@@ -4417,3 +4417,196 @@ class ReviewerClaimReceipt(unittest.TestCase):
                 guard.reviewer_claim_receipt(
                     "danielraffel/Shipyard", 974, self.head,
                     policy, {"signer": "pulp-review", "approved_at": "2026-10-27T20:30:00Z"})
+
+
+class ReviewerClaimReceiptSafety(unittest.TestCase):
+    """One isolating negative test per receipt safety condition: every other
+    check passes, so only the condition under test can refuse."""
+
+    head = "a" * 40
+    repo = "danielraffel/Shipyard"
+
+    def receipt(self, **overrides: object) -> dict[str, object]:
+        value: dict[str, object] = {
+            "schema": "shipyard-reviewer-claim/v1", "repo": "danielraffel/shipyard",
+            "pr": 974, "head_sha": self.head, "epoch": 3, "reviewer": "pulp-review",
+            "claimed_at": "2026-10-27T20:00:00Z", "deadline_at": "2099-10-27T21:00:00Z",
+        }
+        value.update(overrides)
+        return value
+
+    def run_fixture(self, summary: object, **overrides: object) -> dict[str, object]:
+        value: dict[str, object] = {
+            "name": "reviewer-claim", "status": "completed", "conclusion": "success",
+            "app": {"slug": "shipyard-review", "id": 42},
+            "output": {"summary": json.dumps(summary)},
+        }
+        value.update(overrides)
+        return value
+
+    def parse(self, summary: object, repo: str | None = None, pr: int = 974,
+              policy_app: str | int = "shipyard-review", **run: object
+              ) -> dict[str, Any] | None:
+        return guard.parse_claim_receipt(self.run_fixture(summary, **run), repo or self.repo,
+                                         pr, self.head, "reviewer-claim", policy_app)
+
+    def consume(self, approval: dict[str, Any], summary: dict[str, object] | None = None,
+                app: str | int = "shipyard-review") -> str | None:
+        policy = {"claim_receipt": "reviewer-claim", "claim_app": app}
+        listing = [{"total_count": 1,
+                    "check_runs": [self.run_fixture(summary or self.receipt())]}]
+        with mock.patch.object(guard, "run_real_gh", return_value=listing):
+            return guard.reviewer_claim_receipt(self.repo, 974, self.head, policy, approval)
+
+    def test_control_a_canonical_receipt_parses(self) -> None:
+        self.assertEqual(self.parse(self.receipt())["epoch"], 3)
+
+    def test_repo_binding_is_case_insensitive(self) -> None:
+        # The producer writes the lower-cased slug; a mixed-case PR repository
+        # must still accept it, in both directions.
+        for receipt_repo, repo in (("generous-corp/pulp", "Generous-Corp/pulp"),
+                                   ("Generous-Corp/pulp", "generous-corp/PULP")):
+            with self.subTest(receipt_repo=receipt_repo, repo=repo):
+                self.assertIsNotNone(self.parse(self.receipt(repo=receipt_repo), repo=repo))
+
+    def test_repo_binding_refuses_another_repository(self) -> None:
+        for receipt_repo in ("generous-corp/tartci", "generous-corp/pulp-planning", 7):
+            with self.subTest(receipt_repo=receipt_repo):
+                with self.assertRaisesRegex(guard.GuardError, "another pull request"):
+                    self.parse(self.receipt(repo=receipt_repo), repo="Generous-Corp/pulp")
+
+    def test_pr_binding_refuses_another_pull_request(self) -> None:
+        with self.assertRaisesRegex(guard.GuardError, "another pull request"):
+            self.parse(self.receipt(), pr=975)
+
+    def test_future_dated_claim_is_refused(self) -> None:
+        with self.assertRaisesRegex(guard.GuardError, "future-dated"):
+            self.parse(self.receipt(claimed_at="2099-10-27T20:00:00Z"))
+
+    def test_non_forward_deadline_is_refused(self) -> None:
+        for deadline in ("2026-10-27T20:00:00Z", "2026-10-27T19:00:00Z"):
+            with self.subTest(deadline=deadline):
+                with self.assertRaisesRegex(guard.GuardError, "non-forward deadline"):
+                    self.parse(self.receipt(deadline_at=deadline))
+
+    def test_invalid_epoch_is_refused(self) -> None:
+        for epoch in (0, -1, "3", 3.0, True, None):
+            with self.subTest(epoch=epoch):
+                with self.assertRaisesRegex(guard.GuardError, "invalid epoch"):
+                    self.parse(self.receipt(epoch=epoch))
+
+    def test_empty_reviewer_is_refused(self) -> None:
+        for reviewer in ("", "   ", None, 5):
+            with self.subTest(reviewer=reviewer):
+                with self.assertRaisesRegex(guard.GuardError, "no reviewer identity"):
+                    self.parse(self.receipt(reviewer=reviewer))
+
+    def test_integer_app_policy_matches_the_app_id_only(self) -> None:
+        policy = guard.review_policy(
+            "[auto_merge]\nreviewer_claim_receipt = 'reviewer-claim'\nreviewer_claim_app = 42\n",
+            self.repo, True)
+        self.assertEqual(policy["claim_app"], 42)
+        # The id decides, whatever the slug says.
+        self.assertIsNotNone(self.parse(self.receipt(), policy_app=42,
+                                        app={"slug": "renamed", "id": 42}))
+        with self.assertRaisesRegex(guard.GuardError, "unexpected GitHub App"):
+            self.parse(self.receipt(), policy_app=42, app={"slug": "shipyard-review", "id": 43})
+
+    def test_approval_at_or_after_the_deadline_is_refused(self) -> None:
+        summary = self.receipt(deadline_at="2099-10-27T21:00:00Z")
+        self.assertIsNotNone(self.consume(
+            {"signer": "pulp-review", "approved_at": "2099-10-27T20:59:59Z"}, summary))
+        for late in ("2099-10-27T21:00:00Z", "2099-10-27T21:00:01Z"):
+            with self.subTest(approved_at=late):
+                with self.assertRaisesRegex(guard.GuardError, "outside the reviewer claim window"):
+                    self.consume({"signer": "pulp-review", "approved_at": late}, summary)
+
+    def approval_from(self, comment: dict[str, Any]) -> dict[str, Any]:
+        with mock.patch.object(guard, "_deciding_approval_comment", return_value=comment):
+            return guard.deciding_approval(self.head, "author", [comment], [], {})
+
+    def verdict(self, **times: str) -> dict[str, Any]:
+        return {"id": 1, "body": f"reviewer: pulp-review\nverdict: APPROVE head:{self.head}",
+                **times}
+
+    def test_a_verdict_edited_after_the_deadline_is_judged_at_its_edit_time(self) -> None:
+        # A HOLD posted inside the window and edited into an APPROVE after the
+        # deadline keeps its created_at; its edit time is outside the window.
+        edited = self.approval_from(self.verdict(created_at="2026-10-27T20:30:00Z",
+                                                 updated_at="2099-10-28T00:00:00Z"))
+        self.assertEqual(edited["approved_at"], "2099-10-28T00:00:00Z")
+        with self.assertRaisesRegex(guard.GuardError, "outside the reviewer claim window"):
+            self.consume(edited)
+
+    def test_an_unedited_or_in_window_edited_verdict_is_accepted(self) -> None:
+        for times in ({"created_at": "2026-10-27T20:30:00Z"},
+                      {"created_at": "2026-10-27T20:30:00Z", "updated_at": "2026-10-27T20:30:00Z"},
+                      {"created_at": "2026-10-27T20:30:00Z", "updated_at": "2026-10-27T20:40:00Z"}):
+            with self.subTest(times=times):
+                self.assertIn("epoch 3", self.consume(self.approval_from(self.verdict(**times))))
+
+    def test_an_unreadable_edit_time_is_refused(self) -> None:
+        approval = self.approval_from(self.verdict(created_at="2026-10-27T20:30:00Z",
+                                                   updated_at="not-a-time"))
+        self.assertIsNone(approval["approved_at"])
+        with self.assertRaisesRegex(guard.GuardError, "no readable timestamp"):
+            self.consume(approval)
+
+
+class ReviewerClaimReviewGate(unittest.TestCase):
+    """`review_gate` itself consumes the receipt when the base enables it."""
+
+    head = "c" * 40
+    repo = "Generous-Corp/pulp"
+    config = ("[auto_merge]\narm_requires_head_approval = true\n"
+              "reviewer_claim_receipt = 'reviewer-claim'\nreviewer_claim_app = 'shipyard-review'\n")
+
+    def receipt_run(self) -> dict[str, Any]:
+        summary = {
+            "schema": "shipyard-reviewer-claim/v1", "repo": "generous-corp/pulp",
+            "pr": 11, "head_sha": self.head, "epoch": 2, "reviewer": "pulp-review",
+            "claimed_at": "2026-10-27T20:00:00Z", "deadline_at": "2099-10-27T21:00:00Z",
+        }
+        return {"id": 5, "name": "reviewer-claim", "status": "completed",
+                "conclusion": "success", "app": {"slug": "shipyard-review", "id": 42},
+                "output": {"summary": json.dumps(summary)}}
+
+    def gate(self, check_runs: list[dict[str, Any]]) -> tuple[bool, str, Any]:
+        pull = {"base": {"ref": "main"}, "head": {"sha": self.head, "ref": "feature/x"},
+                "user": {"login": "author"}}
+
+        def real_gh(arguments: list[str]) -> Any:
+            path = next(arg for arg in arguments if arg.startswith("repos/"))
+            if "/check-runs" in path:
+                return [{"total_count": len(check_runs), "check_runs": check_runs}]
+            if path == f"repos/{self.repo}/pulls/11":
+                return pull
+            raise AssertionError(f"unexpected gh read {arguments}")
+
+        approval = {"verdict_comment_id": 1, "signer": "pulp-review",
+                    "approved_head": self.head, "approved_at": "2026-10-27T20:30:00Z"}
+        target = {"repo": self.repo, "pr": 11, "head": self.head, "bound_head": self.head}
+        with tempfile.TemporaryDirectory() as guards, \
+                mock.patch.dict(os.environ, {"SHIPYARD_GHAPP_GUARDS_DIR": guards}), \
+                mock.patch.object(guard, "host_review_default", return_value=True), \
+                mock.patch.object(guard, "run_real_gh", side_effect=real_gh), \
+                mock.patch.object(guard, "base_config_text", return_value=self.config), \
+                mock.patch.object(guard, "_rest_pages", return_value=[]), \
+                mock.patch.object(guard, "review_verdict",
+                                  return_value=(True, "approved by pulp-review")), \
+                mock.patch.object(guard, "self_approval", return_value=None), \
+                mock.patch.object(guard, "same_session_note", return_value=None), \
+                mock.patch.object(guard, "deciding_approval", return_value=approval), \
+                contextlib.redirect_stderr(io.StringIO()):
+            return guard.review_gate(target, self.repo, dry_run=True)
+
+    def test_control_a_valid_receipt_is_consumed(self) -> None:
+        allowed, message, _ = self.gate([self.receipt_run()])
+        self.assertTrue(allowed, message)
+        self.assertIn("reviewer claim epoch 2 by pulp-review consumed", message)
+
+    def test_an_approval_without_its_receipt_is_refused(self) -> None:
+        allowed, message, fix = self.gate([])
+        self.assertFalse(allowed, message)
+        self.assertIn("reviewer claim receipt refused", message)
+        self.assertEqual(fix["cause"], "unreviewed")

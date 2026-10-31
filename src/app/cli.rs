@@ -1023,8 +1023,9 @@ pub(super) enum ReviewerClaimCommand {
         /// Claim lifetime in seconds.
         #[arg(long, default_value_t = 1800)]
         deadline_seconds: i64,
-        /// Protected check-run name configured by `[auto_merge]`.
-        #[arg(long, default_value = "shipyard-reviewer-claim")]
+        /// Receipt check-run name. It is fixed to `reviewer-claim`, which the
+        /// base's `[auto_merge] reviewer_claim_receipt` must name.
+        #[arg(long, default_value = crate::reviewer_receipt::REVIEWER_CLAIM_CHECK_NAME)]
         check_name: String,
     },
     /// Check whether a reviewer may publish a verdict now.
@@ -1060,8 +1061,8 @@ pub(super) enum ReviewerClaimCommand {
         /// Stable reviewer identity.
         #[arg(long)]
         reviewer: String,
-        /// Protected check-run name to invalidate with the claim.
-        #[arg(long, default_value = "shipyard-reviewer-claim")]
+        /// Receipt check-run name to invalidate with the claim.
+        #[arg(long, default_value = crate::reviewer_receipt::REVIEWER_CLAIM_CHECK_NAME)]
         check_name: String,
     },
 }

@@ -4195,8 +4195,13 @@ review-required repository lists none); exit 0 allowed, 1 refused, 2
 unreadable, and a caller treats 2 as refused. The review-verdict status pins the rebase carry on for
 the same reason. When the protected base enables `reviewer_claim_receipt` and
 `reviewer_claim_app`, acquire a claim with `shipyard reviewer-claim acquire`
-before the verdict; the managed `reviewer-claim-guard` validates the exact
-head, reviewer, epoch and deadline immediately before the ghapp write. Use
+before the verdict; acquire takes the receipt App from that base policy and
+refuses an absent, partial or shared-App policy (GitHub Actions id 15368)
+before claiming. The managed `reviewer-claim-guard` validates the exact
+head, reviewer, epoch and deadline immediately before the ghapp write. The
+fence is effectively per host and per reviewer name (`validate` compares the
+local ship-state's epoch with itself, the client guard keys on
+`SHIPYARD_AGENT_ID`, and a fresh ship-state resets the epoch to 0).
 `shipyard reviewer-claim revoke` is intentionally unavailable until
 authenticated App receipt invalidation is exposed; claims expire or are
 superseded by exact-head adoption fencing in the meantime. A merge-only update carries the approval only when every file the PR

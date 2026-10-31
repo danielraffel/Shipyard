@@ -1436,6 +1436,24 @@ def _deciding_approval_body(
     return comment.get("body") if comment is not None else None
 
 
+def _comment_effective_time(comment: dict[str, Any]) -> str | None:
+    """When a comment last said what it says now: the later of ``created_at``
+    and ``updated_at``, so a verdict edited in after a claim window is judged
+    at its edit time. ``None`` (no readable time) when either timestamp is
+    present but unreadable or lacks a UTC offset."""
+    created_raw = comment.get("created_at")
+    updated_raw = comment.get("updated_at")
+    created = _timestamp(created_raw)
+    if created is None or created.tzinfo is None:
+        return None
+    if updated_raw is None:
+        return created_raw
+    updated = _timestamp(updated_raw)
+    if updated is None or updated.tzinfo is None:
+        return None
+    return updated_raw if updated > created else created_raw
+
+
 def deciding_approval(
     head: str,
     author: str | None,
@@ -1451,7 +1469,7 @@ def deciding_approval(
         signed = _SIGNER_LINE.findall(comment.get("body") or "")
         return {"verdict_comment_id": comment.get("id"),
                 "signer": signed[-1].lower() if signed else None, "approved_head": head,
-                "approved_at": comment.get("created_at")}
+                "approved_at": _comment_effective_time(comment)}
     for review in reviews:
         if (str(review.get("state") or "").upper() == "APPROVED"
                 and str(review.get("commit_id") or "").lower() == head):
@@ -2221,7 +2239,11 @@ def parse_claim_receipt(
                 "claimed_at", "deadline_at"}
     if set(value) != required or value.get("schema") != CLAIM_RECEIPT_SCHEMA:
         raise GuardError(f"claim receipt `{context}` has an unexpected schema")
-    if value.get("repo") != repo or value.get("pr") != pr:
+    # The producer writes the canonical (lower-cased) slug; GitHub slugs are
+    # case-insensitive, so the binding is too.
+    receipt_repo = value.get("repo")
+    if (not isinstance(receipt_repo, str) or receipt_repo.lower() != repo.lower()
+            or value.get("pr") != pr):
         raise GuardError(f"claim receipt `{context}` is bound to another pull request")
     receipt_head = value.get("head_sha")
     if not isinstance(receipt_head, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", receipt_head):

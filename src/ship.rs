@@ -747,11 +747,7 @@ fn execute_ship_worker_with_options<D: ShipTargetDispatcher>(
     {
         let actions =
             GitHubActions::from_loaded_config(cwd, config).with_repo_override(&request.repo);
-        if let Err(error) = invalidate_adopted_reviewer_receipts(&actions, request) {
-            let execution_error = ShipExecutionError::ShipState(error);
-            cancel_refused_job(queue, &job, &execution_error)?;
-            return Err(execution_error);
-        }
+        invalidate_adopted_receipts_or_cancel(&actions, queue, &job, request)?;
     }
     let mut state = match load_or_create_state(
         request,
@@ -2730,6 +2726,22 @@ fn maybe_reclassify_on_host_incident(
         Some(existing) if !existing.is_empty() => format!("{existing}\n{note}"),
         _ => note,
     });
+}
+
+/// [`invalidate_adopted_reviewer_receipts`], cancelling `job` when it fails:
+/// an adoption whose earlier receipts cannot be marked failed never proceeds.
+fn invalidate_adopted_receipts_or_cancel(
+    actions: &GitHubActions,
+    queue: &mut Queue,
+    job: &Job,
+    request: &ShipExecutionRequest,
+) -> Result<(), ShipExecutionError> {
+    if let Err(error) = invalidate_adopted_reviewer_receipts(actions, request) {
+        let execution_error = ShipExecutionError::ShipState(error);
+        cancel_refused_job(queue, job, &execution_error)?;
+        return Err(execution_error);
+    }
+    Ok(())
 }
 
 /// Invalidate external claim receipts before adopting a changed validation
@@ -6549,6 +6561,155 @@ mod tests {
         );
         assert_eq!(reconciled.merge_queue_observed_at, None);
         assert_eq!(reconciled.merge_queue_enqueue_succeeded_at, None);
+    }
+
+    /// A fake `gh` answering the adopted head's check runs from a fixture and
+    /// logging every call (and each PATCH body) to `calls.log`.
+    #[cfg(unix)]
+    fn adopted_receipts_gh(
+        temp: &tempfile::TempDir,
+        request: &ShipExecutionRequest,
+        read_exit: u8,
+        patch_exit: u8,
+    ) -> crate::cloud::GitHubActions {
+        let summary = |repo: &str, pr: u64| {
+            serde_json::json!({
+                "schema": "shipyard-reviewer-claim/v1",
+                "repo": repo,
+                "pr": pr,
+                "head_sha": request.sha.clone(),
+                "epoch": 3,
+                "reviewer": "pulp-review",
+                "claimed_at": "2026-10-27T20:00:00Z",
+                "deadline_at": "2099-10-27T21:00:00Z",
+            })
+            .to_string()
+        };
+        let listing = serde_json::json!([{ "total_count": 4, "check_runs": [
+            {"id": 10, "name": "reviewer-claim",
+             "output": {"summary": summary(&request.repo, request.pr)}},
+            {"id": 11, "name": "reviewer-claim",
+             "output": {"summary": summary(&request.repo.to_ascii_uppercase(), request.pr)}},
+            {"id": 12, "name": "reviewer-claim",
+             "output": {"summary": summary(&request.repo, request.pr + 1)}},
+            {"id": 13, "name": "build", "output": {"summary": "green"}},
+        ]}]);
+        let listing_path = temp.path().join("listing.json");
+        std::fs::write(&listing_path, listing.to_string()).expect("listing");
+        let gh = temp.path().join("gh");
+        crate::test_support::write_executable_script(
+            &gh,
+            &format!(
+                "#!/bin/sh\nlog='{log}'\nprintf 'ARGS=%s\\n' \"$*\" >> \"$log\"\n\
+                 case \"$*\" in\n\
+                 *PATCH*) for last; do :; done; cat \"$last\" >> \"$log\"; \
+                 printf '\\n' >> \"$log\"; exit {patch_exit};;\n\
+                 *) cat '{listing}'; exit {read_exit};;\n\
+                 esac\n",
+                log = temp.path().join("calls.log").display(),
+                listing = listing_path.display(),
+            ),
+        );
+        crate::cloud::GitHubActions::hermetic_for_tests(temp.path(), &gh)
+    }
+
+    #[cfg(unix)]
+    fn adopted_request() -> ShipExecutionRequest {
+        ShipExecutionRequest {
+            pr: 42,
+            repo: "danielraffel/pulp".to_owned(),
+            sha: "a".repeat(40),
+            adopt_head: true,
+            ..ship_request(vec![ssh_target()])
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adoption_marks_every_bound_receipt_failed_and_nothing_else() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let request = adopted_request();
+        let actions = adopted_receipts_gh(&temp, &request, 0, 0);
+        super::invalidate_adopted_reviewer_receipts(&actions, &request).expect("invalidated");
+        let log = std::fs::read_to_string(temp.path().join("calls.log")).expect("log");
+        let patched: Vec<&str> = log
+            .lines()
+            .filter(|line| line.contains("--method PATCH"))
+            .collect();
+        assert_eq!(patched.len(), 2, "{log}");
+        assert!(
+            patched[0].contains("repos/danielraffel/pulp/check-runs/10"),
+            "{log}"
+        );
+        assert!(
+            patched[1].contains("repos/danielraffel/pulp/check-runs/11"),
+            "{log}"
+        );
+        assert!(
+            !log.contains("check-runs/12"),
+            "another PR's receipt: {log}"
+        );
+        assert!(!log.contains("check-runs/13"), "an unrelated check: {log}");
+        let bodies: Vec<serde_json::Value> = log
+            .lines()
+            .filter(|line| line.starts_with('{'))
+            .map(|line| serde_json::from_str(line).expect("PATCH body"))
+            .collect();
+        assert_eq!(bodies.len(), 2, "{log}");
+        assert!(
+            bodies
+                .iter()
+                .all(|body| body["status"] == "completed" && body["conclusion"] == "failure")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adoption_fails_closed_when_receipts_cannot_be_read_or_marked_failed() {
+        let request = adopted_request();
+        for (read_exit, patch_exit, expected) in [
+            (1, 0, "read adopted reviewer claim receipts"),
+            (0, 1, "invalidate adopted reviewer claim receipt"),
+        ] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let actions = adopted_receipts_gh(&temp, &request, read_exit, patch_exit);
+            let error = super::invalidate_adopted_reviewer_receipts(&actions, &request)
+                .expect_err("fails closed");
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_adoption_invalidation_cancels_the_ship_job() {
+        for (patch_exit, cancelled) in [(1, true), (0, false)] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let request = adopted_request();
+            let actions = adopted_receipts_gh(&temp, &request, 0, patch_exit);
+            let mut queue = Queue::new(temp.path().join("state")).expect("queue");
+            let job =
+                super::submit_ship(&request, &mut queue, temp.path(), temp.path()).expect("queued");
+            let result =
+                super::invalidate_adopted_receipts_or_cancel(&actions, &mut queue, &job, &request);
+            assert_eq!(result.is_err(), cancelled, "{result:?}");
+            let durable = queue.get(&job.id).expect("queue").expect("job");
+            assert_eq!(
+                durable.status == crate::job::JobStatus::Cancelled,
+                cancelled,
+                "{:?}",
+                durable.status
+            );
+            if cancelled {
+                assert!(
+                    durable
+                        .cancellation_reason
+                        .as_deref()
+                        .is_some_and(|reason| reason.contains("adopted reviewer claim")),
+                    "{:?}",
+                    durable.cancellation_reason
+                );
+            }
+        }
     }
 
     #[test]

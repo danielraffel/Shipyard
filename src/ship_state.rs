@@ -2151,6 +2151,103 @@ mod tests {
     }
 
     #[test]
+    fn claim_reviewer_refuses_a_non_forward_deadline() {
+        let claimed_at = Utc.with_ymd_and_hms(2026, 10, 27, 12, 0, 0).unwrap();
+        for deadline_at in [claimed_at, claimed_at - Duration::seconds(1)] {
+            let mut state = sample_state(229, "head-a");
+            assert!(
+                state
+                    .claim_reviewer("head-a", "reviewer", claimed_at, deadline_at, claimed_at)
+                    .is_none(),
+                "deadline {deadline_at} is not after the claim"
+            );
+            assert_eq!(state.reviewer_claim_epoch, 0, "a refusal does not mutate");
+            assert!(state.active_reviewer_claim.is_none());
+        }
+        // Control: one second forward is a valid claim.
+        let mut state = sample_state(229, "head-a");
+        assert!(
+            state
+                .claim_reviewer(
+                    "head-a",
+                    "reviewer",
+                    claimed_at,
+                    claimed_at + Duration::seconds(1),
+                    claimed_at,
+                )
+                .is_some()
+        );
+    }
+
+    /// A state holding an expired claim, which a new reviewer may reclaim
+    /// unless the state is legacy or its epochs disagree.
+    fn state_with_expired_claim(claimed_at: chrono::DateTime<Utc>) -> ShipState {
+        let mut state = sample_state(230, "head-a");
+        state
+            .claim_reviewer(
+                "head-a",
+                "reviewer-a",
+                claimed_at,
+                claimed_at + Duration::minutes(5),
+                claimed_at,
+            )
+            .expect("first claim");
+        state
+    }
+
+    #[test]
+    fn claim_reviewer_refuses_legacy_or_mismatched_epoch_state_with_an_active_claim() {
+        let claimed_at = Utc.with_ymd_and_hms(2026, 10, 27, 12, 0, 0).unwrap();
+        let later = claimed_at + Duration::minutes(10);
+        let reclaim = |state: &mut ShipState| {
+            state.claim_reviewer(
+                "head-a",
+                "reviewer-b",
+                later,
+                later + Duration::minutes(5),
+                later,
+            )
+        };
+        // Control: the expired claim is reclaimed with the next epoch.
+        let mut control = state_with_expired_claim(claimed_at);
+        assert_eq!(reclaim(&mut control).expect("reclaim").epoch, 2);
+
+        let mut legacy = state_with_expired_claim(claimed_at);
+        legacy.schema_version = 1;
+        assert!(reclaim(&mut legacy).is_none(), "legacy schema");
+
+        let mut behind = state_with_expired_claim(claimed_at);
+        behind.reviewer_claim_epoch = 0;
+        assert!(
+            reclaim(&mut behind).is_none(),
+            "state epoch behind the claim"
+        );
+
+        let mut ahead = state_with_expired_claim(claimed_at);
+        ahead.reviewer_claim_epoch = 5;
+        assert!(
+            reclaim(&mut ahead).is_none(),
+            "state epoch ahead of the claim"
+        );
+
+        let mut zero = state_with_expired_claim(claimed_at);
+        zero.reviewer_claim_epoch = 0;
+        zero.active_reviewer_claim.as_mut().expect("claim").epoch = 0;
+        assert!(reclaim(&mut zero).is_none(), "a zero-epoch active claim");
+        for refused in [&legacy, &behind, &ahead, &zero] {
+            assert_eq!(
+                refused
+                    .active_reviewer_claim
+                    .as_ref()
+                    .expect("claim kept")
+                    .reviewer,
+                "reviewer-a",
+                "a refusal does not mutate"
+            );
+        }
+    }
+
+    #[test]
     fn reviewer_claim_fences_timeout_late_verdict_and_stale_epoch() {
         let claimed_at = Utc.with_ymd_and_hms(2026, 10, 27, 12, 0, 0).unwrap();
         let deadline_at = claimed_at + Duration::minutes(5);
