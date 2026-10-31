@@ -60,6 +60,7 @@ fn rule_config(source: &PrWatchRulesSource) -> Result<RuleConfig, CliFailure> {
             .map_err(invalid)?,
         queue_stuck_after: parse_duration(&source.queue_stuck_after).map_err(invalid)?,
         approved_unarmed_after: parse_duration(&source.approved_unarmed_after).map_err(invalid)?,
+        held_after: parse_duration(&source.held_after).map_err(invalid)?,
         reviewers: source
             .reviewers
             .iter()
@@ -306,7 +307,12 @@ fn budget_refusal(
 
 /// Kinds whose verdict could be older than the window: read the pull
 /// request's whole trail before emitting them.
-const TRAIL_DEPENDENT: [&str; 3] = ["ready_unreviewed", "head_unreviewed", "armed_unapproved"];
+const TRAIL_DEPENDENT: [&str; 4] = [
+    "ready_unreviewed",
+    "head_unreviewed",
+    "armed_unapproved",
+    "held_unrepaired",
+];
 
 /// Replace the trail of every pull request a trail-dependent event names
 /// with its whole trail.
@@ -678,6 +684,8 @@ mod tests {
             key: "k".to_owned(),
             at: at(),
             since: None,
+            age_secs: None,
+            age: None,
             repo: Some("o/r".to_owned()),
             pr: Some(7),
             head: Some(HEAD.to_owned()),
@@ -720,6 +728,7 @@ mod tests {
             head_unreviewed_after: None,
             queue_stuck_after: "90m".to_owned(),
             approved_unarmed_after: "15m".to_owned(),
+            held_after: "60m".to_owned(),
             reviewers: reviewers.into_iter().map(str::to_owned).collect(),
             no_cache: false,
         }

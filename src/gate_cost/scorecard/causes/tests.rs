@@ -501,10 +501,9 @@ fn archive_duplicates_and_malformed_rows_stay_unreadable() {
     std::fs::create_dir(&archive_dir).expect("archive dir");
     let path = archive_dir.join("2026-10.jsonl");
     let duplicate = archive_cause(GATE_JOB, 38_308_868_279, PULP);
-    let mut wrong_repo = archive_cause(998, 38_308_868_279, "other/repo");
+    let wrong_repo = archive_cause(998, 38_308_868_279, "other/repo");
     let mut missing_job = archive_cause(997, 38_308_868_279, PULP);
     missing_job["job_id"] = Value::Null;
-    wrong_repo["repo"] = json!("other/repo");
     std::fs::write(
         &path,
         format!("{duplicate}\n{duplicate}\n{wrong_repo}\n{missing_job}\n{{bad json}}\n"),
@@ -513,7 +512,8 @@ fn archive_duplicates_and_malformed_rows_stay_unreadable() {
     let read = archive(dir.path(), PULP).expect("readable archive");
     assert_eq!(read.archive_rows, 4);
     assert_eq!(read.archive_duplicates, 1);
-    assert_eq!(read.archive_malformed, 3);
+    assert_eq!(read.archive_malformed, 2);
+    assert_eq!(read.archive_other_repo, 1);
     let mut cases = cases(&observation());
     attach(&mut cases, &read);
     let naming = compute(&cases, &read);
@@ -613,4 +613,176 @@ fn unreadable_archive_directory_is_unavailable() {
     }
     let error = result.expect_err("unreadable archive must fail");
     assert!(error.contains("cause archive unavailable"), "{error}");
+}
+
+#[test]
+fn archive_invalid_utf8_does_not_hide_later_rows() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let archive_dir = dir.path().join("causes");
+    std::fs::create_dir(&archive_dir).expect("archive dir");
+    let good = archive_cause(GATE_JOB, 38_308_868_279, PULP);
+    let mut bytes = b"{\"detail\":\"".to_vec();
+    bytes.push(0xff);
+    bytes.extend_from_slice(b"\"}\n");
+    bytes.extend_from_slice(format!("{good}\n").as_bytes());
+    std::fs::write(archive_dir.join("2026-10.jsonl"), bytes).expect("archive");
+
+    let read = archive(dir.path(), PULP).expect("readable archive");
+    assert_eq!(read.archive_malformed, 1);
+    assert_eq!(read.archive_rows, 1);
+    assert!(!read.archive_truncated);
+    let mut rows = cases(&observation());
+    attach(&mut rows, &read);
+    assert_eq!(compute(&rows, &read).named, 1);
+}
+
+#[test]
+fn archive_other_repo_is_excluded_without_contaminating_identity_or_malformed_counts() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let archive_dir = dir.path().join("causes");
+    std::fs::create_dir(&archive_dir).expect("archive dir");
+    // Same run/job as an in-scope row: the foreign record is not a duplicate.
+    let foreign = archive_cause(GATE_JOB, 38_308_868_279, "other/repo");
+    let good = archive_cause(GATE_JOB, 38_308_868_279, PULP);
+    std::fs::write(
+        archive_dir.join("2026-10.jsonl"),
+        format!("{foreign}\n{good}\n"),
+    )
+    .expect("archive");
+
+    let read = archive(dir.path(), PULP).expect("readable archive");
+    assert_eq!(read.archive_rows, 2);
+    assert_eq!(read.archive_other_repo, 1);
+    assert_eq!(read.archive_malformed, 0);
+    assert_eq!(read.archive_duplicates, 0);
+    let mut rows = cases(&observation());
+    attach(&mut rows, &read);
+    let naming = compute(&rows, &read);
+    assert_eq!(naming.named, 1);
+    assert_eq!(naming.archive_unjoined, 0);
+    assert_eq!(naming.archive_other_repo, 1);
+    assert!(render(&naming).contains("0 malformed, 1 other repo"));
+    let json = serde_json::to_value(&naming).expect("report json");
+    assert_eq!(json["archive_other_repo"], 1);
+}
+
+#[test]
+fn archive_attempt_zero_is_malformed_and_does_not_poison_a_valid_attempt() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let archive_dir = dir.path().join("causes");
+    std::fs::create_dir(&archive_dir).expect("archive dir");
+    let mut row = archive_cause(GATE_JOB, 38_308_868_279, PULP);
+    row["attempt"] = json!(0);
+    let path = archive_dir.join("2026-10.jsonl");
+    std::fs::write(&path, format!("{row}\n")).expect("archive");
+    let read = archive(dir.path(), PULP).expect("readable archive");
+    assert_eq!(read.archive_rows, 1);
+    assert_eq!(read.archive_malformed, 1);
+    let mut rows = cases(&observation());
+    attach(&mut rows, &read);
+    assert_eq!(compute(&rows, &read).named, 0);
+
+    let valid = archive_cause(GATE_JOB, 38_308_868_279, PULP);
+    std::fs::write(&path, format!("{row}\n{valid}\n")).expect("archive");
+    let read = archive(dir.path(), PULP).expect("readable archive");
+    assert_eq!(read.archive_malformed, 1);
+    assert_eq!(read.archive_duplicates, 0);
+    attach(&mut rows, &read);
+    assert_eq!(compute(&rows, &read).named, 1);
+}
+
+#[test]
+fn archive_line_bound_counts_blank_and_invalid_rows_across_files() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let archive_dir = dir.path().join("causes");
+    std::fs::create_dir(&archive_dir).expect("archive dir");
+    // Blank lines and invalid UTF-8 consume the same global line budget as
+    // valid rows; the last permitted line still contributes a cause.
+    let mut prefix = vec![b'\n'; MAX_ARCHIVE_LINES - 2];
+    prefix.extend_from_slice(&[0xff, b'\n']);
+    std::fs::write(archive_dir.join("2026-09.jsonl"), prefix).expect("prefix");
+    let good = archive_cause(GATE_JOB, 38_308_868_279, PULP);
+    let last = archive_dir.join("2026-10.jsonl");
+    std::fs::write(&last, format!("{good}\n")).expect("last allowed row");
+    let exact = archive(dir.path(), PULP).expect("readable archive");
+    assert_eq!(exact.archive_rows, 1);
+    assert_eq!(exact.archive_malformed, 1);
+    assert!(!exact.archive_truncated);
+    let mut rows = cases(&observation());
+    attach(&mut rows, &exact);
+    assert_eq!(compute(&rows, &exact).named, 1);
+
+    // A duplicate just past the limit must not invalidate the allowed row.
+    std::fs::write(&last, format!("{good}\n{good}\n")).expect("one over limit");
+    let over = archive(dir.path(), PULP).expect("readable archive");
+    assert!(over.archive_truncated);
+    assert_eq!(over.archive_rows, 1);
+    assert_eq!(over.archive_malformed, 1);
+    assert_eq!(over.archive_duplicates, 0);
+    let mut rows = cases(&observation());
+    attach(&mut rows, &over);
+    assert_eq!(compute(&rows, &over).named, 1);
+}
+
+#[test]
+fn a_v7_cached_linker_warning_is_reparsed_and_the_new_cause_is_cached() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cache = ReadCache::open(dir.path(), std::time::SystemTime::now());
+    let repo = "example/project";
+    let job = Job {
+        id: 101,
+        name: "build".to_owned(),
+        status: Some("completed".to_owned()),
+        conclusion: Some("cancelled".to_owned()),
+        started_at: Some("2026-10-01T00:00:00Z".to_owned()),
+        ..Job::default()
+    };
+    let place = Place {
+        repo: repo.to_owned(),
+        ..Place::default()
+    };
+    // Recreate the old cache entry without asking the fixed extractor to
+    // misclassify a warning: v7 gave this warning the same cause as an error.
+    let mut old = cause::build(
+        &job,
+        Some("ld: duplicate symbol 'example_symbol' in: a.o b.o"),
+        &place,
+        None,
+        true,
+    )
+    .expect("cancelled job has a cause");
+    assert_eq!(old.failure_class, "build");
+    old.detail = Some("warning: duplicate symbol 'example_symbol' in: a.o b.o".to_owned());
+    let old_key = "case-cause:v7:example/project:101";
+    cache.put(old_key, &serde_json::to_value(&old).expect("cause json"));
+    assert!(
+        cache.get(old_key).is_some(),
+        "stale cache control must exist"
+    );
+
+    let calls = Mutex::new(0);
+    let reader = |args: &[String]| {
+        *calls.lock().expect("calls") += 1;
+        match args.last().map(String::as_str) {
+            Some("repos/example/project/actions/jobs/101") => {
+                Ok(serde_json::to_string(&job).expect("job json"))
+            }
+            Some("repos/example/project/actions/jobs/101/logs") => Ok(
+                "ld: warning: duplicate symbol 'example_symbol' in: a.o b.o\n\
+                 [2/2] Linking CXX executable example\n\
+                 ##[error]The operation was canceled.\n"
+                    .to_owned(),
+            ),
+            _ => Err(format!("unexpected request {args:?}")),
+        }
+    };
+    let jobs = std::iter::once(101).collect();
+    let first = gather(&reader, &cache, repo, &jobs, 1);
+    assert_eq!(*calls.lock().expect("calls"), 2, "v7 must be reread");
+    assert!(first.unreadable.is_empty());
+    assert_ne!(first.by_job[&101].failure_class, "build");
+    assert_ne!(first.by_job[&101].kind, "link_error");
+    let second = gather(&reader, &cache, repo, &jobs, 1);
+    assert_eq!(*calls.lock().expect("calls"), 2, "new cache must be reused");
+    assert_eq!(first, second);
 }

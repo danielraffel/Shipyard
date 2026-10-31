@@ -5,12 +5,43 @@ description: Shipyard operations guardrails. Use when working in /Users/danielra
 
 # Shipyard
 
+`SHIPYARD_OBSERVATIONS=off` (trimmed, case-insensitive) stops automatic queue
+shadow/timing, command metric copies, route-shadow receipts, daemon GitHub
+imports, and scheduled baseline collection in processes receiving it. Existing
+services need environment rollout/restart. It preserves required evidence,
+merge receipts, explicit metrics imports/record, and historical reporting;
+retention and manual cause/private-corpus collection remain separate.
+
 The gate-cost scorecard can read a bounded historical cause archive with
 `--causes-archive DIR`; the report labels that source as archive and keeps
 malformed, duplicate, truncated, and unjoined rows visible. This is advisory
 measurement only and does not authorize queue or merge actions.
 Missing or unreadable `DIR/causes/` exits unsuccessfully with `cause archive
 unavailable`; only a readable empty directory can report zero archived rows.
+The archive scan keeps its 64 MiB / 500,000-line bounds. Invalid UTF-8 counts
+as one malformed row and does not discard later rows. Otherwise valid rows
+for another repository are excluded as `archive_other_repo`, not malformed;
+`archive_rows` still counts all successfully decoded cause records. Attachment
+uses the exact-identity index, without changing duplicate or attempt policy.
+
+## Durable work-item contract
+
+Shipyard's existing ShipState/lease/receipt primitives are the source of
+durable intent for work started by independent Claude or Codex sessions. Each
+item has a canonical identity, protocol/capability version, checkpoint, owner,
+and fencing epoch. Register before claiming; checkpoint before handoff; after a
+process or host failure, rediscover from shared state and claim a new epoch.
+The previous owner must be fenced before any conflicting mutation. GitHub
+remains authoritative for PR, review, check, merge-queue, and release state;
+Shipyard records intent and ownership only. Autonomous cross-host takeover is
+not enabled until real concurrent-reconciler and lost-acknowledgment tests
+prove idempotent, authorized recovery.
+
+The store rejects corrupt or unsupported records rather than treating them as
+absent. Claims and checkpoints use expected state versions, verify the worker
+capability, compare idempotency keys on replay, and reject checkpoints after
+lease expiry. These are local safety guards; authenticated cross-host identity
+and takeover still require a separate reviewed boundary and failure canary.
 
 Metrics imports preserve exact-head safety when GitHub omits a workflow run's
 pull-request list: `pull_request` and `pull_request_target` runs may use the
@@ -21,6 +52,20 @@ authenticated queue timing table within its explicit `--since` window. It
 counts each distinct superseded job once, reports clean versus
 uncertain/cancelled/unmatched coverage, and never treats survivor runtime as
 savings. It never turns this evidence into a queue or merge decision.
+
+The producer-side merge-receipt export supports an explicit `--stdout` stream
+mode for a governed transport. It emits canonical JSONL receipt records only;
+`--file` remains the atomic handoff mode, and `--stdout` cannot be combined
+with `--file` or `--json`.
+
+The failure-learning observer is intentionally independent of baseline
+collection. On macOS, use `scripts/install_cause_observer.sh` to render a
+per-user launchd job that runs the read-only `shipyard cause record` pass on a
+bounded interval. The installer is dry-run by default; use `--install` only
+after reviewing the rendered plan. Machine-global auth is used by default; a
+checkout with an untracked `.shipyard.local/config.toml` can be selected with
+`--cwd`. The observer writes only its append-only local archive and never
+arms, enqueues, merges, or posts GitHub state.
 
 The read-only `queue-digest` surface reports `queue_idle` and emits
 `merge_queue_idle_with_pending_work` for an armed-but-not-enqueued PR, or the
@@ -297,11 +342,31 @@ invalid timestamps produce unavailable queue coverage; do not synthesize
 submit-to-receipt, cache, or model-token measurements. New providers must bind
 those values to authenticated durable events before they are imported.
 
+The GitHub metrics importer has the same provenance boundary: resolve one
+machine-global App helper token through `GhClient`, bind it to the exact
+repository target, and qualify rows only for `github-app-installation` helper
+auth. Ambient `gh` auth and fixtures stay unknown, even when their repository,
+workflow, event, or runner labels look production-like.
+
+The freshness query classifies jobs through their `github_job` step marker and
+must retain the `(steps.job_id, steps.step)` migration index. Without it, a
+large metrics store makes an observational scorecard scan steps once per job.
+
 `metrics scorecard` also reports failed/cancelled compute waste, queue-wait
 coordination cost, and failed-attempt rework as observational baseline metrics.
+
 It does not alter routing or queue behavior. The per-safely-merged-change
 denominator is unavailable until a durable merge receipt joins the PR head;
 distinct PRs are not a safe-merge proxy.
+
+The optional authenticated handoff schema is
+`shipyard-merge-receipt-handoff-auth/v1`. Its importer must verify the
+canonical payload digest and the authenticated producer fence (repository,
+project, base branch, session generation, route, destination, known-host and
+executable digests, freshness, and replay) before an atomic/idempotent write.
+Legacy v1 receipts stay readable but are excluded from
+`authenticated_safe_merge_summary`; this telemetry boundary grants no queue or
+merge authority.
 
 ## `inspect --profile`: what checks apply to comes from the repo
 
@@ -746,6 +811,9 @@ v0.245.0 published with no attestation after one transient Sigstore TLS error,
 and every host's fleet-update refused it ("no acceptable build-provenance
 attestation"). If a release is stuck as a draft, rerun the failed
 `sign-and-upload-macos` job; do not publish it by hand without an attestation.
+The live GitHub smoke uses a dedicated read-only token when configured and
+otherwise the Actions job token; never route the write-capable release-bot
+credential to the binary under test. The smoke remains fail-closed.
 ## Leftover validation TMPDIRs: owner files, sweep, and `cleanup --validation-tmp`
 
 A killed validation run cannot run the Drop that removes its
@@ -982,7 +1050,9 @@ server-owned queue order and merge-group checks, mutation ownership, and
 nothing and back off through 15/30/60/120/300 seconds. The observer writes an
 atomic canonical cursor plus an append-only transition log under the Shipyard
 state root and takes an exclusive per-cursor lock. It exposes no mutation flag,
-does not acquire a mutation lease, and needs no write credential. See
+does not acquire a mutation lease, and needs no write credential. If a cursor
+uses an older integrity schema, the live observer reboots from a fresh
+authenticated snapshot instead of trusting the stale cursor. See
 [`docs/queue-observer.md`](../../docs/queue-observer.md).
 
 The read-only `shipyard queue-digest` command renders an inventory from those
@@ -1022,15 +1092,21 @@ machine-global config or an untracked `.shipyard.local/config.toml`: every
 `.shipyard.local/config.toml`, naming the file, before anything runs. See
 [`docs/pr-watch.md`](../../docs/pr-watch.md).
 
+Green-unarmed screening uses the existing bounded worker pool for its capped
+candidate set and keeps deterministic input order. A slow GitHub read therefore
+cannot serialize the whole watcher pass, while ambiguous or failed reads still
+remain fail-closed.
+
 `shipyard pr-watch rules` is the rules-first watcher: one JSONL event per new
 condition (READY or new head unreviewed, verdict to route, armed or queued
 without an approval of the head, red required check naming its failing tests,
-failed merge group, queue removal or stall, approved but unarmed, tartci host
-alarm, or a line from `--input-events`), each once per key, so a quiet pass
+failed merge group, queue removal or stall, approved but unarmed, a HOLD nobody
+repaired (`--held-after`), a PR labelled `owner-decision`/`superseded`/`PARKED/*`
+(own state, skipped by the stall rules), tartci host alarm, or a line from `--input-events`), each once per key, so a quiet pass
 prints nothing. Its first pass with no ledger only records what already holds.
 `rules-replay` runs the same rules over a past window. Failing-test names come
 from CTest, Python unittest (`FAIL:`/`ERROR:` with a dotted location) and
-`cargo test` lines. Every event carries a `fix` (what, evidence URL, cause,
+`cargo test` lines. Every event carries `age_secs`/`age` and a `fix` (what, evidence URL, cause,
 command, safe_to_auto_apply, verify); `--reviewer OWNER/REPO=NAME` names who a
 head routes to. A live pass prints its reads, checks the App budget first and
 backs off (exit 75) under `--min-rate-remaining`, and re-reads a pull
@@ -1766,6 +1842,21 @@ targets, or `--target-cwd` when overridden).
 
 ## Runner Metrics
 
+The optional capacity-only observer is `scripts/collect_fleet_capacity.py`;
+see `docs/capacity-observer.md` for its private roster and bounded one-shot
+policy. It fetches without a database lease, then invokes the existing Rust
+capacity importer once. Missing hosts never receive fabricated receipts;
+complete unknown producer documents still require importer validation.
+Compact attempt history has age/byte bounds, source/roster digests, and explicit
+overlap/missing/unconfirmed outcomes. No service installation or scheduling is
+implied. Pass provenance includes the resolved local importer path/hash.
+`SHIPYARD_OBSERVATIONS=off` returns disabled before reads, processes or storage;
+it must not create a successful attempt. Require deployed producer/importer and real timeout/cost evidence
+before an owner approves continuous collection.
+Output-limit failures terminate only the owned child group while pipe callbacks
+continue discarding through EOF; cleanup must preserve the original limit reason
+and close subprocess transports before event-loop shutdown.
+
 Use `shipyard metrics` when an agent needs historical runner timing, queue, and
 health context before recommending a routing, cache, or monitoring change. The
 metrics store is optional and local to Shipyard state; projects do not need
@@ -1837,6 +1928,11 @@ change lands with its fixture and a `c2::VERSION` bump. It began as a port of
 EXP-A3's `c2_extract.py`, which is frozen at version 5 as the reference behind
 EXP-A3's registered results and is not kept in step: do not port rule changes
 to it.
+C2 v8 excludes explicit linker `warning:` diagnostics, including warnings
+mentioning duplicate symbols, missing paths, or undefined references, even
+when the step later fails or is cancelled. Actual linker errors and fatal
+warnings-as-errors diagnostics remain causes; a warning alone is not one.
+The cause-cache version also advances to v8 so old warning causes are reread.
 Records from the step that ended in `##[error]` come first, so a retried
 assertion never outranks the runner dying. A make or ninja failure ranks
 below every runner and compiler record and is `low`: on its own it names the
@@ -3432,7 +3528,71 @@ It observes by default; `--apply` enables exact-head guarded queue admission,
 reruns, and narrowly policy-scoped capacity-preemption mutations. Client-side
 REST direct merge is refused because GitHub cannot atomically bind both complete
 check materialization and the validated base revision; use a server-owned merge
-queue or manual merge instead. Apply mode is restricted by central mutation
+queue or the server-enforced exact-head merge below. A base with no merge queue (GitHub offers
+queues only to organization-owned repositories) reports
+`merge_path: server_enforced_exact_head_merge` when GitHub requires a check set
+that includes the approval context (`--approval-context`, default
+`review-verdict`) and that rule is bound to an app (`integration_id`); an
+unbound rule leaves the base `direct_merge_refused_server_enforcement_required`.
+There the steward merges an owned head with `mergePullRequest`
+(`expectedHeadOid` = that head, `MERGE`) through the ordinary `gh`/`ghapp` path,
+only when GitHub reports it `CLEAN`, every required check is green, and the
+exact-head approval gate returns `Approved` (`NotRequired` is refused). Per-PR
+mutations are `merged_exact_head:<sha>`, `waiting_head_approval`, and
+`waiting_required`. It never arms native auto-merge on such a base, because an
+armed request survives a later push by anyone with write access; any armed
+request on an owned PR is disarmed (`auto_merge_disabled:<sha>`) on every
+`--apply` pass, approved or not. The org-queue path never takes this merge.
+On every base, whatever its `merge_path` (including
+`direct_merge_refused_server_enforcement_required`, where a surviving arm
+merges directly), the steward, as the base's single admission writer, also
+sweeps every open PR, owned or not, and withdraws what the exact-head gate does
+not admit. An armed native auto-merge request on such a head is disabled
+(`disarmed_stale_auto_merge:<sha>`, audit `disarm_stale_auto_merge`). A
+merge-queue entry whose head is not admitted is removed with
+`dequeuePullRequest` (`dequeued_unapproved:<sha>`, audit
+`dequeue_unapproved_queue_entry`): GitHub consumes the arm when it enqueues,
+so a head it enqueued past approval has no arm left to disarm. This closes the
+gap where an arm enabled for an older head survives a push by anyone with
+write access and GitHub then enqueues or merges the unapproved new head
+itself. A head the gate admits (`Approved`, or `NotRequired` where the
+repository does not require approval) keeps its arm and its entry, since the
+steward would enqueue it anyway. The disarm fails closed: an approval that
+cannot be read, or a live head that moved since the census, disarms. The
+dequeue is bounded, because it discards a merge group's runs. It acts only on
+positive evidence from a successful read of the queued head (a HOLD at that
+head, an approval only for another head, no approval where one is required, or
+a 404 on the base config, which `read_policy_required` reports as the typed
+`PolicyReadError::Absent`). An unreadable approval, live state (including a
+GraphQL answer carrying `errors` or `pullRequest: null`) or config defers it
+(`dequeue_deferred_unreadable:<sha>`) and advances a consecutive-unreadable
+streak in the steward ledger (`dequeue_unreadable`, keyed `repo#pr:head`). Any
+successful judgement clears it, each applying pass prunes it once the PR is
+unqueued or its head changes, and the third consecutive unreadable pass
+dequeues. At most two entries leave the queue per repository and base per pass;
+the rest report `dequeue_deferred_cap:<sha>` and wait for the next pass. Each
+steward removal is recorded (`steward_dequeues`) and is not counted toward the
+head's `EJECTION_CAP` when the steward judges that head again, so withdrawing
+an entry it could not judge never costs an approved head its approval. The reviewer policy is read once
+per pass, strictly (`read_policy_required`: an absent config is an error, not
+"approval not required"). An armed request on an owned PR is disarmed
+unconditionally on every base (`auto_merge_disabled:<sha>`, audit
+`disable_auto_merge_owned_pr`), because the steward admits owned heads itself.
+Every withdrawal runs under the PR mutation guard on Shipyard's internal
+queue-mutation path, whose one-shot nonce the `ghapp` `queue-removal-guard`
+accepts; a plain `gh` disarm or dequeue is refused as an unaudited queue
+removal. A dry run reports `would_disarm_stale_auto_merge:<sha>` and
+`would_dequeue_unapproved:<sha>` and changes nothing. The `--arm-unqueued`
+backstop reads the policy just as strictly, so it never arms what the sweep
+would withdraw.
+The bound rule is satisfied only by a check run carrying that app id (the
+canonical `review-verdict` job, github-actions 15368); an app-less status of
+the same name never satisfies it. The canonical job fails unless the head is
+allowed, and the steward also requires the newest same-named commit status to
+be `success` when one exists: a refusing status makes the head `required_failed`
+(`review-verdict (commit status)`). `--arm-unqueued` reports `not applicable`
+on any base without a merge queue and arms nothing there.
+Apply mode is restricted by central mutation
 authority, durable write-ahead intent, and live revalidation immediately before
 every GitHub write. Transient retry limits are also fenced against GitHub's
 durable `run_attempt`, so losing a controller cache after an accepted rerun
@@ -3540,7 +3700,11 @@ result explicitly escalates, with classification used only for routing. A
 global lease, overall deadline, and pre/post policy-evidence witnesses prevent
 parallel calls and stale authorization. This phase cannot edit, rerun, enqueue,
 merge, or release; quota/provider failures become typed terminal failures
-rather than blocking unrelated stewardship.
+rather than blocking unrelated stewardship. Provider authentication and
+transport failures are recorded with distinct `provider_auth_failure` or
+`provider_transport_failure` classes; they remain fail-closed and are eligible
+for one future bounded alternate-provider attempt, but this phase never selects
+an alternate provider implicitly.
 See [references/merge-steward.md](references/merge-steward.md) for the config,
 schema, limits, and exact authority boundary.
 
@@ -3824,6 +3988,23 @@ everything.
 
 ### Log retention operations
 
+The bounded cause archive has an explicit `shipyard cause prune` path. It is
+dry-run by default and refuses to mutate an archive until an operator has
+enrolled that mutable operational copy with `--initialize`; frozen or
+unavailable archives remain readable and are never guessed at. On macOS,
+`scripts/install_cleanup.sh` can install the per-user launchd schedule for the
+existing dry-run/apply cleanup passes. Review the rendered plan before using
+`--install`; each run writes a bounded receipt and a failed pass remains
+visible to `shipyard doctor` until a later pass succeeds. This schedule never
+changes queue or GitHub state.
+
+Metrics cleanup uses the existing `SHIPYARD_METRICS_RETENTION_DAYS` policy
+(default 90; nonpositive disables pruning, not collection). It also expires
+queue shadow observations and terminal timing, preserving timing referenced by
+retained shadow rows and malformed timestamps. It never prunes merge receipts
+or operational queue/recovery state. Run `shipyard cleanup --apply` to apply;
+this is not automatic scheduling or a hard database-size cap.
+
 Run `shipyard cleanup` first: dry-run is the default and reports each planned
 `compress`/`delete`, every protected active/failure/audit directory, and the
 high/low byte-watermark projection. Apply with `shipyard cleanup --apply` only
@@ -3833,6 +4014,10 @@ do not raw-`touch` it while cleanup may run. Failure and unclassified legacy
 evidence is never pressure-deleted. Current Phase 1 rotation is lossless at
 writer reopen boundaries; do not use external `copytruncate` against active
 Shipyard writers. Full continuously-active writer rotation remains Phase 2.
+
+Metrics retention is bounded as well: raw runs and expired fleet-capacity
+samples are deleted in small SQLite transactions, and a metrics-store failure
+fails `cleanup` closed so scheduled receipts cannot report a false success.
 
 ## GraphQL And GitHub App Fallback Behaviour
 
@@ -4067,7 +4252,9 @@ only thing between it and re-arming a queued or ejected head. `src/auto_arm.rs`
 refuses every state the guard refuses (a unit test asserts that agreement), and
 `GHAPP_ALLOW_QUEUE_REARM` is never set by Shipyard. The periodic counterpart is
 `shipyard runner steward --arm-unqueued`, which arms only pull requests the
-steward declines to own. Under `--apply` it takes the central HOLD,
+steward declines to own, and only on a base with a merge queue (on any other
+base it reports `not applicable`: an armed request there survives a later
+push). Under `--apply` it takes the central HOLD,
 `mutation_machine` authority and control lock before arming (a HOLD is reported,
 not a failure), and each `--repo` mints its own token, so it runs from launchd's
 `$HOME`. See
@@ -5326,6 +5513,9 @@ has no value. Wasted compute per change counts every failed or cancelled job of
 the merged pull request, earlier pushes included; duplicate receipts for one
 head count once. Waste is matched by PR number, so
 merge-group runs are not counted, and it is not limited to the scorecard window.
+The producer handoff reader matches the legacy `project` key case-insensitively,
+because older metrics rows may preserve repository casing while current export
+normalizes it.
 
 ### Repeated-work cost
 
@@ -5334,6 +5524,10 @@ merge-group runs are not counted, and it is not limited to the scorecard window.
 timing table, bounded by `--since`, counted once per distinct superseded job
 with excluded and unmatched coverage visible. It never changes queue or merge
 authority.
+The baseline window must be positive: `--since 0d` and `--since=-1d`
+exit with invalid-input code 5. Timing joins require the case-sensitive `sy-`
+prefix and no slash or backslash, even when an excluded ID has a timing row.
+Excluded IDs remain observations with unknown duration, never zero runtime.
 
 ### Prospective baseline pass history
 
@@ -5350,6 +5544,21 @@ diagnostic remains retryable;
 authentication, schema, malformed-data, and receipt-handoff failures stay
 terminal. Use `--provider-retries` and
 `--provider-retry-delay-seconds` only to tune that explicit bounded policy.
+
+The separate baseline status file retains at most 14 days and 1,024 diagnostic
+observations by default. `--state-retention-days` and
+`--state-max-observations` accept positive integers to change those limits;
+raise both when retaining a longer, frequent collection history. Every status
+write trims expired/oldest observations after validating existing timestamps,
+including status-only writes. Malformed state refuses replacement. State
+identity and project/repository scope are checked before any provider
+import or pass-history write in either mode. Provider failures after valid
+preflight still record failed prospective passes. The legacy
+activity/collection counters describe retained observations, as labeled by
+`observation_retention.counter_scope`; they never establish readiness.
+Retention leaves the baseline start and authoritative pass history unchanged.
+Omitting `--collect` skips this collector's provider imports, not all built-in
+Shipyard telemetry.
 # Local Rust gate placement
 
 The pre-push hook selects the repository-pinned Rust channel on the current
@@ -5358,3 +5567,14 @@ formatting and lint gates; m1 is a fallback, not a universal gate. Local gates
 do not grant merge authority: GitHub CI, branch protection, and the configured
 Shipyard mutation machine remain authoritative.
 
+
+## Pulp feeder provenance recovery
+
+When the steward reports `ghapp: exact repository provenance is required`, this is a
+Shipyard invocation defect, not an empty queue or a GitHub authorization verdict.
+The steward must scope its GitHub client to the explicit repository so the
+authenticated `ghapp` wrapper receives `GH_REPO=OWNER/REPO`; do not add a
+`--repo` flag to native `gh api graphql`, which does not support that flag.
+Verify with a bounded
+`shipyard --json runner steward --repo OWNER/REPO --base main --arm-unqueued` dry run;
+an empty `prs` list with a repository error is failure, not a healthy idle feeder.

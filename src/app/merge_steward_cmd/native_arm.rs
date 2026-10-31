@@ -172,6 +172,23 @@ pub(super) fn apply_native_arm_backstop<A>(
     apply: bool,
     authorize: impl FnOnce() -> Result<A, ArmAuthorityRefusal>,
 ) -> (NativeArmRepoStatus, bool) {
+    if !observation.merge_queue {
+        // Without a merge queue an armed request is not consumed on enqueue:
+        // it survives a later push by anyone with write access and then
+        // merges a head nobody judged. A no-queue base is landed only by the
+        // steward's own exact-head merge, if at all.
+        return (
+            NativeArmRepoStatus {
+                policy: format!(
+                    "not applicable: {} has no merge queue on {}, and native auto-merge is \
+                     never armed on a no-queue base",
+                    observation.repo, observation.base
+                ),
+                results: Vec::new(),
+            },
+            false,
+        );
+    }
     if !observation.allow_auto_merge {
         return (
             NativeArmRepoStatus {
@@ -312,9 +329,16 @@ fn consider_candidate(
         environment.as_ref(),
     ) {
         ArmVerdict::Arm => {
-            match crate::head_approval::evaluate_excusing(
-                &run_gh, repo, number, &head_sha, base, &queue, excuse,
-            ) {
+            // The same strict read the steward's enqueue and stale-arm sweep
+            // use: an absent or unreadable base policy refuses the arm rather
+            // than defaulting to "approval not required".
+            match crate::head_approval::read_policy_required(&run_gh, repo, base)
+                .map_err(String::from)
+                .and_then(|policy| {
+                    crate::head_approval::evaluate_excusing_with_policy(
+                        &run_gh, repo, number, &head_sha, &policy, &queue, excuse,
+                    )
+                }) {
                 Ok(gate) if gate.allows() => {
                     match tier_verdict(&run_gh, repo, base, number, &head_sha) {
                         Ok(verdict) => verdict,

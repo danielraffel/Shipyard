@@ -51,6 +51,9 @@ pub(super) struct StewardCommandArgs {
     /// Also arm GitHub-native auto-merge on green, unqueued, unarmed pull
     /// requests the steward declines to own. See `native_arm`.
     pub(super) arm_unqueued: bool,
+    /// Required check that reports exact-head approval; with it required
+    /// and no merge queue, owned PRs are admitted by exact-head auto-merge.
+    pub(super) approval_context: String,
     pub(super) wake_owner: bool,
     pub(super) apply: bool,
     pub(super) ledger: Option<PathBuf>,
@@ -161,6 +164,14 @@ struct StewardLedger {
     audit: Vec<LedgerAudit>,
     #[serde(default)]
     wake_records: BTreeMap<String, String>,
+    /// Consecutive passes on which a queued head's approval, live state or
+    /// policy was unreadable, keyed `repo#pr:head`. See `unapproved_admission`.
+    #[serde(default)]
+    dequeue_unreadable: BTreeMap<String, u32>,
+    /// Queue removals the steward made itself, keyed `repo#pr:head`; they do
+    /// not count toward the head's ejection cap.
+    #[serde(default)]
+    steward_dequeues: BTreeMap<String, u32>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1381,6 +1392,7 @@ mod cancellation_recovery;
 mod cancellation_revalidation;
 mod cancellation_terminalization;
 mod capacity_cancellation;
+mod exact_head_merge;
 mod ledger;
 mod native_arm;
 mod observation;
@@ -1391,6 +1403,7 @@ mod render;
 mod resume_record;
 mod terminal_handoff;
 pub(super) mod train;
+mod unapproved_admission;
 
 use cancellation::{
     apply_repo_plan, cancellation_reason_label, queue_front_head, timestamp_old_enough,

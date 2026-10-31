@@ -91,6 +91,7 @@ fn required(reviewers: &[&str]) -> ApprovalPolicy {
         any_reviewer_but_author: false,
         human_reviewer_logins: Vec::new(),
         signers: None,
+        signer_identities: std::collections::BTreeMap::new(),
         rebase_carry: false,
         signer_source: super::SignerSource::Host,
         carry_excluded: None,
@@ -604,6 +605,7 @@ fn the_policy_is_read_from_the_auto_merge_table() {
             any_reviewer_but_author: false,
             human_reviewer_logins: Vec::new(),
             signers: None,
+            signer_identities: std::collections::BTreeMap::new(),
             rebase_carry: false,
             signer_source: super::SignerSource::Host,
             carry_excluded: None,
@@ -750,6 +752,31 @@ fn a_config_that_sets_the_key_decides_over_the_default() {
         let marker = [fleet("2026-10-12T01:00:00Z", &format!("reviewed: {HEAD}"))];
         assert!(!allows(&policy, &marker, None));
     }
+}
+
+/// A 404 is positive evidence that the base has no config; any other failure
+/// is an unread config. Callers that act on absence must tell them apart.
+#[test]
+fn the_required_read_types_absence_apart_from_an_unreadable_config() {
+    let missing =
+        |_: &[String]| -> Result<String, String> { Err("gh: Not Found (HTTP 404)".to_owned()) };
+    let broken =
+        |_: &[String]| -> Result<String, String> { Err("HTTP 502: Bad Gateway".to_owned()) };
+    let garbled = |_: &[String]| -> Result<String, String> { Ok("not = [toml".to_owned()) };
+    super::with_host_review_default(false, || {
+        assert!(matches!(
+            super::read_policy_required(&missing, "owner/repo", "main"),
+            Err(super::PolicyReadError::Absent(_))
+        ));
+        assert!(matches!(
+            super::read_policy_required(&broken, "owner/repo", "main"),
+            Err(super::PolicyReadError::Unreadable(_))
+        ));
+        assert!(matches!(
+            super::read_policy_required(&garbled, "owner/repo", "main"),
+            Err(super::PolicyReadError::Unreadable(_))
+        ));
+    });
 }
 
 #[test]
@@ -2746,6 +2773,39 @@ fn only_the_repository_side_rule_requires_a_stamp() {
             Some("it has no `ghapp` session stamp")
         );
     });
+}
+
+#[test]
+fn a_base_signer_identity_binding_rejects_wrong_host_or_agent() {
+    let table: toml::Table = "[auto_merge]\nreviewer_signers = [\"codex-review\"]\n\
+         [auto_merge.reviewer_signer_identities]\n\
+         codex-review = [\"Daniels-Mac-Studio-m3 agent:codex-reviewer\"]\n"
+        .parse()
+        .expect("toml");
+    let mut policy = ApprovalPolicy::from_table(&table);
+    policy.signer_source = super::SignerSource::Base;
+    let head = "a".repeat(40);
+    for (stamp, allowed) in [
+        (
+            "<!-- session: Daniels-Mac-Studio-m3/rotating agent: codex-reviewer -->",
+            true,
+        ),
+        (
+            "<!-- session: Daniels-M5-Studio/rotating agent: codex-reviewer -->",
+            false,
+        ),
+        ("<!-- session: Daniels-Mac-Studio-m3/rotating -->", false),
+    ] {
+        let comment = fleet(
+            "2026-10-18T23:33:31Z",
+            &format!("reviewer: codex-review\n{stamp}\nverdict: APPROVE head:{head}"),
+        );
+        assert_eq!(
+            super::app_approval_refusal(&comment, &policy).is_none(),
+            allowed,
+            "{stamp}"
+        );
+    }
 }
 
 /// Every line boundary Python's `str.splitlines` knows ends a verdict line
