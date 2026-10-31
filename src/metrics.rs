@@ -5065,6 +5065,9 @@ mod tests {
             unknown_samples: usize::from(status == "partial"),
             host_target_count: 1,
             eligible_slot_hours,
+            freshness_status: "fresh".to_owned(),
+            freshness_reason: String::new(),
+            latest_valid_until: None,
         }
     }
 

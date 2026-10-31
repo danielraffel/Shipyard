@@ -593,6 +593,8 @@ class BaselineStateRetentionTests(unittest.TestCase):
         summary = store.summarize(self.started, observed)
         card = {
             "instrumentation_coverage": {"status": "available", "continuous": True, "continuous_days": 5},
+            "fleet_capacity": {"freshness_status": "fresh", "status": "available",
+                                "eligible_slot_hours": 1.0},
             "important_lanes": {"lane": {"status": "available", "completed_jobs": 30}},
             "host_generations": {"host": {"status": "available", "completed_jobs": 10}},
             "strata": {name: {"provenance": "authenticated", "coverage": "complete"}
