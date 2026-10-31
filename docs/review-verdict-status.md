@@ -67,6 +67,20 @@ fork pushing an approved commit). The status is `success` only when the guard
 allows the head for every open pull request whose head it is
 (`commits/{sha}/pulls`).
 
+## The job is the check
+
+The job is also the `review-verdict` check run, and it exits non-zero unless
+the head is allowed, so a required `review-verdict` check cannot be green on a
+refused, held or unapproved head. A read or post error fails the job too (it
+never passes by default). The commit status is posted exactly as before.
+
+Only the `pull_request_target` run leaves its check run on the pull request's
+head; a comment's (`issue_comment`) or a review's (`workflow_run`) run leaves
+its check run on the default branch's tip, where it gates nothing. Those runs
+post the status and then re-run the head's newest `pull_request_target` run
+(`actions: write`), so an APPROVE or a HOLD changes the head's check without a
+new push. A re-run that cannot be requested fails the job.
+
 ## Trust
 
 Every trigger runs the default branch's definition of the poster:
@@ -147,6 +161,7 @@ permissions:
   contents: read
   pull-requests: read
   statuses: write
+  actions: write
 
 concurrency:
   group: review-verdict-${{ github.event.pull_request.number || github.event.issue.number || github.event.workflow_run.pull_requests[0].number || github.event.workflow_run.head_sha }}
