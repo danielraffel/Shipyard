@@ -22,8 +22,13 @@
 //! | `queue_stuck` | the pull request has sat in the merge queue for `queue_stuck_after` |
 //! | `approved_unarmed` | the latest verdict on the head approves it, for `approved_unarmed_after`, and nothing armed or queued it |
 //! | `approved_blocked` | the head is approved but GitHub reports it `DIRTY` or `BEHIND` (live passes only: GitHub keeps no history of it) |
+//! | `held_unrepaired` | the latest trusted verdict on the current head is HOLD, no new head followed it, and it is older than `held_after` |
+//! | `owner_decision` / `superseded` / `parked` | the pull request carries the `owner-decision`, `superseded` or `PARKED/*` label; it is reported under that state and skipped by every stall rule |
 //! | `host_alarm` | an alarm issue (a tartci `[tartci] ...` issue) was opened |
 //! | anything else | an input event (`--input-events`), passed through under its own key |
+//!
+//! Every event carries `age_secs` and `age`: how long the condition had held
+//! when it was reported (`at - since`), where the data says when it began.
 //!
 //! Nothing here writes to GitHub.
 
@@ -183,6 +188,8 @@ pub struct RuleConfig {
     pub queue_stuck_after: Duration,
     /// An approved head nobody armed is reported after this long.
     pub approved_unarmed_after: Duration,
+    /// A HOLD on the current head nobody repaired is reported after this long.
+    pub held_after: Duration,
     /// The reviewer to route each repository's heads to, by `OWNER/REPO`
     /// (lower-cased); a fix names it.
     pub reviewers: BTreeMap<String, String>,
@@ -202,6 +209,7 @@ impl Default for RuleConfig {
             head_unreviewed_after: None,
             queue_stuck_after: Duration::minutes(90),
             approved_unarmed_after: Duration::minutes(15),
+            held_after: Duration::minutes(60),
             reviewers: BTreeMap::new(),
         }
     }
@@ -221,6 +229,13 @@ pub struct RuleEvent {
     /// When the condition began, where the data says.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub since: Option<DateTime<Utc>>,
+    /// Seconds from `since` to `at`: how long the condition had held when it
+    /// was reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub age_secs: Option<i64>,
+    /// `age_secs` as `1h05m`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub age: Option<String>,
     /// Repository.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
@@ -364,6 +379,8 @@ impl Emit<'_> {
             key,
             at: self.at,
             since,
+            age_secs: None,
+            age: None,
             repo: Some(self.repo.to_owned()),
             pr: Some(pr.number),
             head: head.map(str::to_owned),
@@ -436,20 +453,7 @@ pub fn evaluate(
         if alarm.opened_at > at {
             continue;
         }
-        out.push(RuleEvent {
-            schema: EVENT_SCHEMA.to_owned(),
-            kind: "host_alarm".to_owned(),
-            key: format!("host_alarm:{}#{}", alarm.repo, alarm.number),
-            at,
-            since: Some(alarm.opened_at),
-            repo: Some(alarm.repo.clone()),
-            pr: None,
-            head: None,
-            summary: format!("{}#{}: {}", alarm.repo, alarm.number, alarm.title),
-            detail: json!({"issue": alarm.number, "title": alarm.title,
-                           "closed_at": alarm.closed_at.map(stamp)}),
-            fix: fix::host_alarm(alarm),
-        });
+        out.push(alarm_event(alarm, at));
     }
     for event in &input.inputs {
         if event.at > at {
@@ -466,6 +470,8 @@ pub fn evaluate(
             key: format!("input:{}", event.key),
             at,
             since: Some(event.at),
+            age_secs: None,
+            age: None,
             repo: event
                 .rest
                 .get("repo")
@@ -478,7 +484,61 @@ pub fn evaluate(
             fix: fix::from_input(&event.kind, &event.key, &event.rest),
         });
     }
+    stamp_ages(&mut out);
     out
+}
+
+fn alarm_event(alarm: &Alarm, at: DateTime<Utc>) -> RuleEvent {
+    RuleEvent {
+        schema: EVENT_SCHEMA.to_owned(),
+        kind: "host_alarm".to_owned(),
+        key: format!("host_alarm:{}#{}", alarm.repo, alarm.number),
+        at,
+        since: Some(alarm.opened_at),
+        age_secs: None,
+        age: None,
+        repo: Some(alarm.repo.clone()),
+        pr: None,
+        head: None,
+        summary: format!("{}#{}: {}", alarm.repo, alarm.number, alarm.title),
+        detail: json!({"issue": alarm.number, "title": alarm.title,
+                           "closed_at": alarm.closed_at.map(stamp)}),
+        fix: fix::host_alarm(alarm),
+    }
+}
+
+fn stamp_ages(events: &mut [RuleEvent]) {
+    for event in events {
+        if let Some(since) = event.since {
+            let secs = (event.at - since).num_seconds().max(0);
+            event.age_secs = Some(secs);
+            event.age = Some(age_text(secs));
+        }
+    }
+}
+
+/// `75` seconds as `1m`, `3900` as `1h05m`, `100000` as `1d03h`.
+fn age_text(secs: i64) -> String {
+    let minutes = secs / 60;
+    match minutes {
+        m if m >= 1440 => format!("{}d{:02}h", m / 1440, (m % 1440) / 60),
+        m if m >= 60 => format!("{}h{:02}m", m / 60, m % 60),
+        m => format!("{m}m"),
+    }
+}
+
+/// The state a label puts a pull request in, if any: owner decision first,
+/// then superseded, then parked.
+fn label_state(labels: &[String]) -> Option<(&'static str, &str)> {
+    let find =
+        |matches: &dyn Fn(&str) -> bool| labels.iter().map(String::as_str).find(|l| matches(l));
+    if let Some(label) = find(&|l| l.eq_ignore_ascii_case("owner-decision")) {
+        return Some(("owner_decision", label));
+    }
+    if let Some(label) = find(&|l| l.eq_ignore_ascii_case("superseded")) {
+        return Some(("superseded", label));
+    }
+    find(&|l| l.len() >= 7 && l[..7].eq_ignore_ascii_case("PARKED/")).map(|l| ("parked", l))
 }
 
 fn evaluate_pr(
@@ -494,10 +554,29 @@ fn evaluate_pr(
     if !open_at(pr, emit.at) {
         return;
     }
-    removal_events(emit, history, pr);
     let Some(head) = head_at(pr, emit.at) else {
+        removal_events(emit, history, pr);
         return;
     };
+    // GitHub keeps no label history: the age of a labelled state is the age of
+    // the current head, the nearest start the data has.
+    if let Some((kind, label)) = label_state(&pr.labels) {
+        emit.push(
+            kind,
+            format!("{kind}:{}#{}@{}", history.repo, pr.number, head.sha),
+            Some(head.first_seen_at),
+            pr,
+            Some(&head.sha),
+            &format!(
+                "labelled {label}; not a stall, so no stall rule reports it ({})",
+                short(&head.sha)
+            ),
+            json!({"label": label, "age_basis": "head_first_seen"}),
+            fix::labelled(&history.repo, pr, &head.sha, kind, label),
+        );
+        return;
+    }
+    removal_events(emit, history, pr);
     let state = pr_state(pr, emit.at);
     let view = HeadView {
         history,
@@ -511,6 +590,36 @@ fn evaluate_pr(
     check_events(emit, &view);
     queue_events(emit, &view, &state, config);
     approval_events(emit, &view, config, live);
+    held_events(emit, &view, config);
+}
+
+fn held_events(emit: &mut Emit<'_>, view: &HeadView<'_>, config: &RuleConfig) {
+    // An armed or queued head with a HOLD is `armed_unapproved`'s.
+    let Some(hold) = view.verdict.filter(|entry| {
+        entry
+            .verdict
+            .as_ref()
+            .is_some_and(|verdict| !verdict.approve)
+    }) else {
+        return;
+    };
+    if view.in_flight || view.pr.draft || hold.at + config.held_after > emit.at {
+        return;
+    }
+    emit.push(
+        "held_unrepaired",
+        view.key("held_unrepaired"),
+        Some(hold.at),
+        view.pr,
+        Some(view.sha()),
+        &format!(
+            "head {} was put on HOLD by {} and nothing was pushed since",
+            short(view.sha()),
+            hold.login
+        ),
+        json!({"held_by": hold.login, "hold_comment": hold.id}),
+        fix::held_unrepaired(&view.history.repo, view.pr, view.sha(), hold),
+    );
 }
 
 /// One open pull request's current head, with what the rules read about it.

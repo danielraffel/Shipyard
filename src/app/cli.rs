@@ -1884,6 +1884,10 @@ pub(crate) struct PrWatchRulesSource {
     /// An approved head nobody armed is reported after this long.
     #[arg(long = "approved-unarmed-after", default_value = "15m")]
     pub(crate) approved_unarmed_after: String,
+    /// A HOLD on the current head that nothing was pushed to answer is
+    /// reported after this long.
+    #[arg(long = "held-after", default_value = "60m")]
+    pub(crate) held_after: String,
     /// `OWNER/REPO=NAME`: the reviewer a head of that repository is routed
     /// to; each event's `fix` names it. Repeatable.
     #[arg(long = "reviewer")]

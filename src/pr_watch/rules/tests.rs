@@ -877,3 +877,107 @@ fn a_second_recorder_in_the_same_directory_keeps_the_first_ones_answers() {
         Ok("[]".to_owned())
     );
 }
+
+fn hold_trail(at: i64) -> Vec<TrailEntry> {
+    vec![comment(
+        1,
+        at,
+        &format!("Findings.\n\nverdict: HOLD head:{HEAD}"),
+    )]
+}
+
+#[test]
+fn a_hold_nobody_repaired_is_reported_after_held_after_with_its_age() {
+    let watch = input(pr(Vec::new(), Vec::new()), hold_trail(10));
+    assert!(
+        !holding(&watch, 60).contains("held_unrepaired"),
+        "inside 60m"
+    );
+    let events = evaluate(&watch, t(100), &RuleConfig::default(), false);
+    let event = events
+        .iter()
+        .find(|event| event.kind == "held_unrepaired")
+        .expect("held");
+    assert_eq!(event.since, Some(t(10)));
+    assert_eq!(event.age_secs, Some(90 * 60));
+    assert_eq!(event.age.as_deref(), Some("1h30m"));
+    assert!(!event.fix.safe_to_auto_apply);
+    let config = RuleConfig {
+        held_after: Duration::minutes(10),
+        ..RuleConfig::default()
+    };
+    assert!(kinds(&evaluate(&watch, t(30), &config, false)).contains("held_unrepaired"));
+}
+
+#[test]
+fn a_hold_is_not_unrepaired_once_a_new_head_or_an_approval_follows() {
+    // Control: the same HOLD on the current head reports.
+    assert!(
+        holding(&input(pr(Vec::new(), Vec::new()), hold_trail(10)), 100)
+            .contains("held_unrepaired")
+    );
+    // A newer approval of the same head supersedes the HOLD.
+    let mut trail = hold_trail(10);
+    trail.push(comment(2, 30, &format!("verdict: APPROVE head:{HEAD}")));
+    assert!(!holding(&input(pr(Vec::new(), Vec::new()), trail), 100).contains("held_unrepaired"));
+    // A push after the HOLD: the verdict names a head that is no longer current.
+    let mut pushed = pr(Vec::new(), Vec::new());
+    pushed.head_sha = OLD.to_owned();
+    pushed.heads[0].sha = HEAD.to_owned();
+    pushed.heads[0].first_seen_at = t(-120);
+    pushed.heads[1].sha = OLD.to_owned();
+    pushed.heads[1].first_seen_at = t(50);
+    assert!(!holding(&input(pushed, hold_trail(10)), 100).contains("held_unrepaired"));
+    // Armed heads are armed_unapproved's, not reported twice.
+    let armed = pr(vec![(20, QueueEventKind::Armed)], Vec::new());
+    let both = holding(&input(armed, hold_trail(10)), 100);
+    assert!(both.contains("armed_unapproved"));
+    assert!(!both.contains("held_unrepaired"));
+}
+
+#[test]
+fn labelled_pull_requests_get_their_own_state_and_no_stall_rule() {
+    for (label, state) in [
+        ("owner-decision", "owner_decision"),
+        ("Superseded", "superseded"),
+        ("PARKED/waiting-on-vendor", "parked"),
+    ] {
+        let mut labelled = pr(vec![(20, QueueEventKind::Armed)], Vec::new());
+        labelled.labels = vec!["bug".to_owned(), label.to_owned()];
+        let watch = input(labelled, hold_trail(10));
+        let events = evaluate(&watch, t(100), &RuleConfig::default(), false);
+        let seen = kinds(&events);
+        assert!(seen.contains(state), "{label}: {seen:?}");
+        for stall in ["held_unrepaired", "armed_unapproved", "queue_stuck"] {
+            assert!(!seen.contains(stall), "{label}: {stall}");
+        }
+        let event = events.iter().find(|event| event.kind == state).unwrap();
+        assert_eq!(event.age_secs, Some(100 * 60), "age is the head's");
+        assert_eq!(event.detail["age_basis"], "head_first_seen");
+    }
+    // Control: near-miss labels do not set the pull request aside.
+    let mut plain = pr(Vec::new(), Vec::new());
+    plain.labels = vec!["parked".to_owned(), "owner-decisions".to_owned()];
+    let seen = holding(&input(plain, hold_trail(10)), 100);
+    assert!(seen.contains("held_unrepaired"));
+    assert!(!seen.contains("parked") && !seen.contains("owner_decision"));
+}
+
+#[test]
+fn every_event_with_a_since_carries_its_age() {
+    let watch = input(
+        pr(Vec::new(), Vec::new()),
+        vec![comment(1, 20, &format!("verdict: APPROVE head:{HEAD}"))],
+    );
+    let events = evaluate(&watch, t(40), &RuleConfig::default(), false);
+    assert!(!events.is_empty());
+    for event in &events {
+        let since = event.since.expect("since");
+        assert_eq!(
+            event.age_secs,
+            Some((t(40) - since).num_seconds()),
+            "{event:?}"
+        );
+        assert!(event.age.is_some());
+    }
+}

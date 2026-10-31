@@ -1070,12 +1070,13 @@ remain fail-closed.
 `shipyard pr-watch rules` is the rules-first watcher: one JSONL event per new
 condition (READY or new head unreviewed, verdict to route, armed or queued
 without an approval of the head, red required check naming its failing tests,
-failed merge group, queue removal or stall, approved but unarmed, tartci host
-alarm, or a line from `--input-events`), each once per key, so a quiet pass
+failed merge group, queue removal or stall, approved but unarmed, a HOLD nobody
+repaired (`--held-after`), a PR labelled `owner-decision`/`superseded`/`PARKED/*`
+(own state, skipped by the stall rules), tartci host alarm, or a line from `--input-events`), each once per key, so a quiet pass
 prints nothing. Its first pass with no ledger only records what already holds.
 `rules-replay` runs the same rules over a past window. Failing-test names come
 from CTest, Python unittest (`FAIL:`/`ERROR:` with a dotted location) and
-`cargo test` lines. Every event carries a `fix` (what, evidence URL, cause,
+`cargo test` lines. Every event carries `age_secs`/`age` and a `fix` (what, evidence URL, cause,
 command, safe_to_auto_apply, verify); `--reviewer OWNER/REPO=NAME` names who a
 head routes to. A live pass prints its reads, checks the App budget first and
 backs off (exit 75) under `--min-rate-remaining`, and re-reads a pull
