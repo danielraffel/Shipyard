@@ -245,6 +245,28 @@ def _is_untrusted_sandbox_canary(
     )
 
 
+VALID_FOCUS = ("macos", "all")
+# Platforms kept when the focus is `macos`. linux-x64 stays in the release set
+# because other repositories install the Shipyard linux-x64 binary on
+# ubuntu-latest, and linux-arm64 because install.sh and the Linux ARM VMs
+# consume it. Only windows-x64 is dropped.
+MACOS_FOCUS_TARGETS = {
+    "ci": frozenset({"macos-arm64"}),
+    "release": frozenset({"macos-arm64", "linux", "linux-arm64"}),
+}
+
+
+def platform_focus(env: Mapping[str, str]) -> str:
+    """`macos` (default) or `all`, from the CI_PLATFORM_FOCUS repo variable or
+    an explicit workflow_dispatch input, passed in as PLATFORM_FOCUS."""
+    focus = _env(env, "PLATFORM_FOCUS").lower() or "macos"
+    if focus not in VALID_FOCUS:
+        raise SystemExit(
+            f"Unsupported platform focus {focus!r}; expected one of {', '.join(VALID_FOCUS)}."
+        )
+    return focus
+
+
 def workflow_matrix(workflow: str, env: Mapping[str, str] = os.environ) -> dict[str, list[dict[str, str]]]:
     try:
         target_keys = WORKFLOW_TARGETS[workflow]
@@ -252,7 +274,11 @@ def workflow_matrix(workflow: str, env: Mapping[str, str] = os.environ) -> dict[
         raise SystemExit(f"Unsupported workflow {workflow!r}") from exc
 
     rows = []
+    focus_keep = MACOS_FOCUS_TARGETS.get(workflow)
+    focus = platform_focus(env)
     for target_key in target_keys:
+        if focus == "macos" and focus_keep is not None and target_key not in focus_keep:
+            continue
         row = resolve_runs_on(target_key, env)
         if row["provider"] == SKIPPED_PROVIDER:
             continue
@@ -279,7 +305,10 @@ def workflow_matrix(workflow: str, env: Mapping[str, str] = os.environ) -> dict[
 
 
 def workflow_outputs(workflow: str, env: Mapping[str, str] = os.environ) -> dict[str, str]:
-    outputs = {"matrix_json": json.dumps(workflow_matrix(workflow, env), separators=(",", ":"))}
+    outputs = {
+        "matrix_json": json.dumps(workflow_matrix(workflow, env), separators=(",", ":")),
+        "platform_focus": platform_focus(env),
+    }
     for target_key in TARGETS:
         row = resolve_runs_on(target_key, env)
         output_key = target_key.replace("-", "_")
