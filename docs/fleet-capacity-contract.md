@@ -17,6 +17,12 @@ bad digests, mismatched slot counts, future timestamps, and intervals longer
 than one hour. Historical observations remain importable for backfills.
 Re-importing a valid `sample_id` is idempotent.
 
+The interval reducer in TartCI emits the separate `tartci.capacity-interval/v1`
+schema. Its interval envelope is useful for offline coverage analysis, but it
+does not carry the host boot, generation, profile, and digest bindings required
+by this importer. Passing an interval record to `metrics import fleet-capacity`
+is rejected; use the `tartci fleet capacity` producer for this contract.
+
 For a verified sample, `eligible_slots = free_slots + occupied_slots +
 in_flight_slots` and `configured_slots = eligible_slots + unknown_slots`.
 Unknown samples set all four capacity optionals to null and
@@ -49,3 +55,14 @@ overstated;
 unknown capacity is never treated as zero or silently omitted.
 The scorecard binds the numerator to safe merges on the measured protected
 `main` branch, matching the baseline collector's merge-receipt health gate.
+
+The scorecard also reports `freshness_status`, `latest_valid_until`, and
+`freshness_reason`. Historical coverage can remain measurable after the latest
+receipt expires, but `freshness_status` is then `stale`; no receipt is current
+unless its producer validity interval extends strictly past the scorecard check
+time. A validity interval alone is not enough: freshness is `unavailable` when
+the current evidence has no verified positive eligible slot-hours (for example,
+when it contains only unknown observations or a zero-capacity result).
+Baseline readiness requires `freshness_status = "fresh"`, an available
+denominator, and positive `eligible_slot_hours`; missing, unusable, or expired
+capacity evidence is reported as unavailable.
