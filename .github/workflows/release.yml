@@ -339,6 +339,11 @@ jobs:
     # job withheld publication after a transient smoke failure.
     if: always() && startsWith(github.ref, 'refs/tags/v') && vars.CI_MACOS_SIGNING_ENABLED == 'true'
     runs-on: ${{ fromJSON(needs.resolve-runners.outputs.macos_arm64_runs_on_json) }}
+    # Release secrets live in the `release` environment, which only main and
+    # release tags can use.
+    environment:
+      name: release
+      deployment: false
     # Uploads the DMG and publishes the release (contents) after attesting it.
     permissions:
       attestations: write

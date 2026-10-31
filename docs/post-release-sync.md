@@ -63,6 +63,10 @@ max_push_attempts    = 5
 # Shipyard repository). When omitted, hook install pins the version of the
 # CLI doing the rendering.
 # workflow_shipyard_version = "v0.127.2"
+# Optional: GitHub environment that holds RELEASE_BOT_TOKEN. Limit its
+# deployment branches and tags to `main` and the release tag pattern so a
+# workflow on any other branch cannot read the token.
+# environment = "release"
 
 [release.post_tag_hook.bot_identity]
 name  = "shipyard-release-bot"
