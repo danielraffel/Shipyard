@@ -94,9 +94,13 @@ class MergeReceiptHandoffTests(unittest.TestCase):
             connection.execute("INSERT INTO merge_receipts VALUES (?, ?, ?, ?)", ("owner/repo", project, "main", imported_at))
             connection.commit()
 
-    def fake_shipyard(self, directory: pathlib.Path, output: pathlib.Path, *, fail: bool = False, malformed: bool = False) -> pathlib.Path:
+    def fake_shipyard(self, directory: pathlib.Path, output: pathlib.Path, *, fail: bool = False, malformed: bool = False, broken: bool = False) -> pathlib.Path:
         directory.mkdir(parents=True, exist_ok=True)
         executable = directory / "shipyard"
+        if broken:
+            executable.write_text("#!/definitely/missing/interpreter\n")
+            executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+            return executable
         body = "#!/bin/sh\n"
         if fail:
             body += "echo export failed >&2\nexit 7\n"
@@ -302,6 +306,21 @@ class MergeReceiptHandoffTests(unittest.TestCase):
             self.assertEqual(handoff.read_text(), "previous\n")
             self.assertEqual(json.loads(health.read_text())["status"], "error")
 
+    def test_preflight_failure_marks_health_when_source_has_no_target_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            shipyard = self.fake_shipyard(root, root / "handoff.jsonl")
+            handoff = root / "handoff.jsonl"
+            health = root / "handoff.health.json"
+            self.producer_db(root)
+            result = self.invoke("export", "--shipyard", str(shipyard), "--state-dir", str(root / "state"),
+                                 "--repo", "other/repo", "--file", str(handoff), "--health-file", str(health))
+            self.assertNotEqual(result.returncode, 0)
+            value = json.loads(health.read_text())
+            self.assertEqual(value["status"], "error")
+            self.assertIn("no imported_at", value["error"])
+            self.assertFalse(handoff.exists())
+
     def test_malformed_staged_export_preserves_previous_payload_and_health(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = pathlib.Path(temp)
@@ -310,11 +329,28 @@ class MergeReceiptHandoffTests(unittest.TestCase):
             handoff.write_text(json.dumps(receipt()) + "\n")
             health.write_text("previous-health\n")
             shipyard = self.fake_shipyard(root, handoff, malformed=True)
+            self.producer_db(root)
             result = self.invoke("export", "--shipyard", str(shipyard), "--state-dir", str(root / "state"),
                                  "--repo", "owner/repo", "--file", str(handoff), "--health-file", str(health))
             self.assertNotEqual(result.returncode, 0)
+            self.assertIn("not JSON", result.stderr)
             self.assertEqual(json.loads(handoff.read_text())["receipt_id"], "r-1")
             self.assertEqual(health.read_text(), "previous-health\n")
+
+    def test_export_oserror_marks_health_and_preserves_previous_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            handoff = root / "handoff.jsonl"
+            health = root / "handoff.health.json"
+            handoff.write_text("previous\n")
+            health.write_text(json.dumps(self.health(handoff)))
+            shipyard = self.fake_shipyard(root, handoff, broken=True)
+            self.producer_db(root)
+            result = self.invoke("export", "--shipyard", str(shipyard), "--state-dir", str(root / "state"),
+                                 "--repo", "owner/repo", "--file", str(handoff), "--health-file", str(health))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("No such file", json.loads(health.read_text())["error"])
+            self.assertEqual(handoff.read_text(), "previous\n")
 
     def test_check_reports_fresh_then_stale(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

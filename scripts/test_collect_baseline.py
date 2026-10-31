@@ -802,6 +802,11 @@ class CollectorInvocationTests(unittest.TestCase):
             self.assertIn("handoff", receipt["reason"])
             self.assertEqual(events[-1]["source"], "collection")
 
+    def test_run_converts_provider_timeout_to_a_bounded_error(self):
+        with mock.patch.object(MOD.subprocess, "run", side_effect=subprocess.TimeoutExpired(["shipyard"], 5)):
+            with self.assertRaisesRegex(RuntimeError, "command timed out after 5s: shipyard"):
+                MOD.run(["shipyard"], timeout=5)
+
     def test_collect_deduplicates_unavailable_event_from_newer_supervisor(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory); db = root / "metrics" / "metrics.db"; db.parent.mkdir()
@@ -816,6 +821,27 @@ class CollectorInvocationTests(unittest.TestCase):
                 events = MOD.import_organic(args)
             self.assertEqual(sum(event.get("source") == "merge-receipt" for event in events), 1)
             self.assertEqual(events[-1]["reason"], "wrapper")
+
+    def test_collect_keeps_only_newest_duplicate_handoff_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); db = root / "metrics" / "metrics.db"; db.parent.mkdir()
+            args = type("Args", (), {"db": db, "state": root / "state.json", "project": "p",
+                "repo": "o/p", "merge_receipts": root / "missing-receipts.jsonl"})()
+            args.state.write_text("{}")
+            newest = {"source": "merge-receipt", "status": "unavailable",
+                      "reason": "fresh authenticated producer handoff is unavailable",
+                      "producer": {"identity": "shipyard"}}
+            provider_events = [
+                {"source": "github", "imported": 1},
+                {"source": "merge-receipt", "status": "unavailable", "reason": "older"},
+                {"source": "collection", "status": "completed"},
+                newest,
+            ]
+            with mock.patch.object(MOD, "_import_organic_after_preflight", return_value=provider_events):
+                events = MOD.import_organic(args)
+            receipts = [event for event in events if event.get("source") == "merge-receipt"]
+            self.assertEqual(receipts, [newest])
+            self.assertEqual(events[-1], newest)
 
     def test_collect_does_not_treat_dangling_merge_receipt_link_as_absent(self):
         with tempfile.TemporaryDirectory() as directory:

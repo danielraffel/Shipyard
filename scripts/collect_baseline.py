@@ -181,6 +181,14 @@ def import_organic(args: argparse.Namespace) -> list[dict[str, Any]]:
             if not any(event.get("source") == "merge-receipt" for event in events):
                 events.append({"source": "merge-receipt", "status": "unavailable",
                                "reason": "producer handoff not present"})
+            else:
+                # A staged rollout can expose more than one unavailable marker.
+                # Keep only the newest as the authoritative status, preserving
+                # its reason and any authenticated provenance fields.
+                newest = max(i for i, event in enumerate(events)
+                             if event.get("source") == "merge-receipt")
+                events = [event for i, event in enumerate(events)
+                          if event.get("source") != "merge-receipt" or i == newest]
             return events
         except OSError as exc:
             raise RuntimeError(f"merge receipt handoff is unreadable: {exc}") from exc
