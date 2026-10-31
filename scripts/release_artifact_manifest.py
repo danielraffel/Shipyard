@@ -12,11 +12,21 @@ import argparse
 import hashlib
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
 
 SCHEMA_VERSION = 1
+
+# Release metadata is derived from the binaries, so it cannot carry its own
+# identity: checksums.sha256 lists the manifest's digest and the manifest would
+# have to list the checksum file's.  Each per-target package directory also has
+# its own checksums.sha256, which is never published (the release job writes one
+# combined file).  None of these names belong in an identity manifest.
+RELEASE_METADATA_FILES = frozenset(
+    {"checksums.sha256", "release-manifest.json", "shipyard-release-manifest.json"}
+)
 
 
 def sha256(path: Path) -> str:
@@ -43,7 +53,7 @@ def write_manifest(args: argparse.Namespace) -> None:
         raise SystemExit(f"artifact root does not exist: {root}")
     files = []
     for path in sorted(root.iterdir()):
-        if not path.is_file() or path.name == "release-manifest.json":
+        if not path.is_file() or path.name in RELEASE_METADATA_FILES:
             continue
         files.append(
             {"name": path.name, "bytes": path.stat().st_size, "sha256": sha256(path)}
@@ -112,6 +122,64 @@ def verify_manifest(
     return document
 
 
+def _describe(entry: dict[str, Any], target: object) -> str:
+    return f"{target}: {entry.get('bytes')} bytes sha256={entry.get('sha256')}"
+
+
+def normalize_release_files(artifacts: list[Any]) -> list[str]:
+    """Make the file entries across ``artifacts`` name each asset at most once.
+
+    Mutates ``artifacts`` in place: release metadata entries are dropped and an
+    entry that repeats an earlier one byte-for-byte is collapsed, so writing the
+    same artifact into a release twice converges instead of accumulating.  Two
+    entries that name one asset with different contents cannot both describe
+    the bytes GitHub serves, so that raises and lists every conflicting entry.
+    Returns a human-readable note per entry it removed.
+    """
+    notes: list[str] = []
+    seen: dict[str, tuple[dict[str, Any], object]] = {}
+    conflicts: dict[str, list[str]] = {}
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            raise SystemExit("release identity manifest has a malformed artifact")
+        files = artifact.get("files", [])
+        if not isinstance(files, list):
+            raise SystemExit("release identity manifest has a malformed file list")
+        target = artifact.get("target")
+        kept = []
+        for entry in files:
+            if not isinstance(entry, dict):
+                raise SystemExit("release identity manifest has a malformed file")
+            name = entry.get("name")
+            if name in RELEASE_METADATA_FILES:
+                notes.append(f"dropped release metadata entry {name} ({_describe(entry, target)})")
+                continue
+            if not isinstance(name, str):
+                kept.append(entry)
+                continue
+            previous = seen.get(name)
+            if previous is None:
+                seen[name] = (entry, target)
+                kept.append(entry)
+                continue
+            first, first_target = previous
+            if (first.get("bytes"), first.get("sha256")) == (entry.get("bytes"), entry.get("sha256")):
+                notes.append(f"collapsed identical repeat of {name} ({target} repeats {first_target})")
+                continue
+            conflicts.setdefault(name, [_describe(first, first_target)]).append(_describe(entry, target))
+            kept.append(entry)
+        artifact["files"] = kept
+    if conflicts:
+        lines = [
+            f"  {name}: " + " | ".join(entries) for name, entries in sorted(conflicts.items())
+        ]
+        raise SystemExit(
+            "release identity manifest lists conflicting contents for the same asset:\n"
+            + "\n".join(lines)
+        )
+    return notes
+
+
 def aggregate(args: argparse.Namespace) -> None:
     source = _source(args)
     records = []
@@ -150,6 +218,8 @@ def aggregate(args: argparse.Namespace) -> None:
         records.append(artifact)
     if not records:
         raise SystemExit("no release artifact manifests found")
+    for note in normalize_release_files(records):
+        print(f"release manifest: {note}", file=sys.stderr)
     args.output.write_text(
         json.dumps({"schema_version": SCHEMA_VERSION, "source": source, "artifacts": records}, indent=2, sort_keys=True)
         + "\n",

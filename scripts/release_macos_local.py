@@ -409,8 +409,10 @@ def verify_release_identity_manifest(
         or source.get("commit") != expected_commit
     ):
         raise SystemExit("release identity manifest does not match this tag and commit")
-    manifest_files: dict[str, dict[str, object]] = {}
-    for artifact in document.get("artifacts", []):
+    artifacts = document.get("artifacts", [])
+    if not isinstance(artifacts, list):
+        raise SystemExit("release identity manifest has malformed artifacts")
+    for artifact in artifacts:
         if not isinstance(artifact, dict):
             raise SystemExit("release identity manifest has a malformed artifact")
         for entry in artifact.get("files", []):
@@ -429,9 +431,15 @@ def verify_release_identity_manifest(
                 or any(character not in "0123456789abcdef" for character in digest)
             ):
                 raise SystemExit("release identity manifest has an invalid file entry")
-            if name in manifest_files:
-                raise SystemExit(f"release identity manifest repeats asset: {name}")
-            manifest_files[name] = {"bytes": size, "sha256": digest}
+    # Metadata entries are skipped and identical repeats collapsed; entries
+    # that disagree about one asset fail here with each conflicting entry named.
+    for note in release_artifact_manifest.normalize_release_files(artifacts):
+        print(f"release identity manifest: {note}", file=sys.stderr)
+    manifest_files: dict[str, dict[str, object]] = {
+        entry["name"]: {"bytes": entry["bytes"], "sha256": entry["sha256"]}
+        for artifact in artifacts
+        for entry in artifact.get("files", [])
+    }
     required = set(expected_assets) - {"checksums.sha256", "shipyard-release-manifest.json"}
     missing = sorted(required - set(manifest_files))
     if missing:
@@ -439,6 +447,7 @@ def verify_release_identity_manifest(
 
     with tempfile.TemporaryDirectory(prefix="shipyard-release-assets-proof-") as directory:
         root = Path(directory)
+        mismatches: list[str] = []
         for name, expected in sorted(manifest_files.items()):
             output = root / name
             runner.run(
@@ -457,13 +466,19 @@ def verify_release_identity_manifest(
                 ]
             )
             if not output.is_file():
-                raise SystemExit(f"release asset download produced no file: {name}")
+                mismatches.append(f"  {name}: release asset download produced no file")
+                continue
             actual_size = output.stat().st_size
             actual_digest = release_artifact_manifest.sha256(output)
             if actual_size != expected["bytes"] or actual_digest != expected["sha256"]:
-                raise SystemExit(
-                    f"release asset does not match identity manifest: {name}"
+                mismatches.append(
+                    f"  {name}: manifest {expected['bytes']} bytes sha256={expected['sha256']}"
+                    f" | release asset {actual_size} bytes sha256={actual_digest}"
                 )
+        if mismatches:
+            raise SystemExit(
+                "release asset does not match identity manifest:\n" + "\n".join(mismatches)
+            )
 
         checksums = root / "checksums.sha256"
         runner.run(
@@ -488,9 +503,16 @@ def verify_release_identity_manifest(
             fields = line.split(maxsplit=1)
             if len(fields) == 2 and len(fields[0]) == 64:
                 checksum_entries[fields[1].lstrip("*")] = fields[0].lower()
-        for name, expected in manifest_files.items():
-            if checksum_entries.get(name) != expected["sha256"]:
-                raise SystemExit(f"release checksum does not match manifest: {name}")
+        checksum_mismatches = [
+            f"  {name}: manifest sha256={expected['sha256']}"
+            f" | checksums.sha256 {checksum_entries.get(name, 'has no entry')}"
+            for name, expected in sorted(manifest_files.items())
+            if checksum_entries.get(name) != expected["sha256"]
+        ]
+        if checksum_mismatches:
+            raise SystemExit(
+                "release checksum does not match manifest:\n" + "\n".join(checksum_mismatches)
+            )
 
 
 def upload_artifact_and_checksums(
@@ -586,11 +608,24 @@ def merge_release_identity_manifest(
     artifacts = current.setdefault("artifacts", [])
     if not isinstance(artifacts, list):
         raise SystemExit("release identity manifest has malformed artifacts")
+    # Replace, never append: a rerun into an existing draft rewrites the
+    # macOS entry, drops any older entry for the same file name (the newest
+    # upload is what the release now serves), and normalizes the rest.
     artifacts[:] = [
         entry
         for entry in artifacts
         if isinstance(entry, dict) and entry.get("target") != "macos-arm64"
     ]
+    for entry in artifacts:
+        files = entry.get("files")
+        if isinstance(files, list):
+            entry["files"] = [
+                item
+                for item in files
+                if not (isinstance(item, dict) and item.get("name") == artifact.name)
+            ]
+    for note in release_artifact_manifest.normalize_release_files(artifacts):
+        print(f"release identity manifest: {note}", file=sys.stderr)
     artifacts.append(
         {
             "target": "macos-arm64",
