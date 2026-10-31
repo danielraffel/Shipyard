@@ -408,8 +408,8 @@ struct MutationApplyContext<'a> {
     approval_blockers: std::cell::RefCell<ApprovalBlockers>,
 }
 
-/// Exact-head approval diagnoses read during one pass, by PR number.
-type ApprovalBlockers = BTreeMap<u64, (String, Option<crate::head_approval::ApprovalBlocker>)>;
+/// Exact-head approval gate reads made during one pass, by PR number.
+type ApprovalBlockers = BTreeMap<u64, blocked_on::GateRecord>;
 
 struct CapacityApplyContext<'a> {
     actions: &'a GitHubActions,

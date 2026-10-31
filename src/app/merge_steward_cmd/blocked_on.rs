@@ -92,7 +92,9 @@ pub(super) struct OldestBlocked {
 pub(super) enum SinceHint {
     /// `since` is already set (or nothing can date it).
     Known,
-    /// The head commit's time: the state began no earlier than the push.
+    /// The head commit's committer date: a best-effort stand-in for the push
+    /// time, from the author's clock, so it can predate the push and the
+    /// state.
     HeadPushed,
     /// The time this label was last added.
     Labeled(String),
@@ -109,6 +111,48 @@ pub(super) enum GateRead<'a> {
     Refused(&'a ApprovalBlocker),
 }
 
+/// One exact-head gate read this pass made: the head it judged, why the gate
+/// refuses it (`None` admits), and whether the merge queue already ejected
+/// that same head, read from the same queue-state answer the admission path
+/// judges ([`crate::pr_queue_state::internal_enqueue_verdict`]).
+#[derive(Clone, Debug)]
+pub(super) struct GateRecord {
+    /// The head the gate judged.
+    pub head: String,
+    /// Why the gate refuses the head; `None` when it admits it.
+    pub blocker: Option<ApprovalBlocker>,
+    /// The queue removed this exact head and no new head followed.
+    pub ejection: Option<SameHeadEjection>,
+}
+
+impl GateRecord {
+    /// Record one gate read of `head` with the queue state it read.
+    #[must_use]
+    pub fn new(head: &str, blocker: Option<ApprovalBlocker>, queue: &serde_json::Value) -> Self {
+        let report = crate::pr_queue_state::explain_pr_queue_state(queue);
+        let ejection = match crate::pr_queue_state::internal_enqueue_verdict(&report, head) {
+            crate::pr_queue_state::InternalEnqueueVerdict::RefuseEjectedSameHead { reason, at } => {
+                Some(SameHeadEjection { reason, at })
+            }
+            _ => None,
+        };
+        Self {
+            head: head.to_owned(),
+            blocker,
+            ejection,
+        }
+    }
+}
+
+/// The merge queue removed this exact head and will not take it back.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SameHeadEjection {
+    /// GitHub's removal reason.
+    pub reason: String,
+    /// When the removal happened.
+    pub at: Option<String>,
+}
+
 /// What the pass knows about one row.
 pub(super) struct RowFacts<'a> {
     /// The pull request as observed.
@@ -123,12 +167,44 @@ pub(super) struct RowFacts<'a> {
     pub approval: GateRead<'a>,
     /// When the merge queue took this head, when it is queued.
     pub enqueued_at: Option<&'a str>,
+    /// The queue's same-head ejection, when the gate read saw one.
+    pub ejection: Option<&'a SameHeadEjection>,
 }
 
 /// Classify one row. Pure: `since` may still need a [`SinceHint`] read.
+///
+/// A HOLD stays visible in `held_by` even when a label or another state
+/// outranks it in `blocked_on`.
 #[must_use]
 pub(super) fn classify(facts: &RowFacts<'_>, policy: &StewardPolicy) -> (Stall, SinceHint) {
+    let (mut stall, hint) = classify_token(facts, policy);
+    if stall.held_by.is_none()
+        && let GateRead::Refused(ApprovalBlocker::Held {
+            holder, record, id, ..
+        }) = facts.approval
+    {
+        stall.held_by = Some(HeldBy {
+            holder: holder.clone(),
+            record,
+            id: *id,
+        });
+    }
+    (stall, hint)
+}
+
+fn classify_token(facts: &RowFacts<'_>, policy: &StewardPolicy) -> (Stall, SinceHint) {
     let pr = facts.pr;
+    // What the steward did this pass outranks every label: a labelled PR that
+    // was nonetheless admitted must read `admitted`, never its label.
+    if admitted(facts.mutation) {
+        return (
+            Stall {
+                blocked_on: "admitted".to_owned(),
+                ..Stall::default()
+            },
+            SinceHint::Known,
+        );
+    }
     if let StewardDecision::Queued { position } = facts.decision {
         return dated(
             "queued".to_owned(),
@@ -179,15 +255,20 @@ pub(super) fn classify(facts: &RowFacts<'_>, policy: &StewardPolicy) -> (Stall, 
             None,
             SinceHint::HeadPushed,
         ),
-        StewardDecision::WaitingRequired { contexts } => waiting_required(pr, policy, contexts),
+        StewardDecision::WaitingRequired { contexts } => {
+            approval_context_only(facts, policy, contexts)
+                .unwrap_or_else(|| waiting_required(pr, policy, contexts))
+        }
         StewardDecision::RequiredFailed { contexts } => {
-            let since = latest_check_time(pr, policy, contexts);
-            dated(
-                format!("required_failed:{}", contexts.join(",")),
-                since,
-                "check_completed",
-                None,
-            )
+            approval_context_only(facts, policy, contexts).unwrap_or_else(|| {
+                let since = latest_check_time(pr, policy, contexts);
+                dated(
+                    format!("required_failed:{}", context_names(policy, contexts)),
+                    since,
+                    "check_completed",
+                    None,
+                )
+            })
         }
         StewardDecision::RerunTransient { run_ids } => undated(
             "transient_rerun".to_owned(),
@@ -216,23 +297,16 @@ fn arm_candidate(facts: &RowFacts<'_>, policy: &StewardPolicy) -> (Stall, SinceH
         .mutation
         .map(|mutation| mutation.split(',').collect())
         .unwrap_or_default();
-    if parts
-        .iter()
-        .any(|part| part.starts_with("enqueued") || part.starts_with("merged_exact_head"))
-    {
-        return (
-            Stall {
-                blocked_on: "admitted".to_owned(),
-                ..Stall::default()
-            },
-            SinceHint::Known,
-        );
+    // The queue's own verdict on this exact head outranks the approval: a
+    // dry run and an apply pass both read it from the gate's queue state.
+    if let Some(ejection) = facts.ejection {
+        return ejected(&ejection.reason, ejection.at.clone(), green_since());
     }
     if let Some(cause) = parts
         .iter()
         .find_map(|part| part.strip_prefix("skipped_ejected_same_head:"))
     {
-        return green(format!("ejected_same_head:{cause}"), green_since(), None);
+        return ejected(cause, None, green_since());
     }
     if parts.contains(&"waiting_head_approval")
         || (facts.mutation.is_none() && facts.error.is_none())
@@ -278,6 +352,88 @@ fn arm_candidate(facts: &RowFacts<'_>, policy: &StewardPolicy) -> (Stall, SinceH
         green_since(),
         facts.mutation.map(str::to_owned),
     )
+}
+
+fn admitted(mutation: Option<&str>) -> bool {
+    mutation.is_some_and(|mutation| {
+        mutation
+            .split(',')
+            .any(|part| part.starts_with("enqueued") || part.starts_with("merged_exact_head"))
+    })
+}
+
+fn ejected(cause: &str, at: Option<String>, green_since: Option<String>) -> (Stall, SinceHint) {
+    let token = format!("ejected_same_head:{cause}");
+    match at {
+        Some(at) => dated(token, Some(at), "queue_removed", None),
+        None => green(token, green_since, None),
+    }
+}
+
+/// When every failing or pending required context is the approval context
+/// (`review-verdict`), the approval is the blocker: name it. Without a gate
+/// read for this head, keep the check token and say so.
+fn approval_context_only(
+    facts: &RowFacts<'_>,
+    policy: &StewardPolicy,
+    contexts: &[String],
+) -> Option<(Stall, SinceHint)> {
+    if !only_approval_contexts(policy, contexts) {
+        return None;
+    }
+    let since = latest_check_time(facts.pr, policy, contexts);
+    match facts.approval {
+        GateRead::Refused(blocker) => Some(approval_blocked(blocker, since)),
+        GateRead::Admits => None,
+        GateRead::Unread => Some(dated(
+            format!("required_failed:{}", context_names(policy, contexts)),
+            since,
+            "check_completed",
+            Some(
+                "only the approval context is not green; this pass did not read the approval \
+                 gate for this head, so a dry run (without --apply) names the reason"
+                    .to_owned(),
+            ),
+        )),
+    }
+}
+
+/// Whether `contexts` (required-check labels) are all the approval context.
+pub(super) fn only_approval_contexts(policy: &StewardPolicy, contexts: &[String]) -> bool {
+    let approval = policy.approval_context.trim();
+    !approval.is_empty()
+        && !contexts.is_empty()
+        && contexts
+            .iter()
+            .all(|label| context_name(policy, label).eq_ignore_ascii_case(approval))
+}
+
+/// The bare context name behind a required-check label.
+fn context_name<'a>(policy: &'a StewardPolicy, label: &'a str) -> &'a str {
+    policy
+        .required_checks
+        .iter()
+        .find(|required| required.label() == label)
+        .map_or_else(
+            || {
+                label
+                    .strip_suffix(" (commit status)")
+                    .unwrap_or(label)
+                    .split(" (app_id=")
+                    .next()
+                    .unwrap_or(label)
+            },
+            |required| required.context.as_str(),
+        )
+}
+
+fn context_names(policy: &StewardPolicy, labels: &[String]) -> String {
+    let mut names: Vec<&str> = labels
+        .iter()
+        .map(|label| context_name(policy, label))
+        .collect();
+    names.dedup();
+    names.join(",")
 }
 
 fn approval_blocked(blocker: &ApprovalBlocker, green_since: Option<String>) -> (Stall, SinceHint) {
@@ -352,17 +508,32 @@ fn waiting_required(
             SinceHint::HeadPushed,
         );
     }
-    let never_ran: Vec<&str> = policy
+    let absent: Vec<&crate::merge_steward::RequiredCheck> = policy
         .required_checks
         .iter()
         .filter(|required| contexts.contains(&required.label()))
         .filter(|required| selected_required_check(&pr.checks, required).is_none())
+        .collect();
+    // A context that has not appeared yet while runs from the same source are
+    // still queued or running is pending (a job that `needs:` another has not
+    // started); only an absent context with nothing in flight never ran.
+    let in_flight = |required: &crate::merge_steward::RequiredCheck| {
+        pr.checks.iter().any(|check| {
+            !check.status.eq_ignore_ascii_case("COMPLETED")
+                && required
+                    .app_id
+                    .is_none_or(|app_id| check.app_id == Some(app_id))
+        })
+    };
+    let never_ran: Vec<&str> = absent
+        .iter()
+        .filter(|required| !in_flight(required))
         .map(|required| required.context.as_str())
         .collect();
     if !never_ran.is_empty() {
         return undated(
             format!("required_never_ran:{}", never_ran.join(",")),
-            Some(contexts.join(",")),
+            Some(context_names(policy, contexts)),
             SinceHint::HeadPushed,
         );
     }
@@ -373,11 +544,18 @@ fn waiting_required(
         .filter_map(|required| selected_required_check(&pr.checks, required))
         .filter_map(|check| check.observed_at.clone())
         .min();
+    let since = since.or_else(|| {
+        pr.checks
+            .iter()
+            .filter(|check| !check.status.eq_ignore_ascii_case("COMPLETED"))
+            .filter_map(|check| check.observed_at.clone())
+            .min()
+    });
     dated(
         "required_pending".to_owned(),
         since,
         "check_started",
-        Some(contexts.join(",")),
+        Some(context_names(policy, contexts)),
     )
 }
 
@@ -503,23 +681,30 @@ pub(super) fn annotate(
             .iter()
             .find(|pr| pr.fact.number == report.number)
         else {
+            "unclassified".clone_into(&mut report.blocked.blocked_on);
             continue;
         };
         if read_gate
-            && matches!(report.decision, StewardDecision::ArmMergeQueue)
+            && dry_run_reads_gate(&report.decision, policy)
             && !blockers.contains_key(&report.number)
-            && let Ok((_, _, _, blocker)) =
-                super::pr_mutations::read_head_gate_for(actions, observation, pr, ledger)
+            && let Ok((_, queue, blocker)) =
+                super::pr_mutations::read_head_gate_for_report(actions, observation, pr, ledger)
         {
-            dry_run_blockers.insert(report.number, (pr.fact.head_sha.clone(), blocker));
+            dry_run_blockers.insert(
+                report.number,
+                GateRecord::new(&pr.fact.head_sha, blocker, &queue),
+            );
         }
-        let approval = blockers
+        let record = blockers
             .get(&report.number)
             .or_else(|| dry_run_blockers.get(&report.number))
-            .filter(|(head, _)| head.eq_ignore_ascii_case(&pr.fact.head_sha))
-            .map_or(GateRead::Unread, |(_, blocker)| {
-                blocker.as_ref().map_or(GateRead::Admits, GateRead::Refused)
-            });
+            .filter(|record| record.head.eq_ignore_ascii_case(&pr.fact.head_sha));
+        let approval = record.map_or(GateRead::Unread, |record| {
+            record
+                .blocker
+                .as_ref()
+                .map_or(GateRead::Admits, GateRead::Refused)
+        });
         let enqueued_at = observation.merge_group_enqueued_at.get(&report.number);
         let (mut blocked, hint) = classify(
             &RowFacts {
@@ -529,11 +714,24 @@ pub(super) fn annotate(
                 error: report.error.as_deref(),
                 approval,
                 enqueued_at: enqueued_at.map(String::as_str),
+                ejection: record.and_then(|record| record.ejection.as_ref()),
             },
             policy,
         );
         fill_since(actions, &observation.repo, pr, &hint, &mut blocked);
         report.blocked = blocked;
+    }
+}
+
+/// Which rows a dry run reads the approval gate for: the heads an apply pass
+/// would try to admit, and the heads whose only red required context is the
+/// approval context. An apply pass reads no more than its admission does.
+fn dry_run_reads_gate(decision: &StewardDecision, policy: &StewardPolicy) -> bool {
+    match decision {
+        StewardDecision::ArmMergeQueue => true,
+        StewardDecision::RequiredFailed { contexts }
+        | StewardDecision::WaitingRequired { contexts } => only_approval_contexts(policy, contexts),
+        _ => false,
     }
 }
 

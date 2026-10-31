@@ -181,9 +181,13 @@ Per row, beside `decision`, `mutation` and `error`:
 - `since_source`: which GitHub time it came from: `checks_green` (the newest
   required check finished), `check_started`, `check_completed`,
   `approval_posted`, `hold_posted`, `queue_removed`, `merge_queue_enqueued`,
-  `label_added` or `head_commit`.
+  `label_added` or `head_commit`. `head_commit` is the head commit's
+  committer date: a best-effort stand-in that can predate the push (and a
+  `BEHIND`/`DIRTY` state, which starts when the base moves): the state may
+  have begun later, so the age it implies is an upper bound.
 - `blocked_detail`: the contexts, reason or record id behind the token.
-- `held_by`: `{holder, record, id}` for a `held` row.
+- `held_by`: `{holder, record, id}` whenever a HOLD names the head, even when a
+  label or another state outranks it in `blocked_on`.
 
 Per repository, `blocked_summary` holds `counts` (rows per token) and
 `oldest`: the three longest-blocked rows as `{number, blocked_on,
@@ -200,17 +204,18 @@ not listed as blocked.
 | `owner_decision` | Labelled `owner-decision` | owner |
 | `excluded_label:<label>` | `superseded`, `PARKED/<platform>` or the opt-out label | whoever owns the label |
 | `provenance_blocked:<labels>` | A provenance-blocking label | owner |
-| `required_never_ran:<contexts>` | A required context has no run on this head (often a renamed check: merge the base to re-run CI) | repair lane |
-| `required_pending` | Required checks are queued or running | CI |
-| `required_failed:<contexts>` | A required check failed | author or repair lane |
+| `required_never_ran:<contexts>` | A required context has no run on this head and nothing from its source is still queued or running (often a renamed check: merge the base to re-run CI) | repair lane |
+| `required_pending` | Required checks are queued or running, or have not appeared yet behind a running job | CI |
+| `required_failed:<contexts>` | A required check failed. When the only red context is the approval context (`review-verdict`), the row names the approval token instead; an apply pass that did not read the gate for that head keeps this token and says so in `blocked_detail` | author or repair lane |
 | `transient_rerun` | The steward is rerunning an interrupted check | steward |
 | `merge_state:<STATE>` | GitHub says `DIRTY`, `BEHIND`, `UNSTABLE`, ... | repair lane: merge the base |
-| `ejected_same_head:<cause>` | The queue ejected this exact head; the steward will not re-enqueue it | repair lane |
+| `ejected_same_head:<cause>` | The queue ejected this exact head; the steward will not re-enqueue it. Read from the same queue state in a dry run and an apply pass; `since` is the removal | repair lane |
 | `waiting_full_test_tier`, `waiting_enqueue_requirements` | Admission waits on a deferred check tier or a GitHub requirement | CI |
 | `revalidating` | The head or queue changed during the pass | next pass |
 | `steward_error` | Admission failed; see `error` | operator |
+| `admission_pending` | Admission returned an outcome with no token of its own; see `blocked_detail` | next pass |
 | `queued` | In the merge queue | queue |
-| `admitted` | Enqueued or merged this pass | nobody |
+| `admitted` | Enqueued or merged this pass (outranks any label) | nobody |
 | `ready` | Approved and green; a dry run would admit it | steward |
 | `draft`, `unmanaged`, `handoff_missing`, `invalid_head`, `direct_merge_refused`, `required_policy_unknown` | The steward does not own or cannot admit it yet | author or config |
 

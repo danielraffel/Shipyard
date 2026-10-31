@@ -1,7 +1,7 @@
 //! Every open pull request names why it is not merging, and since when.
 use super::*;
 use crate::app::merge_steward_cmd::blocked_on::{
-    GateRead, RowFacts, SinceHint, Stall, classify, summarize,
+    self, GateRead, RowFacts, SinceHint, Stall, classify, summarize,
 };
 use crate::head_approval::ApprovalBlocker;
 
@@ -46,6 +46,7 @@ fn row(pr: &ObservedPr, mutation: Option<&str>, approval: GateRead<'_>) -> (Stal
             error: None,
             approval,
             enqueued_at: None,
+            ejection: None,
         },
         &policy,
     )
@@ -176,6 +177,7 @@ fn merge_state_draft_and_queue_are_named() {
             error: None,
             approval: GateRead::Unread,
             enqueued_at: Some("2026-10-31T16:00:00Z"),
+            ejection: None,
         },
         &policy,
     );
@@ -335,9 +337,10 @@ esac
     .expect("gate read");
     assert!(!gate.allows(), "{gate:?}");
     let blockers = context.approval_blockers.borrow();
-    let (head, diagnosis) = blockers.get(&42).expect("the read was recorded");
-    assert_eq!(head, HEAD);
-    let diagnosis = diagnosis.as_ref().expect("a refusal is diagnosed");
+    let record = blockers.get(&42).expect("the read was recorded");
+    assert_eq!(record.head, HEAD);
+    assert_eq!(record.ejection, None);
+    let diagnosis = record.blocker.as_ref().expect("a refusal is diagnosed");
     let policy = queue_policy();
     let decision = classify_pr(&pr.fact, &policy, &BTreeMap::new());
     let explain = gate.explain();
@@ -349,6 +352,7 @@ esac
             error: Some(explain.as_str()),
             approval: GateRead::Refused(diagnosis),
             enqueued_at: None,
+            ejection: None,
         },
         &policy,
     );
@@ -449,4 +453,385 @@ esac
     assert_eq!(first["since"], json!("2026-10-31T01:00:00Z"));
     assert_eq!(first["since_source"], json!("head_commit"));
     assert!(rendered["blocked_summary"]["oldest"].is_array());
+}
+
+/// The real `RemovedFromMergeQueueEvent` timeline of PR 8811: the queue
+/// removed head `e147f2d0` for `failed_checks` and no new head followed.
+const HEAD_8811: &str = "e147f2d09972babcc9977e82a46470e17f9de538";
+
+fn queue_8811() -> Value {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/github/pr_real_8811_same_head_ejected.json");
+    serde_json::from_str(&fs::read_to_string(path).expect("fixture")).expect("json")
+}
+
+/// Generous-Corp/pulp#11308 read `ready` in a dry run while the apply tick
+/// skipped it as `skipped_ejected_same_head:failed_checks`. Both now read the
+/// ejection from the same queue-state answer, dated by the removal.
+#[test]
+fn an_ejected_head_reads_the_same_in_a_dry_run_and_an_apply_pass() {
+    let mut pr = pr_with(11308, &[], "CLEAN", &green_rollup());
+    pr.fact.head_sha = HEAD_8811.to_owned();
+    let record = blocked_on::GateRecord::new(HEAD_8811, None, &queue_8811());
+    let ejection = record.ejection.as_ref().expect("same-head ejection");
+    assert_eq!(ejection.reason, "failed_checks");
+    let policy = queue_policy();
+    let decision = classify_pr(&pr.fact, &policy, &BTreeMap::new());
+    let facts = |mutation: Option<&'static str>| RowFacts {
+        pr: &pr.fact,
+        decision: &decision,
+        mutation,
+        error: None,
+        approval: GateRead::Admits,
+        enqueued_at: None,
+        ejection: Some(ejection),
+    };
+    let (dry_run, _) = classify(&facts(None), &policy);
+    let (apply, _) = classify(
+        &facts(Some("skipped_ejected_same_head:failed_checks")),
+        &policy,
+    );
+    assert_eq!(dry_run, apply);
+    assert_eq!(dry_run.blocked_on, "ejected_same_head:failed_checks");
+    assert_eq!(dry_run.since.as_deref(), Some("2026-09-25T04:12:51Z"));
+    assert_eq!(dry_run.since_source, Some("queue_removed"));
+    // An unapproved ejected head: the apply path stops at the approval, but
+    // the queue's refusal still names it, so both modes agree.
+    let unapproved = ApprovalBlocker::NoVerdict;
+    let (refused, _) = classify(
+        &RowFacts {
+            mutation: Some("waiting_head_approval"),
+            approval: GateRead::Refused(&unapproved),
+            ..facts(None)
+        },
+        &policy,
+    );
+    assert_eq!(refused.blocked_on, "ejected_same_head:failed_checks");
+    // Control: the same queue answer for a different head is no ejection.
+    let other = blocked_on::GateRecord::new(HEAD, None, &queue_8811());
+    assert_eq!(other.ejection, None);
+}
+
+fn app_bound_policy(contexts: &[&str]) -> StewardPolicy {
+    let mut policy = queue_policy();
+    policy.required_checks = contexts
+        .iter()
+        .map(|context| RequiredCheck {
+            context: (*context).to_owned(),
+            app_id: Some(15368),
+        })
+        .collect();
+    policy
+}
+
+fn app_check(name: &str, status: &str, conclusion: Option<&str>, at: &str) -> Value {
+    json!({"__typename": "CheckRun", "name": name, "status": status, "conclusion": conclusion,
+           "startedAt": at, "completedAt": if status == "COMPLETED" { Some(at) } else { None },
+           "checkSuite": {"app": {"databaseId": 15368}}})
+}
+
+/// Generous-Corp/vellum#126: `sterile-consumer` `needs:` `gpu-macos-arm64`,
+/// which is still running, so the context has not appeared yet. That is
+/// pending; only an absent context with nothing in flight never ran.
+#[test]
+fn an_absent_context_behind_a_running_job_is_pending_not_never_ran() {
+    let policy = app_bound_policy(&["gpu-macos-arm64", "sterile-consumer"]);
+    let running = pr_with(
+        126,
+        &[],
+        "CLEAN",
+        &json!([app_check(
+            "gpu-macos-arm64",
+            "IN_PROGRESS",
+            None,
+            "2026-10-31T19:05:00Z"
+        )]),
+    );
+    let classify_row = |pr: &ObservedPr| {
+        let decision = classify_pr(&pr.fact, &policy, &BTreeMap::new());
+        classify(
+            &RowFacts {
+                pr: &pr.fact,
+                decision: &decision,
+                mutation: None,
+                error: None,
+                approval: GateRead::Unread,
+                enqueued_at: None,
+                ejection: None,
+            },
+            &policy,
+        )
+        .0
+    };
+    let stall = classify_row(&running);
+    assert_eq!(stall.blocked_on, "required_pending");
+    assert_eq!(stall.since.as_deref(), Some("2026-10-31T19:05:00Z"));
+    // Control: the producer finished and the context still never appeared.
+    let finished = pr_with(
+        126,
+        &[],
+        "CLEAN",
+        &json!([app_check(
+            "gpu-macos-arm64",
+            "COMPLETED",
+            Some("SUCCESS"),
+            "2026-10-31T19:30:00Z"
+        )]),
+    );
+    assert_eq!(
+        classify_row(&finished).blocked_on,
+        "required_never_ran:sterile-consumer"
+    );
+}
+
+/// danielraffel/Shipyard#969 read `required_failed:review-verdict` while
+/// the real cause was its APPROVE's signer, which the base does not count.
+/// When the approval context is the only red required context, the approval
+/// diagnosis is the token; without a gate read the check token stays and
+/// says why.
+#[test]
+fn a_red_review_verdict_names_the_approval_not_the_check() {
+    let policy = app_bound_policy(&["macos", "review-verdict"]);
+    let pr = pr_with(
+        969,
+        &[],
+        "CLEAN",
+        &json!([
+            app_check(
+                "macos",
+                "COMPLETED",
+                Some("SUCCESS"),
+                "2026-10-31T18:00:00Z"
+            ),
+            app_check(
+                "review-verdict",
+                "COMPLETED",
+                Some("FAILURE"),
+                "2026-10-31T18:40:16Z"
+            ),
+        ]),
+    );
+    let decision = classify_pr(&pr.fact, &policy, &BTreeMap::new());
+    assert!(matches!(decision, StewardDecision::RequiredFailed { .. }));
+    let uncounted = ApprovalBlocker::Excluded {
+        reason: "uncounted_signer",
+        detail: "its signer pulp-review2 is not one of infra-review2".to_owned(),
+        id: Some(6_550_000_000),
+        at: Some("2026-10-31T18:30:00Z".to_owned()),
+    };
+    let facts = |approval| RowFacts {
+        pr: &pr.fact,
+        decision: &decision,
+        mutation: None,
+        error: None,
+        approval,
+        enqueued_at: None,
+        ejection: None,
+    };
+    let (named, _) = classify(&facts(GateRead::Refused(&uncounted)), &policy);
+    assert_eq!(named.blocked_on, "approval_excluded:uncounted_signer");
+    assert_eq!(named.since.as_deref(), Some("2026-10-31T18:30:00Z"));
+    let (unread, _) = classify(&facts(GateRead::Unread), &policy);
+    assert_eq!(unread.blocked_on, "required_failed:review-verdict");
+    assert!(unread.blocked_detail.is_some());
+    // Control: another red context besides the approval keeps the check token.
+    let both = pr_with(
+        969,
+        &[],
+        "CLEAN",
+        &json!([
+            app_check(
+                "macos",
+                "COMPLETED",
+                Some("FAILURE"),
+                "2026-10-31T18:00:00Z"
+            ),
+            app_check(
+                "review-verdict",
+                "COMPLETED",
+                Some("FAILURE"),
+                "2026-10-31T18:40:16Z"
+            ),
+        ]),
+    );
+    let decision = classify_pr(&both.fact, &policy, &BTreeMap::new());
+    let (red, _) = classify(
+        &RowFacts {
+            pr: &both.fact,
+            decision: &decision,
+            ..facts(GateRead::Refused(&uncounted))
+        },
+        &policy,
+    );
+    assert_eq!(red.blocked_on, "required_failed:macos,review-verdict");
+}
+
+/// The dry run reads the gate for a review-verdict-red head and names the
+/// uncounted signer from a real APPROVE body.
+#[cfg(unix)]
+#[test]
+fn a_dry_run_names_an_uncounted_signer_on_a_review_verdict_red_head() {
+    let temp = tempfile::tempdir().expect("temp");
+    let comment = r#"{"id":6550000000,"login":"shipyard-local[bot]","type":"Bot","association":"CONTRIBUTOR","at":"2026-10-31T18:30:00Z","body":"reviewer: pulp-review2\n<!-- session: Daniels-Mac-Studio-m3/08fb81d8 agent: pulp-review2 -->\nverdict: APPROVE head:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#;
+    let actions = fake_gh(
+        &temp,
+        &format!(
+            r#"
+# CONFIG_ERROR: this fixture serves its own policy file
+case "$*" in
+  *"contents/.shipyard/config.toml"*) printf '%s\n' '[auto_merge]' 'reviewer_signers = ["pulp-review"]' ;;
+  *"pulls/969/reviews"*) ;;
+  *"issues/969/comments"*) printf '%s\n' '{comment}' ;;
+  *"commits/{HEAD}"*"--jq"*) printf '%s\n' '2026-10-31T17:00:00Z' ;;
+  *"isInMergeQueue"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"number":969,"state":"OPEN","headRefOid":"{HEAD}","isInMergeQueue":false,"mergeQueueEntry":null,"autoMergeRequest":null,"timelineItems":{{"pageInfo":{{"hasPreviousPage":false}},"nodes":[]}}}}}}}}}}' ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#
+        ),
+    );
+    let policy = app_bound_policy(&["macos", "review-verdict"]);
+    let pr = pr_with(
+        969,
+        &[],
+        "CLEAN",
+        &json!([
+            app_check(
+                "macos",
+                "COMPLETED",
+                Some("SUCCESS"),
+                "2026-10-31T18:00:00Z"
+            ),
+            app_check(
+                "review-verdict",
+                "COMPLETED",
+                Some("FAILURE"),
+                "2026-10-31T18:40:16Z"
+            ),
+        ]),
+    );
+    let mut observation = observation_for(pr.clone(), true);
+    observation.repo = "Generous-Corp/pulp".to_owned();
+    observation
+        .required_checks
+        .clone_from(&policy.required_checks);
+    let decision = classify_pr(&pr.fact, &policy, &BTreeMap::new());
+    let mut reports = vec![PrReport {
+        number: 969,
+        head_sha: HEAD.to_owned(),
+        decision,
+        mutation: None,
+        error: None,
+        blocked: Stall::default(),
+    }];
+    crate::head_approval::with_host_review_default(true, || {
+        blocked_on::annotate(
+            &actions,
+            &observation,
+            &policy,
+            &StewardLedger::default(),
+            &BTreeMap::new(),
+            true,
+            &mut reports,
+        );
+    });
+    assert_eq!(
+        reports[0].blocked.blocked_on,
+        "approval_excluded:uncounted_signer"
+    );
+    assert_eq!(
+        reports[0].blocked.since.as_deref(),
+        Some("2026-10-31T18:30:00Z")
+    );
+}
+
+/// A label that outranks a held head keeps the HOLD visible.
+#[test]
+fn a_label_outranking_a_hold_keeps_held_by() {
+    let pr = pr_with(15, &["owner-decision"], "CLEAN", &green_rollup());
+    let hold = ApprovalBlocker::Held {
+        holder: "infra-review2".to_owned(),
+        record: "comment",
+        id: Some(1),
+        at: Some("2026-10-31T15:00:00Z".to_owned()),
+    };
+    let (stall, _) = row(&pr, Some("waiting_head_approval"), GateRead::Refused(&hold));
+    assert_eq!(stall.blocked_on, "owner_decision");
+    assert_eq!(
+        stall.held_by.map(|held| held.holder),
+        Some("infra-review2".to_owned())
+    );
+}
+
+/// A report's gate read never writes the carry log: a head whose approval
+/// carries across a rebase is judged carried, and `carries.jsonl` stays
+/// byte-identical. Control: the admission evaluation of the same head does
+/// log the carry, so the fixture reaches the carry path.
+#[test]
+fn a_reports_gate_read_writes_no_carry_log() {
+    use crate::head_approval::tests::{History, by_default};
+    let history = History::new(false);
+    let head = history.rebase(|history| history.write("more.txt", b"more base\n"), |_| {});
+    let guards = tempfile::tempdir().expect("guards");
+    let log = guards.path().join("carries.jsonl");
+    fs::write(&log, "{\"kind\":\"rebase\",\"earlier\":true}\n").expect("seed");
+    let before = fs::read(&log).expect("log");
+    let run_gh = |args: &[String]| history.gh(args);
+    let mut pr = ready_pr();
+    pr.fact.head_sha.clone_from(&head);
+    pr.fact.number = 7;
+    let mut observation = observation_for(pr.clone(), true);
+    observation.repo = "danielraffel/tartci".to_owned();
+    let mut policy = by_default("danielraffel/tartci");
+    policy.rebase_carry = true;
+    let queue = json!({"data": {"repository": {"pullRequest": {
+        "number": 7, "state": "OPEN", "headRefOid": head, "isInMergeQueue": false,
+        "mergeQueueEntry": null, "autoMergeRequest": null,
+        "timelineItems": {"pageInfo": {"hasPreviousPage": false}, "nodes": []}}}}});
+    let ledger = StewardLedger::default();
+    let (gate, blocker) = crate::head_approval::with_guards_dir(guards.path(), || {
+        crate::head_approval::with_host_review_default(true, || {
+            crate::app::merge_steward_cmd::pr_mutations::report_gate_with(
+                &run_gh,
+                &observation,
+                &pr,
+                &policy,
+                &queue,
+                &ledger,
+            )
+        })
+    })
+    .expect("gate");
+    assert!(gate.allows(), "{gate:?}");
+    assert_eq!(blocker, None);
+    assert_eq!(
+        fs::read(&log).expect("log"),
+        before,
+        "a report wrote a carry"
+    );
+    crate::head_approval::with_guards_dir(guards.path(), || {
+        crate::head_approval::with_host_review_default(true, || {
+            crate::app::merge_steward_cmd::pr_mutations::evaluate_head_gate_with(
+                &run_gh,
+                &observation,
+                &pr,
+                &head,
+                &policy,
+                &queue,
+                &ledger,
+            )
+        })
+    })
+    .expect("gate");
+    assert_ne!(
+        fs::read(&log).expect("log"),
+        before,
+        "control: admission logs the carry"
+    );
+}
+
+/// An admitted PR reads `admitted` even when it carries a skip label.
+#[test]
+fn an_admission_outranks_every_label() {
+    let pr = pr_with(16, &["owner-decision"], "CLEAN", &green_rollup());
+    assert_eq!(token(&pr, Some("enqueued")), "admitted");
 }
