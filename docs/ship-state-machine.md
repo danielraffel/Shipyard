@@ -542,7 +542,7 @@ authoritative even when an unrelated hosted check has a similar target name.
 - **To:** `STATE_VERDICT_PASS`, `STATE_VERDICT_FAIL`, or still in flight (`None`)
 - **Computation:** `_ship_terminal_verdict(state)` at cli.py:3790
 - **Externals:** none
-- **⚠ Known bug — Bug B1.** The verdict is computed only from `evidence_snapshot.values()` (cli.py:3806) and `evidence_snapshot.items()` (cli.py:3812). The function does **not** check that every `DispatchedRun.target` has a matching evidence row. A ship that dispatched targets `[macos, ubuntu, windows]` and only persisted evidence for `[macos]` (all "pass") will be reported `STATE_VERDICT_PASS` — and `auto-merge` will proceed to `merge_pr`. This is the single highest-impact silent-failure candidate in the state machine; Phase B must have a dedicated regression test for it.
+- **Bug B1 is fixed.** `ship_terminal_verdict` in `src/watch.rs:131-177` first requires an evidence row for every required dispatched target. A ship that dispatched targets `[macos, ubuntu, windows]` and only persisted evidence for `[macos]` remains in flight (`None`); it cannot reach `STATE_VERDICT_PASS` or the merge path. The exact regression is `verdict_requires_terminal_evidence_for_all_required_targets` in `src/watch.rs`, covered by the current Rust library test suite. The older Python-era line references in this historical audit are retained elsewhere only as provenance; they are not current source locations.
 - **Other failure modes:** none — pure function.
 
 ### T5 — Merge on PASS
@@ -1122,7 +1122,7 @@ will fail the `state-machine` CI lane immediately.
 ## Silent-failure regression tests
 
 1. **Merge success hidden behind cleanup failure.** If `gh pr merge --delete-branch` merges on GitHub but fails while deleting a local branch checked out in another worktree, `auto-merge` must archive ship-state and exit 0 with a cleanup warning, not report `merge-failed`. Covered by `auto_merge_archives_when_merge_error_reports_already_merged`.
-2. **Partial evidence PASS (Bug B1).** Dispatch 3 targets, write evidence for only 1 (all "pass"), compute verdict. Today returns True. *Test:* seed a `ShipState` with `dispatched_runs=[T1, T2, T3]` and `evidence_snapshot={"T1":"pass"}`; `_ship_terminal_verdict(state)` must return `None`, not `True`. Proposed fix: extend the function to require an evidence row for every non-advisory `DispatchedRun.target`.
+2. **Partial evidence PASS (Bug B1).** Dispatch 3 targets, write evidence for only 1 (all "pass"), and compute the verdict. The current Rust implementation returns `None`, not `Some(true)`: `ship_terminal_verdict` requires evidence for every required `DispatchedRun.target`. The regression is covered by `verdict_requires_terminal_evidence_for_all_required_targets` in `src/watch.rs`; keep it as a negative control against premature merge readiness.
 3. **Ship-state tmp-write durability.** `ShipStateStore.save` already uses tmp+`os.replace` (core/ship_state.py:342). *Test:* inject an `os.replace` failure; assert the prior file is byte-identical. (Do NOT couple this test to `queue.json` — `Queue._save` uses a different write pattern on `main`; atomicity for that file lands in PR #105.)
 
 ## Phase B test plan

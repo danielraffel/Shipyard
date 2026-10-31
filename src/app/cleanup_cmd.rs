@@ -438,11 +438,11 @@ fn prune_metrics(state_dir: &Path, dry_run: bool, items: &mut Vec<CleanupItem>) 
     let (action, reason) = match result {
         Ok(_) if dry_run => (
             "would-delete".to_owned(),
-            format!("Raw samples older than {days} days would be pruned"),
+            format!("Raw runs and observational rows older than {days} days would be pruned"),
         ),
         Ok(deleted) => (
             "delete".to_owned(),
-            format!("Pruned {deleted} raw runs older than {days} days"),
+            format!("Pruned {deleted} raw runs and observational rows older than {days} days"),
         ),
         Err(error) => ("skip".to_owned(), format!("Metrics prune skipped: {error}")),
     };

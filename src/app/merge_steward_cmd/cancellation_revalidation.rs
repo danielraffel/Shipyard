@@ -127,6 +127,13 @@ pub(super) fn live_current_pull_request_state(
     ))
 }
 
+/// Fields of the live single-pull-request read that re-establishes authority
+/// immediately before a mutation. It must carry every fact the census
+/// classification consults: `author` decides implicit fleet management, so a
+/// read without it re-classifies every unlabelled fleet-authored pull request
+/// as `Unmanaged` and the mutation is skipped after live revalidation.
+pub(super) const LIVE_PR_VIEW_FIELDS: &str = "id,number,state,isDraft,baseRefName,headRefOid,headRefName,mergeStateStatus,autoMergeRequest,labels,author,statusCheckRollup";
+
 pub(super) fn pull_request(
     actions: &GitHubActions,
     repo: &str,
@@ -152,7 +159,7 @@ fn pull_request_with_deadline(
         "--repo".to_owned(),
         repo.to_owned(),
         "--json".to_owned(),
-        "id,number,state,isDraft,baseRefName,headRefOid,headRefName,mergeStateStatus,autoMergeRequest,labels,statusCheckRollup".to_owned(),
+        LIVE_PR_VIEW_FIELDS.to_owned(),
     ];
     let value = match deadline {
         Some(deadline) => {
