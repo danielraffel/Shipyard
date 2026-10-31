@@ -859,7 +859,6 @@ impl MetricsStore {
         Ok(())
     }
 
-
     /// Delete expired raw runs (including jobs/steps), fleet-capacity samples,
     /// and queue observations. Return the number of runs, capacity samples,
     /// shadow observations, and timing rows removed, excluding child jobs/steps.
