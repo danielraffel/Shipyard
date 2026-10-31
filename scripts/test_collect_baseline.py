@@ -380,6 +380,87 @@ class BaselineScorecardTests(unittest.TestCase):
                 MOD.validate_state_identity(path, "demo", "o/r", db)
 
 
+class AutomaticObservationControlTests(unittest.TestCase):
+    def test_off_preserves_malformed_files_and_enabled_collection_fails_closed(self):
+        for value in ["off", "  OfF\t", None]:
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                db = root / "metrics" / "metrics.db"
+                db.parent.mkdir()
+                state = root / "status.json"
+                history_path = root / "history.json"
+                markdown = root / "status.md"
+                for path in [db, state, history_path, markdown]:
+                    path.write_text("existing evidence must remain unchanged")
+                originals = {path: path.read_bytes() for path in [db, state, history_path, markdown]}
+                called = root / "provider-called"
+                provider = root / "provider"
+                provider.write_text(
+                    "#!%s\nimport pathlib,sys\npathlib.Path(%r).touch()\nsys.exit(3)\n"
+                    % (os.sys.executable, str(called))
+                )
+                provider.chmod(0o755)
+                env = os.environ.copy()
+                env.pop("SHIPYARD_OBSERVATIONS", None)
+                if value is not None:
+                    env["SHIPYARD_OBSERVATIONS"] = value
+                result = subprocess.run([
+                    os.sys.executable, str(Path(MOD.__file__)), "--collect",
+                    "--db", str(db), "--project", "pulp", "--repo", "o/pulp",
+                    "--state", str(state), "--pass-history", str(history_path),
+                    "--status-markdown", str(markdown), "--shipyard", str(provider),
+                    "--tartci", str(provider),
+                ], env=env, capture_output=True, text=True, check=False)
+                if value is not None:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertFalse(called.exists())
+                    self.assertIn("collection disabled", result.stderr)
+                    self.assertEqual({path: path.read_bytes() for path in originals}, originals)
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(called.exists(), result.stderr)
+                    self.assertRegex(result.stderr, "baseline state is unreadable|baseline collection failed")
+                    self.assertEqual({path: path.read_bytes() for path in originals}, originals)
+
+    def test_enabled_valid_state_invokes_provider_and_records_failed_pass(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            db = root / "metrics" / "metrics.db"
+            db.parent.mkdir()
+            state = root / "status.json"
+            state.write_text(json.dumps({"identity": MOD.state_identity(state, "pulp", "o/pulp", db)}))
+            history_path = root / "history.json"
+            history_path.write_text(json.dumps(history.PassHistory.create(
+                repository="o/pulp", source_identity="shipyard.collect_baseline:v1",
+                config_identity="baseline-policy:v1;interval=3600;slack=300",
+                expected_interval_secs=3600,
+            ).to_dict()))
+            original_state = state.read_bytes()
+            called = root / "provider-called"
+            provider = root / "provider"
+            provider.write_text(
+                "#!%s\nimport pathlib,sys\npathlib.Path(%r).touch()\n"
+                "print('invalid export', file=sys.stderr)\nsys.exit(3)\n"
+                % (os.sys.executable, str(called))
+            )
+            provider.chmod(0o755)
+            env = os.environ.copy()
+            env.pop("SHIPYARD_OBSERVATIONS", None)
+            result = subprocess.run([
+                os.sys.executable, str(Path(MOD.__file__)), "--collect",
+                "--db", str(db), "--project", "pulp", "--repo", "o/pulp",
+                "--state", str(state), "--pass-history", str(history_path),
+                "--shipyard", str(provider), "--tartci", str(provider),
+            ], env=env, capture_output=True, text=True, check=False)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertTrue(called.exists(), result.stderr)
+            self.assertIn("invalid export", result.stderr)
+            self.assertEqual(state.read_bytes(), original_state)
+            observations = json.loads(history_path.read_text())["observations"]
+            self.assertEqual(len(observations), 1)
+            self.assertEqual(observations[0]["status"], "failed")
+            self.assertIn("invalid export", observations[0]["error"])
+
 class BaselineStateRetentionTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

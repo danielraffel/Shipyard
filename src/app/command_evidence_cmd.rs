@@ -32,6 +32,26 @@ pub(super) fn run_command_evidence<W: Write>(
     json_mode: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
+    run_command_evidence_with_observations(
+        args,
+        config,
+        cwd,
+        runtime_paths,
+        json_mode,
+        stdout,
+        crate::observations::AutomaticObservations::from_env(),
+    )
+}
+
+fn run_command_evidence_with_observations<W: Write>(
+    args: &RunCommandEvidenceArgs,
+    config: &LoadedConfig,
+    cwd: &Path,
+    runtime_paths: &RuntimePaths,
+    json_mode: bool,
+    stdout: &mut W,
+    observations: crate::observations::AutomaticObservations,
+) -> Result<ExitCode, CliFailure> {
     let target = resolve_command_target(config, &args.target)?;
     let command = CommandRequest::for_target(&target, args, cwd)?;
     let name = args.name.as_deref().unwrap_or(&target.name);
@@ -97,7 +117,9 @@ pub(super) fn run_command_evidence<W: Write>(
     store
         .record(&record)
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
-    let _ = record_command_metric(config, runtime_paths, &record);
+    if observations.enabled() {
+        let _ = record_command_metric(config, runtime_paths, &record);
+    }
     emit_run_command_evidence(stdout, &record, json_mode)?;
     Ok(if record.passed() {
         ExitCode::SUCCESS
@@ -812,6 +834,73 @@ mod tests {
             std::fs::read_to_string(artifact_path).expect("artifact"),
             "artifact\n"
         );
+    }
+
+    #[test]
+    fn optional_observations_preserve_command_evidence_and_exit_status() {
+        for value in [Some("off"), None] {
+            for exit in [0, 7] {
+                let policy = crate::observations::AutomaticObservations::from_value(value);
+                let temp = tempfile::tempdir().unwrap();
+                let repo = temp.path().join("repo");
+                seed_repo(&repo);
+                let paths = RuntimePaths::current_with_overrides(
+                    RuntimeMode::Isolated,
+                    Some(temp.path().join("global")),
+                    Some(temp.path().join("state")),
+                );
+                let args = RunCommandEvidenceArgs {
+                    target: "mac".into(),
+                    name: Some("observation-control".into()),
+                    expect_code: 0,
+                    target_cwd: None,
+                    artifacts: Vec::new(),
+                    log_path: None,
+                    timeout_secs: None,
+                    env_fingerprints: Vec::new(),
+                    command: vec![
+                        "sh".into(),
+                        "-c".into(),
+                        format!("echo evidence; exit {exit}"),
+                    ],
+                };
+                let mut stdout = Vec::new();
+                let code = super::run_command_evidence_with_observations(
+                    &args,
+                    &loaded_config(temp.path(), &repo),
+                    &repo,
+                    &paths,
+                    true,
+                    &mut stdout,
+                    policy,
+                )
+                .unwrap();
+                assert_eq!(
+                    code,
+                    if exit == 0 {
+                        ExitCode::SUCCESS
+                    } else {
+                        ExitCode::from(1)
+                    }
+                );
+                let output: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+                let id = output["evidence"]["id"].as_str().unwrap();
+                let evidence = crate::evidence::CommandEvidenceStore::new(
+                    paths.state_dir.join("command-evidence"),
+                )
+                .unwrap()
+                .get(id)
+                .expect("mandatory evidence remains readable");
+                assert_eq!(evidence.exit_code, exit);
+                assert_eq!(evidence.passed(), exit == 0);
+                assert!(std::path::Path::new(&evidence.log_path).is_file());
+                assert_eq!(paths.state_dir.join("metrics").exists(), policy.enabled());
+                if policy.enabled() {
+                    let store = crate::metrics::MetricsStore::open(&paths.state_dir).unwrap();
+                    assert_eq!(store.list(None, 10).unwrap().len(), 1);
+                }
+            }
+        }
     }
 
     #[test]

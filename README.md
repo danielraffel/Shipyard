@@ -229,6 +229,11 @@ You need only the tools used by your setup:
 Run `shipyard doctor` to check the tools and credentials for the current
 configuration.
 
+Set `SHIPYARD_OBSERVATIONS=off` in the producing process to stop automatic
+metrics, route-shadow and baseline collection; existing services need the new
+environment and a restart. Required evidence and explicit imports remain available.
+Retention controls deletion separately; see [collection scope](docs/log-retention.md#automatic-observation-collection).
+
 Shipyard stores optional CI timing data in its local SQLite metrics database so
 scorecards can measure queueing, waste, and rework. `shipyard cleanup --apply`
 keeps raw samples for 90 days by default; set
