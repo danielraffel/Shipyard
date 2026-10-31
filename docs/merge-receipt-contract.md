@@ -30,8 +30,7 @@ fails closed. `-` or an omitted file reads stdin.
 
 The SQLite store keeps receipts in `merge_receipts`, keyed by `receipt_id`.
 Scorecards count distinct imported safe `head_sha` values in the requested
-window on the measured protected `main` branch. A receipt joins only when
-completed jobs exist for its exact `repo`,
+window. A receipt joins only when completed jobs exist for its exact `repo`,
 exact `head_sha`, and PR number. A joined change's wasted compute is every
 failed or cancelled job of that pull request, earlier pushes included, so
 `wasted_compute_per_safely_merged_change` is per change, not per merged head.
@@ -54,53 +53,3 @@ receives no safe-merge receipt. The producer is observational: a receipt-store
 failure is surfaced as a cleanup warning after the merge and never authorizes
 or undoes the merge.
 The GitHub API importer remains read-only and does not manufacture receipts.
-
-For the Pulp merge-group reuse path, `shipyard metrics import
-github-merge-receipt` consumes a normalized `job.json`, one workflow-run and
-pull-request snapshot, and a complete check-runs snapshot (`complete: true`).
-The command requires the observed run URL and exact queue-ref identity to bind
-the artifact to the PR; it accepts GitHub's normal empty `pull_requests` array
-and accepts the artifact's `refs/heads/` spelling when the normalized run uses
-the corresponding bare branch name. The run projection also carries the exact
-merge-group commit's ordered parent SHAs. The importer requires exactly two
-parents: parent 0 is the queue entry's base (the protected base or the previous
-queue entry), and parent 1 is the artifact PR head. A batched group with a
-different second parent remains unavailable. The merged pull request's
-`merge_commit_sha` must also equal both the artifact merge SHA and the observed
-merge-group run head, so a stale queue run cannot certify a different commit
-that later landed.
-and requires each selected check to carry non-null `run_id`/`run_attempt`
-matching the observed workflow run. A commit-wide check-runs response with
-null per-check identity is rejected unless an upstream collector first
-enriches it from the authoritative run jobs. The normalized check snapshot
-also carries a positive `snapshot_run_id` and `snapshot_run_attempt` matching
-the observed workflow run; that binding is included in the gate evidence hash.
-Partial pages, duplicate required checks, ambiguous multi-PR arrays, mismatched
-URLs, and unknown snapshot fields remain unavailable rather than becoming
-receipts.
-
-The run projection must include `pull_requests`, even when GitHub supplies the
-legitimate empty array for a merge-group run. The check projection must include
-`total_count`, accepted only when it equals the captured `check_runs` length
-after pagination. These are normalized, schema-defined inputs; the importer
-intentionally rejects raw GitHub objects with unrelated fields. The artifact
-URL is a caller-provided locator and is not proof of artifact object identity;
-the SHA-256 of the supplied `job.json` bytes is the content binding recorded in
-the receipt. The Pulp `job.json` projection is the one exception for producer
-metadata: extra producer fields are ignored after the nine binding fields are
-strictly normalized, including a decimal-string `run_id`.
-
-The required-check list is checked for consistency, not authenticated. The
-caller must provide a normalized `shipyard.required-check-policy/v1`
-branch-protection/ruleset snapshot whose repository, protected base branch,
-and exact ordered check list match the reconciliation arguments, and
-`--policy-sha256` must be the SHA-256 of that normalized snapshot. A missing or
-mismatched policy, or a digest that does not match the snapshot, refuses the
-receipt. That proves the inputs agree with each other and nothing more: the
-policy snapshot, its digest and `collector_sha256` are all supplied by the
-caller, so whoever writes the policy can also produce its digest, and can drop
-a required gate from both the policy and `--required-check` and still obtain a
-safe-merge receipt. The receipt is therefore producer-self-asserted, like one
-imported with `metrics import merge-receipt`, and carries the same
-`source: "shipyard"` as one emitted at the protected merge boundary; consumers
-must not treat it as evidence of branch-protection provenance.

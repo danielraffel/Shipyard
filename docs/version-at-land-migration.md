@@ -8,10 +8,9 @@ without racing on a shared version line.
 
 The post-merge `version-at-land.yml` workflow is the only writer. It computes
 the highest semver level from the merged range, writes all files in each
-surface, commits `Version-Bump-Applied:` on the bot-owned
-`release/version-at-land` branch, and opens or updates the one bump pull request
-for it (main's ruleset refuses direct pushes). The existing `auto-release.yml`
-notices the version move when that pull request merges and creates `vX.Y.Z`; `release.yml` publishes it, and `shipyard update` continues to use
+surface, commits `Version-Bump-Applied:`, and pushes with a fast-forward-only
+retry. The existing `auto-release.yml` notices the writer commit and creates
+`vX.Y.Z`; `release.yml` publishes it, and `shipyard update` continues to use
 the latest published tag.
 
 ## In-flight pull requests

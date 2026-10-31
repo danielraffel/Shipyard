@@ -120,17 +120,7 @@ fn verdict_for(
         .filter_map(|event| event.strip_prefix("excluded_human_approval:"))
         .map(str::to_owned)
         .collect();
-    let holder = events
-        .iter()
-        .find_map(|event| event.strip_prefix("head_held:"));
     let fix = (!allowed).then(|| {
-        if let Some(holder) = holder {
-            return format!(
-                "head {head} is {holder}, and a HOLD makes its head un-approvable: the author \
-                 pushes a new head to https://github.com/{repo}/pull/{pr} that addresses the \
-                 HOLD, and a reviewer reviews that new head"
-            );
-        }
         format!(
             "a reviewer agent reviews head {head} and posts, through `ghapp` (the fleet App), \
              a comment ending `verdict: APPROVE head:{head}` on \

@@ -341,7 +341,7 @@ pub fn load_state(path: &Path) -> Result<Option<ObserverState>, String> {
 
 /// Load a prior cursor for a digest, rejecting legacy state explicitly.
 ///
-/// `queue-observe` uses [`load_state`] so an older cursor can be replaced by
+/// `queue-observe` uses [`load_state`] so a schema-2 cursor can be replaced by
 /// a fresh authenticated capture. A digest has no fetch/rebootstrap step, so
 /// it must report that legacy state as the reason it cannot prove a census.
 pub fn load_state_for_digest(path: &Path) -> Result<Option<ObserverState>, String> {
@@ -356,7 +356,7 @@ fn load_state_with_legacy_policy(
         Ok(raw) => {
             let state: ObserverState = serde_json::from_str(&raw)
                 .map_err(|error| format!("parse observer state {}: {error}", path.display()))?;
-            if state.schema_version < QUEUE_OBSERVER_SCHEMA_VERSION
+            if state.schema_version == QUEUE_OBSERVER_SCHEMA_VERSION - 1
                 && state.snapshot_integrity_hash.is_empty()
             {
                 let actual = snapshot_hash(&state.snapshot).map_err(|error| {
@@ -1429,8 +1429,8 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp");
         let path = temp.path().join("observer.json");
         let mut state = observe(None, minimal_snapshot("a")).expect("state").state;
-        state.schema_version = QUEUE_OBSERVER_SCHEMA_VERSION - 2;
-        state.snapshot.schema_version = QUEUE_OBSERVER_SCHEMA_VERSION - 2;
+        state.schema_version = QUEUE_OBSERVER_SCHEMA_VERSION - 1;
+        state.snapshot.schema_version = QUEUE_OBSERVER_SCHEMA_VERSION - 1;
         state.state_hash = snapshot_hash(&state.snapshot).expect("legacy hash");
         state.snapshot_integrity_hash.clear();
         save_state(&path, &state).expect("legacy state");

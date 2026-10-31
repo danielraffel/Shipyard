@@ -5,12 +5,6 @@ This is the deliberately small integration: exe.dev owns VM creation and
 account capacity, while Shipyard owns command execution, logs, artifacts, and
 typed evidence.
 
-Nothing exe.dev-specific is needed or implemented. There is no exe.dev
-provider, no VM lifecycle management, and no exe.dev setting in Shipyard's
-code: an exe.dev VM is a Linux host you reach over SSH, configured like any
-other SSH target (see [Targets](targets.md)). Create the VM and register your
-SSH key on exe.dev first; Shipyard does not do either.
-
 ```toml
 [targets.exe-linux]
 backend = "ssh"
@@ -20,9 +14,8 @@ repo_path = "/home/exedev/work/project"
 timeout_secs = 1800
 ```
 
-The target can be used with `shipyard watch local --target exe-linux` for a
-streamed workload or `shipyard run command --target exe-linux -- <command>` for
-a bounded command and evidence bundle. The latter
+The target can be used with `shipyard watch local` for a streamed workload or
+`shipyard run command` for a bounded command and evidence bundle. The latter
 records the caller-provided source SHA, remote host, command, exit code,
 duration, log excerpt, and copied artifact metadata. Verify the remote
 checkout head and compute final executable, artifact, and log hashes separately

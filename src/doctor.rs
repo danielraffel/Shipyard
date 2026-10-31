@@ -4,9 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
-use serde_json::Value;
 
 use crate::cloud::{GitHubActions, workflow_run_is_newer};
 use crate::config::LoadedConfig;
@@ -25,9 +23,6 @@ pub mod stuck_git;
 const RELEASE_CHAIN_WORKFLOW: &str = "auto-release.yml";
 const RELEASE_CHAIN_POLL_ATTEMPTS: usize = 30;
 const RELEASE_CHAIN_POLL_INTERVAL_SECS: u64 = 10;
-const CLEANUP_STATUS_RELATIVE_PATH: &str = "cleanup/last-run.json";
-const CLEANUP_STATUS_MIN_STALE_AGE: Duration = Duration::hours(48);
-const CLEANUP_DEFAULT_INTERVAL_SECS: i64 = 86_400;
 
 /// A single doctor entry shown in one section of the report.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -205,9 +200,6 @@ fn collect_report_with_github_auth(
     {
         core.insert("daemon-public-ingress".to_owned(), entry);
     }
-    if let Some(entry) = check_cleanup_status(state_dir) {
-        core.insert("cleanup".to_owned(), entry);
-    }
     let ready = ["git", "ssh", "rich-bundle"]
         .iter()
         .all(|name| core.get(*name).is_some_and(|entry| entry.ok))
@@ -250,194 +242,6 @@ fn collect_report_with_github_auth(
     }
 
     DoctorReport { ready, checks }
-}
-
-/// Read the last scheduled cleanup receipt when the fleet cleanup agent is installed.
-/// Missing state remains invisible so ordinary interactive installations do not fail
-/// doctor merely because they do not use the macOS fleet scheduler.
-#[allow(clippy::too_many_lines)] // Keep cleanup receipt states in one fail-closed decision chain.
-fn check_cleanup_status(state_dir: &Path) -> Option<DoctorEntry> {
-    let path = state_dir.join(CLEANUP_STATUS_RELATIVE_PATH);
-    let in_progress = state_dir.join("cleanup/last-run.in-progress");
-    if in_progress.exists() {
-        let marker = fs::read_to_string(&in_progress)
-            .ok()
-            .and_then(|text| serde_json::from_str::<Value>(&text).ok());
-        let marker_schema_valid = marker
-            .as_ref()
-            .and_then(|value| value.get("schema"))
-            .and_then(Value::as_str)
-            == Some("shipyard-cleanup-progress/v1");
-        let started_at = marker
-            .as_ref()
-            .and_then(|value| value.get("started_at"))
-            .and_then(Value::as_str)
-            .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
-            .map(|timestamp| timestamp.with_timezone(&Utc));
-        let interval = marker
-            .as_ref()
-            .and_then(|value| value.get("interval_seconds"))
-            .and_then(Value::as_i64)
-            .filter(|seconds| *seconds >= 900)
-            .unwrap_or(CLEANUP_DEFAULT_INTERVAL_SECS);
-        let stale_after = cleanup_stale_after(interval);
-        let age = started_at.map(|timestamp| Utc::now().signed_duration_since(timestamp));
-        let pid_alive = marker
-            .as_ref()
-            .and_then(|value| value.get("pid"))
-            .and_then(Value::as_u64)
-            .and_then(|pid| u32::try_from(pid).ok())
-            .is_some_and(process_is_alive);
-        if marker_schema_valid
-            && let Some(started_at) = started_at
-            && pid_alive
-            && age.is_some_and(|value| value >= Duration::zero() && value <= stale_after)
-        {
-            return Some(DoctorEntry::ok(format!(
-                "scheduled cleanup is in progress ({}; pid {})",
-                started_at.to_rfc3339(),
-                marker
-                    .as_ref()
-                    .and_then(|value| value.get("pid"))
-                    .and_then(Value::as_u64)
-                    .map_or_else(|| "unknown".to_owned(), |pid| pid.to_string())
-            )));
-        }
-        return Some(DoctorEntry {
-            ok: false,
-            version: Some("interrupted".to_owned()),
-            detail: Some(format!(
-                "scheduled cleanup left a stale in-progress marker at {}",
-                in_progress.display()
-            )),
-            error: Some("cleanup did not publish a terminal receipt".to_owned()),
-        });
-    }
-    if !path.exists() {
-        return None;
-    }
-    let value = match fs::read_to_string(&path)
-        .map_err(|error| error.to_string())
-        .and_then(|text| serde_json::from_str::<Value>(&text).map_err(|error| error.to_string()))
-    {
-        Ok(value) => value,
-        Err(error) => {
-            return Some(DoctorEntry {
-                ok: false,
-                version: Some("unreadable".to_owned()),
-                detail: None,
-                error: Some(format!("{}: {error}", path.display())),
-            });
-        }
-    };
-    if value.get("schema").and_then(Value::as_str) != Some("shipyard-cleanup-status/v1") {
-        return Some(DoctorEntry {
-            ok: false,
-            version: Some("invalid".to_owned()),
-            detail: None,
-            error: Some(format!("{} has an unsupported schema", path.display())),
-        });
-    }
-    let observed_at = value
-        .get("observed_at")
-        .and_then(Value::as_str)
-        .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
-        .map(|timestamp| timestamp.with_timezone(&Utc));
-    let Some(observed_at) = observed_at else {
-        return Some(DoctorEntry {
-            ok: false,
-            version: Some("invalid".to_owned()),
-            detail: None,
-            error: Some(format!("{} has no valid observed_at", path.display())),
-        });
-    };
-    if observed_at > Utc::now() + Duration::minutes(5) {
-        return Some(DoctorEntry {
-            ok: false,
-            version: Some("invalid".to_owned()),
-            detail: Some(format!("receipt timestamp is in the future: {observed_at}")),
-            error: Some("cleanup receipt clock binding is invalid".to_owned()),
-        });
-    }
-    let interval = value
-        .get("interval_seconds")
-        .and_then(Value::as_i64)
-        .filter(|seconds| *seconds >= 900)
-        .unwrap_or(CLEANUP_DEFAULT_INTERVAL_SECS);
-    let stale_after = cleanup_stale_after(interval);
-    let age = Utc::now().signed_duration_since(observed_at);
-    if age > stale_after {
-        return Some(DoctorEntry {
-            ok: false,
-            version: Some("stale".to_owned()),
-            detail: Some(format!(
-                "last scheduled cleanup was {} hours ago",
-                age.num_hours()
-            )),
-            error: Some(format!(
-                "cleanup scheduler has not reported within {} hours",
-                stale_after.num_hours()
-            )),
-        });
-    }
-    let cleanup_exit = value.get("cleanup_exit").and_then(Value::as_i64);
-    let validation_exit = value.get("validation_tmp_exit").and_then(Value::as_i64);
-    let failed_output = |key: &str| {
-        value
-            .get(key)
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|text| !text.is_empty())
-            .map(|text| text.chars().take(600).collect::<String>())
-    };
-    if value.get("ok").and_then(Value::as_bool) != Some(true)
-        || cleanup_exit != Some(0)
-        || validation_exit != Some(0)
-    {
-        let mut details = Vec::new();
-        if cleanup_exit != Some(0)
-            && let Some(output) = failed_output("cleanup_output")
-        {
-            details.push(format!("cleanup: {output}"));
-        }
-        if validation_exit != Some(0)
-            && let Some(output) = failed_output("validation_tmp_output")
-        {
-            details.push(format!("validation-tmp: {output}"));
-        }
-        return Some(DoctorEntry {
-            ok: false,
-            version: Some("failed".to_owned()),
-            detail: (!details.is_empty()).then(|| details.join("; ")),
-            error: Some("scheduled cleanup reported a refusal or command failure".to_owned()),
-        });
-    }
-    Some(DoctorEntry::ok(format!(
-        "last run {}",
-        observed_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-    )))
-}
-
-fn cleanup_stale_after(interval_seconds: i64) -> Duration {
-    let interval = Duration::seconds(interval_seconds.saturating_mul(3));
-    if interval > CLEANUP_STATUS_MIN_STALE_AGE {
-        interval
-    } else {
-        CLEANUP_STATUS_MIN_STALE_AGE
-    }
-}
-
-#[cfg(unix)]
-fn process_is_alive(pid: u32) -> bool {
-    Command::new("/bin/kill")
-        .args(["-0", &pid.to_string()])
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
-#[cfg(not(unix))]
-fn process_is_alive(_pid: u32) -> bool {
-    false
 }
 
 /// Probe configured non-local runner targets using the same dispatcher
@@ -1669,9 +1473,6 @@ mod tests {
     use std::path::Path;
 
     #[cfg(unix)]
-    use super::{CLEANUP_DEFAULT_INTERVAL_SECS, cleanup_stale_after};
-
-    #[cfg(unix)]
     #[test]
     fn the_system_probe_refuses_gh_from_path_in_a_test() {
         let refused =
@@ -1706,13 +1507,13 @@ mod tests {
 
     use super::{
         AmbientGhCliAuth, CommandProbe, DoctorCommandOutput, DoctorReport, GhAuthCheckError,
-        ReleaseBotSecretState, ambient_gh_cli_auth_from, check_cleanup_status,
-        check_daemon_version_drift_with, check_gh_workflow_scope_for_auth,
-        check_gh_workflow_scope_with, check_macos_gatekeeper_health_with,
-        check_release_bot_token_with, check_shipyard_path_shadows_with, check_tag_drift_with,
-        collect_report_with_github_auth, configured_token_scope_entry, github_auth_entry,
-        github_auth_entry_result, is_runner_target, nsc_entry, parse_github_repo_slug,
-        release_chain_result_entry, runner_check,
+        ReleaseBotSecretState, ambient_gh_cli_auth_from, check_daemon_version_drift_with,
+        check_gh_workflow_scope_for_auth, check_gh_workflow_scope_with,
+        check_macos_gatekeeper_health_with, check_release_bot_token_with,
+        check_shipyard_path_shadows_with, check_tag_drift_with, collect_report_with_github_auth,
+        configured_token_scope_entry, github_auth_entry, github_auth_entry_result,
+        is_runner_target, nsc_entry, parse_github_repo_slug, release_chain_result_entry,
+        runner_check,
     };
     use crate::executor::dispatch::{ExecutorDispatcher, resolve_targets_from_table};
     use crate::gh::{GhAuthSourceSummary, GhAuthSummary, GhPrepareError};
@@ -1786,244 +1587,6 @@ mod tests {
         let nsc = &report.checks["Cloud providers"]["nsc"];
         assert!(nsc.ok);
         assert_eq!(nsc.version.as_deref(), Some("not configured (optional)"));
-    }
-
-    #[test]
-    fn cleanup_status_is_absent_until_the_scheduler_has_run() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        assert!(check_cleanup_status(temp.path()).is_none());
-    }
-
-    #[test]
-    fn cleanup_status_surfaces_an_interrupted_run_without_a_receipt() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let marker = temp.path().join("cleanup/last-run.in-progress");
-        std::fs::create_dir_all(marker.parent().expect("parent")).expect("directory");
-        std::fs::write(&marker, "2026-10-29T08:00:00Z\n").expect("marker");
-        let entry = check_cleanup_status(temp.path()).expect("entry");
-        assert!(!entry.ok);
-        assert_eq!(entry.version.as_deref(), Some("interrupted"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn cleanup_status_rejects_a_stale_marker_even_when_its_pid_is_reused() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let marker = temp.path().join("cleanup/last-run.in-progress");
-        std::fs::create_dir_all(marker.parent().expect("parent")).expect("directory");
-        let started_at = chrono::Utc::now()
-            - cleanup_stale_after(CLEANUP_DEFAULT_INTERVAL_SECS)
-            - chrono::Duration::minutes(1);
-        std::fs::write(
-            &marker,
-            serde_json::json!({
-                "schema": "shipyard-cleanup-progress/v1",
-                "pid": std::process::id(),
-                "started_at": started_at.to_rfc3339(),
-                "interval_seconds": CLEANUP_DEFAULT_INTERVAL_SECS
-            })
-            .to_string(),
-        )
-        .expect("marker");
-        let entry = check_cleanup_status(temp.path()).expect("entry");
-        assert!(!entry.ok);
-        assert_eq!(entry.version.as_deref(), Some("interrupted"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn cleanup_status_rejects_a_future_in_progress_marker() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let marker = temp.path().join("cleanup/last-run.in-progress");
-        std::fs::create_dir_all(marker.parent().expect("parent")).expect("directory");
-        let started_at = chrono::Utc::now() + chrono::Duration::minutes(10);
-        std::fs::write(
-            &marker,
-            serde_json::json!({
-                "schema": "shipyard-cleanup-progress/v1",
-                "pid": std::process::id(),
-                "started_at": started_at.to_rfc3339(),
-                "interval_seconds": CLEANUP_DEFAULT_INTERVAL_SECS
-            })
-            .to_string(),
-        )
-        .expect("marker");
-        let entry = check_cleanup_status(temp.path()).expect("entry");
-        assert!(!entry.ok);
-        assert_eq!(entry.version.as_deref(), Some("interrupted"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn cleanup_status_rejects_an_unrecognised_progress_marker_schema() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let marker = temp.path().join("cleanup/last-run.in-progress");
-        std::fs::create_dir_all(marker.parent().expect("parent")).expect("directory");
-        std::fs::write(
-            &marker,
-            serde_json::json!({
-                "schema": "other-progress/v1",
-                "pid": std::process::id(),
-                "started_at": chrono::Utc::now().to_rfc3339(),
-                "interval_seconds": CLEANUP_DEFAULT_INTERVAL_SECS
-            })
-            .to_string(),
-        )
-        .expect("marker");
-        let entry = check_cleanup_status(temp.path()).expect("entry");
-        assert!(!entry.ok);
-        assert_eq!(entry.version.as_deref(), Some("interrupted"));
-    }
-
-    #[test]
-    fn cleanup_status_surfaces_a_recent_refusal() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let path = temp.path().join("cleanup/last-run.json");
-        std::fs::create_dir_all(path.parent().expect("parent")).expect("directory");
-        std::fs::write(
-            &path,
-            serde_json::json!({
-                "schema": "shipyard-cleanup-status/v1",
-                "observed_at": chrono::Utc::now().to_rfc3339(),
-                "ok": false,
-                "cleanup_exit": 1,
-                "validation_tmp_exit": 0,
-                "cleanup_output": "refusing log cleanup: malformed terminal job sy-1"
-            })
-            .to_string(),
-        )
-        .expect("status");
-        let entry = check_cleanup_status(temp.path()).expect("entry");
-        assert!(!entry.ok);
-        assert_eq!(entry.version.as_deref(), Some("failed"));
-        assert!(
-            entry
-                .detail
-                .as_deref()
-                .unwrap()
-                .contains("malformed terminal job")
-        );
-    }
-
-    #[test]
-    fn failed_cleanup_receipt_degrades_the_doctor_report() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let path = temp.path().join("cleanup/last-run.json");
-        std::fs::create_dir_all(path.parent().expect("parent")).expect("directory");
-        std::fs::write(
-            &path,
-            serde_json::json!({
-                "schema": "shipyard-cleanup-status/v1",
-                "observed_at": chrono::Utc::now().to_rfc3339(),
-                "ok": false,
-                "cleanup_exit": 1,
-                "validation_tmp_exit": 0,
-                "cleanup_output": "refusing log cleanup: malformed terminal job sy-1"
-            })
-            .to_string(),
-        )
-        .expect("status");
-        // report_with uses a different temporary home; exercise the collector
-        // directly so the state directory is the one carrying the receipt.
-        let probe = FakeProbe {
-            values: [("git", "git version 2.48.0"), ("ssh", "OpenSSH_9.9")]
-                .into_iter()
-                .map(|(command, version)| (command.to_owned(), version.to_owned()))
-                .collect(),
-        };
-        let report = collect_report_with_github_auth(
-            &probe,
-            RuntimeMode::Isolated,
-            temp.path(),
-            temp.path(),
-            &Ok(GhAuthSummary {
-                source: GhAuthSourceSummary::GhCli,
-                token_kind: None,
-                expires_at: None,
-            }),
-        );
-        assert!(
-            report.ready,
-            "cleanup warnings must not make CI readiness red: {report:?}"
-        );
-        assert!(!report.checks["Core"]["cleanup"].ok);
-    }
-
-    #[test]
-    fn cleanup_status_rejects_stale_scheduler_receipt() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let path = temp.path().join("cleanup/last-run.json");
-        std::fs::create_dir_all(path.parent().expect("parent")).expect("directory");
-        std::fs::write(
-            &path,
-            serde_json::json!({
-                "schema": "shipyard-cleanup-status/v1",
-                "observed_at": (chrono::Utc::now() - chrono::Duration::hours(49)).to_rfc3339(),
-                "interval_seconds": 21600,
-                "ok": true,
-                "cleanup_exit": 0,
-                "validation_tmp_exit": 0
-            })
-            .to_string(),
-        )
-        .expect("status");
-        let entry = check_cleanup_status(temp.path()).expect("entry");
-        assert!(!entry.ok);
-        assert_eq!(entry.version.as_deref(), Some("stale"));
-    }
-
-    #[test]
-    fn cleanup_status_reports_validation_only_failure() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let path = temp.path().join("cleanup/last-run.json");
-        std::fs::create_dir_all(path.parent().expect("parent")).expect("directory");
-        std::fs::write(
-            &path,
-            serde_json::json!({
-                "schema": "shipyard-cleanup-status/v1",
-                "observed_at": chrono::Utc::now().to_rfc3339(),
-                "ok": false,
-                "cleanup_exit": 0,
-                "validation_tmp_exit": 1,
-                "cleanup_output": "cleanup ok",
-                "validation_tmp_output": "validation refusal"
-            })
-            .to_string(),
-        )
-        .expect("status");
-        let entry = check_cleanup_status(temp.path()).expect("entry");
-        assert!(!entry.ok);
-        assert!(entry.detail.as_deref().unwrap().contains("validation-tmp"));
-        assert!(
-            entry
-                .detail
-                .as_deref()
-                .unwrap()
-                .contains("validation refusal")
-        );
-        assert!(!entry.detail.as_deref().unwrap().contains("cleanup ok"));
-    }
-
-    #[test]
-    fn cleanup_status_rejects_future_receipt() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let path = temp.path().join("cleanup/last-run.json");
-        std::fs::create_dir_all(path.parent().expect("parent")).expect("directory");
-        std::fs::write(
-            &path,
-            serde_json::json!({
-                "schema": "shipyard-cleanup-status/v1",
-                "observed_at": (chrono::Utc::now() + chrono::Duration::minutes(10)).to_rfc3339(),
-                "ok": true,
-                "cleanup_exit": 0,
-                "validation_tmp_exit": 0
-            })
-            .to_string(),
-        )
-        .expect("status");
-        let entry = check_cleanup_status(temp.path()).expect("entry");
-        assert!(!entry.ok);
-        assert_eq!(entry.version.as_deref(), Some("invalid"));
     }
 
     #[test]

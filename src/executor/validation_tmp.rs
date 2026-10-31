@@ -126,52 +126,6 @@ pub struct Candidate {
     pub age_hours: u64,
     /// Why nothing can still be using it.
     pub reason: String,
-    #[serde(skip)]
-    owner_pid: Option<u32>,
-    #[serde(skip)]
-    planned_modified: SystemTime,
-    #[serde(skip)]
-    planned_identity: PathIdentity,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct PathIdentity {
-    #[cfg(unix)]
-    device: u64,
-    #[cfg(unix)]
-    inode: u64,
-    #[cfg(windows)]
-    volume_serial: u64,
-    #[cfg(windows)]
-    file_index: u64,
-}
-
-fn path_identity(path: &Path) -> Option<PathIdentity> {
-    let metadata = fs::symlink_metadata(path).ok()?;
-    if metadata.file_type().is_symlink() {
-        return None;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        Some(PathIdentity {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        })
-    }
-    #[cfg(windows)]
-    {
-        let handle = winapi_util::Handle::from_path_any(path).ok()?;
-        let info = winapi_util::file::information(&handle).ok()?;
-        return Some(PathIdentity {
-            volume_serial: info.volume_serial_number(),
-            file_index: info.file_index(),
-        });
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        Some(PathIdentity {})
-    }
 }
 
 /// The validation TMPDIRs under `base` that `policy` allows deleting.
@@ -209,7 +163,6 @@ pub fn plan(
         if age < policy.min_age {
             continue;
         }
-        let mut owner_pid = None;
         let reason = match fs::read_to_string(owner_path(&path)) {
             Ok(text) => {
                 let Ok(pid) = text.trim().parse::<u32>() else {
@@ -218,7 +171,6 @@ pub fn plan(
                 if liveness.pid_alive(pid) {
                     continue;
                 }
-                owner_pid = Some(pid);
                 format!("owner process {pid} is gone")
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -237,20 +189,11 @@ pub fn plan(
             }
             Err(_) => continue,
         };
-        let Some(planned_modified) = metadata.modified().ok() else {
-            continue;
-        };
-        let Some(planned_identity) = path_identity(&path) else {
-            continue;
-        };
         candidates.push(Candidate {
             bytes: tree_bytes(&path),
             age_hours: age.as_secs() / 3600,
             path,
             reason,
-            owner_pid,
-            planned_modified,
-            planned_identity,
         });
     }
     candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.bytes));
@@ -260,21 +203,8 @@ pub fn plan(
 /// Delete planned directories, returning the bytes actually freed.
 #[must_use]
 pub fn apply(candidates: &[Candidate]) -> u64 {
-    apply_with_liveness(candidates, &SystemLiveness)
-}
-
-/// Apply a previously planned reclaim with an injected liveness probe. The
-/// production entry point uses [`SystemLiveness`]; this seam also makes the
-/// final recheck race-safe under deterministic tests.
-pub(crate) fn apply_with_liveness(candidates: &[Candidate], liveness: &dyn Liveness) -> u64 {
     let mut freed = 0;
     for candidate in candidates {
-        // Planning and deletion are separate operations. Recheck the owner,
-        // liveness, and directory identity immediately before removal so a
-        // restarted run cannot lose its TMPDIR through a stale plan.
-        if !still_reclaimable(candidate, liveness) {
-            continue;
-        }
         super::local::make_tree_owner_writable(&candidate.path);
         if fs::remove_dir_all(&candidate.path).is_ok() {
             freed += candidate.bytes;
@@ -282,32 +212,6 @@ pub(crate) fn apply_with_liveness(candidates: &[Candidate], liveness: &dyn Liven
         }
     }
     freed
-}
-
-fn still_reclaimable(candidate: &Candidate, liveness: &dyn Liveness) -> bool {
-    let Ok(metadata) = fs::symlink_metadata(&candidate.path) else {
-        return false;
-    };
-    if metadata.file_type().is_symlink()
-        || !metadata.is_dir()
-        || !owned_by_current_user(&metadata)
-        || metadata.modified().ok() != Some(candidate.planned_modified)
-        || path_identity(&candidate.path) != Some(candidate.planned_identity.clone())
-    {
-        return false;
-    }
-    if let Some(pid) = candidate.owner_pid {
-        let Ok(text) = fs::read_to_string(owner_path(&candidate.path)) else {
-            return false;
-        };
-        text.trim().parse::<u32>().ok() == Some(pid) && !liveness.pid_alive(pid)
-    } else {
-        let Some(live_tmpdirs) = liveness.live_tmpdirs() else {
-            return false;
-        };
-        let path = candidate.path.to_string_lossy();
-        !live_tmpdirs.iter().any(|value| value == path.as_ref())
-    }
 }
 
 /// Delete dead owners' directories older than [`AUTOMATIC_MIN_AGE`]. A run

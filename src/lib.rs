@@ -177,7 +177,6 @@ pub mod metadata_authority;
 /// Runner and CI timing metrics store and analysis helpers.
 pub mod metrics;
 mod native_executable;
-mod observations;
 /// Opt-in targets (`default = false`) as a reported fact on every surface.
 pub mod opt_in_targets;
 /// Private outage-window membership and provenance validation.
@@ -221,8 +220,6 @@ pub mod platform;
 pub mod pr;
 /// Same-session sibling pull requests that could ship as one.
 pub mod pr_fold;
-/// The "what happens next" block `shipyard pr` prints.
-pub mod pr_next_steps;
 /// Classify one pull request's merge-queue state from GraphQL timeline facts.
 pub mod pr_queue_state;
 /// Pull request title/body composition.
@@ -274,8 +271,6 @@ pub mod reuse_record_store;
 pub mod review_verdict;
 /// Fail-closed durable reviewer-dispatch receipts and exact-head liveness.
 pub mod reviewer_dispatch;
-/// Authenticated, idempotent reviewer receipt publication boundary.
-pub mod reviewer_receipt;
 /// Rollup batching: several approved pull requests landed as one tested merge.
 pub mod rollup;
 /// Shadow-only ordered route and capability receipts.

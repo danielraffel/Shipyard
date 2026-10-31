@@ -102,18 +102,17 @@ pub fn sql_params(key: Option<&ProjectKey>) -> (Option<i64>, Option<String>, Opt
     })
 }
 
-/// Split a slug passed as a project into the canonical lower-case short key
-/// plus `repo`, keeping an explicit `repo`. Short keys are canonicalized too
-/// so callers cannot create case-split metric populations.
+/// Split a slug passed as a project into the short key plus `repo`, keeping an
+/// explicit `repo`. A short key is returned unchanged.
 #[must_use]
 pub fn normalize_for_write(project: &str, repo: Option<&str>) -> (String, Option<String>) {
     let trimmed = project.trim().trim_matches('/');
     match trimmed.rsplit_once('/') {
         Some((owner, name)) if !owner.is_empty() && !name.is_empty() => (
-            name.to_ascii_lowercase(),
+            name.to_owned(),
             Some(repo.map_or_else(|| trimmed.to_owned(), str::to_owned)),
         ),
-        _ => (trimmed.to_ascii_lowercase(), repo.map(str::to_owned)),
+        _ => (trimmed.to_owned(), repo.map(str::to_owned)),
     }
 }
 
@@ -163,10 +162,5 @@ mod tests {
             ("pulp".to_owned(), Some("Generous-Corp/pulp".to_owned()))
         );
         assert_eq!(normalize_for_write("pulp", None), ("pulp".to_owned(), None));
-        assert_eq!(normalize_for_write("Pulp", None), ("pulp".to_owned(), None));
-        assert_eq!(
-            normalize_for_write("Generous-Corp/Pulp", None),
-            ("pulp".to_owned(), Some("Generous-Corp/Pulp".to_owned()))
-        );
     }
 }

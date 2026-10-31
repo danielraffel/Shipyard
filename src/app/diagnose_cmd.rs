@@ -32,7 +32,6 @@ use crate::config::LoadedConfig;
 use crate::diagnose::annotate::{self, Tree};
 use crate::diagnose::cause;
 use crate::diagnose::{self, Context, Diagnosis, Job, Unreadable};
-use crate::gate_cost::fetch_job_log;
 use crate::identity::RuntimeMode;
 use crate::landability::gate;
 use crate::pr_watch::flags::{DigestRoute, FlagKind};
@@ -554,8 +553,12 @@ fn read_logs(read: &Read<'_>, repo: &str, target: &Target) -> HashMap<i64, Strin
         })
         .take(diagnose::MAX_CHECKS)
         .filter_map(|job| {
-            let id = u64::try_from(job.id).ok()?;
-            fetch_job_log(read, repo, id).ok().map(|log| (job.id, log))
+            read(&argv(&[
+                "api",
+                &format!("repos/{repo}/actions/jobs/{}/logs", job.id),
+            ]))
+            .ok()
+            .map(|log| (job.id, log))
         })
         .collect()
 }

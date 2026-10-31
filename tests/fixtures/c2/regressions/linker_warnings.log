@@ -1,5 +1,0 @@
-ld: warning: duplicate symbol 'example_symbol' in: a.o b.o
-ld: warning: directory not found for option '-L/opt/example/lib'
-/usr/bin/ld: a.o: warning: undefined reference to `example_symbol'
-[2/2] Linking CXX executable example
-Build completed successfully

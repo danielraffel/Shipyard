@@ -27,23 +27,4 @@ PLIST="$HOME/Library/LaunchAgents/com.danielraffel.shipyard.merge-receipt-handof
 grep -q 'bootstrap gui/' "$TMP/launchctl.log"
 grep -q 'owner/repo' "$PLIST"
 grep -q -- '--base-branch' "$PLIST"
-grep -q '<string>com.danielraffel.shipyard.merge-receipt-handoff</string>' "$PLIST"
-PRODUCER_SCRIPT="$HOME/Library/Application Support/shipyard/merge_receipt_handoff.py"
-[ -f "$PRODUCER_SCRIPT" ]
-"$ROOT/scripts/install_merge_receipt_handoff.sh" --repo owner/repo --python "$FAKE_PYTHON" \
-  --source-host m3 --source-shipyard /Users/danielraffel/.local/bin/shipyard \
-  --source-state-dir '/Users/danielraffel/Library/Application Support/shipyard' \
-  --interval 900 --install >"$TMP/observer-install"
-OBSERVER_PLIST="$HOME/Library/LaunchAgents/com.danielraffel.shipyard.merge-receipt-observer.plist"
-[ -f "$OBSERVER_PLIST" ]
-/usr/bin/plutil -lint "$OBSERVER_PLIST" >/dev/null
-grep -q '<string>fetch</string>' "$OBSERVER_PLIST"
-grep -q '<string>m3</string>' "$OBSERVER_PLIST"
-grep -q '<string>--source-shipyard</string>' "$OBSERVER_PLIST"
-if grep -q '<string>export</string>' "$OBSERVER_PLIST"; then exit 1; fi
-grep -q '<string>com.danielraffel.shipyard.merge-receipt-observer</string>' "$OBSERVER_PLIST"
-grep -q 'merge-receipt-observer/merge_receipt_handoff.py' "$OBSERVER_PLIST"
-OBSERVER_SCRIPT="$HOME/Library/Application Support/shipyard/merge-receipt-observer/merge_receipt_handoff.py"
-[ -f "$OBSERVER_SCRIPT" ]
-[ "$PRODUCER_SCRIPT" != "$OBSERVER_SCRIPT" ]
 echo "merge receipt handoff installer checks passed"

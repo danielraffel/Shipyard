@@ -325,46 +325,6 @@ fn orphan_reconciliation_dry_run_then_apply_publishes_outcome_and_releases_only_
 }
 
 #[test]
-fn orphan_reconciliation_accepts_authenticated_foreground_merge_cancellation() {
-    let fixture = orphan_fixture();
-    let request_store = QueueRequestStore::new(&fixture.state_dir).expect("request store");
-    let mut envelope = request_store
-        .load(&fixture.job.id)
-        .expect("load request")
-        .expect("request");
-    envelope.execution_owner = QueuedExecutionOwner::Foreground;
-    request_store.save(&envelope).expect("foreground request");
-
-    let proof = CancellationProof {
-        cause: CancellationCause::AlreadyMerged,
-        repository: "generous-corp/pulp".to_owned(),
-        pull_request: 7863,
-        head_sha: fixture.job.sha.clone(),
-    };
-    let mut queue = Queue::new(&fixture.state_dir).expect("queue");
-    queue
-        .request_cancel_with_proof(
-            &fixture.job.id,
-            Some(crate::queue::ALREADY_MERGED_CANCEL_REASON.to_owned()),
-            Some(proof),
-        )
-        .expect("request cancellation")
-        .expect("running job");
-
-    let dry_run = run_reconciliation(
-        &fixture,
-        None,
-        None,
-        None,
-        false,
-        |job, _, _| Ok(Some(exact_merge(job))),
-        |_, _| Ok(Vec::new()),
-    )
-    .expect("foreground dry run");
-    assert_eq!(output_data(&dry_run)["disposition"], "dry_run");
-}
-
-#[test]
 fn orphan_reconciliation_refuses_related_process_before_merge_observation() {
     let fixture = orphan_fixture();
     let mut observed = false;

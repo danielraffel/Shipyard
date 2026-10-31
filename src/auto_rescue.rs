@@ -470,8 +470,6 @@ mod tests {
             merge_queue_enqueue_succeeded_at: None,
             merge_queue_enqueue_started_at: None,
             abandoned: None,
-            reviewer_claim_epoch: 0,
-            active_reviewer_claim: None,
         };
         state
             .evidence_snapshot

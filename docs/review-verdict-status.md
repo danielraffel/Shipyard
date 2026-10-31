@@ -17,9 +17,8 @@ required check: GitHub then cannot merge a head whose status is not
 `review_gate` with the live head bound, so the status and the guard cannot
 disagree:
 
-- a trusted HOLD naming the head always wins, before or after any APPROVE of
-  the same head (a held head needs a new push); otherwise the newest trusted
-  verdict naming the head decides;
+- the newest trusted verdict naming the head decides; a HOLD with no readable
+  time always wins;
 - `success` only for an APPROVE naming the head (a comment ending
   `verdict: APPROVE head:<sha>` or `reviewed: <sha>`, or an `APPROVED`
   review on it), or one the guard's merge-only carry takes to it;
@@ -46,13 +45,6 @@ APPROVE counts at all ("no signer list is configured on the base branch").
 Every repository that relies on the status, or on `shipyard review-verdict`,
 must set the list on its base branch first.
 
-Repositories that commission more than one provider can bind each signer name
-to stamped host and agent identities with
-`[auto_merge.reviewer_signer_identities]`, for example
-`codex-review = ["Daniels-Mac-Studio-m3 agent:codex-reviewer"]`. The status
-refuses a missing or mismatched host/agent stamp; existing signer and reviewer
-login settings remain unchanged until this map is configured.
-
 An App APPROVE must also carry the `<!-- session: <host>/<session> -->` stamp
 `ghapp` adds, and not an `unattributed` one ("it has no `ghapp` session
 stamp"). Every fleet agent posts as the App, and a body posted around the
@@ -67,20 +59,6 @@ two open pull requests can share a head (one branch opened into two bases, a
 fork pushing an approved commit). The status is `success` only when the guard
 allows the head for every open pull request whose head it is
 (`commits/{sha}/pulls`).
-
-## The job is the check
-
-The job is also the `review-verdict` check run, and it exits non-zero unless
-the head is allowed, so a required `review-verdict` check cannot be green on a
-refused, held or unapproved head. A read or post error fails the job too (it
-never passes by default). The commit status is posted exactly as before.
-
-Only the `pull_request_target` run leaves its check run on the pull request's
-head; a comment's (`issue_comment`) or a review's (`workflow_run`) run leaves
-its check run on the default branch's tip, where it gates nothing. Those runs
-post the status and then re-run the head's newest `pull_request_target` run
-(`actions: write`), so an APPROVE or a HOLD changes the head's check without a
-new push. A re-run that cannot be requested fails the job.
 
 ## Trust
 
@@ -162,7 +140,6 @@ permissions:
   contents: read
   pull-requests: read
   statuses: write
-  actions: write
 
 concurrency:
   group: review-verdict-${{ github.event.pull_request.number || github.event.issue.number || github.event.workflow_run.pull_requests[0].number || github.event.workflow_run.head_sha }}

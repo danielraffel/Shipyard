@@ -7,7 +7,7 @@ Run `shipyard pr` to orchestrate the full push-a-PR flow:
 
 1. `scripts/skill_sync_check.py --mode=report` — hard-fails if a mapped path was touched without updating the corresponding `SKILL.md` (or without a `Skill-Update: skip skill=<name> reason="..."` trailer on a commit in the PR range).
 2. `scripts/version_bump_check.py --mode=report` — confirms the branch does not edit the single-writer version files.
-3. The post-merge `version-at-land` workflow assigns versions through one coalesced bump pull request; its merge triggers the release tag.
+3. The post-merge `version-at-land` workflow assigns versions and triggers the release tag.
 4. Hands off to `shipyard ship` for push + `gh pr create` + cross-platform validate + merge on green.
 5. When the protected base branch has `[merge_steward].auto_handoff = true` (or `--workstream-id` is supplied), writes the exact-head `shipyard/steward-handoff` receipt and managed label immediately after PR creation. The PR branch cannot enable this project default for itself.
 

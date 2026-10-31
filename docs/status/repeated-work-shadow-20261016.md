@@ -43,20 +43,3 @@ live FLEET-BASELINE receipt is not required for this shadow-only accounting
 change.
 
 PR: https://github.com/danielraffel/Shipyard/pull/863
-
-## Public superseded-runtime readout follow-up (2026-10-30)
-
-Status: implemented on the current-main follow-up branch, rebased onto
-`origin/main` at `8c24b0079d0dd26245ef92172d77c0806f208827`.
-
-`metrics repeated-work-cost` now joins distinct canonical superseded queue jobs
-to the authenticated `queue_timing` table, bounded by its explicit baseline
-window, and reports measured superseded runtime with clean, uncertain,
-cancelled, and unmatched coverage. It never substitutes the survivor's runtime
-or presents it as savings. The readout remains observational: it does not alter
-queue authority, skip validation, or make a merge decision. The implementation
-preserves the final-attempt-only boundary and keeps numeric-looking or malformed
-IDs unjoined.
-
-Validation on the rebased head includes `cargo fmt --all -- --check` and
-`cargo test --locked repeated_work` (4 passed, 0 failed).

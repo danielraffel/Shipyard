@@ -8,7 +8,6 @@ use super::post_validation::{
 use super::{AppliedStewardHandoff, CliFailure, RenderedDiagnostics, ShipRenderState, fields};
 use crate::diagnostics::FailureKind;
 use crate::output::write_json_envelope;
-use crate::pr_next_steps::NextSteps;
 
 pub(super) fn render_json<W: Write>(
     stdout: &mut W,
@@ -17,7 +16,6 @@ pub(super) fn render_json<W: Write>(
     state: &ShipRenderState,
     diagnostics: &[RenderedDiagnostics],
     steward_handoff: Option<&AppliedStewardHandoff>,
-    next_steps: Option<&NextSteps>,
 ) -> Result<(), CliFailure> {
     let merged = state.merged();
     // Only the flaky-required wedge carries recovery contexts; every other
@@ -68,10 +66,6 @@ pub(super) fn render_json<W: Write>(
             // execution outcome predates that classification.
             ("post_validation", json!(state.queued_disposition())),
             ("diagnostics", Value::Array(diag_payload)),
-            (
-                "next_steps",
-                next_steps.map_or(Value::Null, NextSteps::to_json),
-            ),
             ("flaky_required_recovery", Value::Array(flaky_recovery)),
             (
                 "steward_handoff",
@@ -97,7 +91,6 @@ pub(super) fn render_human<W: Write>(
     pr: u64,
     state: &ShipRenderState,
     diagnostics: &[RenderedDiagnostics],
-    next_steps: Option<&NextSteps>,
 ) -> Result<(), CliFailure> {
     let result = match state {
         ShipRenderState::ValidationFailed => render_validation_failed(stdout, pr, diagnostics),
@@ -123,11 +116,6 @@ pub(super) fn render_human<W: Write>(
             red_contexts,
         } => render_green_not_merged_flaky(stdout, pr, error, red_contexts),
     };
-    // A merged or failed validation has no "next" admission step to describe.
-    let result = result.and_then(|()| match (state, next_steps) {
-        (ShipRenderState::Merged | ShipRenderState::ValidationFailed, _) | (_, None) => Ok(()),
-        (_, Some(steps)) => steps.write_human(stdout),
-    });
     result.map_err(|error| CliFailure::new(1, error.to_string()))
 }
 

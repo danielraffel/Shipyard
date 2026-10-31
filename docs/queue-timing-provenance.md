@@ -38,27 +38,19 @@ mode), not only the short queue ID.
 
 ## Aggregation semantics
 
-`repeated_work_shadow.superseded_job_id` identifies the job whose runtime may
-be measured. A matching timing row therefore measures **superseded runtime**;
-it does not claim that the surviving job's runtime was avoided or that any
-compute was saved. Aggregation must use one timing row per superseded queue job
-and must not multiply duration by the number of shadow rows or validation
-targets. The public readout bounds observations to its explicit baseline
-window.
+`repeated_work_shadow.job_id` identifies the surviving job. A matching timing
+row therefore measures **avoided survivor runtime**, not runtime that was
+actually wasted by a superseded job. Aggregation must use one timing row per
+queue job and must not multiply duration by the number of shadow rows or
+validation targets.
 
 Unmatched, excluded, and unknown-duration observations remain visible as
 coverage counts. They are never converted to zero and never treated as
 evidence of savings.
 
-If several shadow rows identify one superseded job, counting that job once is
-an intentional conservative undercount. In a supersession chain, unmatched
-rows for jobs that never ran are expected and remain part of coverage
-reporting.
-
-The `metrics repeated-work-cost` readout exposes this accounting as
-`duration_ms` (superseded runtime), together with distinct-superseded-job and
-excluded/unmatched coverage counts. These fields are observational evidence;
-they do not authorize skipping, cancellation, routing, or merge decisions.
+If several shadow rows identify one survivor, counting that survivor once is an
+intentional conservative undercount. In a supersession chain, unmatched rows
+for jobs that never ran are expected and remain part of coverage reporting.
 
 ## Required validation
 

@@ -11,7 +11,6 @@ GraphQL answer, `repos/<r>/pulls/<n>`, and the paginated (`--slurp`)
 | `tartci-511-*` | danielraffel/tartci#511, open, unarmed | an APPROVE naming an older head only |
 | `tartci-490-*` | danielraffel/tartci#490, open, unarmed | a HOLD naming the current head |
 | `shipyard-784-*` | danielraffel/Shipyard#784, merged | HOLD on an older head, then APPROVE naming the final head |
-| `pulp-11175-unattributed-approve.json` | Generous-Corp/pulp#11175, open (captured 2026-10-31) | an exact-head App APPROVE stamped `unattributed`: excluded, not "no verdict" |
 
 `shipyard-784-graphql.json` is the response after the merge. The tests that
 use it as an open pull request set `state` to `OPEN` and drop the

@@ -2,27 +2,15 @@
 
 [![CI](https://github.com/danielraffel/Shipyard/actions/workflows/ci.yml/badge.svg)](https://github.com/danielraffel/Shipyard/actions/workflows/ci.yml)
 
-**Local-first engineering orchestration and governance for coding agents.**
-Shipyard coordinates builds and tests, records review and merge gates, and
-supports bounded recovery across local machines, SSH-reachable VMs, and cloud
-runners. GitHub remains authoritative for pull requests and merge order.
-
 Shipyard and [TartCI](https://github.com/danielraffel/tartci) solve different
 parts of CI:
 
 - **Shipyard coordinates the work.** It sends an exact commit to the targets
   you choose, records the results, watches pull requests, and hands a verified
   head to GitHub for landing.
-- **TartCI runs the work in disposable VMs.** For teams using Tart on Apple
-  Silicon, it turns their Macs into GitHub Actions capacity with clean macOS,
-  Linux, and Windows VM lanes that are removed after each job.
-
-Tart provides the VM runtime; it does not by itself schedule GitHub jobs or
-manage their runner lifecycle. TartCI adds that CI pool around it: managed
-images, capacity leases, ephemeral runner registration, job cleanup, and
-metrics.
-On a managed fleet, TartCI is the supported pool path; Orchard is retired and
-should be disabled so two schedulers do not claim the same jobs or capacity.
+- **TartCI runs the work in disposable VMs.** It turns Apple Silicon Macs into
+  GitHub Actions capacity by booting clean macOS, Linux, or Windows VMs for
+  jobs and removing them afterward.
 
 Use Shipyard without TartCI for local, SSH, or hosted checks. Add TartCI when
 those checks need isolated Mac VM capacity. GitHub remains the authority for
@@ -37,8 +25,7 @@ Use Shipyard if you:
 - want a pull request to land only after the exact head passes every required
   platform;
 - run local Macs or private VMs alongside GitHub-hosted runners;
-- want monitoring that can run unattended and records a specific reason when
-  progress cannot continue.
+- want unattended monitoring that records a clear reason when it must stop.
 
 Shipyard is useful for people and coding tools. It does not choose what your
 product should do or edit code on its own.
@@ -58,13 +45,6 @@ Shipyard chooses targets and records exact-head evidence
         v
 Shipyard reports the evidence; GitHub owns merge order
 ```
-
-Together they can drain a repository on their own: agents open pull requests,
-a reviewer approves exact heads, and Shipyard's steward hands each approved,
-green head to GitHub's merge queue (or merges it directly where there is no
-queue) while TartCI and GitHub-hosted runners do the testing.
-[Draining pull requests automatically](docs/automated-draining.md) explains the
-whole loop, how to set it up, what to tell your agents, and when not to use it.
 
 [TartCI](https://github.com/danielraffel/tartci) is the execution layer in
 this pairing. It owns the VM images, host budgets, caches, and GitHub runner
@@ -130,11 +110,7 @@ installation.
 - **Works with GitHub's merge queue.** Shipyard validates the head, hands the
   exact SHA to GitHub, and records the queue action.
 - **Explains failures.** `shipyard diagnose` and `shipyard cause` reduce a red
-  job to its failing step and a few useful evidence lines. Optional local cause
-  archives preserve diagnostic history; `shipyard cause prune` previews
-  adjustable retention limits. Apply requires a mutable archive marker (or an
-  explicit `--initialize` enrollment) and never guesses through malformed
-  evidence.
+  job to its failing step and a few useful evidence lines.
 - **Recovers supported stuck work.** Runner watchdogs, PR rescue, queue
   observation, and bounded retries handle routine failures without guessing.
 - **Keeps state across restarts.** A stopped terminal or daemon does not erase
@@ -201,13 +177,10 @@ Start here:
 - [Installation](docs/install.md): binaries, source builds, and first-run auth.
 - [Examples](docs/examples.md): common project and target configurations.
 - [Targets](docs/targets.md): local, SSH, cloud, and fallback targets.
-- [exe.dev](docs/exe-dev.md): using an exe.dev Linux VM as an SSH target.
 - [CLI reference](docs/cli-reference.md): every command and option.
 
 For specific workflows:
 
-- [Draining pull requests automatically](docs/automated-draining.md): how
-  Shipyard, TartCI and GitHub merge agent pull requests without babysitting.
 - [Agent integration](docs/agent-integration.md): Claude Code, Codex, and
   handoff patterns.
 - [Landing model](docs/landing-model.md): exact-head evidence and merge-queue
@@ -239,13 +212,19 @@ You need only the tools used by your setup:
 Run `shipyard doctor` to check the tools and credentials for the current
 configuration.
 
-Metrics storage, retention limits, and the `SHIPYARD_OBSERVATIONS` switch are in
-[Installation](docs/install.md#requirements-and-optional-tools).
+Shipyard stores optional CI timing data in its local SQLite metrics database so
+scorecards can measure queueing, waste, and rework. `shipyard cleanup --apply`
+keeps raw samples for 90 days by default; set
+`SHIPYARD_METRICS_RETENTION_DAYS` to another number, or `0` to disable pruning.
+Merge receipts are retained as durable provenance. A producer can hand them to
+an observer with `shipyard metrics export merge-receipt --repo <owner/repo>
+--file <handoff.jsonl>`; the export is repository-scoped, atomic, and reads
+only receipts already persisted by Shipyard. It fails without replacing the
+handoff when no receipt exists.
 
 ## This repository uses Shipyard
 
-Shipyard validates itself on macOS by default; Linux and Windows lanes run when
-`CI_PLATFORM_FOCUS=all` is set. The workflows and
+Shipyard validates itself on macOS, Linux, and Windows. The workflows and
 project configuration are in [`.shipyard/config.toml`](https://github.com/danielraffel/Shipyard/blob/main/.shipyard/config.toml)
 and [`.github/workflows/`](https://github.com/danielraffel/Shipyard/tree/main/.github/workflows). Release details are in
 [RELEASING.md](RELEASING.md).

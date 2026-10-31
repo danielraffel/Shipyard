@@ -327,11 +327,6 @@ pub struct GitHubActions {
     gh: Result<GhClient, String>,
     gh_binary_override: Option<PathBuf>,
     absolute_deadline: Option<Instant>,
-    /// Explicit repository provenance for the authenticated `ghapp` wrapper.
-    /// This is separate from the token-helper override: the wrapper itself
-    /// needs `GH_REPO` even when the native `gh api` command has no `--repo`
-    /// option.
-    repo_override: Option<String>,
 }
 
 impl PartialEq for GitHubActions {
@@ -360,7 +355,6 @@ impl GitHubActions {
             gh,
             gh_binary_override: None,
             absolute_deadline: None,
-            repo_override: None,
         }
     }
 
@@ -375,14 +369,12 @@ impl GitHubActions {
             gh,
             gh_binary_override: None,
             absolute_deadline: None,
-            repo_override: None,
         }
     }
 
     /// Override repository placeholders used by configured token helpers.
     #[must_use]
     pub(crate) fn with_repo_override(mut self, repo: &str) -> Self {
-        self.repo_override = Some(repo.to_owned());
         self.gh = self.gh.and_then(|client| {
             client
                 .with_repo_override(repo)
@@ -429,7 +421,6 @@ impl GitHubActions {
             cwd,
             gh_binary_override: None,
             absolute_deadline: None,
-            repo_override: None,
         }
         .with_gh_binary_for_tests(gh_binary)
     }
@@ -445,7 +436,6 @@ impl GitHubActions {
             cwd,
             gh: Ok(GhClient::ambient()),
             absolute_deadline: None,
-            repo_override: None,
         }
     }
 
@@ -1049,10 +1039,13 @@ impl GitHubActions {
         }
         let mut command = self.prepare_gh_command()?;
         gate_landing(&mut command, args, internal)?;
-        apply_repo_environment(&mut command, env, self.repo_override.as_deref());
-        let output = command.args(args).output().map_err(|error| {
-            GitHubError::new(format!("failed to run gh {}: {error}", args.join(" ")))
-        })?;
+        let output = command
+            .envs(env.iter().copied())
+            .args(args)
+            .output()
+            .map_err(|error| {
+                GitHubError::new(format!("failed to run gh {}: {error}", args.join(" ")))
+            })?;
         if !output.status.success() {
             return Err(GitHubError::command_failed(
                 args,
@@ -1152,8 +1145,8 @@ impl GitHubActions {
         let mut stderr_capture = tempfile::NamedTempFile::new().map_err(|error| {
             GitHubError::new(format!("failed to create gh stderr capture: {error}"))
         })?;
-        apply_repo_environment(&mut command, env, self.repo_override.as_deref());
         command
+            .envs(env.iter().copied())
             .args(args)
             // Regular-file capture cannot leave a Rust reader blocked when a
             // detached descendant inherits stdio. Each reopened writer has an
@@ -1285,17 +1278,6 @@ impl GitHubActions {
                 timeout,
             )
             .map_err(|error| GitHubError::new(format!("failed to prepare gh command: {error}")))
-    }
-}
-
-fn apply_repo_environment(
-    command: &mut std::process::Command,
-    env: &[(&str, &str)],
-    repo: Option<&str>,
-) {
-    command.envs(env.iter().copied());
-    if let Some(repo) = repo {
-        command.env("GH_REPO", repo);
     }
 }
 
@@ -2201,28 +2183,6 @@ exit 2
             .expect("fake gh");
         let log = std::fs::read_to_string(log).expect("log");
         assert_eq!(log, "ARGS=api repos/owner/repo\n");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn explicit_repository_scope_reaches_ghapp_without_native_api_repo_flag() {
-        let temp = TempDir::new().expect("tempdir");
-        let gh = temp.path().join("gh");
-        let log = temp.path().join("calls.log");
-        write_executable(
-            &gh,
-            &format!(
-                "#!/bin/sh\nprintf 'GH_REPO=%s ARGS=%s\\n' \"$GH_REPO\" \"$*\" > '{}'\nprintf '{{}}'\\n",
-                log.display()
-            ),
-        );
-        let client = super::GitHubActions::hermetic_for_tests(temp.path(), &gh)
-            .with_repo_override("owner/repo");
-        client
-            .run_gh(&["api".to_owned(), "graphql".to_owned()])
-            .expect("fake gh");
-        let log = std::fs::read_to_string(log).expect("log");
-        assert_eq!(log, "GH_REPO=owner/repo ARGS=api graphql\n");
     }
 
     #[cfg(unix)]

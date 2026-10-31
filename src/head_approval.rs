@@ -26,11 +26,7 @@
 //!   from a configured reviewer identity.
 //! * A final-line `verdict: APPROVE head:<sha>` or `reviewed:<sha>` comment
 //!   from a configured reviewer identity. The sha is always the full head.
-//!   `verdict: HOLD head:<sha>` and a matching `REQUEST_CHANGES` review block,
-//!   and a counting HOLD is final for its head: no APPROVE naming that head,
-//!   from any reviewer, posted before or after it, counts (reported as
-//!   `excluded_approval:head held by <signer> at <id>`). Only a new head (a
-//!   push) can be approved, and an approval does not carry from a held head.
+//!   `verdict: HOLD head:<sha>` and a matching `REQUEST_CHANGES` review block.
 //!
 //! Bot status alone is not a rejection: the dedicated review App is configured
 //! as a reviewer. The fleet author App and the PR author cannot approve their
@@ -92,10 +88,7 @@ use regex::Regex;
 use serde::Serialize;
 use serde_json::Value;
 
-mod blocker;
 mod rebase;
-
-pub use blocker::ApprovalBlocker;
 pub use rebase::{
     CarryRecord, REBASE_CARRY_ENV, REBASE_CARRY_FILE, REBASE_CARRY_LOG, patch_id, rebase_carry,
     rebase_carry_enabled,
@@ -115,8 +108,6 @@ pub const HUMAN_REVIEWERS_KEY: &str = "human_reviewers";
 /// Who may sign the fleet App's APPROVE, set by the protected base; it takes
 /// precedence over a host's [`SIGNERS_FILE`].
 pub const SIGNERS_KEY: &str = "reviewer_signers";
-/// Base-config binding from a signer name to stamped `host agent:id` values.
-pub const SIGNER_IDENTITIES_KEY: &str = "reviewer_signer_identities";
 /// `[auto_merge]` key replacing [`DEFAULT_CARRY_EXCLUDED_PATHS`].
 pub const CARRY_EXCLUDED_KEY: &str = "carry_excluded_paths";
 /// `[auto_merge]` key adding globs to the carry exclusions (the defaults, or
@@ -356,21 +347,6 @@ pub fn stamped_agent(body: &str) -> Option<String> {
         .map(|agent| agent.as_str().to_owned())
 }
 
-/// The provider-neutral `host agent:id` identity in a ghapp stamp.
-fn stamped_identity(body: &str) -> Option<String> {
-    stamp_pattern()
-        .captures_iter(body)
-        .last()
-        .and_then(|capture| {
-            Some(format!(
-                "{} agent:{}",
-                capture.get(1)?.as_str(),
-                capture.get(3)?.as_str()
-            ))
-        })
-        .map(|identity| identity.to_ascii_lowercase())
-}
-
 /// Run `body` with [`host_review_default`] pinned, on this thread.
 #[cfg(test)]
 pub(crate) fn with_host_review_default<T>(enabled: bool, body: impl FnOnce() -> T) -> T {
@@ -601,37 +577,6 @@ pub fn signers_shape(table: &toml::Table) -> Result<(), String> {
         _ => Err(format!(
             "[{CONFIG_TABLE}] {SIGNERS_KEY} must be a list of reviewer names, not {value}"
         )),
-    }
-}
-
-/// Whether a base-config signer identity map has the expected shape.
-pub fn signer_identities_shape(table: &toml::Table) -> Result<(), String> {
-    let Some(value) = table
-        .get(CONFIG_TABLE)
-        .and_then(toml::Value::as_table)
-        .and_then(|section| section.get(SIGNER_IDENTITIES_KEY))
-    else {
-        return Ok(());
-    };
-    let Some(bindings) = value.as_table() else {
-        return Err(format!(
-            "[{CONFIG_TABLE}] {SIGNER_IDENTITIES_KEY} must map reviewer names to identity lists, not {value}"
-        ));
-    };
-    if bindings.iter().all(|(name, values)| {
-        !name.trim().is_empty()
-            && values.as_array().is_some_and(|values| {
-                !values.is_empty()
-                    && values
-                        .iter()
-                        .all(|value| value.as_str().is_some_and(|value| !value.trim().is_empty()))
-            })
-    }) {
-        Ok(())
-    } else {
-        Err(format!(
-            "[{CONFIG_TABLE}] {SIGNER_IDENTITIES_KEY} must map reviewer names to non-empty identity lists"
-        ))
     }
 }
 
@@ -901,9 +846,6 @@ pub struct ApprovalPolicy {
     /// `None` when this host has no signers file.
     #[serde(default)]
     pub signers: Option<Vec<String>>,
-    /// Stamped `host agent:id` identities allowed for each signer name.
-    #[serde(default)]
-    pub signer_identities: std::collections::BTreeMap<String, Vec<String>>,
     /// Try the rebase carry for this evaluation whatever the host switch
     /// says (`shipyard review-verdict` sets it; a config never does).
     #[serde(default)]
@@ -987,24 +929,6 @@ impl ApprovalPolicy {
                         .map(str::to_ascii_lowercase)
                         .collect()
                 }),
-            signer_identities: section
-                .get(SIGNER_IDENTITIES_KEY)
-                .and_then(toml::Value::as_table)
-                .map(|bindings| {
-                    bindings
-                        .iter()
-                        .filter_map(|(name, values)| {
-                            let values = values
-                                .as_array()?
-                                .iter()
-                                .filter_map(toml::Value::as_str)
-                                .map(|value| value.trim().to_ascii_lowercase())
-                                .collect::<Vec<_>>();
-                            (!values.is_empty()).then(|| (name.to_ascii_lowercase(), values))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
             rebase_carry: false,
             signer_source: SignerSource::Host,
             dry_run: false,
@@ -1373,51 +1297,33 @@ fn approver_allowed(record: &Value, policy: &ApprovalPolicy) -> bool {
 /// signers file the body must carry a `reviewer: <name>` line naming an
 /// allowed signer.
 fn app_approval_refusal(record: &Value, policy: &ApprovalPolicy) -> Option<String> {
-    app_approval_refusal_reason(record, policy).map(|(_, message)| message)
-}
-
-/// [`app_approval_refusal`] with a stable machine token for the reason, so a
-/// report can name the exclusion without parsing the sentence.
-fn app_approval_refusal_reason(
-    record: &Value,
-    policy: &ApprovalPolicy,
-) -> Option<(&'static str, String)> {
     let body = record
         .get("body")
         .and_then(Value::as_str)
         .unwrap_or_default();
     if noncanonical_stamp(body) {
-        return Some((
-            "noncanonical_stamp",
-            "it carries a non-canonical session stamp".to_owned(),
-        ));
+        return Some("it carries a non-canonical session stamp".to_owned());
     }
     let session = stamped_session(body);
     if session.as_deref() == Some("unattributed") {
-        return Some((
-            "unattributed",
-            "its session stamp is unattributed".to_owned(),
-        ));
+        return Some("its session stamp is unattributed".to_owned());
     }
     // The repository-side rule: an APPROVE posted around ghapp's stamper
     // (stdin, a raw API call) names no session at all (tartci#623's copy,
     // stamp removed, still passed the review-verdict status).
     if policy.signer_source == SignerSource::Base && session.is_none() {
-        return Some(("no_stamp", "it has no `ghapp` session stamp".to_owned()));
+        return Some("it has no `ghapp` session stamp".to_owned());
     }
     // Host-local: the repository-side rule has no host to read.
     if policy.signer_source == SignerSource::Host
         && let Some(refusal) =
             session_refusal(body, host_sessions().as_deref(), &host_session_hosts())
     {
-        return Some(("session_not_allowed", refusal));
+        return Some(refusal);
     }
     if policy.signer_source == SignerSource::Base && policy.signers.is_none() {
-        return Some((
-            "no_signer_list",
-            format!(
-                "no signer list is configured on the base branch (`[{CONFIG_TABLE}] {SIGNERS_KEY}`)"
-            ),
+        return Some(format!(
+            "no signer list is configured on the base branch (`[{CONFIG_TABLE}] {SIGNERS_KEY}`)"
         ));
     }
     let signers = policy.signers.as_ref()?;
@@ -1429,55 +1335,18 @@ fn app_approval_refusal_reason(
         .map(|name| name.as_str().to_ascii_lowercase())
         .collect();
     if signed.is_empty() {
-        return Some((
-            "no_signer_line",
-            "it has no `reviewer: <name>` line".to_owned(),
-        ));
+        return Some("it has no `reviewer: <name>` line".to_owned());
     }
-    let matching: Vec<&String> = signed
-        .iter()
-        .filter(|name| signers.contains(name))
-        .collect();
-    if matching.is_empty() {
-        return Some((
-            "uncounted_signer",
-            format!(
-                "its signer {} is not one of {}",
-                signed.last().map_or("", String::as_str),
-                if signers.is_empty() {
-                    "nobody".to_owned()
-                } else {
-                    signers.join(", ")
-                }
-            ),
-        ));
-    }
-    if !policy.signer_identities.is_empty() {
-        let Some(identity) = stamped_identity(body) else {
-            return Some((
-                "unbound_identity",
-                "its ghapp stamp has no reviewer agent identity".to_owned(),
-            ));
-        };
-        let bound = matching.iter().any(|name| {
-            policy
-                .signer_identities
-                .get(*name)
-                .is_some_and(|allowed| allowed.iter().any(|value| value == &identity))
-        });
-        if !bound {
-            let name = matching.last().map_or("", |value| value.as_str());
-            if !policy.signer_identities.contains_key(name) {
-                return Some((
-                    "unbound_identity",
-                    format!("its signer {name} has no base identity binding"),
-                ));
+    if !signed.iter().any(|name| signers.contains(name)) {
+        return Some(format!(
+            "its signer {} is not one of {}",
+            signed.last().map_or("", String::as_str),
+            if signers.is_empty() {
+                "nobody".to_owned()
+            } else {
+                signers.join(", ")
             }
-            return Some((
-                "unbound_identity",
-                format!("its signer {name} is not bound to stamped identity {identity}"),
-            ));
-        }
+        ));
     }
     None
 }
@@ -1531,30 +1400,6 @@ pub fn verdict_audit_events(
                 format!("excluded_human_approval:{login}")
             });
         }
-    }
-    if let Some(hold) = head_hold(head, reviews, comments, policy, author) {
-        // An APPROVE that would have counted, on a head a HOLD names: say
-        // why the pass ignores it.
-        let approves_head = |record: &Value| {
-            let names_head = record
-                .get("state")
-                .and_then(Value::as_str)
-                .is_some_and(|state| state.eq_ignore_ascii_case("APPROVED"))
-                && record
-                    .get("commit_id")
-                    .and_then(Value::as_str)
-                    .is_some_and(|commit| commit.eq_ignore_ascii_case(head))
-                || record
-                    .get("body")
-                    .and_then(Value::as_str)
-                    .is_some_and(|body| marker_names_head(body, head));
-            names_head && verdict_counts(record, Verdict::Approve, policy, author)
-        };
-        let holder = describe_hold(hold);
-        if reviews.iter().chain(comments).any(approves_head) {
-            events.push(format!("excluded_approval:head {holder}"));
-        }
-        events.push(format!("head_held:{holder}"));
     }
     for comment in comments {
         if !reviewer_allowed(comment, policy, author) {
@@ -1716,10 +1561,9 @@ impl HeadGate {
                  `verdict: APPROVE head:{head}` or `reviewed: {head}`, or an APPROVED review \
                  on that commit, from a listed reviewer, or where none is listed from the \
                  fleet App (a `ghapp` verdict comment) or a human the base lists in \
-                 `[auto_merge] human_reviewers`, never the PR author, and no HOLD naming \
-                 it: a HOLD makes its head un-approvable, so a held head needs a new \
-                 push. This repository arms only approved heads; left disarmed until a \
-                 reviewer posts that verdict",
+                 `[auto_merge] human_reviewers`, never the PR author, with no later HOLD \
+                 naming it. This repository arms only approved \
+                 heads; left disarmed until a reviewer posts that verdict",
                 short(head)
             ),
             Self::SelfApproved { head, agent } => format!(
@@ -1786,76 +1630,6 @@ pub fn decide_excusing(
     )
 }
 
-/// The first counting HOLD naming `head`, review or comment, if any.
-///
-/// A HOLD makes its head un-approvable: no APPROVE naming the same head, from
-/// any reviewer, earlier or later, counts against it. Only a new head (a
-/// push) can be approved. The queue-arm guard's `_latest_on` is the same.
-fn head_hold<'a>(
-    head: &str,
-    reviews: &'a [Value],
-    comments: &'a [Value],
-    policy: &ApprovalPolicy,
-    author: Option<&str>,
-) -> Option<&'a Value> {
-    let review = reviews.iter().find(|review| {
-        review
-            .get("commit_id")
-            .and_then(Value::as_str)
-            .is_some_and(|commit| commit.eq_ignore_ascii_case(head))
-            && review
-                .get("state")
-                .and_then(Value::as_str)
-                .is_some_and(|state| state.eq_ignore_ascii_case("CHANGES_REQUESTED"))
-            && verdict_counts(review, Verdict::Hold, policy, author)
-    });
-    review.or_else(|| {
-        comments.iter().find(|comment| {
-            comment
-                .get("body")
-                .and_then(Value::as_str)
-                .and_then(marker_verdict)
-                .is_some_and(|(verdict, marker_head)| {
-                    verdict == Verdict::Hold && marker_head.eq_ignore_ascii_case(head)
-                })
-                && verdict_counts(comment, Verdict::Hold, policy, author)
-        })
-    })
-}
-
-/// `held by <signer> at <comment|review> <id>` for a HOLD record: the `reviewer:` signer line
-/// when the body carries one, else the login; the comment or review id.
-fn describe_hold(record: &Value) -> String {
-    let signer = hold_signer(record);
-    let place = match record.get("id").and_then(Value::as_u64) {
-        Some(id) if record.get("state").is_some() => format!("review {id}"),
-        Some(id) => format!("comment {id}"),
-        None => record
-            .get("at")
-            .and_then(Value::as_str)
-            .map_or_else(|| "an unrecorded time".to_owned(), str::to_owned),
-    };
-    format!("held by {signer} at {place}")
-}
-
-/// Who holds a HOLD record: its `reviewer:` signer line when the body carries
-/// one, else the login.
-fn hold_signer(record: &Value) -> String {
-    record
-        .get("body")
-        .and_then(Value::as_str)
-        .and_then(|body| {
-            Regex::new(r"(?m)^[ \t]*reviewer:[ \t]*([A-Za-z0-9._-]+)[ \t]*$")
-                .expect("signer pattern compiles")
-                .captures_iter(body)
-                .filter_map(|capture| capture.get(1))
-                .last()
-                .map(|name| name.as_str().to_ascii_lowercase())
-        })
-        .or_else(|| login(record).map(str::to_owned))
-        .unwrap_or_else(|| "an unknown reviewer".to_owned())
-}
-
 fn latest_verdict(
     head: &str,
     reviews: &[Value],
@@ -1863,10 +1637,6 @@ fn latest_verdict(
     policy: &ApprovalPolicy,
     author: Option<&str>,
 ) -> Option<Verdict> {
-    // A HOLD is final for its head: no approval, earlier or later, outranks it.
-    if head_hold(head, reviews, comments, policy, author).is_some() {
-        return Some(Verdict::Hold);
-    }
     let review_events = reviews.iter().filter_map(|review| {
         if !review
             .get("commit_id")
@@ -1876,10 +1646,14 @@ fn latest_verdict(
             return None;
         }
         let state = review.get("state")?.as_str()?;
-        if !state.eq_ignore_ascii_case("APPROVED") {
+        let verdict = if state.eq_ignore_ascii_case("APPROVED") {
+            Verdict::Approve
+        } else if state.eq_ignore_ascii_case("CHANGES_REQUESTED") {
+            Verdict::Hold
+        } else {
             return None;
-        }
-        verdict_counts(review, Verdict::Approve, policy, author).then_some(Verdict::Approve)
+        };
+        verdict_counts(review, verdict, policy, author).then(|| (at(review), verdict))
     });
     let comment_events = comments.iter().filter_map(|comment| {
         let (verdict, marker_head) = marker_verdict(comment.get("body")?.as_str()?)?;
@@ -1888,9 +1662,22 @@ fn latest_verdict(
         {
             return None;
         }
-        Some(verdict)
+        Some((at(comment), verdict))
     });
-    review_events.chain(comment_events).next()
+    let events: Vec<_> = review_events.chain(comment_events).collect();
+    // A HOLD whose time cannot be read cannot be ordered against an approval,
+    // so it is not allowed to lose to one.
+    if events
+        .iter()
+        .any(|(timestamp, verdict)| timestamp.is_none() && *verdict == Verdict::Hold)
+    {
+        return Some(Verdict::Hold);
+    }
+    events
+        .into_iter()
+        .filter_map(|(timestamp, verdict)| Some((timestamp?, verdict)))
+        .max_by_key(|(timestamp, _)| *timestamp)
+        .map(|(_, verdict)| verdict)
 }
 
 pub(crate) fn decide_for_author(
@@ -1991,7 +1778,7 @@ fn read_policy_inner(
     base: &str,
     missing_is_error: bool,
     host_default: bool,
-) -> Result<ApprovalPolicy, PolicyReadError> {
+) -> Result<ApprovalPolicy, String> {
     let raw = match run_gh(&[
         "api".to_owned(),
         "-H".to_owned(),
@@ -1999,167 +1786,33 @@ fn read_policy_inner(
         format!("repos/{repo}/contents/{CONFIG_PATH}?ref={base}"),
     ]) {
         Ok(raw) => raw,
-        Err(detail) if is_clean_not_found(&detail) => {
+        Err(detail) if detail.contains("404") || detail.contains("Not Found") => {
             if host_default && requires_review_by_default(repo) {
                 let mut policy = ApprovalPolicy::without_config(repo, host_default);
                 policy.signers = policy.signers.or_else(|| host_signers(repo));
                 return Ok(policy);
             }
             if missing_is_error {
-                // Absence is acted on (the steward dequeues on it), so one
-                // 404 is not enough: a second, independent read must agree.
-                return Err(match confirm_config_absent(run_gh, repo, base) {
-                    Ok(()) => PolicyReadError::Absent(format!(
-                        "{CONFIG_PATH} on {base} is absent; approval policy is required"
-                    )),
-                    Err(why) => PolicyReadError::Unreadable(format!(
-                        "{CONFIG_PATH} on {base} read as absent, but the absence is \
-                         unconfirmed ({why}); approval policy is required"
-                    )),
-                });
+                return Err(format!(
+                    "{CONFIG_PATH} on {base} is absent; approval policy is required"
+                ));
             }
             return Ok(ApprovalPolicy::default());
         }
-        Err(detail) => {
-            return Err(PolicyReadError::Unreadable(format!(
-                "{CONFIG_PATH} on {base} unreadable: {detail}"
-            )));
-        }
+        Err(detail) => return Err(format!("{CONFIG_PATH} on {base} unreadable: {detail}")),
     };
-    let table = raw.parse::<toml::Table>().map_err(|error| {
-        PolicyReadError::Unreadable(format!("{CONFIG_PATH} on {base} does not parse: {error}"))
-    })?;
-    signers_shape(&table).map_err(|error| {
-        PolicyReadError::Unreadable(format!("{CONFIG_PATH} on {base}: {error}"))
-    })?;
-    signer_identities_shape(&table).map_err(|error| {
-        PolicyReadError::Unreadable(format!("{CONFIG_PATH} on {base}: {error}"))
-    })?;
+    let table = raw
+        .parse::<toml::Table>()
+        .map_err(|error| format!("{CONFIG_PATH} on {base} does not parse: {error}"))?;
+    signers_shape(&table).map_err(|error| format!("{CONFIG_PATH} on {base}: {error}"))?;
     let mut policy = ApprovalPolicy::from_table_for_repo(&table, repo, host_default);
     policy.signers = policy.signers.or_else(|| host_signers(repo));
-    policy
-        .validate()
-        .map(|()| policy)
-        .map_err(PolicyReadError::Unreadable)
-}
-
-/// The `stderr` part of a `gh` failure message, which
-/// [`crate::cloud::GitHubError`] formats as `gh <args> failed with status
-/// <code>: <stderr>`; the whole message when it has no such prefix. The args
-/// name the repository, path and ref, so nothing about the HTTP outcome may be
-/// read from them.
-#[must_use]
-pub fn gh_error_stderr(detail: &str) -> &str {
-    const MARK: &str = " failed with status ";
-    detail
-        .find(MARK)
-        .and_then(|index| detail[index + MARK.len()..].split_once(": "))
-        .map_or(detail, |(_, stderr)| stderr)
-}
-
-/// The HTTP status `gh` reported in the stderr part of `detail`
-/// (`(HTTP 404)` or `HTTP 502:`), never one appearing in the command's own
-/// arguments.
-#[must_use]
-pub fn gh_error_http_status(detail: &str) -> Option<u16> {
-    // `gh` prints both `gh: Not Found (HTTP 404)` and `HTTP 502: Bad Gateway`.
-    let pattern = Regex::new(r"\(HTTP (\d{3})\)|\bHTTP (\d{3}):").expect("status pattern compiles");
-    pattern
-        .captures_iter(gh_error_stderr(detail))
-        .last()
-        .and_then(|capture| capture.get(1).or_else(|| capture.get(2)))
-        .and_then(|status| status.as_str().parse().ok())
-}
-
-/// Words that mark a 404 as a credential failure (an App installation or
-/// token that could not be minted) rather than a missing resource.
-const CREDENTIAL_FAILURE_MARKERS: &[&str] = &[
-    "installation",
-    "access_token",
-    "token",
-    "credential",
-    "ghapp",
-    "bad credentials",
-];
-
-/// Whether `detail` is `gh api`'s own plain not-found answer for the
-/// requested resource: `gh: Not Found (HTTP 404)` in stderr, and nothing that
-/// marks it as a credential or installation failure.
-#[must_use]
-pub fn is_clean_not_found(detail: &str) -> bool {
-    let stderr = gh_error_stderr(detail);
-    let lowered = stderr.to_ascii_lowercase();
-    gh_error_http_status(detail) == Some(404)
-        && stderr
-            .lines()
-            .any(|line| line.trim() == "gh: Not Found (HTTP 404)")
-        && !CREDENTIAL_FAILURE_MARKERS
-            .iter()
-            .any(|marker| lowered.contains(marker))
-}
-
-/// Confirm a config 404 with a second, independent read: the base branch must
-/// be readable with the same credentials, and the `.shipyard` directory on it
-/// must either be absent too or list no `config.toml`.
-fn confirm_config_absent(run_gh: RunGh<'_>, repo: &str, base: &str) -> Result<(), String> {
-    let branch = run_gh(&[
-        "api".to_owned(),
-        format!("repos/{repo}/branches/{base}"),
-        "--jq".to_owned(),
-        ".name".to_owned(),
-    ])
-    .map_err(|detail| format!("base branch unreadable: {}", gh_error_stderr(&detail)))?;
-    if branch.trim() != base {
-        return Err(format!("base branch read back as {:?}", branch.trim()));
-    }
-    let (directory, file) = CONFIG_PATH
-        .rsplit_once('/')
-        .unwrap_or((".shipyard", "config.toml"));
-    match run_gh(&[
-        "api".to_owned(),
-        format!("repos/{repo}/contents/{directory}?ref={base}"),
-        "--jq".to_owned(),
-        ".[].name".to_owned(),
-    ]) {
-        Ok(names) if names.lines().any(|name| name.trim() == file) => {
-            Err(format!("{directory} on {base} lists {file}"))
-        }
-        Ok(_) => Ok(()),
-        Err(detail) if is_clean_not_found(&detail) => Ok(()),
-        Err(detail) => Err(format!(
-            "{directory} on {base} unreadable: {}",
-            gh_error_stderr(&detail)
-        )),
-    }
-}
-
-/// Why [`read_policy_required`] produced no policy.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum PolicyReadError {
-    /// A successful read found no config on the base: positive evidence that
-    /// no approval policy admits anything there.
-    Absent(String),
-    /// The config could not be read, or does not parse or validate.
-    Unreadable(String),
-}
-
-impl std::fmt::Display for PolicyReadError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Absent(message) | Self::Unreadable(message) => formatter.write_str(message),
-        }
-    }
-}
-
-impl From<PolicyReadError> for String {
-    fn from(error: PolicyReadError) -> Self {
-        error.to_string()
-    }
+    policy.validate().map(|()| policy)
 }
 
 /// Read the policy from `base` on GitHub, treating a missing file as default.
 pub fn read_policy(run_gh: RunGh<'_>, repo: &str, base: &str) -> Result<ApprovalPolicy, String> {
-    read_policy_inner(run_gh, repo, base, false, host_review_default()).map_err(String::from)
+    read_policy_inner(run_gh, repo, base, false, host_review_default())
 }
 
 /// Read the policy as the repository-side rule, with no host in it: review
@@ -2174,7 +1827,7 @@ pub fn read_policy_repository_side(
     repo: &str,
     base: &str,
 ) -> Result<ApprovalPolicy, String> {
-    let mut policy = read_policy_inner(run_gh, repo, base, false, true).map_err(String::from)?;
+    let mut policy = read_policy_inner(run_gh, repo, base, false, true)?;
     // No host's signers file reaches the repository-side rule: only the base
     // config's list, and with none listed no App APPROVE counts.
     policy.signers = read_base_signers(run_gh, repo, base)?;
@@ -2205,22 +1858,16 @@ fn read_base_signers(
 }
 
 /// Read the policy for the steward enqueue gate, where absence is unsafe.
-///
-/// # Errors
-///
-/// [`PolicyReadError::Absent`] when a successful read found no config (and the
-/// repository has no built-in default); [`PolicyReadError::Unreadable`] for
-/// any other failure.
 pub fn read_policy_required(
     run_gh: RunGh<'_>,
     repo: &str,
     base: &str,
-) -> Result<ApprovalPolicy, PolicyReadError> {
+) -> Result<ApprovalPolicy, String> {
     read_policy_inner(run_gh, repo, base, true, host_review_default())
 }
 
 /// A review as the gate reads it.
-const REVIEW_RECORD_JQ: &str = ".[] | {id: .id, login: .user.login, type: .user.type, association: .author_association, at: .submitted_at, state: .state, commit_id: .commit_id, body: .body, performed_via_github_app_id: .performed_via_github_app.id}";
+const REVIEW_RECORD_JQ: &str = ".[] | {login: .user.login, type: .user.type, association: .author_association, at: .submitted_at, state: .state, commit_id: .commit_id, body: .body, performed_via_github_app_id: .performed_via_github_app.id}";
 /// A comment as the gate reads it.
 const COMMENT_RECORD_JQ: &str = ".[] | {id: .id, login: .user.login, type: .user.type, association: .author_association, at: .created_at, body: .body, performed_via_github_app_id: .performed_via_github_app.id}";
 
@@ -2273,37 +1920,10 @@ pub fn evaluate_excusing(
     latest_was_interruption: bool,
 ) -> Result<HeadGate, String> {
     let policy = read_policy(run_gh, repo, base)?;
-    evaluate_excusing_with_policy(
-        run_gh,
-        repo,
-        pr,
-        head,
-        &policy,
-        queue,
-        latest_was_interruption,
-    )
-}
-
-/// [`evaluate_excusing`] under an already-read `policy`, so a caller can
-/// choose how strictly the policy is read (for example
-/// [`read_policy_required`], where an absent config is an error).
-///
-/// # Errors
-///
-/// When a needed fact cannot be read. Callers must not arm on an error.
-pub fn evaluate_excusing_with_policy(
-    run_gh: RunGh<'_>,
-    repo: &str,
-    pr: u64,
-    head: &str,
-    policy: &ApprovalPolicy,
-    queue: &Value,
-    latest_was_interruption: bool,
-) -> Result<HeadGate, String> {
     if !policy.required {
         return Ok(HeadGate::NotRequired);
     }
-    let author = pr_author(run_gh, repo, pr, policy, None)?;
+    let author = pr_author(run_gh, repo, pr, &policy, None)?;
     let reviews = read_records(
         run_gh,
         &format!("repos/{repo}/pulls/{pr}/reviews"),
@@ -2315,7 +1935,7 @@ pub fn evaluate_excusing_with_policy(
         COMMENT_RECORD_JQ,
     )?;
     let gate = decide_for_author(
-        policy,
+        &policy,
         head,
         &reviews,
         &comments,
@@ -2329,7 +1949,7 @@ pub fn evaluate_excusing_with_policy(
         head,
         reviews: &reviews,
         comments: &comments,
-        policy,
+        policy: &policy,
         author: author.as_deref(),
     };
     let gate = with_carry(run_gh, &input, gate);
@@ -2403,22 +2023,6 @@ pub fn evaluate_with_policy_for_author_with_events(
     author: Option<&str>,
 ) -> Result<(HeadGate, Vec<String>), String> {
     evaluate_events(run_gh, repo, pr, head, policy, queue, author, true)
-        .map(|(gate, events, _)| (gate, events))
-}
-
-/// [`evaluate_with_policy_for_author_with_events`], also naming why a refused
-/// head is refused ([`ApprovalBlocker`]); `None` when the gate allows it. The
-/// diagnosis reads nothing the gate did not already read.
-pub fn evaluate_with_policy_for_author_with_diagnosis(
-    run_gh: RunGh<'_>,
-    repo: &str,
-    pr: u64,
-    head: &str,
-    policy: &ApprovalPolicy,
-    queue: &Value,
-    author: Option<&str>,
-) -> Result<(HeadGate, Vec<String>, Option<ApprovalBlocker>), String> {
-    evaluate_events(run_gh, repo, pr, head, policy, queue, author, true)
 }
 
 /// [`evaluate_with_policy_for_author_with_events`]; `rollups` is false for a
@@ -2433,9 +2037,9 @@ fn evaluate_events(
     queue: &Value,
     author: Option<&str>,
     rollups: bool,
-) -> Result<(HeadGate, Vec<String>, Option<ApprovalBlocker>), String> {
+) -> Result<(HeadGate, Vec<String>), String> {
     if !policy.required {
-        return Ok((HeadGate::NotRequired, Vec::new(), None));
+        return Ok((HeadGate::NotRequired, Vec::new()));
     }
     let author = pr_author(run_gh, repo, pr, policy, author)?;
     let author = author.as_deref();
@@ -2449,7 +2053,6 @@ fn evaluate_events(
         &format!("repos/{repo}/issues/{pr}/comments"),
         COMMENT_RECORD_JQ,
     )?;
-    let all_comments = comments.clone();
     let comments = if comments.iter().any(|comment| {
         comment
             .get("body")
@@ -2485,23 +2088,14 @@ fn evaluate_events(
         author,
     };
     let gate = refuse_self_approval(with_carry(run_gh, &carry, gate), head, &comments);
-    let gate = if rollups {
-        with_rollup(run_gh, &carry, gate)
-    } else {
-        gate
-    };
-    let blocker = blocker::diagnose(
-        &gate,
-        &blocker::Records {
-            head,
-            reviews: &reviews,
-            comments: &comments,
-            all_comments: &all_comments,
+    Ok((
+        if rollups {
+            with_rollup(run_gh, &carry, gate)
+        } else {
+            gate
         },
-        policy,
-        author,
-    );
-    Ok((gate, events, blocker))
+        events,
+    ))
 }
 
 /// One rollup member's gate ([`crate::rollup`]): this rule at its own exact
@@ -2520,7 +2114,7 @@ pub(crate) fn evaluate_member(
     let mut policy = policy.clone();
     policy.dry_run = true;
     evaluate_events(run_gh, repo, pr, head, &policy, &Value::Null, None, false)
-        .map(|(gate, _, _)| gate)
+        .map(|(gate, _)| gate)
 }
 
 /// `gate`, or the acceptance of a rollup ([`crate::rollup::guard_accept`])

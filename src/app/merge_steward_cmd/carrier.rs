@@ -529,7 +529,7 @@ fn read_head_approval(
             }
             (gate, _) => facts.carry_approval_detail = Some(gate.explain()),
         },
-        Err(error) => facts.carry_approval_detail = Some(error.to_string()),
+        Err(error) => facts.carry_approval_detail = Some(error),
     }
     Ok(())
 }

@@ -106,10 +106,6 @@ pub(super) struct ShipCommandArgs {
     /// Text (or `@file` contents) added to the pull request body once, after
     /// the attribution line and before the provenance block.
     pub(super) body_append: Option<String>,
-    /// The "what happens next" block `shipyard pr` printed for this pull
-    /// request, carried so every output path (queued, delegated, final) shows
-    /// it. `None` for `ship`.
-    pub(super) next_steps: Option<crate::pr_next_steps::NextSteps>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -441,7 +437,6 @@ pub(super) fn ship_command<W: Write>(
             config,
             pr_context.number,
             &prepush_shadow,
-            args.next_steps.as_ref(),
             json_mode,
             stdout,
         );
@@ -596,12 +591,6 @@ pub(super) fn ship_command<W: Write>(
                 fields([
                     ("ship", job.to_json_value()),
                     ("pr", Value::from(pr_context.number)),
-                    (
-                        "next_steps",
-                        args.next_steps
-                            .as_ref()
-                            .map_or(Value::Null, crate::pr_next_steps::NextSteps::to_json),
-                    ),
                 ]),
             )
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
@@ -612,11 +601,6 @@ pub(super) fn ship_command<W: Write>(
                 job.id, pr_context.number
             )
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
-            if let Some(steps) = args.next_steps.as_ref() {
-                steps
-                    .write_human(stdout)
-                    .map_err(|error| CliFailure::new(1, error.to_string()))?;
-            }
         }
         return Ok(ExitCode::SUCCESS);
     }
@@ -672,16 +656,9 @@ pub(super) fn ship_command<W: Write>(
             &render_state,
             &diagnostics,
             steward_handoff.as_ref(),
-            args.next_steps.as_ref(),
         )?;
     } else {
-        render_human(
-            stdout,
-            pr_context.number,
-            &render_state,
-            &diagnostics,
-            args.next_steps.as_ref(),
-        )?;
+        render_human(stdout, pr_context.number, &render_state, &diagnostics)?;
     }
     Ok(render_state.exit_code())
 }
@@ -754,7 +731,6 @@ fn render_required_checks_delegation<W: Write>(
     config: &LoadedConfig,
     pr: u64,
     prepush_shadow: &PrepushShadow,
-    next_steps: Option<&crate::pr_next_steps::NextSteps>,
     json_mode: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
@@ -776,10 +752,6 @@ fn render_required_checks_delegation<W: Write>(
                         .map_err(|error| CliFailure::new(1, error.to_string()))?,
                 ),
                 ("prepush_shadow", prepush_shadow.to_json()),
-                (
-                    "next_steps",
-                    next_steps.map_or(Value::Null, crate::pr_next_steps::NextSteps::to_json),
-                ),
             ]),
         )
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
@@ -795,11 +767,6 @@ fn render_required_checks_delegation<W: Write>(
         }
         writeln!(stdout, "  {}", prepush_shadow.line())
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
-        if let Some(steps) = next_steps {
-            steps
-                .write_human(stdout)
-                .map_err(|error| CliFailure::new(1, error.to_string()))?;
-        }
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -1444,7 +1411,7 @@ fn rederive_keyed_runs(
 mod render;
 use render::{render_human, render_json};
 
-pub(super) fn git_repo_slug(cwd: &Path) -> Option<String> {
+fn git_repo_slug(cwd: &Path) -> Option<String> {
     let remote = git_optional(cwd, &["remote", "get-url", "origin"])?;
     parse_github_repo_slug(&remote)
 }

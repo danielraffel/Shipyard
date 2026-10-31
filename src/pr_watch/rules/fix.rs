@@ -362,36 +362,3 @@ pub fn from_input(kind: &str, key: &str, rest: &BTreeMap<String, Value>) -> Fix 
         verify: format!("the next `{kind}` line carries a complete fix"),
     }
 }
-
-/// A HOLD on the current head that no push has answered.
-#[must_use]
-pub fn held_unrepaired(repo: &str, pr: &PrHistory, sha: &str, hold: &TrailEntry) -> Fix {
-    Fix {
-        what: subject(repo, pr, sha),
-        evidence: entry_url(repo, pr, hold),
-        cause: "held_unrepaired".to_owned(),
-        command: format!(
-            "read the HOLD, push a repair to {} (or label the pull request owner-decision, \
-             superseded or PARKED/<why> if it is not the author's to repair)",
-            pr.head_ref
-        ),
-        safe_to_auto_apply: false,
-        verify: format!(
-            "{repo}#{} has a new head and a verdict naming it",
-            pr.number
-        ),
-    }
-}
-
-/// A pull request set aside by a label: not a stall.
-#[must_use]
-pub fn labelled(repo: &str, pr: &PrHistory, sha: &str, state: &str, label: &str) -> Fix {
-    Fix {
-        what: subject(repo, pr, sha),
-        evidence: pr_url(repo, pr),
-        cause: state.to_owned(),
-        command: format!("none; remove the {label} label when it should be worked again"),
-        safe_to_auto_apply: false,
-        verify: format!("{repo}#{} no longer carries {label}", pr.number),
-    }
-}

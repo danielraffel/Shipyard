@@ -159,8 +159,8 @@ fn the_archive_appends_by_month_and_never_rewrites() {
     let september = record(2, "2026-09-30T23:59:59Z");
     let report = archive(dir.path(), &[october.clone(), september.clone()]).expect("archive");
     assert_eq!(report.appended, 2);
-    let first = std::fs::read(dir.path().join("causes/2026-10.jsonl")).expect("october");
-    assert!(dir.path().join("causes/2026-09.jsonl").exists());
+    let first = std::fs::read(dir.path().join("2026-10.jsonl")).expect("october");
+    assert!(dir.path().join("2026-09.jsonl").exists());
 
     // The same records again, a case row carrying a third, and noise.
     let case_row = serde_json::json!({
@@ -185,7 +185,7 @@ fn the_archive_appends_by_month_and_never_rewrites() {
             without_record: 2,
         }
     );
-    let after = std::fs::read(dir.path().join("causes/2026-10.jsonl")).expect("october");
+    let after = std::fs::read(dir.path().join("2026-10.jsonl")).expect("october");
     assert!(after.starts_with(&first), "earlier lines were rewritten");
     let text = String::from_utf8(after).expect("utf8");
     assert_eq!(text.lines().count(), 2);
@@ -197,18 +197,7 @@ fn an_undated_record_goes_to_its_own_file() {
     let mut value: Value = serde_json::from_str(&record(4, "x")).expect("record");
     value["named_at"] = Value::Null;
     archive(dir.path(), &[value.to_string()]).expect("archive");
-    assert!(dir.path().join("causes/undated.jsonl").exists());
-}
-
-#[test]
-fn a_legacy_root_archive_is_refused_instead_of_being_ignored() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    std::fs::write(dir.path().join("2026-10.jsonl"), "not json\n").expect("legacy archive");
-
-    let error = archive(dir.path(), &[record(5, "2026-10-13T12:00:00Z")])
-        .expect_err("legacy root archive must be migrated explicitly");
-    assert!(error.contains("legacy cause archive files"), "{error}");
-    assert!(!dir.path().join("causes/2026-10.jsonl").exists());
+    assert!(dir.path().join("undated.jsonl").exists());
 }
 
 #[test]
@@ -249,7 +238,7 @@ fn two_archivers_at_once_lose_and_duplicate_nothing() {
         reports.iter().map(|r| r.already_archived).sum::<usize>(),
         20
     );
-    let text = std::fs::read_to_string(dir.path().join("causes/2026-10.jsonl")).expect("archive");
+    let text = std::fs::read_to_string(dir.path().join("2026-10.jsonl")).expect("archive");
     let ids: Vec<String> = text
         .lines()
         .map(|line| {
@@ -261,154 +250,4 @@ fn two_archivers_at_once_lose_and_duplicate_nothing() {
     let unique: std::collections::BTreeSet<&String> = ids.iter().collect();
     assert_eq!(ids.len(), 40);
     assert_eq!(unique.len(), 40);
-}
-
-#[test]
-fn archive_reader_holds_a_shared_snapshot_lock() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let writer = lock_archive(dir.path(), true).expect("writer lock");
-    drop(writer);
-    let reader = lock_archive(dir.path(), false).expect("reader lock");
-    let lock = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(dir.path().join(".lock"))
-        .expect("lock file");
-    assert!(
-        lock.try_lock_exclusive().is_err(),
-        "reader must exclude writers"
-    );
-    drop(reader);
-    lock.try_lock_exclusive()
-        .expect("writer can acquire after reader releases");
-}
-
-#[test]
-fn auxiliary_jsonl_files_do_not_prevent_canonical_archiving() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("fixlinks.jsonl"), "").unwrap();
-    std::fs::write(dir.path().join("outages.jsonl"), "").unwrap();
-    let report = archive(dir.path(), &[record(6, "2026-10-13T12:00:00Z")]).unwrap();
-    assert_eq!(report.appended, 1);
-}
-
-#[test]
-fn a_mutable_archive_without_its_lock_joins_the_lock_domain_before_reading() {
-    let dir = tempfile::tempdir().expect("archive");
-    std::fs::create_dir(dir.path().join("causes")).expect("causes directory");
-    std::fs::write(
-        dir.path().join(".shipyard-cause-archive.json"),
-        br#"{"schema":"shipyard.cause-archive/v1","frozen":false}"#,
-    )
-    .expect("archive marker");
-
-    let _reader = lock_archive(dir.path(), false).expect("reader lock");
-    assert!(dir.path().join(".lock").is_file());
-    let writer = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(dir.path().join(".lock"))
-        .expect("lock file");
-    assert!(
-        writer.try_lock_exclusive().is_err(),
-        "reader must hold the newly created lock"
-    );
-}
-
-#[test]
-fn a_frozen_archive_is_readable_without_creating_a_lock() {
-    let dir = tempfile::tempdir().expect("archive");
-    std::fs::create_dir(dir.path().join("causes")).expect("causes directory");
-    std::fs::write(
-        dir.path().join(".shipyard-cause-archive.json"),
-        br#"{"schema":"shipyard.cause-archive/v1","frozen":true}"#,
-    )
-    .expect("archive marker");
-
-    let _reader = lock_archive(dir.path(), false).expect("frozen reader");
-
-    assert!(!dir.path().join(".lock").exists());
-}
-
-#[test]
-fn a_frozen_archive_with_an_interrupted_prune_is_not_readable() {
-    let dir = tempfile::tempdir().expect("archive");
-    std::fs::create_dir(dir.path().join("causes")).expect("causes directory");
-    std::fs::write(
-        dir.path().join(".shipyard-cause-archive.json"),
-        br#"{"schema":"shipyard.cause-archive/v1","frozen":true}"#,
-    )
-    .expect("archive marker");
-    std::fs::create_dir(dir.path().join(".prune-txn")).expect("pending transaction");
-
-    let Err(error) = lock_archive(dir.path(), false) else {
-        panic!("frozen archive with pending transaction must refuse reads")
-    };
-
-    assert!(error.contains("interrupted prune"), "{error}");
-    assert!(!dir.path().join(".lock").exists());
-}
-
-#[cfg(unix)]
-#[test]
-fn frozen_archive_root_symlink_is_rejected_before_reading() {
-    use std::os::unix::fs::symlink;
-
-    let parent = tempfile::tempdir().expect("parent");
-    let outside = tempfile::tempdir().expect("outside");
-    std::fs::create_dir(outside.path().join("causes")).expect("causes directory");
-    std::fs::write(
-        outside.path().join(".shipyard-cause-archive.json"),
-        br#"{"schema":"shipyard.cause-archive/v1","frozen":true}"#,
-    )
-    .expect("archive marker");
-    let link = parent.path().join("archive");
-    symlink(outside.path(), &link).expect("archive symlink");
-
-    let Err(error) = lock_archive(&link, false) else {
-        panic!("symlinked archive root must be rejected")
-    };
-
-    assert!(error.contains("real directory"), "{error}");
-    assert!(!link.join(".lock").exists());
-}
-
-#[cfg(unix)]
-#[test]
-fn inaccessible_archive_lock_fails_closed_for_readers() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let dir = tempfile::tempdir().expect("archive");
-    std::fs::create_dir(dir.path().join("causes")).expect("causes directory");
-    let lock = dir.path().join(".lock");
-    std::fs::write(&lock, b"").expect("lock");
-    std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o000)).expect("chmod");
-
-    let result = lock_archive(dir.path(), false);
-
-    std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o600)).expect("restore chmod");
-    let Err(error) = result else {
-        panic!("inaccessible lock must fail closed")
-    };
-    assert!(!error.is_empty());
-}
-
-#[cfg(unix)]
-#[test]
-fn archive_refuses_a_symlinked_causes_directory_without_writing_outside() {
-    use std::os::unix::fs::symlink;
-
-    let dir = tempfile::tempdir().expect("archive");
-    let outside = tempfile::tempdir().expect("outside");
-    std::fs::write(
-        dir.path().join(".shipyard-cause-archive.json"),
-        br#"{"schema":"shipyard.cause-archive/v1","frozen":false}"#,
-    )
-    .expect("archive marker");
-    symlink(outside.path(), dir.path().join("causes")).expect("causes symlink");
-
-    let error = archive(dir.path(), &[record(99, "2026-10-13T12:00:00Z")]).unwrap_err();
-
-    assert!(error.contains("real directory"), "{error}");
-    assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
 }

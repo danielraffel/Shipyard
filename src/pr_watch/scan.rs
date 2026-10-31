@@ -19,9 +19,7 @@ use super::handback::{self, HandbackConfig, HandbackMode, HandbackReport};
 use super::ledger::{self, PrNow};
 use super::{ACK_LABEL, head_at, open_at};
 use crate::config::LoadedConfig;
-use crate::gate_cost::{ReadCache, SyncGhReader, parallel_map};
-
-type ScreenCandidate = (usize, u64);
+use crate::gate_cost::{ReadCache, SyncGhReader};
 
 /// A `gh` request that may mutate: used only for comment endpoints.
 pub type GhWriter<'a> = dyn Fn(&[String]) -> Result<String, String> + 'a;
@@ -589,24 +587,14 @@ fn screen_green_unarmed(
         .map(|flag| flag.pr)
         .collect();
     let mut drop: Vec<u64> = Vec::new();
-    let (screen, deferred): (Vec<ScreenCandidate>, Vec<ScreenCandidate>) = candidates
-        .into_iter()
-        .enumerate()
-        .partition(|(index, _)| *index < SCREEN_LIMIT);
-    for pr in deferred.into_iter().map(|(_, pr)| pr) {
-        gaps.push(format!(
-            "#{pr}: flag 6 not screened (more than {SCREEN_LIMIT} candidates this pass)"
-        ));
-    }
-
-    // The two reads for each candidate are independent, and screening is
-    // advisory: one slow comments endpoint must not serialize every other
-    // candidate or leave the watcher apparently stalled. Keep the bounded
-    // worker pool in `gate_cost::parallel_map` so GitHub rate pressure remains
-    // capped, while preserving input order for deterministic reports.
-    let screened = parallel_map(&screen, |(_, pr)| (*pr, read_screen(reader, repo, *pr)));
-    for (pr, result) in screened {
-        match result {
+    for (index, pr) in candidates.into_iter().enumerate() {
+        if index >= SCREEN_LIMIT {
+            gaps.push(format!(
+                "#{pr}: flag 6 not screened (more than {SCREEN_LIMIT} candidates this pass)"
+            ));
+            continue;
+        }
+        match read_screen(reader, repo, pr) {
             Ok(screen) if screen.draft || screen.held => drop.push(pr),
             Ok(screen) => {
                 if let (Some(note), Some(flag)) = (
@@ -890,11 +878,6 @@ pub fn daemon_pass(
 
 #[cfg(test)]
 mod screen_tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    };
-
     use serde_json::json;
 
     use super::*;
@@ -997,37 +980,5 @@ mod screen_tests {
         assert_eq!(gaps.len(), 1, "{gaps:?}");
         assert!(gaps[0].starts_with("#6: flag 6 screen"), "{gaps:?}");
         assert!(!calls.lock().unwrap().iter().any(|c| c.contains("/7")));
-    }
-
-    #[test]
-    fn screening_uses_bounded_parallel_reads() {
-        let active = Arc::new(AtomicUsize::new(0));
-        let peak = Arc::new(AtomicUsize::new(0));
-        let reader = {
-            let active = Arc::clone(&active);
-            let peak = Arc::clone(&peak);
-            move |argv: &[String]| -> Result<String, String> {
-                let now = active.fetch_add(1, Ordering::AcqRel) + 1;
-                peak.fetch_max(now, Ordering::AcqRel);
-                std::thread::sleep(std::time::Duration::from_millis(10));
-                active.fetch_sub(1, Ordering::AcqRel);
-                let path = argv[1].as_str();
-                if path.contains("/pulls/") {
-                    Ok(json!({"draft": false, "body": "Fix."}).to_string())
-                } else {
-                    Ok("[]".to_owned())
-                }
-            }
-        };
-        let mut flags = (1..=8)
-            .map(|pr| flag(pr, FlagKind::GreenUnarmed))
-            .collect::<Vec<_>>();
-
-        let (gaps, held) = screen_green_unarmed(&reader, "o/r", &mut flags);
-
-        assert!(gaps.is_empty());
-        assert!(held.is_empty());
-        assert!(peak.load(Ordering::Acquire) > 1, "screening was serialized");
-        assert_eq!(flags.len(), 8);
     }
 }

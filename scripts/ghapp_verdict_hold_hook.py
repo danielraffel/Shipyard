@@ -418,8 +418,7 @@ def main(args: list[str]) -> int:
     if record["action"] in ("dequeued", "disarmed"):
         print(
             f"verdict-hold-hook: {record['action']} {repo}#{number} at {record['head'][:12]} "
-            "before posting this HOLD; that head is now un-approvable, so it lands again only "
-            "after a new head is pushed and approved.",
+            "before posting this HOLD; it lands again only after a new verdict approves its head.",
             file=sys.stderr,
         )
     return 0

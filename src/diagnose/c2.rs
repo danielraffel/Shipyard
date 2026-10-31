@@ -36,9 +36,8 @@ pub const SCHEMA: &str = "c2.cause.v0";
 /// one unnamed; 6 adds `generated_drift`; 7 names a `CMake` error by its call
 /// site and error rather than the bare command name, and a bare exit by the
 /// last line it printed rather than the step's script line. EXP-A3 registers
-/// each version before any re-score. Version 8 excludes explicit warning
-/// diagnostics from linker causes, including the undefined-reference branch.
-pub const VERSION: u32 = 8;
+/// each version before any re-score.
+pub const VERSION: u32 = 7;
 
 /// Every format, in priority order.
 pub const FORMATS: [&str; 25] = [
@@ -661,24 +660,10 @@ static UNDEFINED_REF: LazyLock<Regex> =
 static LD_LINE: LazyLock<Regex> =
     LazyLock::new(|| pattern(r"^(?:ld|ld64\.lld|lld|/usr/bin/ld)(?:\.\w+)?: (?:error: )?(.*)$"));
 
-static LINKER_SEVERITY: LazyLock<Regex> =
-    LazyLock::new(|| pattern(r"(?:^|:\s+)(warning|error|fatal error):(?:\s|$)"));
-
 fn rule_linker(lines: &[String]) -> Vec<Record> {
     let mut out = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         let text = line.trim();
-        // A later cancellation can mark the whole step failed; that does not
-        // make its linker warnings fatal. Check severity before the unanchored
-        // undefined-reference match too. Use the first severity so an error
-        // quoting "warning:" remains fatal; separate -fatal_warnings errors
-        // and diagnostics promoted to "error:" still reach the rules below.
-        if LINKER_SEVERITY
-            .captures(text)
-            .is_some_and(|caps| &caps[1] == "warning")
-        {
-            continue;
-        }
         if text.starts_with("Undefined symbols for architecture") {
             let symbol = next_nonblank(lines, i, 2).map_or_else(String::new, |j| {
                 LD_SYMBOL

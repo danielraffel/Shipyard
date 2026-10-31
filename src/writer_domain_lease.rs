@@ -106,12 +106,6 @@ pub(crate) fn acquire_for_protected_path_with_timeout(
     acquire_thread_lease_at(&runtime_paths.state_dir, timeout).map(Some)
 }
 
-/// Depth of the writer-domain lease held by this thread (0 when none).
-#[cfg(test)]
-pub(crate) fn thread_lease_depth() -> usize {
-    THREAD_WRITER_DOMAIN.with(|slot| slot.borrow().as_ref().map_or(0, |held| held.depth))
-}
-
 pub(crate) fn is_current_protected_path(path: &Path) -> io::Result<bool> {
     let runtime_paths = RuntimePaths::current(RuntimeMode::Shipyard);
     is_protected_path(path, &home_dir(), &runtime_paths)

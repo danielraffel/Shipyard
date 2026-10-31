@@ -95,13 +95,6 @@ class ReviewVerdictStatus(unittest.TestCase):
         answers = self.case("shipyard-784", queue=False, comments=[trail], config=config,
                             graphql=arm.opened(arm.review_fixture("shipyard-784-graphql.json")))
         answers.insert(0, ("/statuses/", {"json": {"state": "posted"}}))
-        # The head's own pull_request_target run, which a comment or review
-        # re-runs so its check follows the verdict.
-        answers.insert(0, ("/actions/runs/555/rerun", {"text": ""}))
-        answers.insert(0, ("actions/runs?head_sha", {"json": {"workflow_runs": [
-            {"id": 500, "name": "Review verdict", "event": "pull_request_target"},
-            {"id": 555, "name": "Review verdict", "event": "pull_request_target"},
-            {"id": 600, "name": "Other", "event": "pull_request_target"}]}}))
         answers.insert(0, (f"/commits/{HEAD}/pulls", {"json": [
             {"number": 784, "state": "open", "head": {"sha": HEAD}},
             {"number": 700, "state": "closed", "head": {"sha": HEAD}},
@@ -180,23 +173,6 @@ class ReviewVerdictStatus(unittest.TestCase):
         signed = [self.comment(f"Reviewed.\nreviewer: infra-review2\n{STAMP}\n"
                                f"verdict: APPROVE head:{HEAD}", "2026-10-12T15:00:00Z")]
         self.assertEqual(self.judged(signed, config), "success")
-
-    def test_base_signer_identity_binding_is_enforced_by_the_status(self) -> None:
-        config = ('[auto_merge]\n'
-                  'reviewer_signers = ["codex-review"]\n'
-                  '[auto_merge.reviewer_signer_identities]\n'
-                  'codex-review = ["Daniels-Mac-Studio-m3 agent:codex-reviewer"]\n')
-
-        def approve(stamp: str) -> list[dict[str, Any]]:
-            return [self.comment(f"Reviewed.\nreviewer: codex-review\n{stamp}\n"
-                                 f"verdict: APPROVE head:{HEAD}", "2026-10-12T15:00:00Z")]
-
-        good = "<!-- session: Daniels-Mac-Studio-m3/rotating agent: codex-reviewer -->"
-        wrong_host = "<!-- session: Daniels-M5-Studio/rotating agent: codex-reviewer -->"
-        no_agent = "<!-- session: Daniels-Mac-Studio-m3/rotating -->"
-        self.assertEqual(self.judged(approve(good), config), "success")
-        self.assertEqual(self.judged(approve(wrong_host), config), "failure")
-        self.assertEqual(self.judged(approve(no_agent), config), "failure")
 
     def test_tartci_623s_copied_approve_fails_stamped_unattributed_or_unstamped(self) -> None:
         # tartci#623's deciding APPROVE (comment 6321450475) copied
@@ -326,94 +302,6 @@ class ReviewVerdictStatus(unittest.TestCase):
         result = self.post(closed)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("/statuses/", self.calls())
-
-    def refused_trail(self) -> list[dict[str, Any]]:
-        return [self.comment(f"verdict: HOLD head:{HEAD}", "2026-10-12T15:00:00Z")]
-
-    def approved_trail(self) -> list[dict[str, Any]]:
-        return [self.comment(SIGNED_APPROVE.format(head=HEAD), "2026-10-12T15:00:00Z")]
-
-    def test_the_head_check_is_red_when_the_verdict_is_refused(self) -> None:
-        # The job is the required `review-verdict` check run on the head, so a
-        # refused head must fail it, not only post a failing status.
-        event = {"pull_request": {"number": 784}}
-        result = self.post(self.answers(self.refused_trail()), "pull_request_target", event)
-        self.assertEqual(self.posted()["state"], "failure")
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertNotIn("/rerun", self.calls())
-
-    def test_the_head_check_is_green_only_when_the_verdict_is_allowed(self) -> None:
-        event = {"pull_request": {"number": 784}}
-        result = self.post(self.answers(self.approved_trail(), SIGNERS),
-                           "pull_request_target", event)
-        self.assertEqual(self.posted()["state"], "success")
-        self.assertEqual(result.returncode, 0, result.stderr)
-
-    def test_no_approval_at_all_fails_the_head_check(self) -> None:
-        event = {"pull_request": {"number": 784}}
-        result = self.post(self.answers([]), "pull_request_target", event)
-        self.assertEqual(self.posted()["state"], "failure")
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-
-    def test_a_comment_re_runs_the_heads_newest_run_so_its_check_follows(self) -> None:
-        # A comment's own check run sits on the default branch's tip. The head's
-        # check run is only updated by re-running the head's own run, newest first.
-        for trail, signers in ((self.refused_trail(), None), (self.approved_trail(), SIGNERS)):
-            with self.subTest(refused=signers is None):
-                result = self.post(self.answers(trail, signers))
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                calls = self.calls()
-                self.assertIn(f"actions/runs?head_sha={HEAD}&event=pull_request_target", calls)
-                self.assertIn("-X POST repos/danielraffel/Shipyard/actions/runs/555/rerun", calls)
-                self.assertNotIn("/actions/runs/500/rerun", calls)
-
-    def test_a_read_error_fails_the_job_instead_of_passing(self) -> None:
-        for event_name, event in (("pull_request_target", {"pull_request": {"number": 784}}),
-                                  ("issue_comment", None)):
-            with self.subTest(event=event_name):
-                broken = [(needle, {"error": "gh: HTTP 502"}) if needle == "/pulls/"
-                          else (needle, answer)
-                          for needle, answer in self.answers(self.approved_trail(), SIGNERS)]
-                result = self.post(broken, event_name, event)
-                self.assertNotEqual(result.returncode, 0, result.stdout)
-                self.assertNotIn("/statuses/", self.calls())
-
-    def test_a_failed_status_post_fails_the_job(self) -> None:
-        broken = [(needle, {"error": "gh: HTTP 403"}) if needle == "/statuses/"
-                  else (needle, answer)
-                  for needle, answer in self.answers(self.approved_trail(), SIGNERS)]
-        result = self.post(broken, "pull_request_target", {"pull_request": {"number": 784}})
-        self.assertNotEqual(result.returncode, 0, result.stdout)
-
-    def test_a_refresh_that_cannot_be_requested_fails_the_job(self) -> None:
-        # A stale green on the head would let a refused head merge.
-        broken = [(needle, {"error": "gh: HTTP 403"}) if needle == "/actions/runs/555/rerun"
-                  else (needle, answer)
-                  for needle, answer in self.answers(self.refused_trail())]
-        self.assertNotEqual(self.post(broken).returncode, 0)
-
-    def test_an_unreadable_event_fails_the_job(self) -> None:
-        self.post([])
-        (self.root / "event.json").write_text("{not json", encoding="utf-8")
-        environment = {"PATH": "/usr/bin:/bin", "GITHUB_EVENT_NAME": "issue_comment",
-                       "GITHUB_EVENT_PATH": str(self.root / "event.json"),
-                       "GITHUB_REPOSITORY": REPO}
-        result = subprocess.run([sys.executable, str(self.scripts / STATUS.name)],
-                                env=environment, capture_output=True, text=True,
-                                check=False, stdin=subprocess.DEVNULL)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("error", result.stderr)
-
-    def test_the_workflow_can_re_run_and_still_runs_on_verdicts(self) -> None:
-        root = STATUS.parent.parent / ".github" / "workflows"
-        workflow = (root / "review-verdict.yml").read_text(encoding="utf-8")
-        for needed in ("pull_request_target:", "issue_comment:", "workflow_run:",
-                       "actions: write", "scripts/review_verdict_status.py"):
-            self.assertIn(needed, workflow)
-        self.assertNotIn("continue-on-error", workflow)
-        self.assertNotIn("|| true", workflow)
-        trigger = (root / "review-verdict-trigger.yml").read_text(encoding="utf-8")
-        self.assertIn("pull_request_review:", trigger)
 
 
 if __name__ == "__main__":

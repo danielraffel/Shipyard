@@ -169,7 +169,6 @@ fn ship_args(pr: Option<u64>, gh: Option<std::path::PathBuf>) -> ShipCommandArgs
         arm_auto_merge: crate::app::cli::ArmRequest::Off,
         leave_unarmed: false,
         body_append: None,
-        next_steps: None,
     }
 }
 
@@ -397,7 +396,6 @@ fn delegated_human_output_names_each_opt_in_target() {
         &config_from(std::path::Path::new("/nonexistent"), OPT_IN_MAC),
         88,
         &super::PrepushShadow::Disabled,
-        None,
         false,
         &mut out,
     )

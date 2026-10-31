@@ -366,14 +366,12 @@ repository with no required checks is watched for everything but red checks.
 | `ready_unreviewed` | a comment whose first line starts with READY names the current head, and no verdict names it |
 | `head_unreviewed` | opt-in, `--head-unreviewed-after 45m`: the current head has been up that long with neither a READY nor a verdict naming it (drafts excepted). Off by default because it fires for every head an agent is still working on |
 | `verdict_posted` | a verdict was posted (a last line `verdict: APPROVE/HOLD head:<sha>` or `reviewed: <sha>`, or an APPROVED / CHANGES_REQUESTED review); route it to the author |
-| `armed_unapproved` | armed or queued, and the head carries no approval: no verdict names it, or a HOLD names it (a HOLD makes its head un-approvable, so a later APPROVE of the same head does not clear it) |
+| `armed_unapproved` | armed or queued, and the latest verdict naming the head is not an approval |
 | `required_red` | the pull request is armed, queued or approved, and the latest attempt of a required check on its head failed or was cancelled; the line names the failing tests. A red head nobody armed or approved is its author's work in progress |
 | `group_red` | a merge group named for the pull request failed a required job; the line names the failing tests |
 | `queue_removed` | the merge queue removed it for any reason but a merge |
 | `queue_stuck` | it has been in the merge queue for `--queue-stuck-after` (90m) |
 | `approved_unarmed` | the head has been approved for `--approved-unarmed-after` (15m) and nothing armed or queued it |
-| `held_unrepaired` | a trusted HOLD names the current head (a later APPROVE of the same head does not clear it), nothing was pushed since (a push makes the verdict name an old head), and it is older than `--held-after` (60m). An armed or queued head is `armed_unapproved`'s, and a draft is skipped |
-| `owner_decision`, `superseded`, `parked` | the pull request carries the label `owner-decision`, `superseded` or `PARKED/<why>` (case-insensitive; that precedence when several). It is reported once per head under its own state and **skipped by every stall rule** (`ready_unreviewed` through `approved_blocked`, `held_unrepaired`, `queue_*`), so a deliberately set-aside pull request does not alarm. `verdict_posted` still relays a verdict |
 | `approved_blocked` | the head is approved but `DIRTY` or `BEHIND` (live passes only: GitHub keeps no history of merge state) |
 | `host_alarm` | a `[tartci] ...` issue opened in `--alarm-repo` |
 | any other | a line from `--input-events`, passed through once per `key` |
@@ -397,9 +395,7 @@ a red check whose annotation already named its failing test was named in a
 median 58 minutes, against 95 without.
 
 Each line is a `shipyard.pr-watch.rules/v1` object: `kind`, `key`, `at` (the
-pass), `since` (when the condition began, where known), `age_secs` and `age`
-(`at - since`, for example `1h30m`: how long it had held when reported, on
-every event that has a `since`), `repo`, `pr`, `head`,
+pass), `since` (when the condition began, where known), `repo`, `pr`, `head`,
 `summary` (one actionable line), `detail`, and `fix`.
 
 `fix` is what an agent needs to act without investigating:
@@ -527,37 +523,6 @@ Its variants, from loosest to strictest:
 Recall on time alone rises with event density, so read every variant against
 `--control-shift-hours N`, which scores the same events moved N hours. A
 variant that does not beat its shifts is measuring density, not detection.
-
-### Turning it on for a fleet
-
-The rules watcher has no `[pr_watch]` config key and no daemon job: it is a
-command, and what a fleet configures is the scheduled invocation. The
-`[pr_watch] enabled` key below governs the *scan* daemon job, not this. To
-turn the rules on, run one pass on a timer on one host (launchd
-`StartInterval` of 900 s, or cron `*/15`), with its output appended to a log
-the steward or a monitor reads:
-
-```bash
-shipyard pr-watch rules \
-  --repo Generous-Corp/pulp --repo danielraffel/Shipyard@ci.yml \
-  --reviewer Generous-Corp/pulp=infra-review2 \
-  --held-after 60m --approved-unarmed-after 15m --queue-stuck-after 90m \
-  --head-unreviewed-after 45m >> "$STATE/pr-watch-rules.jsonl"
-```
-
-The flags are the whole configuration: `--held-after`,
-`--approved-unarmed-after`, `--queue-stuck-after`, `--head-unreviewed-after`
-(opt-in) and `--reviewer`. The first pass primes its ledger and prints
-nothing; later passes print only new conditions. `--state-file` keeps the
-ledger apart per fleet. Labels are read as they are now (GitHub keeps no label
-history), so a replay classifies by the labels a pull request has today.
-
-Use with the steward: the watcher is read-only. It writes nothing to GitHub,
-arms nothing and takes no steward lock, so it can run beside a live steward
-and beside another watcher on a different `--state-file`. Read "what is stuck
-and for how long" by sorting its lines on `age_secs`; act on each line's `fix`
-through the steward, which keeps sole authority to arm and merge. A line
-labelled `owner_decision`, `superseded` or `parked` is information, not work.
 
 ## Daemon job and config
 

@@ -5,7 +5,7 @@
 <key>ProgramArguments</key><array><string>@PYTHON@</string><string>@WRAPPER@</string>
 <string>--collector</string><string>@COLLECTOR@</string><string>--handoff-script</string><string>@HANDOFF@</string>
 <string>--repo</string><string>@REPO@</string><string>--base-branch</string><string>@MERGE_RECEIPT_BASE_BRANCH@</string>
-<string>--merge-receipts</string><string>@MERGE_RECEIPTS@</string><string>--merge-receipt-health</string><string>@MERGE_RECEIPT_HEALTH@</string>@MERGE_RECEIPT_SOURCE_HOST_ARGS@<string>--</string>
+<string>--merge-receipts</string><string>@MERGE_RECEIPTS@</string><string>--merge-receipt-health</string><string>@MERGE_RECEIPT_HEALTH@</string><string>--</string>
 <string>--db</string><string>@DB@</string><string>--project</string><string>@PROJECT@</string>
 <string>--repo</string><string>@REPO@</string><string>--state</string><string>@STATE@</string>
 <string>--status-markdown</string><string>@STATUS@</string><string>--tartci-host</string><string>@TARTCI_HOST@</string><string>--collect</string></array>

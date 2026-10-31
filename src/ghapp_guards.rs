@@ -1,8 +1,8 @@
 //! Install and audit the `ghapp` wrapper's optional queue guards.
 //!
 //! `scripts/ghapp` runs `queue-removal-guard`, `queue-arm-guard`,
-//! `branch-refresh-guard`, `merge-guard`, `verdict-hold-hook`,
-//! `verdict-session-stamp` and `reviewer-claim-guard` from
+//! `branch-refresh-guard`, `merge-guard`, `verdict-hold-hook` and
+//! `verdict-session-stamp` from
 //! `$SHIPYARD_GHAPP_GUARDS_DIR` (default `~/.config/shipyard/guards`) when they
 //! are present and executable. Nothing else puts them there, so a host keeps
 //! whatever copy somebody placed by hand, possibly months stale. This module
@@ -48,7 +48,7 @@ pub struct ManagedGuard {
 /// Every guard `shipyard guards install` manages, in install order: the arm
 /// and branch-refresh guards import the removal guard's request parser, so the
 /// parser lands first.
-pub const MANAGED_GUARDS: [ManagedGuard; 7] = [
+pub const MANAGED_GUARDS: [ManagedGuard; 6] = [
     ManagedGuard {
         name: "queue-removal-guard",
         source_path: "scripts/ghapp_queue_removal_guard.py",
@@ -85,13 +85,6 @@ pub const MANAGED_GUARDS: [ManagedGuard; 7] = [
         name: "verdict-session-stamp",
         source_path: "scripts/ghapp_verdict_session_stamp.py",
         contents: include_bytes!("../scripts/ghapp_verdict_session_stamp.py"),
-    },
-    // Refuses an exact-head verdict when the protected base enables durable
-    // reviewer claims and the posting reviewer has no current local claim.
-    ManagedGuard {
-        name: "reviewer-claim-guard",
-        source_path: "scripts/ghapp_reviewer_claim_guard.py",
-        contents: include_bytes!("../scripts/ghapp_reviewer_claim_guard.py"),
     },
 ];
 

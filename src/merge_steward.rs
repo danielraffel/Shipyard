@@ -90,11 +90,6 @@ pub struct StewardPolicy {
     pub merge_queue: bool,
     /// Repository allows native auto-merge.
     pub native_auto_merge: bool,
-    /// Required check that reports exact-head approval on every PR head (for
-    /// example `review-verdict`). A repository without a merge queue is
-    /// admitted by an exact-head merge only when GitHub itself requires this
-    /// context from a bound app; see [`Self::server_enforced_exact_head_merge`].
-    pub approval_context: String,
     /// Authoritative required check rules. Empty means mutation is refused
     /// because the observed check set cannot prove complete materialization.
     pub required_checks: Vec<RequiredCheck>,
@@ -115,46 +110,6 @@ pub struct StewardPolicy {
     /// Transient reruns allowed per immutable head and required check. Values
     /// above [`crate::transient_interruption::RERUN_BUDGET`] are clamped to it.
     pub max_transient_reruns: u32,
-}
-
-/// Default required approval context for the server-enforced exact-head merge.
-pub const DEFAULT_APPROVAL_CONTEXT: &str = "review-verdict";
-
-impl StewardPolicy {
-    /// Whether this base admits a pull request by a server-enforced
-    /// exact-head merge instead of a merge queue.
-    ///
-    /// Only when there is no merge queue and GitHub itself enforces a
-    /// required-check set that includes the approval context, with that rule
-    /// bound to an app (`integration_id`): an unbound rule is satisfied by any
-    /// actor that can post a status of that name. The steward then merges
-    /// with `mergePullRequest` bound by `expectedHeadOid`, only an approved,
-    /// `CLEAN`, all-green head, and GitHub refuses the merge of any head whose
-    /// approval context or CI has not passed. It never arms auto-merge here:
-    /// an armed request survives a later push by anyone with write access.
-    /// Anything less stays refused, with no merge at all.
-    #[must_use]
-    pub fn server_enforced_exact_head_merge(&self) -> bool {
-        let context = self.approval_context.trim();
-        !self.merge_queue
-            && !context.is_empty()
-            && self
-                .required_checks
-                .iter()
-                .any(|check| check.context == context && check.app_id.is_some())
-    }
-
-    /// Report label for how this base admits a pull request.
-    #[must_use]
-    pub fn merge_path(&self) -> &'static str {
-        if self.merge_queue {
-            "native_queue_exact_head"
-        } else if self.server_enforced_exact_head_merge() {
-            "server_enforced_exact_head_merge"
-        } else {
-            "direct_merge_refused_server_enforcement_required"
-        }
-    }
 }
 
 /// Repository-specific routing vocabulary for bounded capacity preemption.
@@ -428,12 +383,12 @@ pub fn classify_pr(
             contexts: vec![format!("github-merge-state:CLEAN (current={merge_state})")],
         };
     }
-    if policy.merge_queue || policy.server_enforced_exact_head_merge() {
+    if policy.merge_queue {
         // The exact-head enqueue mutation is idempotent from the steward's
         // perspective and is stronger evidence than autoMergeRequest: GitHub
         // clears that field once a PR is in the queue, while a stranded native
         // request can remain armed without ever materializing a queue entry.
-        approval_status_refusal(pr, policy).unwrap_or(StewardDecision::ArmMergeQueue)
+        StewardDecision::ArmMergeQueue
     } else {
         StewardDecision::DirectMergeRefused {
             reasons: vec![DirectMergeRefusal::ValidatedBaseRevisionNotAtomic],
@@ -544,72 +499,6 @@ pub fn has_successful_status(pr: &StewardPullRequest, context: &str) -> bool {
                 .as_deref()
                 .is_some_and(|value| value.eq_ignore_ascii_case("SUCCESS"))
     })
-}
-
-/// Whether every required check has a successful terminal conclusion on the
-/// observed head. Missing, pending, failed and transient checks all answer
-/// `false`.
-#[must_use]
-pub fn required_checks_all_succeeded(pr: &StewardPullRequest, policy: &StewardPolicy) -> bool {
-    !policy.required_checks.is_empty()
-        && selected_checks(pr, policy).iter().all(|(_, check)| {
-            check.is_some_and(|check| {
-                check.status.eq_ignore_ascii_case("COMPLETED")
-                    && matches!(
-                        check
-                            .conclusion
-                            .as_deref()
-                            .unwrap_or_default()
-                            .to_ascii_uppercase()
-                            .as_str(),
-                        "SUCCESS" | "NEUTRAL" | "SKIPPED"
-                    )
-            })
-        })
-}
-
-/// On a server-enforced base, the decision when the approval context's commit
-/// status refuses the head; see [`approval_status_agrees`].
-fn approval_status_refusal(
-    pr: &StewardPullRequest,
-    policy: &StewardPolicy,
-) -> Option<StewardDecision> {
-    (policy.server_enforced_exact_head_merge() && !approval_status_agrees(pr, policy)).then(|| {
-        StewardDecision::RequiredFailed {
-            contexts: vec![format!(
-                "{} (commit status)",
-                policy.approval_context.trim()
-            )],
-        }
-    })
-}
-
-/// Whether the newest commit status named after the approval context, if
-/// there is one, agrees with the app-bound check run that satisfies the rule.
-///
-/// The bound rule is satisfied by a check run carrying the app id; an
-/// app-less status of the same name never satisfies it. But the canonical
-/// `review-verdict` job succeeds whenever it posts a verdict and carries the
-/// verdict itself in a status of the same name, so a check run can be green
-/// while that status says the head is refused. A refusing status therefore
-/// refuses; an absent one leaves the check run to decide.
-#[must_use]
-pub fn approval_status_agrees(pr: &StewardPullRequest, policy: &StewardPolicy) -> bool {
-    let context = policy.approval_context.trim();
-    pr.checks
-        .iter()
-        .filter(|check| {
-            check.source == StewardCheckSource::StatusContext
-                && check.name.eq_ignore_ascii_case(context)
-        })
-        .max_by_key(|check| check_recency(check))
-        .is_none_or(|status| {
-            status.status.eq_ignore_ascii_case("COMPLETED")
-                && status
-                    .conclusion
-                    .as_deref()
-                    .is_some_and(|conclusion| conclusion.eq_ignore_ascii_case("SUCCESS"))
-        })
 }
 
 fn selected_checks<'a>(

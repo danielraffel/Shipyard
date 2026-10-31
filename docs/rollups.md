@@ -76,7 +76,7 @@ apply the same rule. A rollup lands only when all of these hold:
 
 - **(a) Members.** Each `H_i` is the current head of exactly one open pull
   request on the same base, and none is a draft. Each member passes the review rule at its own
-  exact head, and no HOLD names it. With `require_counted_approval` (the
+  exact head, with no later HOLD. With `require_counted_approval` (the
   default) a carried approval does not count: the verdict must name `H_i`.
 - **(b) Chain and replay.** The first-parent chain from the rollup head back
   to `B` is exactly `k` two-parent merges, at most `max_members`, whose second
