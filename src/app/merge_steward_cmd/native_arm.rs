@@ -44,7 +44,7 @@ use super::{
     GitHubActions, MutationControl, ObservedPr, PrReport, RepoObservation, StewardDecision,
 };
 use crate::auto_arm::{
-    ArmSkip, ArmVerdict, arm_mutation_args, arm_mutation_args_at_head, arm_response_accepted,
+    ArmSkip, ArmVerdict, arm_mutation_args_at_head, arm_response_accepted,
     decide_from_queue_state_with_environment, first_graphql_error, is_arm_guard_refusal,
     preselect_backstop_candidate,
 };
@@ -172,6 +172,23 @@ pub(super) fn apply_native_arm_backstop<A>(
     apply: bool,
     authorize: impl FnOnce() -> Result<A, ArmAuthorityRefusal>,
 ) -> (NativeArmRepoStatus, bool) {
+    if !observation.merge_queue {
+        // Without a merge queue an armed request is not consumed on enqueue:
+        // it survives a later push by anyone with write access and then
+        // merges a head nobody judged. A no-queue base is landed only by the
+        // steward's own exact-head merge, if at all.
+        return (
+            NativeArmRepoStatus {
+                policy: format!(
+                    "not applicable: {} has no merge queue on {}, and native auto-merge is \
+                     never armed on a no-queue base",
+                    observation.repo, observation.base
+                ),
+                results: Vec::new(),
+            },
+            false,
+        );
+    }
     if !observation.allow_auto_merge {
         return (
             NativeArmRepoStatus {
@@ -312,9 +329,16 @@ fn consider_candidate(
         environment.as_ref(),
     ) {
         ArmVerdict::Arm => {
-            match crate::head_approval::evaluate_excusing(
-                &run_gh, repo, number, &head_sha, base, &queue, excuse,
-            ) {
+            // The same strict read the steward's enqueue and stale-arm sweep
+            // use: an absent or unreadable base policy refuses the arm rather
+            // than defaulting to "approval not required".
+            match crate::head_approval::read_policy_required(&run_gh, repo, base)
+                .map_err(String::from)
+                .and_then(|policy| {
+                    crate::head_approval::evaluate_excusing_with_policy(
+                        &run_gh, repo, number, &head_sha, &policy, &queue, excuse,
+                    )
+                }) {
                 Ok(gate) if gate.allows() => {
                     match tier_verdict(&run_gh, repo, base, number, &head_sha) {
                         Ok(verdict) => verdict,
@@ -471,9 +495,10 @@ fn armed_since_arrival(
     verdict
 }
 
-/// Arm one pull request. `same_head` is a classified same-head re-enqueue:
-/// the mutation is bound to `head_sha` with `expectedHeadOid`, so GitHub
-/// refuses it if the head moved since the classification.
+/// Arm one pull request. The mutation is always bound to `head_sha` with
+/// `expectedHeadOid`, so GitHub refuses it if the head moved since validation.
+/// `same_head` (a classified same-head re-enqueue) only selects the outcome
+/// label.
 fn arm(
     actions: &GitHubActions,
     number: u64,
@@ -492,16 +517,27 @@ fn arm(
             error: None,
         };
     }
-    // Deliberately the ordinary `run_gh`, not the internal-queue-mutation
-    // path: the internal marker makes the `ghapp` arm guard step aside, and
-    // this request is not bound to a validated head, so the guard's second
-    // opinion is wanted. Its refusals are honoured, never overridden, and
-    // Shipyard never sets `GHAPP_ALLOW_QUEUE_REARM`.
-    let args = if same_head {
-        arm_mutation_args_at_head(node_id, &head_sha)
-    } else {
-        arm_mutation_args(node_id)
-    };
+    // Always bound to the head this pass observed and validated: the `ghapp`
+    // arm guard refuses any request that does not bind `expectedHeadOid`, so
+    // an unbound first arm could never land. Deliberately the ordinary
+    // `run_gh`, not the internal-queue-mutation path: the internal marker
+    // makes the guard step aside, and its second opinion is wanted. Its
+    // refusals are honoured, never overridden, and Shipyard never sets
+    // `GHAPP_ALLOW_QUEUE_REARM`.
+    if head_sha.len() != 40 || !head_sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return NativeArmResult {
+            number,
+            outcome: "skipped".to_owned(),
+            skip: Some(ArmSkip::Unknown {
+                detail: format!(
+                    "observed head {head_sha:?} is not a full 40-hex sha, so the arm cannot be bound to it"
+                ),
+            }),
+            head_sha,
+            error: None,
+        };
+    }
+    let args = arm_mutation_args_at_head(node_id, &head_sha);
     match actions.run_gh(&args) {
         Ok(raw) if arm_response_accepted(&raw) => NativeArmResult {
             number,

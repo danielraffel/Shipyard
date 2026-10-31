@@ -8,13 +8,16 @@ never pass through it. A required ``review-verdict`` status stops those too.
 
 The decision is the guard's own: this script calls
 ``ghapp_queue_arm_guard.review_gate`` with the live head bound, so the two
-cannot drift. The newest trusted verdict naming the head decides, a HOLD with
-no readable time always wins, and only an APPROVE naming the head, or one the
+cannot drift. A trusted HOLD naming the head always wins (a HOLD makes its
+head un-approvable; only a new head can be approved), otherwise the newest
+trusted verdict naming the head decides, and only an APPROVE naming the head, or one the
 guard carries to it, is ``success``. Both carries apply here: the merge-only
 carry and the rebase carry (same patch-id, same files, the base touched none
 of them, each keeps its approved blob and mode, no required check skipped or
 receipt-reused). The status is the repository-side rule, so it turns the
-rebase carry on whatever any host's switch says.
+rebase carry on whatever any host's switch says. Base-config signer identity
+bindings are enforced by that same guard, including the stamped host and
+``agent:`` value.
 
 It runs from a workflow triggered by ``pull_request_target``,
 ``issue_comment`` and ``workflow_run`` (a review reaches it through a
@@ -26,6 +29,14 @@ comment from an untrusted account counts only as the guard's rules allow.
 A status belongs to a commit, but a decision belongs to a pull request, and
 two open pull requests can share a head. The status is ``success`` only when
 the guard allows the head for every open pull request whose head it is.
+
+Exit status: 0 when the head is allowed (or there is nothing to judge), 1 when
+it is refused or anything could not be read or posted. The workflow's job is
+the required ``review-verdict`` check run, so it is green only for an allowed
+head. Only the ``pull_request_target`` run leaves its check run on the pull
+request's head; a comment or review run (which leaves its check run on the
+default branch's tip) re-runs the head's ``pull_request_target`` run instead,
+so an APPROVE turns the head's check green without a new push.
 
 Usage: ``review_verdict_status.py`` with ``GITHUB_EVENT_NAME``,
 ``GITHUB_EVENT_PATH``, ``GITHUB_REPOSITORY`` and ``GH_TOKEN`` set (a GitHub
@@ -48,6 +59,13 @@ CONTEXT = "review-verdict"
 # GitHub refuses a status description over 140 characters.
 DESCRIPTION_LIMIT = 140
 GUARD = pathlib.Path(__file__).with_name("ghapp_queue_arm_guard.py")
+WORKFLOW_NAME = "Review verdict"
+# Only a ``pull_request_target`` run leaves its check run on the pull
+# request's head. A comment's or a review's run (``issue_comment``,
+# ``workflow_run``) leaves its check run on the default branch's tip, where it
+# gates nothing; those runs refresh the head's check instead (see
+# ``refresh_head_check``).
+HEAD_CHECK_EVENTS = frozenset({"pull_request_target"})
 
 
 def load_guard() -> ModuleType:
@@ -110,7 +128,32 @@ def open_pulls_on(guard: ModuleType, repo: str, head: str) -> list[int]:
     )
 
 
+def refresh_head_check(guard: ModuleType, repo: str, head: str) -> None:
+    """Re-run the head's own ``pull_request_target`` run so its check run follows
+    the verdict just posted. A comment or review cannot update that check run
+    from its own run, and a required check left at an old ``success`` would let
+    a refused head merge. Raises when the re-run cannot be requested (the job
+    fails closed); nothing to re-run is not an error, because a head with no
+    check run is a missing required check, not a green one."""
+    listing = guard.run_real_gh([
+        "api", f"repos/{repo}/actions/runs?head_sha={head}&event=pull_request_target&per_page=100"])
+    runs = listing.get("workflow_runs") if isinstance(listing, dict) else None
+    if not isinstance(runs, list):
+        raise guard.GuardError(f"the workflow runs on {head[:12]} are unreadable")
+    ours = [r for r in runs if isinstance(r, dict) and r.get("name") == WORKFLOW_NAME
+            and isinstance(r.get("id"), int)]
+    if not ours:
+        print(f"review-verdict: no {WORKFLOW_NAME} run on {head}; no check to refresh")
+        return
+    newest = max(ours, key=lambda r: r["id"])
+    guard.run_real_gh_text(["api", "-X", "POST", f"repos/{repo}/actions/runs/{newest['id']}/rerun"])
+    print(f"review-verdict: re-ran run {newest['id']} so the check on {head} follows the verdict")
+
+
 def run(event_name: str, event: dict[str, Any], repo: str, run_url: str | None) -> int:
+    """Post the status; exit 0 only when ``head`` is allowed (or nothing to
+    judge). On the event whose check run sits on the head, a refusal is exit 1,
+    so the required ``review-verdict`` check is red exactly when the status is."""
     number, head = event_target(event_name, event)
     if number is None and head is None:
         print("review-verdict: not a pull request; nothing to post")
@@ -163,6 +206,9 @@ def run(event_name: str, event: dict[str, Any], repo: str, run_url: str | None) 
     for n, ok, why in decisions:
         print(f"review-verdict: PR #{n}: {'allowed' if ok else 'refused'}: {why}")
     print(f"review-verdict: {state} on {head}")
+    if event_name in HEAD_CHECK_EVENTS:
+        return 0 if allowed else 1
+    refresh_head_check(guard, repo, head)
     return 0
 
 
@@ -174,11 +220,16 @@ def main() -> int:
         print("review-verdict: GITHUB_EVENT_NAME, GITHUB_REPOSITORY and GITHUB_EVENT_PATH "
               "are required", file=sys.stderr)
         return 2
-    event = json.loads(pathlib.Path(event_path).read_text(encoding="utf-8"))
     server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
     run_id = os.environ.get("GITHUB_RUN_ID")
     run_url = f"{server}/{repo}/actions/runs/{run_id}" if run_id else None
-    return run(event_name, event, repo, run_url)
+    # Fail closed: any read or post error is a failed job, never a pass.
+    try:
+        event = json.loads(pathlib.Path(event_path).read_text(encoding="utf-8"))
+        return run(event_name, event, repo, run_url)
+    except Exception as error:  # noqa: BLE001 - every failure must fail the job
+        print(f"review-verdict: error: {error}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

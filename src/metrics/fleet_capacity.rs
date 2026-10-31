@@ -431,6 +431,15 @@ mod tests {
     }
 
     #[test]
+    fn rejects_tartci_capacity_interval_receipts() {
+        let text =
+            include_str!("../../tests/fixtures/fleet-capacity/tartci-capacity-interval-v1.json");
+        let error =
+            parse_reader(text.as_bytes()).expect_err("interval contract must not be imported");
+        assert!(error.contains("invalid fleet capacity record"), "{error}");
+    }
+
+    #[test]
     fn accepts_a_producer_edge_case_fixture_with_utf8_float_and_large_integer() {
         let text = include_str!("../../tests/fixtures/fleet-capacity/tartci-v1-edge.json");
         let parsed = parse_reader(text.as_bytes()).unwrap();

@@ -92,8 +92,9 @@ Run that after the auto-tag appears. The release workflow will pick up the exist
 
 ### How to cut a macOS release
 
-Tag pushes create a draft GitHub release with Linux and Windows
-artifacts. The macOS job builds and launch-smokes the Rust binary, but
+Tag pushes create a draft GitHub release with the Linux x64 and Linux ARM64
+artifacts, plus Windows x64 when `CI_PLATFORM_FOCUS=all` (the default, `macos`,
+omits Windows). The macOS job builds and launch-smokes the Rust binary, but
 does not upload an unsigned artifact unless the optional CI signing
 experiment is explicitly enabled. The maintainer-local path remains the
 primary macOS release path because it proves the exact DMG on the Mac
@@ -171,9 +172,16 @@ the identity by Team ID, and runs `scripts/release-macos-local.sh
 --ci-mode --upload`.
 
 `--ci-mode` does not weaken publication closure: an upload still requires the
-DMG to mount and launch both binaries, the full Linux/Windows/macOS asset set
-and checksum entries to be visible, and the public installer E2E to pass. Any
+DMG to mount and launch both binaries, the full asset set for the platform focus (Linux x64, Linux
+ARM64, macOS, and Windows under `all`) and checksum entries to be visible, and the public installer E2E to pass. Any
 failure re-drafts the release, including one that was already public.
+
+CI publication uses only the job-scoped `GITHUB_TOKEN` and native `gh` from a
+system installation path. It requires `GITHUB_ACTIONS=true`, pins the CLI path
+for the invocation, and overrides ambient `GH_TOKEN`. Do not install persistent
+release App credentials in the shared `ci` account: it also runs PR jobs.
+Local releases continue to require the managed `ghapp` wrapper; CI authentication
+is not a fallback for local-agent publication.
 
 Required CI secret names:
 
@@ -235,7 +243,7 @@ workflow edits. Per-run overrides still work via
 `gh workflow run ci.yml --ref <branch> -f runner_provider=namespace` when
 Namespace access is available.
 
-**Current default:** GitHub-hosted Linux, macOS, and Windows. This is slower
+**Current default:** GitHub-hosted runners, limited by `CI_PLATFORM_FOCUS` (default `macos`: macOS ARM64 for CI; macOS, Linux x64 and Linux ARM64 for releases; `all` adds Windows and the Linux CI lane). This is slower
 than a warm paid pool, but it avoids paid Namespace capacity and keeps public
 repo CI available while local/self-hosted runners are being set up.
 
@@ -261,10 +269,11 @@ publish step still follows the signed release runbook above unless CI
 macOS signing is explicitly enabled.
 
 1. Open a PR via `shipyard pr` (or `shipyard ship`).
-2. CI runs `.github/workflows/version-skill-check.yml`, which confirms the right bump(s) are present via `scripts/version_bump_check.py` + `scripts/skill_sync_check.py`. Merge on green.
+2. CI runs `.github/workflows/version-skill-check.yml`, which confirms the right bump(s) are present via `scripts/version_bump_check.py` + `scripts/skill_sync_check.py`. The steward merges the exact approved head once the required checks are green; see [Draining pull requests automatically](docs/automated-draining.md).
 3. On push to `main`, `.github/workflows/auto-release.yml` diffs `Cargo.toml`'s package version against the previous push. If it moved, the workflow creates a `v<x.y.z>` tag.
-4. The existing tag-triggered `release.yml` builds Linux, Windows, and
-   macOS ARM64 release candidates, creates a draft GitHub Release, and
+4. The existing tag-triggered `release.yml` builds Linux x64, Linux ARM64, and
+   macOS ARM64 release candidates (plus Windows x64 under
+   `CI_PLATFORM_FOCUS=all`), creates a draft GitHub Release, and
    leaves macOS signing/upload to the runbook unless CI macOS signing is
    explicitly enabled.
 
@@ -277,6 +286,17 @@ from the merged change range. Pull requests do not edit version files, so
 patch-only changes are assigned and released without a per-PR counter race.
 The writer updates Cargo.lock with Cargo.toml and records a marker for replay
 safety.
+
+Main's ruleset requires the `Test macOS ARM64` and `review-verdict` checks, so the
+writer never pushes to `main`: it rebuilds the bot-owned `release/version-at-land`
+branch from the main tip with one cumulative bump commit and opens, or updates, the
+single pull request for it. The workflow labels that pull request `shipyard:managed`
+and posts the `shipyard/steward-handoff` status on its exact head, so the merge
+steward lands it once its required checks are green and a reviewer approves that
+head; `auto-release.yml` tags the merge.
+Every landing re-plans from the last bump that reached `main`, so the pull
+request never stacks bumps, and the run on its own merge is a no-op. A landing
+that needs no version leaves the branch head, and any approval of it, alone.
 
 ## When to go manual
 
@@ -302,10 +322,30 @@ The script:
 3. Tags the commit (`v0.1.1`)
 4. Pushes the tag
 5. The tag push triggers `.github/workflows/release.yml` which:
-   - Builds Linux x64, Linux ARM64, Windows x64, and macOS ARM64 release candidates
+   - Builds Linux x64, Linux ARM64, and macOS ARM64 release candidates, plus Windows x64 when `CI_PLATFORM_FOCUS=all`
    - Uploads non-macOS binaries plus SHA256 checksums to a draft GitHub Release
    - Leaves macOS signing/upload to `scripts/release-macos-local.sh` unless CI macOS signing is explicitly enabled
    - Uses the configured runner provider, with GitHub-hosted as the safe default
+
+## Stuck drafts heal automatically
+
+A release stays a draft until the last `release.yml` job attests and publishes
+the DMG. If that run fails (for example the self-hosted macOS runner cannot
+download the Rust toolchain), the `release-heal.yml` workflow runs on every
+push to `main` and every 30 minutes. For the current `Cargo.toml` version it
+re-runs the failed jobs of the release run (never a cancelled one) once the run has been finished for
+20 minutes, at most 3 attempts in total. When attempts are exhausted, or a
+successful run still left a draft, the job fails and prints the failing steps.
+It only acts when `CI_MACOS_SIGNING_ENABLED=true` and never publishes or edits
+a release itself. Run `python3 scripts/release_draft_heal.py --dry-run` locally
+(with `GH_TOKEN`) to see the decision.
+
+## Release concurrency
+
+`release.yml` uses one concurrency group, `release`, for every tag. A running
+release always finishes (it may be mid-signing on the local Mac), and a newer
+tag replaces any older release still waiting. A burst of merges therefore
+publishes the newest version instead of queueing one signing run per merge.
 
 ## Monitoring a release
 
@@ -349,7 +389,9 @@ increments independently when the output format changes.
 Pull requests do not edit `Cargo.toml`, `Cargo.lock`, or the plugin manifest
 versions. The `version-at-land.yml` workflow is the single writer after a
 merge: it computes the next version, commits the files with a
-`Version-Bump-Applied:` marker, and `auto-release.yml` tags that commit. The
+`Version-Bump-Applied:` marker on the `release/version-at-land` branch, and
+keeps one bump pull request open for it (see "Version-at-land assignment").
+`auto-release.yml` tags the merge of that pull request. The
 tagged `release.yml` workflow and `shipyard update` path remain unchanged.
 
 Inspect the break-glass release path without changing files or creating a tag:

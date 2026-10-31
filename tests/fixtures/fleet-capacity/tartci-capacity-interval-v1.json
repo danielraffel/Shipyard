@@ -1,0 +1,20 @@
+{
+  "schema": "tartci.capacity-interval/v1",
+  "host": "m3",
+  "repo": "Generous-Corp/pulp",
+  "class": "macos",
+  "interval_start": "2026-10-27T00:00:00Z",
+  "interval_end": "2026-10-27T00:02:00Z",
+  "duration_s": 120,
+  "timestamp_source": "fetched_at",
+  "verdict": "ok",
+  "supply": {
+    "schema": "tartci.gate-supply/v1",
+    "host": "m3",
+    "repo": "Generous-Corp/pulp",
+    "class": "macos",
+    "verdict": "ok",
+    "pool": "on",
+    "lanes": []
+  }
+}

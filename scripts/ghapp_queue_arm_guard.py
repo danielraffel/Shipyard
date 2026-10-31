@@ -86,10 +86,14 @@ the head being armed.
 A verdict is the last non-blank line of a pull-request comment,
 ``verdict: APPROVE head:<sha>`` or ``reviewed: <sha>`` (``verdict: HOLD
 head:<sha>`` holds), or a review in state APPROVED / CHANGES_REQUESTED on the
-head. The latest verdict naming the head decides; a HOLD with no readable time
-always holds. When the base config lists ``reviewer_identities``, only those
-count. Otherwise an approval counts only from the fleet App (every agent posts
-as it through ghapp), or from an account the base lists in ``[auto_merge]
+head. A counting HOLD naming the head is final for it: no APPROVE naming the
+same head, from any reviewer, before or after the HOLD, counts, and an
+approval does not carry from a held head; only a new head (a push) can be
+approved; each APPROVE ignored this way is reported as
+``excluded_approval:head held by <signer> at <comment|review> <id>``.
+Otherwise the latest verdict naming the head decides. When the base config
+lists ``reviewer_identities``, only those count. Otherwise an approval counts
+only from the fleet App (every agent posts as it through ghapp), or from an account the base lists in ``[auto_merge]
 human_reviewers`` (empty by default) whose ``author_association`` is OWNER,
 MEMBER or COLLABORATOR: any agent holding the owner's own gh login could post
 a human approval. Each human approval excluded this way is printed and recorded
@@ -275,7 +279,17 @@ RECEIPT_DECISION_TITLE = "shipyard-receipt-decision"
 # PATCH, nor the fleet App every agent posts as. Same as src/deferred_tier.rs.
 TIER_RECORD_PREFIX = "shipyard-test-tier/"
 TIER_RECORD_SCHEMA = "shipyard-test-tier/v1"
+# Optional repository-side proof that a durable reviewer claim was consumed.
+# Both the queue-arm guard and the review-verdict workflow call the parser
+# below, so enabling this policy cannot make the two decisions diverge.
+CLAIM_RECEIPT_KEY = "reviewer_claim_receipt"
+CLAIM_APP_KEY = "reviewer_claim_app"
+CLAIM_RECEIPT_SCHEMA = "shipyard-reviewer-claim/v1"
 ACTIONS_APP = "github-actions"
+# GitHub Actions' App id is shared by every workflow and cannot be used as a
+# durable reviewer authority.  A claim policy naming it is refused at parse
+# time rather than silently turning the optional gate into a shared token.
+SHARED_CLAIM_APP_ID = 15368
 DEFERRED_TIER = "deferred"
 # The log group the runner prints in "Set up job" listing the token's scopes.
 TOKEN_PERMISSIONS_HEADER = "GITHUB_TOKEN Permissions"
@@ -860,6 +874,17 @@ def stamped_agent(body: Any) -> str | None:
     return (found[-1][2] or None) if found else None
 
 
+def stamped_identity(body: Any) -> str | None:
+    """The provider-neutral ``host agent:id`` identity in a ghapp stamp."""
+    if not isinstance(body, str):
+        return None
+    found = _SESSION_STAMP.findall(body)
+    if not found or not found[-1][2]:
+        return None
+    host, _session, agent = found[-1]
+    return f"{host} agent:{agent}".lower()
+
+
 def writer_identity() -> dict[str, str]:
     """``session`` (and ``agent`` when set) for every row a guard writes, so a
     row says which process wrote it."""
@@ -962,6 +987,36 @@ def review_policy(config_text: str | None, repo: str, host_default: bool) -> dic
                          f"be a list of reviewer names, not {configured!r}")
     configured_signers = ([name.lower() for name in configured]
                           if configured is not None else None)
+    claim_receipt = section.get(CLAIM_RECEIPT_KEY)
+    claim_app = section.get(CLAIM_APP_KEY)
+    if claim_receipt is None and claim_app is None:
+        claim_receipt = claim_app = None
+    elif not (isinstance(claim_receipt, str) and claim_receipt.strip()):
+        raise GuardError(f"the base's .shipyard/config.toml [auto_merge] {CLAIM_RECEIPT_KEY} "
+                         "must be a non-empty check-run name when claim receipts are enabled")
+    elif not ((isinstance(claim_app, str) and claim_app.strip())
+              or (type(claim_app) is int and claim_app > 0)):
+        raise GuardError(f"the base's .shipyard/config.toml [auto_merge] {CLAIM_APP_KEY} "
+                         "must be a non-empty app slug or positive app id when claim receipts are enabled")
+    if isinstance(claim_app, str) and claim_app.strip().lower() in {ACTIONS_APP, FLEET_AUTHOR}:
+        raise GuardError(f"the base's .shipyard/config.toml [auto_merge] {CLAIM_APP_KEY} "
+                         f"may not name the shared `{claim_app}` App")
+    if type(claim_app) is int and claim_app == SHARED_CLAIM_APP_ID:
+        raise GuardError(f"the base's .shipyard/config.toml [auto_merge] {CLAIM_APP_KEY} "
+                         f"may not name shared GitHub Actions App id {SHARED_CLAIM_APP_ID}")
+    identity_map = section.get("reviewer_signer_identities")
+    if identity_map is not None:
+        if not isinstance(identity_map, dict) or any(
+                not isinstance(name, str) or not isinstance(values, list)
+                or not values or not all(isinstance(value, str) and value.strip() for value in values)
+                for name, values in identity_map.items()):
+            raise GuardError("the base's .shipyard/config.toml [auto_merge] "
+                             "reviewer_signer_identities must map reviewer names to non-empty "
+                             "lists of host agent identities")
+        identity_map = {
+            name.lower(): [value.strip().lower() for value in values]
+            for name, values in identity_map.items()
+        }
     try:
         excluded, carry_error = carry_paths(section), None
     except GuardError as error:
@@ -984,6 +1039,7 @@ def review_policy(config_text: str | None, repo: str, host_default: bool) -> dic
         # reviewer_signers); None when the host has no signers file.
         "signers": (configured_signers if configured_signers is not None or from_base_only
                     else reviewer_signers(repo)),
+        "signer_identities": identity_map or {},
         # The `session:` lines this host accepts on an App APPROVE (see
         # reviewer_sessions); None when the host lists none. Host-local only, so
         # the repository-side rule never reads it.
@@ -994,6 +1050,10 @@ def review_policy(config_text: str | None, repo: str, host_default: bool) -> dic
         # The repository-side rule (review-verdict status): no host's file,
         # and a default-mode repository with no list admits no App APPROVE.
         "signers_required": from_base_only and from_default and not reviewers,
+        # Optional and default-off: existing stamped reviewer rules remain the
+        # authority until both protected-base fields are present.
+        "claim_receipt": claim_receipt.strip() if isinstance(claim_receipt, str) else None,
+        "claim_app": claim_app.strip() if isinstance(claim_app, str) else claim_app,
     }
 
 
@@ -1002,6 +1062,7 @@ def review_policy(config_text: str | None, repo: str, host_default: bool) -> dic
 SIGNERS_FILE = "reviewer-signers.json"
 # `1`: signers only from the base config (the server-side status pins it).
 SIGNERS_FROM_BASE_ENV = "SHIPYARD_SIGNERS_FROM_BASE"
+SIGNER_IDENTITIES_KEY = "reviewer_signer_identities"
 _SIGNER_LINE = re.compile(r"^[ \t]*reviewer:[ \t]*([A-Za-z0-9._-]+)[ \t]*$", re.MULTILINE)
 
 
@@ -1183,14 +1244,32 @@ def app_approval_refusal(body: Any, policy: dict[str, Any]) -> str | None:
     signed = [name.lower() for name in _SIGNER_LINE.findall(text)]
     if not signed:
         return "it has no `reviewer: <name>` line"
-    if not any(name in signers for name in signed):
+    matching = [name for name in signed if name in signers]
+    if not matching:
         return f"its signer {signed[-1]} is not one of {', '.join(signers) or 'nobody'}"
+    identities = policy.get("signer_identities") or {}
+    if identities:
+        stamp_identity = stamped_identity(text)
+        if stamp_identity is None:
+            return "its ghapp stamp has no reviewer agent identity"
+        bound = next((name for name in matching
+                      if name in identities and stamp_identity in identities[name]), None)
+        if bound is None:
+            name = matching[-1]
+            if name not in identities:
+                return f"its signer {name} has no base identity binding"
+            return (f"its signer {name} is not bound to stamped identity "
+                    f"{stamp_identity}")
     return None
 
 
 # Human approvals the default rule refused this run, for the warning and the
 # arms ledger (see review_gate).
 EXCLUDED_APPROVALS: list[str] = []
+# APPROVEs ignored this run because a HOLD names the same head, as
+# ``excluded_approval:head held by <signer> at <comment|review> <id>`` (see
+# review_verdict and review_gate).
+HELD_EXCLUSIONS: list[str] = []
 
 
 def _reviewer_counts(
@@ -1239,7 +1318,10 @@ def counting_verdicts(
     reviews: list[dict[str, Any]],
     policy: dict[str, Any],
 ) -> list[tuple[datetime | None, str, str, str]]:
-    """``(time, APPROVE|HOLD, head named, description)`` for every counting verdict."""
+    """``(time, APPROVE|HOLD, head named, description)`` for every counting verdict.
+
+    A HOLD's description is ``held by <signer> at <comment|review> <id>``:
+    the ``reviewer:`` signer line when the body has one, else the login."""
     verdicts: list[tuple[datetime | None, str, str, str]] = []
     for review in reviews:
         login = (review.get("user") or {}).get("login")
@@ -1250,8 +1332,10 @@ def counting_verdicts(
         if _reviewer_counts(login, review.get("author_association"), policy, author, verdict,
                             (review.get("user") or {}).get("type") == "Bot", review.get("body")):
             named = str(review.get("commit_id") or "").lower()
-            verdicts.append((_timestamp(review.get("submitted_at")), verdict, named,
-                             f"a {state} review by {login} at {review.get('submitted_at')}"))
+            what = (_held_by(login, review.get("body"), "review", review.get("id"))
+                    if verdict == "HOLD" else
+                    f"a {state} review by {login} at {review.get('submitted_at')}")
+            verdicts.append((_timestamp(review.get("submitted_at")), verdict, named, what))
     for comment in comments:
         login = (comment.get("user") or {}).get("login")
         body = comment.get("body")
@@ -1261,20 +1345,32 @@ def counting_verdicts(
         if _reviewer_counts(login, comment.get("author_association"), policy, author, found[0],
                             (comment.get("user") or {}).get("type") == "Bot", body):
             verdict, named = found
-            verdicts.append((_timestamp(comment.get("created_at")), verdict, named,
-                             f"`{verdict} head:{named[:12]}` by {login} at "
-                             f"{comment.get('created_at')}"))
+            what = (_held_by(login, body, "comment", comment.get("id"))
+                    if verdict == "HOLD" else
+                    f"`{verdict} head:{named[:12]}` by {login} at {comment.get('created_at')}")
+            verdicts.append((_timestamp(comment.get("created_at")), verdict, named, what))
     return verdicts
+
+
+def _held_by(login: str, body: Any, kind: str, record_id: Any) -> str:
+    """``held by <signer> at <kind> <id>`` for one counting HOLD."""
+    signed = _SIGNER_LINE.findall(body) if isinstance(body, str) else []
+    signer = signed[-1].lower() if signed else login
+    return f"held by {signer} at {kind} {record_id if record_id is not None else '(no id)'}"
 
 
 def _latest_on(
     verdicts: list[tuple[datetime | None, str, str, str]], head: str
 ) -> tuple[datetime | None, str, str, str] | None:
-    """The deciding verdict on ``head``: an untimed HOLD, else the newest."""
+    """The deciding verdict on ``head``: any HOLD, else the newest APPROVE.
+
+    A HOLD is final for its head, so no APPROVE naming the same head, earlier
+    or later, from any reviewer, outranks it. Same as src/head_approval.rs
+    ``latest_verdict``."""
     on_head = [entry for entry in verdicts if entry[2] == head]
-    untimed_hold = [entry for entry in on_head if entry[0] is None and entry[1] == "HOLD"]
-    if untimed_hold:
-        return untimed_hold[0]
+    holds = [entry for entry in on_head if entry[1] == "HOLD"]
+    if holds:
+        return holds[0]
     dated = [entry for entry in on_head if entry[0] is not None]
     return max(dated, key=lambda entry: entry[0]) if dated else None
 
@@ -1317,9 +1413,15 @@ def review_verdict(
         at, verdict, _, what = latest
         if verdict == "APPROVE":
             return True, f"head {head[:12]} carries {what}"
-        if at is None:
-            return False, f"a HOLD naming head {head[:12]} has no readable time; it needs {wanted}"
-        return False, f"the latest verdict naming head {head[:12]} is HOLD ({what}); it needs a newer {wanted}"
+        posted = (at.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                  if at is not None and at.tzinfo is not None else "with no readable time")
+        excluded = [entry for entry in verdicts if entry[2] == head and entry[1] == "APPROVE"]
+        if excluded:
+            HELD_EXCLUSIONS.append(f"excluded_approval:head {what}")
+        return False, (
+            f"a HOLD naming head {head[:12]} makes it un-approvable ({what}, posted {posted})"
+            + (f"; ignored {len(excluded)} APPROVE(s) of the same head" if excluded else "")
+            + "; push a new head that addresses the HOLD and have it reviewed")
     older = [entry for entry in verdicts if entry[0] is not None]
     stale = ""
     if older:
@@ -1365,6 +1467,24 @@ def _deciding_approval_body(
     return comment.get("body") if comment is not None else None
 
 
+def _comment_effective_time(comment: dict[str, Any]) -> str | None:
+    """When a comment last said what it says now: the later of ``created_at``
+    and ``updated_at``, so a verdict edited in after a claim window is judged
+    at its edit time. ``None`` (no readable time) when either timestamp is
+    present but unreadable or lacks a UTC offset."""
+    created_raw = comment.get("created_at")
+    updated_raw = comment.get("updated_at")
+    created = _timestamp(created_raw)
+    if created is None or created.tzinfo is None:
+        return None
+    if updated_raw is None:
+        return created_raw
+    updated = _timestamp(updated_raw)
+    if updated is None or updated.tzinfo is None:
+        return None
+    return updated_raw if updated > created else created_raw
+
+
 def deciding_approval(
     head: str,
     author: str | None,
@@ -1379,12 +1499,14 @@ def deciding_approval(
     if comment is not None:
         signed = _SIGNER_LINE.findall(comment.get("body") or "")
         return {"verdict_comment_id": comment.get("id"),
-                "signer": signed[-1].lower() if signed else None, "approved_head": head}
+                "signer": signed[-1].lower() if signed else None, "approved_head": head,
+                "approved_at": _comment_effective_time(comment)}
     for review in reviews:
         if (str(review.get("state") or "").upper() == "APPROVED"
                 and str(review.get("commit_id") or "").lower() == head):
             return {"verdict_review_id": review.get("id"),
-                    "signer": (review.get("user") or {}).get("login"), "approved_head": head}
+                    "signer": (review.get("user") or {}).get("login"), "approved_head": head,
+                    "approved_at": review.get("submitted_at")}
     return {"approved_head": head}
 
 
@@ -2103,6 +2225,129 @@ def _check_runs(repo: str, head: str, api_json: Any) -> list[dict[str, Any]]:
     return listed
 
 
+def _claim_receipt_app_matches(run: dict[str, Any], configured: str | int) -> bool:
+    """Match the check-run's immutable GitHub App identity to the base policy."""
+    app = run.get("app")
+    if not isinstance(app, dict):
+        return False
+    if isinstance(configured, int):
+        return app.get("id") == configured
+    return app.get("slug") == configured
+
+
+def parse_claim_receipt(
+    run: dict[str, Any], repo: str, pr: int, head: str,
+    context: str, app: str | int,
+) -> dict[str, Any] | None:
+    """Return a strict, head-bound durable reviewer-claim receipt.
+
+    A receipt is a completed successful check run with the protected context
+    and App identity. Its summary is a closed JSON object; unknown fields,
+    malformed timestamps/epoch, or a mismatched repository/PR/head are all
+    rejected. ``None`` means this run is not the configured receipt, while a
+    malformed matching run raises ``GuardError`` so callers fail closed.
+    """
+    if run.get("name") != context:
+        return None
+    if not _claim_receipt_app_matches(run, app):
+        raise GuardError(f"claim receipt `{context}` was produced by an unexpected GitHub App")
+    # Failed, cancelled, queued and in-progress rows are historical or
+    # revoked receipts. They do not certify the head; a current success is
+    # selected below, while malformed successful rows still fail closed.
+    if run.get("status") != "completed" or run.get("conclusion") != "success":
+        return None
+    output = run.get("output")
+    summary = output.get("summary") if isinstance(output, dict) else None
+    if not isinstance(summary, str) or not summary.strip():
+        raise GuardError(f"claim receipt `{context}` has no JSON summary")
+    try:
+        value = json.loads(summary)
+    except json.JSONDecodeError as error:
+        raise GuardError(f"claim receipt `{context}` summary is not JSON") from error
+    if not isinstance(value, dict):
+        raise GuardError(f"claim receipt `{context}` summary is not an object")
+    required = {"schema", "repo", "pr", "head_sha", "epoch", "reviewer",
+                "claimed_at", "deadline_at"}
+    if set(value) != required or value.get("schema") != CLAIM_RECEIPT_SCHEMA:
+        raise GuardError(f"claim receipt `{context}` has an unexpected schema")
+    # The producer writes the canonical (lower-cased) slug; GitHub slugs are
+    # case-insensitive, so the binding is too.
+    receipt_repo = value.get("repo")
+    if (not isinstance(receipt_repo, str) or receipt_repo.lower() != repo.lower()
+            or value.get("pr") != pr):
+        raise GuardError(f"claim receipt `{context}` is bound to another pull request")
+    receipt_head = value.get("head_sha")
+    if not isinstance(receipt_head, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", receipt_head):
+        raise GuardError(f"claim receipt `{context}` has an invalid head")
+    if receipt_head.lower() != head.lower():
+        raise GuardError(f"claim receipt `{context}` names another head")
+    if type(value.get("epoch")) is not int or value["epoch"] <= 0:
+        raise GuardError(f"claim receipt `{context}` has an invalid epoch")
+    reviewer = value.get("reviewer")
+    if not isinstance(reviewer, str) or not reviewer.strip():
+        raise GuardError(f"claim receipt `{context}` has no reviewer identity")
+    for key in ("claimed_at", "deadline_at"):
+        parsed = _timestamp(value.get(key))
+        if parsed is None:
+            raise GuardError(f"claim receipt `{context}` has an invalid {key} timestamp")
+    deadline = _timestamp(value["deadline_at"])
+    claimed = _timestamp(value["claimed_at"])
+    now = datetime.now(timezone.utc)
+    if claimed > now:
+        raise GuardError(f"claim receipt `{context}` is future-dated")
+    if deadline <= claimed:
+        raise GuardError(f"claim receipt `{context}` has a non-forward deadline")
+    # Expired receipts are normal history after a reviewer handoff. They do
+    # not certify the head, but they must not poison a later valid receipt for
+    # the same check name; malformed, future-dated and wrong-identity rows
+    # still fail closed above.
+    if deadline <= now:
+        return None
+    return value
+
+
+def reviewer_claim_receipt(
+    repo: str, pr: int, head: str, policy: dict[str, Any], approval: dict[str, Any],
+) -> str | None:
+    """Validate the optional configured claim receipt for a deciding approval."""
+    context = policy.get("claim_receipt")
+    app = policy.get("claim_app")
+    if context is None and app is None:
+        return None
+    if not isinstance(context, str) or not context or app is None:
+        raise GuardError("reviewer claim receipt policy is incomplete")
+    listed = _check_runs(repo, head, run_real_gh)
+    candidates = [run for run in listed if run.get("name") == context]
+    # A newer check-run with the same protected name is the revocation or
+    # replacement record for its older success. Real GitHub rows always carry
+    # numeric ids; fixtures and older API shims may not, so retain the strict
+    # exactly-one behavior when no ids are available.
+    run_ids = [run.get("id") for run in candidates]
+    if candidates and all(isinstance(run_id, int) for run_id in run_ids):
+        latest = max(candidates, key=lambda run: run["id"])
+        matches = [parse_claim_receipt(latest, repo, pr, head, context, app)]
+    else:
+        matches = [parse_claim_receipt(run, repo, pr, head, context, app)
+                   for run in candidates]
+    receipts = [receipt for receipt in matches if receipt is not None]
+    if len(receipts) != 1:
+        raise GuardError(f"expected exactly one valid reviewer claim receipt `{context}` on {head[:12]}")
+    signer = approval.get("signer") if isinstance(approval, dict) else None
+    if not isinstance(signer, str) or not signer.strip():
+        raise GuardError("the deciding approval has no signer identity")
+    if receipts[0]["reviewer"].lower() != signer.lower():
+        raise GuardError("reviewer claim receipt identity does not match the deciding approval")
+    approved_at = _timestamp(approval.get("approved_at")) if isinstance(approval, dict) else None
+    if approved_at is None:
+        raise GuardError("the deciding approval has no readable timestamp")
+    claimed_at = _timestamp(receipts[0]["claimed_at"])
+    deadline_at = _timestamp(receipts[0]["deadline_at"])
+    if claimed_at is None or deadline_at is None or not (claimed_at <= approved_at < deadline_at):
+        raise GuardError("the deciding approval was outside the reviewer claim window")
+    return (f"reviewer claim epoch {receipts[0]['epoch']} by {receipts[0]['reviewer']} "
+            f"consumed for head {head[:12]}")
+
+
 def _app_slug(run: dict[str, Any]) -> Any:
     return (run.get("app") or {}).get("slug") if isinstance(run.get("app"), dict) else None
 
@@ -2765,7 +3010,13 @@ def review_gate(classification: dict[str, Any], repo: str | None, dry_run: bool 
     carry log: read-only callers (the review-verdict status) pass it, so only
     a landing ever logs a carry. Same as src/head_approval.rs ``dry_run``."""
     EXCLUDED_APPROVALS.clear()
+    HELD_EXCLUSIONS.clear()
     result = _review_gate(classification, repo, dry_run)
+    if HELD_EXCLUSIONS:
+        classification["held_exclusions"] = sorted(set(HELD_EXCLUSIONS))
+        print(f"queue-arm-guard: note: PR #{classification.get('pr')}: "
+              f"{'; '.join(classification['held_exclusions'])}: a HOLD makes its head "
+              "un-approvable, so only a new head can be approved", file=sys.stderr)
     excluded = sorted(set(EXCLUDED_APPROVALS))
     if excluded:
         classification["excluded_approvals"] = excluded
@@ -2834,6 +3085,17 @@ def _review_gate(classification: dict[str, Any], repo: str | None, dry_run: bool
                 "self_approval", own, repo, number, head,
                 f"another agent reviews head {head} and posts "
                 f"`verdict: APPROVE head:{head}` on https://github.com/{repo}/pull/{number}", False)
+        try:
+            receipt_note = reviewer_claim_receipt(
+                repo, number, head, policy,
+                deciding_approval(head, author, comments, reviews, policy),
+            )
+        except GuardError as error:
+            return False, f"{label} ({repo}): reviewer claim receipt refused ({error})", review_fix(
+                "unreviewed", f"the reviewer claim receipt for {label} could not be proved: {error}",
+                repo, number, head, read_pull, True)
+        if receipt_note is not None:
+            why = f"{why}; {receipt_note}"
         _note_same_session(classification, label, repo,
                            same_session_note(head, author, comments, reviews, policy))
         classification["approval"] = deciding_approval(head, author, comments, reviews, policy)
@@ -2910,11 +3172,17 @@ def _review_gate(classification: dict[str, Any], repo: str | None, dry_run: bool
         why += f" The approval of {approved[:12]} does not carry: {refusal}."
         cause = "approval_does_not_carry" if cause == "unreviewed" else cause
     what = {
-        "hold": f"the latest trusted verdict on {label}'s head {head[:12]} is HOLD",
+        "hold": f"a trusted HOLD names {label}'s head {head[:12]}, so it is un-approvable",
         "approval_does_not_carry": (f"{label}'s approval of {approved[:12] if approved else ''} "
                                     f"does not carry to head {head[:12]}"),
         "unreviewed": f"no trusted verdict names {label}'s head {head[:12]}",
     }[cause]
+    if cause == "hold":
+        return False, f"{label} ({repo}): {why}", review_fix(
+            cause, what, repo, number, head,
+            f"the author pushes a new head to https://github.com/{repo}/pull/{number} that "
+            "addresses the HOLD; a reviewer then reviews that new head. No APPROVE of the "
+            f"held head {head} counts", False)
     command = (f"a reviewer agent reviews head {head} and posts, through `ghapp` (the fleet "
                f"App), a comment ending `verdict: APPROVE head:{head}` on "
                f"https://github.com/{repo}/pull/{number}; a human approval counts only for a "

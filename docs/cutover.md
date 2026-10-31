@@ -14,8 +14,8 @@ regresses.
 - `shipyard` and `sy` install to `~/.local/bin`.
 - Current macOS releases are Apple Silicon only:
   `shipyard-macos-arm64.dmg`.
-- Linux x64, Linux arm64, and Windows x64 ship as native standalone
-  binaries.
+- Linux x64 and Linux arm64 ship as native standalone binaries, and so does
+  Windows x64 when the release runs with `CI_PLATFORM_FOCUS=all`.
 - macOS artifacts must be Developer-ID signed, notarized, stapled into
   a DMG, mounted, extracted, and launch-tested before the GitHub release
   is published.

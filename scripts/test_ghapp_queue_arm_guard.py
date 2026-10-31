@@ -2393,7 +2393,7 @@ class ReviewBeforeArm(unittest.TestCase):
     def test_a_hold_naming_the_head_is_refused(self) -> None:
         result = self.arm(490, "danielraffel/tartci", self.case("tartci-490"))
         self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn("the latest verdict naming head 82eeaab8a6bd is HOLD", result.stderr)
+        self.assertIn("a HOLD naming head 82eeaab8a6bd makes it un-approvable", result.stderr)
 
     def test_a_verdict_naming_the_head_is_allowed(self) -> None:
         # The App's APPROVE on the App's own PR counts: the author is the
@@ -2411,7 +2411,7 @@ class ReviewBeforeArm(unittest.TestCase):
             body=f"Delta review.\n\nverdict: HOLD head:{HEAD_784}"))
         result = self.arm(784, "danielraffel/Shipyard", self.approved_784(comments=pages))
         self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn("the latest verdict naming head fd0e94e25f44 is HOLD", result.stderr)
+        self.assertIn("a HOLD naming head fd0e94e25f44 makes it un-approvable", result.stderr)
         self.assertIn("2026-10-12T16:00:00Z", result.stderr)
 
     def test_a_hold_on_a_later_page_refuses(self) -> None:
@@ -2425,7 +2425,7 @@ class ReviewBeforeArm(unittest.TestCase):
         result = self.arm(784, "danielraffel/Shipyard",
                           self.approved_784(comments=[pages[0] + filler, [hold]]))
         self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn("is HOLD", result.stderr)
+        self.assertIn("makes it un-approvable", result.stderr)
         self.assertIn("--paginate", self.calls())
 
     def test_a_drive_by_account_cannot_approve(self) -> None:
@@ -2661,7 +2661,7 @@ class ReviewBeforeArm(unittest.TestCase):
                 refused = self.run_guard(argv, self.approved_784(queue=False, comments=held),
                                          "danielraffel/Shipyard")
                 self.assertEqual(refused.returncode, 1, refused.stderr)
-                self.assertIn("is HOLD", refused.stderr)
+                self.assertIn("makes it un-approvable", refused.stderr)
 
     def test_direct_merges_must_bind_the_approved_head(self) -> None:
         for path, argv in self.merge_paths(HOLD_784).items():
@@ -2978,7 +2978,7 @@ class ReviewBeforeArm(unittest.TestCase):
         ]
         result = self.land(history, head, trail)
         self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn("is HOLD", result.stderr)
+        self.assertIn("makes it un-approvable", result.stderr)
         # Control: the same honest merge without the HOLD carries.
         self.assertEqual(self.land(history, head).returncode, 0)
 
@@ -3923,7 +3923,7 @@ class ReviewIdentity(unittest.TestCase):
         ]
         allowed, why = guard.review_verdict(self.HEAD, "shipyard-local[bot]", comments, [], self.policy())
         self.assertFalse(allowed, why)
-        self.assertIn("has no readable time", why)
+        self.assertIn("posted with no readable time", why)
 
     def test_a_user_account_named_like_the_app_never_counts(self) -> None:
         # GitHub's GraphQL names the App `shipyard-local`, a login anyone can
@@ -3976,6 +3976,27 @@ class ReviewIdentity(unittest.TestCase):
         # A host with no signers file does not apply the rule.
         self.assertTrue(guard.review_verdict(head, "shipyard-local[bot]", [comment], [],
                                              self.policy())[0])
+
+    def test_base_signer_identity_binding_accepts_only_the_stamped_host_and_agent(self) -> None:
+        config = ('[auto_merge]\n'
+                  'reviewer_signers = ["codex-review"]\n'
+                  '[auto_merge.reviewer_signer_identities]\n'
+                  'codex-review = ["Daniels-Mac-Studio-m3 agent:codex-reviewer"]\n')
+        policy = guard.review_policy(config, "Generous-Corp/pulp", True)
+        policy["sessions"] = None  # identity binding is repository-side, not host-local
+        stamp = "<!-- session: Daniels-Mac-Studio-m3/rotating-session agent: codex-reviewer -->"
+        good = self.comment("shipyard-local[bot]", f"reviewer: codex-review\n{stamp}\n"
+                            f"verdict: APPROVE head:{self.HEAD}")
+        self.assertTrue(guard.review_verdict(self.HEAD, "danielraffel", [good], [], policy)[0])
+        for wrong in (
+            "<!-- session: Daniels-M5-Studio/rotating-session agent: codex-reviewer -->",
+            "<!-- session: Daniels-Mac-Studio-m3/rotating-session agent: other-agent -->",
+            "<!-- session: Daniels-Mac-Studio-m3/rotating-session -->",
+        ):
+            bad = self.comment("shipyard-local[bot]", f"reviewer: codex-review\n{wrong}\n"
+                               f"verdict: APPROVE head:{self.HEAD}")
+            self.assertFalse(guard.review_verdict(self.HEAD, "danielraffel", [bad], [], policy)[0],
+                             wrong)
 
     def test_the_base_config_names_signers_before_the_host_file(self) -> None:
         with tempfile.TemporaryDirectory() as scratch, \
@@ -4270,3 +4291,408 @@ class ReviewIdentity(unittest.TestCase):
         self.assertEqual(len(rust), 4)
         trusted = source.split("pub const TRUSTED_ASSOCIATIONS", 1)[1].split("];", 1)[0]
         self.assertEqual(tuple(re.findall(r'"([^"]+)"', trusted)), guard.TRUSTED_ASSOCIATIONS)
+
+class HoldMakesHeadUnapprovable(unittest.TestCase):
+    """pulp#11117 / pulp#11311 (2026-10-31): a counting HOLD is final for its
+    head. A later APPROVE of the same unchanged head, from the same signer in
+    another session or from another signer, does not count. Same rule as
+    src/head_approval.rs ``latest_verdict``."""
+
+    HEAD = "a" * 40
+    OLD = "b" * 40
+
+    def setUp(self) -> None:
+        scratch = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, scratch, True)
+        patcher = mock.patch.dict(os.environ, {"SHIPYARD_GHAPP_GUARDS_DIR": scratch})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop("SHIPYARD_SIGNERS_FROM_BASE", None)
+        self.policy = guard.review_policy(
+            '[auto_merge]\nreviewer_signers = ["pulp-review", "infra-review2"]\n',
+            "Generous-Corp/pulp", True)
+        guard.HELD_EXCLUSIONS.clear()
+
+    def verdict(self, comment_id: int, at: str, signer: str, session: str, verdict: str,
+                head: str) -> dict[str, Any]:
+        body = (f"Review.\nreviewer: {signer}\n"
+                f"<!-- session: Daniels-Mac-Studio-m3/{session} -->\nverdict: {verdict} head:{head}")
+        return {"id": comment_id, "user": {"login": "shipyard-local[bot]", "type": "Bot"},
+                "created_at": at, "body": body, "author_association": "CONTRIBUTOR"}
+
+    def judge(self, comments: list[dict[str, Any]],
+              reviews: list[dict[str, Any]] | None = None) -> tuple[bool, str]:
+        return guard.review_verdict(self.HEAD, "danielraffel", comments, reviews or [], self.policy)
+
+    def test_a_hold_then_a_later_approve_of_the_same_head_is_refused(self) -> None:
+        hold = self.verdict(1, "2026-10-31T14:40:00Z", "pulp-review", "737146e7-interactive",
+                            "HOLD", self.HEAD)
+        approve = self.verdict(2, "2026-10-31T15:21:00Z", "pulp-review",
+                               "fleet-pass-reviewer-1", "APPROVE", self.HEAD)
+        # Control: the APPROVE alone counts, so the refusal is the HOLD's.
+        self.assertTrue(self.judge([approve])[0])
+        guard.HELD_EXCLUSIONS.clear()
+        allowed, why = self.judge([hold, approve])
+        self.assertFalse(allowed, why)
+        self.assertIn("held by pulp-review at comment 1", why)
+        self.assertEqual(guard.HELD_EXCLUSIONS,
+                         ["excluded_approval:head held by pulp-review at comment 1"])
+        self.assertIsNone(guard.approved_earlier_head(self.HEAD, "danielraffel",
+                                                      [hold, approve], [], self.policy))
+
+    def test_an_approve_then_a_later_hold_is_refused(self) -> None:
+        allowed, why = self.judge([
+            self.verdict(1, "2026-10-31T14:00:00Z", "pulp-review", "a", "APPROVE", self.HEAD),
+            self.verdict(2, "2026-10-31T15:00:00Z", "pulp-review", "a", "HOLD", self.HEAD)])
+        self.assertFalse(allowed, why)
+
+    def test_a_hold_on_an_old_head_does_not_block_the_new_head(self) -> None:
+        allowed, why = self.judge([
+            self.verdict(1, "2026-10-31T14:00:00Z", "pulp-review", "a", "HOLD", self.OLD),
+            self.verdict(2, "2026-10-31T15:00:00Z", "pulp-review", "b", "APPROVE", self.HEAD)])
+        self.assertTrue(allowed, why)
+        self.assertEqual(guard.HELD_EXCLUSIONS, [])
+
+    def test_a_hold_from_a_login_that_does_not_count_is_ignored(self) -> None:
+        drive_by = {"id": 9, "user": {"login": "drive-by", "type": "User"},
+                    "created_at": "2026-10-31T14:00:00Z", "author_association": "NONE",
+                    "body": f"verdict: HOLD head:{self.HEAD}"}
+        allowed, why = self.judge([
+            drive_by,
+            self.verdict(2, "2026-10-31T15:00:00Z", "pulp-review", "b", "APPROVE", self.HEAD)])
+        self.assertTrue(allowed, why)
+
+    def test_one_signers_hold_is_not_outranked_by_another_signers_approve(self) -> None:
+        allowed, why = self.judge([
+            self.verdict(7, "2026-10-31T14:00:00Z", "infra-review2", "a", "HOLD", self.HEAD),
+            self.verdict(8, "2026-10-31T15:00:00Z", "pulp-review", "b", "APPROVE", self.HEAD)])
+        self.assertFalse(allowed, why)
+        self.assertEqual(guard.HELD_EXCLUSIONS,
+                         ["excluded_approval:head held by infra-review2 at comment 7"])
+
+    def test_an_approval_of_a_held_earlier_head_does_not_carry(self) -> None:
+        comments = [
+            self.verdict(1, "2026-10-31T14:00:00Z", "pulp-review", "a", "HOLD", self.OLD),
+            self.verdict(2, "2026-10-31T15:00:00Z", "pulp-review", "b", "APPROVE", self.OLD)]
+        self.assertIsNone(guard.approved_earlier_head(self.HEAD, "danielraffel", comments, [],
+                                                      self.policy))
+
+
+class ReviewerClaimReceipt(unittest.TestCase):
+    head = "a" * 40
+
+    def run_fixture(self, summary: object, **overrides: object) -> dict[str, object]:
+        value: dict[str, object] = {
+            "name": "reviewer-claim", "status": "completed", "conclusion": "success",
+            "app": {"slug": "shipyard-review", "id": 42},
+            "output": {"summary": json.dumps(summary)},
+        }
+        value.update(overrides)
+        return value
+
+    def receipt(self) -> dict[str, object]:
+        return {
+            "schema": "shipyard-reviewer-claim/v1", "repo": "danielraffel/Shipyard",
+            "pr": 974, "head_sha": self.head, "epoch": 3, "reviewer": "pulp-review",
+            "claimed_at": "2026-10-27T20:00:00Z", "deadline_at": "2099-10-27T21:00:00Z",
+        }
+
+    def test_policy_is_default_off_and_requires_both_fields(self) -> None:
+        self.assertIsNone(guard.review_policy(None, "danielraffel/Shipyard", True)["claim_receipt"])
+        policy = guard.review_policy(
+            "[auto_merge]\nreviewer_claim_receipt = 'reviewer-claim'\n"
+            "reviewer_claim_app = 'shipyard-review'\n", "danielraffel/Shipyard", True)
+        self.assertEqual(policy["claim_receipt"], "reviewer-claim")
+        self.assertEqual(policy["claim_app"], "shipyard-review")
+        with self.assertRaises(guard.GuardError):
+            guard.review_policy("[auto_merge]\nreviewer_claim_receipt = 'reviewer-claim'\n",
+                                "danielraffel/Shipyard", True)
+        with self.assertRaises(guard.GuardError):
+            guard.review_policy(
+                "[auto_merge]\nreviewer_claim_receipt = 'reviewer-claim'\n"
+                "reviewer_claim_app = 'github-actions'\n",
+                "danielraffel/Shipyard", True)
+        with self.assertRaises(guard.GuardError):
+            guard.review_policy(
+                "[auto_merge]\nreviewer_claim_receipt = 'reviewer-claim'\n"
+                "reviewer_claim_app = 15368\n",
+                "danielraffel/Shipyard", True)
+
+    def test_parser_requires_exact_schema_and_binds_identity(self) -> None:
+        parsed = guard.parse_claim_receipt(self.run_fixture(self.receipt()), "danielraffel/Shipyard", 974,
+                                           self.head, "reviewer-claim", "shipyard-review")
+        self.assertEqual(parsed["epoch"], 3)
+        bad = self.receipt(); bad["head_sha"] = "b" * 40
+        with self.assertRaises(guard.GuardError):
+            guard.parse_claim_receipt(self.run_fixture(bad), "danielraffel/Shipyard", 974, self.head,
+                                      "reviewer-claim", "shipyard-review")
+        bad = self.receipt(); bad["extra"] = True
+        with self.assertRaises(guard.GuardError):
+            guard.parse_claim_receipt(self.run_fixture(bad), "danielraffel/Shipyard", 974, self.head,
+                                      "reviewer-claim", "shipyard-review")
+
+    def test_parser_refuses_wrong_app_or_non_success(self) -> None:
+        with self.assertRaises(guard.GuardError):
+            guard.parse_claim_receipt(self.run_fixture(self.receipt(), app={"slug": "other"}),
+                                      "danielraffel/Shipyard", 974, self.head,
+                                      "reviewer-claim", "shipyard-review")
+        self.assertIsNone(guard.parse_claim_receipt(
+            self.run_fixture(self.receipt(), conclusion="failure"),
+            "danielraffel/Shipyard", 974, self.head,
+            "reviewer-claim", "shipyard-review"))
+
+    def test_parser_ignores_expired_history(self) -> None:
+        expired = self.receipt()
+        expired["claimed_at"] = "2020-10-27T20:00:00Z"
+        expired["deadline_at"] = "2020-10-27T21:00:00Z"
+        self.assertIsNone(guard.parse_claim_receipt(
+            self.run_fixture(expired), "danielraffel/Shipyard", 974,
+            self.head, "reviewer-claim", "shipyard-review"))
+
+    def test_consumers_require_one_receipt_and_deciding_reviewer(self) -> None:
+        policy = {"claim_receipt": "reviewer-claim", "claim_app": "shipyard-review"}
+        approval = {"signer": "pulp-review", "approved_at": "2026-10-27T20:30:00Z"}
+        listing = [{"total_count": 1, "check_runs":
+                    [self.run_fixture(self.receipt())]}]
+        with mock.patch.object(guard, "run_real_gh", return_value=listing):
+            note = guard.reviewer_claim_receipt(
+                "danielraffel/Shipyard", 974, self.head, policy, approval)
+        self.assertIn("epoch 3", note)
+
+        with mock.patch.object(guard, "run_real_gh", return_value=listing):
+            with self.assertRaises(guard.GuardError):
+                guard.reviewer_claim_receipt(
+                    "danielraffel/Shipyard", 974, self.head, policy,
+                    {"signer": "pulp-review"})
+        with mock.patch.object(guard, "run_real_gh", return_value=listing):
+            with self.assertRaises(guard.GuardError):
+                guard.reviewer_claim_receipt(
+                    "danielraffel/Shipyard", 974, self.head, policy,
+                    {"signer": "pulp-review", "approved_at": "2020-01-01T00:00:00Z"})
+
+        wrong_reviewer = {"signer": "infra-review2", "approved_at": "2026-10-27T20:30:00Z"}
+        with mock.patch.object(guard, "run_real_gh", return_value=listing):
+            with self.assertRaises(guard.GuardError):
+                guard.reviewer_claim_receipt(
+                    "danielraffel/Shipyard", 974, self.head, policy, wrong_reviewer)
+
+        duplicate = [{"total_count": 2, "check_runs": [
+            self.run_fixture(self.receipt()), self.run_fixture(self.receipt())]}]
+        with mock.patch.object(guard, "run_real_gh", return_value=duplicate):
+            with self.assertRaises(guard.GuardError):
+                guard.reviewer_claim_receipt(
+                    "danielraffel/Shipyard", 974, self.head, policy, approval)
+
+    def test_latest_failed_receipt_supersedes_older_success(self) -> None:
+        policy = {"claim_receipt": "reviewer-claim", "claim_app": "shipyard-review"}
+        listing = [{"total_count": 2, "check_runs": [
+            self.run_fixture(self.receipt(), id=10),
+            self.run_fixture(self.receipt(), id=11, conclusion="failure"),
+        ]}]
+        with mock.patch.object(guard, "run_real_gh", return_value=listing):
+            with self.assertRaises(guard.GuardError):
+                guard.reviewer_claim_receipt(
+                    "danielraffel/Shipyard", 974, self.head,
+                    policy, {"signer": "pulp-review", "approved_at": "2026-10-27T20:30:00Z"})
+
+    def test_consumers_reject_partial_pages(self) -> None:
+        policy = {"claim_receipt": "reviewer-claim", "claim_app": "shipyard-review"}
+        with mock.patch.object(guard, "run_real_gh", return_value=[
+            {"total_count": 2, "check_runs": [self.run_fixture(self.receipt())]}]):
+            with self.assertRaises(guard.GuardError):
+                guard.reviewer_claim_receipt(
+                    "danielraffel/Shipyard", 974, self.head,
+                    policy, {"signer": "pulp-review", "approved_at": "2026-10-27T20:30:00Z"})
+
+
+class ReviewerClaimReceiptSafety(unittest.TestCase):
+    """One isolating negative test per receipt safety condition: every other
+    check passes, so only the condition under test can refuse."""
+
+    head = "a" * 40
+    repo = "danielraffel/Shipyard"
+
+    def receipt(self, **overrides: object) -> dict[str, object]:
+        value: dict[str, object] = {
+            "schema": "shipyard-reviewer-claim/v1", "repo": "danielraffel/shipyard",
+            "pr": 974, "head_sha": self.head, "epoch": 3, "reviewer": "pulp-review",
+            "claimed_at": "2026-10-27T20:00:00Z", "deadline_at": "2099-10-27T21:00:00Z",
+        }
+        value.update(overrides)
+        return value
+
+    def run_fixture(self, summary: object, **overrides: object) -> dict[str, object]:
+        value: dict[str, object] = {
+            "name": "reviewer-claim", "status": "completed", "conclusion": "success",
+            "app": {"slug": "shipyard-review", "id": 42},
+            "output": {"summary": json.dumps(summary)},
+        }
+        value.update(overrides)
+        return value
+
+    def parse(self, summary: object, repo: str | None = None, pr: int = 974,
+              policy_app: str | int = "shipyard-review", **run: object
+              ) -> dict[str, Any] | None:
+        return guard.parse_claim_receipt(self.run_fixture(summary, **run), repo or self.repo,
+                                         pr, self.head, "reviewer-claim", policy_app)
+
+    def consume(self, approval: dict[str, Any], summary: dict[str, object] | None = None,
+                app: str | int = "shipyard-review") -> str | None:
+        policy = {"claim_receipt": "reviewer-claim", "claim_app": app}
+        listing = [{"total_count": 1,
+                    "check_runs": [self.run_fixture(summary or self.receipt())]}]
+        with mock.patch.object(guard, "run_real_gh", return_value=listing):
+            return guard.reviewer_claim_receipt(self.repo, 974, self.head, policy, approval)
+
+    def test_control_a_canonical_receipt_parses(self) -> None:
+        self.assertEqual(self.parse(self.receipt())["epoch"], 3)
+
+    def test_repo_binding_is_case_insensitive(self) -> None:
+        # The producer writes the lower-cased slug; a mixed-case PR repository
+        # must still accept it, in both directions.
+        for receipt_repo, repo in (("generous-corp/pulp", "Generous-Corp/pulp"),
+                                   ("Generous-Corp/pulp", "generous-corp/PULP")):
+            with self.subTest(receipt_repo=receipt_repo, repo=repo):
+                self.assertIsNotNone(self.parse(self.receipt(repo=receipt_repo), repo=repo))
+
+    def test_repo_binding_refuses_another_repository(self) -> None:
+        for receipt_repo in ("generous-corp/tartci", "generous-corp/pulp-planning", 7):
+            with self.subTest(receipt_repo=receipt_repo):
+                with self.assertRaisesRegex(guard.GuardError, "another pull request"):
+                    self.parse(self.receipt(repo=receipt_repo), repo="Generous-Corp/pulp")
+
+    def test_pr_binding_refuses_another_pull_request(self) -> None:
+        with self.assertRaisesRegex(guard.GuardError, "another pull request"):
+            self.parse(self.receipt(), pr=975)
+
+    def test_future_dated_claim_is_refused(self) -> None:
+        with self.assertRaisesRegex(guard.GuardError, "future-dated"):
+            self.parse(self.receipt(claimed_at="2099-10-27T20:00:00Z"))
+
+    def test_non_forward_deadline_is_refused(self) -> None:
+        for deadline in ("2026-10-27T20:00:00Z", "2026-10-27T19:00:00Z"):
+            with self.subTest(deadline=deadline):
+                with self.assertRaisesRegex(guard.GuardError, "non-forward deadline"):
+                    self.parse(self.receipt(deadline_at=deadline))
+
+    def test_invalid_epoch_is_refused(self) -> None:
+        for epoch in (0, -1, "3", 3.0, True, None):
+            with self.subTest(epoch=epoch):
+                with self.assertRaisesRegex(guard.GuardError, "invalid epoch"):
+                    self.parse(self.receipt(epoch=epoch))
+
+    def test_empty_reviewer_is_refused(self) -> None:
+        for reviewer in ("", "   ", None, 5):
+            with self.subTest(reviewer=reviewer):
+                with self.assertRaisesRegex(guard.GuardError, "no reviewer identity"):
+                    self.parse(self.receipt(reviewer=reviewer))
+
+    def test_integer_app_policy_matches_the_app_id_only(self) -> None:
+        policy = guard.review_policy(
+            "[auto_merge]\nreviewer_claim_receipt = 'reviewer-claim'\nreviewer_claim_app = 42\n",
+            self.repo, True)
+        self.assertEqual(policy["claim_app"], 42)
+        # The id decides, whatever the slug says.
+        self.assertIsNotNone(self.parse(self.receipt(), policy_app=42,
+                                        app={"slug": "renamed", "id": 42}))
+        with self.assertRaisesRegex(guard.GuardError, "unexpected GitHub App"):
+            self.parse(self.receipt(), policy_app=42, app={"slug": "shipyard-review", "id": 43})
+
+    def test_approval_at_or_after_the_deadline_is_refused(self) -> None:
+        summary = self.receipt(deadline_at="2099-10-27T21:00:00Z")
+        self.assertIsNotNone(self.consume(
+            {"signer": "pulp-review", "approved_at": "2099-10-27T20:59:59Z"}, summary))
+        for late in ("2099-10-27T21:00:00Z", "2099-10-27T21:00:01Z"):
+            with self.subTest(approved_at=late):
+                with self.assertRaisesRegex(guard.GuardError, "outside the reviewer claim window"):
+                    self.consume({"signer": "pulp-review", "approved_at": late}, summary)
+
+    def approval_from(self, comment: dict[str, Any]) -> dict[str, Any]:
+        with mock.patch.object(guard, "_deciding_approval_comment", return_value=comment):
+            return guard.deciding_approval(self.head, "author", [comment], [], {})
+
+    def verdict(self, **times: str) -> dict[str, Any]:
+        return {"id": 1, "body": f"reviewer: pulp-review\nverdict: APPROVE head:{self.head}",
+                **times}
+
+    def test_a_verdict_edited_after_the_deadline_is_judged_at_its_edit_time(self) -> None:
+        # A HOLD posted inside the window and edited into an APPROVE after the
+        # deadline keeps its created_at; its edit time is outside the window.
+        edited = self.approval_from(self.verdict(created_at="2026-10-27T20:30:00Z",
+                                                 updated_at="2099-10-28T00:00:00Z"))
+        self.assertEqual(edited["approved_at"], "2099-10-28T00:00:00Z")
+        with self.assertRaisesRegex(guard.GuardError, "outside the reviewer claim window"):
+            self.consume(edited)
+
+    def test_an_unedited_or_in_window_edited_verdict_is_accepted(self) -> None:
+        for times in ({"created_at": "2026-10-27T20:30:00Z"},
+                      {"created_at": "2026-10-27T20:30:00Z", "updated_at": "2026-10-27T20:30:00Z"},
+                      {"created_at": "2026-10-27T20:30:00Z", "updated_at": "2026-10-27T20:40:00Z"}):
+            with self.subTest(times=times):
+                self.assertIn("epoch 3", self.consume(self.approval_from(self.verdict(**times))))
+
+    def test_an_unreadable_edit_time_is_refused(self) -> None:
+        approval = self.approval_from(self.verdict(created_at="2026-10-27T20:30:00Z",
+                                                   updated_at="not-a-time"))
+        self.assertIsNone(approval["approved_at"])
+        with self.assertRaisesRegex(guard.GuardError, "no readable timestamp"):
+            self.consume(approval)
+
+
+class ReviewerClaimReviewGate(unittest.TestCase):
+    """`review_gate` itself consumes the receipt when the base enables it."""
+
+    head = "c" * 40
+    repo = "Generous-Corp/pulp"
+    config = ("[auto_merge]\narm_requires_head_approval = true\n"
+              "reviewer_claim_receipt = 'reviewer-claim'\nreviewer_claim_app = 'shipyard-review'\n")
+
+    def receipt_run(self) -> dict[str, Any]:
+        summary = {
+            "schema": "shipyard-reviewer-claim/v1", "repo": "generous-corp/pulp",
+            "pr": 11, "head_sha": self.head, "epoch": 2, "reviewer": "pulp-review",
+            "claimed_at": "2026-10-27T20:00:00Z", "deadline_at": "2099-10-27T21:00:00Z",
+        }
+        return {"id": 5, "name": "reviewer-claim", "status": "completed",
+                "conclusion": "success", "app": {"slug": "shipyard-review", "id": 42},
+                "output": {"summary": json.dumps(summary)}}
+
+    def gate(self, check_runs: list[dict[str, Any]]) -> tuple[bool, str, Any]:
+        pull = {"base": {"ref": "main"}, "head": {"sha": self.head, "ref": "feature/x"},
+                "user": {"login": "author"}}
+
+        def real_gh(arguments: list[str]) -> Any:
+            path = next(arg for arg in arguments if arg.startswith("repos/"))
+            if "/check-runs" in path:
+                return [{"total_count": len(check_runs), "check_runs": check_runs}]
+            if path == f"repos/{self.repo}/pulls/11":
+                return pull
+            raise AssertionError(f"unexpected gh read {arguments}")
+
+        approval = {"verdict_comment_id": 1, "signer": "pulp-review",
+                    "approved_head": self.head, "approved_at": "2026-10-27T20:30:00Z"}
+        target = {"repo": self.repo, "pr": 11, "head": self.head, "bound_head": self.head}
+        with tempfile.TemporaryDirectory() as guards, \
+                mock.patch.dict(os.environ, {"SHIPYARD_GHAPP_GUARDS_DIR": guards}), \
+                mock.patch.object(guard, "host_review_default", return_value=True), \
+                mock.patch.object(guard, "run_real_gh", side_effect=real_gh), \
+                mock.patch.object(guard, "base_config_text", return_value=self.config), \
+                mock.patch.object(guard, "_rest_pages", return_value=[]), \
+                mock.patch.object(guard, "review_verdict",
+                                  return_value=(True, "approved by pulp-review")), \
+                mock.patch.object(guard, "self_approval", return_value=None), \
+                mock.patch.object(guard, "same_session_note", return_value=None), \
+                mock.patch.object(guard, "deciding_approval", return_value=approval), \
+                contextlib.redirect_stderr(io.StringIO()):
+            return guard.review_gate(target, self.repo, dry_run=True)
+
+    def test_control_a_valid_receipt_is_consumed(self) -> None:
+        allowed, message, _ = self.gate([self.receipt_run()])
+        self.assertTrue(allowed, message)
+        self.assertIn("reviewer claim epoch 2 by pulp-review consumed", message)
+
+    def test_an_approval_without_its_receipt_is_refused(self) -> None:
+        allowed, message, fix = self.gate([])
+        self.assertFalse(allowed, message)
+        self.assertIn("reviewer claim receipt refused", message)
+        self.assertEqual(fix["cause"], "unreviewed")

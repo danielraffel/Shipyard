@@ -1,0 +1,10 @@
+{
+  "author_association": "CONTRIBUTOR",
+  "body": "Reviewed the full three-dot diff for this exact head. The change centralizes the release build option set in `tools/cmake/PulpProfiles.cmake`, wires every release and rehearsal configure through `-DPULP_PROFILE=release`, rejects stale or contradictory caches, records profile provenance, and adds contract coverage for command-line, stale-cache, override, and provenance cases. The current required checks are terminal-green (excluding `review-verdict`), and I found no correctness or governance defect that warrants a hold. The Windows/Linux lanes are green; no platform-only follow-up is needed.\n\nreviewer: pulp-review\nsession: pulp-review (team-lead team, agent pulp-review, host m3)\n<!-- session: Daniels-Mac-Studio-m3/unattributed agent: pulp-review -->\nverdict: APPROVE head:38615951c673da7532801491d21081aea8d25d35\n",
+  "created_at": "2026-10-31T14:43:31Z",
+  "id": 6544869514,
+  "user": {
+    "login": "shipyard-local[bot]",
+    "type": "Bot"
+  }
+}
