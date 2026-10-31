@@ -4,7 +4,7 @@
 `release.yml` keeps a release a draft until the macOS DMG is signed, attested
 and published by the final job. If that run ends in failure (a runner that
 cannot reach the Rust distribution servers, a Sigstore blip) nothing retries
-it and the draft sits forever. This script runs from `auto-release.yml` on a
+it and the draft sits forever. This script runs from `release-heal.yml` on a
 schedule and on every main push. For the release of the current Cargo version
 it either does nothing, re-runs the failed jobs of the release run (bounded by
 MAX_ATTEMPTS), or exits non-zero with the exact reason. The attempt cap means an exhausted run fails every scheduled pass until a
@@ -113,6 +113,25 @@ def _gh(*args: str) -> str:
     return out.stdout
 
 
+ALREADY_RUNNING = re.compile(r"already (running|in progress|queued)|currently running|in progress", re.I)
+
+
+def rerun_refusal_is_benign(stderr: str) -> bool:
+    """True only for GitHub refusing because the run is already running or queued.
+
+    `gh api` prints the message and `(HTTP <status>)` on stderr. Only that
+    refusal means another heal pass won the race; any other status (401, 403
+    scope or permission errors, 404, 5xx) means heal cannot recover anything.
+    """
+    m = re.search(r"\(HTTP (\d{3})\)", stderr)
+    status = int(m.group(1)) if m else None
+    if status not in (403, 409, 422):
+        return False
+    if status == 403 and not re.search(r"already running", stderr, re.I):
+        return False
+    return bool(ALREADY_RUNNING.search(stderr))
+
+
 def _failed_steps(repo: str, run_id: int) -> str:
     jobs = json.loads(_gh("api", f"repos/{repo}/actions/runs/{run_id}/jobs?per_page=100"))
     parts = []
@@ -146,8 +165,15 @@ def main() -> int:
         try:
             _gh("api", "-X", "POST", f"repos/{repo}/actions/runs/{decision.run_id}/rerun-failed-jobs")
         except subprocess.CalledProcessError as exc:
-            print(f"rerun request was refused (likely another heal won the race): {exc.stderr.strip()}", file=sys.stderr)
-            return 0
+            detail = (exc.stderr or "").strip()
+            if rerun_refusal_is_benign(detail):
+                print(f"rerun request was refused, the run is already running: {detail}", file=sys.stderr)
+                return 0
+            m = re.search(r"\(HTTP (\d{3})\)", detail)
+            status = m.group(1) if m else "unknown"
+            print(f"::error title=Release {tag} heal could not re-run run {decision.run_id}::HTTP {status}: {detail}")
+            print(f"rerun request failed (HTTP {status}): {detail}", file=sys.stderr)
+            return 1
         print(f"re-ran failed jobs of run {decision.run_id}")
     if decision.action == "fail":
         print(f"::error title=Release {tag} stuck as draft::{decision.reason}")

@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import contextlib
+import io
+import json
+import subprocess
 import sys
+import tempfile
 import unittest
+from unittest import mock
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -77,6 +83,58 @@ class DecideTests(unittest.TestCase):
             p = Path(d) / "Cargo.toml"
             p.write_text('[dependencies]\nx = { version = "9" }\n[package]\nname = "s"\nversion = "1.2.3"\n')
             self.assertEqual(heal.cargo_version(p), "1.2.3")
+
+
+class RerunErrorTests(unittest.TestCase):
+    def _main(self, stderr: str | None) -> tuple[int, str]:
+        """Run main() with a stale failed release run; the rerun POST fails with `stderr`."""
+        stamp = (datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        release_run = {"id": 7, "status": "completed", "conclusion": "failure", "updated_at": stamp, "run_attempt": 1}
+
+        def fake_gh(*args: str) -> str:
+            if "-X" in args:
+                if stderr is None:
+                    return ""
+                raise subprocess.CalledProcessError(1, ["gh", *args], stderr=stderr)
+            url = args[1]
+            if "/jobs" in url:
+                return json.dumps({"jobs": []})
+            if "/releases" in url:
+                return json.dumps([{"tag_name": "v1.2.3", "draft": True}])
+            return json.dumps({"workflow_runs": [release_run]})
+
+        with tempfile.TemporaryDirectory() as d:
+            cargo = Path(d) / "Cargo.toml"
+            cargo.write_text('[package]\nname = "x"\nversion = "1.2.3"\n')
+            out, err = io.StringIO(), io.StringIO()
+            argv = ["heal", "--repo", "o/r", "--cargo-toml", str(cargo)]
+            with mock.patch.object(heal, "_gh", fake_gh), mock.patch.dict(
+                "os.environ", {"CI_MACOS_SIGNING_ENABLED": "true"}
+            ), mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = heal.main()
+        return rc, out.getvalue() + err.getvalue()
+
+    def test_successful_rerun_exits_zero(self) -> None:
+        self.assertEqual(self._main(None)[0], 0)
+
+    def test_lost_race_already_running_is_benign(self) -> None:
+        for msg in (
+            "gh: Cannot rerun a workflow run that is already running (HTTP 409)",
+            "gh: Workflow is already running (HTTP 422)",
+        ):
+            rc, _ = self._main(msg)
+            self.assertEqual(rc, 0, msg)
+
+    def test_other_statuses_fail_loudly_and_name_the_status(self) -> None:
+        for status, msg in (
+            (403, "Resource not accessible by integration"),
+            (404, "Not Found"),
+            (401, "Bad credentials"),
+            (409, "Conflict with something else"),
+        ):
+            rc, out = self._main(f"gh: {msg} (HTTP {status})")
+            self.assertNotEqual(rc, 0, status)
+            self.assertIn(f"HTTP {status}", out)
 
 
 if __name__ == "__main__":

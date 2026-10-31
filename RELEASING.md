@@ -338,7 +338,8 @@ re-runs the failed jobs of the release run (never a cancelled one) once the run 
 successful run still left a draft, the job fails and prints the failing steps.
 It only acts when `CI_MACOS_SIGNING_ENABLED=true` and never publishes or edits
 a release itself. Run `python3 scripts/release_draft_heal.py --dry-run` locally
-(with `GH_TOKEN`) to see the decision.
+(with `GH_TOKEN`) to see the decision. An exhausted draft keeps Release Heal
+red on every push and schedule pass until a newer release run exists.
 
 ## Release concurrency
 
