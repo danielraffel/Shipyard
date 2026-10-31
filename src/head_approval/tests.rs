@@ -1700,7 +1700,8 @@ fn a_hold_after_the_approve_refuses_by_default() {
         ),
     ];
     assert!(!allows(&policy, &comments, None));
-    // Control: the same pair the other way round approves.
+    // The same pair the other way round refuses too: a HOLD is final for its
+    // head, so a later APPROVE of the same head does not outrank it.
     let reversed = [
         fleet(
             "2026-10-12T01:00:00Z",
@@ -1711,7 +1712,238 @@ fn a_hold_after_the_approve_refuses_by_default() {
             &format!("verdict: APPROVE head:{HEAD}"),
         ),
     ];
-    assert!(allows(&policy, &reversed, None));
+    assert!(!allows(&policy, &reversed, None));
+}
+
+// ---------------------------------------------------------------------------
+// A HOLD makes its head un-approvable (pulp#11117 / pulp#11311, 2026-10-31)
+// ---------------------------------------------------------------------------
+
+/// The incident's signers: the standing reviewer and a second allowlisted one.
+fn pulp_signed() -> ApprovalPolicy {
+    let mut policy = by_default("Generous-Corp/pulp");
+    policy.signers = Some(vec!["pulp-review".to_owned(), "infra-review2".to_owned()]);
+    policy
+}
+
+/// A signed fleet-App verdict comment with an id, from `session`.
+fn signed_verdict(
+    id: u64,
+    at: &str,
+    signer: &str,
+    session: &str,
+    verdict: &str,
+    head: &str,
+) -> Value {
+    let mut comment = fleet(
+        at,
+        &format!(
+            "Review.\nreviewer: {signer}\n<!-- session: Daniels-Mac-Studio-m3/{session} -->\n\
+             verdict: {verdict} head:{head}"
+        ),
+    );
+    comment["id"] = json!(id);
+    comment
+}
+
+/// pulp#11117: the interactive `pulp-review` session HOLDs a head; 40 minutes
+/// later a scheduled reviewer session signed `pulp-review` APPROVEs the same
+/// unchanged head without addressing the HOLD. The head stays held.
+#[test]
+fn a_hold_then_a_later_approve_of_the_same_head_is_not_approved() {
+    let policy = pulp_signed();
+    let comments = [
+        signed_verdict(
+            1,
+            "2026-10-31T14:40:00Z",
+            "pulp-review",
+            "737146e7-interactive",
+            "HOLD",
+            HEAD,
+        ),
+        signed_verdict(
+            2,
+            "2026-10-31T15:21:00Z",
+            "pulp-review",
+            "fleet-pass-reviewer-1",
+            "APPROVE",
+            HEAD,
+        ),
+    ];
+    super::with_host_sessions(None, || {
+        // Control: the APPROVE alone counts, so the refusal below is the HOLD's.
+        assert!(allows(&policy, &comments[1..], None));
+        assert!(!allows(&policy, &comments, None));
+        assert_eq!(
+            super::verdict_audit_events(HEAD, &[], &comments, &policy, None),
+            vec![
+                "excluded_approval:head held by pulp-review at comment 1".to_owned(),
+                "head_held:held by pulp-review at comment 1".to_owned()
+            ]
+        );
+    });
+}
+
+#[test]
+fn an_approve_then_a_later_hold_of_the_same_head_is_not_approved() {
+    let policy = pulp_signed();
+    let comments = [
+        signed_verdict(
+            1,
+            "2026-10-31T14:00:00Z",
+            "pulp-review",
+            "a",
+            "APPROVE",
+            HEAD,
+        ),
+        signed_verdict(2, "2026-10-31T15:00:00Z", "pulp-review", "a", "HOLD", HEAD),
+    ];
+    super::with_host_sessions(None, || assert!(!allows(&policy, &comments, None)));
+}
+
+#[test]
+fn a_hold_on_an_old_head_does_not_block_an_approve_of_the_new_head() {
+    let policy = pulp_signed();
+    let comments = [
+        signed_verdict(1, "2026-10-31T14:00:00Z", "pulp-review", "a", "HOLD", OTHER),
+        signed_verdict(
+            2,
+            "2026-10-31T15:00:00Z",
+            "pulp-review",
+            "b",
+            "APPROVE",
+            HEAD,
+        ),
+    ];
+    super::with_host_sessions(None, || {
+        assert!(allows(&policy, &comments, None));
+        assert!(
+            !super::verdict_audit_events(HEAD, &[], &comments, &policy, None)
+                .iter()
+                .any(|event| event.starts_with("excluded_approval:"))
+        );
+    });
+}
+
+#[test]
+fn a_hold_from_a_login_that_does_not_count_is_ignored() {
+    let policy = pulp_signed();
+    let mut drive_by = person("drive-by", "NONE", &format!("verdict: HOLD head:{HEAD}"));
+    drive_by["at"] = json!("2026-10-31T14:00:00Z");
+    let comments = [
+        drive_by,
+        signed_verdict(
+            2,
+            "2026-10-31T15:00:00Z",
+            "pulp-review",
+            "b",
+            "APPROVE",
+            HEAD,
+        ),
+    ];
+    super::with_host_sessions(None, || {
+        assert!(allows(&policy, &comments, None));
+        assert!(super::verdict_audit_events(HEAD, &[], &comments, &policy, None).is_empty());
+    });
+}
+
+#[test]
+fn one_signers_hold_is_not_outranked_by_another_signers_later_approve() {
+    let policy = pulp_signed();
+    let comments = [
+        signed_verdict(
+            7,
+            "2026-10-31T14:00:00Z",
+            "infra-review2",
+            "a",
+            "HOLD",
+            HEAD,
+        ),
+        signed_verdict(
+            8,
+            "2026-10-31T15:00:00Z",
+            "pulp-review",
+            "b",
+            "APPROVE",
+            HEAD,
+        ),
+    ];
+    super::with_host_sessions(None, || {
+        assert!(!allows(&policy, &comments, None));
+        assert_eq!(
+            super::verdict_audit_events(HEAD, &[], &comments, &policy, None),
+            vec![
+                "excluded_approval:head held by infra-review2 at comment 7".to_owned(),
+                "head_held:held by infra-review2 at comment 7".to_owned()
+            ]
+        );
+    });
+}
+
+#[test]
+fn a_changes_requested_review_is_not_outranked_by_a_later_approved_review() {
+    let policy = required(&["shipyard-review[bot]"]);
+    let mut hold = review(
+        "shipyard-review[bot]",
+        "Bot",
+        "CHANGES_REQUESTED",
+        HEAD,
+        "2026-10-31T14:00:00Z",
+    );
+    hold["id"] = json!(55);
+    let approve = review(
+        "shipyard-review[bot]",
+        "Bot",
+        "APPROVED",
+        HEAD,
+        "2026-10-31T15:00:00Z",
+    );
+    let reviews = [hold, approve.clone()];
+    assert!(decide(&policy, HEAD, &[approve], &[], &empty_queue(HEAD)).allows());
+    assert!(!decide(&policy, HEAD, &reviews, &[], &empty_queue(HEAD)).allows());
+    assert_eq!(
+        super::verdict_audit_events(HEAD, &reviews, &[], &policy, None),
+        vec![
+            "excluded_approval:head held by shipyard-review[bot] at review 55".to_owned(),
+            "head_held:held by shipyard-review[bot] at review 55".to_owned()
+        ]
+    );
+}
+
+/// A held head's later APPROVE does not carry to a merge-only update either:
+/// the carry is refused before anything is read from GitHub.
+#[test]
+fn an_approval_of_a_held_head_does_not_carry() {
+    let policy = pulp_signed();
+    let comments = [
+        signed_verdict(1, "2026-10-31T14:00:00Z", "pulp-review", "a", "HOLD", OTHER),
+        signed_verdict(
+            2,
+            "2026-10-31T15:00:00Z",
+            "pulp-review",
+            "b",
+            "APPROVE",
+            OTHER,
+        ),
+    ];
+    let input = super::CarryInput {
+        repo: "Generous-Corp/pulp",
+        pr: 11117,
+        head: HEAD,
+        reviews: &[],
+        comments: &comments,
+        policy: &policy,
+        author: None,
+    };
+    let gh = |args: &[String]| -> Result<String, String> {
+        panic!("a held head must not reach a carry read: {args:?}")
+    };
+    let gate = HeadGate::NotApproved {
+        head: HEAD.to_owned(),
+    };
+    super::with_host_sessions(None, || {
+        assert_eq!(super::with_carry(&gh, &input, gate.clone()), gate);
+    });
 }
 
 #[test]

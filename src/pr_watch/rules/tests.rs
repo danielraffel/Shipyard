@@ -167,6 +167,34 @@ fn a_head_with_no_ready_and_no_verdict_is_reported_only_when_asked() {
     assert!(!at(&input(draft, Vec::new()), 90).contains("head_unreviewed"));
 }
 
+/// pulp#11117: a HOLD, then a later APPROVE of the same unchanged head, then
+/// an arm. The HOLD makes the head un-approvable, so the arm is reported.
+#[test]
+fn a_later_approve_does_not_clear_a_hold_on_the_same_armed_head() {
+    let armed = pr(vec![(30, QueueEventKind::Armed)], Vec::new());
+    let trail = vec![
+        comment(1, 10, &format!("verdict: HOLD head:{HEAD}")),
+        comment(2, 20, &format!("verdict: APPROVE head:{HEAD}")),
+    ];
+    let events = evaluate(
+        &input(armed.clone(), trail),
+        t(31),
+        &RuleConfig::default(),
+        false,
+    );
+    let event = events
+        .iter()
+        .find(|event| event.kind == "armed_unapproved")
+        .expect("a held head armed after a later APPROVE");
+    assert!(event.summary.contains("HOLD"), "{}", event.summary);
+    // Control: the HOLD names an older head, so the APPROVE stands.
+    let moved = vec![
+        comment(1, 10, &format!("verdict: HOLD head:{OLD}")),
+        comment(2, 20, &format!("verdict: APPROVE head:{HEAD}")),
+    ];
+    assert!(!holding(&input(armed, moved), 31).contains("armed_unapproved"));
+}
+
 #[test]
 fn an_armed_head_needs_the_latest_verdict_on_it_to_approve() {
     let armed = pr(vec![(30, QueueEventKind::Armed)], Vec::new());
@@ -910,16 +938,17 @@ fn a_hold_nobody_repaired_is_reported_after_held_after_with_its_age() {
 }
 
 #[test]
-fn a_hold_is_not_unrepaired_once_a_new_head_or_an_approval_follows() {
+fn a_hold_is_unrepaired_until_a_new_head_follows() {
     // Control: the same HOLD on the current head reports.
     assert!(
         holding(&input(pr(Vec::new(), Vec::new()), hold_trail(10)), 100)
             .contains("held_unrepaired")
     );
-    // A newer approval of the same head supersedes the HOLD.
+    // A newer approval of the same head does not supersede the HOLD: a HOLD
+    // makes its head un-approvable, so only a push repairs it.
     let mut trail = hold_trail(10);
     trail.push(comment(2, 30, &format!("verdict: APPROVE head:{HEAD}")));
-    assert!(!holding(&input(pr(Vec::new(), Vec::new()), trail), 100).contains("held_unrepaired"));
+    assert!(holding(&input(pr(Vec::new(), Vec::new()), trail), 100).contains("held_unrepaired"));
     // A push after the HOLD: the verdict names a head that is no longer current.
     let mut pushed = pr(Vec::new(), Vec::new());
     pushed.head_sha = OLD.to_owned();

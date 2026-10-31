@@ -26,7 +26,11 @@
 //!   from a configured reviewer identity.
 //! * A final-line `verdict: APPROVE head:<sha>` or `reviewed:<sha>` comment
 //!   from a configured reviewer identity. The sha is always the full head.
-//!   `verdict: HOLD head:<sha>` and a matching `REQUEST_CHANGES` review block.
+//!   `verdict: HOLD head:<sha>` and a matching `REQUEST_CHANGES` review block,
+//!   and a counting HOLD is final for its head: no APPROVE naming that head,
+//!   from any reviewer, posted before or after it, counts (reported as
+//!   `excluded_approval:head held by <signer> at <id>`). Only a new head (a
+//!   push) can be approved, and an approval does not carry from a held head.
 //!
 //! Bot status alone is not a rejection: the dedicated review App is configured
 //! as a reviewer. The fleet author App and the PR author cannot approve their
@@ -1494,6 +1498,30 @@ pub fn verdict_audit_events(
             });
         }
     }
+    if let Some(hold) = head_hold(head, reviews, comments, policy, author) {
+        // An APPROVE that would have counted, on a head a HOLD names: say
+        // why the pass ignores it.
+        let approves_head = |record: &Value| {
+            let names_head = record
+                .get("state")
+                .and_then(Value::as_str)
+                .is_some_and(|state| state.eq_ignore_ascii_case("APPROVED"))
+                && record
+                    .get("commit_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|commit| commit.eq_ignore_ascii_case(head))
+                || record
+                    .get("body")
+                    .and_then(Value::as_str)
+                    .is_some_and(|body| marker_names_head(body, head));
+            names_head && verdict_counts(record, Verdict::Approve, policy, author)
+        };
+        let holder = describe_hold(hold);
+        if reviews.iter().chain(comments).any(approves_head) {
+            events.push(format!("excluded_approval:head {holder}"));
+        }
+        events.push(format!("head_held:{holder}"));
+    }
     for comment in comments {
         if !reviewer_allowed(comment, policy, author) {
             continue;
@@ -1654,9 +1682,10 @@ impl HeadGate {
                  `verdict: APPROVE head:{head}` or `reviewed: {head}`, or an APPROVED review \
                  on that commit, from a listed reviewer, or where none is listed from the \
                  fleet App (a `ghapp` verdict comment) or a human the base lists in \
-                 `[auto_merge] human_reviewers`, never the PR author, with no later HOLD \
-                 naming it. This repository arms only approved \
-                 heads; left disarmed until a reviewer posts that verdict",
+                 `[auto_merge] human_reviewers`, never the PR author, and no HOLD naming \
+                 it: a HOLD makes its head un-approvable, so a held head needs a new \
+                 push. This repository arms only approved heads; left disarmed until a \
+                 reviewer posts that verdict",
                 short(head)
             ),
             Self::SelfApproved { head, agent } => format!(
@@ -1723,6 +1752,70 @@ pub fn decide_excusing(
     )
 }
 
+/// The first counting HOLD naming `head`, review or comment, if any.
+///
+/// A HOLD makes its head un-approvable: no APPROVE naming the same head, from
+/// any reviewer, earlier or later, counts against it. Only a new head (a
+/// push) can be approved. The queue-arm guard's `_latest_on` is the same.
+fn head_hold<'a>(
+    head: &str,
+    reviews: &'a [Value],
+    comments: &'a [Value],
+    policy: &ApprovalPolicy,
+    author: Option<&str>,
+) -> Option<&'a Value> {
+    let review = reviews.iter().find(|review| {
+        review
+            .get("commit_id")
+            .and_then(Value::as_str)
+            .is_some_and(|commit| commit.eq_ignore_ascii_case(head))
+            && review
+                .get("state")
+                .and_then(Value::as_str)
+                .is_some_and(|state| state.eq_ignore_ascii_case("CHANGES_REQUESTED"))
+            && verdict_counts(review, Verdict::Hold, policy, author)
+    });
+    review.or_else(|| {
+        comments.iter().find(|comment| {
+            comment
+                .get("body")
+                .and_then(Value::as_str)
+                .and_then(marker_verdict)
+                .is_some_and(|(verdict, marker_head)| {
+                    verdict == Verdict::Hold && marker_head.eq_ignore_ascii_case(head)
+                })
+                && verdict_counts(comment, Verdict::Hold, policy, author)
+        })
+    })
+}
+
+/// `held by <signer> at <comment|review> <id>` for a HOLD record: the `reviewer:` signer line
+/// when the body carries one, else the login; the comment or review id.
+fn describe_hold(record: &Value) -> String {
+    let signer = record
+        .get("body")
+        .and_then(Value::as_str)
+        .and_then(|body| {
+            Regex::new(r"(?m)^[ \t]*reviewer:[ \t]*([A-Za-z0-9._-]+)[ \t]*$")
+                .expect("signer pattern compiles")
+                .captures_iter(body)
+                .filter_map(|capture| capture.get(1))
+                .last()
+                .map(|name| name.as_str().to_ascii_lowercase())
+        })
+        .or_else(|| login(record).map(str::to_owned))
+        .unwrap_or_else(|| "an unknown reviewer".to_owned());
+    let place = match record.get("id").and_then(Value::as_u64) {
+        Some(id) if record.get("state").is_some() => format!("review {id}"),
+        Some(id) => format!("comment {id}"),
+        None => record
+            .get("at")
+            .and_then(Value::as_str)
+            .map_or_else(|| "an unrecorded time".to_owned(), str::to_owned),
+    };
+    format!("held by {signer} at {place}")
+}
+
 fn latest_verdict(
     head: &str,
     reviews: &[Value],
@@ -1730,6 +1823,10 @@ fn latest_verdict(
     policy: &ApprovalPolicy,
     author: Option<&str>,
 ) -> Option<Verdict> {
+    // A HOLD is final for its head: no approval, earlier or later, outranks it.
+    if head_hold(head, reviews, comments, policy, author).is_some() {
+        return Some(Verdict::Hold);
+    }
     let review_events = reviews.iter().filter_map(|review| {
         if !review
             .get("commit_id")
@@ -1739,14 +1836,10 @@ fn latest_verdict(
             return None;
         }
         let state = review.get("state")?.as_str()?;
-        let verdict = if state.eq_ignore_ascii_case("APPROVED") {
-            Verdict::Approve
-        } else if state.eq_ignore_ascii_case("CHANGES_REQUESTED") {
-            Verdict::Hold
-        } else {
+        if !state.eq_ignore_ascii_case("APPROVED") {
             return None;
-        };
-        verdict_counts(review, verdict, policy, author).then(|| (at(review), verdict))
+        }
+        verdict_counts(review, Verdict::Approve, policy, author).then_some(Verdict::Approve)
     });
     let comment_events = comments.iter().filter_map(|comment| {
         let (verdict, marker_head) = marker_verdict(comment.get("body")?.as_str()?)?;
@@ -1755,22 +1848,9 @@ fn latest_verdict(
         {
             return None;
         }
-        Some((at(comment), verdict))
+        Some(verdict)
     });
-    let events: Vec<_> = review_events.chain(comment_events).collect();
-    // A HOLD whose time cannot be read cannot be ordered against an approval,
-    // so it is not allowed to lose to one.
-    if events
-        .iter()
-        .any(|(timestamp, verdict)| timestamp.is_none() && *verdict == Verdict::Hold)
-    {
-        return Some(Verdict::Hold);
-    }
-    events
-        .into_iter()
-        .filter_map(|(timestamp, verdict)| Some((timestamp?, verdict)))
-        .max_by_key(|(timestamp, _)| *timestamp)
-        .map(|(_, verdict)| verdict)
+    review_events.chain(comment_events).next()
 }
 
 pub(crate) fn decide_for_author(
@@ -2100,7 +2180,7 @@ pub fn read_policy_required(
 }
 
 /// A review as the gate reads it.
-const REVIEW_RECORD_JQ: &str = ".[] | {login: .user.login, type: .user.type, association: .author_association, at: .submitted_at, state: .state, commit_id: .commit_id, body: .body, performed_via_github_app_id: .performed_via_github_app.id}";
+const REVIEW_RECORD_JQ: &str = ".[] | {id: .id, login: .user.login, type: .user.type, association: .author_association, at: .submitted_at, state: .state, commit_id: .commit_id, body: .body, performed_via_github_app_id: .performed_via_github_app.id}";
 /// A comment as the gate reads it.
 const COMMENT_RECORD_JQ: &str = ".[] | {id: .id, login: .user.login, type: .user.type, association: .author_association, at: .created_at, body: .body, performed_via_github_app_id: .performed_via_github_app.id}";
 

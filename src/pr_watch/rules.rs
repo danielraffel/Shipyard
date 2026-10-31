@@ -15,14 +15,14 @@
 //! | `ready_unreviewed` | a comment whose first line says READY names the current head, and no verdict names it |
 //! | `head_unreviewed` | opt-in (`head_unreviewed_after`): the current head has been up that long with neither a READY nor a verdict naming it |
 //! | `verdict_posted` | a reviewer verdict (`verdict: APPROVE/HOLD head:<sha>`, `reviewed: <sha>`, or a review) was posted; route it to the author |
-//! | `armed_unapproved` | the pull request is armed or queued and the latest verdict on its head is not an approval |
+//! | `armed_unapproved` | the pull request is armed or queued and its head carries no approval: no verdict names it, or a HOLD does (a HOLD makes its head un-approvable) |
 //! | `required_red` | the pull request is armed, queued or approved, and the latest attempt of a required check on its head failed or was cancelled; carries the failing test names |
 //! | `group_red` | a merge group named for the pull request failed a required job; carries the failing test names |
 //! | `queue_removed` | the merge queue removed the pull request for any reason but a merge |
 //! | `queue_stuck` | the pull request has sat in the merge queue for `queue_stuck_after` |
 //! | `approved_unarmed` | the latest verdict on the head approves it, for `approved_unarmed_after`, and nothing armed or queued it |
 //! | `approved_blocked` | the head is approved but GitHub reports it `DIRTY` or `BEHIND` (live passes only: GitHub keeps no history of it) |
-//! | `held_unrepaired` | the latest trusted verdict on the current head is HOLD, no new head followed it, and it is older than `held_after` |
+//! | `held_unrepaired` | a trusted HOLD names the current head (a later APPROVE of it does not clear it), no new head followed it, and it is older than `held_after` |
 //! | `owner_decision` / `superseded` / `parked` | the pull request carries the `owner-decision`, `superseded` or `PARKED/*` label; it is reported under that state and skipped by every stall rule |
 //! | `host_alarm` | an alarm issue (a tartci `[tartci] ...` issue) was opened |
 //! | anything else | an input event (`--input-events`), passed through under its own key |
@@ -290,7 +290,6 @@ fn pr_state(pr: &PrHistory, at: DateTime<Utc>) -> PrState {
     state
 }
 
-/// The latest verdict naming `head`, posted at or before `at`.
 /// Whether `entry`'s verdict counts for a pull request by `author`: the
 /// rule the arm guard applies (`head_approval::trusted_reviewer`), so a
 /// drive-by comment on a public repository, or the author's own, neither
@@ -299,22 +298,35 @@ fn trusted(entry: &TrailEntry, author: Option<&str>) -> bool {
     crate::head_approval::trusted_reviewer(&entry.login, entry.association.as_deref(), author)
 }
 
+/// The deciding verdict naming `head`, posted at or before `at`: the latest
+/// HOLD when one exists (a HOLD makes its head un-approvable, as
+/// `head_approval` rules), else the latest verdict.
 fn latest_verdict<'a>(
     trail: &'a [TrailEntry],
     head: &str,
     at: DateTime<Utc>,
     author: Option<&str>,
 ) -> Option<&'a TrailEntry> {
-    trail
-        .iter()
-        .filter(|entry| entry.at <= at && trusted(entry, author))
+    let on_head = || {
+        trail
+            .iter()
+            .filter(move |entry| entry.at <= at && trusted(entry, author))
+            .filter(move |entry| {
+                entry
+                    .verdict
+                    .as_ref()
+                    .is_some_and(|verdict| verdict.head.eq_ignore_ascii_case(head))
+            })
+    };
+    on_head()
         .filter(|entry| {
             entry
                 .verdict
                 .as_ref()
-                .is_some_and(|verdict| verdict.head.eq_ignore_ascii_case(head))
+                .is_some_and(|verdict| !verdict.approve)
         })
         .max_by_key(|entry| (entry.at, entry.id))
+        .or_else(|| on_head().max_by_key(|entry| (entry.at, entry.id)))
 }
 
 fn stamp(at: DateTime<Utc>) -> String {

@@ -26,7 +26,7 @@
 //! * (a) each `H_i` is the current head of an open member pull request on
 //!   the same base whose own exact-head approval counts (with
 //!   `require_counted_approval`, the default, a carried approval does not),
-//!   with no later HOLD;
+//!   and no HOLD naming it;
 //! * (b) the first-parent chain from the head back to `B` is exactly `k`
 //!   (at most `max_members`) two-parent merges whose second parents are the
 //!   `H_i`, and each merge changes exactly the member's files to the member's

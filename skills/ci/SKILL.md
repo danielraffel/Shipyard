@@ -370,7 +370,8 @@ reviewed:<40-hex sha>
 ```
 
 `reviewed:` is an alias for APPROVE. The latest verdict on the current head
-decides. A HOLD on an older head, a quoted (`>`) line, a line above the last,
+decides, except that a HOLD is final: once a counting HOLD names a head, no
+APPROVE of that head (earlier or later, any signer) counts; push a new head. A HOLD on an older head, a quoted (`>`) line, a line above the last,
 and prose that mentions "hold" or "changes requested" never gate. A marker
 posted before the head commit existed does not count. Without an approval the line reads
 `▸ Auto-merge not armed on #N: head … carries no approval …`, and the same check
