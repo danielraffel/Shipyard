@@ -2,15 +2,27 @@
 
 [![CI](https://github.com/danielraffel/Shipyard/actions/workflows/ci.yml/badge.svg)](https://github.com/danielraffel/Shipyard/actions/workflows/ci.yml)
 
+**Local-first engineering orchestration and governance for coding agents.**
+Shipyard coordinates builds and tests, records review and merge gates, and
+supports bounded recovery across local machines, SSH-reachable VMs, and cloud
+runners. GitHub remains authoritative for pull requests and merge order.
+
 Shipyard and [TartCI](https://github.com/danielraffel/tartci) solve different
 parts of CI:
 
 - **Shipyard coordinates the work.** It sends an exact commit to the targets
   you choose, records the results, watches pull requests, and hands a verified
   head to GitHub for landing.
-- **TartCI runs the work in disposable VMs.** It turns Apple Silicon Macs into
-  GitHub Actions capacity by booting clean macOS, Linux, or Windows VMs for
-  jobs and removing them afterward.
+- **TartCI runs the work in disposable VMs.** For teams using Tart on Apple
+  Silicon, it turns their Macs into GitHub Actions capacity with clean macOS,
+  Linux, and Windows VM lanes that are removed after each job.
+
+Tart provides the VM runtime; it does not by itself schedule GitHub jobs or
+manage their runner lifecycle. TartCI adds that CI pool around it: managed
+images, capacity leases, ephemeral runner registration, job cleanup, and
+metrics.
+On a managed fleet, TartCI is the supported pool path; Orchard is retired and
+should be disabled so two schedulers do not claim the same jobs or capacity.
 
 Use Shipyard without TartCI for local, SSH, or hosted checks. Add TartCI when
 those checks need isolated Mac VM capacity. GitHub remains the authority for
@@ -25,7 +37,8 @@ Use Shipyard if you:
 - want a pull request to land only after the exact head passes every required
   platform;
 - run local Macs or private VMs alongside GitHub-hosted runners;
-- want unattended monitoring that records a clear reason when it must stop.
+- want monitoring that can run unattended and records a specific reason when
+  progress cannot continue.
 
 Shipyard is useful for people and coding tools. It does not choose what your
 product should do or edit code on its own.
@@ -110,7 +123,11 @@ installation.
 - **Works with GitHub's merge queue.** Shipyard validates the head, hands the
   exact SHA to GitHub, and records the queue action.
 - **Explains failures.** `shipyard diagnose` and `shipyard cause` reduce a red
-  job to its failing step and a few useful evidence lines.
+  job to its failing step and a few useful evidence lines. Optional local cause
+  archives preserve diagnostic history; `shipyard cause prune` previews
+  adjustable retention limits. Apply requires a mutable archive marker (or an
+  explicit `--initialize` enrollment) and never guesses through malformed
+  evidence.
 - **Recovers supported stuck work.** Runner watchdogs, PR rescue, queue
   observation, and bounded retries handle routine failures without guessing.
 - **Keeps state across restarts.** A stopped terminal or daemon does not erase
@@ -212,15 +229,31 @@ You need only the tools used by your setup:
 Run `shipyard doctor` to check the tools and credentials for the current
 configuration.
 
+Set `SHIPYARD_OBSERVATIONS=off` in the producing process to stop automatic
+metrics, route-shadow and baseline collection; existing services need the new
+environment and a restart. Required evidence and explicit imports remain available.
+Retention controls deletion separately; see [collection scope](docs/log-retention.md#automatic-observation-collection).
+
 Shipyard stores optional CI timing data in its local SQLite metrics database so
 scorecards can measure queueing, waste, and rework. `shipyard cleanup --apply`
 keeps raw samples for 90 days by default; set
 `SHIPYARD_METRICS_RETENTION_DAYS` to another number, or `0` to disable pruning.
+Invalid, negative, or excessively large values fail cleanup closed.
 Merge receipts are retained as durable provenance. A producer can hand them to
 an observer with `shipyard metrics export merge-receipt --repo <owner/repo>
 --file <handoff.jsonl>`; the export is repository-scoped, atomic, and reads
 only receipts already persisted by Shipyard. It fails without replacing the
-handoff when no receipt exists.
+handoff when no receipt exists. A governed transport can instead use
+`--stdout`; that mode emits only canonical JSONL receipt records and writes no
+summary to stdout.
+
+The optional `scripts/collect_baseline.py` collector keeps diagnostic status
+observations for 14 days, capped at 1,024 entries, to bound accumulated
+scorecards and import details. Increase `--state-retention-days` and
+`--state-max-observations` for a longer history. These limits do not change
+readiness, which uses the separate prospective pass history. Omit `--collect`
+to skip this collector's provider imports; this does not disable other
+Shipyard telemetry.
 
 ## This repository uses Shipyard
 

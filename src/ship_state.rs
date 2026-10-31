@@ -770,6 +770,27 @@ impl ShipStateStore {
         self.delete_scoped_locked(repository, pr)
     }
 
+    /// Delete an active state only if the exact state observed by the caller
+    /// is still present under the per-PR lock. A cleanup pass can scan state
+    /// outside that lock; this compare-and-delete closes the window where a
+    /// worker updates the file after the scan but before deletion.
+    pub fn delete_scoped_if_matches(
+        &self,
+        repository: &str,
+        pr: u64,
+        expected: &ShipState,
+    ) -> Result<bool, std::io::Error> {
+        let lock = self.lock_pr_scoped(repository, pr)?;
+        let Some(current) = self.get_locked_scoped(repository, pr, &lock) else {
+            return Ok(false);
+        };
+        if current != *expected {
+            return Ok(false);
+        }
+        self.delete_scoped_locked(repository, pr)?;
+        Ok(true)
+    }
+
     fn delete_scoped_locked(&self, repository: &str, pr: u64) -> Result<(), std::io::Error> {
         {
             let _writer_domain =
@@ -1654,6 +1675,29 @@ mod tests {
         let mut next_head = claim;
         next_head.head_sha = "head-b".to_owned();
         assert_ne!(same, next_head.receipt_id("generous-corp/pulp", 9));
+    }
+
+    #[test]
+    fn compare_and_delete_preserves_state_updated_after_cleanup_scan() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
+        let observed = sample_state(43, "old-head");
+        store.save(&observed).expect("save observed state");
+
+        let mut current = observed.clone();
+        current.head_sha = "new-head".to_owned();
+        current.touch();
+        store.save(&current).expect("save updated state");
+
+        assert!(
+            !store
+                .delete_scoped_if_matches(&observed.repo, observed.pr, &observed)
+                .expect("compare-and-delete")
+        );
+        assert_eq!(
+            store.get(observed.pr).expect("state remains").head_sha,
+            "new-head"
+        );
     }
 
     #[test]

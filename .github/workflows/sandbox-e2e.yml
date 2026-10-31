@@ -7,6 +7,11 @@ on:
     branches: [main]
   workflow_dispatch:
     inputs:
+      platform_focus:
+        description: "Run the sandbox jobs (empty = repo variable CI_PLATFORM_FOCUS, default macos = off)"
+        required: false
+        default: ""
+        type: string
       runner_provider:
         description: Runner provider for sandbox jobs
         required: false
@@ -42,6 +47,8 @@ env:
 jobs:
   resolve-runners:
     name: Resolve runners
+    # Off under the default macos focus; CI_PLATFORM_FOCUS=all resumes it.
+    if: (inputs.platform_focus || vars.CI_PLATFORM_FOCUS) == 'all'
     runs-on: ubuntu-latest
     outputs:
       matrix_json: ${{ steps.resolve.outputs.matrix_json }}
@@ -61,6 +68,7 @@ jobs:
 
   sandbox:
     needs: resolve-runners
+    if: (inputs.platform_focus || vars.CI_PLATFORM_FOCUS) == 'all'
     name: Sandbox ${{ matrix.name }} [${{ matrix.provider }}]
     runs-on: ${{ fromJSON(matrix.runs_on_json) }}
     strategy:

@@ -461,6 +461,14 @@ blocks an earlier approval. A HOLD whose time cannot be read always blocks.
   `review-verdict` status applies (the status reads no host's file). Without
   either, the signer rule is off on that host;
   roll it out one host at a time.
+  A protected base can additionally bind a signer name to the stamped,
+  provider-neutral host and agent with
+  `[auto_merge.reviewer_signer_identities]`, for example
+  `codex-review = ["Daniels-Mac-Studio-m3 agent:codex-reviewer"]`.
+  A bound signer must carry that host and `agent:` value in its `ghapp` stamp;
+  a missing agent, another host or agent, or a signer with no binding refuses
+  the APPROVE. This map is separate from the existing list form of
+  `reviewer_identities`, which names GitHub reviewer logins.
 * A signer line can be copied, so a host can also list the exact `session:`
   lines its reviewers write, under a `sessions` key in the same file:
   `{"sessions": ["session: pulp-review (team-lead team, agent pulp-review, host m3)"]}`

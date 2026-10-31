@@ -177,6 +177,7 @@ pub mod metadata_authority;
 /// Runner and CI timing metrics store and analysis helpers.
 pub mod metrics;
 mod native_executable;
+mod observations;
 /// Opt-in targets (`default = false`) as a reported fact on every surface.
 pub mod opt_in_targets;
 /// Private outage-window membership and provenance validation.

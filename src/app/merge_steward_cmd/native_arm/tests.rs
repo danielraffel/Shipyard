@@ -417,6 +417,36 @@ fn a_repo_without_native_auto_merge_declines_the_whole_pass() {
     assert!(!log.exists());
 }
 
+/// A no-queue base is never armed, whether or not GitHub would allow it and
+/// whether or not the steward could merge it itself.
+#[cfg(unix)]
+#[test]
+fn a_no_queue_base_is_not_applicable_and_arms_nothing() {
+    let temp = tempfile::tempdir().expect("temp");
+    let log = temp.path().join("calls.log");
+    let actions = fake_gh(&temp, &never_armed_then_arms(&log.display().to_string()));
+    let mut observation = observation(pr_row(&serde_json::json!({})), true);
+    observation.merge_queue = false;
+    observation.required_checks.push(RequiredCheck {
+        context: "review-verdict".to_owned(),
+        app_id: Some(15368),
+    });
+    for apply in [false, true] {
+        let (status, unhealthy) = apply_native_arm_backstop(
+            &actions,
+            &observation,
+            &report(StewardDecision::Unmanaged),
+            "shipyard:no-auto-merge",
+            apply,
+            no_authority_needed,
+        );
+        assert!(!unhealthy, "{status:?}");
+        assert!(status.policy.starts_with("not applicable:"), "{status:?}");
+        assert!(status.results.is_empty(), "{status:?}");
+    }
+    assert!(!log.exists(), "no GitHub call at all");
+}
+
 /// An unreadable state is not an unarmed state, and it is worth a nonzero exit:
 /// the pass could not do its job.
 #[cfg(unix)]
