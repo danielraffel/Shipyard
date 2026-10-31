@@ -22,6 +22,15 @@ CHECKOUT = "actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0"
 
 
 class ReleaseWorkflowTests(unittest.TestCase):
+    def test_release_runs_one_at_a_time_and_newest_supersedes_pending(self) -> None:
+        import yaml
+
+        workflow = yaml.safe_load(RELEASE_WORKFLOW.read_text(encoding="utf-8"))
+        concurrency = workflow.get("concurrency") or {}
+        self.assertEqual(concurrency.get("group"), "release")
+        # A running release must never be cancelled mid-signing.
+        self.assertIs(concurrency.get("cancel-in-progress"), False)
+
     def test_release_workflow_keeps_macos_local_signing_gate(self) -> None:
         text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("draft: true", text)
@@ -29,6 +38,17 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("scripts/release-macos-local.sh", text)
         self.assertIn("--ci-mode", text)
         self.assertIn("CI_MACOS_SIGNING_ENABLED == 'true'", text)
+
+    def test_macos_job_auth_is_checked_before_expensive_work(self) -> None:
+        text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        job = text.split("  sign-and-upload-macos:", 1)[1]
+        config, steps = job.split("    steps:", 1)
+        self.assertNotIn("SHIPYARD_GHAPP_PATH", job)
+        self.assertIn("GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}", steps)
+        self.assertLess(steps.index("from release_macos_local import require_ci_gh"),
+                        steps.index("- name: Install Rust"))
+        self.assertLess(steps.index("from release_macos_local import require_ci_gh"),
+                        steps.index("- name: Import Developer ID signing identity"))
 
     def test_release_is_gated_on_the_live_github_smoke(self) -> None:
         text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
@@ -42,6 +62,14 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertNotIn("continue-on-error", live)
         self.assertIn("    permissions:\n      contents: read\n", live)
         self.assertNotIn("write", live.split("steps:", 1)[0])
+
+    def test_live_smoke_prefers_a_dedicated_read_token(self) -> None:
+        text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn(
+            "secrets.RELEASE_SMOKE_GH_TOKEN || github.token",
+            text,
+        )
+        self.assertNotIn("secrets.RELEASE_BOT_TOKEN", text)
 
     def test_release_workflow_uses_current_ci_signing_secret_names_only(self) -> None:
         text = RELEASE_WORKFLOW.read_text(encoding="utf-8")

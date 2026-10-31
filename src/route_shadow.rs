@@ -1460,7 +1460,14 @@ mod tests {
         ));
         assert!(path.is_file());
 
-        super::record_dispatch_observation_best_effort(
+        // Drive the selected-route writer synchronously. The process-wide
+        // background queue is shared with the full suite and intentionally
+        // drops when full so admission never blocks; under Windows suite
+        // load that can drop this second, higher-value update after the
+        // pending receipt was written. The pending half above still covers
+        // the public runtime sink, while this keeps the selected update
+        // deterministic without changing production backpressure.
+        let selected_pending = dispatch_observation(
             temp.path(),
             "job-runtime",
             &target,
@@ -1471,7 +1478,9 @@ mod tests {
                 attempted_at: Utc::now(),
             }],
             Utc::now(),
-        );
+        )
+        .expect("selected route matches the target snapshot");
+        write_pending_observation(selected_pending);
         let mut selected = None;
         for _ in 0..5_000 {
             if let Ok(Some(receipt)) = store.load("job-runtime:mac")

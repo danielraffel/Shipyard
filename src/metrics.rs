@@ -6,6 +6,7 @@ pub mod github_import;
 pub mod import_schedule;
 pub mod job_name;
 pub mod merge_receipt;
+pub mod merge_receipt_handoff;
 pub mod project_key;
 pub mod proxy;
 mod proxy_store;
@@ -84,6 +85,24 @@ struct ExistingMergeReceipt {
     required_checks_json: String,
     gate_receipt_sha256: String,
     evidence: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+#[allow(dead_code)] // The durable handoff row is consumed by the staged authenticated importer surface.
+struct ExistingMergeReceiptHandoff {
+    schema: String,
+    repo: String,
+    project: String,
+    base_branch: String,
+    payload_sha256: String,
+    producer_host_id: String,
+    producer_session_generation: i64,
+    route: String,
+    destination: String,
+    known_hosts_sha256: String,
+    executable_sha256: String,
+    issued_at: String,
+    expires_at: String,
 }
 
 /// Input for a low-friction `shipyard metrics record` call.
@@ -673,7 +692,8 @@ impl MetricsStore {
         limit: usize,
         cutoff: &str,
     ) -> Result<RepeatedWorkSupersededTiming, Box<dyn std::error::Error>> {
-        let mut stmt = conn.prepare("WITH recent AS (SELECT superseded_job_id FROM repeated_work_shadow WHERE observed_at >= ?2 ORDER BY observed_at DESC, id DESC LIMIT ?1), superseded AS (SELECT DISTINCT superseded_job_id FROM recent) SELECT (SELECT COUNT(*) FROM recent), s.superseded_job_id, t.disposition, t.total_ms FROM superseded s LEFT JOIN queue_timing t ON t.queue_job_id=s.superseded_job_id AND s.superseded_job_id LIKE 'sy-%' AND instr(s.superseded_job_id, '/') = 0 AND instr(s.superseded_job_id, char(92)) = 0")?;
+        // GLOB preserves the canonical prefix's case; SQLite LIKE folds ASCII.
+        let mut stmt = conn.prepare("WITH recent AS (SELECT superseded_job_id FROM repeated_work_shadow WHERE observed_at >= ?2 ORDER BY observed_at DESC, id DESC LIMIT ?1), superseded AS (SELECT DISTINCT superseded_job_id FROM recent) SELECT (SELECT COUNT(*) FROM recent), s.superseded_job_id, t.disposition, t.total_ms FROM superseded s LEFT JOIN queue_timing t ON t.queue_job_id=s.superseded_job_id AND s.superseded_job_id GLOB 'sy-*' AND instr(s.superseded_job_id, '/') = 0 AND instr(s.superseded_job_id, char(92)) = 0")?;
         let mut out = RepeatedWorkSupersededTiming {
             shadow_rows: 0,
             distinct_superseded_jobs: 0,
@@ -793,9 +813,11 @@ impl MetricsStore {
         &self.path
     }
 
-    /// Delete raw run, job, step, and fleet-capacity samples older than
-    /// `retention_days`. Merge receipts are retained because they are durable
-    /// provenance.
+    /// Delete expired raw runs (including jobs/steps), fleet-capacity samples,
+    /// and queue observations. Return the number of runs, capacity samples,
+    /// shadow observations, and timing rows removed, excluding child jobs/steps.
+    /// Retained shadow observations keep their timing joins; merge receipts and
+    /// operational queue/recovery state are not pruned.
     pub fn prune_older_than(
         &self,
         retention_days: i64,
@@ -804,7 +826,12 @@ impl MetricsStore {
             return Ok(0);
         }
         let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&self.path)?;
-        let cutoff = (Utc::now() - Duration::days(retention_days)).to_rfc3339();
+        let window = Duration::try_days(retention_days)
+            .ok_or("metrics retention is outside the timestamp range")?;
+        let cutoff_time = Utc::now()
+            .checked_sub_signed(window)
+            .ok_or("metrics retention cutoff is outside the timestamp range")?;
+        let cutoff = cutoff_time.to_rfc3339();
         let mut deleted = 0;
         loop {
             let mut conn = self.connect()?;
@@ -812,7 +839,7 @@ impl MetricsStore {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let ids = {
                 let mut statement =
-                    tx.prepare("SELECT id FROM runs WHERE ts < ?1 ORDER BY id LIMIT 250")?;
+                    tx.prepare("SELECT id FROM runs WHERE ts < ?1 ORDER BY ts, id LIMIT 250")?;
                 statement
                     .query_map([&cutoff], |row| row.get::<_, i64>(0))?
                     .collect::<Result<Vec<_>, _>>()?
@@ -837,6 +864,67 @@ impl MetricsStore {
             "DELETE FROM fleet_capacity_samples WHERE valid_until < ?1",
             [&cutoff],
         )?;
+        deleted += self.prune_queue_observations(cutoff_time)?;
+        Ok(deleted)
+    }
+
+    fn prune_queue_observations(
+        &self,
+        cutoff: DateTime<Utc>,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        let mut conn = self.connect()?;
+        conn.busy_timeout(StdDuration::from_millis(250))?;
+        let mut deleted = 0;
+        // These are observation tables, never the queue/recovery authority.
+        // Expire shadow rows first so all remaining references protect timing.
+        for (table, timestamp, guard) in [
+            ("repeated_work_shadow", "observed_at", ""),
+            (
+                "queue_timing",
+                "recorded_at",
+                " AND NOT EXISTS (SELECT 1 FROM repeated_work_shadow s
+                    WHERE s.superseded_job_id = queue_timing.queue_job_id)",
+            ),
+        ] {
+            let last: i64 = conn.query_row(
+                &format!("SELECT COALESCE(MAX(rowid), 0) FROM {table}"),
+                [],
+                |row| row.get(0),
+            )?;
+            let mut cursor = 0_i64;
+            while cursor < last {
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let rows = {
+                    let mut statement = tx.prepare(&format!(
+                        "SELECT rowid, {timestamp} FROM {table}
+                         WHERE rowid > ?1 AND rowid <= ?2 ORDER BY rowid LIMIT 250"
+                    ))?;
+                    statement
+                        .query_map(params![cursor, last], |row| {
+                            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                        })?
+                        .collect::<Result<Vec<_>, _>>()?
+                };
+                if rows.is_empty() {
+                    break;
+                }
+                for (id, timestamp) in rows {
+                    cursor = id;
+                    // Strict parsing preserves malformed values and compares
+                    // RFC3339 offsets correctly. Rowid paging bounds each lock
+                    // and the initial high-water mark bounds concurrent growth.
+                    if DateTime::parse_from_rfc3339(&timestamp)
+                        .is_ok_and(|observed| observed < cutoff)
+                    {
+                        deleted += tx.execute(
+                            &format!("DELETE FROM {table} WHERE rowid = ?1{guard}"),
+                            [id],
+                        )?;
+                    }
+                }
+                tx.commit()?;
+            }
+        }
         Ok(deleted)
     }
 
@@ -925,6 +1013,12 @@ impl MetricsStore {
               cache_hit INTEGER,
               artifact_path TEXT
             );
+            CREATE INDEX IF NOT EXISTS metrics_runs_retention
+              ON runs(ts, id);
+            CREATE INDEX IF NOT EXISTS metrics_jobs_run_id
+              ON jobs(run_id);
+            CREATE INDEX IF NOT EXISTS metrics_steps_job_id
+              ON steps(job_id);
             CREATE TABLE IF NOT EXISTS merge_receipts (
               receipt_id TEXT PRIMARY KEY,
               schema TEXT NOT NULL,
@@ -945,6 +1039,40 @@ impl MetricsStore {
             );
             CREATE INDEX IF NOT EXISTS merge_receipts_project_merged
               ON merge_receipts(project, merged_at);
+            CREATE TABLE IF NOT EXISTS merge_receipt_handoffs (
+              envelope_id TEXT PRIMARY KEY,
+              schema TEXT NOT NULL,
+              repo TEXT NOT NULL,
+              project TEXT NOT NULL,
+              base_branch TEXT NOT NULL,
+              payload_sha256 TEXT NOT NULL,
+              producer_host_id TEXT NOT NULL,
+              producer_session_generation INTEGER NOT NULL,
+              route TEXT NOT NULL,
+              destination TEXT NOT NULL,
+              known_hosts_sha256 TEXT NOT NULL,
+              executable_sha256 TEXT NOT NULL,
+              issued_at TEXT NOT NULL,
+              expires_at TEXT NOT NULL,
+              imported_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS merge_receipt_handoff_receipts (
+              envelope_id TEXT NOT NULL REFERENCES merge_receipt_handoffs(envelope_id),
+              receipt_id TEXT NOT NULL,
+              receipt_sha256 TEXT NOT NULL,
+              PRIMARY KEY(envelope_id, receipt_id)
+            );
+            CREATE INDEX IF NOT EXISTS merge_receipt_handoff_receipts_receipt
+              ON merge_receipt_handoff_receipts(receipt_id);
+            CREATE TRIGGER IF NOT EXISTS merge_receipt_authenticated_immutable
+              BEFORE UPDATE ON merge_receipts
+              WHEN EXISTS (
+                SELECT 1 FROM merge_receipt_handoff_receipts
+                WHERE receipt_id = OLD.receipt_id
+              )
+            BEGIN
+              SELECT RAISE(ABORT, 'authenticated merge receipt is immutable');
+            END;
             CREATE TABLE IF NOT EXISTS fleet_capacity_samples (
               sample_id TEXT PRIMARY KEY,
               schema TEXT NOT NULL,
@@ -990,6 +1118,8 @@ impl MetricsStore {
             );
             CREATE INDEX IF NOT EXISTS repeated_work_shadow_observed_at
               ON repeated_work_shadow(observed_at DESC);
+            CREATE INDEX IF NOT EXISTS repeated_work_shadow_superseded_job
+              ON repeated_work_shadow(superseded_job_id);
             ",
         )?;
         add_column_if_missing(&conn, "jobs", "runner_assigned", "INTEGER")?;
@@ -1034,6 +1164,70 @@ impl MetricsStore {
 
     /// Import validated merge receipts atomically. Duplicate receipt IDs are
     /// idempotent only when the payload is byte-for-byte equivalent.
+    fn insert_merge_receipt_tx(
+        tx: &rusqlite::Transaction<'_>,
+        receipt: &crate::metrics::merge_receipt::MergeReceipt,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        receipt
+            .validate()
+            .map_err(|e| format!("invalid merge receipt: {e}"))?;
+        // Repository and project are durable ownership keys. Normalize them
+        // before both conflict checks and storage so case/outer whitespace
+        // cannot create a second identity for one PR.
+        let repo = crate::evidence::canonical_repository(&receipt.repo);
+        let project_input = crate::evidence::canonical_repository(&receipt.project);
+        let (project, _) =
+            crate::metrics::project_key::normalize_for_write(&project_input, Some(&repo));
+        let existing: Option<ExistingMergeReceipt> = tx.query_row(
+            "SELECT schema,repo,project,base_branch,pr,head_sha,validated_head_sha,merge_commit_sha,merged_at,source,required_checks_json,gate_receipt_sha256,evidence FROM merge_receipts WHERE receipt_id = ?1",
+            [&receipt.receipt_id],
+            |row| Ok(ExistingMergeReceipt {
+                schema: row.get(0)?, repo: row.get(1)?, project: row.get(2)?, base_branch: row.get(3)?, pr: row.get(4)?,
+                head_sha: row.get(5)?, validated_head_sha: row.get(6)?, merge_commit_sha: row.get(7)?, merged_at: row.get(8)?,
+                source: row.get(9)?, required_checks_json: row.get(10)?, gate_receipt_sha256: row.get(11)?, evidence: row.get(12)?,
+            }),
+        ).optional()?;
+        if let Some(existing) = existing {
+            let incoming = ExistingMergeReceipt {
+                schema: receipt.schema.clone(),
+                repo: repo.clone(),
+                project: project.clone(),
+                base_branch: receipt.base_branch.clone(),
+                pr: receipt.pr,
+                head_sha: receipt.head_sha.clone(),
+                validated_head_sha: receipt.validated_head_sha.clone(),
+                merge_commit_sha: receipt.merge_commit_sha.clone(),
+                merged_at: receipt.merged_at.to_rfc3339(),
+                source: receipt.source.clone(),
+                required_checks_json: serde_json::to_string(&receipt.required_checks)?,
+                gate_receipt_sha256: receipt.gate_receipt_sha256.clone(),
+                evidence: receipt.evidence.clone(),
+            };
+            if existing != incoming {
+                return Err(format!(
+                    "merge receipt {} conflicts with existing payload",
+                    receipt.receipt_id
+                )
+                .into());
+            }
+            return Ok(false);
+        }
+        let semantic_conflict: Option<String> = tx.query_row(
+            "SELECT receipt_id FROM merge_receipts WHERE lower(trim(repo)) = ?1 AND pr = ?2 AND receipt_id <> ?3 AND (lower(trim(project)) <> ?4 OR base_branch <> ?5 OR head_sha <> ?6 OR merge_commit_sha <> ?7)",
+            rusqlite::params![repo, receipt.pr, receipt.receipt_id, project, receipt.base_branch, receipt.head_sha, receipt.merge_commit_sha],
+            |row| row.get(0),
+        ).optional()?;
+        if let Some(other) = semantic_conflict {
+            return Err(format!(
+                "merge receipt {} conflicts with semantic receipt {other}",
+                receipt.receipt_id
+            )
+            .into());
+        }
+        tx.execute("INSERT INTO merge_receipts (receipt_id,schema,repo,project,base_branch,pr,head_sha,validated_head_sha,merge_commit_sha,merged_at,safe_merge,source,required_checks_json,gate_receipt_sha256,evidence,imported_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,1,?11,?12,?13,?14,?15)", rusqlite::params![receipt.receipt_id, receipt.schema, repo, project, receipt.base_branch, receipt.pr, receipt.head_sha, receipt.validated_head_sha, receipt.merge_commit_sha, receipt.merged_at.to_rfc3339(), receipt.source, serde_json::to_string(&receipt.required_checks)?, receipt.gate_receipt_sha256, receipt.evidence, Utc::now().to_rfc3339()])?;
+        Ok(true)
+    }
+
     pub fn import_merge_receipts(
         &self,
         receipts: &[crate::metrics::merge_receipt::MergeReceipt],
@@ -1043,64 +1237,141 @@ impl MetricsStore {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut imported = 0;
         for receipt in receipts {
-            receipt
-                .validate()
-                .map_err(|e| format!("invalid merge receipt: {e}"))?;
-            // Repository and project are durable ownership keys. Normalize
-            // them before both conflict checks and storage so case/outer
-            // whitespace cannot create a second identity for one PR.
-            let repo = crate::evidence::canonical_repository(&receipt.repo);
-            let project_input = crate::evidence::canonical_repository(&receipt.project);
-            let (project, _) =
-                crate::metrics::project_key::normalize_for_write(&project_input, Some(&repo));
-            let existing: Option<ExistingMergeReceipt> = tx.query_row(
-                "SELECT schema,repo,project,base_branch,pr,head_sha,validated_head_sha,merge_commit_sha,merged_at,source,required_checks_json,gate_receipt_sha256,evidence FROM merge_receipts WHERE receipt_id = ?1",
-                [&receipt.receipt_id],
-                |row| Ok(ExistingMergeReceipt {
-                    schema: row.get(0)?, repo: row.get(1)?, project: row.get(2)?, base_branch: row.get(3)?, pr: row.get(4)?,
-                    head_sha: row.get(5)?, validated_head_sha: row.get(6)?, merge_commit_sha: row.get(7)?, merged_at: row.get(8)?,
-                    source: row.get(9)?, required_checks_json: row.get(10)?, gate_receipt_sha256: row.get(11)?, evidence: row.get(12)?,
+            imported += usize::from(Self::insert_merge_receipt_tx(&tx, receipt)?);
+        }
+        tx.commit()?;
+        Ok(imported)
+    }
+
+    /// Import one authenticated handoff atomically with its provenance links.
+    /// Legacy v1 imports remain valid but do not acquire provenance merely by
+    /// being present in `merge_receipts`.
+    #[allow(dead_code)] // Transport/CLI wiring lands separately; keep this atomic persistence API ready.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn import_authenticated_merge_receipt_handoff(
+        &self,
+        envelope: &crate::metrics::merge_receipt_handoff::AuthenticatedHandoffEnvelope,
+        context: &crate::metrics::merge_receipt_handoff::AuthenticatedProducerContext,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        use crate::metrics::merge_receipt_handoff::{HandoffError, digest_receipt};
+
+        // Validate all envelope-level invariants and the trusted transport
+        // fence before taking the writer lease or opening a write transaction.
+        envelope
+            .validate()
+            .map_err(|error| format!("invalid authenticated handoff: {error}"))?;
+        // A fresh envelope must pass the full trusted-fence check before any
+        // write. An exact envelope already persisted may be replayed after its
+        // expiry so periodic exports remain idempotent; the durable identity
+        // comparison below is the only freshness exception.
+        let verification_error = envelope.verify(context).err();
+        let stale_replay = matches!(verification_error.as_ref(), Some(HandoffError::Stale));
+        if let Some(error) = verification_error
+            && !stale_replay
+        {
+            return Err(format!("authenticated handoff verification failed: {error}").into());
+        }
+
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&self.path)?;
+        let mut conn = self.connect()?;
+        let repository = crate::evidence::canonical_repository(&envelope.repository);
+        let project_input = crate::evidence::canonical_repository(&envelope.project);
+        if project_input.contains('/') && project_input != repository {
+            return Err("authenticated handoff project is not bound to repository".into());
+        }
+        let (project, _) =
+            crate::metrics::project_key::normalize_for_write(&project_input, Some(&repository));
+        let route = serde_json::to_string(&envelope.route)?;
+        let incoming = ExistingMergeReceiptHandoff {
+            schema: envelope.schema.clone(),
+            repo: repository.clone(),
+            project: project.clone(),
+            base_branch: envelope.base_branch.clone(),
+            payload_sha256: envelope.payload_sha256.as_str().to_owned(),
+            producer_host_id: envelope.producer_host_id.clone(),
+            producer_session_generation: i64::try_from(envelope.producer_session_generation)
+                .map_err(|_| HandoffError::Invalid("session generation"))?,
+            route: route.clone(),
+            destination: envelope.destination.clone(),
+            known_hosts_sha256: envelope.known_hosts_sha256.as_str().to_owned(),
+            executable_sha256: envelope.executable_sha256.as_str().to_owned(),
+            issued_at: envelope.issued_at.to_rfc3339(),
+            expires_at: envelope.expires_at.to_rfc3339(),
+        };
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: Option<ExistingMergeReceiptHandoff> = tx
+            .query_row(
+                "SELECT schema,repo,project,base_branch,payload_sha256,producer_host_id,producer_session_generation,route,destination,known_hosts_sha256,executable_sha256,issued_at,expires_at FROM merge_receipt_handoffs WHERE envelope_id=?1",
+                [&envelope.envelope_id],
+                |row| Ok(ExistingMergeReceiptHandoff {
+                    schema: row.get(0)?, repo: row.get(1)?, project: row.get(2)?, base_branch: row.get(3)?,
+                    payload_sha256: row.get(4)?, producer_host_id: row.get(5)?, producer_session_generation: row.get(6)?,
+                    route: row.get(7)?, destination: row.get(8)?, known_hosts_sha256: row.get(9)?, executable_sha256: row.get(10)?,
+                    issued_at: row.get(11)?, expires_at: row.get(12)?,
                 }),
-            ).optional()?;
-            if let Some(existing) = existing {
-                let incoming = ExistingMergeReceipt {
-                    schema: receipt.schema.clone(),
-                    repo: repo.clone(),
-                    project: project.clone(),
-                    base_branch: receipt.base_branch.clone(),
-                    pr: receipt.pr,
-                    head_sha: receipt.head_sha.clone(),
-                    validated_head_sha: receipt.validated_head_sha.clone(),
-                    merge_commit_sha: receipt.merge_commit_sha.clone(),
-                    merged_at: receipt.merged_at.to_rfc3339(),
-                    source: receipt.source.clone(),
-                    required_checks_json: serde_json::to_string(&receipt.required_checks)?,
-                    gate_receipt_sha256: receipt.gate_receipt_sha256.clone(),
-                    evidence: receipt.evidence.clone(),
-                };
-                if existing != incoming {
-                    return Err(format!(
-                        "merge receipt {} conflicts with existing payload",
-                        receipt.receipt_id
-                    )
-                    .into());
-                }
-                continue;
-            }
-            let semantic_conflict: Option<String> = tx.query_row(
-                "SELECT receipt_id FROM merge_receipts WHERE lower(trim(repo)) = ?1 AND pr = ?2 AND receipt_id <> ?3 AND (lower(trim(project)) <> ?4 OR base_branch <> ?5 OR head_sha <> ?6 OR merge_commit_sha <> ?7)",
-                rusqlite::params![repo, receipt.pr, receipt.receipt_id, project, receipt.base_branch, receipt.head_sha, receipt.merge_commit_sha],
+            )
+            .optional()?;
+        let had_existing = existing.is_some();
+        if let Some(existing) = existing.as_ref()
+            && existing != &incoming
+        {
+            return Err(format!(
+                "authenticated handoff {} conflicts with existing envelope",
+                envelope.envelope_id
+            )
+            .into());
+        }
+        if stale_replay && existing.as_ref() != Some(&incoming) {
+            return Err(format!(
+                "authenticated handoff verification failed: {}",
+                HandoffError::Stale
+            )
+            .into());
+        }
+
+        if !had_existing {
+            tx.execute(
+                "INSERT INTO merge_receipt_handoffs (envelope_id,schema,repo,project,base_branch,payload_sha256,producer_host_id,producer_session_generation,route,destination,known_hosts_sha256,executable_sha256,issued_at,expires_at,imported_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+                params![
+                    envelope.envelope_id,
+                    envelope.schema,
+                    repository,
+                    project,
+                    envelope.base_branch,
+                    envelope.payload_sha256.as_str(),
+                    envelope.producer_host_id,
+                    incoming.producer_session_generation,
+                    route,
+                    envelope.destination,
+                    envelope.known_hosts_sha256.as_str(),
+                    envelope.executable_sha256.as_str(),
+                    envelope.issued_at.to_rfc3339(),
+                    envelope.expires_at.to_rfc3339(),
+                    Utc::now().to_rfc3339(),
+                ],
+            )?;
+        }
+        let mut imported = 0;
+        for receipt in &envelope.receipts {
+            imported += usize::from(Self::insert_merge_receipt_tx(&tx, receipt)?);
+            let receipt_sha256 = digest_receipt(receipt)
+                .map_err(|error| format!("authenticated receipt digest failed: {error}"))?;
+            tx.execute(
+                "INSERT OR IGNORE INTO merge_receipt_handoff_receipts (envelope_id,receipt_id,receipt_sha256) VALUES (?1,?2,?3)",
+                params![envelope.envelope_id, receipt.receipt_id, receipt_sha256.as_str()],
+            )?;
+            let stored: String = tx.query_row(
+                "SELECT receipt_sha256 FROM merge_receipt_handoff_receipts WHERE envelope_id=?1 AND receipt_id=?2",
+                params![envelope.envelope_id, receipt.receipt_id],
                 |row| row.get(0),
-            ).optional()?;
-            if let Some(other) = semantic_conflict {
+            )?;
+            if stored != receipt_sha256.as_str() {
                 return Err(format!(
-                    "merge receipt {} conflicts with semantic receipt {other}",
-                    receipt.receipt_id
+                    "authenticated handoff {} conflicts with receipt provenance",
+                    envelope.envelope_id
                 )
                 .into());
             }
-            tx.execute("INSERT INTO merge_receipts (receipt_id,schema,repo,project,base_branch,pr,head_sha,validated_head_sha,merge_commit_sha,merged_at,safe_merge,source,required_checks_json,gate_receipt_sha256,evidence,imported_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,1,?11,?12,?13,?14,?15)", rusqlite::params![receipt.receipt_id, receipt.schema, repo, project, receipt.base_branch, receipt.pr, receipt.head_sha, receipt.validated_head_sha, receipt.merge_commit_sha, receipt.merged_at.to_rfc3339(), receipt.source, serde_json::to_string(&receipt.required_checks)?, receipt.gate_receipt_sha256, receipt.evidence, Utc::now().to_rfc3339()])?;
-            imported += 1;
         }
         tx.commit()?;
         Ok(imported)
@@ -1174,12 +1445,46 @@ impl MetricsStore {
         project: &str,
         cutoff: &str,
     ) -> Result<SafeMergeSummary, Box<dyn std::error::Error>> {
+        self.safe_merge_summary_filtered(project, cutoff, false)
+    }
+
+    /// Count only safe merges joined to an authenticated handoff envelope.
+    /// Legacy v1 rows remain queryable through `safe_merge_summary` but are
+    /// excluded from this opt-in denominator until provenance is attached.
+    #[allow(dead_code)] // Callers opt into authenticated denominators when transport wiring is enabled.
+    pub(crate) fn authenticated_safe_merge_summary(
+        &self,
+        project: &str,
+        cutoff: &str,
+    ) -> Result<SafeMergeSummary, Box<dyn std::error::Error>> {
+        self.safe_merge_summary_filtered(project, cutoff, true)
+    }
+
+    fn safe_merge_summary_filtered(
+        &self,
+        project: &str,
+        cutoff: &str,
+        authenticated_only: bool,
+    ) -> Result<SafeMergeSummary, Box<dyn std::error::Error>> {
         let conn = self.connect()?;
         let key = crate::metrics::project_key::ProjectKey::parse(project);
         let (any, short, full) = crate::metrics::project_key::sql_params(key.as_ref());
         let project_filter = crate::metrics::project_key::sql_filter("project", "repo");
         let safe: Vec<(String, String, i64)> = {
-            let mut q = conn.prepare(&format!("SELECT repo, head_sha, pr FROM merge_receipts WHERE {project_filter} AND safe_merge = 1 AND required_checks_json <> '[]' AND length(gate_receipt_sha256) = 64 AND julianday(merged_at) >= julianday(?4)"))?;
+            let auth_filter = if authenticated_only {
+                " AND EXISTS (
+                    SELECT 1
+                    FROM merge_receipt_handoff_receipts hhr
+                    JOIN merge_receipt_handoffs h ON h.envelope_id = hhr.envelope_id
+                    WHERE hhr.receipt_id = merge_receipts.receipt_id
+                      AND h.repo = merge_receipts.repo
+                      AND h.project = merge_receipts.project
+                      AND h.base_branch = merge_receipts.base_branch
+                )"
+            } else {
+                ""
+            };
+            let mut q = conn.prepare(&format!("SELECT repo, head_sha, pr FROM merge_receipts WHERE {project_filter} AND safe_merge = 1 AND required_checks_json <> '[]' AND length(gate_receipt_sha256) = 64 AND julianday(merged_at) >= julianday(?4){auth_filter}"))?;
             q.query_map(rusqlite::params![any, short, full, cutoff], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })?
@@ -2757,7 +3062,9 @@ fn migrate_repeated_work_shadow(conn: &Connection) -> Result<(), rusqlite::Error
            superseded_sha TEXT NOT NULL
          );
          CREATE INDEX IF NOT EXISTS repeated_work_shadow_observed_at
-           ON repeated_work_shadow(observed_at DESC);",
+           ON repeated_work_shadow(observed_at DESC);
+         CREATE INDEX IF NOT EXISTS repeated_work_shadow_superseded_job
+           ON repeated_work_shadow(superseded_job_id);",
     )
 }
 
@@ -3928,6 +4235,53 @@ mod tests {
         }
     }
 
+    fn test_authenticated_envelope(
+        envelope_id: &str,
+        repository: &str,
+        project: &str,
+        receipts: Vec<crate::metrics::merge_receipt::MergeReceipt>,
+    ) -> crate::metrics::merge_receipt_handoff::AuthenticatedHandoffEnvelope {
+        let payload_sha256 =
+            crate::metrics::merge_receipt_handoff::digest_receipts(&receipts).unwrap();
+        crate::metrics::merge_receipt_handoff::AuthenticatedHandoffEnvelope {
+            schema: crate::metrics::merge_receipt_handoff::SCHEMA.to_owned(),
+            envelope_id: envelope_id.to_owned(),
+            repository: repository.to_owned(),
+            project: project.to_owned(),
+            base_branch: "main".to_owned(),
+            payload_sha256,
+            receipts,
+            producer_host_id: "m1".to_owned(),
+            producer_session_generation: 7,
+            route: crate::parallel_proof_canary::CanaryRoute::Lan,
+            destination: "shipyard@m1.local".to_owned(),
+            known_hosts_sha256: crate::parallel_proof::Sha256Digest::of_bytes(b"known-hosts"),
+            executable_sha256: crate::parallel_proof::Sha256Digest::of_bytes(b"shipyard"),
+            issued_at: "2026-10-28T00:00:00Z".parse().unwrap(),
+            expires_at: "2026-10-28T00:10:00Z".parse().unwrap(),
+        }
+    }
+
+    fn test_authenticated_context(
+        repository: &str,
+        project: &str,
+    ) -> crate::metrics::merge_receipt_handoff::AuthenticatedProducerContext {
+        crate::metrics::merge_receipt_handoff::AuthenticatedProducerContext {
+            repository: repository.to_owned(),
+            project: project.to_owned(),
+            base_branch: "main".to_owned(),
+            producer_host_id: "m1".to_owned(),
+            producer_session_generation: 7,
+            route: crate::parallel_proof_canary::CanaryRoute::Lan,
+            destination: "shipyard@m1.local".to_owned(),
+            known_hosts_sha256: crate::parallel_proof::Sha256Digest::of_bytes(b"known-hosts"),
+            executable_sha256: crate::parallel_proof::Sha256Digest::of_bytes(b"shipyard"),
+            now: "2026-10-28T00:05:00Z".parse().unwrap(),
+            max_age: Duration::minutes(15),
+            max_future_skew: Duration::minutes(2),
+        }
+    }
+
     fn test_capacity_sample(
         observed_at: DateTime<Utc>,
         host: &str,
@@ -4088,6 +4442,130 @@ mod tests {
         let mut changed = first;
         changed.evidence = "sha256:changed".into();
         assert!(store.import_merge_receipts(&[changed]).is_err());
+    }
+
+    #[test]
+    fn authenticated_handoff_persists_fence_and_is_replay_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        let repository = "owner/repo";
+        let receipts = vec![
+            test_receipt("auth-1", repository, "owner/repo", 1, 'a'),
+            test_receipt("auth-2", repository, "owner/repo", 2, 'b'),
+        ];
+        let envelope =
+            test_authenticated_envelope("auth-envelope-1", repository, "owner/repo", receipts);
+        let context = test_authenticated_context(repository, "owner/repo");
+        assert_eq!(
+            store
+                .authenticated_safe_merge_summary("repo", "1970-01-01T00:00:00Z")
+                .unwrap()
+                .0,
+            0
+        );
+        assert_eq!(
+            store
+                .import_authenticated_merge_receipt_handoff(&envelope, &context)
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            store
+                .import_authenticated_merge_receipt_handoff(&envelope, &context)
+                .unwrap(),
+            0
+        );
+        let mut expired_context = context.clone();
+        expired_context.now = "2026-10-28T01:00:00Z".parse().unwrap();
+        assert_eq!(
+            store
+                .import_authenticated_merge_receipt_handoff(&envelope, &expired_context)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .authenticated_safe_merge_summary("repo", "1970-01-01T00:00:00Z")
+                .unwrap()
+                .0,
+            2
+        );
+        let conn = store.connect().unwrap();
+        let counts: (i64, i64, i64, String) = conn
+            .query_row(
+                "SELECT (SELECT count(*) FROM merge_receipt_handoffs), (SELECT count(*) FROM merge_receipt_handoff_receipts), (SELECT count(*) FROM merge_receipts), (SELECT project FROM merge_receipt_handoffs WHERE envelope_id='auth-envelope-1')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (1, 2, 2, "repo".to_owned()));
+        assert!(
+            conn.execute(
+                "UPDATE merge_receipts SET safe_merge=0 WHERE receipt_id='auth-1'",
+                [],
+            )
+            .is_err()
+        );
+        conn.execute(
+            "UPDATE merge_receipt_handoffs SET project='other' WHERE envelope_id='auth-envelope-1'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .authenticated_safe_merge_summary("repo", "1970-01-01T00:00:00Z")
+                .unwrap()
+                .0,
+            0
+        );
+        conn.execute(
+            "UPDATE merge_receipt_handoffs SET project='repo' WHERE envelope_id='auth-envelope-1'",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn authenticated_handoff_attaches_to_legacy_rows_and_rejects_conflicts_atomically() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        let repository = "owner/repo";
+        let receipt = test_receipt("auth-legacy", repository, "repo", 1, 'a');
+        store
+            .import_merge_receipts(std::slice::from_ref(&receipt))
+            .unwrap();
+        let envelope = test_authenticated_envelope(
+            "auth-envelope-legacy",
+            repository,
+            "repo",
+            vec![receipt.clone()],
+        );
+        let context = test_authenticated_context(repository, "repo");
+        assert_eq!(
+            store
+                .import_authenticated_merge_receipt_handoff(&envelope, &context)
+                .unwrap(),
+            0
+        );
+        let mut conflicting = envelope.clone();
+        conflicting.envelope_id = "auth-envelope-conflict".to_owned();
+        conflicting.receipts[0].evidence = "sha256:changed".to_owned();
+        conflicting.payload_sha256 =
+            crate::metrics::merge_receipt_handoff::digest_receipts(&conflicting.receipts).unwrap();
+        assert!(
+            store
+                .import_authenticated_merge_receipt_handoff(&conflicting, &context)
+                .is_err()
+        );
+        let conn = store.connect().unwrap();
+        let counts: (i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT count(*) FROM merge_receipt_handoffs), (SELECT count(*) FROM merge_receipt_handoff_receipts)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (1, 1));
     }
 
     #[test]
@@ -5737,6 +6215,76 @@ mod tests {
     }
 
     #[test]
+    fn repeated_work_cost_rejects_nonpositive_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        for since_days in [0, -1] {
+            for limit in [0, 100] {
+                let error = store.repeated_work_cost(limit, since_days).unwrap_err();
+                assert_eq!(
+                    error.to_string(),
+                    "repeated-work baseline window must be positive"
+                );
+            }
+        }
+        let valid = store.repeated_work_cost(100, 1).unwrap();
+        assert_eq!(valid.observations, 0);
+        assert_eq!(valid.duration_ms, None);
+    }
+
+    #[test]
+    fn repeated_work_cost_only_joins_case_sensitive_queue_ids_without_separators() {
+        // Matching clean timing rows make each rejection exercise the ID guard,
+        // rather than pass because timing was absent.
+        for (id, joins) in [
+            ("sy-a-b", true),
+            ("sy-a/b", false),
+            ("sy-a\\b", false),
+            ("SY-a-b", false),
+            ("Sy-a-b", false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = MetricsStore::open(dir.path()).unwrap();
+            store
+                .record_queue_terminal(
+                    QUEUE_AUTHORITY_TOKEN,
+                    &QueueTerminalTiming {
+                        queue_job_id: id.into(),
+                        queue_identity: format!("identity-{id}"),
+                        disposition: "clean".into(),
+                        started_at: Some(Utc::now()),
+                        completed_at: Some(Utc::now()),
+                        total_ms: Some(99),
+                    },
+                )
+                .unwrap();
+            store
+                .record_repeated_work_shadow(&RepeatedWorkShadowInput {
+                    kind: RepeatedWorkKind::SupersededExactHead,
+                    branch: "main".into(),
+                    sha: "head".into(),
+                    target_config: "cfg".into(),
+                    mode: "normal".into(),
+                    job_id: "sy-survivor".into(),
+                    superseded_job_id: id.into(),
+                    superseded_sha: "old".into(),
+                })
+                .unwrap();
+            let summary = store.repeated_work_cost(100, 14).unwrap();
+            assert_eq!(summary.observations, 1, "{id}");
+            assert_eq!(summary.shadow_rows, 1, "{id}");
+            assert_eq!(summary.distinct_superseded_jobs, 1, "{id}");
+            assert_eq!(summary.joined_durations, usize::from(joins), "{id}");
+            assert_eq!(summary.matched_clean, usize::from(joins), "{id}");
+            assert_eq!(summary.unknown_durations, usize::from(!joins), "{id}");
+            assert_eq!(summary.unmatched, usize::from(!joins), "{id}");
+            assert_eq!(summary.duration_ms, joins.then_some(99), "{id}");
+            assert_eq!(summary.timing_basis, "superseded_queue_job_runtime");
+            assert!(summary.final_attempt_only);
+        }
+    }
+
+    #[test]
     fn repeated_work_cost_keeps_all_unlinked_ids_unknown() {
         let dir = tempfile::tempdir().unwrap();
         let store = MetricsStore::open(dir.path()).unwrap();
@@ -5995,11 +6543,288 @@ mod tests {
         );
     }
 
+    fn retention_shadow(conn: &Connection, timestamp: &str, superseded: &str) {
+        conn.execute(
+            "INSERT INTO repeated_work_shadow
+             (observed_at, kind, branch, sha, target_config, mode, job_id,
+              superseded_job_id, superseded_sha)
+             VALUES (?1, 'superseded_exact_head', 'main', 'new', 'cfg', 'normal',
+                     'sy-new', ?2, 'old')",
+            params![timestamp, superseded],
+        )
+        .unwrap();
+    }
+
+    fn retention_timing(conn: &Connection, id: &str, timestamp: &str, disposition: &str) {
+        conn.execute(
+            "INSERT INTO queue_timing
+             (queue_job_id, queue_identity, disposition, recorded_at, total_ms)
+             VALUES (?1, 'identity', ?2, ?3, ?4)",
+            params![
+                id,
+                disposition,
+                timestamp,
+                (disposition == "clean").then_some(10)
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn metrics_retention_prunes_observations_across_batches_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let conn = store.connect().unwrap();
+        for i in 0..501 {
+            let id = format!("sy-old-{i}");
+            retention_shadow(&conn, "2000-01-01T00:00:00Z", &id);
+            retention_timing(
+                &conn,
+                &id,
+                "2000-01-01T00:00:00Z",
+                ["clean", "cancelled_mid_run", "uncertain"][i % 3],
+            );
+        }
+        retention_shadow(&conn, &Utc::now().to_rfc3339(), "sy-fresh");
+        retention_timing(&conn, "sy-fresh", &Utc::now().to_rfc3339(), "clean");
+        retention_timing(
+            &conn,
+            "sy-fresh-unreferenced",
+            &Utc::now().to_rfc3339(),
+            "uncertain",
+        );
+        assert_eq!(store.prune_older_than(90).unwrap(), 1002);
+        assert_eq!(store.repeated_work_shadow(1000).unwrap().len(), 1);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM queue_timing", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(store.prune_older_than(90).unwrap(), 0);
+    }
+
+    #[test]
+    fn metrics_retention_preserves_recent_shadow_timing_join_until_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let conn = store.connect().unwrap();
+        retention_timing(&conn, "sy-old", "2000-01-01T00:00:00Z", "clean");
+        retention_shadow(&conn, &Utc::now().to_rfc3339(), "sy-old");
+        let before = store.repeated_work_superseded_timing(10, 90).unwrap();
+        assert_eq!(before.matched_clean, 1);
+        assert_eq!(before.superseded_runtime_ms, Some(10));
+        assert_eq!(store.prune_older_than(90).unwrap(), 0);
+        assert_eq!(
+            store.repeated_work_superseded_timing(10, 90).unwrap(),
+            before
+        );
+        conn.execute(
+            "UPDATE repeated_work_shadow SET observed_at='2000-01-01T00:00:00Z'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(store.prune_older_than(90).unwrap(), 2);
+        assert_eq!(store.prune_older_than(90).unwrap(), 0);
+    }
+
+    #[test]
+    fn metrics_retention_preserves_malformed_dates_and_compares_offsets() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let conn = store.connect().unwrap();
+        let cutoff = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        for timestamp in ["invalid", "2000", "2000-02-30T00:00:00Z"] {
+            retention_shadow(&conn, timestamp, "sy-protected");
+            retention_timing(&conn, timestamp, timestamp, "uncertain");
+        }
+        retention_timing(&conn, "sy-protected", "2000-01-01T00:00:00Z", "clean");
+        for (id, timestamp) in [
+            ("sy-equal", "2025-12-31T19:00:00-05:00"),
+            ("sy-future", "2025-12-31T23:00:00-02:00"),
+            ("sy-expired", "2026-01-01T01:00:00+02:00"),
+        ] {
+            retention_shadow(&conn, timestamp, id);
+            retention_timing(&conn, id, timestamp, "clean");
+        }
+        assert_eq!(store.prune_queue_observations(cutoff).unwrap(), 2);
+        assert_eq!(store.repeated_work_shadow(20).unwrap().len(), 5);
+        for id in [
+            "sy-equal",
+            "sy-future",
+            "sy-protected",
+            "invalid",
+            "2000",
+            "2000-02-30T00:00:00Z",
+        ] {
+            assert!(store.read_queue_timing(id).unwrap().is_some(), "{id}");
+        }
+        assert_eq!(store.prune_queue_observations(cutoff).unwrap(), 0);
+    }
+
+    #[test]
+    fn metrics_retention_migrates_shadow_only_store() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("metrics")).unwrap();
+        let conn = Connection::open(dir.path().join("metrics/metrics.db")).unwrap();
+        migrate_repeated_work_shadow(&conn).unwrap();
+        retention_shadow(&conn, "2000-01-01T00:00:00Z", "sy-old");
+        for reopen in [false, true] {
+            if reopen {
+                MetricsStore::open(dir.path()).unwrap();
+            }
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='index'
+                     AND name='repeated_work_shadow_superseded_job'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                1
+            );
+        }
+        let store = MetricsStore::open(dir.path()).unwrap();
+        assert_eq!(store.prune_older_than(90).unwrap(), 1);
+    }
+
+    #[test]
+    fn metrics_retention_disabled_or_extreme_window_does_not_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        retention_shadow(&store.connect().unwrap(), "2000-01-01T00:00:00Z", "sy-old");
+        assert_eq!(store.prune_older_than(0).unwrap(), 0);
+        assert_eq!(store.prune_older_than(-1).unwrap(), 0);
+        assert!(store.prune_older_than(i64::MAX).is_err());
+        assert_eq!(store.repeated_work_shadow(10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn retention_indexes_are_idempotent_and_drive_cleanup_plans() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let expected = [
+            "metrics_jobs_run_id",
+            "metrics_runs_retention",
+            "metrics_steps_job_id",
+        ];
+        let index_names = |store: &MetricsStore| {
+            let conn = store.connect().unwrap();
+            let mut statement = conn
+                .prepare(
+                    "SELECT name FROM sqlite_master
+                     WHERE type = 'index' AND name LIKE 'metrics_%'
+                     ORDER BY name",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(index_names(&store), expected);
+
+        {
+            let conn = store.connect().unwrap();
+            conn.execute("DROP INDEX metrics_runs_retention", [])
+                .unwrap();
+            conn.execute("DROP INDEX metrics_jobs_run_id", []).unwrap();
+            conn.execute("DROP INDEX metrics_steps_job_id", []).unwrap();
+        }
+        store.migrate().unwrap();
+        assert_eq!(index_names(&store), expected);
+
+        let mut conn = store.connect().unwrap();
+        let transaction = conn.transaction().unwrap();
+        for id in 1..=4_000_i64 {
+            let timestamp = if id <= 2_000 {
+                "2020-01-01T00:00:00Z"
+            } else {
+                "2030-01-01T00:00:00Z"
+            };
+            transaction
+                .execute(
+                    "INSERT INTO runs (id, ts, project, status)
+                     VALUES (?1, ?2, 'pulp', 'success')",
+                    params![id, timestamp],
+                )
+                .unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO jobs (id, run_id, job, status)
+                     VALUES (?1, ?1, 'job', 'success')",
+                    params![id],
+                )
+                .unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO steps (id, job_id, step, duration_ms, status)
+                     VALUES (?1, ?1, 'build', 1, 'success')",
+                    params![id],
+                )
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+
+        let plan_detail = |query: &str, parameter: &str| {
+            conn.query_row(&format!("EXPLAIN QUERY PLAN {query}"), [parameter], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+        };
+        let runs_plan = plan_detail(
+            "SELECT id FROM runs WHERE ts < ?1 ORDER BY ts, id LIMIT 250",
+            "2025-01-01T00:00:00Z",
+        );
+        let jobs_plan = plan_detail("SELECT id FROM jobs WHERE run_id = ?1", "1");
+        let steps_plan = plan_detail("SELECT id FROM steps WHERE job_id = ?1", "1");
+        assert!(
+            runs_plan.contains("SEARCH runs USING COVERING INDEX metrics_runs_retention"),
+            "unexpected runs plan: {runs_plan}"
+        );
+        assert!(
+            jobs_plan.contains("SEARCH jobs USING COVERING INDEX metrics_jobs_run_id"),
+            "unexpected jobs plan: {jobs_plan}"
+        );
+        assert!(
+            steps_plan.contains("SEARCH steps USING COVERING INDEX metrics_steps_job_id"),
+            "unexpected steps plan: {steps_plan}"
+        );
+    }
+
     #[test]
     fn metrics_retention_prunes_raw_samples_but_keeps_receipts() {
         let dir = tempfile::tempdir().unwrap();
         let store = MetricsStore::open(dir.path()).unwrap();
         let old = Utc::now() - Duration::days(120);
+        let mut receipt = test_receipt("retained", "o/pulp", "pulp", 42, 'a');
+        receipt.merged_at = old;
+        store
+            .import_merge_receipts(std::slice::from_ref(&receipt))
+            .unwrap();
+        let ships = crate::ship_state::ShipStateStore::new(dir.path().join("ship")).unwrap();
+        let mut open =
+            crate::ship_state::ShipState::new(43, "o/pulp", "feature", "main", "head", "policy");
+        open.updated_at = old;
+        ships.save(&open).unwrap();
+        let mut queue = crate::queue::Queue::new(dir.path()).unwrap();
+        let mut pending = crate::job::Job::create(
+            "head",
+            "feature",
+            vec!["test".into()],
+            crate::job::ValidationMode::Full,
+            crate::job::Priority::Normal,
+        );
+        pending.created_at = old;
+        queue.enqueue(pending.clone()).unwrap();
+        let recovery = dir.path().join("queue/recovery/retained.json");
+        fs::create_dir_all(recovery.parent().unwrap()).unwrap();
+        let recovery_bytes = b"opaque recovery authority must remain byte-identical";
+        fs::write(&recovery, recovery_bytes).unwrap();
+        retention_shadow(&store.connect().unwrap(), "2000-01-01T00:00:00Z", "sy-old");
         store
             .record(&MetricRecordInput {
                 project: "pulp".into(),
@@ -6010,12 +6835,91 @@ mod tests {
                 ..MetricRecordInput::default()
             })
             .unwrap();
-        assert_eq!(store.prune_older_than(90).unwrap(), 1);
+        assert_eq!(store.prune_older_than(90).unwrap(), 2);
+        assert_eq!(
+            store.export_merge_receipts("o/pulp").unwrap(),
+            vec![receipt]
+        );
+        assert_eq!(ships.get_scoped("o/pulp", 43).unwrap().updated_at, old);
+        assert_eq!(queue.get(&pending.id).unwrap(), Some(pending));
+        assert_eq!(fs::read(&recovery).unwrap(), recovery_bytes);
+        assert_eq!(store.prune_older_than(90).unwrap(), 0);
         let conn = store.connect().unwrap();
         assert_eq!(
             conn.query_row("SELECT count(*) FROM runs", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn metrics_retention_prunes_multiple_batches_and_preserves_live_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let old = Utc::now() - Duration::days(120);
+        for pr in 1..=300 {
+            insert_scorecard_sample_at(
+                &store,
+                "pulp",
+                pr,
+                "success",
+                10,
+                0,
+                false,
+                old.to_rfc3339(),
+            );
+        }
+        insert_scorecard_sample(&store, "pulp", 301, "success", 10, 0, false);
+
+        let old_capacity = test_capacity_sample(old, "m3", "verified");
+        store
+            .import_fleet_capacity(&serde_json::to_string(&old_capacity).unwrap())
+            .unwrap();
+        let cutoff = Utc::now() - Duration::days(90);
+        let overlapping_capacity =
+            test_capacity_sample(cutoff - Duration::minutes(1), "m5", "verified");
+        store
+            .import_fleet_capacity(&serde_json::to_string(&overlapping_capacity).unwrap())
+            .unwrap();
+        store
+            .import_merge_receipts(&[test_receipt(
+                "retention-kept",
+                "owner/repo",
+                "repo",
+                301,
+                'a',
+            )])
+            .unwrap();
+
+        assert_eq!(store.prune_older_than(90).unwrap(), 301);
+        let conn = store.connect().unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM runs", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM jobs", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM steps", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM fleet_capacity_samples", [], |row| row
+                .get::<_, i64>(0),)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM merge_receipts", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            1
         );
     }
 

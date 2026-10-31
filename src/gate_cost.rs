@@ -57,7 +57,10 @@ pub type SyncGhReader<'a> = dyn Fn(&[String]) -> Result<String, String> + Sync +
 /// terminal escape sequences refuses such a response unless asked, so the
 /// read asks; a `gh` too old to know the flag rejects it as unknown, and then
 /// the bare read is the one that works.
-pub fn fetch_job_log(gh: &SyncGhReader<'_>, repo: &str, job_id: u64) -> Result<String, String> {
+pub fn fetch_job_log<F>(gh: &F, repo: &str, job_id: u64) -> Result<String, String>
+where
+    F: Fn(&[String]) -> Result<String, String> + ?Sized,
+{
     let path = format!("repos/{repo}/actions/jobs/{job_id}/logs");
     match gh(&[
         "api".to_owned(),

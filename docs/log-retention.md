@@ -99,3 +99,23 @@ its environment must be updated through its normal deployment path and the
 process restarted. This control installs or restarts nothing itself. Retention
 is separate: `SHIPYARD_METRICS_RETENTION_DAYS` changes the cleanup window; larger
 values keep longer history and nonpositive values disable pruning, not collection.
+
+## Metrics observations
+
+`shipyard cleanup --apply` also prunes raw metric runs and fleet-capacity samples,
+repeated-work shadow observations, and terminal queue timing after 90 days.
+`SHIPYARD_METRICS_RETENTION_DAYS` changes this existing window; larger values keep
+longer history and nonpositive values disable pruning, not collection. Extreme
+positive values outside the timestamp range report a skipped prune.
+
+Shadow observations expire by `observed_at`; timing expires by `recorded_at`
+only when no retained shadow observation references it. This keeps recent
+repeated-work reports joined to older superseded jobs. Malformed observation
+timestamps are retained conservatively. The observation scan uses transactions
+of at most 250 rows and a fixed endpoint for each table. Cleanup counts raw runs
+and observational rows removed, excluding the runs' child jobs and steps.
+
+Merge receipts, OPEN ship state, queue ownership, and recovery records are not
+part of metrics pruning. Cleanup must be invoked; this adds no scheduler or
+collection-disable switch. SQLite can reuse deleted pages without shrinking the
+database file, so age retention is not a hard byte ceiling.
