@@ -648,6 +648,12 @@ def validate_state_layout(db: pathlib.Path) -> pathlib.Path:
     return state_dir
 
 
+def coverage_value_text(coverage: Any) -> str:
+    """Render an optional scorecard value without turning unavailable into None."""
+    value = coverage.get("value") if isinstance(coverage, dict) else None
+    return "n/a" if value is None else str(value)
+
+
 def authoritative_scorecard(args: argparse.Namespace) -> dict[str, Any]:
     validate_project_repo(args.project, args.repo)
     state_dir = validate_state_layout(args.db)
@@ -669,6 +675,13 @@ def authoritative_scorecard(args: argparse.Namespace) -> dict[str, Any]:
             "reason": "scorecard did not report a safe-merge denominator",
         }
     )
+    safe_merge_rate = card.get("safely_merged_changes_per_eligible_slot_hour")
+    card["collector_safe_merge_rate"] = (
+        dict(safe_merge_rate) if isinstance(safe_merge_rate, dict) else {
+            "status": "unavailable", "value": None,
+            "reason": "scorecard did not report a safe-merge rate",
+        }
+    )
     card.pop("database", None)
     return consume_authenticated_strata(card, repo=args.repo, since_days=args.since_days,
                                         reference_at=dt.datetime.now(dt.timezone.utc))
@@ -679,6 +692,8 @@ def force_receipt_metrics_unavailable(card: dict[str, Any], reason: str) -> None
     unavailable = {"status": "unavailable", "value": None, "reason": reason}
     card["safely_merged_changes"] = dict(unavailable)
     card["collector_safe_merge_denominator"] = dict(unavailable)
+    card["safely_merged_changes_per_eligible_slot_hour"] = dict(unavailable)
+    card["collector_safe_merge_rate"] = dict(unavailable)
     card["wasted_compute_per_safely_merged_change"] = dict(unavailable)
 
 
@@ -1075,6 +1090,7 @@ def main() -> int:
             f"- Baseline report complete: **{'yes' if state['baseline_readiness'].get('report_complete') else 'no'}**\n"
             f"- Optimization eligibility: **{'yes' if state['baseline_readiness'].get('optimization_eligible') else 'no'}**\n"
             f"- Safely merged denominator: **{card.get('collector_safe_merge_denominator', {}).get('status', 'unavailable')}**\n"
+            f"- Safely merged changes per eligible slot-hour: **{card.get('collector_safe_merge_rate', {}).get('status', 'unavailable')}** ({coverage_value_text(card.get('collector_safe_merge_rate'))})\n"
             f"- Provenance: **{card.get('provenance_status', 'unverified_organic_input')}**.\n"
             f"- Strata: **{len(REQUIRED_STRATA) - len(card.get('missing_strata', REQUIRED_STRATA))}/{len(REQUIRED_STRATA)} sufficient**; authenticated producer records only.\n\n"
             "Synthetic provenance, unavailable phases, and merge denominators are not imputed.\n"

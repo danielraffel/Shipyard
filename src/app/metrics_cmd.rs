@@ -534,7 +534,7 @@ pub(super) fn metrics_command<W: Write>(
                 };
                 text.push_str(&scorecard_proxy_lines(&scorecard));
                 let coverage = format!(
-                    "{}: {} jobs, {:.2} worker-minutes, {} PRs over {}d; worker-minutes coverage={} ({}); PR coverage={} ({}); submit-to-receipt={} ({}); model-tokens={} ({})",
+                    "{}: {} jobs, {:.2} worker-minutes, {} PRs over {}d; worker-minutes coverage={} ({}); PR coverage={} ({}); safe-merge-rate={}={} ({}); submit-to-receipt={} ({}); model-tokens={} ({})",
                     scorecard.project,
                     scorecard.job_samples,
                     scorecard.worker_minutes,
@@ -544,6 +544,16 @@ pub(super) fn metrics_command<W: Write>(
                     scorecard.worker_minutes_coverage.reason,
                     scorecard.pull_request_throughput.status,
                     scorecard.pull_request_throughput.reason,
+                    scorecard
+                        .safely_merged_changes_per_eligible_slot_hour
+                        .status,
+                    scorecard
+                        .safely_merged_changes_per_eligible_slot_hour
+                        .value
+                        .map_or_else(|| "n/a".to_owned(), |value| format!("{value:.6}")),
+                    scorecard
+                        .safely_merged_changes_per_eligible_slot_hour
+                        .reason,
                     scorecard.submit_to_receipt.status,
                     scorecard.submit_to_receipt.reason,
                     scorecard.model_token_use.status,
@@ -659,20 +669,7 @@ fn import_tartci(
     store: &MetricsStore,
     args: &MetricsImportTartciArgs,
 ) -> Result<usize, CliFailure> {
-    let mut text = String::new();
-    match args.file.as_ref().and_then(|path| path.to_str()) {
-        None | Some("-") => {
-            std::io::stdin()
-                .read_to_string(&mut text)
-                .map_err(|error| CliFailure::new(1, format!("stdin read failed: {error}")))?;
-        }
-        Some(_) => {
-            let path = args.file.as_ref().expect("file path");
-            text = std::fs::read_to_string(path).map_err(|error| {
-                CliFailure::new(1, format!("could not read {}: {error}", path.display()))
-            })?;
-        }
-    }
+    let text = read_metrics_import_text(args.file.as_deref())?;
     store
         .import_tartci(&text)
         .map_err(|error| CliFailure::new(1, format!("tartci import failed: {error}")))
@@ -682,23 +679,32 @@ fn import_fleet_capacity(
     store: &MetricsStore,
     args: &MetricsImportFleetCapacityArgs,
 ) -> Result<usize, CliFailure> {
-    let mut text = String::new();
-    match args.file.as_ref().and_then(|path| path.to_str()) {
-        None | Some("-") => {
-            std::io::stdin()
-                .read_to_string(&mut text)
-                .map_err(|error| CliFailure::new(1, format!("stdin read failed: {error}")))?;
-        }
-        Some(_) => {
-            let path = args.file.as_ref().expect("file path");
-            text = std::fs::read_to_string(path).map_err(|error| {
-                CliFailure::new(1, format!("could not read {}: {error}", path.display()))
-            })?;
-        }
-    }
+    let text = read_metrics_import_text(args.file.as_deref())?;
     store
         .import_fleet_capacity(&text)
         .map_err(|error| CliFailure::new(1, format!("fleet-capacity import failed: {error}")))
+}
+
+fn read_metrics_import_text(file: Option<&Path>) -> Result<String, CliFailure> {
+    match file {
+        None => {
+            let mut text = String::new();
+            std::io::stdin()
+                .read_to_string(&mut text)
+                .map_err(|error| CliFailure::new(1, format!("stdin read failed: {error}")))?;
+            Ok(text)
+        }
+        Some(path) if path == Path::new("-") => {
+            let mut text = String::new();
+            std::io::stdin()
+                .read_to_string(&mut text)
+                .map_err(|error| CliFailure::new(1, format!("stdin read failed: {error}")))?;
+            Ok(text)
+        }
+        Some(path) => std::fs::read_to_string(path).map_err(|error| {
+            CliFailure::new(1, format!("could not read {}: {error}", path.display()))
+        }),
+    }
 }
 
 fn import_github(
@@ -1056,6 +1062,21 @@ mod tests {
         assert!(error.message().contains("timed out"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn metrics_import_non_utf8_path_does_not_fall_back_to_stdin() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let path_bytes = OsString::from_vec(vec![
+            b'm', b'i', b's', b's', b'i', b'n', b'g', b'-', 0xff, b'.', b'j', b's', b'o', b'n',
+        ]);
+        let path = Path::new(&path_bytes);
+        let error = read_metrics_import_text(Some(path)).expect_err("path read must fail");
+        assert_eq!(error.code, 1);
+        assert!(error.message().contains("could not read"));
+    }
+
     #[test]
     fn github_api_paths_are_absolute() {
         assert_eq!(
@@ -1197,6 +1218,7 @@ mod tests {
             "cache_hit_rate",
             "submit_to_receipt",
             "model_token_use",
+            "safely_merged_changes_per_eligible_slot_hour",
             "basis",
             "proxies",
             "comparison",
@@ -1438,6 +1460,7 @@ mod tests {
 
         assert!(output.contains("PR coverage=unavailable"));
         assert!(output.contains("worker-minutes coverage=unavailable"));
+        assert!(output.contains("safe-merge-rate=unavailable=n/a"));
         assert!(output.contains("submit-to-receipt=unavailable"));
         assert!(output.contains("model-tokens=unavailable"));
     }
