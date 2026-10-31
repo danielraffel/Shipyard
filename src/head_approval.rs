@@ -1879,16 +1879,24 @@ fn read_policy_inner(
         format!("repos/{repo}/contents/{CONFIG_PATH}?ref={base}"),
     ]) {
         Ok(raw) => raw,
-        Err(detail) if detail.contains("404") || detail.contains("Not Found") => {
+        Err(detail) if is_clean_not_found(&detail) => {
             if host_default && requires_review_by_default(repo) {
                 let mut policy = ApprovalPolicy::without_config(repo, host_default);
                 policy.signers = policy.signers.or_else(|| host_signers(repo));
                 return Ok(policy);
             }
             if missing_is_error {
-                return Err(PolicyReadError::Absent(format!(
-                    "{CONFIG_PATH} on {base} is absent; approval policy is required"
-                )));
+                // Absence is acted on (the steward dequeues on it), so one
+                // 404 is not enough: a second, independent read must agree.
+                return Err(match confirm_config_absent(run_gh, repo, base) {
+                    Ok(()) => PolicyReadError::Absent(format!(
+                        "{CONFIG_PATH} on {base} is absent; approval policy is required"
+                    )),
+                    Err(why) => PolicyReadError::Unreadable(format!(
+                        "{CONFIG_PATH} on {base} read as absent, but the absence is \
+                         unconfirmed ({why}); approval policy is required"
+                    )),
+                });
             }
             return Ok(ApprovalPolicy::default());
         }
@@ -1913,6 +1921,96 @@ fn read_policy_inner(
         .validate()
         .map(|()| policy)
         .map_err(PolicyReadError::Unreadable)
+}
+
+/// The `stderr` part of a `gh` failure message, which
+/// [`crate::cloud::GitHubError`] formats as `gh <args> failed with status
+/// <code>: <stderr>`; the whole message when it has no such prefix. The args
+/// name the repository, path and ref, so nothing about the HTTP outcome may be
+/// read from them.
+#[must_use]
+pub fn gh_error_stderr(detail: &str) -> &str {
+    const MARK: &str = " failed with status ";
+    detail
+        .find(MARK)
+        .and_then(|index| detail[index + MARK.len()..].split_once(": "))
+        .map_or(detail, |(_, stderr)| stderr)
+}
+
+/// The HTTP status `gh` reported in the stderr part of `detail`
+/// (`(HTTP 404)` or `HTTP 502:`), never one appearing in the command's own
+/// arguments.
+#[must_use]
+pub fn gh_error_http_status(detail: &str) -> Option<u16> {
+    // `gh` prints both `gh: Not Found (HTTP 404)` and `HTTP 502: Bad Gateway`.
+    let pattern = Regex::new(r"\(HTTP (\d{3})\)|\bHTTP (\d{3}):").expect("status pattern compiles");
+    pattern
+        .captures_iter(gh_error_stderr(detail))
+        .last()
+        .and_then(|capture| capture.get(1).or_else(|| capture.get(2)))
+        .and_then(|status| status.as_str().parse().ok())
+}
+
+/// Words that mark a 404 as a credential failure (an App installation or
+/// token that could not be minted) rather than a missing resource.
+const CREDENTIAL_FAILURE_MARKERS: &[&str] = &[
+    "installation",
+    "access_token",
+    "token",
+    "credential",
+    "ghapp",
+    "bad credentials",
+];
+
+/// Whether `detail` is `gh api`'s own plain not-found answer for the
+/// requested resource: `gh: Not Found (HTTP 404)` in stderr, and nothing that
+/// marks it as a credential or installation failure.
+#[must_use]
+pub fn is_clean_not_found(detail: &str) -> bool {
+    let stderr = gh_error_stderr(detail);
+    let lowered = stderr.to_ascii_lowercase();
+    gh_error_http_status(detail) == Some(404)
+        && stderr
+            .lines()
+            .any(|line| line.trim() == "gh: Not Found (HTTP 404)")
+        && !CREDENTIAL_FAILURE_MARKERS
+            .iter()
+            .any(|marker| lowered.contains(marker))
+}
+
+/// Confirm a config 404 with a second, independent read: the base branch must
+/// be readable with the same credentials, and the `.shipyard` directory on it
+/// must either be absent too or list no `config.toml`.
+fn confirm_config_absent(run_gh: RunGh<'_>, repo: &str, base: &str) -> Result<(), String> {
+    let branch = run_gh(&[
+        "api".to_owned(),
+        format!("repos/{repo}/branches/{base}"),
+        "--jq".to_owned(),
+        ".name".to_owned(),
+    ])
+    .map_err(|detail| format!("base branch unreadable: {}", gh_error_stderr(&detail)))?;
+    if branch.trim() != base {
+        return Err(format!("base branch read back as {:?}", branch.trim()));
+    }
+    let (directory, file) = CONFIG_PATH
+        .rsplit_once('/')
+        .unwrap_or((".shipyard", "config.toml"));
+    match run_gh(&[
+        "api".to_owned(),
+        format!("repos/{repo}/contents/{directory}?ref={base}"),
+        "--jq".to_owned(),
+        ".[].name".to_owned(),
+    ]) {
+        Ok(names) if names.lines().any(|name| name.trim() == file) => {
+            Err(format!("{directory} on {base} lists {file}"))
+        }
+        Ok(_) => Ok(()),
+        Err(detail) if is_clean_not_found(&detail) => Ok(()),
+        Err(detail) => Err(format!(
+            "{directory} on {base} unreadable: {}",
+            gh_error_stderr(&detail)
+        )),
+    }
 }
 
 /// Why [`read_policy_required`] produced no policy.

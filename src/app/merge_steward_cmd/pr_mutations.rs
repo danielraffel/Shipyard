@@ -225,13 +225,13 @@ pub(super) fn evaluate_head_gate(
     ledger: &StewardLedger,
 ) -> Result<(crate::head_approval::HeadGate, Vec<String>), String> {
     let run_gh = |argv: &[String]| actions.run_gh(argv).map_err(|error| error.to_string());
-    let excused = super::unapproved_admission::steward_dequeues(
+    let recorded = super::unapproved_admission::steward_removal_times(
         ledger,
         &observation.repo,
         pr.fact.number,
         head,
     );
-    let queue = &super::unapproved_admission::without_steward_removals(queue, head, excused);
+    let queue = &super::unapproved_admission::without_steward_removals(queue, head, &recorded);
     crate::head_approval::evaluate_with_policy_for_author_with_events(
         &run_gh,
         &observation.repo,
