@@ -70,6 +70,12 @@ but not durable, so a host that loses power or reboots right after a save
 could read back an empty or old state file and drop the PR's episode. Queue
 requests, execution receipts and queue-hold records use the same helper.
 
+Cleanup of aged active ship state is compare-and-delete: after the cleanup
+scan identifies a closed, stale `(repo, PR)` record, it reacquires that
+record's scoped lock and compares the complete state to the scanned snapshot.
+If a worker updated the record while the scan was in progress, the comparison
+fails and the newer evidence remains in place.
+
 ### Writer-domain audit boundary
 
 The per-PR `ShipStatePrLock` remains the semantic concurrency boundary for
@@ -394,7 +400,7 @@ slipped through anyway is `shipyard runner steward --arm-unqueued`.
 | `shipyard ship-state show`  | `get_scoped(checkout_repo, pr)`; unscoped fallback only when the PR number is unambiguous | None |
 | `shipyard ship-state discard` | `get_scoped(--repo, pr)`, or the only record with that PR number; refuses when several repositories share it (accepts any state, not only MERGED) | `archive_scoped(repo, pr)` (manual tombstone) |
 | `shipyard ship-state prune` | `list_active()`, then each record's PR lifecycle from GitHub, retried under the repository's current name when it was renamed | With `--apply`, `archive_scoped(repo, pr)` for MERGED or CLOSED only; open or unreadable records are kept, and an unreadable row carries the rename check's failure reason |
-| `shipyard cleanup --ship-state` | `prune(active_days=14, archive_days=30, closed_prs=...)` | Queries each active state's recorded repository and deletes aged-out active state only for the matching closed `(repo, PR)`, plus aged archives. Unlinks are unguarded — a failure raises. |
+| `shipyard cleanup --ship-state` | `prune(active_days=14, archive_days=30, closed_prs=...)` | Queries each active state's recorded repository and compare-and-deletes aged-out active state only for the matching closed `(repo, PR)` while holding that record's scoped lock; a changed snapshot is kept. Also removes aged archives. Unlinks are unguarded — a failure raises. |
 | `shipyard runner recovery-worker` | Durable steward recovery requests plus the live exact PR head; trusted machine-global `[merge_steward.recovery_worker]` only | Without `--apply`, no writes and no model launch. With `--apply`, claims at most one request by default and persists a bounded terminal escalation/failure receipt; it never writes ship state or GitHub/queue/merge/release state. |
 
 The daemon's GitHub check-rollup reconciler may heal only dispatched runs whose
@@ -542,7 +548,7 @@ authoritative even when an unrelated hosted check has a similar target name.
 - **To:** `STATE_VERDICT_PASS`, `STATE_VERDICT_FAIL`, or still in flight (`None`)
 - **Computation:** `_ship_terminal_verdict(state)` at cli.py:3790
 - **Externals:** none
-- **⚠ Known bug — Bug B1.** The verdict is computed only from `evidence_snapshot.values()` (cli.py:3806) and `evidence_snapshot.items()` (cli.py:3812). The function does **not** check that every `DispatchedRun.target` has a matching evidence row. A ship that dispatched targets `[macos, ubuntu, windows]` and only persisted evidence for `[macos]` (all "pass") will be reported `STATE_VERDICT_PASS` — and `auto-merge` will proceed to `merge_pr`. This is the single highest-impact silent-failure candidate in the state machine; Phase B must have a dedicated regression test for it.
+- **Bug B1 is fixed.** `ship_terminal_verdict` in `src/watch.rs:131-177` first requires an evidence row for every required dispatched target. A ship that dispatched targets `[macos, ubuntu, windows]` and only persisted evidence for `[macos]` remains in flight (`None`); it cannot reach `STATE_VERDICT_PASS` or the merge path. The exact regression is `verdict_requires_terminal_evidence_for_all_required_targets` in `src/watch.rs`, covered by the current Rust library test suite. The older Python-era line references in this historical audit are retained elsewhere only as provenance; they are not current source locations.
 - **Other failure modes:** none — pure function.
 
 ### T5 — Merge on PASS
@@ -1122,7 +1128,7 @@ will fail the `state-machine` CI lane immediately.
 ## Silent-failure regression tests
 
 1. **Merge success hidden behind cleanup failure.** If `gh pr merge --delete-branch` merges on GitHub but fails while deleting a local branch checked out in another worktree, `auto-merge` must archive ship-state and exit 0 with a cleanup warning, not report `merge-failed`. Covered by `auto_merge_archives_when_merge_error_reports_already_merged`.
-2. **Partial evidence PASS (Bug B1).** Dispatch 3 targets, write evidence for only 1 (all "pass"), compute verdict. Today returns True. *Test:* seed a `ShipState` with `dispatched_runs=[T1, T2, T3]` and `evidence_snapshot={"T1":"pass"}`; `_ship_terminal_verdict(state)` must return `None`, not `True`. Proposed fix: extend the function to require an evidence row for every non-advisory `DispatchedRun.target`.
+2. **Partial evidence PASS (Bug B1).** Dispatch 3 targets, write evidence for only 1 (all "pass"), and compute the verdict. The current Rust implementation returns `None`, not `Some(true)`: `ship_terminal_verdict` requires evidence for every required `DispatchedRun.target`. The regression is covered by `verdict_requires_terminal_evidence_for_all_required_targets` in `src/watch.rs`; keep it as a negative control against premature merge readiness.
 3. **Ship-state tmp-write durability.** `ShipStateStore.save` already uses tmp+`os.replace` (core/ship_state.py:342). *Test:* inject an `os.replace` failure; assert the prior file is byte-identical. (Do NOT couple this test to `queue.json` — `Queue._save` uses a different write pattern on `main`; atomicity for that file lands in PR #105.)
 
 ## Phase B test plan

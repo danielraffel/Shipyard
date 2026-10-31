@@ -120,7 +120,7 @@ pub(super) fn command<W: Write>(
     Ok(std::process::ExitCode::SUCCESS)
 }
 
-fn valid_sha(s: &str) -> bool {
+pub(super) fn valid_sha(s: &str) -> bool {
     s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 fn tokens(s: &str) -> Vec<String> {
@@ -186,6 +186,8 @@ fn advise(
     args: &CauseAdviseArgs,
     windows: &[Window],
 ) -> Result<(Vec<Candidate>, usize), CliFailure> {
+    super::require_archive_parent(&args.dir).map_err(|error| CliFailure::new(2, error))?;
+    let _lock = super::lock_archive(&args.dir, false).map_err(|error| CliFailure::new(1, error))?;
     let rows = read_causes(&args.dir.join("causes"))?;
     let fixlinks = read_fixlinks(&args.dir.join("fixlinks.jsonl"))?;
     let needle = tokens(&args.query);
@@ -352,7 +354,7 @@ fn read_fixlinks(path: &Path) -> Result<Vec<Value>, CliFailure> {
 /// Only attach fix-links whose producer identity and evidence are complete.
 /// This prevents a copied, malformed, or cross-head row from being presented
 /// as a historical fix for an otherwise matching cause.
-fn valid_fixlink(value: &Value) -> bool {
+pub(super) fn valid_fixlink(value: &Value) -> bool {
     let Some(derivation) = value["derivation"].as_str() else {
         return false;
     };
@@ -391,6 +393,61 @@ fn valid_fixlink(value: &Value) -> bool {
         }
         _ => false,
     }
+}
+
+/// Identity and evidence fields required before a producer treats a fix-link
+/// as already recorded. This is intentionally weaker than `valid_fixlink`:
+/// an unsafe but structurally complete row should still be deduplicated, while
+/// malformed provenance or truncated evidence remains eligible for backfill.
+pub(super) fn link_identity_complete(value: &Value) -> bool {
+    let metadata_omitted = ["red_time", "pushed_at", "branch", "rule", "collector", "pr"]
+        .iter()
+        .all(|field| value.get(*field).is_none());
+    let metadata_complete = metadata_omitted || valid_producer_metadata(value);
+    let evidence_complete = match value["derivation"].as_str() {
+        Some("compare_red_head_to_fix_head") => {
+            value["files_raw"]
+                .as_array()
+                .is_some_and(|files| files.iter().all(Value::is_string))
+                && value["files_truncated"].as_bool() == Some(false)
+                && value.get("own_files").is_some_and(|files| {
+                    files.is_null()
+                        || files
+                            .as_array()
+                            .is_some_and(|items| items.iter().all(Value::is_string))
+                })
+                && value["own_files_method"]
+                    .as_str()
+                    .is_some_and(|method| !method.is_empty())
+                && value
+                    .get("own_files_truncated")
+                    .is_some_and(|truncated| truncated.is_null() || truncated.is_boolean())
+        }
+        Some("rerun_green") => {
+            value["files_raw"].as_array().is_some_and(Vec::is_empty)
+                && value["own_files"].as_array().is_some_and(Vec::is_empty)
+                && value["files_truncated"].as_bool() == Some(false)
+                && value["own_files_truncated"].as_bool() == Some(false)
+                && value["own_files_method"].as_str() == Some("rerun_same_head")
+        }
+        _ => false,
+    };
+    value["schema"] == SCHEMA
+        && value["source"] == "fix-link"
+        && value["repo"].as_str().is_some_and(|repo| !repo.is_empty())
+        && value["red_run_id"].as_u64().is_some_and(|id| id > 0)
+        && value["red_attempt"]
+            .as_u64()
+            .is_some_and(|attempt| attempt > 0)
+        && value["head_sha"].as_str().is_some_and(valid_sha)
+        && value["fix_run_id"].as_u64().is_some_and(|id| id > 0)
+        && value["fix_head_sha"].as_str().is_some_and(valid_sha)
+        && matches!(
+            value["derivation"].as_str(),
+            Some("compare_red_head_to_fix_head" | "rerun_green")
+        )
+        && metadata_complete
+        && evidence_complete
 }
 
 /// Validate the producer fields that establish when and why a link was made.
@@ -472,6 +529,18 @@ mod tests {
             limit: 5,
         }
     }
+    #[test]
+    fn legacy_root_causes_are_not_ignored_by_advice() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("causes")).unwrap();
+        fs::write(dir.path().join("2026-10.jsonl"), row(&"b".repeat(40), 8)).unwrap();
+        let Err(error) = advise(&args(dir.path()), &[]) else {
+            panic!("legacy archive must be refused");
+        };
+        assert_eq!(error.code, 2);
+        assert!(error.message.contains("legacy cause archive files"));
+    }
+
     fn row(sha: &str, pr: u64) -> String {
         serde_json::json!({"schema":SCHEMA,"repo":"o/r","head_sha":sha,"pr":pr,"run_id":1,"attempt":1,"job_id":2,"job":"linux","signature":"compile failure","failure_class":"build","confidence":"high","named_at":"2026-10-13T00:00:00Z","completed_at":"2026-10-13T00:00:00Z"}).to_string()
     }

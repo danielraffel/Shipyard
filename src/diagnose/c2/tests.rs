@@ -1,5 +1,5 @@
 //! The fixture set in `tests/fixtures/c2/` is C2's contract: every rule has a
-//! fixture, and `v6_signatures.json` pins what v7 left unchanged.
+//! fixture, and `v6_signatures.json` pins the historical signatures still unchanged.
 use serde_json::Value;
 
 use super::*;
@@ -127,7 +127,7 @@ fn the_regressions_yield_their_expected_records() {
             "{name}"
         );
     }
-    assert_eq!(names.len(), 11);
+    assert_eq!(names.len(), 13);
 }
 
 fn gate_records(name: &str) -> Vec<Record> {
@@ -369,4 +369,75 @@ fn v7_leaves_every_other_rules_signatures_as_v6_recorded_them() {
         compared += then.len();
     }
     assert!(compared > 50, "compared {compared}");
+}
+
+#[test]
+fn linker_warnings_are_not_causes_even_when_the_step_is_cancelled() {
+    for linker in ["ld", "ld.lld", "ld64.lld", "lld", "/usr/bin/ld"] {
+        for detail in [
+            "duplicate symbol 'example_symbol' in: a.o b.o",
+            "directory not found for option '-L/opt/example/lib'",
+            "undefined reference to `example_symbol'",
+            "error loading optional metadata",
+            "a.o: undefined reference to `example_symbol'",
+        ] {
+            let log = format!(
+                "##[group]Run build\n##[endgroup]\n\
+                 2026-10-01T00:00:00Z \x1b[33m{linker}: warning: {detail}\x1b[0m\n\
+                 [2/2] Linking CXX executable example\n\
+                 ##[error]The operation was canceled.\n"
+            );
+            let records = extract(&log);
+            assert!(
+                records.iter().all(|record| record.format != "linker"),
+                "{log}: {records:?}"
+            );
+            assert!(
+                records
+                    .iter()
+                    .any(|record| record.step_failed == Some(true)),
+                "cancellation must still be recognized: {records:?}"
+            );
+        }
+    }
+    // GNU ld may include an object/location before the diagnostic severity.
+    assert!(
+        extract("/usr/bin/ld: a.o: warning: undefined reference to `example_symbol'").is_empty()
+    );
+}
+
+#[test]
+fn linker_fatal_diagnostics_survive_the_warning_filter() {
+    for (line, subject) in [
+        ("ld: duplicate symbol 'example_symbol' in: a.o b.o", "ld"),
+        ("ld: library not found for -lexample", "ld"),
+        (
+            "/usr/bin/ld: a.o: undefined reference to `example_symbol'",
+            "example_symbol",
+        ),
+        (
+            "a.o: undefined reference to `example_symbol'",
+            "example_symbol",
+        ),
+        (
+            "ld.lld: error: undefined reference to `example_symbol'",
+            "example_symbol",
+        ),
+        ("ld.lld: error: duplicate symbol 'example_symbol'", "ld"),
+        ("ld: fatal warning(s) induced error (-fatal_warnings)", "ld"),
+        ("ld.lld: error: directory not found [-Werror]", "ld"),
+        (
+            "ld: error: warning: duplicate symbol 'example_symbol'",
+            "ld",
+        ),
+    ] {
+        let records = extract(line);
+        let linker: Vec<&Record> = records
+            .iter()
+            .filter(|record| record.format == "linker")
+            .collect();
+        assert_eq!(linker.len(), 1, "{line}: {records:?}");
+        assert_eq!(linker[0].kind, "link_error", "{line}");
+        assert_eq!(linker[0].subject, subject, "{line}");
+    }
 }

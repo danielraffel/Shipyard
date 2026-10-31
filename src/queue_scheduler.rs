@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 
 use crate::config::LoadedConfig;
 use crate::evidence::canonical_repository;
-use crate::gh::{self, GhClient};
+use crate::gh::{self, GhClient, MergedPrObservation};
 use crate::host_pool::{HostPoolConfig, HostPoolLease};
 use crate::job::{
     CancellationCause, CancellationProof, DEFAULT_RUNNING_JOB_STALE_SECONDS, Job, JobStatus,
@@ -25,6 +25,9 @@ use crate::queue_request::{
 };
 
 const ALREADY_MERGED_REOBSERVE_INTERVAL: StdDuration = StdDuration::from_secs(30);
+const MIN_MERGED_PROVIDER_LOOKUP_BUDGET: StdDuration = StdDuration::from_secs(1);
+const UNKNOWN_MERGED_REOBSERVE_INITIAL: StdDuration = ALREADY_MERGED_REOBSERVE_INTERVAL;
+const UNKNOWN_MERGED_REOBSERVE_MAX: StdDuration = ALREADY_MERGED_REOBSERVE_INTERVAL;
 
 /// Standard cancellation reason for pending jobs whose durable request envelope
 /// cannot be loaded by the scheduler admit pass.
@@ -135,11 +138,14 @@ pub struct AlreadyMergedCancellation {
 pub struct AlreadyMergedObserver {
     client: Option<GhClient>,
     observations: BTreeMap<(String, u64), CachedMergedObservation>,
+    pending_deadline_cursor: Option<(String, u64)>,
+    running_deadline_cursor: Option<(String, u64)>,
 }
 
 struct CachedMergedObservation {
     observed_at: Instant,
-    merged_head: Option<String>,
+    result: MergedPrObservation,
+    unknown_reobserve_interval: Option<StdDuration>,
 }
 
 impl AlreadyMergedObserver {
@@ -151,6 +157,8 @@ impl AlreadyMergedObserver {
         Self {
             client: GhClient::from_loaded_config(config).ok(),
             observations: BTreeMap::new(),
+            pending_deadline_cursor: None,
+            running_deadline_cursor: None,
         }
     }
 
@@ -167,6 +175,27 @@ impl AlreadyMergedObserver {
         })
     }
 
+    pub(crate) fn observe_pending_until(
+        &mut self,
+        jobs: &[Job],
+        request_store: &QueueRequestStore,
+        cwd: &Path,
+        snapshot_file: Option<&Path>,
+        deadline: Instant,
+    ) -> Vec<AlreadyMergedCancellation> {
+        let client = self.client.clone();
+        self.observe_pending_with_deadline(jobs, request_store, deadline, |repo, pr, remaining| {
+            gh::pr_merged_observation_with_timeout(
+                client.as_ref(),
+                repo,
+                pr,
+                cwd,
+                snapshot_file,
+                remaining,
+            )
+        })
+    }
+
     pub(crate) fn observe_running(
         &mut self,
         jobs: &[Job],
@@ -180,30 +209,103 @@ impl AlreadyMergedObserver {
         })
     }
 
+    pub(crate) fn observe_running_until(
+        &mut self,
+        jobs: &[Job],
+        request_store: &QueueRequestStore,
+        cwd: &Path,
+        snapshot_file: Option<&Path>,
+        deadline: Instant,
+    ) -> Vec<AlreadyMergedCancellation> {
+        let client = self.client.clone();
+        self.observe_running_with_deadline(jobs, request_store, deadline, |repo, pr, remaining| {
+            gh::pr_merged_observation_with_timeout(
+                client.as_ref(),
+                repo,
+                pr,
+                cwd,
+                snapshot_file,
+                remaining,
+            )
+        })
+    }
+
     pub(crate) fn observe_pending_with(
         &mut self,
         jobs: &[Job],
         request_store: &QueueRequestStore,
-        fetch: impl FnMut(&str, u64) -> Option<String>,
+        mut fetch: impl FnMut(&str, u64) -> Option<String>,
     ) -> Vec<AlreadyMergedCancellation> {
-        self.observe_ship_with_status(jobs, request_store, JobStatus::Pending, fetch)
+        self.observe_ship_with_status(
+            jobs,
+            request_store,
+            JobStatus::Pending,
+            None,
+            |repo, pr, _| match fetch(repo, pr) {
+                Some(head) => MergedPrObservation::Merged(head),
+                None => MergedPrObservation::NotMerged,
+            },
+        )
+    }
+
+    pub(crate) fn observe_pending_with_deadline(
+        &mut self,
+        jobs: &[Job],
+        request_store: &QueueRequestStore,
+        deadline: Instant,
+        mut fetch: impl FnMut(&str, u64, StdDuration) -> MergedPrObservation,
+    ) -> Vec<AlreadyMergedCancellation> {
+        self.observe_ship_with_status(
+            jobs,
+            request_store,
+            JobStatus::Pending,
+            Some(deadline),
+            |repo, pr, remaining| fetch(repo, pr, remaining.expect("deadline is set")),
+        )
     }
 
     pub(crate) fn observe_running_with(
         &mut self,
         jobs: &[Job],
         request_store: &QueueRequestStore,
-        fetch: impl FnMut(&str, u64) -> Option<String>,
+        mut fetch: impl FnMut(&str, u64) -> Option<String>,
     ) -> Vec<AlreadyMergedCancellation> {
-        self.observe_ship_with_status(jobs, request_store, JobStatus::Running, fetch)
+        self.observe_ship_with_status(
+            jobs,
+            request_store,
+            JobStatus::Running,
+            None,
+            |repo, pr, _| match fetch(repo, pr) {
+                Some(head) => MergedPrObservation::Merged(head),
+                None => MergedPrObservation::NotMerged,
+            },
+        )
     }
 
+    pub(crate) fn observe_running_with_deadline(
+        &mut self,
+        jobs: &[Job],
+        request_store: &QueueRequestStore,
+        deadline: Instant,
+        mut fetch: impl FnMut(&str, u64, StdDuration) -> MergedPrObservation,
+    ) -> Vec<AlreadyMergedCancellation> {
+        self.observe_ship_with_status(
+            jobs,
+            request_store,
+            JobStatus::Running,
+            Some(deadline),
+            |repo, pr, remaining| fetch(repo, pr, remaining.expect("deadline is set")),
+        )
+    }
+
+    #[allow(clippy::too_many_lines)] // Keep the bounded observer decision chain auditable in one loop.
     fn observe_ship_with_status(
         &mut self,
         jobs: &[Job],
         request_store: &QueueRequestStore,
         status: JobStatus,
-        mut fetch: impl FnMut(&str, u64) -> Option<String>,
+        deadline: Option<Instant>,
+        mut fetch: impl FnMut(&str, u64, Option<StdDuration>) -> MergedPrObservation,
     ) -> Vec<AlreadyMergedCancellation> {
         let mut jobs_by_pr = BTreeMap::<(String, u64), Vec<(String, String)>>::new();
         for job in jobs.iter().filter(|job| job.status == status) {
@@ -220,27 +322,80 @@ impl AlreadyMergedObserver {
         }
 
         let now = Instant::now();
+        let mut entries = jobs_by_pr.into_iter().collect::<Vec<_>>();
+        let cursor = match status {
+            JobStatus::Pending => self.pending_deadline_cursor.as_ref(),
+            JobStatus::Running => self.running_deadline_cursor.as_ref(),
+            _ => None,
+        };
+        if deadline.is_some()
+            && let Some(cursor) = cursor
+            && let Some(index) = entries.iter().position(|(key, _)| key > cursor)
+        {
+            entries.rotate_left(index);
+        }
         let mut cancellations = Vec::new();
-        for ((repo, pr), observed_jobs) in jobs_by_pr {
+        let mut last_key = None;
+        let mut fetch_exhausted = false;
+        for ((repo, pr), observed_jobs) in entries {
             let cache_key = (repo.clone(), pr);
             let fresh_cached = self.observations.get(&cache_key).filter(|cached| {
-                now.saturating_duration_since(cached.observed_at)
-                    < ALREADY_MERGED_REOBSERVE_INTERVAL
+                let interval = cached
+                    .unknown_reobserve_interval
+                    .unwrap_or(ALREADY_MERGED_REOBSERVE_INTERVAL);
+                now.saturating_duration_since(cached.observed_at) < interval
             });
-            let merged_head = if let Some(cached) = fresh_cached {
-                cached.merged_head.clone()
+            let mut fetched = false;
+            let result = if let Some(cached) = fresh_cached {
+                cached.result.clone()
             } else {
-                let merged_head = fetch(&repo, pr);
+                let remaining =
+                    deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
+                if fetch_exhausted
+                    || remaining
+                        .is_some_and(|remaining| remaining < MIN_MERGED_PROVIDER_LOOKUP_BUDGET)
+                {
+                    continue;
+                }
+                fetched = true;
+                let result = fetch(&repo, pr, remaining);
+                if matches!(result, MergedPrObservation::Unknown) {
+                    // One provider failure opens a per-observer circuit for
+                    // this pass. Cached results remain actionable, while
+                    // uncached lookups wait for the next bounded tick instead
+                    // of multiplying an outage across every PR.
+                    fetch_exhausted = true;
+                }
+                let unknown_reobserve_interval = match result {
+                    MergedPrObservation::Unknown => {
+                        let previous = self
+                            .observations
+                            .get(&cache_key)
+                            .and_then(|cached| cached.unknown_reobserve_interval);
+                        Some(match previous {
+                            Some(previous) => previous
+                                .checked_mul(2)
+                                .unwrap_or(UNKNOWN_MERGED_REOBSERVE_MAX)
+                                .min(UNKNOWN_MERGED_REOBSERVE_MAX),
+                            None => UNKNOWN_MERGED_REOBSERVE_INITIAL,
+                        })
+                    }
+                    MergedPrObservation::Merged(_) | MergedPrObservation::NotMerged => None,
+                };
                 self.observations.insert(
                     cache_key,
                     CachedMergedObservation {
-                        observed_at: now,
-                        merged_head: merged_head.clone(),
+                        observed_at: Instant::now(),
+                        result: result.clone(),
+                        unknown_reobserve_interval,
                     },
                 );
-                merged_head
+                result
             };
-            let Some(merged_head) = merged_head else {
+            if fetched {
+                last_key = Some((repo.clone(), pr));
+            }
+            let MergedPrObservation::Merged(merged_head) = result else {
                 continue;
             };
             cancellations.extend(observed_jobs.into_iter().filter_map(
@@ -253,6 +408,14 @@ impl AlreadyMergedObserver {
                     })
                 },
             ));
+        }
+        if deadline.is_some() {
+            let cursor = match status {
+                JobStatus::Pending => &mut self.pending_deadline_cursor,
+                JobStatus::Running => &mut self.running_deadline_cursor,
+                _ => return cancellations,
+            };
+            *cursor = last_key.or_else(|| cursor.clone());
         }
         cancellations
     }
@@ -1028,17 +1191,19 @@ fn running_vm_reservations(running: &[&JobResourcePlan], key: &str) -> u32 {
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::PathBuf;
+    use std::time::{Duration as StdDuration, Instant};
 
     use chrono::{Duration, Utc};
 
     use super::{
         AlreadyMergedObserver, ORPHANED_PENDING_REQUEST_REASON, PendingAdmissionRequest,
-        SchedulerAdmissionBlocker, apply_admit_pass_for_drain, can_admit,
-        host_pool_capacity_deficits, plan_admit_pass, plan_admit_pass_from_jobs,
+        SchedulerAdmissionBlocker, UNKNOWN_MERGED_REOBSERVE_INITIAL, apply_admit_pass_for_drain,
+        can_admit, host_pool_capacity_deficits, plan_admit_pass, plan_admit_pass_from_jobs,
     };
     use crate::executor::dispatch::{
         ResolvedBackend, ResolvedHostPoolConfig, ResolvedTarget, ResolvedValidation,
     };
+    use crate::gh::MergedPrObservation;
     use crate::host_pool::{HostPoolConfig, HostPoolLease, HostPoolMemberConfig};
     use crate::job::{Job, JobStatus, Priority, ValidationMode};
     use crate::queue::Queue;
@@ -2143,6 +2308,8 @@ mod tests {
         let mut observer = AlreadyMergedObserver {
             client: None,
             observations: BTreeMap::new(),
+            pending_deadline_cursor: None,
+            running_deadline_cursor: None,
         };
         let jobs = [one, two];
         let cancellations = observer.observe_pending(
@@ -2181,6 +2348,8 @@ mod tests {
         let mut observer = AlreadyMergedObserver {
             client: None,
             observations: BTreeMap::new(),
+            pending_deadline_cursor: None,
+            running_deadline_cursor: None,
         };
         let cancellations = observer.observe_pending(
             &[job],
@@ -2213,6 +2382,8 @@ mod tests {
         let mut observer = AlreadyMergedObserver {
             client: None,
             observations: BTreeMap::new(),
+            pending_deadline_cursor: None,
+            running_deadline_cursor: None,
         };
         let cancellations = observer.observe_pending(
             &[job],
@@ -2239,6 +2410,8 @@ mod tests {
         let mut observer = AlreadyMergedObserver {
             client: None,
             observations: BTreeMap::new(),
+            pending_deadline_cursor: None,
+            running_deadline_cursor: None,
         };
         let mut calls = Vec::new();
 
@@ -2257,5 +2430,394 @@ mod tests {
             calls,
             [("owner/one".to_owned(), 42), ("owner/two".to_owned(), 42)]
         );
+    }
+
+    #[test]
+    fn deadline_observation_does_not_call_provider_after_budget_expires() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        save_ship(&store, "expired", "owner/one", 42);
+        let mut observer = AlreadyMergedObserver {
+            client: None,
+            observations: BTreeMap::new(),
+            pending_deadline_cursor: None,
+            running_deadline_cursor: None,
+        };
+        let mut calls = 0;
+
+        let cancellations = observer.observe_pending_with_deadline(
+            &[job("expired", JobStatus::Pending, Priority::Normal, 0)],
+            &store,
+            Instant::now(),
+            |_, _, _| {
+                calls += 1;
+                MergedPrObservation::Merged("abc123".to_owned())
+            },
+        );
+
+        assert!(cancellations.is_empty());
+        assert_eq!(calls, 0);
+    }
+
+    #[test]
+    fn deadline_observation_passes_remaining_budget_to_provider() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        save_ship(&store, "budgeted", "owner/one", 42);
+        let mut observer = AlreadyMergedObserver {
+            client: None,
+            observations: BTreeMap::new(),
+            pending_deadline_cursor: None,
+            running_deadline_cursor: None,
+        };
+        let deadline = Instant::now() + StdDuration::from_secs(2);
+        let mut remaining = None;
+
+        observer.observe_pending_with_deadline(
+            &[job("budgeted", JobStatus::Pending, Priority::Normal, 0)],
+            &store,
+            deadline,
+            |_, _, timeout| {
+                remaining = Some(timeout);
+                MergedPrObservation::Unknown
+            },
+        );
+
+        let remaining = remaining.expect("provider called");
+        assert!(remaining > StdDuration::ZERO);
+        assert!(remaining <= StdDuration::from_secs(2));
+    }
+
+    #[test]
+    fn deadline_observation_cancels_running_exact_head() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        save_ship(&store, "running", "owner/one", 42);
+        let mut observer = AlreadyMergedObserver {
+            client: None,
+            observations: BTreeMap::new(),
+            pending_deadline_cursor: None,
+            running_deadline_cursor: None,
+        };
+
+        let cancellations = observer.observe_running_with_deadline(
+            &[job("running", JobStatus::Running, Priority::Normal, 0)],
+            &store,
+            Instant::now() + StdDuration::from_secs(2),
+            |_, _, _| MergedPrObservation::Merged("abc123".to_owned()),
+        );
+
+        assert_eq!(cancellations.len(), 1);
+        assert_eq!(cancellations[0].job_id, "running");
+    }
+
+    #[test]
+    fn deadline_observation_uses_cached_head_after_deadline() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        save_ship(&store, "cached", "owner/one", 42);
+        let mut observer = AlreadyMergedObserver {
+            client: None,
+            observations: BTreeMap::new(),
+            pending_deadline_cursor: None,
+            running_deadline_cursor: None,
+        };
+        let jobs = [job("cached", JobStatus::Pending, Priority::Normal, 0)];
+        let first = observer.observe_pending_with(&jobs, &store, |_, _| Some("abc123".to_owned()));
+        assert_eq!(first.len(), 1);
+        let mut provider_calls = 0;
+        let second =
+            observer.observe_pending_with_deadline(&jobs, &store, Instant::now(), |_, _, _| {
+                provider_calls += 1;
+                MergedPrObservation::Unknown
+            });
+
+        assert_eq!(second.len(), 1);
+        assert_eq!(provider_calls, 0);
+    }
+
+    #[test]
+    fn deadline_observation_unknown_backoff_is_never_shorter_than_normal_interval() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        save_ship(&store, "unknown", "owner/one", 42);
+        let mut observer = AlreadyMergedObserver {
+            client: None,
+            observations: BTreeMap::new(),
+            pending_deadline_cursor: None,
+            running_deadline_cursor: None,
+        };
+        let jobs = [job("unknown", JobStatus::Pending, Priority::Normal, 0)];
+        let mut calls = 0;
+        let observe_unknown = |observer: &mut AlreadyMergedObserver, calls: &mut usize| {
+            observer.observe_pending_with_deadline(
+                &jobs,
+                &store,
+                Instant::now() + StdDuration::from_secs(2),
+                |_, _, _| {
+                    *calls += 1;
+                    MergedPrObservation::Unknown
+                },
+            );
+        };
+        observe_unknown(&mut observer, &mut calls);
+        observe_unknown(&mut observer, &mut calls);
+        assert_eq!(calls, 1, "unknown result is cached with initial backoff");
+        assert_eq!(
+            observer
+                .observations
+                .get(&("owner/one".to_owned(), 42))
+                .and_then(|cached| cached.unknown_reobserve_interval),
+            Some(UNKNOWN_MERGED_REOBSERVE_INITIAL)
+        );
+        observer
+            .observations
+            .get_mut(&("owner/one".to_owned(), 42))
+            .expect("unknown observation")
+            .observed_at = Instant::now()
+            .checked_sub(UNKNOWN_MERGED_REOBSERVE_INITIAL)
+            .expect("test instant supports backoff subtraction");
+        observe_unknown(&mut observer, &mut calls);
+        assert_eq!(calls, 2);
+        let doubled = UNKNOWN_MERGED_REOBSERVE_INITIAL;
+        assert_eq!(
+            observer
+                .observations
+                .get(&("owner/one".to_owned(), 42))
+                .and_then(|cached| cached.unknown_reobserve_interval),
+            Some(doubled)
+        );
+        observer
+            .observations
+            .get_mut(&("owner/one".to_owned(), 42))
+            .expect("unknown observation")
+            .observed_at = Instant::now()
+            .checked_sub(doubled)
+            .expect("test instant supports backoff subtraction");
+        observe_unknown(&mut observer, &mut calls);
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn deadline_observation_definite_result_resets_unknown_backoff() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        save_ship(&store, "reset", "owner/one", 42);
+        let jobs = [job("reset", JobStatus::Pending, Priority::Normal, 0)];
+        let mut observer = AlreadyMergedObserver {
+            client: None,
+            observations: BTreeMap::new(),
+            pending_deadline_cursor: None,
+            running_deadline_cursor: None,
+        };
+        observer.observe_pending_with_deadline(
+            &jobs,
+            &store,
+            Instant::now() + StdDuration::from_secs(2),
+            |_, _, _| MergedPrObservation::Unknown,
+        );
+        observer
+            .observations
+            .get_mut(&("owner/one".to_owned(), 42))
+            .expect("unknown observation")
+            .observed_at = Instant::now()
+            .checked_sub(UNKNOWN_MERGED_REOBSERVE_INITIAL)
+            .expect("test instant supports backoff subtraction");
+        observer.observe_pending_with_deadline(
+            &jobs,
+            &store,
+            Instant::now() + StdDuration::from_secs(2),
+            |_, _, _| MergedPrObservation::NotMerged,
+        );
+        assert_eq!(
+            observer
+                .observations
+                .get(&("owner/one".to_owned(), 42))
+                .and_then(|cached| cached.unknown_reobserve_interval),
+            None
+        );
+    }
+
+    #[test]
+    fn deadline_observation_stamps_unknown_after_slow_provider() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        save_ship(&store, "slow-unknown", "owner/one", 42);
+        let jobs = [job("slow-unknown", JobStatus::Pending, Priority::Normal, 0)];
+        let mut observer = AlreadyMergedObserver {
+            client: None,
+            observations: BTreeMap::new(),
+            pending_deadline_cursor: None,
+            running_deadline_cursor: None,
+        };
+        let mut calls = 0;
+        observer.observe_pending_with_deadline(
+            &jobs,
+            &store,
+            Instant::now() + StdDuration::from_secs(2),
+            |_, _, _| {
+                calls += 1;
+                std::thread::sleep(StdDuration::from_millis(100));
+                MergedPrObservation::Unknown
+            },
+        );
+        observer.observe_pending_with_deadline(
+            &jobs,
+            &store,
+            Instant::now() + StdDuration::from_secs(2),
+            |_, _, _| {
+                calls += 1;
+                MergedPrObservation::Unknown
+            },
+        );
+        assert_eq!(calls, 1, "slow unknown is fresh from provider completion");
+    }
+
+    #[test]
+    fn deadline_observation_caches_definite_open_result_across_ticks() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        save_ship(&store, "open", "owner/one", 42);
+        let jobs = [job("open", JobStatus::Pending, Priority::Normal, 0)];
+        let mut observer = AlreadyMergedObserver {
+            client: None,
+            observations: BTreeMap::new(),
+            pending_deadline_cursor: None,
+            running_deadline_cursor: None,
+        };
+        let mut calls = 0;
+        for _ in 0..2 {
+            observer.observe_pending_with_deadline(
+                &jobs,
+                &store,
+                Instant::now() + StdDuration::from_secs(2),
+                |_, _, _| {
+                    calls += 1;
+                    MergedPrObservation::NotMerged
+                },
+            );
+        }
+        assert_eq!(calls, 1, "definite open result uses the normal cache TTL");
+    }
+
+    #[test]
+    fn deadline_observation_stops_uncached_lookups_after_unknown() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        save_ship(&store, "first", "owner/one", 1);
+        save_ship(&store, "second", "owner/one", 2);
+        let jobs = [
+            job("first", JobStatus::Pending, Priority::Normal, 0),
+            job("second", JobStatus::Pending, Priority::Normal, 0),
+        ];
+        let mut observer = AlreadyMergedObserver {
+            client: None,
+            observations: BTreeMap::new(),
+            pending_deadline_cursor: None,
+            running_deadline_cursor: None,
+        };
+        let mut calls = 0;
+        observer.observe_pending_with_deadline(
+            &jobs,
+            &store,
+            Instant::now() + StdDuration::from_secs(2),
+            |_, _, _| {
+                calls += 1;
+                MergedPrObservation::Unknown
+            },
+        );
+        assert_eq!(calls, 1, "one provider failure opens the pass circuit");
+        assert!(
+            observer
+                .observations
+                .contains_key(&("owner/one".to_owned(), 1))
+        );
+        assert!(
+            !observer
+                .observations
+                .contains_key(&("owner/one".to_owned(), 2))
+        );
+    }
+
+    #[test]
+    fn deadline_observation_keeps_pending_and_running_fairness_independent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        save_ship(&store, "pending", "owner/one", 1);
+        save_ship(&store, "running", "owner/one", 2);
+        let jobs = [
+            job("pending", JobStatus::Pending, Priority::Normal, 0),
+            job("running", JobStatus::Running, Priority::Normal, 0),
+        ];
+        let mut observer = AlreadyMergedObserver {
+            client: None,
+            observations: BTreeMap::new(),
+            pending_deadline_cursor: None,
+            running_deadline_cursor: None,
+        };
+        observer.observe_pending_with_deadline(
+            &jobs,
+            &store,
+            Instant::now() + StdDuration::from_millis(5),
+            |_, _, _| {
+                std::thread::sleep(StdDuration::from_millis(20));
+                MergedPrObservation::Unknown
+            },
+        );
+        let mut running_calls = 0;
+        observer.observe_running_with_deadline(
+            &jobs,
+            &store,
+            Instant::now() + StdDuration::from_secs(2),
+            |_, _, _| {
+                running_calls += 1;
+                MergedPrObservation::Unknown
+            },
+        );
+        assert_eq!(
+            running_calls, 1,
+            "running jobs are not starved by pending cursor"
+        );
+    }
+
+    #[test]
+    fn deadline_observation_rotates_after_a_slow_provider() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        save_ship(&store, "first", "owner/one", 1);
+        save_ship(&store, "second", "owner/one", 2);
+        let jobs = [
+            job("first", JobStatus::Pending, Priority::Normal, 0),
+            job("second", JobStatus::Pending, Priority::Normal, 0),
+        ];
+        let mut observer = AlreadyMergedObserver {
+            client: None,
+            observations: BTreeMap::new(),
+            pending_deadline_cursor: None,
+            running_deadline_cursor: None,
+        };
+        let mut calls = Vec::new();
+        observer.observe_pending_with_deadline(
+            &jobs,
+            &store,
+            Instant::now() + StdDuration::from_millis(5),
+            |repo, pr, _| {
+                calls.push((repo.to_owned(), pr));
+                std::thread::sleep(StdDuration::from_millis(20));
+                MergedPrObservation::Unknown
+            },
+        );
+        observer.observe_pending_with_deadline(
+            &jobs,
+            &store,
+            Instant::now() + StdDuration::from_secs(2),
+            |repo, pr, _| {
+                calls.push((repo.to_owned(), pr));
+                MergedPrObservation::Merged("different".to_owned())
+            },
+        );
+
+        assert_eq!(calls[0], ("owner/one".to_owned(), 1));
+        assert_eq!(calls[1], ("owner/one".to_owned(), 2));
     }
 }

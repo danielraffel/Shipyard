@@ -172,6 +172,23 @@ pub(super) fn apply_native_arm_backstop<A>(
     apply: bool,
     authorize: impl FnOnce() -> Result<A, ArmAuthorityRefusal>,
 ) -> (NativeArmRepoStatus, bool) {
+    if !observation.merge_queue {
+        // Without a merge queue an armed request is not consumed on enqueue:
+        // it survives a later push by anyone with write access and then
+        // merges a head nobody judged. A no-queue base is landed only by the
+        // steward's own exact-head merge, if at all.
+        return (
+            NativeArmRepoStatus {
+                policy: format!(
+                    "not applicable: {} has no merge queue on {}, and native auto-merge is \
+                     never armed on a no-queue base",
+                    observation.repo, observation.base
+                ),
+                results: Vec::new(),
+            },
+            false,
+        );
+    }
     if !observation.allow_auto_merge {
         return (
             NativeArmRepoStatus {

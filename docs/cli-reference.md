@@ -96,8 +96,13 @@ shipyard cause extract --log FILE --job NAME --notice  # `::notice title=ci-caus
                                              #   bound to the job (repo/head/run/attempt/job) and naming the cause it reads,
                                              #   and dates it by the API time of the step that printed it
 shipyard cause extract --log FILE --format c2  # C2's raw records
-shipyard cause archive --dir DIR --input F   # append records (or scorecard case rows' `cause`) to DIR/YYYY-MM.jsonl;
+shipyard cause archive --dir DIR --input F   # append records (or scorecard case rows' `cause`) to DIR/causes/YYYY-MM.jsonl;
                                              #   ids already archived are skipped, nothing is rewritten
+shipyard cause prune --dir DIR               # preview bounded archive retention (365 days, 64 MiB)
+shipyard cause prune --dir DIR --apply       # apply only to a managed, mutable archive
+                                             #   (max 36,500 days / 128 MiB; unresolved evidence is preserved)
+shipyard cause prune --dir DIR --apply --initialize
+                                             # explicitly enroll an existing unmarked archive
 shipyard cause record --repo OWNER/REPO --workflow FILE --dir DIR [--since TIME] [--base main]
                                              # read-only observer: a cause row per new red job (DIR/causes/YYYY-MM.jsonl)
                                              #   and a fix-link once its PR or branch goes green (DIR/fixlinks.jsonl);
@@ -182,8 +187,9 @@ shipyard metrics record --project pulp --job linux-arm64 --step compile --durati
 shipyard metrics import github --repo Generous-Corp/pulp --workflow build.yml --limit 10
 tartci runtime export --repo Generous-Corp/pulp | shipyard metrics import tartci
 shipyard metrics export merge-receipt --repo Generous-Corp/pulp --file "$SHIPYARD_HANDOFF_DIR/merge-receipts.jsonl"
+shipyard metrics export merge-receipt --repo Generous-Corp/pulp --stdout  # canonical JSONL only; for a governed transport
 shipyard metrics summary --project pulp --json
-shipyard metrics repeated-work-cost --limit 1000 --json
+shipyard metrics repeated-work-cost --since 14d --limit 1000 --json
 shipyard metrics summary --project pulp --group-by host --json   # fold ephemeral runners into their host
 shipyard metrics scorecard --project pulp --since 30d --json
 shipyard metrics gate-cost --repo Generous-Corp/pulp --workflow build.yml --gate-job macos --since 48h --json
@@ -246,6 +252,7 @@ shipyard runner steward --recover-hosted-setup-eviction-priority --apply
 shipyard runner steward --provenance-blocking-label 5·unresolved # repeatable authority blocker
 shipyard runner steward --arm-unqueued              # audit green, unqueued, UNARMED PRs
 shipyard runner steward --arm-unqueued --apply      # arm native auto-merge on them
+shipyard runner steward --approval-context review-verdict  # no-queue base: exact-head merge only when GitHub requires this app-bound check
 shipyard runner steward-handoff --repo OWNER/REPO --pr 123 --head "$SHA" --workstream-id GEN-7 --context-url https://linear.app/... --apply
 shipyard runner steward-handoff --repo OWNER/REPO --pr 123 --head "$SHA" --workstream-id GEN-7 --context-url https://linear.app/... --agent-provider codex --agent-session-id NEW_SESSION --transfer-agent-owner --apply
 shipyard pr --workstream-id GEN-7 --context-url https://linear.app/...   # free-form handoff identifiers
@@ -533,6 +540,13 @@ it inside that repository's clone.
 `$SHIPYARD_STATE_DIR/metrics/metrics.db` using SQLite. The feature is optional
 and provider-neutral:
 
+`shipyard cleanup` previews retention by default and applies it only with
+`--apply`. Raw metric rows are kept for 90 days by default; set
+`SHIPYARD_METRICS_RETENTION_DAYS` to another non-negative number, or `0` to
+disable pruning. Invalid, negative, or unreasonably large values refuse the
+command. A corrupt or unreadable metrics database fails cleanup closed,
+including dry-run validation, and durable merge receipts are retained.
+
 - `shipyard metrics record` writes one explicit job/step sample.
 - `shipyard run command` writes a best-effort metrics row automatically when it
   stores command evidence.
@@ -549,7 +563,9 @@ and provider-neutral:
   JSONL handoff. It reads only the local `merge_receipts` store; it never queries
   GitHub or manufactures receipts. An empty export fails closed without
   replacing the destination, so the downstream cannot record a false
-  successful handoff.
+  successful handoff. `--stdout` is the stream form: it is mutually exclusive
+  with `--file` and emits only canonical JSONL receipt records, with no summary
+  mixed into stdout. It cannot be combined with `--json`.
 - `scripts/merge_receipt_handoff.py export ...` supervises that producer export
   and writes an atomic `shipyard-merge-receipt-handoff/v1` health sidecar;
   `... check --repo <owner/repo> --base-branch main --stale-after 2h` exits `3` for a missing, malformed, failed,
@@ -618,6 +634,20 @@ is explicitly `unavailable` until a durable merge receipt joins a PR head to a
 successfully merged change; distinct PR count is never treated as a safe-merge
 denominator. A baseline receipt must therefore carry that merge join before
 reporting the per-change value.
+
+The primary throughput metric is
+`safely_merged_changes_per_eligible_slot_hour`. Its numerator is the number of
+distinct safe merge receipt heads, and its denominator is the observation-only
+`fleet_capacity.eligible_slot_hours`. It is `unavailable` when either side is
+missing or the denominator is zero. When capacity coverage is partial because
+of unknown samples or gaps, the metric remains visible as `partial` and its
+reason states that the denominator is a lower bound, so the reported rate may
+be overstated. Distinct pull requests are never used as a substitute.
+The value is an imported-observation metric; it does not prove that the local
+merge-receipt handoff is complete. Baseline promotion still requires the
+collector's merge-receipt health gate. The authoritative baseline collector
+preserves this coverage object as `collector_safe_merge_rate` and includes its
+status and value in the status markdown; missing fields remain unavailable.
 
 ### Project keys
 
@@ -819,7 +849,11 @@ terminal refresh updates the existing row only when the phase name matches;
 new phase names append rows under the same correlation ID. No phase duration is
 inferred from a job total.
 
-`metrics repeated-work-cost` is read-only shadow accounting. It reports the
-avoided repeated-work cost basis and preserves duration as unavailable until a
-provenance-safe linkage from queue job IDs to metrics rows exists; it never
-infers cost from numeric-looking IDs.
+`metrics repeated-work-cost` is read-only shadow accounting bounded by
+`--since` (default `14d`). It reports measured runtime from distinct
+**superseded queue jobs**, never the surviving job: only clean queue timings
+count. Uncertain, cancelled, and unmatched superseded jobs remain visible as
+coverage counts and are never treated as zero. It never infers cost from
+numeric-looking IDs or changes queue authority. In JSON, `joined_durations` and
+`unknown_durations` count distinct superseded jobs, while `observations` and
+`shadow_rows` preserve raw shadow-row coverage.

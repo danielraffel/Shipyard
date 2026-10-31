@@ -167,11 +167,53 @@ pub(super) fn process_failure_detail(exit_code: Option<i32>, stderr: &[u8]) -> S
         || "worker exited by signal".to_owned(),
         |code| format!("worker exited with status {code}"),
     );
+    let class = classify_worker_failure(tail);
     if tail.is_empty() {
-        prefix
+        format!("{class}: {prefix}")
     } else {
-        bounded_detail(&format!("{prefix}: {tail}"), MAX_RECEIPT_DETAIL_BYTES)
+        bounded_detail(
+            &format!("{class}: {prefix}: {tail}"),
+            MAX_RECEIPT_DETAIL_BYTES,
+        )
     }
+}
+
+/// Classify failures at the provider boundary before they become a durable
+/// recovery receipt.  Authentication and transport failures are operational
+/// infrastructure failures: they must not be interpreted as a model verdict,
+/// and a future launcher may use this class to make one bounded alternate
+/// provider attempt.  The current phase-1 worker remains fail-closed and does
+/// not select an alternate provider implicitly.
+pub(super) fn classify_worker_failure(stderr: &str) -> &'static str {
+    let lowered = stderr.to_ascii_lowercase();
+    if [
+        "401 unauthorized",
+        "http 401",
+        "authentication required",
+        "not logged in",
+        "invalid_grant",
+        "unauthorized",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle))
+    {
+        return "provider_auth_failure";
+    }
+    if [
+        "502 bad gateway",
+        "503 service unavailable",
+        "504 gateway timeout",
+        "connection refused",
+        "connection reset",
+        "timed out",
+        "timeout",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle))
+    {
+        return "provider_transport_failure";
+    }
+    "worker_process_failure"
 }
 
 pub(super) fn bounded_detail(detail: &str, max_bytes: usize) -> String {
@@ -195,4 +237,34 @@ pub(super) fn bounded_detail(detail: &str, max_bytes: usize) -> String {
         start += 1;
     }
     format!("{PREFIX}{}", &sanitized[start..])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{classify_worker_failure, process_failure_detail};
+
+    #[test]
+    fn provider_auth_errors_are_classified_for_fail_closed_recovery() {
+        for detail in [
+            "unexpected status 401 Unauthorized",
+            "subrouter: not logged in",
+            "invalid_grant: refresh token rejected",
+        ] {
+            assert_eq!(classify_worker_failure(detail), "provider_auth_failure");
+        }
+        let receipt = process_failure_detail(Some(1), b"HTTP 401 Unauthorized");
+        assert!(receipt.starts_with("provider_auth_failure: worker exited with status 1:"));
+    }
+
+    #[test]
+    fn provider_transport_errors_are_distinct_from_authentication() {
+        assert_eq!(
+            classify_worker_failure("unexpected status 502 Bad Gateway"),
+            "provider_transport_failure"
+        );
+        assert_eq!(
+            classify_worker_failure("worker returned invalid JSON"),
+            "worker_process_failure"
+        );
+    }
 }

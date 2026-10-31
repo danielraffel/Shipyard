@@ -29,6 +29,11 @@ on:
         required: false
         default: ""
         type: string
+      platform_focus:
+        description: "Platforms to build (empty = repo variable CI_PLATFORM_FOCUS, default macos = macos-arm64 + linux-x64)"
+        required: false
+        default: ""
+        type: string
       windows_runner_selector_json:
         description: Optional JSON string/array for Windows runs-on
         required: false
@@ -38,8 +43,12 @@ on:
 # Each job grants only what its own steps use; nothing is granted by default.
 permissions: {}
 
+# One group across tags: a running release always finishes (it may be mid-
+# signing on the local Mac), and a newer tag replaces any older release still
+# waiting, so a burst of merges publishes the newest version instead of
+# queueing one signing per merge.
 concurrency:
-  group: release-${{ github.ref }}
+  group: release
   cancel-in-progress: false
 
 env:
@@ -61,6 +70,7 @@ jobs:
 
       - id: resolve
         env:
+          PLATFORM_FOCUS: ${{ inputs.platform_focus || vars.CI_PLATFORM_FOCUS || 'macos' }}
           REQUESTED_PROVIDER: ${{ inputs.runner_provider || vars.DEFAULT_RUNNER_PROVIDER || 'github-hosted' }}
           EXPLICIT_LINUX_RUNNER_SELECTOR_JSON: ${{ inputs.linux_runner_selector_json || '' }}
           EXPLICIT_LINUX_ARM64_RUNNER_SELECTOR_JSON: ${{ inputs.linux_arm64_runner_selector_json || '' }}
@@ -171,8 +181,9 @@ jobs:
       - name: Run read-only admission and steward probes against real repositories
         shell: bash
         env:
-          # Public repositories only; a dedicated read token can replace the
-          # job token without changing the gate.
+          # Prefer a dedicated read-only token. The Actions token remains the
+          # fallback; never expose the write-capable release-bot credential to
+          # the binary under test.
           GH_TOKEN: ${{ secrets.RELEASE_SMOKE_GH_TOKEN || github.token }}
           SMOKE_REPOS: ${{ vars.RELEASE_SMOKE_REPOS || 'Generous-Corp/pulp' }}
         run: |
@@ -277,6 +288,14 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Verify job-scoped GitHub publication before signing
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -c 'import sys; sys.path.insert(0, "scripts"); from release_macos_local import require_ci_gh; print(require_ci_gh())'
+
       # The signed build must not read a toolchain or crate sources that an
       # earlier job on a shared runner could have written to ~/.cargo or
       # ~/.rustup. Fresh homes cost a cold toolchain and registry fetch.
@@ -348,6 +367,8 @@ jobs:
       - name: Sign, notarize, staple, and upload macOS DMG
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # The publish gate expects the same asset set the build matrix produced.
+          CI_PLATFORM_FOCUS: ${{ inputs.platform_focus || vars.CI_PLATFORM_FOCUS || 'macos' }}
           SHIPYARD_NOTARIZE_APPLE_ID: ${{ secrets.MACOS_NOTARIZE_APPLE_ID }}
           SHIPYARD_NOTARIZE_APP_PASSWORD: ${{ secrets.MACOS_NOTARIZE_APP_PASSWORD }}
           SHIPYARD_NOTARIZE_TEAM_ID: ${{ secrets.MACOS_NOTARIZE_TEAM_ID }}
