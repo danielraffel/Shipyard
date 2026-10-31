@@ -59,6 +59,13 @@ Shipyard chooses targets and records exact-head evidence
 Shipyard reports the evidence; GitHub owns merge order
 ```
 
+Together they can drain a repository on their own: agents open pull requests,
+a reviewer approves exact heads, and Shipyard's steward hands each approved,
+green head to GitHub's merge queue (or merges it directly where there is no
+queue) while TartCI and GitHub-hosted runners do the testing.
+[Draining pull requests automatically](docs/automated-draining.md) explains the
+whole loop, how to set it up, what to tell your agents, and when not to use it.
+
 [TartCI](https://github.com/danielraffel/tartci) is the execution layer in
 this pairing. It owns the VM images, host budgets, caches, and GitHub runner
 lifecycle. 
@@ -198,6 +205,8 @@ Start here:
 
 For specific workflows:
 
+- [Draining pull requests automatically](docs/automated-draining.md): how
+  Shipyard, TartCI and GitHub merge agent pull requests without babysitting.
 - [Agent integration](docs/agent-integration.md): Claude Code, Codex, and
   handoff patterns.
 - [Landing model](docs/landing-model.md): exact-head evidence and merge-queue
