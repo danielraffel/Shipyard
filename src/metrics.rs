@@ -1087,6 +1087,11 @@ impl MetricsStore {
               ON jobs(run_id);
             CREATE INDEX IF NOT EXISTS metrics_steps_job_id
               ON steps(job_id);
+            -- Freshness classifies each job by whether it has a github_job
+            -- step. Keep that existence probe bounded as the metrics store
+            -- grows; without this index a scorecard scans steps once per job.
+            CREATE INDEX IF NOT EXISTS steps_job_step
+              ON steps(job_id, step);
             CREATE TABLE IF NOT EXISTS merge_receipts (
               receipt_id TEXT PRIMARY KEY,
               schema TEXT NOT NULL,
@@ -1231,7 +1236,8 @@ impl MetricsStore {
     }
 
     /// Import validated merge receipts atomically. Duplicate receipt IDs are
-    /// idempotent only when the payload is byte-for-byte equivalent.
+    /// idempotent when the payload is equivalent after ownership-key
+    /// canonicalization, preserving compatibility with legacy mixed-case rows.
     fn insert_merge_receipt_tx(
         tx: &rusqlite::Transaction<'_>,
         receipt: &crate::metrics::merge_receipt::MergeReceipt,
@@ -1249,11 +1255,30 @@ impl MetricsStore {
         let existing: Option<ExistingMergeReceipt> = tx.query_row(
             "SELECT schema,repo,project,base_branch,pr,head_sha,validated_head_sha,merge_commit_sha,merged_at,source,required_checks_json,gate_receipt_sha256,evidence FROM merge_receipts WHERE receipt_id = ?1",
             [&receipt.receipt_id],
-            |row| Ok(ExistingMergeReceipt {
-                schema: row.get(0)?, repo: row.get(1)?, project: row.get(2)?, base_branch: row.get(3)?, pr: row.get(4)?,
-                head_sha: row.get(5)?, validated_head_sha: row.get(6)?, merge_commit_sha: row.get(7)?, merged_at: row.get(8)?,
-                source: row.get(9)?, required_checks_json: row.get(10)?, gate_receipt_sha256: row.get(11)?, evidence: row.get(12)?,
-            }),
+            |row| {
+                let existing_repo: String = row.get(1)?;
+                let existing_repo = crate::evidence::canonical_repository(&existing_repo);
+                let existing_project_raw: String = row.get(2)?;
+                let (existing_project, _) = crate::metrics::project_key::normalize_for_write(
+                    &existing_project_raw,
+                    Some(&existing_repo),
+                );
+                Ok(ExistingMergeReceipt {
+                    schema: row.get(0)?,
+                    repo: existing_repo,
+                    project: existing_project,
+                    base_branch: row.get(3)?,
+                    pr: row.get(4)?,
+                    head_sha: row.get(5)?,
+                    validated_head_sha: row.get(6)?,
+                    merge_commit_sha: row.get(7)?,
+                    merged_at: row.get(8)?,
+                    source: row.get(9)?,
+                    required_checks_json: row.get(10)?,
+                    gate_receipt_sha256: row.get(11)?,
+                    evidence: row.get(12)?,
+                })
+            },
         ).optional()?;
         if let Some(existing) = existing {
             let incoming = ExistingMergeReceipt {
@@ -1657,7 +1682,7 @@ impl MetricsStore {
         let mut samples = 0_usize;
         let mut duration_gaps = 0_usize;
         for ((repo, head), prs) in unique {
-            let mut q = conn.prepare("SELECT job.status, job.total_ms FROM jobs job JOIN runs run ON run.id = job.run_id WHERE lower(trim(run.repo)) = ?1 AND run.sha = ?2 AND run.pr = ?3 AND job.completed_at IS NOT NULL")?;
+            let mut q = conn.prepare("SELECT job.status, job.total_ms FROM jobs job JOIN runs run ON run.id = job.run_id WHERE lower(trim(run.repo)) = ?1 AND (run.head_sha = ?2 OR run.sha = ?2) AND run.pr = ?3 AND run.provenance = 'production' AND run.provenance_verified = 1 AND job.completed_at IS NOT NULL")?;
             let mut matched_pr = None;
             for pr in prs {
                 let mut pr_matched = false;
@@ -1665,7 +1690,10 @@ impl MetricsStore {
                 for row in q.query_map(rusqlite::params![repo, head, pr], |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
                 })? {
-                    let (_, ms) = row?;
+                    let (status, ms) = row?;
+                    if status == "skipped" {
+                        continue;
+                    }
                     if ms.is_none_or(|v| v < 0) {
                         // A completed row with NULL/negative duration cannot
                         // substantiate a cost join. Keep the merge unjoined so
@@ -2043,6 +2071,9 @@ impl MetricsStore {
             .zip(input.started_at)
             .map(|(queued, started)| (started - queued).num_milliseconds())
             .filter(|value| *value >= 0);
+        if input.provenance_verified && input.provenance.as_deref() == Some("production") {
+            ensure_authenticated_identity_complete(input)?;
+        }
         if let Some(provider) = input.provider.as_deref()
             && let Some(existing) =
                 existing_job_id(conn, provider, input.external_id.as_deref())?.or(
@@ -2875,15 +2906,37 @@ impl MetricsStore {
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn ensure_refresh_identity_compatible(
     conn: &Connection,
     job_id: i64,
     input: &MetricRecordInput,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let stored: (Option<String>, Option<i64>, Option<i64>, Option<String>) = conn.query_row(
-        "SELECT event, run_attempt, provider_run_id, head_sha FROM runs WHERE id = (SELECT run_id FROM jobs WHERE id = ?1)",
+    let stored: (
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+    ) = conn.query_row(
+        "SELECT event, run_attempt, provider_run_id, head_sha, sha, repo, branch, pr
+           FROM runs WHERE id = (SELECT run_id FROM jobs WHERE id = ?1)",
         [job_id],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+            ))
+        },
     )?;
     for (name, old, new) in [
         ("event", stored.0, input.event.clone()),
@@ -2898,12 +2951,66 @@ fn ensure_refresh_identity_compatible(
             input.provider_run_id.map(|v| v.to_string()),
         ),
         ("head_sha", stored.3, input.head_sha.clone()),
+        ("sha", stored.4, input.sha.clone()),
+        ("repo", stored.5, input.repo.clone()),
+        ("branch", stored.6, input.branch.clone()),
+        (
+            "pr",
+            stored.7.map(|v| v.to_string()),
+            input.pr.map(|v| v.to_string()),
+        ),
     ] {
-        if let (Some(old), Some(new)) = (old, new)
-            && old != new
-        {
-            return Err(format!("existing job identity conflict in {name}").into());
+        if let (Some(old), Some(new)) = (old, new) {
+            let equal = if name == "repo" {
+                old.trim().eq_ignore_ascii_case(new.trim())
+            } else {
+                old == new
+            };
+            if !equal {
+                return Err(format!("existing job identity conflict in {name}").into());
+            }
         }
+    }
+    Ok(())
+}
+
+fn ensure_authenticated_identity_complete(
+    input: &MetricRecordInput,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let provenance = input.provenance.as_deref();
+    if !matches!(provenance, Some("production" | "synthetic")) {
+        return Err("verified metrics provenance requires production or synthetic label".into());
+    }
+    if input
+        .external_id
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        return Err("verified metrics provenance requires provider external identity".into());
+    }
+    if input
+        .provider
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        return Err("verified metrics provenance requires provider identity".into());
+    }
+    if input
+        .repo
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        return Err("verified metrics provenance requires repository identity".into());
+    }
+    if input.event.as_deref().is_none_or(str::is_empty)
+        || input.run_attempt.is_none_or(|value| value <= 0)
+        || input.provider_run_id.is_none_or(|value| value <= 0)
+        || input
+            .head_sha
+            .as_deref()
+            .is_none_or(|value| !is_exact_sha(value))
+    {
+        return Err("verified metrics provenance requires complete run identity".into());
     }
     Ok(())
 }
@@ -3161,7 +3268,9 @@ fn pull_request_waste(
 ) -> Result<(i64, usize, usize), rusqlite::Error> {
     let mut q = conn.prepare(
         "SELECT job.status, job.total_ms FROM jobs job JOIN runs run ON run.id = job.run_id \
-         WHERE lower(trim(run.repo)) = ?1 AND run.pr = ?2 AND job.completed_at IS NOT NULL",
+         WHERE lower(trim(run.repo)) = ?1 AND run.pr = ?2 \
+           AND run.provenance = 'production' AND run.provenance_verified = 1
+           AND job.completed_at IS NOT NULL",
     )?;
     let mut wasted = 0_i64;
     let mut samples = 0_usize;
@@ -3509,6 +3618,9 @@ fn refresh_existing_job(
     let started_at = started_at.to_rfc3339();
     let completed_at = completed_at.to_rfc3339();
     let step = input.step.as_deref().unwrap_or("total");
+    let authenticated_rebind = input.provenance_verified
+        && input.provenance.as_deref() == Some("production")
+        && input.provider.is_some();
     conn.execute(
         "UPDATE jobs
             SET queued_at = COALESCE(?2, queued_at), started_at = ?3, completed_at = ?4, run_ms = ?5, total_ms = ?5,
@@ -3542,13 +3654,17 @@ fn refresh_existing_job(
     )?;
     conn.execute(
         "UPDATE runs
-            SET ts = ?2, project = ?3, repo = COALESCE(?4, repo),
-                branch = COALESCE(?5, branch), sha = COALESCE(?6, sha),
+            SET ts = ?2, project = ?3,
+                repo = CASE WHEN ?18 THEN ?4 ELSE COALESCE(?4, repo) END,
+                branch = COALESCE(?5, branch),
+                sha = CASE WHEN ?18 THEN ?6 ELSE COALESCE(?6, sha) END,
                 pr = COALESCE(?7, pr), workflow = COALESCE(?8, workflow),
                 profile = COALESCE(?9, profile),
                 routing_decision = COALESCE(?10, routing_decision), status = ?11,
-                event = COALESCE(event, ?12), provider_run_id = COALESCE(provider_run_id, ?13),
-                run_attempt = COALESCE(run_attempt, ?14), head_sha = COALESCE(head_sha, ?15),
+                event = CASE WHEN ?18 THEN ?12 ELSE COALESCE(event, ?12) END,
+                provider_run_id = CASE WHEN ?18 THEN ?13 ELSE COALESCE(provider_run_id, ?13) END,
+                run_attempt = CASE WHEN ?18 THEN ?14 ELSE COALESCE(run_attempt, ?14) END,
+                head_sha = CASE WHEN ?18 THEN ?15 ELSE COALESCE(head_sha, ?15) END,
                 provenance = CASE WHEN ?17 AND ?16 IS NOT NULL THEN ?16 ELSE provenance END,
                 provenance_verified = MAX(provenance_verified, (?17 AND ?16 IS NOT NULL))
           WHERE id = (SELECT run_id FROM jobs WHERE id = ?1)",
@@ -3570,6 +3686,7 @@ fn refresh_existing_job(
             input.head_sha,
             input.provenance,
             input.provenance_verified,
+            authenticated_rebind,
         ],
     )?;
     let updated_steps = conn.execute(
@@ -4403,6 +4520,42 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn metrics_migration_indexes_freshness_step_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let conn = Connection::open(store.path()).unwrap();
+        let present: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'steps_job_step'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(present, 1);
+        let mut plan = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT 1 FROM jobs
+                 WHERE EXISTS (SELECT 1 FROM steps
+                               WHERE steps.job_id = jobs.id
+                                 AND steps.step = 'github_job')",
+            )
+            .unwrap();
+        let details: Vec<String> = plan
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("steps_job_step")),
+            "freshness probe plan did not use steps_job_step: {details:?}"
+        );
+    }
+
     fn insert_scorecard_sample(
         store: &MetricsStore,
         project: &str,
@@ -4448,6 +4601,34 @@ mod tests {
             gate_receipt_sha256: "c".repeat(64),
             evidence: format!("sha256:{id}"),
         }
+    }
+
+    /// Marks a PR's runs as verified production without touching `sha` or
+    /// `head_sha`, for tests whose point is how the two heads differ.
+    fn mark_production_runs_keeping_heads(store: &MetricsStore, pr: i64) {
+        store
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE runs SET provenance='production', provenance_verified=1,
+                    event='pull_request', provider_run_id=?1, run_attempt=1
+                 WHERE pr=?1",
+                [pr],
+            )
+            .unwrap();
+    }
+
+    fn mark_production_runs(store: &MetricsStore, pr: i64) {
+        store
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE runs SET provenance='production', provenance_verified=1,
+                    event='pull_request', provider_run_id=?1, run_attempt=1, head_sha=sha
+                 WHERE pr=?1",
+                [pr],
+            )
+            .unwrap();
     }
 
     fn test_authenticated_envelope(
@@ -4752,6 +4933,33 @@ mod tests {
     }
 
     #[test]
+    fn merge_receipt_reimport_accepts_legacy_mixed_case_project() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        let receipt = test_receipt("legacy-project-case", "owner/repo", "repo", 1, 'a');
+        assert_eq!(
+            store
+                .import_merge_receipts(std::slice::from_ref(&receipt))
+                .unwrap(),
+            1
+        );
+        store
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE merge_receipts SET repo = 'OWNER/REPO', project = 'REPO' WHERE receipt_id = 'legacy-project-case'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .import_merge_receipts(std::slice::from_ref(&receipt))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn authenticated_handoff_persists_fence_and_is_replay_idempotent() {
         let temp = tempfile::tempdir().unwrap();
         let store = MetricsStore::open(temp.path()).unwrap();
@@ -4949,6 +5157,7 @@ mod tests {
             [&"a".repeat(40)],
         )
         .unwrap();
+        mark_production_runs(&store, 10);
         let mut inside = test_receipt("window-in", "OWNER/REPO", "repo", 10, 'a');
         inside.merged_at = Utc::now();
         let mut old = test_receipt("window-old", "owner/repo", "repo", 11, 'd');
@@ -4983,6 +5192,46 @@ mod tests {
     }
 
     #[test]
+    fn safe_merge_summary_joins_authoritative_head_sha_when_legacy_sha_is_null() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        insert_scorecard_sample(&store, "repo", 12, "failure", 1000, 0, false);
+        let conn = store.connect().unwrap();
+        conn.execute(
+            "UPDATE runs SET repo='owner/repo', sha=NULL, head_sha=?1 WHERE pr=12",
+            [&"b".repeat(40)],
+        )
+        .unwrap();
+        mark_production_runs_keeping_heads(&store, 12);
+        let receipt = test_receipt("head-only", "owner/repo", "repo", 12, 'b');
+        store.import_merge_receipts(&[receipt]).unwrap();
+        let (total, joined, _, samples, gaps) = store
+            .safe_merge_summary("repo", "1970-01-01T00:00:00Z")
+            .unwrap();
+        assert_eq!((total, joined, samples, gaps), (1, 1, 1, 0));
+    }
+
+    #[test]
+    fn safe_merge_summary_keeps_legacy_sha_matches_when_both_heads_differ() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        insert_scorecard_sample(&store, "repo", 13, "failure", 1000, 0, false);
+        let conn = store.connect().unwrap();
+        conn.execute(
+            "UPDATE runs SET repo='owner/repo', sha=?1, head_sha=?2 WHERE pr=13",
+            [&"c".repeat(40), &"d".repeat(40)],
+        )
+        .unwrap();
+        mark_production_runs_keeping_heads(&store, 13);
+        let receipt = test_receipt("legacy-head", "owner/repo", "repo", 13, 'c');
+        store.import_merge_receipts(&[receipt]).unwrap();
+        let (_, joined, _, samples, gaps) = store
+            .safe_merge_summary("repo", "1970-01-01T00:00:00Z")
+            .unwrap();
+        assert_eq!((joined, samples, gaps), (1, 1, 0));
+    }
+
+    #[test]
     fn duplicate_receipts_for_one_head_count_once() {
         let temp = tempfile::tempdir().unwrap();
         let store = MetricsStore::open(temp.path()).unwrap();
@@ -4995,6 +5244,7 @@ mod tests {
                 [&"a".repeat(40)],
             )
             .unwrap();
+        mark_production_runs(&store, 30);
         let first = test_receipt("dup-1", "owner/repo", "repo", 30, 'a');
         let mut second = first.clone();
         second.receipt_id = "dup-2".into();
@@ -5024,6 +5274,7 @@ mod tests {
                 [&"a".repeat(40)],
             )
             .unwrap();
+        mark_production_runs(&store, 30);
         let first = test_receipt("head-pr-30", "owner/repo", "repo", 30, 'a');
         let mut second = first.clone();
         second.receipt_id = "head-pr-31".into();
@@ -5114,6 +5365,7 @@ mod tests {
             [&"a".repeat(40)],
         )
         .unwrap();
+        mark_production_runs(&store, 31);
         // Control: another pull request's failure never counts.
         insert_scorecard_sample(&store, "repo", 32, "failure", 9000, 0, false);
         conn.execute("UPDATE runs SET repo='owner/repo' WHERE pr=32", [])
@@ -5161,6 +5413,7 @@ mod tests {
             [&"a".repeat(40)],
         )
         .unwrap();
+        mark_production_runs(&store, 34);
         conn.execute(
             "UPDATE jobs SET total_ms = NULL WHERE job = 'job-34-5000'",
             [],
@@ -5224,6 +5477,7 @@ mod tests {
             [&"a".repeat(40)],
         )
         .unwrap();
+        mark_production_runs(&store, 34);
         store
             .import_merge_receipts(&[test_receipt("pr-34", "owner/repo", "repo", 34, 'a')])
             .unwrap();
@@ -5555,6 +5809,13 @@ mod tests {
                 duration_ms: 100,
                 completed_at: Some(Utc::now()),
                 external_id: Some("test:verified".to_owned()),
+                provider: Some("github".to_owned()),
+                event: Some("pull_request".to_owned()),
+                run_attempt: Some(1),
+                provider_run_id: Some(1),
+                head_sha: Some("a".repeat(40)),
+                sha: Some("a".repeat(40)),
+                repo: Some("owner/shipyard".to_owned()),
                 provenance: Some("production".to_owned()),
                 provenance_verified: true,
                 ..MetricRecordInput::default()
@@ -5563,6 +5824,25 @@ mod tests {
         let verified = store.stewardship_scorecard("shipyard", 1).unwrap();
         assert_eq!(verified.provenance.production, 1);
         assert_eq!(verified.provenance.eligible_samples, 1);
+    }
+
+    #[test]
+    fn verified_production_requires_provider_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let input = MetricRecordInput {
+            project: "shipyard".to_owned(),
+            job: "macos".to_owned(),
+            status: "success".to_owned(),
+            duration_ms: 100,
+            completed_at: Some(Utc::now()),
+            external_id: Some("test:verified".to_owned()),
+            provenance: Some("production".to_owned()),
+            provenance_verified: true,
+            ..MetricRecordInput::default()
+        };
+        let error = store.record_terminal_observation(&input).unwrap_err();
+        assert!(error.to_string().contains("provider identity"));
     }
 
     #[test]
@@ -5743,6 +6023,8 @@ mod tests {
                 pr: Some(10),
                 provider_run_id: Some(2),
                 head_sha: Some("b".repeat(40)),
+                provenance: None,
+                provenance_verified: false,
                 ..bound
             })
             .unwrap();
@@ -5806,6 +6088,7 @@ mod tests {
                 status: "success".into(),
                 completed_at: Some(Utc::now()),
                 duration_ms: 100,
+                external_id: Some("github:1/1/1".into()),
                 event: Some("pull_request".into()),
                 run_attempt: Some(1),
                 provider_run_id: Some(1),
@@ -5961,12 +6244,19 @@ mod tests {
         let store = MetricsStore::open(dir.path()).unwrap();
         let mut input = MetricRecordInput {
             project: "shipyard".to_owned(),
+            repo: Some("owner/shipyard".to_owned()),
             job: "macos".to_owned(),
             status: "success".to_owned(),
             duration_ms: 100,
             completed_at: Some(Utc::now()),
             external_id: Some("github:8/1/1".to_owned()),
             provider: Some("github".to_owned()),
+            event: Some("pull_request".to_owned()),
+            run_attempt: Some(1),
+            pr: Some(8),
+            provider_run_id: Some(1),
+            sha: Some("a".repeat(40)),
+            head_sha: Some("a".repeat(40)),
             provenance: Some("production".to_owned()),
             ..MetricRecordInput::default()
         };
@@ -5975,17 +6265,146 @@ mod tests {
         input.provenance_verified = true;
         store.record_terminal_observation(&input).unwrap();
         input.external_id = Some("github:8/2/1".to_owned());
+        input.provider_run_id = Some(2);
+        input.sha = Some("b".repeat(40));
+        input.head_sha = Some("b".repeat(40));
         input.provenance = Some("production".to_owned());
         input.provenance_verified = false;
         store.record_terminal_observation(&input).unwrap();
         input.provenance = None;
         input.provenance_verified = true;
-        store.record_terminal_observation(&input).unwrap();
+        assert!(store.record_terminal_observation(&input).is_ok());
         let scorecard = store.stewardship_scorecard("shipyard", 1).unwrap();
         assert_eq!(scorecard.provenance.production, 0);
         assert_eq!(scorecard.provenance.synthetic, 1);
         assert_eq!(scorecard.provenance.unknown, 1);
         assert_eq!(scorecard.provenance.eligible_samples, 0);
+    }
+
+    #[test]
+    #[allow(clippy::type_complexity)]
+    fn verified_refresh_requires_complete_identity_and_rejects_conflicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let base = MetricRecordInput {
+            project: "shipyard".to_owned(),
+            repo: Some("owner/shipyard".to_owned()),
+            job: "macos".to_owned(),
+            status: "success".to_owned(),
+            duration_ms: 100,
+            completed_at: Some(Utc::now()),
+            provider: Some("github".to_owned()),
+            external_id: Some("github:9/1/1".to_owned()),
+            event: Some("pull_request".to_owned()),
+            run_attempt: Some(1),
+            pr: Some(9),
+            provider_run_id: Some(1),
+            sha: Some("a".repeat(40)),
+            head_sha: Some("a".repeat(40)),
+            provenance: Some("production".to_owned()),
+            provenance_verified: true,
+            ..MetricRecordInput::default()
+        };
+        let mut legacy = base.clone();
+        legacy.provenance = None;
+        legacy.provenance_verified = false;
+        store.record_terminal_observation(&legacy).unwrap();
+
+        let mut conflicting = base.clone();
+        conflicting.sha = Some("b".repeat(40));
+        conflicting.head_sha = Some("b".repeat(40));
+        assert!(store.record_terminal_observation(&conflicting).is_err());
+
+        let mut incomplete_legacy = base.clone();
+        incomplete_legacy.external_id = Some("github:9/2/1".to_owned());
+        incomplete_legacy.event = None;
+        incomplete_legacy.run_attempt = None;
+        incomplete_legacy.provider_run_id = None;
+        incomplete_legacy.head_sha = None;
+        incomplete_legacy.sha = None;
+        incomplete_legacy.provenance = None;
+        incomplete_legacy.provenance_verified = false;
+        store
+            .record_terminal_observation(&incomplete_legacy)
+            .unwrap();
+        let mut rebound = incomplete_legacy;
+        rebound.event = Some("pull_request".to_owned());
+        rebound.run_attempt = Some(1);
+        rebound.provider_run_id = Some(2);
+        rebound.head_sha = Some("c".repeat(40));
+        rebound.sha = Some("c".repeat(40));
+        rebound.provenance = Some("production".to_owned());
+        rebound.provenance_verified = true;
+        store.record_terminal_observation(&rebound).unwrap();
+        let conn = store.connect().unwrap();
+        let identity: (Option<String>, Option<i64>, Option<i64>, Option<String>, Option<String>) =
+            conn.query_row(
+                "SELECT event, run_attempt, provider_run_id, head_sha, provenance
+                   FROM runs WHERE id = (SELECT run_id FROM jobs WHERE external_id = 'github:9/2/1')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            identity,
+            (
+                Some("pull_request".to_owned()),
+                Some(1),
+                Some(2),
+                Some("c".repeat(40)),
+                Some("production".to_owned()),
+            )
+        );
+
+        // GitHub repository slugs are case-insensitive. A legacy row written
+        // with mixed casing must still be refresh-compatible with canonical
+        // authenticated input.
+        let mut mixed_case = base.clone();
+        mixed_case.external_id = Some("github:9/3/1".to_owned());
+        mixed_case.provenance = None;
+        mixed_case.provenance_verified = false;
+        mixed_case.repo = Some("OWNER/SHIPYARD".to_owned());
+        store.record_terminal_observation(&mixed_case).unwrap();
+        mixed_case.repo = Some("owner/shipyard".to_owned());
+        mixed_case.provenance = Some("production".to_owned());
+        mixed_case.provenance_verified = true;
+        store.record_terminal_observation(&mixed_case).unwrap();
+
+        let mut incomplete = base;
+        incomplete.external_id = Some("github:9/2/1".to_owned());
+        incomplete.head_sha = None;
+        assert!(store.record_terminal_observation(&incomplete).is_err());
+    }
+
+    #[test]
+    fn safe_merge_summary_excludes_unverified_compute() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        insert_scorecard_sample(&store, "repo", 35, "success", 1000, 0, false);
+        let conn = store.connect().unwrap();
+        conn.execute(
+            "UPDATE runs SET repo='owner/repo', sha=?1 WHERE pr=35",
+            [&"a".repeat(40)],
+        )
+        .unwrap();
+        store
+            .import_merge_receipts(&[test_receipt("pr-35", "owner/repo", "repo", 35, 'a')])
+            .unwrap();
+        assert_eq!(
+            store
+                .safe_merge_summary("repo", "1970-01-01T00:00:00Z")
+                .unwrap()
+                .1,
+            0
+        );
+        mark_production_runs(&store, 35);
+        assert_eq!(
+            store
+                .safe_merge_summary("repo", "1970-01-01T00:00:00Z")
+                .unwrap()
+                .1,
+            1
+        );
     }
 
     #[test]
@@ -6049,6 +6468,7 @@ mod tests {
         .expect("repo identity");
         conn.execute("UPDATE runs SET sha = ?1 WHERE pr = 41", [&"a".repeat(40)])
             .expect("head identity");
+        mark_production_runs(&store, 41);
         let receipt = crate::metrics::merge_receipt::MergeReceipt {
             schema: crate::metrics::merge_receipt::SCHEMA.to_owned(),
             receipt_id: "merge-41".to_owned(),

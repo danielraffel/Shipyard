@@ -323,8 +323,19 @@ invalid timestamps produce unavailable queue coverage; do not synthesize
 submit-to-receipt, cache, or model-token measurements. New providers must bind
 those values to authenticated durable events before they are imported.
 
+The GitHub metrics importer has the same provenance boundary: resolve one
+machine-global App helper token through `GhClient`, bind it to the exact
+repository target, and qualify rows only for `github-app-installation` helper
+auth. Ambient `gh` auth and fixtures stay unknown, even when their repository,
+workflow, event, or runner labels look production-like.
+
+The freshness query classifies jobs through their `github_job` step marker and
+must retain the `(steps.job_id, steps.step)` migration index. Without it, a
+large metrics store makes an observational scorecard scan steps once per job.
+
 `metrics scorecard` also reports failed/cancelled compute waste, queue-wait
 coordination cost, and failed-attempt rework as observational baseline metrics.
+
 It does not alter routing or queue behavior. The per-safely-merged-change
 denominator is unavailable until a durable merge receipt joins the PR head;
 distinct PRs are not a safe-merge proxy.
@@ -3498,7 +3509,7 @@ It observes by default; `--apply` enables exact-head guarded queue admission,
 reruns, and narrowly policy-scoped capacity-preemption mutations. Client-side
 REST direct merge is refused because GitHub cannot atomically bind both complete
 check materialization and the validated base revision; use a server-owned merge
-queue or manual merge instead. A base with no merge queue (GitHub offers
+queue or the server-enforced exact-head merge below. A base with no merge queue (GitHub offers
 queues only to organization-owned repositories) reports
 `merge_path: server_enforced_exact_head_merge` when GitHub requires a check set
 that includes the approval context (`--approval-context`, default
@@ -3515,9 +3526,9 @@ request on an owned PR is disarmed (`auto_merge_disabled:<sha>`) on every
 `--apply` pass, approved or not. The org-queue path never takes this merge.
 The bound rule is satisfied only by a check run carrying that app id (the
 canonical `review-verdict` job, github-actions 15368); an app-less status of
-the same name never satisfies it. Because that job succeeds whenever it posts a
-verdict, the newest same-named commit status must also be `success` when one
-exists: a refusing status makes the head `required_failed`
+the same name never satisfies it. The canonical job fails unless the head is
+allowed, and the steward also requires the newest same-named commit status to
+be `success` when one exists: a refusing status makes the head `required_failed`
 (`review-verdict (commit status)`). `--arm-unqueued` reports `not applicable`
 on any base without a merge queue and arms nothing there.
 Apply mode is restricted by central mutation

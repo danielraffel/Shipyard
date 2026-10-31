@@ -35,7 +35,7 @@ use crate::queue_scheduler::{AlreadyMergedCancellation, AlreadyMergedObserver};
 
 use crate::ship::persist_terminal_outcome;
 use crate::worker_process_custody::{
-    ProcessLiveness, terminate_child_tree as terminate_owned_child_tree,
+    ProcessLiveness, related_process_inventory, terminate_child_tree as terminate_owned_child_tree,
 };
 
 /// Absolute deadline for daemon already-merged provider observations.
@@ -183,6 +183,10 @@ pub struct ExecutionSupervisor {
     state_dir: PathBuf,
     children: BTreeMap<String, Child>,
     merge_observers: BTreeMap<PathBuf, (AlreadyMergedObserver, String)>,
+    /// Foreground cancel-requested observers, kept across ticks so the
+    /// observer's re-observe cache bounds provider calls. The set records
+    /// job ids whose checkout provenance already validated for this cwd.
+    foreground_observers: BTreeMap<PathBuf, (AlreadyMergedObserver, BTreeSet<String>)>,
     merge_observer_cwd_cursor: Option<PathBuf>,
     next_queue_absent_recovery: std::time::Instant,
     queue_absent_recovery_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -197,6 +201,9 @@ pub struct ExecutionSupervisor {
     crash_after_intent: bool,
 }
 
+type ForegroundMergedShipJobsByCwd = MergedShipJobsByCwd;
+type MergedFetchOverride<'a> =
+    &'a mut dyn FnMut(&str, u64, StdDuration) -> crate::gh::MergedPrObservation;
 type MergedShipJobsByCwd = BTreeMap<PathBuf, Vec<(Job, crate::queue_request::ExecutionProvenance)>>;
 
 struct QueueAbsentRecoveryFlight(std::sync::Arc<std::sync::atomic::AtomicBool>);
@@ -223,6 +230,7 @@ impl ExecutionSupervisor {
             state_dir,
             children: BTreeMap::new(),
             merge_observers: BTreeMap::new(),
+            foreground_observers: BTreeMap::new(),
             merge_observer_cwd_cursor: None,
             next_queue_absent_recovery: std::time::Instant::now(),
             queue_absent_recovery_in_flight: std::sync::Arc::new(
@@ -281,11 +289,76 @@ impl ExecutionSupervisor {
         // work is never launched, but behind custody repair so a slow git or
         // provider probe cannot starve an existing cancellation.
         self.observe_merged_ship_jobs()?;
+        self.reconcile_receiptless_merged_cancellations()?;
         self.terminate_cancelled_workers()?;
         let unknown_worker = self.reconcile_running()?;
         if !unknown_worker {
             self.heartbeat_running_worker_capacity()?;
             self.admit_pending()?;
+        }
+        Ok(())
+    }
+
+    /// Finish a cancellation that has an authenticated exact-head merge proof
+    /// but no worker receipt. This is the narrow case where releasing a
+    /// foreground claim is safe: GitHub proves the external effect already
+    /// happened, the request remains fenced by the queue CAS, and a fresh
+    /// process/cwd inventory proves no worker tree is still running.
+    fn reconcile_receiptless_merged_cancellations(&self) -> Result<(), SupervisorError> {
+        let mut queue = Queue::new(&self.state_dir)?;
+        let request_store = QueueRequestStore::new(&self.state_dir)?;
+        for job in queue.get_running()? {
+            if job.cancel_requested_at.is_none()
+                || !job.is_stale_running(
+                    Utc::now(),
+                    Duration::seconds(DEFAULT_RUNNING_JOB_STALE_SECONDS),
+                )
+                || !job.cancellation_proof.as_ref().is_some_and(|proof| {
+                    proof.cause == CancellationCause::AlreadyMerged && proof.head_sha == job.sha
+                })
+                || self.receipt_path(&job.id).exists()
+                || TerminationStore::new(&self.state_dir)
+                    .load(&job.id)?
+                    .is_some()
+            {
+                continue;
+            }
+            let Some(envelope) = request_store.load(&job.id)? else {
+                continue;
+            };
+            if envelope.job_id != job.id
+                || !matches!(envelope.request, QueuedExecutionRequest::Ship(_))
+            {
+                continue;
+            }
+            let Ok(related) = related_process_inventory(&job.id, &envelope.cwd) else {
+                // A failed inventory is not evidence that the worker tree is
+                // gone. Leave the cancellation running and retry on the next
+                // supervisor tick; one unavailable OS probe must not prevent
+                // unrelated heartbeats, termination, or admission work.
+                continue;
+            };
+            if !related.is_empty() {
+                continue;
+            }
+            let expected_jobs = queue.get_all()?;
+            let proof = job
+                .cancellation_proof
+                .clone()
+                .expect("checked authenticated merge proof");
+            let Some(cancelled) = queue.finalize_audited_receiptless_cancel(
+                &expected_jobs,
+                &job,
+                crate::queue::ALREADY_MERGED_CANCEL_REASON.to_owned(),
+                proof,
+            )?
+            else {
+                continue;
+            };
+            persist_terminal_outcome(&cancelled, &self.state_dir)
+                .map_err(|error| SupervisorError::Outcome(error.to_string()))?;
+            self.release_host_pool_leases(&job.id)?;
+            break;
         }
         Ok(())
     }
@@ -340,11 +413,12 @@ impl ExecutionSupervisor {
         let deadline = Instant::now() + MERGED_OBSERVATION_TICK_BUDGET;
         let request_store = QueueRequestStore::new(&self.state_dir)?;
         let mut queue = Queue::new(&self.state_dir)?;
-        let (jobs_by_cwd, collection_complete) =
+        let (jobs_by_cwd, foreground_jobs_by_cwd, collection_complete) =
             Self::collect_merged_ship_jobs(&mut queue, &request_store, deadline)?;
-        if jobs_by_cwd.is_empty() {
+        if jobs_by_cwd.is_empty() && foreground_jobs_by_cwd.is_empty() {
             if collection_complete {
                 self.merge_observers.clear();
+                self.foreground_observers.clear();
             }
             return Ok(());
         }
@@ -353,6 +427,8 @@ impl ExecutionSupervisor {
             let active_cwds = jobs_by_cwd.keys().cloned().collect::<BTreeSet<_>>();
             self.merge_observers
                 .retain(|cwd, _| active_cwds.contains(cwd));
+            self.foreground_observers
+                .retain(|cwd, _| foreground_jobs_by_cwd.contains_key(cwd));
         }
         let mut cwd_entries = jobs_by_cwd.into_iter().collect::<Vec<_>>();
         if let Some(cursor) = self.merge_observer_cwd_cursor.as_ref()
@@ -428,19 +504,145 @@ impl ExecutionSupervisor {
                 deadline,
             ));
         }
+        let (foreground_pending, foreground_running) = self.observe_foreground_merged_ship_jobs(
+            foreground_jobs_by_cwd,
+            &request_store,
+            deadline,
+        );
+        pending.extend(foreground_pending);
+        running.extend(foreground_running);
         self.apply_merge_cancellations(pending, running)
+    }
+
+    fn observe_foreground_merged_ship_jobs(
+        &mut self,
+        foreground_jobs_by_cwd: ForegroundMergedShipJobsByCwd,
+        request_store: &QueueRequestStore,
+        deadline: Instant,
+    ) -> (
+        Vec<AlreadyMergedCancellation>,
+        Vec<AlreadyMergedCancellation>,
+    ) {
+        self.observe_foreground_with(
+            foreground_jobs_by_cwd,
+            request_store,
+            deadline,
+            |provenance, cwd| provenance.validate(cwd).is_ok(),
+            None,
+        )
+    }
+
+    /// Observe foreground cancel-requested ships with a per-cwd observer that
+    /// persists across ticks. Checkout validation runs once per job and the
+    /// cwd configuration loads once per observer, so a steady-state tick does
+    /// no git probing and issues provider lookups only when the observer's
+    /// cache expires. `fetch_override` replaces the provider call in tests.
+    fn observe_foreground_with(
+        &mut self,
+        foreground_jobs_by_cwd: ForegroundMergedShipJobsByCwd,
+        request_store: &QueueRequestStore,
+        deadline: Instant,
+        validate: impl Fn(&crate::queue_request::ExecutionProvenance, &Path) -> bool,
+        mut fetch_override: Option<MergedFetchOverride<'_>>,
+    ) -> (
+        Vec<AlreadyMergedCancellation>,
+        Vec<AlreadyMergedCancellation>,
+    ) {
+        let mut pending = Vec::new();
+        let mut running = Vec::new();
+        for (cwd, entries) in foreground_jobs_by_cwd {
+            if Instant::now() >= deadline {
+                break;
+            }
+            let validated = self
+                .foreground_observers
+                .get(&cwd)
+                .map(|(_, ids)| ids.clone())
+                .unwrap_or_default();
+            let mut newly_validated = Vec::new();
+            let jobs = entries
+                .into_iter()
+                .filter(|(job, provenance)| {
+                    if validated.contains(&job.id) {
+                        return true;
+                    }
+                    let ok = validate(provenance, &cwd);
+                    if ok {
+                        newly_validated.push(job.id.clone());
+                    }
+                    ok
+                })
+                .map(|(job, _)| job)
+                .collect::<Vec<_>>();
+            if jobs.is_empty() {
+                continue;
+            }
+            if !self.foreground_observers.contains_key(&cwd) {
+                let Ok(config) = crate::config::LoadedConfig::load_from_cwd_with_global_dir(
+                    self.mode,
+                    &cwd,
+                    self.global_dir.clone(),
+                ) else {
+                    continue;
+                };
+                self.foreground_observers.insert(
+                    cwd.clone(),
+                    (AlreadyMergedObserver::from_config(&config), BTreeSet::new()),
+                );
+            }
+            let (observer, ids) = self
+                .foreground_observers
+                .get_mut(&cwd)
+                .expect("foreground observer inserted for active cwd");
+            ids.extend(newly_validated);
+            ids.retain(|id| jobs.iter().any(|job| &job.id == id));
+            let pending_deadline = deadline
+                .checked_sub(RUNNING_OBSERVATION_RESERVE)
+                .unwrap_or(deadline);
+            if let Some(fetch) = fetch_override.as_deref_mut() {
+                pending.extend(observer.observe_pending_with_deadline(
+                    jobs.as_slice(),
+                    request_store,
+                    pending_deadline,
+                    &mut *fetch,
+                ));
+                running.extend(observer.observe_running_with_deadline(
+                    jobs.as_slice(),
+                    request_store,
+                    deadline,
+                    &mut *fetch,
+                ));
+            } else {
+                pending.extend(observer.observe_pending_until(
+                    jobs.as_slice(),
+                    request_store,
+                    &cwd,
+                    None,
+                    pending_deadline,
+                ));
+                running.extend(observer.observe_running_until(
+                    jobs.as_slice(),
+                    request_store,
+                    &cwd,
+                    None,
+                    deadline,
+                ));
+            }
+        }
+        (pending, running)
     }
 
     fn collect_merged_ship_jobs(
         queue: &mut Queue,
         request_store: &QueueRequestStore,
         deadline: Instant,
-    ) -> Result<(MergedShipJobsByCwd, bool), SupervisorError> {
+    ) -> Result<(MergedShipJobsByCwd, ForegroundMergedShipJobsByCwd, bool), SupervisorError> {
         let all_jobs = queue.get_all()?;
         if Instant::now() >= deadline {
-            return Ok((BTreeMap::new(), false));
+            return Ok((BTreeMap::new(), BTreeMap::new(), false));
         }
         let mut jobs_by_cwd = MergedShipJobsByCwd::new();
+        let mut foreground_jobs_by_cwd = ForegroundMergedShipJobsByCwd::new();
         let mut complete = true;
         for job in all_jobs
             .into_iter()
@@ -453,7 +655,11 @@ impl ExecutionSupervisor {
             let Ok(Some(envelope)) = request_store.load(&job.id) else {
                 continue;
             };
-            if envelope.job_id != job.id || !envelope.is_daemon_admissible() {
+            let foreground_cancelled = envelope.execution_owner == QueuedExecutionOwner::Foreground
+                && job.cancel_requested_at.is_some();
+            if envelope.job_id != job.id
+                || (!envelope.is_daemon_admissible() && !foreground_cancelled)
+            {
                 continue;
             }
             let Some(provenance) = envelope.provenance.as_ref() else {
@@ -469,11 +675,19 @@ impl ExecutionSupervisor {
             // Bind the durable queue row to the immutable request snapshot as
             // well, so a mixed or tampered envelope cannot substitute its own
             // PR head/repository for the job being observed.
-            if provenance.config_signature.is_none()
-                || envelope.cwd != provenance.canonical_cwd
+            if envelope.cwd != provenance.canonical_cwd
                 || job.sha != request.sha
                 || provenance.repo_slug.as_deref() != Some(request.repo.as_str())
             {
+                continue;
+            }
+            if provenance.config_signature.is_none() {
+                if foreground_cancelled {
+                    foreground_jobs_by_cwd
+                        .entry(provenance.canonical_cwd.clone())
+                        .or_default()
+                        .push((job, provenance.clone()));
+                }
                 continue;
             }
             jobs_by_cwd
@@ -481,7 +695,7 @@ impl ExecutionSupervisor {
                 .or_default()
                 .push((job, provenance.clone()));
         }
-        Ok((jobs_by_cwd, complete))
+        Ok((jobs_by_cwd, foreground_jobs_by_cwd, complete))
     }
 
     fn apply_merge_cancellations(
@@ -1256,21 +1470,33 @@ impl ExecutionSupervisor {
         capacity
             .release_inactive_queue_claims(&running.iter().map(|job| job.id.clone()).collect())?;
         for job in running {
+            // Native daemon capacity is not a generic marker for every
+            // Running queue row. Foreground-owned work is supervised by its
+            // caller and must never be adopted or heartbeated by this daemon.
+            // In particular, a foreground worker that vanished before writing
+            // a receipt must not keep a daemon slot alive forever.
+            let Ok(Some(envelope)) = request_store.load(&job.id) else {
+                capacity.release_queue_work(&job.id)?;
+                continue;
+            };
+            if envelope.job_id != job.id || !envelope.is_daemon_admissible() {
+                capacity.release_queue_work(&job.id)?;
+                continue;
+            }
             let probe = DaemonWorkerClaim::queue(&job.id, "");
             if capacity.heartbeat_existing(&probe)? {
                 continue;
             }
-            let authority = match request_store.load(&job.id) {
-                Ok(Some(envelope)) if envelope.is_metadata_authority_controller() => continue,
-                Ok(Some(envelope)) => envelope
-                    .provenance
-                    .as_ref()
-                    .map_or("unknown-running-request", |provenance| {
-                        provenance.head_sha.as_str()
-                    })
-                    .to_owned(),
-                Ok(None) | Err(_) => "unknown-running-request".to_owned(),
-            };
+            if envelope.is_metadata_authority_controller() {
+                continue;
+            }
+            let authority = envelope
+                .provenance
+                .as_ref()
+                .map_or("unknown-running-request", |provenance| {
+                    provenance.head_sha.as_str()
+                })
+                .to_owned();
             if !capacity.claim_or_heartbeat(&DaemonWorkerClaim::queue(&job.id, &authority))? {
                 return Err(SupervisorError::Outcome(
                     "native worker capacity is owned by another daemon runtime".to_owned(),
@@ -1450,8 +1676,19 @@ fn running_resource_claims(
 }
 
 fn requires_merged_ship_observation(job: &Job) -> bool {
-    matches!(job.status, JobStatus::Pending | JobStatus::Running)
-        && job.cancel_requested_at.is_none()
+    // A cancellation request is not a terminal disposition.  We still need
+    // to reconcile a running job against GitHub so an already-merged proof can
+    // upgrade an untyped operator cancellation and release the local claim.
+    // Without this, a foreground worker that disappeared before publishing a
+    // receipt can keep its queue slot forever.
+    //
+    // A job that already holds an exact-head merged proof has nothing left to
+    // observe; re-querying the provider every tick would only add load while
+    // the row waits on its other finalization gates.
+    let proven = job.cancellation_proof.as_ref().is_some_and(|proof| {
+        proof.cause == CancellationCause::AlreadyMerged && proof.head_sha == job.sha
+    });
+    matches!(job.status, JobStatus::Pending | JobStatus::Running) && !proven
 }
 
 fn request_error_is_job_local(error: &QueueRequestError) -> bool {
@@ -2912,7 +3149,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_merged_cancellation_proof_stops_repeated_remote_observation() {
+    fn exact_head_merged_proof_skips_remote_observation() {
         let temp = tempfile::tempdir().expect("tempdir");
         let pending = queued_ship_job(temp.path(), "proven-merged", "exact-head");
         assert!(requires_merged_ship_observation(&pending));
@@ -2937,7 +3174,142 @@ mod tests {
             .expect("request cancellation")
             .expect("running job");
 
+        // An exact-head proof is final input for receiptless cleanup, so the
+        // job is no longer re-observed remotely.
         assert!(!requires_merged_ship_observation(&proven));
+
+        // An untyped operator cancellation still needs observation to be
+        // upgraded with a proof.
+        let untyped = Job {
+            cancellation_proof: None,
+            ..proven.clone()
+        };
+        assert!(requires_merged_ship_observation(&untyped));
+        let wrong_head = Job {
+            sha: "other-head".to_owned(),
+            ..proven
+        };
+        assert!(requires_merged_ship_observation(&wrong_head));
+    }
+
+    fn running_foreground_cancelled_ship(
+        state_dir: &Path,
+        id: &str,
+        sha: &str,
+    ) -> ForegroundMergedShipJobsByCwd {
+        let pending = queued_ship_job(state_dir, id, sha);
+        let mut queue = Queue::new(state_dir).expect("queue");
+        let lock = queue.acquire_drain_lock().expect("lock").expect("owned");
+        queue
+            .start_pending_jobs_for_drain(&lock, std::slice::from_ref(&pending.id))
+            .expect("start");
+        drop(lock);
+        let job = queue
+            .request_cancel_with_proof(&pending.id, Some("operator".to_owned()), None)
+            .expect("request cancellation")
+            .expect("running job");
+        let provenance = crate::queue_request::ExecutionProvenance {
+            canonical_cwd: state_dir.to_path_buf(),
+            repo_root: state_dir.to_path_buf(),
+            repo_slug: Some("owner/repo".to_owned()),
+            head_sha: sha.to_owned(),
+            tree_signature: "tree".to_owned(),
+            config_signature: None,
+        };
+        let mut jobs = ForegroundMergedShipJobsByCwd::new();
+        jobs.entry(state_dir.to_path_buf())
+            .or_default()
+            .push((job, provenance));
+        jobs
+    }
+
+    #[test]
+    fn foreground_observation_reaches_provider_once_across_ticks() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store_dir = temp.path();
+        let mut supervisor = ExecutionSupervisor::new(
+            PathBuf::from("/does/not/exist"),
+            RuntimeMode::Isolated,
+            store_dir.into(),
+            store_dir.into(),
+        );
+        let request_store = QueueRequestStore::new(store_dir).expect("store");
+        let mut remote_calls = 0usize;
+        let validations = std::cell::Cell::new(0usize);
+        let template = running_foreground_cancelled_ship(store_dir, "fg", "exact-head");
+        let mut fetch = |_: &str, _: u64, _: StdDuration| {
+            remote_calls += 1;
+            crate::gh::MergedPrObservation::NotMerged
+        };
+        for _ in 0..5 {
+            let jobs = template.clone();
+            let (pending, running) = supervisor.observe_foreground_with(
+                jobs,
+                &request_store,
+                Instant::now() + StdDuration::from_secs(10),
+                |_, _| {
+                    validations.set(validations.get() + 1);
+                    true
+                },
+                Some(&mut fetch),
+            );
+            assert!(pending.is_empty() && running.is_empty());
+        }
+        assert_eq!(remote_calls, 1, "provider observed more than once");
+        assert_eq!(validations.get(), 1, "checkout validated every tick");
+    }
+
+    #[test]
+    fn foreground_observation_upgrades_exact_head_merge_only() {
+        for (observed, expected) in [("exact-head", true), ("other-head", false)] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let jobs = running_foreground_cancelled_ship(temp.path(), "fg", "exact-head");
+            let mut supervisor = ExecutionSupervisor::new(
+                PathBuf::from("/does/not/exist"),
+                RuntimeMode::Isolated,
+                temp.path().into(),
+                temp.path().into(),
+            );
+            let request_store = QueueRequestStore::new(temp.path()).expect("store");
+            let mut fetch = |_: &str, _: u64, _: StdDuration| {
+                crate::gh::MergedPrObservation::Merged(observed.to_owned())
+            };
+            let (_, running) = supervisor.observe_foreground_with(
+                jobs,
+                &request_store,
+                Instant::now() + StdDuration::from_secs(10),
+                |_, _| true,
+                Some(&mut fetch),
+            );
+            assert_eq!(!running.is_empty(), expected, "{observed}");
+        }
+    }
+
+    #[test]
+    fn foreground_rejected_checkout_never_reaches_provider() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let jobs = running_foreground_cancelled_ship(temp.path(), "fg", "exact-head");
+        let mut supervisor = ExecutionSupervisor::new(
+            PathBuf::from("/does/not/exist"),
+            RuntimeMode::Isolated,
+            temp.path().into(),
+            temp.path().into(),
+        );
+        let request_store = QueueRequestStore::new(temp.path()).expect("store");
+        let mut calls = 0usize;
+        let mut fetch = |_: &str, _: u64, _: StdDuration| {
+            calls += 1;
+            crate::gh::MergedPrObservation::Merged("exact-head".to_owned())
+        };
+        let (p, r) = supervisor.observe_foreground_with(
+            jobs,
+            &request_store,
+            Instant::now() + StdDuration::from_secs(10),
+            |_, _| false,
+            Some(&mut fetch),
+        );
+        assert!(p.is_empty() && r.is_empty());
+        assert_eq!(calls, 0);
     }
 
     #[cfg(unix)]
@@ -3389,6 +3761,297 @@ mod tests {
         assert_eq!(
             queue
                 .get("foreground-running")
+                .expect("read")
+                .expect("job")
+                .status,
+            JobStatus::Running
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn receiptless_foreground_merge_cancellation_recovers_without_manual_restart() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        queued_ship_job(temp.path(), "merged-foreground", "exact-head");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        let mut request = store
+            .load("merged-foreground")
+            .expect("load")
+            .expect("request");
+        request.execution_owner = QueuedExecutionOwner::Foreground;
+        store.save(&request).expect("foreground request");
+
+        let mut queue = Queue::new(temp.path()).expect("queue");
+        let lock = queue.acquire_drain_lock().expect("lock").expect("owned");
+        queue
+            .start_pending_jobs_for_drain(&lock, &["merged-foreground".to_owned()])
+            .expect("start");
+        drop(lock);
+        let proof = CancellationProof {
+            cause: CancellationCause::AlreadyMerged,
+            repository: "owner/repo".to_owned(),
+            pull_request: 438,
+            head_sha: "exact-head".to_owned(),
+        };
+        let mut running = queue
+            .request_cancel_with_proof(
+                "merged-foreground",
+                Some(crate::queue::ALREADY_MERGED_CANCEL_REASON.to_owned()),
+                Some(proof),
+            )
+            .expect("cancel request")
+            .expect("running");
+        running.started_at = Some(Utc::now() - Duration::minutes(4));
+        queue.update(&running).expect("stale running");
+
+        let supervisor = ExecutionSupervisor::new(
+            PathBuf::from("/does/not/exist"),
+            RuntimeMode::Isolated,
+            temp.path().into(),
+            temp.path().into(),
+        );
+        supervisor
+            .reconcile_receiptless_merged_cancellations()
+            .expect("automatic reconciliation");
+
+        let terminal = Queue::new(temp.path())
+            .expect("queue")
+            .get("merged-foreground")
+            .expect("read")
+            .expect("terminal");
+        assert_eq!(terminal.status, JobStatus::Cancelled);
+        assert_eq!(
+            terminal.cancellation_proof.expect("proof").cause,
+            CancellationCause::AlreadyMerged
+        );
+        assert!(
+            QueueOutcomeStore::new(temp.path())
+                .expect("outcomes")
+                .load("merged-foreground")
+                .expect("load outcome")
+                .is_some()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn receiptless_cancellation_without_merge_proof_stays_running() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        queued_ship_job(temp.path(), "unproven-cancel", "exact-head");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        let mut request = store
+            .load("unproven-cancel")
+            .expect("load")
+            .expect("request");
+        request.execution_owner = QueuedExecutionOwner::Foreground;
+        store.save(&request).expect("foreground request");
+
+        let mut queue = Queue::new(temp.path()).expect("queue");
+        let lock = queue.acquire_drain_lock().expect("lock").expect("owned");
+        queue
+            .start_pending_jobs_for_drain(&lock, &["unproven-cancel".to_owned()])
+            .expect("start");
+        drop(lock);
+        let mut running = queue
+            .request_cancel("unproven-cancel", Some("operator cancel".to_owned()))
+            .expect("cancel request")
+            .expect("running");
+        running.started_at = Some(Utc::now() - Duration::minutes(4));
+        queue.update(&running).expect("stale running");
+
+        let supervisor = ExecutionSupervisor::new(
+            PathBuf::from("/does/not/exist"),
+            RuntimeMode::Isolated,
+            temp.path().into(),
+            temp.path().into(),
+        );
+        supervisor
+            .reconcile_receiptless_merged_cancellations()
+            .expect("reconciliation");
+
+        let current = Queue::new(temp.path())
+            .expect("queue")
+            .get("unproven-cancel")
+            .expect("read")
+            .expect("job");
+        assert_eq!(current.status, JobStatus::Running);
+        assert!(current.cancellation_proof.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn receiptless_merge_cancellation_with_related_process_stays_running() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        queued_ship_job(temp.path(), "related-process", "exact-head");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        let mut request = store
+            .load("related-process")
+            .expect("load")
+            .expect("request");
+        request.execution_owner = QueuedExecutionOwner::Foreground;
+        store.save(&request).expect("foreground request");
+
+        let mut queue = Queue::new(temp.path()).expect("queue");
+        let lock = queue.acquire_drain_lock().expect("lock").expect("owned");
+        queue
+            .start_pending_jobs_for_drain(&lock, &["related-process".to_owned()])
+            .expect("start");
+        drop(lock);
+        let proof = CancellationProof {
+            cause: CancellationCause::AlreadyMerged,
+            repository: "owner/repo".to_owned(),
+            pull_request: 438,
+            head_sha: "exact-head".to_owned(),
+        };
+        let mut running = queue
+            .request_cancel_with_proof(
+                "related-process",
+                Some(crate::queue::ALREADY_MERGED_CANCEL_REASON.to_owned()),
+                Some(proof),
+            )
+            .expect("cancel request")
+            .expect("running");
+        running.started_at = Some(Utc::now() - Duration::minutes(4));
+        queue.update(&running).expect("stale running");
+
+        // A process with this job's checkout as cwd is enough to keep the
+        // negative inventory from proving that the worker tree is gone.
+        let mut related = Command::new("/bin/sleep")
+            .arg("30")
+            .current_dir(temp.path())
+            .spawn()
+            .expect("related process");
+        let supervisor = ExecutionSupervisor::new(
+            PathBuf::from("/does/not/exist"),
+            RuntimeMode::Isolated,
+            temp.path().into(),
+            temp.path().into(),
+        );
+        supervisor
+            .reconcile_receiptless_merged_cancellations()
+            .expect("reconciliation");
+        let current = Queue::new(temp.path())
+            .expect("queue")
+            .get("related-process")
+            .expect("read")
+            .expect("job");
+        assert_eq!(current.status, JobStatus::Running);
+        related.kill().expect("kill related process");
+        related.wait().expect("reap related process");
+    }
+
+    #[test]
+    fn receiptless_merge_cancellation_with_mismatched_proof_stays_running() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        queued_ship_job(temp.path(), "wrong-proof", "exact-head");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        let mut request = store.load("wrong-proof").expect("load").expect("request");
+        request.execution_owner = QueuedExecutionOwner::Foreground;
+        store.save(&request).expect("foreground request");
+
+        let mut queue = Queue::new(temp.path()).expect("queue");
+        let lock = queue.acquire_drain_lock().expect("lock").expect("owned");
+        queue
+            .start_pending_jobs_for_drain(&lock, &["wrong-proof".to_owned()])
+            .expect("start");
+        drop(lock);
+        let proof = CancellationProof {
+            cause: CancellationCause::AlreadyMerged,
+            repository: "owner/repo".to_owned(),
+            pull_request: 438,
+            head_sha: "different-head".to_owned(),
+        };
+        let mut running = queue
+            .request_cancel_with_proof(
+                "wrong-proof",
+                Some(crate::queue::ALREADY_MERGED_CANCEL_REASON.to_owned()),
+                Some(proof),
+            )
+            .expect("cancel request")
+            .expect("running");
+        running.started_at = Some(Utc::now() - Duration::minutes(4));
+        queue.update(&running).expect("stale running");
+
+        let supervisor = ExecutionSupervisor::new(
+            PathBuf::from("/does/not/exist"),
+            RuntimeMode::Isolated,
+            temp.path().into(),
+            temp.path().into(),
+        );
+        supervisor
+            .reconcile_receiptless_merged_cancellations()
+            .expect("reconciliation");
+        assert_eq!(
+            Queue::new(temp.path())
+                .expect("queue")
+                .get("wrong-proof")
+                .expect("read")
+                .expect("job")
+                .status,
+            JobStatus::Running
+        );
+    }
+
+    #[test]
+    fn receiptless_merge_cancellation_with_worker_receipt_stays_running() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        queued_ship_job(temp.path(), "present-receipt", "exact-head");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        let mut request = store
+            .load("present-receipt")
+            .expect("load")
+            .expect("request");
+        request.execution_owner = QueuedExecutionOwner::Foreground;
+        store.save(&request).expect("foreground request");
+
+        let mut queue = Queue::new(temp.path()).expect("queue");
+        let lock = queue.acquire_drain_lock().expect("lock").expect("owned");
+        queue
+            .start_pending_jobs_for_drain(&lock, &["present-receipt".to_owned()])
+            .expect("start");
+        drop(lock);
+        let proof = CancellationProof {
+            cause: CancellationCause::AlreadyMerged,
+            repository: "owner/repo".to_owned(),
+            pull_request: 438,
+            head_sha: "exact-head".to_owned(),
+        };
+        let mut running = queue
+            .request_cancel_with_proof(
+                "present-receipt",
+                Some(crate::queue::ALREADY_MERGED_CANCEL_REASON.to_owned()),
+                Some(proof),
+            )
+            .expect("cancel request")
+            .expect("running");
+        running.started_at = Some(Utc::now() - Duration::minutes(4));
+        queue.update(&running).expect("stale running");
+        fs::create_dir_all(temp.path().join("queue-workers")).expect("worker dir");
+        write_json_atomic(
+            &temp.path().join("queue-workers/present-receipt.json"),
+            &WorkerReceipt {
+                job_id: "present-receipt".to_owned(),
+                generation: "unresolved-generation".to_owned(),
+                pid: std::process::id(),
+                started_at: Utc::now(),
+                boot_id: None,
+            },
+        )
+        .expect("worker receipt");
+
+        let supervisor = ExecutionSupervisor::new(
+            PathBuf::from("/does/not/exist"),
+            RuntimeMode::Isolated,
+            temp.path().into(),
+            temp.path().into(),
+        );
+        supervisor
+            .reconcile_receiptless_merged_cancellations()
+            .expect("reconciliation");
+        assert_eq!(
+            Queue::new(temp.path())
+                .expect("queue")
+                .get("present-receipt")
                 .expect("read")
                 .expect("job")
                 .status,

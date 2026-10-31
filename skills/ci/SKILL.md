@@ -138,6 +138,10 @@ minutes. Treat these as cost proxies only. A safely-merged-change denominator
 requires a durable merge receipt and remains unavailable when the local metrics
 store has only PR/job observations; never substitute distinct PR count.
 
+The freshness query classifies jobs through their `github_job` step marker.
+Keep the metrics-store `(steps.job_id, steps.step)` lookup index in migrations;
+without it, a growing store turns every scorecard into a per-job steps scan.
+
 The optional authenticated merge-receipt handoff uses
 `shipyard-merge-receipt-handoff-auth/v1`. Before an importer accepts it, the
 producer transport must bind the canonical payload digest to the exact
@@ -159,6 +163,12 @@ GitHub Actions can omit `pull_requests` on `pull_request_target` runs. The
 metrics importer resolves those rows only through the exact commit's
 authoritative pull-request API response, and keeps the identity unknown when
 that response is empty or ambiguous.
+
+Authenticated metrics imports must pin the machine-global GitHub App helper
+once, bind it to the exact `--repo` target, and mark rows `production` only
+when the helper reports `github-app-installation`. Ambient `gh` auth and
+fixture callers remain `unknown`; never infer promotion provenance from a
+repository, workflow, event, runner label, or token-shaped string.
 
 For a governed receipt transport, `shipyard metrics export merge-receipt
 --repo <owner/repo> --stdout` emits only canonical JSONL records. It is
@@ -4266,6 +4276,8 @@ nodes are also fatal; they must not be filtered into an empty result.
 ### Steward check hydration
 
 The merge steward implicitly manages fleet-authored pull requests before the explicit `shipyard:managed` handoff label is copied. Census observation must therefore hydrate required check identities for those exact heads, while ordinary human pull requests remain excluded from per-PR hydration. Keep this predicate shared with steward classification so green fleet work is not stranded as `waiting_required`.
+
+Hydration is also lazy: drafts, queued rows and `DIRTY`/`CONFLICTING` rows are skipped because classification answers them before it weighs a required check, except rows carrying the managed label, whose handoff status lives in the hydrated checks. Candidates are read four at a time, and an unreadable candidate still fails the observation. The REST fallback for the open-PR list reads `mergeable_state` from `pulls/{n}` for non-draft, non-queued candidates, bound to the listed head; a row it cannot read stays `UNKNOWN` and is never armed. Before a mutation, the live single-PR revalidation reads the same fields as the census (including `author`), and exact-head approval is checked before that live read.
 
 ### Merge receipt import provenance
 
