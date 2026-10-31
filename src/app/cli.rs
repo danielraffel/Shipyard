@@ -1282,7 +1282,7 @@ pub(crate) enum MetricsCommand {
     Import {
         /// Import source.
         #[command(subcommand)]
-        source: MetricsImportCommand,
+        source: Box<MetricsImportCommand>,
     },
     /// Export producer-bound records for an explicit handoff.
     Export {
@@ -2078,6 +2078,8 @@ pub(crate) enum MetricsImportCommand {
     Github(MetricsImportGithubArgs),
     /// Import producer-self-asserted, format-validated protected-branch merge receipts (JSON/JSONL).
     MergeReceipt(MetricsImportMergeReceiptArgs),
+    /// Reconcile one Pulp merge-group artifact with complete GitHub snapshots and import its receipt.
+    GithubMergeReceipt(Box<MetricsImportGithubMergeReceiptArgs>),
 }
 
 #[derive(Debug, Subcommand)]
@@ -2210,6 +2212,49 @@ pub(crate) struct MetricsImportMergeReceiptArgs {
     /// JSON array, one object, or JSONL file. Omit or pass `-` for stdin.
     #[arg(long)]
     pub(crate) file: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct MetricsImportGithubMergeReceiptArgs {
+    /// Exact owner/repo slug.
+    #[arg(long)]
+    pub(crate) repo: String,
+    /// Metrics project key.
+    #[arg(long)]
+    pub(crate) project: String,
+    /// Protected base branch.
+    #[arg(long, default_value = "main")]
+    pub(crate) base_branch: String,
+    /// Extracted Pulp `job.json` artifact.
+    #[arg(long)]
+    pub(crate) artifact: PathBuf,
+    /// Complete GitHub workflow-run JSON snapshot.
+    #[arg(long)]
+    pub(crate) run: PathBuf,
+    /// GitHub pull-request JSON snapshot.
+    #[arg(long = "pull-request")]
+    pub(crate) pull_request: PathBuf,
+    /// Complete check-runs snapshot with `complete: true`.
+    #[arg(long)]
+    pub(crate) checks: PathBuf,
+    /// Normalized branch-protection/ruleset required-check policy snapshot.
+    #[arg(long)]
+    pub(crate) required_check_policy: PathBuf,
+    /// Immutable GitHub artifact URL.
+    #[arg(long)]
+    pub(crate) artifact_url: String,
+    /// GitHub workflow-run URL; must match the run snapshot.
+    #[arg(long)]
+    pub(crate) run_url: String,
+    /// SHA-256 of the reviewed gate policy.
+    #[arg(long)]
+    pub(crate) policy_sha256: String,
+    /// SHA-256 of the collector implementation.
+    #[arg(long)]
+    pub(crate) collector_sha256: String,
+    /// Exact required check name; repeat for every required check.
+    #[arg(long = "required-check")]
+    pub(crate) required_checks: Vec<String>,
 }
 
 #[derive(Debug, Args)]

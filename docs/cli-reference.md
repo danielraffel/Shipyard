@@ -185,6 +185,7 @@ shipyard evidence command --list
 # Runner metrics
 shipyard metrics record --project pulp --job linux-arm64 --step compile --duration 18.4s --target linux-arm64 --backend local --provider tart-linux --host macstudio
 shipyard metrics import github --repo Generous-Corp/pulp --workflow build.yml --limit 10
+shipyard metrics import github-merge-receipt --repo Generous-Corp/pulp --project pulp --artifact job.json --run run.json --pull-request pr.json --checks checks.json --required-check-policy policy.json --artifact-url https://github.com/Generous-Corp/pulp/actions/artifacts/123 --run-url https://github.com/Generous-Corp/pulp/actions/runs/456 --policy-sha256 <sha256> --collector-sha256 <sha256> --required-check macos
 tartci runtime export --repo Generous-Corp/pulp | shipyard metrics import tartci
 shipyard metrics export merge-receipt --repo Generous-Corp/pulp --file "$SHIPYARD_HANDOFF_DIR/merge-receipts.jsonl"
 shipyard metrics export merge-receipt --repo Generous-Corp/pulp --stdout  # canonical JSONL only; for a governed transport
@@ -557,6 +558,33 @@ including dry-run validation, and durable merge receipts are retained.
   stores command evidence.
 - `shipyard metrics import github` imports recent GitHub Actions job timings
   through `gh api`.
+- `shipyard metrics import github-merge-receipt` reconciles one extracted Pulp
+  `job.json` with complete, caller-captured **normalized** GitHub run,
+  pull-request, and check-run snapshots before importing a gate-bound receipt.
+  The normalized run projection must include `pull_requests` (an empty array is
+  valid) and `head_commit_parents` for the exact merge-group commit. It must
+  contain the queue entry's base SHA (the protected base or previous queue
+  entry) followed by the artifact PR head SHA; a different second parent
+  therefore refuses batched groups. The merged PR commit SHA must also equal
+  the merge-group run and artifact merge SHA. The check snapshot
+  must carry `complete: true`, an exact
+  `total_count`, plus the provider-scoped `snapshot_run_id` and
+  `snapshot_run_attempt` matching the observed run. Required checks must carry
+  their own non-null matching run identity; commit-wide check-runs with null
+  identities are rejected unless enriched from the authoritative run jobs.
+  `--required-check-policy` is a normalized `shipyard.required-check-policy/v1`
+  branch-protection/ruleset snapshot whose repository, base branch, and exact
+  required-check list must match the arguments. `--policy-sha256` must be the
+  SHA-256 of its normalized JSON, which proves only that the snapshot is
+  internally consistent. The policy snapshot, its digest and
+  `--collector-sha256` are all caller-asserted: whoever writes the policy can
+  omit a required gate from both it and `--required-check` and still obtain a
+  safe-merge receipt, so the receipt is producer-self-asserted, like one from
+  `metrics import merge-receipt`, and is not evidence of branch-protection
+  provenance. The producer `job.json` may contain additional metadata; the importer
+  projects only the binding fields and accepts numeric-string run IDs. These
+  projections are caller-produced inputs; raw GitHub payloads must be reduced
+  to this schema before import. The command never calls GitHub or merges.
 - `shipyard metrics import tartci` imports JSON/JSONL from
   `tartci runtime export` when a project uses tartci VM lanes.
 - `shipyard metrics import fleet-capacity --file <path>` imports validated
