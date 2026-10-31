@@ -68,14 +68,11 @@ workflow        = "ci.yml"
 lookback        = "7d"
 post_comments   = false
 stale_after_minutes = 45
+# Mirrors the main-required-checks ruleset; Linux, Windows and coverage do not
+# run under the default macos platform focus, so naming them would flag every
+# PR as having a never-run required check.
 required_checks = [
-  "Test Linux [github-hosted]",
-  "Test macOS ARM64 [local]",
-  "Test Windows [github-hosted]",
-  "Sandbox Linux [github-hosted]",
-  "Coverage >= 75% [github-hosted]",
-  "Python helper tests [github-hosted]",
-  "Enforce version & skill sync",
+  "Test macOS ARM64",
   "review-verdict",
 ]
 
