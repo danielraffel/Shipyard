@@ -182,6 +182,7 @@ shipyard metrics record --project pulp --job linux-arm64 --step compile --durati
 shipyard metrics import github --repo Generous-Corp/pulp --workflow build.yml --limit 10
 tartci runtime export --repo Generous-Corp/pulp | shipyard metrics import tartci
 shipyard metrics export merge-receipt --repo Generous-Corp/pulp --file "$SHIPYARD_HANDOFF_DIR/merge-receipts.jsonl"
+shipyard metrics export merge-receipt --repo Generous-Corp/pulp --stdout  # canonical JSONL only; for a governed transport
 shipyard metrics summary --project pulp --json
 shipyard metrics repeated-work-cost --since 14d --limit 1000 --json
 shipyard metrics summary --project pulp --group-by host --json   # fold ephemeral runners into their host
@@ -557,7 +558,9 @@ including dry-run validation, and durable merge receipts are retained.
   JSONL handoff. It reads only the local `merge_receipts` store; it never queries
   GitHub or manufactures receipts. An empty export fails closed without
   replacing the destination, so the downstream cannot record a false
-  successful handoff.
+  successful handoff. `--stdout` is the stream form: it is mutually exclusive
+  with `--file` and emits only canonical JSONL receipt records, with no summary
+  mixed into stdout. It cannot be combined with `--json`.
 - `scripts/merge_receipt_handoff.py export ...` supervises that producer export
   and writes an atomic `shipyard-merge-receipt-handoff/v1` health sidecar;
   `... check --repo <owner/repo> --base-branch main --stale-after 2h` exits `3` for a missing, malformed, failed,

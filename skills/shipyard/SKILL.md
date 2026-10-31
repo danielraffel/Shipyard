@@ -27,6 +27,11 @@ counts each distinct superseded job once, reports clean versus
 uncertain/cancelled/unmatched coverage, and never treats survivor runtime as
 savings. It never turns this evidence into a queue or merge decision.
 
+The producer-side merge-receipt export supports an explicit `--stdout` stream
+mode for a governed transport. It emits canonical JSONL receipt records only;
+`--file` remains the atomic handoff mode, and `--stdout` cannot be combined
+with `--file` or `--json`.
+
 The failure-learning observer is intentionally independent of baseline
 collection. On macOS, use `scripts/install_cause_observer.sh` to render a
 per-user launchd job that runs the read-only `shipyard cause record` pass on a

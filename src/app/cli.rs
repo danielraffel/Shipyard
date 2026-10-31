@@ -2048,8 +2048,12 @@ pub(crate) struct MetricsExportMergeReceiptArgs {
     #[arg(long)]
     pub(crate) repo: String,
     /// Destination JSONL file. The write is atomic.
-    #[arg(long)]
-    pub(crate) file: PathBuf,
+    #[arg(long, required_unless_present = "stdout", conflicts_with = "stdout")]
+    pub(crate) file: Option<PathBuf>,
+    /// Write canonical JSONL records to stdout for a governed transport.
+    /// No summary or other status is written to stdout in this mode.
+    #[arg(long, conflicts_with = "file")]
+    pub(crate) stdout: bool,
 }
 
 #[derive(Debug, Args)]
