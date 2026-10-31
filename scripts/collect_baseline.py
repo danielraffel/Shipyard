@@ -792,6 +792,16 @@ def baseline_readiness(card: dict[str, Any], started: dt.datetime,
             or instrumentation.get("continuous_days") < 5:
         reasons.append({"status": "unavailable", "reason": "continuous instrumentation coverage is unavailable"})
 
+    safe_merge = card.get("collector_safe_merge_denominator")
+    if not isinstance(safe_merge, dict) or safe_merge.get("status") != "available" \
+            or isinstance(safe_merge.get("value"), bool) \
+            or not isinstance(safe_merge.get("value"), (int, float)) \
+            or not math.isfinite(float(safe_merge.get("value", float("nan")))) \
+            or safe_merge.get("value") < 0:
+        reasons.append({
+            "status": "unavailable",
+            "reason": "authenticated safe-merge denominator is unavailable",
+        })
     capacity = card.get("fleet_capacity")
     if not isinstance(capacity, dict):
         reasons.append({"status": "unavailable", "reason": "fleet-capacity freshness is unavailable"})
@@ -914,6 +924,13 @@ def load_status_state(path: pathlib.Path, started: dt.datetime,
     # Validate expired rows too: retention must not silently repair corrupt state.
     validate_status_observations(state["observations"], baseline_started, observed_at)
     return state, baseline_started
+
+
+def readiness_gate_exit(readiness: dict[str, Any], require_ready: bool) -> int:
+    """Return the opt-in gate exit code without changing collection semantics."""
+    if require_ready and readiness.get("optimization_eligible") is not True:
+        return 3
+    return 0
 
 
 def update_state(path: pathlib.Path, project: str, started: dt.datetime,
@@ -1060,6 +1077,8 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=100)
     parser.add_argument("--since-days", type=int, default=5)
     parser.add_argument("--collect", action="store_true", help="run provider imports")
+    parser.add_argument("--require-ready", action="store_true",
+                        help="exit 3 after writing state unless the baseline is optimization-eligible")
     parser.add_argument("--timeout-seconds", type=int, default=300)
     parser.add_argument("--provider-retries", type=int, default=DEFAULT_PROVIDER_RETRIES,
                         help="bounded retries for recognized provider transport failures")
@@ -1149,12 +1168,15 @@ def main() -> int:
                 print(f"prospective pass history unavailable: {history_error}", file=sys.stderr)
         print(f"baseline collection failed: {exc}", file=sys.stderr)
         return 1
+    gate_exit = readiness_gate_exit(state.get("baseline_readiness", {}), args.require_ready)
     output = {"project": args.project, "database": "configured metrics store", "scorecard": card,
               "baseline": {"source_activity_days_observed": state["source_activity_days_observed"],
                            "collection_days_observed": state.get("collection_days_observed", 0),
                            "observation_retention": state["observation_retention"],
                            "readiness": state.get("baseline_readiness", {"status": "unavailable"}),
-                           "exit": state["baseline_exit"]}, "events": events}
+                           "exit": state["baseline_exit"],
+                           "required": args.require_ready,
+                           "gate_exit": gate_exit}, "events": events}
     if args.status_markdown:
         args.status_markdown.write_text(
             "# Organic baseline status\n\n"
@@ -1171,7 +1193,7 @@ def main() -> int:
             "Synthetic provenance, unavailable phases, and merge denominators are not imputed.\n"
         )
     print(json.dumps(output, indent=2, sort_keys=True))
-    return 0
+    return gate_exit
 
 
 if __name__ == "__main__":

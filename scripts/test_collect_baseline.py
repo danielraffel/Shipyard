@@ -1,3 +1,4 @@
+import contextlib
 import datetime as dt
 import contextlib
 import importlib.util
@@ -94,6 +95,12 @@ class BaselineScorecardTests(unittest.TestCase):
             MOD.coverage_value_text({"status": "available", "value": 0.25}),
             "0.25",
         )
+    def test_readiness_gate_is_opt_in_and_requires_optimization_eligibility(self):
+        self.assertEqual(MOD.readiness_gate_exit({"status": "insufficient", "optimization_eligible": False}, False), 0)
+        self.assertEqual(MOD.readiness_gate_exit({"status": "insufficient", "optimization_eligible": False}, True), 3)
+        self.assertEqual(MOD.readiness_gate_exit({"status": "complete_insufficient", "optimization_eligible": False}, True), 3)
+        self.assertEqual(MOD.readiness_gate_exit({"status": "ready", "optimization_eligible": True}, True), 0)
+        self.assertEqual(MOD.readiness_gate_exit({}, True), 3)
 
     def test_readiness_rejects_nonfinite_instrumentation_and_separates_lane_eligibility(self):
         started = dt.datetime(2026, 10, 1, tzinfo=dt.timezone.utc)
@@ -127,6 +134,7 @@ class BaselineScorecardTests(unittest.TestCase):
         complete_card = {
             "instrumentation_coverage": {"status": "available", "continuous": True,
                                           "continuous_days": 5.0},
+            "collector_safe_merge_denominator": {"status": "available", "value": 1},
             "fleet_capacity": {"freshness_status": "fresh",
                                 "status": "available",
                                 "eligible_slot_hours": 1.0,
@@ -145,12 +153,41 @@ class BaselineScorecardTests(unittest.TestCase):
         self.assertFalse(readiness["optimization_eligible"])
         self.assertEqual(readiness["status"], "complete_insufficient")
 
+    def test_readiness_rejects_missing_safe_merge_denominator(self):
+        started = dt.datetime(2026, 10, 1, tzinfo=dt.timezone.utc)
+        observed = started + dt.timedelta(days=5)
+        card = {
+            "instrumentation_coverage": {"status": "available", "continuous": True,
+                                          "continuous_days": 5.0},
+            "fleet_capacity": {"freshness_status": "fresh",
+                                "status": "available",
+                                "eligible_slot_hours": 1.0,
+                                "latest_valid_until": "2026-10-06T00:02:00+00:00",
+                                "freshness_reason": "latest evidence is current"},
+            "important_lanes": {"lane-a": {"status": "available", "completed_jobs": 30}},
+            "host_generations": {"host-a": {"status": "available", "completed_jobs": 10}},
+            "strata": {name: {"provenance": "authenticated", "coverage": "complete", "qualified_jobs": 1}
+                       for name in MOD.REQUIRED_STRATA},
+            "missing_strata": [],
+            "strata_sufficiency": {name: {"status": "sufficient"} for name in MOD.REQUIRED_STRATA},
+        }
+        history_summary = {"five_continuous_24h_days": True, "missing_intervals": [], "failing_intervals": [],
+                           "window_until": observed.isoformat(), "expected_interval_secs": 3600,
+                           "cadence_slack_secs": 300}
+        readiness = MOD.baseline_readiness(card, started, observed, history_summary)
+        self.assertFalse(readiness["report_complete"])
+        self.assertFalse(readiness["optimization_eligible"])
+        self.assertEqual(readiness["status"], "unavailable")
+        self.assertIn("authenticated safe-merge denominator is unavailable",
+                      [reason["reason"] for reason in readiness["reasons"]])
+
     def test_readiness_requires_current_fleet_capacity_evidence(self):
         started = dt.datetime(2026, 10, 1, tzinfo=dt.timezone.utc)
         observed = started + dt.timedelta(days=5)
         card = {
             "instrumentation_coverage": {"status": "available", "continuous": True,
                                           "continuous_days": 5.0},
+            "collector_safe_merge_denominator": {"status": "available", "value": 1},
             "fleet_capacity": {"freshness_status": "stale",
                                 "freshness_reason": "latest evidence expired at 2026-10-05T23:58:00+00:00"},
             "important_lanes": {}, "host_generations": {},
@@ -173,6 +210,7 @@ class BaselineScorecardTests(unittest.TestCase):
         card = {
             "instrumentation_coverage": {"status": "available", "continuous": True,
                                           "continuous_days": 5.0},
+            "collector_safe_merge_denominator": {"status": "available", "value": 1},
             "fleet_capacity": {"freshness_status": "fresh", "status": "partial",
                                 "eligible_slot_hours": None},
             "important_lanes": {}, "host_generations": {},
@@ -330,6 +368,8 @@ class BaselineScorecardTests(unittest.TestCase):
             "safely_merged_changes_per_eligible_slot_hour": {"status": "partial", "value": 0.5},
             "collector_safe_merge_rate": {"status": "partial", "value": 0.5},
             "wasted_compute_per_safely_merged_change": {"status": "partial", "value": 4},
+            "safely_merged_changes_per_eligible_slot_hour": {"status": "partial", "value": 1.5},
+            "collector_safe_merge_rate": {"status": "partial", "value": 1.5},
         }
         MOD.force_receipt_metrics_unavailable(card, "handoff is stale")
         for key in ("safely_merged_changes", "collector_safe_merge_denominator",
@@ -593,6 +633,7 @@ class BaselineStateRetentionTests(unittest.TestCase):
         summary = store.summarize(self.started, observed)
         card = {
             "instrumentation_coverage": {"status": "available", "continuous": True, "continuous_days": 5},
+            "collector_safe_merge_denominator": {"status": "available", "value": 1},
             "fleet_capacity": {"freshness_status": "fresh", "status": "available",
                                 "eligible_slot_hours": 1.0},
             "important_lanes": {"lane": {"status": "available", "completed_jobs": 30}},
@@ -793,6 +834,81 @@ class CollectorInvocationTests(unittest.TestCase):
                             "aggregate": {"observed_jobs": 4, "qualified_jobs": 4}}}
         self.assertEqual(MOD.consume_authenticated_strata(card, repo="o/pulp")["provenance_status"],
                          "authenticated_strata_partial")
+    def test_require_ready_writes_state_and_status_before_exit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            db = root / "metrics" / "metrics.db"
+            state = root / "state.json"
+            status = root / "status.md"
+            argv = ["collect_baseline.py", "--db", str(db), "--project", "pulp",
+                    "--repo", "owner/pulp", "--state", str(state),
+                    "--status-markdown", str(status), "--require-ready"]
+            card = {"strata": {}}
+            output = io.StringIO()
+            with mock.patch.object(MOD, "authoritative_scorecard", return_value=card), \
+                    mock.patch.object(sys, "argv", argv), \
+                    contextlib.redirect_stdout(output):
+                self.assertEqual(MOD.main(), 3)
+            self.assertTrue(state.exists())
+            self.assertTrue(status.exists())
+            payload = json.loads(output.getvalue())
+            self.assertTrue(payload["baseline"]["required"])
+            self.assertEqual(payload["baseline"]["gate_exit"], 3)
+            self.assertFalse(payload["baseline"]["exit"])
+
+            output = io.StringIO()
+            argv = [item for item in argv if item != "--require-ready"]
+            with mock.patch.object(MOD, "authoritative_scorecard", return_value=card), \
+                    mock.patch.object(sys, "argv", argv), \
+                    contextlib.redirect_stdout(output):
+                self.assertEqual(MOD.main(), 0)
+            payload = json.loads(output.getvalue())
+            self.assertFalse(payload["baseline"]["required"])
+            self.assertEqual(payload["baseline"]["gate_exit"], 0)
+
+    def test_require_ready_subprocess_persists_state_and_status_but_default_stays_green(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            if sys.platform == "win32":
+                fake_implementation = root / "fake_shipyard.py"
+                fake_implementation.write_text("import sys\nprint('{}')\n")
+                fake_shipyard = root / "shipyard.cmd"
+                fake_shipyard.write_text(
+                    f'@"{sys.executable}" "{fake_implementation}" %*\n'
+                )
+            else:
+                fake_shipyard = root / "shipyard"
+                fake_shipyard.write_text("#!/usr/bin/env python3\nprint('{}')\n")
+                fake_shipyard.chmod(0o755)
+            db = root / "metrics" / "metrics.db"
+            state = root / "state.json"
+            status = root / "status.md"
+            command = [
+                sys.executable,
+                str(Path(__file__).with_name("collect_baseline.py")),
+                "--shipyard", str(fake_shipyard),
+                "--db", str(db),
+                "--project", "pulp",
+                "--repo", "owner/pulp",
+                "--state", str(state),
+                "--status-markdown", str(status),
+            ]
+
+            gated = subprocess.run(
+                [*command, "--require-ready"], capture_output=True, text=True, check=False
+            )
+            self.assertEqual(gated.returncode, 3, gated.stderr)
+            self.assertTrue(state.exists())
+            self.assertTrue(status.exists())
+            gated_output = json.loads(gated.stdout)
+            persisted = json.loads(state.read_text())
+            self.assertEqual(gated_output["baseline"]["gate_exit"], 3)
+            self.assertFalse(persisted["baseline_readiness"]["optimization_eligible"])
+            self.assertIn("Optimization eligibility: **no**", status.read_text())
+
+            default = subprocess.run(command, capture_output=True, text=True, check=False)
+            self.assertEqual(default.returncode, 0, default.stderr)
+            self.assertEqual(json.loads(default.stdout)["baseline"]["gate_exit"], 0)
 
     def test_project_repo_scope_requires_owner_and_matching_short_name(self):
         for project, repo in [("pulp", "pulp"), ("pulp", "/pulp"), ("pulp", "a/b/pulp"), ("other", "o/pulp")]:

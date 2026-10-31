@@ -5650,3 +5650,9 @@ authenticated `ghapp` wrapper receives `GH_REPO=OWNER/REPO`; do not add a
 Verify with a bounded
 `shipyard --json runner steward --repo OWNER/REPO --base main --arm-unqueued` dry run;
 an empty `prs` list with a repository error is failure, not a healthy idle feeder.
+The collector is report-only by default; callers that gate an optimization may
+pass `--require-ready`, which writes the same state and status first and then
+returns exit 3 unless `optimization_eligible` is true. Keep the scheduled
+collector without that flag so collection continues while the baseline grows.
+In JSON, `baseline.exit` is the existing report-completeness field and
+`baseline.gate_exit` is the opt-in process exit.
