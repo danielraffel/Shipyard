@@ -3903,6 +3903,16 @@ everything.
 
 ### Log retention operations
 
+The bounded cause archive has an explicit `shipyard cause prune` path. It is
+dry-run by default and refuses to mutate an archive until an operator has
+enrolled that mutable operational copy with `--initialize`; frozen or
+unavailable archives remain readable and are never guessed at. On macOS,
+`scripts/install_cleanup.sh` can install the per-user launchd schedule for the
+existing dry-run/apply cleanup passes. Review the rendered plan before using
+`--install`; each run writes a bounded receipt and a failed pass remains
+visible to `shipyard doctor` until a later pass succeeds. This schedule never
+changes queue or GitHub state.
+
 Metrics cleanup uses the existing `SHIPYARD_METRICS_RETENTION_DAYS` policy
 (default 90; nonpositive disables pruning, not collection). It also expires
 queue shadow observations and terminal timing, preserving timing referenced by

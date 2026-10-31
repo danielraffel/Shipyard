@@ -98,6 +98,11 @@ shipyard cause extract --log FILE --job NAME --notice  # `::notice title=ci-caus
 shipyard cause extract --log FILE --format c2  # C2's raw records
 shipyard cause archive --dir DIR --input F   # append records (or scorecard case rows' `cause`) to DIR/causes/YYYY-MM.jsonl;
                                              #   ids already archived are skipped, nothing is rewritten
+shipyard cause prune --dir DIR               # preview bounded archive retention (365 days, 64 MiB)
+shipyard cause prune --dir DIR --apply       # apply only to a managed, mutable archive
+                                             #   (max 36,500 days / 128 MiB; unresolved evidence is preserved)
+shipyard cause prune --dir DIR --apply --initialize
+                                             # explicitly enroll an existing unmarked archive
 shipyard cause record --repo OWNER/REPO --workflow FILE --dir DIR [--since TIME] [--base main]
                                              # read-only observer: a cause row per new red job (DIR/causes/YYYY-MM.jsonl)
                                              #   and a fix-link once its PR or branch goes green (DIR/fixlinks.jsonl);

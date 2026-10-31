@@ -100,6 +100,24 @@ Otherwise, reconcile the month files into `causes/` before retrying: retain all
 rows and never overwrite an existing destination file. No command moves or
 rewrites legacy files automatically.
 
+The archive is bounded explicitly rather than silently growing forever:
+`shipyard cause prune --dir DIR` previews a 365-day, 64 MiB policy, and
+`--apply` rotates complete red-attempt evidence groups under the archive lock.
+The apply path stages and checksums a recoverable transaction; readers share
+the same lock and refuse interrupted transactions until a writer recovers them. Set
+`--retention-days` or `--max-bytes` to adjust the policy (up to 36,500 days and
+128 MiB). A new archive gets `.shipyard-cause-archive.json`; an existing
+historical archive stays unmarked until an explicit
+`shipyard cause prune --dir DIR --apply --initialize` enrollment. Apply refuses
+an unmarked or `frozen: true` archive otherwise. Unkeyed causes, unmatched links
+and unresolved `supersedes` rows are preserved and listed in JSON output; if the
+size cap cannot retain them, pruning refuses. Malformed or unclassifiable rows
+fail closed and are left untouched. Rotation is separate from collection, so
+disabling observation does not delete data. Readers take a shared lock and
+refuse an interrupted transaction without writing to the archive. A frozen
+archive also refuses `cause record` and `cause archive`; copy it to a mutable
+operational archive before collecting or appending new rows.
+
 For a local integrity check, run `shipyard cause audit --dir DIR`. It reads
 the cause month files and `fixlinks.jsonl`, reports malformed rows, duplicate
 cause IDs, duplicate red run attempts, and fix-links with no archived cause,

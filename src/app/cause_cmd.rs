@@ -26,6 +26,7 @@ use serde_json::Value;
 mod advice;
 mod audit;
 mod record;
+mod retention;
 
 use super::CliFailure;
 use super::cli::{CauseArchiveArgs, CauseCommand, CauseExtractArgs, CauseRecordArgs};
@@ -87,31 +88,92 @@ pub(super) fn cause_command<W: Write>(
             };
             written.map_err(|error| CliFailure::new(1, error.to_string()))?;
         }
+        CauseCommand::Prune(args) => return retention::command(&args, json, stdout),
         CauseCommand::Audit(args) => return audit::command(&args, json, stdout),
     }
     Ok(std::process::ExitCode::SUCCESS)
 }
 
-/// A held archive lock. Readers borrow the writer-created lock file when it
-/// exists; they never create archive state merely to inspect it.
+/// Hold an archive lock for the complete writer operation, or share an
+/// existing lock for a reader. Readers never create a lock or recover a
+/// transaction: an archive without a lock is read without one when no
+/// transaction is pending, while an interrupted transaction is refused until
+/// a writer recovers it.
 pub(crate) struct ArchiveLock {
     _file: Option<std::fs::File>,
 }
 
-/// Lock the archive for one complete operation. Writers create the lock file
-/// and take it exclusively; readers take a shared lock when a writer-created
-/// lock file is present and otherwise proceed without creating one.
+fn validate_archive_root(dir: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(dir) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            Err("archive root must be a real directory".to_owned())
+        }
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.to_string()),
+        _ => Ok(()),
+    }
+}
+
+fn validate_archive_layout(dir: &Path) -> Result<(), String> {
+    let causes = dir.join("causes");
+    if let Ok(metadata) = fs::symlink_metadata(&causes) {
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(format!(
+                "cause archive causes path must be a real directory: {}",
+                causes.display()
+            ));
+        }
+        for entry in fs::read_dir(&causes).map_err(|error| error.to_string())? {
+            let path = entry.map_err(|error| error.to_string())?.path();
+            let metadata = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(format!(
+                    "cause archive entry must be a regular file: {}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    let fixlinks = dir.join("fixlinks.jsonl");
+    if let Ok(metadata) = fs::symlink_metadata(&fixlinks)
+        && (metadata.file_type().is_symlink() || !metadata.is_file())
+    {
+        return Err(format!(
+            "cause archive fixlinks must be a regular file: {}",
+            fixlinks.display()
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn lock_archive(dir: &Path, exclusive: bool) -> Result<ArchiveLock, String> {
+    validate_archive_root(dir)?;
+    // Check before creating a lock so a frozen archive remains byte-for-byte
+    // untouched when it has never been opened by this process.
+    if exclusive {
+        retention::ensure_not_frozen(dir)?;
+    } else if retention::is_frozen(dir)? {
+        validate_archive_layout(dir)?;
+        if retention::has_pending_transaction(dir) {
+            return Err(
+                "archive has an interrupted prune; run cause prune --apply to recover before reading"
+                    .to_owned(),
+            );
+        }
+        return Ok(ArchiveLock { _file: None });
+    }
     if exclusive {
         fs::create_dir_all(dir).map_err(|error| error.to_string())?;
     }
-    let metadata = fs::symlink_metadata(dir).map_err(|error| error.to_string())?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err("archive root must be a real directory".to_owned());
+    match fs::symlink_metadata(dir) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err("archive root must be a real directory".to_owned());
+        }
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.to_string()),
+        _ => {}
     }
     let lock_path = dir.join(".lock");
     if let Ok(metadata) = fs::symlink_metadata(&lock_path)
-        && (metadata.file_type().is_symlink() || !metadata.is_file())
+        && !metadata.is_file()
     {
         return Err("archive lock must be a regular file".to_owned());
     }
@@ -124,27 +186,47 @@ pub(super) fn lock_archive(dir: &Path, exclusive: bool) -> Result<ArchiveLock, S
     {
         Ok(lock) => lock,
         Err(error) if !exclusive && error.kind() == std::io::ErrorKind::NotFound => {
+            validate_archive_layout(dir)?;
+            if retention::has_pending_transaction(dir) {
+                return Err(
+                    "archive has an interrupted prune; run cause prune --apply to recover before reading"
+                        .to_owned(),
+                );
+            }
             return Ok(ArchiveLock { _file: None });
+        }
+        Err(error) if !exclusive && error.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Err(error.to_string());
         }
         Err(error) => return Err(error.to_string()),
     };
-    if exclusive {
-        lock.lock_exclusive().map_err(|error| error.to_string())?;
-    } else {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            match fs2::FileExt::try_lock_shared(&lock) {
-                Ok(()) => break,
-                Err(error) if lock_contention(&error) && std::time::Instant::now() < deadline => {
-                    std::thread::sleep(std::time::Duration::from_millis(25));
-                }
-                Err(error) => {
-                    return Err(format!(
-                        "archive lock unavailable after bounded wait: {error}"
-                    ));
-                }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let result = if exclusive {
+            lock.try_lock_exclusive()
+        } else {
+            fs2::FileExt::try_lock_shared(&lock)
+        };
+        match result {
+            Ok(()) => break,
+            Err(error) if lock_contention(&error) && std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "archive lock unavailable after bounded wait: {error}"
+                ));
             }
         }
+    }
+    validate_archive_layout(dir)?;
+    if exclusive {
+        retention::recover_pending_transaction(dir)?;
+    } else if retention::has_pending_transaction(dir) {
+        return Err(
+            "archive has an interrupted prune; run cause prune --apply to recover before reading"
+                .to_owned(),
+        );
     }
     Ok(ArchiveLock { _file: Some(lock) })
 }
@@ -430,6 +512,7 @@ fn archived_ids(dir: &Path) -> Result<BTreeSet<String>, String> {
 pub(super) fn archive(dir: &Path, lines: &[String]) -> Result<ArchiveReport, String> {
     let _lock = lock_archive(dir, true)?;
     require_archive_parent(dir)?;
+    retention::ensure_archive_marker(dir, false)?;
     fs::create_dir_all(causes_dir(dir)).map_err(|error| error.to_string())?;
     let mut seen = archived_ids(dir)?;
     let mut report = ArchiveReport::default();

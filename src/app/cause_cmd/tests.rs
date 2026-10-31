@@ -291,3 +291,115 @@ fn auxiliary_jsonl_files_do_not_prevent_canonical_archiving() {
     let report = archive(dir.path(), &[record(6, "2026-10-13T12:00:00Z")]).unwrap();
     assert_eq!(report.appended, 1);
 }
+
+#[test]
+fn a_managed_archive_without_its_lock_is_read_without_mutation() {
+    let dir = tempfile::tempdir().expect("archive");
+    std::fs::create_dir(dir.path().join("causes")).expect("causes directory");
+    std::fs::write(
+        dir.path().join(".shipyard-cause-archive.json"),
+        br#"{"schema":"shipyard.cause-archive/v1","frozen":false}"#,
+    )
+    .expect("archive marker");
+
+    let _reader = lock_archive(dir.path(), false).expect("missing lock must not block readers");
+    assert!(!dir.path().join(".lock").exists());
+}
+
+#[test]
+fn a_frozen_archive_is_readable_without_creating_a_lock() {
+    let dir = tempfile::tempdir().expect("archive");
+    std::fs::create_dir(dir.path().join("causes")).expect("causes directory");
+    std::fs::write(
+        dir.path().join(".shipyard-cause-archive.json"),
+        br#"{"schema":"shipyard.cause-archive/v1","frozen":true}"#,
+    )
+    .expect("archive marker");
+
+    let _reader = lock_archive(dir.path(), false).expect("frozen reader");
+
+    assert!(!dir.path().join(".lock").exists());
+}
+
+#[test]
+fn a_frozen_archive_with_an_interrupted_prune_is_not_readable() {
+    let dir = tempfile::tempdir().expect("archive");
+    std::fs::create_dir(dir.path().join("causes")).expect("causes directory");
+    std::fs::write(
+        dir.path().join(".shipyard-cause-archive.json"),
+        br#"{"schema":"shipyard.cause-archive/v1","frozen":true}"#,
+    )
+    .expect("archive marker");
+    std::fs::create_dir(dir.path().join(".prune-txn")).expect("pending transaction");
+
+    let Err(error) = lock_archive(dir.path(), false) else {
+        panic!("frozen archive with pending transaction must refuse reads")
+    };
+
+    assert!(error.contains("interrupted prune"), "{error}");
+    assert!(!dir.path().join(".lock").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn frozen_archive_root_symlink_is_rejected_before_reading() {
+    use std::os::unix::fs::symlink;
+
+    let parent = tempfile::tempdir().expect("parent");
+    let outside = tempfile::tempdir().expect("outside");
+    std::fs::create_dir(outside.path().join("causes")).expect("causes directory");
+    std::fs::write(
+        outside.path().join(".shipyard-cause-archive.json"),
+        br#"{"schema":"shipyard.cause-archive/v1","frozen":true}"#,
+    )
+    .expect("archive marker");
+    let link = parent.path().join("archive");
+    symlink(outside.path(), &link).expect("archive symlink");
+
+    let Err(error) = lock_archive(&link, false) else {
+        panic!("symlinked archive root must be rejected")
+    };
+
+    assert!(error.contains("real directory"), "{error}");
+    assert!(!link.join(".lock").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn inaccessible_archive_lock_fails_closed_for_readers() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("archive");
+    std::fs::create_dir(dir.path().join("causes")).expect("causes directory");
+    let lock = dir.path().join(".lock");
+    std::fs::write(&lock, b"").expect("lock");
+    std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+
+    let result = lock_archive(dir.path(), false);
+
+    std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o600)).expect("restore chmod");
+    let Err(error) = result else {
+        panic!("inaccessible lock must fail closed")
+    };
+    assert!(!error.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn archive_refuses_a_symlinked_causes_directory_without_writing_outside() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().expect("archive");
+    let outside = tempfile::tempdir().expect("outside");
+    std::fs::write(
+        dir.path().join(".shipyard-cause-archive.json"),
+        br#"{"schema":"shipyard.cause-archive/v1","frozen":false}"#,
+    )
+    .expect("archive marker");
+    symlink(outside.path(), dir.path().join("causes")).expect("causes symlink");
+
+    let error = archive(dir.path(), &[record(99, "2026-10-13T12:00:00Z")]).unwrap_err();
+
+    assert!(error.contains("real directory"), "{error}");
+    assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
+}

@@ -1222,6 +1222,13 @@ writer custody before mutation.
 | Explain log/artifact retention without mutation | `shipyard cleanup` (dry-run default; includes action reasons, protected evidence, and byte watermarks) |
 | Apply bounded terminal-log retention | `shipyard cleanup --apply` (gzip closed logs; pressure-deletes successful terminal jobs only; honors `.shipyard-retain`) |
 | Serialize an indefinite incident/audit pin | `shipyard cleanup --pin <job-id>` (do not raw-`touch` the marker while cleanup can run) |
+
+Cause archives use the separate `shipyard cause prune` command. It is
+dry-run by default, age/size bounded, and fail-closed for unmarked or frozen
+archives; `--initialize` is an explicit enrollment of a mutable operational
+copy. The optional macOS cleanup installer schedules only these local,
+read-only/retention passes and records a durable receipt; it never arms,
+enqueues, merges, or posts GitHub state.
 | Wait for a release to fully upload | `shipyard wait release v0.23.0 --timeout 900 --json` |
 | Wait for a PR's required checks to go green | `shipyard wait pr 151 --state green --timeout 1800 --json` |
 | Wait for a workflow run to finish | `shipyard wait run 223344 --success --timeout 1200 --json` |

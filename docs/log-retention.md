@@ -24,6 +24,40 @@ low_watermark_bytes = 805306368   # 768 MiB
 Values are clamped to safe ranges. The low watermark cannot exceed the high
 watermark.
 
+## Schedule it on a fleet host
+
+The macOS fleet installer loads a per-user launchd agent that runs both cleanup
+passes every 24 hours. Installation previews both passes but does not delete
+anything until the first scheduled run. It is a plan-only command unless
+`--install` is supplied:
+
+```bash
+scripts/install_cleanup.sh --shipyard "$HOME/.local/bin/shipyard" --install
+```
+
+Each run writes `cleanup/last-run.json` under Shipyard's state directory. The
+receipt contains both command exit codes and bounded output, so a malformed
+queue refusal is visible through `shipyard doctor` and does not disappear into
+launchd's log. The scheduled validation-TMP pass uses `--owned-only`; manual
+cleanup retains the broader opt-in scan. A failed run stays failed until the
+next successful run; the installer never edits queue state to make cleanup
+pass. Disable it with:
+
+```bash
+scripts/install_cleanup.sh --uninstall
+```
+
+If cleanup names a malformed terminal queue job, inspect the proposed remedy
+first, then explicitly move only that raw row into a durable quarantine record:
+
+```bash
+shipyard queue-quarantine JOB_ID
+shipyard queue-quarantine JOB_ID --apply --reason "verified malformed terminal row"
+```
+
+The command is dry-run by default and uses the queue state lock before it
+rewrites `queue.json`.
+
 ## Cleanup receipts and pins
 
 `shipyard cleanup` remains dry-run by default. Human and JSON output explain
