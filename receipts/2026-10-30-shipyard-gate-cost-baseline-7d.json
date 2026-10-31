@@ -1,0 +1,283 @@
+{
+  "schema": "shipyard-gate-cost/v1",
+  "repo": "danielraffel/Shipyard",
+  "workflow": "ci.yml",
+  "gate_job": "Test macOS ARM64 [local]",
+  "base_branch": "main",
+  "from": "2026-10-23T20:59:22.777525+00:00",
+  "to": "2026-10-30T20:59:22.777525+00:00",
+  "pr_head": {
+    "runs": 417,
+    "jobs": 420,
+    "jobs_ran": 419,
+    "jobs_in_progress": 1,
+    "gate_minutes": 1890.5,
+    "wasted_minutes": 409.58,
+    "median_minutes": 4.72,
+    "p25_minutes": 4.23,
+    "p75_minutes": 5.1,
+    "by_conclusion": {
+      "cancelled": 81,
+      "failure": 39,
+      "success": 299
+    }
+  },
+  "merge_group": {
+    "runs": 0,
+    "jobs": 0,
+    "jobs_ran": 0,
+    "jobs_in_progress": 0,
+    "gate_minutes": 0.0,
+    "wasted_minutes": 0.0,
+    "median_minutes": null,
+    "p25_minutes": null,
+    "p75_minutes": null,
+    "by_conclusion": {}
+  },
+  "gate_minutes": 1890.5,
+  "wasted_gate_minutes": 409.58,
+  "merged_prs": 62,
+  "gate_minutes_per_merged_pr": 30.49,
+  "pr_head_runs_per_merged_pr": 6.73,
+  "merge_group_runs_per_merged_pr": 0.0,
+  "batches": {
+    "batches": 0,
+    "unresolved": 0,
+    "prs_in_batches": 0,
+    "mean_prs_per_batch": null,
+    "max_entries_to_merge": null,
+    "max_entries_to_build": null,
+    "mean_fullness": null,
+    "at_capacity": 0,
+    "distribution": {}
+  },
+  "reuse": {
+    "target": "Test macOS ARM64 [local]",
+    "merge_group_runs": 0,
+    "reused": 0,
+    "refused": 0,
+    "no_decision": 0,
+    "unreadable": 0,
+    "rate": null
+  },
+  "current_queue_depth": null,
+  "telemetry_gaps": [
+    {
+      "signal": "gate_minutes",
+      "reason": "1 gate job(s) still running; their minutes are excluded"
+    },
+    {
+      "signal": "max_entries_to_merge",
+      "reason": "no merge_queue rule applies to `main`"
+    },
+    {
+      "signal": "gate_job_name",
+      "reason": "16 of 417 `pull_request` run(s) have no job named exactly `Test macOS ARM64 [local]`; 4 were cancelled before the gate started, which leaves every job name unevaluated, and count as one gate attempt each through the unevaluated name (names: Test ${{ matrix.name }} | Test ${{ matrix.name }} [${{ matrix.provider }}]); 12 run(s) carry no gate job at all and add no gate minutes (renamed, moved to another workflow, or not scheduled)"
+    },
+    {
+      "signal": "current_queue_depth",
+      "reason": "no merge queue on `main`"
+    },
+    {
+      "signal": "runner_census",
+      "reason": "could not read: organisation"
+    },
+    {
+      "signal": "push_type",
+      "reason": "push cancellations are not split by push type: that needs the pull request timeline per run"
+    },
+    {
+      "signal": "queue_depth_history",
+      "reason": "GitHub exposes only the live merge-queue depth; depth at each batch formation is not recorded, so shallow-queue batches cannot be told apart from under-filled ones"
+    }
+  ],
+  "proxies": {
+    "basis": "count-based, load-independent",
+    "runs_per_merged_pr": {
+      "merged_prs": 62,
+      "pr_head_runs": 417,
+      "merge_group_runs": 0,
+      "wasted_attempts": 120,
+      "pr_head_per_merged_pr": 6.73,
+      "merge_group_per_merged_pr": 0.0,
+      "wasted_per_merged_pr": 1.94,
+      "evidence": {
+        "sample": 62,
+        "min_sample": 5,
+        "sufficient": true,
+        "floor": "n>=5 merged PRs; ratios are rounded to 0.01"
+      }
+    },
+    "starvation": {
+      "gate_attempts": 419,
+      "cancelled_before_runner": 5,
+      "superseded_by_push": 5,
+      "share": 0.012,
+      "evidence": {
+        "sample": 419,
+        "min_sample": 10,
+        "sufficient": true,
+        "floor": "n>=10 gate attempts; a job is starved when cancelled with no runner_name, which GitHub leaves empty only for jobs no runner picked up"
+      }
+    },
+    "placement": {
+      "census": "partial",
+      "census_reason": "could not read: organisation",
+      "jobs": 2775,
+      "unserved_label_jobs": 0,
+      "unserved_label_sets": [],
+      "placement_correct_share": 1.0,
+      "by_job_class": {
+        "Coverage >= 75% [${{ needs.resolve-runners.outputs.linux_provider }}]": {
+          "jobs": 4,
+          "assigned": 0,
+          "unserved": 0,
+          "waiting_or_starved": 4,
+          "placement_correct_share": null
+        },
+        "Coverage >= 75% [github-hosted]": {
+          "jobs": 417,
+          "assigned": 417,
+          "unserved": 0,
+          "waiting_or_starved": 0,
+          "placement_correct_share": 1.0
+        },
+        "Python helper tests [${{ needs.resolve-runners.outputs.linux_provider }}]": {
+          "jobs": 4,
+          "assigned": 0,
+          "unserved": 0,
+          "waiting_or_starved": 4,
+          "placement_correct_share": null
+        },
+        "Python helper tests [github-hosted]": {
+          "jobs": 417,
+          "assigned": 417,
+          "unserved": 0,
+          "waiting_or_starved": 0,
+          "placement_correct_share": 1.0
+        },
+        "Resolve runners": {
+          "jobs": 421,
+          "assigned": 419,
+          "unserved": 0,
+          "waiting_or_starved": 2,
+          "placement_correct_share": 1.0
+        },
+        "Test ${{ matrix.name }}": {
+          "jobs": 1,
+          "assigned": 0,
+          "unserved": 0,
+          "waiting_or_starved": 1,
+          "placement_correct_share": null
+        },
+        "Test ${{ matrix.name }} [${{ matrix.provider }}]": {
+          "jobs": 3,
+          "assigned": 0,
+          "unserved": 0,
+          "waiting_or_starved": 3,
+          "placement_correct_share": null
+        },
+        "Test Linux": {
+          "jobs": 1,
+          "assigned": 1,
+          "unserved": 0,
+          "waiting_or_starved": 0,
+          "placement_correct_share": 1.0
+        },
+        "Test Linux [github-hosted]": {
+          "jobs": 416,
+          "assigned": 416,
+          "unserved": 0,
+          "waiting_or_starved": 0,
+          "placement_correct_share": 1.0
+        },
+        "Test Windows": {
+          "jobs": 1,
+          "assigned": 1,
+          "unserved": 0,
+          "waiting_or_starved": 0,
+          "placement_correct_share": 1.0
+        },
+        "Test Windows [github-hosted]": {
+          "jobs": 416,
+          "assigned": 416,
+          "unserved": 0,
+          "waiting_or_starved": 0,
+          "placement_correct_share": 1.0
+        },
+        "Test macOS ARM64": {
+          "jobs": 1,
+          "assigned": 1,
+          "unserved": 0,
+          "waiting_or_starved": 0,
+          "placement_correct_share": 1.0
+        },
+        "Test macOS ARM64 [local]": {
+          "jobs": 416,
+          "assigned": 415,
+          "unserved": 0,
+          "waiting_or_starved": 1,
+          "placement_correct_share": 1.0
+        },
+        "ci-cause (advisory)": {
+          "jobs": 229,
+          "assigned": 97,
+          "unserved": 0,
+          "waiting_or_starved": 132,
+          "placement_correct_share": 1.0
+        },
+        "risk-tier report": {
+          "jobs": 28,
+          "assigned": 0,
+          "unserved": 0,
+          "waiting_or_starved": 28,
+          "placement_correct_share": null
+        }
+      },
+      "evidence": {
+        "sample": 2775,
+        "min_sample": 10,
+        "sufficient": true,
+        "floor": "n>=10 jobs; a label set counts as served when a registered runner advertises it or any job with that exact set got a runner in the window, so an ephemeral pool that minted no runner all window reads as unserved"
+      }
+    },
+    "queue_wait_per_job_ahead": {
+      "median_seconds": 2.0,
+      "raw_median_wait_seconds": 2.0,
+      "evidence": {
+        "sample": 403,
+        "min_sample": 10,
+        "sufficient": true,
+        "floor": "n>=10 gate jobs with created_at and a runner; GitHub timestamps are whole seconds, so movements under ~1s are noise"
+      }
+    },
+    "merge_queue": {
+      "attempts": 0,
+      "attempts_per_merged_pr": 0.0,
+      "ejections": 0,
+      "ejections_by_cause": {},
+      "evidence": {
+        "sample": 62,
+        "min_sample": 5,
+        "sufficient": true,
+        "floor": "n>=5 merged PRs; the cause is the final gate attempt's conclusion"
+      }
+    },
+    "push_cancellations": {
+      "cancelled_pr_head_runs": 81,
+      "superseded_by_push": 81,
+      "share_of_pr_head_runs": 0.194,
+      "by_push_type": null,
+      "evidence": {
+        "sample": 417,
+        "min_sample": 10,
+        "sufficient": true,
+        "floor": "n>=10 PR-head runs; a cancellation counts only when a newer run on the same branch at another commit was created before it completed"
+      }
+    }
+  },
+  "reads": {
+    "github": 431,
+    "cached": 0
+  }
+}

@@ -14,7 +14,9 @@ guard carries to it, is ``success``. Both carries apply here: the merge-only
 carry and the rebase carry (same patch-id, same files, the base touched none
 of them, each keeps its approved blob and mode, no required check skipped or
 receipt-reused). The status is the repository-side rule, so it turns the
-rebase carry on whatever any host's switch says.
+rebase carry on whatever any host's switch says. Base-config signer identity
+bindings are enforced by that same guard, including the stamped host and
+``agent:`` value.
 
 It runs from a workflow triggered by ``pull_request_target``,
 ``issue_comment`` and ``workflow_run`` (a review reaches it through a

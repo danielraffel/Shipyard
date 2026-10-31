@@ -125,6 +125,60 @@ class ReleaseMacosLocalTests(unittest.TestCase):
             release_macos_local.require_arm64("x64")
         self.assertIn("arm64", str(ctx.exception))
 
+    def test_ci_publication_requires_job_identity_and_native_cli(self) -> None:
+        for env in ({}, {"GITHUB_TOKEN": "test-token"}, {"GITHUB_ACTIONS": "true"}):
+            with self.subTest(env=env), mock.patch.dict(os.environ, env, clear=True):
+                with self.assertRaisesRegex(SystemExit, "Actions job token"):
+                    release_macos_local.CommandRunner(ci_mode=True)
+        with mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true", "GITHUB_TOKEN": "test-token"}), mock.patch.object(release_macos_local.shutil, "which", return_value=None):
+            with self.assertRaisesRegex(SystemExit, "native gh"):
+                release_macos_local.CommandRunner(ci_mode=True)
+
+    def test_ci_publication_pins_native_cli_and_overrides_ambient_token(self) -> None:
+        with mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true", "GITHUB_TOKEN": "job-token", "GH_TOKEN": "ambient-token"}), mock.patch.object(release_macos_local.shutil, "which", return_value="/opt/homebrew/bin/gh") as discover, mock.patch.object(release_macos_local.subprocess, "run", return_value=mock.Mock(returncode=0, stdout="")) as run:
+            runner = release_macos_local.CommandRunner(ci_mode=True)
+            runner.run(["gh", "release", "view"])
+            runner.run(["gh", "release", "edit"])
+            discover.assert_called_once_with("gh", path="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
+            self.assertEqual(run.call_args.args[0][0], "/opt/homebrew/bin/gh")
+            self.assertEqual(run.call_args.kwargs["env"]["GH_TOKEN"], "job-token")
+
+    def test_require_ghapp_uses_explicit_runner_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            wrapper = Path(temp) / "managed-ghapp"
+            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+            wrapper.chmod(0o700)
+            with mock.patch.dict(
+                os.environ,
+                {release_macos_local.GHAPP_ENV: str(wrapper)},
+                clear=False,
+            ):
+                self.assertEqual(release_macos_local.require_ghapp(), str(wrapper))
+
+    def test_require_ghapp_resolves_path_with_unset_or_empty_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            wrapper = Path(temp) / "ghapp"
+            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+            wrapper.chmod(0o700)
+            for configured in (None, ""):
+                env = {"PATH": temp}
+                if configured is not None:
+                    env[release_macos_local.GHAPP_ENV] = configured
+                with self.subTest(configured=configured), mock.patch.dict(
+                    os.environ, env, clear=True
+                ):
+                    self.assertEqual(release_macos_local.require_ghapp(), str(wrapper))
+
+    def test_require_ghapp_does_not_use_missing_service_home(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {release_macos_local.GHAPP_ENV: "/Users/ci/.local/bin/ghapp"},
+            clear=False,
+        ):
+            with self.assertRaises(SystemExit) as ctx:
+                release_macos_local.require_ghapp()
+        self.assertIn(release_macos_local.GHAPP_ENV, str(ctx.exception))
+
     def test_package_signed_dmg_forwards_both_existing_binaries(self) -> None:
         config = release_macos_local.ReleaseConfig(
             tag="v0.127.0",
@@ -586,6 +640,23 @@ class ReleaseMacosLocalTests(unittest.TestCase):
             self.assertTrue(any(line.endswith("  shipyard-linux-x64") for line in lines))
             self.assertTrue(any(line.endswith("  shipyard-macos-arm64.dmg") for line in lines))
 
+    def test_ci_upload_uses_native_cli_replacement_without_local_credentials(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            artifact = Path(temp) / "shipyard-macos-arm64.dmg"
+            artifact.write_text("dmg", encoding="utf-8")
+            config = release_macos_local.ReleaseConfig(
+                tag="v0.1.0", repo="danielraffel/Shipyard", artifact_prefix="shipyard",
+                dist_dir=Path(temp), upload=True, ci_mode=True, skip_build=True,
+                binary=None, cargo_target=None,
+            )
+            runner = FakeRunner(assets=[])
+            with mock.patch.object(release_macos_local, "require_ghapp", side_effect=AssertionError("CI must not use local credentials")):
+                release_macos_local.upload_artifact_and_checksums(config, artifact, runner)
+            uploads = [command for command in runner.commands if command[:3] == ["gh", "release", "upload"]]
+            self.assertEqual(len(uploads), 2)
+            self.assertTrue(all("--clobber" in command for command in uploads))
+            self.assertTrue(all("--replace-existing" not in command for command in uploads))
+
     def test_upload_uses_the_bounded_ghapp_publication_surface(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             artifact = Path(temp) / "shipyard-macos-arm64.dmg"
@@ -596,7 +667,7 @@ class ReleaseMacosLocalTests(unittest.TestCase):
                 artifact_prefix="shipyard",
                 dist_dir=Path(temp),
                 upload=True,
-                ci_mode=True,
+                ci_mode=False,
                 skip_build=True,
                 binary=None,
                 cargo_target=None,

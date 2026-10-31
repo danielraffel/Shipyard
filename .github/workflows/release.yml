@@ -177,8 +177,9 @@ jobs:
       - name: Run read-only admission and steward probes against real repositories
         shell: bash
         env:
-          # Public repositories only; a dedicated read token can replace the
-          # job token without changing the gate.
+          # Prefer a dedicated read-only token. The Actions token remains the
+          # fallback; never expose the write-capable release-bot credential to
+          # the binary under test.
           GH_TOKEN: ${{ secrets.RELEASE_SMOKE_GH_TOKEN || github.token }}
           SMOKE_REPOS: ${{ vars.RELEASE_SMOKE_REPOS || 'Generous-Corp/pulp' }}
         run: |
@@ -282,6 +283,14 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
+
+      - name: Verify job-scoped GitHub publication before signing
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -c 'import sys; sys.path.insert(0, "scripts"); from release_macos_local import require_ci_gh; print(require_ci_gh())'
 
       # The signed build must not read a toolchain or crate sources that an
       # earlier job on a shared runner could have written to ~/.cargo or

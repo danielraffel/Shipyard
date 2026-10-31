@@ -45,6 +45,13 @@ APPROVE counts at all ("no signer list is configured on the base branch").
 Every repository that relies on the status, or on `shipyard review-verdict`,
 must set the list on its base branch first.
 
+Repositories that commission more than one provider can bind each signer name
+to stamped host and agent identities with
+`[auto_merge.reviewer_signer_identities]`, for example
+`codex-review = ["Daniels-Mac-Studio-m3 agent:codex-reviewer"]`. The status
+refuses a missing or mismatched host/agent stamp; existing signer and reviewer
+login settings remain unchanged until this map is configured.
+
 An App APPROVE must also carry the `<!-- session: <host>/<session> -->` stamp
 `ghapp` adds, and not an `unattributed` one ("it has no `ghapp` session
 stamp"). Every fleet agent posts as the App, and a body posted around the
