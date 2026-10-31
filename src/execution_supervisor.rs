@@ -183,6 +183,10 @@ pub struct ExecutionSupervisor {
     state_dir: PathBuf,
     children: BTreeMap<String, Child>,
     merge_observers: BTreeMap<PathBuf, (AlreadyMergedObserver, String)>,
+    /// Foreground cancel-requested observers, kept across ticks so the
+    /// observer's re-observe cache bounds provider calls. The set records
+    /// job ids whose checkout provenance already validated for this cwd.
+    foreground_observers: BTreeMap<PathBuf, (AlreadyMergedObserver, BTreeSet<String>)>,
     merge_observer_cwd_cursor: Option<PathBuf>,
     next_queue_absent_recovery: std::time::Instant,
     queue_absent_recovery_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -198,6 +202,8 @@ pub struct ExecutionSupervisor {
 }
 
 type ForegroundMergedShipJobsByCwd = MergedShipJobsByCwd;
+type MergedFetchOverride<'a> =
+    &'a mut dyn FnMut(&str, u64, StdDuration) -> crate::gh::MergedPrObservation;
 type MergedShipJobsByCwd = BTreeMap<PathBuf, Vec<(Job, crate::queue_request::ExecutionProvenance)>>;
 
 struct QueueAbsentRecoveryFlight(std::sync::Arc<std::sync::atomic::AtomicBool>);
@@ -224,6 +230,7 @@ impl ExecutionSupervisor {
             state_dir,
             children: BTreeMap::new(),
             merge_observers: BTreeMap::new(),
+            foreground_observers: BTreeMap::new(),
             merge_observer_cwd_cursor: None,
             next_queue_absent_recovery: std::time::Instant::now(),
             queue_absent_recovery_in_flight: std::sync::Arc::new(
@@ -411,6 +418,7 @@ impl ExecutionSupervisor {
         if jobs_by_cwd.is_empty() && foreground_jobs_by_cwd.is_empty() {
             if collection_complete {
                 self.merge_observers.clear();
+                self.foreground_observers.clear();
             }
             return Ok(());
         }
@@ -419,6 +427,8 @@ impl ExecutionSupervisor {
             let active_cwds = jobs_by_cwd.keys().cloned().collect::<BTreeSet<_>>();
             self.merge_observers
                 .retain(|cwd, _| active_cwds.contains(cwd));
+            self.foreground_observers
+                .retain(|cwd, _| foreground_jobs_by_cwd.contains_key(cwd));
         }
         let mut cwd_entries = jobs_by_cwd.into_iter().collect::<Vec<_>>();
         if let Some(cursor) = self.merge_observer_cwd_cursor.as_ref()
@@ -505,10 +515,35 @@ impl ExecutionSupervisor {
     }
 
     fn observe_foreground_merged_ship_jobs(
-        &self,
+        &mut self,
         foreground_jobs_by_cwd: ForegroundMergedShipJobsByCwd,
         request_store: &QueueRequestStore,
         deadline: Instant,
+    ) -> (
+        Vec<AlreadyMergedCancellation>,
+        Vec<AlreadyMergedCancellation>,
+    ) {
+        self.observe_foreground_with(
+            foreground_jobs_by_cwd,
+            request_store,
+            deadline,
+            |provenance, cwd| provenance.validate(cwd).is_ok(),
+            None,
+        )
+    }
+
+    /// Observe foreground cancel-requested ships with a per-cwd observer that
+    /// persists across ticks. Checkout validation runs once per job and the
+    /// cwd configuration loads once per observer, so a steady-state tick does
+    /// no git probing and issues provider lookups only when the observer's
+    /// cache expires. `fetch_override` replaces the provider call in tests.
+    fn observe_foreground_with(
+        &mut self,
+        foreground_jobs_by_cwd: ForegroundMergedShipJobsByCwd,
+        request_store: &QueueRequestStore,
+        deadline: Instant,
+        validate: impl Fn(&crate::queue_request::ExecutionProvenance, &Path) -> bool,
+        mut fetch_override: Option<MergedFetchOverride<'_>>,
     ) -> (
         Vec<AlreadyMergedCancellation>,
         Vec<AlreadyMergedCancellation>,
@@ -519,40 +554,80 @@ impl ExecutionSupervisor {
             if Instant::now() >= deadline {
                 break;
             }
+            let validated = self
+                .foreground_observers
+                .get(&cwd)
+                .map(|(_, ids)| ids.clone())
+                .unwrap_or_default();
+            let mut newly_validated = Vec::new();
             let jobs = entries
                 .into_iter()
-                .filter(|(_, provenance)| provenance.validate(&cwd).is_ok())
+                .filter(|(job, provenance)| {
+                    if validated.contains(&job.id) {
+                        return true;
+                    }
+                    let ok = validate(provenance, &cwd);
+                    if ok {
+                        newly_validated.push(job.id.clone());
+                    }
+                    ok
+                })
                 .map(|(job, _)| job)
                 .collect::<Vec<_>>();
             if jobs.is_empty() {
                 continue;
             }
-            let Ok(config) = crate::config::LoadedConfig::load_from_cwd_with_global_dir(
-                self.mode,
-                &cwd,
-                self.global_dir.clone(),
-            ) else {
-                continue;
-            };
-            let mut observer = AlreadyMergedObserver::from_config(&config);
-            pending.extend(
-                observer.observe_pending_until(
+            if !self.foreground_observers.contains_key(&cwd) {
+                let Ok(config) = crate::config::LoadedConfig::load_from_cwd_with_global_dir(
+                    self.mode,
+                    &cwd,
+                    self.global_dir.clone(),
+                ) else {
+                    continue;
+                };
+                self.foreground_observers.insert(
+                    cwd.clone(),
+                    (AlreadyMergedObserver::from_config(&config), BTreeSet::new()),
+                );
+            }
+            let (observer, ids) = self
+                .foreground_observers
+                .get_mut(&cwd)
+                .expect("foreground observer inserted for active cwd");
+            ids.extend(newly_validated);
+            ids.retain(|id| jobs.iter().any(|job| &job.id == id));
+            let pending_deadline = deadline
+                .checked_sub(RUNNING_OBSERVATION_RESERVE)
+                .unwrap_or(deadline);
+            if let Some(fetch) = fetch_override.as_deref_mut() {
+                pending.extend(observer.observe_pending_with_deadline(
+                    jobs.as_slice(),
+                    request_store,
+                    pending_deadline,
+                    &mut *fetch,
+                ));
+                running.extend(observer.observe_running_with_deadline(
+                    jobs.as_slice(),
+                    request_store,
+                    deadline,
+                    &mut *fetch,
+                ));
+            } else {
+                pending.extend(observer.observe_pending_until(
                     jobs.as_slice(),
                     request_store,
                     &cwd,
                     None,
-                    deadline
-                        .checked_sub(RUNNING_OBSERVATION_RESERVE)
-                        .unwrap_or(deadline),
-                ),
-            );
-            running.extend(observer.observe_running_until(
-                jobs.as_slice(),
-                request_store,
-                &cwd,
-                None,
-                deadline,
-            ));
+                    pending_deadline,
+                ));
+                running.extend(observer.observe_running_until(
+                    jobs.as_slice(),
+                    request_store,
+                    &cwd,
+                    None,
+                    deadline,
+                ));
+            }
         }
         (pending, running)
     }
@@ -1606,7 +1681,14 @@ fn requires_merged_ship_observation(job: &Job) -> bool {
     // upgrade an untyped operator cancellation and release the local claim.
     // Without this, a foreground worker that disappeared before publishing a
     // receipt can keep its queue slot forever.
-    matches!(job.status, JobStatus::Pending | JobStatus::Running)
+    //
+    // A job that already holds an exact-head merged proof has nothing left to
+    // observe; re-querying the provider every tick would only add load while
+    // the row waits on its other finalization gates.
+    let proven = job.cancellation_proof.as_ref().is_some_and(|proof| {
+        proof.cause == CancellationCause::AlreadyMerged && proof.head_sha == job.sha
+    });
+    matches!(job.status, JobStatus::Pending | JobStatus::Running) && !proven
 }
 
 fn request_error_is_job_local(error: &QueueRequestError) -> bool {
@@ -3067,7 +3149,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_merged_cancellation_proof_stops_repeated_remote_observation() {
+    fn exact_head_merged_proof_skips_remote_observation() {
         let temp = tempfile::tempdir().expect("tempdir");
         let pending = queued_ship_job(temp.path(), "proven-merged", "exact-head");
         assert!(requires_merged_ship_observation(&pending));
@@ -3092,10 +3174,142 @@ mod tests {
             .expect("request cancellation")
             .expect("running job");
 
-        // Cancellation is still nonterminal. The observer must be able to
-        // upgrade an untyped request with an authenticated exact-head merge
-        // proof so receiptless cleanup can release the local claim safely.
-        assert!(requires_merged_ship_observation(&proven));
+        // An exact-head proof is final input for receiptless cleanup, so the
+        // job is no longer re-observed remotely.
+        assert!(!requires_merged_ship_observation(&proven));
+
+        // An untyped operator cancellation still needs observation to be
+        // upgraded with a proof.
+        let untyped = Job {
+            cancellation_proof: None,
+            ..proven.clone()
+        };
+        assert!(requires_merged_ship_observation(&untyped));
+        let wrong_head = Job {
+            sha: "other-head".to_owned(),
+            ..proven
+        };
+        assert!(requires_merged_ship_observation(&wrong_head));
+    }
+
+    fn running_foreground_cancelled_ship(
+        state_dir: &Path,
+        id: &str,
+        sha: &str,
+    ) -> ForegroundMergedShipJobsByCwd {
+        let pending = queued_ship_job(state_dir, id, sha);
+        let mut queue = Queue::new(state_dir).expect("queue");
+        let lock = queue.acquire_drain_lock().expect("lock").expect("owned");
+        queue
+            .start_pending_jobs_for_drain(&lock, std::slice::from_ref(&pending.id))
+            .expect("start");
+        drop(lock);
+        let job = queue
+            .request_cancel_with_proof(&pending.id, Some("operator".to_owned()), None)
+            .expect("request cancellation")
+            .expect("running job");
+        let provenance = crate::queue_request::ExecutionProvenance {
+            canonical_cwd: state_dir.to_path_buf(),
+            repo_root: state_dir.to_path_buf(),
+            repo_slug: Some("owner/repo".to_owned()),
+            head_sha: sha.to_owned(),
+            tree_signature: "tree".to_owned(),
+            config_signature: None,
+        };
+        let mut jobs = ForegroundMergedShipJobsByCwd::new();
+        jobs.entry(state_dir.to_path_buf())
+            .or_default()
+            .push((job, provenance));
+        jobs
+    }
+
+    #[test]
+    fn foreground_observation_reaches_provider_once_across_ticks() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store_dir = temp.path();
+        let mut supervisor = ExecutionSupervisor::new(
+            PathBuf::from("/does/not/exist"),
+            RuntimeMode::Isolated,
+            store_dir.into(),
+            store_dir.into(),
+        );
+        let request_store = QueueRequestStore::new(store_dir).expect("store");
+        let mut remote_calls = 0usize;
+        let validations = std::cell::Cell::new(0usize);
+        let template = running_foreground_cancelled_ship(store_dir, "fg", "exact-head");
+        let mut fetch = |_: &str, _: u64, _: StdDuration| {
+            remote_calls += 1;
+            crate::gh::MergedPrObservation::NotMerged
+        };
+        for _ in 0..5 {
+            let jobs = template.clone();
+            let (pending, running) = supervisor.observe_foreground_with(
+                jobs,
+                &request_store,
+                Instant::now() + StdDuration::from_secs(10),
+                |_, _| {
+                    validations.set(validations.get() + 1);
+                    true
+                },
+                Some(&mut fetch),
+            );
+            assert!(pending.is_empty() && running.is_empty());
+        }
+        assert_eq!(remote_calls, 1, "provider observed more than once");
+        assert_eq!(validations.get(), 1, "checkout validated every tick");
+    }
+
+    #[test]
+    fn foreground_observation_upgrades_exact_head_merge_only() {
+        for (observed, expected) in [("exact-head", true), ("other-head", false)] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let jobs = running_foreground_cancelled_ship(temp.path(), "fg", "exact-head");
+            let mut supervisor = ExecutionSupervisor::new(
+                PathBuf::from("/does/not/exist"),
+                RuntimeMode::Isolated,
+                temp.path().into(),
+                temp.path().into(),
+            );
+            let request_store = QueueRequestStore::new(temp.path()).expect("store");
+            let mut fetch = |_: &str, _: u64, _: StdDuration| {
+                crate::gh::MergedPrObservation::Merged(observed.to_owned())
+            };
+            let (_, running) = supervisor.observe_foreground_with(
+                jobs,
+                &request_store,
+                Instant::now() + StdDuration::from_secs(10),
+                |_, _| true,
+                Some(&mut fetch),
+            );
+            assert_eq!(!running.is_empty(), expected, "{observed}");
+        }
+    }
+
+    #[test]
+    fn foreground_rejected_checkout_never_reaches_provider() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let jobs = running_foreground_cancelled_ship(temp.path(), "fg", "exact-head");
+        let mut supervisor = ExecutionSupervisor::new(
+            PathBuf::from("/does/not/exist"),
+            RuntimeMode::Isolated,
+            temp.path().into(),
+            temp.path().into(),
+        );
+        let request_store = QueueRequestStore::new(temp.path()).expect("store");
+        let mut calls = 0usize;
+        let mut fetch = |_: &str, _: u64, _: StdDuration| {
+            calls += 1;
+            crate::gh::MergedPrObservation::Merged("exact-head".to_owned())
+        };
+        let (p, r) = supervisor.observe_foreground_with(
+            jobs,
+            &request_store,
+            Instant::now() + StdDuration::from_secs(10),
+            |_, _| false,
+            Some(&mut fetch),
+        );
+        assert!(p.is_empty() && r.is_empty());
+        assert_eq!(calls, 0);
     }
 
     #[cfg(unix)]
