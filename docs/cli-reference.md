@@ -575,8 +575,13 @@ including dry-run validation, and durable merge receipts are retained.
   `--required-check-policy` is a normalized `shipyard.required-check-policy/v1`
   branch-protection/ruleset snapshot whose repository, base branch, and exact
   required-check list must match the arguments. `--policy-sha256` must be the
-  SHA-256 of its canonical JSON, so a caller cannot omit a required gate and
-  still obtain a safe-merge receipt. The producer `job.json` may contain additional metadata; the importer
+  SHA-256 of its normalized JSON, which proves only that the snapshot is
+  internally consistent. The policy snapshot, its digest and
+  `--collector-sha256` are all caller-asserted: whoever writes the policy can
+  omit a required gate from both it and `--required-check` and still obtain a
+  safe-merge receipt, so the receipt is producer-self-asserted, like one from
+  `metrics import merge-receipt`, and is not evidence of branch-protection
+  provenance. The producer `job.json` may contain additional metadata; the importer
   projects only the binding fields and accepts numeric-string run IDs. These
   projections are caller-produced inputs; raw GitHub payloads must be reduced
   to this schema before import. The command never calls GitHub or merges.

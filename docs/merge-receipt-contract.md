@@ -90,10 +90,17 @@ the receipt. The Pulp `job.json` projection is the one exception for producer
 metadata: extra producer fields are ignored after the nine binding fields are
 strictly normalized, including a decimal-string `run_id`.
 
-The required-check list is not trusted merely because it was supplied on the
-command line. The caller must provide a normalized
-`shipyard.required-check-policy/v1` branch-protection/ruleset snapshot whose
-repository, protected base branch, and exact ordered check list match the
-reconciliation arguments. `--policy-sha256` is the SHA-256 of that canonical
-snapshot. A missing, mismatched, or unverifiable policy refuses the receipt;
-safe-merge metrics never use a caller-selected subset of checks.
+The required-check list is checked for consistency, not authenticated. The
+caller must provide a normalized `shipyard.required-check-policy/v1`
+branch-protection/ruleset snapshot whose repository, protected base branch,
+and exact ordered check list match the reconciliation arguments, and
+`--policy-sha256` must be the SHA-256 of that normalized snapshot. A missing or
+mismatched policy, or a digest that does not match the snapshot, refuses the
+receipt. That proves the inputs agree with each other and nothing more: the
+policy snapshot, its digest and `collector_sha256` are all supplied by the
+caller, so whoever writes the policy can also produce its digest, and can drop
+a required gate from both the policy and `--required-check` and still obtain a
+safe-merge receipt. The receipt is therefore producer-self-asserted, like one
+imported with `metrics import merge-receipt`, and carries the same
+`source: "shipyard"` as one emitted at the protected merge boundary; consumers
+must not treat it as evidence of branch-protection provenance.
