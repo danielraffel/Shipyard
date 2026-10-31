@@ -39,6 +39,11 @@ When CI code consumes required-check materialization, preserve producer
 identity (`app_id`) when policy distinguishes checks that share a context name.
 If the materialized endpoint omits that identity, retain ambiguous skipped
 attempts so a success from one producer cannot satisfy another producer.
+An app-bound rule is also satisfied by a commit status that app created, as
+GitHub's branch protection counts it: a status whose REST `creator` is
+`github-actions[bot]` (user id 41898282) carries GitHub Actions' app id 15368.
+The PR rollup omits a status's creator, so read the creator over REST; a status
+from any other creator never satisfies a bound rule.
 
 `metrics repeated-work-cost` is read-only accounting for shadow observations
 within its explicit `--since` baseline window. Its `duration_ms` is measured
