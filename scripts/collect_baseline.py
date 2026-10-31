@@ -191,6 +191,7 @@ def import_organic(args: argparse.Namespace) -> list[dict[str, Any]]:
             pathlib.Path(health_path).expanduser(), receipt_path, args.repo,
             getattr(args, "merge_receipt_stale_after", "2h"),
             getattr(args, "merge_receipt_base_branch", "main"),
+            getattr(args, "merge_receipt_source_host", None),
         )
         with immutable_handoff_snapshot(receipt_path, handoff_payload) as snapshot:
             return _import_organic_after_preflight(args, state_dir, snapshot)
@@ -360,7 +361,8 @@ def prepare_tartci_export(text: str, repo: str, project: str) -> tuple[str, int]
 
 
 def validate_merge_receipt_health(path: pathlib.Path, handoff: pathlib.Path, repo: str,
-                                  stale_after: str, base_branch: str = "main") -> tuple[dict[str, Any], bytes]:
+                                  stale_after: str, base_branch: str = "main",
+                                  expected_source_host: str | None = None) -> tuple[dict[str, Any], bytes]:
     """Require a producer health sidecar before importing its handoff."""
     if receipt_handoff is None:
         raise RuntimeError("merge receipt health validation is unavailable")
@@ -389,6 +391,23 @@ def validate_merge_receipt_health(path: pathlib.Path, handoff: pathlib.Path, rep
         raise RuntimeError(f"merge receipt health base branch is not {base_branch}")
     if health.get("freshness_basis") != receipt_handoff.FRESHNESS_BASIS:
         raise RuntimeError("merge receipt health has an unsupported freshness basis")
+    recorded_source_host = health.get("source_host")
+    if recorded_source_host is not None:
+        try:
+            receipt_handoff.validate_source_host(recorded_source_host)
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+    if expected_source_host is not None:
+        try:
+            receipt_handoff.validate_source_host(expected_source_host)
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+        if not isinstance(recorded_source_host, str):
+            raise RuntimeError("merge receipt health is missing source_host provenance")
+        if recorded_source_host.casefold() != expected_source_host.casefold():
+            raise RuntimeError(
+                f"merge receipt health source_host is {recorded_source_host}, expected {expected_source_host}"
+            )
     recorded_file = health.get("file")
     if not isinstance(recorded_file, str) or pathlib.Path(recorded_file).resolve() != handoff.resolve():
         raise RuntimeError("merge receipt health is bound to a different handoff file")
@@ -947,6 +966,8 @@ def main() -> int:
                         help="maximum producer handoff age when --merge-receipt-health is supplied")
     parser.add_argument("--merge-receipt-base-branch", default="main",
                         help="protected base branch bound to producer receipts")
+    parser.add_argument("--merge-receipt-source-host",
+                        help="expected managed fleet host that produced the receipt handoff")
     parser.add_argument("--merge-receipt-unavailable-reason",
                         help="explicit reason the authenticated producer handoff was unavailable")
     parser.add_argument("--limit", type=int, default=100)
