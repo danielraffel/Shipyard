@@ -192,8 +192,14 @@ fn lock_archive_with_options(
         return Err("archive lock must be a regular file".to_owned());
     }
     let mutable_archive = create_mutable_read_lock
+        && retention::is_managed(dir)?
         && (fs::symlink_metadata(dir.join("causes")).is_ok()
             || fs::symlink_metadata(dir.join("fixlinks.jsonl")).is_ok());
+    if mutable_archive {
+        // Validate before creating a missing reader lock so malformed or
+        // symlinked archives remain metadata-free and fail closed.
+        validate_archive_layout(dir)?;
+    }
     let lock = match OpenOptions::new()
         // Mutable archives join the writer lock domain even when no lock file
         // exists yet. Frozen archives return above and remain read-only.

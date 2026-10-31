@@ -331,25 +331,6 @@ fn cleanup_retention(
     let _cleanup_guard = (!dry_run)
         .then(|| acquire_cleanup_lock(state_dir))
         .transpose()?;
-    // Queue mutations acquire the writer-domain lease while holding the queue
-    // lock. Acquire that lock first for cleanup's log mutation pass so the
-    // cleanup writer cannot invert the queue -> writer lock order.
-    let queue_lock = if !dry_run && has_job_log_directories(state_dir)? {
-        Some(
-            Queue::new(state_dir)
-                .map_err(|error| CliFailure::new(1, error.to_string()))?
-                .lock_for_log_cleanup()
-                .map_err(|error| CliFailure::new(1, error.to_string()))?,
-        )
-    } else {
-        None
-    };
-    let _writer_domain = if dry_run {
-        None
-    } else {
-        crate::writer_domain_lease::acquire_for_protected_path(state_dir)
-            .map_err(|error| CliFailure::new(1, error.to_string()))?
-    };
     let mut items = Vec::new();
     let mut protected_items = Vec::new();
     reject_log_symlinks(&state_dir.join("logs"))?;
@@ -390,7 +371,7 @@ fn cleanup_retention(
         &queue_jobs,
         policy,
         dry_run,
-        queue_lock.is_some(),
+        false,
         &mut items,
         &mut protected_items,
     )?;
@@ -1106,6 +1087,12 @@ fn with_log_mutation_guard<T>(
 ) -> Result<T, CliFailure> {
     if queue_lock_held {
         recheck_mutation_boundary(candidate)?;
+        let state_dir = candidate
+            .logs_root
+            .parent()
+            .ok_or_else(|| CliFailure::new(1, "invalid log staging boundary"))?;
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(state_dir)
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
         return mutation().map_err(|error| CliFailure::new(1, error.to_string()));
     }
     let Some(state_dir) = candidate.path.parent().and_then(Path::parent) else {
@@ -1116,6 +1103,8 @@ fn with_log_mutation_guard<T>(
         .lock_for_log_cleanup()
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     recheck_mutation_boundary(candidate)?;
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(state_dir)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
     mutation().map_err(|error| CliFailure::new(1, error.to_string()))
 }
 
