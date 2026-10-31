@@ -97,6 +97,89 @@ fn annotations_are_read_for_cancelled_required_jobs_and_starved_siblings_only() 
     assert_eq!(annotation_targets(&target), vec![2, 3]);
 }
 
+#[test]
+fn required_failure_logs_use_the_escape_safe_authenticated_reader() {
+    let target = Target {
+        head_sha: "abc".to_owned(),
+        jobs: vec![
+            job(7, "required", "failure", false),
+            job(8, "optional", "failure", false),
+            job(9, "required", "success", false),
+        ],
+        required: vec!["required".to_owned()],
+        unreadable: Vec::new(),
+    };
+    let asked = std::sync::Mutex::new(Vec::new());
+    let read = |args: &[String]| {
+        asked.lock().expect("lock").push(args.to_vec());
+        assert!(args.iter().any(|arg| arg == "--allow-escape-sequences"));
+        Ok("\u{1b}[31mFAILED\u{1b}[0m".to_owned())
+    };
+
+    assert_eq!(
+        read_logs(&read, "o/r", &target),
+        HashMap::from([(7, "\u{1b}[31mFAILED\u{1b}[0m".to_owned())])
+    );
+    assert_eq!(
+        asked.lock().expect("lock").as_slice(),
+        [vec![
+            "api".to_owned(),
+            "--allow-escape-sequences".to_owned(),
+            "repos/o/r/actions/jobs/7/logs".to_owned(),
+        ]]
+    );
+}
+
+#[test]
+fn required_failure_logs_fall_back_for_an_old_gh() {
+    let target = Target {
+        head_sha: "abc".to_owned(),
+        jobs: vec![job(7, "required", "failure", false)],
+        required: vec!["required".to_owned()],
+        unreadable: Vec::new(),
+    };
+    let asked = std::sync::Mutex::new(Vec::new());
+    let read = |args: &[String]| {
+        asked.lock().expect("lock").push(args.to_vec());
+        if args.iter().any(|arg| arg == "--allow-escape-sequences") {
+            Err("unknown flag: --allow-escape-sequences".to_owned())
+        } else {
+            Ok("plain log".to_owned())
+        }
+    };
+
+    assert_eq!(
+        read_logs(&read, "o/r", &target),
+        HashMap::from([(7, "plain log".to_owned())])
+    );
+    assert_eq!(
+        asked.lock().expect("lock").as_slice(),
+        [
+            vec![
+                "api".to_owned(),
+                "--allow-escape-sequences".to_owned(),
+                "repos/o/r/actions/jobs/7/logs".to_owned(),
+            ],
+            vec!["api".to_owned(), "repos/o/r/actions/jobs/7/logs".to_owned()],
+        ]
+    );
+}
+
+#[test]
+fn malformed_negative_job_ids_are_not_wrapped_into_log_paths() {
+    let target = Target {
+        head_sha: "abc".to_owned(),
+        jobs: vec![job(-7, "required", "failure", false)],
+        required: vec!["required".to_owned()],
+        unreadable: Vec::new(),
+    };
+    let read = |_args: &[String]| -> Result<String, String> {
+        panic!("a negative job id must not be read")
+    };
+
+    assert!(read_logs(&read, "o/r", &target).is_empty());
+}
+
 fn entry(pr: u64, kind: FlagKind, route: DigestRoute, seen: DateTime<Utc>) -> LedgerEntry {
     LedgerEntry {
         pr,

@@ -30,7 +30,8 @@ fails closed. `-` or an omitted file reads stdin.
 
 The SQLite store keeps receipts in `merge_receipts`, keyed by `receipt_id`.
 Scorecards count distinct imported safe `head_sha` values in the requested
-window. A receipt joins only when completed jobs exist for its exact `repo`,
+window on the measured protected `main` branch. A receipt joins only when
+completed jobs exist for its exact `repo`,
 exact `head_sha`, and PR number. A joined change's wasted compute is every
 failed or cancelled job of that pull request, earlier pushes included, so
 `wasted_compute_per_safely_merged_change` is per change, not per merged head.
