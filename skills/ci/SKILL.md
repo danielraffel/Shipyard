@@ -4323,6 +4323,42 @@ At the protected merge boundary, Shipyard may produce that receipt only after
 GitHub confirms the exact validated head is merged and supplies a nonzero merge
 commit and merge timestamp. Queue admission or auto-merge activation is not a
 merge receipt; queue supervision must wait for the later merged observation.
+
+### Durable reviewer claims
+
+Reviewer dispatch is head-bound and lease-like. Shipyard records the exact PR
+head, reviewer identity, deadline, and a monotonic claim epoch in durable
+ship-state. A reviewer must publish only while its claim is current; after a
+heartbeat timeout or explicit revocation, the standby lane receives a new epoch
+and the old reviewer cannot make its late verdict count. Agents should use the
+repository's configured handoff and native merge mechanism and must not wake or
+wait on an interactive team-lead tab.
+
+Acquire a claim with `shipyard reviewer-claim acquire --pr N --repo OWNER/REPO
+--head SHA --reviewer NAME`. Acquire first reads the PR base branch's
+`.shipyard/config.toml`: `[auto_merge] reviewer_claim_receipt` must be
+`reviewer-claim` (the fixed receipt check name and the `--check-name` default)
+and `reviewer_claim_app` must name the receipt App by slug or id. An absent or
+partial policy, or one naming the shared GitHub Actions App (id 15368,
+`github-actions`) or `shipyard-local`, refuses the claim before anything is
+persisted. Acquire then persists the claim and publishes the
+`shipyard-reviewer-claim/v1` check-run receipt; a created receipt that is not
+from the configured App is marked failed and the claim is revoked. When the
+protected base enables `[auto_merge] reviewer_claim_receipt` and
+`reviewer_claim_app`, the managed `reviewer-claim-guard` calls
+`shipyard reviewer-claim validate` immediately before a verdict write; expired,
+revoked, replaced, legacy, or wrong-head state is refused. The arm guard
+matches the receipt's repository case-insensitively and judges a verdict
+comment at the later of its `created_at` and `updated_at`, so a verdict edited
+after the claim deadline does not count. The claim fence is effectively per
+host and per reviewer name: `validate` compares the local ship-state's epoch
+with itself, the client guard keys on `SHIPYARD_AGENT_ID`, and a fresh
+ship-state resets the epoch to 0, so two hosts (or two agents sharing a
+reviewer name) do not fence each other. `shipyard reviewer-claim revoke` is
+intentionally unavailable until authenticated App receipt invalidation is
+exposed; claims expire or are superseded by exact-head adoption fencing in the
+meantime.
+
 # Local Rust gate placement
 
 Shipyard's pre-push hook selects the repository-pinned Rust channel on the

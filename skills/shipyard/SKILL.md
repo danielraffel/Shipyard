@@ -4193,7 +4193,18 @@ repositories whatever a host's opt-out says, the rebase carry on unless
 reviewer_signers`, never a host, refusing every App APPROVE where a
 review-required repository lists none); exit 0 allowed, 1 refused, 2
 unreadable, and a caller treats 2 as refused. The review-verdict status pins the rebase carry on for
-the same reason. A merge-only update carries the approval only when every file the PR
+the same reason. When the protected base enables `reviewer_claim_receipt` and
+`reviewer_claim_app`, acquire a claim with `shipyard reviewer-claim acquire`
+before the verdict; acquire takes the receipt App from that base policy and
+refuses an absent, partial or shared-App policy (GitHub Actions id 15368)
+before claiming. The managed `reviewer-claim-guard` validates the exact
+head, reviewer, epoch and deadline immediately before the ghapp write. The
+fence is effectively per host and per reviewer name (`validate` compares the
+local ship-state's epoch with itself, the client guard keys on
+`SHIPYARD_AGENT_ID`, and a fresh ship-state resets the epoch to 0).
+`shipyard reviewer-claim revoke` is intentionally unavailable until
+authenticated App receipt invalidation is exposed; claims expire or are
+superseded by exact-head adoption fencing in the meantime. A merge-only update carries the approval only when every file the PR
 changes keeps its approved blob and mode (the compare API lists no mode, so
 both twins read the files' directory trees), the base changed none of them
 (a rename counts under both names, so a base edit to a file the PR renames
@@ -5583,6 +5594,17 @@ formatting and lint gates; m1 is a fallback, not a universal gate. Local gates
 do not grant merge authority: GitHub CI, branch protection, and the configured
 Shipyard mutation machine remain authoritative.
 
+
+
+### Durable reviewer handoff
+
+Shipyard's reviewer handoff is generic across repository landing models. Each
+claim names the exact PR head and a monotonic epoch; only the current unexpired
+claim can publish a counted verdict. The standby reviewer is failover capacity,
+not a second approval. A changed head, revoked claim, or expired deadline
+requires a fresh claim. Landing still follows the repository adapter: native
+merge queues are admitted through their queue, while serial repositories keep
+their guarded path.
 
 ## Pulp feeder provenance recovery
 
