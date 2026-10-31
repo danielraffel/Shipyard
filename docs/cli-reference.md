@@ -254,6 +254,10 @@ shipyard runner steward --provenance-blocking-label 5·unresolved # repeatable a
 shipyard runner steward --arm-unqueued              # audit green, unqueued, UNARMED PRs
 shipyard runner steward --arm-unqueued --apply      # arm native auto-merge on them
 shipyard runner steward --approval-context review-verdict  # no-queue base: exact-head merge only when GitHub requires this app-bound check
+                                                    # every pass also disarms auto-merge on unapproved heads; removing
+                                                    #   unapproved queue entries is gated by the machine-global
+                                                    #   [merge_steward] unapproved_dequeue = "report" (default: report
+                                                    #   would_dequeue_*, remove nothing) | "apply"
 shipyard runner steward-handoff --repo OWNER/REPO --pr 123 --head "$SHA" --workstream-id GEN-7 --context-url https://linear.app/... --apply
 shipyard runner steward-handoff --repo OWNER/REPO --pr 123 --head "$SHA" --workstream-id GEN-7 --context-url https://linear.app/... --agent-provider codex --agent-session-id NEW_SESSION --transfer-agent-owner --apply
 shipyard pr --workstream-id GEN-7 --context-url https://linear.app/...   # free-form handoff identifiers

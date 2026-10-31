@@ -474,6 +474,7 @@ fn an_armed_request_on_an_unapproved_waiting_head_is_disarmed() {
         arm_unqueued: false,
         approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
         wake_owner: false,
+        unapproved_dequeue: crate::app::merge_steward_cmd::DequeueMode::Report,
         apply: true,
         ledger: None,
     };

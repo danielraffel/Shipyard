@@ -107,6 +107,7 @@ esac
         arm_unqueued: false,
         approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
         wake_owner: false,
+        unapproved_dequeue: crate::app::merge_steward_cmd::DequeueMode::Report,
         apply: true,
         ledger: None,
     };
@@ -2224,6 +2225,7 @@ esac
         arm_unqueued: true,
         approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
         wake_owner: false,
+        unapproved_dequeue: crate::app::merge_steward_cmd::DequeueMode::Report,
         apply: true,
         ledger: None,
     };
@@ -2364,6 +2366,7 @@ fn steward_dry_run_needs_no_mutation_authority_and_makes_no_remote_write() {
         arm_unqueued: false,
         approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
         wake_owner: false,
+        unapproved_dequeue: crate::app::merge_steward_cmd::DequeueMode::Report,
         apply: false,
         ledger: None,
     };
@@ -2452,6 +2455,7 @@ esac
             arm_unqueued: false,
             approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
             wake_owner,
+            unapproved_dequeue: crate::app::merge_steward_cmd::DequeueMode::Report,
             apply: true,
             ledger: None,
         }
@@ -2800,6 +2804,7 @@ fi
         arm_unqueued: false,
         approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
         wake_owner: false,
+        unapproved_dequeue: crate::app::merge_steward_cmd::DequeueMode::Report,
         apply: true,
         ledger: None,
     };
@@ -2861,6 +2866,7 @@ fn routing_readiness_hold_does_not_suppress_an_unrelated_pr_in_repo_plan() {
         arm_unqueued: false,
         approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
         wake_owner: false,
+        unapproved_dequeue: crate::app::merge_steward_cmd::DequeueMode::Report,
         apply: false,
         ledger: None,
     };
@@ -2905,6 +2911,7 @@ fn disabled_preemption_ignores_preemption_only_observation_errors() {
         arm_unqueued: false,
         approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
         wake_owner: false,
+        unapproved_dequeue: crate::app::merge_steward_cmd::DequeueMode::Report,
         apply: false,
         ledger: None,
     };

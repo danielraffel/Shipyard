@@ -55,6 +55,10 @@ pub(super) struct StewardCommandArgs {
     /// and no merge queue, owned PRs are admitted by exact-head auto-merge.
     pub(super) approval_context: String,
     pub(super) wake_owner: bool,
+    /// `[merge_steward] unapproved_dequeue`: whether the sweep removes
+    /// unapproved queue entries or only reports them. Read from the
+    /// machine-global config by [`steward_command`].
+    pub(super) unapproved_dequeue: unapproved_admission::DequeueMode,
     pub(super) apply: bool,
     pub(super) ledger: Option<PathBuf>,
 }
@@ -168,10 +172,15 @@ struct StewardLedger {
     /// policy was unreadable, keyed `repo#pr:head`. See `unapproved_admission`.
     #[serde(default)]
     dequeue_unreadable: BTreeMap<String, u32>,
-    /// Queue removals the steward made itself, keyed `repo#pr:head`; they do
-    /// not count toward the head's ejection cap.
+    /// Superseded by `steward_removals`; read so an older ledger still
+    /// loads, and pruned.
     #[serde(default)]
     steward_dequeues: BTreeMap<String, u32>,
+    /// When the steward itself removed each head from the queue, keyed
+    /// `repo#pr:head` (RFC 3339); exactly those removals do not count toward
+    /// the head's ejection cap.
+    #[serde(default)]
+    steward_removals: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1082,7 +1091,10 @@ pub(super) fn steward_command<W: Write>(
     json_output: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
-    let (normalized_args, repos) = normalized_steward_args(args, cwd)?;
+    let (mut normalized_args, repos) = normalized_steward_args(args, cwd)?;
+    normalized_args.unapproved_dequeue =
+        unapproved_admission::DequeueMode::from_machine_global(&runtime_paths.global_dir)
+            .map_err(|error| CliFailure::new(2, error))?;
     let args = &normalized_args;
     let ledger_path = args
         .ledger
@@ -1404,6 +1416,7 @@ mod resume_record;
 mod terminal_handoff;
 pub(super) mod train;
 mod unapproved_admission;
+pub(super) use unapproved_admission::DequeueMode;
 
 use cancellation::{
     apply_repo_plan, cancellation_reason_label, queue_front_head, timestamp_old_enough,

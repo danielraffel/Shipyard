@@ -3543,46 +3543,62 @@ mutations are `merged_exact_head:<sha>`, `waiting_head_approval`, and
 armed request survives a later push by anyone with write access; any armed
 request on an owned PR is disarmed (`auto_merge_disabled:<sha>`) on every
 `--apply` pass, approved or not. The org-queue path never takes this merge.
-On every base, whatever its `merge_path` (including
+For the base given with `--base`, whatever its `merge_path` (including
 `direct_merge_refused_server_enforcement_required`, where a surviving arm
-merges directly), the steward, as the base's single admission writer, also
+merges directly), the steward, as that base's single admission writer, also
 sweeps every open PR, owned or not, and withdraws what the exact-head gate does
-not admit. An armed native auto-merge request on such a head is disabled
-(`disarmed_stale_auto_merge:<sha>`, audit `disarm_stale_auto_merge`). A
-merge-queue entry whose head is not admitted is removed with
-`dequeuePullRequest` (`dequeued_unapproved:<sha>`, audit
-`dequeue_unapproved_queue_entry`): GitHub consumes the arm when it enqueues,
-so a head it enqueued past approval has no arm left to disarm. This closes the
-gap where an arm enabled for an older head survives a push by anyone with
-write access and GitHub then enqueues or merges the unapproved new head
-itself. A head the gate admits (`Approved`, or `NotRequired` where the
-repository does not require approval) keeps its arm and its entry, since the
-steward would enqueue it anyway. The disarm fails closed: an approval that
-cannot be read, or a live head that moved since the census, disarms. The
-dequeue is bounded, because it discards a merge group's runs. It acts only on
-positive evidence from a successful read of the queued head (a HOLD at that
-head, an approval only for another head, no approval where one is required, or
-a 404 on the base config, which `read_policy_required` reports as the typed
-`PolicyReadError::Absent`). An unreadable approval, live state (including a
-GraphQL answer carrying `errors` or `pullRequest: null`) or config defers it
-(`dequeue_deferred_unreadable:<sha>`) and advances a consecutive-unreadable
-streak in the steward ledger (`dequeue_unreadable`, keyed `repo#pr:head`). Any
-successful judgement clears it, each applying pass prunes it once the PR is
-unqueued or its head changes, and the third consecutive unreadable pass
-dequeues. At most two entries leave the queue per repository and base per pass;
-the rest report `dequeue_deferred_cap:<sha>` and wait for the next pass. Each
-steward removal is recorded (`steward_dequeues`) and is not counted toward the
-head's `EJECTION_CAP` when the steward judges that head again, so withdrawing
-an entry it could not judge never costs an approved head its approval. The reviewer policy is read once
-per pass, strictly (`read_policy_required`: an absent config is an error, not
-"approval not required"). An armed request on an owned PR is disarmed
-unconditionally on every base (`auto_merge_disabled:<sha>`, audit
-`disable_auto_merge_owned_pr`), because the steward admits owned heads itself.
+not admit. Other branches are covered only by running the steward per base.
+
+- **Disarm (always live).** An armed native auto-merge request on such a head
+  is disabled (`disarmed_stale_auto_merge:<sha>`, audit
+  `disarm_stale_auto_merge`). It fails closed: an approval that cannot be read,
+  a live head that moved since the census, or a head at the ejection cap
+  disarms. An armed request on an owned PR is disarmed unconditionally
+  (`auto_merge_disabled:<sha>`, audit `disable_auto_merge_owned_pr`).
+- **Dequeue (gated).** GitHub consumes the arm when it enqueues, so a head it
+  enqueued past approval is withdrawn by removing its queue entry
+  (`dequeuePullRequest`). The machine-global switch
+  `[merge_steward] unapproved_dequeue = "report" | "apply"` gates it and
+  defaults to `"report"`: the sweep computes and reports
+  `would_dequeue_unapproved:<sha>` / `would_dequeue_unreadable_streak:<sha>`
+  (and every deferral and streak) but never calls the mutation. Under
+  `"apply"` it reports `dequeued_unapproved:<sha>` or
+  `dequeued_unreadable_streak:<sha>` (audit `dequeue_unapproved_queue_entry`).
+- **What counts as evidence.** Only a successful read of the queued head's
+  judgement: a HOLD at that head, an approval only for another head, no
+  approval where one is required, or a confirmed absent base config. A config
+  404 is `PolicyReadError::Absent` only when `gh`'s own stderr says
+  `gh: Not Found (HTTP 404)` (never the command's arguments, never a token or
+  installation failure) and a second read agrees: the base branch reads back
+  and `.shipyard` is absent or lists no `config.toml`. An approved head at the
+  ejection cap is never dequeued for the cap alone; the disarm side applies the
+  same classified-interruption excuse as the arming paths.
+- **Unreadable defers, visibly.** An unreadable judgement reports
+  `dequeue_deferred_unreadable:<sha>` and returns its read error as the PR's
+  error, so the pass is unhealthy and the tick summary shows `errors>0`. Only a
+  PR-specific failure (a GraphQL answer with `errors` or `pullRequest: null`, a
+  4xx on that PR's records) advances the consecutive-unreadable streak
+  (`dequeue_unreadable`, keyed `repo#pr:head`); the third consecutive one
+  dequeues. A base-wide or transport failure (the policy, 5xx, 401/403/429,
+  rate limits, timeouts, credentials) never advances it, so an outage cannot
+  drain the queue. Any successful judgement clears the streak, and each
+  applying pass prunes it once the PR is unqueued or its head changes. A dry
+  run never changes it.
+- **Bounds.** At most two entries leave the queue per repository and base per
+  pass; the rest report `dequeue_deferred_cap:<sha>`. The steward records when
+  it removed each head (`steward_removals`), and exactly those removals (each
+  matched to a timeline removal within three minutes) are not counted toward
+  `EJECTION_CAP` on the steward's own gate. `queue-arm-guard` has no ejection
+  cap of its own.
+- **Labels.** `owner-decision`, `superseded` and `PARKED/<platform>` PRs are not
+  exempt: they should never be queued, so on positive evidence they are
+  dequeued like any other.
+
+The reviewer policy is read once per pass, strictly (`read_policy_required`).
 Every withdrawal runs under the PR mutation guard on Shipyard's internal
 queue-mutation path, whose one-shot nonce the `ghapp` `queue-removal-guard`
 accepts; a plain `gh` disarm or dequeue is refused as an unaudited queue
-removal. A dry run reports `would_disarm_stale_auto_merge:<sha>` and
-`would_dequeue_unapproved:<sha>` and changes nothing. The `--arm-unqueued`
+removal. A dry run (no `--apply`) changes nothing. The `--arm-unqueued`
 backstop reads the policy just as strictly, so it never arms what the sweep
 would withdraw.
 The bound rule is satisfied only by a check run carrying that app id (the

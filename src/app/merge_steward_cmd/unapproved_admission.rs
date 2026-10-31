@@ -38,8 +38,13 @@
 //! pull request leaves the queue or its head changes; the third consecutive
 //! unreadable pass dequeues. At most [`MAX_DEQUEUES_PER_PASS`] entries leave a
 //! repository's queue per pass; the rest report `dequeue_deferred_cap` and wait
-//! for the next pass. A dry run reports `would_disarm_stale_auto_merge` and
-//! `would_dequeue_unapproved` and changes nothing, including the streak.
+//! for the next pass. A dequeue reached by the bound reports
+//! `dequeued_unreadable_streak` rather than `dequeued_unapproved`, and every
+//! deferral returns its read error as the PR's error, so the pass is
+//! unhealthy and the deferral shows in the tick summary. A dry run reports
+//! `would_disarm_stale_auto_merge` and `would_dequeue_unapproved` (or
+//! `would_dequeue_unreadable_streak`) and changes nothing, including the
+//! streak.
 //!
 //! A removal the steward makes is recorded in the ledger and is not counted
 //! toward [`crate::head_approval::EJECTION_CAP`] when the steward judges that
@@ -54,6 +59,8 @@
 //! approved or not, by [`super::exact_head_merge::disarm_owned_auto_merge`]:
 //! the steward admits owned heads itself.
 
+use chrono::{DateTime, Utc};
+
 use super::{
     GitHubActions, MutationApplyContext, ObservedPr, RepoObservation, StewardDecision,
     StewardLedger, Value, acquire_pr_mutation_guard,
@@ -62,20 +69,73 @@ use super::{
     record_audit,
 };
 use crate::auto_arm::first_graphql_error;
-use crate::head_approval::{ApprovalPolicy, PolicyReadError};
+use crate::head_approval::{ApprovalPolicy, HeadGate, PolicyReadError};
 
 /// The ledger action recorded for each disarm.
 const DISARM_AUDIT: &str = "disarm_stale_auto_merge";
 /// The ledger action recorded for each dequeue.
 const DEQUEUE_AUDIT: &str = "dequeue_unapproved_queue_entry";
-/// Consecutive unreadable passes after which a queued head is dequeued.
+/// Consecutive PR-specific unreadable passes after which a queued head is
+/// dequeued.
 pub(super) const UNREADABLE_PASSES_TO_DEQUEUE: u32 = 3;
 /// Most queue entries removed per repository and base per pass.
 pub(super) const MAX_DEQUEUES_PER_PASS: usize = 2;
+/// How far a timeline removal may sit from the time the steward recorded its
+/// own dequeue and still be that dequeue.
+const REMOVAL_MATCH_WINDOW_SECONDS: i64 = 180;
 
 /// GraphQL document that removes a pull request from its merge queue.
 const DEQUEUE_MUTATION: &str =
     "mutation($id:ID!){dequeuePullRequest(input:{id:$id}){mergeQueueEntry{id}}}";
+
+/// `[merge_steward] unapproved_dequeue` in the machine-global config: whether
+/// the sweep removes unapproved queue entries or only reports what it would
+/// remove. The disarm is not governed by it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum DequeueMode {
+    /// Compute and report `would_dequeue_*`; never call `dequeuePullRequest`.
+    #[default]
+    Report,
+    Apply,
+}
+
+impl DequeueMode {
+    /// The mode named by `value`, the config's string.
+    ///
+    /// # Errors
+    ///
+    /// For any value other than `report` or `apply`.
+    pub(super) fn parse(value: &str) -> Result<Self, String> {
+        match value.trim() {
+            "report" => Ok(Self::Report),
+            "apply" => Ok(Self::Apply),
+            other => Err(format!(
+                "merge_steward.unapproved_dequeue must be \"report\" or \"apply\", not {other:?}"
+            )),
+        }
+    }
+
+    /// The mode the machine-global config at `global_dir` selects;
+    /// [`Self::Report`] when it is not set.
+    ///
+    /// # Errors
+    ///
+    /// When the config cannot be loaded or names an unknown mode.
+    pub(super) fn from_machine_global(global_dir: &std::path::Path) -> Result<Self, String> {
+        let config =
+            crate::config::LoadedConfig::load_machine_global_from_dir(global_dir.to_path_buf())
+                .map_err(|error| {
+                    format!("failed to load merge_steward.unapproved_dequeue: {error}")
+                })?;
+        match config.get("merge_steward.unapproved_dequeue") {
+            None => Ok(Self::default()),
+            Some(value) => value.as_str().map_or_else(
+                || Err("merge_steward.unapproved_dequeue must be a string".to_owned()),
+                Self::parse,
+            ),
+        }
+    }
+}
 
 /// The ledger key for one head of one pull request.
 fn head_key(repo: &str, number: u64, head: &str) -> String {
@@ -89,44 +149,96 @@ fn parse_head_key<'a>(key: &'a str, repo: &str) -> Option<(u64, &'a str)> {
     Some((number.parse().ok()?, head))
 }
 
-/// How many queue removals of `head` the steward made itself.
-pub(super) fn steward_dequeues(ledger: &StewardLedger, repo: &str, number: u64, head: &str) -> u32 {
+/// When the steward itself removed `head` from the queue.
+pub(super) fn steward_removal_times(
+    ledger: &StewardLedger,
+    repo: &str,
+    number: u64,
+    head: &str,
+) -> Vec<DateTime<Utc>> {
     ledger
-        .steward_dequeues
+        .steward_removals
         .get(&head_key(repo, number, head))
-        .copied()
-        .unwrap_or(0)
+        .into_iter()
+        .flatten()
+        .filter_map(|at| DateTime::parse_from_rfc3339(at).ok())
+        .map(|at| at.with_timezone(&Utc))
+        .collect()
 }
 
-/// `queue` without the latest `excused` queue removals of `head`, so the
-/// approval gate does not count removals the steward made itself.
-pub(super) fn without_steward_removals(queue: &Value, head: &str, excused: u32) -> Value {
+/// Whether timeline `node` is a non-merge queue removal of `head`.
+fn is_removal_of(node: &Value, head: &str) -> bool {
+    node.get("__typename").and_then(Value::as_str) == Some("RemovedFromMergeQueueEvent")
+        && node
+            .pointer("/beforeCommit/oid")
+            .and_then(Value::as_str)
+            .is_some_and(|oid| oid.eq_ignore_ascii_case(head))
+        && !node
+            .get("reason")
+            .and_then(Value::as_str)
+            .is_some_and(|reason| reason.eq_ignore_ascii_case("merged"))
+}
+
+/// `queue` with the removals of `head` that `keep` rejects taken out of its
+/// timeline.
+fn filter_removals(queue: &Value, head: &str, mut keep: impl FnMut(&Value) -> bool) -> Value {
     let mut queue = queue.clone();
-    let Some(nodes) = queue
+    if let Some(nodes) = queue
         .pointer_mut("/data/repository/pullRequest/timelineItems/nodes")
         .and_then(Value::as_array_mut)
-    else {
-        return queue;
-    };
-    let mut remaining = excused;
-    let mut index = nodes.len();
-    while remaining > 0 && index > 0 {
-        index -= 1;
-        let node = &nodes[index];
-        let removal = node.get("__typename").and_then(Value::as_str)
-            == Some("RemovedFromMergeQueueEvent")
-            && node
-                .pointer("/beforeCommit/oid")
-                .and_then(Value::as_str)
-                .is_some_and(|oid| oid.eq_ignore_ascii_case(head))
-            && !node
-                .get("reason")
-                .and_then(Value::as_str)
-                .is_some_and(|reason| reason.eq_ignore_ascii_case("merged"));
-        if removal {
-            nodes.remove(index);
-            remaining -= 1;
-        }
+    {
+        nodes.retain(|node| !is_removal_of(node, head) || keep(node));
+    }
+    queue
+}
+
+/// `queue` without the removals of `head` the steward recorded making: each
+/// recorded time excuses the one removal closest to it within
+/// [`REMOVAL_MATCH_WINDOW_SECONDS`], so a removal anyone else made still counts
+/// toward the ejection cap.
+pub(super) fn without_steward_removals(
+    queue: &Value,
+    head: &str,
+    recorded: &[DateTime<Utc>],
+) -> Value {
+    let mut unclaimed = recorded.to_vec();
+    filter_removals(queue, head, |node| {
+        let Some(at) = node
+            .get("createdAt")
+            .and_then(Value::as_str)
+            .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
+            .map(|at| at.with_timezone(&Utc))
+        else {
+            return true;
+        };
+        let nearest = unclaimed
+            .iter()
+            .enumerate()
+            .map(|(index, mine)| (index, (*mine - at).num_seconds().abs()))
+            .filter(|(_, distance)| *distance <= REMOVAL_MATCH_WINDOW_SECONDS)
+            .min_by_key(|(_, distance)| *distance);
+        nearest.is_none_or(|(index, _)| {
+            unclaimed.remove(index);
+            false
+        })
+    })
+}
+
+/// `queue` without its latest removal of `head`: the excuse the arming paths
+/// give a classified interruption ([`crate::head_approval::decide_excusing`]).
+fn without_latest_removal(queue: &Value, head: &str) -> Value {
+    let latest = queue
+        .pointer("/data/repository/pullRequest/timelineItems/nodes")
+        .and_then(Value::as_array)
+        .and_then(|nodes| nodes.iter().rposition(|node| is_removal_of(node, head)));
+    let mut queue = queue.clone();
+    if let (Some(latest), Some(nodes)) = (
+        latest,
+        queue
+            .pointer_mut("/data/repository/pullRequest/timelineItems/nodes")
+            .and_then(Value::as_array_mut),
+    ) {
+        nodes.remove(latest);
     }
     queue
 }
@@ -142,17 +254,46 @@ pub(super) fn prune(ledger: &mut StewardLedger, observation: &RepoObservation) {
             })
         })
     });
-    ledger.steward_dequeues.retain(|key, _| {
+    let open_at_head = |key: &String| {
         parse_head_key(key, &observation.repo).is_none_or(|(number, head)| {
             census(number).is_some_and(|pr| pr.fact.head_sha.eq_ignore_ascii_case(head))
         })
-    });
+    };
+    ledger.steward_removals.retain(|key, _| open_at_head(key));
+    // Superseded by `steward_removals`, which records when; dropped as read.
+    ledger
+        .steward_dequeues
+        .retain(|key, _| parse_head_key(key, &observation.repo).is_none());
+}
+
+/// Whether a read failure says nothing about this one pull request: a
+/// base-wide input, or a transport, server, rate-limit or credential failure
+/// that would fail every PR alike. Such a failure defers without advancing
+/// any PR's streak, so an outage can never drain the queue.
+pub(super) fn is_systemic_failure(error: &str) -> bool {
+    let status = crate::head_approval::gh_error_http_status(error);
+    let lowered = error.to_ascii_lowercase();
+    status.is_some_and(|code| code >= 500 || matches!(code, 401 | 403 | 429))
+        || [
+            "rate limit",
+            "timed out",
+            "timeout",
+            "deadline",
+            "failed with status signal",
+            "connection",
+            "could not resolve",
+            "bad credentials",
+            "installation",
+            "token",
+        ]
+        .iter()
+        .any(|marker| lowered.contains(marker))
 }
 
 /// The base's reviewer policy, as one read found it.
 enum PolicyRead {
     Policy(ApprovalPolicy),
-    /// A successful read found no config on the base.
+    /// A successful, confirmed read found no config on the base.
     Absent(String),
     Unreadable(String),
 }
@@ -160,11 +301,19 @@ enum PolicyRead {
 /// State shared by every pull request in one repository's pass.
 #[derive(Default)]
 pub(super) struct SweepPass {
+    mode: DequeueMode,
     policy: Option<PolicyRead>,
     dequeues: usize,
 }
 
 impl SweepPass {
+    pub(super) fn new(mode: DequeueMode) -> Self {
+        Self {
+            mode,
+            ..Self::default()
+        }
+    }
+
     /// The reviewer policy, read at most once per pass.
     fn policy(&mut self, actions: &GitHubActions, observation: &RepoObservation) -> &PolicyRead {
         self.policy.get_or_insert_with(|| {
@@ -192,7 +341,43 @@ enum Verdict {
     Admitted,
     /// Positive evidence from successful reads that the head is not admitted.
     Refused(String),
-    Unreadable(String),
+    /// The head was approved but has reached the ejection cap since. The arm
+    /// is withdrawn (fail closed); the entry is not, because the cap alone
+    /// says nothing against a head somebody approved.
+    EjectionCapped(String),
+    /// `systemic` when the failure is base-wide or transport-wide.
+    Unreadable {
+        why: String,
+        systemic: bool,
+    },
+}
+
+impl Verdict {
+    fn unreadable(why: String) -> Self {
+        let systemic = is_systemic_failure(&why);
+        Self::Unreadable { why, systemic }
+    }
+}
+
+/// The classified-interruption excuse for `head`'s latest ejection, exactly
+/// as the `--arm-unqueued` backstop and `ship` apply it: only while the queue
+/// state is that ejection, and only when the repository opted in.
+fn interruption_excused(
+    actions: &GitHubActions,
+    observation: &RepoObservation,
+    queue: &Value,
+) -> bool {
+    let report = crate::pr_queue_state::explain_pr_queue_state(queue);
+    if !crate::environment_requeue::applies(&report) {
+        return false;
+    }
+    let run_gh = |argv: &[String]| actions.run_gh(argv).map_err(|error| error.to_string());
+    crate::environment_requeue::read_opt_in(&run_gh, &observation.repo, &observation.base)
+        .ok()
+        .and_then(|opted_in| {
+            crate::environment_requeue::assess(&run_gh, &observation.repo, &report, opted_in)
+        })
+        .is_some_and(|verdict| verdict.is_allowed_interruption())
 }
 
 fn verdict(
@@ -204,18 +389,40 @@ fn verdict(
     pass: &mut SweepPass,
     ledger: &StewardLedger,
 ) -> Verdict {
-    match pass.policy(actions, observation) {
+    let policy = match pass.policy(actions, observation) {
         PolicyRead::Unreadable(error) => {
-            Verdict::Unreadable(format!("head approval policy unreadable: {error}"))
+            // Base-wide: it would fail every PR alike.
+            return Verdict::Unreadable {
+                why: format!("head approval policy unreadable: {error}"),
+                systemic: true,
+            };
         }
-        PolicyRead::Absent(detail) => Verdict::Refused(detail.clone()),
-        PolicyRead::Policy(policy) => {
-            match evaluate_head_gate(actions, observation, pr, head, policy, queue, ledger) {
-                Ok((gate, _events)) if gate.allows() => Verdict::Admitted,
+        PolicyRead::Absent(detail) => return Verdict::Refused(detail.clone()),
+        PolicyRead::Policy(policy) => policy.clone(),
+    };
+    let judge =
+        |queue: &Value| evaluate_head_gate(actions, observation, pr, head, &policy, queue, ledger);
+    match judge(queue) {
+        Ok((gate, _events)) if gate.allows() => Verdict::Admitted,
+        Ok((HeadGate::EjectionCap { .. }, _events)) => {
+            if interruption_excused(actions, observation, queue)
+                && judge(&without_latest_removal(queue, head))
+                    .is_ok_and(|(gate, _events)| gate.allows())
+            {
+                return Verdict::Admitted;
+            }
+            // Was the head approved at all, ejections aside?
+            match judge(&filter_removals(queue, head, |_| false)) {
+                Ok((gate, _events)) if gate.allows() => Verdict::EjectionCapped(format!(
+                    "head {} is approved but reached the ejection cap",
+                    head.get(..12).unwrap_or(head)
+                )),
                 Ok((gate, _events)) => Verdict::Refused(gate.explain()),
-                Err(error) => Verdict::Unreadable(error),
+                Err(error) => Verdict::unreadable(error),
             }
         }
+        Ok((gate, _events)) => Verdict::Refused(gate.explain()),
+        Err(error) => Verdict::unreadable(error),
     }
 }
 
@@ -227,10 +434,12 @@ enum EntryPlan {
     Dequeue {
         head: String,
         reason: String,
+        /// Reached by the consecutive-unreadable bound rather than by
+        /// positive evidence.
+        streak: bool,
     },
-    Deferred {
-        head: String,
-    },
+    /// Unreadable, below the bound or systemic; `why` is the read error.
+    Deferred { head: String, why: String },
 }
 
 /// What the sweep plans for `pr`.
@@ -238,7 +447,7 @@ struct Plan {
     /// `Some(reason)` when the arm is withdrawn.
     disarm: Option<String>,
     entry: EntryPlan,
-    /// The head an unreadable judgement counts against, when it was one.
+    /// The head a PR-specific unreadable judgement counts against.
     unreadable_head: Option<String>,
     /// Whether a judgement of the queued head succeeded (clears its streak).
     judged: bool,
@@ -264,7 +473,20 @@ fn plan(
             .unwrap_or(0)
             .saturating_add(1)
     };
-    let unreadable = |head: &str, why: String, disarm: Option<String>| {
+    let unreadable = |head: &str, why: String, systemic: bool, disarm: Option<String>| {
+        if systemic {
+            // An outage says nothing about this entry: defer, and leave its
+            // streak exactly where it was.
+            return Plan {
+                disarm,
+                entry: EntryPlan::Deferred {
+                    head: head.to_owned(),
+                    why,
+                },
+                unreadable_head: None,
+                judged: false,
+            };
+        }
         let passes = streak(head);
         Plan {
             disarm,
@@ -272,10 +494,12 @@ fn plan(
                 EntryPlan::Dequeue {
                     head: head.to_owned(),
                     reason: format!("unreadable on {passes} consecutive passes: {why}"),
+                    streak: true,
                 }
             } else {
                 EntryPlan::Deferred {
                     head: head.to_owned(),
+                    why,
                 }
             },
             unreadable_head: Some(head.to_owned()),
@@ -295,7 +519,8 @@ fn plan(
                     judged: false,
                 };
             }
-            return unreadable(census_head, error, disarm);
+            let systemic = is_systemic_failure(&error);
+            return unreadable(census_head, error, systemic, disarm);
         }
     };
     let live = queue.pointer("/data/repository/pullRequest");
@@ -309,7 +534,9 @@ fn plan(
         if live_head.is_some_and(|live| live.eq_ignore_ascii_case(census_head)) {
             match verdict(actions, observation, pr, census_head, &queue, pass, ledger) {
                 Verdict::Admitted => None,
-                Verdict::Refused(reason) | Verdict::Unreadable(reason) => Some(reason),
+                Verdict::Refused(reason)
+                | Verdict::EjectionCapped(reason)
+                | Verdict::Unreadable { why: reason, .. } => Some(reason),
             }
         } else {
             Some("head moved since the census".to_owned())
@@ -331,6 +558,7 @@ fn plan(
         return unreadable(
             census_head,
             "the queue state named no head or queue membership".to_owned(),
+            false,
             disarm,
         );
     };
@@ -343,7 +571,7 @@ fn plan(
         };
     }
     match verdict(actions, observation, pr, entry_head, &queue, pass, ledger) {
-        Verdict::Admitted => Plan {
+        Verdict::Admitted | Verdict::EjectionCapped(_) => Plan {
             disarm,
             entry: EntryPlan::Keep,
             unreadable_head: None,
@@ -354,11 +582,12 @@ fn plan(
             entry: EntryPlan::Dequeue {
                 head: entry_head.to_owned(),
                 reason,
+                streak: false,
             },
             unreadable_head: None,
             judged: true,
         },
-        Verdict::Unreadable(error) => unreadable(entry_head, error, disarm),
+        Verdict::Unreadable { why, systemic } => unreadable(entry_head, why, systemic, disarm),
     }
 }
 
@@ -403,10 +632,11 @@ fn dequeue_under_guard(
         &format!("pr:{}:{head}", pr.fact.number),
         DEQUEUE_AUDIT,
     );
-    *ledger
-        .steward_dequeues
+    ledger
+        .steward_removals
         .entry(head_key(&context.observation.repo, pr.fact.number, head))
-        .or_insert(0) += 1;
+        .or_default()
+        .push(Utc::now().to_rfc3339());
     Ok(())
 }
 
@@ -437,10 +667,17 @@ fn record_streak(ledger: &mut StewardLedger, repo: &str, pr: &ObservedPr, plan: 
 ///
 /// Mutations, comma-joined as the per-PR mutation string:
 /// * `disarmed_stale_auto_merge:<head>` / `would_disarm_stale_auto_merge:<head>`
-/// * `dequeued_unapproved:<head>` / `would_dequeue_unapproved:<head>`
+/// * `dequeued_unapproved:<head>` / `would_dequeue_unapproved:<head>`: on
+///   positive evidence
+/// * `dequeued_unreadable_streak:<head>` /
+///   `would_dequeue_unreadable_streak:<head>`: on the consecutive-unreadable
+///   bound
+///
+/// A deferral (`dequeue_deferred_unreadable`) also returns the underlying read
+/// error as this PR's error, so the pass is reported unhealthy.
 /// * `dequeue_deferred_unreadable:<head>`: unreadable, streak below the bound
 /// * `dequeue_deferred_cap:<head>`: this pass's dequeue cap is spent
-#[allow(clippy::too_many_arguments)] // One pass's inputs, its write context and its state.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // One pass's inputs and one guarded transaction.
 pub(super) fn sweep(
     actions: &GitHubActions,
     observation: &RepoObservation,
@@ -464,23 +701,50 @@ pub(super) fn sweep(
         record_streak(ledger, &observation.repo, pr, &plan);
     }
     let mut reports = Vec::new();
+    // A deferral is reported as this PR's error, so the pass is unhealthy and
+    // an unreadable queue entry is visible rather than silently waiting.
+    let mut deferred = None;
     let dequeue = match &plan.entry {
         EntryPlan::Keep => None,
-        EntryPlan::Deferred { head } => {
+        EntryPlan::Deferred { head, why } => {
             reports.push(format!("dequeue_deferred_unreadable:{head}"));
+            deferred = Some(format!(
+                "PR #{} queue entry at {head} not judged, dequeue deferred: {why}",
+                pr.fact.number
+            ));
             None
         }
         EntryPlan::Dequeue { head, .. } if pass.dequeues >= MAX_DEQUEUES_PER_PASS => {
             reports.push(format!("dequeue_deferred_cap:{head}"));
             None
         }
-        EntryPlan::Dequeue { head, reason } => {
+        EntryPlan::Dequeue {
+            head,
+            reason,
+            streak,
+        } => {
             pass.dequeues += 1;
-            Some((head.clone(), reason.clone()))
+            let label = if *streak {
+                (
+                    "dequeued_unreadable_streak",
+                    "would_dequeue_unreadable_streak",
+                )
+            } else {
+                ("dequeued_unapproved", "would_dequeue_unapproved")
+            };
+            Some((head.clone(), reason.clone(), label))
         }
     };
+    // Report mode (the default): say what would be removed, remove nothing.
+    let dequeue = match dequeue {
+        Some((head, _, (_, planned))) if pass.mode == DequeueMode::Report => {
+            reports.push(format!("{planned}:{head}"));
+            None
+        }
+        dequeue => dequeue,
+    };
     if plan.disarm.is_none() && dequeue.is_none() {
-        return ((!reports.is_empty()).then(|| reports.join(",")), None);
+        return ((!reports.is_empty()).then(|| reports.join(",")), deferred);
     }
     if !apply {
         let planned = [
@@ -489,10 +753,10 @@ pub(super) fn sweep(
                 .map(|_| format!("would_disarm_stale_auto_merge:{census_head}")),
             dequeue
                 .as_ref()
-                .map(|(head, _)| format!("would_dequeue_unapproved:{head}")),
+                .map(|(head, _, (_, planned))| format!("{planned}:{head}")),
         ];
         reports.extend(planned.into_iter().flatten());
-        return (Some(reports.join(",")), None);
+        return (Some(reports.join(",")), deferred);
     }
     let Some(context) = context else {
         return (
@@ -520,7 +784,7 @@ pub(super) fn sweep(
             done.push(format!("disarmed_stale_auto_merge:{census_head}"));
         }
     }
-    if let Some((head, reason)) = &dequeue
+    if let Some((head, reason, (label, _))) = &dequeue
         && error.is_none()
     {
         if let Err(failure) = dequeue_under_guard(context, pr, head, ledger) {
@@ -529,13 +793,17 @@ pub(super) fn sweep(
             ledger
                 .dequeue_unreadable
                 .remove(&head_key(&observation.repo, pr.fact.number, head));
-            done.push(format!("dequeued_unapproved:{head}"));
+            done.push(format!("{label}:{head}"));
         }
     }
     let outcome = if error.is_some() {
         "withdrawal_failed"
     } else {
         "unapproved_admission_withdrawn"
+    };
+    let error = match (error, deferred) {
+        (Some(error), Some(deferred)) => Some(format!("{error}; {deferred}")),
+        (error, deferred) => error.or(deferred),
     };
     done.extend(reports);
     let mutation = (!done.is_empty()).then(|| done.join(","));

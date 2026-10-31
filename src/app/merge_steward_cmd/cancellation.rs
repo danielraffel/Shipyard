@@ -267,7 +267,7 @@ pub(super) fn apply_pr_plans(
         ledger_path,
         mutation_control,
     });
-    let mut sweep_pass = super::unapproved_admission::SweepPass::default();
+    let mut sweep_pass = super::unapproved_admission::SweepPass::new(args.unapproved_dequeue);
     if args.apply {
         super::unapproved_admission::prune(ledger, observation);
     }
