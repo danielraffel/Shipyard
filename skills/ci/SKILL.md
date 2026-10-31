@@ -575,9 +575,11 @@ auto-merge armed before a HOLD (tartci allows it) and Vellum's merge-on-green
 steward, which merges with its own token and reads no verdict, never reach
 `queue-arm-guard`. The `review-verdict` commit status
 (`scripts/review_verdict_status.py`, docs/review-verdict-status.md) is the
-guard's own decision posted on the head; it is report-only until a
-repository requires it. A red `review-verdict` means the guard would refuse
-that head; fix the verdict, not the status.
+guard's own decision posted on the head; its job is also the
+`review-verdict` check run and fails unless the head is allowed, so a
+required check is red exactly when the guard would refuse. A red
+`review-verdict` means the guard would refuse that head; fix the verdict, not
+the status.
 
 **The `risk-tier` status says how much review a head would need.**
 `scripts/risk_tier.py` (`.github/workflows/risk-tier.yml`, docs/risk-tier.md)
