@@ -1498,8 +1498,12 @@ fn handle_run_variant<W: Write>(
         unreachable!("run variant required")
     };
     if let Some(RunSubcommand::Command(args)) = subcommand {
-        let config = LoadedConfig::load_from_cwd(mode, cwd)
-            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        let config = LoadedConfig::load_from_cwd_with_global_dir(
+            mode,
+            cwd,
+            runtime_paths.global_dir.clone(),
+        )
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
         return run_command_evidence(&args, &config, cwd, runtime_paths, json, stdout);
     }
     handle_run_command(
@@ -1698,8 +1702,9 @@ fn handle_run_command<W: Write>(
     json: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
-    let config = LoadedConfig::load_from_cwd(mode, cwd)
-        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let config =
+        LoadedConfig::load_from_cwd_with_global_dir(mode, cwd, runtime_paths.global_dir.clone())
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
     run_command(args, &config, cwd, runtime_paths, json, stdout)
 }
 

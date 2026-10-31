@@ -54,7 +54,7 @@ When the user says "push a PR", "ship this", "ship it", "we're done", "merge thi
 
 1. `skill_sync_check.py --mode=report` — hard-fails on missing SKILL.md updates.
 2. `version_bump_check.py --mode=report` — validates the version-file prohibition.
-3. `git commit` + `gh pr create` + CI validate + merge on green.
+3. `git commit` + PR create + CI validate. Agents pass `--no-arm` and stop there; the steward merges the approved head (see "How a PR lands here").
 4. `.github/workflows/auto-release.yml` tags the moved CLI version on merge; the existing tag-triggered `release.yml` publishes binaries.
 
 Never invoke `gh pr create` + release separately. Never run the version-bump or skill-sync scripts by hand.
@@ -177,6 +177,17 @@ The script is 9 steps: build, re-sign, package-to-dmg, sign-dmg, notarize+staple
 **Load-bearing rule:** the success criterion is a working `--version` after fresh install.sh → mount → extract → launch. Not `codesign --verify`, not `spctl --assess`, not the on-runner launch gate in isolation. We shipped v0.42.0 and v0.43.0 with the same breakage because we declared victory on partial verification. Don't do that again.
 
 Full flow + env-var setup in `RELEASING.md` § "macOS release is a locally-signed + stapled .dmg". Do not revert to CI signing or bare Mach-O without re-running the #219 diagnostic and proving the online-notarization-check issue is resolved (tracked in #226).
+
+## How a PR lands here
+
+- **Open the PR and stop.** Use `ghapp pr create -R danielraffel/Shipyard --base main`. Never arm, enqueue, auto-merge or merge; admission has exactly one writer.
+- **Review:** a standing reviewer posts an exact-head APPROVE or a HOLD once required checks are green. Never approve your own team's work.
+- **Landing:** this repo is user-owned, so there is no merge queue. The m3 steward tick (every 5 minutes) merges the exact approved head. The ruleset requires `Test macOS ARM64` and `review-verdict`, bound to GitHub Actions.
+- **On a HOLD:** fix what it names, with a test. Merge `origin/main` (never rebase or force-push). Push once and comment `repaired: ... at <sha>`; the PR re-enters review on its own.
+- **macOS first.** `CI_PLATFORM_FOCUS=macos` limits Shipyard CI and releases. A Windows- or Linux-only failure gets a `PARKED/<platform>` issue with evidence and never blocks a macOS landing.
+- **Labels the pipeline skips:** `superseded`, `owner-decision`, `PARKED/<platform>`.
+- Launch agents with `sr claude` / `sr codex` and use the smallest model that fits (Haiku or Codex Luna for mechanical work, Sonnet or Codex Terra/Sol for fixes, Opus/Fable/Codex Astra for security, signing and release diffs).
+- Steward log on m3: `~/Library/Logs/shipyard-steward-tick/summary.log`.
 
 ## Development
 

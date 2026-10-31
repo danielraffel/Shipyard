@@ -1668,7 +1668,7 @@ impl MetricsStore {
         let mut samples = 0_usize;
         let mut duration_gaps = 0_usize;
         for ((repo, head), prs) in unique {
-            let mut q = conn.prepare("SELECT job.status, job.total_ms FROM jobs job JOIN runs run ON run.id = job.run_id WHERE lower(trim(run.repo)) = ?1 AND run.sha = ?2 AND run.pr = ?3 AND run.provenance = 'production' AND run.provenance_verified = 1 AND job.completed_at IS NOT NULL")?;
+            let mut q = conn.prepare("SELECT job.status, job.total_ms FROM jobs job JOIN runs run ON run.id = job.run_id WHERE lower(trim(run.repo)) = ?1 AND (run.head_sha = ?2 OR run.sha = ?2) AND run.pr = ?3 AND run.provenance = 'production' AND run.provenance_verified = 1 AND job.completed_at IS NOT NULL")?;
             let mut matched_pr = None;
             for pr in prs {
                 let mut pr_matched = false;
@@ -1676,7 +1676,10 @@ impl MetricsStore {
                 for row in q.query_map(rusqlite::params![repo, head, pr], |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
                 })? {
-                    let (_, ms) = row?;
+                    let (status, ms) = row?;
+                    if status == "skipped" {
+                        continue;
+                    }
                     if ms.is_none_or(|v| v < 0) {
                         // A completed row with NULL/negative duration cannot
                         // substantiate a cost join. Keep the merge unjoined so
@@ -4550,6 +4553,21 @@ mod tests {
         }
     }
 
+    /// Marks a PR's runs as verified production without touching `sha` or
+    /// `head_sha`, for tests whose point is how the two heads differ.
+    fn mark_production_runs_keeping_heads(store: &MetricsStore, pr: i64) {
+        store
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE runs SET provenance='production', provenance_verified=1,
+                    event='pull_request', provider_run_id=?1, run_attempt=1
+                 WHERE pr=?1",
+                [pr],
+            )
+            .unwrap();
+    }
+
     fn mark_production_runs(store: &MetricsStore, pr: i64) {
         store
             .connect()
@@ -5121,6 +5139,46 @@ mod tests {
                     .1
                     == 1
         );
+    }
+
+    #[test]
+    fn safe_merge_summary_joins_authoritative_head_sha_when_legacy_sha_is_null() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        insert_scorecard_sample(&store, "repo", 12, "failure", 1000, 0, false);
+        let conn = store.connect().unwrap();
+        conn.execute(
+            "UPDATE runs SET repo='owner/repo', sha=NULL, head_sha=?1 WHERE pr=12",
+            [&"b".repeat(40)],
+        )
+        .unwrap();
+        mark_production_runs_keeping_heads(&store, 12);
+        let receipt = test_receipt("head-only", "owner/repo", "repo", 12, 'b');
+        store.import_merge_receipts(&[receipt]).unwrap();
+        let (total, joined, _, samples, gaps) = store
+            .safe_merge_summary("repo", "1970-01-01T00:00:00Z")
+            .unwrap();
+        assert_eq!((total, joined, samples, gaps), (1, 1, 1, 0));
+    }
+
+    #[test]
+    fn safe_merge_summary_keeps_legacy_sha_matches_when_both_heads_differ() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        insert_scorecard_sample(&store, "repo", 13, "failure", 1000, 0, false);
+        let conn = store.connect().unwrap();
+        conn.execute(
+            "UPDATE runs SET repo='owner/repo', sha=?1, head_sha=?2 WHERE pr=13",
+            [&"c".repeat(40), &"d".repeat(40)],
+        )
+        .unwrap();
+        mark_production_runs_keeping_heads(&store, 13);
+        let receipt = test_receipt("legacy-head", "owner/repo", "repo", 13, 'c');
+        store.import_merge_receipts(&[receipt]).unwrap();
+        let (_, joined, _, samples, gaps) = store
+            .safe_merge_summary("repo", "1970-01-01T00:00:00Z")
+            .unwrap();
+        assert_eq!((joined, samples, gaps), (1, 1, 0));
     }
 
     #[test]

@@ -207,7 +207,25 @@ pub fn run_pass(
     now: DateTime<Utc>,
     gh_for_repo: &mut RepoGhRunner<'_>,
 ) -> ImportPass {
-    if !config.enabled {
+    run_pass_with_observations(
+        config,
+        state_dir,
+        daemon_repos,
+        now,
+        gh_for_repo,
+        crate::observations::AutomaticObservations::from_env(),
+    )
+}
+
+fn run_pass_with_observations(
+    config: &ImportConfig,
+    state_dir: &Path,
+    daemon_repos: &[String],
+    now: DateTime<Utc>,
+    gh_for_repo: &mut RepoGhRunner<'_>,
+    observations: crate::observations::AutomaticObservations,
+) -> ImportPass {
+    if !observations.enabled() || !config.enabled {
         return ImportPass::default();
     }
     let mut pass = ImportPass {
@@ -305,6 +323,9 @@ pub fn daemon_pass(
     daemon_repos: &[String],
     now: DateTime<Utc>,
 ) -> ImportPass {
+    if !crate::observations::AutomaticObservations::from_env().enabled() {
+        return ImportPass::default();
+    }
     let config = match LoadedConfig::load_machine_global_from_dir(global_dir.to_path_buf()) {
         Ok(config) => config,
         Err(error) => {
@@ -392,6 +413,34 @@ mod tests {
         assert_eq!(pass, ImportPass::default());
         assert!(calls.is_empty());
         assert!(!state.path().join("metrics").exists());
+    }
+
+    #[test]
+    fn optional_observations_stop_scheduled_import_before_requests_or_checkpoint() {
+        for value in [Some("OFF"), None] {
+            let policy = crate::observations::AutomaticObservations::from_value(value);
+            let state = tempfile::tempdir().unwrap();
+            let config = enabled(&["Generous-Corp/pulp"]);
+            let mut calls = Vec::new();
+            let pass = run_pass_with_observations(
+                &config,
+                state.path(),
+                &[],
+                at("2026-09-30T12:00:00Z"),
+                &mut fake_gh(&mut calls),
+                policy,
+            );
+            assert_eq!(pass.enabled, policy.enabled());
+            assert_eq!(state.path().join("metrics").exists(), policy.enabled());
+            assert_eq!(schedule_path(state.path()).exists(), policy.enabled());
+            if policy.enabled() {
+                assert_eq!(calls.len(), 2);
+                assert_eq!(pass.repos[0].imported, Some(1));
+            } else {
+                assert!(calls.is_empty());
+                assert_eq!(pass, ImportPass::default());
+            }
+        }
     }
 
     #[test]

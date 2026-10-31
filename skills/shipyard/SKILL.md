@@ -5,6 +5,13 @@ description: Shipyard operations guardrails. Use when working in /Users/danielra
 
 # Shipyard
 
+`SHIPYARD_OBSERVATIONS=off` (trimmed, case-insensitive) stops automatic queue
+shadow/timing, command metric copies, route-shadow receipts, daemon GitHub
+imports, and scheduled baseline collection in processes receiving it. Existing
+services need environment rollout/restart. It preserves required evidence,
+merge receipts, explicit metrics imports/record, and historical reporting;
+retention and manual cause/private-corpus collection remain separate.
+
 The gate-cost scorecard can read a bounded historical cause archive with
 `--causes-archive DIR`; the report labels that source as archive and keeps
 malformed, duplicate, truncated, and unjoined rows visible. This is advisory
@@ -324,6 +331,7 @@ workflow, event, or runner labels look production-like.
 
 `metrics scorecard` also reports failed/cancelled compute waste, queue-wait
 coordination cost, and failed-attempt rework as observational baseline metrics.
+
 It does not alter routing or queue behavior. The per-safely-merged-change
 denominator is unavailable until a durable merge receipt joins the PR head;
 distinct PRs are not a safe-merge proxy.
