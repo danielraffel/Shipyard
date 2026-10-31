@@ -282,6 +282,18 @@ or merges. `shipyard pr --no-arm` writes no steward handoff (it implies
 handed-off `ship` skips its post-validation merge phase, reporting
 `left unarmed (--no-arm)`, in the foreground and when the daemon owns it.
 
+**`shipyard pr` ends with a "what happens next" block** (three lines under the
+queued/final output; `next_steps` in `--json`, with `admission`,
+`steward_managed`, `lines`, and the observed `merge_queue`, `allow_auto_merge`,
+`required_contexts`). It is read from the base's live merge settings, the same
+facts the steward uses: a native merge queue says the fleet steward enqueues the
+approved head (do not arm or enqueue); no queue but an app-bound approval
+context among the required checks says the steward merges the exact head (do not
+merge); neither says no automatic admission exists; unreadable settings claim
+no path. Every shape ends "On a HOLD: merge main (no rebase), fix, push once."
+It is output only and changes no behaviour; an explicit `--arm` on a
+steward-managed repository also prints a warning line.
+
 **Every Shipyard landing passes `queue-arm-guard`.** Before any request that
 can arm, enqueue or merge (`enablePullRequestAutoMerge`, `enqueuePullRequest`,
 `mergePullRequest`, `gh pr merge`, REST `PUT pulls/<n>/merge`), from `ship`,
