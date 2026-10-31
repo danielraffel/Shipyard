@@ -694,8 +694,12 @@ fn prune(args: &CausePruneArgs) -> Result<Report, CliFailure> {
     if args.apply && !args.initialize {
         ensure_archive_marker(&args.dir, true).map_err(|error| CliFailure::new(2, error))?;
     }
-    let _lock =
-        super::lock_archive(&args.dir, args.apply).map_err(|error| CliFailure::new(1, error))?;
+    let _lock = if args.apply {
+        super::lock_archive(&args.dir, true)
+    } else {
+        super::lock_archive_without_creation(&args.dir)
+    }
+    .map_err(|error| CliFailure::new(1, error))?;
     if args.apply && !args.initialize {
         ensure_archive_marker(&args.dir, true).map_err(|error| CliFailure::new(2, error))?;
     }
