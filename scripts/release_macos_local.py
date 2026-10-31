@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import pwd
 import shutil
 import stat
 import subprocess
@@ -23,7 +22,7 @@ import release_env
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_REPO = "danielraffel/Shipyard"
-GHAPP_PATH = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".local" / "bin" / "ghapp"
+GHAPP_ENV = "SHIPYARD_GHAPP_PATH"
 DEFAULT_LOCAL_ENV_FILES = (
     Path.home() / ".config" / "pulp" / "secrets" / "keychain.env",
     Path.home() / ".config" / "pulp" / "secrets" / "notary.env",
@@ -55,6 +54,9 @@ class ReleaseConfig:
 
 
 class CommandRunner:
+    def __init__(self, *, ci_mode: bool = False) -> None:
+        self.ci_gh = require_ci_gh() if ci_mode else None
+
     def run(
         self,
         args: list[str],
@@ -66,6 +68,10 @@ class CommandRunner:
         merged_env = os.environ.copy()
         if env:
             merged_env.update(env)
+        if self.ci_gh and args[0] == "gh":
+            args = [self.ci_gh, *args[1:]]
+            # Explicit job identity wins over any inherited CLI authentication.
+            merged_env["GH_TOKEN"] = os.environ["GITHUB_TOKEN"]
         result = subprocess.run(
             args,
             cwd=cwd,
@@ -128,14 +134,45 @@ def ci_prepared_signing_keychain() -> bool:
     )
 
 
+def require_ci_gh() -> str:
+    """Use only the Actions job token and the host's native CLI in CI."""
+    if os.environ.get("GITHUB_ACTIONS") != "true" or not os.environ.get("GITHUB_TOKEN"):
+        raise SystemExit("CI publication requires a GitHub Actions job token")
+    native = shutil.which("gh", path="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
+    if not native:
+        raise SystemExit("CI publication requires native gh in a system installation path")
+    return native
+
+
 def require_ghapp() -> str:
-    """Return the installed App wrapper for the account running this process."""
-    if not GHAPP_PATH.is_file() or not os.access(GHAPP_PATH, os.X_OK):
-        raise SystemExit(
-            "the installed ghapp wrapper is missing or not executable for the "
-            f"release runner account: {GHAPP_PATH}"
-        )
-    return str(GHAPP_PATH)
+    """Return the configured or PATH-resolved App wrapper.
+
+    Release runners may run under a service account whose home directory is
+    unrelated to the managed wrapper installation.  An explicit path wins;
+    otherwise resolve the command from the runner's authenticated PATH.  Do
+    not silently fall back to an owner's ambient ``gh`` login.
+    """
+    configured = os.environ.get(GHAPP_ENV)
+    candidates: list[Path] = []
+    if configured:
+        candidates.append(Path(configured))
+    else:
+        discovered = shutil.which("ghapp")
+        if discovered:
+            candidates.append(Path(discovered))
+    for candidate in candidates:
+        if not candidate.is_absolute():
+            continue
+        try:
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return str(candidate)
+        except OSError:
+            continue
+    detail = configured or "ghapp on PATH"
+    raise SystemExit(
+        "the configured authenticated ghapp wrapper is missing or not executable: "
+        f"{detail} (set {GHAPP_ENV} or install ghapp on PATH)"
+    )
 
 
 def resolve_environment_files(requested: list[Path]) -> list[Path]:
@@ -195,19 +232,34 @@ def require_arm64(arch: str) -> None:
         )
 
 
-def expected_release_assets(artifact_prefix: str) -> tuple[str, ...]:
+def expected_release_assets(
+    artifact_prefix: str, focus: str | None = None
+) -> tuple[str, ...]:
+    """Assets a release must carry before it is published.
+
+    `focus` follows the CI_PLATFORM_FOCUS repo variable (read from the
+    environment when not given): `macos` (default) expects macOS and
+    Linux x64/arm64; `all` also expects windows-x64.
+    """
     companion = package_release.COMPANION_BIN_NAME
-    return (
+    focus = (focus or os.environ.get("CI_PLATFORM_FOCUS") or "macos").lower()
+    assets = [
         f"{artifact_prefix}-linux-x64",
         f"{companion}-linux-x64",
         f"{artifact_prefix}-linux-arm64",
         f"{companion}-linux-arm64",
-        f"{artifact_prefix}-windows-x64.exe",
-        f"{companion}-windows-x64.exe",
+    ]
+    if focus == "all":
+        assets += [
+            f"{artifact_prefix}-windows-x64.exe",
+            f"{companion}-windows-x64.exe",
+        ]
+    assets += [
         f"{artifact_prefix}-macos-arm64.dmg",
         "shipyard-release-manifest.json",
         "checksums.sha256",
-    )
+    ]
+    return tuple(assets)
 
 
 def package_signed_dmg(config: ReleaseConfig) -> Path:
@@ -446,31 +498,32 @@ def upload_artifact_and_checksums(
     artifact: Path,
     runner: CommandRunner,
 ) -> Path:
-    ghapp = require_ghapp()
+    publisher = "gh" if config.ci_mode else require_ghapp()
+    replace_flag = "--clobber" if config.ci_mode else "--replace-existing"
     runner.run(
         [
-            ghapp,
+            publisher,
             "release",
             "upload",
             "--repo",
             config.repo,
             config.tag,
             str(artifact),
-            "--replace-existing",
+            replace_flag,
         ]
     )
     merge_release_identity_manifest(config, artifact, runner)
     checksums = merge_release_checksum(config, artifact, runner)
     runner.run(
         [
-            ghapp,
+            publisher,
             "release",
             "upload",
             "--repo",
             config.repo,
             config.tag,
             str(checksums),
-            "--replace-existing",
+            replace_flag,
         ]
     )
     return checksums
@@ -556,14 +609,14 @@ def merge_release_identity_manifest(
     manifest.write_text(json.dumps(current, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     runner.run(
         [
-            require_ghapp(),
+            "gh" if config.ci_mode else require_ghapp(),
             "release",
             "upload",
             "--repo",
             config.repo,
             config.tag,
             str(manifest),
-            "--replace-existing",
+            "--clobber" if config.ci_mode else "--replace-existing",
         ]
     )
 
@@ -1000,8 +1053,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
-    runner = CommandRunner()
     args = parse_args(argv or sys.argv[1:])
+    runner = CommandRunner(ci_mode=args.ci_mode and (args.upload or args.publish_only))
     if args.defer_publish and not args.upload:
         raise SystemExit("--defer-publish only applies with --upload")
     if not args.publish_only:

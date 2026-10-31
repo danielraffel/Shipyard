@@ -189,15 +189,23 @@ fn write_merge_receipts_jsonl(
         .unwrap_or(Path::new("."));
     let mut temporary = tempfile::NamedTempFile::new_in(parent)
         .map_err(|error| CliFailure::new(1, format!("merge receipt export failed: {error}")))?;
-    for receipt in receipts {
-        let line = serde_json::to_string(receipt)
-            .map_err(|error| CliFailure::new(1, format!("merge receipt export failed: {error}")))?;
-        writeln!(temporary, "{line}")
-            .map_err(|error| CliFailure::new(1, format!("merge receipt export failed: {error}")))?;
-    }
+    write_merge_receipts_jsonl_to(&mut temporary, receipts)?;
     temporary.persist(path).map_err(|error| {
         CliFailure::new(1, format!("merge receipt export failed: {}", error.error))
     })?;
+    Ok(())
+}
+
+fn write_merge_receipts_jsonl_to<W: Write>(
+    output: &mut W,
+    receipts: &[crate::metrics::merge_receipt::MergeReceipt],
+) -> Result<(), CliFailure> {
+    for receipt in receipts {
+        let line = serde_json::to_string(receipt)
+            .map_err(|error| CliFailure::new(1, format!("merge receipt export failed: {error}")))?;
+        writeln!(output, "{line}")
+            .map_err(|error| CliFailure::new(1, format!("merge receipt export failed: {error}")))?;
+    }
     Ok(())
 }
 
@@ -333,7 +341,17 @@ pub(super) fn metrics_command<W: Write>(
             }
         },
         MetricsCommand::Export { source } => match source {
-            MetricsExportCommand::MergeReceipt(MetricsExportMergeReceiptArgs { repo, file }) => {
+            MetricsExportCommand::MergeReceipt(MetricsExportMergeReceiptArgs {
+                repo,
+                file,
+                stdout: stream,
+            }) => {
+                if stream && json_output {
+                    return Err(CliFailure::new(
+                        2,
+                        "merge receipt export failed: --json cannot be combined with --stdout",
+                    ));
+                }
                 let receipts = store.export_merge_receipts(&repo).map_err(|error| {
                     CliFailure::new(1, format!("merge receipt export failed: {error}"))
                 })?;
@@ -343,6 +361,16 @@ pub(super) fn metrics_command<W: Write>(
                         format!("merge receipt export failed: no receipts for {repo}"),
                     ));
                 }
+                if stream {
+                    write_merge_receipts_jsonl_to(stdout, &receipts)?;
+                    return Ok(std::process::ExitCode::SUCCESS);
+                }
+                let file = file.ok_or_else(|| {
+                    CliFailure::new(
+                        2,
+                        "merge receipt export failed: --file or --stdout is required",
+                    )
+                })?;
                 let destination = std::fs::canonicalize(&file).unwrap_or_else(|_| file.clone());
                 let store_path = std::fs::canonicalize(store.path())
                     .unwrap_or_else(|_| store.path().to_path_buf());
@@ -400,13 +428,32 @@ pub(super) fn metrics_command<W: Write>(
             return Ok(exit);
         }
         MetricsCommand::RepeatedWorkCost(args) => {
-            let summary = store.repeated_work_cost(args.limit).map_err(|error| {
-                CliFailure::new(1, format!("metrics repeated-work-cost failed: {error}"))
-            })?;
+            let since_days = parse_days(&args.since)?;
+            if since_days <= 0 {
+                return Err(CliFailure::new(
+                    WAIT_EXIT_INVALID,
+                    "repeated-work baseline window must be positive",
+                ));
+            }
+            let summary = store
+                .repeated_work_cost(args.limit, since_days)
+                .map_err(|error| {
+                    CliFailure::new(1, format!("metrics repeated-work-cost failed: {error}"))
+                })?;
             write_output(stdout, json_output, &summary, || {
                 format!(
-                    "{} repeated-work observations; avoided cost unavailable ({} unjoined)",
-                    summary.observations, summary.unknown_durations
+                    "{} repeated-work observations; superseded runtime: {} ({} matched clean, {} uncertain, {} cancelled, {} unmatched; {} distinct superseded jobs; baseline={}d; final attempt only={})",
+                    summary.observations,
+                    summary
+                        .duration_ms
+                        .map_or_else(|| "unavailable".to_owned(), |ms| format!("{ms} ms")),
+                    summary.matched_clean,
+                    summary.excluded_uncertain,
+                    summary.excluded_cancelled,
+                    summary.unmatched,
+                    summary.distinct_superseded_jobs,
+                    summary.since_days,
+                    summary.final_attempt_only
                 )
             })?;
         }
@@ -515,7 +562,7 @@ pub(super) fn metrics_command<W: Write>(
                 };
                 text.push_str(&scorecard_proxy_lines(&scorecard));
                 let coverage = format!(
-                    "{}: {} jobs, {:.2} worker-minutes, {} PRs over {}d; worker-minutes coverage={} ({}); PR coverage={} ({}); submit-to-receipt={} ({}); model-tokens={} ({})",
+                    "{}: {} jobs, {:.2} worker-minutes, {} PRs over {}d; worker-minutes coverage={} ({}); PR coverage={} ({}); safe-merge-rate={}={} ({}); submit-to-receipt={} ({}); model-tokens={} ({})",
                     scorecard.project,
                     scorecard.job_samples,
                     scorecard.worker_minutes,
@@ -525,6 +572,16 @@ pub(super) fn metrics_command<W: Write>(
                     scorecard.worker_minutes_coverage.reason,
                     scorecard.pull_request_throughput.status,
                     scorecard.pull_request_throughput.reason,
+                    scorecard
+                        .safely_merged_changes_per_eligible_slot_hour
+                        .status,
+                    scorecard
+                        .safely_merged_changes_per_eligible_slot_hour
+                        .value
+                        .map_or_else(|| "n/a".to_owned(), |value| format!("{value:.6}")),
+                    scorecard
+                        .safely_merged_changes_per_eligible_slot_hour
+                        .reason,
                     scorecard.submit_to_receipt.status,
                     scorecard.submit_to_receipt.reason,
                     scorecard.model_token_use.status,
@@ -640,20 +697,7 @@ fn import_tartci(
     store: &MetricsStore,
     args: &MetricsImportTartciArgs,
 ) -> Result<usize, CliFailure> {
-    let mut text = String::new();
-    match args.file.as_ref().and_then(|path| path.to_str()) {
-        None | Some("-") => {
-            std::io::stdin()
-                .read_to_string(&mut text)
-                .map_err(|error| CliFailure::new(1, format!("stdin read failed: {error}")))?;
-        }
-        Some(_) => {
-            let path = args.file.as_ref().expect("file path");
-            text = std::fs::read_to_string(path).map_err(|error| {
-                CliFailure::new(1, format!("could not read {}: {error}", path.display()))
-            })?;
-        }
-    }
+    let text = read_metrics_import_text(args.file.as_deref())?;
     store
         .import_tartci(&text)
         .map_err(|error| CliFailure::new(1, format!("tartci import failed: {error}")))
@@ -663,23 +707,32 @@ fn import_fleet_capacity(
     store: &MetricsStore,
     args: &MetricsImportFleetCapacityArgs,
 ) -> Result<usize, CliFailure> {
-    let mut text = String::new();
-    match args.file.as_ref().and_then(|path| path.to_str()) {
-        None | Some("-") => {
-            std::io::stdin()
-                .read_to_string(&mut text)
-                .map_err(|error| CliFailure::new(1, format!("stdin read failed: {error}")))?;
-        }
-        Some(_) => {
-            let path = args.file.as_ref().expect("file path");
-            text = std::fs::read_to_string(path).map_err(|error| {
-                CliFailure::new(1, format!("could not read {}: {error}", path.display()))
-            })?;
-        }
-    }
+    let text = read_metrics_import_text(args.file.as_deref())?;
     store
         .import_fleet_capacity(&text)
         .map_err(|error| CliFailure::new(1, format!("fleet-capacity import failed: {error}")))
+}
+
+fn read_metrics_import_text(file: Option<&Path>) -> Result<String, CliFailure> {
+    match file {
+        None => {
+            let mut text = String::new();
+            std::io::stdin()
+                .read_to_string(&mut text)
+                .map_err(|error| CliFailure::new(1, format!("stdin read failed: {error}")))?;
+            Ok(text)
+        }
+        Some(path) if path == Path::new("-") => {
+            let mut text = String::new();
+            std::io::stdin()
+                .read_to_string(&mut text)
+                .map_err(|error| CliFailure::new(1, format!("stdin read failed: {error}")))?;
+            Ok(text)
+        }
+        Some(path) => std::fs::read_to_string(path).map_err(|error| {
+            CliFailure::new(1, format!("could not read {}: {error}", path.display()))
+        }),
+    }
 }
 
 fn import_github(
@@ -1037,6 +1090,21 @@ mod tests {
         assert!(error.message().contains("timed out"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn metrics_import_non_utf8_path_does_not_fall_back_to_stdin() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let path_bytes = OsString::from_vec(vec![
+            b'm', b'i', b's', b's', b'i', b'n', b'g', b'-', 0xff, b'.', b'j', b's', b'o', b'n',
+        ]);
+        let path = Path::new(&path_bytes);
+        let error = read_metrics_import_text(Some(path)).expect_err("path read must fail");
+        assert_eq!(error.code, 1);
+        assert!(error.message().contains("could not read"));
+    }
+
     #[test]
     fn github_api_paths_are_absolute() {
         assert_eq!(
@@ -1051,6 +1119,91 @@ mod tests {
             github_jobs_api_path("danielraffel/pulp", 123),
             "/repos/danielraffel/pulp/actions/runs/123/jobs"
         );
+    }
+
+    #[test]
+    fn repeated_work_cost_rejects_nonpositive_windows_without_output() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        for since in ["0d", "-1d"] {
+            for json_output in [false, true] {
+                let mut output = Vec::new();
+                let error = metrics_command(
+                    MetricsCommand::RepeatedWorkCost(
+                        crate::app::cli::MetricsRepeatedWorkCostArgs {
+                            limit: 100,
+                            since: since.into(),
+                        },
+                    ),
+                    temp.path(),
+                    None,
+                    json_output,
+                    &mut output,
+                )
+                .expect_err("nonpositive baseline window must fail");
+                assert_eq!(error.code, WAIT_EXIT_INVALID, "{since}");
+                assert_eq!(
+                    error.message(),
+                    "repeated-work baseline window must be positive"
+                );
+                assert!(
+                    output.is_empty(),
+                    "invalid window emitted a report: {since}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_work_cost_json_and_human_output_report_superseded_coverage() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = MetricsStore::open(temp.path()).expect("store");
+        let timing = crate::metrics::QueueTerminalTiming {
+            queue_job_id: "sy-superseded".to_owned(),
+            queue_identity: "identity".to_owned(),
+            disposition: "clean".to_owned(),
+            started_at: Some(Utc::now()),
+            completed_at: Some(Utc::now()),
+            total_ms: Some(12),
+        };
+        store
+            .record_queue_terminal(crate::metrics::QUEUE_AUTHORITY_TOKEN, &timing)
+            .expect("queue timing");
+        store
+            .record_repeated_work_shadow(&crate::metrics::RepeatedWorkShadowInput {
+                kind: crate::metrics::RepeatedWorkKind::SupersededExactHead,
+                branch: "main".into(),
+                sha: "head".into(),
+                target_config: "cfg".into(),
+                mode: "normal".into(),
+                job_id: "sy-survivor".into(),
+                superseded_job_id: "sy-superseded".into(),
+                superseded_sha: "old".into(),
+            })
+            .expect("shadow");
+        let run = |json_output| {
+            let mut output = Vec::new();
+            metrics_command(
+                MetricsCommand::RepeatedWorkCost(crate::app::cli::MetricsRepeatedWorkCostArgs {
+                    limit: 100,
+                    since: "14d".into(),
+                }),
+                temp.path(),
+                None,
+                json_output,
+                &mut output,
+            )
+            .expect("repeated work command");
+            String::from_utf8(output).expect("utf8")
+        };
+        let json: Value = serde_json::from_str(&run(true)).expect("json");
+        assert_eq!(json["duration_ms"], 12);
+        assert_eq!(json["matched_clean"], 1);
+        assert_eq!(json["distinct_superseded_jobs"], 1);
+        assert_eq!(json["timing_basis"], "superseded_queue_job_runtime");
+        assert_eq!(json["since_days"], 14);
+        let human = run(false);
+        assert!(human.contains("superseded runtime: 12 ms"), "{human}");
+        assert!(human.contains("final attempt only"), "{human}");
     }
 
     #[test]
@@ -1093,6 +1246,7 @@ mod tests {
             "cache_hit_rate",
             "submit_to_receipt",
             "model_token_use",
+            "safely_merged_changes_per_eligible_slot_hour",
             "basis",
             "proxies",
             "comparison",
@@ -1230,7 +1384,8 @@ mod tests {
             MetricsCommand::Export {
                 source: MetricsExportCommand::MergeReceipt(MetricsExportMergeReceiptArgs {
                     repo: "owner/repo".to_owned(),
-                    file: destination.clone(),
+                    file: Some(destination.clone()),
+                    stdout: false,
                 }),
             },
             temp.path(),
@@ -1250,6 +1405,74 @@ mod tests {
     }
 
     #[test]
+    fn merge_receipt_export_stdout_contains_only_canonical_jsonl() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = MetricsStore::open(temp.path()).expect("store");
+        let receipt = crate::metrics::merge_receipt::MergeReceipt {
+            schema: crate::metrics::merge_receipt::SCHEMA.to_owned(),
+            receipt_id: "export-stdout".to_owned(),
+            repo: "owner/repo".to_owned(),
+            project: "repo".to_owned(),
+            base_branch: "main".to_owned(),
+            pr: 1,
+            head_sha: "a".repeat(40),
+            validated_head_sha: "a".repeat(40),
+            merge_commit_sha: "b".repeat(40),
+            merged_at: Utc::now(),
+            safe_merge: true,
+            source: "shipyard".to_owned(),
+            required_checks: vec!["linux".to_owned()],
+            gate_receipt_sha256: "c".repeat(64),
+            evidence: "sha256:export-stdout".to_owned(),
+        };
+        store
+            .import_merge_receipts(std::slice::from_ref(&receipt))
+            .expect("receipt");
+
+        let mut output = Vec::new();
+        metrics_command(
+            MetricsCommand::Export {
+                source: MetricsExportCommand::MergeReceipt(MetricsExportMergeReceiptArgs {
+                    repo: "owner/repo".to_owned(),
+                    file: None,
+                    stdout: true,
+                }),
+            },
+            temp.path(),
+            None,
+            false,
+            &mut output,
+        )
+        .expect("stream export");
+
+        let text = String::from_utf8(output).expect("UTF-8 JSONL");
+        assert_eq!(text.lines().count(), 1);
+        let exported: Value = serde_json::from_str(text.trim()).expect("receipt JSON");
+        assert_eq!(exported["receipt_id"], "export-stdout");
+        assert!(
+            exported.get("exported").is_none(),
+            "summary leaked to stdout"
+        );
+
+        let mut json_output = Vec::new();
+        let error = metrics_command(
+            MetricsCommand::Export {
+                source: MetricsExportCommand::MergeReceipt(MetricsExportMergeReceiptArgs {
+                    repo: "owner/repo".to_owned(),
+                    file: None,
+                    stdout: true,
+                }),
+            },
+            temp.path(),
+            None,
+            true,
+            &mut json_output,
+        )
+        .expect_err("stream mode must not mix structured summary output");
+        assert_eq!(error.code, 2);
+    }
+
+    #[test]
     fn merge_receipt_export_refuses_empty_or_database_destinations() {
         let temp = tempfile::tempdir().expect("tempdir");
         let store = MetricsStore::open(temp.path()).expect("store");
@@ -1260,7 +1483,8 @@ mod tests {
                 MetricsCommand::Export {
                     source: MetricsExportCommand::MergeReceipt(MetricsExportMergeReceiptArgs {
                         repo: repo.to_owned(),
-                        file,
+                        file: Some(file),
+                        stdout: false,
                     }),
                 },
                 temp.path(),
@@ -1334,6 +1558,7 @@ mod tests {
 
         assert!(output.contains("PR coverage=unavailable"));
         assert!(output.contains("worker-minutes coverage=unavailable"));
+        assert!(output.contains("safe-merge-rate=unavailable=n/a"));
         assert!(output.contains("submit-to-receipt=unavailable"));
         assert!(output.contains("model-tokens=unavailable"));
     }

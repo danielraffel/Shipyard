@@ -246,6 +246,18 @@ pub(super) enum Command {
         #[arg(long, requires = "apply")]
         confirm_no_worker_tree: bool,
     },
+    /// Quarantine one malformed raw queue row after an explicit dry run.
+    #[command(name = "queue-quarantine")]
+    QueueQuarantine {
+        /// Exact malformed queue job identifier.
+        job_id: String,
+        /// Why this row is being quarantined.
+        #[arg(long, default_value = "malformed queue row blocks safe cleanup")]
+        reason: String,
+        /// Move the row into queue-quarantine/<job-id>-<timestamp>.json.
+        #[arg(long)]
+        apply: bool,
+    },
     /// Change the priority of a pending job.
     Bump {
         /// Job identifier.
@@ -407,6 +419,11 @@ pub(super) enum Command {
             requires = "validation_tmp"
         )]
         older_than_hours: u64,
+        /// With --validation-tmp: reclaim only directories with an owner file.
+        /// Scheduled cleanup uses this conservative mode; manual cleanup keeps
+        /// the historical unowned-directory scan unless this flag is supplied.
+        #[arg(long = "owned-only", requires = "validation_tmp")]
+        owned_only: bool,
     },
     /// List, add, remove, and test validation targets.
     Targets {
@@ -1544,6 +1561,16 @@ pub(crate) struct MetricsGateCostArgs {
     /// yields is cached, never the log.
     #[arg(long, requires = "scorecard")]
     pub(crate) causes: bool,
+    /// Name causes from a local `cause record` archive instead of reading
+    /// GitHub job logs. The archive is bounded and joined by exact repo/run/job
+    /// identity; ambiguous rows stay unreadable.
+    #[arg(
+        long = "causes-archive",
+        value_name = "DIR",
+        requires = "scorecard",
+        conflicts_with = "causes"
+    )]
+    pub(crate) causes_archive: Option<PathBuf>,
     /// Most red jobs whose job and log `--causes` (or `--export-cases`)
     /// fetches in one run, newest first; each costs two GitHub API calls. A
     /// job whose cause is cached does not count. Jobs over the budget count
@@ -1566,9 +1593,13 @@ pub(crate) enum CauseCommand {
     /// only a missing or unreadable log exits non-zero.
     Extract(CauseExtractArgs),
     /// Append `ci.cause/v1` records to an append-only archive: one
-    /// `YYYY-MM.jsonl` per month of `named_at` under `--dir`. A record whose
+    /// `causes/YYYY-MM.jsonl` per month of `named_at` under `--dir`. A record whose
     /// id is already archived is skipped; nothing is rewritten.
     Archive(CauseArchiveArgs),
+    /// Preview or apply bounded age/size retention to a local cause archive.
+    /// The default is a dry run; malformed or unclassifiable rows refuse the
+    /// operation rather than being guessed away.
+    Prune(CausePruneArgs),
     /// Keep a labels archive current: read the workflow's completed runs
     /// since `--since`, write a `ci.cause/v1` record for each red job not yet
     /// in `--dir`, and a fix-link for each red that a later run on its pull
@@ -1643,13 +1674,33 @@ pub(crate) struct CauseRecordArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct CauseArchiveArgs {
-    /// Archive directory (for example `causes/` in a private labels checkout).
+    /// Archive parent directory containing `causes/` and `fixlinks.jsonl` (for
+    /// example `data/ci-cause` in a private labels checkout).
     #[arg(long, value_name = "DIR")]
     pub(crate) dir: PathBuf,
     /// JSONL of `ci.cause/v1` records, or of scorecard case rows (their
     /// `cause` is taken). Repeatable.
     #[arg(long = "input", value_name = "FILE", required = true)]
     pub(crate) inputs: Vec<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct CausePruneArgs {
+    /// Cause archive parent (containing causes/ and fixlinks.jsonl).
+    #[arg(long, value_name = "DIR")]
+    pub(crate) dir: PathBuf,
+    /// Keep rows named within this many days. Default: 365.
+    #[arg(long, default_value_t = 365)]
+    pub(crate) retention_days: i64,
+    /// Maximum retained JSONL payload bytes. Default: 64 MiB.
+    #[arg(long, default_value_t = 64 * 1024 * 1024)]
+    pub(crate) max_bytes: u64,
+    /// Apply the planned rotation. Without this flag the command is a preview.
+    #[arg(long)]
+    pub(crate) apply: bool,
+    /// Explicitly enroll an existing unmarked archive before applying.
+    #[arg(long, requires = "apply")]
+    pub(crate) initialize: bool,
 }
 
 #[derive(Debug, Args)]
@@ -2037,8 +2088,12 @@ pub(crate) struct MetricsExportMergeReceiptArgs {
     #[arg(long)]
     pub(crate) repo: String,
     /// Destination JSONL file. The write is atomic.
-    #[arg(long)]
-    pub(crate) file: PathBuf,
+    #[arg(long, required_unless_present = "stdout", conflicts_with = "stdout")]
+    pub(crate) file: Option<PathBuf>,
+    /// Write canonical JSONL records to stdout for a governed transport.
+    /// No summary or other status is written to stdout in this mode.
+    #[arg(long, conflicts_with = "file")]
+    pub(crate) stdout: bool,
 }
 
 #[derive(Debug, Args)]
@@ -2195,6 +2250,9 @@ pub(crate) struct MetricsRepeatedWorkCostArgs {
     /// Maximum shadow observations to include.
     #[arg(long, default_value_t = 1000)]
     pub(crate) limit: usize,
+    /// Baseline window for shadow observations, for example `14d`.
+    #[arg(long = "since", default_value = "14d")]
+    pub(crate) since: String,
 }
 
 #[derive(Debug, Args)]
@@ -2805,8 +2863,10 @@ pub(super) enum RunnerCommand {
     /// Dry-run is the default. `--apply` may enqueue an exact green head,
     /// rerun a bounded transient failure, or cancel only queued runs with a
     /// provably superseded PR/merge-group head. Same-head duplicates are never
-    /// cancelled. Repositories without a server-owned
-    /// merge queue are reported as direct-merge refusals.
+    /// cancelled. Repositories without a server-owned merge queue are admitted
+    /// by a server-enforced exact-head merge when GitHub requires the
+    /// app-bound approval context; otherwise they are reported as direct-merge
+    /// refusals.
     Steward {
         /// Owner/repo slug. Repeatable; defaults to the current repository.
         #[arg(long)]
@@ -2847,9 +2907,18 @@ pub(super) enum RunnerCommand {
         /// no current-head handoff receipt), so one cannot sit unqueued because
         /// nothing armed it. Audit-only without `--apply`. Drafts, failing
         /// required checks, conflicts, and heads the queue ejected are never
-        /// armed, and the queue-arm guard's refusals are honoured.
+        /// armed, and the queue-arm guard's refusals are honoured. A base with
+        /// no merge queue is never armed: there an armed request survives a
+        /// later push.
         #[arg(long = "arm-unqueued")]
         arm_unqueued: bool,
+        /// Required check that reports exact-head approval. On a base with no
+        /// merge queue, an owned, approved, CLEAN, all-green head is merged by
+        /// `mergePullRequest` bound to that head only when GitHub requires this
+        /// context from a bound app; otherwise it stays refused. Native
+        /// auto-merge is never armed there, and any armed request is disarmed.
+        #[arg(long = "approval-context", default_value = "review-verdict")]
+        approval_context: String,
         /// Perform the planned mutations. Without this flag, only audit.
         #[arg(long)]
         apply: bool,
@@ -4322,6 +4391,48 @@ mod tests {
             ])
             .is_err(),
             "--since and --from conflict"
+        );
+    }
+
+    #[test]
+    fn metrics_gate_cost_parses_archive_cause_source() {
+        let cli = Cli::try_parse_from([
+            "shipyard",
+            "metrics",
+            "gate-cost",
+            "--repo",
+            "o/r",
+            "--workflow",
+            "build.yml",
+            "--gate-job",
+            "macos",
+            "--scorecard",
+            "--causes-archive",
+            "/var/lib/shipyard/causes",
+        ])
+        .expect("archive scorecard");
+        let Command::Metrics { command } = cli.command else {
+            panic!("expected metrics command");
+        };
+        let super::MetricsCommand::GateCost(args) = *command else {
+            panic!("expected metrics gate-cost command");
+        };
+        assert_eq!(
+            args.causes_archive.as_deref(),
+            Some(std::path::Path::new("/var/lib/shipyard/causes"))
+        );
+        assert!(
+            Cli::try_parse_from([
+                "shipyard",
+                "metrics",
+                "gate-cost",
+                "--scorecard",
+                "--causes",
+                "--causes-archive",
+                "/tmp/archive",
+            ])
+            .is_err(),
+            "live and archive causes must be explicit"
         );
     }
 
