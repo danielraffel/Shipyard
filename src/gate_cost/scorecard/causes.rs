@@ -284,6 +284,12 @@ pub fn gather(
 /// A missing or unreadable archive directory is an error, not an empty archive.
 #[allow(clippy::too_many_lines)] // Keep the bounded archive scan and its accounting in one order.
 pub fn archive(dir: &Path, repo: &str) -> Result<CausesRead, String> {
+    let _lock = crate::app::lock_cause_archive(dir).map_err(|error| {
+        format!(
+            "cause archive unavailable at {}: {error}",
+            dir.join("causes").display()
+        )
+    })?;
     let mut read = CausesRead {
         source: CauseSource::Archive,
         ..CausesRead::default()

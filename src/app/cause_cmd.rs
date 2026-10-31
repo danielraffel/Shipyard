@@ -92,6 +92,70 @@ pub(super) fn cause_command<W: Write>(
     Ok(std::process::ExitCode::SUCCESS)
 }
 
+/// A held archive lock. Readers borrow the writer-created lock file when it
+/// exists; they never create archive state merely to inspect it.
+pub(crate) struct ArchiveLock {
+    _file: Option<std::fs::File>,
+}
+
+/// Lock the archive for one complete operation. Writers create the lock file
+/// and take it exclusively; readers take a shared lock when a writer-created
+/// lock file is present and otherwise proceed without creating one.
+pub(super) fn lock_archive(dir: &Path, exclusive: bool) -> Result<ArchiveLock, String> {
+    if exclusive {
+        fs::create_dir_all(dir).map_err(|error| error.to_string())?;
+    }
+    let metadata = fs::symlink_metadata(dir).map_err(|error| error.to_string())?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("archive root must be a real directory".to_owned());
+    }
+    let lock_path = dir.join(".lock");
+    if let Ok(metadata) = fs::symlink_metadata(&lock_path)
+        && (metadata.file_type().is_symlink() || !metadata.is_file())
+    {
+        return Err("archive lock must be a regular file".to_owned());
+    }
+    let lock = match OpenOptions::new()
+        .create(exclusive)
+        .truncate(false)
+        .read(true)
+        .write(exclusive)
+        .open(&lock_path)
+    {
+        Ok(lock) => lock,
+        Err(error) if !exclusive && error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ArchiveLock { _file: None });
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    if exclusive {
+        lock.lock_exclusive().map_err(|error| error.to_string())?;
+    } else {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match fs2::FileExt::try_lock_shared(&lock) {
+                Ok(()) => break,
+                Err(error) if lock_contention(&error) && std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "archive lock unavailable after bounded wait: {error}"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(ArchiveLock { _file: Some(lock) })
+}
+
+fn lock_contention(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock
+        // Windows reports a byte-range lock held by another process as
+        // ERROR_LOCK_VIOLATION (33), which fs2 surfaces as ErrorKind::Other.
+        || error.raw_os_error() == Some(33)
+}
+
 /// `cause record`: one observer pass over the live GitHub reader.
 pub(super) fn record_command<W: Write>(
     args: &CauseRecordArgs,
@@ -364,14 +428,7 @@ fn archived_ids(dir: &Path) -> Result<BTreeSet<String>, String> {
 
 /// Append `records` to the archive under `dir`, holding its lock.
 pub(super) fn archive(dir: &Path, lines: &[String]) -> Result<ArchiveReport, String> {
-    fs::create_dir_all(dir).map_err(|error| error.to_string())?;
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(dir.join(".lock"))
-        .map_err(|error| error.to_string())?;
-    lock.lock_exclusive().map_err(|error| error.to_string())?;
+    let _lock = lock_archive(dir, true)?;
     require_archive_parent(dir)?;
     fs::create_dir_all(causes_dir(dir)).map_err(|error| error.to_string())?;
     let mut seen = archived_ids(dir)?;

@@ -17,6 +17,11 @@ mod base_health_cmd;
 mod branch_cmd;
 mod capacity_cmd;
 mod cause_cmd;
+
+/// Acquire the shared snapshot lock used by the private cause archive.
+pub(crate) fn lock_cause_archive(dir: &Path) -> Result<cause_cmd::ArchiveLock, String> {
+    cause_cmd::lock_archive(dir, false)
+}
 pub(crate) mod changed_surface_cmd;
 mod changed_surface_trial_cmd;
 mod changelog_cmd;

@@ -330,8 +330,18 @@ fn a_full_bounded_job_listing_is_not_treated_as_complete() {
 #[test]
 fn a_red_drift_job_gets_one_record_naming_its_generator() {
     let dir = tempfile::tempdir().expect("tempdir");
+    let writer = super::super::lock_archive(dir.path(), true).expect("seed archive lock");
+    drop(writer);
     let fake = Fake::new(&red_routes()).with_log("jobs/1000/logs", &drift_log());
-    let gh = |args: &[String]| fake.read(args);
+    let archive_dir = dir.path().to_owned();
+    let gh = |args: &[String]| {
+        // A recorder must not hold the exclusive archive lock while it waits
+        // on GitHub. This shared acquisition would time out under the old
+        // whole-pass writer lock.
+        let _snapshot = super::super::lock_archive(&archive_dir, false)
+            .expect("reader is not blocked by observation");
+        fake.read(args)
+    };
     let report = record(&gh, &query(dir.path())).expect("pass");
     assert_eq!(report.causes_written, 1);
     assert_eq!(report.cancelled_skipped, 1);
