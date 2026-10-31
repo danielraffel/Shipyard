@@ -14,8 +14,8 @@
 //!
 //! It never arms native auto-merge: an armed request survives a later push by
 //! anyone with write access and would then merge a head nobody judged. For the
-//! same reason any auto-merge request found armed on an owned pull request on
-//! such a base is disarmed, whatever the pull request's decision.
+//! same reason any auto-merge request found armed on an owned pull request, on
+//! this base or any other, is disarmed, whatever the pull request's decision.
 
 use super::{
     MutationApplyContext, ObservedPr, StewardDecision, StewardLedger, StewardPolicy, Value,
@@ -56,8 +56,8 @@ fn join(prior: Option<String>, next: &str) -> String {
     prior.map_or_else(|| next.to_owned(), |prior| format!("{prior},{next}"))
 }
 
-/// Whether the steward owns `decision` on a server-enforced base, and so must
-/// not leave an auto-merge request armed on it.
+/// Whether the steward owns `decision`, and so must not leave an auto-merge
+/// request armed on it on any base.
 pub(super) fn owns_for_disarm(decision: &StewardDecision) -> bool {
     !matches!(
         decision,
@@ -128,24 +128,18 @@ pub(super) fn disarm_under_guard(
     Ok(())
 }
 
-/// Disarm native auto-merge on `pr` on a server-enforced base, under an
-/// already-held guard.
+/// Disarm native auto-merge on owned `pr`, under an already-held guard.
 fn disarm(
     context: &MutationApplyContext<'_>,
     pr: &ObservedPr,
     ledger: &mut StewardLedger,
 ) -> Result<String, String> {
-    disarm_under_guard(
-        context,
-        pr,
-        ledger,
-        "disable_auto_merge_server_enforced_base",
-    )?;
+    disarm_under_guard(context, pr, ledger, "disable_auto_merge_owned_pr")?;
     Ok(format!("auto_merge_disabled:{}", pr.fact.head_sha))
 }
 
 /// Disarm an auto-merge request the census saw armed on an owned pull
-/// request. Disarming only removes authority, so it needs the mutation guard
+/// request, on any base. Disarming only removes authority, so it needs the mutation guard
 /// but no approval.
 pub(super) fn disarm_owned_auto_merge(
     context: &MutationApplyContext<'_>,
@@ -156,7 +150,7 @@ pub(super) fn disarm_owned_auto_merge(
         context.mutation_control,
         context.observation,
         pr,
-        "runner steward disable auto-merge on a server-enforced base",
+        "runner steward disable auto-merge on an owned pull request",
     ) {
         Ok(guard) => guard,
         Err(error) => return (None, Some(error)),

@@ -132,40 +132,71 @@ pub(super) fn read_head_gate_for(
     observation: &RepoObservation,
     pr: &ObservedPr,
 ) -> Result<(crate::head_approval::HeadGate, Vec<String>, Value), String> {
+    let approval_policy = read_approval_policy(actions, observation)?;
+    let queue = read_pr_queue_state(actions, observation, pr.fact.number)?;
+    let (gate, events) = evaluate_head_gate(actions, observation, pr, &approval_policy, &queue)?;
+    Ok((gate, events, queue))
+}
+
+/// The base's reviewer policy, read strictly: an absent or unreadable config
+/// is an error, never "approval not required".
+pub(super) fn read_approval_policy(
+    actions: &GitHubActions,
+    observation: &RepoObservation,
+) -> Result<crate::head_approval::ApprovalPolicy, String> {
     let run_gh = |argv: &[String]| actions.run_gh(argv).map_err(|error| error.to_string());
-    let approval_policy =
-        crate::head_approval::read_policy_required(&run_gh, &observation.repo, &observation.base)
-            .map_err(|error| format!("head approval policy unreadable: {error}"))?;
+    crate::head_approval::read_policy_required(&run_gh, &observation.repo, &observation.base)
+        .map_err(|error| format!("head approval policy unreadable: {error}"))
+}
+
+/// The live `PR_QUEUE_STATE_QUERY` response for pull request `number`.
+pub(super) fn read_pr_queue_state(
+    actions: &GitHubActions,
+    observation: &RepoObservation,
+    number: u64,
+) -> Result<Value, String> {
     let (owner, name) = observation
         .repo
         .split_once('/')
         .ok_or_else(|| "invalid repository slug".to_owned())?;
-    let raw = run_gh(&[
-        "api".to_owned(),
-        "graphql".to_owned(),
-        "-f".to_owned(),
-        format!("query={}", crate::pr_queue_state::PR_QUEUE_STATE_QUERY),
-        "-F".to_owned(),
-        format!("owner={owner}"),
-        "-F".to_owned(),
-        format!("name={name}"),
-        "-F".to_owned(),
-        format!("number={}", pr.fact.number),
-    ])
-    .map_err(|error| format!("merge-queue observation unreadable: {error}"))?;
-    let queue = serde_json::from_str::<Value>(&raw)
+    let raw = actions
+        .run_gh(&[
+            "api".to_owned(),
+            "graphql".to_owned(),
+            "-f".to_owned(),
+            format!("query={}", crate::pr_queue_state::PR_QUEUE_STATE_QUERY),
+            "-F".to_owned(),
+            format!("owner={owner}"),
+            "-F".to_owned(),
+            format!("name={name}"),
+            "-F".to_owned(),
+            format!("number={number}"),
+        ])
         .map_err(|error| format!("merge-queue observation unreadable: {error}"))?;
-    let (gate, events) = crate::head_approval::evaluate_with_policy_for_author_with_events(
+    serde_json::from_str::<Value>(&raw)
+        .map_err(|error| format!("merge-queue observation unreadable: {error}"))
+}
+
+/// Evaluate `pr`'s census head against `approval_policy` and the live
+/// `queue` state.
+pub(super) fn evaluate_head_gate(
+    actions: &GitHubActions,
+    observation: &RepoObservation,
+    pr: &ObservedPr,
+    approval_policy: &crate::head_approval::ApprovalPolicy,
+    queue: &Value,
+) -> Result<(crate::head_approval::HeadGate, Vec<String>), String> {
+    let run_gh = |argv: &[String]| actions.run_gh(argv).map_err(|error| error.to_string());
+    crate::head_approval::evaluate_with_policy_for_author_with_events(
         &run_gh,
         &observation.repo,
         pr.fact.number,
         &pr.fact.head_sha,
-        &approval_policy,
-        &queue,
+        approval_policy,
+        queue,
         pr.fact.author.as_deref(),
     )
-    .map_err(|error| format!("head approval unreadable: {error}"))?;
-    Ok((gate, events, queue))
+    .map_err(|error| format!("head approval unreadable: {error}"))
 }
 
 #[cfg(all(test, unix))]

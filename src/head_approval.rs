@@ -2014,10 +2014,37 @@ pub fn evaluate_excusing(
     latest_was_interruption: bool,
 ) -> Result<HeadGate, String> {
     let policy = read_policy(run_gh, repo, base)?;
+    evaluate_excusing_with_policy(
+        run_gh,
+        repo,
+        pr,
+        head,
+        &policy,
+        queue,
+        latest_was_interruption,
+    )
+}
+
+/// [`evaluate_excusing`] under an already-read `policy`, so a caller can
+/// choose how strictly the policy is read (for example
+/// [`read_policy_required`], where an absent config is an error).
+///
+/// # Errors
+///
+/// When a needed fact cannot be read. Callers must not arm on an error.
+pub fn evaluate_excusing_with_policy(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    pr: u64,
+    head: &str,
+    policy: &ApprovalPolicy,
+    queue: &Value,
+    latest_was_interruption: bool,
+) -> Result<HeadGate, String> {
     if !policy.required {
         return Ok(HeadGate::NotRequired);
     }
-    let author = pr_author(run_gh, repo, pr, &policy, None)?;
+    let author = pr_author(run_gh, repo, pr, policy, None)?;
     let reviews = read_records(
         run_gh,
         &format!("repos/{repo}/pulls/{pr}/reviews"),
@@ -2029,7 +2056,7 @@ pub fn evaluate_excusing(
         COMMENT_RECORD_JQ,
     )?;
     let gate = decide_for_author(
-        &policy,
+        policy,
         head,
         &reviews,
         &comments,
@@ -2043,7 +2070,7 @@ pub fn evaluate_excusing(
         head,
         reviews: &reviews,
         comments: &comments,
-        policy: &policy,
+        policy,
         author: author.as_deref(),
     };
     let gate = with_carry(run_gh, &input, gate);

@@ -712,10 +712,11 @@ The head lands again only once a newer verdict approves it, which
 
 The merge steward closes the same gap without a HOLD: on every `--apply` pass
 it disables an armed auto-merge request on any open PR whose current head the
-exact-head approval gate does not admit (`disarmed_stale_auto_merge:<sha>`).
-That disarm carries Shipyard's internal marker and one-shot
-`internal-removal` nonce, so `queue-removal-guard` accepts it as an audited
-Shipyard removal; the guard is unchanged for every other caller.
+exact-head approval gate does not admit (`disarmed_stale_auto_merge:<sha>`),
+and removes such a head from the merge queue (`dequeued_unapproved:<sha>`).
+Both carry Shipyard's internal marker and one-shot `internal-removal` nonce, so
+`queue-removal-guard` accepts them as audited Shipyard removals; the guard is
+unchanged for every other caller.
 
 **The one sanctioned route around `queue-removal-guard`.** The hook's mutation
 goes to the real `gh` with the exported App token, not back through `ghapp`, so

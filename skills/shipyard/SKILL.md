@@ -3517,22 +3517,33 @@ mutations are `merged_exact_head:<sha>`, `waiting_head_approval`, and
 armed request survives a later push by anyone with write access; any armed
 request on an owned PR is disarmed (`auto_merge_disabled:<sha>`) on every
 `--apply` pass, approved or not. The org-queue path never takes this merge.
-On both admission paths (`native_queue_exact_head` and
-`server_enforced_exact_head_merge`) the steward, as the base's single admission
-writer, also sweeps every other open PR, owned or not: an armed native
-auto-merge request whose current head the exact-head gate does not admit is
-disabled (`disablePullRequestAutoMerge`), reported as
-`disarmed_stale_auto_merge:<sha>`, and audited as `disarm_stale_auto_merge`.
-This closes the gap where an arm enabled for an older head survives a push by
-anyone with write access and GitHub then enqueues the unapproved new head
+On every base, whatever its `merge_path` (including
+`direct_merge_refused_server_enforcement_required`, where a surviving arm
+merges directly), the steward, as the base's single admission writer, also
+sweeps every open PR, owned or not, and withdraws what the exact-head gate does
+not admit. An armed native auto-merge request on such a head is disabled
+(`disarmed_stale_auto_merge:<sha>`, audit `disarm_stale_auto_merge`). A
+merge-queue entry whose head is not admitted is removed with
+`dequeuePullRequest` (`dequeued_unapproved:<sha>`, audit
+`dequeue_unapproved_queue_entry`): GitHub consumes the arm when it enqueues,
+so a head it enqueued past approval has no arm left to disarm. This closes the
+gap where an arm enabled for an older head survives a push by anyone with
+write access and GitHub then enqueues or merges the unapproved new head
 itself. A head the gate admits (`Approved`, or `NotRequired` where the
-repository does not require approval) keeps its arm, since the steward would
-enqueue it anyway; an approval that cannot be read, or a live head that moved
-since the census, disarms. The disarm runs under the PR mutation guard on
-Shipyard's internal queue-mutation path, whose one-shot nonce the `ghapp`
-`queue-removal-guard` accepts; a plain `gh` disarm is refused as an
-unaudited queue removal. A dry run reports
-`would_disarm_stale_auto_merge:<sha>` and changes nothing.
+repository does not require approval) keeps its arm and its entry, since the
+steward would enqueue it anyway; an approval that cannot be read, or a live
+head that moved since the census, withdraws. The reviewer policy is read once
+per pass, strictly (`read_policy_required`: an absent config is an error, not
+"approval not required"). An armed request on an owned PR is disarmed
+unconditionally on every base (`auto_merge_disabled:<sha>`, audit
+`disable_auto_merge_owned_pr`), because the steward admits owned heads itself.
+Every withdrawal runs under the PR mutation guard on Shipyard's internal
+queue-mutation path, whose one-shot nonce the `ghapp` `queue-removal-guard`
+accepts; a plain `gh` disarm or dequeue is refused as an unaudited queue
+removal. A dry run reports `would_disarm_stale_auto_merge:<sha>` and
+`would_dequeue_unapproved:<sha>` and changes nothing. The `--arm-unqueued`
+backstop reads the policy just as strictly, so it never arms what the sweep
+would withdraw.
 The bound rule is satisfied only by a check run carrying that app id (the
 canonical `review-verdict` job, github-actions 15368); an app-less status of
 the same name never satisfies it. Because that job succeeds whenever it posts a

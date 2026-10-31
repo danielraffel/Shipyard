@@ -267,23 +267,27 @@ pub(super) fn apply_pr_plans(
         ledger_path,
         mutation_control,
     });
+    let mut approval_policy = super::unapproved_admission::PolicyCache::default();
     let reports = observation
         .prs
         .iter()
         .map(|pr| {
             let attempts = attempts_for(ledger, &observation.repo, &pr.fact);
             let decision = classify_pr(&pr.fact, policy, &attempts);
-            // Every open PR on the base, owned or not: an armed request whose
-            // current head the approval gate does not admit is disarmed
-            // before anything else acts on it. See `stale_auto_merge`.
+            // Every open PR on the base, owned or not, on every merge path:
+            // an arm or queue entry whose current head the approval gate does
+            // not admit is withdrawn before anything else acts on it. See
+            // `unapproved_admission`.
             let (stale_mutation, stale_error) =
-                if super::stale_auto_merge::applies(policy, pr, &decision) {
-                    super::stale_auto_merge::sweep(
+                if super::unapproved_admission::applies(pr, &decision) {
+                    super::unapproved_admission::sweep(
                         actions,
                         observation,
                         mutation_context.as_ref(),
                         args.apply,
                         pr,
+                        &decision,
+                        &mut approval_policy,
                         ledger,
                     )
                 } else {
@@ -378,13 +382,13 @@ pub(super) fn apply_pr_plans(
             }
             if args.apply
                 && error.is_none()
-                && policy.server_enforced_exact_head_merge()
                 && pr.fact.auto_merge_active
                 && super::exact_head_merge::owns_for_disarm(&decision)
             {
                 // An armed request survives a later push by anyone with
-                // write access, so none is left armed on an owned PR here,
-                // approved or not. See `exact_head_merge`.
+                // write access, and the steward admits an owned head itself,
+                // so none is left armed on an owned PR on any base, approved
+                // or not. See `exact_head_merge`.
                 if let Some(context) = mutation_context.as_ref() {
                     let (disarm_mutation, disarm_error) =
                         super::exact_head_merge::disarm_owned_auto_merge(context, pr, ledger);
