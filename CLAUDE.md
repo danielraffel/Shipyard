@@ -160,7 +160,7 @@ rather than stacking them.
 
 ## macOS release is a stapled .dmg, built LOCALLY (arm64 only)
 
-As of #219 (2026-04-24 evening), macOS binaries ship as stapled **.dmg** artifacts built on the maintainer's Mac. CI handles Linux + Windows. The `.dmg` wrapper puts the notarization ticket **inside** the artifact so Gatekeeper verifies offline — no online notarization check, no per-Mac taskgated flakiness. Bare Mach-O binaries depend on an online check that proved unreliable (v0.42.0 and v0.43.0 both shipped bare Mach-O and both SIGKILL'd on the maintainer's Mac).
+As of #219 (2026-04-24 evening), macOS binaries ship as stapled **.dmg** artifacts built on the maintainer's Mac. CI builds the Linux binaries (x64 and ARM64) and, only when `CI_PLATFORM_FOCUS=all`, Windows. The `.dmg` wrapper puts the notarization ticket **inside** the artifact so Gatekeeper verifies offline — no online notarization check, no per-Mac taskgated flakiness. Bare Mach-O binaries depend on an online check that proved unreliable (v0.42.0 and v0.43.0 both shipped bare Mach-O and both SIGKILL'd on the maintainer's Mac).
 
 As of #256 (v0.50.0+), **Apple Silicon (arm64) is the only supported macOS architecture.** Intel Macs (x86_64) were dropped — install.sh now prints a clean "unsupported" message on Intel rather than hitting a 404. This halved the release surface and retired the Rosetta/Intel-host branch of the local flow.
 
@@ -184,7 +184,7 @@ Full flow + env-var setup in `RELEASING.md` § "macOS release is a locally-signe
 - **Review:** a standing reviewer posts an exact-head APPROVE or a HOLD once required checks are green. Never approve your own team's work.
 - **Landing:** this repo is user-owned, so there is no merge queue. The m3 steward tick (every 5 minutes) merges the exact approved head. The ruleset requires `Test macOS ARM64` and `review-verdict`, bound to GitHub Actions.
 - **On a HOLD:** fix what it names, with a test. Merge `origin/main` (never rebase or force-push). Push once and comment `repaired: ... at <sha>`; the PR re-enters review on its own.
-- **macOS first.** `CI_PLATFORM_FOCUS=macos` limits Shipyard CI and releases. A Windows- or Linux-only failure gets a `PARKED/<platform>` issue with evidence and never blocks a macOS landing.
+- **macOS first.** `CI_PLATFORM_FOCUS=macos` (the default) limits Shipyard CI to macOS ARM64 and releases to macOS ARM64, Linux x64 and Linux ARM64; Windows and the Linux CI lane run only with `CI_PLATFORM_FOCUS=all`. A Windows- or Linux-only failure gets a `PARKED/<platform>` issue with evidence and never blocks a macOS landing.
 - **Labels the pipeline skips:** `superseded`, `owner-decision`, `PARKED/<platform>`.
 - Launch agents with `sr claude` / `sr codex` and use the smallest model that fits (Haiku or Codex Luna for mechanical work, Sonnet or Codex Terra/Sol for fixes, Opus/Fable/Codex Astra for security, signing and release diffs).
 - Steward log on m3: `~/Library/Logs/shipyard-steward-tick/summary.log`.
