@@ -263,8 +263,11 @@ class VersionAtLandPullRequestTests(unittest.TestCase):
         for repo_cfg in (("user.email", "test@example.com"), ("user.name", "Test")):
             run(self.dev, "git", "config", *repo_cfg)
         (self.dev / "scripts").mkdir()
-        for name in ("version_bump_check.py", "version_at_land.py", "versioning.json"):
+        for name in ("version_bump_check.py", "version_at_land.py", "versioning.json",
+                     "skill_sync_check.py", "skill_path_map.json",
+                     "doc_sync_check.py", "doc_sync_map.json"):
             shutil.copy(HERE / name, self.dev / "scripts" / name)
+        shutil.copytree(ROOT / "skills", self.dev / "skills")
         (self.dev / "Cargo.toml").write_text('[package]\nname = "shipyard"\nversion = "0.292.0"\n')
         (self.dev / "Cargo.lock").write_text('version = 3\n\n[[package]]\nname = "shipyard"\nversion = "0.292.0"\n')
         (self.dev / ".claude-plugin").mkdir()
@@ -419,6 +422,57 @@ class VersionAtLandPullRequestTests(unittest.TestCase):
         self.assertEqual(payload["status"], "opened")
         self.assertEqual([(a["current"], a["assigned"]) for a in payload["plan"]],
                          [("0.292.1", "0.292.2")])
+
+    def bump_message(self, ref: str) -> str:
+        return run(self.origin, "git", "log", "-1", "--format=%B", ref).stdout
+
+    def test_bump_commit_carries_skip_trailers_for_mapped_skills(self) -> None:
+        self.land("src/a.rs", "pub fn a() {}\n", "fix: a")
+        self.land("commands/new.md", "new command\n", "feat: plugin command")
+        self.writer()
+        body = self.bump_message(PR_BRANCH)
+        self.assertIn('Skill-Update: skip skill=ci reason="version-at-land bump: version files only"',
+                      body)
+        self.assertIn("Release: allow-version-files", body)
+
+    def test_bump_commit_passes_the_skill_doc_and_version_gates(self) -> None:
+        self.land("src/a.rs", "pub fn a() {}\n", "fix: a")
+        self.land("commands/new.md", "new command\n", "feat: plugin command")
+        self.writer()
+        run(self.ci, "git", "fetch", "-q", "origin")
+        base, head = "origin/main", f"origin/{PR_BRANCH}"
+        for script, extra in (("skill_sync_check.py", ["--config", "scripts/versioning.json"]),
+                              ("doc_sync_check.py", []),
+                              ("version_bump_check.py", ["--config", "scripts/versioning.json"])):
+            result = run(self.ci, "python3", f"scripts/{script}", "--base", base,
+                         "--head", head, *extra, "--mode=report", check=False)
+            self.assertEqual(result.returncode, 0, script + result.stdout + result.stderr)
+
+    def test_existing_head_without_the_trailers_is_rebuilt(self) -> None:
+        self.land("src/a.rs", "pub fn a() {}\n", "fix: a")
+        self.writer()
+        old = self.origin_rev(PR_BRANCH)
+        # Recreate the head as an older writer built it: no skip trailers.
+        run(self.dev, "git", "fetch", "-q", "origin")
+        run(self.dev, "git", "checkout", "-q", "-B", "stale", f"origin/{PR_BRANCH}")
+        stripped = "".join(line + "\n" for line in self.bump_message(PR_BRANCH).splitlines()
+                           if not line.startswith("Skill-Update:"))
+        run(self.dev, "git", "commit", "-q", "--amend", "-m", stripped)
+        run(self.dev, "git", "push", "-q", "-f", "origin", f"HEAD:refs/heads/{PR_BRANCH}")
+        stale = self.origin_rev(PR_BRANCH)
+        self.assertNotEqual(stale, old)
+        self.assertNotIn("Skill-Update", self.bump_message(PR_BRANCH))
+        self.writer()
+        rebuilt = self.origin_rev(PR_BRANCH)
+        self.assertNotEqual(rebuilt, stale)
+        self.assertIn("Skill-Update: skip skill=ci", self.bump_message(PR_BRANCH))
+        # With the trailers present the head is then kept.
+        self.writer()
+        self.assertEqual(self.origin_rev(PR_BRANCH), rebuilt)
+
+    def test_workflow_can_be_dispatched_by_an_operator(self) -> None:
+        workflow = (ROOT / ".github/workflows/version-at-land.yml").read_text()
+        self.assertIn("workflow_dispatch:", workflow)
 
     def test_landing_while_bump_pr_was_open_is_not_lost(self) -> None:
         self.land("src/a.rs", "pub fn a() {}\n", "fix: a")
