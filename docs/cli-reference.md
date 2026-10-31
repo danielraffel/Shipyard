@@ -668,6 +668,9 @@ values are costs, not promotion decisions. JSON also includes
 `rework_compute_coverage`, and `coordination_rework_coverage`; each reports
 whether its authoritative timing denominator is `available`, `partial`, or
 `unavailable`, so a proxy total is never mistaken for a complete measurement.
+A window with completed job samples but no failed or cancelled attempt reports
+the failure-based proxies as `available`, since their zero total is a complete
+measurement; a window with no samples reports them `unavailable`.
 Human output shows the corresponding status beside each cost.
 `wasted_compute_per_safely_merged_change`
 is explicitly `unavailable` until a durable merge receipt joins a PR head to a

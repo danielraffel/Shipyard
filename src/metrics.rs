@@ -2612,14 +2612,16 @@ impl MetricsStore {
             samples.len(),
             "completed job samples include authoritative queue timing",
         );
-        let rework_coverage = coverage_for_samples(
+        let rework_coverage = coverage_for_failures(
             rework_samples,
             failed_jobs,
+            samples.len(),
             "failed attempts include measured duration",
         );
-        let wasted_coverage = coverage_for_samples(
+        let wasted_coverage = coverage_for_failures(
             wasted_samples,
             wasted_candidates,
+            samples.len(),
             "failed/cancelled jobs include measured duration",
         );
         let coordination_rework_coverage =
@@ -3408,6 +3410,26 @@ fn coverage_for_samples(measured: usize, total: usize, description: &str) -> Sco
         reason: format!("{measured} of {total} {description}"),
         value: None,
     }
+}
+
+/// Coverage of a measurement taken over failed attempts only. When the window
+/// holds completed samples but none failed, the zero-cost proxy is a complete
+/// measurement rather than a missing one; with no samples at all it stays
+/// unavailable.
+fn coverage_for_failures(
+    measured: usize,
+    failures: usize,
+    completed_samples: usize,
+    description: &str,
+) -> ScorecardCoverage {
+    if failures == 0 && completed_samples > 0 {
+        return ScorecardCoverage {
+            status: "available".to_owned(),
+            reason: format!("no failed attempts among {completed_samples} completed job samples"),
+            value: None,
+        };
+    }
+    coverage_for_samples(measured, failures, description)
 }
 
 fn combine_cost_coverage(
@@ -6760,6 +6782,50 @@ mod tests {
         let json = serde_json::to_value(&scorecard).expect("scorecard JSON");
         assert_eq!(json["wasted_compute_coverage"]["status"], "partial");
         assert_eq!(json["coordination_rework_coverage"]["status"], "partial");
+    }
+
+    #[test]
+    fn stewardship_scorecard_reports_complete_cost_proxy_coverage_without_failures() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = MetricsStore::open(temp.path()).expect("store");
+        insert_scorecard_sample(&store, "shipyard", 41, "success", 60_000, 1_000, true);
+        insert_scorecard_sample(&store, "shipyard", 42, "success", 90_000, 2_000, false);
+
+        let scorecard = store
+            .stewardship_scorecard("shipyard", 2)
+            .expect("scorecard");
+
+        assert_eq!(scorecard.failed_jobs, 0);
+        // No failed or cancelled attempt means the 0-minute proxies are
+        // complete measurements, not missing ones.
+        assert_eq!(scorecard.wasted_compute_coverage.status, "available");
+        assert_eq!(scorecard.rework_compute_coverage.status, "available");
+        assert_eq!(scorecard.coordination_coverage.status, "available");
+        assert_eq!(scorecard.coordination_rework_coverage.status, "available");
+        assert!(
+            scorecard
+                .rework_compute_coverage
+                .reason
+                .contains("no failed attempts"),
+            "{}",
+            scorecard.rework_compute_coverage.reason
+        );
+    }
+
+    #[test]
+    fn stewardship_scorecard_keeps_cost_proxy_coverage_unavailable_without_samples() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = MetricsStore::open(temp.path()).expect("store");
+
+        let scorecard = store
+            .stewardship_scorecard("shipyard", 2)
+            .expect("scorecard");
+
+        assert_eq!(scorecard.job_samples, 0);
+        assert_eq!(scorecard.wasted_compute_coverage.status, "unavailable");
+        assert_eq!(scorecard.rework_compute_coverage.status, "unavailable");
+        assert_eq!(scorecard.coordination_coverage.status, "unavailable");
+        assert_eq!(scorecard.coordination_rework_coverage.status, "unavailable");
     }
 
     #[test]
