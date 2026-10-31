@@ -17,10 +17,27 @@ reruns durably, and live-revalidates queued state plus immutable head before
 cancelling a run whose PR or merge-group head is provably superseded.
 Same-head duplicate runs are never cancelled because their unobserved inputs
 may differ. Repositories without a server-owned
-merge queue receive a typed `automatic-merge-refused` decision (exit 10): the REST merge
-endpoint cannot atomically prove complete required-check materialization or
-bind the validated base revision. Use manual merge or enable a native merge
-queue.
+merge queue are admitted only by the server-enforced exact-head merge: a
+`mergePullRequest` bound by `expectedHeadOid`, taken only when GitHub requires
+an app-bound approval check (`--approval-context`, default `review-verdict`) and
+the head is `CLEAN`, all-green and approved. Without that rule the steward
+reports `direct_merge_refused_server_enforcement_required` and merges nothing;
+the REST merge endpoint cannot atomically prove complete required-check
+materialization or bind the validated base revision, so it is never used.
+`shipyard auto-merge` on such a repository still returns a typed
+`automatic-merge-refused` decision (exit 10). Use manual merge, add the bound
+approval rule, or enable a native merge queue.
+
+Apply mode keeps its reads cheap. The census hydrates required-check identities
+only for pull requests that can still reach a check-dependent decision (not
+drafts, queued, conflicting or `DIRTY` rows, except managed-labelled rows, which
+the handoff status needs), four at a time. When the GraphQL list is unavailable,
+the REST fallback reads `mergeable_state` per candidate from `pulls/{n}`, bound
+to the listed head; an unreadable or moved head stays `UNKNOWN` and is refused.
+For an arm or merge candidate, exact-head approval is checked before the live
+single-pull-request revalidation, so an unapproved head costs no extra read, and
+that live read requests every census field (including `author`), so a
+fleet-authored pull request keeps its management classification.
 
 The transient retry ceiling is fenced twice: the local ledger records intent
 before mutation, and GitHub's durable `run_attempt` must still be within the
@@ -139,10 +156,46 @@ Candidates are selected from facts the pass already fetched, so selection costs
 no extra request; only a candidate costs one, because a backlog row carries no
 timeline and so cannot tell a never-armed pull request from an ejected one.
 
-The `ghapp` queue-arm guard judges each arm request (Shipyard does not claim its
-internal marker here — see `docs/ghapp-guards.md`). A guard refusal is agreement
+Where review before arm applies (`[auto_merge] arm_requires_head_approval`, or a
+repository in `REVIEW_REQUIRED_REPOS` on a host without a valid opt-out),
+Shipyard itself checks exact-head approval, including a `verdict: HOLD`, before
+every arm, by the same rules the guard uses. The `ghapp`
+queue-arm guard additionally judges each arm request where Shipyard's `gh`
+resolves to the guarded wrapper (Shipyard does not claim its internal marker
+here — see `docs/ghapp-guards.md`). A guard refusal is agreement
 that there is nothing to arm: it is reported, never retried, and
 `GHAPP_ALLOW_QUEUE_REARM` is never set.
+
+Before arming anything under `--apply`, the pass takes the same central HOLD,
+`[merge_queue].mutation_machine` authority and control lock as every other
+merge-queue mutation, and holds them while it arms. A HOLD is reported as
+`held: …` and is not a failure; a host without the authority, a contended lock,
+or an uncertain earlier mutation on that repository and base fails the pass and
+arms nothing. Audit mode and a pass with no candidates never take the lock.
+
+Each `--repo` mints its own token (`{repo_slug}` in `token_command` expands to
+that repository, not to the working directory's remote), so the pass runs from
+any directory, including launchd's `$HOME`.
+
+### Scheduled arming on the queue-authority host
+
+`scripts/install_arm_unqueued.sh` installs this pass as a launchd agent
+(`com.danielraffel.shipyard.arm-unqueued`). It prints a plan by default;
+`--install` rehearses the exact pass in audit mode under the agent's
+environment, refuses to load on a failed rehearsal, then loads the agent.
+Each run is bounded by `/usr/bin/timeout` (default: interval minus 60 seconds),
+because launchd never starts a tick while the previous one is still running.
+
+```bash
+scripts/install_arm_unqueued.sh --repo OWNER/REPO --interval 600 --shipyard "$(command -v shipyard)"  # plan
+scripts/install_arm_unqueued.sh --repo OWNER/REPO --interval 600 --shipyard "$(command -v shipyard)" --install
+scripts/install_arm_unqueued.sh --status      # loaded?, last exit, last 20 log lines
+scripts/install_arm_unqueued.sh --uninstall   # unload and remove the plist; keeps the log
+```
+
+Install it only on the `[merge_queue].mutation_machine` host: anywhere else
+every armed pass fails on authority by design. The log is
+`~/Library/Logs/shipyard-arm-unqueued.log`.
 
 Per-repository results appear under `native_auto_merge_backstop` in the JSON
 report. A repository whose settings could not be read reports

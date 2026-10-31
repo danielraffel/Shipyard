@@ -24,6 +24,10 @@
   preemption belong to a deliberate `runner steward` invocation by an operator,
   not to an unattended arming tick.
 
+  Each run is bounded by the timeout wrapper below: launchd never starts a
+  tick while the previous one is still running, so one hung pass would
+  otherwise silently stop every later one.
+
   NOTE for editors: an XML comment may not contain a double hyphen, so flag
   names are spelled out in prose here rather than quoted literally.
 -->
@@ -33,6 +37,10 @@
     <string>com.danielraffel.shipyard.arm-unqueued</string>
     <key>ProgramArguments</key>
     <array>
+        <string>@TIMEOUT_BIN@</string>
+        <string>-k</string>
+        <string>@KILL_AFTER@</string>
+        <string>@TIMEOUT@</string>
         <string>@SHIPYARD@</string>
         <string>--json</string>
         <string>runner</string>

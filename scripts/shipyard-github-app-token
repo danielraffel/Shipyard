@@ -50,6 +50,7 @@ OPENSSL_CANDIDATES = (
 OWNER_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
 REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 INSTALLATION_ID_RE = re.compile(r"^[1-9][0-9]*$")
+PERMISSION_NAME_PATTERN = re.compile(r"^[a-z][a-z_]*$")
 RETRYABLE_HTTP_STATUS = frozenset({429, 502, 503, 504})
 API_RETRY_DELAYS_SECONDS = (1, 2, 3)
 WRITER_DOMAIN_LOCK_NAME = ".sandbox-writer-domain.lock"
@@ -77,7 +78,14 @@ def main() -> int:
         )
         api_url = args.api_url.rstrip("/")
         validate_private_key(key_path)
-        cache_dir = Path(args.cache_dir).expanduser() if args.cache_dir else None
+        scope = token_scope(args.repo, args.scope_repository, args.permission)
+        # A scoped token is minted fresh every time: the cache is keyed by
+        # repository only, so it could hand back a broader token.
+        cache_dir = (
+            Path(args.cache_dir).expanduser()
+            if args.cache_dir and scope is None
+            else None
+        )
         validate_cache_platform(cache_dir, sys.platform)
         cached = load_cached_token(
             cache_dir,
@@ -98,7 +106,7 @@ def main() -> int:
             args.installation_id,
             os.environ.get("SHIPYARD_GITHUB_APP_INSTALLATION_ID"),
         )
-        token_payload = create_installation_token(api_url, jwt, installation_id)
+        token_payload = create_installation_token(api_url, jwt, installation_id, scope)
         token = token_payload.get("token")
         expires_at = token_payload.get("expires_at")
         if (
@@ -177,6 +185,24 @@ def parse_args() -> argparse.Namespace:
         help=(
             "owner/name repo slug used to look up the installation id when one "
             "is not supplied."
+        ),
+    )
+    parser.add_argument(
+        "--scope-repository",
+        action="store_true",
+        help=(
+            "Restrict the token to the --repo repository instead of every "
+            "repository in the installation. Never cached."
+        ),
+    )
+    parser.add_argument(
+        "--permission",
+        action="append",
+        default=[],
+        metavar="NAME=read|write",
+        help=(
+            "With --scope-repository, request only these App permissions "
+            "(repeatable), for example contents=write."
         ),
     )
     parser.add_argument(
@@ -615,14 +641,73 @@ def public_token_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return output
 
 
+def token_scope(
+    repo: str | None, scope_repository: bool, permissions: list[str]
+) -> dict[str, Any] | None:
+    """The access-token request body that narrows the token, or None."""
+    if not scope_repository:
+        if permissions:
+            raise HelperError("--permission requires --scope-repository")
+        return None
+    owner, _, name = (repo or "").partition("/")
+    if not OWNER_RE.fullmatch(owner) or not REPOSITORY_RE.fullmatch(name):
+        raise HelperError("--scope-repository requires --repo owner/name")
+    if not permissions:
+        raise HelperError("--scope-repository requires at least one --permission")
+    granted: dict[str, str] = {}
+    for permission in permissions:
+        permission_name, separator, level = permission.partition("=")
+        if (
+            not separator
+            or not PERMISSION_NAME_PATTERN.fullmatch(permission_name)
+            or level not in {"read", "write"}
+            or permission_name in granted
+        ):
+            raise HelperError(
+                f"--permission must be a unique NAME=read|write, got {permission!r}"
+            )
+        granted[permission_name] = level
+    return {"repositories": [name], "permissions": granted}
+
+
 def create_installation_token(
-    api_url: str, jwt: str, installation_id: str
+    api_url: str,
+    jwt: str,
+    installation_id: str,
+    scope: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return api_post(
+    payload = api_post(
         api_url,
         f"/app/installations/{installation_id}/access_tokens",
         jwt,
+        scope or {},
     )
+    if scope is not None:
+        check_scoped_token(payload, scope)
+    return payload
+
+
+def check_scoped_token(payload: dict[str, Any], scope: dict[str, Any]) -> None:
+    """Refuse a token broader than the request: one repository, and no
+    permission beyond those asked for plus the implicit metadata read."""
+    repositories = payload.get("repositories")
+    names = (
+        [item.get("name") for item in repositories if isinstance(item, dict)]
+        if isinstance(repositories, list)
+        else None
+    )
+    allowed = {"metadata": "read", **scope["permissions"]}
+    permissions = payload.get("permissions")
+    if (
+        names is None
+        or [name.lower() for name in names if isinstance(name, str)]
+        != [name.lower() for name in scope["repositories"]]
+        or not isinstance(permissions, dict)
+        or any(allowed.get(name) != level for name, level in permissions.items())
+    ):
+        raise HelperError(
+            "GitHub returned a token broader than the requested repository and permissions"
+        )
 
 
 def api_get(api_url: str, path: str, jwt: str) -> dict[str, Any]:
@@ -630,8 +715,14 @@ def api_get(api_url: str, path: str, jwt: str) -> dict[str, Any]:
     return api_request(request, jwt)
 
 
-def api_post(api_url: str, path: str, jwt: str) -> dict[str, Any]:
-    request = urllib.request.Request(url=f"{api_url}{path}", method="POST", data=b"{}")
+def api_post(
+    api_url: str, path: str, jwt: str, body: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    request = urllib.request.Request(
+        url=f"{api_url}{path}",
+        method="POST",
+        data=json.dumps(body or {}, separators=(",", ":")).encode(),
+    )
     return api_request(request, jwt)
 
 
