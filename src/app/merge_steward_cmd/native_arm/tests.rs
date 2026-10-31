@@ -208,6 +208,12 @@ fn an_unmanaged_green_unarmed_pr_is_armed_with_merge() {
     let calls = std::fs::read_to_string(&log).expect("log");
     assert!(calls.contains("mergeMethod:MERGE"), "{calls}");
     assert!(calls.contains("id=PR_node42"), "{calls}");
+    // A first arm is bound to the observed head, or the arm guard refuses it.
+    assert!(calls.contains("expectedHeadOid:$head"), "{calls}");
+    assert!(
+        calls.contains("head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        "{calls}"
+    );
     // Never a squash: it folds the version-bump marker commit in.
     assert!(!calls.to_ascii_lowercase().contains("squash"), "{calls}");
 }
@@ -1056,5 +1062,24 @@ fn an_unreadable_machine_policy_refuses_at_the_production_arm_call_site() {
     assert!(
         !log.exists(),
         "the backstop reached GitHub past the policy refusal"
+    );
+}
+
+/// An observed head that is not a full sha cannot be bound, so nothing is armed.
+#[cfg(unix)]
+#[test]
+fn a_head_that_is_not_a_full_sha_is_skipped_not_armed_unbound() {
+    let temp = tempfile::tempdir().expect("temp");
+    let log = temp.path().join("calls.log");
+    let actions = fake_gh(&temp, &never_armed_then_arms(&log.display().to_string()));
+    for head in ["abc123", ""] {
+        let result = super::arm(&actions, 42, head.to_owned(), "PR_node42", false);
+        assert_eq!(result.outcome, "skipped", "{result:?}");
+        assert!(result.skip.is_some(), "{result:?}");
+    }
+    assert!(
+        !log.exists(),
+        "no gh call may be made: {:?}",
+        std::fs::read_to_string(&log)
     );
 }
