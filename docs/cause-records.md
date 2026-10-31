@@ -75,7 +75,7 @@ shipyard cause extract --log "$RUNNER_TEMP/test.log" --job "<the job's display n
 shipyard cause extract --log job.log --format c2
 
 # Append records to an archive, one file per month of named_at.
-shipyard cause archive --dir causes/ --input records.jsonl
+shipyard cause archive --dir data/ci-cause --input records.jsonl
 
 # One observer pass over a workflow's recent runs.
 shipyard cause record --repo OWNER/REPO --workflow build.yml --dir data/ci-cause
@@ -92,7 +92,33 @@ match the display name is not trusted by the scorecard. It never fails the
 step it runs in; only a missing or unreadable log exits non-zero.
 
 `cause archive` is append-only. A record whose id is already archived is
-skipped, and nothing is rewritten.
+skipped, and nothing is rewritten. `--dir` is the archive parent: cause month
+files live under `causes/`, with `fixlinks.jsonl` in the parent. All archive
+commands refuse legacy `YYYY-MM.jsonl` or `undated.jsonl` files directly under
+`--dir`. If the old directory is already named `causes/`, pass its parent.
+Otherwise, reconcile the month files into `causes/` before retrying: retain all
+rows and never overwrite an existing destination file. No command moves or
+rewrites legacy files automatically.
+
+The archive is bounded explicitly rather than silently growing forever:
+`shipyard cause prune --dir DIR` previews a 365-day, 64 MiB policy, and
+`--apply` rotates complete red-attempt evidence groups under the archive lock.
+The apply path stages and checksums a recoverable transaction; readers share
+the same lock and refuse interrupted transactions until a writer recovers them. Set
+`--retention-days` or `--max-bytes` to adjust the policy (up to 36,500 days and
+128 MiB). A new archive gets `.shipyard-cause-archive.json`; an existing
+historical archive stays unmarked until an explicit
+`shipyard cause prune --dir DIR --apply --initialize` enrollment. Apply refuses
+an unmarked or `frozen: true` archive otherwise. Unkeyed causes, unmatched links
+and unresolved `supersedes` rows are preserved and listed in JSON output; if the
+size cap cannot retain them, pruning refuses. Malformed or unclassifiable rows
+fail closed and are left untouched. Rotation is separate from collection, so
+disabling observation does not delete data. Readers take a shared lock and
+refuse an interrupted transaction without recovering it. A reader creates the
+lock file only in a managed, non-frozen archive that already holds cause data;
+frozen and unmanaged legacy archives are read without writing anything. A frozen
+archive also refuses `cause record` and `cause archive`; copy it to a mutable
+operational archive before collecting or appending new rows.
 
 For a local integrity check, run `shipyard cause audit --dir DIR`. It reads
 the cause month files and `fixlinks.jsonl`, reports malformed rows, duplicate
@@ -113,11 +139,12 @@ Each pass:
    three days ago);
 2. for every red job not yet in the archive, writes one `ci.cause/v1` row to
    `<dir>/causes/YYYY-MM.jsonl`, by the job's completion time;
-3. for every red run attempt without a fix-link, looks for the earliest later
-   successful run of the same workflow on the same pull request or branch.
-   When it finds one, it writes a fix-link to `<dir>/fixlinks.jsonl`: the red
-   run, the fixing commit, and the files it changed. A rerun that turned the
-   same run green is recorded as `rerun_green`.
+3. for every red run attempt without a fix-link, considers a later attempt of
+   the red run, then later successful runs on the same head, then later
+   successful runs on another head. It accepts the first candidate whose
+   complete job listing proves every failed job passed, and writes a fix-link
+   to `<dir>/fixlinks.jsonl`: the red run, the fixing commit, and the files it
+   changed. A same-head run is recorded as `rerun_green`.
 
 A bare exit that C2 cannot name gets one of two labels. A summary job, such
 as `linux` checking the jobs it needs, takes the cause of the named job in
@@ -165,11 +192,41 @@ written, reds pending (split into those that went red under 24 hours,
 24 to 72 hours, and over 72 hours ago), and reads that failed. Each failed read is also printed
 on stderr. Run it on a schedule you choose; Shipyard does not schedule it.
 
+### Independent observer on macOS
+
+To keep cause and fix-link coverage running when baseline collection is stopped
+or restarted, install the separate supervised observer (dry-run by default):
+
+```bash
+scripts/install_cause_observer.sh \
+  --repo OWNER/REPO --workflow build.yml \
+  --dir "$HOME/Library/Application Support/shipyard/ci-cause"
+scripts/install_cause_observer.sh \
+  --repo OWNER/REPO --workflow build.yml \
+  --dir "$HOME/Library/Application Support/shipyard/ci-cause" --install
+```
+
+The installer renders and validates a per-user `launchd` agent. It runs the
+read-only `shipyard cause record` command at load and then at least every 15
+minutes (the default is hourly), writing only the append-only local archive.
+Use `--interval` to choose a longer interval. Authentication comes from the
+machine-global Shipyard config; pass `--cwd /path/to/checkout` when the
+repository uses an untracked `.shipyard.local/config.toml` overlay. The
+observer can be removed by
+unloading and deleting its generated plist; no GitHub state is changed by the
+agent. Keeping this independent makes failure learning continuous without
+making it a prerequisite for CI execution or merge decisions.
+
 ## Related
 
 `cause advise` reads only the local archive. It requires a full current head
 SHA, excludes that head and the current pull request, ignores unnamed/unknown
-rows, and uses case-insensitive lexical token overlap with stable tie breaks.
+rows and incomplete or malformed fix-links, and uses case-insensitive lexical
+token overlap with stable tie breaks. Human-readable
+output names the derivation (`compare_red_head_to_fix_head` for a code-change
+fix, or `rerun_green` for a same-head rerun); code-change links rank ahead of
+same-head reruns when both exist. A fix-link is only attached when every
+failed job passed in the recorded green run or its selective rerun attempts.
 It can take newline-delimited outage windows (`start`, `end`, optional
 `reason`) and suppresses rows completed inside a declared window. It never
 contacts GitHub, executes `fix_hint`, or writes the archive. Rows containing

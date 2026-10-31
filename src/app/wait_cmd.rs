@@ -1646,7 +1646,11 @@ artifacts = [
             &mut out,
             42,
             WaitPrState::Closed,
-            0.01,
+            // Windows file reads can legitimately exceed ten milliseconds on
+            // a hosted runner. Keep the fixture fast, but leave enough budget
+            // for the authoritative snapshot read to complete before the
+            // wait loop classifies it as a timeout.
+            1.0,
             0.01,
             false,
             Some("owner/repo".to_owned()),

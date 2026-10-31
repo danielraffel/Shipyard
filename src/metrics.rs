@@ -6,6 +6,7 @@ pub mod github_import;
 pub mod import_schedule;
 pub mod job_name;
 pub mod merge_receipt;
+pub mod merge_receipt_handoff;
 pub mod project_key;
 pub mod proxy;
 mod proxy_store;
@@ -14,13 +15,17 @@ mod proxy_store;
 // and samples with missing or invalid durations, respectively.
 type SafeMergeSummary = (usize, usize, i64, usize, usize);
 
+/// The baseline throughput stream is the protected default branch. The
+/// collector's merge-receipt health gate is bound to this same branch.
+const SCORECARD_BASE_BRANCH: &str = "main";
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration, Utc};
-use rusqlite::{Connection, ErrorCode, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -52,14 +57,14 @@ pub(crate) struct QueueTimingRow {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct RepeatedWorkSurvivorTiming {
+pub struct RepeatedWorkSupersededTiming {
     pub shadow_rows: usize,
-    pub distinct_survivors: usize,
+    pub distinct_superseded_jobs: usize,
     pub matched_clean: usize,
     pub excluded_uncertain: usize,
     pub excluded_cancelled: usize,
     pub unmatched: usize,
-    pub avoided_survivor_ms: Option<i64>,
+    pub superseded_runtime_ms: Option<i64>,
     pub final_attempt_only: bool,
 }
 
@@ -84,6 +89,24 @@ struct ExistingMergeReceipt {
     required_checks_json: String,
     gate_receipt_sha256: String,
     evidence: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+#[allow(dead_code)] // The durable handoff row is consumed by the staged authenticated importer surface.
+struct ExistingMergeReceiptHandoff {
+    schema: String,
+    repo: String,
+    project: String,
+    base_branch: String,
+    payload_sha256: String,
+    producer_host_id: String,
+    producer_session_generation: i64,
+    route: String,
+    destination: String,
+    known_hosts_sha256: String,
+    executable_sha256: String,
+    issued_at: String,
+    expires_at: String,
 }
 
 /// Input for a low-friction `shipyard metrics record` call.
@@ -194,8 +217,10 @@ pub struct RepeatedWorkShadowRow {
     pub superseded_sha: String,
 }
 
-/// Read-only avoided-cost accounting; durations stay unavailable until a
-/// provenance-safe queue-to-metrics linkage exists.
+/// Read-only repeated-work accounting from shadow observations and
+/// authoritative timing for the superseded queue jobs. `duration_ms` is the
+/// measured runtime of superseded jobs only; it is never inferred from the
+/// surviving job or presented as savings when the superseded job is unmatched.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct RepeatedWorkCostSummary {
     pub cost_basis: &'static str,
@@ -205,6 +230,15 @@ pub struct RepeatedWorkCostSummary {
     pub joined_durations: usize,
     pub unknown_durations: usize,
     pub duration_ms: Option<i64>,
+    pub shadow_rows: usize,
+    pub distinct_superseded_jobs: usize,
+    pub matched_clean: usize,
+    pub excluded_uncertain: usize,
+    pub excluded_cancelled: usize,
+    pub unmatched: usize,
+    pub timing_basis: &'static str,
+    pub since_days: i64,
+    pub final_attempt_only: bool,
 }
 
 /// One grouped timing summary row.
@@ -378,6 +412,9 @@ pub struct StewardshipScorecard {
     /// Observation-only eligible `TartCI` slot-hours in this window. Unknown
     /// samples remain visible and make the denominator partial.
     pub fleet_capacity: FleetCapacityDenominator,
+    /// Safely merged changes per eligible fleet-hour. This is unavailable
+    /// without both durable safe-merge receipts and measured capacity.
+    pub safely_merged_changes_per_eligible_slot_hour: ScorecardCoverage,
     /// Basis of `comparison.verdict`.
     pub basis: &'static str,
     /// Load-independent proxies over this window (project-wide).
@@ -574,6 +611,18 @@ fn queue_timing_rank(s: &str) -> u8 {
     }
 }
 
+fn repeated_work_cutoff(since_days: i64) -> Result<String, Box<dyn std::error::Error>> {
+    if since_days <= 0 {
+        return Err("repeated-work baseline window must be positive".into());
+    }
+    let window = Duration::try_days(since_days)
+        .ok_or("repeated-work baseline window is outside the timestamp range")?;
+    Utc::now()
+        .checked_sub_signed(window)
+        .ok_or_else(|| "repeated-work baseline cutoff is outside the timestamp range".into())
+        .map(|cutoff| cutoff.to_rfc3339())
+}
+
 impl MetricsStore {
     pub(crate) fn record_queue_terminal(
         &self,
@@ -632,39 +681,56 @@ impl MetricsStore {
         Ok(conn.query_row("SELECT queue_job_id, queue_identity, disposition, started_at, completed_at, total_ms FROM queue_timing WHERE queue_job_id=?1", params![queue_job_id], |r| Ok(QueueTimingRow { queue_job_id: r.get(0)?, queue_identity: r.get(1)?, queue_disposition: r.get(2)?, started_at: r.get(3)?, completed_at: r.get(4)?, total_ms: r.get(5)? })).optional()?)
     }
 
-    pub fn repeated_work_survivor_timing(
+    pub fn repeated_work_superseded_timing(
         &self,
         limit: usize,
-    ) -> Result<RepeatedWorkSurvivorTiming, Box<dyn std::error::Error>> {
+        since_days: i64,
+    ) -> Result<RepeatedWorkSupersededTiming, Box<dyn std::error::Error>> {
         let conn = self.connect()?;
-        let mut stmt = conn.prepare("WITH recent AS (SELECT job_id FROM repeated_work_shadow ORDER BY id DESC LIMIT ?1), survivors AS (SELECT DISTINCT job_id FROM recent) SELECT (SELECT COUNT(*) FROM recent), s.job_id, t.disposition, t.total_ms FROM survivors s LEFT JOIN queue_timing t ON t.queue_job_id=s.job_id")?;
-        let mut out = RepeatedWorkSurvivorTiming {
+        let tx = conn.unchecked_transaction()?;
+        let cutoff = repeated_work_cutoff(since_days)?;
+        let timing = Self::repeated_work_superseded_timing_with_conn(&tx, limit, &cutoff)?;
+        tx.commit()?;
+        Ok(timing)
+    }
+
+    fn repeated_work_superseded_timing_with_conn(
+        conn: &Connection,
+        limit: usize,
+        cutoff: &str,
+    ) -> Result<RepeatedWorkSupersededTiming, Box<dyn std::error::Error>> {
+        // GLOB preserves the canonical prefix's case; SQLite LIKE folds ASCII.
+        let mut stmt = conn.prepare("WITH recent AS (SELECT superseded_job_id FROM repeated_work_shadow WHERE observed_at >= ?2 ORDER BY observed_at DESC, id DESC LIMIT ?1), superseded AS (SELECT DISTINCT superseded_job_id FROM recent) SELECT (SELECT COUNT(*) FROM recent), s.superseded_job_id, t.disposition, t.total_ms FROM superseded s LEFT JOIN queue_timing t ON t.queue_job_id=s.superseded_job_id AND s.superseded_job_id GLOB 'sy-*' AND instr(s.superseded_job_id, '/') = 0 AND instr(s.superseded_job_id, char(92)) = 0")?;
+        let mut out = RepeatedWorkSupersededTiming {
             shadow_rows: 0,
-            distinct_survivors: 0,
+            distinct_superseded_jobs: 0,
             matched_clean: 0,
             excluded_uncertain: 0,
             excluded_cancelled: 0,
             unmatched: 0,
-            avoided_survivor_ms: None,
+            superseded_runtime_ms: None,
             final_attempt_only: true,
         };
-        let rows = stmt.query_map(params![i64::try_from(limit).unwrap_or(i64::MAX)], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, Option<String>>(2)?,
-                r.get::<_, Option<i64>>(3)?,
-            ))
-        })?;
+        let rows = stmt.query_map(
+            params![i64::try_from(limit).unwrap_or(i64::MAX), cutoff],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<i64>>(3)?,
+                ))
+            },
+        )?;
         for row in rows {
             let (count, _, disposition, total) = row?;
             out.shadow_rows = usize::try_from(count).unwrap_or(usize::MAX);
-            out.distinct_survivors += 1;
+            out.distinct_superseded_jobs += 1;
             match disposition.as_deref() {
                 Some("clean") if total.is_some_and(|v| v >= 0) => {
                     out.matched_clean += 1;
-                    out.avoided_survivor_ms = Some(
-                        out.avoided_survivor_ms
+                    out.superseded_runtime_ms = Some(
+                        out.superseded_runtime_ms
                             .unwrap_or(0)
                             .saturating_add(total.unwrap()),
                     );
@@ -674,6 +740,65 @@ impl MetricsStore {
                 _ => out.unmatched += 1,
             }
         }
+        Ok(out)
+    }
+
+    /// Return repeated-work accounting for a positive baseline window.
+    pub fn repeated_work_cost(
+        &self,
+        limit: usize,
+        since_days: i64,
+    ) -> Result<RepeatedWorkCostSummary, Box<dyn std::error::Error>> {
+        let cutoff = repeated_work_cutoff(since_days)?;
+        let conn = self.connect()?;
+        let tx = conn.unchecked_transaction()?;
+        let mut stmt = tx.prepare("SELECT kind, job_id FROM repeated_work_shadow WHERE observed_at >= ?2 ORDER BY observed_at DESC, id DESC LIMIT ?1")?;
+        let ids = stmt.query_map(
+            params![i64::try_from(limit).unwrap_or(i64::MAX), &cutoff],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )?;
+        let mut out = RepeatedWorkCostSummary {
+            cost_basis: "superseded_repeated_work",
+            observations: 0,
+            superseded_exact_head: 0,
+            duplicate_exact_head_config: 0,
+            joined_durations: 0,
+            unknown_durations: 0,
+            duration_ms: None,
+            shadow_rows: 0,
+            distinct_superseded_jobs: 0,
+            matched_clean: 0,
+            excluded_uncertain: 0,
+            excluded_cancelled: 0,
+            unmatched: 0,
+            timing_basis: "superseded_queue_job_runtime",
+            since_days,
+            final_attempt_only: true,
+        };
+        for item in ids {
+            let (kind, _job_id) = item?;
+            out.observations += 1;
+            match kind.as_str() {
+                "superseded_exact_head" => out.superseded_exact_head += 1,
+                "duplicate_exact_head_config" => out.duplicate_exact_head_config += 1,
+                _ => {}
+            }
+        }
+        let timing = Self::repeated_work_superseded_timing_with_conn(&tx, limit, &cutoff)?;
+        out.shadow_rows = timing.shadow_rows;
+        out.distinct_superseded_jobs = timing.distinct_superseded_jobs;
+        out.matched_clean = timing.matched_clean;
+        out.excluded_uncertain = timing.excluded_uncertain;
+        out.excluded_cancelled = timing.excluded_cancelled;
+        out.unmatched = timing.unmatched;
+        out.joined_durations = timing.matched_clean;
+        out.unknown_durations = timing
+            .distinct_superseded_jobs
+            .saturating_sub(timing.matched_clean);
+        out.duration_ms = timing.superseded_runtime_ms;
+        out.final_attempt_only = timing.final_attempt_only;
+        drop(stmt);
+        tx.commit()?;
         Ok(out)
     }
 
@@ -695,9 +820,57 @@ impl MetricsStore {
         &self.path
     }
 
-    /// Delete raw run, job, step, and fleet-capacity samples older than
-    /// `retention_days`. Merge receipts are retained because they are durable
-    /// provenance.
+    /// Validate an existing metrics database without migrating or writing it.
+    /// Cleanup uses this for dry-run validation so an unreadable store cannot
+    /// be reported as a successful rotation plan.
+    pub fn validate_existing(state_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        let path = state_dir.join("metrics").join("metrics.db");
+        let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let result: String = conn.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+        if result != "ok" {
+            return Err(format!("metrics database integrity check failed: {result}").into());
+        }
+        for (table, columns) in [
+            ("runs", &["id", "ts"][..]),
+            ("jobs", &["id", "run_id"][..]),
+            ("steps", &["job_id"][..]),
+            (
+                "fleet_capacity_samples",
+                &["sample_id", "valid_until", "repo", "observed_at"][..],
+            ),
+        ] {
+            let present: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+                [table],
+                |row| row.get(0),
+            )?;
+            if !present {
+                return Err(format!("metrics database missing required table: {table}").into());
+            }
+            for column in columns {
+                let present: bool = conn.query_row(
+                    &format!(
+                        "SELECT COUNT(*) > 0 FROM pragma_table_info('{table}') WHERE name = ?1"
+                    ),
+                    [column],
+                    |row| row.get(0),
+                )?;
+                if !present {
+                    return Err(format!(
+                        "metrics database table {table} missing required column: {column}"
+                    )
+                    .into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Delete expired raw runs (including jobs/steps), fleet-capacity samples,
+    /// and queue observations. Return the number of runs, capacity samples,
+    /// shadow observations, and timing rows removed, excluding child jobs/steps.
+    /// Retained shadow observations keep their timing joins; merge receipts and
+    /// operational queue/recovery state are not pruned.
     pub fn prune_older_than(
         &self,
         retention_days: i64,
@@ -706,7 +879,12 @@ impl MetricsStore {
             return Ok(0);
         }
         let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&self.path)?;
-        let cutoff = (Utc::now() - Duration::days(retention_days)).to_rfc3339();
+        let window = Duration::try_days(retention_days)
+            .ok_or("metrics retention is outside the timestamp range")?;
+        let cutoff_time = Utc::now()
+            .checked_sub_signed(window)
+            .ok_or("metrics retention cutoff is outside the timestamp range")?;
+        let cutoff = cutoff_time.to_rfc3339();
         let mut deleted = 0;
         loop {
             let mut conn = self.connect()?;
@@ -714,7 +892,7 @@ impl MetricsStore {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let ids = {
                 let mut statement =
-                    tx.prepare("SELECT id FROM runs WHERE ts < ?1 ORDER BY id LIMIT 250")?;
+                    tx.prepare("SELECT id FROM runs WHERE ts < ?1 ORDER BY ts, id LIMIT 250")?;
                 statement
                     .query_map([&cutoff], |row| row.get::<_, i64>(0))?
                     .collect::<Result<Vec<_>, _>>()?
@@ -734,11 +912,87 @@ impl MetricsStore {
             tx.commit()?;
             deleted += ids.len();
         }
-        let conn = self.connect()?;
-        deleted += conn.execute(
-            "DELETE FROM fleet_capacity_samples WHERE valid_until < ?1",
-            [&cutoff],
-        )?;
+        loop {
+            let mut conn = self.connect()?;
+            conn.busy_timeout(std::time::Duration::from_millis(250))?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let removed = tx.execute(
+                "DELETE FROM fleet_capacity_samples
+                 WHERE sample_id IN (
+                   SELECT sample_id FROM fleet_capacity_samples
+                   WHERE valid_until < ?1
+                   ORDER BY valid_until, sample_id
+                   LIMIT 250
+                 )",
+                [&cutoff],
+            )?;
+            tx.commit()?;
+            deleted += removed;
+            if removed == 0 {
+                break;
+            }
+        }
+        deleted += self.prune_queue_observations(cutoff_time)?;
+        Ok(deleted)
+    }
+
+    fn prune_queue_observations(
+        &self,
+        cutoff: DateTime<Utc>,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        let mut conn = self.connect()?;
+        conn.busy_timeout(StdDuration::from_millis(250))?;
+        let mut deleted = 0;
+        // These are observation tables, never the queue/recovery authority.
+        // Expire shadow rows first so all remaining references protect timing.
+        for (table, timestamp, guard) in [
+            ("repeated_work_shadow", "observed_at", ""),
+            (
+                "queue_timing",
+                "recorded_at",
+                " AND NOT EXISTS (SELECT 1 FROM repeated_work_shadow s
+                    WHERE s.superseded_job_id = queue_timing.queue_job_id)",
+            ),
+        ] {
+            let last: i64 = conn.query_row(
+                &format!("SELECT COALESCE(MAX(rowid), 0) FROM {table}"),
+                [],
+                |row| row.get(0),
+            )?;
+            let mut cursor = 0_i64;
+            while cursor < last {
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let rows = {
+                    let mut statement = tx.prepare(&format!(
+                        "SELECT rowid, {timestamp} FROM {table}
+                         WHERE rowid > ?1 AND rowid <= ?2 ORDER BY rowid LIMIT 250"
+                    ))?;
+                    statement
+                        .query_map(params![cursor, last], |row| {
+                            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                        })?
+                        .collect::<Result<Vec<_>, _>>()?
+                };
+                if rows.is_empty() {
+                    break;
+                }
+                for (id, timestamp) in rows {
+                    cursor = id;
+                    // Strict parsing preserves malformed values and compares
+                    // RFC3339 offsets correctly. Rowid paging bounds each lock
+                    // and the initial high-water mark bounds concurrent growth.
+                    if DateTime::parse_from_rfc3339(&timestamp)
+                        .is_ok_and(|observed| observed < cutoff)
+                    {
+                        deleted += tx.execute(
+                            &format!("DELETE FROM {table} WHERE rowid = ?1{guard}"),
+                            [id],
+                        )?;
+                    }
+                }
+                tx.commit()?;
+            }
+        }
         Ok(deleted)
     }
 
@@ -827,6 +1081,12 @@ impl MetricsStore {
               cache_hit INTEGER,
               artifact_path TEXT
             );
+            CREATE INDEX IF NOT EXISTS metrics_runs_retention
+              ON runs(ts, id);
+            CREATE INDEX IF NOT EXISTS metrics_jobs_run_id
+              ON jobs(run_id);
+            CREATE INDEX IF NOT EXISTS metrics_steps_job_id
+              ON steps(job_id);
             -- Freshness classifies each job by whether it has a github_job
             -- step. Keep that existence probe bounded as the metrics store
             -- grows; without this index a scorecard scans steps once per job.
@@ -852,6 +1112,40 @@ impl MetricsStore {
             );
             CREATE INDEX IF NOT EXISTS merge_receipts_project_merged
               ON merge_receipts(project, merged_at);
+            CREATE TABLE IF NOT EXISTS merge_receipt_handoffs (
+              envelope_id TEXT PRIMARY KEY,
+              schema TEXT NOT NULL,
+              repo TEXT NOT NULL,
+              project TEXT NOT NULL,
+              base_branch TEXT NOT NULL,
+              payload_sha256 TEXT NOT NULL,
+              producer_host_id TEXT NOT NULL,
+              producer_session_generation INTEGER NOT NULL,
+              route TEXT NOT NULL,
+              destination TEXT NOT NULL,
+              known_hosts_sha256 TEXT NOT NULL,
+              executable_sha256 TEXT NOT NULL,
+              issued_at TEXT NOT NULL,
+              expires_at TEXT NOT NULL,
+              imported_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS merge_receipt_handoff_receipts (
+              envelope_id TEXT NOT NULL REFERENCES merge_receipt_handoffs(envelope_id),
+              receipt_id TEXT NOT NULL,
+              receipt_sha256 TEXT NOT NULL,
+              PRIMARY KEY(envelope_id, receipt_id)
+            );
+            CREATE INDEX IF NOT EXISTS merge_receipt_handoff_receipts_receipt
+              ON merge_receipt_handoff_receipts(receipt_id);
+            CREATE TRIGGER IF NOT EXISTS merge_receipt_authenticated_immutable
+              BEFORE UPDATE ON merge_receipts
+              WHEN EXISTS (
+                SELECT 1 FROM merge_receipt_handoff_receipts
+                WHERE receipt_id = OLD.receipt_id
+              )
+            BEGIN
+              SELECT RAISE(ABORT, 'authenticated merge receipt is immutable');
+            END;
             CREATE TABLE IF NOT EXISTS fleet_capacity_samples (
               sample_id TEXT PRIMARY KEY,
               schema TEXT NOT NULL,
@@ -897,6 +1191,8 @@ impl MetricsStore {
             );
             CREATE INDEX IF NOT EXISTS repeated_work_shadow_observed_at
               ON repeated_work_shadow(observed_at DESC);
+            CREATE INDEX IF NOT EXISTS repeated_work_shadow_superseded_job
+              ON repeated_work_shadow(superseded_job_id);
             ",
         )?;
         add_column_if_missing(&conn, "jobs", "runner_assigned", "INTEGER")?;
@@ -942,6 +1238,89 @@ impl MetricsStore {
     /// Import validated merge receipts atomically. Duplicate receipt IDs are
     /// idempotent when the payload is equivalent after ownership-key
     /// canonicalization, preserving compatibility with legacy mixed-case rows.
+    fn insert_merge_receipt_tx(
+        tx: &rusqlite::Transaction<'_>,
+        receipt: &crate::metrics::merge_receipt::MergeReceipt,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        receipt
+            .validate()
+            .map_err(|e| format!("invalid merge receipt: {e}"))?;
+        // Repository and project are durable ownership keys. Normalize them
+        // before both conflict checks and storage so case/outer whitespace
+        // cannot create a second identity for one PR.
+        let repo = crate::evidence::canonical_repository(&receipt.repo);
+        let project_input = crate::evidence::canonical_repository(&receipt.project);
+        let (project, _) =
+            crate::metrics::project_key::normalize_for_write(&project_input, Some(&repo));
+        let existing: Option<ExistingMergeReceipt> = tx.query_row(
+            "SELECT schema,repo,project,base_branch,pr,head_sha,validated_head_sha,merge_commit_sha,merged_at,source,required_checks_json,gate_receipt_sha256,evidence FROM merge_receipts WHERE receipt_id = ?1",
+            [&receipt.receipt_id],
+            |row| {
+                let existing_repo: String = row.get(1)?;
+                let existing_repo = crate::evidence::canonical_repository(&existing_repo);
+                let existing_project_raw: String = row.get(2)?;
+                let (existing_project, _) = crate::metrics::project_key::normalize_for_write(
+                    &existing_project_raw,
+                    Some(&existing_repo),
+                );
+                Ok(ExistingMergeReceipt {
+                    schema: row.get(0)?,
+                    repo: existing_repo,
+                    project: existing_project,
+                    base_branch: row.get(3)?,
+                    pr: row.get(4)?,
+                    head_sha: row.get(5)?,
+                    validated_head_sha: row.get(6)?,
+                    merge_commit_sha: row.get(7)?,
+                    merged_at: row.get(8)?,
+                    source: row.get(9)?,
+                    required_checks_json: row.get(10)?,
+                    gate_receipt_sha256: row.get(11)?,
+                    evidence: row.get(12)?,
+                })
+            },
+        ).optional()?;
+        if let Some(existing) = existing {
+            let incoming = ExistingMergeReceipt {
+                schema: receipt.schema.clone(),
+                repo: repo.clone(),
+                project: project.clone(),
+                base_branch: receipt.base_branch.clone(),
+                pr: receipt.pr,
+                head_sha: receipt.head_sha.clone(),
+                validated_head_sha: receipt.validated_head_sha.clone(),
+                merge_commit_sha: receipt.merge_commit_sha.clone(),
+                merged_at: receipt.merged_at.to_rfc3339(),
+                source: receipt.source.clone(),
+                required_checks_json: serde_json::to_string(&receipt.required_checks)?,
+                gate_receipt_sha256: receipt.gate_receipt_sha256.clone(),
+                evidence: receipt.evidence.clone(),
+            };
+            if existing != incoming {
+                return Err(format!(
+                    "merge receipt {} conflicts with existing payload",
+                    receipt.receipt_id
+                )
+                .into());
+            }
+            return Ok(false);
+        }
+        let semantic_conflict: Option<String> = tx.query_row(
+            "SELECT receipt_id FROM merge_receipts WHERE lower(trim(repo)) = ?1 AND pr = ?2 AND receipt_id <> ?3 AND (lower(trim(project)) <> ?4 OR base_branch <> ?5 OR head_sha <> ?6 OR merge_commit_sha <> ?7)",
+            rusqlite::params![repo, receipt.pr, receipt.receipt_id, project, receipt.base_branch, receipt.head_sha, receipt.merge_commit_sha],
+            |row| row.get(0),
+        ).optional()?;
+        if let Some(other) = semantic_conflict {
+            return Err(format!(
+                "merge receipt {} conflicts with semantic receipt {other}",
+                receipt.receipt_id
+            )
+            .into());
+        }
+        tx.execute("INSERT INTO merge_receipts (receipt_id,schema,repo,project,base_branch,pr,head_sha,validated_head_sha,merge_commit_sha,merged_at,safe_merge,source,required_checks_json,gate_receipt_sha256,evidence,imported_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,1,?11,?12,?13,?14,?15)", rusqlite::params![receipt.receipt_id, receipt.schema, repo, project, receipt.base_branch, receipt.pr, receipt.head_sha, receipt.validated_head_sha, receipt.merge_commit_sha, receipt.merged_at.to_rfc3339(), receipt.source, serde_json::to_string(&receipt.required_checks)?, receipt.gate_receipt_sha256, receipt.evidence, Utc::now().to_rfc3339()])?;
+        Ok(true)
+    }
+
     pub fn import_merge_receipts(
         &self,
         receipts: &[crate::metrics::merge_receipt::MergeReceipt],
@@ -951,81 +1330,141 @@ impl MetricsStore {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut imported = 0;
         for receipt in receipts {
-            receipt
-                .validate()
-                .map_err(|e| format!("invalid merge receipt: {e}"))?;
-            // Repository and project are durable ownership keys. Normalize
-            // them before both conflict checks and storage so case/outer
-            // whitespace cannot create a second identity for one PR.
-            let repo = crate::evidence::canonical_repository(&receipt.repo);
-            let project_input = crate::evidence::canonical_repository(&receipt.project);
-            let (project, _) =
-                crate::metrics::project_key::normalize_for_write(&project_input, Some(&repo));
-            let existing: Option<ExistingMergeReceipt> = tx.query_row(
-                "SELECT schema,repo,project,base_branch,pr,head_sha,validated_head_sha,merge_commit_sha,merged_at,source,required_checks_json,gate_receipt_sha256,evidence FROM merge_receipts WHERE receipt_id = ?1",
-                [&receipt.receipt_id],
-                |row| {
-                    let existing_repo: String = row.get(1)?;
-                    let existing_repo = crate::evidence::canonical_repository(&existing_repo);
-                    let existing_project_raw: String = row.get(2)?;
-                    let (existing_project, _) =
-                        crate::metrics::project_key::normalize_for_write(&existing_project_raw, Some(&existing_repo));
-                    Ok(ExistingMergeReceipt {
-                        schema: row.get(0)?,
-                        repo: existing_repo,
-                        project: existing_project,
-                        base_branch: row.get(3)?,
-                        pr: row.get(4)?,
-                        head_sha: row.get(5)?,
-                        validated_head_sha: row.get(6)?,
-                        merge_commit_sha: row.get(7)?,
-                        merged_at: row.get(8)?,
-                        source: row.get(9)?,
-                        required_checks_json: row.get(10)?,
-                        gate_receipt_sha256: row.get(11)?,
-                        evidence: row.get(12)?,
-                    })
-                },
-            ).optional()?;
-            if let Some(existing) = existing {
-                let incoming = ExistingMergeReceipt {
-                    schema: receipt.schema.clone(),
-                    repo: repo.clone(),
-                    project: project.clone(),
-                    base_branch: receipt.base_branch.clone(),
-                    pr: receipt.pr,
-                    head_sha: receipt.head_sha.clone(),
-                    validated_head_sha: receipt.validated_head_sha.clone(),
-                    merge_commit_sha: receipt.merge_commit_sha.clone(),
-                    merged_at: receipt.merged_at.to_rfc3339(),
-                    source: receipt.source.clone(),
-                    required_checks_json: serde_json::to_string(&receipt.required_checks)?,
-                    gate_receipt_sha256: receipt.gate_receipt_sha256.clone(),
-                    evidence: receipt.evidence.clone(),
-                };
-                if existing != incoming {
-                    return Err(format!(
-                        "merge receipt {} conflicts with existing payload",
-                        receipt.receipt_id
-                    )
-                    .into());
-                }
-                continue;
-            }
-            let semantic_conflict: Option<String> = tx.query_row(
-                "SELECT receipt_id FROM merge_receipts WHERE lower(trim(repo)) = ?1 AND pr = ?2 AND receipt_id <> ?3 AND (lower(trim(project)) <> ?4 OR base_branch <> ?5 OR head_sha <> ?6 OR merge_commit_sha <> ?7)",
-                rusqlite::params![repo, receipt.pr, receipt.receipt_id, project, receipt.base_branch, receipt.head_sha, receipt.merge_commit_sha],
+            imported += usize::from(Self::insert_merge_receipt_tx(&tx, receipt)?);
+        }
+        tx.commit()?;
+        Ok(imported)
+    }
+
+    /// Import one authenticated handoff atomically with its provenance links.
+    /// Legacy v1 imports remain valid but do not acquire provenance merely by
+    /// being present in `merge_receipts`.
+    #[allow(dead_code)] // Transport/CLI wiring lands separately; keep this atomic persistence API ready.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn import_authenticated_merge_receipt_handoff(
+        &self,
+        envelope: &crate::metrics::merge_receipt_handoff::AuthenticatedHandoffEnvelope,
+        context: &crate::metrics::merge_receipt_handoff::AuthenticatedProducerContext,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        use crate::metrics::merge_receipt_handoff::{HandoffError, digest_receipt};
+
+        // Validate all envelope-level invariants and the trusted transport
+        // fence before taking the writer lease or opening a write transaction.
+        envelope
+            .validate()
+            .map_err(|error| format!("invalid authenticated handoff: {error}"))?;
+        // A fresh envelope must pass the full trusted-fence check before any
+        // write. An exact envelope already persisted may be replayed after its
+        // expiry so periodic exports remain idempotent; the durable identity
+        // comparison below is the only freshness exception.
+        let verification_error = envelope.verify(context).err();
+        let stale_replay = matches!(verification_error.as_ref(), Some(HandoffError::Stale));
+        if let Some(error) = verification_error
+            && !stale_replay
+        {
+            return Err(format!("authenticated handoff verification failed: {error}").into());
+        }
+
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&self.path)?;
+        let mut conn = self.connect()?;
+        let repository = crate::evidence::canonical_repository(&envelope.repository);
+        let project_input = crate::evidence::canonical_repository(&envelope.project);
+        if project_input.contains('/') && project_input != repository {
+            return Err("authenticated handoff project is not bound to repository".into());
+        }
+        let (project, _) =
+            crate::metrics::project_key::normalize_for_write(&project_input, Some(&repository));
+        let route = serde_json::to_string(&envelope.route)?;
+        let incoming = ExistingMergeReceiptHandoff {
+            schema: envelope.schema.clone(),
+            repo: repository.clone(),
+            project: project.clone(),
+            base_branch: envelope.base_branch.clone(),
+            payload_sha256: envelope.payload_sha256.as_str().to_owned(),
+            producer_host_id: envelope.producer_host_id.clone(),
+            producer_session_generation: i64::try_from(envelope.producer_session_generation)
+                .map_err(|_| HandoffError::Invalid("session generation"))?,
+            route: route.clone(),
+            destination: envelope.destination.clone(),
+            known_hosts_sha256: envelope.known_hosts_sha256.as_str().to_owned(),
+            executable_sha256: envelope.executable_sha256.as_str().to_owned(),
+            issued_at: envelope.issued_at.to_rfc3339(),
+            expires_at: envelope.expires_at.to_rfc3339(),
+        };
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: Option<ExistingMergeReceiptHandoff> = tx
+            .query_row(
+                "SELECT schema,repo,project,base_branch,payload_sha256,producer_host_id,producer_session_generation,route,destination,known_hosts_sha256,executable_sha256,issued_at,expires_at FROM merge_receipt_handoffs WHERE envelope_id=?1",
+                [&envelope.envelope_id],
+                |row| Ok(ExistingMergeReceiptHandoff {
+                    schema: row.get(0)?, repo: row.get(1)?, project: row.get(2)?, base_branch: row.get(3)?,
+                    payload_sha256: row.get(4)?, producer_host_id: row.get(5)?, producer_session_generation: row.get(6)?,
+                    route: row.get(7)?, destination: row.get(8)?, known_hosts_sha256: row.get(9)?, executable_sha256: row.get(10)?,
+                    issued_at: row.get(11)?, expires_at: row.get(12)?,
+                }),
+            )
+            .optional()?;
+        let had_existing = existing.is_some();
+        if let Some(existing) = existing.as_ref()
+            && existing != &incoming
+        {
+            return Err(format!(
+                "authenticated handoff {} conflicts with existing envelope",
+                envelope.envelope_id
+            )
+            .into());
+        }
+        if stale_replay && existing.as_ref() != Some(&incoming) {
+            return Err(format!(
+                "authenticated handoff verification failed: {}",
+                HandoffError::Stale
+            )
+            .into());
+        }
+
+        if !had_existing {
+            tx.execute(
+                "INSERT INTO merge_receipt_handoffs (envelope_id,schema,repo,project,base_branch,payload_sha256,producer_host_id,producer_session_generation,route,destination,known_hosts_sha256,executable_sha256,issued_at,expires_at,imported_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+                params![
+                    envelope.envelope_id,
+                    envelope.schema,
+                    repository,
+                    project,
+                    envelope.base_branch,
+                    envelope.payload_sha256.as_str(),
+                    envelope.producer_host_id,
+                    incoming.producer_session_generation,
+                    route,
+                    envelope.destination,
+                    envelope.known_hosts_sha256.as_str(),
+                    envelope.executable_sha256.as_str(),
+                    envelope.issued_at.to_rfc3339(),
+                    envelope.expires_at.to_rfc3339(),
+                    Utc::now().to_rfc3339(),
+                ],
+            )?;
+        }
+        let mut imported = 0;
+        for receipt in &envelope.receipts {
+            imported += usize::from(Self::insert_merge_receipt_tx(&tx, receipt)?);
+            let receipt_sha256 = digest_receipt(receipt)
+                .map_err(|error| format!("authenticated receipt digest failed: {error}"))?;
+            tx.execute(
+                "INSERT OR IGNORE INTO merge_receipt_handoff_receipts (envelope_id,receipt_id,receipt_sha256) VALUES (?1,?2,?3)",
+                params![envelope.envelope_id, receipt.receipt_id, receipt_sha256.as_str()],
+            )?;
+            let stored: String = tx.query_row(
+                "SELECT receipt_sha256 FROM merge_receipt_handoff_receipts WHERE envelope_id=?1 AND receipt_id=?2",
+                params![envelope.envelope_id, receipt.receipt_id],
                 |row| row.get(0),
-            ).optional()?;
-            if let Some(other) = semantic_conflict {
+            )?;
+            if stored != receipt_sha256.as_str() {
                 return Err(format!(
-                    "merge receipt {} conflicts with semantic receipt {other}",
-                    receipt.receipt_id
+                    "authenticated handoff {} conflicts with receipt provenance",
+                    envelope.envelope_id
                 )
                 .into());
             }
-            tx.execute("INSERT INTO merge_receipts (receipt_id,schema,repo,project,base_branch,pr,head_sha,validated_head_sha,merge_commit_sha,merged_at,safe_merge,source,required_checks_json,gate_receipt_sha256,evidence,imported_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,1,?11,?12,?13,?14,?15)", rusqlite::params![receipt.receipt_id, receipt.schema, repo, project, receipt.base_branch, receipt.pr, receipt.head_sha, receipt.validated_head_sha, receipt.merge_commit_sha, receipt.merged_at.to_rfc3339(), receipt.source, serde_json::to_string(&receipt.required_checks)?, receipt.gate_receipt_sha256, receipt.evidence, Utc::now().to_rfc3339()])?;
-            imported += 1;
         }
         tx.commit()?;
         Ok(imported)
@@ -1038,13 +1477,27 @@ impl MetricsStore {
         &self,
         repo: &str,
     ) -> Result<Vec<crate::metrics::merge_receipt::MergeReceipt>, Box<dyn std::error::Error>> {
+        self.export_merge_receipts_for_branch(repo, SCORECARD_BASE_BRANCH)
+    }
+
+    /// Export validated producer receipts for one exact repository and base
+    /// branch. The default export above is deliberately bound to the branch
+    /// used by the scorecard and handoff contract.
+    pub fn export_merge_receipts_for_branch(
+        &self,
+        repo: &str,
+        base_branch: &str,
+    ) -> Result<Vec<crate::metrics::merge_receipt::MergeReceipt>, Box<dyn std::error::Error>> {
+        if base_branch.trim().is_empty() {
+            return Err("merge receipt export base branch must not be empty".into());
+        }
         let repo = crate::evidence::canonical_repository(repo);
         let conn = self.connect()?;
         let mut statement = conn.prepare(
             "SELECT schema,receipt_id,repo,project,base_branch,pr,head_sha,validated_head_sha,merge_commit_sha,merged_at,safe_merge,source,required_checks_json,gate_receipt_sha256,evidence
-             FROM merge_receipts WHERE lower(trim(repo)) = lower(trim(?1)) ORDER BY merged_at, receipt_id",
+             FROM merge_receipts WHERE lower(trim(repo)) = lower(trim(?1)) AND base_branch = ?2 ORDER BY merged_at, receipt_id",
         )?;
-        let rows = statement.query_map([repo], |row| {
+        let rows = statement.query_map(rusqlite::params![repo, base_branch], |row| {
             let required_checks_json: String = row.get(12)?;
             let required_checks = serde_json::from_str(&required_checks_json).map_err(|error| {
                 rusqlite::Error::FromSqlConversionFailure(
@@ -1092,48 +1545,167 @@ impl MetricsStore {
         Ok(receipts)
     }
 
-    /// Count safe merged heads and the failed/cancelled compute attached to
-    /// those exact PR identities in the scorecard window.
+    /// Count safe merged heads on the measured protected branch and the
+    /// failed/cancelled compute attached to those exact PR identities in the
+    /// scorecard window.
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn safe_merge_summary(
         &self,
         project: &str,
         cutoff: &str,
     ) -> Result<SafeMergeSummary, Box<dyn std::error::Error>> {
+        self.safe_merge_summary_filtered(project, cutoff, false)
+    }
+
+    /// Count only safe merges joined to an authenticated handoff envelope.
+    /// Legacy v1 rows remain queryable through `safe_merge_summary` but are
+    /// excluded from this opt-in denominator until provenance is attached.
+    #[allow(dead_code)] // Callers opt into authenticated denominators when transport wiring is enabled.
+    pub(crate) fn authenticated_safe_merge_summary(
+        &self,
+        project: &str,
+        cutoff: &str,
+    ) -> Result<SafeMergeSummary, Box<dyn std::error::Error>> {
+        self.safe_merge_summary_filtered(project, cutoff, true)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn safe_merge_summary_filtered(
+        &self,
+        project: &str,
+        cutoff: &str,
+        authenticated_only: bool,
+    ) -> Result<SafeMergeSummary, Box<dyn std::error::Error>> {
         let conn = self.connect()?;
         let key = crate::metrics::project_key::ProjectKey::parse(project);
         let (any, short, full) = crate::metrics::project_key::sql_params(key.as_ref());
         let project_filter = crate::metrics::project_key::sql_filter("project", "repo");
-        let safe: Vec<(String, String, i64)> = {
-            let mut q = conn.prepare(&format!("SELECT repo, head_sha, pr FROM merge_receipts WHERE {project_filter} AND safe_merge = 1 AND required_checks_json <> '[]' AND length(gate_receipt_sha256) = 64 AND julianday(merged_at) >= julianday(?4)"))?;
-            q.query_map(rusqlite::params![any, short, full, cutoff], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })?
-            .collect::<Result<_, _>>()?
+        let cutoff = DateTime::parse_from_rfc3339(cutoff)?.with_timezone(&Utc);
+        let now = Utc::now();
+        let auth_filter = if authenticated_only {
+            " AND EXISTS (
+                SELECT 1
+                FROM merge_receipt_handoff_receipts hhr
+                JOIN merge_receipt_handoffs h ON h.envelope_id = hhr.envelope_id
+                WHERE hhr.receipt_id = merge_receipts.receipt_id
+                  AND h.repo = merge_receipts.repo
+                  AND h.project = merge_receipts.project
+                  AND h.base_branch = merge_receipts.base_branch
+            )"
+        } else {
+            ""
         };
-        let unique = safe.into_iter().collect::<std::collections::BTreeSet<_>>();
+        let mut q = conn.prepare(&format!(
+            "SELECT schema, receipt_id, repo, project, base_branch, pr, head_sha,
+                    validated_head_sha, merge_commit_sha, merged_at, safe_merge,
+                    source, required_checks_json, gate_receipt_sha256, evidence
+               FROM merge_receipts
+              WHERE {project_filter}{auth_filter}"
+        ))?;
+        let rows = q.query_map(rusqlite::params![any, short, full], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, i64>(10)? == 1,
+                row.get::<_, String>(11)?,
+                row.get::<_, String>(12)?,
+                row.get::<_, String>(13)?,
+                row.get::<_, String>(14)?,
+            ))
+        })?;
+        let mut safe = Vec::new();
+        for row in rows {
+            let (
+                schema,
+                receipt_id,
+                repo,
+                project,
+                base_branch,
+                pr,
+                head_sha,
+                validated_head_sha,
+                merge_commit_sha,
+                merged_at,
+                safe_merge,
+                source,
+                required_checks_json,
+                gate_receipt_sha256,
+                evidence,
+            ) = row?;
+            let required_checks = serde_json::from_str(&required_checks_json).map_err(|error| {
+                format!("stored merge receipt {receipt_id} has invalid required checks: {error}")
+            })?;
+            let merged_at = DateTime::parse_from_rfc3339(&merged_at)?.with_timezone(&Utc);
+            let receipt = crate::metrics::merge_receipt::MergeReceipt {
+                schema,
+                receipt_id: receipt_id.clone(),
+                repo: repo.clone(),
+                project,
+                base_branch,
+                pr,
+                head_sha,
+                validated_head_sha,
+                merge_commit_sha,
+                merged_at,
+                safe_merge,
+                source,
+                required_checks,
+                gate_receipt_sha256,
+                evidence,
+            };
+            receipt.validate().map_err(|error| {
+                format!("stored merge receipt {receipt_id} is invalid: {error}")
+            })?;
+            if receipt.base_branch == SCORECARD_BASE_BRANCH
+                && receipt.merged_at >= cutoff
+                && receipt.merged_at < now
+            {
+                safe.push((repo, receipt.head_sha, pr));
+            }
+        }
+        let mut unique =
+            std::collections::BTreeMap::<(String, String), std::collections::BTreeSet<i64>>::new();
+        for (repo, head, pr) in safe {
+            unique.entry((repo, head)).or_default().insert(pr);
+        }
         let total = unique.len();
         let mut joined = 0_usize;
         let mut wasted = 0_i64;
         let mut samples = 0_usize;
         let mut duration_gaps = 0_usize;
-        for (repo, head, pr) in unique {
+        for ((repo, head), prs) in unique {
             let mut q = conn.prepare("SELECT job.status, job.total_ms FROM jobs job JOIN runs run ON run.id = job.run_id WHERE lower(trim(run.repo)) = ?1 AND run.sha = ?2 AND run.pr = ?3 AND job.completed_at IS NOT NULL")?;
-            let mut matched = false;
-            let mut invalid_duration = false;
-            for row in q.query_map(rusqlite::params![repo, head, pr], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
-            })? {
-                let (_, ms) = row?;
-                if ms.is_none_or(|v| v < 0) {
-                    // A completed row with NULL/negative duration cannot
-                    // substantiate a cost join. Keep the merge unjoined so
-                    // the scorecard cannot report a zero-cost claim.
-                    invalid_duration = true;
-                    continue;
+            let mut matched_pr = None;
+            for pr in prs {
+                let mut pr_matched = false;
+                let mut pr_invalid_duration = false;
+                for row in q.query_map(rusqlite::params![repo, head, pr], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
+                })? {
+                    let (_, ms) = row?;
+                    if ms.is_none_or(|v| v < 0) {
+                        // A completed row with NULL/negative duration cannot
+                        // substantiate a cost join. Keep the merge unjoined so
+                        // the scorecard cannot report a zero-cost claim.
+                        pr_invalid_duration = true;
+                        continue;
+                    }
+                    pr_matched = true;
                 }
-                matched = true;
+                if pr_matched && !pr_invalid_duration {
+                    matched_pr = Some(pr);
+                    break;
+                }
             }
-            if matched && !invalid_duration {
+            if let Some(pr) = matched_pr {
                 // The merged head proved the join; the change's waste is every
                 // failed or cancelled job of its pull request, earlier pushes
                 // included, not only the jobs on the head that merged.
@@ -1415,42 +1987,6 @@ impl MetricsStore {
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
-    }
-
-    /// Aggregate shadow observations. Durations remain unavailable until a
-    /// provenance-safe queue-to-metrics linkage exists.
-    pub fn repeated_work_cost(
-        &self,
-        limit: usize,
-    ) -> Result<RepeatedWorkCostSummary, Box<dyn std::error::Error>> {
-        let conn = self.connect()?;
-        let mut stmt = conn.prepare("SELECT kind, job_id FROM repeated_work_shadow ORDER BY observed_at DESC, id DESC LIMIT ?1")?;
-        let ids = stmt.query_map(params![i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        let mut out = RepeatedWorkCostSummary {
-            cost_basis: "avoided_repeated_work",
-            observations: 0,
-            superseded_exact_head: 0,
-            duplicate_exact_head_config: 0,
-            joined_durations: 0,
-            unknown_durations: 0,
-            duration_ms: None,
-        };
-        for item in ids {
-            let (kind, job_id) = item?;
-            out.observations += 1;
-            match kind.as_str() {
-                "superseded_exact_head" => out.superseded_exact_head += 1,
-                "duplicate_exact_head_config" => out.duplicate_exact_head_config += 1,
-                _ => {}
-            }
-            // Queue ids (`sy-...`) are not SQLite job identities. Without an
-            // authenticated linkage, every duration remains unavailable.
-            let _ = job_id;
-            out.unknown_durations += 1;
-        }
-        Ok(out)
     }
 
     /// Record one low-friction timing row.
@@ -2091,6 +2627,8 @@ impl MetricsStore {
         let now = Utc::now();
         let fleet_capacity =
             self.fleet_capacity_denominator(project, &cutoff, &now.to_rfc3339())?;
+        let safely_merged_changes_per_eligible_slot_hour =
+            safe_merge_rate(safe_merge_count, &fleet_capacity);
         let (proxies, comparison) = proxy_store::scorecard_window(
             &proxy_store::load_samples(&conn, Some(project))?,
             now,
@@ -2189,6 +2727,7 @@ impl MetricsStore {
                 value: None,
             },
             fleet_capacity,
+            safely_merged_changes_per_eligible_slot_hour,
             basis: basis.as_str(),
             proxies,
             comparison,
@@ -2679,6 +3218,51 @@ fn unavailable_merge_coverage() -> ScorecardCoverage {
 }
 
 #[allow(clippy::cast_precision_loss)]
+fn safe_merge_rate(
+    safe_merge_count: usize,
+    capacity: &FleetCapacityDenominator,
+) -> ScorecardCoverage {
+    let Some(hours) = capacity.eligible_slot_hours.filter(|value| *value > 0.0) else {
+        let reason = if safe_merge_count == 0 {
+            "no durable safe-merge receipt heads or positive eligible fleet-hours"
+        } else if capacity.eligible_slot_hours == Some(0.0) {
+            "eligible fleet-hours are zero; safely merged changes per eligible fleet-hour is undefined"
+        } else {
+            "eligible fleet-hours are unavailable; safely merged changes per eligible fleet-hour is unavailable"
+        };
+        return ScorecardCoverage {
+            status: "unavailable".to_owned(),
+            reason: reason.to_owned(),
+            value: None,
+        };
+    };
+    if safe_merge_count == 0 {
+        return ScorecardCoverage {
+            status: "unavailable".to_owned(),
+            reason: "no durable safe-merge receipt heads in the scorecard window".to_owned(),
+            value: None,
+        };
+    }
+
+    let rate = safe_merge_count as f64 / hours;
+    let partial = capacity.status != "available";
+    let reason = if partial {
+        format!(
+            "{safe_merge_count} distinct safe merge receipt heads / {hours:.6} eligible fleet-hours; denominator is a verified lower bound, so the reported rate may be overstated"
+        )
+    } else {
+        format!(
+            "{safe_merge_count} distinct safe merge receipt heads / {hours:.6} eligible fleet-hours"
+        )
+    };
+    ScorecardCoverage {
+        status: if partial { "partial" } else { "available" }.to_owned(),
+        reason,
+        value: Some(rate),
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
 fn pull_requests_per_day(distinct_pull_requests: usize, since_days: i64) -> f64 {
     distinct_pull_requests as f64 / since_days as f64
 }
@@ -2718,7 +3302,9 @@ fn migrate_repeated_work_shadow(conn: &Connection) -> Result<(), rusqlite::Error
            superseded_sha TEXT NOT NULL
          );
          CREATE INDEX IF NOT EXISTS repeated_work_shadow_observed_at
-           ON repeated_work_shadow(observed_at DESC);",
+           ON repeated_work_shadow(observed_at DESC);
+         CREATE INDEX IF NOT EXISTS repeated_work_shadow_superseded_job
+           ON repeated_work_shadow(superseded_job_id);",
     )
 }
 
@@ -3925,6 +4511,53 @@ mod tests {
         }
     }
 
+    fn test_authenticated_envelope(
+        envelope_id: &str,
+        repository: &str,
+        project: &str,
+        receipts: Vec<crate::metrics::merge_receipt::MergeReceipt>,
+    ) -> crate::metrics::merge_receipt_handoff::AuthenticatedHandoffEnvelope {
+        let payload_sha256 =
+            crate::metrics::merge_receipt_handoff::digest_receipts(&receipts).unwrap();
+        crate::metrics::merge_receipt_handoff::AuthenticatedHandoffEnvelope {
+            schema: crate::metrics::merge_receipt_handoff::SCHEMA.to_owned(),
+            envelope_id: envelope_id.to_owned(),
+            repository: repository.to_owned(),
+            project: project.to_owned(),
+            base_branch: "main".to_owned(),
+            payload_sha256,
+            receipts,
+            producer_host_id: "m1".to_owned(),
+            producer_session_generation: 7,
+            route: crate::parallel_proof_canary::CanaryRoute::Lan,
+            destination: "shipyard@m1.local".to_owned(),
+            known_hosts_sha256: crate::parallel_proof::Sha256Digest::of_bytes(b"known-hosts"),
+            executable_sha256: crate::parallel_proof::Sha256Digest::of_bytes(b"shipyard"),
+            issued_at: "2026-10-28T00:00:00Z".parse().unwrap(),
+            expires_at: "2026-10-28T00:10:00Z".parse().unwrap(),
+        }
+    }
+
+    fn test_authenticated_context(
+        repository: &str,
+        project: &str,
+    ) -> crate::metrics::merge_receipt_handoff::AuthenticatedProducerContext {
+        crate::metrics::merge_receipt_handoff::AuthenticatedProducerContext {
+            repository: repository.to_owned(),
+            project: project.to_owned(),
+            base_branch: "main".to_owned(),
+            producer_host_id: "m1".to_owned(),
+            producer_session_generation: 7,
+            route: crate::parallel_proof_canary::CanaryRoute::Lan,
+            destination: "shipyard@m1.local".to_owned(),
+            known_hosts_sha256: crate::parallel_proof::Sha256Digest::of_bytes(b"known-hosts"),
+            executable_sha256: crate::parallel_proof::Sha256Digest::of_bytes(b"shipyard"),
+            now: "2026-10-28T00:05:00Z".parse().unwrap(),
+            max_age: Duration::minutes(15),
+            max_future_skew: Duration::minutes(2),
+        }
+    }
+
     fn test_capacity_sample(
         observed_at: DateTime<Utc>,
         host: &str,
@@ -4012,6 +4645,98 @@ mod tests {
         assert!(scorecard.fleet_capacity.eligible_slot_hours.is_some());
     }
 
+    fn test_capacity_denominator(
+        status: &str,
+        eligible_slot_hours: Option<f64>,
+    ) -> FleetCapacityDenominator {
+        FleetCapacityDenominator {
+            status: status.to_owned(),
+            reason: String::new(),
+            sample_count: 1,
+            verified_samples: usize::from(status == "available"),
+            unknown_samples: usize::from(status == "partial"),
+            host_target_count: 1,
+            eligible_slot_hours,
+        }
+    }
+
+    #[test]
+    fn safe_merge_rate_is_fail_closed_without_capacity_or_receipts() {
+        let no_capacity = safe_merge_rate(2, &test_capacity_denominator("unavailable", None));
+        assert_eq!(no_capacity.status, "unavailable");
+        assert_eq!(no_capacity.value, None);
+
+        let no_receipts = safe_merge_rate(0, &test_capacity_denominator("available", Some(4.0)));
+        assert_eq!(no_receipts.status, "unavailable");
+        assert!(no_receipts.reason.contains("no durable safe-merge"));
+    }
+
+    #[test]
+    fn safe_merge_rate_marks_partial_capacity_as_upper_bound() {
+        let result = safe_merge_rate(3, &test_capacity_denominator("partial", Some(6.0)));
+        assert_eq!(result.status, "partial");
+        assert_eq!(result.value, Some(0.5));
+        assert!(result.reason.contains("lower bound"));
+        assert!(result.reason.contains("may be overstated"));
+    }
+
+    #[test]
+    fn safe_merge_rate_reports_fully_verified_capacity() {
+        let result = safe_merge_rate(3, &test_capacity_denominator("available", Some(6.0)));
+        assert_eq!(result.status, "available");
+        assert_eq!(result.value, Some(0.5));
+        assert!(!result.reason.contains("upper-bound"));
+    }
+
+    #[test]
+    fn safe_merge_rate_rejects_zero_eligible_hours() {
+        let result = safe_merge_rate(3, &test_capacity_denominator("partial", Some(0.0)));
+        assert_eq!(result.status, "unavailable");
+        assert_eq!(result.value, None);
+        assert!(result.reason.contains("zero"));
+    }
+
+    #[test]
+    fn scorecard_reports_safe_merge_rate_from_receipts_and_capacity() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        insert_scorecard_sample(&store, "Shipyard", 41, "success", 1_000, 0, false);
+        let conn = store.connect().unwrap();
+        conn.execute(
+            "UPDATE runs SET repo = 'danielraffel/Shipyard', sha = ?1 WHERE pr = 41",
+            [&"a".repeat(40)],
+        )
+        .unwrap();
+        let observed = Utc::now() - Duration::minutes(1);
+        let capacity = test_capacity_sample(observed, "m3", "verified");
+        store
+            .import_fleet_capacity(&serde_json::to_string(&capacity).unwrap())
+            .unwrap();
+        store
+            .import_merge_receipts(&[test_receipt(
+                "rate-41",
+                "danielraffel/Shipyard",
+                "shipyard",
+                41,
+                'a',
+            )])
+            .unwrap();
+
+        let scorecard = store.stewardship_scorecard("Shipyard", 1).unwrap();
+        let rate = &scorecard.safely_merged_changes_per_eligible_slot_hour;
+        assert_eq!(rate.status, "partial");
+        assert!(rate.value.is_some_and(|value| value > 0.0));
+        assert!(rate.reason.contains("eligible fleet-hours"));
+        assert!(rate.reason.contains("may be overstated"));
+        let json = serde_json::to_value(&scorecard).unwrap();
+        assert!(
+            json.get("safely_merged_changes_per_eligible_slot_hour")
+                .and_then(|value| value.get("value"))
+                .and_then(serde_json::Value::as_f64)
+                .is_some()
+        );
+    }
+
     #[test]
     fn unknown_latest_capacity_observation_suppresses_overlapping_verified_capacity() {
         let temp = tempfile::tempdir().unwrap();
@@ -4088,30 +4813,127 @@ mod tests {
     }
 
     #[test]
-    fn merge_receipt_reimport_accepts_legacy_mixed_case_project() {
+    fn authenticated_handoff_persists_fence_and_is_replay_idempotent() {
         let temp = tempfile::tempdir().unwrap();
         let store = MetricsStore::open(temp.path()).unwrap();
-        let receipt = test_receipt("legacy-project-case", "owner/repo", "repo", 1, 'a');
+        let repository = "owner/repo";
+        let receipts = vec![
+            test_receipt("auth-1", repository, "owner/repo", 1, 'a'),
+            test_receipt("auth-2", repository, "owner/repo", 2, 'b'),
+        ];
+        let envelope =
+            test_authenticated_envelope("auth-envelope-1", repository, "owner/repo", receipts);
+        let context = test_authenticated_context(repository, "owner/repo");
         assert_eq!(
             store
-                .import_merge_receipts(std::slice::from_ref(&receipt))
-                .unwrap(),
-            1
+                .authenticated_safe_merge_summary("repo", "1970-01-01T00:00:00Z")
+                .unwrap()
+                .0,
+            0
         );
-        store
-            .connect()
-            .unwrap()
-            .execute(
-                "UPDATE merge_receipts SET repo = 'OWNER/REPO', project = 'REPO' WHERE receipt_id = 'legacy-project-case'",
-                [],
-            )
-            .unwrap();
         assert_eq!(
             store
-                .import_merge_receipts(std::slice::from_ref(&receipt))
+                .import_authenticated_merge_receipt_handoff(&envelope, &context)
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            store
+                .import_authenticated_merge_receipt_handoff(&envelope, &context)
                 .unwrap(),
             0
         );
+        let mut expired_context = context.clone();
+        expired_context.now = "2026-10-28T01:00:00Z".parse().unwrap();
+        assert_eq!(
+            store
+                .import_authenticated_merge_receipt_handoff(&envelope, &expired_context)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .authenticated_safe_merge_summary("repo", "1970-01-01T00:00:00Z")
+                .unwrap()
+                .0,
+            2
+        );
+        let conn = store.connect().unwrap();
+        let counts: (i64, i64, i64, String) = conn
+            .query_row(
+                "SELECT (SELECT count(*) FROM merge_receipt_handoffs), (SELECT count(*) FROM merge_receipt_handoff_receipts), (SELECT count(*) FROM merge_receipts), (SELECT project FROM merge_receipt_handoffs WHERE envelope_id='auth-envelope-1')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (1, 2, 2, "repo".to_owned()));
+        assert!(
+            conn.execute(
+                "UPDATE merge_receipts SET safe_merge=0 WHERE receipt_id='auth-1'",
+                [],
+            )
+            .is_err()
+        );
+        conn.execute(
+            "UPDATE merge_receipt_handoffs SET project='other' WHERE envelope_id='auth-envelope-1'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .authenticated_safe_merge_summary("repo", "1970-01-01T00:00:00Z")
+                .unwrap()
+                .0,
+            0
+        );
+        conn.execute(
+            "UPDATE merge_receipt_handoffs SET project='repo' WHERE envelope_id='auth-envelope-1'",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn authenticated_handoff_attaches_to_legacy_rows_and_rejects_conflicts_atomically() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        let repository = "owner/repo";
+        let receipt = test_receipt("auth-legacy", repository, "repo", 1, 'a');
+        store
+            .import_merge_receipts(std::slice::from_ref(&receipt))
+            .unwrap();
+        let envelope = test_authenticated_envelope(
+            "auth-envelope-legacy",
+            repository,
+            "repo",
+            vec![receipt.clone()],
+        );
+        let context = test_authenticated_context(repository, "repo");
+        assert_eq!(
+            store
+                .import_authenticated_merge_receipt_handoff(&envelope, &context)
+                .unwrap(),
+            0
+        );
+        let mut conflicting = envelope.clone();
+        conflicting.envelope_id = "auth-envelope-conflict".to_owned();
+        conflicting.receipts[0].evidence = "sha256:changed".to_owned();
+        conflicting.payload_sha256 =
+            crate::metrics::merge_receipt_handoff::digest_receipts(&conflicting.receipts).unwrap();
+        assert!(
+            store
+                .import_authenticated_merge_receipt_handoff(&conflicting, &context)
+                .is_err()
+        );
+        let conn = store.connect().unwrap();
+        let counts: (i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT count(*) FROM merge_receipt_handoffs), (SELECT count(*) FROM merge_receipt_handoff_receipts)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (1, 1));
     }
 
     #[test]
@@ -4119,9 +4941,11 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = MetricsStore::open(temp.path()).unwrap();
         let first = test_receipt("export-1", "OWNER/REPO", "repo", 1, 'a');
+        let mut release = test_receipt("export-release", "owner/repo", "repo", 3, 'c');
+        release.base_branch = "release".to_owned();
         let other = test_receipt("export-2", "other/repo", "repo", 2, 'd');
         store
-            .import_merge_receipts(&[first.clone(), other])
+            .import_merge_receipts(&[first.clone(), release, other])
             .unwrap();
 
         let exported = store.export_merge_receipts("owner/repo").unwrap();
@@ -4246,6 +5070,89 @@ mod tests {
         );
         let scorecard = store.stewardship_scorecard("repo", 2).unwrap();
         assert_eq!(scorecard.safely_merged_changes.value, Some(1.0));
+    }
+
+    #[test]
+    fn safe_merge_rate_deduplicates_one_head_across_pr_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        insert_scorecard_sample(&store, "repo", 30, "success", 1_000, 0, false);
+        store
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE runs SET repo='owner/repo', sha=?1 WHERE pr=30",
+                [&"a".repeat(40)],
+            )
+            .unwrap();
+        let first = test_receipt("head-pr-30", "owner/repo", "repo", 30, 'a');
+        let mut second = first.clone();
+        second.receipt_id = "head-pr-31".into();
+        second.pr = 31;
+        store.import_merge_receipts(&[first, second]).unwrap();
+        let (total, joined, _, _, _) = store
+            .safe_merge_summary("repo", "1970-01-01T00:00:00Z")
+            .unwrap();
+        assert_eq!((total, joined), (1, 1));
+    }
+
+    #[test]
+    fn safe_merge_summary_excludes_future_receipts() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        let mut future = test_receipt("future-merge", "owner/repo", "repo", 1, 'a');
+        future.merged_at = Utc::now() + Duration::hours(1);
+        store.import_merge_receipts(&[future]).unwrap();
+        assert_eq!(
+            store
+                .safe_merge_summary("repo", "1970-01-01T00:00:00Z")
+                .unwrap()
+                .0,
+            0
+        );
+    }
+
+    #[test]
+    fn safe_merge_summary_counts_only_the_measured_main_branch() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        let main = test_receipt("main-merge", "owner/repo", "repo", 1, 'a');
+        let mut release = test_receipt("release-merge", "owner/repo", "repo", 2, 'd');
+        release.base_branch = "release".to_owned();
+        store.import_merge_receipts(&[main, release]).unwrap();
+
+        let (total, joined, _, _, _) = store
+            .safe_merge_summary("repo", "1970-01-01T00:00:00Z")
+            .unwrap();
+        assert_eq!((total, joined), (1, 0));
+    }
+
+    #[test]
+    fn safe_merge_summary_rejects_malformed_stored_receipts() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        store
+            .import_merge_receipts(&[test_receipt(
+                "malformed-merge",
+                "owner/repo",
+                "repo",
+                1,
+                'a',
+            )])
+            .unwrap();
+        store
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE merge_receipts SET validated_head_sha = ?1 WHERE receipt_id = ?2",
+                rusqlite::params![&"b".repeat(40), "malformed-merge"],
+            )
+            .unwrap();
+
+        let error = store
+            .safe_merge_summary("repo", "1970-01-01T00:00:00Z")
+            .expect_err("malformed stored receipts must fail closed");
+        assert!(error.to_string().contains("validated_head_sha"));
     }
 
     #[test]
@@ -5761,6 +6668,76 @@ mod tests {
     }
 
     #[test]
+    fn repeated_work_cost_rejects_nonpositive_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        for since_days in [0, -1] {
+            for limit in [0, 100] {
+                let error = store.repeated_work_cost(limit, since_days).unwrap_err();
+                assert_eq!(
+                    error.to_string(),
+                    "repeated-work baseline window must be positive"
+                );
+            }
+        }
+        let valid = store.repeated_work_cost(100, 1).unwrap();
+        assert_eq!(valid.observations, 0);
+        assert_eq!(valid.duration_ms, None);
+    }
+
+    #[test]
+    fn repeated_work_cost_only_joins_case_sensitive_queue_ids_without_separators() {
+        // Matching clean timing rows make each rejection exercise the ID guard,
+        // rather than pass because timing was absent.
+        for (id, joins) in [
+            ("sy-a-b", true),
+            ("sy-a/b", false),
+            ("sy-a\\b", false),
+            ("SY-a-b", false),
+            ("Sy-a-b", false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = MetricsStore::open(dir.path()).unwrap();
+            store
+                .record_queue_terminal(
+                    QUEUE_AUTHORITY_TOKEN,
+                    &QueueTerminalTiming {
+                        queue_job_id: id.into(),
+                        queue_identity: format!("identity-{id}"),
+                        disposition: "clean".into(),
+                        started_at: Some(Utc::now()),
+                        completed_at: Some(Utc::now()),
+                        total_ms: Some(99),
+                    },
+                )
+                .unwrap();
+            store
+                .record_repeated_work_shadow(&RepeatedWorkShadowInput {
+                    kind: RepeatedWorkKind::SupersededExactHead,
+                    branch: "main".into(),
+                    sha: "head".into(),
+                    target_config: "cfg".into(),
+                    mode: "normal".into(),
+                    job_id: "sy-survivor".into(),
+                    superseded_job_id: id.into(),
+                    superseded_sha: "old".into(),
+                })
+                .unwrap();
+            let summary = store.repeated_work_cost(100, 14).unwrap();
+            assert_eq!(summary.observations, 1, "{id}");
+            assert_eq!(summary.shadow_rows, 1, "{id}");
+            assert_eq!(summary.distinct_superseded_jobs, 1, "{id}");
+            assert_eq!(summary.joined_durations, usize::from(joins), "{id}");
+            assert_eq!(summary.matched_clean, usize::from(joins), "{id}");
+            assert_eq!(summary.unknown_durations, usize::from(!joins), "{id}");
+            assert_eq!(summary.unmatched, usize::from(!joins), "{id}");
+            assert_eq!(summary.duration_ms, joins.then_some(99), "{id}");
+            assert_eq!(summary.timing_basis, "superseded_queue_job_runtime");
+            assert!(summary.final_attempt_only);
+        }
+    }
+
+    #[test]
     fn repeated_work_cost_keeps_all_unlinked_ids_unknown() {
         let dir = tempfile::tempdir().unwrap();
         let store = MetricsStore::open(dir.path()).unwrap();
@@ -5774,21 +6751,34 @@ mod tests {
                 sha: "sha".into(),
                 target_config: "cfg".into(),
                 mode: "normal".into(),
-                job_id: id.into(),
-                superseded_job_id: "old".into(),
+                job_id: "sy-survivor".into(),
+                superseded_job_id: id.into(),
                 superseded_sha: "oldsha".into(),
             };
             store.record_repeated_work_shadow(&input).unwrap();
         }
         let conn = Connection::open(store.path()).unwrap();
         conn.execute("INSERT INTO repeated_work_shadow (observed_at,kind,branch,sha,target_config,mode,job_id,superseded_job_id,superseded_sha) VALUES ('now','future_kind','main','sha','cfg','normal','7','old','oldsha')", []).unwrap();
-        let summary = store.repeated_work_cost(100).unwrap();
+        store
+            .record_queue_terminal(
+                QUEUE_AUTHORITY_TOKEN,
+                &QueueTerminalTiming {
+                    queue_job_id: "42".into(),
+                    queue_identity: "numeric-test".into(),
+                    disposition: "clean".into(),
+                    started_at: Some(Utc::now()),
+                    completed_at: Some(Utc::now()),
+                    total_ms: Some(99),
+                },
+            )
+            .unwrap();
+        let summary = store.repeated_work_cost(100, 14).unwrap();
         assert_eq!(summary.duration_ms, None);
         assert_eq!(summary.joined_durations, 0);
         assert_eq!(summary.unknown_durations, 3);
         assert_eq!(summary.superseded_exact_head, 1);
         assert_eq!(summary.duplicate_exact_head_config, 1);
-        assert_eq!(store.repeated_work_cost(0).unwrap().observations, 0);
+        assert_eq!(store.repeated_work_cost(0, 14).unwrap().observations, 0);
         assert_eq!(
             serde_json::to_value(summary).unwrap()["duration_ms"],
             serde_json::Value::Null
@@ -5888,7 +6878,7 @@ mod tests {
         );
     }
     #[test]
-    fn survivor_timing_counts_distinct_and_excluded_rows() {
+    fn superseded_timing_counts_distinct_and_excluded_rows_in_window() {
         let dir = tempfile::tempdir().unwrap();
         let store = MetricsStore::open(dir.path()).unwrap();
         let mk = |id: &str, d: &str, ms| QueueTerminalTiming {
@@ -5900,21 +6890,30 @@ mod tests {
             total_ms: ms,
         };
         store
-            .record_queue_terminal(QUEUE_AUTHORITY_TOKEN, &mk("clean", "clean", Some(10)))
+            .record_queue_terminal(QUEUE_AUTHORITY_TOKEN, &mk("sy-clean", "clean", Some(10)))
             .unwrap();
         store
             .record_queue_terminal(
                 QUEUE_AUTHORITY_TOKEN,
-                &mk("uncertain", "uncertain", Some(20)),
+                &mk("sy-uncertain", "uncertain", Some(20)),
             )
             .unwrap();
         store
             .record_queue_terminal(
                 QUEUE_AUTHORITY_TOKEN,
-                &mk("cancel", "cancelled_mid_run", Some(30)),
+                &mk("sy-cancel", "cancelled_mid_run", Some(30)),
             )
             .unwrap();
-        for id in ["clean", "clean", "uncertain", "cancel", "missing"] {
+        for (index, id) in [
+            "sy-clean",
+            "sy-clean",
+            "sy-uncertain",
+            "sy-cancel",
+            "sy-missing",
+        ]
+        .into_iter()
+        .enumerate()
+        {
             store
                 .record_repeated_work_shadow(&RepeatedWorkShadowInput {
                     kind: RepeatedWorkKind::SupersededExactHead,
@@ -5922,20 +6921,38 @@ mod tests {
                     sha: "s".into(),
                     target_config: "t".into(),
                     mode: "m".into(),
-                    job_id: id.into(),
-                    superseded_job_id: "o".into(),
+                    job_id: "sy-survivor".into(),
+                    superseded_job_id: id.into(),
                     superseded_sha: "o".into(),
                 })
                 .unwrap();
+            if index == 4 {
+                let conn = Connection::open(store.path()).unwrap();
+                conn.execute(
+                    "UPDATE repeated_work_shadow SET observed_at='2000-01-01T00:00:00Z' WHERE id=(SELECT max(id) FROM repeated_work_shadow)",
+                    [],
+                )
+                .unwrap();
+            }
         }
-        let r = store.repeated_work_survivor_timing(100).unwrap();
-        assert_eq!(r.shadow_rows, 5);
-        assert_eq!(r.distinct_survivors, 4);
+        let r = store.repeated_work_superseded_timing(100, 14).unwrap();
+        assert_eq!(r.shadow_rows, 4);
+        assert_eq!(r.distinct_superseded_jobs, 3);
         assert_eq!(r.matched_clean, 1);
-        assert_eq!(r.avoided_survivor_ms, Some(10));
+        assert_eq!(r.superseded_runtime_ms, Some(10));
         assert_eq!(r.excluded_uncertain, 1);
         assert_eq!(r.excluded_cancelled, 1);
-        assert_eq!(r.unmatched, 1);
+        assert_eq!(r.unmatched, 0);
+        let cost = store.repeated_work_cost(100, 14).unwrap();
+        assert_eq!(cost.observations, 4);
+        assert_eq!(cost.shadow_rows, 4);
+        assert_eq!(cost.distinct_superseded_jobs, 3);
+        assert_eq!(cost.joined_durations, 1);
+        assert_eq!(cost.unknown_durations, 2);
+        assert_eq!(cost.duration_ms, Some(10));
+        assert_eq!(cost.excluded_uncertain, 1);
+        assert_eq!(cost.excluded_cancelled, 1);
+        assert_eq!(cost.unmatched, 0);
     }
     #[test]
     fn queue_timing_contract_rejects_identity_and_downgrades() {
@@ -5979,11 +6996,288 @@ mod tests {
         );
     }
 
+    fn retention_shadow(conn: &Connection, timestamp: &str, superseded: &str) {
+        conn.execute(
+            "INSERT INTO repeated_work_shadow
+             (observed_at, kind, branch, sha, target_config, mode, job_id,
+              superseded_job_id, superseded_sha)
+             VALUES (?1, 'superseded_exact_head', 'main', 'new', 'cfg', 'normal',
+                     'sy-new', ?2, 'old')",
+            params![timestamp, superseded],
+        )
+        .unwrap();
+    }
+
+    fn retention_timing(conn: &Connection, id: &str, timestamp: &str, disposition: &str) {
+        conn.execute(
+            "INSERT INTO queue_timing
+             (queue_job_id, queue_identity, disposition, recorded_at, total_ms)
+             VALUES (?1, 'identity', ?2, ?3, ?4)",
+            params![
+                id,
+                disposition,
+                timestamp,
+                (disposition == "clean").then_some(10)
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn metrics_retention_prunes_observations_across_batches_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let conn = store.connect().unwrap();
+        for i in 0..501 {
+            let id = format!("sy-old-{i}");
+            retention_shadow(&conn, "2000-01-01T00:00:00Z", &id);
+            retention_timing(
+                &conn,
+                &id,
+                "2000-01-01T00:00:00Z",
+                ["clean", "cancelled_mid_run", "uncertain"][i % 3],
+            );
+        }
+        retention_shadow(&conn, &Utc::now().to_rfc3339(), "sy-fresh");
+        retention_timing(&conn, "sy-fresh", &Utc::now().to_rfc3339(), "clean");
+        retention_timing(
+            &conn,
+            "sy-fresh-unreferenced",
+            &Utc::now().to_rfc3339(),
+            "uncertain",
+        );
+        assert_eq!(store.prune_older_than(90).unwrap(), 1002);
+        assert_eq!(store.repeated_work_shadow(1000).unwrap().len(), 1);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM queue_timing", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(store.prune_older_than(90).unwrap(), 0);
+    }
+
+    #[test]
+    fn metrics_retention_preserves_recent_shadow_timing_join_until_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let conn = store.connect().unwrap();
+        retention_timing(&conn, "sy-old", "2000-01-01T00:00:00Z", "clean");
+        retention_shadow(&conn, &Utc::now().to_rfc3339(), "sy-old");
+        let before = store.repeated_work_superseded_timing(10, 90).unwrap();
+        assert_eq!(before.matched_clean, 1);
+        assert_eq!(before.superseded_runtime_ms, Some(10));
+        assert_eq!(store.prune_older_than(90).unwrap(), 0);
+        assert_eq!(
+            store.repeated_work_superseded_timing(10, 90).unwrap(),
+            before
+        );
+        conn.execute(
+            "UPDATE repeated_work_shadow SET observed_at='2000-01-01T00:00:00Z'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(store.prune_older_than(90).unwrap(), 2);
+        assert_eq!(store.prune_older_than(90).unwrap(), 0);
+    }
+
+    #[test]
+    fn metrics_retention_preserves_malformed_dates_and_compares_offsets() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let conn = store.connect().unwrap();
+        let cutoff = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        for timestamp in ["invalid", "2000", "2000-02-30T00:00:00Z"] {
+            retention_shadow(&conn, timestamp, "sy-protected");
+            retention_timing(&conn, timestamp, timestamp, "uncertain");
+        }
+        retention_timing(&conn, "sy-protected", "2000-01-01T00:00:00Z", "clean");
+        for (id, timestamp) in [
+            ("sy-equal", "2025-12-31T19:00:00-05:00"),
+            ("sy-future", "2025-12-31T23:00:00-02:00"),
+            ("sy-expired", "2026-01-01T01:00:00+02:00"),
+        ] {
+            retention_shadow(&conn, timestamp, id);
+            retention_timing(&conn, id, timestamp, "clean");
+        }
+        assert_eq!(store.prune_queue_observations(cutoff).unwrap(), 2);
+        assert_eq!(store.repeated_work_shadow(20).unwrap().len(), 5);
+        for id in [
+            "sy-equal",
+            "sy-future",
+            "sy-protected",
+            "invalid",
+            "2000",
+            "2000-02-30T00:00:00Z",
+        ] {
+            assert!(store.read_queue_timing(id).unwrap().is_some(), "{id}");
+        }
+        assert_eq!(store.prune_queue_observations(cutoff).unwrap(), 0);
+    }
+
+    #[test]
+    fn metrics_retention_migrates_shadow_only_store() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("metrics")).unwrap();
+        let conn = Connection::open(dir.path().join("metrics/metrics.db")).unwrap();
+        migrate_repeated_work_shadow(&conn).unwrap();
+        retention_shadow(&conn, "2000-01-01T00:00:00Z", "sy-old");
+        for reopen in [false, true] {
+            if reopen {
+                MetricsStore::open(dir.path()).unwrap();
+            }
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='index'
+                     AND name='repeated_work_shadow_superseded_job'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                1
+            );
+        }
+        let store = MetricsStore::open(dir.path()).unwrap();
+        assert_eq!(store.prune_older_than(90).unwrap(), 1);
+    }
+
+    #[test]
+    fn metrics_retention_disabled_or_extreme_window_does_not_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        retention_shadow(&store.connect().unwrap(), "2000-01-01T00:00:00Z", "sy-old");
+        assert_eq!(store.prune_older_than(0).unwrap(), 0);
+        assert_eq!(store.prune_older_than(-1).unwrap(), 0);
+        assert!(store.prune_older_than(i64::MAX).is_err());
+        assert_eq!(store.repeated_work_shadow(10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn retention_indexes_are_idempotent_and_drive_cleanup_plans() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let expected = [
+            "metrics_jobs_run_id",
+            "metrics_runs_retention",
+            "metrics_steps_job_id",
+        ];
+        let index_names = |store: &MetricsStore| {
+            let conn = store.connect().unwrap();
+            let mut statement = conn
+                .prepare(
+                    "SELECT name FROM sqlite_master
+                     WHERE type = 'index' AND name LIKE 'metrics_%'
+                     ORDER BY name",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(index_names(&store), expected);
+
+        {
+            let conn = store.connect().unwrap();
+            conn.execute("DROP INDEX metrics_runs_retention", [])
+                .unwrap();
+            conn.execute("DROP INDEX metrics_jobs_run_id", []).unwrap();
+            conn.execute("DROP INDEX metrics_steps_job_id", []).unwrap();
+        }
+        store.migrate().unwrap();
+        assert_eq!(index_names(&store), expected);
+
+        let mut conn = store.connect().unwrap();
+        let transaction = conn.transaction().unwrap();
+        for id in 1..=4_000_i64 {
+            let timestamp = if id <= 2_000 {
+                "2020-01-01T00:00:00Z"
+            } else {
+                "2030-01-01T00:00:00Z"
+            };
+            transaction
+                .execute(
+                    "INSERT INTO runs (id, ts, project, status)
+                     VALUES (?1, ?2, 'pulp', 'success')",
+                    params![id, timestamp],
+                )
+                .unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO jobs (id, run_id, job, status)
+                     VALUES (?1, ?1, 'job', 'success')",
+                    params![id],
+                )
+                .unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO steps (id, job_id, step, duration_ms, status)
+                     VALUES (?1, ?1, 'build', 1, 'success')",
+                    params![id],
+                )
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+
+        let plan_detail = |query: &str, parameter: &str| {
+            conn.query_row(&format!("EXPLAIN QUERY PLAN {query}"), [parameter], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+        };
+        let runs_plan = plan_detail(
+            "SELECT id FROM runs WHERE ts < ?1 ORDER BY ts, id LIMIT 250",
+            "2025-01-01T00:00:00Z",
+        );
+        let jobs_plan = plan_detail("SELECT id FROM jobs WHERE run_id = ?1", "1");
+        let steps_plan = plan_detail("SELECT id FROM steps WHERE job_id = ?1", "1");
+        assert!(
+            runs_plan.contains("SEARCH runs USING COVERING INDEX metrics_runs_retention"),
+            "unexpected runs plan: {runs_plan}"
+        );
+        assert!(
+            jobs_plan.contains("SEARCH jobs USING COVERING INDEX metrics_jobs_run_id"),
+            "unexpected jobs plan: {jobs_plan}"
+        );
+        assert!(
+            steps_plan.contains("SEARCH steps USING COVERING INDEX metrics_steps_job_id"),
+            "unexpected steps plan: {steps_plan}"
+        );
+    }
+
     #[test]
     fn metrics_retention_prunes_raw_samples_but_keeps_receipts() {
         let dir = tempfile::tempdir().unwrap();
         let store = MetricsStore::open(dir.path()).unwrap();
         let old = Utc::now() - Duration::days(120);
+        let mut receipt = test_receipt("retained", "o/pulp", "pulp", 42, 'a');
+        receipt.merged_at = old;
+        store
+            .import_merge_receipts(std::slice::from_ref(&receipt))
+            .unwrap();
+        let ships = crate::ship_state::ShipStateStore::new(dir.path().join("ship")).unwrap();
+        let mut open =
+            crate::ship_state::ShipState::new(43, "o/pulp", "feature", "main", "head", "policy");
+        open.updated_at = old;
+        ships.save(&open).unwrap();
+        let mut queue = crate::queue::Queue::new(dir.path()).unwrap();
+        let mut pending = crate::job::Job::create(
+            "head",
+            "feature",
+            vec!["test".into()],
+            crate::job::ValidationMode::Full,
+            crate::job::Priority::Normal,
+        );
+        pending.created_at = old;
+        queue.enqueue(pending.clone()).unwrap();
+        let recovery = dir.path().join("queue/recovery/retained.json");
+        fs::create_dir_all(recovery.parent().unwrap()).unwrap();
+        let recovery_bytes = b"opaque recovery authority must remain byte-identical";
+        fs::write(&recovery, recovery_bytes).unwrap();
+        retention_shadow(&store.connect().unwrap(), "2000-01-01T00:00:00Z", "sy-old");
         store
             .record(&MetricRecordInput {
                 project: "pulp".into(),
@@ -5994,13 +7288,102 @@ mod tests {
                 ..MetricRecordInput::default()
             })
             .unwrap();
-        assert_eq!(store.prune_older_than(90).unwrap(), 1);
+        assert_eq!(store.prune_older_than(90).unwrap(), 2);
+        assert_eq!(
+            store.export_merge_receipts("o/pulp").unwrap(),
+            vec![receipt]
+        );
+        assert_eq!(ships.get_scoped("o/pulp", 43).unwrap().updated_at, old);
+        assert_eq!(queue.get(&pending.id).unwrap(), Some(pending));
+        assert_eq!(fs::read(&recovery).unwrap(), recovery_bytes);
+        assert_eq!(store.prune_older_than(90).unwrap(), 0);
         let conn = store.connect().unwrap();
         assert_eq!(
             conn.query_row("SELECT count(*) FROM runs", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn metrics_retention_prunes_multiple_batches_and_preserves_live_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let old = Utc::now() - Duration::days(120);
+        for pr in 1..=300 {
+            insert_scorecard_sample_at(
+                &store,
+                "pulp",
+                pr,
+                "success",
+                10,
+                0,
+                false,
+                old.to_rfc3339(),
+            );
+        }
+        insert_scorecard_sample(&store, "pulp", 301, "success", 10, 0, false);
+
+        let old_capacity = test_capacity_sample(old, "m3", "verified");
+        store
+            .import_fleet_capacity(&serde_json::to_string(&old_capacity).unwrap())
+            .unwrap();
+        let cutoff = Utc::now() - Duration::days(90);
+        let overlapping_capacity =
+            test_capacity_sample(cutoff - Duration::minutes(1), "m5", "verified");
+        store
+            .import_fleet_capacity(&serde_json::to_string(&overlapping_capacity).unwrap())
+            .unwrap();
+        store
+            .import_merge_receipts(&[test_receipt(
+                "retention-kept",
+                "owner/repo",
+                "repo",
+                301,
+                'a',
+            )])
+            .unwrap();
+
+        assert_eq!(store.prune_older_than(90).unwrap(), 301);
+        let conn = store.connect().unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM runs", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM jobs", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM steps", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM fleet_capacity_samples", [], |row| row
+                .get::<_, i64>(0),)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM merge_receipts", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn metrics_retention_rejects_period_outside_date_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let error = store
+            .prune_older_than(100_000_000)
+            .expect_err("out-of-range retention must fail closed");
+        assert!(error.to_string().contains("outside the timestamp range"));
     }
 
     #[test]
@@ -6018,6 +7401,34 @@ mod tests {
             conn.query_row("SELECT count(*) FROM fleet_capacity_samples", [], |row| row
                 .get::<_, i64>(0))
                 .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn metrics_retention_prunes_capacity_samples_in_bounded_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let old = Utc::now() - Duration::days(120);
+        let records = (0..501)
+            .map(|index| {
+                serde_json::to_string(&test_capacity_sample(
+                    old - Duration::seconds(i64::from(index)),
+                    &format!("m{index}"),
+                    "verified",
+                ))
+                .unwrap()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(store.import_fleet_capacity(&records).unwrap(), 501);
+        assert_eq!(store.prune_older_than(90).unwrap(), 501);
+        let conn = store.connect().unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM fleet_capacity_samples", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
             0
         );
     }

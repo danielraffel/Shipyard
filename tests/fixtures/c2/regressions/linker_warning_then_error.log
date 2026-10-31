@@ -1,0 +1,6 @@
+ld: warning: duplicate symbol 'example_symbol' in: a.o b.o
+[2/3] Linking CXX executable example
+/usr/bin/ld: a.o: warning: undefined reference to `optional_symbol'
+/usr/bin/ld: b.o: undefined reference to `required_symbol'
+ld: warning: directory not found for option '-L/opt/example/lib'
+ld: fatal warning(s) induced error (-fatal_warnings)
