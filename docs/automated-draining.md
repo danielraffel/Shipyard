@@ -57,8 +57,10 @@ owner only acts on evidence about the exact commit in front of it.
    a verdict naming the exact commit: APPROVE, or HOLD with what to fix.
 4. On a HOLD, a repair agent fixes what was named, adds a test, merges the
    base branch in (never a rebase), and pushes once. A new head means a fresh
-   review. A HOLD makes its head un-approvable: a later APPROVE of the same
-   head, from any reviewer, does not count, so only the pushed fix can land.
+   review. A HOLD locks its exact head: once a counted reviewer holds it, no
+   approval of that head counts, from anyone, before or after. Only a new push
+   can be approved. (A second reviewer session once approved a held head and it
+   merged; Shipyard now refuses that.)
 5. On the next steward pass (every five minutes is plenty), the approved head
    is handed to GitHub. A merge queue tests it with up to four others and
    merges the batch. Without a queue, Shipyard merges that exact head, and
@@ -144,6 +146,7 @@ someone else owns. Something like this is enough:
 - A reviewer posts an exact-head APPROVE or HOLD once required checks are green.
 - The Shipyard steward admits approved heads on its own every few minutes.
 - On a HOLD: fix what it names with a test, merge main (never rebase), push once.
+- A HOLD sticks to its head: fix it and push; don't ask for a re-approval of the same head.
 - Platform-only failures you can't fix now: open an issue labelled
   `PARKED/<platform>` with evidence and a next step; don't block the merge.
 - Use the smallest model that does the job; escalate only on a named blocker.
@@ -188,6 +191,27 @@ These came from running it for real:
   and hands that one pull request to the steward (`shipyard:managed` plus an
   exact-head `shipyard/steward-handoff` status); it still needs green required
   checks and an exact-head approval.
+- **A rule in an agent's brief is not a gate.** A scheduled reviewer was told
+  to review only heads with no verdict, ignored it, and approved held heads.
+  Anything that posts verdicts needs a mechanical check before it goes live;
+  Shipyard now enforces held heads itself.
+- **Give every reviewer process its own signer and an attributed session.**
+  Verdicts from an unattributed session are discarded, and two processes
+  sharing a signer can't be told apart. Scheduled (headless) runs must set a
+  session id explicitly.
+- **Fail over between providers.** A headless review pass should retry on
+  another provider when one returns auth or quota errors, and remember a recent
+  failure instead of paying for it on every run.
+- **Version bumps on a protected branch.** If required checks block direct
+  pushes, route bumps through one coalesced bump pull request that the writer
+  keeps updating. Don't add a ruleset bypass: it applies to every path, and a
+  token readable by branch workflows could use it. Give the bump commit the
+  skip trailers its own sync checks need, and give the bot token permission to
+  open and update pull requests, add labels and post statuses, not just push.
+- **Keep release-signing keys off the machines agents run on.** If a fast path
+  trusts "signed by the release bot", the key should live only in CI secrets,
+  with an offline backup for recovery. The verifier should pin the key's
+  fingerprint from the protected branch rather than trust author names.
 
 ## Related
 
