@@ -538,7 +538,11 @@ fn label_state(labels: &[String]) -> Option<(&'static str, &str)> {
     if let Some(label) = find(&|l| l.eq_ignore_ascii_case("superseded")) {
         return Some(("superseded", label));
     }
-    find(&|l| l.len() >= 7 && l[..7].eq_ignore_ascii_case("PARKED/")).map(|l| ("parked", l))
+    find(&|l| {
+        l.get(..7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("PARKED/"))
+    })
+    .map(|l| ("parked", l))
 }
 
 fn evaluate_pr(

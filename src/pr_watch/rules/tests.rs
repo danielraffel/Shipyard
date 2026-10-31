@@ -964,6 +964,29 @@ fn labelled_pull_requests_get_their_own_state_and_no_stall_rule() {
 }
 
 #[test]
+fn multibyte_labels_cannot_panic_the_label_prefix_check() {
+    // Byte 7 of each label falls inside a multibyte character, so slicing at
+    // byte 7 would panic. Labels come from live GraphQL, and one such label
+    // on any watched pull request must not take down the whole rules pass.
+    for label in ["🚧🚧", "✅✅✅", "owner🚧x"] {
+        assert!(label.len() >= 7 && !label.is_char_boundary(7), "{label}");
+        let mut labelled = pr(Vec::new(), Vec::new());
+        labelled.labels = vec![label.to_owned()];
+        let seen = holding(&input(labelled, hold_trail(10)), 100);
+        assert!(seen.contains("held_unrepaired"), "{label}: {seen:?}");
+        assert!(!seen.contains("parked"), "{label}: {seen:?}");
+    }
+    // Control: a multibyte suffix after the real prefix still parks the PR.
+    let mut parked = pr(Vec::new(), Vec::new());
+    parked.labels = vec!["PARKED/🚧".to_owned()];
+    let seen = holding(&input(parked, hold_trail(10)), 100);
+    assert!(
+        seen.contains("parked") && !seen.contains("held_unrepaired"),
+        "{seen:?}"
+    );
+}
+
+#[test]
 fn every_event_with_a_since_carries_its_age() {
     let watch = input(
         pr(Vec::new(), Vec::new()),
