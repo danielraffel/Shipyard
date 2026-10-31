@@ -88,6 +88,9 @@ pub(super) fn mutate_pr_with_recovery(
     }
     let pr = &live_pr;
     match decision {
+        StewardDecision::ArmMergeQueue if policy.server_enforced_exact_head_merge() => {
+            super::exact_head_merge::merge_exact_head(context, pr, policy, ledger)
+        }
         StewardDecision::ArmMergeQueue => enqueue_pull_request_with_recovery(
             context,
             pr,
@@ -109,6 +112,16 @@ fn read_head_gate(
     context: &MutationApplyContext<'_>,
     pr: &ObservedPr,
 ) -> Result<(crate::head_approval::HeadGate, Vec<String>), String> {
+    read_head_gate_with_queue_state(context, pr).map(|(gate, events, _queue)| (gate, events))
+}
+
+/// [`read_head_gate`], also returning the live queue-state response it read
+/// (`PR_QUEUE_STATE_QUERY`), so a caller can bind a mutation to the same
+/// observation the gate was evaluated against.
+pub(super) fn read_head_gate_with_queue_state(
+    context: &MutationApplyContext<'_>,
+    pr: &ObservedPr,
+) -> Result<(crate::head_approval::HeadGate, Vec<String>, Value), String> {
     let run_gh = |argv: &[String]| {
         context
             .actions
@@ -141,7 +154,7 @@ fn read_head_gate(
     .map_err(|error| format!("merge-queue observation unreadable: {error}"))?;
     let queue = serde_json::from_str::<Value>(&raw)
         .map_err(|error| format!("merge-queue observation unreadable: {error}"))?;
-    crate::head_approval::evaluate_with_policy_for_author_with_events(
+    let (gate, events) = crate::head_approval::evaluate_with_policy_for_author_with_events(
         &run_gh,
         &context.observation.repo,
         pr.fact.number,
@@ -150,7 +163,8 @@ fn read_head_gate(
         &queue,
         pr.fact.author.as_deref(),
     )
-    .map_err(|error| format!("head approval unreadable: {error}"))
+    .map_err(|error| format!("head approval unreadable: {error}"))?;
+    Ok((gate, events, queue))
 }
 
 #[cfg(all(test, unix))]
@@ -752,7 +766,7 @@ fn same_head_enqueue_refusal(
     })
 }
 
-fn final_enqueue_revalidation(
+pub(super) fn final_enqueue_revalidation(
     context: &MutationApplyContext<'_>,
     observed: &ObservedPr,
     policy: &StewardPolicy,

@@ -3485,7 +3485,29 @@ It observes by default; `--apply` enables exact-head guarded queue admission,
 reruns, and narrowly policy-scoped capacity-preemption mutations. Client-side
 REST direct merge is refused because GitHub cannot atomically bind both complete
 check materialization and the validated base revision; use a server-owned merge
-queue or manual merge instead. Apply mode is restricted by central mutation
+queue or manual merge instead. A base with no merge queue (GitHub offers
+queues only to organization-owned repositories) reports
+`merge_path: server_enforced_exact_head_merge` when GitHub requires a check set
+that includes the approval context (`--approval-context`, default
+`review-verdict`) and that rule is bound to an app (`integration_id`); an
+unbound rule leaves the base `direct_merge_refused_server_enforcement_required`.
+There the steward merges an owned head with `mergePullRequest`
+(`expectedHeadOid` = that head, `MERGE`) through the ordinary `gh`/`ghapp` path,
+only when GitHub reports it `CLEAN`, every required check is green, and the
+exact-head approval gate returns `Approved` (`NotRequired` is refused). Per-PR
+mutations are `merged_exact_head:<sha>`, `waiting_head_approval`, and
+`waiting_required`. It never arms native auto-merge on such a base, because an
+armed request survives a later push by anyone with write access; any armed
+request on an owned PR is disarmed (`auto_merge_disabled:<sha>`) on every
+`--apply` pass, approved or not. The org-queue path never takes this merge.
+The bound rule is satisfied only by a check run carrying that app id (the
+canonical `review-verdict` job, github-actions 15368); an app-less status of
+the same name never satisfies it. Because that job succeeds whenever it posts a
+verdict, the newest same-named commit status must also be `success` when one
+exists: a refusing status makes the head `required_failed`
+(`review-verdict (commit status)`). `--arm-unqueued` reports `not applicable`
+on any base without a merge queue and arms nothing there.
+Apply mode is restricted by central mutation
 authority, durable write-ahead intent, and live revalidation immediately before
 every GitHub write. Transient retry limits are also fenced against GitHub's
 durable `run_attempt`, so losing a controller cache after an accepted rerun
@@ -4127,7 +4149,9 @@ only thing between it and re-arming a queued or ejected head. `src/auto_arm.rs`
 refuses every state the guard refuses (a unit test asserts that agreement), and
 `GHAPP_ALLOW_QUEUE_REARM` is never set by Shipyard. The periodic counterpart is
 `shipyard runner steward --arm-unqueued`, which arms only pull requests the
-steward declines to own. Under `--apply` it takes the central HOLD,
+steward declines to own, and only on a base with a merge queue (on any other
+base it reports `not applicable`: an armed request there survives a later
+push). Under `--apply` it takes the central HOLD,
 `mutation_machine` authority and control lock before arming (a HOLD is reported,
 not a failure), and each `--repo` mints its own token, so it runs from launchd's
 `$HOME`. See
