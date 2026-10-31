@@ -223,6 +223,8 @@ fn stage_rows(run_gh: RunGh<'_>, observation: &super::RepoObservation) -> Vec<St
     let policy = StewardPolicy {
         merge_queue: observation.merge_queue,
         native_auto_merge: observation.allow_auto_merge,
+        auto_merge_approval_context: crate::merge_steward::DEFAULT_AUTO_MERGE_APPROVAL_CONTEXT
+            .to_owned(),
         required_checks: observation.required_checks.clone(),
         opt_out_label: "shipyard:no-auto-merge".to_owned(),
         provenance_blocking_labels: vec![super::DEFAULT_PROVENANCE_BLOCKING_LABEL.to_owned()],

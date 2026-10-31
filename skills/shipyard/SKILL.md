@@ -3485,7 +3485,22 @@ It observes by default; `--apply` enables exact-head guarded queue admission,
 reruns, and narrowly policy-scoped capacity-preemption mutations. Client-side
 REST direct merge is refused because GitHub cannot atomically bind both complete
 check materialization and the validated base revision; use a server-owned merge
-queue or manual merge instead. Apply mode is restricted by central mutation
+queue or manual merge instead. A base with no merge queue (GitHub offers
+queues only to organization-owned repositories) reports
+`merge_path: native_auto_merge_exact_head` when the repository allows
+auto-merge and GitHub requires a non-empty check set that includes the approval
+context (`--auto-merge-approval-context`, default `review-verdict`). There an
+owned, exact-head-approved PR is armed with `enablePullRequestAutoMerge`
+(`expectedHeadOid` = the approved head, `MERGE`) through the ordinary
+`gh`/`ghapp` path, so the queue-arm guard judges it; pending required checks do
+not hold the arm back, failed ones do. Per-PR mutations are
+`auto_merge_enabled:<sha>`, `auto_merge_already_enabled:<sha>`,
+`auto_merge_disabled_head_moved:<sha>` (an arm from before this head arrived is
+disarmed; re-arm waits for a later pass), `waiting_head_approval`, and
+`auto_merge_refused_clean_status:<sha>`: GitHub will not arm an already-mergeable
+PR, and the steward never falls back to a direct merge. Without the approval
+context the base stays `direct_merge_refused_server_enforcement_required`.
+Apply mode is restricted by central mutation
 authority, durable write-ahead intent, and live revalidation immediately before
 every GitHub write. Transient retry limits are also fenced against GitHub's
 durable `run_attempt`, so losing a controller cache after an accepted rerun

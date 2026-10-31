@@ -79,6 +79,7 @@ pub(super) fn apply_repo_plan(
     let policy = StewardPolicy {
         merge_queue: observation.merge_queue,
         native_auto_merge: observation.allow_auto_merge,
+        auto_merge_approval_context: args.auto_merge_approval_context.clone(),
         required_checks: observation.required_checks.clone(),
         opt_out_label: args.opt_out_label.clone(),
         provenance_blocking_labels: args.provenance_blocking_labels.clone(),
@@ -218,11 +219,7 @@ pub(super) fn apply_repo_plan(
             base: args.base.clone(),
             allow_auto_merge: observation.allow_auto_merge,
             merge_queue: observation.merge_queue,
-            merge_path: if observation.merge_queue {
-                "native_queue_exact_head".to_owned()
-            } else {
-                "direct_merge_refused_server_enforcement_required".to_owned()
-            },
+            merge_path: policy.merge_path().to_owned(),
             required_contexts: observation
                 .required_checks
                 .iter()

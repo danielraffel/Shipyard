@@ -51,6 +51,9 @@ pub(super) struct StewardCommandArgs {
     /// Also arm GitHub-native auto-merge on green, unqueued, unarmed pull
     /// requests the steward declines to own. See `native_arm`.
     pub(super) arm_unqueued: bool,
+    /// Required check that reports exact-head approval; with it required
+    /// and no merge queue, owned PRs are admitted by exact-head auto-merge.
+    pub(super) auto_merge_approval_context: String,
     pub(super) wake_owner: bool,
     pub(super) apply: bool,
     pub(super) ledger: Option<PathBuf>,
@@ -1376,6 +1379,7 @@ fn acquire_ledger_lock(path: &Path) -> Result<crate::file_lock::LockedFile, CliF
     })
 }
 
+mod auto_merge_exact_head;
 mod cancellation;
 mod cancellation_recovery;
 mod cancellation_revalidation;

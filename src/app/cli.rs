@@ -2819,8 +2819,9 @@ pub(super) enum RunnerCommand {
     /// Dry-run is the default. `--apply` may enqueue an exact green head,
     /// rerun a bounded transient failure, or cancel only queued runs with a
     /// provably superseded PR/merge-group head. Same-head duplicates are never
-    /// cancelled. Repositories without a server-owned
-    /// merge queue are reported as direct-merge refusals.
+    /// cancelled. Repositories without a server-owned merge queue are admitted
+    /// by exact-head native auto-merge when GitHub requires the approval
+    /// context; otherwise they are reported as direct-merge refusals.
     Steward {
         /// Owner/repo slug. Repeatable; defaults to the current repository.
         #[arg(long)]
@@ -2864,6 +2865,13 @@ pub(super) enum RunnerCommand {
         /// armed, and the queue-arm guard's refusals are honoured.
         #[arg(long = "arm-unqueued")]
         arm_unqueued: bool,
+        /// Required check that reports exact-head approval. On a base with no
+        /// merge queue, owned pull requests are admitted by GitHub-native
+        /// auto-merge pinned to the approved head only when GitHub requires
+        /// this context and the repository allows auto-merge; otherwise they
+        /// stay refused. Never a direct merge.
+        #[arg(long = "auto-merge-approval-context", default_value = "review-verdict")]
+        auto_merge_approval_context: String,
         /// Perform the planned mutations. Without this flag, only audit.
         #[arg(long)]
         apply: bool,
