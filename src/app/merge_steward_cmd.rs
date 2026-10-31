@@ -51,6 +51,9 @@ pub(super) struct StewardCommandArgs {
     /// Also arm GitHub-native auto-merge on green, unqueued, unarmed pull
     /// requests the steward declines to own. See `native_arm`.
     pub(super) arm_unqueued: bool,
+    /// Required check that reports exact-head approval; with it required
+    /// and no merge queue, owned PRs are admitted by exact-head auto-merge.
+    pub(super) approval_context: String,
     pub(super) wake_owner: bool,
     pub(super) apply: bool,
     pub(super) ledger: Option<PathBuf>,
@@ -1381,6 +1384,7 @@ mod cancellation_recovery;
 mod cancellation_revalidation;
 mod cancellation_terminalization;
 mod capacity_cancellation;
+mod exact_head_merge;
 mod ledger;
 mod native_arm;
 mod observation;
@@ -1389,6 +1393,7 @@ pub(super) mod queue_drain;
 mod queue_priority_recovery;
 mod render;
 mod resume_record;
+mod stale_auto_merge;
 mod terminal_handoff;
 pub(super) mod train;
 

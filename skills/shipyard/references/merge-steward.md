@@ -17,10 +17,27 @@ reruns durably, and live-revalidates queued state plus immutable head before
 cancelling a run whose PR or merge-group head is provably superseded.
 Same-head duplicate runs are never cancelled because their unobserved inputs
 may differ. Repositories without a server-owned
-merge queue receive a typed `automatic-merge-refused` decision (exit 10): the REST merge
-endpoint cannot atomically prove complete required-check materialization or
-bind the validated base revision. Use manual merge or enable a native merge
-queue.
+merge queue are admitted only by the server-enforced exact-head merge: a
+`mergePullRequest` bound by `expectedHeadOid`, taken only when GitHub requires
+an app-bound approval check (`--approval-context`, default `review-verdict`) and
+the head is `CLEAN`, all-green and approved. Without that rule the steward
+reports `direct_merge_refused_server_enforcement_required` and merges nothing;
+the REST merge endpoint cannot atomically prove complete required-check
+materialization or bind the validated base revision, so it is never used.
+`shipyard auto-merge` on such a repository still returns a typed
+`automatic-merge-refused` decision (exit 10). Use manual merge, add the bound
+approval rule, or enable a native merge queue.
+
+Apply mode keeps its reads cheap. The census hydrates required-check identities
+only for pull requests that can still reach a check-dependent decision (not
+drafts, queued, conflicting or `DIRTY` rows, except managed-labelled rows, which
+the handoff status needs), four at a time. When the GraphQL list is unavailable,
+the REST fallback reads `mergeable_state` per candidate from `pulls/{n}`, bound
+to the listed head; an unreadable or moved head stays `UNKNOWN` and is refused.
+For an arm or merge candidate, exact-head approval is checked before the live
+single-pull-request revalidation, so an unapproved head costs no extra read, and
+that live read requests every census field (including `author`), so a
+fleet-authored pull request keeps its management classification.
 
 The transient retry ceiling is fenced twice: the local ledger records intent
 before mutation, and GitHub's durable `run_attempt` must still be within the

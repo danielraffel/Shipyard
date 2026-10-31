@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>com.danielraffel.shipyard.cause-observer</string>
+<key>ProgramArguments</key><array>
+<string>@SHIPYARD@</string><string>--cwd</string><string>@CWD@</string>
+<string>--json</string><string>cause</string><string>record</string>
+<string>--repo</string><string>@REPO@</string><string>--workflow</string><string>@WORKFLOW@</string>
+<string>--dir</string><string>@DIR@</string><string>--base</string><string>@BASE@</string>
+</array>
+<key>WorkingDirectory</key><string>@CWD@</string>
+<key>RunAtLoad</key><true/><key>StartInterval</key><integer>@INTERVAL@</integer>
+<key>ProcessType</key><string>Background</string><key>LowPriorityIO</key><true/>
+<key>StandardOutPath</key><string>@LOG@</string><key>StandardErrorPath</key><string>@LOG@</string>
+<key>EnvironmentVariables</key><dict>
+<key>HOME</key><string>@HOME@</string>
+<key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:@HOME@/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+</dict>
+</dict></plist>

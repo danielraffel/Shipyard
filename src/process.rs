@@ -14,7 +14,7 @@ const TERMINATION_REAP_TIMEOUT: Duration = Duration::from_secs(2);
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_BOUNDED_OUTPUT_BYTES: u64 = 8 * 1024 * 1024;
 #[cfg(unix)]
-const DEADLINE_TEARDOWN_BUDGET: Duration = Duration::from_millis(500);
+pub(crate) const DEADLINE_TEARDOWN_BUDGET: Duration = Duration::from_millis(500);
 
 /// Failure from a descendant-safe command observation bounded by one deadline.
 #[derive(Debug)]
