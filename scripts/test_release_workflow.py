@@ -340,17 +340,20 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertLess(restore.index('[ ! -e "$KEYCHAIN_STATE" ]'),
                         restore.index("ci_macos_signing_keychain.py restore"))
 
-    def test_auto_release_heals_stuck_drafts_without_starving_tagging(self) -> None:
+    def test_heal_is_its_own_workflow_and_auto_release_is_untouched(self) -> None:
         import yaml
 
-        workflow = yaml.safe_load(AUTO_RELEASE_WORKFLOW.read_text(encoding="utf-8"))
+        auto = AUTO_RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        self.assertNotIn("schedule", auto)
+        self.assertNotIn("heal", auto)
+        self.assertNotIn("github.event_name", auto)
+        workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "release-heal.yml").read_text(encoding="utf-8"))
         triggers = workflow.get(True) or workflow.get("on")
-        self.assertIn("schedule", triggers)
-        group = workflow["concurrency"]["group"]
-        self.assertIn("github.event_name == 'schedule'", group)
-        self.assertEqual(workflow["jobs"]["tag"]["if"], "github.event_name != 'schedule'")
+        self.assertEqual(set(triggers), {"push", "schedule", "workflow_dispatch"})
+        self.assertEqual(workflow["concurrency"], {"group": "release-heal", "cancel-in-progress": False})
+        self.assertEqual(workflow["permissions"], {})
         heal = workflow["jobs"]["heal"]
-        self.assertEqual(heal["permissions"]["actions"], "write")
+        self.assertEqual(heal["permissions"], {"actions": "write", "contents": "write"})
         run_steps = [s["run"] for s in heal["steps"] if "run" in s]
         self.assertIn("python3 scripts/release_draft_heal.py", run_steps)
 

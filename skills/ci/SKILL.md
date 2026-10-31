@@ -961,7 +961,7 @@ v0.245.0 published with no attestation after one transient Sigstore TLS error,
 and every host's fleet-update refused it ("no acceptable build-provenance
 attestation"). If a release is stuck as a draft, rerun the failed
 `sign-and-upload-macos` job; do not publish it by hand without an attestation.
-This recovery is automatic: the `heal` job in `auto-release.yml` (every main
+This recovery is automatic: the `release-heal.yml` workflow (every main
 push and every 30 minutes) re-runs the failed jobs of the current version's
 release run once it has been finished for 20 minutes, up to 3 attempts
 (`scripts/release_draft_heal.py`), and fails with the failing step names when

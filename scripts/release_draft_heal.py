@@ -7,7 +7,9 @@ cannot reach the Rust distribution servers, a Sigstore blip) nothing retries
 it and the draft sits forever. This script runs from `auto-release.yml` on a
 schedule and on every main push. For the release of the current Cargo version
 it either does nothing, re-runs the failed jobs of the release run (bounded by
-MAX_ATTEMPTS), or exits non-zero with the exact reason. It never edits the
+MAX_ATTEMPTS), or exits non-zero with the exact reason. The attempt cap means an exhausted run fails every scheduled pass until a
+newer release run exists; that is deliberate, a stuck draft stays visible.
+It never edits the
 release itself: publication stays inside the pipeline that attests the DMG.
 """
 
@@ -25,7 +27,7 @@ from pathlib import Path
 
 GRACE_MINUTES = 20
 MAX_ATTEMPTS = 3
-FAILED = {"failure", "cancelled", "timed_out", "startup_failure"}
+FAILED = {"failure", "timed_out", "startup_failure"}
 
 
 @dataclass(frozen=True)
@@ -73,6 +75,14 @@ def decide(
             "the publish step did not publish it (check the 'Publish the attested release' step)",
             run["id"],
         )
+    if conclusion == "cancelled":
+        # A maintainer may have cancelled on purpose, and a run superseded by
+        # the release concurrency group is cancelled too; neither is resumed.
+        return Decision(
+            "fail",
+            f"release run {run['id']} was cancelled; re-run it by hand or delete the draft",
+            run["id"],
+        )
     if conclusion in FAILED:
         attempt = int(run.get("run_attempt") or 1)
         if attempt >= max_attempts:
@@ -107,7 +117,7 @@ def _failed_steps(repo: str, run_id: int) -> str:
     jobs = json.loads(_gh("api", f"repos/{repo}/actions/runs/{run_id}/jobs?per_page=100"))
     parts = []
     for job in jobs.get("jobs", []):
-        if job.get("conclusion") in FAILED:
+        if job.get("conclusion") in FAILED | {"cancelled"}:
             steps = [s["name"] for s in job.get("steps", []) if s.get("conclusion") in FAILED]
             parts.append(f"{job['name']} -> {', '.join(steps) or job['conclusion']}")
     return "; ".join(parts)
@@ -133,7 +143,11 @@ def main() -> int:
     decision = decide(release, run, now=datetime.now(timezone.utc), signing_enabled=signing, failed_steps=steps)
     print(f"{tag}: {decision.action}: {decision.reason}")
     if decision.action == "rerun" and not args.dry_run:
-        _gh("api", "-X", "POST", f"repos/{repo}/actions/runs/{decision.run_id}/rerun-failed-jobs")
+        try:
+            _gh("api", "-X", "POST", f"repos/{repo}/actions/runs/{decision.run_id}/rerun-failed-jobs")
+        except subprocess.CalledProcessError as exc:
+            print(f"rerun request was refused (likely another heal won the race): {exc.stderr.strip()}", file=sys.stderr)
+            return 0
         print(f"re-ran failed jobs of run {decision.run_id}")
     if decision.action == "fail":
         print(f"::error title=Release {tag} stuck as draft::{decision.reason}")

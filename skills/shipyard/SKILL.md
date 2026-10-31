@@ -811,7 +811,7 @@ v0.245.0 published with no attestation after one transient Sigstore TLS error,
 and every host's fleet-update refused it ("no acceptable build-provenance
 attestation"). If a release is stuck as a draft, rerun the failed
 `sign-and-upload-macos` job; do not publish it by hand without an attestation.
-That rerun is automatic: the `heal` job in `auto-release.yml` (main pushes and
+That rerun is automatic: the `release-heal.yml` workflow (main pushes and
 every 30 minutes) re-runs the failed jobs of the current version's release run
 after a 20 minute grace, at most 3 attempts, then fails naming the failing
 steps (`scripts/release_draft_heal.py`). The signing job's Rust install retries

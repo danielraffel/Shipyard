@@ -41,8 +41,21 @@ class DecideTests(unittest.TestCase):
         self.assertEqual((d.action, d.run_id), ("rerun", 7))
         self.assertIn("Install Rust", d.reason)
 
-    def test_cancelled_reruns_too(self) -> None:
-        self.assertEqual(decide(run_=run("cancelled")).action, "rerun")
+    def test_cancelled_is_never_resumed(self) -> None:
+        d = decide(run_=run("cancelled"))
+        self.assertEqual(d.action, "fail")
+        self.assertIn("was cancelled", d.reason)
+
+    def test_timed_out_and_startup_failure_rerun(self) -> None:
+        for c in ("timed_out", "startup_failure"):
+            self.assertEqual(decide(run_=run(c)).action, "rerun")
+
+    def test_heal_only_calls_rerun_write_endpoint(self) -> None:
+        src = (ROOT / "scripts" / "release_draft_heal.py").read_text()
+        self.assertEqual(src.count('"-X", "POST"'), 1)
+        self.assertIn("rerun-failed-jobs", src)
+        for bad in ("-X\", \"PATCH", "/git/refs", "releases/", '"DELETE"'):
+            self.assertNotIn(bad, src)
 
     def test_attempts_are_bounded_and_fail_loudly(self) -> None:
         d = decide(run_=run(attempt=3), failed_steps="sign -> Install Rust")

@@ -331,9 +331,9 @@ The script:
 
 A release stays a draft until the last `release.yml` job attests and publishes
 the DMG. If that run fails (for example the self-hosted macOS runner cannot
-download the Rust toolchain), the `heal` job in `auto-release.yml` runs on every
+download the Rust toolchain), the `release-heal.yml` workflow runs on every
 push to `main` and every 30 minutes. For the current `Cargo.toml` version it
-re-runs the failed jobs of the release run once the run has been finished for
+re-runs the failed jobs of the release run (never a cancelled one) once the run has been finished for
 20 minutes, at most 3 attempts in total. When attempts are exhausted, or a
 successful run still left a draft, the job fails and prints the failing steps.
 It only acts when `CI_MACOS_SIGNING_ENABLED=true` and never publishes or edits

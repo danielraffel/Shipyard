@@ -9,24 +9,14 @@ name: Auto-Release on CLI Version Bump
 # --release-chain` can verify that actions/checkout accepts
 # RELEASE_BOT_TOKEN. A manual dispatch with no version movement is a
 # no-op after checkout.
-#
-# The same workflow heals a stuck draft: release.yml leaves a release as a draft
-# until its final job attests and publishes the DMG, and a failure there (a
-# runner that cannot reach static.rust-lang.org) used to strand it silently.
-# The `heal` job runs on every main push and every 30 minutes, and re-runs the
-# failed jobs of the current version's release run, bounded, or fails loudly.
 
 on:
   push:
     branches: [main]
-  schedule:
-    - cron: "17,47 * * * *"
   workflow_dispatch:
 
-# Tagging runs must never be replaced by a scheduled heal run (a pending run is
-# replaced by a newer one in the same group), so heal runs get their own group.
 concurrency:
-  group: auto-release-${{ github.event_name == 'schedule' && 'heal' || 'tag' }}
+  group: auto-release
   cancel-in-progress: false
 
 permissions:
@@ -36,7 +26,6 @@ jobs:
   tag:
     runs-on: ubuntu-latest
     name: Tag CLI version bumps
-    if: github.event_name != 'schedule'
 
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
@@ -129,21 +118,3 @@ jobs:
           git tag -a "$tag" -m "Release $tag (automated by auto-release.yml)"
           git push origin "$tag"
           echo "created $tag"
-
-  heal:
-    runs-on: ubuntu-latest
-    name: Recover a stuck draft release
-    # contents: write only so draft releases are listed; this job never edits one.
-    permissions:
-      actions: write
-      contents: write
-    steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-        with:
-          persist-credentials: false
-
-      - name: Re-run a failed release run or fail with the reason
-        env:
-          GH_TOKEN: ${{ github.token }}
-          CI_MACOS_SIGNING_ENABLED: ${{ vars.CI_MACOS_SIGNING_ENABLED }}
-        run: python3 scripts/release_draft_heal.py
