@@ -584,6 +584,46 @@ fn an_absent_context_behind_a_running_job_is_pending_not_never_ran() {
     );
 }
 
+/// A review-verdict job that is still running is pending, not failed: with
+/// no gate read the check token (`required_pending`) must stand instead of a
+/// synthesized `required_failed:review-verdict`.
+#[test]
+fn a_running_review_verdict_stays_pending_without_a_gate_read() {
+    let policy = app_bound_policy(&["macos", "review-verdict"]);
+    let pr = pr_with(
+        1092,
+        &[],
+        "CLEAN",
+        &json!([
+            app_check(
+                "macos",
+                "COMPLETED",
+                Some("SUCCESS"),
+                "2026-10-31T18:00:00Z"
+            ),
+            app_check(
+                "review-verdict",
+                "IN_PROGRESS",
+                None,
+                "2026-10-31T18:40:16Z"
+            ),
+        ]),
+    );
+    let decision = classify_pr(&pr.fact, &policy, &BTreeMap::new());
+    assert!(matches!(decision, StewardDecision::WaitingRequired { .. }));
+    let facts = RowFacts {
+        pr: &pr.fact,
+        decision: &decision,
+        mutation: None,
+        error: None,
+        approval: GateRead::Unread,
+        enqueued_at: None,
+        ejection: None,
+    };
+    let (stall, _) = classify(&facts, &policy);
+    assert_eq!(stall.blocked_on, "required_pending");
+}
+
 /// danielraffel/Shipyard#969 read `required_failed:review-verdict` while
 /// the real cause was its APPROVE's signer, which the base does not count.
 /// When the approval context is the only red required context, the approval

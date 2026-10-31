@@ -256,11 +256,11 @@ fn classify_token(facts: &RowFacts<'_>, policy: &StewardPolicy) -> (Stall, Since
             SinceHint::HeadPushed,
         ),
         StewardDecision::WaitingRequired { contexts } => {
-            approval_context_only(facts, policy, contexts)
+            approval_context_only(facts, policy, contexts, false)
                 .unwrap_or_else(|| waiting_required(pr, policy, contexts))
         }
         StewardDecision::RequiredFailed { contexts } => {
-            approval_context_only(facts, policy, contexts).unwrap_or_else(|| {
+            approval_context_only(facts, policy, contexts, true).unwrap_or_else(|| {
                 let since = latest_check_time(pr, policy, contexts);
                 dated(
                     format!("required_failed:{}", context_names(policy, contexts)),
@@ -372,11 +372,13 @@ fn ejected(cause: &str, at: Option<String>, green_since: Option<String>) -> (Sta
 
 /// When every failing or pending required context is the approval context
 /// (`review-verdict`), the approval is the blocker: name it. Without a gate
-/// read for this head, keep the check token and say so.
+/// read for this head, keep the check token and say so (`failed` is true only
+/// for a `RequiredFailed` decision).
 fn approval_context_only(
     facts: &RowFacts<'_>,
     policy: &StewardPolicy,
     contexts: &[String],
+    failed: bool,
 ) -> Option<(Stall, SinceHint)> {
     if !only_approval_contexts(policy, contexts) {
         return None;
@@ -385,6 +387,9 @@ fn approval_context_only(
     match facts.approval {
         GateRead::Refused(blocker) => Some(approval_blocked(blocker, since)),
         GateRead::Admits => None,
+        // A verdict job still running is pending, not failed: keep the check
+        // token (`required_pending`) rather than synthesizing a failure.
+        GateRead::Unread if !failed => None,
         GateRead::Unread => Some(dated(
             format!("required_failed:{}", context_names(policy, contexts)),
             since,
