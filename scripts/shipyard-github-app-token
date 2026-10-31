@@ -51,6 +51,8 @@ OWNER_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
 REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 INSTALLATION_ID_RE = re.compile(r"^[1-9][0-9]*$")
 PERMISSION_NAME_PATTERN = re.compile(r"^[a-z][a-z_]*$")
+INSTALLATION_SCOPE = "installation"
+REPOSITORY_SCOPE = "repository"
 RETRYABLE_HTTP_STATUS = frozenset({429, 502, 503, 504})
 API_RETRY_DELAYS_SECONDS = (1, 2, 3)
 WRITER_DOMAIN_LOCK_NAME = ".sandbox-writer-domain.lock"
@@ -79,11 +81,12 @@ def main() -> int:
         api_url = args.api_url.rstrip("/")
         validate_private_key(key_path)
         scope = token_scope(args.repo, args.scope_repository, args.permission)
-        # A scoped token is minted fresh every time: the cache is keyed by
-        # repository only, so it could hand back a broader token.
+        cache_scope = token_cache_scope(scope)
+        # A permission-narrowed token is minted fresh every time; the other
+        # two scopes are cached in separate entries, never in each other's.
         cache_dir = (
             Path(args.cache_dir).expanduser()
-            if args.cache_dir and scope is None
+            if args.cache_dir and cache_scope is not None
             else None
         )
         validate_cache_platform(cache_dir, sys.platform)
@@ -94,6 +97,7 @@ def main() -> int:
             args.repo,
             args.installation_id,
             os.environ.get("SHIPYARD_GITHUB_APP_INSTALLATION_ID"),
+            cache_scope or INSTALLATION_SCOPE,
         )
         if cached is not None:
             print(json.dumps(public_token_payload(cached), separators=(",", ":")))
@@ -129,6 +133,7 @@ def main() -> int:
                 "api_url": api_url,
                 "installation_id": installation_id,
                 "repository": args.repo,
+                "scope": cache_scope or INSTALLATION_SCOPE,
             }
         )
         store_cached_token(
@@ -138,6 +143,7 @@ def main() -> int:
             args.repo,
             installation_id,
             cache_payload,
+            cache_scope or INSTALLATION_SCOPE,
         )
         print(json.dumps(output, separators=(",", ":")))
         return 0
@@ -192,7 +198,8 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "Restrict the token to the --repo repository instead of every "
-            "repository in the installation. Never cached."
+            "repository in the installation. Cached apart from unscoped "
+            "tokens; never cached together with --permission."
         ),
     )
     parser.add_argument(
@@ -371,10 +378,14 @@ def cache_route(
     repo: str | None,
     explicit_installation_id: str | None,
     environment_installation_id: str | None,
+    scope: str = INSTALLATION_SCOPE,
 ) -> tuple[str, str | None]:
     if repo is not None:
         validate_repo_slug(repo)
-        return f"repo:{repo}", explicit_installation_id
+        # The unscoped route keeps its historical key, so existing entries
+        # stay valid; a repository-scoped token gets its own entry.
+        suffix = "" if scope == INSTALLATION_SCOPE else f"\0scope={scope}"
+        return f"repo:{repo}{suffix}", explicit_installation_id
     installation_id = explicit_installation_id or environment_installation_id
     if not installation_id or not INSTALLATION_ID_RE.fullmatch(installation_id):
         raise HelperError(
@@ -527,6 +538,7 @@ def load_cached_token(
     repo: str | None,
     explicit_installation_id: str | None,
     environment_installation_id: str | None,
+    scope: str = INSTALLATION_SCOPE,
 ) -> dict[str, Any] | None:
     if cache_dir is None:
         return None
@@ -534,6 +546,7 @@ def load_cached_token(
         repo,
         explicit_installation_id,
         environment_installation_id,
+        scope,
     )
     if not ensure_private_cache_dir(cache_dir, create=False):
         return None
@@ -571,6 +584,8 @@ def load_cached_token(
         or payload.get("repository") != repo
     ):
         raise HelperError("token cache provenance does not match the requested repository")
+    if payload.get("scope", INSTALLATION_SCOPE) != scope:
+        raise HelperError("token cache scope does not match the requested scope")
     cached_installation_id = payload.get("installation_id")
     if not isinstance(cached_installation_id, str):
         raise HelperError("token cache installation provenance is missing")
@@ -606,10 +621,13 @@ def store_cached_token(
     repo: str | None,
     installation_id: str,
     payload: dict[str, Any],
+    scope: str = INSTALLATION_SCOPE,
 ) -> None:
     if cache_dir is None:
         return
-    route, _ = cache_route(repo, installation_id if repo is None else None, None)
+    route, _ = cache_route(
+        repo, installation_id if repo is None else None, None, scope
+    )
     with protected_cache_writer_lease(cache_dir):
         ensure_private_cache_dir(cache_dir)
         destination = cache_file(cache_dir, api_url, app_id, route)
@@ -653,7 +671,9 @@ def token_scope(
     if not OWNER_RE.fullmatch(owner) or not REPOSITORY_RE.fullmatch(name):
         raise HelperError("--scope-repository requires --repo owner/name")
     if not permissions:
-        raise HelperError("--scope-repository requires at least one --permission")
+        # Repository only: GitHub grants every App permission, for this one
+        # repository.
+        return {"repositories": [name]}
     granted: dict[str, str] = {}
     for permission in permissions:
         permission_name, separator, level = permission.partition("=")
@@ -668,6 +688,15 @@ def token_scope(
             )
         granted[permission_name] = level
     return {"repositories": [name], "permissions": granted}
+
+
+def token_cache_scope(scope: dict[str, Any] | None) -> str | None:
+    """The cache partition for a request, or None when it must not be cached."""
+    if scope is None:
+        return INSTALLATION_SCOPE
+    if "permissions" in scope:
+        return None
+    return REPOSITORY_SCOPE
 
 
 def create_installation_token(
@@ -691,19 +720,33 @@ def check_scoped_token(payload: dict[str, Any], scope: dict[str, Any]) -> None:
     """Refuse a token broader than the request: one repository, and no
     permission beyond those asked for plus the implicit metadata read."""
     repositories = payload.get("repositories")
-    names = (
-        [item.get("name") for item in repositories if isinstance(item, dict)]
-        if isinstance(repositories, list)
-        else None
-    )
-    allowed = {"metadata": "read", **scope["permissions"]}
+    names = None
+    if isinstance(repositories, list):
+        # Do not silently discard malformed entries. A response that cannot be
+        # proven to contain exactly the requested repositories must fail closed
+        # before its token is handed to a caller.
+        parsed_names: list[str] = []
+        if all(
+            isinstance(item, dict)
+            and isinstance(item.get("name"), str)
+            and bool(item["name"].strip())
+            for item in repositories
+        ):
+            parsed_names = [item["name"] for item in repositories]
+            names = parsed_names
     permissions = payload.get("permissions")
+    if "permissions" in scope:
+        allowed = {"metadata": "read", **scope["permissions"]}
+        broader = not isinstance(permissions, dict) or any(
+            allowed.get(name) != level for name, level in permissions.items()
+        )
+    else:
+        broader = False
     if (
         names is None
         or [name.lower() for name in names if isinstance(name, str)]
         != [name.lower() for name in scope["repositories"]]
-        or not isinstance(permissions, dict)
-        or any(allowed.get(name) != level for name, level in permissions.items())
+        or broader
     ):
         raise HelperError(
             "GitHub returned a token broader than the requested repository and permissions"

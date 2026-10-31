@@ -184,7 +184,9 @@ fn collect_head_evidence(
     number: u64,
     base: &mut String,
 ) -> (Option<HeadEvidence>, u32, Vec<String>) {
-    let actions = crate::cloud::GitHubActions::from_loaded_config(cwd, config);
+    let actions = crate::cloud::GitHubActions::from_loaded_config(cwd, config)
+        // Route the App token to the repository asked about, not the checkout's.
+        .with_repo_override(repo);
     let mut notes = Vec::new();
     let mut calls = 0u32;
 

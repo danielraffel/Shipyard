@@ -39,8 +39,9 @@ pub(super) fn release_bot_command<W: Write>(
 ) -> Result<ExitCode, CliFailure> {
     let config = LoadedConfig::load_from_cwd(mode, cwd)
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let route = ReleaseBotGh::configured(&config)?;
     release_bot_command_with(
-        command, mode, &config, cwd, state_root, json_mode, stdout, None,
+        command, mode, &config, cwd, state_root, json_mode, stdout, &route,
     )
 }
 
@@ -53,7 +54,7 @@ fn release_bot_command_with<W: Write>(
     state_root: &Path,
     json_mode: bool,
     stdout: &mut W,
-    gh_command: Option<&Path>,
+    gh_command: &ReleaseBotGh<'_>,
 ) -> Result<ExitCode, CliFailure> {
     match command {
         ReleaseBotCommand::Status { siblings } => {
@@ -128,7 +129,7 @@ struct ReleaseBotState {
 fn detect_state(
     repo_slug: &str,
     siblings: &[String],
-    gh_command: Option<&Path>,
+    gh_command: &ReleaseBotGh<'_>,
 ) -> ReleaseBotState {
     let secrets = list_secrets(repo_slug, gh_command);
     let (secret_present, secret_updated_at) = secrets
@@ -259,7 +260,7 @@ fn setup<W: Write>(
     stdout: &mut W,
     repo_slug: &str,
     options: &SetupOptions<'_>,
-    gh_command: Option<&Path>,
+    gh_command: &ReleaseBotGh<'_>,
 ) -> Result<ExitCode, CliFailure> {
     let state = detect_state(repo_slug, options.siblings, gh_command);
     for line in describe_state(&state) {
@@ -339,7 +340,7 @@ fn hook_install<W: Write>(
     tag_pattern: &str,
     shipyard_version: Option<&str>,
     json_mode: bool,
-    gh_command: Option<&Path>,
+    gh_command: &ReleaseBotGh<'_>,
 ) -> Result<ExitCode, CliFailure> {
     let hook_config = load_hook_config(config);
     let shipyard_version = if let Some(shipyard_version) = shipyard_version {
@@ -434,9 +435,10 @@ fn hook_install<W: Write>(
 fn ensure_runner_label(
     repo_slug: &str,
     label: &str,
-    gh_command: Option<&Path>,
+    gh_command: &ReleaseBotGh<'_>,
 ) -> Result<(), CliFailure> {
-    let output = gh(gh_command)
+    let output = gh(gh_command, repo_slug)
+        .map_err(|error| CliFailure::new(1, error))?
         .args([
             "api",
             &format!("repos/{repo_slug}/actions/runners"),
@@ -1321,7 +1323,7 @@ fn wait_for_required_pr_checks(cwd: &Path, pr: u64) -> Result<(), String> {
 }
 
 fn required_pr_check_state(cwd: &Path, pr: u64) -> Result<RequiredCheckState, String> {
-    let output = gh(None)
+    let output = ambient_gh()
         .args([
             "pr",
             "checks",
@@ -1640,8 +1642,9 @@ fn watched_diffs(cwd: &Path, paths: &[String]) -> Vec<String> {
     diffed
 }
 
-fn list_secrets(repo_slug: &str, gh_command: Option<&Path>) -> Option<Vec<Value>> {
-    let output = gh(gh_command)
+fn list_secrets(repo_slug: &str, gh_command: &ReleaseBotGh<'_>) -> Option<Vec<Value>> {
+    let output = gh(gh_command, repo_slug)
+        .ok()?
         .args([
             "api",
             &format!("repos/{repo_slug}/actions/secrets"),
@@ -1656,8 +1659,13 @@ fn list_secrets(repo_slug: &str, gh_command: Option<&Path>) -> Option<Vec<Value>
     data.get("secrets")?.as_array().cloned()
 }
 
-fn last_workflow_run(repo_slug: &str, workflow: &str, gh_command: Option<&Path>) -> Option<Value> {
-    let output = gh(gh_command)
+fn last_workflow_run(
+    repo_slug: &str,
+    workflow: &str,
+    gh_command: &ReleaseBotGh<'_>,
+) -> Option<Value> {
+    let output = gh(gh_command, repo_slug)
+        .ok()?
         .args([
             "run",
             "list",
@@ -1684,9 +1692,10 @@ fn last_workflow_run(repo_slug: &str, workflow: &str, gh_command: Option<&Path>)
 fn detect_checkout_auth_failure(
     repo_slug: &str,
     run_id: u64,
-    gh_command: Option<&Path>,
+    gh_command: &ReleaseBotGh<'_>,
 ) -> Option<String> {
-    let output = gh(gh_command)
+    let output = gh(gh_command, repo_slug)
+        .ok()?
         .args([
             "run",
             "view",
@@ -1705,8 +1714,12 @@ fn detect_checkout_auth_failure(
         .then(|| String::from("auth"))
 }
 
-fn set_secret(repo_slug: &str, token: &str, gh_command: Option<&Path>) -> Result<(), CliFailure> {
-    let mut command = gh(gh_command);
+fn set_secret(
+    repo_slug: &str,
+    token: &str,
+    gh_command: &ReleaseBotGh<'_>,
+) -> Result<(), CliFailure> {
+    let mut command = gh(gh_command, repo_slug).map_err(|error| CliFailure::new(1, error))?;
     command.args([
         "secret",
         "set",
@@ -1744,10 +1757,10 @@ fn set_secret(repo_slug: &str, token: &str, gh_command: Option<&Path>) -> Result
     }
 }
 
-fn verify_token(repo_slug: &str, gh_command: Option<&Path>) -> Result<String, String> {
+fn verify_token(repo_slug: &str, gh_command: &ReleaseBotGh<'_>) -> Result<String, String> {
     let baseline = last_workflow_run(repo_slug, "auto-release.yml", gh_command)
         .and_then(|run| run.get("databaseId").and_then(Value::as_u64));
-    let dispatch = gh(gh_command)
+    let dispatch = gh(gh_command, repo_slug)?
         .args([
             "workflow",
             "run",
@@ -1863,7 +1876,7 @@ fn run_git_owned_with_date(cwd: &Path, args: &[String], date: &str) -> Result<()
 // Run `gh` in `cwd` via shipyard's ambient GhClient (same auth path as
 // src/pr.rs). Used by push_via_pr to open, watch, and enqueue the changelog PR.
 fn run_gh(cwd: &Path, args: &[&str]) -> Result<(), String> {
-    let output = gh(None)
+    let output = ambient_gh()
         .args(args)
         .current_dir(cwd)
         .output()
@@ -1880,7 +1893,7 @@ fn run_gh(cwd: &Path, args: &[&str]) -> Result<(), String> {
 }
 
 fn run_gh_json(cwd: &Path, args: &[&str]) -> Result<Value, String> {
-    let output = gh(None)
+    let output = ambient_gh()
         .args(args)
         .current_dir(cwd)
         .output()
@@ -1896,11 +1909,77 @@ fn run_gh_json(cwd: &Path, args: &[&str]) -> Result<Value, String> {
         .map_err(|error| format!("gh {} returned malformed JSON: {error}", args.join(" ")))
 }
 
-fn gh(gh_command: Option<&Path>) -> Command {
+/// How the release-bot status, setup and install commands reach GitHub. On a
+/// host this is the configured client (the Shipyard App token on the fleet),
+/// routed to the repository each call names, so none of them needs the
+/// owner's `gh` login. Tests pass a fake `gh` and no token.
+pub(super) struct ReleaseBotGh<'a> {
+    client: Option<GhClient>,
+    binary: Option<&'a Path>,
+}
+
+impl ReleaseBotGh<'_> {
+    fn configured(config: &LoadedConfig) -> Result<Self, CliFailure> {
+        let client = GhClient::from_loaded_config(config)
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        Ok(Self {
+            client: Some(client),
+            binary: None,
+        })
+    }
+}
+
+#[cfg(test)]
+impl<'a> ReleaseBotGh<'a> {
+    /// No token and the ambient `gh`, for tests that never reach GitHub.
+    fn fake_none() -> Self {
+        Self {
+            client: None,
+            binary: None,
+        }
+    }
+
+    fn fake(binary: &'a Path) -> Self {
+        Self {
+            client: None,
+            binary: Some(binary),
+        }
+    }
+}
+
+/// `gh` for a call against `repo_slug`, carrying that repository's token.
+fn gh(route: &ReleaseBotGh<'_>, repo_slug: &str) -> Result<Command, String> {
+    let Some(client) = &route.client else {
+        return Ok(GhClient::ambient()
+            .prepare_command(
+                Path::new("."),
+                route.binary,
+                GhSupervision::Unsupervised,
+                GhAuthPolicy::AmbientOnly,
+            )
+            .expect("ambient gh command preparation should not fail"));
+    };
+    client
+        .clone()
+        .with_repo_override(repo_slug)
+        .and_then(|client| {
+            client.prepare_command(
+                Path::new("."),
+                route.binary,
+                GhSupervision::Unsupervised,
+                GhAuthPolicy::Default,
+            )
+        })
+        .map_err(|error| format!("GitHub auth for {repo_slug}: {error}"))
+}
+
+// The post-tag hook's PR route runs in the release workflow, where `gh`
+// authenticates from the workflow's own environment.
+fn ambient_gh() -> Command {
     GhClient::ambient()
         .prepare_command(
             Path::new("."),
-            gh_command,
+            None,
             GhSupervision::Unsupervised,
             GhAuthPolicy::AmbientOnly,
         )
@@ -2208,7 +2287,7 @@ fn main() {
             "shipyard-v*",
             Some("v0.50.0"),
             true,
-            None,
+            &ReleaseBotGh::fake_none(),
         )
         .expect("hook install");
 
@@ -2251,7 +2330,7 @@ workflow_shipyard_version = "latest"
             "v*",
             None,
             false,
-            None,
+            &ReleaseBotGh::fake_none(),
         )
         .expect("default install");
         assert!(
@@ -2270,7 +2349,7 @@ workflow_shipyard_version = "latest"
             "v*",
             None,
             false,
-            None,
+            &ReleaseBotGh::fake_none(),
         )
         .expect("configured install");
         assert!(
@@ -2286,7 +2365,7 @@ workflow_shipyard_version = "latest"
             "v*",
             Some("v1.2.3"),
             false,
-            None,
+            &ReleaseBotGh::fake_none(),
         )
         .expect("explicit install");
         assert!(
@@ -2304,7 +2383,7 @@ workflow_shipyard_version = "latest"
             "v*",
             Some("2.3.4"),
             false,
-            None,
+            &ReleaseBotGh::fake_none(),
         )
         .expect("explicit version overrides invalid lower-precedence config");
         assert!(
@@ -2333,7 +2412,7 @@ workflow_shipyard_version = "latest"
                 "v*",
                 Some(invalid),
                 false,
-                None,
+                &ReleaseBotGh::fake_none(),
             )
             .expect_err("invalid version");
             assert!(error.message().contains("exact stable semantic version"));
@@ -2351,7 +2430,7 @@ workflow_shipyard_version = "latest"
             "v*",
             None,
             false,
-            None,
+            &ReleaseBotGh::fake_none(),
         )
         .expect_err("invalid configured version");
         assert!(!temp.path().join(".github").exists());
@@ -2366,7 +2445,7 @@ workflow_shipyard_version = "latest"
             "v*",
             None,
             false,
-            None,
+            &ReleaseBotGh::fake_none(),
         )
         .expect_err("non-string configured version");
         assert!(error.message().contains("must be a string"));
@@ -2486,7 +2565,7 @@ workflow_shipyard_version = "latest"
             "v*",
             Some(CHECKOUT_SHIPYARD_VERSION),
             false,
-            None,
+            &ReleaseBotGh::fake_none(),
         )
         .expect_err("no Cargo.toml");
         assert!(
@@ -2508,7 +2587,7 @@ workflow_shipyard_version = "latest"
             "v*",
             Some(CHECKOUT_SHIPYARD_VERSION),
             false,
-            None,
+            &ReleaseBotGh::fake_none(),
         )
         .expect_err("another package");
         assert!(!temp.path().join(".github").exists());
@@ -2525,7 +2604,7 @@ workflow_shipyard_version = "latest"
             "v*",
             Some(CHECKOUT_SHIPYARD_VERSION),
             false,
-            None,
+            &ReleaseBotGh::fake_none(),
         )
         .expect("shipyard checkout");
         let workflow = fs::read_to_string(
@@ -2604,7 +2683,7 @@ workflow_shipyard_version = "latest"
             "v*",
             Some("v0.79.0"),
             true,
-            Some(&gh),
+            &ReleaseBotGh::fake(&gh),
         )
         .expect("install");
         let workflow = fs::read_to_string(
@@ -2968,11 +3047,52 @@ enabled = true
 
     #[cfg(unix)]
     #[test]
+    fn configured_route_uses_the_app_token_for_each_named_repository() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let helper = temp.path().join("token-helper");
+        write_executable(
+            &helper,
+            "#!/bin/sh\nprintf '{\"token\":\"ghs_for_%s\",\"expires_at\":\"2099-01-01T00:00:00Z\"}' \"$(printf '%s' \"$1\" | tr / _)\"\n",
+        );
+        let log = temp.path().join("gh.log");
+        let gh_binary = temp.path().join("gh");
+        write_executable(
+            &gh_binary,
+            &format!(
+                "#!/bin/sh\nprintf '%s %s\\n' \"$GH_TOKEN\" \"$*\" >> '{}'\nprintf '{{\"secrets\":[]}}'\n",
+                log.display()
+            ),
+        );
+        let config = config_from_toml(&format!(
+            "[github.auth]\nsource = \"command\"\ntoken_command = [\"{}\", \"{{repo_slug}}\"]\n",
+            helper.display()
+        ));
+        let route = ReleaseBotGh {
+            client: Some(GhClient::from_loaded_config(&config).expect("client")),
+            binary: Some(&gh_binary),
+        };
+
+        list_secrets("owner/repo", &route);
+        list_secrets("owner/other", &route);
+
+        assert_eq!(
+            fs::read_to_string(log).expect("log"),
+            "ghs_for_owner_repo api repos/owner/repo/actions/secrets --paginate\n\
+             ghs_for_owner_other api repos/owner/other/actions/secrets --paginate\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn detect_state_reads_secret_siblings_and_auth_failures_from_gh() {
         let temp = tempfile::tempdir().expect("tempdir");
         let gh = fake_gh(temp.path());
 
-        let state = detect_state("owner/repo", &[String::from("owner/other")], Some(&gh));
+        let state = detect_state(
+            "owner/repo",
+            &[String::from("owner/other")],
+            &ReleaseBotGh::fake(&gh),
+        );
 
         assert!(state.secret_present);
         assert_eq!(
@@ -3011,7 +3131,7 @@ enabled = true
                 verify: false,
                 reconfigure: false,
             },
-            Some(&gh),
+            &ReleaseBotGh::fake(&gh),
         )
         .expect("setup");
 
@@ -3064,7 +3184,7 @@ enabled = true
             &temp.path().join("state"),
             true,
             &mut output,
-            Some(&gh),
+            &ReleaseBotGh::fake(&gh),
         )
         .expect("status");
 

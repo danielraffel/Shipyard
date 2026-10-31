@@ -107,6 +107,61 @@ pub fn push_branch_with_env(
     )))
 }
 
+/// Git configuration, as `GIT_CONFIG_*` environment, that makes a push to
+/// github.com authenticate through `shipyard auth git-credential` (an App token
+/// covering only the pushed repository) over HTTPS, whatever credentials the
+/// host's own git config holds. Empty unless the machine-global
+/// `git_credential.shipyard_push` is true.
+pub fn scoped_push_environment(global_dir: &Path) -> Result<Vec<(OsString, OsString)>, PrError> {
+    let config = LoadedConfig::load_machine_global_from_dir(global_dir.to_path_buf())
+        .map_err(|error| PrError::new(error.to_string()))?;
+    match config.get("git_credential.shipyard_push") {
+        None | Some(toml::Value::Boolean(false)) => return Ok(Vec::new()),
+        Some(toml::Value::Boolean(true)) => {}
+        Some(_) => {
+            return Err(PrError::new(
+                "machine-global git_credential.shipyard_push must be a boolean",
+            ));
+        }
+    }
+    let binary = std::env::current_exe()
+        .map_err(|error| PrError::new(format!("cannot locate the shipyard binary: {error}")))?;
+    let helper = format!(
+        "!{} --global-dir {} auth git-credential",
+        shell_single_quote(&binary.to_string_lossy())?,
+        shell_single_quote(&global_dir.to_string_lossy())?,
+    );
+    let entries = [
+        ("url.https://github.com/.insteadOf", "git@github.com:"),
+        ("url.https://github.com/.insteadOf", "ssh://git@github.com/"),
+        // The empty helper drops every inherited one, such as a personal
+        // `gh auth git-credential`, before adding the scoped helper.
+        ("credential.https://github.com.helper", ""),
+        ("credential.https://github.com.helper", helper.as_str()),
+        ("credential.https://github.com.useHttpPath", "true"),
+        ("credential.interactive", "never"),
+    ];
+    let mut environment = vec![(
+        OsString::from("GIT_CONFIG_COUNT"),
+        OsString::from(entries.len().to_string()),
+    )];
+    for (index, (key, value)) in entries.iter().enumerate() {
+        environment.push((format!("GIT_CONFIG_KEY_{index}").into(), (*key).into()));
+        environment.push((format!("GIT_CONFIG_VALUE_{index}").into(), (*value).into()));
+    }
+    environment.push(("GIT_TERMINAL_PROMPT".into(), "0".into()));
+    Ok(environment)
+}
+
+fn shell_single_quote(value: &str) -> Result<String, PrError> {
+    if value.contains('\'') || value.chars().any(char::is_control) {
+        return Err(PrError::new(format!(
+            "cannot pass {value:?} to git's credential helper shell"
+        )));
+    }
+    Ok(format!("'{value}'"))
+}
+
 /// Find the first open PR for `branch`.
 pub fn find_pr_for_branch(
     config: &LoadedConfig,
@@ -782,8 +837,85 @@ mod tests {
         PrInfo, is_graphql_pr_create_integration_blocked, is_graphql_rate_limited,
         is_integration_blocked, parse_github_remote_slug, parse_pr_checkout_info,
         parse_pr_checkout_rest_info, parse_pr_info, parse_pr_list, parse_pr_rest_info,
-        parse_pr_rest_list, select_unique_head_match, selector_pr_number, url_encode,
+        parse_pr_rest_list, scoped_push_environment, select_unique_head_match, selector_pr_number,
+        shell_single_quote, url_encode,
     };
+    use std::process::Command;
+
+    fn write_global_config(contents: &str) -> tempfile::TempDir {
+        let global = tempfile::tempdir().expect("tempdir");
+        std::fs::write(global.path().join("config.toml"), contents).expect("config");
+        global
+    }
+
+    #[test]
+    fn scoped_push_environment_is_empty_unless_enabled() {
+        for contents in ["", "[git_credential]\nshipyard_push = false\n"] {
+            let global = write_global_config(contents);
+            assert!(
+                scoped_push_environment(global.path())
+                    .expect("environment")
+                    .is_empty()
+            );
+        }
+        let global = write_global_config("[git_credential]\nshipyard_push = \"yes\"\n");
+        let error = scoped_push_environment(global.path()).expect_err("non-boolean");
+        assert!(error.to_string().contains("must be a boolean"));
+    }
+
+    #[test]
+    fn scoped_push_environment_routes_github_through_the_scoped_helper() {
+        let global = write_global_config("[git_credential]\nshipyard_push = true\n");
+        let environment = scoped_push_environment(global.path()).expect("environment");
+        let repo = tempfile::tempdir().expect("repo");
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .envs(environment.iter().map(|(key, value)| (key, value)))
+                .output()
+                .expect("git");
+            assert!(output.status.success(), "{output:?}");
+            String::from_utf8(output.stdout).expect("utf8")
+        };
+        git(&["init", "-q"]);
+        git(&["remote", "add", "origin", "git@github.com:owner/repo.git"]);
+        assert_eq!(
+            git(&["remote", "get-url", "--push", "origin"]).trim(),
+            "https://github.com/owner/repo.git"
+        );
+        let helpers = git(&[
+            "config",
+            "--get-urlmatch",
+            "credential.helper",
+            "https://github.com/owner/repo.git",
+        ]);
+        let helper = helpers.trim();
+        assert!(helper.starts_with("!'"), "{helper}");
+        assert!(helper.ends_with(&format!(
+            " --global-dir '{}' auth git-credential",
+            global.path().display()
+        )));
+        assert_eq!(
+            git(&[
+                "config",
+                "--get-urlmatch",
+                "credential.useHttpPath",
+                "https://github.com/owner/repo.git"
+            ])
+            .trim(),
+            "true"
+        );
+    }
+
+    #[test]
+    fn helper_paths_with_quotes_are_refused() {
+        assert!(shell_single_quote("/a/b c").is_ok());
+        assert!(shell_single_quote("/a/b'c").is_err());
+        assert!(shell_single_quote("/a/b\nc").is_err());
+    }
 
     const GRAPHQL_PR: &str = r#"{
         "number": 42,

@@ -47,7 +47,9 @@ pub(super) fn review_verdict_command<W: Write>(
             format!("--head must be a full 40-character commit sha, not {head:?}"),
         ));
     }
-    let actions = crate::cloud::GitHubActions::from_loaded_config(cwd, &config);
+    let actions = crate::cloud::GitHubActions::from_loaded_config(cwd, &config)
+        // Route the App token to the repository asked about, not the checkout's.
+        .with_repo_override(&repo);
     let run_gh = |gh_args: &[String]| {
         actions
             .run_gh_with_timeout(gh_args, GITHUB_READ_TIMEOUT)

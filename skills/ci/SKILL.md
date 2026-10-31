@@ -1118,8 +1118,10 @@ PRs are gone.
 | Drain a backed-up PR CI queue | `shipyard queue triage --repo OWNER/REPO --apply --json`, then later `shipyard queue resume --repo OWNER/REPO --apply --json` (see [Draining a GitHub CI backlog](#draining-a-github-ci-backlog-triage-prioritize-the-fix-resume)) |
 | Move one PR's waiting jobs to the front | `shipyard queue prioritize --pr <n> --repo OWNER/REPO --apply --json` |
 | Merge on green (cron-safe one-shot) | `shipyard auto-merge <pr>` (0=merged, 1=fail, 2=not-found, 3=in-flight, 10=automatic classic merge refused) |
-| Diagnose RELEASE_BOT_TOKEN | `shipyard release-bot status --json` |
+| Diagnose RELEASE_BOT_TOKEN | `shipyard release-bot status --json` (App token, no owner `gh` login needed) |
 | Push as the App, scoped to one repo | `shipyard auth git-credential` as the github.com credential helper with `useHttpPath = true` and machine-global `git_credential.repositories` (see `docs/git-credential.md`) |
+| Scope every App token, or `shipyard pr` pushes, to one repo | machine-global `github.auth.scope_to_repository = true`; `git_credential.shipyard_push = true` |
+| A command acts on another repo than the checkout | its `gh` token follows `--repo`/`api repos/OWNER/REPO`; a bare `GhClient` needs `.with_repo_override(repo)` (a hint loses to the cwd checkout) |
 | Configure RELEASE_BOT_TOKEN | `shipyard release-bot setup` (guided) |
 | Re-paste token after rotation | `shipyard release-bot setup --paste` |
 | Opt in to post-release docs sync | `shipyard changelog init` then `shipyard release-bot hook install` |
