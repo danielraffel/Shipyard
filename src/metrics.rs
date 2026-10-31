@@ -1483,6 +1483,7 @@ impl MetricsStore {
         self.safe_merge_summary_filtered(project, cutoff, true)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn safe_merge_summary_filtered(
         &self,
         project: &str,
