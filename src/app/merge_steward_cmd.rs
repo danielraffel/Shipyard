@@ -164,6 +164,14 @@ struct StewardLedger {
     audit: Vec<LedgerAudit>,
     #[serde(default)]
     wake_records: BTreeMap<String, String>,
+    /// Consecutive passes on which a queued head's approval, live state or
+    /// policy was unreadable, keyed `repo#pr:head`. See `unapproved_admission`.
+    #[serde(default)]
+    dequeue_unreadable: BTreeMap<String, u32>,
+    /// Queue removals the steward made itself, keyed `repo#pr:head`; they do
+    /// not count toward the head's ejection cap.
+    #[serde(default)]
+    steward_dequeues: BTreeMap<String, u32>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

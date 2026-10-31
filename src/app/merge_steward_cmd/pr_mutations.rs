@@ -48,7 +48,7 @@ pub(super) fn mutate_pr_with_recovery(
     // `enqueue_pull_request_with_recovery` re-evaluates the gate on the live
     // head, so a moved head or a late HOLD is still refused fail-closed.
     if matches!(decision, StewardDecision::ArmMergeQueue)
-        && let Ok((gate, _events)) = read_head_gate(context, pr)
+        && let Ok((gate, _events)) = read_head_gate(context, pr, ledger)
         && !gate.allows()
     {
         return (
@@ -111,8 +111,10 @@ pub(super) fn mutate_pr_with_recovery(
 fn read_head_gate(
     context: &MutationApplyContext<'_>,
     pr: &ObservedPr,
+    ledger: &StewardLedger,
 ) -> Result<(crate::head_approval::HeadGate, Vec<String>), String> {
-    read_head_gate_with_queue_state(context, pr).map(|(gate, events, _queue)| (gate, events))
+    read_head_gate_with_queue_state(context, pr, ledger)
+        .map(|(gate, events, _queue)| (gate, events))
 }
 
 /// [`read_head_gate`], also returning the live queue-state response it read
@@ -121,8 +123,9 @@ fn read_head_gate(
 pub(super) fn read_head_gate_with_queue_state(
     context: &MutationApplyContext<'_>,
     pr: &ObservedPr,
+    ledger: &StewardLedger,
 ) -> Result<(crate::head_approval::HeadGate, Vec<String>, Value), String> {
-    read_head_gate_for(context.actions, context.observation, pr)
+    read_head_gate_for(context.actions, context.observation, pr, ledger)
 }
 
 /// [`read_head_gate_with_queue_state`] from read-only inputs, so an audit
@@ -131,16 +134,25 @@ pub(super) fn read_head_gate_for(
     actions: &GitHubActions,
     observation: &RepoObservation,
     pr: &ObservedPr,
+    ledger: &StewardLedger,
 ) -> Result<(crate::head_approval::HeadGate, Vec<String>, Value), String> {
     let approval_policy = read_approval_policy(actions, observation)?;
     let queue = read_pr_queue_state(actions, observation, pr.fact.number)?;
-    let (gate, events) = evaluate_head_gate(actions, observation, pr, &approval_policy, &queue)?;
+    let (gate, events) = evaluate_head_gate(
+        actions,
+        observation,
+        pr,
+        &pr.fact.head_sha,
+        &approval_policy,
+        &queue,
+        ledger,
+    )?;
     Ok((gate, events, queue))
 }
 
 /// The base's reviewer policy, read strictly: an absent or unreadable config
 /// is an error, never "approval not required".
-pub(super) fn read_approval_policy(
+fn read_approval_policy(
     actions: &GitHubActions,
     observation: &RepoObservation,
 ) -> Result<crate::head_approval::ApprovalPolicy, String> {
@@ -177,21 +189,54 @@ pub(super) fn read_pr_queue_state(
         .map_err(|error| format!("merge-queue observation unreadable: {error}"))
 }
 
-/// Evaluate `pr`'s census head against `approval_policy` and the live
-/// `queue` state.
+/// [`read_pr_queue_state`], refusing a 200 answer that carries no pull
+/// request: GraphQL `errors`, or `pullRequest: null`. That is an unread
+/// state, never a moved or unqueued head, so a caller that would act on the
+/// head's absence (the unapproved-admission sweep) must not see it as one.
+pub(super) fn read_pr_queue_state_strict(
+    actions: &GitHubActions,
+    observation: &RepoObservation,
+    number: u64,
+) -> Result<Value, String> {
+    let queue = read_pr_queue_state(actions, observation, number)?;
+    if let Some(errors) = queue.get("errors").filter(|errors| !errors.is_null()) {
+        return Err(format!("merge-queue observation unreadable: {errors}"));
+    }
+    if !queue
+        .pointer("/data/repository/pullRequest")
+        .is_some_and(Value::is_object)
+    {
+        return Err("merge-queue observation unreadable: no pull request in the answer".to_owned());
+    }
+    Ok(queue)
+}
+
+/// Evaluate `head` of `pr` against `approval_policy` and the live `queue`
+/// state. Queue removals of `head` the steward made itself are not counted
+/// toward [`crate::head_approval::EJECTION_CAP`]: withdrawing an entry it
+/// could not judge says nothing against the head.
 pub(super) fn evaluate_head_gate(
     actions: &GitHubActions,
     observation: &RepoObservation,
     pr: &ObservedPr,
+    head: &str,
     approval_policy: &crate::head_approval::ApprovalPolicy,
     queue: &Value,
+    ledger: &StewardLedger,
 ) -> Result<(crate::head_approval::HeadGate, Vec<String>), String> {
     let run_gh = |argv: &[String]| actions.run_gh(argv).map_err(|error| error.to_string());
+    let excused = super::unapproved_admission::steward_dequeues(
+        ledger,
+        &observation.repo,
+        pr.fact.number,
+        head,
+    );
+    let queue = &super::unapproved_admission::without_steward_removals(queue, head, excused);
     crate::head_approval::evaluate_with_policy_for_author_with_events(
         &run_gh,
         &observation.repo,
         pr.fact.number,
-        &pr.fact.head_sha,
+        head,
         approval_policy,
         queue,
         pr.fact.author.as_deref(),
@@ -231,7 +276,7 @@ fn enqueue_pull_request_with_recovery(
     let mut approval_app_id = None;
     let verdict_audit_events;
     {
-        match read_head_gate(context, pr) {
+        match read_head_gate(context, pr, ledger) {
             Ok((crate::head_approval::HeadGate::Approved { approval }, events)) => {
                 verdict_audit_events = events;
                 approval_comment_id = approval.comment_id();

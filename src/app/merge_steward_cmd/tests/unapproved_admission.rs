@@ -99,6 +99,21 @@ struct Fixture {
     comments: String,
     /// Whether the reviewer-policy read fails (approval unreadable).
     policy_unreadable: bool,
+    /// Whether a successful read finds no `.shipyard/config.toml`.
+    policy_absent: bool,
+    /// Whether the live queue-state read fails.
+    queue_unreadable: bool,
+    /// A 200 queue-state answer that names no pull request (GraphQL
+    /// `errors`, or `pullRequest: null`).
+    queue_body: Option<&'static str>,
+    /// Whether the approval reviews read fails.
+    reviews_unreadable: bool,
+    /// Queue removals of the head in the timeline, after the approval.
+    removals: usize,
+    /// Whether the approval comments read fails.
+    comments_unreadable: bool,
+    /// The repository observed.
+    repo: &'static str,
     /// Head the live queue-state read reports.
     live_head: &'static str,
     apply: bool,
@@ -116,6 +131,13 @@ impl Fixture {
             path,
             comments: approval_for(OLD_HEAD),
             policy_unreadable: false,
+            policy_absent: false,
+            queue_unreadable: false,
+            queue_body: None,
+            reviews_unreadable: false,
+            removals: 0,
+            comments_unreadable: false,
+            repo: "owner/repo",
             live_head: HEAD,
             apply: true,
             queued: false,
@@ -132,10 +154,18 @@ impl Fixture {
     }
 
     fn script(&self, log: &Path) -> String {
+        let fail = r#"echo "HTTP 502: Bad Gateway" >&2; exit 1"#;
         let policy = if self.policy_unreadable {
-            r#"echo "HTTP 502: Bad Gateway" >&2; exit 1"#.to_owned()
+            fail.to_owned()
+        } else if self.policy_absent {
+            r#"echo "gh: Not Found (HTTP 404)" >&2; exit 1"#.to_owned()
         } else {
             POLICY_REQUIRED.to_owned()
+        };
+        let comments = if self.comments_unreadable {
+            fail.to_owned()
+        } else {
+            format!("printf '%s\\n' '{}'", self.comments)
         };
         let (in_queue, entry, auto_merge) = if self.queued {
             ("true", r#"{"state":"QUEUED","position":1}"#, "null")
@@ -160,19 +190,33 @@ case "$*" in
   *"enablePullRequestAutoMerge"*) echo "the sweep must never arm" >&2; exit 92 ;;
   *"mergePullRequest("*) echo "the sweep must never merge" >&2; exit 93 ;;
   *"enqueuePullRequest"*) echo "the sweep must never enqueue" >&2; exit 91 ;;
-  *"/reviews"*) printf '' ;;
-  *"repos/owner/repo/pulls/4"[0-9]" "*) printf 'feature\nmain\n' ;;
+  *"/reviews"*) {reviews} ;;
+  *"/pulls/4"[0-9]" "*) printf 'feature\nmain\n' ;;
   *"query=query("*"mergeQueue(branch"*) printf '%s' '{merge_queue}' ;;
-  *"/comments"*) printf '%s\n' '{comments}' ;;
+  *"/comments"*) {comments} ;;
   *"commits/{HEAD}"*) printf '%s' '2026-10-30T00:00:00Z' ;;
-  *"isInMergeQueue"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"number":42,"state":"OPEN","headRefOid":"{live_head}","isInMergeQueue":{in_queue},"mergeQueueEntry":{entry},"autoMergeRequest":{auto_merge},"timelineItems":{{"pageInfo":{{"hasPreviousPage":false}},"nodes":[]}}}}}}}}}}' ;;
+  *"isInMergeQueue"*) {queue_fail}printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"number":42,"state":"OPEN","headRefOid":"{live_head}","isInMergeQueue":{in_queue},"mergeQueueEntry":{entry},"autoMergeRequest":{auto_merge},"timelineItems":{{"pageInfo":{{"hasPreviousPage":false}},"nodes":[{removals}]}}}}}}}}}}' ;;
   "pr view "*) printf '%s' '{live_pr}' ;;
   *) echo "unexpected: $*" >&2; exit 2 ;;
 esac
 "#,
             log = log.display(),
             guard = guard_script().display(),
-            comments = self.comments,
+            comments = comments,
+            reviews = if self.reviews_unreadable { fail } else { "printf ''" },
+            removals = (0..self.removals)
+                .map(|minute| format!(
+                    r#"{{"__typename":"RemovedFromMergeQueueEvent","createdAt":"2026-10-30T13:0{minute}:00Z","reason":"MANUAL","actor":{{"login":"shipyard-local[bot]"}},"beforeCommit":{{"oid":"{HEAD}","parents":{{"nodes":[]}}}}}}"#
+                ))
+                .collect::<Vec<_>>()
+                .join(","),
+            queue_fail = if let Some(body) = self.queue_body {
+                format!("printf '%s' '{body}'; exit 0; ")
+            } else if self.queue_unreadable {
+                format!("{fail}; ")
+            } else {
+                String::new()
+            },
             live_head = self.live_head,
             live_pr = pr_row(false),
             merge_queue = match self.path {
@@ -193,6 +237,11 @@ struct Outcome {
 }
 
 fn run(fixture: &Fixture) -> Outcome {
+    run_with(fixture, StewardLedger::default())
+}
+
+/// One steward pass over `fixture`, carrying `ledger` from earlier passes.
+fn run_with(fixture: &Fixture, mut ledger: StewardLedger) -> Outcome {
     let temp = tempfile::tempdir().expect("temp");
     let log = temp.path().join("calls");
     let actions = fake_gh(&temp, &fixture.script(&log));
@@ -204,10 +253,11 @@ fn run(fixture: &Fixture) -> Outcome {
     observation.prs = (0..fixture.prs)
         .map(|offset| census_pr(42 + offset, fixture.queued))
         .collect();
+    observation.repo = fixture.repo.to_owned();
     observation.allow_auto_merge = true;
     observation.required_checks = policy.required_checks.clone();
     let args = StewardCommandArgs {
-        repos: vec!["owner/repo".to_owned()],
+        repos: vec![fixture.repo.to_owned()],
         base: "main".to_owned(),
         opt_out_label: "steward:skip".to_owned(),
         provenance_blocking_labels: default_provenance_blocking_labels(),
@@ -234,7 +284,6 @@ fn run(fixture: &Fixture) -> Outcome {
             ..policy
         }
     };
-    let mut ledger = StewardLedger::default();
     let control = mutation_control(&temp, "studio", "studio");
     let (reports, _failed) = apply_pr_plans(
         &actions,
@@ -383,13 +432,354 @@ fn an_enqueued_approved_head_is_left_in_the_queue() {
     }));
 }
 
-#[test]
-fn an_unreadable_approval_dequeues() {
-    assert_dequeued(&run(&Fixture {
+fn deferred(outcome: &Outcome, head: &str) {
+    assert_eq!(
+        outcome.report.mutation.as_deref(),
+        Some(format!("dequeue_deferred_unreadable:{head}").as_str()),
+        "{:?}\n{}",
+        outcome.report,
+        outcome.calls
+    );
+    assert_left_alone_writes(outcome);
+}
+
+/// PR #42's unreadable streak in `owner/repo`, as `(head, passes)`.
+fn streak(outcome: &Outcome) -> Option<(String, u32)> {
+    let mut streaks = outcome
+        .ledger
+        .dequeue_unreadable
+        .iter()
+        .filter_map(|(key, passes)| {
+            key.strip_prefix("owner/repo#42:")
+                .map(|head| (head.to_owned(), *passes))
+        });
+    let found = streaks.next();
+    assert!(streaks.next().is_none(), "one streak per PR");
+    found
+}
+
+const GRAPHQL_ERRORS: &str =
+    r#"{"data":{"repository":{"pullRequest":null}},"errors":[{"message":"Something went wrong"}]}"#;
+const NULL_PULL_REQUEST: &str = r#"{"data":{"repository":{"pullRequest":null}}}"#;
+/// GraphQL `errors` beside partial data that, read at face value, shows the
+/// entry queued at a head nobody approved.
+const GRAPHQL_ERRORS_WITH_DATA: &str = r#"{"data":{"repository":{"pullRequest":{"number":42,"state":"OPEN","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","isInMergeQueue":true,"mergeQueueEntry":null,"autoMergeRequest":null,"timelineItems":{"pageInfo":{"hasPreviousPage":false},"nodes":[]}}}},"errors":[{"message":"timeline partially unavailable"}]}"#;
+
+/// Every way a queued entry's judgement can be unreadable: policy 502, the
+/// queue-state read failing, a 200 queue-state answer with GraphQL `errors` or
+/// `pullRequest: null`, and the reviews or comments read failing.
+fn each_failure(base: impl Fn() -> Fixture) -> Vec<(&'static str, Fixture)> {
+    vec![
+        (
+            "policy 502",
+            Fixture {
+                policy_unreadable: true,
+                ..base()
+            },
+        ),
+        (
+            "queue-state failure",
+            Fixture {
+                queue_unreadable: true,
+                ..base()
+            },
+        ),
+        (
+            "GraphQL errors body",
+            Fixture {
+                queue_body: Some(GRAPHQL_ERRORS),
+                ..base()
+            },
+        ),
+        (
+            "null pullRequest body",
+            Fixture {
+                queue_body: Some(NULL_PULL_REQUEST),
+                ..base()
+            },
+        ),
+        (
+            "reviews failure",
+            Fixture {
+                reviews_unreadable: true,
+                ..base()
+            },
+        ),
+        (
+            "comments failure",
+            Fixture {
+                comments_unreadable: true,
+                ..base()
+            },
+        ),
+    ]
+}
+
+fn queued_unapproved() -> Fixture {
+    Fixture {
         queued: true,
-        policy_unreadable: true,
         ..Fixture::unapproved(Admission::NativeQueue)
+    }
+}
+
+fn queued_approved() -> Fixture {
+    Fixture {
+        queued: true,
+        ..Fixture::approved(Admission::NativeQueue)
+    }
+}
+
+/// A dequeue throws away a merge group's runs, so an unreadable read defers
+/// it; only the third consecutive unreadable pass on the same head dequeues,
+/// carried by the shared steward ledger.
+#[test]
+fn an_unreadable_queued_head_defers_twice_then_dequeues() {
+    for (failure, fixture) in each_failure(queued_unapproved) {
+        let first = run(&fixture);
+        deferred(&first, HEAD);
+        assert_eq!(streak(&first), Some((HEAD.to_owned(), 1)), "{failure}");
+        let second = run_with(&fixture, first.ledger);
+        deferred(&second, HEAD);
+        assert_eq!(streak(&second), Some((HEAD.to_owned(), 2)), "{failure}");
+        let third = run_with(&fixture, second.ledger);
+        assert_dequeued(&third);
+        assert_eq!(streak(&third), None, "{failure}");
+    }
+}
+
+/// A 200 answer with `errors` or no pull request is an unread state, not a
+/// moved or unqueued head: it defers, never dequeues on the first pass.
+#[test]
+fn a_graphql_answer_without_a_pull_request_defers() {
+    for body in [GRAPHQL_ERRORS, NULL_PULL_REQUEST, GRAPHQL_ERRORS_WITH_DATA] {
+        deferred(
+            &run(&Fixture {
+                queue_body: Some(body),
+                ..queued_unapproved()
+            }),
+            HEAD,
+        );
+    }
+}
+
+#[test]
+fn an_unreadable_approval_defers_rather_than_dequeues() {
+    deferred(
+        &run(&Fixture {
+            comments_unreadable: true,
+            ..queued_unapproved()
+        }),
+        HEAD,
+    );
+}
+
+#[test]
+fn a_config_read_error_defers() {
+    deferred(
+        &run(&Fixture {
+            policy_unreadable: true,
+            ..queued_unapproved()
+        }),
+        HEAD,
+    );
+}
+
+/// A 404 on the config is a fact a successful read proved, not an
+/// unreadable policy.
+#[test]
+fn a_missing_config_after_a_successful_read_dequeues() {
+    assert_dequeued(&run(&Fixture {
+        policy_absent: true,
+        ..queued_unapproved()
     }));
+}
+
+#[test]
+fn a_successful_read_resets_the_streak() {
+    let fixture = Fixture {
+        comments_unreadable: true,
+        ..queued_unapproved()
+    };
+    let first = run(&fixture);
+    let second = run_with(&fixture, first.ledger);
+    assert_eq!(streak(&second), Some((HEAD.to_owned(), 2)));
+    // A successful read of an approved head: kept, and the streak clears.
+    let readable = run_with(&queued_approved(), second.ledger);
+    assert_left_alone(&readable);
+    assert_eq!(streak(&readable), None);
+    // So the next unreadable pass starts over rather than dequeuing.
+    let again = run_with(&fixture, readable.ledger);
+    deferred(&again, HEAD);
+    assert_eq!(streak(&again), Some((HEAD.to_owned(), 1)));
+}
+
+#[test]
+fn a_new_head_resets_the_streak() {
+    let fixture = Fixture {
+        comments_unreadable: true,
+        ..queued_unapproved()
+    };
+    let first = run(&fixture);
+    let second = run_with(&fixture, first.ledger);
+    assert_eq!(streak(&second), Some((HEAD.to_owned(), 2)));
+    let moved = run_with(
+        &Fixture {
+            live_head: MOVED,
+            ..fixture
+        },
+        second.ledger,
+    );
+    deferred(&moved, MOVED);
+    assert_eq!(streak(&moved), Some((MOVED.to_owned(), 1)));
+}
+
+/// At the start of an applying pass, a streak survives only while its pull
+/// request is still queued at that head, and a steward-removal record only
+/// while the pull request is open at that head.
+#[test]
+fn the_pass_prunes_streaks_for_unqueued_or_moved_pull_requests() {
+    let key = |number: u64, head: &str| format!("owner/repo#{number}:{head}");
+    let mut ledger = StewardLedger::default();
+    for number in [42, 43, 44, 45] {
+        ledger.dequeue_unreadable.insert(key(number, HEAD), 2);
+        ledger.steward_dequeues.insert(key(number, HEAD), 1);
+    }
+    ledger
+        .dequeue_unreadable
+        .insert("owner/other#42:x".to_owned(), 2);
+    let mut observation = observation_for(census_pr(42, true), true);
+    let mut moved = census_pr(44, true);
+    moved.fact.head_sha = MOVED.to_owned();
+    // 42 queued at HEAD; 43 open but unqueued; 44 queued at a new head; 45 gone.
+    observation.prs = vec![census_pr(42, true), census_pr(43, false), moved];
+    crate::app::merge_steward_cmd::unapproved_admission::prune(&mut ledger, &observation);
+    assert_eq!(
+        ledger
+            .dequeue_unreadable
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        ["owner/other#42:x".to_owned(), key(42, HEAD)]
+    );
+    assert_eq!(
+        ledger.steward_dequeues.keys().cloned().collect::<Vec<_>>(),
+        [key(42, HEAD), key(43, HEAD)]
+    );
+}
+
+/// The streak is cleared when a judgement finds the pull request unqueued.
+#[test]
+fn an_unqueued_pull_request_loses_its_streak() {
+    let fixture = Fixture {
+        comments_unreadable: true,
+        ..queued_unapproved()
+    };
+    let first = run(&fixture);
+    assert_eq!(streak(&first), Some((HEAD.to_owned(), 1)));
+    let unqueued = run_with(&Fixture::approved(Admission::NativeQueue), first.ledger);
+    assert_eq!(streak(&unqueued), None);
+}
+
+/// An approved head is never dequeued with each failure injected: the
+/// unreadable passes defer, and the readable pass that shows the approval
+/// keeps it and clears the streak before it can reach the bound.
+#[test]
+fn an_approved_head_is_never_dequeued_with_each_failure_injected() {
+    for (failure, failing) in each_failure(queued_approved) {
+        let mut ledger = StewardLedger::default();
+        for (pass, fixture) in [&failing, &failing, &queued_approved(), &failing, &failing]
+            .into_iter()
+            .enumerate()
+        {
+            let outcome = run_with(fixture, ledger);
+            assert!(
+                !outcome.calls.contains("dequeuePullRequest"),
+                "{failure}, pass {pass}: {}",
+                outcome.calls
+            );
+            ledger = outcome.ledger;
+        }
+        assert_eq!(
+            ledger
+                .dequeue_unreadable
+                .values()
+                .copied()
+                .collect::<Vec<_>>(),
+            [2],
+            "{failure}"
+        );
+    }
+}
+
+/// A circuit breaker: at most two entries leave the queue per repository and
+/// base per pass; the rest report `dequeue_deferred_cap`. Two repositories
+/// with three candidates each give two and two.
+#[test]
+fn at_most_two_dequeues_per_repository_per_pass() {
+    let mut ledger = StewardLedger::default();
+    for repo in ["owner/repo", "owner/other"] {
+        let outcome = run_with(
+            &Fixture {
+                prs: 3,
+                repo,
+                ..queued_unapproved()
+            },
+            ledger,
+        );
+        let mutations = outcome
+            .reports
+            .iter()
+            .map(|report| report.mutation.clone().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            mutations,
+            [
+                format!("dequeued_unapproved:{HEAD}"),
+                format!("dequeued_unapproved:{HEAD}"),
+                format!("dequeue_deferred_cap:{HEAD}"),
+            ],
+            "{repo}\n{}",
+            outcome.calls
+        );
+        assert_eq!(outcome.calls.matches("dequeuePullRequest").count(), 2);
+        assert_guard_accepted(&outcome);
+        ledger = outcome.ledger;
+    }
+}
+
+/// A steward dequeue does not consume the head's ejection cap: two steward
+/// removals of an approved head (three unreadable passes each, say) leave it
+/// admitted, where two removals by anyone else would not.
+#[test]
+fn a_steward_dequeue_does_not_consume_the_ejection_cap() {
+    let fixture = Fixture {
+        removals: crate::head_approval::EJECTION_CAP,
+        ..queued_approved()
+    };
+    // Control: the same two removals, not the steward's, cap the head.
+    let foreign = run(&fixture);
+    assert_dequeued(&foreign);
+    // The steward recorded both removals as its own.
+    let mut ledger = StewardLedger::default();
+    ledger
+        .steward_dequeues
+        .insert(format!("owner/repo#42:{HEAD}"), 2);
+    let own = run_with(&fixture, ledger);
+    assert_left_alone(&own);
+}
+
+/// The steward records each of its own removals for that head.
+#[test]
+fn a_steward_dequeue_is_recorded_as_its_own() {
+    let outcome = run(&queued_unapproved());
+    assert_dequeued(&outcome);
+    assert_eq!(
+        outcome
+            .ledger
+            .steward_dequeues
+            .get(&format!("owner/repo#42:{HEAD}")),
+        Some(&1)
+    );
 }
 
 /// The steward's own entries are untouched only because their heads are

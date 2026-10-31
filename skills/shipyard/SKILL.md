@@ -3537,8 +3537,23 @@ gap where an arm enabled for an older head survives a push by anyone with
 write access and GitHub then enqueues or merges the unapproved new head
 itself. A head the gate admits (`Approved`, or `NotRequired` where the
 repository does not require approval) keeps its arm and its entry, since the
-steward would enqueue it anyway; an approval that cannot be read, or a live
-head that moved since the census, withdraws. The reviewer policy is read once
+steward would enqueue it anyway. The disarm fails closed: an approval that
+cannot be read, or a live head that moved since the census, disarms. The
+dequeue is bounded, because it discards a merge group's runs. It acts only on
+positive evidence from a successful read of the queued head (a HOLD at that
+head, an approval only for another head, no approval where one is required, or
+a 404 on the base config, which `read_policy_required` reports as the typed
+`PolicyReadError::Absent`). An unreadable approval, live state (including a
+GraphQL answer carrying `errors` or `pullRequest: null`) or config defers it
+(`dequeue_deferred_unreadable:<sha>`) and advances a consecutive-unreadable
+streak in the steward ledger (`dequeue_unreadable`, keyed `repo#pr:head`). Any
+successful judgement clears it, each applying pass prunes it once the PR is
+unqueued or its head changes, and the third consecutive unreadable pass
+dequeues. At most two entries leave the queue per repository and base per pass;
+the rest report `dequeue_deferred_cap:<sha>` and wait for the next pass. Each
+steward removal is recorded (`steward_dequeues`) and is not counted toward the
+head's `EJECTION_CAP` when the steward judges that head again, so withdrawing
+an entry it could not judge never costs an approved head its approval. The reviewer policy is read once
 per pass, strictly (`read_policy_required`: an absent config is an error, not
 "approval not required"). An armed request on an owned PR is disarmed
 unconditionally on every base (`auto_merge_disabled:<sha>`, audit

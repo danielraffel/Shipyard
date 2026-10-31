@@ -267,7 +267,10 @@ pub(super) fn apply_pr_plans(
         ledger_path,
         mutation_control,
     });
-    let mut approval_policy = super::unapproved_admission::PolicyCache::default();
+    let mut sweep_pass = super::unapproved_admission::SweepPass::default();
+    if args.apply {
+        super::unapproved_admission::prune(ledger, observation);
+    }
     let reports = observation
         .prs
         .iter()
@@ -287,7 +290,7 @@ pub(super) fn apply_pr_plans(
                         args.apply,
                         pr,
                         &decision,
-                        &mut approval_policy,
+                        &mut sweep_pass,
                         ledger,
                     )
                 } else {

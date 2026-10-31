@@ -332,13 +332,13 @@ fn consider_candidate(
             // The same strict read the steward's enqueue and stale-arm sweep
             // use: an absent or unreadable base policy refuses the arm rather
             // than defaulting to "approval not required".
-            match crate::head_approval::read_policy_required(&run_gh, repo, base).and_then(
-                |policy| {
+            match crate::head_approval::read_policy_required(&run_gh, repo, base)
+                .map_err(String::from)
+                .and_then(|policy| {
                     crate::head_approval::evaluate_excusing_with_policy(
                         &run_gh, repo, number, &head_sha, &policy, &queue, excuse,
                     )
-                },
-            ) {
+                }) {
                 Ok(gate) if gate.allows() => {
                     match tier_verdict(&run_gh, repo, base, number, &head_sha) {
                         Ok(verdict) => verdict,

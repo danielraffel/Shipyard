@@ -179,29 +179,29 @@ pub(super) fn merge_exact_head(
     ledger: &mut StewardLedger,
 ) -> (Option<String>, Option<String>) {
     let head = pr.fact.head_sha.clone();
-    let (approval, verdict_audit_events, queue) = match read_head_gate_with_queue_state(context, pr)
-    {
-        Ok((crate::head_approval::HeadGate::Approved { approval }, events, queue)) => {
-            (approval, events, queue)
-        }
-        Ok((crate::head_approval::HeadGate::NotRequired, _events, _queue)) => {
-            return (
-                Some("waiting_head_approval".to_owned()),
-                Some(format!(
-                    "head {} needs an exact-head approval: this base merges only approved \
+    let (approval, verdict_audit_events, queue) =
+        match read_head_gate_with_queue_state(context, pr, ledger) {
+            Ok((crate::head_approval::HeadGate::Approved { approval }, events, queue)) => {
+                (approval, events, queue)
+            }
+            Ok((crate::head_approval::HeadGate::NotRequired, _events, _queue)) => {
+                return (
+                    Some("waiting_head_approval".to_owned()),
+                    Some(format!(
+                        "head {} needs an exact-head approval: this base merges only approved \
                      heads, and head approval is not required here, so nothing was merged",
-                    head.get(..12).unwrap_or(&head)
-                )),
-            );
-        }
-        Ok((gate, _events, _queue)) => {
-            return (
-                Some("waiting_head_approval".to_owned()),
-                Some(gate.explain()),
-            );
-        }
-        Err(error) => return (None, Some(error)),
-    };
+                        head.get(..12).unwrap_or(&head)
+                    )),
+                );
+            }
+            Ok((gate, _events, _queue)) => {
+                return (
+                    Some("waiting_head_approval".to_owned()),
+                    Some(gate.explain()),
+                );
+            }
+            Err(error) => return (None, Some(error)),
+        };
     let queue_head = queue
         .pointer("/data/repository/pullRequest/headRefOid")
         .and_then(Value::as_str);
