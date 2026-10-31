@@ -196,33 +196,28 @@ def import_organic(args: argparse.Namespace) -> list[dict[str, Any]]:
             os.lstat(receipt_path)
         except FileNotFoundError:
             events = _import_organic_after_preflight(args, state_dir, None)
-            # The provider helper records a generic unavailable denominator for
-            # direct callers, and a newer supervisor may already have recorded
-            # a more specific one; a staged rollout can expose several. Keep
-            # only the newest marker, insert one before the collection event
-            # when there is none, and rewrite only a generic reason that carries
-            # no authenticated producer provenance.
+            # The provider helper also records an unavailable denominator for
+            # direct callers. Replace only its generic event with the more
+            # precise missing-handoff reason in place, keeping the collection
+            # event last. A newer supervisor may already have a more specific
+            # reason; preserve it.
             receipt_events = [event for event in events if event.get("source") == "merge-receipt"]
-            if not receipt_events:
-                replacement = {"source": "merge-receipt", "status": "unavailable",
-                               "reason": "producer handoff not present"}
+            generic = next((event for event in receipt_events
+                            if event.get("reason") == "fresh authenticated producer handoff is unavailable"), None)
+            if generic is not None and len(receipt_events) == 1:
+                events[events.index(generic)] = {
+                    "source": "merge-receipt", "status": "unavailable",
+                    "reason": "producer handoff not present"}
+            elif not receipt_events:
                 collection_index = next((index for index, event in enumerate(events)
                                           if event.get("source") == "collection"), len(events))
-                events.insert(collection_index, replacement)
+                events.insert(collection_index, {"source": "merge-receipt", "status": "unavailable",
+                                                 "reason": "producer handoff not present"})
             else:
                 newest = max(i for i, event in enumerate(events)
                              if event.get("source") == "merge-receipt")
                 events = [event for i, event in enumerate(events)
                           if event.get("source") != "merge-receipt" or i == newest]
-                marker_index = next(i for i, event in enumerate(events)
-                                    if event.get("source") == "merge-receipt")
-                marker = events[marker_index]
-                if (marker.get("reason") == "fresh authenticated producer handoff is unavailable"
-                        and "producer" not in marker):
-                    events[marker_index] = {
-                        "source": "merge-receipt", "status": "unavailable",
-                        "reason": "producer handoff not present",
-                    }
             return events
         except OSError as exc:
             raise RuntimeError(f"merge receipt handoff is unreadable: {exc}") from exc
