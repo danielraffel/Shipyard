@@ -154,10 +154,10 @@ fn path_identity(path: &Path) -> Option<PathIdentity> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        return Some(PathIdentity {
+        Some(PathIdentity {
             device: metadata.dev(),
             inode: metadata.ino(),
-        });
+        })
     }
     #[cfg(windows)]
     {
@@ -296,20 +296,17 @@ fn still_reclaimable(candidate: &Candidate, liveness: &dyn Liveness) -> bool {
     {
         return false;
     }
-    match candidate.owner_pid {
-        Some(pid) => {
-            let Ok(text) = fs::read_to_string(owner_path(&candidate.path)) else {
-                return false;
-            };
-            text.trim().parse::<u32>().ok() == Some(pid) && !liveness.pid_alive(pid)
-        }
-        None => {
-            let Some(live_tmpdirs) = liveness.live_tmpdirs() else {
-                return false;
-            };
-            let path = candidate.path.to_string_lossy();
-            !live_tmpdirs.iter().any(|value| value == path.as_ref())
-        }
+    if let Some(pid) = candidate.owner_pid {
+        let Ok(text) = fs::read_to_string(owner_path(&candidate.path)) else {
+            return false;
+        };
+        text.trim().parse::<u32>().ok() == Some(pid) && !liveness.pid_alive(pid)
+    } else {
+        let Some(live_tmpdirs) = liveness.live_tmpdirs() else {
+            return false;
+        };
+        let path = candidate.path.to_string_lossy();
+        !live_tmpdirs.iter().any(|value| value == path.as_ref())
     }
 }
 

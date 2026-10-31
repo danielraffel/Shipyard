@@ -1281,13 +1281,11 @@ fn cleanup_ship_state(
             .iter()
             .any(|(repo, pr)| repo.eq_ignore_ascii_case(&state.repo) && *pr == state.pr)
             && state.updated_at <= active_cutoff
-        {
-            if store
+            && store
                 .delete_scoped_if_matches(&state.repo, state.pr, &state)
                 .map_err(|error| CliFailure::new(1, error.to_string()))?
-            {
-                deleted_active.push(state.pr);
-            }
+        {
+            deleted_active.push(state.pr);
         }
     }
 
