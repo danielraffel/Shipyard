@@ -189,6 +189,31 @@ written, reds pending (split into those that went red under 24 hours,
 24 to 72 hours, and over 72 hours ago), and reads that failed. Each failed read is also printed
 on stderr. Run it on a schedule you choose; Shipyard does not schedule it.
 
+### Independent observer on macOS
+
+To keep cause and fix-link coverage running when baseline collection is stopped
+or restarted, install the separate supervised observer (dry-run by default):
+
+```bash
+scripts/install_cause_observer.sh \
+  --repo OWNER/REPO --workflow build.yml \
+  --dir "$HOME/Library/Application Support/shipyard/ci-cause"
+scripts/install_cause_observer.sh \
+  --repo OWNER/REPO --workflow build.yml \
+  --dir "$HOME/Library/Application Support/shipyard/ci-cause" --install
+```
+
+The installer renders and validates a per-user `launchd` agent. It runs the
+read-only `shipyard cause record` command at load and then at least every 15
+minutes (the default is hourly), writing only the append-only local archive.
+Use `--interval` to choose a longer interval. Authentication comes from the
+machine-global Shipyard config; pass `--cwd /path/to/checkout` when the
+repository uses an untracked `.shipyard.local/config.toml` overlay. The
+observer can be removed by
+unloading and deleting its generated plist; no GitHub state is changed by the
+agent. Keeping this independent makes failure learning continuous without
+making it a prerequisite for CI execution or merge decisions.
+
 ## Related
 
 `cause advise` reads only the local archive. It requires a full current head
