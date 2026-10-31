@@ -381,7 +381,30 @@ jobs:
           echo "CARGO_HOME=$root/cargo" >> "$GITHUB_ENV"
           echo "RUSTUP_HOME=$root/rustup" >> "$GITHUB_ENV"
 
-      - name: Install Rust
+      # static.rust-lang.org is unreachable from the self-hosted runner for
+      # minutes at a time; v0.381.0 and v0.383.0 stayed drafts on it. Retry
+      # with backoff here, and the auto-release heal job re-runs what remains.
+      - name: Install Rust (attempt 1)
+        id: rust_1
+        continue-on-error: true
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-13
+        with:
+          toolchain: stable
+      - name: Back off before retrying Rust install
+        if: steps.rust_1.outcome == 'failure'
+        run: sleep 30
+      - name: Install Rust (attempt 2)
+        id: rust_2
+        if: steps.rust_1.outcome == 'failure'
+        continue-on-error: true
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-13
+        with:
+          toolchain: stable
+      - name: Back off before the last Rust install attempt
+        if: steps.rust_2.outcome == 'failure'
+        run: sleep 90
+      - name: Install Rust (attempt 3)
+        if: steps.rust_2.outcome == 'failure'
         uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-13
         with:
           toolchain: stable
@@ -505,6 +528,12 @@ jobs:
           KEYCHAIN_STATE="${RUNNER_TEMP}/shipyard-ci-sign-${GITHUB_RUN_ID}.json"
           SIGNING_HOME="${RUNNER_TEMP}/shipyard-ci-home-${GITHUB_RUN_ID}"
           rm -f "${RUNNER_TEMP}/shipyard-cert-${GITHUB_RUN_ID}.p12"
+          # An earlier step failed before the keychain was prepared: nothing to
+          # restore, and failing here would hide the real error.
+          if [ ! -e "$KEYCHAIN_STATE" ]; then
+            echo "no signing keychain was prepared; nothing to restore"
+            exit 0
+          fi
           python3 scripts/ci_macos_signing_keychain.py restore \
             --keychain "$KEYCHAIN" \
             --state "$KEYCHAIN_STATE" \

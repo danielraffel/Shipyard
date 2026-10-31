@@ -46,7 +46,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertNotIn("SHIPYARD_GHAPP_PATH", job)
         self.assertIn("GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}", steps)
         self.assertLess(steps.index("from release_macos_local import require_ci_gh"),
-                        steps.index("- name: Install Rust"))
+                        steps.index("- name: Install Rust (attempt 1)"))
         self.assertLess(steps.index("from release_macos_local import require_ci_gh"),
                         steps.index("- name: Import Developer ID signing identity"))
 
@@ -261,7 +261,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
         names = [step.split("\n", 1)[0] for step in steps]
         isolate = names.index("name: Isolate the build from shared Rust homes")
         # Before the toolchain install and every cargo invocation.
-        self.assertLess(isolate, names.index("name: Install Rust"))
+        self.assertLess(isolate, names.index("name: Install Rust (attempt 1)"))
         self.assertLess(isolate, next(
             index for index, step in enumerate(steps)
             if "scripts/release-macos-local.sh" in step
@@ -329,6 +329,33 @@ class ReleaseWorkflowTests(unittest.TestCase):
                         continue
                     if in_run or stripped.startswith(("run: ", "- run: ")):
                         self.assertNotRegex(line, r"\$\{\{\s*inputs\.", line)
+
+    def test_macos_job_retries_rust_install_and_restore_tolerates_unprepared_keychain(self) -> None:
+        text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        job = text.split("  sign-and-upload-macos:", 1)[1]
+        for n in (1, 2, 3):
+            self.assertIn(f"name: Install Rust (attempt {n})", job)
+        self.assertIn("steps.rust_2.outcome == 'failure'", job)
+        restore = job.split("name: Restore user keychains", 1)[1]
+        self.assertLess(restore.index('[ ! -e "$KEYCHAIN_STATE" ]'),
+                        restore.index("ci_macos_signing_keychain.py restore"))
+
+    def test_heal_is_its_own_workflow_and_auto_release_is_untouched(self) -> None:
+        import yaml
+
+        auto = AUTO_RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        self.assertNotIn("schedule", auto)
+        self.assertNotIn("heal", auto)
+        self.assertNotIn("github.event_name", auto)
+        workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "release-heal.yml").read_text(encoding="utf-8"))
+        triggers = workflow.get(True) or workflow.get("on")
+        self.assertEqual(set(triggers), {"push", "schedule", "workflow_dispatch"})
+        self.assertEqual(workflow["concurrency"], {"group": "release-heal", "cancel-in-progress": False})
+        self.assertEqual(workflow["permissions"], {})
+        heal = workflow["jobs"]["heal"]
+        self.assertEqual(heal["permissions"], {"actions": "write", "contents": "write"})
+        run_steps = [s["run"] for s in heal["steps"] if "run" in s]
+        self.assertIn("python3 scripts/release_draft_heal.py", run_steps)
 
     def test_auto_release_workflow_supports_doctor_release_chain(self) -> None:
         text = AUTO_RELEASE_WORKFLOW.read_text(encoding="utf-8")
