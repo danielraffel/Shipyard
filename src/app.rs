@@ -74,6 +74,7 @@ mod reuse_cmd;
 mod reuse_rederive;
 mod review_verdict_cmd;
 mod reviewer_claim_cmd;
+mod reviewer_dispatch_cmd;
 mod rollup_cmd;
 mod run_cmd;
 mod runner_cmd;
@@ -137,6 +138,7 @@ use self::queue_observer_cmd::{QueueObserverArgs, queue_observer_command};
 use self::queue_quarantine_cmd::queue_quarantine_command;
 use self::release_bot_cmd::release_bot_command;
 use self::rescue_cmd::rescue_command;
+use self::reviewer_dispatch_cmd::reviewer_dispatch_command;
 use self::run_cmd::{
     FailFastMode, ReachabilityPolicy, RootMismatchPolicy, RunCommandArgs, TreeDriftPolicy,
     WarmPolicy, run_command,
@@ -580,6 +582,16 @@ where
                 stdout,
             );
         }
+        Command::ReviewerDispatch { command } => {
+            return reviewer_dispatch_command(
+                command,
+                &runtime_paths.state_dir,
+                cli.mode.into(),
+                &cwd,
+                cli.json,
+                stdout,
+            );
+        }
         Command::ReviewerClaim { command } => {
             return reviewer_claim_cmd::reviewer_claim_command(
                 command,
@@ -962,6 +974,7 @@ fn handle_operational_variant<W: Write>(
         | Command::Landing { .. }
         | Command::Inspect { .. }
         | Command::ReviewVerdict { .. }
+        | Command::ReviewerDispatch { .. }
         | Command::ReviewerClaim { .. }
         | Command::Rollup { .. }
         | Command::Who { .. }
