@@ -42,6 +42,7 @@ MARKER = "Version-Bump-Applied"
 # The bump commit edits version files, which the PR gate refuses without this
 # explicit release trailer.
 RELEASE_TRAILER = 'Release: allow-version-files reason="version-at-land bump pull request"'
+SYNC_REASON = "version-at-land bump: version files only"
 MANAGED_LABEL = "shipyard:managed"
 HANDOFF_CONTEXT = "shipyard/steward-handoff"
 HANDOFF_DESCRIPTION = "Managed handoff version-at-land"
@@ -158,13 +159,52 @@ def apply(repo: Path, config: Config, assignments: list[Assignment]) -> list[str
     return list(dict.fromkeys(edited))
 
 
-def message(assignments: list[Assignment], base: str, head: str) -> str:
+def sync_trailers(repo: Path, edited: list[str]) -> list[str]:
+    """Skip trailers the skill-sync and doc-sync gates need for these files.
+
+    The bump commit edits only version files, which the skill map and doc map
+    also claim (Cargo.toml, .claude-plugin/**). The gates would otherwise fail
+    the bump pull request, and the steward admits only a CLEAN one. The
+    trailers are derived from the gates' own maps and matchers, so they track
+    the maps instead of a hard-coded skill name. A repo without the gate
+    scripts or maps has nothing to satisfy.
+    """
+    trailers: list[str] = []
+    try:
+        import skill_sync_check as skills
+        cfg_path, _ = skills.resolve_config(repo, None)
+        if cfg_path is not None:
+            cfg = skills.load_config(cfg_path, repo)
+            skill_map = skills.load_skill_map(cfg.path_map_file)
+            changed = skills.filter_generated(edited, cfg.generated_globs)
+            for name, patterns in skill_map.skills.items():
+                if any(skills._matches_any(path, patterns) for path in changed):
+                    trailers.append(f'{cfg.trailer_skill_update}: skip skill={name} '
+                                    f'reason="{SYNC_REASON}"')
+    except (ImportError, OSError, ValueError, KeyError):
+        pass
+    try:
+        import doc_sync_check as docs
+        doc_map_path = repo / "scripts" / "doc_sync_map.json"
+        if doc_map_path.exists():
+            for entry in docs.load_doc_map(doc_map_path).docs:
+                if any(docs._matches_any(path, entry.paths) for path in edited):
+                    trailers.append(f'Doc-Update: skip doc={entry.doc} '
+                                    f'reason="{SYNC_REASON}"')
+    except (ImportError, OSError, ValueError):
+        pass
+    return trailers
+
+
+def message(assignments: list[Assignment], base: str, head: str,
+            extra_trailers: list[str] | None = None) -> str:
     summary = "; ".join(
         f"{a.surface} {a.current}->{a.assigned} ({a.level})" for a in assignments
     )
     return ("chore: assign versions at land\n\n"
             f"Assigned from merged range {base[:12]}..{head[:12]}.\n"
-            f"{summary}\n\n{MARKER}: {head}\n{RELEASE_TRAILER}\n")
+            f"{summary}\n\n{MARKER}: {head}\n{RELEASE_TRAILER}\n"
+            + "".join(f"{line}\n" for line in extra_trailers or []))
 
 
 class GitHub:
@@ -259,6 +299,11 @@ def still_current(repo: Path, config: Config, remote: str, pr_branch: str,
         return False
     if not is_marker_commit(repo, existing):
         return False
+    # A head built before a required trailer existed would fail the sync gates
+    # forever if kept, so it is stale.
+    body = git(repo, "log", "-1", "--format=%B", existing).stdout.splitlines()
+    if any(line not in body for line in sync_trailers(repo, edited)):
+        return False
     parent = git(repo, "rev-parse", f"{existing}^1", check=False).stdout.strip()
     if not parent or git(repo, "merge-base", "--is-ancestor", parent, head,
                          check=False).returncode != 0:
@@ -326,7 +371,8 @@ def run(repo: Path, config: Config, remote: str, branch: str,
         if not edited:
             return "noop", assignments
         git(repo, "add", "--", *edited)
-        git(repo, "commit", "--no-verify", "-m", message(assignments, base, head))
+        git(repo, "commit", "--no-verify", "-m",
+            message(assignments, base, head, sync_trailers(repo, edited)))
         if pr_branch is not None and github is not None:
             status, _ = publish_pull(repo, config, remote, branch, pr_branch, github,
                                      assignments, edited, base, head, target_url)
