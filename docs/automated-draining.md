@@ -209,7 +209,7 @@ not listed as blocked.
 | `required_failed:<contexts>` | A required check failed. When the only red context is the approval context (`review-verdict`), the row names the approval token instead; an apply pass that did not read the gate for that head keeps this token and says so in `blocked_detail` | author or repair lane |
 | `transient_rerun` | The steward is rerunning an interrupted check | steward |
 | `merge_state:<STATE>` | GitHub says `DIRTY`, `BEHIND`, `UNSTABLE`, ... | repair lane: merge the base |
-| `ejected_same_head:<cause>` | The queue ejected this exact head; the steward will not re-enqueue it. Read from the same queue state in a dry run and an apply pass; `since` is the removal | repair lane |
+| `ejected_same_head:<cause>` | The queue ejected this exact head and the steward will not re-enqueue it: the failure is the head's, could not be placed, or the head's one retry is spent. `blocked_detail` carries the classifier's reason (the failing job and whether the retry was spent). Read from the same queue state in a dry run and an apply pass; `since` is the removal | repair lane |
 | `waiting_full_test_tier`, `waiting_enqueue_requirements` | Admission waits on a deferred check tier or a GitHub requirement | CI |
 | `revalidating` | The head or queue changed during the pass | next pass |
 | `steward_error` | Admission failed; see `error` | operator |
@@ -236,6 +236,17 @@ These came from running it for real:
 - **A timer job that touches an external volume can hang.** On macOS a
   background job opening a path on `/Volumes` can wait forever on a privacy
   prompt nobody sees. Run the steward from the internal disk.
+- **A flaky or broken runner ejects good heads.** A merge-group failure that
+  is not the head's fault used to strand an approved head until someone
+  pushed. With `[queue.environment_requeue] enabled = true` the steward now
+  re-enqueues the same head once, through its exact-head path with the
+  approval read live, when every failing required check on the ejecting merge
+  group is a runner failure (`timed_out`, `startup_failure`, `stale`, a
+  lost-runner annotation, or a network signature), is also failing on the base
+  tip, or passed on the head itself; a check that passed on the base tip and
+  not on the head, an unplaceable one, or a second ejection of the same head
+  (counted from GitHub's own removal events) stays `ejected_same_head:<cause>`
+  for repair.
 - **Rebasing loses approved work.** A rebase once silently dropped hardening
   that a reviewer had already approved. Merge the base branch in instead.
 - **One burst of merges can queue a release per merge.** Give the release

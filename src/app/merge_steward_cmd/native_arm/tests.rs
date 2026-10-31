@@ -906,6 +906,7 @@ fn an_arrival_the_window_cannot_place_refuses_the_rearm() {
     let allowed = crate::environment_requeue::EnvironmentRequeue {
         allowed: true,
         class: Some(crate::environment_requeue::RequeueClass::Interruption),
+        attribution: Vec::new(),
         reason: "starved".to_owned(),
         merge_group_commit: None,
         evidence: Vec::new(),

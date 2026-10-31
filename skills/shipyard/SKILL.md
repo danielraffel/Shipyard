@@ -4152,6 +4152,23 @@ and the steward's `--arm-unqueued` backstop re-arms it with `expectedHeadOid`
 (outcome `rearmed_same_head`), but only for a head somebody armed after it arrived (`merge_carrier::head_arm_time`). Under the same opt-in as below. Do not dequeue,
 rebase or push a no-op commit for these; read `shipyard landing --pr <n>`.
 
+**A head ejected once for a failure that is not its own is re-enqueued by the
+steward, unattended.** Under the same opt-in, when no signature explains a
+same-head `failed_checks` ejection, `src/environment_requeue.rs` attributes each
+failing required check on the merge-group commit: a `timed_out` /
+`startup_failure` / `stale` conclusion or a lost-runner annotation (infra), the
+same check failing on the base tip, or the same check having passed on the head
+clears it; passing on the base tip but not on the head is head-caused, and an
+unreadable or unplaceable check is unknown. All cleared on the head's **first**
+ejection gives `class: not_head_caused`, and the steward's own enqueue (after
+the live approval gate, so a HOLD still blocks) re-enqueues that exact head
+once. Anything else, or a second ejection, stays
+`blocked_on=ejected_same_head:<cause>` with the reason (failing job, whether the
+retry is spent) in `blocked_detail`: that is the repair lane's cue. `cancelled`
+alone is not infra; a cancelled check is placed by comparison. The `ghapp`
+Python guard does not mirror this class, so do not expect a manual `ghapp` arm
+of such a head to pass.
+
 **One same-head re-enqueue after an ENVIRONMENT ejection needs no new push**
 when the repo sets `[queue.environment_requeue] enabled = true`: every failing
 required check on the removal's merge-group commit must be an Actions job whose

@@ -512,6 +512,59 @@ fn an_ejected_head_reads_the_same_in_a_dry_run_and_an_apply_pass() {
     assert_eq!(other.ejection, None);
 }
 
+/// The retry classifier's reason rides on the ejection token, so a repair
+/// lane reads the failing job and whether the retry is spent; a head it
+/// clears for its one retry is an ordinary admission candidate instead.
+#[test]
+fn an_ejection_carries_the_retry_verdict_as_its_detail() {
+    let mut pr = pr_with(11308, &[], "CLEAN", &green_rollup());
+    pr.fact.head_sha = HEAD_8811.to_owned();
+    let record = blocked_on::GateRecord::new(HEAD_8811, None, &queue_8811());
+    let mut ejection = record.ejection.clone().expect("same-head ejection");
+    let policy = queue_policy();
+    let decision = classify_pr(&pr.fact, &policy, &BTreeMap::new());
+    let classify_with = |ejection: &blocked_on::SameHeadEjection| {
+        classify(
+            &RowFacts {
+                pr: &pr.fact,
+                decision: &decision,
+                mutation: None,
+                error: None,
+                approval: GateRead::Admits,
+                enqueued_at: None,
+                ejection: Some(ejection),
+            },
+            &policy,
+        )
+        .0
+    };
+    ejection.retry = Some(blocked_on::SameHeadRetry {
+        allowed: false,
+        detail: "required check `macos` concluded `failure`; the one not-head-caused retry \
+                 this head is allowed has been spent"
+            .to_owned(),
+    });
+    let spent = classify_with(&ejection);
+    assert_eq!(spent.blocked_on, "ejected_same_head:failed_checks");
+    assert!(
+        spent
+            .blocked_detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("`macos`") && detail.contains("spent")),
+        "{spent:?}"
+    );
+    ejection.retry = Some(blocked_on::SameHeadRetry {
+        allowed: true,
+        detail: "passed on head".to_owned(),
+    });
+    assert_eq!(classify_with(&ejection).blocked_on, "ready");
+    // Control: no verdict keeps the bare ejection token.
+    ejection.retry = None;
+    let bare = classify_with(&ejection);
+    assert_eq!(bare.blocked_on, "ejected_same_head:failed_checks");
+    assert_eq!(bare.blocked_detail, None);
+}
+
 fn app_bound_policy(contexts: &[&str]) -> StewardPolicy {
     let mut policy = queue_policy();
     policy.required_checks = contexts

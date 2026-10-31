@@ -248,6 +248,20 @@ pub fn next_action_with_environment(
                 verdict.reason
             )
         }
+        (PrQueueState::Ejected { reason, at, .. }, Some(verdict))
+            if verdict.allowed
+                && verdict.class
+                    == Some(crate::environment_requeue::RequeueClass::NotHeadCaused) =>
+        {
+            format!(
+                "Ejected for {reason} at {} by a failure that is NOT this head's fault ({}), and \
+                 this is the head's first ejection: re-enqueue this head once with `shipyard \
+                 ship --pr {pr}` (no new push needed); the merge steward does this on its own. \
+                 If the queue ejects it again, push a fix first.",
+                at.as_deref().unwrap_or("an unknown time"),
+                verdict.reason
+            )
+        }
         (PrQueueState::Ejected { reason, at, .. }, Some(verdict)) if verdict.allowed => {
             format!(
                 "Ejected for {reason} at {} by an ENVIRONMENT failure, and this is the head's \
@@ -486,6 +500,7 @@ mod tests {
             reason: "because".to_owned(),
             merge_group_commit: Some("2410ca497342".to_owned()),
             evidence: Vec::new(),
+            attribution: Vec::new(),
         };
         let allowed = next_action_with_environment(&state, 8678, Some(&verdict(true)));
         assert!(allowed.contains("ENVIRONMENT failure"), "{allowed}");

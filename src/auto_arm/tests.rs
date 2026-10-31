@@ -217,6 +217,7 @@ fn environment_verdict(allowed: bool) -> crate::environment_requeue::Environment
         reason: "test".to_owned(),
         merge_group_commit: None,
         evidence: Vec::new(),
+        attribution: Vec::new(),
     }
 }
 
