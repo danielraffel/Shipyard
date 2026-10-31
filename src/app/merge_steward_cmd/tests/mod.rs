@@ -140,6 +140,7 @@ fn queue_policy() -> StewardPolicy {
     StewardPolicy {
         merge_queue: true,
         native_auto_merge: true,
+        approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
         required_checks: vec![RequiredCheck {
             context: "macos".to_owned(),
             app_id: None,
@@ -198,6 +199,7 @@ mod admission;
 mod arm_guard;
 #[cfg(unix)]
 mod capacity;
+mod exact_head_merge;
 mod mutations;
 mod observation;
 #[cfg(unix)]
@@ -206,3 +208,5 @@ mod recovery;
 mod train_off;
 #[cfg(unix)]
 mod transient_rerun;
+#[cfg(unix)]
+mod unapproved_admission;

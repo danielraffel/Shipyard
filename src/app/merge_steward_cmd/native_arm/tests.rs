@@ -49,7 +49,7 @@ case "$*" in
   *isInMergeQueue*)
     printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"number":42,"state":"OPEN","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","isInMergeQueue":false,"mergeQueueEntry":null,"autoMergeRequest":null,"timelineItems":{{"pageInfo":{{"hasPreviousPage":false}},"nodes":[]}}}}}}}}}}' ;;
   *contents/.shipyard/config.toml*)
-    printf '%s\n' 'gh: Not Found (HTTP 404)' >&2; exit 1 ;;
+    printf '[auto_merge]\narm_requires_head_approval = false\n' ;;
   *) printf '%s' '{{}}' ;;
 esac"#
     )
@@ -417,6 +417,36 @@ fn a_repo_without_native_auto_merge_declines_the_whole_pass() {
     assert!(!log.exists());
 }
 
+/// A no-queue base is never armed, whether or not GitHub would allow it and
+/// whether or not the steward could merge it itself.
+#[cfg(unix)]
+#[test]
+fn a_no_queue_base_is_not_applicable_and_arms_nothing() {
+    let temp = tempfile::tempdir().expect("temp");
+    let log = temp.path().join("calls.log");
+    let actions = fake_gh(&temp, &never_armed_then_arms(&log.display().to_string()));
+    let mut observation = observation(pr_row(&serde_json::json!({})), true);
+    observation.merge_queue = false;
+    observation.required_checks.push(RequiredCheck {
+        context: "review-verdict".to_owned(),
+        app_id: Some(15368),
+    });
+    for apply in [false, true] {
+        let (status, unhealthy) = apply_native_arm_backstop(
+            &actions,
+            &observation,
+            &report(StewardDecision::Unmanaged),
+            "shipyard:no-auto-merge",
+            apply,
+            no_authority_needed,
+        );
+        assert!(!unhealthy, "{status:?}");
+        assert!(status.policy.starts_with("not applicable:"), "{status:?}");
+        assert!(status.results.is_empty(), "{status:?}");
+    }
+    assert!(!log.exists(), "no GitHub call at all");
+}
+
 /// An unreadable state is not an unarmed state, and it is worth a nonzero exit:
 /// the pass could not do its job.
 #[cfg(unix)]
@@ -476,7 +506,7 @@ case "$*" in
   *isInMergeQueue*)
     printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"number":42,"state":"OPEN","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","isInMergeQueue":false,"mergeQueueEntry":null,"autoMergeRequest":null,"timelineItems":{{"pageInfo":{{"hasPreviousPage":false}},"nodes":[]}}}}}}}}}}' ;;
   *contents/.shipyard/config.toml*)
-    printf '%s\n' 'gh: Not Found (HTTP 404)' >&2; exit 1 ;;
+    printf '[auto_merge]\narm_requires_head_approval = false\n' ;;
   *) printf '%s' '{{}}' ;;
 esac"#,
             log.display()
@@ -568,6 +598,45 @@ fn the_backstop_leaves_an_unapproved_head_disarmed() {
         calls.contains("contents/.shipyard/config.toml?ref=main"),
         "{calls}"
     );
+    assert!(!calls.contains("enablePullRequestAutoMerge"), "{calls}");
+}
+
+/// The backstop reads the base policy as strictly as the steward's enqueue and
+/// its unapproved-admission sweep: an absent config is not "approval not
+/// required", so nothing is armed and the pass reports the error. (Before, the
+/// backstop armed here and the sweep, failing closed, disarmed it again.)
+#[cfg(unix)]
+#[test]
+fn an_absent_base_policy_arms_nothing() {
+    let temp = tempfile::tempdir().expect("temp");
+    let log = temp.path().join("calls.log");
+    let actions = fake_gh(
+        &temp,
+        &never_armed_then_arms(&log.display().to_string()).replace(
+            "printf '[auto_merge]\\narm_requires_head_approval = false\\n' ;;",
+            "printf '%s\\n' 'gh: Not Found (HTTP 404)' >&2; exit 1 ;;",
+        ),
+    );
+    let observation = observation(pr_row(&serde_json::json!({})), true);
+    let (status, unhealthy) = apply_native_arm_backstop(
+        &actions,
+        &observation,
+        &report(StewardDecision::Unmanaged),
+        "shipyard:no-auto-merge",
+        true,
+        no_authority_needed,
+    );
+    assert!(unhealthy, "{status:?}");
+    assert_eq!(status.results[0].outcome, "skipped", "{status:?}");
+    assert!(
+        status.results[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("approval policy is required")),
+        "{status:?}"
+    );
+    let calls = std::fs::read_to_string(&log).expect("log");
+    assert!(calls.contains("contents/.shipyard/config.toml"), "{calls}");
     assert!(!calls.contains("enablePullRequestAutoMerge"), "{calls}");
 }
 
