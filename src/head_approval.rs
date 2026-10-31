@@ -1871,7 +1871,7 @@ fn read_policy_inner(
     base: &str,
     missing_is_error: bool,
     host_default: bool,
-) -> Result<ApprovalPolicy, String> {
+) -> Result<ApprovalPolicy, PolicyReadError> {
     let raw = match run_gh(&[
         "api".to_owned(),
         "-H".to_owned(),
@@ -1886,27 +1886,62 @@ fn read_policy_inner(
                 return Ok(policy);
             }
             if missing_is_error {
-                return Err(format!(
+                return Err(PolicyReadError::Absent(format!(
                     "{CONFIG_PATH} on {base} is absent; approval policy is required"
-                ));
+                )));
             }
             return Ok(ApprovalPolicy::default());
         }
-        Err(detail) => return Err(format!("{CONFIG_PATH} on {base} unreadable: {detail}")),
+        Err(detail) => {
+            return Err(PolicyReadError::Unreadable(format!(
+                "{CONFIG_PATH} on {base} unreadable: {detail}"
+            )));
+        }
     };
-    let table = raw
-        .parse::<toml::Table>()
-        .map_err(|error| format!("{CONFIG_PATH} on {base} does not parse: {error}"))?;
-    signers_shape(&table).map_err(|error| format!("{CONFIG_PATH} on {base}: {error}"))?;
-    signer_identities_shape(&table).map_err(|error| format!("{CONFIG_PATH} on {base}: {error}"))?;
+    let table = raw.parse::<toml::Table>().map_err(|error| {
+        PolicyReadError::Unreadable(format!("{CONFIG_PATH} on {base} does not parse: {error}"))
+    })?;
+    signers_shape(&table).map_err(|error| {
+        PolicyReadError::Unreadable(format!("{CONFIG_PATH} on {base}: {error}"))
+    })?;
+    signer_identities_shape(&table).map_err(|error| {
+        PolicyReadError::Unreadable(format!("{CONFIG_PATH} on {base}: {error}"))
+    })?;
     let mut policy = ApprovalPolicy::from_table_for_repo(&table, repo, host_default);
     policy.signers = policy.signers.or_else(|| host_signers(repo));
-    policy.validate().map(|()| policy)
+    policy
+        .validate()
+        .map(|()| policy)
+        .map_err(PolicyReadError::Unreadable)
+}
+
+/// Why [`read_policy_required`] produced no policy.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PolicyReadError {
+    /// A successful read found no config on the base: positive evidence that
+    /// no approval policy admits anything there.
+    Absent(String),
+    /// The config could not be read, or does not parse or validate.
+    Unreadable(String),
+}
+
+impl std::fmt::Display for PolicyReadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Absent(message) | Self::Unreadable(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl From<PolicyReadError> for String {
+    fn from(error: PolicyReadError) -> Self {
+        error.to_string()
+    }
 }
 
 /// Read the policy from `base` on GitHub, treating a missing file as default.
 pub fn read_policy(run_gh: RunGh<'_>, repo: &str, base: &str) -> Result<ApprovalPolicy, String> {
-    read_policy_inner(run_gh, repo, base, false, host_review_default())
+    read_policy_inner(run_gh, repo, base, false, host_review_default()).map_err(String::from)
 }
 
 /// Read the policy as the repository-side rule, with no host in it: review
@@ -1921,7 +1956,7 @@ pub fn read_policy_repository_side(
     repo: &str,
     base: &str,
 ) -> Result<ApprovalPolicy, String> {
-    let mut policy = read_policy_inner(run_gh, repo, base, false, true)?;
+    let mut policy = read_policy_inner(run_gh, repo, base, false, true).map_err(String::from)?;
     // No host's signers file reaches the repository-side rule: only the base
     // config's list, and with none listed no App APPROVE counts.
     policy.signers = read_base_signers(run_gh, repo, base)?;
@@ -1952,11 +1987,17 @@ fn read_base_signers(
 }
 
 /// Read the policy for the steward enqueue gate, where absence is unsafe.
+///
+/// # Errors
+///
+/// [`PolicyReadError::Absent`] when a successful read found no config (and the
+/// repository has no built-in default); [`PolicyReadError::Unreadable`] for
+/// any other failure.
 pub fn read_policy_required(
     run_gh: RunGh<'_>,
     repo: &str,
     base: &str,
-) -> Result<ApprovalPolicy, String> {
+) -> Result<ApprovalPolicy, PolicyReadError> {
     read_policy_inner(run_gh, repo, base, true, host_review_default())
 }
 
@@ -2014,10 +2055,37 @@ pub fn evaluate_excusing(
     latest_was_interruption: bool,
 ) -> Result<HeadGate, String> {
     let policy = read_policy(run_gh, repo, base)?;
+    evaluate_excusing_with_policy(
+        run_gh,
+        repo,
+        pr,
+        head,
+        &policy,
+        queue,
+        latest_was_interruption,
+    )
+}
+
+/// [`evaluate_excusing`] under an already-read `policy`, so a caller can
+/// choose how strictly the policy is read (for example
+/// [`read_policy_required`], where an absent config is an error).
+///
+/// # Errors
+///
+/// When a needed fact cannot be read. Callers must not arm on an error.
+pub fn evaluate_excusing_with_policy(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    pr: u64,
+    head: &str,
+    policy: &ApprovalPolicy,
+    queue: &Value,
+    latest_was_interruption: bool,
+) -> Result<HeadGate, String> {
     if !policy.required {
         return Ok(HeadGate::NotRequired);
     }
-    let author = pr_author(run_gh, repo, pr, &policy, None)?;
+    let author = pr_author(run_gh, repo, pr, policy, None)?;
     let reviews = read_records(
         run_gh,
         &format!("repos/{repo}/pulls/{pr}/reviews"),
@@ -2029,7 +2097,7 @@ pub fn evaluate_excusing(
         COMMENT_RECORD_JQ,
     )?;
     let gate = decide_for_author(
-        &policy,
+        policy,
         head,
         &reviews,
         &comments,
@@ -2043,7 +2111,7 @@ pub fn evaluate_excusing(
         head,
         reviews: &reviews,
         comments: &comments,
-        policy: &policy,
+        policy,
         author: author.as_deref(),
     };
     let gate = with_carry(run_gh, &input, gate);

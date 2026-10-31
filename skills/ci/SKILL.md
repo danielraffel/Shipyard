@@ -432,7 +432,10 @@ by another route, or ejected and left unarmed — is
 `[merge_queue].mutation_machine` host; each run is bounded by `/usr/bin/timeout`,
 and `--status` / `--uninstall` inspect or remove it). It acts only on pull
 requests the steward itself declines to own, so it cannot contend with the
-enqueue path, and it honours the central HOLD before arming. See the shipyard skill's
+enqueue path, and it honours the central HOLD before arming. It reads the base's
+reviewer policy strictly (an absent `.shipyard/config.toml` refuses the arm),
+matching the steward's sweep that withdraws arms and queue entries on
+unapproved heads. See the shipyard skill's
 [merge-steward reference](../shipyard/references/merge-steward.md).
 
 ## The unattended carrier: `runner carrier`

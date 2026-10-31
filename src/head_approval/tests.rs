@@ -754,6 +754,31 @@ fn a_config_that_sets_the_key_decides_over_the_default() {
     }
 }
 
+/// A 404 is positive evidence that the base has no config; any other failure
+/// is an unread config. Callers that act on absence must tell them apart.
+#[test]
+fn the_required_read_types_absence_apart_from_an_unreadable_config() {
+    let missing =
+        |_: &[String]| -> Result<String, String> { Err("gh: Not Found (HTTP 404)".to_owned()) };
+    let broken =
+        |_: &[String]| -> Result<String, String> { Err("HTTP 502: Bad Gateway".to_owned()) };
+    let garbled = |_: &[String]| -> Result<String, String> { Ok("not = [toml".to_owned()) };
+    super::with_host_review_default(false, || {
+        assert!(matches!(
+            super::read_policy_required(&missing, "owner/repo", "main"),
+            Err(super::PolicyReadError::Absent(_))
+        ));
+        assert!(matches!(
+            super::read_policy_required(&broken, "owner/repo", "main"),
+            Err(super::PolicyReadError::Unreadable(_))
+        ));
+        assert!(matches!(
+            super::read_policy_required(&garbled, "owner/repo", "main"),
+            Err(super::PolicyReadError::Unreadable(_))
+        ));
+    });
+}
+
 #[test]
 fn a_missing_config_on_a_listed_repository_follows_the_host_switch() {
     let missing =
