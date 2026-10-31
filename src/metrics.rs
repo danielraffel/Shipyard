@@ -1087,6 +1087,11 @@ impl MetricsStore {
               ON jobs(run_id);
             CREATE INDEX IF NOT EXISTS metrics_steps_job_id
               ON steps(job_id);
+            -- Freshness classifies each job by whether it has a github_job
+            -- step. Keep that existence probe bounded as the metrics store
+            -- grows; without this index a scorecard scans steps once per job.
+            CREATE INDEX IF NOT EXISTS steps_job_step
+              ON steps(job_id, step);
             CREATE TABLE IF NOT EXISTS merge_receipts (
               receipt_id TEXT PRIMARY KEY,
               schema TEXT NOT NULL,
@@ -1231,7 +1236,8 @@ impl MetricsStore {
     }
 
     /// Import validated merge receipts atomically. Duplicate receipt IDs are
-    /// idempotent only when the payload is byte-for-byte equivalent.
+    /// idempotent when the payload is equivalent after ownership-key
+    /// canonicalization, preserving compatibility with legacy mixed-case rows.
     fn insert_merge_receipt_tx(
         tx: &rusqlite::Transaction<'_>,
         receipt: &crate::metrics::merge_receipt::MergeReceipt,
@@ -1249,11 +1255,30 @@ impl MetricsStore {
         let existing: Option<ExistingMergeReceipt> = tx.query_row(
             "SELECT schema,repo,project,base_branch,pr,head_sha,validated_head_sha,merge_commit_sha,merged_at,source,required_checks_json,gate_receipt_sha256,evidence FROM merge_receipts WHERE receipt_id = ?1",
             [&receipt.receipt_id],
-            |row| Ok(ExistingMergeReceipt {
-                schema: row.get(0)?, repo: row.get(1)?, project: row.get(2)?, base_branch: row.get(3)?, pr: row.get(4)?,
-                head_sha: row.get(5)?, validated_head_sha: row.get(6)?, merge_commit_sha: row.get(7)?, merged_at: row.get(8)?,
-                source: row.get(9)?, required_checks_json: row.get(10)?, gate_receipt_sha256: row.get(11)?, evidence: row.get(12)?,
-            }),
+            |row| {
+                let existing_repo: String = row.get(1)?;
+                let existing_repo = crate::evidence::canonical_repository(&existing_repo);
+                let existing_project_raw: String = row.get(2)?;
+                let (existing_project, _) = crate::metrics::project_key::normalize_for_write(
+                    &existing_project_raw,
+                    Some(&existing_repo),
+                );
+                Ok(ExistingMergeReceipt {
+                    schema: row.get(0)?,
+                    repo: existing_repo,
+                    project: existing_project,
+                    base_branch: row.get(3)?,
+                    pr: row.get(4)?,
+                    head_sha: row.get(5)?,
+                    validated_head_sha: row.get(6)?,
+                    merge_commit_sha: row.get(7)?,
+                    merged_at: row.get(8)?,
+                    source: row.get(9)?,
+                    required_checks_json: row.get(10)?,
+                    gate_receipt_sha256: row.get(11)?,
+                    evidence: row.get(12)?,
+                })
+            },
         ).optional()?;
         if let Some(existing) = existing {
             let incoming = ExistingMergeReceipt {
@@ -4405,6 +4430,42 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+
+    #[test]
+    fn metrics_migration_indexes_freshness_step_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let conn = Connection::open(store.path()).unwrap();
+        let present: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'steps_job_step'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(present, 1);
+        let mut plan = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT 1 FROM jobs
+                 WHERE EXISTS (SELECT 1 FROM steps
+                               WHERE steps.job_id = jobs.id
+                                 AND steps.step = 'github_job')",
+            )
+            .unwrap();
+        let details: Vec<String> = plan
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("steps_job_step")),
+            "freshness probe plan did not use steps_job_step: {details:?}"
+        );
+    }
 
     fn insert_scorecard_sample(
         store: &MetricsStore,
