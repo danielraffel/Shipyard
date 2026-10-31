@@ -2,8 +2,6 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-#[cfg(unix)]
-use std::process::Command;
 use std::process::ExitCode;
 
 use chrono::Utc;
@@ -183,13 +181,16 @@ where
         .load(job_id)
         .map_err(|error| CliFailure::new(1, error.to_string()))?
         .ok_or_else(|| CliFailure::new(1, "durable request is missing"))?;
-    if envelope.job_id != job_id
-        || envelope.execution_owner != QueuedExecutionOwner::Daemon
-        || !envelope.is_daemon_admissible()
+    let foreground_already_merged = envelope.execution_owner == QueuedExecutionOwner::Foreground
+        && job
+            .cancellation_proof
+            .as_ref()
+            .is_some_and(|proof| proof.cause == crate::job::CancellationCause::AlreadyMerged);
+    if envelope.job_id != job_id || (!envelope.is_daemon_admissible() && !foreground_already_merged)
     {
         return Err(CliFailure::new(
             1,
-            "durable request is not exact daemon-owned work",
+            "durable request is not exact daemon-owned work or an authenticated foreground merge cancellation",
         ));
     }
     let provenance = envelope
@@ -426,69 +427,8 @@ fn require_daemon_stopped(state_dir: &Path) -> Result<(), CliFailure> {
 }
 
 fn related_process_inventory(job_id: &str, cwd: &Path) -> Result<Vec<String>, CliFailure> {
-    #[cfg(unix)]
-    {
-        let mut related = Vec::new();
-        let ps = Command::new("/bin/ps")
-            .args(["-axo", "pid=,ppid=,command="])
-            .output()
-            .map_err(|error| CliFailure::new(1, error.to_string()))?;
-        if !ps.status.success() {
-            return Err(CliFailure::new(1, "process inventory ps failed"));
-        }
-        for line in String::from_utf8_lossy(&ps.stdout).lines() {
-            if line.contains("execution-worker") && line.contains(job_id) {
-                related.push(line.trim().to_owned());
-            }
-        }
-        let lsof = Command::new("/usr/sbin/lsof")
-            .args(["-a", "-d", "cwd", "-Fn"])
-            .output()
-            .map_err(|error| {
-                CliFailure::new(1, format!("process cwd inventory failed: {error}"))
-            })?;
-        if !lsof.status.success() {
-            return Err(CliFailure::new(1, "process cwd inventory lsof failed"));
-        }
-        let canonical = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-        if !canonical.is_absolute() {
-            return Err(CliFailure::new(1, "durable worker cwd is not absolute"));
-        }
-        let canonical_text = canonical.to_string_lossy();
-        let current_pid = std::process::id().to_string();
-        let mut pid = None::<String>;
-        for line in String::from_utf8_lossy(&lsof.stdout).lines() {
-            if let Some(value) = line.strip_prefix('p') {
-                pid = Some(value.to_owned());
-            } else if let Some(value) = line.strip_prefix('n') {
-                let path = Path::new(value);
-                // lsof decorates an unlinked working directory as
-                // `/exact/path (deleted)`.  Preserve that as related rather
-                // than treating a retired checkout as proof of absence.
-                let deleted_or_descendant = value
-                    .strip_prefix(canonical_text.as_ref())
-                    .is_some_and(|suffix| {
-                        suffix.is_empty() || suffix.starts_with('/') || suffix.starts_with(' ')
-                    });
-                if (path == canonical || path.starts_with(&canonical) || deleted_or_descendant)
-                    && pid.as_deref() != Some(current_pid.as_str())
-                {
-                    related.push(format!("pid={} cwd={value}", pid.as_deref().unwrap_or("?")));
-                }
-            }
-        }
-        related.sort();
-        related.dedup();
-        Ok(related)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (job_id, cwd);
-        Err(CliFailure::new(
-            1,
-            "receiptless orphan process inventory is unsupported on this platform",
-        ))
-    }
+    crate::worker_process_custody::related_process_inventory(job_id, cwd)
+        .map_err(|error| CliFailure::new(1, error.to_string()))
 }
 
 fn render_orphan_reconciliation<W: Write>(

@@ -48,7 +48,7 @@ pub(super) fn mutate_pr_with_recovery(
     // `enqueue_pull_request_with_recovery` re-evaluates the gate on the live
     // head, so a moved head or a late HOLD is still refused fail-closed.
     if matches!(decision, StewardDecision::ArmMergeQueue)
-        && let Ok((gate, _events)) = read_head_gate(context, pr)
+        && let Ok((gate, _events)) = read_head_gate(context, pr, ledger)
         && !gate.allows()
     {
         return (
@@ -111,8 +111,10 @@ pub(super) fn mutate_pr_with_recovery(
 fn read_head_gate(
     context: &MutationApplyContext<'_>,
     pr: &ObservedPr,
+    ledger: &StewardLedger,
 ) -> Result<(crate::head_approval::HeadGate, Vec<String>), String> {
-    read_head_gate_with_queue_state(context, pr).map(|(gate, events, _queue)| (gate, events))
+    read_head_gate_with_queue_state(context, pr, ledger)
+        .map(|(gate, events, _queue)| (gate, events))
 }
 
 /// [`read_head_gate`], also returning the live queue-state response it read
@@ -121,50 +123,125 @@ fn read_head_gate(
 pub(super) fn read_head_gate_with_queue_state(
     context: &MutationApplyContext<'_>,
     pr: &ObservedPr,
+    ledger: &StewardLedger,
 ) -> Result<(crate::head_approval::HeadGate, Vec<String>, Value), String> {
-    let run_gh = |argv: &[String]| {
-        context
-            .actions
-            .run_gh(argv)
-            .map_err(|error| error.to_string())
-    };
-    let approval_policy = crate::head_approval::read_policy_required(
-        &run_gh,
-        &context.observation.repo,
-        &context.observation.base,
-    )
-    .map_err(|error| format!("head approval policy unreadable: {error}"))?;
-    let (owner, name) = context
-        .observation
-        .repo
-        .split_once('/')
-        .ok_or_else(|| "invalid repository slug".to_owned())?;
-    let raw = run_gh(&[
-        "api".to_owned(),
-        "graphql".to_owned(),
-        "-f".to_owned(),
-        format!("query={}", crate::pr_queue_state::PR_QUEUE_STATE_QUERY),
-        "-F".to_owned(),
-        format!("owner={owner}"),
-        "-F".to_owned(),
-        format!("name={name}"),
-        "-F".to_owned(),
-        format!("number={}", pr.fact.number),
-    ])
-    .map_err(|error| format!("merge-queue observation unreadable: {error}"))?;
-    let queue = serde_json::from_str::<Value>(&raw)
-        .map_err(|error| format!("merge-queue observation unreadable: {error}"))?;
-    let (gate, events) = crate::head_approval::evaluate_with_policy_for_author_with_events(
-        &run_gh,
-        &context.observation.repo,
-        pr.fact.number,
+    read_head_gate_for(context.actions, context.observation, pr, ledger)
+}
+
+/// [`read_head_gate_with_queue_state`] from read-only inputs, so an audit
+/// (dry-run) pass can judge a head without mutation control.
+pub(super) fn read_head_gate_for(
+    actions: &GitHubActions,
+    observation: &RepoObservation,
+    pr: &ObservedPr,
+    ledger: &StewardLedger,
+) -> Result<(crate::head_approval::HeadGate, Vec<String>, Value), String> {
+    let approval_policy = read_approval_policy(actions, observation)?;
+    let queue = read_pr_queue_state(actions, observation, pr.fact.number)?;
+    let (gate, events) = evaluate_head_gate(
+        actions,
+        observation,
+        pr,
         &pr.fact.head_sha,
         &approval_policy,
         &queue,
+        ledger,
+    )?;
+    Ok((gate, events, queue))
+}
+
+/// The base's reviewer policy, read strictly: an absent or unreadable config
+/// is an error, never "approval not required".
+fn read_approval_policy(
+    actions: &GitHubActions,
+    observation: &RepoObservation,
+) -> Result<crate::head_approval::ApprovalPolicy, String> {
+    let run_gh = |argv: &[String]| actions.run_gh(argv).map_err(|error| error.to_string());
+    crate::head_approval::read_policy_required(&run_gh, &observation.repo, &observation.base)
+        .map_err(|error| format!("head approval policy unreadable: {error}"))
+}
+
+/// The live `PR_QUEUE_STATE_QUERY` response for pull request `number`.
+pub(super) fn read_pr_queue_state(
+    actions: &GitHubActions,
+    observation: &RepoObservation,
+    number: u64,
+) -> Result<Value, String> {
+    let (owner, name) = observation
+        .repo
+        .split_once('/')
+        .ok_or_else(|| "invalid repository slug".to_owned())?;
+    let raw = actions
+        .run_gh(&[
+            "api".to_owned(),
+            "graphql".to_owned(),
+            "-f".to_owned(),
+            format!("query={}", crate::pr_queue_state::PR_QUEUE_STATE_QUERY),
+            "-F".to_owned(),
+            format!("owner={owner}"),
+            "-F".to_owned(),
+            format!("name={name}"),
+            "-F".to_owned(),
+            format!("number={number}"),
+        ])
+        .map_err(|error| format!("merge-queue observation unreadable: {error}"))?;
+    serde_json::from_str::<Value>(&raw)
+        .map_err(|error| format!("merge-queue observation unreadable: {error}"))
+}
+
+/// [`read_pr_queue_state`], refusing a 200 answer that carries no pull
+/// request: GraphQL `errors`, or `pullRequest: null`. That is an unread
+/// state, never a moved or unqueued head, so a caller that would act on the
+/// head's absence (the unapproved-admission sweep) must not see it as one.
+pub(super) fn read_pr_queue_state_strict(
+    actions: &GitHubActions,
+    observation: &RepoObservation,
+    number: u64,
+) -> Result<Value, String> {
+    let queue = read_pr_queue_state(actions, observation, number)?;
+    if let Some(errors) = queue.get("errors").filter(|errors| !errors.is_null()) {
+        return Err(format!("merge-queue observation unreadable: {errors}"));
+    }
+    if !queue
+        .pointer("/data/repository/pullRequest")
+        .is_some_and(Value::is_object)
+    {
+        return Err("merge-queue observation unreadable: no pull request in the answer".to_owned());
+    }
+    Ok(queue)
+}
+
+/// Evaluate `head` of `pr` against `approval_policy` and the live `queue`
+/// state. Queue removals of `head` the steward made itself are not counted
+/// toward [`crate::head_approval::EJECTION_CAP`]: withdrawing an entry it
+/// could not judge says nothing against the head.
+pub(super) fn evaluate_head_gate(
+    actions: &GitHubActions,
+    observation: &RepoObservation,
+    pr: &ObservedPr,
+    head: &str,
+    approval_policy: &crate::head_approval::ApprovalPolicy,
+    queue: &Value,
+    ledger: &StewardLedger,
+) -> Result<(crate::head_approval::HeadGate, Vec<String>), String> {
+    let run_gh = |argv: &[String]| actions.run_gh(argv).map_err(|error| error.to_string());
+    let recorded = super::unapproved_admission::steward_removal_times(
+        ledger,
+        &observation.repo,
+        pr.fact.number,
+        head,
+    );
+    let queue = &super::unapproved_admission::without_steward_removals(queue, head, &recorded);
+    crate::head_approval::evaluate_with_policy_for_author_with_events(
+        &run_gh,
+        &observation.repo,
+        pr.fact.number,
+        head,
+        approval_policy,
+        queue,
         pr.fact.author.as_deref(),
     )
-    .map_err(|error| format!("head approval unreadable: {error}"))?;
-    Ok((gate, events, queue))
+    .map_err(|error| format!("head approval unreadable: {error}"))
 }
 
 #[cfg(all(test, unix))]
@@ -199,7 +276,7 @@ fn enqueue_pull_request_with_recovery(
     let mut approval_app_id = None;
     let verdict_audit_events;
     {
-        match read_head_gate(context, pr) {
+        match read_head_gate(context, pr, ledger) {
             Ok((crate::head_approval::HeadGate::Approved { approval }, events)) => {
                 verdict_audit_events = events;
                 approval_comment_id = approval.comment_id();

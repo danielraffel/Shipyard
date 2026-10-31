@@ -14,8 +14,8 @@
 //!
 //! It never arms native auto-merge: an armed request survives a later push by
 //! anyone with write access and would then merge a head nobody judged. For the
-//! same reason any auto-merge request found armed on an owned pull request on
-//! such a base is disarmed, whatever the pull request's decision.
+//! same reason any auto-merge request found armed on an owned pull request, on
+//! this base or any other, is disarmed, whatever the pull request's decision.
 
 use super::{
     MutationApplyContext, ObservedPr, StewardDecision, StewardLedger, StewardPolicy, Value,
@@ -27,7 +27,7 @@ use crate::merge_queue_control::MergeQueueMutationGuard;
 
 /// GraphQL document that disarms native auto-merge. Variable: `id`.
 const DISABLE_AUTO_MERGE_MUTATION: &str = "mutation($id:ID!){disablePullRequestAutoMerge(input:\
-     {pullRequestId:$id}){pullRequest{number}}}";
+     {pullRequestId:$id}){pullRequest{number autoMergeRequest{enabledAt}}}}";
 
 /// GraphQL document that merges one exact head. Variables: `id`, `head`.
 const EXACT_HEAD_MERGE_MUTATION: &str = "mutation($id:ID!,$head:GitObjectID!)\
@@ -56,8 +56,8 @@ fn join(prior: Option<String>, next: &str) -> String {
     prior.map_or_else(|| next.to_owned(), |prior| format!("{prior},{next}"))
 }
 
-/// Whether the steward owns `decision` on a server-enforced base, and so must
-/// not leave an auto-merge request armed on it.
+/// Whether the steward owns `decision`, and so must not leave an auto-merge
+/// request armed on it on any base.
 pub(super) fn owns_for_disarm(decision: &StewardDecision) -> bool {
     !matches!(
         decision,
@@ -68,12 +68,22 @@ pub(super) fn owns_for_disarm(decision: &StewardDecision) -> bool {
     )
 }
 
-/// Disarm native auto-merge on `pr` under an already-held guard.
-fn disarm(
+/// Disarm native auto-merge on `pr` under an already-held guard, recording
+/// `audit_action` in the ledger.
+///
+/// The mutation goes through Shipyard's internal queue-mutation path
+/// ([`crate::cloud::GitHubActions::run_gh_internal_queue_mutation`]): the
+/// `ghapp` queue-removal guard judges `disablePullRequestAutoMerge` a queue
+/// removal and refuses it unless it carries the one-shot nonce that path
+/// issues, so a plain `gh` disarm would never reach GitHub behind the
+/// wrapper. Accepted only when GitHub answers with the pull request and no
+/// auto-merge request left on it.
+pub(super) fn disarm_under_guard(
     context: &MutationApplyContext<'_>,
     pr: &ObservedPr,
     ledger: &mut StewardLedger,
-) -> Result<String, String> {
+    audit_action: &str,
+) -> Result<(), String> {
     let args = vec![
         "api".to_owned(),
         "graphql".to_owned(),
@@ -82,17 +92,25 @@ fn disarm(
         "-F".to_owned(),
         format!("id={}", pr.node_id),
     ];
-    let raw = context.actions.run_gh(&args).map_err(|error| {
-        format!(
-            "PR #{} auto-merge could not be disarmed: {error}",
-            pr.fact.number
-        )
-    })?;
+    let raw = context
+        .actions
+        .run_gh_internal_queue_mutation(&args)
+        .map_err(|error| {
+            format!(
+                "PR #{} auto-merge could not be disarmed: {error}",
+                pr.fact.number
+            )
+        })?;
     let accepted = serde_json::from_str::<Value>(&raw).is_ok_and(|value| {
         value.get("errors").is_none()
             && value
                 .pointer("/data/disablePullRequestAutoMerge/pullRequest")
-                .is_some_and(|pull_request| !pull_request.is_null())
+                .is_some_and(|pull_request| {
+                    pull_request.is_object()
+                        && pull_request
+                            .get("autoMergeRequest")
+                            .is_none_or(Value::is_null)
+                })
     });
     if !accepted {
         return Err(format!(
@@ -105,13 +123,23 @@ fn disarm(
         ledger,
         &context.observation.repo,
         &format!("pr:{}:{}", pr.fact.number, pr.fact.head_sha),
-        "disable_auto_merge_server_enforced_base",
+        audit_action,
     );
+    Ok(())
+}
+
+/// Disarm native auto-merge on owned `pr`, under an already-held guard.
+fn disarm(
+    context: &MutationApplyContext<'_>,
+    pr: &ObservedPr,
+    ledger: &mut StewardLedger,
+) -> Result<String, String> {
+    disarm_under_guard(context, pr, ledger, "disable_auto_merge_owned_pr")?;
     Ok(format!("auto_merge_disabled:{}", pr.fact.head_sha))
 }
 
 /// Disarm an auto-merge request the census saw armed on an owned pull
-/// request. Disarming only removes authority, so it needs the mutation guard
+/// request, on any base. Disarming only removes authority, so it needs the mutation guard
 /// but no approval.
 pub(super) fn disarm_owned_auto_merge(
     context: &MutationApplyContext<'_>,
@@ -122,7 +150,7 @@ pub(super) fn disarm_owned_auto_merge(
         context.mutation_control,
         context.observation,
         pr,
-        "runner steward disable auto-merge on a server-enforced base",
+        "runner steward disable auto-merge on an owned pull request",
     ) {
         Ok(guard) => guard,
         Err(error) => return (None, Some(error)),
@@ -151,29 +179,29 @@ pub(super) fn merge_exact_head(
     ledger: &mut StewardLedger,
 ) -> (Option<String>, Option<String>) {
     let head = pr.fact.head_sha.clone();
-    let (approval, verdict_audit_events, queue) = match read_head_gate_with_queue_state(context, pr)
-    {
-        Ok((crate::head_approval::HeadGate::Approved { approval }, events, queue)) => {
-            (approval, events, queue)
-        }
-        Ok((crate::head_approval::HeadGate::NotRequired, _events, _queue)) => {
-            return (
-                Some("waiting_head_approval".to_owned()),
-                Some(format!(
-                    "head {} needs an exact-head approval: this base merges only approved \
+    let (approval, verdict_audit_events, queue) =
+        match read_head_gate_with_queue_state(context, pr, ledger) {
+            Ok((crate::head_approval::HeadGate::Approved { approval }, events, queue)) => {
+                (approval, events, queue)
+            }
+            Ok((crate::head_approval::HeadGate::NotRequired, _events, _queue)) => {
+                return (
+                    Some("waiting_head_approval".to_owned()),
+                    Some(format!(
+                        "head {} needs an exact-head approval: this base merges only approved \
                      heads, and head approval is not required here, so nothing was merged",
-                    head.get(..12).unwrap_or(&head)
-                )),
-            );
-        }
-        Ok((gate, _events, _queue)) => {
-            return (
-                Some("waiting_head_approval".to_owned()),
-                Some(gate.explain()),
-            );
-        }
-        Err(error) => return (None, Some(error)),
-    };
+                        head.get(..12).unwrap_or(&head)
+                    )),
+                );
+            }
+            Ok((gate, _events, _queue)) => {
+                return (
+                    Some("waiting_head_approval".to_owned()),
+                    Some(gate.explain()),
+                );
+            }
+            Err(error) => return (None, Some(error)),
+        };
     let queue_head = queue
         .pointer("/data/repository/pullRequest/headRefOid")
         .and_then(Value::as_str);

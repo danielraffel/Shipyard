@@ -12,6 +12,27 @@ Keep this doc in step with `src/ship_state.rs`, `src/ship.rs`,
 `src/app/watch_cmd.rs`, `src/app/auto_merge_cmd.rs`, and
 `src/app/cloud_cmd.rs`.
 
+## External durable work items
+
+ShipState also persists externally initiated work items under the same durable
+state root (`work-items/`). A work item is identified by its canonical
+repository, pull request, work kind, and release identity. Registration is
+idempotent and records the protocol/capability version and durable intent
+before an agent claims it. Claims advance a fencing epoch; checkpoints include
+the owner and epoch, so a stale session cannot write after another host has
+reclaimed the item. Checkpoints contain resumable context and remain usable
+after the original process, session, or host disappears. This is a persistence
+and fencing primitive, not autonomous takeover: cross-host reconciliation and
+privileged recovery remain default-off until shared fencing and failure
+injection evidence land.
+
+Work-item reads fail closed on corrupt or unsupported records. Registration
+compares the idempotency key, claims and checkpoints require an expected
+`state_version` and matching capability, and an expired owner cannot checkpoint
+until a fenced reclaim occurs. These checks protect intent from silent
+replacement and lost acknowledgements; they still do not authenticate a host
+or session by themselves.
+
 **Phase B** (transition tests, see below) and **Phase C** (pre-merge
 doc-sync hook, dedicated CI lane) land in follow-up PRs.
 
