@@ -225,6 +225,7 @@ pub(super) fn apply_repo_plan(
                 .iter()
                 .map(RequiredCheck::label)
                 .collect(),
+            blocked_summary: super::blocked_on::summarize(&reports, Utc::now()),
             prs: reports,
             cancellations,
             native_auto_merge_backstop: native_arm_status,
@@ -266,12 +267,13 @@ pub(super) fn apply_pr_plans(
         observation,
         ledger_path,
         mutation_control,
+        approval_blockers: std::cell::RefCell::default(),
     });
     let mut sweep_pass = super::unapproved_admission::SweepPass::new(args.unapproved_dequeue);
     if args.apply {
         super::unapproved_admission::prune(ledger, observation);
     }
-    let reports = observation
+    let mut reports = observation
         .prs
         .iter()
         .map(|pr| {
@@ -433,9 +435,22 @@ pub(super) fn apply_pr_plans(
                 decision,
                 mutation,
                 error,
+                blocked: super::blocked_on::Stall::default(),
             }
         })
-        .collect();
+        .collect::<Vec<_>>();
+    let approval_blockers = mutation_context
+        .map(|context| context.approval_blockers.take())
+        .unwrap_or_default();
+    super::blocked_on::annotate(
+        actions,
+        observation,
+        policy,
+        ledger,
+        &approval_blockers,
+        !args.apply,
+        &mut reports,
+    );
     (reports, unhealthy)
 }
 
@@ -458,6 +473,7 @@ fn provenance_blocked_report(
         decision: decision.clone(),
         mutation,
         error,
+        blocked: super::blocked_on::Stall::default(),
     })
 }
 

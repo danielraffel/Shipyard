@@ -109,6 +109,9 @@ struct PrReport {
     decision: StewardDecision,
     mutation: Option<String>,
     error: Option<String>,
+    /// Why this pull request is not merging, and since when.
+    #[serde(flatten)]
+    blocked: blocked_on::Stall,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -128,6 +131,8 @@ struct RepoReport {
     merge_path: String,
     required_contexts: Vec<String>,
     prs: Vec<PrReport>,
+    /// Counts by `blocked_on` token and the oldest blocked pull requests.
+    blocked_summary: blocked_on::BlockedSummary,
     cancellations: Vec<CancellationReport>,
     stale_pr_run_wedge: StalePrRunWedgeRepoStatus,
     native_auto_merge_backstop: native_arm::NativeArmRepoStatus,
@@ -397,7 +402,14 @@ struct MutationApplyContext<'a> {
     observation: &'a RepoObservation,
     ledger_path: &'a Path,
     mutation_control: &'a MutationControl,
+    /// Every exact-head approval verdict this pass read, by PR number: the
+    /// head it judged and, when refused, why. The report's `blocked_on` reads
+    /// it instead of asking GitHub again.
+    approval_blockers: std::cell::RefCell<ApprovalBlockers>,
 }
+
+/// Exact-head approval diagnoses read during one pass, by PR number.
+type ApprovalBlockers = BTreeMap<u64, (String, Option<crate::head_approval::ApprovalBlocker>)>;
 
 struct CapacityApplyContext<'a> {
     actions: &'a GitHubActions,
@@ -1226,6 +1238,7 @@ fn unreadable_repo_report(
         merge_path: "unreadable".to_owned(),
         required_contexts: Vec::new(),
         prs: Vec::new(),
+        blocked_summary: blocked_on::BlockedSummary::default(),
         cancellations: Vec::new(),
         stale_pr_run_wedge: stale_pr_wedge::repo_status(None, Vec::new(), ledger, repo),
         native_auto_merge_backstop: native_arm::NativeArmRepoStatus::default(),
@@ -1298,6 +1311,7 @@ fn append_unmatched_recovery_errors(
             merge_path: "pending_cancellation_recovery".to_owned(),
             required_contexts: Vec::new(),
             prs: Vec::new(),
+            blocked_summary: blocked_on::BlockedSummary::default(),
             cancellations,
             stale_pr_run_wedge: stale_pr_wedge::repo_status(None, Vec::new(), ledger, &repo),
             native_auto_merge_backstop: native_arm::NativeArmRepoStatus::default(),
@@ -1330,6 +1344,7 @@ fn persist_final_ledger(
             merge_path: "unreadable".to_owned(),
             required_contexts: Vec::new(),
             prs: Vec::new(),
+            blocked_summary: blocked_on::BlockedSummary::default(),
             cancellations: Vec::new(),
             stale_pr_run_wedge: stale_pr_wedge::repo_status(None, Vec::new(), ledger, "steward"),
             native_auto_merge_backstop: native_arm::NativeArmRepoStatus::default(),
@@ -1399,6 +1414,7 @@ fn acquire_ledger_lock(path: &Path) -> Result<crate::file_lock::LockedFile, CliF
     })
 }
 
+mod blocked_on;
 mod cancellation;
 mod cancellation_recovery;
 mod cancellation_revalidation;

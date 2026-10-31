@@ -120,6 +120,7 @@ fn report(decision: StewardDecision) -> Vec<PrReport> {
         decision,
         mutation: None,
         error: None,
+        blocked: crate::app::merge_steward_cmd::blocked_on::Stall::default(),
     }]
 }
 
