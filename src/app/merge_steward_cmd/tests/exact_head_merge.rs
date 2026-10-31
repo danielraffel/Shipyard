@@ -2,7 +2,6 @@
 //! GitHub-enforced, app-bound required approval context.
 use super::*;
 use crate::app::merge_steward_cmd::cancellation::apply_pr_plans;
-use crate::merge_steward::StewardCheckSource;
 
 const HEAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const MOVED: &str = "cccccccccccccccccccccccccccccccccccccccc";
@@ -36,7 +35,14 @@ fn no_queue_policy(required_checks: Vec<RequiredCheck>) -> StewardPolicy {
 
 /// The PR as GitHub reports it. `review-verdict` comes from the head's
 /// check-runs (app-bound), not the rollup.
-fn pr_json(head: &str, clean: bool, armed: bool) -> String {
+/// The PR as GitHub reports it; its rollup optionally carries an app-less `review-verdict` commit
+/// status in `state`, as the canonical workflow posts it.
+fn pr_json_with_status(head: &str, clean: bool, armed: bool, status: Option<&str>) -> String {
+    let status = status.map_or_else(String::new, |state| {
+        format!(
+            r#",{{"__typename":"StatusContext","context":"review-verdict","state":"{state}","createdAt":"2026-10-30T00:02:00Z"}}"#
+        )
+    });
     let state = if clean { "CLEAN" } else { "BLOCKED" };
     let auto_merge = if armed {
         r#"{"enabledAt":"2026-10-30T00:00:00Z"}"#
@@ -44,30 +50,41 @@ fn pr_json(head: &str, clean: bool, armed: bool) -> String {
         "null"
     };
     format!(
-        r#"{{"id":"PR_kw","number":42,"state":"OPEN","isDraft":false,"baseRefName":"main","headRefOid":"{head}","headRefName":"feature","mergeStateStatus":"{state}","autoMergeRequest":{auto_merge},"labels":[],"statusCheckRollup":[{{"__typename":"CheckRun","name":"macos","status":"COMPLETED","conclusion":"SUCCESS","completedAt":"2026-10-30T00:00:00Z","detailsUrl":"https://github.com/owner/repo/actions/runs/100"}}]}}"#
+        r#"{{"id":"PR_kw","number":42,"state":"OPEN","isDraft":false,"baseRefName":"main","headRefOid":"{head}","headRefName":"feature","mergeStateStatus":"{state}","autoMergeRequest":{auto_merge},"labels":[],"statusCheckRollup":[{{"__typename":"CheckRun","name":"macos","status":"COMPLETED","conclusion":"SUCCESS","completedAt":"2026-10-30T00:00:00Z","detailsUrl":"https://github.com/owner/repo/actions/runs/100"}}{status}]}}"#
     )
-}
-
-fn verdict_check(clean: bool) -> StewardCheck {
-    StewardCheck {
-        name: "review-verdict".to_owned(),
-        source: StewardCheckSource::CheckRun,
-        app_id: Some(ACTIONS_APP),
-        status: if clean { "COMPLETED" } else { "IN_PROGRESS" }.to_owned(),
-        conclusion: clean.then(|| "SUCCESS".to_owned()),
-        run_id: None,
-        observed_at: Some("2026-10-30T00:01:00Z".to_owned()),
-    }
 }
 
 /// The census row the steward observed.
 fn observed_pr(clean: bool, armed: bool) -> ObservedPr {
+    observed_pr_with(clean, armed, true, None)
+}
+
+/// A REST check-run row shaped as GitHub returns it for the canonical job.
+fn rest_check_run(clean: bool) -> String {
+    let (status, conclusion) = if clean {
+        ("completed", r#""success""#)
+    } else {
+        ("in_progress", "null")
+    };
+    format!(
+        r#"{{"id":9001,"name":"review-verdict","head_sha":"{HEAD}","status":"{status}","conclusion":{conclusion},"started_at":"2026-10-30T00:00:30Z","completed_at":"2026-10-30T00:01:00Z","details_url":"https://github.com/owner/repo/actions/runs/101/job/9001","app":{{"id":{ACTIONS_APP},"slug":"github-actions"}}}}"#
+    )
+}
+
+fn observed_pr_with(clean: bool, armed: bool, check_run: bool, status: Option<&str>) -> ObservedPr {
     let mut pr = parse_pr(
-        &serde_json::from_str(&pr_json(HEAD, clean, armed)).expect("PR json"),
+        &serde_json::from_str(&pr_json_with_status(HEAD, clean, armed, status)).expect("PR json"),
         &BTreeMap::new(),
     )
     .expect("PR");
-    pr.fact.checks.push(verdict_check(clean));
+    if check_run {
+        pr.fact.checks.push(
+            crate::app::merge_steward_cmd::observation::parse_rest_check(
+                &serde_json::from_str(&rest_check_run(clean)).expect("check run"),
+            )
+            .expect("check run"),
+        );
+    }
     pr
 }
 
@@ -97,6 +114,10 @@ struct Fixture<'a> {
     queue_head: &'a str,
     clean: bool,
     armed: bool,
+    /// Whether the head has the app-bound `review-verdict` check run.
+    check_run: bool,
+    /// The app-less `review-verdict` commit status, when one exists.
+    status: Option<&'a str>,
 }
 
 impl Fixture<'_> {
@@ -108,6 +129,8 @@ impl Fixture<'_> {
             queue_head: HEAD,
             clean: true,
             armed: false,
+            check_run: true,
+            status: None,
         }
     }
 
@@ -117,10 +140,10 @@ impl Fixture<'_> {
         } else {
             "null"
         };
-        let (status, conclusion) = if self.clean {
-            ("completed", r#""success""#)
+        let check_runs = if self.check_run {
+            rest_check_run(self.clean)
         } else {
-            ("in_progress", "null")
+            String::new()
         };
         format!(
             r#"
@@ -134,7 +157,7 @@ case "$*" in
   *"enqueuePullRequest"*) echo "a no-queue base must never enqueue" >&2; exit 91 ;;
   *"pulls/42/reviews"*) printf '' ;;
   *"issues/42/comments"*) printf '%s\n' '{comments}' ;;
-  *"/check-runs?"*) printf '%s' '{{"total_count":1,"check_runs":[{{"name":"review-verdict","status":"{status}","conclusion":{conclusion},"app":{{"id":{ACTIONS_APP}}},"completed_at":"2026-10-30T00:01:00Z"}}]}}' ;;
+  *"/check-runs?"*) printf '%s' '{{"check_runs":[{check_runs}]}}' ;;
   *"commits/{HEAD}"*) printf '%s' '2026-10-30T00:00:00Z' ;;
   *"isInMergeQueue"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"number":42,"state":"OPEN","headRefOid":"{queue_head}","isInMergeQueue":false,"mergeQueueEntry":null,"autoMergeRequest":{auto_merge},"timelineItems":{{"pageInfo":{{"hasPreviousPage":false}},"nodes":[]}}}}}}}}}}' ;;
   *"query=query("*"mergeQueue"*) printf '%s' '{{"data":{{"repository":{{"mergeQueue":null}}}}}}' ;;
@@ -146,7 +169,7 @@ esac
             policy = self.policy,
             comments = self.comments,
             queue_head = self.queue_head,
-            live_pr = pr_json(self.live_head, self.clean, self.armed),
+            live_pr = pr_json_with_status(self.live_head, self.clean, self.armed, self.status),
         )
     }
 }
@@ -165,7 +188,12 @@ fn run(fixture: &Fixture<'_>) -> Outcome {
     let temp = tempfile::tempdir().expect("temp");
     let log = temp.path().join("calls");
     let actions = fake_gh(&temp, &fixture.script(&log));
-    let pr = observed_pr(fixture.clean, fixture.armed);
+    let pr = observed_pr_with(
+        fixture.clean,
+        fixture.armed,
+        fixture.check_run,
+        fixture.status,
+    );
     let observation = observation(pr.clone());
     let policy = no_queue_policy(required(true));
     let mut ledger = StewardLedger::default();
@@ -477,4 +505,45 @@ fn an_armed_request_on_an_unapproved_waiting_head_is_disarmed() {
     assert!(calls.contains("disablePullRequestAutoMerge"), "{calls}");
     assert!(!calls.contains("mergePullRequest("), "{calls}");
     assert!(!calls.contains("enablePullRequestAutoMerge"), "{calls}");
+}
+
+/// The shape both live repositories show: the canonical job's check run from
+/// github-actions (app 15368) and an app-less status of the same name. The
+/// check run satisfies the bound rule; the status alone never does; and a
+/// refusing status refuses even when the job's check run is green, because
+/// the job succeeds whenever it posts a verdict.
+#[cfg(unix)]
+#[test]
+fn the_app_bound_check_run_counts_and_an_app_less_status_alone_does_not() {
+    let both = run(&Fixture {
+        status: Some("SUCCESS"),
+        ..Fixture::approved_clean()
+    });
+    assert_eq!(both.decision, StewardDecision::ArmMergeQueue);
+    assert_eq!(both.mutation, Some(format!("merged_exact_head:{HEAD}")));
+
+    let status_only = run(&Fixture {
+        check_run: false,
+        status: Some("SUCCESS"),
+        ..Fixture::approved_clean()
+    });
+    assert_eq!(
+        status_only.decision,
+        StewardDecision::WaitingRequired {
+            contexts: vec![format!("review-verdict (app_id={ACTIONS_APP})")]
+        }
+    );
+    assert_no_write(&status_only);
+
+    let refused = run(&Fixture {
+        status: Some("FAILURE"),
+        ..Fixture::approved_clean()
+    });
+    assert_eq!(
+        refused.decision,
+        StewardDecision::RequiredFailed {
+            contexts: vec!["review-verdict (commit status)".to_owned()]
+        }
+    );
+    assert_no_write(&refused);
 }

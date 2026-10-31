@@ -257,7 +257,8 @@ pub(super) fn merge_exact_head(
         }
     };
     if !(live.fact.merge_state.eq_ignore_ascii_case("CLEAN")
-        && crate::merge_steward::required_checks_all_succeeded(&live.fact, policy))
+        && crate::merge_steward::required_checks_all_succeeded(&live.fact, policy)
+        && crate::merge_steward::approval_status_agrees(&live.fact, policy))
     {
         return finish(
             guard,

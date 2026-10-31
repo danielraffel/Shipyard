@@ -2863,7 +2863,9 @@ pub(super) enum RunnerCommand {
         /// no current-head handoff receipt), so one cannot sit unqueued because
         /// nothing armed it. Audit-only without `--apply`. Drafts, failing
         /// required checks, conflicts, and heads the queue ejected are never
-        /// armed, and the queue-arm guard's refusals are honoured.
+        /// armed, and the queue-arm guard's refusals are honoured. A base with
+        /// no merge queue is never armed: there an armed request survives a
+        /// later push.
         #[arg(long = "arm-unqueued")]
         arm_unqueued: bool,
         /// Required check that reports exact-head approval. On a base with no

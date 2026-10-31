@@ -429,13 +429,11 @@ pub fn classify_pr(
         };
     }
     if policy.merge_queue || policy.server_enforced_exact_head_merge() {
-        // On a no-queue base this is only reached for a `CLEAN`, all-green
-        // head; the exact-head merge re-reads both and the approval gate.
         // The exact-head enqueue mutation is idempotent from the steward's
         // perspective and is stronger evidence than autoMergeRequest: GitHub
         // clears that field once a PR is in the queue, while a stranded native
         // request can remain armed without ever materializing a queue entry.
-        StewardDecision::ArmMergeQueue
+        approval_status_refusal(pr, policy).unwrap_or(StewardDecision::ArmMergeQueue)
     } else {
         StewardDecision::DirectMergeRefused {
             reasons: vec![DirectMergeRefusal::ValidatedBaseRevisionNotAtomic],
@@ -567,6 +565,50 @@ pub fn required_checks_all_succeeded(pr: &StewardPullRequest, policy: &StewardPo
                         "SUCCESS" | "NEUTRAL" | "SKIPPED"
                     )
             })
+        })
+}
+
+/// On a server-enforced base, the decision when the approval context's commit
+/// status refuses the head; see [`approval_status_agrees`].
+fn approval_status_refusal(
+    pr: &StewardPullRequest,
+    policy: &StewardPolicy,
+) -> Option<StewardDecision> {
+    (policy.server_enforced_exact_head_merge() && !approval_status_agrees(pr, policy)).then(|| {
+        StewardDecision::RequiredFailed {
+            contexts: vec![format!(
+                "{} (commit status)",
+                policy.approval_context.trim()
+            )],
+        }
+    })
+}
+
+/// Whether the newest commit status named after the approval context, if
+/// there is one, agrees with the app-bound check run that satisfies the rule.
+///
+/// The bound rule is satisfied by a check run carrying the app id; an
+/// app-less status of the same name never satisfies it. But the canonical
+/// `review-verdict` job succeeds whenever it posts a verdict and carries the
+/// verdict itself in a status of the same name, so a check run can be green
+/// while that status says the head is refused. A refusing status therefore
+/// refuses; an absent one leaves the check run to decide.
+#[must_use]
+pub fn approval_status_agrees(pr: &StewardPullRequest, policy: &StewardPolicy) -> bool {
+    let context = policy.approval_context.trim();
+    pr.checks
+        .iter()
+        .filter(|check| {
+            check.source == StewardCheckSource::StatusContext
+                && check.name.eq_ignore_ascii_case(context)
+        })
+        .max_by_key(|check| check_recency(check))
+        .is_none_or(|status| {
+            status.status.eq_ignore_ascii_case("COMPLETED")
+                && status
+                    .conclusion
+                    .as_deref()
+                    .is_some_and(|conclusion| conclusion.eq_ignore_ascii_case("SUCCESS"))
         })
 }
 
