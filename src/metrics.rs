@@ -1665,10 +1665,10 @@ impl MetricsStore {
                 for row in q.query_map(rusqlite::params![repo, head, pr], |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
                 })? {
-                let (status, ms) = row?;
-                if status == "skipped" {
-                    continue;
-                }
+                    let (status, ms) = row?;
+                    if status == "skipped" {
+                        continue;
+                    }
                     if ms.is_none_or(|v| v < 0) {
                         // A completed row with NULL/negative duration cannot
                         // substantiate a cost join. Keep the merge unjoined so
