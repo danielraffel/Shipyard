@@ -709,8 +709,8 @@ fn append_causes_and_fixlinks(
     let fixlinks = fixlinks(
         gh,
         query,
-        &run_index,
-        &incomplete_reds,
+        run_index,
+        incomplete_reds,
         pulls,
         report,
         linked,
@@ -1374,6 +1374,7 @@ fn pending(report: &mut RecordReport, red: &Red, now: &str) {
 }
 
 /// Fix-links for every red run attempt in the window that has turned green.
+#[allow(clippy::too_many_arguments)] // Keep the ordered discovery pass transactional.
 fn fixlinks(
     gh: &SyncGhReader<'_>,
     query: &RecordQuery,
