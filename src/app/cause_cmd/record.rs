@@ -20,7 +20,6 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::LazyLock;
 
-use fs2::FileExt;
 use regex::Regex;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -573,22 +572,16 @@ fn may_hold_red(run: &Value) -> bool {
 }
 
 /// One pass: causes for new red jobs, then fix-links for reds now green.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines)] // Keep observation and the short final append transaction ordered.
 pub(super) fn record(gh: &SyncGhReader<'_>, query: &RecordQuery) -> Result<RecordReport, String> {
     fs::create_dir_all(&query.dir).map_err(|error| error.to_string())?;
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(query.dir.join(".lock"))
-        .map_err(|error| error.to_string())?;
-    lock.lock_exclusive().map_err(|error| error.to_string())?;
-
+    super::require_archive_parent(&query.dir)?;
+    let (archived, linked) = {
+        let _lock = super::lock_archive(&query.dir, false)?;
+        (archived_causes(&query.dir)?, linked_fixlinks(&query.dir)?)
+    };
     let mut report = RecordReport::default();
     let mut pulls = BTreeMap::new();
-    super::require_archive_parent(&query.dir)?;
-    let archived = archived_causes(&query.dir)?;
-    let linked = linked_fixlinks(&query.dir)?;
     let mut incomplete_reds = BTreeSet::new();
     let recorded: BTreeSet<(String, u64)> = archived
         .iter()
@@ -667,57 +660,75 @@ pub(super) fn record(gh: &SyncGhReader<'_>, query: &RecordQuery) -> Result<Recor
                 .unwrap_or("undated")
                 .to_owned();
             by_month.entry(month).or_default().push(row);
-            report.causes_written += 1;
         }
     }
-    report.fixlinks_written = append_causes_and_fixlinks(
+    let mut all_causes = archived.clone();
+    for rows in by_month.values() {
+        all_causes.extend(rows.iter().cloned());
+    }
+    let observed_fixlinks = fixlinks(
         gh,
         query,
         &run_index,
+        &incomplete_reds,
         &mut pulls,
         &mut report,
-        &incomplete_reds,
         &linked,
-        &archived,
-        &by_month,
+        &all_causes,
     )?;
-    Ok(report)
-}
-
-#[allow(clippy::too_many_arguments)] // Keep archive append and link discovery in one ordered pass.
-fn append_causes_and_fixlinks(
-    gh: &SyncGhReader<'_>,
-    query: &RecordQuery,
-    run_index: &BTreeMap<u64, Value>,
-    pulls: &mut BTreeMap<String, Vec<Value>>,
-    report: &mut RecordReport,
-    incomplete_reds: &BTreeSet<(u64, u64)>,
-    linked: &BTreeSet<(String, u64, u64)>,
-    archived: &[Value],
-    by_month: &BTreeMap<String, Vec<Value>>,
-) -> Result<usize, String> {
+    // Network observation is complete before taking the exclusive lock. The
+    // final section only re-reads and appends, so scorecard readers are never
+    // blocked behind GitHub API calls or log downloads.
+    let _lock = super::lock_archive(&query.dir, true)?;
+    super::require_archive_parent(&query.dir)?;
+    let final_archived = archived_causes(&query.dir)?;
+    let final_linked = linked_fixlinks(&query.dir)?;
+    let recorded: BTreeSet<(String, u64)> = final_archived
+        .iter()
+        .filter_map(|row| Some((row["repo"].as_str()?.to_owned(), row["job_id"].as_u64()?)))
+        .collect();
+    let mut rows_to_append = BTreeMap::new();
     for (month, rows) in by_month {
+        let mut seen = BTreeSet::new();
+        let filtered: Vec<Value> = rows
+            .into_iter()
+            .filter(|row| {
+                let key = row["repo"]
+                    .as_str()
+                    .zip(row["job_id"].as_u64())
+                    .map(|(repo, job_id)| (repo.to_owned(), job_id));
+                key.as_ref()
+                    .is_none_or(|key| !recorded.contains(key) && seen.insert(key.clone()))
+            })
+            .collect();
+        if !filtered.is_empty() {
+            rows_to_append.insert(month, filtered);
+        }
+    }
+    report.causes_written = rows_to_append.values().map(Vec::len).sum();
+    for (month, rows) in &rows_to_append {
         append(
             &query.dir.join("causes").join(format!("{month}.jsonl")),
             rows,
         )?;
     }
-    let mut all_causes = archived.to_vec();
-    for rows in by_month.values() {
-        all_causes.extend(rows.iter().cloned());
+    let mut seen_links = final_linked;
+    let mut links_to_append = Vec::new();
+    for link in observed_fixlinks {
+        let attempt = link["red_attempt"].as_u64().unwrap_or(1);
+        let key = link["repo"]
+            .as_str()
+            .zip(link["red_run_id"].as_u64())
+            .map(|(repo, run_id)| (repo.to_owned(), run_id, attempt));
+        if let Some(key) = key
+            && seen_links.insert(key)
+        {
+            links_to_append.push(link);
+        }
     }
-    let fixlinks = fixlinks(
-        gh,
-        query,
-        run_index,
-        incomplete_reds,
-        pulls,
-        report,
-        linked,
-        &all_causes,
-    )?;
-    append(&query.dir.join("fixlinks.jsonl"), &fixlinks)?;
-    Ok(fixlinks.len())
+    append(&query.dir.join("fixlinks.jsonl"), &links_to_append)?;
+    report.fixlinks_written = links_to_append.len();
+    Ok(report)
 }
 
 /// The cause row of one failed job, or `None` when its payload says it did

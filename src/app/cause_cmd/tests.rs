@@ -264,6 +264,26 @@ fn two_archivers_at_once_lose_and_duplicate_nothing() {
 }
 
 #[test]
+fn archive_reader_holds_a_shared_snapshot_lock() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let writer = lock_archive(dir.path(), true).expect("writer lock");
+    drop(writer);
+    let reader = lock_archive(dir.path(), false).expect("reader lock");
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(dir.path().join(".lock"))
+        .expect("lock file");
+    assert!(
+        lock.try_lock_exclusive().is_err(),
+        "reader must exclude writers"
+    );
+    drop(reader);
+    lock.try_lock_exclusive()
+        .expect("writer can acquire after reader releases");
+}
+
+#[test]
 fn auxiliary_jsonl_files_do_not_prevent_canonical_archiving() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("fixlinks.jsonl"), "").unwrap();
