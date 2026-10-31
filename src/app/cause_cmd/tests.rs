@@ -279,8 +279,21 @@ fn archive_reader_holds_a_shared_snapshot_lock() {
         "reader must exclude writers"
     );
     drop(reader);
-    lock.try_lock_exclusive()
-        .expect("writer can acquire after reader releases");
+    // The kernel can take a moment to release the shared flock after the
+    // reader's descriptor closes (seen as WouldBlock on macOS), so poll the
+    // exclusive try-lock for a bounded time instead of asserting on the
+    // first attempt.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        match lock.try_lock_exclusive() {
+            Ok(()) => break,
+            Err(err) if std::time::Instant::now() < deadline => {
+                let _ = err;
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(err) => panic!("writer can acquire after reader releases: {err}"),
+        }
+    }
 }
 
 #[test]
