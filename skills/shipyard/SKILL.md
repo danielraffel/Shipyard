@@ -3615,7 +3615,11 @@ result explicitly escalates, with classification used only for routing. A
 global lease, overall deadline, and pre/post policy-evidence witnesses prevent
 parallel calls and stale authorization. This phase cannot edit, rerun, enqueue,
 merge, or release; quota/provider failures become typed terminal failures
-rather than blocking unrelated stewardship.
+rather than blocking unrelated stewardship. Provider authentication and
+transport failures are recorded with distinct `provider_auth_failure` or
+`provider_transport_failure` classes; they remain fail-closed and are eligible
+for one future bounded alternate-provider attempt, but this phase never selects
+an alternate provider implicitly.
 See [references/merge-steward.md](references/merge-steward.md) for the config,
 schema, limits, and exact authority boundary.
 
