@@ -138,6 +138,10 @@ minutes. Treat these as cost proxies only. A safely-merged-change denominator
 requires a durable merge receipt and remains unavailable when the local metrics
 store has only PR/job observations; never substitute distinct PR count.
 
+The freshness query classifies jobs through their `github_job` step marker.
+Keep the metrics-store `(steps.job_id, steps.step)` lookup index in migrations;
+without it, a growing store turns every scorecard into a per-job steps scan.
+
 The optional authenticated merge-receipt handoff uses
 `shipyard-merge-receipt-handoff-auth/v1`. Before an importer accepts it, the
 producer transport must bind the canonical payload digest to the exact

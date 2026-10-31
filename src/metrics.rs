@@ -1087,6 +1087,11 @@ impl MetricsStore {
               ON jobs(run_id);
             CREATE INDEX IF NOT EXISTS metrics_steps_job_id
               ON steps(job_id);
+            -- Freshness classifies each job by whether it has a github_job
+            -- step. Keep that existence probe bounded as the metrics store
+            -- grows; without this index a scorecard scans steps once per job.
+            CREATE INDEX IF NOT EXISTS steps_job_step
+              ON steps(job_id, step);
             CREATE TABLE IF NOT EXISTS merge_receipts (
               receipt_id TEXT PRIMARY KEY,
               schema TEXT NOT NULL,
@@ -1231,7 +1236,8 @@ impl MetricsStore {
     }
 
     /// Import validated merge receipts atomically. Duplicate receipt IDs are
-    /// idempotent only when the payload is byte-for-byte equivalent.
+    /// idempotent when the payload is equivalent after ownership-key
+    /// canonicalization, preserving compatibility with legacy mixed-case rows.
     fn insert_merge_receipt_tx(
         tx: &rusqlite::Transaction<'_>,
         receipt: &crate::metrics::merge_receipt::MergeReceipt,
@@ -1249,11 +1255,30 @@ impl MetricsStore {
         let existing: Option<ExistingMergeReceipt> = tx.query_row(
             "SELECT schema,repo,project,base_branch,pr,head_sha,validated_head_sha,merge_commit_sha,merged_at,source,required_checks_json,gate_receipt_sha256,evidence FROM merge_receipts WHERE receipt_id = ?1",
             [&receipt.receipt_id],
-            |row| Ok(ExistingMergeReceipt {
-                schema: row.get(0)?, repo: row.get(1)?, project: row.get(2)?, base_branch: row.get(3)?, pr: row.get(4)?,
-                head_sha: row.get(5)?, validated_head_sha: row.get(6)?, merge_commit_sha: row.get(7)?, merged_at: row.get(8)?,
-                source: row.get(9)?, required_checks_json: row.get(10)?, gate_receipt_sha256: row.get(11)?, evidence: row.get(12)?,
-            }),
+            |row| {
+                let existing_repo: String = row.get(1)?;
+                let existing_repo = crate::evidence::canonical_repository(&existing_repo);
+                let existing_project_raw: String = row.get(2)?;
+                let (existing_project, _) = crate::metrics::project_key::normalize_for_write(
+                    &existing_project_raw,
+                    Some(&existing_repo),
+                );
+                Ok(ExistingMergeReceipt {
+                    schema: row.get(0)?,
+                    repo: existing_repo,
+                    project: existing_project,
+                    base_branch: row.get(3)?,
+                    pr: row.get(4)?,
+                    head_sha: row.get(5)?,
+                    validated_head_sha: row.get(6)?,
+                    merge_commit_sha: row.get(7)?,
+                    merged_at: row.get(8)?,
+                    source: row.get(9)?,
+                    required_checks_json: row.get(10)?,
+                    gate_receipt_sha256: row.get(11)?,
+                    evidence: row.get(12)?,
+                })
+            },
         ).optional()?;
         if let Some(existing) = existing {
             let incoming = ExistingMergeReceipt {
@@ -1657,7 +1682,7 @@ impl MetricsStore {
         let mut samples = 0_usize;
         let mut duration_gaps = 0_usize;
         for ((repo, head), prs) in unique {
-            let mut q = conn.prepare("SELECT job.status, job.total_ms FROM jobs job JOIN runs run ON run.id = job.run_id WHERE lower(trim(run.repo)) = ?1 AND run.sha = ?2 AND run.pr = ?3 AND job.completed_at IS NOT NULL")?;
+            let mut q = conn.prepare("SELECT job.status, job.total_ms FROM jobs job JOIN runs run ON run.id = job.run_id WHERE lower(trim(run.repo)) = ?1 AND (run.head_sha = ?2 OR run.sha = ?2) AND run.pr = ?3 AND job.completed_at IS NOT NULL")?;
             let mut matched_pr = None;
             for pr in prs {
                 let mut pr_matched = false;
@@ -1665,7 +1690,10 @@ impl MetricsStore {
                 for row in q.query_map(rusqlite::params![repo, head, pr], |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
                 })? {
-                    let (_, ms) = row?;
+                    let (status, ms) = row?;
+                    if status == "skipped" {
+                        continue;
+                    }
                     if ms.is_none_or(|v| v < 0) {
                         // A completed row with NULL/negative duration cannot
                         // substantiate a cost join. Keep the merge unjoined so
@@ -4403,6 +4431,42 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn metrics_migration_indexes_freshness_step_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let conn = Connection::open(store.path()).unwrap();
+        let present: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'steps_job_step'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(present, 1);
+        let mut plan = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT 1 FROM jobs
+                 WHERE EXISTS (SELECT 1 FROM steps
+                               WHERE steps.job_id = jobs.id
+                                 AND steps.step = 'github_job')",
+            )
+            .unwrap();
+        let details: Vec<String> = plan
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("steps_job_step")),
+            "freshness probe plan did not use steps_job_step: {details:?}"
+        );
+    }
+
     fn insert_scorecard_sample(
         store: &MetricsStore,
         project: &str,
@@ -4980,6 +5044,44 @@ mod tests {
                     .1
                     == 1
         );
+    }
+
+    #[test]
+    fn safe_merge_summary_joins_authoritative_head_sha_when_legacy_sha_is_null() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        insert_scorecard_sample(&store, "repo", 12, "failure", 1000, 0, false);
+        let conn = store.connect().unwrap();
+        conn.execute(
+            "UPDATE runs SET repo='owner/repo', sha=NULL, head_sha=?1 WHERE pr=12",
+            [&"b".repeat(40)],
+        )
+        .unwrap();
+        let receipt = test_receipt("head-only", "owner/repo", "repo", 12, 'b');
+        store.import_merge_receipts(&[receipt]).unwrap();
+        let (total, joined, _, samples, gaps) = store
+            .safe_merge_summary("repo", "1970-01-01T00:00:00Z")
+            .unwrap();
+        assert_eq!((total, joined, samples, gaps), (1, 1, 1, 0));
+    }
+
+    #[test]
+    fn safe_merge_summary_keeps_legacy_sha_matches_when_both_heads_differ() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        insert_scorecard_sample(&store, "repo", 13, "failure", 1000, 0, false);
+        let conn = store.connect().unwrap();
+        conn.execute(
+            "UPDATE runs SET repo='owner/repo', sha=?1, head_sha=?2 WHERE pr=13",
+            [&"c".repeat(40), &"d".repeat(40)],
+        )
+        .unwrap();
+        let receipt = test_receipt("legacy-head", "owner/repo", "repo", 13, 'c');
+        store.import_merge_receipts(&[receipt]).unwrap();
+        let (_, joined, _, samples, gaps) = store
+            .safe_merge_summary("repo", "1970-01-01T00:00:00Z")
+            .unwrap();
+        assert_eq!((joined, samples, gaps), (1, 1, 0));
     }
 
     #[test]
