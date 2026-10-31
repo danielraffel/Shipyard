@@ -196,7 +196,7 @@ These came from running it for real:
   Anything that posts verdicts needs a mechanical check before it goes live;
   Shipyard now enforces held heads itself.
 - **Give every reviewer process its own signer and an attributed session.**
-  Verdicts from an unattributed session are discarded, and two processes
+  Approvals from an unattributed session don't count (a HOLD still does), and two processes
   sharing a signer can't be told apart. Scheduled (headless) runs must set a
   session id explicitly.
 - **Fail over between providers.** A headless review pass should retry on
