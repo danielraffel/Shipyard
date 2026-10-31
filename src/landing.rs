@@ -54,6 +54,7 @@ pub mod placement;
 pub mod pr_state;
 pub mod queue;
 pub mod render;
+pub mod strategy;
 pub mod verdict;
 pub mod verdict_gather;
 
@@ -128,6 +129,11 @@ pub struct SurfaceRead {
 pub enum SurfaceOutcome {
     /// The surface answered and the answer was parsed.
     Read,
+    /// The surface answered with a confirmed absence.
+    Absent {
+        /// Why the absence is authoritative.
+        detail: String,
+    },
     /// The surface answered, and the answer structurally cannot carry the
     /// fact being sought. Deliberately not `Read`: a surface that cannot
     /// express a queue must never be counted as having found no queue.
@@ -160,6 +166,8 @@ pub struct LandingReport {
     pub strict: queue::StrictFinding,
     /// How a pull request is put on the path to merge here.
     pub enqueue: queue::EnqueueGuidance,
+    /// Whether a configured rollup train should batch before landing.
+    pub batching: strategy::BatchingGuidance,
     /// Where each required context was last observed executing.
     pub required_checks: placement::PlacementFinding,
     /// Open pull requests grouped by mergeability.
@@ -194,6 +202,9 @@ impl LandingReport {
     /// are large enough to time out.
     #[must_use]
     pub fn has_unknown(&self) -> bool {
-        self.merge_queue.verdict.is_unknown() || self.strict.verdict.is_unknown()
+        self.merge_queue.verdict.is_unknown()
+            || self.strict.verdict.is_unknown()
+            || self.enqueue.action == "unknown"
+            || self.batching.action == strategy::BatchingAction::Unknown
     }
 }

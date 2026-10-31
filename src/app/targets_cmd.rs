@@ -273,6 +273,7 @@ fn targets_warm_status<W: Write>(
             target: entry.target,
             host: entry.host,
             backend: entry.backend,
+            member_id: entry.member_id,
             workdir: entry.workdir,
             sha: entry.sha,
             ttl_remaining_secs: round_one((entry.expires_at - now).max(0.0)),
@@ -466,6 +467,8 @@ struct WarmEntryRow {
     target: String,
     host: String,
     backend: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    member_id: Option<String>,
     workdir: String,
     sha: String,
     ttl_remaining_secs: f64,

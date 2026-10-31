@@ -31,6 +31,10 @@ use crate::landing::{LandingReport, SCHEMA_VERSION, SurfaceRead, backlog};
 /// How many completed runs to consider when deriving placement.
 pub const DEFAULT_RUN_SAMPLE: usize = 30;
 
+fn default_batching(queue: &queue::QueueFinding) -> crate::landing::strategy::BatchingGuidance {
+    crate::landing::strategy::batching_guidance(queue, &crate::rollup::Config::default())
+}
+
 /// How many per-run job reads to spend at most.
 pub const DEFAULT_MAX_JOB_READS: usize = 20;
 
@@ -50,6 +54,7 @@ pub struct GatherOptions<'a> {
 
 /// Read every surface and assemble the report.
 #[must_use]
+#[allow(clippy::too_many_lines)] // Keep the read-only landing evidence assembly in one auditable order.
 pub fn gather(actions: &GitHubActions, options: &GatherOptions<'_>) -> LandingReport {
     let mut surfaces: Vec<SurfaceRead> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
@@ -148,6 +153,7 @@ pub fn gather(actions: &GitHubActions, options: &GatherOptions<'_>) -> LandingRe
         finding
     };
     let base_jump = crate::base_health::jump_advice(repo, &base_health, chrono::Utc::now());
+    let batching = default_batching(&merge_queue);
 
     LandingReport {
         schema_version: SCHEMA_VERSION,
@@ -156,6 +162,7 @@ pub fn gather(actions: &GitHubActions, options: &GatherOptions<'_>) -> LandingRe
         merge_queue,
         strict,
         enqueue,
+        batching,
         required_checks: placement::PlacementFinding {
             contexts_source,
             checks,
@@ -210,16 +217,27 @@ fn read_rulesets(actions: &GitHubActions, repo: &str, inputs: &mut QueueInputs) 
             return calls;
         }
     };
-    let ids: Vec<u64> = list
-        .as_array()
-        .map(|items| {
-            items
-                .iter()
-                .filter(|item| item.get("target").and_then(Value::as_str) != Some("tag"))
-                .filter_map(|item| item.get("id").and_then(Value::as_u64))
-                .collect()
-        })
-        .unwrap_or_default();
+    let Some(items) = list.as_array() else {
+        inputs.rulesets_error = Some((
+            Boundary::Parse,
+            "rulesets response was not an array".to_owned(),
+        ));
+        return calls;
+    };
+    let mut ids = Vec::new();
+    for item in items {
+        if item.get("target").and_then(Value::as_str) == Some("tag") {
+            continue;
+        }
+        let Some(id) = item.get("id").and_then(Value::as_u64) else {
+            inputs.rulesets_error = Some((
+                Boundary::Parse,
+                "rulesets response contained a non-tag entry without a numeric id".to_owned(),
+            ));
+            return calls;
+        };
+        ids.push(id);
+    }
     let mut details = Vec::new();
     let mut detail_error: Option<(Boundary, String)> = None;
     for id in ids {

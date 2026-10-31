@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import json
+import hashlib
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -14,7 +15,7 @@ import release_macos_local
 
 
 def complete_release_assets() -> list[str]:
-    return list(release_macos_local.expected_release_assets("shipyard"))
+    return list(release_macos_local.expected_release_assets("shipyard", "all"))
 
 
 class FakeRunner(release_macos_local.CommandRunner):
@@ -30,6 +31,11 @@ class FakeRunner(release_macos_local.CommandRunner):
         self.checksum_names = checksum_names or [
             name for name in assets if name != "checksums.sha256"
         ]
+        self.payloads = {
+            name: f"fixture:{name}\n".encode("utf-8")
+            for name in assets
+            if name not in {"checksums.sha256", "shipyard-release-manifest.json"}
+        }
         self.commands: list[list[str]] = []
         self.envs: list[dict[str, str] | None] = []
 
@@ -49,11 +55,71 @@ class FakeRunner(release_macos_local.CommandRunner):
             return "true" if self.draft else "false"
         if args[:4] == ["gh", "release", "download", "--repo"]:
             output = Path(args[args.index("--output") + 1])
-            names = sorted({"shipyard-linux-x64", *self.checksum_names})
-            output.write_text(
-                "".join(f"{'0' * 64}  {name}\n" for name in names),
-                encoding="utf-8",
-            )
+            pattern = args[args.index("--pattern") + 1]
+            if pattern == "shipyard-release-manifest.json":
+                names = sorted(
+                    name
+                    for name in self.assets
+                    if name not in {"checksums.sha256", "shipyard-release-manifest.json"}
+                )
+                files = [
+                    {
+                        "name": name,
+                        "bytes": len(self.payloads[name]),
+                        "sha256": hashlib.sha256(self.payloads[name]).hexdigest(),
+                    }
+                    for name in names
+                ]
+                output.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "source": {
+                                "repository": "danielraffel/Shipyard",
+                                "tag": args[5],
+                                # GitHub Actions exposes GITHUB_SHA to the
+                                # release helper. Keep the fixture bound to the
+                                # same source identity so the tests remain
+                                # deterministic both locally and in CI.
+                                "commit": os.environ.get("GITHUB_SHA", ""),
+                                "run_id": 0,
+                                "run_attempt": 0,
+                            },
+                            "artifacts": [
+                                {
+                                    "target": "fixture",
+                                    "artifact_id": "fixture",
+                                    "artifact_digest": "0" * 64,
+                                    "files": files,
+                                }
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return ""
+            if pattern == "checksums.sha256":
+                names = sorted(
+                    {
+                        "shipyard-linux-x64",
+                        *{
+                            name
+                            for name in self.checksum_names
+                            if name != "shipyard-release-manifest.json"
+                        },
+                    }
+                )
+                payloads = dict(self.payloads)
+                payloads.setdefault("shipyard-linux-x64", b"fixture:shipyard-linux-x64\n")
+                output.write_text(
+                    "".join(
+                        f"{hashlib.sha256(payloads[name]).hexdigest()}  {name}\n"
+                        for name in names
+                    ),
+                    encoding="utf-8",
+                )
+            elif pattern in self.payloads:
+                output.write_bytes(self.payloads[pattern])
             return ""
         if args[:4] == ["gh", "release", "edit", "--repo"]:
             self.draft = "--draft=true" in args
@@ -76,18 +142,41 @@ class FakeRunner(release_macos_local.CommandRunner):
 
 
 class ReleaseMacosLocalTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # These tests exercise the full asset set; the focus switch has its own test.
+        patcher = mock.patch.dict(os.environ, {"CI_PLATFORM_FOCUS": "all"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_shell_wrapper_matches_mainline_entrypoint(self) -> None:
         wrapper = release_macos_local.ROOT / "scripts" / "release-macos-local.sh"
         content = wrapper.read_text(encoding="utf-8")
         self.assertIn("release_macos_local.py", content)
         self.assertTrue(os.access(wrapper, os.X_OK))
 
+    def test_macos_focus_expects_macos_and_both_linux_but_not_windows(self) -> None:
+        for focus in (None, "macos"):
+            with mock.patch.dict(os.environ, {}, clear=True):
+                assets = release_macos_local.expected_release_assets("shipyard", focus)
+            self.assertIn("shipyard-macos-arm64.dmg", assets)
+            self.assertIn("shipyard-workstream-provider-linux-x64", assets)
+            self.assertIn("checksums.sha256", assets)
+            self.assertIn("shipyard-linux-arm64", assets)
+            self.assertIn("shipyard-workstream-provider-linux-arm64", assets)
+            self.assertFalse([a for a in assets if "windows" in a])
+        with mock.patch.dict(os.environ, {"CI_PLATFORM_FOCUS": "all"}):
+            self.assertIn(
+                "shipyard-windows-x64.exe",
+                release_macos_local.expected_release_assets("shipyard"),
+            )
+
     def test_expected_release_assets_include_every_binary_and_checksums(self) -> None:
-        assets = release_macos_local.expected_release_assets("shipyard")
+        assets = release_macos_local.expected_release_assets("shipyard", "all")
         self.assertIn("shipyard-macos-arm64.dmg", assets)
         self.assertIn("shipyard-workstream-provider-linux-x64", assets)
         self.assertIn("shipyard-workstream-provider-linux-arm64", assets)
         self.assertIn("shipyard-workstream-provider-windows-x64.exe", assets)
+        self.assertIn("shipyard-release-manifest.json", assets)
         self.assertIn("checksums.sha256", assets)
 
     def test_missing_env_reports_all_required_names(self) -> None:
@@ -104,6 +193,60 @@ class ReleaseMacosLocalTests(unittest.TestCase):
         with self.assertRaises(SystemExit) as ctx:
             release_macos_local.require_arm64("x64")
         self.assertIn("arm64", str(ctx.exception))
+
+    def test_ci_publication_requires_job_identity_and_native_cli(self) -> None:
+        for env in ({}, {"GITHUB_TOKEN": "test-token"}, {"GITHUB_ACTIONS": "true"}):
+            with self.subTest(env=env), mock.patch.dict(os.environ, env, clear=True):
+                with self.assertRaisesRegex(SystemExit, "Actions job token"):
+                    release_macos_local.CommandRunner(ci_mode=True)
+        with mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true", "GITHUB_TOKEN": "test-token"}), mock.patch.object(release_macos_local.shutil, "which", return_value=None):
+            with self.assertRaisesRegex(SystemExit, "native gh"):
+                release_macos_local.CommandRunner(ci_mode=True)
+
+    def test_ci_publication_pins_native_cli_and_overrides_ambient_token(self) -> None:
+        with mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true", "GITHUB_TOKEN": "job-token", "GH_TOKEN": "ambient-token"}), mock.patch.object(release_macos_local.shutil, "which", return_value="/opt/homebrew/bin/gh") as discover, mock.patch.object(release_macos_local.subprocess, "run", return_value=mock.Mock(returncode=0, stdout="")) as run:
+            runner = release_macos_local.CommandRunner(ci_mode=True)
+            runner.run(["gh", "release", "view"])
+            runner.run(["gh", "release", "edit"])
+            discover.assert_called_once_with("gh", path="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
+            self.assertEqual(run.call_args.args[0][0], "/opt/homebrew/bin/gh")
+            self.assertEqual(run.call_args.kwargs["env"]["GH_TOKEN"], "job-token")
+
+    def test_require_ghapp_uses_explicit_runner_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            wrapper = Path(temp) / "managed-ghapp"
+            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+            wrapper.chmod(0o700)
+            with mock.patch.dict(
+                os.environ,
+                {release_macos_local.GHAPP_ENV: str(wrapper)},
+                clear=False,
+            ):
+                self.assertEqual(release_macos_local.require_ghapp(), str(wrapper))
+
+    def test_require_ghapp_resolves_path_with_unset_or_empty_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            wrapper = Path(temp) / "ghapp"
+            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+            wrapper.chmod(0o700)
+            for configured in (None, ""):
+                env = {"PATH": temp}
+                if configured is not None:
+                    env[release_macos_local.GHAPP_ENV] = configured
+                with self.subTest(configured=configured), mock.patch.dict(
+                    os.environ, env, clear=True
+                ):
+                    self.assertEqual(release_macos_local.require_ghapp(), str(wrapper))
+
+    def test_require_ghapp_does_not_use_missing_service_home(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {release_macos_local.GHAPP_ENV: "/Users/ci/.local/bin/ghapp"},
+            clear=False,
+        ):
+            with self.assertRaises(SystemExit) as ctx:
+                release_macos_local.require_ghapp()
+        self.assertIn(release_macos_local.GHAPP_ENV, str(ctx.exception))
 
     def test_package_signed_dmg_forwards_both_existing_binaries(self) -> None:
         config = release_macos_local.ReleaseConfig(
@@ -395,6 +538,37 @@ class ReleaseMacosLocalTests(unittest.TestCase):
         self.assertEqual(outcome, "partial")
         self.assertIn(f"checksum:{missing_name}", stdout.getvalue())
 
+    def test_manifest_byte_mismatch_is_fail_closed(self) -> None:
+        class TamperedRunner(FakeRunner):
+            def run(self, args: list[str], **kwargs: object) -> str:
+                if (
+                    args[:4] == ["gh", "release", "download", "--repo"]
+                    and args[args.index("--pattern") + 1] == "shipyard-linux-x64"
+                ):
+                    output = Path(args[args.index("--output") + 1])
+                    output.write_bytes(b"tampered release bytes\n")
+                    return ""
+                return super().run(args, **kwargs)
+
+        config = release_macos_local.ReleaseConfig(
+            tag="v0.127.0",
+            repo="danielraffel/Shipyard",
+            artifact_prefix="shipyard",
+            dist_dir=Path("dist"),
+            upload=True,
+            ci_mode=True,
+            skip_build=True,
+            binary=None,
+            cargo_target=None,
+        )
+        runner = TamperedRunner(assets=complete_release_assets())
+
+        with self.assertRaises(SystemExit) as ctx:
+            release_macos_local.publish_if_ready(config, runner)
+
+        self.assertIn("does not match identity manifest", str(ctx.exception))
+        self.assertTrue(runner.draft)
+
     def test_public_release_asset_visibility_can_retry(self) -> None:
         class EventuallyVisibleRunner(FakeRunner):
             def __init__(self) -> None:
@@ -562,9 +736,27 @@ class ReleaseMacosLocalTests(unittest.TestCase):
             )
 
             lines = checksums.read_text(encoding="utf-8").splitlines()
-            self.assertEqual(len(lines), 2)
+            self.assertEqual(len(lines), 3)
             self.assertTrue(any(line.endswith("  shipyard-linux-x64") for line in lines))
             self.assertTrue(any(line.endswith("  shipyard-macos-arm64.dmg") for line in lines))
+            self.assertTrue(any(line.endswith("  shipyard-release-manifest.json") for line in lines))
+
+    def test_ci_upload_uses_native_cli_replacement_without_local_credentials(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            artifact = Path(temp) / "shipyard-macos-arm64.dmg"
+            artifact.write_text("dmg", encoding="utf-8")
+            config = release_macos_local.ReleaseConfig(
+                tag="v0.1.0", repo="danielraffel/Shipyard", artifact_prefix="shipyard",
+                dist_dir=Path(temp), upload=True, ci_mode=True, skip_build=True,
+                binary=None, cargo_target=None,
+            )
+            runner = FakeRunner(assets=[])
+            with mock.patch.object(release_macos_local, "require_ghapp", side_effect=AssertionError("CI must not use local credentials")):
+                release_macos_local.upload_artifact_and_checksums(config, artifact, runner)
+            uploads = [command for command in runner.commands if command[:3] == ["gh", "release", "upload"]]
+            self.assertEqual(len(uploads), 3)  # artifact, identity manifest, checksums
+            self.assertTrue(all("--clobber" in command for command in uploads))
+            self.assertTrue(all("--replace-existing" not in command for command in uploads))
 
     def test_upload_uses_the_bounded_ghapp_publication_surface(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -576,7 +768,7 @@ class ReleaseMacosLocalTests(unittest.TestCase):
                 artifact_prefix="shipyard",
                 dist_dir=Path(temp),
                 upload=True,
-                ci_mode=True,
+                ci_mode=False,
                 skip_build=True,
                 binary=None,
                 cargo_target=None,
@@ -594,9 +786,15 @@ class ReleaseMacosLocalTests(unittest.TestCase):
                 command for command in runner.commands
                 if command[:3] == ["/Users/tester/.local/bin/ghapp", "release", "upload"]
             ]
-            self.assertEqual(len(uploads), 2)
+            self.assertEqual(len(uploads), 3)
             self.assertTrue(all("--replace-existing" in command for command in uploads))
             self.assertTrue(all("--clobber" not in command for command in uploads))
+            self.assertTrue(
+                any(
+                    any("shipyard-release-manifest.json" in argument for argument in command)
+                    for command in uploads
+                )
+            )
 
 
 class FleetRolloutStageTests(unittest.TestCase):

@@ -1,10 +1,16 @@
 import datetime as dt
+import contextlib
 import importlib.util
+import io
 import json
+import os
 import subprocess
+import sqlite3
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SPEC = importlib.util.spec_from_file_location("collect_baseline", Path(__file__).with_name("collect_baseline.py"))
 MOD = importlib.util.module_from_spec(SPEC)
@@ -13,6 +19,82 @@ import baseline_pass_history as history
 
 
 class BaselineScorecardTests(unittest.TestCase):
+    def test_transient_provider_failure_classifier_does_not_retry_validation_errors(self):
+        transient = subprocess.CompletedProcess(
+            ["shipyard"], 1, "", "Get https://api.github.com: dial tcp 1.2.3.4:443: i/o timeout",
+        )
+        validation = subprocess.CompletedProcess(["shipyard"], 1, "", "invalid provider export")
+        self.assertTrue(MOD.transient_provider_failure(transient))
+        self.assertFalse(MOD.transient_provider_failure(validation))
+        self.assertFalse(MOD.transient_provider_failure(subprocess.CompletedProcess(["shipyard"], 0, "", "")))
+
+    def test_transient_provider_failure_classifier_covers_provider_outage_markers(self):
+        for message in (
+            "gh: HTTP 502 Bad Gateway",
+            "HTTP 503 Service Unavailable",
+            "HTTP 504 Gateway Timeout",
+            "HTTP 429: API rate limit exceeded",
+            "GraphQL: API rate limit already exceeded",
+            "ssh: connect to host m5s port 22: Operation timed out",
+            "ssh: Connection closed by remote host",
+            "provider: unexpected EOF",
+            "provider: temporarily unavailable",
+            "provider: deadline exceeded",
+            "provider: rate_limit exceeded",
+            "provider: timeout",
+            "command timed out after 300s: tartci",
+        ):
+            with self.subTest(message=message):
+                self.assertTrue(MOD.transient_provider_failure(
+                    subprocess.CompletedProcess(["provider"], 1, "", message)
+                ))
+
+    def test_provider_import_retries_command_timeout(self):
+        calls = []
+
+        def run_attempt(command, **kwargs):
+            calls.append(command)
+            if len(calls) == 1:
+                raise RuntimeError("command timed out after 300s: provider")
+            return subprocess.CompletedProcess(command, 0, '{"imported": 3}', "")
+
+        with mock.patch.object(MOD, "run", side_effect=run_attempt):
+            with mock.patch.object(MOD.time, "sleep") as sleep:
+                result = MOD.run_provider_with_retry(["provider"], retries=2, delay_seconds=5)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(len(calls), 2)
+        sleep.assert_called_once_with(5)
+
+    def test_provider_retry_configuration_is_bounded_and_finite(self):
+        with self.assertRaises(ValueError):
+            MOD.run_provider_with_retry(["provider"], retries=MOD.MAX_PROVIDER_RETRIES + 1)
+        with self.assertRaises(ValueError):
+            MOD.run_provider_with_retry(["provider"], delay_seconds=float("nan"))
+        with self.assertRaises(ValueError):
+            MOD.run_provider_with_retry(["provider"], delay_seconds=MOD.MAX_PROVIDER_RETRY_DELAY_SECONDS + 1)
+
+    def test_provider_import_retries_transient_failure_with_bounded_backoff(self):
+        results = [
+            subprocess.CompletedProcess(["provider"], 1, "", "dial tcp 1.2.3.4:443: i/o timeout"),
+            subprocess.CompletedProcess(["provider"], 0, '{"imported": 3}', ""),
+        ]
+        calls = []
+        with mock.patch.object(MOD, "run", side_effect=lambda command, **kwargs: calls.append(command) or results.pop(0)):
+            with mock.patch.object(MOD.time, "sleep") as sleep:
+                result = MOD.run_provider_with_retry(["provider"], retries=2, delay_seconds=5)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(len(calls), 2)
+        sleep.assert_called_once_with(5)
+    def test_coverage_value_text_is_fail_closed_for_unavailable(self):
+        self.assertEqual(
+            MOD.coverage_value_text({"status": "unavailable", "value": None}),
+            "n/a",
+        )
+        self.assertEqual(
+            MOD.coverage_value_text({"status": "available", "value": 0.25}),
+            "0.25",
+        )
+
     def test_readiness_rejects_nonfinite_instrumentation_and_separates_lane_eligibility(self):
         started = dt.datetime(2026, 10, 1, tzinfo=dt.timezone.utc)
         observed = started + dt.timedelta(days=5)
@@ -153,6 +235,7 @@ class BaselineScorecardTests(unittest.TestCase):
                 MOD.run = original
             self.assertTrue(result["provenance_status"])
             self.assertEqual(result["collector_safe_merge_denominator"]["status"], "unavailable")
+            self.assertEqual(result["collector_safe_merge_rate"]["status"], "unavailable")
             self.assertEqual(result["strata"]["rerun"]["status"], "unavailable")
             self.assertEqual(commands[0][commands[0].index("--project") + 1], "Generous-Corp/pulp")
 
@@ -168,15 +251,33 @@ class BaselineScorecardTests(unittest.TestCase):
             finally:
                 MOD.run = original
             self.assertEqual(result["collector_safe_merge_denominator"], {"status": "available", "value": 2})
+            self.assertEqual(result["collector_safe_merge_rate"]["status"], "unavailable")
+
+    def test_scorecard_preserves_producer_safe_merge_rate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = type("Args", (), {"db": Path(directory) / "metrics" / "metrics.db", "project": "pulp", "repo": "Generous-Corp/pulp",
+                                      "shipyard": "shipyard", "since_days": 5, "timeout_seconds": 300})()
+            original = MOD.run
+            rate = {"status": "partial", "value": 0.25, "reason": "capacity lower bound"}
+            MOD.run = lambda *a, **k: subprocess.CompletedProcess(
+                a[0], 0, json.dumps({"safely_merged_changes_per_eligible_slot_hour": rate}), "")
+            try:
+                result = MOD.authoritative_scorecard(args)
+            finally:
+                MOD.run = original
+            self.assertEqual(result["collector_safe_merge_rate"], rate)
 
     def test_unavailable_handoff_masks_stale_local_receipt_metrics(self):
         card = {
             "safely_merged_changes": {"status": "available", "value": 2},
             "collector_safe_merge_denominator": {"status": "available", "value": 2},
+            "safely_merged_changes_per_eligible_slot_hour": {"status": "partial", "value": 0.5},
+            "collector_safe_merge_rate": {"status": "partial", "value": 0.5},
             "wasted_compute_per_safely_merged_change": {"status": "partial", "value": 4},
         }
         MOD.force_receipt_metrics_unavailable(card, "handoff is stale")
         for key in ("safely_merged_changes", "collector_safe_merge_denominator",
+                    "safely_merged_changes_per_eligible_slot_hour", "collector_safe_merge_rate",
                     "wasted_compute_per_safely_merged_change"):
             self.assertEqual(card[key]["status"], "unavailable")
             self.assertIsNone(card[key]["value"])
@@ -279,7 +380,362 @@ class BaselineScorecardTests(unittest.TestCase):
                 MOD.validate_state_identity(path, "demo", "o/r", db)
 
 
+class AutomaticObservationControlTests(unittest.TestCase):
+    def test_off_preserves_malformed_files_and_enabled_collection_fails_closed(self):
+        for value in ["off", "  OfF\t", None]:
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                db = root / "metrics" / "metrics.db"
+                db.parent.mkdir()
+                state = root / "status.json"
+                history_path = root / "history.json"
+                markdown = root / "status.md"
+                for path in [db, state, history_path, markdown]:
+                    path.write_text("existing evidence must remain unchanged")
+                originals = {path: path.read_bytes() for path in [db, state, history_path, markdown]}
+                called = root / "provider-called"
+                provider = root / "provider"
+                provider.write_text(
+                    "#!%s\nimport pathlib,sys\npathlib.Path(%r).touch()\nsys.exit(3)\n"
+                    % (os.sys.executable, str(called))
+                )
+                provider.chmod(0o755)
+                env = os.environ.copy()
+                env.pop("SHIPYARD_OBSERVATIONS", None)
+                if value is not None:
+                    env["SHIPYARD_OBSERVATIONS"] = value
+                result = subprocess.run([
+                    os.sys.executable, str(Path(MOD.__file__)), "--collect",
+                    "--db", str(db), "--project", "pulp", "--repo", "o/pulp",
+                    "--state", str(state), "--pass-history", str(history_path),
+                    "--status-markdown", str(markdown), "--shipyard", str(provider),
+                    "--tartci", str(provider),
+                ], env=env, capture_output=True, text=True, check=False)
+                if value is not None:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertFalse(called.exists())
+                    self.assertIn("collection disabled", result.stderr)
+                    self.assertEqual({path: path.read_bytes() for path in originals}, originals)
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(called.exists(), result.stderr)
+                    self.assertRegex(result.stderr, "baseline state is unreadable|baseline collection failed")
+                    self.assertEqual({path: path.read_bytes() for path in originals}, originals)
+
+    def test_enabled_valid_state_invokes_provider_and_records_failed_pass(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            db = root / "metrics" / "metrics.db"
+            db.parent.mkdir()
+            state = root / "status.json"
+            state.write_text(json.dumps({"identity": MOD.state_identity(state, "pulp", "o/pulp", db)}))
+            history_path = root / "history.json"
+            history_path.write_text(json.dumps(history.PassHistory.create(
+                repository="o/pulp", source_identity="shipyard.collect_baseline:v1",
+                config_identity="baseline-policy:v1;interval=3600;slack=300",
+                expected_interval_secs=3600,
+            ).to_dict()))
+            original_state = state.read_bytes()
+            called = root / "provider-called"
+            provider = root / "provider"
+            provider.write_text(
+                "#!%s\nimport pathlib,sys\npathlib.Path(%r).touch()\n"
+                "print('invalid export', file=sys.stderr)\nsys.exit(3)\n"
+                % (os.sys.executable, str(called))
+            )
+            provider.chmod(0o755)
+            env = os.environ.copy()
+            env.pop("SHIPYARD_OBSERVATIONS", None)
+            result = subprocess.run([
+                os.sys.executable, str(Path(MOD.__file__)), "--collect",
+                "--db", str(db), "--project", "pulp", "--repo", "o/pulp",
+                "--state", str(state), "--pass-history", str(history_path),
+                "--shipyard", str(provider), "--tartci", str(provider),
+            ], env=env, capture_output=True, text=True, check=False)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertTrue(called.exists(), result.stderr)
+            self.assertIn("invalid export", result.stderr)
+            self.assertEqual(state.read_bytes(), original_state)
+            observations = json.loads(history_path.read_text())["observations"]
+            self.assertEqual(len(observations), 1)
+            self.assertEqual(observations[0]["status"], "failed")
+            self.assertIn("invalid export", observations[0]["error"])
+
+class BaselineStateRetentionTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "state.json"
+        self.started = dt.datetime(2026, 10, 1, tzinfo=dt.timezone.utc)
+        self.observed = self.started + dt.timedelta(days=29)
+        self.card = {"missing_strata": ["rerun"]}
+
+    def row(self, at):
+        return {"at": at.isoformat(), "source_activity_dates": [at.date().isoformat()],
+                "events": [{"new_rows": 1}], "scorecard": self.card}
+
+    def seed(self, rows):
+        self.path.write_text(json.dumps({"started_at": self.started.isoformat(), "observations": rows}))
+
+    def update(self, **kwargs):
+        return MOD.update_state(self.path, "pulp", self.started,
+                                kwargs.pop("card", self.card), kwargs.pop("events", []),
+                                observed_at=kwargs.pop("observed_at", self.observed), **kwargs)
+
+    def test_age_boundary_and_count_cap_keep_newest_observations(self):
+        cutoff = self.observed - dt.timedelta(days=14)
+        old = cutoff - dt.timedelta(seconds=1)
+        recent = self.observed - dt.timedelta(days=1)
+        self.seed([self.row(recent), self.row(old), self.row(cutoff)])
+        state = self.update()
+        self.assertEqual([row["at"] for row in state["observations"]],
+                         [cutoff.isoformat(), recent.isoformat()])
+        self.assertEqual(state["observation_retention"]["max_observations"], 1024)
+        state = self.update(state_max_observations=1)
+        self.assertEqual(state["observations"], [self.row(recent)])
+        self.assertEqual(state["collection_days_observed"], 1)
+        self.assertEqual(state["source_activity_days_observed"], 1)
+        self.assertEqual(state["observation_retention"]["counter_scope"], "retained_observations")
+        self.assertEqual(state["started_at"], self.started.isoformat())
+
+    def test_longer_retention_keeps_older_observations(self):
+        self.seed([self.row(self.started), self.row(self.observed)])
+        state = self.update(state_retention_days=30, state_max_observations=2000)
+        self.assertEqual(len(state["observations"]), 2)
+        self.assertEqual(state["observation_retention"]["days"], 30)
+        self.assertEqual(state["observation_retention"]["max_observations"], 2000)
+
+    def test_default_count_limit_caps_existing_large_state(self):
+        self.seed([self.row(self.observed - dt.timedelta(seconds=index)) for index in range(1025)])
+        state = self.update()
+        self.assertEqual(len(state["observations"]), 1024)
+        self.assertEqual(state["observations"][0]["at"], (self.observed - dt.timedelta(seconds=1023)).isoformat())
+        self.assertEqual(state["observations"][-1]["at"], self.observed.isoformat())
+
+    def test_repeated_writes_and_status_only_expiry_remain_bounded(self):
+        for index in range(20):
+            observed = self.started + dt.timedelta(hours=index)
+            state = self.update(observed_at=observed, state_max_observations=3,
+                                events=[{"new_rows": 1}], card={"sample": index})
+            self.assertLessEqual(len(state["observations"]), 3)
+            self.assertEqual(json.loads(self.path.read_text()), state)
+        self.assertEqual([row["scorecard"]["sample"] for row in state["observations"]], [17, 18, 19])
+        state = self.update(record_observation=False)
+        self.assertEqual(state["observations"], [])
+        self.assertEqual(state["collection_weekday_days"], 0)
+        self.assertEqual(state["weekday_days_observed"], 0)
+
+    def test_retention_does_not_change_authoritative_readiness(self):
+        observed = self.started + dt.timedelta(days=5)
+        store = history.PassHistory.create(repository="o/pulp", source_identity="test",
+                                            config_identity="test", expected_interval_secs=3600)
+        for index in range(121):
+            at = self.started + dt.timedelta(hours=index)
+            store.append(history.PassObservation.success(
+                repo="o/pulp", observed_at=at, expected_interval_secs=3600,
+                source_identity="test", config_identity="test"), now=at)
+        summary = store.summarize(self.started, observed)
+        card = {
+            "instrumentation_coverage": {"status": "available", "continuous": True, "continuous_days": 5},
+            "important_lanes": {"lane": {"status": "available", "completed_jobs": 30}},
+            "host_generations": {"host": {"status": "available", "completed_jobs": 10}},
+            "strata": {name: {"provenance": "authenticated", "coverage": "complete"}
+                       for name in MOD.REQUIRED_STRATA},
+            "strata_sufficiency": {name: {"status": "sufficient"} for name in MOD.REQUIRED_STRATA},
+        }
+        expected = MOD.baseline_readiness(card, self.started, observed, summary)
+        self.assertTrue(expected["exit"])
+        for days, count in ((1, 1), (30, 2000)):
+            self.seed([self.row(self.started), self.row(observed)])
+            state = self.update(card=card, observed_at=observed, pass_history=summary,
+                                state_retention_days=days, state_max_observations=count)
+            self.assertEqual(state["baseline_readiness"], expected)
+            self.assertEqual(state["pass_history"], summary)
+        failed = dict(summary, failing_intervals=[{"reason": "provider failed"}])
+        state = self.update(card=card, observed_at=observed, pass_history=failed,
+                            state_retention_days=1, state_max_observations=1)
+        self.assertFalse(state["baseline_exit"])
+        self.assertEqual(state["baseline_readiness"],
+                         MOD.baseline_readiness(card, self.started, observed, failed))
+
+    def test_malformed_state_is_preserved_even_when_row_would_expire(self):
+        valid = {"started_at": self.started.isoformat(), "observations": [self.row(self.started)]}
+        invalid = [[], {"observations": {}}, {"started_at": "2026-10-01", "observations": []},
+                   {"observations": [self.row(self.started)]},
+                   dict(valid, last_observed_at=(self.observed + dt.timedelta(seconds=1)).isoformat()),
+                   dict(valid, observations=[None]),
+                   dict(valid, observations=[{"at": "garbage"}]),
+                   dict(valid, observations=[{"at": "2026-10-01T00:00:00"}]),
+                   dict(valid, observations=[self.row(self.observed + dt.timedelta(seconds=1))]),
+                   dict(valid, observations=[dict(self.row(self.started), source_activity_dates=["invalid"])]),
+                   dict(valid, observations=[dict(self.row(self.started), events="invalid")]),
+                   dict(valid, observations=[dict(self.row(self.started), scorecard=[])])]
+        for value in invalid:
+            with self.subTest(value=value):
+                original = json.dumps(value)
+                self.path.write_text(original)
+                with self.assertRaises(ValueError):
+                    self.update()
+                self.assertEqual(self.path.read_text(), original)
+
+    def test_invalid_retention_options_do_not_replace_state(self):
+        self.seed([self.row(self.started)])
+        original = self.path.read_bytes()
+        for name in ("state_retention_days", "state_max_observations"):
+            for value in (0, -1, True, 1.5, "14"):
+                with self.subTest(name=name, value=value), self.assertRaises(ValueError):
+                    self.update(**{name: value})
+                self.assertEqual(self.path.read_bytes(), original)
+
+    def test_cli_options_reject_invalid_values_before_collection(self):
+        base = ["collect_baseline.py", "--db", str(self.path.parent / "metrics/metrics.db"),
+                "--project", "pulp", "--repo", "o/pulp", "--state", str(self.path), "--collect"]
+        for option in ("--state-retention-days", "--state-max-observations"):
+            for value in ("0", "-1", "1.5"):
+                with self.subTest(option=option, value=value), mock.patch.object(sys, "argv", base + [option, value]), \
+                        mock.patch.object(MOD, "import_organic") as collect, contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as raised:
+                        MOD.main()
+                    self.assertEqual(raised.exception.code, 2)
+                    collect.assert_not_called()
+        self.assertFalse(self.path.exists())
+
+    def test_cli_status_only_threads_retention_without_importing(self):
+        self.seed([self.row(self.started)])
+        argv = ["collect_baseline.py", "--db", str(self.path.parent / "metrics/metrics.db"),
+                "--project", "pulp", "--repo", "o/pulp", "--state", str(self.path),
+                "--state-retention-days", "30", "--state-max-observations", "2"]
+        # Identity is mandatory when old observations are present.
+        state = json.loads(self.path.read_text())
+        state["identity"] = MOD.state_identity(self.path, "pulp", "o/pulp", self.path.parent / "metrics/metrics.db")
+        self.path.write_text(json.dumps(state))
+        output = io.StringIO()
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(MOD, "import_organic") as collect, \
+                mock.patch.object(MOD, "authoritative_scorecard", return_value=self.card), \
+                contextlib.redirect_stdout(output):
+            self.assertEqual(MOD.main(), 0)
+        collect.assert_not_called()
+        self.assertEqual(json.loads(output.getvalue())["baseline"]["observation_retention"]["max_observations"], 2)
+        self.assertFalse(json.loads(self.path.read_text())["baseline_exit"])
+
+    def test_cli_bad_state_stops_before_imports_or_history_mutation(self):
+        self.path.write_text("[]")
+        argv = ["collect_baseline.py", "--db", str(self.path.parent / "metrics/metrics.db"),
+                "--project", "pulp", "--repo", "o/pulp", "--state", str(self.path), "--collect"]
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(MOD, "import_organic") as collect, \
+                mock.patch.object(MOD, "record_pass_observation") as record, contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(MOD.main(), 1)
+        collect.assert_not_called()
+        record.assert_not_called()
+        self.assertEqual(self.path.read_text(), "[]")
+
+    def test_atomic_replace_failure_preserves_original_state(self):
+        self.seed([self.row(self.started)])
+        original = self.path.read_bytes()
+        with mock.patch.object(MOD.os, "replace", side_effect=OSError("replace failed")):
+            with self.assertRaisesRegex(OSError, "replace failed"):
+                self.update()
+        self.assertEqual(self.path.read_bytes(), original)
+
+    def test_cli_invalid_identity_preserves_state_and_history_in_both_modes(self):
+        db = self.path.parent / "metrics/metrics.db"
+        pass_path = self.path.parent / "passes.json"
+        pass_path.write_text("existing history must not be touched")
+        base = ["collect_baseline.py", "--db", str(db), "--project", "pulp",
+                "--repo", "o/pulp", "--state", str(self.path), "--pass-history", str(pass_path)]
+        valid_identity = MOD.state_identity(self.path, "pulp", "o/pulp", db)
+        for identity in (None, [], "invalid", dict(valid_identity, repo="other/pulp")):
+            for collect_flag in ([], ["--collect"]):
+                with self.subTest(identity=identity, collect=bool(collect_flag)):
+                    state = {"started_at": self.started.isoformat(), "observations": [self.row(self.started)]}
+                    if identity is not None:
+                        state["identity"] = identity
+                    original = json.dumps(state)
+                    self.path.write_text(original)
+                    with mock.patch.object(sys, "argv", base + collect_flag), \
+                            mock.patch.object(MOD, "import_organic") as collect, \
+                            mock.patch.object(MOD, "authoritative_scorecard") as scorecard, \
+                            mock.patch.object(MOD, "record_pass_observation", wraps=MOD.record_pass_observation) as record, \
+                            contextlib.redirect_stderr(io.StringIO()):
+                        self.assertEqual(MOD.main(), 1)
+                    collect.assert_not_called()
+                    scorecard.assert_not_called()
+                    record.assert_not_called()
+                    self.assertEqual(self.path.read_text(), original)
+                    self.assertEqual(pass_path.read_text(), "existing history must not be touched")
+
+    def test_cli_project_repo_mismatch_stops_before_collection_or_history(self):
+        argv = ["collect_baseline.py", "--db", str(self.path.parent / "metrics/metrics.db"),
+                "--project", "other", "--repo", "o/pulp", "--state", str(self.path)]
+        for collect_flag in ([], ["--collect"]):
+            with self.subTest(collect=bool(collect_flag)), mock.patch.object(sys, "argv", argv + collect_flag), \
+                    mock.patch.object(MOD, "import_organic") as collect, \
+                    mock.patch.object(MOD, "authoritative_scorecard") as scorecard, \
+                    mock.patch.object(MOD, "record_pass_observation") as record, \
+                    contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(MOD.main(), 1)
+            collect.assert_not_called()
+            scorecard.assert_not_called()
+            record.assert_not_called()
+            self.assertFalse(self.path.exists())
+
+    def test_provider_failure_after_valid_preflight_records_failed_pass(self):
+        db = self.path.parent / "metrics/metrics.db"
+        pass_path = self.path.parent / "passes.json"
+        state = {"started_at": self.started.isoformat(), "observations": [self.row(self.started)],
+                 "identity": MOD.state_identity(self.path, "pulp", "o/pulp", db)}
+        original = json.dumps(state)
+        self.path.write_text(original)
+        argv = ["collect_baseline.py", "--db", str(db), "--project", "pulp", "--repo", "o/pulp",
+                "--state", str(self.path), "--pass-history", str(pass_path), "--collect"]
+        with mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(MOD, "import_organic", side_effect=RuntimeError("provider unavailable")) as collect, \
+                mock.patch.object(MOD, "authoritative_scorecard") as scorecard, \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(MOD.main(), 1)
+        collect.assert_called_once()
+        scorecard.assert_not_called()
+        self.assertEqual(self.path.read_text(), original)
+        observations = json.loads(pass_path.read_text())["observations"]
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0]["status"], "failed")
+        self.assertEqual(observations[0]["error"], "provider unavailable")
+        self.assertFalse(observations[0]["completed"])
+
+
 class CollectorInvocationTests(unittest.TestCase):
+    def test_project_key_helpers_are_case_insensitive(self):
+        self.assertEqual(MOD.canonical_project(" Pulp "), "pulp")
+        self.assertEqual(MOD.state_identity(Path("state.json"), "Pulp", "o/pulp", Path("metrics.db"))["project"], "pulp")
+        with tempfile.TemporaryDirectory() as directory:
+            db = Path(directory) / "metrics.db"
+            conn = __import__("sqlite3").connect(db)
+            conn.executescript("create table runs(id integer primary key, project text, repo text); create table jobs(id integer primary key, run_id integer, started_at text, completed_at text);")
+            conn.execute("insert into runs values (1, 'pulp', 'o/pulp')")
+            conn.execute("insert into jobs values (1, 1, '2026-10-16T12:00:00Z', '2026-10-16T12:30:00Z')")
+            conn.commit(); conn.close()
+            self.assertEqual(MOD.count_jobs(db, "Pulp", "o/pulp"), 1)
+            self.assertEqual(MOD.source_activity_dates(db, "Pulp", "o/pulp"), {"2026-10-16"})
+            self.assertEqual(MOD.count_jobs(db, "Pulp", "O/PULP"), 1)
+            self.assertEqual(MOD.source_activity_dates(db, "Pulp", "O/PULP"), {"2026-10-16"})
+        payload, excluded = MOD.prepare_tartci_export(
+            json.dumps({"project": "Pulp", "repo": "o/pulp", "provider": "tart", "external_id": "job-1"}),
+            "o/pulp", "pulp")
+        self.assertEqual(excluded, 0)
+        self.assertEqual(json.loads(payload)[0]["project"], "Pulp")
+
+        record = {"observed_jobs": 1, "qualified_jobs": 1,
+                  "provenance": "authenticated", "coverage": "complete", "reason": ""}
+        card = {"strata": {"schema": MOD.STRATA_CONTRACT, "repo": "O/PULP",
+                            "unit": "job", "source_head": "a" * 40,
+                            "generated_at": "2026-10-16T12:00:00Z",
+                            "window_since": "2026-10-11T12:00:00Z",
+                            "window_until": "2026-10-16T12:00:00Z",
+                            "strata": {name: dict(record) for name in MOD.PRODUCER_STRATA},
+                            "aggregate": {"observed_jobs": 4, "qualified_jobs": 4}}}
+        self.assertEqual(MOD.consume_authenticated_strata(card, repo="o/pulp")["provenance_status"],
+                         "authenticated_strata_partial")
+
     def test_project_repo_scope_requires_owner_and_matching_short_name(self):
         for project, repo in [("pulp", "pulp"), ("pulp", "/pulp"), ("pulp", "a/b/pulp"), ("other", "o/pulp")]:
             with self.assertRaises(ValueError):
@@ -357,6 +813,97 @@ class CollectorInvocationTests(unittest.TestCase):
             self.assertEqual(receipt["status"], "unavailable")
             self.assertIn("source empty", receipt["reason"])
 
+    def test_collect_allows_missing_merge_receipt_handoff(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); db = root / "metrics" / "metrics.db"; db.parent.mkdir()
+            conn = __import__("sqlite3").connect(db)
+            conn.executescript("create table runs(id integer primary key, project text, repo text); create table jobs(id integer primary key, run_id integer, started_at text, completed_at text);")
+            conn.commit(); conn.close()
+            shipyard = root / "shipyard"; tartci = root / "tartci"
+            shipyard.write_text("#!/bin/sh\ncase \"$*\" in *merge-receipt*) echo 'unexpected merge receipt import' >&2; exit 1;; *) echo '{\"imported\": 1}' ;; esac\n")
+            tartci.write_text("#!/bin/sh\necho '{\"project\":\"p\",\"repo\":\"o/p\",\"provider\":\"tart\",\"external_id\":\"fixture-1\"}'\n")
+            shipyard.chmod(0o755); tartci.chmod(0o755)
+            args = type("Args", (), {"db": db, "state": root / "state.json", "project": "p", "repo": "o/p",
+                "shipyard": str(shipyard), "tartci": str(tartci), "limit": 1, "since_days": 5,
+                "timeout_seconds": 5, "merge_receipts": root / "missing-receipts.jsonl"})()
+            args.state.write_text("{}")
+            events = MOD.import_organic(args)
+            receipt = next(event for event in events if event.get("source") == "merge-receipt")
+            self.assertEqual(receipt["source"], "merge-receipt")
+            self.assertEqual(receipt["status"], "unavailable")
+            self.assertEqual(receipt["reason"], "producer handoff not present")
+            self.assertEqual([event["source"] for event in events],
+                             ["github", "tartci", "merge-receipt", "collection"])
+            self.assertEqual(events[-1]["source"], "collection")
+
+    def test_run_converts_provider_timeout_to_a_bounded_error(self):
+        with mock.patch.object(MOD.subprocess, "run", side_effect=subprocess.TimeoutExpired(["shipyard"], 5)):
+            with self.assertRaisesRegex(RuntimeError, "command timed out after 5s: shipyard"):
+                MOD.run(["shipyard"], timeout=5)
+
+    def test_collect_deduplicates_unavailable_event_from_newer_supervisor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); db = root / "metrics" / "metrics.db"; db.parent.mkdir()
+            args = type("Args", (), {"db": db, "state": root / "state.json", "project": "p",
+                "repo": "o/p", "merge_receipts": root / "missing-receipts.jsonl"})()
+            args.state.write_text("{}")
+            provider_events = [
+                {"source": "github", "imported": 1},
+                {"source": "merge-receipt", "status": "unavailable", "reason": "wrapper"},
+            ]
+            with mock.patch.object(MOD, "_import_organic_after_preflight", return_value=provider_events):
+                events = MOD.import_organic(args)
+            self.assertEqual(sum(event.get("source") == "merge-receipt" for event in events), 1)
+            self.assertEqual(events[-1]["reason"], "wrapper")
+
+    def test_collect_inserts_missing_receipt_before_collection_event(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = type("Args", (), {"db": root / "metrics" / "metrics.db", "state": root / "state.json",
+                "project": "p", "repo": "o/p", "merge_receipts": root / "missing.jsonl"})()
+            args.state.write_text("{}")
+            provider_events = [
+                {"source": "github", "imported": 1},
+                {"source": "collection", "status": "completed"},
+            ]
+            with mock.patch.object(MOD, "_import_organic_after_preflight", return_value=provider_events):
+                events = MOD.import_organic(args)
+            self.assertEqual([event["source"] for event in events],
+                             ["github", "merge-receipt", "collection"])
+            self.assertEqual(events[1]["reason"], "producer handoff not present")
+
+    def test_collect_keeps_only_newest_duplicate_handoff_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); db = root / "metrics" / "metrics.db"; db.parent.mkdir()
+            args = type("Args", (), {"db": db, "state": root / "state.json", "project": "p",
+                "repo": "o/p", "merge_receipts": root / "missing-receipts.jsonl"})()
+            args.state.write_text("{}")
+            newest = {"source": "merge-receipt", "status": "unavailable",
+                      "reason": "fresh authenticated producer handoff is unavailable",
+                      "producer": {"identity": "shipyard"}}
+            provider_events = [
+                {"source": "github", "imported": 1},
+                {"source": "merge-receipt", "status": "unavailable", "reason": "older"},
+                {"source": "collection", "status": "completed"},
+                newest,
+            ]
+            with mock.patch.object(MOD, "_import_organic_after_preflight", return_value=provider_events):
+                events = MOD.import_organic(args)
+            receipts = [event for event in events if event.get("source") == "merge-receipt"]
+            self.assertEqual(receipts, [newest])
+            self.assertEqual(events[-1], newest)
+
+    def test_collect_does_not_treat_dangling_merge_receipt_link_as_absent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            handoff = root / "missing-receipts.jsonl"
+            os.symlink(root / "does-not-exist.jsonl", handoff)
+            args = type("Args", (), {"db": root / "metrics" / "metrics.db", "state": root / "state.json",
+                "project": "p", "repo": "o/p", "merge_receipts": handoff})()
+            args.state.write_text("{}")
+            with self.assertRaisesRegex(RuntimeError, "health sidecar is required"):
+                MOD.import_organic(args)
+
     def test_collect_refuses_unknown_provider_counts(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory); db = root / "metrics" / "metrics.db"; db.parent.mkdir()
@@ -431,7 +978,7 @@ class CollectorInvocationTests(unittest.TestCase):
             health.write_text(json.dumps(generated))
             handoff.write_text(json.dumps({**value, "evidence": "sha256:tampered"}) + "\n")
             with self.assertRaisesRegex(RuntimeError, "(byte count|digest) does not match"):
-                MOD.validate_merge_receipt_health(health, handoff, "owner/repo", "2h")
+                MOD.validate_merge_receipt_health(health, handoff, "OWNER/REPO", "2h")
 
     def test_merge_receipt_health_rejects_stale_before_import(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -473,6 +1020,7 @@ class CollectorInvocationTests(unittest.TestCase):
                 status="fresh", exported_at=dt.datetime.now(dt.timezone.utc), receipts=[value], payload=payload,
                 source_imported_at=dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
                 stale_after_seconds=7200,
+                source_host="m3",
                 producer={"identity": "shipyard", "version": "shipyard 0.366.4", "executable_sha256": "a" * 64})
             generated["unexpected"] = True
             health.write_text(json.dumps(generated))
@@ -483,6 +1031,11 @@ class CollectorInvocationTests(unittest.TestCase):
             health.write_text(json.dumps(generated))
             with self.assertRaisesRegex(RuntimeError, "base branch"):
                 MOD.validate_merge_receipt_health(health, handoff, "owner/repo", "2h")
+            generated["base_branch"] = "main"
+            health.write_text(json.dumps(generated))
+            MOD.validate_merge_receipt_health(health, handoff, "owner/repo", "2h", expected_source_host="m3")
+            with self.assertRaisesRegex(RuntimeError, "expected m1"):
+                MOD.validate_merge_receipt_health(health, handoff, "owner/repo", "2h", expected_source_host="m1")
 
     def test_import_uses_immutable_validated_handoff_snapshot(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -536,6 +1089,138 @@ class CollectorInvocationTests(unittest.TestCase):
             path.write_text(json.dumps({"repo": "other/repo"}) + "\n")
             with self.assertRaisesRegex(RuntimeError, "repository other than"):
                 MOD.validate_merge_receipt_scope(path, "owner/repo")
+
+class BaselineProviderRetryIntegrationTests(unittest.TestCase):
+    GITHUB_TIMEOUT = "metrics GitHub observation timed out"
+    TARTCI_TIMEOUT = "ssh: connect to host example port 22: Operation timed out"
+
+    def args(self, root, retries=2):
+        db = root / "metrics" / "metrics.db"
+        db.parent.mkdir()
+        with sqlite3.connect(db) as connection:
+            connection.executescript(
+                "create table runs(id integer primary key, project text, repo text);"
+                "create table jobs(id integer primary key, run_id integer, started_at text, completed_at text);"
+            )
+        return MOD.argparse.Namespace(
+            db=db, state=root / "state.json", project="pulp", repo="o/pulp",
+            shipyard="shipyard", tartci="tartci", limit=1, since_days=5,
+            timeout_seconds=300, provider_retries=retries, provider_retry_delay_seconds=5,
+        )
+
+    def provider_runner(self, failures, calls):
+        def run(command, **kwargs):
+            if command[:3] == ["tartci", "runtime", "export"]:
+                phase = "tartci_export"
+            elif command[3:6] == ["metrics", "import", "github"]:
+                phase = "github"
+            elif command[3:6] == ["metrics", "import", "tartci"]:
+                phase = "tartci_import"
+            else:
+                self.fail(f"unexpected provider command: {command}")
+            calls.append(phase)
+            if failures.get(phase, 0):
+                failures[phase] -= 1
+                error = self.GITHUB_TIMEOUT if phase == "github" else self.TARTCI_TIMEOUT
+                return subprocess.CompletedProcess(command, 1, "", error)
+            if phase == "tartci_export":
+                payload = '{"project":"pulp","repo":"o/pulp","provider":"tart","external_id":"fixture-1"}'
+            else:
+                payload = '{"imported": 1}'
+            return subprocess.CompletedProcess(command, 0, payload, "")
+        return run
+
+    def test_each_provider_timeout_recovers_through_import_organic(self):
+        for provider, expected_calls in (
+            ("github", ["github", "github", "tartci_export", "tartci_import"]),
+            ("tartci_export", ["github", "tartci_export", "tartci_export", "tartci_import"]),
+        ):
+            with self.subTest(provider=provider), tempfile.TemporaryDirectory() as directory:
+                args = self.args(Path(directory))
+                calls = []
+                with mock.patch.object(MOD, "run", side_effect=self.provider_runner({provider: 1}, calls)), \
+                        mock.patch.object(MOD.time, "sleep") as sleep:
+                    events = MOD.import_organic(args)
+                self.assertEqual(calls, expected_calls)
+                sleep.assert_called_once_with(5)
+                self.assertEqual([(e["source"], e["status"], e["imported"]) for e in events[:2]],
+                                 [("github", "completed", 1), ("tartci", "completed", 1)])
+                self.assertEqual(events[-1]["status"], "completed")
+
+    def test_each_provider_exhaustion_records_failed_history_and_exit_one(self):
+        for provider, expected_calls, error in (
+            ("github", ["github"] * 3, "GitHub import failed: " + self.GITHUB_TIMEOUT),
+            ("tartci_export", ["github"] + ["tartci_export"] * 3, "TartCI export failed: " + self.TARTCI_TIMEOUT),
+        ):
+            with self.subTest(provider=provider), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                args = self.args(root)
+                history_path = root / "pass-history.json"
+                argv = ["collect_baseline.py", "--db", str(args.db), "--project", args.project,
+                        "--repo", args.repo, "--state", str(args.state), "--collect",
+                        "--pass-history", str(history_path)]
+                calls, stderr, stdout = [], io.StringIO(), io.StringIO()
+                with mock.patch.object(MOD.sys, "argv", argv), \
+                        mock.patch.object(MOD.sys, "stderr", stderr), \
+                        mock.patch.object(MOD.sys, "stdout", stdout), \
+                        mock.patch.object(MOD, "run", side_effect=self.provider_runner({provider: 100}, calls)), \
+                        mock.patch.object(MOD.time, "sleep") as sleep, \
+                        mock.patch.object(MOD, "authoritative_scorecard") as scorecard, \
+                        mock.patch.object(MOD, "update_state") as update_state:
+                    exit_code = MOD.main()
+                self.assertEqual(exit_code, 1)
+                self.assertEqual(calls, expected_calls)
+                self.assertEqual(sleep.call_args_list, [mock.call(5), mock.call(10)])
+                scorecard.assert_not_called()
+                update_state.assert_not_called()
+                self.assertFalse(args.state.exists(), "failed pass must not publish successful state")
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertIn("baseline collection failed: " + error, stderr.getvalue())
+                self.assertNotIn("prospective pass history unavailable", stderr.getvalue())
+                observations = json.loads(history_path.read_text())["observations"]
+                self.assertEqual(len(observations), 1)
+                self.assertEqual(observations[0]["status"], "failed")
+                self.assertEqual(observations[0]["error"], error)
+
+    def test_zero_retries_stops_each_provider_after_one_attempt(self):
+        for provider, expected_calls, error in (
+            ("github", ["github"], "GitHub import failed: " + self.GITHUB_TIMEOUT),
+            ("tartci_export", ["github", "tartci_export"], "TartCI export failed: " + self.TARTCI_TIMEOUT),
+        ):
+            with self.subTest(provider=provider), tempfile.TemporaryDirectory() as directory:
+                args = self.args(Path(directory), retries=0)
+                calls = []
+                with mock.patch.object(MOD, "run", side_effect=self.provider_runner({provider: 100}, calls)), \
+                        mock.patch.object(MOD.time, "sleep") as sleep:
+                    with self.assertRaises(RuntimeError) as caught:
+                        MOD.import_organic(args)
+                self.assertEqual(str(caught.exception), error)
+                self.assertEqual(calls, expected_calls)
+                sleep.assert_not_called()
+
+    def test_provider_metadata_does_not_override_a_terminal_error(self):
+        for stdout, stderr in (
+            ('{"timeout_seconds":300}', "invalid export"),
+            ('{"deadline":"2026-10-30T00:00:00Z"}', "authentication failed"),
+            ('{"timeout_seconds":300,"deadline":"configured"}', ""),
+            ("", "invalid export field timeout_seconds or deadline"),
+        ):
+            with self.subTest(stdout=stdout, stderr=stderr):
+                failed = subprocess.CompletedProcess(["provider"], 1, stdout, stderr)
+                self.assertFalse(MOD.transient_provider_failure(failed))
+                with mock.patch.object(MOD, "run", return_value=failed) as run, \
+                        mock.patch.object(MOD.time, "sleep") as sleep:
+                    result = MOD.run_provider_with_retry(["provider"])
+                self.assertIs(result, failed)
+                run.assert_called_once()
+                sleep.assert_not_called()
+
+    def test_stdout_transport_diagnostic_remains_retryable_without_stderr(self):
+        for diagnostic in ("HTTP 503 Service Unavailable", "provider: timeout", "context deadline exceeded"):
+            with self.subTest(diagnostic=diagnostic):
+                result = subprocess.CompletedProcess(["provider"], 1, diagnostic, "")
+                self.assertTrue(MOD.transient_provider_failure(result))
+
 
 if __name__ == "__main__":
     unittest.main()

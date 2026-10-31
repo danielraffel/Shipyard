@@ -136,6 +136,12 @@ pub struct TargetResult {
     pub status: TargetStatus,
     /// Backend label.
     pub backend: String,
+    /// Host-pool member that executed the validation, when applicable.
+    ///
+    /// This is carried separately from `backend`, whose display label may
+    /// gain `-failover` or `-exhausted` suffixes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_pool_member_id: Option<String>,
     /// Git HEAD observed in the execution checkout before validation began.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_head_sha: Option<String>,
@@ -246,6 +252,7 @@ impl TargetResult {
             platform: platform.into(),
             status,
             backend: backend.into(),
+            host_pool_member_id: None,
             source_head_sha: None,
             source_tree_sha: None,
             source_checkout_clean: None,
