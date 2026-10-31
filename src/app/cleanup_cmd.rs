@@ -489,11 +489,11 @@ fn prune_metrics(
     let (action, reason) = match result {
         Ok(_) if dry_run => (
             "would-delete".to_owned(),
-            format!("Metric rows older than {days} days would be pruned"),
+            format!("Raw runs and observational rows older than {days} days would be pruned"),
         ),
         Ok(deleted) => (
             "delete".to_owned(),
-            format!("Pruned {deleted} metric rows older than {days} days"),
+            format!("Pruned {deleted} raw runs and observational rows older than {days} days"),
         ),
         Err(error) => {
             items.push(CleanupItem {

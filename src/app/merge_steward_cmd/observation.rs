@@ -531,7 +531,8 @@ pub(super) fn pull_requests(
                         .to_owned(),
                 );
             }
-            let rows = rows.iter().map(rest_pull_request_row).collect::<Vec<_>>();
+            let mut rows = rows.iter().map(rest_pull_request_row).collect::<Vec<_>>();
+            hydrate_rest_merge_states(actions, repo, positions, &mut rows);
             Value::Array(rows)
         }
         Err(error) => return Err(error),
@@ -563,6 +564,94 @@ fn transient_open_pr_error(error: &str) -> bool {
     ]
     .iter()
     .any(|needle| lower.contains(needle))
+}
+
+/// Number of concurrent per-pull-request reads during hydration.
+const HYDRATION_CONCURRENCY: usize = 4;
+
+/// Run `work` over `items` with at most [`HYDRATION_CONCURRENCY`] in flight.
+///
+/// The first error wins and stops further items from starting, so a failing
+/// read still fails the pass exactly as the sequential loop did.
+fn run_bounded<T: Send>(
+    items: Vec<T>,
+    work: &(impl Fn(T) -> Result<(), String> + Sync),
+) -> Result<(), String> {
+    if items.len() < 2 {
+        return items.into_iter().try_for_each(work);
+    }
+    let workers = HYDRATION_CONCURRENCY.min(items.len());
+    let queue = std::sync::Mutex::new(items);
+    let first_error = std::sync::Mutex::new(None::<String>);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    if first_error.lock().is_ok_and(|error| error.is_some()) {
+                        return;
+                    }
+                    let Some(item) = queue.lock().ok().and_then(|mut queue| queue.pop()) else {
+                        return;
+                    };
+                    if let Err(error) = work(item)
+                        && let Ok(mut slot) = first_error.lock()
+                    {
+                        slot.get_or_insert(error);
+                    }
+                }
+            });
+        }
+    });
+    match first_error.into_inner() {
+        Ok(None) => Ok(()),
+        Ok(Some(error)) => Err(error),
+        Err(_) => Err("hydration worker panicked".to_owned()),
+    }
+}
+
+/// The REST list endpoint omits `mergeable_state`; only `GET pulls/{n}`
+/// carries it. Read it for the rows that can still be admitted. A row that
+/// cannot be read keeps no state, which parses as `UNKNOWN` and is refused by
+/// the native arming backstop.
+fn hydrate_rest_merge_states(
+    actions: &GitHubActions,
+    repo: &str,
+    positions: &BTreeMap<u64, u64>,
+    rows: &mut [Value],
+) {
+    let candidates = rows
+        .iter_mut()
+        .filter(|row| {
+            let number = row.get("number").and_then(Value::as_u64);
+            row.get("isDraft").and_then(Value::as_bool) == Some(false)
+                && number.is_some_and(|number| !positions.contains_key(&number))
+                && row
+                    .get("headRefOid")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_full_sha)
+        })
+        .collect::<Vec<_>>();
+    let _ = run_bounded(candidates, &|row: &mut Value| {
+        let Some(number) = row.get("number").and_then(Value::as_u64) else {
+            return Ok(());
+        };
+        let Ok(live) = gh_json(
+            actions,
+            &["api".to_owned(), format!("repos/{repo}/pulls/{number}")],
+            "open PR merge state",
+        ) else {
+            return Ok(());
+        };
+        let same_head = live.pointer("/head/sha") == row.get("headRefOid");
+        if let Some(state) = live
+            .get("mergeable_state")
+            .and_then(Value::as_str)
+            .filter(|_| same_head)
+        {
+            row["mergeStateStatus"] = Value::String(state.to_ascii_uppercase());
+        }
+        Ok(())
+    });
 }
 
 fn rest_pull_request_row(value: &Value) -> Value {
@@ -774,16 +863,47 @@ pub(super) fn hydrate_census_check_identities(
     required_checks: &[RequiredCheck],
     prs: &mut [ObservedPr],
 ) -> Result<(), String> {
-    for pr in prs.iter_mut().filter(|pr| checks_are_consulted(pr)) {
+    let candidates = prs
+        .iter_mut()
+        .filter(|pr| checks_are_consulted(pr) && checks_can_change_decision(pr))
+        .collect::<Vec<_>>();
+    run_bounded(candidates, &|pr: &mut ObservedPr| {
         hydrate_required_check_identities_with_deadline(
             actions,
             repo,
             required_checks,
             std::slice::from_mut(pr),
             None,
-        )?;
+        )
+    })
+}
+
+/// Whether the steward could still reach a check-dependent decision for this
+/// pull request.
+///
+/// `classify_pr` answers queued, draft, invalid-head and conflicting pull
+/// requests before it weighs a required check, so those rows skip hydration.
+/// A row carrying the managed label is the exception: `classify_management`
+/// runs first and reads the handoff commit status from the hydrated checks, so
+/// without them a labelled queued, draft or conflicting row would classify as
+/// `HandoffMissing` and lose its recovery wake, success continuation and run
+/// supersedence.
+fn checks_can_change_decision(pr: &ObservedPr) -> bool {
+    let fact = &pr.fact;
+    if fact
+        .labels
+        .iter()
+        .any(|label| label.eq_ignore_ascii_case(super::MANAGED_LABEL))
+    {
+        return true;
     }
-    Ok(())
+    fact.queue_position.is_none()
+        && !fact.draft
+        && is_full_sha(&fact.head_sha)
+        && !matches!(
+            fact.merge_state.to_ascii_uppercase().as_str(),
+            "DIRTY" | "CONFLICTING"
+        )
 }
 
 pub(super) fn hydrate_required_check_identities_before(

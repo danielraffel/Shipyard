@@ -75,7 +75,7 @@ shipyard cause extract --log "$RUNNER_TEMP/test.log" --job "<the job's display n
 shipyard cause extract --log job.log --format c2
 
 # Append records to an archive, one file per month of named_at.
-shipyard cause archive --dir causes/ --input records.jsonl
+shipyard cause archive --dir data/ci-cause --input records.jsonl
 
 # One observer pass over a workflow's recent runs.
 shipyard cause record --repo OWNER/REPO --workflow build.yml --dir data/ci-cause
@@ -92,7 +92,13 @@ match the display name is not trusted by the scorecard. It never fails the
 step it runs in; only a missing or unreadable log exits non-zero.
 
 `cause archive` is append-only. A record whose id is already archived is
-skipped, and nothing is rewritten.
+skipped, and nothing is rewritten. `--dir` is the archive parent: cause month
+files live under `causes/`, with `fixlinks.jsonl` in the parent. All archive
+commands refuse legacy `YYYY-MM.jsonl` or `undated.jsonl` files directly under
+`--dir`. If the old directory is already named `causes/`, pass its parent.
+Otherwise, reconcile the month files into `causes/` before retrying: retain all
+rows and never overwrite an existing destination file. No command moves or
+rewrites legacy files automatically.
 
 For a local integrity check, run `shipyard cause audit --dir DIR`. It reads
 the cause month files and `fixlinks.jsonl`, reports malformed rows, duplicate
@@ -164,6 +170,31 @@ listed and read, causes written, already recorded, cancelled jobs, fix-links
 written, reds pending (split into those that went red under 24 hours,
 24 to 72 hours, and over 72 hours ago), and reads that failed. Each failed read is also printed
 on stderr. Run it on a schedule you choose; Shipyard does not schedule it.
+
+### Independent observer on macOS
+
+To keep cause and fix-link coverage running when baseline collection is stopped
+or restarted, install the separate supervised observer (dry-run by default):
+
+```bash
+scripts/install_cause_observer.sh \
+  --repo OWNER/REPO --workflow build.yml \
+  --dir "$HOME/Library/Application Support/shipyard/ci-cause"
+scripts/install_cause_observer.sh \
+  --repo OWNER/REPO --workflow build.yml \
+  --dir "$HOME/Library/Application Support/shipyard/ci-cause" --install
+```
+
+The installer renders and validates a per-user `launchd` agent. It runs the
+read-only `shipyard cause record` command at load and then at least every 15
+minutes (the default is hourly), writing only the append-only local archive.
+Use `--interval` to choose a longer interval. Authentication comes from the
+machine-global Shipyard config; pass `--cwd /path/to/checkout` when the
+repository uses an untracked `.shipyard.local/config.toml` overlay. The
+observer can be removed by
+unloading and deleting its generated plist; no GitHub state is changed by the
+agent. Keeping this independent makes failure learning continuous without
+making it a prerequisite for CI execution or merge decisions.
 
 ## Related
 

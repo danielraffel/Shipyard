@@ -72,7 +72,7 @@ class CiMatrixTests(unittest.TestCase):
         self.assertEqual(rows["linux"]["package_target"], "linux-x64")
 
     def test_release_matrix_carries_all_release_platforms(self) -> None:
-        matrix = ci_matrix.workflow_matrix("release", {})
+        matrix = ci_matrix.workflow_matrix("release", {"PLATFORM_FOCUS": "all"})
         rows = {row["key"]: row for row in matrix["include"]}
         self.assertEqual(
             set(rows),
@@ -166,7 +166,7 @@ class CiMatrixTests(unittest.TestCase):
 
     def test_release_matrix_local_provider_routes_only_macos(self) -> None:
         matrix = ci_matrix.workflow_matrix(
-            "release", {"REQUESTED_PROVIDER": "local"}
+            "release", {"REQUESTED_PROVIDER": "local", "PLATFORM_FOCUS": "all"}
         )
         rows = {row["key"]: row for row in matrix["include"]}
         self.assertEqual(rows["macos-arm64"]["provider"], "local")
@@ -357,6 +357,38 @@ class CiMatrixTests(unittest.TestCase):
         self.assertEqual(json.loads(rows["macos-arm64"]["runs_on_json"]), "macos-15")
         self.assertEqual(ci_matrix.skipped_notices("sandbox-e2e", env), [])
 
+    def test_default_focus_runs_only_macos_for_ci(self) -> None:
+        for event in ("pull_request", "merge_group", "push"):
+            for focus in ({}, {"PLATFORM_FOCUS": "macos"}):
+                with self.subTest(event=event, focus=focus):
+                    env = {"GITHUB_EVENT_NAME": event, **focus}
+                    rows = ci_matrix.workflow_matrix("ci", env)["include"]
+                    self.assertEqual([r["key"] for r in rows], ["macos-arm64"])
+                    outputs = ci_matrix.workflow_outputs("ci", env)
+                    self.assertEqual(outputs["platform_focus"], "macos")
+
+    def test_focus_all_runs_every_ci_platform(self) -> None:
+        env = {"GITHUB_EVENT_NAME": "push", "PLATFORM_FOCUS": "all"}
+        rows = ci_matrix.workflow_matrix("ci", env)["include"]
+        self.assertEqual([r["key"] for r in rows], ["linux", "macos-arm64", "windows"])
+        self.assertEqual(ci_matrix.workflow_outputs("ci", env)["platform_focus"], "all")
+
+    def test_release_default_focus_builds_macos_and_both_linux(self) -> None:
+        rows = ci_matrix.workflow_matrix("release", {})["include"]
+        self.assertEqual(
+            [r["package_target"] for r in rows],
+            ["macos-arm64", "linux-x64", "linux-arm64"],
+        )
+        full = ci_matrix.workflow_matrix("release", {"PLATFORM_FOCUS": "all"})["include"]
+        self.assertEqual(
+            [r["package_target"] for r in full],
+            ["macos-arm64", "linux-x64", "linux-arm64", "windows-x64"],
+        )
+
+    def test_unknown_focus_is_rejected(self) -> None:
+        with self.assertRaises(SystemExit):
+            ci_matrix.workflow_matrix("ci", {"PLATFORM_FOCUS": "linux"})
+
     def test_ci_workflow_ignores_the_sandbox_trust_gate(self) -> None:
         env = {
             "GITHUB_EVENT_NAME": "pull_request",
@@ -401,7 +433,7 @@ class CiMatrixTests(unittest.TestCase):
                     resolve,
                 )
         ci = (root / ".github/workflows/ci.yml").read_text(encoding="utf-8")
-        guard = "    if: needs.resolve-runners.outputs.linux_provider != 'skipped'\n"
+        guard = "needs.resolve-runners.outputs.linux_provider != 'skipped'\n"
         self.assertEqual(
             ci.count("runs-on: ${{ fromJSON(needs.resolve-runners.outputs.linux_runs_on_json) }}"),
             ci.count(guard),
@@ -427,7 +459,7 @@ class CiMatrixTests(unittest.TestCase):
                     names.setdefault(stripped, []).append(path.name)
         duplicated = {name: files for name, files in names.items() if len(files) > 1}
         self.assertEqual(duplicated, {})
-        self.assertIn("name: Test ${{ matrix.name }} [${{ matrix.provider }}]", names)
+        self.assertIn("name: Test ${{ matrix.name }}", names)
         self.assertIn("name: Sandbox ${{ matrix.name }} [${{ matrix.provider }}]", names)
 
     def test_rust_cache_never_runs_the_macos_save_hook(self) -> None:
