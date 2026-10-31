@@ -5,7 +5,35 @@ description: "Cross-platform CI coordination with Shipyard: validates, ships, ma
 
 # CI Operations with Shipyard
 
+## Durable external work
+
+Agents may register CI preparation, repair, review, or release work through
+Shipyard's durable work-item store without being launched or supervised by
+Shipyard. Registration is idempotent; checkpoints must be written before a
+session hands off or exits. Claims carry a fencing epoch and protocol/capability
+version, and stale owners are rejected on checkpoint. A host-loss recovery
+must rediscover the item from shared ShipState and obtain a new fenced claim;
+local files or conversation history are not recovery state. This contract is
+observation-only until the cross-host failure canary proves concurrent
+reconcilers cannot duplicate privileged effects. Work-item records fail closed
+on corruption or schema drift; idempotency keys, capability versions, lease
+expiry, and expected state versions are checked before checkpoint or claim.
+
+`SHIPYARD_OBSERVATIONS=off` (trimmed, case-insensitive) stops automatic queue
+shadow/timing, command metric copies, route-shadow receipts, daemon GitHub
+imports, and scheduled baseline collection in processes receiving it. Existing
+services need environment rollout/restart. It preserves required evidence,
+merge receipts, explicit metrics imports/record, and historical reporting;
+retention and manual cause/private-corpus collection remain separate.
+
 ## Required-check producer identity
+
+Metrics cleanup uses the existing `SHIPYARD_METRICS_RETENTION_DAYS` policy
+(default 90; nonpositive disables pruning, not collection). It also expires
+queue shadow observations and terminal timing, preserving timing referenced by
+retained shadow rows and malformed timestamps. It never prunes merge receipts
+or operational queue/recovery state. Run `shipyard cleanup --apply` to apply;
+this is not automatic scheduling or a hard database-size cap.
 
 When CI code consumes required-check materialization, preserve producer
 identity (`app_id`) when policy distinguishes checks that share a context name.
@@ -101,6 +129,11 @@ the separate GitHub job-log read.
 Missing or unreadable `DIR/causes/` fails with `cause archive unavailable` before
 GitHub reads or case exports; it never produces a successful zero-count report.
 A readable empty archive remains valid and leaves cases unjoined.
+The archive scan keeps its 64 MiB / 500,000-line bounds. Invalid UTF-8 counts
+as one malformed row and does not discard later rows. Otherwise valid rows
+for another repository are excluded as `archive_other_repo`, not malformed;
+`archive_rows` still counts all successfully decoded cause records. Attachment
+uses the exact-identity index, without changing duplicate or attempt policy.
 
 Metrics verdicts (`shipyard metrics compare|watch|trend|scorecard`) default to
 load-independent proxies; wall-clock p50/p90 is load-dependent context. Do not
@@ -119,6 +152,20 @@ minutes. Treat these as cost proxies only. A safely-merged-change denominator
 requires a durable merge receipt and remains unavailable when the local metrics
 store has only PR/job observations; never substitute distinct PR count.
 
+The freshness query classifies jobs through their `github_job` step marker.
+Keep the metrics-store `(steps.job_id, steps.step)` lookup index in migrations;
+without it, a growing store turns every scorecard into a per-job steps scan.
+
+The optional authenticated merge-receipt handoff uses
+`shipyard-merge-receipt-handoff-auth/v1`. Before an importer accepts it, the
+producer transport must bind the canonical payload digest to the exact
+repository, project, base branch, producer session, route, destination,
+known-host authority, executable, freshness window, and replay state. Imports
+are atomic and idempotent; legacy `shipyard-merge-receipt/v1` rows remain
+visible but do not enter an authenticated denominator. The resulting
+`authenticated_safe_merge_summary` is telemetry only and never authorizes a
+queue, rerun, arm, enqueue, or merge decision.
+
 `shipyard queue-digest --json` exposes `queue_idle` and deterministic `alerts`.
 Treat `merge_queue_idle_with_pending_work` as a supervisor notification for an
 armed-but-not-enqueued PR, and
@@ -130,6 +177,17 @@ GitHub Actions can omit `pull_requests` on `pull_request_target` runs. The
 metrics importer resolves those rows only through the exact commit's
 authoritative pull-request API response, and keeps the identity unknown when
 that response is empty or ambiguous.
+
+Authenticated metrics imports must pin the machine-global GitHub App helper
+once, bind it to the exact `--repo` target, and mark rows `production` only
+when the helper reports `github-app-installation`. Ambient `gh` auth and
+fixture callers remain `unknown`; never infer promotion provenance from a
+repository, workflow, event, runner label, or token-shaped string.
+
+For a governed receipt transport, `shipyard metrics export merge-receipt
+--repo <owner/repo> --stdout` emits only canonical JSONL records. It is
+mutually exclusive with `--file` and `--json`; keep health or transport status
+on a separate channel so stdout remains machine-readable handoff bytes.
 
 ## Version-only release bumps
 
@@ -374,7 +432,10 @@ by another route, or ejected and left unarmed — is
 `[merge_queue].mutation_machine` host; each run is bounded by `/usr/bin/timeout`,
 and `--status` / `--uninstall` inspect or remove it). It acts only on pull
 requests the steward itself declines to own, so it cannot contend with the
-enqueue path, and it honours the central HOLD before arming. See the shipyard skill's
+enqueue path, and it honours the central HOLD before arming. It reads the base's
+reviewer policy strictly (an absent `.shipyard/config.toml` refuses the arm),
+matching the steward's sweep that withdraws arms and queue entries on
+unapproved heads. See the shipyard skill's
 [merge-steward reference](../shipyard/references/merge-steward.md).
 
 ## The unattended carrier: `runner carrier`
@@ -553,9 +614,11 @@ auto-merge armed before a HOLD (tartci allows it) and Vellum's merge-on-green
 steward, which merges with its own token and reads no verdict, never reach
 `queue-arm-guard`. The `review-verdict` commit status
 (`scripts/review_verdict_status.py`, docs/review-verdict-status.md) is the
-guard's own decision posted on the head; it is report-only until a
-repository requires it. A red `review-verdict` means the guard would refuse
-that head; fix the verdict, not the status.
+guard's own decision posted on the head; its job is also the
+`review-verdict` check run and fails unless the head is allowed, so a
+required check is red exactly when the guard would refuse. A red
+`review-verdict` means the guard would refuse that head; fix the verdict, not
+the status.
 
 **The `risk-tier` status says how much review a head would need.**
 `scripts/risk_tier.py` (`.github/workflows/risk-tier.yml`, docs/risk-tier.md)
@@ -673,6 +736,11 @@ a checkout of the main branch, never from the pull request's own checkout, where
 `tools/scripts/<name>.py` is the pull request's own script. Nothing in Shipyard
 executes a `fix_hint` and nothing auto-applies one. A `detail` is log text and
 is never a command.
+C2 v8 excludes explicit linker `warning:` diagnostics, including warnings
+mentioning duplicate symbols, missing paths, or undefined references, even
+when the step later fails or is cancelled. Actual linker errors and fatal
+warnings-as-errors diagnostics remain causes; a warning alone is not one.
+The cause-cache version also advances to v8 so old warning causes are reread.
 It outranks the ctest line that ran the check. Since C2 v7 a CMake error is named
 by its call site and its error's first clause (`PulpLinkFloor.cmake:463 string
 sub-command JSON failed parsing ...`), not by the bare command in parentheses,
@@ -893,7 +961,9 @@ needs `live-smoke`, which runs `scripts/release_live_smoke.py` on the built
 linux-x64 binary: read-only `runner admission-clean` and `runner steward`
 dry-run, `--mode isolated` under a throwaway HOME, against real repositories
 (`vars.RELEASE_SMOKE_REPOS`, default `Generous-Corp/pulp`; token
-`secrets.RELEASE_SMOKE_GH_TOKEN`, else the job token). Any `error` verdict or
+`secrets.RELEASE_SMOKE_GH_TOKEN`, else the job token). Keep this token
+read-only; never route the write-capable release-bot credential to the binary
+under test. Any `error` verdict or
 steward repository error fails the release, as does a lock-held `defer`
 (`observation_in_progress`) or a verdict that does not name the requested
 repository. The job runs with `contents: read` only. v0.302.0-v0.307.0 shipped a census
@@ -955,6 +1025,11 @@ a sibling `<dir>.owner` (the run's pid). A new run first deletes dirs older than
 [--older-than-hours N]` also handles dirs without an owner file, keeping any that
 a live process (`ps eww`) still has as TMPDIR. A failed process listing keeps
 everything unowned. The cleanup touches nothing but `shipyard-validation-*`.
+
+The scheduled metrics retention pass is fail-closed: raw runs and expired
+fleet-capacity samples are deleted in bounded SQLite batches, and an unreadable
+metrics store makes the cleanup command fail so its receipt cannot claim a
+successful rotation.
 
 ## Version-at-land
 
@@ -1020,7 +1095,8 @@ PRs are gone.
 | Experimental authority schema v5 | No operational command exists. Official builds are v4-only; an explicit source test build may validate the reserved request shape only to return `ExperimentalAuthorityRefused`, with no writer, queue mutation, outcome, backend, execution, or authority. |
 | Observe GitHub queue and PR transitions without mutation | `shipyard --json queue-observe --repo <owner/repo> [--follow]` (one bounded GraphQL query per tick; unchanged polls are silent and back off adaptively) |
 | Flag stuck open PRs (repeat test failure, red while armed, repeated ejection on the current head, rebase treadmill, green but unarmed for 2 h (skips drafts and `shipyard:hold` / `shipyard:no-auto-merge` holds), red and unarmed for 2 h, and any Shipyard-handed PR no rule accounts for (`unaccounted`, with the reason; counts and gaps in `pr-watch liveness` and `doctor`), ejected for failed_checks then green and never re-armed; split advisory) | `shipyard pr-watch scan --repo <owner/repo> [--post-comments] [--digest]` (read-only dry run by default; `replay --since 7d --expect PR=FLAGS --control merged-clean` simulates a past window; the daemon digest toggle is `[pr_watch.digest] enabled = true`; see `docs/pr-watch.md`) |
-| Wake a model only when something changed: a READY head nobody reviewed, a head with no READY or verdict, a verdict to route, an armed or queued head nobody approved, a red required check (with its failing tests), a failed merge group, a removed or stuck queue entry, an approved head nobody armed, a tartci host alarm; each once, nothing otherwise | `shipyard pr-watch rules --repo <owner/repo>[@workflow.yml] ... [--alarm-repo danielraffel/tartci] [--input-events FILE]` (JSONL on stdout; the first pass only primes its ledger); `rules-replay --since 2d --tick 5m` replays a window and `scripts/rules_watch_score.py` scores it against labelled turns. Each event's `fix` gives the exact next command; a live pass backs off (exit 75) when the App budget is low. See `docs/pr-watch.md#rules-watcher` |
+| Keep bounded green-unarmed screening responsive | The watcher screens its capped candidate set through the existing bounded worker pool, preserving input order and fail-closed semantics; a slow GitHub read must not serialize the entire pass. |
+| Wake a model only when something changed: a READY head nobody reviewed, a head with no READY or verdict, a verdict to route, an armed or queued head nobody approved, a red required check (with its failing tests), a failed merge group, a removed or stuck queue entry, an approved head nobody armed, a HOLD nobody repaired (`--held-after`), a tartci host alarm; PRs labelled `owner-decision`/`superseded`/`PARKED/*` are reported under their own state and skipped by the stall rules; every event carries `age_secs`/`age`; each once, nothing otherwise | `shipyard pr-watch rules --repo <owner/repo>[@workflow.yml] ... [--alarm-repo danielraffel/tartci] [--input-events FILE]` (JSONL on stdout; the first pass only primes its ledger); `rules-replay --since 2d --tick 5m` replays a window and `scripts/rules_watch_score.py` scores it against labelled turns. Each event's `fix` gives the exact next command; a live pass backs off (exit 75) when the App budget is low. See `docs/pr-watch.md#rules-watcher` |
 | Check pr-watch passes are still completing (the scanning host's silence otherwise mutes hand-back, comments and digest) | `shipyard pr-watch liveness [--json]` (exit 1 when stale past `[pr_watch] stale_after_minutes`, default 45); `shipyard doctor` shows a `PR watch` section on a scanning host; `shipyard doctor --fleet` asks every host class and fails `pr-watch:fleet` when none is completing passes |
 | Hand a red PR back to its owning session (label + `cmux notify` + inbox note, no input injection; the label is removed on merge/close too; never labels a PR that is no longer open; `pr-watch sweep-labels` lists, and with `--apply` removes, stale labels on closed PRs; no label when no owner resolves; an owner session is live when cmux reports it `running` or `idle` with its process alive; inbox notes name their head and age, and an unread note is retracted when its episode resolves; `pr-watch wakes` measures sent vs seen) | `shipyard pr-watch scan --repo <owner/repo> --handback` (dry run); `--deliver-handback` with `[pr_watch.handback] enabled = true` sends. See `docs/pr-watch.md#hand-back` |
 | Remove an exact queue entry | Do not use raw `ghapp pr merge --disable-auto` or `dequeuePullRequest`; use Shipyard's audited exact-head path. The ghapp queue-removal guard refuses unaudited removal, with `GHAPP_ALLOW_QUEUE_REMOVAL=1` reserved for an explicit authority action. |
@@ -1125,7 +1201,7 @@ writer custody before mutation.
 
 | **A ship-state or queue file reads back empty after a reboot** | Every state write now goes through `src/durable_file.rs` (sync the temp file, rename, sync the directory). A new writer that hand-rolls `NamedTempFile` + `persist` skips the syncs; route it through `durable_file::replace_json` instead. |
 | **A lane job was running when the host rebooted** | On a host with machine-global `[queue.boot_requeue] enabled = true` (off by default), the first supervisor tick after the reboot returns it to `Pending` once (`shipyard queue` shows `interrupted: host reboot, requeued once at <UTC>`; marker in `queue-workers/boot-requeue/`), because its receipt names an earlier boot. Older receipts without a boot id, or a second reboot of the same job, still complete `UNCERTAIN`. Restart the daemon; never hand-edit `queue.json`. |
-| **Triage a steward exception without a resident agent** | `shipyard runner recovery-worker` inspects/revalidates one durable exact-head request without launching a model; add `--apply` for one bounded phase-1 classification attempt, or `--drain --apply` for the bounded current snapshot. Policy is machine-global only; Shipyard constructs a tool-disabled argv, clears the inherited environment, uses a global model lease and overall deadline, and accepts strict JSON that can classify/escalate but cannot authorize repairs, paths, or tests. Provider/quota failures terminalize; unsafe findings escalate; neither blocks unrelated PRs. |
+| **Triage a steward exception without a resident agent** | `shipyard runner recovery-worker` inspects/revalidates one durable exact-head request without launching a model; add `--apply` for one bounded phase-1 classification attempt, or `--drain --apply` for the bounded current snapshot. Policy is machine-global only; Shipyard constructs a tool-disabled argv, clears the inherited environment, uses a global model lease and overall deadline, and accepts strict JSON that can classify/escalate but cannot authorize repairs, paths, or tests. Provider/quota failures terminalize with distinct authentication or transport classes; unsafe findings escalate; neither blocks unrelated PRs. A future alternate-provider attempt remains bounded and explicit; no implicit provider switch occurs. |
 | **Understand daemon shadow observation** | With an existing work ledger, the daemon observes policy-covered native nonterminal exact PR heads even with zero IPC subscribers; inert imported history is never scheduled. Relevant webhooks debounce for 2s with a 10s maximum burst age; overflow is requeued. An 8-target round-robin catch-up runs every 5m; exact-target cooldown, four-read concurrency, and a rolling-hour request ceiling with worst-case page reservation bound cost. Each exact target uses producer-provenanced pagination through exact-repository auth loaded only from trusted machine-global configuration, exhaustive through 1,000 contexts and fail-closed beyond; request evidence counts every page. Token-helper preparation is separately bounded and cached, and pre-command failures do not count as requests. Only changed snapshots and redacted fetch failure/recovery transitions emit `shadow_observation_transition` to IPC and the retained supervised daemon stderr log, including exact-head, API-cost, latency, policy-revision, and zero-model evidence. Repeated failures stay quiet. This phase cannot write GitHub, the ledger, or Linear; publish a wake; activate; or dispatch. |
 | **Recognize an assigned-capacity dispatch wedge** | The daemon can publish one durable `dispatch_wedge` actionable wake after two stable observations prove that the exact current merge-queue job remains queued with no assigned runner while a compatible runner is online and idle. Authority binds repository identity, PR/head, merge-group head, run/attempt/job, labels, queue position, policy, and the final authenticated PR/queue reread. Head movement, regenerated/dequeued groups, incomplete pagination, label mismatch, busy/offline capacity, or ambiguous evidence refuses publication. Restart preserves the observation deadline and exact pending publication; a failed or capacity-less observation gets a bounded durable follow-up. This is diagnosis and escalation only: it does not cancel, requeue, mutate selectors or runners, reorder GitHub's queue, or retry work. |
 | **Run sandbox E2E beside production Shipyard safely** | Each protected queue/supervisor/ship mutation holds the shared host-global writer-domain lease only for its critical section; streamed logs reacquire per append, while idle daemons and read-only commands own no lease. Sandbox E2E keeps the fair-entry turnstile and data-domain lease exclusive from snapshot through contamination assertion. A production mutation waits boundedly, then exits `75` with `sandbox_writer_domain_overlap` instead of racing evidence. If the guardian refuses before transition because production workers are active, classify the canary as safely deferred only through `scripts/sandbox_admission_deferral.py`; its exact receipt, installed hash, mutation-probe path, lease absence, daemon PID, and live process start identity must all agree at both workflow checkpoints. That admission deferral is INFRA/retryable and does not justify rerunning the production job. The macOS guardian observes only the exact no-holder/contended ambiguity through a bounded stable-idle window while continuously fencing production identity, binary, config, and active workers; any holder or drift still fails closed. If a corrected-path cleanup retains the host lease solely because workers appeared after its mutation proof, the launchd-owned guardian may reconcile it without a model: authenticate the unique prior ready/mutation/final receipts, preserve exact production identity and configuration while workers drain, prove stable idle again immediately before removing the exact device/inode/ctime plus cryptographically random lease generation, and publish a durable pending/terminal receipt. Removal first atomically detaches that generation under a unique tombstone name, then deletes only the revalidated detached identity; crash debris cannot authorize or block a later fixed-name lease and is retained for evidence rather than guessed away. A lease retained by a canary that never wrote its mutation fence is reconcilable the same way only when its receipts prove it never touched production (never quiesced or restored it, never armed or ran its mutation probe, no workers at admission, candidate dead) and the production it snapshotted was replaced out of band (daemon pid/start or installed binary changed, e.g. by a fleet update); the reconciliation then binds to the current production and its receipts say `reconciliation_basis: production-superseded` with `mutation_fence_proved: false`. With production unchanged, a fence-less lease stays fail-closed for an operator. A fenced lease whose production daemon was later replaced (restart or install) binds to the current production the same way (`production-superseded`), and a cleanup whose two writer-domain holder inspections both timed out (`lsof` on a loaded host) is reconcilable like the exhausted-deadline case; when the workflow's final receipt check fails it prints the guardian's `failure`, not a bare `false`. The guardian holds the host's fleet install guard (`fleet-auth-support.guard` in the production state dir) from before lease creation until its terminal receipt, so a fleet rollout defers (exit 75, no attempt spent) instead of replacing production mid-canary; fleet-reconcile's attempt ledger never rewrites itself on an idle tick, defers a tick before recording when the controller's own guard is held, and takes the shared writer-domain lease for every real write, so it can never land inside a contamination audit (the audit stays strict; nothing in `fleet-reconcile/` is exempted); a canary that finds an install in flight waits 60s, then fails `FleetUpdateInProgress` (INFRA/retryable). A process that exits while being inspected is reported as `ProcessGone`, not a raw KERN_PROCARGS2 errno. Pre-generation legacy leases require explicit operator reconciliation; ambiguous, unexpectedly populated, live-owner, quiesced, identity-drifted, or foreign-holder cases remain untouched. A pending/deferred retained-lease result is only INFRA/retryable evidence, never physical-canary or release acceptance. After its terminal receipt proves the exact lease generation was removed, rerun only the targeted macOS Sandbox job; do not rerun the whole workflow or rebuild unchanged binaries. After cleanup, confirm daemon IPC liveness through a bounded exact-PID-fenced window and require the receipt's configured repositories rather than treating one status miss as death. The guardian must fsync its terminal receipt before self-unloading its exact launchd label; later runs may recover only a bounded set of inert, receipt-authenticated registrations, and terminal workflow paths must fail closed if a successful full inventory does not prove the current label disappeared. Keep failure artifacts inside explicit canary/runner temp roots. Do not add filename/PID/job-ID exemptions or delete either lock file. Restart v0.108.1 daemons during rollout because they hold the obsolete lifetime lease. |
@@ -1190,6 +1266,13 @@ writer custody before mutation.
 | Explain log/artifact retention without mutation | `shipyard cleanup` (dry-run default; includes action reasons, protected evidence, and byte watermarks) |
 | Apply bounded terminal-log retention | `shipyard cleanup --apply` (gzip closed logs; pressure-deletes successful terminal jobs only; honors `.shipyard-retain`) |
 | Serialize an indefinite incident/audit pin | `shipyard cleanup --pin <job-id>` (do not raw-`touch` the marker while cleanup can run) |
+
+Cause archives use the separate `shipyard cause prune` command. It is
+dry-run by default, age/size bounded, and fail-closed for unmarked or frozen
+archives; `--initialize` is an explicit enrollment of a mutable operational
+copy. The optional macOS cleanup installer schedules only these local,
+read-only/retention passes and records a durable receipt; it never arms,
+enqueues, merges, or posts GitHub state.
 | Wait for a release to fully upload | `shipyard wait release v0.23.0 --timeout 900 --json` |
 | Wait for a PR's required checks to go green | `shipyard wait pr 151 --state green --timeout 1800 --json` |
 | Wait for a workflow run to finish | `shipyard wait run 223344 --success --timeout 1200 --json` |
@@ -2768,7 +2851,9 @@ open PR heads, use `shipyard queue-observe`. It persists a canonical snapshot,
 emits only initial state or semantic deltas, and backs unchanged polling off
 through 15/30/60/120/300 seconds. The command also reports local mutation
 authority and `HOLD` state, but it never acquires a mutation lease or calls a
-GitHub mutation. Its state file, append-only transition log, and exclusive lock
+GitHub mutation. When a cursor predates the current integrity schema, the live
+observer reboots from a fresh authenticated snapshot rather than trusting
+legacy timestamps. Its state file, append-only transition log, and exclusive lock
 provide a durable handoff boundary for queue-monitor agents. See
 [`docs/queue-observer.md`](../../docs/queue-observer.md).
 
@@ -4209,6 +4294,8 @@ nodes are also fatal; they must not be filtered into an empty result.
 
 The merge steward implicitly manages fleet-authored pull requests before the explicit `shipyard:managed` handoff label is copied. Census observation must therefore hydrate required check identities for those exact heads, while ordinary human pull requests remain excluded from per-PR hydration. Keep this predicate shared with steward classification so green fleet work is not stranded as `waiting_required`.
 
+Hydration is also lazy: drafts, queued rows and `DIRTY`/`CONFLICTING` rows are skipped because classification answers them before it weighs a required check, except rows carrying the managed label, whose handoff status lives in the hydrated checks. Candidates are read four at a time, and an unreadable candidate still fails the observation. The REST fallback for the open-PR list reads `mergeable_state` from `pulls/{n}` for non-draft, non-queued candidates, bound to the listed head; a row it cannot read stays `UNKNOWN` and is never armed. Before a mutation, the live single-PR revalidation reads the same fields as the census (including `author`), and exact-head approval is checked before that live read.
+
 ### Merge receipt import provenance
 
 The metrics merge-receipt importer is telemetry only. It requires a
@@ -4226,6 +4313,10 @@ waste is not limited to the scorecard window.
 timing table within the requested `--since` window. It counts each distinct
 superseded job once; uncertain, cancelled, and unmatched jobs remain coverage
 gaps, and the result never authorizes a queue or merge decision.
+The baseline window must be positive: `--since 0d` and `--since=-1d`
+exit with invalid-input code 5. Timing joins require the case-sensitive `sy-`
+prefix and no slash or backslash, even when an excluded ID has a timing row.
+Excluded IDs remain observations with unknown duration, never zero runtime.
 
 
 At the protected merge boundary, Shipyard may produce that receipt only after
@@ -4239,4 +4330,12 @@ current host. Any fleet host with that channel plus rustfmt and clippy may run
 the local formatting and lint gates; m1 is a fallback, not a universal gate.
 These checks are a push safeguard only. GitHub CI, branch protection, and the
 configured Shipyard mutation machine remain the landing authority.
+
+## Authenticated wrapper repository provenance
+
+When a Shipyard GitHub client targets a repository outside its checkout, its
+explicit repository scope must be exported as `GH_REPO=OWNER/REPO` for the
+`ghapp` wrapper. Native `gh api graphql` does not accept a `--repo` argument;
+keep provenance in the client environment rather than appending wrapper-only
+flags to native CLI invocations.
 
