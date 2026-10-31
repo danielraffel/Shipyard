@@ -3569,6 +3569,16 @@ merges directly), the steward, as that base's single admission writer, also
 sweeps every open PR, owned or not, and withdraws what the exact-head gate does
 not admit. Other branches are covered only by running the steward per base.
 
+Every row of a steward pass also names why that pull request is not merging:
+`blocked_on` (one token, such as `no_verdict`, `held`,
+`approval_excluded:unattributed`, `required_never_ran:<contexts>`,
+`merge_state:DIRTY` or `owner_decision`) and `since` (when that state began,
+UTC), and each repository carries `blocked_summary` (counts per token and the
+three oldest blocked rows with `age_minutes`). Read those instead of inferring
+the state from `mutation`: `waiting_head_approval` alone does not say whether
+nobody reviewed the head, a reviewer holds it, or its approval is excluded.
+The full token list is in `docs/automated-draining.md`.
+
 - **Disarm (always live).** An armed native auto-merge request on such a head
   is disabled (`disarmed_stale_auto_merge:<sha>`, audit
   `disarm_stale_auto_merge`). It fails closed: an approval that cannot be read,

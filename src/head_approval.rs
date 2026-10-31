@@ -92,7 +92,10 @@ use regex::Regex;
 use serde::Serialize;
 use serde_json::Value;
 
+mod blocker;
 mod rebase;
+
+pub use blocker::ApprovalBlocker;
 pub use rebase::{
     CarryRecord, REBASE_CARRY_ENV, REBASE_CARRY_FILE, REBASE_CARRY_LOG, patch_id, rebase_carry,
     rebase_carry_enabled,
@@ -1370,33 +1373,51 @@ fn approver_allowed(record: &Value, policy: &ApprovalPolicy) -> bool {
 /// signers file the body must carry a `reviewer: <name>` line naming an
 /// allowed signer.
 fn app_approval_refusal(record: &Value, policy: &ApprovalPolicy) -> Option<String> {
+    app_approval_refusal_reason(record, policy).map(|(_, message)| message)
+}
+
+/// [`app_approval_refusal`] with a stable machine token for the reason, so a
+/// report can name the exclusion without parsing the sentence.
+fn app_approval_refusal_reason(
+    record: &Value,
+    policy: &ApprovalPolicy,
+) -> Option<(&'static str, String)> {
     let body = record
         .get("body")
         .and_then(Value::as_str)
         .unwrap_or_default();
     if noncanonical_stamp(body) {
-        return Some("it carries a non-canonical session stamp".to_owned());
+        return Some((
+            "noncanonical_stamp",
+            "it carries a non-canonical session stamp".to_owned(),
+        ));
     }
     let session = stamped_session(body);
     if session.as_deref() == Some("unattributed") {
-        return Some("its session stamp is unattributed".to_owned());
+        return Some((
+            "unattributed",
+            "its session stamp is unattributed".to_owned(),
+        ));
     }
     // The repository-side rule: an APPROVE posted around ghapp's stamper
     // (stdin, a raw API call) names no session at all (tartci#623's copy,
     // stamp removed, still passed the review-verdict status).
     if policy.signer_source == SignerSource::Base && session.is_none() {
-        return Some("it has no `ghapp` session stamp".to_owned());
+        return Some(("no_stamp", "it has no `ghapp` session stamp".to_owned()));
     }
     // Host-local: the repository-side rule has no host to read.
     if policy.signer_source == SignerSource::Host
         && let Some(refusal) =
             session_refusal(body, host_sessions().as_deref(), &host_session_hosts())
     {
-        return Some(refusal);
+        return Some(("session_not_allowed", refusal));
     }
     if policy.signer_source == SignerSource::Base && policy.signers.is_none() {
-        return Some(format!(
-            "no signer list is configured on the base branch (`[{CONFIG_TABLE}] {SIGNERS_KEY}`)"
+        return Some((
+            "no_signer_list",
+            format!(
+                "no signer list is configured on the base branch (`[{CONFIG_TABLE}] {SIGNERS_KEY}`)"
+            ),
         ));
     }
     let signers = policy.signers.as_ref()?;
@@ -1408,26 +1429,35 @@ fn app_approval_refusal(record: &Value, policy: &ApprovalPolicy) -> Option<Strin
         .map(|name| name.as_str().to_ascii_lowercase())
         .collect();
     if signed.is_empty() {
-        return Some("it has no `reviewer: <name>` line".to_owned());
+        return Some((
+            "no_signer_line",
+            "it has no `reviewer: <name>` line".to_owned(),
+        ));
     }
     let matching: Vec<&String> = signed
         .iter()
         .filter(|name| signers.contains(name))
         .collect();
     if matching.is_empty() {
-        return Some(format!(
-            "its signer {} is not one of {}",
-            signed.last().map_or("", String::as_str),
-            if signers.is_empty() {
-                "nobody".to_owned()
-            } else {
-                signers.join(", ")
-            }
+        return Some((
+            "uncounted_signer",
+            format!(
+                "its signer {} is not one of {}",
+                signed.last().map_or("", String::as_str),
+                if signers.is_empty() {
+                    "nobody".to_owned()
+                } else {
+                    signers.join(", ")
+                }
+            ),
         ));
     }
     if !policy.signer_identities.is_empty() {
         let Some(identity) = stamped_identity(body) else {
-            return Some("its ghapp stamp has no reviewer agent identity".to_owned());
+            return Some((
+                "unbound_identity",
+                "its ghapp stamp has no reviewer agent identity".to_owned(),
+            ));
         };
         let bound = matching.iter().any(|name| {
             policy
@@ -1438,10 +1468,14 @@ fn app_approval_refusal(record: &Value, policy: &ApprovalPolicy) -> Option<Strin
         if !bound {
             let name = matching.last().map_or("", |value| value.as_str());
             if !policy.signer_identities.contains_key(name) {
-                return Some(format!("its signer {name} has no base identity binding"));
+                return Some((
+                    "unbound_identity",
+                    format!("its signer {name} has no base identity binding"),
+                ));
             }
-            return Some(format!(
-                "its signer {name} is not bound to stamped identity {identity}"
+            return Some((
+                "unbound_identity",
+                format!("its signer {name} is not bound to stamped identity {identity}"),
             ));
         }
     }
@@ -1792,7 +1826,22 @@ fn head_hold<'a>(
 /// `held by <signer> at <comment|review> <id>` for a HOLD record: the `reviewer:` signer line
 /// when the body carries one, else the login; the comment or review id.
 fn describe_hold(record: &Value) -> String {
-    let signer = record
+    let signer = hold_signer(record);
+    let place = match record.get("id").and_then(Value::as_u64) {
+        Some(id) if record.get("state").is_some() => format!("review {id}"),
+        Some(id) => format!("comment {id}"),
+        None => record
+            .get("at")
+            .and_then(Value::as_str)
+            .map_or_else(|| "an unrecorded time".to_owned(), str::to_owned),
+    };
+    format!("held by {signer} at {place}")
+}
+
+/// Who holds a HOLD record: its `reviewer:` signer line when the body carries
+/// one, else the login.
+fn hold_signer(record: &Value) -> String {
+    record
         .get("body")
         .and_then(Value::as_str)
         .and_then(|body| {
@@ -1804,16 +1853,7 @@ fn describe_hold(record: &Value) -> String {
                 .map(|name| name.as_str().to_ascii_lowercase())
         })
         .or_else(|| login(record).map(str::to_owned))
-        .unwrap_or_else(|| "an unknown reviewer".to_owned());
-    let place = match record.get("id").and_then(Value::as_u64) {
-        Some(id) if record.get("state").is_some() => format!("review {id}"),
-        Some(id) => format!("comment {id}"),
-        None => record
-            .get("at")
-            .and_then(Value::as_str)
-            .map_or_else(|| "an unrecorded time".to_owned(), str::to_owned),
-    };
-    format!("held by {signer} at {place}")
+        .unwrap_or_else(|| "an unknown reviewer".to_owned())
 }
 
 fn latest_verdict(
@@ -2363,6 +2403,22 @@ pub fn evaluate_with_policy_for_author_with_events(
     author: Option<&str>,
 ) -> Result<(HeadGate, Vec<String>), String> {
     evaluate_events(run_gh, repo, pr, head, policy, queue, author, true)
+        .map(|(gate, events, _)| (gate, events))
+}
+
+/// [`evaluate_with_policy_for_author_with_events`], also naming why a refused
+/// head is refused ([`ApprovalBlocker`]); `None` when the gate allows it. The
+/// diagnosis reads nothing the gate did not already read.
+pub fn evaluate_with_policy_for_author_with_diagnosis(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    pr: u64,
+    head: &str,
+    policy: &ApprovalPolicy,
+    queue: &Value,
+    author: Option<&str>,
+) -> Result<(HeadGate, Vec<String>, Option<ApprovalBlocker>), String> {
+    evaluate_events(run_gh, repo, pr, head, policy, queue, author, true)
 }
 
 /// [`evaluate_with_policy_for_author_with_events`]; `rollups` is false for a
@@ -2377,9 +2433,9 @@ fn evaluate_events(
     queue: &Value,
     author: Option<&str>,
     rollups: bool,
-) -> Result<(HeadGate, Vec<String>), String> {
+) -> Result<(HeadGate, Vec<String>, Option<ApprovalBlocker>), String> {
     if !policy.required {
-        return Ok((HeadGate::NotRequired, Vec::new()));
+        return Ok((HeadGate::NotRequired, Vec::new(), None));
     }
     let author = pr_author(run_gh, repo, pr, policy, author)?;
     let author = author.as_deref();
@@ -2393,6 +2449,7 @@ fn evaluate_events(
         &format!("repos/{repo}/issues/{pr}/comments"),
         COMMENT_RECORD_JQ,
     )?;
+    let all_comments = comments.clone();
     let comments = if comments.iter().any(|comment| {
         comment
             .get("body")
@@ -2428,14 +2485,23 @@ fn evaluate_events(
         author,
     };
     let gate = refuse_self_approval(with_carry(run_gh, &carry, gate), head, &comments);
-    Ok((
-        if rollups {
-            with_rollup(run_gh, &carry, gate)
-        } else {
-            gate
+    let gate = if rollups {
+        with_rollup(run_gh, &carry, gate)
+    } else {
+        gate
+    };
+    let blocker = blocker::diagnose(
+        &gate,
+        &blocker::Records {
+            head,
+            reviews: &reviews,
+            comments: &comments,
+            all_comments: &all_comments,
         },
-        events,
-    ))
+        policy,
+        author,
+    );
+    Ok((gate, events, blocker))
 }
 
 /// One rollup member's gate ([`crate::rollup`]): this rule at its own exact
@@ -2454,7 +2520,7 @@ pub(crate) fn evaluate_member(
     let mut policy = policy.clone();
     policy.dry_run = true;
     evaluate_events(run_gh, repo, pr, head, &policy, &Value::Null, None, false)
-        .map(|(gate, _)| gate)
+        .map(|(gate, _, _)| gate)
 }
 
 /// `gate`, or the acceptance of a rollup ([`crate::rollup::guard_accept`])

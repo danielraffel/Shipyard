@@ -310,7 +310,10 @@ wrapper. Each attempt, allowed or refused, appends a line to
 `queue-arms.jsonl` in Shipyard's state directory (`repo`, `pr`, `head`,
 `verb`, `verdict`, `verdict_comment_id`, `signer`, `caller`; override the path
 with `SHIPYARD_QUEUE_ARMS_LOG`). A guard that cannot run (no `python3` 3.11+)
-refuses. The steward reports a refusal as `waiting_head_approval`. There is no
+refuses. The steward reports a refusal as `waiting_head_approval`; its pass
+JSON also names the reason per PR in `blocked_on` (`no_verdict`, `held`,
+`approval_excluded:<reason>`, ...) with a `since` time, so read that rather
+than the mutation when diagnosing a stall. There is no
 override: `--arm` asks only for an arm the verdict allows, and
 `GHAPP_ALLOW_UNREVIEWED_ARM` is refused and audited. The review-only switch
 and Shipyard's internal marker count only with the one-shot nonce Shipyard

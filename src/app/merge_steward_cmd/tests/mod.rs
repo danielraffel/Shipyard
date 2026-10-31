@@ -60,6 +60,7 @@ fn mutation_apply_context<'a>(
         observation,
         ledger_path,
         mutation_control,
+        approval_blockers: std::cell::RefCell::default(),
     }
 }
 
@@ -197,6 +198,7 @@ fn pending_cancellation_record() -> PendingCancellation {
 mod admission;
 #[cfg(unix)]
 mod arm_guard;
+mod blocked_on;
 #[cfg(unix)]
 mod capacity;
 mod exact_head_merge;

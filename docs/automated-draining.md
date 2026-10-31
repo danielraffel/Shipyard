@@ -167,6 +167,64 @@ machine.
 - **Two things are already admitting work.** Turn one off before starting the
   steward, or they will race each other.
 
+## Why a pull request is not merging
+
+Every steward pass (`shipyard runner steward --json`) gives each open pull
+request on the base one `blocked_on` token and a `since` time, so a stall has
+a name and an age. Nothing is left out of the pass: a draft, an unmanaged pull
+request and one whose checks never ran each get a row.
+
+Per row, beside `decision`, `mutation` and `error`:
+
+- `blocked_on`: one stable token (below).
+- `since`: when that state began, UTC, or `null` when nothing dates it.
+- `since_source`: which GitHub time it came from: `checks_green` (the newest
+  required check finished), `check_started`, `check_completed`,
+  `approval_posted`, `hold_posted`, `queue_removed`, `merge_queue_enqueued`,
+  `label_added` or `head_commit`. `head_commit` is the head commit's
+  committer date: a best-effort stand-in that can predate the push (and a
+  `BEHIND`/`DIRTY` state, which starts when the base moves): the state may
+  have begun later, so the age it implies is an upper bound.
+- `blocked_detail`: the contexts, reason or record id behind the token.
+- `held_by`: `{holder, record, id}` whenever a HOLD names the head, even when a
+  label or another state outranks it in `blocked_on`.
+
+Per repository, `blocked_summary` holds `counts` (rows per token) and
+`oldest`: the three longest-blocked rows as `{number, blocked_on,
+age_minutes}`. `admitted`, `queued`, `ready` and `draft` rows are counted but
+not listed as blocked.
+
+| Token | Meaning | Who moves it |
+|---|---|---|
+| `no_verdict` | Green, and no reviewer verdict names this head | reviewer |
+| `held` | A counting HOLD names this head | author: fix and push |
+| `approval_excluded:<reason>` | An APPROVE names this head but does not count. Reasons: `unattributed`, `no_stamp`, `noncanonical_stamp`, `session_not_allowed`, `no_signer_list`, `no_signer_line`, `uncounted_signer`, `unbound_identity`, `pr_author`, `impersonated_app`, `untrusted_reviewer`, `unlisted_reviewer`, `unlisted_human`, `predates_head` (posted before the head commit), `stale_head` (only an earlier head is approved), `self_approved` | reviewer or fleet config |
+| `ejection_cap` | The queue removed this head too often since its last approval | reviewer, or a new push |
+| `approval_unread` | The approval gate could not be read this pass | next pass |
+| `owner_decision` | Labelled `owner-decision` | owner |
+| `excluded_label:<label>` | `superseded`, `PARKED/<platform>` or the opt-out label | whoever owns the label |
+| `provenance_blocked:<labels>` | A provenance-blocking label | owner |
+| `required_never_ran:<contexts>` | A required context has no run on this head and nothing from its source is still queued or running (often a renamed check: merge the base to re-run CI) | repair lane |
+| `required_pending` | Required checks are queued or running, or have not appeared yet behind a running job | CI |
+| `required_failed:<contexts>` | A required check failed. When the only red context is the approval context (`review-verdict`), the row names the approval token instead; an apply pass that did not read the gate for that head keeps this token and says so in `blocked_detail` | author or repair lane |
+| `transient_rerun` | The steward is rerunning an interrupted check | steward |
+| `merge_state:<STATE>` | GitHub says `DIRTY`, `BEHIND`, `UNSTABLE`, ... | repair lane: merge the base |
+| `ejected_same_head:<cause>` | The queue ejected this exact head; the steward will not re-enqueue it. Read from the same queue state in a dry run and an apply pass; `since` is the removal | repair lane |
+| `waiting_full_test_tier`, `waiting_enqueue_requirements` | Admission waits on a deferred check tier or a GitHub requirement | CI |
+| `revalidating` | The head or queue changed during the pass | next pass |
+| `steward_error` | Admission failed; see `error` | operator |
+| `admission_pending` | Admission returned an outcome with no token of its own; see `blocked_detail` | next pass |
+| `queued` | In the merge queue | queue |
+| `admitted` | Enqueued or merged this pass (outranks any label) | nobody |
+| `ready` | Approved and green; a dry run would admit it | steward |
+| `draft`, `unmanaged`, `handoff_missing`, `invalid_head`, `direct_merge_refused`, `required_policy_unknown` | The steward does not own or cannot admit it yet | author or config |
+
+The approval tokens come from the same review and comment reads the gate made
+to refuse the head, so naming them costs nothing extra. Only an undated state
+(a conflict, a draft, a check that never ran) reads the head commit's time,
+and a skip label reads its `labeled` event; a failed read leaves `since` null
+and never fails the pass.
+
 ## Things that bite
 
 These came from running it for real:

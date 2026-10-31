@@ -125,7 +125,13 @@ pub(super) fn read_head_gate_with_queue_state(
     pr: &ObservedPr,
     ledger: &StewardLedger,
 ) -> Result<(crate::head_approval::HeadGate, Vec<String>, Value), String> {
-    read_head_gate_for(context.actions, context.observation, pr, ledger)
+    let (gate, events, queue, blocker) =
+        read_head_gate_for(context.actions, context.observation, pr, ledger)?;
+    context.approval_blockers.borrow_mut().insert(
+        pr.fact.number,
+        super::blocked_on::GateRecord::new(&pr.fact.head_sha, blocker, &queue),
+    );
+    Ok((gate, events, queue))
 }
 
 /// [`read_head_gate_with_queue_state`] from read-only inputs, so an audit
@@ -135,10 +141,18 @@ pub(super) fn read_head_gate_for(
     observation: &RepoObservation,
     pr: &ObservedPr,
     ledger: &StewardLedger,
-) -> Result<(crate::head_approval::HeadGate, Vec<String>, Value), String> {
+) -> Result<
+    (
+        crate::head_approval::HeadGate,
+        Vec<String>,
+        Value,
+        Option<crate::head_approval::ApprovalBlocker>,
+    ),
+    String,
+> {
     let approval_policy = read_approval_policy(actions, observation)?;
     let queue = read_pr_queue_state(actions, observation, pr.fact.number)?;
-    let (gate, events) = evaluate_head_gate(
+    let (gate, events, blocker) = evaluate_head_gate_diagnosed(
         actions,
         observation,
         pr,
@@ -147,7 +161,7 @@ pub(super) fn read_head_gate_for(
         &queue,
         ledger,
     )?;
-    Ok((gate, events, queue))
+    Ok((gate, events, queue, blocker))
 }
 
 /// The base's reviewer policy, read strictly: an absent or unreadable config
@@ -224,7 +238,64 @@ pub(super) fn evaluate_head_gate(
     queue: &Value,
     ledger: &StewardLedger,
 ) -> Result<(crate::head_approval::HeadGate, Vec<String>), String> {
+    evaluate_head_gate_diagnosed(
+        actions,
+        observation,
+        pr,
+        head,
+        approval_policy,
+        queue,
+        ledger,
+    )
+    .map(|(gate, events, _)| (gate, events))
+}
+
+/// [`evaluate_head_gate`], also naming why a refused head is refused.
+fn evaluate_head_gate_diagnosed(
+    actions: &GitHubActions,
+    observation: &RepoObservation,
+    pr: &ObservedPr,
+    head: &str,
+    approval_policy: &crate::head_approval::ApprovalPolicy,
+    queue: &Value,
+    ledger: &StewardLedger,
+) -> Result<
+    (
+        crate::head_approval::HeadGate,
+        Vec<String>,
+        Option<crate::head_approval::ApprovalBlocker>,
+    ),
+    String,
+> {
     let run_gh = |argv: &[String]| actions.run_gh(argv).map_err(|error| error.to_string());
+    evaluate_head_gate_with(
+        &run_gh,
+        observation,
+        pr,
+        head,
+        approval_policy,
+        queue,
+        ledger,
+    )
+}
+
+/// [`evaluate_head_gate_diagnosed`] over any `gh` runner.
+pub(super) fn evaluate_head_gate_with(
+    run_gh: crate::head_approval::RunGh<'_>,
+    observation: &RepoObservation,
+    pr: &ObservedPr,
+    head: &str,
+    approval_policy: &crate::head_approval::ApprovalPolicy,
+    queue: &Value,
+    ledger: &StewardLedger,
+) -> Result<
+    (
+        crate::head_approval::HeadGate,
+        Vec<String>,
+        Option<crate::head_approval::ApprovalBlocker>,
+    ),
+    String,
+> {
     let recorded = super::unapproved_admission::steward_removal_times(
         ledger,
         &observation.repo,
@@ -232,8 +303,8 @@ pub(super) fn evaluate_head_gate(
         head,
     );
     let queue = &super::unapproved_admission::without_steward_removals(queue, head, &recorded);
-    crate::head_approval::evaluate_with_policy_for_author_with_events(
-        &run_gh,
+    crate::head_approval::evaluate_with_policy_for_author_with_diagnosis(
+        run_gh,
         &observation.repo,
         pr.fact.number,
         head,
@@ -242,6 +313,60 @@ pub(super) fn evaluate_head_gate(
         pr.fact.author.as_deref(),
     )
     .map_err(|error| format!("head approval unreadable: {error}"))
+}
+
+/// The gate read a report makes: the same evaluation as admission, but the
+/// policy is marked `dry_run`, so a carried approval is judged and never
+/// appended to the carry log (`carries.jsonl` records only carries a landing
+/// accepted). Returns the gate, the queue state it read, and the diagnosis.
+pub(super) fn read_head_gate_for_report(
+    actions: &GitHubActions,
+    observation: &RepoObservation,
+    pr: &ObservedPr,
+    ledger: &StewardLedger,
+) -> Result<
+    (
+        crate::head_approval::HeadGate,
+        Value,
+        Option<crate::head_approval::ApprovalBlocker>,
+    ),
+    String,
+> {
+    let approval_policy = read_approval_policy(actions, observation)?;
+    let queue = read_pr_queue_state(actions, observation, pr.fact.number)?;
+    let run_gh = |argv: &[String]| actions.run_gh(argv).map_err(|error| error.to_string());
+    let (gate, blocker) =
+        report_gate_with(&run_gh, observation, pr, &approval_policy, &queue, ledger)?;
+    Ok((gate, queue, blocker))
+}
+
+/// [`read_head_gate_for_report`]'s evaluation over any `gh` runner.
+pub(super) fn report_gate_with(
+    run_gh: crate::head_approval::RunGh<'_>,
+    observation: &RepoObservation,
+    pr: &ObservedPr,
+    approval_policy: &crate::head_approval::ApprovalPolicy,
+    queue: &Value,
+    ledger: &StewardLedger,
+) -> Result<
+    (
+        crate::head_approval::HeadGate,
+        Option<crate::head_approval::ApprovalBlocker>,
+    ),
+    String,
+> {
+    let mut report_policy = approval_policy.clone();
+    report_policy.dry_run = true;
+    evaluate_head_gate_with(
+        run_gh,
+        observation,
+        pr,
+        &pr.fact.head_sha,
+        &report_policy,
+        queue,
+        ledger,
+    )
+    .map(|(gate, _events, blocker)| (gate, blocker))
 }
 
 #[cfg(all(test, unix))]
