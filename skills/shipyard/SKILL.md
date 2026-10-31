@@ -27,6 +27,11 @@ counts each distinct superseded job once, reports clean versus
 uncertain/cancelled/unmatched coverage, and never treats survivor runtime as
 savings. It never turns this evidence into a queue or merge decision.
 
+The producer-side merge-receipt export supports an explicit `--stdout` stream
+mode for a governed transport. It emits canonical JSONL receipt records only;
+`--file` remains the atomic handoff mode, and `--stdout` cannot be combined
+with `--file` or `--json`.
+
 The failure-learning observer is intentionally independent of baseline
 collection. On macOS, use `scripts/install_cause_observer.sh` to render a
 per-user launchd job that runs the read-only `shipyard cause record` pass on a
@@ -3621,7 +3626,11 @@ result explicitly escalates, with classification used only for routing. A
 global lease, overall deadline, and pre/post policy-evidence witnesses prevent
 parallel calls and stale authorization. This phase cannot edit, rerun, enqueue,
 merge, or release; quota/provider failures become typed terminal failures
-rather than blocking unrelated stewardship.
+rather than blocking unrelated stewardship. Provider authentication and
+transport failures are recorded with distinct `provider_auth_failure` or
+`provider_transport_failure` classes; they remain fail-closed and are eligible
+for one future bounded alternate-provider attempt, but this phase never selects
+an alternate provider implicitly.
 See [references/merge-steward.md](references/merge-steward.md) for the config,
 schema, limits, and exact authority boundary.
 
@@ -3905,6 +3914,16 @@ everything.
 
 ### Log retention operations
 
+The bounded cause archive has an explicit `shipyard cause prune` path. It is
+dry-run by default and refuses to mutate an archive until an operator has
+enrolled that mutable operational copy with `--initialize`; frozen or
+unavailable archives remain readable and are never guessed at. On macOS,
+`scripts/install_cleanup.sh` can install the per-user launchd schedule for the
+existing dry-run/apply cleanup passes. Review the rendered plan before using
+`--install`; each run writes a bounded receipt and a failed pass remains
+visible to `shipyard doctor` until a later pass succeeds. This schedule never
+changes queue or GitHub state.
+
 Metrics cleanup uses the existing `SHIPYARD_METRICS_RETENTION_DAYS` policy
 (default 90; nonpositive disables pruning, not collection). It also expires
 queue shadow observations and terminal timing, preserving timing referenced by
@@ -3921,6 +3940,10 @@ do not raw-`touch` it while cleanup may run. Failure and unclassified legacy
 evidence is never pressure-deleted. Current Phase 1 rotation is lossless at
 writer reopen boundaries; do not use external `copytruncate` against active
 Shipyard writers. Full continuously-active writer rotation remains Phase 2.
+
+Metrics retention is bounded as well: raw runs and expired fleet-capacity
+samples are deleted in small SQLite transactions, and a metrics-store failure
+fails `cleanup` closed so scheduled receipts cannot report a false success.
 
 ## GraphQL And GitHub App Fallback Behaviour
 

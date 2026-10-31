@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
-use super::{Liveness, ReclaimPolicy, owner_path, plan};
+use super::{Liveness, ReclaimPolicy, apply_with_liveness, owner_path, plan};
 
 struct Fake {
     alive: Vec<u32>,
@@ -91,6 +91,62 @@ fn an_unreadable_process_listing_keeps_every_unowned_directory() {
         tmpdirs: None,
     };
     assert!(plan(temp.path(), later(), POLICY, &liveness).is_empty());
+}
+
+#[test]
+fn apply_rechecks_owner_before_deleting_a_planned_directory() {
+    let temp = tempfile::tempdir().expect("temp");
+    let dir = make(temp.path(), "shipyard-validation-reused", Some(4_000_004));
+    let planned = plan(
+        temp.path(),
+        later(),
+        POLICY,
+        &Fake {
+            alive: Vec::new(),
+            tmpdirs: Some(Vec::new()),
+        },
+    );
+    assert_eq!(planned.len(), 1);
+    fs::write(owner_path(&dir), "4\n").expect("owner changed");
+    let freed = apply_with_liveness(
+        &planned,
+        &Fake {
+            alive: vec![4],
+            tmpdirs: Some(Vec::new()),
+        },
+    );
+    assert_eq!(freed, 0);
+    assert!(dir.exists(), "a reused owner must survive the final check");
+}
+
+#[test]
+fn apply_rechecks_path_identity_before_deleting_a_replaced_directory() {
+    let temp = tempfile::tempdir().expect("temp");
+    let dir = make(temp.path(), "shipyard-validation-replaced", Some(4_000_005));
+    let planned = plan(
+        temp.path(),
+        later(),
+        POLICY,
+        &Fake {
+            alive: Vec::new(),
+            tmpdirs: Some(Vec::new()),
+        },
+    );
+    assert_eq!(planned.len(), 1);
+    fs::remove_dir_all(&dir).expect("remove planned directory");
+    let replacement = make(temp.path(), "shipyard-validation-replaced", Some(4_000_005));
+    let freed = apply_with_liveness(
+        &planned,
+        &Fake {
+            alive: Vec::new(),
+            tmpdirs: Some(Vec::new()),
+        },
+    );
+    assert_eq!(freed, 0);
+    assert!(
+        replacement.exists(),
+        "a replaced path must survive the final check"
+    );
 }
 
 #[test]

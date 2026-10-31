@@ -85,6 +85,15 @@ class BaselineScorecardTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertEqual(len(calls), 2)
         sleep.assert_called_once_with(5)
+    def test_coverage_value_text_is_fail_closed_for_unavailable(self):
+        self.assertEqual(
+            MOD.coverage_value_text({"status": "unavailable", "value": None}),
+            "n/a",
+        )
+        self.assertEqual(
+            MOD.coverage_value_text({"status": "available", "value": 0.25}),
+            "0.25",
+        )
 
     def test_readiness_rejects_nonfinite_instrumentation_and_separates_lane_eligibility(self):
         started = dt.datetime(2026, 10, 1, tzinfo=dt.timezone.utc)
@@ -226,6 +235,7 @@ class BaselineScorecardTests(unittest.TestCase):
                 MOD.run = original
             self.assertTrue(result["provenance_status"])
             self.assertEqual(result["collector_safe_merge_denominator"]["status"], "unavailable")
+            self.assertEqual(result["collector_safe_merge_rate"]["status"], "unavailable")
             self.assertEqual(result["strata"]["rerun"]["status"], "unavailable")
             self.assertEqual(commands[0][commands[0].index("--project") + 1], "Generous-Corp/pulp")
 
@@ -241,15 +251,33 @@ class BaselineScorecardTests(unittest.TestCase):
             finally:
                 MOD.run = original
             self.assertEqual(result["collector_safe_merge_denominator"], {"status": "available", "value": 2})
+            self.assertEqual(result["collector_safe_merge_rate"]["status"], "unavailable")
+
+    def test_scorecard_preserves_producer_safe_merge_rate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = type("Args", (), {"db": Path(directory) / "metrics" / "metrics.db", "project": "pulp", "repo": "Generous-Corp/pulp",
+                                      "shipyard": "shipyard", "since_days": 5, "timeout_seconds": 300})()
+            original = MOD.run
+            rate = {"status": "partial", "value": 0.25, "reason": "capacity lower bound"}
+            MOD.run = lambda *a, **k: subprocess.CompletedProcess(
+                a[0], 0, json.dumps({"safely_merged_changes_per_eligible_slot_hour": rate}), "")
+            try:
+                result = MOD.authoritative_scorecard(args)
+            finally:
+                MOD.run = original
+            self.assertEqual(result["collector_safe_merge_rate"], rate)
 
     def test_unavailable_handoff_masks_stale_local_receipt_metrics(self):
         card = {
             "safely_merged_changes": {"status": "available", "value": 2},
             "collector_safe_merge_denominator": {"status": "available", "value": 2},
+            "safely_merged_changes_per_eligible_slot_hour": {"status": "partial", "value": 0.5},
+            "collector_safe_merge_rate": {"status": "partial", "value": 0.5},
             "wasted_compute_per_safely_merged_change": {"status": "partial", "value": 4},
         }
         MOD.force_receipt_metrics_unavailable(card, "handoff is stale")
         for key in ("safely_merged_changes", "collector_safe_merge_denominator",
+                    "safely_merged_changes_per_eligible_slot_hour", "collector_safe_merge_rate",
                     "wasted_compute_per_safely_merged_change"):
             self.assertEqual(card[key]["status"], "unavailable")
             self.assertIsNone(card[key]["value"])
@@ -885,6 +913,7 @@ class CollectorInvocationTests(unittest.TestCase):
                 status="fresh", exported_at=dt.datetime.now(dt.timezone.utc), receipts=[value], payload=payload,
                 source_imported_at=dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
                 stale_after_seconds=7200,
+                source_host="m3",
                 producer={"identity": "shipyard", "version": "shipyard 0.366.4", "executable_sha256": "a" * 64})
             generated["unexpected"] = True
             health.write_text(json.dumps(generated))
@@ -895,6 +924,11 @@ class CollectorInvocationTests(unittest.TestCase):
             health.write_text(json.dumps(generated))
             with self.assertRaisesRegex(RuntimeError, "base branch"):
                 MOD.validate_merge_receipt_health(health, handoff, "owner/repo", "2h")
+            generated["base_branch"] = "main"
+            health.write_text(json.dumps(generated))
+            MOD.validate_merge_receipt_health(health, handoff, "owner/repo", "2h", expected_source_host="m3")
+            with self.assertRaisesRegex(RuntimeError, "expected m1"):
+                MOD.validate_merge_receipt_health(health, handoff, "owner/repo", "2h", expected_source_host="m1")
 
     def test_import_uses_immutable_validated_handoff_snapshot(self):
         with tempfile.TemporaryDirectory() as directory:

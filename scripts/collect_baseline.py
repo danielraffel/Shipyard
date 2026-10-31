@@ -224,6 +224,7 @@ def import_organic(args: argparse.Namespace) -> list[dict[str, Any]]:
             pathlib.Path(health_path).expanduser(), receipt_path, args.repo,
             getattr(args, "merge_receipt_stale_after", "2h"),
             getattr(args, "merge_receipt_base_branch", "main"),
+            getattr(args, "merge_receipt_source_host", None),
         )
         with immutable_handoff_snapshot(receipt_path, handoff_payload) as snapshot:
             return _import_organic_after_preflight(args, state_dir, snapshot)
@@ -400,7 +401,8 @@ def prepare_tartci_export(text: str, repo: str, project: str) -> tuple[str, int]
 
 
 def validate_merge_receipt_health(path: pathlib.Path, handoff: pathlib.Path, repo: str,
-                                  stale_after: str, base_branch: str = "main") -> tuple[dict[str, Any], bytes]:
+                                  stale_after: str, base_branch: str = "main",
+                                  expected_source_host: str | None = None) -> tuple[dict[str, Any], bytes]:
     """Require a producer health sidecar before importing its handoff."""
     if receipt_handoff is None:
         raise RuntimeError("merge receipt health validation is unavailable")
@@ -430,6 +432,23 @@ def validate_merge_receipt_health(path: pathlib.Path, handoff: pathlib.Path, rep
         raise RuntimeError(f"merge receipt health base branch is not {base_branch}")
     if health.get("freshness_basis") != receipt_handoff.FRESHNESS_BASIS:
         raise RuntimeError("merge receipt health has an unsupported freshness basis")
+    recorded_source_host = health.get("source_host")
+    if recorded_source_host is not None:
+        try:
+            receipt_handoff.validate_source_host(recorded_source_host)
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+    if expected_source_host is not None:
+        try:
+            receipt_handoff.validate_source_host(expected_source_host)
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+        if not isinstance(recorded_source_host, str):
+            raise RuntimeError("merge receipt health is missing source_host provenance")
+        if recorded_source_host.casefold() != expected_source_host.casefold():
+            raise RuntimeError(
+                f"merge receipt health source_host is {recorded_source_host}, expected {expected_source_host}"
+            )
     recorded_file = health.get("file")
     if not isinstance(recorded_file, str) or pathlib.Path(recorded_file).resolve() != handoff.resolve():
         raise RuntimeError("merge receipt health is bound to a different handoff file")
@@ -676,6 +695,12 @@ def validate_state_layout(db: pathlib.Path) -> pathlib.Path:
     return state_dir
 
 
+def coverage_value_text(coverage: Any) -> str:
+    """Render an optional scorecard value without turning unavailable into None."""
+    value = coverage.get("value") if isinstance(coverage, dict) else None
+    return "n/a" if value is None else str(value)
+
+
 def authoritative_scorecard(args: argparse.Namespace) -> dict[str, Any]:
     validate_project_repo(args.project, args.repo)
     state_dir = validate_state_layout(args.db)
@@ -697,6 +722,13 @@ def authoritative_scorecard(args: argparse.Namespace) -> dict[str, Any]:
             "reason": "scorecard did not report a safe-merge denominator",
         }
     )
+    safe_merge_rate = card.get("safely_merged_changes_per_eligible_slot_hour")
+    card["collector_safe_merge_rate"] = (
+        dict(safe_merge_rate) if isinstance(safe_merge_rate, dict) else {
+            "status": "unavailable", "value": None,
+            "reason": "scorecard did not report a safe-merge rate",
+        }
+    )
     card.pop("database", None)
     return consume_authenticated_strata(card, repo=args.repo, since_days=args.since_days,
                                         reference_at=dt.datetime.now(dt.timezone.utc))
@@ -707,6 +739,8 @@ def force_receipt_metrics_unavailable(card: dict[str, Any], reason: str) -> None
     unavailable = {"status": "unavailable", "value": None, "reason": reason}
     card["safely_merged_changes"] = dict(unavailable)
     card["collector_safe_merge_denominator"] = dict(unavailable)
+    card["safely_merged_changes_per_eligible_slot_hour"] = dict(unavailable)
+    card["collector_safe_merge_rate"] = dict(unavailable)
     card["wasted_compute_per_safely_merged_change"] = dict(unavailable)
 
 
@@ -994,6 +1028,8 @@ def main() -> int:
                         help="maximum producer handoff age when --merge-receipt-health is supplied")
     parser.add_argument("--merge-receipt-base-branch", default="main",
                         help="protected base branch bound to producer receipts")
+    parser.add_argument("--merge-receipt-source-host",
+                        help="expected managed fleet host that produced the receipt handoff")
     parser.add_argument("--merge-receipt-unavailable-reason",
                         help="explicit reason the authenticated producer handoff was unavailable")
     parser.add_argument("--limit", type=int, default=100)
@@ -1101,6 +1137,7 @@ def main() -> int:
             f"- Baseline report complete: **{'yes' if state['baseline_readiness'].get('report_complete') else 'no'}**\n"
             f"- Optimization eligibility: **{'yes' if state['baseline_readiness'].get('optimization_eligible') else 'no'}**\n"
             f"- Safely merged denominator: **{card.get('collector_safe_merge_denominator', {}).get('status', 'unavailable')}**\n"
+            f"- Safely merged changes per eligible slot-hour: **{card.get('collector_safe_merge_rate', {}).get('status', 'unavailable')}** ({coverage_value_text(card.get('collector_safe_merge_rate'))})\n"
             f"- Provenance: **{card.get('provenance_status', 'unverified_organic_input')}**.\n"
             f"- Strata: **{len(REQUIRED_STRATA) - len(card.get('missing_strata', REQUIRED_STRATA))}/{len(REQUIRED_STRATA)} sufficient**; authenticated producer records only.\n\n"
             "Synthetic provenance, unavailable phases, and merge denominators are not imputed.\n"
