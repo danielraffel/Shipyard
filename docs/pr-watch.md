@@ -366,13 +366,13 @@ repository with no required checks is watched for everything but red checks.
 | `ready_unreviewed` | a comment whose first line starts with READY names the current head, and no verdict names it |
 | `head_unreviewed` | opt-in, `--head-unreviewed-after 45m`: the current head has been up that long with neither a READY nor a verdict naming it (drafts excepted). Off by default because it fires for every head an agent is still working on |
 | `verdict_posted` | a verdict was posted (a last line `verdict: APPROVE/HOLD head:<sha>` or `reviewed: <sha>`, or an APPROVED / CHANGES_REQUESTED review); route it to the author |
-| `armed_unapproved` | armed or queued, and the latest verdict naming the head is not an approval |
+| `armed_unapproved` | armed or queued, and the head carries no approval: no verdict names it, or a HOLD names it (a HOLD makes its head un-approvable, so a later APPROVE of the same head does not clear it) |
 | `required_red` | the pull request is armed, queued or approved, and the latest attempt of a required check on its head failed or was cancelled; the line names the failing tests. A red head nobody armed or approved is its author's work in progress |
 | `group_red` | a merge group named for the pull request failed a required job; the line names the failing tests |
 | `queue_removed` | the merge queue removed it for any reason but a merge |
 | `queue_stuck` | it has been in the merge queue for `--queue-stuck-after` (90m) |
 | `approved_unarmed` | the head has been approved for `--approved-unarmed-after` (15m) and nothing armed or queued it |
-| `held_unrepaired` | the latest trusted verdict on the current head is HOLD, nothing was pushed since (a push makes the verdict name an old head), and it is older than `--held-after` (60m). An armed or queued head is `armed_unapproved`'s, and a draft is skipped |
+| `held_unrepaired` | a trusted HOLD names the current head (a later APPROVE of the same head does not clear it), nothing was pushed since (a push makes the verdict name an old head), and it is older than `--held-after` (60m). An armed or queued head is `armed_unapproved`'s, and a draft is skipped |
 | `owner_decision`, `superseded`, `parked` | the pull request carries the label `owner-decision`, `superseded` or `PARKED/<why>` (case-insensitive; that precedence when several). It is reported once per head under its own state and **skipped by every stall rule** (`ready_unreviewed` through `approved_blocked`, `held_unrepaired`, `queue_*`), so a deliberately set-aside pull request does not alarm. `verdict_posted` still relays a verdict |
 | `approved_blocked` | the head is approved but `DIRTY` or `BEHIND` (live passes only: GitHub keeps no history of merge state) |
 | `host_alarm` | a `[tartci] ...` issue opened in `--alarm-repo` |

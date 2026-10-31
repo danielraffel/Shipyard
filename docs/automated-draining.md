@@ -57,7 +57,8 @@ owner only acts on evidence about the exact commit in front of it.
    a verdict naming the exact commit: APPROVE, or HOLD with what to fix.
 4. On a HOLD, a repair agent fixes what was named, adds a test, merges the
    base branch in (never a rebase), and pushes once. A new head means a fresh
-   review.
+   review. A HOLD makes its head un-approvable: a later APPROVE of the same
+   head, from any reviewer, does not count, so only the pushed fix can land.
 5. On the next steward pass (every five minutes is plenty), the approved head
    is handed to GitHub. A merge queue tests it with up to four others and
    merges the batch. Without a queue, Shipyard merges that exact head, and
@@ -181,7 +182,12 @@ These came from running it for real:
   still waiting.
 - **Version-bump pull requests are cheap to make expensive.** If a bot opens
   one per merge, each costs a full CI run. Hold bumps while the queue is busy,
-  and fast-path a bump whose diff touches only version files.
+  and fast-path a bump whose diff touches only version files. Shipyard itself
+  keeps exactly one: `version-at-land.yml` force-updates the bot-owned
+  `release/version-at-land` branch with the cumulative bump after each landing
+  and hands that one pull request to the steward (`shipyard:managed` plus an
+  exact-head `shipyard/steward-handoff` status); it still needs green required
+  checks and an exact-head approval.
 
 ## Related
 

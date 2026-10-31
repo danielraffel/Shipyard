@@ -221,3 +221,30 @@ fn a_repository_that_requires_no_review_is_allowed() {
     assert!(verdict.allowed());
     assert!(!verdict.required);
 }
+
+/// pulp#11117 through `shipyard review-verdict` (the repository-side rule):
+/// a signed HOLD, then a later signed APPROVE of the same unchanged head from
+/// another session. The head stays refused, the excluded APPROVE is named, and
+/// the fix asks for a new head rather than another APPROVE.
+#[test]
+fn a_hold_then_a_later_approve_of_the_same_head_is_refused() {
+    let mut hold = app_comment(&format!(
+        "Hold.\nreviewer: pulp-review\n<!-- session: Daniels-Mac-Studio-m3/interactive -->\n\
+         verdict: HOLD head:{HEAD}"
+    ));
+    hold["id"] = json!(4);
+    hold["at"] = json!("2026-10-14T16:30:00Z");
+    let approve = app_approval(HEAD, Some("pulp-review"));
+    // Control: the APPROVE alone is allowed.
+    assert!(judged(Some(SIGNED), vec![approve.clone()]).allowed());
+    let verdict = judged(Some(SIGNED), vec![hold, approve]);
+    assert!(!verdict.allowed(), "{verdict:?}");
+    assert!(
+        verdict
+            .audit_events
+            .contains(&"excluded_approval:head held by pulp-review at comment 4".to_owned()),
+        "{verdict:?}"
+    );
+    let fix = verdict.fix.as_deref().expect("a refusal names its fix");
+    assert!(fix.contains("pushes a new head"), "{fix}");
+}

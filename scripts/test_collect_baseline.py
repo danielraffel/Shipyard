@@ -135,6 +135,11 @@ class BaselineScorecardTests(unittest.TestCase):
             "instrumentation_coverage": {"status": "available", "continuous": True,
                                           "continuous_days": 5.0},
             "collector_safe_merge_denominator": {"status": "available", "value": 1},
+            "fleet_capacity": {"freshness_status": "fresh",
+                                "status": "available",
+                                "eligible_slot_hours": 1.0,
+                                "latest_valid_until": "2026-10-06T00:02:00+00:00",
+                                "freshness_reason": "latest evidence is current"},
             "important_lanes": {"lane-a": {"status": "insufficient", "completed_jobs": 2}},
             "host_generations": {"host-a": {"status": "insufficient", "completed_jobs": 2}},
             "strata": {name: {"provenance": "authenticated", "coverage": "complete", "qualified_jobs": 1}
@@ -154,6 +159,11 @@ class BaselineScorecardTests(unittest.TestCase):
         card = {
             "instrumentation_coverage": {"status": "available", "continuous": True,
                                           "continuous_days": 5.0},
+            "fleet_capacity": {"freshness_status": "fresh",
+                                "status": "available",
+                                "eligible_slot_hours": 1.0,
+                                "latest_valid_until": "2026-10-06T00:02:00+00:00",
+                                "freshness_reason": "latest evidence is current"},
             "important_lanes": {"lane-a": {"status": "available", "completed_jobs": 30}},
             "host_generations": {"host-a": {"status": "available", "completed_jobs": 10}},
             "strata": {name: {"provenance": "authenticated", "coverage": "complete", "qualified_jobs": 1}
@@ -169,6 +179,59 @@ class BaselineScorecardTests(unittest.TestCase):
         self.assertFalse(readiness["optimization_eligible"])
         self.assertEqual(readiness["status"], "unavailable")
         self.assertIn("authenticated safe-merge denominator is unavailable",
+                      [reason["reason"] for reason in readiness["reasons"]])
+
+    def test_readiness_requires_current_fleet_capacity_evidence(self):
+        started = dt.datetime(2026, 10, 1, tzinfo=dt.timezone.utc)
+        observed = started + dt.timedelta(days=5)
+        card = {
+            "instrumentation_coverage": {"status": "available", "continuous": True,
+                                          "continuous_days": 5.0},
+            "collector_safe_merge_denominator": {"status": "available", "value": 1},
+            "fleet_capacity": {"freshness_status": "stale",
+                                "freshness_reason": "latest evidence expired at 2026-10-05T23:58:00+00:00"},
+            "important_lanes": {}, "host_generations": {},
+            "strata": {name: {"provenance": "authenticated", "coverage": "complete", "qualified_jobs": 1}
+                       for name in MOD.REQUIRED_STRATA},
+            "missing_strata": [],
+            "strata_sufficiency": {name: {"status": "sufficient"} for name in MOD.REQUIRED_STRATA},
+        }
+        history_summary = {"five_continuous_24h_days": True, "missing_intervals": [], "failing_intervals": [],
+                           "window_until": observed.isoformat(), "expected_interval_secs": 3600,
+                           "cadence_slack_secs": 300}
+        readiness = MOD.baseline_readiness(card, started, observed, history_summary)
+        self.assertFalse(readiness["report_complete"])
+        self.assertIn("fleet-capacity evidence is not fresh: latest evidence expired at 2026-10-05T23:58:00+00:00",
+                      [reason["reason"] for reason in readiness["reasons"]])
+
+    def test_readiness_rejects_fresh_but_unusable_capacity(self):
+        started = dt.datetime(2026, 10, 1, tzinfo=dt.timezone.utc)
+        observed = started + dt.timedelta(days=5)
+        card = {
+            "instrumentation_coverage": {"status": "available", "continuous": True,
+                                          "continuous_days": 5.0},
+            "collector_safe_merge_denominator": {"status": "available", "value": 1},
+            "fleet_capacity": {"freshness_status": "fresh", "status": "partial",
+                                "eligible_slot_hours": None},
+            "important_lanes": {}, "host_generations": {},
+            "strata": {name: {"provenance": "authenticated", "coverage": "complete", "qualified_jobs": 1}
+                       for name in MOD.REQUIRED_STRATA},
+            "missing_strata": [],
+            "strata_sufficiency": {name: {"status": "sufficient"} for name in MOD.REQUIRED_STRATA},
+        }
+        history_summary = {"five_continuous_24h_days": True, "missing_intervals": [], "failing_intervals": [],
+                           "window_until": observed.isoformat(), "expected_interval_secs": 3600,
+                           "cadence_slack_secs": 300}
+        readiness = MOD.baseline_readiness(card, started, observed, history_summary)
+        self.assertFalse(readiness["report_complete"])
+        self.assertIn("fleet-capacity usable verified denominator is unavailable",
+                      [reason["reason"] for reason in readiness["reasons"]])
+
+    def test_readiness_reports_missing_fleet_capacity_freshness(self):
+        started = dt.datetime(2026, 10, 1, tzinfo=dt.timezone.utc)
+        observed = started + dt.timedelta(days=5)
+        readiness = MOD.baseline_readiness({}, started, observed, None)
+        self.assertIn("fleet-capacity freshness is unavailable",
                       [reason["reason"] for reason in readiness["reasons"]])
 
     def test_readiness_rejects_stale_pass_history_summary(self):
@@ -571,6 +634,8 @@ class BaselineStateRetentionTests(unittest.TestCase):
         card = {
             "instrumentation_coverage": {"status": "available", "continuous": True, "continuous_days": 5},
             "collector_safe_merge_denominator": {"status": "available", "value": 1},
+            "fleet_capacity": {"freshness_status": "fresh", "status": "available",
+                                "eligible_slot_hours": 1.0},
             "important_lanes": {"lane": {"status": "available", "completed_jobs": 30}},
             "host_generations": {"host": {"status": "available", "completed_jobs": 10}},
             "strata": {name: {"provenance": "authenticated", "coverage": "complete"}

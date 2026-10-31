@@ -2393,7 +2393,7 @@ class ReviewBeforeArm(unittest.TestCase):
     def test_a_hold_naming_the_head_is_refused(self) -> None:
         result = self.arm(490, "danielraffel/tartci", self.case("tartci-490"))
         self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn("the latest verdict naming head 82eeaab8a6bd is HOLD", result.stderr)
+        self.assertIn("a HOLD naming head 82eeaab8a6bd makes it un-approvable", result.stderr)
 
     def test_a_verdict_naming_the_head_is_allowed(self) -> None:
         # The App's APPROVE on the App's own PR counts: the author is the
@@ -2411,7 +2411,7 @@ class ReviewBeforeArm(unittest.TestCase):
             body=f"Delta review.\n\nverdict: HOLD head:{HEAD_784}"))
         result = self.arm(784, "danielraffel/Shipyard", self.approved_784(comments=pages))
         self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn("the latest verdict naming head fd0e94e25f44 is HOLD", result.stderr)
+        self.assertIn("a HOLD naming head fd0e94e25f44 makes it un-approvable", result.stderr)
         self.assertIn("2026-10-12T16:00:00Z", result.stderr)
 
     def test_a_hold_on_a_later_page_refuses(self) -> None:
@@ -2425,7 +2425,7 @@ class ReviewBeforeArm(unittest.TestCase):
         result = self.arm(784, "danielraffel/Shipyard",
                           self.approved_784(comments=[pages[0] + filler, [hold]]))
         self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn("is HOLD", result.stderr)
+        self.assertIn("makes it un-approvable", result.stderr)
         self.assertIn("--paginate", self.calls())
 
     def test_a_drive_by_account_cannot_approve(self) -> None:
@@ -2661,7 +2661,7 @@ class ReviewBeforeArm(unittest.TestCase):
                 refused = self.run_guard(argv, self.approved_784(queue=False, comments=held),
                                          "danielraffel/Shipyard")
                 self.assertEqual(refused.returncode, 1, refused.stderr)
-                self.assertIn("is HOLD", refused.stderr)
+                self.assertIn("makes it un-approvable", refused.stderr)
 
     def test_direct_merges_must_bind_the_approved_head(self) -> None:
         for path, argv in self.merge_paths(HOLD_784).items():
@@ -2978,7 +2978,7 @@ class ReviewBeforeArm(unittest.TestCase):
         ]
         result = self.land(history, head, trail)
         self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn("is HOLD", result.stderr)
+        self.assertIn("makes it un-approvable", result.stderr)
         # Control: the same honest merge without the HOLD carries.
         self.assertEqual(self.land(history, head).returncode, 0)
 
@@ -3923,7 +3923,7 @@ class ReviewIdentity(unittest.TestCase):
         ]
         allowed, why = guard.review_verdict(self.HEAD, "shipyard-local[bot]", comments, [], self.policy())
         self.assertFalse(allowed, why)
-        self.assertIn("has no readable time", why)
+        self.assertIn("posted with no readable time", why)
 
     def test_a_user_account_named_like_the_app_never_counts(self) -> None:
         # GitHub's GraphQL names the App `shipyard-local`, a login anyone can
@@ -4291,6 +4291,92 @@ class ReviewIdentity(unittest.TestCase):
         self.assertEqual(len(rust), 4)
         trusted = source.split("pub const TRUSTED_ASSOCIATIONS", 1)[1].split("];", 1)[0]
         self.assertEqual(tuple(re.findall(r'"([^"]+)"', trusted)), guard.TRUSTED_ASSOCIATIONS)
+
+class HoldMakesHeadUnapprovable(unittest.TestCase):
+    """pulp#11117 / pulp#11311 (2026-10-31): a counting HOLD is final for its
+    head. A later APPROVE of the same unchanged head, from the same signer in
+    another session or from another signer, does not count. Same rule as
+    src/head_approval.rs ``latest_verdict``."""
+
+    HEAD = "a" * 40
+    OLD = "b" * 40
+
+    def setUp(self) -> None:
+        scratch = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, scratch, True)
+        patcher = mock.patch.dict(os.environ, {"SHIPYARD_GHAPP_GUARDS_DIR": scratch})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop("SHIPYARD_SIGNERS_FROM_BASE", None)
+        self.policy = guard.review_policy(
+            '[auto_merge]\nreviewer_signers = ["pulp-review", "infra-review2"]\n',
+            "Generous-Corp/pulp", True)
+        guard.HELD_EXCLUSIONS.clear()
+
+    def verdict(self, comment_id: int, at: str, signer: str, session: str, verdict: str,
+                head: str) -> dict[str, Any]:
+        body = (f"Review.\nreviewer: {signer}\n"
+                f"<!-- session: Daniels-Mac-Studio-m3/{session} -->\nverdict: {verdict} head:{head}")
+        return {"id": comment_id, "user": {"login": "shipyard-local[bot]", "type": "Bot"},
+                "created_at": at, "body": body, "author_association": "CONTRIBUTOR"}
+
+    def judge(self, comments: list[dict[str, Any]],
+              reviews: list[dict[str, Any]] | None = None) -> tuple[bool, str]:
+        return guard.review_verdict(self.HEAD, "danielraffel", comments, reviews or [], self.policy)
+
+    def test_a_hold_then_a_later_approve_of_the_same_head_is_refused(self) -> None:
+        hold = self.verdict(1, "2026-10-31T14:40:00Z", "pulp-review", "737146e7-interactive",
+                            "HOLD", self.HEAD)
+        approve = self.verdict(2, "2026-10-31T15:21:00Z", "pulp-review",
+                               "fleet-pass-reviewer-1", "APPROVE", self.HEAD)
+        # Control: the APPROVE alone counts, so the refusal is the HOLD's.
+        self.assertTrue(self.judge([approve])[0])
+        guard.HELD_EXCLUSIONS.clear()
+        allowed, why = self.judge([hold, approve])
+        self.assertFalse(allowed, why)
+        self.assertIn("held by pulp-review at comment 1", why)
+        self.assertEqual(guard.HELD_EXCLUSIONS,
+                         ["excluded_approval:head held by pulp-review at comment 1"])
+        self.assertIsNone(guard.approved_earlier_head(self.HEAD, "danielraffel",
+                                                      [hold, approve], [], self.policy))
+
+    def test_an_approve_then_a_later_hold_is_refused(self) -> None:
+        allowed, why = self.judge([
+            self.verdict(1, "2026-10-31T14:00:00Z", "pulp-review", "a", "APPROVE", self.HEAD),
+            self.verdict(2, "2026-10-31T15:00:00Z", "pulp-review", "a", "HOLD", self.HEAD)])
+        self.assertFalse(allowed, why)
+
+    def test_a_hold_on_an_old_head_does_not_block_the_new_head(self) -> None:
+        allowed, why = self.judge([
+            self.verdict(1, "2026-10-31T14:00:00Z", "pulp-review", "a", "HOLD", self.OLD),
+            self.verdict(2, "2026-10-31T15:00:00Z", "pulp-review", "b", "APPROVE", self.HEAD)])
+        self.assertTrue(allowed, why)
+        self.assertEqual(guard.HELD_EXCLUSIONS, [])
+
+    def test_a_hold_from_a_login_that_does_not_count_is_ignored(self) -> None:
+        drive_by = {"id": 9, "user": {"login": "drive-by", "type": "User"},
+                    "created_at": "2026-10-31T14:00:00Z", "author_association": "NONE",
+                    "body": f"verdict: HOLD head:{self.HEAD}"}
+        allowed, why = self.judge([
+            drive_by,
+            self.verdict(2, "2026-10-31T15:00:00Z", "pulp-review", "b", "APPROVE", self.HEAD)])
+        self.assertTrue(allowed, why)
+
+    def test_one_signers_hold_is_not_outranked_by_another_signers_approve(self) -> None:
+        allowed, why = self.judge([
+            self.verdict(7, "2026-10-31T14:00:00Z", "infra-review2", "a", "HOLD", self.HEAD),
+            self.verdict(8, "2026-10-31T15:00:00Z", "pulp-review", "b", "APPROVE", self.HEAD)])
+        self.assertFalse(allowed, why)
+        self.assertEqual(guard.HELD_EXCLUSIONS,
+                         ["excluded_approval:head held by infra-review2 at comment 7"])
+
+    def test_an_approval_of_a_held_earlier_head_does_not_carry(self) -> None:
+        comments = [
+            self.verdict(1, "2026-10-31T14:00:00Z", "pulp-review", "a", "HOLD", self.OLD),
+            self.verdict(2, "2026-10-31T15:00:00Z", "pulp-review", "b", "APPROVE", self.OLD)]
+        self.assertIsNone(guard.approved_earlier_head(self.HEAD, "danielraffel", comments, [],
+                                                      self.policy))
+
 
 class ReviewerClaimReceipt(unittest.TestCase):
     head = "a" * 40

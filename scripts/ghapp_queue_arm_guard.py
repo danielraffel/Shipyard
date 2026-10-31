@@ -86,10 +86,14 @@ the head being armed.
 A verdict is the last non-blank line of a pull-request comment,
 ``verdict: APPROVE head:<sha>`` or ``reviewed: <sha>`` (``verdict: HOLD
 head:<sha>`` holds), or a review in state APPROVED / CHANGES_REQUESTED on the
-head. The latest verdict naming the head decides; a HOLD with no readable time
-always holds. When the base config lists ``reviewer_identities``, only those
-count. Otherwise an approval counts only from the fleet App (every agent posts
-as it through ghapp), or from an account the base lists in ``[auto_merge]
+head. A counting HOLD naming the head is final for it: no APPROVE naming the
+same head, from any reviewer, before or after the HOLD, counts, and an
+approval does not carry from a held head; only a new head (a push) can be
+approved; each APPROVE ignored this way is reported as
+``excluded_approval:head held by <signer> at <comment|review> <id>``.
+Otherwise the latest verdict naming the head decides. When the base config
+lists ``reviewer_identities``, only those count. Otherwise an approval counts
+only from the fleet App (every agent posts as it through ghapp), or from an account the base lists in ``[auto_merge]
 human_reviewers`` (empty by default) whose ``author_association`` is OWNER,
 MEMBER or COLLABORATOR: any agent holding the owner's own gh login could post
 a human approval. Each human approval excluded this way is printed and recorded
@@ -1262,6 +1266,10 @@ def app_approval_refusal(body: Any, policy: dict[str, Any]) -> str | None:
 # Human approvals the default rule refused this run, for the warning and the
 # arms ledger (see review_gate).
 EXCLUDED_APPROVALS: list[str] = []
+# APPROVEs ignored this run because a HOLD names the same head, as
+# ``excluded_approval:head held by <signer> at <comment|review> <id>`` (see
+# review_verdict and review_gate).
+HELD_EXCLUSIONS: list[str] = []
 
 
 def _reviewer_counts(
@@ -1310,7 +1318,10 @@ def counting_verdicts(
     reviews: list[dict[str, Any]],
     policy: dict[str, Any],
 ) -> list[tuple[datetime | None, str, str, str]]:
-    """``(time, APPROVE|HOLD, head named, description)`` for every counting verdict."""
+    """``(time, APPROVE|HOLD, head named, description)`` for every counting verdict.
+
+    A HOLD's description is ``held by <signer> at <comment|review> <id>``:
+    the ``reviewer:`` signer line when the body has one, else the login."""
     verdicts: list[tuple[datetime | None, str, str, str]] = []
     for review in reviews:
         login = (review.get("user") or {}).get("login")
@@ -1321,8 +1332,10 @@ def counting_verdicts(
         if _reviewer_counts(login, review.get("author_association"), policy, author, verdict,
                             (review.get("user") or {}).get("type") == "Bot", review.get("body")):
             named = str(review.get("commit_id") or "").lower()
-            verdicts.append((_timestamp(review.get("submitted_at")), verdict, named,
-                             f"a {state} review by {login} at {review.get('submitted_at')}"))
+            what = (_held_by(login, review.get("body"), "review", review.get("id"))
+                    if verdict == "HOLD" else
+                    f"a {state} review by {login} at {review.get('submitted_at')}")
+            verdicts.append((_timestamp(review.get("submitted_at")), verdict, named, what))
     for comment in comments:
         login = (comment.get("user") or {}).get("login")
         body = comment.get("body")
@@ -1332,20 +1345,32 @@ def counting_verdicts(
         if _reviewer_counts(login, comment.get("author_association"), policy, author, found[0],
                             (comment.get("user") or {}).get("type") == "Bot", body):
             verdict, named = found
-            verdicts.append((_timestamp(comment.get("created_at")), verdict, named,
-                             f"`{verdict} head:{named[:12]}` by {login} at "
-                             f"{comment.get('created_at')}"))
+            what = (_held_by(login, body, "comment", comment.get("id"))
+                    if verdict == "HOLD" else
+                    f"`{verdict} head:{named[:12]}` by {login} at {comment.get('created_at')}")
+            verdicts.append((_timestamp(comment.get("created_at")), verdict, named, what))
     return verdicts
+
+
+def _held_by(login: str, body: Any, kind: str, record_id: Any) -> str:
+    """``held by <signer> at <kind> <id>`` for one counting HOLD."""
+    signed = _SIGNER_LINE.findall(body) if isinstance(body, str) else []
+    signer = signed[-1].lower() if signed else login
+    return f"held by {signer} at {kind} {record_id if record_id is not None else '(no id)'}"
 
 
 def _latest_on(
     verdicts: list[tuple[datetime | None, str, str, str]], head: str
 ) -> tuple[datetime | None, str, str, str] | None:
-    """The deciding verdict on ``head``: an untimed HOLD, else the newest."""
+    """The deciding verdict on ``head``: any HOLD, else the newest APPROVE.
+
+    A HOLD is final for its head, so no APPROVE naming the same head, earlier
+    or later, from any reviewer, outranks it. Same as src/head_approval.rs
+    ``latest_verdict``."""
     on_head = [entry for entry in verdicts if entry[2] == head]
-    untimed_hold = [entry for entry in on_head if entry[0] is None and entry[1] == "HOLD"]
-    if untimed_hold:
-        return untimed_hold[0]
+    holds = [entry for entry in on_head if entry[1] == "HOLD"]
+    if holds:
+        return holds[0]
     dated = [entry for entry in on_head if entry[0] is not None]
     return max(dated, key=lambda entry: entry[0]) if dated else None
 
@@ -1388,9 +1413,15 @@ def review_verdict(
         at, verdict, _, what = latest
         if verdict == "APPROVE":
             return True, f"head {head[:12]} carries {what}"
-        if at is None:
-            return False, f"a HOLD naming head {head[:12]} has no readable time; it needs {wanted}"
-        return False, f"the latest verdict naming head {head[:12]} is HOLD ({what}); it needs a newer {wanted}"
+        posted = (at.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                  if at is not None and at.tzinfo is not None else "with no readable time")
+        excluded = [entry for entry in verdicts if entry[2] == head and entry[1] == "APPROVE"]
+        if excluded:
+            HELD_EXCLUSIONS.append(f"excluded_approval:head {what}")
+        return False, (
+            f"a HOLD naming head {head[:12]} makes it un-approvable ({what}, posted {posted})"
+            + (f"; ignored {len(excluded)} APPROVE(s) of the same head" if excluded else "")
+            + "; push a new head that addresses the HOLD and have it reviewed")
     older = [entry for entry in verdicts if entry[0] is not None]
     stale = ""
     if older:
@@ -2979,7 +3010,13 @@ def review_gate(classification: dict[str, Any], repo: str | None, dry_run: bool 
     carry log: read-only callers (the review-verdict status) pass it, so only
     a landing ever logs a carry. Same as src/head_approval.rs ``dry_run``."""
     EXCLUDED_APPROVALS.clear()
+    HELD_EXCLUSIONS.clear()
     result = _review_gate(classification, repo, dry_run)
+    if HELD_EXCLUSIONS:
+        classification["held_exclusions"] = sorted(set(HELD_EXCLUSIONS))
+        print(f"queue-arm-guard: note: PR #{classification.get('pr')}: "
+              f"{'; '.join(classification['held_exclusions'])}: a HOLD makes its head "
+              "un-approvable, so only a new head can be approved", file=sys.stderr)
     excluded = sorted(set(EXCLUDED_APPROVALS))
     if excluded:
         classification["excluded_approvals"] = excluded
@@ -3135,11 +3172,17 @@ def _review_gate(classification: dict[str, Any], repo: str | None, dry_run: bool
         why += f" The approval of {approved[:12]} does not carry: {refusal}."
         cause = "approval_does_not_carry" if cause == "unreviewed" else cause
     what = {
-        "hold": f"the latest trusted verdict on {label}'s head {head[:12]} is HOLD",
+        "hold": f"a trusted HOLD names {label}'s head {head[:12]}, so it is un-approvable",
         "approval_does_not_carry": (f"{label}'s approval of {approved[:12] if approved else ''} "
                                     f"does not carry to head {head[:12]}"),
         "unreviewed": f"no trusted verdict names {label}'s head {head[:12]}",
     }[cause]
+    if cause == "hold":
+        return False, f"{label} ({repo}): {why}", review_fix(
+            cause, what, repo, number, head,
+            f"the author pushes a new head to https://github.com/{repo}/pull/{number} that "
+            "addresses the HOLD; a reviewer then reviews that new head. No APPROVE of the "
+            f"held head {head} counts", False)
     command = (f"a reviewer agent reviews head {head} and posts, through `ghapp` (the fleet "
                f"App), a comment ending `verdict: APPROVE head:{head}` on "
                f"https://github.com/{repo}/pull/{number}; a human approval counts only for a "
