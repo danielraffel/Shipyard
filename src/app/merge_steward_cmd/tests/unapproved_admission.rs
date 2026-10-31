@@ -35,7 +35,7 @@ fn pr_row_numbered(number: u64, armed: bool) -> String {
         "null"
     };
     format!(
-        r#"{{"id":"PR_kw{number}","number":{number},"state":"OPEN","isDraft":false,"baseRefName":"main","headRefOid":"{HEAD}","headRefName":"feature","mergeStateStatus":"BLOCKED","autoMergeRequest":{auto_merge},"labels":[],"statusCheckRollup":[{{"__typename":"CheckRun","name":"macos","status":"COMPLETED","conclusion":"SUCCESS","completedAt":"2026-10-30T00:00:00Z","detailsUrl":"https://github.com/owner/repo/actions/runs/100"}}]}}"#
+        r#"{{"id":"PR_kw{number}","number":{number},"state":"OPEN","isDraft":false,"baseRefName":"main","headRefOid":"{HEAD}","headRefName":"feature","mergeStateStatus":"BLOCKED","autoMergeRequest":{auto_merge},"labels":[{{"name":"shipyard:unmanaged"}}],"statusCheckRollup":[{{"__typename":"CheckRun","name":"macos","status":"COMPLETED","conclusion":"SUCCESS","completedAt":"2026-10-30T00:00:00Z","detailsUrl":"https://github.com/owner/repo/actions/runs/100"}}]}}"#
     )
 }
 
@@ -191,6 +191,7 @@ case "$*" in
   *"mergePullRequest("*) echo "the sweep must never merge" >&2; exit 93 ;;
   *"enqueuePullRequest"*) echo "the sweep must never enqueue" >&2; exit 91 ;;
   *"/reviews"*) {reviews} ;;
+  *"/labels"*) printf '{{}}' ;;
   *"/pulls/4"[0-9]" "*) printf 'feature\nmain\n' ;;
   *"query=query("*"mergeQueue(branch"*) printf '%s' '{merge_queue}' ;;
   *"/comments"*) {comments} ;;
@@ -230,6 +231,8 @@ esac
 }
 
 struct Outcome {
+    /// Whether the pass reported itself unhealthy.
+    unhealthy: bool,
     reports: Vec<PrReport>,
     report: PrReport,
     calls: String,
@@ -285,7 +288,7 @@ fn run_with(fixture: &Fixture, mut ledger: StewardLedger) -> Outcome {
         }
     };
     let control = mutation_control(&temp, "studio", "studio");
-    let (reports, _failed) = apply_pr_plans(
+    let (reports, unhealthy) = apply_pr_plans(
         &actions,
         &args,
         &observation,
@@ -295,6 +298,7 @@ fn run_with(fixture: &Fixture, mut ledger: StewardLedger) -> Outcome {
         fixture.apply.then_some(&control),
     );
     Outcome {
+        unhealthy,
         report: reports[0].clone(),
         reports,
         calls: fs::read_to_string(log).unwrap_or_default(),
@@ -350,8 +354,14 @@ fn assert_disarmed(outcome: &Outcome) {
 }
 
 fn assert_dequeued(outcome: &Outcome) {
+    // The sweep's own mutation comes first; an owned PR's later steps may
+    // append theirs.
     assert_eq!(
-        outcome.report.mutation.as_deref(),
+        outcome
+            .report
+            .mutation
+            .as_deref()
+            .and_then(|mutation| mutation.split(',').next()),
         Some(format!("dequeued_unapproved:{HEAD}").as_str()),
         "{:?}\n{}",
         outcome.report,
@@ -440,7 +450,44 @@ fn deferred(outcome: &Outcome, head: &str) {
         outcome.report,
         outcome.calls
     );
+    // Visible: the read error is the PR's error, and the pass is unhealthy.
+    assert!(
+        outcome
+            .report
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("dequeue deferred")),
+        "{:?}",
+        outcome.report
+    );
+    assert!(outcome.unhealthy, "{:?}", outcome.report);
     assert_left_alone_writes(outcome);
+}
+
+/// Control on the same instrument: a readable, approved queued head leaves
+/// the pass healthy, so `unhealthy` above is the deferral's doing.
+#[test]
+fn a_readable_approved_queued_head_leaves_the_pass_healthy() {
+    let outcome = run(&queued_approved());
+    assert_left_alone(&outcome);
+    assert!(
+        !outcome.unhealthy,
+        "{:?}\n{}",
+        outcome.report, outcome.calls
+    );
+    assert_eq!(outcome.report.error, None);
+}
+
+fn assert_streak_dequeued(outcome: &Outcome) {
+    assert_eq!(
+        outcome.report.mutation.as_deref(),
+        Some(format!("dequeued_unreadable_streak:{HEAD}").as_str()),
+        "{:?}\n{}",
+        outcome.report,
+        outcome.calls
+    );
+    assert_guard_accepted(outcome);
+    assert_audited(outcome, "dequeue_unapproved_queue_entry");
 }
 
 /// PR #42's unreadable streak in `owner/repo`, as `(head, passes)`.
@@ -542,7 +589,7 @@ fn an_unreadable_queued_head_defers_twice_then_dequeues() {
         deferred(&second, HEAD);
         assert_eq!(streak(&second), Some((HEAD.to_owned(), 2)), "{failure}");
         let third = run_with(&fixture, second.ledger);
-        assert_dequeued(&third);
+        assert_streak_dequeued(&third);
         assert_eq!(streak(&third), None, "{failure}");
     }
 }

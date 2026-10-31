@@ -38,8 +38,13 @@
 //! pull request leaves the queue or its head changes; the third consecutive
 //! unreadable pass dequeues. At most [`MAX_DEQUEUES_PER_PASS`] entries leave a
 //! repository's queue per pass; the rest report `dequeue_deferred_cap` and wait
-//! for the next pass. A dry run reports `would_disarm_stale_auto_merge` and
-//! `would_dequeue_unapproved` and changes nothing, including the streak.
+//! for the next pass. A dequeue reached by the bound reports
+//! `dequeued_unreadable_streak` rather than `dequeued_unapproved`, and every
+//! deferral returns its read error as the PR's error, so the pass is
+//! unhealthy and the deferral shows in the tick summary. A dry run reports
+//! `would_disarm_stale_auto_merge` and `would_dequeue_unapproved` (or
+//! `would_dequeue_unreadable_streak`) and changes nothing, including the
+//! streak.
 //!
 //! A removal the steward makes is recorded in the ledger and is not counted
 //! toward [`crate::head_approval::EJECTION_CAP`] when the steward judges that
@@ -227,10 +232,12 @@ enum EntryPlan {
     Dequeue {
         head: String,
         reason: String,
+        /// Reached by the consecutive-unreadable bound rather than by
+        /// positive evidence.
+        streak: bool,
     },
-    Deferred {
-        head: String,
-    },
+    /// Unreadable, below the bound; `why` is the underlying read error.
+    Deferred { head: String, why: String },
 }
 
 /// What the sweep plans for `pr`.
@@ -272,10 +279,12 @@ fn plan(
                 EntryPlan::Dequeue {
                     head: head.to_owned(),
                     reason: format!("unreadable on {passes} consecutive passes: {why}"),
+                    streak: true,
                 }
             } else {
                 EntryPlan::Deferred {
                     head: head.to_owned(),
+                    why,
                 }
             },
             unreadable_head: Some(head.to_owned()),
@@ -354,6 +363,7 @@ fn plan(
             entry: EntryPlan::Dequeue {
                 head: entry_head.to_owned(),
                 reason,
+                streak: false,
             },
             unreadable_head: None,
             judged: true,
@@ -437,10 +447,17 @@ fn record_streak(ledger: &mut StewardLedger, repo: &str, pr: &ObservedPr, plan: 
 ///
 /// Mutations, comma-joined as the per-PR mutation string:
 /// * `disarmed_stale_auto_merge:<head>` / `would_disarm_stale_auto_merge:<head>`
-/// * `dequeued_unapproved:<head>` / `would_dequeue_unapproved:<head>`
+/// * `dequeued_unapproved:<head>` / `would_dequeue_unapproved:<head>`: on
+///   positive evidence
+/// * `dequeued_unreadable_streak:<head>` /
+///   `would_dequeue_unreadable_streak:<head>`: on the consecutive-unreadable
+///   bound
+///
+/// A deferral (`dequeue_deferred_unreadable`) also returns the underlying read
+/// error as this PR's error, so the pass is reported unhealthy.
 /// * `dequeue_deferred_unreadable:<head>`: unreadable, streak below the bound
 /// * `dequeue_deferred_cap:<head>`: this pass's dequeue cap is spent
-#[allow(clippy::too_many_arguments)] // One pass's inputs, its write context and its state.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // One pass's inputs and one guarded transaction.
 pub(super) fn sweep(
     actions: &GitHubActions,
     observation: &RepoObservation,
@@ -464,23 +481,42 @@ pub(super) fn sweep(
         record_streak(ledger, &observation.repo, pr, &plan);
     }
     let mut reports = Vec::new();
+    // A deferral is reported as this PR's error, so the pass is unhealthy and
+    // an unreadable queue entry is visible rather than silently waiting.
+    let mut deferred = None;
     let dequeue = match &plan.entry {
         EntryPlan::Keep => None,
-        EntryPlan::Deferred { head } => {
+        EntryPlan::Deferred { head, why } => {
             reports.push(format!("dequeue_deferred_unreadable:{head}"));
+            deferred = Some(format!(
+                "PR #{} queue entry at {head} not judged, dequeue deferred: {why}",
+                pr.fact.number
+            ));
             None
         }
         EntryPlan::Dequeue { head, .. } if pass.dequeues >= MAX_DEQUEUES_PER_PASS => {
             reports.push(format!("dequeue_deferred_cap:{head}"));
             None
         }
-        EntryPlan::Dequeue { head, reason } => {
+        EntryPlan::Dequeue {
+            head,
+            reason,
+            streak,
+        } => {
             pass.dequeues += 1;
-            Some((head.clone(), reason.clone()))
+            let label = if *streak {
+                (
+                    "dequeued_unreadable_streak",
+                    "would_dequeue_unreadable_streak",
+                )
+            } else {
+                ("dequeued_unapproved", "would_dequeue_unapproved")
+            };
+            Some((head.clone(), reason.clone(), label))
         }
     };
     if plan.disarm.is_none() && dequeue.is_none() {
-        return ((!reports.is_empty()).then(|| reports.join(",")), None);
+        return ((!reports.is_empty()).then(|| reports.join(",")), deferred);
     }
     if !apply {
         let planned = [
@@ -489,10 +525,10 @@ pub(super) fn sweep(
                 .map(|_| format!("would_disarm_stale_auto_merge:{census_head}")),
             dequeue
                 .as_ref()
-                .map(|(head, _)| format!("would_dequeue_unapproved:{head}")),
+                .map(|(head, _, (_, planned))| format!("{planned}:{head}")),
         ];
         reports.extend(planned.into_iter().flatten());
-        return (Some(reports.join(",")), None);
+        return (Some(reports.join(",")), deferred);
     }
     let Some(context) = context else {
         return (
@@ -520,7 +556,7 @@ pub(super) fn sweep(
             done.push(format!("disarmed_stale_auto_merge:{census_head}"));
         }
     }
-    if let Some((head, reason)) = &dequeue
+    if let Some((head, reason, (label, _))) = &dequeue
         && error.is_none()
     {
         if let Err(failure) = dequeue_under_guard(context, pr, head, ledger) {
@@ -529,13 +565,17 @@ pub(super) fn sweep(
             ledger
                 .dequeue_unreadable
                 .remove(&head_key(&observation.repo, pr.fact.number, head));
-            done.push(format!("dequeued_unapproved:{head}"));
+            done.push(format!("{label}:{head}"));
         }
     }
     let outcome = if error.is_some() {
         "withdrawal_failed"
     } else {
         "unapproved_admission_withdrawn"
+    };
+    let error = match (error, deferred) {
+        (Some(error), Some(deferred)) => Some(format!("{error}; {deferred}")),
+        (error, deferred) => error.or(deferred),
     };
     done.extend(reports);
     let mutation = (!done.is_empty()).then(|| done.join(","));

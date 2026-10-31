@@ -716,8 +716,12 @@ exact-head approval gate does not admit (`disarmed_stale_auto_merge:<sha>`),
 and removes such a head from the merge queue (`dequeued_unapproved:<sha>`):
 only on positive evidence from a successful read, or after three consecutive
 unreadable passes, and at most two per repository per pass. The steward does
-not count its own removals toward the head's ejection cap; the
-`queue-arm-guard` twin of that cap still counts them.
+not count its own removals toward the head's ejection cap, which only the
+steward's own approval gate applies; `queue-arm-guard` has no such cap (its
+only bound is `INTERRUPTION_REARM_LIMIT` for environment re-enqueues, and it
+refuses a same-head re-arm after any removal). A deferral is reported as the
+PR's error so the pass is unhealthy, and a dequeue reached by the
+consecutive-unreadable bound reports `dequeued_unreadable_streak:<sha>`.
 Both carry Shipyard's internal marker and one-shot `internal-removal` nonce, so
 `queue-removal-guard` accepts them as audited Shipyard removals; the guard is
 unchanged for every other caller.

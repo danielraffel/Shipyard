@@ -3569,7 +3569,9 @@ GraphQL answer carrying `errors` or `pullRequest: null`) or config defers it
 streak in the steward ledger (`dequeue_unreadable`, keyed `repo#pr:head`). Any
 successful judgement clears it, each applying pass prunes it once the PR is
 unqueued or its head changes, and the third consecutive unreadable pass
-dequeues. At most two entries leave the queue per repository and base per pass;
+dequeues (`dequeued_unreadable_streak:<sha>`, distinct from a dequeue on
+positive evidence). Every deferral also returns its read error as the PR's
+error, so the pass is unhealthy and the tick summary shows `errors>0`. At most two entries leave the queue per repository and base per pass;
 the rest report `dequeue_deferred_cap:<sha>` and wait for the next pass. Each
 steward removal is recorded (`steward_dequeues`) and is not counted toward the
 head's `EJECTION_CAP` when the steward judges that head again, so withdrawing
