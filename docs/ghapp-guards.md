@@ -412,14 +412,19 @@ read or parsed (invalid TOML, or a Python without `tomllib`) refuses rather
 than loosening. Shipyard's own arming and merge paths use the same switch for
 the list default; a repository's own config key applies to them on any host.
 
-**What approves.** The newest verdict naming the head decides:
+**What approves.** A verdict naming the head decides:
 
 * a comment whose last non-blank line is `verdict: APPROVE head:<40-hex>` or
   `reviewed: <40-hex>`, or
 * an `APPROVED` review whose `commit_id` is the head.
 
 `verdict: HOLD head:<40-hex>` or a `CHANGES_REQUESTED` review on the head
-blocks an earlier approval. A HOLD whose time cannot be read always blocks.
+makes that head un-approvable: no APPROVE naming the same head counts, from
+any counting reviewer or signer, posted before or after the HOLD, and an
+approval does not carry from a held head. Only a new head (a push) can be
+approved. Each APPROVE ignored this way is reported as
+`excluded_approval:head held by <signer> at <comment|review> <id>`. A HOLD
+from a login that does not count is ignored.
 
 **Whose verdict counts.**
 
@@ -708,7 +713,8 @@ exactly that sha, it dequeues it (`dequeuePullRequest`) if queued, else
 disables auto-merge (`disablePullRequestAutoMerge`) if armed. Another pull
 request, another head, or one neither armed nor queued is left alone. Every
 action and every failure is a line in `holds.jsonl` in the guards directory.
-The head lands again only once a newer verdict approves it, which
+A held head never lands again: a HOLD makes its head un-approvable, so the
+pull request lands only after a new head is pushed and approved, which
 `queue-arm-guard` requires on hosts with review before arm.
 
 The merge steward closes the same gap without a HOLD. On every `--apply` pass

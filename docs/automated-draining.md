@@ -57,7 +57,8 @@ owner only acts on evidence about the exact commit in front of it.
    a verdict naming the exact commit: APPROVE, or HOLD with what to fix.
 4. On a HOLD, a repair agent fixes what was named, adds a test, merges the
    base branch in (never a rebase), and pushes once. A new head means a fresh
-   review.
+   review. A HOLD makes its head un-approvable: a later APPROVE of the same
+   head, from any reviewer, does not count, so only the pushed fix can land.
 5. On the next steward pass (every five minutes is plenty), the approved head
    is handed to GitHub. A merge queue tests it with up to four others and
    merges the batch. Without a queue, Shipyard merges that exact head, and

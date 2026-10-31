@@ -4264,7 +4264,12 @@ with any non-canonical variant); it has no override:
 `hold-disarms`, `verdict-hold-hook` dequeues or disarms a pull request queued
 or armed at exactly the head a HOLD names, before the HOLD posts, and never
 blocks the HOLD (`docs/ghapp-guards.md`, A HOLD takes its head out of the
-landing path). See `crate::head_approval`. Its count of queue removals per
+landing path). A HOLD is also final for its head: no APPROVE of that head
+counts, from any signer, before or after it (pulp#11117 merged on a held head
+when a second reviewer session approved it later), and no approval carries
+from a held head; the only escape is a new push. Each APPROVE excluded this
+way is reported as `excluded_approval:head held by <signer> at <id>`. See
+`crate::head_approval`. Its count of queue removals per
 head reads only the last 100 timeline events, so a very busy pull request can
 under-count; that errs lenient (an approval is still required), never strict. This matters because Shipyard's own admission path enqueues only
 after it has validated a head, which happens only while a Shipyard process is
