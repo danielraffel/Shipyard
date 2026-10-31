@@ -331,6 +331,19 @@ fn cleanup_retention(
     let _cleanup_guard = (!dry_run)
         .then(|| acquire_cleanup_lock(state_dir))
         .transpose()?;
+    // Queue mutations acquire the writer-domain lease while holding the queue
+    // lock. Acquire that lock first for cleanup's log mutation pass so the
+    // cleanup writer cannot invert the queue -> writer lock order.
+    let queue_lock = if !dry_run && has_job_log_directories(state_dir)? {
+        Some(
+            Queue::new(state_dir)
+                .map_err(|error| CliFailure::new(1, error.to_string()))?
+                .lock_for_log_cleanup()
+                .map_err(|error| CliFailure::new(1, error.to_string()))?,
+        )
+    } else {
+        None
+    };
     let _writer_domain = if dry_run {
         None
     } else {
@@ -377,7 +390,7 @@ fn cleanup_retention(
         &queue_jobs,
         policy,
         dry_run,
-        false,
+        queue_lock.is_some(),
         &mut items,
         &mut protected_items,
     )?;
@@ -2078,6 +2091,16 @@ mod retention_tests {
         )
         .expect("second apply");
         assert!(!job.join("target.log").exists());
+    }
+
+    #[test]
+    fn cleanup_apply_orders_queue_lock_before_writer_domain() {
+        let temp = tempfile::tempdir().expect("temp");
+        let job = temp.path().join("logs/success");
+        write_terminal(&job, "success", false, 2);
+        cleanup_retention(temp.path(), false, LogRetentionPolicy::default())
+            .expect("cleanup apply");
+        assert!(job.join("target.log.gz").is_file());
     }
 
     #[test]

@@ -293,7 +293,7 @@ fn auxiliary_jsonl_files_do_not_prevent_canonical_archiving() {
 }
 
 #[test]
-fn a_managed_archive_without_its_lock_is_read_without_mutation() {
+fn a_mutable_archive_without_its_lock_joins_the_lock_domain_before_reading() {
     let dir = tempfile::tempdir().expect("archive");
     std::fs::create_dir(dir.path().join("causes")).expect("causes directory");
     std::fs::write(
@@ -302,8 +302,17 @@ fn a_managed_archive_without_its_lock_is_read_without_mutation() {
     )
     .expect("archive marker");
 
-    let _reader = lock_archive(dir.path(), false).expect("missing lock must not block readers");
-    assert!(!dir.path().join(".lock").exists());
+    let _reader = lock_archive(dir.path(), false).expect("reader lock");
+    assert!(dir.path().join(".lock").is_file());
+    let writer = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(dir.path().join(".lock"))
+        .expect("lock file");
+    assert!(
+        writer.try_lock_exclusive().is_err(),
+        "reader must hold the newly created lock"
+    );
 }
 
 #[test]

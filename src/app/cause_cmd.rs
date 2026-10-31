@@ -146,6 +146,20 @@ fn validate_archive_layout(dir: &Path) -> Result<(), String> {
 }
 
 pub(super) fn lock_archive(dir: &Path, exclusive: bool) -> Result<ArchiveLock, String> {
+    lock_archive_with_options(dir, exclusive, true)
+}
+
+/// Read an archive without creating a lock file. Used by dry-run commands so
+/// previewing retention remains metadata-free.
+pub(super) fn lock_archive_without_creation(dir: &Path) -> Result<ArchiveLock, String> {
+    lock_archive_with_options(dir, false, false)
+}
+
+fn lock_archive_with_options(
+    dir: &Path,
+    exclusive: bool,
+    create_mutable_read_lock: bool,
+) -> Result<ArchiveLock, String> {
     validate_archive_root(dir)?;
     // Check before creating a lock so a frozen archive remains byte-for-byte
     // untouched when it has never been opened by this process.
@@ -177,11 +191,16 @@ pub(super) fn lock_archive(dir: &Path, exclusive: bool) -> Result<ArchiveLock, S
     {
         return Err("archive lock must be a regular file".to_owned());
     }
+    let mutable_archive = create_mutable_read_lock
+        && (fs::symlink_metadata(dir.join("causes")).is_ok()
+            || fs::symlink_metadata(dir.join("fixlinks.jsonl")).is_ok());
     let lock = match OpenOptions::new()
-        .create(exclusive)
+        // Mutable archives join the writer lock domain even when no lock file
+        // exists yet. Frozen archives return above and remain read-only.
+        .create(exclusive || mutable_archive)
         .truncate(false)
         .read(true)
-        .write(exclusive)
+        .write(exclusive || mutable_archive)
         .open(&lock_path)
     {
         Ok(lock) => lock,
