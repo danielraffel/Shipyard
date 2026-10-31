@@ -181,7 +181,12 @@ These came from running it for real:
   still waiting.
 - **Version-bump pull requests are cheap to make expensive.** If a bot opens
   one per merge, each costs a full CI run. Hold bumps while the queue is busy,
-  and fast-path a bump whose diff touches only version files.
+  and fast-path a bump whose diff touches only version files. Shipyard itself
+  keeps exactly one: `version-at-land.yml` force-updates the bot-owned
+  `release/version-at-land` branch with the cumulative bump after each landing
+  and hands that one pull request to the steward (`shipyard:managed` plus an
+  exact-head `shipyard/steward-handoff` status); it still needs green required
+  checks and an exact-head approval.
 
 ## Related
 

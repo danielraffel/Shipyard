@@ -287,6 +287,17 @@ patch-only changes are assigned and released without a per-PR counter race.
 The writer updates Cargo.lock with Cargo.toml and records a marker for replay
 safety.
 
+Main's ruleset requires the `Test macOS ARM64` and `review-verdict` checks, so the
+writer never pushes to `main`: it rebuilds the bot-owned `release/version-at-land`
+branch from the main tip with one cumulative bump commit and opens, or updates, the
+single pull request for it. The workflow labels that pull request `shipyard:managed`
+and posts the `shipyard/steward-handoff` status on its exact head, so the merge
+steward lands it once its required checks are green and a reviewer approves that
+head; `auto-release.yml` tags the merge.
+Every landing re-plans from the last bump that reached `main`, so the pull
+request never stacks bumps, and the run on its own merge is a no-op. A landing
+that needs no version leaves the branch head, and any approval of it, alone.
+
 ## When to go manual
 
 Only when the automatic flow is genuinely unavailable:
@@ -365,7 +376,9 @@ increments independently when the output format changes.
 Pull requests do not edit `Cargo.toml`, `Cargo.lock`, or the plugin manifest
 versions. The `version-at-land.yml` workflow is the single writer after a
 merge: it computes the next version, commits the files with a
-`Version-Bump-Applied:` marker, and `auto-release.yml` tags that commit. The
+`Version-Bump-Applied:` marker on the `release/version-at-land` branch, and
+keeps one bump pull request open for it (see "Version-at-land assignment").
+`auto-release.yml` tags the merge of that pull request. The
 tagged `release.yml` workflow and `shipyard update` path remain unchanged.
 
 Inspect the break-glass release path without changing files or creating a tag:
