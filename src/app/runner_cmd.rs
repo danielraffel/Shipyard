@@ -413,6 +413,7 @@ fn runner_command_with_actions<W: Write>(
                 arm_unqueued,
                 approval_context,
                 wake_owner,
+                unapproved_dequeue: super::merge_steward_cmd::DequeueMode::default(),
                 apply,
                 ledger,
             },

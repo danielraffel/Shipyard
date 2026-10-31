@@ -208,3 +208,5 @@ mod recovery;
 mod train_off;
 #[cfg(unix)]
 mod transient_rerun;
+#[cfg(unix)]
+mod unapproved_admission;

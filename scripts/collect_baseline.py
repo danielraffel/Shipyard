@@ -75,6 +75,16 @@ DEFAULT_STATE_RETENTION_DAYS = 14
 DEFAULT_STATE_MAX_OBSERVATIONS = 1024
 
 
+def canonical_project(project: str) -> str:
+    """Return the case-insensitive short project key used by metrics storage."""
+    return project.strip().casefold()
+
+
+def canonical_repo(repo: str) -> str:
+    """Return the case-insensitive GitHub owner/repository identity."""
+    return repo.strip().casefold()
+
+
 def run(command: Sequence[str], *, stdin: str | None = None, timeout: int = 300) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(command, input=stdin, text=True, capture_output=True, check=False, timeout=timeout)
@@ -129,12 +139,13 @@ def run_provider_with_retry(command: Sequence[str], *, stdin: str | None = None,
 
 
 def state_identity(path: pathlib.Path, project: str, repo: str, db: pathlib.Path) -> dict[str, str]:
-    return {"project": project, "repo": repo, "database": str(db.expanduser().resolve(strict=False))}
+    return {"project": canonical_project(project), "repo": canonical_repo(repo),
+            "database": str(db.expanduser().resolve(strict=False))}
 
 
 def validate_project_repo(project: str, repo: str) -> None:
-    parts = repo.split("/")
-    if len(parts) != 2 or not all(parts) or project.casefold() != parts[1].casefold():
+    parts = canonical_repo(repo).split("/")
+    if len(parts) != 2 or not all(parts) or canonical_project(project) != parts[1].casefold():
         raise ValueError("--project must be the repository short name for exact scorecard scoping")
 
 
@@ -153,12 +164,23 @@ def validate_state_identity(path: pathlib.Path, project: str, repo: str, db: pat
         if state.get("observations"):
             raise RuntimeError("baseline state has observations but no identity; refusing cross-project reuse")
         return
-    if not isinstance(stored, dict) or any(stored.get(key) != value for key, value in expected.items()):
+    mismatched = []
+    if not isinstance(stored, dict):
+        mismatched.append("identity")
+    else:
+        for key, value in expected.items():
+            actual = stored.get(key)
+            if key == "repo" and isinstance(actual, str):
+                actual = canonical_repo(actual)
+            if actual != value:
+                mismatched.append(key)
+    if mismatched:
         raise RuntimeError(f"baseline state identity mismatch: stored={stored!r} requested={expected!r}")
 
 
 def import_organic(args: argparse.Namespace) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
+    args.project = canonical_project(args.project)
     validate_project_repo(args.project, args.repo)
     validate_state_identity(args.state, args.project, args.repo, args.db)
     state_dir = str(validate_state_layout(args.db))
@@ -174,13 +196,28 @@ def import_organic(args: argparse.Namespace) -> list[dict[str, Any]]:
             os.lstat(receipt_path)
         except FileNotFoundError:
             events = _import_organic_after_preflight(args, state_dir, None)
-            # A newer supervisor may already record the unavailable handoff
-            # while collecting the provider rows.  Keep the older direct
-            # invocation compatible without emitting a duplicate event when
-            # both versions are combined during a staged rollout.
-            if not any(event.get("source") == "merge-receipt" for event in events):
-                events.append({"source": "merge-receipt", "status": "unavailable",
-                               "reason": "producer handoff not present"})
+            # The provider helper also records an unavailable denominator for
+            # direct callers. Replace only its generic event with the more
+            # precise missing-handoff reason in place, keeping the collection
+            # event last. A newer supervisor may already have a more specific
+            # reason; preserve it.
+            receipt_events = [event for event in events if event.get("source") == "merge-receipt"]
+            generic = next((event for event in receipt_events
+                            if event.get("reason") == "fresh authenticated producer handoff is unavailable"), None)
+            if generic is not None and len(receipt_events) == 1:
+                events[events.index(generic)] = {
+                    "source": "merge-receipt", "status": "unavailable",
+                    "reason": "producer handoff not present"}
+            elif not receipt_events:
+                collection_index = next((index for index, event in enumerate(events)
+                                          if event.get("source") == "collection"), len(events))
+                events.insert(collection_index, {"source": "merge-receipt", "status": "unavailable",
+                                                 "reason": "producer handoff not present"})
+            else:
+                newest = max(i for i, event in enumerate(events)
+                             if event.get("source") == "merge-receipt")
+                events = [event for i, event in enumerate(events)
+                          if event.get("source") != "merge-receipt" or i == newest]
             return events
         except OSError as exc:
             raise RuntimeError(f"merge receipt handoff is unreadable: {exc}") from exc
@@ -287,7 +324,8 @@ def count_jobs(db: pathlib.Path, project: str, repo: str) -> int | None:
     try:
         with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as connection:
             return int(connection.execute("""select count(*) from jobs j join runs r on r.id=j.run_id
-                where r.project=? and r.repo=?""", (project, repo)).fetchone()[0])
+                where lower(r.project)=? and lower(r.repo)=?""",
+                (canonical_project(project), canonical_repo(repo))).fetchone()[0])
     except sqlite3.Error:
         return None
 
@@ -304,7 +342,8 @@ def source_activity_dates(db: pathlib.Path, project: str, repo: str) -> set[str]
             timestamp_sql = "coalesce(" + ",".join("j." + name for name in timestamps) + ")"
             rows = connection.execute(
                 f"select {timestamp_sql} from jobs j join runs r on r.id=j.run_id "
-                "where r.project=? and r.repo=?", (project, repo))
+                "where lower(r.project)=? and lower(r.repo)=?",
+                (canonical_project(project), canonical_repo(repo)))
             dates = set()
             for (value,) in rows:
                 if isinstance(value, str):
@@ -345,7 +384,12 @@ def prepare_tartci_export(text: str, repo: str, project: str) -> tuple[str, int]
     A malformed record, wrong project, or invalid provider remains fatal.
     """
     records = _tartci_records(text)
-    invalid = [record for record in records if record.get("repo") != repo or record.get("project") != project
+    expected_project = canonical_project(project)
+    expected_repo = canonical_repo(repo)
+    invalid = [record for record in records if not isinstance(record.get("repo"), str)
+               or canonical_repo(record["repo"]) != expected_repo
+               or not isinstance(record.get("project"), str)
+               or canonical_project(record["project"]) != expected_project
                or not isinstance(record.get("provider"), str) or not record["provider"].strip()
                or ("external_id" in record and not isinstance(record.get("external_id"), str))]
     if invalid:
@@ -385,7 +429,8 @@ def validate_merge_receipt_health(path: pathlib.Path, handoff: pathlib.Path, rep
     if (not isinstance(health_repo, str)
             or health_repo.strip().casefold() != repo.strip().casefold()):
         raise RuntimeError(f"merge receipt health names a repository other than {repo}")
-    if health.get("project") != repo.rsplit("/", 1)[-1]:
+    if (not isinstance(health.get("project"), str)
+            or canonical_project(health["project"]) != canonical_project(repo.rsplit("/", 1)[-1])):
         raise RuntimeError("merge receipt health project is not bound to repository")
     if health.get("base_branch") != base_branch:
         raise RuntimeError(f"merge receipt health base branch is not {base_branch}")
@@ -487,7 +532,12 @@ def validate_merge_receipt_scope(path: pathlib.Path, repo: str) -> None:
 def validate_tartci_export(text: str, repo: str, project: str) -> None:
     """Strict compatibility validator retained for callers and tests."""
     records = _tartci_records(text)
-    missing = [record for record in records if record.get("repo") != repo or record.get("project") != project
+    expected_repo = canonical_repo(repo)
+    expected_project = canonical_project(project)
+    missing = [record for record in records if not isinstance(record.get("repo"), str)
+               or canonical_repo(record["repo"]) != expected_repo
+               or not isinstance(record.get("project"), str)
+               or canonical_project(record["project"]) != expected_project
                or not isinstance(record.get("provider"), str) or not record["provider"].strip()
                or not isinstance(record.get("external_id"), str) or not record["external_id"].strip()]
     if missing:
@@ -537,7 +587,8 @@ def consume_authenticated_strata(card: dict[str, Any], *, repo: str | None = Non
         card["missing_strata"] = list(REQUIRED_STRATA)
         card["provenance_status"] = "unverified_organic_input"
         return card
-    if repo is not None and payload.get("repo") != repo:
+    if repo is not None and (not isinstance(payload.get("repo"), str)
+                            or canonical_repo(payload["repo"]) != canonical_repo(repo)):
         card["strata"] = unavailable
         card["missing_strata"] = list(REQUIRED_STRATA)
         card["provenance_status"] = "unverified_organic_input"
@@ -1001,6 +1052,9 @@ def main() -> int:
     parser.add_argument("--expected-interval-secs", type=int, default=3600)
     parser.add_argument("--cadence-slack-secs", type=int, default=300)
     args = parser.parse_args()
+    if args.collect and os.environ.get("SHIPYARD_OBSERVATIONS", "").strip().lower() == "off":
+        print("Automatic observation collection disabled by SHIPYARD_OBSERVATIONS=off", file=sys.stderr)
+        return 0
     if args.timeout_seconds <= 0:
         parser.error("--timeout-seconds must be positive")
     if not 0 <= args.provider_retries <= MAX_PROVIDER_RETRIES:

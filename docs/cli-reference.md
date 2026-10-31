@@ -31,7 +31,7 @@ shipyard --json parallel-proof-canary --request /absolute/private/invocation.jso
 shipyard --json parallel-proof-canary --request /absolute/private/invocation.json --apply # exact machine-global digest-pinned canary
 
 # Ship
-shipyard ship                  # PR → validate → merge on green
+shipyard ship                  # PR → validate → arm native auto-merge (GitHub merges once green)
 shipyard ship --base develop   # target a different branch
 shipyard merge-queue status    # local mutation authority hold
 shipyard merge-queue hold --reason "incident"
@@ -185,6 +185,7 @@ shipyard evidence command --list
 # Runner metrics
 shipyard metrics record --project pulp --job linux-arm64 --step compile --duration 18.4s --target linux-arm64 --backend local --provider tart-linux --host macstudio
 shipyard metrics import github --repo Generous-Corp/pulp --workflow build.yml --limit 10
+shipyard metrics import github-merge-receipt --repo Generous-Corp/pulp --project pulp --artifact job.json --run run.json --pull-request pr.json --checks checks.json --required-check-policy policy.json --artifact-url https://github.com/Generous-Corp/pulp/actions/artifacts/123 --run-url https://github.com/Generous-Corp/pulp/actions/runs/456 --policy-sha256 <sha256> --collector-sha256 <sha256> --required-check macos
 tartci runtime export --repo Generous-Corp/pulp | shipyard metrics import tartci
 shipyard metrics export merge-receipt --repo Generous-Corp/pulp --file "$SHIPYARD_HANDOFF_DIR/merge-receipts.jsonl"
 shipyard metrics export merge-receipt --repo Generous-Corp/pulp --stdout  # canonical JSONL only; for a governed transport
@@ -201,6 +202,14 @@ shipyard metrics advise --project pulp --profile normal --json
 shipyard metrics compare --project pulp --lane windows-arm64 --before 7d --after 7d --json
 shipyard metrics compare --project pulp --basis wall-time --json   # duration verdict (load-dependent)
 shipyard metrics trend --project pulp --since 14d --json
+
+`metrics compare` splits at `now - --split-days-ago`. `--before` bounds the earlier
+side to `[split-before, split)` and `--after` independently bounds the later
+side to `[split, split+after)`; neither flag moves the split. Both intervals
+are half-open, so a sample exactly at the split belongs to the after side and
+a sample exactly at an explicit window end is excluded. Windows that cannot
+be represented by the timestamp range produce no findings instead of
+panicking.
 
 # Manage
 shipyard bump <id> high        # reprioritize a pending job
@@ -253,6 +262,10 @@ shipyard runner steward --provenance-blocking-label 5·unresolved # repeatable a
 shipyard runner steward --arm-unqueued              # audit green, unqueued, UNARMED PRs
 shipyard runner steward --arm-unqueued --apply      # arm native auto-merge on them
 shipyard runner steward --approval-context review-verdict  # no-queue base: exact-head merge only when GitHub requires this app-bound check
+                                                    # every pass also disarms auto-merge on unapproved heads; removing
+                                                    #   unapproved queue entries is gated by the machine-global
+                                                    #   [merge_steward] unapproved_dequeue = "report" (default: report
+                                                    #   would_dequeue_*, remove nothing) | "apply"
 shipyard runner steward-handoff --repo OWNER/REPO --pr 123 --head "$SHA" --workstream-id GEN-7 --context-url https://linear.app/... --apply
 shipyard runner steward-handoff --repo OWNER/REPO --pr 123 --head "$SHA" --workstream-id GEN-7 --context-url https://linear.app/... --agent-provider codex --agent-session-id NEW_SESSION --transfer-agent-owner --apply
 shipyard pr --workstream-id GEN-7 --context-url https://linear.app/...   # free-form handoff identifiers
@@ -314,10 +327,15 @@ merge-group head that differs from GitHub's current head. Apply mode requires
 the trusted machine-global `[merge_queue].mutation_machine`, rejects the
 central merge-queue `HOLD`, and serializes plus write-ahead audits every
 enqueue, rerun, and cancellation through the shared mutation guard. A
-repository without a GitHub-native merge queue receives a typed
-`automatic-merge-refused` decision (exit 10); Shipyard does not issue a client-side REST
-merge because that endpoint cannot atomically enforce complete check
-materialization and the validated base revision.
+repository without a GitHub-native merge queue is admitted only by the
+server-enforced exact-head merge (`mergePullRequest` bound by `expectedHeadOid`)
+and only when GitHub requires an app-bound approval check
+(`--approval-context`, default `review-verdict`); otherwise the steward refuses
+(`direct_merge_refused_server_enforcement_required`). `shipyard auto-merge`
+on such a repository still receives a typed `automatic-merge-refused` decision
+(exit 10), and Shipyard never issues a client-side REST merge because that
+endpoint cannot atomically enforce complete check materialization and the
+validated base revision.
 
 Queue-priority recovery is separately default-off. When
 `--recover-hosted-setup-eviction-priority` is enabled on an apply pass, the
@@ -552,6 +570,33 @@ including dry-run validation, and durable merge receipts are retained.
   stores command evidence.
 - `shipyard metrics import github` imports recent GitHub Actions job timings
   through `gh api`.
+- `shipyard metrics import github-merge-receipt` reconciles one extracted Pulp
+  `job.json` with complete, caller-captured **normalized** GitHub run,
+  pull-request, and check-run snapshots before importing a gate-bound receipt.
+  The normalized run projection must include `pull_requests` (an empty array is
+  valid) and `head_commit_parents` for the exact merge-group commit. It must
+  contain the queue entry's base SHA (the protected base or previous queue
+  entry) followed by the artifact PR head SHA; a different second parent
+  therefore refuses batched groups. The merged PR commit SHA must also equal
+  the merge-group run and artifact merge SHA. The check snapshot
+  must carry `complete: true`, an exact
+  `total_count`, plus the provider-scoped `snapshot_run_id` and
+  `snapshot_run_attempt` matching the observed run. Required checks must carry
+  their own non-null matching run identity; commit-wide check-runs with null
+  identities are rejected unless enriched from the authoritative run jobs.
+  `--required-check-policy` is a normalized `shipyard.required-check-policy/v1`
+  branch-protection/ruleset snapshot whose repository, base branch, and exact
+  required-check list must match the arguments. `--policy-sha256` must be the
+  SHA-256 of its normalized JSON, which proves only that the snapshot is
+  internally consistent. The policy snapshot, its digest and
+  `--collector-sha256` are all caller-asserted: whoever writes the policy can
+  omit a required gate from both it and `--required-check` and still obtain a
+  safe-merge receipt, so the receipt is producer-self-asserted, like one from
+  `metrics import merge-receipt`, and is not evidence of branch-protection
+  provenance. The producer `job.json` may contain additional metadata; the importer
+  projects only the binding fields and accepts numeric-string run IDs. These
+  projections are caller-produced inputs; raw GitHub payloads must be reduced
+  to this schema before import. The command never calls GitHub or merges.
 - `shipyard metrics import tartci` imports JSON/JSONL from
   `tartci runtime export` when a project uses tartci VM lanes.
 - `shipyard metrics import fleet-capacity --file <path>` imports validated
@@ -592,12 +637,13 @@ associations remain `NULL`. Only an authenticated `production` or `synthetic` la
 provenance-qualified scorecard populations; unknown rows remain visible in the
 `scorecard.provenance` counts and are excluded from promotion decisions.
 
-The current GitHub importer does not assign authenticated `production` or
-`synthetic` provenance, so imported GitHub rows normally remain `unknown` and
-`qualified_jobs` is expected to be zero. That is an honest unavailable
-measurement, not evidence that no production jobs exist. A future producer
-must attach verified provenance at the producer boundary; the importer does
-not infer it from event names, repository, workflow, or runner identity.
+GitHub imports made through Shipyard's machine-global GitHub App command helper
+are now marked `production` only when the helper returns the verified
+`github-app-installation` token kind and is bound to the exact `--repo` target.
+Ambient `gh` auth, arbitrary token helpers, and fixture callers remain
+`unknown`. This keeps the promotion denominator tied to the authenticated
+producer boundary; the importer still does not infer provenance from event
+names, repository, workflow, or runner identity.
 
 The agent-facing queries are `summary`, `scorecard`, `slowest`, `watch`,
 `advise`, and `compare`. `scorecard` returns one bounded project-level view of
@@ -629,7 +675,16 @@ The scorecard also reports cost proxies needed for the fleet baseline:
 `coordination_minutes` sums authoritative queue wait, and
 `rework_compute_minutes` counts failed attempts only. The combined
 `coordination_rework_minutes` is queue wait plus failed-attempt compute. These
-values are costs, not promotion decisions. `wasted_compute_per_safely_merged_change`
+values are costs, not promotion decisions. JSON also includes
+`wasted_compute_coverage`, `coordination_coverage`,
+`rework_compute_coverage`, and `coordination_rework_coverage`; each reports
+whether its authoritative timing denominator is `available`, `partial`, or
+`unavailable`, so a proxy total is never mistaken for a complete measurement.
+A window with completed job samples but no failed or cancelled attempt reports
+the failure-based proxies as `available`, since their zero total is a complete
+measurement; a window with no samples reports them `unavailable`.
+Human output shows the corresponding status beside each cost.
+`wasted_compute_per_safely_merged_change`
 is explicitly `unavailable` until a durable merge receipt joins a PR head to a
 successfully merged change; distinct PR count is never treated as a safe-merge
 denominator. A baseline receipt must therefore carry that merge join before

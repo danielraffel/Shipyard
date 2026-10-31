@@ -267,16 +267,53 @@ pub(super) fn apply_pr_plans(
         ledger_path,
         mutation_control,
     });
+    let mut sweep_pass = super::unapproved_admission::SweepPass::new(args.unapproved_dequeue);
+    if args.apply {
+        super::unapproved_admission::prune(ledger, observation);
+    }
     let reports = observation
         .prs
         .iter()
         .map(|pr| {
             let attempts = attempts_for(ledger, &observation.repo, &pr.fact);
             let decision = classify_pr(&pr.fact, policy, &attempts);
-            if let Some(report) =
+            // Every open PR on the base, owned or not, on every merge path:
+            // an arm or queue entry whose current head the approval gate does
+            // not admit is withdrawn before anything else acts on it. See
+            // `unapproved_admission`.
+            let (stale_mutation, stale_error) =
+                if super::unapproved_admission::applies(pr, &decision) {
+                    super::unapproved_admission::sweep(
+                        actions,
+                        observation,
+                        mutation_context.as_ref(),
+                        args.apply,
+                        pr,
+                        &decision,
+                        &mut sweep_pass,
+                        ledger,
+                    )
+                } else {
+                    (None, None)
+                };
+            unhealthy |= stale_error.is_some();
+            let fold = |mutation: Option<String>, error: Option<String>| {
+                (
+                    match (stale_mutation.clone(), mutation) {
+                        (Some(stale), Some(next)) => Some(format!("{stale},{next}")),
+                        (stale, next) => stale.or(next),
+                    },
+                    match (stale_error.clone(), error) {
+                        (Some(stale), Some(next)) => Some(format!("{stale}; {next}")),
+                        (stale, next) => stale.or(next),
+                    },
+                )
+            };
+            if let Some(mut report) =
                 provenance_blocked_report(mutation_context.as_ref(), pr, policy, &decision, ledger)
             {
                 unhealthy |= report.error.is_some();
+                (report.mutation, report.error) = fold(report.mutation, report.error);
                 return report;
             }
             let (mut mutation, mut error) = (None, None);
@@ -348,13 +385,13 @@ pub(super) fn apply_pr_plans(
             }
             if args.apply
                 && error.is_none()
-                && policy.server_enforced_exact_head_merge()
                 && pr.fact.auto_merge_active
                 && super::exact_head_merge::owns_for_disarm(&decision)
             {
                 // An armed request survives a later push by anyone with
-                // write access, so none is left armed on an owned PR here,
-                // approved or not. See `exact_head_merge`.
+                // write access, and the steward admits an owned head itself,
+                // so none is left armed on an owned PR on any base, approved
+                // or not. See `exact_head_merge`.
                 if let Some(context) = mutation_context.as_ref() {
                     let (disarm_mutation, disarm_error) =
                         super::exact_head_merge::disarm_owned_auto_merge(context, pr, ledger);
@@ -389,6 +426,7 @@ pub(super) fn apply_pr_plans(
                 }
             }
             unhealthy |= error.is_some();
+            let (mutation, error) = fold(mutation, error);
             PrReport {
                 number: pr.fact.number,
                 head_sha: pr.fact.head_sha.clone(),

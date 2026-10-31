@@ -73,6 +73,7 @@ mod rescue_cmd;
 mod reuse_cmd;
 mod reuse_rederive;
 mod review_verdict_cmd;
+mod reviewer_claim_cmd;
 mod rollup_cmd;
 mod run_cmd;
 mod runner_cmd;
@@ -579,6 +580,16 @@ where
                 stdout,
             );
         }
+        Command::ReviewerClaim { command } => {
+            return reviewer_claim_cmd::reviewer_claim_command(
+                command,
+                cli.mode.into(),
+                &cwd,
+                &runtime_paths.state_dir,
+                cli.json,
+                stdout,
+            );
+        }
         Command::Who { pr, repo } => {
             return who_cmd::who_command(
                 cli.mode.into(),
@@ -951,6 +962,7 @@ fn handle_operational_variant<W: Write>(
         | Command::Landing { .. }
         | Command::Inspect { .. }
         | Command::ReviewVerdict { .. }
+        | Command::ReviewerClaim { .. }
         | Command::Rollup { .. }
         | Command::Who { .. }
         | Command::BaseHealth { .. }
@@ -1500,8 +1512,12 @@ fn handle_run_variant<W: Write>(
         unreachable!("run variant required")
     };
     if let Some(RunSubcommand::Command(args)) = subcommand {
-        let config = LoadedConfig::load_from_cwd(mode, cwd)
-            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        let config = LoadedConfig::load_from_cwd_with_global_dir(
+            mode,
+            cwd,
+            runtime_paths.global_dir.clone(),
+        )
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
         return run_command_evidence(&args, &config, cwd, runtime_paths, json, stdout);
     }
     handle_run_command(
@@ -1700,8 +1716,9 @@ fn handle_run_command<W: Write>(
     json: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
-    let config = LoadedConfig::load_from_cwd(mode, cwd)
-        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let config =
+        LoadedConfig::load_from_cwd_with_global_dir(mode, cwd, runtime_paths.global_dir.clone())
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
     run_command(args, &config, cwd, runtime_paths, json, stdout)
 }
 

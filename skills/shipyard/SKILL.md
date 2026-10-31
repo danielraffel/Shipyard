@@ -5,6 +5,13 @@ description: Shipyard operations guardrails. Use when working in /Users/danielra
 
 # Shipyard
 
+`SHIPYARD_OBSERVATIONS=off` (trimmed, case-insensitive) stops automatic queue
+shadow/timing, command metric copies, route-shadow receipts, daemon GitHub
+imports, and scheduled baseline collection in processes receiving it. Existing
+services need environment rollout/restart. It preserves required evidence,
+merge receipts, explicit metrics imports/record, and historical reporting;
+retention and manual cause/private-corpus collection remain separate.
+
 The gate-cost scorecard can read a bounded historical cause archive with
 `--causes-archive DIR`; the report labels that source as archive and keeps
 malformed, duplicate, truncated, and unjoined rows visible. This is advisory
@@ -16,6 +23,25 @@ as one malformed row and does not discard later rows. Otherwise valid rows
 for another repository are excluded as `archive_other_repo`, not malformed;
 `archive_rows` still counts all successfully decoded cause records. Attachment
 uses the exact-identity index, without changing duplicate or attempt policy.
+
+## Durable work-item contract
+
+Shipyard's existing ShipState/lease/receipt primitives are the source of
+durable intent for work started by independent Claude or Codex sessions. Each
+item has a canonical identity, protocol/capability version, checkpoint, owner,
+and fencing epoch. Register before claiming; checkpoint before handoff; after a
+process or host failure, rediscover from shared state and claim a new epoch.
+The previous owner must be fenced before any conflicting mutation. GitHub
+remains authoritative for PR, review, check, merge-queue, and release state;
+Shipyard records intent and ownership only. Autonomous cross-host takeover is
+not enabled until real concurrent-reconciler and lost-acknowledgment tests
+prove idempotent, authorized recovery.
+
+The store rejects corrupt or unsupported records rather than treating them as
+absent. Claims and checkpoints use expected state versions, verify the worker
+capability, compare idempotency keys on replay, and reject checkpoints after
+lease expiry. These are local safety guards; authenticated cross-host identity
+and takeover still require a separate reviewed boundary and failure canary.
 
 Metrics imports preserve exact-head safety when GitHub omits a workflow run's
 pull-request list: `pull_request` and `pull_request_target` runs may use the
@@ -316,8 +342,19 @@ invalid timestamps produce unavailable queue coverage; do not synthesize
 submit-to-receipt, cache, or model-token measurements. New providers must bind
 those values to authenticated durable events before they are imported.
 
+The GitHub metrics importer has the same provenance boundary: resolve one
+machine-global App helper token through `GhClient`, bind it to the exact
+repository target, and qualify rows only for `github-app-installation` helper
+auth. Ambient `gh` auth and fixtures stay unknown, even when their repository,
+workflow, event, or runner labels look production-like.
+
+The freshness query classifies jobs through their `github_job` step marker and
+must retain the `(steps.job_id, steps.step)` migration index. Without it, a
+large metrics store makes an observational scorecard scan steps once per job.
+
 `metrics scorecard` also reports failed/cancelled compute waste, queue-wait
 coordination cost, and failed-attempt rework as observational baseline metrics.
+
 It does not alter routing or queue behavior. The per-safely-merged-change
 denominator is unavailable until a durable merge receipt joins the PR head;
 distinct PRs are not a safe-merge proxy.
@@ -1063,12 +1100,13 @@ remain fail-closed.
 `shipyard pr-watch rules` is the rules-first watcher: one JSONL event per new
 condition (READY or new head unreviewed, verdict to route, armed or queued
 without an approval of the head, red required check naming its failing tests,
-failed merge group, queue removal or stall, approved but unarmed, tartci host
-alarm, or a line from `--input-events`), each once per key, so a quiet pass
+failed merge group, queue removal or stall, approved but unarmed, a HOLD nobody
+repaired (`--held-after`), a PR labelled `owner-decision`/`superseded`/`PARKED/*`
+(own state, skipped by the stall rules), tartci host alarm, or a line from `--input-events`), each once per key, so a quiet pass
 prints nothing. Its first pass with no ledger only records what already holds.
 `rules-replay` runs the same rules over a past window. Failing-test names come
 from CTest, Python unittest (`FAIL:`/`ERROR:` with a dotted location) and
-`cargo test` lines. Every event carries a `fix` (what, evidence URL, cause,
+`cargo test` lines. Every event carries `age_secs`/`age` and a `fix` (what, evidence URL, cause,
 command, safe_to_auto_apply, verify); `--reviewer OWNER/REPO=NAME` names who a
 head routes to. A live pass prints its reads, checks the App budget first and
 backs off (exit 75) under `--min-rate-remaining`, and re-reads a pull
@@ -3490,7 +3528,7 @@ It observes by default; `--apply` enables exact-head guarded queue admission,
 reruns, and narrowly policy-scoped capacity-preemption mutations. Client-side
 REST direct merge is refused because GitHub cannot atomically bind both complete
 check materialization and the validated base revision; use a server-owned merge
-queue or manual merge instead. A base with no merge queue (GitHub offers
+queue or the server-enforced exact-head merge below. A base with no merge queue (GitHub offers
 queues only to organization-owned repositories) reports
 `merge_path: server_enforced_exact_head_merge` when GitHub requires a check set
 that includes the approval context (`--approval-context`, default
@@ -3505,11 +3543,69 @@ mutations are `merged_exact_head:<sha>`, `waiting_head_approval`, and
 armed request survives a later push by anyone with write access; any armed
 request on an owned PR is disarmed (`auto_merge_disabled:<sha>`) on every
 `--apply` pass, approved or not. The org-queue path never takes this merge.
+For the base given with `--base`, whatever its `merge_path` (including
+`direct_merge_refused_server_enforcement_required`, where a surviving arm
+merges directly), the steward, as that base's single admission writer, also
+sweeps every open PR, owned or not, and withdraws what the exact-head gate does
+not admit. Other branches are covered only by running the steward per base.
+
+- **Disarm (always live).** An armed native auto-merge request on such a head
+  is disabled (`disarmed_stale_auto_merge:<sha>`, audit
+  `disarm_stale_auto_merge`). It fails closed: an approval that cannot be read,
+  a live head that moved since the census, or a head at the ejection cap
+  disarms. An armed request on an owned PR is disarmed unconditionally
+  (`auto_merge_disabled:<sha>`, audit `disable_auto_merge_owned_pr`).
+- **Dequeue (gated).** GitHub consumes the arm when it enqueues, so a head it
+  enqueued past approval is withdrawn by removing its queue entry
+  (`dequeuePullRequest`). The machine-global switch
+  `[merge_steward] unapproved_dequeue = "report" | "apply"` gates it and
+  defaults to `"report"`: the sweep computes and reports
+  `would_dequeue_unapproved:<sha>` / `would_dequeue_unreadable_streak:<sha>`
+  (and every deferral and streak) but never calls the mutation. Under
+  `"apply"` it reports `dequeued_unapproved:<sha>` or
+  `dequeued_unreadable_streak:<sha>` (audit `dequeue_unapproved_queue_entry`).
+- **What counts as evidence.** Only a successful read of the queued head's
+  judgement: a HOLD at that head, an approval only for another head, no
+  approval where one is required, or a confirmed absent base config. A config
+  404 is `PolicyReadError::Absent` only when `gh`'s own stderr says
+  `gh: Not Found (HTTP 404)` (never the command's arguments, never a token or
+  installation failure) and a second read agrees: the base branch reads back
+  and `.shipyard` is absent or lists no `config.toml`. An approved head at the
+  ejection cap is never dequeued for the cap alone; the disarm side applies the
+  same classified-interruption excuse as the arming paths.
+- **Unreadable defers, visibly.** An unreadable judgement reports
+  `dequeue_deferred_unreadable:<sha>` and returns its read error as the PR's
+  error, so the pass is unhealthy and the tick summary shows `errors>0`. Only a
+  PR-specific failure (a GraphQL answer with `errors` or `pullRequest: null`, a
+  4xx on that PR's records) advances the consecutive-unreadable streak
+  (`dequeue_unreadable`, keyed `repo#pr:head`); the third consecutive one
+  dequeues. A base-wide or transport failure (the policy, 5xx, 401/403/429,
+  rate limits, timeouts, credentials) never advances it, so an outage cannot
+  drain the queue. Any successful judgement clears the streak, and each
+  applying pass prunes it once the PR is unqueued or its head changes. A dry
+  run never changes it.
+- **Bounds.** At most two entries leave the queue per repository and base per
+  pass; the rest report `dequeue_deferred_cap:<sha>`. The steward records when
+  it removed each head (`steward_removals`), and exactly those removals (each
+  matched to a timeline removal within three minutes) are not counted toward
+  `EJECTION_CAP` on the steward's own gate. `queue-arm-guard` has no ejection
+  cap of its own.
+- **Labels.** `owner-decision`, `superseded` and `PARKED/<platform>` PRs are not
+  exempt: they should never be queued, so on positive evidence they are
+  dequeued like any other.
+
+The reviewer policy is read once per pass, strictly (`read_policy_required`).
+Every withdrawal runs under the PR mutation guard on Shipyard's internal
+queue-mutation path, whose one-shot nonce the `ghapp` `queue-removal-guard`
+accepts; a plain `gh` disarm or dequeue is refused as an unaudited queue
+removal. A dry run (no `--apply`) changes nothing. The `--arm-unqueued`
+backstop reads the policy just as strictly, so it never arms what the sweep
+would withdraw.
 The bound rule is satisfied only by a check run carrying that app id (the
 canonical `review-verdict` job, github-actions 15368); an app-less status of
-the same name never satisfies it. Because that job succeeds whenever it posts a
-verdict, the newest same-named commit status must also be `success` when one
-exists: a refusing status makes the head `required_failed`
+the same name never satisfies it. The canonical job fails unless the head is
+allowed, and the steward also requires the newest same-named commit status to
+be `success` when one exists: a refusing status makes the head `required_failed`
 (`review-verdict (commit status)`). `--arm-unqueued` reports `not applicable`
 on any base without a merge queue and arms nothing there.
 Apply mode is restricted by central mutation
@@ -4102,7 +4198,18 @@ repositories whatever a host's opt-out says, the rebase carry on unless
 reviewer_signers`, never a host, refusing every App APPROVE where a
 review-required repository lists none); exit 0 allowed, 1 refused, 2
 unreadable, and a caller treats 2 as refused. The review-verdict status pins the rebase carry on for
-the same reason. A merge-only update carries the approval only when every file the PR
+the same reason. When the protected base enables `reviewer_claim_receipt` and
+`reviewer_claim_app`, acquire a claim with `shipyard reviewer-claim acquire`
+before the verdict; acquire takes the receipt App from that base policy and
+refuses an absent, partial or shared-App policy (GitHub Actions id 15368)
+before claiming. The managed `reviewer-claim-guard` validates the exact
+head, reviewer, epoch and deadline immediately before the ghapp write. The
+fence is effectively per host and per reviewer name (`validate` compares the
+local ship-state's epoch with itself, the client guard keys on
+`SHIPYARD_AGENT_ID`, and a fresh ship-state resets the epoch to 0).
+`shipyard reviewer-claim revoke` is intentionally unavailable until
+authenticated App receipt invalidation is exposed; claims expire or are
+superseded by exact-head adoption fencing in the meantime. A merge-only update carries the approval only when every file the PR
 changes keeps its approved blob and mode (the compare API lists no mode, so
 both twins read the files' directory trees), the base changed none of them
 (a rename counts under both names, so a base edit to a file the PR renames
@@ -5492,6 +5599,17 @@ formatting and lint gates; m1 is a fallback, not a universal gate. Local gates
 do not grant merge authority: GitHub CI, branch protection, and the configured
 Shipyard mutation machine remain authoritative.
 
+
+
+### Durable reviewer handoff
+
+Shipyard's reviewer handoff is generic across repository landing models. Each
+claim names the exact PR head and a monotonic epoch; only the current unexpired
+claim can publish a counted verdict. The standby reviewer is failover capacity,
+not a second approval. A changed head, revoked claim, or expired deadline
+requires a fresh claim. Landing still follows the repository adapter: native
+merge queues are admitted through their queue, while serial repositories keep
+their guarded path.
 
 ## Pulp feeder provenance recovery
 

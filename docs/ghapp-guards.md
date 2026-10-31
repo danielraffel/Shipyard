@@ -52,6 +52,7 @@ its binary and needs only step 1.
 | `merge-guard` | `scripts/ghapp_merge_guard.sh` | `pr merge` on a repository listed in `~/.config/shipyard/merge-guard.json` (one that cannot enforce required checks server-side) until every listed check reads `pass`, and `--auto` there outright; inert for unlisted repositories and when that file is missing or malformed |
 | `verdict-hold-hook` | `scripts/ghapp_verdict_hold_hook.py` | nothing: before a HOLD verdict posts, it dequeues or disarms that pull request when it is queued or armed at exactly the HOLD's head ([A HOLD takes its head out of the landing path](#a-hold-takes-its-head-out-of-the-landing-path)) |
 | `verdict-session-stamp` | `scripts/ghapp_verdict_session_stamp.py` | nothing: it adds a `<!-- session: <host>/<session> -->` stamp to a verdict comment before it posts, so the arm guard can tell who approved ([An agent cannot approve its own landing](#review-before-arm-or-merge)) |
+| `reviewer-claim-guard` | `scripts/ghapp_reviewer_claim_guard.py` | a verdict when the protected base enables reviewer-claim receipts and the posting reviewer has no current exact-head claim |
 
 `pr-close-guard` is a mandatory member of the authenticated `ghapp` generation
 and is managed by `shipyard runner fleet-update`, not by this page.
@@ -709,6 +710,23 @@ request, another head, or one neither armed nor queued is left alone. Every
 action and every failure is a line in `holds.jsonl` in the guards directory.
 The head lands again only once a newer verdict approves it, which
 `queue-arm-guard` requires on hosts with review before arm.
+
+The merge steward closes the same gap without a HOLD. On every `--apply` pass
+it disables an armed auto-merge request on any open PR whose current head the
+exact-head approval gate does not admit (`disarmed_stale_auto_merge:<sha>`).
+It can also remove such a head from the merge queue
+(`dequeued_unapproved:<sha>`), gated by the machine-global
+`[merge_steward] unapproved_dequeue` switch, which defaults to `"report"`
+(report `would_dequeue_unapproved:<sha>`, remove nothing). Under `"apply"` it
+dequeues only on positive evidence from a successful read, or after three
+consecutive PR-specific unreadable passes (`dequeued_unreadable_streak:<sha>`),
+and at most two per repository per pass. Both mutations carry Shipyard's
+internal marker and one-shot `internal-removal` nonce, so `queue-removal-guard`
+accepts them as audited Shipyard removals; the guard is unchanged for every
+other caller. The steward's own approval gate does not count its own removals
+toward the head's ejection cap; `queue-arm-guard` has no ejection cap (its only
+bound is `INTERRUPTION_REARM_LIMIT` for environment re-enqueues, and it refuses
+a same-head re-arm after any removal).
 
 **The one sanctioned route around `queue-removal-guard`.** The hook's mutation
 goes to the real `gh` with the exported App token, not back through `ghapp`, so

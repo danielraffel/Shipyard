@@ -7,23 +7,29 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::{Value, json};
+#[cfg(test)]
+use sha2::{Digest, Sha256};
 
 use crate::app::cli::{
     MetricsCommand, MetricsExportCommand, MetricsExportMergeReceiptArgs, MetricsFreshnessArgs,
     MetricsGroupBy, MetricsImportCommand, MetricsImportFleetCapacityArgs, MetricsImportGithubArgs,
-    MetricsImportTartciArgs, MetricsRecordArgs,
+    MetricsImportGithubMergeReceiptArgs, MetricsImportTartciArgs, MetricsRecordArgs,
 };
 use crate::app::{CliFailure, WAIT_EXIT_INVALID};
 use crate::config::LoadedConfig;
+use crate::gh::{GhAuthPolicy, GhAuthSourceSummary, GhAuthSummary, GhClient, GhSupervision};
 use crate::identity::RuntimeMode;
 use crate::metrics::freshness::{
     DEFAULT_STALE_AFTER_HOURS, Freshness, FreshnessStatus, parse_stale_after,
 };
-use crate::metrics::github_import::{self, GithubImportReport, GithubImportRequest};
+use crate::metrics::github_import::{
+    self, GithubImportProvenance, GithubImportReport, GithubImportRequest,
+};
 #[cfg(test)]
 use crate::metrics::github_import::{
     github_jobs_api_path, github_runs_api_path, workflow_run_single_pr,
 };
+use crate::metrics::github_merge_receipts;
 use crate::metrics::proxy::{Basis, ProxyValue, WALL_CONTEXT_LABEL};
 use crate::metrics::{
     AuthenticatedStrataReceipt, GateClass, MetricRecordInput, MetricsFinding, MetricsJobRow,
@@ -281,7 +287,7 @@ pub(super) fn metrics_command<W: Write>(
                 format!("recorded job {job_id}")
             })?;
         }
-        MetricsCommand::Import { source } => match source {
+        MetricsCommand::Import { source } => match *source {
             MetricsImportCommand::Tartci(args) => {
                 let imported = import_tartci(&store, &args)?;
                 let output = MetricsImportOutput {
@@ -324,8 +330,25 @@ pub(super) fn metrics_command<W: Write>(
                     format!("imported {imported} merge receipts")
                 })?;
             }
+            MetricsImportCommand::GithubMergeReceipt(args) => {
+                let receipt = reconcile_github_merge_receipt(&args)?;
+                let imported = store
+                    .import_merge_receipts(std::slice::from_ref(&receipt))
+                    .map_err(|error| {
+                        CliFailure::new(1, format!("GitHub merge receipt import failed: {error}"))
+                    })?;
+                let output = MetricsImportOutput {
+                    database: store.path().display().to_string(),
+                    source: "github-merge-receipt".to_owned(),
+                    imported,
+                    skipped_runs: None,
+                };
+                write_output(stdout, json_output, &output, || {
+                    format!("imported {imported} GitHub merge receipt")
+                })?;
+            }
             MetricsImportCommand::Github(args) => {
-                let report = import_github(&store, &args)?;
+                let report = import_github(&store, &args, config_cwd)?;
                 let output = MetricsImportOutput {
                     database: store.path().display().to_string(),
                     source: "github".to_owned(),
@@ -465,15 +488,16 @@ pub(super) fn metrics_command<W: Write>(
         }
         MetricsCommand::Compare(args) => {
             let _lane = args.lane.as_deref();
-            let _before_days = args.before.as_deref().map(parse_days).transpose()?;
-            let split_days_ago = args
-                .after
-                .as_deref()
-                .map(parse_days)
-                .transpose()?
-                .unwrap_or(args.split_days_ago);
+            let before_days = parse_compare_window(args.before.as_deref())?;
+            let after_days = parse_compare_window(args.after.as_deref())?;
             let findings = store
-                .compare(&args.project, split_days_ago, args.basis.into())
+                .compare_with_windows(
+                    &args.project,
+                    args.split_days_ago,
+                    before_days,
+                    after_days,
+                    args.basis.into(),
+                )
                 .map_err(|error| CliFailure::new(1, format!("metrics compare failed: {error}")))?;
             write_findings(
                 stdout,
@@ -590,14 +614,18 @@ pub(super) fn metrics_command<W: Write>(
                 text.push_str(&coverage);
                 let _ = write!(
                     text,
-                    "\n  cost: {:.2} wasted compute minutes ({} failure/cancelled jobs), {:.2} coordination minutes ({} queued jobs), {:.2} rework compute minutes ({} failed attempts), {:.2} coordination+rework minutes; wasted/safely-merged={} ({})",
+                    "\n  cost: {:.2} wasted compute minutes ({} failure/cancelled jobs; {}), {:.2} coordination minutes ({} queued jobs; {}), {:.2} rework compute minutes ({} failed attempts; {}), {:.2} coordination+rework minutes ({}); wasted/safely-merged={} ({})",
                     scorecard.wasted_compute_minutes,
                     scorecard.wasted_compute_samples,
+                    scorecard.wasted_compute_coverage.status,
                     scorecard.coordination_minutes,
                     scorecard.coordination_samples,
+                    scorecard.coordination_coverage.status,
                     scorecard.rework_compute_minutes,
                     scorecard.rework_compute_samples,
+                    scorecard.rework_compute_coverage.status,
                     scorecard.coordination_rework_minutes,
+                    scorecard.coordination_rework_coverage.status,
                     scorecard.wasted_compute_per_safely_merged_change.status,
                     scorecard.wasted_compute_per_safely_merged_change.reason,
                 );
@@ -613,6 +641,58 @@ pub(super) fn metrics_command<W: Write>(
         }
     }
     Ok(std::process::ExitCode::SUCCESS)
+}
+
+fn reconcile_github_merge_receipt(
+    args: &MetricsImportGithubMergeReceiptArgs,
+) -> Result<crate::metrics::merge_receipt::MergeReceipt, CliFailure> {
+    let artifact = github_merge_receipts::read_job(&args.artifact).map_err(|error| {
+        CliFailure::new(2, format!("GitHub merge receipt input failed: {error}"))
+    })?;
+    let run: github_merge_receipts::RunObservation =
+        github_merge_receipts::read_json(&args.run, "GitHub run snapshot").map_err(|error| {
+            CliFailure::new(2, format!("GitHub merge receipt input failed: {error}"))
+        })?;
+    let pull_request: github_merge_receipts::PullRequestObservation =
+        github_merge_receipts::read_json(&args.pull_request, "GitHub pull-request snapshot")
+            .map_err(|error| {
+                CliFailure::new(2, format!("GitHub merge receipt input failed: {error}"))
+            })?;
+    let checks: github_merge_receipts::CheckRunsResponse =
+        github_merge_receipts::read_json(&args.checks, "GitHub check-runs snapshot").map_err(
+            |error| CliFailure::new(2, format!("GitHub merge receipt input failed: {error}")),
+        )?;
+    let policy: github_merge_receipts::RequiredCheckPolicy = github_merge_receipts::read_json(
+        &args.required_check_policy,
+        "required-check policy snapshot",
+    )
+    .map_err(|error| CliFailure::new(2, format!("GitHub merge receipt input failed: {error}")))?;
+    let artifact_sha256 =
+        github_merge_receipts::sha256_file(&args.artifact, "GitHub reuse artifact").map_err(
+            |error| CliFailure::new(2, format!("GitHub merge receipt input failed: {error}")),
+        )?;
+    github_merge_receipts::reconcile(
+        &args.repo,
+        &args.project,
+        &args.base_branch,
+        &args.artifact_url,
+        &args.run_url,
+        &artifact_sha256,
+        &args.policy_sha256,
+        &args.collector_sha256,
+        &artifact,
+        &run,
+        &pull_request,
+        &checks,
+        &policy,
+        &args.required_checks,
+    )
+    .map_err(|error| {
+        CliFailure::new(
+            1,
+            format!("GitHub merge receipt reconciliation failed: {error}"),
+        )
+    })
 }
 
 fn record_input(args: MetricsRecordArgs) -> Result<MetricRecordInput, CliFailure> {
@@ -693,6 +773,20 @@ fn parse_days(value: &str) -> Result<i64, CliFailure> {
     })
 }
 
+fn parse_compare_window(value: Option<&str>) -> Result<Option<i64>, CliFailure> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let days = parse_days(value)?;
+    if days <= 0 {
+        return Err(CliFailure::new(
+            WAIT_EXIT_INVALID,
+            format!("compare window must be positive, got {value:?}"),
+        ));
+    }
+    Ok(Some(days))
+}
+
 fn import_tartci(
     store: &MetricsStore,
     args: &MetricsImportTartciArgs,
@@ -738,6 +832,7 @@ fn read_metrics_import_text(file: Option<&Path>) -> Result<String, CliFailure> {
 fn import_github(
     store: &MetricsStore,
     args: &MetricsImportGithubArgs,
+    config_cwd: Option<(RuntimeMode, &Path)>,
 ) -> Result<GithubImportReport, CliFailure> {
     let request = GithubImportRequest {
         repo: args.repo.clone(),
@@ -746,14 +841,69 @@ fn import_github(
         branch: args.branch.clone(),
         limit: args.limit,
     };
-    let mut gh = |argv: &[String]| gh_json(argv);
-    github_import::import_github_report(store, &request, &mut gh, &|message| {
-        CliFailure::new(1, message)
-    })
+    let Some((mode, cwd)) = config_cwd else {
+        let mut gh = |argv: &[String]| gh_json(argv);
+        return github_import::import_github_report(store, &request, &mut gh, &|message| {
+            CliFailure::new(1, message)
+        });
+    };
+
+    // Metrics observation must use the same machine-global GitHub auth as the
+    // rest of Shipyard. Bind token-command helpers to this exact repository,
+    // pin one helper result for the whole import, and qualify rows only when
+    // the helper identifies a GitHub App installation token. Ambient `gh`
+    // auth remains useful for observation but cannot enter promotion strata.
+    let mut client = GhClient::from_cwd(mode, cwd)
+        .map_err(|error| CliFailure::new(1, format!("GitHub auth config failed: {error}")))?
+        .with_repo_override(&request.repo)
+        .map_err(|error| {
+            CliFailure::new(1, format!("GitHub repository binding failed: {error}"))
+        })?;
+    let auth = client
+        .pin_command_auth_with_timeout(cwd, GITHUB_METRICS_OBSERVATION_TIMEOUT)
+        .map_err(|error| CliFailure::new(1, format!("GitHub auth resolution failed: {error}")))?;
+    let provenance = github_import_provenance(&auth);
+    let mut gh = |argv: &[String]| gh_json_with_client(&client, cwd, argv);
+    github_import::import_github_report_with_provenance(
+        store,
+        &request,
+        &mut gh,
+        &|message| CliFailure::new(1, message),
+        provenance,
+    )
+}
+
+fn github_import_provenance(auth: &GhAuthSummary) -> GithubImportProvenance {
+    if matches!(auth.source, GhAuthSourceSummary::Command)
+        && auth.token_kind.as_deref() == Some("github-app-installation")
+    {
+        GithubImportProvenance::Production
+    } else {
+        GithubImportProvenance::Unknown
+    }
 }
 
 fn gh_json(args: &[String]) -> Result<Value, CliFailure> {
     gh_json_with_timeout("gh", args, GITHUB_METRICS_OBSERVATION_TIMEOUT)
+}
+
+fn gh_json_with_client(
+    client: &GhClient,
+    cwd: &Path,
+    args: &[String],
+) -> Result<Value, CliFailure> {
+    let mut command = client
+        .prepare_command(
+            cwd,
+            None,
+            GhSupervision::Unsupervised,
+            GhAuthPolicy::Default,
+        )
+        .map_err(|error| {
+            CliFailure::new(1, format!("GitHub command preparation failed: {error}"))
+        })?;
+    command.args(args);
+    gh_json_command(command, GITHUB_METRICS_OBSERVATION_TIMEOUT)
 }
 
 fn gh_json_with_timeout(
@@ -767,6 +917,14 @@ fn gh_json_with_timeout(
     // complete process tree under one fixed deadline.
     let mut command = Command::new(program.as_ref());
     command.args(args);
+    gh_json_command(command, timeout)
+}
+
+fn gh_json_command(mut command: Command, timeout: Duration) -> Result<Value, CliFailure> {
+    // Metrics import is observational and must never strand the invoking
+    // agent behind an unbounded gh subprocess. Capture to regular files so an
+    // escaped descendant cannot keep a pipe reader blocked, and supervise the
+    // complete process tree under one fixed deadline.
     let deadline = Instant::now() + timeout;
     let output =
         crate::process::run_output_until(&mut command, deadline, "metrics GitHub observation")
@@ -1064,13 +1222,53 @@ fn _json_debug(value: &impl Serialize) -> Value {
 mod tests {
     use super::*;
     use crate::app::cli::{
-        MetricsExportCommand, MetricsExportMergeReceiptArgs, MetricsImportMergeReceiptArgs,
+        MetricsExportCommand, MetricsExportMergeReceiptArgs, MetricsImportGithubMergeReceiptArgs,
+        MetricsImportMergeReceiptArgs,
     };
 
     fn no_freshness_flags() -> MetricsFreshnessArgs {
         MetricsFreshnessArgs {
             stale_after: None,
             fail_on_stale: false,
+        }
+    }
+
+    #[test]
+    fn compare_window_parser_rejects_non_positive_values() {
+        assert_eq!(parse_compare_window(Some("7d")).unwrap(), Some(7));
+        assert!(parse_compare_window(Some("0d")).is_err());
+        assert!(parse_compare_window(Some("-1d")).is_err());
+        assert_eq!(parse_compare_window(None).unwrap(), None);
+    }
+
+    #[test]
+    fn github_import_provenance_requires_the_app_helper_kind() {
+        let app = GhAuthSummary {
+            source: GhAuthSourceSummary::Command,
+            token_kind: Some("github-app-installation".to_owned()),
+            expires_at: None,
+        };
+        assert_eq!(
+            github_import_provenance(&app),
+            GithubImportProvenance::Production
+        );
+
+        for summary in [
+            GhAuthSummary {
+                source: GhAuthSourceSummary::Command,
+                token_kind: Some("personal-access-token".to_owned()),
+                expires_at: None,
+            },
+            GhAuthSummary {
+                source: GhAuthSourceSummary::GhCli,
+                token_kind: None,
+                expires_at: None,
+            },
+        ] {
+            assert_eq!(
+                github_import_provenance(&summary),
+                GithubImportProvenance::Unknown
+            );
         }
     }
 
@@ -1327,9 +1525,9 @@ mod tests {
             let mut out = Vec::new();
             metrics_command(
                 MetricsCommand::Import {
-                    source: MetricsImportCommand::MergeReceipt(MetricsImportMergeReceiptArgs {
-                        file,
-                    }),
+                    source: Box::new(MetricsImportCommand::MergeReceipt(
+                        MetricsImportMergeReceiptArgs { file },
+                    )),
                 },
                 temp.path(),
                 None,
@@ -1352,6 +1550,130 @@ mod tests {
         changed["evidence"] = serde_json::json!("sha256:changed");
         std::fs::write(&path, serde_json::to_vec(&changed).unwrap()).unwrap();
         assert_eq!(run(Some(path)).unwrap_err().code, 1);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn github_merge_receipt_cli_reconciles_and_imports_real_shape() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let head = "a".repeat(40);
+        let merge = "b".repeat(40);
+        let merge_commit = "b".repeat(40);
+        let queue_ref = format!("refs/heads/gh-readonly-queue/main/pr-42-{}", "c".repeat(40));
+        let artifact_path = temp.path().join("job.json");
+        let run_path = temp.path().join("run.json");
+        let pr_path = temp.path().join("pr.json");
+        let checks_path = temp.path().join("checks.json");
+        let policy_path = temp.path().join("required-check-policy.json");
+        std::fs::write(
+            &artifact_path,
+            serde_json::json!({
+                "schema": "pulp-reuse-record/v1",
+                "run_id": 7,
+                "run_attempt": 1,
+                "run_kind": "merge_group",
+                "pr": 42,
+                "head_sha": head,
+                "base_sha": "c".repeat(40),
+                "merge_sha": merge,
+                "merge_group_head_ref": queue_ref,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            &run_path,
+            serde_json::json!({
+                "id": 7,
+                "run_attempt": 1,
+                "event": "merge_group",
+                "status": "completed",
+                "conclusion": "success",
+                "head_sha": "b".repeat(40),
+                "head_branch": format!("gh-readonly-queue/main/pr-42-{}", "c".repeat(40)),
+                "head_commit_parents": ["c".repeat(40), "a".repeat(40)],
+                "html_url": "https://github.com/owner/repo/actions/runs/7",
+                "pull_requests": [],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            &pr_path,
+            serde_json::json!({
+                "number": 42,
+                "state": "closed",
+                "merged_at": "2026-10-25T00:00:00Z",
+                "merge_commit_sha": merge_commit,
+                "head": {"sha": "a".repeat(40)},
+                "base": {"ref": "main", "repo": {"full_name": "owner/repo"}},
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            &checks_path,
+            serde_json::json!({
+                "total_count": 1,
+                "complete": true,
+                "snapshot_run_id": 7,
+                "snapshot_run_attempt": 1,
+                "check_runs": [{
+                    "id": 8,
+                    "name": "macos",
+                    "status": "completed",
+                    "conclusion": "success",
+                    "head_sha": "b".repeat(40),
+                    "html_url": null,
+                    "details_url": null,
+                    "run_id": 7,
+                    "run_attempt": 1,
+                }],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let policy = github_merge_receipts::RequiredCheckPolicy {
+            schema: "shipyard.required-check-policy/v1".to_owned(),
+            repo: "owner/repo".to_owned(),
+            base_branch: "main".to_owned(),
+            required_checks: vec!["macos".to_owned()],
+        };
+        let policy_bytes = serde_json::to_vec(&policy).unwrap();
+        let policy_sha256 = format!("{:x}", Sha256::digest(&policy_bytes));
+        std::fs::write(&policy_path, policy_bytes).unwrap();
+        let mut output = Vec::new();
+        let result = metrics_command(
+            MetricsCommand::Import {
+                source: Box::new(MetricsImportCommand::GithubMergeReceipt(Box::new(
+                    MetricsImportGithubMergeReceiptArgs {
+                        repo: "owner/repo".to_owned(),
+                        project: "repo".to_owned(),
+                        base_branch: "main".to_owned(),
+                        artifact: artifact_path,
+                        run: run_path,
+                        pull_request: pr_path,
+                        checks: checks_path,
+                        required_check_policy: policy_path,
+                        artifact_url: "https://github.com/owner/repo/actions/artifacts/1"
+                            .to_owned(),
+                        run_url: "https://github.com/owner/repo/actions/runs/7".to_owned(),
+                        policy_sha256,
+                        collector_sha256: "1".repeat(64),
+                        required_checks: vec!["macos".to_owned()],
+                    },
+                ))),
+            },
+            temp.path(),
+            None,
+            true,
+            &mut output,
+        )
+        .expect("GitHub merge receipt import");
+        assert_eq!(result, std::process::ExitCode::SUCCESS);
+        let json: Value = serde_json::from_slice(&output).expect("output JSON");
+        assert_eq!(json["source"], "github-merge-receipt");
+        assert_eq!(json["imported"], 1);
     }
 
     #[test]

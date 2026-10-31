@@ -12,6 +12,27 @@ Keep this doc in step with `src/ship_state.rs`, `src/ship.rs`,
 `src/app/watch_cmd.rs`, `src/app/auto_merge_cmd.rs`, and
 `src/app/cloud_cmd.rs`.
 
+## External durable work items
+
+ShipState also persists externally initiated work items under the same durable
+state root (`work-items/`). A work item is identified by its canonical
+repository, pull request, work kind, and release identity. Registration is
+idempotent and records the protocol/capability version and durable intent
+before an agent claims it. Claims advance a fencing epoch; checkpoints include
+the owner and epoch, so a stale session cannot write after another host has
+reclaimed the item. Checkpoints contain resumable context and remain usable
+after the original process, session, or host disappears. This is a persistence
+and fencing primitive, not autonomous takeover: cross-host reconciliation and
+privileged recovery remain default-off until shared fencing and failure
+injection evidence land.
+
+Work-item reads fail closed on corrupt or unsupported records. Registration
+compares the idempotency key, claims and checkpoints require an expected
+`state_version` and matching capability, and an expired owner cannot checkpoint
+until a fenced reclaim occurs. These checks protect intent from silent
+replacement and lost acknowledgements; they still do not authenticate a host
+or session by themselves.
+
 **Phase B** (transition tests, see below) and **Phase C** (pre-merge
 doc-sync hook, dedicated CI lane) land in follow-up PRs.
 
@@ -107,10 +128,12 @@ real ship-state write from overlapping that audit.
 | `dispatched_runs`   | List of `DispatchedRun`. Upsert key is `(target, run_id)`, not just `target` — a single target can hold multiple rows if a new run id was issued (e.g. from a peer dispatch under the same state). Phase B should either add deduplication logic or document the multi-row invariant. |
 | `evidence_snapshot` | `{target: "pass" | "fail"}` written by `_update_ship_state_from_job` (cli.py:4576). No other values are ever written by the normal path — `"pending"` is accepted by `_ship_terminal_verdict` but never produced. |
 | `attempt`           | Monotonic attempt counter bumped on `--no-resume`; the value is carried into the replacement state so old attempts do not reattach. |
+| `reviewer_claim_epoch` | Monotonic fence for reviewer ownership claims. It advances on claim and revocation, and also when an attempt is replaced, so a late verdict cannot reuse an older claim epoch. Defaults to `0` for legacy state. The fence is effectively per host and per reviewer name: `shipyard reviewer-claim validate` compares this state's epoch with itself, the client guard keys on `SHIPYARD_AGENT_ID`, and a fresh ship-state resets the epoch to `0`, so claims on different hosts do not fence each other. |
+| `active_reviewer_claim` | Optional exact-head `ReviewerClaim` (`head_sha`, `epoch`, `reviewer`, `claimed_at`, `deadline_at`). An unexpired claim remains exclusive; an expired claim may be reclaimed with a new epoch. `ReviewerClaim::receipt_id(repo, pr)` deterministically identifies the external handoff so a restarted dispatcher reconciles an existing check run instead of creating a duplicate. Verdict acceptance requires the current head, matching epoch and reviewer, and an unexpired deadline. Defaults to absent for legacy state. |
 | `pr_url`, `pr_title`, `commit_subject` | Human context. Refreshed by the `ship` resume path (cli.py:2679) on each invocation; NOT refreshed by add-lane's `save` (cli.py:2359) or by `_update_ship_state_from_job`. Test coverage: `ship-state show` after a force-push + `shipyard ship` resume should see updated fields; after a `cloud add-lane` against the same state, should not. |
 | `created_at`        | Attempt-scoped: stable for the life of an attempt.                                  |
 | `updated_at`        | Last `touch()` — bumped after every mutation helper.                                |
-| `schema_version`    | `SCHEMA_VERSION` (currently 1). `from_dict` defaults to `SCHEMA_VERSION` when reading older files that omit it.                                                                 |
+| `schema_version`    | `SCHEMA_VERSION` (currently 2). v1 files remain readable for non-claim state; claim checks require v2 and a consistent epoch. `from_dict` defaults to `SCHEMA_VERSION` when reading files that omit it. |
 
 `DispatchedRun` is the per-dispatch record (not strictly per-target — see
 `dispatched_runs` note above):

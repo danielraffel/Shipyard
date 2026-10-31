@@ -754,6 +754,166 @@ fn a_config_that_sets_the_key_decides_over_the_default() {
     }
 }
 
+/// The message `GitHubError::command_failed` builds for a failed `gh` call:
+/// the arguments, which name the repository, path and ref, then the status,
+/// then stderr.
+fn command_failed(args: &str, stderr: &str) -> String {
+    format!("gh {args} failed with status 1: {stderr}")
+}
+
+fn config_args(repo: &str, base: &str) -> String {
+    format!(
+        "api -H Accept: application/vnd.github.raw+json repos/{repo}/contents/.shipyard/config.toml?ref={base}"
+    )
+}
+
+type StrictReader = dyn Fn(&[String]) -> Result<String, String>;
+
+/// A `gh` stand-in for the strict read: the config answers `config`, the
+/// branch reads back as `base`, and the `.shipyard` directory is absent.
+fn strict_reader(config: impl Fn(&str) -> String) -> impl Fn(&[String]) -> Result<String, String> {
+    move |argv: &[String]| {
+        let joined = argv.join(" ");
+        if joined.contains("contents/.shipyard/config.toml") {
+            Err(config(&joined))
+        } else if joined.contains("/branches/") {
+            Ok("main\n".to_owned())
+        } else if joined.contains("contents/.shipyard?ref=") {
+            Err(command_failed(&joined, "gh: Not Found (HTTP 404)"))
+        } else {
+            Err(format!("unexpected: {joined}"))
+        }
+    }
+}
+
+/// A clean, confirmed 404 is positive evidence that the base has no config;
+/// anything else is an unread config. The classification reads only the
+/// stderr `gh` printed, never the arguments it was given.
+#[test]
+fn the_required_read_types_absence_apart_from_an_unreadable_config() {
+    super::with_host_review_default(false, || {
+        let absent = strict_reader(|args| command_failed(args, "gh: Not Found (HTTP 404)"));
+        assert!(matches!(
+            super::read_policy_required(&absent, "owner/repo", "main"),
+            Err(super::PolicyReadError::Absent(_))
+        ));
+        let cases: [(&str, Box<StrictReader>); 3] = [
+            (
+                "a 502 on a repository and ref named 404",
+                Box::new(strict_reader(|_| {
+                    command_failed(
+                        &config_args("owner/404-tools", "rel-404"),
+                        "HTTP 502: Bad Gateway (https://api.github.com/repos/owner/404-tools)",
+                    )
+                })),
+            ),
+            (
+                "a token-mint 404",
+                Box::new(strict_reader(|args| {
+                    command_failed(
+                        args,
+                        "ghapp: could not mint an installation token\ngh: Not Found (HTTP 404)",
+                    )
+                })),
+            ),
+            (
+                "a 404 without gh's not-found line",
+                Box::new(strict_reader(|args| {
+                    command_failed(args, "HTTP 404: Not Found")
+                })),
+            ),
+        ];
+        for (shape, reader) in &cases {
+            assert!(
+                matches!(
+                    super::read_policy_required(reader.as_ref(), "owner/404-tools", "main"),
+                    Err(super::PolicyReadError::Unreadable(_))
+                ),
+                "{shape}"
+            );
+        }
+        let garbled = |_: &[String]| -> Result<String, String> { Ok("not = [toml".to_owned()) };
+        assert!(matches!(
+            super::read_policy_required(&garbled, "owner/repo", "main"),
+            Err(super::PolicyReadError::Unreadable(_))
+        ));
+    });
+}
+
+/// A clean 404 counts as absence only when a second, independent read agrees.
+#[test]
+fn absence_needs_a_confirming_read() {
+    let not_found = |args: &str| command_failed(args, "gh: Not Found (HTTP 404)");
+    super::with_host_review_default(false, || {
+        let branch_unreadable = |argv: &[String]| -> Result<String, String> {
+            let joined = argv.join(" ");
+            if joined.contains("/branches/") {
+                Err(command_failed(&joined, "HTTP 502: Bad Gateway"))
+            } else {
+                Err(not_found(&joined))
+            }
+        };
+        let lists_config = |argv: &[String]| -> Result<String, String> {
+            let joined = argv.join(" ");
+            if joined.contains("/branches/") {
+                Ok("main\n".to_owned())
+            } else if joined.contains("contents/.shipyard?ref=") {
+                Ok("config.toml\n".to_owned())
+            } else {
+                Err(not_found(&joined))
+            }
+        };
+        let other_files = |argv: &[String]| -> Result<String, String> {
+            let joined = argv.join(" ");
+            if joined.contains("/branches/") {
+                Ok("main\n".to_owned())
+            } else if joined.contains("contents/.shipyard?ref=") {
+                Ok("signers.toml\n".to_owned())
+            } else {
+                Err(not_found(&joined))
+            }
+        };
+        for (shape, reader) in [
+            ("branch unreadable", &branch_unreadable as super::RunGh<'_>),
+            ("directory lists config.toml", &lists_config),
+        ] {
+            assert!(
+                matches!(
+                    super::read_policy_required(reader, "owner/repo", "main"),
+                    Err(super::PolicyReadError::Unreadable(_))
+                ),
+                "{shape}"
+            );
+        }
+        assert!(matches!(
+            super::read_policy_required(&other_files, "owner/repo", "main"),
+            Err(super::PolicyReadError::Absent(_))
+        ));
+    });
+}
+
+#[test]
+fn the_http_status_is_read_from_stderr_only() {
+    assert_eq!(
+        super::gh_error_http_status(&command_failed(
+            &config_args("owner/repo-404", "404"),
+            "HTTP 502: Bad Gateway"
+        )),
+        Some(502)
+    );
+    assert_eq!(
+        super::gh_error_http_status(&command_failed(
+            &config_args("o/r", "main"),
+            "gh: Not Found (HTTP 404)"
+        )),
+        Some(404)
+    );
+    assert_eq!(
+        super::gh_error_http_status(&command_failed(&config_args("o/r404", "404"), "timeout")),
+        None
+    );
+}
+
 #[test]
 fn a_missing_config_on_a_listed_repository_follows_the_host_switch() {
     let missing =

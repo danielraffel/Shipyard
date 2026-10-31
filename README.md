@@ -59,6 +59,13 @@ Shipyard chooses targets and records exact-head evidence
 Shipyard reports the evidence; GitHub owns merge order
 ```
 
+Together they can drain a repository on their own: agents open pull requests,
+a reviewer approves exact heads, and Shipyard's steward hands each approved,
+green head to GitHub's merge queue (or merges it directly where there is no
+queue) while TartCI and GitHub-hosted runners do the testing.
+[Draining pull requests automatically](docs/automated-draining.md) explains the
+whole loop, how to set it up, what to tell your agents, and when not to use it.
+
 [TartCI](https://github.com/danielraffel/tartci) is the execution layer in
 this pairing. It owns the VM images, host budgets, caches, and GitHub runner
 lifecycle. 
@@ -194,10 +201,13 @@ Start here:
 - [Installation](docs/install.md): binaries, source builds, and first-run auth.
 - [Examples](docs/examples.md): common project and target configurations.
 - [Targets](docs/targets.md): local, SSH, cloud, and fallback targets.
+- [exe.dev](docs/exe-dev.md): using an exe.dev Linux VM as an SSH target.
 - [CLI reference](docs/cli-reference.md): every command and option.
 
 For specific workflows:
 
+- [Draining pull requests automatically](docs/automated-draining.md): how
+  Shipyard, TartCI and GitHub merge agent pull requests without babysitting.
 - [Agent integration](docs/agent-integration.md): Claude Code, Codex, and
   handoff patterns.
 - [Landing model](docs/landing-model.md): exact-head evidence and merge-queue
@@ -229,30 +239,13 @@ You need only the tools used by your setup:
 Run `shipyard doctor` to check the tools and credentials for the current
 configuration.
 
-Shipyard stores optional CI timing data in its local SQLite metrics database so
-scorecards can measure queueing, waste, and rework. `shipyard cleanup --apply`
-keeps raw samples for 90 days by default; set
-`SHIPYARD_METRICS_RETENTION_DAYS` to another number, or `0` to disable pruning.
-Invalid, negative, or excessively large values fail cleanup closed.
-Merge receipts are retained as durable provenance. A producer can hand them to
-an observer with `shipyard metrics export merge-receipt --repo <owner/repo>
---file <handoff.jsonl>`; the export is repository-scoped, atomic, and reads
-only receipts already persisted by Shipyard. It fails without replacing the
-handoff when no receipt exists. A governed transport can instead use
-`--stdout`; that mode emits only canonical JSONL receipt records and writes no
-summary to stdout.
-
-The optional `scripts/collect_baseline.py` collector keeps diagnostic status
-observations for 14 days, capped at 1,024 entries, to bound accumulated
-scorecards and import details. Increase `--state-retention-days` and
-`--state-max-observations` for a longer history. These limits do not change
-readiness, which uses the separate prospective pass history. Omit `--collect`
-to skip this collector's provider imports; this does not disable other
-Shipyard telemetry.
+Metrics storage, retention limits, and the `SHIPYARD_OBSERVATIONS` switch are in
+[Installation](docs/install.md#requirements-and-optional-tools).
 
 ## This repository uses Shipyard
 
-Shipyard validates itself on macOS, Linux, and Windows. The workflows and
+Shipyard validates itself on macOS by default; Linux and Windows lanes run when
+`CI_PLATFORM_FOCUS=all` is set. The workflows and
 project configuration are in [`.shipyard/config.toml`](https://github.com/danielraffel/Shipyard/blob/main/.shipyard/config.toml)
 and [`.github/workflows/`](https://github.com/danielraffel/Shipyard/tree/main/.github/workflows). Release details are in
 [RELEASING.md](RELEASING.md).

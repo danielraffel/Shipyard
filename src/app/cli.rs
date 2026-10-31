@@ -515,6 +515,14 @@ pub(super) enum Command {
         #[arg(long)]
         no_rebase_carry: bool,
     },
+    /// Acquire, validate, or revoke a durable reviewer claim for one exact
+    /// pull-request head. Claim acquisition publishes the configured
+    /// `shipyard-reviewer-claim/v1` check-run receipt through the App client.
+    ReviewerClaim {
+        /// Reviewer claim operation.
+        #[command(subcommand)]
+        command: ReviewerClaimCommand,
+    },
     /// Land several approved pull requests as one tested merge: a rollup.
     ///
     /// Off unless the base's `.shipyard/config.toml` sets `[train]
@@ -995,6 +1003,70 @@ pub(super) enum Command {
     },
 }
 
+/// Durable reviewer claim operations.
+#[derive(Clone, Debug, Subcommand)]
+pub(super) enum ReviewerClaimCommand {
+    /// Claim the exact current head and publish its receipt.
+    Acquire {
+        /// Pull request number.
+        #[arg(long)]
+        pr: u64,
+        /// Exact OWNER/REPO. Defaults to the origin remote.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+        /// Exact 40-character pull-request head.
+        #[arg(long)]
+        head: String,
+        /// Stable reviewer identity. This must match the later verdict signer.
+        #[arg(long)]
+        reviewer: String,
+        /// Claim lifetime in seconds.
+        #[arg(long, default_value_t = 1800)]
+        deadline_seconds: i64,
+        /// Receipt check-run name. It is fixed to `reviewer-claim`, which the
+        /// base's `[auto_merge] reviewer_claim_receipt` must name.
+        #[arg(long, default_value = crate::reviewer_receipt::REVIEWER_CLAIM_CHECK_NAME)]
+        check_name: String,
+    },
+    /// Check whether a reviewer may publish a verdict now.
+    Validate {
+        /// Pull request number.
+        #[arg(long)]
+        pr: u64,
+        /// Exact OWNER/REPO. Defaults to the origin remote.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+        /// Exact 40-character pull-request head.
+        #[arg(long)]
+        head: String,
+        /// Stable reviewer identity.
+        #[arg(long)]
+        reviewer: String,
+    },
+    /// Explicitly revoke a current reviewer claim (currently unavailable until
+    /// authenticated App receipt invalidation is exposed).
+    Revoke {
+        /// Pull request number.
+        #[arg(long)]
+        pr: u64,
+        /// Exact OWNER/REPO. Defaults to the origin remote.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+        /// Exact 40-character pull-request head.
+        #[arg(long)]
+        head: String,
+        /// Claim epoch returned by `acquire`.
+        #[arg(long)]
+        epoch: u64,
+        /// Stable reviewer identity.
+        #[arg(long)]
+        reviewer: String,
+        /// Receipt check-run name to invalidate with the claim.
+        #[arg(long, default_value = crate::reviewer_receipt::REVIEWER_CLAIM_CHECK_NAME)]
+        check_name: String,
+    },
+}
+
 #[derive(Debug, Subcommand)]
 pub(super) enum EvidenceCommand {
     /// Show command-evidence bundles produced by `shipyard run command`.
@@ -1282,7 +1354,7 @@ pub(crate) enum MetricsCommand {
     Import {
         /// Import source.
         #[command(subcommand)]
-        source: MetricsImportCommand,
+        source: Box<MetricsImportCommand>,
     },
     /// Export producer-bound records for an explicit handoff.
     Export {
@@ -1319,6 +1391,9 @@ pub(crate) enum MetricsCommand {
     /// `queue_wait_per_job_ahead_ms` = median of wait / (1 + jobs of the same
     /// lane queued earlier and still waiting).
     /// `cache_hit_rate` = jobs whose every reported step hit / jobs reporting.
+    /// `--before` bounds the earlier side to [split-before, split), while
+    /// `--after` bounds the later side to [split, split+after); neither moves
+    /// the `--split-days-ago` point. Both intervals are half-open.
     #[command(verbatim_doc_comment)]
     Compare(MetricsCompareArgs),
     /// Show recent rows plus each job class's earlier-half vs later-half
@@ -1884,6 +1959,10 @@ pub(crate) struct PrWatchRulesSource {
     /// An approved head nobody armed is reported after this long.
     #[arg(long = "approved-unarmed-after", default_value = "15m")]
     pub(crate) approved_unarmed_after: String,
+    /// A HOLD on the current head that nothing was pushed to answer is
+    /// reported after this long.
+    #[arg(long = "held-after", default_value = "60m")]
+    pub(crate) held_after: String,
     /// `OWNER/REPO=NAME`: the reviewer a head of that repository is routed
     /// to; each event's `fix` names it. Repeatable.
     #[arg(long = "reviewer")]
@@ -2074,6 +2153,8 @@ pub(crate) enum MetricsImportCommand {
     Github(MetricsImportGithubArgs),
     /// Import producer-self-asserted, format-validated protected-branch merge receipts (JSON/JSONL).
     MergeReceipt(MetricsImportMergeReceiptArgs),
+    /// Reconcile one Pulp merge-group artifact with complete GitHub snapshots and import its receipt.
+    GithubMergeReceipt(Box<MetricsImportGithubMergeReceiptArgs>),
 }
 
 #[derive(Debug, Subcommand)]
@@ -2209,6 +2290,49 @@ pub(crate) struct MetricsImportMergeReceiptArgs {
 }
 
 #[derive(Debug, Args)]
+pub(crate) struct MetricsImportGithubMergeReceiptArgs {
+    /// Exact owner/repo slug.
+    #[arg(long)]
+    pub(crate) repo: String,
+    /// Metrics project key.
+    #[arg(long)]
+    pub(crate) project: String,
+    /// Protected base branch.
+    #[arg(long, default_value = "main")]
+    pub(crate) base_branch: String,
+    /// Extracted Pulp `job.json` artifact.
+    #[arg(long)]
+    pub(crate) artifact: PathBuf,
+    /// Complete GitHub workflow-run JSON snapshot.
+    #[arg(long)]
+    pub(crate) run: PathBuf,
+    /// GitHub pull-request JSON snapshot.
+    #[arg(long = "pull-request")]
+    pub(crate) pull_request: PathBuf,
+    /// Complete check-runs snapshot with `complete: true`.
+    #[arg(long)]
+    pub(crate) checks: PathBuf,
+    /// Normalized branch-protection/ruleset required-check policy snapshot.
+    #[arg(long)]
+    pub(crate) required_check_policy: PathBuf,
+    /// Immutable GitHub artifact URL.
+    #[arg(long)]
+    pub(crate) artifact_url: String,
+    /// GitHub workflow-run URL; must match the run snapshot.
+    #[arg(long)]
+    pub(crate) run_url: String,
+    /// SHA-256 of the reviewed gate policy.
+    #[arg(long)]
+    pub(crate) policy_sha256: String,
+    /// SHA-256 of the collector implementation.
+    #[arg(long)]
+    pub(crate) collector_sha256: String,
+    /// Exact required check name; repeat for every required check.
+    #[arg(long = "required-check")]
+    pub(crate) required_checks: Vec<String>,
+}
+
+#[derive(Debug, Args)]
 pub(crate) struct MetricsImportGithubArgs {
     /// Owner/repo slug.
     #[arg(long)]
@@ -2263,10 +2387,10 @@ pub(crate) struct MetricsCompareArgs {
     /// Optional lane key for agent context.
     #[arg(long)]
     pub(crate) lane: Option<String>,
-    /// Before window, for example `7d`.
+    /// Limit the before side to this window ending at the split, for example `7d`.
     #[arg(long)]
     pub(crate) before: Option<String>,
-    /// After window, for example `7d`.
+    /// Limit the after side to this window starting at the split, for example `7d`.
     #[arg(long)]
     pub(crate) after: Option<String>,
     /// Split point in days ago. Older rows are before; newer rows are after.
