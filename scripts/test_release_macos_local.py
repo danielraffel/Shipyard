@@ -797,6 +797,167 @@ class ReleaseMacosLocalTests(unittest.TestCase):
             )
 
 
+class DraftRunner(FakeRunner):
+    """A draft release whose identity manifest persists across uploads."""
+
+    def __init__(self, manifest: dict[str, object]) -> None:
+        super().__init__(assets=["shipyard-release-manifest.json", "checksums.sha256"])
+        self.manifest = manifest
+
+    def run(self, args: list[str], **kwargs: object) -> str:
+        if args[:4] == ["gh", "release", "download", "--repo"] and (
+            args[args.index("--pattern") + 1] == "shipyard-release-manifest.json"
+        ):
+            Path(args[args.index("--output") + 1]).write_text(
+                json.dumps(self.manifest), encoding="utf-8"
+            )
+            return ""
+        if args[:3] == ["gh", "release", "upload"]:
+            uploaded = Path(args[6])
+            if uploaded.name == "shipyard-release-manifest.json":
+                self.manifest = json.loads(uploaded.read_text(encoding="utf-8"))
+            self.commands.append(args)
+            return ""
+        return super().run(args, **kwargs)
+
+
+def _entry(name: str, payload: bytes) -> dict[str, object]:
+    return {"name": name, "bytes": len(payload), "sha256": hashlib.sha256(payload).hexdigest()}
+
+
+def v0383_shaped_manifest(commit: str) -> dict[str, object]:
+    """Both Linux targets list their own per-target checksums.sha256."""
+    return {
+        "schema_version": 1,
+        "source": {
+            "repository": "danielraffel/Shipyard",
+            "tag": "v0.1.0",
+            "commit": commit,
+            "run_id": 7,
+            "run_attempt": 1,
+        },
+        "artifacts": [
+            {
+                "target": "linux-x64",
+                "artifact_id": "1",
+                "artifact_digest": "a" * 64,
+                "files": [
+                    _entry("checksums.sha256", b"x64 sums"),
+                    _entry("shipyard-linux-x64", b"fixture:shipyard-linux-x64\n"),
+                ],
+            },
+            {
+                "target": "linux-arm64",
+                "artifact_id": "2",
+                "artifact_digest": "b" * 64,
+                "files": [
+                    _entry("checksums.sha256", b"arm64 sums!"),
+                    _entry("shipyard-linux-arm64", b"fixture:shipyard-linux-arm64\n"),
+                ],
+            },
+        ],
+    }
+
+
+class IdempotentDraftManifestTests(unittest.TestCase):
+    def _config(self, root: Path) -> release_macos_local.ReleaseConfig:
+        return release_macos_local.ReleaseConfig(
+            tag="v0.1.0",
+            repo="danielraffel/Shipyard",
+            artifact_prefix="shipyard",
+            dist_dir=root,
+            upload=True,
+            ci_mode=True,
+            skip_build=True,
+            binary=None,
+            cargo_target=None,
+        )
+
+    def test_second_run_into_existing_draft_keeps_one_entry_per_asset(self) -> None:
+        with tempfile.TemporaryDirectory() as temp, mock.patch.dict(
+            os.environ, {"GITHUB_SHA": "c" * 40}
+        ), redirect_stderr(StringIO()):
+            root = Path(temp)
+            dmg = root / "shipyard-macos-arm64.dmg"
+            runner = DraftRunner(v0383_shaped_manifest("c" * 40))
+            dmg.write_bytes(b"first signed dmg")
+            release_macos_local.merge_release_identity_manifest(self._config(root), dmg, runner)
+            dmg.write_bytes(b"second signed dmg, notarized again")
+            release_macos_local.merge_release_identity_manifest(self._config(root), dmg, runner)
+
+            files = [
+                entry
+                for artifact in runner.manifest["artifacts"]
+                for entry in artifact["files"]
+            ]
+            names = [entry["name"] for entry in files]
+            self.assertEqual(len(names), len(set(names)), names)
+            self.assertNotIn("checksums.sha256", names)
+            self.assertEqual(
+                sorted(names),
+                ["shipyard-linux-arm64", "shipyard-linux-x64", "shipyard-macos-arm64.dmg"],
+            )
+            dmg_entry = next(e for e in files if e["name"] == "shipyard-macos-arm64.dmg")
+            self.assertEqual(dmg_entry, _entry("shipyard-macos-arm64.dmg", dmg.read_bytes()))
+            self.assertEqual(
+                [a["target"] for a in runner.manifest["artifacts"]].count("macos-arm64"), 1
+            )
+
+    def test_publish_gate_accepts_the_v0383_metadata_repeat(self) -> None:
+        commit = "c" * 40
+        runner = DraftRunner(v0383_shaped_manifest(commit))
+        runner.assets = ["shipyard-linux-x64", "shipyard-linux-arm64"]
+        runner.payloads = {
+            name: f"fixture:{name}\n".encode("utf-8") for name in runner.assets
+        }
+        runner.checksum_names = list(runner.assets)
+        stderr = StringIO()
+        with mock.patch.dict(os.environ, {"GITHUB_SHA": commit}), redirect_stderr(stderr):
+            release_macos_local.verify_release_identity_manifest(
+                self._config(Path(".")), ("shipyard-linux-x64", "shipyard-linux-arm64"), runner
+            )
+        self.assertIn("dropped release metadata entry checksums.sha256", stderr.getvalue())
+
+    def test_publish_gate_names_each_conflicting_duplicate(self) -> None:
+        commit = "c" * 40
+        document = v0383_shaped_manifest(commit)
+        document["artifacts"][1]["files"].append(_entry("shipyard-linux-x64", b"stale bytes"))
+        runner = DraftRunner(document)
+        with mock.patch.dict(os.environ, {"GITHUB_SHA": commit}), redirect_stderr(StringIO()):
+            with self.assertRaises(SystemExit) as ctx:
+                release_macos_local.verify_release_identity_manifest(
+                    self._config(Path(".")), ("shipyard-linux-x64",), runner
+                )
+        message = str(ctx.exception)
+        self.assertIn("conflicting contents for the same asset", message)
+        self.assertIn(
+            "linux-x64: 27 bytes sha256="
+            + hashlib.sha256(b"fixture:shipyard-linux-x64\n").hexdigest(),
+            message,
+        )
+        self.assertIn(
+            "linux-arm64: 11 bytes sha256=" + hashlib.sha256(b"stale bytes").hexdigest(), message
+        )
+
+    def test_publish_gate_reports_every_mismatched_asset(self) -> None:
+        commit = "c" * 40
+        document = v0383_shaped_manifest(commit)
+        runner = DraftRunner(document)
+        runner.payloads = {
+            "shipyard-linux-x64": b"replaced x64\n",
+            "shipyard-linux-arm64": b"replaced arm64\n",
+        }
+        with mock.patch.dict(os.environ, {"GITHUB_SHA": commit}), redirect_stderr(StringIO()):
+            with self.assertRaises(SystemExit) as ctx:
+                release_macos_local.verify_release_identity_manifest(
+                    self._config(Path(".")), ("shipyard-linux-x64",), runner
+                )
+        message = str(ctx.exception)
+        self.assertIn("does not match identity manifest", message)
+        self.assertIn("shipyard-linux-x64: manifest", message)
+        self.assertIn("shipyard-linux-arm64: manifest", message)
+
+
 class FleetRolloutStageTests(unittest.TestCase):
     def config(self, **overrides: object) -> release_macos_local.ReleaseConfig:
         values: dict[str, object] = dict(

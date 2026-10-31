@@ -817,6 +817,16 @@ after a 20 minute grace, at most 3 attempts, then fails naming the failing
 steps (`scripts/release_draft_heal.py`). The signing job's Rust install retries
 3 times because the self-hosted runner has lost `static.rust-lang.org` for
 minutes at a time (v0.381.0, v0.383.0).
+The identity manifest (`shipyard-release-manifest.json`) names each published
+asset once. Each per-target package directory holds its own unpublished
+`checksums.sha256`; v0.383.0's manifest listed both Linux copies, and
+`--publish-only` refused it ("repeats asset: checksums.sha256") after signing,
+notarization and attestation had passed. Generation now drops release
+metadata names, collapses identical repeats, and fails listing every entry
+when two disagree. A rerun into an existing draft replaces the macOS entry
+instead of appending. The rerun executes the tag's scripts, so a draft built
+by an older tag must have its manifest corrected on the draft before a rerun
+can pass.
 The live GitHub smoke uses a dedicated read-only token when configured and
 otherwise the Actions job token; never route the write-capable release-bot
 credential to the binary under test. The smoke remains fail-closed.

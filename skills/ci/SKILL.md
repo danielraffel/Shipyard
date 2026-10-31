@@ -979,6 +979,16 @@ volume was busy. `detach_dmg` now retries, forces the last attempt, and names
 the refusal. A failed run can still leave the image mounted under
 `$TMPDIR/shipyard-dmg-*/mnt` on the runner host; `hdiutil detach` it there.
 Rerunning the failed job is safe.
+The identity manifest (`shipyard-release-manifest.json`) names each published
+asset once. Each per-target package directory holds its own unpublished
+`checksums.sha256`; v0.383.0's manifest listed both Linux copies, and
+`--publish-only` refused it ("repeats asset: checksums.sha256") after signing,
+notarization and attestation had passed. Generation now drops release
+metadata names, collapses identical repeats, and fails listing every entry
+when two disagree. A rerun into an existing draft replaces the macOS entry
+instead of appending. The rerun executes the tag's scripts, so a draft built
+by an older tag must have its manifest corrected on the draft before a rerun
+can pass.
 
 **No draft exists until the live smoke passes.** `release.yml`'s `release` job
 needs `live-smoke`, which runs `scripts/release_live_smoke.py` on the built
