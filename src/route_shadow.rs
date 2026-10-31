@@ -623,6 +623,10 @@ pub fn record_scheduler_observation_best_effort(
     leases: &[HostPoolLease],
     observed_at: DateTime<Utc>,
 ) {
+    if !crate::observations::AutomaticObservations::from_env().enabled() {
+        return;
+    }
+
     let Some(snapshot) = scheduler_snapshot(job_id, target, leases, observed_at) else {
         return;
     };
@@ -656,6 +660,10 @@ pub fn record_dispatch_observation_best_effort(
     route_attempts: &[RouteAttempt],
     observed_at: DateTime<Utc>,
 ) {
+    if !crate::observations::AutomaticObservations::from_env().enabled() {
+        return;
+    }
+
     let Some(pending) =
         dispatch_observation(state_dir, job_id, target, route_attempts, observed_at)
     else {
@@ -720,6 +728,19 @@ fn observation_sender() -> Option<&'static SyncSender<PendingObservation>> {
 
 /// Persist one queued observation. Runs only on the background writer.
 fn write_pending_observation(pending: PendingObservation) {
+    write_pending_observation_with_policy(
+        pending,
+        crate::observations::AutomaticObservations::from_env(),
+    );
+}
+
+fn write_pending_observation_with_policy(
+    pending: PendingObservation,
+    observations: crate::observations::AutomaticObservations,
+) {
+    if !observations.enabled() {
+        return;
+    }
     let store = RouteShadowReceiptStore::new(pending.state_dir);
     if pending
         .observation
@@ -1306,6 +1327,64 @@ mod tests {
             validation: ResolvedValidation::HostPool,
             failure_parser: None,
         }
+    }
+
+    #[test]
+    fn optional_observations_stop_route_sink_and_existing_receipt_attachment() {
+        let temp = tempfile::tempdir().unwrap();
+        let snapshot = snapshot(vec![candidate(
+            "primary",
+            "macos",
+            "macos",
+            &["macos", "arm64"],
+            RouteAvailability::Available,
+        )]);
+        let observation = RouteShadowObservation {
+            correlation_id: snapshot.request_id.clone(),
+            snapshot,
+            observed_at: Utc::now(),
+            freshness: Duration::minutes(5),
+            capability_provenance: "shipyard.scheduler.test".into(),
+            route_attempts: None,
+        };
+        let pending = |observation| super::PendingObservation {
+            state_dir: temp.path().to_path_buf(),
+            observation,
+        };
+        let off = crate::observations::AutomaticObservations::from_value(Some("OFF"));
+        let on = crate::observations::AutomaticObservations::from_value(None);
+        super::write_pending_observation_with_policy(pending(observation.clone()), off);
+        assert!(!temp.path().join("route_shadow").exists());
+        super::write_pending_observation_with_policy(pending(observation.clone()), on);
+        let store = RouteShadowReceiptStore::new(temp.path());
+        let path = store.path_for(&observation.correlation_id);
+        let before = std::fs::read(&path).unwrap();
+        let mut dispatched = observation;
+        dispatched.route_attempts = Some(vec![crate::job::RouteAttempt {
+            route_id: "primary".into(),
+            position: 0,
+            outcome: crate::job::TargetStatus::Pass,
+            attempted_at: Utc::now(),
+        }]);
+        super::write_pending_observation_with_policy(pending(dispatched.clone()), off);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let original = store.load(&dispatched.correlation_id).unwrap().unwrap();
+        assert!(
+            original
+                .observation
+                .as_ref()
+                .unwrap()
+                .dispatch_attempts
+                .is_none()
+        );
+        super::write_pending_observation_with_policy(pending(dispatched.clone()), on);
+        let attached = store.load(&dispatched.correlation_id).unwrap().unwrap();
+        assert_eq!(attached.authoritative_route, original.authoritative_route);
+        assert_eq!(attached.counterfactuals, original.counterfactuals);
+        assert_eq!(
+            attached.observation.unwrap().dispatch_attempts,
+            dispatched.route_attempts
+        );
     }
 
     #[test]

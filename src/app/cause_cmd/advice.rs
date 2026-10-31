@@ -187,6 +187,7 @@ fn advise(
     windows: &[Window],
 ) -> Result<(Vec<Candidate>, usize), CliFailure> {
     super::require_archive_parent(&args.dir).map_err(|error| CliFailure::new(2, error))?;
+    let _lock = super::lock_archive(&args.dir, false).map_err(|error| CliFailure::new(1, error))?;
     let rows = read_causes(&args.dir.join("causes"))?;
     let fixlinks = read_fixlinks(&args.dir.join("fixlinks.jsonl"))?;
     let needle = tokens(&args.query);

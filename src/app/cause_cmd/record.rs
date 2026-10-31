@@ -402,14 +402,17 @@ fn linked_fixlinks(dir: &Path) -> Result<BTreeSet<(String, u64, u64)>, String> {
                 )
             })?;
             let red_attempt = match row.get("red_attempt") {
-                None => 1,
-                Some(value) => value.as_u64().ok_or_else(|| {
-                    format!(
-                        "{} row {}: fix-link red_attempt must be an integer",
-                        path.display(),
-                        index + 1
-                    )
-                })?,
+                None | Some(Value::Null) => 1,
+                Some(value) => value
+                    .as_u64()
+                    .filter(|attempt| *attempt != 0)
+                    .ok_or_else(|| {
+                        format!(
+                            "{} row {}: fix-link red_attempt must be a non-zero integer",
+                            path.display(),
+                            index + 1
+                        )
+                    })?,
             };
             if !super::advice::link_identity_complete(&row) {
                 return Ok(None);
@@ -571,15 +574,19 @@ fn may_hold_red(run: &Value) -> bool {
     }
 }
 
-/// One pass: causes for new red jobs, then fix-links for reds now green.
-#[allow(clippy::too_many_lines)] // Keep observation and the short final append transaction ordered.
-pub(super) fn record(gh: &SyncGhReader<'_>, query: &RecordQuery) -> Result<RecordReport, String> {
-    fs::create_dir_all(&query.dir).map_err(|error| error.to_string())?;
-    super::require_archive_parent(&query.dir)?;
-    let (archived, linked) = {
-        let _lock = super::lock_archive(&query.dir, false)?;
-        (archived_causes(&query.dir)?, linked_fixlinks(&query.dir)?)
-    };
+struct Observation {
+    report: RecordReport,
+    by_month: BTreeMap<String, Vec<Value>>,
+    fixlinks: Vec<Value>,
+}
+
+#[allow(clippy::too_many_lines)] // Keep bounded observation accounting in one ordered pass.
+fn observe(
+    gh: &SyncGhReader<'_>,
+    query: &RecordQuery,
+    archived: &[Value],
+    linked: &BTreeSet<(String, u64, u64)>,
+) -> Result<Observation, String> {
     let mut report = RecordReport::default();
     let mut pulls = BTreeMap::new();
     let mut incomplete_reds = BTreeSet::new();
@@ -649,7 +656,7 @@ pub(super) fn record(gh: &SyncGhReader<'_>, query: &RecordQuery) -> Result<Recor
                 }
             }
         }
-        report.inherited += labels::inherit_from_summarised(&mut run_rows, &archived);
+        report.inherited += labels::inherit_from_summarised(&mut run_rows, archived);
         for row in run_rows {
             if row["labelled_by"] == "step" {
                 report.labelled_by_step += 1;
@@ -662,9 +669,9 @@ pub(super) fn record(gh: &SyncGhReader<'_>, query: &RecordQuery) -> Result<Recor
             by_month.entry(month).or_default().push(row);
         }
     }
-    let mut all_causes = archived.clone();
+    let mut all_observed_causes = archived.to_vec();
     for rows in by_month.values() {
-        all_causes.extend(rows.iter().cloned());
+        all_observed_causes.extend(rows.iter().cloned());
     }
     let observed_fixlinks = fixlinks(
         gh,
@@ -673,14 +680,38 @@ pub(super) fn record(gh: &SyncGhReader<'_>, query: &RecordQuery) -> Result<Recor
         &incomplete_reds,
         &mut pulls,
         &mut report,
-        &linked,
-        &all_causes,
+        linked,
+        &all_observed_causes,
     )?;
-    // Network observation is complete before taking the exclusive lock. The
-    // final section only re-reads and appends, so scorecard readers are never
-    // blocked behind GitHub API calls or log downloads.
+    Ok(Observation {
+        report,
+        by_month,
+        fixlinks: observed_fixlinks,
+    })
+}
+
+/// One pass: causes for new red jobs, then fix-links for reds now green.
+#[allow(clippy::too_many_lines)] // Keep observation and the short final append transaction ordered.
+pub(super) fn record(gh: &SyncGhReader<'_>, query: &RecordQuery) -> Result<RecordReport, String> {
+    fs::create_dir_all(&query.dir).map_err(|error| error.to_string())?;
+    super::require_archive_parent(&query.dir)?;
+    super::retention::ensure_not_frozen(&query.dir)?;
+    if super::retention::has_pending_transaction(&query.dir) {
+        let _lock = super::lock_archive(&query.dir, true)?;
+    }
+    let (archived, linked) = {
+        let _lock = super::lock_archive(&query.dir, false)?;
+        super::require_archive_parent(&query.dir)?;
+        (archived_causes(&query.dir)?, linked_fixlinks(&query.dir)?)
+    };
+    let Observation {
+        mut report,
+        by_month,
+        fixlinks: observed_fixlinks,
+    } = observe(gh, query, &archived, &linked)?;
     let _lock = super::lock_archive(&query.dir, true)?;
     super::require_archive_parent(&query.dir)?;
+    super::retention::ensure_archive_marker(&query.dir, false)?;
     let final_archived = archived_causes(&query.dir)?;
     let final_linked = linked_fixlinks(&query.dir)?;
     let recorded: BTreeSet<(String, u64)> = final_archived
@@ -706,25 +737,29 @@ pub(super) fn record(gh: &SyncGhReader<'_>, query: &RecordQuery) -> Result<Recor
         }
     }
     report.causes_written = rows_to_append.values().map(Vec::len).sum();
-    for (month, rows) in &rows_to_append {
-        append(
-            &query.dir.join("causes").join(format!("{month}.jsonl")),
-            rows,
-        )?;
-    }
-    let mut seen_links = final_linked;
     let mut links_to_append = Vec::new();
+    let mut seen_links = final_linked.clone();
     for link in observed_fixlinks {
-        let attempt = link["red_attempt"].as_u64().unwrap_or(1);
+        let attempt = match link.get("red_attempt") {
+            None | Some(Value::Null) => Some(1),
+            Some(value) => value.as_u64().filter(|attempt| *attempt != 0),
+        };
         let key = link["repo"]
             .as_str()
             .zip(link["red_run_id"].as_u64())
-            .map(|(repo, run_id)| (repo.to_owned(), run_id, attempt));
+            .zip(attempt)
+            .map(|((repo, run_id), attempt)| (repo.to_owned(), run_id, attempt));
         if let Some(key) = key
             && seen_links.insert(key)
         {
             links_to_append.push(link);
         }
+    }
+    for (month, rows) in &rows_to_append {
+        append(
+            &query.dir.join("causes").join(format!("{month}.jsonl")),
+            rows,
+        )?;
     }
     append(&query.dir.join("fixlinks.jsonl"), &links_to_append)?;
     report.fixlinks_written = links_to_append.len();

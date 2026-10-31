@@ -5,6 +5,13 @@ description: "Cross-platform CI coordination with Shipyard: validates, ships, ma
 
 # CI Operations with Shipyard
 
+`SHIPYARD_OBSERVATIONS=off` (trimmed, case-insensitive) stops automatic queue
+shadow/timing, command metric copies, route-shadow receipts, daemon GitHub
+imports, and scheduled baseline collection in processes receiving it. Existing
+services need environment rollout/restart. It preserves required evidence,
+merge receipts, explicit metrics imports/record, and historical reporting;
+retention and manual cause/private-corpus collection remain separate.
+
 ## Required-check producer identity
 
 Metrics cleanup uses the existing `SHIPYARD_METRICS_RETENTION_DAYS` policy
@@ -152,6 +159,11 @@ GitHub Actions can omit `pull_requests` on `pull_request_target` runs. The
 metrics importer resolves those rows only through the exact commit's
 authoritative pull-request API response, and keeps the identity unknown when
 that response is empty or ambiguous.
+
+For a governed receipt transport, `shipyard metrics export merge-receipt
+--repo <owner/repo> --stdout` emits only canonical JSONL records. It is
+mutually exclusive with `--file` and `--json`; keep health or transport status
+on a separate channel so stdout remains machine-readable handoff bytes.
 
 ## Version-only release bumps
 
@@ -987,6 +999,11 @@ a sibling `<dir>.owner` (the run's pid). A new run first deletes dirs older than
 a live process (`ps eww`) still has as TMPDIR. A failed process listing keeps
 everything unowned. The cleanup touches nothing but `shipyard-validation-*`.
 
+The scheduled metrics retention pass is fail-closed: raw runs and expired
+fleet-capacity samples are deleted in bounded SQLite batches, and an unreadable
+metrics store makes the cleanup command fail so its receipt cannot claim a
+successful rotation.
+
 ## Version-at-land
 
 A normal PR does not edit `Cargo.toml`, `Cargo.lock`, or plugin manifest
@@ -1222,6 +1239,13 @@ writer custody before mutation.
 | Explain log/artifact retention without mutation | `shipyard cleanup` (dry-run default; includes action reasons, protected evidence, and byte watermarks) |
 | Apply bounded terminal-log retention | `shipyard cleanup --apply` (gzip closed logs; pressure-deletes successful terminal jobs only; honors `.shipyard-retain`) |
 | Serialize an indefinite incident/audit pin | `shipyard cleanup --pin <job-id>` (do not raw-`touch` the marker while cleanup can run) |
+
+Cause archives use the separate `shipyard cause prune` command. It is
+dry-run by default, age/size bounded, and fail-closed for unmarked or frozen
+archives; `--initialize` is an explicit enrollment of a mutable operational
+copy. The optional macOS cleanup installer schedules only these local,
+read-only/retention passes and records a durable receipt; it never arms,
+enqueues, merges, or posts GitHub state.
 | Wait for a release to fully upload | `shipyard wait release v0.23.0 --timeout 900 --json` |
 | Wait for a PR's required checks to go green | `shipyard wait pr 151 --state green --timeout 1800 --json` |
 | Wait for a workflow run to finish | `shipyard wait run 223344 --success --timeout 1200 --json` |

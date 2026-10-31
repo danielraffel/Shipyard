@@ -1001,6 +1001,9 @@ def main() -> int:
     parser.add_argument("--expected-interval-secs", type=int, default=3600)
     parser.add_argument("--cadence-slack-secs", type=int, default=300)
     args = parser.parse_args()
+    if args.collect and os.environ.get("SHIPYARD_OBSERVATIONS", "").strip().lower() == "off":
+        print("Automatic observation collection disabled by SHIPYARD_OBSERVATIONS=off", file=sys.stderr)
+        return 0
     if args.timeout_seconds <= 0:
         parser.error("--timeout-seconds must be positive")
     if not 0 <= args.provider_retries <= MAX_PROVIDER_RETRIES:

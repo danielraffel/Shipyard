@@ -1,4 +1,4 @@
-use std::sync::Mutex;
+use std::sync::{Arc, Barrier, Condvar, Mutex};
 
 use serde_json::{Value, json};
 
@@ -1585,4 +1585,111 @@ fn legacy_root_causes_refuse_before_github_reads() {
     assert!(fake.asked().is_empty());
     assert_eq!(std::fs::read_to_string(legacy).unwrap(), "legacy bytes\n");
     assert!(!dir.path().join("causes/2026-10.jsonl").exists());
+}
+
+#[test]
+fn record_releases_archive_lock_during_github_observation() {
+    let dir = tempfile::tempdir().expect("archive");
+    super::super::retention::initialize_archive_marker(dir.path()).expect("enroll archive");
+    // Create the lock file before the observer starts so a reader must really
+    // acquire a shared lock; an unmarked, lockless legacy directory is a
+    // separate compatibility case.
+    let guard = super::super::lock_archive(dir.path(), true).expect("lock");
+    drop(guard);
+
+    let started = Arc::new((Mutex::new(false), Condvar::new()));
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let fake = Arc::new(Fake::new(&red_routes()).with_log("jobs/1000/logs", &drift_log()));
+    let reader = {
+        let started = Arc::clone(&started);
+        let release = Arc::clone(&release);
+        let fake = Arc::clone(&fake);
+        move |args: &[String]| {
+            let path = args.last().cloned().unwrap_or_default();
+            if path.contains("runs?status=completed") {
+                let (ready, wake) = &*started;
+                *ready.lock().expect("ready lock") = true;
+                wake.notify_all();
+                let (go, wake) = &*release;
+                let mut go = go.lock().expect("release lock");
+                while !*go {
+                    go = wake.wait(go).expect("release wait");
+                }
+            }
+            fake.read(args)
+        }
+    };
+    let worker_dir = dir.path().to_path_buf();
+    let worker = std::thread::spawn(move || record(&reader, &query(&worker_dir)));
+
+    let (ready, wake) = &*started;
+    let mut ready = ready.lock().expect("ready lock");
+    while !*ready {
+        ready = wake.wait(ready).expect("ready wait");
+    }
+    // A reader must remain usable while the network pass is blocked. The old
+    // implementation held an exclusive lock here and made this wait ten
+    // seconds before refusing.
+    let reader_guard = super::super::lock_archive(dir.path(), false).expect("reader lock");
+    drop(reader_guard);
+    let (go, wake) = &*release;
+    *go.lock().expect("release lock") = true;
+    wake.notify_all();
+    worker
+        .join()
+        .expect("observer thread")
+        .expect("record pass");
+}
+
+#[test]
+fn record_recovers_an_interrupted_prune_before_observing_github() {
+    let dir = tempfile::tempdir().expect("archive");
+    super::super::retention::initialize_archive_marker(dir.path()).expect("enroll archive");
+    std::fs::create_dir_all(dir.path().join(".prune-txn/old")).expect("pending transaction");
+    std::fs::create_dir(dir.path().join(".prune-txn/new")).expect("pending transaction");
+
+    let fake = Fake::new(&red_routes()).with_log("jobs/1000/logs", &drift_log());
+    let gh = |args: &[String]| fake.read(args);
+    record(&gh, &query(dir.path())).expect("record pass");
+
+    assert!(!dir.path().join(".prune-txn").exists());
+    assert_eq!(rows(&dir.path().join("causes/2026-10.jsonl")).len(), 1);
+}
+
+#[test]
+fn overlapping_record_passes_serialize_the_final_append() {
+    let dir = tempfile::tempdir().expect("archive");
+    super::super::retention::initialize_archive_marker(dir.path()).expect("enroll archive");
+    let guard = super::super::lock_archive(dir.path(), true).expect("lock");
+    drop(guard);
+
+    let fake = Arc::new(Fake::new(&red_routes()).with_log("jobs/1000/logs", &drift_log()));
+    let barrier = Arc::new(Barrier::new(2));
+    let mut workers = Vec::new();
+    for _ in 0..2 {
+        let dir = dir.path().to_path_buf();
+        let fake = Arc::clone(&fake);
+        let barrier = Arc::clone(&barrier);
+        workers.push(std::thread::spawn(move || {
+            let reader = move |args: &[String]| {
+                let path = args.last().cloned().unwrap_or_default();
+                if path.contains("runs?status=completed") {
+                    barrier.wait();
+                }
+                fake.read(args)
+            };
+            record(&reader, &query(&dir))
+        }));
+    }
+    for worker in workers {
+        worker
+            .join()
+            .expect("observer thread")
+            .expect("record pass");
+    }
+    assert_eq!(
+        rows(&dir.path().join("causes/2026-10.jsonl")).len(),
+        1,
+        "the final exclusive section must deduplicate overlapping passes"
+    );
 }

@@ -5,6 +5,13 @@ description: Shipyard operations guardrails. Use when working in /Users/danielra
 
 # Shipyard
 
+`SHIPYARD_OBSERVATIONS=off` (trimmed, case-insensitive) stops automatic queue
+shadow/timing, command metric copies, route-shadow receipts, daemon GitHub
+imports, and scheduled baseline collection in processes receiving it. Existing
+services need environment rollout/restart. It preserves required evidence,
+merge receipts, explicit metrics imports/record, and historical reporting;
+retention and manual cause/private-corpus collection remain separate.
+
 The gate-cost scorecard can read a bounded historical cause archive with
 `--causes-archive DIR`; the report labels that source as archive and keeps
 malformed, duplicate, truncated, and unjoined rows visible. This is advisory
@@ -26,6 +33,11 @@ authenticated queue timing table within its explicit `--since` window. It
 counts each distinct superseded job once, reports clean versus
 uncertain/cancelled/unmatched coverage, and never treats survivor runtime as
 savings. It never turns this evidence into a queue or merge decision.
+
+The producer-side merge-receipt export supports an explicit `--stdout` stream
+mode for a governed transport. It emits canonical JSONL receipt records only;
+`--file` remains the atomic handoff mode, and `--stdout` cannot be combined
+with `--file` or `--json`.
 
 The failure-learning observer is intentionally independent of baseline
 collection. On macOS, use `scripts/install_cause_observer.sh` to render a
@@ -3903,6 +3915,16 @@ everything.
 
 ### Log retention operations
 
+The bounded cause archive has an explicit `shipyard cause prune` path. It is
+dry-run by default and refuses to mutate an archive until an operator has
+enrolled that mutable operational copy with `--initialize`; frozen or
+unavailable archives remain readable and are never guessed at. On macOS,
+`scripts/install_cleanup.sh` can install the per-user launchd schedule for the
+existing dry-run/apply cleanup passes. Review the rendered plan before using
+`--install`; each run writes a bounded receipt and a failed pass remains
+visible to `shipyard doctor` until a later pass succeeds. This schedule never
+changes queue or GitHub state.
+
 Metrics cleanup uses the existing `SHIPYARD_METRICS_RETENTION_DAYS` policy
 (default 90; nonpositive disables pruning, not collection). It also expires
 queue shadow observations and terminal timing, preserving timing referenced by
@@ -3919,6 +3941,10 @@ do not raw-`touch` it while cleanup may run. Failure and unclassified legacy
 evidence is never pressure-deleted. Current Phase 1 rotation is lossless at
 writer reopen boundaries; do not use external `copytruncate` against active
 Shipyard writers. Full continuously-active writer rotation remains Phase 2.
+
+Metrics retention is bounded as well: raw runs and expired fleet-capacity
+samples are deleted in small SQLite transactions, and a metrics-store failure
+fails `cleanup` closed so scheduled receipts cannot report a false success.
 
 ## GraphQL And GitHub App Fallback Behaviour
 
