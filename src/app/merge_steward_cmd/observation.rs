@@ -98,6 +98,40 @@ pub(super) fn observe_repo(
     })
 }
 
+/// The repository facts that decide how a head is admitted, without the
+/// pull-request and run census `observe_repo` also loads.
+pub(super) fn admission_policy(
+    actions: &GitHubActions,
+    repo: &str,
+    base: &str,
+) -> Result<crate::merge_steward::StewardPolicy, String> {
+    let settings = gh_json(
+        actions,
+        &["api".to_owned(), format!("repos/{repo}")],
+        "repository settings",
+    )?;
+    let repo = canonical_repo_name(&settings)?;
+    let allow_auto_merge = settings
+        .get("allow_auto_merge")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let evaluated_rules = evaluated_branch_rules(actions, &repo, base)?;
+    let required_checks =
+        required_checks_with_evaluated_rules(actions, &repo, base, &evaluated_rules)?;
+    let (merge_queue, ..) = merge_queue_snapshot(actions, &repo, base)?;
+    Ok(crate::merge_steward::StewardPolicy {
+        merge_queue,
+        native_auto_merge: allow_auto_merge,
+        approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
+        required_checks,
+        opt_out_label: String::new(),
+        provenance_blocking_labels: Vec::new(),
+        managed_label: None,
+        handoff_context: String::new(),
+        max_transient_reruns: 0,
+    })
+}
+
 pub(super) fn canonical_repo_name(settings: &Value) -> Result<String, String> {
     let full_name = settings
         .get("full_name")
@@ -281,6 +315,10 @@ fn load_merge_queue_snapshot_once(
     base: &str,
     deadline: Option<Instant>,
 ) -> Result<(MergeQueueSnapshot, usize), String> {
+    // `gh api graphql` has no `--repo` flag. Scope the authenticated client
+    // instead so repository-specific token helpers still receive provenance
+    // while the argv remains valid for the native GitHub CLI.
+    let actions = actions.clone().with_repo_override(repo);
     let (owner, name) = repo
         .split_once('/')
         .ok_or_else(|| format!("invalid repository slug `{repo}`"))?;
@@ -306,7 +344,7 @@ fn load_merge_queue_snapshot_once(
         if let Some(cursor) = cursor.as_deref() {
             args.extend(["-F".to_owned(), format!("cursor={cursor}")]);
         }
-        let value = match gh_json_with_deadline(actions, &args, "merge-queue policy", deadline) {
+        let value = match gh_json_with_deadline(&actions, &args, "merge-queue policy", deadline) {
             Ok(value) => value,
             Err(error) if page == 1 && is_private_free_entitlement(&error) => {
                 return Ok((
@@ -507,7 +545,32 @@ pub(super) fn pull_requests(
         "--json".to_owned(),
         OPEN_PR_LIST_FIELDS.to_owned(),
     ];
-    let value = gh_json(actions, &args, "open PR list")?;
+    let value = match gh_json(actions, &args, "open PR list") {
+        Ok(value) => value,
+        Err(error) if transient_open_pr_error(&error) => {
+            let rest_args = vec![
+                "api".to_owned(),
+                format!(
+                    "repos/{repo}/pulls?state=open&base={}&per_page=100&page=1",
+                    encode_path_segment(base)
+                ),
+            ];
+            let rest = gh_json(actions, &rest_args, "open PR REST fallback")?;
+            let rows = rest
+                .as_array()
+                .ok_or_else(|| "open PR REST fallback was not an array".to_owned())?;
+            if rows.len() == 100 {
+                return Err(
+                    "open PR REST fallback reached 100; refusing a possibly partial snapshot"
+                        .to_owned(),
+                );
+            }
+            let mut rows = rows.iter().map(rest_pull_request_row).collect::<Vec<_>>();
+            hydrate_rest_merge_states(actions, repo, positions, &mut rows);
+            Value::Array(rows)
+        }
+        Err(error) => return Err(error),
+    };
     let rows = value
         .as_array()
         .ok_or_else(|| "open PR list was not an array".to_owned())?;
@@ -517,6 +580,167 @@ pub(super) fn pull_requests(
         ));
     }
     rows.iter().map(|row| parse_pr(row, positions)).collect()
+}
+
+fn transient_open_pr_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    [
+        "bad gateway",
+        "http 502",
+        "http 504",
+        "gateway timeout",
+        "service unavailable",
+        "connection aborted",
+        "connection closed",
+        "connection refused",
+        "connection reset",
+        "timed out",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+/// Number of concurrent per-pull-request reads during hydration.
+const HYDRATION_CONCURRENCY: usize = 4;
+
+/// Run `work` over `items` with at most [`HYDRATION_CONCURRENCY`] in flight.
+///
+/// The first error wins and stops further items from starting, so a failing
+/// read still fails the pass exactly as the sequential loop did.
+fn run_bounded<T: Send>(
+    items: Vec<T>,
+    work: &(impl Fn(T) -> Result<(), String> + Sync),
+) -> Result<(), String> {
+    if items.len() < 2 {
+        return items.into_iter().try_for_each(work);
+    }
+    let workers = HYDRATION_CONCURRENCY.min(items.len());
+    let queue = std::sync::Mutex::new(items);
+    let first_error = std::sync::Mutex::new(None::<String>);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    if first_error.lock().is_ok_and(|error| error.is_some()) {
+                        return;
+                    }
+                    let Some(item) = queue.lock().ok().and_then(|mut queue| queue.pop()) else {
+                        return;
+                    };
+                    if let Err(error) = work(item)
+                        && let Ok(mut slot) = first_error.lock()
+                    {
+                        slot.get_or_insert(error);
+                    }
+                }
+            });
+        }
+    });
+    match first_error.into_inner() {
+        Ok(None) => Ok(()),
+        Ok(Some(error)) => Err(error),
+        Err(_) => Err("hydration worker panicked".to_owned()),
+    }
+}
+
+/// The REST list endpoint omits `mergeable_state`; only `GET pulls/{n}`
+/// carries it. Read it for the rows that can still be admitted. A row that
+/// cannot be read keeps no state, which parses as `UNKNOWN` and is refused by
+/// the native arming backstop.
+fn hydrate_rest_merge_states(
+    actions: &GitHubActions,
+    repo: &str,
+    positions: &BTreeMap<u64, u64>,
+    rows: &mut [Value],
+) {
+    let candidates = rows
+        .iter_mut()
+        .filter(|row| {
+            let number = row.get("number").and_then(Value::as_u64);
+            row.get("isDraft").and_then(Value::as_bool) == Some(false)
+                && number.is_some_and(|number| !positions.contains_key(&number))
+                && row
+                    .get("headRefOid")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_full_sha)
+        })
+        .collect::<Vec<_>>();
+    let _ = run_bounded(candidates, &|row: &mut Value| {
+        let Some(number) = row.get("number").and_then(Value::as_u64) else {
+            return Ok(());
+        };
+        let Ok(live) = gh_json(
+            actions,
+            &["api".to_owned(), format!("repos/{repo}/pulls/{number}")],
+            "open PR merge state",
+        ) else {
+            return Ok(());
+        };
+        let same_head = live.pointer("/head/sha") == row.get("headRefOid");
+        if let Some(state) = live
+            .get("mergeable_state")
+            .and_then(Value::as_str)
+            .filter(|_| same_head)
+        {
+            row["mergeStateStatus"] = Value::String(state.to_ascii_uppercase());
+        }
+        Ok(())
+    });
+}
+
+fn rest_pull_request_row(value: &Value) -> Value {
+    let mut row = serde_json::Map::new();
+    row.insert(
+        "id".to_owned(),
+        value
+            .get("node_id")
+            .cloned()
+            .or_else(|| value.get("id").map(|id| Value::String(id.to_string())))
+            .unwrap_or(Value::Null),
+    );
+    row.insert(
+        "number".to_owned(),
+        value.get("number").cloned().unwrap_or(Value::Null),
+    );
+    row.insert(
+        "isDraft".to_owned(),
+        value.get("draft").cloned().unwrap_or(Value::Bool(true)),
+    );
+    row.insert(
+        "baseRefName".to_owned(),
+        value.pointer("/base/ref").cloned().unwrap_or(Value::Null),
+    );
+    row.insert(
+        "headRefOid".to_owned(),
+        value.pointer("/head/sha").cloned().unwrap_or(Value::Null),
+    );
+    row.insert(
+        "headRefName".to_owned(),
+        value.pointer("/head/ref").cloned().unwrap_or(Value::Null),
+    );
+    row.insert(
+        "mergeStateStatus".to_owned(),
+        value.get("mergeable_state").cloned().unwrap_or(Value::Null),
+    );
+    row.insert(
+        "autoMergeRequest".to_owned(),
+        value.get("auto_merge").cloned().unwrap_or(Value::Null),
+    );
+    row.insert(
+        "labels".to_owned(),
+        value
+            .get("labels")
+            .cloned()
+            .unwrap_or_else(|| Value::Array(Vec::new())),
+    );
+    // Force the normal REST check/status hydration path below. The marker is
+    // represented by the same 100-entry sentinel used for a truncated GraphQL
+    // rollup, while parse_check ignores the null entries.
+    row.insert(
+        "statusCheckRollup".to_owned(),
+        Value::Array((0..100).map(|_| Value::Null).collect()),
+    );
+    Value::Object(row)
 }
 
 pub(super) fn parse_pr(row: &Value, positions: &BTreeMap<u64, u64>) -> Result<ObservedPr, String> {
@@ -673,16 +897,47 @@ pub(super) fn hydrate_census_check_identities(
     required_checks: &[RequiredCheck],
     prs: &mut [ObservedPr],
 ) -> Result<(), String> {
-    for pr in prs.iter_mut().filter(|pr| checks_are_consulted(pr)) {
+    let candidates = prs
+        .iter_mut()
+        .filter(|pr| checks_are_consulted(pr) && checks_can_change_decision(pr))
+        .collect::<Vec<_>>();
+    run_bounded(candidates, &|pr: &mut ObservedPr| {
         hydrate_required_check_identities_with_deadline(
             actions,
             repo,
             required_checks,
             std::slice::from_mut(pr),
             None,
-        )?;
+        )
+    })
+}
+
+/// Whether the steward could still reach a check-dependent decision for this
+/// pull request.
+///
+/// `classify_pr` answers queued, draft, invalid-head and conflicting pull
+/// requests before it weighs a required check, so those rows skip hydration.
+/// A row carrying the managed label is the exception: `classify_management`
+/// runs first and reads the handoff commit status from the hydrated checks, so
+/// without them a labelled queued, draft or conflicting row would classify as
+/// `HandoffMissing` and lose its recovery wake, success continuation and run
+/// supersedence.
+fn checks_can_change_decision(pr: &ObservedPr) -> bool {
+    let fact = &pr.fact;
+    if fact
+        .labels
+        .iter()
+        .any(|label| label.eq_ignore_ascii_case(super::MANAGED_LABEL))
+    {
+        return true;
     }
-    Ok(())
+    fact.queue_position.is_none()
+        && !fact.draft
+        && is_full_sha(&fact.head_sha)
+        && !matches!(
+            fact.merge_state.to_ascii_uppercase().as_str(),
+            "DIRTY" | "CONFLICTING"
+        )
 }
 
 pub(super) fn hydrate_required_check_identities_before(

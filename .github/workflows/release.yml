@@ -29,6 +29,11 @@ on:
         required: false
         default: ""
         type: string
+      platform_focus:
+        description: "Platforms to build (empty = repo variable CI_PLATFORM_FOCUS, default macos = macos-arm64 + linux-x64 + linux-arm64)"
+        required: false
+        default: ""
+        type: string
       windows_runner_selector_json:
         description: Optional JSON string/array for Windows runs-on
         required: false
@@ -38,8 +43,12 @@ on:
 # Each job grants only what its own steps use; nothing is granted by default.
 permissions: {}
 
+# One group across tags: a running release always finishes (it may be mid-
+# signing on the local Mac), and a newer tag replaces any older release still
+# waiting, so a burst of merges publishes the newest version instead of
+# queueing one signing per merge.
 concurrency:
-  group: release-${{ github.ref }}
+  group: release
   cancel-in-progress: false
 
 env:
@@ -61,6 +70,7 @@ jobs:
 
       - id: resolve
         env:
+          PLATFORM_FOCUS: ${{ inputs.platform_focus || vars.CI_PLATFORM_FOCUS || 'macos' }}
           REQUESTED_PROVIDER: ${{ inputs.runner_provider || vars.DEFAULT_RUNNER_PROVIDER || 'github-hosted' }}
           EXPLICIT_LINUX_RUNNER_SELECTOR_JSON: ${{ inputs.linux_runner_selector_json || '' }}
           EXPLICIT_LINUX_ARM64_RUNNER_SELECTOR_JSON: ${{ inputs.linux_arm64_runner_selector_json || '' }}
@@ -129,11 +139,39 @@ jobs:
             --dist-dir artifacts/release
 
       - name: Upload non-macOS artifact
+        id: upload_artifact
         if: matrix.package_target != 'macos-arm64'
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
         with:
           name: release-${{ matrix.package_target }}
           path: artifacts/release/${{ github.ref_name }}/*
+          if-no-files-found: error
+
+      - name: Write non-macOS artifact identity manifest
+        if: matrix.package_target != 'macos-arm64'
+        env:
+          ARTIFACT_ID: ${{ steps.upload_artifact.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.upload_artifact.outputs.artifact-digest }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release_artifact_manifest.py write \
+            --output artifacts/release-manifest.json \
+            --root "artifacts/release/${GITHUB_REF_NAME}" \
+            --repository "$GITHUB_REPOSITORY" \
+            --tag "$GITHUB_REF_NAME" \
+            --commit "$GITHUB_SHA" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --target "${{ matrix.package_target }}" \
+            --artifact-id "$ARTIFACT_ID" \
+            --artifact-digest "$ARTIFACT_DIGEST"
+
+      - name: Upload non-macOS artifact identity manifest
+        if: matrix.package_target != 'macos-arm64'
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: release-${{ matrix.package_target }}-manifest
+          path: artifacts/release-manifest.json
           if-no-files-found: error
 
       - name: macOS build health check only
@@ -171,8 +209,9 @@ jobs:
       - name: Run read-only admission and steward probes against real repositories
         shell: bash
         env:
-          # Public repositories only; a dedicated read token can replace the
-          # job token without changing the gate.
+          # Prefer a dedicated read-only token. The Actions token remains the
+          # fallback; never expose the write-capable release-bot credential to
+          # the binary under test.
           GH_TOKEN: ${{ secrets.RELEASE_SMOKE_GH_TOKEN || github.token }}
           SMOKE_REPOS: ${{ vars.RELEASE_SMOKE_REPOS || 'Generous-Corp/pulp' }}
         run: |
@@ -187,13 +226,29 @@ jobs:
   release:
     needs: [build, live-smoke]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Run the gate even when live-smoke failed so a `gh run rerun --failed`
+    # retries both jobs. Successful build artifacts stay attached to this run;
+    # a later smoke pass can therefore reach publication without rebuilding.
+    # The first step below remains fail-closed and prevents any release write.
+    if: always() && startsWith(github.ref, 'refs/tags/v')
     # Creates the draft release (contents) and signs its build provenance.
     permissions:
       attestations: write
       contents: write
       id-token: write
     steps:
+      - name: Require verified build and live smoke
+        env:
+          BUILD_RESULT: ${{ needs.build.result }}
+          LIVE_SMOKE_RESULT: ${{ needs.live-smoke.result }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$BUILD_RESULT" != success || "$LIVE_SMOKE_RESULT" != success ]]; then
+            echo "release withheld: build=$BUILD_RESULT live-smoke=$LIVE_SMOKE_RESULT" >&2
+            exit 1
+          fi
+
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
@@ -208,7 +263,22 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release
-          find artifacts -type f ! -name checksums.sha256 -print0 | while IFS= read -r -d '' file; do
+          mapfile -t manifests < <(find artifacts -path '*/release-manifest.json' -type f -print)
+          test "${#manifests[@]}" -gt 0
+          manifest_args=()
+          for manifest in "${manifests[@]}"; do
+            manifest_args+=(--manifest "$manifest")
+          done
+          python3 scripts/release_artifact_manifest.py aggregate \
+            --output release/shipyard-release-manifest.json \
+            --artifacts-root artifacts \
+            --repository "$GITHUB_REPOSITORY" \
+            --tag "$GITHUB_REF_NAME" \
+            --commit "$GITHUB_SHA" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            "${manifest_args[@]}"
+          find artifacts -type f ! -name checksums.sha256 ! -name release-manifest.json -print0 | while IFS= read -r -d '' file; do
             cp "$file" release/
           done
           test "$(find release -type f | wc -l | tr -d ' ')" -gt 0
@@ -265,7 +335,9 @@ jobs:
 
   sign-and-upload-macos:
     needs: [resolve-runners, release]
-    if: startsWith(github.ref, 'refs/tags/v') && vars.CI_MACOS_SIGNING_ENABLED == 'true'
+    # Keep this gate rerunnable with `gh run rerun --failed` when the release
+    # job withheld publication after a transient smoke failure.
+    if: always() && startsWith(github.ref, 'refs/tags/v') && vars.CI_MACOS_SIGNING_ENABLED == 'true'
     runs-on: ${{ fromJSON(needs.resolve-runners.outputs.macos_arm64_runs_on_json) }}
     # Uploads the DMG and publishes the release (contents) after attesting it.
     permissions:
@@ -273,9 +345,28 @@ jobs:
       contents: write
       id-token: write
     steps:
+      - name: Require published non-macOS release gate
+        env:
+          RELEASE_RESULT: ${{ needs.release.result }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$RELEASE_RESULT" != success ]]; then
+            echo "macOS publication withheld: release=$RELEASE_RESULT" >&2
+            exit 1
+          fi
+
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
+
+      - name: Verify job-scoped GitHub publication before signing
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -c 'import sys; sys.path.insert(0, "scripts"); from release_macos_local import require_ci_gh; print(require_ci_gh())'
 
       # The signed build must not read a toolchain or crate sources that an
       # earlier job on a shared runner could have written to ~/.cargo or
@@ -290,7 +381,30 @@ jobs:
           echo "CARGO_HOME=$root/cargo" >> "$GITHUB_ENV"
           echo "RUSTUP_HOME=$root/rustup" >> "$GITHUB_ENV"
 
-      - name: Install Rust
+      # static.rust-lang.org is unreachable from the self-hosted runner for
+      # minutes at a time; v0.381.0 and v0.383.0 stayed drafts on it. Retry
+      # with backoff here, and the auto-release heal job re-runs what remains.
+      - name: Install Rust (attempt 1)
+        id: rust_1
+        continue-on-error: true
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-13
+        with:
+          toolchain: stable
+      - name: Back off before retrying Rust install
+        if: steps.rust_1.outcome == 'failure'
+        run: sleep 30
+      - name: Install Rust (attempt 2)
+        id: rust_2
+        if: steps.rust_1.outcome == 'failure'
+        continue-on-error: true
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-13
+        with:
+          toolchain: stable
+      - name: Back off before the last Rust install attempt
+        if: steps.rust_2.outcome == 'failure'
+        run: sleep 90
+      - name: Install Rust (attempt 3)
+        if: steps.rust_2.outcome == 'failure'
         uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-13
         with:
           toolchain: stable
@@ -348,6 +462,8 @@ jobs:
       - name: Sign, notarize, staple, and upload macOS DMG
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # The publish gate expects the same asset set the build matrix produced.
+          CI_PLATFORM_FOCUS: ${{ inputs.platform_focus || vars.CI_PLATFORM_FOCUS || 'macos' }}
           SHIPYARD_NOTARIZE_APPLE_ID: ${{ secrets.MACOS_NOTARIZE_APPLE_ID }}
           SHIPYARD_NOTARIZE_APP_PASSWORD: ${{ secrets.MACOS_NOTARIZE_APP_PASSWORD }}
           SHIPYARD_NOTARIZE_TEAM_ID: ${{ secrets.MACOS_NOTARIZE_TEAM_ID }}
@@ -412,6 +528,12 @@ jobs:
           KEYCHAIN_STATE="${RUNNER_TEMP}/shipyard-ci-sign-${GITHUB_RUN_ID}.json"
           SIGNING_HOME="${RUNNER_TEMP}/shipyard-ci-home-${GITHUB_RUN_ID}"
           rm -f "${RUNNER_TEMP}/shipyard-cert-${GITHUB_RUN_ID}.p12"
+          # An earlier step failed before the keychain was prepared: nothing to
+          # restore, and failing here would hide the real error.
+          if [ ! -e "$KEYCHAIN_STATE" ]; then
+            echo "no signing keychain was prepared; nothing to restore"
+            exit 0
+          fi
           python3 scripts/ci_macos_signing_keychain.py restore \
             --keychain "$KEYCHAIN" \
             --state "$KEYCHAIN_STATE" \

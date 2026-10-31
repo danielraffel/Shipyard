@@ -110,3 +110,46 @@ threshold before it reopens. Fully bounding those active writers is Phase 2: it
 requires routing child stdout/stderr through a supervised rotating sink. Renaming
 an open file would leave the child writing to the renamed inode and is not an
 acceptable substitute.
+
+## Automatic observation collection
+
+`SHIPYARD_OBSERVATIONS=off` stops optional **new automatic observations** in
+processes receiving that environment variable. `off` ignores surrounding
+whitespace and ASCII letter case; unset or other values preserve current behavior.
+The covered producers are queue repeated-work observations and terminal timing,
+recovered terminal timing, the metric copy of `run command` evidence, scheduler
+and dispatch route-shadow receipts, the daemon GitHub importer, and baseline
+wrapper/collector runs using `--collect`. Disabled scheduled collection exits
+successfully without importing or appending a successful pass to its history.
+
+Required queue/recovery state, command/validation evidence, operational logs and
+merge receipts continue to be written. Explicit `metrics record`/`metrics import`,
+receipt export, and historical reports remain available. This does not disable
+manual cause recording, private corpus collection, or other feature-owned proof
+records. No existing data is deleted by this switch.
+
+A shell export does not change an already-running daemon or launchd service:
+its environment must be updated through its normal deployment path and the
+process restarted. This control installs or restarts nothing itself. Retention
+is separate: `SHIPYARD_METRICS_RETENTION_DAYS` changes the cleanup window; larger
+values keep longer history and nonpositive values disable pruning, not collection.
+
+## Metrics observations
+
+`shipyard cleanup --apply` also prunes raw metric runs and fleet-capacity samples,
+repeated-work shadow observations, and terminal queue timing after 90 days.
+`SHIPYARD_METRICS_RETENTION_DAYS` changes this existing window; larger values keep
+longer history and nonpositive values disable pruning, not collection. Extreme
+positive values outside the timestamp range report a skipped prune.
+
+Shadow observations expire by `observed_at`; timing expires by `recorded_at`
+only when no retained shadow observation references it. This keeps recent
+repeated-work reports joined to older superseded jobs. Malformed observation
+timestamps are retained conservatively. The observation scan uses transactions
+of at most 250 rows and a fixed endpoint for each table. Cleanup counts raw runs
+and observational rows removed, excluding the runs' child jobs and steps.
+
+Merge receipts, OPEN ship state, queue ownership, and recovery records are not
+part of metrics pruning. Cleanup must be invoked; this adds no scheduler or
+collection-disable switch. SQLite can reuse deleted pages without shrinking the
+database file, so age retention is not a hard byte ceiling.

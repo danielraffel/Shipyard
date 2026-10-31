@@ -13,6 +13,7 @@ python3 scripts/collect_baseline.py \
   --tartci-host m5s \
   --merge-receipts "$SHIPYARD_STATE_DIR/merge-receipts.jsonl" \
   --merge-receipt-health "$SHIPYARD_STATE_DIR/merge-receipts.health.json" \
+  --merge-receipt-source-host m3 \
   --collect
 ```
 
@@ -22,17 +23,29 @@ TartCI but excluded from Shipyard's joinable baseline with an explicit count;
 they cannot contribute to safely merged throughput or wasted-compute metrics.
 
 On the observation controller, install the supervised hourly schedule with
-`scripts/install_baseline_collector.sh --install`. The installer is dry-run by
+`scripts/install_baseline_collector.sh --merge-receipt-source-host m3 --install`.
+The installer is dry-run by
 default, validates the collector, handoff checker, wrapper, and
 `baseline_pass_history.py` dependency before loading launchd, and copies them
 into the managed Shipyard state directory (`~/Library/Application
 Support/shipyard`). The launchd job executes that managed copy, so removing or
 replacing the checkout that performed the installation cannot silently break
 future runs. Before each collection the wrapper checks the producer handoff;
+with `--merge-receipt-source-host`, the default handoff and health paths are
+the observer's `merge-receipt-observer/` directory (explicit paths override
+those defaults). Before each collection the wrapper checks the producer handoff;
 when it is fresh and valid, receipt import is enabled. When it is missing,
 empty, stale, or failed, timing and queue proxies still collect and an explicit
 `merge-receipt: unavailable` event records the reason. The scorecard keeps the
 safe-merge denominator unavailable and never turns it into zero.
+
+Provider reads retry only recognized transport failures (by default, two
+retries after the initial attempt: three attempts with 5s then 10s backoff).
+Authentication, schema, malformed data, and handoff validation failures remain
+terminal and record a failed pass;
+the retry cannot manufacture a successful observation or a safe-merge value.
+Override the bounded policy explicitly with `--provider-retries` and
+`--provider-retry-delay-seconds` when diagnosing a host.
 
 The producer-side handoff is explicit and read-only. On the Shipyard state
 directory that records protected merges, install the supervised exporter (dry-run
@@ -61,14 +74,26 @@ shipyard --state-dir "$PRODUCER_STATE_DIR" metrics export merge-receipt \
 ```
 
 Its health sidecar is checked with `python3 scripts/merge_receipt_handoff.py
-check ... --stale-after 2h`; a stale, malformed, failed, or empty handoff is
-unavailable, never zero.
+check ... --expect-source-host m3 --stale-after 2h`; a stale, malformed,
+failed, wrong-host, or empty handoff is unavailable, never zero.
 
 The observer then passes that file as `--merge-receipts`. The export reads only
 validated receipts already persisted by Shipyard, scopes them to the exact
 repository, and atomically replaces the handoff file when at least one receipt
 exists. An empty export fails without replacing the previous handoff. It never
 asks GitHub for merge state or creates a receipt.
+
+When the producer and observer are different fleet hosts, run the observer's
+`merge_receipt_handoff.py fetch --source-host <producer>` command. It invokes
+the same local export over the managed SSH alias, checks the producer's
+`imported_at` before and after export, transfers the exact payload and producer
+freshness metadata, then validates both before replacing the observer handoff.
+The health sidecar records the configured source host. Two bounded retries are
+used for transient SSH transport failures, so one flap does not immediately
+turn a previously healthy handoff into an error; exhausted transport, source,
+or validation failure leaves the prior payload in place and marks health
+unavailable. Producer and observer LaunchAgents use separate labels and
+managed directories. The handoff never manufactures a receipt.
 
 The command writes an append-only observation history and reports continuous
 elapsed 24-hour days, required activity strata, organic sample counts, and the
@@ -78,3 +103,13 @@ remains unavailable without `--merge-receipts`; failed or cancelled jobs are
 never treated as merged changes. A receipt import failure fails the collection
 pass. Synthetic provenance is not asserted by this wrapper; use only the
 organic provider exports intended for the baseline.
+
+Collection remains report-only by default: it writes the state and status files
+and exits successfully even while the baseline is still accumulating. A
+downstream optimization gate can opt into fail-closed readiness with
+`--require-ready`; the collector still writes its observation and status, then
+exits `3` unless `baseline_readiness.optimization_eligible` is true. This keeps
+hourly collection alive while preventing an experiment from starting on an
+immature or incomplete baseline. In JSON, `baseline.exit` remains the
+report-completeness field for compatibility; `baseline.gate_exit` records the
+process exit that the opt-in gate will use.

@@ -31,8 +31,6 @@
     <string>Background</string>
     <key>LowPriorityIO</key>
     <true/>
-    <key>RunAtLoad</key>
-    <true/>
     <key>StartInterval</key>
     <integer>@INTERVAL@</integer>
     <key>StandardOutPath</key>

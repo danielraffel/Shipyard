@@ -162,9 +162,41 @@ fi
 "$PLUTIL" -lint "$STAGED" >/dev/null
 chmod 644 "$STAGED"
 DOMAIN="gui/$(id -u)"
+OLD_PLIST_BACKUP=""
+OLD_WRAPPER_BACKUP=""
+if [ -f "$PLIST" ]; then
+  OLD_PLIST_BACKUP="$(mktemp "$PLIST_DIR/.$LABEL.old.XXXXXX")"
+  cp "$PLIST" "$OLD_PLIST_BACKUP"
+  chmod 644 "$OLD_PLIST_BACKUP"
+fi
+if [ -f "$INSTALLED_WRAPPER" ]; then
+  OLD_WRAPPER_BACKUP="$(mktemp "$(dirname "$INSTALLED_WRAPPER")/.run_cleanup.old.XXXXXX")"
+  cp "$INSTALLED_WRAPPER" "$OLD_WRAPPER_BACKUP"
+  chmod 700 "$OLD_WRAPPER_BACKUP"
+fi
+cleanup_install_backups() {
+  rm -f "$OLD_PLIST_BACKUP" "$OLD_WRAPPER_BACKUP"
+}
+trap cleanup_install_backups EXIT
 "$LAUNCHCTL" bootout "$DOMAIN/$LABEL" >/dev/null 2>&1 || true
 mv -f "$WRAPPER_STAGED" "$INSTALLED_WRAPPER"
 mv -f "$STAGED" "$PLIST"
+if ! "$LAUNCHCTL" bootstrap "$DOMAIN" "$PLIST"; then
+  echo "launchd rejected $LABEL; restoring the previous installation" >&2
+  rm -f "$PLIST" "$INSTALLED_WRAPPER"
+  if [ -n "$OLD_PLIST_BACKUP" ]; then
+    mv -f "$OLD_PLIST_BACKUP" "$PLIST"
+    OLD_PLIST_BACKUP=""
+  fi
+  if [ -n "$OLD_WRAPPER_BACKUP" ]; then
+    mv -f "$OLD_WRAPPER_BACKUP" "$INSTALLED_WRAPPER"
+    OLD_WRAPPER_BACKUP=""
+  fi
+  if [ -f "$PLIST" ]; then
+    "$LAUNCHCTL" bootstrap "$DOMAIN" "$PLIST" >/dev/null 2>&1 || true
+  fi
+  exit 1
+fi
 trap - EXIT
-"$LAUNCHCTL" bootstrap "$DOMAIN" "$PLIST"
+cleanup_install_backups
 echo "  action=installed and loaded $LABEL"
