@@ -5,6 +5,20 @@ description: "Cross-platform CI coordination with Shipyard: validates, ships, ma
 
 # CI Operations with Shipyard
 
+## Durable external work
+
+Agents may register CI preparation, repair, review, or release work through
+Shipyard's durable work-item store without being launched or supervised by
+Shipyard. Registration is idempotent; checkpoints must be written before a
+session hands off or exits. Claims carry a fencing epoch and protocol/capability
+version, and stale owners are rejected on checkpoint. A host-loss recovery
+must rediscover the item from shared ShipState and obtain a new fenced claim;
+local files or conversation history are not recovery state. This contract is
+observation-only until the cross-host failure canary proves concurrent
+reconcilers cannot duplicate privileged effects. Work-item records fail closed
+on corruption or schema drift; idempotency keys, capability versions, lease
+expiry, and expected state versions are checked before checkpoint or claim.
+
 `SHIPYARD_OBSERVATIONS=off` (trimmed, case-insensitive) stops automatic queue
 shadow/timing, command metric copies, route-shadow receipts, daemon GitHub
 imports, and scheduled baseline collection in processes receiving it. Existing
@@ -1082,7 +1096,7 @@ PRs are gone.
 | Observe GitHub queue and PR transitions without mutation | `shipyard --json queue-observe --repo <owner/repo> [--follow]` (one bounded GraphQL query per tick; unchanged polls are silent and back off adaptively) |
 | Flag stuck open PRs (repeat test failure, red while armed, repeated ejection on the current head, rebase treadmill, green but unarmed for 2 h (skips drafts and `shipyard:hold` / `shipyard:no-auto-merge` holds), red and unarmed for 2 h, and any Shipyard-handed PR no rule accounts for (`unaccounted`, with the reason; counts and gaps in `pr-watch liveness` and `doctor`), ejected for failed_checks then green and never re-armed; split advisory) | `shipyard pr-watch scan --repo <owner/repo> [--post-comments] [--digest]` (read-only dry run by default; `replay --since 7d --expect PR=FLAGS --control merged-clean` simulates a past window; the daemon digest toggle is `[pr_watch.digest] enabled = true`; see `docs/pr-watch.md`) |
 | Keep bounded green-unarmed screening responsive | The watcher screens its capped candidate set through the existing bounded worker pool, preserving input order and fail-closed semantics; a slow GitHub read must not serialize the entire pass. |
-| Wake a model only when something changed: a READY head nobody reviewed, a head with no READY or verdict, a verdict to route, an armed or queued head nobody approved, a red required check (with its failing tests), a failed merge group, a removed or stuck queue entry, an approved head nobody armed, a tartci host alarm; each once, nothing otherwise | `shipyard pr-watch rules --repo <owner/repo>[@workflow.yml] ... [--alarm-repo danielraffel/tartci] [--input-events FILE]` (JSONL on stdout; the first pass only primes its ledger); `rules-replay --since 2d --tick 5m` replays a window and `scripts/rules_watch_score.py` scores it against labelled turns. Each event's `fix` gives the exact next command; a live pass backs off (exit 75) when the App budget is low. See `docs/pr-watch.md#rules-watcher` |
+| Wake a model only when something changed: a READY head nobody reviewed, a head with no READY or verdict, a verdict to route, an armed or queued head nobody approved, a red required check (with its failing tests), a failed merge group, a removed or stuck queue entry, an approved head nobody armed, a HOLD nobody repaired (`--held-after`), a tartci host alarm; PRs labelled `owner-decision`/`superseded`/`PARKED/*` are reported under their own state and skipped by the stall rules; every event carries `age_secs`/`age`; each once, nothing otherwise | `shipyard pr-watch rules --repo <owner/repo>[@workflow.yml] ... [--alarm-repo danielraffel/tartci] [--input-events FILE]` (JSONL on stdout; the first pass only primes its ledger); `rules-replay --since 2d --tick 5m` replays a window and `scripts/rules_watch_score.py` scores it against labelled turns. Each event's `fix` gives the exact next command; a live pass backs off (exit 75) when the App budget is low. See `docs/pr-watch.md#rules-watcher` |
 | Check pr-watch passes are still completing (the scanning host's silence otherwise mutes hand-back, comments and digest) | `shipyard pr-watch liveness [--json]` (exit 1 when stale past `[pr_watch] stale_after_minutes`, default 45); `shipyard doctor` shows a `PR watch` section on a scanning host; `shipyard doctor --fleet` asks every host class and fails `pr-watch:fleet` when none is completing passes |
 | Hand a red PR back to its owning session (label + `cmux notify` + inbox note, no input injection; the label is removed on merge/close too; never labels a PR that is no longer open; `pr-watch sweep-labels` lists, and with `--apply` removes, stale labels on closed PRs; no label when no owner resolves; an owner session is live when cmux reports it `running` or `idle` with its process alive; inbox notes name their head and age, and an unread note is retracted when its episode resolves; `pr-watch wakes` measures sent vs seen) | `shipyard pr-watch scan --repo <owner/repo> --handback` (dry run); `--deliver-handback` with `[pr_watch.handback] enabled = true` sends. See `docs/pr-watch.md#hand-back` |
 | Remove an exact queue entry | Do not use raw `ghapp pr merge --disable-auto` or `dequeuePullRequest`; use Shipyard's audited exact-head path. The ghapp queue-removal guard refuses unaudited removal, with `GHAPP_ALLOW_QUEUE_REMOVAL=1` reserved for an explicit authority action. |

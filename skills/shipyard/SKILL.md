@@ -24,6 +24,25 @@ for another repository are excluded as `archive_other_repo`, not malformed;
 `archive_rows` still counts all successfully decoded cause records. Attachment
 uses the exact-identity index, without changing duplicate or attempt policy.
 
+## Durable work-item contract
+
+Shipyard's existing ShipState/lease/receipt primitives are the source of
+durable intent for work started by independent Claude or Codex sessions. Each
+item has a canonical identity, protocol/capability version, checkpoint, owner,
+and fencing epoch. Register before claiming; checkpoint before handoff; after a
+process or host failure, rediscover from shared state and claim a new epoch.
+The previous owner must be fenced before any conflicting mutation. GitHub
+remains authoritative for PR, review, check, merge-queue, and release state;
+Shipyard records intent and ownership only. Autonomous cross-host takeover is
+not enabled until real concurrent-reconciler and lost-acknowledgment tests
+prove idempotent, authorized recovery.
+
+The store rejects corrupt or unsupported records rather than treating them as
+absent. Claims and checkpoints use expected state versions, verify the worker
+capability, compare idempotency keys on replay, and reject checkpoints after
+lease expiry. These are local safety guards; authenticated cross-host identity
+and takeover still require a separate reviewed boundary and failure canary.
+
 Metrics imports preserve exact-head safety when GitHub omits a workflow run's
 pull-request list: `pull_request` and `pull_request_target` runs may use the
 commit-to-pull-requests API, but zero or multiple matches remain unknown.
@@ -1081,12 +1100,13 @@ remain fail-closed.
 `shipyard pr-watch rules` is the rules-first watcher: one JSONL event per new
 condition (READY or new head unreviewed, verdict to route, armed or queued
 without an approval of the head, red required check naming its failing tests,
-failed merge group, queue removal or stall, approved but unarmed, tartci host
-alarm, or a line from `--input-events`), each once per key, so a quiet pass
+failed merge group, queue removal or stall, approved but unarmed, a HOLD nobody
+repaired (`--held-after`), a PR labelled `owner-decision`/`superseded`/`PARKED/*`
+(own state, skipped by the stall rules), tartci host alarm, or a line from `--input-events`), each once per key, so a quiet pass
 prints nothing. Its first pass with no ledger only records what already holds.
 `rules-replay` runs the same rules over a past window. Failing-test names come
 from CTest, Python unittest (`FAIL:`/`ERROR:` with a dotted location) and
-`cargo test` lines. Every event carries a `fix` (what, evidence URL, cause,
+`cargo test` lines. Every event carries `age_secs`/`age` and a `fix` (what, evidence URL, cause,
 command, safe_to_auto_apply, verify); `--reviewer OWNER/REPO=NAME` names who a
 head routes to. A live pass prints its reads, checks the App budget first and
 backs off (exit 75) under `--min-rate-remaining`, and re-reads a pull
