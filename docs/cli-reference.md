@@ -31,7 +31,7 @@ shipyard --json parallel-proof-canary --request /absolute/private/invocation.jso
 shipyard --json parallel-proof-canary --request /absolute/private/invocation.json --apply # exact machine-global digest-pinned canary
 
 # Ship
-shipyard ship                  # PR → validate → merge on green
+shipyard ship                  # PR → validate → arm native auto-merge (GitHub merges once green)
 shipyard ship --base develop   # target a different branch
 shipyard merge-queue status    # local mutation authority hold
 shipyard merge-queue hold --reason "incident"
@@ -314,10 +314,15 @@ merge-group head that differs from GitHub's current head. Apply mode requires
 the trusted machine-global `[merge_queue].mutation_machine`, rejects the
 central merge-queue `HOLD`, and serializes plus write-ahead audits every
 enqueue, rerun, and cancellation through the shared mutation guard. A
-repository without a GitHub-native merge queue receives a typed
-`automatic-merge-refused` decision (exit 10); Shipyard does not issue a client-side REST
-merge because that endpoint cannot atomically enforce complete check
-materialization and the validated base revision.
+repository without a GitHub-native merge queue is admitted only by the
+server-enforced exact-head merge (`mergePullRequest` bound by `expectedHeadOid`)
+and only when GitHub requires an app-bound approval check
+(`--approval-context`, default `review-verdict`); otherwise the steward refuses
+(`direct_merge_refused_server_enforcement_required`). `shipyard auto-merge`
+on such a repository still receives a typed `automatic-merge-refused` decision
+(exit 10), and Shipyard never issues a client-side REST merge because that
+endpoint cannot atomically enforce complete check materialization and the
+validated base revision.
 
 Queue-priority recovery is separately default-off. When
 `--recover-hosted-setup-eviction-priority` is enabled on an apply pass, the
