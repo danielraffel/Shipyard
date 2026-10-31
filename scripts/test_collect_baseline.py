@@ -716,11 +716,25 @@ class CollectorInvocationTests(unittest.TestCase):
             conn.commit(); conn.close()
             self.assertEqual(MOD.count_jobs(db, "Pulp", "o/pulp"), 1)
             self.assertEqual(MOD.source_activity_dates(db, "Pulp", "o/pulp"), {"2026-10-16"})
+            self.assertEqual(MOD.count_jobs(db, "Pulp", "O/PULP"), 1)
+            self.assertEqual(MOD.source_activity_dates(db, "Pulp", "O/PULP"), {"2026-10-16"})
         payload, excluded = MOD.prepare_tartci_export(
             json.dumps({"project": "Pulp", "repo": "o/pulp", "provider": "tart", "external_id": "job-1"}),
             "o/pulp", "pulp")
         self.assertEqual(excluded, 0)
         self.assertEqual(json.loads(payload)[0]["project"], "Pulp")
+
+        record = {"observed_jobs": 1, "qualified_jobs": 1,
+                  "provenance": "authenticated", "coverage": "complete", "reason": ""}
+        card = {"strata": {"schema": MOD.STRATA_CONTRACT, "repo": "O/PULP",
+                            "unit": "job", "source_head": "a" * 40,
+                            "generated_at": "2026-10-16T12:00:00Z",
+                            "window_since": "2026-10-11T12:00:00Z",
+                            "window_until": "2026-10-16T12:00:00Z",
+                            "strata": {name: dict(record) for name in MOD.PRODUCER_STRATA},
+                            "aggregate": {"observed_jobs": 4, "qualified_jobs": 4}}}
+        self.assertEqual(MOD.consume_authenticated_strata(card, repo="o/pulp")["provenance_status"],
+                         "authenticated_strata_partial")
 
     def test_project_repo_scope_requires_owner_and_matching_short_name(self):
         for project, repo in [("pulp", "pulp"), ("pulp", "/pulp"), ("pulp", "a/b/pulp"), ("other", "o/pulp")]:
@@ -817,7 +831,9 @@ class CollectorInvocationTests(unittest.TestCase):
             receipt = next(event for event in events if event.get("source") == "merge-receipt")
             self.assertEqual(receipt["source"], "merge-receipt")
             self.assertEqual(receipt["status"], "unavailable")
-            self.assertIn("handoff", receipt["reason"])
+            self.assertEqual(receipt["reason"], "producer handoff not present")
+            self.assertEqual([event["source"] for event in events],
+                             ["github", "tartci", "merge-receipt", "collection"])
             self.assertEqual(events[-1]["source"], "collection")
 
     def test_run_converts_provider_timeout_to_a_bounded_error(self):
@@ -839,6 +855,22 @@ class CollectorInvocationTests(unittest.TestCase):
                 events = MOD.import_organic(args)
             self.assertEqual(sum(event.get("source") == "merge-receipt" for event in events), 1)
             self.assertEqual(events[-1]["reason"], "wrapper")
+
+    def test_collect_inserts_missing_receipt_before_collection_event(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = type("Args", (), {"db": root / "metrics" / "metrics.db", "state": root / "state.json",
+                "project": "p", "repo": "o/p", "merge_receipts": root / "missing.jsonl"})()
+            args.state.write_text("{}")
+            provider_events = [
+                {"source": "github", "imported": 1},
+                {"source": "collection", "status": "completed"},
+            ]
+            with mock.patch.object(MOD, "_import_organic_after_preflight", return_value=provider_events):
+                events = MOD.import_organic(args)
+            self.assertEqual([event["source"] for event in events],
+                             ["github", "merge-receipt", "collection"])
+            self.assertEqual(events[1]["reason"], "producer handoff not present")
 
     def test_collect_keeps_only_newest_duplicate_handoff_marker(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -946,7 +978,7 @@ class CollectorInvocationTests(unittest.TestCase):
             health.write_text(json.dumps(generated))
             handoff.write_text(json.dumps({**value, "evidence": "sha256:tampered"}) + "\n")
             with self.assertRaisesRegex(RuntimeError, "(byte count|digest) does not match"):
-                MOD.validate_merge_receipt_health(health, handoff, "owner/repo", "2h")
+                MOD.validate_merge_receipt_health(health, handoff, "OWNER/REPO", "2h")
 
     def test_merge_receipt_health_rejects_stale_before_import(self):
         with tempfile.TemporaryDirectory() as directory:

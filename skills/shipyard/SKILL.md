@@ -323,6 +323,12 @@ invalid timestamps produce unavailable queue coverage; do not synthesize
 submit-to-receipt, cache, or model-token measurements. New providers must bind
 those values to authenticated durable events before they are imported.
 
+The GitHub metrics importer has the same provenance boundary: resolve one
+machine-global App helper token through `GhClient`, bind it to the exact
+repository target, and qualify rows only for `github-app-installation` helper
+auth. Ambient `gh` auth and fixtures stay unknown, even when their repository,
+workflow, event, or runner labels look production-like.
+
 The freshness query classifies jobs through their `github_job` step marker and
 must retain the `(steps.job_id, steps.step)` migration index. Without it, a
 large metrics store makes an observational scorecard scan steps once per job.

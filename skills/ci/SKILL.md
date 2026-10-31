@@ -164,6 +164,12 @@ metrics importer resolves those rows only through the exact commit's
 authoritative pull-request API response, and keeps the identity unknown when
 that response is empty or ambiguous.
 
+Authenticated metrics imports must pin the machine-global GitHub App helper
+once, bind it to the exact `--repo` target, and mark rows `production` only
+when the helper reports `github-app-installation`. Ambient `gh` auth and
+fixture callers remain `unknown`; never infer promotion provenance from a
+repository, workflow, event, runner label, or token-shaped string.
+
 For a governed receipt transport, `shipyard metrics export merge-receipt
 --repo <owner/repo> --stdout` emits only canonical JSONL records. It is
 mutually exclusive with `--file` and `--json`; keep health or transport status
