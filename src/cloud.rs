@@ -484,7 +484,7 @@ impl GitHubActions {
     /// Check whether the `gh` CLI is authenticated.
     #[must_use]
     pub fn auth_status(&self) -> bool {
-        let Ok(mut command) = self.prepare_gh_command() else {
+        let Ok(mut command) = self.prepare_gh_command(&[]) else {
             return false;
         };
         command.args(["auth", "status"]);
@@ -1047,7 +1047,7 @@ impl GitHubActions {
             }
             return Ok(String::from_utf8_lossy(output.stdout()).to_string());
         }
-        let mut command = self.prepare_gh_command()?;
+        let mut command = self.prepare_gh_command(args)?;
         gate_landing(&mut command, args, internal)?;
         apply_repo_environment(&mut command, env, self.repo_override.as_deref());
         let output = command.args(args).output().map_err(|error| {
@@ -1137,7 +1137,7 @@ impl GitHubActions {
             .map_or(timeout, |remaining| timeout.min(remaining));
         let started = Instant::now();
         let (deadline, execution_deadline) = gh_command_deadlines(started, timeout)?;
-        let mut command = self.prepare_gh_command_with_timeout(timeout)?;
+        let mut command = self.prepare_gh_command_with_timeout(args, timeout)?;
         gate_landing(&mut command, args, internal)?;
         if Instant::now() >= deadline {
             return Err(GitHubError::new(format!(
@@ -1253,12 +1253,15 @@ impl GitHubActions {
         Ok(Some(remaining))
     }
 
-    fn prepare_gh_command(&self) -> Result<std::process::Command, GitHubError> {
+    fn prepare_gh_command(&self, args: &[String]) -> Result<std::process::Command, GitHubError> {
         let client = self
             .gh
             .as_ref()
             .map_err(|error| GitHubError::new(error.clone()))?;
-        client
+        let routed = target_repo(args).and_then(|slug| client.routed_for_target(&slug));
+        routed
+            .as_ref()
+            .unwrap_or(client)
             .prepare_command(
                 &self.cwd,
                 self.gh_binary_override.as_deref(),
@@ -1270,13 +1273,17 @@ impl GitHubActions {
 
     fn prepare_gh_command_with_timeout(
         &self,
+        args: &[String],
         timeout: Duration,
     ) -> Result<std::process::Command, GitHubError> {
         let client = self
             .gh
             .as_ref()
             .map_err(|error| GitHubError::new(error.clone()))?;
-        client
+        let routed = target_repo(args).and_then(|slug| client.routed_for_target(&slug));
+        routed
+            .as_ref()
+            .unwrap_or(client)
             .prepare_command_with_auth_timeout(
                 &self.cwd,
                 self.gh_binary_override.as_deref(),
@@ -1286,6 +1293,78 @@ impl GitHubActions {
             )
             .map_err(|error| GitHubError::new(format!("failed to prepare gh command: {error}")))
     }
+}
+
+/// The one repository a `gh` command names: its `--repo`/`-R` value, or an
+/// `api` endpoint under `repos/OWNER/REPO`. The App token is routed there, so a
+/// client built in one checkout can still act on another repository when the
+/// token covers only one. `None` for anything else (graphql, `orgs/...`).
+const API_VALUE_FLAGS: &[&str] = &[
+    "-X",
+    "--method",
+    "-H",
+    "--header",
+    "-f",
+    "--raw-field",
+    "-F",
+    "--field",
+    "-q",
+    "--jq",
+    "-t",
+    "--template",
+    "--input",
+    "-p",
+    "--preview",
+    "--cache",
+    "--hostname",
+];
+
+fn target_repo(args: &[String]) -> Option<String> {
+    let mut found: Option<String> = None;
+    let mut note = |slug: &str| -> bool {
+        match &found {
+            Some(existing) if !existing.eq_ignore_ascii_case(slug) => false,
+            _ => {
+                found = Some(slug.to_owned());
+                true
+            }
+        }
+    };
+    let mut iter = args.iter();
+    let is_api = args.first().is_some_and(|first| first == "api");
+    let mut endpoint_seen = false;
+    while let Some(arg) = iter.next() {
+        let value = match arg.as_str() {
+            "--repo" | "-R" => iter.next().map(String::as_str),
+            other => other
+                .strip_prefix("--repo=")
+                .or_else(|| other.strip_prefix("-R").filter(|rest| !rest.is_empty())),
+        };
+        if let Some(value) = value {
+            if !note(value) {
+                return None;
+            }
+            continue;
+        }
+        if is_api && API_VALUE_FLAGS.contains(&arg.as_str()) {
+            iter.next();
+            continue;
+        }
+        if is_api && !endpoint_seen && arg != "api" && !arg.starts_with('-') {
+            endpoint_seen = true;
+            let path = arg.trim_start_matches('/');
+            if let Some(rest) = path.strip_prefix("repos/") {
+                let mut parts = rest.splitn(3, '/');
+                if let (Some(owner), Some(name)) = (parts.next(), parts.next()) {
+                    let name = name.split(['?', '#']).next().unwrap_or(name);
+                    if !note(&format!("{owner}/{name}")) {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+    found.filter(|slug| crate::gh::validate_repo_slug(slug).is_ok())
 }
 
 fn apply_repo_environment(
@@ -2062,6 +2141,140 @@ cache_ttl_seconds = 300
             local_dir: None,
             local_overlay_source: LocalOverlaySource::None,
         }
+    }
+
+    #[test]
+    fn target_repo_reads_the_repository_a_command_names() {
+        let target = |args: &[&str]| {
+            super::target_repo(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>())
+        };
+        assert_eq!(
+            target(&["pr", "view", "1", "--repo", "o/r"]).as_deref(),
+            Some("o/r")
+        );
+        assert_eq!(
+            target(&["pr", "view", "1", "-R", "o/r"]).as_deref(),
+            Some("o/r")
+        );
+        assert_eq!(
+            target(&["run", "list", "--repo=o/r"]).as_deref(),
+            Some("o/r")
+        );
+        assert_eq!(
+            target(&["api", "repos/o/r/pulls/1"]).as_deref(),
+            Some("o/r")
+        );
+        assert_eq!(target(&["api", "/repos/o/r"]).as_deref(), Some("o/r"));
+        assert_eq!(
+            target(&["api", "repos/o/r?per_page=1"]).as_deref(),
+            Some("o/r")
+        );
+        assert_eq!(
+            target(&[
+                "api",
+                "-X",
+                "POST",
+                "repos/o/r/actions/runners/registration-token"
+            ])
+            .as_deref(),
+            Some("o/r")
+        );
+        assert_eq!(
+            target(&[
+                "api",
+                "--paginate",
+                "-H",
+                "Accept: x",
+                "repos/o/r/hooks",
+                "--jq",
+                ".[]"
+            ])
+            .as_deref(),
+            Some("o/r")
+        );
+        // Not a single repository: leave the caller's routing alone.
+        assert_eq!(target(&["api", "orgs/o/actions/runners"]), None);
+        assert_eq!(target(&["api", "graphql", "-f", "query=repos/o/r"]), None);
+        assert_eq!(target(&["api", "repos/o/r", "--repo", "o/other"]), None);
+        assert_eq!(target(&["api", "repos/o"]), None);
+        assert_eq!(target(&["auth", "status"]), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_token_follows_the_repository_each_command_names() {
+        let temp = TempDir::new().expect("tempdir");
+        // The checkout is o/checkout; every call below targets another repository.
+        let checkout = temp.path().join("checkout");
+        std::fs::create_dir(&checkout).expect("checkout");
+        for args in [
+            &["init", "-q"][..],
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/o/checkout.git",
+            ][..],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&checkout)
+                    .status()
+                    .expect("git")
+                    .success()
+            );
+        }
+        let helper = temp.path().join("token-helper");
+        write_executable(
+            &helper,
+            r#"#!/bin/sh
+printf '{"token":"ghs_for_%s","expires_at":"2099-01-01T00:00:00Z"}' "$(printf '%s' "$1" | tr / _)"
+"#,
+        );
+        let log = temp.path().join("gh.log");
+        let gh = temp.path().join("gh");
+        write_executable(
+            &gh,
+            &format!(
+                "#!/bin/sh\nprintf '%s %s\\n' \"$GH_TOKEN\" \"$*\" >> '{}'\nprintf '{{}}'\n",
+                log.display()
+            ),
+        );
+        let config = LoadedConfig {
+            data: format!(
+                "[github.auth]\nsource = \"command\"\ntoken_command = [\"{}\", \"{{repo_slug}}\"]\n",
+                helper.display()
+            )
+            .parse()
+            .expect("config"),
+            global_dir: Path::new("/tmp/shipyard-global").to_path_buf(),
+            project_dir: None,
+            local_dir: None,
+            local_overlay_source: LocalOverlaySource::None,
+        };
+        let client = super::GitHubActions::from_loaded_config(&checkout, &config)
+            .with_gh_binary_for_tests(&gh);
+        let run = |args: &[&str]| {
+            client
+                .run_gh(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>())
+                .expect("gh");
+        };
+        run(&["api", "repos/o/target/pulls/1"]);
+        run(&["pr", "view", "1", "--repo", "o/other"]);
+        run(&["api", "orgs/o/actions/runners"]);
+        let pinned = client.clone().with_repo_override("o/pinned");
+        pinned
+            .run_gh(&["api".to_owned(), "repos/o/target/hooks".to_owned()])
+            .expect("gh");
+
+        assert_eq!(
+            std::fs::read_to_string(log).expect("log"),
+            "ghs_for_o_target api repos/o/target/pulls/1\n\
+             ghs_for_o_other pr view 1 --repo o/other\n\
+             ghs_for_o_checkout api orgs/o/actions/runners\n\
+             ghs_for_o_pinned api repos/o/target/hooks\n"
+        );
     }
 
     #[cfg(unix)]

@@ -69,7 +69,9 @@ pub(super) fn inspect_command<W: Write>(
         .get_str(PROFILE_CONFIG_KEY)
         .filter(|value| !value.trim().is_empty())
         .map(str::to_owned);
-    let actions = crate::cloud::GitHubActions::from_loaded_config(cwd, &config);
+    let actions = crate::cloud::GitHubActions::from_loaded_config(cwd, &config)
+        // Route the App token to the repository asked about, not the checkout's.
+        .with_repo_override(&repo);
     let reader = |gh_args: &[String]| {
         actions
             .run_gh_with_timeout(gh_args, GITHUB_READ_TIMEOUT)

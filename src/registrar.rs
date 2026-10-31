@@ -333,6 +333,9 @@ impl Registrar {
     }
 
     /// Idempotently create or update a webhook with an explicit `gh` binary.
+    /// Test seam: the ambient `gh` with no App token, so production webhook
+    /// calls never depend on the owner's `gh` login.
+    #[cfg(test)]
     pub fn ensure_registered_with_gh(
         &mut self,
         repo: &str,
@@ -400,6 +403,9 @@ impl Registrar {
     }
 
     /// Unregister a repo with an explicit `gh` binary.
+    /// Test seam: the ambient `gh` with no App token, so production webhook
+    /// calls never depend on the owner's `gh` login.
+    #[cfg(test)]
     pub fn unregister_with_gh(
         &mut self,
         repo: &str,
@@ -530,6 +536,9 @@ impl Registrar {
     }
 
     /// Observe with an explicit `gh` binary.
+    /// Test seam: the ambient `gh` with no App token, so production webhook
+    /// calls never depend on the owner's `gh` login.
+    #[cfg(test)]
     pub fn observe_with_gh(
         &self,
         repo: &str,
@@ -641,8 +650,8 @@ impl Registrar {
             .ok_or_else(|| RegistrarError::GhUnavailable("gh CLI not found on PATH".to_owned()))
     }
 
-    /// Build the configured `gh` client, hinting `repo` for a `{repo_slug}`
-    /// token-command placeholder (the daemon's CWD isn't a GitHub checkout).
+    /// Build the configured `gh` client with its `{repo_slug}` token-command
+    /// placeholder pinned to `repo`, whatever checkout the daemon's CWD is.
     #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
     fn configured_gh_client_optional(
         &self,
@@ -657,8 +666,12 @@ impl Registrar {
         {
             let client = GhClient::from_cwd(self.mode, &self.cwd)
                 .map_err(|error| RegistrarError::GhUnavailable(error.to_string()))?;
+            // An override, not a hint: a hint loses to the daemon's cwd
+            // checkout, which would route another repository's token here.
             let client = match repo {
-                Some(slug) => client.with_repo_hint(slug),
+                Some(slug) => client
+                    .with_repo_override(slug)
+                    .map_err(|error| RegistrarError::GhUnavailable(error.to_string()))?,
                 None => client,
             };
             Ok(Some(client))
@@ -1302,6 +1315,7 @@ fn run_gh_once(
     })
 }
 
+#[cfg(test)]
 fn validate_gh_binary(path: &Path) -> Result<(), RegistrarError> {
     let metadata = fs::metadata(path).map_err(|_| {
         RegistrarError::GhUnavailable(format!("gh CLI not executable: {}", path.display()))

@@ -483,18 +483,33 @@ fn resolve_helper_argv(
         ));
     }
     exact_absolute_path(Path::new(&command[5]), "token_command --private-key")?;
+    let scope_to_repository = match auth.get("scope_to_repository") {
+        None => false,
+        Some(TomlValue::Boolean(value)) => *value,
+        Some(_) => {
+            return Err(CliFailure::new(
+                1,
+                "machine-global github.auth.scope_to_repository must be a boolean",
+            ));
+        }
+    };
 
+    let mut credential_argv = vec![
+        "--app-id".to_owned(),
+        command[3].clone(),
+        "--private-key".to_owned(),
+        command[5].clone(),
+    ];
+    // ghapp then mints a token that covers only `repo`.
+    if scope_to_repository {
+        credential_argv.push("--scope-repository".to_owned());
+    }
     Ok(HelperArgvOutput {
         schema_version: SCHEMA_VERSION,
         command: "auth.helper-argv",
         wrapper,
         repo: repo.to_owned(),
-        credential_argv: vec![
-            "--app-id".to_owned(),
-            command[3].clone(),
-            "--private-key".to_owned(),
-            command[5].clone(),
-        ],
+        credential_argv,
     })
 }
 
@@ -941,6 +956,60 @@ mod tests {
             output.credential_argv,
             ["--app-id", "123456", "--private-key", TEST_PRIVATE_KEY,]
         );
+    }
+
+    #[test]
+    fn helper_argv_adds_repository_scope_only_when_configured() {
+        let temp = TempDir::new().expect("tempdir");
+        let command = [
+            TEST_WRAPPER,
+            "token",
+            "--app-id",
+            "123456",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--repo",
+            "{repo_slug}",
+        ];
+        let with_scope = |value: Option<TomlValue>| {
+            let mut config = command_config(temp.path(), &command);
+            if let Some(value) = value {
+                config
+                    .data
+                    .get_mut("github")
+                    .and_then(TomlValue::as_table_mut)
+                    .and_then(|github| github.get_mut("auth"))
+                    .and_then(TomlValue::as_table_mut)
+                    .expect("auth table")
+                    .insert("scope_to_repository".to_owned(), value);
+            }
+            resolve_helper_argv(&config, Path::new(TEST_WRAPPER), "danielraffel/Shipyard")
+        };
+
+        assert_eq!(
+            with_scope(Some(TomlValue::Boolean(true)))
+                .expect("scoped")
+                .credential_argv,
+            [
+                "--app-id",
+                "123456",
+                "--private-key",
+                TEST_PRIVATE_KEY,
+                "--scope-repository"
+            ]
+        );
+        for unscoped in [None, Some(TomlValue::Boolean(false))] {
+            assert_eq!(
+                with_scope(unscoped)
+                    .expect("unscoped")
+                    .credential_argv
+                    .len(),
+                4
+            );
+        }
+        let error = with_scope(Some(TomlValue::String("true".to_owned())))
+            .expect_err("non-boolean refused");
+        assert!(error.message.contains("must be a boolean"));
     }
 
     #[test]

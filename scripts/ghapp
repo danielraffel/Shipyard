@@ -1533,7 +1533,8 @@ if (
     or value.get("wrapper") != sys.argv[1]
     or value.get("repo") != sys.argv[2]
     or not isinstance(argv, list)
-    or len(argv) != 4
+    or len(argv) not in (4, 5)
+    or (len(argv) == 5 and argv[4] != "--scope-repository")
     or argv[0] != "--app-id"
     or argv[2] != "--private-key"
     or not argv[1].isascii()
@@ -1548,10 +1549,13 @@ for item in argv:
     sys.stdout.write(item + "\n")
 ' "$public_wrapper_path" "$repo" <<<"$resolver_json")
 unset resolver_json
-if [[ "${#credential_argv[@]}" != 4 || \
+# A fifth argument, only ever `--scope-repository`, comes from the machine-global
+# github.auth.scope_to_repository: the token then covers $repo alone.
+if [[ ( "${#credential_argv[@]}" != 4 && "${#credential_argv[@]}" != 5 ) || \
       "${credential_argv[0]}" != "--app-id" || \
       "${credential_argv[2]}" != "--private-key" || \
-      "${credential_argv[3]}" != /* ]]; then
+      "${credential_argv[3]}" != /* || \
+      ( "${#credential_argv[@]}" == 5 && "${credential_argv[4]}" != "--scope-repository" ) ]]; then
     echo "ghapp: shipyard helper-argv returned malformed JSON" >&2
     exit 1
 fi

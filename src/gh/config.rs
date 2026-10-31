@@ -126,6 +126,7 @@ struct RawGithubAuthConfig {
     token_command: Option<Vec<String>>,
     cache_ttl_seconds: Option<u64>,
     refresh_skew_seconds: Option<u64>,
+    scope_to_repository: Option<bool>,
     ambient_gh_binary: Option<PathBuf>,
     privileged_gh_binary: Option<PathBuf>,
     privileged_git_binary: Option<PathBuf>,
@@ -179,14 +180,33 @@ impl RawGithubAuthConfig {
         };
 
         let source = match source {
+            _ if self.scope_to_repository == Some(true) && source != "command" => {
+                return Err(GhConfigError::Invalid {
+                    message: "`github.auth.scope_to_repository` requires source = \"command\""
+                        .to_owned(),
+                });
+            }
             "gh-cli" => GhAuthSource::GhCli,
             "env" => {
                 let token_env = required_nonempty(self.token_env, "github.auth.token_env")?;
                 GhAuthSource::Env { token_env }
             }
             "command" => {
-                let token_command =
+                let mut token_command =
                     required_nonempty_vec(self.token_command, "github.auth.token_command")?;
+                if self.scope_to_repository == Some(true) {
+                    // The ghapp helper then asks GitHub for a token covering
+                    // only the expanded {repo_slug}. The flag joins the
+                    // command, so the token cache key carries the scope too.
+                    if !token_command.iter().any(|arg| arg.contains("{repo_slug}")) {
+                        return Err(GhConfigError::Invalid {
+                            message: "`github.auth.scope_to_repository` needs a `{repo_slug}` \
+                                      argument in `github.auth.token_command`"
+                                .to_owned(),
+                        });
+                    }
+                    token_command.push("--scope-repository".to_owned());
+                }
                 GhAuthSource::Command {
                     token_command,
                     cache_ttl_seconds: self.cache_ttl_seconds,

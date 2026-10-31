@@ -166,6 +166,8 @@ pub fn origin_main_satisfies_target(main_pin: &str, target: &str) -> bool {
     main_pin >= target
 }
 
+const SHIPYARD_RELEASE_REPO: &str = "danielraffel/Shipyard";
+
 /// Return the latest published Shipyard release tag via `gh`.
 #[must_use]
 pub fn latest_shipyard_release() -> Option<String> {
@@ -176,7 +178,10 @@ pub fn latest_shipyard_release() -> Option<String> {
 /// Return the latest published Shipyard release tag via the configured `gh`.
 #[must_use]
 pub fn latest_shipyard_release_from_cwd(mode: RuntimeMode, cwd: &Path) -> Option<String> {
+    // The token is for Shipyard's repository, not the consumer checkout.
     let output = GhClient::from_cwd(mode, cwd)
+        .ok()?
+        .with_repo_override(SHIPYARD_RELEASE_REPO)
         .ok()?
         .prepare_command(
             cwd,
@@ -189,7 +194,7 @@ pub fn latest_shipyard_release_from_cwd(mode: RuntimeMode, cwd: &Path) -> Option
             "release",
             "list",
             "--repo",
-            "danielraffel/Shipyard",
+            SHIPYARD_RELEASE_REPO,
             "--limit",
             "1",
             "--json",

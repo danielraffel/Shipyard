@@ -127,6 +127,9 @@ pub(super) fn collect_fleet_assessment(
     actions: &GitHubActions,
 ) -> Result<FleetAssessment, CliFailure> {
     let repo = super::runner_cmd::resolve_repo_slug(args.repo, cwd)?;
+    // Route the App token to the repository asked about, not the checkout's.
+    let routed_actions = actions.clone().with_repo_override(&repo);
+    let actions = &routed_actions;
     let classes = configured_host_classes(config).map_err(|e| CliFailure::new(2, e))?;
     if classes.is_empty() {
         return Err(CliFailure::new(
