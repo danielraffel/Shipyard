@@ -2,6 +2,10 @@
 
 Guidance for Claude Code (and Codex via `AGENTS.md → CLAUDE.md`) when working in this repository.
 
+## Autonomous architecture contract
+
+The permanent invariants for autonomous review, CI, merge, release, recovery, and cross-host handoff are in `docs/autonomy-contract.md`. Read it before changing those paths. A detector is not a recovery system: permitted remediation or redispatch and an authoritative post-action progress read are required. Keep the rollout default-off until the contract's crash, restart, fencing, and integrated-provider evidence passes.
+
 ## What is Shipyard
 
 Shipyard is a cross-platform CI controller: local VMs, SSH hosts, and cloud runners (Namespace / GitHub-hosted) coordinated under one queue-and-evidence model. It is designed so agents, not humans, are the primary users.

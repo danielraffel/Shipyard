@@ -2823,8 +2823,10 @@ pub(super) enum RunnerCommand {
     /// Dry-run is the default. `--apply` may enqueue an exact green head,
     /// rerun a bounded transient failure, or cancel only queued runs with a
     /// provably superseded PR/merge-group head. Same-head duplicates are never
-    /// cancelled. Repositories without a server-owned
-    /// merge queue are reported as direct-merge refusals.
+    /// cancelled. Repositories without a server-owned merge queue are admitted
+    /// by a server-enforced exact-head merge when GitHub requires the
+    /// app-bound approval context; otherwise they are reported as direct-merge
+    /// refusals.
     Steward {
         /// Owner/repo slug. Repeatable; defaults to the current repository.
         #[arg(long)]
@@ -2865,9 +2867,18 @@ pub(super) enum RunnerCommand {
         /// no current-head handoff receipt), so one cannot sit unqueued because
         /// nothing armed it. Audit-only without `--apply`. Drafts, failing
         /// required checks, conflicts, and heads the queue ejected are never
-        /// armed, and the queue-arm guard's refusals are honoured.
+        /// armed, and the queue-arm guard's refusals are honoured. A base with
+        /// no merge queue is never armed: there an armed request survives a
+        /// later push.
         #[arg(long = "arm-unqueued")]
         arm_unqueued: bool,
+        /// Required check that reports exact-head approval. On a base with no
+        /// merge queue, an owned, approved, CLEAN, all-green head is merged by
+        /// `mergePullRequest` bound to that head only when GitHub requires this
+        /// context from a bound app; otherwise it stays refused. Native
+        /// auto-merge is never armed there, and any armed request is disarmed.
+        #[arg(long = "approval-context", default_value = "review-verdict")]
+        approval_context: String,
         /// Perform the planned mutations. Without this flag, only audit.
         #[arg(long)]
         apply: bool,
