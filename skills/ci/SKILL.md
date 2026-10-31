@@ -1036,7 +1036,12 @@ successful rotation.
 A normal PR does not edit `Cargo.toml`, `Cargo.lock`, or plugin manifest
 versions. The read-only version gate rejects those edits unless the PR carries
 the explicit release recovery trailer. After merge, `version-at-land.yml` is the
-single writer and assigns the next versions.
+single writer and assigns the next versions. It never pushes to `main` (the
+ruleset requires PR-only checks): it rebuilds the bot-owned
+`release/version-at-land` branch with one cumulative bump commit, keeps a single
+pull request open for it, labels it `shipyard:managed` and posts the exact-head
+`shipyard/steward-handoff` status. That pull request still needs green required
+checks and a reviewer's exact-head APPROVE; the run on its merge is a no-op.
 
 ## Stale ship-state records: `discard --repo` and `prune`
 
