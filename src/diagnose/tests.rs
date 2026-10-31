@@ -451,6 +451,15 @@ const STALL_LOG: &str = "\
 ";
 
 #[test]
+fn unittest_failure_summary_is_not_a_test_name() {
+    let lines = evidence::clean(&evidence::split_lines(
+        "FAILED real_test\nFAILED (failures=1, skipped=1)\n",
+    ));
+    let found = evidence::extract(&lines, 0, lines.len());
+    assert_eq!(found.tests, vec!["real_test"]);
+}
+
+#[test]
 fn an_upload_stall_after_a_green_test_step_is_infra() {
     let green_log = STALL_LOG
         .replace("FAILED", "passed")

@@ -460,6 +460,14 @@ blocks an earlier approval. A HOLD whose time cannot be read always blocks.
   `review-verdict` status applies (the status reads no host's file). Without
   either, the signer rule is off on that host;
   roll it out one host at a time.
+  A protected base can additionally bind a signer name to the stamped,
+  provider-neutral host and agent with
+  `[auto_merge.reviewer_signer_identities]`, for example
+  `codex-review = ["Daniels-Mac-Studio-m3 agent:codex-reviewer"]`.
+  A bound signer must carry that host and `agent:` value in its `ghapp` stamp;
+  a missing agent, another host or agent, or a signer with no binding refuses
+  the APPROVE. This map is separate from the existing list form of
+  `reviewer_identities`, which names GitHub reviewer logins.
 * A signer line can be copied, so a host can also list the exact `session:`
   lines its reviewers write, under a `sessions` key in the same file:
   `{"sessions": ["session: pulp-review (team-lead team, agent pulp-review, host m3)"]}`
@@ -701,6 +709,23 @@ request, another head, or one neither armed nor queued is left alone. Every
 action and every failure is a line in `holds.jsonl` in the guards directory.
 The head lands again only once a newer verdict approves it, which
 `queue-arm-guard` requires on hosts with review before arm.
+
+The merge steward closes the same gap without a HOLD. On every `--apply` pass
+it disables an armed auto-merge request on any open PR whose current head the
+exact-head approval gate does not admit (`disarmed_stale_auto_merge:<sha>`).
+It can also remove such a head from the merge queue
+(`dequeued_unapproved:<sha>`), gated by the machine-global
+`[merge_steward] unapproved_dequeue` switch, which defaults to `"report"`
+(report `would_dequeue_unapproved:<sha>`, remove nothing). Under `"apply"` it
+dequeues only on positive evidence from a successful read, or after three
+consecutive PR-specific unreadable passes (`dequeued_unreadable_streak:<sha>`),
+and at most two per repository per pass. Both mutations carry Shipyard's
+internal marker and one-shot `internal-removal` nonce, so `queue-removal-guard`
+accepts them as audited Shipyard removals; the guard is unchanged for every
+other caller. The steward's own approval gate does not count its own removals
+toward the head's ejection cap; `queue-arm-guard` has no ejection cap (its only
+bound is `INTERRUPTION_REARM_LIMIT` for environment re-enqueues, and it refuses
+a same-head re-arm after any removal).
 
 **The one sanctioned route around `queue-removal-guard`.** The hook's mutation
 goes to the real `gh` with the exported App token, not back through `ghapp`, so
