@@ -325,6 +325,7 @@ those values to authenticated durable events before they are imported.
 
 `metrics scorecard` also reports failed/cancelled compute waste, queue-wait
 coordination cost, and failed-attempt rework as observational baseline metrics.
+
 It does not alter routing or queue behavior. The per-safely-merged-change
 denominator is unavailable until a durable merge receipt joins the PR head;
 distinct PRs are not a safe-merge proxy.
