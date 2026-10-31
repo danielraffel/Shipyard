@@ -135,13 +135,13 @@ fn read_archive(dir: &Path) -> Result<ArchiveRows, CliFailure> {
                 continue;
             };
             if is_fixlinks {
-                if value["schema"] != cause::SCHEMA || value["source"] != "fix-link" {
+                if !super::advice::valid_fixlink(&value) {
                     findings.push(finding(
                         &path,
                         dir,
                         line_number,
                         "invalid_fixlink",
-                        "row is not a ci.cause/v1 fix-link",
+                        "row is not a complete, safe ci.cause/v1 fix-link",
                     ));
                     continue;
                 }
@@ -368,6 +368,43 @@ mod tests {
         }).to_string()
     }
 
+    fn fixlink(red_run_id: u64, derivation: &str) -> Value {
+        serde_json::json!({
+            "schema": cause::SCHEMA,
+            "source": "fix-link",
+            "repo": "o/r",
+            "red_run_id": red_run_id,
+            "red_attempt": 1,
+            "fix_run_id": if derivation == "rerun_green" {
+                red_run_id
+            } else {
+                red_run_id + 1
+            },
+            "head_sha": "a".repeat(40),
+            "fix_head_sha": if derivation == "rerun_green" {
+                "a".repeat(40)
+            } else {
+                "b".repeat(40)
+            },
+            "derivation": derivation,
+            "red_time": "2026-10-13T00:00:00Z",
+            "pushed_at": "2026-10-13T01:00:00Z",
+            "branch": "main",
+            "rule": "test",
+            "collector": "test",
+            "pr": null,
+            "files_raw": [],
+            "own_files": [],
+            "files_truncated": false,
+            "own_files_truncated": false,
+            "own_files_method": if derivation == "rerun_green" {
+                "rerun_same_head"
+            } else {
+                "first_parent_non_merge_commits"
+            },
+        })
+    }
+
     #[test]
     fn reports_malformed_duplicate_and_orphan_rows_without_writing() {
         let dir = tempdir().expect("tempdir");
@@ -377,9 +414,12 @@ mod tests {
             format!("{}\n{}\nnot-json\n", cause(1), cause(1)),
         )
         .expect("causes file");
-        fs::write(dir.path().join("fixlinks.jsonl"), r#"{"schema":"ci.cause/v1","source":"fix-link","repo":"o/r","red_run_id":2,"red_attempt":1}
-{"schema":"ci.cause/v1","source":"fix-link","repo":"o/r","red_run_id":2,"red_attempt":1}
-"#).expect("fixlinks");
+        let duplicate = fixlink(2, "compare_red_head_to_fix_head");
+        fs::write(
+            dir.path().join("fixlinks.jsonl"),
+            format!("{duplicate}\n{duplicate}\n"),
+        )
+        .expect("fixlinks");
         let before = fs::read_dir(dir.path()).expect("before").count();
         let report = audit(&CauseAuditArgs {
             dir: dir.path().to_path_buf(),
@@ -440,11 +480,11 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         fs::create_dir(dir.path().join("causes")).expect("causes");
         fs::write(dir.path().join("causes/2026-10.jsonl"), cause(1)).expect("cause");
+        let compare = fixlink(1, "compare_red_head_to_fix_head");
+        let rerun = fixlink(1, "rerun_green");
         fs::write(
             dir.path().join("fixlinks.jsonl"),
-            r#"{"schema":"ci.cause/v1","source":"fix-link","repo":"o/r","red_run_id":1,"red_attempt":1,"derivation":"compare_red_head_to_fix_head"}
-{"schema":"ci.cause/v1","source":"fix-link","repo":"o/r","red_run_id":1,"red_attempt":1,"derivation":"rerun_green"}
-"#,
+            format!("{compare}\n{rerun}\n"),
         )
         .expect("fixlinks");
         let report = audit(&CauseAuditArgs {
@@ -460,7 +500,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         fs::write(
             dir.path().join("fixlinks.jsonl"),
-            r#"{"schema":"ci.cause/v1","source":"fix-link","repo":"o/r","red_run_id":2,"red_attempt":1,"derivation":"rerun_green","fix_run_id":2,"fix_head_sha":"0123456789abcdef0123456789abcdef01234567","head_sha":"0123456789abcdef0123456789abcdef01234567","files_raw":[],"own_files":[],"files_truncated":false,"own_files_truncated":false,"own_files_method":"rerun_same_head"}
+            r#"{"schema":"ci.cause/v1","source":"fix-link","repo":"o/r","red_run_id":2,"red_attempt":1,"derivation":"rerun_green","fix_run_id":2,"fix_head_sha":"0123456789abcdef0123456789abcdef01234567","head_sha":"0123456789abcdef0123456789abcdef01234567","red_time":"2026-10-13T00:00:00Z","pushed_at":"2026-10-13T00:30:00Z","branch":"main","rule":"test","collector":"test","pr":null,"files_raw":[],"own_files":[],"files_truncated":false,"own_files_truncated":false,"own_files_method":"rerun_same_head"}
 "#,
         )
         .expect("fixlinks");
@@ -475,12 +515,9 @@ mod tests {
     #[test]
     fn rejects_unproven_orphan_rerun_fixlink() {
         let dir = tempdir().expect("tempdir");
-        fs::write(
-            dir.path().join("fixlinks.jsonl"),
-            r#"{"schema":"ci.cause/v1","source":"fix-link","repo":"o/r","red_run_id":2,"red_attempt":1,"derivation":"rerun_green"}
-"#,
-        )
-        .expect("fixlinks");
+        let mut unproven = fixlink(2, "rerun_green");
+        unproven["fix_run_id"] = serde_json::json!(3);
+        fs::write(dir.path().join("fixlinks.jsonl"), unproven.to_string()).expect("fixlinks");
         let report = audit(&CauseAuditArgs {
             dir: dir.path().to_path_buf(),
         })
