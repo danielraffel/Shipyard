@@ -273,10 +273,40 @@ pub(super) fn apply_pr_plans(
         .map(|pr| {
             let attempts = attempts_for(ledger, &observation.repo, &pr.fact);
             let decision = classify_pr(&pr.fact, policy, &attempts);
-            if let Some(report) =
+            // Every open PR on the base, owned or not: an armed request whose
+            // current head the approval gate does not admit is disarmed
+            // before anything else acts on it. See `stale_auto_merge`.
+            let (stale_mutation, stale_error) =
+                if super::stale_auto_merge::applies(policy, pr, &decision) {
+                    super::stale_auto_merge::sweep(
+                        actions,
+                        observation,
+                        mutation_context.as_ref(),
+                        args.apply,
+                        pr,
+                        ledger,
+                    )
+                } else {
+                    (None, None)
+                };
+            unhealthy |= stale_error.is_some();
+            let fold = |mutation: Option<String>, error: Option<String>| {
+                (
+                    match (stale_mutation.clone(), mutation) {
+                        (Some(stale), Some(next)) => Some(format!("{stale},{next}")),
+                        (stale, next) => stale.or(next),
+                    },
+                    match (stale_error.clone(), error) {
+                        (Some(stale), Some(next)) => Some(format!("{stale}; {next}")),
+                        (stale, next) => stale.or(next),
+                    },
+                )
+            };
+            if let Some(mut report) =
                 provenance_blocked_report(mutation_context.as_ref(), pr, policy, &decision, ledger)
             {
                 unhealthy |= report.error.is_some();
+                (report.mutation, report.error) = fold(report.mutation, report.error);
                 return report;
             }
             let (mut mutation, mut error) = (None, None);
@@ -389,6 +419,7 @@ pub(super) fn apply_pr_plans(
                 }
             }
             unhealthy |= error.is_some();
+            let (mutation, error) = fold(mutation, error);
             PrReport {
                 number: pr.fact.number,
                 head_sha: pr.fact.head_sha.clone(),

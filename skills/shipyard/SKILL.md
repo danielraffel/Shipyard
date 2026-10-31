@@ -3523,6 +3523,22 @@ mutations are `merged_exact_head:<sha>`, `waiting_head_approval`, and
 armed request survives a later push by anyone with write access; any armed
 request on an owned PR is disarmed (`auto_merge_disabled:<sha>`) on every
 `--apply` pass, approved or not. The org-queue path never takes this merge.
+On both admission paths (`native_queue_exact_head` and
+`server_enforced_exact_head_merge`) the steward, as the base's single admission
+writer, also sweeps every other open PR, owned or not: an armed native
+auto-merge request whose current head the exact-head gate does not admit is
+disabled (`disablePullRequestAutoMerge`), reported as
+`disarmed_stale_auto_merge:<sha>`, and audited as `disarm_stale_auto_merge`.
+This closes the gap where an arm enabled for an older head survives a push by
+anyone with write access and GitHub then enqueues the unapproved new head
+itself. A head the gate admits (`Approved`, or `NotRequired` where the
+repository does not require approval) keeps its arm, since the steward would
+enqueue it anyway; an approval that cannot be read, or a live head that moved
+since the census, disarms. The disarm runs under the PR mutation guard on
+Shipyard's internal queue-mutation path, whose one-shot nonce the `ghapp`
+`queue-removal-guard` accepts; a plain `gh` disarm is refused as an
+unaudited queue removal. A dry run reports
+`would_disarm_stale_auto_merge:<sha>` and changes nothing.
 The bound rule is satisfied only by a check run carrying that app id (the
 canonical `review-verdict` job, github-actions 15368); an app-less status of
 the same name never satisfies it. The canonical job fails unless the head is

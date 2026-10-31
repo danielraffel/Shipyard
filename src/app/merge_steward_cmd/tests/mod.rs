@@ -205,6 +205,8 @@ mod observation;
 #[cfg(unix)]
 mod recovery;
 #[cfg(unix)]
+mod stale_auto_merge;
+#[cfg(unix)]
 mod train_off;
 #[cfg(unix)]
 mod transient_rerun;
