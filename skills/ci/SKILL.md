@@ -1056,6 +1056,15 @@ pull request open for it, labels it `shipyard:managed` and posts the exact-head
 `shipyard/steward-handoff` status. That pull request still needs green required
 checks and a reviewer's exact-head APPROVE; the run on its merge is a no-op.
 
+The bump commit also carries `Skill-Update: skip` (and `Doc-Update: skip`)
+trailers, computed from `skill_path_map.json` / `doc_sync_map.json` for the
+files it edited, because the skill map claims `Cargo.toml` and
+`.claude-plugin/**` and the sync gate otherwise leaves the bump pull request
+non-CLEAN (the steward admits only CLEAN). A kept bump head that lacks a
+currently required trailer is treated as stale and rebuilt on the next run;
+dispatch `version-at-land.yml` by hand to force that without waiting for a
+landing.
+
 ## Stale ship-state records: `discard --repo` and `prune`
 
 The daemon archives a record when its PR's `pull_request.closed` webhook
