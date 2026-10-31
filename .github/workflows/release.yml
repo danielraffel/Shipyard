@@ -363,6 +363,8 @@ jobs:
       - name: Sign, notarize, staple, and upload macOS DMG
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # The publish gate expects the same asset set the build matrix produced.
+          CI_PLATFORM_FOCUS: ${{ inputs.platform_focus || vars.CI_PLATFORM_FOCUS || 'macos' }}
           SHIPYARD_NOTARIZE_APPLE_ID: ${{ secrets.MACOS_NOTARIZE_APPLE_ID }}
           SHIPYARD_NOTARIZE_APP_PASSWORD: ${{ secrets.MACOS_NOTARIZE_APP_PASSWORD }}
           SHIPYARD_NOTARIZE_TEAM_ID: ${{ secrets.MACOS_NOTARIZE_TEAM_ID }}

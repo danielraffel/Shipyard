@@ -88,14 +88,16 @@ class ReleaseMacosLocalTests(unittest.TestCase):
         self.assertIn("release_macos_local.py", content)
         self.assertTrue(os.access(wrapper, os.X_OK))
 
-    def test_macos_focus_expects_macos_and_linux_x64_only(self) -> None:
+    def test_macos_focus_expects_macos_and_both_linux_but_not_windows(self) -> None:
         for focus in (None, "macos"):
             with mock.patch.dict(os.environ, {}, clear=True):
                 assets = release_macos_local.expected_release_assets("shipyard", focus)
             self.assertIn("shipyard-macos-arm64.dmg", assets)
             self.assertIn("shipyard-workstream-provider-linux-x64", assets)
             self.assertIn("checksums.sha256", assets)
-            self.assertFalse([a for a in assets if "windows" in a or "linux-arm64" in a])
+            self.assertIn("shipyard-linux-arm64", assets)
+            self.assertIn("shipyard-workstream-provider-linux-arm64", assets)
+            self.assertFalse([a for a in assets if "windows" in a])
         with mock.patch.dict(os.environ, {"CI_PLATFORM_FOCUS": "all"}):
             self.assertIn(
                 "shipyard-windows-x64.exe",

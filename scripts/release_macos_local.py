@@ -238,18 +238,18 @@ def expected_release_assets(
 
     `focus` follows the CI_PLATFORM_FOCUS repo variable (read from the
     environment when not given): `macos` (default) expects macOS and
-    linux-x64; `all` also expects linux-arm64 and windows-x64.
+    Linux x64/arm64; `all` also expects windows-x64.
     """
     companion = package_release.COMPANION_BIN_NAME
     focus = (focus or os.environ.get("CI_PLATFORM_FOCUS") or "macos").lower()
     assets = [
         f"{artifact_prefix}-linux-x64",
         f"{companion}-linux-x64",
+        f"{artifact_prefix}-linux-arm64",
+        f"{companion}-linux-arm64",
     ]
     if focus == "all":
         assets += [
-            f"{artifact_prefix}-linux-arm64",
-            f"{companion}-linux-arm64",
             f"{artifact_prefix}-windows-x64.exe",
             f"{companion}-windows-x64.exe",
         ]

@@ -373,10 +373,11 @@ class CiMatrixTests(unittest.TestCase):
         self.assertEqual([r["key"] for r in rows], ["linux", "macos-arm64", "windows"])
         self.assertEqual(ci_matrix.workflow_outputs("ci", env)["platform_focus"], "all")
 
-    def test_release_default_focus_builds_macos_and_linux_x64_only(self) -> None:
+    def test_release_default_focus_builds_macos_and_both_linux(self) -> None:
         rows = ci_matrix.workflow_matrix("release", {})["include"]
         self.assertEqual(
-            [r["package_target"] for r in rows], ["macos-arm64", "linux-x64"]
+            [r["package_target"] for r in rows],
+            ["macos-arm64", "linux-x64", "linux-arm64"],
         )
         full = ci_matrix.workflow_matrix("release", {"PLATFORM_FOCUS": "all"})["include"]
         self.assertEqual(

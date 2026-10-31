@@ -248,10 +248,11 @@ def _is_untrusted_sandbox_canary(
 VALID_FOCUS = ("macos", "all")
 # Platforms kept when the focus is `macos`. linux-x64 stays in the release set
 # because other repositories install the Shipyard linux-x64 binary on
-# ubuntu-latest.
+# ubuntu-latest, and linux-arm64 because install.sh and the Linux ARM VMs
+# consume it. Only windows-x64 is dropped.
 MACOS_FOCUS_TARGETS = {
     "ci": frozenset({"macos-arm64"}),
-    "release": frozenset({"macos-arm64", "linux"}),
+    "release": frozenset({"macos-arm64", "linux", "linux-arm64"}),
 }
 
 
