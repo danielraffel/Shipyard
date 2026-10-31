@@ -57,10 +57,24 @@ LOCK_OWNER="$LOCK_DIR/owner"
 lock_acquired=0
 for _lock_attempt in 1 2; do
   if mkdir "$LOCK_DIR" 2>/dev/null; then
-    printf '%s\n' "$$" >"$LOCK_OWNER"
-    chmod 600 "$LOCK_OWNER"
+    owner_tmp="$LOCK_DIR/.owner.$$"
+    printf '%s\n' "$$" >"$owner_tmp"
+    chmod 600 "$owner_tmp"
+    if ! ln "$owner_tmp" "$LOCK_OWNER" 2>/dev/null; then
+      rm -f "$owner_tmp"
+      rmdir "$LOCK_DIR" 2>/dev/null || true
+      echo "could not publish cleanup lock owner for $STATUS" >&2
+      exit 1
+    fi
+    rm -f "$owner_tmp"
     lock_acquired=1
     break
+  fi
+  # An owner-less lock cannot be distinguished from a live process paused
+  # before its marker publication. Leave it in place and fail closed.
+  if [ ! -e "$LOCK_OWNER" ]; then
+    echo "another scheduled cleanup is already running for $STATUS" >&2
+    exit 1
   fi
   owner_pid="$(cat "$LOCK_OWNER" 2>/dev/null || true)"
   owner_command=""
@@ -75,6 +89,7 @@ for _lock_attempt in 1 2; do
       ;;
   esac
   if [ -n "$owner_pid" ] && rm -f "$LOCK_OWNER" 2>/dev/null \
+    && rm -f "$LOCK_DIR"/.owner.* 2>/dev/null \
     && rmdir "$LOCK_DIR" 2>/dev/null; then
     continue
   fi
