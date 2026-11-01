@@ -134,6 +134,7 @@ pub(super) fn reconcile_recovery_signal(
         StewardDecision::Unmanaged
         | StewardDecision::HandoffMissing
         | StewardDecision::OptedOut
+        | StewardDecision::ExcludedLabel { .. }
         | StewardDecision::ProvenanceBlocked { .. }
         | StewardDecision::Draft
         | StewardDecision::InvalidHead => {
