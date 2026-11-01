@@ -87,7 +87,7 @@ pub(super) fn apply_repo_plan(
         handoff_context: args.handoff_context.clone(),
         max_transient_reruns: args.max_transient_reruns,
     };
-    let (reports, pr_mutation_failed) = apply_pr_plans(
+    let (mut reports, pr_mutation_failed) = apply_pr_plans(
         actions,
         args,
         observation,
@@ -124,6 +124,7 @@ pub(super) fn apply_repo_plan(
             false,
         )
     };
+    super::native_arm::annotate_carried_refusals(&native_arm_status, &mut reports);
     let mut unhealthy = (args.preempt_capacity && observation.preemption_error.is_some())
         || native_arm_failed
         || pr_mutation_failed
@@ -268,6 +269,7 @@ pub(super) fn apply_pr_plans(
         ledger_path,
         mutation_control,
         approval_blockers: std::cell::RefCell::default(),
+        carried_commits: std::cell::RefCell::default(),
     });
     let mut sweep_pass = super::unapproved_admission::SweepPass::new(args.unapproved_dequeue);
     if args.apply {

@@ -406,6 +406,9 @@ struct MutationApplyContext<'a> {
     /// head it judged and, when refused, why. The report's `blocked_on` reads
     /// it instead of asking GitHub again.
     approval_blockers: std::cell::RefCell<ApprovalBlockers>,
+    /// Open pull requests' commits and approvals this pass read for the
+    /// carried-commit admission guard. See `carried_commits`.
+    carried_commits: std::cell::RefCell<carried_commits::PassCache>,
 }
 
 /// Exact-head approval gate reads made during one pass, by PR number.
@@ -1420,6 +1423,7 @@ mod cancellation_recovery;
 mod cancellation_revalidation;
 mod cancellation_terminalization;
 mod capacity_cancellation;
+mod carried_commits;
 mod exact_head_merge;
 mod ledger;
 mod native_arm;

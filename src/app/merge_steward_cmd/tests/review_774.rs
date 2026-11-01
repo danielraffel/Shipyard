@@ -609,3 +609,69 @@ fn apply_hold_posted_after_census_is_still_refused_inside_enqueue() {
     );
     assert_eq!(count(&calls, "enqueuePullRequest"), 0, "{calls}");
 }
+
+/// The 2026-11-01 shape through the real admission entry point: this head is
+/// approved and green, but it carries a commit of #11361, whose own head is
+/// held. Admission is refused and names #11361; with #11361 approved instead,
+/// the same head reaches the enqueue.
+#[cfg(unix)]
+#[test]
+fn apply_refuses_a_head_carrying_another_prs_held_commit() {
+    const HELD_HEAD: &str = "883bb3f600000000000000000000000000000000";
+    const CARRIED: &str = "c26a23be00000000000000000000000000000000";
+    for verdict in ["HOLD", "APPROVE"] {
+        let temp = tempfile::tempdir().expect("temp");
+        let log = temp.path().join("calls");
+        let approve = comment_at(
+            "shipyard-review[bot]",
+            "2026-10-11T12:00:00Z",
+            &format!("verdict: APPROVE head:{HEAD}"),
+        );
+        let held = comment_at(
+            "shipyard-review[bot]",
+            "2026-10-11T12:00:00Z",
+            &format!("verdict: {verdict} head:{HELD_HEAD}"),
+        );
+        let listing = format!(
+            r#"{{"data":{{"repository":{{"pullRequests":{{"pageInfo":{{"hasNextPage":false,"endCursor":null}},"nodes":[{{"number":11361,"headRefName":"feat/real-world-inputs-t2","baseRefName":"main","headRefOid":"{HELD_HEAD}","isCrossRepository":false,"author":{{"login":"someone"}},"carriedCommits":{{"totalCount":2,"nodes":[{{"commit":{{"oid":"{CARRIED}"}}}},{{"commit":{{"oid":"{HELD_HEAD}"}}}}]}}}}]}}}}}}}}"#
+        );
+        let carried = format!(
+            r#"# CARRIED_COMMITS
+printf '%s\n' "$*" >> '{log}'
+case "$*" in
+  *"/compare/"*"total_commits"*) printf '%s' '{{"total":2,"shas":["{CARRIED}","{HEAD}"]}}'; exit 0 ;;
+  *"carriedCommits"*) printf '%s' '{listing}'; exit 0 ;;
+  *"commits/{HELD_HEAD}"*) printf '%s' '2026-10-11T00:00:00Z'; exit 0 ;;
+  *"pulls/11361/reviews"*) printf '%s\n' ''; exit 0 ;;
+  *"issues/11361/comments"*) printf '%s\n' '{held}'; exit 0 ;;
+  *"isInMergeQueue"*"number=11361"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"number":11361,"state":"OPEN","headRefOid":"{HELD_HEAD}","isInMergeQueue":false,"mergeQueueEntry":null,"autoMergeRequest":null,"timelineItems":{{"pageInfo":{{"hasPreviousPage":false}},"nodes":[]}}}}}}}}}}'; exit 0 ;;
+esac
+"#,
+            log = log.display(),
+        );
+        let body = format!(
+            "{carried}{}",
+            apply_script(&log, &format!("printf '%s\\n' '{approve}'"))
+        );
+        let (mutation, error, calls) = apply_run(&temp, &body);
+        if verdict == "HOLD" {
+            assert_eq!(
+                mutation.as_deref(),
+                Some("carries_unapproved_commits:#11361"),
+                "{error:?}\n{calls}"
+            );
+            let detail = error.expect("the refusal names the carried commits");
+            assert!(detail.contains(CARRIED), "{detail}");
+            assert!(detail.contains(HELD_HEAD), "{detail}");
+            assert_eq!(count(&calls, "enqueuePullRequest"), 0, "{calls}");
+        } else {
+            // The fixture's enqueue answer is empty; reaching it is the point.
+            assert!(
+                !mutation.as_deref().unwrap_or("").contains("carried"),
+                "{mutation:?}"
+            );
+            assert!(count(&calls, "enqueuePullRequest") >= 1, "{calls}");
+        }
+        assert_eq!(count(&calls, "carriedCommits"), 1, "{calls}");
+    }
+}
