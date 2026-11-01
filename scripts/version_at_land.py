@@ -22,6 +22,7 @@ import argparse
 import json
 import os
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -207,6 +208,45 @@ def message(assignments: list[Assignment], base: str, head: str,
             + "".join(f"{line}\n" for line in extra_trailers or []))
 
 
+# A fine-grained token made from the release-bot recipe has only Contents
+# write. The bump pull request also needs these, or every call is a 403.
+REQUIRED_TOKEN_PERMISSIONS = ("Pull requests: Read and write",
+                              "Commit statuses: Read and write")
+
+
+class GitHubApiError(RuntimeError):
+    """A ``gh api`` call failed; carries what gh printed so the log says why."""
+
+    def __init__(self, args: list[str], returncode: int, stdout: str, stderr: str) -> None:
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+        method = args[1] if args[:1] == ["-X"] else "GET"
+        path = next((a for a in (args[2:] if args[:1] == ["-X"] else args)
+                     if not a.startswith("-")), "?")
+        self.method, self.path = method, path
+        super().__init__(f"gh api {method} {path} exited {returncode}")
+
+    def report(self) -> str:
+        lines = [f"version-at-land: gh api {self.method} {self.path} failed "
+                 f"(exit {self.returncode})"]
+        if self.stderr.strip():
+            lines.append("gh stderr: " + self.stderr.strip())
+        if self.stdout.strip():
+            lines.append("gh response: " + self.stdout.strip())
+        text = (self.stderr + self.stdout).lower()
+        if "403" in text or "resource not accessible" in text:
+            lines.append(
+                "RELEASE_BOT_TOKEN cannot make this call. The bump pull request needs "
+                "the token to also grant: " + "; ".join(REQUIRED_TOKEN_PERMISSIONS)
+                + ". Edit the token at https://github.com/settings/personal-access-tokens "
+                "(or replace it with `gh secret set RELEASE_BOT_TOKEN`).")
+        elif "401" in text or "bad credentials" in text:
+            lines.append("RELEASE_BOT_TOKEN is expired or revoked; replace it with "
+                         "`gh secret set RELEASE_BOT_TOKEN`.")
+        return "\n".join(lines)
+
+
 class GitHub:
     """The few REST calls the bump pull request needs, through ``gh api``.
 
@@ -221,8 +261,10 @@ class GitHub:
         self.binary = binary or os.environ.get("VERSION_AT_LAND_GH", "gh")
 
     def api(self, *args: str) -> object:
-        result = subprocess.run([self.binary, "api", *args], check=True,
+        result = subprocess.run([self.binary, "api", *args], check=False,
                                 capture_output=True, text=True)
+        if result.returncode != 0:
+            raise GitHubApiError(list(args), result.returncode, result.stdout, result.stderr)
         return json.loads(result.stdout) if result.stdout.strip() else None
 
     def open_pull(self, branch: str, base: str) -> int | None:
@@ -416,9 +458,17 @@ def main(argv: list[str] | None = None) -> int:
     if not args.push and not args.base:
         parser.error("--base is required unless --push is given")
     github = GitHub(args.repo) if args.pr_branch else None
-    status, assignments = run(root, config, args.remote, args.branch, args.base,
-                              args.max_retries, args.push, args.pr_branch, github,
-                              args.target_url)
+    try:
+        status, assignments = run(root, config, args.remote, args.branch, args.base,
+                                  args.max_retries, args.push, args.pr_branch, github,
+                                  args.target_url)
+    except GitHubApiError as error:
+        print(error.report(), file=sys.stderr, flush=True)
+        if args.json:
+            print(json.dumps({"status": "github-api-failed", "method": error.method,
+                              "path": error.path, "stderr": error.stderr.strip(),
+                              "response": error.stdout.strip()}, indent=2))
+        return 1
     payload = {"status": status, "plan": [a.__dict__ for a in assignments]}
     if args.json:
         print(json.dumps(payload, indent=2))

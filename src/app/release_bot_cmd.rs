@@ -293,7 +293,7 @@ fn setup<W: Write>(
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
         writeln!(
             stdout,
-            "\nRequired repository permissions:\n  - Contents: Read and write\n  - Metadata: Read-only\n  - Workflows: Read and write when the bot touches workflows"
+            "\nRequired repository permissions:\n  - Contents: Read and write\n  - Metadata: Read-only\n  - Pull requests: Read and write (version-at-land opens the bump pull request)\n  - Commit statuses: Read and write (version-at-land hands the bump head to the steward)\n  - Workflows: Read and write when the bot touches workflows"
         )
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     }

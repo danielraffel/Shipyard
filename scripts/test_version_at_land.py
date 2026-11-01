@@ -212,6 +212,13 @@ while rest:
     fields.setdefault(key, []).append(value)
     rest = rest[2:]
 state["calls"].append({"method": method, "path": path, "fields": fields})
+fail = os.environ.get("FAKE_GH_FAIL", "")
+if fail and fail.split(" ", 1)[0] == method and fail.split(" ", 1)[1] in path:
+    json.dump(state, open(state_path, "w"))
+    print(json.dumps({"message": "Resource not accessible by personal access token",
+                      "status": "403"}))
+    sys.stderr.write("gh: Resource not accessible by personal access token (HTTP 403)\n")
+    sys.exit(1)
 out = None
 repo = "/".join(path.split("/")[1:3])
 if method == "GET" and "/pulls?" in path:
@@ -309,12 +316,16 @@ class VersionAtLandPullRequestTests(unittest.TestCase):
         run(self.dev, "git", "push", "-q", "origin", "HEAD:main")
         return run(self.dev, "git", "rev-parse", "HEAD").stdout.strip()
 
-    def writer(self) -> dict:
+    def run_writer(self, **extra_env: str) -> subprocess.CompletedProcess[str]:
         env = {**os.environ, "VERSION_AT_LAND_GH": str(self.fake_gh),
-               "FAKE_GH_STATE": str(self.state), "GITHUB_REPOSITORY": "owner/shipyard"}
-        result = subprocess.run(
+               "FAKE_GH_STATE": str(self.state), "GITHUB_REPOSITORY": "owner/shipyard",
+               **extra_env}
+        return subprocess.run(
             ["python3", "scripts/version_at_land.py", "--push", "--pr-branch", PR_BRANCH,
              "--json"], cwd=self.ci, env=env, text=True, capture_output=True)
+
+    def writer(self) -> dict:
+        result = self.run_writer()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return json.loads(result.stdout[result.stdout.index("{"):])
 
@@ -473,6 +484,29 @@ class VersionAtLandPullRequestTests(unittest.TestCase):
     def test_workflow_can_be_dispatched_by_an_operator(self) -> None:
         workflow = (ROOT / ".github/workflows/version-at-land.yml").read_text()
         self.assertIn("workflow_dispatch:", workflow)
+
+    def test_refused_pull_request_call_prints_ghs_error_and_the_fix(self) -> None:
+        self.land("src/a.rs", "pub fn a() {}\n", "fix: a")
+        result = self.run_writer(FAKE_GH_FAIL="POST /pulls")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertIn("gh api POST repos/owner/shipyard/pulls failed", result.stderr)
+        self.assertIn("Resource not accessible by personal access token (HTTP 403)",
+                      result.stderr)
+        self.assertIn("Pull requests: Read and write", result.stderr)
+        payload = json.loads(result.stdout[result.stdout.index("{"):])
+        self.assertEqual(payload["status"], "github-api-failed")
+        self.assertEqual(payload["path"], "repos/owner/shipyard/pulls")
+        self.assertIn("HTTP 403", payload["stderr"])
+
+    def test_refused_update_of_an_open_pull_request_is_reported(self) -> None:
+        self.land("src/a.rs", "pub fn a() {}\n", "fix: a")
+        self.writer()
+        self.land("src/b.rs", "pub fn b() {}\n", "feat: b")
+        result = self.run_writer(FAKE_GH_FAIL="PATCH /pulls/100")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("gh api PATCH repos/owner/shipyard/pulls/100 failed", result.stderr)
+        self.assertIn("Commit statuses: Read and write", result.stderr)
 
     def test_landing_while_bump_pr_was_open_is_not_lost(self) -> None:
         self.land("src/a.rs", "pub fn a() {}\n", "fix: a")

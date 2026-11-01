@@ -14,6 +14,22 @@ for it (main's ruleset refuses direct pushes). The existing `auto-release.yml`
 notices the version move when that pull request merges and creates `vX.Y.Z`; `release.yml` publishes it, and `shipyard update` continues to use
 the latest published tag.
 
+## Token permissions
+
+`RELEASE_BOT_TOKEN` pushes the bump branch and also calls the pull request API:
+it opens or updates the bump pull request, labels it `shipyard:managed`, and
+posts the `shipyard/steward-handoff` status on its head. A fine-grained token
+therefore needs, on this repository:
+
+- Contents: Read and write
+- Pull requests: Read and write
+- Commit statuses: Read and write
+
+A token with only Contents write still pushes `release/version-at-land`, then
+fails on the first pull request call, so no bump pull request is opened and
+nothing is released. When a call fails the workflow log prints gh's own error
+and names the missing permission.
+
 ## In-flight pull requests
 
 Remove any hand-written bump commit and restore the branch to the version at
