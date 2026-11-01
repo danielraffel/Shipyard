@@ -37,4 +37,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           CI_MACOS_SIGNING_ENABLED: ${{ vars.CI_MACOS_SIGNING_ENABLED }}
+          # Same focus release.yml builds for, so the expected asset set matches.
+          CI_PLATFORM_FOCUS: ${{ vars.CI_PLATFORM_FOCUS || 'macos' }}
         run: python3 scripts/release_draft_heal.py
