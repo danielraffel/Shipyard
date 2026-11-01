@@ -77,6 +77,25 @@ class DecideTests(unittest.TestCase):
     def test_untagged_version_is_noop(self) -> None:
         self.assertEqual(decide(release=None, run_=None).action, "noop")
 
+    def test_published_with_every_asset_is_healthy_after_an_exhausted_run(self) -> None:
+        assets = ("a.dmg", "checksums.sha256")
+        release = {"draft": False, "assets": [{"name": "a.dmg"}, {"name": "checksums.sha256"}]}
+        d = decide(release, run(attempt=4), expected_assets=assets)
+        self.assertEqual(d.action, "noop")
+        self.assertIn("all 2 expected assets", d.reason)
+
+    def test_published_with_missing_assets_fails_loudly(self) -> None:
+        release = {"draft": False, "assets": [{"name": "a.dmg"}]}
+        d = decide(release, run("success"), expected_assets=("a.dmg", "checksums.sha256"))
+        self.assertEqual(d.action, "fail")
+        self.assertIn("checksums.sha256", d.reason)
+
+    def test_expected_assets_follow_the_release_pipeline(self) -> None:
+        with mock.patch.dict("os.environ", {"CI_PLATFORM_FOCUS": "macos"}):
+            assets = heal.expected_assets()
+        self.assertIn("shipyard-macos-arm64.dmg", assets)
+        self.assertIn("checksums.sha256", assets)
+
     def test_cargo_version_reads_package_table(self) -> None:
         import tempfile
         with tempfile.TemporaryDirectory() as d:
@@ -135,6 +154,56 @@ class RerunErrorTests(unittest.TestCase):
             rc, out = self._main(f"gh: {msg} (HTTP {status})")
             self.assertNotEqual(rc, 0, status)
             self.assertIn(f"HTTP {status}", out)
+
+
+class ReleaseLookupTests(unittest.TestCase):
+    """The current release is found even behind a page of abandoned drafts."""
+
+    ASSETS = ("shipyard-macos-arm64.dmg", "checksums.sha256")
+
+    def _main(self, current: dict) -> tuple[int, str]:
+        stamp = (datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        exhausted = {"id": 7, "status": "completed", "conclusion": "failure",
+                     "updated_at": stamp, "run_attempt": 4}
+        drafts = [{"tag_name": f"v0.1.{i}", "draft": True, "assets": []} for i in range(3)]
+        listing = drafts + [current]
+
+        def fake_gh(*args: str) -> str:
+            assert "-X" not in args, args
+            url = args[1]
+            if "/jobs" in url:
+                return json.dumps({"jobs": []})
+            if "/releases?" in url:
+                page = int(url.split("page=")[-1])
+                return json.dumps(listing[(page - 1) * 2:page * 2])
+            return json.dumps({"workflow_runs": [exhausted]})
+
+        with tempfile.TemporaryDirectory() as d:
+            cargo = Path(d) / "Cargo.toml"
+            cargo.write_text('[package]\nname = "x"\nversion = "1.2.3"\n')
+            out = io.StringIO()
+            argv = ["heal", "--repo", "o/r", "--cargo-toml", str(cargo)]
+            with mock.patch.object(heal, "_gh", fake_gh), \
+                    mock.patch.object(heal, "RELEASE_PAGE_SIZE", 2), \
+                    mock.patch.object(heal, "expected_assets", lambda: self.ASSETS), \
+                    mock.patch.dict("os.environ", {"CI_MACOS_SIGNING_ENABLED": "true"}), \
+                    mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(out), \
+                    contextlib.redirect_stderr(out):
+                rc = heal.main()
+        return rc, out.getvalue()
+
+    def test_published_release_past_the_first_page_is_healthy(self) -> None:
+        current = {"tag_name": "v1.2.3", "draft": False,
+                   "assets": [{"name": n} for n in self.ASSETS]}
+        rc, out = self._main(current)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("v1.2.3: noop: release is published", out)
+
+    def test_stranded_draft_past_the_first_page_still_fails(self) -> None:
+        rc, out = self._main({"tag_name": "v1.2.3", "draft": True, "assets": []})
+        self.assertEqual(rc, 1, out)
+        self.assertIn("not retrying", out)
+        self.assertIn("stuck as draft", out)
 
 
 if __name__ == "__main__":
