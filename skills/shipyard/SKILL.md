@@ -3603,6 +3603,12 @@ three oldest blocked rows with `age_minutes`). Read those instead of inferring
 the state from `mutation`: `waiting_head_approval` alone does not say whether
 nobody reviewed the head, a reviewer holds it, or its approval is excluded.
 The full token list is in `docs/automated-draining.md`.
+A required context bound to an app counts that app's check run or its commit
+status (newest wins), as GitHub does: a status created by
+`github-actions[bot]` satisfies a rule bound to GitHub Actions (15368), and a
+status of that name from anyone else never does. So a repository whose job
+posting the context was renamed still admits on the status alone, instead of
+reporting `required_never_ran:<context>` while GitHub shows the rule green.
 
 - **Disarm (always live).** An armed native auto-merge request on such a head
   is disabled (`disarmed_stale_auto_merge:<sha>`, audit

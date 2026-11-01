@@ -1376,3 +1376,197 @@ fn next_steps_claims_nothing_when_settings_cannot_be_read() {
     assert!(steps.lines()[1].contains("could not be read"));
     assert!(steps.to_json()["unavailable_reason"].is_string());
 }
+
+fn pick(checks: &[StewardCheck], required: &RequiredCheck) -> Option<StewardCheck> {
+    crate::merge_steward::selected_required_check(checks, required).cloned()
+}
+
+fn rest_status_row(state: &str, at: &str, login: &str, id: u64) -> serde_json::Value {
+    serde_json::json!({
+        "context": "review-verdict",
+        "state": state,
+        "created_at": at,
+        "updated_at": at,
+        "target_url": "https://github.com/o/r/actions/runs/41242241688",
+        "creator": {"login": login, "id": id, "type": "Bot"}
+    })
+}
+
+fn actions_bound_review_verdict() -> RequiredCheck {
+    RequiredCheck {
+        context: "review-verdict".to_owned(),
+        app_id: Some(crate::merge_steward::GITHUB_ACTIONS_APP_ID),
+    }
+}
+
+#[test]
+fn a_rest_status_carries_the_app_only_when_its_creator_is_the_actions_bot() {
+    let parse = |login, id| {
+        crate::app::merge_steward_cmd::observation::parse_rest_status(&rest_status_row(
+            "success",
+            "2026-10-31T23:28:45Z",
+            login,
+            id,
+        ))
+        .expect("status")
+    };
+    assert_eq!(
+        parse("github-actions[bot]", 41_898_282).app_id,
+        Some(crate::merge_steward::GITHUB_ACTIONS_APP_ID)
+    );
+    for (login, id) in [
+        ("github-actions[bot]", 1),
+        ("github-actions", 41_898_282),
+        ("octocat", 583_231),
+        ("shipyard-review[bot]", 99),
+    ] {
+        assert_eq!(parse(login, id).app_id, None, "{login} {id}");
+    }
+    let creatorless = crate::app::merge_steward_cmd::observation::parse_rest_status(
+        &serde_json::json!({"context": "review-verdict", "state": "success"}),
+    )
+    .expect("status");
+    assert_eq!(creatorless.app_id, None);
+}
+
+#[test]
+fn an_app_bound_rule_selects_the_newest_actions_status_and_ignores_other_creators() {
+    let parse = |state, at, login, id| {
+        crate::app::merge_steward_cmd::observation::parse_rest_status(&rest_status_row(
+            state, at, login, id,
+        ))
+        .expect("status")
+    };
+    let required = actions_bound_review_verdict();
+    let older_failure = parse(
+        "failure",
+        "2026-10-31T21:24:21Z",
+        "github-actions[bot]",
+        41_898_282,
+    );
+    let newer_success = parse(
+        "success",
+        "2026-10-31T23:28:45Z",
+        "github-actions[bot]",
+        41_898_282,
+    );
+    let selected =
+        pick(&[older_failure.clone(), newer_success.clone()], &required).expect("selected");
+    assert_eq!(selected.conclusion.as_deref(), Some("SUCCESS"));
+    let selected = pick(&[newer_success.clone(), older_failure.clone()], &required)
+        .expect("selected regardless of order");
+    assert_eq!(selected.conclusion.as_deref(), Some("SUCCESS"));
+    let newest_failure = parse(
+        "error",
+        "2026-11-01T00:00:00Z",
+        "github-actions[bot]",
+        41_898_282,
+    );
+    let selected = pick(&[newer_success.clone(), newest_failure], &required).expect("selected");
+    assert_eq!(selected.conclusion.as_deref(), Some("FAILURE"));
+
+    // A newer success from someone else neither satisfies nor masks the rule.
+    let spoof = parse("success", "2026-11-01T01:00:00Z", "octocat", 583_231);
+    assert!(pick(std::slice::from_ref(&spoof), &required).is_none());
+    let selected =
+        pick(&[older_failure, spoof], &required).expect("the Actions status still decides");
+    assert_eq!(selected.conclusion.as_deref(), Some("FAILURE"));
+}
+
+#[test]
+fn an_app_bound_rule_still_selects_that_apps_check_run() {
+    let required = actions_bound_review_verdict();
+    let run = parse_rest_check(&serde_json::json!({
+        "name": "review-verdict",
+        "status": "completed",
+        "conclusion": "success",
+        "completed_at": "2026-10-31T23:30:00Z",
+        "app": {"id": crate::merge_steward::GITHUB_ACTIONS_APP_ID}
+    }))
+    .expect("check run");
+    let other_app_run = parse_rest_check(&serde_json::json!({
+        "name": "review-verdict",
+        "status": "completed",
+        "conclusion": "success",
+        "completed_at": "2026-10-31T23:31:00Z",
+        "app": {"id": 7}
+    }))
+    .expect("check run");
+    let selected = pick(&[run.clone(), other_app_run], &required).expect("selected");
+    assert_eq!(selected, run);
+    assert_eq!(
+        selected.source,
+        crate::merge_steward::StewardCheckSource::CheckRun
+    );
+}
+
+/// The Pulp shape: the rollup names a `review-verdict` status without its
+/// creator and there is no check run of that name. Hydration reads the
+/// statuses over REST, attributes the Actions bot's to GitHub Actions, and the
+/// bound rule is satisfied, as GitHub's own branch protection treats it.
+#[cfg(unix)]
+#[test]
+fn hydration_attributes_a_rollup_status_to_the_actions_app() {
+    let temp = tempfile::tempdir().expect("temp");
+    let head = "f7d73f2d776740ec9fb7127cd73cd13187627d37";
+    let statuses = serde_json::json!([
+        rest_status_row(
+            "success",
+            "2026-10-31T23:28:45Z",
+            "github-actions[bot]",
+            41_898_282
+        ),
+        rest_status_row(
+            "failure",
+            "2026-10-31T21:24:21Z",
+            "github-actions[bot]",
+            41_898_282
+        )
+    ]);
+    let statuses_path = temp.path().join("statuses.json");
+    fs::write(&statuses_path, statuses.to_string()).expect("statuses");
+    let actions = fake_gh(
+        &temp,
+        &format!(
+            r#"
+case "$*" in
+  *"pr view"*)
+    printf '%s' '{{"id":"PR_kw","number":11308,"state":"OPEN","isDraft":false,"baseRefName":"main","headRefOid":"{head}","headRefName":"feature","mergeStateStatus":"CLEAN","autoMergeRequest":null,"labels":[],"statusCheckRollup":[{{"__typename":"CheckRun","name":"macos","status":"COMPLETED","conclusion":"SUCCESS"}},{{"__typename":"StatusContext","context":"review-verdict","startedAt":"2026-10-31T23:28:45Z","state":"SUCCESS","targetUrl":"https://github.com/o/r/actions/runs/41242241688"}}]}}' ;;
+  *"commits/{head}/check-runs"*)
+    printf '%s' '{{"check_runs":[{{"name":"macos","app":{{"id":15368}},"status":"completed","conclusion":"success","completed_at":"2026-10-31T23:00:00Z"}},{{"name":"post-review-verdict","app":{{"id":15368}},"status":"completed","conclusion":"success","completed_at":"2026-10-31T23:28:50Z"}}]}}' ;;
+  *"commits/{head}/statuses"*)
+    cat '{statuses}' ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+            statuses = statuses_path.display()
+        ),
+    );
+    let policy = StewardPolicy {
+        required_checks: vec![
+            RequiredCheck {
+                context: "macos".to_owned(),
+                app_id: Some(crate::merge_steward::GITHUB_ACTIONS_APP_ID),
+            },
+            actions_bound_review_verdict(),
+        ],
+        ..queue_policy()
+    };
+    let pr = pull_request_with_required_checks(
+        &actions,
+        "owner/repo",
+        11308,
+        "main",
+        &BTreeMap::new(),
+        &policy.required_checks,
+    )
+    .expect("live PR")
+    .expect("open PR");
+    assert!(crate::merge_steward::required_checks_all_succeeded(
+        &pr.fact, &policy
+    ));
+    assert_eq!(
+        classify_pr(&pr.fact, &policy, &BTreeMap::new()),
+        StewardDecision::ArmMergeQueue
+    );
+}

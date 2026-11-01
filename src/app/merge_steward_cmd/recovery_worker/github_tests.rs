@@ -481,3 +481,79 @@ fn full_commit_status_window_fails_closed() {
             .contains("bounded 400-entry identity window")
     );
 }
+
+/// A bound rule failed through its app's commit status alone (no check run of
+/// that name). The rollup omits the status creator, so the worker reads the
+/// statuses over REST, as the steward does, and finds the same failure still
+/// current instead of calling the evidence stale.
+#[cfg(unix)]
+#[test]
+fn app_bound_failure_from_an_actions_status_stays_current() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = temp.path().join("gh");
+    let actions_app = crate::merge_steward::GITHUB_ACTIONS_APP_ID;
+    let request = RecoveryRequest::new(
+        "Generous-Corp/pulp",
+        42,
+        "main",
+        "0123456789abcdef0123456789abcdef01234567",
+        "failure-fingerprint",
+        "required check failed",
+        vec![RecoveryRequiredCheck {
+            context: "review-verdict".to_owned(),
+            app_id: Some(actions_app),
+        }],
+        vec![RecoveryFailureFact::RequiredCheck {
+            context: "review-verdict".to_owned(),
+            app_id: Some(actions_app),
+            conclusion: "FAILURE".to_owned(),
+            run_id: None,
+        }],
+        "steward-policy",
+        "worker-config",
+    )
+    .expect("request");
+    let pull = serde_json::json!({
+        "state": "OPEN",
+        "isDraft": false,
+        "baseRefName": "main",
+        "headRefOid": request.head_sha,
+        "mergeStateStatus": "CLEAN",
+        "labels": [
+            {"name": super::super::super::MANAGED_LABEL},
+            {"name": super::super::super::NEEDS_AGENT_LABEL}
+        ],
+        "statusCheckRollup": [{
+            "__typename": "StatusContext",
+            "context": "review-verdict",
+            "state": "FAILURE",
+            "startedAt": "2026-08-21T08:00:00Z"
+        }]
+    });
+    let script = format!(
+        r#"#!/bin/sh
+set -eu
+case "$*" in
+  *"pr view"*)
+    printf '%s' '{}' ;;
+  *"check-runs?per_page=100&page=1"*)
+    printf '%s' '{{"check_runs":[]}}' ;;
+  *"statuses?per_page=100&page=1"*)
+    printf '%s' '[{{"id":1,"context":"{}","state":"success","created_at":"2026-08-21T08:00:00Z"}},{{"id":2,"context":"{}","state":"failure","created_at":"2026-08-21T08:00:01Z"}},{{"id":3,"context":"review-verdict","state":"failure","created_at":"2026-08-21T08:00:02Z","creator":{{"login":"github-actions[bot]","id":41898282,"type":"Bot"}}}}]' ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+        serde_json::to_string(&pull).expect("pull JSON"),
+        super::super::super::HANDOFF_CONTEXT,
+        super::super::super::RECOVERY_CONTEXT,
+    );
+    crate::test_support::write_executable_script(&binary, &script);
+    let actions = GitHubActions::hermetic_for_tests(temp.path(), binary);
+
+    let disposition = inspect_request(&actions, &request, Instant::now() + Duration::from_secs(30))
+        .expect("bounded hydration");
+    match disposition {
+        RequestDisposition::Current => {}
+        RequestDisposition::Superseded(reason) => panic!("superseded: {reason}"),
+    }
+}

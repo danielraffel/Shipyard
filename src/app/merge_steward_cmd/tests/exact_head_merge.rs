@@ -56,7 +56,19 @@ fn pr_json_with_status(head: &str, clean: bool, armed: bool, status: Option<&str
 
 /// The census row the steward observed.
 fn observed_pr(clean: bool, armed: bool) -> ObservedPr {
-    observed_pr_with(clean, armed, true, None)
+    observed_pr_with(clean, armed, true, None, ACTIONS_BOT)
+}
+
+/// The creator GitHub records on a status posted with a workflow's token.
+const ACTIONS_BOT: (&str, u64) = ("github-actions[bot]", 41_898_282);
+
+/// A REST commit-status row, which, unlike the rollup, names its creator.
+fn rest_status(state: &str, creator: (&str, u64)) -> String {
+    let (login, id) = creator;
+    format!(
+        r#"{{"context":"review-verdict","state":"{}","created_at":"2026-10-30T00:02:00Z","updated_at":"2026-10-30T00:02:00Z","target_url":"https://github.com/owner/repo/actions/runs/101","creator":{{"login":"{login}","id":{id},"type":"Bot"}}}}"#,
+        state.to_ascii_lowercase()
+    )
 }
 
 /// A REST check-run row shaped as GitHub returns it for the canonical job.
@@ -71,7 +83,13 @@ fn rest_check_run(clean: bool) -> String {
     )
 }
 
-fn observed_pr_with(clean: bool, armed: bool, check_run: bool, status: Option<&str>) -> ObservedPr {
+fn observed_pr_with(
+    clean: bool,
+    armed: bool,
+    check_run: bool,
+    status: Option<&str>,
+    creator: (&str, u64),
+) -> ObservedPr {
     let mut pr = parse_pr(
         &serde_json::from_str(&pr_json_with_status(HEAD, clean, armed, status)).expect("PR json"),
         &BTreeMap::new(),
@@ -83,6 +101,16 @@ fn observed_pr_with(clean: bool, armed: bool, check_run: bool, status: Option<&s
                 &serde_json::from_str(&rest_check_run(clean)).expect("check run"),
             )
             .expect("check run"),
+        );
+    }
+    // The census reads the status's creator over REST, as hydration does when
+    // a bound rule's context appears as a rollup status.
+    if let Some(state) = status {
+        pr.fact.checks.extend(
+            crate::app::merge_steward_cmd::observation::parse_rest_status(
+                &serde_json::from_str(&rest_status(state, creator)).expect("status"),
+            )
+            .filter(|status| status.app_id.is_some()),
         );
     }
     pr
@@ -116,8 +144,10 @@ struct Fixture<'a> {
     armed: bool,
     /// Whether the head has the app-bound `review-verdict` check run.
     check_run: bool,
-    /// The app-less `review-verdict` commit status, when one exists.
+    /// The `review-verdict` commit status, when one exists.
     status: Option<&'a str>,
+    /// Who created that status.
+    status_creator: (&'a str, u64),
 }
 
 impl Fixture<'_> {
@@ -131,6 +161,7 @@ impl Fixture<'_> {
             armed: false,
             check_run: true,
             status: None,
+            status_creator: ACTIONS_BOT,
         }
     }
 
@@ -145,6 +176,9 @@ impl Fixture<'_> {
         } else {
             String::new()
         };
+        let statuses = self
+            .status
+            .map_or_else(String::new, |state| rest_status(state, self.status_creator));
         format!(
             r#"
 # CONFIG_ERROR: this fixture serves its own policy file
@@ -158,6 +192,7 @@ case "$*" in
   *"pulls/42/reviews"*) printf '' ;;
   *"issues/42/comments"*) printf '%s\n' '{comments}' ;;
   *"/check-runs?"*) printf '%s' '{{"check_runs":[{check_runs}]}}' ;;
+  *"/statuses?"*) printf '%s' '[{statuses}]' ;;
   *"commits/{HEAD}"*) printf '%s' '2026-10-30T00:00:00Z' ;;
   *"isInMergeQueue"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"number":42,"state":"OPEN","headRefOid":"{queue_head}","isInMergeQueue":false,"mergeQueueEntry":null,"autoMergeRequest":{auto_merge},"timelineItems":{{"pageInfo":{{"hasPreviousPage":false}},"nodes":[]}}}}}}}}}}' ;;
   *"query=query("*"mergeQueue"*) printf '%s' '{{"data":{{"repository":{{"mergeQueue":null}}}}}}' ;;
@@ -193,6 +228,7 @@ fn run(fixture: &Fixture<'_>) -> Outcome {
         fixture.armed,
         fixture.check_run,
         fixture.status,
+        fixture.status_creator,
     );
     let observation = observation(pr.clone());
     let policy = no_queue_policy(required(true));
@@ -508,14 +544,16 @@ fn an_armed_request_on_an_unapproved_waiting_head_is_disarmed() {
     assert!(!calls.contains("enablePullRequestAutoMerge"), "{calls}");
 }
 
-/// The shape both live repositories show: the canonical job's check run from
-/// github-actions (app 15368) and an app-less status of the same name. The
-/// check run satisfies the bound rule; the status alone never does; and a
-/// refusing status refuses even when the job's check run is green, because
-/// the job succeeds whenever it posts a verdict.
+/// The shapes the live repositories show: the canonical job's check run from
+/// github-actions (app 15368), and a status of the same name that the job
+/// posts with its `GITHUB_TOKEN`, so its creator is `github-actions[bot]`.
+/// Either satisfies the bound rule, as GitHub's branch protection counts it;
+/// a status of that name from any other creator never does; and a refusing
+/// status refuses even when the job's check run is green, because the job
+/// succeeds whenever it posts a verdict.
 #[cfg(unix)]
 #[test]
-fn the_app_bound_check_run_counts_and_an_app_less_status_alone_does_not() {
+fn an_app_bound_rule_counts_that_apps_check_run_or_status_and_no_one_elses_status() {
     let both = run(&Fixture {
         status: Some("SUCCESS"),
         ..Fixture::approved_clean()
@@ -523,28 +561,65 @@ fn the_app_bound_check_run_counts_and_an_app_less_status_alone_does_not() {
     assert_eq!(both.decision, StewardDecision::ArmMergeQueue);
     assert_eq!(both.mutation, Some(format!("merged_exact_head:{HEAD}")));
 
+    // The job renamed away from the context: only the Actions status remains.
     let status_only = run(&Fixture {
         check_run: false,
         status: Some("SUCCESS"),
         ..Fixture::approved_clean()
     });
+    assert_eq!(status_only.decision, StewardDecision::ArmMergeQueue);
     assert_eq!(
-        status_only.decision,
-        StewardDecision::WaitingRequired {
-            contexts: vec![format!("review-verdict (app_id={ACTIONS_APP})")]
-        }
+        status_only.mutation,
+        Some(format!("merged_exact_head:{HEAD}")),
+        "{:?}\n{}",
+        status_only.error,
+        status_only.calls
     );
-    assert_no_write(&status_only);
+
+    for creator in [
+        ("octocat", 583_231),
+        ("someone-elses-app[bot]", 99_999),
+        // The Actions login without its user ID is not the Actions bot.
+        ("github-actions[bot]", 1),
+    ] {
+        let spoofed = run(&Fixture {
+            check_run: false,
+            status: Some("SUCCESS"),
+            status_creator: creator,
+            ..Fixture::approved_clean()
+        });
+        assert_eq!(
+            spoofed.decision,
+            StewardDecision::WaitingRequired {
+                contexts: vec![format!("review-verdict (app_id={ACTIONS_APP})")]
+            },
+            "{creator:?}"
+        );
+        assert_no_write(&spoofed);
+    }
 
     let refused = run(&Fixture {
         status: Some("FAILURE"),
         ..Fixture::approved_clean()
     });
-    assert_eq!(
-        refused.decision,
-        StewardDecision::RequiredFailed {
-            contexts: vec!["review-verdict (commit status)".to_owned()]
-        }
+    assert!(
+        matches!(&refused.decision, StewardDecision::RequiredFailed { contexts }
+            if contexts.iter().all(|context| context.starts_with("review-verdict "))),
+        "{:?}",
+        refused.decision
     );
     assert_no_write(&refused);
+
+    let pending = run(&Fixture {
+        check_run: false,
+        status: Some("PENDING"),
+        ..Fixture::approved_clean()
+    });
+    assert_eq!(
+        pending.decision,
+        StewardDecision::WaitingRequired {
+            contexts: vec![format!("review-verdict (app_id={ACTIONS_APP})")]
+        }
+    );
+    assert_no_write(&pending);
 }

@@ -79,7 +79,20 @@ pub(super) fn inspect_request(
         {
             checks.extend(fetch_bounded_check_runs(actions, request, deadline)?);
         }
-        None
+        // The rollup names a commit status without its creator; read the
+        // creators over REST, as the steward does, so a bound rule satisfied
+        // by its app's status is classified the same way here.
+        if checks_required && bound_status_seen(&checks, request) {
+            let statuses = fetch_bounded_complete_statuses(actions, request, deadline)?;
+            checks.extend(
+                parse_rest_statuses(&statuses)?
+                    .into_iter()
+                    .filter(|status| status.app_id.is_some()),
+            );
+            Some(statuses)
+        } else {
+            None
+        }
     };
     match classify_failure_evidence(&pull, request, &checks)? {
         RequestDisposition::Current => {}
@@ -183,6 +196,16 @@ fn fetch_bounded_complete_statuses(
         }
     }
     unreachable!("the final bounded status page always returns or errors")
+}
+
+fn bound_status_seen(checks: &[StewardCheck], request: &RecoveryRequest) -> bool {
+    request.required_checks.iter().any(|required| {
+        required.app_id.is_some()
+            && checks.iter().any(|check| {
+                check.source == crate::merge_steward::StewardCheckSource::StatusContext
+                    && check.name.eq_ignore_ascii_case(&required.context)
+            })
+    })
 }
 
 fn parse_rest_statuses(statuses: &[Value]) -> Result<Vec<StewardCheck>, CliFailure> {

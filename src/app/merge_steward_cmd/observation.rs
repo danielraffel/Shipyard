@@ -984,8 +984,44 @@ fn hydrate_required_check_identities_with_deadline(
                 &pr.fact.head_sha,
                 deadline,
             )?);
+            hydrate_app_bound_status_identities(actions, repo, required_checks, pr, deadline)?;
         }
     }
+    Ok(())
+}
+
+/// Attribute the commit statuses that can satisfy an app-bound rule.
+///
+/// The pull-request rollup names a commit status without its creator, so a
+/// status from the bound app is indistinguishable there from anyone else's of
+/// the same name. When a bound rule's context appears as a rollup status, read
+/// the head's statuses over REST, which carry the creator, and add the ones
+/// attributed to an app. Without this, a rule GitHub satisfies with the app's
+/// status alone reads as never having run.
+fn hydrate_app_bound_status_identities(
+    actions: &GitHubActions,
+    repo: &str,
+    required_checks: &[RequiredCheck],
+    pr: &mut ObservedPr,
+    deadline: Option<Instant>,
+) -> Result<(), String> {
+    let bound_status_seen = required_checks.iter().any(|required| {
+        required.app_id.is_some()
+            && pr.fact.checks.iter().any(|check| {
+                check.source == crate::merge_steward::StewardCheckSource::StatusContext
+                    && check.name.eq_ignore_ascii_case(&required.context)
+            })
+    });
+    if !bound_status_seen {
+        return Ok(());
+    }
+    let statuses =
+        commit_statuses_for_head_with_deadline(actions, repo, &pr.fact.head_sha, deadline)?;
+    pr.fact.checks.extend(
+        statuses
+            .into_iter()
+            .filter(|status| status.app_id.is_some()),
+    );
     Ok(())
 }
 
@@ -1134,7 +1170,10 @@ pub(super) fn parse_rest_status(value: &Value) -> Option<StewardCheck> {
     Some(StewardCheck {
         name: value.get("context")?.as_str()?.to_owned(),
         source: crate::merge_steward::StewardCheckSource::StatusContext,
-        app_id: None,
+        app_id: crate::merge_steward::status_creator_app_id(
+            value.pointer("/creator/login").and_then(Value::as_str),
+            value.pointer("/creator/id").and_then(Value::as_u64),
+        ),
         status: if state.eq_ignore_ascii_case("pending") {
             "IN_PROGRESS"
         } else {

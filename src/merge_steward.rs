@@ -18,8 +18,10 @@ pub struct StewardCheck {
     pub name: String,
     /// GitHub surface that produced the observation.
     pub source: StewardCheckSource,
-    /// GitHub App database ID that produced this check run. Legacy commit
-    /// statuses and observations whose producer is unavailable have no ID.
+    /// GitHub App database ID that produced this check. A commit status
+    /// carries one only when its creator was read and is a known app bot
+    /// (see [`status_creator_app_id`]); a status read without its creator,
+    /// and any observation whose producer is unavailable, has no ID.
     pub app_id: Option<u64>,
     /// GitHub state (`QUEUED`, `IN_PROGRESS`, or `COMPLETED`).
     pub status: String,
@@ -56,6 +58,28 @@ impl RequiredCheck {
             |app_id| format!("{} (app_id={app_id})", self.context),
         )
     }
+}
+
+/// GitHub App database ID of GitHub Actions.
+pub const GITHUB_ACTIONS_APP_ID: u64 = 15_368;
+/// User database ID of `github-actions[bot]`, the creator GitHub records on a
+/// commit status posted with a workflow's `GITHUB_TOKEN`.
+pub const GITHUB_ACTIONS_BOT_USER_ID: u64 = 41_898_282;
+const GITHUB_ACTIONS_BOT_LOGIN: &str = "github-actions[bot]";
+
+/// The GitHub App that a commit status's creator acts for, if it is one this
+/// steward can identify.
+///
+/// Branch protection satisfies a required context bound to an app with a
+/// commit status that app created, not only with its check run. A status
+/// posted by a workflow's `GITHUB_TOKEN` is created by `github-actions[bot]`,
+/// which acts for GitHub Actions. Login and user ID must both match: any
+/// other creator, including a user or another app's bot that posts a status
+/// of the same name, does not act for the bound app.
+#[must_use]
+pub fn status_creator_app_id(login: Option<&str>, user_id: Option<u64>) -> Option<u64> {
+    (login == Some(GITHUB_ACTIONS_BOT_LOGIN) && user_id == Some(GITHUB_ACTIONS_BOT_USER_ID))
+        .then_some(GITHUB_ACTIONS_APP_ID)
 }
 
 /// One open pull request observed at an immutable head.
@@ -587,8 +611,9 @@ fn approval_status_refusal(
 /// Whether the newest commit status named after the approval context, if
 /// there is one, agrees with the app-bound check run that satisfies the rule.
 ///
-/// The bound rule is satisfied by a check run carrying the app id; an
-/// app-less status of the same name never satisfies it. But the canonical
+/// The bound rule is satisfied by a check run carrying the app id, or by a
+/// commit status that app created; a status from any other creator never
+/// satisfies it. But the canonical
 /// `review-verdict` job succeeds whenever it posts a verdict and carries the
 /// verdict itself in a status of the same name, so a check run can be green
 /// while that status says the head is refused. A refusing status therefore
@@ -628,6 +653,12 @@ fn selected_checks<'a>(
         .collect()
 }
 
+/// The observation that decides one required rule on this head: the newest
+/// check run or commit status with the rule's context, restricted to the
+/// rule's app when it is bound. A commit status counts for a bound rule only
+/// when its creator acts for that app ([`status_creator_app_id`]), as GitHub's
+/// own branch protection counts it. Admission, `blocked_on`, recovery and the
+/// carrier all select through here so they agree on what satisfies a rule.
 pub(crate) fn selected_required_check<'a>(
     checks: &'a [StewardCheck],
     required: &RequiredCheck,
