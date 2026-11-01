@@ -977,6 +977,11 @@ attempts are exhausted. It never publishes by itself and does nothing unless
 `CI_MACOS_SIGNING_ENABLED=true`. The Rust install in that job retries 3 times
 (a self-hosted runner that cannot reach static.rust-lang.org stranded v0.381.0
 and v0.383.0 as drafts).
+A release that is published with every asset `release.yml` must attach is
+healthy to the heal even when its run exhausted its retries (v0.383.0 was
+recovered by hand). The heal walks every page of the releases list to find the
+tag: drafts list first, and 34 abandoned drafts once pushed the published
+v0.383.0 off a 30-entry page, so the heal reported it stuck for hours.
 A `sign-and-upload-macos` failure that ends in `OSError: [Errno 30] Read-only
 file system` after "The validate action worked!" is the DMG smoke's detach.
 The image was signed and notarized, but `hdiutil detach` was refused while the
