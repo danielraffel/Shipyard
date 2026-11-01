@@ -100,8 +100,11 @@ request Q whose current head is not approved (a counted HOLD, or no counted
 APPROVE), P is refused with `blocked_on=carries_unapproved_commits:#Q`, and
 `blocked_detail` names the shared commits and why Q is not approved. Commits
 already on the base never count, nor does Q when it is P's own base-branch
-pull request, is stacked on P (its base branch is P's head branch), or is a
-Shipyard rollup that merged P's head. Land or
+pull request, is stacked on P (following its base branch through other open
+pull requests' head branches reaches P's head branch), only inherits the
+commit (a commit counts as Q's only if it is in Q's own diff against Q's own
+base branch; a Q that merged P's branch still has it there and still holds
+P), or is a Shipyard rollup that merged P's head. Land or
 approve Q first, or drop its commits from P; a branch built on another pull
 request should target that pull request's branch. At most 250 commits are read
 per pull request: a larger, unapproved one fails closed
