@@ -1228,3 +1228,57 @@ fn green_head_checks_do_not_arm_a_head_the_queue_ejected_for_failed_checks() {
     let verdict = crate::pr_queue_state::internal_enqueue_verdict(&new_head, &head);
     assert!(arm_survives_queue_state(&decision, &verdict));
 }
+
+#[test]
+fn fleet_hold_labels_deny_admission_and_removal_readmits() {
+    let policy = queue_policy();
+    for held in [
+        "owner-decision",
+        "Owner-Decision",
+        "superseded",
+        "PARKED/linux",
+    ] {
+        let mut pr = green_pr();
+        assert_eq!(
+            classify_pr(&pr, &policy, &BTreeMap::new()),
+            StewardDecision::ArmMergeQueue,
+            "control: the unlabelled PR is admitted"
+        );
+        pr.labels.push(held.to_owned());
+        assert_eq!(
+            classify_pr(&pr, &policy, &BTreeMap::new()),
+            StewardDecision::ExcludedLabel {
+                label: held.to_owned()
+            },
+            "{held}"
+        );
+        pr.labels.clear();
+        assert_eq!(
+            classify_pr(&pr, &policy, &BTreeMap::new()),
+            StewardDecision::ArmMergeQueue
+        );
+    }
+}
+
+#[test]
+fn a_hold_label_denies_the_exact_head_merge_path_too() {
+    let mut policy = queue_policy();
+    policy.merge_queue = false;
+    let mut pr = green_pr();
+    pr.labels.push("owner-decision".to_owned());
+    assert!(matches!(
+        classify_pr(&pr, &policy, &BTreeMap::new()),
+        StewardDecision::ExcludedLabel { .. }
+    ));
+}
+
+#[test]
+fn a_hold_label_outranks_queue_position() {
+    let mut pr = green_pr();
+    pr.queue_position = Some(0);
+    pr.labels.push("owner-decision".to_owned());
+    assert!(matches!(
+        classify_pr(&pr, &queue_policy(), &BTreeMap::new()),
+        StewardDecision::ExcludedLabel { .. }
+    ));
+}

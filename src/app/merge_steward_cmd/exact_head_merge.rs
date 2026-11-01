@@ -64,6 +64,7 @@ pub(super) fn owns_for_disarm(decision: &StewardDecision) -> bool {
         StewardDecision::Unmanaged
             | StewardDecision::HandoffMissing
             | StewardDecision::OptedOut
+            | StewardDecision::ExcludedLabel { .. }
             | StewardDecision::ProvenanceBlocked { .. }
     )
 }

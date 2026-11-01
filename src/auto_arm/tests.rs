@@ -599,3 +599,21 @@ fn an_unrelated_failure_is_not_read_as_auto_merge_being_disabled() {
         );
     }
 }
+
+#[test]
+fn fleet_hold_labels_exclude_a_backstop_candidate() {
+    for held in ["owner-decision", "superseded", "PARKED/windows"] {
+        let mut pr = open_pr();
+        assert_eq!(
+            preselect_backstop_candidate(&pr, true, "shipyard:no-auto-merge"),
+            ArmVerdict::Arm
+        );
+        pr.labels = vec![held.to_owned()];
+        assert_eq!(
+            preselect_backstop_candidate(&pr, true, "shipyard:no-auto-merge"),
+            ArmVerdict::Skip(ArmSkip::ExcludedLabel {
+                label: held.to_owned()
+            })
+        );
+    }
+}

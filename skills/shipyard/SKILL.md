@@ -3653,7 +3653,12 @@ reporting `required_never_ran:<context>` while GitHub shows the rule green.
   cap of its own.
 - **Labels.** `owner-decision`, `superseded` and `PARKED/<platform>` PRs are not
   exempt: they should never be queued, so on positive evidence they are
-  dequeued like any other.
+  dequeued like any other. The same three labels also deny admission:
+  `classify_pr` returns `ExcludedLabel` (after the opt-out label, before queue
+  position) so no enqueue, exact-head merge, native arm or backstop arm happens
+  while one is attached, and removing the label admits the PR on the next pass.
+  The set lives in `excluded_admission_label` in `src/merge_steward.rs`, which
+  the `blocked_on` report reads too.
 
 The reviewer policy is read once per pass, strictly (`read_policy_required`).
 Every withdrawal runs under the PR mutation guard on Shipyard's internal

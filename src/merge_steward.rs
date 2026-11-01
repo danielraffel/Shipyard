@@ -302,6 +302,12 @@ pub enum StewardDecision {
     },
     /// PR explicitly opted out.
     OptedOut,
+    /// PR carries a fleet hold label ([`excluded_admission_label`]): the
+    /// owner has to act before it may be admitted.
+    ExcludedLabel {
+        /// The label as it appears on the PR.
+        label: String,
+    },
     /// Current PR metadata says its provenance is unresolved. The steward may
     /// observe the PR, but it receives no mutation authority.
     ProvenanceBlocked {
@@ -363,8 +369,8 @@ pub fn classify_pr(
     if let Some(decision) = classify_provenance(pr, policy) {
         return decision;
     }
-    if has_pr_label(pr, &policy.opt_out_label) {
-        return StewardDecision::OptedOut;
+    if let Some(decision) = classify_label_exclusion(pr, policy) {
+        return decision;
     }
     if let Some(decision) = classify_management(pr, policy) {
         return decision;
@@ -486,6 +492,29 @@ pub fn arm_survives_queue_state(
         )
 }
 
+/// Fleet hold labels that deny admission: `owner-decision` (needs the owner),
+/// `superseded`, and any `PARKED/<platform>`. This is the one place they are
+/// evaluated; classification, the exact-head merge, native arming, the
+/// backstop pre-selection, and the `blocked_on` report all read it.
+pub const OWNER_DECISION_LABEL: &str = "owner-decision";
+/// The `superseded` hold label.
+pub const SUPERSEDED_LABEL: &str = "superseded";
+/// Prefix of a `PARKED/<platform>` hold label, lower-cased.
+pub const PARKED_LABEL_PREFIX: &str = "parked/";
+
+/// The first fleet hold label in `labels`, in the PR's own spelling.
+#[must_use]
+pub fn excluded_admission_label(labels: &[String]) -> Option<String> {
+    labels
+        .iter()
+        .find(|label| {
+            label.eq_ignore_ascii_case(OWNER_DECISION_LABEL)
+                || label.eq_ignore_ascii_case(SUPERSEDED_LABEL)
+                || label.to_ascii_lowercase().starts_with(PARKED_LABEL_PREFIX)
+        })
+        .cloned()
+}
+
 fn has_pr_label(pr: &StewardPullRequest, expected: &str) -> bool {
     pr.labels
         .iter()
@@ -516,6 +545,16 @@ pub fn matching_provenance_blockers(
         })
         .cloned()
         .collect()
+}
+
+fn classify_label_exclusion(
+    pr: &StewardPullRequest,
+    policy: &StewardPolicy,
+) -> Option<StewardDecision> {
+    if has_pr_label(pr, &policy.opt_out_label) {
+        return Some(StewardDecision::OptedOut);
+    }
+    excluded_admission_label(&pr.labels).map(|label| StewardDecision::ExcludedLabel { label })
 }
 
 fn classify_management(pr: &StewardPullRequest, policy: &StewardPolicy) -> Option<StewardDecision> {

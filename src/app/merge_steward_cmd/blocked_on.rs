@@ -24,12 +24,8 @@ use super::{
 use crate::head_approval::ApprovalBlocker;
 use crate::merge_steward::{StewardPullRequest, selected_required_check};
 
-/// The label an owner puts on a pull request only they can decide.
-pub(super) const OWNER_DECISION_LABEL: &str = "owner-decision";
-/// The label on a pull request another one replaced.
-pub(super) const SUPERSEDED_LABEL: &str = "superseded";
-/// The prefix of a `PARKED/<platform>` label.
-pub(super) const PARKED_LABEL_PREFIX: &str = "parked/";
+// The hold labels live beside admission so both read one definition.
+use crate::merge_steward::{OWNER_DECISION_LABEL, PARKED_LABEL_PREFIX, SUPERSEDED_LABEL};
 
 /// Tokens that are not blocked: the summary leaves them out of its oldest
 /// list.
@@ -265,6 +261,11 @@ fn classify_token(facts: &RowFacts<'_>, policy: &StewardPolicy) -> (Stall, Since
             format!("excluded_label:{}", policy.opt_out_label),
             None,
             SinceHint::Labeled(policy.opt_out_label.clone()),
+        ),
+        StewardDecision::ExcludedLabel { label } => undated(
+            format!("excluded_label:{label}"),
+            None,
+            SinceHint::Labeled(label.clone()),
         ),
         StewardDecision::ProvenanceBlocked { labels } => undated(
             format!("provenance_blocked:{}", labels.join(",")),

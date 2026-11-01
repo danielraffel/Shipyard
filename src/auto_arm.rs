@@ -114,6 +114,12 @@ pub enum ArmSkip {
         /// The label that opted it out.
         label: String,
     },
+    /// The pull request carries a fleet hold label
+    /// ([`crate::merge_steward::excluded_admission_label`]).
+    ExcludedLabel {
+        /// The label that holds it.
+        label: String,
+    },
     /// The repository does not allow native auto-merge at all.
     NativeAutoMergeDisabled,
     /// The repository arms only approved heads, and this head has no
@@ -163,6 +169,9 @@ impl ArmSkip {
                  permits arming"
             ),
             Self::OptedOut { label } => format!("it carries the opt-out label `{label}`"),
+            Self::ExcludedLabel { label } => {
+                format!("it carries the hold label `{label}`, which denies admission")
+            }
             Self::NativeAutoMergeDisabled => {
                 "the repository does not allow native auto-merge".to_owned()
             }
@@ -297,6 +306,9 @@ pub fn preselect_backstop_candidate(
         return ArmVerdict::Skip(ArmSkip::OptedOut {
             label: label.clone(),
         });
+    }
+    if let Some(label) = crate::merge_steward::excluded_admission_label(&pr.labels) {
+        return ArmVerdict::Skip(ArmSkip::ExcludedLabel { label });
     }
     // Queue membership is read from the queue's own entries, never from a
     // null auto-merge request, so this is authoritative even though the row
