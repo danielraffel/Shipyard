@@ -667,6 +667,7 @@ mod tests {
             conclusion: Some("FAILURE".to_owned()),
             run_id: Some(42),
             observed_at: None,
+            check_id: None,
         };
         assert!(failed_required_check_matches_run(&check, 42));
         let mut status = check.clone();

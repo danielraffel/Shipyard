@@ -5723,3 +5723,7 @@ returns exit 3 unless `optimization_eligible` is true. Keep the scheduled
 collector without that flag so collection continues while the baseline grows.
 In JSON, `baseline.exit` is the existing report-completeness field and
 `baseline.gate_exit` is the opt-in process exit.
+
+## Duplicate check recency
+
+When a required context has several observations (reruns), the steward, queue observer, reconcile and landing verdict pick the newest by monotonic id (check-run id, i.e. the Actions job id, or status id), never by timestamp alone: a clock change such as the repeated DST hour can stamp an older attempt later. Ids decide only when both sides have one; otherwise the timestamp does (`cmp_id_then_time`).

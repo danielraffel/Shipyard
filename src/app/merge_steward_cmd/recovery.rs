@@ -1033,7 +1033,7 @@ fn latest_recovery_state(pr: &ObservedPr) -> Option<&str> {
         .checks
         .iter()
         .filter(|check| check.name.eq_ignore_ascii_case(RECOVERY_CONTEXT))
-        .max_by_key(|check| check.observed_at.as_deref().unwrap_or_default())
+        .max_by(|left, right| crate::merge_steward::cmp_recency(left, right))
         .and_then(|check| check.conclusion.as_deref())
 }
 
@@ -1089,6 +1089,7 @@ mod tests {
                         conclusion: Some(conclusion.to_owned()),
                         run_id: None,
                         observed_at: Some(observed_at.to_owned()),
+                        check_id: None,
                     })
                     .collect(),
             },
@@ -1182,6 +1183,7 @@ mod tests {
                 conclusion: Some("FAILURE".to_owned()),
                 run_id: Some(101),
                 observed_at: Some("2026-08-21T08:00:00Z".to_owned()),
+                check_id: None,
             },
             StewardCheck {
                 name: "macos".to_owned(),
@@ -1191,6 +1193,7 @@ mod tests {
                 conclusion: Some("TIMED_OUT".to_owned()),
                 run_id: None,
                 observed_at: Some("2026-08-21T08:00:00Z".to_owned()),
+                check_id: None,
             },
         ];
         let (summary, contexts) = normalized_recovery_facts(&decision, &policy, &checks)
@@ -1233,6 +1236,7 @@ mod tests {
             conclusion: Some("FAILURE".to_owned()),
             run_id: None,
             observed_at: Some("2026-08-21T08:00:00Z".to_owned()),
+            check_id: None,
         }];
         let (_, facts) = normalized_recovery_facts(&literal, &literal_policy, &literal_checks)
             .expect("literal label is unambiguous")

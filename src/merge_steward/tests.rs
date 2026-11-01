@@ -23,6 +23,7 @@ fn green_pr() -> StewardPullRequest {
             conclusion: Some("SUCCESS".to_owned()),
             run_id: Some(10),
             observed_at: Some("2026-07-26T00:00:00Z".to_owned()),
+            check_id: None,
         }],
     }
 }
@@ -68,6 +69,7 @@ fn explicit_management_requires_label_and_current_head_receipt() {
         conclusion: Some("SUCCESS".to_owned()),
         run_id: None,
         observed_at: Some("2026-08-13T00:00:00Z".to_owned()),
+        check_id: None,
     });
     assert_eq!(
         classify_pr(&pr, &policy, &BTreeMap::new()),
@@ -161,6 +163,7 @@ fn check_run_cannot_impersonate_handoff_status_context() {
         conclusion: Some("SUCCESS".to_owned()),
         run_id: Some(99),
         observed_at: Some("2026-08-13T00:00:00Z".to_owned()),
+        check_id: None,
     });
     assert_eq!(
         classify_pr(&pr, &policy, &BTreeMap::new()),
@@ -249,6 +252,7 @@ fn ignores_advisory_failure_when_required_context_is_green() {
         conclusion: Some("FAILURE".to_owned()),
         run_id: Some(11),
         observed_at: Some("2026-07-26T00:00:00Z".to_owned()),
+        check_id: None,
     });
     assert_eq!(
         classify_pr(&pr, &queue_policy(), &BTreeMap::new()),
@@ -269,6 +273,7 @@ fn newest_duplicate_required_context_is_authoritative() {
         conclusion: Some("SUCCESS".to_owned()),
         run_id: Some(12),
         observed_at: Some("2026-07-26T00:00:00Z".to_owned()),
+        check_id: None,
     });
     assert_eq!(
         classify_pr(&pr, &queue_policy(), &BTreeMap::new()),
@@ -288,6 +293,7 @@ fn undated_pending_duplicate_blocks_older_success() {
         conclusion: None,
         run_id: Some(12),
         observed_at: None,
+        check_id: None,
     });
     assert!(matches!(
         classify_pr(&pr, &queue_policy(), &BTreeMap::new()),
@@ -390,6 +396,7 @@ fn direct_merge_refuses_unvalidated_base_advance_even_with_authoritative_checks(
         conclusion: Some("SUCCESS".to_owned()),
         run_id: Some(12),
         observed_at: Some("2026-07-26T00:00:00Z".to_owned()),
+        check_id: None,
     });
 
     assert_eq!(
@@ -1281,4 +1288,120 @@ fn a_hold_label_outranks_queue_position() {
         classify_pr(&pr, &queue_policy(), &BTreeMap::new()),
         StewardDecision::ExcludedLabel { .. }
     ));
+}
+
+fn run_check(conclusion: &str, observed_at: &str, check_id: Option<u64>) -> StewardCheck {
+    StewardCheck {
+        name: "required".to_owned(),
+        source: StewardCheckSource::CheckRun,
+        app_id: None,
+        status: "COMPLETED".to_owned(),
+        conclusion: Some(conclusion.to_owned()),
+        run_id: Some(10),
+        observed_at: Some(observed_at.to_owned()),
+        check_id,
+    }
+}
+
+fn decision_for(checks: Vec<StewardCheck>) -> StewardDecision {
+    let mut pr = green_pr();
+    pr.checks = checks;
+    classify_pr(&pr, &queue_policy(), &BTreeMap::new())
+}
+
+#[test]
+fn rerun_success_with_earlier_timestamp_but_higher_id_is_green() {
+    // The stale failed attempt carries the LATER timestamp (a repeated DST
+    // hour); the rerun that passed has the higher check-run id.
+    let failure = run_check("FAILURE", "2026-11-01T09:42:22Z", Some(124_798_936_965));
+    let success = run_check("SUCCESS", "2026-11-01T09:23:21Z", Some(124_807_721_073));
+    for checks in [
+        vec![failure.clone(), success.clone()],
+        vec![success.clone(), failure.clone()],
+    ] {
+        assert_eq!(decision_for(checks), StewardDecision::ArmMergeQueue);
+    }
+}
+
+#[test]
+fn newer_failure_with_earlier_timestamp_but_higher_id_is_red() {
+    let success = run_check("SUCCESS", "2026-11-01T09:42:22Z", Some(100));
+    let failure = run_check("FAILURE", "2026-11-01T09:23:21Z", Some(200));
+    for checks in [
+        vec![success.clone(), failure.clone()],
+        vec![failure.clone(), success.clone()],
+    ] {
+        assert!(matches!(
+            decision_for(checks),
+            StewardDecision::RequiredFailed { .. }
+        ));
+    }
+}
+
+#[test]
+fn missing_ids_fall_back_to_timestamp_order() {
+    let old_failure = run_check("FAILURE", "2026-11-01T01:00:00Z", None);
+    let new_success = run_check("SUCCESS", "2026-11-01T02:00:00Z", None);
+    assert_eq!(
+        decision_for(vec![new_success, old_failure]),
+        StewardDecision::ArmMergeQueue
+    );
+}
+
+#[test]
+fn status_context_uses_status_id_over_skewed_timestamp() {
+    let policy = queue_policy();
+    let context = crate::merge_steward::DEFAULT_APPROVAL_CONTEXT;
+    let status = |conclusion: &str, at: &str, id: u64| StewardCheck {
+        name: context.to_owned(),
+        source: StewardCheckSource::StatusContext,
+        app_id: None,
+        status: "COMPLETED".to_owned(),
+        conclusion: Some(conclusion.to_owned()),
+        run_id: None,
+        observed_at: Some(at.to_owned()),
+        check_id: Some(id),
+    };
+    let mut pr = green_pr();
+    pr.checks = vec![
+        status("FAILURE", "2026-11-01T09:42:00Z", 5),
+        status("SUCCESS", "2026-11-01T09:23:00Z", 9),
+    ];
+    assert!(approval_status_agrees(&pr, &policy));
+    pr.checks.reverse();
+    assert!(approval_status_agrees(&pr, &policy));
+    pr.checks[0] = status("FAILURE", "2026-11-01T09:00:00Z", 12);
+    assert!(!approval_status_agrees(&pr, &policy));
+}
+
+#[test]
+fn job_id_is_parsed_from_details_url() {
+    assert_eq!(
+        job_id_from_url("https://github.com/o/r/actions/runs/41289906175/job/124807721073"),
+        Some(124_807_721_073)
+    );
+    assert_eq!(
+        job_id_from_url("https://github.com/o/r/actions/runs/1"),
+        None
+    );
+}
+
+#[test]
+fn id_less_newer_check_beats_older_check_that_has_an_id() {
+    let older_with_id = run_check("FAILURE", "2026-11-01T01:00:00Z", Some(999));
+    let newer_without_id = run_check("SUCCESS", "2026-11-01T02:00:00Z", None);
+    for checks in [
+        vec![older_with_id.clone(), newer_without_id.clone()],
+        vec![newer_without_id.clone(), older_with_id.clone()],
+    ] {
+        assert_eq!(decision_for(checks), StewardDecision::ArmMergeQueue);
+    }
+}
+
+#[test]
+fn ids_of_different_surfaces_are_not_compared() {
+    let mut status = run_check("SUCCESS", "2026-11-01T02:00:00Z", Some(1));
+    status.source = StewardCheckSource::StatusContext;
+    let run = run_check("FAILURE", "2026-11-01T01:00:00Z", Some(9_999));
+    assert_eq!(cmp_recency(&status, &run), std::cmp::Ordering::Greater);
 }

@@ -29,8 +29,14 @@ pub struct StewardCheck {
     pub conclusion: Option<String>,
     /// Workflow run ID parsed from the details URL, when available.
     pub run_id: Option<u64>,
-    /// GitHub observation timestamp used to disambiguate duplicate contexts.
+    /// GitHub observation timestamp. Only a tiebreak: GitHub can stamp an
+    /// older attempt later than a newer one (the repeated hour of a DST change
+    /// did), so [`Self::check_id`] orders duplicates whenever both carry one.
     pub observed_at: Option<String>,
+    /// Monotonic GitHub identifier of this observation: the check-run id (the
+    /// Actions job id) for a check run, the status id for a commit status.
+    /// A rerun is a new check run, so a later attempt always has a larger id.
+    pub check_id: Option<u64>,
 }
 
 /// GitHub check-rollup surface that produced a check observation.
@@ -666,7 +672,7 @@ pub fn approval_status_agrees(pr: &StewardPullRequest, policy: &StewardPolicy) -
             check.source == StewardCheckSource::StatusContext
                 && check.name.eq_ignore_ascii_case(context)
         })
-        .max_by_key(|check| check_recency(check))
+        .max_by(|left, right| cmp_recency(left, right))
         .is_none_or(|status| {
             status.status.eq_ignore_ascii_case("COMPLETED")
                 && status
@@ -710,7 +716,46 @@ pub(crate) fn selected_required_check<'a>(
                     .app_id
                     .is_none_or(|app_id| check.app_id == Some(app_id))
         })
-        .max_by_key(|check| check_recency(check))
+        .max_by(|left, right| cmp_recency(left, right))
+}
+
+/// Order two observations of the same context, newest last.
+///
+/// Two observations from the same surface that both carry a monotonic id are
+/// ordered by that id alone. Timestamps are not trusted for that: a clock
+/// change can stamp an older attempt later than a newer one. Anything else
+/// (mixed surfaces, or a missing id) falls back to the timestamp.
+pub(crate) fn cmp_recency(left: &StewardCheck, right: &StewardCheck) -> std::cmp::Ordering {
+    let same_surface = left.source == right.source;
+    cmp_id_then_time(
+        left.check_id.filter(|_| same_surface),
+        right.check_id.filter(|_| same_surface),
+        &check_recency(left),
+        &check_recency(right),
+    )
+}
+
+/// The one recency rule: ids decide only when BOTH sides have one; a missing
+/// id on either side (a run-level URL, a status without an id) falls back to
+/// `time`. Never rank `Some(id)` above `None`, which would let an older
+/// observation that happens to carry an id beat a newer one that does not.
+pub(crate) fn cmp_id_then_time<T: Ord>(
+    left_id: Option<u64>,
+    right_id: Option<u64>,
+    left_time: &T,
+    right_time: &T,
+) -> std::cmp::Ordering {
+    match (left_id, right_id) {
+        (Some(left), Some(right)) => left.cmp(&right),
+        _ => left_time.cmp(right_time),
+    }
+}
+
+/// The Actions job id (the check-run id) in a check's details URL
+/// (`.../actions/runs/<run>/job/<id>`).
+pub(crate) fn job_id_from_url(url: &str) -> Option<u64> {
+    let tail = url.split("/job/").nth(1)?;
+    tail.split(['/', '?', '#']).next()?.parse().ok()
 }
 
 fn check_recency(check: &StewardCheck) -> (bool, &str, bool) {

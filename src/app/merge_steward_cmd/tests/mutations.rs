@@ -84,6 +84,7 @@ esac
         conclusion: Some("SUCCESS".to_owned()),
         run_id: None,
         observed_at: Some("2026-08-25T21:39:00Z".to_owned()),
+        check_id: None,
     });
     let mut observation = observation_for(pr, true);
     observation
@@ -564,6 +565,7 @@ fn managed_ownership_uses_the_configured_label_and_handoff_context() {
         conclusion: Some("SUCCESS".to_owned()),
         run_id: None,
         observed_at: Some("2026-07-26T00:00:00Z".to_owned()),
+        check_id: None,
     });
 
     assert!(pull_request_is_managed(
@@ -826,6 +828,7 @@ esac
         conclusion: Some("FAILURE".to_owned()),
         run_id: None,
         observed_at: Some("2026-08-27T00:00:01Z".to_owned()),
+        check_id: None,
     });
     let observation = observation_for(pr.clone(), true);
     let policy = queue_policy();
@@ -882,6 +885,7 @@ fn contended_terminal_publication_lease_cannot_report_healthy_without_an_obligat
         conclusion: Some("FAILURE".to_owned()),
         run_id: None,
         observed_at: Some("2026-08-27T00:00:01Z".to_owned()),
+        check_id: None,
     });
     let observation = observation_for(pr.clone(), true);
     let policy = queue_policy();
@@ -952,6 +956,7 @@ esac
         conclusion: Some("FAILURE".to_owned()),
         run_id: None,
         observed_at: Some("2026-08-27T00:00:01Z".to_owned()),
+        check_id: None,
     });
     let observation = observation_for(pr.clone(), true);
     let policy = queue_policy();
@@ -2475,6 +2480,7 @@ esac
             conclusion: Some("FAILURE".to_owned()),
             run_id: None,
             observed_at: Some("2026-08-27T00:00:02Z".to_owned()),
+            check_id: None,
         });
         pr
     }
@@ -2678,6 +2684,7 @@ fn owner_wake_does_not_escalate_after_a_check_state_change() {
         conclusion: None,
         run_id: None,
         observed_at: Some(hours_ago(1)),
+        check_id: None,
     });
     let report = harness.pass(pr, true);
     assert!(report.error.is_none(), "{report:?}");
@@ -2777,6 +2784,7 @@ fi
             conclusion: Some("SUCCESS".to_owned()),
             run_id: None,
             observed_at: Some("2026-08-22T00:00:00Z".to_owned()),
+            check_id: None,
         },
         StewardCheck {
             name: RECOVERY_CONTEXT.to_owned(),
@@ -2786,6 +2794,7 @@ fi
             conclusion: Some("FAILURE".to_owned()),
             run_id: None,
             observed_at: Some("2026-08-22T00:00:01Z".to_owned()),
+            check_id: None,
         },
     ]);
     let observation = observation_for(pr, true);

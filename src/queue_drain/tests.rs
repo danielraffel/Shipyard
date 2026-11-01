@@ -33,6 +33,7 @@ fn check(name: &str, status: &str, conclusion: Option<&str>, run_id: u64) -> Ste
         conclusion: conclusion.map(str::to_owned),
         run_id: Some(run_id),
         observed_at: Some("2026-10-24T10:00:00Z".to_owned()),
+        check_id: None,
     }
 }
 

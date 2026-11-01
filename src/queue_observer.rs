@@ -1094,10 +1094,25 @@ fn parse_pull_request(
     })
 }
 
+/// Recency of one rollup context. The check-run id is monotonic; the
+/// timestamp string is not (a clock change can stamp an older attempt later),
+/// so it only decides when either side has no id.
+#[derive(Clone, Debug)]
+struct CheckStamp {
+    id: Option<u64>,
+    stamp: String,
+}
+
+impl CheckStamp {
+    fn is_at_least(&self, other: &Self) -> bool {
+        crate::merge_steward::cmp_id_then_time(self.id, other.id, &self.stamp, &other.stamp).is_ge()
+    }
+}
+
 fn parse_check(
     node: &Value,
     required: &BTreeMap<String, Option<u64>>,
-) -> Result<(String, CheckSnapshot), String> {
+) -> Result<(CheckStamp, CheckSnapshot), String> {
     let typename = node.get("__typename").and_then(Value::as_str).unwrap_or("");
     let (name, status, conclusion, url, stamp, app_id) = match typename {
         "CheckRun" => {
@@ -1123,6 +1138,10 @@ fn parse_check(
                 || format!("~|check:{database_id:020}"),
                 |timestamp| format!("{timestamp}|check:{database_id:020}"),
             );
+            let stamp = CheckStamp {
+                id: (database_id != 0).then_some(database_id),
+                stamp,
+            };
             (
                 name,
                 status,
@@ -1147,10 +1166,13 @@ fn parse_check(
             } else {
                 state
             };
-            let stamp = format!(
-                "{}|status",
-                node.get("createdAt").and_then(Value::as_str).unwrap_or("")
-            );
+            let stamp = CheckStamp {
+                id: None,
+                stamp: format!(
+                    "{}|status",
+                    node.get("createdAt").and_then(Value::as_str).unwrap_or("")
+                ),
+            };
             (
                 name,
                 status,
@@ -1184,7 +1206,7 @@ fn parse_latest_checks(
     contexts: Option<&Value>,
     required: &BTreeMap<String, Option<u64>>,
 ) -> Result<Vec<CheckSnapshot>, String> {
-    let mut latest = BTreeMap::<(String, Option<u64>), (String, CheckSnapshot)>::new();
+    let mut latest = BTreeMap::<(String, Option<u64>), (CheckStamp, CheckSnapshot)>::new();
     for check in connection_nodes(contexts) {
         let (stamp, parsed) = parse_check(check, required)?;
         // App identity is load-bearing only for an app-bound requirement. An
@@ -1197,7 +1219,7 @@ fn parse_latest_checks(
             .flatten();
         let key = (parsed.name.clone(), app_key);
         match latest.get(&key) {
-            Some((existing, _)) if existing >= &stamp => {}
+            Some((existing, _)) if existing.is_at_least(&stamp) => {}
             _ => {
                 latest.insert(key, (stamp, parsed));
             }
@@ -1593,11 +1615,11 @@ mod tests {
             "status":"QUEUED", "conclusion":null,
             "detailsUrl":"https://github.test/run/11", "startedAt":null
         });
-        let mut latest = BTreeMap::<String, (String, CheckSnapshot)>::new();
+        let mut latest = BTreeMap::<String, (CheckStamp, CheckSnapshot)>::new();
         for value in [&old, &queued] {
             let (stamp, check) = parse_check(value, &required).expect("check");
             match latest.get(&check.name) {
-                Some((existing, _)) if existing >= &stamp => {}
+                Some((existing, _)) if existing.is_at_least(&stamp) => {}
                 _ => {
                     latest.insert(check.name.clone(), (stamp, check));
                 }
@@ -1620,7 +1642,55 @@ mod tests {
         });
         let (old_stamp, _) = parse_check(&old_status, &required).expect("status");
         let (new_stamp, _) = parse_check(&new_check, &required).expect("check");
-        assert!(new_stamp > old_stamp);
+        assert!(!old_stamp.is_at_least(&new_stamp));
+    }
+
+    #[test]
+    fn rollup_id_less_newer_context_beats_older_one_with_id() {
+        let required = BTreeMap::from([("macos".to_owned(), None)]);
+        let older_with_id = serde_json::json!({
+            "__typename":"CheckRun", "databaseId":999, "name":"macos",
+            "status":"COMPLETED", "conclusion":"FAILURE", "detailsUrl":"https://x/job/999",
+            "checkSuite":{"createdAt":"2026-11-01T01:00:00Z"}
+        });
+        let newer_status = serde_json::json!({
+            "__typename":"StatusContext", "context":"macos", "state":"SUCCESS",
+            "targetUrl":"https://x/s", "createdAt":"2026-11-01T02:00:00Z"
+        });
+        let contexts = serde_json::json!({"nodes": [older_with_id, newer_status]});
+        let checks = parse_latest_checks(Some(&contexts), &required).expect("checks");
+        assert_eq!(checks[0].conclusion.as_deref(), Some("success"));
+    }
+
+    #[test]
+    fn rollup_orders_reruns_by_check_run_id_not_skewed_timestamps() {
+        let required = BTreeMap::from([("review-verdict".to_owned(), None)]);
+        let stale_failure = serde_json::json!({
+            "__typename":"CheckRun", "databaseId":200, "name":"review-verdict",
+            "status":"COMPLETED", "conclusion":"FAILURE", "detailsUrl":"https://x/job/200",
+            "checkSuite":{"createdAt":"2026-11-01T09:42:00Z"}
+        });
+        let rerun_success = serde_json::json!({
+            "__typename":"CheckRun", "databaseId":300, "name":"review-verdict",
+            "status":"COMPLETED", "conclusion":"SUCCESS", "detailsUrl":"https://x/job/300",
+            "checkSuite":{"createdAt":"2026-11-01T09:23:00Z"}
+        });
+        for order in [
+            [&stale_failure, &rerun_success],
+            [&rerun_success, &stale_failure],
+        ] {
+            let contexts = serde_json::json!({"nodes": order});
+            let checks = parse_latest_checks(Some(&contexts), &required).expect("checks");
+            assert_eq!(checks.len(), 1);
+            assert_eq!(checks[0].conclusion.as_deref(), Some("success"));
+        }
+        let failure_newest = serde_json::json!({"nodes": [&rerun_success, {
+            "__typename":"CheckRun", "databaseId":400, "name":"review-verdict",
+            "status":"COMPLETED", "conclusion":"FAILURE", "detailsUrl":"https://x/job/400",
+            "checkSuite":{"createdAt":"2026-11-01T08:00:00Z"}
+        }]});
+        let checks = parse_latest_checks(Some(&failure_newest), &required).expect("checks");
+        assert_eq!(checks[0].conclusion.as_deref(), Some("failure"));
     }
 
     #[test]

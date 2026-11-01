@@ -309,7 +309,14 @@ fn latest<'a>(checks: &'a [CheckFact], name: &str) -> Option<&'a CheckFact> {
     checks
         .iter()
         .filter(|check| check.name == name)
-        .max_by_key(|check| (check.started_at.or(check.completed_at), check.id))
+        .max_by(|left, right| {
+            crate::merge_steward::cmp_id_then_time(
+                Some(left.id),
+                Some(right.id),
+                &left.started_at.or(left.completed_at),
+                &right.started_at.or(right.completed_at),
+            )
+        })
 }
 
 /// Compute the verdict.
@@ -468,7 +475,7 @@ fn latest_group_failure(facts: &VerdictFacts) -> Vec<&GroupRun> {
         .iter()
         .filter(|run| run.pr == Some(facts.pr) && run.created_at >= since)
         .collect();
-    let Some(latest) = own.iter().max_by_key(|run| (run.created_at, run.id)) else {
+    let Some(latest) = own.iter().max_by_key(|run| (run.id, run.created_at)) else {
         return Vec::new();
     };
     own.iter()
@@ -760,4 +767,46 @@ fn render_line(
         let _ = write!(line, "; queue: {queue}");
     }
     line
+}
+
+#[cfg(test)]
+mod latest_attempt_tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn fact(id: u64, conclusion: &str, hour: u32) -> CheckFact {
+        let at = Utc.with_ymd_and_hms(2026, 11, 1, hour, 0, 0).single();
+        CheckFact {
+            name: "review-verdict".to_owned(),
+            id,
+            status: "completed".to_owned(),
+            conclusion: Some(conclusion.to_owned()),
+            started_at: at,
+            completed_at: at,
+            signatures: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn latest_attempt_is_the_highest_id_not_the_latest_timestamp() {
+        // The older attempt carries the later (skewed) timestamp.
+        let checks = [fact(200, "failure", 10), fact(300, "success", 9)];
+        assert_eq!(latest(&checks, "review-verdict").map(|c| c.id), Some(300));
+        let reversed = [fact(300, "success", 9), fact(200, "failure", 10)];
+        assert_eq!(latest(&reversed, "review-verdict").map(|c| c.id), Some(300));
+        let newer_failure = [fact(300, "success", 10), fact(400, "failure", 9)];
+        assert_eq!(
+            latest(&newer_failure, "review-verdict").map(|c| c.id),
+            Some(400)
+        );
+    }
+
+    #[test]
+    fn latest_attempt_falls_back_to_time_for_equal_ids() {
+        let checks = [fact(5, "failure", 9), fact(5, "success", 10)];
+        assert_eq!(
+            latest(&checks, "review-verdict").and_then(|c| c.conclusion.as_deref()),
+            Some("success")
+        );
+    }
 }
