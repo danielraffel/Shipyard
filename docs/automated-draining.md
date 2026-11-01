@@ -49,13 +49,23 @@ owner only acts on evidence about the exact commit in front of it.
 
 ## What runs, and when
 
-Three timed jobs on one machine. Nothing else has to be running.
+Four timed jobs on one machine. Nothing else has to be running.
 
 | Job | How often | What it does |
 |---|---|---|
 | **Steward** (Shipyard CLI, no AI) | every 5 to 10 minutes | Admits approved, green exact heads (queue or exact-head merge). Writes one summary line per repository, with the oldest stuck pull requests and why. |
-| **Reviewer pass** | every 15 minutes or so | A script starts a one-shot AI session (through a pooled router such as Subrouter, falling back to another provider when one runs out) and gives it the written reviewer brief. It posts APPROVE or HOLD on pull requests that need a verdict, then exits. |
+| **Reviewer pass** | every 15 minutes or so, and on demand | A script computes the must-review queue (see below) and starts a one-shot AI session, through a pooled router such as Subrouter that falls back to another provider when one runs out. It gives the session the written reviewer brief and that queue. The session posts APPROVE or HOLD on each queued pull request in order, then exits. |
+| **Eligibility tick** (no AI) | every 2 minutes | Recomputes the must-review queue. When a pull request has just become reviewable, it starts a reviewer pass now. If a pass is already running, it queues exactly one follow-up, which re-checks the queue and is skipped when nothing is left. |
 | **Repair pass** | every 15 minutes or so | The same pattern: fixes one held or failing pull request, pushes once, exits. |
+
+**The reviewer never picks its own work.** Before each pass, a script lists
+every open, non-draft, unlabelled pull request whose required checks are green
+and which has no verdict naming its current head. That list is the must-review
+queue. The pass works through it in order. Anything still without a verdict
+afterwards is logged as missed and goes first next time. A pull request
+therefore keeps coming back until a verdict names its exact head; a new push
+resets that. The 2-minute tick cuts pickup to about 2 minutes from the moment
+checks go green, and the 15-minute timer remains as the backstop.
 
 **No agent session needs to stay open.** Shipyard and TartCI never start AI
 sessions themselves; the timer script does. GitHub runs CI (on TartCI VMs or
@@ -138,7 +148,13 @@ owns. The approval check name is `--approval-context` (default
    time. Each pass gets a written brief scoped by a list of repositories, not
    by repo-specific instructions, so adding a repo is a one-line change. Keep
    exactly one reviewer process. Interactive reviewer sessions are optional and
-   must skip heads that already carry a verdict.
+   must skip heads that already carry a verdict. Compute the reviewer's
+   candidates with a script (the must-review queue), never by the model. Add
+   the 2-minute eligibility tick so a pull request is reviewed shortly after its
+   checks go green:
+   - it never interrupts a running pass;
+   - at most one follow-up is pending;
+   - it kicks at most once per head.
 5. **Tell every agent the rules** (next section).
 
 ## Accounts and identities
@@ -293,6 +309,17 @@ These came from running it for real:
   Approvals from an unattributed session don't count (a HOLD still does), and
   two processes sharing a signer can't be told apart. Scheduled (headless) runs
   must set a session id explicitly.
+- **A model choosing its own candidates skips work.** Given only a brief, a
+  reviewer pass reviewed other pull requests and twice passed over a repaired,
+  green one. Compute the candidate list mechanically and hand it to the pass.
+  Log anything it leaves unreviewed, and put that first next time.
+- **A timer alone adds up to a full interval of latency, and a pass can just
+  miss a head.** A pass builds its queue when it starts. A pull request whose
+  last check turns green seconds later waits for the next pass. A cheap
+  eligibility tick that starts a pass when a pull request becomes reviewable
+  removes that wait. Run it with an explicit `PATH`: under a timer job the
+  login profile may not load, and a helper such as `ghapp` silently goes
+  missing.
 - **Fail over between providers.** A headless review pass should retry on
   another provider when one returns auth or quota errors, and remember a recent
   failure instead of paying for it on every run.
