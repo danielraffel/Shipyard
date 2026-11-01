@@ -1,0 +1,46 @@
+name: Auto-release watchdog
+
+# Layer 2 of the release-watchdog triad (docs/release-watchdog.md), ported from
+# Pulp's auto-release-watchdog.yml. When version-at-land.yml or auto-release.yml
+# fails, keep that workflow's tracking issue open with the run, the error lines
+# from its log and the fix; close it on the next successful run. A run GitHub
+# rejected at the workflow-file level (no jobs) counts as a failure.
+#
+# version-at-land.yml once failed on every landing for a day: it pushed the bump
+# branch, died on the pull request call, and nothing else noticed.
+
+on:
+  workflow_run:
+    workflows: ["Assign versions at land", "Auto-Release on CLI Version Bump"]
+    types: [completed]
+
+permissions: {}
+
+concurrency:
+  group: auto-release-watchdog-${{ github.event.workflow_run.name }}
+  cancel-in-progress: false
+
+jobs:
+  alert:
+    runs-on: ubuntu-latest
+    name: Alert on release-chain failure
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Maintain the tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORKFLOW: ${{ github.event.workflow_run.name }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+        run: |
+          python3 scripts/release_watchdog.py watchdog --workflow "$WORKFLOW" \
+            --run-id "$RUN_ID" --run-url "$RUN_URL" --sha "$RUN_SHA" --conclusion "$CONCLUSION"

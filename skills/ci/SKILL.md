@@ -1098,6 +1098,13 @@ branch looks healthy) and then fails on `POST /pulls`; no bump pull request
 opens and main stops releasing. The run log prints gh's error and names the
 missing permission.
 
+A stalled release chain opens a `release-stall` issue on its own:
+`auto-release-watchdog.yml` tracks a failing `version-at-land.yml` or
+`auto-release.yml` run (error lines and fix copied in), and
+`release-cadence-check.yml` flags `feat:`/`fix:` merges older than two hours
+that are in no tag while no bump pull request is open. Both close their issue
+on recovery; see `docs/release-watchdog.md`.
+
 ## Stale ship-state records: `discard --repo` and `prune`
 
 The daemon archives a record when its PR's `pull_request.closed` webhook

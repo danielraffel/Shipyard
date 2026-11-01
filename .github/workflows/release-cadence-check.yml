@@ -1,0 +1,52 @@
+name: Release cadence check
+
+# Layer 3 of the release-watchdog triad (docs/release-watchdog.md), ported from
+# Pulp's release-cadence-check.yml. It looks only at outcomes, with the default
+# token, so it fires whatever broke and does not depend on the release
+# workflows it checks:
+# - a feat:/fix: pull request merged to main more than two hours ago is in no
+#   v* tag and no release/version-at-land pull request is open;
+# - a Cargo.toml version move on main is in no v* tag after 30 minutes.
+# It keeps one tracking issue and closes it when every change is released.
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Log findings but do not touch the tracking issue"
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: release-cadence-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    # A fork inherits the schedule silently; it has nothing to report.
+    if: github.event_name != 'schedule' || github.repository == 'danielraffel/Shipyard'
+    runs-on: ubuntu-latest
+    name: Check every merged change reached a release
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Check merges and version bumps against tags
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
+        run: |
+          args=()
+          if [ "$DRY_RUN" = "true" ]; then args+=(--dry-run); fi
+          python3 scripts/release_watchdog.py "${args[@]}" cadence --grace-hours 2 --bump-grace-minutes 30
