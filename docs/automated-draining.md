@@ -47,6 +47,21 @@ owner only acts on evidence about the exact commit in front of it.
   A *reviewer* agent posts verdicts. A *repair* agent picks up holds. Neither
   one merges anything.
 
+## What runs, and when
+
+Three timed jobs on one machine. Nothing else has to be running.
+
+| Job | How often | What it does |
+|---|---|---|
+| **Steward** (Shipyard CLI, no AI) | every 5 to 10 minutes | Admits approved, green exact heads (queue or exact-head merge). Writes one summary line per repository, with the oldest stuck pull requests and why. |
+| **Reviewer pass** | every 15 minutes or so | A script starts a one-shot AI session (through a pooled router such as Subrouter, falling back to another provider when one runs out) and gives it the written reviewer brief. It posts APPROVE or HOLD on pull requests that need a verdict, then exits. |
+| **Repair pass** | every 15 minutes or so | The same pattern: fixes one held or failing pull request, pushes once, exits. |
+
+**No agent session needs to stay open.** Shipyard and TartCI never start AI
+sessions themselves; the timer script does. GitHub runs CI (on TartCI VMs or
+hosted runners) and does the merge. If the machine is off, draining pauses and
+picks up again when it returns; nothing unsafe merges in the meantime.
+
 ## How a pull request moves
 
 1. An agent opens a pull request (`shipyard pr --no-arm`, or any normal way)
@@ -65,6 +80,12 @@ owner only acts on evidence about the exact commit in front of it.
    is handed to GitHub. A merge queue tests it with up to four others and
    merges the batch. Without a queue, Shipyard merges that exact head, and
    GitHub refuses unless the required checks pass.
+
+Labels keep a pull request out of admission, and the steward refuses it:
+`owner-decision`, `superseded` and `PARKED/<platform>`. `PARKED/<platform>`
+excuses only that platform's CI, never a HOLD that names a code defect. If only
+the owner can fix it (secrets, environments), close it with a tracking issue
+rather than leaving it open.
 
 That's the whole loop. When it stalls, the reason shows up in one place: the
 steward's per-pass summary (how many PRs it admitted, how many are waiting for
@@ -111,9 +132,13 @@ owns. The approval check name is `--approval-context` (default
 3. **Give CI somewhere to run.** Install TartCI on the Macs you want in the
    pool, label your jobs for it, and keep GitHub-hosted runners as overflow or
    for platforms you don't host.
-4. **Start a reviewer and a repair agent** as long-running sessions with
-   written briefs. Scope them by a list of repositories, not by repo-specific
-   instructions, so adding a repo is a one-line change.
+4. **Run the reviewer and repair as scheduled one-shot passes.** Each is a
+   timer job plus a small runner script that picks an available provider, sets
+   a unique session id, takes a lock so passes never overlap, and caps run
+   time. Each pass gets a written brief scoped by a list of repositories, not
+   by repo-specific instructions, so adding a repo is a one-line change. Keep
+   exactly one reviewer process. Interactive reviewer sessions are optional and
+   must skip heads that already carry a verdict.
 5. **Tell every agent the rules** (next section).
 
 ## Accounts and identities
@@ -264,10 +289,10 @@ These came from running it for real:
   to review only heads with no verdict, ignored it, and approved held heads.
   Anything that posts verdicts needs a mechanical check before it goes live;
   Shipyard now enforces held heads itself.
-- **Give every reviewer process its own signer and an attributed session.**
-  Approvals from an unattributed session don't count (a HOLD still does), and two processes
-  sharing a signer can't be told apart. Scheduled (headless) runs must set a
-  session id explicitly.
+- **One reviewer process per signer, with an attributed session.**
+  Approvals from an unattributed session don't count (a HOLD still does), and
+  two processes sharing a signer can't be told apart. Scheduled (headless) runs
+  must set a session id explicitly.
 - **Fail over between providers.** A headless review pass should retry on
   another provider when one returns auth or quota errors, and remember a recent
   failure instead of paying for it on every run.
