@@ -1385,3 +1385,23 @@ fn job_id_is_parsed_from_details_url() {
         None
     );
 }
+
+#[test]
+fn id_less_newer_check_beats_older_check_that_has_an_id() {
+    let older_with_id = run_check("FAILURE", "2026-11-01T01:00:00Z", Some(999));
+    let newer_without_id = run_check("SUCCESS", "2026-11-01T02:00:00Z", None);
+    for checks in [
+        vec![older_with_id.clone(), newer_without_id.clone()],
+        vec![newer_without_id.clone(), older_with_id.clone()],
+    ] {
+        assert_eq!(decision_for(checks), StewardDecision::ArmMergeQueue);
+    }
+}
+
+#[test]
+fn ids_of_different_surfaces_are_not_compared() {
+    let mut status = run_check("SUCCESS", "2026-11-01T02:00:00Z", Some(1));
+    status.source = StewardCheckSource::StatusContext;
+    let run = run_check("FAILURE", "2026-11-01T01:00:00Z", Some(9_999));
+    assert_eq!(cmp_recency(&status, &run), std::cmp::Ordering::Greater);
+}

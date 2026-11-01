@@ -1105,10 +1105,7 @@ struct CheckStamp {
 
 impl CheckStamp {
     fn is_at_least(&self, other: &Self) -> bool {
-        match (self.id, other.id) {
-            (Some(left), Some(right)) => left >= right,
-            _ => self.stamp >= other.stamp,
-        }
+        crate::merge_steward::cmp_id_then_time(self.id, other.id, &self.stamp, &other.stamp).is_ge()
     }
 }
 
@@ -1646,6 +1643,23 @@ mod tests {
         let (old_stamp, _) = parse_check(&old_status, &required).expect("status");
         let (new_stamp, _) = parse_check(&new_check, &required).expect("check");
         assert!(!old_stamp.is_at_least(&new_stamp));
+    }
+
+    #[test]
+    fn rollup_id_less_newer_context_beats_older_one_with_id() {
+        let required = BTreeMap::from([("macos".to_owned(), None)]);
+        let older_with_id = serde_json::json!({
+            "__typename":"CheckRun", "databaseId":999, "name":"macos",
+            "status":"COMPLETED", "conclusion":"FAILURE", "detailsUrl":"https://x/job/999",
+            "checkSuite":{"createdAt":"2026-11-01T01:00:00Z"}
+        });
+        let newer_status = serde_json::json!({
+            "__typename":"StatusContext", "context":"macos", "state":"SUCCESS",
+            "targetUrl":"https://x/s", "createdAt":"2026-11-01T02:00:00Z"
+        });
+        let contexts = serde_json::json!({"nodes": [older_with_id, newer_status]});
+        let checks = parse_latest_checks(Some(&contexts), &required).expect("checks");
+        assert_eq!(checks[0].conclusion.as_deref(), Some("success"));
     }
 
     #[test]

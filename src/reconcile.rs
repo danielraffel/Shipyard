@@ -880,8 +880,14 @@ fn match_check<'a>(run: &DispatchedRun, checks: &'a [Value]) -> Option<&'a Value
     } else {
         substring
     };
-    pool.into_iter()
-        .max_by_key(|check| (check_job_id(check), check_timestamp(check)))
+    pool.into_iter().max_by(|left, right| {
+        crate::merge_steward::cmp_id_then_time(
+            check_job_id(left),
+            check_job_id(right),
+            check_timestamp(left),
+            check_timestamp(right),
+        )
+    })
 }
 
 fn padded_check_name(name_lc: &str) -> String {
@@ -1153,6 +1159,73 @@ mod tests {
         assert!(!capture.timed_out);
         assert_eq!(capture.returncode, Some(0));
         assert_eq!(capture.stdout.len(), 200_000);
+    }
+
+    fn rollup_check(conclusion: &str, completed_at: &str, details_url: &str) -> serde_json::Value {
+        serde_json::json!({
+            "name": "macos", "status": "COMPLETED", "conclusion": conclusion,
+            "completedAt": completed_at, "detailsUrl": details_url
+        })
+    }
+
+    fn matched_conclusion(checks: &[serde_json::Value]) -> String {
+        super::match_check(&run("macos", "running"), checks)
+            .and_then(|check| check["conclusion"].as_str())
+            .expect("a match")
+            .to_owned()
+    }
+
+    #[test]
+    fn match_check_orders_reruns_by_job_id_over_skewed_timestamps() {
+        let stale_failure = rollup_check(
+            "FAILURE",
+            "2026-11-01T09:42:22Z",
+            "https://x/actions/runs/1/job/200",
+        );
+        let rerun_success = rollup_check(
+            "SUCCESS",
+            "2026-11-01T09:23:21Z",
+            "https://x/actions/runs/1/job/300",
+        );
+        assert_eq!(
+            matched_conclusion(&[stale_failure.clone(), rerun_success.clone()]),
+            "SUCCESS"
+        );
+        assert_eq!(
+            matched_conclusion(&[rerun_success.clone(), stale_failure.clone()]),
+            "SUCCESS"
+        );
+        let newer_failure = rollup_check(
+            "FAILURE",
+            "2026-11-01T09:00:00Z",
+            "https://x/actions/runs/1/job/400",
+        );
+        assert_eq!(
+            matched_conclusion(&[rerun_success, newer_failure]),
+            "FAILURE"
+        );
+    }
+
+    #[test]
+    fn match_check_uses_timestamp_when_either_side_has_no_job_id() {
+        let older_with_job = rollup_check(
+            "FAILURE",
+            "2026-11-01T01:00:00Z",
+            "https://x/actions/runs/1/job/999",
+        );
+        let newer_run_level = rollup_check(
+            "SUCCESS",
+            "2026-11-01T02:00:00Z",
+            "https://x/actions/runs/2",
+        );
+        assert_eq!(
+            matched_conclusion(&[older_with_job.clone(), newer_run_level.clone()]),
+            "SUCCESS"
+        );
+        assert_eq!(
+            matched_conclusion(&[newer_run_level, older_with_job]),
+            "SUCCESS"
+        );
     }
 
     fn run(target: &str, status: &str) -> DispatchedRun {

@@ -726,12 +726,29 @@ pub(crate) fn selected_required_check<'a>(
 /// change can stamp an older attempt later than a newer one. Anything else
 /// (mixed surfaces, or a missing id) falls back to the timestamp.
 pub(crate) fn cmp_recency(left: &StewardCheck, right: &StewardCheck) -> std::cmp::Ordering {
-    if left.source == right.source
-        && let (Some(left_id), Some(right_id)) = (left.check_id, right.check_id)
-    {
-        return left_id.cmp(&right_id);
+    let same_surface = left.source == right.source;
+    cmp_id_then_time(
+        left.check_id.filter(|_| same_surface),
+        right.check_id.filter(|_| same_surface),
+        check_recency(left),
+        check_recency(right),
+    )
+}
+
+/// The one recency rule: ids decide only when BOTH sides have one; a missing
+/// id on either side (a run-level URL, a status without an id) falls back to
+/// `time`. Never rank `Some(id)` above `None`, which would let an older
+/// observation that happens to carry an id beat a newer one that does not.
+pub(crate) fn cmp_id_then_time<T: Ord>(
+    left_id: Option<u64>,
+    right_id: Option<u64>,
+    left_time: T,
+    right_time: T,
+) -> std::cmp::Ordering {
+    match (left_id, right_id) {
+        (Some(left), Some(right)) => left.cmp(&right),
+        _ => left_time.cmp(&right_time),
     }
-    check_recency(left).cmp(&check_recency(right))
 }
 
 /// The Actions job id (the check-run id) in a check's details URL
