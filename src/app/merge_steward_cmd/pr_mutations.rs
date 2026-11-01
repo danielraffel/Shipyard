@@ -87,6 +87,14 @@ pub(super) fn mutate_pr_with_recovery(
         return (Some("skipped_after_live_revalidation".to_owned()), None);
     }
     let pr = &live_pr;
+    // A HOLD on another open pull request must not reach the base through
+    // this one: refuse a head that carries its unapproved commits.
+    if matches!(decision, StewardDecision::ArmMergeQueue)
+        && let Some((token, detail)) =
+            super::carried_commits::admission_refusal(context, pr, ledger)
+    {
+        return (Some(token), Some(detail));
+    }
     match decision {
         StewardDecision::ArmMergeQueue if policy.server_enforced_exact_head_merge() => {
             super::exact_head_merge::merge_exact_head(context, pr, policy, ledger)

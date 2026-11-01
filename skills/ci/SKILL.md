@@ -318,7 +318,10 @@ with `SHIPYARD_QUEUE_ARMS_LOG`). A guard that cannot run (no `python3` 3.11+)
 refuses. The steward reports a refusal as `waiting_head_approval`; its pass
 JSON also names the reason per PR in `blocked_on` (`no_verdict`, `held`,
 `approval_excluded:<reason>`, ...) with a `since` time, so read that rather
-than the mutation when diagnosing a stall. There is no
+than the mutation when diagnosing a stall. The steward also refuses a head
+that carries another open PR's commits whose head is not approved
+(`carries_unapproved_commits:#Q`, shared shas in `blocked_detail`): a HOLD
+cannot be bypassed by merging the held branch into another one. There is no
 override: `--arm` asks only for an arm the verdict allows, and
 `GHAPP_ALLOW_UNREVIEWED_ARM` is refused and audited. The review-only switch
 and Shipyard's internal marker count only with the one-shot nonce Shipyard

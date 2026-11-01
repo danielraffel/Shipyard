@@ -348,6 +348,17 @@ fn arm_candidate(facts: &RowFacts<'_>, policy: &StewardPolicy) -> (Stall, SinceH
     {
         return ejected(cause, None, green_since(), None);
     }
+    if let Some(part) = parts.iter().find(|part| {
+        part.starts_with("carries_unapproved_commits")
+            || part.starts_with("carried_commits_over_cap")
+            || part.starts_with("carried_commits_unreadable")
+    }) {
+        return green(
+            (*part).to_owned(),
+            green_since(),
+            facts.error.map(str::to_owned),
+        );
+    }
     if parts.contains(&"waiting_head_approval")
         || (facts.mutation.is_none() && facts.error.is_none())
     {

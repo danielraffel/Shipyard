@@ -11,9 +11,17 @@ fn fake_gh(temp: &tempfile::TempDir, body: &str) -> GitHubActions {
     } else {
         "case \"$*\" in *contents/.shipyard/config.toml*) printf '%s\\n' '[auto_merge]' 'arm_requires_head_approval = false'; exit 0;; esac\n".to_owned()
     };
+    // The carried-commit admission guard compares each candidate with its
+    // base; by default a candidate carries no commit, so no other pull
+    // request is read. `# CARRIED_COMMITS` lets a fixture answer it itself.
+    let carried_shim = if body.contains("# CARRIED_COMMITS") {
+        ""
+    } else {
+        "case \"$*\" in *\"/compare/\"*\"total_commits\"*) printf '%s' '{\"total\":0,\"shas\":[]}'; exit 0;; esac\n"
+    };
     crate::test_support::write_executable_script(
         &path,
-        &format!("#!/bin/sh\nset -eu\n{policy_shim}{body}\n"),
+        &format!("#!/bin/sh\nset -eu\n{policy_shim}{carried_shim}{body}\n"),
     );
     let config = crate::config::LoadedConfig {
         data: toml::Table::new(),
@@ -61,6 +69,7 @@ fn mutation_apply_context<'a>(
         ledger_path,
         mutation_control,
         approval_blockers: std::cell::RefCell::default(),
+        carried_commits: std::cell::RefCell::default(),
     }
 }
 

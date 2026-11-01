@@ -91,6 +91,26 @@ picks up again when it returns; nothing unsafe merges in the meantime.
    merges the batch. Without a queue, Shipyard merges that exact head, and
    GitHub refuses unless the required checks pass.
 
+A HOLD is only as strong as nobody stacking on it, so the steward also refuses
+a head that carries another open pull request's unapproved commits. Before it
+enqueues or merges pull request P, it reads P's commits that are not on the
+base (the compare API `base...head`) and, once per pass, the commits of every
+other open pull request in the repository. If P carries any commit of a pull
+request Q whose current head is not approved (a counted HOLD, or no counted
+APPROVE), P is refused with `blocked_on=carries_unapproved_commits:#Q`, and
+`blocked_detail` names the shared commits and why Q is not approved. Commits
+already on the base never count, nor does Q when it is P's own base-branch
+pull request, is stacked on P (its base branch is P's head branch), or is a
+Shipyard rollup that merged P's head. Land or
+approve Q first, or drop its commits from P; a branch built on another pull
+request should target that pull request's branch. At most 250 commits are read
+per pull request: a larger, unapproved one fails closed
+(`carried_commits_over_cap:#N`), as does an unreadable listing, compare or
+approval (`carried_commits_unreadable`). The check applies only where the base
+requires head approval, and only on an apply pass. (On 2026-11-01 a branch
+merged another branch that carried a held pull request's commits; its own
+diff was approved and the held code reached main.)
+
 Labels keep a pull request out of admission, and the steward refuses it:
 `owner-decision`, `superseded` and `PARKED/<platform>`. `PARKED/<platform>`
 excuses only that platform's CI, never a HOLD that names a code defect. If only
@@ -252,6 +272,8 @@ not listed as blocked.
 | `merge_state:<STATE>` | GitHub says `DIRTY`, `BEHIND`, `UNSTABLE`, ... | repair lane: merge the base |
 | `ejected_same_head:<cause>` | The queue ejected this exact head and the steward will not re-enqueue it: the failure is the head's, could not be placed, or the head's one retry is spent. `blocked_detail` carries the classifier's reason (the failing job and whether the retry was spent). Read from the same queue state in a dry run and an apply pass; `since` is the removal | repair lane |
 | `waiting_full_test_tier`, `waiting_enqueue_requirements` | Admission waits on a deferred check tier or a GitHub requirement | CI |
+| `carries_unapproved_commits:#Q` | Approved and green, but carries commits of open pull request #Q, whose head is not approved; `blocked_detail` names the commits | Q's reviewer, or the author: drop Q's commits |
+| `carried_commits_over_cap:#N`, `carried_commits_unreadable` | Whether the head carries unapproved commits could not be proven (more than 250 commits, or a failed read) | author, or next pass |
 | `revalidating` | The head or queue changed during the pass | next pass |
 | `steward_error` | Admission failed; see `error` | operator |
 | `admission_pending` | Admission returned an outcome with no token of its own; see `blocked_detail` | next pass |

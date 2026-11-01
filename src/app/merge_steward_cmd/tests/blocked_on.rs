@@ -928,3 +928,25 @@ fn an_admission_outranks_every_label() {
     let pr = pr_with(16, &["owner-decision"], "CLEAN", &green_rollup());
     assert_eq!(token(&pr, Some("enqueued")), "admitted");
 }
+
+#[test]
+fn a_head_carrying_held_commits_names_the_held_pull_request_and_the_commits() {
+    let pr = pr_with(11369, &[], "CLEAN", &green_rollup());
+    let policy = queue_policy();
+    let decision = classify_pr(&pr.fact, &policy, &BTreeMap::new());
+    let detail = "carries 2 commit(s) of #11361 not on main (c26a23be, a0148424)";
+    let (stall, _) = classify(
+        &RowFacts {
+            pr: &pr.fact,
+            decision: &decision,
+            mutation: Some("carries_unapproved_commits:#11361"),
+            error: Some(detail),
+            approval: GateRead::Admits,
+            enqueued_at: None,
+            ejection: None,
+        },
+        &policy,
+    );
+    assert_eq!(stall.blocked_on, "carries_unapproved_commits:#11361");
+    assert_eq!(stall.blocked_detail.as_deref(), Some(detail));
+}

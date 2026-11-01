@@ -268,6 +268,7 @@ pub(super) fn apply_pr_plans(
         ledger_path,
         mutation_control,
         approval_blockers: std::cell::RefCell::default(),
+        carried_commits: std::cell::RefCell::default(),
     });
     let mut sweep_pass = super::unapproved_admission::SweepPass::new(args.unapproved_dequeue);
     if args.apply {

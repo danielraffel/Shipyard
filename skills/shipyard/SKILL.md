@@ -722,6 +722,9 @@ leaves a managed PR `HandoffMissing`; `train status` reports whether the
 newest handed-off earlier head carries to the current one under the same
 merge-only rule as an approval. The steward itself still requires the status
 on the head until the train admits PRs.
+Before it enqueues or merges a head, the steward also refuses one that carries
+commits of another open PR whose head is not approved
+(`carries_unapproved_commits:#Q`; see `docs/automated-draining.md`).
 
 ## The carrier re-arms with `expectedHeadOid`, through the internal path
 
