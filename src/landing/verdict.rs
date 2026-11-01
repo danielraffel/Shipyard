@@ -313,8 +313,8 @@ fn latest<'a>(checks: &'a [CheckFact], name: &str) -> Option<&'a CheckFact> {
             crate::merge_steward::cmp_id_then_time(
                 Some(left.id),
                 Some(right.id),
-                left.started_at.or(left.completed_at),
-                right.started_at.or(right.completed_at),
+                &left.started_at.or(left.completed_at),
+                &right.started_at.or(right.completed_at),
             )
         })
 }

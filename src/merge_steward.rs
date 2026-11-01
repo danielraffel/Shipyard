@@ -730,8 +730,8 @@ pub(crate) fn cmp_recency(left: &StewardCheck, right: &StewardCheck) -> std::cmp
     cmp_id_then_time(
         left.check_id.filter(|_| same_surface),
         right.check_id.filter(|_| same_surface),
-        check_recency(left),
-        check_recency(right),
+        &check_recency(left),
+        &check_recency(right),
     )
 }
 
@@ -742,12 +742,12 @@ pub(crate) fn cmp_recency(left: &StewardCheck, right: &StewardCheck) -> std::cmp
 pub(crate) fn cmp_id_then_time<T: Ord>(
     left_id: Option<u64>,
     right_id: Option<u64>,
-    left_time: T,
-    right_time: T,
+    left_time: &T,
+    right_time: &T,
 ) -> std::cmp::Ordering {
     match (left_id, right_id) {
         (Some(left), Some(right)) => left.cmp(&right),
-        _ => left_time.cmp(&right_time),
+        _ => left_time.cmp(right_time),
     }
 }
 

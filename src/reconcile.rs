@@ -884,8 +884,8 @@ fn match_check<'a>(run: &DispatchedRun, checks: &'a [Value]) -> Option<&'a Value
         crate::merge_steward::cmp_id_then_time(
             check_job_id(left),
             check_job_id(right),
-            check_timestamp(left),
-            check_timestamp(right),
+            &check_timestamp(left),
+            &check_timestamp(right),
         )
     })
 }

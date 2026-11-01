@@ -4435,3 +4435,7 @@ explicit repository scope must be exported as `GH_REPO=OWNER/REPO` for the
 keep provenance in the client environment rather than appending wrapper-only
 flags to native CLI invocations.
 
+
+## Duplicate check recency
+
+When a required context has several observations (reruns), the steward, queue observer, reconcile and landing verdict pick the newest by monotonic id (check-run id, i.e. the Actions job id, or status id), never by timestamp alone: a clock change such as the repeated DST hour can stamp an older attempt later. Ids decide only when both sides have one; otherwise the timestamp does (`cmp_id_then_time`).
