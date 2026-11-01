@@ -47,7 +47,6 @@ fn candidate(commits: &BTreeSet<String>) -> Candidate<'_> {
         number: 11369,
         base_ref: "main",
         head_ref: "feat/real-world-inputs-t8",
-        head_sha: OWN,
         commits,
     }
 }
@@ -214,7 +213,7 @@ fn listing(prs: &[(&OpenPr, usize)]) -> serde_json::Value {
 }
 
 #[test]
-fn the_incident_through_github_reads_is_refused_and_reads_are_cached_per_pass() {
+fn the_incident_through_github_reads_is_refused_and_revalidates_each_candidate() {
     let q = held();
     let listings = Cell::new(0);
     let run_gh = |argv: &[String]| -> Result<String, String> {
@@ -250,7 +249,63 @@ fn the_incident_through_github_reads_is_refused_and_reads_are_cached_per_pass() 
         assert_eq!(refusal.token, "carries_unapproved_commits:#11361");
     }
     assert_eq!(listings.get(), 1, "open pull requests read once per pass");
-    assert_eq!(judged.get(), 1, "a carried head judged once per pass");
+    assert_eq!(
+        judged.get(),
+        2,
+        "a carried head is revalidated for each candidate"
+    );
+}
+
+#[test]
+fn a_carried_approval_is_not_reused_after_a_later_candidate_sees_a_new_verdict() {
+    let q = held();
+    let run_gh = |argv: &[String]| -> Result<String, String> {
+        let joined = argv.join(" ");
+        if joined.contains("compare/main...") {
+            return Ok(json!({"total": 3, "shas": [HELD_A, HELD_B, OWN]}).to_string());
+        }
+        if joined.contains("OPEN") {
+            return Ok(listing(&[(&q, 3)]).to_string());
+        }
+        Err(format!("unexpected: {joined}"))
+    };
+    let judged = Cell::new(0);
+    let mut judge = |_: &OpenPr| {
+        let call = judged.get();
+        judged.set(call + 1);
+        if call == 0 {
+            Judgement::Approved
+        } else {
+            Judgement::Unapproved("the carried head moved after the first candidate".to_owned())
+        }
+    };
+    let mut cache = PassCache::default();
+    assert_eq!(
+        refusal_with(
+            &run_gh,
+            "owner/repo",
+            "main",
+            11369,
+            "feat/real-world-inputs-t8",
+            OWN,
+            &mut cache,
+            &mut judge,
+        ),
+        None
+    );
+    let refusal = refusal_with(
+        &run_gh,
+        "owner/repo",
+        "main",
+        11370,
+        "feat/real-world-inputs-t8",
+        OWN,
+        &mut cache,
+        &mut judge,
+    )
+    .expect("the later candidate must not reuse the stale approval");
+    assert_eq!(refusal.token, "carries_unapproved_commits:#11361");
+    assert_eq!(judged.get(), 2);
 }
 
 #[test]
@@ -301,7 +356,7 @@ fn an_unreadable_listing_fails_closed() {
 }
 
 #[test]
-fn a_rollup_that_merged_the_candidate_does_not_block_it_but_any_other_rollup_does() {
+fn a_rollup_shaped_branch_is_checked_like_any_other_carried_pr() {
     let own = set(&[OWN]);
     let rollup = open(
         9,
@@ -310,14 +365,19 @@ fn a_rollup_that_merged_the_candidate_does_not_block_it_but_any_other_rollup_doe
         HELD_HEAD,
         &[OWN, HELD_A, HELD_HEAD],
     );
-    assert!(carried(&candidate(&own), std::slice::from_ref(&rollup)).is_empty());
-    // A rollup branch that does not hold P's head is judged like any Q.
-    let own = set(&[HELD_A, "dddddddddddddddddddddddddddddddddddddddd"]);
-    let other = Candidate {
-        head_sha: "dddddddddddddddddddddddddddddddddddddddd",
-        ..candidate(&own)
-    };
-    assert_eq!(carried(&other, &[rollup]).len(), 1);
+    assert_eq!(
+        carried(&candidate(&own), std::slice::from_ref(&rollup)).len(),
+        1
+    );
+    // A spoofed rollup prefix receives the same check.
+    let spoofed = open(
+        10,
+        "shipyard-train/rollup-spoof",
+        "main",
+        HELD_HEAD,
+        &[OWN, HELD_A, HELD_HEAD],
+    );
+    assert_eq!(carried(&candidate(&own), &[spoofed]).len(), 1);
 }
 
 #[test]

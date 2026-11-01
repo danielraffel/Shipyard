@@ -17,8 +17,6 @@
 //! * Q is P's own base-branch pull request (same repository, Q's head branch
 //!   is P's base); a properly stacked P never targets the steward's base.
 //! * Q is stacked on P (Q's base branch is P's head branch): Q builds on P.
-//! * Q is a Shipyard rollup that merged P's head: it shares only P's own
-//!   commits, and its other members are open pull requests judged directly.
 //! * Commits already on the base: P's set comes from the compare API
 //!   `base...head`, which lists only commits the base does not have.
 //! * A base whose policy does not require head approval: there every head is
@@ -34,8 +32,8 @@
 //!
 //! Cost is bounded per pass. Open pull requests and their commits are read
 //! once per pass per repository (one paged GraphQL listing, cached in the
-//! mutation context), Q's approval is read only when Q overlaps a candidate
-//! and is cached per head, and P's own set costs one compare call. At most
+//! mutation context), Q's approval is read whenever Q overlaps a candidate,
+//! and P's own set costs one compare call. At most
 //! [`MAX_COMMITS_PER_PR`] commits are read for any pull request; a pull
 //! request with more fails closed (`carried_commits_over_cap:#N`) unless it is
 //! an approved Q. An unreadable listing, compare or approval also fails closed
@@ -43,7 +41,7 @@
 //! head is still the head the listing saw; a push after the listing also
 //! fails closed (`carried_commits_unreadable:#Q`) until the next pass.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use serde_json::Value;
 
@@ -106,8 +104,6 @@ pub(super) struct Candidate<'a> {
     pub base_ref: &'a str,
     /// P's head branch.
     pub head_ref: &'a str,
-    /// P's head commit.
-    pub head_sha: &'a str,
     /// P's commits not on the base.
     pub commits: &'a BTreeSet<String>,
 }
@@ -161,10 +157,6 @@ pub(super) fn carried(candidate: &Candidate<'_>, others: &[OpenPr]) -> Vec<Carri
         .filter(|q| q.cross_repository || q.head_ref != candidate.base_ref)
         // Q is stacked on P.
         .filter(|q| q.base_ref != candidate.head_ref)
-        // Q is a rollup with P as a member: it merged P's head, so what they
-        // share is P's own, and the rollup's other members are judged as
-        // pull requests of their own.
-        .filter(|q| !(is_rollup(q) && contains(q, candidate.head_sha)))
         .filter_map(|q| match &q.commits {
             CommitList::Complete(commits) => {
                 let shared: Vec<String> =
@@ -181,14 +173,6 @@ pub(super) fn carried(candidate: &Candidate<'_>, others: &[OpenPr]) -> Vec<Carri
             }),
         })
         .collect()
-}
-
-fn is_rollup(q: &OpenPr) -> bool {
-    !q.cross_repository && q.head_ref.starts_with(crate::rollup::BRANCH_PREFIX)
-}
-
-fn contains(q: &OpenPr, sha: &str) -> bool {
-    matches!(&q.commits, CommitList::Complete(commits) if commits.contains(sha))
 }
 
 /// Whether P may be admitted given what it carries and each carried pull
@@ -275,7 +259,6 @@ fn name_shas(shas: &[String]) -> String {
 #[derive(Debug, Default)]
 pub(super) struct PassCache {
     open: Option<Result<Vec<OpenPr>, String>>,
-    judged: BTreeMap<(u64, String), Judgement>,
 }
 
 /// The guard on the steward's own admission path (enqueue and exact-head
@@ -428,7 +411,6 @@ pub(super) fn refusal_with(
         number,
         base_ref: base,
         head_ref,
-        head_sha,
         commits: &own,
     };
     let overlaps = carried(&candidate, others);
@@ -438,11 +420,11 @@ pub(super) fn refusal_with(
             .iter()
             .find(|q| q.number == overlap.number())
             .expect("an overlap names a listed pull request");
-        let judgement = cache
-            .judged
-            .entry((q.number, q.head_sha.clone()))
-            .or_insert_with(|| judge(q))
-            .clone();
+        // Re-read the carried head's approval for every candidate. The live
+        // head check is part of `judge`; caching an approval would let a
+        // force-push after the first candidate reuse a stale verdict later in
+        // the same pass.
+        let judgement = judge(q);
         judged.push((overlap, judgement));
     }
     decide(base, &judged)
