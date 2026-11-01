@@ -264,6 +264,7 @@ fn observation(merge_state: &str, head: &str) -> RepoObservation {
                     conclusion: Some("SUCCESS".to_owned()),
                     run_id: Some(300),
                     observed_at: Some("2026-10-09T09:00:00Z".to_owned()),
+                    check_id: None,
                 }],
             },
             check_rollup_maybe_truncated: false,

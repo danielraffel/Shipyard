@@ -130,6 +130,7 @@ fn enqueue_audit(temp: &tempfile::TempDir, reviews_json: &str, comments_json: &s
         conclusion: Some("SUCCESS".to_owned()),
         run_id: None,
         observed_at: Some("2026-10-11T12:00:01Z".to_owned()),
+        check_id: None,
     });
     let observation = observation_for(pr.clone(), true);
     let mut ledger = StewardLedger::default();
@@ -487,6 +488,7 @@ fn apply_run(temp: &tempfile::TempDir, body: &str) -> (Option<String>, Option<St
         conclusion: Some("SUCCESS".to_owned()),
         run_id: None,
         observed_at: Some("2026-10-11T12:00:01Z".to_owned()),
+        check_id: None,
     });
     let observation = observation_for(pr.clone(), true);
     let mut ledger = StewardLedger::default();

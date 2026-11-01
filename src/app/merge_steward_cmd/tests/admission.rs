@@ -22,6 +22,7 @@ fn managed_pr(head: &str) -> ObservedPr {
                 conclusion: Some("SUCCESS".to_owned()),
                 run_id: None,
                 observed_at: Some("2026-08-15T17:00:00Z".to_owned()),
+                check_id: None,
             }],
         },
         check_rollup_maybe_truncated: false,

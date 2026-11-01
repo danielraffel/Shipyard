@@ -309,7 +309,7 @@ fn latest<'a>(checks: &'a [CheckFact], name: &str) -> Option<&'a CheckFact> {
     checks
         .iter()
         .filter(|check| check.name == name)
-        .max_by_key(|check| (check.started_at.or(check.completed_at), check.id))
+        .max_by_key(|check| (check.id, check.started_at.or(check.completed_at)))
 }
 
 /// Compute the verdict.
@@ -468,7 +468,7 @@ fn latest_group_failure(facts: &VerdictFacts) -> Vec<&GroupRun> {
         .iter()
         .filter(|run| run.pr == Some(facts.pr) && run.created_at >= since)
         .collect();
-    let Some(latest) = own.iter().max_by_key(|run| (run.created_at, run.id)) else {
+    let Some(latest) = own.iter().max_by_key(|run| (run.id, run.created_at)) else {
         return Vec::new();
     };
     own.iter()

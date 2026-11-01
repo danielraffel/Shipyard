@@ -880,7 +880,8 @@ fn match_check<'a>(run: &DispatchedRun, checks: &'a [Value]) -> Option<&'a Value
     } else {
         substring
     };
-    pool.into_iter().max_by_key(|check| check_timestamp(check))
+    pool.into_iter()
+        .max_by_key(|check| (check_job_id(check), check_timestamp(check)))
 }
 
 fn padded_check_name(name_lc: &str) -> String {
@@ -939,6 +940,15 @@ fn check_name(check: &Value) -> &str {
         .get("name")
         .and_then(Value::as_str)
         .unwrap_or_default()
+}
+
+/// The Actions job id in a check's details URL. A rerun is a new job with a
+/// larger id, and unlike the timestamps it is never skewed by a clock change.
+fn check_job_id(check: &Value) -> Option<u64> {
+    check
+        .get("detailsUrl")
+        .and_then(Value::as_str)
+        .and_then(crate::merge_steward::job_id_from_url)
 }
 
 fn check_timestamp(check: &Value) -> &str {
