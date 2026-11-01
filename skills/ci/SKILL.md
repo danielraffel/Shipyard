@@ -1091,6 +1091,13 @@ currently required trailer is treated as stale and rebuilt on the next run;
 dispatch `version-at-land.yml` by hand to force that without waiting for a
 landing.
 
+`RELEASE_BOT_TOKEN` makes those pull request calls too, so as a fine-grained
+token it needs Pull requests and Commit statuses write on top of Contents write.
+With Contents alone the run still force-pushes `release/version-at-land` (the
+branch looks healthy) and then fails on `POST /pulls`; no bump pull request
+opens and main stops releasing. The run log prints gh's error and names the
+missing permission.
+
 ## Stale ship-state records: `discard --repo` and `prune`
 
 The daemon archives a record when its PR's `pull_request.closed` webhook
