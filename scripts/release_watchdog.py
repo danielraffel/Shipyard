@@ -33,7 +33,13 @@ from datetime import datetime, timedelta, timezone
 
 DEFAULT_REPO = "danielraffel/Shipyard"
 BUMP_BRANCH = "release/version-at-land"
-LABELS = ("ci", "blocks-release", "release-stall")
+# GitHub refuses a label without a colour, so each carries one.
+LABEL_SPECS = {
+    "ci": ("0E8A16", "Continuous integration and release automation"),
+    "blocks-release": ("B60205", "Blocks the next release until resolved"),
+    "release-stall": ("D93F0B", "Opened and closed by the release watchdog"),
+}
+LABELS = tuple(LABEL_SPECS)
 TRACKER_LABEL = "release-stall"
 CADENCE_TITLE = "Release cadence: merged changes but no release"
 # Which tracker a watched workflow owns, keyed by its `name:`.
@@ -181,9 +187,14 @@ def _parse(ts: str) -> datetime:
 
 # ----------------------------------------------------------------------- I/O
 
+def run_gh(*args: str) -> subprocess.CompletedProcess[str]:
+    """Every gh call goes through here (tests replace it)."""
+    return subprocess.run([os.environ.get("RELEASE_WATCHDOG_GH", "gh"), *args],
+                          capture_output=True, text=True)
+
+
 def gh(*args: str, check: bool = True) -> str:
-    result = subprocess.run([os.environ.get("RELEASE_WATCHDOG_GH", "gh"), *args],
-                            capture_output=True, text=True)
+    result = run_gh(*args)
     if check and result.returncode != 0:
         raise SystemExit(f"gh {' '.join(args[:4])} failed (exit {result.returncode}): "
                          f"{result.stderr.strip()} {result.stdout.strip()}")
@@ -195,23 +206,67 @@ def git(*args: str) -> subprocess.CompletedProcess[str]:
 
 
 def find_tracker(repo: str, title: str) -> dict | None:
-    """The open tracker with this exact title, found by label (never a duplicate)."""
-    issues = json.loads(gh("api", f"repos/{repo}/issues?labels={TRACKER_LABEL}"
-                                  "&state=open&per_page=100"))
-    return next((i for i in issues if "pull_request" not in i and i.get("title") == title), None)
+    """The open tracker with this exact title (never a duplicate).
+
+    Found by label first; an unlabelled tracker (opened while its labels could
+    not be created) is found by title among the open issues.
+    """
+    for query in (f"labels={TRACKER_LABEL}&state=open&per_page=100", "state=open&per_page=100"):
+        issues = json.loads(gh("api", f"repos/{repo}/issues?{query}"))
+        match = next((i for i in issues
+                      if "pull_request" not in i and i.get("title") == title), None)
+        if match:
+            return match
+    return None
+
+
+def ensure_labels(repo: str) -> list[str]:
+    """Create the tracker labels if missing; return the ones that exist.
+
+    A 422 ``already_exists`` is success. Any other refusal is reported and that
+    label is left off the issue rather than failing the issue.
+    """
+    usable = []
+    for name, (color, description) in LABEL_SPECS.items():
+        result = run_gh("api", "-X", "POST", f"repos/{repo}/labels", "-f", f"name={name}",
+                        "-f", f"color={color}", "-f", f"description={description}")
+        if result.returncode == 0 or "already_exists" in result.stdout + result.stderr:
+            usable.append(name)
+        else:
+            print(f"release-watchdog: could not create label {name!r} "
+                  f"(exit {result.returncode}): {result.stderr.strip()} {result.stdout.strip()}",
+                  file=sys.stderr)
+    return usable
+
+
+def create_tracker(repo: str, title: str, body: str) -> list[str]:
+    """Open the tracker; return the labels it carries.
+
+    Labels are best-effort: if GitHub refuses the issue with them, it is
+    opened without labels and the log says so.
+    """
+    labels = ensure_labels(repo)
+    base = ["api", "-X", "POST", f"repos/{repo}/issues", "-f", f"title={title}",
+            "-f", f"body={body}"]
+    if labels:
+        labelled = base + [arg for label in labels for arg in ("-f", f"labels[]={label}")]
+        result = run_gh(*labelled)
+        if result.returncode == 0:
+            return labels
+        print(f"release-watchdog: opening the issue with labels {labels} failed "
+              f"(exit {result.returncode}): {result.stderr.strip()} {result.stdout.strip()}; "
+              "opening it without labels", file=sys.stderr)
+    gh(*base)
+    if not labels:
+        print("release-watchdog: opened the issue without labels", file=sys.stderr)
+    return []
 
 
 def apply_tracker(repo: str, title: str, failing: bool, body: str, close_note: str) -> str:
     issue = find_tracker(repo, title)
     action = issue_action(issue is not None, failing)
     if action == "create":
-        for label in LABELS:  # 422 when the label already exists
-            gh("api", "-X", "POST", f"repos/{repo}/labels", "-f", f"name={label}", check=False)
-        args = ["api", "-X", "POST", f"repos/{repo}/issues", "-f", f"title={title}",
-                "-f", f"body={body}"]
-        for label in LABELS:
-            args += ["-f", f"labels[]={label}"]
-        gh(*args)
+        create_tracker(repo, title, body)
     elif action == "update":
         gh("api", "-X", "PATCH", f"repos/{repo}/issues/{issue['number']}", "-f", f"body={body}")
     elif action == "close":

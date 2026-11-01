@@ -12,8 +12,10 @@ requests merged, and nothing was released.
 The watchdog is a port of Pulp's release-watchdog triad (Pulp
 `docs/guides/release-watchdog.md`). Each layer keeps a GitHub issue labelled
 `release-stall` (plus `ci` and `blocks-release`) open while its check fails.
-It finds an open issue by label and exact title, so it updates one tracker
-instead of opening duplicates. Each tracker closes itself when its check passes.
+It creates those labels (with a colour, as GitHub requires) on first use. If
+a label cannot be created, the issue opens without it and the log says so. It
+finds an open issue by label and exact title, or by title alone for an
+unlabelled one, so it updates one tracker instead of opening duplicates. Each tracker closes itself when its check passes.
 
 | Layer | Workflow | Fires on | Tracker title |
 |---|---|---|---|

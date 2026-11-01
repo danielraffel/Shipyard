@@ -3,9 +3,14 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
+import json
 import re
+import subprocess
 import sys
 import unittest
+from unittest import mock
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -138,6 +143,112 @@ class TrackerTests(unittest.TestCase):
         self.assertEqual(rw.issue_action(True, True), "update")
         self.assertEqual(rw.issue_action(True, False), "close")
         self.assertEqual(rw.issue_action(False, False), "none")
+
+
+class FakeGitHub:
+    """Models GitHub's label and issue rules: a label needs a colour, and an
+    issue naming a label that does not exist is refused (422)."""
+
+    def __init__(self, labels: set[str] | None = None, label_create_fails: bool = False) -> None:
+        self.labels = set(labels or ())
+        self.label_create_fails = label_create_fails
+        self.issues: list[dict] = []
+        self.calls: list[tuple[str, ...]] = []
+
+    @staticmethod
+    def fields(args: tuple[str, ...]) -> dict[str, list[str]]:
+        out: dict[str, list[str]] = {}
+        for flag, value in zip(args, args[1:]):
+            if flag == "-f":
+                key, _, val = value.partition("=")
+                out.setdefault(key, []).append(val)
+        return out
+
+    def __call__(self, *args: str) -> subprocess.CompletedProcess[str]:
+        self.calls.append(args)
+        method = args[2] if args[1:2] == ("-X",) else "GET"
+        path = args[3] if method != "GET" else args[1]
+        f = self.fields(args)
+
+        def done(rc: int, out: object = "") -> subprocess.CompletedProcess[str]:
+            text = out if isinstance(out, str) else json.dumps(out)
+            return subprocess.CompletedProcess(args, rc, stdout=text,
+                                               stderr="" if rc == 0 else f"gh: HTTP {rc}")
+        if method == "GET" and "/issues?" in path:
+            want = "labels=release-stall" in path
+            return done(0, [i for i in self.issues
+                            if not want or "release-stall" in i["labels"]])
+        if method == "POST" and path.endswith("/labels"):
+            name = f["name"][0]
+            if self.label_create_fails or "color" not in f:
+                return done(1, {"message": "Validation Failed", "status": "422"})
+            if name in self.labels:
+                return done(1, {"message": "Validation Failed",
+                                "errors": [{"code": "already_exists"}], "status": "422"})
+            self.labels.add(name)
+            return done(0, {"name": name})
+        if method == "POST" and path.endswith("/issues"):
+            labels = f.get("labels[]", [])
+            if any(label not in self.labels for label in labels):
+                return done(1, {"message": "Validation Failed", "status": "422"})
+            issue = {"number": 1 + len(self.issues), "title": f["title"][0], "labels": labels}
+            self.issues.append(issue)
+            return done(0, issue)
+        raise AssertionError(f"unexpected call {args}")
+
+
+class TrackerCreationTests(unittest.TestCase):
+    def apply(self, fake: FakeGitHub) -> tuple[str, str]:
+        err = io.StringIO()
+        with mock.patch.object(rw, "run_gh", fake), contextlib.redirect_stderr(err):
+            action = rw.apply_tracker("o/r", "t", True, "body", "closed")
+        return action, err.getvalue()
+
+    def test_first_run_creates_coloured_labels_then_a_labelled_issue(self) -> None:
+        fake = FakeGitHub()
+        action, err = self.apply(fake)
+        self.assertEqual(action, "create")
+        creates = [FakeGitHub.fields(c) for c in fake.calls if c[3:4] == ("repos/o/r/labels",)]
+        self.assertEqual([c["name"][0] for c in creates], list(rw.LABEL_SPECS))
+        for c in creates:
+            self.assertRegex(c["color"][0], r"^[0-9A-F]{6}$")
+            self.assertTrue(c["description"][0])
+        self.assertEqual(fake.issues[0]["labels"], list(rw.LABEL_SPECS))
+        self.assertEqual(err, "")
+
+    def test_existing_labels_are_fine(self) -> None:
+        fake = FakeGitHub(labels=set(rw.LABEL_SPECS))
+        self.assertEqual(self.apply(fake)[0], "create")
+        self.assertEqual(fake.issues[0]["labels"], list(rw.LABEL_SPECS))
+
+    def test_refused_labels_still_open_an_unlabelled_issue_and_say_so(self) -> None:
+        fake = FakeGitHub(label_create_fails=True)
+        action, err = self.apply(fake)
+        self.assertEqual(action, "create")
+        self.assertEqual(fake.issues[0]["labels"], [])
+        self.assertIn("could not create label 'release-stall'", err)
+        self.assertIn("without labels", err)
+
+    def test_issue_refused_with_labels_falls_back_to_none(self) -> None:
+        fake = FakeGitHub()
+        real = fake.__call__
+
+        def drop_one(*args: str) -> subprocess.CompletedProcess[str]:
+            result = real(*args)
+            fake.labels.discard("ci")  # a label vanishes between create and use
+            return result
+        err = io.StringIO()
+        with mock.patch.object(rw, "run_gh", drop_one), contextlib.redirect_stderr(err):
+            rw.apply_tracker("o/r", "t", True, "body", "closed")
+        self.assertEqual(fake.issues[0]["labels"], [])
+        self.assertIn("opening it without labels", err.getvalue())
+
+    def test_unlabelled_tracker_is_found_by_title_not_duplicated(self) -> None:
+        fake = FakeGitHub(label_create_fails=True)
+        self.apply(fake)
+        with mock.patch.object(rw, "run_gh", fake):
+            found = rw.find_tracker("o/r", "t")
+        self.assertEqual(found["number"], 1)
 
 
 class WorkflowTests(unittest.TestCase):
