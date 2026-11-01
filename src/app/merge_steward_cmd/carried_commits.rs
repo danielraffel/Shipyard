@@ -24,6 +24,14 @@
 //! * A base whose policy does not require head approval: there every head is
 //!   admissible, so no commit is unapproved.
 //!
+//! Every steward admission path runs it through [`refusal_for`]: the managed
+//! enqueue (including the hosted-setup priority re-enqueue and the one
+//! not-head's-fault same-head retry) and the exact-head merge, both via
+//! [`admission_refusal`] in `mutate_pr_with_recovery`, and the
+//! `--arm-unqueued` native-arm backstop, which refuses the arm with an
+//! [`crate::auto_arm::ArmSkip::CarriedCommits`] skip and gives the pull
+//! request's report row the same `blocked_on` token.
+//!
 //! Cost is bounded per pass. Open pull requests and their commits are read
 //! once per pass per repository (one paged GraphQL listing, cached in the
 //! mutation context), Q's approval is read only when Q overlaps a candidate
@@ -268,8 +276,9 @@ pub(super) struct PassCache {
     judged: BTreeMap<(u64, String), Judgement>,
 }
 
-/// The guard on the admission path: `Some` refuses `pr` (already live
-/// revalidated) with `(mutation token, detail)`.
+/// The guard on the steward's own admission path (enqueue and exact-head
+/// merge): `Some` refuses `pr` (already live revalidated) with
+/// `(mutation token, detail)`.
 pub(super) fn admission_refusal(
     context: &MutationApplyContext<'_>,
     pr: &ObservedPr,
@@ -294,31 +303,62 @@ pub(super) fn admission_refusal(
             ));
         }
     };
+    let mut cache = context.carried_commits.borrow_mut();
+    refusal_for(
+        context.actions,
+        &context.observation.repo,
+        &context.observation.base,
+        &policy,
+        &pr.fact,
+        Some(ledger),
+        &mut cache,
+    )
+    .map(|refusal| (refusal.token, refusal.detail))
+}
+
+/// The guard every steward admission path runs once `policy` (the base's
+/// strictly read approval policy) is in hand: the managed enqueue, the
+/// exact-head merge, and the `--arm-unqueued` native-arm backstop. `ledger`
+/// excuses queue removals the steward made itself, as admission does.
+pub(super) fn refusal_for(
+    actions: &super::GitHubActions,
+    repo: &str,
+    base: &str,
+    policy: &crate::head_approval::ApprovalPolicy,
+    pr: &crate::merge_steward::StewardPullRequest,
+    ledger: Option<&super::StewardLedger>,
+    cache: &mut PassCache,
+) -> Option<Refusal> {
     if !policy.required {
         return None;
     }
-    let mut report_policy = policy;
+    let run_gh = |argv: &[String]| actions.run_gh(argv).map_err(|error| error.to_string());
+    let mut report_policy = policy.clone();
     report_policy.dry_run = true;
     let mut judge = |q: &OpenPr| -> Judgement {
-        let queue = match super::pr_mutations::read_pr_queue_state(
-            context.actions,
-            context.observation,
-            q.number,
-        ) {
+        let queue = match super::native_arm::read_queue_state(actions, repo, q.number) {
             Ok(queue) => queue,
             Err(error) => return Judgement::Unreadable(error),
         };
-        let recorded = super::unapproved_admission::steward_removal_times(
-            ledger,
-            &context.observation.repo,
-            q.number,
-            &q.head_sha,
-        );
-        let queue =
-            super::unapproved_admission::without_steward_removals(&queue, &q.head_sha, &recorded);
+        let queue = match ledger {
+            Some(ledger) => {
+                let recorded = super::unapproved_admission::steward_removal_times(
+                    ledger,
+                    repo,
+                    q.number,
+                    &q.head_sha,
+                );
+                super::unapproved_admission::without_steward_removals(
+                    &queue,
+                    &q.head_sha,
+                    &recorded,
+                )
+            }
+            None => queue,
+        };
         match crate::head_approval::evaluate_with_policy_for_author_with_diagnosis(
             &run_gh,
-            &context.observation.repo,
+            repo,
             q.number,
             &q.head_sha,
             &report_policy,
@@ -330,18 +370,16 @@ pub(super) fn admission_refusal(
             Err(error) => Judgement::Unreadable(error),
         }
     };
-    let mut cache = context.carried_commits.borrow_mut();
     refusal_with(
         &run_gh,
-        &context.observation.repo,
-        &context.observation.base,
-        pr.fact.number,
-        &pr.fact.head_branch,
-        &pr.fact.head_sha,
-        &mut cache,
+        repo,
+        base,
+        pr.number,
+        &pr.head_branch,
+        &pr.head_sha,
+        cache,
         &mut judge,
     )
-    .map(|refusal| (refusal.token, refusal.detail))
 }
 
 /// [`admission_refusal`] over any `gh` runner and approval judge, after the

@@ -107,7 +107,10 @@ request should target that pull request's branch. At most 250 commits are read
 per pull request: a larger, unapproved one fails closed
 (`carried_commits_over_cap:#N`), as does an unreadable listing, compare or
 approval (`carried_commits_unreadable`). The check applies only where the base
-requires head approval, and only on an apply pass. (On 2026-11-01 a branch
+requires head approval. It guards every admission the steward makes: its own
+enqueue (including a same-head retry or priority re-enqueue), the exact-head
+merge on a base without a queue, and the `--arm-unqueued` backstop, which then
+declines to arm (`skip: carried_commits`) and gives the row the same token. (On 2026-11-01 a branch
 merged another branch that carried a held pull request's commits; its own
 diff was approved and the held code reached main.)
 

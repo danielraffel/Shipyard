@@ -134,6 +134,16 @@ pub enum ArmSkip {
         /// Each check holding the head back, and what to do next.
         detail: String,
     },
+    /// The head carries commits of another open pull request whose head is
+    /// not approved, or that cannot be ruled out
+    /// (`app::merge_steward_cmd::carried_commits`).
+    CarriedCommits {
+        /// The steward's `blocked_on` token, e.g.
+        /// `carries_unapproved_commits:#Q`.
+        blocked_on: String,
+        /// The shared commits and why the other head is not approved.
+        detail: String,
+    },
     /// The state could not be determined. Never treated as "unarmed".
     Unknown {
         /// What was missing or malformed.
@@ -176,6 +186,7 @@ impl ArmSkip {
                 "the repository does not allow native auto-merge".to_owned()
             }
             Self::HeadNotApproved { detail } | Self::DeferredTier { detail } => detail.clone(),
+            Self::CarriedCommits { blocked_on, detail } => format!("{blocked_on}: {detail}"),
             Self::Unknown { detail } => format!(
                 "its merge-queue state could not be determined ({detail}); refusing to arm blind"
             ),

@@ -236,8 +236,16 @@ pub(super) fn apply_native_arm_backstop<A>(
     };
     let mut unhealthy = false;
     let mut results = Vec::new();
+    let mut carried = super::carried_commits::PassCache::default();
     for pr in candidates {
-        let result = consider_candidate(actions, &observation.repo, &observation.base, pr, apply);
+        let result = consider_candidate(
+            actions,
+            &observation.repo,
+            &observation.base,
+            pr,
+            apply,
+            &mut carried,
+        );
         unhealthy |= result.error.is_some();
         results.push(result);
     }
@@ -256,6 +264,26 @@ pub(super) fn apply_native_arm_backstop<A>(
         },
         unhealthy,
     )
+}
+
+/// Give each pull request the backstop refused for carried commits the same
+/// `blocked_on` token the steward's own admission reports.
+pub(super) fn annotate_carried_refusals(status: &NativeArmRepoStatus, reports: &mut [PrReport]) {
+    for result in &status.results {
+        let Some(ArmSkip::CarriedCommits { blocked_on, detail }) = &result.skip else {
+            continue;
+        };
+        if let Some(report) = reports
+            .iter_mut()
+            .find(|report| report.number == result.number && report.head_sha == result.head_sha)
+        {
+            report.blocked = super::blocked_on::Stall {
+                blocked_on: blocked_on.clone(),
+                blocked_detail: Some(detail.clone()),
+                ..super::blocked_on::Stall::default()
+            };
+        }
+    }
 }
 
 /// Pull requests worth a confirming read, from facts already in hand.
@@ -287,6 +315,7 @@ fn consider_candidate(
     base: &str,
     pr: &ObservedPr,
     apply: bool,
+    carried: &mut super::carried_commits::PassCache,
 ) -> NativeArmResult {
     let number = pr.fact.number;
     let head_sha = pr.fact.head_sha.clone();
@@ -338,14 +367,27 @@ fn consider_candidate(
                     crate::head_approval::evaluate_excusing_with_policy(
                         &run_gh, repo, number, &head_sha, &policy, &queue, excuse,
                     )
+                    .map(|gate| (gate, policy))
                 }) {
-                Ok(gate) if gate.allows() => {
+                Ok((gate, policy)) if gate.allows() => {
                     match tier_verdict(&run_gh, repo, base, number, &head_sha) {
+                        // The same carried-commit guard the steward's own
+                        // admission runs: a HOLD on another pull request
+                        // must not land through this arm either.
+                        Ok(ArmVerdict::Arm) => super::carried_commits::refusal_for(
+                            actions, repo, base, &policy, &pr.fact, None, carried,
+                        )
+                        .map_or(ArmVerdict::Arm, |refusal| {
+                            ArmVerdict::Skip(ArmSkip::CarriedCommits {
+                                blocked_on: refusal.token,
+                                detail: refusal.detail,
+                            })
+                        }),
                         Ok(verdict) => verdict,
                         Err(result) => return *result,
                     }
                 }
-                Ok(gate) => ArmVerdict::Skip(ArmSkip::HeadNotApproved {
+                Ok((gate, _)) => ArmVerdict::Skip(ArmSkip::HeadNotApproved {
                     detail: gate.explain(),
                 }),
                 Err(detail) => {

@@ -27,7 +27,17 @@ fn no_authority_needed() -> Result<(), super::ArmAuthorityRefusal> {
 #[cfg(unix)]
 fn fake_gh(temp: &tempfile::TempDir, body: &str) -> GitHubActions {
     let path = temp.path().join("gh");
-    crate::test_support::write_executable_script(&path, &format!("#!/bin/sh\nset -eu\n{body}\n"));
+    // The carried-commit guard's compare: by default the candidate carries no
+    // commit. `# CARRIED_COMMITS` lets a fixture answer it itself.
+    let carried_shim = if body.contains("# CARRIED_COMMITS") {
+        ""
+    } else {
+        "case \"$*\" in *\"/compare/\"*\"total_commits\"*) printf '%s' '{\"total\":0,\"shas\":[]}'; exit 0;; esac\n"
+    };
+    crate::test_support::write_executable_script(
+        &path,
+        &format!("#!/bin/sh\nset -eu\n{carried_shim}{body}\n"),
+    );
     let config = crate::config::LoadedConfig {
         data: toml::Table::new(),
         global_dir: temp.path().join("global"),
@@ -1084,4 +1094,91 @@ fn a_head_that_is_not_a_full_sha_is_skipped_not_armed_unbound() {
         "no gh call may be made: {:?}",
         std::fs::read_to_string(&log)
     );
+}
+
+/// `approval_required` with this head approved, where the head also carries
+/// `CARRIED`, a commit of open pull request #11361 whose head `HELD_HEAD`
+/// carries `q_reviews` and `q_comments`.
+#[cfg(unix)]
+fn carrying_a_commit_of_11361(log: &str, q_reviews: &str, q_comments: &str) -> String {
+    const HELD_HEAD: &str = "883bb3f600000000000000000000000000000000";
+    const CARRIED: &str = "c26a23be00000000000000000000000000000000";
+    let review = r#"{"login":"someone","type":"User","at":"2026-10-04T01:00:00Z","state":"APPROVED","commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#;
+    let listing = format!(
+        r#"{{"data":{{"repository":{{"pullRequests":{{"pageInfo":{{"hasNextPage":false,"endCursor":null}},"nodes":[{{"number":11361,"headRefName":"feat/real-world-inputs-t2","baseRefName":"main","headRefOid":"{HELD_HEAD}","isCrossRepository":false,"author":{{"login":"author"}},"carriedCommits":{{"totalCount":2,"nodes":[{{"commit":{{"oid":"{CARRIED}"}}}},{{"commit":{{"oid":"{HELD_HEAD}"}}}}]}}}}]}}}}}}}}"#
+    );
+    format!(
+        r#"# CARRIED_COMMITS
+printf '%s\n' "$*" >> '{log}'
+case "$*" in
+  *"/compare/main..."*"total_commits"*) printf '%s' '{{"total":2,"shas":["{CARRIED}","aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]}}'; exit 0 ;;
+  *carriedCommits*) printf '%s' '{listing}'; exit 0 ;;
+  *pulls/11361/reviews*) printf '%s' '{q_reviews}'; exit 0 ;;
+  *issues/11361/comments*) printf '%s\n' '{q_comments}'; exit 0 ;;
+  *commits/{HELD_HEAD}*) printf '%s' '2026-10-03T00:00:00Z'; exit 0 ;;
+  *isInMergeQueue*number=11361*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"number":11361,"state":"OPEN","headRefOid":"{HELD_HEAD}","isInMergeQueue":false,"mergeQueueEntry":null,"autoMergeRequest":null,"timelineItems":{{"pageInfo":{{"hasPreviousPage":false}},"nodes":[]}}}}}}}}}}'; exit 0 ;;
+esac
+{}"#,
+        approval_required(log, review)
+    )
+}
+
+/// The 2026-11-01 shape on the live `--arm-unqueued` path: this head is green
+/// and approved, but it carries a commit of #11361, whose head is held. The
+/// backstop neither arms nor merges, and the PR row names the same
+/// `blocked_on` token the steward's own admission uses. With #11361 approved,
+/// the same head is armed (the control).
+#[cfg(unix)]
+#[test]
+fn the_backstop_never_arms_a_head_carrying_another_prs_held_commit() {
+    let held_head = "883bb3f600000000000000000000000000000000";
+    let hold = format!(
+        r#"{{"id":777,"login":"someone","type":"User","at":"2026-10-04T02:00:00Z","body":"verdict: HOLD head:{held_head}"}}"#
+    );
+    let approve = format!(
+        r#"{{"login":"someone","type":"User","at":"2026-10-04T02:00:00Z","state":"APPROVED","commit_id":"{held_head}"}}"#
+    );
+    for (q_reviews, q_comments, armed) in [("", hold.as_str(), false), (approve.as_str(), "", true)]
+    {
+        let temp = tempfile::tempdir().expect("temp");
+        let log = temp.path().join("calls.log");
+        let actions = fake_gh(
+            &temp,
+            &carrying_a_commit_of_11361(&log.display().to_string(), q_reviews, q_comments),
+        );
+        let observation = observation(pr_row(&serde_json::json!({})), true);
+        let mut reports = report(StewardDecision::Unmanaged);
+        let (status, _) = apply_native_arm_backstop(
+            &actions,
+            &observation,
+            &reports,
+            "shipyard:no-auto-merge",
+            true,
+            no_authority_needed,
+        );
+        let calls = std::fs::read_to_string(&log).expect("log");
+        assert!(calls.contains("carriedCommits"), "{calls}");
+        if armed {
+            assert_eq!(status.results[0].outcome, "armed", "{status:?}");
+            // Both script halves log each call.
+            assert!(calls.contains("enablePullRequestAutoMerge"), "{calls}");
+            continue;
+        }
+        assert_eq!(status.results[0].outcome, "skipped", "{status:?}");
+        let Some(crate::auto_arm::ArmSkip::CarriedCommits { blocked_on, detail }) =
+            &status.results[0].skip
+        else {
+            panic!("{status:?}");
+        };
+        assert_eq!(blocked_on, "carries_unapproved_commits:#11361");
+        assert!(detail.contains("c26a23be"), "{detail}");
+        assert!(!calls.contains("enablePullRequestAutoMerge"), "{calls}");
+        assert!(!calls.contains("mergePullRequest"), "{calls}");
+        assert!(!calls.contains("enqueuePullRequest"), "{calls}");
+        super::annotate_carried_refusals(&status, &mut reports);
+        assert_eq!(
+            reports[0].blocked.blocked_on,
+            "carries_unapproved_commits:#11361"
+        );
+    }
 }
