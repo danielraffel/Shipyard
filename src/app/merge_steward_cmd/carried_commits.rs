@@ -39,7 +39,9 @@
 //! [`MAX_COMMITS_PER_PR`] commits are read for any pull request; a pull
 //! request with more fails closed (`carried_commits_over_cap:#N`) unless it is
 //! an approved Q. An unreadable listing, compare or approval also fails closed
-//! (`carried_commits_unreadable`).
+//! (`carried_commits_unreadable`). Q's approval is judged only while its live
+//! head is still the head the listing saw; a push after the listing also
+//! fails closed (`carried_commits_unreadable:#Q`) until the next pass.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -340,6 +342,9 @@ pub(super) fn refusal_for(
             Ok(queue) => queue,
             Err(error) => return Judgement::Unreadable(error),
         };
+        if let Err(error) = live_head_matches(&queue, q) {
+            return Judgement::Unreadable(error);
+        }
         let queue = match ledger {
             Some(ledger) => {
                 let recorded = super::unapproved_admission::steward_removal_times(
@@ -441,6 +446,29 @@ pub(super) fn refusal_with(
         judged.push((overlap, judgement));
     }
     decide(base, &judged)
+}
+
+/// Q's approval is judged only at the head the listing saw, so the live
+/// queue-state read must still show that head. A push after the listing
+/// (or an answer with no head) fails closed: judging the listed head could
+/// call a since-replaced, unapproved head approved. The next pass re-reads
+/// the listing. Pure.
+pub(super) fn live_head_matches(queue: &Value, q: &OpenPr) -> Result<(), String> {
+    match queue
+        .pointer("/data/repository/pullRequest/headRefOid")
+        .and_then(Value::as_str)
+    {
+        Some(live) if live == q.head_sha => Ok(()),
+        Some(live) => Err(format!(
+            "#{} moved from {} to {live} after this pass listed it; its commits and \
+             approval are re-read next pass",
+            q.number, q.head_sha
+        )),
+        None => Err(format!(
+            "#{}'s live head is unreadable, so its approval at {} cannot be bound to it",
+            q.number, q.head_sha
+        )),
+    }
 }
 
 fn unreadable(error: String) -> Refusal {

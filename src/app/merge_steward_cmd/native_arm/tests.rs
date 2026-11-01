@@ -1101,6 +1101,23 @@ fn a_head_that_is_not_a_full_sha_is_skipped_not_armed_unbound() {
 /// carries `q_reviews` and `q_comments`.
 #[cfg(unix)]
 fn carrying_a_commit_of_11361(log: &str, q_reviews: &str, q_comments: &str) -> String {
+    carrying_a_commit_of_11361_live_at(
+        log,
+        q_reviews,
+        q_comments,
+        "883bb3f600000000000000000000000000000000",
+    )
+}
+
+/// [`carrying_a_commit_of_11361`], where the live queue-state read reports
+/// #11361 at `live_head` (a push after the open-PR listing when it differs).
+#[cfg(unix)]
+fn carrying_a_commit_of_11361_live_at(
+    log: &str,
+    q_reviews: &str,
+    q_comments: &str,
+    live_head: &str,
+) -> String {
     const HELD_HEAD: &str = "883bb3f600000000000000000000000000000000";
     const CARRIED: &str = "c26a23be00000000000000000000000000000000";
     let review = r#"{"login":"someone","type":"User","at":"2026-10-04T01:00:00Z","state":"APPROVED","commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#;
@@ -1116,7 +1133,7 @@ case "$*" in
   *pulls/11361/reviews*) printf '%s' '{q_reviews}'; exit 0 ;;
   *issues/11361/comments*) printf '%s\n' '{q_comments}'; exit 0 ;;
   *commits/{HELD_HEAD}*) printf '%s' '2026-10-03T00:00:00Z'; exit 0 ;;
-  *isInMergeQueue*number=11361*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"number":11361,"state":"OPEN","headRefOid":"{HELD_HEAD}","isInMergeQueue":false,"mergeQueueEntry":null,"autoMergeRequest":null,"timelineItems":{{"pageInfo":{{"hasPreviousPage":false}},"nodes":[]}}}}}}}}}}'; exit 0 ;;
+  *isInMergeQueue*number=11361*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"number":11361,"state":"OPEN","headRefOid":"{live_head}","isInMergeQueue":false,"mergeQueueEntry":null,"autoMergeRequest":null,"timelineItems":{{"pageInfo":{{"hasPreviousPage":false}},"nodes":[]}}}}}}}}}}'; exit 0 ;;
 esac
 {}"#,
         approval_required(log, review)
@@ -1181,4 +1198,54 @@ fn the_backstop_never_arms_a_head_carrying_another_prs_held_commit() {
             "carries_unapproved_commits:#11361"
         );
     }
+}
+
+/// Review of #1112: #11361 is listed at an approved head, then pushed to a
+/// new, unapproved head before its approval is read. The guard must not call
+/// the listed head's approval current: nothing is armed, and the row fails
+/// closed with `carried_commits_unreadable:#11361`.
+#[cfg(unix)]
+#[test]
+fn the_backstop_never_arms_when_the_carried_pr_moved_after_the_listing() {
+    let listed = "883bb3f600000000000000000000000000000000";
+    let pushed = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    let approve_listed = format!(
+        r#"{{"login":"someone","type":"User","at":"2026-10-04T02:00:00Z","state":"APPROVED","commit_id":"{listed}"}}"#
+    );
+    let temp = tempfile::tempdir().expect("temp");
+    let log = temp.path().join("calls.log");
+    let actions = fake_gh(
+        &temp,
+        &carrying_a_commit_of_11361_live_at(
+            &log.display().to_string(),
+            &approve_listed,
+            "",
+            pushed,
+        ),
+    );
+    let observation = observation(pr_row(&serde_json::json!({})), true);
+    let mut reports = report(StewardDecision::Unmanaged);
+    let (status, _) = apply_native_arm_backstop(
+        &actions,
+        &observation,
+        &reports,
+        "shipyard:no-auto-merge",
+        true,
+        no_authority_needed,
+    );
+    let calls = std::fs::read_to_string(&log).expect("log");
+    assert!(!calls.contains("enablePullRequestAutoMerge"), "{calls}");
+    assert!(!calls.contains("mergePullRequest"), "{calls}");
+    let Some(crate::auto_arm::ArmSkip::CarriedCommits { blocked_on, detail }) =
+        &status.results[0].skip
+    else {
+        panic!("{status:?}");
+    };
+    assert_eq!(blocked_on, "carried_commits_unreadable:#11361");
+    assert!(detail.contains(pushed), "{detail}");
+    super::annotate_carried_refusals(&status, &mut reports);
+    assert_eq!(
+        reports[0].blocked.blocked_on,
+        "carried_commits_unreadable:#11361"
+    );
 }

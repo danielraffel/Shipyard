@@ -4,7 +4,8 @@ use std::collections::BTreeSet;
 use serde_json::json;
 
 use super::{
-    Candidate, Carried, CommitList, Judgement, OpenPr, PassCache, carried, decide, refusal_with,
+    Candidate, Carried, CommitList, Judgement, OpenPr, PassCache, carried, decide,
+    live_head_matches, refusal_with,
 };
 
 // The 2026-11-01 incident: #11361 (t2) held at 883bb3f6; #11369 (t8) merged t3,
@@ -317,4 +318,13 @@ fn a_rollup_that_merged_the_candidate_does_not_block_it_but_any_other_rollup_doe
         ..candidate(&own)
     };
     assert_eq!(carried(&other, &[rollup]).len(), 1);
+}
+
+#[test]
+fn a_carried_pr_pushed_after_the_listing_is_not_judged_at_its_listed_head() {
+    let live = |head: Option<&str>| json!({"data": {"repository": {"pullRequest": {"number": 11361, "headRefOid": head}}}});
+    assert_eq!(live_head_matches(&live(Some(HELD_HEAD)), &held()), Ok(()));
+    let moved = live_head_matches(&live(Some(OWN)), &held()).expect_err("moved head");
+    assert!(moved.contains(HELD_HEAD) && moved.contains(OWN), "{moved}");
+    assert!(live_head_matches(&live(None), &held()).is_err());
 }

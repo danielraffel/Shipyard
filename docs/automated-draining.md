@@ -106,7 +106,8 @@ approve Q first, or drop its commits from P; a branch built on another pull
 request should target that pull request's branch. At most 250 commits are read
 per pull request: a larger, unapproved one fails closed
 (`carried_commits_over_cap:#N`), as does an unreadable listing, compare or
-approval (`carried_commits_unreadable`). The check applies only where the base
+approval, or a Q pushed after the pass listed it (`carried_commits_unreadable`;
+the next pass re-reads it). The check applies only where the base
 requires head approval. It guards every admission the steward makes: its own
 enqueue (including a same-head retry or priority re-enqueue), the exact-head
 merge on a base without a queue, and the `--arm-unqueued` backstop, which then
