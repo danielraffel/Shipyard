@@ -388,3 +388,197 @@ fn a_carried_pr_pushed_after_the_listing_is_not_judged_at_its_listed_head() {
     assert!(moved.contains(HELD_HEAD) && moved.contains(OWN), "{moved}");
     assert!(live_head_matches(&live(None), &held()).is_err());
 }
+
+// 2026-11-01 stack: #11363 (t4, base main) is P; #11364 (t6) is on t4; #11365,
+// #11367 and #11368 are on t6. 9c34474f is P's own commit that every child
+// inherits.
+const P_OWN: &str = "9c34474f00000000000000000000000000000000";
+const T6_OWN: &str = "66666666000000000000000000000000000000aa";
+const CHILD_OWN: &str = "cccccccc00000000000000000000000000000000";
+const P_HEAD_BRANCH: &str = "feat/real-world-inputs-t4";
+
+fn stack() -> Vec<OpenPr> {
+    vec![
+        open(
+            11364,
+            "feat/real-world-inputs-t6",
+            P_HEAD_BRANCH,
+            "t6head",
+            &[P_OWN, T6_OWN],
+        ),
+        open(
+            11365,
+            "feat/c5",
+            "feat/real-world-inputs-t6",
+            "c5head",
+            &[P_OWN, T6_OWN, CHILD_OWN],
+        ),
+        open(
+            11367,
+            "feat/c7",
+            "feat/real-world-inputs-t6",
+            "c7head",
+            &[P_OWN, T6_OWN],
+        ),
+        open(
+            11368,
+            "feat/c8",
+            "feat/real-world-inputs-t6",
+            "c8head",
+            &[P_OWN, T6_OWN],
+        ),
+    ]
+}
+
+fn p_candidate(commits: &BTreeSet<String>) -> Candidate<'_> {
+    Candidate {
+        number: 11363,
+        base_ref: "main",
+        head_ref: P_HEAD_BRANCH,
+        commits,
+    }
+}
+
+#[test]
+fn transitive_descendants_of_the_candidate_never_block_it() {
+    let own = set(&[P_OWN]);
+    assert!(carried(&p_candidate(&own), &stack()).is_empty());
+}
+
+#[test]
+fn a_cycle_in_base_chains_ends_the_walk() {
+    let own = set(&[P_OWN]);
+    let a = open(1, "a", "b", "ah", &[P_OWN]);
+    let b = open(2, "b", "a", "bh", &[P_OWN]);
+    assert_eq!(carried(&p_candidate(&own), &[a, b]).len(), 2);
+}
+
+#[test]
+fn the_live_stack_through_github_reads_admits_the_origin_pr() {
+    let others = stack();
+    let run_gh = |argv: &[String]| -> Result<String, String> {
+        let joined = argv.join(" ");
+        if joined.contains("compare/main...") {
+            return Ok(json!({"total": 1, "shas": [P_OWN]}).to_string());
+        }
+        if joined.contains("OPEN") {
+            let refs: Vec<(&OpenPr, usize)> = others
+                .iter()
+                .map(|pr| {
+                    let CommitList::Complete(c) = &pr.commits else {
+                        unreachable!()
+                    };
+                    (pr, c.len())
+                })
+                .collect();
+            return Ok(listing(&refs).to_string());
+        }
+        Err(format!("unexpected: {joined}"))
+    };
+    let mut judge = |_: &OpenPr| Judgement::Unapproved("no APPROVE".to_owned());
+    let refusal = refusal_with(
+        &run_gh,
+        "Generous-Corp/pulp",
+        "main",
+        11363,
+        P_HEAD_BRANCH,
+        P_OWN,
+        &mut PassCache::default(),
+        &mut judge,
+    );
+    assert_eq!(refusal, None);
+}
+
+#[test]
+fn an_inheritor_not_in_the_chain_is_cleared_by_its_own_diff() {
+    // Q is on base X (not P's chain) and lists P's commit, but X already has
+    // it, so Q's own diff against X does not: Q merely inherits it.
+    let q = open(20, "feat/q", "feat/x", "qhead", &[P_OWN, CHILD_OWN]);
+    let run_gh = |argv: &[String]| -> Result<String, String> {
+        let joined = argv.join(" ");
+        if joined.contains("compare/main...") {
+            return Ok(json!({"total": 1, "shas": [P_OWN]}).to_string());
+        }
+        if joined.contains("compare/feat/x...qhead") {
+            return Ok(json!({"total": 1, "shas": [CHILD_OWN]}).to_string());
+        }
+        if joined.contains("OPEN") {
+            return Ok(listing(&[(&q, 2)]).to_string());
+        }
+        Err(format!("unexpected: {joined}"))
+    };
+    let mut judge = |_: &OpenPr| Judgement::Unapproved("held".to_owned());
+    let refusal = refusal_with(
+        &run_gh,
+        "o/r",
+        "main",
+        11363,
+        P_HEAD_BRANCH,
+        P_OWN,
+        &mut PassCache::default(),
+        &mut judge,
+    );
+    assert_eq!(refusal, None);
+}
+
+#[test]
+fn a_pr_that_merged_the_candidates_branch_without_stacking_is_still_refused() {
+    // Q (base X) merged P's branch: P's commit is in Q's own diff against X.
+    // The sets cannot tell P's origin commit from Q's copy, so the unapproved
+    // Q conservatively holds P; Q must drop the merge or land first.
+    let q = open(21, "feat/q2", "feat/x", "q2head", &[P_OWN, CHILD_OWN]);
+    let run_gh = |argv: &[String]| -> Result<String, String> {
+        let joined = argv.join(" ");
+        if joined.contains("compare/main...") {
+            return Ok(json!({"total": 1, "shas": [P_OWN]}).to_string());
+        }
+        if joined.contains("compare/feat/x...q2head") {
+            return Ok(json!({"total": 2, "shas": [P_OWN, CHILD_OWN]}).to_string());
+        }
+        if joined.contains("OPEN") {
+            return Ok(listing(&[(&q, 2)]).to_string());
+        }
+        Err(format!("unexpected: {joined}"))
+    };
+    let mut judge = |_: &OpenPr| Judgement::Unapproved("held".to_owned());
+    let refusal = refusal_with(
+        &run_gh,
+        "o/r",
+        "main",
+        11363,
+        P_HEAD_BRANCH,
+        P_OWN,
+        &mut PassCache::default(),
+        &mut judge,
+    )
+    .expect("refused");
+    assert_eq!(refusal.token, "carries_unapproved_commits:#21");
+}
+
+#[test]
+fn an_unreadable_own_diff_fails_closed() {
+    let q = open(22, "feat/q3", "feat/x", "q3head", &[P_OWN]);
+    let run_gh = |argv: &[String]| -> Result<String, String> {
+        let joined = argv.join(" ");
+        if joined.contains("compare/main...") {
+            return Ok(json!({"total": 1, "shas": [P_OWN]}).to_string());
+        }
+        if joined.contains("OPEN") {
+            return Ok(listing(&[(&q, 1)]).to_string());
+        }
+        Err("boom".to_owned())
+    };
+    let mut judge = |_: &OpenPr| Judgement::Unapproved("held".to_owned());
+    let refusal = refusal_with(
+        &run_gh,
+        "o/r",
+        "main",
+        11363,
+        P_HEAD_BRANCH,
+        P_OWN,
+        &mut PassCache::default(),
+        &mut judge,
+    )
+    .expect("refused");
+    assert_eq!(refusal.token, "carried_commits_unreadable:#22");
+}

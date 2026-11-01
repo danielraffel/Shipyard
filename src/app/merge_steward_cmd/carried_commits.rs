@@ -16,7 +16,19 @@
 //!
 //! * Q is P's own base-branch pull request (same repository, Q's head branch
 //!   is P's base); a properly stacked P never targets the steward's base.
-//! * Q is stacked on P (Q's base branch is P's head branch): Q builds on P.
+//! * Q is stacked on P, directly or transitively (following Q's base branch
+//!   through other open pull requests' head branches reaches P's head
+//!   branch): Q builds on P.
+//! * Q only inherits the commit: Q "introduced" a commit only if it is in Q's
+//!   own diff against Q's own base branch (`Q.base...Q.head`), not merely
+//!   reachable from Q. A pull request stacked on another branch therefore
+//!   never matches the commits its base branch already carries, which is what
+//!   keeps P admissible when P's own commit reached Q through a chain. A pull
+//!   request that merges another pull request's branch still has those
+//!   commits in its own diff and is still caught; this includes a Q that
+//!   merged P's branch without being stacked on it (conservative: the sets
+//!   cannot tell P's origin commit from Q's copy, so the unapproved Q holds P
+//!   until it is landed, approved or has dropped the merge).
 //! * Commits already on the base: P's set comes from the compare API
 //!   `base...head`, which lists only commits the base does not have.
 //! * A base whose policy does not require head approval: there every head is
@@ -155,8 +167,8 @@ pub(super) fn carried(candidate: &Candidate<'_>, others: &[OpenPr]) -> Vec<Carri
         .filter(|q| q.number != candidate.number)
         // Q is P's base-branch pull request.
         .filter(|q| q.cross_repository || q.head_ref != candidate.base_ref)
-        // Q is stacked on P.
-        .filter(|q| q.base_ref != candidate.head_ref)
+        // Q is stacked on P, directly or through other open pull requests.
+        .filter(|q| !stacked_on(q, candidate.head_ref, others))
         .filter_map(|q| match &q.commits {
             CommitList::Complete(commits) => {
                 let shared: Vec<String> =
@@ -173,6 +185,65 @@ pub(super) fn carried(candidate: &Candidate<'_>, others: &[OpenPr]) -> Vec<Carri
             }),
         })
         .collect()
+}
+
+/// Whether `q`'s base-branch chain, followed through other open (same
+/// repository) pull requests' head branches, reaches `head_ref`. Pure; a cycle
+/// ends the walk.
+fn stacked_on(q: &OpenPr, head_ref: &str, others: &[OpenPr]) -> bool {
+    let mut seen = BTreeSet::new();
+    let mut base = q.base_ref.as_str();
+    while seen.insert(base) {
+        if base == head_ref {
+            return true;
+        }
+        match others
+            .iter()
+            .find(|r| !r.cross_repository && r.head_ref == base)
+        {
+            Some(parent) => base = parent.base_ref.as_str(),
+            None => return false,
+        }
+    }
+    false
+}
+
+/// Narrow an overlap with `q` to the commits `q` introduced: those in `q`'s
+/// own diff against `q`'s own base branch. A `q` on the steward's base is
+/// already listed against it. `None` when nothing remains.
+fn introduced_overlap(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    base: &str,
+    q: &OpenPr,
+    overlap: Carried,
+) -> Result<Option<Carried>, String> {
+    let Carried::Shares {
+        number,
+        head_sha,
+        shared,
+    } = overlap
+    else {
+        return Ok(Some(overlap));
+    };
+    if q.base_ref == base {
+        return Ok(Some(Carried::Shares {
+            number,
+            head_sha,
+            shared,
+        }));
+    }
+    match compare_commits(run_gh, repo, &q.base_ref, &q.head_sha)? {
+        CommitList::Complete(own) => {
+            let shared: Vec<String> = shared.into_iter().filter(|sha| own.contains(sha)).collect();
+            Ok((!shared.is_empty()).then_some(Carried::Shares {
+                number,
+                head_sha,
+                shared,
+            }))
+        }
+        CommitList::OverCap { total } => Ok(Some(Carried::Unbounded { number, total })),
+    }
 }
 
 /// Whether P may be admitted given what it carries and each carried pull
@@ -424,6 +495,18 @@ pub(super) fn refusal_with(
         // head check is part of `judge`; caching an approval would let a
         // force-push after the first candidate reuse a stale verdict later in
         // the same pass.
+        let overlap = match introduced_overlap(run_gh, repo, base, q, overlap) {
+            Ok(Some(overlap)) => overlap,
+            Ok(None) => continue,
+            Err(error) => {
+                let unreadable = Carried::Unbounded {
+                    number: q.number,
+                    total: 0,
+                };
+                judged.push((unreadable, Judgement::Unreadable(error)));
+                continue;
+            }
+        };
         let judgement = judge(q);
         judged.push((overlap, judgement));
     }

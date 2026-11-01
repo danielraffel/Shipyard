@@ -321,7 +321,7 @@ JSON also names the reason per PR in `blocked_on` (`no_verdict`, `held`,
 than the mutation when diagnosing a stall. The steward also refuses a head
 that carries another open PR's commits whose head is not approved
 (`carries_unapproved_commits:#Q`, shared shas in `blocked_detail`): a HOLD
-cannot be bypassed by merging the held branch into another one. There is no
+cannot be bypassed by merging the held branch into another one. A PR stacked on P, directly or through other open PRs' branches, or one that only inherits P's commit (not in its own diff against its own base), never counts as carrying. There is no
 override: `--arm` asks only for an arm the verdict allows, and
 `GHAPP_ALLOW_UNREVIEWED_ARM` is refused and audited. The review-only switch
 and Shipyard's internal marker count only with the one-shot nonce Shipyard
