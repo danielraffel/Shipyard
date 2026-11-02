@@ -92,6 +92,7 @@ fn required(reviewers: &[&str]) -> ApprovalPolicy {
         human_reviewer_logins: Vec::new(),
         signers: None,
         signer_identities: std::collections::BTreeMap::new(),
+        stamp_sessions: None,
         rebase_carry: false,
         signer_source: super::SignerSource::Host,
         carry_excluded: None,
@@ -606,6 +607,7 @@ fn the_policy_is_read_from_the_auto_merge_table() {
             human_reviewer_logins: Vec::new(),
             signers: None,
             signer_identities: std::collections::BTreeMap::new(),
+            stamp_sessions: None,
             rebase_carry: false,
             signer_source: super::SignerSource::Host,
             carry_excluded: None,
@@ -3173,6 +3175,189 @@ fn a_base_signer_identity_binding_rejects_wrong_host_or_agent() {
             "{stamp}"
         );
     }
+}
+
+/// pulp#11407: the authoring Codex session approved its own head (comment
+/// 6568210591), signed `reviewer: pulp-review` and stamped `agent:
+/// pulp-review` under its own session, and the `review-verdict` status
+/// counted it. A signer line and an agent id are text any lane can write; a
+/// reviewer run's session id is minted for that run. With the base listing
+/// the reviewer runs' session globs, only such a run's APPROVE counts, under
+/// the host rule and the repository-side rule alike. A HOLD from any session
+/// still holds the head.
+#[test]
+fn pulp_11407s_author_lane_approve_is_refused_where_the_base_lists_reviewer_sessions() {
+    let author = record_from("pulp-11407-author-lane-approve.json");
+    let head = marker_head(&author);
+    assert_eq!(head, "25ee078ece3441cce0cae581ef5e7b4b7510c9c0");
+    let table: toml::Table = "[auto_merge]\n\
+         reviewer_signers = [\"pulp-review\", \"infra-review2\"]\n\
+         reviewer_stamp_sessions = [\"fleet-pass-reviewer-*\"]\n"
+        .parse()
+        .expect("toml");
+    let mut policy = ApprovalPolicy::from_table_for_repo(&table, "Generous-Corp/pulp", true);
+    assert_eq!(
+        policy.stamp_sessions.as_deref(),
+        Some(["fleet-pass-reviewer-*".to_owned()].as_slice())
+    );
+    // The standing reviewer run's APPROVE of the same head (comment 6568664369).
+    let reviewer = fleet(
+        "2026-11-02T03:55:50Z",
+        &format!(
+            "Reviewed exact head {head}.\n\nreviewer: pulp-review\n\
+             session: pulp-review (team-lead team, agent pulp-review, host m3)\n\
+             <!-- session: Daniels-Mac-Studio-m3/fleet-pass-reviewer-Daniels-Mac-Studio-m3-20261102T033922Z-92868 agent: pulp-review -->\n\
+             verdict: APPROVE head:{head}\n"
+        ),
+    );
+    let mut hold = author.clone();
+    hold["id"] = json!(6_568_210_592_u64);
+    hold["at"] = json!("2026-11-02T04:00:00Z");
+    hold["body"] = json!(
+        author["body"]
+            .as_str()
+            .expect("body")
+            .replace("verdict: APPROVE", "verdict: HOLD")
+    );
+    super::with_host_sessions(None, || {
+        for source in [super::SignerSource::Host, super::SignerSource::Base] {
+            policy.signer_source = source;
+            assert!(
+                !gate_on(&policy, &head, std::slice::from_ref(&author)).allows(),
+                "{source:?}"
+            );
+            assert_eq!(
+                super::app_approval_refusal_reason(&author, &policy).map(|(token, _)| token),
+                Some("unlisted_stamp_session"),
+                "{source:?}"
+            );
+            assert_eq!(
+                super::verdict_audit_events(
+                    &head,
+                    &[],
+                    std::slice::from_ref(&author),
+                    &policy,
+                    None
+                ),
+                vec![
+                    "excluded_app_approval:its stamp session \
+                     01a18030-f638-7010-94b9-2198e940232f is not one of the base's \
+                     `reviewer_stamp_sessions` (fleet-pass-reviewer-*)"
+                        .to_owned()
+                ],
+                "{source:?}"
+            );
+            // Control: the reviewer run's APPROVE counts.
+            assert!(
+                gate_on(&policy, &head, std::slice::from_ref(&reviewer)).allows(),
+                "{source:?}"
+            );
+            // A HOLD never needs a listed session: the author lane's holds the head.
+            let gate = gate_on(&policy, &head, &[reviewer.clone(), hold.clone()]);
+            assert!(!gate.allows(), "{source:?}");
+            assert!(
+                super::verdict_audit_events(
+                    &head,
+                    &[],
+                    &[reviewer.clone(), hold.clone()],
+                    &policy,
+                    None
+                )
+                .iter()
+                .any(|event| event.starts_with("head_held:")),
+                "{source:?}"
+            );
+        }
+        // With no list on the base, the rule is off and the author lane's
+        // APPROVE counts: what the status did on pulp#11407.
+        policy.stamp_sessions = None;
+        assert!(gate_on(&policy, &head, std::slice::from_ref(&author)).allows());
+    });
+}
+
+/// `reviewer_stamp_sessions` matches the stamp's session by the carry glob
+/// (`*` within a segment) without case, and an exact session id lists as
+/// itself. A stamp with no session cannot match any list.
+#[test]
+fn reviewer_stamp_sessions_match_the_stamped_session_by_glob() {
+    let table: toml::Table = "[auto_merge]\n\
+         reviewer_signers = [\"pulp-review\"]\n\
+         reviewer_stamp_sessions = [\"Fleet-Pass-Reviewer-*\", \"08fb81d8-38a3-4b20-8bcc-c34ba2a66ffb\"]\n"
+        .parse()
+        .expect("toml");
+    let mut policy = ApprovalPolicy::from_table(&table);
+    policy.signer_source = super::SignerSource::Base;
+    for (stamp, allowed) in [
+        (
+            "<!-- session: Daniels-Mac-Studio-m3/fleet-pass-reviewer-Daniels-Mac-Studio-m3-20261102T033922Z-92868 -->",
+            true,
+        ),
+        (
+            "<!-- session: Daniels-M5-Studio/FLEET-PASS-REVIEWER-m5-1 agent: pulp-review -->",
+            true,
+        ),
+        (
+            "<!-- session: Daniels-Mac-Studio-m3/08fb81d8-38a3-4b20-8bcc-c34ba2a66ffb -->",
+            true,
+        ),
+        (
+            "<!-- session: Daniels-Mac-Studio-m3/fleet-pass-repair-Daniels-Mac-Studio-m3-20261102T033922Z-1 -->",
+            false,
+        ),
+        (
+            "<!-- session: Daniels-Mac-Studio-m3/737146e7-1497-4dda-b178-f95c88c28b91 agent: pulp-review -->",
+            false,
+        ),
+        ("", false),
+    ] {
+        let comment = fleet(
+            "2026-11-02T03:55:50Z",
+            &format!("reviewer: pulp-review\n{stamp}\nverdict: APPROVE head:{HEAD}"),
+        );
+        assert_eq!(
+            super::app_approval_refusal(&comment, &policy).is_none(),
+            allowed,
+            "{stamp}"
+        );
+    }
+}
+
+/// An empty or malformed `reviewer_stamp_sessions` is an unreadable policy,
+/// not a list that admits nobody or one that is silently ignored.
+#[test]
+fn reviewer_stamp_sessions_must_be_a_non_empty_list_of_globs() {
+    let parse =
+        |body: &str| -> toml::Table { format!("[auto_merge]\n{body}\n").parse().expect("toml") };
+    assert!(super::stamp_sessions_shape(&parse("queue = true")).is_ok());
+    assert!(super::stamp_sessions_shape(&parse("reviewer_stamp_sessions = [\"a-*\"]")).is_ok());
+    for bad in [
+        "reviewer_stamp_sessions = []",
+        "reviewer_stamp_sessions = \"a-*\"",
+        "reviewer_stamp_sessions = [\"\"]",
+        "reviewer_stamp_sessions = [\" \"]",
+        "reviewer_stamp_sessions = [1]",
+    ] {
+        assert!(super::stamp_sessions_shape(&parse(bad)).is_err(), "{bad}");
+    }
+    super::with_host_review_default(true, || {
+        let empty = |argv: &[String]| -> Result<String, String> {
+            let joined = argv.join(" ");
+            if joined.contains("contents/.shipyard/config.toml") {
+                Ok("[auto_merge]\nreviewer_stamp_sessions = []\n".to_owned())
+            } else if joined.contains("/branches/") {
+                Ok("main\n".to_owned())
+            } else {
+                Err(format!("unexpected: {joined}"))
+            }
+        };
+        let error = super::read_policy_required(&empty, "Generous-Corp/pulp", "main")
+            .expect_err("an empty list is unreadable");
+        let detail = String::from(error);
+        assert!(
+            detail.contains("reviewer_stamp_sessions must be a non-empty list of session globs"),
+            "{detail}"
+        );
+    });
 }
 
 /// Every line boundary Python's `str.splitlines` knows ends a verdict line

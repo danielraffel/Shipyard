@@ -355,7 +355,10 @@ App APPROVE carrying any other stamp-like text (`<!--`, whitespace,
 "non-canonical", never read as stamped. A body file
 that is not a regular file (a FIFO) cannot be checked and is refused; an
 `api` output filter (`--jq`, `--template`) is never sent and is not checked.
-A request without stamp text posts as before. The session is `CLAUDE_CODE_SESSION_ID`, else
+A request without stamp text posts as before. The session is
+`SHIPYARD_STAMP_SESSION_ID` (a scheduled reviewer run exports its per-run id
+there, since Claude Code sets `CLAUDE_CODE_SESSION_ID` itself in its tool
+subprocesses), else `CLAUDE_CODE_SESSION_ID`, else
 `CODEX_COMPANION_SESSION_ID`, else `unattributed`; `agent: <id>` appears only
 when `SHIPYARD_AGENT_ID` is set. The marker stays the last line, so every
 verdict reader is unchanged. The arm guard, and `head_approval` for Shipyard's
@@ -474,6 +477,16 @@ from a login that does not count is ignored.
   a missing agent, another host or agent, or a signer with no binding refuses
   the APPROVE. This map is separate from the existing list form of
   `reviewer_identities`, which names GitHub reviewer logins.
+  A protected base can also list which sessions may approve, as globs on the
+  stamp's `<session>`: `[auto_merge] reviewer_stamp_sessions =
+  ["fleet-pass-reviewer-*"]`. A signer line and an agent id are text any lane
+  can write (pulp#11407: the authoring session approved its own head, signed
+  `reviewer: pulp-review`), while a reviewer run's session id is minted for
+  that run. With the list set, an App APPROVE whose stamped session matches
+  no glob is refused (`unlisted_stamp_session`), on the host and under the
+  server-side status alike; a HOLD from any session still counts. Without
+  the list the rule is off; an empty or malformed list is an unreadable
+  policy.
 * A signer line can be copied, so a host can also list the exact `session:`
   lines its reviewers write, under a `sessions` key in the same file:
   `{"sessions": ["session: pulp-review (team-lead team, agent pulp-review, host m3)"]}`

@@ -347,7 +347,12 @@ the App APPROVE must be listed and one must be present, since a copied
 `reviewer:` line otherwise passes, and its single `ghapp` stamp must come
 from a hostname the `session_hosts` map gives for the line's `host <name>`,
 since a copied `session:` line otherwise passes; with no list the guard warns
-once)
+once; and where the base lists `[auto_merge] reviewer_stamp_sessions`
+(globs such as `fleet-pass-reviewer-*`), only an App APPROVE whose `ghapp`
+stamp session matches one counts, because a `reviewer:` line and an agent id
+are text any lane can write while a reviewer run's session id is minted for
+that run (pulp#11407: the authoring session approved its own head); a HOLD
+from any session still counts)
 arms or merges only a
 head that carries an
 approval of that exact head from an identity listed in
@@ -708,7 +713,10 @@ names excluded human approvals and the fix), 2 when unreadable (treat as
 refused). Pass `--head <sha>` to judge the head a merge group lands rather
 than the pull request's current one. It takes signers only from the base's
 `[auto_merge] reviewer_signers`: a repository that requires review and lists
-none refuses every App APPROVE, so set the list on the base first.
+none refuses every App APPROVE, so set the list on the base first. Where the
+base also lists `reviewer_stamp_sessions`, only an APPROVE stamped from a
+matching session counts (`approval_excluded:unlisted_stamp_session`
+otherwise).
 
 Every row a guard appends (`holds.jsonl`, `overrides.jsonl`, `carries.jsonl`,
 `switches.jsonl`, `queue-arms.jsonl`, `queue-removals.jsonl`) names its

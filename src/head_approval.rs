@@ -53,6 +53,12 @@
 //! that arms. Unstamped verdicts, and either side without an agent id,
 //! count as before.
 //!
+//! A base that lists `[auto_merge] reviewer_stamp_sessions` (globs such as
+//! `fleet-pass-reviewer-*`) counts an App APPROVE only when its stamped
+//! session matches one: a reviewer run's session id is minted for that run,
+//! while a `reviewer:` line or an agent id is text any lane can write
+//! (pulp#11407). A HOLD never needs a listed session.
+//!
 //! With no reviewer listed, such a repository counts an approval only from
 //! the fleet App (`shipyard-local`, which every agent posts as through
 //! `ghapp`), or from a human account the base lists in `[auto_merge]
@@ -117,6 +123,11 @@ pub const HUMAN_REVIEWERS_KEY: &str = "human_reviewers";
 pub const SIGNERS_KEY: &str = "reviewer_signers";
 /// Base-config binding from a signer name to stamped `host agent:id` values.
 pub const SIGNER_IDENTITIES_KEY: &str = "reviewer_signer_identities";
+/// Base-config globs the `<session>` in an App APPROVE's `ghapp` stamp must
+/// match, e.g. `["fleet-pass-reviewer-*"]`: only a reviewer run's own
+/// session approves, never an author lane's (pulp#11407, where the authoring
+/// session signed `reviewer: pulp-review` and the status counted it).
+pub const STAMP_SESSIONS_KEY: &str = "reviewer_stamp_sessions";
 /// `[auto_merge]` key replacing [`DEFAULT_CARRY_EXCLUDED_PATHS`].
 pub const CARRY_EXCLUDED_KEY: &str = "carry_excluded_paths";
 /// `[auto_merge]` key adding globs to the carry exclusions (the defaults, or
@@ -635,6 +646,34 @@ pub fn signer_identities_shape(table: &toml::Table) -> Result<(), String> {
     }
 }
 
+/// Whether a base-config [`STAMP_SESSIONS_KEY`] list has the expected shape:
+/// a non-empty list of non-empty globs. An empty list would admit no App
+/// APPROVE at all, which is never what a base means; it is refused loudly.
+pub fn stamp_sessions_shape(table: &toml::Table) -> Result<(), String> {
+    let Some(value) = table
+        .get(CONFIG_TABLE)
+        .and_then(toml::Value::as_table)
+        .and_then(|section| section.get(STAMP_SESSIONS_KEY))
+    else {
+        return Ok(());
+    };
+    let well_formed = value.as_array().is_some_and(|patterns| {
+        !patterns.is_empty()
+            && patterns.iter().all(|pattern| {
+                pattern
+                    .as_str()
+                    .is_some_and(|pattern| !pattern.trim().is_empty())
+            })
+    });
+    if well_formed {
+        Ok(())
+    } else {
+        Err(format!(
+            "[{CONFIG_TABLE}] {STAMP_SESSIONS_KEY} must be a non-empty list of session globs, not {value}"
+        ))
+    }
+}
+
 /// The `sessions` key of [`SIGNERS_FILE`]: the exact `session:` lines a
 /// reviewer writes on its verdicts. The queue-arm guard reads the same key.
 pub const SESSIONS_KEY: &str = "sessions";
@@ -904,6 +943,11 @@ pub struct ApprovalPolicy {
     /// Stamped `host agent:id` identities allowed for each signer name.
     #[serde(default)]
     pub signer_identities: std::collections::BTreeMap<String, Vec<String>>,
+    /// Globs the stamped session of an App APPROVE must match
+    /// ([`STAMP_SESSIONS_KEY`]), lower-cased; `None` when the base sets none
+    /// (any stamped session approves, as before).
+    #[serde(default)]
+    pub stamp_sessions: Option<Vec<String>>,
     /// Try the rebase carry for this evaluation whatever the host switch
     /// says (`shipyard review-verdict` sets it; a config never does).
     #[serde(default)]
@@ -1005,6 +1049,17 @@ impl ApprovalPolicy {
                         .collect()
                 })
                 .unwrap_or_default(),
+            stamp_sessions: section
+                .get(STAMP_SESSIONS_KEY)
+                .and_then(toml::Value::as_array)
+                .map(|patterns| {
+                    patterns
+                        .iter()
+                        .filter_map(toml::Value::as_str)
+                        .map(|pattern| pattern.trim().to_ascii_lowercase())
+                        .filter(|pattern| !pattern.is_empty())
+                        .collect()
+                }),
             rebase_carry: false,
             signer_source: SignerSource::Host,
             dry_run: false,
@@ -1362,6 +1417,29 @@ fn approver_allowed(record: &Value, policy: &ApprovalPolicy) -> bool {
     })
 }
 
+/// Why a stamped `session` does not admit an App APPROVE under the base's
+/// [`STAMP_SESSIONS_KEY`] `patterns` (lower-cased globs), or `None`: no
+/// stamp at all, or a session no pattern matches (case-blind).
+fn stamp_session_refusal(
+    session: Option<&str>,
+    patterns: &[String],
+) -> Option<(&'static str, String)> {
+    let Some(session) = session else {
+        return Some(("no_stamp", "it has no `ghapp` session stamp".to_owned()));
+    };
+    let lowered = session.to_ascii_lowercase();
+    if patterns.iter().any(|pattern| glob_match(pattern, &lowered)) {
+        return None;
+    }
+    Some((
+        "unlisted_stamp_session",
+        format!(
+            "its stamp session {session} is not one of the base's `{STAMP_SESSIONS_KEY}` ({})",
+            patterns.join(", ")
+        ),
+    ))
+}
+
 /// Why the fleet App's APPROVE in `record` does not count, or `None`.
 ///
 /// Every agent posts as the same App, so the App's identity says nothing
@@ -1404,6 +1482,15 @@ fn app_approval_refusal_reason(
     // stamp removed, still passed the review-verdict status).
     if policy.signer_source == SignerSource::Base && session.is_none() {
         return Some(("no_stamp", "it has no `ghapp` session stamp".to_owned()));
+    }
+    // The base's reviewer sessions, read by both rules: a `reviewer:` line
+    // and an agent id are text any lane can write (pulp#11407's authoring
+    // session signed `reviewer: pulp-review` under its own session), but a
+    // reviewer run's session id is minted for that run.
+    if let Some(patterns) = &policy.stamp_sessions
+        && let Some(refusal) = stamp_session_refusal(session.as_deref(), patterns)
+    {
+        return Some(refusal);
     }
     // Host-local: the repository-side rule has no host to read.
     if policy.signer_source == SignerSource::Host
@@ -2033,6 +2120,9 @@ fn read_policy_inner(
         PolicyReadError::Unreadable(format!("{CONFIG_PATH} on {base}: {error}"))
     })?;
     signer_identities_shape(&table).map_err(|error| {
+        PolicyReadError::Unreadable(format!("{CONFIG_PATH} on {base}: {error}"))
+    })?;
+    stamp_sessions_shape(&table).map_err(|error| {
         PolicyReadError::Unreadable(format!("{CONFIG_PATH} on {base}: {error}"))
     })?;
     let mut policy = ApprovalPolicy::from_table_for_repo(&table, repo, host_default);

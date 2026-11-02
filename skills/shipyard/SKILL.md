@@ -4328,7 +4328,13 @@ approval only from the fleet App or a login the base lists in `[auto_merge]
 human_reviewers` (each ignored human approval is printed and recorded); the
 App counts only as a `Bot` (a user account named `shipyard-local` counts for
 nothing), an App APPROVE stamped `unattributed` never counts (nor, under the
-server-side `review-verdict` status, one with no ghapp stamp), and on a host
+server-side `review-verdict` status, one with no ghapp stamp), where the base
+lists `[auto_merge] reviewer_stamp_sessions` (globs such as
+`fleet-pass-reviewer-*`) an App APPROVE counts only when its `ghapp` stamp
+session matches one, since a `reviewer:` line and an agent id are text any
+lane can write while a reviewer run's session id is minted for that run
+(pulp#11407: the authoring session approved its own head, and a HOLD from any
+session still counts), and on a host
 with `reviewer-signers.json` (or a base that sets `[auto_merge]
 reviewer_signers`, which wins and is what the server-side status applies) it
 needs a `reviewer: <name>` line naming an allowed signer; a host whose

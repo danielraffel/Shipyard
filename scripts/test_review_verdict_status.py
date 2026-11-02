@@ -198,6 +198,40 @@ class ReviewVerdictStatus(unittest.TestCase):
         self.assertEqual(self.judged(approve(wrong_host), config), "failure")
         self.assertEqual(self.judged(approve(no_agent), config), "failure")
 
+    def test_pulp_11407s_author_lane_approve_fails_where_the_base_lists_reviewer_sessions(
+            self) -> None:
+        # pulp#11407: the authoring session's APPROVE (comment 6568210591),
+        # signed `reviewer: pulp-review` under its own session stamp, turned
+        # the status green. With the base listing the reviewer runs' session
+        # globs only such a run's APPROVE does; a HOLD from any session fails it.
+        config = ('[auto_merge]\n'
+                  'reviewer_signers = ["pulp-review", "infra-review2"]\n'
+                  'reviewer_stamp_sessions = ["fleet-pass-reviewer-*"]\n')
+        author = ("<!-- session: Daniels-Mac-Studio-m3/01a18030-f638-7010-94b9-2198e940232f "
+                  "agent: pulp-review -->")
+        reviewer = ("<!-- session: Daniels-Mac-Studio-m3/fleet-pass-reviewer-Daniels-Mac-Studio-m3-"
+                    "20261102T033922Z-92868 agent: pulp-review -->")
+
+        def verdict(stamp: str, verdict: str, at: str, **change: Any) -> dict[str, Any]:
+            return self.comment(f"Reviewed exact head {HEAD}.\n\nreviewer: pulp-review\n{stamp}\n"
+                                f"verdict: {verdict} head:{HEAD}", at, **change)
+
+        self.assertEqual(self.judged([verdict(author, "APPROVE", "2026-11-02T03:18:19Z")], config),
+                         "failure")
+        result = self.post(self.answers([verdict(author, "APPROVE", "2026-11-02T03:18:19Z")],
+                                        config))
+        self.assertIn("its stamp session 01a18030-f638-7010-94b9-2198e940232f is not one of the "
+                      "base's `reviewer_stamp_sessions` (fleet-pass-reviewer-*)", result.stderr)
+        self.assertEqual(self.judged([verdict(reviewer, "APPROVE", "2026-11-02T03:55:50Z")],
+                                     config), "success", "control: the reviewer run counts")
+        self.assertEqual(self.judged([verdict(reviewer, "APPROVE", "2026-11-02T03:55:50Z"),
+                                      verdict(author, "HOLD", "2026-11-02T04:00:00Z", id=2)],
+                                     config), "failure", "the author lane's HOLD still holds")
+        self.assertIn("HOLD", self.posted()["description"])
+        self.assertEqual(self.judged([verdict(author, "APPROVE", "2026-11-02T03:18:19Z")],
+                                     SIGNERS), "success",
+                         "with no list on the base the rule is off: what pulp#11407 saw")
+
     def test_tartci_623s_copied_approve_fails_stamped_unattributed_or_unstamped(self) -> None:
         # tartci#623's deciding APPROVE (comment 6321450475) copied
         # infra-review2's signer and session lines under a

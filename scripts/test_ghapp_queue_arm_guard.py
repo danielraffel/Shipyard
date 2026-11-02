@@ -3998,6 +3998,86 @@ class ReviewIdentity(unittest.TestCase):
             self.assertFalse(guard.review_verdict(self.HEAD, "danielraffel", [bad], [], policy)[0],
                              wrong)
 
+    def test_pulp_11407s_author_lane_approve_is_refused_where_the_base_lists_reviewer_sessions(
+            self) -> None:
+        # pulp#11407: the authoring Codex session approved its own head
+        # (comment 6568210591), signed `reviewer: pulp-review` and stamped
+        # `agent: pulp-review` under its own session, and the review-verdict
+        # status counted it. With the base listing the reviewer runs' session
+        # globs, only such a run's APPROVE counts; a HOLD from any session
+        # still holds the head.
+        author, head = self.incident("pulp-11407-author-lane-approve.json")
+        self.assertEqual(head, "25ee078ece3441cce0cae581ef5e7b4b7510c9c0")
+        signers = '[auto_merge]\nreviewer_signers = ["pulp-review", "infra-review2"]\n'
+        policy = guard.review_policy(
+            signers + 'reviewer_stamp_sessions = ["fleet-pass-reviewer-*"]\n',
+            "Generous-Corp/pulp", True)
+        self.assertEqual(policy["stamp_sessions"], ["fleet-pass-reviewer-*"])
+        policy["sessions"] = None  # the base's list applies with no host allowlist
+        # The standing reviewer run's APPROVE of the same head (comment 6568664369).
+        reviewer = self.comment(
+            "shipyard-local[bot]",
+            f"Reviewed exact head {head}.\n\nreviewer: pulp-review\n"
+            "session: pulp-review (team-lead team, agent pulp-review, host m3)\n"
+            "<!-- session: Daniels-Mac-Studio-m3/fleet-pass-reviewer-Daniels-Mac-Studio-m3-"
+            f"20261102T033922Z-92868 agent: pulp-review -->\nverdict: APPROVE head:{head}\n",
+            at="2026-11-02T03:55:50Z")
+        hold = dict(author, body=author["body"].replace("verdict: APPROVE", "verdict: HOLD"),
+                    created_at="2026-11-02T04:00:00Z", id=6568210592)
+        for from_base in ("0", "1"):
+            with self.subTest(from_base=from_base), \
+                    mock.patch.dict(os.environ, {guard.SIGNERS_FROM_BASE_ENV: from_base}):
+                guard.EXCLUDED_APPROVALS.clear()
+                allowed, why = guard.review_verdict(head, "shipyard-local[bot]", [author], [], policy)
+                self.assertFalse(allowed, why)
+                self.assertIn(
+                    "shipyard-local[bot] (its stamp session 01a18030-f638-7010-94b9-2198e940232f "
+                    "is not one of the base's `reviewer_stamp_sessions` (fleet-pass-reviewer-*))",
+                    guard.EXCLUDED_APPROVALS)
+                self.assertTrue(guard.review_verdict(head, "shipyard-local[bot]", [reviewer], [],
+                                                     policy)[0], "control: the reviewer run counts")
+                allowed, why = guard.review_verdict(head, "shipyard-local[bot]", [reviewer, hold],
+                                                    [], policy)
+                self.assertFalse(allowed, "the author lane's HOLD still holds the head")
+                self.assertIn("HOLD", why)
+        # With no list on the base the rule is off and the author lane's
+        # APPROVE counts: what the status did on pulp#11407.
+        unset = guard.review_policy(signers, "Generous-Corp/pulp", True)
+        unset["sessions"] = None
+        self.assertIsNone(unset["stamp_sessions"])
+        self.assertTrue(guard.review_verdict(head, "shipyard-local[bot]", [author], [], unset)[0])
+
+    def test_reviewer_stamp_sessions_match_the_stamped_session_by_glob(self) -> None:
+        policy = guard.review_policy(
+            '[auto_merge]\nreviewer_signers = ["pulp-review"]\n'
+            'reviewer_stamp_sessions = ["Fleet-Pass-Reviewer-*", '
+            '"08fb81d8-38a3-4b20-8bcc-c34ba2a66ffb"]\n', "Generous-Corp/pulp", True)
+        policy["sessions"] = None
+        for stamp, allowed in (
+            ("<!-- session: Daniels-Mac-Studio-m3/fleet-pass-reviewer-Daniels-Mac-Studio-m3-"
+             "20261102T033922Z-92868 -->", True),
+            ("<!-- session: Daniels-M5-Studio/FLEET-PASS-REVIEWER-m5-1 agent: pulp-review -->", True),
+            ("<!-- session: Daniels-Mac-Studio-m3/08fb81d8-38a3-4b20-8bcc-c34ba2a66ffb -->", True),
+            ("<!-- session: Daniels-Mac-Studio-m3/fleet-pass-repair-Daniels-Mac-Studio-m3-"
+             "20261102T033922Z-1 -->", False),
+            ("<!-- session: Daniels-Mac-Studio-m3/737146e7-1497-4dda-b178-f95c88c28b91 "
+             "agent: pulp-review -->", False),
+            ("", False),
+        ):
+            comment = self.comment("shipyard-local[bot]",
+                                   f"reviewer: pulp-review\n{stamp}\nverdict: APPROVE head:{self.HEAD}")
+            self.assertEqual(guard.review_verdict(self.HEAD, "danielraffel", [comment], [], policy)[0],
+                             allowed, stamp)
+
+    def test_reviewer_stamp_sessions_must_be_a_non_empty_list_of_globs(self) -> None:
+        for bad in ('reviewer_stamp_sessions = []', 'reviewer_stamp_sessions = "a-*"',
+                    'reviewer_stamp_sessions = [""]', 'reviewer_stamp_sessions = [" "]',
+                    'reviewer_stamp_sessions = [1]'):
+            with self.subTest(bad=bad), self.assertRaises(guard.GuardError) as refused:
+                guard.review_policy(f"[auto_merge]\n{bad}\n", "Generous-Corp/pulp", True)
+            self.assertIn("reviewer_stamp_sessions must be a non-empty list of session globs",
+                          str(refused.exception))
+
     def test_the_base_config_names_signers_before_the_host_file(self) -> None:
         with tempfile.TemporaryDirectory() as scratch, \
                 mock.patch.dict(os.environ, {"SHIPYARD_GHAPP_GUARDS_DIR": scratch}):

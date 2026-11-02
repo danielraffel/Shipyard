@@ -112,6 +112,21 @@ class Stamp(unittest.TestCase):
         assert out is not None
         self.assertEqual(guard.stamped_session(out), "unattributed")
 
+    def test_a_dedicated_stamp_session_id_wins_over_the_agents_own(self) -> None:
+        # Claude Code sets CLAUDE_CODE_SESSION_ID itself in its tool
+        # subprocesses, so a scheduled reviewer run cannot override it; it
+        # exports SHIPYARD_STAMP_SESSION_ID, which the stamp prefers.
+        run = "fleet-pass-reviewer-m3-20261102T033922Z-92868"
+        with mock.patch.dict(os.environ, {"SHIPYARD_STAMP_SESSION_ID": run,
+                                          "CODEX_COMPANION_SESSION_ID": "sess-codex"}):
+            out = stamp.stamped(VERDICT)
+        assert out is not None
+        self.assertEqual(guard.stamped_session(out), run)
+        with mock.patch.dict(os.environ, {"SHIPYARD_STAMP_SESSION_ID": " "}):
+            out = stamp.stamped(VERDICT)
+        assert out is not None
+        self.assertEqual(guard.stamped_session(out), "sess-A", "blank: the agent's own id")
+
     def test_the_comment_forms_ghapp_posts_are_rewritten(self) -> None:
         for args, index in (
             (["pr", "comment", "5", "--body", VERDICT], 4),

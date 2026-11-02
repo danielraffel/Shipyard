@@ -266,7 +266,7 @@ not listed as blocked.
 |---|---|---|
 | `no_verdict` | Green, and no reviewer verdict names this head | reviewer |
 | `held` | A counting HOLD names this head | author: fix and push |
-| `approval_excluded:<reason>` | An APPROVE names this head but does not count. Reasons: `unattributed`, `no_stamp`, `noncanonical_stamp`, `session_not_allowed`, `no_signer_list`, `no_signer_line`, `uncounted_signer`, `unbound_identity`, `pr_author`, `impersonated_app`, `untrusted_reviewer`, `unlisted_reviewer`, `unlisted_human`, `predates_head` (posted before the head commit), `stale_head` (only an earlier head is approved), `self_approved` | reviewer or fleet config |
+| `approval_excluded:<reason>` | An APPROVE names this head but does not count. Reasons: `unattributed`, `no_stamp`, `noncanonical_stamp`, `session_not_allowed`, `unlisted_stamp_session`, `no_signer_list`, `no_signer_line`, `uncounted_signer`, `unbound_identity`, `pr_author`, `impersonated_app`, `untrusted_reviewer`, `unlisted_reviewer`, `unlisted_human`, `predates_head` (posted before the head commit), `stale_head` (only an earlier head is approved), `self_approved` | reviewer or fleet config |
 | `ejection_cap` | The queue removed this head too often since its last approval | reviewer, or a new push |
 | `approval_unread` | The approval gate could not be read this pass | next pass |
 | `owner_decision` | Labelled `owner-decision` | owner |
@@ -357,6 +357,16 @@ These came from running it for real:
   Approvals from an unattributed session don't count (a HOLD still does), and
   two processes sharing a signer can't be told apart. Scheduled (headless) runs
   must set a session id explicitly.
+- **Only a reviewer run's session approves.** A `reviewer:` line and an
+  agent id are text any lane can write; a reviewer run's session id is minted
+  for that run. List those sessions on the base as globs on the `ghapp` stamp,
+  `[auto_merge] reviewer_stamp_sessions = ["fleet-pass-reviewer-*"]`, and an
+  APPROVE from any other session is excluded (`unlisted_stamp_session`); a
+  HOLD from any session still counts. Example: on pulp#11407 the authoring
+  session approved its own head, signed `reviewer: pulp-review`, and the
+  `review-verdict` status went green; with the list, only the scheduled
+  reviewer's APPROVE (session `fleet-pass-reviewer-<host>-<stamp>-<pid>`)
+  counts.
 - **A model choosing its own candidates skips work.** Given only a brief, a
   reviewer pass reviewed other pull requests and twice passed over a repaired,
   green one. Compute the candidate list mechanically and hand it to the pass.
