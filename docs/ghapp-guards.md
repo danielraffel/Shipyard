@@ -474,6 +474,16 @@ from a login that does not count is ignored.
   a missing agent, another host or agent, or a signer with no binding refuses
   the APPROVE. This map is separate from the existing list form of
   `reviewer_identities`, which names GitHub reviewer logins.
+  A protected base can also list which sessions may approve, as globs on the
+  stamp's `<session>`: `[auto_merge] reviewer_stamp_sessions =
+  ["fleet-pass-reviewer-*"]`. A signer line and an agent id are text any lane
+  can write (pulp#11407: the authoring session approved its own head, signed
+  `reviewer: pulp-review`), while a reviewer run's session id is minted for
+  that run. With the list set, an App APPROVE whose stamped session matches
+  no glob is refused (`unlisted_stamp_session`), on the host and under the
+  server-side status alike; a HOLD from any session still counts. Without
+  the list the rule is off; an empty or malformed list is an unreadable
+  policy.
 * A signer line can be copied, so a host can also list the exact `session:`
   lines its reviewers write, under a `sessions` key in the same file:
   `{"sessions": ["session: pulp-review (team-lead team, agent pulp-review, host m3)"]}`

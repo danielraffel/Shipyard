@@ -1017,6 +1017,15 @@ def review_policy(config_text: str | None, repo: str, host_default: bool) -> dic
             name.lower(): [value.strip().lower() for value in values]
             for name, values in identity_map.items()
         }
+    stamp_sessions = section.get(STAMP_SESSIONS_KEY)
+    if stamp_sessions is not None:
+        if not isinstance(stamp_sessions, list) or not stamp_sessions or any(
+                not isinstance(pattern, str) or not pattern.strip() for pattern in stamp_sessions):
+            # An empty list would admit no App APPROVE at all, which is never
+            # what a base means; refuse it loudly, as src/head_approval.rs does.
+            raise GuardError(f"the base's .shipyard/config.toml [auto_merge] {STAMP_SESSIONS_KEY} "
+                             f"must be a non-empty list of session globs, not {stamp_sessions!r}")
+        stamp_sessions = [pattern.strip().lower() for pattern in stamp_sessions]
     try:
         excluded, carry_error = carry_paths(section), None
     except GuardError as error:
@@ -1040,6 +1049,10 @@ def review_policy(config_text: str | None, repo: str, host_default: bool) -> dic
         "signers": (configured_signers if configured_signers is not None or from_base_only
                     else reviewer_signers(repo)),
         "signer_identities": identity_map or {},
+        # Globs the stamped session of an App APPROVE must match (see
+        # app_approval_refusal); None when the base sets none. Read by both
+        # rules: it comes from the base, not a host.
+        "stamp_sessions": stamp_sessions,
         # The `session:` lines this host accepts on an App APPROVE (see
         # reviewer_sessions); None when the host lists none. Host-local only, so
         # the repository-side rule never reads it.
@@ -1063,6 +1076,12 @@ SIGNERS_FILE = "reviewer-signers.json"
 # `1`: signers only from the base config (the server-side status pins it).
 SIGNERS_FROM_BASE_ENV = "SHIPYARD_SIGNERS_FROM_BASE"
 SIGNER_IDENTITIES_KEY = "reviewer_signer_identities"
+# Base-config globs the `<session>` in an App APPROVE's ghapp stamp must
+# match, e.g. ["fleet-pass-reviewer-*"]: only a reviewer run's own session
+# approves, never an author lane's (pulp#11407, where the authoring session
+# signed `reviewer: pulp-review` and the status counted it). Same key as
+# src/head_approval.rs STAMP_SESSIONS_KEY.
+STAMP_SESSIONS_KEY = "reviewer_stamp_sessions"
 _SIGNER_LINE = re.compile(r"^[ \t]*reviewer:[ \t]*([A-Za-z0-9._-]+)[ \t]*$", re.MULTILINE)
 
 
@@ -1210,7 +1229,11 @@ def app_approval_refusal(body: Any, policy: dict[str, Any]) -> str | None:
     about who reviewed. An APPROVE with stamp-like text that is not an exact
     stamp never counts, and one stamped by ``ghapp`` with an
     ``unattributed`` session never counts, nor, under the repository-side rule
-    (``review-verdict``), one with no stamp at all; on a host with a session
+    (``review-verdict``), one with no stamp at all; where the base lists
+    ``reviewer_stamp_sessions`` the stamped session must match one of its
+    globs (a ``reviewer:`` line or an agent id is text any lane can write; a
+    reviewer run's session id is minted for that run, pulp#11407); on a host
+    with a session
     allowlist every ``session:`` line must be listed (and one must be present)
     and the single ``ghapp`` stamp must come from the host those lines name,
     and on a
@@ -1228,6 +1251,14 @@ def app_approval_refusal(body: Any, policy: dict[str, Any]) -> str | None:
         # (stdin, a raw API call) names no session at all (tartci#623's copy,
         # stamp removed, still passed this status).
         return "it has no `ghapp` session stamp"
+    patterns = policy.get("stamp_sessions")
+    if patterns is not None:
+        if not stamp:
+            return "it has no `ghapp` session stamp"
+        session = stamp[-1][1]
+        if not any(glob_match(pattern, session.lower()) for pattern in patterns):
+            return (f"its stamp session {session} is not one of the base's "
+                    f"`{STAMP_SESSIONS_KEY}` ({', '.join(patterns)})")
     if os.environ.get(SIGNERS_FROM_BASE_ENV) != "1":
         # Host-local: the repository-side rule has no host to read.
         refusal = session_refusal(
