@@ -214,6 +214,8 @@ mod capacity;
 mod ejected_retry;
 mod exact_head_merge;
 mod mutations;
+#[cfg(unix)]
+mod next_action;
 mod observation;
 #[cfg(unix)]
 mod recovery;

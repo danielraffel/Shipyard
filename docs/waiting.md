@@ -4,7 +4,8 @@
 something on GitHub reaches a known state." Four truth conditions:
 
 - **`wait release <version>`** — release tag exists, artifacts uploaded.
-- **`wait pr <N> --state {green|merged|closed}`** — PR reached a state.
+- **`wait pr <N> --state {green|merged|closed|actionable}`** — PR reached a state;
+  `actionable` means the merge steward's classification says you must act or may stop.
 - **`wait run <id> [--success]`** — workflow run reached terminal.
 - **`wait job <sy-id> [--success]`** — durable Shipyard queue job reached terminal.
 
@@ -126,6 +127,19 @@ path until governance support lands.
 `merged` matches when the PR's `merged` field is true. `closed`
 matches when `state ∈ {CLOSED, MERGED}`. Both are monotonic — once
 matched, they stay matched, so a resume is safe.
+
+### `wait pr <N> --state actionable`
+
+Matches when the merge steward's own dry-run classification of the current
+head (`blocked_on`, see `docs/automated-draining.md`) says the caller must act
+(a HOLD, a failed required check, a conflict, an empty diff) or may stop
+(owner decision, merged, closed). `observed.next_action` carries `actor`,
+`action` and `stop`. Exit 1 on timeout means nothing is yours to do yet.
+Default `--poll-interval` is 120 seconds for this state.
+
+```sh
+shipyard wait pr 11364 --state actionable --timeout 1800 --json
+```
 
 ### `wait run <id> [--success]`
 

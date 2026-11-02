@@ -2636,6 +2636,7 @@ authoritative snapshot.
 | Treating a missing queue-job log or GitHub run as completion | `shipyard wait job sy-20260901-example --success --timeout 1200 --json` |
 | `while ! gh release view v0.23.0 --json assets -q '.assets\|length' \| grep -q '^5$'; do sleep 10; done` | `shipyard wait release v0.23.0 --timeout 900 --json` |
 | `gh pr checks 151 --watch` (blocking; no structured output) | `shipyard wait pr 151 --state green --timeout 1800 --json` |
+| Reading PR state yourself to decide whether you are blocked (stale head, missed HOLD, merged hours ago, advisory checks, merging main for BEHIND) | `shipyard wait pr 151 --state actionable --timeout 1800 --json`: the steward's own `blocked_on` plus `next_action` (`actor`, `action`, `stop`); exit 0 means act or stop, exit 1 means nothing is yours yet. Before declaring yourself blocked, run it; stop only on `stop: true`. |
 
 ### Detection gate (when to use it vs hand-rolled `gh`)
 
