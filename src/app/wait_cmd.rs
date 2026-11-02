@@ -20,6 +20,7 @@ use crate::metrics::MetricsStore;
 use crate::output::write_json_envelope;
 use crate::queue::Queue;
 use crate::wait as wait_logic;
+use crate::wait_transport;
 use crate::wait_transport::{
     WaitOutcome, fetch_pr_green_snapshot_with_timeout, fetch_pr_snapshot_with_timeout,
     fetch_release_snapshot_with_timeout, fetch_run_snapshot_with_timeout, pr_event_filter,
@@ -74,7 +75,7 @@ pub(super) fn wait_command<W: Write>(
             pr_number,
             state,
             timeout,
-            poll_interval,
+            poll_interval.unwrap_or(default_pr_poll_interval(state)),
             no_fallback,
             repo,
             snapshot_file.as_deref(),
@@ -168,6 +169,125 @@ fn wait_release<W: Write>(
     Ok(wait_exit_code(&outcome))
 }
 
+/// The reconciliation cadence for a PR wait that did not set one: a steward
+/// classification is a full admission read, so it polls less often.
+pub(super) const fn default_pr_poll_interval(state: WaitPrState) -> f64 {
+    match state {
+        WaitPrState::Actionable => 120.0,
+        _ => 30.0,
+    }
+}
+
+/// `--state actionable`'s snapshot: the steward's own classification of the
+/// live head, with the next action (`super::merge_steward_cmd`). A pull
+/// request `gh` cannot find is `None`, which the wait reports as invalid
+/// input, like every other PR wait.
+pub(super) fn fetch_pr_actionable_snapshot(
+    actions: &crate::cloud::GitHubActions,
+    state_dir: &Path,
+    repo: &str,
+    pr_number: u64,
+) -> wait_transport::WaitResult<Option<Value>> {
+    match super::merge_steward_cmd::pr_next_action_snapshot(actions, state_dir, repo, pr_number) {
+        Ok(snapshot) => Ok(Some(snapshot)),
+        Err(error) if pull_request_absent(&error) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Whether the single-PR read failed because the pull request does not
+/// exist, as `gh pr view` and the REST API word it.
+fn pull_request_absent(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.starts_with("pull request failed")
+        && (lower.contains("could not resolve to a pullrequest")
+            || lower.contains("http 404")
+            || lower.contains("not found"))
+}
+
+/// Whether an `actionable` snapshot says the caller has something to do.
+///
+/// The snapshot carries `actionable` from the same `next_action` it reports;
+/// nothing here re-derives it from the token, so the wait cannot disagree with
+/// the answer it prints.
+pub(super) fn evaluate_pr_actionable(
+    snapshot: Option<&Value>,
+) -> Result<wait_logic::TruthResult, Box<dyn std::error::Error>> {
+    let snapshot =
+        snapshot.ok_or_else(|| wait_logic::InvalidInputError("PR not found".to_owned()))?;
+    let field = |key: &str| snapshot.get(key).cloned().unwrap_or(Value::Null);
+    let actionable = snapshot
+        .get("actionable")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    Ok(wait_logic::TruthResult {
+        matched: actionable,
+        observed: BTreeMap::from([
+            ("pr".to_owned(), field("number")),
+            ("state".to_owned(), field("state")),
+            ("head_sha".to_owned(), field("headRefOid")),
+            ("merge_state".to_owned(), field("merge_state")),
+            ("blocked_on".to_owned(), field("blocked_on")),
+            ("blocked_detail".to_owned(), field("blocked_detail")),
+            ("since".to_owned(), field("since")),
+            ("held_by".to_owned(), field("held_by")),
+            ("next_action".to_owned(), field("next_action")),
+            ("actionable".to_owned(), Value::Bool(actionable)),
+            ("required_contexts".to_owned(), field("required_contexts")),
+            ("pass_errors".to_owned(), field("pass_errors")),
+        ]),
+    })
+}
+
+/// The human lines for an `actionable` answer: the token, then who acts and
+/// what they do, so the one line to follow is the last one printed.
+fn render_pr_actionable<W: Write>(stdout: &mut W, outcome: &WaitOutcome) -> std::io::Result<()> {
+    let text = |key: &str| {
+        outcome
+            .observed
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned()
+    };
+    let head = text("head_sha").chars().take(12).collect::<String>();
+    let since = text("since");
+    writeln!(
+        stdout,
+        "#{} head {head} blocked_on={}{}{}",
+        outcome
+            .observed
+            .get("pr")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        text("blocked_on"),
+        outcome
+            .observed
+            .get("blocked_detail")
+            .and_then(Value::as_str)
+            .map_or_else(String::new, |detail| format!(" ({detail})")),
+        if since.is_empty() {
+            String::new()
+        } else {
+            format!(" since {since}")
+        }
+    )?;
+    if let Some(next) = outcome.observed.get("next_action") {
+        let actor = next
+            .get("actor")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let stop = next.get("stop").and_then(Value::as_bool).unwrap_or(false);
+        writeln!(
+            stdout,
+            "next ({actor}{}): {}",
+            if stop { ", stop" } else { "" },
+            next.get("action").and_then(Value::as_str).unwrap_or("")
+        )?;
+    }
+    Ok(())
+}
+
 // This is the public wait orchestration boundary; keeping the transport and
 // rendering paths together preserves the exact exit-code contract.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -204,6 +324,7 @@ fn wait_pr<W: Write>(
                     .map_err(|error| Box::new(error) as Box<dyn std::error::Error>),
                 WaitPrState::Closed => wait_logic::evaluate_pr_state(snapshot, "closed")
                     .map_err(|error| Box::new(error) as Box<dyn std::error::Error>),
+                WaitPrState::Actionable => evaluate_pr_actionable(snapshot),
             }
         },
         |remaining| match snapshot_file {
@@ -211,6 +332,13 @@ fn wait_pr<W: Write>(
             None => match state {
                 WaitPrState::Green => {
                     fetch_pr_green_snapshot_with_timeout(&repo, pr_number, cwd, remaining)
+                }
+                WaitPrState::Actionable => {
+                    let config = LoadedConfig::load_from_cwd(mode, cwd)?;
+                    let actions = crate::cloud::GitHubActions::from_loaded_config(cwd, &config)
+                        .with_repo_override(&repo)
+                        .with_absolute_deadline(Instant::now() + remaining);
+                    fetch_pr_actionable_snapshot(&actions, state_dir, &repo, pr_number)
                 }
                 WaitPrState::Queued
                 | WaitPrState::Red
@@ -284,6 +412,10 @@ fn wait_pr<W: Write>(
                 crate::landing::pr_state::write_validation(stdout, signals)
                     .map_err(|error| CliFailure::new(1, error.to_string()))?;
             }
+            if matches!(state, WaitPrState::Actionable) && !json {
+                render_pr_actionable(stdout, &outcome)
+                    .map_err(|error| CliFailure::new(1, error.to_string()))?;
+            }
             if terminal_wrong {
                 return Ok(ExitCode::from(WAIT_EXIT_TERMINAL_WRONG));
             }
@@ -312,7 +444,7 @@ fn delegated_receipt_warning(
 
 fn wait_pr_state_exit_code(state: WaitPrState) -> ExitCode {
     match state {
-        WaitPrState::Green => ExitCode::SUCCESS,
+        WaitPrState::Green | WaitPrState::Actionable => ExitCode::SUCCESS,
         WaitPrState::Queued => ExitCode::from(WAIT_EXIT_QUEUED),
         WaitPrState::Red => ExitCode::from(WAIT_EXIT_RED),
         WaitPrState::Ejected => ExitCode::from(WAIT_EXIT_EJECTED),
@@ -1662,6 +1794,128 @@ artifacts = [
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.starts_with("matched after "));
         assert!(text.contains("(transport=polling, events=0)"));
+    }
+
+    fn actionable_snapshot(actionable: bool) -> Value {
+        serde_json::json!({
+            "number": 11364,
+            "state": "OPEN",
+            "merged": false,
+            "headRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "merge_state": "CLEAN",
+            "blocked_on": if actionable { "held" } else { "no_verdict" },
+            "since": "2026-11-01T10:10:00Z",
+            "held_by": if actionable {
+                serde_json::json!({"holder": "infra-review2", "record": "comment", "id": 1})
+            } else {
+                Value::Null
+            },
+            "next_action": {
+                "actor": if actionable { "author" } else { "reviewer" },
+                "action": if actionable { "HOLD by infra-review2: fix it." } else { "Nothing to do." },
+                "stop": false
+            },
+            "actionable": actionable,
+            "required_contexts": ["macos"],
+            "pass_errors": []
+        })
+    }
+
+    fn run_actionable_wait(snapshot: &Value, json: bool) -> (ExitCode, String) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("pr.json");
+        std::fs::write(&path, snapshot.to_string()).expect("snapshot");
+        let mut out = Vec::new();
+        let code = wait_pr(
+            RuntimeMode::Isolated,
+            &temp.path().join("missing.sock"),
+            temp.path(),
+            temp.path(),
+            json,
+            &mut out,
+            11364,
+            WaitPrState::Actionable,
+            0.2,
+            0.01,
+            false,
+            Some("owner/repo".to_owned()),
+            Some(&path),
+        )
+        .expect("wait pr");
+        (code, String::from_utf8(out).expect("utf8"))
+    }
+
+    /// The wait returns 0 with the token and the next action printed as soon
+    /// as the snapshot says the caller must act.
+    #[test]
+    fn wait_pr_actionable_matches_and_prints_the_next_action() {
+        let (code, text) = run_actionable_wait(&actionable_snapshot(true), false);
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(text.starts_with("matched after "), "{text}");
+        assert!(
+            text.contains("#11364 head aaaaaaaaaaaa blocked_on=held since 2026-11-01T10:10:00Z"),
+            "{text}"
+        );
+        assert!(
+            text.contains("next (author): HOLD by infra-review2: fix it."),
+            "{text}"
+        );
+    }
+
+    /// A snapshot that is nobody's move for the caller never matches, so the
+    /// wait runs to its timeout: exit 1 means "nothing is yours to do yet".
+    #[test]
+    fn wait_pr_actionable_times_out_while_the_next_move_is_someone_elses() {
+        let (code, text) = run_actionable_wait(&actionable_snapshot(false), false);
+        assert_eq!(code, ExitCode::from(WAIT_EXIT_TIMEOUT));
+        assert!(text.starts_with("timeout after "), "{text}");
+        assert!(text.contains("blocked_on=no_verdict"), "{text}");
+        assert!(text.contains("next (reviewer): Nothing to do."), "{text}");
+    }
+
+    /// The JSON envelope carries the whole answer under `observed`, from the
+    /// snapshot's own `actionable` flag, never re-derived from the token.
+    #[test]
+    fn wait_pr_actionable_json_carries_next_action_and_actionable() {
+        let (code, text) = run_actionable_wait(&actionable_snapshot(true), true);
+        assert_eq!(code, ExitCode::SUCCESS);
+        let envelope: Value = serde_json::from_str(text.trim()).expect("json");
+        assert_eq!(envelope["matched"], true);
+        assert_eq!(envelope["condition"]["type"], "pr_actionable");
+        assert_eq!(envelope["observed"]["blocked_on"], "held");
+        assert_eq!(envelope["observed"]["actionable"], true);
+        assert_eq!(envelope["observed"]["next_action"]["actor"], "author");
+        assert_eq!(envelope["observed"]["held_by"]["holder"], "infra-review2");
+
+        let mut snapshot = actionable_snapshot(true);
+        snapshot["actionable"] = Value::Bool(false);
+        let truth = super::evaluate_pr_actionable(Some(&snapshot)).expect("truth");
+        assert!(!truth.matched, "the flag decides, not the token");
+        assert!(super::evaluate_pr_actionable(None).is_err());
+    }
+
+    #[test]
+    fn actionable_waits_poll_less_often_by_default() {
+        assert!(
+            (super::default_pr_poll_interval(WaitPrState::Actionable) - 120.0).abs() < f64::EPSILON
+        );
+        assert!((super::default_pr_poll_interval(WaitPrState::Green) - 30.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn an_absent_pull_request_is_told_apart_from_a_failed_read() {
+        assert!(super::pull_request_absent(
+            "pull request failed: GraphQL: Could not resolve to a PullRequest with the number of 9."
+        ));
+        assert!(super::pull_request_absent(
+            "pull request failed: HTTP 404: Not Found"
+        ));
+        assert!(!super::pull_request_absent(
+            "pull request failed: HTTP 502 Bad Gateway"
+        ));
+        assert!(!super::pull_request_absent(
+            "repository settings failed: HTTP 404"
+        ));
     }
 
     #[test]

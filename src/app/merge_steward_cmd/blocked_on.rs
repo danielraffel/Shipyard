@@ -50,6 +50,10 @@ pub(super) struct Stall {
     /// The HOLD behind a `held` token.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub held_by: Option<HeldBy>,
+    /// Who moves the pull request next, and what they do
+    /// ([`super::next_action`]). Filled by [`annotate`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_action: Option<super::next_action::NextAction>,
 }
 
 /// The HOLD behind a `held` token.
@@ -537,6 +541,7 @@ fn approval_blocked(blocker: &ApprovalBlocker, green_since: Option<String>) -> (
             since,
             blocked_detail: detail,
             held_by,
+            next_action: None,
         },
         hint,
     )
@@ -665,6 +670,7 @@ fn dated(
             since,
             blocked_detail: detail,
             held_by: None,
+            next_action: None,
         },
         hint,
     )
@@ -743,6 +749,7 @@ pub(super) fn annotate(
             .find(|pr| pr.fact.number == report.number)
         else {
             "unclassified".clone_into(&mut report.blocked.blocked_on);
+            report.blocked.next_action = Some(super::next_action::NextAction::unclassified());
             continue;
         };
         if read_gate
@@ -787,6 +794,16 @@ pub(super) fn annotate(
             policy,
         );
         fill_since(actions, &observation.repo, pr, &hint, &mut blocked);
+        blocked.next_action = Some(super::next_action::for_row(
+            &super::next_action::RowContext {
+                repo: &observation.repo,
+                base: &observation.base,
+                pr: &pr.fact,
+                policy,
+                error: report.error.as_deref(),
+            },
+            &blocked,
+        ));
         report.blocked = blocked;
     }
 }

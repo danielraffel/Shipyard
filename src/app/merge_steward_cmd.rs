@@ -1427,6 +1427,7 @@ mod carried_commits;
 mod exact_head_merge;
 mod ledger;
 mod native_arm;
+mod next_action;
 mod observation;
 mod pr_mutations;
 pub(super) mod queue_drain;
@@ -1474,6 +1475,194 @@ pub(super) fn observe_next_steps(
         Ok(policy) => crate::pr_next_steps::NextSteps::from_policy(&policy),
         Err(error) => crate::pr_next_steps::NextSteps::unavailable(error),
     }
+}
+
+/// One pull request's live answer for `shipyard wait pr <n> --state
+/// actionable`: the `blocked_on` row a dry-run admission pass gives that pull
+/// request alone, with its next action, as one JSON object. A merged or
+/// closed pull request, one based on a branch other than the repository
+/// default, and one whose diff against its base is empty are answered before
+/// any admission read. Read-only: the pass is a dry run and the steward
+/// ledger is only read.
+pub(super) fn pr_next_action_snapshot(
+    actions: &GitHubActions,
+    state_dir: &Path,
+    repo: &str,
+    number: u64,
+) -> Result<Value, String> {
+    let row = gh_json(
+        actions,
+        &[
+            "pr".to_owned(),
+            "view".to_owned(),
+            number.to_string(),
+            "--repo".to_owned(),
+            repo.to_owned(),
+            "--json".to_owned(),
+            observation::PR_VIEW_FIELDS.to_owned(),
+        ],
+        "pull request",
+    )?;
+    let settings = gh_json(
+        actions,
+        &["api".to_owned(), format!("repos/{repo}")],
+        "repository settings",
+    )?;
+    let repo = observation::canonical_repo_name(&settings)?;
+    let default_branch = settings
+        .get("default_branch")
+        .and_then(Value::as_str)
+        .filter(|branch| !branch.is_empty())
+        .unwrap_or("main")
+        .to_owned();
+    let text = |key: &str| {
+        row.get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let state = text("state").to_ascii_uppercase();
+    let base = text("baseRefName");
+    let mut snapshot = json!({
+        "repo": repo,
+        "number": number,
+        "state": state,
+        "merged": state == "MERGED",
+        "headRefOid": text("headRefOid"),
+        "headRefName": text("headRefName"),
+        "baseRefName": base,
+        "default_branch": default_branch,
+    });
+    let pre_admission = match state.as_str() {
+        "MERGED" => Some((
+            "merged".to_owned(),
+            next_action::NextAction::merged(
+                &text("headRefName"),
+                &base,
+                row.get("mergedAt").and_then(Value::as_str),
+            ),
+        )),
+        "CLOSED" => Some(("closed".to_owned(), next_action::NextAction::closed())),
+        _ if !base.eq_ignore_ascii_case(&default_branch) => {
+            let parent = open_pull_request_for_head(actions, &repo, &base);
+            Some((
+                format!("stacked_on:{base}"),
+                next_action::NextAction::stacked(&base, &default_branch, parent),
+            ))
+        }
+        _ if row.get("changedFiles").and_then(Value::as_u64) == Some(0) => Some((
+            "empty_diff".to_owned(),
+            next_action::NextAction::empty_diff(&base),
+        )),
+        _ => None,
+    };
+    if let Some((blocked_on, next)) = pre_admission {
+        snapshot["blocked_on"] = Value::from(blocked_on);
+        snapshot["actionable"] = Value::from(next.actionable());
+        snapshot["next_action"] = serde_json::to_value(next).unwrap_or(Value::Null);
+        return Ok(snapshot);
+    }
+    let observation = observation::observe_pull_request(actions, &settings, &base, &row)?;
+    let (pr, merge_state, required_contexts, errors) =
+        single_pr_dry_run(actions, state_dir, &observation, number)?;
+    let actionable = pr
+        .blocked
+        .next_action
+        .as_ref()
+        .is_some_and(next_action::NextAction::actionable);
+    let value = serde_json::to_value(&pr).map_err(|error| error.to_string())?;
+    if let (Some(target), Some(fields)) = (snapshot.as_object_mut(), value.as_object()) {
+        for (key, field) in fields {
+            target.insert(key.clone(), field.clone());
+        }
+        target.insert("actionable".to_owned(), Value::from(actionable));
+        target.insert("merge_state".to_owned(), Value::from(merge_state));
+        target.insert(
+            "required_contexts".to_owned(),
+            Value::from(required_contexts),
+        );
+        target.insert("pass_errors".to_owned(), Value::from(errors));
+    }
+    Ok(snapshot)
+}
+
+/// The dry-run admission pass over a one-row observation: the row for
+/// `number`, its merge state, the base's required contexts, and the pass's
+/// errors. The same `apply_repo_plan` a scheduled pass runs, with every
+/// mutation, coalescing, preemption and backstop plan off.
+fn single_pr_dry_run(
+    actions: &GitHubActions,
+    state_dir: &Path,
+    observation: &RepoObservation,
+    number: u64,
+) -> Result<(PrReport, String, Vec<String>, Vec<String>), String> {
+    let ledger_path = state_dir.join("merge-steward.json");
+    let mut ledger = load_ledger(&ledger_path).map_err(|error| error.message().to_owned())?;
+    let args = StewardCommandArgs {
+        repos: vec![observation.repo.clone()],
+        base: observation.base.clone(),
+        opt_out_label: "shipyard:no-auto-merge".to_owned(),
+        provenance_blocking_labels: default_provenance_blocking_labels(),
+        managed_label: MANAGED_LABEL.to_owned(),
+        handoff_context: HANDOFF_CONTEXT.to_owned(),
+        max_transient_reruns: 1,
+        recover_hosted_setup_eviction_priority: false,
+        coalesce: false,
+        preempt_capacity: false,
+        max_preemptions_per_head: 1,
+        arm_unqueued: false,
+        approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
+        wake_owner: false,
+        unapproved_dequeue: DequeueMode::Report,
+        apply: false,
+        ledger: None,
+    };
+    let (report, _, _) = apply_repo_plan(
+        actions,
+        &args,
+        observation,
+        &ledger_path,
+        &mut ledger,
+        0,
+        None,
+    );
+    let pr = report
+        .prs
+        .into_iter()
+        .find(|pr| pr.number == number)
+        .ok_or_else(|| format!("the admission pass produced no row for #{number}"))?;
+    let merge_state = observation
+        .prs
+        .first()
+        .map(|observed| observed.fact.merge_state.clone())
+        .unwrap_or_default();
+    Ok((pr, merge_state, report.required_contexts, report.errors))
+}
+
+/// The open pull request whose head is `branch`, when exactly one exists.
+fn open_pull_request_for_head(actions: &GitHubActions, repo: &str, branch: &str) -> Option<u64> {
+    gh_json(
+        actions,
+        &[
+            "pr".to_owned(),
+            "list".to_owned(),
+            "--repo".to_owned(),
+            repo.to_owned(),
+            "--head".to_owned(),
+            branch.to_owned(),
+            "--state".to_owned(),
+            "open".to_owned(),
+            "--json".to_owned(),
+            "number".to_owned(),
+            "--limit".to_owned(),
+            "2".to_owned(),
+        ],
+        "parent pull request",
+    )
+    .ok()?
+    .as_array()
+    .filter(|rows| rows.len() == 1)
+    .and_then(|rows| rows[0].get("number").and_then(Value::as_u64))
 }
 
 use observation::{

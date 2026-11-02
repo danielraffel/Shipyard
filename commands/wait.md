@@ -36,11 +36,16 @@ asset uploads.
 shipyard wait release v0.23.0 --timeout 900 --json
 ```
 
-### `shipyard wait pr <N> --state {green|queued|red|ejected|merged|closed}`
+### `shipyard wait pr <N> --state {green|queued|red|ejected|merged|closed|actionable}`
 
 Waits for PR `<N>` to reach the given state.
 
 ```bash
+# The merge steward's own answer says you must act (HOLD, failed required
+# check, conflict, empty diff) or may stop (owner decision, merged, closed).
+# Exit 1 on timeout: nothing is yours to do yet. Follow observed.next_action.
+shipyard wait pr 151 --state actionable --timeout 1800 --json
+
 # All required checks on current HEAD pass.
 shipyard wait pr 151 --state green --timeout 1800 --json
 

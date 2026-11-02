@@ -4153,15 +4153,23 @@ pub(super) enum WaitCommand {
     Pr {
         /// Pull request number.
         pr_number: u64,
-        /// What PR state to wait for.
+        /// What PR state to wait for. `actionable` answers from the merge
+        /// steward's own classification of the live head (`blocked_on`) and
+        /// returns once the caller must act (a HOLD, a failed required check,
+        /// a conflict, an empty diff) or may stop (owner decision, merged,
+        /// closed); a reviewer, CI or the steward being the next mover is a
+        /// wait. Exit 0 with `next_action` in the output; exit 1 on timeout
+        /// means nothing is yours to do yet.
         #[arg(long, value_enum)]
         state: WaitPrState,
         /// Give up after N seconds.
         #[arg(long, default_value_t = 1800.0)]
         timeout: f64,
-        /// Authoritative snapshot reconciliation cadence.
-        #[arg(long = "poll-interval", default_value_t = 30.0)]
-        poll_interval: f64,
+        /// Authoritative snapshot reconciliation cadence. Defaults to 30
+        /// seconds, or 120 for `--state actionable`, whose snapshot is a
+        /// full admission read.
+        #[arg(long = "poll-interval")]
+        poll_interval: Option<f64>,
         /// Fail with exit 6 rather than polling after the first snapshot miss.
         #[arg(long)]
         no_fallback: bool,
@@ -4219,6 +4227,7 @@ pub(super) enum WaitPrState {
     Ejected,
     Merged,
     Closed,
+    Actionable,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -4302,6 +4311,7 @@ impl WaitPrState {
             Self::Ejected => "ejected",
             Self::Merged => "merged",
             Self::Closed => "closed",
+            Self::Actionable => "actionable",
         }
     }
 }
@@ -4402,6 +4412,33 @@ mod tests {
                 && (timeout - 42.0).abs() < f64::EPSILON
                 && (poll_interval - 0.25).abs() < f64::EPSILON
         ));
+    }
+
+    #[test]
+    fn wait_pr_accepts_actionable_and_leaves_the_poll_interval_to_the_state() {
+        let cli = Cli::try_parse_from([
+            "shipyard",
+            "wait",
+            "pr",
+            "11364",
+            "--state",
+            "actionable",
+            "--timeout",
+            "900",
+        ])
+        .expect("wait pr");
+        assert!(matches!(
+            cli.command,
+            Command::Wait {
+                command: WaitCommand::Pr {
+                    pr_number: 11364,
+                    state: super::WaitPrState::Actionable,
+                    poll_interval: None,
+                    ..
+                }
+            }
+        ));
+        assert_eq!(super::WaitPrState::Actionable.as_str(), "actionable");
     }
 
     #[test]

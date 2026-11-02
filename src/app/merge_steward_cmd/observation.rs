@@ -98,6 +98,49 @@ pub(super) fn observe_repo(
     })
 }
 
+/// Fields `pr_next_action_snapshot` reads for one pull request: the census
+/// fields plus the state, diff size and merge time only a single-PR read
+/// needs.
+pub(super) const PR_VIEW_FIELDS: &str = "id,number,state,isDraft,baseRefName,headRefOid,headRefName,mergeStateStatus,autoMergeRequest,labels,author,changedFiles,mergedAt";
+
+/// One open pull request in the shape [`observe_repo`] gives a repository:
+/// the same policy and queue reads, one census row (`row`, a `gh pr view`
+/// answer with [`PR_VIEW_FIELDS`]), and no run census, which only the
+/// coalescing and preemption plans read.
+pub(super) fn observe_pull_request(
+    actions: &GitHubActions,
+    settings: &Value,
+    base: &str,
+    row: &Value,
+) -> Result<RepoObservation, String> {
+    let repo = canonical_repo_name(settings)?;
+    let allow_auto_merge = settings
+        .get("allow_auto_merge")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let evaluated_rules = evaluated_branch_rules(actions, &repo, base)?;
+    let required_checks =
+        required_checks_with_evaluated_rules(actions, &repo, base, &evaluated_rules)?;
+    let (merge_queue, queue_positions, merge_group_heads, merge_group_enqueued_at) =
+        merge_queue_snapshot(actions, &repo, base)?;
+    let mut prs = vec![parse_pr(row, &queue_positions)?];
+    hydrate_census_check_identities(actions, &repo, &required_checks, &mut prs)?;
+    let capacity_preemption_policy = CapacityPreemptionPolicy::for_repository(&repo);
+    Ok(RepoObservation {
+        repo,
+        base: base.to_owned(),
+        allow_auto_merge,
+        merge_queue,
+        required_checks,
+        prs,
+        runs: Vec::new(),
+        merge_group_heads,
+        merge_group_enqueued_at,
+        capacity_preemption_policy,
+        preemption_error: None,
+    })
+}
+
 /// The repository facts that decide how a head is admitted, without the
 /// pull-request and run census `observe_repo` also loads.
 pub(super) fn admission_policy(

@@ -215,6 +215,8 @@ someone else owns. Something like this is enough:
 - The Shipyard steward admits approved heads on its own every few minutes.
 - On a HOLD: fix what it names with a test, merge main (never rebase), push once.
 - A HOLD sticks to its head: fix it and push; don't ask for a re-approval of the same head.
+- Before declaring yourself blocked, run `shipyard wait pr <n> --state actionable --timeout 1800 --json`
+  and do what `next_action` says. You may stop only when it says `stop: true`.
 - Platform-only failures you can't fix now: open an issue labelled
   `PARKED/<platform>` with evidence and a next step; don't block the merge.
 - Use the smallest model that does the job; escalate only on a named blocker.
@@ -294,6 +296,27 @@ to refuse the head, so naming them costs nothing extra. Only an undated state
 (a conflict, a draft, a check that never ran) reads the head commit's time,
 and a skip label reads its `labeled` event; a failed read leaves `since` null
 and never fails the pass.
+
+## What to do next, for one pull request
+
+`shipyard wait pr <n> --state actionable --timeout <seconds> [--json]` runs the
+same dry-run classification as a steward pass over that one pull request and
+returns the moment the answer is yours: exit 0 with `blocked_on` and
+`next_action` (`actor`, `action`, `stop`), or exit 1 on timeout, which means
+nothing is yours to do yet. A merged, closed, stacked (base is not the default
+branch) or empty-diff pull request is answered before any admission read.
+Every steward pass row carries the same `next_action`.
+
+| `actor` | Meaning |
+|---|---|
+| `author` | Act now: the action names the HOLD (with its link), the failed required check, the conflict, or the dropped change. |
+| `owner` | `stop: true`: `owner-decision`, `superseded`, `PARKED/*`, or no automatic admission. Report and stop. |
+| `nobody` | `stop: true`: merged or closed. A merged answer says to retarget stacked children to the base. |
+| `reviewer`, `ci`, `steward`, `operator` | Nothing to do; keep waiting. Includes green-with-no-verdict, checks running, queued, and BEHIND on a merge-queue base (never merge main for that). |
+
+Reads are a full admission pass, so the default `--poll-interval` is 120
+seconds for this state. The ledger used for transient-rerun budgets is the
+local one; on the steward host it is the steward's own.
 
 ## Things that bite
 

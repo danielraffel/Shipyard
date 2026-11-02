@@ -67,6 +67,14 @@ pub(super) fn render_report<W: Write>(
                     .map_or_else(String::new, |value| format!(" ERROR={value}"))
             )
             .map_err(|error| io_failure(&error))?;
+            if let Some(next) = &pr.blocked.next_action {
+                writeln!(
+                    stdout,
+                    "    blocked_on={} next({:?}): {}",
+                    pr.blocked.blocked_on, next.actor, next.action
+                )
+                .map_err(|error| io_failure(&error))?;
+            }
         }
         for cancellation in &repo.cancellations {
             writeln!(
