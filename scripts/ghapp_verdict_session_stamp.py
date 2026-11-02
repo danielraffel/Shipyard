@@ -8,8 +8,8 @@ one more line just above that marker::
 
     <!-- session: <host>/<session>[ agent: <id>] -->
 
-``<session>`` is ``CLAUDE_CODE_SESSION_ID``, else ``CODEX_COMPANION_SESSION_ID``,
-else ``unattributed``; ``agent`` is ``SHIPYARD_AGENT_ID`` when set. The marker
+``<session>`` is ``SHIPYARD_STAMP_SESSION_ID``, else ``CLAUDE_CODE_SESSION_ID``,
+else ``CODEX_COMPANION_SESSION_ID``, else ``unattributed``; ``agent`` is ``SHIPYARD_AGENT_ID`` when set. The marker
 stays the last line, so every verdict reader is unchanged. ``queue-arm-guard``
 refuses an arm whose agent id equals the deciding approval's, and only warns
 when just the session matches (every agent of one team shares it).
@@ -72,7 +72,12 @@ def deadline_seconds() -> int:
     except ValueError:
         return DEADLINE_SECONDS
     return max(1, min(DEADLINE_SECONDS, wait - 1))
-SESSION_ENVS = ("CLAUDE_CODE_SESSION_ID", "CODEX_COMPANION_SESSION_ID")
+# A dedicated id first: Claude Code sets CLAUDE_CODE_SESSION_ID itself inside its
+# tool subprocesses, so a scheduled reviewer run (fleet-pass) cannot override
+# it; it exports SHIPYARD_STAMP_SESSION_ID instead, the per-run id a base lists
+# in `[auto_merge] reviewer_stamp_sessions`.
+SESSION_ENVS = ("SHIPYARD_STAMP_SESSION_ID", "CLAUDE_CODE_SESSION_ID",
+                "CODEX_COMPANION_SESSION_ID")
 AGENT_ENV = "SHIPYARD_AGENT_ID"
 # Same pattern as queue-arm-guard's _MARKER and src/head_approval.rs marker_verdict.
 # Used only when queue-arm-guard's own marker_verdict cannot be loaded.

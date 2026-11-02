@@ -355,7 +355,10 @@ App APPROVE carrying any other stamp-like text (`<!--`, whitespace,
 "non-canonical", never read as stamped. A body file
 that is not a regular file (a FIFO) cannot be checked and is refused; an
 `api` output filter (`--jq`, `--template`) is never sent and is not checked.
-A request without stamp text posts as before. The session is `CLAUDE_CODE_SESSION_ID`, else
+A request without stamp text posts as before. The session is
+`SHIPYARD_STAMP_SESSION_ID` (a scheduled reviewer run exports its per-run id
+there, since Claude Code sets `CLAUDE_CODE_SESSION_ID` itself in its tool
+subprocesses), else `CLAUDE_CODE_SESSION_ID`, else
 `CODEX_COMPANION_SESSION_ID`, else `unattributed`; `agent: <id>` appears only
 when `SHIPYARD_AGENT_ID` is set. The marker stays the last line, so every
 verdict reader is unchanged. The arm guard, and `head_approval` for Shipyard's
