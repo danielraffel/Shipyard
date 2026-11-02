@@ -53,6 +53,18 @@ to stamped host and agent identities with
 refuses a missing or mismatched host/agent stamp; existing signer and reviewer
 login settings remain unchanged until this map is configured.
 
+A `reviewer:` line and an `agent:` id are text any lane can write; a reviewer
+run's session id is minted for that run. So a base can list the sessions that
+may approve, as globs on the stamp's `<session>`:
+`[auto_merge] reviewer_stamp_sessions = ["fleet-pass-reviewer-*"]`. With the
+list set, an App APPROVE counts only when its stamped session matches one
+(`unlisted_stamp_session`); a HOLD from any session still counts. pulp#11407:
+the authoring session approved its own head, signed `reviewer: pulp-review`
+under its own session stamp, and the status went green; with this list only
+the scheduled reviewer run's APPROVE
+(`fleet-pass-reviewer-Daniels-Mac-Studio-m3-20261102T033922Z-92868`) counts.
+Without the list the rule is off. The steward's own gate reads the same key.
+
 An App APPROVE must also carry the `<!-- session: <host>/<session> -->` stamp
 `ghapp` adds, and not an `unattributed` one ("it has no `ghapp` session
 stamp"). Every fleet agent posts as the App, and a body posted around the
