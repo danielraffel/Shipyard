@@ -27,6 +27,24 @@ pub(super) fn apply_repo_plan(
     remaining_preemptions: usize,
     mutation_control: Option<&MutationControl>,
 ) -> (RepoReport, bool, usize) {
+    // Settle earlier uncertain admissions first, so a pull request whose
+    // enqueue GitHub plainly took or refused is not held behind it.
+    let (uncertain_mutations, uncertain_reconcile_error) = match mutation_control {
+        Some(control) if args.apply => match super::mutation_outcome::reconcile(
+            actions,
+            control,
+            &observation.repo,
+            &observation.base,
+            ledger,
+        ) {
+            Ok(results) => (results, None),
+            Err(error) => (
+                Vec::new(),
+                Some(format!("uncertain mutation reconciliation: {error}")),
+            ),
+        },
+        _ => (Vec::new(), None),
+    };
     let wedge_reconcile_error = if args.apply && args.coalesce {
         super::stale_pr_wedge::reconcile_receipts(
             actions,
@@ -131,7 +149,15 @@ pub(super) fn apply_repo_plan(
         || recovery_witness_error.is_some()
         || terminal_handoff_reconcile_error.is_some()
         || wedge_reconcile_error.is_some()
-        || wedge_observation_error.is_some();
+        || wedge_observation_error.is_some()
+        // Another process holding the control lock is mid-mutation, not a
+        // fault: the next pass reconciles.
+        || uncertain_reconcile_error
+            .as_deref()
+            .is_some_and(|error| !error.contains("another Shipyard process is performing"))
+        || uncertain_mutations
+            .iter()
+            .any(|result| result.outcome == "uncertain");
     let mut planned_cancellations = Vec::new();
     if args.coalesce {
         let current_heads = current_pull_request_heads(&observation.prs);
@@ -216,6 +242,7 @@ pub(super) fn apply_repo_plan(
     (
         RepoReport {
             rollup_reconciliation: Vec::new(),
+            uncertain_mutations,
             repo: observation.repo.clone(),
             base: args.base.clone(),
             allow_auto_merge: observation.allow_auto_merge,
@@ -242,6 +269,7 @@ pub(super) fn apply_repo_plan(
                 .filter(|_| args.preempt_capacity)
                 .cloned()
                 .chain(recovery_witness_error)
+                .chain(uncertain_reconcile_error)
                 .chain(terminal_handoff_reconcile_error)
                 .chain(wedge_reconcile_error)
                 .chain(wedge_observation_error)

@@ -282,6 +282,9 @@ not listed as blocked.
 | `carries_unapproved_commits:#Q` | Approved and green, but carries commits of open pull request #Q, whose head is not approved; `blocked_detail` names the commits | Q's reviewer, or the author: drop Q's commits |
 | `carried_commits_over_cap:#N`, `carried_commits_unreadable` | Whether the head carries unapproved commits could not be proven (more than 250 commits, or a failed read) | author, or next pass |
 | `revalidating` | The head or queue changed during the pass | next pass |
+| `code_owner_review` | GitHub refused the enqueue: a code-owner review is outstanding | code owner |
+| `enqueue_refused:<message>` | GitHub definitively refused the enqueue for another reason, quoted | author or owner |
+| `uncertain_mutation` | An earlier enqueue of this pull request is still uncertain because GitHub's state could not be read; only this pull request waits | next pass, or operator |
 | `steward_error` | Admission failed; see `error` | operator |
 | `admission_pending` | Admission returned an outcome with no token of its own; see `blocked_detail` | next pass |
 | `queued` | In the merge queue | queue |
@@ -317,6 +320,22 @@ These came from running it for real:
   not on the head, an unplaceable one, or a second ejection of the same head
   (counted from GitHub's own removal events) stays `ejected_same_head:<cause>`
   for repair.
+- **A refused enqueue is not an uncertain one.** When GitHub answers an
+  enqueue with a typed refusal (for example "Waiting on code owner review"),
+  the steward records it `rejected` with GitHub's message and reports its own
+  token. Only a timeout or transport failure is recorded as uncertain.
+- **Uncertain enqueues settle themselves.** Each pass re-reads any pull
+  request with an uncertain enqueue. Merged, or queued at the recorded head,
+  resolves it `accepted`; no queue entry, no auto-merge and not merged
+  resolves it `rejected`. Each settlement is written to the mutations ledger
+  with `resolver: steward-auto-reconcile`. An unreadable state stays uncertain,
+  marks the pass unhealthy, and holds only that pull request: other admissions
+  and `--arm-unqueued` carry on.
+- **Advisory checks do not hold the backstop.** `--arm-unqueued` judges green
+  by the base's required checks, like admission. A `BLOCKED` pull request
+  whose required checks all passed is still armed when the only red is a
+  cancelled, skipped or neutral advisory check. A failed or missing required
+  check still stops it.
 - **Rebasing loses approved work.** A rebase once silently dropped hardening
   that a reviewer had already approved. Merge the base branch in instead.
 - **One burst of merges can queue a release per merge.** Give the release

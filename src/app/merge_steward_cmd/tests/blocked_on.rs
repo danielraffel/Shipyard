@@ -247,6 +247,12 @@ fn admission_outcomes_are_named() {
     );
     let (ready, _) = row(&pr, None, GateRead::Admits);
     assert_eq!(ready.blocked_on, "ready");
+    // A definitive GitHub refusal names itself, never `steward_error`.
+    assert_eq!(token(&pr, Some("code_owner_review")), "code_owner_review");
+    assert_eq!(
+        token(&pr, Some("enqueue_refused:Base branch was modified")),
+        "enqueue_refused:Base branch was modified"
+    );
 }
 
 #[test]

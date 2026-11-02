@@ -4388,7 +4388,14 @@ base it reports `not applicable`: an armed request there survives a later
 push). Under `--apply` it takes the central HOLD,
 `mutation_machine` authority and control lock before arming (a HOLD is reported,
 not a failure), and each `--repo` mints its own token, so it runs from launchd's
-`$HOME`. See
+`$HOME`. It counts only base-required checks as green, so a cancelled advisory
+check does not hold a `BLOCKED` pull request whose required checks passed. An
+uncertain mutation holds only its own pull request. Each `--apply` pass first
+re-reads every uncertain enqueue and resolves it in the mutations ledger:
+merged or queued at the recorded head is `accepted`, nothing on GitHub is
+`rejected`, and an unreadable state stays uncertain and marks the pass
+unhealthy. A typed GitHub refusal of an enqueue is recorded `rejected` with its
+message and reported as `code_owner_review` or `enqueue_refused:<message>`. See
 [references/merge-steward.md](references/merge-steward.md).
 
 Branch refreshes are the third guarded mutation, and the only one whose

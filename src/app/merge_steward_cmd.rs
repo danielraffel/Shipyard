@@ -142,6 +142,10 @@ struct RepoReport {
     /// takes rollups.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     rollup_reconciliation: Vec<String>,
+    /// Uncertain merge-queue admissions this pass settled from GitHub, or
+    /// left uncertain with the reason ([`mutation_outcome::reconcile`]).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    uncertain_mutations: Vec<crate::merge_queue_control::UncertainReconciliation>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1234,6 +1238,7 @@ fn unreadable_repo_report(
 ) -> RepoReport {
     RepoReport {
         rollup_reconciliation: Vec::new(),
+        uncertain_mutations: Vec::new(),
         repo: repo.to_owned(),
         base: base.to_owned(),
         allow_auto_merge: false,
@@ -1307,6 +1312,7 @@ fn append_unmatched_recovery_errors(
             .map_or_else(|| default_base.to_owned(), |pending| pending.base.clone());
         reports.push(RepoReport {
             rollup_reconciliation: Vec::new(),
+            uncertain_mutations: Vec::new(),
             repo: repo.clone(),
             base,
             allow_auto_merge: false,
@@ -1340,6 +1346,7 @@ fn persist_final_ledger(
     } else {
         reports.push(RepoReport {
             rollup_reconciliation: Vec::new(),
+            uncertain_mutations: Vec::new(),
             repo: "steward".to_owned(),
             base: base.to_owned(),
             allow_auto_merge: false,
@@ -1426,6 +1433,7 @@ mod capacity_cancellation;
 mod carried_commits;
 mod exact_head_merge;
 mod ledger;
+mod mutation_outcome;
 mod native_arm;
 mod observation;
 mod pr_mutations;
