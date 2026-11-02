@@ -620,9 +620,19 @@ pub fn has_successful_status(pr: &StewardPullRequest, context: &str) -> bool {
 /// `false`.
 #[must_use]
 pub fn required_checks_all_succeeded(pr: &StewardPullRequest, policy: &StewardPolicy) -> bool {
-    !policy.required_checks.is_empty()
-        && selected_checks(pr, policy).iter().all(|(_, check)| {
-            check.is_some_and(|check| {
+    required_checks_green(&pr.checks, &policy.required_checks)
+}
+
+/// [`required_checks_all_succeeded`] over a bare rule set: every required rule
+/// is satisfied on `checks` by a `SUCCESS`, `NEUTRAL` or `SKIPPED` conclusion,
+/// selected exactly as admission selects it. Checks no rule names are never
+/// consulted, so a cancelled advisory check cannot make a head red. An empty
+/// rule set is never green.
+#[must_use]
+pub fn required_checks_green(checks: &[StewardCheck], required: &[RequiredCheck]) -> bool {
+    !required.is_empty()
+        && required.iter().all(|rule| {
+            selected_required_check(checks, rule).is_some_and(|check| {
                 check.status.eq_ignore_ascii_case("COMPLETED")
                     && matches!(
                         check

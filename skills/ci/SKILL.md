@@ -464,7 +464,13 @@ requests the steward itself declines to own, so it cannot contend with the
 enqueue path, and it honours the central HOLD before arming. It reads the base's
 reviewer policy strictly (an absent `.shipyard/config.toml` refuses the arm),
 matching the steward's sweep that withdraws arms and queue entries on
-unapproved heads. See the shipyard skill's
+unapproved heads. It judges green by the base's required checks, so a
+cancelled advisory check does not hold an otherwise green `BLOCKED` pull
+request. An uncertain merge-queue mutation holds only its own pull request;
+the steward settles it each pass from GitHub (merged or queued: accepted;
+nothing there: rejected). A typed GitHub refusal of an enqueue is recorded
+`rejected` and shows as `code_owner_review` or `enqueue_refused:<message>`,
+not `steward_error`. See the shipyard skill's
 [merge-steward reference](../shipyard/references/merge-steward.md).
 
 ## The unattended carrier: `runner carrier`

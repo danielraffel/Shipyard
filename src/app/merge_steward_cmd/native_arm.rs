@@ -38,6 +38,8 @@
 //! ejected on this exact head — and re-arming the latter re-enqueues it, which
 //! under `ALLGREEN` grouping fails every batch-mate with it.
 
+use std::collections::BTreeSet;
+
 use serde::Serialize;
 
 use super::{
@@ -48,7 +50,9 @@ use crate::auto_arm::{
     decide_from_queue_state_with_environment, first_graphql_error, is_arm_guard_refusal,
     preselect_backstop_candidate,
 };
-use crate::merge_queue_control::{MergeQueueMutationPreflight, preflight_mutation_authority};
+use crate::merge_queue_control::{
+    MergeQueueMutationPreflight, preflight_mutation_authority_per_pr,
+};
 use crate::pr_queue_state::{PR_QUEUE_STATE_QUERY, explain_pr_queue_state};
 
 /// What the backstop did for this repository on this pass.
@@ -113,17 +117,44 @@ pub(super) struct ArmAuthorityRefusal {
     pub(super) failed: bool,
 }
 
+/// What the backstop holds while it arms: the control lock, plus the pull
+/// requests it must leave alone.
+pub(super) trait ArmAuthority {
+    /// Whether `pr` has an unresolved merge-queue mutation of its own.
+    fn uncertain(&self, pr: u64) -> bool;
+}
+
+impl ArmAuthority for () {
+    fn uncertain(&self, _pr: u64) -> bool {
+        false
+    }
+}
+
+/// [`ArmAuthority`] from the real control lock.
+#[derive(Debug)]
+pub(super) struct ArmingAuthority {
+    _preflight: MergeQueueMutationPreflight,
+    uncertain_prs: BTreeSet<u64>,
+}
+
+impl ArmAuthority for ArmingAuthority {
+    fn uncertain(&self, pr: u64) -> bool {
+        self.uncertain_prs.contains(&pr)
+    }
+}
+
 /// Take the same central HOLD, machine authority and control lock every other
 /// merge-queue mutation takes, and keep it for the arming that follows.
 ///
-/// Arming changes what the queue will admit, so an operator's HOLD, a host
-/// other than `[merge_queue].mutation_machine`, or an uncertain earlier
-/// mutation on this repository and base all stop it.
+/// Arming changes what the queue will admit, so an operator's HOLD or a host
+/// other than `[merge_queue].mutation_machine` stops it. An uncertain earlier
+/// mutation stops only its own pull request: every arm is bound to one exact
+/// head, so it cannot be consumed by another pull request's ambiguity.
 pub(super) fn arming_authority(
     control: &MutationControl,
     repo: &str,
     base: &str,
-) -> Result<MergeQueueMutationPreflight, ArmAuthorityRefusal> {
+) -> Result<ArmingAuthority, ArmAuthorityRefusal> {
     match crate::merge_queue_control::hold_status(&control.state_dir) {
         Ok(Some(_)) => {
             return Err(ArmAuthorityRefusal {
@@ -145,18 +176,15 @@ pub(super) fn arming_authority(
             });
         }
     }
-    preflight_mutation_authority(
-        &control.state_dir,
-        &control.cwd,
-        control.mode,
-        &control.global_dir,
-        repo,
-        base,
-    )
-    .map_err(|reason| ArmAuthorityRefusal {
-        reason: format!("declined: no merge-queue mutation authority: {reason}"),
-        failed: true,
-    })
+    preflight_mutation_authority_per_pr(&control.state_dir, &control.global_dir, repo, base)
+        .map(|(preflight, uncertain_prs)| ArmingAuthority {
+            _preflight: preflight,
+            uncertain_prs,
+        })
+        .map_err(|reason| ArmAuthorityRefusal {
+            reason: format!("declined: no merge-queue mutation authority: {reason}"),
+            failed: true,
+        })
 }
 
 /// Run the backstop over one repository's observation.
@@ -164,7 +192,7 @@ pub(super) fn arming_authority(
 /// Returns the status plus whether anything genuinely failed. A refusal is not
 /// a failure: the pass reports it and moves on. With `apply`, `authorize` runs
 /// once there is a candidate, and what it returns is held until the pass ends.
-pub(super) fn apply_native_arm_backstop<A>(
+pub(super) fn apply_native_arm_backstop<A: ArmAuthority>(
     actions: &GitHubActions,
     observation: &RepoObservation,
     pr_reports: &[PrReport],
@@ -202,7 +230,7 @@ pub(super) fn apply_native_arm_backstop<A>(
         );
     }
 
-    let candidates = select_candidates(observation, pr_reports, opt_out_label);
+    let candidates = select_candidates(actions, observation, pr_reports, opt_out_label);
     if candidates.is_empty() {
         return (
             NativeArmRepoStatus {
@@ -218,7 +246,7 @@ pub(super) fn apply_native_arm_backstop<A>(
         );
     }
 
-    let _authority = if apply {
+    let authority = if apply {
         match authorize() {
             Ok(authority) => Some(authority),
             Err(refusal) => {
@@ -237,7 +265,14 @@ pub(super) fn apply_native_arm_backstop<A>(
     let mut unhealthy = false;
     let mut results = Vec::new();
     let mut carried = super::carried_commits::PassCache::default();
-    for pr in candidates {
+    for pr in &candidates {
+        if authority
+            .as_ref()
+            .is_some_and(|authority| authority.uncertain(pr.fact.number))
+        {
+            results.push(held_by_uncertainty(pr));
+            continue;
+        }
         let result = consider_candidate(
             actions,
             &observation.repo,
@@ -266,6 +301,22 @@ pub(super) fn apply_native_arm_backstop<A>(
     )
 }
 
+/// The result for a pull request with an unresolved merge-queue mutation of
+/// its own: it waits, and nothing else does.
+fn held_by_uncertainty(pr: &ObservedPr) -> NativeArmResult {
+    NativeArmResult {
+        number: pr.fact.number,
+        head_sha: pr.fact.head_sha.clone(),
+        outcome: "skipped".to_owned(),
+        skip: Some(ArmSkip::Unknown {
+            detail: "an earlier merge-queue mutation for this pull request is still uncertain; \
+                     only this pull request waits for it"
+                .to_owned(),
+        }),
+        error: None,
+    }
+}
+
 /// Give each pull request the backstop refused for carried commits the same
 /// `blocked_on` token the steward's own admission reports.
 pub(super) fn annotate_carried_refusals(status: &NativeArmRepoStatus, reports: &mut [PrReport]) {
@@ -287,11 +338,18 @@ pub(super) fn annotate_carried_refusals(status: &NativeArmRepoStatus, reports: &
 }
 
 /// Pull requests worth a confirming read, from facts already in hand.
-fn select_candidates<'a>(
-    observation: &'a RepoObservation,
+///
+/// GitHub's `mergeStateStatus` decides most rows. A `BLOCKED` row is the one
+/// exception: GitHub also reports it when only an advisory check was
+/// cancelled, skipped or neutral, so it is a candidate when every check the
+/// base requires is green, judged the way admission judges it. Only those rows
+/// cost a check read. A failed or missing required check still excludes it.
+fn select_candidates(
+    actions: &GitHubActions,
+    observation: &RepoObservation,
     pr_reports: &[PrReport],
     opt_out_label: &str,
-) -> Vec<&'a ObservedPr> {
+) -> Vec<ObservedPr> {
     observation
         .prs
         .iter()
@@ -301,11 +359,41 @@ fn select_candidates<'a>(
                 .find(|report| report.number == pr.fact.number)
                 .is_some_and(|report| steward_declines_ownership(&report.decision))
         })
-        .filter(|pr| {
-            preselect_backstop_candidate(&pr.fact, observation.allow_auto_merge, opt_out_label)
-                .arms()
+        .filter_map(|pr| {
+            match preselect_backstop_candidate(
+                &pr.fact,
+                observation.allow_auto_merge,
+                opt_out_label,
+            ) {
+                ArmVerdict::Arm => Some(pr.clone()),
+                ArmVerdict::Skip(ArmSkip::NotArmReady { merge_state })
+                    if merge_state.eq_ignore_ascii_case("BLOCKED") =>
+                {
+                    required_green_despite_blocked(actions, observation, pr)
+                }
+                ArmVerdict::Skip(_) => None,
+            }
         })
         .collect()
+}
+
+/// `pr`, with its head's checks read in full, when every base-required check
+/// on it is green. An unreadable check set is not green.
+fn required_green_despite_blocked(
+    actions: &GitHubActions,
+    observation: &RepoObservation,
+    pr: &ObservedPr,
+) -> Option<ObservedPr> {
+    let mut hydrated = pr.clone();
+    super::observation::hydrate_required_check_identities(
+        actions,
+        &observation.repo,
+        &observation.required_checks,
+        std::slice::from_mut(&mut hydrated),
+    )
+    .ok()?;
+    crate::merge_steward::required_checks_green(&hydrated.fact.checks, &observation.required_checks)
+        .then_some(hydrated)
 }
 
 /// Confirm one candidate authoritatively, then arm it when `apply`.

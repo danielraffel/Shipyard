@@ -380,6 +380,16 @@ fn arm_candidate(facts: &RowFacts<'_>, policy: &StewardPolicy) -> (Stall, SinceH
     }
     if let Some(part) = parts
         .iter()
+        .find(|part| super::mutation_outcome::is_refusal_token(part))
+    {
+        return green(
+            (*part).to_owned(),
+            green_since(),
+            facts.error.map(str::to_owned),
+        );
+    }
+    if let Some(part) = parts
+        .iter()
         .find(|part| **part == "waiting_full_test_tier" || **part == "waiting_enqueue_requirements")
     {
         return green(
@@ -396,6 +406,15 @@ fn arm_candidate(facts: &RowFacts<'_>, policy: &StewardPolicy) -> (Stall, SinceH
         );
     }
     if let Some(error) = facts.error {
+        // The steward re-reads GitHub for an uncertain admission every pass;
+        // one still here is GitHub's state being unreadable for this PR only.
+        if error.contains("is uncertain; reconcile GitHub") {
+            return green(
+                "uncertain_mutation".to_owned(),
+                green_since(),
+                Some(error.to_owned()),
+            );
+        }
         return green(
             "steward_error".to_owned(),
             green_since(),

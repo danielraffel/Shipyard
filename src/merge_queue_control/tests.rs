@@ -474,6 +474,43 @@ fn uncertain_mutation_blocks_retry_until_explicit_resolution() {
 }
 
 #[test]
+fn legacy_admission_resolution_clears_ship_state() {
+    for action in [
+        "runner steward enqueue pull request",
+        "runner steward restore hosted setup eviction priority",
+    ] {
+        let (_temp, cwd, store, mut state) = fixture();
+        let state_root = store.path().parent().expect("state root");
+        std::fs::write(state_root.join("machine-tag"), "studio\n").expect("tag");
+        state.merge_queue_enqueue_started_at = Some(chrono::Utc::now());
+        state.merge_queue_enqueue_succeeded_at = Some(chrono::Utc::now());
+        store.save(&state).expect("state");
+
+        let guard = acquire_guard(&store, &cwd, &state, action).expect("mutation");
+        let correlation_id = guard.correlation_id.clone();
+        drop(guard);
+
+        resolve_uncertainty(
+            state_root,
+            &trusted_global_dir(&cwd),
+            &correlation_id,
+            "rejected",
+            "not present in queue",
+        )
+        .expect("resolution");
+        let resolved = store.get(state.pr).expect("resolved state");
+        assert!(
+            resolved.merge_queue_enqueue_started_at.is_none(),
+            "started timestamp remains for {action}"
+        );
+        assert!(
+            resolved.merge_queue_enqueue_succeeded_at.is_none(),
+            "succeeded timestamp remains for {action}"
+        );
+    }
+}
+
+#[test]
 fn revocation_resolution_allows_live_base_and_preserves_enqueue_proof() {
     let (_temp, cwd, store, mut state) = fixture();
     let state_root = store.path().parent().expect("state root");

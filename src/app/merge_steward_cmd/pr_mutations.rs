@@ -858,6 +858,9 @@ fn enqueue_unstacked_pull_request(
             }
         }
         Ok(raw) => {
+            if let Some(refusal) = super::mutation_outcome::definitive_refusal(&raw) {
+                return record_definitive_refusal(context, &pr, ledger, guard, &refusal);
+            }
             let audit_error = guard
                 .finish("rejected")
                 .err()
@@ -873,6 +876,11 @@ fn enqueue_unstacked_pull_request(
         }
         Err(error) => {
             let message = error.to_string();
+            if !crate::queue_arm_gate::is_refusal(&message)
+                && let Some(refusal) = super::mutation_outcome::definitive_refusal(&message)
+            {
+                return record_definitive_refusal(context, &pr, ledger, guard, &refusal);
+            }
             if crate::queue_arm_gate::is_refusal(&message) {
                 // The queue-arm guard refused before anything reached GitHub.
                 let audit_error = guard.finish("refused_by_queue_arm_guard").err();
@@ -938,6 +946,54 @@ fn enqueue_unstacked_pull_request(
             }
         }
     }
+}
+
+/// GitHub definitively refused the enqueue: record it `rejected` with GitHub's
+/// message, release the terminal continuation like any other refusal, and
+/// report it under its own `blocked_on` token rather than as an error.
+fn record_definitive_refusal(
+    context: &MutationApplyContext<'_>,
+    pr: &ObservedPr,
+    ledger: &mut StewardLedger,
+    guard: crate::merge_queue_control::MergeQueueMutationGuard,
+    refusal: &str,
+) -> (Option<String>, Option<String>) {
+    let token = super::mutation_outcome::refusal_token(refusal);
+    let audit_error = guard.finish_with_reason("rejected", refusal).err();
+    let continuation_error = resolve_success_continuation(
+        context.ledger_path,
+        ledger,
+        &context.observation.repo,
+        &context.observation.base,
+        pr.fact.number,
+        &pr.fact.head_sha,
+    )
+    .err();
+    record_audit(
+        ledger,
+        &context.observation.repo,
+        &format!("pr:{}:{}", pr.fact.number, pr.fact.head_sha),
+        "enqueue_refused_by_github",
+    );
+    let mut errors = Vec::new();
+    if let Some(error) = audit_error {
+        errors.push(format!("mutation audit failed: {error}"));
+    }
+    if let Some(error) = continuation_error {
+        errors.push(format!(
+            "terminal continuation resolution failed: {}",
+            error.message
+        ));
+    }
+    (
+        Some(token),
+        (!errors.is_empty()).then(|| {
+            format!(
+                "GitHub refused the enqueue ({refusal}) but {}",
+                errors.join("; ")
+            )
+        }),
+    )
 }
 
 /// The head-scoped queue verdict for an ordinary steward enqueue.

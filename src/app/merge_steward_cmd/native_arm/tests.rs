@@ -1249,3 +1249,224 @@ fn the_backstop_never_arms_when_the_carried_pr_moved_after_the_listing() {
         "carried_commits_unreadable:#11361"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Uncertain mutations are contained to their own pull request
+// ---------------------------------------------------------------------------
+
+/// Leave an uncertain admission for `pr` in the mutations ledger, the way a
+/// guard dropped without a finish leaves one.
+#[cfg(unix)]
+fn leave_uncertain_admission(control: &crate::app::merge_steward_cmd::MutationControl, pr: u64) {
+    let state = crate::ship_state::ShipState::new(
+        pr,
+        "owner/repo",
+        "feature",
+        "main",
+        "b".repeat(40),
+        "runner-steward",
+    );
+    let guard = crate::merge_queue_control::MergeQueueMutationGuard::acquire_in_mode(
+        &control.store,
+        &control.cwd,
+        control.mode,
+        &control.global_dir,
+        &state,
+        "runner steward enqueue pull request",
+    )
+    .expect("guard");
+    drop(guard);
+    assert_eq!(
+        crate::merge_queue_control::uncertain_mutations(&control.state_dir)
+            .expect("uncertain")
+            .len(),
+        1
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_uncertain_mutation_for_one_pr_does_not_stop_arming_another() {
+    let temp = tempfile::tempdir().expect("temp");
+    let control = crate::app::merge_steward_cmd::tests::mutation_control(&temp, "studio", "studio");
+    leave_uncertain_admission(&control, 7);
+    let log = temp.path().join("calls.log");
+    let actions = fake_gh(&temp, &never_armed_then_arms(&log.display().to_string()));
+    let mut observation = observation(pr_row(&serde_json::json!({})), true);
+    observation.prs.push(pr_row(&serde_json::json!({
+        "id": "PR_node7",
+        "number": 7,
+        "headRefOid": "b".repeat(40),
+    })));
+    let mut reports = report(StewardDecision::Unmanaged);
+    reports.push(PrReport {
+        number: 7,
+        head_sha: "b".repeat(40),
+        decision: StewardDecision::Unmanaged,
+        mutation: None,
+        error: None,
+        blocked: crate::app::merge_steward_cmd::blocked_on::Stall::default(),
+    });
+
+    let (status, unhealthy) = apply_native_arm_backstop(
+        &actions,
+        &observation,
+        &reports,
+        "shipyard:no-auto-merge",
+        true,
+        || super::arming_authority(&control, "owner/repo", "main"),
+    );
+
+    assert!(!unhealthy, "{status:?}");
+    let by_number = |number: u64| {
+        status
+            .results
+            .iter()
+            .find(|result| result.number == number)
+            .unwrap_or_else(|| panic!("PR #{number} missing: {status:?}"))
+    };
+    assert_eq!(by_number(42).outcome, "armed", "{status:?}");
+    let held = by_number(7);
+    assert_eq!(held.outcome, "skipped", "{status:?}");
+    assert!(
+        matches!(&held.skip, Some(crate::auto_arm::ArmSkip::Unknown { detail }) if detail.contains("still uncertain")),
+        "{held:?}"
+    );
+    let calls = std::fs::read_to_string(&log).expect("calls");
+    assert_eq!(
+        calls.matches("enablePullRequestAutoMerge").count(),
+        1,
+        "{calls}"
+    );
+    assert!(!calls.contains("number=7"), "PR #7 was read: {calls}");
+}
+
+#[cfg(unix)]
+#[test]
+fn the_steward_enqueue_guard_for_another_pr_is_not_blocked_by_an_uncertain_one() {
+    let temp = tempfile::tempdir().expect("temp");
+    let control = crate::app::merge_steward_cmd::tests::mutation_control(&temp, "studio", "studio");
+    leave_uncertain_admission(&control, 7);
+    let other = crate::ship_state::ShipState::new(
+        42,
+        "owner/repo",
+        "feature",
+        "main",
+        "a".repeat(40),
+        "runner-steward",
+    );
+    let guard = crate::merge_queue_control::MergeQueueMutationGuard::acquire_in_mode(
+        &control.store,
+        &control.cwd,
+        control.mode,
+        &control.global_dir,
+        &other,
+        "runner steward enqueue pull request",
+    )
+    .expect("PR #42 is not held behind PR #7");
+    guard.finish("enqueued").expect("finish");
+    // Control: the uncertain PR itself is still held.
+    let same = crate::ship_state::ShipState::new(
+        7,
+        "owner/repo",
+        "feature",
+        "main",
+        "b".repeat(40),
+        "runner-steward",
+    );
+    let refusal = crate::merge_queue_control::MergeQueueMutationGuard::acquire_in_mode(
+        &control.store,
+        &control.cwd,
+        control.mode,
+        &control.global_dir,
+        &same,
+        "runner steward enqueue pull request",
+    )
+    .expect_err("PR #7 stays held");
+    assert!(refusal.contains("is uncertain"), "{refusal}");
+}
+
+// ---------------------------------------------------------------------------
+// Green means the base's required checks, not every check on the head
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+fn blocked_with(rollup: &serde_json::Value) -> ObservedPr {
+    pr_row(&serde_json::json!({
+        "mergeStateStatus": "BLOCKED",
+        "statusCheckRollup": rollup,
+    }))
+}
+
+#[cfg(unix)]
+#[test]
+fn a_cancelled_advisory_check_does_not_stop_the_backstop() {
+    let temp = tempfile::tempdir().expect("temp");
+    let log = temp.path().join("calls.log");
+    let actions = fake_gh(&temp, &never_armed_then_arms(&log.display().to_string()));
+    // Pulp #11406: every required check green, one advisory check cancelled by
+    // concurrency, and GitHub reporting the row BLOCKED.
+    let observation = observation(
+        blocked_with(&serde_json::json!([
+            {"__typename": "CheckRun", "name": "macos", "status": "COMPLETED",
+             "conclusion": "SUCCESS", "completedAt": "2026-11-02T02:00:00Z"},
+            {"__typename": "CheckRun", "name": "yamllint + actionlint + structural parse",
+             "status": "COMPLETED", "conclusion": "CANCELLED",
+             "completedAt": "2026-11-02T02:20:25Z"},
+        ])),
+        true,
+    );
+    let (status, unhealthy) = apply_native_arm_backstop(
+        &actions,
+        &observation,
+        &report(StewardDecision::Unmanaged),
+        "shipyard:no-auto-merge",
+        true,
+        no_authority_needed,
+    );
+    assert!(!unhealthy, "{status:?}");
+    assert_eq!(status.results.len(), 1, "{status:?}");
+    assert_eq!(status.results[0].outcome, "armed", "{status:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_required_check_still_stops_the_backstop() {
+    let temp = tempfile::tempdir().expect("temp");
+    let log = temp.path().join("calls.log");
+    let actions = fake_gh(&temp, &never_armed_then_arms(&log.display().to_string()));
+    for required in ["FAILURE", "CANCELLED"] {
+        let observation = observation(
+            blocked_with(&serde_json::json!([
+                {"__typename": "CheckRun", "name": "macos", "status": "COMPLETED",
+                 "conclusion": required, "completedAt": "2026-11-02T02:00:00Z"},
+                {"__typename": "CheckRun", "name": "yamllint + actionlint + structural parse",
+                 "status": "COMPLETED", "conclusion": "SUCCESS",
+                 "completedAt": "2026-11-02T02:20:25Z"},
+            ])),
+            true,
+        );
+        let (status, _) = apply_native_arm_backstop(
+            &actions,
+            &observation,
+            &report(StewardDecision::Unmanaged),
+            "shipyard:no-auto-merge",
+            true,
+            no_authority_needed,
+        );
+        assert!(status.results.is_empty(), "{required}: {status:?}");
+        assert!(status.policy.contains("no candidates"), "{status:?}");
+    }
+    // A missing required check is not green either.
+    let observation = observation(blocked_with(&serde_json::json!([])), true);
+    let (status, _) = apply_native_arm_backstop(
+        &actions,
+        &observation,
+        &report(StewardDecision::Unmanaged),
+        "shipyard:no-auto-merge",
+        true,
+        no_authority_needed,
+    );
+    assert!(status.results.is_empty(), "{status:?}");
+    assert!(!log.exists(), "nothing may be read or armed for a red head");
+}

@@ -1,6 +1,6 @@
 //! Machine authority, serialization, and audit controls for merge-queue writes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -186,6 +186,33 @@ pub fn preflight_mutation_authority(
     repo: &str,
     base: &str,
 ) -> Result<MergeQueueMutationPreflight, String> {
+    preflight(state_root, global_dir, repo, base, false).map(|(preflight, _)| preflight)
+}
+
+/// [`preflight_mutation_authority`] for a caller whose every later mutation is
+/// bound to one pull request's exact head, such as the steward's native-arm
+/// backstop.
+///
+/// An uncertain mutation does not refuse the whole base here. It is contained
+/// to its own pull request: the returned set names every pull request on this
+/// repository and base with an unresolved mutation, and the caller must not
+/// act on those.
+pub fn preflight_mutation_authority_per_pr(
+    state_root: &Path,
+    global_dir: &Path,
+    repo: &str,
+    base: &str,
+) -> Result<(MergeQueueMutationPreflight, BTreeSet<u64>), String> {
+    preflight(state_root, global_dir, repo, base, true)
+}
+
+fn preflight(
+    state_root: &Path,
+    global_dir: &Path,
+    repo: &str,
+    base: &str,
+    contain_per_pr: bool,
+) -> Result<(MergeQueueMutationPreflight, BTreeSet<u64>), String> {
     let control_lock = acquire_control_lock(state_root, true)?;
     let hold_path = state_root.join(HOLD_FILE);
     if hold_path.exists() {
@@ -196,11 +223,18 @@ pub fn preflight_mutation_authority(
     }
     // A workflow that does not know its PR identity yet must not change a
     // remote branch while any prior mutation remains ambiguous: an existing
-    // auto-merge could otherwise consume the newly pushed head.
-    if let Some(uncertain) = uncertain_mutations(state_root)?.iter().find(|entry| {
+    // auto-merge could otherwise consume the newly pushed head. A caller bound
+    // to exact pull-request heads only has to stay off the uncertain ones.
+    let mut uncertain_prs = BTreeSet::new();
+    for uncertain in uncertain_mutations(state_root)?.iter().filter(|entry| {
         entry.get("repo").and_then(serde_json::Value::as_str) == Some(repo)
             && entry.get("base").and_then(serde_json::Value::as_str) == Some(base)
     }) {
+        let pr = uncertain.get("pr").and_then(serde_json::Value::as_u64);
+        if contain_per_pr && let Some(pr) = pr {
+            uncertain_prs.insert(pr);
+            continue;
+        }
         let correlation_id = uncertain
             .get("correlation_id")
             .and_then(serde_json::Value::as_str)
@@ -212,10 +246,13 @@ pub fn preflight_mutation_authority(
     let config = LoadedConfig::load_machine_global_from_dir(global_dir.to_path_buf())
         .map_err(|error| format!("failed to load merge-queue mutation policy: {error}"))?;
     validate_machine_authority(&config, state_root)?;
-    Ok(MergeQueueMutationPreflight {
-        control_lock,
-        global_dir: global_dir.to_path_buf(),
-    })
+    Ok((
+        MergeQueueMutationPreflight {
+            control_lock,
+            global_dir: global_dir.to_path_buf(),
+        },
+        uncertain_prs,
+    ))
 }
 
 /// Return mutation starts that have no durable finished record. Hard process
@@ -413,6 +450,158 @@ pub fn resolve_uncertainty(
             "no uncertain merge-queue mutation has correlation id `{correlation_id}`"
         ));
     };
+    apply_resolution(state_root, retention_policy, entry, outcome, reason, None)?;
+    control_lock
+        .unlock()
+        .map_err(|error| format!("failed to release merge-queue control lock: {error}"))
+}
+
+/// What fresh GitHub evidence says about one uncertain admission mutation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UncertainVerdict {
+    /// GitHub shows the mutation took effect.
+    Accepted(String),
+    /// GitHub shows it did not.
+    Rejected(String),
+    /// The evidence could not be read or does not decide it.
+    Unresolved(String),
+}
+
+/// One uncertain mutation a reconciliation pass looked at.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct UncertainReconciliation {
+    /// Audit correlation id.
+    pub correlation_id: String,
+    /// Recorded audit action.
+    pub action: String,
+    /// Pull request the mutation targeted, when recorded.
+    pub pr: Option<u64>,
+    /// Head the mutation was bound to, when recorded.
+    pub head: Option<String>,
+    /// `resolved_accepted`, `resolved_rejected`, or `uncertain`.
+    pub outcome: String,
+    /// The evidence, or why there was none.
+    pub reason: String,
+}
+
+/// Whether an audit action admits a pull request to the merge queue, which is
+/// the only kind of uncertainty the steward settles from queue evidence.
+#[must_use]
+pub fn is_admission_action(action: &str) -> bool {
+    action == ARM_ACTION
+        || action == LEGACY_ENQUEUE_ACTION
+        || action == "runner steward enqueue pull request"
+        || action == "runner steward restore hosted setup eviction priority"
+}
+
+/// Settle every uncertain admission mutation for `repo`/`base` from fresh
+/// GitHub evidence, under the same control lock every mutation takes.
+///
+/// `judge` reads GitHub for one recorded entry. An `Accepted` or `Rejected`
+/// verdict is written to the mutations ledger exactly as
+/// `shipyard merge-queue resolve` writes it, with `resolver` set to
+/// `steward-auto-reconcile`; an `Unresolved` one is left uncertain. Holding
+/// the lock across the read means a mutation still in flight in another
+/// process cannot be settled from evidence that predates it.
+pub fn reconcile_uncertain_admissions(
+    state_root: &Path,
+    global_dir: &Path,
+    repo: &str,
+    base: &str,
+    mut judge: impl FnMut(&serde_json::Value) -> UncertainVerdict,
+) -> Result<Vec<UncertainReconciliation>, String> {
+    let candidates = uncertain_mutations(state_root)?
+        .into_iter()
+        .filter(|entry| {
+            entry.get("repo").and_then(serde_json::Value::as_str) == Some(repo)
+                && entry.get("base").and_then(serde_json::Value::as_str) == Some(base)
+                && entry
+                    .get("action")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(is_admission_action)
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut control_lock = acquire_control_lock(state_root, true)?;
+    let config = LoadedConfig::load_machine_global_from_dir(global_dir.to_path_buf())
+        .map_err(|error| format!("failed to load merge-queue mutation policy: {error}"))?;
+    validate_machine_authority(&config, state_root)?;
+    let retention_policy = crate::log_retention::LogRetentionPolicy::from_config(&config);
+    // Re-read under the lock: an entry another process finished meanwhile is
+    // no longer ours to settle.
+    let still_uncertain = uncertain_mutations(state_root)?;
+    let mut results = Vec::new();
+    for entry in candidates {
+        let correlation_id = entry
+            .get("correlation_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        if !still_uncertain.iter().any(|current| {
+            current
+                .get("correlation_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(correlation_id.as_str())
+        }) {
+            continue;
+        }
+        let (outcome, reason) = match judge(&entry) {
+            UncertainVerdict::Accepted(reason) => ("accepted", reason),
+            UncertainVerdict::Rejected(reason) => ("rejected", reason),
+            UncertainVerdict::Unresolved(reason) => ("uncertain", reason),
+        };
+        if outcome != "uncertain" {
+            apply_resolution(
+                state_root,
+                retention_policy,
+                &entry,
+                outcome,
+                &reason,
+                Some("steward-auto-reconcile"),
+            )?;
+        }
+        results.push(UncertainReconciliation {
+            correlation_id,
+            action: entry
+                .get("action")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            pr: entry.get("pr").and_then(serde_json::Value::as_u64),
+            head: entry
+                .get("head")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            outcome: if outcome == "uncertain" {
+                "uncertain".to_owned()
+            } else {
+                format!("resolved_{outcome}")
+            },
+            reason,
+        });
+    }
+    control_lock
+        .unlock()
+        .map_err(|error| format!("failed to release merge-queue control lock: {error}"))?;
+    Ok(results)
+}
+
+/// Reconcile ship-state for one resolved uncertain mutation and append its
+/// `resolved_<outcome>` record. The caller holds the control lock.
+fn apply_resolution(
+    state_root: &Path,
+    retention_policy: crate::log_retention::LogRetentionPolicy,
+    entry: &serde_json::Value,
+    outcome: &str,
+    reason: &str,
+    resolver: Option<&str>,
+) -> Result<(), String> {
+    let correlation_id = entry
+        .get("correlation_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "uncertain mutation is missing its correlation id".to_owned())?;
     if let Some(pr) = entry.get("pr").and_then(serde_json::Value::as_u64) {
         let repo = entry
             .get("repo")
@@ -428,7 +617,7 @@ pub fn resolve_uncertainty(
                 .get("action")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("");
-            let enqueue = action == ARM_ACTION || action == LEGACY_ENQUEUE_ACTION;
+            let enqueue = is_admission_action(action);
             let revocation = matches!(action, "disable native auto-merge" | "dequeue drifted PR");
             let identity_matches = entry.get("repo").and_then(serde_json::Value::as_str)
                 == Some(state.repo.as_str())
@@ -461,25 +650,27 @@ pub fn resolve_uncertainty(
             }
         }
     }
-    append_audit(
-        &state_root.join(AUDIT_FILE),
-        retention_policy,
-        &json!({
-            "timestamp": Utc::now(),
-            "correlation_id": correlation_id,
-            "phase": "finished",
-            "outcome": format!("resolved_{outcome}"),
-            "reason": reason,
-            "resolver_pid": process::id(),
-            "resolver_machine": read_machine_tag(state_root)
-                .as_deref()
-                .unwrap_or("unconfigured"),
-        }),
-    )
-    .map_err(|error| format!("failed to write merge-queue mutation resolution: {error}"))?;
-    control_lock
-        .unlock()
-        .map_err(|error| format!("failed to release merge-queue control lock: {error}"))
+    let mut record = json!({
+        "timestamp": Utc::now(),
+        "correlation_id": correlation_id,
+        "phase": "finished",
+        "outcome": format!("resolved_{outcome}"),
+        "reason": reason,
+        "resolver_pid": process::id(),
+        "resolver_machine": read_machine_tag(state_root)
+            .as_deref()
+            .unwrap_or("unconfigured"),
+    });
+    if let (Some(resolver), Some(object)) = (resolver, record.as_object_mut()) {
+        object.insert("resolver".to_owned(), json!(resolver));
+        for key in ["action", "repo", "base", "pr", "head"] {
+            if let Some(value) = entry.get(key) {
+                object.insert(key.to_owned(), value.clone());
+            }
+        }
+    }
+    append_audit(&state_root.join(AUDIT_FILE), retention_policy, &record)
+        .map_err(|error| format!("failed to write merge-queue mutation resolution: {error}"))
 }
 
 /// Close an uncertain mutation without claiming whether the remote request was
@@ -922,11 +1113,18 @@ impl MergeQueueMutationGuard {
     }
 
     /// Record the externally observed mutation result before releasing authority.
-    pub fn finish(mut self, outcome: &str) -> Result<(), String> {
-        append_audit(
-            &self.audit_path,
-            self.retention_policy,
-            &json!({
+    pub fn finish(self, outcome: &str) -> Result<(), String> {
+        self.finish_with_detail(outcome, None)
+    }
+
+    /// [`Self::finish`] with GitHub's own words for the outcome, such as the
+    /// message of a definitive refusal.
+    pub fn finish_with_reason(self, outcome: &str, reason: &str) -> Result<(), String> {
+        self.finish_with_detail(outcome, Some(reason))
+    }
+
+    fn finish_with_detail(mut self, outcome: &str, reason: Option<&str>) -> Result<(), String> {
+        let mut record = json!({
                 "timestamp": Utc::now(),
                 "correlation_id": self.correlation_id,
                 "phase": "finished",
@@ -939,9 +1137,12 @@ impl MergeQueueMutationGuard {
                 "approval_comment_id": self.approval_comment_id,
                 "performed_via_github_app_id": self.approval_app_id,
                 "verdict_audit_events": self.verdict_audit_events,
-            }),
-        )
-        .map_err(|error| format!("failed to write merge-queue mutation result: {error}"))?;
+        });
+        if let (Some(reason), Some(object)) = (reason, record.as_object_mut()) {
+            object.insert("reason".to_owned(), json!(reason));
+        }
+        append_audit(&self.audit_path, self.retention_policy, &record)
+            .map_err(|error| format!("failed to write merge-queue mutation result: {error}"))?;
         self.finished = true;
         Ok(())
     }
