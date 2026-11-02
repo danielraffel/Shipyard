@@ -617,7 +617,7 @@ fn apply_resolution(
                 .get("action")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("");
-            let enqueue = action == ARM_ACTION || action == LEGACY_ENQUEUE_ACTION;
+            let enqueue = is_admission_action(action);
             let revocation = matches!(action, "disable native auto-merge" | "dequeue drifted PR");
             let identity_matches = entry.get("repo").and_then(serde_json::Value::as_str)
                 == Some(state.repo.as_str())
