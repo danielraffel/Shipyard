@@ -61,6 +61,45 @@ class RepositorySideSwitches(unittest.TestCase):
         self.assertEqual(seen, {"SHIPYARD_REBASE_CARRY": "1", "SHIPYARD_REVIEW_BEFORE_ARM": "1"})
 
 
+class AwaitingClassification(unittest.TestCase):
+    """Which refusals read as waiting, and how an uncounted approval is named."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("review_verdict_status", STATUS)
+        assert spec is not None and spec.loader is not None
+        cls.status = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.status)
+
+    def test_only_a_missing_counted_verdict_is_awaiting(self) -> None:
+        decision = self.status.Decision
+        self.assertTrue(decision(False, "no verdict", "unreviewed", ()).awaiting)
+        self.assertTrue(decision(False, "stale", "approval_does_not_carry", ()).awaiting)
+        for cause in ("hold", "unreadable", "head_moved", "unbound", "self_approval", None):
+            self.assertFalse(decision(False, "x", cause, ()).awaiting, cause)
+        self.assertFalse(decision(True, "ok", None, ()).awaiting)
+        # A receipt the guard could not prove shares the "unreviewed" cause but
+        # is a refusal of an approval that exists, not a wait.
+        self.assertFalse(decision(False, "PR #1: reviewer claim receipt refused (x)",
+                                  "unreviewed", ()).awaiting)
+
+    def test_exclusion_codes_name_why_an_approval_did_not_count(self) -> None:
+        code = self.status.exclusion_code
+        self.assertEqual(code("its session stamp is unattributed"), "unattributed")
+        self.assertEqual(code("it has no `ghapp` session stamp"), "unattributed")
+        self.assertEqual(code("its stamp session s is not one of the base's "
+                              "`reviewer_stamp_sessions` (a-*)"), "unlisted_stamp_session")
+        self.assertEqual(code("its signer x is not one of a, b"), "uncounted_signer")
+        self.assertEqual(code("not the App: a user account"), "not_the_app")
+        self.assertEqual(code("drive-by"), "unlisted_human")
+
+    def test_the_description_stays_within_githubs_limit(self) -> None:
+        text = self.status.awaiting_description("a" * 40, ["unattributed"] * 30 + ["x" * 200])
+        self.assertLessEqual(len(text), self.status.DESCRIPTION_LIMIT)
+        self.assertTrue(text.startswith("awaiting reviewer verdict; 31 approvals excluded"))
+
+
 class ReviewVerdictStatus(unittest.TestCase):
     install = arm.ReviewBeforeArm.install
     case = arm.ReviewBeforeArm.case
@@ -164,10 +203,10 @@ class ReviewVerdictStatus(unittest.TestCase):
             line = f"reviewer: {signer}\n" if signer else ""
             return [self.comment(f"Reviewed.\n{line}{STAMP}\nverdict: APPROVE head:{HEAD}",
                                  "2026-10-12T15:00:00Z")]
-        self.assertEqual(self.judged(approve(None), SIGNERS), "failure", "unsigned")
-        self.assertEqual(self.judged(approve("codex-g2h"), SIGNERS), "failure", "unlisted")
+        self.assertEqual(self.judged(approve(None), SIGNERS), "pending", "unsigned")
+        self.assertEqual(self.judged(approve("codex-g2h"), SIGNERS), "pending", "unlisted")
         self.assertEqual(self.judged(approve("pulp-review"), SIGNERS), "success", "listed")
-        self.assertEqual(self.judged(approve("pulp-review"), None), "failure", "none listed")
+        self.assertEqual(self.judged(approve("pulp-review"), None), "pending", "none listed")
         result = self.post(self.answers(approve("pulp-review"), None))
         self.assertIn("no signer list is configured on the base branch", result.stderr)
 
@@ -176,7 +215,7 @@ class ReviewVerdictStatus(unittest.TestCase):
         # applies the same rule server-side.
         config = '[auto_merge]\nreviewer_signers = ["pulp-review", "infra-review2"]\n'
         unsigned = [self.comment(f"verdict: APPROVE head:{HEAD}", "2026-10-12T15:00:00Z")]
-        self.assertEqual(self.judged(unsigned, config), "failure")
+        self.assertEqual(self.judged(unsigned, config), "pending")
         signed = [self.comment(f"Reviewed.\nreviewer: infra-review2\n{STAMP}\n"
                                f"verdict: APPROVE head:{HEAD}", "2026-10-12T15:00:00Z")]
         self.assertEqual(self.judged(signed, config), "success")
@@ -195,8 +234,8 @@ class ReviewVerdictStatus(unittest.TestCase):
         wrong_host = "<!-- session: Daniels-M5-Studio/rotating agent: codex-reviewer -->"
         no_agent = "<!-- session: Daniels-Mac-Studio-m3/rotating -->"
         self.assertEqual(self.judged(approve(good), config), "success")
-        self.assertEqual(self.judged(approve(wrong_host), config), "failure")
-        self.assertEqual(self.judged(approve(no_agent), config), "failure")
+        self.assertEqual(self.judged(approve(wrong_host), config), "pending")
+        self.assertEqual(self.judged(approve(no_agent), config), "pending")
 
     def test_pulp_11407s_author_lane_approve_fails_where_the_base_lists_reviewer_sessions(
             self) -> None:
@@ -217,7 +256,9 @@ class ReviewVerdictStatus(unittest.TestCase):
                                 f"verdict: {verdict} head:{HEAD}", at, **change)
 
         self.assertEqual(self.judged([verdict(author, "APPROVE", "2026-11-02T03:18:19Z")], config),
-                         "failure")
+                         "pending")
+        self.assertEqual(self.posted()["description"],
+                         "awaiting reviewer verdict; 1 approval excluded: unlisted_stamp_session")
         result = self.post(self.answers([verdict(author, "APPROVE", "2026-11-02T03:18:19Z")],
                                         config))
         self.assertIn("its stamp session 01a18030-f638-7010-94b9-2198e940232f is not one of the "
@@ -246,7 +287,9 @@ class ReviewVerdictStatus(unittest.TestCase):
                             "its session stamp is unattributed"),
                            ("", "it has no `ghapp` session stamp")):
             with self.subTest(why=why):
-                self.assertEqual(self.judged(copied(stamp), SIGNERS), "failure")
+                self.assertEqual(self.judged(copied(stamp), SIGNERS), "pending")
+                self.assertEqual(self.posted()["description"],
+                                 "awaiting reviewer verdict; 1 approval excluded: unattributed")
                 result = self.post(self.answers(copied(stamp), SIGNERS))
                 self.assertIn(why, result.stderr)
         self.assertEqual(self.judged(copied(STAMP + "\n"), SIGNERS), "success", "control")
@@ -267,16 +310,50 @@ class ReviewVerdictStatus(unittest.TestCase):
                  self.comment(f"verdict: APPROVE head:{HEAD}", "2026-10-12T17:00:00Z", id=2)]
         self.assertEqual(self.judged(trail), "failure")
 
-    def test_an_approve_from_an_untrusted_account_is_failure(self) -> None:
+    def test_an_approve_from_an_untrusted_account_is_pending(self) -> None:
         # A fork's author or a drive-by account cannot forge the status.
         trail = [self.comment(f"verdict: APPROVE head:{HEAD}", "2026-10-12T15:00:00Z",
                               user={"login": "drive-by", "type": "User"},
                               author_association="NONE")]
-        self.assertEqual(self.judged(trail), "failure")
+        self.assertEqual(self.judged(trail), "pending")
 
-    def test_an_approve_of_another_head_is_failure(self) -> None:
-        trail = [self.comment(f"verdict: APPROVE head:{arm.HOLD_784}", "2026-10-12T15:00:00Z")]
-        self.assertEqual(self.judged(trail), "failure")
+    def test_an_approve_of_another_head_is_pending_and_says_so(self) -> None:
+        trail = [self.comment(SIGNED_APPROVE.format(head=arm.HOLD_784), "2026-10-12T15:00:00Z")]
+        self.assertEqual(self.judged(trail, SIGNERS), "pending")
+        self.assertEqual(self.posted()["description"],
+                         "awaiting reviewer verdict; 1 approval excluded: not_exact_head")
+
+    def test_no_verdict_at_the_head_is_pending_not_failure(self) -> None:
+        self.assertEqual(self.judged([]), "pending")
+        self.assertEqual(self.posted()["description"],
+                         f"awaiting reviewer verdict for head {HEAD[:12]}")
+
+    def test_a_counted_hold_stays_failure_with_its_description(self) -> None:
+        self.assertEqual(self.judged(self.refused_trail()), "failure")
+        self.assertIn("HOLD naming head", self.posted()["description"])
+
+    def test_a_hold_on_one_pull_request_sharing_the_head_is_failure(self) -> None:
+        # Waiting on #785 must not hide a HOLD that #784 carries.
+        pull = copy.deepcopy(arm.review_fixture("shipyard-784-pull.json"))
+        pull.update(state="open", number=785)
+        answers = self.answers(self.refused_trail())
+        answers[:0] = [
+            (f"/commits/{HEAD}/pulls", {"json": [
+                {"number": 784, "state": "open", "head": {"sha": HEAD}},
+                {"number": 785, "state": "open", "head": {"sha": HEAD}}]}),
+            ("issues/785/comments", {"pages": [[]]}),
+            ("pulls/785/reviews", {"pages": [[]]}),
+            ("pulls/785", {"json": pull}),
+        ]
+        self.assertEqual(self.post(answers).returncode, 0)
+        self.assertEqual(self.posted()["state"], "failure")
+
+    def test_an_unreadable_review_is_failure_not_waiting(self) -> None:
+        broken = [(needle, {"error": "gh: HTTP 502"}) if needle == "/comments"
+                  else (needle, answer) for needle, answer in self.answers([])]
+        result = self.post(broken)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.posted()["state"], "failure")
 
     def test_a_repository_that_does_not_require_review_is_success(self) -> None:
         config = "[auto_merge]\narm_requires_head_approval = false\n"
@@ -347,9 +424,9 @@ class ReviewVerdictStatus(unittest.TestCase):
         result = self.post(answers)
         self.assertEqual(result.returncode, 0, result.stderr)
         posted = self.posted()
-        self.assertEqual(posted["state"], "failure", result.stdout)
+        self.assertEqual(posted["state"], "pending", result.stdout)
         self.assertIn("PR #784: allowed", result.stdout)
-        self.assertIn("PR #785: refused", result.stdout)
+        self.assertIn("PR #785: awaiting", result.stdout)
         # Control: with only #784 on the head, the same trail is success.
         self.assertEqual(self.judged(trail, SIGNERS), "success")
 
@@ -383,11 +460,13 @@ class ReviewVerdictStatus(unittest.TestCase):
         self.assertEqual(self.posted()["state"], "success")
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_no_approval_at_all_fails_the_head_check(self) -> None:
+    def test_no_approval_at_all_keeps_the_head_check_red_but_the_status_pending(self) -> None:
         event = {"pull_request": {"number": 784}}
         result = self.post(self.answers([]), "pull_request_target", event)
-        self.assertEqual(self.posted()["state"], "failure")
+        self.assertEqual(self.posted()["state"], "pending")
+        # The required check run still fails closed; only the status reads as waiting.
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("nothing for the author to do", result.stdout)
 
     def test_a_comment_re_runs_the_heads_newest_run_so_its_check_follows(self) -> None:
         # A comment's own check run sits on the default branch's tip. The head's

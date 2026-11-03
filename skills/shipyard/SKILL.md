@@ -4379,7 +4379,9 @@ to arm. The `review-verdict`
 commit status (`scripts/review_verdict_status.py`) posts that same decision
 on every pull request's head from a workflow, so a repository can require it
 and stop landings that never pass through `ghapp`
-(docs/review-verdict-status.md).
+(docs/review-verdict-status.md). It is `pending` while a head awaits its
+reviewer (the steward reads that as waiting, not `required_failed`; nothing for
+the author to do) and `failure` only for a counted HOLD or an unreadable review.
 
 The report-only `risk-tier` status (`scripts/risk_tier.py`,
 docs/risk-tier.md) posts the review tier a pull request would need: Low (CI

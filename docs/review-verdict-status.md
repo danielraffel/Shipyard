@@ -23,6 +23,16 @@ disagree:
 - `success` only for an APPROVE naming the head (a comment ending
   `verdict: APPROVE head:<sha>` or `reviewed: <sha>`, or an `APPROVED`
   review on it), or one the guard's merge-only carry takes to it;
+- `pending`, not `failure`, while the head only awaits its reviewer: no
+  counted verdict names it, or only approvals that do not count do. The
+  description says `awaiting reviewer verdict for head <sha>`, or names why an
+  approval was excluded (`awaiting reviewer verdict; 1 approval excluded:
+  unlisted_stamp_session`; codes include `unattributed`, `uncounted_signer`,
+  `not_exact_head`). Branch protection treats `pending` as unsatisfied exactly
+  like `failure`, so nothing merges without an approval; `failure` is kept for a
+  counted HOLD or an unreadable review. The job (the required check run) still
+  fails while awaiting, so that check cannot read as satisfied; it carries a
+  notice saying there is nothing for the author to do;
 - whose verdict counts is the guard's rule: the base's `reviewer_identities`,
   else an approval only from the fleet App or a human the base lists in
   `[auto_merge] human_reviewers` (a HOLD from any OWNER, MEMBER or

@@ -145,6 +145,10 @@ a `review-verdict` check, and **both must be bound to the app that produces
 them** (for GitHub Actions, integration id `15368`). Otherwise anyone who can
 post a commit status could satisfy the requirement. The `review-verdict` job
 fails unless the head is allowed, so a held or unapproved head cannot be green.
+While a head only awaits its reviewer, the `review-verdict` status is
+`pending` (not `failure`; a HOLD or an unreadable review is the `failure`), and
+the steward reads it as waiting on the reviewer: nothing for the author to do.
+`pending` is unsatisfied exactly like `failure`, so nothing merges unapproved.
 The steward reports this path as `server_enforced_exact_head_merge`. It merges
 only a head that GitHub reports `CLEAN`, with every required check green and an
 approval it has itself confirmed. On any base that has no queue and no
@@ -266,7 +270,7 @@ not listed as blocked.
 
 | Token | Meaning | Who moves it |
 |---|---|---|
-| `no_verdict` | Green, and no reviewer verdict names this head | reviewer |
+| `no_verdict` | Green, and no reviewer verdict names this head: "awaiting the standing reviewer; nothing for the author to do" | reviewer |
 | `held` | A counting HOLD names this head | author: fix and push |
 | `approval_excluded:<reason>` | An APPROVE names this head but does not count. Reasons: `unattributed`, `no_stamp`, `noncanonical_stamp`, `session_not_allowed`, `unlisted_stamp_session`, `no_signer_list`, `no_signer_line`, `uncounted_signer`, `unbound_identity`, `pr_author`, `impersonated_app`, `untrusted_reviewer`, `unlisted_reviewer`, `unlisted_human`, `predates_head` (posted before the head commit), `stale_head` (only an earlier head is approved), `self_approved` | reviewer or fleet config |
 | `ejection_cap` | The queue removed this head too often since its last approval | reviewer, or a new push |
@@ -275,7 +279,7 @@ not listed as blocked.
 | `excluded_label:<label>` | `superseded`, `PARKED/<platform>` or the opt-out label | whoever owns the label |
 | `provenance_blocked:<labels>` | A provenance-blocking label | owner |
 | `required_never_ran:<contexts>` | A required context has no run on this head and nothing from its source is still queued or running (often a renamed check: merge the base to re-run CI) | repair lane |
-| `required_pending` | Required checks are queued or running, or have not appeared yet behind a running job | CI |
+| `required_pending` | Required checks are queued or running, or have not appeared yet behind a running job. A `pending` `review-verdict` status (head awaiting its reviewer) also reads here, with the reviewer as actor, never as `required_failed` | CI, or the reviewer |
 | `required_failed:<contexts>` | A required check failed. When the only red context is the approval context (`review-verdict`), the row names the approval token instead; an apply pass that did not read the gate for that head keeps this token and says so in `blocked_detail` | author or repair lane |
 | `transient_rerun` | The steward is rerunning an interrupted check | steward |
 | `merge_state:<STATE>` | GitHub says `DIRTY`, `BEHIND`, `UNSTABLE`, ... | repair lane: merge the base |
