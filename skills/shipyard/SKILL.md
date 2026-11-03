@@ -873,6 +873,16 @@ currently required trailer is treated as stale and rebuilt on the next run;
 dispatch `version-at-land.yml` by hand to force that without waiting for a
 landing.
 
+On a base without a merge queue the steward's own failed
+`shipyard/steward-recovery` status is itself a red non-required context, so
+GitHub reports the head UNSTABLE and the steward waits on
+`github-merge-state:CLEAN (current=UNSTABLE)` even after every required check
+is green. A pass that clears that signal re-reads the exact head and admits it
+in the same pass when it is now CLEAN and ready; a head GitHub still reports
+UNSTABLE waits for the next pass. Do not post a success
+`shipyard/steward-recovery` status by hand to hurry it: the steward clears it
+under its recovery-clear fence.
+
 It judges each first-parent change since the last `Version-Bump-Applied` marker
 on its own, then takes the highest level per surface. A
 `Version-Bump: <surface>=skip` trailer therefore skips only the change that

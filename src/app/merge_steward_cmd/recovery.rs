@@ -566,6 +566,115 @@ fn combine_mutations(left: Option<String>, right: Option<String>) -> Option<Stri
     }
 }
 
+/// The wait a direct-merge base reports while the steward's own failed
+/// recovery status is on the head: that status is a red non-required context,
+/// so GitHub holds the merge state at UNSTABLE until the steward clears it.
+const UNSTABLE_MERGE_STATE_WAIT: &str = "github-merge-state:CLEAN (current=UNSTABLE)";
+
+/// Pauses before each live read after a clear. GitHub recomputes the merge
+/// state asynchronously after a status write, so a read that still says
+/// UNSTABLE gets one more look before the PR waits for the next pass.
+#[cfg(not(test))]
+const RECLASSIFY_READ_DELAYS: [Duration; 2] = [Duration::ZERO, Duration::from_secs(3)];
+#[cfg(test)]
+const RECLASSIFY_READ_DELAYS: [Duration; 2] = [Duration::ZERO, Duration::ZERO];
+
+/// Outcome of re-reading a PR whose recovery signal this pass just cleared.
+pub(super) enum RecoveryClearReclassification {
+    /// Nothing to do: the clear did not change what the decision waits on.
+    Unchanged,
+    /// The live, exact-head PR is now ready for admission; later steps of
+    /// this pass act on it instead of the pre-clear observation.
+    Reclassified(Box<ObservedPr>, StewardDecision),
+    /// The live read failed. The pre-clear decision stands; the next pass
+    /// re-observes as before.
+    ReadFailed(String),
+}
+
+/// Re-read and re-classify a PR whose decision was waiting only on the
+/// UNSTABLE merge state that the steward's own failed recovery status caused,
+/// once this pass has cleared that status.
+///
+/// This grants no authority: the result is an ordinary exact-head live
+/// classification, and any admission it leads to still runs through the
+/// mutation path's own guard and final live revalidation.
+pub(super) fn reclassify_after_recovery_clear(
+    context: &MutationApplyContext<'_>,
+    observed: &ObservedPr,
+    policy: &StewardPolicy,
+    decision: &StewardDecision,
+    recovery_mutation: Option<&str>,
+    ledger: &StewardLedger,
+) -> RecoveryClearReclassification {
+    let cleared = recovery_mutation.is_some_and(|mutation| {
+        mutation
+            .split([',', ';'])
+            .any(|action| action == "needs_agent_cleared")
+    });
+    let waits_on_own_status = matches!(
+        decision,
+        StewardDecision::WaitingRequired { contexts }
+            if contexts.len() == 1 && contexts[0] == UNSTABLE_MERGE_STATE_WAIT
+    );
+    if policy.merge_queue || !cleared || !waits_on_own_status {
+        return RecoveryClearReclassification::Unchanged;
+    }
+    let deadline = recovery_revalidation_deadline();
+    for (attempt, delay) in RECLASSIFY_READ_DELAYS.iter().enumerate() {
+        if !delay.is_zero() {
+            std::thread::sleep(*delay);
+        }
+        let positions = match merge_queue_snapshot_before(
+            context.actions,
+            &context.observation.repo,
+            &context.observation.base,
+            deadline,
+        ) {
+            Ok((false, positions, _, _)) => positions,
+            Ok(_) => return RecoveryClearReclassification::Unchanged,
+            Err(error) => return RecoveryClearReclassification::ReadFailed(error),
+        };
+        let live = match pull_request_with_required_checks_before(
+            context.actions,
+            &context.observation.repo,
+            observed.fact.number,
+            &context.observation.base,
+            &positions,
+            &policy.required_checks,
+            deadline,
+        ) {
+            Ok(Some(live))
+                if live
+                    .fact
+                    .head_sha
+                    .eq_ignore_ascii_case(&observed.fact.head_sha) =>
+            {
+                live
+            }
+            Ok(_) => return RecoveryClearReclassification::Unchanged,
+            Err(error) => return RecoveryClearReclassification::ReadFailed(error),
+        };
+        let attempts = super::attempts_for(ledger, &context.observation.repo, &live.fact);
+        let live_decision = classify_pr(&live.fact, policy, &attempts);
+        if live_decision == StewardDecision::ArmMergeQueue {
+            return RecoveryClearReclassification::Reclassified(Box::new(live), live_decision);
+        }
+        // Any other change (a new failure, a moved state) is left to the next
+        // pass, which runs the full recovery reconciliation for it.
+        if live_decision != *decision {
+            break;
+        }
+        // Still UNSTABLE. Look again only while the steward's own status is no
+        // longer failing, i.e. GitHub has not yet caught up with the clear.
+        if attempt + 1 == RECLASSIFY_READ_DELAYS.len()
+            || latest_recovery_state(&live) == Some("FAILURE")
+        {
+            break;
+        }
+    }
+    RecoveryClearReclassification::Unchanged
+}
+
 pub(super) fn revalidate_recovery_target(
     context: &MutationApplyContext<'_>,
     observed: &ObservedPr,
