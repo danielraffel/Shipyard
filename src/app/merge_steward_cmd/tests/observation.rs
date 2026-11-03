@@ -1570,3 +1570,125 @@ esac
         StewardDecision::ArmMergeQueue
     );
 }
+
+/// A fake `gh` whose first invocation misbehaves as `first` describes and
+/// whose later invocations answer at once; each call appends to `calls`.
+#[cfg(unix)]
+fn flaky_read(temp: &tempfile::TempDir, first: &str) -> (GitHubActions, std::path::PathBuf) {
+    let calls = temp.path().join("calls");
+    let actions = fake_gh(
+        temp,
+        &format!(
+            r#"
+echo "$*" >> '{calls}'
+if [ "$(wc -l < '{calls}')" -eq 1 ]; then {first}; fi
+printf '%s' '{{"check_runs":[]}}'
+"#,
+            calls = calls.display(),
+        ),
+    );
+    (actions, calls)
+}
+
+fn read_args() -> Vec<String> {
+    vec![
+        "api".to_owned(),
+        format!(
+            "repos/owner/repo/commits/{}/check-runs?per_page=100&page=1",
+            "a".repeat(40)
+        ),
+    ]
+}
+
+/// A first attempt that stalls is cut at the per-attempt cap and a fresh
+/// attempt answers inside the same deadline.
+#[cfg(unix)]
+#[test]
+fn a_stalled_bounded_read_is_retried_once_within_its_deadline() {
+    let temp = tempfile::tempdir().expect("temp");
+    let (actions, calls) = flaky_read(&temp, "sleep 30");
+    let started = Instant::now();
+    let value = crate::app::merge_steward_cmd::observation::gh_json_before_with_attempt_timeout(
+        &actions,
+        &read_args(),
+        "current-head check identities",
+        started + Duration::from_secs(10),
+        Duration::from_secs(1),
+    )
+    .expect("the retry answers");
+    assert!(value.get("check_runs").is_some(), "{value}");
+    assert_eq!(
+        fs::read_to_string(&calls).expect("calls").lines().count(),
+        2
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+/// A gateway error is retried; a refusal that a retry cannot cure is not.
+#[cfg(unix)]
+#[test]
+fn only_transient_bounded_read_failures_are_retried() {
+    let temp = tempfile::tempdir().expect("temp");
+    let (actions, calls) = flaky_read(&temp, "echo 'HTTP 502: Bad Gateway' >&2; exit 1");
+    gh_json_before(
+        &actions,
+        &read_args(),
+        "current-head check identities",
+        Instant::now() + Duration::from_secs(10),
+    )
+    .expect("a 502 is retried");
+    assert_eq!(
+        fs::read_to_string(&calls).expect("calls").lines().count(),
+        2
+    );
+
+    let temp = tempfile::tempdir().expect("temp");
+    let (actions, calls) = flaky_read(
+        &temp,
+        "echo 'HTTP 403: Resource not accessible' >&2; exit 1",
+    );
+    let error = gh_json_before(
+        &actions,
+        &read_args(),
+        "current-head check identities",
+        Instant::now() + Duration::from_secs(10),
+    )
+    .expect_err("a 403 is final");
+    assert!(error.contains("HTTP 403"), "{error}");
+    assert_eq!(
+        fs::read_to_string(&calls).expect("calls").lines().count(),
+        1
+    );
+}
+
+/// The retry never extends the deadline: a read that stalls past it fails
+/// there, with no second attempt started on a spent budget.
+#[cfg(unix)]
+#[test]
+fn a_bounded_read_retry_never_outlives_the_deadline() {
+    let temp = tempfile::tempdir().expect("temp");
+    let (actions, calls) = flaky_read(&temp, "sleep 30");
+    let started = Instant::now();
+    let error = crate::app::merge_steward_cmd::observation::gh_json_before_with_attempt_timeout(
+        &actions,
+        &read_args(),
+        "current-head check identities",
+        started + Duration::from_secs(1),
+        Duration::from_secs(15),
+    )
+    .expect_err("the deadline holds");
+    assert!(error.contains("timed out"), "{error}");
+    assert_eq!(
+        fs::read_to_string(&calls).expect("calls").lines().count(),
+        1
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+}

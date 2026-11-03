@@ -162,10 +162,8 @@ fn pull_request_with_deadline(
         LIVE_PR_VIEW_FIELDS.to_owned(),
     ];
     let value = match deadline {
-        Some(deadline) => {
-            gh_json_before(actions, &args, "capacity-preemption candidate PR", deadline)?
-        }
-        None => gh_json(actions, &args, "capacity-preemption candidate PR")?,
+        Some(deadline) => gh_json_before(actions, &args, "live pull-request read", deadline)?,
+        None => gh_json(actions, &args, "live pull-request read")?,
     };
     if value.get("state").and_then(Value::as_str) != Some("OPEN") {
         return Ok(None);

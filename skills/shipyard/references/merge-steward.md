@@ -246,9 +246,15 @@ An operational failure before claim consumes no attempt and durably rotates
 that request behind untouched pending work, preventing a broken repository or
 GitHub preflight from starving unrelated requests.
 The steward's final merge-queue, PR, and required-check revalidation uses one
-20-second absolute deadline with bounded output capture. That budget begins
+45-second absolute deadline with bounded output capture. That budget begins
 before it acquires the publication lease, preventing a stalled GitHub process
-from retaining the lease indefinitely.
+from retaining the lease indefinitely. Each read inside it is capped at 15
+seconds per attempt and, when the first attempt times out or GitHub answers
+with a 5xx or a dropped connection, gets one more attempt inside the same
+deadline; a 4xx answer is final, and a retry never extends the deadline. A
+revalidation read failure leaves that PR's decision for the next pass and is
+reported as the PR's error. The live single-PR read reports itself as
+`live pull-request read` whichever step asked for it.
 
 Configure it only in the trusted machine-global `config.toml` reported by
 `shipyard paths`. Repository `.shipyard/config.toml` and checkout-local
