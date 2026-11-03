@@ -284,7 +284,8 @@ not listed as blocked.
 | `carries_unapproved_commits:#Q` | Approved and green, but carries commits of open pull request #Q, whose head is not approved; `blocked_detail` names the commits | Q's reviewer, or the author: drop Q's commits |
 | `carried_commits_over_cap:#N`, `carried_commits_unreadable` | Whether the head carries unapproved commits could not be proven (more than 250 commits, or a failed read) | author, or next pass |
 | `revalidating` | The head or queue changed during the pass | next pass |
-| `code_owner_review` | GitHub refused the enqueue: a code-owner review is outstanding | code owner |
+| `waiting_code_owner:<owners>` | Approved and green, but the base's ruleset requires a code-owner review and no owner `CODEOWNERS` (at the base) assigns to a changed file has approved this exact head. The steward asks GitHub nothing and records no mutation; it posts one comment per head mentioning the owners (`+`-joined in the token). It never reads `reviewDecision`, which is `null` on a base that requires zero approvals even after the owner approves. A team or e-mail owner, or a file the PR author owns, is left to GitHub | code owner |
+| `code_owner_review` | GitHub refused the enqueue: a code-owner review is outstanding. Recorded `rejected` with GitHub's message, never left uncertain | code owner |
 | `enqueue_refused:<message>` | GitHub definitively refused the enqueue for another reason, quoted | author or owner |
 | `uncertain_mutation` | An earlier enqueue of this pull request is still uncertain because GitHub's state could not be read; only this pull request waits | next pass, or operator |
 | `steward_error` | Admission failed; see `error` | operator |

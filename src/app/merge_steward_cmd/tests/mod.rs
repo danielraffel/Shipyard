@@ -19,9 +19,17 @@ fn fake_gh(temp: &tempfile::TempDir, body: &str) -> GitHubActions {
     } else {
         "case \"$*\" in *\"/compare/\"*\"total_commits\"*) printf '%s' '{\"total\":0,\"shas\":[]}'; exit 0;; esac\n"
     };
+    // The code-owner admission check reads the base's evaluated rules; by
+    // default they require no code-owner review. A fixture that answers
+    // `rules/branches` answers it itself.
+    let code_owner_shim = if body.contains("rules/branches") {
+        ""
+    } else {
+        "case \"$*\" in *rules/branches/*per_page=100*) printf '%s' '[[]]'; exit 0;; esac\n"
+    };
     crate::test_support::write_executable_script(
         &path,
-        &format!("#!/bin/sh\nset -eu\n{policy_shim}{carried_shim}{body}\n"),
+        &format!("#!/bin/sh\nset -eu\n{policy_shim}{carried_shim}{code_owner_shim}{body}\n"),
     );
     let config = crate::config::LoadedConfig {
         data: toml::Table::new(),
@@ -210,6 +218,8 @@ mod arm_guard;
 mod blocked_on;
 #[cfg(unix)]
 mod capacity;
+#[cfg(unix)]
+mod code_owner_wait;
 #[cfg(unix)]
 mod ejected_retry;
 mod exact_head_merge;

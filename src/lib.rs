@@ -47,6 +47,8 @@ pub mod classify;
 pub mod cloud;
 /// Durable cloud workflow dispatch records.
 pub mod cloud_records;
+/// Whether a pull request waits on a code-owner review, from `CODEOWNERS`.
+pub mod code_owners;
 /// Layered configuration loading and worktree fallback behavior.
 pub mod config;
 /// Pure, fail-closed translation from CTest JSON-v1 metadata into a canonical test inventory.

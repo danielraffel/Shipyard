@@ -4405,7 +4405,7 @@ re-reads every uncertain enqueue and resolves it in the mutations ledger:
 merged or queued at the recorded head is `accepted`, nothing on GitHub is
 `rejected`, and an unreadable state stays uncertain and marks the pass
 unhealthy. A typed GitHub refusal of an enqueue is recorded `rejected` with its
-message and reported as `code_owner_review` or `enqueue_refused:<message>`. See
+message and reported as `code_owner_review` or `enqueue_refused:<message>`. Before any enqueue or exact-head merge on a base whose ruleset requires a code-owner review, the steward judges the head from `CODEOWNERS` at the base and the exact-head reviews (never `reviewDecision`); a head no owner approved is reported `waiting_code_owner:<owners>`, with no mutation and one owner notice per head. See
 [references/merge-steward.md](references/merge-steward.md).
 
 Branch refreshes are the third guarded mutation, and the only one whose

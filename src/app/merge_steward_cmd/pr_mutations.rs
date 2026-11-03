@@ -95,6 +95,14 @@ pub(super) fn mutate_pr_with_recovery(
     {
         return (Some(token), Some(detail));
     }
+    // A base that requires a code-owner review refuses this head until an
+    // owner approves it: wait, without asking GitHub (or recording a
+    // mutation) for a refusal that is certain.
+    if matches!(decision, StewardDecision::ArmMergeQueue)
+        && let Some(waiting) = super::code_owner_wait::admission_wait(context, pr, ledger)
+    {
+        return (Some(waiting), None);
+    }
     match decision {
         StewardDecision::ArmMergeQueue if policy.server_enforced_exact_head_merge() => {
             super::exact_head_merge::merge_exact_head(context, pr, policy, ledger)
