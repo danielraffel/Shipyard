@@ -873,6 +873,14 @@ currently required trailer is treated as stale and rebuilt on the next run;
 dispatch `version-at-land.yml` by hand to force that without waiting for a
 landing.
 
+A steward PR error ending `timed out after <N>ms` on a live read (the
+`live pull-request read`, `current-head check identities`, or the merge-queue
+snapshot) usually means the shared revalidation deadline ran out, not that
+the one call was slow: `<N>` is whatever was left of the deadline. Each read
+inside it is capped per attempt and retried once on a timeout, 5xx or dropped
+connection, within the same deadline. The PR is decided again on the next
+pass; there is nothing to repair on the PR.
+
 It judges each first-parent change since the last `Version-Bump-Applied` marker
 on its own, then takes the highest level per surface. A
 `Version-Bump: <surface>=skip` trailer therefore skips only the change that
