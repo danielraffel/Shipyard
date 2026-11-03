@@ -201,6 +201,7 @@ pub(super) fn for_row(context: &RowContext<'_>, stall: &Stall) -> NextAction {
         error: context.error,
     };
     let mut next = callers_move(kind, &facts, stall)
+        .or_else(|| code_owners_move(kind, &facts))
         .or_else(|| someone_elses_move(kind, &facts))
         .unwrap_or_else(|| {
             NextAction::new(
@@ -312,6 +313,34 @@ fn callers_move(kind: &str, facts: &Facts<'_>, stall: &Stall) -> Option<NextActi
                 .to_owned(),
         ),
         "empty_diff" => NextAction::empty_diff(base),
+        _ => return None,
+    })
+}
+
+/// The tokens a code owner moves: the caller stops and reports.
+fn code_owners_move(kind: &str, facts: &Facts<'_>) -> Option<NextAction> {
+    let Facts {
+        arg, detail_suffix, ..
+    } = facts;
+    Some(match kind {
+        "waiting_code_owner" => NextAction::stop(
+            Actor::Owner,
+            format!(
+                "Green and approved; the base requires a code-owner review and no code owner \
+                 ({}) has approved this exact head. The steward notified them once and admits \
+                 the head on the pass after one approves. Stop and report; do not push, do not \
+                 label it {OWNER_DECISION_LABEL}.",
+                arg.replace('+', ", ")
+            ),
+        ),
+        "code_owner_review" => NextAction::stop(
+            Actor::Owner,
+            format!(
+                "GitHub refused to admit this head pending a code-owner review{detail_suffix}. \
+                 A code owner approves this exact head; the steward retries on its next pass. \
+                 Stop and report; do not push."
+            ),
+        ),
         _ => return None,
     })
 }

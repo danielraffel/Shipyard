@@ -1431,6 +1431,7 @@ mod cancellation_revalidation;
 mod cancellation_terminalization;
 mod capacity_cancellation;
 mod carried_commits;
+mod code_owner_wait;
 mod exact_head_merge;
 mod ledger;
 mod mutation_outcome;

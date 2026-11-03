@@ -123,6 +123,9 @@ pub(super) struct GateRecord {
     pub blocker: Option<ApprovalBlocker>,
     /// The queue removed this exact head and no new head followed.
     pub ejection: Option<SameHeadEjection>,
+    /// A dry run's `waiting_code_owner:<owners>` token for a head the gate
+    /// admits but a required code-owner review still holds.
+    pub code_owner_wait: Option<String>,
 }
 
 impl GateRecord {
@@ -144,6 +147,7 @@ impl GateRecord {
             head: head.to_owned(),
             blocker,
             ejection,
+            code_owner_wait: None,
         }
     }
 }
@@ -377,6 +381,12 @@ fn arm_candidate(facts: &RowFacts<'_>, policy: &StewardPolicy) -> (Stall, SinceH
                 facts.error.map(str::to_owned),
             ),
         };
+    }
+    if let Some(part) = parts
+        .iter()
+        .find(|part| super::code_owner_wait::is_wait_token(part))
+    {
+        return green((*part).to_owned(), green_since(), None);
     }
     if let Some(part) = parts
         .iter()
@@ -787,6 +797,21 @@ pub(super) fn annotate(
                 .as_ref()
                 .map(SameHeadRetry::from_verdict);
             }
+            // What an apply pass would find before its mutation: a head the
+            // gate admits may still wait on a code-owner review.
+            if record.blocker.is_none()
+                && record.ejection.is_none()
+                && matches!(report.decision, StewardDecision::ArmMergeQueue)
+                && let Ok(crate::code_owners::CodeOwnerStatus::Missing { owners, .. }) =
+                    super::code_owner_wait::read_status(
+                        actions,
+                        &observation.repo,
+                        &observation.base,
+                        pr,
+                    )
+            {
+                record.code_owner_wait = Some(super::code_owner_wait::token(&owners));
+            }
             dry_run_blockers.insert(report.number, record);
         }
         let record = blockers
@@ -812,6 +837,11 @@ pub(super) fn annotate(
             },
             policy,
         );
+        if blocked.blocked_on == "ready"
+            && let Some(waiting) = record.and_then(|record| record.code_owner_wait.as_ref())
+        {
+            blocked.blocked_on.clone_from(waiting);
+        }
         fill_since(actions, &observation.repo, pr, &hint, &mut blocked);
         blocked.next_action = Some(super::next_action::for_row(
             &super::next_action::RowContext {
