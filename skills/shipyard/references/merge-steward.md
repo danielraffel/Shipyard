@@ -238,6 +238,17 @@ recovery signal, it supersedes active receipts and removes only the matching
 exact-head witness under the final completion lease. A newer-head witness
 published during the GitHub-operation gap remains intact, while an in-flight
 old-head advisory result cannot commit afterward.
+On a base without a merge queue, the steward's own failed
+`shipyard/steward-recovery` status is a red non-required context, so GitHub
+reports the head UNSTABLE until it is cleared. When a pass clears that signal
+from a PR whose only wait was that UNSTABLE merge state, it re-reads the exact
+head live, re-classifies it, and acts on the new decision in the same pass, so
+a fixed PR merges without waiting a tick. The re-read is an ordinary live
+classification: the merge still needs CLEAN, green required checks, and the
+exact-head approval under the merge path's own guard and final revalidation.
+If GitHub still reports UNSTABLE (it recomputes the state asynchronously,
+so the steward looks once more after a short pause) or the re-read fails, the
+PR waits for the next pass as before.
 `--apply` runs one worker attempt and persists its terminal receipt;
 `--drain --apply` processes only the initial bounded snapshot (at most 32), not
 an unbounded watch loop. Even if normalized evidence or policy changes, a

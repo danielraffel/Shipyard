@@ -11,6 +11,7 @@ use super::{
     pull_request_is_managed, pull_request_provenance_blocked,
     queue_priority_recovery::record_queue_witnesses,
     reconcile_management_label, reconcile_recovery_signal, record_audit,
+    recovery::RecoveryClearReclassification,
     revalidate_coalescing_cancellation,
     terminal_handoff::{
         reconcile_queued_success_continuation, resolve_superseded_terminal_handoffs,
@@ -308,7 +309,8 @@ pub(super) fn apply_pr_plans(
         .iter()
         .map(|pr| {
             let attempts = attempts_for(ledger, &observation.repo, &pr.fact);
-            let decision = classify_pr(&pr.fact, policy, &attempts);
+            let mut decision = classify_pr(&pr.fact, policy, &attempts);
+            let mut reobserved: Option<Box<ObservedPr>> = None;
             // Every open PR on the base, owned or not, on every merge path:
             // an arm or queue entry whose current head the approval gate does
             // not admit is withdrawn before anything else acts on it. See
@@ -381,10 +383,37 @@ pub(super) fn apply_pr_plans(
                 if let Some(context) = mutation_context.as_ref() {
                     let (recovery_mutation, recovery_error) =
                         reconcile_recovery_signal(context, pr, policy, &decision, ledger);
+                    // A clear can lift the only thing the decision waited on;
+                    // act on the live head now rather than a pass later.
+                    let reclassification = if recovery_error.is_none() {
+                        super::recovery::reclassify_after_recovery_clear(
+                            context,
+                            pr,
+                            policy,
+                            &decision,
+                            recovery_mutation.as_deref(),
+                            ledger,
+                        )
+                    } else {
+                        RecoveryClearReclassification::Unchanged
+                    };
                     if let Some(recovery_mutation) = recovery_mutation {
                         mutation = Some(mutation.map_or(recovery_mutation.clone(), |prior| {
                             format!("{prior},{recovery_mutation}")
                         }));
+                    }
+                    match reclassification {
+                        RecoveryClearReclassification::Unchanged => {}
+                        RecoveryClearReclassification::Reclassified(live, live_decision) => {
+                            reobserved = Some(live);
+                            decision = live_decision;
+                        }
+                        RecoveryClearReclassification::ReadFailed(read_error) => {
+                            let note = format!("recovery_clear_reread_failed:{read_error}");
+                            mutation = Some(
+                                mutation.map_or(note.clone(), |prior| format!("{prior},{note}")),
+                            );
+                        }
                     }
                     error = recovery_error;
                 } else {
@@ -415,6 +444,7 @@ pub(super) fn apply_pr_plans(
                     }
                 }
             }
+            let pr = reobserved.as_deref().unwrap_or(pr);
             if args.apply
                 && error.is_none()
                 && pr.fact.auto_merge_active

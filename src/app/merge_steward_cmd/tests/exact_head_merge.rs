@@ -623,3 +623,150 @@ fn an_app_bound_rule_counts_that_apps_check_run_or_status_and_no_one_elses_statu
     );
     assert_no_write(&pending);
 }
+
+/// The PR as GitHub reports it while the steward's own failed recovery status
+/// and its `needs-agent` label are still on the head: everything required is
+/// green, but that red non-required status holds the merge state at UNSTABLE.
+fn recovery_flagged_pr_json() -> String {
+    pr_json_with_status(HEAD, true, false, None)
+        .replace(r#""mergeStateStatus":"CLEAN""#, r#""mergeStateStatus":"UNSTABLE""#)
+        .replace(r#""labels":[]"#, r#""labels":[{"name":"shipyard:needs-agent"}]"#)
+        .replace(
+            "]}",
+            &format!(
+                r#",{{"__typename":"StatusContext","context":"{RECOVERY_CONTEXT}","state":"FAILURE","createdAt":"2026-10-30T00:03:00Z"}}]}}"#
+            ),
+        )
+}
+
+/// The same PR once the clear has landed: label gone, recovery status green,
+/// merge state CLEAN.
+fn recovery_cleared_pr_json() -> String {
+    pr_json_with_status(HEAD, true, false, None).replace(
+        "]}",
+        &format!(
+            r#",{{"__typename":"StatusContext","context":"{RECOVERY_CONTEXT}","state":"SUCCESS","createdAt":"2026-10-30T00:04:00Z"}}]}}"#
+        ),
+    )
+}
+
+/// Run one full steward pass over a recovery-flagged, otherwise-ready head.
+/// The fake GitHub reports the cleared shape only after the steward has
+/// written its success recovery status, and reports `cleared_merge_state`
+/// as the merge state from then on.
+fn run_recovery_clear_pass(cleared_merge_state: &str) -> (PrReport, String) {
+    let temp = tempfile::tempdir().expect("temp");
+    let log = temp.path().join("calls");
+    let marker = temp.path().join("recovery-cleared");
+    let base = Fixture::approved_clean().script(&log);
+    let live_line = format!(
+        r#"  "pr view "*) printf '%s' '{}' ;;"#,
+        pr_json_with_status(HEAD, true, false, None)
+    );
+    assert!(base.contains(&live_line), "fixture shape changed");
+    let cleared =
+        recovery_cleared_pr_json().replace("\"CLEAN\"", &format!("\"{cleared_merge_state}\""));
+    let script = base.replace(
+        &live_line,
+        &format!(
+            r#"  *"-X POST repos/owner/repo/statuses/{HEAD}"*) : > '{marker}'; printf '%s' '{{}}' ;;
+  *"-X DELETE repos/owner/repo/issues/42/labels/"*) printf '%s' '{{}}' ;;
+  "api repos/owner/repo/pulls/42") printf '%s' '{{"state":"open","head":{{"sha":"{HEAD}"}}}}' ;;
+  "pr view "*) if [ -e '{marker}' ]; then printf '%s' '{cleared}'; else printf '%s' '{flagged}'; fi ;;"#,
+            marker = marker.display(),
+            flagged = recovery_flagged_pr_json(),
+        ),
+    );
+    let actions = fake_gh(&temp, &script);
+    let mut pr = parse_pr(
+        &serde_json::from_str(&recovery_flagged_pr_json()).expect("PR json"),
+        &BTreeMap::new(),
+    )
+    .expect("PR");
+    pr.fact.checks.push(
+        crate::app::merge_steward_cmd::observation::parse_rest_check(
+            &serde_json::from_str(&rest_check_run(true)).expect("check run"),
+        )
+        .expect("check run"),
+    );
+    let observation = observation(pr);
+    let args = StewardCommandArgs {
+        repos: vec!["owner/repo".to_owned()],
+        base: "main".to_owned(),
+        opt_out_label: "steward:skip".to_owned(),
+        provenance_blocking_labels: default_provenance_blocking_labels(),
+        managed_label: MANAGED_LABEL.to_owned(),
+        handoff_context: HANDOFF_CONTEXT.to_owned(),
+        max_transient_reruns: 1,
+        recover_hosted_setup_eviction_priority: false,
+        coalesce: true,
+        preempt_capacity: true,
+        max_preemptions_per_head: 1,
+        arm_unqueued: false,
+        approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
+        wake_owner: false,
+        unapproved_dequeue: crate::app::merge_steward_cmd::DequeueMode::Report,
+        apply: true,
+        ledger: None,
+    };
+    let mut ledger = StewardLedger::default();
+    let control = mutation_control(&temp, "studio", "studio");
+    let (mut reports, _failed) = apply_pr_plans(
+        &actions,
+        &args,
+        &observation,
+        &no_queue_policy(required(true)),
+        &temp.path().join("ledger.json"),
+        &mut ledger,
+        Some(&control),
+    );
+    let calls = fs::read_to_string(log).unwrap_or_default();
+    (reports.remove(0), calls)
+}
+
+/// A pass that clears the steward's own stale recovery signal from an
+/// otherwise-ready head merges it in that same pass, instead of leaving it to
+/// wait on the UNSTABLE merge state the cleared status caused.
+#[cfg(unix)]
+#[test]
+fn clearing_a_stale_recovery_signal_merges_the_ready_head_in_the_same_pass() {
+    let (report, calls) = run_recovery_clear_pass("CLEAN");
+    assert!(report.error.is_none(), "{report:?}\n{calls}");
+    assert_eq!(report.decision, StewardDecision::ArmMergeQueue, "{calls}");
+    assert_eq!(
+        report.mutation,
+        Some(format!("needs_agent_cleared,merged_exact_head:{HEAD}")),
+        "{calls}"
+    );
+    // The clear is written before the merge, and the merge is exact-head.
+    let clear = calls.find("state=success").expect("recovery clear");
+    let merge = calls.find("mergePullRequest(").expect("merge");
+    assert!(clear < merge, "{calls}");
+    assert!(calls.contains(&format!("head={HEAD}")), "{calls}");
+    assert_eq!(calls.matches("mergePullRequest(").count(), 1, "{calls}");
+}
+
+/// When GitHub still reports UNSTABLE after the clear, the pass merges
+/// nothing: the re-read is a live classification, not a waiver of the
+/// CLEAN requirement.
+#[cfg(unix)]
+#[test]
+fn a_head_still_unstable_after_the_clear_waits_for_the_next_pass() {
+    let (report, calls) = run_recovery_clear_pass("UNSTABLE");
+    assert!(report.error.is_none(), "{report:?}\n{calls}");
+    assert_eq!(
+        report.decision,
+        StewardDecision::WaitingRequired {
+            contexts: vec!["github-merge-state:CLEAN (current=UNSTABLE)".to_owned()]
+        }
+    );
+    assert_eq!(report.mutation.as_deref(), Some("needs_agent_cleared"));
+    assert_no_write(&Outcome {
+        decision: report.decision.clone(),
+        mutation: report.mutation.clone(),
+        error: None,
+        calls: calls.clone(),
+        ledger: StewardLedger::default(),
+        temp: tempfile::tempdir().expect("temp"),
+    });
+}
