@@ -1188,15 +1188,19 @@ fn check_runs_for_head_with_deadline(
 ) -> Result<Vec<StewardCheck>, String> {
     let mut checks = Vec::new();
     for page in 1..=10 {
-        let value = gh_json_with_deadline(
-            actions,
-            &[
-                "api".to_owned(),
-                format!("repos/{repo}/commits/{head_sha}/check-runs?per_page=100&page={page}"),
-            ],
-            "current-head check identities",
-            deadline,
-        )?;
+        let args = [
+            "api".to_owned(),
+            format!("repos/{repo}/commits/{head_sha}/check-runs?per_page=100&page={page}"),
+        ];
+        let value = match deadline {
+            Some(deadline) => {
+                gh_json_before(actions, &args, "current-head check identities", deadline)
+            }
+            None => retry_check_observation(
+                || gh_json(actions, &args, "current-head check identities"),
+                std::thread::sleep,
+            ),
+        }?;
         let rows = value
             .get("check_runs")
             .and_then(Value::as_array)
@@ -1222,7 +1226,30 @@ pub(super) fn complete_checks_for_head(
     Ok(checks)
 }
 
-fn commit_statuses_for_head_with_deadline(
+// Only the read-only check-run and status endpoints use these retries. A persistent outage
+// still refuses the observation; no partial check set reaches admission.
+pub(super) fn retry_check_observation<T>(
+    mut read: impl FnMut() -> Result<T, String>,
+    mut sleep: impl FnMut(Duration),
+) -> Result<T, String> {
+    for attempt in 0..3 {
+        match read() {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                let transient_http = ["(HTTP 500)", "(HTTP 502)", "(HTTP 503)", "(HTTP 504)"]
+                    .iter()
+                    .any(|status| error.contains(status));
+                if attempt == 2 || !transient_http {
+                    return Err(error);
+                }
+                sleep(Duration::from_millis(250 << attempt));
+            }
+        }
+    }
+    unreachable!("the final attempt returns")
+}
+
+pub(super) fn commit_statuses_for_head_with_deadline(
     actions: &GitHubActions,
     repo: &str,
     head_sha: &str,
@@ -1230,15 +1257,19 @@ fn commit_statuses_for_head_with_deadline(
 ) -> Result<Vec<StewardCheck>, String> {
     let mut checks = Vec::new();
     for page in 1..=10 {
-        let value = gh_json_with_deadline(
-            actions,
-            &[
-                "api".to_owned(),
-                format!("repos/{repo}/commits/{head_sha}/statuses?per_page=100&page={page}"),
-            ],
-            "current-head commit statuses",
-            deadline,
-        )?;
+        let args = [
+            "api".to_owned(),
+            format!("repos/{repo}/commits/{head_sha}/statuses?per_page=100&page={page}"),
+        ];
+        let value = match deadline {
+            Some(deadline) => {
+                gh_json_before(actions, &args, "current-head commit statuses", deadline)
+            }
+            None => retry_check_observation(
+                || gh_json(actions, &args, "current-head commit statuses"),
+                std::thread::sleep,
+            ),
+        }?;
         let rows = value
             .as_array()
             .ok_or_else(|| "current-head commit statuses were not an array".to_owned())?;

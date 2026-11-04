@@ -5770,3 +5770,13 @@ In JSON, `baseline.exit` is the existing report-completeness field and
 ## Duplicate check recency
 
 When a required context has several observations (reruns), the steward, queue observer, reconcile and landing verdict pick the newest by monotonic id (check-run id, i.e. the Actions job id, or status id), never by timestamp alone: a clock change such as the repeated DST hour can stamp an older attempt later. Ids decide only when both sides have one; otherwise the timestamp does (`cmp_id_then_time`).
+
+## Transient check observation failures
+
+Current-head check-run and commit-status GETs without a caller deadline get
+three attempts total for HTTP 500/502/503/504, with 250 ms and 500 ms backoff.
+A persistent outage still refuses admission; auth, rate-limit and payload
+validation failures are not retried. Deadline-bound observations retain their
+existing deadline. An enqueue mutation returning HTTP 502 has an unknown
+outcome: read back the live queue before reconciliation; these read retries do
+not authorize repeating an enqueue.

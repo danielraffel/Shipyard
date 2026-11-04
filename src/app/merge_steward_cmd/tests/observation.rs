@@ -1692,3 +1692,137 @@ fn a_bounded_read_retry_never_outlives_the_deadline() {
         started.elapsed()
     );
 }
+
+#[test]
+fn check_observation_retries_only_transient_http_with_bounded_backoff() {
+    use crate::app::merge_steward_cmd::observation::retry_check_observation;
+    for status in [500, 502, 503, 504] {
+        let mut calls = 0;
+        let mut delays = Vec::new();
+        let value = retry_check_observation(
+            || {
+                calls += 1;
+                if calls < 3 {
+                    Err(format!("gh: server error (HTTP {status})"))
+                } else {
+                    Ok(42)
+                }
+            },
+            |delay| delays.push(delay),
+        )
+        .expect("transient response recovers");
+        assert_eq!(value, 42);
+        assert_eq!(calls, 3);
+        assert_eq!(
+            delays,
+            [Duration::from_millis(250), Duration::from_millis(500)]
+        );
+    }
+    let mut calls = 0;
+    let mut delays = Vec::new();
+    let error = retry_check_observation::<()>(
+        || {
+            calls += 1;
+            Err("gh: Bad Gateway (HTTP 502)".to_owned())
+        },
+        |delay| delays.push(delay),
+    )
+    .expect_err("persistent failure stays closed");
+    assert!(error.contains("HTTP 502"));
+    assert_eq!(calls, 3);
+    assert_eq!(delays.len(), 2);
+}
+
+#[test]
+fn check_observation_does_not_retry_auth_policy_or_validation_errors() {
+    use crate::app::merge_steward_cmd::observation::retry_check_observation;
+    for error in [
+        "gh: Bad credentials (HTTP 401)",
+        "gh: Forbidden (HTTP 403)",
+        "gh: Not Found (HTTP 404)",
+        "gh: Too Many Requests (HTTP 429)",
+        "gh: Not Implemented (HTTP 501)",
+        "current-head commit statuses returned malformed JSON",
+        "current-head commit statuses were not an array",
+        "connection reset",
+        "HTTP 5020",
+    ] {
+        let mut calls = 0;
+        let result = retry_check_observation::<()>(
+            || {
+                calls += 1;
+                Err(error.to_owned())
+            },
+            |_| panic!("non-transient failures must not back off"),
+        );
+        assert_eq!(result, Err(error.to_owned()));
+        assert_eq!(calls, 1);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn status_endpoint_recovers_transient_gateway_failure_without_partial_checks() {
+    use crate::app::merge_steward_cmd::observation::commit_statuses_for_head_with_deadline;
+    let temp = tempfile::tempdir().expect("temp");
+    let calls = temp.path().join("status-calls");
+    let actions = fake_gh(
+        &temp,
+        &format!(
+            r#"
+case "$*" in
+  *"/statuses?per_page=100&page=1"*) ;;
+  *) echo "unexpected endpoint: $*" >&2; exit 2 ;;
+esac
+echo "$*" >> '{calls}'
+if [ "$(wc -l < '{calls}')" -eq 1 ]; then
+  echo 'gh: Bad Gateway (HTTP 502)' >&2
+  exit 1
+fi
+printf '%s' '[{{"context":"macos","state":"success"}}]'
+"#,
+            calls = calls.display()
+        ),
+    );
+    let checks =
+        commit_statuses_for_head_with_deadline(&actions, "owner/repo", &"a".repeat(40), None)
+            .expect("same status page recovers");
+    assert_eq!(checks.len(), 1);
+    assert_eq!(checks[0].name, "macos");
+    let calls = fs::read_to_string(calls).expect("calls");
+    let lines: Vec<_> = calls.lines().collect();
+    assert_eq!(lines.len(), 2);
+    assert_eq!(
+        lines[0], lines[1],
+        "retry must read the same immutable head and page"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn check_endpoint_recovers_transient_server_failure() {
+    let temp = tempfile::tempdir().expect("temp");
+    let calls = temp.path().join("check-calls");
+    let actions = fake_gh(
+        &temp,
+        &format!(
+            r#"
+echo "$*" >> '{calls}'
+if [ "$(wc -l < '{calls}')" -eq 1 ]; then
+  echo 'gh: Internal Server Error (HTTP 500)' >&2
+  exit 1
+fi
+printf '%s' '{{"check_runs":[{{"name":"macos","status":"completed","conclusion":"success"}}]}}'
+"#,
+            calls = calls.display()
+        ),
+    );
+    let checks = check_runs_for_head(&actions, "owner/repo", &"a".repeat(40))
+        .expect("check-run read recovers");
+    assert_eq!(checks.len(), 1);
+    assert_eq!(checks[0].name, "macos");
+    let calls = fs::read_to_string(calls).expect("calls");
+    let lines: Vec<_> = calls.lines().collect();
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0], lines[1]);
+}
