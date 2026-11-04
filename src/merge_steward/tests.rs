@@ -1524,3 +1524,23 @@ fn a_pending_approval_status_on_an_exact_head_base_is_waiting_not_failed() {
         Some(StewardDecision::RequiredFailed { .. })
     ));
 }
+
+#[test]
+fn a_failed_ordinary_check_outranks_a_pending_approval_status() {
+    let mut pr = awaiting_verdict_pr("IN_PROGRESS", None);
+    pr.checks[0].conclusion = Some("FAILURE".to_owned());
+    let decision = classify_pr(&pr, &approval_policy(), &BTreeMap::new());
+    assert_eq!(
+        decision,
+        StewardDecision::RequiredFailed {
+            contexts: vec!["required".to_owned()]
+        }
+    );
+    // Control: with the ordinary check green only the reviewer remains, and
+    // admission still refuses.
+    let waiting = awaiting_verdict_pr("IN_PROGRESS", None);
+    assert!(matches!(
+        classify_pr(&waiting, &approval_policy(), &BTreeMap::new()),
+        StewardDecision::WaitingRequired { .. }
+    ));
+}

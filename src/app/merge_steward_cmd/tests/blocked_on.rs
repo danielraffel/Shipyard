@@ -764,6 +764,65 @@ fn a_pending_review_verdict_under_a_failed_check_run_waits_on_the_reviewer() {
     );
 }
 
+/// A failed ordinary check stays actionable when the approval status is
+/// pending: the failure is named and recovery still sees `RequiredFailed`.
+#[test]
+fn a_failed_macos_check_is_not_hidden_by_a_pending_review_verdict() {
+    let policy = app_bound_policy(&["macos", "review-verdict"]);
+    let mut pr = pr_with(
+        1101,
+        &[],
+        "CLEAN",
+        &json!([
+            app_check(
+                "macos",
+                "COMPLETED",
+                Some("FAILURE"),
+                "2026-11-03T09:00:00Z"
+            ),
+            app_check(
+                "review-verdict",
+                "COMPLETED",
+                Some("FAILURE"),
+                "2026-11-03T10:00:05Z"
+            ),
+        ]),
+    );
+    pr.fact.checks.push(crate::merge_steward::StewardCheck {
+        name: "review-verdict".to_owned(),
+        source: crate::merge_steward::StewardCheckSource::StatusContext,
+        app_id: Some(15368),
+        status: "IN_PROGRESS".to_owned(),
+        conclusion: None,
+        run_id: None,
+        observed_at: Some("2026-11-03T10:00:00Z".to_owned()),
+        check_id: Some(5),
+    });
+    let decision = classify_pr(&pr.fact, &policy, &BTreeMap::new());
+    let StewardDecision::RequiredFailed { contexts } = &decision else {
+        panic!("expected RequiredFailed, got {decision:?}");
+    };
+    assert!(
+        contexts.iter().all(|c| c.starts_with("macos")),
+        "{contexts:?}"
+    );
+    let facts = RowFacts {
+        pr: &pr.fact,
+        decision: &decision,
+        mutation: None,
+        error: None,
+        approval: GateRead::Unread,
+        enqueued_at: None,
+        ejection: None,
+    };
+    let (stall, _) = classify(&facts, &policy);
+    assert!(
+        stall.blocked_on.starts_with("required_failed:macos"),
+        "{}",
+        stall.blocked_on
+    );
+}
+
 /// danielraffel/Shipyard#969 read `required_failed:review-verdict` while
 /// the real cause was its APPROVE's signer, which the base does not count.
 /// When the approval context is the only red required context, the approval

@@ -463,13 +463,17 @@ fn bucket_required_checks(
     // a failed check, so the pending status decides: it is never a pass.
     let approval_pending = approval_status_pending(pr, policy);
     let approval_context = policy.approval_context.trim();
+    let mut approval_waiting = Vec::new();
     for (context, check) in selected {
-        let waits = check.is_none_or(|check| {
-            !check.status.eq_ignore_ascii_case("COMPLETED")
-                || (approval_pending && check.name.eq_ignore_ascii_case(approval_context))
-        });
+        let waits = check.is_none_or(|check| !check.status.eq_ignore_ascii_case("COMPLETED"));
         if waits {
             waiting.push(context);
+            continue;
+        }
+        if approval_pending
+            && check.is_some_and(|check| check.name.eq_ignore_ascii_case(approval_context))
+        {
+            approval_waiting.push(context);
             continue;
         }
         let Some(check) = check else { continue };
@@ -490,6 +494,11 @@ fn bucket_required_checks(
         } else {
             failed.push(context);
         }
+    }
+    // A reviewer-only wait must not mask a genuine terminal failure in another
+    // required check: the failure stays actionable for the author and recovery.
+    if failed.is_empty() {
+        waiting.extend(approval_waiting);
     }
     (waiting, failed, transient_runs)
 }
