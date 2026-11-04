@@ -43,18 +43,24 @@ class ClassifyTests(unittest.TestCase):
 
 
 class KnownFixTests(unittest.TestCase):
-    def test_pat_without_pull_request_rights(self) -> None:
-        fix = rw.known_fix("gh stderr: gh: Resource not accessible by personal access token (HTTP 403)")
+    def test_app_token_without_pull_request_rights(self) -> None:
+        fix = rw.known_fix("gh stderr: gh: Resource not accessible by integration (HTTP 403)")
         self.assertIn("Pull requests: Read and write", fix)
         self.assertIn("Commit statuses: Read and write", fix)
-        self.assertIn("gh secret set RELEASE_BOT_TOKEN --repo danielraffel/Shipyard", fix)
+        self.assertIn("shipyard-local App", fix)
+        self.assertIn("gh workflow run version-at-land.yml --repo danielraffel/Shipyard", fix)
 
-    def test_expired_token(self) -> None:
-        self.assertIn("expired", rw.known_fix("gh: Bad credentials (HTTP 401)"))
-        self.assertIn("expired", rw.known_fix("fatal: could not read Username"))
+    def test_rejected_token(self) -> None:
+        self.assertIn("rejected", rw.known_fix("gh: Bad credentials (HTTP 401)"))
+        self.assertIn("rejected", rw.known_fix("fatal: could not read Username"))
+        self.assertIn("SHIPYARD_APP_PRIVATE_KEY", rw.known_fix(
+            "Release App token was rejected; check the secrets"))
 
     def test_missing_secret(self) -> None:
-        self.assertIn("not set", rw.known_fix("RELEASE_BOT_TOKEN is required; refusing"))
+        fix = rw.known_fix("##[error]Shipyard release App credentials are required "
+                           "(secret SHIPYARD_APP_PRIVATE_KEY); refusing")
+        self.assertIn("not set", fix)
+        self.assertIn("gh secret set SHIPYARD_APP_PRIVATE_KEY --repo danielraffel/Shipyard", fix)
 
     def test_ruleset_refusal(self) -> None:
         self.assertIn("repository rule",
@@ -67,16 +73,16 @@ class KnownFixTests(unittest.TestCase):
 class LogExcerptTests(unittest.TestCase):
     def test_keeps_error_lines_and_drops_the_echoed_script(self) -> None:
         log = "\n".join(PREFIX + line for line in (
-            "\x1b[36;1mtest -n \"$RELEASE_BOT_TOKEN\" || { echo 'RELEASE_BOT_TOKEN is required' >&2; }",
-            "  RELEASE_BOT_TOKEN: ***",
+            "\x1b[36;1mtest -n \"$GH_TOKEN\" || { echo 'Release App token is required' >&2; }",
+            "  GH_TOKEN: ***",
             "version-at-land: gh api POST repos/o/r/pulls failed (exit 1)",
-            "gh stderr: gh: Resource not accessible by personal access token (HTTP 403)",
+            "gh stderr: gh: Resource not accessible by integration (HTTP 403)",
             "##[error]Process completed with exit code 1.",
         ))
         excerpt = rw.log_excerpt(log)
         self.assertEqual(excerpt, [
             "version-at-land: gh api POST repos/o/r/pulls failed (exit 1)",
-            "gh stderr: gh: Resource not accessible by personal access token (HTTP 403)",
+            "gh stderr: gh: Resource not accessible by integration (HTTP 403)",
             "##[error]Process completed with exit code 1.",
         ])
         self.assertIn("Pull requests", rw.known_fix("\n".join(excerpt)))
@@ -88,7 +94,7 @@ class WatchdogBodyTests(unittest.TestCase):
                                 1, ["gh stderr: gh: Bad credentials (HTTP 401)"], NOW)
         self.assertIn("https://run/1", body)
         self.assertIn("gh stderr: gh: Bad credentials (HTTP 401)", body)
-        self.assertIn("**Fix:** RELEASE_BOT_TOKEN is expired", body)
+        self.assertIn("**Fix:** The release App token was rejected", body)
         self.assertIn("closes automatically", body)
 
     def test_workflow_file_error_points_at_actionlint(self) -> None:

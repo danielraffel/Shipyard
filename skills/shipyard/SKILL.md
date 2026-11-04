@@ -2305,7 +2305,10 @@ When debugging GitHub behavior:
   configuration operations. An unreadable runner inventory is unknown/defer,
   never proof that capacity is idle or safe to reset.
 - Keep `RELEASE_BOT_TOKEN` separate. `shipyard release-bot setup/status` are
-  operator actions and intentionally use ambient `gh` auth.
+  operator actions and intentionally use ambient `gh` auth. Shipyard's own
+  release workflows no longer read it: they mint a repository-scoped
+  shipyard-local App token from the `SHIPYARD_APP_PRIVATE_KEY` secret, so
+  `release-bot status` reporting the PAT missing on Shipyard itself is expected.
 - Keep high-volume GitHub inspection on the configured Shipyard auth source.
   Ambient auth is permitted only for documented low-volume mutations after an
   exact App integration-permission denial (PR creation after both GraphQL and

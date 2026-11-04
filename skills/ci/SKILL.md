@@ -1114,12 +1114,22 @@ currently required trailer is treated as stale and rebuilt on the next run;
 dispatch `version-at-land.yml` by hand to force that without waiting for a
 landing.
 
-`RELEASE_BOT_TOKEN` makes those pull request calls too, so as a fine-grained
-token it needs Pull requests and Commit statuses write on top of Contents write.
-With Contents alone the run still force-pushes `release/version-at-land` (the
-branch looks healthy) and then fails on `POST /pulls`; no bump pull request
-opens and main stops releasing. The run log prints gh's error and names the
-missing permission.
+Shipyard's own `version-at-land.yml` and `auto-release.yml` mint a
+shipyard-local App installation token per run (`actions/create-github-app-token`,
+App client ID in the workflow, private key in the `SHIPYARD_APP_PRIVATE_KEY`
+secret) instead of a PAT; App-token pushes and pull requests still start
+workflows. The bump token requests Contents, Pull requests, Commit statuses and
+Workflows write: Workflows because the rebuilt branch is force-pushed, and
+GitHub refuses that from an App token without it whenever main changed
+`.github/workflows` since the last bump. Never pass `owner:` with a
+`repositories:` value read from `github.event.repository` — schedule events
+carry none, and an empty list widens the token to every repository of the
+owner; omit both to scope to the current repository. A token missing a
+permission still force-pushes `release/version-at-land` (the branch looks
+healthy) and then fails on `POST /pulls`; no bump pull request opens and main
+stops releasing. The run log prints gh's error and names the missing
+permission. Consumer repos set up through `shipyard release-bot` still use a
+`RELEASE_BOT_TOKEN` PAT with the same permission set.
 
 A stalled release chain opens a `release-stall` issue on its own:
 `auto-release-watchdog.yml` tracks a failing `version-at-land.yml` or
