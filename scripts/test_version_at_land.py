@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -132,7 +133,13 @@ class VersionAtLandTests(unittest.TestCase):
             self.assertIn("Shipyard release App credentials are required", workflow)
             self.assertIn("actions/create-github-app-token@" + APP_TOKEN_ACTION_SHA, workflow)
             self.assertIn("token: ${{ steps.app-token.outputs.token }}", workflow)
-            self.assertIn("repositories: ${{ github.event.repository.name }}", workflow)
+            # No owner/repositories input: the token covers this repository only.
+            # (An empty repositories value with owner set widens it to every
+            # repository of the owner.)
+            self.assertNotIn("owner:", workflow)
+            self.assertNotIn("repositories:", workflow)
+            self.assertIn("client-id: Iv23liTCzDQWqmMjkDTI", workflow)
+            self.assertNotIn("app-id:", workflow)
 
     def test_writer_workflow_lands_through_the_bump_pr(self) -> None:
         workflow = (HERE.parent / ".github/workflows/version-at-land.yml").read_text()
@@ -143,10 +150,9 @@ class VersionAtLandTests(unittest.TestCase):
         # The default job token stays read-only; the App token carries only
         # what the bump needs.
         self.assertNotRegex(workflow, r"(?m)^\s+contents: write")
-        for permission in ("contents", "pull-requests", "statuses"):
-            self.assertIn(f"permission-{permission}: write", workflow)
-        self.assertNotIn("permission-workflows", workflow)
-        self.assertNotIn("permission-administration", workflow)
+        permissions = sorted(re.findall(r"permission-([a-z-]+): (\w+)", workflow))
+        self.assertEqual(permissions, [("contents", "write"), ("pull-requests", "write"),
+                                       ("statuses", "write"), ("workflows", "write")])
 
     def test_gate_has_no_apply_mode(self) -> None:
         result = run(self.repo, "python3", "scripts/version_bump_check.py",

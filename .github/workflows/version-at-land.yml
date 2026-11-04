@@ -15,9 +15,9 @@ name: Assign versions at land
 # the pull request: events from the default workflow token start no workflows,
 # and the required checks must run on the pull request. The token is minted
 # per run, scoped to this repository, and carries only the permissions the
-# bump needs. The App credentials are the SHIPYARD_APP_ID and
-# SHIPYARD_APP_PRIVATE_KEY repository secrets; without them the run fails
-# rather than falling back to the default token.
+# bump needs. The App's private key is the SHIPYARD_APP_PRIVATE_KEY
+# repository secret; without it the run fails rather than falling back to the
+# default token.
 
 on:
   push:
@@ -37,11 +37,10 @@ jobs:
     steps:
       - name: Require release App credentials
         env:
-          SHIPYARD_APP_ID: ${{ secrets.SHIPYARD_APP_ID }}
           SHIPYARD_APP_PRIVATE_KEY: ${{ secrets.SHIPYARD_APP_PRIVATE_KEY }}
         run: |
-          if [ -z "$SHIPYARD_APP_ID" ] || [ -z "$SHIPYARD_APP_PRIVATE_KEY" ]; then
-            echo '::error::Shipyard release App credentials are required (secrets SHIPYARD_APP_ID and SHIPYARD_APP_PRIVATE_KEY); refusing to land an untagged version bump.' >&2
+          if [ -z "$SHIPYARD_APP_PRIVATE_KEY" ]; then
+            echo '::error::Shipyard release App credentials are required (secret SHIPYARD_APP_PRIVATE_KEY); refusing to land an untagged version bump.' >&2
             exit 1
           fi
 
@@ -49,16 +48,20 @@ jobs:
         id: app-token
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
-          app-id: ${{ secrets.SHIPYARD_APP_ID }}
+          # The shipyard-local App's public client ID. With no owner or
+          # repositories input the token is scoped to this repository only.
+          client-id: Iv23liTCzDQWqmMjkDTI
           private-key: ${{ secrets.SHIPYARD_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-          repositories: ${{ github.event.repository.name }}
           # Push the bump branch; open, edit and label the bump pull request
           # (pull request write covers labels on a pull request); post the
           # exact-head handoff status.
           permission-contents: write
           permission-pull-requests: write
           permission-statuses: write
+          # The bump branch is rebuilt from the main tip and force-pushed; when
+          # main changed .github/workflows since the last bump, GitHub refuses
+          # that ref update from an App token without workflows write.
+          permission-workflows: write
 
       - name: Checkout main with history
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0

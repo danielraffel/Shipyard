@@ -58,9 +58,8 @@ class KnownFixTests(unittest.TestCase):
 
     def test_missing_secret(self) -> None:
         fix = rw.known_fix("##[error]Shipyard release App credentials are required "
-                           "(secrets SHIPYARD_APP_ID and SHIPYARD_APP_PRIVATE_KEY); refusing")
+                           "(secret SHIPYARD_APP_PRIVATE_KEY); refusing")
         self.assertIn("not set", fix)
-        self.assertIn("gh secret set SHIPYARD_APP_ID --repo danielraffel/Shipyard", fix)
         self.assertIn("gh secret set SHIPYARD_APP_PRIVATE_KEY --repo danielraffel/Shipyard", fix)
 
     def test_ruleset_refusal(self) -> None:

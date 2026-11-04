@@ -6,7 +6,7 @@ name: Auto-Release on CLI Version Bump
 # release.yml then builds draft release assets from the tag.
 #
 # The tag is pushed with a shipyard-local GitHub App installation token
-# (secrets SHIPYARD_APP_ID and SHIPYARD_APP_PRIVATE_KEY), scoped to this
+# (secret SHIPYARD_APP_PRIVATE_KEY), scoped to this
 # repository with contents write only: a tag pushed by the default workflow
 # token would start no release.yml run. Without the App credentials the run
 # fails rather than falling back to the default token.
@@ -35,11 +35,10 @@ jobs:
     steps:
       - name: Require release App credentials
         env:
-          SHIPYARD_APP_ID: ${{ secrets.SHIPYARD_APP_ID }}
           SHIPYARD_APP_PRIVATE_KEY: ${{ secrets.SHIPYARD_APP_PRIVATE_KEY }}
         run: |
-          if [ -z "$SHIPYARD_APP_ID" ] || [ -z "$SHIPYARD_APP_PRIVATE_KEY" ]; then
-            echo '::error::Shipyard release App credentials are required (secrets SHIPYARD_APP_ID and SHIPYARD_APP_PRIVATE_KEY); refusing to create an untriggering tag.' >&2
+          if [ -z "$SHIPYARD_APP_PRIVATE_KEY" ]; then
+            echo '::error::Shipyard release App credentials are required (secret SHIPYARD_APP_PRIVATE_KEY); refusing to create an untriggering tag.' >&2
             exit 1
           fi
 
@@ -47,10 +46,10 @@ jobs:
         id: app-token
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
-          app-id: ${{ secrets.SHIPYARD_APP_ID }}
+          # The shipyard-local App's public client ID. With no owner or
+          # repositories input the token is scoped to this repository only.
+          client-id: Iv23liTCzDQWqmMjkDTI
           private-key: ${{ secrets.SHIPYARD_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-          repositories: ${{ github.event.repository.name }}
           permission-contents: write
 
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0

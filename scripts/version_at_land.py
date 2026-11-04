@@ -243,8 +243,9 @@ class GitHubApiError(RuntimeError):
                 "repository and that version-at-land.yml requests them (permission-* "
                 "inputs of the token step).")
         elif "401" in text or "bad credentials" in text:
-            lines.append("Release App token was rejected; check the SHIPYARD_APP_ID and "
-                         "SHIPYARD_APP_PRIVATE_KEY repository secrets.")
+            lines.append("Release App token was rejected; check that the "
+                         "SHIPYARD_APP_PRIVATE_KEY repository secret holds a current "
+                         "shipyard-local App private key.")
         return "\n".join(lines)
 
 

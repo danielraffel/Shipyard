@@ -79,20 +79,18 @@ def known_fix(text: str, repo: str = DEFAULT_REPO) -> str:
     if ("resource not accessible by integration" in lowered
             or "resource not accessible by personal access token" in lowered):
         return ("The release App token lacks a permission. The shipyard-local App "
-                f"installation must grant {repo} Contents, Pull requests: Read and write "
-                "and Commit statuses: Read and write, and the workflow's token step must "
-                "request them; then "
+                f"installation must grant {repo} Contents, Workflows, Pull requests: Read "
+                "and write and Commit statuses: Read and write, and the workflow's token "
+                "step must request them; then "
                 f"`gh workflow run version-at-land.yml --repo {repo}`.")
     if "release app credentials are required" in lowered:
-        return ("The release App credentials are not set: "
-                f"`gh secret set SHIPYARD_APP_ID --repo {repo}` and "
+        return ("The release App private key is not set: "
                 f"`gh secret set SHIPYARD_APP_PRIVATE_KEY --repo {repo} < <key.pem>`.")
     if ("bad credentials" in lowered or "http 401" in lowered or "could not read username" in lowered
             or "release app token was rejected" in lowered):
         return ("The release App token was rejected or not authorised for this repository. "
-                "Check that SHIPYARD_APP_ID and SHIPYARD_APP_PRIVATE_KEY hold the "
-                f"shipyard-local App's ID and a current private key, and that the App is "
-                f"installed on {repo}.")
+                "Check that SHIPYARD_APP_PRIVATE_KEY holds a current shipyard-local App "
+                f"private key and that the App is installed on {repo}.")
     if "gh013" in lowered:
         return ("A repository rule refused a push. version-at-land pushes only "
                 f"{BUMP_BRANCH}; read which ref the log names.")
