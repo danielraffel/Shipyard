@@ -208,8 +208,8 @@ def message(assignments: list[Assignment], base: str, head: str,
             + "".join(f"{line}\n" for line in extra_trailers or []))
 
 
-# A fine-grained token made from the release-bot recipe has only Contents
-# write. The bump pull request also needs these, or every call is a 403.
+# The release App token is minted with Contents write for the branch push.
+# The bump pull request also needs these, or every call is a 403.
 REQUIRED_TOKEN_PERMISSIONS = ("Pull requests: Read and write",
                               "Commit statuses: Read and write")
 
@@ -237,13 +237,14 @@ class GitHubApiError(RuntimeError):
         text = (self.stderr + self.stdout).lower()
         if "403" in text or "resource not accessible" in text:
             lines.append(
-                "RELEASE_BOT_TOKEN cannot make this call. The bump pull request needs "
+                "Release App token cannot make this call. The bump pull request needs "
                 "the token to also grant: " + "; ".join(REQUIRED_TOKEN_PERMISSIONS)
-                + ". Edit the token at https://github.com/settings/personal-access-tokens "
-                "(or replace it with `gh secret set RELEASE_BOT_TOKEN`).")
+                + ". Check that the shipyard-local App installation grants them on this "
+                "repository and that version-at-land.yml requests them (permission-* "
+                "inputs of the token step).")
         elif "401" in text or "bad credentials" in text:
-            lines.append("RELEASE_BOT_TOKEN is expired or revoked; replace it with "
-                         "`gh secret set RELEASE_BOT_TOKEN`.")
+            lines.append("Release App token was rejected; check the SHIPYARD_APP_ID and "
+                         "SHIPYARD_APP_PRIVATE_KEY repository secrets.")
         return "\n".join(lines)
 
 
@@ -251,7 +252,7 @@ class GitHub:
     """The few REST calls the bump pull request needs, through ``gh api``.
 
     ``VERSION_AT_LAND_GH`` names the binary (tests point it at a fake). The
-    workflow authenticates it with RELEASE_BOT_TOKEN, because events caused by
+    workflow authenticates it with a GitHub App installation token, because events caused by
     the default workflow token start no workflows, and the pull request's
     required checks must run.
     """

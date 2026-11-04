@@ -51,7 +51,7 @@ FAILED = {"failure", "timed_out", "startup_failure"}
 RELEASE_TITLE = re.compile(r"^(feat|fix)(\([^)]*\))?!?:", re.I)
 # Anchored so the echoed step script and its env listing never match.
 EXCERPT = re.compile(
-    r"^(version-at-land:|gh stderr:|gh response:|RELEASE_BOT_TOKEN (cannot|is required)|"
+    r"^(version-at-land:|gh stderr:|gh response:|Release App token (cannot|is required|was rejected)|"
     r"subprocess\.CalledProcessError|remote: error|remote: - |error:|fatal:|##\[error\])")
 TIMESTAMP = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z ?")
 
@@ -76,18 +76,23 @@ def classify(conclusion: str, jobs: int) -> str:
 def known_fix(text: str, repo: str = DEFAULT_REPO) -> str:
     """The exact fix for a release-chain error, from its log lines."""
     lowered = text.lower()
-    if "resource not accessible by personal access token" in lowered:
-        return ("RELEASE_BOT_TOKEN lacks pull request rights. Edit the fine-grained token at "
-                "https://github.com/settings/personal-access-tokens and add, for this "
-                "repository, Pull requests: Read and write and Commit statuses: Read and "
-                "write (or store a new token with Contents, Pull requests and Commit statuses "
-                f"write: `gh secret set RELEASE_BOT_TOKEN --repo {repo}`), then "
+    if ("resource not accessible by integration" in lowered
+            or "resource not accessible by personal access token" in lowered):
+        return ("The release App token lacks a permission. The shipyard-local App "
+                f"installation must grant {repo} Contents, Pull requests: Read and write "
+                "and Commit statuses: Read and write, and the workflow's token step must "
+                "request them; then "
                 f"`gh workflow run version-at-land.yml --repo {repo}`.")
-    if "bad credentials" in lowered or "http 401" in lowered or "could not read username" in lowered:
-        return ("RELEASE_BOT_TOKEN is expired, revoked or not authorised for this repository. "
-                f"Store a new one: `gh secret set RELEASE_BOT_TOKEN --repo {repo}`.")
-    if "release_bot_token is required" in lowered:
-        return f"RELEASE_BOT_TOKEN is not set: `gh secret set RELEASE_BOT_TOKEN --repo {repo}`."
+    if "release app credentials are required" in lowered:
+        return ("The release App credentials are not set: "
+                f"`gh secret set SHIPYARD_APP_ID --repo {repo}` and "
+                f"`gh secret set SHIPYARD_APP_PRIVATE_KEY --repo {repo} < <key.pem>`.")
+    if ("bad credentials" in lowered or "http 401" in lowered or "could not read username" in lowered
+            or "release app token was rejected" in lowered):
+        return ("The release App token was rejected or not authorised for this repository. "
+                "Check that SHIPYARD_APP_ID and SHIPYARD_APP_PRIVATE_KEY hold the "
+                f"shipyard-local App's ID and a current private key, and that the App is "
+                f"installed on {repo}.")
     if "gh013" in lowered:
         return ("A repository rule refused a push. version-at-land pushes only "
                 f"{BUMP_BRANCH}; read which ref the log names.")

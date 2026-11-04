@@ -5,10 +5,15 @@ name: Auto-Release on CLI Version Bump
 # if it moved, create the matching v<x.y.z> tag;
 # release.yml then builds draft release assets from the tag.
 #
+# The tag is pushed with a shipyard-local GitHub App installation token
+# (secrets SHIPYARD_APP_ID and SHIPYARD_APP_PRIVATE_KEY), scoped to this
+# repository with contents write only: a tag pushed by the default workflow
+# token would start no release.yml run. Without the App credentials the run
+# fails rather than falling back to the default token.
+#
 # The workflow also supports workflow_dispatch so `shipyard doctor
-# --release-chain` can verify that actions/checkout accepts
-# RELEASE_BOT_TOKEN. A manual dispatch with no version movement is a
-# no-op after checkout.
+# --release-chain` can verify that the release token is accepted. A manual
+# dispatch with no version movement is a no-op after checkout.
 
 on:
   push:
@@ -20,7 +25,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   tag:
@@ -28,16 +33,30 @@ jobs:
     name: Tag CLI version bumps
 
     steps:
+      - name: Require release App credentials
+        env:
+          SHIPYARD_APP_ID: ${{ secrets.SHIPYARD_APP_ID }}
+          SHIPYARD_APP_PRIVATE_KEY: ${{ secrets.SHIPYARD_APP_PRIVATE_KEY }}
+        run: |
+          if [ -z "$SHIPYARD_APP_ID" ] || [ -z "$SHIPYARD_APP_PRIVATE_KEY" ]; then
+            echo '::error::Shipyard release App credentials are required (secrets SHIPYARD_APP_ID and SHIPYARD_APP_PRIVATE_KEY); refusing to create an untriggering tag.' >&2
+            exit 1
+          fi
+
+      - name: Mint release App token
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.SHIPYARD_APP_ID }}
+          private-key: ${{ secrets.SHIPYARD_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
-          token: ${{ secrets.RELEASE_BOT_TOKEN }}
-
-      - name: Require release bot token
-        env:
-          RELEASE_BOT_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
-        run: |
-          test -n "$RELEASE_BOT_TOKEN" || { echo 'RELEASE_BOT_TOKEN is required; refusing to create an untriggering tag.' >&2; exit 1; }
+          token: ${{ steps.app-token.outputs.token }}
 
       - name: Skip on trailer or revert
         id: guard
@@ -84,7 +103,6 @@ jobs:
         if: steps.guard.outputs.skip == '0'
         shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
           V_BEFORE: ${{ steps.versions.outputs.before }}
           V_AFTER: ${{ steps.versions.outputs.after }}
         run: |

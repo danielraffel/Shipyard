@@ -13,6 +13,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
+APP_TOKEN_ACTION_SHA = "64ab729a6294000f5aa4a4bc0b73d1f32bc45510"  # v3.3.0
 
 
 def run(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -122,19 +123,30 @@ class VersionAtLandTests(unittest.TestCase):
         self.assertEqual(payload["plan"][0]["current"], "0.292.1")
         self.assertEqual(payload["plan"][0]["assigned"], "0.292.2")
 
-    def test_release_workflows_fail_closed_without_bot_token(self) -> None:
+    def test_release_workflows_fail_closed_without_app_credentials(self) -> None:
         for name in ("version-at-land.yml", "auto-release.yml"):
             workflow = (HERE.parent / ".github/workflows" / name).read_text()
-            self.assertNotIn("|| secrets.GITHUB_TOKEN", workflow)
-            self.assertIn("RELEASE_BOT_TOKEN is required", workflow)
+            self.assertNotIn("secrets.GITHUB_TOKEN", workflow)
+            self.assertNotIn("github.token", workflow)
+            self.assertNotIn("secrets.RELEASE_BOT_TOKEN", workflow)
+            self.assertIn("Shipyard release App credentials are required", workflow)
+            self.assertIn("actions/create-github-app-token@" + APP_TOKEN_ACTION_SHA, workflow)
+            self.assertIn("token: ${{ steps.app-token.outputs.token }}", workflow)
+            self.assertIn("repositories: ${{ github.event.repository.name }}", workflow)
 
     def test_writer_workflow_lands_through_the_bump_pr(self) -> None:
         workflow = (HERE.parent / ".github/workflows/version-at-land.yml").read_text()
         self.assertIn("--push --pr-branch release/version-at-land", workflow)
         # Events from the default token start no workflows, so the PR's
         # required checks would never run.
-        self.assertIn("GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}", workflow)
-        self.assertNotIn("contents: write", workflow)
+        self.assertIn("GH_TOKEN: ${{ steps.app-token.outputs.token }}", workflow)
+        # The default job token stays read-only; the App token carries only
+        # what the bump needs.
+        self.assertNotRegex(workflow, r"(?m)^\s+contents: write")
+        for permission in ("contents", "pull-requests", "statuses"):
+            self.assertIn(f"permission-{permission}: write", workflow)
+        self.assertNotIn("permission-workflows", workflow)
+        self.assertNotIn("permission-administration", workflow)
 
     def test_gate_has_no_apply_mode(self) -> None:
         result = run(self.repo, "python3", "scripts/version_bump_check.py",
