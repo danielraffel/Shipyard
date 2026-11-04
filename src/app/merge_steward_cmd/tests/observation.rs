@@ -1694,12 +1694,12 @@ fn a_bounded_read_retry_never_outlives_the_deadline() {
 }
 
 #[test]
-fn status_observation_retries_only_transient_http_with_bounded_backoff() {
-    use crate::app::merge_steward_cmd::observation::retry_status_observation;
+fn check_observation_retries_only_transient_http_with_bounded_backoff() {
+    use crate::app::merge_steward_cmd::observation::retry_check_observation;
     for status in [500, 502, 503, 504] {
         let mut calls = 0;
         let mut delays = Vec::new();
-        let value = retry_status_observation(
+        let value = retry_check_observation(
             || {
                 calls += 1;
                 if calls < 3 {
@@ -1720,7 +1720,7 @@ fn status_observation_retries_only_transient_http_with_bounded_backoff() {
     }
     let mut calls = 0;
     let mut delays = Vec::new();
-    let error = retry_status_observation::<()>(
+    let error = retry_check_observation::<()>(
         || {
             calls += 1;
             Err("gh: Bad Gateway (HTTP 502)".to_owned())
@@ -1734,8 +1734,8 @@ fn status_observation_retries_only_transient_http_with_bounded_backoff() {
 }
 
 #[test]
-fn status_observation_does_not_retry_auth_policy_or_validation_errors() {
-    use crate::app::merge_steward_cmd::observation::retry_status_observation;
+fn check_observation_does_not_retry_auth_policy_or_validation_errors() {
+    use crate::app::merge_steward_cmd::observation::retry_check_observation;
     for error in [
         "gh: Bad credentials (HTTP 401)",
         "gh: Forbidden (HTTP 403)",
@@ -1748,7 +1748,7 @@ fn status_observation_does_not_retry_auth_policy_or_validation_errors() {
         "HTTP 5020",
     ] {
         let mut calls = 0;
-        let result = retry_status_observation::<()>(
+        let result = retry_check_observation::<()>(
             || {
                 calls += 1;
                 Err(error.to_owned())
@@ -1796,4 +1796,33 @@ printf '%s' '[{{"context":"macos","state":"success"}}]'
         lines[0], lines[1],
         "retry must read the same immutable head and page"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn check_endpoint_recovers_transient_server_failure() {
+    let temp = tempfile::tempdir().expect("temp");
+    let calls = temp.path().join("check-calls");
+    let actions = fake_gh(
+        &temp,
+        &format!(
+            r#"
+echo "$*" >> '{calls}'
+if [ "$(wc -l < '{calls}')" -eq 1 ]; then
+  echo 'gh: Internal Server Error (HTTP 500)' >&2
+  exit 1
+fi
+printf '%s' '{{"check_runs":[{{"name":"macos","status":"completed","conclusion":"success"}}]}}'
+"#,
+            calls = calls.display()
+        ),
+    );
+    let checks = check_runs_for_head(&actions, "owner/repo", &"a".repeat(40))
+        .expect("check-run read recovers");
+    assert_eq!(checks.len(), 1);
+    assert_eq!(checks[0].name, "macos");
+    let calls = fs::read_to_string(calls).expect("calls");
+    let lines: Vec<_> = calls.lines().collect();
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0], lines[1]);
 }

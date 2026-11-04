@@ -1188,15 +1188,19 @@ fn check_runs_for_head_with_deadline(
 ) -> Result<Vec<StewardCheck>, String> {
     let mut checks = Vec::new();
     for page in 1..=10 {
-        let value = gh_json_with_deadline(
-            actions,
-            &[
-                "api".to_owned(),
-                format!("repos/{repo}/commits/{head_sha}/check-runs?per_page=100&page={page}"),
-            ],
-            "current-head check identities",
-            deadline,
-        )?;
+        let args = [
+            "api".to_owned(),
+            format!("repos/{repo}/commits/{head_sha}/check-runs?per_page=100&page={page}"),
+        ];
+        let value = match deadline {
+            Some(deadline) => {
+                gh_json_before(actions, &args, "current-head check identities", deadline)
+            }
+            None => retry_check_observation(
+                || gh_json(actions, &args, "current-head check identities"),
+                std::thread::sleep,
+            ),
+        }?;
         let rows = value
             .get("check_runs")
             .and_then(Value::as_array)
@@ -1222,9 +1226,9 @@ pub(super) fn complete_checks_for_head(
     Ok(checks)
 }
 
-// Only this read-only status endpoint uses these retries. A persistent outage
+// Only the read-only check-run and status endpoints use these retries. A persistent outage
 // still refuses the observation; no partial check set reaches admission.
-pub(super) fn retry_status_observation<T>(
+pub(super) fn retry_check_observation<T>(
     mut read: impl FnMut() -> Result<T, String>,
     mut sleep: impl FnMut(Duration),
 ) -> Result<T, String> {
@@ -1261,7 +1265,7 @@ pub(super) fn commit_statuses_for_head_with_deadline(
             Some(deadline) => {
                 gh_json_before(actions, &args, "current-head commit statuses", deadline)
             }
-            None => retry_status_observation(
+            None => retry_check_observation(
                 || gh_json(actions, &args, "current-head commit statuses"),
                 std::thread::sleep,
             ),

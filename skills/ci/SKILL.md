@@ -4483,9 +4483,9 @@ flags to native CLI invocations.
 
 When a required context has several observations (reruns), the steward, queue observer, reconcile and landing verdict pick the newest by monotonic id (check-run id, i.e. the Actions job id, or status id), never by timestamp alone: a clock change such as the repeated DST hour can stamp an older attempt later. Ids decide only when both sides have one; otherwise the timestamp does (`cmp_id_then_time`).
 
-### Steward commit-status observation recovery
+### Steward check observation recovery
 
-The steward retries a non-deadline current-head commit-status GET at most twice
+The steward retries a non-deadline current-head check-run or commit-status GET at most twice
 (after 250 ms, then 500 ms) for GitHub HTTP 500, 502, 503, or 504 responses.
 Persistent failures still refuse the repository observation. Authentication,
 authorization, rate-limit, and malformed payload failures remain fail-closed;
