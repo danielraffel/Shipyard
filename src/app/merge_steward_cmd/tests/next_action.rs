@@ -136,7 +136,7 @@ fn green_with_no_verdict_is_a_wait_not_an_action() {
     let action = snapshot["next_action"]["action"]
         .as_str()
         .expect("action text");
-    assert!(action.contains("Nothing to do"), "{action}");
+    assert!(action.contains("nothing for the author to do"), "{action}");
     // BEHIND on a merge-queue base is never a reason to merge main.
     assert!(action.contains("do not merge main"), "{action}");
     assert_eq!(snapshot["merge_state"], "BEHIND");

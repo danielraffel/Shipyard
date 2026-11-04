@@ -30,8 +30,15 @@ A status belongs to a commit, but a decision belongs to a pull request, and
 two open pull requests can share a head. The status is ``success`` only when
 the guard allows the head for every open pull request whose head it is.
 
+The status is ``pending`` while a head is only awaiting its reviewer (no
+verdict names it yet, or only approvals that do not count do), and
+``failure`` for a real refusal: a counted HOLD, or anything the guard could not
+read. Branch protection treats ``pending`` as unsatisfied exactly like
+``failure``, so waiting never admits; it only reads as waiting.
+
 Exit status: 0 when the head is allowed (or there is nothing to judge), 1 when
-it is refused or anything could not be read or posted. The workflow's job is
+it is refused, awaiting its reviewer, or anything could not be read or posted
+(the job is the required check run, so it stays red until the head is allowed). The workflow's job is
 the required ``review-verdict`` check run, so it is green only for an allowed
 head. Only the ``pull_request_target`` run leaves its check run on the pull
 request's head; a comment or review run (which leaves its check run on the
@@ -53,7 +60,7 @@ import shutil
 import sys
 import tempfile
 from types import ModuleType
-from typing import Any
+from typing import Any, NamedTuple
 
 CONTEXT = "review-verdict"
 # GitHub refuses a status description over 140 characters.
@@ -66,6 +73,26 @@ WORKFLOW_NAME = "Review verdict"
 # gates nothing; those runs refresh the head's check instead (see
 # ``refresh_head_check``).
 HEAD_CHECK_EVENTS = frozenset({"pull_request_target"})
+# The guard's refusal causes that mean "no counted verdict yet": the head has
+# no verdict, or only an earlier head's approval that does not carry. Every
+# other refusal (a HOLD, an unreadable review, a self-approval) is a failure.
+AWAITING_CAUSES = frozenset({"unreviewed", "approval_does_not_carry"})
+RECEIPT_REFUSAL = "reviewer claim receipt refused"
+
+
+class Decision(NamedTuple):
+    """One pull request's review decision for the head."""
+
+    allowed: bool
+    message: str
+    cause: str | None
+    excluded: tuple[str, ...]
+
+    @property
+    def awaiting(self) -> bool:
+        """Refused only because no counted verdict names the head yet."""
+        return (not self.allowed and self.cause in AWAITING_CAUSES
+                and RECEIPT_REFUSAL not in self.message)
 
 
 def load_guard() -> ModuleType:
@@ -106,13 +133,43 @@ def describe(allowed: bool, message: str) -> str:
     return text if len(text) <= DESCRIPTION_LIMIT else text[: DESCRIPTION_LIMIT - 1] + "…"
 
 
-def decide(guard: ModuleType, repo: str, number: int, head: str) -> tuple[bool, str]:
+def exclusion_code(reason: str) -> str:
+    """A short stable code for why the guard did not count an approval."""
+    if "unattributed" in reason or "no `ghapp` session stamp" in reason:
+        return "unattributed"
+    if "reviewer_stamp_sessions" in reason:
+        return "unlisted_stamp_session"
+    if "non-canonical session stamp" in reason:
+        return "noncanonical_stamp"
+    if "a user account" in reason:
+        return "not_the_app"
+    if any(part in reason for part in ("signer", "reviewer:", "identity")):
+        return "uncounted_signer"
+    return "unlisted_human" if "(" not in reason else "uncounted"
+
+
+def decide(guard: ModuleType, repo: str, number: int, head: str) -> Decision:
     """The guard's review-before-arm decision for ``head``, bound to it."""
+    classification: dict[str, Any] = {
+        "repo": repo, "pr": number, "head": head, "bound_head": head}
     # A status is read-only: it judges a carry but never logs one.
-    allowed, message, _ = guard.review_gate(
-        {"repo": repo, "pr": number, "head": head, "bound_head": head}, repo, dry_run=True
-    )
-    return allowed, message
+    allowed, message, fix = guard.review_gate(classification, repo, dry_run=True)
+    cause = fix.get("cause") if isinstance(fix, dict) else None
+    excluded = [exclusion_code(entry.split(" (", 1)[1] if " (" in entry else entry)
+                for entry in classification.get("excluded_approvals") or []]
+    if cause == "approval_does_not_carry":
+        excluded.append("not_exact_head")
+    return Decision(allowed, message, cause, tuple(excluded))
+
+
+def awaiting_description(head: str, excluded: list[str]) -> str:
+    """The ``pending`` description: waiting, and why any approval did not count."""
+    if not excluded:
+        return f"awaiting reviewer verdict for head {head[:12]}"
+    codes = sorted(set(excluded))
+    noun = "approval" if len(excluded) == 1 else "approvals"
+    text = f"awaiting reviewer verdict; {len(excluded)} {noun} excluded: {', '.join(codes)}"
+    return text if len(text) <= DESCRIPTION_LIMIT else text[: DESCRIPTION_LIMIT - 1] + "…"
 
 
 def open_pulls_on(guard: ModuleType, repo: str, head: str) -> list[int]:
@@ -187,25 +244,41 @@ def run(event_name: str, event: dict[str, Any], repo: str, run_url: str | None) 
     if not numbers:
         print(f"review-verdict: no open pull request has head {head}; nothing to post")
         return 0
-    decisions = [(n, *decide(guard, repo, n, head)) for n in sorted(numbers)]
-    refused = [(n, message) for n, allowed, message in decisions if not allowed]
+    decisions = [(n, decide(guard, repo, n, head)) for n in sorted(numbers)]
+    refused = [(n, d) for n, d in decisions if not d.allowed]
     allowed = not refused
-    message = refused[0][1] if refused else decisions[0][2]
-    if len(decisions) > 1:
-        message += f" (judged for PRs {', '.join(f'#{n}' for n, _, _ in decisions)} on this head)"
-    state = "success" if allowed else "failure"
+    # Waiting is not failing: pending only when every refusal is "no counted
+    # verdict yet". A counted HOLD, an unreadable review or any other refusal
+    # on any pull request sharing the head is a failure.
+    awaiting = bool(refused) and all(d.awaiting for _, d in refused)
+    shared = (f" (judged for PRs {', '.join(f'#{n}' for n, _ in decisions)} on this head)"
+              if len(decisions) > 1 else "")
+    if allowed:
+        state, text = "success", describe(True, decisions[0][1].message + shared)
+    elif awaiting:
+        state = "pending"
+        text = awaiting_description(head, [code for _, d in refused for code in d.excluded])
+    else:
+        hard = next(d for _, d in refused if not d.awaiting)
+        state, text = "failure", describe(False, hard.message + shared)
     arguments = [
         "api", "-X", "POST", f"repos/{repo}/statuses/{head}",
         "-f", f"state={state}",
         "-f", f"context={CONTEXT}",
-        "-f", f"description={describe(allowed, message)}",
+        "-f", f"description={text}",
     ]
     if run_url:
         arguments += ["-f", f"target_url={run_url}"]
     guard.run_real_gh(arguments)
-    for n, ok, why in decisions:
-        print(f"review-verdict: PR #{n}: {'allowed' if ok else 'refused'}: {why}")
+    for n, d in decisions:
+        verdict = "allowed" if d.allowed else "awaiting" if d.awaiting else "refused"
+        print(f"review-verdict: PR #{n}: {verdict}: {d.message}")
     print(f"review-verdict: {state} on {head}")
+    if awaiting:
+        # Not a defect: the check run stays red only so GitHub cannot read it
+        # as satisfied. The author has nothing to fix.
+        print(f"::notice title=review-verdict::awaiting reviewer verdict for head {head[:12]}; "
+              "nothing for the author to do")
     if event_name in HEAD_CHECK_EVENTS:
         return 0 if allowed else 1
     refresh_head_check(guard, repo, head)

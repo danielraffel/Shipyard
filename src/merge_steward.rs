@@ -413,37 +413,8 @@ pub fn classify_pr(
         };
     }
 
-    let selected = selected_checks(pr, policy);
-    let mut waiting = Vec::new();
-    let mut failed = Vec::new();
-    let mut transient_runs = BTreeSet::new();
-    for (context, check) in selected {
-        let Some(check) = check else {
-            waiting.push(context);
-            continue;
-        };
-        if !check.status.eq_ignore_ascii_case("COMPLETED") {
-            waiting.push(context);
-            continue;
-        }
-        let conclusion = check
-            .conclusion
-            .as_deref()
-            .unwrap_or_default()
-            .to_ascii_uppercase();
-        if matches!(conclusion.as_str(), "SUCCESS" | "NEUTRAL" | "SKIPPED") {
-            continue;
-        }
-        if is_transient_conclusion(&conclusion)
-            && let Some(run_id) = check.run_id
-            && transient_attempts.get(&run_id).copied().unwrap_or(0)
-                < crate::transient_interruption::clamp_rerun_budget(policy.max_transient_reruns)
-        {
-            transient_runs.insert(run_id);
-        } else {
-            failed.push(context);
-        }
-    }
+    let (mut waiting, mut failed, transient_runs) =
+        bucket_required_checks(pr, policy, transient_attempts);
     if !waiting.is_empty() {
         waiting.sort();
         waiting.dedup();
@@ -475,6 +446,61 @@ pub fn classify_pr(
             reasons: vec![DirectMergeRefusal::ValidatedBaseRevisionNotAtomic],
         }
     }
+}
+
+/// Sort every required rule into waiting, failed and transient-interrupted.
+fn bucket_required_checks(
+    pr: &StewardPullRequest,
+    policy: &StewardPolicy,
+    transient_attempts: &BTreeMap<u64, u32>,
+) -> (Vec<String>, Vec<String>, BTreeSet<u64>) {
+    let selected = selected_checks(pr, policy);
+    let mut waiting = Vec::new();
+    let mut failed = Vec::new();
+    let mut transient_runs = BTreeSet::new();
+    // The approval job fails its check run while a head only awaits a verdict,
+    // after posting a `pending` commit status. Waiting for the reviewer is not
+    // a failed check, so the pending status decides: it is never a pass.
+    let approval_pending = approval_status_pending(pr, policy);
+    let approval_context = policy.approval_context.trim();
+    let mut approval_waiting = Vec::new();
+    for (context, check) in selected {
+        let waits = check.is_none_or(|check| !check.status.eq_ignore_ascii_case("COMPLETED"));
+        if waits {
+            waiting.push(context);
+            continue;
+        }
+        if approval_pending
+            && check.is_some_and(|check| check.name.eq_ignore_ascii_case(approval_context))
+        {
+            approval_waiting.push(context);
+            continue;
+        }
+        let Some(check) = check else { continue };
+        let conclusion = check
+            .conclusion
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_uppercase();
+        if matches!(conclusion.as_str(), "SUCCESS" | "NEUTRAL" | "SKIPPED") {
+            continue;
+        }
+        if is_transient_conclusion(&conclusion)
+            && let Some(run_id) = check.run_id
+            && transient_attempts.get(&run_id).copied().unwrap_or(0)
+                < crate::transient_interruption::clamp_rerun_budget(policy.max_transient_reruns)
+        {
+            transient_runs.insert(run_id);
+        } else {
+            failed.push(context);
+        }
+    }
+    // A reviewer-only wait must not mask a genuine terminal failure in another
+    // required check: the failure stays actionable for the author and recovery.
+    if failed.is_empty() {
+        waiting.extend(approval_waiting);
+    }
+    (waiting, failed, transient_runs)
 }
 
 /// Whether a steward `ArmMergeQueue` decision survives the head-scoped queue
@@ -653,14 +679,38 @@ fn approval_status_refusal(
     pr: &StewardPullRequest,
     policy: &StewardPolicy,
 ) -> Option<StewardDecision> {
-    (policy.server_enforced_exact_head_merge() && !approval_status_agrees(pr, policy)).then(|| {
-        StewardDecision::RequiredFailed {
-            contexts: vec![format!(
-                "{} (commit status)",
-                policy.approval_context.trim()
-            )],
-        }
+    if !policy.server_enforced_exact_head_merge() || approval_status_agrees(pr, policy) {
+        return None;
+    }
+    let contexts = vec![format!(
+        "{} (commit status)",
+        policy.approval_context.trim()
+    )];
+    // A head awaiting its reviewer's verdict is waiting, not failed; it is
+    // refused all the same.
+    Some(if approval_status_pending(pr, policy) {
+        StewardDecision::WaitingRequired { contexts }
+    } else {
+        StewardDecision::RequiredFailed { contexts }
     })
+}
+
+/// Whether the newest commit status named after the approval context is
+/// `pending`: the head awaits its reviewer's verdict. Pending never satisfies
+/// the rule (see [`approval_status_agrees`]); it only reads as waiting.
+#[must_use]
+pub fn approval_status_pending(pr: &StewardPullRequest, policy: &StewardPolicy) -> bool {
+    let context = policy.approval_context.trim();
+    !context.is_empty()
+        && pr
+            .checks
+            .iter()
+            .filter(|check| {
+                check.source == StewardCheckSource::StatusContext
+                    && check.name.eq_ignore_ascii_case(context)
+            })
+            .max_by(|left, right| cmp_recency(left, right))
+            .is_some_and(|status| !status.status.eq_ignore_ascii_case("COMPLETED"))
 }
 
 /// Whether the newest commit status named after the approval context, if

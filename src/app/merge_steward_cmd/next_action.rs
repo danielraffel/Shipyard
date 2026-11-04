@@ -172,6 +172,8 @@ struct Facts<'a> {
     /// The required contexts, comma-joined.
     required: String,
     error: Option<&'a str>,
+    /// The policy's approval context (`review-verdict`).
+    approval_context: &'a str,
 }
 
 /// The next action for one classified row.
@@ -199,6 +201,7 @@ pub(super) fn for_row(context: &RowContext<'_>, stall: &Stall) -> NextAction {
             .collect::<Vec<_>>()
             .join(","),
         error: context.error,
+        approval_context: context.policy.approval_context.as_str(),
     };
     let mut next = callers_move(kind, &facts, stall)
         .or_else(|| code_owners_move(kind, &facts))
@@ -378,6 +381,7 @@ fn someone_elses_move(kind: &str, facts: &Facts<'_>) -> Option<NextAction> {
                  not push, do not arm, do not merge {base}."
             ),
         ),
+        "required_pending" if awaiting_reviewer(facts) => awaiting_reviewer_action(),
         "required_pending" => NextAction::new(
             Actor::Ci,
             format!(
@@ -395,9 +399,9 @@ fn someone_elses_move(kind: &str, facts: &Facts<'_>) -> Option<NextAction> {
         "no_verdict" => NextAction::new(
             Actor::Reviewer,
             format!(
-                "Green on every required check ({required}); no reviewer verdict names this \
-                 head. Nothing to do: do not push, do not merge {base}; the reviewer posts \
-                 APPROVE or HOLD."
+                "Awaiting the standing reviewer; nothing for the author to do. Green on every \
+                 required check ({required}); no reviewer verdict names this head. Do not push, \
+                 do not merge {base}; the reviewer posts APPROVE or HOLD."
             ),
         ),
         "approval_excluded" => NextAction::new(
@@ -420,6 +424,28 @@ fn someone_elses_move(kind: &str, facts: &Facts<'_>) -> Option<NextAction> {
         ),
         _ => return operators_move(kind, facts),
     })
+}
+
+/// Whether a `required_pending` row waits only on the approval context (the
+/// `review-verdict` status is `pending` while the head awaits its reviewer).
+fn awaiting_reviewer(facts: &Facts<'_>) -> bool {
+    let approval = facts.approval_context.trim();
+    !approval.is_empty()
+        && facts.detail.is_some_and(|detail| {
+            detail
+                .split(',')
+                .all(|name| name.trim().eq_ignore_ascii_case(approval))
+        })
+}
+
+fn awaiting_reviewer_action() -> NextAction {
+    NextAction::new(
+        Actor::Reviewer,
+        "Awaiting the standing reviewer; nothing for the author to do. The approval status is \
+         pending, not failed: do not push, do not merge the base; the reviewer posts APPROVE or \
+         HOLD."
+            .to_owned(),
+    )
 }
 
 /// The tokens only the fleet operator or the next pass resolves.
@@ -668,9 +694,31 @@ mod tests {
         let next = next("no_verdict", None, true, "CLEAN");
         assert_eq!(next.actor, Actor::Reviewer);
         assert!(!next.actionable());
-        assert!(next.action.contains("Nothing to do"), "{next:?}");
+        assert!(
+            next.action
+                .contains("Awaiting the standing reviewer; nothing for the author to do"),
+            "{next:?}"
+        );
         assert!(next.action.contains("do not merge main"), "{next:?}");
         assert!(next.action.contains("macos,review-verdict"), "{next:?}");
+    }
+
+    #[test]
+    fn a_pending_approval_context_is_the_reviewers_wait_not_a_ci_run() {
+        let waiting = next("required_pending", Some("review-verdict"), true, "CLEAN");
+        assert_eq!(waiting.actor, Actor::Reviewer);
+        assert!(!waiting.actionable());
+        assert!(
+            waiting
+                .action
+                .contains("Awaiting the standing reviewer; nothing for the author to do"),
+            "{waiting:?}"
+        );
+        // Control: a pending ordinary check stays CI's, and a mixed set too.
+        for detail in ["macos", "macos,review-verdict"] {
+            let other = next("required_pending", Some(detail), true, "CLEAN");
+            assert_eq!(other.actor, Actor::Ci, "{detail}");
+        }
     }
 
     #[test]

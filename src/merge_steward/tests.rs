@@ -1405,3 +1405,142 @@ fn ids_of_different_surfaces_are_not_compared() {
     let run = run_check("FAILURE", "2026-11-01T01:00:00Z", Some(9_999));
     assert_eq!(cmp_recency(&status, &run), std::cmp::Ordering::Greater);
 }
+
+/// A pull request whose approval job has failed its check run while the head
+/// only awaits a verdict: the `review-verdict` status is `pending`.
+fn awaiting_verdict_pr(status_state: &str, status_conclusion: Option<&str>) -> StewardPullRequest {
+    let context = crate::merge_steward::DEFAULT_APPROVAL_CONTEXT;
+    let mut pr = green_pr();
+    pr.checks.push(StewardCheck {
+        name: context.to_owned(),
+        source: StewardCheckSource::StatusContext,
+        app_id: Some(15368),
+        status: status_state.to_owned(),
+        conclusion: status_conclusion.map(str::to_owned),
+        run_id: None,
+        observed_at: Some("2026-11-03T10:00:00Z".to_owned()),
+        check_id: Some(7),
+    });
+    pr.checks.push(StewardCheck {
+        name: context.to_owned(),
+        source: StewardCheckSource::CheckRun,
+        app_id: Some(15368),
+        status: "COMPLETED".to_owned(),
+        conclusion: Some("FAILURE".to_owned()),
+        run_id: Some(11),
+        observed_at: Some("2026-11-03T10:00:05Z".to_owned()),
+        check_id: Some(99),
+    });
+    pr
+}
+
+fn approval_policy() -> StewardPolicy {
+    let mut policy = queue_policy();
+    policy.required_checks.push(RequiredCheck {
+        context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
+        app_id: Some(15368),
+    });
+    policy
+}
+
+#[test]
+fn a_pending_approval_status_reads_as_waiting_even_under_a_failed_check_run() {
+    let pr = awaiting_verdict_pr("IN_PROGRESS", None);
+    assert!(approval_status_pending(&pr, &approval_policy()));
+    assert_eq!(
+        classify_pr(&pr, &approval_policy(), &BTreeMap::new()),
+        StewardDecision::WaitingRequired {
+            contexts: vec!["review-verdict (app_id=15368)".to_owned()]
+        }
+    );
+}
+
+#[test]
+fn a_failed_approval_status_stays_required_failed() {
+    // Control: the same failed check run under a `failure` status is a real
+    // refusal, never waiting.
+    let pr = awaiting_verdict_pr("COMPLETED", Some("FAILURE"));
+    assert!(!approval_status_pending(&pr, &approval_policy()));
+    assert!(matches!(
+        classify_pr(&pr, &approval_policy(), &BTreeMap::new()),
+        StewardDecision::RequiredFailed { .. }
+    ));
+}
+
+#[test]
+fn a_pending_approval_status_never_agrees_or_arms() {
+    let mut pr = awaiting_verdict_pr("IN_PROGRESS", None);
+    pr.checks.retain(|check| {
+        check.source == StewardCheckSource::StatusContext || check.name == "required"
+    });
+    assert!(!approval_status_agrees(&pr, &approval_policy()));
+    // Even with every other required check green and a passing approval check
+    // run, the pending status keeps the head from being admitted.
+    pr.checks.push(StewardCheck {
+        name: "review-verdict".to_owned(),
+        source: StewardCheckSource::CheckRun,
+        app_id: Some(15368),
+        status: "COMPLETED".to_owned(),
+        conclusion: Some("SUCCESS".to_owned()),
+        run_id: Some(12),
+        observed_at: Some("2026-11-03T10:00:01Z".to_owned()),
+        check_id: Some(100),
+    });
+    assert_ne!(
+        classify_pr(&pr, &approval_policy(), &BTreeMap::new()),
+        StewardDecision::ArmMergeQueue
+    );
+}
+
+#[test]
+fn a_pending_approval_status_on_an_exact_head_base_is_waiting_not_failed() {
+    let mut policy = approval_policy();
+    policy.merge_queue = false;
+    let mut pr = awaiting_verdict_pr("IN_PROGRESS", None);
+    // Only the status is observed: the app-bound rule is satisfied by a green
+    // check run, but the pending status still refuses.
+    pr.checks.retain(|check| {
+        check.source == StewardCheckSource::StatusContext || check.name == "required"
+    });
+    pr.checks.push(StewardCheck {
+        name: "review-verdict".to_owned(),
+        source: StewardCheckSource::CheckRun,
+        app_id: Some(15368),
+        status: "COMPLETED".to_owned(),
+        conclusion: Some("SUCCESS".to_owned()),
+        run_id: Some(12),
+        observed_at: Some("2026-11-03T10:00:01Z".to_owned()),
+        check_id: Some(100),
+    });
+    assert!(policy.server_enforced_exact_head_merge());
+    assert!(matches!(
+        approval_status_refusal(&pr, &policy),
+        Some(StewardDecision::WaitingRequired { .. })
+    ));
+    pr.checks[1].status = "COMPLETED".to_owned();
+    pr.checks[1].conclusion = Some("FAILURE".to_owned());
+    assert!(matches!(
+        approval_status_refusal(&pr, &policy),
+        Some(StewardDecision::RequiredFailed { .. })
+    ));
+}
+
+#[test]
+fn a_failed_ordinary_check_outranks_a_pending_approval_status() {
+    let mut pr = awaiting_verdict_pr("IN_PROGRESS", None);
+    pr.checks[0].conclusion = Some("FAILURE".to_owned());
+    let decision = classify_pr(&pr, &approval_policy(), &BTreeMap::new());
+    assert_eq!(
+        decision,
+        StewardDecision::RequiredFailed {
+            contexts: vec!["required".to_owned()]
+        }
+    );
+    // Control: with the ordinary check green only the reviewer remains, and
+    // admission still refuses.
+    let waiting = awaiting_verdict_pr("IN_PROGRESS", None);
+    assert!(matches!(
+        classify_pr(&waiting, &approval_policy(), &BTreeMap::new()),
+        StewardDecision::WaitingRequired { .. }
+    ));
+}
