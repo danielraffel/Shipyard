@@ -55,7 +55,7 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
-          token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: false
 
       - name: Skip on trailer or revert
         id: guard
@@ -102,6 +102,7 @@ jobs:
         if: steps.guard.outputs.skip == '0'
         shell: bash
         env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           V_BEFORE: ${{ steps.versions.outputs.before }}
           V_AFTER: ${{ steps.versions.outputs.after }}
         run: |
@@ -113,6 +114,10 @@ jobs:
           fi
 
           tag="v${V_AFTER}"
+
+          test -n "$GH_TOKEN" || { echo 'Release App token is required; refusing to create an untriggering tag.' >&2; exit 1; }
+          # git authenticates through gh, which reads GH_TOKEN (the App token).
+          gh auth setup-git
 
           git config user.name "shipyard-release-bot"
           git config user.email "shipyard-release-bot@users.noreply.github.com"

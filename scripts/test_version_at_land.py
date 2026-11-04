@@ -132,7 +132,10 @@ class VersionAtLandTests(unittest.TestCase):
             self.assertNotIn("secrets.RELEASE_BOT_TOKEN", workflow)
             self.assertIn("Shipyard release App credentials are required", workflow)
             self.assertIn("actions/create-github-app-token@" + APP_TOKEN_ACTION_SHA, workflow)
-            self.assertIn("token: ${{ steps.app-token.outputs.token }}", workflow)
+            self.assertIn("GH_TOKEN: ${{ steps.app-token.outputs.token }}", workflow)
+            self.assertIn("gh auth setup-git", workflow)
+            self.assertIn("persist-credentials: false", workflow)
+            self.assertNotIn("persist-credentials: true", workflow)
             # No owner/repositories input: the token covers this repository only.
             # (An empty repositories value with owner set widens it to every
             # repository of the owner.)
