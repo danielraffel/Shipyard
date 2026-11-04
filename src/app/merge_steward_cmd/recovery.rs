@@ -17,7 +17,11 @@ use super::recovery_worker::{
 };
 use super::terminal_handoff::{persist_actionable_failure, resolve_terminal_handoffs};
 
-const RECOVERY_REVALIDATION_TIMEOUT: Duration = Duration::from_secs(20);
+/// Budget for one live recovery revalidation: a merge-queue snapshot, the PR
+/// read, and its check-run and status pages. Sized for the steward's GitHub
+/// App token path on a loaded host, where one read can take several seconds
+/// and a stalled first attempt (capped per attempt) still leaves a retry.
+const RECOVERY_REVALIDATION_TIMEOUT: Duration = Duration::from_secs(45);
 
 fn recovery_revalidation_deadline() -> Instant {
     Instant::now() + RECOVERY_REVALIDATION_TIMEOUT

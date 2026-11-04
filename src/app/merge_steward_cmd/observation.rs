@@ -215,26 +215,85 @@ pub(super) fn gh_json_timeout(
         .map_err(|error| format!("{purpose} returned malformed JSON: {error}"))
 }
 
+/// Longest one attempt of a deadline-bound read may run. A stalled request
+/// rarely recovers, so capping the first attempt leaves budget for a fresh
+/// one instead of letting a single hung call spend the whole deadline.
+const BOUNDED_READ_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(15);
+/// A retry with less time than this left is not started.
+const BOUNDED_READ_RETRY_FLOOR: Duration = Duration::from_secs(1);
+
+/// Read JSON from GitHub before `deadline`. Every caller is a read, so a
+/// timed-out or transiently failed first attempt gets one more attempt within
+/// the same deadline; the deadline itself never moves.
 pub(super) fn gh_json_before(
     actions: &GitHubActions,
     args: &[String],
     purpose: &str,
     deadline: Instant,
 ) -> Result<Value, String> {
+    gh_json_before_with_attempt_timeout(
+        actions,
+        args,
+        purpose,
+        deadline,
+        BOUNDED_READ_ATTEMPT_TIMEOUT,
+    )
+}
+
+pub(super) fn gh_json_before_with_attempt_timeout(
+    actions: &GitHubActions,
+    args: &[String],
+    purpose: &str,
+    deadline: Instant,
+    attempt_timeout: Duration,
+) -> Result<Value, String> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         return Err(format!("{purpose} exceeded its bounded deadline"));
     }
-    let raw = actions
-        .run_gh_with_timeout_bounded(
-            args,
-            remaining,
-            BOUNDED_GH_STDOUT_BYTES,
-            BOUNDED_GH_STDERR_BYTES,
-        )
-        .map_err(|error| format!("{purpose} failed: {error}"))?;
+    let attempt = |timeout: Duration| {
+        actions
+            .run_gh_with_timeout_bounded(
+                args,
+                timeout,
+                BOUNDED_GH_STDOUT_BYTES,
+                BOUNDED_GH_STDERR_BYTES,
+            )
+            .map_err(|error| error.to_string())
+    };
+    let raw = match attempt(remaining.min(attempt_timeout)) {
+        Ok(raw) => raw,
+        Err(first) => {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if !is_retryable_read_failure(&first) || remaining < BOUNDED_READ_RETRY_FLOOR {
+                return Err(format!("{purpose} failed: {first}"));
+            }
+            attempt(remaining.min(attempt_timeout)).map_err(|second| {
+                format!("{purpose} failed after one retry: {second} (first attempt: {first})")
+            })?
+        }
+    };
     serde_json::from_str(&raw)
         .map_err(|error| format!("{purpose} returned malformed JSON: {error}"))
+}
+
+/// Failures a fresh attempt of the same read can plausibly cure: a local
+/// timeout, a gateway error, or a dropped connection. Authorization, rate
+/// limits, and not-found answers are not retried.
+pub(super) fn is_retryable_read_failure(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    [
+        "timed out after",
+        "http 500",
+        "http 502",
+        "http 503",
+        "http 504",
+        "connection reset",
+        "unexpected eof",
+        "tls handshake timeout",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 fn gh_json_with_deadline(
