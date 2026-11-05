@@ -16,8 +16,9 @@ name: Assign versions at land
 # and the required checks must run on the pull request. The token is minted
 # per run, scoped to this repository, and carries only the permissions the
 # bump needs. The App's private key is the SHIPYARD_APP_PRIVATE_KEY
-# repository secret; without it the run fails rather than falling back to the
-# default token.
+# secret of the `automation` environment (deployment policy: branch main
+# only); without it the run fails rather than falling back to the default
+# token.
 
 on:
   push:
@@ -34,6 +35,7 @@ permissions:
 jobs:
   assign:
     runs-on: ubuntu-latest
+    environment: automation
     steps:
       - name: Require release App credentials
         env:

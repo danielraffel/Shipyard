@@ -9,7 +9,10 @@ name: Auto-Release on CLI Version Bump
 # (secret SHIPYARD_APP_PRIVATE_KEY), scoped to this
 # repository with contents write only: a tag pushed by the default workflow
 # token would start no release.yml run. Without the App credentials the run
-# fails rather than falling back to the default token.
+# fails rather than falling back to the default token. The key is a secret of
+# the `automation` environment, whose deployment policy admits branch main
+# only, so a run from any other ref (or from a tag) never sees it and stops at
+# the credential check.
 #
 # The workflow also supports workflow_dispatch so `shipyard doctor
 # --release-chain` can verify that the release token is accepted. A manual
@@ -31,6 +34,7 @@ jobs:
   tag:
     runs-on: ubuntu-latest
     name: Tag CLI version bumps
+    environment: automation
 
     steps:
       - name: Require release App credentials

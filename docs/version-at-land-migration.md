@@ -18,7 +18,7 @@ the latest published tag.
 
 Each run mints a shipyard-local GitHub App installation token with
 `actions/create-github-app-token`, from the App's public client ID (in the
-workflow) and the `SHIPYARD_APP_PRIVATE_KEY` repository secret. That token pushes the bump
+workflow) and the `SHIPYARD_APP_PRIVATE_KEY` secret of the main-only `automation` environment. That token pushes the bump
 branch and also calls the pull request API: it opens or updates the bump pull
 request, labels it `shipyard:managed`, and posts the `shipyard/steward-handoff`
 status on its head. The token is scoped to this repository and requests only:
