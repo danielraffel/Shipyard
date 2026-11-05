@@ -124,6 +124,13 @@ fn verdict_for(
         .iter()
         .find_map(|event| event.strip_prefix("head_held:"));
     let fix = (!allowed).then(|| {
+        if let HeadGate::NotAdmitted { detail, .. } = &gate {
+            return format!(
+                "head {head} is not admitted ({detail}); this base takes authorization from \
+                 the fleet admission check only, so no comment can approve it. Wait for the \
+                 trust root to judge the head, or address what its check run reports"
+            );
+        }
         if let Some(holder) = holder {
             return format!(
                 "head {head} is {holder}, and a HOLD makes its head un-approvable: the author \

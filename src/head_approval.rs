@@ -99,6 +99,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 mod blocker;
+pub mod guard;
 mod rebase;
 
 pub use blocker::ApprovalBlocker;
@@ -969,6 +970,10 @@ pub struct ApprovalPolicy {
     /// it is never read from a config.
     #[serde(skip)]
     pub dry_run: bool,
+    /// What authorizes a head ([`guard`]): comments and reviews, or the
+    /// fleet's admission check run.
+    #[serde(default)]
+    pub source: guard::ApprovalSource,
 }
 
 /// Where an [`ApprovalPolicy`]'s signers came from.
@@ -1064,7 +1069,21 @@ impl ApprovalPolicy {
             signer_source: SignerSource::Host,
             dry_run: false,
             carry_excluded: carry_paths(section).unwrap_or_else(|_| Some(vec!["**".to_owned()])),
+            source: guard::source_from_section(Some(section))
+                .unwrap_or_else(|detail| guard::ApprovalSource::Misconfigured { detail }),
         }
+        .with_source_required()
+    }
+
+    /// A policy whose source is not comments always requires authorization:
+    /// guard mode cannot be switched off by leaving
+    /// `arm_requires_head_approval` unset.
+    #[must_use]
+    fn with_source_required(mut self) -> Self {
+        if !self.source.is_comments() {
+            self.required = true;
+        }
+        self
     }
 
     /// The globs whose change keeps an approval from carrying.
@@ -1155,6 +1174,19 @@ pub enum Approval {
         #[serde(default)]
         performed_via_github_app_id: Option<u64>,
     },
+    /// A successful fleet admission check run on the head ([`guard`]).
+    Admission {
+        /// Check-run name.
+        check: String,
+        /// The App that posted it.
+        app_id: u64,
+        /// Check-run id.
+        check_run_id: u64,
+        /// Policy the trust root judged under.
+        policy_sha: String,
+        /// `routine` or `enforcement`.
+        classification: String,
+    },
 }
 
 impl Approval {
@@ -1163,7 +1195,7 @@ impl Approval {
     pub fn comment_id(&self) -> Option<u64> {
         match self {
             Self::Marker { comment_id, .. } => *comment_id,
-            Self::Review { .. } | Self::Rollup { .. } => None,
+            Self::Review { .. } | Self::Rollup { .. } | Self::Admission { .. } => None,
             Self::Carried { approval, .. } => approval.comment_id(),
         }
     }
@@ -1180,6 +1212,7 @@ impl Approval {
                 performed_via_github_app_id,
                 ..
             } => *performed_via_github_app_id,
+            Self::Admission { app_id, .. } => Some(*app_id),
             Self::Rollup { .. } => None,
             Self::Carried { approval, .. } => approval.app_id(),
         }
@@ -1191,6 +1224,12 @@ impl Approval {
         match self {
             Self::Review { login, .. } => format!("an approving review by {login}"),
             Self::Marker { login, .. } => format!("a reviewed:<sha> marker by {login}"),
+            Self::Admission {
+                check,
+                check_run_id,
+                classification,
+                ..
+            } => format!("`{check}` admission (run {check_run_id}, {classification})"),
             Self::Rollup { members } => format!(
                 "a rollup of {}, each merged at the exact head its own approval names",
                 members
@@ -1783,6 +1822,14 @@ pub enum HeadGate {
         /// Every removal of it, oldest first.
         ejections: Vec<Ejection>,
     },
+    /// The base takes authorization from the fleet's admission check
+    /// ([`guard`]) and that check does not admit this head.
+    NotAdmitted {
+        /// The head.
+        head: String,
+        /// Why: no run yet, a refusing run, or an unusable policy.
+        detail: String,
+    },
 }
 
 impl HeadGate {
@@ -1813,6 +1860,11 @@ impl HeadGate {
                 "the approval of head {} was posted by this same agent ({agent}); an agent \
                  cannot approve its own landing. Left disarmed until another agent approves \
                  it",
+                short(head)
+            ),
+            Self::NotAdmitted { head, detail } => format!(
+                "head {} is not admitted: {detail}. This base takes authorization from the \
+                 fleet's admission check only; reviewer comments do not count",
                 short(head)
             ),
             Self::EjectionCap { head, ejections } => format!(
@@ -1989,6 +2041,14 @@ pub(crate) fn decide_for_author(
     latest_was_interruption: bool,
     author: Option<&str>,
 ) -> HeadGate {
+    if !policy.source.is_comments() {
+        // Comments never authorize a guard-mode head; only
+        // [`guard::evaluate`], which reads the admission check, can.
+        return HeadGate::NotAdmitted {
+            head: head.to_owned(),
+            detail: "judged from comments under a guard-mode policy".to_owned(),
+        };
+    }
     if !policy.required {
         return HeadGate::NotRequired;
     }
@@ -2125,6 +2185,9 @@ fn read_policy_inner(
     stamp_sessions_shape(&table).map_err(|error| {
         PolicyReadError::Unreadable(format!("{CONFIG_PATH} on {base}: {error}"))
     })?;
+    guard::source_from_section(table.get(CONFIG_TABLE).and_then(toml::Value::as_table)).map_err(
+        |error| PolicyReadError::Unreadable(format!("{CONFIG_PATH} on {base}: {error}")),
+    )?;
     let mut policy = ApprovalPolicy::from_table_for_repo(&table, repo, host_default);
     policy.signers = policy.signers.or_else(|| host_signers(repo));
     policy
@@ -2390,6 +2453,16 @@ pub fn evaluate_excusing_with_policy(
     queue: &Value,
     latest_was_interruption: bool,
 ) -> Result<HeadGate, String> {
+    if let Some((gate, _, _)) = guard::evaluate(
+        run_gh,
+        repo,
+        head,
+        &policy.source,
+        queue,
+        latest_was_interruption,
+    )? {
+        return Ok(gate);
+    }
     if !policy.required {
         return Ok(HeadGate::NotRequired);
     }
@@ -2524,6 +2597,9 @@ fn evaluate_events(
     author: Option<&str>,
     rollups: bool,
 ) -> Result<(HeadGate, Vec<String>, Option<ApprovalBlocker>), String> {
+    if let Some(outcome) = guard::evaluate(run_gh, repo, head, &policy.source, queue, false)? {
+        return Ok(outcome);
+    }
     if !policy.required {
         return Ok((HeadGate::NotRequired, Vec::new(), None));
     }
