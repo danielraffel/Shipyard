@@ -582,3 +582,254 @@ fn an_unreadable_own_diff_fails_closed() {
     .expect("refused");
     assert_eq!(refusal.token, "carried_commits_unreadable:#22");
 }
+
+// 2026-11-05: #11450 is stacked on feature/unfreeze-value-source. Its listing
+// is 278 commits, over the cap, but its own diff against its own base is
+// three commits, and every approved green pull request on main was refused
+// `carried_commits_over_cap:#11450` regardless.
+const STACKED_BASE: &str = "feature/unfreeze-value-source";
+const STACKED_HEAD: &str = "11450000000000000000000000000000000000aa";
+const STACKED_OWN: [&str; 3] = [
+    "11450000000000000000000000000000000000a1",
+    "11450000000000000000000000000000000000a2",
+    "11450000000000000000000000000000000000a3",
+];
+const INDEPENDENT: &str = "11558000000000000000000000000000000000aa";
+
+fn over_cap_listing(number: u64, head_ref: &str, base_ref: &str, head: &str) -> serde_json::Value {
+    json!({"data": {"repository": {"pullRequests": {
+        "pageInfo": {"hasNextPage": false, "endCursor": null},
+        "nodes": [{
+            "number": number,
+            "headRefName": head_ref,
+            "baseRefName": base_ref,
+            "headRefOid": head,
+            "isCrossRepository": false,
+            "author": {"login": "someone"},
+            "carriedCommits": {"totalCount": 278, "nodes": []},
+        }],
+    }}}})
+}
+
+fn independent_refusal(
+    run_gh: &dyn Fn(&[String]) -> Result<String, String>,
+    judged: &Cell<usize>,
+) -> Option<super::Refusal> {
+    let mut judge = |_: &OpenPr| {
+        judged.set(judged.get() + 1);
+        Judgement::Unapproved("no counted APPROVE".to_owned())
+    };
+    refusal_with(
+        run_gh,
+        "Generous-Corp/pulp",
+        "main",
+        11558,
+        "feat/independent",
+        INDEPENDENT,
+        &mut PassCache::default(),
+        &mut judge,
+    )
+}
+
+#[test]
+fn an_unapproved_over_cap_stacked_pr_does_not_block_an_independent_pr() {
+    let run_gh = |argv: &[String]| -> Result<String, String> {
+        let joined = argv.join(" ");
+        if joined.contains("compare/main...") {
+            return Ok(json!({"total": 1, "shas": [INDEPENDENT]}).to_string());
+        }
+        if joined.contains(&format!("compare/{STACKED_BASE}...{STACKED_HEAD}")) {
+            return Ok(json!({"total": 3, "shas": STACKED_OWN}).to_string());
+        }
+        if joined.contains("OPEN") {
+            return Ok(
+                over_cap_listing(11450, "feat/stacked", STACKED_BASE, STACKED_HEAD).to_string(),
+            );
+        }
+        Err(format!("unexpected: {joined}"))
+    };
+    let judged = Cell::new(0);
+    assert_eq!(independent_refusal(&run_gh, &judged), None);
+    assert_eq!(judged.get(), 0, "a cleared own diff reads no approval");
+}
+
+#[test]
+fn an_over_cap_own_diff_that_does_not_reach_the_candidate_does_not_block_it() {
+    // Q's own diff is itself over the cap, Q is unapproved, but Q's head does
+    // not reach P's commit, so P is admitted.
+    let run_gh = |argv: &[String]| -> Result<String, String> {
+        let joined = argv.join(" ");
+        if joined.contains("compare/main...") {
+            return Ok(json!({"total": 1, "shas": [INDEPENDENT]}).to_string());
+        }
+        if joined.contains(&format!("compare/{STACKED_BASE}...{STACKED_HEAD}")) {
+            return Ok(json!({"total": 278, "shas": STACKED_OWN}).to_string());
+        }
+        if joined.contains(&format!("compare/{STACKED_HEAD}...{INDEPENDENT}")) {
+            return Ok("diverged".to_owned());
+        }
+        if joined.contains("OPEN") {
+            return Ok(
+                over_cap_listing(11450, "feat/stacked", STACKED_BASE, STACKED_HEAD).to_string(),
+            );
+        }
+        Err(format!("unexpected: {joined}"))
+    };
+    let judged = Cell::new(0);
+    assert_eq!(independent_refusal(&run_gh, &judged), None);
+    assert_eq!(judged.get(), 1);
+}
+
+#[test]
+fn an_over_cap_own_diff_that_carries_the_candidates_commit_is_refused() {
+    // Q's head reaches P's commit and Q's base does not: Q introduced it.
+    let run_gh = |argv: &[String]| -> Result<String, String> {
+        let joined = argv.join(" ");
+        if joined.contains("compare/main...") {
+            return Ok(json!({"total": 1, "shas": [INDEPENDENT]}).to_string());
+        }
+        if joined.contains(&format!("compare/{STACKED_BASE}...{STACKED_HEAD}")) {
+            return Ok(json!({"total": 278, "shas": STACKED_OWN}).to_string());
+        }
+        if joined.contains(&format!("compare/{STACKED_HEAD}...{INDEPENDENT}")) {
+            return Ok("behind".to_owned());
+        }
+        if joined.contains(&format!("compare/{STACKED_BASE}...{INDEPENDENT}")) {
+            return Ok("ahead".to_owned());
+        }
+        if joined.contains("OPEN") {
+            return Ok(
+                over_cap_listing(11450, "feat/stacked", STACKED_BASE, STACKED_HEAD).to_string(),
+            );
+        }
+        Err(format!("unexpected: {joined}"))
+    };
+    let refusal = independent_refusal(&run_gh, &Cell::new(0)).expect("refused");
+    assert_eq!(refusal.token, "carries_unapproved_commits:#11450");
+    assert!(refusal.detail.contains(INDEPENDENT), "{}", refusal.detail);
+}
+
+#[test]
+fn an_over_cap_own_diff_inheriting_the_candidates_commit_from_its_base_is_cleared() {
+    let run_gh = |argv: &[String]| -> Result<String, String> {
+        let joined = argv.join(" ");
+        if joined.contains("compare/main...") {
+            return Ok(json!({"total": 1, "shas": [INDEPENDENT]}).to_string());
+        }
+        if joined.contains(&format!("compare/{STACKED_BASE}...{STACKED_HEAD}")) {
+            return Ok(json!({"total": 278, "shas": STACKED_OWN}).to_string());
+        }
+        if joined.contains(&format!("compare/{STACKED_HEAD}...{INDEPENDENT}"))
+            || joined.contains(&format!("compare/{STACKED_BASE}...{INDEPENDENT}"))
+        {
+            return Ok("behind".to_owned());
+        }
+        if joined.contains("OPEN") {
+            return Ok(
+                over_cap_listing(11450, "feat/stacked", STACKED_BASE, STACKED_HEAD).to_string(),
+            );
+        }
+        Err(format!("unexpected: {joined}"))
+    };
+    assert_eq!(independent_refusal(&run_gh, &Cell::new(0)), None);
+}
+
+#[test]
+fn an_over_cap_own_diff_with_too_many_candidate_commits_to_probe_fails_closed() {
+    let many: Vec<String> = (0..=super::MAX_PROBED_COMMITS)
+        .map(|i| format!("{i:040x}"))
+        .collect();
+    let run_gh = |argv: &[String]| -> Result<String, String> {
+        let joined = argv.join(" ");
+        if joined.contains("compare/main...") {
+            return Ok(json!({"total": many.len(), "shas": many}).to_string());
+        }
+        if joined.contains(&format!("compare/{STACKED_BASE}...{STACKED_HEAD}")) {
+            return Ok(json!({"total": 278, "shas": STACKED_OWN}).to_string());
+        }
+        if joined.contains("OPEN") {
+            return Ok(
+                over_cap_listing(11450, "feat/stacked", STACKED_BASE, STACKED_HEAD).to_string(),
+            );
+        }
+        Err(format!("unexpected: {joined}"))
+    };
+    let refusal = independent_refusal(&run_gh, &Cell::new(0)).expect("refused");
+    assert_eq!(refusal.token, "carried_commits_over_cap:#11450");
+}
+
+#[test]
+fn an_over_cap_own_diff_with_an_unreadable_probe_fails_closed() {
+    let run_gh = |argv: &[String]| -> Result<String, String> {
+        let joined = argv.join(" ");
+        if joined.contains("compare/main...") {
+            return Ok(json!({"total": 1, "shas": [INDEPENDENT]}).to_string());
+        }
+        if joined.contains(&format!("compare/{STACKED_BASE}...{STACKED_HEAD}")) {
+            return Ok(json!({"total": 278, "shas": STACKED_OWN}).to_string());
+        }
+        if joined.contains("OPEN") {
+            return Ok(
+                over_cap_listing(11450, "feat/stacked", STACKED_BASE, STACKED_HEAD).to_string(),
+            );
+        }
+        Err("HTTP 502".to_owned())
+    };
+    let refusal = independent_refusal(&run_gh, &Cell::new(0)).expect("refused");
+    assert_eq!(refusal.token, "carried_commits_unreadable:#11450");
+}
+
+#[test]
+fn an_approved_over_cap_own_diff_is_not_probed() {
+    let run_gh = |argv: &[String]| -> Result<String, String> {
+        let joined = argv.join(" ");
+        if joined.contains("compare/main...") {
+            return Ok(json!({"total": 1, "shas": [INDEPENDENT]}).to_string());
+        }
+        if joined.contains(&format!("compare/{STACKED_BASE}...{STACKED_HEAD}")) {
+            return Ok(json!({"total": 278, "shas": STACKED_OWN}).to_string());
+        }
+        if joined.contains("OPEN") {
+            return Ok(
+                over_cap_listing(11450, "feat/stacked", STACKED_BASE, STACKED_HEAD).to_string(),
+            );
+        }
+        Err(format!("unexpected: {joined}"))
+    };
+    let refusal = refusal_with(
+        &run_gh,
+        "Generous-Corp/pulp",
+        "main",
+        11558,
+        "feat/independent",
+        INDEPENDENT,
+        &mut PassCache::default(),
+        &mut |_| Judgement::Approved,
+    );
+    assert_eq!(refusal, None);
+}
+
+#[test]
+fn a_compare_over_one_page_is_read_page_by_page() {
+    let shas: Vec<String> = (0..150).map(|i| format!("{i:040x}")).collect();
+    let pages = Cell::new(0);
+    let run_gh = |argv: &[String]| -> Result<String, String> {
+        let joined = argv.join(" ");
+        pages.set(pages.get() + 1);
+        let page = if joined.contains("&page=1 ") {
+            &shas[..100]
+        } else if joined.contains("&page=2 ") {
+            &shas[100..]
+        } else {
+            return Err(format!("unexpected: {joined}"));
+        };
+        Ok(json!({"total": 150, "shas": page}).to_string())
+    };
+    let CommitList::Complete(read) =
+        super::compare_commits(&run_gh, "o/r", "main", "h").expect("readable")
+    else {
+        panic!("150 commits are under the cap");
+    };
+    assert_eq!(read.len(), 150);
+    assert_eq!(pages.get(), 2);
+}
