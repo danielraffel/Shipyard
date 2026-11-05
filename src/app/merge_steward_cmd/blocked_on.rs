@@ -546,6 +546,8 @@ fn approval_blocked(blocker: &ApprovalBlocker, green_since: Option<String>) -> (
             Some(format!("the newest approval names {approved_head}"))
         }
         ApprovalBlocker::SelfApproved { agent } => Some(format!("approved and armed by {agent}")),
+        ApprovalBlocker::AdmissionMissing { detail }
+        | ApprovalBlocker::AdmissionRefused { detail, .. } => Some(detail.clone()),
         _ => None,
     };
     let held_by = match blocker {

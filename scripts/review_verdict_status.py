@@ -76,7 +76,10 @@ HEAD_CHECK_EVENTS = frozenset({"pull_request_target"})
 # The guard's refusal causes that mean "no counted verdict yet": the head has
 # no verdict, or only an earlier head's approval that does not carry. Every
 # other refusal (a HOLD, an unreadable review, a self-approval) is a failure.
-AWAITING_CAUSES = frozenset({"unreviewed", "approval_does_not_carry"})
+AWAITING_CAUSES = frozenset({"unreviewed", "approval_does_not_carry", "admission_missing"})
+# A base whose `[auto_merge] approval_source = "guard"` takes authorization
+# from the fleet admission check run instead of comments; its completion
+# reaches this workflow as a ``check_run`` event (see event_target).
 RECEIPT_REFUSAL = "reviewer claim receipt refused"
 
 
@@ -117,6 +120,12 @@ def event_target(event_name: str, event: dict[str, Any]) -> tuple[int | None, st
         issue = event.get("issue") or {}
         number = issue.get("number") if issue.get("pull_request") else None
         return (number if isinstance(number, int) else None), None
+    if event_name == "check_run":
+        run = event.get("check_run") or {}
+        pulls = [pull.get("number") for pull in run.get("pull_requests") or []
+                 if isinstance(pull, dict) and isinstance(pull.get("number"), int)]
+        head = run.get("head_sha") if isinstance(run.get("head_sha"), str) else None
+        return (pulls[0] if pulls else None), head
     if event_name == "workflow_run":
         run = event.get("workflow_run") or {}
         pulls = [pull.get("number") for pull in run.get("pull_requests") or []
@@ -162,8 +171,10 @@ def decide(guard: ModuleType, repo: str, number: int, head: str) -> Decision:
     return Decision(allowed, message, cause, tuple(excluded))
 
 
-def awaiting_description(head: str, excluded: list[str]) -> str:
+def awaiting_description(head: str, excluded: list[str], admission: bool = False) -> str:
     """The ``pending`` description: waiting, and why any approval did not count."""
+    if admission:
+        return f"awaiting fleet-guard admission for head {head[:12]}"
     if not excluded:
         return f"awaiting reviewer verdict for head {head[:12]}"
     codes = sorted(set(excluded))
@@ -257,7 +268,9 @@ def run(event_name: str, event: dict[str, Any], repo: str, run_url: str | None) 
         state, text = "success", describe(True, decisions[0][1].message + shared)
     elif awaiting:
         state = "pending"
-        text = awaiting_description(head, [code for _, d in refused for code in d.excluded])
+        text = awaiting_description(
+            head, [code for _, d in refused for code in d.excluded],
+            admission=all(d.cause == "admission_missing" for _, d in refused))
     else:
         hard = next(d for _, d in refused if not d.awaiting)
         state, text = "failure", describe(False, hard.message + shared)

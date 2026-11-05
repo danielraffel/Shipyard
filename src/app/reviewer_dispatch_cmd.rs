@@ -233,7 +233,9 @@ fn direct_approval_time(
             }
             login
         }
-        Approval::Carried { .. } | Approval::Rollup { .. } => return Ok(None),
+        Approval::Carried { .. } | Approval::Rollup { .. } | Approval::Admission { .. } => {
+            return Ok(None);
+        }
     };
     let review_rows = run_gh(&[
         "api".to_owned(),
@@ -306,7 +308,7 @@ fn direct_exact_approval(approval: &Approval, reviewer: &str) -> bool {
         Approval::Review { login, .. } | Approval::Marker { login, .. } => {
             login.eq_ignore_ascii_case(reviewer)
         }
-        Approval::Carried { .. } | Approval::Rollup { .. } => false,
+        Approval::Carried { .. } | Approval::Rollup { .. } | Approval::Admission { .. } => false,
     }
 }
 

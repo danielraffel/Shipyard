@@ -97,6 +97,7 @@ fn required(reviewers: &[&str]) -> ApprovalPolicy {
         signer_source: super::SignerSource::Host,
         carry_excluded: None,
         dry_run: false,
+        source: super::guard::ApprovalSource::Comments,
     }
 }
 
@@ -612,6 +613,7 @@ fn the_policy_is_read_from_the_auto_merge_table() {
             signer_source: super::SignerSource::Host,
             carry_excluded: None,
             dry_run: false,
+            source: super::guard::ApprovalSource::Comments,
         }
     );
     let empty: toml::Table = "[project]\nname = \"x\"\n".parse().expect("toml");
