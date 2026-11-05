@@ -107,16 +107,28 @@ base branch; a Q that merged P's branch still has it there and still holds
 P), or is a Shipyard rollup that merged P's head. Land or
 approve Q first, or drop its commits from P; a branch built on another pull
 request should target that pull request's branch. At most 250 commits are read
-per pull request: a larger, unapproved one fails closed
-(`carried_commits_over_cap:#N`), as does an unreadable listing, compare or
-approval, or a Q pushed after the pass listed it (`carried_commits_unreadable`;
+per pull request. A Q whose listing is larger (for example a stacked pull
+request whose listing reaches back past its base) is not refused on that count:
+the steward reads Q's own diff against Q's own base (`Q.base...Q.head`, paged),
+and the cap applies to that. If Q's own diff is still over 250 commits, an
+approved Q is ignored, and for an unapproved Q each of P's commits (at most 50)
+is probed: it counts only if Q's head reaches it and Q's base does not. So an
+over-cap Q that carries none of P's commits never blocks P. Only when that
+cannot be settled (P has more than 50 commits to probe) does P fail closed
+(`carried_commits_over_cap:#Q`); a P that is itself over the cap fails closed as
+`carried_commits_over_cap:#P`. An unreadable listing, compare, probe or
+approval, or a Q pushed after the pass listed it, also fails closed
+(`carried_commits_unreadable`;
 the next pass re-reads it). The check applies only where the base
 requires head approval. It guards every admission the steward makes: its own
 enqueue (including a same-head retry or priority re-enqueue), the exact-head
 merge on a base without a queue, and the `--arm-unqueued` backstop, which then
 declines to arm (`skip: carried_commits`) and gives the row the same token. (On 2026-11-01 a branch
 merged another branch that carried a held pull request's commits; its own
-diff was approved and the held code reached main.)
+diff was approved and the held code reached main. On 2026-11-05 one
+unapproved stacked pull request whose listing was over the cap refused every
+approved pull request on main, though it carried none of their commits; the
+own-diff read and the per-commit probe end that.)
 
 Labels keep a pull request out of admission, and the steward refuses it:
 `owner-decision`, `superseded` and `PARKED/<platform>`. `PARKED/<platform>`
@@ -286,7 +298,7 @@ not listed as blocked.
 | `ejected_same_head:<cause>` | The queue ejected this exact head and the steward will not re-enqueue it: the failure is the head's, could not be placed, or the head's one retry is spent. `blocked_detail` carries the classifier's reason (the failing job and whether the retry was spent). Read from the same queue state in a dry run and an apply pass; `since` is the removal | repair lane |
 | `waiting_full_test_tier`, `waiting_enqueue_requirements` | Admission waits on a deferred check tier or a GitHub requirement | CI |
 | `carries_unapproved_commits:#Q` | Approved and green, but carries commits of open pull request #Q, whose head is not approved; `blocked_detail` names the commits | Q's reviewer, or the author: drop Q's commits |
-| `carried_commits_over_cap:#N`, `carried_commits_unreadable` | Whether the head carries unapproved commits could not be proven (more than 250 commits, or a failed read) | author, or next pass |
+| `carried_commits_over_cap:#N`, `carried_commits_unreadable` | Whether the head carries unapproved commits could not be proven (P over 250 commits; or an unapproved #N whose own diff is over 250 commits while P has more than 50 commits to probe; or a failed read) | author, or next pass |
 | `revalidating` | The head or queue changed during the pass | next pass |
 | `waiting_code_owner:<owners>` | Approved and green, but the base's ruleset requires a code-owner review and no owner `CODEOWNERS` (at the base) assigns to a changed file has approved this exact head. The steward asks GitHub nothing and records no mutation; it posts one comment per head mentioning the owners (`+`-joined in the token). It never reads `reviewDecision`, which is `null` on a base that requires zero approvals even after the owner approves. A team or e-mail owner, or a file the PR author owns, is left to GitHub | code owner |
 | `code_owner_review` | GitHub refused the enqueue: a code-owner review is outstanding. Recorded `rejected` with GitHub's message, never left uncertain | code owner |
