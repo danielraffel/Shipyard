@@ -304,3 +304,75 @@ fn a_guard_config_without_an_app_id_is_an_unreadable_policy() {
         Err(PolicyReadError::Unreadable(_))
     ));
 }
+
+/// A queue-state response in which the merge queue removed `head` `count`
+/// times for a failure (never `merged`).
+fn ejected(head: &str, count: usize) -> Value {
+    let nodes = (0..count)
+        .map(|index| {
+            json!({
+                "__typename": "RemovedFromMergeQueueEvent",
+                "createdAt": format!("2026-11-04T0{index}:30:00Z"),
+                "reason": "failed_checks",
+                "beforeCommit": {"oid": head},
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({"data": {"repository": {"pullRequest": {"timelineItems": {"nodes": nodes}}}}})
+}
+
+fn gate_with_queue(queue: &Value, latest_was_interruption: bool) -> HeadGate {
+    let calls = RefCell::new(Vec::new());
+    let runs = [run(10)];
+    let run_gh = github(GUARD_CONFIG, &runs, &calls);
+    let policy = read_policy_required(&run_gh, "owner/repo", "main").expect("policy");
+    if latest_was_interruption {
+        return crate::head_approval::evaluate_excusing_with_policy(
+            &run_gh,
+            "owner/repo",
+            7,
+            HEAD,
+            &policy,
+            queue,
+            true,
+        )
+        .expect("gate");
+    }
+    evaluate_with_policy_for_author_with_events(
+        &run_gh,
+        "owner/repo",
+        7,
+        HEAD,
+        &policy,
+        queue,
+        Some("author"),
+    )
+    .expect("gate")
+    .0
+}
+
+/// The ejection cap is the steward's loop-breaker, not an approval rule, so
+/// it holds in guard mode: an admitted head the queue removed the cap's
+/// number of times is not admitted for another enqueue, and a fresh
+/// admission run does not lift it (only a new head does).
+#[test]
+fn an_admitted_head_ejected_to_the_cap_is_not_re_enqueued() {
+    let cap = crate::head_approval::EJECTION_CAP;
+    let gate = gate_with_queue(&ejected(HEAD, cap), false);
+    assert!(
+        matches!(&gate, HeadGate::EjectionCap { ejections, .. } if ejections.len() == cap),
+        "{gate:?}"
+    );
+    assert!(!gate.allows());
+    // Control: one removal short of the cap, the same admission admits.
+    assert!(gate_with_queue(&ejected(HEAD, cap - 1), false).allows());
+    // Removals of another head do not count against this one.
+    assert!(gate_with_queue(&ejected(OTHER, cap), false).allows());
+}
+
+#[test]
+fn an_interruption_excuses_the_newest_removal_in_guard_mode_too() {
+    let cap = crate::head_approval::EJECTION_CAP;
+    assert!(gate_with_queue(&ejected(HEAD, cap), true).allows());
+    assert!(!gate_with_queue(&ejected(HEAD, cap + 1), true).allows());
+}

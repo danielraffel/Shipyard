@@ -4412,7 +4412,9 @@ instead: only a run of that name on the exact head whose GitHub-set `app.id`
 is `guard_app_id`, newest first, completed `success`, with an `external_id`
 binding that head. The steward, `shipyard review-verdict`, the
 `review-verdict` status and the `ghapp` queue-arm guard all switch together;
-no comment or review counts and no approval carries to a new head. A
+no comment or review counts and no approval carries to a new head. The
+ejection cap still holds: an admitted head the queue removed twice is not
+re-enqueued, and only a new head lifts it. A
 malformed guard setting refuses every head rather than falling back to
 comments, and a `require-guard-admission` file in a host's guards directory
 refuses comment mode on that host. Do not post a verdict comment to unblock

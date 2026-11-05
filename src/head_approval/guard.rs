@@ -21,7 +21,8 @@
 //! default, keeps the comment and review rule as a transition fallback.
 //! There is no mixed mode: in guard mode no comment or review is read for
 //! authorization, and approvals never carry from an earlier head, because a
-//! new head needs its own admission.
+//! new head needs its own admission. The merge-queue ejection cap still
+//! applies to an admitted head (see [`evaluate`]).
 //!
 //! A host can refuse the fallback outright: a [`HOST_REQUIRE_FILE`] in the
 //! guards directory makes every comment-mode policy fail closed, so a base
@@ -313,6 +314,13 @@ pub(super) type GateOutcome = (HeadGate, Vec<String>, Option<ApprovalBlocker>);
 /// The gate for a policy whose source is not comments, or `None` when
 /// comments decide. Reads only the head's admission check runs.
 ///
+/// The merge-queue ejection cap still applies: it is the steward's
+/// loop-breaker, not an approval rule. An admitted head the queue removed
+/// [`super::EJECTION_CAP`] times is [`HeadGate::EjectionCap`]. Unlike a
+/// reviewer's fresh comment, a later admission run does not lift it (the
+/// trust root re-posts admission every tick), so only a new head does;
+/// `latest_was_interruption` excuses the newest removal, as in comment mode.
+///
 /// # Errors
 ///
 /// When the check runs cannot be read. Callers must not arm on an error.
@@ -321,6 +329,8 @@ pub(super) fn evaluate(
     repo: &str,
     head: &str,
     source: &ApprovalSource,
+    queue: &Value,
+    latest_was_interruption: bool,
 ) -> Result<Option<GateOutcome>, String> {
     let (check, app_id) = match source {
         ApprovalSource::Comments if host_requires_guard() => {
@@ -345,19 +355,32 @@ pub(super) fn evaluate(
             check_run_id,
             policy_sha,
             classification,
-        } => (
-            HeadGate::Approved {
-                approval: Approval::Admission {
-                    check: check.clone(),
-                    app_id,
-                    check_run_id,
-                    policy_sha,
-                    classification,
+        } => match capped(queue, head, latest_was_interruption) {
+            Some(ejections) => {
+                let at = ejections.last().and_then(|ejection| ejection.at.clone());
+                (
+                    HeadGate::EjectionCap {
+                        head: head.to_owned(),
+                        ejections,
+                    },
+                    events,
+                    Some(ApprovalBlocker::EjectionCap { at }),
+                )
+            }
+            None => (
+                HeadGate::Approved {
+                    approval: Approval::Admission {
+                        check: check.clone(),
+                        app_id,
+                        check_run_id,
+                        policy_sha,
+                        classification,
+                    },
                 },
-            },
-            events,
-            None,
-        ),
+                events,
+                None,
+            ),
+        },
         Judgement::Waiting { detail } => {
             let (gate, mut more, blocker) = refuse(head, detail);
             more.append(&mut events);
@@ -380,6 +403,19 @@ pub(super) fn evaluate(
             )
         }
     }))
+}
+
+/// The head's queue removals when they reach the cap, else `None`.
+fn capped(
+    queue: &Value,
+    head: &str,
+    latest_was_interruption: bool,
+) -> Option<Vec<super::Ejection>> {
+    let mut ejections = super::head_ejections(queue, head);
+    if latest_was_interruption {
+        ejections.pop();
+    }
+    (ejections.len() >= super::EJECTION_CAP).then_some(ejections)
 }
 
 fn refuse(head: &str, detail: String) -> GateOutcome {

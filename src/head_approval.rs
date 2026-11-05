@@ -2453,7 +2453,14 @@ pub fn evaluate_excusing_with_policy(
     queue: &Value,
     latest_was_interruption: bool,
 ) -> Result<HeadGate, String> {
-    if let Some((gate, _, _)) = guard::evaluate(run_gh, repo, head, &policy.source)? {
+    if let Some((gate, _, _)) = guard::evaluate(
+        run_gh,
+        repo,
+        head,
+        &policy.source,
+        queue,
+        latest_was_interruption,
+    )? {
         return Ok(gate);
     }
     if !policy.required {
@@ -2590,7 +2597,7 @@ fn evaluate_events(
     author: Option<&str>,
     rollups: bool,
 ) -> Result<(HeadGate, Vec<String>, Option<ApprovalBlocker>), String> {
-    if let Some(outcome) = guard::evaluate(run_gh, repo, head, &policy.source)? {
+    if let Some(outcome) = guard::evaluate(run_gh, repo, head, &policy.source, queue, false)? {
         return Ok(outcome);
     }
     if !policy.required {

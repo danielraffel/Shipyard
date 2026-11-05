@@ -164,7 +164,11 @@ reported and ignored. The newest counting run decides:
 `external_id` is JSON: `{"base_sha", "head_sha", "policy_sha",
 "classification"}`. No comment or review is read for authorization in guard
 mode, and no approval carries to a new head (merge-only, rebase, or rollup):
-each head needs its own admission. `approval_source = "guard"` also turns
+each head needs its own admission. The steward's merge-queue ejection cap
+still applies: it is a loop-breaker, not an approval rule, so an admitted
+head the queue removed twice is not enqueued again, and a later admission
+run does not lift it (the trust root re-posts admission every tick); only a
+new head does. `approval_source = "guard"` also turns
 `arm_requires_head_approval` on, so leaving that key out cannot switch the
 gate off. A guard source with no usable `guard_app_id`, an unknown
 `approval_source`, or `guard_app_id = 15368` (GitHub Actions) refuses every
