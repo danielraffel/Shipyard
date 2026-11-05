@@ -19,10 +19,16 @@ on:
   workflow_run:
     workflows: [Review verdict trigger]
     types: [completed]
+  # A base with `[auto_merge] approval_source = "guard"` follows the fleet
+  # admission check run; its completion re-judges the head.
+  check_run:
+    types: [completed]
 
 permissions:
   contents: read
   pull-requests: read
+  # Reads the fleet admission check run on a guard-mode base.
+  checks: read
   statuses: write
   # Re-runs the head's own run when a comment or review changes the verdict.
   actions: write
@@ -31,12 +37,14 @@ permissions:
 # run on the same pull request queue behind each other instead of racing; a
 # fork's review lists no pull request and falls back to its head.
 concurrency:
-  group: review-verdict-${{ github.event.pull_request.number || github.event.issue.number || github.event.workflow_run.pull_requests[0].number || github.event.workflow_run.head_sha }}
+  group: review-verdict-${{ github.event.pull_request.number || github.event.issue.number || github.event.workflow_run.pull_requests[0].number || github.event.check_run.pull_requests[0].number || github.event.workflow_run.head_sha || github.event.check_run.head_sha }}
   cancel-in-progress: false
 
 jobs:
   review-verdict:
-    if: github.event_name != 'issue_comment' || github.event.issue.pull_request
+    if: >-
+      (github.event_name != 'issue_comment' || github.event.issue.pull_request)
+      && (github.event_name != 'check_run' || github.event.check_run.name == 'fleet-guard/admission')
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

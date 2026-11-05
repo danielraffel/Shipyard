@@ -588,6 +588,16 @@ fn approval_evidence(approval: &crate::head_approval::Approval) -> String {
             comment_id.map_or_else(|| "unknown".to_owned(), |id| id.to_string()),
             app(performed_via_github_app_id)
         ),
+        crate::head_approval::Approval::Admission {
+            check,
+            app_id,
+            check_run_id,
+            policy_sha,
+            classification,
+        } => format!(
+            "admission:{check} app={app_id} run={check_run_id} policy={policy_sha} \
+             class={classification}"
+        ),
         crate::head_approval::Approval::Rollup { members } => format!(
             "rollup:{}",
             members

@@ -133,6 +133,55 @@ Pins: the job runs on `ubuntu-24.04`, uses `actions/checkout` and
 guard needs `tomllib`, 3.11 or later; an older interpreter would fail every
 status closed). It calls only `gh api`, from the image's `gh`.
 
+## Guard mode: authorization from the fleet admission check
+
+A verdict comment is text posted through the shared fleet App, so anyone who
+runs an agent can post one, signer line and session stamp included. A base
+can instead take authorization from the fleet trust root's admission check
+run, posted by an App no agent holds:
+
+```toml
+[auto_merge]
+approval_source = "guard"            # "comments" (the default) is the fallback
+guard_app_id = 1234567               # the admission App's numeric id
+guard_admission_check = "fleet-guard/admission"   # the default
+```
+
+Then this status, `shipyard review-verdict`, the steward (enqueue, exact-head
+merge, native arm, carrier) and the `ghapp` queue-arm guard all read the same
+thing: the check runs named `guard_admission_check` on the exact head whose
+`app.id` is `guard_app_id`. GitHub sets `app.id`; a run or status of that name
+from any other App, including `github-actions` and `shipyard-local`, is
+reported and ignored. The newest counting run decides:
+
+| Newest counting run | Result |
+|---|---|
+| none, queued or in progress | `pending` (waiting for admission) |
+| completed `success` whose `external_id` binds this head | `success` |
+| completed `success` whose `external_id` is missing, not JSON, names another head, or lacks a full `policy_sha` or a `classification` | `pending`: counts as absent |
+| completed with any other conclusion | `failure` |
+
+`external_id` is JSON: `{"base_sha", "head_sha", "policy_sha",
+"classification"}`. No comment or review is read for authorization in guard
+mode, and no approval carries to a new head (merge-only, rebase, or rollup):
+each head needs its own admission. `approval_source = "guard"` also turns
+`arm_requires_head_approval` on, so leaving that key out cannot switch the
+gate off. A guard source with no usable `guard_app_id`, an unknown
+`approval_source`, or `guard_app_id = 15368` (GitHub Actions) refuses every
+head instead of falling back to comments.
+
+A host can refuse the comment fallback outright: a
+`require-guard-admission` file in its guards directory
+(`$SHIPYARD_GHAPP_GUARDS_DIR`, else `~/.config/shipyard/guards`) makes every
+comment-mode base fail closed on that host, so a later base-config edit
+cannot quietly put it back on comments. Like every file in that directory it
+is an accident guard: the agent user can delete it.
+
+The `check_run` trigger re-judges a head when its admission run completes,
+so the status follows admission without a new push. Only runs named
+`fleet-guard/admission` start the job; a base that renames the check also
+edits that `if:`.
+
 ## Rollout
 
 1. Report-only: the status posts but is not required. Compare it with the
@@ -179,20 +228,25 @@ on:
   workflow_run:
     workflows: [Review verdict trigger]
     types: [completed]
+  check_run:
+    types: [completed]
 
 permissions:
   contents: read
   pull-requests: read
+  checks: read
   statuses: write
   actions: write
 
 concurrency:
-  group: review-verdict-${{ github.event.pull_request.number || github.event.issue.number || github.event.workflow_run.pull_requests[0].number || github.event.workflow_run.head_sha }}
+  group: review-verdict-${{ github.event.pull_request.number || github.event.issue.number || github.event.workflow_run.pull_requests[0].number || github.event.check_run.pull_requests[0].number || github.event.workflow_run.head_sha || github.event.check_run.head_sha }}
   cancel-in-progress: false
 
 jobs:
   review-verdict:
-    if: github.event_name != 'issue_comment' || github.event.issue.pull_request
+    if: >-
+      (github.event_name != 'issue_comment' || github.event.issue.pull_request)
+      && (github.event_name != 'check_run' || github.event.check_run.name == 'fleet-guard/admission')
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

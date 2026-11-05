@@ -4404,6 +4404,21 @@ and stop landings that never pass through `ghapp`
 reviewer (the steward reads that as waiting, not `required_failed`; nothing for
 the author to do) and `failure` only for a counted HOLD or an unreadable review.
 
+Every rule above judges comments posted through the shared fleet App, which
+every agent can use, so none of it is proof of who reviewed. A base with
+`[auto_merge] approval_source = "guard"` and `guard_app_id = <id>` takes
+authorization from the fleet trust root's `fleet-guard/admission` check run
+instead: only a run of that name on the exact head whose GitHub-set `app.id`
+is `guard_app_id`, newest first, completed `success`, with an `external_id`
+binding that head. The steward, `shipyard review-verdict`, the
+`review-verdict` status and the `ghapp` queue-arm guard all switch together;
+no comment or review counts and no approval carries to a new head. A
+malformed guard setting refuses every head rather than falling back to
+comments, and a `require-guard-admission` file in a host's guards directory
+refuses comment mode on that host. Do not post a verdict comment to unblock
+a guard-mode head; only the trust root's admission does
+(`docs/review-verdict-status.md`, "Guard mode").
+
 The report-only `risk-tier` status (`scripts/risk_tier.py`,
 docs/risk-tier.md) posts the review tier a pull request would need: Low (CI
 only), Moderate (one review-App approval) or High (two, plus the owner for

@@ -62,6 +62,19 @@ pub enum ApprovalBlocker {
         /// The agent that both approved and armed.
         agent: String,
     },
+    /// The fleet admission check has not admitted this head yet (none, not
+    /// complete, unbound) or the guard policy is unusable.
+    AdmissionMissing {
+        /// Why.
+        detail: String,
+    },
+    /// The fleet admission check refused this head.
+    AdmissionRefused {
+        /// The refusing check run.
+        check_run_id: u64,
+        /// Why.
+        detail: String,
+    },
 }
 
 impl ApprovalBlocker {
@@ -76,6 +89,8 @@ impl ApprovalBlocker {
             Self::StaleHead { .. } => "approval_excluded:stale_head".to_owned(),
             Self::EjectionCap { .. } => "ejection_cap".to_owned(),
             Self::SelfApproved { .. } => "approval_excluded:self_approved".to_owned(),
+            Self::AdmissionMissing { .. } => "admission_missing".to_owned(),
+            Self::AdmissionRefused { .. } => "admission_refused".to_owned(),
         }
     }
 
@@ -87,7 +102,10 @@ impl ApprovalBlocker {
             | Self::Excluded { at, .. }
             | Self::StaleHead { at, .. }
             | Self::EjectionCap { at } => at.as_deref(),
-            Self::NoVerdict | Self::SelfApproved { .. } => None,
+            Self::NoVerdict
+            | Self::SelfApproved { .. }
+            | Self::AdmissionMissing { .. }
+            | Self::AdmissionRefused { .. } => None,
         }
     }
 }
@@ -121,6 +139,9 @@ pub(super) fn diagnose(
             at: ejections.last().and_then(|ejection| ejection.at.clone()),
         }),
         HeadGate::NotApproved { .. } => Some(not_approved(records, policy, author)),
+        HeadGate::NotAdmitted { detail, .. } => Some(ApprovalBlocker::AdmissionMissing {
+            detail: detail.clone(),
+        }),
     }
 }
 

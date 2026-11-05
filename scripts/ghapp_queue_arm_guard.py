@@ -137,6 +137,7 @@ import posixpath
 import re
 import subprocess
 import sys
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from types import ModuleType
 from typing import Any
@@ -950,6 +951,167 @@ def _guards_dir() -> pathlib.Path:
     )
 
 
+# `[auto_merge]` keys choosing what authorizes a head; same as
+# src/head_approval/guard.rs. `approval_source = "guard"` takes authorization
+# from the fleet trust root's admission check run, posted by its own App,
+# which no agent holds; "comments" (the default) is the transition fallback.
+APPROVAL_SOURCE_KEY = "approval_source"
+GUARD_CHECK_KEY = "guard_admission_check"
+GUARD_APP_ID_KEY = "guard_app_id"
+DEFAULT_GUARD_CHECK = "fleet-guard/admission"
+# Guards-directory file that makes this host refuse comment-mode policies.
+HOST_REQUIRE_GUARD_FILE = "require-guard-admission"
+SHARED_ADMISSION_SLUGS = frozenset({"github-actions", "shipyard-local"})
+
+
+def approval_source(section: dict[str, Any]) -> dict[str, Any]:
+    """``{"source": "comments"}``, ``{"source": "guard", "check", "app_id"}``, or
+    ``{"source": "misconfigured", "detail"}``. A base that asks for guard mode
+    with unusable settings is refused, never judged by comments."""
+    value = section.get(APPROVAL_SOURCE_KEY)
+    if value is None or value == "comments":
+        return {"source": "comments"}
+    if value != "guard":
+        return {"source": "misconfigured",
+                "detail": f"[auto_merge] {APPROVAL_SOURCE_KEY} must be \"guard\" or "
+                          f"\"comments\", not {value!r}"}
+    app_id = section.get(GUARD_APP_ID_KEY)
+    if type(app_id) is not int or app_id <= 0:
+        return {"source": "misconfigured",
+                "detail": f"[auto_merge] {APPROVAL_SOURCE_KEY} = \"guard\" needs a positive "
+                          f"{GUARD_APP_ID_KEY}, not {app_id!r}"}
+    if app_id == SHARED_CLAIM_APP_ID:
+        return {"source": "misconfigured",
+                "detail": f"[auto_merge] {GUARD_APP_ID_KEY} may not be GitHub Actions "
+                          f"({SHARED_CLAIM_APP_ID}): any workflow can post as it"}
+    check = section.get(GUARD_CHECK_KEY, DEFAULT_GUARD_CHECK)
+    if not isinstance(check, str) or not check.strip():
+        return {"source": "misconfigured",
+                "detail": f"[auto_merge] {GUARD_CHECK_KEY} must be a non-empty check name"}
+    return {"source": "guard", "check": check.strip(), "app_id": app_id}
+
+
+def host_requires_guard() -> bool:
+    """Whether this host refuses comment-mode policies (a
+    ``require-guard-admission`` file in the guards directory)."""
+    return (_guards_dir() / HOST_REQUIRE_GUARD_FILE).is_file()
+
+
+def _admission_record(run: dict[str, Any], head: str) -> tuple[str, str] | str:
+    """``(policy_sha, classification)`` when the run's ``external_id`` binds
+    ``head``, else why it does not."""
+    raw = run.get("external_id")
+    if not isinstance(raw, str) or not raw.strip():
+        return "no external_id"
+    try:
+        record = json.loads(raw)
+    except json.JSONDecodeError as error:
+        return f"external_id is not JSON: {error}"
+    if not isinstance(record, dict):
+        return "external_id is not an object"
+    bound = record.get("head_sha")
+    if not isinstance(bound, str) or bound.strip().lower() != head.lower():
+        return "external_id names another head"
+    policy_sha = record.get("policy_sha")
+    if not (isinstance(policy_sha, str) and re.fullmatch(r"[0-9a-fA-F]{40}", policy_sha.strip())):
+        return "external_id has no full policy_sha"
+    classification = record.get("classification")
+    if not isinstance(classification, str) or not classification.strip():
+        return "external_id has no classification"
+    return policy_sha.strip().lower(), classification.strip()
+
+
+def judge_admission(runs: list[dict[str, Any]], head: str, check: str, app_id: int,
+                    notes: list[str]) -> tuple[str, str, dict[str, Any] | None]:
+    """``(state, why, approval)`` for ``head`` from its check runs: state is
+    ``admitted``, ``waiting`` or ``refused``. Only runs named ``check`` on
+    ``head`` from App ``app_id`` count, and the newest (highest id) decides.
+    Same rule as src/head_approval/guard.rs ``judge``."""
+    counting: list[dict[str, Any]] = []
+    for run in runs:
+        if run.get("name") != check:
+            continue
+        app = run.get("app") if isinstance(run.get("app"), dict) else {}
+        run_id = run.get("id")
+        if app.get("id") != app_id or app.get("slug") in SHARED_ADMISSION_SLUGS:
+            notes.append(f"excluded_admission:run {run_id} from app {app.get('id')} "
+                         f"({app.get('slug')})")
+            continue
+        if str(run.get("head_sha") or "").lower() != head.lower():
+            notes.append(f"excluded_admission:run {run_id} is on another head")
+            continue
+        counting.append(run)
+    if not counting:
+        return "waiting", f"no `{check}` check run from App {app_id} on this head yet", None
+    run = max(counting, key=lambda item: item.get("id") if isinstance(item.get("id"), int) else 0)
+    run_id = run.get("id")
+    if str(run.get("status") or "").lower() != "completed":
+        return "waiting", f"`{check}` run {run_id} has not completed", None
+    conclusion = str(run.get("conclusion") or "none").lower()
+    if conclusion != "success":
+        return "refused", f"`{check}` run {run_id} concluded {conclusion}", None
+    record = _admission_record(run, head)
+    if isinstance(record, str):
+        notes.append(f"excluded_admission:run {run_id}: {record}")
+        return "waiting", f"`{check}` run {run_id} does not bind this head ({record})", None
+    policy_sha, classification = record
+    return "admitted", (f"`{check}` admission (run {run_id}, {classification}, policy "
+                        f"{policy_sha[:12]})"), {
+        "approved_head": head.lower(), "admission_check": check, "admission_app_id": app_id,
+        "admission_run_id": run_id, "policy_sha": policy_sha, "classification": classification}
+
+
+def admission_gate(repo: str, number: int, head: str, source: dict[str, Any],
+                   classification: dict[str, Any]) -> tuple[bool, str, dict[str, Any] | None] | None:
+    """The gate under a non-comment policy, or ``None`` when comments decide.
+    Reads only the head's admission check runs; no comment or review counts."""
+    label = f"PR #{number}"
+    read = (f"ghapp api 'repos/{repo}/commits/{head}/check-runs?check_name="
+            f"{source.get('check', DEFAULT_GUARD_CHECK)}'")
+    if source["source"] == "comments":
+        if not host_requires_guard():
+            return None
+        why = (f"this host requires fleet-guard admission ({HOST_REQUIRE_GUARD_FILE}), but the "
+               f"base's [auto_merge] {APPROVAL_SOURCE_KEY} selects comments")
+        return False, f"{label} ({repo}): {why}", review_fix(
+            "admission_missing", why, repo, number, head, read, False)
+    if source["source"] == "misconfigured":
+        return False, f"{label} ({repo}): {source['detail']}", review_fix(
+            "admission_missing", source["detail"], repo, number, head, read, False)
+    check, app_id = source["check"], source["app_id"]
+    try:
+        runs = _rest_check_runs(repo, head, check)
+    except GuardError as error:
+        why = f"its admission check cannot be read ({error})"
+        return False, f"{label} ({repo}): {why}", review_fix(
+            "unreadable", why, repo, number, head, read, True)
+    notes: list[str] = []
+    state, why, approval = judge_admission(runs, head, check, app_id, notes)
+    if notes:
+        classification["excluded_admissions"] = notes
+    if state == "admitted":
+        classification["approval"] = approval
+        return True, f"{label} ({repo}): {why}", None
+    cause = "admission_missing" if state == "waiting" else "admission_refused"
+    return False, (f"{label} ({repo}): not admitted: {why}. This base takes authorization "
+                   "from the fleet admission check only; reviewer comments do not count"), \
+        review_fix(cause, why, repo, number, head, read, state == "waiting")
+
+
+def _rest_check_runs(repo: str, head: str, check: str) -> list[dict[str, Any]]:
+    value = run_real_gh(["api", "--paginate", "--slurp",
+                         f"repos/{repo}/commits/{head}/check-runs?check_name="
+                         f"{urllib.parse.quote(check, safe='')}&filter=all&per_page=100"])
+    pages = value if isinstance(value, list) else [value]
+    runs: list[dict[str, Any]] = []
+    for page in pages:
+        rows = page.get("check_runs") if isinstance(page, dict) else None
+        if not isinstance(rows, list):
+            raise GuardError("check-runs did not answer a check_runs list")
+        runs.extend(row for row in rows if isinstance(row, dict))
+    return runs
+
+
 def review_policy(config_text: str | None, repo: str, host_default: bool) -> dict[str, Any]:
     """``{required, reviewers, any_but_author}`` from the base's config text.
 
@@ -1026,6 +1188,7 @@ def review_policy(config_text: str | None, repo: str, host_default: bool) -> dic
             raise GuardError(f"the base's .shipyard/config.toml [auto_merge] {STAMP_SESSIONS_KEY} "
                              f"must be a non-empty list of session globs, not {stamp_sessions!r}")
         stamp_sessions = [pattern.strip().lower() for pattern in stamp_sessions]
+    source = approval_source(section)
     try:
         excluded, carry_error = carry_paths(section), None
     except GuardError as error:
@@ -1037,7 +1200,12 @@ def review_policy(config_text: str | None, repo: str, host_default: bool) -> dic
                            else list(DEFAULT_CARRY_EXCLUDED_PATHS)),
         # Why the base's carry configuration was refused, or None.
         "carry_error": carry_error,
-        "required": required if isinstance(required, bool) else default,
+        # Guard mode always requires authorization (see approval_source).
+        "required": (True if source["source"] != "comments"
+                     else required if isinstance(required, bool) else default),
+        # What authorizes a head: comments and reviews, or the fleet
+        # admission check run. Same keys as src/head_approval/guard.rs.
+        "source": source,
         "reviewers": [str(login).lower() for login in reviewers if isinstance(login, str)],
         # Required by REVIEW_REQUIRED_REPOS, not by the repository's own key.
         "any_but_author": from_default,
@@ -3070,7 +3238,7 @@ def _review_gate(classification: dict[str, Any], repo: str | None, dry_run: bool
     label = f"PR #{number}"
     if not repo or not isinstance(number, int) or not isinstance(head, str):
         return False, f"{label}: cannot tell which head would land, so its review cannot be checked", None
-    if not host_review_default():
+    if not host_review_default() and not host_requires_guard():
         # Off is inert: nothing is read, so no config, Python version or
         # GitHub answer can change what an arm does on a host that opted out.
         return True, (f"review before arm is OFF on this host ({HOST_OPT_OUT_FILE}: "
@@ -3108,6 +3276,9 @@ def _review_gate(classification: dict[str, Any], repo: str | None, dry_run: bool
             repo, number, head,
             f"repeat the same command with `--match-head-commit {head}` (gh pr merge), "
             f"`expectedHeadOid: \"{head}\"` (GraphQL) or `sha={head}` (REST)", False)
+    admitted = admission_gate(repo, number, head, policy["source"], classification)
+    if admitted is not None:
+        return admitted
     allowed, why = review_verdict(head, author, comments, reviews, policy)
     if allowed:
         own = self_approval(head, author, comments, reviews, policy)

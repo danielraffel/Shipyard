@@ -406,7 +406,9 @@ class ReviewVerdictStatus(unittest.TestCase):
             self.assertEqual(groups, [
                 "group: review-verdict-${{ github.event.pull_request.number || "
                 "github.event.issue.number || github.event.workflow_run.pull_requests[0].number "
-                "|| github.event.workflow_run.head_sha }}"], path)
+                "|| github.event.check_run.pull_requests[0].number "
+                "|| github.event.workflow_run.head_sha || github.event.check_run.head_sha }}"],
+                path)
 
     def test_a_head_two_open_pull_requests_share_needs_both_approved(self) -> None:
         trail = [self.comment(SIGNED_APPROVE.format(head=HEAD), "2026-10-12T15:00:00Z")]
