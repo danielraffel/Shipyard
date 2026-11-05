@@ -376,3 +376,113 @@ fn an_interruption_excuses_the_newest_removal_in_guard_mode_too() {
     assert!(gate_with_queue(&ejected(HEAD, cap), true).allows());
     assert!(!gate_with_queue(&ejected(HEAD, cap + 1), true).allows());
 }
+
+/// A fake GitHub for a comment-mode base: `config` and `comments` answer as
+/// given, and any admission check run on the head is a green one from the
+/// guard App, so a gate that consulted it would be visibly different.
+fn comment_mode_github<'a>(
+    config: &'a str,
+    comments: &'a [Value],
+    calls: &'a RefCell<Vec<String>>,
+) -> impl Fn(&[String]) -> Result<String, String> + 'a {
+    move |args: &[String]| {
+        let joined = args.join(" ");
+        calls.borrow_mut().push(joined.clone());
+        if joined.contains("contents/.shipyard/config.toml") {
+            return Ok(config.to_owned());
+        }
+        if joined.contains("/check-runs") {
+            return Ok(run(10).to_string());
+        }
+        if joined.contains("/issues/7/comments") {
+            return Ok(comments
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"));
+        }
+        if joined.contains("/pulls/7/reviews") {
+            return Ok(String::new());
+        }
+        if joined.contains(&format!("commits/{HEAD}")) {
+            return Ok("2026-11-01T00:00:00Z".to_owned());
+        }
+        Err(format!("unexpected: {joined}"))
+    }
+}
+
+/// Landing this module changes nothing for a base that has not opted in: a
+/// base with no `approval_source` (or `approval_source = "comments"`) gets
+/// exactly the comment rule's decision, never reads a check run, and is not
+/// admitted by a green admission run alone.
+#[test]
+fn an_unconfigured_base_behaves_exactly_as_the_comment_rule() {
+    let reviewer = "shipyard-review[bot]";
+    let comment = |verdict: &str| {
+        json!({"id": 5, "login": reviewer, "type": "Bot", "association": "NONE",
+            "at": "2026-11-02T00:00:00Z", "body": format!("verdict: {verdict} head:{HEAD}"),
+            "performed_via_github_app_id": 99})
+    };
+    let base = "[auto_merge]\narm_requires_head_approval = true\nreviewer_identities = [\"shipyard-review[bot]\"]\n";
+    let explicit = format!("{base}approval_source = \"comments\"\n");
+    let silent = "[project]\nname = \"x\"\n";
+    for config in [base, explicit.as_str(), silent] {
+        for comments in [vec![], vec![comment("APPROVE")], vec![comment("HOLD")]] {
+            let calls = RefCell::new(Vec::new());
+            let run_gh = comment_mode_github(config, &comments, &calls);
+            let policy = read_policy_required(&run_gh, "owner/repo", "main").expect("policy");
+            assert_eq!(policy.source, ApprovalSource::Comments, "{config}");
+            let (gate, _) = evaluate_with_policy_for_author_with_events(
+                &run_gh,
+                "owner/repo",
+                7,
+                HEAD,
+                &policy,
+                &json!({}),
+                Some("author"),
+            )
+            .expect("gate");
+            let expected = crate::head_approval::decide_for_author(
+                &policy,
+                HEAD,
+                &[],
+                &comments,
+                &json!({}),
+                false,
+                Some("author"),
+            );
+            assert_eq!(gate, expected, "{config} {comments:?}");
+            assert!(
+                !matches!(
+                    &gate,
+                    HeadGate::Approved {
+                        approval: crate::head_approval::Approval::Admission { .. }
+                    }
+                ),
+                "{gate:?}"
+            );
+            drop(run_gh);
+            let calls = calls.into_inner();
+            assert!(
+                !calls.iter().any(|call| call.contains("/check-runs")),
+                "a comment-mode base never reads a check run: {calls:?}"
+            );
+        }
+    }
+    // Control: the fixture distinguishes the outcomes it claims to compare.
+    let calls = RefCell::new(Vec::new());
+    let approve = [comment("APPROVE")];
+    let run_gh = comment_mode_github(base, &approve, &calls);
+    let policy = read_policy_required(&run_gh, "owner/repo", "main").expect("policy");
+    let (gate, _) = evaluate_with_policy_for_author_with_events(
+        &run_gh,
+        "owner/repo",
+        7,
+        HEAD,
+        &policy,
+        &json!({}),
+        Some("author"),
+    )
+    .expect("gate");
+    assert!(gate.allows(), "{gate:?}");
+}

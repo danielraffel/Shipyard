@@ -54,6 +54,31 @@ class ApprovalSource(unittest.TestCase):
         self.assertEqual(guard.approval_source({"approval_source": "comments"}),
                          {"source": "comments"})
 
+    def test_an_unconfigured_base_keeps_todays_policy(self) -> None:
+        # Landing guard mode changes nothing until a base opts in: the policy
+        # a base without the new keys reads is the comment policy, field for
+        # field, apart from the added `source`.
+        for text in (None, "[project]\nname = 'x'\n",
+                     "[auto_merge]\narm_requires_head_approval = true\n"
+                     "reviewer_identities = ['shipyard-review[bot]']\n"):
+            with self.subTest(text=text):
+                policy = guard.review_policy(text, "owner/repo", False)
+                self.assertEqual(policy["source"], {"source": "comments"})
+                explicit = guard.review_policy(
+                    (text or "") + "\n[auto_merge]\napproval_source = 'comments'\n"
+                    if text is None or "[auto_merge]" not in text
+                    else text + "approval_source = 'comments'\n",
+                    "owner/repo", False)
+                self.assertEqual(policy, explicit)
+                with tempfile.TemporaryDirectory() as guards, \
+                        mock.patch.object(guard, "_guards_dir",
+                                          return_value=pathlib.Path(guards)), \
+                        mock.patch.object(guard, "_rest_check_runs") as read:
+                    self.assertIsNone(guard.admission_gate(
+                        "owner/repo", 7, HEAD, policy["source"], {}))
+                read.assert_not_called()
+        self.assertFalse(guard.review_policy(None, "owner/repo", False)["required"])
+
     def test_guard_needs_a_positive_non_actions_app_id(self) -> None:
         self.assertEqual(
             guard.approval_source({"approval_source": "guard", "guard_app_id": GUARD_APP}),
