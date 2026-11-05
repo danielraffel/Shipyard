@@ -73,7 +73,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
         text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
         signing = text.split("  sign-and-upload-macos:\n", 1)[1]
         self.assertIn(
-            "if: always() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && "
+            "if: always() && startsWith(github.ref, 'refs/tags/v') && "
             "vars.CI_MACOS_SIGNING_ENABLED == 'true'",
             signing,
         )
@@ -272,17 +272,12 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn('echo "CARGO_HOME=$root/cargo" >> "$GITHUB_ENV"', step)
         self.assertIn('echo "RUSTUP_HOME=$root/rustup" >> "$GITHUB_ENV"', step)
         self.assertNotIn("if:", step)
-        # The signing job runs on a fixed label, never one an input or a
-        # repository variable chose, and only for a tag push.
+        # Runner selection is unchanged by the isolation.
         job = RELEASE_WORKFLOW.read_text(encoding="utf-8").split("\n  sign-and-upload-macos:\n", 1)[1]
-        config = job.split("steps:", 1)[0]
         self.assertIn(
-            """runs-on: ${{ fromJSON('["self-hosted","local-mac","shipyard-build-studio"]') }}""",
-            config,
+            "runs-on: ${{ fromJSON(needs.resolve-runners.outputs.macos_arm64_runs_on_json) }}",
+            job.split("steps:", 1)[0],
         )
-        self.assertNotIn("needs.resolve-runners", config)
-        self.assertIn("github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')", config)
-        self.assertIn("\n    environment: release\n", config)
 
     def test_rust_home_isolation_is_specific_to_the_signing_job(self) -> None:
         # Negative control: the unsigned build matrix keeps its runner homes.

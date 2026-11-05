@@ -34,6 +34,8 @@ ENVIRONMENT_SECRETS: dict[str, str] = {
     "MACOS_NOTARIZE_APPLE_ID": "release",
     "MACOS_NOTARIZE_APP_PASSWORD": "release",
     "MACOS_NOTARIZE_TEAM_ID": "release",
+    # post-tag-sync is tag-triggered; its PAT is revoked in Stage 1 step 3.
+    "RELEASE_BOT_TOKEN": "release",
 }
 
 # Environments whose jobs must run no repository code.
@@ -44,9 +46,6 @@ REPOSITORY_SECRETS: dict[str, str] = {
     # Deferred: the shipyard-local App key; Shipyard and the steward read it
     # at runtime, so moving it waits for the shipyard-local narrowing.
     "SHIPYARD_APP_PRIVATE_KEY": "deferred: shipyard-local",
-    # The release-bot PAT post-tag-sync reads: revoked with every owner PAT,
-    # and the workflow is being fixed separately.
-    "RELEASE_BOT_TOKEN": "to be revoked, not moved",
     # Optional read-only token for the release smoke; unset today, and the
     # job falls back to its own read-only job token.
     "RELEASE_SMOKE_GH_TOKEN": "read-only smoke credential",

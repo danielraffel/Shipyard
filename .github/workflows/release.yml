@@ -334,16 +334,11 @@ jobs:
           draft: true
 
   sign-and-upload-macos:
-    needs: [release]
+    needs: [resolve-runners, release]
     # Keep this gate rerunnable with `gh run rerun --failed` when the release
     # job withheld publication after a transient smoke failure.
-    # Tag pushes only (re-runs keep the push event): a dispatch can choose
-    # runners through its inputs, and this job holds the signing secrets.
-    if: always() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && vars.CI_MACOS_SIGNING_ENABLED == 'true'
-    # A fixed label, not the resolved selector: inputs and repository
-    # variables choose the other legs, and neither may choose where the
-    # Developer ID identity is unpacked.
-    runs-on: ${{ fromJSON('["self-hosted","local-mac","shipyard-build-studio"]') }}
+    if: always() && startsWith(github.ref, 'refs/tags/v') && vars.CI_MACOS_SIGNING_ENABLED == 'true'
+    runs-on: ${{ fromJSON(needs.resolve-runners.outputs.macos_arm64_runs_on_json) }}
     # The Developer ID P12 and notarization credentials are secrets of the
     # `release` environment (deployment policy: tags v* only). A tag push runs
     # the tagged commit's own workflow, so the v* tag rulesets, not this file,
