@@ -3251,7 +3251,10 @@ def _review_gate(classification: dict[str, Any], repo: str | None, dry_run: bool
             raise GuardError("the pull request carries no base branch")
         config_text = base_config_text(repo, base)
         policy = review_policy(config_text, repo, True)
-        if not policy["required"]:
+        if not policy["required"] and not host_requires_guard():
+            # A host that requires guard admission never takes this early
+            # return: a base cannot opt out of review to dodge the host rule
+            # (src/head_approval/guard.rs checks the host rule first too).
             return True, f"{repo} does not require a review before arming", None
         live_head = ((pull.get("head") or {}).get("sha") or "").lower()
         if live_head != head.lower():

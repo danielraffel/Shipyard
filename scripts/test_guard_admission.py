@@ -187,6 +187,34 @@ class Gate(unittest.TestCase):
         self.assertEqual(fix["cause"], "unreadable")
 
 
+class ReviewGateHostRule(unittest.TestCase):
+    """The host rule holds through ``_review_gate``, not just ``admission_gate``."""
+
+    def review_gate(self, config: str, require_file: bool) -> tuple[bool, str, Any]:
+        classification = {"repo": "owner/repo", "pr": 7, "head": HEAD, "bound_head": HEAD}
+        pull = {"base": {"ref": "main"}, "head": {"sha": HEAD}, "user": {"login": "author"}}
+        with tempfile.TemporaryDirectory() as guards, \
+                mock.patch.object(guard, "_guards_dir", return_value=pathlib.Path(guards)), \
+                mock.patch.object(guard, "host_review_default", return_value=True), \
+                mock.patch.object(guard, "run_real_gh", return_value=pull), \
+                mock.patch.object(guard, "base_config_text", return_value=config), \
+                mock.patch.object(guard, "_rest_pages", return_value=[]):
+            if require_file:
+                (pathlib.Path(guards) / guard.HOST_REQUIRE_GUARD_FILE).write_text("1\n")
+            return guard._review_gate(classification, "owner/repo")
+
+    def test_a_base_cannot_opt_out_of_review_to_dodge_the_host_guard_rule(self) -> None:
+        config = "[auto_merge]\narm_requires_head_approval = false\n"
+        allowed, message, fix = self.review_gate(config, require_file=True)
+        self.assertFalse(allowed, message)
+        self.assertEqual(fix["cause"], "admission_missing")
+
+    def test_without_the_host_file_an_opted_out_base_still_arms(self) -> None:
+        config = "[auto_merge]\narm_requires_head_approval = false\n"
+        allowed, message, _ = self.review_gate(config, require_file=False)
+        self.assertTrue(allowed, message)
+
+
 class Status(unittest.TestCase):
     def test_the_admission_check_run_event_names_its_head(self) -> None:
         event = {"check_run": {"name": CHECK, "head_sha": HEAD,
