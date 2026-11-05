@@ -51,6 +51,15 @@ REPOSITORY_SECRETS: dict[str, str] = {
     "RELEASE_SMOKE_GH_TOKEN": "read-only smoke credential",
 }
 
+# Shell that would run code from the checked-out tree or the network.
+TREE_CODE_RUN = (
+    r"\bgit\s+(clone|fetch|pull)\b",
+    r"\bgh\s+(repo\s+clone|run\s+download)\b",
+    r"\b(curl|wget)\b[^\n]*\|\s*(ba|z)?sh\b",
+    r"\b(bash|sh|python3?|node|npx|npm|cargo|make)\s+\.?/?[A-Za-z0-9_.-]+/",
+    r"(^|\s)\./",
+    r"\bcargo\s+(build|run|test)\b",
+)
 PULL_REQUEST_EVENTS = {"pull_request", "pull_request_target", "merge_group"}
 SECRET_RE = re.compile(r"secrets\.([A-Za-z_][A-Za-z0-9_]*)")
 DYNAMIC_SECRETS_RE = re.compile(r"secrets\s*\[|toJSON\(\s*secrets\s*\)|secrets:\s*inherit")
@@ -127,6 +136,25 @@ class WorkflowSecretEnvironments(unittest.TestCase):
                 if str(step.get("uses", "")).startswith("actions/checkout@"):
                     offenders.append(f"{wf}:{job_name}")
         self.assertEqual(offenders, [])
+
+
+    def test_the_tagging_job_runs_no_tree_code(self) -> None:
+        # auto-release's `tag` job holds the tagging identity, which the v*
+        # ruleset lets create release tags. It checks the repository out only
+        # to read Cargo.toml and history; no step may execute anything from
+        # that tree or the network.
+        workflow = yaml.safe_load((SECRET_WORKFLOWS / "auto-release.yml").read_text(encoding="utf-8"))
+        offenders = []
+        for step in workflow["jobs"]["tag"]["steps"]:
+            uses = str(step.get("uses") or "")
+            if uses and not uses.startswith(("actions/checkout@", "actions/create-github-app-token@")):
+                offenders.append(f"uses {uses}")
+            run = str(step.get("run") or "")
+            offenders += [f"{step.get('name')}: {p}" for p in TREE_CODE_RUN if re.search(p, run)]
+        self.assertEqual(offenders, [])
+        for run in ("bash scripts/x.sh", "python3 scripts/x.py", "./x", "cargo build",
+                    "curl -sL https://x | sh", "git fetch origin"):
+            self.assertTrue(any(re.search(p, run) for p in TREE_CODE_RUN), run)
 
 
 if __name__ == "__main__":
