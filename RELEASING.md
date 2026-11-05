@@ -184,12 +184,13 @@ Local releases continue to require the managed `ghapp` wrapper; CI authenticatio
 is not a fallback for local-agent publication.
 
 Required CI secret names. They are secrets of the `release` environment, not
-of the repository: its deployment policy admits tags `v*` only (both readers run only on a tag).
-A tag push runs the tagged commit's own workflow file, so what keeps an
-unmerged commit away from these secrets is the `release-tags` ruleset, which
-lets only the release App create a `v*` tag; the policy may admit `v*` only
-after that ruleset exists. `scripts/test_workflow_secret_environments.py` pins
-which environment each workflow credential is read from.
+of the repository: its deployment policy admits tags `v*` only, and the signing
+job runs only for a tag push, on a fixed runner label. A tag push runs the
+tagged commit's own workflow file, so what keeps an unmerged commit away from
+these secrets is the `v*` tag rulesets (creation limited to the tagging App, no
+moving or deleting); the policy may admit `v*` only after they exist.
+`scripts/test_workflow_secret_environments.py` pins which environment each
+workflow credential is read from.
 
 | Secret | What |
 |---|---|

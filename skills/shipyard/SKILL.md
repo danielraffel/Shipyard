@@ -815,15 +815,17 @@ re-checks `done` when the owner ends. The lease is removed either way, so this
 never wedges later runs.
 ## Release credentials live in the `release` environment
 
-The Developer ID and notarization secrets and `RELEASE_BOT_TOKEN` are secrets of
-the `release` environment (tags `v*` only), never of the
-repository. A tag push runs the tagged commit's own workflow file, so the
-environment is only as safe as the `release-tags` ruleset's creation rule; add
-the tag policy only after that ruleset exists. The signing and post-tag jobs
-still build repository code next to those secrets, so the environment limits
-which refs reach them, not what merged code can do. Adding a job that reads a
-secret means classifying it in `scripts/test_workflow_secret_environments.py`.
-`SHIPYARD_APP_PRIVATE_KEY` stays a repository secret for now.
+The Developer ID and notarization secrets are secrets of the `release`
+environment (tags `v*` only), never of the repository. The signing job runs
+only for a tag push and on a fixed runner label, so no dispatch input or
+repository variable chooses where the identity is unpacked. A tag push runs the
+tagged commit's own workflow file, so the environment is only as safe as the
+`v*` tag rulesets; add the tag policy only after they exist. The job still
+builds repository code next to those secrets: the environment limits which
+refs reach them, not what merged code can do. Adding a job that reads a secret
+means classifying it in `scripts/test_workflow_secret_environments.py`.
+`SHIPYARD_APP_PRIVATE_KEY` and `RELEASE_BOT_TOKEN` stay repository secrets for
+now.
 
 ## Release publication waits for attestation
 

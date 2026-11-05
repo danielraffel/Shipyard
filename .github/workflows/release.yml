@@ -334,16 +334,20 @@ jobs:
           draft: true
 
   sign-and-upload-macos:
-    needs: [resolve-runners, release]
+    needs: [release]
     # Keep this gate rerunnable with `gh run rerun --failed` when the release
     # job withheld publication after a transient smoke failure.
-    if: always() && startsWith(github.ref, 'refs/tags/v') && vars.CI_MACOS_SIGNING_ENABLED == 'true'
-    runs-on: ${{ fromJSON(needs.resolve-runners.outputs.macos_arm64_runs_on_json) }}
+    # Tag pushes only (re-runs keep the push event): a dispatch can choose
+    # runners through its inputs, and this job holds the signing secrets.
+    if: always() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && vars.CI_MACOS_SIGNING_ENABLED == 'true'
+    # A fixed label, not the resolved selector: inputs and repository
+    # variables choose the other legs, and neither may choose where the
+    # Developer ID identity is unpacked.
+    runs-on: ${{ fromJSON('["self-hosted","local-mac","shipyard-build-studio"]') }}
     # The Developer ID P12 and notarization credentials are secrets of the
-    # `release` environment (deployment policy: tags v* only, the
-    # tag ruleset limiting v* creation to the release App). A tag push runs the
-    # tagged commit's own workflow, so the ruleset, not this file, is what keeps
-    # an unmerged commit away from them.
+    # `release` environment (deployment policy: tags v* only). A tag push runs
+    # the tagged commit's own workflow, so the v* tag rulesets, not this file,
+    # are what keep an unmerged commit away from them.
     environment: release
     # Uploads the DMG and publishes the release (contents) after attesting it.
     permissions:

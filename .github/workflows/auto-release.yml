@@ -11,11 +11,6 @@ name: Auto-Release on CLI Version Bump
 # token would start no release.yml run. Without the App credentials the run
 # fails rather than falling back to the default token.
 #
-# When vars.FLEET_RELEASE_INTERIM_APP_ID is set, the tag is pushed by the
-# fleet-release-interim App instead (key FLEET_RELEASE_INTERIM_APP_PRIVATE_KEY,
-# a secret of the main-only `automation` environment). That App is the only
-# bypass actor of the v* tag ruleset's creation rule. Unset, nothing changes.
-#
 # The workflow also supports workflow_dispatch so `shipyard doctor
 # --release-chain` can verify that the release token is accepted. A manual
 # dispatch with no version movement is a no-op after checkout.
@@ -36,11 +31,9 @@ jobs:
   tag:
     runs-on: ubuntu-latest
     name: Tag CLI version bumps
-    environment: automation
 
     steps:
       - name: Require release App credentials
-        if: vars.FLEET_RELEASE_INTERIM_APP_ID == ''
         env:
           SHIPYARD_APP_PRIVATE_KEY: ${{ secrets.SHIPYARD_APP_PRIVATE_KEY }}
         run: |
@@ -51,22 +44,12 @@ jobs:
 
       - name: Mint release App token
         id: app-token
-        if: vars.FLEET_RELEASE_INTERIM_APP_ID == ''
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           # The shipyard-local App's public client ID. With no owner or
           # repositories input the token is scoped to this repository only.
           client-id: Iv23liTCzDQWqmMjkDTI
           private-key: ${{ secrets.SHIPYARD_APP_PRIVATE_KEY }}
-          permission-contents: write
-
-      - name: Mint fleet-release-interim App token
-        id: interim-token
-        if: vars.FLEET_RELEASE_INTERIM_APP_ID != ''
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
-        with:
-          app-id: ${{ vars.FLEET_RELEASE_INTERIM_APP_ID }}
-          private-key: ${{ secrets.FLEET_RELEASE_INTERIM_APP_PRIVATE_KEY }}
           permission-contents: write
 
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
@@ -119,7 +102,7 @@ jobs:
         if: steps.guard.outputs.skip == '0'
         shell: bash
         env:
-          GH_TOKEN: ${{ steps.interim-token.outputs.token || steps.app-token.outputs.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           V_BEFORE: ${{ steps.versions.outputs.before }}
           V_AFTER: ${{ steps.versions.outputs.after }}
         run: |

@@ -34,9 +34,6 @@ ENVIRONMENT_SECRETS: dict[str, str] = {
     "MACOS_NOTARIZE_APPLE_ID": "release",
     "MACOS_NOTARIZE_APP_PASSWORD": "release",
     "MACOS_NOTARIZE_TEAM_ID": "release",
-    "RELEASE_BOT_TOKEN": "release",
-    # The tagging identity once vars.FLEET_RELEASE_INTERIM_APP_ID is set.
-    "FLEET_RELEASE_INTERIM_APP_PRIVATE_KEY": "automation",
 }
 
 # Environments whose jobs must run no repository code.
@@ -45,8 +42,11 @@ NO_REPO_CODE = set()  # none yet: the signing and post-tag jobs still build repo
 # Credentials that stay repository secrets this round, with the reason.
 REPOSITORY_SECRETS: dict[str, str] = {
     # Deferred: the shipyard-local App key; Shipyard and the steward read it
-    # at runtime, so moving it needs a canary plan.
+    # at runtime, so moving it waits for the shipyard-local narrowing.
     "SHIPYARD_APP_PRIVATE_KEY": "deferred: shipyard-local",
+    # The release-bot PAT post-tag-sync reads: revoked with every owner PAT,
+    # and the workflow is being fixed separately.
+    "RELEASE_BOT_TOKEN": "to be revoked, not moved",
     # Optional read-only token for the release smoke; unset today, and the
     # job falls back to its own read-only job token.
     "RELEASE_SMOKE_GH_TOKEN": "read-only smoke credential",
