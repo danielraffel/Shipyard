@@ -816,7 +816,7 @@ never wedges later runs.
 ## Release credentials live in the `release` environment
 
 The Developer ID and notarization secrets and `RELEASE_BOT_TOKEN` are secrets of
-the `release` environment (branch `main` and tags `v*`), never of the
+the `release` environment (tags `v*` only), never of the
 repository. A tag push runs the tagged commit's own workflow file, so the
 environment is only as safe as the `release-tags` ruleset's creation rule; add
 the tag policy only after that ruleset exists. The signing and post-tag jobs

@@ -3,7 +3,7 @@ name: Post-tag docs sync
 # Installed by `shipyard release-bot hook install`. Shipyard-owned file:
 # re-running the install command overwrites this file in place; keep the
 # `environment: release` line below when it does. RELEASE_BOT_TOKEN is a
-# secret of that environment (branch main and tags v*), not of the repository.
+# secret of that environment (tags v* only), not of the repository.
 
 on:
   push:

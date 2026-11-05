@@ -184,7 +184,7 @@ Local releases continue to require the managed `ghapp` wrapper; CI authenticatio
 is not a fallback for local-agent publication.
 
 Required CI secret names. They are secrets of the `release` environment, not
-of the repository: its deployment policy admits branch `main` and tags `v*`.
+of the repository: its deployment policy admits tags `v*` only (both readers run only on a tag).
 A tag push runs the tagged commit's own workflow file, so what keeps an
 unmerged commit away from these secrets is the `release-tags` ruleset, which
 lets only the release App create a `v*` tag; the policy may admit `v*` only

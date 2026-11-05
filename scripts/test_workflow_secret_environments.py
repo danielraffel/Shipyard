@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 import unittest
 from pathlib import Path
 
@@ -51,15 +52,58 @@ REPOSITORY_SECRETS: dict[str, str] = {
     "RELEASE_SMOKE_GH_TOKEN": "read-only smoke credential",
 }
 
-# Shell that would run code from the checked-out tree or the network.
-TREE_CODE_RUN = (
-    r"\bgit\s+(clone|fetch|pull)\b",
-    r"\bgh\s+(repo\s+clone|run\s+download)\b",
-    r"\b(curl|wget)\b[^\n]*\|\s*(ba|z)?sh\b",
-    r"\b(bash|sh|python3?|node|npx|npm|cargo|make)\s+\.?/?[A-Za-z0-9_.-]+/",
-    r"(^|\s)\./",
-    r"\bcargo\s+(build|run|test)\b",
-)
+# Commands a credential-holding job's shell may run: no interpreter, no
+# package manager, nothing that fetches or executes other code.
+ALLOWED_COMMANDS = {
+    "gh", "git", "tar", "sha256sum", "find", "mkdir", "test", "echo", "printf",
+    "cut", "awk", "grep", "set", "exit", "true", "false", "local", "return",
+    "[", "[[", "case", "esac", "fi", "done", "for", "}", "python3 -c",
+}
+_COMMAND_SEPARATORS = {"|", "||", "&&", ";", ";;", "(", "()", "\n", "&", "|&", "$("}
+_TRANSPARENT = {"if", "then", "else", "elif", "do", "while", "until", "!", "{", "time"}
+
+
+def disallowed_commands(script: str, functions: frozenset[str] = frozenset()) -> list[str]:
+    """First words of the commands in `script` that ALLOWED_COMMANDS lacks.
+
+    Tokenizes with shell quoting, so separators inside quotes, regexes and
+    awk programs are not commands. A word that names a function the script
+    defines is allowed.
+    """
+    lines = [line for line in script.replace("\\\n", " ").splitlines()
+             if not line.strip().startswith("#")]
+    text = "\n".join(line for line in lines
+                     if not re.match(r"^\s*[\w|*.-]+\)", line))
+    lexer = shlex.shlex(text, posix=True, punctuation_chars="();<>|&\n")
+    lexer.whitespace = " \t"
+    lexer.commenters = ""
+    lexer.whitespace_split = True
+    tokens = list(lexer)
+    functions = set(functions) | set(re.findall(r"(?m)^\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(\)", text))
+    found = []
+    expect = True
+    for i, tok in enumerate(tokens):
+        if tok in _COMMAND_SEPARATORS or tok.endswith("$"):
+            expect = True
+            continue
+        if not expect:
+            continue
+        if tok in functions and tokens[i + 1:i + 2] in (["("], ["()"]):
+            continue  # the definition itself
+        if tok in _TRANSPARENT or re.match(r"^[A-Za-z_][A-Za-z0-9_]*\+?=", tok) or tok in (")", "<", ">"):
+            continue
+        expect = False
+        word = "python3 -c" if tok == "python3" and tokens[i + 1:i + 2] == ["-c"] else tok
+        if word not in ALLOWED_COMMANDS and word not in functions:
+            found.append(word)
+    # Command substitutions inside double quotes are one word to the lexer.
+    for inner in re.findall(r"\$\(([^()]*)\)", text):
+        found += [w for w in disallowed_commands(inner, frozenset(functions)) if w not in found]
+    if "`" in text:
+        found.append("`")
+    return found
+
+
 PULL_REQUEST_EVENTS = {"pull_request", "pull_request_target", "merge_group"}
 SECRET_RE = re.compile(r"secrets\.([A-Za-z_][A-Za-z0-9_]*)")
 DYNAMIC_SECRETS_RE = re.compile(r"secrets\s*\[|toJSON\(\s*secrets\s*\)|secrets:\s*inherit")
@@ -150,11 +194,11 @@ class WorkflowSecretEnvironments(unittest.TestCase):
             if uses and not uses.startswith(("actions/checkout@", "actions/create-github-app-token@")):
                 offenders.append(f"uses {uses}")
             run = str(step.get("run") or "")
-            offenders += [f"{step.get('name')}: {p}" for p in TREE_CODE_RUN if re.search(p, run)]
+            offenders += [f"{step.get('name')}: runs {word}" for word in disallowed_commands(run)]
         self.assertEqual(offenders, [])
         for run in ("bash scripts/x.sh", "python3 scripts/x.py", "./x", "cargo build",
-                    "curl -sL https://x | sh", "git fetch origin"):
-            self.assertTrue(any(re.search(p, run) for p in TREE_CODE_RUN), run)
+                    "curl -sL https://x | sh", 'echo "$(npx q)"', ". x.sh", "make"):
+            self.assertNotEqual(disallowed_commands(run), [], run)
 
 
 if __name__ == "__main__":
