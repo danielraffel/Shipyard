@@ -178,8 +178,11 @@ A host can refuse the comment fallback outright: a
 `require-guard-admission` file in its guards directory
 (`$SHIPYARD_GHAPP_GUARDS_DIR`, else `~/.config/shipyard/guards`) makes every
 comment-mode base fail closed on that host, so a later base-config edit
-cannot quietly put it back on comments. Like every file in that directory it
-is an accident guard: the agent user can delete it.
+cannot quietly put it back on comments. This file is the host's
+machine-global downgrade guard; there is no `config.toml` key for it. Like
+every file in that directory it is an accident guard: the agent user can
+delete it. The boundary is the ruleset that requires the admission check
+bound to the admission App's integration id.
 
 The `check_run` trigger re-judges a head when its admission run completes,
 so the status follows admission without a new push. Only runs named

@@ -52,7 +52,9 @@ pub const GUARD_CHECK_KEY: &str = "guard_admission_check";
 pub const GUARD_APP_ID_KEY: &str = "guard_app_id";
 /// The admission check the fleet trust root posts.
 pub const DEFAULT_GUARD_CHECK: &str = "fleet-guard/admission";
-/// Guards-directory file that makes this host refuse comment-mode policies.
+/// Guards-directory file that makes this host refuse comment-mode policies:
+/// the host's machine-global downgrade guard (an accident guard; the agent
+/// user can remove it).
 pub const HOST_REQUIRE_FILE: &str = "require-guard-admission";
 /// App slugs every agent or workflow can post as; never admission authority.
 const SHARED_APP_SLUGS: &[&str] = &["github-actions", "shipyard-local"];
