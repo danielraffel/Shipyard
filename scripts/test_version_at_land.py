@@ -132,7 +132,11 @@ class VersionAtLandTests(unittest.TestCase):
             self.assertNotIn("secrets.RELEASE_BOT_TOKEN", workflow)
             self.assertIn("Shipyard release App credentials are required", workflow)
             self.assertIn("actions/create-github-app-token@" + APP_TOKEN_ACTION_SHA, workflow)
-            self.assertIn("GH_TOKEN: ${{ steps.app-token.outputs.token }}", workflow)
+            # auto-release tags as the fleet-release-interim App once its id
+            # is configured; that is the only other App it may mint for.
+            token = ("GH_TOKEN: ${{ steps.interim-token.outputs.token || steps.app-token.outputs.token }}"
+                     if name == "auto-release.yml" else "GH_TOKEN: ${{ steps.app-token.outputs.token }}")
+            self.assertIn(token, workflow)
             self.assertIn("gh auth setup-git", workflow)
             self.assertIn("persist-credentials: false", workflow)
             self.assertNotIn("persist-credentials: true", workflow)
@@ -142,7 +146,9 @@ class VersionAtLandTests(unittest.TestCase):
             self.assertNotIn("owner:", workflow)
             self.assertNotIn("repositories:", workflow)
             self.assertIn("client-id: Iv23liTCzDQWqmMjkDTI", workflow)
-            self.assertNotIn("app-id:", workflow)
+            app_ids = [line.strip() for line in workflow.splitlines() if "app-id:" in line]
+            self.assertEqual(app_ids, ["app-id: ${{ vars.FLEET_RELEASE_INTERIM_APP_ID }}"]
+                             if name == "auto-release.yml" else [])
 
     def test_writer_workflow_lands_through_the_bump_pr(self) -> None:
         workflow = (HERE.parent / ".github/workflows/version-at-land.yml").read_text()

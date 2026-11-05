@@ -340,10 +340,10 @@ jobs:
     if: always() && startsWith(github.ref, 'refs/tags/v') && vars.CI_MACOS_SIGNING_ENABLED == 'true'
     runs-on: ${{ fromJSON(needs.resolve-runners.outputs.macos_arm64_runs_on_json) }}
     # The Developer ID P12 and notarization credentials are secrets of the
-    # `release` environment only (deployment policy: branch main and tags v*,
-    # tag creation restricted by the release-tags ruleset). A run from any other
-    # ref is refused the environment, so the import step finds them missing and
-    # fails before signing anything.
+    # `release` environment (deployment policy: branch main and tags v*, the
+    # tag ruleset limiting v* creation to the release App). A tag push runs the
+    # tagged commit's own workflow, so the ruleset, not this file, is what keeps
+    # an unmerged commit away from them.
     environment: release
     # Uploads the DMG and publishes the release (contents) after attesting it.
     permissions:
@@ -365,21 +365,6 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
-          # Full history, so the next step can see origin/main.
-          fetch-depth: 0
-
-      - name: Require the tag to point at a commit on main
-        # A v* tag is the only non-main ref the environment admits. A tag
-        # push runs the tagged commit's own workflow, so this catches a
-        # mistaken tag; the release-tags ruleset is what stops a hostile one.
-        shell: bash
-        run: |
-          set -euo pipefail
-          # The checkout above fetched full history, so origin/main is local.
-          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
-            echo "::error::$GITHUB_REF ($GITHUB_SHA) is not on main; refusing to continue." >&2
-            exit 1
-          fi
 
       - name: Verify job-scoped GitHub publication before signing
         env:

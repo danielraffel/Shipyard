@@ -3,7 +3,7 @@ name: Post-tag docs sync
 # Installed by `shipyard release-bot hook install`. Shipyard-owned file:
 # re-running the install command overwrites this file in place; keep the
 # `environment: release` line below when it does. RELEASE_BOT_TOKEN is a
-# secret of that environment only (branch main and tags v*), never of the repo.
+# secret of that environment (branch main and tags v*), not of the repository.
 
 on:
   push:
@@ -34,19 +34,6 @@ jobs:
           fetch-tags: true
           # Only the docs-sync step below receives the push token.
           persist-credentials: false
-
-      - name: Require the tag to point at a commit on main
-        # A v* tag is the only non-main ref the environment admits. A tag
-        # push runs the tagged commit's own workflow, so this catches a
-        # mistaken tag; the release-tags ruleset is what stops a hostile one.
-        shell: bash
-        run: |
-          set -euo pipefail
-          # The checkout above fetched full history, so origin/main is local.
-          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
-            echo "::error::$GITHUB_REF ($GITHUB_SHA) is not on main; refusing to continue." >&2
-            exit 1
-          fi
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-13

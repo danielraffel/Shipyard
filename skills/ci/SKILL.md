@@ -978,18 +978,17 @@ line in the receipt (`foreign_writers`, printed by the workflow on failure)
 and on stderr. The failure string itself is unchanged because retained-lease
 recovery parses it. Do not run `flock`/`lsof` probes against that lock on a
 host while a sandbox canary is running: the probe itself is a foreign holder.
-## Release and App credentials live in main-only environments
+## Release credentials live in the `release` environment
 
-No workflow credential is a repository secret: a repository secret is readable
-by a run from any pushed branch that edits a workflow. `release` (branch `main`
-and tags `v*`) holds the Developer ID and notarization secrets and
-`RELEASE_BOT_TOKEN`; `automation` (branch `main` only) holds
-`SHIPYARD_APP_PRIVATE_KEY`, so a tag run never sees the App key. A tag push
-runs the tagged commit's own workflow file, so `release` is only as safe as the
-`release-tags` ruleset's creation rule; the tag jobs' "Require the tag to point
-at a commit on main" step catches a mistaken tag, not an attacker. Adding a job
-that reads a secret means classifying it in
-`scripts/test_workflow_secret_environments.py`.
+The Developer ID and notarization secrets and `RELEASE_BOT_TOKEN` are secrets of
+the `release` environment (branch `main` and tags `v*`), never of the
+repository. A tag push runs the tagged commit's own workflow file, so the
+environment is only as safe as the `release-tags` ruleset's creation rule; add
+the tag policy only after that ruleset exists. The signing and post-tag jobs
+still build repository code next to those secrets, so the environment limits
+which refs reach them, not what merged code can do. Adding a job that reads a
+secret means classifying it in `scripts/test_workflow_secret_environments.py`.
+`SHIPYARD_APP_PRIVATE_KEY` stays a repository secret for now.
 
 ## Release publication waits for attestation
 

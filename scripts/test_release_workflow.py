@@ -363,7 +363,11 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertNotIn("secrets.RELEASE_BOT_TOKEN", text)
         self.assertIn("secrets.SHIPYARD_APP_PRIVATE_KEY", text)
         self.assertIn("Shipyard release App credentials are required", text)
-        self.assertIn("GH_TOKEN: ${{ steps.app-token.outputs.token }}", text)
+        self.assertIn("GH_TOKEN: ${{ steps.interim-token.outputs.token || steps.app-token.outputs.token }}", text)
+        # The interim release App mints only when configured; the shipyard-local
+        # path is skipped then, and used exactly as before otherwise.
+        self.assertIn("if: vars.FLEET_RELEASE_INTERIM_APP_ID != ''", text)
+        self.assertEqual(text.count("if: vars.FLEET_RELEASE_INTERIM_APP_ID == ''"), 2)
         self.assertIn("gh auth setup-git", text)
         self.assertIn("persist-credentials: false", text)
         self.assertIn("permission-contents: write", text)
