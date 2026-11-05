@@ -813,6 +813,19 @@ failure: the step touches `done` as its last command and exits, and the
 guardian could see the owner gone before it saw `done`. The guardian now
 re-checks `done` when the owner ends. The lease is removed either way, so this
 never wedges later runs.
+## Release and App credentials live in main-only environments
+
+No workflow credential is a repository secret: a repository secret is readable
+by a run from any pushed branch that edits a workflow. `release` (branch `main`
+and tags `v*`) holds the Developer ID and notarization secrets and
+`RELEASE_BOT_TOKEN`; `automation` (branch `main` only) holds
+`SHIPYARD_APP_PRIVATE_KEY`, so a tag run never sees the App key. A tag push
+runs the tagged commit's own workflow file, so `release` is only as safe as the
+`release-tags` ruleset's creation rule; the tag jobs' "Require the tag to point
+at a commit on main" step catches a mistaken tag, not an attacker. Adding a job
+that reads a secret means classifying it in
+`scripts/test_workflow_secret_environments.py`.
+
 ## Release publication waits for attestation
 
 `release.yml` keeps the release a draft until the macOS DMG is attested:

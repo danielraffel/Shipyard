@@ -36,8 +36,9 @@ jobs:
           persist-credentials: false
 
       - name: Require the tag to point at a commit on main
-        # A v* tag is the only non-main ref the environment admits. Signing
-        # must still never run on a commit that did not land on main.
+        # A v* tag is the only non-main ref the environment admits. A tag
+        # push runs the tagged commit's own workflow, so this catches a
+        # mistaken tag; the release-tags ruleset is what stops a hostile one.
         shell: bash
         run: |
           set -euo pipefail
