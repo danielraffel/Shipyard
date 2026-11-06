@@ -724,7 +724,7 @@ merge-only rule as an approval. The steward itself still requires the status
 on the head until the train admits PRs.
 Before it enqueues or merges a head, the steward also refuses one that carries
 commits of another open PR whose head is not approved
-(`carries_unapproved_commits:#Q`; see `docs/automated-draining.md`). A PR stacked on P, directly or through other open PRs' branches, or one that only inherits P's commit (not in its own diff against its own base), never counts as carrying.
+(`carries_unapproved_commits:#Q`; see `docs/automated-draining.md`). A PR stacked on P, directly or through other open PRs' branches, or one that only inherits P's commit (not in its own diff against its own base), never counts as carrying. A PR whose listing is over the 250-commit cap is judged by its own diff against its own base, and an unapproved one whose own diff is still over the cap blocks P only if probing P's commits (at most 50) cannot rule out that it carries them (`carried_commits_over_cap:#Q`).
 
 ## The carrier re-arms with `expectedHeadOid`, through the internal path
 
