@@ -438,3 +438,4 @@ These came from running it for real:
   pull requests, measured rather than read from config.
 - [TartCI](https://github.com/danielraffel/tartci) covers VM pools, images,
   leases and runner lifecycle.
+- The scheduled reviewer, repair and operator pass-runner used on m3 is versioned in [`tools/fleet-pass/`](../tools/fleet-pass/README.md).
