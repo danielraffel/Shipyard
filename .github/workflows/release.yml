@@ -339,6 +339,11 @@ jobs:
     # job withheld publication after a transient smoke failure.
     if: always() && startsWith(github.ref, 'refs/tags/v') && vars.CI_MACOS_SIGNING_ENABLED == 'true'
     runs-on: ${{ fromJSON(needs.resolve-runners.outputs.macos_arm64_runs_on_json) }}
+    # The Developer ID P12 and notarization credentials are secrets of the
+    # `release` environment (deployment policy: tags v* only). A tag push runs
+    # the tagged commit's own workflow, so the v* tag rulesets, not this file,
+    # are what keep an unmerged commit away from them.
+    environment: release
     # Uploads the DMG and publishes the release (contents) after attesting it.
     permissions:
       attestations: write

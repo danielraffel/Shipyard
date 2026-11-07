@@ -813,6 +813,20 @@ failure: the step touches `done` as its last command and exits, and the
 guardian could see the owner gone before it saw `done`. The guardian now
 re-checks `done` when the owner ends. The lease is removed either way, so this
 never wedges later runs.
+## Release credentials live in the `release` environment
+
+The Developer ID and notarization secrets are secrets of the `release`
+environment (tags `v*` only), never of the repository; the signing job names
+that environment. post-tag-sync does not: it must stay identical to what
+`shipyard release-bot hook install` renders. A tag push runs the
+tagged commit's own workflow file, so the environment is only as safe as the
+`v*` tag rulesets; add the tag policy only after they exist. The job still
+builds repository code next to those secrets: the environment limits which
+refs reach them, not what merged code can do. Adding a job that reads a secret
+means classifying it in `scripts/test_workflow_secret_environments.py`.
+`SHIPYARD_APP_PRIVATE_KEY` and post-tag-sync's `RELEASE_BOT_TOKEN` stay
+repository secrets for now.
+
 ## Release publication waits for attestation
 
 `release.yml` keeps the release a draft until the macOS DMG is attested:
