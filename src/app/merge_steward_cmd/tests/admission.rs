@@ -569,3 +569,124 @@ fn steward_locks_release_while_a_forked_duplicate_descriptor_lives() {
     );
     drop(duplicate);
 }
+
+/// A fake `gh` for a repository with one managed, labelled pull request whose
+/// rollup is absent, which is how the production census sees it: every
+/// admission observation must then read that head's check runs and statuses.
+#[cfg(unix)]
+fn managed_head_admission_actions(
+    dir: &tempfile::TempDir,
+    calls: &Path,
+    head: &str,
+) -> GitHubActions {
+    fake_gh(
+        dir,
+        &format!(
+            r#"
+printf '%s\n' "$*" >> '{calls}'
+case "$*" in
+  "api repos/owner/repo") printf '%s' '{{"full_name":"owner/repo","allow_auto_merge":true}}' ;;
+  *"rules/branches/main --paginate --slurp"*) printf '%s' '[[]]' ;;
+  *"branches/main/protection/required_status_checks"*) printf '%s' '{{"contexts":[],"checks":[]}}' ;;
+  "api graphql "*) printf '%s' '{{"data":{{"repository":{{"mergeQueue":null}}}}}}' ;;
+  "pr list "*) printf '%s' '[{{"id":"PR_kw","number":42,"isDraft":false,"baseRefName":"main","headRefOid":"{head}","headRefName":"feature","mergeStateStatus":"CLEAN","autoMergeRequest":null,"labels":[{{"name":"shipyard:managed"}}],"author":{{"login":"someone"}}}}]' ;;
+  *"commits/{head}/check-runs"*) printf '%s' '{{"check_runs":[]}}' ;;
+  *"commits/{head}/statuses"*) printf '%s' '[{{"context":"shipyard/steward-handoff","state":"success","updated_at":"2026-08-30T00:00:00Z"}}]' ;;
+  *"actions/runs?status="*) printf '%s' '{{"workflow_runs":[]}}' ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+            calls = calls.display(),
+        ),
+    )
+    .with_repo_override("owner/repo")
+}
+
+/// Admission's clean verdict is made entirely by its read client: when that
+/// client carries a dedicated credential, the shared one is never spent. The
+/// read cache then collapses the repeated per-head reads of one verdict, and of
+/// the next verdict inside the TTL, to a single read each.
+#[cfg(unix)]
+#[test]
+fn clean_admission_reads_use_the_read_client_and_reuse_per_head_reads() {
+    let temp = tempfile::tempdir().expect("temp");
+    let control = mutation_control(&temp, "studio", "studio");
+    let paths = RuntimePaths::current_with_overrides(
+        RuntimeMode::Isolated,
+        Some(control.global_dir),
+        Some(control.state_dir),
+    );
+    let head = "c".repeat(40);
+    let shared_calls = temp.path().join("shared-calls");
+    let read_calls = temp.path().join("read-calls");
+    let shared_dir = tempfile::tempdir().expect("shared gh");
+    let reads_dir = tempfile::tempdir().expect("reads gh");
+    let shared = managed_head_admission_actions(&shared_dir, &shared_calls, &head);
+    let cache = crate::cloud::ReadCache::new(
+        paths.state_dir.join("admission-read-cache"),
+        Duration::from_mins(3),
+    );
+    let reads =
+        managed_head_admission_actions(&reads_dir, &read_calls, &head).with_read_cache(cache);
+    let args = AdmissionCleanArgs {
+        repo: "owner/repo".to_owned(),
+        base: "main".to_owned(),
+        labels: vec!["self-hosted".to_owned(), "ARM64".to_owned()],
+        apply: true,
+    };
+    let run = |output: &mut Vec<u8>| {
+        admission_clean_command_with_reads(
+            &args,
+            temp.path(),
+            RuntimeMode::Isolated,
+            &paths,
+            &shared,
+            &reads,
+            true,
+            output,
+        )
+    };
+    let count = |calls: &Path, needle: &str| {
+        fs::read_to_string(calls)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.contains(needle))
+            .count()
+    };
+
+    let mut output = Vec::new();
+    let exit = run(&mut output).expect("clean verdict");
+    typed_verdict(exit, &output, 0, "clean");
+    assert!(
+        !shared_calls.exists(),
+        "a clean verdict must not spend the shared credential: {}",
+        fs::read_to_string(&shared_calls).unwrap_or_default()
+    );
+    // Observation, its fence, revalidation and its fence each consult the
+    // head; the cache answers all but the first.
+    assert_eq!(count(&read_calls, "/statuses"), 1);
+    assert_eq!(count(&read_calls, "/check-runs"), 1);
+    let settings_reads = |calls: &Path| {
+        fs::read_to_string(calls)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| *line == "api repos/owner/repo")
+            .count()
+    };
+    assert_eq!(settings_reads(&read_calls), 1);
+    assert_eq!(count(&read_calls, "rules/branches"), 1);
+    // The PR census, the merge queue and the run census are never cached.
+    assert_eq!(count(&read_calls, "pr list "), 4);
+    assert_eq!(count(&read_calls, "status=queued"), 2);
+
+    fs::remove_file(&read_calls).unwrap();
+    output.clear();
+    let exit = run(&mut output).expect("second clean verdict");
+    typed_verdict(exit, &output, 0, "clean");
+    assert_eq!(count(&read_calls, "/statuses"), 0);
+    assert_eq!(count(&read_calls, "/check-runs"), 0);
+    assert_eq!(count(&read_calls, "rules/branches"), 0);
+    assert_eq!(settings_reads(&read_calls), 0);
+    assert_eq!(count(&read_calls, "pr list "), 4);
+    assert_eq!(count(&read_calls, "status=queued"), 2);
+}

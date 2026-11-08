@@ -345,6 +345,189 @@ fn admission_clean_scopes_token_helper_from_repo_less_cwd() {
     assert!(gh_calls.contains("api repos/owner/repo"), "{gh_calls}");
 }
 
+/// Two token helpers, one per credential table, each printing its own token,
+/// and a fake `gh` that logs which token every call carried.
+#[cfg(unix)]
+fn two_credential_admission(
+    temp: &tempfile::TempDir,
+    admission_helper_body: &str,
+) -> (crate::config::LoadedConfig, PathBuf, PathBuf) {
+    use crate::config::{LoadedConfig, LocalOverlaySource};
+
+    let helper = |name: &str, body: &str| {
+        let path = temp.path().join(name);
+        write_test_executable(&path, &format!("#!/bin/sh\nset -eu\n{body}\n"));
+        path
+    };
+    let shared = helper(
+        "shared-helper",
+        r#"printf '%s' '{"token":"ghs_shared","kind":"github-app-installation","expires_at":"2099-01-01T00:00:00Z"}'"#,
+    );
+    let admission = helper("admission-helper", admission_helper_body);
+    let config_text = format!(
+        r#"
+[github.auth]
+source = "command"
+token_command = ["{}", "{{repo_slug}}"]
+
+[github.admission_auth]
+source = "command"
+token_command = ["{}", "{{repo_slug}}"]
+"#,
+        shared.display(),
+        admission.display()
+    );
+    let gh_log = temp.path().join("gh-tokens.log");
+    let gh = temp.path().join("gh");
+    write_test_executable(
+        &gh,
+        &format!(
+            r#"#!/bin/sh
+set -eu
+printf '%s %s\n' "${{GH_TOKEN:-none}}" "$*" >> '{}'
+case "$*" in
+  "api repos/owner/repo") printf '%s' '{{"full_name":"owner/repo","allow_auto_merge":true}}' ;;
+  *"rules/branches/main --paginate --slurp"*) printf '%s' '[[]]' ;;
+  *"protection/required_status_checks"*) printf '%s' '{{"contexts":[],"checks":[]}}' ;;
+  "api graphql "*) printf '%s' '{{"data":{{"repository":{{"mergeQueue":null}}}}}}' ;;
+  "pr list "*) printf '%s' '[]' ;;
+  *"actions/runs?status="*) printf '%s' '{{"workflow_runs":[]}}' ;;
+  *) echo "unexpected gh args: $*" >&2; exit 2 ;;
+esac
+"#,
+            gh_log.display()
+        ),
+    );
+    let config = LoadedConfig {
+        data: config_text.parse().expect("parse config"),
+        global_dir: temp.path().join("global"),
+        project_dir: None,
+        local_dir: None,
+        local_overlay_source: LocalOverlaySource::None,
+    };
+    (config, gh, gh_log)
+}
+
+#[cfg(unix)]
+fn run_two_credential_admission(admission_helper_body: &str) -> Vec<String> {
+    use crate::platform::Platform;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let cwd = temp.path().join("launchd-cwd");
+    std::fs::create_dir_all(&cwd).expect("repo-less cwd");
+    let (config, gh, gh_log) = two_credential_admission(&temp, admission_helper_body);
+    let actions = GitHubActions::from_loaded_config(&cwd, &config).with_gh_binary_for_tests(&gh);
+    let runtime_paths = RuntimePaths::for_platform(
+        Platform::current(),
+        &temp.path().join("home"),
+        RuntimeMode::Shipyard,
+    );
+    let mut output = Vec::new();
+    let exit = runner_command_with_actions(
+        RunnerCommand::AdmissionClean {
+            repo: "owner/repo".to_owned(),
+            base: "main".to_owned(),
+            labels: vec!["self-hosted".to_owned()],
+            apply: true,
+        },
+        &config,
+        RuntimeMode::Shipyard,
+        &cwd,
+        &runtime_paths,
+        &actions,
+        true,
+        &mut output,
+    )
+    .expect("admission command");
+    assert_eq!(
+        exit,
+        ExitCode::SUCCESS,
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let tokens = std::fs::read_to_string(gh_log)
+        .expect("gh log")
+        .lines()
+        .map(|line| {
+            line.split_once(' ')
+                .map_or(line, |(token, _)| token)
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    assert!(!tokens.is_empty(), "admission made no GitHub reads");
+    tokens
+}
+
+#[cfg(unix)]
+#[test]
+fn admission_reads_use_the_dedicated_admission_credential() {
+    let tokens = run_two_credential_admission(
+        r#"printf '%s' '{"token":"ghs_admission","kind":"github-app-installation","expires_at":"2099-01-01T00:00:00Z"}'"#,
+    );
+    assert!(
+        tokens.iter().all(|token| token == "ghs_admission"),
+        "{tokens:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn admission_reads_fall_back_to_the_shared_credential_when_admission_cannot_mint() {
+    let tokens = run_two_credential_admission("echo 'no installation' >&2; exit 1");
+    assert!(
+        tokens.iter().all(|token| token == "ghs_shared"),
+        "{tokens:?}"
+    );
+}
+
+#[test]
+fn admission_auth_is_optional_global_only_and_parsed_like_github_auth() {
+    use crate::config::{LoadedConfig, LocalOverlaySource};
+    use crate::gh::GhClient;
+
+    let global = |body: &str| LoadedConfig {
+        data: body.parse().expect("parse config"),
+        global_dir: PathBuf::from("/nonexistent-global"),
+        project_dir: None,
+        local_dir: None,
+        local_overlay_source: LocalOverlaySource::None,
+    };
+    let absent = global("[github.auth]\nsource = \"env\"\ntoken_env = \"SHARED\"\n");
+    assert!(
+        GhClient::admission_from_loaded_config(&absent)
+            .expect("absent table is valid")
+            .is_none()
+    );
+    let invalid = global("[github.admission_auth]\nsource = \"bogus\"\n");
+    assert!(GhClient::admission_from_loaded_config(&invalid).is_err());
+    let present = global("[github.admission_auth]\nsource = \"env\"\ntoken_env = \"ADMISSION\"\n");
+    assert!(
+        GhClient::admission_from_loaded_config(&present)
+            .expect("valid table")
+            .is_some()
+    );
+    // A branch must not be able to choose the admission credential either.
+    let sandbox = tempfile::tempdir().expect("tempdir");
+    let project_dir = sandbox.path().join(".shipyard");
+    std::fs::create_dir_all(&project_dir).expect("project dir");
+    std::fs::write(
+        project_dir.join("config.toml"),
+        "[github.admission_auth]\nsource = \"env\"\ntoken_env = \"X\"\n",
+    )
+    .expect("write config");
+    let tracked = LoadedConfig::load(
+        Some(sandbox.path().join("global-missing")),
+        Some(project_dir),
+        None,
+        LocalOverlaySource::None,
+    )
+    .expect("load config");
+    let error = GhClient::admission_from_loaded_config(&tracked)
+        .expect_err("repository-controlled admission auth is refused")
+        .to_string();
+    assert!(error.contains("github.admission_auth"), "{error}");
+}
+
 #[test]
 fn reaper_thresholds_fall_back_to_built_in_defaults() {
     let config = config_with("[project]\nname = \"x\"\n");

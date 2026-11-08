@@ -51,6 +51,55 @@ fn actions_for_explicit_repo(actions: &GitHubActions, repo: &str) -> GitHubActio
     actions.clone().with_repo_override(repo)
 }
 
+/// The client JIT admission makes its read-only observations with.
+///
+/// Admission runs before every VM a `TartCI` lane mints, so it must not share a
+/// rate-limit budget with agents, reviewers and steward passes. When the
+/// machine-global config names `[github.admission_auth]` and that credential
+/// mints a token for `repo`, reads use it; otherwise (absent table, bad
+/// table, missing key, App not installed) they fall back to `actions`, which
+/// is today's `[github.auth]` path. Either way the reads go through the
+/// short-lived admission read cache. Mutations never use this client.
+fn admission_read_actions(
+    actions: &GitHubActions,
+    config: &LoadedConfig,
+    cwd: &Path,
+    repo: &str,
+    state_dir: &Path,
+) -> GitHubActions {
+    let reads = match admission_client(config, cwd, repo) {
+        Ok(Some(client)) => actions.clone().with_gh_client(client),
+        Ok(None) => actions.clone(),
+        Err(detail) => {
+            eprintln!("shipyard: github.admission_auth {detail}; admission reads use github.auth");
+            actions.clone()
+        }
+    };
+    reads.with_read_cache(crate::cloud::ReadCache::for_admission(state_dir))
+}
+
+fn admission_client(
+    config: &LoadedConfig,
+    cwd: &Path,
+    repo: &str,
+) -> Result<Option<crate::gh::GhClient>, String> {
+    let Some(client) = crate::gh::GhClient::admission_from_loaded_config(config)
+        .map_err(|error| format!("is invalid ({error})"))?
+    else {
+        return Ok(None);
+    };
+    let client = client
+        .with_repo_override(repo)
+        .map_err(|error| format!("cannot scope to {repo} ({error})"))?;
+    // Resolve once up front: a credential that cannot mint must not turn every
+    // admission read into an error. The token lands in the shared in-process
+    // cache, so the reads that follow reuse it instead of re-running the helper.
+    client
+        .auth_summary(cwd, crate::gh::GhAuthPolicy::Default)
+        .map_err(|error| format!("could not mint a token ({error})"))?;
+    Ok(Some(client))
+}
+
 /// Entry point dispatched from `src/app.rs`.
 #[allow(clippy::too_many_lines)]
 pub(super) fn runner_command<W: Write>(
@@ -335,7 +384,9 @@ fn runner_command_with_actions<W: Write>(
             // so configured token helpers can expand `{repo_slug}` from the
             // command target instead of trying to discover a Git remote.
             let actions = actions_for_explicit_repo(actions, &repo);
-            super::merge_steward_cmd::admission_clean_command(
+            let read_actions =
+                admission_read_actions(&actions, config, cwd, &repo, &runtime_paths.state_dir);
+            super::merge_steward_cmd::admission_clean_command_with_reads(
                 &super::merge_steward_cmd::AdmissionCleanArgs {
                     repo,
                     base,
@@ -346,6 +397,7 @@ fn runner_command_with_actions<W: Write>(
                 mode,
                 runtime_paths,
                 &actions,
+                &read_actions,
                 json,
                 stdout,
             )
