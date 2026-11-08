@@ -34,9 +34,14 @@
 //!   every shared commit is P's own, Q is cleared, and a refusal P still gets
 //!   from another pull request says "#Q merged #P's branch; not carried".
 //!   The real catches remain: P merging held work in (the held commits are
-//!   P's second parent, so not on P's first-parent chain) and P
-//!   fast-forwarding onto Q's commits (they are on both chains). A
+//!   P's second parent, so not on P's first-parent chain) and P built
+//!   straight on commits on Q's own first-parent chain (on both chains). A
 //!   first-parent read that fails or is over the cap keeps the overlap.
+//!   Named residual: P built straight on commits that held Q itself took in
+//!   through a merge's second parent (Q = merge(Q.base, X) with P on X, or Q's
+//!   tip re-hung as merge(Q.base, old tip)) is cleared. The commit graph
+//!   cannot tell that from Q having merged P's branch, so X lands under P's
+//!   own approval; P's reviewer reviews X as P's diff.
 //! * Commits already on the base: P's set comes from the compare API
 //!   `base...head`, which lists only commits the base does not have.
 //! * A base whose policy does not require head approval: there every head is
@@ -283,6 +288,7 @@ fn introduced_overlap(
     q: &OpenPr,
     own: &BTreeSet<String>,
     overlap: Carried,
+    graphs: &mut GraphCache,
 ) -> Result<Narrowed, String> {
     let (candidates, reachable) = match overlap {
         Carried::Shares {
@@ -301,11 +307,13 @@ fn introduced_overlap(
         }
         Carried::Unbounded { .. } => (own.clone(), false),
     };
-    match compare_commits(run_gh, repo, &q.base_ref, &q.head_sha)? {
-        CommitList::Complete(introduced) => {
+    // The same read later gives `q`'s first-parent chain, so `q`'s own diff
+    // and its chain describe one comparison even if `q`'s base moves.
+    match cached_graph(run_gh, repo, graphs, &q.base_ref, &q.head_sha)? {
+        CommitGraph::Complete(introduced) => {
             let shared: Vec<String> = candidates
                 .into_iter()
-                .filter(|sha| introduced.contains(sha))
+                .filter(|sha| introduced.contains_key(sha))
                 .collect();
             Ok(if shared.is_empty() {
                 Narrowed::Clear
@@ -317,7 +325,7 @@ fn introduced_overlap(
                 })
             })
         }
-        CommitList::OverCap { total } => Ok(Narrowed::OverCap {
+        CommitGraph::OverCap { total } => Ok(Narrowed::OverCap {
             total,
             probe: candidates,
             reachable,
@@ -386,6 +394,7 @@ fn resolve_overlap(
     q: &OpenPr,
     own: &BTreeSet<String>,
     overlap: Carried,
+    graphs: &mut GraphCache,
     judge: &mut dyn FnMut(&OpenPr) -> Judgement,
 ) -> Option<(Carried, Judgement)> {
     let unreadable = |error: String| {
@@ -397,7 +406,7 @@ fn resolve_overlap(
             Judgement::Unreadable(error),
         ))
     };
-    let narrowed = match introduced_overlap(run_gh, repo, base, q, own, overlap) {
+    let narrowed = match introduced_overlap(run_gh, repo, base, q, own, overlap, graphs) {
         Ok(narrowed) => narrowed,
         Err(error) => return unreadable(error),
     };
@@ -525,8 +534,26 @@ pub(super) struct PassCache {
     /// Each open pull request's own roots, by number and listed head, for
     /// every over-cap candidate and admission path in the pass.
     roots: BTreeMap<(u64, String), Result<Roots, String>>,
-    /// First-parent chains, by `(base, head)`.
-    first_parent: BTreeMap<(String, String), Result<BTreeSet<String>, String>>,
+    /// Commit graphs (`base...head` with parents), by `(base, head)`: a
+    /// pull request's own diff and its first-parent chain come from one read.
+    graphs: GraphCache,
+}
+
+/// Commit graphs read this pass, by `(base, head)`.
+type GraphCache = BTreeMap<(String, String), Result<CommitGraph, String>>;
+
+/// `base...head` with parents, read once per pass.
+fn cached_graph(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    graphs: &mut GraphCache,
+    base: &str,
+    head: &str,
+) -> Result<CommitGraph, String> {
+    graphs
+        .entry((base.to_owned(), head.to_owned()))
+        .or_insert_with(|| compare_graph(run_gh, repo, base, head))
+        .clone()
 }
 
 /// The guard on the steward's own admission path (enqueue and exact-head
@@ -682,15 +709,21 @@ pub(super) fn refusal_with(
             .iter()
             .find(|q| q.number == overlap.number())
             .expect("an overlap names a listed pull request");
-        let Some(settled) = resolve_overlap(run_gh, repo, base, q, &own, overlap, judge) else {
+        let Some(settled) = resolve_overlap(
+            run_gh,
+            repo,
+            base,
+            q,
+            &own,
+            overlap,
+            &mut cache.graphs,
+            judge,
+        ) else {
             continue;
         };
         let mut chain = |chain_base: &str, chain_head: &str| {
-            cache
-                .first_parent
-                .entry((chain_base.to_owned(), chain_head.to_owned()))
-                .or_insert_with(|| first_parent_chain(run_gh, repo, chain_base, chain_head))
-                .clone()
+            cached_graph(run_gh, repo, &mut cache.graphs, chain_base, chain_head)
+                .and_then(|graph| first_parent_chain(&graph, chain_base, chain_head))
         };
         match without_own_commits(settled, base, head_sha, q, &mut chain) {
             Some(settled) => judged.push(settled),
@@ -765,12 +798,11 @@ fn without_own_commits(
 /// one of `head`'s commits not on `base`. An over-cap compare is an error, so
 /// the caller keeps the overlap.
 fn first_parent_chain(
-    run_gh: RunGh<'_>,
-    repo: &str,
+    graph: &CommitGraph,
     base: &str,
     head: &str,
 ) -> Result<BTreeSet<String>, String> {
-    let graph = match compare_graph(run_gh, repo, base, head)? {
+    let graph = match graph {
         CommitGraph::Complete(graph) => graph,
         CommitGraph::OverCap { total } => {
             return Err(format!(
@@ -1037,7 +1069,7 @@ fn own_roots(run_gh: RunGh<'_>, repo: &str, base: &str, q: &OpenPr) -> Result<Ro
 }
 
 /// Commits with their parents, as far as the steward read them.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum CommitGraph {
     /// Every commit, each with its parents.
     Complete(BTreeMap<String, Vec<String>>),

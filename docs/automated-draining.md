@@ -111,9 +111,14 @@ first-parent chain that reached Q only through a merge's second parent is P's
 own. When every shared commit is P's own, Q does not hold P, and a refusal P
 still gets from another pull request ends with `#Q merged #P's branch; not
 carried`. P merging held work in (the held commits are P's second parent) and
-P fast-forwarding onto Q's commits (they are on both chains) are still
-refused, and a first-parent read that fails or is over the cap keeps the
-overlap. Land or
+P built straight on commits on Q's own first-parent chain (they are on both
+chains) are still refused, and a first-parent read that fails or is over the
+cap keeps the overlap. Q's own diff and its first-parent chain come from one
+read of `Q.base...Q.head`. Named residual: P built straight on commits that a
+held Q itself took in through a merge's second parent (Q = merge(Q.base, X)
+with P on X, or Q's tip re-hung as merge(Q.base, old tip)) is cleared, because
+the commit graph cannot tell that from Q having merged P's branch; X then
+lands under P's own approval, so P's reviewer reviews X as part of P's diff. Land or
 approve Q first, or drop its commits from P; a branch built on another pull
 request should target that pull request's branch. At most 250 commits are read
 per pull request. A Q whose listing is larger (for example a stacked pull

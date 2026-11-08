@@ -501,7 +501,7 @@ fn an_inheritor_not_in_the_chain_is_cleared_by_its_own_diff() {
             return Ok(json!({"total": 1, "shas": [P_OWN]}).to_string());
         }
         if joined.contains("compare/feat/x...qhead") {
-            return Ok(json!({"total": 1, "shas": [CHILD_OWN]}).to_string());
+            return Ok(graph(&[(CHILD_OWN, &["feat-x-tip"])]));
         }
         if joined.contains("OPEN") {
             return Ok(listing(&[(&q, 2)]).to_string());
@@ -707,24 +707,24 @@ fn a_merge_of_the_candidates_branch_with_one_real_q_commit_is_refused_for_that_c
 
 #[test]
 fn an_unreadable_first_parent_chain_keeps_the_overlap() {
-    // Q merged P, but Q's first-parent chain cannot be read: fail closed.
+    // Q merged P, but P's first-parent chain cannot be read: fail closed.
     let q = open(35, "feat/q5", "feat/x", FP_QM, &[FP_P1, FP_P2, FP_QM]);
-    let q_shas = json!({"total": 3, "shas": [FP_P1, FP_P2, FP_QM]}).to_string();
+    let q_graph = graph(&[
+        (FP_P1, &[FP_MAIN]),
+        (FP_P2, &[FP_P1]),
+        (FP_QM, &["feat-x-tip", FP_P2]),
+    ]);
     let listed = listing(&[(&q, 3)]).to_string();
     let run_gh = |argv: &[String]| -> Result<String, String> {
         let joined = argv.join(" ");
         if joined.contains("OPEN") {
             return Ok(listed.clone());
         }
-        if joined.contains(&format!("compare/main...{FP_P2}?")) {
-            return Ok(if joined.contains("parents") {
-                graph(P_LINE)
-            } else {
-                json!({"total": 2, "shas": [FP_P1, FP_P2]}).to_string()
-            });
+        if joined.contains(&format!("compare/main...{FP_P2}?")) && !joined.contains("parents") {
+            return Ok(json!({"total": 2, "shas": [FP_P1, FP_P2]}).to_string());
         }
-        if joined.contains(&format!("compare/feat/x...{FP_QM}?")) && !joined.contains("parents") {
-            return Ok(q_shas.clone());
+        if joined.contains(&format!("compare/feat/x...{FP_QM}?")) {
+            return Ok(q_graph.clone());
         }
         Err("HTTP 502".to_owned())
     };
@@ -740,6 +740,100 @@ fn an_unreadable_first_parent_chain_keeps_the_overlap() {
     )
     .expect("refused");
     assert_eq!(refusal.token, "carries_unapproved_commits:#35");
+}
+
+#[test]
+fn an_over_cap_first_parent_chain_keeps_the_overlap() {
+    // Q (base main) merged P, but Q's own compare is over the 250-commit cap,
+    // so its first-parent chain cannot be read: the block stays.
+    let q = open(36, "feat/q6", "main", FP_QM, &[FP_P1, FP_P2, FP_QM]);
+    let listed = listing(&[(&q, 3)]).to_string();
+    let run_gh = |argv: &[String]| -> Result<String, String> {
+        let joined = argv.join(" ");
+        if joined.contains("OPEN") {
+            return Ok(listed.clone());
+        }
+        if joined.contains(&format!("compare/main...{FP_P2}?")) {
+            return Ok(if joined.contains("parents") {
+                graph(P_LINE)
+            } else {
+                json!({"total": 2, "shas": [FP_P1, FP_P2]}).to_string()
+            });
+        }
+        if joined.contains(&format!("compare/main...{FP_QM}?")) {
+            return Ok(json!({"total": 300, "commits": []}).to_string());
+        }
+        Err(format!("unexpected: {joined}"))
+    };
+    let refusal = refusal_with(
+        &run_gh,
+        "o/r",
+        "main",
+        11363,
+        P_HEAD_BRANCH,
+        FP_P2,
+        &mut PassCache::default(),
+        &mut |_| Judgement::Unapproved("held".to_owned()),
+    )
+    .expect("refused");
+    assert_eq!(refusal.token, "carries_unapproved_commits:#36");
+    assert!(refusal.detail.contains(FP_P1), "{}", refusal.detail);
+}
+
+#[test]
+fn a_candidate_that_merged_a_held_pr_and_then_main_is_refused() {
+    // P merged held Q (base main), then merged main again. Q's commits stay
+    // off P's first-parent chain; main's new tip is on the base.
+    let q = open(37, "feat/held", "main", FP_H2, &[FP_H1, FP_H2]);
+    let q_graph: Graph<'_> = &[(FP_H1, &[FP_MAIN]), (FP_H2, &[FP_H1])];
+    let p_graph: Graph<'_> = &[
+        (FP_P1, &[FP_MAIN]),
+        (FP_H1, &[FP_MAIN]),
+        (FP_H2, &[FP_H1]),
+        (FP_PM, &[FP_P1, FP_H2]),
+        (FP_P2, &[FP_PM, "main-new-tip"]),
+    ];
+    let refusal = first_parent_refusal(FP_P2, p_graph, &[(&q, q_graph)]).expect("refused");
+    assert_eq!(refusal.token, "carries_unapproved_commits:#37");
+    assert!(refusal.detail.contains(FP_H1), "{}", refusal.detail);
+    assert!(refusal.detail.contains(FP_H2), "{}", refusal.detail);
+}
+
+#[test]
+fn a_criss_cross_merge_is_refused_for_qs_own_commit_only() {
+    // P merged Q1 and Q (base feat/x) merged P1: P1 is P's own, Q1 is Q's.
+    let q = open(38, "feat/q8", "feat/x", FP_QM, &[FP_Q1, FP_P1, FP_QM]);
+    let q_graph: Graph<'_> = &[
+        (FP_Q1, &[FP_MAIN]),
+        (FP_P1, &[FP_MAIN]),
+        (FP_QM, &[FP_Q1, FP_P1]),
+    ];
+    let p_graph: Graph<'_> = &[
+        (FP_P1, &[FP_MAIN]),
+        (FP_Q1, &[FP_MAIN]),
+        (FP_PM, &[FP_P1, FP_Q1]),
+    ];
+    let refusal = first_parent_refusal(FP_PM, p_graph, &[(&q, q_graph)]).expect("refused");
+    assert_eq!(refusal.token, "carries_unapproved_commits:#38");
+    assert!(refusal.detail.contains(FP_Q1), "{}", refusal.detail);
+    assert!(!refusal.detail.contains(FP_P1), "{}", refusal.detail);
+}
+
+#[test]
+fn residual_a_candidate_built_on_commits_a_held_pr_merged_in_is_cleared() {
+    // Named residual, documented as current behaviour: held Q (base feat/x)
+    // is merge(feat/x tip, X2), taking X1..X2 in as a second parent, and P is
+    // built straight on X2. X1 and X2 are on P's first-parent chain and not
+    // on Q's, which the graph cannot tell from Q having merged P's branch, so
+    // Q is cleared and X lands under P's own approval.
+    let q = open(39, "feat/q9", "feat/x", FP_QM, &[FP_H1, FP_H2, FP_QM]);
+    let q_graph: Graph<'_> = &[
+        (FP_H1, &[FP_MAIN]),
+        (FP_H2, &[FP_H1]),
+        (FP_QM, &["feat-x-tip", FP_H2]),
+    ];
+    let p_graph: Graph<'_> = &[(FP_H1, &[FP_MAIN]), (FP_H2, &[FP_H1]), (FP_P1, &[FP_H2])];
+    assert_eq!(first_parent_refusal(FP_P1, p_graph, &[(&q, q_graph)]), None);
 }
 
 #[test]
@@ -826,7 +920,11 @@ fn an_unapproved_over_cap_stacked_pr_does_not_block_an_independent_pr() {
             return Ok(json!({"total": 1, "shas": [INDEPENDENT]}).to_string());
         }
         if joined.contains(&format!("compare/{STACKED_BASE}...{STACKED_HEAD}")) {
-            return Ok(json!({"total": 3, "shas": STACKED_OWN}).to_string());
+            return Ok(graph(&[
+                (STACKED_OWN[0], &["base-tip"]),
+                (STACKED_OWN[1], &[STACKED_OWN[0]]),
+                (STACKED_OWN[2], &[STACKED_OWN[1]]),
+            ]));
         }
         if joined.contains("OPEN") {
             return Ok(
