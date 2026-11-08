@@ -896,7 +896,9 @@ in `runner steward --json`: REST, GraphQL, cache hits and a per-call-site
 breakdown) from a dry run before changing anything. A pull request whose
 failure the steward already published costs no GitHub read in later passes;
 the pass cache reuses only base-policy and content-addressed reads, never a
-review, comment, check, status, queue or pull-request read. See the
+review, comment, check, status, queue or pull-request read. The census reads
+current-head checks six heads per GraphQL rollup query and rereads a head's
+status history over REST only when the rollup shows a new status. See the
 [merge-steward reference](references/merge-steward.md#what-a-pass-costs-github-api_calls).
 
 It judges each first-parent change since the last `Version-Bump-Applied` marker

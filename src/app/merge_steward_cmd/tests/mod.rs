@@ -226,6 +226,8 @@ mod code_owner_wait;
 mod ejected_retry;
 mod exact_head_merge;
 #[cfg(unix)]
+mod head_rollup;
+#[cfg(unix)]
 mod mutation_outcome;
 mod mutations;
 #[cfg(unix)]
