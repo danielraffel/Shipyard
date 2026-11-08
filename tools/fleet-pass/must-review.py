@@ -10,8 +10,11 @@ disputed point instead of repeating it.
 Repair mode (--repair): the rescue sweep. Open, non-draft, unlabelled PRs that
 nothing has pushed to for STALL_MINUTES while they sit in a state only a push
 can change: a HOLD at the head, a required check failed at the head, a merge
-conflict, or a stacked base whose PR has already merged. Fresh repair claims
-are honoured.
+conflict, or a stacked base whose PR has already merged. A PR labelled
+`stacked:<n>` (opened with `shipyard pr --stacked-on <n>`) is listed as soon as
+PR n merges, without the stall wait, and never while n is open; if n closed
+unmerged it is listed as STACK-PARENT-CLOSED for a person, never retargeted.
+Fresh repair claims are honoured.
 
 Adversary mode (--adversary): the second, adversarial review that Vellum's
 required `release-path-review` status needs. Open, non-draft, unlabelled Vellum
@@ -36,6 +39,7 @@ ADVERSARY_SIGNER = "infra-review2"
 RELEASE_PATH_PREFIXES = (".github/workflows/", ".github/actions/")
 STALL_MINUTES = 45
 VERDICT = re.compile(r"^verdict: (APPROVE|HOLD) head:([0-9a-f]{40})\s*$", re.M)
+STACKED_LABEL = re.compile(r"^stacked:([1-9][0-9]*)$")
 CLAIM = re.compile(r"repair-claim: \S+ until (\d{4}-\d\d-\d\dT\d\d:\d\d(?::\d\d)?Z)")
 
 
@@ -396,16 +400,49 @@ def adversary_candidates(repo, req, now):
     return out
 
 
+def stacked_parent(pr):
+    """The parent PR number a `stacked:<n>` label names, or None."""
+    for label in pr["labels"]:
+        m = STACKED_LABEL.match(label["name"])
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def stacked_state(repo, pr, open_numbers):
+    """(state, parent) for a labelled stacked PR still off main: state is "open",
+    "merged" or "closed" for its parent. (None, parent) when unlabelled or already
+    on main, where the label no longer means anything. Reads the parent only once it
+    has left the open list, so a pass costs one REST read per stack whose parent closed."""
+    parent = stacked_parent(pr)
+    if parent is None or pr["base"]["ref"] == "main":
+        return None, parent
+    if parent in open_numbers:
+        return "open", parent
+    p = api(f"repos/{repo}/pulls/{parent}")
+    return ("merged" if p.get("merged_at") else "closed"), parent
+
+
 def repair_candidates(repo, req, now):
     out = []
     prs = fetch_prs(repo)
     open_heads = {p["head"]["ref"] for p in prs}
+    open_numbers = {p["number"] for p in prs}
     for pr in prs:
         labels = {l["name"] for l in pr["labels"]}
         if pr["draft"] or labels & HOLD_LABELS or any(l.startswith("PARKED/") for l in labels):
             continue
         sha = pr["head"]["sha"]
         pushed = ts(pr["_pushed"])
+        stack, parent = stacked_state(repo, pr, open_numbers)
+        if stack == "open":
+            continue  # invisible until its parent merges
+        if stack in ("merged", "closed"):
+            # Immediate: the parent's merge is the event, not a stall.
+            if not claimed(comments(repo, pr["number"]), now):
+                note = "STACK-BASE-MERGED" if stack == "merged" else "STACK-PARENT-CLOSED"
+                out.append((f"{repo}#{pr['number']}", sha, pushed.isoformat(), f"{note} parent:#{parent}"))
+            continue
         if (now - pushed).total_seconds() < STALL_MINUTES * 60:
             continue
         cs = comments(repo, pr["number"])

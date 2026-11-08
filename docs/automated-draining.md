@@ -145,6 +145,18 @@ own-diff read and the per-commit probe end that. On 2026-11-07 an approved
 re-export carrying a 2,724-commit mirror-history import was refused only for
 its own size; the reverse root probe ends that.)
 
+No stacking by default: `shipyard pr` refuses a base other than the
+configured one unless `--stacked-on <n>` names the open parent pull request,
+and then labels the new pull request `stacked:<n>`. The carried-commit guard
+never judges another pull request against a labelled stack whose base is still
+not the steward's base: required checks do not run on its head and the
+reviewer never reviews it, so a verdict that would release P never comes. The
+label stops counting once the stack is retargeted onto the base, so a lingering
+label exempts nothing. When `<n>` merges, the repair and operator passes list
+the stack immediately as `STACK-BASE-MERGED parent:#<n>`; they retarget it onto
+main, merge main, push once and comment `retargeted: ...`. A parent closed
+without merging is `STACK-PARENT-CLOSED` and is never retargeted.
+
 Labels keep a pull request out of admission, and the steward refuses it:
 `owner-decision`, `superseded` and `PARKED/<platform>`. `PARKED/<platform>`
 excuses only that platform's CI, never a HOLD that names a code defect. If only

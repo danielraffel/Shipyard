@@ -40,7 +40,9 @@ def main():
             rows, rep = steward_rows(repo)
             queued = set()
             owner, name = repo.split("/")
-            for pr in mr.fetch_prs(repo):
+            prs = mr.fetch_prs(repo)
+            open_numbers = {p["number"] for p in prs}
+            for pr in prs:
                 n = pr["number"]
                 labels = {l["name"] for l in pr["labels"]}
                 if pr["draft"] or labels & mr.HOLD_LABELS or any(l.startswith("PARKED/") for l in labels):
@@ -57,6 +59,13 @@ def main():
                 green = all(st.get(c) in ("success", "neutral", "skipped") for c in req)
                 v, _ = mr.verdict_at(mr.comments(repo, n), sha)
                 base = pr["base"]["ref"]
+                stack, parent = mr.stacked_state(repo, pr, open_numbers)
+                if stack == "merged":
+                    print(f"{repo}#{n} {sha[:10]} STACKED-BASE-MERGED parent=#{parent}")
+                    continue
+                if stack == "closed":
+                    print(f"{repo}#{n} {sha[:10]} STACKED-PARENT-CLOSED parent=#{parent} (needs its author; do not retarget)")
+                    continue
                 if base != "main":
                     if idle > HELD_IDLE_MIN and why.startswith(("carried", "steward_error")):
                         print(f"{repo}#{n} {sha[:10]} STACKED-BLOCKING idle={int(idle)}m steward={why} {detail}")

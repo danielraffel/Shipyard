@@ -103,8 +103,8 @@ const SHAS_NAMED: usize = 10;
 const OPEN_PULL_COMMITS_QUERY: &str = "query($owner:String!,$name:String!,$cursor:String){\
      repository(owner:$owner,name:$name){pullRequests(states:OPEN,first:50,after:$cursor){\
      pageInfo{hasNextPage endCursor} nodes{number headRefName headRefOid baseRefName \
-     isCrossRepository author{login} carriedCommits:commits(first:100){totalCount \
-     nodes{commit{oid}}}}}}}";
+     isCrossRepository author{login} labels(first:50){nodes{name}} \
+     carriedCommits:commits(first:100){totalCount nodes{commit{oid}}}}}}}";
 
 /// The commits a pull request carries, as far as the steward read them.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -128,6 +128,9 @@ pub(super) struct OpenPr {
     pub cross_repository: bool,
     pub author: Option<String>,
     pub commits: CommitList,
+    /// The parent pull request a `stacked:<n>` label names, the label
+    /// `shipyard pr --stacked-on <n>` applies.
+    pub stacked_on: Option<u64>,
 }
 
 /// The candidate under admission.
@@ -208,8 +211,16 @@ pub(super) fn carried(candidate: &Candidate<'_>, others: &[OpenPr]) -> Vec<Carri
 }
 
 /// The open pull requests whose commits P must not carry unapproved: every
-/// one but P itself, P's own base-branch pull request, and those stacked on
-/// P. Pure.
+/// one but P itself, P's own base-branch pull request, those stacked on P,
+/// and labelled stacked pull requests. Pure.
+///
+/// A labelled stacked pull request (`stacked:<n>`, still on a base other than
+/// the steward's) is invisible to admission until it is retargeted: required
+/// checks do not run on its head and the reviewer never reviews it, so
+/// judging P against it can only hold P on a verdict that will never come.
+/// The label counts only while Q's base is not the steward's base, so a
+/// retargeted pull request whose label lingered is checked like any other.
+/// P carrying such a Q's commits is still P's own diff, reviewed at P's head.
 fn unrelated<'a>(
     number: u64,
     base_ref: &'a str,
@@ -223,7 +234,26 @@ fn unrelated<'a>(
         .filter(move |q| q.cross_repository || q.head_ref != base_ref)
         // Q is stacked on P, directly or through other open pull requests.
         .filter(move |q| !stacked_on(q, head_ref, others))
+        // Q is a labelled stacked pull request, not yet retargeted.
+        .filter(move |q| !labelled_stack(q, base_ref))
 }
+
+/// Whether `q` carries a `stacked:<n>` label and still targets a base other
+/// than the steward's. Pure.
+fn labelled_stack(q: &OpenPr, base_ref: &str) -> bool {
+    q.stacked_on.is_some() && q.base_ref != base_ref
+}
+
+/// The parent number of a `stacked:<n>` label, if `name` is one. Pure.
+fn stacked_label_parent(name: &str) -> Option<u64> {
+    name.strip_prefix(STACKED_LABEL_PREFIX)?
+        .parse()
+        .ok()
+        .filter(|number| *number > 0)
+}
+
+/// The label prefix `shipyard pr --stacked-on <n>` applies, as `stacked:<n>`.
+pub(in crate::app) const STACKED_LABEL_PREFIX: &str = "stacked:";
 
 /// Whether `q`'s base-branch chain, followed through other open (same
 /// repository) pull requests' head branches, reaches `head_ref`. Pure; a cycle
@@ -1148,6 +1178,13 @@ fn parse_open_pr(run_gh: RunGh<'_>, repo: &str, node: &Value) -> Result<OpenPr, 
             .and_then(Value::as_str)
             .map(str::to_owned),
         commits,
+        stacked_on: node
+            .pointer("/labels/nodes")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|label| label.get("name").and_then(Value::as_str))
+            .find_map(stacked_label_parent),
     })
 }
 
@@ -1171,3 +1208,6 @@ fn rest_commits(run_gh: RunGh<'_>, repo: &str, number: u64) -> Result<BTreeSet<S
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod stacked_label_tests;

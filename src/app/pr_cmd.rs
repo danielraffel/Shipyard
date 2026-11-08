@@ -33,8 +33,11 @@ pub(super) struct PrCommandArgs {
     pub(super) allow_unreachable_triggers: Vec<String>,
     /// Skip the landability gate for this invocation.
     pub(super) skip_landability: bool,
-    /// The author intends a stacked pull request against a non-default base.
+    /// The retired `--stacked` flag, which named no parent; it now refuses.
     pub(super) stacked: bool,
+    /// `--stacked-on <n>`: the author intends a pull request stacked on open
+    /// pull request `n`, whose head branch is the non-default base.
+    pub(super) stacked_on: Option<u64>,
     pub(super) skip_targets: Vec<String>,
     /// Opt-in targets to validate in addition to the default set.
     pub(super) targets: Vec<String>,
@@ -92,9 +95,11 @@ fn normalize_base(input: &str) -> &str {
 /// workflow is in the checkout, and nothing about the question needs the pull
 /// request to exist. Every input is local, so this costs zero API calls.
 ///
-/// With `--stacked` it still prints the verdict, because the author needs to
-/// know at open time that the gate fires only after a retarget **and** a push
-/// — not after the retarget alone.
+/// No stacking by default: a non-default base proceeds only with
+/// `--stacked-on <n>`, naming the parent pull request. With it the guard still
+/// prints the verdict, because the author needs to know at open time that the
+/// gate fires only after a retarget **and** a push, not after the retarget
+/// alone.
 fn stacked_base_guard<W: Write>(
     args: &PrCommandArgs,
     config: &LoadedConfig,
@@ -103,6 +108,16 @@ fn stacked_base_guard<W: Write>(
 ) -> Result<(), CliFailure> {
     let configured = crate::landability::gate::resolve_base(config);
     if args.base == configured {
+        if let Some(parent) = args.stacked_on {
+            return Err(CliFailure::new(
+                2,
+                format!(
+                    "--stacked-on {parent} needs --base set to #{parent}'s head branch; \
+                     `{configured}` is the configured base branch, so this pull request would \
+                     not be stacked. No pull request was created."
+                ),
+            ));
+        }
         return Ok(());
     }
 
@@ -110,18 +125,105 @@ fn stacked_base_guard<W: Write>(
     let verdict = describe_stacked_base(config, cwd, &args.base, &configured, &contexts);
     writeln!(stdout, "{verdict}").map_err(|error| CliFailure::new(1, error.to_string()))?;
 
-    if args.stacked {
+    if args.stacked_on.is_some() {
         return Ok(());
     }
+    let retired = if args.stacked {
+        " --stacked no longer suffices: a stacked pull request must name its parent."
+    } else {
+        ""
+    };
     Err(CliFailure::new(
         crate::landability::EXIT_TRIGGER_UNREACHABLE,
         format!(
             "--base `{}` is not the configured base branch `{configured}`. No pull request was \
-             created. Pass --stacked if you intend a stacked pull request that stays unchecked \
-             until its parent lands; the verdict above says what its gate will do.",
-            args.base
+             created.{retired} Open it against `{configured}` once its parent lands, or pass \
+             --stacked-on <n> (the open pull request whose head branch is `{}`) if you intend a \
+             stacked pull request that stays unchecked until it is retargeted; the verdict above \
+             says what its gate will do.",
+            args.base, args.base
         ),
     ))
+}
+
+/// The text `--stacked-on <n>` adds to the pull request body, so a reader
+/// sees at open time that this head cannot be reviewed or gated yet.
+fn stacked_body_note(parent: u64, base: &str, configured: &str) -> String {
+    format!(
+        "**Stacked on #{parent}** (`{base}`), labelled `{prefix}{parent}`. Required checks \
+         do not run on a stacked head, so this pull request cannot be reviewed or admitted \
+         yet, and the steward never holds other pull requests on it. Once #{parent} merges, \
+         it is retargeted onto `{configured}`, `{configured}` is merged in and pushed once; \
+         review starts from that head.",
+        prefix = super::merge_steward_cmd::STACKED_LABEL_PREFIX,
+    )
+}
+
+/// Check, from the parent's REST pull request, that `--stacked-on <n>` names
+/// an open same-repository pull request whose head branch is `--base`. Pure.
+fn check_stacked_parent(
+    parent_json: &str,
+    repo: &str,
+    parent: u64,
+    base: &str,
+) -> Result<(), String> {
+    let value: Value = serde_json::from_str(parent_json)
+        .map_err(|error| format!("#{parent} is unreadable: {error}"))?;
+    let state = value.get("state").and_then(Value::as_str).unwrap_or("");
+    if state != "open" {
+        return Err(format!(
+            "#{parent} is not open ({}); open this pull request against the configured base \
+             instead",
+            if state.is_empty() {
+                "state unknown"
+            } else {
+                state
+            }
+        ));
+    }
+    let head = value
+        .pointer("/head/ref")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let head_repo = value
+        .pointer("/head/repo/full_name")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if !head_repo.eq_ignore_ascii_case(repo) {
+        return Err(format!(
+            "#{parent}'s head is in `{head_repo}`, not `{repo}`; a stack needs a same-repository \
+             parent"
+        ));
+    }
+    if head != base {
+        return Err(format!(
+            "#{parent}'s head branch is `{head}`, not --base `{base}`"
+        ));
+    }
+    Ok(())
+}
+
+/// Read the parent pull request and run [`check_stacked_parent`]; before any
+/// side effect, so a wrong `--stacked-on` creates nothing.
+fn verify_stacked_parent(
+    config: &LoadedConfig,
+    cwd: &Path,
+    parent: u64,
+    base: &str,
+) -> Result<(), CliFailure> {
+    let refuse = |detail: String| {
+        CliFailure::new(
+            2,
+            format!("--stacked-on {parent}: {detail}. No pull request was created."),
+        )
+    };
+    let repo = detect_repo_from_remote(cwd, None)
+        .ok_or_else(|| refuse("no GitHub origin remote to read the parent from".to_owned()))?;
+    let actions = crate::cloud::GitHubActions::from_loaded_config(cwd, config);
+    let raw = actions
+        .run_gh(&["api".to_owned(), format!("repos/{repo}/pulls/{parent}")])
+        .map_err(|error| refuse(format!("#{parent} is unreadable: {error}")))?;
+    check_stacked_parent(&raw, &repo, parent, base).map_err(refuse)
 }
 
 /// Required contexts from config alone, for the open-time verdict.
@@ -234,6 +336,18 @@ pub(super) fn pr_command<W: Write>(
 
     // Before ANY side effect — no trailer, no bump, no push, no pull request.
     stacked_base_guard(&args, config, cwd, stdout)?;
+    if let Some(parent) = args.stacked_on {
+        verify_stacked_parent(config, cwd, parent, &args.base)?;
+        let note = stacked_body_note(
+            parent,
+            &args.base,
+            &crate::landability::gate::resolve_base(config),
+        );
+        args.body_append = Some(match args.body_append.take() {
+            Some(text) => format!("{note}\n\n{text}"),
+            None => note,
+        });
+    }
 
     if !args.skip_bump.is_empty() && args.bump_reason.is_none() {
         return Err(CliFailure::new(
@@ -352,6 +466,7 @@ pub(super) fn pr_command<W: Write>(
             arm_auto_merge: args.arm_auto_merge,
             leave_unarmed: args.arm_auto_merge.leaves_unarmed(),
             body_append: args.body_append,
+            stacked_on: args.stacked_on,
             next_steps: Some(next_steps),
         },
         config,
@@ -878,6 +993,7 @@ mod tests {
             allow_unreachable_triggers: Vec::new(),
             skip_landability: false,
             stacked: false,
+            stacked_on: None,
             skip_targets: Vec::new(),
             targets: Vec::new(),
             skip_bump: Vec::new(),
@@ -1293,22 +1409,23 @@ mod tests {
         );
     }
 
-    /// `--stacked` prints the same verdict and proceeds — the author needs to
-    /// know at open time that the gate fires only after a retarget AND a push.
+    /// `--stacked-on <n>` prints the same verdict and proceeds — the author
+    /// needs to know at open time that the gate fires only after a retarget
+    /// AND a push.
     #[cfg(unix)]
     #[test]
-    fn t9_stacked_proceeds_but_still_prints_the_verdict() {
+    fn t9_stacked_on_proceeds_but_still_prints_the_verdict() {
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = repo_with_main_only_gate(temp.path());
         let config = config_at(&repo);
         let args = PrCommandArgs {
             base: String::from("feature/parent"),
-            stacked: true,
+            stacked_on: Some(41),
             ..pr_args()
         };
         let mut out = Vec::new();
 
-        stacked_base_guard(&args, &config, &repo, &mut out).expect("--stacked proceeds");
+        stacked_base_guard(&args, &config, &repo, &mut out).expect("--stacked-on proceeds");
 
         let printed = String::from_utf8(out).expect("utf8");
         assert!(printed.contains("base_excluded"), "{printed}");
@@ -1321,6 +1438,97 @@ mod tests {
     /// The break line for T9: comparing against a literal instead of the
     /// configured base branch. With this, a repository whose base is not
     /// `main` stops being guarded at all.
+    /// No stacking by default: the retired `--stacked` flag names no parent,
+    /// so it no longer lets a non-default base through.
+    #[cfg(unix)]
+    #[test]
+    fn the_retired_stacked_flag_alone_refuses_and_names_stacked_on() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = repo_with_main_only_gate(temp.path());
+        let config = config_at(&repo);
+        let args = PrCommandArgs {
+            base: String::from("feature/parent"),
+            stacked: true,
+            ..pr_args()
+        };
+        let failure = stacked_base_guard(&args, &config, &repo, &mut Vec::new())
+            .expect_err("--stacked without a parent must refuse");
+        assert_eq!(failure.code, crate::landability::EXIT_TRIGGER_UNREACHABLE);
+        assert!(
+            failure.message.contains("--stacked-on <n>"),
+            "{}",
+            failure.message
+        );
+        assert!(
+            failure.message.contains("--stacked no longer suffices"),
+            "{}",
+            failure.message
+        );
+    }
+
+    /// `--stacked-on` on the configured base would label a pull request the
+    /// steward then skips although nothing is stacked; refuse it.
+    #[cfg(unix)]
+    #[test]
+    fn stacked_on_with_the_configured_base_refuses() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = repo_with_main_only_gate(temp.path());
+        let config = config_at(&repo);
+        let args = PrCommandArgs {
+            base: String::from("main"),
+            stacked_on: Some(41),
+            ..pr_args()
+        };
+        let failure = stacked_base_guard(&args, &config, &repo, &mut Vec::new())
+            .expect_err("--stacked-on main must refuse");
+        assert_eq!(failure.code, 2);
+        assert!(failure.message.contains("No pull request was created"));
+    }
+
+    fn parent_json(state: &str, head: &str, head_repo: &str) -> String {
+        serde_json::json!({
+            "state": state,
+            "head": {"ref": head, "repo": {"full_name": head_repo}},
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn stacked_on_must_name_the_open_same_repo_pr_whose_head_is_the_base() {
+        let ok = parent_json("open", "feature/parent", "Generous-Corp/pulp");
+        assert_eq!(
+            check_stacked_parent(&ok, "Generous-Corp/pulp", 41, "feature/parent"),
+            Ok(())
+        );
+        let merged = parent_json("closed", "feature/parent", "Generous-Corp/pulp");
+        assert!(
+            check_stacked_parent(&merged, "Generous-Corp/pulp", 41, "feature/parent")
+                .expect_err("closed parent")
+                .contains("not open (closed)")
+        );
+        let other = parent_json("open", "feature/other", "Generous-Corp/pulp");
+        assert!(
+            check_stacked_parent(&other, "Generous-Corp/pulp", 41, "feature/parent")
+                .expect_err("wrong head")
+                .contains("`feature/other`, not --base `feature/parent`")
+        );
+        let fork = parent_json("open", "feature/parent", "someone/pulp");
+        assert!(
+            check_stacked_parent(&fork, "Generous-Corp/pulp", 41, "feature/parent")
+                .expect_err("fork parent")
+                .contains("same-repository")
+        );
+    }
+
+    #[test]
+    fn the_stacked_body_note_says_the_head_cannot_be_reviewed_yet() {
+        let note = stacked_body_note(41, "feature/parent", "main");
+        assert!(note.contains("Stacked on #41"), "{note}");
+        assert!(note.contains("`stacked:41`"), "{note}");
+        assert!(note.contains("cannot be reviewed"), "{note}");
+        assert!(note.contains("retargeted onto `main`"), "{note}");
+    }
+
     #[cfg(unix)]
     #[test]
     fn t9_the_guard_reads_the_configured_base_not_a_literal_main() {

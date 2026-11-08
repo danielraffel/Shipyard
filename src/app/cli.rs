@@ -838,12 +838,18 @@ pub(super) enum Command {
         /// Skip the landability gate entirely for this invocation.
         #[arg(long = "skip-landability")]
         skip_landability: bool,
-        /// Open this pull request against a base that is not the configured
-        /// base branch, on purpose. The trigger verdict is printed either
-        /// way; without this flag a non-default base refuses with exit 8 and
-        /// creates nothing.
-        #[arg(long = "stacked")]
+        /// Retired: a stacked pull request now names its parent with
+        /// `--stacked-on <n>`. Passing `--stacked` alone refuses and says so.
+        #[arg(long = "stacked", hide = true)]
         stacked: bool,
+        /// Open this pull request stacked on open pull request `<n>`, whose
+        /// head branch must be `--base`. Without it a base other than the
+        /// configured base branch refuses with exit 8 and creates nothing.
+        /// The pull request is labelled `stacked:<n>`, so the steward never
+        /// holds other pull requests on it, and its body says its required
+        /// checks run only after it is retargeted onto the base.
+        #[arg(long = "stacked-on", value_name = "PR")]
+        stacked_on: Option<u64>,
         /// Skip a target after preflight.
         #[arg(long = "skip-target")]
         skip_targets: Vec<String>,
