@@ -1199,7 +1199,8 @@ pub(super) fn steward_command<W: Write>(
             &mut ledger,
             &mut remaining_preemptions,
             mutation_control.as_ref(),
-            (&mut recovery_errors, &mut recovery_cancellations),
+            &mut recovery_errors,
+            &mut recovery_cancellations,
         );
         if report
             .errors
@@ -1262,12 +1263,9 @@ fn steward_repo(
     ledger: &mut StewardLedger,
     remaining_preemptions: &mut usize,
     mutation_control: Option<&MutationControl>,
-    recovered: (
-        &mut BTreeMap<String, Vec<String>>,
-        &mut BTreeMap<String, Vec<CancellationReport>>,
-    ),
+    recovery_errors: &mut BTreeMap<String, Vec<String>>,
+    recovery_cancellations: &mut BTreeMap<String, Vec<CancellationReport>>,
 ) -> (RepoReport, bool) {
-    let (recovery_errors, recovery_cancellations) = recovered;
     // Scope the token helper to this exact repository: a scheduled pass
     // runs from a directory that is not a checkout, and one checkout's
     // remote must never mint the token for another repository.
