@@ -511,6 +511,7 @@ fn an_armed_request_on_an_unapproved_waiting_head_is_disarmed() {
         approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
         wake_owner: false,
         unapproved_dequeue: crate::app::merge_steward_cmd::DequeueMode::Report,
+        pass_deadline: None,
         apply: true,
         ledger: None,
     };
@@ -706,6 +707,7 @@ fn run_recovery_clear_pass(cleared_merge_state: &str) -> (PrReport, String) {
         approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
         wake_owner: false,
         unapproved_dequeue: crate::app::merge_steward_cmd::DequeueMode::Report,
+        pass_deadline: None,
         apply: true,
         ledger: None,
     };

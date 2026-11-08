@@ -395,6 +395,7 @@ fn runner_command_with_actions<W: Write>(
             arm_unqueued,
             approval_context,
             wake_owner,
+            pass_budget_secs,
             apply,
             ledger,
         } => super::merge_steward_cmd::steward_command(
@@ -414,6 +415,8 @@ fn runner_command_with_actions<W: Write>(
                 approval_context,
                 wake_owner,
                 unapproved_dequeue: super::merge_steward_cmd::DequeueMode::default(),
+                pass_deadline: (pass_budget_secs > 0)
+                    .then(|| std::time::Instant::now() + Duration::from_secs(pass_budget_secs)),
                 apply,
                 ledger,
             },

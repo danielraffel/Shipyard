@@ -414,6 +414,7 @@ esac
         approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
         wake_owner: false,
         unapproved_dequeue: crate::app::merge_steward_cmd::DequeueMode::Report,
+        pass_deadline: None,
         apply: false,
         ledger: None,
     };

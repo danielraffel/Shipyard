@@ -22,13 +22,18 @@ pub(super) fn observe_candidates(
         return Ok(Vec::new());
     }
     let mut runs = observation.runs.clone();
+    // A wedge needs an active run on a head its pull request has moved past,
+    // so only such a pull request's runs are read; all of them are, so a
+    // current-head run's jobs are known rather than assumed empty. A run left
+    // unread keeps no jobs and can be neither side of a candidate: the stale
+    // side needs its local job, and the current side belongs to the same
+    // pull request. A backlog of current-head runs therefore costs no reads.
+    let stale = stale_head_pull_requests(observation);
     for run in &mut runs {
-        if run.event == "pull_request"
-            && run.workflow == "Build and Test"
-            && matches!(
-                run.status.to_ascii_lowercase().as_str(),
-                "queued" | "waiting" | "pending" | "requested" | "in_progress"
-            )
+        if is_active_wedge_run(run)
+            && run
+                .pull_request_number
+                .is_some_and(|number| stale.contains(&number))
         {
             run.jobs = fetch_run_jobs(actions, &observation.repo, run.id)?;
         }
@@ -43,6 +48,35 @@ pub(super) fn observe_candidates(
             .collect::<Vec<_>>(),
         &observation.required_checks,
     ))
+}
+
+fn is_active_wedge_run(run: &StewardRun) -> bool {
+    run.event == "pull_request"
+        && run.workflow == "Build and Test"
+        && matches!(
+            run.status.to_ascii_lowercase().as_str(),
+            "queued" | "waiting" | "pending" | "requested" | "in_progress"
+        )
+}
+
+/// Pull requests with an active `Build and Test` run whose head is not the
+/// pull request's current head: a superset of those
+/// `plan_stale_pr_run_wedges` can select a stale run for.
+fn stale_head_pull_requests(observation: &RepoObservation) -> BTreeSet<u64> {
+    observation
+        .runs
+        .iter()
+        .filter(|run| is_active_wedge_run(run))
+        .filter_map(|run| {
+            let number = run.pull_request_number?;
+            observation
+                .prs
+                .iter()
+                .find(|pr| pr.fact.number == number)
+                .filter(|pr| !pr.fact.head_sha.eq_ignore_ascii_case(&run.head_sha))
+                .map(|_| number)
+        })
+        .collect()
 }
 
 pub(super) fn reconcile_receipts(
@@ -898,6 +932,122 @@ esac
             Some(StalePrRunWedgeReceiptPhase::Accepted)
         );
         assert!(dedupe_candidates(vec![candidate], &ledger).is_empty());
+    }
+
+    #[cfg(unix)]
+    fn wedge_pr(number: u64, head: char, branch: &str) -> super::super::ObservedPr {
+        super::super::parse_pr(
+            &serde_json::json!({
+                "id": format!("PR_{number}"),
+                "number": number,
+                "isDraft": false,
+                "headRefOid": sha(head),
+                "headRefName": branch,
+                "mergeStateStatus": "BLOCKED",
+                "autoMergeRequest": null,
+                "labels": [{"name": "shipyard:managed"}],
+                "statusCheckRollup": []
+            }),
+            &BTreeMap::new(),
+        )
+        .expect("PR")
+    }
+
+    #[cfg(unix)]
+    fn wedge_run(id: u64, pr: u64, head: char, branch: &str, status: &str) -> StewardRun {
+        StewardRun {
+            id,
+            workflow_id: 77,
+            run_attempt: 1,
+            workflow: "Build and Test".to_owned(),
+            head_sha: sha(head),
+            head_branch: branch.to_owned(),
+            status: status.to_owned(),
+            event: "pull_request".to_owned(),
+            pull_request_number: Some(pr),
+            created_at: format!("2026-08-29T09:00:{:02}Z", id % 60),
+            jobs: Vec::new(),
+        }
+    }
+
+    /// Observation reads jobs only for the pull request whose active run is
+    /// on a superseded head, and still finds its wedge; current-head runs of
+    /// every other pull request cost nothing.
+    #[cfg(unix)]
+    #[test]
+    fn observation_reads_jobs_only_for_pull_requests_with_a_stale_head_run() {
+        let temp = tempfile::tempdir().expect("temp");
+        let calls = temp.path().join("calls");
+        let gh = temp.path().join("gh");
+        let script = format!(
+            r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> '{}'
+case "$*" in
+  *"actions/runs/100/jobs"*) printf '%s' '{{"jobs":[{{"id":900,"name":"macos","status":"in_progress","conclusion":null,"labels":["self-hosted","macOS","ARM64","pulp-build","pulp-build-vm","pulp-build-pr-head"],"runner_name":"pulp-macos-gate-slot2"}}]}}' ;;
+  *"/jobs"*) printf '%s' '{{"jobs":[]}}' ;;
+  *) printf '%s' '{{}}' ;;
+esac
+"#,
+            calls.display()
+        );
+        crate::test_support::write_executable_script(&gh, &script);
+        let actions = GitHubActions::hermetic_for_tests(temp.path(), gh);
+        let mut runs = vec![
+            // PR 7895 moved from head a to head b: a wedge.
+            wedge_run(100, 7895, 'a', "feature/wedge", "in_progress"),
+            wedge_run(101, 7895, 'b', "feature/wedge", "pending"),
+        ];
+        // Twenty more pull requests, each with only a current-head run.
+        let mut prs = vec![wedge_pr(7895, 'b', "feature/wedge")];
+        for number in 8000..8020 {
+            prs.push(wedge_pr(number, 'c', "feature/current"));
+            runs.push(wedge_run(number, number, 'c', "feature/current", "queued"));
+        }
+        let observation = RepoObservation {
+            repo: "Generous-Corp/pulp".to_owned(),
+            base: "main".to_owned(),
+            allow_auto_merge: true,
+            merge_queue: true,
+            required_checks: vec![RequiredCheck {
+                context: "macos".to_owned(),
+                app_id: None,
+            }],
+            prs,
+            runs,
+            merge_group_heads: BTreeMap::new(),
+            merge_group_enqueued_at: BTreeMap::new(),
+            capacity_preemption_policy: CapacityPreemptionPolicy::pulp(),
+            preemption_error: None,
+        };
+
+        let candidates = observe_candidates(&actions, &observation).expect("observe");
+
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| (candidate.old_run_id, candidate.new_run_id))
+                .collect::<Vec<_>>(),
+            vec![(100, 101)]
+        );
+        let calls = fs::read_to_string(&calls).expect("calls");
+        assert_eq!(calls.matches("/jobs").count(), 2, "{calls}");
+        assert!(calls.contains("actions/runs/100/jobs"), "{calls}");
+        assert!(calls.contains("actions/runs/101/jobs"), "{calls}");
+
+        // Control: with no superseded head nothing is read at all.
+        fs::remove_file(temp.path().join("calls")).expect("reset calls");
+        let mut current_only = observation.clone();
+        current_only.runs.retain(|run| run.id != 100);
+        assert!(
+            observe_candidates(&actions, &current_only)
+                .expect("observe")
+                .is_empty()
+        );
+        assert!(
+            !temp.path().join("calls").exists(),
+            "current-head runs must cost no job reads"
+        );
     }
 
     #[allow(dead_code)]

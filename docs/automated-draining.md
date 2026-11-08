@@ -305,6 +305,7 @@ not listed as blocked.
 | `enqueue_refused:<message>` | GitHub definitively refused the enqueue for another reason, quoted | author or owner |
 | `uncertain_mutation` | An earlier enqueue of this pull request is still uncertain because GitHub's state could not be read; only this pull request waits | next pass, or operator |
 | `steward_error` | Admission failed; see `error` | operator |
+| `deferred_pass_budget` | The pass spent its time budget (or hit the API rate limit) before this row and did nothing for it; the next pass takes it first. See "Things that bite" | next pass |
 | `admission_pending` | Admission returned an outcome with no token of its own; see `blocked_detail` | next pass |
 | `queued` | In the merge queue | queue |
 | `admitted` | Enqueued or merged this pass (outranks any label) | nobody |
@@ -346,6 +347,16 @@ These came from running it for real:
   while it works, and TartCI's VM admission takes the same lock. Keep passes
   short (Shipyard hydrates only pull requests that could actually be
   admitted), and run repositories one after another, not in parallel.
+- **A pass that is killed reports nothing.** A pass reads GitHub per open
+  pull request, so a deep backlog on a slow token path can outrun a
+  scheduler's timeout, and a killed pass prints no report. Past
+  `--pass-budget-secs` (default 240; 0 disables) an apply pass starts no new
+  per-PR work, and it does the same once GitHub reports the token's API rate
+  limit exceeded. Each remaining row is reported `deferred_pass_budget` with
+  its census decision, is never admitted, armed, enqueued or dequeued that
+  pass, and is evaluated first on the next pass, after admission candidates
+  and queued or armed rows. Keep the budget a few minutes under the
+  scheduler's timeout so the in-flight pull request and the report fit.
 - **A timer job that touches an external volume can hang.** On macOS a
   background job opening a path on `/Volumes` can wait forever on a privacy
   prompt nobody sees. Run the steward from the internal disk.

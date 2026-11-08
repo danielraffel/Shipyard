@@ -109,6 +109,7 @@ esac
         approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
         wake_owner: false,
         unapproved_dequeue: crate::app::merge_steward_cmd::DequeueMode::Report,
+        pass_deadline: None,
         apply: true,
         ledger: None,
     };
@@ -2231,6 +2232,7 @@ esac
         approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
         wake_owner: false,
         unapproved_dequeue: crate::app::merge_steward_cmd::DequeueMode::Report,
+        pass_deadline: None,
         apply: true,
         ledger: None,
     };
@@ -2372,6 +2374,7 @@ fn steward_dry_run_needs_no_mutation_authority_and_makes_no_remote_write() {
         approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
         wake_owner: false,
         unapproved_dequeue: crate::app::merge_steward_cmd::DequeueMode::Report,
+        pass_deadline: None,
         apply: false,
         ledger: None,
     };
@@ -2393,6 +2396,95 @@ fn steward_dry_run_needs_no_mutation_authority_and_makes_no_remote_write() {
     assert!(reports[0].mutation.is_none());
     assert!(reports[0].error.is_none());
     assert!(!temp.path().join("state/ship").exists());
+}
+
+/// Past the pass budget a ready pull request is deferred, never admitted:
+/// the pass makes no GitHub read or write for it, reports it with its census
+/// decision, and records it so the next pass evaluates it first.
+#[cfg(unix)]
+#[test]
+fn spent_pass_budget_defers_a_ready_pull_request_without_admitting_it() {
+    let temp = tempfile::tempdir().expect("temp");
+    let log = temp.path().join("calls");
+    let actions = fake_gh(
+        &temp,
+        &format!(
+            r#"
+printf '%s\n' "$*" >> '{}'
+echo "unexpected: $*" >&2; exit 90
+"#,
+            log.display()
+        ),
+    );
+    let observation = observation_for(ready_pr(), true);
+    let control = mutation_control(&temp, "studio", "studio");
+    let args = StewardCommandArgs {
+        repos: vec!["owner/repo".to_owned()],
+        base: "main".to_owned(),
+        opt_out_label: "steward:skip".to_owned(),
+        provenance_blocking_labels: default_provenance_blocking_labels(),
+        managed_label: MANAGED_LABEL.to_owned(),
+        handoff_context: HANDOFF_CONTEXT.to_owned(),
+        max_transient_reruns: 1,
+        recover_hosted_setup_eviction_priority: false,
+        coalesce: true,
+        preempt_capacity: true,
+        max_preemptions_per_head: 1,
+        arm_unqueued: false,
+        approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
+        wake_owner: false,
+        unapproved_dequeue: crate::app::merge_steward_cmd::DequeueMode::Report,
+        pass_deadline: Some(std::time::Instant::now()),
+        apply: true,
+        ledger: None,
+    };
+    let mut ledger = StewardLedger::default();
+
+    let (reports, failed) = apply_pr_plans(
+        &actions,
+        &args,
+        &observation,
+        &queue_policy(),
+        &temp.path().join("ledger.json"),
+        &mut ledger,
+        Some(&control),
+    );
+
+    assert!(!failed);
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].decision, StewardDecision::ArmMergeQueue);
+    assert_eq!(reports[0].mutation.as_deref(), Some("deferred_pass_budget"));
+    assert!(reports[0].error.is_none());
+    assert_eq!(reports[0].blocked.blocked_on, "deferred_pass_budget");
+    assert!(
+        !log.exists(),
+        "a deferred row must cost no GitHub call: {:?}",
+        fs::read_to_string(&log)
+    );
+    assert_eq!(
+        ledger.pass_budget_deferred.get("owner/repo"),
+        Some(&vec![42])
+    );
+
+    // The next pass takes the deferred row ahead of an equal row that was
+    // not deferred; an admission candidate still goes first.
+    let mut first = ready_pr();
+    first.fact.number = 1;
+    let mut carried = ready_pr();
+    carried.fact.number = 42;
+    let mut candidate = ready_pr();
+    candidate.fact.number = 3;
+    let order = crate::app::merge_steward_cmd::pass_budget::processing_order(
+        "Owner/Repo",
+        &[first, carried, candidate],
+        &[
+            StewardDecision::Draft,
+            StewardDecision::Draft,
+            StewardDecision::ArmMergeQueue,
+        ],
+        &ledger,
+    );
+    assert_eq!(order, vec![2, 1, 0]);
 }
 
 /// A fake GitHub for the owner-wake scenarios. It records every comment POST
@@ -2461,6 +2553,7 @@ esac
             approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
             wake_owner,
             unapproved_dequeue: crate::app::merge_steward_cmd::DequeueMode::Report,
+            pass_deadline: None,
             apply: true,
             ledger: None,
         }
@@ -2814,6 +2907,7 @@ fi
         approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
         wake_owner: false,
         unapproved_dequeue: crate::app::merge_steward_cmd::DequeueMode::Report,
+        pass_deadline: None,
         apply: true,
         ledger: None,
     };
@@ -2876,6 +2970,7 @@ fn routing_readiness_hold_does_not_suppress_an_unrelated_pr_in_repo_plan() {
         approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
         wake_owner: false,
         unapproved_dequeue: crate::app::merge_steward_cmd::DequeueMode::Report,
+        pass_deadline: None,
         apply: false,
         ledger: None,
     };
@@ -2921,6 +3016,7 @@ fn disabled_preemption_ignores_preemption_only_observation_errors() {
         approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
         wake_owner: false,
         unapproved_dequeue: crate::app::merge_steward_cmd::DequeueMode::Report,
+        pass_deadline: None,
         apply: false,
         ledger: None,
     };

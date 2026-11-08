@@ -59,6 +59,9 @@ pub(super) struct StewardCommandArgs {
     /// unapproved queue entries or only reports them. Read from the
     /// machine-global config by [`steward_command`].
     pub(super) unapproved_dequeue: unapproved_admission::DequeueMode,
+    /// Past this instant a pass starts no new per-PR work; see
+    /// `pass_budget`. `None` never defers.
+    pub(super) pass_deadline: Option<Instant>,
     pub(super) apply: bool,
     pub(super) ledger: Option<PathBuf>,
 }
@@ -190,6 +193,10 @@ struct StewardLedger {
     /// the head's ejection cap.
     #[serde(default)]
     steward_removals: BTreeMap<String, Vec<String>>,
+    /// Pull requests the last pass deferred (`pass_budget`), keyed by
+    /// lowercase repository; the next pass evaluates them first.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pass_budget_deferred: BTreeMap<String, Vec<u64>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1189,7 +1196,11 @@ pub(super) fn steward_command<W: Write>(
                 if let Some(cancellations) = recovery_cancellations.remove(&observation.repo) {
                     report.cancellations.extend(cancellations);
                 }
-                if args.apply {
+                if args.apply && pass_budget::deadline_passed(args.pass_deadline) {
+                    report
+                        .rollup_reconciliation
+                        .push("deferred: the pass time budget is spent".to_owned());
+                } else if args.apply {
                     reconcile_rollups(actions, &observation.repo, &args.base, &mut report);
                 }
                 remaining_preemptions = remaining_preemptions.saturating_sub(planned_preemptions);
@@ -1448,6 +1459,7 @@ mod mutation_outcome;
 mod native_arm;
 mod next_action;
 mod observation;
+mod pass_budget;
 mod pr_mutations;
 pub(super) mod queue_drain;
 mod queue_priority_recovery;
@@ -1633,6 +1645,7 @@ fn single_pr_dry_run(
         approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
         wake_owner: false,
         unapproved_dequeue: DequeueMode::Report,
+        pass_deadline: None,
         apply: false,
         ledger: None,
     };
