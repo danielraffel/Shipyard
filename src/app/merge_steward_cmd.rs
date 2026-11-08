@@ -390,7 +390,7 @@ enum PendingMutationKind {
     ForceCancel,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct LedgerAudit {
     at: String,
     repo: String,
@@ -1006,9 +1006,62 @@ pub(super) fn admission_clean_command<W: Write>(
         );
     }
 
-    let _ledger_lock = acquire_admission_ledger_lock!(&blocker_run_ids);
-    let mut ledger = load_ledger(&ledger_path)?;
-    let pending = pending_admission_cancellations(&ledger, &canonical_repo, &base);
+    // A pending cancellation is steward-owned crash-recovery state: resuming
+    // it rewrites that record, so it needs the steward ledger lock and still
+    // defers while an apply pass holds it. Cancelling a superseded run does
+    // not: it writes no pending record, the per-run mutation guard serializes
+    // it against a steward cancelling the same run, and its only ledger write
+    // is an audit line. While a steward pass holds the lock (minutes), that
+    // audit line goes to an admission-owned sidecar instead of waiting, because
+    // the steward rewrites its whole in-memory ledger on save and would drop a
+    // line written into the shared file underneath it.
+    let ledger_lock = if observed_pending.is_empty() {
+        match try_acquire_ledger_lock(&ledger_path) {
+            Ok(lock) => lock,
+            Err(error) => return_verdict!(
+                Error,
+                "mutation_failed",
+                &canonical_repo,
+                &blocker_run_ids,
+                Some(error.message())
+            ),
+        }
+    } else {
+        Some(acquire_admission_ledger_lock!(&blocker_run_ids))
+    };
+    let audit_path = if ledger_lock.is_some() {
+        ledger_path.clone()
+    } else {
+        admission_audit_path(&ledger_path)
+    };
+    let (mut ledger, pending) = if ledger_lock.is_some() {
+        let ledger = load_ledger(&ledger_path)?;
+        let pending = pending_admission_cancellations(&ledger, &canonical_repo, &base);
+        (ledger, pending)
+    } else {
+        // A pending cancellation the running steward published since the
+        // first snapshot is still a queue hold the steward will resume.
+        let snapshot = load_ledger(&ledger_path)?;
+        let late_pending = pending_admission_cancellations(&snapshot, &canonical_repo, &base);
+        if !late_pending.is_empty() {
+            let blockers = admission_blocker_run_ids(&candidates, &blocking_only, &late_pending);
+            return_verdict!(
+                Defer,
+                "stewardship_in_progress",
+                &canonical_repo,
+                &blockers,
+                Some("another steward apply pass is already running")
+            );
+        }
+        (StewardLedger::default(), Vec::new())
+    };
+    let persist = |ledger: &StewardLedger| {
+        if ledger_lock.is_some() {
+            save_ledger(&ledger_path, ledger)
+        } else {
+            append_admission_audit(&audit_path, ledger)
+        }
+    };
     blocker_run_ids = admission_blocker_run_ids(&candidates, &blocking_only, &pending);
     // Reobserve all pre-lock blockers before deciding whether to admit or defer.
     let mutation_control = MutationControl {
@@ -1082,12 +1135,24 @@ pub(super) fn admission_clean_command<W: Write>(
             MANAGED_LABEL,
             HANDOFF_CONTEXT,
             &default_provenance_blocking_labels(),
-            &ledger_path,
+            &audit_path,
             &mut ledger,
             &mutation_control,
         );
         if let Some(error) = error {
-            let _ = save_ledger(&ledger_path, &ledger);
+            let _ = persist(&ledger);
+            // The merge-queue control lock is taken without blocking, and a
+            // steward or another admission lane holds it for one GitHub call.
+            // That is a transient queue hold, not an operational failure.
+            if merge_queue_lock_contended(&error) {
+                return_verdict!(
+                    Defer,
+                    "mutation_in_progress",
+                    &canonical_repo,
+                    &blocker_run_ids,
+                    Some(&error)
+                );
+            }
             return_verdict!(
                 Error,
                 "mutation_failed",
@@ -1097,7 +1162,7 @@ pub(super) fn admission_clean_command<W: Write>(
             );
         }
     }
-    save_ledger(&ledger_path, &ledger)?;
+    persist(&ledger)?;
     let (remaining, remaining_blocking) =
         match observe_admission_candidates(actions, &canonical_repo, &base, &labels, true) {
             Ok((_, candidates, blocking)) => (candidates, blocking),
@@ -1621,6 +1686,50 @@ fn persist_final_ledger(
             rate_limit_deferred: None,
         });
     }
+}
+
+/// Whether `error` is another Shipyard process holding the merge-queue
+/// mutation control lock or authority, which the guard takes without waiting.
+fn merge_queue_lock_contended(error: &str) -> bool {
+    error.contains("another Shipyard process is performing a merge-queue mutation")
+        || error.contains("another Shipyard process owns merge-queue mutation authority")
+}
+
+/// The admission-owned audit file beside the steward ledger. Admission writes
+/// here only while a steward apply pass holds the steward ledger lock.
+fn admission_audit_path(ledger_path: &Path) -> PathBuf {
+    ledger_path.with_file_name("merge-steward-admission-audit.json")
+}
+
+/// How long admission waits for another admission to finish appending to the
+/// audit sidecar. Each holder only reads, appends and renames one small file.
+const ADMISSION_AUDIT_LOCK_WAIT: Duration = Duration::from_secs(5);
+
+/// Append `ledger`'s audit lines to the admission audit sidecar under its own
+/// lock, which no steward pass ever holds.
+fn append_admission_audit(path: &Path, ledger: &StewardLedger) -> Result<(), CliFailure> {
+    if ledger.audit.is_empty() {
+        return Ok(());
+    }
+    let deadline = Instant::now() + ADMISSION_AUDIT_LOCK_WAIT;
+    let _lock = loop {
+        if let Some(lock) = try_acquire_ledger_lock(path)? {
+            break lock;
+        }
+        if Instant::now() >= deadline {
+            return Err(CliFailure::new(
+                1,
+                format!("could not lock admission audit {}", path.display()),
+            ));
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    let mut sidecar = load_ledger(path)?;
+    sidecar.audit.extend(ledger.audit.iter().cloned());
+    if sidecar.audit.len() > 1_000 {
+        sidecar.audit.drain(..sidecar.audit.len() - 1_000);
+    }
+    save_ledger(path, &sidecar)
 }
 
 fn try_acquire_ledger_lock(

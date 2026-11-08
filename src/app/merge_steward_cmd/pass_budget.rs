@@ -190,19 +190,32 @@ pub(super) fn is_deferred(report: &PrReport) -> bool {
 
 /// The order a pass evaluates `prs` in, as indexes into `prs`: queued or
 /// armed rows first (the unapproved-admission sweep), then admission
-/// candidates, then rows the previous pass deferred, then the rest; census order
-/// within each group. A row deferred once is therefore evaluated ahead of
-/// rows that were not, so the same tail is not starved pass after pass.
+/// candidates (rows the steward can enqueue or rerun), then signaling-only
+/// work. Within the last two groups, rows the previous pass deferred go
+/// first, oldest deferral first (the order `record_deferred` persisted), and
+/// census order breaks the remaining ties.
+///
+/// The carry order matters as much as the carry itself. Census order is
+/// newest first, so ordering carried rows by census index alone took the same
+/// newest few every pass; the rows that pass did evaluate then rejoined the
+/// carried set as newly deferred and were again the newest, so the oldest
+/// tail was deferred forever.
 pub(super) fn processing_order(
     repo: &str,
     prs: &[ObservedPr],
     decisions: &[StewardDecision],
     ledger: &StewardLedger,
 ) -> Vec<usize> {
-    let carried: BTreeSet<u64> = ledger
+    let carried: BTreeMap<u64, usize> = ledger
         .pass_budget_deferred
         .get(&ledger_key(repo))
-        .map(|numbers| numbers.iter().copied().collect())
+        .map(|numbers| {
+            numbers
+                .iter()
+                .enumerate()
+                .map(|(rank, number)| (*number, rank))
+                .collect()
+        })
         .unwrap_or_default();
     let mut order: Vec<usize> = (0..prs.len()).collect();
     order.sort_by_key(|&index| {
@@ -213,28 +226,48 @@ pub(super) fn processing_order(
             // leave such an entry free to merge.
             _ if pr.fact.queue_position.is_some() || pr.fact.auto_merge_active => 0,
             Some(StewardDecision::ArmMergeQueue | StewardDecision::RerunTransient { .. }) => 1,
-            _ if carried.contains(&pr.fact.number) => 2,
-            _ => 3,
+            _ => 2,
         };
-        (group, index)
+        let carry_rank = carried.get(&pr.fact.number).copied().unwrap_or(usize::MAX);
+        (group, carry_rank, index)
     });
     order
 }
 
-/// Remember which rows this pass deferred, for the next pass's order.
+/// Remember which rows this pass deferred, in the order the next pass should
+/// take them: rows the previous pass had already deferred keep their place at
+/// the front, and rows deferred for the first time follow in census order. A
+/// row evaluated this pass and deferred next pass therefore goes to the back,
+/// so every deferred row reaches the front within a bounded number of passes.
 pub(super) fn record_deferred(ledger: &mut StewardLedger, repo: &str, reports: &[PrReport]) {
-    let deferred: Vec<u64> = reports
+    let deferred: BTreeSet<u64> = reports
         .iter()
         .filter(|report| is_deferred(report))
         .map(|report| report.number)
         .collect();
     if deferred.is_empty() {
         ledger.pass_budget_deferred.remove(&ledger_key(repo));
-    } else {
-        ledger
-            .pass_budget_deferred
-            .insert(ledger_key(repo), deferred);
+        return;
     }
+    let previous = ledger
+        .pass_budget_deferred
+        .get(&ledger_key(repo))
+        .cloned()
+        .unwrap_or_default();
+    let mut ordered: Vec<u64> = previous
+        .iter()
+        .copied()
+        .filter(|number| deferred.contains(number))
+        .collect();
+    let mut seen: BTreeSet<u64> = ordered.iter().copied().collect();
+    for report in reports {
+        if deferred.contains(&report.number) && seen.insert(report.number) {
+            ordered.push(report.number);
+        }
+    }
+    ledger
+        .pass_budget_deferred
+        .insert(ledger_key(repo), ordered);
 }
 
 fn ledger_key(repo: &str) -> String {
@@ -248,7 +281,8 @@ mod tests {
     use super::super::{StewardDecision, StewardLedger, parse_pr};
     use super::{
         RATE_LIMIT_COOLDOWN_FLOOR_SECONDS, RateLimitCooldown, active_rate_limit_cooldown,
-        is_rate_limited, processing_order, rate_limit_cooldown_key, rate_limit_cooldown_until,
+        deferred_report, is_rate_limited, processing_order, rate_limit_cooldown_key,
+        rate_limit_cooldown_until, record_deferred,
     };
 
     fn pr(number: u64, positions: &BTreeMap<u64, u64>) -> super::ObservedPr {
@@ -293,6 +327,89 @@ mod tests {
             .map(|index| prs[index].fact.number)
             .collect();
         assert_eq!(order, vec![4, 3, 5, 1, 2]);
+    }
+
+    /// Run steward passes over `prs` (census order) that each evaluate only
+    /// `per_pass` rows, returning the numbers each pass evaluated.
+    fn budgeted_passes(
+        prs: &[super::ObservedPr],
+        decisions: &[StewardDecision],
+        per_pass: usize,
+        passes: usize,
+    ) -> Vec<Vec<u64>> {
+        let mut ledger = StewardLedger::default();
+        let mut evaluated = Vec::new();
+        for _ in 0..passes {
+            let order = processing_order("Owner/Repo", prs, decisions, &ledger);
+            let taken: Vec<usize> = order.iter().copied().take(per_pass).collect();
+            let reports: Vec<_> = (0..prs.len())
+                .map(|index| {
+                    let mut report =
+                        deferred_report(&prs[index], decisions[index].clone(), "spent");
+                    if taken.contains(&index) {
+                        report.mutation = None;
+                    }
+                    report
+                })
+                .collect();
+            record_deferred(&mut ledger, "Owner/Repo", &reports);
+            evaluated.push(taken.iter().map(|&index| prs[index].fact.number).collect());
+        }
+        evaluated
+    }
+
+    /// A budget that covers only part of the backlog must still reach every
+    /// row: the rows the last pass deferred go first, oldest deferral first,
+    /// rather than the newest rows of the census every pass.
+    #[test]
+    fn deferred_rows_are_taken_first_oldest_deferral_first() {
+        let positions = BTreeMap::new();
+        // Census order is newest first.
+        let prs: Vec<_> = [16, 15, 14, 13, 12, 11]
+            .iter()
+            .map(|n| pr(*n, &positions))
+            .collect();
+        let decisions = vec![StewardDecision::Unmanaged; prs.len()];
+        let evaluated = budgeted_passes(&prs, &decisions, 2, 3);
+        assert_eq!(evaluated[0], vec![16, 15]);
+        assert_eq!(
+            evaluated[1],
+            vec![14, 13],
+            "the next pass takes the deferred rows first"
+        );
+        assert_eq!(
+            evaluated[2],
+            vec![12, 11],
+            "rows deferred longest go ahead of rows evaluated a pass ago"
+        );
+    }
+
+    /// Enqueueable rows are evaluated before signaling-only rows, and a
+    /// deferred enqueueable row goes ahead of a fresh one.
+    #[test]
+    fn enqueueable_rows_go_before_signaling_rows_and_carried_before_fresh() {
+        let positions = BTreeMap::new();
+        let prs: Vec<_> = [6, 5, 4, 3, 2, 1]
+            .iter()
+            .map(|n| pr(*n, &positions))
+            .collect();
+        let decisions = vec![
+            StewardDecision::Unmanaged,
+            StewardDecision::ArmMergeQueue,
+            StewardDecision::Unmanaged,
+            StewardDecision::ArmMergeQueue,
+            StewardDecision::Unmanaged,
+            StewardDecision::ArmMergeQueue,
+        ];
+        let mut ledger = StewardLedger::default();
+        ledger
+            .pass_budget_deferred
+            .insert("owner/repo".to_owned(), vec![2, 1, 4]);
+        let order: Vec<u64> = processing_order("Owner/Repo", &prs, &decisions, &ledger)
+            .into_iter()
+            .map(|index| prs[index].fact.number)
+            .collect();
+        assert_eq!(order, vec![1, 5, 3, 2, 4, 6]);
     }
 
     #[test]
