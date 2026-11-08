@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::config::LoadedConfig;
 use crate::identity::RuntimeMode;
@@ -227,6 +228,27 @@ impl GhClient {
             return None;
         }
         self.clone().with_repo_override(slug).ok()
+    }
+
+    /// Return a stable, non-secret identity for the credential scope used by
+    /// a repository read.  Steward rate-limit cooldowns are keyed by this
+    /// value plus the repository, so one App/token cannot pause an unrelated
+    /// installation.  The token itself is never written to the ledger.
+    pub(crate) fn rate_limit_scope_key(&self, repo: &str) -> String {
+        let repo = repo.to_ascii_lowercase();
+        let identity = match &self.auth.source {
+            GhAuthSource::GhCli => env::var("GH_TOKEN")
+                .or_else(|_| env::var("GITHUB_TOKEN"))
+                .map_or_else(|_| "gh-cli".to_owned(), |token| format!("token:{token}")),
+            GhAuthSource::Env { token_env } => env::var(token_env).map_or_else(
+                |_| format!("env:{token_env}"),
+                |token| format!("token:{token}"),
+            ),
+            GhAuthSource::Command { token_command, .. } => {
+                format!("command:{}:{repo}", token_command.join("\u{1f}"))
+            }
+        };
+        format!("{:x}", Sha256::digest(identity.as_bytes()))
     }
 
     /// Force token-command repository placeholders to use an explicit target.

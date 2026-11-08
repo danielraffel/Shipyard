@@ -457,6 +457,16 @@ impl GitHubActions {
         self
     }
 
+    /// Stable, non-secret identity for the credential scope used by a repo.
+    /// The steward uses this to keep one installation's rate-limit cooldown
+    /// from suppressing another installation's observations.
+    pub(crate) fn rate_limit_scope_key(&self, repo: &str) -> String {
+        self.gh.as_ref().map_or_else(
+            |_| format!("auth-unavailable:{repo}"),
+            |client| client.rate_limit_scope_key(repo),
+        )
+    }
+
     /// Dispatch a workflow with optional repository and input fields.
     pub fn workflow_dispatch(
         &self,

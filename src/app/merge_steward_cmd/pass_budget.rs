@@ -12,6 +12,7 @@
 //! armed, enqueued or dequeued, and the native-arm backstop skips it, so
 //! nothing reaches the base without the full per-PR evaluation.
 
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::time::Instant;
 
@@ -21,6 +22,88 @@ use super::{ObservedPr, PrReport, StewardDecision, StewardLedger};
 
 /// The `mutation` and `blocked_on` token of a deferred row.
 pub(super) const DEFERRED: &str = "deferred_pass_budget";
+/// Do not immediately retry a token that GitHub just rejected.  The floor is
+/// deliberately short enough for a secondary limit while preventing a tight
+/// scheduled-steward loop when the provider omits reset metadata.
+pub(super) const RATE_LIMIT_COOLDOWN_FLOOR_SECONDS: i64 = 30;
+const RATE_LIMIT_COOLDOWN_DEFAULT_SECONDS: i64 = 300;
+const RATE_LIMIT_COOLDOWN_MAX_SECONDS: i64 = 24 * 60 * 60;
+
+/// Durable repository-scoped rate-limit deferral.  `scope_key` is a hash of
+/// the effective installation/token identity and never contains credential
+/// material; the repository is included in the map key as a second fence.
+#[derive(Clone, Debug, Default, serde::Deserialize, Eq, PartialEq, serde::Serialize)]
+pub(super) struct RateLimitCooldown {
+    pub(super) repo: String,
+    pub(super) scope_key: String,
+    pub(super) until_epoch: i64,
+    pub(super) observed_at_epoch: i64,
+    pub(super) detail: String,
+}
+
+pub(super) fn rate_limit_cooldown_key(scope_key: &str, repo: &str) -> String {
+    format!("{scope_key}:{}", repo.to_ascii_lowercase())
+}
+
+/// Return an active cooldown, if any.  Expired entries are left for the
+/// caller to remove and persist so expiry itself is durable.
+pub(super) fn active_rate_limit_cooldown<'a>(
+    cooldowns: &'a BTreeMap<String, RateLimitCooldown>,
+    key: &str,
+    now_epoch: i64,
+) -> Option<&'a RateLimitCooldown> {
+    cooldowns
+        .get(key)
+        .filter(|cooldown| cooldown.until_epoch > now_epoch)
+}
+
+/// Compute the next permitted probe time from provider metadata.  GitHub's
+/// CLI normally preserves the 403 text but not response headers; test/fleet
+/// wrappers may include `Retry-After` or `X-RateLimit-Reset`, both of which
+/// are accepted here.  Malformed or absent metadata falls back to a bounded
+/// five-minute pause, and every value honours the anti-tight-loop floor.
+pub(super) fn rate_limit_cooldown_until(error: &str, now_epoch: i64) -> i64 {
+    let retry_after = header_number(error, &["retry-after"]);
+    let reset_epoch = header_number(
+        error,
+        &[
+            "x-ratelimit-reset",
+            "x-rate-limit-reset",
+            "rate_limit_reset",
+            "reset_at_epoch",
+        ],
+    );
+    let seconds = retry_after.or_else(|| reset_epoch.map(|reset| reset.saturating_sub(now_epoch)));
+    now_epoch.saturating_add(
+        seconds
+            .unwrap_or(RATE_LIMIT_COOLDOWN_DEFAULT_SECONDS)
+            .clamp(
+                RATE_LIMIT_COOLDOWN_FLOOR_SECONDS,
+                RATE_LIMIT_COOLDOWN_MAX_SECONDS,
+            ),
+    )
+}
+
+fn header_number(message: &str, names: &[&str]) -> Option<i64> {
+    let lower = message.to_ascii_lowercase();
+    for name in names {
+        let mut offset = 0;
+        while let Some(found) = lower[offset..].find(name) {
+            let start = offset + found + name.len();
+            let tail = message.get(start..)?;
+            let digits = tail
+                .chars()
+                .skip_while(|character| !character.is_ascii_digit())
+                .take_while(char::is_ascii_digit)
+                .collect::<String>();
+            if let Ok(value) = digits.parse::<i64>() {
+                return Some(value);
+            }
+            offset = start;
+        }
+    }
+    None
+}
 
 /// Whether the pass may still start per-PR work.
 pub(super) struct PassBudget {
@@ -163,7 +246,10 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::super::{StewardDecision, StewardLedger, parse_pr};
-    use super::{is_rate_limited, processing_order};
+    use super::{
+        RATE_LIMIT_COOLDOWN_FLOOR_SECONDS, RateLimitCooldown, active_rate_limit_cooldown,
+        is_rate_limited, processing_order, rate_limit_cooldown_key, rate_limit_cooldown_until,
+    };
 
     fn pr(number: u64, positions: &BTreeMap<u64, u64>) -> super::ObservedPr {
         parse_pr(
@@ -233,5 +319,48 @@ mod tests {
         ] {
             assert!(!is_rate_limited(message), "{message}");
         }
+    }
+
+    #[test]
+    fn rate_limit_403_honours_retry_after_and_reset_floor() {
+        let now = 1_700_000_000;
+        assert_eq!(
+            rate_limit_cooldown_until(
+                "gh: API rate limit exceeded (HTTP 403) Retry-After: 90",
+                now
+            ),
+            now + 90
+        );
+        assert_eq!(
+            rate_limit_cooldown_until(
+                "gh: API rate limit exceeded (HTTP 403) X-RateLimit-Reset: 1700000120",
+                now
+            ),
+            now + 120
+        );
+        assert_eq!(
+            rate_limit_cooldown_until(
+                "gh: API rate limit exceeded for installation ID 7 (HTTP 403) Retry-After: 0",
+                now
+            ),
+            now + RATE_LIMIT_COOLDOWN_FLOOR_SECONDS
+        );
+    }
+
+    #[test]
+    fn expired_rate_limit_cooldown_is_probeable_again() {
+        let key = rate_limit_cooldown_key("installation-7", "Owner/Repo");
+        let cooldowns = BTreeMap::from([(
+            key.clone(),
+            RateLimitCooldown {
+                repo: "Owner/Repo".to_owned(),
+                scope_key: "installation-7".to_owned(),
+                until_epoch: 1_700_000_010,
+                observed_at_epoch: 1_700_000_000,
+                detail: "HTTP 403 rate limit".to_owned(),
+            },
+        )]);
+        assert!(active_rate_limit_cooldown(&cooldowns, &key, 1_700_000_009).is_some());
+        assert!(active_rate_limit_cooldown(&cooldowns, &key, 1_700_000_010).is_none());
     }
 }
