@@ -153,6 +153,10 @@ struct RepoReport {
     /// left uncertain with the reason ([`mutation_outcome::reconcile`]).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     uncertain_mutations: Vec<crate::merge_queue_control::UncertainReconciliation>,
+    /// What this repository's pass asked GitHub, by call site
+    /// ([`crate::gh_pass`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    api_calls: Option<crate::gh_pass::GhPassReport>,
     /// Durable provider cooldown that deferred this repository's observation.
     #[serde(skip_serializing_if = "Option::is_none")]
     rate_limit_deferred: Option<pass_budget::RateLimitCooldown>,
@@ -1280,6 +1284,23 @@ pub(super) fn steward_command<W: Write>(
     })
 }
 
+/// `actions` for one repository's pass: scoped to `repo` for the token
+/// helper (a scheduled pass runs outside any checkout, and one checkout's
+/// remote must never mint the token for another repository), counting its
+/// GitHub reads and reusing the base-policy and content-addressed answers it
+/// may cache ([`crate::gh_pass`]).
+fn repo_pass_actions(
+    actions: &GitHubActions,
+    repo: &str,
+) -> (GitHubActions, std::sync::Arc<crate::gh_pass::GhPass>) {
+    let pass = std::sync::Arc::new(crate::gh_pass::GhPass::caching());
+    let scoped = actions
+        .clone()
+        .with_repo_override(repo)
+        .with_pass(std::sync::Arc::clone(&pass));
+    (scoped, pass)
+}
+
 /// Close the members of rollups that landed on `base` lately, however they
 /// landed ([`crate::rollup::reconcile_if_enabled`]); nothing on a base that
 /// does not take rollups.
@@ -1312,8 +1333,37 @@ fn steward_repo(
     // Scope the token helper to this exact repository: a scheduled pass
     // runs from a directory that is not a checkout, and one checkout's
     // remote must never mint the token for another repository.
-    let scoped_actions = actions.clone().with_repo_override(repo);
+    let (scoped_actions, pass) = repo_pass_actions(actions, repo);
     let actions = &scoped_actions;
+    let (mut report, unhealthy) = steward_repo_observed(
+        actions,
+        pass_args,
+        repo,
+        ledger_path,
+        ledger,
+        remaining_preemptions,
+        mutation_control,
+        recovery_errors,
+        recovery_cancellations,
+    );
+    report.api_calls = Some(pass.report());
+    (report, unhealthy)
+}
+
+/// [`steward_repo`] once `actions` is scoped to `repo` and counting its
+/// GitHub reads.
+#[allow(clippy::too_many_arguments)]
+fn steward_repo_observed(
+    actions: &GitHubActions,
+    pass_args: &StewardCommandArgs,
+    repo: &str,
+    ledger_path: &Path,
+    ledger: &mut StewardLedger,
+    remaining_preemptions: &mut usize,
+    mutation_control: Option<&MutationControl>,
+    recovery_errors: &mut BTreeMap<String, Vec<String>>,
+    recovery_cancellations: &mut BTreeMap<String, Vec<CancellationReport>>,
+) -> (RepoReport, bool) {
     let mut repo_args = pass_args.clone();
     if let Some(budget) = pass_args.pass_budget {
         repo_args.pass_deadline = Some(Instant::now() + budget);
@@ -1429,6 +1479,7 @@ fn deferred_rate_limit_repo_report(
         stale_pr_run_wedge: stale_pr_wedge::repo_status(None, Vec::new(), ledger, repo),
         native_auto_merge_backstop: native_arm::NativeArmRepoStatus::default(),
         errors: Vec::new(),
+        api_calls: None,
         rate_limit_deferred: Some(cooldown),
     }
 }
@@ -1442,6 +1493,7 @@ fn unreadable_repo_report(
     RepoReport {
         rollup_reconciliation: Vec::new(),
         uncertain_mutations: Vec::new(),
+        api_calls: None,
         repo: repo.to_owned(),
         base: base.to_owned(),
         allow_auto_merge: false,
@@ -1517,6 +1569,7 @@ fn append_unmatched_recovery_errors(
         reports.push(RepoReport {
             rollup_reconciliation: Vec::new(),
             uncertain_mutations: Vec::new(),
+            api_calls: None,
             repo: repo.clone(),
             base,
             allow_auto_merge: false,
@@ -1552,6 +1605,7 @@ fn persist_final_ledger(
         reports.push(RepoReport {
             rollup_reconciliation: Vec::new(),
             uncertain_mutations: Vec::new(),
+            api_calls: None,
             repo: "steward".to_owned(),
             base: base.to_owned(),
             allow_auto_merge: false,

@@ -28,6 +28,28 @@ impl RecoveryStore {
         Ok(EnqueueOutcome::Created)
     }
 
+    /// The record [`Self::enqueue`] would answer `Existing` for while writing
+    /// nothing, or `None` whenever it could create, reactivate, supersede or
+    /// refuse instead. Read-only.
+    pub fn settled_existing(
+        &self,
+        request: &RecoveryRequest,
+    ) -> RecoveryResult<Option<RecoveryRecord>> {
+        validate_request(request)?;
+        let _lock = self.lock()?;
+        let Some(existing) = self.load_unlocked(&request.id)? else {
+            return Ok(None);
+        };
+        // The branches of `enqueue_existing_unlocked` that return `Existing`
+        // without saving: same identity, same config, and either an attempt
+        // already spent or any status but `Superseded`.
+        let settled = same_recovery_identity(&existing.request, request)
+            && existing.request.config_signature == request.config_signature
+            && (existing.receipt.attempt > 0
+                || existing.receipt.status != RecoveryStatus::Superseded);
+        Ok(settled.then_some(existing))
+    }
+
     fn enqueue_existing_unlocked(
         &self,
         existing: RecoveryRecord,

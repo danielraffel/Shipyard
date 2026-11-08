@@ -214,6 +214,8 @@ fn pending_cancellation_record() -> PendingCancellation {
 #[cfg(unix)]
 mod admission;
 #[cfg(unix)]
+mod api_budget;
+#[cfg(unix)]
 mod arm_guard;
 mod blocked_on;
 #[cfg(unix)]

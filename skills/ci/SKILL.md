@@ -472,6 +472,10 @@ nothing there: rejected). A typed GitHub refusal of an enqueue is recorded
 `rejected` and shows as `code_owner_review` or `enqueue_refused:<message>`,
 not `steward_error`. Before any enqueue or exact-head merge on a base whose ruleset requires a code-owner review, the steward judges the head from `CODEOWNERS` at the base and the exact-head reviews (never `reviewDecision`); a head no owner approved is reported `waiting_code_owner:<owners>`, with no mutation and one owner notice per head. See the shipyard skill's
 [merge-steward reference](../shipyard/references/merge-steward.md).
+Each repository in the steward's JSON report carries `api_calls` (REST and
+GraphQL calls, pass-cache hits, per call site): a pass that times out on a busy
+repository is diagnosed from a dry run's numbers, not by guessing. Published
+failures cost no read in later passes.
 
 ## The unattended carrier: `runner carrier`
 
