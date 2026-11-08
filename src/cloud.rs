@@ -17,6 +17,9 @@ use crate::config::LoadedConfig;
 use crate::gh::{GhAuthPolicy, GhClient, GhSupervision};
 use crate::identity::RuntimeMode;
 
+mod read_cache;
+pub(crate) use read_cache::ReadCache;
+
 const RUN_JSON_FIELDS: &str =
     "databaseId,status,conclusion,url,createdAt,updatedAt,workflowName,headBranch,headSha";
 const JOB_ACTIVE_STATUSES: [&str; 2] = ["queued", "in_progress"];
@@ -332,6 +335,9 @@ pub struct GitHubActions {
     /// needs `GH_REPO` even when the native `gh api` command has no `--repo`
     /// option.
     repo_override: Option<String>,
+    /// Admission-only reuse of argv-determined reads (see `read_cache`).
+    /// Shared across clones so every scoped copy of one client hits it.
+    read_cache: Option<std::sync::Arc<ReadCache>>,
     /// The steward pass this client counts its `gh` children for, and whose
     /// narrow read cache it consults ([`crate::gh_pass`]).
     pass: Option<std::sync::Arc<crate::gh_pass::GhPass>>,
@@ -364,6 +370,7 @@ impl GitHubActions {
             gh_binary_override: None,
             absolute_deadline: None,
             repo_override: None,
+            read_cache: None,
             pass: None,
         }
     }
@@ -380,6 +387,7 @@ impl GitHubActions {
             gh_binary_override: None,
             absolute_deadline: None,
             repo_override: None,
+            read_cache: None,
             pass: None,
         }
     }
@@ -443,6 +451,7 @@ impl GitHubActions {
             gh_binary_override: None,
             absolute_deadline: None,
             repo_override: None,
+            read_cache: None,
             pass: None,
         }
         .with_gh_binary_for_tests(gh_binary)
@@ -460,8 +469,25 @@ impl GitHubActions {
             gh: Ok(GhClient::ambient()),
             absolute_deadline: None,
             repo_override: None,
+            read_cache: None,
             pass: None,
         }
+    }
+
+    /// Answer this client's cacheable GitHub reads from `cache` when it holds
+    /// a fresh copy, and store the live answers it does make.
+    #[must_use]
+    pub(crate) fn with_read_cache(mut self, cache: Option<ReadCache>) -> Self {
+        self.read_cache = cache.map(std::sync::Arc::new);
+        self
+    }
+
+    /// Use `client` for every command this client prepares, keeping its
+    /// working directory, deadline, repository scope and read cache.
+    #[must_use]
+    pub(crate) fn with_gh_client(mut self, client: GhClient) -> Self {
+        self.gh = Ok(client);
+        self
     }
 
     pub(crate) fn with_absolute_deadline(mut self, deadline: Instant) -> Self {
@@ -1062,7 +1088,30 @@ impl GitHubActions {
         if internal {
             return self.run_gh_gated_uncached(args, env, internal);
         }
+        if env.is_empty() {
+            return self.cached_read(args, || {
+                self.through_pass_cache(args, || self.run_gh_gated_uncached(args, env, internal))
+            });
+        }
         self.through_pass_cache(args, || self.run_gh_gated_uncached(args, env, internal))
+    }
+
+    /// Serve `args` from the admission read cache when it is cacheable and
+    /// fresh; otherwise run `live` and remember a successful answer.
+    fn cached_read(
+        &self,
+        args: &[String],
+        live: impl FnOnce() -> Result<String, GitHubError>,
+    ) -> Result<String, GitHubError> {
+        let Some(cache) = self.read_cache.as_deref() else {
+            return live();
+        };
+        if let Some(body) = cache.get(args) {
+            return Ok(body);
+        }
+        let body = live()?;
+        cache.put(args, &body);
+        Ok(body)
     }
 
     /// Answer a read from the pass cache when it holds one, otherwise run
@@ -1177,17 +1226,19 @@ impl GitHubActions {
                 "bounded gh output limits must be positive".to_owned(),
             ));
         }
-        let output = self.run_gh_with_timeout_output_limits(
-            args,
-            timeout,
-            Some((max_stdout_bytes, max_stderr_bytes)),
-            &[],
-            false,
-        )?;
-        if !output.success() {
-            return Err(output.command_error(args));
-        }
-        Ok(String::from_utf8_lossy(output.stdout()).to_string())
+        self.cached_read(args, || {
+            let output = self.run_gh_with_timeout_output_limits(
+                args,
+                timeout,
+                Some((max_stdout_bytes, max_stderr_bytes)),
+                &[],
+                false,
+            )?;
+            if !output.success() {
+                return Err(output.command_error(args));
+            }
+            Ok(String::from_utf8_lossy(output.stdout()).to_string())
+        })
     }
 
     fn run_gh_with_timeout_output_limits(

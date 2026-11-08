@@ -181,6 +181,14 @@ impl GhClient {
         Ok(Self::new(auth))
     }
 
+    /// The client for `[github.admission_auth]`, or `None` when the machine
+    /// configures no dedicated admission credential.
+    pub(crate) fn admission_from_loaded_config(
+        config: &LoadedConfig,
+    ) -> Result<Option<Self>, GhConfigError> {
+        Ok(GhAuthConfig::admission_from_loaded_config(config)?.map(Self::new))
+    }
+
     /// The executables this client's auth config would run itself: the
     /// token helper's program and any configured `gh` or `git` binary.
     #[cfg(all(test, unix))]

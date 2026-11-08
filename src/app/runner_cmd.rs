@@ -40,6 +40,10 @@ use watch::dispatch_watch;
 use watch::{fleet_liveness_due, resolve_reaper_thresholds, watch_exit_code};
 
 const QUEUED_RUNS_LIMIT: u32 = 100;
+/// Bound the dedicated admission credential helper before observation starts.
+/// A wedged helper must fall back to the shared credential instead of blocking
+/// the admission command before its observation deadline is established.
+const ADMISSION_AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 /// Cap on the number of paginated `gh api` calls per reaper tick, per status.
 /// Each page is 100 items, so the worst case is 500 `in_progress` + 500
 /// `queued` runs scanned — far beyond any healthy repo. The paginated listers
@@ -49,6 +53,55 @@ const REAP_RUNS_MAX_PAGES: u32 = 5;
 
 fn actions_for_explicit_repo(actions: &GitHubActions, repo: &str) -> GitHubActions {
     actions.clone().with_repo_override(repo)
+}
+
+/// The client JIT admission makes its read-only observations with.
+///
+/// Admission runs before every VM a `TartCI` lane mints, so it must not share a
+/// rate-limit budget with agents, reviewers and steward passes. When the
+/// machine-global config names `[github.admission_auth]` and that credential
+/// mints a token for `repo`, reads use it; otherwise (absent table, bad
+/// table, missing key, App not installed) they fall back to `actions`, which
+/// is today's `[github.auth]` path. Either way the reads go through the
+/// short-lived admission read cache. Mutations never use this client.
+fn admission_read_actions(
+    actions: &GitHubActions,
+    config: &LoadedConfig,
+    cwd: &Path,
+    repo: &str,
+    state_dir: &Path,
+) -> GitHubActions {
+    let reads = match admission_client(config, cwd, repo) {
+        Ok(Some(client)) => actions.clone().with_gh_client(client),
+        Ok(None) => actions.clone(),
+        Err(detail) => {
+            eprintln!("shipyard: github.admission_auth {detail}; admission reads use github.auth");
+            actions.clone()
+        }
+    };
+    reads.with_read_cache(crate::cloud::ReadCache::for_admission(state_dir))
+}
+
+fn admission_client(
+    config: &LoadedConfig,
+    cwd: &Path,
+    repo: &str,
+) -> Result<Option<crate::gh::GhClient>, String> {
+    let Some(client) = crate::gh::GhClient::admission_from_loaded_config(config)
+        .map_err(|error| format!("is invalid ({error})"))?
+    else {
+        return Ok(None);
+    };
+    let mut client = client
+        .with_repo_override(repo)
+        .map_err(|error| format!("cannot scope to {repo} ({error})"))?;
+    // Resolve once up front: a credential that cannot mint must not turn every
+    // admission read into an error. The token lands in the shared in-process
+    // cache, so the reads that follow reuse it instead of re-running the helper.
+    client
+        .pin_command_auth_with_timeout(cwd, ADMISSION_AUTH_TIMEOUT)
+        .map_err(|error| format!("could not mint a token ({error})"))?;
+    Ok(Some(client))
 }
 
 /// Entry point dispatched from `src/app.rs`.
@@ -335,7 +388,9 @@ fn runner_command_with_actions<W: Write>(
             // so configured token helpers can expand `{repo_slug}` from the
             // command target instead of trying to discover a Git remote.
             let actions = actions_for_explicit_repo(actions, &repo);
-            super::merge_steward_cmd::admission_clean_command(
+            let read_actions =
+                admission_read_actions(&actions, config, cwd, &repo, &runtime_paths.state_dir);
+            super::merge_steward_cmd::admission_clean_command_with_reads(
                 &super::merge_steward_cmd::AdmissionCleanArgs {
                     repo,
                     base,
@@ -346,6 +401,7 @@ fn runner_command_with_actions<W: Write>(
                 mode,
                 runtime_paths,
                 &actions,
+                &read_actions,
                 json,
                 stdout,
             )

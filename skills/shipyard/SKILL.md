@@ -2460,6 +2460,19 @@ Because TartCI invokes `shipyard` by name from `PATH`, a gate fix ships by
 replacing that binary. No TartCI generation, supervisor restart or `pool off` is
 involved — each admission call is a fresh process.
 
+- **Its REST cost lands on the installation everyone else spends.** A clean
+  `--apply` verdict reads each managed head's check runs and statuses once for
+  the observation, once for its fence, and again for the revalidation and its
+  fence. On Pulp with 14 managed heads that was 125 REST reads per verdict,
+  twice per VM, on the same installation the steward, reviewers and agents
+  use, so a busy hour starved the gate (`API rate limit exceeded for
+  installation`). Admission reuses argv-determined reads for three minutes
+  (`SHIPYARD_ADMISSION_READ_CACHE_SECS`, `0` disables) and, when the machine
+  config names `[github.admission_auth]`, reads with that credential instead
+  (see `docs/github-app-quota.md`). Do not "fix" this by putting
+  `statusCheckRollup` back on the census: that is the backlog-scaled snapshot
+  above.
+
 ## Runner Watchdog (self-hosted runner recovery)
 
 Shipyard ships a `runner` subcommand family for detecting and recovering from

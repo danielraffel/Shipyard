@@ -839,13 +839,40 @@ fn admission_blocker_run_ids(
     run_ids
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[cfg(test)]
 pub(super) fn admission_clean_command<W: Write>(
     args: &AdmissionCleanArgs,
     cwd: &Path,
     mode: RuntimeMode,
     runtime_paths: &RuntimePaths,
     actions: &GitHubActions,
+    json_output: bool,
+    stdout: &mut W,
+) -> Result<ExitCode, CliFailure> {
+    admission_clean_command_with_reads(
+        args,
+        cwd,
+        mode,
+        runtime_paths,
+        actions,
+        actions,
+        json_output,
+        stdout,
+    )
+}
+
+/// `runner admission-clean`. `read_actions` makes every census, including
+/// the ones around a cancellation, so they spend a dedicated admission budget
+/// and reuse recent per-head reads; `actions` performs the cancellation and
+/// its recovery.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub(super) fn admission_clean_command_with_reads<W: Write>(
+    args: &AdmissionCleanArgs,
+    cwd: &Path,
+    mode: RuntimeMode,
+    runtime_paths: &RuntimePaths,
+    actions: &GitHubActions,
+    read_actions: &GitHubActions,
     json_output: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
@@ -875,12 +902,13 @@ pub(super) fn admission_clean_command<W: Write>(
         Ok(None) => return_verdict!(Defer, "observation_in_progress", &repo, &[], None),
         Err(error) => return_verdict!(Error, "observation_failed", &repo, &[], Some(&error)),
     };
-    let admission_actions = actions
-        .clone()
-        .with_absolute_deadline(Instant::now() + ADMISSION_OBSERVATION_TIMEOUT);
+    let deadline = Instant::now() + ADMISSION_OBSERVATION_TIMEOUT;
+    let admission_actions = actions.clone().with_absolute_deadline(deadline);
     let actions = &admission_actions;
+    let admission_read_actions = read_actions.clone().with_absolute_deadline(deadline);
+    let read_actions = &admission_read_actions;
     let (mut observation, mut candidates, mut blocking_only) =
-        match observe_admission_candidates(actions, &repo, &base, &labels, args.apply) {
+        match observe_admission_candidates(read_actions, &repo, &base, &labels, args.apply) {
             Ok(observation) => observation,
             Err(error) => return_verdict!(Error, "observation_failed", &repo, &[], Some(&error)),
         };
@@ -960,7 +988,7 @@ pub(super) fn admission_clean_command<W: Write>(
             );
         }
         let (final_candidates, final_blocking) =
-            match revalidate_active_admission_candidates(actions, &observation, &labels) {
+            match revalidate_active_admission_candidates(read_actions, &observation, &labels) {
                 Ok(candidates) => candidates,
                 Err(error) => return_verdict!(
                     Error,
@@ -1096,7 +1124,11 @@ pub(super) fn admission_clean_command<W: Write>(
             );
         }
     }
-    match observe_admission_candidates(actions, &canonical_repo, &base, &labels, true) {
+    // The pre-cancel and post-cancel censuses are reads, so they spend the
+    // admission credential and reuse its per-head cache. A cached head can
+    // only hide a newer handoff status, which skips a cancellation rather than
+    // adding one; `apply_run_cancellation` still acts with `[github.auth]`.
+    match observe_admission_candidates(read_actions, &canonical_repo, &base, &labels, true) {
         Ok((refreshed_observation, refreshed_candidates, refreshed_blocking)) => {
             observation = refreshed_observation;
             candidates = refreshed_candidates;
@@ -1164,7 +1196,7 @@ pub(super) fn admission_clean_command<W: Write>(
     }
     persist(&ledger)?;
     let (remaining, remaining_blocking) =
-        match observe_admission_candidates(actions, &canonical_repo, &base, &labels, true) {
+        match observe_admission_candidates(read_actions, &canonical_repo, &base, &labels, true) {
             Ok((_, candidates, blocking)) => (candidates, blocking),
             Err(error) => return_verdict!(
                 Error,
