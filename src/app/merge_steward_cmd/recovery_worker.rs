@@ -289,11 +289,30 @@ fn ensure_canonical_recovery_paths(global_dir: &Path, state_dir: &Path) -> Resul
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    static PUBLICATION_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run `body` with [`recovery_publication_is_enabled`] answering `enabled`,
+/// for tests whose temporary state directory is not the canonical one.
+#[cfg(test)]
+pub(super) fn with_recovery_publication<T>(enabled: bool, body: impl FnOnce() -> T) -> T {
+    let previous = PUBLICATION_OVERRIDE.with(|cell| cell.replace(Some(enabled)));
+    let result = body();
+    PUBLICATION_OVERRIDE.with(|cell| cell.set(previous));
+    result
+}
+
 pub(super) fn recovery_publication_is_enabled(
     global_dir: &Path,
     state_dir: &Path,
     repo: &str,
 ) -> Result<bool, CliFailure> {
+    #[cfg(test)]
+    if let Some(enabled) = PUBLICATION_OVERRIDE.with(std::cell::Cell::get) {
+        return Ok(enabled);
+    }
     ensure_canonical_recovery_paths(global_dir, state_dir)?;
     let trusted_config = LoadedConfig::load_machine_global_from_dir(global_dir.to_path_buf())
         .map_err(|error| {
@@ -334,46 +353,28 @@ pub(super) fn enqueue_recovery_request(
     failure_facts: Vec<RecoveryFailureFact>,
     policy_signature: &str,
 ) -> Result<RecoveryEnqueueDisposition, CliFailure> {
-    ensure_canonical_recovery_paths(global_dir, state_dir)?;
-    let trusted_config = LoadedConfig::load_machine_global_from_dir(global_dir.to_path_buf())
-        .map_err(|error| {
-            CliFailure::new(
-                1,
-                format!("failed to load trusted recovery-worker policy: {error}"),
-            )
-        })?;
-    let Some(policy) = enqueue_policy(&trusted_config)? else {
+    let Some((request, store)) = trusted_recovery_request(
+        global_dir,
+        state_dir,
+        &publication_lease,
+        RecoveryRequestFacts {
+            repo,
+            pr,
+            base_ref,
+            head_sha,
+            merge_queue,
+            opt_out_label,
+            failure_fingerprint,
+            failure_summary,
+            required_checks,
+            failure_facts,
+            policy_signature,
+        },
+    )?
+    else {
         return Ok(RecoveryEnqueueDisposition::Disabled);
     };
-    let config_signature = policy.signature()?;
-    let _ = policy.repo_path(repo)?;
-    let request = RecoveryRequest::new_with_steward_policy(
-        repo,
-        pr,
-        base_ref,
-        head_sha,
-        merge_queue,
-        opt_out_label,
-        failure_fingerprint,
-        failure_summary,
-        required_checks,
-        failure_facts,
-        policy_signature,
-        &config_signature,
-    )
-    .map_err(|error| CliFailure::new(1, format!("invalid recovery request: {error}")))?;
     let id = request.id.clone();
-    let store = RecoveryStore::with_max_attempts(
-        recovery_store_root(state_dir),
-        policy.max_attempts_per_head,
-    )
-    .map_err(|error| CliFailure::new(1, format!("failed to open recovery store: {error}")))?;
-    if !publication_lease.covers(store.root()) {
-        return Err(CliFailure::new(
-            1,
-            "recovery publication lease does not cover the canonical store",
-        ));
-    }
     let outcome = store.enqueue(request).map_err(|error| {
         CliFailure::new(1, format!("failed to enqueue recovery request: {error}"))
     })?;
@@ -384,13 +385,7 @@ pub(super) fn enqueue_recovery_request(
             .map_err(|error| {
                 CliFailure::new(1, format!("failed to reload recovery request: {error}"))
             })?
-            .filter(|record| {
-                matches!(
-                    record.receipt.status,
-                    crate::recovery_worker::RecoveryStatus::Pending
-                        | crate::recovery_worker::RecoveryStatus::Running
-                )
-            })
+            .filter(|record| witness_tracks(record.receipt.status))
             .map(|_| id.as_str()),
         EnqueueOutcome::HeadAlreadyTracked { .. } => None,
     };
@@ -415,6 +410,106 @@ pub(super) fn enqueue_recovery_request(
             RecoveryEnqueueDisposition::Existing(existing_id)
         }
     })
+}
+
+/// The facts one exact-head recovery request is built from.
+pub(super) struct RecoveryRequestFacts<'a> {
+    pub repo: &'a str,
+    pub pr: u64,
+    pub base_ref: &'a str,
+    pub head_sha: &'a str,
+    pub merge_queue: bool,
+    pub opt_out_label: &'a str,
+    pub failure_fingerprint: &'a str,
+    pub failure_summary: &'a str,
+    pub required_checks: Vec<RecoveryRequiredCheck>,
+    pub failure_facts: Vec<RecoveryFailureFact>,
+    pub policy_signature: &'a str,
+}
+
+/// A request in these states keeps its witness current on every publication.
+const fn witness_tracks(status: crate::recovery_worker::RecoveryStatus) -> bool {
+    matches!(
+        status,
+        crate::recovery_worker::RecoveryStatus::Pending
+            | crate::recovery_worker::RecoveryStatus::Running
+    )
+}
+
+/// The request [`enqueue_recovery_request`] builds from `facts`, and the
+/// canonical store it goes to; `None` when recovery publication is disabled.
+fn trusted_recovery_request(
+    global_dir: &Path,
+    state_dir: &Path,
+    publication_lease: &RecoveryEnqueueLease,
+    facts: RecoveryRequestFacts<'_>,
+) -> Result<Option<(RecoveryRequest, RecoveryStore)>, CliFailure> {
+    ensure_canonical_recovery_paths(global_dir, state_dir)?;
+    let trusted_config = LoadedConfig::load_machine_global_from_dir(global_dir.to_path_buf())
+        .map_err(|error| {
+            CliFailure::new(
+                1,
+                format!("failed to load trusted recovery-worker policy: {error}"),
+            )
+        })?;
+    let Some(policy) = enqueue_policy(&trusted_config)? else {
+        return Ok(None);
+    };
+    let config_signature = policy.signature()?;
+    let _ = policy.repo_path(facts.repo)?;
+    let request = RecoveryRequest::new_with_steward_policy(
+        facts.repo,
+        facts.pr,
+        facts.base_ref,
+        facts.head_sha,
+        facts.merge_queue,
+        facts.opt_out_label,
+        facts.failure_fingerprint,
+        facts.failure_summary,
+        facts.required_checks,
+        facts.failure_facts,
+        facts.policy_signature,
+        &config_signature,
+    )
+    .map_err(|error| CliFailure::new(1, format!("invalid recovery request: {error}")))?;
+    let store = RecoveryStore::with_max_attempts(
+        recovery_store_root(state_dir),
+        policy.max_attempts_per_head,
+    )
+    .map_err(|error| CliFailure::new(1, format!("failed to open recovery store: {error}")))?;
+    if !publication_lease.covers(store.root()) {
+        return Err(CliFailure::new(
+            1,
+            "recovery publication lease does not cover the canonical store",
+        ));
+    }
+    Ok(Some((request, store)))
+}
+
+/// Whether [`enqueue_recovery_request`] with `facts` would write nothing and
+/// answer `Existing`: the request is already in the store, the store would not
+/// change it, and its witness (when its state keeps one) already names it.
+/// Read-only; run it under the same publication lease the write takes. Any
+/// doubt, including a read error, is `false`, so the caller takes the full
+/// path.
+pub(super) fn recovery_request_is_settled(
+    global_dir: &Path,
+    state_dir: &Path,
+    publication_lease: &RecoveryEnqueueLease,
+    facts: RecoveryRequestFacts<'_>,
+) -> bool {
+    let Ok(Some((request, store))) =
+        trusted_recovery_request(global_dir, state_dir, publication_lease, facts)
+    else {
+        return false;
+    };
+    match store.settled_existing(&request) {
+        Ok(Some(record)) => {
+            !witness_tracks(record.receipt.status)
+                || verify_recovery_witness(state_dir, &request).is_ok()
+        }
+        _ => false,
+    }
 }
 
 mod witness;

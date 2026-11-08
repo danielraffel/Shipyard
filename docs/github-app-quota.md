@@ -557,6 +557,20 @@ The export contains the `[github.auth]` command configuration. It does not
 include GitHub tokens, token caches, private keys, Keychain items, or
 1Password sessions.
 
+## What the merge steward spends
+
+Every repository in `shipyard runner steward --json` reports `api_calls`: the
+REST and GraphQL children that pass spawned, the reads it answered from its
+pass cache, and a per-call-site breakdown. One App installation serves every
+consumer on its account (the steward, reviewers, watchers, CI helpers), so when
+an installation runs out compare the steward's per-pass total with the
+installation's hourly use before blaming the steward. On Generous-Corp/pulp on
+2026-11-08 a dry pass with 46 open pull requests spent 135 REST and 13 GraphQL
+calls. An apply pass adds a few reads per pull request it acts on; at four
+ticks an hour the steward spends well under 1,000 of the installation's 15,000
+REST calls. See the shipyard skill's merge-steward reference for
+what the steward caches and skips.
+
 ## Additional clients (the same App across several Macs)
 
 One GitHub App installation covers every machine — the private key is the App's

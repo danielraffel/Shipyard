@@ -891,6 +891,14 @@ inside it is capped per attempt and retried once on a timeout, 5xx or dropped
 connection, within the same deadline. The PR is decided again on the next
 pass; there is nothing to repair on the PR.
 
+When a steward pass is slow or times out, read its `api_calls` (per repository
+in `runner steward --json`: REST, GraphQL, cache hits and a per-call-site
+breakdown) from a dry run before changing anything. A pull request whose
+failure the steward already published costs no GitHub read in later passes;
+the pass cache reuses only base-policy and content-addressed reads, never a
+review, comment, check, status, queue or pull-request read. See the
+[merge-steward reference](references/merge-steward.md#what-a-pass-costs-github-api_calls).
+
 It judges each first-parent change since the last `Version-Bump-Applied` marker
 on its own, then takes the highest level per surface. A
 `Version-Bump: <surface>=skip` trailer therefore skips only the change that

@@ -332,6 +332,9 @@ pub struct GitHubActions {
     /// needs `GH_REPO` even when the native `gh api` command has no `--repo`
     /// option.
     repo_override: Option<String>,
+    /// The steward pass this client counts its `gh` children for, and whose
+    /// narrow read cache it consults ([`crate::gh_pass`]).
+    pass: Option<std::sync::Arc<crate::gh_pass::GhPass>>,
 }
 
 impl PartialEq for GitHubActions {
@@ -361,6 +364,7 @@ impl GitHubActions {
             gh_binary_override: None,
             absolute_deadline: None,
             repo_override: None,
+            pass: None,
         }
     }
 
@@ -376,7 +380,16 @@ impl GitHubActions {
             gh_binary_override: None,
             absolute_deadline: None,
             repo_override: None,
+            pass: None,
         }
+    }
+
+    /// Count every `gh` child against `pass`, and let it answer the reads it
+    /// may cache ([`crate::gh_pass::pass_cacheable`]).
+    #[must_use]
+    pub(crate) fn with_pass(mut self, pass: std::sync::Arc<crate::gh_pass::GhPass>) -> Self {
+        self.pass = Some(pass);
+        self
     }
 
     /// Override repository placeholders used by configured token helpers.
@@ -430,6 +443,7 @@ impl GitHubActions {
             gh_binary_override: None,
             absolute_deadline: None,
             repo_override: None,
+            pass: None,
         }
         .with_gh_binary_for_tests(gh_binary)
     }
@@ -446,6 +460,7 @@ impl GitHubActions {
             gh: Ok(GhClient::ambient()),
             absolute_deadline: None,
             repo_override: None,
+            pass: None,
         }
     }
 
@@ -1034,6 +1049,42 @@ impl GitHubActions {
         env: &[(&str, &str)],
         internal: bool,
     ) -> Result<String, GitHubError> {
+        if internal {
+            return self.run_gh_gated_uncached(args, env, internal);
+        }
+        self.through_pass_cache(args, || self.run_gh_gated_uncached(args, env, internal))
+    }
+
+    /// Answer a read from the pass cache when it holds one, otherwise run
+    /// `spawn` and keep a successful answer the pass may reuse.
+    fn through_pass_cache(
+        &self,
+        args: &[String],
+        spawn: impl FnOnce() -> Result<String, GitHubError>,
+    ) -> Result<String, GitHubError> {
+        let Some(pass) = self.pass.as_deref() else {
+            return spawn();
+        };
+        if let Some(hit) = pass.cached(args) {
+            return Ok(hit);
+        }
+        let stdout = spawn()?;
+        pass.remember(args, &stdout);
+        Ok(stdout)
+    }
+
+    fn record_pass_call(&self, args: &[String], started: Instant) {
+        if let Some(pass) = self.pass.as_deref() {
+            pass.record(args, started.elapsed());
+        }
+    }
+
+    fn run_gh_gated_uncached(
+        &self,
+        args: &[String],
+        env: &[(&str, &str)],
+        internal: bool,
+    ) -> Result<String, GitHubError> {
         if let Some(timeout) = self.remaining_deadline()? {
             let output = self.run_gh_with_timeout_output_limits(
                 args,
@@ -1050,7 +1101,10 @@ impl GitHubActions {
         let mut command = self.prepare_gh_command(args)?;
         gate_landing(&mut command, args, internal)?;
         apply_repo_environment(&mut command, env, self.repo_override.as_deref());
-        let output = command.args(args).output().map_err(|error| {
+        let started = Instant::now();
+        let output = command.args(args).output();
+        self.record_pass_call(args, started);
+        let output = output.map_err(|error| {
             GitHubError::new(format!("failed to run gh {}: {error}", args.join(" ")))
         })?;
         if !output.status.success() {
@@ -1068,11 +1122,13 @@ impl GitHubActions {
         args: &[String],
         timeout: Duration,
     ) -> Result<String, GitHubError> {
-        let output = self.run_gh_with_timeout_output(args, timeout)?;
-        if !output.success() {
-            return Err(output.command_error(args));
-        }
-        Ok(String::from_utf8_lossy(output.stdout()).to_string())
+        self.through_pass_cache(args, || {
+            let output = self.run_gh_with_timeout_output(args, timeout)?;
+            if !output.success() {
+                return Err(output.command_error(args));
+            }
+            Ok(String::from_utf8_lossy(output.stdout()).to_string())
+        })
     }
 
     /// Like [`Self::run_gh_with_timeout`] with extra environment for the child,
@@ -1125,6 +1181,21 @@ impl GitHubActions {
     }
 
     fn run_gh_with_timeout_output_limits(
+        &self,
+        args: &[String],
+        timeout: Duration,
+        output_limits: Option<(usize, usize)>,
+        env: &[(&str, &str)],
+        internal: bool,
+    ) -> Result<GitHubCommandOutput, GitHubError> {
+        let started = Instant::now();
+        let output =
+            self.spawn_gh_with_timeout_output_limits(args, timeout, output_limits, env, internal);
+        self.record_pass_call(args, started);
+        output
+    }
+
+    fn spawn_gh_with_timeout_output_limits(
         &self,
         args: &[String],
         timeout: Duration,

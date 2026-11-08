@@ -92,8 +92,50 @@ pub(super) fn persist_actionable_failure(
     pr_number: u64,
     head_sha: &str,
     owner: Option<TerminalOwnerRoute>,
-    mut failure_contexts: Vec<String>,
+    failure_contexts: Vec<String>,
 ) -> Result<(), CliFailure> {
+    persist(
+        ledger_path,
+        ledger,
+        actionable_failure_record(repo, base, pr_number, head_sha, owner, failure_contexts),
+        false,
+    )
+}
+
+/// Whether [`persist_actionable_failure`] with these arguments would leave the
+/// ledger exactly as it is. Pure: it runs the same merge on a copy and writes
+/// nothing. An `Err` is the error the real write would return.
+#[allow(clippy::too_many_arguments)] // The same exact identity the write takes.
+pub(super) fn actionable_failure_is_recorded(
+    ledger: &StewardLedger,
+    repo: &str,
+    base: &str,
+    pr_number: u64,
+    head_sha: &str,
+    owner: Option<TerminalOwnerRoute>,
+    failure_contexts: Vec<String>,
+) -> Result<bool, CliFailure> {
+    // The merge reads and writes only these two maps.
+    let mut probe = StewardLedger {
+        terminal_handoffs: ledger.terminal_handoffs.clone(),
+        resume_records: ledger.resume_records.clone(),
+        ..StewardLedger::default()
+    };
+    let incoming =
+        actionable_failure_record(repo, base, pr_number, head_sha, owner, failure_contexts);
+    let handoff_changed = persist_inner(&mut probe, incoming, false)?;
+    let resume_changed = reconcile_resume_records(&mut probe)?;
+    Ok(!handoff_changed && !resume_changed)
+}
+
+fn actionable_failure_record(
+    repo: &str,
+    base: &str,
+    pr_number: u64,
+    head_sha: &str,
+    owner: Option<TerminalOwnerRoute>,
+    mut failure_contexts: Vec<String>,
+) -> TerminalHandoff {
     failure_contexts.sort();
     failure_contexts.dedup();
     let trigger_fingerprint = failure_fingerprint(&failure_contexts);
@@ -108,36 +150,31 @@ pub(super) fn persist_actionable_failure(
     let owner_disposition = owner
         .as_ref()
         .map_or("route_registry_required", |owner| &owner.owner_disposition);
-    persist(
-        ledger_path,
-        ledger,
-        TerminalHandoff {
-            dedupe_key,
-            repo: repo.to_ascii_lowercase(),
-            base: base.to_owned(),
-            pr_number,
-            head_sha: head_sha.to_ascii_lowercase(),
-            outcome: TerminalHandoffOutcome::ActionableFailure,
-            trigger: "actionable_terminal_failure".to_owned(),
-            next_action: "wake_exact_owner_for_causal_repair".to_owned(),
-            origin_machine: owner.as_ref().map(|owner| owner.origin_machine.clone()),
-            owner_id: owner.as_ref().map(|owner| owner.owner_id.clone()),
-            ownership_generation: owner.as_ref().map(|owner| owner.ownership_generation),
-            owner_disposition: owner_disposition.to_owned(),
-            owner_route_id: owner.as_ref().and_then(|owner| owner.route_id.clone()),
-            owner_provider: owner.as_ref().and_then(|owner| owner.provider.clone()),
-            resume_transport: owner
-                .as_ref()
-                .and_then(|owner| owner.resume_transport.clone()),
-            owner_terminal_provenance: owner.and_then(|owner| owner.terminal_provenance),
-            wake_consumer_available: false,
-            failure_contexts,
-            phase: TerminalHandoffPhase::Recorded,
-            created_at: Utc::now().to_rfc3339(),
-            updated_at: Utc::now().to_rfc3339(),
-        },
-        false,
-    )
+    TerminalHandoff {
+        dedupe_key,
+        repo: repo.to_ascii_lowercase(),
+        base: base.to_owned(),
+        pr_number,
+        head_sha: head_sha.to_ascii_lowercase(),
+        outcome: TerminalHandoffOutcome::ActionableFailure,
+        trigger: "actionable_terminal_failure".to_owned(),
+        next_action: "wake_exact_owner_for_causal_repair".to_owned(),
+        origin_machine: owner.as_ref().map(|owner| owner.origin_machine.clone()),
+        owner_id: owner.as_ref().map(|owner| owner.owner_id.clone()),
+        ownership_generation: owner.as_ref().map(|owner| owner.ownership_generation),
+        owner_disposition: owner_disposition.to_owned(),
+        owner_route_id: owner.as_ref().and_then(|owner| owner.route_id.clone()),
+        owner_provider: owner.as_ref().and_then(|owner| owner.provider.clone()),
+        resume_transport: owner
+            .as_ref()
+            .and_then(|owner| owner.resume_transport.clone()),
+        owner_terminal_provenance: owner.and_then(|owner| owner.terminal_provenance),
+        wake_consumer_available: false,
+        failure_contexts,
+        phase: TerminalHandoffPhase::Recorded,
+        created_at: Utc::now().to_rfc3339(),
+        updated_at: Utc::now().to_rfc3339(),
+    }
 }
 
 pub(super) fn mark_success_continuation_applied(
