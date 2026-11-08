@@ -4396,8 +4396,13 @@ spent on a state that was never going to change.
   default). Either way the verdict is printed at open time, because the author
   needs to know that the gate fires only after a retarget **and** a push. With
   `--stacked-on <n>` the pull request is labelled `stacked:<n>` and its body
-  says it cannot be reviewed yet; the steward's carried-commit guard skips it
-  while its base is not the steward's base, and the repair and operator passes
+  says it cannot be reviewed yet. Integration bases (`[ship]
+  integration_bases`, default `develop/*` and `release/*`) pass unstacked. The
+  steward's carried-commit guard skips a stack only while its base is not the
+  steward's base, `<n>` is the open same-repo PR whose head is that base, and no
+  counting HOLD names the stack's head (a hand-added label naming another PR
+  excuses nothing; mismatches surface as `STACK-LABEL-MISMATCH`, a 404 parent
+  as `STACK-PARENT-UNREADABLE`). The repair and operator passes
   list it as `STACK-BASE-MERGED parent:#<n>` the moment `<n>` merges (no stall
   wait) to retarget onto main, merge main, push once and comment
   `retargeted: ...`. A parent closed unmerged is `STACK-PARENT-CLOSED`: never

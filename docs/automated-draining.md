@@ -165,15 +165,32 @@ never going to be reviewed. The first-parent rule ends that.)
 
 No stacking by default: `shipyard pr` refuses a base other than the
 configured one unless `--stacked-on <n>` names the open parent pull request,
-and then labels the new pull request `stacked:<n>`. The carried-commit guard
-never judges another pull request against a labelled stack whose base is still
-not the steward's base: required checks do not run on its head and the
-reviewer never reviews it, so a verdict that would release P never comes. The
-label stops counting once the stack is retargeted onto the base, so a lingering
-label exempts nothing. When `<n>` merges, the repair and operator passes list
-the stack immediately as `STACK-BASE-MERGED parent:#<n>`; they retarget it onto
-main, merge main, push once and comment `retargeted: ...`. A parent closed
-without merging is `STACK-PARENT-CLOSED` and is never retargeted.
+and then labels the new pull request `stacked:<n>`. Long-lived integration
+bases are not stacks and pass unstacked: `[ship] integration_bases` lists them
+as patterns (`*` within one path segment, `**` across segments), defaulting to
+`["develop/*", "release/*"]`; an explicit list replaces the defaults and `[]`
+allows none.
+
+```toml
+[ship]
+integration_bases = ["develop/*", "release/*"]
+```
+
+The carried-commit guard excuses a labelled stack only when the label is
+verified and nothing holds it: its base is still not the steward's base, `<n>`
+is an open same-repository pull request whose head branch is the stack's base,
+and no counting HOLD names the stack's head (under fleet-guard admission, where
+a HOLD is not observable, a refused stack is never excused). Such a stack can
+never be reviewed or gated, so a verdict that would release P never comes. A
+`stacked:<n>` label anyone added by hand, naming a pull request that is not the
+stack's parent, excuses nothing. The label stops counting once the stack is
+retargeted onto the base. When `<n>` merges, the repair and operator passes
+list the stack immediately as `STACK-BASE-MERGED parent:#<n>`; they retarget it
+onto main, merge main, push once and comment `retargeted: ...`. A parent closed
+without merging is `STACK-PARENT-CLOSED`, a label whose pull request's head is
+not the stack's base is `STACK-LABEL-MISMATCH`, and a parent that cannot be
+read (a bogus number) is `STACK-PARENT-UNREADABLE`, reported without aborting
+the rest of the listing. None of those three is retargeted.
 
 Labels keep a pull request out of admission, and the steward refuses it:
 `owner-decision`, `superseded` and `PARKED/<platform>`. `PARKED/<platform>`

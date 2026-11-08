@@ -128,6 +128,20 @@ fn stacked_base_guard<W: Write>(
     if args.stacked_on.is_some() {
         return Ok(());
     }
+    let integration = integration_bases(config);
+    if let Some(pattern) = integration
+        .iter()
+        .find(|pattern| crate::head_approval::glob_match(pattern, &args.base))
+    {
+        writeln!(
+            stdout,
+            "▸ `{}` is an integration base (`{pattern}` in [ship] {INTEGRATION_BASES_KEY}); \
+             proceeding unstacked",
+            args.base
+        )
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        return Ok(());
+    }
     let retired = if args.stacked {
         " --stacked no longer suffices: a stacked pull request must name its parent."
     } else {
@@ -144,6 +158,33 @@ fn stacked_base_guard<W: Write>(
             args.base, args.base
         ),
     ))
+}
+
+/// The `[ship]` key listing long-lived integration bases (`develop/*`,
+/// `release/*`) a pull request may target without being a stack.
+const INTEGRATION_BASES_KEY: &str = "integration_bases";
+
+/// Integration bases when `[ship] integration_bases` is not set.
+const DEFAULT_INTEGRATION_BASES: [&str; 2] = ["develop/*", "release/*"];
+
+/// The configured integration-base patterns (`*` within one path segment,
+/// `**` across segments); the defaults when the key is absent, none when it
+/// is an empty list. Non-string entries are ignored.
+fn integration_bases(config: &LoadedConfig) -> Vec<String> {
+    match config
+        .get(&format!("ship.{INTEGRATION_BASES_KEY}"))
+        .and_then(toml::Value::as_array)
+    {
+        Some(patterns) => patterns
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .map(str::to_owned)
+            .collect(),
+        None => DEFAULT_INTEGRATION_BASES
+            .iter()
+            .map(|pattern| (*pattern).to_owned())
+            .collect(),
+    }
 }
 
 /// The text `--stacked-on <n>` adds to the pull request body, so a reader
@@ -1483,6 +1524,54 @@ mod tests {
             .expect_err("--stacked-on main must refuse");
         assert_eq!(failure.code, 2);
         assert!(failure.message.contains("No pull request was created"));
+    }
+
+    /// Long-lived integration bases are not stacks: `develop/*` and
+    /// `release/*` pass by default, a configured list replaces the defaults,
+    /// and an ordinary branch still refuses.
+    #[cfg(unix)]
+    #[test]
+    fn integration_bases_pass_unstacked_by_default_and_are_configurable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = repo_with_main_only_gate(temp.path());
+        let config = config_at(&repo);
+        for base in ["develop/next", "release/1.2"] {
+            let args = PrCommandArgs {
+                base: base.to_owned(),
+                ..pr_args()
+            };
+            let mut out = Vec::new();
+            stacked_base_guard(&args, &config, &repo, &mut out)
+                .unwrap_or_else(|failure| panic!("{base}: {}", failure.message));
+            let printed = String::from_utf8(out).expect("utf8");
+            assert!(printed.contains("is an integration base"), "{printed}");
+        }
+        // Control: an ordinary branch on the same instrument still refuses.
+        let feature = PrCommandArgs {
+            base: String::from("feature/parent"),
+            ..pr_args()
+        };
+        assert!(stacked_base_guard(&feature, &config, &repo, &mut Vec::new()).is_err());
+
+        fs::write(
+            repo.join(".shipyard/config.toml"),
+            "[ship]\nbase_branch = \"main\"\nintegration_bases = [\"train/**\"]\n",
+        )
+        .expect("config");
+        let config = config_at(&repo);
+        let train = PrCommandArgs {
+            base: String::from("train/a/b"),
+            ..pr_args()
+        };
+        stacked_base_guard(&train, &config, &repo, &mut Vec::new()).expect("configured pattern");
+        let develop = PrCommandArgs {
+            base: String::from("develop/next"),
+            ..pr_args()
+        };
+        assert!(
+            stacked_base_guard(&develop, &config, &repo, &mut Vec::new()).is_err(),
+            "a configured list replaces the defaults"
+        );
     }
 
     fn parent_json(state: &str, head: &str, head_repo: &str) -> String {

@@ -186,6 +186,8 @@ pub(super) enum Judgement {
     Approved,
     /// The gate refuses Q's head, for this reason.
     Unapproved(String),
+    /// A counting HOLD names Q's head: refused, and never excused as a stack.
+    Held(String),
     /// Q's approval could not be read.
     Unreadable(String),
 }
@@ -224,16 +226,9 @@ pub(super) fn carried(candidate: &Candidate<'_>, others: &[OpenPr]) -> Vec<Carri
 }
 
 /// The open pull requests whose commits P must not carry unapproved: every
-/// one but P itself, P's own base-branch pull request, those stacked on P,
-/// and labelled stacked pull requests. Pure.
-///
-/// A labelled stacked pull request (`stacked:<n>`, still on a base other than
-/// the steward's) is invisible to admission until it is retargeted: required
-/// checks do not run on its head and the reviewer never reviews it, so
-/// judging P against it can only hold P on a verdict that will never come.
-/// The label counts only while Q's base is not the steward's base, so a
-/// retargeted pull request whose label lingered is checked like any other.
-/// P carrying such a Q's commits is still P's own diff, reviewed at P's head.
+/// one but P itself, P's own base-branch pull request, and those stacked on
+/// P. Pure. Labelled stacks are excused later, by [`excused_stack`], because
+/// that needs Q's judgement.
 fn unrelated<'a>(
     number: u64,
     base_ref: &'a str,
@@ -247,14 +242,35 @@ fn unrelated<'a>(
         .filter(move |q| q.cross_repository || q.head_ref != base_ref)
         // Q is stacked on P, directly or through other open pull requests.
         .filter(move |q| !stacked_on(q, head_ref, others))
-        // Q is a labelled stacked pull request, not yet retargeted.
-        .filter(move |q| !labelled_stack(q, base_ref))
 }
 
-/// Whether `q` carries a `stacked:<n>` label and still targets a base other
-/// than the steward's. Pure.
-fn labelled_stack(q: &OpenPr, base_ref: &str) -> bool {
-    q.stacked_on.is_some() && q.base_ref != base_ref
+/// Whether `q` is a verified labelled stack: it carries `stacked:<n>`, still
+/// targets a base other than the steward's, and `n` is an open same-repository
+/// pull request whose head branch is `q`'s base. The label alone proves
+/// nothing (anyone with triage can add it), so the parent must check out.
+/// Pure.
+fn verified_stack(q: &OpenPr, base_ref: &str, others: &[OpenPr]) -> bool {
+    let Some(parent) = q.stacked_on else {
+        return false;
+    };
+    q.base_ref != base_ref
+        && !q.cross_repository
+        && others
+            .iter()
+            .any(|p| p.number == parent && !p.cross_repository && p.head_ref == q.base_ref)
+}
+
+/// Whether P is excused from carrying `q`'s commits because `q` is a verified
+/// labelled stack whose head no counting HOLD names. Such a stack is invisible
+/// to admission until it is retargeted: required checks do not run on its head
+/// and the reviewer never reviews it, so judging P against it can only hold P
+/// on a verdict that will never come. A HOLD, or an unreadable judgement,
+/// excuses nothing. The label stops counting once `q` is on the steward's
+/// base. P carrying such a `q`'s commits is still P's own diff, reviewed at
+/// P's head. Pure.
+fn excused_stack(q: &OpenPr, base_ref: &str, others: &[OpenPr], judgement: &Judgement) -> bool {
+    verified_stack(q, base_ref, others)
+        && matches!(judgement, Judgement::Approved | Judgement::Unapproved(_))
 }
 
 /// The parent number of a `stacked:<n>` label, if `name` is one. Pure.
@@ -488,10 +504,13 @@ pub(super) fn decide(base: &str, judged: &[(Carried, Judgement)]) -> Option<Refu
     for (carried, judgement) in judged {
         match (carried, judgement) {
             (_, Judgement::Approved) => {}
-            (Carried::Shares { .. }, Judgement::Unapproved(reason)) => {
+            (Carried::Shares { .. }, Judgement::Unapproved(reason) | Judgement::Held(reason)) => {
                 carries.push((carried, reason));
             }
-            (Carried::Unbounded { .. }, Judgement::Unapproved(reason)) => {
+            (
+                Carried::Unbounded { .. },
+                Judgement::Unapproved(reason) | Judgement::Held(reason),
+            ) => {
                 unbounded.push((carried, reason));
             }
             (_, Judgement::Unreadable(error)) => unreadable.push((carried, error)),
@@ -643,6 +662,10 @@ pub(super) fn refusal_for(
         return None;
     }
     let run_gh = |argv: &[String]| actions.run_gh(argv).map_err(|error| error.to_string());
+    let comment_source = matches!(
+        policy.source,
+        crate::head_approval::guard::ApprovalSource::Comments
+    );
     let mut report_policy = policy.clone();
     report_policy.dry_run = true;
     let mut judge = |q: &OpenPr| -> Judgement {
@@ -678,8 +701,7 @@ pub(super) fn refusal_for(
             &queue,
             q.author.as_deref(),
         ) {
-            Ok((gate, _, _)) if gate.allows() => Judgement::Approved,
-            Ok((gate, _, _)) => Judgement::Unapproved(gate.explain()),
+            Ok((gate, _, blocker)) => judgement_of(&gate, blocker.as_ref(), comment_source),
             Err(error) => Judgement::Unreadable(error),
         }
     };
@@ -693,6 +715,29 @@ pub(super) fn refusal_for(
         cache,
         &mut judge,
     )
+}
+
+/// The judgement of Q's head from the approval gate and its blocker. A HOLD
+/// at the head is [`Judgement::Held`]. Under fleet-guard admission
+/// (`comment_source` false) a HOLD is not observable here, so any refusal is
+/// treated as held and a refused stack is never excused: fail closed. Pure.
+fn judgement_of(
+    gate: &crate::head_approval::HeadGate,
+    blocker: Option<&crate::head_approval::ApprovalBlocker>,
+    comment_source: bool,
+) -> Judgement {
+    if gate.allows() {
+        Judgement::Approved
+    } else if !comment_source
+        || matches!(
+            blocker,
+            Some(crate::head_approval::ApprovalBlocker::Held { .. })
+        )
+    {
+        Judgement::Held(gate.explain())
+    } else {
+        Judgement::Unapproved(gate.explain())
+    }
 }
 
 /// [`admission_refusal`] over any `gh` runner and approval judge, after the
@@ -739,6 +784,9 @@ pub(super) fn refusal_with(
             .iter()
             .find(|q| q.number == overlap.number())
             .expect("an overlap names a listed pull request");
+        if verified_stack(q, base, others) && excused_stack(q, base, others, &judge(q)) {
+            continue;
+        }
         let Some(settled) = resolve_overlap(
             run_gh,
             repo,
@@ -960,6 +1008,9 @@ fn over_cap_refusal(
     let mut judged = Vec::new();
     let mut probes_left = MAX_REVERSE_PROBES;
     for q in unrelated(number, base, head_ref, others) {
+        if verified_stack(q, base, others) && excused_stack(q, base, others, &judge(q)) {
+            continue;
+        }
         let roots = cache
             .roots
             .entry((q.number, q.head_sha.clone()))

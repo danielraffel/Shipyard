@@ -844,7 +844,9 @@ pub(super) enum Command {
         stacked: bool,
         /// Open this pull request stacked on open pull request `<n>`, whose
         /// head branch must be `--base`. Without it a base other than the
-        /// configured base branch refuses with exit 8 and creates nothing.
+        /// configured base branch or an integration base (`[ship]
+        /// integration_bases`, default `develop/*`, `release/*`) refuses with
+        /// exit 8 and creates nothing.
         /// The pull request is labelled `stacked:<n>`, so the steward never
         /// holds other pull requests on it, and its body says its required
         /// checks run only after it is retargeted onto the base.

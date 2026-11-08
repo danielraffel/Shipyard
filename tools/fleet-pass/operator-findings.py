@@ -41,7 +41,7 @@ def main():
             queued = set()
             owner, name = repo.split("/")
             prs = mr.fetch_prs(repo)
-            open_numbers = {p["number"] for p in prs}
+            open_numbers = {p["number"]: p["head"]["ref"] for p in prs}
             for pr in prs:
                 n = pr["number"]
                 labels = {l["name"] for l in pr["labels"]}
@@ -65,6 +65,12 @@ def main():
                     continue
                 if stack == "closed":
                     print(f"{repo}#{n} {sha[:10]} STACKED-PARENT-CLOSED parent=#{parent} (needs its author; do not retarget)")
+                    continue
+                if stack == "mismatch":
+                    print(f"{repo}#{n} {sha[:10]} STACK-LABEL-MISMATCH parent=#{parent} (label names a PR whose head is not this base; do not retarget)")
+                    continue
+                if stack == "unreadable":
+                    print(f"{repo}#{n} {sha[:10]} STACK-PARENT-UNREADABLE parent=#{parent} (do not retarget)")
                     continue
                 if base != "main":
                     if idle > HELD_IDLE_MIN and why.startswith(("carried", "steward_error")):

@@ -214,6 +214,10 @@ class RepairReasons(unittest.TestCase):
         self.assertEqual(self.run_repair(self.pr(comments=hold, draft=True)), [])
 
 
+MERGED = {"merged_at": "2026-11-07T11:58:00Z", "head": {"ref": "gone"}}
+CLOSED = {"merged_at": None, "head": {"ref": "gone"}}
+
+
 class LabelledStacks(unittest.TestCase):
     """A `stacked:<n>` PR (shipyard pr --stacked-on <n>) is retargeted as soon as n merges."""
     REPO = "o/r"
@@ -229,6 +233,8 @@ class LabelledStacks(unittest.TestCase):
             reads.append(path)
             if parent is None:
                 raise AssertionError(f"unexpected read {path}")
+            if isinstance(parent, Exception):
+                raise parent
             return parent
 
         with serve(list(prs)), mock.patch.object(mr, "api", side_effect=fake_api):
@@ -237,7 +243,7 @@ class LabelledStacks(unittest.TestCase):
     def test_merged_parent_is_listed_immediately(self):
         out, reads = self.run_repair(
             [node(9, base="gone", labels=["stacked:7"], pushed=self.FRESH)],
-            parent={"merged_at": "2026-11-07T11:58:00Z"})
+            parent=MERGED)
         self.assertEqual([(o[0], o[3]) for o in out], [("o/r#9", "STACK-BASE-MERGED parent:#7")])
         self.assertEqual(reads, ["repos/o/r/pulls/7"])
 
@@ -252,17 +258,37 @@ class LabelledStacks(unittest.TestCase):
         self.assertEqual(reads, [])
 
     def test_closed_unmerged_parent_is_surfaced_not_retargeted(self):
-        out, _ = self.run_repair([node(9, base="gone", labels=["stacked:7"])], parent={"merged_at": None})
+        out, _ = self.run_repair([node(9, base="gone", labels=["stacked:7"])], parent=CLOSED)
         self.assertEqual([o[3] for o in out], ["STACK-PARENT-CLOSED parent:#7"])
 
     def test_a_label_left_on_a_retargeted_pr_means_nothing(self):
         out, reads = self.run_repair([node(9, labels=["stacked:7"], states={"macos": "success"})])
         self.assertEqual((out, reads), ([], []))
 
+    def test_label_naming_a_pr_with_another_head_is_a_mismatch_not_a_retarget(self):
+        # Closed parent whose head was some other branch.
+        out, _ = self.run_repair([node(9, base="gone", labels=["stacked:7"], pushed=self.FRESH)],
+                                 parent={"merged_at": "2026-11-07T11:58:00Z", "head": {"ref": "elsewhere"}})
+        self.assertEqual([o[3] for o in out], ["STACK-LABEL-MISMATCH parent:#7"])
+        # Open parent whose head is not this base; costs no read.
+        other = node(7, ref="elsewhere", sha="7" * 40, states={"macos": "success"})
+        out, reads = self.run_repair([node(9, base="gone", labels=["stacked:7"]), other])
+        self.assertEqual(([o[3] for o in out], reads), (["STACK-LABEL-MISMATCH parent:#7"], []))
+        # Control: the matching parent on the same instrument retargets.
+        out, _ = self.run_repair([node(9, base="gone", labels=["stacked:7"], pushed=self.FRESH)], parent=MERGED)
+        self.assertEqual([o[3] for o in out], ["STACK-BASE-MERGED parent:#7"])
+
+    def test_unreadable_parent_is_reported_and_the_listing_continues(self):
+        held = node(3, sha="3" * 40, comments=[comment(body("HOLD", sha="3" * 40))])
+        out, _ = self.run_repair([node(9, base="gone", labels=["stacked:999999"]), held],
+                                 parent=RuntimeError("ghapp api repos/o/r/pulls/999999: HTTP 404"))
+        self.assertEqual(sorted((o[0], o[3]) for o in out),
+                         [("o/r#3", "HOLD"), ("o/r#9", "STACK-PARENT-UNREADABLE parent:#999999")])
+
     def test_live_claim_is_honoured(self):
         claim = comment("repair-claim: m1 until 2026-11-07T13:00Z")
         out, _ = self.run_repair([node(9, base="gone", labels=["stacked:7"], comments=[claim])],
-                                 parent={"merged_at": "2026-11-07T11:58:00Z"})
+                                 parent=MERGED)
         self.assertEqual(out, [])
 
     def test_operator_findings_names_the_merged_parent(self):
@@ -275,7 +301,7 @@ class LabelledStacks(unittest.TestCase):
         with serve([node(9, base="gone", labels=["stacked:7"], pushed=self.FRESH)]), \
                 mock.patch.object(mr, "REPOS", [self.REPO]), \
                 mock.patch.object(mr, "required", return_value={"macos"}), \
-                mock.patch.object(mr, "api", return_value={"merged_at": "2026-11-07T11:58:00Z"}), \
+                mock.patch.object(mr, "api", return_value=MERGED), \
                 mock.patch.object(of, "steward_rows", return_value=({}, {})), \
                 contextlib.redirect_stdout(buf), self.assertRaises(SystemExit) as done:
             of.main()
