@@ -892,12 +892,20 @@ pub(super) fn admission_clean_command<W: Write>(
         pending_admission_cancellations(&observed_ledger, &canonical_repo, &base);
     let mut blocker_run_ids =
         admission_blocker_run_ids(&candidates, &blocking_only, &observed_pending);
+    // The steward ledger lock serializes ledger *writers*. A steward apply
+    // pass holds it for its whole multi-repo pass (minutes), so an admission
+    // that only reads must not wait on it or defer because of it: the ledger
+    // is published by atomic rename, so `load_ledger` without the lock is a
+    // consistent snapshot. Admission takes the lock only on the path where it
+    // resumes a pending cancellation or cancels a run itself; there a held
+    // lock is a real queue hold and still defers `stewardship_in_progress`.
+    // Holding the lock on a read-only path would not protect the JIT mint
+    // either, because the lock is released when this command returns.
+    //
     // Report-only admission is an observation, not a mutation precondition.
-    // Return the snapshot verdict after checking the ledger lock, without
-    // running a second full census; the apply path below performs the
-    // exact-head fence.
+    // Return the snapshot verdict without running a second full census; the
+    // apply path below performs the exact-head fence.
     if !args.apply {
-        let _ledger_lock = acquire_admission_ledger_lock!(&blocker_run_ids);
         if candidates.is_empty() && blocking_only.is_empty() && observed_pending.is_empty() {
             return_verdict!(Admit, "clean", &canonical_repo, &[], None);
         }
@@ -914,7 +922,9 @@ pub(super) fn admission_clean_command<W: Write>(
         );
     }
     if candidates.is_empty() && blocking_only.is_empty() && observed_pending.is_empty() {
-        let _ledger_lock = acquire_admission_ledger_lock!(&[]);
+        // Read-only clean path: a fresh lock-free snapshot (see above). A
+        // pending cancellation a running steward published since the first
+        // read still defers, as `cancellation_pending`.
         let ledger = load_ledger(&ledger_path)?;
         let final_pending = pending_admission_cancellations(&ledger, &canonical_repo, &base);
         if !final_pending.is_empty() {
