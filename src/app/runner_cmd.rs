@@ -40,6 +40,10 @@ use watch::dispatch_watch;
 use watch::{fleet_liveness_due, resolve_reaper_thresholds, watch_exit_code};
 
 const QUEUED_RUNS_LIMIT: u32 = 100;
+/// Bound the dedicated admission credential helper before observation starts.
+/// A wedged helper must fall back to the shared credential instead of blocking
+/// the admission command before its observation deadline is established.
+const ADMISSION_AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 /// Cap on the number of paginated `gh api` calls per reaper tick, per status.
 /// Each page is 100 items, so the worst case is 500 `in_progress` + 500
 /// `queued` runs scanned — far beyond any healthy repo. The paginated listers
@@ -88,14 +92,14 @@ fn admission_client(
     else {
         return Ok(None);
     };
-    let client = client
+    let mut client = client
         .with_repo_override(repo)
         .map_err(|error| format!("cannot scope to {repo} ({error})"))?;
     // Resolve once up front: a credential that cannot mint must not turn every
     // admission read into an error. The token lands in the shared in-process
     // cache, so the reads that follow reuse it instead of re-running the helper.
     client
-        .auth_summary(cwd, crate::gh::GhAuthPolicy::Default)
+        .pin_command_auth_with_timeout(cwd, ADMISSION_AUTH_TIMEOUT)
         .map_err(|error| format!("could not mint a token ({error})"))?;
     Ok(Some(client))
 }

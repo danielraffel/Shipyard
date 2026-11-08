@@ -480,6 +480,16 @@ fn admission_reads_fall_back_to_the_shared_credential_when_admission_cannot_mint
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn admission_reads_fall_back_to_shared_credential_when_admission_helper_times_out() {
+    let tokens = run_two_credential_admission("sleep 30");
+    assert!(
+        tokens.iter().all(|token| token == "ghs_shared"),
+        "{tokens:?}"
+    );
+}
+
 #[test]
 fn admission_auth_is_optional_global_only_and_parsed_like_github_auth() {
     use crate::config::{LoadedConfig, LocalOverlaySource};
