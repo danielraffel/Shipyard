@@ -50,7 +50,9 @@ impl PassBudget {
     /// Note a finished row. A rate-limited read fails every later read of
     /// the pass alike, so the rest are deferred rather than spent on errors.
     pub(super) fn observe(&mut self, report: &PrReport) {
-        if report.error.as_deref().is_some_and(is_rate_limited) {
+        if report.error.as_deref().is_some_and(is_rate_limited)
+            || report.mutation.as_deref().is_some_and(is_rate_limited)
+        {
             self.rate_limited = true;
         }
     }
@@ -61,9 +63,23 @@ pub(super) fn deadline_passed(deadline: Option<Instant>) -> bool {
     deadline.is_some_and(|deadline| Instant::now() >= deadline)
 }
 
-fn is_rate_limited(error: &str) -> bool {
+/// Whether `error` is GitHub refusing for rate: the primary REST limit
+/// ("API rate limit exceeded for installation ID ...", "... already exceeded
+/// for user ID ..."), GraphQL's `RATE_LIMITED`, the secondary or abuse limit,
+/// or an HTTP 429.
+pub(super) fn is_rate_limited(error: &str) -> bool {
     let lower = error.to_ascii_lowercase();
-    lower.contains("api rate limit exceeded") || lower.contains("secondary rate limit")
+    [
+        "rate limit exceeded",
+        "rate limit already exceeded",
+        "rate_limited",
+        "secondary rate limit",
+        "abuse detection",
+        "http 429",
+        "too many requests",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 /// The row for a pull request this pass did not evaluate.
@@ -89,9 +105,9 @@ pub(super) fn is_deferred(report: &PrReport) -> bool {
     report.mutation.as_deref() == Some(DEFERRED)
 }
 
-/// The order a pass evaluates `prs` in, as indexes into `prs`: admission
-/// candidates first, then queued or armed rows (the unapproved-admission
-/// sweep), then rows the previous pass deferred, then the rest; census order
+/// The order a pass evaluates `prs` in, as indexes into `prs`: queued or
+/// armed rows first (the unapproved-admission sweep), then admission
+/// candidates, then rows the previous pass deferred, then the rest; census order
 /// within each group. A row deferred once is therefore evaluated ahead of
 /// rows that were not, so the same tail is not starved pass after pass.
 pub(super) fn processing_order(
@@ -109,8 +125,11 @@ pub(super) fn processing_order(
     order.sort_by_key(|&index| {
         let pr = &prs[index];
         let group = match decisions.get(index) {
-            Some(StewardDecision::ArmMergeQueue | StewardDecision::RerunTransient { .. }) => 0,
-            _ if pr.fact.queue_position.is_some() || pr.fact.auto_merge_active => 1,
+            // Queued or armed rows first: their unapproved-admission sweep
+            // withdraws what the gate does not admit, and deferring it would
+            // leave such an entry free to merge.
+            _ if pr.fact.queue_position.is_some() || pr.fact.auto_merge_active => 0,
+            Some(StewardDecision::ArmMergeQueue | StewardDecision::RerunTransient { .. }) => 1,
             _ if carried.contains(&pr.fact.number) => 2,
             _ => 3,
         };
@@ -137,4 +156,82 @@ pub(super) fn record_deferred(ledger: &mut StewardLedger, repo: &str, reports: &
 
 fn ledger_key(repo: &str) -> String {
     repo.to_ascii_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::super::{StewardDecision, StewardLedger, parse_pr};
+    use super::{is_rate_limited, processing_order};
+
+    fn pr(number: u64, positions: &BTreeMap<u64, u64>) -> super::ObservedPr {
+        parse_pr(
+            &serde_json::json!({
+                "id": format!("PR_{number}"),
+                "number": number,
+                "isDraft": false,
+                "headRefOid": format!("{number:040x}"),
+                "headRefName": format!("feature/{number}"),
+                "mergeStateStatus": "CLEAN",
+                "autoMergeRequest": null,
+                "labels": [{"name": "shipyard:managed"}],
+                "statusCheckRollup": []
+            }),
+            positions,
+        )
+        .expect("PR")
+    }
+
+    /// Queued rows first (their unapproved-admission sweep must never be
+    /// deferred), then admission candidates, then last pass's deferred rows,
+    /// then the rest, census order within each.
+    #[test]
+    fn queued_rows_then_ready_rows_then_last_pass_deferred_rows_go_first() {
+        let positions = BTreeMap::from([(4, 1)]);
+        let prs: Vec<_> = [1, 2, 3, 4, 5].iter().map(|n| pr(*n, &positions)).collect();
+        let other = StewardDecision::Unmanaged;
+        let decisions = vec![
+            other.clone(),
+            other.clone(),
+            StewardDecision::ArmMergeQueue,
+            other.clone(),
+            other,
+        ];
+        let mut ledger = StewardLedger::default();
+        ledger
+            .pass_budget_deferred
+            .insert("owner/repo".to_owned(), vec![5]);
+        let order: Vec<u64> = processing_order("Owner/Repo", &prs, &decisions, &ledger)
+            .into_iter()
+            .map(|index| prs[index].fact.number)
+            .collect();
+        assert_eq!(order, vec![4, 3, 5, 1, 2]);
+    }
+
+    #[test]
+    fn github_rate_limit_refusals_are_recognised() {
+        for message in [
+            "gh: API rate limit exceeded for installation ID 147677577. (HTTP 403)",
+            "API rate limit already exceeded for user ID 1.",
+            r#"{"errors":[{"type":"RATE_LIMITED","message":"API rate limit exceeded"}]}"#,
+            "You have exceeded a secondary rate limit. Please wait a few minutes",
+            "You have triggered an abuse detection mechanism.",
+            "gh: Too Many Requests (HTTP 429)",
+        ] {
+            assert!(is_rate_limited(message), "{message}");
+        }
+    }
+
+    #[test]
+    fn other_failures_are_not_rate_limits() {
+        for message in [
+            "gh: Not Found (HTTP 404)",
+            "gh: Resource not accessible by integration (HTTP 403)",
+            "HTTP 502 Bad Gateway",
+            "the rate of change is unknown",
+        ] {
+            assert!(!is_rate_limited(message), "{message}");
+        }
+    }
 }
