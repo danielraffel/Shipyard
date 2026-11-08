@@ -1270,3 +1270,33 @@ fn an_over_cap_candidate_reads_each_open_prs_roots_once_per_pass() {
         "a second admission path reuses Q's roots"
     );
 }
+
+#[test]
+fn an_over_cap_stacked_q_is_narrowed_before_the_over_cap_decision() {
+    // Q inherits a large history from its base, but its own diff is small and
+    // does not reach P. The inherited history must not make Q unbounded.
+    const STACKED_BASE: &str = "feat/base";
+    const INHERITED: &str = "8888888800000000000000000000000000000000";
+    const OWN_ROOT: &str = "8888888800000000000000000000000000000001";
+    let q = open_q(231, "feat/stacked", STACKED_BASE, Q_HEAD);
+    let reads = |joined: &str| {
+        if joined.contains(&format!("compare/main...{Q_HEAD}")) {
+            return Some(Ok(json!({
+                "total": 300,
+                "merge_base": MAIN_TIP,
+                "commits": [("inherited", [MAIN_TIP])],
+            })
+            .to_string()));
+        }
+        if joined.contains(&format!("compare/{STACKED_BASE}...{Q_HEAD}")) {
+            return Some(Ok(graph(&[(OWN_ROOT, &[INHERITED])])));
+        }
+        probe_read(joined, OWN_ROOT).then(|| Ok("diverged".to_owned()))
+    };
+    assert_eq!(
+        big_refusal(&[&q], &reads, &mut |_| {
+            Judgement::Unapproved("no counted APPROVE".to_owned())
+        }),
+        None
+    );
+}

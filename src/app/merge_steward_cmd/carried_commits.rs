@@ -885,11 +885,22 @@ enum Roots {
 /// `q.base...q.head` when `q` targets another branch, keeping each commit's
 /// parents.
 fn own_roots(run_gh: RunGh<'_>, repo: &str, base: &str, q: &OpenPr) -> Result<Roots, String> {
+    let mut narrowed_to_own_base = false;
     let mut graph = match compare_graph(run_gh, repo, base, &q.head_sha)? {
         CommitGraph::Complete(graph) => graph,
+        CommitGraph::OverCap { .. } if q.base_ref != base => {
+            // The repository-base comparison can be over the cap solely
+            // because Q inherits a large stacked history. Read Q's own
+            // base-to-head graph before deciding that Q is unbounded.
+            narrowed_to_own_base = true;
+            match compare_graph(run_gh, repo, &q.base_ref, &q.head_sha)? {
+                CommitGraph::Complete(graph) => graph,
+                CommitGraph::OverCap { total } => return Ok(Roots::OverCap { total }),
+            }
+        }
         CommitGraph::OverCap { total } => return Ok(Roots::OverCap { total }),
     };
-    if q.base_ref != base {
+    if q.base_ref != base && !narrowed_to_own_base {
         match compare_commits(run_gh, repo, &q.base_ref, &q.head_sha)? {
             CommitList::Complete(introduced) => {
                 graph.retain(|sha, _| introduced.contains(sha));
