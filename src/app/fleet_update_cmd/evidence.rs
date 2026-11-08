@@ -567,10 +567,11 @@ fn normalized_absolute_credential_path(value: &str) -> bool {
             .all(|component| !component.is_empty() && component != "." && component != "..")
 }
 
+/// The `daemon run` command line a refreshed daemon must be running. Repos
+/// go through the same [`crate::daemon_runtime::normalize_repos`] the argv
+/// writers use, so the two renderings share one definition.
 fn rendered_daemon_launch(plan: &HostUpdatePlan, repos: &[String]) -> String {
-    let mut repos = repos.to_vec();
-    repos.sort();
-    repos.dedup();
+    let repos = crate::daemon_runtime::normalize_repos(repos.to_vec());
     let mut rendered = format!(
         "{} --mode {} --global-dir {} --state-dir {} daemon run",
         plan.binary.display(),
@@ -2012,23 +2013,60 @@ pub(super) fn validate_evidence(
             evidence.daemon_version
         ));
     }
-    if evidence.daemon_runtime.pid != evidence.daemon_pid
-        || evidence.daemon_runtime.loaded_executable_path != generation.binary.path
-        || evidence.daemon_runtime.loaded_executable_sha256 != generation.binary.sha256
-        || evidence.daemon_runtime.rendered_launch_sha256
-            != evidence.daemon_runtime.loaded_launch_sha256
-        || evidence.daemon_runtime.machine_auth_generation_id != generation.generation_id
-        || !valid_sha256(&evidence.daemon_runtime.machine_auth_probe_sha256)
+    if let Some(unbound) =
+        daemon_runtime_unbound(&evidence.daemon_runtime, evidence.daemon_pid, generation)
     {
-        return Err(
-            "refreshed daemon was not bound to the exact loaded generation, launch identity, and machine-global auth selector"
-                .to_owned(),
-        );
+        return Err(format!(
+            "refreshed daemon was not bound to the exact loaded generation, launch identity, and machine-global auth selector ({unbound})"
+        ));
     }
     if evidence.configured_repos_preserved == Some(false) {
         return Err("configured repositories changed across daemon refresh".to_owned());
     }
     Ok(())
+}
+
+/// The first daemon-runtime binding that does not hold, named so a failed
+/// update says which one broke instead of only that one of them did.
+fn daemon_runtime_unbound(
+    runtime: &DaemonRuntimeEvidence,
+    daemon_pid: u32,
+    generation: &GenerationEvidence,
+) -> Option<String> {
+    if runtime.pid != daemon_pid {
+        return Some(format!(
+            "daemon pid {} is not the refreshed pid {daemon_pid}",
+            runtime.pid
+        ));
+    }
+    if runtime.loaded_executable_path != generation.binary.path {
+        return Some(format!(
+            "loaded executable {} is not the generation binary {}",
+            runtime.loaded_executable_path.display(),
+            generation.binary.path.display()
+        ));
+    }
+    if runtime.loaded_executable_sha256 != generation.binary.sha256 {
+        return Some("loaded executable digest is not the generation binary digest".to_owned());
+    }
+    if runtime.rendered_launch_sha256 != runtime.loaded_launch_sha256 {
+        return Some(format!(
+            "launch identity: rendered argv sha256 {} != loaded argv sha256 {}",
+            short_digest(&runtime.rendered_launch_sha256),
+            short_digest(&runtime.loaded_launch_sha256)
+        ));
+    }
+    if runtime.machine_auth_generation_id != generation.generation_id {
+        return Some("machine-global auth generation is not the loaded generation".to_owned());
+    }
+    if !valid_sha256(&runtime.machine_auth_probe_sha256) {
+        return Some("machine-global auth probe digest is invalid".to_owned());
+    }
+    None
+}
+
+fn short_digest(digest: &str) -> &str {
+    digest.get(..12).unwrap_or(digest)
 }
 
 fn validate_auth_support(
