@@ -997,6 +997,10 @@ where
     // A refresh re-resolves the watch set rather than copying the prior
     // daemon's slugs verbatim, so a repository renamed while the daemon ran
     // is watched under its new name from here on.
+    // An empty result falls back to the default watch set without a
+    // rename/404 probe, unlike `daemon start`: that matches what a repo-less
+    // `daemon run` always chose, so the watch set is unchanged and only the
+    // argv now names it.
     let repos = explicit_daemon_repos(
         mode,
         &runtime_paths.state_dir,

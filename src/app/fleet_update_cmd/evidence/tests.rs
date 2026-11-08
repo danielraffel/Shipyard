@@ -914,4 +914,18 @@ fn rendered_launch_matches_the_spawned_daemon_argv_for_its_reported_repos() {
     // set is exactly the shape that failed on m1 and m5: the binding must
     // keep refusing it, because its argv does not state what it watches.
     assert_ne!(rendered_daemon_launch(&plan, &reported), argv(Vec::new()));
+
+    // A status that reports a mixed-case or duplicated slug renders the same
+    // canonical argv the spawn writes.
+    let mixed = vec![
+        "Generous-Corp/vellum".to_owned(),
+        "danielraffel/tartci".to_owned(),
+        "Generous-Corp/Pulp".to_owned(),
+        "generous-corp/pulp".to_owned(),
+    ];
+    assert_eq!(rendered_daemon_launch(&plan, &mixed), argv(mixed.clone()));
+    assert_eq!(
+        rendered_daemon_launch(&plan, &mixed),
+        rendered_daemon_launch(&plan, &reported)
+    );
 }

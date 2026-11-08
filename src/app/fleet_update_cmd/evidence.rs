@@ -567,10 +567,11 @@ fn normalized_absolute_credential_path(value: &str) -> bool {
             .all(|component| !component.is_empty() && component != "." && component != "..")
 }
 
+/// The `daemon run` command line a refreshed daemon must be running. Repos
+/// go through the same [`crate::daemon_runtime::normalize_repos`] the argv
+/// writers use, so the two renderings share one definition.
 fn rendered_daemon_launch(plan: &HostUpdatePlan, repos: &[String]) -> String {
-    let mut repos = repos.to_vec();
-    repos.sort();
-    repos.dedup();
+    let repos = crate::daemon_runtime::normalize_repos(repos.to_vec());
     let mut rendered = format!(
         "{} --mode {} --global-dir {} --state-dir {} daemon run",
         plan.binary.display(),
