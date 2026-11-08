@@ -116,6 +116,8 @@ fn apply_args() -> StewardCommandArgs {
         unapproved_dequeue: crate::app::merge_steward_cmd::DequeueMode::Report,
         apply: true,
         ledger: None,
+        pass_budget: None,
+        pass_deadline: None,
     }
 }
 

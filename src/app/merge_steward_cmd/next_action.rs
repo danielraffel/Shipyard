@@ -141,6 +141,17 @@ impl NextAction {
             "The pass could not classify this pull request. Nothing to do; next pass.".to_owned(),
         )
     }
+
+    /// A row the pass deferred before evaluating it (see `pass_budget`).
+    #[must_use]
+    pub fn deferred_pass_budget() -> Self {
+        Self::new(
+            Actor::Steward,
+            "The pass stopped before evaluating this pull request; the next pass takes it \
+             first. Nothing to do."
+                .to_owned(),
+        )
+    }
 }
 
 /// What the row's next action is derived from.

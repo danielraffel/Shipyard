@@ -73,25 +73,82 @@ class VerdictAt(unittest.TestCase):
         self.assertEqual(mr.verdict_at(cs, "c" * 40), (None, None))
 
 
+def node(n=1, base="main", ref="feat", sha=SHA, draft=False, labels=(), states=None, comments=(),
+         pushed="2026-11-07T08:00:00Z", merge="CLEAN", created="2026-11-07T07:00:00Z", statuses=(), runs=None):
+    """A pullRequests node exactly as the GraphQL query returns it."""
+    ctx = [{"__typename": "CheckRun", "name": k, "status": "COMPLETED", "conclusion": v.upper(), "databaseId": 100 + i}
+           for i, (k, v) in enumerate((states or {}).items())] + list(runs or []) + list(statuses)
+    return {"id": f"PR_{n}", "number": n, "isDraft": draft, "baseRefName": base, "headRefName": ref,
+            "headRefOid": sha, "createdAt": created, "mergeStateStatus": merge,
+            "labels": {"nodes": [{"name": l} for l in labels]},
+            "comments": {"totalCount": len(comments), "nodes": [
+                {"body": c["body"], "createdAt": c["created_at"],
+                 "author": {"login": "x", "__typename": "User"}} for c in comments]},
+            "commits": {"nodes": [{"commit": {"committedDate": pushed, "statusCheckRollup": {
+                "contexts": {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": ctx}}}}]}}
+
+
+def serve(repo_nodes, pages=1):
+    """Patch the GraphQL transport with fixture pages for one repo."""
+    chunks = [repo_nodes[i::pages] for i in range(pages)] if pages > 1 else [repo_nodes]
+    calls = iter(range(pages))
+
+    def fake(repo, query, **vars):
+        i = next(calls)
+        return {"repository": {"pullRequests": {"nodes": chunks[i],
+                "pageInfo": {"hasNextPage": i < pages - 1, "endCursor": f"c{i}"}}}}
+    mr._PRS.clear()
+    return mock.patch.object(mr, "graphql", side_effect=fake)
+
+
 class CheckStates(unittest.TestCase):
+    REPO = "o/r"
+
+    def states(self, **kw):
+        with serve([node(**kw)]):
+            mr.fetch_prs(self.REPO)
+        return mr.check_states(self.REPO, SHA)
+
     def test_orders_by_id_so_stale_later_timestamp_failure_loses(self):
-        runs = {"check_runs": [
-            {"id": 20, "name": "macos", "status": "completed", "conclusion": "success",
-             "completed_at": "2026-11-07T10:00:00Z"},
-            {"id": 10, "name": "macos", "status": "completed", "conclusion": "failure",
-             "completed_at": "2026-11-07T11:00:00Z"},
-            {"id": 30, "name": "lint", "status": "in_progress"},
-        ]}
-        with mock.patch.object(mr, "api", side_effect=[runs, {"statuses": []}]):
-            st = mr.check_states("o/r", SHA)
+        runs = [
+            {"__typename": "CheckRun", "name": "macos", "status": "COMPLETED", "conclusion": "FAILURE", "databaseId": 10},
+            {"__typename": "CheckRun", "name": "macos", "status": "COMPLETED", "conclusion": "SUCCESS", "databaseId": 20},
+            {"__typename": "CheckRun", "name": "lint", "status": "IN_PROGRESS", "conclusion": None, "databaseId": 30},
+        ]
+        st = self.states(runs=runs)
         self.assertEqual(st["macos"], "success")
         self.assertEqual(st["lint"], "pending")
 
-    def test_statuses_ordered_by_id(self):
-        statuses = {"statuses": [{"id": 2, "context": "ci", "state": "success"},
-                                 {"id": 1, "context": "ci", "state": "failure"}]}
-        with mock.patch.object(mr, "api", side_effect=[{"check_runs": []}, statuses]):
-            self.assertEqual(mr.check_states("o/r", SHA)["ci"], "success")
+    def test_status_contexts_override_runs_and_newest_wins(self):
+        statuses = [
+            {"__typename": "StatusContext", "context": "ci", "state": "SUCCESS", "createdAt": "2026-11-07T10:00:00Z"},
+            {"__typename": "StatusContext", "context": "ci", "state": "FAILURE", "createdAt": "2026-11-07T09:00:00Z"},
+            {"__typename": "StatusContext", "context": "macos", "state": "FAILURE", "createdAt": "2026-11-07T09:00:00Z"},
+        ]
+        st = self.states(states={"macos": "success"}, statuses=statuses)
+        self.assertEqual(st["ci"], "success")
+        self.assertEqual(st["macos"], "failure")
+
+    def test_rest_fallback_matches_graphql_fold(self):
+        runs = {"check_runs": [
+            {"id": 20, "name": "macos", "status": "completed", "conclusion": "success"},
+            {"id": 10, "name": "macos", "status": "completed", "conclusion": "failure"}]}
+        mr._PRS.clear()
+        with mock.patch.object(mr, "api", side_effect=[runs, {"statuses": []}]):
+            self.assertEqual(mr.check_states("o/r", "d" * 40), {"macos": "success"})
+
+    def test_rollup_contexts_paginate(self):
+        n = node(states={"a": "success"})
+        n["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]["pageInfo"] = {"hasNextPage": True, "endCursor": "k"}
+        more = {"node": {"commits": {"nodes": [{"commit": {"statusCheckRollup": {"contexts": {
+            "pageInfo": {"hasNextPage": False, "endCursor": None},
+            "nodes": [{"__typename": "CheckRun", "name": "b", "status": "COMPLETED",
+                       "conclusion": "FAILURE", "databaseId": 999}]}}}}]}}}
+        mr._PRS.clear()
+        first = {"repository": {"pullRequests": {"nodes": [n], "pageInfo": {"hasNextPage": False, "endCursor": None}}}}
+        with mock.patch.object(mr, "graphql", side_effect=[first, more]):
+            mr.fetch_prs("o/r")
+        self.assertEqual(mr.check_states("o/r", SHA), {"a": "success", "b": "failure"})
 
 
 class Disputed(unittest.TestCase):
@@ -110,38 +167,27 @@ class Disputed(unittest.TestCase):
 class RepairReasons(unittest.TestCase):
     REPO = "o/r"
 
-    def run_repair(self, pr, comments=(), states=None, detail=None, pushed="2026-11-07T08:00:00Z", extra_prs=()):
-        commit = {"commit": {"committer": {"date": pushed}}}
-
-        def fake_api(path):
-            if path.startswith(f"repos/{self.REPO}/pulls?"):
-                return [pr, *extra_prs]
-            if "/commits/" in path:
-                return commit
-            if "/issues/" in path:
-                return list(comments)
-            if "/pulls/" in path:
-                return detail or {}
-            raise AssertionError(path)
-
-        with mock.patch.object(mr, "api", side_effect=fake_api), \
-             mock.patch.object(mr, "check_states", return_value=states or {}):
+    def run_repair(self, pr, extra_prs=()):
+        with serve([pr, *extra_prs]):
             return mr.repair_candidates(self.REPO, {"macos"}, NOW)
 
     @staticmethod
-    def pr(base="main", ref="feat", n=1):
-        return {"number": n, "draft": False, "labels": [], "head": {"sha": SHA, "ref": ref}, "base": {"ref": base}}
+    def pr(**kw):
+        return node(**kw)
+
+    def setUp(self):
+        mr._PRS.clear()
 
     def test_hold(self):
-        out = self.run_repair(self.pr(), [comment(body("HOLD"))])
+        out = self.run_repair(self.pr(comments=[comment(body("HOLD"))]))
         self.assertEqual(out[0][3], "HOLD")
 
     def test_failed(self):
-        out = self.run_repair(self.pr(), states={"macos": "failure"})
+        out = self.run_repair(self.pr(states={"macos": "failure"}))
         self.assertEqual(out[0][3], "FAILED:macos")
 
     def test_conflict(self):
-        out = self.run_repair(self.pr(), states={"macos": "success"}, detail={"mergeable_state": "dirty"})
+        out = self.run_repair(self.pr(states={"macos": "success"}, merge="DIRTY"))
         self.assertEqual(out[0][3], "CONFLICT")
 
     def test_stack_base_merged(self):
@@ -149,17 +195,111 @@ class RepairReasons(unittest.TestCase):
         self.assertEqual(out[0][3], "STACK-BASE-MERGED")
 
     def test_stack_base_still_open_is_not_listed(self):
-        base = self.pr(ref="gone-branch", n=2)
+        base = self.pr(ref="gone-branch", n=2, states={"macos": "success"})
         self.assertEqual(self.run_repair(self.pr(base="gone-branch"), extra_prs=[base]), [])
 
     def test_fresh_push_and_live_claim_are_skipped(self):
-        self.assertEqual(self.run_repair(self.pr(), [comment(body("HOLD"))], pushed="2026-11-07T11:50:00Z"), [])
+        hold = [comment(body("HOLD"))]
+        self.assertEqual(self.run_repair(self.pr(comments=hold, pushed="2026-11-07T11:50:00Z")), [])
         claim = comment("repair-claim: m1 until 2026-11-07T13:00Z")
-        self.assertEqual(self.run_repair(self.pr(), [comment(body("HOLD")), claim]), [])
+        self.assertEqual(self.run_repair(self.pr(comments=hold + [claim])), [])
 
     def test_healthy_pr_not_listed(self):
-        self.assertEqual(self.run_repair(self.pr(), states={"macos": "success"},
-                                         detail={"mergeable_state": "clean"}), [])
+        self.assertEqual(self.run_repair(self.pr(states={"macos": "success"})), [])
+
+    def test_hold_label_and_draft_skipped(self):
+        hold = [comment(body("HOLD"))]
+        self.assertEqual(self.run_repair(self.pr(comments=hold, labels=["owner-decision"])), [])
+        self.assertEqual(self.run_repair(self.pr(comments=hold, labels=["PARKED/windows"])), [])
+        self.assertEqual(self.run_repair(self.pr(comments=hold, draft=True)), [])
+
+
+class ReviewCandidates(unittest.TestCase):
+    REPO = "o/r"
+
+    def run_review(self, *nodes):
+        with serve(list(nodes)), mock.patch.object(mr, "overrides", return_value={}):
+            return mr.review_candidates(self.REPO, {"macos"}, NOW)
+
+    def test_green_without_verdict_listed_and_disputed_marked(self):
+        green = {"macos": "success"}
+        out = self.run_review(node(1, states=green),
+                              node(2, states=green, sha="2" * 40, comments=[comment(body("HOLD", sha=OLD), "2026-11-07T09:00:00Z"),
+                                                              comment("dispute: no", "2026-11-07T10:00:00Z")]))
+        self.assertEqual([(o[0], o[3]) for o in out], [("o/r#1", ""), ("o/r#2", "DISPUTED")])
+
+    def test_verdict_red_stack_label_and_draft_excluded(self):
+        green = {"macos": "success"}
+        out = self.run_review(
+            node(1, states=green, comments=[comment(body())]),
+            node(2, states={"macos": "failure"}, sha="2" * 40),
+            node(3, states=green, base="other", sha="3" * 40),
+            node(4, states=green, labels=["superseded"], sha="4" * 40),
+            node(5, states=green, draft=True, sha="5" * 40))
+        self.assertEqual(out, [])
+
+    def test_override_lists_pr_until_newer_verdict(self):
+        since = datetime.datetime(2026, 11, 7, 9, 0, tzinfo=datetime.timezone.utc)
+        ov = {"o/r#1": (SHA, since)}
+        for cs, expect in (([comment(body(), "2026-11-07T08:00:00Z")], 1), ([comment(body(), "2026-11-07T10:00:00Z")], 0)):
+            with serve([node(1, states={"macos": "failure"}, comments=cs)]), \
+                 mock.patch.object(mr, "overrides", return_value=ov):
+                out = mr.review_candidates(self.REPO, {"macos"}, NOW)
+            self.assertEqual(len(out), expect)
+            if expect:
+                self.assertEqual(out[0][3], "AUTHOR-SELF-APPROVED")
+
+    def test_more_than_100_comments_falls_back_to_rest(self):
+        n = node(1, states={"macos": "success"}, comments=[comment("x")])
+        n["comments"]["totalCount"] = 150
+        rest = [{"body": body(), "created_at": "2026-11-07T10:00:00Z", "user": {"login": "x", "type": "User"}}]
+        with serve([n]), mock.patch.object(mr, "api", return_value=rest) as api:
+            out = mr.review_candidates(self.REPO, {"macos"}, NOW)
+        self.assertEqual(out, [])
+        api.assert_called_once()
+
+
+class ApiBudget(unittest.TestCase):
+    """A run costs 2 REST reads (required) plus one GraphQL page per 30 open PRs, per repo."""
+
+    def test_calls_per_repo_are_bounded_regardless_of_pr_count(self):
+        nodes = [node(i, states={"macos": "success"}, comments=[comment("hi")]) for i in range(1, 46)]
+        pages = [{"data": {"repository": {"pullRequests": {
+            "nodes": nodes[:30], "pageInfo": {"hasNextPage": True, "endCursor": "a"}}}}},
+            {"data": {"repository": {"pullRequests": {
+                "nodes": nodes[30:], "pageInfo": {"hasNextPage": False, "endCursor": None}}}}}]
+        calls = {"rest": 0, "graphql": 0}
+
+        def fake_run(cmd, **kw):
+            if cmd[2] == "graphql":
+                doc = pages[calls["graphql"]]
+                calls["graphql"] += 1
+                return mock.Mock(returncode=0, stdout=json.dumps(doc), stderr="")
+            calls["rest"] += 1
+            body_ = "{}" if "protection" in cmd[-1] else "[]"
+            return mock.Mock(returncode=0, stdout=body_, stderr="")
+
+        for mode in (mr.review_candidates, mr.repair_candidates):
+            mr._PRS.clear()
+            calls.update(rest=0, graphql=0)
+            with mock.patch.object(mr.subprocess, "run", side_effect=fake_run), \
+                 mock.patch.object(mr, "overrides", return_value={}):
+                req = mr.required("o/r")
+                mode("o/r", req, NOW)
+            self.assertEqual(calls["graphql"], 2)
+            self.assertLessEqual(calls["rest"], 3)
+
+    def test_graphql_failure_raises_so_runner_exits_2(self):
+        mr._PRS.clear()
+        bad = mock.Mock(returncode=1, stdout="", stderr="API rate limit exceeded")
+        with mock.patch.object(mr.subprocess, "run", return_value=bad):
+            with self.assertRaises(RuntimeError):
+                mr.fetch_prs("o/r")
+        mr._PRS.clear()
+        errs = mock.Mock(returncode=0, stdout=json.dumps({"errors": [{"message": "boom"}], "data": None}), stderr="")
+        with mock.patch.object(mr.subprocess, "run", return_value=errs):
+            with self.assertRaises(RuntimeError):
+                mr.fetch_prs("o/r")
 
 
 if __name__ == "__main__":

@@ -334,6 +334,8 @@ fn run_with(fixture: &Fixture, mut ledger: StewardLedger) -> Outcome {
         approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
         wake_owner: false,
         unapproved_dequeue: fixture.dequeue_mode,
+        pass_budget: None,
+        pass_deadline: None,
         apply: fixture.apply,
         ledger: None,
     };

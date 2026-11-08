@@ -115,8 +115,21 @@ approved Q is ignored, and for an unapproved Q each of P's commits (at most 50)
 is probed: it counts only if Q's head reaches it and Q's base does not. So an
 over-cap Q that carries none of P's commits never blocks P. Only when that
 cannot be settled (P has more than 50 commits to probe) does P fail closed
-(`carried_commits_over_cap:#Q`); a P that is itself over the cap fails closed as
-`carried_commits_over_cap:#P`. An unreadable listing, compare, probe or
+(`carried_commits_over_cap:#Q`). A P that is itself over the cap (for example a
+mirror-history import of thousands of commits) cannot list its own commits, so
+the check runs the other way: for every other open Q (the same exclusions
+apply), the steward reads Q's own commits not on the base with their parents
+(`base...Q.head`, narrowed to `Q.base...Q.head` for a Q on another branch) and
+probes whether P's head reaches each root of that set (a commit none of whose
+parents is in it). P carries some commit of Q's exactly when it reaches a root,
+so a P that reaches none of an unapproved Q's roots is not held by Q, and one
+that does is refused with `carries_unapproved_commits:#Q` naming the roots it
+reaches. An unapproved Q whose own commits are over 250, with more than 50
+roots, or past the 100 probes one over-cap P may make in a pass, refuses P as
+`carried_commits_over_cap:#Q`. Each Q's roots are read once per pass and
+reused across candidates. A paged compare whose total or merge base changes
+between pages (the base moved mid-read) fails closed until the next pass.
+There is no label or override that skips the check. An unreadable listing, compare, probe or
 approval, or a Q pushed after the pass listed it, also fails closed
 (`carried_commits_unreadable`;
 the next pass re-reads it). The check applies only where the base
@@ -128,7 +141,9 @@ merged another branch that carried a held pull request's commits; its own
 diff was approved and the held code reached main. On 2026-11-05 one
 unapproved stacked pull request whose listing was over the cap refused every
 approved pull request on main, though it carried none of their commits; the
-own-diff read and the per-commit probe end that.)
+own-diff read and the per-commit probe end that. On 2026-11-07 an approved
+re-export carrying a 2,724-commit mirror-history import was refused only for
+its own size; the reverse root probe ends that.)
 
 Labels keep a pull request out of admission, and the steward refuses it:
 `owner-decision`, `superseded` and `PARKED/<platform>`. `PARKED/<platform>`
@@ -298,13 +313,14 @@ not listed as blocked.
 | `ejected_same_head:<cause>` | The queue ejected this exact head and the steward will not re-enqueue it: the failure is the head's, could not be placed, or the head's one retry is spent. `blocked_detail` carries the classifier's reason (the failing job and whether the retry was spent). Read from the same queue state in a dry run and an apply pass; `since` is the removal | repair lane |
 | `waiting_full_test_tier`, `waiting_enqueue_requirements` | Admission waits on a deferred check tier or a GitHub requirement | CI |
 | `carries_unapproved_commits:#Q` | Approved and green, but carries commits of open pull request #Q, whose head is not approved; `blocked_detail` names the commits | Q's reviewer, or the author: drop Q's commits |
-| `carried_commits_over_cap:#N`, `carried_commits_unreadable` | Whether the head carries unapproved commits could not be proven (P over 250 commits; or an unapproved #N whose own diff is over 250 commits while P has more than 50 commits to probe; or a failed read) | author, or next pass |
+| `carried_commits_over_cap:#N`, `carried_commits_unreadable` | Whether the head carries unapproved commits could not be proven (an unapproved #N whose own diff is over 250 commits while P has more than 50 commits to probe; for a P over 250 commits, an unapproved #N whose own commits are over 250, have more than 50 roots, or exceed P's 100 probes; or a failed read) | author, or next pass |
 | `revalidating` | The head or queue changed during the pass | next pass |
 | `waiting_code_owner:<owners>` | Approved and green, but the base's ruleset requires a code-owner review and no owner `CODEOWNERS` (at the base) assigns to a changed file has approved this exact head. The steward asks GitHub nothing and records no mutation; it posts one comment per head mentioning the owners (`+`-joined in the token). It never reads `reviewDecision`, which is `null` on a base that requires zero approvals even after the owner approves. A team or e-mail owner, or a file the PR author owns, is left to GitHub | code owner |
 | `code_owner_review` | GitHub refused the enqueue: a code-owner review is outstanding. Recorded `rejected` with GitHub's message, never left uncertain | code owner |
 | `enqueue_refused:<message>` | GitHub definitively refused the enqueue for another reason, quoted | author or owner |
 | `uncertain_mutation` | An earlier enqueue of this pull request is still uncertain because GitHub's state could not be read; only this pull request waits | next pass, or operator |
 | `steward_error` | Admission failed; see `error` | operator |
+| `deferred_pass_budget` | The pass spent its time budget (or hit the API rate limit) before this row and did nothing for it; the next pass takes it first. See "Things that bite" | next pass |
 | `admission_pending` | Admission returned an outcome with no token of its own; see `blocked_detail` | next pass |
 | `queued` | In the merge queue | queue |
 | `admitted` | Enqueued or merged this pass (outranks any label) | nobody |
@@ -346,6 +362,19 @@ These came from running it for real:
   while it works, and TartCI's VM admission takes the same lock. Keep passes
   short (Shipyard hydrates only pull requests that could actually be
   admitted), and run repositories one after another, not in parallel.
+- **A pass that is killed reports nothing.** A pass reads GitHub per open
+  pull request, so a deep backlog on a slow token path can outrun a
+  scheduler's timeout, and a killed pass prints no report. Past
+  `--pass-budget-secs` (default 240; 0 disables) an apply pass starts no new
+  per-PR work, and it does the same once GitHub reports the token's API rate
+  limit exceeded. The budget is per repository: each repository's clock starts
+  when its observation starts, so an earlier repository never starves a later
+  one. A rate limit while observing a repository leaves the remaining
+  repositories of the invocation unread rather than erroring through them. Each remaining row is reported `deferred_pass_budget` with
+  its census decision, is never admitted, armed, enqueued or dequeued that
+  pass, and is evaluated first on the next pass, after admission candidates
+  and queued or armed rows. Keep the budget a few minutes under the
+  scheduler's timeout so the in-flight pull request and the report fit.
 - **A timer job that touches an external volume can hang.** On macOS a
   background job opening a path on `/Volumes` can wait forever on a privacy
   prompt nobody sees. Run the steward from the internal disk.

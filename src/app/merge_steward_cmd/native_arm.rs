@@ -357,7 +357,10 @@ fn select_candidates(
             pr_reports
                 .iter()
                 .find(|report| report.number == pr.fact.number)
-                .is_some_and(|report| steward_declines_ownership(&report.decision))
+                .is_some_and(|report| {
+                    !super::pass_budget::is_deferred(report)
+                        && steward_declines_ownership(&report.decision)
+                })
         })
         .filter_map(|pr| {
             match preselect_backstop_candidate(

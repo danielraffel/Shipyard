@@ -54,14 +54,18 @@
 //! [`MAX_PROBED_COMMITS`]) is probed for reachability from Q's head and
 //! absence from Q's base, so an over-cap Q that carries none of P's commits
 //! never blocks P. Only when that cannot be settled does P fail closed
-//! (`carried_commits_over_cap:#Q`); a candidate P over the cap itself also
-//! fails closed (`carried_commits_over_cap:#P`). An unreadable listing,
+//! (`carried_commits_over_cap:#Q`). A candidate P over the cap itself is
+//! checked the other way ([`over_cap_refusal`]): each other open Q's own
+//! commits not on the base are read with their parents, and P's head is probed
+//! for reaching the roots of that set, so a large P (a mirror-history import)
+//! carrying no unapproved Q's commits is admitted, while one that does, or an
+//! unapproved Q too large to settle, still refuses. An unreadable listing,
 //! compare, probe or approval also fails closed
 //! (`carried_commits_unreadable`). Q's approval is judged only while its live
 //! head is still the head the listing saw; a push after the listing also
 //! fails closed (`carried_commits_unreadable:#Q`) until the next pass.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
@@ -75,6 +79,10 @@ pub(super) const MAX_COMMITS_PER_PR: usize = 250;
 
 /// Most of P's commits probed one by one against an over-cap Q's head.
 pub(super) const MAX_PROBED_COMMITS: usize = 50;
+
+/// Most reachability probes one over-cap candidate makes across every other
+/// open pull request.
+pub(super) const MAX_REVERSE_PROBES: usize = 100;
 
 /// Commits per compare page.
 const COMPARE_PAGE: usize = 100;
@@ -176,29 +184,45 @@ pub(super) struct Refusal {
 /// Which other open pull requests P carries commits of. Pure.
 #[must_use]
 pub(super) fn carried(candidate: &Candidate<'_>, others: &[OpenPr]) -> Vec<Carried> {
+    unrelated(
+        candidate.number,
+        candidate.base_ref,
+        candidate.head_ref,
+        others,
+    )
+    .filter_map(|q| match &q.commits {
+        CommitList::Complete(commits) => {
+            let shared: Vec<String> = candidate.commits.intersection(commits).cloned().collect();
+            (!shared.is_empty()).then(|| Carried::Shares {
+                number: q.number,
+                head_sha: q.head_sha.clone(),
+                shared,
+            })
+        }
+        CommitList::OverCap { total } => Some(Carried::Unbounded {
+            number: q.number,
+            total: *total,
+        }),
+    })
+    .collect()
+}
+
+/// The open pull requests whose commits P must not carry unapproved: every
+/// one but P itself, P's own base-branch pull request, and those stacked on
+/// P. Pure.
+fn unrelated<'a>(
+    number: u64,
+    base_ref: &'a str,
+    head_ref: &'a str,
+    others: &'a [OpenPr],
+) -> impl Iterator<Item = &'a OpenPr> {
     others
         .iter()
-        .filter(|q| q.number != candidate.number)
+        .filter(move |q| q.number != number)
         // Q is P's base-branch pull request.
-        .filter(|q| q.cross_repository || q.head_ref != candidate.base_ref)
+        .filter(move |q| q.cross_repository || q.head_ref != base_ref)
         // Q is stacked on P, directly or through other open pull requests.
-        .filter(|q| !stacked_on(q, candidate.head_ref, others))
-        .filter_map(|q| match &q.commits {
-            CommitList::Complete(commits) => {
-                let shared: Vec<String> =
-                    candidate.commits.intersection(commits).cloned().collect();
-                (!shared.is_empty()).then(|| Carried::Shares {
-                    number: q.number,
-                    head_sha: q.head_sha.clone(),
-                    shared,
-                })
-            }
-            CommitList::OverCap { total } => Some(Carried::Unbounded {
-                number: q.number,
-                total: *total,
-            }),
-        })
-        .collect()
+        .filter(move |q| !stacked_on(q, head_ref, others))
 }
 
 /// Whether `q`'s base-branch chain, followed through other open (same
@@ -460,10 +484,10 @@ pub(super) fn decide(base: &str, judged: &[(Carried, Judgement)]) -> Option<Refu
         return Some(Refusal {
             token: format!("carried_commits_over_cap:#{number}"),
             detail: format!(
-                "#{number} has {total} commits in its own diff against its base, more than \
-                 the {MAX_COMMITS_PER_PR} read, its head is not approved ({reason}), and this \
-                 head has more than {MAX_PROBED_COMMITS} commits to probe against it one by \
-                 one, so whether this head carries #{number}'s commits is unproven"
+                "whether this head carries #{number}'s commits could not be settled within the \
+                 read limits ({MAX_COMMITS_PER_PR} commits listed, {MAX_PROBED_COMMITS} probed \
+                 per pull request, {MAX_REVERSE_PROBES} per over-cap head; #{number} counted \
+                 {total}), and #{number}'s head is not approved: {reason}"
             ),
         });
     }
@@ -490,6 +514,9 @@ fn name_shas(shas: &[String]) -> String {
 #[derive(Debug, Default)]
 pub(super) struct PassCache {
     open: Option<Result<Vec<OpenPr>, String>>,
+    /// Each open pull request's own roots, by number and listed head, for
+    /// every over-cap candidate and admission path in the pass.
+    roots: BTreeMap<(u64, String), Result<Roots, String>>,
 }
 
 /// The guard on the steward's own admission path (enqueue and exact-head
@@ -616,15 +643,8 @@ pub(super) fn refusal_with(
 ) -> Option<Refusal> {
     let own = match compare_commits(run_gh, repo, base, head_sha) {
         Ok(CommitList::Complete(commits)) => commits,
-        Ok(CommitList::OverCap { total }) => {
-            return Some(Refusal {
-                token: format!("carried_commits_over_cap:#{number}"),
-                detail: format!(
-                    "this head has {total} commits not on {base}, more than the \
-                     {MAX_COMMITS_PER_PR} read, so whether it carries another pull request's \
-                     unapproved commits is unproven"
-                ),
-            });
+        Ok(CommitList::OverCap { .. }) => {
+            return over_cap_refusal(run_gh, repo, base, number, head_ref, head_sha, cache, judge);
         }
         Err(error) => return Some(unreadable(error)),
     };
@@ -698,12 +718,14 @@ fn compare_commits(
 ) -> Result<CommitList, String> {
     let mut shas = BTreeSet::new();
     let mut total = 0;
+    let mut basis = None;
     for page in 1..=MAX_COMMITS_PER_PR.div_ceil(COMPARE_PAGE) {
         let raw = run_gh(&[
             "api".to_owned(),
             format!("repos/{repo}/compare/{base}...{head}?per_page={COMPARE_PAGE}&page={page}"),
             "--jq".to_owned(),
-            "{total: .total_commits, shas: [.commits[].sha]}".to_owned(),
+            "{total: .total_commits, merge_base: .merge_base_commit.sha, shas: [.commits[].sha]}"
+                .to_owned(),
         ])
         .map_err(|error| format!("compare {base}...{head} unreadable: {error}"))?;
         let value: Value = serde_json::from_str(&raw)
@@ -714,6 +736,7 @@ fn compare_commits(
             .ok_or_else(|| format!("compare {base}...{head} has no total_commits"))?;
         let page_shas = sha_array(value.get("shas"))
             .ok_or_else(|| format!("compare {base}...{head} has no commit list"))?;
+        same_basis(&mut basis, page_total, &value, base, head)?;
         total = usize::try_from(page_total).unwrap_or(usize::MAX);
         if total > MAX_COMMITS_PER_PR {
             return Ok(CommitList::OverCap { total });
@@ -725,6 +748,278 @@ fn compare_commits(
         }
     }
     Ok(bounded(total, shas))
+}
+
+/// [`refusal_with`] for a candidate P whose own commits are over the cap and
+/// so cannot be listed: the check runs the other way. For each other open
+/// pull request Q, Q's own commits not on the base (`base...Q.head`, and for a
+/// Q on another base branch also its own diff `Q.base...Q.head`) are read with
+/// their parents; that set's roots are the commits none of whose parents is in
+/// it. P's head carries some commit of the set exactly when it reaches one of
+/// the roots (from any carried commit, following parents inside the set ends at
+/// a root P also reaches), and reachability is probed exactly, root by root.
+/// The commit lists may name more commits than the exact set, never fewer, so
+/// they can only add roots and refuse more, never admit a carrier. A Q that
+/// shares a root with P is judged like any carried pull request. An
+/// unapproved Q whose set or roots are over the cap, and any failed read, fail
+/// closed.
+#[allow(clippy::too_many_arguments)]
+fn over_cap_refusal(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    base: &str,
+    number: u64,
+    head_ref: &str,
+    head_sha: &str,
+    cache: &mut PassCache,
+    judge: &mut dyn FnMut(&OpenPr) -> Judgement,
+) -> Option<Refusal> {
+    let open = cache
+        .open
+        .get_or_insert_with(|| open_pull_requests(run_gh, repo));
+    let others = match open {
+        Ok(others) => others,
+        Err(error) => return Some(unreadable(error.clone())),
+    };
+    let mut judged = Vec::new();
+    let mut probes_left = MAX_REVERSE_PROBES;
+    for q in unrelated(number, base, head_ref, others) {
+        let roots = cache
+            .roots
+            .entry((q.number, q.head_sha.clone()))
+            .or_insert_with(|| own_roots(run_gh, repo, base, q))
+            .clone();
+        let roots = match roots {
+            Ok(Roots::Clear) => continue,
+            Ok(Roots::Probe(roots)) if roots.len() <= probes_left => roots,
+            Ok(Roots::Probe(roots)) => {
+                // The probe budget is spent: only an approved Q is settled.
+                judge_unbounded(q, roots.len(), judge, &mut judged);
+                continue;
+            }
+            Ok(Roots::OverCap { total }) => {
+                judge_unbounded(q, total, judge, &mut judged);
+                continue;
+            }
+            Err(error) => {
+                judged.push(unreadable_overlap(q, error));
+                continue;
+            }
+        };
+        probes_left -= roots.len();
+        let mut shared = Vec::new();
+        let mut failed = None;
+        for root in roots {
+            match is_ancestor(run_gh, repo, &root, head_sha) {
+                Ok(true) => shared.push(root),
+                Ok(false) => {}
+                Err(error) => {
+                    failed = Some(error);
+                    break;
+                }
+            }
+        }
+        if let Some(error) = failed {
+            judged.push(unreadable_overlap(q, error));
+            continue;
+        }
+        if shared.is_empty() {
+            continue;
+        }
+        let judgement = judge(q);
+        if judgement != Judgement::Approved {
+            judged.push((
+                Carried::Shares {
+                    number: q.number,
+                    head_sha: q.head_sha.clone(),
+                    shared,
+                },
+                judgement,
+            ));
+        }
+    }
+    decide(base, &judged)
+}
+
+/// Record `q` as unbounded unless the gate admits its head.
+fn judge_unbounded(
+    q: &OpenPr,
+    total: usize,
+    judge: &mut dyn FnMut(&OpenPr) -> Judgement,
+    judged: &mut Vec<(Carried, Judgement)>,
+) {
+    let judgement = judge(q);
+    if judgement != Judgement::Approved {
+        judged.push((
+            Carried::Unbounded {
+                number: q.number,
+                total,
+            },
+            judgement,
+        ));
+    }
+}
+
+fn unreadable_overlap(q: &OpenPr, error: String) -> (Carried, Judgement) {
+    (
+        Carried::Unbounded {
+            number: q.number,
+            total: 0,
+        },
+        Judgement::Unreadable(error),
+    )
+}
+
+/// The roots of an open pull request's own commits not on the base.
+#[derive(Clone, Debug)]
+enum Roots {
+    /// It has no such commits.
+    Clear,
+    /// These roots, at most [`MAX_PROBED_COMMITS`].
+    Probe(Vec<String>),
+    /// Too many commits, or roots, to settle.
+    OverCap { total: usize },
+}
+
+/// The roots of `q`'s own commits not on `base`: `base...q.head`, narrowed to
+/// `q.base...q.head` when `q` targets another branch, keeping each commit's
+/// parents.
+fn own_roots(run_gh: RunGh<'_>, repo: &str, base: &str, q: &OpenPr) -> Result<Roots, String> {
+    let mut narrowed_to_own_base = false;
+    let mut graph = match compare_graph(run_gh, repo, base, &q.head_sha)? {
+        CommitGraph::Complete(graph) => graph,
+        CommitGraph::OverCap { .. } if q.base_ref != base => {
+            // The repository-base comparison can be over the cap solely
+            // because Q inherits a large stacked history. Read Q's own
+            // base-to-head graph before deciding that Q is unbounded.
+            narrowed_to_own_base = true;
+            match compare_graph(run_gh, repo, &q.base_ref, &q.head_sha)? {
+                CommitGraph::Complete(graph) => graph,
+                CommitGraph::OverCap { total } => return Ok(Roots::OverCap { total }),
+            }
+        }
+        CommitGraph::OverCap { total } => return Ok(Roots::OverCap { total }),
+    };
+    if q.base_ref != base && !narrowed_to_own_base {
+        match compare_commits(run_gh, repo, &q.base_ref, &q.head_sha)? {
+            CommitList::Complete(introduced) => {
+                graph.retain(|sha, _| introduced.contains(sha));
+            }
+            CommitList::OverCap { total } => return Ok(Roots::OverCap { total }),
+        }
+    }
+    if graph.is_empty() {
+        return Ok(Roots::Clear);
+    }
+    let roots: Vec<String> = graph
+        .iter()
+        .filter(|(_, parents)| !parents.iter().any(|parent| graph.contains_key(parent)))
+        .map(|(sha, _)| sha.clone())
+        .collect();
+    if roots.len() > MAX_PROBED_COMMITS {
+        return Ok(Roots::OverCap { total: graph.len() });
+    }
+    Ok(Roots::Probe(roots))
+}
+
+/// Commits with their parents, as far as the steward read them.
+#[derive(Debug)]
+enum CommitGraph {
+    /// Every commit, each with its parents.
+    Complete(BTreeMap<String, Vec<String>>),
+    /// More commits than [`MAX_COMMITS_PER_PR`].
+    OverCap { total: usize },
+}
+
+/// `head`'s commits not on `base` with each one's parents, from the compare
+/// API, paged up to [`MAX_COMMITS_PER_PR`].
+fn compare_graph(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    base: &str,
+    head: &str,
+) -> Result<CommitGraph, String> {
+    let mut graph = BTreeMap::new();
+    let mut total = 0;
+    let mut basis = None;
+    for page in 1..=MAX_COMMITS_PER_PR.div_ceil(COMPARE_PAGE) {
+        let raw = run_gh(&[
+            "api".to_owned(),
+            format!("repos/{repo}/compare/{base}...{head}?per_page={COMPARE_PAGE}&page={page}"),
+            "--jq".to_owned(),
+            "{total: .total_commits, merge_base: .merge_base_commit.sha, commits: [.commits[] | \
+             {sha, parents: [.parents[].sha]}]}"
+                .to_owned(),
+        ])
+        .map_err(|error| format!("compare {base}...{head} unreadable: {error}"))?;
+        let value: Value = serde_json::from_str(&raw)
+            .map_err(|error| format!("compare {base}...{head} malformed: {error}"))?;
+        let page_total = value
+            .get("total")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| format!("compare {base}...{head} has no total_commits"))?;
+        same_basis(&mut basis, page_total, &value, base, head)?;
+        total = usize::try_from(page_total).unwrap_or(usize::MAX);
+        if total > MAX_COMMITS_PER_PR {
+            return Ok(CommitGraph::OverCap { total });
+        }
+        let commits = value
+            .get("commits")
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("compare {base}...{head} has no commit list"))?;
+        for commit in commits {
+            let sha = commit
+                .get("sha")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("compare {base}...{head} has a commit without sha"))?;
+            let parents = commit
+                .get("parents")
+                .and_then(Value::as_array)
+                .and_then(|parents| {
+                    parents
+                        .iter()
+                        .map(|parent| parent.as_str().map(str::to_owned))
+                        .collect::<Option<Vec<_>>>()
+                })
+                .ok_or_else(|| format!("compare {base}...{head}: {sha} has no parents"))?;
+            graph.insert(sha.to_owned(), parents);
+        }
+        if graph.len() >= total || commits.len() < COMPARE_PAGE {
+            break;
+        }
+    }
+    Ok(if graph.len() < total {
+        CommitGraph::OverCap { total }
+    } else {
+        CommitGraph::Complete(graph)
+    })
+}
+
+/// Every page of one paged compare must describe the same comparison: `base`
+/// is a branch name, so if it moves between pages the pages shift and a
+/// commit can fall between them while the count still adds up. A changed
+/// total or merge base fails the read closed; the next pass re-reads it.
+fn same_basis(
+    basis: &mut Option<(u64, Option<String>)>,
+    total: u64,
+    page: &Value,
+    base: &str,
+    head: &str,
+) -> Result<(), String> {
+    let merge_base = page
+        .get("merge_base")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    match basis {
+        None => {
+            *basis = Some((total, merge_base));
+            Ok(())
+        }
+        Some(first) if *first == (total, merge_base) => Ok(()),
+        Some(_) => Err(format!(
+            "compare {base}...{head} moved between pages; its commits are re-read next pass"
+        )),
+    }
 }
 
 fn bounded(total: usize, shas: BTreeSet<String>) -> CommitList {
