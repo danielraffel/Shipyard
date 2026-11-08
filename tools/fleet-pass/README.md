@@ -9,6 +9,11 @@ The scheduled reviewer, repair and operator passes that drain the fleet's PRs.
   no counted verdict at their head; `--repair` is the rescue list (HOLD, FAILED,
   CONFLICT, STACK-BASE-MERGED); `--adversary` is the release-path second review.
 - `operator-findings.py`: the stuck-PR detector the operator pass reads.
+
+API use: each run reads every open PR of a repo (labels, head commit date, check
+rollup, newest 100 comments, merge state) with one paginated GraphQL query per
+30 PRs, plus two REST reads for the required checks. Per-PR REST reads would
+spend the App's REST budget (a shared 15000/hour) several times per PR per run.
 - `test_must_review.py`: offline unit tests for `must-review.py` (no network).
 
 ## Install (m3)

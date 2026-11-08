@@ -40,14 +40,13 @@ def main():
             rows, rep = steward_rows(repo)
             queued = set()
             owner, name = repo.split("/")
-            qd = mr.api(f"repos/{repo}/pulls?state=open&per_page=100")
-            for pr in qd:
+            for pr in mr.fetch_prs(repo):
                 n = pr["number"]
                 labels = {l["name"] for l in pr["labels"]}
                 if pr["draft"] or labels & mr.HOLD_LABELS or any(l.startswith("PARKED/") for l in labels):
                     continue
                 sha = pr["head"]["sha"]
-                pushed = mr.ts(mr.api(f"repos/{repo}/commits/{sha}")["commit"]["committer"]["date"])
+                pushed = mr.ts(pr["_pushed"])
                 idle = (now - pushed).total_seconds() / 60
                 row = rows.get(n, {})
                 why = row.get("blocked_on") or "-"
