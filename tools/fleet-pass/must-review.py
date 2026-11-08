@@ -25,7 +25,7 @@ Output is one line per PR, "<repo>#<n> <head> [NOTE]", previously missed
 entries (from FILE) first, then oldest first. Exits 2 when any repo could not
 be read, so the runner never mistakes a failed read for "nothing to do".
 """
-import datetime, json, re, subprocess, sys
+import datetime, json, os, re, subprocess, sys
 
 REPOS = ["Generous-Corp/pulp", "Generous-Corp/vellum", "danielraffel/Shipyard", "danielraffel/tartci"]
 HOLD_LABELS = {"owner-decision", "superseded"}
@@ -72,21 +72,145 @@ def required(repo):
     return ctx - SELF
 
 
-def check_states(repo, sha):
-    state = {}
+def rest_check_states(repo, sha):
+    """REST fallback for a head the GraphQL snapshot does not hold."""
     runs = api(f"repos/{repo}/commits/{sha}/check-runs?per_page=100")
     runs = runs.get("check_runs", []) if isinstance(runs, dict) else [x for p in runs for x in p.get("check_runs", [])]
+    st = api(f"repos/{repo}/commits/{sha}/status")
+    return fold_states(runs, st.get("statuses", []))
+
+
+def fold_states(runs, statuses):
+    state = {}
     # Newest run per name wins, ordered by id: timestamps can be skewed (DST hour).
     for r in sorted(runs, key=lambda r: r["id"]):
         state[r["name"]] = r.get("conclusion") if r.get("status") == "completed" else "pending"
-    st = api(f"repos/{repo}/commits/{sha}/status")
-    for s in sorted(st.get("statuses", []), key=lambda s: s.get("id") or 0):
+    # A commit status overrides a check run of the same name; the newest status wins.
+    for s in sorted(statuses, key=lambda s: (s.get("id") or 0, s.get("created_at") or "")):
         state[s["context"]] = s["state"]
     return state
 
 
+def check_states(repo, sha):
+    for pr in _PRS.get(repo, ()):
+        if pr["head"]["sha"] == sha:
+            return fold_states(pr["_runs"], pr["_statuses"])
+    return rest_check_states(repo, sha)
+
+
 def comments(repo, n):
+    for pr in _PRS.get(repo, ()):
+        if pr["number"] == n:
+            return pr["_comments"]
     return api(f"repos/{repo}/issues/{n}/comments?per_page=100")
+
+
+# One paginated GraphQL query per repo replaces the per-PR commit, check-run, status,
+# comment and detail REST reads. The result is shaped like the REST objects the rules
+# below were written against.
+_PRS = {}
+PR_QUERY = """
+query($owner:String!,$name:String!,$after:String){
+  repository(owner:$owner,name:$name){
+    pullRequests(states:OPEN,first:30,after:$after,orderBy:{field:CREATED_AT,direction:DESC}){
+      pageInfo{hasNextPage endCursor}
+      nodes{
+        id number isDraft baseRefName headRefName headRefOid createdAt mergeStateStatus
+        labels(first:50){nodes{name}}
+        comments(last:100){totalCount nodes{body createdAt author{login __typename}}}
+        commits(last:1){nodes{commit{committedDate statusCheckRollup{contexts(first:100){
+          pageInfo{hasNextPage endCursor}
+          nodes{__typename ... on CheckRun{name status conclusion databaseId}
+                ... on StatusContext{context state createdAt}}}}}}}
+      }
+    }
+  }
+}"""
+CONTEXTS_QUERY = """
+query($id:ID!,$after:String){
+  node(id:$id){... on PullRequest{commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100,after:$after){
+    pageInfo{hasNextPage endCursor}
+    nodes{__typename ... on CheckRun{name status conclusion databaseId}
+          ... on StatusContext{context state createdAt}}}}}}}}}
+}"""
+
+
+def graphql(repo, query, **variables):
+    # ghapp mints its token per repository and cannot infer it from a GraphQL body or
+    # variables, so the repository is bound through GH_REPO.
+    cmd = ["ghapp", "api", "graphql", "-f", f"query={query}"]
+    for k, v in variables.items():
+        if v is not None:
+            cmd += ["-f", f"{k}={v}"]
+    out = subprocess.run(cmd, capture_output=True, text=True, env={**os.environ, "GH_REPO": repo})
+    if out.returncode != 0:
+        raise RuntimeError(f"ghapp api graphql: {out.stderr.strip()[:200] or out.stdout.strip()[:200]}")
+    doc = json.loads(out.stdout or "{}")
+    if doc.get("errors") or not doc.get("data"):
+        raise RuntimeError(f"ghapp api graphql: {json.dumps(doc.get('errors'))[:200]}")
+    return doc["data"]
+
+
+def split_contexts(nodes):
+    runs, statuses = [], []
+    for c in nodes:
+        if c.get("__typename") == "CheckRun":
+            runs.append({"id": c["databaseId"], "name": c["name"],
+                         "status": (c.get("status") or "").lower(),
+                         "conclusion": (c.get("conclusion") or "").lower() or None})
+        elif c.get("__typename") == "StatusContext":
+            state = c["state"].lower()
+            statuses.append({"context": c["context"], "created_at": c.get("createdAt") or "",
+                             "state": "pending" if state == "expected" else state})
+    return runs, statuses
+
+
+def rest_comment(c):
+    a = c.get("author") or {}
+    login = a.get("login")
+    bot = a.get("__typename") == "Bot"
+    return {"body": c.get("body") or "", "created_at": c["createdAt"],
+            "user": {"login": login + "[bot]" if bot and login else login, "type": "Bot" if bot else "User"}}
+
+
+def fetch_prs(repo):
+    """All open PRs of repo as REST-shaped dicts, newest first, fetched once per process."""
+    if repo in _PRS:
+        return _PRS[repo]
+    owner, name = repo.split("/")
+    out, after = [], None
+    while True:
+        page = graphql(repo, PR_QUERY, owner=owner, name=name, after=after)["repository"]["pullRequests"]
+        for n in page["nodes"]:
+            commit = ((n.get("commits") or {}).get("nodes") or [{}])[0].get("commit") or {}
+            ctx = ((commit.get("statusCheckRollup") or {}).get("contexts")) or {}
+            runs, statuses = split_contexts(ctx.get("nodes") or [])
+            more = (ctx.get("pageInfo") or {})
+            while more.get("hasNextPage"):
+                nxt = graphql(repo, CONTEXTS_QUERY, id=n["id"], after=more["endCursor"])["node"]
+                ctx = nxt["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]
+                r2, s2 = split_contexts(ctx["nodes"])
+                runs += r2
+                statuses += s2
+                more = ctx["pageInfo"]
+            cs = [rest_comment(c) for c in n["comments"]["nodes"]]
+            if n["comments"]["totalCount"] > len(cs):
+                # More than the newest 100 comments: read them all, as the REST path did.
+                cs = [{"body": c.get("body") or "", "created_at": c["created_at"], "user": c.get("user")}
+                      for c in api(f"repos/{repo}/issues/{n['number']}/comments?per_page=100")]
+            out.append({
+                "number": n["number"], "draft": n["isDraft"], "state": "open",
+                "labels": [{"name": l["name"]} for l in n["labels"]["nodes"]],
+                "head": {"sha": n["headRefOid"], "ref": n["headRefName"]},
+                "base": {"ref": n["baseRefName"]}, "created_at": n["createdAt"],
+                "mergeable_state": (n.get("mergeStateStatus") or "").lower(),
+                "_pushed": commit.get("committedDate"),
+                "_runs": runs, "_statuses": statuses, "_comments": cs})
+        if not page["pageInfo"]["hasNextPage"]:
+            break
+        after = page["pageInfo"]["endCursor"]
+    _PRS[repo] = out
+    return out
 
 
 SIGNERS_FILE = __import__("os").path.expanduser(__import__("os").environ.get(
@@ -164,15 +288,17 @@ def review_candidates(repo, req, now):
         if not key.startswith(repo + "#"):
             continue
         n = int(key.split("#")[1])
-        pr = api(f"repos/{repo}/pulls/{n}")
-        if pr["state"] != "open" or pr["head"]["sha"] != sha:
-            continue
+        pr = next((p for p in fetch_prs(repo) if p["number"] == n), None)
+        if pr is None or pr["head"]["sha"] != sha:
+            continue  # not open any more, or the head moved
         v, at = verdict_at(comments(repo, n), sha)
         if v and ts(at) > since:
             continue
         out.append((key, sha, pr["created_at"], "AUTHOR-SELF-APPROVED"))
     seen = {o[0] for o in out}
-    for pr in api(f"repos/{repo}/pulls?state=open&base=main&per_page=100"):
+    for pr in fetch_prs(repo):
+        if pr["base"]["ref"] != "main":
+            continue
         labels = {l["name"] for l in pr["labels"]}
         if pr["draft"] or labels & HOLD_LABELS or any(l.startswith("PARKED/") for l in labels):
             continue
@@ -242,7 +368,9 @@ def adversary_candidates(repo, req, now):
         return []
     protected, signers, globs = release_path_policy(repo)
     out = []
-    for pr in api(f"repos/{repo}/pulls?state=open&base=main&per_page=100"):
+    for pr in fetch_prs(repo):
+        if pr["base"]["ref"] != "main":
+            continue
         labels = {l["name"] for l in pr["labels"]}
         if pr["draft"] or labels & HOLD_LABELS or any(l.startswith("PARKED/") for l in labels):
             continue
@@ -270,15 +398,14 @@ def adversary_candidates(repo, req, now):
 
 def repair_candidates(repo, req, now):
     out = []
-    prs = api(f"repos/{repo}/pulls?state=open&per_page=100")
+    prs = fetch_prs(repo)
     open_heads = {p["head"]["ref"] for p in prs}
     for pr in prs:
         labels = {l["name"] for l in pr["labels"]}
         if pr["draft"] or labels & HOLD_LABELS or any(l.startswith("PARKED/") for l in labels):
             continue
         sha = pr["head"]["sha"]
-        commit = api(f"repos/{repo}/commits/{sha}")
-        pushed = ts(commit["commit"]["committer"]["date"])
+        pushed = ts(pr["_pushed"])
         if (now - pushed).total_seconds() < STALL_MINUTES * 60:
             continue
         cs = comments(repo, pr["number"])
@@ -298,8 +425,7 @@ def repair_candidates(repo, req, now):
                 if failed:
                     reason = "FAILED:" + ",".join(sorted(failed))
                 else:
-                    detail = api(f"repos/{repo}/pulls/{pr['number']}")
-                    if detail.get("mergeable_state") == "dirty":
+                    if pr["mergeable_state"] == "dirty":
                         reason = "CONFLICT"
         if reason:
             out.append((f"{repo}#{pr['number']}", sha, pushed.isoformat(), reason))
