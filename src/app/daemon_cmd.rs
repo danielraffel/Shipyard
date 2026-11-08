@@ -138,6 +138,7 @@ fn spawn_execution_daemon(
 ) -> Result<u32, CliFailure> {
     let binary = std::env::current_exe()
         .map_err(|error| CliFailure::new(3, format!("failed to locate current binary: {error}")))?;
+    let repos = explicit_daemon_repos(mode, &runtime_paths.state_dir, repos);
     spawn_detached(&SpawnRequest {
         binary,
         mode,
@@ -827,6 +828,23 @@ fn daemon_run_repos(mode: RuntimeMode, state_dir: &Path, repos: &[String]) -> Ve
     resolve_repos(state_dir, &requested_daemon_repos(mode, repos))
 }
 
+/// The watch set a spawned daemon is given on its command line.
+///
+/// A `daemon run` with no `--repo` picks its own default watch set
+/// ([`daemon_run_repos`]): the fleet for the production daemon. Spawning it
+/// that way leaves the launch argv without the repositories the daemon then
+/// reports in `configured_repos`, so the argv no longer states the daemon's
+/// identity and fleet-update's launch binding (rendered from the status)
+/// cannot match it. Resolving the same default here and passing it
+/// explicitly keeps the watch set unchanged while making the argv carry it.
+fn explicit_daemon_repos(mode: RuntimeMode, state_dir: &Path, repos: Vec<String>) -> Vec<String> {
+    if repos.is_empty() {
+        daemon_run_repos(mode, state_dir, &[])
+    } else {
+        repos
+    }
+}
+
 fn daemon_run_with_repos(
     mode: RuntimeMode,
     runtime_paths: &RuntimePaths,
@@ -979,11 +997,15 @@ where
     // A refresh re-resolves the watch set rather than copying the prior
     // daemon's slugs verbatim, so a repository renamed while the daemon ran
     // is watched under its new name from here on.
-    let repos = resolve_watch(if explicit_repos.is_empty() {
-        prior_repos
-    } else {
-        resolve_repos(&runtime_paths.state_dir, explicit_repos)
-    });
+    let repos = explicit_daemon_repos(
+        mode,
+        &runtime_paths.state_dir,
+        resolve_watch(if explicit_repos.is_empty() {
+            prior_repos
+        } else {
+            resolve_repos(&runtime_paths.state_dir, explicit_repos)
+        }),
+    );
     let binary = binary_override
         .map_or_else(std::env::current_exe, Ok)
         .map_err(|error| DaemonRefreshError {
@@ -1330,8 +1352,8 @@ mod tests {
     use super::{
         DaemonRefreshError, DaemonRefreshOutcome, RuntimeMode, configured_repos_from_status,
         configured_repositories_with_missing, daemon_command, execute_daemon_refresh,
-        render_daemon_refresh, render_daemon_refresh_error, render_daemon_start,
-        render_daemon_status, render_daemon_stop,
+        explicit_daemon_repos, normalize_repos, render_daemon_refresh, render_daemon_refresh_error,
+        render_daemon_start, render_daemon_status, render_daemon_stop,
     };
 
     #[test]
@@ -1800,6 +1822,65 @@ mod tests {
 
         assert!(!outcome.stopped_prior);
         assert!(outcome.repos.is_empty());
+    }
+
+    #[test]
+    fn refresh_without_a_prior_daemon_passes_the_default_watch_set_explicitly() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let fleet = normalize_repos(
+            FLEET_REPOSITORIES
+                .iter()
+                .map(|repo| (*repo).to_owned())
+                .collect(),
+        );
+        assert!(!fleet.is_empty());
+
+        let outcome = execute_daemon_refresh(
+            RuntimeMode::Shipyard,
+            Some(temp.path().to_path_buf()),
+            Some(temp.path().to_path_buf()),
+            &runtime_paths(temp.path()),
+            &[],
+            None,
+            |repos| repos,
+            |request: &SpawnRequest| {
+                assert_eq!(
+                    request.repos, fleet,
+                    "a fresh production daemon must be told its default watch set on argv"
+                );
+                // The daemon reports exactly what its argv names, so the
+                // launch argv and `configured_repos` agree.
+                assert_eq!(
+                    daemon_run_repos(RuntimeMode::Shipyard, temp.path(), &request.repos),
+                    request.repos
+                );
+                Ok(31337)
+            },
+        )
+        .expect("refresh outcome");
+
+        assert!(!outcome.stopped_prior);
+        assert_eq!(outcome.repos, fleet);
+    }
+
+    #[test]
+    fn explicit_daemon_repos_keeps_a_nonempty_watch_set_and_fills_an_empty_one() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            explicit_daemon_repos(
+                RuntimeMode::Shipyard,
+                temp.path(),
+                vec!["owner/a".to_owned()]
+            ),
+            vec!["owner/a"]
+        );
+        assert_eq!(
+            explicit_daemon_repos(RuntimeMode::Shipyard, temp.path(), Vec::new()),
+            daemon_run_repos(RuntimeMode::Shipyard, temp.path(), &[])
+        );
+        // An isolated daemon defaults to its in-flight ship repos, which is
+        // nothing for a fresh state directory: no fleet repos leak in.
+        assert!(explicit_daemon_repos(RuntimeMode::Isolated, temp.path(), Vec::new()).is_empty());
     }
 
     #[cfg(unix)]

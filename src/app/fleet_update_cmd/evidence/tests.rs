@@ -420,7 +420,11 @@ fn daemon_runtime_receipt_refuses_pid_binary_launch_and_auth_generation_drift() 
 
     let mut launch = control.clone();
     launch.daemon_runtime.loaded_launch_sha256 = "f".repeat(64);
-    assert!(validate_evidence(&plan, &launch).is_err());
+    let error = validate_evidence(&plan, &launch).expect_err("launch drift");
+    assert!(
+        error.contains("launch identity: rendered argv sha256"),
+        "launch drift must name the launch binding: {error}"
+    );
 
     let mut auth = control;
     auth.daemon_runtime.machine_auth_generation_id = "f".repeat(64);
@@ -871,4 +875,43 @@ fn only_the_exact_busy_status_and_marker_classify_as_a_deferral() {
         classify_update_failure(&output(1, &marker)),
         PlanExecutionError::Failed(_)
     ));
+}
+
+/// The launch binding renders the daemon argv from the repositories the
+/// daemon reports. It holds only when a spawned daemon's argv is exactly the
+/// spawn contract over those same repositories, so the two renderers must
+/// agree byte for byte.
+#[test]
+fn rendered_launch_matches_the_spawned_daemon_argv_for_its_reported_repos() {
+    let plan = super::super::host_update_plan(&host(Some("m5-lan")), "v0.137.0").expect("plan");
+    let reported = vec![
+        "danielraffel/tartci".to_owned(),
+        "generous-corp/pulp".to_owned(),
+        "generous-corp/vellum".to_owned(),
+    ];
+    let argv = |repos: Vec<String>| {
+        let request = crate::daemon_runtime::SpawnRequest {
+            binary: plan.binary.clone(),
+            mode: plan.runtime_mode,
+            global_dir_override: Some(plan.global_dir.clone()),
+            state_dir_override: Some(plan.state_dir.clone()),
+            state_dir: plan.state_dir.clone(),
+            repos,
+        };
+        std::iter::once(plan.binary.clone().into_os_string())
+            .chain(crate::daemon_runtime::daemon_run_arguments(&request))
+            .map(|part| part.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+
+    assert_eq!(
+        rendered_daemon_launch(&plan, &reported),
+        argv(reported.clone()),
+        "a daemon spawned with its watch set on the command line binds"
+    );
+    // A daemon spawned with no `--repo` that then reports a default watch
+    // set is exactly the shape that failed on m1 and m5: the binding must
+    // keep refusing it, because its argv does not state what it watches.
+    assert_ne!(rendered_daemon_launch(&plan, &reported), argv(Vec::new()));
 }
