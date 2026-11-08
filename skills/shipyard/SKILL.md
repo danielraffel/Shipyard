@@ -3626,6 +3626,8 @@ merges directly), the steward, as that base's single admission writer, also
 sweeps every open PR, owned or not, and withdraws what the exact-head gate does
 not admit. Other branches are covered only by running the steward per base.
 
+A pass past `--pass-budget-secs` (default 240; 0 disables), or after GitHub reports the API rate limit exceeded, starts no new per-PR work: remaining rows report `deferred_pass_budget`, are never admitted, armed, enqueued or dequeued, and are taken first next pass. Keep the budget under the scheduler's timeout so the report still prints.
+
 Every row of a steward pass also names why that pull request is not merging:
 `blocked_on` (one token, such as `no_verdict`, `held`,
 `approval_excluded:unattributed`, `required_never_ran:<contexts>`,

@@ -318,7 +318,7 @@ with `SHIPYARD_QUEUE_ARMS_LOG`). A guard that cannot run (no `python3` 3.11+)
 refuses. The steward reports a refusal as `waiting_head_approval`; its pass
 JSON also names the reason per PR in `blocked_on` (`no_verdict`, `held`,
 `approval_excluded:<reason>`, ...) with a `since` time, so read that rather
-than the mutation when diagnosing a stall. The steward also refuses a head
+than the mutation when diagnosing a stall. A pass past `--pass-budget-secs` (default 240; 0 disables), or after GitHub reports the API rate limit exceeded, starts no new per-PR work: remaining rows report `deferred_pass_budget`, are never admitted, armed, enqueued or dequeued, and are taken first next pass. Keep the budget under the scheduler's timeout so the report still prints. The steward also refuses a head
 that carries another open PR's commits whose head is not approved
 (`carries_unapproved_commits:#Q`, shared shas in `blocked_detail`): a HOLD
 cannot be bypassed by merging the held branch into another one. A PR stacked on P, directly or through other open PRs' branches, or one that only inherits P's commit (not in its own diff against its own base), never counts as carrying. A PR whose listing is over the 250-commit cap is judged by its own diff against its own base, and an unapproved one whose own diff is still over the cap blocks P only if probing P's commits (at most 50) cannot rule out that it carries them (`carried_commits_over_cap:#Q`). There is no
