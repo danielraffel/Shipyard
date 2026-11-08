@@ -541,6 +541,111 @@ fn running_steward_blocks_only_admission_that_must_write() {
     drop(steward);
 }
 
+/// A fake GitHub with one managed pull request at head b and one queued run
+/// of its superseded head a that a `self-hosted,ARM64` runner can claim.
+/// Cancelling the run records `cancelled` beside `calls`; afterwards the run
+/// reads as cancelled and is no longer listed as queued.
+fn superseded_run_actions(temp: &tempfile::TempDir, calls: &Path) -> GitHubActions {
+    let cancelled = calls.with_file_name("cancelled");
+    fake_gh(
+        temp,
+        &format!(
+            r#"
+printf '%s\n' "$*" >> '{calls}'
+run='{{"id":9001,"workflow_id":77,"run_attempt":1,"name":"Build and Test","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","head_branch":"feature","status":"STATUS","event":"pull_request","pull_requests":[{{"number":42}}],"created_at":"2026-08-30T00:00:00Z"}}'
+if [ -e '{cancelled}' ]; then status=cancelled; else status=queued; fi
+case "$*" in
+  "api repos/owner/repo") printf '%s' '{{"full_name":"owner/repo","allow_auto_merge":true}}' ;;
+  *"rules/branches/main --paginate --slurp"*) printf '%s' '[[]]' ;;
+  *"branches/main/protection/required_status_checks"*) printf '%s' '{{"contexts":[],"checks":[]}}' ;;
+  "api graphql "*) printf '%s' '{{"data":{{"repository":{{"mergeQueue":null}}}}}}' ;;
+  "pr list "*|"pr view "*|*"repos/owner/repo/pulls/42"*)
+    pr='{{"id":"PR_kw","number":42,"state":"OPEN","isDraft":false,"baseRefName":"main","headRefOid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","headRefName":"feature","mergeStateStatus":"CLEAN","autoMergeRequest":null,"labels":[{{"name":"shipyard:managed"}}],"statusCheckRollup":[{{"__typename":"StatusContext","context":"shipyard/steward-handoff","state":"SUCCESS","createdAt":"2026-08-30T00:00:00Z"}}]}}'
+    case "$*" in "pr list "*) printf '[%s]' "$pr" ;; *) printf '%s' "$pr" ;; esac ;;
+  *"/cancel"*) : > '{cancelled}'; printf '%s' '{{}}' ;;
+  *"actions/runs?status=queued"*)
+    if [ "$status" = queued ]; then printf '{{"workflow_runs":[%s]}}' "$(printf '%s' "$run" | sed "s/STATUS/$status/")"; else printf '%s' '{{"workflow_runs":[]}}'; fi ;;
+  *"actions/runs?status="*) printf '%s' '{{"workflow_runs":[]}}' ;;
+  *"actions/runs/9001/jobs"*)
+    printf '%s' '{{"jobs":[{{"name":"macOS","status":"queued","conclusion":null,"labels":["self-hosted","ARM64"],"runner_name":null}}]}}' ;;
+  *"actions/runs/9001"*) printf '%s' "$run" | sed "s/STATUS/$status/" ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+            calls = calls.display(),
+            cancelled = cancelled.display(),
+        ),
+    )
+    .with_repo_override("owner/repo")
+}
+
+/// Cancelling a superseded run writes no steward crash-recovery record, so a
+/// running steward apply pass (which holds the ledger lock for minutes) must
+/// not hold up the admission check `TartCI` runs before cloning a VM. The cancellation
+/// happens under the per-run mutation guard, the steward's ledger is left
+/// untouched for its own save, and the audit line lands in the sidecar.
+#[cfg(unix)]
+#[test]
+fn running_steward_does_not_block_admission_cancelling_a_superseded_run() {
+    let temp = tempfile::tempdir().expect("temp");
+    let control = mutation_control(&temp, "studio", "studio");
+    let paths = RuntimePaths::current_with_overrides(
+        RuntimeMode::Isolated,
+        Some(control.global_dir),
+        Some(control.state_dir),
+    );
+    let calls = temp.path().join("github-calls");
+    let actions = superseded_run_actions(&temp, &calls);
+    let args = AdmissionCleanArgs {
+        repo: "owner/repo".to_owned(),
+        base: "main".to_owned(),
+        labels: vec!["self-hosted".to_owned(), "ARM64".to_owned()],
+        apply: true,
+    };
+    let ledger_path = paths.state_dir.join("merge-steward.json");
+    save_ledger(&ledger_path, &StewardLedger::default()).expect("seed steward ledger");
+    let before = fs::read(&ledger_path).expect("steward ledger");
+    let steward = acquire_ledger_lock(&ledger_path).expect("active steward lock");
+
+    let mut output = Vec::new();
+    let started = Instant::now();
+    let exit = admission_clean_command(
+        &args,
+        temp.path(),
+        RuntimeMode::Isolated,
+        &paths,
+        &actions,
+        true,
+        &mut output,
+    )
+    .expect("admission verdict under a running steward");
+    let verdict = typed_verdict(exit, &output, 0, "cleaned");
+    assert_eq!(verdict["verdict"], "admit");
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "admission must not wait for the steward pass"
+    );
+    assert!(
+        fs::read_to_string(&calls).unwrap().contains("/cancel"),
+        "the superseded run must be cancelled"
+    );
+    assert_eq!(
+        fs::read(&ledger_path).expect("steward ledger"),
+        before,
+        "admission must not write the ledger a running steward will overwrite"
+    );
+    let audit = load_ledger(&admission_audit_path(&ledger_path)).expect("admission audit");
+    assert!(
+        audit
+            .audit
+            .iter()
+            .any(|entry| entry.subject == "run:9001"
+                && entry.action == "cancel_revalidated_queued_run"),
+        "the cancellation must still be audited"
+    );
+    drop(steward);
+}
+
 /// The #609 shape, deterministically: a child forked while a steward holds its
 /// ledger or observation lock keeps a duplicate of the locked descriptor until
 /// its exec. Releasing must not depend on that duplicate closing first.
