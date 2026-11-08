@@ -1466,7 +1466,13 @@ fn steward_repo_observed(
         repo_args.pass_deadline = Some(Instant::now() + budget);
     }
     let args = &repo_args;
-    match observe_repo(actions, repo, &args.base, args.preempt_capacity) {
+    match observe_repo_with_status_history(
+        actions,
+        repo,
+        &args.base,
+        args.preempt_capacity,
+        Some(&status_history_path(ledger_path, repo)),
+    ) {
         Ok(observation) => {
             let scope_key = actions.rate_limit_scope_key(repo);
             let cooldown_key = pass_budget::rate_limit_cooldown_key(&scope_key, repo);
@@ -1525,6 +1531,24 @@ fn steward_repo_observed(
             true,
         ),
     }
+}
+
+/// Where the census keeps the commit-status histories it may reuse on the
+/// next pass of `repo`: beside the ledger, one file per repository, since
+/// several repositories' passes share one ledger and each rewrites its file.
+fn status_history_path(ledger_path: &Path, repo: &str) -> PathBuf {
+    let slug = repo
+        .to_ascii_lowercase()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '~'
+            }
+        })
+        .collect::<String>();
+    ledger_path.with_extension(format!("status-history.{slug}.json"))
 }
 
 fn record_rate_limit_cooldown(
@@ -1834,6 +1858,7 @@ mod capacity_cancellation;
 mod carried_commits;
 mod code_owner_wait;
 mod exact_head_merge;
+mod head_rollup;
 mod ledger;
 mod mutation_outcome;
 mod native_arm;
@@ -2082,8 +2107,9 @@ use observation::{
     active_runs, complete_checks_for_head, fetch_run_jobs, fetch_run_jobs_before, gh_json,
     gh_json_before, gh_json_timeout, hydrate_census_check_identities,
     hydrate_required_check_identities, hydrate_required_check_identities_before,
-    merge_queue_snapshot, merge_queue_snapshot_before, observe_repo, parse_job, parse_pr,
-    parse_run, pull_requests, required_checks, resolve_repos,
+    merge_queue_snapshot, merge_queue_snapshot_before, observe_repo,
+    observe_repo_with_status_history, parse_job, parse_pr, parse_run, pull_requests,
+    required_checks, resolve_repos,
 };
 #[cfg(test)]
 use pr_mutations::mutate_pr;

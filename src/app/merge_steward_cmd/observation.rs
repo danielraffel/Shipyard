@@ -47,6 +47,19 @@ pub(super) fn observe_repo(
     base: &str,
     preempt_capacity: bool,
 ) -> Result<RepoObservation, String> {
+    observe_repo_with_status_history(actions, repo, base, preempt_capacity, None)
+}
+
+/// [`observe_repo`], reusing the commit-status histories an earlier pass
+/// kept at `status_history` when the live rollup shows them current (see
+/// [`super::head_rollup`]).
+pub(super) fn observe_repo_with_status_history(
+    actions: &GitHubActions,
+    repo: &str,
+    base: &str,
+    preempt_capacity: bool,
+    status_history: Option<&Path>,
+) -> Result<RepoObservation, String> {
     let settings = gh_json(
         actions,
         &["api".to_owned(), format!("repos/{repo}")],
@@ -63,7 +76,15 @@ pub(super) fn observe_repo(
     let (merge_queue, queue_positions, merge_group_heads, merge_group_enqueued_at) =
         merge_queue_snapshot(actions, &repo, base)?;
     let mut prs = pull_requests(actions, &repo, base, &queue_positions)?;
-    hydrate_census_check_identities(actions, &repo, &required_checks, &mut prs)?;
+    let mut history =
+        status_history.map(|path| super::head_rollup::StatusHistory::load(path, &repo));
+    hydrate_census_check_identities_with_history(
+        actions,
+        &repo,
+        &required_checks,
+        &mut prs,
+        history.as_mut(),
+    )?;
     let mut runs = active_runs(actions, &repo)?;
     let capacity_preemption_policy = CapacityPreemptionPolicy::for_repository(&repo);
     let front_head = queue_positions
@@ -296,7 +317,7 @@ pub(super) fn is_retryable_read_failure(message: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
-fn gh_json_with_deadline(
+pub(super) fn gh_json_with_deadline(
     actions: &GitHubActions,
     args: &[String],
     purpose: &str,
@@ -1006,11 +1027,30 @@ pub(super) fn hydrate_census_check_identities(
     required_checks: &[RequiredCheck],
     prs: &mut [ObservedPr],
 ) -> Result<(), String> {
-    let candidates = prs
+    hydrate_census_check_identities_with_history(actions, repo, required_checks, prs, None)
+}
+
+/// [`hydrate_census_check_identities`], with an optional store of status
+/// histories read on earlier passes.
+///
+/// A head without a usable rollup row (every census row, since the bulk list
+/// leaves the rollup out) needs its complete check set. Those heads are read
+/// [`super::head_rollup::HEADS_PER_QUERY`] at a time through one GraphQL
+/// rollup query, with each head's status history read over REST only when
+/// the rollup shows it may have changed. The store, when given, is rewritten
+/// to hold exactly the histories this census used.
+pub(super) fn hydrate_census_check_identities_with_history(
+    actions: &GitHubActions,
+    repo: &str,
+    required_checks: &[RequiredCheck],
+    prs: &mut [ObservedPr],
+    history: Option<&mut super::head_rollup::StatusHistory>,
+) -> Result<(), String> {
+    let (complete, partial): (Vec<_>, Vec<_>) = prs
         .iter_mut()
         .filter(|pr| checks_are_consulted(pr) && checks_can_change_decision(pr))
-        .collect::<Vec<_>>();
-    run_bounded(candidates, &|pr: &mut ObservedPr| {
+        .partition(|pr| pr.check_rollup_maybe_truncated && is_full_sha(&pr.fact.head_sha));
+    run_bounded(partial, &|pr: &mut ObservedPr| {
         hydrate_required_check_identities_with_deadline(
             actions,
             repo,
@@ -1018,7 +1058,86 @@ pub(super) fn hydrate_census_check_identities(
             std::slice::from_mut(pr),
             None,
         )
-    })
+    })?;
+    let mut batches: Vec<Vec<&mut ObservedPr>> = Vec::new();
+    for pr in complete {
+        match batches.last_mut() {
+            Some(batch) if batch.len() < super::head_rollup::HEADS_PER_QUERY => batch.push(pr),
+            _ => batches.push(vec![pr]),
+        }
+    }
+    let used = std::sync::Mutex::new(BTreeMap::new());
+    let stored = history.as_deref();
+    run_bounded(batches, &|batch: Vec<&mut ObservedPr>| {
+        hydrate_complete_head_checks_batch(actions, repo, batch, stored, &used)
+    })?;
+    if let Some(history) = history {
+        history.replace_and_save(
+            used.into_inner()
+                .map_err(|_| "status history collection panicked".to_owned())?,
+        );
+    }
+    Ok(())
+}
+
+/// Complete check sets for a batch of heads from one rollup read. If the
+/// rollup cannot be read whole, every head in the batch takes the per-head
+/// REST path instead, which fails closed as it always has.
+fn hydrate_complete_head_checks_batch(
+    actions: &GitHubActions,
+    repo: &str,
+    batch: Vec<&mut ObservedPr>,
+    history: Option<&super::head_rollup::StatusHistory>,
+    used: &std::sync::Mutex<BTreeMap<String, Vec<Value>>>,
+) -> Result<(), String> {
+    let heads = batch
+        .iter()
+        .map(|pr| pr.fact.head_sha.clone())
+        .collect::<Vec<_>>();
+    let rollups = match super::head_rollup::read_rollups(actions, repo, &heads, None) {
+        Ok(rollups) => rollups,
+        // A spent rate limit is not cured by spending two REST reads per head
+        // from the same installation; the pass defers instead.
+        Err(error) if super::pass_budget::is_rate_limited(&error) => return Err(error),
+        Err(error) => {
+            if let Some(pass) = actions.gh_pass() {
+                pass.record_fallback(
+                    &format!(
+                        "census check rollup -> REST: {}",
+                        super::head_rollup::fallback_reason(&error)
+                    ),
+                    &error,
+                );
+            }
+            for pr in batch {
+                hydrate_complete_head_checks(actions, repo, pr, None)?;
+            }
+            return Ok(());
+        }
+    };
+    for pr in batch {
+        let head = pr.fact.head_sha.clone();
+        let rollup = rollups
+            .get(&head)
+            .ok_or_else(|| format!("current-head check rollup lost {head}"))?;
+        let mut checks = rollup.check_runs.clone();
+        if rollup.has_statuses {
+            let rows = match history
+                .and_then(|history| history.get(&head))
+                .filter(|rows| rollup.history_is_current(rows))
+            {
+                Some(rows) => rows.to_vec(),
+                None => commit_status_rows_for_head_with_deadline(actions, repo, &head, None)?,
+            };
+            checks.extend(rows.iter().filter_map(parse_rest_status));
+            if let Ok(mut used) = used.lock() {
+                used.insert(head, rows);
+            }
+        }
+        pr.fact.checks = checks;
+        pr.check_rollup_maybe_truncated = false;
+    }
+    Ok(())
 }
 
 /// Whether the steward could still reach a check-dependent decision for this
@@ -1255,7 +1374,22 @@ pub(super) fn commit_statuses_for_head_with_deadline(
     head_sha: &str,
     deadline: Option<Instant>,
 ) -> Result<Vec<StewardCheck>, String> {
-    let mut checks = Vec::new();
+    Ok(
+        commit_status_rows_for_head_with_deadline(actions, repo, head_sha, deadline)?
+            .iter()
+            .filter_map(parse_rest_status)
+            .collect(),
+    )
+}
+
+/// Every commit status row on `head_sha`, newest first, as REST lists them.
+pub(super) fn commit_status_rows_for_head_with_deadline(
+    actions: &GitHubActions,
+    repo: &str,
+    head_sha: &str,
+    deadline: Option<Instant>,
+) -> Result<Vec<Value>, String> {
+    let mut rows_read = Vec::new();
     for page in 1..=10 {
         let args = [
             "api".to_owned(),
@@ -1274,9 +1408,9 @@ pub(super) fn commit_statuses_for_head_with_deadline(
             .as_array()
             .ok_or_else(|| "current-head commit statuses were not an array".to_owned())?;
         let count = rows.len();
-        checks.extend(rows.iter().filter_map(parse_rest_status));
+        rows_read.extend(rows.iter().cloned());
         if count < 100 {
-            return Ok(checks);
+            return Ok(rows_read);
         }
     }
     Err("current-head commit statuses exceed 1000; refusing partial status scan".to_owned())

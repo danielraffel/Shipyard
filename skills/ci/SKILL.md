@@ -475,7 +475,9 @@ not `steward_error`. Before any enqueue or exact-head merge on a base whose rule
 Each repository in the steward's JSON report carries `api_calls` (REST and
 GraphQL calls, pass-cache hits, per call site): a pass that times out on a busy
 repository is diagnosed from a dry run's numbers, not by guessing. Published
-failures cost no read in later passes.
+failures cost no read in later passes, and the census reads current-head checks
+through batched rollup queries (site `graphql query checkRollup0`) instead of
+two REST reads per head.
 
 ## The unattended carrier: `runner carrier`
 

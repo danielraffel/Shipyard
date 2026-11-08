@@ -474,10 +474,23 @@ esac
             "{skipped} must not be hydrated"
         );
     }
+    // One rollup read covers both heads; this fake cannot answer it, so the
+    // batch falls back to the per-head REST reads.
     assert_eq!(
-        calls.lines().count(),
+        calls
+            .lines()
+            .filter(|line| line.contains("statusCheckRollup"))
+            .count(),
+        1,
+        "both hydrated heads share one rollup read"
+    );
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|line| line.contains("commits/"))
+            .count(),
         4,
-        "two hydrated heads, two reads each"
+        "two hydrated heads, two REST reads each after the fallback"
     );
     assert!(!prs[0].check_rollup_maybe_truncated);
     assert!(prs[1].check_rollup_maybe_truncated, "left unobserved");
