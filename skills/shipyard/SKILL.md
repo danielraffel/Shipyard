@@ -828,6 +828,16 @@ after a 20 minute grace, at most 3 attempts, then fails naming the failing
 steps (`scripts/release_draft_heal.py`). The signing job's Rust install retries
 3 times because the self-hosted runner has lost `static.rust-lang.org` for
 minutes at a time (v0.381.0, v0.383.0).
+
+A signing job stuck at "syncing channel updates" is usually LuLu, not the
+network: the release Macs' outbound firewall approves per executable path. The
+job therefore installs rustup and the pinned toolchain at a fixed path,
+`~/.shipyard-release-rust` on the runner user (`scripts/ci_macos_release_rust.py`),
+and the owner approves its `rustup` and toolchain `cargo` once per host
+(v0.393.0 and v0.394.0 stayed Linux-only drafts while it used a per-run path).
+A job that fails with "changed since it was installed and verified" found a
+modified toolchain: inspect it before removing the toolchain directory and its
+`toolchain-*.sha256` marker. Rerunning will not clear it.
 The identity manifest (`shipyard-release-manifest.json`) names each published
 asset once. Each per-target package directory holds its own unpublished
 `checksums.sha256`; v0.383.0's manifest listed both Linux copies, and
