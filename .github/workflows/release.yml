@@ -344,6 +344,13 @@ jobs:
       attestations: write
       contents: write
       id-token: write
+    # Exact pins for the fixed-path toolchain. Bump the toolchain together
+    # with the version `stable` resolves to in the build matrix. The rustup-init
+    # SHA-256 is static.rust-lang.org/rustup/archive/<version>/aarch64-apple-darwin/rustup-init.sha256.
+    env:
+      SHIPYARD_RELEASE_RUST_TOOLCHAIN: "1.99.1"
+      SHIPYARD_RELEASE_RUSTUP_VERSION: "1.29.3"
+      SHIPYARD_RELEASE_RUSTUP_INIT_SHA256: "63752a1919a3a4793173ec70f8f212621a7ce38ba6a246095984482f4de20f9f"
     steps:
       - name: Require published non-macOS release gate
         env:
@@ -370,44 +377,46 @@ jobs:
 
       # The signed build must not read a toolchain or crate sources that an
       # earlier job on a shared runner could have written to ~/.cargo or
-      # ~/.rustup. Fresh homes cost a cold toolchain and registry fetch.
-      - name: Isolate the build from shared Rust homes
+      # ~/.rustup, so it never uses those homes. The runners sit behind an
+      # interactive outbound firewall (LuLu) that approves each executable
+      # path once; a toolchain installed under a fresh per-run directory was a
+      # new path every release and stalled at "syncing channel updates" until
+      # someone clicked Allow. So rustup and the pinned toolchain live at one
+      # fixed path per runner user, verified by pinned SHA-256 (rustup-init),
+      # exact version and a recorded tree digest, and installed under a flock.
+      # Only the toolchain is shared: CARGO_HOME (crate registry) is fresh per
+      # run and target/ is the clean checkout's. See scripts/ci_macos_release_rust.py.
+      # static.rust-lang.org is unreachable from the self-hosted runner for
+      # minutes at a time; v0.381.0 and v0.383.0 stayed drafts on it. The
+      # script retries with backoff, and the auto-release heal job re-runs
+      # what remains.
+      - name: Install pinned Rust toolchain at the fixed runner path
+        timeout-minutes: 45
         shell: bash
         run: |
           set -euo pipefail
-          root="${RUNNER_TEMP:?}/shipyard-rust-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          rm -rf "$root"
-          mkdir -p "$root/cargo" "$root/rustup"
-          echo "CARGO_HOME=$root/cargo" >> "$GITHUB_ENV"
-          echo "RUSTUP_HOME=$root/rustup" >> "$GITHUB_ENV"
-
-      # static.rust-lang.org is unreachable from the self-hosted runner for
-      # minutes at a time; v0.381.0 and v0.383.0 stayed drafts on it. Retry
-      # with backoff here, and the auto-release heal job re-runs what remains.
-      - name: Install Rust (attempt 1)
-        id: rust_1
-        continue-on-error: true
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-13
-        with:
-          toolchain: stable
-      - name: Back off before retrying Rust install
-        if: steps.rust_1.outcome == 'failure'
-        run: sleep 30
-      - name: Install Rust (attempt 2)
-        id: rust_2
-        if: steps.rust_1.outcome == 'failure'
-        continue-on-error: true
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-13
-        with:
-          toolchain: stable
-      - name: Back off before the last Rust install attempt
-        if: steps.rust_2.outcome == 'failure'
-        run: sleep 90
-      - name: Install Rust (attempt 3)
-        if: steps.rust_2.outcome == 'failure'
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-13
-        with:
-          toolchain: stable
+          python3 scripts/ci_macos_release_rust.py \
+            --root "${HOME:?}/.shipyard-release-rust" \
+            --toolchain "$SHIPYARD_RELEASE_RUST_TOOLCHAIN" \
+            --host aarch64-apple-darwin \
+            --rustup-version "$SHIPYARD_RELEASE_RUSTUP_VERSION" \
+            --rustup-init-sha256 "$SHIPYARD_RELEASE_RUSTUP_INIT_SHA256" \
+            --run-cargo-home "${RUNNER_TEMP:?}/shipyard-cargo-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --github-env "$GITHUB_ENV" \
+            --github-path "$GITHUB_PATH"
+      - name: Verify the release build uses the pinned toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "cargo: $(command -v cargo)"
+          echo "rustc: $(command -v rustc)"
+          rustc --version
+          cargo --version
+          case "$(command -v cargo)" in
+            "$RUSTUP_HOME/toolchains/$RUSTUP_TOOLCHAIN/bin/cargo") ;;
+            *) echo "cargo resolves outside the pinned toolchain" >&2; exit 1 ;;
+          esac
+          rustc --version | grep -q "^rustc ${SHIPYARD_RELEASE_RUST_TOOLCHAIN} "
 
       # No cargo cache: release binaries build from a clean target/, and a tag
       # ref can only restore its own or main's entries, neither of which holds
