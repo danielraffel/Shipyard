@@ -44,6 +44,14 @@ pub(super) fn render_report<W: Write>(
             }
         )
         .map_err(|error| io_failure(&error))?;
+        if let Some(api) = &repo.api_calls {
+            writeln!(
+                stdout,
+                "  github: rest={} graphql={} cache_hits={}",
+                api.rest, api.graphql, api.cache_hits
+            )
+            .map_err(|error| io_failure(&error))?;
+        }
         writeln!(
             stdout,
             "  stale-pr-run-wedge policy={} candidates={} receipts={}",

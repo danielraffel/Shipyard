@@ -153,6 +153,10 @@ struct RepoReport {
     /// left uncertain with the reason ([`mutation_outcome::reconcile`]).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     uncertain_mutations: Vec<crate::merge_queue_control::UncertainReconciliation>,
+    /// What this repository's pass asked GitHub, by call site
+    /// ([`crate::gh_pass`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    api_calls: Option<crate::gh_pass::GhPassReport>,
     /// Durable provider cooldown that deferred this repository's observation.
     #[serde(skip_serializing_if = "Option::is_none")]
     rate_limit_deferred: Option<pass_budget::RateLimitCooldown>,
@@ -386,7 +390,7 @@ enum PendingMutationKind {
     ForceCancel,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct LedgerAudit {
     at: String,
     repo: String,
@@ -857,10 +861,10 @@ pub(super) fn admission_clean_command<W: Write>(
     )
 }
 
-/// `runner admission-clean`. `read_actions` makes the observations behind a
-/// clean verdict, so they can spend a dedicated admission budget and reuse
-/// recent per-head reads; `actions` alone performs, and re-observes before,
-/// any cancellation.
+/// `runner admission-clean`. `read_actions` makes every census, including
+/// the ones around a cancellation, so they spend a dedicated admission budget
+/// and reuse recent per-head reads; `actions` performs the cancellation and
+/// its recovery.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(super) fn admission_clean_command_with_reads<W: Write>(
     args: &AdmissionCleanArgs,
@@ -1030,9 +1034,62 @@ pub(super) fn admission_clean_command_with_reads<W: Write>(
         );
     }
 
-    let _ledger_lock = acquire_admission_ledger_lock!(&blocker_run_ids);
-    let mut ledger = load_ledger(&ledger_path)?;
-    let pending = pending_admission_cancellations(&ledger, &canonical_repo, &base);
+    // A pending cancellation is steward-owned crash-recovery state: resuming
+    // it rewrites that record, so it needs the steward ledger lock and still
+    // defers while an apply pass holds it. Cancelling a superseded run does
+    // not: it writes no pending record, the per-run mutation guard serializes
+    // it against a steward cancelling the same run, and its only ledger write
+    // is an audit line. While a steward pass holds the lock (minutes), that
+    // audit line goes to an admission-owned sidecar instead of waiting, because
+    // the steward rewrites its whole in-memory ledger on save and would drop a
+    // line written into the shared file underneath it.
+    let ledger_lock = if observed_pending.is_empty() {
+        match try_acquire_ledger_lock(&ledger_path) {
+            Ok(lock) => lock,
+            Err(error) => return_verdict!(
+                Error,
+                "mutation_failed",
+                &canonical_repo,
+                &blocker_run_ids,
+                Some(error.message())
+            ),
+        }
+    } else {
+        Some(acquire_admission_ledger_lock!(&blocker_run_ids))
+    };
+    let audit_path = if ledger_lock.is_some() {
+        ledger_path.clone()
+    } else {
+        admission_audit_path(&ledger_path)
+    };
+    let (mut ledger, pending) = if ledger_lock.is_some() {
+        let ledger = load_ledger(&ledger_path)?;
+        let pending = pending_admission_cancellations(&ledger, &canonical_repo, &base);
+        (ledger, pending)
+    } else {
+        // A pending cancellation the running steward published since the
+        // first snapshot is still a queue hold the steward will resume.
+        let snapshot = load_ledger(&ledger_path)?;
+        let late_pending = pending_admission_cancellations(&snapshot, &canonical_repo, &base);
+        if !late_pending.is_empty() {
+            let blockers = admission_blocker_run_ids(&candidates, &blocking_only, &late_pending);
+            return_verdict!(
+                Defer,
+                "stewardship_in_progress",
+                &canonical_repo,
+                &blockers,
+                Some("another steward apply pass is already running")
+            );
+        }
+        (StewardLedger::default(), Vec::new())
+    };
+    let persist = |ledger: &StewardLedger| {
+        if ledger_lock.is_some() {
+            save_ledger(&ledger_path, ledger)
+        } else {
+            append_admission_audit(&audit_path, ledger)
+        }
+    };
     blocker_run_ids = admission_blocker_run_ids(&candidates, &blocking_only, &pending);
     // Reobserve all pre-lock blockers before deciding whether to admit or defer.
     let mutation_control = MutationControl {
@@ -1067,7 +1124,11 @@ pub(super) fn admission_clean_command_with_reads<W: Write>(
             );
         }
     }
-    match observe_admission_candidates(actions, &canonical_repo, &base, &labels, true) {
+    // The pre-cancel and post-cancel censuses are reads, so they spend the
+    // admission credential and reuse its per-head cache. A cached head can
+    // only hide a newer handoff status, which skips a cancellation rather than
+    // adding one; `apply_run_cancellation` still acts with `[github.auth]`.
+    match observe_admission_candidates(read_actions, &canonical_repo, &base, &labels, true) {
         Ok((refreshed_observation, refreshed_candidates, refreshed_blocking)) => {
             observation = refreshed_observation;
             candidates = refreshed_candidates;
@@ -1106,12 +1167,24 @@ pub(super) fn admission_clean_command_with_reads<W: Write>(
             MANAGED_LABEL,
             HANDOFF_CONTEXT,
             &default_provenance_blocking_labels(),
-            &ledger_path,
+            &audit_path,
             &mut ledger,
             &mutation_control,
         );
         if let Some(error) = error {
-            let _ = save_ledger(&ledger_path, &ledger);
+            let _ = persist(&ledger);
+            // The merge-queue control lock is taken without blocking, and a
+            // steward or another admission lane holds it for one GitHub call.
+            // That is a transient queue hold, not an operational failure.
+            if merge_queue_lock_contended(&error) {
+                return_verdict!(
+                    Defer,
+                    "mutation_in_progress",
+                    &canonical_repo,
+                    &blocker_run_ids,
+                    Some(&error)
+                );
+            }
             return_verdict!(
                 Error,
                 "mutation_failed",
@@ -1121,9 +1194,9 @@ pub(super) fn admission_clean_command_with_reads<W: Write>(
             );
         }
     }
-    save_ledger(&ledger_path, &ledger)?;
+    persist(&ledger)?;
     let (remaining, remaining_blocking) =
-        match observe_admission_candidates(actions, &canonical_repo, &base, &labels, true) {
+        match observe_admission_candidates(read_actions, &canonical_repo, &base, &labels, true) {
             Ok((_, candidates, blocking)) => (candidates, blocking),
             Err(error) => return_verdict!(
                 Error,
@@ -1308,6 +1381,23 @@ pub(super) fn steward_command<W: Write>(
     })
 }
 
+/// `actions` for one repository's pass: scoped to `repo` for the token
+/// helper (a scheduled pass runs outside any checkout, and one checkout's
+/// remote must never mint the token for another repository), counting its
+/// GitHub reads and reusing the base-policy and content-addressed answers it
+/// may cache ([`crate::gh_pass`]).
+fn repo_pass_actions(
+    actions: &GitHubActions,
+    repo: &str,
+) -> (GitHubActions, std::sync::Arc<crate::gh_pass::GhPass>) {
+    let pass = std::sync::Arc::new(crate::gh_pass::GhPass::caching());
+    let scoped = actions
+        .clone()
+        .with_repo_override(repo)
+        .with_pass(std::sync::Arc::clone(&pass));
+    (scoped, pass)
+}
+
 /// Close the members of rollups that landed on `base` lately, however they
 /// landed ([`crate::rollup::reconcile_if_enabled`]); nothing on a base that
 /// does not take rollups.
@@ -1340,8 +1430,37 @@ fn steward_repo(
     // Scope the token helper to this exact repository: a scheduled pass
     // runs from a directory that is not a checkout, and one checkout's
     // remote must never mint the token for another repository.
-    let scoped_actions = actions.clone().with_repo_override(repo);
+    let (scoped_actions, pass) = repo_pass_actions(actions, repo);
     let actions = &scoped_actions;
+    let (mut report, unhealthy) = steward_repo_observed(
+        actions,
+        pass_args,
+        repo,
+        ledger_path,
+        ledger,
+        remaining_preemptions,
+        mutation_control,
+        recovery_errors,
+        recovery_cancellations,
+    );
+    report.api_calls = Some(pass.report());
+    (report, unhealthy)
+}
+
+/// [`steward_repo`] once `actions` is scoped to `repo` and counting its
+/// GitHub reads.
+#[allow(clippy::too_many_arguments)]
+fn steward_repo_observed(
+    actions: &GitHubActions,
+    pass_args: &StewardCommandArgs,
+    repo: &str,
+    ledger_path: &Path,
+    ledger: &mut StewardLedger,
+    remaining_preemptions: &mut usize,
+    mutation_control: Option<&MutationControl>,
+    recovery_errors: &mut BTreeMap<String, Vec<String>>,
+    recovery_cancellations: &mut BTreeMap<String, Vec<CancellationReport>>,
+) -> (RepoReport, bool) {
     let mut repo_args = pass_args.clone();
     if let Some(budget) = pass_args.pass_budget {
         repo_args.pass_deadline = Some(Instant::now() + budget);
@@ -1457,6 +1576,7 @@ fn deferred_rate_limit_repo_report(
         stale_pr_run_wedge: stale_pr_wedge::repo_status(None, Vec::new(), ledger, repo),
         native_auto_merge_backstop: native_arm::NativeArmRepoStatus::default(),
         errors: Vec::new(),
+        api_calls: None,
         rate_limit_deferred: Some(cooldown),
     }
 }
@@ -1470,6 +1590,7 @@ fn unreadable_repo_report(
     RepoReport {
         rollup_reconciliation: Vec::new(),
         uncertain_mutations: Vec::new(),
+        api_calls: None,
         repo: repo.to_owned(),
         base: base.to_owned(),
         allow_auto_merge: false,
@@ -1545,6 +1666,7 @@ fn append_unmatched_recovery_errors(
         reports.push(RepoReport {
             rollup_reconciliation: Vec::new(),
             uncertain_mutations: Vec::new(),
+            api_calls: None,
             repo: repo.clone(),
             base,
             allow_auto_merge: false,
@@ -1580,6 +1702,7 @@ fn persist_final_ledger(
         reports.push(RepoReport {
             rollup_reconciliation: Vec::new(),
             uncertain_mutations: Vec::new(),
+            api_calls: None,
             repo: "steward".to_owned(),
             base: base.to_owned(),
             allow_auto_merge: false,
@@ -1595,6 +1718,50 @@ fn persist_final_ledger(
             rate_limit_deferred: None,
         });
     }
+}
+
+/// Whether `error` is another Shipyard process holding the merge-queue
+/// mutation control lock or authority, which the guard takes without waiting.
+fn merge_queue_lock_contended(error: &str) -> bool {
+    error.contains("another Shipyard process is performing a merge-queue mutation")
+        || error.contains("another Shipyard process owns merge-queue mutation authority")
+}
+
+/// The admission-owned audit file beside the steward ledger. Admission writes
+/// here only while a steward apply pass holds the steward ledger lock.
+fn admission_audit_path(ledger_path: &Path) -> PathBuf {
+    ledger_path.with_file_name("merge-steward-admission-audit.json")
+}
+
+/// How long admission waits for another admission to finish appending to the
+/// audit sidecar. Each holder only reads, appends and renames one small file.
+const ADMISSION_AUDIT_LOCK_WAIT: Duration = Duration::from_secs(5);
+
+/// Append `ledger`'s audit lines to the admission audit sidecar under its own
+/// lock, which no steward pass ever holds.
+fn append_admission_audit(path: &Path, ledger: &StewardLedger) -> Result<(), CliFailure> {
+    if ledger.audit.is_empty() {
+        return Ok(());
+    }
+    let deadline = Instant::now() + ADMISSION_AUDIT_LOCK_WAIT;
+    let _lock = loop {
+        if let Some(lock) = try_acquire_ledger_lock(path)? {
+            break lock;
+        }
+        if Instant::now() >= deadline {
+            return Err(CliFailure::new(
+                1,
+                format!("could not lock admission audit {}", path.display()),
+            ));
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    let mut sidecar = load_ledger(path)?;
+    sidecar.audit.extend(ledger.audit.iter().cloned());
+    if sidecar.audit.len() > 1_000 {
+        sidecar.audit.drain(..sidecar.audit.len() - 1_000);
+    }
+    save_ledger(path, &sidecar)
 }
 
 fn try_acquire_ledger_lock(

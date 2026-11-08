@@ -891,6 +891,14 @@ inside it is capped per attempt and retried once on a timeout, 5xx or dropped
 connection, within the same deadline. The PR is decided again on the next
 pass; there is nothing to repair on the PR.
 
+When a steward pass is slow or times out, read its `api_calls` (per repository
+in `runner steward --json`: REST, GraphQL, cache hits and a per-call-site
+breakdown) from a dry run before changing anything. A pull request whose
+failure the steward already published costs no GitHub read in later passes;
+the pass cache reuses only base-policy and content-addressed reads, never a
+review, comment, check, status, queue or pull-request read. See the
+[merge-steward reference](references/merge-steward.md#what-a-pass-costs-github-api_calls).
+
 It judges each first-parent change since the last `Version-Bump-Applied` marker
 on its own, then takes the highest level per surface. A
 `Version-Bump: <surface>=skip` trailer therefore skips only the change that
@@ -2493,7 +2501,7 @@ hours.
   live serialized protected-main `Shipyard merge steward` workflow; its exact
   workflow ref, event, SHA, run, and attempt are re-read from GitHub and bound
   with the candidate fingerprint in the remote receipt.
-- `shipyard runner admission-clean --repo <owner/repo> --base main --labels self-hosted,<exact-labels> --apply --json` — TartCI's last pre-JIT correctness gate. It emits a flat schema-v1 verdict with exit 0 `admit`, 3 `defer`, 1 operational error, or 2 invalid configuration. It inspects only managed PR/merge-group runs: a compatible queued job inside a superseded queued workflow may authorize cancellation, while one inside an `in_progress` workflow blocks admission but is never cancelled. Every GitHub call made while holding the exact-key observation lock shares one 120-second absolute budget. Observation contention returns typed `observation_in_progress` defer. A running steward apply pass returns `stewardship_in_progress` only when admission must write (resume a pending cancellation or cancel a run); read-only verdicts read the atomically published ledger snapshot instead of waiting on the steward's lock, and a pending cancellation there still defers `cancellation_pending`; a timeout or other non-contention observation or lock failure releases the lock and returns a typed error with bounded underlying detail. A non-authority machine returns `mutation_authority_required` instead of mutating. TartCI must treat every result except typed `admit` as fail-closed and discard the still-unregistered VM.
+- `shipyard runner admission-clean --repo <owner/repo> --base main --labels self-hosted,<exact-labels> --apply --json` — TartCI's last pre-JIT correctness gate. It emits a flat schema-v1 verdict with exit 0 `admit`, 3 `defer`, 1 operational error, or 2 invalid configuration. It inspects only managed PR/merge-group runs: a compatible queued job inside a superseded queued workflow may authorize cancellation, while one inside an `in_progress` workflow blocks admission but is never cancelled. Every GitHub call made while holding the exact-key observation lock shares one 120-second absolute budget. Observation contention returns typed `observation_in_progress` defer. A running steward apply pass returns `stewardship_in_progress` only when admission must resume a pending cancellation; cancelling a superseded run proceeds under the per-run mutation guard without waiting on the steward ledger lock, with its audit line written to `merge-steward-admission-audit.json` while a steward holds that lock, and a merge-queue control lock held by another process for its own mutation defers `mutation_in_progress`; read-only verdicts read the atomically published ledger snapshot instead of waiting on the steward's lock, and a pending cancellation there still defers `cancellation_pending`; a timeout or other non-contention observation or lock failure releases the lock and returns a typed error with bounded underlying detail. A non-authority machine returns `mutation_authority_required` instead of mutating. TartCI must treat every result except typed `admit` as fail-closed and discard the still-unregistered VM.
 - `shipyard runner kill --pid X --reason "..."` — kill a specific Worker; requires typed `KILL` confirmation
 
 ### `runner kill` recovery sequence
@@ -5354,7 +5362,7 @@ have deleted something load-bearing:
 |---|---|
 | `worker_process_custody.rs` | generic OS process custody, zero references to any workstream code. Only the word "custody" matched. |
 | `verify_current_companion_digest` | the parallel-proof canary's trust boundary (NOFOLLOW open, uid, `nlink == 1`, mode bits, TOCTOU dev/ino recheck). It merely *lived* in the deleted provider module. |
-| `runner steward --ledger` | the merge steward's retry/audit JSON file, not the work ledger. Pulp CI passes it on every run, so cutting it breaks Pulp. |
+| `runner steward --ledger` | the merge steward's retry/audit JSON file, not the work ledger. Pulp CI passes it on every run, so cutting it breaks Pulp. Superseded-run cancellations that `runner admission-clean` makes while a steward pass holds that ledger's lock are audited in `merge-steward-admission-audit.json` beside it instead; the durable per-mutation record for every cancellation is still the ship-state merge-queue guard audit (`guard.finish`). |
 | `shipyard-workstream-provider` | a release-pairing artifact. `package_release.py` fails the build without it, `install.sh` requires it, `fleet update` verifies its digest. Only one *entry point* was dead. |
 
 So when scoping a removal here, never decide by name match. Read the

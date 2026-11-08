@@ -373,7 +373,10 @@ These came from running it for real:
   repositories of the invocation unread rather than erroring through them. Each remaining row is reported `deferred_pass_budget` with
   its census decision, is never admitted, armed, enqueued or dequeued that
   pass, and is evaluated first on the next pass, after admission candidates
-  and queued or armed rows. Keep the budget a few minutes under the
+  and queued or armed rows. Deferred rows are taken oldest deferral first (a
+  deferred admission candidate also goes ahead of a fresh one), so a row
+  evaluated last pass goes to the back instead of re-taking the newest rows
+  every pass and starving the oldest. Keep the budget a few minutes under the
   scheduler's timeout so the in-flight pull request and the report fit.
 - **A timer job that touches an external volume can hang.** On macOS a
   background job opening a path on `/Volumes` can wait forever on a privacy

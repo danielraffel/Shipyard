@@ -541,6 +541,163 @@ fn running_steward_blocks_only_admission_that_must_write() {
     drop(steward);
 }
 
+/// A fake GitHub with one managed pull request at head b and one queued run
+/// of its superseded head a that a `self-hosted,ARM64` runner can claim.
+/// Cancelling the run records `cancelled` beside `calls`; afterwards the run
+/// reads as cancelled and is no longer listed as queued.
+fn superseded_run_actions(temp: &tempfile::TempDir, calls: &Path) -> GitHubActions {
+    let cancelled = calls.with_file_name("cancelled");
+    fake_gh(
+        temp,
+        &format!(
+            r#"
+printf '%s\n' "$*" >> '{calls}'
+run='{{"id":9001,"workflow_id":77,"run_attempt":1,"name":"Build and Test","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","head_branch":"feature","status":"STATUS","event":"pull_request","pull_requests":[{{"number":42}}],"created_at":"2026-08-30T00:00:00Z"}}'
+if [ -e '{cancelled}' ]; then status=cancelled; else status=queued; fi
+case "$*" in
+  "api repos/owner/repo") printf '%s' '{{"full_name":"owner/repo","allow_auto_merge":true}}' ;;
+  *"rules/branches/main --paginate --slurp"*) printf '%s' '[[]]' ;;
+  *"branches/main/protection/required_status_checks"*) printf '%s' '{{"contexts":[],"checks":[]}}' ;;
+  "api graphql "*) printf '%s' '{{"data":{{"repository":{{"mergeQueue":null}}}}}}' ;;
+  "pr list "*|"pr view "*|*"repos/owner/repo/pulls/42"*)
+    pr='{{"id":"PR_kw","number":42,"state":"OPEN","isDraft":false,"baseRefName":"main","headRefOid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","headRefName":"feature","mergeStateStatus":"CLEAN","autoMergeRequest":null,"labels":[{{"name":"shipyard:managed"}}],"statusCheckRollup":[{{"__typename":"StatusContext","context":"shipyard/steward-handoff","state":"SUCCESS","createdAt":"2026-08-30T00:00:00Z"}}]}}'
+    case "$*" in "pr list "*) printf '[%s]' "$pr" ;; *) printf '%s' "$pr" ;; esac ;;
+  *"/cancel"*) : > '{cancelled}'; printf '%s' '{{}}' ;;
+  *"actions/runs?status=queued"*)
+    if [ "$status" = queued ]; then printf '{{"workflow_runs":[%s]}}' "$(printf '%s' "$run" | sed "s/STATUS/$status/")"; else printf '%s' '{{"workflow_runs":[]}}'; fi ;;
+  *"actions/runs?status="*) printf '%s' '{{"workflow_runs":[]}}' ;;
+  *"actions/runs/9001/jobs"*)
+    printf '%s' '{{"jobs":[{{"name":"macOS","status":"queued","conclusion":null,"labels":["self-hosted","ARM64"],"runner_name":null}}]}}' ;;
+  *"actions/runs/9001"*) printf '%s' "$run" | sed "s/STATUS/$status/" ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+            calls = calls.display(),
+            cancelled = cancelled.display(),
+        ),
+    )
+    .with_repo_override("owner/repo")
+}
+
+/// Cancelling a superseded run writes no steward crash-recovery record, so a
+/// running steward apply pass (which holds the ledger lock for minutes) must
+/// not hold up the admission check `TartCI` runs before cloning a VM. The cancellation
+/// happens under the per-run mutation guard, the steward's ledger is left
+/// untouched for its own save, and the audit line lands in the sidecar.
+#[cfg(unix)]
+#[test]
+fn running_steward_does_not_block_admission_cancelling_a_superseded_run() {
+    let temp = tempfile::tempdir().expect("temp");
+    let control = mutation_control(&temp, "studio", "studio");
+    let paths = RuntimePaths::current_with_overrides(
+        RuntimeMode::Isolated,
+        Some(control.global_dir),
+        Some(control.state_dir),
+    );
+    let calls = temp.path().join("github-calls");
+    let actions = superseded_run_actions(&temp, &calls);
+    let args = AdmissionCleanArgs {
+        repo: "owner/repo".to_owned(),
+        base: "main".to_owned(),
+        labels: vec!["self-hosted".to_owned(), "ARM64".to_owned()],
+        apply: true,
+    };
+    let ledger_path = paths.state_dir.join("merge-steward.json");
+    save_ledger(&ledger_path, &StewardLedger::default()).expect("seed steward ledger");
+    let before = fs::read(&ledger_path).expect("steward ledger");
+    let steward = acquire_ledger_lock(&ledger_path).expect("active steward lock");
+
+    let mut output = Vec::new();
+    let started = Instant::now();
+    let exit = admission_clean_command(
+        &args,
+        temp.path(),
+        RuntimeMode::Isolated,
+        &paths,
+        &actions,
+        true,
+        &mut output,
+    )
+    .expect("admission verdict under a running steward");
+    let verdict = typed_verdict(exit, &output, 0, "cleaned");
+    assert_eq!(verdict["verdict"], "admit");
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "admission must not wait for the steward pass"
+    );
+    assert!(
+        fs::read_to_string(&calls).unwrap().contains("/cancel"),
+        "the superseded run must be cancelled"
+    );
+    assert_eq!(
+        fs::read(&ledger_path).expect("steward ledger"),
+        before,
+        "admission must not write the ledger a running steward will overwrite"
+    );
+    let audit = load_ledger(&admission_audit_path(&ledger_path)).expect("admission audit");
+    assert!(
+        audit
+            .audit
+            .iter()
+            .any(|entry| entry.subject == "run:9001"
+                && entry.action == "cancel_revalidated_queued_run"),
+        "the cancellation must still be audited"
+    );
+    drop(steward);
+}
+
+/// The run-mutation guard takes the global merge-queue control lock without
+/// blocking. A steward or another admission lane holding it for one GitHub
+/// call is a transient hold: admission defers rather than reporting an
+/// operational error, and cancels nothing.
+#[cfg(unix)]
+#[test]
+fn contended_merge_queue_control_lock_defers_admission() {
+    let temp = tempfile::tempdir().expect("temp");
+    let control = mutation_control(&temp, "studio", "studio");
+    let paths = RuntimePaths::current_with_overrides(
+        RuntimeMode::Isolated,
+        Some(control.global_dir),
+        Some(control.state_dir),
+    );
+    let calls = temp.path().join("github-calls");
+    let actions = superseded_run_actions(&temp, &calls);
+    let args = AdmissionCleanArgs {
+        repo: "owner/repo".to_owned(),
+        base: "main".to_owned(),
+        labels: vec!["self-hosted".to_owned(), "ARM64".to_owned()],
+        apply: true,
+    };
+    let lock_path = paths.state_dir.join("merge_queue").join("control.lock");
+    fs::create_dir_all(lock_path.parent().unwrap()).expect("control lock dir");
+    let held = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .expect("control lock");
+    held.try_lock_exclusive().expect("hold control lock");
+
+    let mut output = Vec::new();
+    let exit = admission_clean_command(
+        &args,
+        temp.path(),
+        RuntimeMode::Isolated,
+        &paths,
+        &actions,
+        true,
+        &mut output,
+    )
+    .expect("typed verdict");
+    let verdict = typed_verdict(exit, &output, 3, "mutation_in_progress");
+    assert_eq!(verdict["verdict"], "defer");
+    assert!(
+        !fs::read_to_string(&calls).unwrap().contains("/cancel"),
+        "nothing may be cancelled without the control lock"
+    );
+    drop(held);
+}
+
 /// The #609 shape, deterministically: a child forked while a steward holds its
 /// ledger or observation lock keeps a duplicate of the locked descriptor until
 /// its exec. Releasing must not depend on that duplicate closing first.
@@ -689,4 +846,75 @@ fn clean_admission_reads_use_the_read_client_and_reuse_per_head_reads() {
     assert_eq!(settings_reads(&read_calls), 0);
     assert_eq!(count(&read_calls, "pr list "), 4);
     assert_eq!(count(&read_calls, "status=queued"), 2);
+}
+
+/// On the lock-free cancel path the censuses before and after the
+/// cancellation are reads, so they spend the admission read client; only the
+/// cancellation itself spends the shared `[github.auth]` client.
+#[cfg(unix)]
+#[test]
+fn admission_cancel_path_reads_with_the_read_client_and_cancels_with_the_shared_one() {
+    let temp = tempfile::tempdir().expect("temp");
+    let control = mutation_control(&temp, "studio", "studio");
+    let paths = RuntimePaths::current_with_overrides(
+        RuntimeMode::Isolated,
+        Some(control.global_dir),
+        Some(control.state_dir),
+    );
+    // One `cancelled` marker beside both call logs, so a cancellation the
+    // shared client makes is what the read client then observes.
+    let shared_calls = temp.path().join("shared-calls");
+    let read_calls = temp.path().join("read-calls");
+    let shared_dir = tempfile::tempdir().expect("shared gh");
+    let reads_dir = tempfile::tempdir().expect("reads gh");
+    let shared = superseded_run_actions(&shared_dir, &shared_calls);
+    let reads = superseded_run_actions(&reads_dir, &read_calls).with_read_cache(
+        crate::cloud::ReadCache::new(
+            paths.state_dir.join("admission-read-cache"),
+            Duration::from_mins(3),
+        ),
+    );
+    let args = AdmissionCleanArgs {
+        repo: "owner/repo".to_owned(),
+        base: "main".to_owned(),
+        labels: vec!["self-hosted".to_owned(), "ARM64".to_owned()],
+        apply: true,
+    };
+    let mut output = Vec::new();
+    let exit = admission_clean_command_with_reads(
+        &args,
+        temp.path(),
+        RuntimeMode::Isolated,
+        &paths,
+        &shared,
+        &reads,
+        true,
+        &mut output,
+    )
+    .expect("admission verdict");
+    typed_verdict(exit, &output, 0, "cleaned");
+    let shared_log = fs::read_to_string(&shared_calls).unwrap_or_default();
+    let read_log = fs::read_to_string(&read_calls).unwrap_or_default();
+    assert!(shared_log.contains("/cancel"), "{shared_log}");
+    assert!(!read_log.contains("/cancel"), "{read_log}");
+    // The census (repository policy, the open-PR list and per-head reads)
+    // is the read client's. The shared client still makes the cancellation's
+    // own exact-run fence (the PR, the queue and the run), fresh, beside it.
+    for census in [
+        "pr list ",
+        "rules/branches",
+        "protection/required_status_checks",
+    ] {
+        assert!(
+            !shared_log.contains(census),
+            "census `{census}` spent the shared client: {shared_log}"
+        );
+        assert!(read_log.contains(census), "read client skipped `{census}`");
+    }
+    assert!(
+        !shared_log
+            .lines()
+            .any(|line| line == "api repos/owner/repo"),
+        "{shared_log}"
+    );
 }
