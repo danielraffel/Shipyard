@@ -1647,6 +1647,13 @@ license had lapsed exit 69 -- including a rollback -- while a plain
 `shipyard update` on the same host worked. The immediate host fix is
 `sudo xcodebuild -license accept`.
 
+A refreshed daemon whose launch argv omits its watch set fails fleet-update's
+launch binding (`launch identity: rendered argv sha256 … != loaded argv
+sha256 …`) and rolls the host back. That was a refresh on a host with no
+running daemon: `daemon run` without `--repo` defaulted to the fleet. Spawn
+sites now pass the resolved default explicitly, so the refresh run by the
+release being installed binds whether or not a daemon was running.
+
 `--lagging-only` reads each selected host first and skips
 hosts already at or ahead of the target. Reinstalling such a host cannot be
 rolled back and restarts its daemon. The release stage and reconcile always use

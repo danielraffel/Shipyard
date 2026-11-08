@@ -3969,6 +3969,17 @@ installed binary's `daemon refresh` with explicit mode/global/state paths and
 requires the typed refresh receipt. Do not call old in-process refresh code or
 accept child exit zero without the exact receipt.
 
+**A spawned daemon always carries its watch set on argv.** fleet-update binds
+the refreshed daemon by comparing the launch rendered from its reported
+`configured_repos` with the live `ps` argv. A `daemon run` with no `--repo`
+picks the fleet default itself, so a refresh on a host whose daemon was not
+running produced an argv without the repositories the daemon then reported,
+and the update rolled back (m1 at v0.345.0, m5 at v0.394.0, issues #907/#908).
+Refresh and execution auto-start now resolve that default before spawning and
+pass it explicitly; keep any new spawn site on `explicit_daemon_repos`. The
+evidence error names the broken binding (`launch identity: rendered argv
+sha256 … != loaded argv sha256 …`).
+
 Daemon-owned validation must not use the daemon's protected `TMPDIR` for test
 fixtures. When local validation inherits that state-owned path, Shipyard gives
 the validation subprocess a fresh owner-private directory under the platform's
