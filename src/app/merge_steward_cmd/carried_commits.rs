@@ -104,7 +104,7 @@ const OPEN_PULL_COMMITS_QUERY: &str = "query($owner:String!,$name:String!,$curso
      repository(owner:$owner,name:$name){pullRequests(states:OPEN,first:50,after:$cursor){\
      pageInfo{hasNextPage endCursor} nodes{number headRefName headRefOid baseRefName \
      isCrossRepository author{login} carriedCommits:commits(first:100){totalCount \
-     nodes{commit{oid}}}}}}}";
+     nodes{commit{oid parents(first:1){nodes{oid}}}}}}}}}";
 
 /// The commits a pull request carries, as far as the steward read them.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -128,7 +128,13 @@ pub(super) struct OpenPr {
     pub cross_repository: bool,
     pub author: Option<String>,
     pub commits: CommitList,
+    /// Each listed commit's first parent, when the listing carried every
+    /// commit's parents; `None` when it did not (a listing read over REST).
+    pub first_parents: Option<FirstParents>,
 }
+
+/// Each commit's first parent (`None` for a root commit).
+pub(super) type FirstParents = BTreeMap<String, Option<String>>;
 
 /// The candidate under admission.
 #[derive(Clone, Debug)]
@@ -223,6 +229,76 @@ fn unrelated<'a>(
         .filter(move |q| q.cross_repository || q.head_ref != base_ref)
         // Q is stacked on P, directly or through other open pull requests.
         .filter(move |q| !stacked_on(q, head_ref, others))
+}
+
+/// The commits on `head`'s first-parent line, as far as `first_parents`
+/// knows them. Pure.
+fn first_parent_line(head: &str, first_parents: &FirstParents) -> BTreeSet<String> {
+    let mut line = BTreeSet::new();
+    let mut at = Some(head.to_owned());
+    while let Some(sha) = at {
+        let Some(parent) = first_parents.get(&sha) else {
+            break;
+        };
+        if !line.insert(sha) {
+            break;
+        }
+        at = parent.clone();
+    }
+    line
+}
+
+/// Drop from each overlap the commits that are P's own and only merged into
+/// Q: those on P's first-parent line but not on Q's. A stack's bottom pull
+/// request P is then not held by a child Q that merged P's branch, because a
+/// commit belongs to the pull request whose own line introduced it, and a
+/// descendant never makes its ancestor carry it. A commit on Q's own line
+/// (P merged Q's branch, or P branched from Q's commits) or on neither line
+/// (both merged a third branch) still counts. Without either side's parents
+/// nothing is dropped. Pure.
+fn without_own_line(
+    overlaps: Vec<Carried>,
+    head_sha: &str,
+    own_first_parents: Option<&FirstParents>,
+    others: &[OpenPr],
+) -> Vec<Carried> {
+    let Some(own_first_parents) = own_first_parents else {
+        return overlaps;
+    };
+    let own_line = first_parent_line(head_sha, own_first_parents);
+    overlaps
+        .into_iter()
+        .filter_map(|overlap| match overlap {
+            Carried::Shares {
+                number,
+                head_sha: q_head,
+                shared,
+            } => {
+                let Some(q_first_parents) = others
+                    .iter()
+                    .find(|q| q.number == number)
+                    .and_then(|q| q.first_parents.as_ref())
+                else {
+                    return Some(Carried::Shares {
+                        number,
+                        head_sha: q_head,
+                        shared,
+                    });
+                };
+                let q_line = first_parent_line(&q_head, q_first_parents);
+                let shared: Vec<String> = shared
+                    .into_iter()
+                    .filter(|sha| q_line.contains(sha) || !own_line.contains(sha))
+                    .collect();
+                (!shared.is_empty()).then_some(Carried::Shares {
+                    number,
+                    head_sha: q_head,
+                    shared,
+                })
+            }
+            unbounded @ Carried::Unbounded { .. } => Some(unbounded),
+        })
+        .collect()
 }
 
 /// Whether `q`'s base-branch chain, followed through other open (same
@@ -641,13 +717,16 @@ pub(super) fn refusal_with(
     cache: &mut PassCache,
     judge: &mut dyn FnMut(&OpenPr) -> Judgement,
 ) -> Option<Refusal> {
-    let own = match compare_commits(run_gh, repo, base, head_sha) {
-        Ok(CommitList::Complete(commits)) => commits,
-        Ok(CommitList::OverCap { .. }) => {
-            return over_cap_refusal(run_gh, repo, base, number, head_ref, head_sha, cache, judge);
-        }
-        Err(error) => return Some(unreadable(error)),
-    };
+    let (own, own_first_parents) =
+        match compare_commits_with_first_parents(run_gh, repo, base, head_sha) {
+            Ok((CommitList::Complete(commits), first_parents)) => (commits, first_parents),
+            Ok((CommitList::OverCap { .. }, _)) => {
+                return over_cap_refusal(
+                    run_gh, repo, base, number, head_ref, head_sha, cache, judge,
+                );
+            }
+            Err(error) => return Some(unreadable(error)),
+        };
     if own.is_empty() {
         return None;
     }
@@ -665,6 +744,7 @@ pub(super) fn refusal_with(
         commits: &own,
     };
     let overlaps = carried(&candidate, others);
+    let overlaps = without_own_line(overlaps, head_sha, own_first_parents.as_ref(), others);
     let mut judged = Vec::with_capacity(overlaps.len());
     for overlap in overlaps {
         let q = others
@@ -716,7 +796,19 @@ fn compare_commits(
     base: &str,
     head: &str,
 ) -> Result<CommitList, String> {
+    compare_commits_with_first_parents(run_gh, repo, base, head).map(|(commits, _)| commits)
+}
+
+/// [`compare_commits`], with each commit's first parent when every page
+/// carried them.
+fn compare_commits_with_first_parents(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    base: &str,
+    head: &str,
+) -> Result<(CommitList, Option<FirstParents>), String> {
     let mut shas = BTreeSet::new();
+    let mut first_parents = Some(FirstParents::new());
     let mut total = 0;
     let mut basis = None;
     for page in 1..=MAX_COMMITS_PER_PR.div_ceil(COMPARE_PAGE) {
@@ -724,7 +816,8 @@ fn compare_commits(
             "api".to_owned(),
             format!("repos/{repo}/compare/{base}...{head}?per_page={COMPARE_PAGE}&page={page}"),
             "--jq".to_owned(),
-            "{total: .total_commits, merge_base: .merge_base_commit.sha, shas: [.commits[].sha]}"
+            "{total: .total_commits, merge_base: .merge_base_commit.sha, shas: [.commits[].sha], \
+             first_parents: [.commits[] | .parents[0].sha]}"
                 .to_owned(),
         ])
         .map_err(|error| format!("compare {base}...{head} unreadable: {error}"))?;
@@ -734,20 +827,37 @@ fn compare_commits(
             .get("total")
             .and_then(Value::as_u64)
             .ok_or_else(|| format!("compare {base}...{head} has no total_commits"))?;
-        let page_shas = sha_array(value.get("shas"))
+        let page_list = value
+            .get("shas")
+            .and_then(Value::as_array)
+            .and_then(|shas| {
+                shas.iter()
+                    .map(|sha| sha.as_str().map(str::to_owned))
+                    .collect::<Option<Vec<_>>>()
+            })
             .ok_or_else(|| format!("compare {base}...{head} has no commit list"))?;
         same_basis(&mut basis, page_total, &value, base, head)?;
         total = usize::try_from(page_total).unwrap_or(usize::MAX);
         if total > MAX_COMMITS_PER_PR {
-            return Ok(CommitList::OverCap { total });
+            return Ok((CommitList::OverCap { total }, None));
         }
-        let read = page_shas.len();
-        shas.extend(page_shas);
+        first_parents = first_parents.and_then(|mut known| {
+            let parents = value.get("first_parents")?.as_array()?;
+            if parents.len() != page_list.len() {
+                return None;
+            }
+            for (sha, parent) in page_list.iter().zip(parents) {
+                known.insert(sha.clone(), parent.as_str().map(str::to_owned));
+            }
+            Some(known)
+        });
+        let read = page_list.len();
+        shas.extend(page_list);
         if shas.len() >= total || read < COMPARE_PAGE {
             break;
         }
     }
-    Ok(bounded(total, shas))
+    Ok((bounded(total, shas), first_parents))
 }
 
 /// [`refusal_with`] for a candidate P whose own commits are over the cap and
@@ -1030,14 +1140,6 @@ fn bounded(total: usize, shas: BTreeSet<String>) -> CommitList {
     }
 }
 
-fn sha_array(value: Option<&Value>) -> Option<BTreeSet<String>> {
-    value?
-        .as_array()?
-        .iter()
-        .map(|sha| sha.as_str().map(str::to_owned))
-        .collect()
-}
-
 /// Every open pull request in `repo` with its commits.
 fn open_pull_requests(run_gh: RunGh<'_>, repo: &str) -> Result<Vec<OpenPr>, String> {
     let (owner, name) = repo
@@ -1114,7 +1216,9 @@ fn parse_open_pr(run_gh: RunGh<'_>, repo: &str, node: &Value) -> Result<OpenPr, 
         .and_then(Value::as_u64)
         .ok_or_else(|| format!("#{number}: no commit count"))?;
     let total = usize::try_from(total).unwrap_or(usize::MAX);
+    let mut first_parents = None;
     let commits = if total <= LISTING_COMMITS {
+        first_parents = listed_first_parents(node);
         let shas = node
             .pointer("/carriedCommits/nodes")
             .and_then(Value::as_array)
@@ -1148,7 +1252,26 @@ fn parse_open_pr(run_gh: RunGh<'_>, repo: &str, node: &Value) -> Result<OpenPr, 
             .and_then(Value::as_str)
             .map(str::to_owned),
         commits,
+        first_parents,
     })
+}
+
+/// Each listed commit's first parent, or `None` when any commit's parents are
+/// missing from the listing.
+fn listed_first_parents(node: &Value) -> Option<FirstParents> {
+    node.pointer("/carriedCommits/nodes")?
+        .as_array()?
+        .iter()
+        .map(|commit| {
+            let oid = commit.pointer("/commit/oid")?.as_str()?.to_owned();
+            let parents = commit.pointer("/commit/parents/nodes")?.as_array()?;
+            let first = match parents.first() {
+                Some(parent) => Some(parent.get("oid")?.as_str()?.to_owned()),
+                None => None,
+            };
+            Some((oid, first))
+        })
+        .collect()
 }
 
 /// Up to [`MAX_COMMITS_PER_PR`] commits of pull request `number`, over REST.

@@ -29,6 +29,7 @@ fn open(number: u64, head_ref: &str, base_ref: &str, head: &str, shas: &[&str]) 
         cross_repository: false,
         author: None,
         commits: CommitList::Complete(set(shas)),
+        first_parents: None,
     }
 }
 
@@ -1299,4 +1300,202 @@ fn an_over_cap_stacked_q_is_narrowed_before_the_over_cap_decision() {
         }),
         None
     );
+}
+
+// A stack whose bottom pull request lands first (Shipyard#1162): the middle
+// pull request merged the bottom one's branch but targets a branch that is no
+// longer an open pull request, so it is not recognised as stacked on it.
+const STACK_MAIN: &str = "5700000000000000000000000000000000000000";
+const BOTTOM_1: &str = "5700000000000000000000000000000000000b01";
+const BOTTOM_2: &str = "5700000000000000000000000000000000000b02";
+const MIDDLE_1: &str = "5700000000000000000000000000000000000a01";
+const MIDDLE_MERGE: &str = "5700000000000000000000000000000000000a02";
+const TOP_1: &str = "5700000000000000000000000000000000000c01";
+
+/// An open pull request listing whose commits carry their first parents.
+fn parented_listing(prs: &[(&OpenPr, &[(&str, Option<&str>)])]) -> serde_json::Value {
+    let nodes = prs
+        .iter()
+        .map(|(pr, commits)| {
+            json!({
+                "number": pr.number,
+                "headRefName": pr.head_ref,
+                "baseRefName": pr.base_ref,
+                "headRefOid": pr.head_sha,
+                "isCrossRepository": false,
+                "author": {"login": "someone"},
+                "carriedCommits": {
+                    "totalCount": commits.len(),
+                    "nodes": commits.iter().map(|(oid, parent)| json!({"commit": {
+                        "oid": oid,
+                        "parents": {"nodes": parent.map(|p| vec![json!({"oid": p})]).unwrap_or_default()},
+                    }})).collect::<Vec<_>>(),
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({"data": {"repository": {"pullRequests": {
+        "pageInfo": {"hasNextPage": false, "endCursor": null},
+        "nodes": nodes,
+    }}}})
+}
+
+fn own_compare(commits: &[(&str, &str)]) -> String {
+    json!({
+        "total": commits.len(),
+        "merge_base": STACK_MAIN,
+        "shas": commits.iter().map(|(sha, _)| sha).collect::<Vec<_>>(),
+        "first_parents": commits.iter().map(|(_, parent)| parent).collect::<Vec<_>>(),
+    })
+    .to_string()
+}
+
+struct Stack {
+    bottom: OpenPr,
+    middle: OpenPr,
+    top: OpenPr,
+}
+
+fn stack3() -> Stack {
+    Stack {
+        bottom: open(
+            11765,
+            "feature/bottom",
+            "main",
+            BOTTOM_2,
+            &[BOTTOM_1, BOTTOM_2],
+        ),
+        middle: open(
+            11772,
+            "feature/middle",
+            "feature/merged-away",
+            MIDDLE_MERGE,
+            &[MIDDLE_1, BOTTOM_1, BOTTOM_2, MIDDLE_MERGE],
+        ),
+        top: open(11790, "feature/top", "feature/middle", TOP_1, &[TOP_1]),
+    }
+}
+
+const BOTTOM_LINE: [(&str, Option<&str>); 2] =
+    [(BOTTOM_1, Some(STACK_MAIN)), (BOTTOM_2, Some(BOTTOM_1))];
+// The middle merged the bottom's branch: the merge's first parent is its own.
+const MIDDLE_LINE: [(&str, Option<&str>); 4] = [
+    (MIDDLE_1, Some(STACK_MAIN)),
+    (BOTTOM_1, Some(STACK_MAIN)),
+    (BOTTOM_2, Some(BOTTOM_1)),
+    (MIDDLE_MERGE, Some(MIDDLE_1)),
+];
+const TOP_LINE: [(&str, Option<&str>); 1] = [(TOP_1, Some(MIDDLE_MERGE))];
+
+fn stack_refusal(
+    listing: &str,
+    candidate: &OpenPr,
+    own: &str,
+    judged: &Cell<usize>,
+    judgement: &Judgement,
+) -> Option<super::Refusal> {
+    let run_gh = |argv: &[String]| -> Result<String, String> {
+        let joined = argv.join(" ");
+        if joined.contains(&format!("compare/main...{}", candidate.head_sha)) {
+            return Ok(own.to_owned());
+        }
+        if joined.contains(&format!("compare/feature/merged-away...{MIDDLE_MERGE}")) {
+            return Ok(
+                json!({"total": 4, "shas": [MIDDLE_1, BOTTOM_1, BOTTOM_2, MIDDLE_MERGE]})
+                    .to_string(),
+            );
+        }
+        if joined.contains("OPEN") {
+            return Ok(listing.to_owned());
+        }
+        Err(format!("unexpected: {joined}"))
+    };
+    let mut judge = |_: &OpenPr| {
+        judged.set(judged.get() + 1);
+        judgement.clone()
+    };
+    refusal_with(
+        &run_gh,
+        "Generous-Corp/pulp",
+        "main",
+        candidate.number,
+        &candidate.head_ref,
+        &candidate.head_sha,
+        &mut PassCache::default(),
+        &mut judge,
+    )
+}
+
+#[test]
+fn a_stacks_approved_bottom_is_not_held_by_a_child_that_merged_it() {
+    let stack = stack3();
+    let listing = parented_listing(&[
+        (&stack.bottom, &BOTTOM_LINE),
+        (&stack.middle, &MIDDLE_LINE),
+        (&stack.top, &TOP_LINE),
+    ])
+    .to_string();
+    let own = own_compare(&[(BOTTOM_1, STACK_MAIN), (BOTTOM_2, BOTTOM_1)]);
+    let judged = Cell::new(0);
+    let unapproved = Judgement::Unapproved("no counted APPROVE".to_owned());
+    assert_eq!(
+        stack_refusal(&listing, &stack.bottom, &own, &judged, &unapproved),
+        None
+    );
+    assert_eq!(judged.get(), 0, "the bottom's own commits read no approval");
+}
+
+#[test]
+fn an_approved_middle_is_still_held_by_its_unapproved_bottom() {
+    let stack = stack3();
+    let listing = parented_listing(&[
+        (&stack.bottom, &BOTTOM_LINE),
+        (&stack.middle, &MIDDLE_LINE),
+        (&stack.top, &TOP_LINE),
+    ])
+    .to_string();
+    let own = own_compare(&[
+        (MIDDLE_1, STACK_MAIN),
+        (BOTTOM_1, STACK_MAIN),
+        (BOTTOM_2, BOTTOM_1),
+        (MIDDLE_MERGE, MIDDLE_1),
+    ]);
+    let judged = Cell::new(0);
+    let unapproved = Judgement::Unapproved("no counted APPROVE".to_owned());
+    let refusal = stack_refusal(&listing, &stack.middle, &own, &judged, &unapproved)
+        .expect("the middle carries the unapproved bottom");
+    assert_eq!(refusal.token, "carries_unapproved_commits:#11765");
+    assert!(refusal.detail.contains(BOTTOM_1), "{}", refusal.detail);
+    assert!(refusal.detail.contains(BOTTOM_2), "{}", refusal.detail);
+}
+
+#[test]
+fn a_head_built_on_an_unapproved_prs_line_is_still_refused() {
+    // P branched from Q's commits: they are on both first-parent lines.
+    const P_TIP: &str = "5700000000000000000000000000000000000d01";
+    let q = open(11800, "feature/q", "main", BOTTOM_2, &[BOTTOM_1, BOTTOM_2]);
+    let p = open(11801, "feature/p", "main", P_TIP, &[]);
+    let listing = parented_listing(&[(&q, &BOTTOM_LINE)]).to_string();
+    let own = own_compare(&[
+        (BOTTOM_1, STACK_MAIN),
+        (BOTTOM_2, BOTTOM_1),
+        (P_TIP, BOTTOM_2),
+    ]);
+    let judged = Cell::new(0);
+    let unapproved = Judgement::Unapproved("held".to_owned());
+    let refusal = stack_refusal(&listing, &p, &own, &judged, &unapproved).expect("refused");
+    assert_eq!(refusal.token, "carries_unapproved_commits:#11800");
+}
+
+#[test]
+fn without_parents_a_stacks_bottom_is_judged_as_before() {
+    // A listing without parents (read over REST) drops nothing.
+    let stack = stack3();
+    let listing = listing(&[(&stack.bottom, 2), (&stack.middle, 4), (&stack.top, 1)]).to_string();
+    let own = own_compare(&[(BOTTOM_1, STACK_MAIN), (BOTTOM_2, BOTTOM_1)]);
+    let judged = Cell::new(0);
+    let unapproved = Judgement::Unapproved("no counted APPROVE".to_owned());
+    let refusal = stack_refusal(&listing, &stack.bottom, &own, &judged, &unapproved)
+        .expect("refused without parents");
+    assert_eq!(refusal.token, "carries_unapproved_commits:#11772");
 }
