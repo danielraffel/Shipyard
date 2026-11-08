@@ -1141,6 +1141,18 @@ pub(super) fn admission_clean_command<W: Write>(
         );
         if let Some(error) = error {
             let _ = persist(&ledger);
+            // The merge-queue control lock is taken without blocking, and a
+            // steward or another admission lane holds it for one GitHub call.
+            // That is a transient queue hold, not an operational failure.
+            if merge_queue_lock_contended(&error) {
+                return_verdict!(
+                    Defer,
+                    "mutation_in_progress",
+                    &canonical_repo,
+                    &blocker_run_ids,
+                    Some(&error)
+                );
+            }
             return_verdict!(
                 Error,
                 "mutation_failed",
@@ -1674,6 +1686,13 @@ fn persist_final_ledger(
             rate_limit_deferred: None,
         });
     }
+}
+
+/// Whether `error` is another Shipyard process holding the merge-queue
+/// mutation control lock or authority, which the guard takes without waiting.
+fn merge_queue_lock_contended(error: &str) -> bool {
+    error.contains("another Shipyard process is performing a merge-queue mutation")
+        || error.contains("another Shipyard process owns merge-queue mutation authority")
 }
 
 /// The admission-owned audit file beside the steward ledger. Admission writes

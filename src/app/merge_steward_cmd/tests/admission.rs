@@ -646,6 +646,58 @@ fn running_steward_does_not_block_admission_cancelling_a_superseded_run() {
     drop(steward);
 }
 
+/// The run-mutation guard takes the global merge-queue control lock without
+/// blocking. A steward or another admission lane holding it for one GitHub
+/// call is a transient hold: admission defers rather than reporting an
+/// operational error, and cancels nothing.
+#[cfg(unix)]
+#[test]
+fn contended_merge_queue_control_lock_defers_admission() {
+    let temp = tempfile::tempdir().expect("temp");
+    let control = mutation_control(&temp, "studio", "studio");
+    let paths = RuntimePaths::current_with_overrides(
+        RuntimeMode::Isolated,
+        Some(control.global_dir),
+        Some(control.state_dir),
+    );
+    let calls = temp.path().join("github-calls");
+    let actions = superseded_run_actions(&temp, &calls);
+    let args = AdmissionCleanArgs {
+        repo: "owner/repo".to_owned(),
+        base: "main".to_owned(),
+        labels: vec!["self-hosted".to_owned(), "ARM64".to_owned()],
+        apply: true,
+    };
+    let lock_path = paths.state_dir.join("merge_queue").join("control.lock");
+    fs::create_dir_all(lock_path.parent().unwrap()).expect("control lock dir");
+    let held = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .expect("control lock");
+    held.try_lock_exclusive().expect("hold control lock");
+
+    let mut output = Vec::new();
+    let exit = admission_clean_command(
+        &args,
+        temp.path(),
+        RuntimeMode::Isolated,
+        &paths,
+        &actions,
+        true,
+        &mut output,
+    )
+    .expect("typed verdict");
+    let verdict = typed_verdict(exit, &output, 3, "mutation_in_progress");
+    assert_eq!(verdict["verdict"], "defer");
+    assert!(
+        !fs::read_to_string(&calls).unwrap().contains("/cancel"),
+        "nothing may be cancelled without the control lock"
+    );
+    drop(held);
+}
+
 /// The #609 shape, deterministically: a child forked while a steward holds its
 /// ledger or observation lock keeps a duplicate of the locked descriptor until
 /// its exec. Releasing must not depend on that duplicate closing first.
