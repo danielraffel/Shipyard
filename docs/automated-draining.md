@@ -352,7 +352,10 @@ These came from running it for real:
   scheduler's timeout, and a killed pass prints no report. Past
   `--pass-budget-secs` (default 240; 0 disables) an apply pass starts no new
   per-PR work, and it does the same once GitHub reports the token's API rate
-  limit exceeded. Each remaining row is reported `deferred_pass_budget` with
+  limit exceeded. The budget is per repository: each repository's clock starts
+  when its observation starts, so an earlier repository never starves a later
+  one. A rate limit while observing a repository leaves the remaining
+  repositories of the invocation unread rather than erroring through them. Each remaining row is reported `deferred_pass_budget` with
   its census decision, is never admitted, armed, enqueued or dequeued that
   pass, and is evaluated first on the next pass, after admission candidates
   and queued or armed rows. Keep the budget a few minutes under the

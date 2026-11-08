@@ -59,8 +59,12 @@ pub(super) struct StewardCommandArgs {
     /// unapproved queue entries or only reports them. Read from the
     /// machine-global config by [`steward_command`].
     pub(super) unapproved_dequeue: unapproved_admission::DequeueMode,
-    /// Past this instant a pass starts no new per-PR work; see
-    /// `pass_budget`. `None` never defers.
+    /// Each repository's time budget (`--pass-budget-secs`); its clock
+    /// starts when that repository's observation starts, so a later
+    /// repository is never starved by an earlier one. `None` never defers.
+    pub(super) pass_budget: Option<Duration>,
+    /// Past this instant the current repository starts no new per-PR work;
+    /// see `pass_budget`. Set per repository from `pass_budget`.
     pub(super) pass_deadline: Option<Instant>,
     pub(super) apply: bool,
     pub(super) ledger: Option<PathBuf>,
@@ -1173,12 +1177,31 @@ pub(super) fn steward_command<W: Write>(
     let mut unhealthy = false;
     let mut remaining_preemptions =
         usize::from(!recovery_owned_preemption_budget && ledger.pending_cancellations.is_empty());
+    let pass_args = args;
+    let mut rate_limited: Option<String> = None;
     for repo in repos {
         // Scope the token helper to this exact repository: a scheduled pass
         // runs from a directory that is not a checkout, and one checkout's
         // remote must never mint the token for another repository.
         let scoped_actions = actions.clone().with_repo_override(&repo);
         let actions = &scoped_actions;
+        // A rate limit spends the token for every repository alike: the rest
+        // are reported unread rather than spending the pass on errors.
+        if let Some(error) = rate_limited.as_ref() {
+            unhealthy = true;
+            reports.push(unreadable_repo_report(
+                &repo,
+                &pass_args.base,
+                &ledger,
+                format!("{}: not observed this pass; {error}", pass_budget::DEFERRED),
+            ));
+            continue;
+        }
+        let mut repo_args = pass_args.clone();
+        if let Some(budget) = pass_args.pass_budget {
+            repo_args.pass_deadline = Some(Instant::now() + budget);
+        }
+        let args = &repo_args;
         match observe_repo(actions, &repo, &args.base, args.preempt_capacity) {
             Ok(observation) => {
                 let (mut report, failed, planned_preemptions) = apply_repo_plan(
@@ -1209,10 +1232,14 @@ pub(super) fn steward_command<W: Write>(
             }
             Err(error) => {
                 unhealthy = true;
+                if pass_budget::is_rate_limited(&error.to_string()) {
+                    rate_limited = Some(format!("GitHub rate-limited observing {repo}"));
+                }
                 reports.push(unreadable_repo_report(&repo, &args.base, &ledger, error));
             }
         }
     }
+    let args = pass_args;
     append_unmatched_recovery_errors(
         recovery_errors,
         recovery_cancellations,
@@ -1645,6 +1672,7 @@ fn single_pr_dry_run(
         approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
         wake_owner: false,
         unapproved_dequeue: DequeueMode::Report,
+        pass_budget: None,
         pass_deadline: None,
         apply: false,
         ledger: None,

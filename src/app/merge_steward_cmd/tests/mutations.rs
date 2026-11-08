@@ -109,6 +109,7 @@ esac
         approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
         wake_owner: false,
         unapproved_dequeue: crate::app::merge_steward_cmd::DequeueMode::Report,
+        pass_budget: None,
         pass_deadline: None,
         apply: true,
         ledger: None,
@@ -2232,6 +2233,7 @@ esac
         approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
         wake_owner: false,
         unapproved_dequeue: crate::app::merge_steward_cmd::DequeueMode::Report,
+        pass_budget: None,
         pass_deadline: None,
         apply: true,
         ledger: None,
@@ -2374,6 +2376,7 @@ fn steward_dry_run_needs_no_mutation_authority_and_makes_no_remote_write() {
         approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
         wake_owner: false,
         unapproved_dequeue: crate::app::merge_steward_cmd::DequeueMode::Report,
+        pass_budget: None,
         pass_deadline: None,
         apply: false,
         ledger: None,
@@ -2434,6 +2437,7 @@ echo "unexpected: $*" >&2; exit 90
         approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
         wake_owner: false,
         unapproved_dequeue: crate::app::merge_steward_cmd::DequeueMode::Report,
+        pass_budget: None,
         pass_deadline: Some(std::time::Instant::now()),
         apply: true,
         ledger: None,
@@ -2485,6 +2489,84 @@ echo "unexpected: $*" >&2; exit 90
         &ledger,
     );
     assert_eq!(order, vec![2, 1, 0]);
+}
+
+/// A row that GitHub rate-limits stops the pass mid-way: every later row is
+/// deferred without a call, while the time budget is still unspent.
+#[cfg(unix)]
+#[test]
+fn a_rate_limited_row_defers_every_later_row_mid_pass() {
+    let temp = tempfile::tempdir().expect("temp");
+    let log = temp.path().join("calls");
+    let actions = fake_gh(
+        &temp,
+        &format!(
+            r#"
+printf '%s\n' "$*" >> '{}'
+echo "gh: API rate limit exceeded for installation ID 147677577. (HTTP 403)" >&2; exit 1
+"#,
+            log.display()
+        ),
+    );
+    let mut first = ready_pr();
+    first.fact.number = 41;
+    let mut second = ready_pr();
+    second.fact.number = 43;
+    second.fact.head_sha = "b".repeat(40);
+    let mut observation = observation_for(first, true);
+    observation.prs.push(second);
+    let control = mutation_control(&temp, "studio", "studio");
+    let args = StewardCommandArgs {
+        repos: vec!["owner/repo".to_owned()],
+        base: "main".to_owned(),
+        opt_out_label: "steward:skip".to_owned(),
+        provenance_blocking_labels: default_provenance_blocking_labels(),
+        managed_label: MANAGED_LABEL.to_owned(),
+        handoff_context: HANDOFF_CONTEXT.to_owned(),
+        max_transient_reruns: 1,
+        recover_hosted_setup_eviction_priority: false,
+        coalesce: true,
+        preempt_capacity: true,
+        max_preemptions_per_head: 1,
+        arm_unqueued: false,
+        approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
+        wake_owner: false,
+        unapproved_dequeue: crate::app::merge_steward_cmd::DequeueMode::Report,
+        pass_budget: None,
+        pass_deadline: None,
+        apply: true,
+        ledger: None,
+    };
+    let mut ledger = StewardLedger::default();
+
+    let (reports, _) = apply_pr_plans(
+        &actions,
+        &args,
+        &observation,
+        &queue_policy(),
+        &temp.path().join("ledger.json"),
+        &mut ledger,
+        Some(&control),
+    );
+
+    assert_eq!(reports.len(), 2);
+    let first = &reports[0];
+    assert_eq!(first.number, 41);
+    assert_ne!(first.mutation.as_deref(), Some("deferred_pass_budget"));
+    let error = first.error.as_deref().unwrap_or_default().to_owned()
+        + first.mutation.as_deref().unwrap_or_default();
+    assert!(error.contains("rate limit"), "{first:?}");
+    assert_eq!(reports[1].number, 43);
+    assert_eq!(reports[1].mutation.as_deref(), Some("deferred_pass_budget"));
+    let calls = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !calls.contains("PR_kw") || !calls.contains("bbbbbbbb"),
+        "{calls}"
+    );
+    assert_eq!(
+        ledger.pass_budget_deferred.get("owner/repo"),
+        Some(&vec![43])
+    );
 }
 
 /// A fake GitHub for the owner-wake scenarios. It records every comment POST
@@ -2553,6 +2635,7 @@ esac
             approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
             wake_owner,
             unapproved_dequeue: crate::app::merge_steward_cmd::DequeueMode::Report,
+            pass_budget: None,
             pass_deadline: None,
             apply: true,
             ledger: None,
@@ -2907,6 +2990,7 @@ fi
         approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
         wake_owner: false,
         unapproved_dequeue: crate::app::merge_steward_cmd::DequeueMode::Report,
+        pass_budget: None,
         pass_deadline: None,
         apply: true,
         ledger: None,
@@ -2970,6 +3054,7 @@ fn routing_readiness_hold_does_not_suppress_an_unrelated_pr_in_repo_plan() {
         approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
         wake_owner: false,
         unapproved_dequeue: crate::app::merge_steward_cmd::DequeueMode::Report,
+        pass_budget: None,
         pass_deadline: None,
         apply: false,
         ledger: None,
@@ -3016,6 +3101,7 @@ fn disabled_preemption_ignores_preemption_only_observation_errors() {
         approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
         wake_owner: false,
         unapproved_dequeue: crate::app::merge_steward_cmd::DequeueMode::Report,
+        pass_budget: None,
         pass_deadline: None,
         apply: false,
         ledger: None,

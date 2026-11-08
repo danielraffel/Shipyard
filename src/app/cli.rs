@@ -3136,7 +3136,7 @@ pub(super) enum RunnerCommand {
         /// This is the B4 write; it never arms or merges.
         #[arg(long = "wake-owner")]
         wake_owner: bool,
-        /// Seconds after which an apply pass starts no new per-PR work: the
+        /// Seconds, per repository, after which an apply pass starts no new per-PR work: the
         /// remaining pull requests are reported `deferred_pass_budget` and
         /// left for the next pass, which takes them first. Keep it under any
         /// external timeout so the pass still prints its report. 0 disables.
