@@ -1962,7 +1962,11 @@ by version and SHA-256) and the exact toolchain in the job's `env:`
 runner user, holding a `flock` on `.install.lock` so two jobs on one host never
 install at once. It verifies `rustc`/`cargo --version`, makes the toolchain
 read-only, records its tree digest, and on later runs reuses it only when the
-digest still matches (anything else is removed and reinstalled). The build puts
+digest still matches. A changed digest on a complete install fails the job with
+an `::error::` (remove the toolchain dir and its `toolchain-*.sha256` to
+reinstall); only an incomplete install is reinstalled. An installed `rustup` is
+reused only when it is byte-identical to the pinned `rustup-init`, and rustup's
+download servers are pinned to `static.rust-lang.org`. The build puts
 the toolchain's own `bin/` first on `PATH` (no rustup proxies), and `CARGO_HOME`
 is a fresh directory under `RUNNER_TEMP`, so crate sources are still fetched
 per run; `target/` is the clean checkout's.

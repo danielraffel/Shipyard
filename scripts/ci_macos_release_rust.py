@@ -14,11 +14,17 @@ isolated from the runner user's shared ``~/.cargo`` and ``~/.rustup``:
   ``--root``; the crate registry (``CARGO_HOME``) is a fresh per-run
   directory, and ``target/`` is the job's clean checkout.
 * ``rustup-init`` is fetched at a pinned version and checked against a pinned
-  SHA-256 before it runs.
+  SHA-256 before it runs. An installed ``rustup`` is reused only when it is
+  byte-identical to that pin and reports the pinned version, so a pin bump
+  reinstalls it.
+* rustup's download servers are pinned to the official ones; inherited
+  ``RUSTUP_DIST_SERVER`` / ``RUSTUP_DIST_ROOT`` / ``RUSTUP_UPDATE_ROOT`` are
+  ignored.
 * The toolchain is pinned to an exact version, verified with
   ``rustc --version`` / ``cargo --version``, made read-only, and its file tree
-  is digested. A later run reuses it only when the digest still matches; any
-  drift (a partial install, an edit) removes it and installs again.
+  is digested. A later run reuses it only when the digest still matches. A
+  complete install whose digest changed fails the job (drift or tampering);
+  only an incomplete install is removed and installed again.
 * Installation holds an exclusive ``flock`` on ``<root>/.install.lock``, so
   two jobs on one host never install into the same directory at once.
 * The build calls the toolchain's own ``cargo``/``rustc`` from ``PATH`` (not
@@ -46,6 +52,13 @@ from pathlib import Path
 RUSTUP_INIT_URL = (
     "https://static.rust-lang.org/rustup/archive/{version}/{host}/rustup-init"
 )
+# rustup reads these to choose where it downloads from; the job pins them to
+# the official servers so an inherited value cannot redirect the fetch.
+OFFICIAL_RUSTUP_ENV = {
+    "RUSTUP_DIST_SERVER": "https://static.rust-lang.org",
+    "RUSTUP_UPDATE_ROOT": "https://static.rust-lang.org/rustup",
+}
+DROPPED_RUSTUP_ENV = ("RUSTUP_DIST_ROOT", "RUSTUP_TOOLCHAIN")
 LOCK_WAIT_SECONDS = 30 * 60
 ATTEMPT_TIMEOUT_SECONDS = 10 * 60
 
@@ -56,6 +69,10 @@ def log(message: str) -> None:
 
 def fail(message: str) -> None:
     raise SystemExit(f"ci-macos-release-rust: {message}")
+
+
+def annotate(level: str, message: str) -> None:
+    print(f"::{level}::ci-macos-release-rust: {message}", flush=True)
 
 
 def sha256_file(path: Path) -> str:
@@ -161,20 +178,34 @@ def tool_env(cargo_home: Path, rustup_home: Path) -> dict[str, str]:
     env = dict(os.environ)
     env["CARGO_HOME"] = str(cargo_home)
     env["RUSTUP_HOME"] = str(rustup_home)
-    env.pop("RUSTUP_TOOLCHAIN", None)
+    for name in DROPPED_RUSTUP_ENV:
+        env.pop(name, None)
+    env.update(OFFICIAL_RUSTUP_ENV)
     return env
 
 
+def verify_rustup_version(rustup: Path, version: str, env: dict[str, str]) -> None:
+    reported = run([str(rustup), "--version"], env).strip()
+    if not reported.startswith(f"rustup {version} "):
+        fail(f"{rustup} reports {reported!r}, expected rustup {version}")
+
+
 def ensure_rustup(args, cargo_home: Path, rustup_home: Path, env: dict[str, str]) -> Path:
+    """Reuse rustup only when it is the pinned binary; otherwise install the pin.
+
+    rustup-init installs a copy of itself as ``rustup``, so the installed binary
+    is compared to the pinned rustup-init SHA-256 directly (no marker file), and
+    bumping the pin in the workflow reinstalls it on every host.
+    """
     rustup = cargo_home / "bin" / "rustup"
-    marker = Path(args.root) / "rustup.sha256"
-    if rustup.is_file() and marker.is_file():
-        if sha256_file(rustup) == marker.read_text(encoding="utf-8").strip():
+    if rustup.is_file() and not rustup.is_symlink():
+        if sha256_file(rustup) == args.rustup_init_sha256:
+            verify_rustup_version(rustup, args.rustup_version, env)
             log(f"reusing {rustup}")
             return rustup
-        log(f"{rustup} no longer matches its recorded digest; reinstalling")
+        log(f"{rustup} is not the pinned rustup-init {args.rustup_version}; reinstalling")
     remove_tree(cargo_home)
-    marker.unlink(missing_ok=True)
+    (Path(args.root) / "rustup.sha256").unlink(missing_ok=True)
     url = args.rustup_init_url or RUSTUP_INIT_URL.format(
         version=args.rustup_version, host=args.host
     )
@@ -191,8 +222,8 @@ def ensure_rustup(args, cargo_home: Path, rustup_home: Path, env: dict[str, str]
         run([str(init), "-y", "--no-modify-path", "--default-toolchain", "none"], env)
     if not rustup.is_file():
         fail(f"rustup-init did not install {rustup}")
+    verify_rustup_version(rustup, args.rustup_version, env)
     run([str(rustup), "set", "auto-self-update", "disable"], env)
-    marker.write_text(sha256_file(rustup) + "\n", encoding="utf-8")
     log(f"installed {rustup}")
     return rustup
 
@@ -212,12 +243,23 @@ def ensure_toolchain(args, rustup: Path, rustup_home: Path, env: dict[str, str])
     toolchain_dir = rustup_home / "toolchains" / name
     bin_dir = toolchain_dir / "bin"
     marker = Path(args.root) / f"toolchain-{name}.sha256"
-    if toolchain_dir.is_dir() and not toolchain_dir.is_symlink() and marker.is_file():
-        if tree_digest(toolchain_dir) == marker.read_text(encoding="utf-8").strip():
+    if marker.is_file():
+        # The marker is written only after a verified, complete install, so a
+        # mismatch here is drift or tampering, not a partial install. Never
+        # sign with it, and never silently replace it: stop for a human.
+        if toolchain_dir.is_dir() and not toolchain_dir.is_symlink() \
+                and tree_digest(toolchain_dir) == marker.read_text(encoding="utf-8").strip():
             log(f"reusing {verify_versions(bin_dir, args.toolchain, env)} from {toolchain_dir}")
             return bin_dir
-        log(f"{toolchain_dir} no longer matches its recorded digest; reinstalling")
-    marker.unlink(missing_ok=True)
+        message = (
+            f"{toolchain_dir} changed since it was installed and verified (digest "
+            f"mismatch). Refusing to build a signed release with it. Inspect it, "
+            f"then remove {toolchain_dir} and {marker} to reinstall."
+        )
+        annotate("error", message)
+        fail(message)
+    if toolchain_dir.exists() or toolchain_dir.is_symlink():
+        annotate("warning", f"{toolchain_dir} is an incomplete install; reinstalling")
     remove_tree(toolchain_dir)
     (rustup_home / "update-hashes" / name).unlink(missing_ok=True)
     run_with_retries(
