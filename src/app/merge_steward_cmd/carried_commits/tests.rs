@@ -1134,7 +1134,7 @@ fn an_over_cap_candidate_fails_closed_when_the_base_moves_between_pages() {
         if !graph_read(joined, Q_HEAD) {
             return None;
         }
-        Some(Ok(if joined.contains("page=1") {
+        Some(Ok(if joined.contains("&page=1") {
             graph_page(150, "aaaa", &shas, 0..100)
         } else {
             graph_page(140, "bbbb", &shas, 110..150)
@@ -1151,7 +1151,7 @@ fn an_over_cap_candidate_fails_closed_when_the_base_moves_between_pages() {
     // Control: the same pages from one unmoved base are read in full.
     let steady = |joined: &str| {
         if graph_read(joined, Q_HEAD) {
-            return Some(Ok(if joined.contains("page=1") {
+            return Some(Ok(if joined.contains("&page=1") {
                 graph_page(150, "aaaa", &shas, 0..100)
             } else {
                 graph_page(150, "aaaa", &shas, 100..150)
@@ -1172,7 +1172,7 @@ fn a_candidates_own_compare_fails_closed_when_the_base_moves_between_pages() {
     let shas: Vec<String> = (1..=150).map(|i| format!("{i:040x}")).collect();
     let run_gh = |argv: &[String]| -> Result<String, String> {
         let joined = argv.join(" ");
-        if joined.contains("compare/main...") && joined.contains("page=1") {
+        if joined.contains("compare/main...") && joined.contains("&page=1") {
             return Ok(
                 json!({"total": 150, "merge_base": "aaaa", "shas": shas[..100]}).to_string(),
             );
