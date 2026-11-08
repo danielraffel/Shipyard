@@ -309,13 +309,13 @@ fn a_carried_approval_is_not_reused_after_a_later_candidate_sees_a_new_verdict()
 }
 
 #[test]
-fn a_candidate_over_the_commit_cap_fails_closed() {
+fn a_candidate_over_the_commit_cap_with_an_unreadable_listing_fails_closed() {
     let run_gh = |argv: &[String]| -> Result<String, String> {
         let joined = argv.join(" ");
         if joined.contains("compare/main...") {
             return Ok(json!({"total": 400, "shas": [OWN]}).to_string());
         }
-        Err(format!("unexpected: {joined}"))
+        Err("HTTP 502".to_owned())
     };
     let refusal = refusal_with(
         &run_gh,
@@ -328,7 +328,8 @@ fn a_candidate_over_the_commit_cap_fails_closed() {
         &mut |_| Judgement::Approved,
     )
     .expect("refused");
-    assert_eq!(refusal.token, "carried_commits_over_cap:#11369");
+    assert_eq!(refusal.token, "carried_commits_unreadable");
+    assert!(refusal.detail.contains("HTTP 502"), "{}", refusal.detail);
 }
 
 #[test]
@@ -832,4 +833,440 @@ fn a_compare_over_one_page_is_read_page_by_page() {
     };
     assert_eq!(read.len(), 150);
     assert_eq!(pages.get(), 2);
+}
+
+// A candidate P over the commit cap (vellum's re-rooted mirror-history import:
+// 2,724 commits) cannot list its own commits, so each other open Q's own
+// commits are read with their parents and P's head is probed for the roots.
+const BIG_HEAD: &str = "fbbd56fd00000000000000000000000000000000";
+const MAIN_TIP: &str = "0000000000000000000000000000000000000001";
+const Q_HEAD: &str = "7777777700000000000000000000000000000000";
+const Q_ROOT: &str = "7777777700000000000000000000000000000001";
+const Q_TIP: &str = Q_HEAD;
+
+fn graph(commits: &[(&str, &[&str])]) -> String {
+    json!({
+        "total": commits.len(),
+        "commits": commits
+            .iter()
+            .map(|(sha, parents)| json!({"sha": sha, "parents": parents}))
+            .collect::<Vec<_>>(),
+    })
+    .to_string()
+}
+
+fn open_q(number: u64, head_ref: &str, base_ref: &str, head: &str) -> OpenPr {
+    open(number, head_ref, base_ref, head, &[head])
+}
+
+/// Every GitHub read an over-cap candidate makes, served from `reads`, which
+/// answers a read it recognises and `None` for any other; an unrecognised read
+/// fails the test. P's own compare is always over the cap.
+fn big_refusal(
+    others: &[&OpenPr],
+    reads: &dyn Fn(&str) -> Option<Result<String, String>>,
+    judge: &mut dyn FnMut(&OpenPr) -> Judgement,
+) -> Option<super::Refusal> {
+    let listed = listing(&others.iter().map(|q| (*q, 1)).collect::<Vec<_>>()).to_string();
+    let run_gh = |argv: &[String]| -> Result<String, String> {
+        let joined = argv.join(" ");
+        if joined.contains(&format!("compare/main...{BIG_HEAD}")) {
+            return Ok(json!({"total": 2724, "shas": []}).to_string());
+        }
+        if joined.contains("OPEN") {
+            return Ok(listed.clone());
+        }
+        reads(&joined).unwrap_or_else(|| panic!("unexpected read: {joined}"))
+    };
+    refusal_with(
+        &run_gh,
+        "Generous-Corp/vellum",
+        "main",
+        229,
+        "m2/combined-reexport",
+        BIG_HEAD,
+        &mut PassCache::default(),
+        judge,
+    )
+}
+
+fn graph_read(joined: &str, head: &str) -> bool {
+    joined.contains(&format!("compare/main...{head}")) && joined.contains("parents")
+}
+
+fn probe_read(joined: &str, root: &str) -> bool {
+    joined.contains(&format!("compare/{BIG_HEAD}...{root}?per_page=1"))
+}
+
+#[test]
+fn an_over_cap_candidate_carrying_no_open_prs_commits_is_admitted() {
+    let q = open_q(228, "feat/other", "main", Q_HEAD);
+    let reads = |joined: &str| {
+        if graph_read(joined, Q_HEAD) {
+            return Some(Ok(graph(&[(Q_ROOT, &[MAIN_TIP]), (Q_TIP, &[Q_ROOT])])));
+        }
+        probe_read(joined, Q_ROOT).then(|| Ok("diverged".to_owned()))
+    };
+    let judged = Cell::new(0);
+    let mut judge = |_: &OpenPr| {
+        judged.set(judged.get() + 1);
+        Judgement::Unapproved("no counted APPROVE".to_owned())
+    };
+    assert_eq!(big_refusal(&[&q], &reads, &mut judge), None);
+    assert_eq!(
+        judged.get(),
+        0,
+        "a head carrying nothing of Q reads no approval"
+    );
+}
+
+#[test]
+fn an_over_cap_candidate_carrying_an_unapproved_prs_commit_is_refused() {
+    let q = open_q(228, "feat/other", "main", Q_HEAD);
+    let reads = |joined: &str| {
+        if graph_read(joined, Q_HEAD) {
+            return Some(Ok(graph(&[(Q_ROOT, &[MAIN_TIP]), (Q_TIP, &[Q_ROOT])])));
+        }
+        probe_read(joined, Q_ROOT).then(|| Ok("behind".to_owned()))
+    };
+    let refusal = big_refusal(&[&q], &reads, &mut |_| {
+        Judgement::Unapproved("no counted APPROVE".to_owned())
+    })
+    .expect("refused");
+    assert_eq!(refusal.token, "carries_unapproved_commits:#228");
+    assert!(refusal.detail.contains(Q_ROOT), "{}", refusal.detail);
+
+    // The same head is admitted once Q's head is approved.
+    assert_eq!(
+        big_refusal(&[&q], &reads, &mut |_| Judgement::Approved),
+        None
+    );
+}
+
+#[test]
+fn an_over_cap_candidate_carrying_only_a_branch_merged_into_q_is_refused() {
+    // Q merged a side branch; P carries only that branch's commit, which is
+    // a second root of Q's own commits.
+    const SIDE: &str = "5151515100000000000000000000000000000000";
+    let q = open_q(228, "feat/other", "main", Q_HEAD);
+    let reads = |joined: &str| {
+        if graph_read(joined, Q_HEAD) {
+            return Some(Ok(graph(&[
+                (Q_ROOT, &[MAIN_TIP]),
+                (SIDE, &[MAIN_TIP]),
+                (Q_TIP, &[Q_ROOT, SIDE]),
+            ])));
+        }
+        if probe_read(joined, Q_ROOT) {
+            return Some(Ok("diverged".to_owned()));
+        }
+        probe_read(joined, SIDE).then(|| Ok("behind".to_owned()))
+    };
+    let refusal = big_refusal(&[&q], &reads, &mut |_| {
+        Judgement::Unapproved("held".to_owned())
+    })
+    .expect("refused");
+    assert_eq!(refusal.token, "carries_unapproved_commits:#228");
+    assert!(refusal.detail.contains(SIDE), "{}", refusal.detail);
+    assert!(!refusal.detail.contains(Q_ROOT), "{}", refusal.detail);
+}
+
+#[test]
+fn an_over_cap_candidate_is_not_blocked_by_commits_q_only_inherits() {
+    // Q is stacked on another branch; P carries that branch's commit, not Q's.
+    const INHERITED: &str = "1212121200000000000000000000000000000000";
+    let q = open_q(230, "feat/stacked", "feat/base", Q_HEAD);
+    let reads = |joined: &str| {
+        if graph_read(joined, Q_HEAD) {
+            return Some(Ok(graph(&[
+                (INHERITED, &[MAIN_TIP]),
+                (Q_ROOT, &[INHERITED]),
+            ])));
+        }
+        if joined.contains(&format!("compare/feat/base...{Q_HEAD}")) {
+            return Some(Ok(json!({"total": 1, "shas": [Q_ROOT]}).to_string()));
+        }
+        assert!(
+            !probe_read(joined, INHERITED),
+            "an inherited commit is not probed"
+        );
+        probe_read(joined, Q_ROOT).then(|| Ok("diverged".to_owned()))
+    };
+    let mut judge = |_: &OpenPr| Judgement::Unapproved("held".to_owned());
+    assert_eq!(big_refusal(&[&q], &reads, &mut judge), None);
+}
+
+#[test]
+fn an_over_cap_candidates_base_branch_pr_and_stacked_prs_are_not_read() {
+    let base_pr = open_q(1, "main", "release", Q_HEAD);
+    let stacked = open_q(2, "feat/on-top", "m2/combined-reexport", Q_HEAD);
+    let reads = |_: &str| None;
+    let mut judge = |_: &OpenPr| Judgement::Unapproved("held".to_owned());
+    assert_eq!(big_refusal(&[&base_pr, &stacked], &reads, &mut judge), None);
+}
+
+#[test]
+fn an_over_cap_candidate_fails_closed_on_an_unapproved_over_cap_q() {
+    let q = open_q(228, "feat/other", "main", Q_HEAD);
+    let reads = |joined: &str| {
+        graph_read(joined, Q_HEAD).then(|| Ok(json!({"total": 300, "commits": []}).to_string()))
+    };
+    let refusal = big_refusal(&[&q], &reads, &mut |_| {
+        Judgement::Unapproved("no counted APPROVE".to_owned())
+    })
+    .expect("refused");
+    assert_eq!(refusal.token, "carried_commits_over_cap:#228");
+    assert!(refusal.detail.contains("300"), "{}", refusal.detail);
+
+    // An approved over-cap Q never refuses.
+    assert_eq!(
+        big_refusal(&[&q], &reads, &mut |_| Judgement::Approved),
+        None
+    );
+}
+
+#[test]
+fn an_over_cap_candidate_fails_closed_on_an_unreadable_read() {
+    let q = open_q(228, "feat/other", "main", Q_HEAD);
+    let unreadable_probe = |joined: &str| {
+        if graph_read(joined, Q_HEAD) {
+            return Some(Ok(graph(&[(Q_ROOT, &[MAIN_TIP])])));
+        }
+        probe_read(joined, Q_ROOT).then(|| Err("HTTP 502".to_owned()))
+    };
+    let refusal =
+        big_refusal(&[&q], &unreadable_probe, &mut |_| Judgement::Approved).expect("refused");
+    assert_eq!(refusal.token, "carried_commits_unreadable:#228");
+    assert!(refusal.detail.contains("HTTP 502"), "{}", refusal.detail);
+
+    let unreadable_graph =
+        |joined: &str| graph_read(joined, Q_HEAD).then(|| Err("HTTP 403".to_owned()));
+    let refusal =
+        big_refusal(&[&q], &unreadable_graph, &mut |_| Judgement::Approved).expect("refused");
+    assert_eq!(refusal.token, "carried_commits_unreadable:#228");
+
+    let malformed = |joined: &str| {
+        graph_read(joined, Q_HEAD)
+            .then(|| Ok(json!({"total": 1, "commits": [{"sha": Q_ROOT}]}).to_string()))
+    };
+    let refusal = big_refusal(&[&q], &malformed, &mut |_| Judgement::Approved).expect("refused");
+    assert_eq!(refusal.token, "carried_commits_unreadable:#228");
+}
+
+#[test]
+fn an_over_cap_candidate_whose_probe_budget_is_spent_fails_closed_on_an_unapproved_q() {
+    use super::{MAX_PROBED_COMMITS, MAX_REVERSE_PROBES};
+    let per_q = MAX_PROBED_COMMITS;
+    let qs: Vec<OpenPr> = (0..=MAX_REVERSE_PROBES / per_q)
+        .map(|i| {
+            open_q(
+                300 + i as u64,
+                &format!("feat/q{i}"),
+                "main",
+                &format!("{i:040x}"),
+            )
+        })
+        .collect();
+    let roots = |i: usize| -> Vec<String> {
+        (0..per_q)
+            .map(|r| format!("{:020x}{:020x}", i + 1, r + 1))
+            .collect()
+    };
+    let reads = |joined: &str| {
+        for (i, q) in qs.iter().enumerate() {
+            if graph_read(joined, &q.head_sha) {
+                let roots = roots(i);
+                let commits: Vec<(&str, &[&str])> = roots
+                    .iter()
+                    .map(|sha| (sha.as_str(), &[MAIN_TIP][..]))
+                    .collect();
+                return Some(Ok(graph(&commits)));
+            }
+        }
+        joined
+            .contains(&format!("compare/{BIG_HEAD}..."))
+            .then(|| Ok("diverged".to_owned()))
+    };
+    let refs: Vec<&OpenPr> = qs.iter().collect();
+    let last = qs.last().expect("qs").number;
+    let refusal = big_refusal(&refs, &reads, &mut |q| {
+        if q.number == last {
+            Judgement::Unapproved("held".to_owned())
+        } else {
+            Judgement::Approved
+        }
+    })
+    .expect("refused");
+    assert_eq!(refusal.token, format!("carried_commits_over_cap:#{last}"));
+    assert_eq!(
+        big_refusal(&refs, &reads, &mut |_| Judgement::Approved),
+        None
+    );
+}
+
+/// One compare page of a linear history `all`, holding `all[range]`.
+fn graph_page(
+    total: usize,
+    merge_base: &str,
+    all: &[String],
+    range: std::ops::Range<usize>,
+) -> String {
+    json!({
+        "total": total,
+        "merge_base": merge_base,
+        "commits": range
+            .map(|i| {
+                let parent = if i == 0 { MAIN_TIP } else { all[i - 1].as_str() };
+                json!({"sha": all[i], "parents": [parent]})
+            })
+            .collect::<Vec<_>>(),
+    })
+    .to_string()
+}
+
+#[test]
+fn an_over_cap_candidate_fails_closed_when_the_base_moves_between_pages() {
+    // Q has 150 own commits; ten of them land on main between page 1 and
+    // page 2, so page 2 shifts and the count (now 140) would still add up.
+    let q = open_q(228, "feat/other", "main", Q_HEAD);
+    let shas: Vec<String> = (1..=150).map(|i| format!("{i:040x}")).collect();
+    let reads = |joined: &str| {
+        if !graph_read(joined, Q_HEAD) {
+            return None;
+        }
+        Some(Ok(if joined.contains("page=1") {
+            graph_page(150, "aaaa", &shas, 0..100)
+        } else {
+            graph_page(140, "bbbb", &shas, 110..150)
+        }))
+    };
+    let refusal = big_refusal(&[&q], &reads, &mut |_| Judgement::Approved).expect("refused");
+    assert_eq!(refusal.token, "carried_commits_unreadable:#228");
+    assert!(
+        refusal.detail.contains("moved between pages"),
+        "{}",
+        refusal.detail
+    );
+
+    // Control: the same pages from one unmoved base are read in full.
+    let steady = |joined: &str| {
+        if graph_read(joined, Q_HEAD) {
+            return Some(Ok(if joined.contains("page=1") {
+                graph_page(150, "aaaa", &shas, 0..100)
+            } else {
+                graph_page(150, "aaaa", &shas, 100..150)
+            }));
+        }
+        joined
+            .contains(&format!("compare/{BIG_HEAD}..."))
+            .then(|| Ok("diverged".to_owned()))
+    };
+    assert_eq!(
+        big_refusal(&[&q], &steady, &mut |_| Judgement::Approved),
+        None
+    );
+}
+
+#[test]
+fn a_candidates_own_compare_fails_closed_when_the_base_moves_between_pages() {
+    let shas: Vec<String> = (1..=150).map(|i| format!("{i:040x}")).collect();
+    let run_gh = |argv: &[String]| -> Result<String, String> {
+        let joined = argv.join(" ");
+        if joined.contains("compare/main...") && joined.contains("page=1") {
+            return Ok(
+                json!({"total": 150, "merge_base": "aaaa", "shas": shas[..100]}).to_string(),
+            );
+        }
+        if joined.contains("compare/main...") {
+            return Ok(
+                json!({"total": 140, "merge_base": "bbbb", "shas": shas[110..]}).to_string(),
+            );
+        }
+        Err(format!("unexpected: {joined}"))
+    };
+    let refusal = refusal_with(
+        &run_gh,
+        "owner/repo",
+        "main",
+        11369,
+        "feat/real-world-inputs-t8",
+        OWN,
+        &mut PassCache::default(),
+        &mut |_| Judgement::Approved,
+    )
+    .expect("refused");
+    assert_eq!(refusal.token, "carried_commits_unreadable");
+    assert!(
+        refusal.detail.contains("moved between pages"),
+        "{}",
+        refusal.detail
+    );
+}
+
+#[test]
+fn an_over_cap_candidate_is_refused_for_a_commit_a_stacked_q_introduced() {
+    // Q targets another branch; its own diff keeps Q_ROOT, which P carries.
+    const INHERITED: &str = "1212121200000000000000000000000000000000";
+    let q = open_q(230, "feat/stacked", "feat/base", Q_HEAD);
+    let reads = |joined: &str| {
+        if graph_read(joined, Q_HEAD) {
+            return Some(Ok(graph(&[
+                (INHERITED, &[MAIN_TIP]),
+                (Q_ROOT, &[INHERITED]),
+            ])));
+        }
+        if joined.contains(&format!("compare/feat/base...{Q_HEAD}")) {
+            return Some(Ok(json!({"total": 1, "shas": [Q_ROOT]}).to_string()));
+        }
+        probe_read(joined, Q_ROOT).then(|| Ok("behind".to_owned()))
+    };
+    let refusal = big_refusal(&[&q], &reads, &mut |_| {
+        Judgement::Unapproved("held".to_owned())
+    })
+    .expect("refused");
+    assert_eq!(refusal.token, "carries_unapproved_commits:#230");
+    assert!(refusal.detail.contains(Q_ROOT), "{}", refusal.detail);
+}
+
+#[test]
+fn an_over_cap_candidate_reads_each_open_prs_roots_once_per_pass() {
+    let q = open_q(228, "feat/other", "main", Q_HEAD);
+    let listed = listing(&[(&q, 1)]).to_string();
+    let graph_reads = Cell::new(0);
+    let run_gh = |argv: &[String]| -> Result<String, String> {
+        let joined = argv.join(" ");
+        if joined.contains(&format!("compare/main...{BIG_HEAD}")) {
+            return Ok(json!({"total": 2724, "shas": []}).to_string());
+        }
+        if joined.contains("OPEN") {
+            return Ok(listed.clone());
+        }
+        if graph_read(&joined, Q_HEAD) {
+            graph_reads.set(graph_reads.get() + 1);
+            return Ok(graph(&[(Q_ROOT, &[MAIN_TIP])]));
+        }
+        if probe_read(&joined, Q_ROOT) {
+            return Ok("diverged".to_owned());
+        }
+        Err(format!("unexpected: {joined}"))
+    };
+    let mut cache = PassCache::default();
+    for _ in 0..2 {
+        let refusal = refusal_with(
+            &run_gh,
+            "Generous-Corp/vellum",
+            "main",
+            229,
+            "m2/combined-reexport",
+            BIG_HEAD,
+            &mut cache,
+            &mut |_| Judgement::Unapproved("held".to_owned()),
+        );
+        assert_eq!(refusal, None);
+    }
+    assert_eq!(
+        graph_reads.get(),
+        1,
+        "a second admission path reuses Q's roots"
+    );
 }
