@@ -153,6 +153,9 @@ struct RepoReport {
     /// left uncertain with the reason ([`mutation_outcome::reconcile`]).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     uncertain_mutations: Vec<crate::merge_queue_control::UncertainReconciliation>,
+    /// Durable provider cooldown that deferred this repository's observation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rate_limit_deferred: Option<pass_budget::RateLimitCooldown>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -201,6 +204,10 @@ struct StewardLedger {
     /// lowercase repository; the next pass evaluates them first.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pass_budget_deferred: BTreeMap<String, Vec<u64>>,
+    /// Repository observations deferred after a provider rate-limit refusal,
+    /// keyed by credential-scope hash plus lowercase repository.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    rate_limit_cooldowns: BTreeMap<String, pass_budget::RateLimitCooldown>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1122,6 +1129,7 @@ pub(super) fn admission_clean_command<W: Write>(
     );
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) fn steward_command<W: Write>(
     args: &StewardCommandArgs,
     cwd: &Path,
@@ -1179,16 +1187,50 @@ pub(super) fn steward_command<W: Write>(
         usize::from(!recovery_owned_preemption_budget && ledger.pending_cancellations.is_empty());
     let mut rate_limited: Option<String> = None;
     for repo in repos {
+        let scope_key = actions.rate_limit_scope_key(&repo);
+        let cooldown_key = pass_budget::rate_limit_cooldown_key(&scope_key, &repo);
+        let now_epoch = Utc::now().timestamp();
+        if let Some(cooldown) = pass_budget::active_rate_limit_cooldown(
+            &ledger.rate_limit_cooldowns,
+            &cooldown_key,
+            now_epoch,
+        ) {
+            unhealthy = true;
+            reports.push(deferred_rate_limit_repo_report(
+                &repo,
+                &args.base,
+                cooldown.clone(),
+                &ledger,
+            ));
+            continue;
+        }
+        // Expiry is itself a state transition. Remove the stale receipt so a
+        // successful probe can clear it from the durable ledger.
+        ledger.rate_limit_cooldowns.remove(&cooldown_key);
         // A rate limit spends the token for every repository alike: the rest
         // are reported unread rather than spending the pass on errors.
         if let Some(error) = rate_limited.as_ref() {
-            unhealthy = true;
-            reports.push(unreadable_repo_report(
+            let cooldown = record_rate_limit_cooldown(
                 &repo,
-                &args.base,
-                &ledger,
-                format!("{}: not observed this pass; {error}", pass_budget::DEFERRED),
-            ));
+                &scope_key,
+                error,
+                &mut ledger,
+                args.apply.then_some(&ledger_path),
+            );
+            if let Ok(cooldown) = cooldown {
+                unhealthy = true;
+                reports.push(deferred_rate_limit_repo_report(
+                    &repo, &args.base, cooldown, &ledger,
+                ));
+            } else {
+                unhealthy = true;
+                reports.push(unreadable_repo_report(
+                    &repo,
+                    &args.base,
+                    &ledger,
+                    format!("{}: not observed this pass; {error}", pass_budget::DEFERRED),
+                ));
+            }
             continue;
         }
         let (report, failed) = steward_repo(
@@ -1202,10 +1244,11 @@ pub(super) fn steward_command<W: Write>(
             &mut recovery_errors,
             &mut recovery_cancellations,
         );
-        if report
-            .errors
-            .iter()
-            .any(|error| pass_budget::is_rate_limited(error))
+        if report.rate_limit_deferred.is_some()
+            || report
+                .errors
+                .iter()
+                .any(|error| pass_budget::is_rate_limited(error))
         {
             rate_limited = Some(format!("GitHub rate-limited observing {repo}"));
         }
@@ -1278,6 +1321,11 @@ fn steward_repo(
     let args = &repo_args;
     match observe_repo(actions, repo, &args.base, args.preempt_capacity) {
         Ok(observation) => {
+            let scope_key = actions.rate_limit_scope_key(repo);
+            let cooldown_key = pass_budget::rate_limit_cooldown_key(&scope_key, repo);
+            // A successful repository-wide probe proves this credential/repo
+            // scope is usable again; clear its stale receipt before planning.
+            ledger.rate_limit_cooldowns.remove(&cooldown_key);
             let (mut report, failed, planned_preemptions) = apply_repo_plan(
                 actions,
                 args,
@@ -1304,10 +1352,84 @@ fn steward_repo(
             let unhealthy = failed || !report.errors.is_empty();
             (report, unhealthy)
         }
+        Err(error) if pass_budget::is_rate_limited(&error) => {
+            let scope_key = actions.rate_limit_scope_key(repo);
+            let cooldown = record_rate_limit_cooldown(
+                repo,
+                &scope_key,
+                &error,
+                ledger,
+                args.apply.then_some(ledger_path),
+            );
+            match cooldown {
+                Ok(cooldown) => (
+                    deferred_rate_limit_repo_report(repo, &args.base, cooldown, ledger),
+                    true,
+                ),
+                Err(persist_error) => {
+                    let mut report = unreadable_repo_report(repo, &args.base, ledger, error);
+                    report.errors.push(persist_error);
+                    (report, true)
+                }
+            }
+        }
         Err(error) => (
             unreadable_repo_report(repo, &args.base, ledger, error),
             true,
         ),
+    }
+}
+
+fn record_rate_limit_cooldown(
+    repo: &str,
+    scope_key: &str,
+    error: &str,
+    ledger: &mut StewardLedger,
+    ledger_path: Option<&Path>,
+) -> Result<pass_budget::RateLimitCooldown, String> {
+    let observed_at_epoch = Utc::now().timestamp();
+    let cooldown = pass_budget::RateLimitCooldown {
+        repo: repo.to_owned(),
+        scope_key: scope_key.to_owned(),
+        until_epoch: pass_budget::rate_limit_cooldown_until(error, observed_at_epoch),
+        observed_at_epoch,
+        detail: error.to_owned(),
+    };
+    let key = pass_budget::rate_limit_cooldown_key(scope_key, repo);
+    ledger.rate_limit_cooldowns.insert(key, cooldown.clone());
+    if let Some(path) = ledger_path {
+        save_ledger(path, ledger).map_err(|error| {
+            format!(
+                "could not persist rate-limit cooldown receipt: {}",
+                error.message()
+            )
+        })?;
+    }
+    Ok(cooldown)
+}
+
+fn deferred_rate_limit_repo_report(
+    repo: &str,
+    base: &str,
+    cooldown: pass_budget::RateLimitCooldown,
+    ledger: &StewardLedger,
+) -> RepoReport {
+    RepoReport {
+        rollup_reconciliation: Vec::new(),
+        uncertain_mutations: Vec::new(),
+        repo: repo.to_owned(),
+        base: base.to_owned(),
+        allow_auto_merge: false,
+        merge_queue: false,
+        merge_path: "deferred_rate_limit".to_owned(),
+        required_contexts: Vec::new(),
+        prs: Vec::new(),
+        blocked_summary: blocked_on::BlockedSummary::default(),
+        cancellations: Vec::new(),
+        stale_pr_run_wedge: stale_pr_wedge::repo_status(None, Vec::new(), ledger, repo),
+        native_auto_merge_backstop: native_arm::NativeArmRepoStatus::default(),
+        errors: Vec::new(),
+        rate_limit_deferred: Some(cooldown),
     }
 }
 
@@ -1332,6 +1454,7 @@ fn unreadable_repo_report(
         stale_pr_run_wedge: stale_pr_wedge::repo_status(None, Vec::new(), ledger, repo),
         native_auto_merge_backstop: native_arm::NativeArmRepoStatus::default(),
         errors: vec![error],
+        rate_limit_deferred: None,
     }
 }
 
@@ -1406,6 +1529,7 @@ fn append_unmatched_recovery_errors(
             stale_pr_run_wedge: stale_pr_wedge::repo_status(None, Vec::new(), ledger, &repo),
             native_auto_merge_backstop: native_arm::NativeArmRepoStatus::default(),
             errors,
+            rate_limit_deferred: None,
         });
     }
 }
@@ -1440,6 +1564,7 @@ fn persist_final_ledger(
             stale_pr_run_wedge: stale_pr_wedge::repo_status(None, Vec::new(), ledger, "steward"),
             native_auto_merge_backstop: native_arm::NativeArmRepoStatus::default(),
             errors: vec![message],
+            rate_limit_deferred: None,
         });
     }
 }
