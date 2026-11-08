@@ -127,7 +127,7 @@ pub(super) fn latest_status_keys(rows: &[Value]) -> Option<BTreeSet<StatusKey>> 
 
 /// A rollup status context, keyed like a REST row. GraphQL names a bot
 /// without the `[bot]` suffix REST gives its login.
-fn rollup_status_key(node: &Value) -> Option<StatusKey> {
+pub(super) fn rollup_status_key(node: &Value) -> Option<StatusKey> {
     let creator = node.get("creator").filter(|creator| !creator.is_null());
     let creator_login = match creator {
         None => None,
@@ -166,7 +166,7 @@ fn rollup_status_key(node: &Value) -> Option<StatusKey> {
 }
 
 /// A rollup check run, as `parse_rest_check` reads the same run.
-fn rollup_check_run(node: &Value) -> Option<StewardCheck> {
+pub(super) fn rollup_check_run(node: &Value) -> Option<StewardCheck> {
     let mut check = super::observation::parse_check(node)?;
     check.status = check.status.to_ascii_lowercase();
     check.conclusion = check
@@ -194,6 +194,30 @@ fn rollup_query(heads: &[(String, Option<String>)]) -> String {
         );
     }
     format!("query({variables}){{repository(owner:$owner,name:$name){{{selections}}}}}")
+}
+
+/// A short, stable name for why [`read_rollups`] refused, for the pass's
+/// fallback counters. The full message travels beside it.
+pub(super) fn fallback_reason(error: &str) -> &'static str {
+    if error.contains("GraphQL errors") {
+        "graphql_errors"
+    } else if error.contains("has no commit") {
+        "missing_commit"
+    } else if error.contains("exceeds") {
+        "too_many_pages"
+    } else if error.contains("repeated a cursor") {
+        "repeated_cursor"
+    } else if error.contains("malformed JSON") {
+        "malformed_response"
+    } else if error.contains("malformed check run")
+        || error.contains("unknown context kind")
+        || error.contains("another object")
+        || error.contains(" has no ")
+    {
+        "unexpected_shape"
+    } else {
+        "read_failed"
+    }
 }
 
 /// Read the rollup of every head in `heads` (full SHAs), following each
@@ -363,6 +387,47 @@ pub(super) struct StatusHistory {
 
 const HISTORY_SCHEMA: u64 = 1;
 
+/// A write that dies between creating its temp file and renaming it leaves
+/// `<file>.json.<pid>.tmp` behind. Remove those older than a pass could take,
+/// so a live writer's temp is never touched.
+fn sweep_stale_temps(path: &Path) {
+    const STALE: std::time::Duration = std::time::Duration::from_mins(30);
+    let (Some(parent), Some(name)) = (
+        path.parent(),
+        path.file_name().and_then(|name| name.to_str()),
+    ) else {
+        return;
+    };
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    let prefix = format!("{name}.");
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        let is_temp = file_name
+            .strip_prefix(&prefix)
+            .and_then(|rest| rest.strip_suffix(".tmp"))
+            .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit()));
+        let stale = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= STALE);
+        if is_temp && stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// The fields `parse_rest_status` and [`latest_status_keys`] read; the rest
 /// of a status row is not kept.
 fn trim_row(row: &Value) -> Value {
@@ -397,6 +462,7 @@ impl StatusHistory {
     /// The store at `path` for `repo`. A missing, unreadable or foreign file
     /// is an empty store.
     pub(super) fn load(path: &Path, repo: &str) -> Self {
+        sweep_stale_temps(path);
         let heads = std::fs::read(path)
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())

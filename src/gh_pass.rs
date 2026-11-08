@@ -49,6 +49,7 @@ struct Inner {
     sites: BTreeMap<(ApiKind, String), SiteStats>,
     cache: HashMap<Vec<String>, String>,
     cache_hits: BTreeMap<(ApiKind, String), u64>,
+    fallbacks: BTreeMap<String, (u64, String)>,
 }
 
 /// Counters, and optionally a read cache, for one pass.
@@ -96,6 +97,22 @@ pub struct GhPassReport {
     pub millis: u128,
     /// Per call site, most calls first.
     pub sites: Vec<SiteReport>,
+    /// Faster reads that were refused and answered by a slower path instead,
+    /// by reason. Empty on a healthy pass; a reason that keeps appearing is a
+    /// schema change or a persistent failure, not noise.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub fallbacks: Vec<FallbackReport>,
+}
+
+/// One reason a pass fell back from a faster read to a slower one.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct FallbackReport {
+    /// What fell back, and why, in a stable short form.
+    pub reason: String,
+    /// How many times this pass.
+    pub count: u64,
+    /// The last refusal's message, bounded.
+    pub last_detail: String,
 }
 
 impl GhPass {
@@ -144,6 +161,18 @@ impl GhPass {
         }
     }
 
+    /// Count one fallback from a faster read to a slower one.
+    pub(crate) fn record_fallback(&self, reason: &str, detail: &str) {
+        if let Ok(mut inner) = self.inner.lock() {
+            let entry = inner
+                .fallbacks
+                .entry(reason.to_owned())
+                .or_insert((0, String::new()));
+            entry.0 += 1;
+            entry.1 = detail.chars().take(300).collect();
+        }
+    }
+
     /// Everything counted so far.
     #[must_use]
     pub fn report(&self) -> GhPassReport {
@@ -179,6 +208,15 @@ impl GhPass {
                 millis,
             });
         }
+        report.fallbacks = inner
+            .fallbacks
+            .iter()
+            .map(|(reason, (count, detail))| FallbackReport {
+                reason: reason.clone(),
+                count: *count,
+                last_detail: detail.clone(),
+            })
+            .collect();
         report.sites.sort_by(|left, right| {
             right
                 .calls

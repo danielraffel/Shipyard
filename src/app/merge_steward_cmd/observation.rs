@@ -1094,11 +1094,26 @@ fn hydrate_complete_head_checks_batch(
         .iter()
         .map(|pr| pr.fact.head_sha.clone())
         .collect::<Vec<_>>();
-    let Ok(rollups) = super::head_rollup::read_rollups(actions, repo, &heads, None) else {
-        for pr in batch {
-            hydrate_complete_head_checks(actions, repo, pr, None)?;
+    let rollups = match super::head_rollup::read_rollups(actions, repo, &heads, None) {
+        Ok(rollups) => rollups,
+        // A spent rate limit is not cured by spending two REST reads per head
+        // from the same installation; the pass defers instead.
+        Err(error) if super::pass_budget::is_rate_limited(&error) => return Err(error),
+        Err(error) => {
+            if let Some(pass) = actions.gh_pass() {
+                pass.record_fallback(
+                    &format!(
+                        "census check rollup -> REST: {}",
+                        super::head_rollup::fallback_reason(&error)
+                    ),
+                    &error,
+                );
+            }
+            for pr in batch {
+                hydrate_complete_head_checks(actions, repo, pr, None)?;
+            }
+            return Ok(());
         }
-        return Ok(());
     };
     for pr in batch {
         let head = pr.fact.head_sha.clone();

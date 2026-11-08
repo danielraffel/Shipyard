@@ -695,6 +695,11 @@ impl GitHubActions {
             .unwrap_or_default())
     }
 
+    /// The pass this client counts against, if any ([`Self::with_pass`]).
+    pub(crate) fn gh_pass(&self) -> Option<&crate::gh_pass::GhPass> {
+        self.pass.as_deref()
+    }
+
     /// The most recent `base_ref_changed` event on a pull request's timeline.
     ///
     /// The conditional third call: spent only when the first two already say

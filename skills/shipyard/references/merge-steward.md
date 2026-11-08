@@ -163,8 +163,15 @@ observation. A head's history is kept beside the ledger, one file per
 repository (`merge-steward.status-history.<owner>~<name>.json`), and reused on the next pass only while the newest status of
 every context in it equals what the rollup reports now (context, state, time,
 target URL, creator) and the rollup names no other context; statuses are
-append-only, so that proves the history unchanged. Any rollup failure leaves
-the batch to the per-head REST reads. On Generous-Corp/pulp (17 hydrated heads,
+append-only, so that proves the history unchanged. Dry-run passes write that
+file too: it is a read cache, never a decision record. A write that dies before
+its rename leaves `<file>.json.<pid>.tmp`; the next load removes such files
+older than 30 minutes. A rate-limited rollup read fails the census, so the pass
+takes its rate-limit cooldown instead of spending two REST reads per head on
+the same installation. Any other rollup failure leaves the batch to the
+per-head REST reads and is counted in `api_calls.fallbacks` (reason such as
+`census check rollup -> REST: graphql_errors`, count, last message); a reason
+that recurs every pass is a schema change or a persistent failure. On Generous-Corp/pulp (17 hydrated heads,
 2026-11-08) this took the census from 34 REST calls to 3 GraphQL calls plus one
 status read; decisions matched a concurrent pass of the old binary on 28 of 29
 pull requests, the 29th being a check that completed between the two reads.
