@@ -103,8 +103,17 @@ already on the base never count, nor does Q when it is P's own base-branch
 pull request, is stacked on P (following its base branch through other open
 pull requests' head branches reaches P's head branch), only inherits the
 commit (a commit counts as Q's only if it is in Q's own diff against Q's own
-base branch; a Q that merged P's branch still has it there and still holds
-P), or is a Shipyard rollup that merged P's head. Land or
+base branch), merged P's branch without being stacked on it, or is a Shipyard
+rollup that merged P's head. A shared commit counts against P only when it is
+on Q's first-parent chain (`Q.base..Q.head` followed through first parents) or
+is not on P's own first-parent chain (`base..P.head`): a commit on P's
+first-parent chain that reached Q only through a merge's second parent is P's
+own. When every shared commit is P's own, Q does not hold P, and a refusal P
+still gets from another pull request ends with `#Q merged #P's branch; not
+carried`. P merging held work in (the held commits are P's second parent) and
+P fast-forwarding onto Q's commits (they are on both chains) are still
+refused, and a first-parent read that fails or is over the cap keeps the
+overlap. Land or
 approve Q first, or drop its commits from P; a branch built on another pull
 request should target that pull request's branch. At most 250 commits are read
 per pull request. A Q whose listing is larger (for example a stacked pull
@@ -143,7 +152,11 @@ unapproved stacked pull request whose listing was over the cap refused every
 approved pull request on main, though it carried none of their commits; the
 own-diff read and the per-commit probe end that. On 2026-11-07 an approved
 re-export carrying a 2,724-commit mirror-history import was refused only for
-its own size; the reverse root probe ends that.)
+its own size; the reverse root probe ends that. On 2026-11-08 three ready
+pull requests on main were each held by a stacked pull request that had merged
+their branch; every shared commit was on the held pull request's own
+first-parent chain, and the stacked pull request, whose base is not main, was
+never going to be reviewed. The first-parent rule ends that.)
 
 Labels keep a pull request out of admission, and the steward refuses it:
 `owner-decision`, `superseded` and `PARKED/<platform>`. `PARKED/<platform>`

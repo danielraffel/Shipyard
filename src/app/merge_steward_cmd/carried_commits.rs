@@ -25,10 +25,18 @@
 //!   never matches the commits its base branch already carries, which is what
 //!   keeps P admissible when P's own commit reached Q through a chain. A pull
 //!   request that merges another pull request's branch still has those
-//!   commits in its own diff and is still caught; this includes a Q that
-//!   merged P's branch without being stacked on it (conservative: the sets
-//!   cannot tell P's origin commit from Q's copy, so the unapproved Q holds P
-//!   until it is landed, approved or has dropped the merge).
+//!   commits in its own diff and is still caught.
+//! * Q merged P's branch without being stacked on it: a shared commit counts
+//!   against P only when it is on Q's first-parent chain (`Q.base..Q.head`
+//!   walked through first parents) or is not on P's own first-parent chain
+//!   (`base..P.head`). A commit on P's first-parent chain that reached Q only
+//!   through a merge's second parent is P's own, so it does not hold P; when
+//!   every shared commit is P's own, Q is cleared, and a refusal P still gets
+//!   from another pull request says "#Q merged #P's branch; not carried".
+//!   The real catches remain: P merging held work in (the held commits are
+//!   P's second parent, so not on P's first-parent chain) and P
+//!   fast-forwarding onto Q's commits (they are on both chains). A
+//!   first-parent read that fails or is over the cap keeps the overlap.
 //! * Commits already on the base: P's set comes from the compare API
 //!   `base...head`, which lists only commits the base does not have.
 //! * A base whose policy does not require head approval: there every head is
@@ -517,6 +525,8 @@ pub(super) struct PassCache {
     /// Each open pull request's own roots, by number and listed head, for
     /// every over-cap candidate and admission path in the pass.
     roots: BTreeMap<(u64, String), Result<Roots, String>>,
+    /// First-parent chains, by `(base, head)`.
+    first_parent: BTreeMap<(String, String), Result<BTreeSet<String>, String>>,
 }
 
 /// The guard on the steward's own admission path (enqueue and exact-head
@@ -666,16 +676,120 @@ pub(super) fn refusal_with(
     };
     let overlaps = carried(&candidate, others);
     let mut judged = Vec::with_capacity(overlaps.len());
+    let mut merged_own = Vec::new();
     for overlap in overlaps {
         let q = others
             .iter()
             .find(|q| q.number == overlap.number())
             .expect("an overlap names a listed pull request");
-        if let Some(settled) = resolve_overlap(run_gh, repo, base, q, &own, overlap, judge) {
-            judged.push(settled);
+        let Some(settled) = resolve_overlap(run_gh, repo, base, q, &own, overlap, judge) else {
+            continue;
+        };
+        let mut chain = |chain_base: &str, chain_head: &str| {
+            cache
+                .first_parent
+                .entry((chain_base.to_owned(), chain_head.to_owned()))
+                .or_insert_with(|| first_parent_chain(run_gh, repo, chain_base, chain_head))
+                .clone()
+        };
+        match without_own_commits(settled, base, head_sha, q, &mut chain) {
+            Some(settled) => judged.push(settled),
+            None => merged_own.push(q.number),
         }
     }
-    decide(base, &judged)
+    decide(base, &judged).map(|mut refusal| {
+        for q in merged_own {
+            use std::fmt::Write as _;
+            let _ = write!(
+                refusal.detail,
+                "; #{q} merged #{number}'s branch; not carried"
+            );
+        }
+        refusal
+    })
+}
+
+/// Reads a `(base, head)` first-parent chain.
+type ChainReader<'a> = dyn FnMut(&str, &str) -> Result<BTreeSet<String>, String> + 'a;
+
+/// Drop from a refusing overlap with `q` the commits that are P's own: on P's
+/// first-parent chain (`base..p_head`) and not on `q`'s (`q.base..q.head`).
+/// Such a commit reached `q` only through a merge's second parent, so `q`
+/// merged P's branch and P carries nothing of `q`'s. `None` when every shared
+/// commit is P's own. An approved `q`, an unbounded overlap, and any chain
+/// that cannot be read keep the overlap as it is.
+fn without_own_commits(
+    settled: (Carried, Judgement),
+    base: &str,
+    p_head: &str,
+    q: &OpenPr,
+    chain: &mut ChainReader<'_>,
+) -> Option<(Carried, Judgement)> {
+    let (
+        Carried::Shares {
+            number,
+            head_sha,
+            shared,
+        },
+        judgement,
+    ) = &settled
+    else {
+        return Some(settled);
+    };
+    if *judgement == Judgement::Approved {
+        return Some(settled);
+    }
+    let (Ok(p_chain), Ok(q_chain)) = (chain(base, p_head), chain(&q.base_ref, &q.head_sha)) else {
+        return Some(settled);
+    };
+    let kept: Vec<String> = shared
+        .iter()
+        .filter(|sha| q_chain.contains(*sha) || !p_chain.contains(*sha))
+        .cloned()
+        .collect();
+    if kept.is_empty() {
+        return None;
+    }
+    Some((
+        Carried::Shares {
+            number: *number,
+            head_sha: head_sha.clone(),
+            shared: kept,
+        },
+        judgement.clone(),
+    ))
+}
+
+/// `head`'s first-parent chain not on `base` (`git log --first-parent
+/// base..head`): from `head`, follow each commit's first parent while it is
+/// one of `head`'s commits not on `base`. An over-cap compare is an error, so
+/// the caller keeps the overlap.
+fn first_parent_chain(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    base: &str,
+    head: &str,
+) -> Result<BTreeSet<String>, String> {
+    let graph = match compare_graph(run_gh, repo, base, head)? {
+        CommitGraph::Complete(graph) => graph,
+        CommitGraph::OverCap { total } => {
+            return Err(format!(
+                "compare {base}...{head} has {total} commits, over the first-parent read cap"
+            ));
+        }
+    };
+    let mut chain = BTreeSet::new();
+    let mut at = head.to_owned();
+    while let Some(parents) = graph.get(&at) {
+        if !chain.insert(at.clone()) {
+            break;
+        }
+        match parents.first() {
+            Some(first) => at = first.clone(),
+            None => break,
+        }
+    }
+    Ok(chain)
 }
 
 /// Q's approval is judged only at the head the listing saw, so the live
