@@ -59,6 +59,13 @@ pub(super) struct StewardCommandArgs {
     /// unapproved queue entries or only reports them. Read from the
     /// machine-global config by [`steward_command`].
     pub(super) unapproved_dequeue: unapproved_admission::DequeueMode,
+    /// Each repository's time budget (`--pass-budget-secs`); its clock
+    /// starts when that repository's observation starts, so a later
+    /// repository is never starved by an earlier one. `None` never defers.
+    pub(super) pass_budget: Option<Duration>,
+    /// Past this instant the current repository starts no new per-PR work;
+    /// see `pass_budget`. Set per repository from `pass_budget`.
+    pub(super) pass_deadline: Option<Instant>,
     pub(super) apply: bool,
     pub(super) ledger: Option<PathBuf>,
 }
@@ -190,6 +197,10 @@ struct StewardLedger {
     /// the head's ejection cap.
     #[serde(default)]
     steward_removals: BTreeMap<String, Vec<String>>,
+    /// Pull requests the last pass deferred (`pass_budget`), keyed by
+    /// lowercase repository; the next pass evaluates them first.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pass_budget_deferred: BTreeMap<String, Vec<u64>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1166,41 +1177,40 @@ pub(super) fn steward_command<W: Write>(
     let mut unhealthy = false;
     let mut remaining_preemptions =
         usize::from(!recovery_owned_preemption_budget && ledger.pending_cancellations.is_empty());
+    let mut rate_limited: Option<String> = None;
     for repo in repos {
-        // Scope the token helper to this exact repository: a scheduled pass
-        // runs from a directory that is not a checkout, and one checkout's
-        // remote must never mint the token for another repository.
-        let scoped_actions = actions.clone().with_repo_override(&repo);
-        let actions = &scoped_actions;
-        match observe_repo(actions, &repo, &args.base, args.preempt_capacity) {
-            Ok(observation) => {
-                let (mut report, failed, planned_preemptions) = apply_repo_plan(
-                    actions,
-                    args,
-                    &observation,
-                    &ledger_path,
-                    &mut ledger,
-                    remaining_preemptions,
-                    mutation_control.as_ref(),
-                );
-                if let Some(errors) = recovery_errors.remove(&observation.repo) {
-                    report.errors.extend(errors);
-                }
-                if let Some(cancellations) = recovery_cancellations.remove(&observation.repo) {
-                    report.cancellations.extend(cancellations);
-                }
-                if args.apply {
-                    reconcile_rollups(actions, &observation.repo, &args.base, &mut report);
-                }
-                remaining_preemptions = remaining_preemptions.saturating_sub(planned_preemptions);
-                unhealthy |= failed || !report.errors.is_empty();
-                reports.push(report);
-            }
-            Err(error) => {
-                unhealthy = true;
-                reports.push(unreadable_repo_report(&repo, &args.base, &ledger, error));
-            }
+        // A rate limit spends the token for every repository alike: the rest
+        // are reported unread rather than spending the pass on errors.
+        if let Some(error) = rate_limited.as_ref() {
+            unhealthy = true;
+            reports.push(unreadable_repo_report(
+                &repo,
+                &args.base,
+                &ledger,
+                format!("{}: not observed this pass; {error}", pass_budget::DEFERRED),
+            ));
+            continue;
         }
+        let (report, failed) = steward_repo(
+            actions,
+            args,
+            &repo,
+            &ledger_path,
+            &mut ledger,
+            &mut remaining_preemptions,
+            mutation_control.as_ref(),
+            &mut recovery_errors,
+            &mut recovery_cancellations,
+        );
+        if report
+            .errors
+            .iter()
+            .any(|error| pass_budget::is_rate_limited(error))
+        {
+            rate_limited = Some(format!("GitHub rate-limited observing {repo}"));
+        }
+        unhealthy |= failed;
+        reports.push(report);
     }
     append_unmatched_recovery_errors(
         recovery_errors,
@@ -1237,6 +1247,67 @@ fn reconcile_rollups(actions: &GitHubActions, repo: &str, base: &str, report: &m
         Err(error) => report
             .errors
             .push(format!("rollup reconciliation: {error}")),
+    }
+}
+
+/// One repository of a steward pass: observe it, apply its plan, settle its
+/// rollups. Its own time budget starts here, so an earlier repository never
+/// spends a later one's. Returns the report and whether the repository is
+/// unhealthy.
+#[allow(clippy::too_many_arguments)]
+fn steward_repo(
+    actions: &GitHubActions,
+    pass_args: &StewardCommandArgs,
+    repo: &str,
+    ledger_path: &Path,
+    ledger: &mut StewardLedger,
+    remaining_preemptions: &mut usize,
+    mutation_control: Option<&MutationControl>,
+    recovery_errors: &mut BTreeMap<String, Vec<String>>,
+    recovery_cancellations: &mut BTreeMap<String, Vec<CancellationReport>>,
+) -> (RepoReport, bool) {
+    // Scope the token helper to this exact repository: a scheduled pass
+    // runs from a directory that is not a checkout, and one checkout's
+    // remote must never mint the token for another repository.
+    let scoped_actions = actions.clone().with_repo_override(repo);
+    let actions = &scoped_actions;
+    let mut repo_args = pass_args.clone();
+    if let Some(budget) = pass_args.pass_budget {
+        repo_args.pass_deadline = Some(Instant::now() + budget);
+    }
+    let args = &repo_args;
+    match observe_repo(actions, repo, &args.base, args.preempt_capacity) {
+        Ok(observation) => {
+            let (mut report, failed, planned_preemptions) = apply_repo_plan(
+                actions,
+                args,
+                &observation,
+                ledger_path,
+                ledger,
+                *remaining_preemptions,
+                mutation_control,
+            );
+            if let Some(errors) = recovery_errors.remove(&observation.repo) {
+                report.errors.extend(errors);
+            }
+            if let Some(cancellations) = recovery_cancellations.remove(&observation.repo) {
+                report.cancellations.extend(cancellations);
+            }
+            if args.apply && pass_budget::deadline_passed(args.pass_deadline) {
+                report
+                    .rollup_reconciliation
+                    .push("deferred: the pass time budget is spent".to_owned());
+            } else if args.apply {
+                reconcile_rollups(actions, &observation.repo, &args.base, &mut report);
+            }
+            *remaining_preemptions = remaining_preemptions.saturating_sub(planned_preemptions);
+            let unhealthy = failed || !report.errors.is_empty();
+            (report, unhealthy)
+        }
+        Err(error) => (
+            unreadable_repo_report(repo, &args.base, ledger, error),
+            true,
+        ),
     }
 }
 
@@ -1448,6 +1519,7 @@ mod mutation_outcome;
 mod native_arm;
 mod next_action;
 mod observation;
+mod pass_budget;
 mod pr_mutations;
 pub(super) mod queue_drain;
 mod queue_priority_recovery;
@@ -1633,6 +1705,8 @@ fn single_pr_dry_run(
         approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
         wake_owner: false,
         unapproved_dequeue: DequeueMode::Report,
+        pass_budget: None,
+        pass_deadline: None,
         apply: false,
         ledger: None,
     };

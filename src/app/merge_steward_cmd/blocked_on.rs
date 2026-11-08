@@ -774,6 +774,11 @@ pub(super) fn annotate(
 ) {
     let mut dry_run_blockers = ApprovalBlockers::new();
     for report in reports.iter_mut() {
+        // A deferred row already names why it waits, and reading GitHub to
+        // date it would spend the budget it was deferred to save.
+        if super::pass_budget::is_deferred(report) {
+            continue;
+        }
         let Some(pr) = observation
             .prs
             .iter()
