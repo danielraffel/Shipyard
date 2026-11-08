@@ -125,6 +125,8 @@ pub mod gate_cost;
 pub mod gate_scripts;
 /// Shared GitHub CLI command boundary and auth resolution.
 pub mod gh;
+/// One steward pass's GitHub read accounting and narrow read cache.
+pub mod gh_pass;
 /// Install and audit the `ghapp` wrapper's optional queue guards.
 pub mod ghapp_guards;
 /// Branch governance profiles and GitHub branch-protection helpers.

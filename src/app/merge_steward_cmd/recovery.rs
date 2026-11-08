@@ -11,11 +11,13 @@ use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 
 use super::recovery_worker::{
-    RecoveryEnqueueDisposition, RecoveryEnqueueLease, acquire_recovery_publication_lease,
-    enqueue_recovery_request, recovery_publication_is_enabled, with_recovery_clear_fence,
-    with_recovery_clear_fence_held,
+    RecoveryEnqueueDisposition, RecoveryEnqueueLease, RecoveryRequestFacts,
+    acquire_recovery_publication_lease, enqueue_recovery_request, recovery_publication_is_enabled,
+    recovery_request_is_settled, with_recovery_clear_fence, with_recovery_clear_fence_held,
 };
-use super::terminal_handoff::{persist_actionable_failure, resolve_terminal_handoffs};
+use super::terminal_handoff::{
+    actionable_failure_is_recorded, persist_actionable_failure, resolve_terminal_handoffs,
+};
 
 /// Budget for one live recovery revalidation: a merge-queue snapshot, the PR
 /// read, and its check-run and status pages. Sized for the steward's GitHub
@@ -260,6 +262,16 @@ fn enqueue_recovery_after_revalidation(
                 );
             }
         };
+    if let Some(settled) = settled_recovery_outcome(
+        context,
+        observed,
+        policy,
+        decision,
+        ledger,
+        &publication_lease,
+    ) {
+        return settled;
+    }
     let deadline = recovery_revalidation_deadline();
     let live =
         match revalidate_recovery_target(context, observed, policy, decision, ledger, deadline) {
@@ -354,32 +366,19 @@ fn enqueue_recovery(
     decision: &StewardDecision,
     publication_lease: RecoveryEnqueueLease,
 ) -> (Option<String>, Option<String>) {
-    let (failure_summary, failure_facts) =
-        match normalized_recovery_facts(decision, policy, &pr.fact.checks) {
-            Ok(Some(facts)) => facts,
-            Ok(None) => return (None, None),
-            Err(error) => {
-                return (
-                    Some(format!(
-                        "recovery_request_deferred:{}",
-                        truncate_description(&error)
-                    )),
-                    None,
-                );
-            }
-        };
-    let mut fingerprint_components = vec![failure_summary.clone()];
-    fingerprint_components.extend(failure_facts.iter().map(failure_fact_component));
-    let failure_fingerprint = digest_components(fingerprint_components.iter().map(String::as_str));
-    let policy_signature = steward_policy_signature(policy);
-    let required_checks = policy
-        .required_checks
-        .iter()
-        .map(|required| RecoveryRequiredCheck {
-            context: required.context.clone(),
-            app_id: required.app_id,
-        })
-        .collect();
+    let publication = match RecoveryPublication::for_decision(decision, policy, &pr.fact.checks) {
+        Ok(Some(publication)) => publication,
+        Ok(None) => return (None, None),
+        Err(error) => {
+            return (
+                Some(format!(
+                    "recovery_request_deferred:{}",
+                    truncate_description(&error)
+                )),
+                None,
+            );
+        }
+    };
     match enqueue_recovery_request(
         &context.mutation_control.global_dir,
         &context.mutation_control.state_dir,
@@ -390,11 +389,11 @@ fn enqueue_recovery(
         &pr.fact.head_sha,
         policy.merge_queue,
         &policy.opt_out_label,
-        &failure_fingerprint,
-        &failure_summary,
-        required_checks,
-        failure_facts,
-        &policy_signature,
+        &publication.failure_fingerprint,
+        &publication.failure_summary,
+        publication.required_checks,
+        publication.failure_facts,
+        &publication.policy_signature,
     ) {
         Ok(RecoveryEnqueueDisposition::Disabled | RecoveryEnqueueDisposition::Existing(_)) => {
             (None, None)
@@ -406,6 +405,126 @@ fn enqueue_recovery(
         // the per-PR report, but never make deterministic stewardship unhealthy
         // or prevent unrelated queue progress.
         Err(error) => deferred_recovery_request(error.message()),
+    }
+}
+
+/// The normalized recovery request one exact-head failure publishes.
+struct RecoveryPublication {
+    failure_summary: String,
+    failure_facts: Vec<RecoveryFailureFact>,
+    failure_fingerprint: String,
+    policy_signature: String,
+    required_checks: Vec<RecoveryRequiredCheck>,
+}
+
+impl RecoveryPublication {
+    fn for_decision(
+        decision: &StewardDecision,
+        policy: &StewardPolicy,
+        checks: &[StewardCheck],
+    ) -> Result<Option<Self>, String> {
+        let Some((failure_summary, failure_facts)) =
+            normalized_recovery_facts(decision, policy, checks)?
+        else {
+            return Ok(None);
+        };
+        let mut fingerprint_components = vec![failure_summary.clone()];
+        fingerprint_components.extend(failure_facts.iter().map(failure_fact_component));
+        let failure_fingerprint =
+            digest_components(fingerprint_components.iter().map(String::as_str));
+        let required_checks = policy
+            .required_checks
+            .iter()
+            .map(|required| RecoveryRequiredCheck {
+                context: required.context.clone(),
+                app_id: required.app_id,
+            })
+            .collect();
+        Ok(Some(Self {
+            failure_summary,
+            failure_facts,
+            failure_fingerprint,
+            policy_signature: steward_policy_signature(policy),
+            required_checks,
+        }))
+    }
+}
+
+/// What [`enqueue_recovery_after_revalidation`] would return for `observed`
+/// when it would write nothing: a previous pass already published the same
+/// exact-head failure (identical ledger record, identical recovery request,
+/// current witness), and the census still shows the needs-agent signal in
+/// place. The live revalidation exists to bind a WRITE to the live head; with
+/// nothing to write it only spends four GitHub reads per failing pull request
+/// per pass, which on a busy repository is most of the pass.
+///
+/// Every input is the census observation or local durable state, read under
+/// the publication lease the caller already holds, so a concurrent clear is
+/// ordered exactly as on the full path. `None` (any change, any doubt, any
+/// read error) takes the full path. A failure whose live checks moved after
+/// the census is published by the next pass, whose census sees them.
+fn settled_recovery_outcome(
+    context: &MutationApplyContext<'_>,
+    observed: &ObservedPr,
+    policy: &StewardPolicy,
+    decision: &StewardDecision,
+    ledger: &StewardLedger,
+    publication_lease: &RecoveryEnqueueLease,
+) -> Option<(Option<String>, Option<String>)> {
+    if !signal_is_converged(observed, true) {
+        return None;
+    }
+    let publication =
+        RecoveryPublication::for_decision(decision, policy, &observed.fact.checks).ok()??;
+    let failure_contexts = publication
+        .failure_facts
+        .iter()
+        .map(failure_fact_component)
+        .collect();
+    let owner = super::handoff::terminal_owner_route_or_unresolved(
+        &context.mutation_control.state_dir,
+        &context.observation.repo,
+        observed.fact.number,
+        &observed.fact.head_sha,
+    );
+    let recorded = actionable_failure_is_recorded(
+        ledger,
+        &context.observation.repo,
+        &context.observation.base,
+        observed.fact.number,
+        &observed.fact.head_sha,
+        owner,
+        failure_contexts,
+    );
+    if !matches!(recorded, Ok(true)) {
+        return None;
+    }
+    match recovery_publication_is_enabled(
+        &context.mutation_control.global_dir,
+        &context.mutation_control.state_dir,
+        &context.observation.repo,
+    ) {
+        Ok(false) => Some((Some("actionable_failure_persisted".to_owned()), None)),
+        Ok(true) => recovery_request_is_settled(
+            &context.mutation_control.global_dir,
+            &context.mutation_control.state_dir,
+            publication_lease,
+            RecoveryRequestFacts {
+                repo: &context.observation.repo,
+                pr: observed.fact.number,
+                base_ref: &context.observation.base,
+                head_sha: &observed.fact.head_sha,
+                merge_queue: policy.merge_queue,
+                opt_out_label: &policy.opt_out_label,
+                failure_fingerprint: &publication.failure_fingerprint,
+                failure_summary: &publication.failure_summary,
+                required_checks: publication.required_checks.clone(),
+                failure_facts: publication.failure_facts.clone(),
+                policy_signature: &publication.policy_signature,
+            },
+        )
+        .then_some((None, None)),
+        Err(_) => None,
     }
 }
 

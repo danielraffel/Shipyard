@@ -256,6 +256,7 @@ pub(super) fn apply_repo_plan(
         RepoReport {
             rollup_reconciliation: Vec::new(),
             uncertain_mutations,
+            api_calls: None,
             rate_limit_deferred: None,
             repo: observation.repo.clone(),
             base: args.base.clone(),
