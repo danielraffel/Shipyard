@@ -1956,15 +1956,36 @@ runner's own job-started hook (`ACTIONS_RUNNER_HOOK_JOB_STARTED`, installed
 by `fleet-move-runner` in the runner folder) fails any job that is not a push
 or dispatch of `danielraffel/Shipyard` `refs/heads/main`.
 
-**The macOS signing job builds with fresh Rust homes.** `sign-and-upload-macos`
-points `CARGO_HOME` and `RUSTUP_HOME` at new directories under `RUNNER_TEMP`
-before installing Rust, so the signed build installs its toolchain and fetches
-crates fresh instead of reading a shared runner's `~/.cargo` registry or
-`~/.rustup` toolchains. A `rustup` already on the runner's `PATH` is still the
-one that installs them, and the `cargo`/`rustc` proxies in a shared
-`~/.cargo/bin` on `PATH` are still the shared ones too. Full isolation comes
-only from running the job as a dedicated runner user. Runner selection is
-unchanged.
+**The macOS signing job builds with a fixed, pinned toolchain and fresh crates.**
+`sign-and-upload-macos` never uses the runner user's `~/.cargo` or `~/.rustup`.
+`scripts/ci_macos_release_rust.py` installs rustup (from a `rustup-init` pinned
+by version and SHA-256) and the exact toolchain in the job's `env:`
+(`SHIPYARD_RELEASE_RUST_TOOLCHAIN`) under `~/.shipyard-release-rust` on the
+runner user, holding a `flock` on `.install.lock` so two jobs on one host never
+install at once. It verifies `rustc`/`cargo --version`, makes the toolchain
+read-only, records its tree digest, and on later runs reuses it only when the
+digest still matches. A changed digest on a complete install fails the job with
+an `::error::` (remove the toolchain dir and its `toolchain-*.sha256` to
+reinstall); only an incomplete install is reinstalled. An installed `rustup` is
+reused only when it is byte-identical to the pinned `rustup-init`, and rustup's
+download servers are pinned to `static.rust-lang.org`. The build puts
+the toolchain's own `bin/` first on `PATH` (no rustup proxies), and `CARGO_HOME`
+is a fresh directory under `RUNNER_TEMP`, so crate sources are still fetched
+per run; `target/` is the clean checkout's.
+
+The path is fixed because the self-hosted Macs run LuLu, an interactive
+outbound firewall that approves each executable path. A toolchain under a
+per-run `RUNNER_TEMP` directory was a new `rustup` and `cargo` every release,
+so the job stalled at "syncing channel updates" until someone clicked Allow
+(v0.393.0 and v0.394.0 stayed Linux-only drafts on it). With the fixed path
+the owner approves `~/.shipyard-release-rust/cargo/bin/rustup` and the
+toolchain's `cargo` once per host. When bumping the toolchain pin, expect one
+new prompt for the new toolchain's `cargo`.
+
+Jobs running as the same OS user can still write that directory; the digest
+detects a change between runs but is not a boundary. The boundary is that fork
+pull requests never reach the self-hosted runners; full isolation would need a
+dedicated runner user. Runner selection is unchanged.
 
 To land jobs on the Mac, register a runner carrying the matching labels with
 `shipyard runner register --repo <owner/repo> --labels self-hosted,macos,arm64,local-mac`
