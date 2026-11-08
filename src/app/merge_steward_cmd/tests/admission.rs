@@ -436,14 +436,10 @@ fn cross_process_contender_defers_and_owner_death_forces_fresh_observation() {
     let steward = acquire_ledger_lock(&paths.state_dir.join("merge-steward.json"))
         .expect("active steward lock");
     output.clear();
-    let exit = run(&args, &actions, &mut output).expect("typed ledger contention verdict");
-    let verdict = typed_verdict(exit, &output, 3, "stewardship_in_progress");
-    assert!(
-        verdict["error"]
-            .as_str()
-            .unwrap()
-            .contains("already running")
-    );
+    // A read-only admission reads the ledger snapshot and does not wait on a
+    // running steward pass.
+    let exit = run(&args, &actions, &mut output).expect("read-only verdict under steward");
+    typed_verdict(exit, &output, 0, "clean");
 
     let mut ledger = StewardLedger::default();
     ledger
@@ -467,6 +463,82 @@ fn cross_process_contender_defers_and_owner_death_forces_fresh_observation() {
             .unwrap()
             .contains("could not open")
     );
+}
+
+/// A steward apply pass holds the ledger lock for its whole multi-repo pass,
+/// which on a busy host is most of the time. Admission that only reads must
+/// not be starved by it, but a pending cancellation (a real queue hold) must
+/// still defer, and the path that writes must still require the lock.
+#[cfg(unix)]
+#[test]
+fn running_steward_blocks_only_admission_that_must_write() {
+    let temp = tempfile::tempdir().expect("temp");
+    let control = mutation_control(&temp, "studio", "studio");
+    let paths = RuntimePaths::current_with_overrides(
+        RuntimeMode::Isolated,
+        Some(control.global_dir),
+        Some(control.state_dir),
+    );
+    let calls = temp.path().join("github-calls");
+    let actions = clean_admission_actions(&temp, &calls);
+    let mut args = AdmissionCleanArgs {
+        repo: "owner/repo".to_owned(),
+        base: "main".to_owned(),
+        labels: vec!["self-hosted".to_owned(), "ARM64".to_owned()],
+        apply: true,
+    };
+    let run = |args: &AdmissionCleanArgs, output: &mut Vec<u8>| {
+        admission_clean_command(
+            args,
+            temp.path(),
+            RuntimeMode::Isolated,
+            &paths,
+            &actions,
+            true,
+            output,
+        )
+    };
+    let ledger_path = paths.state_dir.join("merge-steward.json");
+    let steward = acquire_ledger_lock(&ledger_path).expect("active steward lock");
+
+    // Clean queue, no pending cancellation: the apply path TartCI calls admits
+    // while the steward pass is still running, after its fresh revalidation.
+    let mut output = Vec::new();
+    let exit = run(&args, &mut output).expect("clean apply verdict under steward");
+    let verdict = typed_verdict(exit, &output, 0, "clean");
+    assert_eq!(verdict["verdict"], "admit");
+
+    // A pending cancellation the steward published is a queue hold. The
+    // lock-free snapshot still sees it, so report-only admission defers.
+    let mut ledger = StewardLedger::default();
+    ledger
+        .pending_cancellations
+        .insert("pending".to_owned(), pending_cancellation_record());
+    save_ledger(&ledger_path, &ledger).expect("seed pending");
+    args.apply = false;
+    output.clear();
+    let exit = run(&args, &mut output).expect("report-only pending verdict");
+    let verdict = typed_verdict(exit, &output, 3, "cancellation_pending");
+    assert_eq!(verdict["blocker_run_ids"], serde_json::json!([100]));
+
+    // Resuming that cancellation writes the ledger, so the apply path still
+    // needs the lock and defers while the steward holds it.
+    args.apply = true;
+    output.clear();
+    let exit = run(&args, &mut output).expect("apply pending verdict under steward");
+    let verdict = typed_verdict(exit, &output, 3, "stewardship_in_progress");
+    assert!(
+        verdict["error"]
+            .as_str()
+            .unwrap()
+            .contains("already running")
+    );
+    let unchanged = load_ledger(&ledger_path).expect("ledger");
+    assert!(
+        unchanged.pending_cancellations.contains_key("pending"),
+        "a deferred admission must not touch the steward's ledger"
+    );
+    drop(steward);
 }
 
 /// The #609 shape, deterministically: a child forked while a steward holds its
