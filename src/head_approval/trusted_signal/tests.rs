@@ -190,8 +190,10 @@ fn a_missing_signal_is_refused() {
 fn a_spoof_beside_a_genuine_signal_is_refused() {
     let mut spoof = genuine_run(8);
     spoof["event"] = json!("pull_request");
+    // The spoof is the older status, so only the every-signal rule sees it;
+    // the newest status is the genuine one.
     let world = World::new(
-        vec![status(1, "success", &run_url(7)), status(2, "success", &run_url(8))],
+        vec![status(1, "success", &run_url(8)), status(2, "success", &run_url(7))],
         vec![],
         vec![genuine_run(7), spoof],
     );
