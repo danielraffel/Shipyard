@@ -340,6 +340,11 @@ fn run_repo(
             }
             tracked.pending.push(event);
         }
+        // An overdue notice for a head that has since moved is stale.
+        tracked.pending.retain(|event| match event {
+            RelayEvent::Overdue { head, .. } => *head == digest.head,
+            _ => true,
+        });
         let first_sighting = tracked.digest.is_none();
         tracked.digest = Some(digest.clone());
         if tracked.pending.is_empty() {

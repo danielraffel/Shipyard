@@ -4,7 +4,9 @@
 //! Tiers, closest first:
 //!
 //! 0. **stack base**: a pull request others are stacked on or carry, that is
-//!    itself within reach (tiers 1 to 3): landing it unblocks them;
+//!    itself approved (tiers 1 and 2): landing it unblocks them. A stack base
+//!    still waiting on a review stays in tier 3, first within it, so it never
+//!    spends admission work ahead of an admittable head;
 //! 1. **approved green**: every required check green and the exact head
 //!    approved;
 //! 2. **approved pending**: approved, the other required checks still
@@ -66,7 +68,7 @@ pub struct RankInput {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Tier {
-    /// Unblocks other pull requests and is within reach.
+    /// Unblocks other pull requests and is approved.
     StackBase,
     /// Approved and green.
     ApprovedGreen,
@@ -113,11 +115,11 @@ pub fn base_tier(input: &RankInput) -> Tier {
     }
 }
 
-/// The ranking tier, with the stack-base promotion.
+/// The ranking tier, with the stack-base promotion of approved heads.
 #[must_use]
 pub fn tier(input: &RankInput) -> Tier {
     let tier = base_tier(input);
-    if input.unblocks > 0 && tier != Tier::Rest {
+    if input.unblocks > 0 && matches!(tier, Tier::ApprovedGreen | Tier::ApprovedPending) {
         Tier::StackBase
     } else {
         tier
@@ -249,7 +251,7 @@ mod tests {
         review.token = "no_verdict".to_owned();
         let pending = input(3, true, OthersState::Pending);
         let green = input(4, true, OthersState::Green);
-        let mut base = input(5, false, OthersState::Green);
+        let mut base = input(5, true, OthersState::Pending);
         base.unblocks = 1;
         let ranked = rank(&[rest, review, pending, green, base]);
         assert_eq!(order(&ranked), vec![5, 4, 3, 2, 1]);
@@ -266,6 +268,20 @@ mod tests {
         );
         assert_eq!(ranked[0].rank, 1);
         assert!(ranked[0].needs.contains("unblocks 1"), "{:?}", ranked[0]);
+    }
+
+    #[test]
+    fn a_stack_base_still_needing_review_ranks_first_in_its_tier_not_above_approved_heads() {
+        let mut base = input(30, false, OthersState::Green);
+        base.token = "no_verdict".to_owned();
+        base.unblocks = 2;
+        let mut review = input(31, false, OthersState::Green);
+        review.token = "no_verdict".to_owned();
+        review.age_minutes = Some(500);
+        let green = input(32, true, OthersState::Green);
+        let ranked = rank(&[review, base, green]);
+        assert_eq!(order(&ranked), vec![32, 30, 31]);
+        assert_eq!(ranked[1].tier, Tier::GreenNeedsReview);
     }
 
     #[test]

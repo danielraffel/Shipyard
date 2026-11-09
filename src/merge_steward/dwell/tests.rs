@@ -42,8 +42,16 @@ fn observed(numbers: &[u64]) -> BTreeSet<u64> {
     numbers.iter().copied().collect()
 }
 
-fn tracked_once(sightings: &[Sighting], policy: &DwellPolicy) -> DwellRepoState {
+/// A repository the steward already tracks (not its first pass, which
+/// seeds silently).
+fn established() -> DwellRepoState {
     let mut state = DwellRepoState::default();
+    state.seen.insert(0, minutes_before(now(), 1));
+    state
+}
+
+fn tracked_once(sightings: &[Sighting], policy: &DwellPolicy) -> DwellRepoState {
+    let mut state = established();
     let numbers: Vec<u64> = sightings.iter().map(|s| s.number).collect();
     track(
         &mut state,
@@ -229,7 +237,7 @@ fn entry_dates_from_github_since_and_resets_on_state_or_head_change() {
 }
 
 #[test]
-fn entries_and_acts_of_pull_requests_no_longer_open_are_pruned() {
+fn entries_of_pull_requests_no_longer_open_are_pruned_but_their_acts_outlive_them() {
     let policy = DwellPolicy::default();
     let mut state = tracked_once(
         &[
@@ -247,6 +255,7 @@ fn entries_and_acts_of_pull_requests_no_longer_open_are_pruned() {
             status: "done".to_owned(),
             at: now(),
             detail: None,
+            attempts: 1,
         },
     );
     // The stacked listing was not read: the stacked entry survives.
@@ -262,8 +271,8 @@ fn entries_and_acts_of_pull_requests_no_longer_open_are_pruned() {
     );
     assert!(!state.entries.contains_key(&1));
     assert!(
-        !state.acts.contains_key(&1),
-        "a closed pull request's acts go with it"
+        state.acts.contains_key(&1),
+        "a pull request missing from one pass keeps its acts, so none repeats"
     );
     assert!(state.entries.contains_key(&2));
     // It was read and #2 is gone: pruned.
@@ -278,6 +287,18 @@ fn entries_and_acts_of_pull_requests_no_longer_open_are_pruned() {
         now(),
     );
     assert!(state.entries.is_empty());
+    // Acts expire by age only.
+    track(
+        &mut state,
+        &[],
+        &observed(&[]),
+        &BTreeSet::new(),
+        true,
+        &policy,
+        APPROVAL,
+        now() + chrono::Duration::days(15),
+    );
+    assert!(state.acts.is_empty());
 }
 
 #[test]
@@ -292,7 +313,13 @@ fn levels_double_and_cap() {
 }
 
 fn plan_for(state: &DwellRepoState, policy: &DwellPolicy) -> Vec<Planned> {
-    plan(state, overdue(state, policy, now()), policy, &|_| true)
+    plan(
+        state,
+        overdue(state, policy, now()),
+        policy,
+        now(),
+        &|_, _| Actable::Yes,
+    )
 }
 
 #[test]
@@ -331,6 +358,7 @@ fn a_mechanical_act_runs_once_per_state_and_head() {
             status: "intent".to_owned(),
             at: now(),
             detail: None,
+            attempts: 1,
         },
     );
     let again = plan_for(&state, &policy);
@@ -371,7 +399,8 @@ fn a_mechanical_act_runs_once_per_state_and_head() {
         &state,
         overdue(&state, &policy, minutes_before(now(), -60)),
         &policy,
-        &|_| true,
+        now(),
+        &|_, _| Actable::Yes,
     );
     assert!(
         matches!(back[0].act, Disposition::Acted { .. }),
@@ -402,7 +431,8 @@ fn a_mechanical_act_runs_once_per_state_and_head() {
         &state,
         overdue(&state, &policy, minutes_before(now(), -30)),
         &policy,
-        &|_| true,
+        now(),
+        &|_, _| Actable::Yes,
     );
     assert_eq!(
         fresh[0].act,
@@ -459,7 +489,13 @@ fn a_never_ran_check_without_a_mapped_workflow_escalates() {
         &[sighting(1, "required_never_ran:linux", HEAD, Some(31))],
         &policy,
     );
-    let planned = plan(&state, overdue(&state, &policy, now()), &policy, &|_| false);
+    let planned = plan(
+        &state,
+        overdue(&state, &policy, now()),
+        &policy,
+        now(),
+        &|_, _| Actable::Never,
+    );
     assert_eq!(planned[0].act, Disposition::NoAct);
     assert!(planned[0].escalate);
 }
@@ -545,7 +581,8 @@ fn each_escalation_level_fires_once_and_the_cap_defers_the_rest_worst_first() {
         &state,
         overdue(&state, &roomy, minutes_before(now(), -40)),
         &roomy,
-        &|_| true,
+        now(),
+        &|_, _| Actable::Yes,
     );
     assert!(
         later
@@ -567,5 +604,225 @@ fn a_thousand_overdue_pull_requests_escalate_at_most_the_cap_per_pass() {
     assert_eq!(
         planned.iter().filter(|row| row.escalate).count(),
         policy.max_escalations_per_pass
+    );
+}
+
+fn record(status: &str, attempts: u32, at: DateTime<Utc>) -> ActRecord {
+    ActRecord {
+        kind: ActKind::DispatchNeverRan,
+        state: DwellState::RequiredNeverRan,
+        head: HEAD.to_owned(),
+        status: status.to_owned(),
+        at,
+        detail: None,
+        attempts,
+    }
+}
+
+#[test]
+fn an_act_missing_from_one_pass_and_back_is_not_repeated() {
+    let policy = DwellPolicy {
+        act: ActMode::Apply,
+        ..DwellPolicy::default()
+    };
+    let mut state = tracked_once(
+        &[sighting(1, "required_never_ran:macos", HEAD, Some(31))],
+        &policy,
+    );
+    state.record_act(1, record("done", 1, now()));
+    // A pass that did not see #1 (census fallback, closed and reopened).
+    track(
+        &mut state,
+        &[],
+        &observed(&[]),
+        &BTreeSet::new(),
+        true,
+        &policy,
+        APPROVAL,
+        now(),
+    );
+    track(
+        &mut state,
+        &[sighting(1, "required_never_ran:macos", HEAD, Some(31))],
+        &observed(&[1]),
+        &BTreeSet::new(),
+        true,
+        &policy,
+        APPROVAL,
+        now(),
+    );
+    let later = now() + chrono::Duration::minutes(40);
+    let planned = plan(
+        &state,
+        overdue(&state, &policy, later),
+        &policy,
+        later,
+        &|_, _| Actable::Yes,
+    );
+    assert!(
+        matches!(planned[0].act, Disposition::Acted { .. }),
+        "{:?}",
+        planned[0].act
+    );
+}
+
+#[test]
+fn a_state_entered_after_an_untracked_one_is_not_dated_before_it() {
+    let policy = DwellPolicy::default();
+    let mut state = tracked_once(&[sighting(1, "queued", HEAD, None)], &policy);
+    assert!(state.entries.is_empty(), "queued is untracked");
+    // Ejected: back as DIRTY with a since from the head commit, days old.
+    track(
+        &mut state,
+        &[sighting(1, "merge_state:DIRTY", HEAD, Some(5_000))],
+        &observed(&[1]),
+        &BTreeSet::new(),
+        true,
+        &policy,
+        APPROVAL,
+        now() + chrono::Duration::minutes(2),
+    );
+    let entry = &state.entries[&1];
+    assert_eq!(
+        entry.entered_at,
+        now(),
+        "dated by the pass that last saw it queued"
+    );
+}
+
+#[test]
+fn the_first_pass_seeds_the_backlog_without_escalating_it() {
+    let policy = DwellPolicy::default();
+    let mut state = DwellRepoState::default();
+    track(
+        &mut state,
+        &[
+            sighting(1, "merge_state:DIRTY", HEAD, Some(500)),
+            sighting(2, "held", HEAD, Some(35)),
+        ],
+        &observed(&[1, 2]),
+        &BTreeSet::new(),
+        true,
+        &policy,
+        APPROVAL,
+        now(),
+    );
+    let planned = plan(
+        &state,
+        overdue(&state, &policy, now()),
+        &policy,
+        now(),
+        &|_, _| Actable::Yes,
+    );
+    assert_eq!(planned.len(), 2, "still reported overdue");
+    assert!(planned.iter().all(|row| !row.escalate), "{planned:?}");
+    // A later level still escalates.
+    let later = now() + chrono::Duration::minutes(30);
+    let planned = plan(
+        &state,
+        overdue(&state, &policy, later),
+        &policy,
+        later,
+        &|_, _| Actable::Yes,
+    );
+    assert!(
+        planned
+            .iter()
+            .find(|row| row.overdue.number == 2)
+            .unwrap()
+            .escalate
+    );
+}
+
+#[test]
+fn a_failed_or_deferred_act_is_retried_with_backoff_at_most_three_times() {
+    let at = now();
+    assert!(!retry_due(
+        &record("done", 1, at),
+        at + chrono::Duration::days(1)
+    ));
+    assert!(
+        !retry_due(&record("intent", 1, at), at + chrono::Duration::days(1)),
+        "an intent may have happened"
+    );
+    assert!(!retry_due(
+        &record("deferred", 1, at),
+        at + chrono::Duration::minutes(14)
+    ));
+    assert!(retry_due(
+        &record("deferred", 1, at),
+        at + chrono::Duration::minutes(15)
+    ));
+    assert!(!retry_due(
+        &record("failed", 2, at),
+        at + chrono::Duration::minutes(29)
+    ));
+    assert!(retry_due(
+        &record("failed", 2, at),
+        at + chrono::Duration::minutes(30)
+    ));
+    assert!(!retry_due(
+        &record("refused", MAX_ATTEMPTS, at),
+        at + chrono::Duration::days(1)
+    ));
+    // Attempts count intents after a retryable outcome.
+    let mut state = DwellRepoState::default();
+    state.record_act(1, record("intent", 1, at));
+    state.record_act(1, record("deferred", 1, at));
+    state.record_act(1, record("intent", 1, at));
+    assert_eq!(
+        state
+            .acted(1, DwellState::RequiredNeverRan, HEAD)
+            .unwrap()
+            .attempts,
+        2
+    );
+    state.record_act(1, record("failed", 1, at));
+    assert_eq!(
+        state
+            .acted(1, DwellState::RequiredNeverRan, HEAD)
+            .unwrap()
+            .attempts,
+        2
+    );
+}
+
+#[test]
+fn an_act_that_cannot_run_now_waits_and_the_cap_bounds_acts_per_pass() {
+    let policy = DwellPolicy {
+        act: ActMode::Apply,
+        max_acts_per_pass: 2,
+        ..DwellPolicy::default()
+    };
+    let sightings: Vec<Sighting> = (1..=5)
+        .map(|n| sighting(n, "required_never_ran:macos", HEAD, Some(31)))
+        .collect();
+    let state = tracked_once(&sightings, &policy);
+    let planned = plan(
+        &state,
+        overdue(&state, &policy, now()),
+        &policy,
+        now(),
+        &|row, _| {
+            if row.number == 5 {
+                Actable::NotNow("deferred".to_owned())
+            } else {
+                Actable::Yes
+            }
+        },
+    );
+    let acts = planned
+        .iter()
+        .filter(|row| matches!(row.act, Disposition::Act { .. }))
+        .count();
+    assert_eq!(acts, 2, "{planned:?}");
+    let later: Vec<&Planned> = planned
+        .iter()
+        .filter(|row| matches!(row.act, Disposition::ActLater { .. }))
+        .collect();
+    assert_eq!(later.len(), 3);
+    assert!(
+        later.iter().all(|row| !row.escalate),
+        "waiting acts do not escalate at level 1"
     );
 }

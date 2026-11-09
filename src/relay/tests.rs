@@ -1655,17 +1655,25 @@ fn a_steward_overdue_row_reaches_the_owner_once_per_level_at_the_current_head() 
 }
 
 #[test]
-fn steward_overdue_reads_the_tick_report_and_skips_rows_being_acted_on() {
+fn steward_overdue_relays_only_emitted_author_levels_not_being_acted_on() {
+    let row = |pr: u64, state: &str, role: &str, level: u64, emitted: u64, act: &str| {
+        json!({"pr": pr, "state": state, "head": HEAD_A, "level": level, "escalated_level": emitted,
+               "age_minutes": 31, "limit_minutes": 30, "owner": {"role": role},
+               "act": {"disposition": act}})
+    };
     let report = json!({"repos": [{"dwell": {"overdue": [
-        {"pr": 7, "state": "held", "head": HEAD_A, "level": 1, "age_minutes": 31,
-         "limit_minutes": 30, "act": {"disposition": "no_act"}},
-        {"pr": 8, "state": "stale_verdict_check", "head": HEAD_A, "level": 1,
-         "act": {"disposition": "act", "kind": "rerun_verdict_check"}},
-        {"pr": 9, "state": "required_never_ran", "head": HEAD_A, "level": 2,
-         "act": {"disposition": "acted", "kind": "dispatch_never_ran", "status": "done"}},
+        row(7, "held", "author", 1, 1, "no_act"),
+        row(8, "stacked_base_merged", "author", 1, 1, "act"),
+        row(9, "dirty", "author", 2, 2, "acted"),
+        row(10, "needs_review", "reviewer", 1, 1, "no_act"),
+        row(11, "dirty", "author", 2, 1, "no_act"),
     ]}}]});
     let rows = steward_overdue(&report);
-    assert_eq!(rows.keys().copied().collect::<Vec<_>>(), vec![7, 9]);
+    assert_eq!(
+        rows.keys().copied().collect::<Vec<_>>(),
+        vec![7, 9],
+        "acting (8), not the author's (10) and not yet emitted (11) are left out"
+    );
     assert_eq!(
         rows[&7][0].key(REPO, 7),
         format!("{REPO}#7:overdue:{HEAD_A}:held:1")

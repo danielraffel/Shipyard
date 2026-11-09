@@ -35,8 +35,8 @@ use super::{
     StewardPolicy, StewardPullRequest,
 };
 use crate::merge_steward::dwell::{
-    self, ActKind, ActMode, ActRecord, Disposition, DwellPolicy, DwellRepoState, DwellState,
-    Planned, Sighting,
+    self, ActKind, ActMode, ActRecord, Actable, Disposition, DwellPolicy, DwellRepoState,
+    DwellState, Planned, Sighting,
 };
 use crate::merge_steward::next_admit::{self, OthersState, RankInput, Ranked};
 use crate::merge_steward::selected_required_check;
@@ -47,6 +47,12 @@ pub(crate) const DIR: &str = "steward-dwell";
 pub(crate) const FEED: &str = "overdue.jsonl";
 /// Feed size past which it is rotated to `overdue.jsonl.1`.
 const FEED_ROTATE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// The ledger key of one repository and base: a steward run for another
+/// base never touches this one's dwell state.
+pub(super) fn dwell_key(repo: &str, base: &str) -> String {
+    format!("{}@{}", repo.to_ascii_lowercase(), base)
+}
 
 /// The dwell section of one repository's tick report.
 #[derive(Clone, Debug, Default, Serialize)]
@@ -103,6 +109,9 @@ pub(crate) struct OverdueRecord {
     pub over_minutes: i64,
     /// Escalation level (1 at the limit, doubling).
     pub level: u32,
+    /// Highest level the steward has emitted for this state and head: the
+    /// relay delivers a level once it is emitted, even from a later tick.
+    pub escalated_level: u32,
     /// The steward's next action for the row, when the census classified it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_action: Option<NextAction>,
@@ -150,8 +159,10 @@ pub(super) enum ActOutcome {
     Done(String),
     /// A live revalidation refused it; nothing was written.
     Refused(String),
-    /// It was attempted and failed.
+    /// It was attempted and GitHub refused it.
     Failed(String),
+    /// A precondition could not be read; nothing was attempted.
+    Deferred(String),
 }
 
 impl ActOutcome {
@@ -160,12 +171,16 @@ impl ActOutcome {
             Self::Done(_) => "done",
             Self::Refused(_) => "refused",
             Self::Failed(_) => "failed",
+            Self::Deferred(_) => "deferred",
         }
     }
 
     fn detail(&self) -> &str {
         match self {
-            Self::Done(detail) | Self::Refused(detail) | Self::Failed(detail) => detail,
+            Self::Done(detail)
+            | Self::Refused(detail)
+            | Self::Failed(detail)
+            | Self::Deferred(detail) => detail,
         }
     }
 }
@@ -197,6 +212,8 @@ pub(super) struct DwellInput<'a> {
     /// state directory).
     pub state_dir: Option<&'a Path>,
     pub now: DateTime<Utc>,
+    /// Past this instant no GitHub-writing act is taken (`--pass-budget-secs`).
+    pub deadline: Option<std::time::Instant>,
 }
 
 /// Read `[auto_merge.dwell]` from the base's `.shipyard/config.toml`, through
@@ -233,6 +250,7 @@ pub(super) fn read_policy(actions: &GitHubActions, repo: &str, base: &str) -> Dw
 }
 
 /// Run the dwell step for one repository: track, rank, act, escalate.
+#[allow(clippy::too_many_lines)] // One pass, in order; each step is a call.
 pub(super) fn run(
     input: &DwellInput<'_>,
     reports: &[PrReport],
@@ -240,7 +258,7 @@ pub(super) fn run(
     acts: &dyn DwellActs,
 ) -> DwellRepoReport {
     let observation = input.observation;
-    let repo_key = observation.repo.to_ascii_lowercase();
+    let repo_key = dwell_key(&observation.repo, &observation.base);
     let mut report = DwellRepoReport {
         act_mode: input.dwell_policy.act,
         stack_listing: if input.listing.is_some() {
@@ -283,23 +301,50 @@ pub(super) fn run(
     state.admission_rank.clone_from(&report.ranking);
 
     let rows = dwell::overdue(&state, input.dwell_policy, input.now);
-    let dispatchable =
-        |row: &dwell::Overdue| !workflows_for(&row.token, &input.dwell_policy.dispatch).is_empty();
-    let planned = dwell::plan(&state, rows, input.dwell_policy, &dispatchable);
+    let stacked_now: BTreeSet<u64> = stacked.iter().map(|pr| pr.number).collect();
+    let actable = |row: &dwell::Overdue, kind: ActKind| {
+        if skipped.contains(&row.number) {
+            return Actable::NotNow(
+                "deferred by the pass budget; not classified this pass".to_owned(),
+            );
+        }
+        if kind.writes_github() && super::pass_budget::deadline_passed(input.deadline) {
+            return Actable::NotNow("the pass time budget is spent".to_owned());
+        }
+        match kind {
+            ActKind::DispatchNeverRan
+                if workflows_for(&row.token, &input.dwell_policy.dispatch).is_empty() =>
+            {
+                Actable::Never
+            }
+            ActKind::RetargetStacked if !stacked_now.contains(&row.number) => {
+                Actable::NotNow("stacked pull requests were not listed this pass".to_owned())
+            }
+            _ => Actable::Yes,
+        }
+    };
+    let mut planned = dwell::plan(&state, rows, input.dwell_policy, input.now, &actable);
     state.readmit_first.clear();
     let mut outcomes: BTreeMap<u64, String> = BTreeMap::new();
-    for row in &planned {
+    for row in &mut planned {
         let Disposition::Act { kind } = row.act else {
             continue;
         };
-        let outcome = take_act(
-            input, row, kind, reports, &stacked, &mut state, ledger, acts, &repo_key,
-        );
-        match outcome {
-            Ok(Some(text)) => {
+        match take_act(
+            input, row, kind, &stacked, &mut state, ledger, acts, &repo_key,
+        ) {
+            Ok((text, done)) => {
                 outcomes.insert(row.overdue.number, text);
+                // An act that did not happen is escalated now, not a level
+                // later.
+                if !done {
+                    let already = state
+                        .entries
+                        .get(&row.overdue.number)
+                        .map_or(0, |entry| entry.escalated_level);
+                    row.escalate = row.overdue.level > already;
+                }
             }
-            Ok(None) => {}
             Err(error) => report.errors.push(error),
         }
     }
@@ -308,13 +353,22 @@ pub(super) fn run(
     }
     report.escalations_new = planned.iter().filter(|row| row.escalate).count();
     report.escalations_deferred = planned.iter().filter(|row| row.escalation_deferred).count();
+    let by_number: BTreeMap<u64, &PrReport> = reports
+        .iter()
+        .map(|report| (report.number, report))
+        .collect();
     report.overdue = planned
         .iter()
         .map(|row| {
+            let escalated_level = state
+                .entries
+                .get(&row.overdue.number)
+                .map_or(0, |entry| entry.escalated_level);
             overdue_record(
                 input,
-                reports,
+                by_number.get(&row.overdue.number).copied(),
                 row,
+                escalated_level,
                 outcomes.get(&row.overdue.number).cloned(),
             )
         })
@@ -402,20 +456,19 @@ fn workflows_for(token: &str, dispatch: &BTreeMap<String, String>) -> Vec<String
 }
 
 /// Take one planned act: record the intent durably, then the side effect,
-/// then the outcome. Returns the outcome text, or an error that left nothing
-/// done.
+/// then the outcome. Returns the outcome text and whether the act happened,
+/// or an error that left nothing done.
 #[allow(clippy::too_many_arguments)]
 fn take_act(
     input: &DwellInput<'_>,
     row: &Planned,
     kind: ActKind,
-    reports: &[PrReport],
     stacked: &[OpenPr],
     state: &mut DwellRepoState,
     ledger: &mut StewardLedger,
     acts: &dyn DwellActs,
     repo_key: &str,
-) -> Result<Option<String>, String> {
+) -> Result<(String, bool), String> {
     let number = row.overdue.number;
     let record = |status: &str, detail: Option<String>| ActRecord {
         kind,
@@ -424,6 +477,7 @@ fn take_act(
         status: status.to_owned(),
         at: input.now,
         detail,
+        attempts: 1,
     };
     if kind == ActKind::Readmit {
         // Reordering the steward's own next pass: the admission path keeps
@@ -436,10 +490,10 @@ fn take_act(
                 Some("evaluated first in the next admission pass".to_owned()),
             ),
         );
-        return Ok(Some("readmit: evaluated first next pass".to_owned()));
+        return Ok(("readmit: evaluated first next pass".to_owned(), true));
     }
     if !input.apply {
-        return Ok(Some(format!("{}: not taken (dry run)", kind.key())));
+        return Ok((format!("{}: not taken (dry run)", kind.key()), true));
     }
     // Write-ahead: the intent is durable before the side effect, so a crash
     // after it can never take the act a second time. If it cannot be saved,
@@ -468,20 +522,17 @@ fn take_act(
             {
                 None => ActOutcome::Refused("head moved since it was observed".to_owned()),
                 Some(pr) if kind == ActKind::RerunVerdictCheck => acts.rerun_verdict(pr, ledger),
-                Some(pr) => {
-                    let current = reports
-                        .iter()
-                        .find(|report| report.number == number)
-                        .map_or("", |report| report.blocked.blocked_on.as_str());
-                    acts.dispatch(pr, &workflows_for(current, &input.dwell_policy.dispatch))
-                }
+                // The token the entry was tracked under, never this pass's
+                // report row (a deferred row has none).
+                Some(pr) => acts.dispatch(
+                    pr,
+                    &workflows_for(&row.overdue.token, &input.dwell_policy.dispatch),
+                ),
             }
         }
         ActKind::RetargetStacked => match stacked.iter().find(|pr| pr.number == number) {
             Some(pr) if pr.head_sha.eq_ignore_ascii_case(&row.overdue.head) => acts.retarget(pr),
-            _ => ActOutcome::Refused(
-                "not seen stacked on a merged base this pass; retried when it is".to_owned(),
-            ),
+            _ => ActOutcome::Deferred("not seen stacked on a merged base this pass".to_owned()),
         },
         ActKind::Readmit => unreachable!("handled above"),
     };
@@ -491,41 +542,48 @@ fn take_act(
         outcome.status(),
         outcome.detail()
     );
-    // A refusal names a state the act could not change; the record stays so
-    // the act is not retried at this head, and the escalation path takes
-    // over at the next level.
+    // `done` is final at this head. Anything else is retried a bounded number
+    // of times with backoff (`dwell::retry_due`) and escalates meanwhile.
     state.record_act(
         number,
         record(outcome.status(), Some(outcome.detail().to_owned())),
     );
-    Ok(Some(text))
+    Ok((text, matches!(outcome, ActOutcome::Done(_))))
 }
 
 fn overdue_record(
     input: &DwellInput<'_>,
-    reports: &[PrReport],
+    report: Option<&PrReport>,
     row: &Planned,
+    escalated_level: u32,
     act_outcome: Option<String>,
 ) -> OverdueRecord {
     let number = row.overdue.number;
-    let report = reports.iter().find(|report| report.number == number);
+    let role = row.overdue.state.escalation_role();
     let author = input
         .observation
         .prs
         .iter()
         .find(|pr| pr.fact.number == number)
         .and_then(|pr| pr.fact.author.clone());
-    let registered = input.state_dir.and_then(|dir| {
-        crate::owner_registry::load(dir, &input.observation.repo, number)
-            .filter(|record| !record.released)
-    });
+    // Only the author's own states go to the owning (author) session; review,
+    // CI and steward states go to the feed, where the party that can act
+    // reads them.
+    let registered = (role == "author")
+        .then(|| {
+            input.state_dir.and_then(|dir| {
+                crate::owner_registry::load(dir, &input.observation.repo, number)
+                    .filter(|record| !record.released)
+            })
+        })
+        .flatten();
     let owner = OwnerRef {
         route: if registered.is_some() {
             "relay"
         } else {
             "feed"
         },
-        role: row.overdue.state.escalation_role(),
+        role,
         host: registered.as_ref().map(|record| record.host.clone()),
         surface: registered
             .as_ref()
@@ -547,6 +605,7 @@ fn overdue_record(
         limit_minutes: row.overdue.limit_minutes,
         over_minutes: row.overdue.over_minutes,
         level: row.overdue.level,
+        escalated_level,
         next_action: report.and_then(|report| report.blocked.next_action.clone()),
         owner,
         act: row.act.clone(),
@@ -772,13 +831,12 @@ fn append_feed<'a>(
         .map_err(|error| format!("overdue feed {}: {error}", path.display()))
 }
 
-/// Where `repo`'s snapshot lives.
-pub(crate) fn snapshot_path(state_dir: &Path, repo: &str) -> PathBuf {
-    let slug: String = repo
-        .to_ascii_lowercase()
+/// Where `repo`'s snapshot for `base` lives.
+pub(crate) fn snapshot_path(state_dir: &Path, repo: &str, base: &str) -> PathBuf {
+    let slug: String = dwell_key(repo, base)
         .chars()
         .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '.' {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '@') {
                 c
             } else {
                 '_'
@@ -812,7 +870,7 @@ pub(super) fn write_snapshot(
             "rest": api.rest, "graphql": api.graphql, "cache_hits": api.cache_hits,
         })),
     });
-    let path = snapshot_path(state_dir, repo);
+    let path = snapshot_path(state_dir, repo, base);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| format!("dwell snapshot: {error}"))?;
     }
@@ -820,12 +878,137 @@ pub(super) fn write_snapshot(
         .map_err(|error| format!("dwell snapshot {}: {error}", path.display()))
 }
 
-/// [`DwellActs`] against GitHub, under the steward's mutation guard.
+/// The newest observation of the approval context on the head, when it is a
+/// completed red run that a re-run could flip: the check the required rule
+/// selects (app binding included), with no later or still-running check of
+/// the same name. Pure.
+pub(super) fn rerun_target(
+    checks: &[crate::merge_steward::StewardCheck],
+    required: &crate::merge_steward::RequiredCheck,
+) -> Result<u64, String> {
+    let selected = selected_required_check(checks, required)
+        .ok_or_else(|| format!("no {} check on the head", required.context))?;
+    if checks.iter().any(|check| {
+        check.name.eq_ignore_ascii_case(&required.context)
+            && !check.status.eq_ignore_ascii_case("COMPLETED")
+    }) {
+        return Err(format!("a {} run is still running", required.context));
+    }
+    if !selected.status.eq_ignore_ascii_case("COMPLETED") || green(selected.conclusion.as_deref()) {
+        return Err(format!("the {} check is not red", required.context));
+    }
+    selected
+        .run_id
+        .ok_or_else(|| format!("the {} check names no workflow run", required.context))
+}
+
+/// Whether the approval gate's live answer allows re-running the verdict
+/// check: only an exact-head approval does. `NotRequired` does not (the
+/// ruleset may still require the context, and a re-run cannot make it
+/// green), and any refusal (a HOLD above all) does not. Pure.
+pub(super) fn gate_allows_rerun(
+    gate: &crate::head_approval::HeadGate,
+    blocker: Option<&crate::head_approval::ApprovalBlocker>,
+) -> Result<(), String> {
+    if let Some(blocker) = blocker {
+        return Err(format!(
+            "the approval gate refuses the head ({}); a re-run cannot change it",
+            blocker.token()
+        ));
+    }
+    match gate {
+        crate::head_approval::HeadGate::Approved { .. } => Ok(()),
+        _ => Err("the approval gate does not approve the exact head".to_owned()),
+    }
+}
+
+/// What a live read of a pull request must show before an act on it: still
+/// open, the head the act was planned for, and a head branch in the base
+/// repository (a fork's branch name would dispatch on a base-repository
+/// branch of the same name). Pure.
+pub(super) fn live_pr_matches(live: &Value, repo: &str, head: &str) -> Result<(), String> {
+    let text = |pointer: &str| {
+        live.pointer(pointer)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    };
+    if text("/state") != "open" {
+        return Err("no longer open".to_owned());
+    }
+    if !text("/head/sha").eq_ignore_ascii_case(head) {
+        return Err("head moved since it was observed".to_owned());
+    }
+    if !text("/head/repo/full_name").eq_ignore_ascii_case(repo) {
+        return Err("its head branch is in a fork".to_owned());
+    }
+    Ok(())
+}
+
+/// Every fact a retarget needs, read live. Pure: refuses unless the stacked
+/// pull request is unchanged, its `stacked:<n>` parent merged into the
+/// steward's base from the very branch it is based on, and that branch still
+/// points at the parent's merged head (so it carries nothing the parent did
+/// not land).
+pub(super) fn retarget_allowed(
+    stacked: &OpenPr,
+    live: &Value,
+    parent: &Value,
+    base_tip: Option<&str>,
+    repo: &str,
+    base: &str,
+) -> Result<(), String> {
+    let text = |value: &Value, pointer: &str| {
+        value
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    live_pr_matches(live, repo, &stacked.head_sha)?;
+    if text(live, "/base/ref") != stacked.base_ref {
+        return Err("its base changed since it was observed".to_owned());
+    }
+    let number = parent.get("number").and_then(Value::as_u64).unwrap_or(0);
+    if parent.get("merged_at").is_none_or(Value::is_null) {
+        return Err(format!(
+            "#{number} closed without merging: retargeting would carry its commits"
+        ));
+    }
+    if text(parent, "/head/ref") != stacked.base_ref
+        || !text(parent, "/head/repo/full_name").eq_ignore_ascii_case(repo)
+    {
+        return Err(format!(
+            "#{number} was not the pull request of `{}`",
+            stacked.base_ref
+        ));
+    }
+    if text(parent, "/base/ref") != base {
+        return Err(format!(
+            "#{number} merged into `{}`, not `{base}`",
+            text(parent, "/base/ref")
+        ));
+    }
+    match base_tip {
+        None => Err(format!(
+            "`{}` is gone; GitHub retargets on branch deletion",
+            stacked.base_ref
+        )),
+        Some(tip) if tip.eq_ignore_ascii_case(&text(parent, "/head/sha")) => Ok(()),
+        Some(_) => Err(format!(
+            "`{}` moved after #{number} merged; retargeting would carry unlanded commits",
+            stacked.base_ref
+        )),
+    }
+}
+
+/// [`DwellActs`] against GitHub, under the steward's mutation guard. Every
+/// act re-reads the pull request live immediately before its side effect.
 pub(super) struct GitHubDwellActs<'a> {
     pub actions: &'a GitHubActions,
     pub observation: &'a RepoObservation,
     pub control: Option<&'a MutationControl>,
-    pub approval_context: &'a str,
+    /// The policy's approval context and the required rule naming it.
+    pub approval: Option<&'a crate::merge_steward::RequiredCheck>,
 }
 
 impl GitHubDwellActs<'_> {
@@ -836,11 +1019,11 @@ impl GitHubDwellActs<'_> {
         effect: impl FnOnce() -> Result<String, String>,
     ) -> ActOutcome {
         let Some(control) = self.control else {
-            return ActOutcome::Refused("no mutation control (dry run)".to_owned());
+            return ActOutcome::Deferred("no mutation control (dry run)".to_owned());
         };
         let guard = match super::acquire_pr_mutation_guard(control, self.observation, pr, action) {
             Ok(guard) => guard,
-            Err(error) => return ActOutcome::Failed(format!("mutation guard: {error}")),
+            Err(error) => return ActOutcome::Deferred(format!("mutation guard: {error}")),
         };
         match effect() {
             Ok(detail) => match guard.finish("dwell_act_accepted") {
@@ -861,45 +1044,59 @@ impl GitHubDwellActs<'_> {
             .map_err(|error| error.to_string())?;
         serde_json::from_str(&raw).map_err(|error| error.to_string())
     }
+
+    fn live_pr(&self, number: u64) -> Result<Value, String> {
+        self.gh_json(&[
+            "api".to_owned(),
+            format!("repos/{}/pulls/{number}", self.observation.repo),
+        ])
+    }
+
+    /// Live revalidation of a census pull request before an act on it.
+    fn revalidate(&self, pr: &ObservedPr) -> Option<ActOutcome> {
+        match self.live_pr(pr.fact.number) {
+            Err(error) => Some(ActOutcome::Deferred(format!(
+                "pull request unreadable: {error}"
+            ))),
+            Ok(live) => live_pr_matches(&live, &self.observation.repo, &pr.fact.head_sha)
+                .err()
+                .map(ActOutcome::Refused),
+        }
+    }
 }
 
 impl DwellActs for GitHubDwellActs<'_> {
     fn rerun_verdict(&self, pr: &ObservedPr, ledger: &StewardLedger) -> ActOutcome {
-        let Some(run_id) = pr
-            .fact
-            .checks
-            .iter()
-            .filter(|check| check.name.eq_ignore_ascii_case(self.approval_context))
-            .filter(|check| check.status.eq_ignore_ascii_case("COMPLETED"))
-            .filter(|check| !green(check.conclusion.as_deref()))
-            .max_by_key(|check| check.check_id)
-            .and_then(|check| check.run_id)
-        else {
-            return ActOutcome::Refused(format!(
-                "no completed red {} run on the head",
-                self.approval_context
-            ));
+        let Some(required) = self.approval else {
+            return ActOutcome::Refused("no required approval context".to_owned());
         };
+        let run_id = match rerun_target(&pr.fact.checks, required) {
+            Ok(run_id) => run_id,
+            Err(why) => return ActOutcome::Refused(why),
+        };
+        if let Some(outcome) = self.revalidate(pr) {
+            return outcome;
+        }
         match super::pr_mutations::read_head_gate_for_report(
             self.actions,
             self.observation,
             pr,
             ledger,
         ) {
-            Err(error) => return ActOutcome::Failed(format!("approval gate unreadable: {error}")),
-            Ok((_, _, Some(blocker))) => {
-                return ActOutcome::Refused(format!(
-                    "the approval gate refuses the head ({}); a re-run cannot change it",
-                    blocker.token()
-                ));
+            Err(error) => {
+                return ActOutcome::Deferred(format!("approval gate unreadable: {error}"));
             }
-            Ok((_, _, None)) => {}
+            Ok((gate, _, blocker)) => {
+                if let Err(why) = gate_allows_rerun(&gate, blocker.as_ref()) {
+                    return ActOutcome::Refused(why);
+                }
+            }
         }
         self.guarded(
             pr,
             &format!(
                 "runner steward dwell rerun stale {} run {run_id}",
-                self.approval_context
+                required.context
             ),
             || {
                 self.actions
@@ -913,6 +1110,9 @@ impl DwellActs for GitHubDwellActs<'_> {
     fn dispatch(&self, pr: &ObservedPr, workflows: &[String]) -> ActOutcome {
         if workflows.is_empty() {
             return ActOutcome::Refused("no mapped workflow for the missing context".to_owned());
+        }
+        if let Some(outcome) = self.revalidate(pr) {
+            return outcome;
         }
         self.guarded(
             pr,
@@ -943,39 +1143,40 @@ impl DwellActs for GitHubDwellActs<'_> {
     fn retarget(&self, stacked: &OpenPr) -> ActOutcome {
         let repo = &self.observation.repo;
         let base = &self.observation.base;
-        let Some(parent) = stacked.stacked_on else {
+        let Some(parent_number) = stacked.stacked_on else {
             return ActOutcome::Refused("no stacked:<n> label".to_owned());
         };
-        let live = match self.gh_json(&[
-            "api".to_owned(),
-            format!("repos/{repo}/pulls/{}", stacked.number),
-        ]) {
+        let live = match self.live_pr(stacked.number) {
             Ok(live) => live,
             Err(error) => {
-                return ActOutcome::Failed(format!("#{} unreadable: {error}", stacked.number));
+                return ActOutcome::Deferred(format!("#{} unreadable: {error}", stacked.number));
             }
         };
-        let text = |value: &Value, pointer: &str| {
-            value
-                .pointer(pointer)
+        let parent = match self.live_pr(parent_number) {
+            Ok(parent) => parent,
+            Err(error) => {
+                return ActOutcome::Deferred(format!("#{parent_number} unreadable: {error}"));
+            }
+        };
+        let base_tip = match self.gh_json(&[
+            "api".to_owned(),
+            format!(
+                "repos/{repo}/branches/{}",
+                super::observation::encode_path_segment(&stacked.base_ref)
+            ),
+        ]) {
+            Ok(branch) => branch
+                .pointer("/commit/sha")
                 .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned()
-        };
-        if text(&live, "/state") != "open"
-            || text(&live, "/base/ref") != stacked.base_ref
-            || !text(&live, "/head/sha").eq_ignore_ascii_case(&stacked.head_sha)
-        {
-            return ActOutcome::Refused("changed since it was observed".to_owned());
-        }
-        match self.gh_json(&["api".to_owned(), format!("repos/{repo}/pulls/{parent}")]) {
-            Ok(parent_pr) if parent_pr.get("merged_at").is_some_and(|at| !at.is_null()) => {}
-            Ok(_) => {
-                return ActOutcome::Refused(format!(
-                    "#{parent} closed without merging: retargeting would carry its commits"
-                ));
+                .map(str::to_owned),
+            Err(error) if error.contains("404") || error.contains("Not Found") => None,
+            Err(error) => {
+                return ActOutcome::Deferred(format!("`{}` unreadable: {error}", stacked.base_ref));
             }
-            Err(error) => return ActOutcome::Failed(format!("#{parent} unreadable: {error}")),
+        };
+        if let Err(why) = retarget_allowed(stacked, &live, &parent, base_tip.as_deref(), repo, base)
+        {
+            return ActOutcome::Refused(why);
         }
         let observed = ObservedPr {
             node_id: String::new(),
@@ -996,7 +1197,7 @@ impl DwellActs for GitHubDwellActs<'_> {
         };
         self.guarded(
             &observed,
-            &format!("runner steward dwell retarget to {base} after #{parent} merged"),
+            &format!("runner steward dwell retarget to {base} after #{parent_number} merged"),
             || {
                 let updated = self.gh_json(&[
                     "api".to_owned(),
@@ -1007,13 +1208,14 @@ impl DwellActs for GitHubDwellActs<'_> {
                     format!("base={base}"),
                 ])?;
                 // Post-action proof: GitHub's answer names the new base.
-                if text(&updated, "/base/ref") == *base {
-                    Ok(format!("retargeted to {base}; #{parent} merged"))
+                let now_base = updated
+                    .pointer("/base/ref")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if now_base == base {
+                    Ok(format!("retargeted to {base}; #{parent_number} merged"))
                 } else {
-                    Err(format!(
-                        "readback base is {:?}, not {base}",
-                        text(&updated, "/base/ref")
-                    ))
+                    Err(format!("readback base is {now_base:?}, not {base}"))
                 }
             },
         )

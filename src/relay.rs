@@ -812,8 +812,10 @@ pub(crate) fn steward_next_actions(report: &Value) -> BTreeMap<u64, (String, Str
 }
 
 /// The steward's overdue rows per pull request, from its tick report
-/// (`repos[].dwell.overdue[]`), as relay events. A row the steward is acting
-/// on this pass is left out: the act gets its chance before anyone is told.
+/// (`repos[].dwell.overdue[]`), as relay events: the author's own states
+/// (failed checks, conflicts, HOLDs, stacks), at levels the steward has
+/// emitted. A row the steward is acting on this pass is left out: the act
+/// gets its chance before anyone is told.
 pub(crate) fn steward_overdue(report: &Value) -> BTreeMap<u64, Vec<RelayEvent>> {
     let mut out: BTreeMap<u64, Vec<RelayEvent>> = BTreeMap::new();
     let rows = report
@@ -824,7 +826,18 @@ pub(crate) fn steward_overdue(report: &Value) -> BTreeMap<u64, Vec<RelayEvent>> 
         .filter_map(|repo| repo.pointer("/dwell/overdue").and_then(Value::as_array))
         .flatten();
     for row in rows {
-        if row.pointer("/act/disposition").and_then(Value::as_str) == Some("act") {
+        // Only the author's own states go to the owning session, and only a
+        // level the steward has emitted (its per-pass cap holds; a level
+        // emitted in a tick this relay missed is still delivered).
+        let emitted = row
+            .get("escalated_level")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let level = row.get("level").and_then(Value::as_u64).unwrap_or(u64::MAX);
+        if row.pointer("/act/disposition").and_then(Value::as_str) == Some("act")
+            || row.pointer("/owner/role").and_then(Value::as_str) != Some("author")
+            || emitted < level
+        {
             continue;
         }
         let (Some(pr), Some(state), Some(head), Some(level)) = (

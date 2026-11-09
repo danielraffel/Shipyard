@@ -17,7 +17,7 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use super::CliFailure;
-use super::merge_steward_cmd::dwell_pass::{DIR, snapshot_path};
+use super::merge_steward_cmd::dwell_pass::DIR;
 use crate::output::write_json_envelope;
 
 /// Which view.
@@ -29,40 +29,45 @@ pub(super) enum View {
     Next,
 }
 
-/// Every snapshot to show: `repo`'s, or every repository's.
-fn snapshots(state_dir: &Path, repo: Option<&str>) -> Result<Vec<(PathBuf, Value)>, CliFailure> {
-    let paths: Vec<PathBuf> = repo.map_or_else(
-        || {
-            let mut paths: Vec<PathBuf> = std::fs::read_dir(state_dir.join(DIR))
-                .map(|entries| {
-                    entries
-                        .flatten()
-                        .map(|entry| entry.path())
-                        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
-                        .collect()
-                })
-                .unwrap_or_default();
-            paths.sort();
-            paths
-        },
-        |repo| vec![snapshot_path(state_dir, repo)],
-    );
-    let mut out = Vec::new();
-    for path in paths {
-        match std::fs::read_to_string(&path) {
-            Ok(text) => {
-                let value: Value = serde_json::from_str(&text).map_err(|error| {
-                    CliFailure::new(1, format!("{} is not valid JSON: {error}", path.display()))
-                })?;
-                out.push((path, value));
+/// Every snapshot to show: `repo`'s (any base), or every repository's. A
+/// snapshot that cannot be read is skipped with a warning on stderr rather
+/// than hiding the others.
+fn snapshots(state_dir: &Path, repo: Option<&str>) -> Vec<Value> {
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(state_dir.join(DIR))
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+                .collect()
+        })
+        .unwrap_or_default();
+    paths.sort();
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let parsed = std::fs::read_to_string(&path)
+                .map_err(|error| error.to_string())
+                .and_then(|text| {
+                    serde_json::from_str::<Value>(&text).map_err(|error| error.to_string())
+                });
+            match parsed {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    eprintln!("warning: skipping {}: {error}", path.display());
+                    None
+                }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound && repo.is_some() => {}
-            Err(error) => {
-                return Err(CliFailure::new(1, format!("{}: {error}", path.display())));
-            }
-        }
-    }
-    Ok(out)
+        })
+        .filter(|value| {
+            repo.is_none_or(|repo| {
+                value
+                    .get("repo")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| name.eq_ignore_ascii_case(repo))
+            })
+        })
+        .collect()
 }
 
 fn age_seconds(snapshot: &Value, now: DateTime<Utc>) -> Option<i64> {
@@ -81,7 +86,7 @@ pub(super) fn dwell_view_command<W: Write>(
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
     let repo = repo.map(str::trim).filter(|repo| !repo.is_empty());
-    let snapshots = snapshots(state_dir, repo)?;
+    let snapshots = snapshots(state_dir, repo);
     let key = match view {
         View::Overdue => "overdue",
         View::Next => "next_to_admit",
@@ -90,7 +95,7 @@ pub(super) fn dwell_view_command<W: Write>(
     if json {
         let repos: Vec<Value> = snapshots
             .iter()
-            .map(|(_, snapshot)| {
+            .map(|snapshot| {
                 serde_json::json!({
                     "repo": snapshot.get("repo"),
                     "base": snapshot.get("base"),
@@ -122,7 +127,7 @@ pub(super) fn dwell_view_command<W: Write>(
         .map_err(io)?;
         return Ok(ExitCode::SUCCESS);
     }
-    for (_, snapshot) in &snapshots {
+    for snapshot in &snapshots {
         render_text(view, key, snapshot, now, stdout)?;
     }
     Ok(ExitCode::SUCCESS)
@@ -205,7 +210,8 @@ mod tests {
     use super::*;
 
     fn write(state_dir: &Path, repo: &str, at: &str) {
-        let path = snapshot_path(state_dir, repo);
+        let path =
+            super::super::merge_steward_cmd::dwell_pass::snapshot_path(state_dir, repo, "main");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
             path,
@@ -254,6 +260,17 @@ mod tests {
         assert_eq!(value["repos"][0]["next_to_admit"][0]["number"], 9);
         assert_eq!(value["repos"][0]["age_seconds"], 120);
         assert!(value["repos"][0].get("overdue").is_none());
+    }
+
+    #[test]
+    fn an_unreadable_snapshot_is_skipped_not_fatal() {
+        let temp = tempfile::tempdir().unwrap();
+        write(temp.path(), "Owner/Repo", "2026-11-09T11:58:00Z");
+        std::fs::write(temp.path().join(DIR).join("broken.json"), "{").unwrap();
+        let mut out = Vec::new();
+        dwell_view_command(View::Next, temp.path(), None, true, now(), &mut out).unwrap();
+        let value: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(value["repos"].as_array().unwrap().len(), 1);
     }
 
     #[test]

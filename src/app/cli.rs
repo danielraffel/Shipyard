@@ -556,9 +556,9 @@ pub(super) enum Command {
     /// The pull requests closest to mergeable, in the order the merge
     /// steward admits them, with the single action each needs. Read-only.
     ///
-    /// Stack bases first, then approved and green, approved with checks
-    /// running, green but needing a review, then the rest; within a tier,
-    /// more unblocked pull requests first. Reads the steward's last
+    /// Approved stack bases first, then approved and green, approved with
+    /// checks running, green but needing a review, then the rest; within a
+    /// tier, more unblocked pull requests first. Reads the steward's last
     /// snapshot; never reads GitHub.
     Next {
         /// Exact OWNER/REPO.

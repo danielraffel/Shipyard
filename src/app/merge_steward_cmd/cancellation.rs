@@ -128,6 +128,7 @@ pub(super) fn apply_repo_plan(
             ledger_path,
             state_dir: mutation_control.map(|control| control.state_dir.as_path()),
             now: Utc::now(),
+            deadline: args.pass_deadline,
         },
         &reports,
         ledger,
@@ -135,7 +136,11 @@ pub(super) fn apply_repo_plan(
             actions,
             observation,
             control: mutation_control,
-            approval_context: &policy.approval_context,
+            approval: policy.required_checks.iter().find(|required| {
+                required
+                    .context
+                    .eq_ignore_ascii_case(policy.approval_context.trim())
+            }),
         },
     );
     // The backstop acts only on pull requests the steward declines to own, so
@@ -390,6 +395,7 @@ pub(super) fn apply_pr_plans_with_listing(
         .collect::<Vec<_>>();
     let order = super::pass_budget::processing_order(
         &observation.repo,
+        &observation.base,
         &observation.prs,
         &census_decisions,
         ledger,

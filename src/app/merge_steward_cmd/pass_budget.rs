@@ -193,9 +193,9 @@ pub(super) fn is_deferred(report: &PrReport) -> bool {
 /// candidates (rows the steward can enqueue or rerun), then signaling-only
 /// work. Within the last two groups, rows the previous pass deferred go
 /// first, oldest deferral first (the order `record_deferred` persisted).
-/// Within a group, an approved green head the dwell step flagged as
-/// overstaying goes before everything, and the last pass's next-to-admit
-/// ranking orders the rest; census order breaks the remaining ties.
+/// After the carry, an approved green head the dwell step flagged as
+/// overstaying goes first, then the last pass's next-to-admit ranking;
+/// census order breaks the remaining ties.
 ///
 /// The carry order matters as much as the carry itself. Census order is
 /// newest first, so ordering carried rows by census index alone took the same
@@ -204,6 +204,7 @@ pub(super) fn is_deferred(report: &PrReport) -> bool {
 /// tail was deferred forever.
 pub(super) fn processing_order(
     repo: &str,
+    base: &str,
     prs: &[ObservedPr],
     decisions: &[StewardDecision],
     ledger: &StewardLedger,
@@ -219,9 +220,11 @@ pub(super) fn processing_order(
                 .collect()
         })
         .unwrap_or_default();
-    // The last pass's dwell step: approved green heads that overstayed go
-    // first, then the next-to-admit ranking (closest to mergeable first).
-    let dwell = ledger.dwell.get(&ledger_key(repo));
+    // The last pass's dwell step: after the deferral carry (whose rotation
+    // keeps every deferred row from starving), approved green heads that
+    // overstayed, then the next-to-admit ranking (closest to mergeable
+    // first).
+    let dwell = ledger.dwell.get(&super::dwell_pass::dwell_key(repo, base));
     let readmit: BTreeSet<u64> = dwell
         .map(|dwell| dwell.readmit_first.iter().copied().collect())
         .unwrap_or_default();
@@ -250,7 +253,7 @@ pub(super) fn processing_order(
         let overstayed = usize::from(!readmit.contains(&number));
         let carry_rank = carried.get(&number).copied().unwrap_or(usize::MAX);
         let rank = ranked.get(&number).copied().unwrap_or(usize::MAX);
-        (group, overstayed, carry_rank, rank, index)
+        (group, carry_rank, overstayed, rank, index)
     });
     order
 }
@@ -343,7 +346,7 @@ mod tests {
         ledger
             .pass_budget_deferred
             .insert("owner/repo".to_owned(), vec![5]);
-        let order: Vec<u64> = processing_order("Owner/Repo", &prs, &decisions, &ledger)
+        let order: Vec<u64> = processing_order("Owner/Repo", "main", &prs, &decisions, &ledger)
             .into_iter()
             .map(|index| prs[index].fact.number)
             .collect();
@@ -361,7 +364,7 @@ mod tests {
         let mut ledger = StewardLedger::default();
         let mut evaluated = Vec::new();
         for _ in 0..passes {
-            let order = processing_order("Owner/Repo", prs, decisions, &ledger);
+            let order = processing_order("Owner/Repo", "main", prs, decisions, &ledger);
             let taken: Vec<usize> = order.iter().copied().take(per_pass).collect();
             let reports: Vec<_> = (0..prs.len())
                 .map(|index| {
@@ -426,7 +429,7 @@ mod tests {
         ledger
             .pass_budget_deferred
             .insert("owner/repo".to_owned(), vec![2, 1, 4]);
-        let order: Vec<u64> = processing_order("Owner/Repo", &prs, &decisions, &ledger)
+        let order: Vec<u64> = processing_order("Owner/Repo", "main", &prs, &decisions, &ledger)
             .into_iter()
             .map(|index| prs[index].fact.number)
             .collect();

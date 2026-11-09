@@ -220,6 +220,10 @@ pub struct DwellPolicy {
     /// Most new escalations one pass emits per repository; the rest wait for
     /// the next pass, worst first.
     pub max_escalations_per_pass: usize,
+    /// Most GitHub-writing acts one pass takes per repository; the rest wait
+    /// for the next pass. Bounds an outage (every PR `required_never_ran` at
+    /// once) to a trickle.
+    pub max_acts_per_pass: usize,
     /// Highest escalation level: level `n` fires at `limit * 2^(n-1)`.
     pub max_level: u32,
     /// Why the config could not be read, when it could not; the defaults
@@ -238,6 +242,7 @@ impl Default for DwellPolicy {
             act: ActMode::default(),
             dispatch: BTreeMap::new(),
             max_escalations_per_pass: 25,
+            max_acts_per_pass: 3,
             max_level: 4,
             read_error: None,
         }
@@ -278,6 +283,13 @@ impl DwellPolicy {
             .and_then(|cap| usize::try_from(cap).ok())
         {
             policy.max_escalations_per_pass = cap;
+        }
+        if let Some(cap) = section
+            .get("max_acts_per_pass")
+            .and_then(toml::Value::as_integer)
+            .and_then(|cap| usize::try_from(cap).ok())
+        {
+            policy.max_acts_per_pass = cap;
         }
         if let Some(level) = section
             .get("max_level")
@@ -389,17 +401,36 @@ pub struct ActRecord {
     pub state: DwellState,
     /// The head.
     pub head: String,
-    /// `intent`, `done`, `failed`, `refused`.
+    /// `intent` (recorded before the side effect), `done`, `failed` (the
+    /// side effect was attempted and GitHub refused it), `refused` (a live
+    /// revalidation said no) or `deferred` (a precondition could not be
+    /// read; nothing was attempted).
     pub status: String,
     /// When it was recorded.
     pub at: DateTime<Utc>,
     /// What happened.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// Attempts at this act for this state and head, the current one
+    /// included.
+    #[serde(default = "one")]
+    pub attempts: u32,
+}
+
+const fn one() -> u32 {
+    1
 }
 
 /// Acts kept per pull request; older ones are dropped.
-const ACTS_KEPT: usize = 16;
+const ACTS_KEPT: usize = 64;
+/// An act record is kept this long, whether or not its pull request is seen:
+/// a pull request missing from one pass, or closed and reopened, never gets
+/// an act repeated at a head it already acted on.
+const ACT_TTL_DAYS: i64 = 14;
+/// Most attempts at one act for one state and head.
+pub const MAX_ATTEMPTS: u32 = 3;
+/// Wait before the first retry; doubles per attempt.
+const RETRY_BASE_MINUTES: i64 = 15;
 
 /// One repository's dwell state, in the steward ledger.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -419,6 +450,11 @@ pub struct DwellRepoState {
     /// in the next pass.
     #[serde(default)]
     pub readmit_first: Vec<u64>,
+    /// The last pass that saw each pull request, in any state: a state
+    /// entered after an untracked one (queued, draft) is never dated before
+    /// it.
+    #[serde(default)]
+    pub seen: BTreeMap<u64, DateTime<Utc>>,
 }
 
 impl DwellRepoState {
@@ -433,19 +469,40 @@ impl DwellRepoState {
     }
 
     /// Record an act (intent or outcome), replacing the same act's earlier
-    /// record for the same head.
-    pub fn record_act(&mut self, number: u64, record: ActRecord) {
+    /// record for the same head. An intent after a retryable outcome counts
+    /// one more attempt; an outcome keeps its intent's count.
+    pub fn record_act(&mut self, number: u64, mut record: ActRecord) {
         let acts = self.acts.entry(number).or_default();
-        acts.retain(|existing| {
-            !(existing.state == record.state
+        let same = |existing: &ActRecord| {
+            existing.state == record.state
                 && existing.kind == record.kind
-                && existing.head.eq_ignore_ascii_case(&record.head))
-        });
+                && existing.head.eq_ignore_ascii_case(&record.head)
+        };
+        if let Some(previous) = acts.iter().rev().find(|existing| same(existing)) {
+            record.attempts = if record.status == "intent" && previous.status != "intent" {
+                previous.attempts + 1
+            } else {
+                previous.attempts
+            };
+        }
+        acts.retain(|existing| !same(existing));
         acts.push(record);
         if acts.len() > ACTS_KEPT {
             acts.drain(..acts.len() - ACTS_KEPT);
         }
     }
+}
+
+/// Whether a recorded act may be tried again now: never after `done` or a
+/// bare `intent` (its outcome is unknown, so it may have happened), and never
+/// past [`MAX_ATTEMPTS`]; otherwise after a backoff that doubles per attempt.
+#[must_use]
+pub fn retry_due(record: &ActRecord, now: DateTime<Utc>) -> bool {
+    if matches!(record.status.as_str(), "done" | "intent") || record.attempts >= MAX_ATTEMPTS {
+        return false;
+    }
+    let shift = record.attempts.saturating_sub(1).min(8);
+    now - record.at >= Duration::minutes(RETRY_BASE_MINUTES << shift)
 }
 
 /// What one pass saw of one pull request.
@@ -465,10 +522,14 @@ pub struct Sighting {
 ///
 /// A pull request in an untracked state loses its entry; one that changed
 /// state or head starts a new entry, dated by GitHub's `since` when that is
-/// no earlier than the previous state's last sighting (else by the previous
-/// sighting) and never later than `now`. `observed` is every pull request
-/// this pass could see; entries for any other are removed, and their acts
-/// with them, so a closed pull request leaves nothing behind. An entry
+/// no earlier than the last pass that saw the pull request in any state
+/// (else by that pass) and never later than `now`. `observed` is every pull
+/// request this pass could see; entries for any other are removed. Act
+/// records are kept for [`ACT_TTL_DAYS`] whatever is observed, so an act is
+/// never repeated at a head because its pull request dropped out of one
+/// pass. The first pass that tracks a repository seeds its entries as
+/// already escalated at their current level, so turning the feature on does
+/// not flood the feed with the existing backlog. An entry
 /// survives unchanged when the pass saw its pull request but did not
 /// classify it (`skipped`, a row the pass budget deferred), and a stacked
 /// entry survives a pass that could not see stacked pull requests
@@ -484,6 +545,7 @@ pub fn track(
     approval_context: &str,
     now: DateTime<Utc>,
 ) {
+    let first_pass = state.entries.is_empty() && state.seen.is_empty();
     let mut current = BTreeMap::new();
     for sighting in sightings {
         let Some(dwell) = state_for_token(&sighting.token, approval_context)
@@ -503,18 +565,29 @@ pub fn track(
                 }
             }
             _ => {
-                let floor = previous.map(|entry| entry.last_seen_at);
+                let floor = previous
+                    .map(|entry| entry.last_seen_at)
+                    .into_iter()
+                    .chain(state.seen.get(&sighting.number).copied())
+                    .max();
                 let entered = sighting
                     .since
                     .map_or(now, |since| floor.map_or(since, |floor| since.max(floor)))
                     .min(now);
+                let escalated_level = if first_pass {
+                    policy.limit(dwell).map_or(0, |limit| {
+                        level((now - entered).num_minutes(), limit, policy.max_level)
+                    })
+                } else {
+                    0
+                };
                 DwellEntry {
                     state: dwell,
                     token: sighting.token.clone(),
                     head: sighting.head.clone(),
                     entered_at: entered,
                     last_seen_at: now,
-                    escalated_level: 0,
+                    escalated_level,
                 }
             }
         };
@@ -540,8 +613,16 @@ pub fn track(
         .copied()
         .chain(state.entries.keys().copied())
         .collect();
-    state.acts.retain(|number, _| live.contains(number));
+    let expiry = now - Duration::days(ACT_TTL_DAYS);
+    for records in state.acts.values_mut() {
+        records.retain(|record| record.at >= expiry);
+    }
+    state.acts.retain(|_, records| !records.is_empty());
     state.readmit_first.retain(|number| live.contains(number));
+    state.seen.retain(|number, _| live.contains(number));
+    for number in seen.iter().chain(skipped) {
+        state.seen.insert(*number, now);
+    }
 }
 
 /// One pull request past its limit.
@@ -634,6 +715,16 @@ pub enum Disposition {
         /// The act.
         kind: ActKind,
     },
+    /// The act applies but cannot be taken this pass: a precondition is not
+    /// observable (a row the pass budget deferred, a stacked pull request the
+    /// pass could not see), the per-pass act cap or the pass budget is spent.
+    /// Escalation still waits until level 2, as for an act taken now.
+    ActLater {
+        /// The act.
+        kind: ActKind,
+        /// Why not now.
+        why: String,
+    },
     /// The act was already taken for this state and head.
     Acted {
         /// The act.
@@ -659,37 +750,66 @@ pub struct Planned {
     pub escalation_deferred: bool,
 }
 
-/// Plan one pass: an act where one applies and was not taken, and an
+/// Whether a row's act can be taken this pass.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Actable {
+    /// Its preconditions are observable now.
+    Yes,
+    /// It never applies to this row (a never-ran context with no mapped
+    /// workflow): escalate instead.
+    Never,
+    /// Not this pass, for this reason; try again on a later pass.
+    NotNow(String),
+}
+
+/// Plan one pass: an act where one applies and was not taken (or is due a
+/// bounded retry, [`retry_due`]), at most `max_acts_per_pass`, and an
 /// escalation for each new level, at most `max_escalations_per_pass`, worst
 /// first.
 ///
-/// A pull request whose act runs this pass is not escalated at level 1: the
-/// act gets its chance first. Every other overdue level escalates, including
-/// one whose act was already taken (it did not clear the state).
-/// `dispatchable` says whether a [`ActKind::DispatchNeverRan`] has a mapped
-/// workflow for the row's contexts.
+/// A pull request whose act runs, or waits for a later pass, is not
+/// escalated at level 1: the act gets its chance first. Every other overdue
+/// level escalates, including one whose act was already taken (it did not
+/// clear the state). `actable` says whether a row's act can be taken now.
 #[must_use]
 pub fn plan(
     state: &DwellRepoState,
     rows: Vec<Overdue>,
     policy: &DwellPolicy,
-    dispatchable: &dyn Fn(&Overdue) -> bool,
+    now: DateTime<Utc>,
+    actable: &dyn Fn(&Overdue, ActKind) -> Actable,
 ) -> Vec<Planned> {
     let mut budget = policy.max_escalations_per_pass;
+    let mut acts_left = policy.max_acts_per_pass;
     rows.into_iter()
         .map(|row| {
             let act = match row.state.mechanical_act() {
                 None => Disposition::NoAct,
-                Some(ActKind::DispatchNeverRan) if !dispatchable(&row) => Disposition::NoAct,
                 Some(kind) => match state.acted(row.number, row.state, &row.head) {
-                    Some(record) => Disposition::Acted {
+                    Some(record) if !retry_due(record, now) => Disposition::Acted {
                         kind: record.kind,
                         status: record.status.clone(),
                     },
-                    None => match policy.act {
-                        ActMode::Off => Disposition::NoAct,
-                        ActMode::Shadow if kind.writes_github() => Disposition::WouldAct { kind },
-                        ActMode::Apply | ActMode::Shadow => Disposition::Act { kind },
+                    _ => match (policy.act, actable(&row, kind)) {
+                        (ActMode::Off, _) | (_, Actable::Never) => Disposition::NoAct,
+                        (ActMode::Shadow, _) if kind.writes_github() => {
+                            Disposition::WouldAct { kind }
+                        }
+                        (_, Actable::NotNow(why)) => Disposition::ActLater { kind, why },
+                        (ActMode::Apply | ActMode::Shadow, Actable::Yes)
+                            if kind.writes_github() && acts_left == 0 =>
+                        {
+                            Disposition::ActLater {
+                                kind,
+                                why: "per-pass act cap reached".to_owned(),
+                            }
+                        }
+                        (ActMode::Apply | ActMode::Shadow, Actable::Yes) => {
+                            if kind.writes_github() {
+                                acts_left -= 1;
+                            }
+                            Disposition::Act { kind }
+                        }
                     },
                 },
             };
@@ -697,7 +817,9 @@ pub fn plan(
                 .entries
                 .get(&row.number)
                 .map_or(0, |entry| entry.escalated_level);
-            let acting_first = matches!(act, Disposition::Act { .. }) && row.level <= 1;
+            let acting_first =
+                matches!(act, Disposition::Act { .. } | Disposition::ActLater { .. })
+                    && row.level <= 1;
             let owed = row.level > already && !acting_first;
             let escalate = owed && budget > 0;
             if escalate {
