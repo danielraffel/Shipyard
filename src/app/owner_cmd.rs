@@ -105,6 +105,17 @@ pub(super) fn registration_enabled(env: &dyn Fn(&str) -> Option<String>) -> bool
     env(REGISTER_ENV).is_none_or(|value| value.trim() != "0")
 }
 
+/// Whether this `shipyard ship` run registers its session as the owner:
+/// only a run that pushed (no `--pr`: `ship --pr N` attaches to someone's
+/// pull request, which is how other sessions wait on it), and only when the
+/// environment has not opted out.
+pub(super) fn push_registers(
+    explicit_pr: Option<u64>,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> bool {
+    explicit_pr.is_none() && registration_enabled(env)
+}
+
 /// Register the session that just pushed `repo#number` through
 /// `shipyard pr` / `shipyard ship`. Never fails the caller: the answer is a
 /// line to print.
@@ -119,12 +130,27 @@ pub(super) fn register_after_push(
         Ok(relay) => relay,
         Err(error) => return format!("⚠︎ Owner not registered: {}", error.message),
     };
+    // Opt-in per host: a machine without `[relay]` writes no hostnames or
+    // session ids into pull-request bodies.
+    if !relay.configured || !relay.enabled {
+        return format!("▸ Owner of {repo}#{number} not registered (no [relay] on this host)");
+    }
     let identity = this_session(&relay);
     let actions = gh_for(cwd, config, repo);
     let gh = run_gh(&actions);
     match owner_registry::read_pr_body(&gh, repo, number) {
         Ok(pr) => {
             let record = identity.record(repo, number, Source::Ship, Utc::now());
+            let current = owner_registry::load(&runtime_paths.state_dir, repo, number)
+                .into_iter()
+                .chain(owner_registry::parse_marker(repo, number, &pr.body))
+                .max_by_key(|r| r.registered_at);
+            if !owner_registry::push_takes_over(current.as_ref(), &record) {
+                return format!(
+                    "▸ Owner of {repo}#{number} kept: this session has no cmux surface and the \
+                     current owner has one"
+                );
+            }
             owner_registry::register(&gh, &runtime_paths.state_dir, &pr, record).line()
         }
         Err(error) => format!("⚠︎ Owner of {repo}#{number} not registered: {error}"),
@@ -658,6 +684,13 @@ mod tests {
             !same_session(&record(None, None), &anonymous),
             "two unknown sessions are not the same session"
         );
+    }
+
+    #[test]
+    fn waiting_on_a_pull_request_with_ship_pr_never_takes_it_over() {
+        assert!(push_registers(None, &|_| None));
+        assert!(!push_registers(Some(11830), &|_| None));
+        assert!(!push_registers(None, &|name| (name == REGISTER_ENV).then(|| "0".to_owned())));
     }
 
     #[test]

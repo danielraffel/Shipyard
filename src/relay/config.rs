@@ -96,6 +96,9 @@ pub(crate) struct RepoFallbacks {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RelayConfig {
     pub(crate) enabled: bool,
+    /// The machine config has a `[relay]` table. Without one the host is not
+    /// part of a relay fleet and pushes register no owner.
+    pub(crate) configured: bool,
     pub(crate) mode: Mode,
     pub(crate) host_name: Option<String>,
     pub(crate) interval_secs: u64,
@@ -140,6 +143,7 @@ impl Default for RelayConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            configured: false,
             mode: Mode::Shadow,
             host_name: None,
             interval_secs: 120,
@@ -200,6 +204,7 @@ pub(crate) fn parse(data: &Table) -> Result<RelayConfig, String> {
     let table = value
         .as_table()
         .ok_or_else(|| "relay must be a table".to_owned())?;
+    config.configured = true;
     if let Some(enabled) = table.get("enabled") {
         config.enabled = enabled
             .as_bool()

@@ -302,3 +302,45 @@ fn the_pull_request_for_a_branch_must_be_unique() {
     );
     assert!(gh.calls.borrow()[0].iter().any(|a| a == "branch=feat/x"));
 }
+
+#[test]
+fn a_marker_for_the_same_session_is_not_rewritten_when_only_its_time_differs() {
+    let old = record();
+    let mut again = old.clone();
+    again.registered_at = at(40);
+    again.source = Source::Ship;
+    let gh = FakeGh::new(vec![]);
+    let run = |args: &[String]| gh.run(args);
+    let pr = PrBody {
+        id: "PR_node".to_owned(),
+        number: 11796,
+        state: "OPEN".to_owned(),
+        body: format!("Body\n\n{}", render_marker(&old)),
+    };
+    assert_eq!(write_marker(&run, &pr, &again), Ok(MarkerWrite::Unchanged));
+    assert!(
+        gh.calls.borrow().is_empty(),
+        "no body edit, no edited event"
+    );
+    let mut moved = again;
+    moved.surface = Some("NEW-SURFACE".to_owned());
+    let gh = FakeGh::new(vec![Ok("{}".to_owned())]);
+    let run = |args: &[String]| gh.run(args);
+    assert_eq!(write_marker(&run, &pr, &moved), Ok(MarkerWrite::Written));
+}
+
+#[test]
+fn a_push_without_a_surface_never_displaces_a_reachable_owner() {
+    let live = record();
+    let mut headless = record();
+    headless.surface = None;
+    assert!(!push_takes_over(Some(&live), &headless));
+    assert!(
+        push_takes_over(Some(&live), &record()),
+        "another surface may take over"
+    );
+    let mut released = live.clone();
+    released.released = true;
+    assert!(push_takes_over(Some(&released), &headless));
+    assert!(push_takes_over(None, &headless));
+}

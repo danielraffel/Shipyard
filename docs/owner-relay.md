@@ -9,8 +9,13 @@ do next. Neither one uses a model.
 
 ## Owner registration
 
-`shipyard pr` and `shipyard ship` record the pushing session as the owner of
-the pull request, every time they push:
+`shipyard pr` and `shipyard ship` (without `--pr`) record the pushing session
+as the owner of the pull request every time they push. `shipyard ship --pr N`
+pushes nothing (it is how other sessions wait on a pull request), so it never
+registers. Registration is opt-in per host: a machine without a `[relay]` table
+in its config registers nothing and writes nothing into pull-request bodies.
+A push from a session without a cmux surface (a headless or scheduled run)
+never displaces a live owner that has one.
 
 | field | from |
 |---|---|
@@ -29,6 +34,10 @@ The record is written twice:
   `<!-- shipyard-owner: host=m5 client=codex surface=... socket=... session=... at=... -->`,
   so the address survives the loss of that host and any host can read it.
   The body is written over GraphQL (`updatePullRequest`), not REST.
+
+The body is only rewritten when the address changes (host, client, surface,
+socket, session, agent, released), never for a new timestamp alone: every body
+edit fires `pull_request: edited`, which some required gates listen to.
 
 Values are kept only when they consist of `[A-Za-z0-9._:/@+-]`, so a marker can
 never close its comment or carry shell syntax into a transport. The record is
@@ -66,7 +75,10 @@ One pass per repository:
    `relay.steward_tick_dir`) is fresh and judged the same head, its
    `next_action` is the next step in the message, at no GitHub cost.
 3. **Events**, comparing with the last pass. A first sighting is a baseline,
-   not an event.
+   not an event. Verdicts and `repair-claim:` lines count only from a
+   repository owner, member or collaborator, or a GitHub App: an outside
+   contributor's `verdict: APPROVE` is never relayed. A pull request with more
+   than 100 check contexts is never reported green from a partial page.
 
 | event | fires when |
 |---|---|
@@ -80,7 +92,11 @@ One pass per repository:
 | `stacked_base_merged` | the pull request whose head is its base merged, or it was retargeted to the default branch |
 
 4. **Delivery.** Each event has an idempotency key (`repo#pr:event:head:detail`)
-   and is delivered once. A pull request gets at most one message per
+   and is delivered once. Repeatable events (`enqueued`, `ejected`,
+   `required_check`) carry a per-PR sequence number, so a second ejection or a
+   re-run that fails again at the same head is a new message; a verdict
+   re-posted at the same head is not. The state and the log record are written
+   after each delivery, before the next one is sent. A pull request gets at most one message per
    `relay.rate_limit_minutes` (default 10); events in between are batched into
    the next one. `merged` and `closed` skip the wait.
 
@@ -92,7 +108,16 @@ The fallback chain, first success wins:
 4. one pull-request comment (GraphQL `addComment`) starting `shipyard-relay:`,
    when `relay.comment_fallback` is on.
 
-A batch nothing could take stays pending and is retried next pass.
+A batch nothing could take is retried one rate-limit window later, up to six
+times, then dropped (logged as `refused`). At most one fallback comment is
+posted per head. A pull request GitHub does not know is dropped after three
+passes.
+
+Run **one** relay per fleet: every relay that reads a repository's body
+markers delivers to every owner. Owner hosts must be this host or listed in
+`relay.hosts`; a host named only by a body marker is never an ssh destination,
+a marker's `socket` is used only when it is one of `relay.sockets`, and a
+marker's time is clamped to now (a store record on this host wins a tie).
 
 ### Transport
 

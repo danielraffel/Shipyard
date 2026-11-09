@@ -75,7 +75,8 @@ impl Pr {
             "baseRef": {"associatedPullRequests": {"nodes":
                 self.stacked.map(|n| vec![json!({"number": n})]).unwrap_or_default()}},
             "comments": {"nodes": self.comments.iter()
-                .map(|(body, at)| json!({"body": body, "createdAt": at})).collect::<Vec<_>>()},
+                .map(|(body, at)| json!({"body": body, "createdAt": at,
+                    "authorAssociation": "MEMBER", "author": {"__typename": "User", "login": "rev"}})).collect::<Vec<_>>()},
             "commits": {"nodes": [{"commit": {"statusCheckRollup": {"contexts": {"nodes": self.checks}}}}]},
         })
     }
@@ -157,6 +158,7 @@ fn the_digest_reads_claims_merges_and_stacking() {
         "2026-11-09T12:09:00Z".to_owned(),
     ));
     pr.stacked = Some(41);
+    pr.base = "feat/parent";
     let d = digest(&pr);
     assert_eq!(
         d.claim,
@@ -279,6 +281,7 @@ fn the_idempotency_key_names_the_head_and_the_fact() {
         result: "red".to_owned(),
         names: vec!["macos".to_owned()],
         head: HEAD_A.to_owned(),
+        seq: 1,
     };
     let mut red_b = red_a.clone();
     if let RelayEvent::RequiredCheck { head, .. } = &mut red_b {
@@ -721,6 +724,7 @@ impl Harness {
             gh: &gh,
             runner: &self.cmux,
             steward: &steward,
+            persist: None,
         };
         let report = run_pass(&input, &mut self.state);
         self.log.extend(report.log.clone());
@@ -886,7 +890,13 @@ fn an_undeliverable_batch_stays_pending_and_is_retried() {
         "/tmp/cmux-nightly.sock".to_owned(),
         "GONE".to_owned(),
     ));
-    h.pass(2, Mode::Send);
+    h.pass(5, Mode::Send);
+    assert_eq!(
+        h.deliveries().len(),
+        1,
+        "a failed batch backs off one window"
+    );
+    h.pass(12, Mode::Send);
     assert_eq!(
         h.deliveries()[1]["delivered"],
         true,
@@ -1127,6 +1137,7 @@ fn a_recorded_day_replays_into_the_expected_deliveries() {
             gh: &answer,
             runner: &h.cmux,
             steward: &steward,
+            persist: None,
         };
         let report = run_pass(&input, &mut h.state);
         let got: Vec<String> = report
@@ -1156,7 +1167,7 @@ fn a_recorded_day_replays_into_the_expected_deliveries() {
 }
 
 #[test]
-fn a_rerun_that_goes_red_again_at_the_same_head_is_not_resent() {
+fn a_rerun_that_goes_red_again_at_the_same_head_is_resent() {
     let pr = Pr::open(3);
     let mut h = Harness::new(
         std::slice::from_ref(&pr),
@@ -1175,8 +1186,8 @@ fn a_rerun_that_goes_red_again_at_the_same_head_is_not_resent() {
     h.pass(40, Mode::Send);
     assert_eq!(
         h.cmux.sends().len(),
-        1,
-        "the same red at the same head is delivered once"
+        2,
+        "a re-run that fails again is a new fact, not a duplicate"
     );
 }
 
@@ -1248,6 +1259,223 @@ fn an_unreachable_owner_gets_at_most_one_comment_per_head() {
         h.gh.comments.borrow().len(),
         2,
         "a new head may get its own"
+    );
+}
+
+#[test]
+fn the_same_verdict_reposted_at_the_same_head_is_not_resent() {
+    let pr = Pr::open(4);
+    let mut h = Harness::new(
+        std::slice::from_ref(&pr),
+        FakeCmux::with(&[("m5", "/tmp/cmux-nightly.sock", "S")]),
+    );
+    h.own(&owner(4, "m5", "S"));
+    h.pass(0, Mode::Send);
+    let mut approved = pr.clone();
+    approved.comments.push(verdict("APPROVE", HEAD_A));
+    h.gh.set(approved.clone());
+    h.pass(1, Mode::Send);
+    // The comment is deleted and posted again: the same fact.
+    h.gh.set(pr.clone());
+    h.pass(20, Mode::Send);
+    h.gh.set(approved);
+    h.pass(40, Mode::Send);
+    assert_eq!(h.cmux.sends().len(), 1);
+}
+
+#[test]
+fn an_outsiders_verdict_or_claim_is_not_relayed() {
+    let mut node = Pr::open(1).node();
+    node["comments"]["nodes"] = json!([
+        {"body": format!("verdict: APPROVE head:{HEAD_A}"), "createdAt": "2026-11-09T12:00:00Z",
+         "authorAssociation": "CONTRIBUTOR", "author": {"__typename": "User", "login": "x"}},
+        {"body": "repair-claim: lane until 2026-11-09T14:00Z", "createdAt": "2026-11-09T12:01:00Z",
+         "authorAssociation": "NONE", "author": {"__typename": "User", "login": "x"}},
+    ]);
+    let d = summarize(Some(&node), "main", &gates());
+    assert_eq!(d.verdict, None);
+    assert_eq!(d.claim, None);
+    assert_eq!(
+        d.last_comment_at.as_deref(),
+        Some("2026-11-09T12:01:00Z"),
+        "still activity"
+    );
+    // A GitHub App (the fleet's reviewer) is trusted.
+    node["comments"]["nodes"][0]["author"]["__typename"] = json!("Bot");
+    assert_eq!(
+        summarize(Some(&node), "main", &gates()).verdict.as_deref(),
+        Some("APPROVE")
+    );
+}
+
+#[test]
+fn a_merged_pull_request_headed_by_main_is_not_a_stacked_base() {
+    let mut pr = Pr::open(1);
+    pr.stacked = Some(77); // e.g. a main -> release sync pull request
+    assert_eq!(digest(&pr).stacked_base_merged, None);
+    pr.base = "feat/parent";
+    assert_eq!(digest(&pr).stacked_base_merged, Some(77));
+}
+
+#[test]
+fn more_contexts_than_one_page_is_never_green() {
+    let mut node = Pr::open(1).node();
+    node["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"] =
+        json!({"totalCount": 140, "nodes": green()});
+    assert_eq!(
+        summarize(Some(&node), "main", &gates()).checks,
+        Checks::Pending
+    );
+}
+
+#[test]
+fn dirty_without_a_base_move_is_not_a_base_move() {
+    let old = Pr::open(1);
+    let mut dirty = old.clone();
+    dirty.merge = "DIRTY";
+    assert!(
+        events(&old, &dirty).is_empty(),
+        "same head, same base: not a base move"
+    );
+}
+
+#[test]
+fn a_pull_request_github_does_not_know_is_dropped() {
+    let mut h = Harness::new(&[], FakeCmux::default());
+    h.own(&owner(404, "m5", "S"));
+    for minute in 0..3 {
+        h.pass(minute, Mode::Send);
+    }
+    assert!(h.state.prs.values().all(|t| t.done_at.is_some()));
+    let queries = *h.gh.queries.borrow();
+    h.pass(10, Mode::Send);
+    let tracked = h.state.prs.values().next().unwrap();
+    assert!(tracked.done_at.is_some());
+    assert_eq!(
+        *h.gh.queries.borrow(),
+        queries + 1,
+        "still one query, no alias for it"
+    );
+}
+
+#[test]
+fn a_batch_nothing_takes_is_dropped_after_bounded_retries() {
+    let pr = Pr::open(7);
+    let mut h = Harness::new(std::slice::from_ref(&pr), FakeCmux::default());
+    h.config.comment_fallback = false;
+    h.own(&owner(7, "m5", "GONE"));
+    h.pass(0, Mode::Send);
+    let mut red_pr = pr.clone();
+    red_pr.checks = red();
+    h.gh.set(red_pr);
+    for attempt in 1..=8 {
+        h.pass(attempt * 11, Mode::Send);
+    }
+    let deliveries = h.deliveries();
+    assert_eq!(
+        deliveries.len(),
+        6,
+        "six attempts, one window apart, then dropped"
+    );
+    assert!(
+        deliveries[5]["refused"]
+            .as_str()
+            .unwrap()
+            .contains("undeliverable")
+    );
+}
+
+#[test]
+fn a_marker_cannot_outrank_by_a_future_time_or_name_an_unknown_socket() {
+    let pr = Pr::open(5);
+    let mut h = Harness::new(
+        std::slice::from_ref(&pr),
+        FakeCmux::with(&[("m5", "/tmp/cmux-nightly.sock", "S")]),
+    );
+    let mut stored = owner(5, "m5", "S");
+    stored.registered_at = at(-10);
+    h.own(&stored);
+    let mut forged = owner(5, "m1", "EVIL");
+    forged.registered_at = at(60 * 24 * 365 * 70);
+    forged.cmux_socket = Some("/tmp/attacker.sock".to_owned());
+    let marker = owner_registry::render_marker(&forged);
+    h.gh.open_bodies.borrow_mut().insert(5, marker);
+    h.pass(0, Mode::Send);
+    let owner = h.state.prs.values().next().unwrap().owner.clone().unwrap();
+    assert_eq!(
+        owner.host, "m1",
+        "a marker newer than the store record still wins..."
+    );
+    assert_eq!(owner.registered_at, at(0), "...but only up to now");
+    assert_eq!(owner.cmux_socket, None, "an unconfigured socket is dropped");
+    // A store record registered now ties the clamped marker, and the store wins.
+    let mut later = stored;
+    later.registered_at = at(5);
+    h.own(&later);
+    h.pass(5, Mode::Send);
+    assert_eq!(
+        h.state
+            .prs
+            .values()
+            .next()
+            .unwrap()
+            .owner
+            .as_ref()
+            .unwrap()
+            .host,
+        "m5"
+    );
+}
+
+#[test]
+fn each_delivery_is_persisted_before_the_next_one_is_sent() {
+    let prs = [Pr::open(1), Pr::open(2)];
+    let mut h = Harness::new(
+        &prs,
+        FakeCmux::with(&[("m5", "/tmp/cmux-nightly.sock", "S")]),
+    );
+    h.own(&owner(1, "m5", "S"));
+    h.own(&owner(2, "m5", "S"));
+    h.pass(0, Mode::Send);
+    for pr in &prs {
+        let mut merged = pr.clone();
+        merged.state = "MERGED";
+        merged.merged = true;
+        h.gh.set(merged);
+    }
+    let saved: RefCell<Vec<(usize, usize)>> = RefCell::new(Vec::new());
+    let sends_so_far = || h.cmux.sends().len();
+    let persist = |state: &RelayState, record: &Value| -> Result<(), String> {
+        assert_eq!(record["kind"], "delivery");
+        let sent: usize = state.prs.values().map(|t| t.sent.len()).sum();
+        saved.borrow_mut().push((sends_so_far(), sent));
+        Ok(())
+    };
+    let repos = vec![REPO.to_owned()];
+    let gh = |args: &[String]| h.gh.run(args);
+    let steward = |_: &str| BTreeMap::new();
+    let input = PassInput {
+        config: &h.config,
+        repos: &repos,
+        local_host: "m3",
+        mode: Mode::Send,
+        state_dir: h.temp.path(),
+        now: at(1),
+        gh: &gh,
+        runner: &h.cmux,
+        steward: &steward,
+        persist: Some(&persist),
+    };
+    let mut state = h.state.clone();
+    let report = run_pass(&input, &mut state);
+    assert!(
+        report.log.is_empty(),
+        "persisted records are not returned again"
+    );
+    assert_eq!(
+        *saved.borrow(),
+        [(1, 1), (2, 2)],
+        "saved after each send, with its key"
     );
 }
 

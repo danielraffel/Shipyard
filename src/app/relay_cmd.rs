@@ -224,6 +224,14 @@ pub(super) fn relay_command<W: Write>(
             };
             let steward = |repo: &str| steward_actions(tick_dir.as_deref(), repo, tick_age);
             let one = std::slice::from_ref(repo);
+            // State first, then the record: a crash between them loses a log
+            // line, never sends a message twice.
+            let persist = |state: &RelayState, record: &Value| -> Result<(), String> {
+                crate::durable_file::replace_json(&state_path, state, true)
+                    .map_err(|error| format!("save relay state: {error}"))?;
+                append_log(&log_path, std::slice::from_ref(record))
+                    .map_err(|error| format!("append delivery log: {}", error.message))
+            };
             let input = PassInput {
                 config: &relay,
                 repos: one,
@@ -234,14 +242,15 @@ pub(super) fn relay_command<W: Write>(
                 gh: &gh,
                 runner: &runner,
                 steward: &steward,
+                persist: Some(&persist),
             };
             let report = run_pass(&input, &mut state);
             log.extend(report.log);
             repo_reports.extend(report.repos);
             api_calls.insert(repo.clone(), pass.report());
         }
-        append_log(&log_path, &log)?;
         crate::durable_file::replace_json(&state_path, &state, true).map_err(io_failure)?;
+        append_log(&log_path, &log)?;
         unhealthy = repo_reports.iter().any(|r| !r.errors.is_empty());
         if json_output {
             let mut data = BTreeMap::new();

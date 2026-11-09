@@ -57,6 +57,16 @@ pub(crate) struct Tracked {
     /// Heads that already got a fallback comment: at most one per head.
     #[serde(default)]
     pub(crate) commented_heads: BTreeSet<String>,
+    /// Numbers the repeatable events (enqueued, ejected, required checks),
+    /// so a second ejection or a re-run that fails again is a new fact.
+    #[serde(default)]
+    pub(crate) event_seq: u64,
+    /// Consecutive passes whose batch nothing could take.
+    #[serde(default)]
+    pub(crate) failed_deliveries: u32,
+    /// Consecutive passes GitHub had no such pull request.
+    #[serde(default)]
+    pub(crate) missing_passes: u32,
 }
 
 /// The relay's durable state.
@@ -71,6 +81,15 @@ pub(crate) struct RelayState {
 /// The steward's `next_action` per pull request (head, text), for a repo.
 pub(crate) type StewardActions<'a> = dyn Fn(&str) -> BTreeMap<u64, (String, String)> + 'a;
 
+/// Persists the state and one log record right after a delivery, so a
+/// crash later in the pass cannot send it again.
+pub(crate) type Persist<'a> = dyn Fn(&RelayState, &Value) -> Result<(), String> + 'a;
+
+/// Batches nothing could take are dropped after this many passes.
+const MAX_FAILED_DELIVERIES: u32 = 6;
+/// A pull request GitHub does not know is dropped after this many passes.
+const MAX_MISSING_PASSES: u32 = 3;
+
 /// What a pass needs from its caller.
 pub(crate) struct PassInput<'a> {
     pub(crate) config: &'a RelayConfig,
@@ -84,6 +103,8 @@ pub(crate) struct PassInput<'a> {
     pub(crate) runner: &'a dyn CmuxRunner,
     /// The steward's `next_action` per pull request (head, text), by repo.
     pub(crate) steward: &'a StewardActions<'a>,
+    /// Durable write after each delivery; `None` keeps records in the report.
+    pub(crate) persist: Option<&'a Persist<'a>>,
 }
 
 /// One repository's share of a pass.
@@ -146,6 +167,32 @@ fn adopt_owner(tracked: &mut Tracked, candidate: OwnerRecord) {
     tracked.owner = Some(owner_registry::newest(tracked.owner.take(), candidate));
 }
 
+/// Adopt the owner a body marker names. The marker is text anyone who can
+/// edit the body wrote: its time is clamped to now, its socket kept only
+/// when it is a configured one, and a store record on this host wins a tie.
+/// A marker-sourced owner is re-read every pass, so fixing the body fixes it.
+fn adopt_marker(
+    tracked: &mut Tracked,
+    mut record: OwnerRecord,
+    config: &RelayConfig,
+    now: DateTime<Utc>,
+) {
+    record.registered_at = record.registered_at.min(now);
+    if record
+        .cmux_socket
+        .as_ref()
+        .is_some_and(|socket| !config.sockets.contains(socket))
+    {
+        record.cmux_socket = None;
+    }
+    match tracked.owner.take() {
+        Some(current) if current.source != owner_registry::Source::BodyMarker => {
+            tracked.owner = Some(owner_registry::newest(Some(current), record));
+        }
+        _ => tracked.owner = Some(record),
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn run_repo(
     input: &PassInput<'_>,
@@ -190,7 +237,7 @@ fn run_repo(
         if entry.done_at.is_some() {
             continue;
         }
-        adopt_owner(entry, record);
+        adopt_marker(entry, record, input.config, input.now);
         if !read.prs.contains_key(number) {
             discovered.push(*number);
         }
@@ -214,11 +261,25 @@ fn run_repo(
             &read.default_branch,
             &input.config.review_gates,
         );
+        if digest.state == "MISSING" {
+            tracked.missing_passes += 1;
+            if tracked.missing_passes >= MAX_MISSING_PASSES {
+                tracked.done_at = Some(input.now);
+            }
+            continue;
+        }
+        tracked.missing_passes = 0;
         infer_actions(tracked, &digest, input.now, log);
-        let events: Vec<RelayEvent> = derive_events(tracked.digest.as_ref(), &digest)
+        let mut events: Vec<RelayEvent> = derive_events(tracked.digest.as_ref(), &digest)
             .into_iter()
             .filter(|event| input.config.events.contains(event.name()))
             .collect();
+        for event in &mut events {
+            if let Some(seq) = event.seq_mut() {
+                tracked.event_seq += 1;
+                *seq = tracked.event_seq;
+            }
+        }
         repo_pass.events += events.len();
         for event in events {
             let event_key = event.key(repo, *number);
@@ -257,8 +318,19 @@ fn run_repo(
         } else {
             repo_pass.undelivered += 1;
         }
-        log.push(serde_json::to_value(&record).unwrap_or(Value::Null));
+        let mut record = record;
+        if !record.delivered && record.refused.is_none() {
+            tracked.failed_deliveries += 1;
+            // Back off a window before retrying, and give up eventually.
+            tracked.last_sent_at = Some(input.now);
+            if tracked.failed_deliveries >= MAX_FAILED_DELIVERIES {
+                record.refused = Some(format!(
+                    "undeliverable after {MAX_FAILED_DELIVERIES} attempts; dropped"
+                ));
+            }
+        }
         if record.delivered || record.refused.is_some() {
+            tracked.failed_deliveries = 0;
             tracked.sent.extend(record.keys.iter().cloned());
             tracked.pending.clear();
             tracked.last_sent_at = Some(input.now);
@@ -276,6 +348,11 @@ fn run_repo(
             if digest.terminal() {
                 tracked.done_at = Some(input.now);
             }
+        }
+        let value = serde_json::to_value(&record).unwrap_or(Value::Null);
+        match input.persist {
+            Some(persist) => persist(state, &value)?,
+            None => log.push(value),
         }
     }
     Ok(())

@@ -343,8 +343,11 @@ pub(super) fn ship_command<W: Write>(
         }
     }
     // Record the pushing session as the pull request's owner, so the relay
-    // can tell it when the pull request changes. Never fatal.
-    if !repo.is_empty() && super::owner_cmd::registration_enabled(&|name| std::env::var(name).ok())
+    // can tell it when the pull request changes. Only when this run pushed
+    // (`--pr N` attaches to an existing pull request without pushing, and is
+    // how other sessions wait on it). Never fatal.
+    if !repo.is_empty()
+        && super::owner_cmd::push_registers(args.pr, &|name| std::env::var(name).ok())
     {
         let line = super::owner_cmd::register_after_push(
             cwd,

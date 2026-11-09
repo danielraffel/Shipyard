@@ -1,14 +1,402 @@
 {
-  "_comment": "One pull request's day as the relay saw it (shape of Generous-Corp/pulp#11808 on 2026-11-09): opened, macos red, pushed, green, approved, queued, ejected on a conflict, repaired, merged. Each step is the GraphQL pullRequest node at a pass; expect is the event sequence delivered at that pass (rate limit 10 min).",
-  "pr": 11808,
-  "steps": [
-    {"minute": 0, "expect": [], "node": {"id": "PR_1", "number": 11808, "state": "OPEN", "merged": false, "isInMergeQueue": false, "mergeStateStatus": "BLOCKED", "headRefOid": "fd22be1fc7000000000000000000000000000000", "baseRefName": "main", "baseRefOid": "1111111111111111111111111111111111111111", "baseRef": {"associatedPullRequests": {"nodes": []}}, "comments": {"nodes": []}, "commits": {"nodes": [{"commit": {"statusCheckRollup": {"contexts": {"nodes": [{"name": "macos", "status": "IN_PROGRESS", "conclusion": null, "isRequired": true}]}}}}]}}},
-    {"minute": 20, "expect": ["required_check"], "node": {"id": "PR_1", "number": 11808, "state": "OPEN", "merged": false, "isInMergeQueue": false, "mergeStateStatus": "BLOCKED", "headRefOid": "fd22be1fc7000000000000000000000000000000", "baseRefName": "main", "baseRefOid": "1111111111111111111111111111111111111111", "baseRef": {"associatedPullRequests": {"nodes": []}}, "comments": {"nodes": []}, "commits": {"nodes": [{"commit": {"statusCheckRollup": {"contexts": {"nodes": [{"name": "macos", "status": "COMPLETED", "conclusion": "FAILURE", "isRequired": true}]}}}}]}}},
-    {"minute": 25, "expect": [], "node": {"id": "PR_1", "number": 11808, "state": "OPEN", "merged": false, "isInMergeQueue": false, "mergeStateStatus": "BLOCKED", "headRefOid": "a22c77af13000000000000000000000000000000", "baseRefName": "main", "baseRefOid": "1111111111111111111111111111111111111111", "baseRef": {"associatedPullRequests": {"nodes": []}}, "comments": {"nodes": [{"body": "repaired: macos at a22c77af13", "createdAt": "2026-11-09T12:24:00Z"}]}, "commits": {"nodes": [{"commit": {"statusCheckRollup": {"contexts": {"nodes": [{"name": "macos", "status": "IN_PROGRESS", "conclusion": null, "isRequired": true}]}}}}]}}},
-    {"minute": 70, "expect": ["verdict", "required_check"], "node": {"id": "PR_1", "number": 11808, "state": "OPEN", "merged": false, "isInMergeQueue": false, "mergeStateStatus": "CLEAN", "headRefOid": "a22c77af13000000000000000000000000000000", "baseRefName": "main", "baseRefOid": "1111111111111111111111111111111111111111", "baseRef": {"associatedPullRequests": {"nodes": []}}, "comments": {"nodes": [{"body": "repaired: macos at a22c77af13", "createdAt": "2026-11-09T12:24:00Z"}, {"body": "LGTM\n<!-- session: m3/rev -->\nverdict: APPROVE head:a22c77af13000000000000000000000000000000", "createdAt": "2026-11-09T13:05:00Z"}]}, "commits": {"nodes": [{"commit": {"statusCheckRollup": {"contexts": {"nodes": [{"name": "macos", "status": "COMPLETED", "conclusion": "SUCCESS", "isRequired": true}, {"name": "review-verdict", "status": "COMPLETED", "conclusion": "FAILURE", "isRequired": true}]}}}}]}}},
-    {"minute": 75, "expect": [], "node": {"id": "PR_1", "number": 11808, "state": "OPEN", "merged": false, "isInMergeQueue": true, "mergeStateStatus": "CLEAN", "headRefOid": "a22c77af13000000000000000000000000000000", "baseRefName": "main", "baseRefOid": "1111111111111111111111111111111111111111", "baseRef": {"associatedPullRequests": {"nodes": []}}, "comments": {"nodes": [{"body": "LGTM\nverdict: APPROVE head:a22c77af13000000000000000000000000000000", "createdAt": "2026-11-09T13:05:00Z"}]}, "commits": {"nodes": [{"commit": {"statusCheckRollup": {"contexts": {"nodes": [{"name": "macos", "status": "COMPLETED", "conclusion": "SUCCESS", "isRequired": true}]}}}}]}}},
-    {"minute": 90, "expect": ["enqueued", "ejected", "dirty_after_base_move"], "node": {"id": "PR_1", "number": 11808, "state": "OPEN", "merged": false, "isInMergeQueue": false, "mergeStateStatus": "DIRTY", "headRefOid": "a22c77af13000000000000000000000000000000", "baseRefName": "main", "baseRefOid": "2222222222222222222222222222222222222222", "baseRef": {"associatedPullRequests": {"nodes": []}}, "comments": {"nodes": [{"body": "LGTM\nverdict: APPROVE head:a22c77af13000000000000000000000000000000", "createdAt": "2026-11-09T13:05:00Z"}]}, "commits": {"nodes": [{"commit": {"statusCheckRollup": {"contexts": {"nodes": [{"name": "macos", "status": "COMPLETED", "conclusion": "SUCCESS", "isRequired": true}]}}}}]}}},
-    {"minute": 95, "expect": ["merged"], "node": {"id": "PR_1", "number": 11808, "state": "MERGED", "merged": true, "isInMergeQueue": false, "mergeStateStatus": "UNKNOWN", "headRefOid": "c9f469f036000000000000000000000000000000", "baseRefName": "main", "baseRefOid": "2222222222222222222222222222222222222222", "baseRef": {"associatedPullRequests": {"nodes": []}}, "comments": {"nodes": []}, "commits": {"nodes": [{"commit": {"statusCheckRollup": {"contexts": {"nodes": []}}}}]}}},
-    {"minute": 130, "expect": [], "node": {"id": "PR_1", "number": 11808, "state": "MERGED", "merged": true, "isInMergeQueue": false, "mergeStateStatus": "UNKNOWN", "headRefOid": "c9f469f036000000000000000000000000000000", "baseRefName": "main", "baseRefOid": "2222222222222222222222222222222222222222", "baseRef": {"associatedPullRequests": {"nodes": []}}, "comments": {"nodes": []}, "commits": {"nodes": [{"commit": {"statusCheckRollup": {"contexts": {"nodes": []}}}}]}}}
-  ]
+ "_comment": "One pull request's day as the relay saw it (shape of Generous-Corp/pulp#11808 on 2026-11-09): opened, macos red, pushed, green, approved, queued, ejected on a conflict, repaired, merged. Each step is the GraphQL pullRequest node at a pass; expect is the event sequence delivered at that pass (rate limit 10 min).",
+ "pr": 11808,
+ "steps": [
+  {
+   "minute": 0,
+   "expect": [],
+   "node": {
+    "id": "PR_1",
+    "number": 11808,
+    "state": "OPEN",
+    "merged": false,
+    "isInMergeQueue": false,
+    "mergeStateStatus": "BLOCKED",
+    "headRefOid": "fd22be1fc7000000000000000000000000000000",
+    "baseRefName": "main",
+    "baseRefOid": "1111111111111111111111111111111111111111",
+    "baseRef": {
+     "associatedPullRequests": {
+      "nodes": []
+     }
+    },
+    "comments": {
+     "nodes": []
+    },
+    "commits": {
+     "nodes": [
+      {
+       "commit": {
+        "statusCheckRollup": {
+         "contexts": {
+          "nodes": [
+           {
+            "name": "macos",
+            "status": "IN_PROGRESS",
+            "conclusion": null,
+            "isRequired": true
+           }
+          ]
+         }
+        }
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "minute": 20,
+   "expect": [
+    "required_check"
+   ],
+   "node": {
+    "id": "PR_1",
+    "number": 11808,
+    "state": "OPEN",
+    "merged": false,
+    "isInMergeQueue": false,
+    "mergeStateStatus": "BLOCKED",
+    "headRefOid": "fd22be1fc7000000000000000000000000000000",
+    "baseRefName": "main",
+    "baseRefOid": "1111111111111111111111111111111111111111",
+    "baseRef": {
+     "associatedPullRequests": {
+      "nodes": []
+     }
+    },
+    "comments": {
+     "nodes": []
+    },
+    "commits": {
+     "nodes": [
+      {
+       "commit": {
+        "statusCheckRollup": {
+         "contexts": {
+          "nodes": [
+           {
+            "name": "macos",
+            "status": "COMPLETED",
+            "conclusion": "FAILURE",
+            "isRequired": true
+           }
+          ]
+         }
+        }
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "minute": 25,
+   "expect": [],
+   "node": {
+    "id": "PR_1",
+    "number": 11808,
+    "state": "OPEN",
+    "merged": false,
+    "isInMergeQueue": false,
+    "mergeStateStatus": "BLOCKED",
+    "headRefOid": "a22c77af13000000000000000000000000000000",
+    "baseRefName": "main",
+    "baseRefOid": "1111111111111111111111111111111111111111",
+    "baseRef": {
+     "associatedPullRequests": {
+      "nodes": []
+     }
+    },
+    "comments": {
+     "nodes": [
+      {
+       "body": "repaired: macos at a22c77af13",
+       "createdAt": "2026-11-09T12:24:00Z",
+       "authorAssociation": "MEMBER",
+       "author": {
+        "__typename": "User",
+        "login": "reviewer"
+       }
+      }
+     ]
+    },
+    "commits": {
+     "nodes": [
+      {
+       "commit": {
+        "statusCheckRollup": {
+         "contexts": {
+          "nodes": [
+           {
+            "name": "macos",
+            "status": "IN_PROGRESS",
+            "conclusion": null,
+            "isRequired": true
+           }
+          ]
+         }
+        }
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "minute": 70,
+   "expect": [
+    "verdict",
+    "required_check"
+   ],
+   "node": {
+    "id": "PR_1",
+    "number": 11808,
+    "state": "OPEN",
+    "merged": false,
+    "isInMergeQueue": false,
+    "mergeStateStatus": "CLEAN",
+    "headRefOid": "a22c77af13000000000000000000000000000000",
+    "baseRefName": "main",
+    "baseRefOid": "1111111111111111111111111111111111111111",
+    "baseRef": {
+     "associatedPullRequests": {
+      "nodes": []
+     }
+    },
+    "comments": {
+     "nodes": [
+      {
+       "body": "repaired: macos at a22c77af13",
+       "createdAt": "2026-11-09T12:24:00Z",
+       "authorAssociation": "MEMBER",
+       "author": {
+        "__typename": "User",
+        "login": "reviewer"
+       }
+      },
+      {
+       "body": "LGTM\n<!-- session: m3/rev -->\nverdict: APPROVE head:a22c77af13000000000000000000000000000000",
+       "createdAt": "2026-11-09T13:05:00Z",
+       "authorAssociation": "MEMBER",
+       "author": {
+        "__typename": "User",
+        "login": "reviewer"
+       }
+      }
+     ]
+    },
+    "commits": {
+     "nodes": [
+      {
+       "commit": {
+        "statusCheckRollup": {
+         "contexts": {
+          "nodes": [
+           {
+            "name": "macos",
+            "status": "COMPLETED",
+            "conclusion": "SUCCESS",
+            "isRequired": true
+           },
+           {
+            "name": "review-verdict",
+            "status": "COMPLETED",
+            "conclusion": "FAILURE",
+            "isRequired": true
+           }
+          ]
+         }
+        }
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "minute": 75,
+   "expect": [],
+   "node": {
+    "id": "PR_1",
+    "number": 11808,
+    "state": "OPEN",
+    "merged": false,
+    "isInMergeQueue": true,
+    "mergeStateStatus": "CLEAN",
+    "headRefOid": "a22c77af13000000000000000000000000000000",
+    "baseRefName": "main",
+    "baseRefOid": "1111111111111111111111111111111111111111",
+    "baseRef": {
+     "associatedPullRequests": {
+      "nodes": []
+     }
+    },
+    "comments": {
+     "nodes": [
+      {
+       "body": "LGTM\nverdict: APPROVE head:a22c77af13000000000000000000000000000000",
+       "createdAt": "2026-11-09T13:05:00Z",
+       "authorAssociation": "MEMBER",
+       "author": {
+        "__typename": "User",
+        "login": "reviewer"
+       }
+      }
+     ]
+    },
+    "commits": {
+     "nodes": [
+      {
+       "commit": {
+        "statusCheckRollup": {
+         "contexts": {
+          "nodes": [
+           {
+            "name": "macos",
+            "status": "COMPLETED",
+            "conclusion": "SUCCESS",
+            "isRequired": true
+           }
+          ]
+         }
+        }
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "minute": 90,
+   "expect": [
+    "enqueued",
+    "ejected",
+    "dirty_after_base_move"
+   ],
+   "node": {
+    "id": "PR_1",
+    "number": 11808,
+    "state": "OPEN",
+    "merged": false,
+    "isInMergeQueue": false,
+    "mergeStateStatus": "DIRTY",
+    "headRefOid": "a22c77af13000000000000000000000000000000",
+    "baseRefName": "main",
+    "baseRefOid": "2222222222222222222222222222222222222222",
+    "baseRef": {
+     "associatedPullRequests": {
+      "nodes": []
+     }
+    },
+    "comments": {
+     "nodes": [
+      {
+       "body": "LGTM\nverdict: APPROVE head:a22c77af13000000000000000000000000000000",
+       "createdAt": "2026-11-09T13:05:00Z",
+       "authorAssociation": "MEMBER",
+       "author": {
+        "__typename": "User",
+        "login": "reviewer"
+       }
+      }
+     ]
+    },
+    "commits": {
+     "nodes": [
+      {
+       "commit": {
+        "statusCheckRollup": {
+         "contexts": {
+          "nodes": [
+           {
+            "name": "macos",
+            "status": "COMPLETED",
+            "conclusion": "SUCCESS",
+            "isRequired": true
+           }
+          ]
+         }
+        }
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "minute": 95,
+   "expect": [
+    "merged"
+   ],
+   "node": {
+    "id": "PR_1",
+    "number": 11808,
+    "state": "MERGED",
+    "merged": true,
+    "isInMergeQueue": false,
+    "mergeStateStatus": "UNKNOWN",
+    "headRefOid": "c9f469f036000000000000000000000000000000",
+    "baseRefName": "main",
+    "baseRefOid": "2222222222222222222222222222222222222222",
+    "baseRef": {
+     "associatedPullRequests": {
+      "nodes": []
+     }
+    },
+    "comments": {
+     "nodes": []
+    },
+    "commits": {
+     "nodes": [
+      {
+       "commit": {
+        "statusCheckRollup": {
+         "contexts": {
+          "nodes": []
+         }
+        }
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "minute": 130,
+   "expect": [],
+   "node": {
+    "id": "PR_1",
+    "number": 11808,
+    "state": "MERGED",
+    "merged": true,
+    "isInMergeQueue": false,
+    "mergeStateStatus": "UNKNOWN",
+    "headRefOid": "c9f469f036000000000000000000000000000000",
+    "baseRefName": "main",
+    "baseRefOid": "2222222222222222222222222222222222222222",
+    "baseRef": {
+     "associatedPullRequests": {
+      "nodes": []
+     }
+    },
+    "comments": {
+     "nodes": []
+    },
+    "commits": {
+     "nodes": [
+      {
+       "commit": {
+        "statusCheckRollup": {
+         "contexts": {
+          "nodes": []
+         }
+        }
+       }
+      }
+     ]
+    }
+   }
+  }
+ ]
 }

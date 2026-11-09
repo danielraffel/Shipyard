@@ -537,6 +537,32 @@ pub(crate) fn find_pr_for_branch(
     }
 }
 
+/// Whether two records name the same session at the same address (time and
+/// source aside). Only values a marker can carry are compared.
+pub(crate) fn same_address(left: &OwnerRecord, right: &OwnerRecord) -> bool {
+    let carried = |value: &Option<String>| value.clone().filter(|v| safe_value(v));
+    left.host == right.host
+        && left.client == right.client
+        && carried(&left.surface) == carried(&right.surface)
+        && carried(&left.cmux_socket) == carried(&right.cmux_socket)
+        && carried(&left.session) == carried(&right.session)
+        && carried(&left.agent) == carried(&right.agent)
+        && left.released == right.released
+}
+
+/// Whether a push by `incoming` should replace `current` as the owner. A
+/// session without a cmux surface (a headless or scheduled run) never
+/// displaces a live owner that has one: the relay could reach the old owner
+/// and could not reach the new one.
+pub(crate) fn push_takes_over(current: Option<&OwnerRecord>, incoming: &OwnerRecord) -> bool {
+    match current {
+        Some(current) if !current.released && current.surface.is_some() => {
+            incoming.surface.is_some()
+        }
+        _ => true,
+    }
+}
+
 /// What a marker write did.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MarkerWrite {
@@ -552,6 +578,14 @@ pub(crate) fn write_marker(
     pr: &PrBody,
     record: &OwnerRecord,
 ) -> Result<MarkerWrite, String> {
+    // Every body edit fires `pull_request: edited` (and any required gate
+    // listening for it), so a marker naming the same session is left alone
+    // even though its time would differ.
+    if parse_marker(&record.repo, record.pr, &pr.body)
+        .is_some_and(|current| same_address(&current, record))
+    {
+        return Ok(MarkerWrite::Unchanged);
+    }
     let marker = render_marker(record);
     let Some(next) = upsert_marker(&pr.body, &marker) else {
         return Ok(MarkerWrite::Unchanged);

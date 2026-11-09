@@ -128,9 +128,13 @@ pub(crate) enum RelayEvent {
     Ejected {
         head: String,
         reason: String,
+        #[serde(default)]
+        seq: u64,
     },
     Enqueued {
         head: String,
+        #[serde(default)]
+        seq: u64,
     },
     Verdict {
         verdict: String,
@@ -140,6 +144,8 @@ pub(crate) enum RelayEvent {
         result: String,
         names: Vec<String>,
         head: String,
+        #[serde(default)]
+        seq: u64,
     },
     DirtyAfterBaseMove {
         head: String,
@@ -158,6 +164,17 @@ pub(crate) enum RelayEvent {
 }
 
 impl RelayEvent {
+    /// The per-PR sequence number of a repeatable event (one that can
+    /// recur at the same head: enqueued, ejected, required checks).
+    pub(crate) fn seq_mut(&mut self) -> Option<&mut u64> {
+        match self {
+            Self::Ejected { seq, .. }
+            | Self::Enqueued { seq, .. }
+            | Self::RequiredCheck { seq, .. } => Some(seq),
+            _ => None,
+        }
+    }
+
     /// The event's name, as `relay.events` lists it.
     pub(crate) fn name(&self) -> &'static str {
         match self {
@@ -181,16 +198,17 @@ impl RelayEvent {
     /// Idempotency key: the same fact about the same head is delivered once.
     pub(crate) fn key(&self, repo: &str, pr: u64) -> String {
         let detail = match self {
-            Self::Merged { head }
-            | Self::Closed { head }
-            | Self::Enqueued { head }
-            | Self::Ejected { head, .. } => head.clone(),
+            Self::Merged { head } | Self::Closed { head } => head.clone(),
+            Self::Enqueued { head, seq } | Self::Ejected { head, seq, .. } => {
+                format!("{head}:{seq}")
+            }
             Self::Verdict { verdict, head } => format!("{head}:{verdict}"),
             Self::RequiredCheck {
                 result,
                 names,
                 head,
-            } => format!("{head}:{result}:{}", names.join(",")),
+                seq,
+            } => format!("{head}:{result}:{}:{seq}", names.join(",")),
             Self::DirtyAfterBaseMove { head, base_oid, .. } => format!("{head}:{base_oid}"),
             Self::ClaimTaken { by, until, .. } => format!("{by}:{until}"),
             Self::StackedBaseMerged { base_pr, head } => {
@@ -209,10 +227,10 @@ impl RelayEvent {
         match self {
             Self::Merged { .. } => "merged".to_owned(),
             Self::Closed { .. } => "closed without merging".to_owned(),
-            Self::Ejected { head, reason } => {
+            Self::Ejected { head, reason, .. } => {
                 format!("ejected from the merge queue at {} ({reason})", short(head))
             }
-            Self::Enqueued { head } => format!("entered the merge queue at {}", short(head)),
+            Self::Enqueued { head, .. } => format!("entered the merge queue at {}", short(head)),
             Self::Verdict { verdict, head } => {
                 format!("review {verdict} at your head {}", short(head))
             }
@@ -220,6 +238,7 @@ impl RelayEvent {
                 result,
                 names,
                 head,
+                ..
             } => {
                 if result == "red" {
                     format!(
@@ -271,9 +290,13 @@ pub(crate) fn derive_events(old: Option<&PrDigest>, new: &PrDigest) -> Vec<Relay
         events.push(RelayEvent::Ejected {
             head: head.clone(),
             reason,
+            seq: 0,
         });
     } else if !old.in_queue && new.in_queue {
-        events.push(RelayEvent::Enqueued { head: head.clone() });
+        events.push(RelayEvent::Enqueued {
+            head: head.clone(),
+            seq: 0,
+        });
     }
     if let Some(verdict) = &new.verdict
         && (old.verdict.as_ref() != Some(verdict) || old.head != new.head)
@@ -290,6 +313,7 @@ pub(crate) fn derive_events(old: Option<&PrDigest>, new: &PrDigest) -> Vec<Relay
                 result: "red".to_owned(),
                 names: new.red.clone(),
                 head: head.clone(),
+                seq: 0,
             });
         }
         Checks::Success if old.checks != Checks::Success || head_moved => {
@@ -297,11 +321,13 @@ pub(crate) fn derive_events(old: Option<&PrDigest>, new: &PrDigest) -> Vec<Relay
                 result: "green".to_owned(),
                 names: Vec::new(),
                 head: head.clone(),
+                seq: 0,
             });
         }
         _ => {}
     }
-    if new.merge == "DIRTY" && old.merge != "DIRTY" && !head_moved {
+    let base_moved = old.base_oid.is_empty() || old.base_oid != new.base_oid;
+    if new.merge == "DIRTY" && old.merge != "DIRTY" && !head_moved && base_moved {
         events.push(RelayEvent::DirtyAfterBaseMove {
             head: head.clone(),
             base: new.base.clone(),
@@ -360,6 +386,21 @@ pub(crate) fn refuses_verdict_text(text: &str) -> bool {
     re.is_match(text)
 }
 
+/// A comment author whose verdict or claim the relay repeats: a repository
+/// owner, member or collaborator, or a GitHub App (the fleet's reviewers and
+/// lanes post through one). Outside contributors are not.
+pub(crate) fn trusted_author(comment: &Value) -> bool {
+    let association = comment
+        .get("authorAssociation")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    crate::head_approval::TRUSTED_ASSOCIATIONS.contains(&association)
+        || comment
+            .pointer("/author/__typename")
+            .and_then(Value::as_str)
+            == Some("Bot")
+}
+
 fn required_name(node: &Value) -> Option<String> {
     node.get("name")
         .or_else(|| node.get("context"))
@@ -382,6 +423,51 @@ fn check_result(node: &Value) -> &'static str {
         Some("SUCCESS" | "SKIPPED" | "NEUTRAL") => "ok",
         _ => "red",
     }
+}
+
+/// Verdict at `head`, newest trusted repair claim, and newest comment time
+/// not written by the relay.
+fn scan_comments(pr: &Value, head: &str) -> (Option<String>, Option<Claim>, Option<String>) {
+    let comments = pr
+        .pointer("/comments/nodes")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut verdict = None;
+    let mut claim = None;
+    let mut last_comment_at = None;
+    for comment in &comments {
+        let body = comment.get("body").and_then(Value::as_str).unwrap_or("");
+        if !body.trim_start().starts_with(MESSAGE_PREFIX)
+            && let Some(at) = comment.get("createdAt").and_then(Value::as_str)
+        {
+            last_comment_at = Some(at.to_owned());
+        }
+        // Anyone can comment. Only a trusted author's verdict or claim is
+        // relayed, so a forged "verdict: APPROVE" cannot stand the owner down
+        // and an outsider's text never reaches an agent's prompt.
+        if !trusted_author(comment) {
+            continue;
+        }
+        for found in verdict_regex().captures_iter(body) {
+            if &found[2] == head {
+                verdict = Some(found[1].to_ascii_uppercase());
+            }
+        }
+        // Comment text reaches an agent's prompt: keep only plain tokens.
+        if let Some(found) = claim_regex().captures_iter(body).last()
+            && crate::owner_registry::safe_value(&found[1])
+            && crate::owner_registry::safe_value(&found[2])
+            && found[1].len() <= 64
+            && found[2].len() <= 64
+        {
+            claim = Some(Claim {
+                by: found[1].to_owned(),
+                until: found[2].to_owned(),
+            });
+        }
+    }
+    (verdict, claim, last_comment_at)
 }
 
 /// Fold one `pullRequest` GraphQL node into a digest. `None` for a missing
@@ -411,39 +497,7 @@ pub(crate) fn summarize(
     };
     let text = |key: &str| pr.get(key).and_then(Value::as_str).unwrap_or("").to_owned();
     let head = text("headRefOid");
-    let comments = pr
-        .pointer("/comments/nodes")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let mut verdict = None;
-    let mut claim = None;
-    let mut last_comment_at = None;
-    for comment in &comments {
-        let body = comment.get("body").and_then(Value::as_str).unwrap_or("");
-        for found in verdict_regex().captures_iter(body) {
-            if found[2] == head {
-                verdict = Some(found[1].to_ascii_uppercase());
-            }
-        }
-        // Comment text reaches an agent's prompt: keep only plain tokens.
-        if let Some(found) = claim_regex().captures_iter(body).last()
-            && crate::owner_registry::safe_value(&found[1])
-            && crate::owner_registry::safe_value(&found[2])
-            && found[1].len() <= 64
-            && found[2].len() <= 64
-        {
-            claim = Some(Claim {
-                by: found[1].to_owned(),
-                until: found[2].to_owned(),
-            });
-        }
-        if !body.trim_start().starts_with(MESSAGE_PREFIX)
-            && let Some(at) = comment.get("createdAt").and_then(Value::as_str)
-        {
-            last_comment_at = Some(at.to_owned());
-        }
-    }
+    let (verdict, claim, last_comment_at) = scan_comments(pr, &head);
     let contexts = pr
         .pointer("/commits/nodes/0/commit/statusCheckRollup/contexts/nodes")
         .and_then(Value::as_array)
@@ -461,9 +515,18 @@ pub(crate) fn summarize(
         .collect();
     red.sort();
     red.dedup();
+    // More contexts than one page holds: an unread one may be a required
+    // check still running, so never call it green.
+    let truncated = pr
+        .pointer("/commits/nodes/0/commit/statusCheckRollup/contexts/totalCount")
+        .and_then(Value::as_u64)
+        .is_some_and(|total| total > contexts.len() as u64);
     let checks = if !red.is_empty() {
         Checks::Failure
-    } else if required.is_empty() || required.iter().any(|node| check_result(node) == "pending") {
+    } else if truncated
+        || required.is_empty()
+        || required.iter().any(|node| check_result(node) == "pending")
+    {
         Checks::Pending
     } else {
         Checks::Success
@@ -473,9 +536,15 @@ pub(crate) fn summarize(
     } else {
         text("state")
     };
-    let stacked_base_merged = pr
-        .pointer("/baseRef/associatedPullRequests/nodes/0/number")
-        .and_then(Value::as_u64);
+    // `associatedPullRequests` on the base ref lists pull requests whose
+    // HEAD is that ref; it only means "stacked base" when the base is not the
+    // default branch (a main-to-release sync PR has head main).
+    let stacked_base_merged = (!default_branch.is_empty() && text("baseRefName") != default_branch)
+        .then(|| {
+            pr.pointer("/baseRef/associatedPullRequests/nodes/0/number")
+                .and_then(Value::as_u64)
+        })
+        .flatten();
     PrDigest {
         state,
         merge: text("mergeStateStatus"),
@@ -576,8 +645,8 @@ pub(crate) fn pr_fields(number: u64) -> String {
         "pr{number}: pullRequest(number:{number}){{id number state merged isDraft isInMergeQueue \
          mergeStateStatus headRefOid baseRefName baseRefOid \
          baseRef{{associatedPullRequests(states:[MERGED],last:1){{nodes{{number}}}}}} \
-         comments(last:20){{nodes{{body createdAt}}}} \
-         commits(last:1){{nodes{{commit{{statusCheckRollup{{contexts(first:100){{nodes{{\
+         comments(last:30){{nodes{{body createdAt authorAssociation author{{__typename login}}}}}} \
+         commits(last:1){{nodes{{commit{{statusCheckRollup{{contexts(first:100){{totalCount nodes{{\
          ... on CheckRun{{name status conclusion isRequired(pullRequestNumber:{number})}} \
          ... on StatusContext{{context state isRequired(pullRequestNumber:{number})}}}}}}}}}}}}}}}}"
     )
