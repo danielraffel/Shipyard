@@ -670,7 +670,7 @@ run (exact same-repo run URL, the named workflow path, `pull_request_target`,
 `head_sha` equal to the PR head, `head_branch` equal to the PR's head branch),
 then requires the workflow's newest run on that head to have succeeded and the
 newest status to be `success` and name that run. A same-named check run is a
-spoof, and every PR sharing the head branch or commit must target `main`.
+spoof, and every PR headed by this commit must target `main`.
 Enforcement starts once the base branch's current tip has the workflow file
 (never the PR's `base.sha` snapshot); otherwise the PR that adds the workflow
 could never land. A refusal or an API error never admits

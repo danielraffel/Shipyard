@@ -58,8 +58,8 @@ and whose `head_branch` is the PR's head branch. The workflow's runs decide,
 not the statuses: its newest `pull_request_target` run on the head must have
 concluded `success` (a newer failed, queued or running run refuses), and the
 newest status must be `success` and name exactly that run, so an older success
-cannot be replayed. Every PR, open or closed, with that head branch or head
-commit must target `main`, since `pull_request_target` runs the base's
+cannot be replayed. Every PR, open or closed, headed by this commit (found by
+its head branch or by the commit) must target `main`, since `pull_request_target` runs the base's
 workflow. A `pull_request_target` run's `head_sha` is the PR head it ran for,
 so a run for an older push never admits a newer head. It is enforced once the
 base branch's current tip (`git/ref/heads/<base.ref>`, never the PR's
