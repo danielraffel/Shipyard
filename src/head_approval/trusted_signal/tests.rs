@@ -49,16 +49,31 @@ struct World {
 
 impl World {
     fn new(statuses: Vec<Value>, checks: Vec<Value>, runs: Vec<Value>) -> Self {
-        Self { statuses, checks, runs, fail: false, calls: RefCell::new(Vec::new()) }
+        Self {
+            statuses,
+            checks,
+            runs,
+            fail: false,
+            calls: RefCell::new(Vec::new()),
+        }
     }
 
     fn gh(&self, argv: &[String]) -> Result<String, String> {
-        let path = argv.iter().find(|arg| arg.starts_with("repos/")).cloned().unwrap_or_default();
+        let path = argv
+            .iter()
+            .find(|arg| arg.starts_with("repos/"))
+            .cloned()
+            .unwrap_or_default();
         self.calls.borrow_mut().push(path.clone());
         if self.fail {
             return Err("HTTP 502".to_owned());
         }
-        let lines = |rows: &[Value]| rows.iter().map(Value::to_string).collect::<Vec<_>>().join("\n");
+        let lines = |rows: &[Value]| {
+            rows.iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
         if path.contains("/statuses") {
             return Ok(lines(&self.statuses));
         }
@@ -89,14 +104,22 @@ fn refused(world: &World, needle: &str) {
 
 #[test]
 fn a_genuine_status_admits() {
-    let world = World::new(vec![status(1, "success", &run_url(7))], vec![], vec![genuine_run(7)]);
+    let world = World::new(
+        vec![status(1, "success", &run_url(7))],
+        vec![],
+        vec![genuine_run(7)],
+    );
     assert_eq!(world.judge().unwrap(), None);
 }
 
 #[test]
 fn a_genuine_check_run_admits() {
     let url = format!("{}/job/99", run_url(7));
-    let world = World::new(vec![], vec![check(5, "success", &url)], vec![genuine_run(7)]);
+    let world = World::new(
+        vec![],
+        vec![check(5, "success", &url)],
+        vec![genuine_run(7)],
+    );
     assert_eq!(world.judge().unwrap(), None);
 }
 
@@ -143,30 +166,59 @@ fn a_failed_run_is_refused_even_under_a_success_status() {
 #[test]
 fn a_failing_newest_status_is_refused() {
     let world = World::new(
-        vec![status(1, "success", &run_url(7)), status(2, "failure", &run_url(7))],
+        vec![
+            status(1, "success", &run_url(7)),
+            status(2, "failure", &run_url(7)),
+        ],
         vec![],
         vec![genuine_run(7)],
     );
-    refused(&world, "the newest `framework-trusted-verify` status is `failure`");
+    refused(
+        &world,
+        "the newest `framework-trusted-verify` status is `failure`",
+    );
 }
 
 #[test]
 fn a_failing_check_run_is_refused() {
-    let world = World::new(vec![], vec![check(5, "failure", &run_url(7))], vec![genuine_run(7)]);
+    let world = World::new(
+        vec![],
+        vec![check(5, "failure", &run_url(7))],
+        vec![genuine_run(7)],
+    );
     refused(&world, "check run is completed/failure");
 }
 
 #[test]
 fn an_unresolvable_or_foreign_url_is_refused() {
     for (url, needle) in [
-        ("https://evil.example/Generous-Corp/vellum/actions/runs/7", "not a github.com"),
-        ("https://github.com/someone/vellum/actions/runs/7", "names `someone/vellum`"),
-        ("https://github.com/Generous-Corp/vellum/pull/272", "not an Actions run URL"),
-        ("https://github.com/Generous-Corp/vellum/actions/runs/7?x=1", "not an exact"),
-        ("https://github.com/Generous-Corp/vellum/actions/runs/7/logs", "not an exact"),
+        (
+            "https://evil.example/Generous-Corp/vellum/actions/runs/7",
+            "not a github.com",
+        ),
+        (
+            "https://github.com/someone/vellum/actions/runs/7",
+            "names `someone/vellum`",
+        ),
+        (
+            "https://github.com/Generous-Corp/vellum/pull/272",
+            "not an Actions run URL",
+        ),
+        (
+            "https://github.com/Generous-Corp/vellum/actions/runs/7?x=1",
+            "not an exact",
+        ),
+        (
+            "https://github.com/Generous-Corp/vellum/actions/runs/7/logs",
+            "not an exact",
+        ),
         ("", "not a github.com"),
     ] {
-        let world = World::new(vec![status(1, "success", url)], vec![], vec![genuine_run(7)]);
+        let world = World::new(
+            vec![status(1, "success", url)],
+            vec![],
+            vec![genuine_run(7)],
+        );
         refused(&world, needle);
     }
 }
@@ -181,7 +233,8 @@ fn a_run_in_another_repository_is_refused() {
 
 #[test]
 fn a_missing_signal_is_refused() {
-    let other = json!({"id": 1, "state": "success", "context": "something-else", "target_url": run_url(7)});
+    let other =
+        json!({"id": 1, "state": "success", "context": "something-else", "target_url": run_url(7)});
     let world = World::new(vec![other], vec![], vec![genuine_run(7)]);
     refused(&world, "no `framework-trusted-verify` status or check run");
 }
@@ -193,7 +246,10 @@ fn a_spoof_beside_a_genuine_signal_is_refused() {
     // The spoof is the older status, so only the every-signal rule sees it;
     // the newest status is the genuine one.
     let world = World::new(
-        vec![status(1, "success", &run_url(8)), status(2, "success", &run_url(7))],
+        vec![
+            status(1, "success", &run_url(8)),
+            status(2, "success", &run_url(7)),
+        ],
         vec![],
         vec![genuine_run(7), spoof],
     );
@@ -210,21 +266,44 @@ fn a_same_named_check_from_another_app_does_not_count() {
 
 #[test]
 fn an_unreadable_signal_is_an_error_not_an_admission() {
-    let mut world = World::new(vec![status(1, "success", &run_url(7))], vec![], vec![genuine_run(7)]);
+    let mut world = World::new(
+        vec![status(1, "success", &run_url(7))],
+        vec![],
+        vec![genuine_run(7)],
+    );
     world.fail = true;
     assert!(world.judge().is_err());
-    let world = World::new(vec![status(1, "success", &run_url(9))], vec![], vec![genuine_run(7)]);
-    assert!(world.judge().is_err(), "a run that cannot be fetched is unreadable");
+    let world = World::new(
+        vec![status(1, "success", &run_url(9))],
+        vec![],
+        vec![genuine_run(7)],
+    );
+    assert!(
+        world.judge().is_err(),
+        "a run that cannot be fetched is unreadable"
+    );
 }
 
 #[test]
 fn urls_parse_strictly() {
     assert_eq!(run_id_from_url(&run_url(42), REPO), Ok(42));
-    assert_eq!(run_id_from_url(&format!("{}/attempts/2", run_url(42)), REPO), Ok(42));
-    assert_eq!(run_id_from_url(&format!("{}/job/9", run_url(42)), REPO), Ok(42));
-    assert_eq!(run_id_from_url(&format!("{}/attempts/2/job/9", run_url(42)), REPO), Ok(42));
     assert_eq!(
-        run_id_from_url("https://github.com/generous-corp/VELLUM/actions/runs/42", REPO),
+        run_id_from_url(&format!("{}/attempts/2", run_url(42)), REPO),
+        Ok(42)
+    );
+    assert_eq!(
+        run_id_from_url(&format!("{}/job/9", run_url(42)), REPO),
+        Ok(42)
+    );
+    assert_eq!(
+        run_id_from_url(&format!("{}/attempts/2/job/9", run_url(42)), REPO),
+        Ok(42)
+    );
+    assert_eq!(
+        run_id_from_url(
+            "https://github.com/generous-corp/VELLUM/actions/runs/42",
+            REPO
+        ),
         Ok(42)
     );
     for url in [
@@ -244,10 +323,21 @@ fn urls_parse_strictly() {
 fn vellum_requires_it_and_other_repositories_do_not() {
     assert_eq!(required(REPO, &[]), vec![signal()]);
     assert_eq!(required("generous-corp/VELLUM", &[]), vec![signal()]);
-    for repo in ["Generous-Corp/pulp", "danielraffel/Shipyard", "danielraffel/tartci"] {
+    for repo in [
+        "Generous-Corp/pulp",
+        "danielraffel/Shipyard",
+        "danielraffel/tartci",
+    ] {
         assert!(required(repo, &[]).is_empty(), "{repo}");
         let world = World::new(vec![], vec![], vec![]);
-        let gate = apply(&|argv| world.gh(argv), repo, HEAD, &[], HeadGate::NotRequired).unwrap();
+        let gate = apply(
+            &|argv| world.gh(argv),
+            repo,
+            HEAD,
+            &[],
+            HeadGate::NotRequired,
+        )
+        .unwrap();
         assert_eq!(gate, HeadGate::NotRequired);
         assert!(world.calls.borrow().is_empty(), "{repo} must cost no reads");
     }
@@ -260,27 +350,52 @@ fn a_config_adds_signals_and_a_bad_entry_refuses_everything() {
     )
     .unwrap();
     let signals = signals_from_section(table.get("auto_merge").and_then(toml::Value::as_table));
-    assert_eq!(signals, vec![TrustedSignal { name: "x".into(), workflow: ".github/workflows/x.yml".into() }]);
+    assert_eq!(
+        signals,
+        vec![TrustedSignal {
+            name: "x".into(),
+            workflow: ".github/workflows/x.yml".into()
+        }]
+    );
     assert_eq!(required("danielraffel/tartci", &signals), signals);
     assert_eq!(required(REPO, &signals).len(), 2);
     let policy = ApprovalPolicy::from_table(&table);
     assert_eq!(policy.trusted_signals, signals);
 
-    let bad: toml::Table = toml::from_str("[auto_merge]\ntrusted_signals = [{ name = \"x\" }]\n").unwrap();
+    let bad: toml::Table =
+        toml::from_str("[auto_merge]\ntrusted_signals = [{ name = \"x\" }]\n").unwrap();
     let signals = signals_from_section(bad.get("auto_merge").and_then(toml::Value::as_table));
     assert_eq!(signals.len(), 1);
     let world = World::new(vec![], vec![], vec![]);
-    let detail = judge(&|argv| world.gh(argv), "danielraffel/tartci", HEAD, &signals[0]).unwrap();
+    let detail = judge(
+        &|argv| world.gh(argv),
+        "danielraffel/tartci",
+        HEAD,
+        &signals[0],
+    )
+    .unwrap();
     assert!(detail.is_some_and(|detail| detail.contains("cannot be verified")));
 }
 
 #[test]
 fn a_refused_head_stays_refused_and_an_admitted_one_is_judged() {
     let world = World::new(vec![], vec![], vec![]);
-    let held = HeadGate::NotApproved { head: HEAD.to_owned() };
-    assert_eq!(apply(&|argv| world.gh(argv), REPO, HEAD, &[], held.clone()).unwrap(), held);
+    let held = HeadGate::NotApproved {
+        head: HEAD.to_owned(),
+    };
+    assert_eq!(
+        apply(&|argv| world.gh(argv), REPO, HEAD, &[], held.clone()).unwrap(),
+        held
+    );
     assert!(world.calls.borrow().is_empty());
-    let gate = apply(&|argv| world.gh(argv), REPO, HEAD, &[], HeadGate::NotRequired).unwrap();
+    let gate = apply(
+        &|argv| world.gh(argv),
+        REPO,
+        HEAD,
+        &[],
+        HeadGate::NotRequired,
+    )
+    .unwrap();
     assert!(matches!(gate, HeadGate::UntrustedSignal { .. }), "{gate:?}");
     assert!(!gate.allows());
 }
@@ -291,13 +406,40 @@ fn the_steward_gate_requires_it_for_vellum() {
     // admits a Vellum head only with the genuine signal.
     let policy = ApprovalPolicy::default();
     let missing = World::new(vec![], vec![], vec![]);
-    let gate = evaluate_with_policy(&|argv| missing.gh(argv), REPO, 272, HEAD, &policy, &Value::Null).unwrap();
+    let gate = evaluate_with_policy(
+        &|argv| missing.gh(argv),
+        REPO,
+        272,
+        HEAD,
+        &policy,
+        &Value::Null,
+    )
+    .unwrap();
     assert!(matches!(gate, HeadGate::UntrustedSignal { .. }), "{gate:?}");
-    let genuine = World::new(vec![status(1, "success", &run_url(7))], vec![], vec![genuine_run(7)]);
-    let gate = evaluate_with_policy(&|argv| genuine.gh(argv), REPO, 272, HEAD, &policy, &Value::Null).unwrap();
+    let genuine = World::new(
+        vec![status(1, "success", &run_url(7))],
+        vec![],
+        vec![genuine_run(7)],
+    );
+    let gate = evaluate_with_policy(
+        &|argv| genuine.gh(argv),
+        REPO,
+        272,
+        HEAD,
+        &policy,
+        &Value::Null,
+    )
+    .unwrap();
     assert_eq!(gate, HeadGate::NotRequired);
     let pulp = World::new(vec![], vec![], vec![]);
-    let gate =
-        evaluate_with_policy(&|argv| pulp.gh(argv), "Generous-Corp/pulp", 1, HEAD, &policy, &Value::Null).unwrap();
+    let gate = evaluate_with_policy(
+        &|argv| pulp.gh(argv),
+        "Generous-Corp/pulp",
+        1,
+        HEAD,
+        &policy,
+        &Value::Null,
+    )
+    .unwrap();
     assert_eq!(gate, HeadGate::NotRequired);
 }

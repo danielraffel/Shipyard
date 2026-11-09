@@ -102,7 +102,7 @@ pub fn signals_from_section(section: Option<&toml::Table>) -> Vec<TrustedSignal>
         return Vec::new();
     };
     let Some(entries) = value.as_array() else {
-        return vec![unusable(format!("`{TRUSTED_SIGNALS_KEY}` is not an array"))];
+        return vec![unusable(&format!("`{TRUSTED_SIGNALS_KEY}` is not an array"))];
     };
     entries
         .iter()
@@ -119,7 +119,7 @@ pub fn signals_from_section(section: Option<&toml::Table>) -> Vec<TrustedSignal>
                     name: name.to_owned(),
                     workflow: workflow.to_owned(),
                 },
-                _ => unusable(format!(
+                _ => unusable(&format!(
                     "a `{TRUSTED_SIGNALS_KEY}` entry needs non-empty `name` and `workflow`"
                 )),
             }
@@ -128,7 +128,7 @@ pub fn signals_from_section(section: Option<&toml::Table>) -> Vec<TrustedSignal>
 }
 
 /// A requirement nothing satisfies, named after what made it unusable.
-fn unusable(detail: String) -> TrustedSignal {
+fn unusable(detail: &str) -> TrustedSignal {
     TrustedSignal {
         name: format!("unusable trusted_signals config ({detail})"),
         workflow: String::new(),
@@ -227,7 +227,11 @@ pub fn judge(
     for (kind, record, url_key) in statuses
         .iter()
         .map(|status| ("status", status, "target_url"))
-        .chain(checks.iter().map(|check| ("check run", check, "details_url")))
+        .chain(
+            checks
+                .iter()
+                .map(|check| ("check run", check, "details_url")),
+        )
     {
         let id = record.get("id").and_then(Value::as_u64).unwrap_or(0);
         let url = record.get(url_key).and_then(Value::as_str).unwrap_or("");
@@ -235,45 +239,81 @@ pub fn judge(
             Ok(run_id) => run_id,
             Err(why) => return Ok(Some(format!("`{name}` {kind} {id}: {why}"))),
         };
-        if !runs.contains_key(&run_id) {
-            runs.insert(run_id, read_run(run_gh, repo, run_id)?);
+        if let std::collections::btree_map::Entry::Vacant(entry) = runs.entry(run_id) {
+            entry.insert(read_run(run_gh, repo, run_id)?);
         }
         if let Some(why) = untrusted_run(&runs[&run_id], repo, head, signal) {
-            return Ok(Some(format!("`{name}` {kind} {id} names run {run_id}, which {why}")));
+            return Ok(Some(format!(
+                "`{name}` {kind} {id} names run {run_id}, which {why}"
+            )));
         }
     }
-    if let Some(status) = newest(&statuses) {
-        let state = status.get("state").and_then(Value::as_str).unwrap_or("none");
+    Ok(newest_unsuccessful(name, repo, &statuses, &checks, &runs))
+}
+
+/// Why the newest status or check run of `name` has not succeeded, or `None`
+/// when each newest one succeeded and so did its run (all already judged
+/// trusted and fetched into `runs`).
+fn newest_unsuccessful(
+    name: &str,
+    repo: &str,
+    statuses: &[Value],
+    checks: &[Value],
+    runs: &BTreeMap<u64, Value>,
+) -> Option<String> {
+    if let Some(status) = newest(statuses) {
+        let state = status
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("none");
         if state != "success" {
-            return Ok(Some(format!("the newest `{name}` status is `{state}`")));
+            return Some(format!("the newest `{name}` status is `{state}`"));
         }
-        let run_id = run_id_from_url(
-            status.get("target_url").and_then(Value::as_str).unwrap_or(""),
+        let Ok(run_id) = run_id_from_url(
+            status
+                .get("target_url")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
             repo,
-        )?;
-        if let Some(why) = unsuccessful(&runs[&run_id]) {
-            return Ok(Some(format!("the newest `{name}` status names run {run_id}, which {why}")));
+        ) else {
+            return Some(format!("the newest `{name}` signal names no run"));
+        };
+        if let Some(why) = runs.get(&run_id).and_then(unsuccessful) {
+            return Some(format!(
+                "the newest `{name}` status names run {run_id}, which {why}"
+            ));
         }
     }
-    if let Some(check) = newest(&checks) {
-        let status = check.get("status").and_then(Value::as_str).unwrap_or("none");
-        let conclusion = check.get("conclusion").and_then(Value::as_str).unwrap_or("none");
+    if let Some(check) = newest(checks) {
+        let status = check
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("none");
+        let conclusion = check
+            .get("conclusion")
+            .and_then(Value::as_str)
+            .unwrap_or("none");
         if status != "completed" || conclusion != "success" {
-            return Ok(Some(format!(
+            return Some(format!(
                 "the newest `{name}` check run is {status}/{conclusion}"
-            )));
+            ));
         }
-        let run_id = run_id_from_url(
-            check.get("details_url").and_then(Value::as_str).unwrap_or(""),
+        let Ok(run_id) = run_id_from_url(
+            check
+                .get("details_url")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
             repo,
-        )?;
-        if let Some(why) = unsuccessful(&runs[&run_id]) {
-            return Ok(Some(format!(
+        ) else {
+            return Some(format!("the newest `{name}` signal names no run"));
+        };
+        if let Some(why) = runs.get(&run_id).and_then(unsuccessful) {
+            return Some(format!(
                 "the newest `{name}` check run names run {run_id}, which {why}"
-            )));
+            ));
         }
     }
-    Ok(None)
+    None
 }
 
 /// The record with the highest id.
@@ -290,11 +330,7 @@ fn untrusted_run(run: &Value, repo: &str, head: &str, signal: &TrustedSignal) ->
         return Some(format!("belongs to `{}`", field("repository")));
     }
     if field("path") != signal.workflow {
-        return Some(format!(
-            "is `{}`, not `{}`",
-            field("path"),
-            signal.workflow
-        ));
+        return Some(format!("is `{}`, not `{}`", field("path"), signal.workflow));
     }
     if !TRUSTED_EVENTS.contains(&field("event")) {
         return Some(format!(
@@ -303,7 +339,11 @@ fn untrusted_run(run: &Value, repo: &str, head: &str, signal: &TrustedSignal) ->
         ));
     }
     if !field("head_sha").eq_ignore_ascii_case(head) {
-        return Some(format!("ran for {}, not {}", short(field("head_sha")), short(head)));
+        return Some(format!(
+            "ran for {}, not {}",
+            short(field("head_sha")),
+            short(head)
+        ));
     }
     None
 }
@@ -311,9 +351,11 @@ fn untrusted_run(run: &Value, repo: &str, head: &str, signal: &TrustedSignal) ->
 /// Why `run` has not succeeded, or `None` when it has.
 fn unsuccessful(run: &Value) -> Option<String> {
     let status = run.get("status").and_then(Value::as_str).unwrap_or("none");
-    let conclusion = run.get("conclusion").and_then(Value::as_str).unwrap_or("none");
-    (status != "completed" || conclusion != "success")
-        .then(|| format!("is {status}/{conclusion}"))
+    let conclusion = run
+        .get("conclusion")
+        .and_then(Value::as_str)
+        .unwrap_or("none");
+    (status != "completed" || conclusion != "success").then(|| format!("is {status}/{conclusion}"))
 }
 
 /// The workflow run id an exact Actions run URL of `repo` names.
@@ -330,9 +372,11 @@ pub fn run_id_from_url(url: &str, repo: &str) -> Result<u64, String> {
     }
     let parts: Vec<&str> = rest.split('/').collect();
     let number = |text: &str| -> Option<u64> {
-        (!text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()) && !text.starts_with('0'))
-            .then(|| text.parse::<u64>().ok())
-            .flatten()
+        (!text.is_empty()
+            && text.bytes().all(|byte| byte.is_ascii_digit())
+            && !text.starts_with('0'))
+        .then(|| text.parse::<u64>().ok())
+        .flatten()
     };
     let (owner_repo, tail) = match parts.as_slice() {
         [owner, name, "actions", "runs", id, tail @ ..] => (format!("{owner}/{name}"), (id, tail)),
@@ -345,7 +389,7 @@ pub fn run_id_from_url(url: &str, repo: &str) -> Result<u64, String> {
     let run_id = number(id).ok_or_else(|| format!("`{url}` has no run id"))?;
     let tail_ok = match tail {
         [] => true,
-        ["attempts", attempt] | ["job", attempt] => number(attempt).is_some(),
+        ["attempts" | "job", attempt] => number(attempt).is_some(),
         ["attempts", attempt, "job", job] => number(attempt).is_some() && number(job).is_some(),
         _ => false,
     };
@@ -378,7 +422,9 @@ fn read_lines(run_gh: RunGh<'_>, path: &str, jq: &str) -> Result<Vec<Value>, Str
     ])?;
     raw.lines()
         .filter(|line| !line.trim().is_empty())
-        .map(|line| serde_json::from_str(line).map_err(|error| format!("malformed {path} record: {error}")))
+        .map(|line| {
+            serde_json::from_str(line).map_err(|error| format!("malformed {path} record: {error}"))
+        })
         .collect()
 }
 
