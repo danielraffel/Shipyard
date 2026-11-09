@@ -331,7 +331,8 @@ read it claims no admission path rather than guessing one.
 non-default base requires `--stacked-on <n>`, naming an open parent whose head
 branch is that base; the retired `--stacked` flag is insufficient. Configured
 integration bases may proceed unstacked. The command labels an accepted stack
-as `stacked:<n>` so the steward can verify its parent before admission.
+as `stacked:<n>` so fleet-pass can verify its parent when deciding whether to
+list it for retargeting.
 
 ## Arming auto-merge is outside the state machine
 

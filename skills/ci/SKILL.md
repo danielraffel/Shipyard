@@ -4398,11 +4398,11 @@ spent on a state that was never going to change.
   `--stacked-on <n>` the pull request is labelled `stacked:<n>` and its body
   says it cannot be reviewed yet. Integration bases (`[ship]
   integration_bases`, default `develop/*` and `release/*`) pass unstacked. The
-  steward's carried-commit guard skips a stack only while its base is not the
-  steward's base, `<n>` is the open same-repo PR whose head is that base, and no
-  counting HOLD names the stack's head (a hand-added label naming another PR
-  excuses nothing; mismatches surface as `STACK-LABEL-MISMATCH`, a 404 parent
-  as `STACK-PARENT-UNREADABLE`). The repair and operator passes
+  `stacked:<n>` label is a repair-lane marker only; the steward's carried-commit
+  guard judges a labelled stack like any other open PR. The repair and operator
+  passes verify the named parent and its head only when deciding whether to
+  retarget, reporting mismatches as `STACK-LABEL-MISMATCH` and an unreadable
+  parent as `STACK-PARENT-UNREADABLE`. The repair and operator passes
   list it as `STACK-BASE-MERGED parent:#<n>` the moment `<n>` merges (no stall
   wait) to retarget onto main, merge main, push once and comment
   `retargeted: ...`. A parent closed unmerged is `STACK-PARENT-CLOSED`: never

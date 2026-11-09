@@ -36,11 +36,11 @@ See `docs/automated-draining.md`.
 
 `shipyard pr` requires `--stacked-on <n>` for a non-default base, and the
 parent must be an open pull request in the same repository whose head is the
-requested base branch. The `stacked:<n>` label is trusted only after that same
-parent and head are verified; a forged, stale, closed, or unreadable parent
-does not excuse the stack from carried-commit review. A counting HOLD also
-keeps the stack blocked, and fleet-pass reports the mismatch instead of
-retargeting it automatically.
+requested base branch. The `stacked:<n>` label is a repair-lane marker only:
+the steward's carried-commit guard judges a labelled stack like any other open
+PR. Fleet-pass verifies the named parent and head only when deciding whether to
+retarget; a forged, stale, closed, or unreadable parent is reported and never
+retargeted automatically.
 
 ## Durable work-item contract
 
