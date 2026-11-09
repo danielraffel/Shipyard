@@ -50,14 +50,18 @@ are also verified by their run before the steward admits a head
 (`src/head_approval/trusted_signal.rs`). Vellum's `framework-trusted-verify` is
 required that way by default (`TRUSTED_SIGNAL_REPOS`); a base adds more with
 `[auto_merge] trusted_signals = [{ name, workflow }]`, and can never remove the
-default. Every status and Actions check run of that name on the head must name
-a run of that workflow file, in that repository, on `pull_request_target` or
-`merge_group`, whose `head_sha` is the head; the newest status and check run
-must be `success` and their run must have concluded `success`. A
+default. The signal is a commit status: every status of that name on the head
+must name, by the exact URL `https://github.com/<repo>/actions/runs/<id>`, a run
+of that workflow file, in that repository, on `pull_request_target` or
+`merge_group`, whose `head_sha` is the head; the newest status must be
+`success` (pending never admits) and its run must have concluded `success`. A
+check run of that name, from any App, is a spoof and refuses. A
 `pull_request_target` run's `head_sha` is the pull request head it ran for (not
-the base), so a run for an older push never admits a newer head. Anything else
-is `HeadGate::UntrustedSignal`; a read that fails is an error, never an
-admission.
+the base), so a run for an older push never admits a newer head. It is only
+enforced once the pull request's `base.sha` has the workflow file (git trees
+read), because `pull_request_target` runs the base's definition; a pull request
+deleting the file is still enforced. Anything else is
+`HeadGate::UntrustedSignal`; a read that fails is an error, never an admission.
 
 `metrics repeated-work-cost` is read-only accounting for shadow observations
 within its explicit `--since` baseline window. Its `duration_ms` is measured

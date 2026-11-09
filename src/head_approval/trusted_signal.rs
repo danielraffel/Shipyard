@@ -4,7 +4,7 @@
 //!
 //! A repository ruleset can require a status context or a check run name, and
 //! bind it to an App, but for GitHub Actions the App is the one every workflow
-//! shares (`github-actions`, [`SHARED_ACTIONS_APP_ID`]). Any workflow with
+//! shares (`github-actions`, App 15368). Any workflow with
 //! `statuses: write`, or any job of the same name, satisfies such a rule,
 //! including one a same-repository pull request adds under `pull_request`.
 //! Vellum's `framework-trusted-verify` is such a signal: it is only worth
@@ -18,24 +18,36 @@
 //!
 //! ## What counts
 //!
-//! A signal named `name` on the head is every commit status whose context is
-//! `name`, and every check run of that name from the Actions App. Each one must
-//! name a workflow run of the same repository, by an exact URL:
-//! `https://github.com/<owner>/<repo>/actions/runs/<id>`, optionally followed
-//! by `/attempts/<n>` and `/job/<id>` (a status's `target_url`, a check run's
-//! `details_url`). That run must have:
+//! The signal is a commit status: Vellum's workflow posts the context `name`
+//! to the head it ran for (pending at start, then success or failure) from a
+//! job of a different name, and lints that no job carries `name`. So a check
+//! run named `name`, from any App, is a spoof and refuses the head.
+//!
+//! Every commit status whose context is `name` must name a workflow run of
+//! the same repository by its exact URL,
+//! `https://github.com/<owner>/<repo>/actions/runs/<id>` and nothing else,
+//! and that run must have:
 //!
 //! * `path` equal to the signal's workflow file;
 //! * `event` `pull_request_target` or `merge_group`;
 //! * `head_sha` equal to the head being admitted;
 //! * `repository.full_name` equal to the repository.
 //!
-//! Every status and check run of that name must pass this, not only the
-//! newest: a same-named signal from any other workflow or event is a spoof
-//! attempt, and the head is refused even beside a genuine one. Then the newest
-//! status (by id) must be `success` and its run must have concluded `success`,
-//! and likewise the newest Actions check run (completed, `success`). No signal
-//! of that name refuses.
+//! Every status of that name must pass this, not only the newest: a
+//! same-named status from any other workflow or event is a spoof attempt, and
+//! the head is refused even beside a genuine one. Then the newest status (by
+//! id) must be `success`, so a pending one never admits, and its run must
+//! have concluded `success`. No status of that name refuses.
+//!
+//! ## When it is enforced
+//!
+//! `pull_request_target` runs the workflow as the base defines it, so until
+//! the base has the workflow file no run can post the signal, and enforcing
+//! it would hold every pull request, including the one that adds the file.
+//! A signal is therefore enforced for a pull request exactly when the
+//! workflow file is a blob at the pull request's `base.sha`, read through the
+//! git trees API. A pull request that deletes or edits the file is still
+//! enforced, because its base has it. A failed read is an error.
 //!
 //! Which sha a `pull_request_target` run reports was measured on
 //! Generous-Corp/vellum's own `pull_request_target` workflow
@@ -68,7 +80,6 @@ use serde::Serialize;
 use serde_json::Value;
 
 use super::{HeadGate, RunGh};
-use crate::reviewer_receipt::SHARED_ACTIONS_APP_ID;
 
 /// `[auto_merge]` key listing extra trusted signals.
 pub const TRUSTED_SIGNALS_KEY: &str = "trusted_signals";
@@ -84,10 +95,10 @@ pub const TRUSTED_SIGNAL_REPOS: &[(&str, &str, &str)] = &[(
 /// Events whose runs may carry a trusted signal.
 const TRUSTED_EVENTS: &[&str] = &["pull_request_target", "merge_group"];
 
-/// A status context (or check run name) that only one workflow may satisfy.
+/// A status context that only one workflow may satisfy.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct TrustedSignal {
-    /// The status context and check run name.
+    /// The status context.
     pub name: String,
     /// The only workflow file whose run may post it.
     pub workflow: String,
@@ -159,11 +170,13 @@ pub fn required(repo: &str, configured: &[TrustedSignal]) -> Vec<TrustedSignal> 
 ///
 /// # Errors
 ///
-/// When a status, check run or workflow run cannot be read. Callers must not
+/// When the pull request, its base tree, a status, a check run or a workflow
+/// run cannot be read. Callers must not
 /// admit on an error.
 pub(super) fn apply(
     run_gh: RunGh<'_>,
     repo: &str,
+    pr: u64,
     head: &str,
     configured: &[TrustedSignal],
     gate: HeadGate,
@@ -171,7 +184,15 @@ pub(super) fn apply(
     if !gate.allows() {
         return Ok(gate);
     }
-    for signal in required(repo, configured) {
+    let signals = required(repo, configured);
+    if signals.is_empty() {
+        return Ok(gate);
+    }
+    let base = base_sha(run_gh, repo, pr)?;
+    for signal in signals {
+        if !signal.workflow.is_empty() && !blob_at(run_gh, repo, &base, &signal.workflow)? {
+            continue;
+        }
         if let Some(detail) = judge(run_gh, repo, head, &signal)? {
             return Ok(HeadGate::UntrustedSignal {
                 head: head.to_owned(),
@@ -205,117 +226,141 @@ pub fn judge(
     .into_iter()
     .filter(|status| status.get("context").and_then(Value::as_str) == Some(name.as_str()))
     .collect();
-    let checks: Vec<Value> = read_lines(
+    let spoofs: Vec<Value> = read_lines(
         run_gh,
         &format!(
             "repos/{repo}/commits/{head}/check-runs?check_name={}&filter=all&per_page=100",
             crate::required_check_policy::encode_path_segment(name)
         ),
-        ".check_runs[] | {id, name, status, conclusion, details_url, app_id: .app.id}",
+        ".check_runs[] | {id, name, app_id: .app.id}",
     )?
     .into_iter()
-    .filter(|run| {
-        run.get("name").and_then(Value::as_str) == Some(name.as_str())
-            && run.get("app_id").and_then(Value::as_u64) == Some(SHARED_ACTIONS_APP_ID)
-    })
+    .filter(|run| run.get("name").and_then(Value::as_str) == Some(name.as_str()))
     .collect();
-    if statuses.is_empty() && checks.is_empty() {
+    if let Some(spoof) = spoofs.first() {
         return Ok(Some(format!(
-            "no `{name}` status or check run on head {}",
+            "check run {} named `{name}` (App {}) is on head {}; the signal is a \
+             commit status, so a same-named check run is a spoof",
+            spoof.get("id").and_then(Value::as_u64).unwrap_or(0),
+            spoof.get("app_id").and_then(Value::as_u64).unwrap_or(0),
+            short(head)
+        )));
+    }
+    if statuses.is_empty() {
+        return Ok(Some(format!(
+            "no `{name}` status on head {}",
             short(head)
         )));
     }
     let mut runs: BTreeMap<u64, Value> = BTreeMap::new();
-    for (kind, record, url_key) in statuses
-        .iter()
-        .map(|status| ("status", status, "target_url"))
-        .chain(
-            checks
-                .iter()
-                .map(|check| ("check run", check, "details_url")),
-        )
-    {
-        let id = record.get("id").and_then(Value::as_u64).unwrap_or(0);
-        let url = record.get(url_key).and_then(Value::as_str).unwrap_or("");
+    for status in &statuses {
+        let id = status.get("id").and_then(Value::as_u64).unwrap_or(0);
+        let url = status.get("target_url").and_then(Value::as_str).unwrap_or("");
         let run_id = match run_id_from_url(url, repo) {
             Ok(run_id) => run_id,
-            Err(why) => return Ok(Some(format!("`{name}` {kind} {id}: {why}"))),
+            Err(why) => return Ok(Some(format!("`{name}` status {id}: {why}"))),
         };
         if let std::collections::btree_map::Entry::Vacant(entry) = runs.entry(run_id) {
             entry.insert(read_run(run_gh, repo, run_id)?);
         }
         if let Some(why) = untrusted_run(&runs[&run_id], repo, head, signal) {
             return Ok(Some(format!(
-                "`{name}` {kind} {id} names run {run_id}, which {why}"
+                "`{name}` status {id} names run {run_id}, which {why}"
             )));
         }
     }
-    Ok(newest_unsuccessful(name, repo, &statuses, &checks, &runs))
+    Ok(newest_unsuccessful(name, repo, &statuses, &runs))
 }
 
-/// Why the newest status or check run of `name` has not succeeded, or `None`
-/// when each newest one succeeded and so did its run (all already judged
-/// trusted and fetched into `runs`).
+/// Why the newest `name` status has not succeeded, or `None` when it and its
+/// run have (every status already judged trusted, its run fetched into `runs`).
 fn newest_unsuccessful(
     name: &str,
     repo: &str,
     statuses: &[Value],
-    checks: &[Value],
     runs: &BTreeMap<u64, Value>,
 ) -> Option<String> {
-    if let Some(status) = newest(statuses) {
-        let state = status
-            .get("state")
-            .and_then(Value::as_str)
-            .unwrap_or("none");
-        if state != "success" {
-            return Some(format!("the newest `{name}` status is `{state}`"));
-        }
-        let Ok(run_id) = run_id_from_url(
-            status
-                .get("target_url")
-                .and_then(Value::as_str)
-                .unwrap_or(""),
-            repo,
-        ) else {
-            return Some(format!("the newest `{name}` signal names no run"));
-        };
-        if let Some(why) = runs.get(&run_id).and_then(unsuccessful) {
-            return Some(format!(
-                "the newest `{name}` status names run {run_id}, which {why}"
-            ));
-        }
+    let status = newest(statuses)?;
+    let state = status
+        .get("state")
+        .and_then(Value::as_str)
+        .unwrap_or("none");
+    if state != "success" {
+        return Some(format!("the newest `{name}` status is `{state}`"));
     }
-    if let Some(check) = newest(checks) {
-        let status = check
-            .get("status")
-            .and_then(Value::as_str)
-            .unwrap_or("none");
-        let conclusion = check
-            .get("conclusion")
-            .and_then(Value::as_str)
-            .unwrap_or("none");
-        if status != "completed" || conclusion != "success" {
-            return Some(format!(
-                "the newest `{name}` check run is {status}/{conclusion}"
-            ));
-        }
-        let Ok(run_id) = run_id_from_url(
-            check
-                .get("details_url")
-                .and_then(Value::as_str)
-                .unwrap_or(""),
-            repo,
-        ) else {
-            return Some(format!("the newest `{name}` signal names no run"));
-        };
-        if let Some(why) = runs.get(&run_id).and_then(unsuccessful) {
-            return Some(format!(
-                "the newest `{name}` check run names run {run_id}, which {why}"
-            ));
-        }
+    let url = status
+        .get("target_url")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    match run_id_from_url(url, repo).map(|run_id| (run_id, runs.get(&run_id))) {
+        Ok((run_id, Some(run))) => unsuccessful(run).map(|why| {
+            format!("the newest `{name}` status names run {run_id}, which {why}")
+        }),
+        _ => Some(format!("the newest `{name}` status names no fetched run")),
     }
-    None
+}
+
+/// The pull request's `base.sha`.
+fn base_sha(run_gh: RunGh<'_>, repo: &str, pr: u64) -> Result<String, String> {
+    let sha = run_gh(&[
+        "api".to_owned(),
+        format!("repos/{repo}/pulls/{pr}"),
+        "--jq".to_owned(),
+        ".base.sha".to_owned(),
+    ])?;
+    let sha = sha.trim();
+    if is_sha(sha) {
+        Ok(sha.to_owned())
+    } else {
+        Err(format!("pull request {pr} base sha read back as {sha:?}"))
+    }
+}
+
+/// Whether `path` is a blob in commit `commit`'s tree, walked one directory
+/// at a time through the git trees API so absence is an answer, not a 404.
+fn blob_at(run_gh: RunGh<'_>, repo: &str, commit: &str, path: &str) -> Result<bool, String> {
+    let parts: Vec<&str> = path.split('/').collect();
+    if parts.iter().any(|part| part.is_empty() || *part == "." || *part == "..") {
+        return Err(format!("workflow path `{path}` is not a plain relative path"));
+    }
+    let mut tree = commit.to_owned();
+    for (index, part) in parts.iter().enumerate() {
+        let raw = run_gh(&[
+            "api".to_owned(),
+            format!("repos/{repo}/git/trees/{tree}"),
+            "--jq".to_owned(),
+            "{truncated, tree: [.tree[] | {path, type, sha}]}".to_owned(),
+        ])?;
+        let listing: Value = serde_json::from_str(raw.trim())
+            .map_err(|error| format!("malformed tree {tree}: {error}"))?;
+        if listing.get("truncated") != Some(&Value::Bool(false)) {
+            return Err(format!("tree {tree} is truncated or unreadable"));
+        }
+        let entries = listing
+            .get("tree")
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("tree {tree} has no entries"))?;
+        let Some(entry) = entries
+            .iter()
+            .find(|entry| entry.get("path").and_then(Value::as_str) == Some(part))
+        else {
+            return Ok(false);
+        };
+        let want = if index + 1 == parts.len() { "blob" } else { "tree" };
+        if entry.get("type").and_then(Value::as_str) != Some(want) {
+            return Ok(false);
+        }
+        let sha = entry.get("sha").and_then(Value::as_str).unwrap_or("");
+        if !is_sha(sha) {
+            return Err(format!("tree {tree} lists `{part}` without a sha"));
+        }
+        tree = sha.to_owned();
+    }
+    Ok(true)
+}
+
+fn is_sha(text: &str) -> bool {
+    text.len() == 40 && text.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// The record with the highest id.
@@ -389,13 +434,7 @@ pub fn run_id_from_url(url: &str, repo: &str) -> Result<u64, String> {
     }
     let (id, tail) = tail;
     let run_id = number(id).ok_or_else(|| format!("`{url}` has no run id"))?;
-    let tail_ok = match tail {
-        [] => true,
-        ["attempts" | "job", attempt] => number(attempt).is_some(),
-        ["attempts", attempt, "job", job] => number(attempt).is_some() && number(job).is_some(),
-        _ => false,
-    };
-    if !tail_ok {
+    if !tail.is_empty() {
         return Err(format!("`{url}` is not an exact Actions run URL"));
     }
     Ok(run_id)

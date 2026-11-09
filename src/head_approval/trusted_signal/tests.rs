@@ -12,6 +12,11 @@ const HEAD: &str = "11120fb7d8b2feee6a49117b692400f314491280";
 const OTHER: &str = "09b407e14b0708d94eaaafb8db3e921f2c417240";
 const WORKFLOW: &str = ".github/workflows/framework-trusted-verify.yml";
 const NAME: &str = "framework-trusted-verify";
+const PR: u64 = 272;
+const BASE: &str = "0b5a7afaac13aa2c7e0c4b5bb5f0b3f26c35a8a1";
+const GITHUB_TREE: &str = "1111111111111111111111111111111111111111";
+const WORKFLOWS_TREE: &str = "2222222222222222222222222222222222222222";
+const BLOB: &str = "3333333333333333333333333333333333333333";
 
 fn signal() -> TrustedSignal {
     TrustedSignal {
@@ -33,9 +38,16 @@ fn status(id: u64, state: &str, url: &str) -> Value {
     json!({"id": id, "state": state, "context": NAME, "target_url": url})
 }
 
-fn check(id: u64, conclusion: &str, url: &str) -> Value {
-    json!({"id": id, "name": NAME, "status": "completed", "conclusion": conclusion,
-           "details_url": url, "app_id": 15368})
+fn check(id: u64, app_id: u64) -> Value {
+    json!({"id": id, "name": NAME, "app_id": app_id})
+}
+
+fn tree(entries: &[(&str, &str, &str)]) -> String {
+    let entries: Vec<Value> = entries
+        .iter()
+        .map(|(path, kind, sha)| json!({"path": path, "type": kind, "sha": sha}))
+        .collect();
+    json!({"truncated": false, "tree": entries}).to_string()
 }
 
 /// A stand-in GitHub: statuses, check runs and workflow runs, and every call it saw.
@@ -44,6 +56,10 @@ struct World {
     checks: Vec<Value>,
     runs: Vec<Value>,
     fail: bool,
+    /// Whether the base commit has the trusted workflow file.
+    workflow_at_base: bool,
+    /// Whether the pull request (and so its base) cannot be read.
+    base_fails: bool,
     calls: RefCell<Vec<String>>,
 }
 
@@ -54,6 +70,8 @@ impl World {
             checks,
             runs,
             fail: false,
+            workflow_at_base: true,
+            base_fails: false,
             calls: RefCell::new(Vec::new()),
         }
     }
@@ -74,6 +92,28 @@ impl World {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
+        if path == format!("repos/{REPO}/pulls/{PR}") {
+            return if self.base_fails {
+                Err("HTTP 502".to_owned())
+            } else {
+                Ok(BASE.to_owned())
+            };
+        }
+        if let Some(sha) = path.strip_prefix(&format!("repos/{REPO}/git/trees/")) {
+            return match sha {
+                BASE => Ok(tree(&[
+                    (".github", "tree", GITHUB_TREE),
+                    ("README.md", "blob", BLOB),
+                ])),
+                GITHUB_TREE => Ok(tree(&[("workflows", "tree", WORKFLOWS_TREE)])),
+                WORKFLOWS_TREE if self.workflow_at_base => Ok(tree(&[
+                    ("framework-trusted-verify.yml", "blob", BLOB),
+                    ("review-verdict.yml", "blob", BLOB),
+                ])),
+                WORKFLOWS_TREE => Ok(tree(&[("review-verdict.yml", "blob", BLOB)])),
+                _ => Err("HTTP 404".to_owned()),
+            };
+        }
         if path.contains("/statuses") {
             return Ok(lines(&self.statuses));
         }
@@ -95,6 +135,10 @@ impl World {
     fn judge(&self) -> Result<Option<String>, String> {
         judge(&|argv| self.gh(argv), REPO, HEAD, &signal())
     }
+
+    fn apply(&self, repo: &str, gate: HeadGate) -> Result<HeadGate, String> {
+        apply(&|argv| self.gh(argv), repo, PR, HEAD, &[], gate)
+    }
 }
 
 fn refused(world: &World, needle: &str) {
@@ -113,14 +157,31 @@ fn a_genuine_status_admits() {
 }
 
 #[test]
-fn a_genuine_check_run_admits() {
-    let url = format!("{}/job/99", run_url(7));
+fn a_same_named_check_run_is_a_spoof_even_beside_a_genuine_status() {
+    for app_id in [15368, 42] {
+        let world = World::new(
+            vec![status(1, "success", &run_url(7))],
+            vec![check(5, app_id)],
+            vec![genuine_run(7)],
+        );
+        refused(&world, "a same-named check run is a spoof");
+    }
+}
+
+#[test]
+fn a_pending_newest_status_is_refused() {
     let world = World::new(
+        vec![
+            status(1, "success", &run_url(7)),
+            status(2, "pending", &run_url(7)),
+        ],
         vec![],
-        vec![check(5, "success", &url)],
         vec![genuine_run(7)],
     );
-    assert_eq!(world.judge().unwrap(), None);
+    refused(
+        &world,
+        "the newest `framework-trusted-verify` status is `pending`",
+    );
 }
 
 #[test]
@@ -180,16 +241,6 @@ fn a_failing_newest_status_is_refused() {
 }
 
 #[test]
-fn a_failing_check_run_is_refused() {
-    let world = World::new(
-        vec![],
-        vec![check(5, "failure", &run_url(7))],
-        vec![genuine_run(7)],
-    );
-    refused(&world, "check run is completed/failure");
-}
-
-#[test]
 fn an_unresolvable_or_foreign_url_is_refused() {
     for (url, needle) in [
         (
@@ -210,6 +261,10 @@ fn an_unresolvable_or_foreign_url_is_refused() {
         ),
         (
             "https://github.com/Generous-Corp/vellum/actions/runs/7/logs",
+            "not an exact",
+        ),
+        (
+            "https://github.com/Generous-Corp/vellum/actions/runs/7/job/9",
             "not an exact",
         ),
         ("", "not a github.com"),
@@ -236,7 +291,7 @@ fn a_missing_signal_is_refused() {
     let other =
         json!({"id": 1, "state": "success", "context": "something-else", "target_url": run_url(7)});
     let world = World::new(vec![other], vec![], vec![genuine_run(7)]);
-    refused(&world, "no `framework-trusted-verify` status or check run");
+    refused(&world, "no `framework-trusted-verify` status on head");
 }
 
 #[test]
@@ -257,11 +312,49 @@ fn a_spoof_beside_a_genuine_signal_is_refused() {
 }
 
 #[test]
-fn a_same_named_check_from_another_app_does_not_count() {
-    let mut other = check(5, "success", &run_url(7));
-    other["app_id"] = json!(42);
-    let world = World::new(vec![], vec![other], vec![genuine_run(7)]);
-    refused(&world, "no `framework-trusted-verify` status or check run");
+fn it_is_not_enforced_until_the_base_has_the_workflow() {
+    // No run can post the signal before the base defines the workflow, so the
+    // pull request that adds it is not held.
+    let mut world = World::new(vec![], vec![], vec![]);
+    world.workflow_at_base = false;
+    assert_eq!(
+        world.apply(REPO, HeadGate::NotRequired).unwrap(),
+        HeadGate::NotRequired
+    );
+    assert!(
+        !world.calls.borrow().iter().any(|call| call.contains("/statuses")),
+        "an unenforced signal reads no statuses"
+    );
+}
+
+#[test]
+fn a_pull_request_deleting_the_workflow_is_still_enforced() {
+    // Its base has the file, so the base decides; the head's tree is never read.
+    let world = World::new(vec![], vec![], vec![]);
+    let gate = world.apply(REPO, HeadGate::NotRequired).unwrap();
+    assert!(matches!(gate, HeadGate::UntrustedSignal { .. }), "{gate:?}");
+    assert!(
+        world
+            .calls
+            .borrow()
+            .iter()
+            .all(|call| !call.contains(&format!("git/trees/{HEAD}"))),
+        "only the base tree decides enforcement"
+    );
+}
+
+#[test]
+fn an_unreadable_base_is_an_error_not_an_admission() {
+    let mut world = World::new(
+        vec![status(1, "success", &run_url(7))],
+        vec![],
+        vec![genuine_run(7)],
+    );
+    world.base_fails = true;
+    assert!(world.apply(REPO, HeadGate::NotRequired).is_err());
+    let mut world = World::new(vec![], vec![], vec![]);
+    world.fail = true;
+    assert!(world.apply(REPO, HeadGate::NotRequired).is_err());
 }
 
 #[test]
@@ -288,18 +381,6 @@ fn an_unreadable_signal_is_an_error_not_an_admission() {
 fn urls_parse_strictly() {
     assert_eq!(run_id_from_url(&run_url(42), REPO), Ok(42));
     assert_eq!(
-        run_id_from_url(&format!("{}/attempts/2", run_url(42)), REPO),
-        Ok(42)
-    );
-    assert_eq!(
-        run_id_from_url(&format!("{}/job/9", run_url(42)), REPO),
-        Ok(42)
-    );
-    assert_eq!(
-        run_id_from_url(&format!("{}/attempts/2/job/9", run_url(42)), REPO),
-        Ok(42)
-    );
-    assert_eq!(
         run_id_from_url(
             "https://github.com/generous-corp/VELLUM/actions/runs/42",
             REPO
@@ -311,6 +392,8 @@ fn urls_parse_strictly() {
         "https://github.com/Generous-Corp/vellum/actions/runs/04",
         "https://github.com/Generous-Corp/vellum/actions/runs/x",
         "https://github.com/Generous-Corp/vellum/actions/runs/4/job/",
+        "https://github.com/Generous-Corp/vellum/actions/runs/4/attempts/2",
+        "https://github.com/Generous-Corp/vellum/actions/runs/4/job/9",
         "https://github.com/Generous-Corp/vellum//actions/runs/4",
         "http://github.com/Generous-Corp/vellum/actions/runs/4",
         "https://github.com.evil/Generous-Corp/vellum/actions/runs/4",
@@ -330,14 +413,7 @@ fn vellum_requires_it_and_other_repositories_do_not() {
     ] {
         assert!(required(repo, &[]).is_empty(), "{repo}");
         let world = World::new(vec![], vec![], vec![]);
-        let gate = apply(
-            &|argv| world.gh(argv),
-            repo,
-            HEAD,
-            &[],
-            HeadGate::NotRequired,
-        )
-        .unwrap();
+        let gate = world.apply(repo, HeadGate::NotRequired).unwrap();
         assert_eq!(gate, HeadGate::NotRequired);
         assert!(world.calls.borrow().is_empty(), "{repo} must cost no reads");
     }
@@ -383,19 +459,9 @@ fn a_refused_head_stays_refused_and_an_admitted_one_is_judged() {
     let held = HeadGate::NotApproved {
         head: HEAD.to_owned(),
     };
-    assert_eq!(
-        apply(&|argv| world.gh(argv), REPO, HEAD, &[], held.clone()).unwrap(),
-        held
-    );
+    assert_eq!(world.apply(REPO, held.clone()).unwrap(), held);
     assert!(world.calls.borrow().is_empty());
-    let gate = apply(
-        &|argv| world.gh(argv),
-        REPO,
-        HEAD,
-        &[],
-        HeadGate::NotRequired,
-    )
-    .unwrap();
+    let gate = world.apply(REPO, HeadGate::NotRequired).unwrap();
     assert!(matches!(gate, HeadGate::UntrustedSignal { .. }), "{gate:?}");
     assert!(!gate.allows());
 }

@@ -2481,12 +2481,13 @@ pub fn evaluate_excusing_with_policy(
         queue,
         latest_was_interruption,
     )? {
-        return trusted_signal::apply(run_gh, repo, head, &policy.trusted_signals, gate);
+        return trusted_signal::apply(run_gh, repo, pr, head, &policy.trusted_signals, gate);
     }
     if !policy.required {
         return trusted_signal::apply(
             run_gh,
             repo,
+            pr,
             head,
             &policy.trusted_signals,
             HeadGate::NotRequired,
@@ -2523,7 +2524,7 @@ pub fn evaluate_excusing_with_policy(
     };
     let gate = with_carry(run_gh, &input, gate);
     let gate = with_rollup(run_gh, &input, gate);
-    trusted_signal::apply(run_gh, repo, head, &policy.trusted_signals, gate)
+    trusted_signal::apply(run_gh, repo, pr, head, &policy.trusted_signals, gate)
 }
 
 /// The pull request's author, read when the policy turns on it: with no
@@ -2626,7 +2627,7 @@ fn evaluate_events(
 ) -> Result<(HeadGate, Vec<String>, Option<ApprovalBlocker>), String> {
     let (gate, events, blocker) =
         evaluate_events_by_source(run_gh, repo, pr, head, policy, queue, author, rollups)?;
-    let gate = trusted_signal::apply(run_gh, repo, head, &policy.trusted_signals, gate)?;
+    let gate = trusted_signal::apply(run_gh, repo, pr, head, &policy.trusted_signals, gate)?;
     let blocker = match &gate {
         HeadGate::UntrustedSignal { detail, .. } => Some(ApprovalBlocker::AdmissionMissing {
             detail: detail.clone(),

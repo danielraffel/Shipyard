@@ -655,10 +655,13 @@ PR rewrote, can satisfy it. For a repo listed in
 `head_approval::trusted_signal::TRUSTED_SIGNAL_REPOS` (today
 `Generous-Corp/vellum` → `framework-trusted-verify`), or opted in with
 `trusted_signals = [{ name, workflow }]` in the head-approval config, the
-steward checks every same-named status and Actions check run on the exact
-head against its run: strict same-repo run URL, the named workflow path,
-event `pull_request_target`/`merge_group`, `head_sha` equal to the PR head,
-and success. A refusal or an API error never admits
+steward checks every same-named commit status on the exact head against its
+run: exact same-repo run URL, the named workflow path, event
+`pull_request_target`/`merge_group`, `head_sha` equal to the PR head, and a
+`success` newest status (pending never admits). A same-named check run is a
+spoof. Enforcement starts once the PR's `base.sha` has the workflow file, since
+`pull_request_target` runs the base's definition; otherwise the PR that adds the
+workflow could never land. A refusal or an API error never admits
 (`HeadGate::UntrustedSignal`). A `pull_request_target` run's `head_sha` is the
 PR head it ran for, so the head comparison is a real staleness check.
 
