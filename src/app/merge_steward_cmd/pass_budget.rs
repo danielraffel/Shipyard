@@ -192,8 +192,10 @@ pub(super) fn is_deferred(report: &PrReport) -> bool {
 /// armed rows first (the unapproved-admission sweep), then admission
 /// candidates (rows the steward can enqueue or rerun), then signaling-only
 /// work. Within the last two groups, rows the previous pass deferred go
-/// first, oldest deferral first (the order `record_deferred` persisted), and
-/// census order breaks the remaining ties.
+/// first, oldest deferral first (the order `record_deferred` persisted).
+/// Within a group, an approved green head the dwell step flagged as
+/// overstaying goes before everything, and the last pass's next-to-admit
+/// ranking orders the rest; census order breaks the remaining ties.
 ///
 /// The carry order matters as much as the carry itself. Census order is
 /// newest first, so ordering carried rows by census index alone took the same
@@ -217,6 +219,22 @@ pub(super) fn processing_order(
                 .collect()
         })
         .unwrap_or_default();
+    // The last pass's dwell step: approved green heads that overstayed go
+    // first, then the next-to-admit ranking (closest to mergeable first).
+    let dwell = ledger.dwell.get(&ledger_key(repo));
+    let readmit: BTreeSet<u64> = dwell
+        .map(|dwell| dwell.readmit_first.iter().copied().collect())
+        .unwrap_or_default();
+    let ranked: BTreeMap<u64, usize> = dwell
+        .map(|dwell| {
+            dwell
+                .admission_rank
+                .iter()
+                .enumerate()
+                .map(|(rank, number)| (*number, rank))
+                .collect()
+        })
+        .unwrap_or_default();
     let mut order: Vec<usize> = (0..prs.len()).collect();
     order.sort_by_key(|&index| {
         let pr = &prs[index];
@@ -228,8 +246,11 @@ pub(super) fn processing_order(
             Some(StewardDecision::ArmMergeQueue | StewardDecision::RerunTransient { .. }) => 1,
             _ => 2,
         };
-        let carry_rank = carried.get(&pr.fact.number).copied().unwrap_or(usize::MAX);
-        (group, carry_rank, index)
+        let number = pr.fact.number;
+        let overstayed = usize::from(!readmit.contains(&number));
+        let carry_rank = carried.get(&number).copied().unwrap_or(usize::MAX);
+        let rank = ranked.get(&number).copied().unwrap_or(usize::MAX);
+        (group, overstayed, carry_rank, rank, index)
     });
     order
 }

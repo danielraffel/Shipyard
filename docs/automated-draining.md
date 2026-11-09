@@ -522,6 +522,87 @@ steward does not own), `shipyard auto-merge`, `shipyard ship` and the `ghapp`
 arm guard keep their earlier same-head rules, including re-arming after
 `invalid_merge_commit`.
 
+## Dwell-time limits and the next-to-admit ranking
+
+A pull request should never sit in one state for hours with nobody told. Each
+pass, after every row has its `blocked_on`, the steward maps the token to a
+dwell state, remembers in its ledger (`dwell`) when the pull request entered it,
+and acts once the state outlives its limit. The limits are the **base** branch's
+`.shipyard/config.toml` `[auto_merge.dwell]` table (minutes; `0` stops tracking
+that state):
+
+```toml
+[auto_merge.dwell]
+needs_review = 20               # no_verdict, approval_excluded:stale_head|predates_head
+required_pending = 60
+required_failed_infra = 10      # transient_rerun: an interruption the steward is re-running
+required_failed = 45
+stale_verdict_check = 10        # only review-verdict red: re-run once if the gate admits the head
+dirty = 30                      # merge_state:DIRTY: escalate only, never touched
+held = 30                       # a HOLD names the head: escalate only
+required_never_ran = 30         # dispatch the mapped workflow once
+approved_green_not_queued = 5   # ready / admission_pending: evaluated first next pass
+carries_unapproved = 60         # escalate only
+stacked_base_merged = 10        # stacked on a merged base: retarget once
+act = "shadow"                  # "apply" runs the GitHub-writing acts; "off" runs none
+max_escalations_per_pass = 25
+max_level = 4
+
+[auto_merge.dwell.dispatch]     # required context -> workflow file, for required_never_ran
+macos = "build.yml"
+```
+
+Past its limit a pull request is **overdue**. The steward then takes the one
+mechanical act its state allows, once per pull request, state and head, with the
+intent saved to the ledger before the side effect so a crash cannot repeat it:
+
+| State | Act | Revalidation before it |
+|---|---|---|
+| `stale_verdict_check` | re-run the newest red `review-verdict` run | the approval gate, read live, admits the exact head (no HOLD) |
+| `required_never_ran` | `gh workflow run <file> --ref <head branch>` for each mapped context | the head is the one observed |
+| `approved_green_not_queued` | evaluate it first in the next pass's admission | none: it only reorders the steward's own admission, which keeps every gate |
+| `stacked_base_merged` | retarget it to the steward's base | the pull request is unchanged and its `stacked:<n>` parent merged (a closed, unmerged parent refuses) |
+
+Everything else escalates: DIRTY (contract row 2: never touched unattended),
+held, carried-unapproved, needs-review, pending and failed checks. An act that
+did not clear the state escalates at the next level. Levels fire at the limit,
+then twice, four and eight times it; each level is emitted once, worst first,
+at most `max_escalations_per_pass` per repository per pass (the rest wait for
+the next pass). An escalation goes to the overdue feed
+(`<state>/steward-dwell/overdue.jsonl`, rotated past 4 MiB) for fleet-loop or a
+model pass, and, when an owner record names the pull request
+(`shipyard owner register`), to the owning session through `shipyard relay`
+(event `overdue`, idempotent per state, head and level, inside the relay's
+per-pull-request rate limit). Rows the steward is acting on this pass are not
+relayed. The GitHub-writing acts ship in `shadow`: they are reported as
+`would_act` and escalate until the base sets `act = "apply"`.
+
+No act arms, enqueues, merges, updates a branch or approves; the act interface
+has no method that could.
+
+**Ranking.** The same pass ranks every open pull request by closeness to
+mergeable: stack bases (pull requests others are stacked on or carry) that are
+themselves within reach, then approved and green, approved with checks
+running, green but needing an exact-head review, then the rest. Within a tier,
+more unblocked pull requests first, then the longest in its state. The next
+pass evaluates admission candidates in that order (after rows the pass budget
+deferred and overstayed approved heads). The report lists the top five as
+`dwell.next_to_admit`, each with `needs` (the single thing it waits on) and the
+row's `next_action`.
+
+**Cost.** Nothing here polls. Ranking and tracking read only the rows and
+checks the pass already has; stacked pull requests are seen through the
+open-pull-request listing the carried-commit check read in the same pass
+(`dwell.stack_listing` says `reused`, or `not_read_this_pass`, when stacked
+entries simply hold). The base config read is the one the pass caches. The only
+extra calls are an act's own revalidation and mutation, once per pull request,
+state and head. The tick JSON's top-level `api_cost` sums each repository's
+`api_calls` (REST, GraphQL, cache hits).
+
+**Read it.** `shipyard overdue [--repo R] [--json]` and `shipyard next [--repo
+R] [--json]` read the snapshot the last `--apply` pass wrote
+(`<state>/steward-dwell/<repo>.json`) and print its age; neither reads GitHub.
+
 ## Things that bite
 
 These came from running it for real:

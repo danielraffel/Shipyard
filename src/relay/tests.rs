@@ -690,6 +690,7 @@ struct Harness {
     cmux: FakeCmux,
     log: Vec<Value>,
     steward: BTreeMap<u64, (String, String)>,
+    overdue: BTreeMap<u64, Vec<RelayEvent>>,
 }
 
 impl Harness {
@@ -702,6 +703,7 @@ impl Harness {
             cmux,
             log: Vec::new(),
             steward: BTreeMap::new(),
+            overdue: BTreeMap::new(),
         }
     }
 
@@ -714,6 +716,8 @@ impl Harness {
         let gh = |args: &[String]| self.gh.run(args);
         let steward_map = self.steward.clone();
         let steward = move |_: &str| steward_map.clone();
+        let overdue_map = self.overdue.clone();
+        let steward_overdue = move |_: &str| overdue_map.clone();
         let input = PassInput {
             config: &self.config,
             repos: &repos,
@@ -724,6 +728,7 @@ impl Harness {
             gh: &gh,
             runner: &self.cmux,
             steward: &steward,
+            steward_overdue: &steward_overdue,
             persist: None,
         };
         let report = run_pass(&input, &mut self.state);
@@ -1127,6 +1132,7 @@ fn a_recorded_day_replays_into_the_expected_deliveries() {
             Ok(json!({"data": {"repository": repository}}).to_string())
         };
         let steward = |_: &str| BTreeMap::new();
+        let steward_overdue = |_: &str| BTreeMap::new();
         let input = PassInput {
             config: &h.config,
             repos: &repos,
@@ -1137,6 +1143,7 @@ fn a_recorded_day_replays_into_the_expected_deliveries() {
             gh: &answer,
             runner: &h.cmux,
             steward: &steward,
+            steward_overdue: &steward_overdue,
             persist: None,
         };
         let report = run_pass(&input, &mut h.state);
@@ -1455,6 +1462,7 @@ fn each_delivery_is_persisted_before_the_next_one_is_sent() {
     let repos = vec![REPO.to_owned()];
     let gh = |args: &[String]| h.gh.run(args);
     let steward = |_: &str| BTreeMap::new();
+    let steward_overdue = |_: &str| BTreeMap::new();
     let input = PassInput {
         config: &h.config,
         repos: &repos,
@@ -1465,6 +1473,7 @@ fn each_delivery_is_persisted_before_the_next_one_is_sent() {
         gh: &gh,
         runner: &h.cmux,
         steward: &steward,
+        steward_overdue: &steward_overdue,
         persist: Some(&persist),
     };
     let mut state = h.state.clone();
@@ -1599,5 +1608,66 @@ fn the_batched_query_reads_every_owned_pull_request_in_one_call() {
     assert!(
         read.prs.values().all(Option::is_none),
         "missing pull requests are None"
+    );
+}
+
+fn overdue_event(head: &str, level: u32) -> RelayEvent {
+    RelayEvent::Overdue {
+        state: "dirty".to_owned(),
+        head: head.to_owned(),
+        level,
+        age_minutes: 45,
+        limit_minutes: 30,
+    }
+}
+
+#[test]
+fn a_steward_overdue_row_reaches_the_owner_once_per_level_at_the_current_head() {
+    let pr = Pr::open(7);
+    let mut h = Harness::new(
+        std::slice::from_ref(&pr),
+        FakeCmux::with(&[("m5", "/tmp/cmux-nightly.sock", "S")]),
+    );
+    h.own(&owner(7, "m5", "S"));
+    // An overdue row for an older head is not this pull request's state.
+    h.overdue.insert(7, vec![overdue_event(HEAD_B, 1)]);
+    h.pass(0, Mode::Send);
+    assert!(h.cmux.sends().is_empty());
+    h.overdue.insert(7, vec![overdue_event(HEAD_A, 1)]);
+    h.pass(1, Mode::Send);
+    let sends = h.cmux.sends();
+    assert_eq!(sends.len(), 1);
+    assert!(
+        sends[0]
+            .2
+            .as_deref()
+            .unwrap()
+            .contains("overdue: dirty for 45 min (limit 30 min)"),
+        "{sends:?}"
+    );
+    // Same level again, after the rate-limit window: nothing new.
+    h.pass(30, Mode::Send);
+    assert_eq!(h.cmux.sends().len(), 1);
+    // The next level is new.
+    h.overdue.insert(7, vec![overdue_event(HEAD_A, 2)]);
+    h.pass(60, Mode::Send);
+    assert_eq!(h.cmux.sends().len(), 2);
+}
+
+#[test]
+fn steward_overdue_reads_the_tick_report_and_skips_rows_being_acted_on() {
+    let report = json!({"repos": [{"dwell": {"overdue": [
+        {"pr": 7, "state": "held", "head": HEAD_A, "level": 1, "age_minutes": 31,
+         "limit_minutes": 30, "act": {"disposition": "no_act"}},
+        {"pr": 8, "state": "stale_verdict_check", "head": HEAD_A, "level": 1,
+         "act": {"disposition": "act", "kind": "rerun_verdict_check"}},
+        {"pr": 9, "state": "required_never_ran", "head": HEAD_A, "level": 2,
+         "act": {"disposition": "acted", "kind": "dispatch_never_ran", "status": "done"}},
+    ]}}]});
+    let rows = steward_overdue(&report);
+    assert_eq!(rows.keys().copied().collect::<Vec<_>>(), vec![7, 9]);
+    assert_eq!(
+        rows[&7][0].key(REPO, 7),
+        format!("{REPO}#7:overdue:{HEAD_A}:held:1")
     );
 }

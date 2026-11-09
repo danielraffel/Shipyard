@@ -37,6 +37,7 @@ mod daemon_prune_cmd;
 mod dependency_cmd;
 mod diagnose_cmd;
 mod doctor_cmd;
+mod dwell_cmd;
 mod execution_worker_cmd;
 pub mod fleet_escalation_cmd;
 mod fleet_status_cmd;
@@ -604,6 +605,26 @@ where
                 stdout,
             );
         }
+        Command::Overdue { repo } => {
+            return dwell_cmd::dwell_view_command(
+                dwell_cmd::View::Overdue,
+                &runtime_paths.state_dir,
+                repo.as_deref(),
+                cli.json,
+                chrono::Utc::now(),
+                stdout,
+            );
+        }
+        Command::Next { repo } => {
+            return dwell_cmd::dwell_view_command(
+                dwell_cmd::View::Next,
+                &runtime_paths.state_dir,
+                repo.as_deref(),
+                cli.json,
+                chrono::Utc::now(),
+                stdout,
+            );
+        }
         Command::Who { pr, repo, contact } => {
             if let Some(contact) = contact {
                 let pr = contact.or(pr).ok_or_else(|| {
@@ -1034,6 +1055,8 @@ fn handle_operational_variant<W: Write>(
         | Command::ReviewerClaim { .. }
         | Command::Rollup { .. }
         | Command::Who { .. }
+        | Command::Overdue { .. }
+        | Command::Next { .. }
         | Command::Owner { .. }
         | Command::Relay { .. }
         | Command::BaseHealth { .. }

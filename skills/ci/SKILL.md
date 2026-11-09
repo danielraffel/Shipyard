@@ -26,6 +26,26 @@ services need environment rollout/restart. It preserves required evidence,
 merge receipts, explicit metrics imports/record, and historical reporting;
 retention and manual cause/private-corpus collection remain separate.
 
+## Overdue pull requests and what lands next: `shipyard overdue`, `shipyard next`
+
+Before guessing what to work on, read the steward's own answer:
+`shipyard next [--repo R] [--json]` lists the five pull requests closest to
+mergeable (stack bases first, then approved green, approved pending, green
+needing review), each with the single thing it needs; `shipyard overdue`
+lists every pull request past its `[auto_merge.dwell]` limit with its owner
+route and any act taken. Both read the snapshot the steward's last `--apply`
+pass wrote and print its age; neither costs GitHub API budget. The steward
+takes only contract-allowed acts (re-run a stale `review-verdict` after a live
+gate read, dispatch a never-ran required check from the base's
+`[auto_merge.dwell.dispatch]` map, evaluate an overstayed approved head first,
+retarget a stack whose parent merged), once per pull request, state and head,
+and ships them in `shadow` until the base sets `act = "apply"`. It never
+touches a DIRTY or held head and never arms. Gotcha: stacked pull requests are
+seen only through the open-pull-request listing the carried-commit check reads
+in the same pass, so a pass with no admission candidate holds stacked entries
+(`stack_listing: not_read_this_pass`) rather than reading GitHub again. Full
+reference: `docs/automated-draining.md`, "Dwell-time limits".
+
 ## Required-check producer identity
 
 Metrics cleanup uses the existing `SHIPYARD_METRICS_RETENTION_DAYS` policy

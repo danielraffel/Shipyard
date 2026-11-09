@@ -84,6 +84,9 @@ pub(crate) struct RelayState {
 /// The steward's `next_action` per pull request (head, text), for a repo.
 pub(crate) type StewardActions<'a> = dyn Fn(&str) -> BTreeMap<u64, (String, String)> + 'a;
 
+/// The steward's overdue rows per pull request, as relay events, for a repo.
+pub(crate) type StewardOverdue<'a> = dyn Fn(&str) -> BTreeMap<u64, Vec<RelayEvent>> + 'a;
+
 /// Persists the state and one log record right after a delivery, so a
 /// crash later in the pass cannot send it again.
 pub(crate) type Persist<'a> = dyn Fn(&RelayState, &Value) -> Result<(), String> + 'a;
@@ -106,6 +109,8 @@ pub(crate) struct PassInput<'a> {
     pub(crate) runner: &'a dyn CmuxRunner,
     /// The steward's `next_action` per pull request (head, text), by repo.
     pub(crate) steward: &'a StewardActions<'a>,
+    /// The steward's overdue rows (dwell limits) per pull request, by repo.
+    pub(crate) steward_overdue: &'a StewardOverdue<'a>,
     /// Durable write after each delivery; `None` keeps records in the report.
     pub(crate) persist: Option<&'a Persist<'a>>,
 }
@@ -265,6 +270,7 @@ fn run_repo(
         read.prs.extend(extra.prs);
     }
     let steward = (input.steward)(repo);
+    let overdue = (input.steward_overdue)(repo);
     let window = Duration::minutes(input.config.rate_limit_minutes);
     for (number, node) in &read.prs {
         let Some(tracked) = state.prs.get_mut(&key(repo, *number)) else {
@@ -288,8 +294,19 @@ fn run_repo(
         }
         tracked.missing_passes = 0;
         infer_actions(tracked, &digest, input.now, log);
+        // Overdue rows are the steward's, at this exact head; the rest are
+        // derived from the change since the last pass.
+        let overdue_now = overdue
+            .get(number)
+            .into_iter()
+            .flatten()
+            .filter(
+                |event| matches!(event, RelayEvent::Overdue { head, .. } if *head == digest.head),
+            )
+            .cloned();
         let mut events: Vec<RelayEvent> = derive_events(tracked.digest.as_ref(), &digest)
             .into_iter()
+            .chain(overdue_now)
             .filter(|event| input.config.events.contains(event.name()))
             // Green, pending (a re-run), green again at one head is one fact.
             .filter(|event| match event {

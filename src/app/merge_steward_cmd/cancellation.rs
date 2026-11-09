@@ -107,7 +107,7 @@ pub(super) fn apply_repo_plan(
         max_transient_reruns: args.max_transient_reruns,
         ejection_guards: super::read_ejection_guards(actions, observation),
     };
-    let (mut reports, pr_mutation_failed) = apply_pr_plans(
+    let (mut reports, pr_mutation_failed, listing) = apply_pr_plans_with_listing(
         actions,
         args,
         observation,
@@ -115,6 +115,28 @@ pub(super) fn apply_repo_plan(
         ledger_path,
         ledger,
         mutation_control,
+    );
+    let dwell_policy =
+        super::dwell_pass::read_policy(actions, &observation.repo, &observation.base);
+    let dwell_report = super::dwell_pass::run(
+        &super::dwell_pass::DwellInput {
+            observation,
+            policy: &policy,
+            dwell_policy: &dwell_policy,
+            listing: listing.as_deref(),
+            apply: args.apply,
+            ledger_path,
+            state_dir: mutation_control.map(|control| control.state_dir.as_path()),
+            now: Utc::now(),
+        },
+        &reports,
+        ledger,
+        &super::dwell_pass::GitHubDwellActs {
+            actions,
+            observation,
+            control: mutation_control,
+            approval_context: &policy.approval_context,
+        },
     );
     // The backstop acts only on pull requests the steward declines to own, so
     // it can never contend with the enqueue path above. See `native_arm`.
@@ -260,6 +282,7 @@ pub(super) fn apply_repo_plan(
             api_calls: None,
             rate_limit_deferred: None,
             exit_reasons: Vec::new(),
+            dwell: Some(dwell_report),
             repo: observation.repo.clone(),
             base: args.base.clone(),
             allow_auto_merge: observation.allow_auto_merge,
@@ -297,7 +320,8 @@ pub(super) fn apply_repo_plan(
     )
 }
 
-#[allow(clippy::too_many_lines)]
+/// [`apply_pr_plans_with_listing`] without the listing, for tests.
+#[cfg(test)]
 pub(super) fn apply_pr_plans(
     actions: &GitHubActions,
     args: &StewardCommandArgs,
@@ -307,6 +331,34 @@ pub(super) fn apply_pr_plans(
     ledger: &mut StewardLedger,
     mutation_control: Option<&MutationControl>,
 ) -> (Vec<PrReport>, bool) {
+    let (reports, unhealthy, _) = apply_pr_plans_with_listing(
+        actions,
+        args,
+        observation,
+        policy,
+        ledger_path,
+        ledger,
+        mutation_control,
+    );
+    (reports, unhealthy)
+}
+
+/// [`apply_pr_plans`], also handing back the open-pull-request listing the
+/// carried-commit check read this pass, when it read one.
+#[allow(clippy::too_many_lines)]
+pub(super) fn apply_pr_plans_with_listing(
+    actions: &GitHubActions,
+    args: &StewardCommandArgs,
+    observation: &RepoObservation,
+    policy: &StewardPolicy,
+    ledger_path: &Path,
+    ledger: &mut StewardLedger,
+    mutation_control: Option<&MutationControl>,
+) -> (
+    Vec<PrReport>,
+    bool,
+    Option<Vec<super::carried_commits::OpenPr>>,
+) {
     let mut unhealthy = false;
     let mutation_context = mutation_control.map(|mutation_control| MutationApplyContext {
         actions,
@@ -552,6 +604,9 @@ pub(super) fn apply_pr_plans(
         .map(|(_, report)| report)
         .collect::<Vec<_>>();
     super::pass_budget::record_deferred(ledger, &observation.repo, &reports);
+    let listing = mutation_context
+        .as_ref()
+        .and_then(|context| context.carried_commits.borrow_mut().take_open());
     let approval_blockers = mutation_context
         .map(|context| context.approval_blockers.take())
         .unwrap_or_default();
@@ -564,7 +619,7 @@ pub(super) fn apply_pr_plans(
         !args.apply,
         &mut reports,
     );
-    (reports, unhealthy)
+    (reports, unhealthy, listing)
 }
 
 fn provenance_blocked_report(

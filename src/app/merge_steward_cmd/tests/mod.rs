@@ -225,6 +225,7 @@ mod blocked_on;
 mod capacity;
 #[cfg(unix)]
 mod code_owner_wait;
+mod dwell;
 #[cfg(unix)]
 mod ejected_retry;
 #[cfg(unix)]

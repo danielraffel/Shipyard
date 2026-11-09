@@ -90,6 +90,7 @@ One pass per repository:
 | `dirty_after_base_move` | it became `DIRTY` while its head did not move |
 | `claim_taken` | a new `repair-claim: <lane> until <time>` comment |
 | `stacked_base_merged` | the pull request whose head is its base merged, or it was retargeted to the default branch |
+| `overdue` | the steward's fresh tick report (`steward_tick_dir`) names it past an `[auto_merge.dwell]` limit at the current head; once per state, head and escalation level, never while the steward is acting on it that pass (see `automated-draining.md`, "Dwell-time limits") |
 
 4. **Delivery.** Each event has an idempotency key (`repo#pr:event:head:detail`)
    and is delivered once. Repeatable events (`enqueued`, `ejected`,
@@ -173,7 +174,7 @@ interval_secs = 120
 rate_limit_minutes = 10
 repos = ["Generous-Corp/pulp", "Generous-Corp/vellum"]
 events = ["merged", "closed", "ejected", "verdict", "required_check",
-          "dirty_after_base_move", "claim_taken", "stacked_base_merged"]
+          "dirty_after_base_move", "claim_taken", "stacked_base_merged", "overdue"]
 sockets = ["/tmp/cmux-nightly.sock", ""]   # "" is cmux's default socket
 comment_fallback = true
 steward_tick_dir = "/Users/me/Library/Logs/shipyard-steward-tick"
