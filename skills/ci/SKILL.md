@@ -859,7 +859,8 @@ enforces it.
 **Your pull requests tell you when they change; do not poll them.**
 `shipyard pr` and `shipyard ship` register the pushing session (host, cmux
 surface, session) as the owner, in the state dir and as a `shipyard-owner:`
-marker in the PR body. `shipyard relay` (run on the steward host) sends that
+marker in the PR body (the session id is `sid=`, never `session=`: ghapp refuses
+any body comment containing that word as a possible reviewer stamp). `shipyard relay` (run on the steward host) sends that
 surface one line when the PR merges, closes, is ejected, gets a verdict at its
 head, goes required-red or green, conflicts after the base moved, gets a
 `repair-claim:`, or its stacked base merges, with the next step. After a
