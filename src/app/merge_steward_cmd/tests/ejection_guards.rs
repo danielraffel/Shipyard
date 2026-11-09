@@ -488,3 +488,42 @@ fn a_failed_config_read_is_re_read_before_admitting() {
         pass.error
     );
 }
+
+/// #11584's shape through the steward: only a listed flake failed in the
+/// merge group, and the check passed on the head, so the base's
+/// `known_flaky_tests` earns the one retry under the discipline.
+#[cfg(unix)]
+#[test]
+fn a_known_flake_listed_in_the_base_config_is_re_enqueued_once() {
+    let body = |log: &Path| {
+        passed_on_head_body(log).replace(
+            "'2026-11-06T10:30:00.0000000Z 1/2 Test #4: hosted_editor ....***Failed'",
+            "'2026-11-06T10:30:00.0000000Z The following tests FAILED:' '2026-11-06T10:30:00.0000000Z \t13716 - ui-script-plugin-editor-au (Failed)'",
+        )
+    };
+    let listed = EjectionGuards {
+        known_flaky_tests: vec!["ui-script-plugin-editor-au".to_owned()],
+        ..EjectionGuards::for_base(true)
+    };
+    let temp = tempfile::tempdir().expect("temp");
+    let pass_listed = pass(&temp, &body(&temp.path().join("calls")), &listed);
+    assert!(
+        enqueued(&pass_listed),
+        "{:?} {:?}\n{}",
+        pass_listed.mutation,
+        pass_listed.error,
+        pass_listed.calls
+    );
+    // Control: the same ejection with nothing listed needs a new head.
+    let temp = tempfile::tempdir().expect("temp");
+    let unlisted = pass(
+        &temp,
+        &body(&temp.path().join("calls")),
+        &EjectionGuards::for_base(true),
+    );
+    assert!(!enqueued(&unlisted), "{}", unlisted.calls);
+    assert_eq!(
+        unlisted.blocked_on,
+        "ejected_same_head:failed_checks:needs_new_head"
+    );
+}
