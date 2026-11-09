@@ -299,6 +299,39 @@ class VerdictContradictionGuard(unittest.TestCase):
         self.assert_held(self.run_guard(argv, [comment("HOLD")],
                                         env={"SHIPYARD_AGENT_ID": "someone-else"}))
 
+    def test_a_boolean_short_flag_with_a_value_approves(self) -> None:
+        self.assert_held(self.run_guard(["pr", "review", "7", "-a=true"], [comment("HOLD")],
+                                        env={"SHIPYARD_AGENT_ID": "someone-else"}))
+        result = self.run_guard(["pr", "review", "7", "-a=false", "-b", "notes"],
+                                [comment("HOLD")])
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_without_a_numeric_selector_gh_pr_view_names_the_pull_request(self) -> None:
+        quoted = f"see https://github.com/{REPO}/pull/8\nverdict: APPROVE head:{HEAD}"
+        for argv in (["pr", "review", "--approve", "-b", quoted],
+                     ["pr", "review", "mybranch", "--approve", "-b", quoted],
+                     ["pr", "comment", "-b", quoted],
+                     ["pr", "comment", "mybranch", "--body", quoted]):
+            with self.subTest(argv=argv):
+                if self.calls.exists():
+                    self.calls.unlink()
+                self.assert_held(self.run_guard(argv, [comment("HOLD")],
+                                                env={"SHIPYARD_AGENT_ID": "someone-else"}))
+                calls = self.calls.read_text(encoding="utf-8")
+                self.assertIn("pr view", calls)
+                self.assertNotIn("pulls/8", calls, "a URL in the body is not the selector")
+        self.assertIn("pr view mybranch", calls)
+
+    def test_a_pr_command_whose_pull_request_cannot_be_read_refuses_an_approve(self) -> None:
+        result = self.run_guard(["pr", "comment", "8", "-b", f"verdict: APPROVE head:{HEAD}"],
+                                [comment("HOLD")])
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("an APPROVE is not posted unchecked", result.stderr)
+
+    def test_a_typed_file_field_that_cannot_carry_a_verdict_is_not_read(self) -> None:
+        argv = ["api", f"repos/{REPO}/issues/7/labels", "-F", "labels=@/nonexistent"]
+        self.assertEqual(self.run_guard(argv, []).returncode, 0)
+
     def test_a_verdict_marker_on_an_issue_is_not_judged(self) -> None:
         argv = ["api", f"repos/{REPO}/issues/8/comments", "-f", f"body=reviewed: {HEAD}"]
         result = self.run_guard(argv, [comment("HOLD")])

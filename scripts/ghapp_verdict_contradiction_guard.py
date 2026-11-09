@@ -76,6 +76,8 @@ SESSION_ENVS = ("SHIPYARD_STAMP_SESSION_ID", "CLAUDE_CODE_SESSION_ID",
                 "CODEX_COMPANION_SESSION_ID")
 AGENT_ENV = "SHIPYARD_AGENT_ID"
 SHA = re.compile(r"^[0-9a-fA-F]{40}$")
+# Fields that can carry a verdict, its event or its GraphQL document.
+VERDICT_KEYS = {"body", "query", "event", "input", "commit_id"}
 FIELD_FLAGS = {"-f", "-F", "--field", "--raw-field"}
 REVIEW_EVENTS = {"APPROVE": "APPROVE", "REQUEST_CHANGES": "HOLD"}
 PREFIX = "verdict-contradiction-guard"
@@ -161,6 +163,8 @@ def _fields(args: list[str]) -> dict[str, str]:
             continue
         key, _, text = value.partition("=")
         if flag in ("-F", "--field") and text.startswith("@"):
+            if key not in VERDICT_KEYS:
+                continue  # Cannot carry a verdict; gh reports a bad file itself.
             text = _read(text[1:])
         found[key] = text
     return found
@@ -261,6 +265,13 @@ def normalise(args: list[str]) -> list[str]:
             letter = letters[position]
             position += 1
             if letter in booleans:
+                if letters[position:position + 1] == "=":
+                    # `-a=true`: pflag sets a boolean short flag from its value.
+                    if letters[position + 1:].lower() in ("true", "1", "t"):
+                        expanded.append(f"-{letter}")
+                    elif letters[position + 1:].lower() not in ("false", "0", "f"):
+                        expanded = [argument]
+                    break
                 expanded.append(f"-{letter}")
             elif letter in valued:
                 remainder = letters[position:]
@@ -470,15 +481,18 @@ def own_contradiction(kind: str, head: str, comments: list[dict[str, Any]],
     return None
 
 
-def explicit_target(args: list[str]) -> tuple[str | None, int | None]:
-    """``(repo, number)`` a ``pr``/``issue`` command names itself: ``-R/--repo``
-    and the first positional selector (a number, ``#N`` or a pull-request
-    URL, whose repository it also names)."""
+def explicit_target(args: list[str]) -> tuple[str | None, int | None, str | None]:
+    """``(repo, number, selector)`` a ``pr``/``issue`` command names itself:
+    ``-R/--repo`` and the first positional selector (a number, ``#N`` or a
+    pull-request URL, whose repository it also names; any other selector, a
+    branch, is returned for ``gh pr view`` to resolve). Option values, such as
+    a body that quotes a pull-request URL, are never the selector."""
     args = normalise(args)
     if _command(args) in (None, ("api",)):
-        return None, None
+        return None, None, None
     repo: str | None = None
     number: int | None = None
+    selector: str | None = None
     rest = args[2:]
     index = 0
     while index < len(rest):
@@ -498,7 +512,7 @@ def explicit_target(args: list[str]) -> tuple[str | None, int | None]:
                                SHORT_FLAGS[_command(args)][0]):
                 index += 1
             continue
-        if number is not None:
+        if number is not None or selector is not None:
             continue
         url = re.match(r"^https?://github\.com/([^/]+/[^/]+)/(?:pull|issues)/(\d+)", argument)
         if url:
@@ -506,9 +520,24 @@ def explicit_target(args: list[str]) -> tuple[str | None, int | None]:
             repo = repo or url.group(1)
         elif argument.removeprefix("#").isdigit():
             number = int(argument.removeprefix("#"))
+        else:
+            selector = argument
     if repo:
         repo = re.sub(r"^(?:https?://)?github\.com/", "", repo).strip("/")
-    return repo, number
+    return repo, number, selector
+
+
+def _pr_view_number(selector: str | None, repo: str | None) -> int:
+    """The pull request ``gh pr view`` resolves: the selector (a branch), or
+    the current branch's."""
+    arguments = ["pr", "view", *([selector] if selector else []), "--json", "number"]
+    if repo:
+        arguments += ["--repo", repo]
+    answer = ARM.run_real_gh(arguments)
+    number = (answer or {}).get("number") if isinstance(answer, dict) else None
+    if not isinstance(number, int) or number <= 0:
+        raise ARM.GuardError("gh pr view named no pull request")
+    return number
 
 
 def _refuse(message: str) -> int:
@@ -553,10 +582,21 @@ def judge(args: list[str]) -> int:
         return 0
 
     bound = os.environ.get("GH_REPO", "").strip() or None
-    named_repo, number = explicit_target(args)
+    named_repo, number, selector = explicit_target(args)
     if named_repo and bound and named_repo.lower() != bound.lower():
         return unreadable(f"the request names {named_repo} but ghapp is bound to {bound}")
     repo = named_repo or bound
+    command = _command(normalise(args))
+    on_pr = command is not None and command[0] == "pr"
+    if number is None and command not in (None, ("api",)):
+        if not on_pr:
+            if approving:
+                return unreadable("an issue command names no issue or pull request")
+            return 0
+        try:
+            number = _pr_view_number(selector, repo)
+        except Exception as error:  # noqa: BLE001 - see unreadable()
+            return unreadable(f"cannot tell which pull request: {error}")
     if number is None:
         try:
             number, endpoint_repo = CLAIM._target(args, repo) if CLAIM else (None, None)
@@ -573,7 +613,7 @@ def judge(args: list[str]) -> int:
         try:
             pull = ARM.run_real_gh(["api", f"repos/{repo}/pulls/{number}"])
         except ARM.GuardError as error:
-            if "404" in str(error) or "Not Found" in str(error):
+            if not on_pr and ("404" in str(error) or "Not Found" in str(error)):
                 return 0  # An issue, not a pull request: nothing to judge.
             raise
         if not isinstance(pull, dict):
