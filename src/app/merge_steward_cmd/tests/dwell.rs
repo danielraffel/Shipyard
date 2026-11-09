@@ -98,6 +98,8 @@ fn report(number: u64, token: &str, since_minutes: Option<i64>) -> PrReport {
 #[derive(Default)]
 struct FakeActs {
     calls: RefCell<Vec<String>>,
+    /// Dispatch reports a failure after its side effect was attempted.
+    dispatch_fails: bool,
     /// The ledger file, read at the moment of each side effect.
     ledger_path: Option<std::path::PathBuf>,
     intent_on_disk: RefCell<Vec<bool>>,
@@ -122,6 +124,9 @@ impl DwellActs for FakeActs {
             pr.fact.number,
             workflows.join(",")
         ));
+        if self.dispatch_fails {
+            return ActOutcome::Failed("second workflow: HTTP 502".to_owned());
+        }
         ActOutcome::Done("dispatched".to_owned())
     }
     fn retarget(&self, pr: &OpenPr) -> ActOutcome {
@@ -173,8 +178,7 @@ fn established() -> StewardLedger {
         .dwell
         .entry("owner/repo@main".to_owned())
         .or_default()
-        .seen
-        .insert(0, now());
+        .initialized = true;
     ledger
 }
 
@@ -835,4 +839,53 @@ fn a_dwell_state_for_another_base_is_left_alone() {
     pass.observation.prs = Vec::new();
     pass.run(&mut ledger, &FakeActs::default());
     assert!(ledger.dwell["owner/repo@main"].entries.contains_key(&1));
+}
+
+#[test]
+fn a_dispatch_that_failed_after_its_attempt_is_never_sent_again_at_that_head() {
+    let temp = tempfile::tempdir().unwrap();
+    let prs = vec![pr(1, None, Some("SUCCESS"), &[])];
+    let mut pass = pass(
+        &temp,
+        prs,
+        vec![report(1, "required_never_ran:macos,linux", Some(31))],
+    );
+    pass.dwell_policy
+        .dispatch
+        .insert("macos".to_owned(), "build.yml".to_owned());
+    pass.dwell_policy
+        .dispatch
+        .insert("linux".to_owned(), "linux.yml".to_owned());
+    let mut ledger = established();
+    let acts = FakeActs {
+        dispatch_fails: true,
+        ..FakeActs::default()
+    };
+    let first = pass.run(&mut ledger, &acts);
+    assert!(first.overdue[0].escalated, "a failed act escalates at once");
+    for minutes in [20, 50, 120, 300] {
+        pass.now = now() + chrono::Duration::minutes(minutes);
+        pass.run(&mut ledger, &acts);
+    }
+    assert_eq!(
+        *acts.calls.borrow(),
+        vec!["dispatch #1 build.yml,linux.yml".to_owned()]
+    );
+}
+
+#[test]
+fn a_seeded_backlog_is_not_reported_as_emitted_to_the_relay() {
+    let temp = tempfile::tempdir().unwrap();
+    let pass = pass(
+        &temp,
+        vec![pr(1, Some("SUCCESS"), Some("SUCCESS"), &[])],
+        vec![report(1, "held", Some(500))],
+    );
+    let mut fresh = StewardLedger::default();
+    let report = pass.run(&mut fresh, &FakeActs::default());
+    assert!(!report.overdue[0].escalated);
+    assert_eq!(
+        report.overdue[0].escalated_level, 0,
+        "seeded, never emitted"
+    );
 }

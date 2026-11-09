@@ -387,9 +387,12 @@ pub struct DwellEntry {
     pub entered_at: DateTime<Utc>,
     /// The last pass that saw it in the state.
     pub last_seen_at: DateTime<Utc>,
-    /// Highest escalation level already emitted for this entry.
+    /// Highest escalation level already emitted for this entry (or seeded).
     #[serde(default)]
     pub escalated_level: u32,
+    /// The level the first pass seeded without emitting it: never relayed.
+    #[serde(default)]
+    pub seeded_level: u32,
 }
 
 /// One act, as recorded before (`intent`) and after its side effect.
@@ -455,6 +458,10 @@ pub struct DwellRepoState {
     /// it.
     #[serde(default)]
     pub seen: BTreeMap<u64, DateTime<Utc>>,
+    /// Set by the first pass that tracked this repository and base: the
+    /// backlog it found was seeded, not escalated.
+    #[serde(default)]
+    pub initialized: bool,
 }
 
 impl DwellRepoState {
@@ -493,12 +500,18 @@ impl DwellRepoState {
     }
 }
 
-/// Whether a recorded act may be tried again now: never after `done` or a
-/// bare `intent` (its outcome is unknown, so it may have happened), and never
-/// past [`MAX_ATTEMPTS`]; otherwise after a backoff that doubles per attempt.
+/// Whether a recorded act may be tried again now: only after `refused` or
+/// `deferred` (nothing was attempted), never after `done`, `failed` or a bare
+/// `intent` (each may have reached GitHub), and never past [`MAX_ATTEMPTS`];
+/// after a backoff that doubles per attempt.
 #[must_use]
 pub fn retry_due(record: &ActRecord, now: DateTime<Utc>) -> bool {
-    if matches!(record.status.as_str(), "done" | "intent") || record.attempts >= MAX_ATTEMPTS {
+    // `failed` means the side effect was attempted: GitHub may have taken
+    // part of it (a dispatch of several workflows, or a call that timed out
+    // after GitHub accepted it), so it is never tried again at this head.
+    // Only `refused` and `deferred`, which attempted nothing, retry.
+    if !matches!(record.status.as_str(), "refused" | "deferred") || record.attempts >= MAX_ATTEMPTS
+    {
         return false;
     }
     let shift = record.attempts.saturating_sub(1).min(8);
@@ -545,7 +558,8 @@ pub fn track(
     approval_context: &str,
     now: DateTime<Utc>,
 ) {
-    let first_pass = state.entries.is_empty() && state.seen.is_empty();
+    let first_pass = !state.initialized;
+    state.initialized = true;
     let mut current = BTreeMap::new();
     for sighting in sightings {
         let Some(dwell) = state_for_token(&sighting.token, approval_context)
@@ -588,6 +602,7 @@ pub fn track(
                     entered_at: entered,
                     last_seen_at: now,
                     escalated_level,
+                    seeded_level: escalated_level,
                 }
             }
         };

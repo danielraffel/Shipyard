@@ -324,6 +324,10 @@ pub(super) fn run(
         }
     };
     let mut planned = dwell::plan(&state, rows, input.dwell_policy, input.now, &actable);
+    let mut escalations_left = input
+        .dwell_policy
+        .max_escalations_per_pass
+        .saturating_sub(planned.iter().filter(|row| row.escalate).count());
     state.readmit_first.clear();
     let mut outcomes: BTreeMap<u64, String> = BTreeMap::new();
     for row in &mut planned {
@@ -337,12 +341,19 @@ pub(super) fn run(
                 outcomes.insert(row.overdue.number, text);
                 // An act that did not happen is escalated now, not a level
                 // later.
-                if !done {
+                if !done && !row.escalate {
                     let already = state
                         .entries
                         .get(&row.overdue.number)
                         .map_or(0, |entry| entry.escalated_level);
-                    row.escalate = row.overdue.level > already;
+                    let owed = row.overdue.level > already;
+                    // Within the same per-pass cap as every other escalation.
+                    if owed && escalations_left > 0 {
+                        escalations_left -= 1;
+                        row.escalate = true;
+                    } else if owed {
+                        row.escalation_deferred = true;
+                    }
                 }
             }
             Err(error) => report.errors.push(error),
@@ -360,10 +371,14 @@ pub(super) fn run(
     report.overdue = planned
         .iter()
         .map(|row| {
-            let escalated_level = state
-                .entries
-                .get(&row.overdue.number)
-                .map_or(0, |entry| entry.escalated_level);
+            // A seeded level was never emitted, so the relay must not see it.
+            let escalated_level = state.entries.get(&row.overdue.number).map_or(0, |entry| {
+                if entry.escalated_level > entry.seeded_level {
+                    entry.escalated_level
+                } else {
+                    0
+                }
+            });
             overdue_record(
                 input,
                 by_number.get(&row.overdue.number).copied(),
@@ -494,6 +509,14 @@ fn take_act(
     }
     if !input.apply {
         return Ok((format!("{}: not taken (dry run)", kind.key()), true));
+    }
+    // Each act re-checks the pass budget: a gate read and a live read each
+    // can take a while.
+    if super::pass_budget::deadline_passed(input.deadline) {
+        return Ok((
+            format!("{}: not taken (the pass time budget is spent)", kind.key()),
+            true,
+        ));
     }
     // Write-ahead: the intent is durable before the side effect, so a crash
     // after it can never take the act a second time. If it cannot be saved,

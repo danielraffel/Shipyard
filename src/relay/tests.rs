@@ -1679,3 +1679,37 @@ fn steward_overdue_relays_only_emitted_author_levels_not_being_acted_on() {
         format!("{REPO}#7:overdue:{HEAD_A}:held:1")
     );
 }
+
+#[test]
+fn a_pending_overdue_notice_for_a_head_that_moved_is_dropped() {
+    let pr = Pr::open(7);
+    let mut h = Harness::new(
+        std::slice::from_ref(&pr),
+        FakeCmux::with(&[("m5", "/tmp/cmux-nightly.sock", "S")]),
+    );
+    h.own(&owner(7, "m5", "S"));
+    h.pass(0, Mode::Send);
+    // A first message opens the rate-limit window.
+    let mut red_pr = pr.clone();
+    red_pr.checks = red();
+    h.gh.set(red_pr.clone());
+    h.pass(1, Mode::Send);
+    assert_eq!(h.cmux.sends().len(), 1);
+    // Overdue at HEAD_A arrives inside the window, so it waits.
+    h.overdue.insert(7, vec![overdue_event(HEAD_A, 1)]);
+    h.pass(2, Mode::Send);
+    assert_eq!(h.cmux.sends().len(), 1);
+    // The author pushes a new head before the window ends.
+    h.overdue.clear();
+    let mut moved = red_pr.clone();
+    moved.head = HEAD_B;
+    h.gh.set(moved);
+    h.pass(30, Mode::Send);
+    let sends = h.cmux.sends();
+    assert!(
+        sends
+            .iter()
+            .all(|send| !send.2.as_deref().unwrap_or("").contains("overdue")),
+        "{sends:?}"
+    );
+}

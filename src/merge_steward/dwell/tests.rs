@@ -46,7 +46,7 @@ fn observed(numbers: &[u64]) -> BTreeSet<u64> {
 /// seeds silently).
 fn established() -> DwellRepoState {
     let mut state = DwellRepoState::default();
-    state.seen.insert(0, minutes_before(now(), 1));
+    state.initialized = true;
     state
 }
 
@@ -754,13 +754,17 @@ fn a_failed_or_deferred_act_is_retried_with_backoff_at_most_three_times() {
         at + chrono::Duration::minutes(15)
     ));
     assert!(!retry_due(
-        &record("failed", 2, at),
+        &record("refused", 2, at),
         at + chrono::Duration::minutes(29)
     ));
     assert!(retry_due(
-        &record("failed", 2, at),
+        &record("refused", 2, at),
         at + chrono::Duration::minutes(30)
     ));
+    assert!(
+        !retry_due(&record("failed", 1, at), at + chrono::Duration::days(1)),
+        "an attempted side effect may have reached GitHub: never again at this head"
+    );
     assert!(!retry_due(
         &record("refused", MAX_ATTEMPTS, at),
         at + chrono::Duration::days(1)
@@ -825,4 +829,38 @@ fn an_act_that_cannot_run_now_waits_and_the_cap_bounds_acts_per_pass() {
         later.iter().all(|row| !row.escalate),
         "waiting acts do not escalate at level 1"
     );
+}
+
+#[test]
+fn a_pass_with_no_open_pull_requests_does_not_reseed_the_next() {
+    let policy = DwellPolicy::default();
+    let mut state = DwellRepoState::default();
+    track(
+        &mut state,
+        &[],
+        &observed(&[]),
+        &BTreeSet::new(),
+        true,
+        &policy,
+        APPROVAL,
+        now(),
+    );
+    track(
+        &mut state,
+        &[sighting(1, "held", HEAD, Some(35))],
+        &observed(&[1]),
+        &BTreeSet::new(),
+        true,
+        &policy,
+        APPROVAL,
+        now(),
+    );
+    let planned = plan(
+        &state,
+        overdue(&state, &policy, now()),
+        &policy,
+        now(),
+        &|_, _| Actable::Yes,
+    );
+    assert!(planned[0].escalate, "only the very first pass seeds");
 }
