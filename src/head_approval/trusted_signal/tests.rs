@@ -322,7 +322,11 @@ fn it_is_not_enforced_until_the_base_has_the_workflow() {
         HeadGate::NotRequired
     );
     assert!(
-        !world.calls.borrow().iter().any(|call| call.contains("/statuses")),
+        !world
+            .calls
+            .borrow()
+            .iter()
+            .any(|call| call.contains("/statuses")),
         "an unenforced signal reads no statuses"
     );
 }

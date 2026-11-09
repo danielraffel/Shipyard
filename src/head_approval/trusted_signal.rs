@@ -247,15 +247,15 @@ pub fn judge(
         )));
     }
     if statuses.is_empty() {
-        return Ok(Some(format!(
-            "no `{name}` status on head {}",
-            short(head)
-        )));
+        return Ok(Some(format!("no `{name}` status on head {}", short(head))));
     }
     let mut runs: BTreeMap<u64, Value> = BTreeMap::new();
     for status in &statuses {
         let id = status.get("id").and_then(Value::as_u64).unwrap_or(0);
-        let url = status.get("target_url").and_then(Value::as_str).unwrap_or("");
+        let url = status
+            .get("target_url")
+            .and_then(Value::as_str)
+            .unwrap_or("");
         let run_id = match run_id_from_url(url, repo) {
             Ok(run_id) => run_id,
             Err(why) => return Ok(Some(format!("`{name}` status {id}: {why}"))),
@@ -293,9 +293,8 @@ fn newest_unsuccessful(
         .and_then(Value::as_str)
         .unwrap_or("");
     match run_id_from_url(url, repo).map(|run_id| (run_id, runs.get(&run_id))) {
-        Ok((run_id, Some(run))) => unsuccessful(run).map(|why| {
-            format!("the newest `{name}` status names run {run_id}, which {why}")
-        }),
+        Ok((run_id, Some(run))) => unsuccessful(run)
+            .map(|why| format!("the newest `{name}` status names run {run_id}, which {why}")),
         _ => Some(format!("the newest `{name}` status names no fetched run")),
     }
 }
@@ -320,8 +319,13 @@ fn base_sha(run_gh: RunGh<'_>, repo: &str, pr: u64) -> Result<String, String> {
 /// at a time through the git trees API so absence is an answer, not a 404.
 fn blob_at(run_gh: RunGh<'_>, repo: &str, commit: &str, path: &str) -> Result<bool, String> {
     let parts: Vec<&str> = path.split('/').collect();
-    if parts.iter().any(|part| part.is_empty() || *part == "." || *part == "..") {
-        return Err(format!("workflow path `{path}` is not a plain relative path"));
+    if parts
+        .iter()
+        .any(|part| part.is_empty() || *part == "." || *part == "..")
+    {
+        return Err(format!(
+            "workflow path `{path}` is not a plain relative path"
+        ));
     }
     let mut tree = commit.to_owned();
     for (index, part) in parts.iter().enumerate() {
@@ -346,7 +350,11 @@ fn blob_at(run_gh: RunGh<'_>, repo: &str, commit: &str, path: &str) -> Result<bo
         else {
             return Ok(false);
         };
-        let want = if index + 1 == parts.len() { "blob" } else { "tree" };
+        let want = if index + 1 == parts.len() {
+            "blob"
+        } else {
+            "tree"
+        };
         if entry.get("type").and_then(Value::as_str) != Some(want) {
             return Ok(false);
         }
