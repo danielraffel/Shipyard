@@ -135,7 +135,10 @@ pub const INTERRUPTION_SIGNATURES: [&str; 1] = ["Upload progress stalled"];
 /// timeout (ctest `***Timeout`) is deliberately absent: a head can introduce
 /// a hang that only the merged tree exercises. Because a step timeout or an
 /// HTTP error line can come from the head too, a hit clears the head only
-/// when the same check passed on the head itself.
+/// when the same check passed on the head itself. A step or job timeout
+/// (`has timed out after`, a `cancelled` job) still gets its one retry
+/// deliberately: it is far more often a stalled bootstrap or runner than a
+/// merged-tree-only hang, and the retry is bounded to one per head.
 pub const INFRA_STEP_SIGNATURES: [&str; 15] = [
     "has timed out after",
     "HTTP Error 403: rate limit exceeded",

@@ -474,7 +474,9 @@ infra_only_same_head_retry = true         # default: on with a merge queue
   the 9 wasted group builds; turn it off per base if flakes dominate. The
   widened readings (a step-timeout, HTTP 5xx or rate-limit line, a
   `cancelled` conclusion) clear the head only when the same check passed on
-  the head itself. A ctest-level `***Timeout` is not an infrastructure line. `invalid_merge_commit` is never re-enqueued on the same
+  the head itself. A ctest-level `***Timeout` is not an infrastructure line;
+  a step or job timeout is, deliberately, so a hang only the merged tree
+  exercises can still spend the head's one retry. `invalid_merge_commit` is never re-enqueued on the same
   head (before, it reset the refusal: #11698 went `failed_checks`, then three
   immediate `invalid_merge_commit` removals, each re-enqueued). Every refusal
   reads `ejected_same_head:<cause>:needs_new_head`.

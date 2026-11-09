@@ -11,14 +11,16 @@
 //!
 //! So before an enqueue the steward reads the queue live and, when another
 //! entry is queued, the candidate's changed files; when it changes a
-//! generated path and another queued entry changes that same path, the candidate waits (`generated_path_batch:#<n>`) and is admitted on
-//! the first pass after `#<n>` leaves the queue. The steward re-reads the
+//! generated path and another queued entry changes that same path, the
+//! candidate waits (`generated_path_batch:#<n>`) and is admitted on the first
+//! pass after `#<n>` leaves the queue. The steward re-reads the
 //! queue live for this, so a pull request it enqueued earlier in the same
 //! pass counts.
 //!
 //! Cost: one GraphQL `files(first:100)` page per pull request, cached for the
-//! pass, and only on a base that lists generated paths. The queue's entries
-//! are read only when the candidate changes a generated path. A list longer
+//! pass, and only on a base that lists generated paths while another entry is
+//! queued. The queued entries' files are read only when the candidate changes
+//! a generated path. A list longer
 //! than one page is paged to GitHub's 3000-file ceiling; one that is still
 //! incomplete is treated as possibly changing any generated path, which can
 //! only defer.
