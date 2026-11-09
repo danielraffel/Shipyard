@@ -1395,6 +1395,35 @@ fn credentials_come_only_from_the_canonical_token_command() {
 }
 
 #[test]
+fn the_default_transport_is_gh_until_a_host_opts_in() {
+    if std::env::var_os(super::TRANSPORT_ENV).is_some() {
+        return;
+    }
+    let config = |table: Option<&str>| {
+        let data = table.map_or_else(toml::Table::new, |text| text.parse().expect("toml"));
+        crate::config::LoadedConfig {
+            data,
+            global_dir: PathBuf::from("/nonexistent-global"),
+            project_dir: None,
+            local_dir: None,
+            local_overlay_source: crate::config::LocalOverlaySource::None,
+        }
+    };
+    assert_eq!(
+        super::configured_transport(&config(None)),
+        Ok(super::ReadTransport::Gh)
+    );
+    assert_eq!(
+        super::configured_transport(&config(Some("[github.reads]\ntransport = \"inproc\"\n"))),
+        Ok(super::ReadTransport::Inproc)
+    );
+    assert!(
+        super::configured_transport(&config(Some("[github.reads]\ntransport = \"fast\"\n")))
+            .is_err()
+    );
+}
+
+#[test]
 fn transport_setting_selects_gh_or_inproc() {
     assert_eq!(super::parse_transport("gh"), Some(super::ReadTransport::Gh));
     assert_eq!(
@@ -1526,6 +1555,37 @@ mod actions {
             .expect("gh answered");
         assert_eq!(gh_calls(&log).len(), 2);
         assert!(mock.requests().is_empty());
+    }
+
+    #[test]
+    fn a_landing_request_always_takes_the_guarded_gh_path() {
+        let key = write_key();
+        let clock = now_clock();
+        let mock = github(Arc::clone(&clock), |_| Reply::json(200, &json!({})));
+        let dir = tempfile::tempdir().unwrap();
+        let (gh, log) = fake_gh(dir.path(), "{}");
+        let actions = GitHubActions::hermetic_for_tests(dir.path(), &gh)
+            .with_repo_override("o/r")
+            .with_inproc_reads(Some(reader(&mock, &key.path, &clock)));
+        // A bare `gh api .../pulls/N/merge` is a GET to the classifier, but
+        // the queue guard treats it as a landing; it must reach gh.
+        let args = argv(&["api", "repos/o/r/pulls/1/merge"]);
+        assert!(argv::classify(&args, Some("o/r")).is_some());
+        assert!(crate::queue_arm_gate::is_landing_request(&args));
+        let _ = actions.run_gh_with_timeout(&args, Duration::from_secs(5));
+        let _ = actions.run_gh(&args);
+        assert!(
+            mock.requests()
+                .iter()
+                .all(|request| !request.path.ends_with("/merge")),
+            "no landing request was answered in process"
+        );
+        assert!(
+            gh_calls(&log)
+                .iter()
+                .any(|call| call.contains("pulls/1/merge")),
+            "the landing request ran through gh"
+        );
     }
 
     #[test]

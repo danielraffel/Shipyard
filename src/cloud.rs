@@ -1403,7 +1403,10 @@ impl GitHubActions {
     ) -> Option<(Option<Result<GitHubCommandOutput, GitHubError>>, Duration)> {
         use crate::github_read::{FailureKind, ReadOutcome};
         let reads = self.inproc.as_ref()?;
-        if internal || !env.is_empty() {
+        // A landing request (`pr merge`, an arm or enqueue mutation, a bare
+        // `api repos/O/R/pulls/N/merge`) keeps the guarded `gh` path even when
+        // its shape reads like a GET.
+        if internal || !env.is_empty() || crate::queue_arm_gate::is_landing_request(args) {
             return None;
         }
         let timeout = match self.remaining_deadline() {

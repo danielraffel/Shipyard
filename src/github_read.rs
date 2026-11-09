@@ -21,8 +21,12 @@
 //! shaped as `gh` would have printed it, error text included, so callers and
 //! their error classifiers see no difference.
 //!
-//! Turn it off with `[github.reads] transport = "gh"` in the machine-global
-//! config, or `SHIPYARD_GITHUB_READS=gh` for one process.
+//! It is off by default in this release. A canary host opts in with
+//! `[github.reads] transport = "inproc"` in its machine-global config (m3 is
+//! the first), or `SHIPYARD_GITHUB_READS=inproc` for one process. The default
+//! flips to `inproc` once canary passes show `api_calls.fallbacks` empty and a
+//! re-run of `runner steward-read-probe` matches gh on every answer. Setting
+//! `transport = "gh"` (or `SHIPYARD_GITHUB_READS=gh`) always forces `gh`.
 
 pub(crate) mod argv;
 pub(crate) mod batch;
@@ -79,14 +83,15 @@ pub enum ReadTransport {
 }
 
 /// Which transport `config` (and the process environment) selects.
-/// In-process is the default; anything unrecognised selects `gh`.
+/// `gh` is the default while in-process reads are canaried; anything
+/// unrecognised selects `gh` too.
 pub(crate) fn configured_transport(config: &LoadedConfig) -> Result<ReadTransport, String> {
     if let Ok(value) = std::env::var(TRANSPORT_ENV) {
         return parse_transport(&value)
             .ok_or_else(|| format!("{TRANSPORT_ENV}={value:?} is not \"gh\" or \"inproc\""));
     }
     match config.get("github.reads.transport") {
-        None => Ok(ReadTransport::Inproc),
+        None => Ok(ReadTransport::Gh),
         Some(value) => value
             .as_str()
             .and_then(parse_transport)
@@ -700,7 +705,9 @@ impl InprocReads {
             ],
             body: Some(body.to_string().into_bytes()),
         };
-        let reply = self.credential_send(&request, &bearer, deadline)?;
+        let mut reply = self.credential_send(&request, &bearer, deadline)?;
+        // The body holds the token: wiped on every path out of here.
+        let body = Zeroizing::new(std::mem::take(&mut reply.body));
         if reply.status != 201 && reply.status != 200 {
             return Err(Unanswered::Decline(format!(
                 "credential: GitHub refused the installation token mint (HTTP {})",
@@ -708,7 +715,7 @@ impl InprocReads {
             )));
         }
         let token = parse_token_reply(
-            &reply.body,
+            &body,
             self.inner.credential.scope_to_repository.then_some(name),
             now,
         )
@@ -855,17 +862,20 @@ fn parse_token_reply(
     scoped_name: Option<&str>,
     now: i64,
 ) -> Result<InstallationToken, String> {
-    let value = serde_json::from_slice::<Value>(body)
+    let mut value = serde_json::from_slice::<Value>(body)
         .map_err(|_| "installation token answer is not JSON".to_owned())?;
-    let secret = value
-        .get("token")
-        .and_then(Value::as_str)
-        .filter(|token| {
-            !token.is_empty()
-                && token.len() <= 512
-                && token.bytes().all(|byte| byte.is_ascii_graphic())
-        })
-        .ok_or_else(|| "GitHub response did not include a usable installation token".to_owned())?;
+    // Move the token out of the document so the only copy left is the
+    // zeroizing one.
+    let secret = match value.get_mut("token").map(Value::take) {
+        Some(Value::String(token)) => Zeroizing::new(token),
+        _ => Zeroizing::new(String::new()),
+    };
+    if secret.is_empty()
+        || secret.len() > 512
+        || !secret.bytes().all(|byte| byte.is_ascii_graphic())
+    {
+        return Err("GitHub response did not include a usable installation token".to_owned());
+    }
     if let Some(name) = scoped_name {
         let names = value
             .get("repositories")
@@ -886,8 +896,5 @@ fn parse_token_reply(
         .and_then(Value::as_str)
         .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
         .map_or(now + ASSUMED_TOKEN_LIFETIME_SECONDS, |at| at.timestamp());
-    Ok(InstallationToken {
-        secret: Zeroizing::new(secret.to_owned()),
-        expires_at,
-    })
+    Ok(InstallationToken { secret, expires_at })
 }

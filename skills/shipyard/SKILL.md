@@ -289,7 +289,10 @@ webhook events.
 
 ## Steward reads mint their own token and never spawn `gh`
 
-The steward's reads (`src/github_read`) do not spawn `gh`, so the `ghapp`
+Off by default (`[github.reads] transport = "gh"`). m3 canaries it with
+`transport = "inproc"` in its machine-global config. The default flips once
+canary passes show `api_calls.fallbacks` empty and the read probe matches.
+When on, the steward's reads (`src/github_read`) do not spawn `gh`, so the `ghapp`
 wrapper never re-mints for them. Shipyard parses the canonical
 `[github.auth] token_command` (`[WRAPPER, "token", "--app-id", ID,
 "--private-key", PATH, "--repo", "{repo_slug}"]`, optional

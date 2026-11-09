@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use base64::Engine as _;
 use ring::rand::SystemRandom;
 use ring::signature::{RSA_PKCS1_SHA256, RsaKeyPair};
-use zeroize::Zeroize as _;
+use zeroize::{Zeroize as _, Zeroizing};
 
 /// Largest private-key file this reader opens.
 const MAX_KEY_BYTES: u64 = 64 * 1024;
@@ -141,7 +141,7 @@ impl AppSigner {
             .to_string(),
         );
         let signing_input = format!("{header}.{claims}");
-        let mut signature = vec![0; self.key.public().modulus_len()];
+        let mut signature = Zeroizing::new(vec![0; self.key.public().modulus_len()]);
         self.key
             .sign(
                 &RSA_PKCS1_SHA256,
@@ -150,7 +150,8 @@ impl AppSigner {
                 &mut signature,
             )
             .map_err(|_| "could not sign the GitHub App JWT".to_owned())?;
-        Ok(format!("{signing_input}.{}", engine.encode(signature)))
+        let encoded = Zeroizing::new(engine.encode(signature.as_slice()));
+        Ok(format!("{signing_input}.{}", encoded.as_str()))
     }
 }
 
@@ -195,14 +196,50 @@ fn check_key_file(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Open the key without following a symlink, and check the opened handle
+/// itself, so a file swapped in after [`check_key_file`] is still refused.
+#[cfg(unix)]
+fn open_key(path: &Path) -> Result<std::fs::File, String> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits())
+        .open(path)
+        .map_err(|_| "GitHub App private key is not readable (or is a symlink)".to_owned())?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| "GitHub App private key is not readable".to_owned())?;
+    if !metadata.file_type().is_file() {
+        return Err("GitHub App private key must be a regular file, not a symlink".to_owned());
+    }
+    if metadata.mode() & 0o7777 != 0o600 {
+        return Err("GitHub App private key must have mode 0600".to_owned());
+    }
+    if metadata.uid() != nix::unistd::getuid().as_raw() {
+        return Err("GitHub App private key must be owned by the current user".to_owned());
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_key(path: &Path) -> Result<std::fs::File, String> {
+    std::fs::File::open(path).map_err(|_| "GitHub App private key is not readable".to_owned())
+}
+
 fn read_bounded(path: &Path) -> Result<String, String> {
     use std::io::Read as _;
-    let file = std::fs::File::open(path)
-        .map_err(|_| "GitHub App private key is not readable".to_owned())?;
-    let mut text = String::new();
-    file.take(MAX_KEY_BYTES + 1)
+    let file = open_key(path)?;
+    // Sized well past the read limit so reading never reallocates and
+    // strands an unwiped copy.
+    let mut text = String::with_capacity(usize::try_from(MAX_KEY_BYTES * 2).unwrap_or(131_072));
+    if file
+        .take(MAX_KEY_BYTES + 1)
         .read_to_string(&mut text)
-        .map_err(|_| "GitHub App private key is not valid text".to_owned())?;
+        .is_err()
+    {
+        text.zeroize();
+        return Err("GitHub App private key is not valid text".to_owned());
+    }
     if text.len() as u64 > MAX_KEY_BYTES {
         text.zeroize();
         return Err("GitHub App private key file is too large".to_owned());
@@ -213,7 +250,7 @@ fn read_bounded(path: &Path) -> Result<String, String> {
 /// The DER body of a PKCS#1 (`RSA PRIVATE KEY`) or PKCS#8 (`PRIVATE KEY`) PEM.
 fn parse_pem(pem: &str) -> Result<Vec<u8>, String> {
     let malformed = || "GitHub App private key is not a PEM RSA key".to_owned();
-    let mut body = String::new();
+    let mut body = String::with_capacity(pem.len());
     let mut inside = false;
     let mut seen = false;
     for line in pem.lines().map(str::trim) {
@@ -238,9 +275,15 @@ fn parse_pem(pem: &str) -> Result<Vec<u8>, String> {
         body.zeroize();
         return Err(malformed());
     }
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(body.as_bytes())
-        .map_err(|_| malformed());
+    let mut decoded = vec![0; base64::decoded_len_estimate(body.len())];
+    let result =
+        base64::engine::general_purpose::STANDARD.decode_slice(body.as_bytes(), &mut decoded);
     body.zeroize();
-    decoded
+    if let Ok(length) = result {
+        decoded.truncate(length);
+        Ok(decoded)
+    } else {
+        decoded.zeroize();
+        Err(malformed())
+    }
 }
