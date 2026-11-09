@@ -193,6 +193,12 @@ pub(super) fn admission_policy(
         managed_label: None,
         handoff_context: String::new(),
         max_transient_reruns: 0,
+        ejection_guards: crate::merge_steward::EjectionGuards::from_config(
+            &|argv: &[String]| actions.run_gh(argv).map_err(|error| error.to_string()),
+            &repo,
+            base,
+            merge_queue,
+        ),
     })
 }
 

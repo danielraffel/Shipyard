@@ -873,3 +873,177 @@ fn one_head_caused_check_refuses_even_beside_a_runner_failure() {
                 && matches!(check.attribution, FailureAttribution::Infra(_)))
     );
 }
+
+// ── retry discipline (`assess_with` infra_only) ────────────────────────────
+
+fn assess_strict(
+    answers: &HashMap<String, Result<String, String>>,
+    ejections: u32,
+) -> EnvironmentRequeue {
+    let mut report =
+        explain_pr_queue_state(&fixture("pr_real_8678_first_environment_ejection.json"));
+    report.ejections_of_current_head = ejections;
+    if let Some(ejection) = report.last_ejection.as_mut() {
+        ejection.merge_group_commit = Some(GROUP.to_owned());
+    }
+    let gh = |args: &[String]| {
+        answers
+            .get(&args[1])
+            .cloned()
+            .unwrap_or_else(|| Err(format!("unexpected call {}", args[1])))
+    };
+    assess_with(&gh, REPO, &report, true, true).expect("applies")
+}
+
+/// One failing `Run` step whose output ends at `lines`, the last of which is
+/// expected to be its `##[error]`.
+fn step_log(lines: &[&str]) -> String {
+    let mut log = String::from(
+        "2026-10-09T23:10:00.0000000Z ##[group]Run ./bootstrap.sh\n\
+         2026-10-09T23:10:00.0000000Z # retries HTTP Error 504 and rate limit exceeded itself\n\
+         2026-10-09T23:10:00.0000000Z ./bootstrap.sh\n\
+         2026-10-09T23:10:00.0000000Z ##[endgroup]\n",
+    );
+    for line in lines {
+        log.push_str("2026-10-09T23:20:00.0000000Z ");
+        log.push_str(line);
+        log.push('\n');
+    }
+    log
+}
+
+#[test]
+fn the_discipline_does_not_retry_a_failure_that_merely_passed_on_the_head() {
+    // #11471's shape: green on the head, red on the merge group, no signature.
+    let lenient = assess_group(&flake_group(Some("success"), Some("success")), 1);
+    assert!(lenient.allowed, "{}", lenient.reason);
+    let strict = assess_strict(&flake_group(Some("success"), Some("success")), 1);
+    assert!(!strict.allowed, "{}", strict.reason);
+    assert!(matches!(
+        only_cause(&strict),
+        FailureAttribution::NoInfraSignature(_)
+    ));
+    assert!(
+        strict.reason.contains("no infrastructure signature"),
+        "{}",
+        strict.reason
+    );
+    // Base poison is not a reason to retry the same head either: it fails
+    // again until the base is fixed.
+    let poisoned = assess_strict(&flake_group(Some("failure"), None), 1);
+    assert!(!poisoned.allowed, "{}", poisoned.reason);
+}
+
+#[test]
+fn the_discipline_still_retries_runner_conclusions_and_cancels() {
+    for conclusion in INFRA_CONCLUSIONS {
+        let verdict = assess_strict(&interrupted_group(conclusion, &test_failure_job(), ""), 1);
+        assert!(verdict.allowed, "{conclusion}: {}", verdict.reason);
+        assert_eq!(verdict.class, Some(RequeueClass::NotHeadCaused));
+    }
+    // #11451's shape: the macos job cancelled at a late step with a runner
+    // attached, so not starved. Under the discipline a cancel is
+    // infrastructure; without it, it is placed by comparison (unanswered
+    // here, so unknown).
+    let cancelled = queued_job(
+        "studio-pulp-gate-03",
+        "2026-11-03T10:00:00Z",
+        "2026-11-03T10:40:00Z",
+    );
+    let answers = interrupted_group("cancelled", &cancelled, "");
+    let strict = assess_strict(&answers, 1);
+    assert!(strict.allowed, "{}", strict.reason);
+    assert!(
+        matches!(only_cause(&strict), FailureAttribution::Infra(detail) if detail.contains("cancelled"))
+    );
+    let lenient = assess_group(&answers, 1);
+    assert!(!lenient.allowed, "{}", lenient.reason);
+    // The retry is still one per head.
+    let second = assess_strict(&answers, 2);
+    assert!(!second.allowed, "{}", second.reason);
+}
+
+#[test]
+fn the_discipline_reads_real_infrastructure_lines_at_the_failure() {
+    let cases: [(&str, &[&str]); 4] = [
+        // 11441/11446: drift-fast bootstrap FetchContent clones.
+        (
+            "has timed out after",
+            &[
+                "Cloning into 'skia'...",
+                "##[error]The action 'Bootstrap repository dependencies' has timed out after 10 minutes.",
+            ],
+        ),
+        // 11845: skia-builder release download.
+        (
+            "rate limit exceeded",
+            &[
+                "urllib.error.HTTPError: HTTP Error 403: rate limit exceeded",
+                "##[error]Process completed with exit code 1.",
+            ],
+        ),
+        // Vellum artifact downloads.
+        (
+            "HTTP Error 504",
+            &[
+                "pulp-view-audio-archive: cannot download libpulp-view-audio.a: HTTP Error 504: Gateway Time-out",
+                "##[error]Process completed with exit code 1.",
+            ],
+        ),
+        (
+            "The requested URL returned error: 504",
+            &[
+                "curl: (22) The requested URL returned error: 504",
+                "##[error]Process completed with exit code 22.",
+            ],
+        ),
+    ];
+    for (signature, lines) in cases {
+        let log = step_log(lines);
+        let hit = infra_signature_at_failure(&log, "2026-10-09T23:10:00Z").expect(signature);
+        assert_eq!(hit.signature, signature);
+        let answers = interrupted_group("failure", &test_failure_job(), &log);
+        let strict = assess_strict(&answers, 1);
+        assert!(strict.allowed, "{signature}: {}", strict.reason);
+        assert!(
+            matches!(only_cause(&strict), FailureAttribution::Infra(detail) if detail.contains(signature))
+        );
+    }
+}
+
+#[test]
+fn infrastructure_lines_in_the_script_echo_or_far_from_the_failure_do_not_count() {
+    // The script echo quotes two signatures; the output is a test failure.
+    let log = step_log(&[
+        "1/2 Test #4: hosted_editor ....***Failed",
+        "##[error]Process completed with exit code 8.",
+    ]);
+    assert_eq!(
+        infra_signature_at_failure(&log, "2026-10-09T23:10:00Z"),
+        None
+    );
+    let strict = assess_strict(&interrupted_group("failure", &test_failure_job(), &log), 1);
+    assert!(!strict.allowed, "{}", strict.reason);
+    // A recovered 504 more than FAILURE_PROXIMITY_LINES before a compile error.
+    let mut lines = vec!["transient download failure (HTTP Error 504: Gateway Time-out); retrying"];
+    lines.extend(std::iter::repeat_n(
+        "[ 50%] Building CXX object",
+        FAILURE_PROXIMITY_LINES + 5,
+    ));
+    lines.push("error: no member named 'pos'");
+    lines.push("##[error]Process completed with exit code 2.");
+    let log = step_log(&lines);
+    assert_eq!(
+        infra_signature_at_failure(&log, "2026-10-09T23:10:00Z"),
+        None
+    );
+    // A ctest-level timeout is not an infrastructure line.
+    let log = step_log(&[
+        "5/9 Test #7: WakeSignal racing publish ...***Timeout 60.01 sec",
+        "##[error]Process completed with exit code 8.",
+    ]);
+    assert_eq!(
+        infra_signature_at_failure(&log, "2026-10-09T23:10:00Z"),
+        None
+    );
+}

@@ -105,6 +105,7 @@ pub(super) fn apply_repo_plan(
         managed_label: Some(args.managed_label.clone()),
         handoff_context: args.handoff_context.clone(),
         max_transient_reruns: args.max_transient_reruns,
+        ejection_guards: super::read_ejection_guards(actions, observation),
     };
     let (mut reports, pr_mutation_failed) = apply_pr_plans(
         actions,
@@ -314,6 +315,8 @@ pub(super) fn apply_pr_plans(
         mutation_control,
         approval_blockers: std::cell::RefCell::default(),
         carried_commits: std::cell::RefCell::default(),
+        changed_files: std::cell::RefCell::default(),
+        ejection_guards: policy.ejection_guards.clone(),
     });
     let mut sweep_pass = super::unapproved_admission::SweepPass::new(args.unapproved_dequeue);
     if args.apply {

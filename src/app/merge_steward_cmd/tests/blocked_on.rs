@@ -484,7 +484,7 @@ fn queue_8811() -> Value {
 fn an_ejected_head_reads_the_same_in_a_dry_run_and_an_apply_pass() {
     let mut pr = pr_with(11308, &[], "CLEAN", &green_rollup());
     pr.fact.head_sha = HEAD_8811.to_owned();
-    let record = blocked_on::GateRecord::new(HEAD_8811, None, &queue_8811());
+    let record = blocked_on::GateRecord::new(HEAD_8811, None, &queue_8811(), false);
     let ejection = record.ejection.as_ref().expect("same-head ejection");
     assert_eq!(ejection.reason, "failed_checks");
     let policy = queue_policy();
@@ -520,7 +520,7 @@ fn an_ejected_head_reads_the_same_in_a_dry_run_and_an_apply_pass() {
     );
     assert_eq!(refused.blocked_on, "ejected_same_head:failed_checks");
     // Control: the same queue answer for a different head is no ejection.
-    let other = blocked_on::GateRecord::new(HEAD, None, &queue_8811());
+    let other = blocked_on::GateRecord::new(HEAD, None, &queue_8811(), false);
     assert_eq!(other.ejection, None);
 }
 
@@ -531,7 +531,7 @@ fn an_ejected_head_reads_the_same_in_a_dry_run_and_an_apply_pass() {
 fn an_ejection_carries_the_retry_verdict_as_its_detail() {
     let mut pr = pr_with(11308, &[], "CLEAN", &green_rollup());
     pr.fact.head_sha = HEAD_8811.to_owned();
-    let record = blocked_on::GateRecord::new(HEAD_8811, None, &queue_8811());
+    let record = blocked_on::GateRecord::new(HEAD_8811, None, &queue_8811(), false);
     let mut ejection = record.ejection.clone().expect("same-head ejection");
     let policy = queue_policy();
     let decision = classify_pr(&pr.fact, &policy, &BTreeMap::new());
@@ -1133,4 +1133,65 @@ fn a_pr_refusal_with_no_repo_error_is_named_in_exit_reasons() {
             .get("exit_reasons")
             .is_none()
     );
+}
+
+/// #11698 at 03:24: `Enforce version & skill sync` red while `macos` still
+/// ran. Under the guard the row reads failed, not pending; the decision still
+/// waits (and never admits), so recovery waits for a settled head.
+#[test]
+fn a_red_required_check_outranks_a_pending_one_in_the_report() {
+    let pr = pr_with(
+        11698,
+        &[],
+        "CLEAN",
+        &json!([
+            {"__typename": "CheckRun", "name": "macos", "status": "IN_PROGRESS",
+             "startedAt": "2026-11-07T03:20:00Z"},
+            {"__typename": "CheckRun", "name": "Enforce version & skill sync",
+             "status": "COMPLETED", "conclusion": "FAILURE",
+             "completedAt": "2026-11-07T03:24:29Z"}
+        ]),
+    );
+    let mut policy = queue_policy();
+    policy.required_checks = ["macos", "Enforce version & skill sync"]
+        .into_iter()
+        .map(|context| RequiredCheck {
+            context: context.to_owned(),
+            app_id: None,
+        })
+        .collect();
+    let read = |policy: &StewardPolicy| {
+        let decision = classify_pr(&pr.fact, policy, &BTreeMap::new());
+        assert!(matches!(decision, StewardDecision::WaitingRequired { .. }));
+        classify(
+            &RowFacts {
+                pr: &pr.fact,
+                decision: &decision,
+                mutation: None,
+                error: None,
+                approval: GateRead::Unread,
+                enqueued_at: None,
+                ejection: None,
+            },
+            policy,
+        )
+        .0
+    };
+    policy.ejection_guards = crate::merge_steward::EjectionGuards::for_base(true);
+    let guarded = read(&policy);
+    assert_eq!(
+        guarded.blocked_on,
+        "required_failed:Enforce version & skill sync"
+    );
+    assert_eq!(guarded.since.as_deref(), Some("2026-11-07T03:24:29Z"));
+    assert!(
+        guarded
+            .blocked_detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("macos")),
+        "{guarded:?}"
+    );
+    // Control: without the guard the same head reads pending.
+    policy.ejection_guards = crate::merge_steward::EjectionGuards::default();
+    assert_eq!(read(&policy).blocked_on, "required_pending");
 }

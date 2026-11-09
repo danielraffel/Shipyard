@@ -155,6 +155,39 @@ impl InternalEnqueueVerdict {
 /// caller's own head-drift check.
 #[must_use]
 pub fn internal_enqueue_verdict(report: &PrQueueReport, head: &str) -> InternalEnqueueVerdict {
+    internal_enqueue_verdict_with(report, head, false)
+}
+
+/// Whether the steward's retry discipline refuses re-enqueuing the unchanged
+/// head after a removal for `reason`: [`same_head_requeue_cascades`], plus
+/// `invalid_merge_commit`.
+///
+/// GitHub removes an `invalid_merge_commit` head at once, and on the same
+/// head it does so again: Generous-Corp/pulp#11698 was re-enqueued three times
+/// in 21 minutes and removed each time, and the one re-enqueue that did build
+/// a merge group failed its checks. Under the discipline the head needs a new
+/// commit (merge the base once), like a `merge_conflict`.
+#[must_use]
+pub fn same_head_requeue_refused_by_discipline(reason: &str) -> bool {
+    same_head_requeue_cascades(reason) || reason.eq_ignore_ascii_case("invalid_merge_commit")
+}
+
+/// [`internal_enqueue_verdict`], with `retry_discipline` also refusing an
+/// unchanged head the queue removed for `invalid_merge_commit`
+/// ([`same_head_requeue_refused_by_discipline`]).
+#[must_use]
+pub fn internal_enqueue_verdict_with(
+    report: &PrQueueReport,
+    head: &str,
+    retry_discipline: bool,
+) -> InternalEnqueueVerdict {
+    let refused = |reason: &str| {
+        if retry_discipline {
+            same_head_requeue_refused_by_discipline(reason)
+        } else {
+            same_head_requeue_cascades(reason)
+        }
+    };
     match &report.state {
         PrQueueState::Unknown { detail } => InternalEnqueueVerdict::Unknown {
             detail: detail.clone(),
@@ -164,7 +197,7 @@ pub fn internal_enqueue_verdict(report: &PrQueueReport, head: &str) -> InternalE
             at,
             new_head_since_removal: false,
             ..
-        } if same_head_requeue_cascades(reason)
+        } if refused(reason)
             && report
                 .head_oid
                 .as_deref()
@@ -1433,5 +1466,62 @@ mod tests {
         let node =
             serde_json::json!({"data": {"node": value["data"]["repository"]["pullRequest"]}});
         assert_eq!(classify_pr_queue_state(&node).class(), "queued");
+    }
+
+    /// #11698's timeline (head 28d1ad64): one `failed_checks`, then three
+    /// immediate `invalid_merge_commit` removals of the unchanged head, each
+    /// re-enqueued by the steward because the last removal "said nothing
+    /// against the head".
+    fn pulp_11698(new_head_after: bool) -> Value {
+        let head = "28d1ad64d883cbf89852906b9096ac7f75fdb65f";
+        let group = "7cea025de6dc8ed1d2dd4de6bb0b8408c9440c71";
+        let base = "a09d5269eda655aaa12726a8fa6808daa47a375a";
+        let mut nodes =
+            vec![serde_json::json!({"__typename":"PullRequestCommit","commit":{"oid":head}})];
+        nodes.push(serde_json::json!({"__typename":"AddedToMergeQueueEvent","createdAt":"2026-11-07T01:06:43Z"}));
+        nodes.push(serde_json::json!({"__typename":"RemovedFromMergeQueueEvent","createdAt":"2026-11-07T02:25:14Z","reason":"failed_checks","beforeCommit":{"oid":group,"parents":{"nodes":[{"oid":base},{"oid":head}]}}}));
+        for (added, removed) in [
+            ("02:33:12", "02:33:27"),
+            ("02:44:30", "02:44:45"),
+            ("02:54:49", "02:55:05"),
+        ] {
+            nodes.push(serde_json::json!({"__typename":"AddedToMergeQueueEvent","createdAt":format!("2026-11-07T{added}Z")}));
+            nodes.push(serde_json::json!({"__typename":"RemovedFromMergeQueueEvent","createdAt":format!("2026-11-07T{removed}Z"),"reason":"invalid_merge_commit","beforeCommit":null}));
+        }
+        let live = if new_head_after {
+            let fix = "b644622a4395220429eeaf5aa1ace84566a37765";
+            nodes.push(serde_json::json!({"__typename":"HeadRefForcePushedEvent","createdAt":"2026-11-07T03:54:57Z","afterCommit":{"oid":fix}}));
+            fix
+        } else {
+            head
+        };
+        serde_json::json!({"data":{"repository":{"pullRequest":{
+            "number":11698,"state":"OPEN","headRefOid":live,"isInMergeQueue":false,
+            "mergeQueueEntry":null,"autoMergeRequest":null,
+            "timelineItems":{"pageInfo":{"hasPreviousPage":false},"nodes":nodes}}}}})
+    }
+
+    #[test]
+    fn the_retry_discipline_refuses_an_invalid_merge_commit_head() {
+        let head = "28d1ad64d883cbf89852906b9096ac7f75fdb65f";
+        let report = explain_pr_queue_state(&pulp_11698(false));
+        // Without the discipline the last removal admits the same head again.
+        assert_eq!(
+            internal_enqueue_verdict(&report, head),
+            InternalEnqueueVerdict::Admit
+        );
+        assert!(matches!(
+            internal_enqueue_verdict_with(&report, head, true),
+            InternalEnqueueVerdict::RefuseEjectedSameHead { reason, .. }
+                if reason == "invalid_merge_commit"
+        ));
+        // A new head is a different head.
+        let fixed = explain_pr_queue_state(&pulp_11698(true));
+        assert_eq!(
+            internal_enqueue_verdict_with(&fixed, "b644622a4395220429eeaf5aa1ace84566a37765", true),
+            InternalEnqueueVerdict::Admit
+        );
+        assert!(same_head_requeue_refused_by_discipline("merge_conflict"));
+        assert!(!same_head_requeue_refused_by_discipline("manual"));
     }
 }

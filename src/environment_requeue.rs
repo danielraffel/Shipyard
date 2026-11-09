@@ -126,6 +126,31 @@ pub const ENVIRONMENT_SIGNATURES: [&str; 13] = [
 /// was.
 pub const INTERRUPTION_SIGNATURES: [&str; 1] = ["Upload progress stalled"];
 
+/// Failing-step lines that name an infrastructure failure, read only under
+/// the steward's retry discipline ([`assess_with`] `infra_only`): GitHub's own
+/// step-timeout line, an HTTP 5xx or rate-limit answer from a download, and
+/// the runner's own shutdown lines. Exact spellings from real merge-group
+/// logs (Generous-Corp/pulp, 2026-11-03..09), never the bare words `timeout`
+/// or `500`, which a test prints when the head is at fault. A test-level
+/// timeout (ctest `***Timeout`) is deliberately absent: a head can introduce
+/// a hang that only the merged tree exercises.
+pub const INFRA_STEP_SIGNATURES: [&str; 14] = [
+    "has timed out after",
+    "rate limit exceeded",
+    "HTTP Error 500",
+    "HTTP Error 502",
+    "HTTP Error 503",
+    "HTTP Error 504",
+    "The requested URL returned error: 500",
+    "The requested URL returned error: 502",
+    "The requested URL returned error: 503",
+    "The requested URL returned error: 504",
+    "502 Bad Gateway",
+    "503 Service Unavailable",
+    "The runner has received a shutdown signal",
+    "lost communication with the server",
+];
+
 /// A required job cancelled before any runner took it is starved only after
 /// it waited this long. A shorter no-runner cancel is a superseding push or a
 /// concurrency-group cancel, which says nothing about capacity.
@@ -307,6 +332,24 @@ pub fn read_failing_step(log: &str, started_at: &str) -> StepReading {
     }
 }
 
+/// The first [`INFRA_STEP_SIGNATURES`] line within
+/// [`FAILURE_PROXIMITY_LINES`] of the failing step's own error, searching
+/// back from it. Script echo is never read ([`failing_step_output`]).
+#[must_use]
+pub fn infra_signature_at_failure(log: &str, started_at: &str) -> Option<SignatureHit> {
+    let output = failing_step_output(log, started_at)?;
+    let tail = &output[output.len().saturating_sub(FAILURE_PROXIMITY_LINES)..];
+    tail.iter().rev().find_map(|line| {
+        INFRA_STEP_SIGNATURES
+            .iter()
+            .find(|signature| line.contains(**signature))
+            .map(|signature| SignatureHit {
+                signature: (*signature).to_owned(),
+                line: line.trim().chars().take(240).collect(),
+            })
+    })
+}
+
 /// An [`INTERRUPTION_SIGNATURES`] line on the step's own `##[error]` line or
 /// the line just before it. Only the failure itself counts: an earlier,
 /// recovered stall says nothing about why the step failed.
@@ -371,6 +414,10 @@ pub struct StepEvidence {
     /// What its output says.
     #[serde(flatten)]
     pub reading: StepReading,
+    /// An [`INFRA_STEP_SIGNATURES`] line near the step's failure, when one
+    /// is there. Consulted only under the retry discipline.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub infra: Option<SignatureHit>,
 }
 
 impl StepEvidence {
@@ -453,6 +500,9 @@ pub enum FailureAttribution {
     HeadCaused(String),
     /// None of the reads could place it.
     Unknown(String),
+    /// Under the retry discipline: no infrastructure signature explains it,
+    /// so whether it passed on the head or fails on the base is not read.
+    NoInfraSignature(String),
 }
 
 impl FailureAttribution {
@@ -472,6 +522,7 @@ impl FailureAttribution {
             Self::PassedOnHead(detail) => ("passed on head", detail),
             Self::HeadCaused(detail) => ("head-caused", detail),
             Self::Unknown(detail) => ("unknown", detail),
+            Self::NoInfraSignature(detail) => ("no infrastructure signature", detail),
         }
     }
 }
@@ -739,6 +790,10 @@ fn read_job(
                 .map_or(StepReading::NotLocated, |started| {
                     read_failing_step(&log, started)
                 }),
+            infra: step
+                .get("started_at")
+                .and_then(Value::as_str)
+                .and_then(|started| infra_signature_at_failure(&log, started)),
         })
         .collect())
 }
@@ -755,6 +810,26 @@ pub fn assess(
     repo: &str,
     report: &PrQueueReport,
     opted_in: bool,
+) -> Option<EnvironmentRequeue> {
+    assess_with(run_gh, repo, report, opted_in, false)
+}
+
+/// [`assess`], with `infra_only` applying the steward's retry discipline
+/// ([`crate::merge_steward::EjectionGuards::infra_only_retry`]): the
+/// not-head-caused retry is allowed only when every failing required check
+/// is an infrastructure failure ([`FailureAttribution::Infra`]: a runner
+/// conclusion or `cancelled`, a lost-runner annotation, or an environment,
+/// interruption or [`INFRA_STEP_SIGNATURES`] line at the failing step).
+/// "Passed on the head" and "fails on the base" no longer earn it: on Pulp
+/// every merge-group-only failure passed on its head, and 9 of 23 same-head
+/// retries failed again the same way.
+#[must_use]
+pub fn assess_with(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    report: &PrQueueReport,
+    opted_in: bool,
+    infra_only: bool,
 ) -> Option<EnvironmentRequeue> {
     if !applies(report) {
         return None;
@@ -798,10 +873,12 @@ pub fn assess(
             None,
         ));
     };
-    Some(match assess_merge_group(run_gh, repo, report, &sha) {
-        Ok(verdict) => verdict,
-        Err(detail) => EnvironmentRequeue::refuse(detail, commit),
-    })
+    Some(
+        match assess_merge_group(run_gh, repo, report, &sha, infra_only) {
+            Ok(verdict) => verdict,
+            Err(detail) => EnvironmentRequeue::refuse(detail, commit),
+        },
+    )
 }
 
 fn assess_merge_group(
@@ -809,6 +886,7 @@ fn assess_merge_group(
     repo: &str,
     report: &PrQueueReport,
     sha: &str,
+    infra_only: bool,
 ) -> Result<EnvironmentRequeue, String> {
     let pr = report
         .pr
@@ -864,7 +942,7 @@ fn assess_merge_group(
         .iter()
         .map(|check| CheckAttribution {
             check: check.name.clone(),
-            attribution: attribute(run_gh, repo, base, head, check, &evidence),
+            attribution: attribute(run_gh, repo, base, head, check, &evidence, infra_only),
         })
         .collect::<Vec<_>>();
     Ok(verdict_from_attribution(
@@ -903,6 +981,7 @@ fn read_signatures(
                 step: "(queued)".to_owned(),
                 reading: starved_job(&job, &annotations)
                     .map_or(StepReading::NoSignature, StepReading::Interruption),
+                infra: None,
             });
             continue;
         }
@@ -926,28 +1005,38 @@ fn attribute(
     head: &str,
     check: &FailedCheck,
     evidence: &[StepEvidence],
+    infra_only: bool,
 ) -> FailureAttribution {
     let steps = evidence
         .iter()
         .filter(|step| step.check == check.name)
         .collect::<Vec<_>>();
-    if !steps.is_empty()
-        && steps.iter().all(|step| {
-            matches!(
-                step.reading,
-                StepReading::Environment(_) | StepReading::Interruption(_)
-            )
-        })
-    {
+    let step_is_infra = |step: &&StepEvidence| {
+        matches!(
+            step.reading,
+            StepReading::Environment(_) | StepReading::Interruption(_)
+        ) || (infra_only && step.infra.is_some())
+    };
+    if !steps.is_empty() && steps.iter().all(step_is_infra) {
         return FailureAttribution::Infra(
             steps
                 .iter()
-                .map(|step| step.render())
+                .map(|step| match (&step.reading, &step.infra) {
+                    (StepReading::Environment(_) | StepReading::Interruption(_), _) | (_, None) => {
+                        step.render()
+                    }
+                    (_, Some(hit)) => format!(
+                        "{} / {} [job {}]: infrastructure ({}): {}",
+                        step.check, step.step, step.job_id, hit.signature, hit.line
+                    ),
+                })
                 .collect::<Vec<_>>()
                 .join("; "),
         );
     }
-    if INFRA_CONCLUSIONS.contains(&check.conclusion.as_str()) {
+    if INFRA_CONCLUSIONS.contains(&check.conclusion.as_str())
+        || (infra_only && check.conclusion == "cancelled")
+    {
         return FailureAttribution::Infra(format!(
             "concluded `{}` on the merge group",
             check.conclusion
@@ -961,6 +1050,13 @@ fn attribute(
         && let Some(message) = runner_lost(&annotations)
     {
         return FailureAttribution::Infra(format!("[job {job_id}] {message}"));
+    }
+    if infra_only {
+        return FailureAttribution::NoInfraSignature(format!(
+            "`{}` on the merge group with no runner, network, timeout, HTTP 5xx, rate-limit or \
+             download signature at its failure; a same-head retry would re-run it",
+            check.conclusion
+        ));
     }
     let on_base = latest_conclusion(run_gh, repo, base, &check.name);
     if let Ok(Some(conclusion)) = &on_base

@@ -134,14 +134,24 @@ pub(super) struct GateRecord {
 impl GateRecord {
     /// Record one gate read of `head` with the queue state it read.
     #[must_use]
-    pub fn new(head: &str, blocker: Option<ApprovalBlocker>, queue: &serde_json::Value) -> Self {
+    pub fn new(
+        head: &str,
+        blocker: Option<ApprovalBlocker>,
+        queue: &serde_json::Value,
+        retry_discipline: bool,
+    ) -> Self {
         let report = crate::pr_queue_state::explain_pr_queue_state(queue);
-        let ejection = match crate::pr_queue_state::internal_enqueue_verdict(&report, head) {
+        let ejection = match crate::pr_queue_state::internal_enqueue_verdict_with(
+            &report,
+            head,
+            retry_discipline,
+        ) {
             crate::pr_queue_state::InternalEnqueueVerdict::RefuseEjectedSameHead { reason, at } => {
                 Some(SameHeadEjection {
                     reason,
                     at,
                     retry: None,
+                    needs_new_head: retry_discipline,
                 })
             }
             _ => None,
@@ -165,6 +175,22 @@ pub(super) struct SameHeadEjection {
     /// The one not-head's-fault retry verdict, when it was assessed
     /// ([`crate::environment_requeue::assess`]).
     pub retry: Option<SameHeadRetry>,
+    /// Read under the retry discipline: a refused head is reported
+    /// `ejected_same_head:<reason>:needs_new_head`.
+    pub needs_new_head: bool,
+}
+
+impl SameHeadEjection {
+    /// The `ejected_same_head:` argument: the reason, and under the retry
+    /// discipline the `needs_new_head` suffix.
+    #[must_use]
+    pub fn cause(&self) -> String {
+        if self.needs_new_head {
+            format!("{}:{}", self.reason, super::pr_mutations::NEEDS_NEW_HEAD)
+        } else {
+            self.reason.clone()
+        }
+    }
 }
 
 /// Whether an ejected head gets its one automatic re-enqueue, and why.
@@ -295,10 +321,9 @@ fn classify_token(facts: &RowFacts<'_>, policy: &StewardPolicy) -> (Stall, Since
             None,
             SinceHint::HeadPushed,
         ),
-        StewardDecision::WaitingRequired { contexts } => {
-            approval_context_only(facts, policy, contexts, false)
-                .unwrap_or_else(|| waiting_required(pr, policy, contexts))
-        }
+        StewardDecision::WaitingRequired { contexts } => red_while_pending(pr, policy, contexts)
+            .or_else(|| approval_context_only(facts, policy, contexts, false))
+            .unwrap_or_else(|| waiting_required(pr, policy, contexts)),
         StewardDecision::RequiredFailed { contexts } => {
             approval_context_only(facts, policy, contexts, true).unwrap_or_else(|| {
                 let since = latest_check_time(pr, policy, contexts);
@@ -330,6 +355,33 @@ fn classify_token(facts: &RowFacts<'_>, policy: &StewardPolicy) -> (Stall, Since
     }
 }
 
+/// Under [`crate::merge_steward::EjectionGuards::red_outranks_pending`], a
+/// head that waits on running checks but already has a red required check
+/// reads `required_failed:<red>`, with the still-running contexts in
+/// `blocked_detail`. The approval context alone is left to its own token.
+fn red_while_pending(
+    pr: &StewardPullRequest,
+    policy: &StewardPolicy,
+    pending: &[String],
+) -> Option<(Stall, SinceHint)> {
+    if !policy.ejection_guards.red_outranks_pending {
+        return None;
+    }
+    let red = crate::merge_steward::failed_required_contexts(pr, policy);
+    if red.is_empty() || only_approval_contexts(policy, &red) {
+        return None;
+    }
+    Some(dated(
+        format!("required_failed:{}", context_names(policy, &red)),
+        latest_check_time(pr, policy, &red),
+        "check_completed",
+        Some(format!(
+            "red while {} still run(s); never admitted red",
+            context_names(policy, pending)
+        )),
+    ))
+}
+
 /// A head every required check passed: what the admission attempt found.
 fn arm_candidate(facts: &RowFacts<'_>, policy: &StewardPolicy) -> (Stall, SinceHint) {
     let green_since = || latest_check_time(facts.pr, policy, &required_labels(policy));
@@ -337,27 +389,11 @@ fn arm_candidate(facts: &RowFacts<'_>, policy: &StewardPolicy) -> (Stall, SinceH
         .mutation
         .map(|mutation| mutation.split(',').collect())
         .unwrap_or_default();
-    // The queue's own verdict on this exact head outranks the approval: a
-    // dry run and an apply pass both read it from the gate's queue state.
-    // A head the classifier clears for its one retry is an ordinary
-    // admission candidate; every other ejection names the classifier's
-    // reason (the failing job, and whether the retry is spent).
-    if let Some(ejection) = facts
-        .ejection
-        .filter(|ejection| !ejection.retry.as_ref().is_some_and(|retry| retry.allowed))
-    {
-        return ejected(
-            &ejection.reason,
-            ejection.at.clone(),
-            green_since(),
-            ejection.retry.as_ref().map(|retry| retry.detail.clone()),
-        );
+    if let Some(row) = ejection_row(facts, &parts, green_since) {
+        return row;
     }
-    if let Some(cause) = parts
-        .iter()
-        .find_map(|part| part.strip_prefix("skipped_ejected_same_head:"))
-    {
-        return ejected(cause, None, green_since(), None);
+    if let Some((token, detail)) = generated_path_wait(&parts) {
+        return green(token, green_since(), detail);
     }
     if let Some(part) = parts.iter().find(|part| {
         part.starts_with("carries_unapproved_commits")
@@ -439,6 +475,50 @@ fn arm_candidate(facts: &RowFacts<'_>, policy: &StewardPolicy) -> (Stall, SinceH
         green_since(),
         facts.mutation.map(str::to_owned),
     )
+}
+
+/// The queue's own verdict on this exact head outranks the approval: a dry
+/// run and an apply pass both read it from the gate's queue state. A head the
+/// classifier clears for its one retry is an ordinary admission candidate;
+/// every other ejection names the classifier's reason (the failing job, and
+/// whether the retry is spent).
+fn ejection_row(
+    facts: &RowFacts<'_>,
+    parts: &[&str],
+    green_since: impl Fn() -> Option<String>,
+) -> Option<(Stall, SinceHint)> {
+    if let Some(ejection) = facts
+        .ejection
+        .filter(|ejection| !ejection.retry.as_ref().is_some_and(|retry| retry.allowed))
+    {
+        return Some(ejected(
+            &ejection.cause(),
+            ejection.at.clone(),
+            green_since(),
+            ejection.retry.as_ref().map(|retry| retry.detail.clone()),
+        ));
+    }
+    parts
+        .iter()
+        .find_map(|part| part.strip_prefix("skipped_ejected_same_head:"))
+        .map(|cause| ejected(cause, None, green_since(), None))
+}
+
+/// A `generated_path_batch:#<n>` deferral among the mutation parts: the
+/// token and the detail naming the shared paths.
+fn generated_path_wait(parts: &[&str]) -> Option<(String, Option<String>)> {
+    let (token, shared) = parts
+        .iter()
+        .find_map(|part| super::generated_paths::parse_token(part))?;
+    Some((
+        token,
+        shared.map(|shared| {
+            format!(
+                "shares generated path(s) {shared} with that queued entry; admitted on the first \
+                 pass after it leaves the queue"
+            )
+        }),
+    ))
 }
 
 fn admitted(mutation: Option<&str>) -> bool {
@@ -800,12 +880,14 @@ pub(super) fn annotate(
             && let Ok((_, queue, blocker)) =
                 super::pr_mutations::read_head_gate_for_report(actions, observation, pr, ledger)
         {
-            let mut record = GateRecord::new(&pr.fact.head_sha, blocker, &queue);
+            let discipline = policy.ejection_guards.infra_only_retry;
+            let mut record = GateRecord::new(&pr.fact.head_sha, blocker, &queue, discipline);
             if let Some(ejection) = record.ejection.as_mut() {
                 ejection.retry = super::pr_mutations::same_head_retry_verdict(
                     actions,
                     observation,
                     &crate::pr_queue_state::explain_pr_queue_state(&queue),
+                    discipline,
                 )
                 .as_ref()
                 .map(SameHeadRetry::from_verdict);

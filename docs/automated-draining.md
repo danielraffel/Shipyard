@@ -360,11 +360,13 @@ not listed as blocked.
 | `excluded_label:<label>` | `superseded`, `PARKED/<platform>` or the opt-out label | whoever owns the label |
 | `provenance_blocked:<labels>` | A provenance-blocking label | owner |
 | `required_never_ran:<contexts>` | A required context has no run on this head and nothing from its source is still queued or running (often a renamed check: merge the base to re-run CI) | repair lane |
-| `required_pending` | Required checks are queued or running, or have not appeared yet behind a running job. A `pending` `review-verdict` status (head awaiting its reviewer) also reads here, with the reviewer as actor, never as `required_failed` | CI, or the reviewer |
-| `required_failed:<contexts>` | A required check failed. When the only red context is the approval context (`review-verdict`), the row names the approval token instead; an apply pass that did not read the gate for that head keeps this token and says so in `blocked_detail` | author or repair lane |
+| `required_pending` | Required checks are queued or running, or have not appeared yet behind a running job, and none has failed. A `pending` `review-verdict` status (head awaiting its reviewer) also reads here, with the reviewer as actor, never as `required_failed` | CI, or the reviewer |
+| `required_failed:<contexts>` | A required check failed. On a merge-queue base (`red_check_outranks_pending`, see [Ejection guards](#ejection-guards)) this outranks `required_pending`: a red head reads failed while its other checks still run. No red required check is ever admitted, whichever token it reads. When the only red context is the approval context (`review-verdict`), the row names the approval token instead; an apply pass that did not read the gate for that head keeps this token and says so in `blocked_detail` | author or repair lane |
 | `transient_rerun` | The steward is rerunning an interrupted check | steward |
 | `merge_state:<STATE>` | GitHub says `DIRTY`, `BEHIND`, `UNSTABLE`, ... | repair lane: merge the base |
 | `ejected_same_head:<cause>` | The queue ejected this exact head and the steward will not re-enqueue it: the failure is the head's, could not be placed, or the head's one retry is spent. `blocked_detail` carries the classifier's reason (the failing job and whether the retry was spent). Read from the same queue state in a dry run and an apply pass; `since` is the removal | repair lane |
+| `ejected_same_head:<cause>:needs_new_head` | The same, under the retry discipline ([Ejection guards](#ejection-guards)): `<cause>` is `failed_checks` with no infrastructure signature, `merge_conflict`, or `invalid_merge_commit`. Only a new head moves it; for `invalid_merge_commit` or `merge_conflict`, merge the base once and push once | author or repair lane |
+| `generated_path_batch:#<n>` | Approved and green, but this head changes a generated path (`[auto_merge] generated_paths`) that queued entry `#<n>` also changes; `blocked_detail` names the shared paths. Not an error: the steward admits it on the first pass after `#<n>` leaves the queue | steward (nothing to do) |
 | `waiting_full_test_tier`, `waiting_enqueue_requirements` | Admission waits on a deferred check tier or a GitHub requirement | CI |
 | `carries_unapproved_commits:#Q` | Approved and green, but carries commits of open pull request #Q, whose head is not approved; `blocked_detail` names the commits | Q's reviewer, or the author: drop Q's commits |
 | `carried_commits_over_cap:#N`, `carried_commits_unreadable` | Whether the head carries unapproved commits could not be proven (an unapproved #N whose own diff is over 250 commits while P has more than 50 commits to probe and #N's head reaches a root of P's commits, or P's commits have more than 50 roots; for a P over 250 commits, an unapproved #N whose own commits are over 250, have more than 50 roots, or exceed P's 100 probes; or a failed read) | author, or next pass |
@@ -408,6 +410,69 @@ Reads are a full admission pass, so the default `--poll-interval` is 120
 seconds for this state. The ledger used for transient-rerun budgets is the
 local one; on the steward host it is the steward's own.
 
+## Ejection guards
+
+An ejected pull request costs the batch it broke a rebuild and costs itself
+hours: on Generous-Corp/pulp over one week (2026-11-02..09) an ejected pull
+request took a median of 231 minutes from first entry to merge, against 31
+minutes for one that merged first time. Of 59 ejections, 19 were two batch-mates
+changing the same generated file, 18 were flakes or infrastructure, and 4 were
+`invalid_merge_commit` (one head re-enqueued three times in 21 minutes). The
+steward runs three guards against what it can see coming. Each is a key in the
+**base** branch's `.shipyard/config.toml` `[auto_merge]` table (never read from a
+head) and each defaults **on** for a base with a merge queue, off otherwise:
+
+```toml
+[auto_merge]
+generated_paths = [                       # globs: `**` whole segments, `*` within one
+  "test/ctest_script_inputs.json",
+  "test/ctest_script_inputs/**",
+]
+generated_path_batch_guard = true         # default: on with a merge queue
+red_check_outranks_pending = true         # default: on with a merge queue
+infra_only_same_head_retry = true         # default: on with a merge queue
+```
+
+- **Generated-path batch guard.** Before an enqueue the steward reads the
+  candidate's changed files (one GraphQL `files(first:100)` page, cached for the
+  pass; paged to GitHub's 3000-file limit only for a larger pull request). When
+  it changes a generated path, the steward re-reads the queue live and reads
+  each queued entry's files; the first entry that changes the same path defers
+  the candidate as `generated_path_batch:#<n>`, with no mutation and no error.
+  It is admitted on the first pass after `#<n>` leaves the queue. A file list
+  that cannot be read never admits (`steward_error`); one that is still
+  incomplete after paging is compared by the other side's generated paths, so
+  it can only defer. Two different files under one glob (two shards) do not
+  collide; only the same path does. With no `generated_paths` the guard never
+  defers.
+- **A red required check outranks a pending one.** A head with a failed
+  required check reports `blocked_on=required_failed:<contexts>` (the running
+  contexts in `blocked_detail`) even while another required check is still
+  running, instead of `required_pending`. Only the report changes: admission
+  still waits, and the recovery worker still waits for a settled head before
+  it asks an agent. Every enqueue already re-reads the head's
+  checks live and refuses any red required check; Generous-Corp/pulp#11698's
+  red version check (cited as "armed red") went red at 03:21, after its last
+  enqueue at 03:05. What re-enqueued it was the next guard's gap.
+- **Retry discipline.** The one free same-head re-enqueue after a
+  `failed_checks` ejection is spent only on an infrastructure signature: a
+  runner conclusion (`timed_out`, `startup_failure`, `stale`) or `cancelled`, a
+  lost-runner annotation, a network or interruption signature, or, at the
+  failing step's own error, GitHub's step-timeout line (`has timed out after`),
+  an HTTP 5xx or `rate limit exceeded` download answer, or the runner's own
+  shutdown lines (`INFRA_STEP_SIGNATURES` in `src/environment_requeue.rs`). A
+  check that merely passed on the head, or also fails on the base tip, is not
+  retried: on Pulp every merge-group-only failure passed on its head, and 9 of
+  23 same-head retries failed again. A ctest-level `***Timeout` is not an
+  infrastructure line. `invalid_merge_commit` is never re-enqueued on the same
+  head (before, it reset the refusal: #11698 went `failed_checks`, then three
+  immediate `invalid_merge_commit` removals, each re-enqueued). Every refusal
+  reads `ejected_same_head:<cause>:needs_new_head`.
+
+Turn one off by setting its key to `false` in the base's config. An unreadable
+config keeps them at their merge-queue defaults with no generated paths, and
+the enqueue's own approval read refuses an unreadable config anyway.
+
 ## Things that bite
 
 These came from running it for real:
@@ -441,8 +506,11 @@ These came from running it for real:
   re-enqueues the same head once, through its exact-head path with the
   approval read live, when every failing required check on the ejecting merge
   group is a runner failure (`timed_out`, `startup_failure`, `stale`, a
-  lost-runner annotation, or a network signature), is also failing on the base
-  tip, or passed on the head itself; a check that passed on the base tip and
+  lost-runner annotation, or a network signature). On a base without the retry
+  discipline it also retries a check that is failing on the base tip or passed
+  on the head itself; on a merge-queue base the discipline is on by default and
+  those stay `ejected_same_head:failed_checks:needs_new_head` (see
+  [Ejection guards](#ejection-guards)). A check that passed on the base tip and
   not on the head, an unplaceable one, or a second ejection of the same head
   (counted from GitHub's own removal events) stays `ejected_same_head:<cause>`
   for repair.
