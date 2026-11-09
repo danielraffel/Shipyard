@@ -5941,3 +5941,8 @@ validation failures are not retried. Deadline-bound observations retain their
 existing deadline. An enqueue mutation returning HTTP 502 has an unknown
 outcome: read back the live queue before reconciliation; these read retries do
 not authorize repeating an enqueue.
+
+The PR owner marker (`<!-- shipyard-owner: ... sid=<id> ... -->`) writes the
+session id as `sid=`, never `session=`: the ghapp stamp guard refuses any body
+comment containing the word "session" as a possible reviewer stamp. Readers
+still accept the legacy `session=` key.

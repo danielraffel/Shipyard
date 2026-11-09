@@ -344,3 +344,52 @@ fn a_push_without_a_surface_never_displaces_a_reachable_owner() {
     assert!(push_takes_over(Some(&released), &headless));
     assert!(push_takes_over(None, &headless));
 }
+
+/// The `ghapp` wrapper refuses a body whose `<!-- ... -->` text contains
+/// "session" in any case, so a marker must never spell it.
+fn ghapp_would_refuse(text: &str) -> bool {
+    text.split("!--").skip(1).any(|rest| {
+        rest.split('>')
+            .next()
+            .is_some_and(|c| c.to_ascii_lowercase().contains("session"))
+    })
+}
+
+#[test]
+fn the_marker_never_carries_the_word_the_ghapp_stamp_guard_refuses() {
+    let mut record = record();
+    let marker = render_marker(&record);
+    assert!(marker.contains("sid=thread-1"), "{marker}");
+    assert!(!ghapp_would_refuse(&marker), "{marker}");
+
+    // A value that spells the word stays out of the marker, not the record.
+    record.agent = Some("Session-3".to_owned());
+    record.cmux_socket = Some("/tmp/cmux-session.sock".to_owned());
+    let marker = render_marker(&record);
+    assert!(!ghapp_would_refuse(&marker), "{marker}");
+    assert_eq!(record.agent.as_deref(), Some("Session-3"));
+    assert!(ghapp_would_refuse("<!-- session: m3/abc -->"));
+}
+
+#[test]
+fn a_marker_written_with_the_old_session_key_still_parses() {
+    let old = "text\n<!-- shipyard-owner: host=m5 client=codex surface=S1 session=thread-1 at=2026-11-09T12:05:00Z -->";
+    let parsed = parse_marker("o/r", 1, old).expect("parses");
+    assert_eq!(parsed.session.as_deref(), Some("thread-1"));
+    let current = render_marker(&record());
+    let parsed = parse_marker("o/r", 1, &current).expect("parses");
+    assert_eq!(parsed.session.as_deref(), Some("thread-1"));
+    // Rewriting an old marker replaces it, so the body stops carrying the key.
+    let next = upsert_marker(old, &current).expect("replaced");
+    assert!(!next.contains("session="));
+}
+
+#[test]
+fn a_value_left_out_of_the_marker_does_not_make_the_address_look_changed() {
+    let mut local = record();
+    local.cmux_socket = Some("/tmp/cmux-session.sock".to_owned());
+    let marker = render_marker(&local);
+    let mut read = parse_marker("Generous-Corp/pulp", 11796, &marker).expect("parses");
+    read.registered_at = at(30);
+    assert!(same_address(&read, &local), "{marker}");
+}
