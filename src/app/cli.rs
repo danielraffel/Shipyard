@@ -541,6 +541,30 @@ pub(super) enum Command {
         #[command(subcommand)]
         command: RollupCommand,
     },
+    /// Pull requests that have sat in one blocked state past its dwell
+    /// limit, with the next action, owner and any act taken. Read-only.
+    ///
+    /// Reads the snapshot the merge steward's last `--apply` pass wrote
+    /// (`<state>/steward-dwell/<repo>.json`); never reads GitHub. Limits come
+    /// from `[auto_merge.dwell]` in the base's `.shipyard/config.toml`.
+    /// Without `--repo`, every repository the steward wrote a snapshot for.
+    Overdue {
+        /// Exact OWNER/REPO.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+    },
+    /// The pull requests closest to mergeable, in the order the merge
+    /// steward admits them, with the single action each needs. Read-only.
+    ///
+    /// Approved stack bases first, then approved and green, approved with
+    /// checks running, green but needing a review, then the rest; within a
+    /// tier, more unblocked pull requests first. Reads the steward's last
+    /// snapshot; never reads GitHub.
+    Next {
+        /// Exact OWNER/REPO.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+    },
     /// Which host and agent session armed, enqueued, merged or removed a
     /// pull request. Read-only.
     ///

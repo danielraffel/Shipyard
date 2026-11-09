@@ -42,6 +42,29 @@ PR. Fleet-pass verifies the named parent and head only when deciding whether to
 retarget; a forged, stale, closed, or unreadable parent is reported and never
 retargeted automatically.
 
+## Overdue pull requests and what lands next: `shipyard overdue`, `shipyard next`
+
+Before guessing what to work on, read the steward's own answer:
+`shipyard next [--repo R] [--json]` lists the five pull requests closest to
+mergeable (stack bases first, then approved green, approved pending, green
+needing review; a stack base must itself be approved to rank first), each
+with the single thing it needs; `shipyard overdue`
+lists every pull request past its `[auto_merge.dwell]` limit with its owner
+route and any act taken. Both read the snapshot the steward's last `--apply`
+pass wrote and print its age; neither costs GitHub API budget. The steward
+takes only contract-allowed acts (re-run a stale `review-verdict` after a live
+gate read, dispatch a never-ran required check from the base's
+`[auto_merge.dwell.dispatch]` map, evaluate an overstayed approved head first,
+retarget a stack whose parent merged from its exact base branch), each after a
+live re-read of the pull request, at most three per pass, once per pull
+request, state and head, and ships them in `shadow` until the base sets
+`act = "apply"`. It never
+touches a DIRTY or held head and never arms. Gotcha: stacked pull requests are
+seen only through the open-pull-request listing the carried-commit check reads
+in the same pass, so a pass with no admission candidate holds stacked entries
+(`stack_listing: not_read_this_pass`) rather than reading GitHub again. Full
+reference: `docs/automated-draining.md`, "Dwell-time limits".
+
 ## Durable work-item contract
 
 Shipyard's existing ShipState/lease/receipt primitives are the source of

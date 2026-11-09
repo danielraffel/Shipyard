@@ -59,20 +59,12 @@ pub(crate) fn relay_paths(state_dir: &Path, mode: Mode) -> (PathBuf, PathBuf, Pa
 }
 
 /// The steward's newest tick report for `repo` in `dir`, when no older than
-/// `max_age`, reduced to per-PR next actions.
-pub(crate) fn steward_actions(
-    dir: Option<&Path>,
-    repo: &str,
-    max_age: Duration,
-) -> BTreeMap<u64, (String, String)> {
-    let Some(dir) = dir else {
-        return BTreeMap::new();
-    };
+/// `max_age`.
+fn newest_steward_report(dir: Option<&Path>, repo: &str, max_age: Duration) -> Option<Value> {
+    let dir = dir?;
     let prefix = format!("{}-", repo.replace('/', "_"));
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return BTreeMap::new();
-    };
-    let newest = entries
+    let newest = std::fs::read_dir(dir)
+        .ok()?
         .flatten()
         .map(|entry| entry.path())
         .filter(|path| {
@@ -81,22 +73,40 @@ pub(crate) fn steward_actions(
                 .is_some_and(|n| n.starts_with(&prefix))
                 && path.extension().is_some_and(|ext| ext == "json")
         })
-        .max();
-    let Some(path) = newest else {
-        return BTreeMap::new();
-    };
-    let fresh = std::fs::metadata(&path)
+        .max()?;
+    let fresh = std::fs::metadata(&newest)
         .and_then(|m| m.modified())
         .ok()
         .and_then(|modified| SystemTime::now().duration_since(modified).ok())
         .is_some_and(|age| age <= max_age);
     if !fresh {
-        return BTreeMap::new();
+        return None;
     }
-    std::fs::read_to_string(&path)
+    std::fs::read_to_string(&newest)
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+}
+
+/// The steward's newest tick report for `repo` in `dir`, when no older than
+/// `max_age`, reduced to per-PR next actions.
+pub(crate) fn steward_actions(
+    dir: Option<&Path>,
+    repo: &str,
+    max_age: Duration,
+) -> BTreeMap<u64, (String, String)> {
+    newest_steward_report(dir, repo, max_age)
         .map(|report| crate::relay::steward_next_actions(&report))
+        .unwrap_or_default()
+}
+
+/// The same report's overdue rows ([`crate::relay::steward_overdue`]).
+pub(crate) fn steward_overdue(
+    dir: Option<&Path>,
+    repo: &str,
+    max_age: Duration,
+) -> BTreeMap<u64, Vec<crate::relay::RelayEvent>> {
+    newest_steward_report(dir, repo, max_age)
+        .map(|report| crate::relay::steward_overdue(&report))
         .unwrap_or_default()
 }
 
@@ -223,6 +233,7 @@ pub(super) fn relay_command<W: Write>(
                     .map_err(|error| error.to_string())
             };
             let steward = |repo: &str| steward_actions(tick_dir.as_deref(), repo, tick_age);
+            let steward_overdue = |repo: &str| steward_overdue(tick_dir.as_deref(), repo, tick_age);
             let one = std::slice::from_ref(repo);
             // State first, then the record: a crash between them loses a log
             // line, never sends a message twice.
@@ -242,6 +253,7 @@ pub(super) fn relay_command<W: Write>(
                 gh: &gh,
                 runner: &runner,
                 steward: &steward,
+                steward_overdue: &steward_overdue,
                 persist: Some(&persist),
             };
             let report = run_pass(&input, &mut state);

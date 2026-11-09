@@ -624,6 +624,17 @@ pub(super) struct PassCache {
     graphs: GraphCache,
 }
 
+impl PassCache {
+    /// The open-pull-request listing this pass read, when it read one: the
+    /// dwell step reuses it to see stacked pull requests at no extra cost.
+    pub(super) fn take_open(&mut self) -> Option<Vec<OpenPr>> {
+        match self.open.take() {
+            Some(Ok(open)) => Some(open),
+            _ => None,
+        }
+    }
+}
+
 /// Commit graphs read this pass, by `(base, head)`.
 type GraphCache = BTreeMap<(String, String), Result<CommitGraph, String>>;
 
