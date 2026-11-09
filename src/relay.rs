@@ -161,6 +161,17 @@ pub(crate) enum RelayEvent {
         base_pr: Option<u64>,
         head: String,
     },
+    /// The steward's dwell limit for the pull request's state passed
+    /// (`shipyard overdue`). One per state, head and escalation level.
+    Overdue {
+        state: String,
+        head: String,
+        level: u32,
+        #[serde(default)]
+        age_minutes: i64,
+        #[serde(default)]
+        limit_minutes: u32,
+    },
 }
 
 impl RelayEvent {
@@ -187,6 +198,7 @@ impl RelayEvent {
             Self::DirtyAfterBaseMove { .. } => "dirty_after_base_move",
             Self::ClaimTaken { .. } => "claim_taken",
             Self::StackedBaseMerged { .. } => "stacked_base_merged",
+            Self::Overdue { .. } => "overdue",
         }
     }
 
@@ -217,6 +229,9 @@ impl RelayEvent {
                     base_pr.map_or("?".to_owned(), |n| n.to_string())
                 )
             }
+            Self::Overdue {
+                state, head, level, ..
+            } => format!("{head}:{state}:{level}"),
         };
         format!("{repo}#{pr}:{}:{detail}", self.name())
     }
@@ -258,6 +273,12 @@ impl RelayEvent {
                 Some(n) => format!("its stacked base #{n} merged"),
                 None => "its stacked base merged (retargeted)".to_owned(),
             },
+            Self::Overdue {
+                state,
+                age_minutes,
+                limit_minutes,
+                ..
+            } => format!("overdue: {state} for {age_minutes} min (limit {limit_minutes} min)"),
         }
     }
 }
@@ -786,6 +807,58 @@ pub(crate) fn steward_next_actions(report: &Value) -> BTreeMap<u64, (String, Str
                 out.insert(number, (head.to_owned(), action.to_owned()));
             }
         }
+    }
+    out
+}
+
+/// The steward's overdue rows per pull request, from its tick report
+/// (`repos[].dwell.overdue[]`), as relay events: the author's own states
+/// (failed checks, conflicts, HOLDs, stacks), at levels the steward has
+/// emitted. A row the steward is acting on this pass is left out: the act
+/// gets its chance before anyone is told.
+pub(crate) fn steward_overdue(report: &Value) -> BTreeMap<u64, Vec<RelayEvent>> {
+    let mut out: BTreeMap<u64, Vec<RelayEvent>> = BTreeMap::new();
+    let rows = report
+        .get("repos")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|repo| repo.pointer("/dwell/overdue").and_then(Value::as_array))
+        .flatten();
+    for row in rows {
+        // Only the author's own states go to the owning session, and only a
+        // level the steward has emitted (its per-pass cap holds; a level
+        // emitted in a tick this relay missed is still delivered).
+        let emitted = row
+            .get("escalated_level")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let level = row.get("level").and_then(Value::as_u64).unwrap_or(u64::MAX);
+        if row.pointer("/act/disposition").and_then(Value::as_str) == Some("act")
+            || row.pointer("/owner/role").and_then(Value::as_str) != Some("author")
+            || emitted < level
+        {
+            continue;
+        }
+        let (Some(pr), Some(state), Some(head), Some(level)) = (
+            row.get("pr").and_then(Value::as_u64),
+            row.get("state").and_then(Value::as_str),
+            row.get("head").and_then(Value::as_str),
+            row.get("level").and_then(Value::as_u64),
+        ) else {
+            continue;
+        };
+        out.entry(pr).or_default().push(RelayEvent::Overdue {
+            state: state.to_owned(),
+            head: head.to_owned(),
+            level: u32::try_from(level).unwrap_or(u32::MAX),
+            age_minutes: row.get("age_minutes").and_then(Value::as_i64).unwrap_or(0),
+            limit_minutes: row
+                .get("limit_minutes")
+                .and_then(Value::as_u64)
+                .and_then(|minutes| u32::try_from(minutes).ok())
+                .unwrap_or(0),
+        });
     }
     out
 }
