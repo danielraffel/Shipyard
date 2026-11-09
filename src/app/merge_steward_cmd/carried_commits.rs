@@ -123,8 +123,8 @@ const SHAS_NAMED: usize = 10;
 const OPEN_PULL_COMMITS_QUERY: &str = "query($owner:String!,$name:String!,$cursor:String){\
      repository(owner:$owner,name:$name){pullRequests(states:OPEN,first:50,after:$cursor){\
      pageInfo{hasNextPage endCursor} nodes{number headRefName headRefOid baseRefName \
-     isCrossRepository author{login} carriedCommits:commits(first:100){totalCount \
-     nodes{commit{oid}}}}}}}";
+     isCrossRepository author{login} labels(first:50){nodes{name}} \
+     carriedCommits:commits(first:100){totalCount nodes{commit{oid}}}}}}}";
 
 /// The commits a pull request carries, as far as the steward read them.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -148,6 +148,9 @@ pub(super) struct OpenPr {
     pub cross_repository: bool,
     pub author: Option<String>,
     pub commits: CommitList,
+    /// The parent pull request a `stacked:<n>` label names, the label
+    /// `shipyard pr --stacked-on <n>` applies.
+    pub stacked_on: Option<u64>,
 }
 
 /// The candidate under admission.
@@ -190,6 +193,8 @@ pub(super) enum Judgement {
     Approved,
     /// The gate refuses Q's head, for this reason.
     Unapproved(String),
+    /// A counting HOLD names Q's head: refused, and never excused as a stack.
+    Held(String),
     /// Q's approval could not be read.
     Unreadable(String),
 }
@@ -229,7 +234,9 @@ pub(super) fn carried(candidate: &Candidate<'_>, others: &[OpenPr]) -> Vec<Carri
 
 /// The open pull requests whose commits P must not carry unapproved: every
 /// one but P itself, P's own base-branch pull request, and those stacked on
-/// P. Pure.
+/// P. Pure. A labelled stack is still checked here when it is unrelated to P;
+/// the label is only a repair-lane marker. A Q stacked on P is excluded by the
+/// base-branch relation itself, regardless of labels.
 fn unrelated<'a>(
     number: u64,
     base_ref: &'a str,
@@ -244,6 +251,17 @@ fn unrelated<'a>(
         // Q is stacked on P, directly or through other open pull requests.
         .filter(move |q| !stacked_on(q, head_ref, others))
 }
+
+/// The parent number of a `stacked:<n>` label, if `name` is one. Pure.
+fn stacked_label_parent(name: &str) -> Option<u64> {
+    name.strip_prefix(STACKED_LABEL_PREFIX)?
+        .parse()
+        .ok()
+        .filter(|number| *number > 0)
+}
+
+/// The label prefix `shipyard pr --stacked-on <n>` applies, as `stacked:<n>`.
+pub(in crate::app) const STACKED_LABEL_PREFIX: &str = "stacked:";
 
 /// Whether `q`'s base-branch chain, followed through other open (same
 /// repository) pull requests' head branches, reaches `head_ref`. Pure; a cycle
@@ -522,10 +540,13 @@ pub(super) fn decide(base: &str, judged: &[(Carried, Judgement)]) -> Option<Refu
     for (carried, judgement) in judged {
         match (carried, judgement) {
             (_, Judgement::Approved) => {}
-            (Carried::Shares { .. }, Judgement::Unapproved(reason)) => {
+            (Carried::Shares { .. }, Judgement::Unapproved(reason) | Judgement::Held(reason)) => {
                 carries.push((carried, reason));
             }
-            (Carried::Unbounded { .. }, Judgement::Unapproved(reason)) => {
+            (
+                Carried::Unbounded { .. },
+                Judgement::Unapproved(reason) | Judgement::Held(reason),
+            ) => {
                 unbounded.push((carried, reason));
             }
             (_, Judgement::Unreadable(error)) => unreadable.push((carried, error)),
@@ -677,6 +698,10 @@ pub(super) fn refusal_for(
         return None;
     }
     let run_gh = |argv: &[String]| actions.run_gh(argv).map_err(|error| error.to_string());
+    let comment_source = matches!(
+        policy.source,
+        crate::head_approval::guard::ApprovalSource::Comments
+    );
     let mut report_policy = policy.clone();
     report_policy.dry_run = true;
     let mut judge = |q: &OpenPr| -> Judgement {
@@ -712,8 +737,7 @@ pub(super) fn refusal_for(
             &queue,
             q.author.as_deref(),
         ) {
-            Ok((gate, _, _)) if gate.allows() => Judgement::Approved,
-            Ok((gate, _, _)) => Judgement::Unapproved(gate.explain()),
+            Ok((gate, _, blocker)) => judgement_of(&gate, blocker.as_ref(), comment_source),
             Err(error) => Judgement::Unreadable(error),
         }
     };
@@ -727,6 +751,29 @@ pub(super) fn refusal_for(
         cache,
         &mut judge,
     )
+}
+
+/// The judgement of Q's head from the approval gate and its blocker. A HOLD
+/// at the head is [`Judgement::Held`]. Under fleet-guard admission
+/// (`comment_source` false) a HOLD is not observable here, so any refusal is
+/// treated as held and a refused stack is never excused: fail closed. Pure.
+fn judgement_of(
+    gate: &crate::head_approval::HeadGate,
+    blocker: Option<&crate::head_approval::ApprovalBlocker>,
+    comment_source: bool,
+) -> Judgement {
+    if gate.allows() {
+        Judgement::Approved
+    } else if !comment_source
+        || matches!(
+            blocker,
+            Some(crate::head_approval::ApprovalBlocker::Held { .. })
+        )
+    {
+        Judgement::Held(gate.explain())
+    } else {
+        Judgement::Unapproved(gate.explain())
+    }
 }
 
 /// [`admission_refusal`] over any `gh` runner and approval judge, after the
@@ -1359,6 +1406,13 @@ fn parse_open_pr(run_gh: RunGh<'_>, repo: &str, node: &Value) -> Result<OpenPr, 
             .and_then(Value::as_str)
             .map(str::to_owned),
         commits,
+        stacked_on: node
+            .pointer("/labels/nodes")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|label| label.get("name").and_then(Value::as_str))
+            .find_map(stacked_label_parent),
     })
 }
 
@@ -1382,3 +1436,6 @@ fn rest_commits(run_gh: RunGh<'_>, repo: &str, number: u64) -> Result<BTreeSet<S
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod stacked_label_tests;

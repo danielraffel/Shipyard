@@ -4414,9 +4414,22 @@ spent on a state that was never going to change.
   returned exactly **one** run ever — created 2 h 48 m after the pull request
   opened.
 - **`--base` that is not the configured base branch refuses before any side
-  effect**, unless `--stacked` is passed; either way the verdict is printed at
-  open time, because the author needs to know that the gate fires only after a
-  retarget **and** a push.
+  effect**, unless `--stacked-on <n>` names the open parent pull request whose
+  head branch is `--base` (`--stacked` alone now refuses: no stacking by
+  default). Either way the verdict is printed at open time, because the author
+  needs to know that the gate fires only after a retarget **and** a push. With
+  `--stacked-on <n>` the pull request is labelled `stacked:<n>` and its body
+  says it cannot be reviewed yet. Integration bases (`[ship]
+  integration_bases`, default `develop/*` and `release/*`) pass unstacked. The
+  `stacked:<n>` label is a repair-lane marker only; the steward's carried-commit
+  guard judges a labelled stack like any other open PR. The repair and operator
+  passes verify the named parent and its head only when deciding whether to
+  retarget, reporting mismatches as `STACK-LABEL-MISMATCH` and an unreadable
+  parent as `STACK-PARENT-UNREADABLE`. The repair and operator passes
+  list it as `STACK-BASE-MERGED parent:#<n>` the moment `<n>` merges (no stall
+  wait) to retarget onto main, merge main, push once and comment
+  `retargeted: ...`. A parent closed unmerged is `STACK-PARENT-CLOSED`: never
+  retargeted.
 
 ### Where the `on:` reader refuses, and why the list is long on purpose
 

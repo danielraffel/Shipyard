@@ -327,6 +327,13 @@ rendering only. It is not persisted in `ShipState`, adds no state or
 transition, and never changes what `ship` does; when the settings cannot be
 read it claims no admission path rather than guessing one.
 
+`shipyard pr` also guards the pull request's base before any PR is created. A
+non-default base requires `--stacked-on <n>`, naming an open parent whose head
+branch is that base; the retired `--stacked` flag is insufficient. Configured
+integration bases may proceed unstacked. The command labels an accepted stack
+as `stacked:<n>` so fleet-pass can verify its parent when deciding whether to
+list it for retargeting.
+
 ## Arming auto-merge is outside the state machine
 
 Once `resolve_pr_context` has a pull-request number — for `shipyard pr`, a bare

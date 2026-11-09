@@ -1873,6 +1873,7 @@ mod resume_record;
 mod terminal_handoff;
 pub(super) mod train;
 mod unapproved_admission;
+pub(super) use carried_commits::STACKED_LABEL_PREFIX;
 pub(super) use unapproved_admission::DequeueMode;
 
 use cancellation::{
