@@ -550,13 +550,65 @@ pub(super) enum Command {
     /// time only breaks ties. An event no ledger explains (a landing through
     /// native `gh`) is `unattributed`, never guessed. Prints its own
     /// time to answer.
+    ///
+    /// `--contact [PR]` instead names the live address of the session that
+    /// owns the pull request (its owner record on any host, else its body
+    /// marker, else the last stamped verdict author) and probes it over cmux.
     Who {
         /// Pull request number.
         #[arg(long)]
-        pr: u64,
+        pr: Option<u64>,
         /// Exact OWNER/REPO. Defaults to the `origin` remote.
         #[arg(long, value_name = "OWNER/REPO")]
         repo: Option<String>,
+        /// Resolve and probe the owning session's cmux address. Takes the
+        /// pull request number, or uses `--pr`.
+        #[arg(long, value_name = "PR", num_args = 0..=1)]
+        #[allow(clippy::option_option)] // absent / bare flag / flag with a number
+        contact: Option<Option<u64>>,
+    },
+    /// Record, move or hand off the agent session that owns a pull request.
+    ///
+    /// The record (host, client, cmux socket and surface, agent id, session
+    /// id) is written to this host's state directory and as a
+    /// `shipyard-owner:` marker in the pull request body, so `shipyard relay`
+    /// can tell that session when the pull request changes. `shipyard pr` and
+    /// `shipyard ship` register the pushing session automatically.
+    Owner {
+        /// Owner subcommand.
+        #[command(subcommand)]
+        command: OwnerCommand,
+    },
+    /// Deliver pull-request events (merged, closed, ejected, verdict,
+    /// required red/green, conflicts after the base moved, repair claims,
+    /// stacked base merged) to the session that owns each pull request.
+    ///
+    /// Model-free. One batched GraphQL read per repository per pass; no REST.
+    /// Delivers over cmux (local, or ssh for another host), falling back to
+    /// the repository's lead, then its repair lane, then one PR comment.
+    /// `[relay]` in the machine config sets the repositories, mode, hosts and
+    /// fallbacks; `relay.enabled = false` turns it off. Never approves, arms,
+    /// merges or posts a verdict.
+    Relay {
+        /// Keep running, one pass every `--interval` seconds.
+        #[arg(long)]
+        follow: bool,
+        /// Seconds between passes with `--follow`. Defaults to
+        /// `relay.interval_secs` (120).
+        #[arg(long, value_parser = clap::value_parser!(u64).range(15..))]
+        interval: Option<u64>,
+        /// Repository to relay (repeatable). Defaults to `relay.repos`.
+        #[arg(long = "repo", value_name = "OWNER/REPO")]
+        repos: Vec<String>,
+        /// Deliver, overriding `relay.mode`.
+        #[arg(long, conflicts_with = "shadow")]
+        send: bool,
+        /// Log what would be delivered without sending, overriding `relay.mode`.
+        #[arg(long)]
+        shadow: bool,
+        /// Stop `--follow` after this many passes. Test and supervised-run hook.
+        #[arg(long = "max-passes", hide = true, value_parser = clap::value_parser!(u64).range(1..))]
+        max_passes: Option<u64>,
     },
     /// Read the repository's CI and say what to change. Read-only.
     ///
@@ -3376,6 +3428,34 @@ pub(super) enum DaemonLauncherCommand {
     /// Stop starting the daemon through launchd. The running daemon is left
     /// alone; the next refresh spawns it directly.
     Uninstall,
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum OwnerCommand {
+    /// Register this session as the owner of a pull request (default: the
+    /// open pull request for the current branch).
+    Register {
+        /// Pull request number.
+        #[arg(long, conflicts_with = "all")]
+        pr: Option<u64>,
+        /// Exact OWNER/REPO. Defaults to the `origin` remote.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+        /// Re-register every pull request this host's records give to this
+        /// session (same session id or cmux surface), e.g. after a restart.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Hand a pull request to the repository's repair lane: the relay stops
+    /// addressing this session and uses the configured fallbacks.
+    Release {
+        /// Pull request number.
+        #[arg(long)]
+        pr: u64,
+        /// Exact OWNER/REPO. Defaults to the `origin` remote.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]

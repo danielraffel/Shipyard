@@ -189,6 +189,8 @@ pub mod opt_in_targets;
 pub(crate) mod outage;
 /// Structured JSON output helpers.
 pub mod output;
+/// Pull-request owner registry: the session that owns a pull request, and its address.
+pub(crate) mod owner_registry;
 /// Shadow-only build-once and sharded-test proof invariants.
 pub mod parallel_proof;
 /// Default-off admission policy for the first Pulp macOS sharding canary.
@@ -263,6 +265,8 @@ mod record_identity;
 pub mod recovery_worker;
 /// GitHub webhook registration through the user's existing `gh` auth.
 pub mod registrar;
+/// PR event relay: deliver pull-request events to the owning session.
+pub(crate) mod relay;
 /// Canonical identity of a watched repository after a rename or transfer.
 pub mod repo_slug;
 /// Read and write one GitHub Actions repository variable.

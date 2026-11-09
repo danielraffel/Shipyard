@@ -833,6 +833,18 @@ code span or the fenced block); outside one it renders as `$`, or fails the
 whole site build. `every_liquid_delimiter_in_tracked_markdown_is_inside_a_raw_block`
 enforces it.
 
+**Your pull requests tell you when they change; do not poll them.**
+`shipyard pr` and `shipyard ship` register the pushing session (host, cmux
+surface, session) as the owner, in the state dir and as a `shipyard-owner:`
+marker in the PR body. `shipyard relay` (run on the steward host) sends that
+surface one line when the PR merges, closes, is ejected, gets a verdict at its
+head, goes required-red or green, conflicts after the base moved, gets a
+`repair-claim:`, or its stacked base merges, with the next step. After a
+restart run `shipyard owner register --all`; to take over a PR run
+`shipyard owner register --pr N`; to hand one off, `shipyard owner release --pr N`.
+`shipyard who --contact N` shows (and probes) where messages for PR N go. A
+plain `git push` does not re-register. See `docs/owner-relay.md`.
+
 **"Who armed it?" is `shipyard who --pr N`, not a timeline read.** Every queue
 event shows the fleet App as its actor. `who` joins the arm guard's
 `queue-arms.jsonl` and the removal guard's `queue-removals.jsonl` from every
