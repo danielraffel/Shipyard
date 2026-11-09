@@ -4519,6 +4519,12 @@ retraction of one's own APPROVE posts with `SHIPYARD_VERDICT_RETRACT=1`. The
 steward reports such a row as `held` with `blocked_detail` "held head: needs
 a new head", which `shipyard wait pr --state actionable` prints.
 
+`wait pr --state actionable` spends a full admission read per tick on the
+shared App installation budget. It backs off from 120 to 600 s while the
+classification is unchanged, shares the host's admission read cache, and
+reports its spend as `data.github_reads` in `--json`. Concurrent agent waits
+drained that budget before the backoff; keep to one wait per PR.
+
 Every rule above judges comments posted through the shared fleet App, which
 every agent can use, so none of it is proof of who reviewed. A base with
 `[auto_merge] approval_source = "guard"` and `guard_app_id = <id>` takes

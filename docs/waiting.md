@@ -135,7 +135,15 @@ head (`blocked_on`, see `docs/automated-draining.md`) says the caller must act
 (a HOLD, a failed required check, a conflict, an empty diff) or may stop
 (owner decision, merged, closed). `observed.next_action` carries `actor`,
 `action` and `stop`. Exit 1 on timeout means nothing is yours to do yet.
-Default `--poll-interval` is 120 seconds for this state.
+Default `--poll-interval` is 120 seconds for this state. Each tick is a full
+admission read, so while the classification stays the same the tick doubles,
+up to 600 seconds (120, 240, 480, 600); a changed classification or a daemon
+event returns it to the base interval. Repository settings, branch rules,
+required checks and the check runs of the exact head are read through the
+host's short-lived admission read cache (`SHIPYARD_ADMISSION_READ_CACHE_SECS`,
+default 180), so concurrent waits on one host share one read. `--json`
+reports what the wait spent as `data.github_reads`: `polls`, `rest`,
+`graphql`, `cache_hits` and REST calls by call site.
 
 ```sh
 shipyard wait pr 11364 --state actionable --timeout 1800 --json
