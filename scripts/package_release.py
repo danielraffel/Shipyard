@@ -12,9 +12,11 @@ import re
 import secrets
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,7 +31,39 @@ SEMVER_RE = re.compile(
     r"(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?"
     r"(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$"
 )
-NOTARY_WAIT_TIMEOUT = "45m"
+# `notarytool --timeout` bounds only the wait for Apple's verdict. An upload
+# or credential lookup that stalls never reaches that wait, so each notarytool
+# process also has a hard wall-clock cap, and a stalled or transiently failed
+# attempt is retried. The release job's step timeout is sized from these
+# numbers (scripts/test_release_workflow.py checks it).
+NOTARY_WAIT_TIMEOUT = "20m"
+NOTARY_ATTEMPT_TIMEOUT_SECS = 25 * 60
+NOTARY_SUBMIT_ATTEMPTS = 3
+NOTARY_RETRY_BACKOFF_SECS = (60.0, 180.0)
+NOTARY_AUX_TIMEOUT_SECS = 5 * 60
+STAPLER_TIMEOUT_SECS = 3 * 60
+NOTARY_ID_RE = re.compile(
+    r"^\s*id:\s*([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})\s*$",
+    re.MULTILINE,
+)
+NOTARY_STATUS_RE = re.compile(r"^\s*status:\s*(\S.*?)\s*$", re.MULTILINE)
+NOTARY_REJECTED_STATUSES = {"Invalid", "Rejected"}
+# notarytool prints the id before uploading. Only these lines show Apple holds
+# the whole file, so only then may a retry wait on the id instead of re-upload.
+NOTARY_UPLOAD_DONE_MARKERS = (
+    "Successfully uploaded file",
+    "Waiting for processing to complete",
+    "Current status:",
+)
+# Authentication and account failures do not heal on retry.
+NOTARY_FATAL_PATTERNS = (
+    "HTTP status code: 401",
+    "HTTP status code: 403",
+    "No Keychain password item found",
+)
+NOTARY_CREDENTIAL_ATTEMPTS = 2
+NOTARY_CREDENTIAL_BACKOFF_SECS = 30.0
+NOTARY_CREDENTIAL_TIMEOUT_SECS = 3 * 60
 SENSITIVE_FLAGS = {"--password", "-p", "-P", "-k"}
 SENSITIVE_ENV_NAMES = (
     "SHIPYARD_NOTARIZE_APP_PASSWORD",
@@ -111,15 +145,23 @@ def run(
     capture: bool = False,
     redact_values: tuple[str, ...] = (),
     env: dict[str, str] | None = None,
+    timeout: float | None = None,
 ) -> str:
-    result = subprocess.run(
-        args,
-        cwd=cwd,
-        check=False,
-        text=True,
-        capture_output=capture,
-        env=env,
-    )
+    try:
+        result = subprocess.run(
+            args,
+            cwd=cwd,
+            check=False,
+            text=True,
+            capture_output=capture,
+            env=env,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise CommandFailed(
+            f"command timed out after {timeout:.0f}s: "
+            f"{' '.join(redact_args(args, redact_values))}"
+        ) from error
     if result.returncode != 0:
         detail = f"command failed ({result.returncode}): {' '.join(redact_args(args, redact_values))}"
         if capture and result.stderr:
@@ -517,30 +559,262 @@ def delete_notary_keychain(keychain: Path) -> None:
         pass
 
 
+def _stop_process_group(proc: subprocess.Popen, *, grace: float = 5.0) -> None:
+    """SIGTERM the child's process group, then SIGKILL it after ``grace``.
+
+    The grace period lets notarytool flush output it buffered for the pipe
+    (a submission id among it) before it dies.
+    """
+    for sig, wait in ((signal.SIGTERM, grace), (signal.SIGKILL, 30.0)):
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(proc.pid, sig)
+        with contextlib.suppress(ProcessLookupError):
+            proc.send_signal(sig)
+        try:
+            proc.wait(timeout=wait)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+    # Still alive after SIGKILL: stuck in the kernel. Do not block on it.
+
+
+def run_streamed(
+    args: list[str],
+    *,
+    timeout: float,
+    redact_values: tuple[str, ...] = (),
+) -> tuple[int | None, str]:
+    """Run ``args``, echoing redacted output as it arrives, under a hard cap.
+
+    Returns ``(returncode, output)``; the return code is ``None`` when the
+    process was stopped at ``timeout``. Output is echoed live so a submission
+    id reaches the job log even if the process later stalls. stdin is closed
+    so a credential prompt fails instead of waiting forever. Any exception
+    while waiting (Ctrl-C included) stops the process group before it
+    propagates, so no notarytool outlives this call.
+    """
+    env = os.environ.copy()
+    # Ask Foundation tools not to block-buffer output sent to a pipe.
+    env["NSUnbufferedIO"] = "YES"
+    proc = subprocess.Popen(
+        args,
+        cwd=ROOT,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        start_new_session=True,
+    )
+    lines: list[str] = []
+
+    def pump() -> None:
+        assert proc.stdout is not None
+        # Keep draining even if echoing fails, so a full pipe never blocks
+        # the child.
+        for line in proc.stdout:
+            line = redact_text(line, redact_values)
+            lines.append(line)
+            with contextlib.suppress(Exception):
+                sys.stdout.write(line)
+                sys.stdout.flush()
+
+    reader = threading.Thread(target=pump, daemon=True)
+    reader.start()
+    returncode: int | None
+    try:
+        returncode = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        returncode = None
+        _stop_process_group(proc)
+    except BaseException:
+        _stop_process_group(proc, grace=1.0)
+        raise
+    reader.join(timeout=10)
+    # A reader still blocked holds the pipe's buffer lock; closing under it
+    # would hang, so leave that pipe to the (daemon) thread.
+    if not reader.is_alive() and proc.stdout is not None:
+        proc.stdout.close()
+    return returncode, "".join(lines)
+
+
+def notary_submission_id(output: str) -> str | None:
+    match = NOTARY_ID_RE.search(output)
+    return match.group(1) if match else None
+
+
+def notary_final_status(output: str) -> str | None:
+    statuses = NOTARY_STATUS_RE.findall(output)
+    return statuses[-1] if statuses else None
+
+
+def report_notary_submission(submission_id: str) -> None:
+    message = (
+        f"notarization submission id: {submission_id} "
+        f"(diagnose with `xcrun notarytool info {submission_id}` and "
+        f"`xcrun notarytool log {submission_id}`)"
+    )
+    print(message, flush=True)
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with contextlib.suppress(OSError):
+            with open(summary, "a", encoding="utf-8") as handle:
+                handle.write(f"- {message}\n")
+
+
+def notary_log(submission_id: str, auth_args: list[str]) -> str:
+    returncode, output = run_streamed(
+        ["xcrun", "notarytool", "log", submission_id, *auth_args],
+        timeout=NOTARY_AUX_TIMEOUT_SECS,
+    )
+    if returncode is None:
+        return f"(notarytool log timed out after {NOTARY_AUX_TIMEOUT_SECS}s)\n{output}"
+    return output
+
+
+def submit_for_notarization(
+    path: Path,
+    auth_args: list[str],
+    *,
+    attempts: int = NOTARY_SUBMIT_ATTEMPTS,
+    backoff: tuple[float, ...] = NOTARY_RETRY_BACKOFF_SECS,
+    attempt_timeout: float = NOTARY_ATTEMPT_TIMEOUT_SECS,
+    sleep=time.sleep,
+) -> str:
+    """Submit ``path`` and wait for Apple's verdict, bounded and retried.
+
+    Each attempt is one notarytool process under ``attempt_timeout``. Once
+    Apple holds the whole upload for a submission, later attempts wait on that
+    submission rather than upload a duplicate; an id seen before the upload
+    finished is only reported. Returns the accepted submission id. An Invalid
+    or Rejected verdict is final: it fails with the notary log, without retry.
+    """
+    submission_id: str | None = None  # latest id seen, for logs and errors
+    uploaded_id: str | None = None  # an id whose upload completed
+    failures: list[str] = []
+    for attempt in range(1, attempts + 1):
+        if uploaded_id is None:
+            args = ["xcrun", "notarytool", "submit", str(path), *auth_args, "--wait"]
+        else:
+            args = ["xcrun", "notarytool", "wait", uploaded_id, *auth_args]
+        args += ["--timeout", NOTARY_WAIT_TIMEOUT]
+        print(
+            f"notarization attempt {attempt}/{attempts}: "
+            f"{'submit' if uploaded_id is None else 'wait on ' + uploaded_id}",
+            flush=True,
+        )
+        returncode, output = run_streamed(args, timeout=attempt_timeout)
+        found = notary_submission_id(output)
+        if found and found != submission_id:
+            submission_id = found
+            report_notary_submission(found)
+        status = notary_final_status(output)
+        if found and uploaded_id is None:
+            if status or any(marker in output for marker in NOTARY_UPLOAD_DONE_MARKERS):
+                uploaded_id = found
+            else:
+                print(
+                    f"notarization: upload for {found} did not complete; "
+                    "the next attempt uploads again",
+                    flush=True,
+                )
+        if status == "Accepted":
+            return submission_id or ""
+        if status in NOTARY_REJECTED_STATUSES:
+            log = notary_log(submission_id, auth_args) if submission_id else "(no submission id)"
+            raise SystemExit(
+                f"::error::Notarization {status} for {path.name} "
+                f"(submission id {submission_id}). notarytool log:\n{log}"
+            )
+        fatal = next((p for p in NOTARY_FATAL_PATTERNS if p in output), None)
+        if fatal and returncode is not None:
+            raise SystemExit(
+                f"::error::Notarization of {path.name} failed with a non-retryable "
+                f"error ({fatal!r}); notarytool exited {returncode}:\n{output}"
+            )
+        if returncode is None:
+            failures.append(
+                f"attempt {attempt}: notarytool killed after {attempt_timeout:.0f}s "
+                f"(status {status or 'unknown'})"
+            )
+        else:
+            failures.append(
+                f"attempt {attempt}: notarytool exited {returncode} "
+                f"(status {status or 'unknown'})"
+            )
+        print(f"notarization {failures[-1]}", flush=True)
+        if attempt < attempts:
+            delay = backoff[min(attempt - 1, len(backoff) - 1)] if backoff else 0.0
+            print(f"retrying notarization in {delay:.0f}s", flush=True)
+            sleep(delay)
+    raise SystemExit(
+        f"::error::Notarization of {path.name} did not complete after {attempts} attempts "
+        f"(submission id {submission_id or 'never received'}):\n  "
+        + "\n  ".join(failures)
+    )
+
+
+def store_notary_credentials(
+    profile: str, keychain: Path, *, sleep=time.sleep
+) -> None:
+    """Create the temporary keychain profile, bounded and retried once.
+
+    store-credentials validates the password with Apple over the network, so
+    it gets the same stdin-closed, process-group-killed cap as submit.
+    """
+    args = [
+        "xcrun",
+        "notarytool",
+        "store-credentials",
+        profile,
+        "--apple-id",
+        os.environ["SHIPYARD_NOTARIZE_APPLE_ID"],
+        "--team-id",
+        os.environ["SHIPYARD_NOTARIZE_TEAM_ID"],
+        "--password",
+        os.environ["SHIPYARD_NOTARIZE_APP_PASSWORD"],
+        "--keychain",
+        str(keychain),
+    ]
+    detail = ""
+    for attempt in range(1, NOTARY_CREDENTIAL_ATTEMPTS + 1):
+        returncode, output = run_streamed(args, timeout=NOTARY_CREDENTIAL_TIMEOUT_SECS)
+        if returncode == 0:
+            return
+        detail = (
+            f"killed after {NOTARY_CREDENTIAL_TIMEOUT_SECS}s"
+            if returncode is None
+            else f"exited {returncode}"
+        )
+        fatal = any(p in output for p in NOTARY_FATAL_PATTERNS)
+        if fatal or attempt == NOTARY_CREDENTIAL_ATTEMPTS:
+            break
+        print(f"notarytool store-credentials {detail}; retrying", flush=True)
+        sleep(NOTARY_CREDENTIAL_BACKOFF_SECS)
+    raise SystemExit(f"::error::notarytool store-credentials {detail}:\n{output}")
+
+
+def staple(path: Path) -> None:
+    run(["xcrun", "stapler", "staple", str(path)], timeout=STAPLER_TIMEOUT_SECS)
+    run(["xcrun", "stapler", "validate", str(path)], timeout=STAPLER_TIMEOUT_SECS)
+
+
 def notarize_and_staple(path: Path) -> None:
     if notarization_mode() == "api-key":
-        output = run(
+        submit_for_notarization(
+            path,
             [
-                "xcrun",
-                "notarytool",
-                "submit",
-                str(path),
                 "--key",
                 str(expanded_env_path("SHIPYARD_NOTARIZE_KEY_PATH")),
                 "--key-id",
                 os.environ["SHIPYARD_NOTARIZE_KEY_ID"],
                 "--issuer",
                 os.environ["SHIPYARD_NOTARIZE_ISSUER_ID"],
-                "--wait",
-                "--timeout",
-                NOTARY_WAIT_TIMEOUT,
             ],
-            capture=True,
         )
-        if "status: Accepted" not in output:
-            raise SystemExit(f"Notarization was not accepted:\n{output}")
-        run(["xcrun", "stapler", "staple", str(path)])
-        run(["xcrun", "stapler", "validate", str(path)])
+        staple(path)
         return
 
     # Keep the long-running `notarytool submit --wait` process free of the
@@ -550,44 +824,14 @@ def notarize_and_staple(path: Path) -> None:
         keychain, _password = create_notary_keychain(Path(temp))
         profile = f"shipyard-notary-{os.getpid()}-{secrets.token_hex(4)}"
         try:
-            run(
-                [
-                    "xcrun",
-                    "notarytool",
-                    "store-credentials",
-                    profile,
-                    "--apple-id",
-                    os.environ["SHIPYARD_NOTARIZE_APPLE_ID"],
-                    "--team-id",
-                    os.environ["SHIPYARD_NOTARIZE_TEAM_ID"],
-                    "--password",
-                    os.environ["SHIPYARD_NOTARIZE_APP_PASSWORD"],
-                    "--keychain",
-                    str(keychain),
-                ],
-            )
-            output = run(
-                [
-                    "xcrun",
-                    "notarytool",
-                    "submit",
-                    str(path),
-                    "--keychain-profile",
-                    profile,
-                    "--keychain",
-                    str(keychain),
-                    "--wait",
-                    "--timeout",
-                    NOTARY_WAIT_TIMEOUT,
-                ],
-                capture=True,
+            store_notary_credentials(profile, keychain)
+            submit_for_notarization(
+                path,
+                ["--keychain-profile", profile, "--keychain", str(keychain)],
             )
         finally:
             delete_notary_keychain(keychain)
-    if "status: Accepted" not in output:
-        raise SystemExit(f"Notarization was not accepted:\n{output}")
-    run(["xcrun", "stapler", "staple", str(path)])
-    run(["xcrun", "stapler", "validate", str(path)])
+    staple(path)
 
 
 def smoke_dmg(path: Path, binary_names: tuple[str, ...], *, ci_mode: bool) -> str:

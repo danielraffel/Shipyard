@@ -370,6 +370,59 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertLess(restore.index('[ ! -e "$KEYCHAIN_STATE" ]'),
                         restore.index("ci_macos_signing_keychain.py restore"))
 
+    def _macos_job(self) -> dict:
+        import yaml
+
+        workflow = yaml.safe_load(RELEASE_WORKFLOW.read_text(encoding="utf-8"))
+        return workflow["jobs"]["sign-and-upload-macos"]
+
+    def test_macos_notarization_step_is_bounded_and_covers_its_retries(self) -> None:
+        job = self._macos_job()
+        step = next(
+            s for s in job["steps"]
+            if s.get("name") == "Sign, notarize, staple, and upload macOS DMG"
+        )
+        limit_secs = int(step["timeout-minutes"]) * 60
+        worst_case = (
+            package_release.NOTARY_CREDENTIAL_ATTEMPTS
+            * package_release.NOTARY_CREDENTIAL_TIMEOUT_SECS
+            + package_release.NOTARY_CREDENTIAL_BACKOFF_SECS
+            + package_release.NOTARY_SUBMIT_ATTEMPTS
+            * package_release.NOTARY_ATTEMPT_TIMEOUT_SECS
+            + sum(package_release.NOTARY_RETRY_BACKOFF_SECS)
+            + package_release.NOTARY_AUX_TIMEOUT_SECS
+            + 2 * package_release.STAPLER_TIMEOUT_SECS
+        )
+        # At most two retries, each one hard-capped above notarytool's own wait.
+        self.assertEqual(package_release.NOTARY_SUBMIT_ATTEMPTS, 3)
+        self.assertEqual(len(package_release.NOTARY_RETRY_BACKOFF_SECS), 2)
+        self.assertEqual(package_release.NOTARY_WAIT_TIMEOUT, "20m")
+        self.assertGreater(package_release.NOTARY_ATTEMPT_TIMEOUT_SECS, 20 * 60)
+        # The Python retries must finish (and report the submission id) before
+        # the runner kills the step: leave at least 15 minutes for the build,
+        # signing, DMG smoke and upload.
+        self.assertLessEqual(worst_case + 15 * 60, limit_secs)
+        # ...yet the step must not be allowed to idle for hours.
+        self.assertLessEqual(limit_secs, 2 * 60 * 60)
+
+    def test_macos_job_has_a_timeout_covering_its_bounded_steps(self) -> None:
+        job = self._macos_job()
+        self.assertIn("timeout-minutes", job)
+        job_limit = int(job["timeout-minutes"])
+        self.assertLess(job_limit, 360, "the 6-hour default is what stranded drafts")
+        bounded = 0
+        for step in job["steps"]:
+            name = step.get("name", "")
+            if "timeout-minutes" in step:
+                bounded += int(step["timeout-minutes"])
+            elif name.startswith("Back off before"):
+                bounded += 3  # a fixed sleep of at most 90s
+            elif name.startswith(
+                ("Sign, notarize", "Install pinned Rust", "Publish the", "Attest", "Import Developer ID")
+            ):
+                self.fail(f"long-running step {name!r} has no timeout-minutes")
+        self.assertLessEqual(bounded, job_limit)
+
     def test_heal_is_its_own_workflow_and_auto_release_is_untouched(self) -> None:
         import yaml
 
