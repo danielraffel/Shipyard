@@ -55,8 +55,10 @@
 //!
 //! Because `pull_request_target` runs whatever workflow the pull request's
 //! base branch defines, a run is only as trusted as that base. So when a
-//! signal is enforced, every pull request (open or closed) with this head
-//! branch, or with this head commit, must target `main`.
+//! signal is enforced, every pull request (open or closed) whose head is this
+//! commit, found by this head branch or by the commit, must target `main`. An
+//! older pull request from the same branch, headed by another commit, does not
+//! count.
 //!
 //! ## When it is enforced
 //!
@@ -82,8 +84,9 @@
 //! rights. Known residuals: retargeting or deleting a pull request after its
 //! run; a forged status on a `merge_group` commit (merge-group heads are
 //! outside this gate, which judges pull request heads before admission); and
-//! anything else a pusher can do through a workflow sharing App 15368. Only a
-//! dedicated judge App closes those.
+//! a token with `statuses: write` posting a status directly; and anything
+//! else a pusher can do through a workflow sharing App 15368. Only a dedicated
+//! judge App closes those (planned in Generous-Corp/vellum#275).
 //!
 //! ## Scope
 //!
@@ -284,8 +287,8 @@ fn branch_tip(run_gh: RunGh<'_>, repo: &str, branch: &str) -> Result<String, Str
     }
 }
 
-/// Why a pull request sharing this head branch or head commit makes its runs
-/// untrustworthy (it targets a base other than [`TRUSTED_BASE`], whose
+/// Why a pull request headed by this commit (found by this head branch or by
+/// the commit) makes its runs untrustworthy (it targets a base other than [`TRUSTED_BASE`], whose
 /// workflow definition `pull_request_target` would have run), or `None`.
 fn foreign_base(
     run_gh: RunGh<'_>,
@@ -293,6 +296,7 @@ fn foreign_base(
     head: &str,
     pull: &Pull,
 ) -> Result<Option<String>, String> {
+    let fields = ".[] | {number, base: .base.ref, head_sha: .head.sha}";
     let by_branch = read_lines(
         run_gh,
         &format!(
@@ -300,31 +304,35 @@ fn foreign_base(
             pull.head_owner,
             crate::required_check_policy::encode_path_segment(&pull.head_ref)
         ),
-        ".[] | {number, base: .base.ref}",
+        fields,
     )?;
-    let by_commit: Vec<Value> = read_lines(
+    let by_commit = read_lines(
         run_gh,
         &format!("repos/{repo}/commits/{head}/pulls?per_page=100"),
-        ".[] | {number, base: .base.ref, head_sha: .head.sha}",
-    )?
-    .into_iter()
-    .filter(|other| {
+        fields,
+    )?;
+    // Only pull requests headed by this very commit: an older pull request
+    // from the same branch says nothing about where this head's runs came from.
+    let headed_here = |other: &&Value| {
         other
             .get("head_sha")
             .and_then(Value::as_str)
             .is_some_and(|sha| sha.eq_ignore_ascii_case(head))
-    })
-    .collect();
-    Ok(by_branch.iter().chain(&by_commit).find_map(|other| {
-        let base = other.get("base").and_then(Value::as_str).unwrap_or("");
-        (base != TRUSTED_BASE).then(|| {
-            format!(
-                "pull request #{} with this head targets `{base}`, not `{TRUSTED_BASE}`, so \
+    };
+    Ok(by_branch
+        .iter()
+        .chain(&by_commit)
+        .filter(headed_here)
+        .find_map(|other| {
+            let base = other.get("base").and_then(Value::as_str).unwrap_or("");
+            (base != TRUSTED_BASE).then(|| {
+                format!(
+                    "pull request #{} with this head targets `{base}`, not `{TRUSTED_BASE}`, so \
                  its `{TRUSTED_EVENT}` runs used that branch's workflow",
-                other.get("number").and_then(Value::as_u64).unwrap_or(0)
-            )
-        })
-    }))
+                    other.get("number").and_then(Value::as_u64).unwrap_or(0)
+                )
+            })
+        }))
 }
 
 /// Why `signal` does not admit `head` (pushed on branch `head_ref`), or
