@@ -139,9 +139,11 @@ pub(super) fn diagnose(
             at: ejections.last().and_then(|ejection| ejection.at.clone()),
         }),
         HeadGate::NotApproved { .. } => Some(not_approved(records, policy, author)),
-        HeadGate::NotAdmitted { detail, .. } => Some(ApprovalBlocker::AdmissionMissing {
-            detail: detail.clone(),
-        }),
+        HeadGate::NotAdmitted { detail, .. } | HeadGate::UntrustedSignal { detail, .. } => {
+            Some(ApprovalBlocker::AdmissionMissing {
+                detail: detail.clone(),
+            })
+        }
     }
 }
 
