@@ -98,6 +98,7 @@ fn required(reviewers: &[&str]) -> ApprovalPolicy {
         carry_excluded: None,
         dry_run: false,
         source: super::guard::ApprovalSource::Comments,
+        trusted_signals: Vec::new(),
     }
 }
 
@@ -614,6 +615,7 @@ fn the_policy_is_read_from_the_auto_merge_table() {
             carry_excluded: None,
             dry_run: false,
             source: super::guard::ApprovalSource::Comments,
+            trusted_signals: Vec::new(),
         }
     );
     let empty: toml::Table = "[project]\nname = \"x\"\n".parse().expect("toml");
