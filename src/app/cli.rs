@@ -847,9 +847,10 @@ pub(super) enum Command {
         /// configured base branch or an integration base (`[ship]
         /// integration_bases`, default `develop/*`, `release/*`) refuses with
         /// exit 8 and creates nothing.
-        /// The pull request is labelled `stacked:<n>`, so the steward never
-        /// holds other pull requests on it, and its body says its required
-        /// checks run only after it is retargeted onto the base.
+        /// The pull request is labelled `stacked:<n>` (a repair-lane marker
+        /// only; the steward's carried-commit guard still judges it like any
+        /// other open pull request), and its body says its required checks
+        /// run only after it is retargeted onto the base.
         #[arg(long = "stacked-on", value_name = "PR")]
         stacked_on: Option<u64>,
         /// Skip a target after preflight.
@@ -4930,6 +4931,36 @@ mod tests {
             }
         ));
         assert!(Cli::try_parse_from(["shipyard", "dependency", "pulp"]).is_err());
+    }
+
+    #[test]
+    fn stacked_on_help_does_not_claim_the_steward_excuses_the_stack() {
+        // The steward's carried-commit guard judges a labelled stack like any
+        // other open PR (`carried_commits::unrelated` never reads the label),
+        // so `--help` must not promise that the label exempts it.
+        let help = std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                use clap::CommandFactory;
+                let mut command = Cli::command();
+                let pr = command.find_subcommand_mut("pr").expect("pr subcommand");
+                let stacked_on = pr
+                    .get_arguments()
+                    .find(|argument| argument.get_id() == "stacked_on")
+                    .expect("--stacked-on argument");
+                stacked_on
+                    .get_long_help()
+                    .or_else(|| stacked_on.get_help())
+                    .map(ToString::to_string)
+                    .unwrap_or_default()
+            })
+            .expect("spawn help thread")
+            .join()
+            .expect("help thread");
+        assert!(help.contains("stacked:<n>"), "{help}");
+        assert!(!help.contains("never holds other pull requests"), "{help}");
+        assert!(help.contains("repair-lane marker only"), "{help}");
+        assert!(help.contains("like any other open pull request"), "{help}");
     }
 
     #[test]
