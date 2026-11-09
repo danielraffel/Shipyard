@@ -232,7 +232,9 @@ Each line is <repo>#<pr> <head sha> <reason>. Take the FIRST entry you can make 
 - HOLD: fix what the HOLD at that head names. If you judge the HOLD itself mistaken, still push one real improvement or a merge of the PR's base, and post 'dispute: <concrete reason>' after your repaired comment so the reviewer re-judges it.
 - FAILED:<checks>: fix the failure if this PR caused it. If it is infrastructure, re-run the failed job once and say so.
 - CONFLICT: merge the PR's own base branch.
-- STACK-BASE-MERGED: the PR's base branch no longer has an open PR. Retarget it with ghapp api -X PATCH repos/<repo>/pulls/<n> -f base=main, merge origin/main, push once.
+- STACK-BASE-MERGED: the PR's base branch no longer has an open PR (with parent:#<m>, its stacked:<m> parent merged). Retarget it with ghapp api -X PATCH repos/<repo>/pulls/<n> -f base=main, merge origin/main, push once, and comment 'retargeted: onto main after #<m> merged, main merged at <sha>'. A conflict outside generated files: stop and surface it.
+- STACK-PARENT-CLOSED parent:#<m>: the parent closed without merging. Do not retarget; comment once that the stack needs its author and move on.
+- STACK-LABEL-MISMATCH / STACK-PARENT-UNREADABLE parent:#<m>: the stacked:<m> label names a PR whose head branch is not this PR's base, or #<m> cannot be read. Do not retarget; comment once naming the mismatch and move on.
 $(cat "$MUST_FILE")"
   elif [ $MUST_OK = 1 ]; then
     # Nothing to do: do not start a model at all.
@@ -253,7 +255,8 @@ if [ "$ROLE" = operator ] && [ $DRY = 0 ]; then
 
 Each finding below names a stuck PR and the steward's own blocked_on reason. For each one, in order, diagnose the real cause from live state (steward JSON in ~/Library/Logs/shipyard-steward-tick/, check-run logs, PR comments) and take the smallest allowed action that unsticks it:
 - A failed check caused by infrastructure (cancelled run, bootstrap timeout, runner wedge): re-run that run once with ghapp api -X POST .../actions/runs/<id>/rerun-failed-jobs.
-- A PR whose stacked base PR has merged: retarget it with ghapp api -X PATCH repos/<repo>/pulls/<n> -f base=main, merge origin/main, and push once.
+- A PR whose stacked base PR has merged (STACKED-BASE-MERGED, or a base branch with no open PR): retarget it with ghapp api -X PATCH repos/<repo>/pulls/<n> -f base=main, merge origin/main, push once, and comment 'retargeted: onto main after #<parent> merged, main merged at <sha>'. Its stacked:<parent> label is ignored once the base is main, so leave it. A conflict outside generated files: stop and surface it.
+- STACKED-PARENT-CLOSED, STACK-LABEL-MISMATCH, STACK-PARENT-UNREADABLE: never retarget; say the stack needs its author.
 - A HOLD or a code failure: repair it per the brief (claim, fix with a focused test, one push, a repaired comment).
 - An uncertain merge-queue mutation: reconcile it against GitHub state, then shipyard merge-queue resolve <id> --outcome accepted|rejected.
 - A steward or guard bug that blocks admission (it blocks every PR, or blocked_on names a guard that misfires): file or update ONE Shipyard issue with the evidence and the exact failing rule. Do not work around it.

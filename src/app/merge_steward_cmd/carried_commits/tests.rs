@@ -29,6 +29,7 @@ fn open(number: u64, head_ref: &str, base_ref: &str, head: &str, shas: &[&str]) 
         cross_repository: false,
         author: None,
         commits: CommitList::Complete(set(shas)),
+        stacked_on: None,
     }
 }
 

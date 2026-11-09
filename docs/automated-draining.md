@@ -173,6 +173,32 @@ their branch; every shared commit was on the held pull request's own
 first-parent chain, and the stacked pull request, whose base is not main, was
 never going to be reviewed. The first-parent rule ends that.)
 
+No stacking by default: `shipyard pr` refuses a base other than the
+configured one unless `--stacked-on <n>` names the open parent pull request,
+and then labels the new pull request `stacked:<n>`. Long-lived integration
+bases are not stacks and pass unstacked: `[ship] integration_bases` lists them
+as patterns (`*` within one path segment, `**` across segments), defaulting to
+`["develop/*", "release/*"]`; an explicit list replaces the defaults and `[]`
+allows none.
+
+```toml
+[ship]
+integration_bases = ["develop/*", "release/*"]
+```
+
+The `stacked:<n>` label records the parent of a stacked pull request and keeps
+that head out of review and admission until it is retargeted. It does not waive
+the carried-commit guard: an unrelated candidate is still held when it carries
+commits introduced by a labelled Q whose current head has no APPROVE (or has a
+HOLD). A label anyone added by hand, naming a pull request that is not the
+stack's parent, has no effect on that guard. When `<n>` merges, the repair and operator passes
+list the stack immediately as `STACK-BASE-MERGED parent:#<n>`; they retarget it
+onto main, merge main, push once and comment `retargeted: ...`. A parent closed
+without merging is `STACK-PARENT-CLOSED`, a label whose pull request's head is
+not the stack's base is `STACK-LABEL-MISMATCH`, and a parent that cannot be
+read (a bogus number) is `STACK-PARENT-UNREADABLE`, reported without aborting
+the rest of the listing. None of those three is retargeted.
+
 Labels keep a pull request out of admission, and the steward refuses it:
 `owner-decision`, `superseded` and `PARKED/<platform>`. `PARKED/<platform>`
 excuses only that platform's CI, never a HOLD that names a code defect. If only

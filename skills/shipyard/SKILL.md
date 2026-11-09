@@ -32,6 +32,16 @@ no model call, starts a pass when a pull request becomes reviewable, or queues o
 Kick a pass by hand only once the checks are green, because the queue skips anything else.
 See `docs/automated-draining.md`.
 
+## PR stacking and admission
+
+`shipyard pr` requires `--stacked-on <n>` for a non-default base, and the
+parent must be an open pull request in the same repository whose head is the
+requested base branch. The `stacked:<n>` label is a repair-lane marker only:
+the steward's carried-commit guard judges a labelled stack like any other open
+PR. Fleet-pass verifies the named parent and head only when deciding whether to
+retarget; a forged, stale, closed, or unreadable parent is reported and never
+retargeted automatically.
+
 ## Durable work-item contract
 
 Shipyard's existing ShipState/lease/receipt primitives are the source of

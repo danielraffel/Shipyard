@@ -106,6 +106,9 @@ pub(super) struct ShipCommandArgs {
     /// Text (or `@file` contents) added to the pull request body once, after
     /// the attribution line and before the provenance block.
     pub(super) body_append: Option<String>,
+    /// `shipyard pr --stacked-on <n>`: label the pull request `stacked:<n>`
+    /// once it is known. `None` for every other path.
+    pub(super) stacked_on: Option<u64>,
     /// The "what happens next" block `shipyard pr` printed for this pull
     /// request, carried so every output path (queued, delegated, final) shows
     /// it. `None` for `ship`.
@@ -333,6 +336,26 @@ pub(super) fn ship_command<W: Write>(
                 pr_context.number
             ),
         };
+        if json_mode {
+            let _ = crate::writer_domain_lease::write_stderr(format_args!("{line}"));
+        } else {
+            writeln!(stdout, "{line}").map_err(|error| CliFailure::new(1, error.to_string()))?;
+        }
+    }
+    if let Some(parent) = args.stacked_on
+        && !repo.is_empty()
+    {
+        let label_actions = crate::cloud::GitHubActions::from_loaded_config(cwd, config);
+        let line = stacked_label_line(
+            &|gh_args: &[String]| {
+                label_actions
+                    .run_gh(gh_args)
+                    .map_err(|error| error.to_string())
+            },
+            &repo,
+            pr_context.number,
+            parent,
+        );
         if json_mode {
             let _ = crate::writer_domain_lease::write_stderr(format_args!("{line}"));
         } else {
@@ -1486,6 +1509,34 @@ fn fields(items: impl IntoIterator<Item = (&'static str, Value)>) -> BTreeMap<St
         .collect()
 }
 
+/// Label pull request `number` `stacked:<parent>` and say what happened. A
+/// failure is reported, never fatal: the pull request already exists, and an
+/// unlabelled stack is only held to the ordinary carried-commit check.
+fn stacked_label_line(
+    gh: &dyn Fn(&[String]) -> Result<String, String>,
+    repo: &str,
+    number: u64,
+    parent: u64,
+) -> String {
+    let label = format!("{}{parent}", super::merge_steward_cmd::STACKED_LABEL_PREFIX);
+    match gh(&[
+        "api".to_owned(),
+        "-X".to_owned(),
+        "POST".to_owned(),
+        format!("repos/{repo}/issues/{number}/labels"),
+        "-f".to_owned(),
+        format!("labels[]={label}"),
+    ]) {
+        Ok(_) => format!(
+            "▸ Labelled #{number} `{label}`: it stays out of review and admission until it is retargeted"
+        ),
+        Err(error) => format!(
+            "⚠︎ Could not label #{number} `{label}`: {error}. Add it by hand; ordinary \
+             carried-commit checks still apply"
+        ),
+    }
+}
+
 #[cfg(test)]
 #[path = "ship_cmd/command_tests.rs"]
 mod command_tests;
@@ -1498,6 +1549,9 @@ mod provenance_tests;
 #[cfg(test)]
 #[path = "ship_cmd/render_tests.rs"]
 mod render_tests;
+#[cfg(test)]
+#[path = "ship_cmd/stacked_label_tests.rs"]
+mod stacked_label_tests;
 #[cfg(test)]
 #[path = "ship_cmd/test_support.rs"]
 mod test_support;
