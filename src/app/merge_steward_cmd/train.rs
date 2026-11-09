@@ -230,6 +230,12 @@ fn stage_rows(run_gh: RunGh<'_>, observation: &super::RepoObservation) -> Vec<St
         managed_label: None,
         handoff_context: String::new(),
         max_transient_reruns: 1,
+        ejection_guards: crate::merge_steward::EjectionGuards::from_config(
+            run_gh,
+            &observation.repo,
+            &observation.base,
+            observation.merge_queue,
+        ),
     };
     let approval = crate::head_approval::read_policy(run_gh, &observation.repo, &observation.base);
     let mut rows: Vec<StageRow> = observation

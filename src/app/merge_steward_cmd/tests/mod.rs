@@ -78,6 +78,8 @@ fn mutation_apply_context<'a>(
         mutation_control,
         approval_blockers: std::cell::RefCell::default(),
         carried_commits: std::cell::RefCell::default(),
+        changed_files: std::cell::RefCell::default(),
+        ejection_guards: crate::merge_steward::EjectionGuards::default(),
     }
 }
 
@@ -168,6 +170,7 @@ fn queue_policy() -> StewardPolicy {
         managed_label: None,
         handoff_context: "shipyard/steward-handoff".to_owned(),
         max_transient_reruns: 1,
+        ejection_guards: crate::merge_steward::EjectionGuards::default(),
     }
 }
 
@@ -224,6 +227,8 @@ mod capacity;
 mod code_owner_wait;
 #[cfg(unix)]
 mod ejected_retry;
+#[cfg(unix)]
+mod ejection_guards;
 mod exact_head_merge;
 #[cfg(unix)]
 mod head_rollup;

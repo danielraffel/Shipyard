@@ -305,14 +305,7 @@ fn callers_move(kind: &str, facts: &Facts<'_>, stall: &Stall) -> Option<NextActi
                  `shipyard landing --pr {number} --repo {repo}`, fix the cause, push once."
             ),
         ),
-        "ejected_same_head" => NextAction::new(
-            Actor::Author,
-            format!(
-                "The merge queue ejected this exact head ({arg}{detail_suffix}): `shipyard \
-                 diagnose --pr {number} --repo {repo}`, fix, push once. Do not re-enqueue the \
-                 same head."
-            ),
-        ),
+        "ejected_same_head" => ejected_same_head(facts),
         "carries_unapproved_commits" => NextAction::new(
             Actor::Author,
             format!(
@@ -426,6 +419,14 @@ fn someone_elses_move(kind: &str, facts: &Facts<'_>) -> Option<NextAction> {
             Actor::Ci,
             format!("Admission waits on {token}. Nothing to do."),
         ),
+        "generated_path_batch" => NextAction::new(
+            Actor::Steward,
+            format!(
+                "Waits for queued {arg} to leave the merge queue: both change a generated \
+                 path{detail_suffix}. Nothing to do; the steward admits it on the next pass after \
+                 that. Do not push or merge {base} for this."
+            ),
+        ),
         "revalidating" | "admission_pending" => NextAction::new(
             Actor::Steward,
             format!(
@@ -500,6 +501,33 @@ fn operators_move(kind: &str, facts: &Facts<'_>) -> Option<NextAction> {
         "unclassified" => NextAction::unclassified(),
         _ => return None,
     })
+}
+
+/// A head the queue ejected and the steward will not re-enqueue. A head the
+/// queue could not merge at all (`invalid_merge_commit`, `merge_conflict`)
+/// needs the base merged once; any other needs a fix.
+fn ejected_same_head(facts: &Facts<'_>) -> NextAction {
+    let Facts {
+        arg,
+        detail_suffix,
+        repo,
+        base,
+        number,
+        ..
+    } = facts;
+    let action = if arg.starts_with("invalid_merge_commit") || arg.starts_with("merge_conflict") {
+        format!(
+            "The merge queue could not merge this exact head ({arg}{detail_suffix}): merge \
+             {base} once (no rebase) and push once. The steward does not re-enqueue the same \
+             head."
+        )
+    } else {
+        format!(
+            "The merge queue ejected this exact head ({arg}{detail_suffix}): `shipyard diagnose \
+             --pr {number} --repo {repo}`, fix, push once. Do not re-enqueue the same head."
+        )
+    };
+    NextAction::new(Actor::Author, action)
 }
 
 fn excluded_label(label: &str) -> NextAction {
@@ -606,6 +634,7 @@ mod tests {
             managed_label: None,
             handoff_context: String::new(),
             max_transient_reruns: 1,
+            ejection_guards: crate::merge_steward::EjectionGuards::default(),
         }
     }
 
@@ -857,6 +886,33 @@ mod tests {
         assert!(next.action.contains("failed_checks"), "{next:?}");
         assert!(next.action.contains("retry spent"), "{next:?}");
         assert!(next.action.contains("Do not re-enqueue"), "{next:?}");
+    }
+
+    #[test]
+    fn an_unmergeable_ejected_head_needs_one_merge_of_the_base() {
+        let next = next(
+            "ejected_same_head:invalid_merge_commit:needs_new_head",
+            None,
+            true,
+            "CLEAN",
+        );
+        assert_eq!(next.actor, Actor::Author);
+        assert!(next.action.contains("merge main once"), "{next:?}");
+        assert!(next.action.contains("does not re-enqueue"), "{next:?}");
+    }
+
+    #[test]
+    fn a_generated_path_batch_waits_on_the_steward() {
+        let next = next(
+            "generated_path_batch:#11720",
+            Some("test/ctest_script_inputs.json"),
+            true,
+            "CLEAN",
+        );
+        assert_eq!(next.actor, Actor::Steward);
+        assert!(!next.actionable(), "{next:?}");
+        assert!(next.action.contains("#11720"), "{next:?}");
+        assert!(next.action.contains("Nothing to do"), "{next:?}");
     }
 
     #[test]

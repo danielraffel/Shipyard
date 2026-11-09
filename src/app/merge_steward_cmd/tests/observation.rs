@@ -541,6 +541,7 @@ esac
         managed_label: Some(MANAGED_LABEL.to_owned()),
         handoff_context: HANDOFF_CONTEXT.to_owned(),
         max_transient_reruns: 0,
+        ejection_guards: crate::merge_steward::EjectionGuards::default(),
     };
     let decisions = prs
         .iter()

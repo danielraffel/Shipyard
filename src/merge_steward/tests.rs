@@ -42,6 +42,7 @@ fn queue_policy() -> StewardPolicy {
         managed_label: None,
         handoff_context: "shipyard/steward-handoff".to_owned(),
         max_transient_reruns: 1,
+        ejection_guards: crate::merge_steward::EjectionGuards::default(),
     }
 }
 
@@ -1541,6 +1542,83 @@ fn a_failed_ordinary_check_outranks_a_pending_approval_status() {
     let waiting = awaiting_verdict_pr("IN_PROGRESS", None);
     assert!(matches!(
         classify_pr(&waiting, &approval_policy(), &BTreeMap::new()),
+        StewardDecision::WaitingRequired { .. }
+    ));
+}
+
+fn check(name: &str, status: &str, conclusion: Option<&str>) -> StewardCheck {
+    StewardCheck {
+        name: name.to_owned(),
+        source: StewardCheckSource::CheckRun,
+        app_id: None,
+        status: status.to_owned(),
+        conclusion: conclusion.map(str::to_owned),
+        run_id: Some(11),
+        observed_at: Some("2026-11-07T03:24:29Z".to_owned()),
+        check_id: None,
+    }
+}
+
+/// #11698's head at 03:24: `Enforce version & skill sync` red while the
+/// `macos` gate was still running. A red required check must read failed,
+/// never pending, and must never arm.
+fn pulp_11698_head() -> (StewardPullRequest, StewardPolicy) {
+    let mut pr = green_pr();
+    pr.checks = vec![
+        check("macos", "IN_PROGRESS", None),
+        check("Enforce version & skill sync", "COMPLETED", Some("FAILURE")),
+    ];
+    let mut policy = queue_policy();
+    policy.required_checks = ["macos", "Enforce version & skill sync"]
+        .into_iter()
+        .map(|context| RequiredCheck {
+            context: context.to_owned(),
+            app_id: None,
+        })
+        .collect();
+    (pr, policy)
+}
+
+#[test]
+fn a_red_required_check_beside_a_pending_one_is_listed_and_never_arms() {
+    let (pr, mut policy) = pulp_11698_head();
+    for guards in [EjectionGuards::default(), EjectionGuards::for_base(true)] {
+        policy.ejection_guards = guards;
+        // Admission still waits for a settled head (recovery depends on it),
+        // and never arms.
+        assert_eq!(
+            classify_pr(&pr, &policy, &BTreeMap::new()),
+            StewardDecision::WaitingRequired {
+                contexts: vec!["macos".to_owned()]
+            }
+        );
+        assert_eq!(
+            failed_required_contexts(&pr, &policy),
+            vec!["Enforce version & skill sync".to_owned()]
+        );
+    }
+}
+
+#[test]
+fn a_red_required_check_never_arms_whatever_the_guards() {
+    let (mut pr, mut policy) = pulp_11698_head();
+    pr.checks[0] = check("macos", "COMPLETED", Some("SUCCESS"));
+    for guards in [EjectionGuards::default(), EjectionGuards::for_base(true)] {
+        policy.ejection_guards = guards;
+        assert!(matches!(
+            classify_pr(&pr, &policy, &BTreeMap::new()),
+            StewardDecision::RequiredFailed { .. }
+        ));
+    }
+    // A rerun of the red check in progress is pending again, not failed: the
+    // newest observation decides.
+    pr.checks.push(StewardCheck {
+        observed_at: Some("2026-11-07T03:40:00Z".to_owned()),
+        ..check("Enforce version & skill sync", "IN_PROGRESS", None)
+    });
+    assert!(failed_required_contexts(&pr, &policy).is_empty());
+    assert!(matches!(
+        classify_pr(&pr, &policy, &BTreeMap::new()),
         StewardDecision::WaitingRequired { .. }
     ));
 }

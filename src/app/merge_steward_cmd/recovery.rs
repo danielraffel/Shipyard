@@ -1405,6 +1405,7 @@ mod tests {
             managed_label: Some(MANAGED_LABEL.to_owned()),
             handoff_context: "shipyard/steward-handoff".to_owned(),
             max_transient_reruns: 1,
+            ejection_guards: crate::merge_steward::EjectionGuards::default(),
         };
         let checks = vec![
             StewardCheck {
@@ -1496,6 +1497,7 @@ mod tests {
             managed_label: Some(MANAGED_LABEL.to_owned()),
             handoff_context: "shipyard/steward-handoff".to_owned(),
             max_transient_reruns: reruns,
+            ejection_guards: crate::merge_steward::EjectionGuards::default(),
         };
         let linux = RequiredCheck {
             context: "linux".to_owned(),

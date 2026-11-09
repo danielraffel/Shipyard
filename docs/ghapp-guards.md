@@ -1321,7 +1321,12 @@ queued and armed PRs, so what changes for them is:
   proceeding.
 
 Re-enqueues after `invalid_merge_commit`, and anything after a new head, are
-unaffected.
+unaffected by this guard. The merge steward's own enqueue is stricter on a
+merge-queue base: its retry discipline (`[auto_merge]
+infra_only_same_head_retry`, default on with a merge queue) refuses a same-head
+re-enqueue after `invalid_merge_commit` too, and spends the `failed_checks`
+retry only on an infrastructure signature (see `docs/automated-draining.md`
+"Ejection guards").
 
 Marked binaries do not simply step around the guard: `shipyard auto-merge`
 admission and the merge steward's ordinary enqueue read the same

@@ -440,6 +440,11 @@ struct MutationApplyContext<'a> {
     /// Open pull requests' commits and approvals this pass read for the
     /// carried-commit admission guard. See `carried_commits`.
     carried_commits: std::cell::RefCell<carried_commits::PassCache>,
+    /// Changed files this pass read for the generated-path batch guard. See
+    /// `generated_paths`.
+    changed_files: std::cell::RefCell<generated_paths::PassCache>,
+    /// The base's ejection guards ([`crate::merge_steward::EjectionGuards`]).
+    ejection_guards: crate::merge_steward::EjectionGuards,
 }
 
 /// Exact-head approval gate reads made during one pass, by PR number.
@@ -1915,6 +1920,7 @@ mod capacity_cancellation;
 mod carried_commits;
 mod code_owner_wait;
 mod exact_head_merge;
+mod generated_paths;
 mod head_rollup;
 mod ledger;
 mod mutation_outcome;
@@ -1957,6 +1963,7 @@ use capacity_cancellation::{
     CapacityCancelError, apply_capacity_preemption, cancel_capacity_preemption_after_revalidation,
     mark_cancellation_skipped, persist_capacity_evidence,
 };
+use generated_paths::read_ejection_guards;
 use ledger::{attempt_key, check_attempt_key, load_ledger, record_audit, save_ledger};
 /// How `repo`'s `base` admits an approved head, for `shipyard pr`'s next-steps
 /// block. Read-only.
