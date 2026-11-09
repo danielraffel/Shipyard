@@ -734,7 +734,7 @@ merge-only rule as an approval. The steward itself still requires the status
 on the head until the train admits PRs.
 Before it enqueues or merges a head, the steward also refuses one that carries
 commits of another open PR whose head is not approved
-(`carries_unapproved_commits:#Q`; see `docs/automated-draining.md`). A PR stacked on P, directly or through other open PRs' branches, or one that only inherits P's commit (not in its own diff against its own base), never counts as carrying. Nor does a PR that merged P's branch: a shared commit counts only if it is on Q's first-parent chain or not on P's own first-parent chain, so P's own commits reaching Q through a merge's second parent do not hold P, while P merging held work in or building on commits on Q's own first-parent chain is still refused (residual: P built on commits Q itself merged in as a second parent is cleared; see `docs/automated-draining.md`). A PR whose listing is over the 250-commit cap is judged by its own diff against its own base, and an unapproved one whose own diff is still over the cap blocks P only if probing P's commits (at most 50) cannot rule out that it carries them (`carried_commits_over_cap:#Q`). A P that is itself over the cap (a mirror-history import) is checked the other way: P's head is probed against the roots of each other open PR's own commits, so it is admitted unless it carries an unapproved PR's commit, or an unapproved PR is too large to settle.
+(`carries_unapproved_commits:#Q`; see `docs/automated-draining.md`). A PR stacked on P, directly or through other open PRs' branches, or one that only inherits P's commit (not in its own diff against its own base), never counts as carrying. Nor does a PR that merged P's branch: a shared commit counts only if it is on Q's first-parent chain or not on P's own first-parent chain, so P's own commits reaching Q through a merge's second parent do not hold P, while P merging held work in or building on commits on Q's own first-parent chain is still refused (residual: P built on commits Q itself merged in as a second parent is cleared; see `docs/automated-draining.md`). A PR whose listing is over the 250-commit cap is judged by its own diff against its own base, and an unapproved one whose own diff is still over the cap blocks P only if probing P's commits (at most 50), or for a larger P the roots of P's commits (at most 50), cannot rule out that it carries them (`carried_commits_over_cap:#Q`). A P that is itself over the cap (a mirror-history import) is checked the other way: P's head is probed against the roots of each other open PR's own commits, so it is admitted unless it carries an unapproved PR's commit, or an unapproved PR is too large to settle.
 
 ## The carrier re-arms with `expectedHeadOid`, through the internal path
 
@@ -4455,6 +4455,17 @@ and stop landings that never pass through `ghapp`
 (docs/review-verdict-status.md). It is `pending` while a head awaits its
 reviewer (the steward reads that as waiting, not `required_failed`; nothing for
 the author to do) and `failure` only for a counted HOLD or an unreadable review.
+
+A HOLD makes its head un-approvable, so posting an APPROVE of a held head
+only makes the pull request look approved. The managed
+`verdict-contradiction-guard` refuses that APPROVE before it posts (same
+counting rule as the gate, from any signer) and names the HOLD's signer and
+URL; the author pushes a new head (merging the base) and the reviewer
+reviews that. It also refuses a verdict that contradicts the same session's
+opposite verdict on the same head within ten minutes; a deliberate
+retraction of one's own APPROVE posts with `SHIPYARD_VERDICT_RETRACT=1`. The
+steward reports such a row as `held` with `blocked_detail` "held head: needs
+a new head", which `shipyard wait pr --state actionable` prints.
 
 Every rule above judges comments posted through the shared fleet App, which
 every agent can use, so none of it is proof of who reviewed. A base with

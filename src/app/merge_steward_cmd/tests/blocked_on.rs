@@ -83,6 +83,10 @@ fn a_held_head_names_holder_and_comment() {
     assert_eq!(blocked.blocked_on, "held");
     assert_eq!(blocked.since.as_deref(), Some("2026-10-31T15:00:00Z"));
     assert_eq!(blocked.since_source, Some("hold_posted"));
+    assert_eq!(
+        blocked.blocked_detail.as_deref(),
+        Some("held head: needs a new head")
+    );
     let held_by = blocked.held_by.expect("holder");
     assert_eq!(
         (held_by.holder.as_str(), held_by.record, held_by.id),

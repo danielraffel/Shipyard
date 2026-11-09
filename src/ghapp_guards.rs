@@ -2,7 +2,8 @@
 //!
 //! `scripts/ghapp` runs `queue-removal-guard`, `queue-arm-guard`,
 //! `branch-refresh-guard`, `merge-guard`, `verdict-hold-hook`,
-//! `verdict-session-stamp` and `reviewer-claim-guard` from
+//! `verdict-session-stamp`, `reviewer-claim-guard` and
+//! `verdict-contradiction-guard` from
 //! `$SHIPYARD_GHAPP_GUARDS_DIR` (default `~/.config/shipyard/guards`) when they
 //! are present and executable. Nothing else puts them there, so a host keeps
 //! whatever copy somebody placed by hand, possibly months stale. This module
@@ -48,7 +49,7 @@ pub struct ManagedGuard {
 /// Every guard `shipyard guards install` manages, in install order: the arm
 /// and branch-refresh guards import the removal guard's request parser, so the
 /// parser lands first.
-pub const MANAGED_GUARDS: [ManagedGuard; 7] = [
+pub const MANAGED_GUARDS: [ManagedGuard; 8] = [
     ManagedGuard {
         name: "queue-removal-guard",
         source_path: "scripts/ghapp_queue_removal_guard.py",
@@ -92,6 +93,15 @@ pub const MANAGED_GUARDS: [ManagedGuard; 7] = [
         name: "reviewer-claim-guard",
         source_path: "scripts/ghapp_reviewer_claim_guard.py",
         contents: include_bytes!("../scripts/ghapp_reviewer_claim_guard.py"),
+    },
+    // Refuses an APPROVE of a head a counting HOLD already names, and a
+    // verdict contradicting the same session's opposite verdict on that head
+    // within ten minutes. Loads the arm guard's verdict rules and the
+    // reviewer-claim guard's target parser, so it installs after both.
+    ManagedGuard {
+        name: "verdict-contradiction-guard",
+        source_path: "scripts/ghapp_verdict_contradiction_guard.py",
+        contents: include_bytes!("../scripts/ghapp_verdict_contradiction_guard.py"),
     },
 ];
 

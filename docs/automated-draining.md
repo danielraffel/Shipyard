@@ -127,9 +127,19 @@ the steward reads Q's own diff against Q's own base (`Q.base...Q.head`, paged),
 and the cap applies to that. If Q's own diff is still over 250 commits, an
 approved Q is ignored, and for an unapproved Q each of P's commits (at most 50)
 is probed: it counts only if Q's head reaches it and Q's base does not. So an
-over-cap Q that carries none of P's commits never blocks P. Only when that
-cannot be settled (P has more than 50 commits to probe) does P fail closed
-(`carried_commits_over_cap:#Q`). A P that is itself over the cap (for example a
+over-cap Q that carries none of P's commits never blocks P. When P has more
+than 50 commits to probe, the steward reads P's own commits not on the base
+with their parents (`base...P.head`) and probes whether Q's head reaches each
+root of that set (at most 50 roots). Every commit of P's set has its parents
+in the set or on the base, so a Q head that reaches any of P's commits reaches
+one of those roots; a Q head that reaches none of them shares no commit off the
+base with P and does not block it. This is the same as "every merge base of P
+and Q is on the base", without relying on the single merge base the compare API
+reports, which a criss-cross history can have several of. Only when that
+cannot be settled either (Q's head reaches a root of P's, P's graph is
+incomplete or has more than 50 roots) does P fail closed
+(`carried_commits_over_cap:#Q`); a failed read there fails closed as
+`carried_commits_unreadable:#Q`. A P that is itself over the cap (for example a
 mirror-history import of thousands of commits) cannot list its own commits, so
 the check runs the other way: for every other open Q (the same exclusions
 apply), the steward reads Q's own commits not on the base with their parents
@@ -342,7 +352,7 @@ not listed as blocked.
 | Token | Meaning | Who moves it |
 |---|---|---|
 | `no_verdict` | Green, and no reviewer verdict names this head: "awaiting the standing reviewer; nothing for the author to do" | reviewer |
-| `held` | A counting HOLD names this head | author: fix and push |
+| `held` | A counting HOLD names this head, so it is un-approvable and any APPROVE of it is ignored; `blocked_detail` reads "held head: needs a new head" | author: fix and push a new head (if the HOLD is wrong, push a new head anyway and comment `dispute: <reason>`) |
 | `approval_excluded:<reason>` | An APPROVE names this head but does not count. Reasons: `unattributed`, `no_stamp`, `noncanonical_stamp`, `session_not_allowed`, `unlisted_stamp_session`, `no_signer_list`, `no_signer_line`, `uncounted_signer`, `unbound_identity`, `pr_author`, `impersonated_app`, `untrusted_reviewer`, `unlisted_reviewer`, `unlisted_human`, `predates_head` (posted before the head commit), `stale_head` (only an earlier head is approved), `self_approved` | reviewer or fleet config |
 | `ejection_cap` | The queue removed this head too often since its last approval | reviewer, or a new push |
 | `approval_unread` | The approval gate could not be read this pass | next pass |
@@ -357,7 +367,7 @@ not listed as blocked.
 | `ejected_same_head:<cause>` | The queue ejected this exact head and the steward will not re-enqueue it: the failure is the head's, could not be placed, or the head's one retry is spent. `blocked_detail` carries the classifier's reason (the failing job and whether the retry was spent). Read from the same queue state in a dry run and an apply pass; `since` is the removal | repair lane |
 | `waiting_full_test_tier`, `waiting_enqueue_requirements` | Admission waits on a deferred check tier or a GitHub requirement | CI |
 | `carries_unapproved_commits:#Q` | Approved and green, but carries commits of open pull request #Q, whose head is not approved; `blocked_detail` names the commits | Q's reviewer, or the author: drop Q's commits |
-| `carried_commits_over_cap:#N`, `carried_commits_unreadable` | Whether the head carries unapproved commits could not be proven (an unapproved #N whose own diff is over 250 commits while P has more than 50 commits to probe; for a P over 250 commits, an unapproved #N whose own commits are over 250, have more than 50 roots, or exceed P's 100 probes; or a failed read) | author, or next pass |
+| `carried_commits_over_cap:#N`, `carried_commits_unreadable` | Whether the head carries unapproved commits could not be proven (an unapproved #N whose own diff is over 250 commits while P has more than 50 commits to probe and #N's head reaches a root of P's commits, or P's commits have more than 50 roots; for a P over 250 commits, an unapproved #N whose own commits are over 250, have more than 50 roots, or exceed P's 100 probes; or a failed read) | author, or next pass |
 | `revalidating` | The head or queue changed during the pass | next pass |
 | `waiting_code_owner:<owners>` | Approved and green, but the base's ruleset requires a code-owner review and no owner `CODEOWNERS` (at the base) assigns to a changed file has approved this exact head. The steward asks GitHub nothing and records no mutation; it posts one comment per head mentioning the owners (`+`-joined in the token). It never reads `reviewDecision`, which is `null` on a base that requires zero approvals even after the owner approves. A team or e-mail owner, or a file the PR author owns, is left to GitHub | code owner |
 | `code_owner_review` | GitHub refused the enqueue: a code-owner review is outstanding. Recorded `rejected` with GitHub's message, never left uncertain | code owner |

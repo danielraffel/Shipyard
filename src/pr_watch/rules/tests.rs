@@ -930,6 +930,19 @@ fn a_hold_nobody_repaired_is_reported_after_held_after_with_its_age() {
     assert_eq!(event.age_secs, Some(90 * 60));
     assert_eq!(event.age.as_deref(), Some("1h30m"));
     assert!(!event.fix.safe_to_auto_apply);
+    assert!(
+        event.summary.contains("held head: needs a new head"),
+        "{}",
+        event.summary
+    );
+    assert!(
+        event
+            .fix
+            .command
+            .starts_with("held head: needs a new head."),
+        "{}",
+        event.fix.command
+    );
     let config = RuleConfig {
         held_after: Duration::minutes(10),
         ..RuleConfig::default()

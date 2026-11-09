@@ -66,8 +66,12 @@
 //! refuses; for an unapproved one each of P's commits (at most
 //! [`MAX_PROBED_COMMITS`]) is probed for reachability from Q's head and
 //! absence from Q's base, so an over-cap Q that carries none of P's commits
-//! never blocks P. Only when that cannot be settled does P fail closed
-//! (`carried_commits_over_cap:#Q`). A candidate P over the cap itself is
+//! never blocks P. When P has more commits than that, P's commits not on the
+//! base are read once with their parents and Q's head is probed for each of
+//! their roots (at most [`MAX_PROBED_COMMITS`]): a head that reaches none of
+//! the roots reaches none of P's commits, which clears Q whatever its size
+//! (see `candidate_roots_unreached`). Only when neither settles it does P
+//! fail closed (`carried_commits_over_cap:#Q`). A candidate P over the cap itself is
 //! checked the other way ([`over_cap_refusal`]): each other open Q's own
 //! commits not on the base are read with their parents, and P's head is probed
 //! for reaching the roots of that set, so a large P (a mirror-history import)
@@ -75,8 +79,11 @@
 //! unapproved Q too large to settle, still refuses. An unreadable listing,
 //! compare, probe or approval also fails closed
 //! (`carried_commits_unreadable`). Q's approval is judged only while its live
-//! head is still the head the listing saw; a push after the listing also
-//! fails closed (`carried_commits_unreadable:#Q`) until the next pass.
+//! head is still the head the listing saw; when an overlap with Q survives, a
+//! push after the listing fails closed (`carried_commits_unreadable:#Q`) until
+//! the next pass. A Q cleared by a probe of its listed head is not held against
+//! P even if Q has since moved: the held content is the listed head's, and the
+//! next pass re-lists Q.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -402,13 +409,16 @@ fn is_ancestor(run_gh: RunGh<'_>, repo: &str, ancestor: &str, of: &str) -> Resul
 
 /// Settle one overlap with `q`: narrow it to `q`'s own diff, judge `q`, and
 /// for an unapproved `q` whose own diff is over the cap probe P's commits
-/// one by one. `None` when `q` carries none of P's commits. An unapproved,
-/// over-cap `q` refuses only when the probe cannot settle the overlap.
+/// one by one, or, when P has too many for that, the roots of P's commits
+/// ([`candidate_roots_unreached`]). `None` when `q` carries none of P's
+/// commits. An unapproved, over-cap `q` refuses only when neither probe can
+/// settle the overlap.
 #[allow(clippy::too_many_arguments)]
 fn resolve_overlap(
     run_gh: RunGh<'_>,
     repo: &str,
     base: &str,
+    p_head: &str,
     q: &OpenPr,
     own: &BTreeSet<String>,
     overlap: Carried,
@@ -457,11 +467,65 @@ fn resolve_overlap(
                     },
                     judgement,
                 )),
-                Ok(None) => Some((unbounded, judgement)),
+                Ok(None) => {
+                    match candidate_roots_unreached(run_gh, repo, base, p_head, q, graphs) {
+                        Ok(true) => None,
+                        Ok(false) => Some((unbounded, judgement)),
+                        Err(error) => unreadable(error),
+                    }
+                }
                 Err(error) => unreadable(error),
             }
         }
     }
+}
+
+/// Whether `q`'s head provably reaches none of P's commits not on `base`,
+/// settled from P's side when P has too many commits to probe one by one.
+///
+/// Let S be P's commits not on `base` (`base...p_head`, read with parents).
+/// S is closed downward inside itself: a commit of S has every parent either
+/// in S or on `base`. So if `q`'s head reaches any commit of S, following
+/// parents that stay in S from it ends at a root of S (a commit of S none of
+/// whose parents is in S), which `q`'s head then reaches too. Probing every
+/// root therefore settles the whole set: when `q`'s head reaches no root, it
+/// reaches no commit of S, and `q`'s own commits (all reachable from its
+/// head) share none with P. This is the merge-base argument made exact: it
+/// says every merge base of P's and `q`'s heads is on `base`, without
+/// trusting the single merge base the compare API names, which a criss-cross
+/// history can have several of.
+///
+/// `false` (not settled, so the caller fails closed) when S is over the cap,
+/// empty (the base absorbed P between reads; the next pass re-reads it), or
+/// has more than [`MAX_PROBED_COMMITS`] roots, or when any root is reachable.
+/// A root with no parents at all (an orphan history) is a root like any
+/// other. The graph must be complete: a missing commit could hide a root.
+/// A failed read is an error.
+fn candidate_roots_unreached(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    base: &str,
+    p_head: &str,
+    q: &OpenPr,
+    graphs: &mut GraphCache,
+) -> Result<bool, String> {
+    let CommitGraph::Complete(graph) = cached_graph(run_gh, repo, graphs, base, p_head)? else {
+        return Ok(false);
+    };
+    let roots: Vec<&String> = graph
+        .iter()
+        .filter(|(_, parents)| !parents.iter().any(|parent| graph.contains_key(parent)))
+        .map(|(sha, _)| sha)
+        .collect();
+    if roots.is_empty() || roots.len() > MAX_PROBED_COMMITS {
+        return Ok(false);
+    }
+    for root in roots {
+        if is_ancestor(run_gh, repo, root, &q.head_sha)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Whether P may be admitted given what it carries and each carried pull
@@ -760,6 +824,7 @@ pub(super) fn refusal_with(
             run_gh,
             repo,
             base,
+            head_sha,
             q,
             &own,
             overlap,
