@@ -1453,12 +1453,12 @@ mod tests {
         WAIT_EXIT_CLOSED, WAIT_EXIT_INVALID, WAIT_EXIT_NO_FALLBACK, WAIT_EXIT_TERMINAL_WRONG,
         WAIT_EXIT_TIMEOUT, WAIT_EXIT_UNSUPPORTED,
     };
+    use crate::config::LoadedConfig;
     use crate::delegated_validation::DelegatedValidationWitness;
     use crate::gh::GhPrepareError;
     use crate::job::{Job, Priority, TargetResult, TargetStatus, ValidationMode};
     use crate::queue::{KEEP_COMPLETED, Queue};
     use crate::wait as wait_logic;
-    use crate::config::LoadedConfig;
     use crate::wait_transport::wait_for_condition_with_timeout;
 
     fn delegated_snapshot(policy_context: &str) -> Value {

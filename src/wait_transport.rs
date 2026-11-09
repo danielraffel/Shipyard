@@ -1383,10 +1383,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        PR_CHECKS_JSON_FIELDS, PR_VIEW_JSON_FIELDS, SnapshotHeadChanged, WaitOutcome,
+        PR_CHECKS_JSON_FIELDS, PR_VIEW_JSON_FIELDS, PollBackoff, SnapshotHeadChanged, WaitOutcome,
         annotate_required_checks, ensure_snapshot_matches_live_head, is_transient_snapshot_error,
         pr_event_filter, read_snapshot_file, release_event_filter, remaining_snapshot_timeout,
-        PollBackoff, run_event_filter, snapshot_command_timeout, synthesize_pr_snapshot_from_rest,
+        run_event_filter, snapshot_command_timeout, synthesize_pr_snapshot_from_rest,
         wait_for_condition_with_backoff, wait_for_condition_with_timeout,
     };
     #[cfg(unix)]
