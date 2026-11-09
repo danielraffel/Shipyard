@@ -1032,38 +1032,7 @@ fn attribute(
             && !steps.iter().all(established))
             || check.conclusion == "cancelled");
     if widened {
-        return match latest_conclusion(run_gh, repo, head, &check.name) {
-            Ok(Some(conclusion)) if conclusion == "success" => FailureAttribution::Infra(
-                steps
-                    .iter()
-                    .map(|step| match (&step.reading, &step.infra) {
-                        (StepReading::Environment(_) | StepReading::Interruption(_), _)
-                        | (_, None) => step.render(),
-                        (_, Some(hit)) => format!(
-                            "{} / {} [job {}]: infrastructure ({}): {}",
-                            step.check, step.step, step.job_id, hit.signature, hit.line
-                        ),
-                    })
-                    .chain(
-                        (check.conclusion == "cancelled")
-                            .then(|| "concluded `cancelled` on the merge group".to_owned()),
-                    )
-                    .chain(std::iter::once(format!("passed on head {}", short(head))))
-                    .collect::<Vec<_>>()
-                    .join("; "),
-            ),
-            other => FailureAttribution::NoInfraSignature(format!(
-                "`{}` on the merge group looks like infrastructure, but the same check did not \
-                 pass on head {} ({}), so a head-caused failure is not ruled out",
-                check.conclusion,
-                short(head),
-                match other {
-                    Ok(Some(conclusion)) => format!("`{conclusion}`"),
-                    Ok(None) => "no completed run".to_owned(),
-                    Err(error) => format!("unreadable: {error}"),
-                }
-            )),
-        };
+        return widened_attribution(run_gh, repo, head, check, &steps);
     }
     if !steps.is_empty() && steps.iter().all(established) {
         return FailureAttribution::Infra(
@@ -1130,6 +1099,51 @@ fn attribute(
         describe(&on_head),
         short(head)
     ))
+}
+
+/// Under the retry discipline, a widened infrastructure reading (an
+/// [`INFRA_STEP_SIGNATURES`] line, or a `cancelled` conclusion) clears the
+/// head only when the same check passed on the head itself.
+fn widened_attribution(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    head: &str,
+    check: &FailedCheck,
+    steps: &[&StepEvidence],
+) -> FailureAttribution {
+    match latest_conclusion(run_gh, repo, head, &check.name) {
+        Ok(Some(conclusion)) if conclusion == "success" => FailureAttribution::Infra(
+            steps
+                .iter()
+                .map(|step| match (&step.reading, &step.infra) {
+                    (StepReading::Environment(_) | StepReading::Interruption(_), _) | (_, None) => {
+                        step.render()
+                    }
+                    (_, Some(hit)) => format!(
+                        "{} / {} [job {}]: infrastructure ({}): {}",
+                        step.check, step.step, step.job_id, hit.signature, hit.line
+                    ),
+                })
+                .chain(
+                    (check.conclusion == "cancelled")
+                        .then(|| "concluded `cancelled` on the merge group".to_owned()),
+                )
+                .chain(std::iter::once(format!("passed on head {}", short(head))))
+                .collect::<Vec<_>>()
+                .join("; "),
+        ),
+        other => FailureAttribution::NoInfraSignature(format!(
+            "`{}` on the merge group looks like infrastructure, but the same check did not \
+                 pass on head {} ({}), so a head-caused failure is not ruled out",
+            check.conclusion,
+            short(head),
+            match other {
+                Ok(Some(conclusion)) => format!("`{conclusion}`"),
+                Ok(None) => "no completed run".to_owned(),
+                Err(error) => format!("unreadable: {error}"),
+            }
+        )),
+    }
 }
 
 /// The first [`RUNNER_LOST_ANNOTATIONS`] annotation message.

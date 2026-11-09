@@ -1143,8 +1143,9 @@ malformed authority, and a non-null queue still stop or select the queue path.
 Never treat queue absence alone as permission to rearm. The PR must first have
 been observed in the queue (durably recorded across restarts), and only an
 `invalid_merge_commit` removal may be re-enqueued automatically (except by the
-merge steward on a merge-queue base, whose retry discipline refuses it on the
-same head; see `docs/automated-draining.md` "Ejection guards"). Admission is
+merge steward's own enqueue on a merge-queue base, whose retry discipline
+refuses it on the same head; the `--arm-unqueued` backstop does not apply the
+discipline; see `docs/automated-draining.md` "Ejection guards"). Admission is
 also head-scoped: `auto-merge` and the steward's ordinary enqueue read the PR's
 queue timeline and refuse a head removed for `failed_checks` /
 `merge_conflict` with no new head since, even from a ship-state created after
@@ -4325,9 +4326,10 @@ alone is not infra; a cancelled check is placed by comparison.
 (`[auto_merge] infra_only_same_head_retry`, default on with a merge queue): only
 infra clears a check (a runner conclusion or `cancelled`, a lost-runner
 annotation, a network/interruption signature, or a step-timeout / HTTP 5xx /
-`rate limit exceeded` / runner-shutdown line at the failing step,
-`INFRA_STEP_SIGNATURES`); "passed on the head" and "fails on the base" no longer
-do, and `invalid_merge_commit` is never re-enqueued on the same head. Refusals
+rate-limit / runner-shutdown line at the failing step,
+`INFRA_STEP_SIGNATURES`; the widened readings and `cancelled` also need the same
+check passed on the head); "passed on the head" alone and "fails on the base"
+no longer do, and `invalid_merge_commit` is never re-enqueued on the same head. Refusals
 read `ejected_same_head:<cause>:needs_new_head`: push a fix, or for
 `invalid_merge_commit`/`merge_conflict` merge the base once and push once. The
 same `[auto_merge]` table holds `generated_paths` (globs) and

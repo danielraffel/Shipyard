@@ -433,18 +433,24 @@ red_check_outranks_pending = true         # default: on with a merge queue
 infra_only_same_head_retry = true         # default: on with a merge queue
 ```
 
-- **Generated-path batch guard.** Before an enqueue the steward reads the
-  candidate's changed files (one GraphQL `files(first:100)` page, cached for the
-  pass; paged to GitHub's 3000-file limit only for a larger pull request). When
-  it changes a generated path, the steward re-reads the queue live and reads
-  each queued entry's files; the first entry that changes the same path defers
+- **Generated-path batch guard.** Before an enqueue the steward re-reads the
+  queue live; when another entry is queued it reads the candidate's changed
+  files (one GraphQL `files(first:100)` page, cached for the pass; paged to
+  GitHub's 3000-file limit only for a larger pull request). When the candidate
+  changes a generated path it reads each queued entry's files; the first entry that changes the same path defers
   the candidate as `generated_path_batch:#<n>`, with no mutation and no error.
   It is admitted on the first pass after `#<n>` leaves the queue. A file list
   that cannot be read never admits (`steward_error`); one that is still
   incomplete after paging is compared by the other side's generated paths, so
   it can only defer. Two different files under one glob (two shards) do not
   collide; only the same path does. With no `generated_paths` the guard never
-  defers.
+  defers. What it prevents: the two heads sharing one batch, so a textual
+  conflict or drift no longer ejects the batch-mate, and the deferred head
+  meets the other's change as a `DIRTY` merge state (merge the base) instead
+  of in the queue. A deferred head that merges textually but whose generated
+  file drifts against the merged tree can still be ejected once; it then
+  needs a regenerate commit either way. A deferred head gets no priority over
+  a fresh one in the next pass.
 - **A red required check outranks a pending one.** A head with a failed
   required check reports `blocked_on=required_failed:<contexts>` (the running
   contexts in `blocked_detail`) even while another required check is still
@@ -462,16 +468,27 @@ infra_only_same_head_retry = true         # default: on with a merge queue
   an HTTP 5xx or `rate limit exceeded` download answer, or the runner's own
   shutdown lines (`INFRA_STEP_SIGNATURES` in `src/environment_requeue.rs`). A
   check that merely passed on the head, or also fails on the base tip, is not
-  retried: on Pulp every merge-group-only failure passed on its head, and 9 of
-  23 same-head retries failed again. A ctest-level `***Timeout` is not an
-  infrastructure line. `invalid_merge_commit` is never re-enqueued on the same
+  retried: on Pulp every merge-group-only failure passed on its head; of 23
+  same-head retries 12 merged and 9 failed again the same way. The discipline
+  trades some of those 12 flake recoveries (which now need a new head) for
+  the 9 wasted group builds; turn it off per base if flakes dominate. The
+  widened readings (a step-timeout, HTTP 5xx or rate-limit line, a
+  `cancelled` conclusion) clear the head only when the same check passed on
+  the head itself. A ctest-level `***Timeout` is not an infrastructure line. `invalid_merge_commit` is never re-enqueued on the same
   head (before, it reset the refusal: #11698 went `failed_checks`, then three
   immediate `invalid_merge_commit` removals, each re-enqueued). Every refusal
   reads `ejected_same_head:<cause>:needs_new_head`.
 
-Turn one off by setting its key to `false` in the base's config. An unreadable
-config keeps them at their merge-queue defaults with no generated paths, and
-the enqueue's own approval read refuses an unreadable config anyway.
+Turn one off by setting its key to `false` in the base's config. If the
+pass-start config read fails, the guards keep their merge-queue defaults and
+the batch guard re-reads the config live before each enqueue; a second failure
+refuses the enqueue (`steward_error`) rather than admitting unguarded.
+
+Scope: the guards apply to the steward's own enqueue and its `blocked_on`
+report. The `--arm-unqueued` native-auto-merge backstop (for pull requests the
+steward does not own), `shipyard auto-merge`, `shipyard ship` and the `ghapp`
+arm guard keep their earlier same-head rules, including re-arming after
+`invalid_merge_commit`.
 
 ## Things that bite
 
