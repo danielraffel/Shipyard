@@ -13,9 +13,13 @@ case "$*" in
 esac
 "#;
 
-/// Revalidate a ready PR against `deadline`, returning the error, the wall
-/// time and the `gh` invocations.
-fn revalidate_until(deadline: Instant) -> (Option<String>, Duration, Vec<String>) {
+/// Revalidate a ready PR within `budget`, returning the error, the wall time
+/// and the `gh` invocations.
+///
+/// The deadline starts after the fixtures exist: building the fake `gh` can
+/// compile a native helper, and on a loaded host that alone can spend a
+/// budget fixed before it, so no read would ever start.
+fn revalidate_within(budget: Duration) -> (Option<String>, Duration, Vec<String>) {
     let temp = tempfile::tempdir().expect("temp");
     let actions = fake_gh(&temp, HUNG_PR_READ);
     let observed = ready_pr();
@@ -25,6 +29,7 @@ fn revalidate_until(deadline: Instant) -> (Option<String>, Duration, Vec<String>
     let context = mutation_apply_context(&actions, &observation, &ledger_path, &control);
     let policy = queue_policy();
     let started = Instant::now();
+    let deadline = started + budget;
     let (_, error) = revalidate_recovery_target(
         &context,
         &observed,
@@ -54,7 +59,7 @@ fn deadline_held(error: Option<&str>) -> bool {
 
 #[test]
 fn recovery_revalidation_kills_a_hung_github_read_at_one_absolute_deadline() {
-    let (error, elapsed, calls) = revalidate_until(Instant::now() + Duration::from_secs(1));
+    let (error, elapsed, calls) = revalidate_within(Duration::from_secs(1));
     assert!(deadline_held(error.as_deref()), "{error:?}");
     assert!(!calls.is_empty(), "control: the call log records reads");
     assert!(
@@ -67,7 +72,7 @@ fn recovery_revalidation_kills_a_hung_github_read_at_one_absolute_deadline() {
 fn a_spent_recovery_deadline_fails_closed_before_any_read() {
     // The outcome a loaded host reaches when the merge-queue read uses the
     // whole budget, reached here without depending on load.
-    let (error, elapsed, calls) = revalidate_until(Instant::now());
+    let (error, elapsed, calls) = revalidate_within(Duration::ZERO);
     assert!(
         error
             .as_deref()
