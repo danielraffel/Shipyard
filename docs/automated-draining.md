@@ -566,9 +566,13 @@ head, head branch in the base repository, never a fork):
 | `approved_green_not_queued` | evaluate it first in the next pass's admission (after the deferral carry) | none: it only reorders the steward's own admission, which keeps every gate |
 | `stacked_base_merged` | retarget it to the steward's base | the pull request is unchanged; its `stacked:<n>` parent merged into the steward's base from exactly the branch it is based on; and that branch still points at the parent's merged head, so nothing unlanded is carried |
 
-`done` is final at that head; an act that is refused, fails, or cannot read a
-precondition is retried at most three times with a backoff (15, 30 minutes)
-and escalates meanwhile. Act records outlive a pull request dropping out of a
+`done` and `failed` are final at that head (a `failed` act was attempted and
+may have reached GitHub: one of several dispatched workflows, or a call that
+timed out after GitHub took it, so it is never sent again). An act refused by
+a live revalidation, or deferred because a precondition could not be read,
+attempted nothing and is retried at most three times with a backoff (15, 30
+minutes); every act that did not happen escalates at once, within the per-pass
+cap. Act records outlive a pull request dropping out of a
 pass (kept 14 days), so a census gap or a close and reopen never repeats one.
 At most `max_acts_per_pass` GitHub-writing acts run per repository per pass,
 none past the pass time budget, and none on a row the pass budget deferred or
