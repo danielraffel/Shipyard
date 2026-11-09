@@ -4329,7 +4329,9 @@ annotation, a network/interruption signature, or a step-timeout / HTTP 5xx /
 rate-limit / runner-shutdown line at the failing step,
 `INFRA_STEP_SIGNATURES`; the widened readings and `cancelled` also need the same
 check passed on the head); "passed on the head" alone and "fails on the base"
-no longer do, and `invalid_merge_commit` is never re-enqueued on the same head. Refusals
+no longer do (except a listed `[auto_merge] known_flaky_tests` name, when the
+ctest FAILED block names only listed tests and the check passed on the head),
+and `invalid_merge_commit` is never re-enqueued on the same head. Refusals
 read `ejected_same_head:<cause>:needs_new_head`: push a fix, or for
 `invalid_merge_commit`/`merge_conflict` merge the base once and push once. The
 same `[auto_merge]` table holds `generated_paths` (globs) and

@@ -880,6 +880,18 @@ fn assess_strict(
     answers: &HashMap<String, Result<String, String>>,
     ejections: u32,
 ) -> EnvironmentRequeue {
+    assess_flaky(answers, ejections, &[])
+}
+
+fn assess_flaky(
+    answers: &HashMap<String, Result<String, String>>,
+    ejections: u32,
+    known: &[&str],
+) -> EnvironmentRequeue {
+    let known = known
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect::<Vec<_>>();
     let mut report =
         explain_pr_queue_state(&fixture("pr_real_8678_first_environment_ejection.json"));
     report.ejections_of_current_head = ejections;
@@ -892,7 +904,7 @@ fn assess_strict(
             .cloned()
             .unwrap_or_else(|| Err(format!("unexpected call {}", args[1])))
     };
-    assess_with(&gh, REPO, &report, true, true).expect("applies")
+    assess_with(&gh, REPO, &report, true, Some(&known)).expect("applies")
 }
 
 /// One failing `Run` step whose output ends at `lines`, the last of which is
@@ -1059,4 +1071,114 @@ fn infrastructure_lines_in_the_script_echo_or_far_from_the_failure_do_not_count(
         infra_signature_at_failure(&log, "2026-10-09T23:10:00Z"),
         None
     );
+}
+
+// ── known flakes (`known_flaky_tests`) ─────────────────────────────────────
+
+/// Pulp's ctest summary shape, naming `tests`.
+fn ctest_log(tests: &[&str]) -> String {
+    let mut lines = vec![
+        "99% tests passed, 1 tests failed out of 24365".to_owned(),
+        "The following tests FAILED:".to_owned(),
+    ];
+    for (index, test) in tests.iter().enumerate() {
+        lines.push(format!("\t{} - {test} (Failed)", 13_700 + index));
+    }
+    lines.push("Errors while running CTest".to_owned());
+    lines.push("##[error]Process completed with exit code 8.".to_owned());
+    step_log(&lines.iter().map(String::as_str).collect::<Vec<_>>())
+}
+
+const PULP_FLAKES: [&str; 3] = [
+    "ui-script-plugin-editor-au",
+    "AsyncBlockWorker: a fast pull without an offline flag waits in Auto mode",
+    "a public WaveNet node runs its GPU path*",
+];
+
+#[test]
+fn the_ctest_failed_block_names_the_failing_tests() {
+    let log = ctest_log(&[
+        "ui-script-plugin-editor-au",
+        "Graphite still shadows the coordinates",
+    ]);
+    assert_eq!(
+        failed_tests_in_step(&log, "2026-10-09T23:10:00Z"),
+        vec![
+            "ui-script-plugin-editor-au",
+            "Graphite still shadows the coordinates"
+        ]
+    );
+    assert!(failed_tests_in_step(TEST_FAILURE_LOG, "2026-10-09T23:10:00Z").is_empty());
+    assert!(known_flaky_match(
+        "a public WaveNet node runs its GPU path*",
+        "a public WaveNet node runs its GPU path on Metal"
+    ));
+    assert!(!known_flaky_match(
+        "ui-script-plugin-editor-au",
+        "ui-script-plugin-editor-au3"
+    ));
+}
+
+/// #11584's shape: only `ui-script-plugin-editor-au` failed in the merge
+/// group, and the same check passed on the head.
+#[test]
+fn a_listed_flake_that_passed_on_the_head_gets_the_one_retry() {
+    let mut answers = interrupted_group(
+        "failure",
+        &test_failure_job(),
+        &ctest_log(&["ui-script-plugin-editor-au"]),
+    );
+    compare(&mut answers, Some("success"), Some("success"));
+    let verdict = assess_flaky(&answers, 1, &PULP_FLAKES);
+    assert!(verdict.allowed, "{}", verdict.reason);
+    assert!(
+        matches!(only_cause(&verdict), FailureAttribution::KnownFlake(detail) if detail.contains("ui-script-plugin-editor-au"))
+    );
+    // Control: the same ejection with no list is refused under the discipline.
+    assert!(!assess_flaky(&answers, 1, &[]).allowed);
+    // Still one per head.
+    assert!(!assess_flaky(&answers, 2, &PULP_FLAKES).allowed);
+}
+
+#[test]
+fn a_listed_flake_beside_an_unlisted_failure_or_red_on_the_head_is_refused() {
+    // #11471's test beside a listed flake: the unlisted one decides.
+    let mut answers = interrupted_group(
+        "failure",
+        &test_failure_job(),
+        &ctest_log(&[
+            "ui-script-plugin-editor-au",
+            "every hosted format adapter builds its editor from hosted_editor()",
+        ]),
+    );
+    compare(&mut answers, Some("success"), Some("success"));
+    let mixed = assess_flaky(&answers, 1, &PULP_FLAKES);
+    assert!(!mixed.allowed, "{}", mixed.reason);
+    // A listed flake whose check did not pass on the head is not cleared.
+    let mut answers = interrupted_group(
+        "failure",
+        &test_failure_job(),
+        &ctest_log(&["ui-script-plugin-editor-au"]),
+    );
+    compare(&mut answers, Some("success"), Some("failure"));
+    let red_head = assess_flaky(&answers, 1, &PULP_FLAKES);
+    assert!(!red_head.allowed, "{}", red_head.reason);
+    assert!(matches!(
+        only_cause(&red_head),
+        FailureAttribution::NoInfraSignature(_)
+    ));
+    // A step that names no test is never a known flake.
+    let mut answers = interrupted_group("failure", &test_failure_job(), TEST_FAILURE_LOG);
+    compare(&mut answers, Some("success"), Some("success"));
+    assert!(!assess_flaky(&answers, 1, &["dylib-*"]).allowed);
+}
+
+/// A listed check name (a single-test job such as
+/// `inject-worktree-lineage-hook`) is a known flake by itself.
+#[test]
+fn a_listed_check_name_is_a_known_flake() {
+    let mut answers = interrupted_group("failure", &test_failure_job(), TEST_FAILURE_LOG);
+    compare(&mut answers, Some("success"), Some("success"));
+    let verdict = assess_flaky(&answers, 1, &["macos"]);
+    assert!(verdict.allowed, "{}", verdict.reason);
 }

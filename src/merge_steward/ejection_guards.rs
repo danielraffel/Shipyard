@@ -36,6 +36,7 @@
 //! generated_path_batch_guard = true   # default: on when the base has a merge queue
 //! red_check_outranks_pending = true   # default: on when the base has a merge queue
 //! infra_only_same_head_retry = true   # default: on when the base has a merge queue
+//! known_flaky_tests = ["ui-script-plugin-editor-au"]  # names or `*` globs
 //! ```
 //!
 //! The batch guard needs `generated_paths`; with none listed it never defers.
@@ -52,6 +53,9 @@ pub const BATCH_GUARD_KEY: &str = "generated_path_batch_guard";
 pub const RED_OUTRANKS_PENDING_KEY: &str = "red_check_outranks_pending";
 /// Switch for [`EjectionGuards::infra_only_retry`].
 pub const INFRA_ONLY_RETRY_KEY: &str = "infra_only_same_head_retry";
+/// Test or check names (or `*` globs) whose failure earns the retry under
+/// the discipline ([`EjectionGuards::known_flaky_tests`]).
+pub const KNOWN_FLAKY_TESTS_KEY: &str = "known_flaky_tests";
 
 /// The ejection guards one base runs under.
 ///
@@ -69,6 +73,10 @@ pub struct EjectionGuards {
     /// Spend the free same-head retry only on infrastructure signatures, and
     /// never re-enqueue an `invalid_merge_commit` head.
     pub infra_only_retry: bool,
+    /// Known flaky tests or checks: under the discipline, an ejection whose
+    /// failing steps name only these tests (or whose check is one), and whose
+    /// check passed on the head, still earns the one same-head retry.
+    pub known_flaky_tests: Vec<String>,
     /// Why the base config could not be read, when it could not. The guards
     /// then keep their merge-queue defaults (on) with no generated paths.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -85,6 +93,7 @@ impl EjectionGuards {
             batch_guard: merge_queue,
             red_outranks_pending: merge_queue,
             infra_only_retry: merge_queue,
+            known_flaky_tests: Vec::new(),
             read_error: None,
         }
     }
@@ -106,6 +115,18 @@ impl EjectionGuards {
         guards.batch_guard = flag(BATCH_GUARD_KEY, guards.batch_guard);
         guards.red_outranks_pending = flag(RED_OUTRANKS_PENDING_KEY, guards.red_outranks_pending);
         guards.infra_only_retry = flag(INFRA_ONLY_RETRY_KEY, guards.infra_only_retry);
+        guards.known_flaky_tests = section
+            .get(KNOWN_FLAKY_TESTS_KEY)
+            .and_then(toml::Value::as_array)
+            .map(|names| {
+                names
+                    .iter()
+                    .filter_map(toml::Value::as_str)
+                    .map(|name| name.trim().to_owned())
+                    .filter(|name| !name.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
         guards.generated_paths = section
             .get(GENERATED_PATHS_KEY)
             .and_then(toml::Value::as_array)
@@ -265,6 +286,24 @@ generated_paths = [
                 "tools/scripts/agent_capability_catalog_dsp.py",
             ]
         );
+    }
+
+    #[test]
+    fn known_flaky_tests_are_read_from_the_base_config() {
+        let guards = EjectionGuards::from_table(
+            &table(
+                "[auto_merge]\nknown_flaky_tests = [\"ui-script-plugin-editor-au\", \" \", \"a public WaveNet node runs its GPU path*\"]\n",
+            ),
+            true,
+        );
+        assert_eq!(
+            guards.known_flaky_tests,
+            vec![
+                "ui-script-plugin-editor-au".to_owned(),
+                "a public WaveNet node runs its GPU path*".to_owned()
+            ]
+        );
+        assert!(EjectionGuards::for_base(true).known_flaky_tests.is_empty());
     }
 
     #[test]

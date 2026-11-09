@@ -1073,10 +1073,14 @@ fn same_head_enqueue_refusal(
             // not its own fault: the same classifier the native-arm backstop
             // and `shipyard ship` consult, read live from this queue answer.
             // The approval gate was already read live for this head above.
-            let retry =
-                same_head_retry_verdict(context.actions, context.observation, &report, discipline)
-                    .as_ref()
-                    .map(super::blocked_on::SameHeadRetry::from_verdict);
+            let retry = same_head_retry_verdict(
+                context.actions,
+                context.observation,
+                &report,
+                &context.ejection_guards,
+            )
+            .as_ref()
+            .map(super::blocked_on::SameHeadRetry::from_verdict);
             if let Some(ejection) = context
                 .approval_blockers
                 .borrow_mut()
@@ -1111,7 +1115,7 @@ pub(super) fn same_head_retry_verdict(
     actions: &GitHubActions,
     observation: &RepoObservation,
     report: &crate::pr_queue_state::PrQueueReport,
-    infra_only: bool,
+    guards: &crate::merge_steward::EjectionGuards,
 ) -> Option<crate::environment_requeue::EnvironmentRequeue> {
     if !crate::environment_requeue::applies(report) {
         return None;
@@ -1123,7 +1127,9 @@ pub(super) fn same_head_retry_verdict(
             &observation.repo,
             report,
             opted_in,
-            infra_only,
+            guards
+                .infra_only_retry
+                .then_some(guards.known_flaky_tests.as_slice()),
         ),
         Err(detail) => Some(crate::environment_requeue::EnvironmentRequeue::refused(
             format!("the re-enqueue policy is unreadable, so the head is not retried: {detail}"),

@@ -887,7 +887,7 @@ pub(super) fn annotate(
                     actions,
                     observation,
                     &crate::pr_queue_state::explain_pr_queue_state(&queue),
-                    discipline,
+                    &policy.ejection_guards,
                 )
                 .as_ref()
                 .map(SameHeadRetry::from_verdict);

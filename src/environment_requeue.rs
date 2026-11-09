@@ -424,6 +424,10 @@ pub struct StepEvidence {
     /// is there. Consulted only under the retry discipline.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub infra: Option<SignatureHit>,
+    /// The tests the step's own output says failed (a ctest `The following
+    /// tests FAILED:` block). Consulted only for `known_flaky_tests`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub failed_tests: Vec<String>,
 }
 
 impl StepEvidence {
@@ -506,6 +510,10 @@ pub enum FailureAttribution {
     HeadCaused(String),
     /// None of the reads could place it.
     Unknown(String),
+    /// Under the retry discipline: every test the failing step names is a
+    /// configured known flake (or the check itself is), and the same check
+    /// passed on the head.
+    KnownFlake(String),
     /// Under the retry discipline: no infrastructure signature explains it,
     /// so whether it passed on the head or fails on the base is not read.
     NoInfraSignature(String),
@@ -517,7 +525,7 @@ impl FailureAttribution {
     pub fn clears_head(&self) -> bool {
         matches!(
             self,
-            Self::Infra(_) | Self::FailsOnBase(_) | Self::PassedOnHead(_)
+            Self::Infra(_) | Self::FailsOnBase(_) | Self::PassedOnHead(_) | Self::KnownFlake(_)
         )
     }
 
@@ -529,6 +537,7 @@ impl FailureAttribution {
             Self::HeadCaused(detail) => ("head-caused", detail),
             Self::Unknown(detail) => ("unknown", detail),
             Self::NoInfraSignature(detail) => ("no infrastructure signature", detail),
+            Self::KnownFlake(detail) => ("known flake", detail),
         }
     }
 }
@@ -800,6 +809,11 @@ fn read_job(
                 .get("started_at")
                 .and_then(Value::as_str)
                 .and_then(|started| infra_signature_at_failure(&log, started)),
+            failed_tests: step
+                .get("started_at")
+                .and_then(Value::as_str)
+                .map(|started| failed_tests_in_step(&log, started))
+                .unwrap_or_default(),
         })
         .collect())
 }
@@ -817,10 +831,11 @@ pub fn assess(
     report: &PrQueueReport,
     opted_in: bool,
 ) -> Option<EnvironmentRequeue> {
-    assess_with(run_gh, repo, report, opted_in, false)
+    assess_with(run_gh, repo, report, opted_in, None)
 }
 
-/// [`assess`], with `infra_only` applying the steward's retry discipline
+/// [`assess`], with `discipline` (`Some(known_flaky_tests)`) applying the
+/// steward's retry discipline
 /// ([`crate::merge_steward::EjectionGuards::infra_only_retry`]): the
 /// not-head-caused retry is allowed only when every failing required check
 /// is an infrastructure failure ([`FailureAttribution::Infra`]: a runner
@@ -835,7 +850,7 @@ pub fn assess_with(
     repo: &str,
     report: &PrQueueReport,
     opted_in: bool,
-    infra_only: bool,
+    discipline: Option<&[String]>,
 ) -> Option<EnvironmentRequeue> {
     if !applies(report) {
         return None;
@@ -880,7 +895,7 @@ pub fn assess_with(
         ));
     };
     Some(
-        match assess_merge_group(run_gh, repo, report, &sha, infra_only) {
+        match assess_merge_group(run_gh, repo, report, &sha, discipline) {
             Ok(verdict) => verdict,
             Err(detail) => EnvironmentRequeue::refuse(detail, commit),
         },
@@ -892,7 +907,7 @@ fn assess_merge_group(
     repo: &str,
     report: &PrQueueReport,
     sha: &str,
-    infra_only: bool,
+    discipline: Option<&[String]>,
 ) -> Result<EnvironmentRequeue, String> {
     let pr = report
         .pr
@@ -948,7 +963,7 @@ fn assess_merge_group(
         .iter()
         .map(|check| CheckAttribution {
             check: check.name.clone(),
-            attribution: attribute(run_gh, repo, base, head, check, &evidence, infra_only),
+            attribution: attribute(run_gh, repo, base, head, check, &evidence, discipline),
         })
         .collect::<Vec<_>>();
     Ok(verdict_from_attribution(
@@ -988,6 +1003,7 @@ fn read_signatures(
                 reading: starved_job(&job, &annotations)
                     .map_or(StepReading::NoSignature, StepReading::Interruption),
                 infra: None,
+                failed_tests: Vec::new(),
             });
             continue;
         }
@@ -1011,8 +1027,9 @@ fn attribute(
     head: &str,
     check: &FailedCheck,
     evidence: &[StepEvidence],
-    infra_only: bool,
+    discipline: Option<&[String]>,
 ) -> FailureAttribution {
+    let infra_only = discipline.is_some();
     let steps = evidence
         .iter()
         .filter(|step| step.check == check.name)
@@ -1060,6 +1077,11 @@ fn attribute(
         && let Some(message) = runner_lost(&annotations)
     {
         return FailureAttribution::Infra(format!("[job {job_id}] {message}"));
+    }
+    if let Some(known_flaky) = discipline.filter(|list| !list.is_empty())
+        && let Some(tests) = known_flake(check, &steps, known_flaky)
+    {
+        return known_flake_attribution(run_gh, repo, head, check, &tests);
     }
     if infra_only {
         return FailureAttribution::NoInfraSignature(format!(
@@ -1139,6 +1161,99 @@ fn widened_attribution(
             "`{}` on the merge group looks like infrastructure, but the same check did not \
                  pass on head {} ({}), so a head-caused failure is not ruled out",
             check.conclusion,
+            short(head),
+            match other {
+                Ok(Some(conclusion)) => format!("`{conclusion}`"),
+                Ok(None) => "no completed run".to_owned(),
+                Err(error) => format!("unreadable: {error}"),
+            }
+        )),
+    }
+}
+
+/// The tests a failing step's output lists under ctest's `The following
+/// tests FAILED:` block, in order. Empty when the step has no such block:
+/// then nothing names the failure, and no known-flake allowance applies.
+#[must_use]
+pub fn failed_tests_in_step(log: &str, started_at: &str) -> Vec<String> {
+    let Some(output) = failing_step_output(log, started_at) else {
+        return Vec::new();
+    };
+    let Some(start) = output
+        .iter()
+        .rposition(|line| line.trim() == "The following tests FAILED:")
+    else {
+        return Vec::new();
+    };
+    output[start + 1..]
+        .iter()
+        .map_while(|line| {
+            // `\t13716 - <name> (Failed)`
+            let (number, rest) = line.trim().split_once(" - ")?;
+            number.trim().parse::<u64>().ok()?;
+            let name = rest.rsplit_once(" (").map_or(rest, |(name, _)| name);
+            Some(name.trim().to_owned())
+        })
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
+/// Whether `name` matches a `known_flaky_tests` entry: an exact name, or a
+/// glob where `*` matches any run of characters (`/` and spaces included).
+#[must_use]
+pub fn known_flaky_match(pattern: &str, name: &str) -> bool {
+    fn matches(pattern: &[u8], text: &[u8]) -> bool {
+        match pattern.split_first() {
+            None => text.is_empty(),
+            Some((b'*', rest)) => (0..=text.len()).any(|index| matches(rest, &text[index..])),
+            Some((first, rest)) => text
+                .split_first()
+                .is_some_and(|(byte, others)| first == byte && matches(rest, others)),
+        }
+    }
+    matches(pattern.trim().as_bytes(), name.trim().as_bytes())
+}
+
+/// The known-flake names that explain `check`'s failure: the check itself
+/// when its name is listed, else every failing step's named tests when each
+/// step names at least one and all of them are listed. `None` otherwise.
+fn known_flake(
+    check: &FailedCheck,
+    steps: &[&StepEvidence],
+    known_flaky: &[String],
+) -> Option<Vec<String>> {
+    let listed = |name: &str| known_flaky.iter().any(|glob| known_flaky_match(glob, name));
+    if listed(&check.name) {
+        return Some(vec![check.name.clone()]);
+    }
+    if steps.is_empty() || steps.iter().any(|step| step.failed_tests.is_empty()) {
+        return None;
+    }
+    let tests = steps
+        .iter()
+        .flat_map(|step| step.failed_tests.iter().cloned())
+        .collect::<Vec<_>>();
+    tests.iter().all(|name| listed(name)).then_some(tests)
+}
+
+/// A known flake clears the head only when the same check passed on the head.
+fn known_flake_attribution(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    head: &str,
+    check: &FailedCheck,
+    tests: &[String],
+) -> FailureAttribution {
+    match latest_conclusion(run_gh, repo, head, &check.name) {
+        Ok(Some(conclusion)) if conclusion == "success" => FailureAttribution::KnownFlake(format!(
+            "only configured known flakes failed ({}); passed on head {}",
+            tests.join(", "),
+            short(head)
+        )),
+        other => FailureAttribution::NoInfraSignature(format!(
+            "only configured known flakes failed ({}), but the same check did not pass on head \
+             {} ({}), so a head-caused failure is not ruled out",
+            tests.join(", "),
             short(head),
             match other {
                 Ok(Some(conclusion)) => format!("`{conclusion}`"),

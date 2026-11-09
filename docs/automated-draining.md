@@ -431,6 +431,7 @@ generated_paths = [                       # globs: `**` whole segments, `*` with
 generated_path_batch_guard = true         # default: on with a merge queue
 red_check_outranks_pending = true         # default: on with a merge queue
 infra_only_same_head_retry = true         # default: on with a merge queue
+known_flaky_tests = []                    # names or `*` globs; empty by default
 ```
 
 - **Generated-path batch guard.** Before an enqueue the steward re-reads the
@@ -476,7 +477,29 @@ infra_only_same_head_retry = true         # default: on with a merge queue
   `cancelled` conclusion) clear the head only when the same check passed on
   the head itself. A ctest-level `***Timeout` is not an infrastructure line;
   a step or job timeout is, deliberately, so a hang only the merged tree
-  exercises can still spend the head's one retry. `invalid_merge_commit` is never re-enqueued on the same
+  exercises can still spend the head's one retry.
+
+  **Known flakes** (`known_flaky_tests`): under the discipline, a failing
+  required check also earns the one same-head retry when its name is listed,
+  or when every failing step's ctest `The following tests FAILED:` block names
+  only listed tests. The same check must have passed on the head, the retry is
+  still one per head, and `invalid_merge_commit` / `merge_conflict` are never
+  retried. A step that names no test (a compile error, a crash before the
+  summary) is never a known flake. Entries are exact names or globs where `*`
+  matches anything. Keep the list to tests with a tracking issue, and remove
+  an entry when its issue closes. Pulp's tracked flakes at the time of
+  writing, as a starting list:
+
+  ```toml
+  known_flaky_tests = [
+    "ui-script-plugin-editor-au",          # #11861; the evidence suggests a real crash, review before listing
+    "a public WaveNet node runs its GPU path*",  # #11862
+    "AsyncBlockWorker: a fast pull without an offline flag waits in Auto mode",  # #11863
+    "WakeSignal: racing publish and park never lose a wakeup",  # #11864
+    "Staged GpuConvolver*",                # #11865
+    "inject-worktree-lineage-hook",        # #11866
+  ]
+  ``` `invalid_merge_commit` is never re-enqueued on the same
   head (before, it reset the refusal: #11698 went `failed_checks`, then three
   immediate `invalid_merge_commit` removals, each re-enqueued). Every refusal
   reads `ejected_same_head:<cause>:needs_new_head`.
