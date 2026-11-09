@@ -53,6 +53,7 @@ its binary and needs only step 1.
 | `verdict-hold-hook` | `scripts/ghapp_verdict_hold_hook.py` | nothing: before a HOLD verdict posts, it dequeues or disarms that pull request when it is queued or armed at exactly the HOLD's head ([A HOLD takes its head out of the landing path](#a-hold-takes-its-head-out-of-the-landing-path)) |
 | `verdict-session-stamp` | `scripts/ghapp_verdict_session_stamp.py` | nothing: it adds a `<!-- session: <host>/<session> -->` stamp to a verdict comment before it posts, so the arm guard can tell who approved ([An agent cannot approve its own landing](#review-before-arm-or-merge)) |
 | `reviewer-claim-guard` | `scripts/ghapp_reviewer_claim_guard.py` | a verdict when the protected base enables reviewer-claim receipts and the posting reviewer has no current exact-head claim |
+| `verdict-contradiction-guard` | `scripts/ghapp_verdict_contradiction_guard.py` | an APPROVE of a head a counting HOLD already names (from any signer), and a verdict that contradicts the same session's opposite verdict on that head within ten minutes ([A held head is not approvable](#a-held-head-is-not-approvable)) |
 
 `pr-close-guard` is a mandatory member of the authenticated `ghapp` generation
 and is managed by `shipyard runner fleet-update`, not by this page.
@@ -781,6 +782,58 @@ makes with its own token.
 (`0` forces it off) or a file named `hold-disarms` in the guards directory.
 Off, it reads nothing. Roll it out one host at a time; roll back by removing
 the file.
+
+### A held head is not approvable
+
+A HOLD makes its head un-approvable: the review gate ignores every APPROVE
+naming a head that a counting HOLD names, posted before or after it. So an
+APPROVE of a held head changes nothing except how the pull request looks. On
+Generous-Corp/pulp#11733 a reviewer session posted `verdict: HOLD head:<sha>`
+and, five seconds later, `verdict: APPROVE head:<sha>`; the `review-verdict`
+check correctly stayed red ("ignored 1 APPROVE"), but the pull request read as
+approved, the reviewers' queue counted it as reviewed, and nobody acted.
+`verdict-contradiction-guard` stops that APPROVE before it posts.
+
+**What it recognises:** the verdicts the stamper and the reviewer-claim guard
+read: a body whose last non-blank line is `verdict: APPROVE|HOLD head:<sha>` or
+`reviewed: <sha>` in `pr`/`issue` `comment`/`review`/`close` options, `api`
+fields, `--input` (a file, or stdin `ghapp` spooled to a file, which it reads
+and rewinds) or a GraphQL document; and a review event (`pr review --approve`
+/ `--request-changes`, REST `event=`, GraphQL `addPullRequestReview`), on
+`commit_id`/`commitOID` or else the live head. It runs after the stamper, so
+it reads the final request.
+
+**Its rules**, for the exact head the verdict names:
+
+1. **An APPROVE of a held head is refused.** "Held" is the gate's own
+   `counting_verdicts` under the base's review policy, one record at a time, so
+   the guard refuses exactly the APPROVEs the gate would ignore: a HOLD from
+   any counted signer (the fleet App whoever signed it, or a trusted human's
+   HOLD), and never a drive-by comment the gate does not count. The refusal
+   names the HOLD and the next action: "head <sha> is held by <signer> at
+   <comment url>; a HOLD makes a head un-approvable. If the HOLD is wrong, the
+   author must push a new head (merge the base) and you review that; do not
+   approve this head."
+2. **A session does not contradict itself.** A HOLD is refused when the same
+   session (the same host, session id and agent id in the fleet App's stamp)
+   posted an APPROVE of that head in the last ten minutes, and an APPROVE in
+   the reverse case. Only the fleet App's own stamped records count, so a
+   stamp copied into somebody else's comment cannot block a HOLD. A deliberate
+   retraction of one's own APPROVE posts with `SHIPYARD_VERDICT_RETRACT=1`: a
+   HOLD is the conservative direction, so it has an override and an APPROVE
+   has none.
+3. One request carrying both an APPROVE and a HOLD is refused.
+
+**Failure follows the direction of harm.** When the pull request, its verdicts
+or the base policy cannot be read, an APPROVE is refused (retry it) and a HOLD
+posts with a warning. A request with no verdict reads nothing.
+
+**What the rest of the fleet sees.** A held head reads `blocked_on=held` with
+`blocked_detail` "held head: needs a new head" in the steward's report and in
+`shipyard wait pr --state actionable`; its `next_action` starts "Held head:
+needs a new head" and tells the author to push a new head (or, when the HOLD
+is wrong, push a new head anyway and comment `dispute: <reason>`). `pr-watch`'s
+`held_unrepaired` event says the same.
 
 ## Environment re-enqueue
 

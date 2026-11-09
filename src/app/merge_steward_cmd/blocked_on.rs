@@ -31,6 +31,9 @@ use crate::merge_steward::{OWNER_DECISION_LABEL, PARKED_LABEL_PREFIX, SUPERSEDED
 /// list.
 const NOT_BLOCKED: [&str; 4] = ["admitted", "queued", "ready", "draft"];
 
+/// `blocked_detail` of a `held` row: the one move that unblocks it.
+pub(super) const HELD_DETAIL: &str = "held head: needs a new head";
+
 /// How many blocked pull requests the summary lists, oldest first.
 const OLDEST_LISTED: usize = 3;
 
@@ -548,6 +551,9 @@ fn approval_blocked(blocker: &ApprovalBlocker, green_since: Option<String>) -> (
         ApprovalBlocker::SelfApproved { agent } => Some(format!("approved and armed by {agent}")),
         ApprovalBlocker::AdmissionMissing { detail }
         | ApprovalBlocker::AdmissionRefused { detail, .. } => Some(detail.clone()),
+        // A HOLD makes its head un-approvable, so no verdict on this head can
+        // move it, however approved it looks: say so where the token is read.
+        ApprovalBlocker::Held { .. } => Some(HELD_DETAIL.to_owned()),
         _ => None,
     };
     let held_by = match blocker {

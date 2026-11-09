@@ -4513,6 +4513,17 @@ intentionally unavailable until authenticated App receipt invalidation is
 exposed; claims expire or are superseded by exact-head adoption fencing in the
 meantime.
 
+A HOLD makes its head un-approvable, so posting an APPROVE of a held head
+only makes the pull request look approved. The managed
+`verdict-contradiction-guard` refuses that APPROVE before it posts (same
+counting rule as the gate, from any signer) and names the HOLD's signer and
+URL; the author pushes a new head (merging the base) and the reviewer
+reviews that. It also refuses a verdict that contradicts the same session's
+opposite verdict on the same head within ten minutes; a deliberate
+retraction of one's own APPROVE posts with `SHIPYARD_VERDICT_RETRACT=1`. The
+steward reports such a row as `held` with `blocked_detail` "held head: needs
+a new head", which `shipyard wait pr --state actionable` prints.
+
 # Local Rust gate placement
 
 Shipyard's pre-push hook selects the repository-pinned Rust channel on the

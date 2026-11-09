@@ -2040,6 +2040,14 @@ if [[ -x "$guards/reviewer-claim-guard" ]]; then
     PATH="$trusted_path" SHIPYARD_GHAPP_SHIPYARD_BINARY="$shipyard_binary" \
         "$guards/reviewer-claim-guard" "$@" || exit 1
 fi
+# A HOLD makes its head un-approvable, so an APPROVE of a held head would only
+# make the pull request look approved. This guard refuses that APPROVE, and a
+# verdict contradicting the same session's opposite verdict on the same head
+# within ten minutes. It reads the final, stamped request. Optional for older
+# installations, like the reviewer-claim guard.
+if [[ -x "$guards/verdict-contradiction-guard" ]]; then
+    PATH="$trusted_path" "$guards/verdict-contradiction-guard" "$@" || exit 1
+fi
 
 if [[ "${1:-}" == "release" && "${2:-}" == "upload" && \
       -n "${release_upload_stage_dir:-}" ]]; then

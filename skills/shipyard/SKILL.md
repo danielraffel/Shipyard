@@ -4446,6 +4446,17 @@ and stop landings that never pass through `ghapp`
 reviewer (the steward reads that as waiting, not `required_failed`; nothing for
 the author to do) and `failure` only for a counted HOLD or an unreadable review.
 
+A HOLD makes its head un-approvable, so posting an APPROVE of a held head
+only makes the pull request look approved. The managed
+`verdict-contradiction-guard` refuses that APPROVE before it posts (same
+counting rule as the gate, from any signer) and names the HOLD's signer and
+URL; the author pushes a new head (merging the base) and the reviewer
+reviews that. It also refuses a verdict that contradicts the same session's
+opposite verdict on the same head within ten minutes; a deliberate
+retraction of one's own APPROVE posts with `SHIPYARD_VERDICT_RETRACT=1`. The
+steward reports such a row as `held` with `blocked_detail` "held head: needs
+a new head", which `shipyard wait pr --state actionable` prints.
+
 Every rule above judges comments posted through the shared fleet App, which
 every agent can use, so none of it is proof of who reviewed. A base with
 `[auto_merge] approval_source = "guard"` and `guard_app_id = <id>` takes
