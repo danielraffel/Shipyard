@@ -420,6 +420,20 @@ fn another_pull_request_with_this_head_branch_on_another_base_refuses() {
 }
 
 #[test]
+fn an_older_pull_request_on_this_branch_with_another_base_admits() {
+    // Once opened from this branch against another base, then closed: a
+    // different head, so it says nothing about this head's runs.
+    let mut world = World::genuine();
+    let mut older = pull(299, "develop");
+    older["head_sha"] = json!(OTHER);
+    world.by_branch.push(older);
+    assert_eq!(
+        world.apply(REPO, HeadGate::NotRequired).unwrap(),
+        HeadGate::NotRequired
+    );
+}
+
+#[test]
 fn another_pull_request_with_this_head_commit_on_another_base_refuses() {
     let mut world = World::genuine();
     world.by_commit.push(pull(301, "weak"));
