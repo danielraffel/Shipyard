@@ -178,6 +178,45 @@ pub(super) const fn default_pr_poll_interval(state: WaitPrState) -> f64 {
     }
 }
 
+/// The GitHub reads an `actionable` wait spent, summed over its polls and
+/// reported in `--json` as `github_reads`, so a wait's share of the shared App
+/// installation budget is attributable. Counts are `gh` children; a
+/// `--paginate` child can make more than one request.
+#[derive(Debug, Default, serde::Serialize)]
+pub(super) struct WaitReadCost {
+    /// Snapshots read from GitHub.
+    pub(super) polls: u64,
+    /// REST children spawned, over every poll.
+    pub(super) rest: u64,
+    /// GraphQL children spawned, over every poll.
+    pub(super) graphql: u64,
+    /// Reads answered from a poll's own read cache instead.
+    pub(super) cache_hits: u64,
+    /// REST children by call site, over every poll.
+    pub(super) sites: BTreeMap<String, u64>,
+}
+
+impl WaitReadCost {
+    pub(super) fn add(&mut self, report: &crate::gh_pass::GhPassReport) {
+        self.polls += 1;
+        self.rest += report.rest;
+        self.graphql += report.graphql;
+        self.cache_hits += report.cache_hits;
+        for site in &report.sites {
+            if site.calls > 0 {
+                let kind = match site.kind {
+                    crate::gh_pass::ApiKind::Rest => "rest",
+                    crate::gh_pass::ApiKind::Graphql => "graphql",
+                };
+                *self
+                    .sites
+                    .entry(format!("{kind} {}", site.site))
+                    .or_default() += site.calls;
+            }
+        }
+    }
+}
+
 /// `--state actionable`'s snapshot: the steward's own classification of the
 /// live head, with the next action (`super::merge_steward_cmd`). A pull
 /// request `gh` cannot find is `None`, which the wait reports as invalid
@@ -310,6 +349,7 @@ fn wait_pr<W: Write>(
     let event_filter = pr_event_filter(pr_number, &repo);
     let mut terminal_wrong = false;
     let mut merged_snapshot = None;
+    let mut read_cost = WaitReadCost::default();
     let result = wait_for_condition_with_timeout(
         |snapshot| {
             if matches!(state, WaitPrState::Merged) {
@@ -335,10 +375,15 @@ fn wait_pr<W: Write>(
                 }
                 WaitPrState::Actionable => {
                     let config = LoadedConfig::load_from_cwd(mode, cwd)?;
+                    let pass = std::sync::Arc::new(crate::gh_pass::GhPass::counting());
                     let actions = crate::cloud::GitHubActions::from_loaded_config(cwd, &config)
                         .with_repo_override(&repo)
-                        .with_absolute_deadline(Instant::now() + remaining);
-                    fetch_pr_actionable_snapshot(&actions, state_dir, &repo, pr_number)
+                        .with_absolute_deadline(Instant::now() + remaining)
+                        .with_pass(std::sync::Arc::clone(&pass));
+                    let snapshot =
+                        fetch_pr_actionable_snapshot(&actions, state_dir, &repo, pr_number);
+                    read_cost.add(&pass.report());
+                    snapshot
                 }
                 WaitPrState::Queued
                 | WaitPrState::Red
@@ -393,6 +438,16 @@ fn wait_pr<W: Write>(
                             serde_json::to_value(signals).unwrap_or(Value::Null),
                         )
                     })
+                })
+                .or_else(|| {
+                    (matches!(state, WaitPrState::Actionable) && snapshot_file.is_none()).then(
+                        || {
+                            (
+                                "github_reads",
+                                serde_json::to_value(&read_cost).unwrap_or(Value::Null),
+                            )
+                        },
+                    )
                 });
             render_wait_outcome_with(
                 stdout,
