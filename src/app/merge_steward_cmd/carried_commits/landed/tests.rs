@@ -64,10 +64,8 @@ impl Fake {
     fn run(&self, argv: &[String]) -> Result<String, String> {
         self.calls.set(self.calls.get() + 1);
         let joined = argv.join(" ");
-        if let Some(needle) = self.fail_on {
-            if joined.contains(needle) {
-                return Err("boom".to_owned());
-            }
+        if self.fail_on.is_some_and(|needle| joined.contains(needle)) {
+            return Err("boom".to_owned());
         }
         if joined.contains("git/ref/heads/main") {
             return Ok(json!({"sha": TIP, "kind": "commit"}).to_string());
@@ -239,33 +237,31 @@ fn a_commit_with_no_equivalent_on_main_is_refused() {
     assert_eq!(check(&fake, PICK), Some(shares(PICK)));
 }
 
+/// Every read a commit kind makes, failed one at a time, must refuse.
 #[test]
 fn a_git_error_refuses() {
-    for needle in [
+    let merge_reads = ["git/ref/heads", "git/commits/", "git/trees/"];
+    let pick_reads = [
         "git/ref/heads",
-        "git/trees/",
         "git/commits/",
         "vnd.github.diff",
         "commits?sha=",
-    ] {
-        let mut merge = merge_fake("aaaa");
-        merge.fail_on = Some(needle);
-        let mut pick = pick_fake(DIFF_MOVED);
-        pick.fail_on = Some(needle);
-        for (fake, sha) in [(merge, MERGE), (pick, PICK)] {
-            let admitted = check(&fake, sha).is_none();
-            let needed = fake.calls.get() > 0;
-            assert!(needed);
-            // An error on a read this commit kind makes must not admit; a
-            // read it never makes cannot.
-            if fake.fail_on == Some("git/trees/") && sha == PICK
-                || fake.fail_on == Some("vnd.github.diff") && sha == MERGE
-                || fake.fail_on == Some("commits?sha=") && sha == MERGE
-            {
-                continue;
-            }
-            assert!(!admitted, "{needle} failed for {sha} but it was admitted");
-        }
+    ];
+    for needle in merge_reads {
+        let mut fake = merge_fake("aaaa");
+        fake.fail_on = Some(needle);
+        assert!(
+            check(&fake, MERGE).is_some(),
+            "merge admitted despite {needle} failing"
+        );
+    }
+    for needle in pick_reads {
+        let mut fake = pick_fake(DIFF_MOVED);
+        fake.fail_on = Some(needle);
+        assert!(
+            check(&fake, PICK).is_some(),
+            "pick admitted despite {needle} failing"
+        );
     }
 }
 

@@ -108,15 +108,15 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn json(&self, argv: Vec<String>, what: &str) -> Result<serde_json::Value, String> {
-        let raw = (self.run_gh)(&argv).map_err(|error| format!("{what} unreadable: {error}"))?;
+    fn json(&self, argv: &[String], what: &str) -> Result<serde_json::Value, String> {
+        let raw = (self.run_gh)(argv).map_err(|error| format!("{what} unreadable: {error}"))?;
         serde_json::from_str(&raw).map_err(|error| format!("{what} malformed: {error}"))
     }
 
     fn tip(&self, base: &str) -> Result<Tip, String> {
         let repo = self.repo;
         let reference = self.json(
-            vec![
+            &[
                 "api".to_owned(),
                 format!("repos/{repo}/git/ref/heads/{base}"),
                 "--jq".to_owned(),
@@ -138,7 +138,7 @@ impl<'a> Reader<'a> {
     fn commit(&self, sha: &str) -> Result<Commit, String> {
         let repo = self.repo;
         let value = self.json(
-            vec![
+            &[
                 "api".to_owned(),
                 format!("repos/{repo}/git/commits/{sha}"),
                 "--jq".to_owned(),
@@ -197,7 +197,7 @@ impl<'a> Reader<'a> {
         };
         let repo = self.repo;
         let listed = self.json(
-            vec![
+            &[
                 "api".to_owned(),
                 format!(
                     "repos/{repo}/commits?sha={}&path={}&since={}&per_page={MAX_PATCH_CANDIDATES}",
@@ -283,7 +283,7 @@ impl<'a> Reader<'a> {
         self.tree_reads += 1;
         let repo = self.repo;
         let value = self.json(
-            vec![
+            &[
                 "api".to_owned(),
                 format!("repos/{repo}/git/trees/{sha}"),
                 "--jq".to_owned(),
@@ -293,7 +293,7 @@ impl<'a> Reader<'a> {
             ],
             &format!("tree {sha}"),
         )?;
-        if value.get("truncated").and_then(|v| v.as_bool()) != Some(false) {
+        if value.get("truncated").and_then(serde_json::Value::as_bool) != Some(false) {
             return Err(format!("tree {sha} is truncated or unmarked"));
         }
         let entries = value
