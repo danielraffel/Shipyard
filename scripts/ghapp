@@ -1806,13 +1806,6 @@ unset ghapp_queue_kinds
 if [[ -x "$guards/branch-refresh-guard" ]]; then
     PATH="$trusted_path" "$guards/branch-refresh-guard" "$@" || exit 1
 fi
-# Optional, and never a refusal: before a `verdict: HOLD head:<sha>` comment or
-# a REQUEST_CHANGES review posts, it dequeues or disarms that pull request when
-# it is queued or armed at exactly that head (only on a host that turns
-# `hold-disarms` on). A HOLD on an already-armed head otherwise merged anyway.
-if [[ -x "$guards/verdict-hold-hook" ]]; then
-    PATH="$trusted_path" "$guards/verdict-hold-hook" "$@" || true
-fi
 # A verdict comment gets a `<!-- session: <host>/<session>[ agent: <id>] -->`
 # line above its marker from the verdict-session-stamp guard, so
 # queue-arm-guard can tell which session approved. The stamp is the only
@@ -2047,6 +2040,14 @@ fi
 # installations, like the reviewer-claim guard.
 if [[ -x "$guards/verdict-contradiction-guard" ]]; then
     PATH="$trusted_path" "$guards/verdict-contradiction-guard" "$@" || exit 1
+fi
+# Optional, and never a refusal. It runs after every refusing guard (the
+# contradiction guard can refuse a HOLD), so a refused HOLD never disarms: before a `verdict: HOLD head:<sha>` comment or
+# a REQUEST_CHANGES review posts, it dequeues or disarms that pull request when
+# it is queued or armed at exactly that head (only on a host that turns
+# `hold-disarms` on). A HOLD on an already-armed head otherwise merged anyway.
+if [[ -x "$guards/verdict-hold-hook" ]]; then
+    PATH="$trusted_path" "$guards/verdict-hold-hook" "$@" || true
 fi
 
 if [[ "${1:-}" == "release" && "${2:-}" == "upload" && \

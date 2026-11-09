@@ -21,6 +21,11 @@ else the live head.
 
 Rules, for the pull request's exact head the verdict names:
 
+Short options are read as gh (Cobra) reads them: ``-bTEXT``, ``-b=TEXT``,
+bundles such as ``-ab TEXT``, and ``--approve=true``. GraphQL reviews are
+``addPullRequestReview`` and ``submitPullRequestReview``, with fields inline,
+as variables, or inside an ``input: $var`` object.
+
 1. **A held head is not approvable.** An APPROVE is refused when a HOLD that
    the gate counts already names that head, from any signer. "Counts" is the
    gate's own ``counting_verdicts`` with the base's review policy, so this
@@ -35,8 +40,19 @@ Rules, for the pull request's exact head the verdict names:
 
 Failure handling follows the direction of harm: when the pull request, its
 verdicts or the base policy cannot be read, an APPROVE is refused (retry it)
-and a HOLD posts with a warning. Requests that carry no verdict are never
-read.
+and a HOLD posts with a warning. A body source this guard cannot read (a stdin
+pipe ``ghapp`` did not spool, a missing file, a GraphQL variable that is not
+supplied) is refused, since it may hold an APPROVE. A request naming a
+repository other than the one ``ghapp`` is bound to (``GH_REPO``) is judged
+unreadable. Requests that carry no verdict are never read; each verdict costs
+four App API reads (the pull request, its comments, its reviews and, for an
+APPROVE, the base config), one more for a comment edit.
+
+Rule 2 needs ``SHIPYARD_AGENT_ID``: team agents share one session id, so a
+process without an agent id cannot tell its own verdict from a teammate's and
+rule 2 does not apply to it. A verdict on a review comment
+(``pulls/comments/N``) cannot be resolved to its pull request, so an APPROVE
+there is refused.
 """
 
 from __future__ import annotations
@@ -186,6 +202,89 @@ def _option_texts(args: list[str], text_flags: set[str], file_flags: set[str]) -
     return texts
 
 
+# Short flags per command, as gh (Cobra) parses them: those that take a value
+# and those that do not. Cobra accepts `-bTEXT`, `-b=TEXT` and bundles such as
+# `-ab TEXT`; normalise() spells each as separate arguments.
+SHORT_FLAGS: dict[tuple[str, ...], tuple[str, str]] = {
+    ("api",): ("fFHXqtp", "i"),
+    ("pr", "comment"): ("bFR", "eaw"),
+    ("issue", "comment"): ("bFR", "eaw"),
+    ("pr", "review"): ("bFR", "acr"),
+    ("pr", "close"): ("cR", "d"),
+    ("issue", "close"): ("cRr", ""),
+}
+BOOL_LONG = {"--approve", "--request-changes", "--comment"}
+# Long options whose value is the next argument, per command (for finding the
+# positional pull-request selector).
+LONG_VALUES = {"--body", "--body-file", "--repo", "--comment", "--reason", "--field",
+               "--raw-field", "--header", "--method", "--input", "--jq", "--template",
+               "--preview", "--hostname", "--cache"}
+
+
+def _command(args: list[str]) -> tuple[str, ...] | None:
+    if args[:1] == ["api"]:
+        return ("api",)
+    key = tuple(args[:2])
+    return key if key in SHORT_FLAGS else None
+
+
+def normalise(args: list[str]) -> list[str]:
+    """``args`` with attached short values and bundles split, and
+    ``--flag=true|false`` booleans spelled as gh reads them."""
+    command = _command(args)
+    if command is None:
+        return list(args)
+    valued, booleans = SHORT_FLAGS[command]
+    out = list(args[:len(command)])
+    rest = args[len(command):]
+    index = 0
+    while index < len(rest):
+        argument = rest[index]
+        index += 1
+        if argument == "--":
+            out += rest[index - 1:]
+            break
+        name, equals, value = argument.partition("=")
+        if equals and name in BOOL_LONG and command in (("pr", "review"), ("pr", "close")):
+            if value.lower() in ("true", "1", "t"):
+                out.append(name)
+            elif value.lower() not in ("false", "0", "f"):
+                out.append(argument)
+            continue
+        if len(argument) < 3 or not argument.startswith("-") or argument.startswith("--"):
+            out.append(argument)
+            continue
+        expanded: list[str] = []
+        letters = argument[1:]
+        position = 0
+        while position < len(letters):
+            letter = letters[position]
+            position += 1
+            if letter in booleans:
+                expanded.append(f"-{letter}")
+            elif letter in valued:
+                remainder = letters[position:]
+                remainder = remainder[1:] if remainder.startswith("=") else remainder
+                expanded.append(f"-{letter}")
+                if remainder:
+                    expanded.append(remainder)
+                elif index < len(rest):
+                    expanded.append(rest[index])
+                    index += 1
+                break
+            else:
+                expanded = [argument]  # Not a bundle gh would parse this way.
+                break
+        out += expanded
+    return out
+
+
+def _input_objects(document: str, variables: dict[str, Any]) -> list[dict[str, Any]]:
+    """Variables bound as a whole input object (`input: $var`)."""
+    return [variables[name] for name in re.findall(r"\binput\s*:\s*\$(\w+)", document)
+            if isinstance(variables.get(name), dict)]
+
+
 def _graphql_value(document: str, name: str, variables: dict[str, Any]) -> Any:
     match = re.search(r"\b" + name + r'\s*:\s*"((?:[^"\\]|\\.)*)"', document)
     if match:
@@ -195,9 +294,16 @@ def _graphql_value(document: str, name: str, variables: dict[str, Any]) -> Any:
             return None
     match = re.search(r"\b" + name + r"\s*:\s*\$(\w+)", document)
     if match:
+        if match.group(1) not in variables:
+            raise Unreadable(f"GraphQL variable ${match.group(1)} ({name}) is not supplied")
         return variables.get(match.group(1))
     match = re.search(r"\b" + name + r"\s*:\s*([A-Z_]+)\b", document)
-    return match.group(1) if match else None
+    if match:
+        return match.group(1)
+    for value in _input_objects(document, variables):
+        if name in value:
+            return value[name]
+    return None
 
 
 def verdicts_in(args: list[str]) -> list[tuple[str, str | None]]:
@@ -205,6 +311,7 @@ def verdicts_in(args: list[str]) -> list[tuple[str, str | None]]:
     ``None`` is the pull request's live head."""
     found: list[tuple[str, str | None]] = []
     bodies: list[str] = []
+    args = normalise(args)
     if len(args) >= 2 and args[0] in ("pr", "issue") and args[1] in ("comment", "review", "close"):
         if args[1] == "close":
             bodies += _option_texts(args[2:], {"--comment", "-c"}, set())
@@ -244,7 +351,8 @@ def verdicts_in(args: list[str]) -> list[tuple[str, str | None]]:
             body = _graphql_value(document, "body", variables)
             if isinstance(body, str):
                 bodies.append(body)
-            if "addpullrequestreview" in document.lower():
+            lowered = document.lower()
+            if "addpullrequestreview" in lowered or "submitpullrequestreview" in lowered:
                 event = _graphql_value(document, "event", variables)
                 if isinstance(event, str) and event.upper() in REVIEW_EVENTS:
                     commit = _graphql_value(document, "commitOID", variables)
@@ -262,13 +370,14 @@ def verdicts_in(args: list[str]) -> list[tuple[str, str | None]]:
 
 def own_identity() -> tuple[str, str, str | None] | None:
     """``(host, session, agent)`` exactly as the stamper writes this process's
-    stamp; ``None`` when the session is unattributed."""
+    stamp; ``None`` when the session is unattributed or has no agent id."""
     session = next((os.environ[name].strip() for name in SESSION_ENVS
                     if os.environ.get(name, "").strip()), "")
-    if not session:
-        return None
     agent = os.environ.get(AGENT_ENV, "").strip()
-    agent = agent if agent and not any(c.isspace() for c in agent) else None
+    if not session or not agent or any(c.isspace() for c in agent):
+        # Team agents share one session id, so without an agent id this
+        # process cannot tell its own verdict from a teammate's.
+        return None
     return socket.gethostname().split(".")[0].lower(), session, agent
 
 
@@ -361,6 +470,47 @@ def own_contradiction(kind: str, head: str, comments: list[dict[str, Any]],
     return None
 
 
+def explicit_target(args: list[str]) -> tuple[str | None, int | None]:
+    """``(repo, number)`` a ``pr``/``issue`` command names itself: ``-R/--repo``
+    and the first positional selector (a number, ``#N`` or a pull-request
+    URL, whose repository it also names)."""
+    args = normalise(args)
+    if _command(args) in (None, ("api",)):
+        return None, None
+    repo: str | None = None
+    number: int | None = None
+    rest = args[2:]
+    index = 0
+    while index < len(rest):
+        argument = rest[index]
+        index += 1
+        if argument in ("-R", "--repo") and index < len(rest):
+            repo = rest[index]
+            index += 1
+            continue
+        if argument.startswith("--repo="):
+            repo = argument[len("--repo="):]
+            continue
+        if argument.startswith("-"):
+            takes_value = argument in LONG_VALUES and not (
+                argument == "--comment" and args[1] == "review")
+            if takes_value or (len(argument) == 2 and argument[1] in
+                               SHORT_FLAGS[_command(args)][0]):
+                index += 1
+            continue
+        if number is not None:
+            continue
+        url = re.match(r"^https?://github\.com/([^/]+/[^/]+)/(?:pull|issues)/(\d+)", argument)
+        if url:
+            number = int(url.group(2))
+            repo = repo or url.group(1)
+        elif argument.removeprefix("#").isdigit():
+            number = int(argument.removeprefix("#"))
+    if repo:
+        repo = re.sub(r"^(?:https?://)?github\.com/", "", repo).strip("/")
+    return repo, number
+
+
 def _refuse(message: str) -> int:
     print(f"{PREFIX}: refused: {message}", file=sys.stderr)
     return 1
@@ -377,12 +527,14 @@ def judge(args: list[str]) -> int:
     try:
         verdicts = verdicts_in(args)
     except Unreadable as error:
-        print(f"{PREFIX}: warning: cannot read this request's body ({error}); if it is a "
-              "verdict it was not checked against HOLDs. Post verdicts with --body-file FILE or "
-              "-f body=...", file=sys.stderr)
-        return 0
+        # ghapp spools a body read from stdin to a file, so an unreadable
+        # source here is anomalous; it could hold an APPROVE.
+        return _refuse(f"cannot read this request's body ({error}), so it may be an APPROVE "
+                       "that cannot be checked against HOLDs. Post it with --body-file FILE "
+                       "or -f body=...")
     if not verdicts:
         return 0
+    PARSED.extend(kind for kind, _ in verdicts)
     kinds = {kind for kind, _ in verdicts}
     if kinds == {"APPROVE", "HOLD"}:
         return _refuse("this one request posts both an APPROVE and a HOLD; post one verdict")
@@ -400,20 +552,32 @@ def judge(args: list[str]) -> int:
               f"({error}); it posts anyway.", file=sys.stderr)
         return 0
 
-    repo = os.environ.get("GH_REPO", "").strip() or None
-    try:
-        number, endpoint_repo = CLAIM._target(args, repo) if CLAIM else (None, None)
-    except Exception as error:  # noqa: BLE001 - see unreadable()
-        return unreadable(f"cannot tell which pull request: {error}")
-    repo = repo or endpoint_repo
+    bound = os.environ.get("GH_REPO", "").strip() or None
+    named_repo, number = explicit_target(args)
+    if named_repo and bound and named_repo.lower() != bound.lower():
+        return unreadable(f"the request names {named_repo} but ghapp is bound to {bound}")
+    repo = named_repo or bound
+    if number is None:
+        try:
+            number, endpoint_repo = CLAIM._target(args, repo) if CLAIM else (None, None)
+        except Exception as error:  # noqa: BLE001 - see unreadable()
+            return unreadable(f"cannot tell which pull request: {error}")
+        if endpoint_repo and repo and endpoint_repo.lower() != repo.lower():
+            return unreadable(f"the endpoint names {endpoint_repo} but ghapp is bound to {repo}")
+        repo = repo or endpoint_repo
     if number is None or not repo:
         if approving:
             return unreadable("cannot tell which pull request this verdict is on")
         return 0
     try:
-        pull = ARM.run_real_gh(["api", f"repos/{repo}/pulls/{number}"])
+        try:
+            pull = ARM.run_real_gh(["api", f"repos/{repo}/pulls/{number}"])
+        except ARM.GuardError as error:
+            if "404" in str(error) or "Not Found" in str(error):
+                return 0  # An issue, not a pull request: nothing to judge.
+            raise
         if not isinstance(pull, dict):
-            return 0  # An issue, not a pull request: nothing to judge.
+            return unreadable("the pull request did not read as an object")
         live = str((pull.get("head") or {}).get("sha") or "").lower()
         base = (pull.get("base") or {}).get("ref")
         author = (pull.get("user") or {}).get("login")
@@ -454,15 +618,28 @@ def judge(args: list[str]) -> int:
     return 0
 
 
+def _may_carry_verdict(args: list[str]) -> bool:
+    """Whether a request judge() could not parse might post an APPROVE: verdict
+    text, an approving review flag or event, or a body read from elsewhere."""
+    text = " ".join(args)
+    return bool(re.search(r"verdict:|reviewed:|APPROVE|--approve|--body-file|--input|=@|"
+                          r"(?:^| )-[A-Za-z]*a(?: |$)", text))
+
+
+# The verdict kinds judge() parsed from this request, for main()'s fallback.
+PARSED: list[str] = []
+
+
 def main(args: list[str]) -> int:
     try:
         return judge(args)
-    except Exception as error:  # noqa: BLE001 - an APPROVE fails closed
-        approving = any("APPROVE" in a for a in args) or "--approve" in args or "-a" in args
-        if approving:
-            return _refuse(f"internal error ({error}); an APPROVE is not posted unchecked")
-        print(f"{PREFIX}: warning: internal error ({error}); not checked", file=sys.stderr)
-        return 0
+    except Exception as error:  # noqa: BLE001 - fails closed unless it is only a HOLD
+        if (set(PARSED) == {"HOLD"}) or (not PARSED and not _may_carry_verdict(args)):
+            print(f"{PREFIX}: warning: internal error ({error}); not checked",
+                  file=sys.stderr)
+            return 0
+        return _refuse(f"internal error ({error}); a verdict that may be an APPROVE is not "
+                       "posted unchecked")
 
 
 if __name__ == "__main__":

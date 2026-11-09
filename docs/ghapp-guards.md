@@ -800,8 +800,11 @@ read: a body whose last non-blank line is `verdict: APPROVE|HOLD head:<sha>` or
 fields, `--input` (a file, or stdin `ghapp` spooled to a file, which it reads
 and rewinds) or a GraphQL document; and a review event (`pr review --approve`
 / `--request-changes`, REST `event=`, GraphQL `addPullRequestReview`), on
-`commit_id`/`commitOID` or else the live head. It runs after the stamper, so
-it reads the final request.
+`commit_id`/`commitOID` or else the live head. Short options are read as gh
+reads them (`-bTEXT`, `-fbody=...`, bundles such as `-ab TEXT`,
+`--approve=true`), and GraphQL `submitPullRequestReview` and `input: $var`
+objects count. It runs after the stamper, so it reads the final request, and
+before `verdict-hold-hook`, so a HOLD it refuses never disarms anything.
 
 **Its rules**, for the exact head the verdict names:
 
@@ -817,7 +820,9 @@ it reads the final request.
 2. **A session does not contradict itself.** A HOLD is refused when the same
    session (the same host, session id and agent id in the fleet App's stamp)
    posted an APPROVE of that head in the last ten minutes, and an APPROVE in
-   the reverse case. Only the fleet App's own stamped records count, so a
+   the reverse case. It needs `SHIPYARD_AGENT_ID`: team agents share one
+   session id, so without an agent id a process cannot tell its own verdict
+   from a teammate's and the rule does not apply. Only the fleet App's own stamped records count, so a
    stamp copied into somebody else's comment cannot block a HOLD. A deliberate
    retraction of one's own APPROVE posts with `SHIPYARD_VERDICT_RETRACT=1`: a
    HOLD is the conservative direction, so it has an override and an APPROVE
@@ -826,7 +831,12 @@ it reads the final request.
 
 **Failure follows the direction of harm.** When the pull request, its verdicts
 or the base policy cannot be read, an APPROVE is refused (retry it) and a HOLD
-posts with a warning. A request with no verdict reads nothing.
+posts with a warning. A body it cannot read (a stdin pipe `ghapp` did not
+spool, a missing file, an unsupplied GraphQL variable) is refused, since it
+may be an APPROVE, and so is a command whose `-R/--repo` names another
+repository than the one `ghapp` is bound to. A verdict marker on an issue,
+not a pull request, is not judged. A request with no verdict reads nothing;
+each verdict costs up to four App API reads.
 
 **What the rest of the fleet sees.** A held head reads `blocked_on=held` with
 `blocked_detail` "held head: needs a new head" in the steward's report and in

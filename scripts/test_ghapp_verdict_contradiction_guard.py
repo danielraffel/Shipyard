@@ -84,6 +84,8 @@ class VerdictContradictionGuard(unittest.TestCase):
             "    print(json.dumps([state['reviews']])); sys.exit(0)\n"
             "if 'issues/7/comments' in argv and '--paginate' in argv:\n"
             "    print(json.dumps([state['comments']])); sys.exit(0)\n"
+            "if argv.endswith('pulls/8'):\n"
+            "    sys.stderr.write('HTTP 404: Not Found\\n'); sys.exit(1)\n"
             "if argv.endswith('pulls/7'):\n"
             "    print(json.dumps(state['pull'])); sys.exit(0)\n"
             "if 'node(id' in argv:\n"
@@ -185,7 +187,6 @@ class VerdictContradictionGuard(unittest.TestCase):
         argv = ["api", "-X", "PATCH", f"repos/{REPO}/issues/comments/55", "--raw-field",
                 f"body=verdict: APPROVE head:{HEAD}"]
         fake_extra = self.root / "gh"
-        result = None
         self.fake_gh([comment("HOLD")])
         source = fake_extra.read_text(encoding="utf-8").replace(
             "if state['fail']:",
@@ -236,7 +237,80 @@ class VerdictContradictionGuard(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("both an APPROVE and a HOLD", result.stderr)
 
+    def test_attached_short_options_and_bundles_are_read_as_gh_reads_them(self) -> None:
+        body = self.root / "body.txt"
+        body.write_text(f"verdict: APPROVE head:{HEAD}\n", encoding="utf-8")
+        marker = f"verdict: APPROVE head:{HEAD}"
+        for argv in (["api", f"repos/{REPO}/issues/7/comments", f"-fbody={marker}"],
+                     ["api", f"repos/{REPO}/issues/7/comments", f"-Fbody=@{body}"],
+                     ["api", "-XPOST", f"repos/{REPO}/issues/7/comments", f"-f=body={marker}"],
+                     ["pr", "comment", "7", f"-b{marker}"],
+                     ["pr", "comment", "7", f"-F{body}"],
+                     ["pr", "review", "7", "--approve=true"],
+                     ["pr", "review", "7", "-ab", "lgtm"],
+                     ["pr", "review", "-a", "7"]):
+            with self.subTest(argv=argv):
+                self.assert_held(self.run_guard(argv, [comment("HOLD")],
+                                                env={"SHIPYARD_AGENT_ID": "someone-else"}))
+        # Control: an explicit false is no approval at all.
+        result = self.run_guard(["pr", "review", "7", "--approve=false", "-b", "notes"],
+                                [comment("HOLD")])
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_graphql_submit_and_input_object_reviews_are_judged(self) -> None:
+        submit = ["api", "graphql", "-f",
+                  "query=mutation{submitPullRequestReview(input:{pullRequestId:\"PR_7\","
+                  "event:APPROVE}){clientMutationId}}"]
+        self.assert_held(self.run_guard(submit, [comment("HOLD")]))
+        payload = self.root / "payload.json"
+        payload.write_text(json.dumps({
+            "query": "mutation($input:AddPullRequestReviewInput!){addPullRequestReview("
+                     "input:$input){clientMutationId}}",
+            "variables": {"input": {"pullRequestId": "PR_7", "event": "APPROVE",
+                                    "commitOID": HEAD}},
+        }), encoding="utf-8")
+        argv = ["api", "graphql", "--input", str(payload), "-f", "pullRequestId=PR_7"]
+        self.assert_held(self.run_guard(argv, [comment("HOLD")]))
+
+    def test_an_unsupplied_graphql_event_variable_is_refused(self) -> None:
+        argv = ["api", "graphql", "-f",
+                "query=mutation($e:PullRequestReviewEvent){addPullRequestReview(input:"
+                "{pullRequestId:\"PR_7\",event:$e}){clientMutationId}}"]
+        result = self.run_guard(argv, [])
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("cannot read this request's body", result.stderr)
+
+    def test_an_unspooled_stdin_pipe_is_refused(self) -> None:
+        argv = ["api", f"repos/{REPO}/issues/7/comments", "--input", "-"]
+        result = self.run_guard(argv, [], stdin=subprocess.PIPE)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("cannot read this request's body", result.stderr)
+
+    def test_the_repository_the_command_names_is_the_one_judged(self) -> None:
+        marker = f"verdict: APPROVE head:{HEAD}"
+        # Another repository than ghapp's binding: never judged as the bound one.
+        other = self.run_guard(["pr", "comment", "7", "-R", "Generous-Corp/vellum",
+                                "--body", marker], [])
+        self.assertEqual(other.returncode, 1, other.stderr)
+        self.assertIn("names Generous-Corp/vellum", other.stderr)
+        # A pull-request URL in the body text is not the selector.
+        argv = ["pr", "comment", "--body",
+                f"see https://github.com/{REPO}/pull/99/files\n{marker}", "7"]
+        self.assert_held(self.run_guard(argv, [comment("HOLD")],
+                                        env={"SHIPYARD_AGENT_ID": "someone-else"}))
+
+    def test_a_verdict_marker_on_an_issue_is_not_judged(self) -> None:
+        argv = ["api", f"repos/{REPO}/issues/8/comments", "-f", f"body=reviewed: {HEAD}"]
+        result = self.run_guard(argv, [comment("HOLD")])
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     # ------------------------------------------------ rule 2: own contradiction
+
+    def test_teammates_sharing_a_session_id_without_agent_ids_are_not_one_self(self) -> None:
+        mate = comment("APPROVE", at=NOW - timedelta(seconds=30),
+                       stamp=_stamp(session="team-lead", agent=None))
+        result = self.run_guard(self.post("HOLD"), [mate], env={"SHIPYARD_AGENT_ID": ""})
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_a_hold_right_after_this_sessions_approve_is_refused(self) -> None:
         own = comment("APPROVE", ident=77, at=NOW - timedelta(seconds=30))
@@ -319,6 +393,9 @@ class VerdictContradictionGuard(unittest.TestCase):
         line = 'PATH="$trusted_path" "$guards/verdict-contradiction-guard" "$@" || exit 1'
         self.assertIn(line, wrapper)
         self.assertGreater(wrapper.index(line), wrapper.index('"$guards/verdict-session-stamp"'))
+        # The HOLD hook disarms; it runs only once this guard has let the HOLD through.
+        self.assertGreater(wrapper.index('"$guards/verdict-hold-hook" "$@" || true'),
+                           wrapper.index(line))
 
 
 if __name__ == "__main__":
