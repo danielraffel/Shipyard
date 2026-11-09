@@ -726,6 +726,12 @@ impl GitHubActions {
         self.pass.as_deref()
     }
 
+    /// Whether this client reads through a read cache ([`Self::with_read_cache`]).
+    #[cfg(test)]
+    pub(crate) const fn has_read_cache(&self) -> bool {
+        self.read_cache.is_some()
+    }
+
     /// The most recent `base_ref_changed` event on a pull request's timeline.
     ///
     /// The conditional third call: spent only when the first two already say

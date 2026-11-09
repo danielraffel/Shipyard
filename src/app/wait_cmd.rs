@@ -24,7 +24,8 @@ use crate::wait_transport;
 use crate::wait_transport::{
     WaitOutcome, fetch_pr_green_snapshot_with_timeout, fetch_pr_snapshot_with_timeout,
     fetch_release_snapshot_with_timeout, fetch_run_snapshot_with_timeout, pr_event_filter,
-    read_snapshot_file, release_event_filter, run_event_filter, wait_for_condition_with_timeout,
+    read_snapshot_file, release_event_filter, run_event_filter, wait_for_condition_with_backoff,
+    wait_for_condition_with_timeout,
 };
 
 pub(super) fn wait_command<W: Write>(
@@ -176,6 +177,42 @@ pub(super) const fn default_pr_poll_interval(state: WaitPrState) -> f64 {
         WaitPrState::Actionable => 120.0,
         _ => 30.0,
     }
+}
+
+/// The longest reconciliation tick an `actionable` wait backs off to while the
+/// steward's classification of the pull request stays the same.
+pub(super) const ACTIONABLE_MAX_POLL_INTERVAL_SECS: f64 = 600.0;
+
+/// The longest tick a PR wait backs off to from `poll_interval`. Only
+/// `actionable` backs off: each of its ticks is a full admission read, and
+/// concurrent agent waits were draining the shared App installation's REST
+/// budget. The other states read one pull request and keep a fixed cadence.
+pub(super) fn max_pr_poll_interval(state: WaitPrState, poll_interval: f64) -> f64 {
+    match state {
+        WaitPrState::Actionable => poll_interval.max(ACTIONABLE_MAX_POLL_INTERVAL_SECS),
+        _ => poll_interval,
+    }
+}
+
+/// The client one `actionable` poll reads through. Every `gh` child is
+/// counted against `pass`, which also reuses its content-addressed and
+/// base-policy reads within the poll. Argv-determined reads (repository
+/// settings, branch rules, required checks, and the check runs and statuses
+/// of a full head SHA) go through the host's short-lived admission read
+/// cache, so concurrent waits and admission on one host share one read.
+pub(super) fn actionable_read_actions(
+    cwd: &Path,
+    config: &LoadedConfig,
+    repo: &str,
+    state_dir: &Path,
+    deadline: Instant,
+    pass: &std::sync::Arc<crate::gh_pass::GhPass>,
+) -> crate::cloud::GitHubActions {
+    crate::cloud::GitHubActions::from_loaded_config(cwd, config)
+        .with_repo_override(repo)
+        .with_absolute_deadline(deadline)
+        .with_pass(std::sync::Arc::clone(pass))
+        .with_read_cache(crate::cloud::ReadCache::for_admission(state_dir))
 }
 
 /// The GitHub reads an `actionable` wait spent, summed over its polls and
@@ -350,7 +387,7 @@ fn wait_pr<W: Write>(
     let mut terminal_wrong = false;
     let mut merged_snapshot = None;
     let mut read_cost = WaitReadCost::default();
-    let result = wait_for_condition_with_timeout(
+    let result = wait_for_condition_with_backoff(
         |snapshot| {
             if matches!(state, WaitPrState::Merged) {
                 merged_snapshot = snapshot.cloned();
@@ -375,11 +412,15 @@ fn wait_pr<W: Write>(
                 }
                 WaitPrState::Actionable => {
                     let config = LoadedConfig::load_from_cwd(mode, cwd)?;
-                    let pass = std::sync::Arc::new(crate::gh_pass::GhPass::counting());
-                    let actions = crate::cloud::GitHubActions::from_loaded_config(cwd, &config)
-                        .with_repo_override(&repo)
-                        .with_absolute_deadline(Instant::now() + remaining)
-                        .with_pass(std::sync::Arc::clone(&pass));
+                    let pass = std::sync::Arc::new(crate::gh_pass::GhPass::caching());
+                    let actions = actionable_read_actions(
+                        cwd,
+                        &config,
+                        &repo,
+                        state_dir,
+                        Instant::now() + remaining,
+                        &pass,
+                    );
                     let snapshot =
                         fetch_pr_actionable_snapshot(&actions, state_dir, &repo, pr_number);
                     read_cost.add(&pass.report());
@@ -397,6 +438,7 @@ fn wait_pr<W: Write>(
         event_filter,
         timeout_seconds,
         poll_interval,
+        max_pr_poll_interval(state, poll_interval),
         no_fallback,
         socket_path,
     );
@@ -1416,6 +1458,7 @@ mod tests {
     use crate::job::{Job, Priority, TargetResult, TargetStatus, ValidationMode};
     use crate::queue::{KEEP_COMPLETED, Queue};
     use crate::wait as wait_logic;
+    use crate::config::LoadedConfig;
     use crate::wait_transport::wait_for_condition_with_timeout;
 
     fn delegated_snapshot(policy_context: &str) -> Value {
@@ -1955,6 +1998,59 @@ artifacts = [
             (super::default_pr_poll_interval(WaitPrState::Actionable) - 120.0).abs() < f64::EPSILON
         );
         assert!((super::default_pr_poll_interval(WaitPrState::Green) - 30.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn only_actionable_waits_back_off_to_ten_minutes() {
+        let max = |state, poll| super::max_pr_poll_interval(state, poll);
+        assert!((max(WaitPrState::Actionable, 120.0) - 600.0).abs() < f64::EPSILON);
+        assert!((max(WaitPrState::Actionable, 900.0) - 900.0).abs() < f64::EPSILON);
+        assert!((max(WaitPrState::Green, 30.0) - 30.0).abs() < f64::EPSILON);
+        assert!((max(WaitPrState::Merged, 30.0) - 30.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn actionable_reads_are_counted_and_share_the_host_read_cache() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config =
+            LoadedConfig::load_from_cwd(RuntimeMode::Isolated, temp.path()).expect("load config");
+        let pass = std::sync::Arc::new(crate::gh_pass::GhPass::caching());
+        let actions = super::actionable_read_actions(
+            temp.path(),
+            &config,
+            "owner/repo",
+            temp.path(),
+            Instant::now() + Duration::from_secs(5),
+            &pass,
+        );
+        assert!(actions.has_read_cache());
+        assert!(actions.gh_pass().is_some());
+    }
+
+    #[test]
+    fn wait_read_cost_sums_polls_and_sites() {
+        let report = |rest, graphql| crate::gh_pass::GhPassReport {
+            rest,
+            graphql,
+            cache_hits: 1,
+            sites: vec![crate::gh_pass::SiteReport {
+                kind: crate::gh_pass::ApiKind::Rest,
+                site: "repos/{repo}".to_owned(),
+                calls: rest,
+                cache_hits: 1,
+                millis: 0,
+            }],
+            ..crate::gh_pass::GhPassReport::default()
+        };
+        let mut cost = super::WaitReadCost::default();
+        cost.add(&report(5, 1));
+        cost.add(&report(3, 0));
+        let value = serde_json::to_value(&cost).expect("json");
+        assert_eq!(value["polls"], 2);
+        assert_eq!(value["rest"], 8);
+        assert_eq!(value["graphql"], 1);
+        assert_eq!(value["cache_hits"], 2);
+        assert_eq!(value["sites"]["rest repos/{repo}"], 8);
     }
 
     #[test]

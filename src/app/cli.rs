@@ -4262,7 +4262,8 @@ pub(super) enum WaitCommand {
         timeout: f64,
         /// Authoritative snapshot reconciliation cadence. Defaults to 30
         /// seconds, or 120 for `--state actionable`, whose snapshot is a
-        /// full admission read.
+        /// full admission read; an actionable wait doubles its cadence while
+        /// the classification is unchanged, up to 600 seconds.
         #[arg(long = "poll-interval")]
         poll_interval: Option<f64>,
         /// Fail with exit 6 rather than polling after the first snapshot miss.
