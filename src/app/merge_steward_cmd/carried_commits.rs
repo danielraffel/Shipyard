@@ -227,8 +227,9 @@ pub(super) fn carried(candidate: &Candidate<'_>, others: &[OpenPr]) -> Vec<Carri
 
 /// The open pull requests whose commits P must not carry unapproved: every
 /// one but P itself, P's own base-branch pull request, and those stacked on
-/// P. Pure. Labelled stacks are excused later, by [`excused_stack`], because
-/// that needs Q's judgement.
+/// P. Pure. A labelled stack is still checked here when it is unrelated to P;
+/// the label is only a repair-lane marker. A Q stacked on P is excluded by the
+/// base-branch relation itself, regardless of labels.
 fn unrelated<'a>(
     number: u64,
     base_ref: &'a str,
@@ -242,42 +243,6 @@ fn unrelated<'a>(
         .filter(move |q| q.cross_repository || q.head_ref != base_ref)
         // Q is stacked on P, directly or through other open pull requests.
         .filter(move |q| !stacked_on(q, head_ref, others))
-}
-
-/// Whether `q` is a verified labelled stack: it carries `stacked:<n>`, still
-/// targets a base other than the steward's, and `n` is an open same-repository
-/// pull request whose head branch is `q`'s base. The label alone proves
-/// nothing (anyone with triage can add it), so the parent must check out.
-/// Pure.
-fn verified_stack(q: &OpenPr, base_ref: &str, others: &[OpenPr]) -> bool {
-    let Some(parent) = q.stacked_on else {
-        return false;
-    };
-    q.base_ref != base_ref
-        && !q.cross_repository
-        && others
-            .iter()
-            .any(|p| p.number == parent && !p.cross_repository && p.head_ref == q.base_ref)
-}
-
-/// Whether P is excused from carrying `q`'s commits because `q` is a verified
-/// labelled stack on P's base-branch chain whose head has no counting HOLD.
-/// Such a stack is invisible to admission until it is retargeted: required
-/// checks do not run on its head and the reviewer never reviews it, so judging
-/// P against it can only hold P on a verdict that will never come. A HOLD, an
-/// unreadable judgement, or a label on an unrelated stack excuses nothing. The
-/// label stops counting once `q` is on the steward's base. P carrying such a
-/// `q`'s commits is still P's own diff, reviewed at P's head. Pure.
-fn excused_stack(
-    q: &OpenPr,
-    base_ref: &str,
-    head_ref: &str,
-    others: &[OpenPr],
-    judgement: &Judgement,
-) -> bool {
-    verified_stack(q, base_ref, others)
-        && stacked_on(q, head_ref, others)
-        && matches!(judgement, Judgement::Approved | Judgement::Unapproved(_))
 }
 
 /// The parent number of a `stacked:<n>` label, if `name` is one. Pure.
@@ -791,9 +756,6 @@ pub(super) fn refusal_with(
             .iter()
             .find(|q| q.number == overlap.number())
             .expect("an overlap names a listed pull request");
-        if verified_stack(q, base, others) && excused_stack(q, base, head_ref, others, &judge(q)) {
-            continue;
-        }
         let Some(settled) = resolve_overlap(
             run_gh,
             repo,
@@ -1015,9 +977,6 @@ fn over_cap_refusal(
     let mut judged = Vec::new();
     let mut probes_left = MAX_REVERSE_PROBES;
     for q in unrelated(number, base, head_ref, others) {
-        if verified_stack(q, base, others) && excused_stack(q, base, head_ref, others, &judge(q)) {
-            continue;
-        }
         let roots = cache
             .roots
             .entry((q.number, q.head_sha.clone()))

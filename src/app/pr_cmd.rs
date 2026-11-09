@@ -193,7 +193,7 @@ fn stacked_body_note(parent: u64, base: &str, configured: &str) -> String {
     format!(
         "**Stacked on #{parent}** (`{base}`), labelled `{prefix}{parent}`. Required checks \
          do not run on a stacked head, so this pull request cannot be reviewed or admitted \
-         yet, and the steward never holds other pull requests on it. Once #{parent} merges, \
+         yet. Once #{parent} merges, \
          it is retargeted onto `{configured}`, `{configured}` is merged in and pushed once; \
          review starts from that head.",
         prefix = super::merge_steward_cmd::STACKED_LABEL_PREFIX,
@@ -1616,6 +1616,7 @@ mod tests {
         assert!(note.contains("`stacked:41`"), "{note}");
         assert!(note.contains("cannot be reviewed"), "{note}");
         assert!(note.contains("retargeted onto `main`"), "{note}");
+        assert!(!note.contains("never holds other pull requests"), "{note}");
     }
 
     #[cfg(unix)]

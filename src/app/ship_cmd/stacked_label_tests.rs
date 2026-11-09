@@ -28,4 +28,12 @@ fn a_failed_label_write_is_reported_not_swallowed() {
         "{line}"
     );
     assert!(line.contains("HTTP 403"), "{line}");
+    assert!(
+        line.contains("ordinary carried-commit checks still apply"),
+        "{line}"
+    );
+    assert!(
+        !line.contains("will judge other pull requests against this stack"),
+        "{line}"
+    );
 }

@@ -1,14 +1,12 @@
-//! A verified labelled stacked pull request (`stacked:<n>`, opened by
-//! `shipyard pr --stacked-on <n>`) with no HOLD at its head is invisible to the
-//! carried-commit guard until it is retargeted onto the steward's base.
+//! A `stacked:<n>` label records a stacked pull request, but does not waive the
+//! carried-commit guard for an unrelated candidate.
 
 use std::collections::BTreeSet;
 
 use serde_json::json;
 
 use super::{
-    CommitList, Judgement, OpenPr, PassCache, excused_stack, judgement_of, refusal_with,
-    stacked_label_parent,
+    CommitList, Judgement, OpenPr, PassCache, judgement_of, refusal_with, stacked_label_parent,
 };
 
 const SHARED: &str = "5ba4ed0000000000000000000000000000000000";
@@ -53,113 +51,6 @@ fn parent(head_ref: &str) -> OpenPr {
 
 fn unapproved() -> Judgement {
     Judgement::Unapproved("no APPROVE at this head".to_owned())
-}
-
-#[test]
-fn a_verified_stack_without_a_hold_is_excused() {
-    let q = stacked_q(PARENT_BRANCH, Some(PARENT));
-    let others = [q.clone(), parent(PARENT_BRANCH)];
-    assert!(excused_stack(
-        &q,
-        "main",
-        PARENT_BRANCH,
-        &others,
-        &unapproved()
-    ));
-}
-
-#[test]
-fn control_the_same_stack_without_the_label_is_not_excused() {
-    let q = stacked_q(PARENT_BRANCH, None);
-    let others = [q.clone(), parent(PARENT_BRANCH)];
-    assert!(!excused_stack(
-        &q,
-        "main",
-        PARENT_BRANCH,
-        &others,
-        &unapproved()
-    ));
-}
-
-#[test]
-fn a_forged_label_is_not_excused_and_the_matching_label_is() {
-    // `stacked:1`: no such open pull request.
-    let forged = stacked_q(PARENT_BRANCH, Some(1));
-    let others = [forged.clone(), parent(PARENT_BRANCH)];
-    assert!(!excused_stack(
-        &forged,
-        "main",
-        PARENT_BRANCH,
-        &others,
-        &unapproved()
-    ));
-    // `stacked:<n>` naming an open pull request whose head is not Q's base.
-    let q = stacked_q(PARENT_BRANCH, Some(PARENT));
-    let elsewhere = [q.clone(), parent("feat/unrelated")];
-    assert!(!excused_stack(
-        &q,
-        "main",
-        PARENT_BRANCH,
-        &elsewhere,
-        &unapproved()
-    ));
-    // Control: the matching label on the same instrument.
-    let matching = [q.clone(), parent(PARENT_BRANCH)];
-    assert!(excused_stack(
-        &q,
-        "main",
-        PARENT_BRANCH,
-        &matching,
-        &unapproved()
-    ));
-    // A parent from a fork is no parent.
-    let fork = [
-        q.clone(),
-        OpenPr {
-            cross_repository: true,
-            ..parent(PARENT_BRANCH)
-        },
-    ];
-    assert!(!excused_stack(
-        &q,
-        "main",
-        PARENT_BRANCH,
-        &fork,
-        &unapproved()
-    ));
-}
-
-#[test]
-fn a_hold_or_an_unreadable_judgement_excuses_nothing() {
-    let q = stacked_q(PARENT_BRANCH, Some(PARENT));
-    let others = [q.clone(), parent(PARENT_BRANCH)];
-    assert!(!excused_stack(
-        &q,
-        "main",
-        PARENT_BRANCH,
-        &others,
-        &Judgement::Held("held by infra-review2".to_owned())
-    ));
-    assert!(!excused_stack(
-        &q,
-        "main",
-        PARENT_BRANCH,
-        &others,
-        &Judgement::Unreadable("timeout".to_owned())
-    ));
-}
-
-#[test]
-fn a_lingering_label_on_a_retargeted_pr_does_not_exempt_it() {
-    let q = stacked_q("main", Some(PARENT));
-    let others = [q.clone(), parent("main")];
-    assert!(!excused_stack(
-        &q,
-        "main",
-        PARENT_BRANCH,
-        &others,
-        &unapproved()
-    ));
 }
 
 fn node(pr: &OpenPr, labels: &[String], total: usize) -> serde_json::Value {

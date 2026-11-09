@@ -176,15 +176,12 @@ allows none.
 integration_bases = ["develop/*", "release/*"]
 ```
 
-The carried-commit guard excuses a labelled stack only when the label is
-verified and nothing holds it: its base is still not the steward's base, `<n>`
-is an open same-repository pull request whose head branch is the stack's base,
-and no counting HOLD names the stack's head (under fleet-guard admission, where
-a HOLD is not observable, a refused stack is never excused). Such a stack can
-never be reviewed or gated, so a verdict that would release P never comes. A
-`stacked:<n>` label anyone added by hand, naming a pull request that is not the
-stack's parent, excuses nothing. The label stops counting once the stack is
-retargeted onto the base. When `<n>` merges, the repair and operator passes
+The `stacked:<n>` label records the parent of a stacked pull request and keeps
+that head out of review and admission until it is retargeted. It does not waive
+the carried-commit guard: an unrelated candidate is still held when it carries
+commits introduced by a labelled Q whose current head has no APPROVE (or has a
+HOLD). A label anyone added by hand, naming a pull request that is not the
+stack's parent, has no effect on that guard. When `<n>` merges, the repair and operator passes
 list the stack immediately as `STACK-BASE-MERGED parent:#<n>`; they retarget it
 onto main, merge main, push once and comment `retargeted: ...`. A parent closed
 without merging is `STACK-PARENT-CLOSED`, a label whose pull request's head is

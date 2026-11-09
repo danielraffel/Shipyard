@@ -1531,8 +1531,8 @@ fn stacked_label_line(
             "▸ Labelled #{number} `{label}`: it stays out of review and admission until it is retargeted"
         ),
         Err(error) => format!(
-            "⚠︎ Could not label #{number} `{label}`: {error}. Add it by hand, or the steward \
-             will judge other pull requests against this stack"
+            "⚠︎ Could not label #{number} `{label}`: {error}. Add it by hand; ordinary \
+             carried-commit checks still apply"
         ),
     }
 }
