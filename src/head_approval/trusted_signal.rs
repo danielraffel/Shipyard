@@ -385,3 +385,6 @@ fn read_lines(run_gh: RunGh<'_>, path: &str, jq: &str) -> Result<Vec<Value>, Str
 fn short(sha: &str) -> &str {
     sha.get(..12).unwrap_or(sha)
 }
+
+#[cfg(test)]
+mod tests;
