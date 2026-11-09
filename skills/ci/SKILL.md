@@ -45,6 +45,29 @@ GitHub's branch protection counts it: a status whose REST `creator` is
 The PR rollup omits a status's creator, so read the creator over REST; a status
 from any other creator never satisfies a bound rule.
 
+That binding cannot tell one Actions workflow from another, so some signals
+are also verified by their run before the steward admits a head
+(`src/head_approval/trusted_signal.rs`). Vellum's `framework-trusted-verify` is
+required that way by default (`TRUSTED_SIGNAL_REPOS`); a base adds more with
+`[auto_merge] trusted_signals = [{ name, workflow }]`, and can never remove the
+default. The signal is a commit status; a check run of that name, from any App,
+is a spoof and refuses. Every status of that name on the head must name, by the
+exact URL `https://github.com/<repo>/actions/runs/<id>`, a run of that workflow
+file in that repository on `pull_request_target` whose `head_sha` is the head
+and whose `head_branch` is the PR's head branch. The workflow's runs decide,
+not the statuses: its newest `pull_request_target` run on the head must have
+concluded `success` (a newer failed, queued or running run refuses), and the
+newest status must be `success` and name exactly that run, so an older success
+cannot be replayed. Every PR, open or closed, with that head branch or head
+commit must target `main`, since `pull_request_target` runs the base's
+workflow. A `pull_request_target` run's `head_sha` is the PR head it ran for,
+so a run for an older push never admits a newer head. It is enforced once the
+base branch's current tip (`git/ref/heads/<base.ref>`, never the PR's
+`base.sha` snapshot) has the workflow file, read through `git/trees`; a PR
+deleting the file is still enforced. Anything else is
+`HeadGate::UntrustedSignal`; a read that fails is an error, never an admission.
+It is an accident guard, not a defence against someone with push rights.
+
 `metrics repeated-work-cost` is read-only accounting for shadow observations
 within its explicit `--since` baseline window. Its `duration_ms` is measured
 runtime from authenticated timing for each distinct superseded queue job, with

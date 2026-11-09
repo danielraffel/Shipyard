@@ -657,6 +657,27 @@ Every merge carry a landing accepts is logged to `carries.jsonl` with its
 verdict id and both merge bases. Read-only evaluations (`dry_run`: the
 `review-verdict` status, `train status`) never append a row.
 
+## A required check bound to Actions is not bound to a workflow
+
+A ruleset can bind a required context to the GitHub Actions app (15368) but
+not to a workflow file, so any workflow in the repository, including one the
+PR rewrote, can satisfy it. For a repo listed in
+`head_approval::trusted_signal::TRUSTED_SIGNAL_REPOS` (today
+`Generous-Corp/vellum` → `framework-trusted-verify`), or opted in with
+`trusted_signals = [{ name, workflow }]` in the head-approval config, the
+steward checks every same-named commit status on the exact head against its
+run (exact same-repo run URL, the named workflow path, `pull_request_target`,
+`head_sha` equal to the PR head, `head_branch` equal to the PR's head branch),
+then requires the workflow's newest run on that head to have succeeded and the
+newest status to be `success` and name that run. A same-named check run is a
+spoof, and every PR sharing the head branch or commit must target `main`.
+Enforcement starts once the base branch's current tip has the workflow file
+(never the PR's `base.sha` snapshot); otherwise the PR that adds the workflow
+could never land. A refusal or an API error never admits
+(`HeadGate::UntrustedSignal`). It guards against accidents, not a pusher;
+retargeting after the run and `merge_group` forgery remain open until a
+dedicated judge App exists.
+
 ## Rollups: several approved pull requests as one tested merge
 
 Off unless the base's `.shipyard/config.toml` sets `[train] enabled = true`
