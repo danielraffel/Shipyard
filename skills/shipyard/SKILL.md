@@ -656,14 +656,17 @@ PR rewrote, can satisfy it. For a repo listed in
 `Generous-Corp/vellum` → `framework-trusted-verify`), or opted in with
 `trusted_signals = [{ name, workflow }]` in the head-approval config, the
 steward checks every same-named commit status on the exact head against its
-run: exact same-repo run URL, the named workflow path, event
-`pull_request_target`/`merge_group`, `head_sha` equal to the PR head, and a
-`success` newest status (pending never admits). A same-named check run is a
-spoof. Enforcement starts once the PR's `base.sha` has the workflow file, since
-`pull_request_target` runs the base's definition; otherwise the PR that adds the
-workflow could never land. A refusal or an API error never admits
-(`HeadGate::UntrustedSignal`). A `pull_request_target` run's `head_sha` is the
-PR head it ran for, so the head comparison is a real staleness check.
+run (exact same-repo run URL, the named workflow path, `pull_request_target`,
+`head_sha` equal to the PR head, `head_branch` equal to the PR's head branch),
+then requires the workflow's newest run on that head to have succeeded and the
+newest status to be `success` and name that run. A same-named check run is a
+spoof, and every PR sharing the head branch or commit must target `main`.
+Enforcement starts once the base branch's current tip has the workflow file
+(never the PR's `base.sha` snapshot); otherwise the PR that adds the workflow
+could never land. A refusal or an API error never admits
+(`HeadGate::UntrustedSignal`). It guards against accidents, not a pusher;
+retargeting after the run and `merge_group` forgery remain open until a
+dedicated judge App exists.
 
 ## Rollups: several approved pull requests as one tested merge
 

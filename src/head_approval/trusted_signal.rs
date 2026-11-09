@@ -2,52 +2,46 @@
 //!
 //! ## Why
 //!
-//! A repository ruleset can require a status context or a check run name, and
-//! bind it to an App, but for GitHub Actions the App is the one every workflow
-//! shares (`github-actions`, App 15368). Any workflow with
-//! `statuses: write`, or any job of the same name, satisfies such a rule,
-//! including one a same-repository pull request adds under `pull_request`.
-//! Vellum's `framework-trusted-verify` is such a signal: it is only worth
-//! something when it comes from `.github/workflows/framework-trusted-verify.yml`
-//! running on `pull_request_target` (the base's definition) or `merge_group`.
+//! A repository ruleset can require a status context and bind it to an App,
+//! but for GitHub Actions the App is the one every workflow shares
+//! (`github-actions`, App 15368). Any workflow with `statuses: write` satisfies
+//! such a rule, including one a same-repository pull request adds under
+//! `pull_request`. Vellum's `framework-trusted-verify` is such a signal: it is
+//! only worth something when it comes from
+//! `.github/workflows/framework-trusted-verify.yml` running on
+//! `pull_request_target` (the base's definition of the workflow).
 //!
 //! So before the steward admits a head (every caller of the approval gate:
 //! enqueue, exact-head merge, native arm, the carrier and the
 //! unapproved-admission sweep), each required trusted signal must resolve to
-//! that workflow's own run on that exact head.
+//! that workflow's own latest run on that exact head.
 //!
 //! ## What counts
 //!
-//! The signal is a commit status: Vellum's workflow posts the context `name`
-//! to the head it ran for (pending at start, then success or failure) from a
-//! job of a different name, and lints that no job carries `name`. So a check
-//! run named `name`, from any App, is a spoof and refuses the head.
+//! The canonical signal is a commit status. Vellum's workflow posts the
+//! context `name` to the head it ran for (pending at start, then success or
+//! failure) from a job of a different name, and lints that no job carries
+//! `name`. So a check run named `name`, from any App, is a spoof and refuses
+//! the head.
 //!
-//! Every commit status whose context is `name` must name a workflow run of
-//! the same repository by its exact URL,
-//! `https://github.com/<owner>/<repo>/actions/runs/<id>` and nothing else,
-//! and that run must have:
+//! Every status of that context on the head must name a workflow run of the
+//! same repository by its exact URL,
+//! `https://github.com/<owner>/<repo>/actions/runs/<id>` and nothing else, and
+//! that run must have:
 //!
 //! * `path` equal to the signal's workflow file;
-//! * `event` `pull_request_target` or `merge_group`;
+//! * `event` `pull_request_target`;
 //! * `head_sha` equal to the head being admitted;
+//! * `head_branch` equal to the pull request's head branch;
 //! * `repository.full_name` equal to the repository.
 //!
-//! Every status of that name must pass this, not only the newest: a
-//! same-named status from any other workflow or event is a spoof attempt, and
-//! the head is refused even beside a genuine one. Then the newest status (by
-//! id) must be `success`, so a pending one never admits, and its run must
-//! have concluded `success`. No status of that name refuses.
-//!
-//! ## When it is enforced
-//!
-//! `pull_request_target` runs the workflow as the base defines it, so until
-//! the base has the workflow file no run can post the signal, and enforcing
-//! it would hold every pull request, including the one that adds the file.
-//! A signal is therefore enforced for a pull request exactly when the
-//! workflow file is a blob at the pull request's `base.sha`, read through the
-//! git trees API. A pull request that deletes or edits the file is still
-//! enforced, because its base has it. A failed read is an error.
+//! A same-named status from any other workflow or event refuses the head even
+//! beside a genuine one. Then the workflow's own runs decide, not the statuses:
+//! of the workflow's `pull_request_target` runs on the head, the newest (by id)
+//! must pass the same checks and have concluded `success`, so a newer run that
+//! failed, or is queued or in progress, refuses. The newest status must be
+//! `success` (pending never admits) and must name exactly that newest run, so
+//! an older success cannot be replayed over a newer run. No status refuses.
 //!
 //! Which sha a `pull_request_target` run reports was measured on
 //! Generous-Corp/vellum's own `pull_request_target` workflow
@@ -57,22 +51,48 @@
 //! ran; the earlier runs 42580805263 and 42578269821 keep the earlier heads
 //! `09b407e14b07…` and `0b5a7afaac13…`, while their `pull_requests[]` shows
 //! only the pull request's current head. So the run's own `head_sha` is the
-//! binding, and a run for an older push never admits a newer head. A
-//! `merge_group` run's `head_sha` is the merge-group commit, which is never a
-//! pull request's head, so on a pull request it fails the binding.
+//! binding, and a run for an older push never admits a newer head.
+//!
+//! Because `pull_request_target` runs whatever workflow the pull request's
+//! base branch defines, a run is only as trusted as that base. So when a
+//! signal is enforced, every pull request (open or closed) with this head
+//! branch, or with this head commit, must target `main`.
+//!
+//! ## When it is enforced
+//!
+//! Until the base branch has the workflow file no run can post the signal, and
+//! enforcing it would hold every pull request, including the one that adds the
+//! file. A signal is enforced exactly when the workflow file is a blob at the
+//! pull request's base branch as it is now: `refs/heads/<base.ref>` resolved at
+//! admission, then walked through the git trees API (so absence is an answer,
+//! not a 404). The pull request's `base.sha` is deliberately not used: it is a
+//! snapshot, and a pull request opened before the workflow landed would escape
+//! forever. A pull request that deletes or edits the file is still enforced,
+//! because its base has it. A failed, truncated or malformed read is an error.
 //!
 //! Anything missing, unparsable, foreign or mismatched refuses
 //! ([`HeadGate::UntrustedSignal`], named in the verdict). A read that fails is
 //! an error, never an admission: the steward does not admit on an error, and
 //! the dequeue sweep only defers on one.
 //!
+//! ## Threat model
+//!
+//! This guards against accidents: an agent's workflow, a misnamed job, a
+//! stale or replayed result. It is not a defence against someone with push
+//! rights. Known residuals: retargeting or deleting a pull request after its
+//! run; a forged status on a `merge_group` commit (merge-group heads are
+//! outside this gate, which judges pull request heads before admission); and
+//! anything else a pusher can do through a workflow sharing App 15368. Only a
+//! dedicated judge App closes those.
+//!
 //! ## Scope
 //!
 //! [`TRUSTED_SIGNAL_REPOS`] requires Vellum's signal whatever its base config
 //! says. Any repository can add signals with
 //! `[auto_merge] trusted_signals = [{ name = "...", workflow = "..." }]` in its
-//! base config; a config can add a requirement, never remove one. Every other
-//! repository is unaffected.
+//! base config; a config can add a requirement, never remove one. A workflow
+//! must be a file directly under `.github/workflows/`. Every other repository
+//! is unaffected.
 
 use std::collections::BTreeMap;
 
@@ -92,8 +112,14 @@ pub const TRUSTED_SIGNAL_REPOS: &[(&str, &str, &str)] = &[(
     ".github/workflows/framework-trusted-verify.yml",
 )];
 
-/// Events whose runs may carry a trusted signal.
-const TRUSTED_EVENTS: &[&str] = &["pull_request_target", "merge_group"];
+/// The event whose runs may carry a trusted signal.
+const TRUSTED_EVENT: &str = "pull_request_target";
+
+/// The branch every pull request with a trusted head must target.
+const TRUSTED_BASE: &str = "main";
+
+/// Where a workflow file must live for its runs to be listed.
+const WORKFLOWS_DIR: &str = ".github/workflows/";
 
 /// A status context that only one workflow may satisfy.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -170,8 +196,8 @@ pub fn required(repo: &str, configured: &[TrustedSignal]) -> Vec<TrustedSignal> 
 ///
 /// # Errors
 ///
-/// When the pull request, its base tree, a status, a check run or a workflow
-/// run cannot be read. Callers must not
+/// When the pull request, its base branch, a tree, a status, a check run, a
+/// workflow run or a related pull request cannot be read. Callers must not
 /// admit on an error.
 pub(super) fn apply(
     run_gh: RunGh<'_>,
@@ -188,22 +214,121 @@ pub(super) fn apply(
     if signals.is_empty() {
         return Ok(gate);
     }
-    let base = base_sha(run_gh, repo, pr)?;
+    let pull = read_pull(run_gh, repo, pr)?;
+    let tip = branch_tip(run_gh, repo, &pull.base_ref)?;
+    let untrusted = |detail| HeadGate::UntrustedSignal {
+        head: head.to_owned(),
+        detail,
+    };
+    let mut enforced = false;
     for signal in signals {
-        if !signal.workflow.is_empty() && !blob_at(run_gh, repo, &base, &signal.workflow)? {
+        if !signal.workflow.is_empty() && !blob_at(run_gh, repo, &tip, &signal.workflow)? {
             continue;
         }
-        if let Some(detail) = judge(run_gh, repo, head, &signal)? {
-            return Ok(HeadGate::UntrustedSignal {
-                head: head.to_owned(),
-                detail,
-            });
+        enforced = true;
+        if let Some(detail) = judge(run_gh, repo, head, &pull.head_ref, &signal)? {
+            return Ok(untrusted(detail));
         }
     }
-    Ok(gate)
+    if !enforced {
+        return Ok(gate);
+    }
+    Ok(foreign_base(run_gh, repo, head, &pull)?.map_or(gate, untrusted))
 }
 
-/// Why `signal` does not admit `head`, or `None` when it does.
+/// The pull request fields enforcement reads.
+#[derive(Debug)]
+struct Pull {
+    base_ref: String,
+    head_ref: String,
+    head_owner: String,
+}
+
+fn read_pull(run_gh: RunGh<'_>, repo: &str, pr: u64) -> Result<Pull, String> {
+    let raw = run_gh(&[
+        "api".to_owned(),
+        format!("repos/{repo}/pulls/{pr}"),
+        "--jq".to_owned(),
+        "{base_ref: .base.ref, head_ref: .head.ref, head_owner: .head.repo.owner.login}".to_owned(),
+    ])?;
+    let value: Value = serde_json::from_str(raw.trim())
+        .map_err(|error| format!("malformed pull request {pr}: {error}"))?;
+    let field = |key: &str| {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| format!("pull request {pr} has no {key}"))
+    };
+    Ok(Pull {
+        base_ref: field("base_ref")?,
+        head_ref: field("head_ref")?,
+        head_owner: field("head_owner")?,
+    })
+}
+
+/// The commit `branch` points at now.
+fn branch_tip(run_gh: RunGh<'_>, repo: &str, branch: &str) -> Result<String, String> {
+    let raw = run_gh(&[
+        "api".to_owned(),
+        format!("repos/{repo}/git/ref/heads/{branch}"),
+        "--jq".to_owned(),
+        ".object.sha".to_owned(),
+    ])?;
+    let sha = raw.trim();
+    if is_sha(sha) {
+        Ok(sha.to_owned())
+    } else {
+        Err(format!("branch `{branch}` resolved to {sha:?}"))
+    }
+}
+
+/// Why a pull request sharing this head branch or head commit makes its runs
+/// untrustworthy (it targets a base other than [`TRUSTED_BASE`], whose
+/// workflow definition `pull_request_target` would have run), or `None`.
+fn foreign_base(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    head: &str,
+    pull: &Pull,
+) -> Result<Option<String>, String> {
+    let by_branch = read_lines(
+        run_gh,
+        &format!(
+            "repos/{repo}/pulls?state=all&head={}:{}&per_page=100",
+            pull.head_owner,
+            crate::required_check_policy::encode_path_segment(&pull.head_ref)
+        ),
+        ".[] | {number, base: .base.ref}",
+    )?;
+    let by_commit: Vec<Value> = read_lines(
+        run_gh,
+        &format!("repos/{repo}/commits/{head}/pulls?per_page=100"),
+        ".[] | {number, base: .base.ref, head_sha: .head.sha}",
+    )?
+    .into_iter()
+    .filter(|other| {
+        other
+            .get("head_sha")
+            .and_then(Value::as_str)
+            .is_some_and(|sha| sha.eq_ignore_ascii_case(head))
+    })
+    .collect();
+    Ok(by_branch.iter().chain(&by_commit).find_map(|other| {
+        let base = other.get("base").and_then(Value::as_str).unwrap_or("");
+        (base != TRUSTED_BASE).then(|| {
+            format!(
+                "pull request #{} with this head targets `{base}`, not `{TRUSTED_BASE}`, so \
+                 its `{TRUSTED_EVENT}` runs used that branch's workflow",
+                other.get("number").and_then(Value::as_u64).unwrap_or(0)
+            )
+        })
+    }))
+}
+
+/// Why `signal` does not admit `head` (pushed on branch `head_ref`), or
+/// `None` when it does.
 ///
 /// # Errors
 ///
@@ -212,12 +337,17 @@ pub fn judge(
     run_gh: RunGh<'_>,
     repo: &str,
     head: &str,
+    head_ref: &str,
     signal: &TrustedSignal,
 ) -> Result<Option<String>, String> {
     let name = &signal.name;
-    if signal.workflow.is_empty() {
+    let Some(file) = signal
+        .workflow
+        .strip_prefix(WORKFLOWS_DIR)
+        .filter(|file| !file.is_empty() && !file.contains('/'))
+    else {
         return Ok(Some(format!("`{name}` cannot be verified")));
-    }
+    };
     let statuses: Vec<Value> = read_lines(
         run_gh,
         &format!("repos/{repo}/commits/{head}/statuses?per_page=100"),
@@ -249,7 +379,19 @@ pub fn judge(
     if statuses.is_empty() {
         return Ok(Some(format!("no `{name}` status on head {}", short(head))));
     }
-    let mut runs: BTreeMap<u64, Value> = BTreeMap::new();
+    let workflow_runs = read_lines(
+        run_gh,
+        &format!(
+            "repos/{repo}/actions/workflows/{}/runs?head_sha={head}&event={TRUSTED_EVENT}&per_page=100",
+            crate::required_check_policy::encode_path_segment(file)
+        ),
+        ".workflow_runs[] | {id, path, event, head_sha, head_branch, status, conclusion, \
+         repository: .repository.full_name}",
+    )?;
+    let mut runs: BTreeMap<u64, Value> = workflow_runs
+        .iter()
+        .filter_map(|run| Some((run.get("id")?.as_u64()?, run.clone())))
+        .collect();
     for status in &statuses {
         let id = status.get("id").and_then(Value::as_u64).unwrap_or(0);
         let url = status
@@ -263,23 +405,50 @@ pub fn judge(
         if let std::collections::btree_map::Entry::Vacant(entry) = runs.entry(run_id) {
             entry.insert(read_run(run_gh, repo, run_id)?);
         }
-        if let Some(why) = untrusted_run(&runs[&run_id], repo, head, signal) {
+        if let Some(why) = untrusted_run(&runs[&run_id], repo, head, head_ref, signal) {
             return Ok(Some(format!(
                 "`{name}` status {id} names run {run_id}, which {why}"
             )));
         }
     }
-    Ok(newest_unsuccessful(name, repo, &statuses, &runs))
+    Ok(latest_refusal(
+        repo,
+        head,
+        head_ref,
+        signal,
+        &statuses,
+        &workflow_runs,
+    ))
 }
 
-/// Why the newest `name` status has not succeeded, or `None` when it and its
-/// run have (every status already judged trusted, its run fetched into `runs`).
-fn newest_unsuccessful(
-    name: &str,
+/// Why the workflow's newest run on `head`, or the newest status, does not
+/// admit it: the newest run must be trusted and have succeeded, and the newest
+/// status must be `success` and name exactly that run.
+fn latest_refusal(
     repo: &str,
+    head: &str,
+    head_ref: &str,
+    signal: &TrustedSignal,
     statuses: &[Value],
-    runs: &BTreeMap<u64, Value>,
+    workflow_runs: &[Value],
 ) -> Option<String> {
+    let name = &signal.name;
+    let workflow = &signal.workflow;
+    let Some(latest) = newest(workflow_runs) else {
+        return Some(format!(
+            "no `{TRUSTED_EVENT}` run of `{workflow}` on head {}",
+            short(head)
+        ));
+    };
+    let latest_id = latest.get("id").and_then(Value::as_u64).unwrap_or(0);
+    if let Some(why) =
+        untrusted_run(latest, repo, head, head_ref, signal).or_else(|| unsuccessful(latest))
+    {
+        return Some(format!(
+            "the newest run {latest_id} of `{workflow}` on head {} {why}",
+            short(head)
+        ));
+    }
     let status = newest(statuses)?;
     let state = status
         .get("state")
@@ -288,31 +457,20 @@ fn newest_unsuccessful(
     if state != "success" {
         return Some(format!("the newest `{name}` status is `{state}`"));
     }
-    let url = status
-        .get("target_url")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    match run_id_from_url(url, repo).map(|run_id| (run_id, runs.get(&run_id))) {
-        Ok((run_id, Some(run))) => unsuccessful(run)
-            .map(|why| format!("the newest `{name}` status names run {run_id}, which {why}")),
-        _ => Some(format!("the newest `{name}` status names no fetched run")),
-    }
-}
-
-/// The pull request's `base.sha`.
-fn base_sha(run_gh: RunGh<'_>, repo: &str, pr: u64) -> Result<String, String> {
-    let sha = run_gh(&[
-        "api".to_owned(),
-        format!("repos/{repo}/pulls/{pr}"),
-        "--jq".to_owned(),
-        ".base.sha".to_owned(),
-    ])?;
-    let sha = sha.trim();
-    if is_sha(sha) {
-        Ok(sha.to_owned())
-    } else {
-        Err(format!("pull request {pr} base sha read back as {sha:?}"))
-    }
+    let named = run_id_from_url(
+        status
+            .get("target_url")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+        repo,
+    )
+    .ok();
+    (named != Some(latest_id)).then(|| {
+        format!(
+            "the newest `{name}` status names run {}, not the newest run {latest_id}",
+            named.map_or_else(|| "none".to_owned(), |id| id.to_string())
+        )
+    })
 }
 
 /// Whether `path` is a blob in commit `commit`'s tree, walked one directory
@@ -379,7 +537,13 @@ fn newest(records: &[Value]) -> Option<&Value> {
 }
 
 /// Why `run` may not carry `signal` for `head`, or `None` when it may.
-fn untrusted_run(run: &Value, repo: &str, head: &str, signal: &TrustedSignal) -> Option<String> {
+fn untrusted_run(
+    run: &Value,
+    repo: &str,
+    head: &str,
+    head_ref: &str,
+    signal: &TrustedSignal,
+) -> Option<String> {
     let field = |key: &str| run.get(key).and_then(Value::as_str).unwrap_or("");
     if !field("repository").eq_ignore_ascii_case(repo) {
         return Some(format!("belongs to `{}`", field("repository")));
@@ -387,17 +551,20 @@ fn untrusted_run(run: &Value, repo: &str, head: &str, signal: &TrustedSignal) ->
     if field("path") != signal.workflow {
         return Some(format!("is `{}`, not `{}`", field("path"), signal.workflow));
     }
-    if !TRUSTED_EVENTS.contains(&field("event")) {
-        return Some(format!(
-            "ran on `{}`, not pull_request_target or merge_group",
-            field("event")
-        ));
+    if field("event") != TRUSTED_EVENT {
+        return Some(format!("ran on `{}`, not {TRUSTED_EVENT}", field("event")));
     }
     if !field("head_sha").eq_ignore_ascii_case(head) {
         return Some(format!(
             "ran for {}, not {}",
             short(field("head_sha")),
             short(head)
+        ));
+    }
+    if field("head_branch") != head_ref {
+        return Some(format!(
+            "ran on branch `{}`, not `{head_ref}`",
+            field("head_branch")
         ));
     }
     None
@@ -454,7 +621,7 @@ fn read_run(run_gh: RunGh<'_>, repo: &str, run_id: u64) -> Result<Value, String>
         "api".to_owned(),
         format!("repos/{repo}/actions/runs/{run_id}"),
         "--jq".to_owned(),
-        "{id, path, event, head_sha, status, conclusion, repository: .repository.full_name}"
+        "{id, path, event, head_sha, head_branch, status, conclusion, repository: .repository.full_name}"
             .to_owned(),
     ])?;
     serde_json::from_str(raw.trim()).map_err(|error| format!("malformed run {run_id}: {error}"))
