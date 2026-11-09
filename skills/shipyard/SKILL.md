@@ -4387,7 +4387,9 @@ arm, the classic merge, the steward backstop), with no override: `--arm` only
 asks for an arm the verdict allows. An approval comment stamped (by `ghapp`) with the arming agent id
 (`SHIPYARD_AGENT_ID`) is `SelfApproved`: an agent cannot approve its own
 landing; a shared session alone never refuses, and unstamped verdicts count
-as before. `shipyard who --pr N` names the host and session (and agent, when
+as before. `shipyard who --contact N` names and probes the cmux address of the session
+that owns PR N (`shipyard owner register|release`; `shipyard relay` delivers
+PR events to it, docs/owner-relay.md). `shipyard who --pr N` names the host and session (and agent, when
 recorded) behind each
 queue and merge event from the guards' ledgers on every host. `shipyard
 review-verdict --pr N [--head SHA] --json` gives the same decision with the

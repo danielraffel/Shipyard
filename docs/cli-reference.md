@@ -125,6 +125,17 @@ shipyard guards install --opt-in-review-before-arm               # remove the op
 shipyard who --pr 123 [--repo OWNER/REPO]    # which host/session (and agent, if set) armed, enqueued, merged or removed it; joins every
                                              #   host's queue-arms.jsonl + queue-removals.jsonl to the PR timeline
                                              #   (repo+PR+verb+head; time breaks ties); unexplained = unattributed
+shipyard who --contact 123 [--repo OWNER/REPO] # the owning session's live cmux address (owner record on any host, else
+                                             #   the body marker), probed over cmux; plus the repo's fallbacks
+shipyard owner register [--pr 123 | --all] [--repo OWNER/REPO]
+                                             # record this session (host, client, cmux socket+surface, agent, session)
+                                             #   as the PR's owner: state dir + PR-body marker; shipyard pr/ship do it
+shipyard owner release --pr 123 [--repo OWNER/REPO]
+                                             # hand the PR to the repo's repair lane
+shipyard relay [--follow] [--interval SECS] [--repo OWNER/REPO]... [--send|--shadow]
+                                             # deliver merged/closed/ejected/verdict/required red-green/dirty-after-base-move/
+                                             #   claim/stacked-base-merged to each PR's owner over cmux; one GraphQL query per
+                                             #   repo per pass; see docs/owner-relay.md
 shipyard review-verdict --pr 123 [--repo OWNER/REPO] [--head SHA] [--no-rebase-carry] [--json]
                                              # may this head land, by the repository-side review rule (no host
                                              #   switch); merge-only and rebase carries apply; exit 0 allowed,

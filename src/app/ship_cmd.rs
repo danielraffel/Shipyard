@@ -342,6 +342,23 @@ pub(super) fn ship_command<W: Write>(
             writeln!(stdout, "{line}").map_err(|error| CliFailure::new(1, error.to_string()))?;
         }
     }
+    // Record the pushing session as the pull request's owner, so the relay
+    // can tell it when the pull request changes. Never fatal.
+    if !repo.is_empty() && super::owner_cmd::registration_enabled(&|name| std::env::var(name).ok())
+    {
+        let line = super::owner_cmd::register_after_push(
+            cwd,
+            config,
+            runtime_paths,
+            &repo,
+            pr_context.number,
+        );
+        if json_mode {
+            let _ = crate::writer_domain_lease::write_stderr(format_args!("{line}"));
+        } else {
+            writeln!(stdout, "{line}").map_err(|error| CliFailure::new(1, error.to_string()))?;
+        }
+    }
     if let Some(parent) = args.stacked_on
         && !repo.is_empty()
     {
