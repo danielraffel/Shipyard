@@ -160,6 +160,11 @@ struct RepoReport {
     /// Durable provider cooldown that deferred this repository's observation.
     #[serde(skip_serializing_if = "Option::is_none")]
     rate_limit_deferred: Option<pass_budget::RateLimitCooldown>,
+    /// Why this repository made the pass exit 1: each entry is a category,
+    /// then the PR numbers or count behind it. Absent when the repository
+    /// was healthy, so a non-zero exit with empty `errors` is explained here.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    exit_reasons: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1444,7 +1449,55 @@ fn steward_repo(
         recovery_cancellations,
     );
     report.api_calls = Some(pass.report());
+    if unhealthy {
+        report.exit_reasons = exit_reasons(&report);
+    }
     (report, unhealthy)
+}
+
+/// The categories that make a repository's pass exit 1, derived from its
+/// report. Pull-request refusals (an unapproved carried commit, a failed
+/// mutation) land in `prs[].error` and leave `errors` empty, so they need
+/// their own entry; `unclassified` marks an unhealthy repository none of the
+/// report fields explain.
+fn exit_reasons(report: &RepoReport) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if !report.errors.is_empty() {
+        reasons.push(format!("repo_errors:{}", report.errors.len()));
+    }
+    let numbers = |numbers: Vec<String>| numbers.join(",");
+    let pr_errors = report
+        .prs
+        .iter()
+        .filter(|pr| pr.error.is_some())
+        .map(|pr| format!("#{}", pr.number))
+        .collect::<Vec<_>>();
+    if !pr_errors.is_empty() {
+        reasons.push(format!("pr_errors:{}", numbers(pr_errors)));
+    }
+    let failed_runs = report
+        .cancellations
+        .iter()
+        .filter(|cancellation| cancellation.error.is_some())
+        .map(|cancellation| cancellation.run_id.to_string())
+        .collect::<Vec<_>>();
+    if !failed_runs.is_empty() {
+        reasons.push(format!("cancellation_errors:{}", numbers(failed_runs)));
+    }
+    if report.rate_limit_deferred.is_some() {
+        reasons.push("rate_limited".to_owned());
+    }
+    if report
+        .uncertain_mutations
+        .iter()
+        .any(|result| result.outcome == "uncertain")
+    {
+        reasons.push("uncertain_mutations".to_owned());
+    }
+    if reasons.is_empty() {
+        reasons.push("unclassified".to_owned());
+    }
+    reasons
 }
 
 /// [`steward_repo`] once `actions` is scoped to `repo` and counting its
@@ -1602,6 +1655,7 @@ fn deferred_rate_limit_repo_report(
         errors: Vec::new(),
         api_calls: None,
         rate_limit_deferred: Some(cooldown),
+        exit_reasons: Vec::new(),
     }
 }
 
@@ -1628,6 +1682,7 @@ fn unreadable_repo_report(
         native_auto_merge_backstop: native_arm::NativeArmRepoStatus::default(),
         errors: vec![error],
         rate_limit_deferred: None,
+        exit_reasons: Vec::new(),
     }
 }
 
@@ -1704,6 +1759,7 @@ fn append_unmatched_recovery_errors(
             native_auto_merge_backstop: native_arm::NativeArmRepoStatus::default(),
             errors,
             rate_limit_deferred: None,
+            exit_reasons: Vec::new(),
         });
     }
 }
@@ -1740,6 +1796,7 @@ fn persist_final_ledger(
             native_auto_merge_backstop: native_arm::NativeArmRepoStatus::default(),
             errors: vec![message],
             rate_limit_deferred: None,
+            exit_reasons: Vec::new(),
         });
     }
 }
