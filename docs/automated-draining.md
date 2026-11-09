@@ -99,7 +99,12 @@ other open pull request in the repository. If P carries any commit of a pull
 request Q whose current head is not approved (a counted HOLD, or no counted
 APPROVE), P is refused with `blocked_on=carries_unapproved_commits:#Q`, and
 `blocked_detail` names the shared commits and why Q is not approved. Commits
-already on the base never count, nor does Q when it is P's own base-branch
+already on the base never count, nor does a shared commit whose change the base tip
+already has under other shas (a non-merge commit with the patch-id of a
+single-parent tip commit, or a merge whose every path differing from its first
+parent has an identical mode, type and blob on the tip; proven by the steward
+against the tip, all shared commits must qualify, any doubt or read error keeps
+the refusal), nor does Q when it is P's own base-branch
 pull request, is stacked on P (following its base branch through other open
 pull requests' head branches reaches P's head branch), only inherits the
 commit (a commit counts as Q's only if it is in Q's own diff against Q's own
