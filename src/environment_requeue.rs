@@ -133,10 +133,13 @@ pub const INTERRUPTION_SIGNATURES: [&str; 1] = ["Upload progress stalled"];
 /// logs (Generous-Corp/pulp, 2026-11-03..09), never the bare words `timeout`
 /// or `500`, which a test prints when the head is at fault. A test-level
 /// timeout (ctest `***Timeout`) is deliberately absent: a head can introduce
-/// a hang that only the merged tree exercises.
-pub const INFRA_STEP_SIGNATURES: [&str; 14] = [
+/// a hang that only the merged tree exercises. Because a step timeout or an
+/// HTTP error line can come from the head too, a hit clears the head only
+/// when the same check passed on the head itself.
+pub const INFRA_STEP_SIGNATURES: [&str; 15] = [
     "has timed out after",
-    "rate limit exceeded",
+    "HTTP Error 403: rate limit exceeded",
+    "API rate limit exceeded",
     "HTTP Error 500",
     "HTTP Error 502",
     "HTTP Error 503",
@@ -1011,32 +1014,67 @@ fn attribute(
         .iter()
         .filter(|step| step.check == check.name)
         .collect::<Vec<_>>();
-    let step_is_infra = |step: &&StepEvidence| {
+    let established = |step: &&StepEvidence| {
         matches!(
             step.reading,
             StepReading::Environment(_) | StepReading::Interruption(_)
-        ) || (infra_only && step.infra.is_some())
+        )
     };
-    if !steps.is_empty() && steps.iter().all(step_is_infra) {
+    // The discipline's wider readings (a step-timeout, HTTP 5xx or rate-limit
+    // line, a `cancelled` conclusion) are also what a head-caused hang or a
+    // test of HTTP error handling produces. They clear the head only when the
+    // same check passed on the head itself; positive evidence, never absence.
+    let widened = infra_only
+        && ((!steps.is_empty()
+            && steps
+                .iter()
+                .all(|step| established(step) || step.infra.is_some())
+            && !steps.iter().all(established))
+            || check.conclusion == "cancelled");
+    if widened {
+        return match latest_conclusion(run_gh, repo, head, &check.name) {
+            Ok(Some(conclusion)) if conclusion == "success" => FailureAttribution::Infra(
+                steps
+                    .iter()
+                    .map(|step| match (&step.reading, &step.infra) {
+                        (StepReading::Environment(_) | StepReading::Interruption(_), _)
+                        | (_, None) => step.render(),
+                        (_, Some(hit)) => format!(
+                            "{} / {} [job {}]: infrastructure ({}): {}",
+                            step.check, step.step, step.job_id, hit.signature, hit.line
+                        ),
+                    })
+                    .chain(
+                        (check.conclusion == "cancelled")
+                            .then(|| "concluded `cancelled` on the merge group".to_owned()),
+                    )
+                    .chain(std::iter::once(format!("passed on head {}", short(head))))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ),
+            other => FailureAttribution::NoInfraSignature(format!(
+                "`{}` on the merge group looks like infrastructure, but the same check did not \
+                 pass on head {} ({}), so a head-caused failure is not ruled out",
+                check.conclusion,
+                short(head),
+                match other {
+                    Ok(Some(conclusion)) => format!("`{conclusion}`"),
+                    Ok(None) => "no completed run".to_owned(),
+                    Err(error) => format!("unreadable: {error}"),
+                }
+            )),
+        };
+    }
+    if !steps.is_empty() && steps.iter().all(established) {
         return FailureAttribution::Infra(
             steps
                 .iter()
-                .map(|step| match (&step.reading, &step.infra) {
-                    (StepReading::Environment(_) | StepReading::Interruption(_), _) | (_, None) => {
-                        step.render()
-                    }
-                    (_, Some(hit)) => format!(
-                        "{} / {} [job {}]: infrastructure ({}): {}",
-                        step.check, step.step, step.job_id, hit.signature, hit.line
-                    ),
-                })
+                .map(|step| step.render())
                 .collect::<Vec<_>>()
                 .join("; "),
         );
     }
-    if INFRA_CONCLUSIONS.contains(&check.conclusion.as_str())
-        || (infra_only && check.conclusion == "cancelled")
-    {
+    if INFRA_CONCLUSIONS.contains(&check.conclusion.as_str()) {
         return FailureAttribution::Infra(format!(
             "concluded `{}` on the merge group",
             check.conclusion

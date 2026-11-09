@@ -950,14 +950,22 @@ fn the_discipline_still_retries_runner_conclusions_and_cancels() {
         "2026-11-03T10:00:00Z",
         "2026-11-03T10:40:00Z",
     );
-    let answers = interrupted_group("cancelled", &cancelled, "");
+    let mut answers = interrupted_group("cancelled", &cancelled, "");
+    // Without the head's own pass a cancel is not cleared: a job timeout
+    // reads `cancelled`, and a head can hang only in the merged tree.
+    compare(&mut answers, Some("success"), None);
+    let unproven = assess_strict(&answers, 1);
+    assert!(!unproven.allowed, "{}", unproven.reason);
+    assert!(matches!(
+        only_cause(&unproven),
+        FailureAttribution::NoInfraSignature(_)
+    ));
+    compare(&mut answers, Some("success"), Some("success"));
     let strict = assess_strict(&answers, 1);
     assert!(strict.allowed, "{}", strict.reason);
     assert!(
         matches!(only_cause(&strict), FailureAttribution::Infra(detail) if detail.contains("cancelled"))
     );
-    let lenient = assess_group(&answers, 1);
-    assert!(!lenient.allowed, "{}", lenient.reason);
     // The retry is still one per head.
     let second = assess_strict(&answers, 2);
     assert!(!second.allowed, "{}", second.reason);
@@ -976,7 +984,7 @@ fn the_discipline_reads_real_infrastructure_lines_at_the_failure() {
         ),
         // 11845: skia-builder release download.
         (
-            "rate limit exceeded",
+            "HTTP Error 403: rate limit exceeded",
             &[
                 "urllib.error.HTTPError: HTTP Error 403: rate limit exceeded",
                 "##[error]Process completed with exit code 1.",
@@ -1002,7 +1010,12 @@ fn the_discipline_reads_real_infrastructure_lines_at_the_failure() {
         let log = step_log(lines);
         let hit = infra_signature_at_failure(&log, "2026-10-09T23:10:00Z").expect(signature);
         assert_eq!(hit.signature, signature);
-        let answers = interrupted_group("failure", &test_failure_job(), &log);
+        let mut answers = interrupted_group("failure", &test_failure_job(), &log);
+        // Not cleared until the same check is seen passing on the head.
+        compare(&mut answers, Some("success"), Some("failure"));
+        let unproven = assess_strict(&answers, 1);
+        assert!(!unproven.allowed, "{signature}: {}", unproven.reason);
+        compare(&mut answers, Some("success"), Some("success"));
         let strict = assess_strict(&answers, 1);
         assert!(strict.allowed, "{signature}: {}", strict.reason);
         assert!(

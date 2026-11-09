@@ -9,9 +9,9 @@
 //! retry: each needs a regenerate commit on top of the other. On Pulp over one
 //! week that was 19 of 59 ejections.
 //!
-//! So before an enqueue the steward reads the candidate's changed files; when
-//! it changes a generated path and another queued entry changes that same
-//! path, the candidate waits (`generated_path_batch:#<n>`) and is admitted on
+//! So before an enqueue the steward reads the queue live and, when another
+//! entry is queued, the candidate's changed files; when it changes a
+//! generated path and another queued entry changes that same path, the candidate waits (`generated_path_batch:#<n>`) and is admitted on
 //! the first pass after `#<n>` leaves the queue. The steward re-reads the
 //! queue live for this, so a pull request it enqueued earlier in the same
 //! pass counts.
@@ -107,7 +107,7 @@ pub(super) fn read_changed_files(
             format!("number={number}"),
         ];
         if let Some(cursor) = cursor.as_deref() {
-            args.extend(["-F".to_owned(), format!("cursor={cursor}")]);
+            args.extend(["-f".to_owned(), format!("cursor={cursor}")]);
         }
         let raw = actions
             .run_gh(&args)
@@ -213,7 +213,40 @@ pub(super) fn batch_refusal(
     guards: &EjectionGuards,
     pr: &ObservedPr,
 ) -> Option<Result<String, String>> {
+    // The pass-start config read failed: the generated paths are unknown, and
+    // a failed read is never cached, so a later approval read can succeed.
+    // Re-read live; a second failure refuses rather than admitting unguarded.
+    let reread;
+    let guards = if guards.read_error.is_some() && guards.batch_guard {
+        reread = read_ejection_guards(context.actions, context.observation);
+        if let Some(error) = &reread.read_error {
+            return Some(Err(format!(
+                "generated-path batch guard: base config unreadable, so a collision cannot be \
+                 ruled out: {error}"
+            )));
+        }
+        &reread
+    } else {
+        guards
+    };
     if !guards.batch_guard_active() {
+        return None;
+    }
+    // The queue first: with no other entry there is nothing to collide with,
+    // and no file list is read at all.
+    let positions = match super::merge_queue_snapshot(
+        context.actions,
+        &context.observation.repo,
+        &context.observation.base,
+    ) {
+        Ok((_, positions, _, _)) => positions,
+        Err(error) => {
+            return Some(Err(format!(
+                "merge queue unreadable for the generated-path batch guard: {error}"
+            )));
+        }
+    };
+    if positions.keys().all(|number| *number == pr.fact.number) {
         return None;
     }
     let candidate = match cached_files(context, pr.fact.number) {
@@ -227,18 +260,6 @@ pub(super) fn batch_refusal(
     {
         return None;
     }
-    let positions = match super::merge_queue_snapshot(
-        context.actions,
-        &context.observation.repo,
-        &context.observation.base,
-    ) {
-        Ok((_, positions, _, _)) => positions,
-        Err(error) => {
-            return Some(Err(format!(
-                "merge queue unreadable for the generated-path batch guard: {error}"
-            )));
-        }
-    };
     let mut queued = positions
         .into_iter()
         .filter(|(number, _)| *number != pr.fact.number)

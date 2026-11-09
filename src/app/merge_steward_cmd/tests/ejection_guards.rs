@@ -441,3 +441,50 @@ fn a_runner_timeout_still_gets_its_one_retry_under_the_discipline() {
         pass.calls
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn an_empty_queue_reads_no_file_list() {
+    let temp = tempfile::tempdir().expect("temp");
+    let body = script(
+        &temp.path().join("calls"),
+        "",
+        &["test/ctest_script_inputs.json"],
+        &[],
+        "success",
+    );
+    let pass = pass(&temp, &body, &pulp_guards());
+    assert!(enqueued(&pass), "{:?}\n{}", pass.mutation, pass.calls);
+    assert!(!pass.calls.contains("files(first:100"), "{}", pass.calls);
+}
+
+/// The pass-start config read failed (a transient 5xx), so the pass holds no
+/// generated paths. The guard re-reads the config live rather than admitting
+/// unguarded; here the re-read succeeds and finds the collision.
+#[cfg(unix)]
+#[test]
+fn a_failed_config_read_is_re_read_before_admitting() {
+    let temp = tempfile::tempdir().expect("temp");
+    let body = script(
+        &temp.path().join("calls"),
+        "",
+        &["test/ctest_script_inputs.json"],
+        &[(11720, &["test/ctest_script_inputs.json"])],
+        "success",
+    )
+    .replace(
+        OPTED_IN,
+        r#"printf '%s\n' '[auto_merge]' 'arm_requires_head_approval = false' 'generated_paths = ["test/ctest_script_inputs.json"]'"#,
+    );
+    let degraded = EjectionGuards {
+        read_error: Some("HTTP 502: Bad Gateway".to_owned()),
+        ..EjectionGuards::for_base(true)
+    };
+    let pass = pass(&temp, &body, &degraded);
+    assert!(!enqueued(&pass), "{}", pass.calls);
+    assert_eq!(
+        pass.blocked_on, "generated_path_batch:#11720",
+        "{:?}",
+        pass.error
+    );
+}
