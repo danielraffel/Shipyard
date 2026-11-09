@@ -1021,11 +1021,22 @@ fn an_over_cap_own_diff_inheriting_the_candidates_commit_from_its_base_is_cleare
 
 #[test]
 fn an_over_cap_own_diff_with_too_many_candidate_commits_to_probe_fails_closed() {
+    // Too many of P's commits to probe one by one, and each is its own root,
+    // so the roots are too many to probe as well.
     let many: Vec<String> = (0..=super::MAX_PROBED_COMMITS)
         .map(|i| format!("{i:040x}"))
         .collect();
+    let many_roots = graph(
+        &many
+            .iter()
+            .map(|sha| (sha.as_str(), &["base-tip"][..]))
+            .collect::<Vec<_>>(),
+    );
     let run_gh = |argv: &[String]| -> Result<String, String> {
         let joined = argv.join(" ");
+        if joined.contains("compare/main...") && joined.contains("parents") {
+            return Ok(many_roots.clone());
+        }
         if joined.contains("compare/main...") {
             return Ok(json!({"total": many.len(), "shas": many}).to_string());
         }
@@ -1582,5 +1593,224 @@ fn an_over_cap_stacked_q_is_narrowed_before_the_over_cap_decision() {
             Judgement::Unapproved("no counted APPROVE".to_owned())
         }),
         None
+    );
+}
+
+// The 2026-11-09 (UTC) incident: #11796 (57 commits off main, one root) was refused
+// with `carried_commits_over_cap:#11829`. #11829 is stacked on another branch
+// and its own diff counts 283 commits, over the cap, and it is unapproved;
+// P's 57 commits are over the per-commit probe limit. Probing the root of
+// P's commits settles it.
+const WIDE_HEAD: &str = "ca48f12096fe589b1885384b2efe4aa0d8399de9";
+const WIDE_ROOT: &str = "14224c9fe5d992ed587dd9901d2548ea5f0560e2";
+const MIDI_BASE: &str = "feature/midi-learn-feedback";
+const MIDI_HEAD: &str = "ba19976dcd4af55d4bdd596710fab3dd430a29f5";
+
+/// P's 57 commits: a chain from `WIDE_ROOT` (whose parent is on main) to
+/// `WIDE_HEAD`, with one merge of main part way up, plus `extra_roots`
+/// (each with a parent on main) merged in at the head.
+fn wide_chain(extra_roots: &[&str]) -> (Vec<String>, String) {
+    let mut shas: Vec<String> = vec![WIDE_ROOT.to_owned()];
+    shas.extend((1..56 - extra_roots.len()).map(|i| format!("{i:040x}")));
+    shas.extend(extra_roots.iter().map(|sha| (*sha).to_owned()));
+    shas.push(WIDE_HEAD.to_owned());
+    let mut commits: Vec<(String, Vec<String>)> = Vec::new();
+    let chain_len = shas.len() - 1 - extra_roots.len();
+    for (i, sha) in shas.iter().take(chain_len).enumerate() {
+        let parents = match i {
+            0 => vec!["main-old".to_owned()],
+            20 => vec![shas[i - 1].clone(), "main-mid".to_owned()],
+            _ => vec![shas[i - 1].clone()],
+        };
+        commits.push((sha.clone(), parents));
+    }
+    for root in extra_roots {
+        commits.push(((*root).to_owned(), vec!["main-old".to_owned()]));
+    }
+    let mut head_parents = vec![shas[chain_len - 1].clone()];
+    head_parents.extend(extra_roots.iter().map(|sha| (*sha).to_owned()));
+    commits.push((WIDE_HEAD.to_owned(), head_parents));
+    let refs: Vec<(&str, Vec<&str>)> = commits
+        .iter()
+        .map(|(sha, parents)| (sha.as_str(), parents.iter().map(String::as_str).collect()))
+        .collect();
+    let graph_json = graph(
+        &refs
+            .iter()
+            .map(|(sha, parents)| (*sha, parents.as_slice()))
+            .collect::<Vec<_>>(),
+    );
+    (shas, graph_json)
+}
+
+/// #11796's admission against an over-cap, unapproved #11829, with `graph`
+/// as P's `main...P` read with parents and `probe` answering
+/// `compare/{MIDI_HEAD}...{root}` (`None` fails the test).
+fn wide_refusal(
+    shas: &[String],
+    graph_json: &str,
+    probe: &dyn Fn(&str) -> Option<Result<String, String>>,
+    probes: &Cell<usize>,
+) -> Option<super::Refusal> {
+    let run_gh = |argv: &[String]| -> Result<String, String> {
+        let joined = argv.join(" ");
+        if joined.contains(&format!("compare/main...{WIDE_HEAD}")) && joined.contains("parents") {
+            return Ok(graph_json.to_owned());
+        }
+        if joined.contains(&format!("compare/main...{WIDE_HEAD}")) {
+            return Ok(json!({"total": shas.len(), "shas": shas}).to_string());
+        }
+        if joined.contains(&format!("compare/{MIDI_BASE}...{MIDI_HEAD}")) {
+            return Ok(json!({"total": 283, "shas": []}).to_string());
+        }
+        if joined.contains("OPEN") {
+            return Ok(
+                over_cap_listing(11829, "feature/midi-learn-view", MIDI_BASE, MIDI_HEAD)
+                    .to_string(),
+            );
+        }
+        if let Some(root) = joined
+            .split(&format!("compare/{MIDI_HEAD}..."))
+            .nth(1)
+            .and_then(|rest| rest.split('?').next())
+        {
+            probes.set(probes.get() + 1);
+            if let Some(answer) = probe(root) {
+                return answer;
+            }
+        }
+        panic!("unexpected read: {joined}")
+    };
+    refusal_with(
+        &run_gh,
+        "Generous-Corp/pulp",
+        "main",
+        11796,
+        "feature/audio-decoder-fuzz-20261107",
+        WIDE_HEAD,
+        &mut PassCache::default(),
+        &mut |_| Judgement::Unapproved("head ba19976dcd4a carries no approval".to_owned()),
+    )
+}
+
+#[test]
+fn a_wide_candidate_whose_root_an_over_cap_q_does_not_reach_is_admitted() {
+    let (shas, graph_json) = wide_chain(&[]);
+    assert!(
+        shas.len() > super::MAX_PROBED_COMMITS,
+        "too many to probe one by one"
+    );
+    let probes = Cell::new(0);
+    let refusal = wide_refusal(
+        &shas,
+        &graph_json,
+        &|root| (root == WIDE_ROOT).then(|| Ok("diverged".to_owned())),
+        &probes,
+    );
+    assert_eq!(refusal, None);
+    assert_eq!(probes.get(), 1, "one root, one probe");
+}
+
+#[test]
+fn a_wide_candidate_that_carries_an_over_cap_qs_commits_is_still_refused() {
+    // Q's head reaches P's root: Q (or a branch Q merged) has P's history, so
+    // the root probe cannot clear it and P fails closed as before.
+    let (shas, graph_json) = wide_chain(&[]);
+    let refusal = wide_refusal(
+        &shas,
+        &graph_json,
+        &|root| (root == WIDE_ROOT).then(|| Ok("behind".to_owned())),
+        &Cell::new(0),
+    )
+    .expect("refused");
+    assert_eq!(refusal.token, "carried_commits_over_cap:#11829");
+}
+
+#[test]
+fn a_criss_cross_history_with_a_merge_base_off_main_is_refused() {
+    // P and Q have two merge bases: one on main (the one the compare API may
+    // name) and X, a commit off main that P merged in and Q also reaches.
+    // X is a root of P's commits, so the root probe sees it, whatever single
+    // merge base the API reports.
+    const CROSS: &str = "c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2";
+    let (shas, graph_json) = wide_chain(&[CROSS]);
+    let refusal = wide_refusal(
+        &shas,
+        &graph_json,
+        &|root| match root {
+            WIDE_ROOT => Some(Ok("diverged".to_owned())),
+            CROSS => Some(Ok("behind".to_owned())),
+            _ => None,
+        },
+        &Cell::new(0),
+    )
+    .expect("refused");
+    assert_eq!(refusal.token, "carried_commits_over_cap:#11829");
+}
+
+#[test]
+fn a_wide_candidate_whose_commit_graph_is_unreadable_fails_closed() {
+    let (shas, _) = wide_chain(&[]);
+    let refusal =
+        wide_refusal(&shas, "{\"error\": 502}", &|_| None, &Cell::new(0)).expect("refused");
+    assert_eq!(refusal.token, "carried_commits_unreadable:#11829");
+}
+
+#[test]
+fn a_wide_candidate_whose_root_probe_is_unreadable_fails_closed() {
+    let (shas, graph_json) = wide_chain(&[]);
+    let refusal = wide_refusal(
+        &shas,
+        &graph_json,
+        &|_| Some(Err("HTTP 502".to_owned())),
+        &Cell::new(0),
+    )
+    .expect("refused");
+    assert_eq!(refusal.token, "carried_commits_unreadable:#11829");
+}
+
+#[test]
+fn a_wide_candidate_whose_commit_graph_is_incomplete_fails_closed() {
+    // The graph names fewer commits than its total: a missing commit could
+    // hide the real root, so nothing is probed and P fails closed.
+    let (shas, graph_json) = wide_chain(&[]);
+    let mut short: serde_json::Value = serde_json::from_str(&graph_json).expect("json");
+    short["commits"]
+        .as_array_mut()
+        .expect("commits")
+        .retain(|commit| commit["sha"] != WIDE_ROOT);
+    let probes = Cell::new(0);
+    let refusal = wide_refusal(&shas, &short.to_string(), &|_| None, &probes).expect("refused");
+    assert_eq!(refusal.token, "carried_commits_over_cap:#11829");
+    assert_eq!(probes.get(), 0);
+}
+
+#[test]
+fn an_orphan_root_with_no_parents_is_probed_like_any_root() {
+    // A commit of P's with no parents (an unrelated history merged in) is a
+    // root of P's commits and is probed like any other.
+    const ORPHAN: &str = "0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e";
+    let (shas, graph_json) = wide_chain(&[ORPHAN]);
+    let mut orphaned: serde_json::Value = serde_json::from_str(&graph_json).expect("json");
+    for commit in orphaned["commits"].as_array_mut().expect("commits") {
+        if commit["sha"] == ORPHAN {
+            commit["parents"] = json!([]);
+        }
+    }
+    let probes = Cell::new(0);
+    let refusal = wide_refusal(
+        &shas,
+        &orphaned.to_string(),
+        &|root| match root {
+            WIDE_ROOT | ORPHAN => Some(Ok("diverged".to_owned())),
+            _ => None,
+        },
+        &probes,
+    );
+    assert_eq!(refusal, None);
+    assert_eq!(
+        probes.get(),
+        2,
+        "both roots, the orphan included, are probed"
     );
 }
