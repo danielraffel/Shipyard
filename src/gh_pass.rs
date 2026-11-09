@@ -45,8 +45,26 @@ struct SiteStats {
 }
 
 #[derive(Default)]
+struct TransportStats {
+    millis: Vec<u64>,
+    timeouts: u64,
+    failures: u64,
+}
+
+#[derive(Default)]
+struct CostStats {
+    attempts: u64,
+    retries: u64,
+    conditional_hits: u64,
+    token_mints: u64,
+    rate_limit: BTreeMap<String, (u64, u64)>,
+}
+
+#[derive(Default)]
 struct Inner {
     sites: BTreeMap<(ApiKind, String), SiteStats>,
+    transports: BTreeMap<&'static str, TransportStats>,
+    cost: CostStats,
     cache: HashMap<Vec<String>, String>,
     cache_hits: BTreeMap<(ApiKind, String), u64>,
     fallbacks: BTreeMap<String, (u64, String)>,
@@ -102,6 +120,80 @@ pub struct GhPassReport {
     /// schema change or a persistent failure, not noise.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub fallbacks: Vec<FallbackReport>,
+    /// Per-read latency by transport (`gh` or `inproc`). A read answered from
+    /// a cache is not a transport call and is not counted here.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub latency: BTreeMap<String, LatencyReport>,
+    /// What in-process reads cost GitHub. Absent when none ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_cost: Option<ApiCostReport>,
+    /// Heads per check-rollup GraphQL query this pass, and the size the next
+    /// pass will use. Absent when the size is fixed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rollup_batch: Option<RollupBatchReport>,
+}
+
+/// The adaptive check-rollup batch size ([`crate::github_read::batch`]).
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct RollupBatchReport {
+    /// Heads per query used this pass.
+    pub heads_per_query: usize,
+    /// Heads per query the next pass will use.
+    pub next_heads_per_query: usize,
+}
+
+/// Latency of one transport's reads during a pass.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct LatencyReport {
+    /// Reads.
+    pub calls: u64,
+    /// Median, in milliseconds (nearest rank).
+    pub p50_ms: u64,
+    /// 90th percentile, in milliseconds (nearest rank).
+    pub p90_ms: u64,
+    /// Slowest read, in milliseconds.
+    pub max_ms: u64,
+    /// Reads that hit their timeout.
+    pub timeouts: u64,
+    /// Reads that failed without an answer for any other reason.
+    pub failures: u64,
+}
+
+/// GitHub API cost of a pass's in-process reads.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct ApiCostReport {
+    /// HTTP requests sent for reads, retries included.
+    pub requests: u64,
+    /// Requests that were retries of a transient failure.
+    pub retries: u64,
+    /// REST reads GitHub answered `304 Not Modified`; these do not count
+    /// against the primary rate limit.
+    pub conditional_hits: u64,
+    /// Installation tokens minted during the pass.
+    pub token_mints: u64,
+    /// Lowest `x-ratelimit-remaining`, and highest `x-ratelimit-used`, seen
+    /// per rate-limit resource (`core`, `graphql`, ...).
+    pub rate_limit: BTreeMap<String, RateLimitSeen>,
+}
+
+/// The tightest rate-limit reading a pass saw for one resource.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct RateLimitSeen {
+    /// Lowest remaining.
+    pub remaining: u64,
+    /// Highest used.
+    pub used: u64,
+}
+
+/// How one transport call ended, for [`GhPass::record_transport`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CallEnd {
+    /// An answer arrived (whatever its status).
+    Answered,
+    /// The call hit its timeout.
+    TimedOut,
+    /// The call failed without an answer.
+    Failed,
 }
 
 /// One reason a pass fell back from a faster read to a slower one.
@@ -161,6 +253,40 @@ impl GhPass {
         }
     }
 
+    /// Time one transport call (`gh` or `inproc`).
+    pub fn record_transport(&self, transport: &'static str, elapsed: Duration, end: CallEnd) {
+        if let Ok(mut inner) = self.inner.lock() {
+            let stats = inner.transports.entry(transport).or_default();
+            stats
+                .millis
+                .push(u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX));
+            match end {
+                CallEnd::Answered => {}
+                CallEnd::TimedOut => stats.timeouts += 1,
+                CallEnd::Failed => stats.failures += 1,
+            }
+        }
+    }
+
+    /// Add one in-process read's request cost.
+    pub(crate) fn record_inproc_cost(&self, meta: &crate::github_read::CallMeta) {
+        if let Ok(mut inner) = self.inner.lock() {
+            let cost = &mut inner.cost;
+            cost.attempts += u64::from(meta.attempts);
+            cost.retries += u64::from(meta.attempts.saturating_sub(1));
+            cost.conditional_hits += u64::from(meta.conditional_hit);
+            cost.token_mints += u64::from(meta.minted);
+            if let Some(limit) = &meta.rate_limit {
+                let entry = cost
+                    .rate_limit
+                    .entry(limit.resource.clone())
+                    .or_insert((u64::MAX, 0));
+                entry.0 = entry.0.min(limit.remaining);
+                entry.1 = entry.1.max(limit.used);
+            }
+        }
+    }
+
     /// Count one fallback from a faster read to a slower one.
     pub(crate) fn record_fallback(&self, reason: &str, detail: &str) {
         if let Ok(mut inner) = self.inner.lock() {
@@ -217,6 +343,43 @@ impl GhPass {
                 last_detail: detail.clone(),
             })
             .collect();
+        for (transport, stats) in &inner.transports {
+            let mut sorted = stats.millis.clone();
+            sorted.sort_unstable();
+            report.latency.insert(
+                (*transport).to_owned(),
+                LatencyReport {
+                    calls: sorted.len() as u64,
+                    p50_ms: nearest_rank(&sorted, 50),
+                    p90_ms: nearest_rank(&sorted, 90),
+                    max_ms: sorted.last().copied().unwrap_or(0),
+                    timeouts: stats.timeouts,
+                    failures: stats.failures,
+                },
+            );
+        }
+        if inner.transports.contains_key(INPROC) {
+            let cost = &inner.cost;
+            report.api_cost = Some(ApiCostReport {
+                requests: cost.attempts,
+                retries: cost.retries,
+                conditional_hits: cost.conditional_hits,
+                token_mints: cost.token_mints,
+                rate_limit: cost
+                    .rate_limit
+                    .iter()
+                    .map(|(resource, (remaining, used))| {
+                        (
+                            resource.clone(),
+                            RateLimitSeen {
+                                remaining: *remaining,
+                                used: *used,
+                            },
+                        )
+                    })
+                    .collect(),
+            });
+        }
         report.sites.sort_by(|left, right| {
             right
                 .calls
@@ -225,6 +388,20 @@ impl GhPass {
         });
         report
     }
+}
+
+/// Transport label for reads run through `gh`.
+pub const GH: &str = "gh";
+/// Transport label for reads answered in process.
+pub const INPROC: &str = "inproc";
+
+/// Nearest-rank percentile of an ascending slice; 0 when empty.
+fn nearest_rank(sorted: &[u64], pct: usize) -> u64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let rank = (pct * sorted.len()).div_ceil(100).max(1);
+    sorted[rank.min(sorted.len()) - 1]
 }
 
 /// `gh api` flags that take a value.

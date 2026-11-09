@@ -1463,6 +1463,30 @@ fn steward_repo(
         recovery_cancellations,
     );
     report.api_calls = Some(pass.report());
+    if let (Some(api_calls), Some(sizer)) = (
+        report.api_calls.as_mut(),
+        actions
+            .inproc_reads()
+            .and_then(crate::github_read::InprocReads::batch),
+    ) {
+        // A dry run reports the next size but leaves the live steward's state.
+        let next = if pass_args.apply {
+            sizer.save().unwrap_or_else(|error| {
+                api_calls.fallbacks.push(crate::gh_pass::FallbackReport {
+                    reason: "rollup batch size not saved".to_owned(),
+                    count: 1,
+                    last_detail: error,
+                });
+                sizer.next_size()
+            })
+        } else {
+            sizer.next_size()
+        };
+        api_calls.rollup_batch = Some(crate::gh_pass::RollupBatchReport {
+            heads_per_query: sizer.size(),
+            next_heads_per_query: next,
+        });
+    }
     if pass_args.apply
         && let (Some(control), Some(dwell)) = (mutation_control, report.dwell.as_mut())
         && let Err(error) = dwell_pass::write_snapshot(
@@ -1958,6 +1982,7 @@ mod pass_budget;
 mod pr_mutations;
 pub(super) mod queue_drain;
 mod queue_priority_recovery;
+pub(super) mod read_probe;
 mod render;
 mod resume_record;
 mod terminal_handoff;
