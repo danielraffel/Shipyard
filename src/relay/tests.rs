@@ -1403,28 +1403,29 @@ fn a_marker_cannot_outrank_by_a_future_time_or_name_an_unknown_socket() {
     h.pass(0, Mode::Send);
     let owner = h.state.prs.values().next().unwrap().owner.clone().unwrap();
     assert_eq!(
-        owner.host, "m1",
-        "a marker newer than the store record still wins..."
+        owner.host, "m5",
+        "a future-dated marker cannot outrank the store"
     );
-    assert_eq!(owner.registered_at, at(0), "...but only up to now");
-    assert_eq!(owner.cmux_socket, None, "an unconfigured socket is dropped");
-    // A store record registered now ties the clamped marker, and the store wins.
-    let mut later = stored;
-    later.registered_at = at(5);
-    h.own(&later);
-    h.pass(5, Mode::Send);
+    // With no store record, the marker is used, minus its unknown socket.
+    let mut h2 = Harness::new(
+        std::slice::from_ref(&pr),
+        FakeCmux::with(&[("m5", "/tmp/cmux-nightly.sock", "S")]),
+    );
+    h2.gh
+        .open_bodies
+        .borrow_mut()
+        .insert(5, owner_registry::render_marker(&forged));
+    h2.pass(0, Mode::Send);
+    let from_body = h2.state.prs.values().next().unwrap().owner.clone().unwrap();
+    assert_eq!(from_body.host, "m1");
     assert_eq!(
-        h.state
-            .prs
-            .values()
-            .next()
-            .unwrap()
-            .owner
-            .as_ref()
-            .unwrap()
-            .host,
-        "m5"
+        from_body.cmux_socket, None,
+        "an unconfigured socket is dropped"
     );
+    // Removing the marker from the body forgets the marker-sourced owner.
+    h2.gh.open_bodies.borrow_mut().clear();
+    h2.pass(1, Mode::Send);
+    assert!(h2.state.prs.values().next().unwrap().owner.is_none());
 }
 
 #[test]
@@ -1476,6 +1477,44 @@ fn each_delivery_is_persisted_before_the_next_one_is_sent() {
         *saved.borrow(),
         [(1, 1), (2, 2)],
         "saved after each send, with its key"
+    );
+}
+
+#[test]
+fn green_again_after_a_rerun_at_the_same_head_is_not_resent() {
+    let pr = Pr::open(6);
+    let mut h = Harness::new(
+        std::slice::from_ref(&pr),
+        FakeCmux::with(&[("m5", "/tmp/cmux-nightly.sock", "S")]),
+    );
+    h.own(&owner(6, "m5", "S"));
+    h.pass(0, Mode::Send);
+    let mut green_pr = pr.clone();
+    green_pr.checks = green();
+    h.gh.set(green_pr.clone());
+    h.pass(1, Mode::Send);
+    h.gh.set(pr.clone());
+    h.pass(20, Mode::Send);
+    h.gh.set(green_pr);
+    h.pass(40, Mode::Send);
+    assert_eq!(h.cmux.sends().len(), 1);
+}
+
+#[test]
+fn a_null_alias_under_partial_errors_is_not_a_missing_pull_request() {
+    let answer = json!({"errors": [{"message": "timeout"}],
+        "data": {"repository": {"defaultBranchRef": {"name": "main"}, "pr1": null}}})
+    .to_string();
+    let run = |_: &[String]| -> Result<String, String> { Ok(answer.clone()) };
+    let read = fetch(&run, REPO, &[1], false).expect("partial answer");
+    assert!(!read.prs.contains_key(&1));
+    let clean =
+        json!({"data": {"repository": {"defaultBranchRef": {"name": "main"}, "pr1": null}}})
+            .to_string();
+    let run = |_: &[String]| -> Result<String, String> { Ok(clean.clone()) };
+    assert_eq!(
+        fetch(&run, REPO, &[1], false).expect("clean").prs.get(&1),
+        Some(&None)
     );
 }
 

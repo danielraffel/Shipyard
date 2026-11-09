@@ -64,6 +64,9 @@ pub(crate) struct Tracked {
     /// Consecutive passes whose batch nothing could take.
     #[serde(default)]
     pub(crate) failed_deliveries: u32,
+    /// The head whose required checks were last seen green.
+    #[serde(default)]
+    pub(crate) green_head: Option<String>,
     /// Consecutive passes GitHub had no such pull request.
     #[serde(default)]
     pub(crate) missing_passes: u32,
@@ -177,7 +180,11 @@ fn adopt_marker(
     config: &RelayConfig,
     now: DateTime<Utc>,
 ) {
-    record.registered_at = record.registered_at.min(now);
+    // A marker dated in the future is forged or broken: it ranks as never
+    // registered, so it cannot outrank a real record by its date.
+    if record.registered_at > now {
+        record.registered_at = DateTime::<Utc>::MIN_UTC;
+    }
     if record
         .cmux_socket
         .as_ref()
@@ -220,6 +227,17 @@ fn run_repo(
         .map(|t| t.pr)
         .collect();
     let mut read = super::fetch(input.gh, repo, &live, true)?;
+    // A marker-sourced owner whose marker is gone from the body is forgotten.
+    for tracked in state.prs.values_mut().filter(|t| t.repo == repo) {
+        if tracked
+            .owner
+            .as_ref()
+            .is_some_and(|o| o.source == owner_registry::Source::BodyMarker)
+            && !read.markers.contains_key(&tracked.pr)
+        {
+            tracked.owner = None;
+        }
+    }
     // Owners registered anywhere, from the body markers.
     let mut discovered = Vec::new();
     for (number, body) in &read.markers {
@@ -273,7 +291,19 @@ fn run_repo(
         let mut events: Vec<RelayEvent> = derive_events(tracked.digest.as_ref(), &digest)
             .into_iter()
             .filter(|event| input.config.events.contains(event.name()))
+            // Green, pending (a re-run), green again at one head is one fact.
+            .filter(|event| match event {
+                RelayEvent::RequiredCheck { result, head, .. } if result == "green" => {
+                    tracked.green_head.as_deref() != Some(head.as_str())
+                }
+                _ => true,
+            })
             .collect();
+        if digest.checks == super::Checks::Success {
+            tracked.green_head = Some(digest.head.clone());
+        } else if digest.checks == super::Checks::Failure {
+            tracked.green_head = None;
+        }
         for event in &mut events {
             if let Some(seq) = event.seq_mut() {
                 tracked.event_seq += 1;

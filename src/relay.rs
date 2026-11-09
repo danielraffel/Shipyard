@@ -729,11 +729,17 @@ pub(crate) fn fetch(
         {
             branch.clone_into(&mut read.default_branch);
         }
+        // Under partial GraphQL errors a null alias may be a failed field,
+        // not a missing pull request: leave it out of this pass.
+        let partial = value.get("errors").is_some_and(|e| !e.is_null());
         for number in *chunk {
             let node = repository
                 .get(format!("pr{number}"))
                 .filter(|v| !v.is_null())
                 .cloned();
+            if node.is_none() && partial {
+                continue;
+            }
             read.prs.insert(*number, node);
         }
         if with_discovery {
