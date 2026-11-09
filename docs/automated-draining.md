@@ -485,8 +485,15 @@ known_flaky_tests = []                    # names or `*` globs; empty by default
   only listed tests. The same check must have passed on the head, the retry is
   still one per head, and `invalid_merge_commit` / `merge_conflict` are never
   retried. A step that names no test (a compile error, a crash before the
-  summary) is never a known flake. Entries are exact names or globs where `*`
-  matches anything. Keep the list to tests with a tracking issue, and remove
+  summary) is never a known flake. Every FAILED block in the step counts (a
+  rerun's block cannot hide the first run's failure), each must end on a blank
+  line, `Errors while running CTest` or the step's `##[error]`, and the last
+  must sit within 60 lines of the error. Entries are exact test names or globs
+  where `*` matches anything; matching is case-sensitive, so copy names from
+  the ctest output. A check name is listed only by its exact name, never by a
+  glob, and a bare `*` lists nothing. A listed test that failed by `(Timeout)`
+  is accepted on purpose: flakes often time out, and listing a test is a
+  deliberate, issue-tracked decision. Keep the list to tests with a tracking issue, and remove
   an entry when its issue closes. Pulp's tracked flakes at the time of
   writing, as a starting list:
 

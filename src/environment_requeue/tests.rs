@@ -1182,3 +1182,57 @@ fn a_listed_check_name_is_a_known_flake() {
     let verdict = assess_flaky(&answers, 1, &["macos"]);
     assert!(verdict.allowed, "{}", verdict.reason);
 }
+
+#[test]
+fn every_failed_block_counts_and_must_end_cleanly() {
+    let started = "2026-10-09T23:10:00Z";
+    // `ctest || ctest --rerun-failed`: the first block names an unlisted test.
+    let two = step_log(&[
+        "The following tests FAILED:",
+        "\t13716 - hosted_editor (Failed)",
+        "Errors while running CTest",
+        "The following tests FAILED:",
+        "\t13717 - ui-script-plugin-editor-au (Failed)",
+        "Errors while running CTest",
+        "##[error]Process completed with exit code 8.",
+    ]);
+    assert_eq!(
+        failed_tests_in_step(&two, started),
+        vec!["hosted_editor", "ui-script-plugin-editor-au"]
+    );
+    // An interleaved line inside the block grants nothing.
+    let torn = step_log(&[
+        "The following tests FAILED:",
+        "\t13717 - ui-script-plugin-editor-au (Failed)",
+        "[ 3%] some parallel output",
+        "\t13716 - hosted_editor (Failed)",
+        "Errors while running CTest",
+        "##[error]Process completed with exit code 8.",
+    ]);
+    assert!(failed_tests_in_step(&torn, started).is_empty());
+    // A flaky block, then something else in the step fails far later.
+    let mut lines = vec![
+        "The following tests FAILED:",
+        "\t13717 - ui-script-plugin-editor-au (Failed)",
+        "Errors while running CTest",
+    ];
+    lines.extend(std::iter::repeat_n(
+        "lint: checking",
+        FAILURE_PROXIMITY_LINES + 5,
+    ));
+    lines.push("##[error]Process completed with exit code 1.");
+    assert!(failed_tests_in_step(&step_log(&lines), started).is_empty());
+}
+
+#[test]
+fn a_bare_star_or_a_test_glob_never_lists_the_check() {
+    let mut answers = interrupted_group(
+        "failure",
+        &test_failure_job(),
+        &ctest_log(&["hosted_editor"]),
+    );
+    compare(&mut answers, Some("success"), Some("success"));
+    for pattern in ["*", "**", "mac*"] {
+        assert!(!assess_flaky(&answers, 1, &[pattern]).allowed, "{pattern}");
+    }
+}

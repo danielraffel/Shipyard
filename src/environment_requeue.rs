@@ -1172,30 +1172,57 @@ fn widened_attribution(
 }
 
 /// The tests a failing step's output lists under ctest's `The following
-/// tests FAILED:` block, in order. Empty when the step has no such block:
-/// then nothing names the failure, and no known-flake allowance applies.
+/// tests FAILED:` blocks, every block in the step. Empty, which grants no
+/// known-flake allowance, when the step has no block, when a block does not
+/// end on a recognised terminator (a blank line, `Errors while running
+/// CTest`, or the step's `##[error]`), so an interleaved or wrapped line can
+/// never silently drop entries, or when the last block ends more than
+/// [`FAILURE_PROXIMITY_LINES`] before the step's error: then something else
+/// in the step failed.
 #[must_use]
 pub fn failed_tests_in_step(log: &str, started_at: &str) -> Vec<String> {
     let Some(output) = failing_step_output(log, started_at) else {
         return Vec::new();
     };
-    let Some(start) = output
-        .iter()
-        .rposition(|line| line.trim() == "The following tests FAILED:")
-    else {
-        return Vec::new();
-    };
-    output[start + 1..]
-        .iter()
-        .map_while(|line| {
-            // `\t13716 - <name> (Failed)`
-            let (number, rest) = line.trim().split_once(" - ")?;
-            number.trim().parse::<u64>().ok()?;
-            let name = rest.rsplit_once(" (").map_or(rest, |(name, _)| name);
-            Some(name.trim().to_owned())
-        })
-        .filter(|name| !name.is_empty())
-        .collect()
+    let mut names = Vec::new();
+    let mut last_end = None;
+    let mut index = 0;
+    while index < output.len() {
+        if output[index].trim() != "The following tests FAILED:" {
+            index += 1;
+            continue;
+        }
+        index += 1;
+        let mut entries = 0;
+        loop {
+            let Some(line) = output.get(index) else {
+                return Vec::new();
+            };
+            let text = line.trim();
+            if text.is_empty() || text == "Errors while running CTest" || text.starts_with(ERROR) {
+                break;
+            }
+            // `13716 - <name> (Failed)`
+            let Some(name) = text.split_once(" - ").and_then(|(number, rest)| {
+                number.trim().parse::<u64>().ok()?;
+                let name = rest.rsplit_once(" (").map_or(rest, |(name, _)| name).trim();
+                (!name.is_empty()).then(|| name.to_owned())
+            }) else {
+                return Vec::new();
+            };
+            names.push(name);
+            entries += 1;
+            index += 1;
+        }
+        if entries == 0 {
+            return Vec::new();
+        }
+        last_end = Some(index);
+    }
+    match last_end {
+        Some(end) if output.len().saturating_sub(end) <= FAILURE_PROXIMITY_LINES => names,
+        _ => Vec::new(),
+    }
 }
 
 /// Whether `name` matches a `known_flaky_tests` entry: an exact name, or a
@@ -1215,15 +1242,22 @@ pub fn known_flaky_match(pattern: &str, name: &str) -> bool {
 }
 
 /// The known-flake names that explain `check`'s failure: the check itself
-/// when its name is listed, else every failing step's named tests when each
+/// when its exact name is listed, else every failing step's named tests when each
 /// step names at least one and all of them are listed. `None` otherwise.
 fn known_flake(
     check: &FailedCheck,
     steps: &[&StepEvidence],
     known_flaky: &[String],
 ) -> Option<Vec<String>> {
-    let listed = |name: &str| known_flaky.iter().any(|glob| known_flaky_match(glob, name));
-    if listed(&check.name) {
+    // A bare `*` lists nothing: it would switch the discipline off.
+    let patterns = known_flaky
+        .iter()
+        .filter(|glob| !glob.trim().chars().all(|c| c == '*'))
+        .collect::<Vec<_>>();
+    let listed = |name: &str| patterns.iter().any(|glob| known_flaky_match(glob, name));
+    // A check is listed only by its exact name, never by a glob written for
+    // test names.
+    if patterns.iter().any(|name| name.trim() == check.name) {
         return Some(vec![check.name.clone()]);
     }
     if steps.is_empty() || steps.iter().any(|step| step.failed_tests.is_empty()) {
