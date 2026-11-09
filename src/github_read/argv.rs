@@ -138,7 +138,9 @@ fn classify_graphql(rest: &[String]) -> Option<ReadRequest> {
 /// `gh api -F` value typing: `true`, `false`, `null` and integers become
 /// JSON literals; a leading `@` reads a file, which this client never does.
 fn typed_field(value: &str) -> Option<Value> {
-    if value.starts_with('@') {
+    // `gh` fills `{owner}`/`{repo}`/`{branch}` placeholders in `-F` values
+    // from the checkout; this client has none to fill them from.
+    if value.starts_with('@') || value.contains('{') {
         return None;
     }
     Some(match value {
@@ -148,11 +150,8 @@ fn typed_field(value: &str) -> Option<Value> {
         _ => value
             .parse::<i64>()
             .ok()
-            .filter(|_| {
-                // Go's strconv.Atoi accepts an optional sign and decimal digits
-                // only; Rust's parser agrees except for a leading `+`.
-                !value.starts_with('+')
-            })
+            // Go's strconv.Atoi and Rust's parser accept the same text: an
+            // optional sign, then decimal digits.
             .map_or_else(|| Value::String(value.to_owned()), Value::from),
     })
 }

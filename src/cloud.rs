@@ -1207,6 +1207,13 @@ impl GitHubActions {
             }
         }
         if let Some(remaining) = fallback_timeout {
+            if remaining < INPROC_FALLBACK_FLOOR {
+                return Err(GitHubError::new(format!(
+                    "gh {} timed out after {}ms",
+                    args.join(" "),
+                    INPROC_UNBOUNDED_READ_TIMEOUT.as_millis()
+                )));
+            }
             // An in-process attempt spent part of the budget before handing
             // the read back; `gh` gets the rest, bounded like any timed read.
             let output = self.run_gh_with_timeout_output_limits_via(
@@ -1344,6 +1351,13 @@ impl GitHubActions {
         {
             match result {
                 Some(result) => return result,
+                None if remaining < INPROC_FALLBACK_FLOOR => {
+                    return Err(GitHubError::new(format!(
+                        "gh {} timed out after {}ms",
+                        args.join(" "),
+                        timeout.as_millis()
+                    )));
+                }
                 None => timeout = remaining,
             }
         }
@@ -1661,6 +1675,10 @@ impl GitHubActions {
 /// Longest an in-process read may take when its caller set no timeout (a
 /// `gh` child in that position has none at all).
 const INPROC_UNBOUNDED_READ_TIMEOUT: Duration = Duration::from_mins(1);
+
+/// Less time than this left after an in-process read hands back is reported
+/// as the timeout it is, rather than starting a `gh` child that cannot finish.
+const INPROC_FALLBACK_FLOOR: Duration = Duration::from_secs(1);
 
 /// The exit status `gh` would have reported: 0 or 1.
 fn synthetic_exit_status(code: i32) -> std::process::ExitStatus {

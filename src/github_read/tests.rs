@@ -351,6 +351,8 @@ fn classifier_accepts_the_steward_read_shapes() {
             "n=7",
             "-F",
             "flag=true",
+            "-F",
+            "plus=+5",
             "-f",
             "sha=0123",
             "-F",
@@ -365,6 +367,7 @@ fn classifier_accepts_the_steward_read_shapes() {
     assert_eq!(variables["owner"], json!("o"));
     assert_eq!(variables["n"], json!(7), "-F types integers as gh does");
     assert_eq!(variables["flag"], json!(true));
+    assert_eq!(variables["plus"], json!(5), "Go's Atoi accepts a leading +");
     assert_eq!(variables["sha"], json!("0123"), "-f never types");
     assert!(variables["cursor"].is_string());
 
@@ -428,6 +431,7 @@ fn classifier_declines_every_write_and_every_unknown_shape() {
         argv(&["api", "graphql", "-f", query, "-f", "operationName=x"]),
         argv(&["api", "graphql", "-f", query, "-f", query]),
         argv(&["api", "graphql", "-f", query, "-f", "a[]=1"]),
+        argv(&["api", "graphql", "-f", query, "-F", "owner={owner}"]),
         // pr view with an unknown field, an extra flag, or no repository.
         argv(&["pr", "view", "1", "--repo", "o/r", "--json", "body"]),
         argv(&["pr", "view", "1", "--repo", "o/r", "--json", "id,id"]),
@@ -548,7 +552,16 @@ fn pr_view_encodes_users_auto_merge_and_empty_rollups_like_gh() {
         json!({"is_bot": true, "login": "app/shipyard-local"})
     );
     assert_eq!(rendered["autoMergeRequest"]["mergeMethod"], json!("MERGE"));
-    assert_eq!(rendered["statusCheckRollup"], Value::Null);
+    // A head with no rollup prints `[]` (gh 2.102.0 on a pull request with
+    // no checks), and so does an empty rollup.
+    assert_eq!(rendered["statusCheckRollup"], json!([]));
+    let empty = pr_view::render(
+        &json!({"statusCheckRollup": {"nodes": [{"commit": {"statusCheckRollup": {"contexts": {
+            "nodes": [], "pageInfo": {"hasNextPage": false, "endCursor": null}}}}}]}}),
+        &[PrField::StatusCheckRollup],
+    )
+    .expect("render");
+    assert_eq!(empty["statusCheckRollup"], json!([]));
     let no_commit = pr_view::render(
         &json!({"author": null, "autoMergeRequest": null, "statusCheckRollup": {"nodes": []}}),
         &fields,
@@ -718,6 +731,8 @@ fn scoped_tokens_request_one_repository_and_refuse_a_broader_grant() {
     );
 
     *broad.lock().unwrap() = false;
+    // The refusal is held for a minute, then the credential is asked again.
+    clock.fetch_add(61, Ordering::SeqCst);
     let (success, ..) = answered(reads.try_read(
         &argv(&["api", STATUSES]),
         Some("o/r"),
@@ -848,6 +863,113 @@ fn parse_token_reply_refuses_unusable_tokens() {
             .expires_at,
         100 + super::ASSUMED_TOKEN_LIFETIME_SECONDS
     );
+}
+
+#[test]
+fn a_refused_installation_is_not_asked_again_for_a_while() {
+    let key = write_key();
+    let clock = now_clock();
+    let mock = Mock::start(|request| {
+        if request.path.ends_with("/installation") {
+            return Reply::json(404, &json!({"message": "Not Found"}));
+        }
+        Reply::json(200, &json!([]))
+    });
+    let reads = reader(&mock, &key.path, &clock);
+    let read = || {
+        reads.try_read(
+            &argv(&["api", STATUSES]),
+            Some("o/r"),
+            Duration::from_secs(5),
+            None,
+        )
+    };
+    for _ in 0..3 {
+        assert!(matches!(read(), ReadOutcome::Declined { reason: Some(_) }));
+    }
+    assert_eq!(mock.count("GET", "repos/o/r/installation"), 1);
+    clock.fetch_add(61, Ordering::SeqCst);
+    assert!(matches!(read(), ReadOutcome::Declined { reason: Some(_) }));
+    assert_eq!(mock.count("GET", "repos/o/r/installation"), 2);
+}
+
+#[test]
+fn a_reader_waiting_on_a_slow_mint_keeps_its_own_deadline() {
+    let key = write_key();
+    let clock = now_clock();
+    let mock = Mock::start(|request| {
+        if request.path.ends_with("/installation") {
+            return Reply::json(200, &json!({"id": 77}));
+        }
+        if request.path.ends_with("/access_tokens") {
+            return Reply::json(
+                201,
+                &json!({"token": "ghs_slow", "expires_at": "2999-01-01T00:00:00Z"}),
+            )
+            .delayed(Duration::from_secs(3));
+        }
+        Reply::json(200, &json!([]))
+    });
+    let reads = reader(&mock, &key.path, &clock);
+    std::thread::scope(|scope| {
+        let slow = scope.spawn(|| {
+            reads.try_read(
+                &argv(&["api", STATUSES]),
+                Some("o/r"),
+                Duration::from_secs(10),
+                None,
+            )
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        let started = Instant::now();
+        let waiter = reads.try_read(
+            &argv(&["api", STATUSES]),
+            Some("o/r"),
+            Duration::from_secs(1),
+            None,
+        );
+        let elapsed_waiting = started.elapsed();
+        assert!(
+            matches!(
+                waiter,
+                ReadOutcome::Failed {
+                    kind: FailureKind::TimedOut,
+                    ..
+                }
+            ),
+            "{waiter:?}"
+        );
+        assert!(
+            elapsed_waiting < Duration::from_millis(1_800),
+            "{elapsed_waiting:?}"
+        );
+        assert!(matches!(
+            slow.join().unwrap(),
+            ReadOutcome::Answered { success: true, .. }
+        ));
+    });
+}
+
+#[test]
+fn a_bounded_pr_view_is_judged_on_what_it_prints() {
+    let key = write_key();
+    let clock = now_clock();
+    let padding = "x".repeat(4096);
+    let mock = github(Arc::clone(&clock), move |_| {
+        Reply::json(
+            200,
+            &json!({"data": {"repository": {"pullRequest": {"state": "OPEN", "unrequested": padding}}}}),
+        )
+    });
+    let reads = reader(&mock, &key.path, &clock);
+    let (success, stdout, ..) = answered(reads.try_read(
+        &argv(&["pr", "view", "9", "--repo", "o/r", "--json", "state"]),
+        Some("o/r"),
+        Duration::from_secs(5),
+        Some(1024),
+    ));
+    assert!(success, "a raw answer over the bound still prints under it");
+    assert_eq!(stdout, "{\"state\":\"OPEN\"}\n");
 }
 
 // ------------------------------------------------------ timeout and retry

@@ -10,7 +10,8 @@
 //! * `statusCheckRollup` flattens the last commit's rollup contexts. A check
 //!   run's missing timestamps become `0001-01-01T00:00:00Z` and its missing
 //!   conclusion becomes `""`; a status context reports its `createdAt` as
-//!   `startedAt`. A head with no rollup is `null`.
+//!   `startedAt`. A head with no checks is `[]`; only a pull request with no
+//!   commit is `null`.
 //! * `labels` is the label node list; a missing description is `""`.
 //!
 //! When the answer is something `gh` would have paged further (more than 100
@@ -226,12 +227,16 @@ fn status_check_rollup(raw: &Value) -> Result<Value, ShapeError> {
         .get("nodes")
         .and_then(Value::as_array)
         .ok_or(ShapeError::Malformed("statusCheckRollup.nodes missing"))?;
-    let Some(rollup) = commits
-        .first()
-        .and_then(|commit| commit.pointer("/commit/statusCheckRollup"))
+    // gh prints `null` only when the pull request has no commit; a head
+    // with no rollup, or an empty one, is `[]`.
+    let Some(commit) = commits.first() else {
+        return Ok(Value::Null);
+    };
+    let Some(rollup) = commit
+        .pointer("/commit/statusCheckRollup")
         .filter(|rollup| !rollup.is_null())
     else {
-        return Ok(Value::Null);
+        return Ok(Value::Array(Vec::new()));
     };
     let contexts = rollup
         .get("contexts")
@@ -247,9 +252,6 @@ fn status_check_rollup(raw: &Value) -> Result<Value, ShapeError> {
         .get("nodes")
         .and_then(Value::as_array)
         .ok_or(ShapeError::Malformed("rollup context nodes missing"))?;
-    if nodes.is_empty() {
-        return Ok(Value::Null);
-    }
     Ok(Value::Array(nodes.iter().map(rollup_context).collect()))
 }
 

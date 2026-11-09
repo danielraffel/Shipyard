@@ -56,6 +56,8 @@ pub(crate) const TRANSPORT_ENV: &str = "SHIPYARD_GITHUB_READS";
 const TOKEN_REFRESH_LEAD_SECONDS: i64 = 300;
 /// Lifetime assumed when GitHub omits `expires_at` (it never has).
 const ASSUMED_TOKEN_LIFETIME_SECONDS: i64 = 50 * 60;
+/// How long a refused credential sends a repository's reads straight to `gh`.
+const REFUSAL_HOLD_SECONDS: i64 = 60;
 /// Largest body any read accepts when the caller sets no bound.
 const DEFAULT_MAX_BODY: u64 = 32 * 1024 * 1024;
 /// Largest body kept for a conditional re-read.
@@ -228,7 +230,10 @@ struct Inner {
     signer: Mutex<Option<Arc<AppSigner>>>,
     installations: Mutex<HashMap<String, u64>>,
     tokens: Mutex<HashMap<TokenKey, Arc<InstallationToken>>>,
-    mint_lock: Mutex<()>,
+    mint_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Repositories whose credential was refused recently, until when (by
+    /// [`Clock`]), and why: their reads go straight to `gh`.
+    refused: Mutex<HashMap<String, (i64, String)>>,
     etags: Mutex<EtagCache>,
     mints: AtomicU64,
     token_hits: AtomicU64,
@@ -293,7 +298,8 @@ impl InprocReads {
                 signer: Mutex::new(None),
                 installations: Mutex::new(HashMap::new()),
                 tokens: Mutex::new(HashMap::new()),
-                mint_lock: Mutex::new(()),
+                mint_locks: Mutex::new(HashMap::new()),
+                refused: Mutex::new(HashMap::new()),
                 etags: Mutex::new(EtagCache::default()),
                 mints: AtomicU64::new(0),
                 token_hits: AtomicU64::new(0),
@@ -332,7 +338,12 @@ impl InprocReads {
             return ReadOutcome::Declined { reason: None };
         };
         let deadline = Instant::now() + timeout;
-        let max_body = max_stdout.map_or(DEFAULT_MAX_BODY, |limit| limit as u64);
+        // A REST body is printed as is, so the caller's bound applies to it.
+        // A GraphQL body is reshaped first; its bound is checked on the output.
+        let max_body = match (&read.request, max_stdout) {
+            (ReadRequest::Rest { .. }, Some(limit)) => limit as u64,
+            _ => DEFAULT_MAX_BODY,
+        };
         let mut meta = CallMeta::default();
         let outcome = self.answer(&read, deadline, max_body, &mut meta);
         match outcome {
@@ -408,11 +419,13 @@ impl InprocReads {
                 ReadRequest::PrView { .. } => (
                     false,
                     Vec::new(),
-                    format!(
-                        "HTTP {}: {} (https://api.github.com/graphql)",
-                        reply.status,
-                        body_message(&reply.body).unwrap_or_else(|| "request failed".to_owned())
-                    ),
+                    match body_message(&reply.body) {
+                        Some(message) => format!(
+                            "HTTP {}: {message} (https://api.github.com/graphql)",
+                            reply.status
+                        ),
+                        None => format!("HTTP {} (https://api.github.com/graphql)", reply.status),
+                    },
                 ),
                 _ => (false, reply.body.clone(), gh_http_error(&reply)),
             });
@@ -550,15 +563,43 @@ impl InprocReads {
             self.inner.token_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(found);
         }
-        // One mint at a time: concurrent readers wait for it, then reuse it.
-        let _mint = self
+        if let Some(reason) = self.recently_refused(&repo_key) {
+            return Err(Unanswered::Decline(reason));
+        }
+        // One mint per repository at a time: concurrent readers of the same
+        // repository wait for it, then reuse it. A waiter never waits past
+        // its own deadline.
+        let lock = self
             .inner
-            .mint_lock
+            .mint_locks
             .lock()
-            .map_err(|_| Unanswered::Decline("token mint lock poisoned".to_owned()))?;
+            .map_err(|_| Unanswered::Decline("token mint lock poisoned".to_owned()))?
+            .entry(repo_key.clone())
+            .or_default()
+            .clone();
+        let _mint = loop {
+            match lock.try_lock() {
+                Ok(guard) => break guard,
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err(Unanswered::Decline("token mint lock poisoned".to_owned()));
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if Instant::now() >= deadline {
+                        return Err(Unanswered::Fail(
+                            FailureKind::TimedOut,
+                            "timed out waiting for a token mint".to_owned(),
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        };
         if let Some(found) = self.cached_token(&repo_key) {
             self.inner.token_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(found);
+        }
+        if let Some(reason) = self.recently_refused(&repo_key) {
+            return Err(Unanswered::Decline(reason));
         }
         let minted = self.mint(repo, &repo_key, deadline);
         match minted {
@@ -569,9 +610,26 @@ impl InprocReads {
             }
             Err(error) => {
                 self.inner.mint_failures.fetch_add(1, Ordering::Relaxed);
+                if let Unanswered::Decline(reason) = &error
+                    && let Ok(mut refused) = self.inner.refused.lock()
+                {
+                    // A refused credential stays refused for a while: do not
+                    // sign and ask again on every read of the pass.
+                    refused.insert(
+                        repo_key,
+                        ((self.inner.clock)() + REFUSAL_HOLD_SECONDS, reason.clone()),
+                    );
+                }
                 Err(error)
             }
         }
+    }
+
+    fn recently_refused(&self, repo_key: &str) -> Option<String> {
+        let now = (self.inner.clock)();
+        let refused = self.inner.refused.lock().ok()?;
+        let (until, reason) = refused.get(repo_key)?;
+        (now < *until).then(|| format!("{reason} (held from an earlier attempt)"))
     }
 
     fn cached_token(&self, repo_key: &str) -> Option<(TokenKey, Arc<InstallationToken>)> {

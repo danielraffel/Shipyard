@@ -542,8 +542,10 @@ token mints and the lowest rate-limit remaining per resource;
 `api_calls.rollup_batch` gives the adaptive rollup batch size (it grows by two
 while batches answer under 2.5 s and halves on a failure or a batch over 5 s,
 within 2 to 12, and is kept in `github-read-batch.json` in the state dir).
-A credential problem hands the read back to `gh` and shows in
-`api_calls.fallbacks` as `in-process read -> gh`. To go back to `gh` for every
+A credential problem hands the read back to `gh` (and holds that repository
+on `gh` for a minute) and shows in `api_calls.fallbacks` as `in-process read ->
+gh`. A read whose caller set no timeout gets 60 s in process; a timeout is
+reported, never re-spent on `gh`. To go back to `gh` for every
 read, set `[github.reads] transport = "gh"` in the machine-global config, or
 `SHIPYARD_GITHUB_READS=gh` for one process. `shipyard runner
 steward-read-probe --repo OWNER/REPO --pr N` times the hottest reads through

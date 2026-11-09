@@ -163,7 +163,7 @@ fn check_key_file(path: &Path) -> Result<(), String> {
     if !metadata.file_type().is_file() {
         return Err("GitHub App private key must be a regular file, not a symlink".to_owned());
     }
-    if metadata.mode() & 0o777 != 0o600 {
+    if metadata.mode() & 0o7777 != 0o600 {
         return Err("GitHub App private key must have mode 0600".to_owned());
     }
     if metadata.uid() != uid {
