@@ -647,6 +647,21 @@ Every merge carry a landing accepts is logged to `carries.jsonl` with its
 verdict id and both merge bases. Read-only evaluations (`dry_run`: the
 `review-verdict` status, `train status`) never append a row.
 
+## A required check bound to Actions is not bound to a workflow
+
+A ruleset can bind a required context to the GitHub Actions app (15368) but
+not to a workflow file, so any workflow in the repository, including one the
+PR rewrote, can satisfy it. For a repo listed in
+`head_approval::trusted_signal::TRUSTED_SIGNAL_REPOS` (today
+`Generous-Corp/vellum` → `framework-trusted-verify`), or opted in with
+`trusted_signals = [{ name, workflow }]` in the head-approval config, the
+steward checks every same-named status and Actions check run on the exact
+head against its run: strict same-repo run URL, the named workflow path,
+event `pull_request_target`/`merge_group`, `head_sha` equal to the PR head,
+and success. A refusal or an API error never admits
+(`HeadGate::UntrustedSignal`). A `pull_request_target` run's `head_sha` is the
+PR head it ran for, so the head comparison is a real staleness check.
+
 ## Rollups: several approved pull requests as one tested merge
 
 Off unless the base's `.shipyard/config.toml` sets `[train] enabled = true`
