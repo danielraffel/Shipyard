@@ -6,10 +6,12 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
+from shlex import quote as shlex_quote
 from unittest import mock
 
 import package_release
@@ -429,14 +431,31 @@ class PackageReleaseTests(unittest.TestCase):
         self.assertEqual(outcome, "smoke ok")
         self.assertFalse(created[0].exists())
 
+    ACCEPTED = (
+        "Submission ID received\n"
+        "  id: 2efe2717-52ef-43a5-96dc-0797e4ca1041\n"
+        "Processing complete\n"
+        "  id: 2efe2717-52ef-43a5-96dc-0797e4ca1041\n"
+        "  status: Accepted\n"
+    )
+    SUBMISSION_ID = "2efe2717-52ef-43a5-96dc-0797e4ca1041"
+
     def test_notarize_uses_keychain_profile_for_long_running_submit(self) -> None:
         calls: list[list[str]] = []
+        streamed: list[list[str]] = []
 
         def fake_run(args: list[str], **_kwargs: object) -> str:
             calls.append(args)
-            if args[:3] == ["xcrun", "notarytool", "submit"]:
-                return "status: Accepted"
             return ""
+
+        def fake_streamed(args: list[str], **kwargs: object) -> tuple[int, str]:
+            streamed.append(args)
+            if args[:3] == ["xcrun", "notarytool", "store-credentials"]:
+                self.assertEqual(
+                    kwargs["timeout"], package_release.NOTARY_CREDENTIAL_TIMEOUT_SECS
+                )
+                return 0, ""
+            return 0, self.ACCEPTED
 
         with mock.patch.dict(
             os.environ,
@@ -454,37 +473,38 @@ class PackageReleaseTests(unittest.TestCase):
             package_release,
             "delete_notary_keychain",
         ) as delete_keychain, mock.patch.object(
-            package_release,
-            "run",
-            side_effect=fake_run,
-        ):
+            package_release, "run", side_effect=fake_run
+        ), mock.patch.object(
+            package_release, "run_streamed", side_effect=fake_streamed
+        ), redirect_stdout(StringIO()):
             package_release.notarize_and_staple(Path("shipyard.dmg"))
 
-        store = next(
-            args for args in calls
-            if args[:3] == ["xcrun", "notarytool", "store-credentials"]
-        )
-        submit = next(
-            args for args in calls
-            if args[:3] == ["xcrun", "notarytool", "submit"]
-        )
-
+        store = streamed[0]
+        self.assertEqual(store[:3], ["xcrun", "notarytool", "store-credentials"])
+        self.assertEqual(len(streamed), 2)
+        submit = streamed[1]
+        self.assertEqual(submit[:3], ["xcrun", "notarytool", "submit"])
         self.assertIn("--password", store)
         self.assertNotIn("--password", submit)
         self.assertIn("--keychain-profile", submit)
         self.assertIn("--keychain", submit)
-        self.assertIn("--timeout", submit)
-        self.assertIn(package_release.NOTARY_WAIT_TIMEOUT, submit)
+        self.assertIn("--wait", submit)
+        self.assertEqual(submit[submit.index("--timeout") + 1], "20m")
+        self.assertEqual(package_release.NOTARY_WAIT_TIMEOUT, "20m")
+        self.assertIn(["xcrun", "stapler", "staple", "shipyard.dmg"], calls)
         delete_keychain.assert_called_once_with(Path("/tmp/notary.keychain-db"))
 
     def test_notarize_api_key_mode_uses_direct_credentials(self) -> None:
         calls: list[list[str]] = []
+        streamed: list[list[str]] = []
 
         def fake_run(args: list[str], **_kwargs: object) -> str:
             calls.append(args)
-            if args[:3] == ["xcrun", "notarytool", "submit"]:
-                return "status: Accepted"
             return ""
+
+        def fake_streamed(args: list[str], **_kwargs: object) -> tuple[int, str]:
+            streamed.append(args)
+            return 0, self.ACCEPTED
 
         with mock.patch.dict(
             os.environ,
@@ -494,16 +514,239 @@ class PackageReleaseTests(unittest.TestCase):
                 "SHIPYARD_NOTARIZE_ISSUER_ID": "issuer-uuid",
             },
             clear=True,
-        ), mock.patch.object(package_release, "run", side_effect=fake_run):
+        ), mock.patch.object(package_release, "run", side_effect=fake_run), \
+                mock.patch.object(package_release, "run_streamed", side_effect=fake_streamed), \
+                redirect_stdout(StringIO()):
             package_release.notarize_and_staple(Path("shipyard.dmg"))
 
-        submit = calls[0]
+        submit = streamed[0]
         self.assertEqual(submit[:3], ["xcrun", "notarytool", "submit"])
         self.assertIn("--key", submit)
         self.assertIn("--key-id", submit)
         self.assertIn("--issuer", submit)
         self.assertNotIn("--password", submit)
+        self.assertEqual(submit[submit.index("--timeout") + 1], "20m")
         self.assertNotIn("store-credentials", " ".join(" ".join(call) for call in calls))
+
+    def _submit(self, results, *, attempts=3):
+        """Drive submit_for_notarization over scripted (returncode, output) pairs."""
+        streamed: list[list[str]] = []
+        sleeps: list[float] = []
+        queue = list(results)
+
+        def fake_streamed(args: list[str], **kwargs: object) -> tuple[int | None, str]:
+            streamed.append(args)
+            if args[:3] == ["xcrun", "notarytool", "log"]:
+                return 0, '{"issues": [{"message": "The binary is not signed."}]}'
+            self.assertEqual(kwargs["timeout"], package_release.NOTARY_ATTEMPT_TIMEOUT_SECS)
+            return queue.pop(0)
+
+        out = StringIO()
+        with mock.patch.object(package_release, "run_streamed", side_effect=fake_streamed), \
+                mock.patch.dict(os.environ, {}, clear=True), redirect_stdout(out):
+            try:
+                result = package_release.submit_for_notarization(
+                    Path("shipyard.dmg"),
+                    ["--key", "k.p8"],
+                    attempts=attempts,
+                    sleep=sleeps.append,
+                )
+                error = None
+            except SystemExit as exc:
+                result, error = None, exc
+        return result, error, streamed, sleeps, out.getvalue()
+
+    def test_notarization_accepted_logs_the_submission_id(self) -> None:
+        result, error, streamed, sleeps, out = self._submit([(0, self.ACCEPTED)])
+        self.assertIsNone(error)
+        self.assertEqual(result, self.SUBMISSION_ID)
+        self.assertEqual(len(streamed), 1)
+        self.assertEqual(sleeps, [])
+        self.assertIn(f"notarization submission id: {self.SUBMISSION_ID}", out)
+        self.assertIn(f"xcrun notarytool log {self.SUBMISSION_ID}", out)
+
+    def test_hung_upload_with_no_id_is_resubmitted_with_backoff(self) -> None:
+        result, error, streamed, sleeps, _ = self._submit(
+            [(None, "Conducting pre-submission checks...\n"), (0, self.ACCEPTED)]
+        )
+        self.assertIsNone(error)
+        self.assertEqual(result, self.SUBMISSION_ID)
+        self.assertEqual([args[2] for args in streamed], ["submit", "submit"])
+        self.assertEqual(sleeps, [60.0])
+
+    def test_id_without_a_finished_upload_is_uploaded_again(self) -> None:
+        # notarytool prints the id before the upload; a stall mid-upload
+        # leaves Apple without the file, so waiting on that id cannot succeed.
+        mid_upload = (
+            "Submission ID received\n"
+            f"  id: {self.SUBMISSION_ID}\n"
+            "Upload progress: 42.00% (1.2 MB of 2.9 MB)\n"
+        )
+        result, error, streamed, sleeps, out = self._submit(
+            [(None, mid_upload), (0, self.ACCEPTED)]
+        )
+        self.assertIsNone(error)
+        self.assertEqual([args[2] for args in streamed], ["submit", "submit"])
+        self.assertIn(f"notarization submission id: {self.SUBMISSION_ID}", out)
+        self.assertIn("did not complete", out)
+
+    def test_auth_failure_is_not_retried(self) -> None:
+        result, error, streamed, sleeps, _ = self._submit(
+            [(69, "Error: HTTP status code: 401. Invalid credentials.\n")]
+        )
+        self.assertIsNotNone(error)
+        self.assertEqual(len(streamed), 1)
+        self.assertEqual(sleeps, [])
+        self.assertIn("non-retryable", str(error))
+
+    def test_store_credentials_is_bounded_and_retried_once(self) -> None:
+        calls: list[tuple[list[str], float]] = []
+        sleeps: list[float] = []
+        results = [(None, ""), (0, "")]
+
+        def fake_streamed(args: list[str], **kwargs: object):
+            calls.append((args, kwargs["timeout"]))
+            return results.pop(0)
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "SHIPYARD_NOTARIZE_APPLE_ID": "apple@example.com",
+                "SHIPYARD_NOTARIZE_TEAM_ID": "TEAM123",
+                "SHIPYARD_NOTARIZE_APP_PASSWORD": "app-secret",
+            },
+            clear=True,
+        ), mock.patch.object(package_release, "run_streamed", side_effect=fake_streamed), \
+                redirect_stdout(StringIO()):
+            package_release.store_notary_credentials(
+                "profile", Path("/tmp/k.keychain-db"), sleep=sleeps.append
+            )
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all(t == package_release.NOTARY_CREDENTIAL_TIMEOUT_SECS for _, t in calls))
+        self.assertEqual(sleeps, [package_release.NOTARY_CREDENTIAL_BACKOFF_SECS])
+
+    def test_retry_after_a_finished_upload_waits_instead_of_resubmitting(self) -> None:
+        in_progress = (
+            "Submission ID received\n"
+            f"  id: {self.SUBMISSION_ID}\n"
+            "Successfully uploaded file\n"
+            f"  id: {self.SUBMISSION_ID}\n"
+            "Waiting for processing to complete.\n"
+            "Current status: In Progress...\n"
+        )
+        result, error, streamed, sleeps, _ = self._submit(
+            [(None, in_progress), (0, self.ACCEPTED)]
+        )
+        self.assertIsNone(error)
+        self.assertEqual(streamed[0][2], "submit")
+        self.assertEqual(streamed[1][:4], ["xcrun", "notarytool", "wait", self.SUBMISSION_ID])
+        self.assertNotIn("--wait", streamed[1])
+        self.assertEqual(streamed[1][streamed[1].index("--timeout") + 1], "20m")
+        self.assertEqual(sleeps, [60.0])
+
+    def test_transient_upload_error_is_retried_at_most_twice(self) -> None:
+        failure = (1, "Error: HTTP status code: 503. Service Unavailable\n")
+        result, error, streamed, sleeps, _ = self._submit([failure, failure, failure])
+        self.assertIsNotNone(error)
+        self.assertEqual(len(streamed), 3)
+        self.assertEqual(sleeps, [60.0, 180.0])
+        message = str(error)
+        self.assertIn("did not complete after 3 attempts", message)
+        self.assertIn("submission id never received", message)
+        self.assertIn("attempt 3: notarytool exited 1", message)
+
+    def test_invalid_verdict_fails_loudly_with_the_notary_log_and_no_retry(self) -> None:
+        invalid = (
+            f"  id: {self.SUBMISSION_ID}\n"
+            "Processing complete\n"
+            f"  id: {self.SUBMISSION_ID}\n"
+            "  status: Invalid\n"
+        )
+        result, error, streamed, sleeps, _ = self._submit([(1, invalid)])
+        self.assertIsNotNone(error)
+        self.assertEqual(sleeps, [])
+        self.assertEqual(
+            streamed[-1][:4], ["xcrun", "notarytool", "log", self.SUBMISSION_ID]
+        )
+        self.assertIn("--key", streamed[-1])
+        message = str(error)
+        self.assertIn("Notarization Invalid", message)
+        self.assertIn(self.SUBMISSION_ID, message)
+        self.assertIn("The binary is not signed.", message)
+
+    def test_current_status_line_is_not_read_as_a_verdict(self) -> None:
+        self.assertIsNone(
+            package_release.notary_final_status("Current status: Accepted...\n")
+        )
+        self.assertEqual(
+            package_release.notary_final_status("Current status: In Progress\n  status: Accepted\n"),
+            "Accepted",
+        )
+
+    def test_submission_id_is_appended_to_the_step_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            summary = Path(temp) / "summary.md"
+            with mock.patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(summary)}), \
+                    redirect_stdout(StringIO()):
+                package_release.report_notary_submission(self.SUBMISSION_ID)
+            self.assertIn(self.SUBMISSION_ID, summary.read_text(encoding="utf-8"))
+
+    def test_run_streamed_kills_a_stalled_process_group_and_keeps_its_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            marker = Path(temp) / "child.pid"
+            # The grandchild stands in for an upload helper that outlives a
+            # killed parent: the whole process group must go.
+            script = (
+                f"sleep 60 & echo $! > {shlex_quote(str(marker))}; "
+                "echo 'Submission ID received'; sleep 60"
+            )
+            out = StringIO()
+            started = time.monotonic()
+            with redirect_stdout(out):
+                returncode, output = package_release.run_streamed(
+                    ["/bin/sh", "-c", script], timeout=1.0
+                )
+            elapsed = time.monotonic() - started
+            self.assertIsNone(returncode)
+            self.assertLess(elapsed, 20)
+            self.assertIn("Submission ID received", output)
+            self.assertIn("Submission ID received", out.getvalue())
+            child = int(marker.read_text(encoding="utf-8").strip())
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(child, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.05)
+            else:
+                os.kill(child, 9)
+                self.fail("grandchild outlived the timeout kill")
+
+    def test_run_streamed_closes_stdin_and_redacts(self) -> None:
+        # Hold the parent's stdin on a pipe nobody writes, as a runner's can
+        # be: a child that inherited it would block in `read` until the cap.
+        read_fd, write_fd = os.pipe()
+        saved_stdin = os.dup(0)
+        os.dup2(read_fd, 0)
+        try:
+            with mock.patch.dict(os.environ, {"SHIPYARD_NOTARIZE_APP_PASSWORD": "app-secret"}), \
+                    redirect_stdout(StringIO()) as out:
+                returncode, output = package_release.run_streamed(
+                    ["/bin/sh", "-c", "read line || echo eof; echo app-secret"], timeout=5
+                )
+        finally:
+            os.dup2(saved_stdin, 0)
+            for fd in (saved_stdin, read_fd, write_fd):
+                os.close(fd)
+        self.assertEqual(returncode, 0)
+        self.assertIn("eof", output)
+        self.assertNotIn("app-secret", output)
+        self.assertNotIn("app-secret", out.getvalue())
+
+    def test_run_timeout_raises_command_failed(self) -> None:
+        with self.assertRaisesRegex(package_release.CommandFailed, "timed out after"):
+            package_release.run(["/bin/sleep", "30"], timeout=0.5)
 
     def test_signing_keychain_is_first_and_search_list_is_restored(self) -> None:
         calls: list[list[str]] = []
