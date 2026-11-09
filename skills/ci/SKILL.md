@@ -2005,6 +2005,19 @@ the owner approves `~/.shipyard-release-rust/cargo/bin/rustup` and the
 toolchain's `cargo` once per host. When bumping the toolchain pin, expect one
 new prompt for the new toolchain's `cargo`.
 
+**`notarytool --timeout` does not bound the upload.** It caps only the wait
+for Apple's verdict. v0.398.0 sat in `notarytool submit --wait --timeout 45m`
+for hours, and Apple had no record of the submission. `scripts/package_release.py`
+therefore runs every notarytool process under its own wall-clock cap, with
+stdin closed, and stops it by process group. It retries at most twice. A retry
+waits on an existing id only after `Successfully uploaded file`, because the
+id is printed before the upload starts. The script logs the id (also to the
+step summary) for `xcrun notarytool info|log <id>`. The signing step has
+`timeout-minutes: 115` and the job has 220; `scripts/test_release_workflow.py`
+ties those limits to the script's retry constants. If a stall recurs, check
+whether LuLu is holding an outbound connection from `notarytool` on the
+runner, as it did for `rustup`.
+
 Jobs running as the same OS user can still write that directory; the digest
 detects a change between runs but is not a boundary. The boundary is that fork
 pull requests never reach the self-hosted runners; full isolation would need a
