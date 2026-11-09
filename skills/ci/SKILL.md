@@ -501,6 +501,11 @@ repository is diagnosed from a dry run's numbers, not by guessing. Published
 failures cost no read in later passes, and the census reads current-head checks
 through batched rollup queries (site `graphql query checkRollup0`) instead of
 two REST reads per head.
+A repository that makes the pass exit 1 also carries `exit_reasons`, one
+entry per cause (`repo_errors:N`, `pr_errors:#A,#B`, `cancellation_errors:<run ids>`,
+`rate_limited`, `uncertain_mutations`, or `unclassified`), so a non-zero exit
+with an empty `errors` list is explained. The field is absent when the
+repository was healthy.
 
 ## The unattended carrier: `runner carrier`
 

@@ -942,6 +942,13 @@ current-head checks six heads per GraphQL rollup query and rereads a head's
 status history over REST only when the rollup shows a new status. See the
 [merge-steward reference](references/merge-steward.md#what-a-pass-costs-github-api_calls).
 
+When a pass exits 1 but a repository's `errors` is empty, read that
+repository's `exit_reasons`: one entry per cause (`repo_errors:N`,
+`pr_errors:#A,#B` for pull-request refusals such as an unapproved carried
+commit, `cancellation_errors:<run ids>`, `rate_limited`,
+`uncertain_mutations`, or `unclassified`). It is omitted for a healthy
+repository.
+
 It judges each first-parent change since the last `Version-Bump-Applied` marker
 on its own, then takes the highest level per surface. A
 `Version-Bump: <surface>=skip` trailer therefore skips only the change that
