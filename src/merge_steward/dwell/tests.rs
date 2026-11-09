@@ -45,9 +45,10 @@ fn observed(numbers: &[u64]) -> BTreeSet<u64> {
 /// A repository the steward already tracks (not its first pass, which
 /// seeds silently).
 fn established() -> DwellRepoState {
-    let mut state = DwellRepoState::default();
-    state.initialized = true;
-    state
+    DwellRepoState {
+        initialized: true,
+        ..DwellRepoState::default()
+    }
 }
 
 fn tracked_once(sightings: &[Sighting], policy: &DwellPolicy) -> DwellRepoState {
