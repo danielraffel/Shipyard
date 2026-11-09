@@ -571,8 +571,11 @@ fn held(stall: &Stall, repo: &str, base: &str, number: u64) -> NextAction {
     NextAction::new(
         Actor::Author,
         format!(
-            "HOLD by {holder} on this head{link}: fix what it names (with a test), merge {base} \
-             if needed (no rebase), push once, then comment `repaired: <what> at <sha>`."
+            "Held head: needs a new head. HOLD by {holder} on this head{link} makes it \
+             un-approvable, and any APPROVE of this same head is ignored: fix what it names \
+             (with a test), merge {base} if needed (no rebase), push once, then comment \
+             `repaired: <what> at <sha>`. If the HOLD is wrong, still push a new head (merge \
+             {base}) and comment `dispute: <reason>`; never ask for this head to be approved."
         ),
     )
 }
@@ -675,6 +678,11 @@ mod tests {
             "{next:?}"
         );
         assert!(next.action.contains("repaired:"), "{next:?}");
+        assert!(
+            next.action.starts_with("Held head: needs a new head."),
+            "{next:?}"
+        );
+        assert!(next.action.contains("dispute:"), "{next:?}");
     }
 
     #[test]

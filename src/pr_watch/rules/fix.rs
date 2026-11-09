@@ -371,8 +371,10 @@ pub fn held_unrepaired(repo: &str, pr: &PrHistory, sha: &str, hold: &TrailEntry)
         evidence: entry_url(repo, pr, hold),
         cause: "held_unrepaired".to_owned(),
         command: format!(
-            "read the HOLD, push a repair to {} (or label the pull request owner-decision, \
-             superseded or PARKED/<why> if it is not the author's to repair)",
+            "held head: needs a new head. Read the HOLD and push a repair to {} (if the HOLD \
+             is wrong, still push a new head, merging the base, and comment `dispute: <reason>`; \
+             never re-approve this head), or label the pull request owner-decision, superseded \
+             or PARKED/<why> if it is not the author's to repair",
             pr.head_ref
         ),
         safe_to_auto_apply: false,

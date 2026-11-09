@@ -112,7 +112,8 @@ shipyard cause advise --dir DIR --repo OWNER/REPO --head-sha SHA --query TEXT [-
 shipyard cause audit --dir DIR               # read-only local archive integrity report; exit 1 on findings
 
 # ghapp guards (queue-removal-guard, queue-arm-guard, branch-refresh-guard, merge-guard,
-#   verdict-hold-hook, verdict-session-stamp); see docs/ghapp-guards.md
+#   verdict-hold-hook, verdict-session-stamp, reviewer-claim-guard,
+#   verdict-contradiction-guard); see docs/ghapp-guards.md
 shipyard guards status                       # missing/stale/current vs this build's copies, plus whether
                                              #   review-before-arm is on (default) or OFF by opt-out; exit 1 unless all current
 shipyard guards install [--dir DIR] [--dry-run]  # install this build's copies atomically

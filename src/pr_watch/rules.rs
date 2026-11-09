@@ -629,7 +629,8 @@ fn held_events(emit: &mut Emit<'_>, view: &HeadView<'_>, config: &RuleConfig) {
         view.pr,
         Some(view.sha()),
         &format!(
-            "head {} was put on HOLD by {} and nothing was pushed since",
+            "held head: needs a new head: head {} was put on HOLD by {} and nothing was \
+             pushed since (a HOLD makes its head un-approvable; an APPROVE of it does not count)",
             short(view.sha()),
             hold.login
         ),
