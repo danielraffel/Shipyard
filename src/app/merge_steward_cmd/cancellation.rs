@@ -258,6 +258,7 @@ pub(super) fn apply_repo_plan(
             uncertain_mutations,
             api_calls: None,
             rate_limit_deferred: None,
+            exit_reasons: Vec::new(),
             repo: observation.repo.clone(),
             base: args.base.clone(),
             allow_auto_merge: observation.allow_auto_merge,

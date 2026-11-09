@@ -1102,3 +1102,35 @@ fn a_head_carrying_held_commits_names_the_held_pull_request_and_the_commits() {
     assert_eq!(stall.blocked_on, "carries_unapproved_commits:#11361");
     assert_eq!(stall.blocked_detail.as_deref(), Some(detail));
 }
+
+#[test]
+fn a_pr_refusal_with_no_repo_error_is_named_in_exit_reasons() {
+    let pr = |number: u64, error: Option<&str>| PrReport {
+        number,
+        head_sha: HEAD.to_owned(),
+        decision: StewardDecision::ArmMergeQueue,
+        mutation: None,
+        error: error.map(str::to_owned),
+        blocked: Stall::default(),
+    };
+    let mut report =
+        unreadable_repo_report("o/r", "main", &StewardLedger::default(), "boom".to_owned());
+    report.errors.clear();
+    report.prs = vec![
+        pr(1, None),
+        pr(7, Some("carries 1 commit(s) of #6 not on main")),
+        pr(9, Some("dequeue deferred")),
+    ];
+    assert_eq!(exit_reasons(&report), vec!["pr_errors:#7,#9".to_owned()]);
+
+    // Negative control: a repository with no failing field is unclassified,
+    // never silently empty, and a healthy report serializes no field.
+    report.prs = vec![pr(1, None)];
+    assert_eq!(exit_reasons(&report), vec!["unclassified".to_owned()]);
+    assert!(
+        serde_json::to_value(&report)
+            .expect("serializes")
+            .get("exit_reasons")
+            .is_none()
+    );
+}
