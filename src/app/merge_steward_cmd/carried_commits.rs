@@ -261,15 +261,22 @@ fn verified_stack(q: &OpenPr, base_ref: &str, others: &[OpenPr]) -> bool {
 }
 
 /// Whether P is excused from carrying `q`'s commits because `q` is a verified
-/// labelled stack whose head no counting HOLD names. Such a stack is invisible
-/// to admission until it is retargeted: required checks do not run on its head
-/// and the reviewer never reviews it, so judging P against it can only hold P
-/// on a verdict that will never come. A HOLD, or an unreadable judgement,
-/// excuses nothing. The label stops counting once `q` is on the steward's
-/// base. P carrying such a `q`'s commits is still P's own diff, reviewed at
-/// P's head. Pure.
-fn excused_stack(q: &OpenPr, base_ref: &str, others: &[OpenPr], judgement: &Judgement) -> bool {
+/// labelled stack on P's base-branch chain whose head has no counting HOLD.
+/// Such a stack is invisible to admission until it is retargeted: required
+/// checks do not run on its head and the reviewer never reviews it, so judging
+/// P against it can only hold P on a verdict that will never come. A HOLD, an
+/// unreadable judgement, or a label on an unrelated stack excuses nothing. The
+/// label stops counting once `q` is on the steward's base. P carrying such a
+/// `q`'s commits is still P's own diff, reviewed at P's head. Pure.
+fn excused_stack(
+    q: &OpenPr,
+    base_ref: &str,
+    head_ref: &str,
+    others: &[OpenPr],
+    judgement: &Judgement,
+) -> bool {
     verified_stack(q, base_ref, others)
+        && stacked_on(q, head_ref, others)
         && matches!(judgement, Judgement::Approved | Judgement::Unapproved(_))
 }
 
@@ -784,7 +791,7 @@ pub(super) fn refusal_with(
             .iter()
             .find(|q| q.number == overlap.number())
             .expect("an overlap names a listed pull request");
-        if verified_stack(q, base, others) && excused_stack(q, base, others, &judge(q)) {
+        if verified_stack(q, base, others) && excused_stack(q, base, head_ref, others, &judge(q)) {
             continue;
         }
         let Some(settled) = resolve_overlap(
@@ -1008,7 +1015,7 @@ fn over_cap_refusal(
     let mut judged = Vec::new();
     let mut probes_left = MAX_REVERSE_PROBES;
     for q in unrelated(number, base, head_ref, others) {
-        if verified_stack(q, base, others) && excused_stack(q, base, others, &judge(q)) {
+        if verified_stack(q, base, others) && excused_stack(q, base, head_ref, others, &judge(q)) {
             continue;
         }
         let roots = cache
