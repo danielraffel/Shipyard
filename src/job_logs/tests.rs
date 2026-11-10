@@ -462,6 +462,37 @@ fn a_fallback_is_counted_as_two_requests() {
 }
 
 #[test]
+fn a_fallback_obeys_pass_and_minute_budgets() {
+    let gh = FakeGh::new();
+    let logs = JobLogPass::with_window(None, policy(1, 100), own_window()).with_reader(Box::new(
+        |_: &[String]| Err("gh: Bad credentials (HTTP 401)".to_owned()),
+    ));
+    let error = logs
+        .read(&gh.reader(), REPO, 1)
+        .expect_err("the fallback exceeded the pass budget");
+    assert!(is_deferred(&error), "{error}");
+    assert!(
+        gh.requests().is_empty(),
+        "the fallback bypassed the pass cap"
+    );
+    assert_eq!(logs.stats().fetched, 1);
+
+    let gh = FakeGh::new();
+    let logs = JobLogPass::with_window(None, policy(2, 1), own_window()).with_reader(Box::new(
+        |_: &[String]| Err("gh: Bad credentials (HTTP 401)".to_owned()),
+    ));
+    let error = logs
+        .read(&gh.reader(), REPO, 2)
+        .expect_err("the fallback exceeded the minute budget");
+    assert!(is_deferred(&error), "{error}");
+    assert!(
+        gh.requests().is_empty(),
+        "the fallback bypassed the minute cap"
+    );
+    assert_eq!(logs.stats().fetched, 1);
+}
+
+#[test]
 fn a_404_is_remembered_for_less_time_than_a_410() {
     let root = tempfile::tempdir().expect("temp");
     let cache = store(root.path(), &JobLogPolicy::default());

@@ -657,6 +657,10 @@ impl JobLogPass {
                     // The dedicated credential cannot read this log: the
                     // caller's reader still can.
                     Err(error) if credential_refused(&error) => {
+                        // The fallback is a second GitHub request. It must
+                        // consume the same pass and rate-window budgets as
+                        // the dedicated attempt before it is sent.
+                        self.admit()?;
                         crate::gate_cost::fetch_job_log(&counted, repo, job_id)
                     }
                     other => other,
