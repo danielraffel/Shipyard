@@ -118,6 +118,15 @@ Settled answers are cached under `<state>/pr-watch/cache/<repo>`: required jobs
 of a completed run attempt, signatures of a completed job's log, check runs of
 a head that is no longer an open PR's head, and merge bases.
 
+Job logs themselves are cached under `<state>/job-logs/` (one file per job,
+least recently used evicted past `cache_max_mb`), and log requests are bounded
+by `[github.job_logs]` (see [GitHub App quota](github-app-quota.md#job-log-reads)).
+A pass reads failed jobs newest first; logs past the pass budget are reported
+as the gap `N failed job log(s) deferred by the [github.job_logs] fetch
+budget`, and the next pass reads them, serving the ones already fetched from
+disk. The daemon's `pr_watch_pass` event carries `job_logs` per repository:
+`fetched`, `cached` and `deferred`.
+
 ## Sticky comment
 
 Marker `<!-- shipyard-pr-watch v1 -->`. A comment is ours when its id is in

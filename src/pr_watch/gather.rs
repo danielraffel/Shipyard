@@ -635,9 +635,9 @@ fn read_group_runs(
     out
 }
 
-/// Failure signatures for every failed required job, from its log.
-fn read_signatures(gh: &SyncGhReader<'_>, cache: &ReadCache, history: &mut RepoHistory) {
-    let repo = history.repo.clone();
+/// Every failed required job of the window: heads' checks and merge-group
+/// runs' required jobs.
+fn failed_job_ids(history: &RepoHistory) -> BTreeSet<u64> {
     let mut ids: BTreeSet<u64> = BTreeSet::new();
     for pr in history.prs.values() {
         for head in &pr.heads {
@@ -652,40 +652,92 @@ fn read_signatures(gh: &SyncGhReader<'_>, cache: &ReadCache, history: &mut RepoH
                 .map(|c| c.id),
         );
     }
-    let ids: Vec<u64> = ids.into_iter().collect();
-    let results = parallel_map(&ids, |id| {
-        let key = format!("pr-watch:signatures:{repo}:{id}");
-        if let Some(Value::Array(items)) = cache.get(&key) {
-            return Ok(items
+    ids
+}
+
+/// Failure signatures for every failed required job, from its log.
+///
+/// Logs come through the cache's job-log pass, which serves logs already read
+/// from disk and sends at most a bounded number of requests per pass. Jobs
+/// are read newest first, so when the budget defers the rest of a backlog the
+/// signatures that matter now are the ones read, and the next pass resumes
+/// with the older jobs it deferred.
+fn read_signatures(gh: &SyncGhReader<'_>, cache: &ReadCache, history: &mut RepoHistory) {
+    let repo = history.repo.clone();
+    let ids = failed_job_ids(history);
+    let key = |id: u64| format!("pr-watch:signatures:{repo}:{id}");
+    let signatures_of = |id: u64, log: &str| {
+        let signatures = failure_signatures(log);
+        cache.put(
+            &key(id),
+            &Value::Array(signatures.iter().cloned().map(Value::String).collect()),
+        );
+        signatures
+    };
+    // Answers already on disk first, with no request. Then requests, newest
+    // job first (ids grow with time), and only as many as the budget has
+    // left: deciding which jobs to defer here, before the concurrent reads,
+    // keeps "newest first" true however the read workers interleave.
+    let mut results: BTreeMap<u64, Result<Vec<String>, String>> = BTreeMap::new();
+    let mut uncached: Vec<u64> = Vec::new();
+    for id in ids.into_iter().rev() {
+        if let Some(Value::Array(items)) = cache.get(&key(id)) {
+            let signatures = items
                 .iter()
                 .filter_map(Value::as_str)
                 .map(str::to_owned)
-                .collect());
+                .collect();
+            results.insert(id, Ok(signatures));
+            continue;
         }
-        let log = gh(&strings(&[
-            "api",
-            &format!("repos/{repo}/actions/jobs/{id}/logs"),
-        ]))?;
-        let signatures = failure_signatures(&log);
-        cache.put(
-            &key,
-            &Value::Array(signatures.iter().cloned().map(Value::String).collect()),
-        );
-        Ok::<Vec<String>, String>(signatures)
+        match cache.job_log_cached(&repo, id) {
+            Some(Ok(log)) => {
+                results.insert(id, Ok(signatures_of(id, &log)));
+            }
+            Some(Err(error)) => {
+                results.insert(id, Err(error));
+            }
+            None => uncached.push(id),
+        }
+    }
+    let send = uncached.len().min(cache.job_log_fetches_left());
+    let deferred_ids = uncached.split_off(send);
+    cache.note_job_logs_deferred(deferred_ids.len());
+    let fetched = parallel_map(&uncached, |id| {
+        let log = cache.job_log(gh, &repo, *id)?;
+        Ok::<Vec<String>, String>(signatures_of(*id, &log))
     });
+    results.extend(uncached.iter().copied().zip(fetched));
+    for id in deferred_ids {
+        results.insert(
+            id,
+            Err(format!(
+                "{}: past this pass's budget",
+                crate::job_logs::DEFERRED
+            )),
+        );
+    }
     let mut by_id: BTreeMap<u64, Vec<String>> = BTreeMap::new();
     let mut unreadable = 0_u64;
-    for (id, result) in ids.iter().zip(results) {
+    let mut deferred = 0_u64;
+    for (id, result) in results {
         match result {
             Ok(signatures) => {
-                by_id.insert(*id, signatures);
+                by_id.insert(id, signatures);
             }
+            Err(error) if crate::job_logs::is_deferred(&error) => deferred += 1,
             Err(_) => unreadable += 1,
         }
     }
     if unreadable > 0 {
         history.gaps.push(format!(
             "{unreadable} failed job log(s) unreadable; their signatures are unknown"
+        ));
+    }
+    if deferred > 0 {
+        history.gaps.push(format!(
+            "{deferred} failed job log(s) deferred by the [github.job_logs] fetch budget; \
+             a later pass reads them"
         ));
     }
     let apply = |check: &mut CheckFact| {
@@ -794,6 +846,138 @@ fn read_merge_bases(
             if let Some(merge_base) = found.get(&head.sha) {
                 head.merge_base = Some(merge_base.clone());
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod job_log_budget_tests {
+    use std::sync::Mutex;
+
+    use super::*;
+    use crate::job_logs::{JobLogPass, JobLogPolicy, RateWindow};
+
+    fn failed(id: u64) -> CheckFact {
+        CheckFact {
+            name: "macos".to_owned(),
+            id,
+            status: "completed".to_owned(),
+            conclusion: Some("failure".to_owned()),
+            ..CheckFact::default()
+        }
+    }
+
+    fn history() -> RepoHistory {
+        let mut history = RepoHistory {
+            repo: "o/r".to_owned(),
+            ..RepoHistory::default()
+        };
+        history.prs.insert(
+            1,
+            PrHistory {
+                number: 1,
+                heads: vec![HeadFact {
+                    checks: vec![failed(10), failed(30), failed(20)],
+                    ..HeadFact::default()
+                }],
+                ..PrHistory::default()
+            },
+        );
+        history
+    }
+
+    #[test]
+    fn signatures_read_newest_first_and_defer_past_the_budget() {
+        let requests = Mutex::new(Vec::new());
+        let gh = |argv: &[String]| -> Result<String, String> {
+            requests.lock().expect("requests").push(argv.join(" "));
+            Ok("##[error]boom\n".to_owned())
+        };
+        let policy = JobLogPolicy {
+            max_fetches_per_pass: 1,
+            ..JobLogPolicy::default()
+        };
+        let window: &'static RateWindow = Box::leak(Box::new(RateWindow::default()));
+        let root = tempfile::tempdir().expect("temp");
+        let cache = ReadCache::open(root.path(), std::time::SystemTime::now())
+            .with_job_logs(JobLogPass::with_window(None, policy, window));
+        let mut history = history();
+        read_signatures(&gh, &cache, &mut history);
+        for deferred in [20, 10] {
+            assert_eq!(
+                cache.get(&format!("pr-watch:signatures:o/r:{deferred}")),
+                None,
+                "a deferred job's signatures were cached"
+            );
+        }
+        assert!(cache.get("pr-watch:signatures:o/r:30").is_some());
+        let requests = requests.into_inner().expect("requests");
+        assert_eq!(requests.len(), 1, "sent past the budget: {requests:?}");
+        assert!(
+            requests[0].contains("actions/jobs/30/logs"),
+            "the newest failed job was not read first: {requests:?}"
+        );
+        assert!(
+            requests[0].contains("--allow-escape-sequences"),
+            "a log read without allowing escape sequences: {requests:?}"
+        );
+        assert!(
+            history
+                .gaps
+                .iter()
+                .any(|gap| gap.starts_with("2 failed job log(s) deferred")),
+            "{:?}",
+            history.gaps
+        );
+        assert!(
+            !history.gaps.iter().any(|gap| gap.contains("unreadable")),
+            "a deferral was reported as unreadable: {:?}",
+            history.gaps
+        );
+        let checks = &history.prs[&1].heads[0].checks;
+        let signed: Vec<u64> = checks
+            .iter()
+            .filter(|check| !check.signatures.is_empty())
+            .map(|check| check.id)
+            .collect();
+        assert_eq!(signed, vec![30]);
+    }
+
+    #[test]
+    fn a_log_on_disk_needs_no_request_or_budget() {
+        let root = tempfile::tempdir().expect("temp");
+        let policy = JobLogPolicy {
+            max_fetches_per_pass: 1,
+            ..JobLogPolicy::default()
+        };
+        let window: &'static RateWindow = Box::leak(Box::new(RateWindow::default()));
+        let requests = Mutex::new(Vec::new());
+        let gh = |argv: &[String]| -> Result<String, String> {
+            requests.lock().expect("requests").push(argv.join(" "));
+            Ok("##[error]boom\n".to_owned())
+        };
+        let pass = |policy: JobLogPolicy| {
+            let store = crate::job_logs::JobLogStore::open(root.path(), &policy);
+            ReadCache::disabled().with_job_logs(JobLogPass::with_window(store, policy, window))
+        };
+        // Three passes of one request each read the three logs once each.
+        for _ in 0..3 {
+            let cache = pass(policy.clone());
+            let mut history = history();
+            read_signatures(&gh, &cache, &mut history);
+        }
+        let mut history = history();
+        let cache = pass(policy);
+        read_signatures(&gh, &cache, &mut history);
+        assert!(history.gaps.is_empty(), "{:?}", history.gaps);
+        let requests = requests.into_inner().expect("requests");
+        assert_eq!(
+            requests.len(),
+            3,
+            "a cached log was requested again: {requests:?}"
+        );
+        for (request, id) in requests.iter().zip([30, 20, 10]) {
+            assert!(request.contains(&format!("jobs/{id}/logs")), "{requests:?}");
         }
     }
 }

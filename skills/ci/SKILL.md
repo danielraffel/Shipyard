@@ -558,6 +558,11 @@ it unset), or `SHIPYARD_GITHUB_READS=gh` for one process;
 `SHIPYARD_GITHUB_READS=inproc` opts one process in. `shipyard runner
 steward-read-probe --repo OWNER/REPO --pr N` times the hottest reads through
 both transports side by side and checks their output matches.
+Job-log reads are budgeted separately by `[github.job_logs]` (per pass, per
+minute, and a disk cache of completed jobs' logs under `<state>/job-logs/`);
+a pr-watch gap `N failed job log(s) deferred by the [github.job_logs] fetch
+budget` is that cap working, and a later pass reads the rest. See
+`docs/github-app-quota.md#job-log-reads`.
 A repository that makes the pass exit 1 also carries `exit_reasons`, one
 entry per cause (`repo_errors:N`, `pr_errors:#A,#B`, `cancellation_errors:<run ids>`,
 `rate_limited`, `uncertain_mutations`, or `unclassified`), so a non-zero exit
@@ -1082,6 +1087,21 @@ line in the receipt (`foreign_writers`, printed by the workflow on failure)
 and on stderr. The failure string itself is unchanged because retained-lease
 recovery parses it. Do not run `flock`/`lsof` probes against that lock on a
 host while a sandbox canary is running: the probe itself is a foreign holder.
+## The signing job runs in the `release` environment
+
+The signing job names the `release` environment (tags `v*` only), so it runs
+only for `v*` tags. The Developer ID and notarization secrets stay repository
+secrets for now (an environment job also receives them, so releases keep
+signing); moving them into the environment is a later owner step. post-tag-sync does not: it must stay identical to what
+`shipyard release-bot hook install` renders. A tag push runs the
+tagged commit's own workflow file, so the environment is only as safe as the
+`v*` tag rulesets; add the tag policy only after they exist. The job still
+builds repository code next to those secrets: the environment limits which
+refs reach them, not what merged code can do. Adding a job that reads a secret
+means classifying it in `scripts/test_workflow_secret_environments.py`.
+`SHIPYARD_APP_PRIVATE_KEY` and post-tag-sync's `RELEASE_BOT_TOKEN` stay
+repository secrets too.
+
 ## Release publication waits for attestation
 
 `release.yml` keeps the release a draft until the macOS DMG is attested:

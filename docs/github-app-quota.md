@@ -535,6 +535,54 @@ workflow runs are always read fresh. Set
 window (at most 600) or to `0` to turn the cache off. The cache lives under the
 state dir in `runner-admission-observation/read-cache/`.
 
+### Job-log reads
+
+A job log is one REST request per job, so a pass that walks every failed job
+of a multi-day window can spend hundreds of requests at once: one
+daemon pr-watch pass read 645 logs in fourteen minutes (about
+2,800 an hour) on the shared installation. Every log read through
+`ReadCache::job_log` (pr-watch signatures, `shipyard landing` signatures) is
+bounded:
+
+```toml
+[github.job_logs]
+max_fetches_per_pass = 100   # requests one pass may send; 0 = cache only
+max_fetches_per_minute = 30  # requests this process may send per minute
+max_wait_seconds = 90        # wait this long for a per-minute slot, then defer
+cache_max_mb = 512           # disk cache bound; least recently used evicted
+max_entry_mb = 16            # larger logs are returned but not cached
+missing_ttl_hours = 24       # how long a 410 is remembered (a 404: at most 1 h)
+admission_auth = false       # Generous-Corp logs via [github.admission_auth]
+```
+
+A completed job's log never changes, so a log read once is served from
+`<state>/job-logs/` afterwards and is never requested again while it is
+cached. A read past a budget fails fast as deferred; because every fetched log
+is cached, the next pass serves those from disk and spends its budget on the
+next ones, so a backlog drains a bounded slice per pass and resumes where the
+last one stopped. With the daemon's fifteen-minute pr-watch cadence the
+defaults cap pr-watch at 400 log requests an hour per repository, and the
+per-minute ceiling caps the whole process at 1,800 an hour. A 404 is
+remembered for at most an hour, because GitHub answers 404 for a short while
+after a job completes, before its log is uploaded. `pr-watch --no-cache` and
+`--record` read every log unbudgeted, since a recording must hold every
+answer.
+
+The per-minute wait paces a pass: at the defaults one repository with a
+backlog can spend about three and a half minutes waiting for slots in a
+pass, so several such repositories can stretch a daemon pass past its
+fifteen-minute cadence. The next pass then starts when the running one ends;
+passes never overlap.
+
+`admission_auth = true` sends Generous-Corp log requests with the
+`[github.admission_auth]` credential above (its App is installed on
+Generous-Corp repositories only, and needs Actions read). That moves log reads
+off the shared installation, at the cost of spending admission's budget, which
+JIT runner admission depends on; the per-pass and per-minute caps still apply.
+A credential that cannot mint, or a 401, 429, rate-limit 403 or 403 "not
+accessible by integration" on a log read, falls back to `[github.auth]`; the
+`fetched` count in the `pr_watch_pass` event includes both requests.
+
 ## Validate the quota
 
 Run:

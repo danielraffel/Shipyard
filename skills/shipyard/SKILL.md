@@ -552,6 +552,22 @@ file, or a committed overlay). Merged config would let the machine-global file
 or Pulp's untracked overlay turn off Pulp's gates with nothing changing in
 Pulp, so a `pr_gates` set there is refused with exit 2, as is an opt-out in a
 repository whose gate scripts resolve.
+
+## Job-log reads
+
+Read an Actions job log with `ReadCache::job_log` (or a
+`crate::job_logs::JobLogPass`), never a bare `gh api .../jobs/{id}/logs`, in
+any path that can read more than a handful of logs. It serves completed jobs'
+logs from `<state>/job-logs/`, sends at most `[github.job_logs]
+max_fetches_per_pass` requests per pass and `max_fetches_per_minute` per
+process (waiting up to `max_wait_seconds` for a slot), and returns a deferral
+(`crate::job_logs::is_deferred`) past either;
+report a deferral as a gap, not as an unreadable log. An uncapped walk over a
+window's failed jobs has spent hundreds of requests in one pass on the shared
+installation. A cache write that cannot take the writer-domain lease skips that
+one write only: never latch caching off for the rest of a pass, because every
+skipped write is a refetch next pass.
+
 ## Crash-safe state writes
 
 Write Shipyard state files (ship state, queue requests, receipts, holds) with
@@ -896,6 +912,21 @@ failure: the step touches `done` as its last command and exits, and the
 guardian could see the owner gone before it saw `done`. The guardian now
 re-checks `done` when the owner ends. The lease is removed either way, so this
 never wedges later runs.
+## The signing job runs in the `release` environment
+
+The signing job names the `release` environment (tags `v*` only), so it runs
+only for `v*` tags. The Developer ID and notarization secrets stay repository
+secrets for now (an environment job also receives them, so releases keep
+signing); moving them into the environment is a later owner step. post-tag-sync does not: it must stay identical to what
+`shipyard release-bot hook install` renders. A tag push runs the
+tagged commit's own workflow file, so the environment is only as safe as the
+`v*` tag rulesets; add the tag policy only after they exist. The job still
+builds repository code next to those secrets: the environment limits which
+refs reach them, not what merged code can do. Adding a job that reads a secret
+means classifying it in `scripts/test_workflow_secret_environments.py`.
+`SHIPYARD_APP_PRIVATE_KEY` and post-tag-sync's `RELEASE_BOT_TOKEN` stay
+repository secrets too.
+
 ## Release publication waits for attestation
 
 `release.yml` keeps the release a draft until the macOS DMG is attested:

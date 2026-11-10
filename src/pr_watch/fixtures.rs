@@ -67,10 +67,21 @@ impl FixtureReader {
         if let Ok(mut served) = self.served.lock() {
             served.push(argv.to_vec());
         }
-        self.answers.get(argv).cloned().ok_or_else(|| {
-            let shown: Vec<&str> = argv.iter().map(String::as_str).take(6).collect();
-            format!("no fixture for gh {}", shown.join(" "))
-        })
+        // A job-log read asks gh to allow escape sequences; recordings made
+        // before it did hold the bare argv, which is the same request.
+        let bare: Vec<String> = argv
+            .iter()
+            .filter(|arg| *arg != "--allow-escape-sequences")
+            .cloned()
+            .collect();
+        self.answers
+            .get(argv)
+            .or_else(|| self.answers.get(&bare))
+            .cloned()
+            .ok_or_else(|| {
+                let shown: Vec<&str> = argv.iter().map(String::as_str).take(6).collect();
+                format!("no fixture for gh {}", shown.join(" "))
+            })
     }
 
     /// Every argv requested so far.

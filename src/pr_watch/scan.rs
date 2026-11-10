@@ -763,6 +763,8 @@ pub struct DaemonPass {
     pub errors: Vec<String>,
     /// Config warnings (for example a digest table that is not enabled).
     pub warnings: Vec<String>,
+    /// Per-repository job-log reads: fetched, served from cache, deferred.
+    pub job_logs: BTreeMap<String, crate::job_logs::JobLogStats>,
 }
 
 /// One daemon pass: re-read machine-global `[pr_watch]` config (so a toggle
@@ -831,7 +833,8 @@ pub fn daemon_pass(
                 .join("cache")
                 .join(repo.replace('/', "__").to_ascii_lowercase()),
             std::time::SystemTime::now(),
-        );
+        )
+        .with_job_logs(daemon_job_logs(&config, state_dir, &cwd, &repo, &mut pass));
         let request = ScanRequest {
             repo: repo.clone(),
             config: watch.clone(),
@@ -863,7 +866,7 @@ pub fn daemon_pass(
             local_names: handback::local_host_names(),
             local_machine: handback::owner::local_machine_identity(state_dir),
         };
-        match scan(
+        let result = scan(
             &reader,
             &writer,
             &mut sender,
@@ -872,7 +875,9 @@ pub fn daemon_pass(
             &request,
             now,
             Some(&mut deps),
-        ) {
+        );
+        pass.job_logs.insert(repo.clone(), cache.job_log_stats());
+        match result {
             Ok(report) => {
                 pass.flags.insert(repo.clone(), report.flags.len());
                 pass.errors.extend(
@@ -886,6 +891,69 @@ pub fn daemon_pass(
         }
     }
     pass
+}
+
+/// The job-log pass for one daemon pass over `repo`: logs cached on disk
+/// under the state directory, fetches bounded by `[github.job_logs]`, and,
+/// when `admission_auth` is on and the repository is Generous-Corp's, log
+/// requests sent with the `[github.admission_auth]` credential so they do not
+/// spend the shared `[github.auth]` budget.
+fn daemon_job_logs(
+    config: &LoadedConfig,
+    state_dir: &std::path::Path,
+    cwd: &std::path::Path,
+    repo: &str,
+    pass: &mut DaemonPass,
+) -> crate::job_logs::JobLogPass {
+    let (job_logs, warnings) = crate::job_logs::JobLogPass::for_state_dir(state_dir, config);
+    pass.warnings.extend(warnings);
+    if !(job_logs.policy().admission_auth && admission_eligible(repo)) {
+        return job_logs;
+    }
+    match admission_log_reader(config, cwd, repo) {
+        Ok(reader) => job_logs.with_reader(reader),
+        Err(detail) => {
+            pass.warnings.push(format!(
+                "{repo}: [github.job_logs] admission_auth: {detail}; job logs use github.auth"
+            ));
+            job_logs
+        }
+    }
+}
+
+/// The admission-reader App is installed on Generous-Corp repositories only.
+fn admission_eligible(repo: &str) -> bool {
+    repo.split_once('/')
+        .is_some_and(|(owner, _)| owner.eq_ignore_ascii_case("Generous-Corp"))
+}
+
+fn admission_log_reader(
+    config: &LoadedConfig,
+    cwd: &std::path::Path,
+    repo: &str,
+) -> Result<crate::job_logs::LogReader, String> {
+    let client = crate::gh::GhClient::admission_from_loaded_config(config)
+        .map_err(|error| format!("is invalid ({error})"))?
+        .ok_or_else(|| "[github.admission_auth] is not configured".to_owned())?;
+    let mut client = client
+        .with_repo_override(repo)
+        .map_err(|error| format!("cannot scope to {repo} ({error})"))?;
+    client
+        .pin_command_auth_with_timeout(cwd, StdDuration::from_secs(5))
+        .map_err(|error| format!("could not mint a token ({error})"))?;
+    let actions = crate::cloud::GitHubActions::from_loaded_config(cwd, config)
+        .with_repo_override(repo)
+        .with_gh_client(client);
+    let repo = repo.to_owned();
+    Ok(Box::new(move |argv: &[String]| {
+        actions
+            .run_gh_with_timeout_env(
+                argv,
+                StdDuration::from_mins(2),
+                &[("GH_REPO", repo.as_str())],
+            )
+            .map_err(|error| error.to_string())
+    }))
 }
 
 #[cfg(test)]
