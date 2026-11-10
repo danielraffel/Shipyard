@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 
 pub use crate::stale_pr_wedge::{StalePrRunWedgeCandidate, plan_stale_pr_run_wedges};
 
+pub mod dwell;
 pub mod ejection_guards;
+pub mod next_admit;
 pub use ejection_guards::EjectionGuards;
 
 /// One current-head check observed on a pull request.

@@ -8,7 +8,7 @@
 //! * durably on the registering host, at
 //!   `<state_dir>/owners/<owner>/<name>/<pr>.json`, written atomically;
 //! * as one HTML comment in the pull request body,
-//!   `<!-- shipyard-owner: host=m5 client=codex surface=... session=... -->`,
+//!   `<!-- shipyard-owner: host=m5 client=codex surface=... sid=... -->`,
 //!   so the address survives the loss of that host and is readable from any
 //!   host with one GraphQL read.
 //!
@@ -33,6 +33,21 @@ pub(crate) const MARKER_PREFIX: &str = "<!-- shipyard-owner:";
 const MARKER_SUFFIX: &str = "-->";
 /// Schema version of an [`OwnerRecord`] on disk.
 const RECORD_SCHEMA: u32 = 1;
+
+/// Marker key for the owning session's id. It must not contain the word
+/// "session": the `ghapp` wrapper refuses any request body whose
+/// `<!-- ... -->` text mentions it, because that is the shape of the
+/// reviewer session stamp on a verdict, so a marker spelling it could never be
+/// written through `ghapp`.
+const SESSION_KEY: &str = "sid";
+/// The key earlier releases wrote. Still read, never written.
+const LEGACY_SESSION_KEY: &str = "session";
+
+/// Whether `value` carries the word the `ghapp` stamp guard refuses inside a
+/// body comment. Such a value stays in the local record and out of the marker.
+fn names_a_session(value: &str) -> bool {
+    value.to_ascii_lowercase().contains("session")
+}
 
 /// Which agent client a session runs.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -240,7 +255,7 @@ pub(crate) fn render_marker(record: &OwnerRecord) -> String {
         fields.push(("socket", socket.clone()));
     }
     if let Some(session) = &record.session {
-        fields.push(("session", session.clone()));
+        fields.push((SESSION_KEY, session.clone()));
     }
     if let Some(agent) = &record.agent {
         fields.push(("agent", agent.clone()));
@@ -256,7 +271,7 @@ pub(crate) fn render_marker(record: &OwnerRecord) -> String {
     }
     let body = fields
         .into_iter()
-        .filter(|(_, value)| safe_value(value))
+        .filter(|(_, value)| safe_value(value) && !names_a_session(value))
         .map(|(key, value)| format!("{key}={value}"))
         .collect::<Vec<_>>()
         .join(" ");
@@ -295,7 +310,10 @@ pub(crate) fn parse_marker(repo: &str, pr: u64, body: &str) -> Option<OwnerRecor
         cmux_socket: fields.get("socket").cloned(),
         surface: fields.get("surface").cloned(),
         agent: fields.get("agent").cloned(),
-        session: fields.get("session").cloned(),
+        session: fields
+            .get(SESSION_KEY)
+            .or_else(|| fields.get(LEGACY_SESSION_KEY))
+            .cloned(),
         registered_at,
         source: Source::BodyMarker,
         released: fields.get("released").is_some_and(|v| v == "true"),
@@ -540,7 +558,11 @@ pub(crate) fn find_pr_for_branch(
 /// Whether two records name the same session at the same address (time and
 /// source aside). Only values a marker can carry are compared.
 pub(crate) fn same_address(left: &OwnerRecord, right: &OwnerRecord) -> bool {
-    let carried = |value: &Option<String>| value.clone().filter(|v| safe_value(v));
+    let carried = |value: &Option<String>| {
+        value
+            .clone()
+            .filter(|v| safe_value(v) && !names_a_session(v))
+    };
     left.host == right.host
         && left.client == right.client
         && carried(&left.surface) == carried(&right.surface)

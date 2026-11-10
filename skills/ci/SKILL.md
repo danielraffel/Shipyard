@@ -26,6 +26,29 @@ services need environment rollout/restart. It preserves required evidence,
 merge receipts, explicit metrics imports/record, and historical reporting;
 retention and manual cause/private-corpus collection remain separate.
 
+## Overdue pull requests and what lands next: `shipyard overdue`, `shipyard next`
+
+Before guessing what to work on, read the steward's own answer:
+`shipyard next [--repo R] [--json]` lists the five pull requests closest to
+mergeable (stack bases first, then approved green, approved pending, green
+needing review; a stack base must itself be approved to rank first), each
+with the single thing it needs; `shipyard overdue`
+lists every pull request past its `[auto_merge.dwell]` limit with its owner
+route and any act taken. Both read the snapshot the steward's last `--apply`
+pass wrote and print its age; neither costs GitHub API budget. The steward
+takes only contract-allowed acts (re-run a stale `review-verdict` after a live
+gate read, dispatch a never-ran required check from the base's
+`[auto_merge.dwell.dispatch]` map, evaluate an overstayed approved head first,
+retarget a stack whose parent merged from its exact base branch), each after a
+live re-read of the pull request, at most three per pass, once per pull
+request, state and head, and ships them in `shadow` until the base sets
+`act = "apply"`. It never
+touches a DIRTY or held head and never arms. Gotcha: stacked pull requests are
+seen only through the open-pull-request listing the carried-commit check reads
+in the same pass, so a pass with no admission candidate holds stacked entries
+(`stack_listing: not_read_this_pass`) rather than reading GitHub again. Full
+reference: `docs/automated-draining.md`, "Dwell-time limits".
+
 ## Required-check producer identity
 
 Metrics cleanup uses the existing `SHIPYARD_METRICS_RETENTION_DAYS` policy
@@ -501,6 +524,40 @@ repository is diagnosed from a dry run's numbers, not by guessing. Published
 failures cost no read in later passes, and the census reads current-head checks
 through batched rollup queries (site `graphql query checkRollup0`) instead of
 two REST reads per head.
+
+The steward can read GitHub in process instead of through `gh`. This release
+ships it off: the default is `[github.reads] transport = "gh"`. m3 opts in as
+the canary with `transport = "inproc"` in its machine-global config. The
+default flips to `inproc` only after canary passes show `api_calls.fallbacks`
+empty and a re-run of `runner steward-read-probe` matches gh on every answer.
+A `gh` read runs the
+whole `ghapp` chain (about ten processes, 1.4 to 5.5 s, and 15 s timeouts when
+the host stalls); in process, Shipyard mints the App installation token itself
+from the machine-global `[github.auth] token_command` (same App, key and
+per-repository installation the wrapper uses), caches it until five minutes
+before expiry, keeps HTTPS connections alive, revalidates repeated REST reads
+with their ETag, and retries only transport failures and 5xx with jittered
+backoff inside the call's timeout. Only reads move: `gh api repos/...` with no
+flags, a read-only `gh api graphql` query, and `gh pr view --json` for the
+steward's field set, each printed exactly as `gh` would print it. Every write,
+every queue call and every other shape still runs `gh` and the wrapper's
+guards. Any landing request (`pr merge`, an arm or enqueue mutation, even a
+bare `gh api repos/O/R/pulls/N/merge`) is never answered in process.
+`api_calls.latency` gives p50/p90/max and timeouts per transport
+(`gh`, `inproc`); `api_calls.api_cost` gives requests, retries, `304` hits,
+token mints and the lowest rate-limit remaining per resource;
+`api_calls.rollup_batch` gives the adaptive rollup batch size (it grows by two
+while batches answer under 2.5 s and halves on a failure or a batch over 5 s,
+within 2 to 12, and is kept in `github-read-batch.json` in the state dir).
+A credential problem hands the read back to `gh` (and holds that repository
+on `gh` for a minute) and shows in `api_calls.fallbacks` as `in-process read ->
+gh`. A read whose caller set no timeout gets 60 s in process; a timeout is
+reported, never re-spent on `gh`. To force `gh` for every read,
+set `[github.reads] transport = "gh"` in the machine-global config (or leave
+it unset), or `SHIPYARD_GITHUB_READS=gh` for one process;
+`SHIPYARD_GITHUB_READS=inproc` opts one process in. `shipyard runner
+steward-read-probe --repo OWNER/REPO --pr N` times the hottest reads through
+both transports side by side and checks their output matches.
 A repository that makes the pass exit 1 also carries `exit_reasons`, one
 entry per cause (`repo_errors:N`, `pr_errors:#A,#B`, `cancellation_errors:<run ids>`,
 `rate_limited`, `uncertain_mutations`, or `unclassified`), so a non-zero exit
@@ -836,7 +893,8 @@ enforces it.
 **Your pull requests tell you when they change; do not poll them.**
 `shipyard pr` and `shipyard ship` register the pushing session (host, cmux
 surface, session) as the owner, in the state dir and as a `shipyard-owner:`
-marker in the PR body. `shipyard relay` (run on the steward host) sends that
+marker in the PR body (the session id is `sid=`, never `session=`: ghapp refuses
+any body comment containing that word as a possible reviewer stamp). `shipyard relay` (run on the steward host) sends that
 surface one line when the PR merges, closes, is ejected, gets a verdict at its
 head, goes required-red or green, conflicts after the base moved, gets a
 `repair-claim:`, or its stacked base merges, with the next step. After a
@@ -2746,7 +2804,7 @@ authoritative snapshot.
 | Treating a missing queue-job log or GitHub run as completion | `shipyard wait job sy-20260901-example --success --timeout 1200 --json` |
 | `while ! gh release view v0.23.0 --json assets -q '.assets\|length' \| grep -q '^5$'; do sleep 10; done` | `shipyard wait release v0.23.0 --timeout 900 --json` |
 | `gh pr checks 151 --watch` (blocking; no structured output) | `shipyard wait pr 151 --state green --timeout 1800 --json` |
-| Reading PR state yourself to decide whether you are blocked (stale head, missed HOLD, merged hours ago, advisory checks, merging main for BEHIND) | `shipyard wait pr 151 --state actionable --timeout 1800 --json`: the steward's own `blocked_on` plus `next_action` (`actor`, `action`, `stop`); exit 0 means act or stop, exit 1 means nothing is yours yet. Before declaring yourself blocked, run it; stop only on `stop: true`. |
+| Reading PR state yourself to decide whether you are blocked (stale head, missed HOLD, merged hours ago, advisory checks, merging main for BEHIND) | `shipyard wait pr 151 --state actionable --timeout 1800 --json`: the steward's own `blocked_on` plus `next_action` (`actor`, `action`, `stop`); exit 0 means act or stop, exit 1 means nothing is yours yet. Before declaring yourself blocked, run it; stop only on `stop: true`. Each tick is a full admission read on the shared App installation budget: run one wait per PR (never a loop of short waits), and expect the tick to back off from 120 to 600 s while nothing changes. `data.github_reads` in `--json` shows what the wait spent. |
 
 ### Detection gate (when to use it vs hand-rolled `gh`)
 

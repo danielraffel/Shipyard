@@ -541,6 +541,30 @@ pub(super) enum Command {
         #[command(subcommand)]
         command: RollupCommand,
     },
+    /// Pull requests that have sat in one blocked state past its dwell
+    /// limit, with the next action, owner and any act taken. Read-only.
+    ///
+    /// Reads the snapshot the merge steward's last `--apply` pass wrote
+    /// (`<state>/steward-dwell/<repo>.json`); never reads GitHub. Limits come
+    /// from `[auto_merge.dwell]` in the base's `.shipyard/config.toml`.
+    /// Without `--repo`, every repository the steward wrote a snapshot for.
+    Overdue {
+        /// Exact OWNER/REPO.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+    },
+    /// The pull requests closest to mergeable, in the order the merge
+    /// steward admits them, with the single action each needs. Read-only.
+    ///
+    /// Approved stack bases first, then approved and green, approved with
+    /// checks running, green but needing a review, then the rest; within a
+    /// tier, more unblocked pull requests first. Reads the steward's last
+    /// snapshot; never reads GitHub.
+    Next {
+        /// Exact OWNER/REPO.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+    },
     /// Which host and agent session armed, enqueued, merged or removed a
     /// pull request. Read-only.
     ///
@@ -3207,6 +3231,24 @@ pub(super) enum RunnerCommand {
         #[arg(long = "ledger", hide = true)]
         ledger: Option<PathBuf>,
     },
+    /// Time the steward's hottest GitHub reads through `gh` and in process,
+    /// side by side, and check that both paths print the same JSON. Read-only;
+    /// prints latency and parity, never response bodies.
+    #[command(name = "steward-read-probe", hide = true)]
+    StewardReadProbe {
+        /// Exact OWNER/REPO.
+        #[arg(long)]
+        repo: String,
+        /// An open pull request to read.
+        #[arg(long)]
+        pr: u64,
+        /// Base branch for the merge-queue read.
+        #[arg(long, default_value = "main")]
+        base: String,
+        /// Rounds; each round makes every read once per transport.
+        #[arg(long, default_value_t = 5)]
+        rounds: u32,
+    },
     /// Plan, and optionally apply, the unattended carrier's mechanical
     /// actions on armed, approved pull requests: rerun a cancelled required
     /// run, re-arm a head the queue removed because its batch starved, and
@@ -4262,7 +4304,8 @@ pub(super) enum WaitCommand {
         timeout: f64,
         /// Authoritative snapshot reconciliation cadence. Defaults to 30
         /// seconds, or 120 for `--state actionable`, whose snapshot is a
-        /// full admission read.
+        /// full admission read; an actionable wait doubles its cadence while
+        /// the classification is unchanged, up to 600 seconds.
         #[arg(long = "poll-interval")]
         poll_interval: Option<f64>,
         /// Fail with exit 6 rather than polling after the first snapshot miss.

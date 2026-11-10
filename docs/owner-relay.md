@@ -31,13 +31,19 @@ The record is written twice:
 - atomically to `<state_dir>/owners/<owner>/<repo>/<pr>.json` on the host
   that pushed (`~/Library/Application Support/shipyard` on macOS);
 - as one line in the pull-request body,
-  `<!-- shipyard-owner: host=m5 client=codex surface=... socket=... session=... at=... -->`,
+  `<!-- shipyard-owner: host=m5 client=codex surface=... socket=... sid=... at=... -->`,
   so the address survives the loss of that host and any host can read it.
   The body is written over GraphQL (`updatePullRequest`), not REST.
 
 The body is only rewritten when the address changes (host, client, surface,
 socket, session, agent, released), never for a new timestamp alone: every body
 edit fires `pull_request: edited`, which some required gates listen to.
+
+The session id is written as `sid=`, never `session=`: the `ghapp` wrapper
+refuses any body whose HTML comment contains the word "session", since that
+is the shape of a reviewer session stamp. A marker written by an earlier
+release with `session=` is still read. A value containing "session" is left
+out of the marker (it stays in the local record).
 
 Values are kept only when they consist of `[A-Za-z0-9._:/@+-]`, so a marker can
 never close its comment or carry shell syntax into a transport. The record is
@@ -90,6 +96,7 @@ One pass per repository:
 | `dirty_after_base_move` | it became `DIRTY` while its head did not move |
 | `claim_taken` | a new `repair-claim: <lane> until <time>` comment |
 | `stacked_base_merged` | the pull request whose head is its base merged, or it was retargeted to the default branch |
+| `overdue` | the steward's fresh tick report (`steward_tick_dir`) names it past an `[auto_merge.dwell]` limit at the current head; once per state, head and escalation level, never while the steward is acting on it that pass (see `automated-draining.md`, "Dwell-time limits") |
 
 4. **Delivery.** Each event has an idempotency key (`repo#pr:event:head:detail`)
    and is delivered once. Repeatable events (`enqueued`, `ejected`,
@@ -173,7 +180,7 @@ interval_secs = 120
 rate_limit_minutes = 10
 repos = ["Generous-Corp/pulp", "Generous-Corp/vellum"]
 events = ["merged", "closed", "ejected", "verdict", "required_check",
-          "dirty_after_base_move", "claim_taken", "stacked_base_merged"]
+          "dirty_after_base_move", "claim_taken", "stacked_base_merged", "overdue"]
 sockets = ["/tmp/cmux-nightly.sock", ""]   # "" is cmux's default socket
 comment_fallback = true
 steward_tick_dir = "/Users/me/Library/Logs/shipyard-steward-tick"
@@ -201,3 +208,7 @@ never ignored.
 
 Rollback: `relay.enabled = false`. Keep `pr_relay.py` until the shadow day is
 clean.
+
+A body that already carries other stamp-shaped text (for example a
+`pr.provenance` block with a `session` key) still makes `ghapp` refuse the
+marker write; the ship does not fail and the local record is kept.

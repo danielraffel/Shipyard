@@ -129,6 +129,9 @@ pub mod gh;
 pub mod gh_pass;
 /// Install and audit the `ghapp` wrapper's optional queue guards.
 pub mod ghapp_guards;
+/// GitHub reads answered in process: App token mint and cache, kept-alive
+/// HTTPS, conditional reads and bounded retries.
+pub mod github_read;
 /// Branch governance profiles and GitHub branch-protection helpers.
 pub mod governance;
 /// Arm native auto-merge only on a head a reviewer approved.

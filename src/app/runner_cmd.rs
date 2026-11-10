@@ -479,9 +479,22 @@ fn runner_command_with_actions<W: Write>(
             cwd,
             mode,
             runtime_paths,
-            actions,
+            &actions
+                .clone()
+                .with_inproc_reads(crate::github_read::for_steward(
+                    config,
+                    &runtime_paths.state_dir,
+                )),
             json,
             stdout,
+        ),
+        RunnerCommand::StewardReadProbe {
+            repo,
+            pr,
+            base,
+            rounds,
+        } => super::merge_steward_cmd::read_probe::read_probe_command(
+            config, cwd, &repo, pr, &base, rounds, stdout,
         ),
         RunnerCommand::Carrier {
             repo,

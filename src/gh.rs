@@ -212,6 +212,17 @@ impl GhClient {
         executables
     }
 
+    /// The configured `token_command` argv, when auth comes from a command.
+    /// In-process reads derive their App credential from it, so they use the
+    /// same App and key the `ghapp` wrapper resolves through
+    /// `shipyard auth helper-argv`.
+    pub(crate) fn command_token_argv(&self) -> Option<&[String]> {
+        match &self.auth.source {
+            GhAuthSource::Command { token_command, .. } => Some(token_command),
+            _ => None,
+        }
+    }
+
     /// Build a client that uses ambient `gh` auth.
     #[must_use]
     pub fn ambient() -> Self {

@@ -2480,6 +2480,7 @@ echo "unexpected: $*" >&2; exit 90
     candidate.fact.number = 3;
     let order = crate::app::merge_steward_cmd::pass_budget::processing_order(
         "Owner/Repo",
+        "main",
         &[first, carried, candidate],
         &[
             StewardDecision::Draft,

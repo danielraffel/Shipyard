@@ -42,6 +42,29 @@ PR. Fleet-pass verifies the named parent and head only when deciding whether to
 retarget; a forged, stale, closed, or unreadable parent is reported and never
 retargeted automatically.
 
+## Overdue pull requests and what lands next: `shipyard overdue`, `shipyard next`
+
+Before guessing what to work on, read the steward's own answer:
+`shipyard next [--repo R] [--json]` lists the five pull requests closest to
+mergeable (stack bases first, then approved green, approved pending, green
+needing review; a stack base must itself be approved to rank first), each
+with the single thing it needs; `shipyard overdue`
+lists every pull request past its `[auto_merge.dwell]` limit with its owner
+route and any act taken. Both read the snapshot the steward's last `--apply`
+pass wrote and print its age; neither costs GitHub API budget. The steward
+takes only contract-allowed acts (re-run a stale `review-verdict` after a live
+gate read, dispatch a never-ran required check from the base's
+`[auto_merge.dwell.dispatch]` map, evaluate an overstayed approved head first,
+retarget a stack whose parent merged from its exact base branch), each after a
+live re-read of the pull request, at most three per pass, once per pull
+request, state and head, and ships them in `shadow` until the base sets
+`act = "apply"`. It never
+touches a DIRTY or held head and never arms. Gotcha: stacked pull requests are
+seen only through the open-pull-request listing the carried-commit check reads
+in the same pass, so a pass with no admission candidate holds stacked entries
+(`stack_listing: not_read_this_pass`) rather than reading GitHub again. Full
+reference: `docs/automated-draining.md`, "Dwell-time limits".
+
 ## Durable work-item contract
 
 Shipyard's existing ShipState/lease/receipt primitives are the source of
@@ -263,6 +286,35 @@ the cache key lowercases the slug (the helper still receives the caller's
 spelling), and `shipyard wait` event filters compare the payload's
 `owner/Repo` case-insensitively, so a lowercased remote still wakes on its
 webhook events.
+
+## Steward reads mint their own token and never spawn `gh`
+
+Off by default (`[github.reads] transport = "gh"`). m3 canaries it with
+`transport = "inproc"` in its machine-global config. The default flips once
+canary passes show `api_calls.fallbacks` empty and the read probe matches.
+When on, the steward's reads (`src/github_read`) do not spawn `gh`, so the `ghapp`
+wrapper never re-mints for them. Shipyard parses the canonical
+`[github.auth] token_command` (`[WRAPPER, "token", "--app-id", ID,
+"--private-key", PATH, "--repo", "{repo_slug}"]`, optional
+`--scope-repository`). Any other shape keeps every read on `gh`. It checks the
+key exactly as the helper does: a regular file, mode 0600, owned by the user,
+in a 0700 directory. It signs the App JWT in process, looks up
+`repos/R/installation`, and mints. The token stays in memory (`Zeroizing`,
+with `Debug` redacted) until 5 minutes before it expires. A 401 re-mints once.
+A refused credential sends that repository's reads to `gh` for 60 s.
+Gotchas:
+
+- Parity is gh's *printed* shape, not GitHub's. For `pr view`, a bot author
+  is `app/<login>` and a pending check has conclusion `""` and completedAt
+  `0001-01-01T00:00:00Z`. A status context reports `startedAt`, and a head
+  with no checks is `[]`. Changing a field set in a steward `pr view` means
+  adding it to `PrField`, or that read silently goes back to `gh`.
+- A new steward read is in process only if it is a bare `gh api repos/...`, a
+  read-only `gh api graphql`, or a supported `pr view`. Adding `--jq`,
+  `--paginate` or `-H` sends it back through the wrapper chain. That is
+  correct, but it brings back the slow path.
+- `runner steward-read-probe --repo R --pr N` is the parity and latency check
+  to run after touching any of this.
 
 ## The writer-domain lease, for tools outside Shipyard
 
@@ -4519,6 +4571,12 @@ retraction of one's own APPROVE posts with `SHIPYARD_VERDICT_RETRACT=1`. The
 steward reports such a row as `held` with `blocked_detail` "held head: needs
 a new head", which `shipyard wait pr --state actionable` prints.
 
+`wait pr --state actionable` spends a full admission read per tick on the
+shared App installation budget. It backs off from 120 to 600 s while the
+classification is unchanged, shares the host's admission read cache, and
+reports its spend as `data.github_reads` in `--json`. Concurrent agent waits
+drained that budget before the backoff; keep to one wait per PR.
+
 Every rule above judges comments posted through the shared fleet App, which
 every agent can use, so none of it is proof of who reviewed. A base with
 `[auto_merge] approval_source = "guard"` and `guard_app_id = <id>` takes
@@ -5912,3 +5970,8 @@ validation failures are not retried. Deadline-bound observations retain their
 existing deadline. An enqueue mutation returning HTTP 502 has an unknown
 outcome: read back the live queue before reconciliation; these read retries do
 not authorize repeating an enqueue.
+
+The PR owner marker (`<!-- shipyard-owner: ... sid=<id> ... -->`) writes the
+session id as `sid=`, never `session=`: the ghapp stamp guard refuses any body
+comment containing the word "session" as a possible reviewer stamp. Readers
+still accept the legacy `session=` key.

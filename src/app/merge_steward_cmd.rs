@@ -165,6 +165,10 @@ struct RepoReport {
     /// was healthy, so a non-zero exit with empty `errors` is explained here.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     exit_reasons: Vec<String>,
+    /// Dwell-time limits, overdue pull requests and the next-to-admit
+    /// ranking ([`dwell_pass`]). Absent when the repository was not observed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dwell: Option<dwell_pass::DwellRepoReport>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -217,6 +221,11 @@ struct StewardLedger {
     /// keyed by credential-scope hash plus lowercase repository.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     rate_limit_cooldowns: BTreeMap<String, pass_budget::RateLimitCooldown>,
+    /// How long each open pull request has been in its blocked state, the
+    /// acts taken and the last ranking, keyed by lowercase repository. See
+    /// `dwell_pass`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    dwell: BTreeMap<String, crate::merge_steward::dwell::DwellRepoState>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1454,6 +1463,43 @@ fn steward_repo(
         recovery_cancellations,
     );
     report.api_calls = Some(pass.report());
+    if let (Some(api_calls), Some(sizer)) = (
+        report.api_calls.as_mut(),
+        actions
+            .inproc_reads()
+            .and_then(crate::github_read::InprocReads::batch),
+    ) {
+        // A dry run reports the next size but leaves the live steward's state.
+        let next = if pass_args.apply {
+            sizer.save().unwrap_or_else(|error| {
+                api_calls.fallbacks.push(crate::gh_pass::FallbackReport {
+                    reason: "rollup batch size not saved".to_owned(),
+                    count: 1,
+                    last_detail: error,
+                });
+                sizer.next_size()
+            })
+        } else {
+            sizer.next_size()
+        };
+        api_calls.rollup_batch = Some(crate::gh_pass::RollupBatchReport {
+            heads_per_query: sizer.size(),
+            next_heads_per_query: next,
+        });
+    }
+    if pass_args.apply
+        && let (Some(control), Some(dwell)) = (mutation_control, report.dwell.as_mut())
+        && let Err(error) = dwell_pass::write_snapshot(
+            &control.state_dir,
+            &report.repo,
+            &report.base,
+            dwell,
+            report.api_calls.as_ref(),
+            Utc::now(),
+        )
+    {
+        dwell.errors.push(error);
+    }
     if unhealthy {
         report.exit_reasons = exit_reasons(&report);
     }
@@ -1661,6 +1707,7 @@ fn deferred_rate_limit_repo_report(
         api_calls: None,
         rate_limit_deferred: Some(cooldown),
         exit_reasons: Vec::new(),
+        dwell: None,
     }
 }
 
@@ -1688,6 +1735,7 @@ fn unreadable_repo_report(
         errors: vec![error],
         rate_limit_deferred: None,
         exit_reasons: Vec::new(),
+        dwell: None,
     }
 }
 
@@ -1765,6 +1813,7 @@ fn append_unmatched_recovery_errors(
             errors,
             rate_limit_deferred: None,
             exit_reasons: Vec::new(),
+            dwell: None,
         });
     }
 }
@@ -1802,6 +1851,7 @@ fn persist_final_ledger(
             errors: vec![message],
             rate_limit_deferred: None,
             exit_reasons: Vec::new(),
+            dwell: None,
         });
     }
 }
@@ -1919,6 +1969,7 @@ mod cancellation_terminalization;
 mod capacity_cancellation;
 mod carried_commits;
 mod code_owner_wait;
+pub(super) mod dwell_pass;
 mod exact_head_merge;
 mod generated_paths;
 mod head_rollup;
@@ -1931,6 +1982,7 @@ mod pass_budget;
 mod pr_mutations;
 pub(super) mod queue_drain;
 mod queue_priority_recovery;
+pub(super) mod read_probe;
 mod render;
 mod resume_record;
 mod terminal_handoff;
