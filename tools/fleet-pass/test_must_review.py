@@ -397,5 +397,17 @@ class ApiBudget(unittest.TestCase):
                 mr.fetch_prs("o/r")
 
 
+class ReviewScope(unittest.TestCase):
+    def test_every_review_required_repository_gets_a_reviewer_pass(self):
+        # A repository whose landing needs an exact-head APPROVE but that the
+        # reviewer pass never lists would wait forever for a verdict.
+        import re
+        source = open(os.path.join(HERE, "..", "..", "src", "head_approval.rs"), encoding="utf-8").read()
+        block = source.split("pub const REVIEW_REQUIRED_REPOS", 1)[1].split("];", 1)[0]
+        required = set(re.findall(r'"([^"]+)"', block))
+        self.assertIn("danielraffel/fleet-handbook", required)
+        self.assertLessEqual({r.lower() for r in required}, {r.lower() for r in mr.REPOS})
+
+
 if __name__ == "__main__":
     unittest.main()

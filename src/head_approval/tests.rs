@@ -735,6 +735,114 @@ fn a_listed_repository_requires_review_only_on_a_host_that_turns_it_on() {
 }
 
 #[test]
+fn the_handbook_requires_review_and_counts_the_fleet_app_verdict_on_its_own_pr() {
+    let policy = by_default("danielraffel/fleet-handbook");
+    assert!(policy.required);
+    assert!(policy.any_reviewer_but_author);
+    // The handbook's pull requests are opened by the fleet App, and so is its
+    // reviewer's verdict: the App's APPROVE counts on an App-authored PR.
+    let approve = [fleet(
+        "2026-10-12T01:00:00Z",
+        &format!("verdict: APPROVE head:{HEAD}"),
+    )];
+    assert!(allows(&policy, &approve, Some("shipyard-local[bot]")));
+    // Only the exact slug is listed, case-blind.
+    assert!(by_default("DanielRaffel/Fleet-Handbook").required);
+    for near in [
+        "danielraffel/fleet-handbook-staging",
+        "someone/fleet-handbook",
+        "danielraffel/fleet",
+    ] {
+        assert_eq!(by_default(near), ApprovalPolicy::default(), "{near}");
+    }
+}
+
+/// The handbook's base config once it drops `arm_requires_head_approval`
+/// (it keeps `reviewer_signers` and `reviewer_stamp_sessions`): the list
+/// default applies, and the base's own signer and session rules still bind
+/// the fleet App's verdict, so an author lane's APPROVE on its own PR does not
+/// count while the scheduled reviewer run's does.
+#[test]
+fn the_handbook_base_keeps_its_signer_and_session_rules_under_the_list_default() {
+    const SILENT: &str = "[auto_merge]\n\
+         reviewer_signers = [\"pulp-review\", \"infra-review2\"]\n\
+         reviewer_stamp_sessions = [\"fleet-pass-reviewer-*\"]\n";
+    let table: toml::Table = SILENT.parse().expect("toml");
+    let mut policy =
+        ApprovalPolicy::from_table_for_repo(&table, "danielraffel/fleet-handbook", true);
+    assert!(policy.required);
+    assert!(policy.any_reviewer_but_author);
+    assert!(policy.validate().is_ok());
+    let reviewer = fleet(
+        "2026-11-09T01:00:00Z",
+        &format!(
+            "Reviewed.\n\nreviewer: infra-review2\n\
+             <!-- session: Daniels-Mac-Studio-m3/fleet-pass-reviewer-m3-20261109T010000Z-1 agent: infra-review2 -->\n\
+             verdict: APPROVE head:{HEAD}\n"
+        ),
+    );
+    let author_lane = fleet(
+        "2026-11-09T01:00:00Z",
+        &format!(
+            "Looks good.\n\nreviewer: infra-review2\n\
+             <!-- session: Daniels-Mac-Studio-m3/01a18030-f638-7010-94b9-2198e940232f agent: author -->\n\
+             verdict: APPROVE head:{HEAD}\n"
+        ),
+    );
+    let unsigned = fleet(
+        "2026-11-09T01:00:00Z",
+        &format!(
+            "<!-- session: Daniels-Mac-Studio-m3/fleet-pass-reviewer-m3-20261109T010000Z-1 -->\n\
+             verdict: APPROVE head:{HEAD}\n"
+        ),
+    );
+    let hold = fleet(
+        "2026-11-09T02:00:00Z",
+        &format!(
+            "<!-- session: Daniels-Mac-Studio-m3/01a18030-f638-7010-94b9-2198e940232f -->\n\
+             verdict: HOLD head:{HEAD}\n"
+        ),
+    );
+    super::with_host_sessions(None, || {
+        for source in [super::SignerSource::Host, super::SignerSource::Base] {
+            policy.signer_source = source;
+            assert!(
+                gate_on(&policy, HEAD, std::slice::from_ref(&reviewer)).allows(),
+                "{source:?}"
+            );
+            assert!(
+                !gate_on(&policy, HEAD, std::slice::from_ref(&author_lane)).allows(),
+                "{source:?}"
+            );
+            assert!(
+                !gate_on(&policy, HEAD, std::slice::from_ref(&unsigned)).allows(),
+                "{source:?}"
+            );
+            assert!(
+                !gate_on(&policy, HEAD, &[reviewer.clone(), hold.clone()]).allows(),
+                "{source:?}"
+            );
+        }
+    });
+    // A host that opted out does not apply the list: nothing is required, so
+    // the steward's approved-heads-only merge path refuses rather than merging.
+    assert!(
+        !ApprovalPolicy::from_table_for_repo(&table, "danielraffel/fleet-handbook", false).required
+    );
+    // Setting the key, even to true, selects the strict rule: the fleet App's
+    // verdict never counts there, which is why the handbook must drop it.
+    let keyed: toml::Table = format!("{SILENT}arm_requires_head_approval = true\n")
+        .parse()
+        .expect("toml");
+    let strict = ApprovalPolicy::from_table_for_repo(&keyed, "danielraffel/fleet-handbook", true);
+    assert!(strict.required);
+    assert!(!strict.any_reviewer_but_author);
+    super::with_host_sessions(None, || {
+        assert!(!gate_on(&strict, HEAD, std::slice::from_ref(&reviewer)).allows());
+    });
+}
+
+#[test]
 fn a_config_that_sets_the_key_decides_over_the_default() {
     let off: toml::Table = "[auto_merge]\narm_requires_head_approval = false\n"
         .parse()

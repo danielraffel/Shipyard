@@ -4481,7 +4481,7 @@ and every marked mutation carry a fresh one-shot nonce, and a Shipyard process
 that inherits the marker, the review-only switch, a nonce variable or a
 `GHAPP_ALLOW_*` override re-executes itself without them, so nothing it
 spawns carries them. A repository whose base sets `[auto_merge]
-arm_requires_head_approval = true` (the default for pulp, vellum, tartci and
+arm_requires_head_approval = true` (the default for pulp, vellum, fleet-handbook, tartci and
 Shipyard when their base is silent, on every host unless it has a
 `review-before-arm.opt-out` file, written with a reason by
 `guards install --opt-out-review-before-arm "<reason>"` and logged to

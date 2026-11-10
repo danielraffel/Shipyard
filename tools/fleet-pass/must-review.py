@@ -32,7 +32,8 @@ be read, so the runner never mistakes a failed read for "nothing to do".
 """
 import datetime, json, os, re, subprocess, sys
 
-REPOS = ["Generous-Corp/pulp", "Generous-Corp/vellum", "danielraffel/Shipyard", "danielraffel/tartci"]
+REPOS = ["Generous-Corp/pulp", "Generous-Corp/vellum", "danielraffel/Shipyard", "danielraffel/tartci",
+         "danielraffel/fleet-handbook"]
 HOLD_LABELS = {"owner-decision", "superseded"}
 # Statuses that wait on a review cannot gate the review itself.
 SELF = {"review-verdict", "post-review-verdict", "release-path-review"}

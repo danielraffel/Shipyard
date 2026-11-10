@@ -4363,12 +4363,19 @@ class ReviewIdentity(unittest.TestCase):
         self.assertFalse(guard.review_policy(None, "Generous-Corp/pulp", False)["required"])
         self.assertTrue(guard.review_policy(None, "Generous-Corp/pulp", True)["required"])
 
+    def test_the_handbook_is_review_required_by_default_case_blind(self) -> None:
+        for slug in ("danielraffel/fleet-handbook", "DanielRaffel/Fleet-Handbook"):
+            policy = guard.review_policy(None, slug, True)
+            self.assertTrue(policy["required"], slug)
+            self.assertTrue(policy["any_but_author"], slug)
+        self.assertFalse(guard.review_policy(None, "danielraffel/fleet-handbook", False)["required"])
+
     def test_the_default_repositories_match_the_rust_list(self) -> None:
         source = (SCRIPT.parent.parent / "src" / "head_approval.rs").read_text(encoding="utf-8")
         block = source.split("pub const REVIEW_REQUIRED_REPOS", 1)[1].split("];", 1)[0]
         rust = tuple(re.findall(r'"([^"]+)"', block))
         self.assertEqual(rust, guard.REVIEW_REQUIRED_REPOS)
-        self.assertEqual(len(rust), 4)
+        self.assertEqual(len(rust), 5)
         trusted = source.split("pub const TRUSTED_ASSOCIATIONS", 1)[1].split("];", 1)[0]
         self.assertEqual(tuple(re.findall(r'"([^"]+)"', trusted)), guard.TRUSTED_ASSOCIATIONS)
 
