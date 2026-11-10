@@ -185,10 +185,7 @@ fn signatures(
             .map(str::to_owned)
             .collect());
     }
-    let log = gh.raw(&[
-        "api".to_owned(),
-        format!("repos/{repo}/actions/jobs/{job}/logs"),
-    ])?;
+    let log = cache.job_log(&|args: &[String]| gh.raw(args), repo, job)?;
     let found = failure_signatures(&log);
     cache.put(
         &key,

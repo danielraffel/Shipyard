@@ -56,6 +56,8 @@ pub struct ReadCache {
     /// Set once a write could not take the lease; later writes are skipped
     /// rather than each waiting out the lease timeout again.
     writes_refused: AtomicBool,
+    /// Job-log reads: their own disk cache and fetch budgets.
+    job_logs: crate::job_logs::JobLogPass,
 }
 
 impl Default for ReadCache {
@@ -66,6 +68,7 @@ impl Default for ReadCache {
             cached: AtomicU64::new(0),
             lease: acquire_for_protected_path,
             writes_refused: AtomicBool::new(false),
+            job_logs: crate::job_logs::JobLogPass::default(),
         }
     }
 }
@@ -115,6 +118,34 @@ impl ReadCache {
         (self.lease)(path).map_err(|_| {
             self.writes_refused.store(true, Ordering::Relaxed);
         })
+    }
+
+    /// Read job logs through `job_logs` (its disk cache and budgets) instead
+    /// of the default uncached, default-budget pass.
+    #[must_use]
+    pub fn with_job_logs(mut self, job_logs: crate::job_logs::JobLogPass) -> Self {
+        self.job_logs = job_logs;
+        self
+    }
+
+    /// The log of completed job `job_id`, through this report's job-log pass:
+    /// served from its disk cache when present, and otherwise fetched only
+    /// while the pass and per-minute budgets allow.
+    ///
+    /// # Errors
+    /// The read failed, or a budget deferred it
+    /// ([`crate::job_logs::is_deferred`]).
+    pub fn job_log(
+        &self,
+        gh: &crate::job_logs::Reader<'_>,
+        repo: &str, job_id: u64) -> Result<String, String> {
+        self.job_logs.read(gh, repo, job_id)
+    }
+
+    /// Where this report's job-log reads came from.
+    #[must_use]
+    pub fn job_log_stats(&self) -> crate::job_logs::JobLogStats {
+        self.job_logs.stats()
     }
 
     /// Record one request sent to GitHub.

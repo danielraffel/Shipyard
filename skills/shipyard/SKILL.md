@@ -552,6 +552,20 @@ file, or a committed overlay). Merged config would let the machine-global file
 or Pulp's untracked overlay turn off Pulp's gates with nothing changing in
 Pulp, so a `pr_gates` set there is refused with exit 2, as is an opt-out in a
 repository whose gate scripts resolve.
+## Job-log reads
+
+Read an Actions job log with `ReadCache::job_log` (or a
+`crate::job_logs::JobLogPass`), never a bare `gh api .../jobs/{id}/logs`, in
+any path that can read more than a handful of logs. It serves completed jobs'
+logs from `<state>/job-logs/`, sends at most `[github.job_logs]
+max_fetches_per_pass` requests per pass and `max_fetches_per_minute` per
+process, and returns a deferral (`crate::job_logs::is_deferred`) past either;
+report a deferral as a gap, not as an unreadable log. An uncapped walk over a
+window's failed jobs has spent hundreds of requests in one pass on the shared
+installation. A cache write that cannot take the writer-domain lease skips that
+one write only: never latch caching off for the rest of a pass, because every
+skipped write is a refetch next pass.
+
 ## Crash-safe state writes
 
 Write Shipyard state files (ship state, queue requests, receipts, holds) with
