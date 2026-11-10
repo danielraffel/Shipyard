@@ -339,6 +339,12 @@ jobs:
     # job withheld publication after a transient smoke failure.
     if: always() && startsWith(github.ref, 'refs/tags/v') && vars.CI_MACOS_SIGNING_ENABLED == 'true'
     runs-on: ${{ fromJSON(needs.resolve-runners.outputs.macos_arm64_runs_on_json) }}
+    # The `release` environment (deployment policy: tags v* only) gates this
+    # signing job to v* tags; the Developer ID P12 and notarization credentials
+    # are still repository secrets, which an environment job also receives. A tag push runs
+    # the tagged commit's own workflow, so the v* tag rulesets, not this file,
+    # are what keep an unmerged commit away from them.
+    environment: release
     # Backstop over the per-step timeouts below (toolchain 45 + identity 10 +
     # sign/notarize 115 + attestation 15 and its 2 min of backoff + publish 20),
     # so a stall can never hold the release draft for the 6-hour default. The
