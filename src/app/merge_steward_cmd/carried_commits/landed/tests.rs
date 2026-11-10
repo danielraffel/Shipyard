@@ -181,6 +181,17 @@ fn a_merge_whose_mode_differs_from_the_tip_is_refused() {
 }
 
 #[test]
+fn a_merge_with_the_tree_of_its_first_parent_is_refused() {
+    let mut fake = merge_fake("aaaa");
+    fake.commit(
+        MERGE,
+        FIRST_TREE,
+        &[FIRST, "7a00000000000000000000000000000000000000"],
+    );
+    assert_eq!(check(&fake, MERGE), Some(shares(MERGE)));
+}
+
+#[test]
 fn a_merge_that_removes_a_path_the_tip_still_has_is_refused() {
     let mut fake = merge_fake("aaaa");
     fake.tree(MERGE_TREE, &[("d", "040000", "tree", "dmerge")]);

@@ -173,6 +173,10 @@ impl<'a> Reader<'a> {
             [_] => self.patch_on_tip(sha, &commit, tip),
             [first, ..] => {
                 let first = self.commit(first)?;
+                // An empty diff proves nothing landed: fail closed.
+                if first.tree == commit.tree {
+                    return Ok(false);
+                }
                 self.merge_on_tip(&commit.tree, &first.tree, &tip.tree)
             }
         }
