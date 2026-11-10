@@ -735,6 +735,20 @@ fn a_listed_repository_requires_review_only_on_a_host_that_turns_it_on() {
 }
 
 #[test]
+fn the_handbook_requires_review_and_counts_the_fleet_app_verdict_on_its_own_pr() {
+    let policy = by_default("danielraffel/fleet-handbook");
+    assert!(policy.required);
+    assert!(policy.any_reviewer_but_author);
+    // The handbook's pull requests are opened by the fleet App, and so is its
+    // reviewer's verdict: the App's APPROVE counts on an App-authored PR.
+    let approve = [fleet(
+        "2026-10-12T01:00:00Z",
+        &format!("verdict: APPROVE head:{HEAD}"),
+    )];
+    assert!(allows(&policy, &approve, Some("shipyard-local[bot]")));
+}
+
+#[test]
 fn a_config_that_sets_the_key_decides_over_the_default() {
     let off: toml::Table = "[auto_merge]\narm_requires_head_approval = false\n"
         .parse()

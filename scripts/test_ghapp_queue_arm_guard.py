@@ -4368,7 +4368,7 @@ class ReviewIdentity(unittest.TestCase):
         block = source.split("pub const REVIEW_REQUIRED_REPOS", 1)[1].split("];", 1)[0]
         rust = tuple(re.findall(r'"([^"]+)"', block))
         self.assertEqual(rust, guard.REVIEW_REQUIRED_REPOS)
-        self.assertEqual(len(rust), 4)
+        self.assertEqual(len(rust), 5)
         trusted = source.split("pub const TRUSTED_ASSOCIATIONS", 1)[1].split("];", 1)[0]
         self.assertEqual(tuple(re.findall(r'"([^"]+)"', trusted)), guard.TRUSTED_ASSOCIATIONS)
 

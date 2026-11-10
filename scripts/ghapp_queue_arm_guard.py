@@ -172,6 +172,7 @@ MERGE_GROUP_ANCESTRY_PROBES = 3
 REVIEW_REQUIRED_REPOS = (
     "Generous-Corp/pulp",
     "Generous-Corp/vellum",
+    "danielraffel/fleet-handbook",
     "danielraffel/tartci",
     "danielraffel/Shipyard",
 )
