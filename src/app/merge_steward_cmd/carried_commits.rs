@@ -44,8 +44,9 @@
 //!   own approval; P's reviewer reviews X as P's diff.
 //! * A carried commit whose change is already on the base under other shas
 //!   (a merge that only re-applies landed content, a cherry-pick with the
-//!   base's patch-id): see [`landed`]. The steward proves it against the
-//!   base's tip; any doubt or read error keeps the refusal.
+//!   base's patch-id and matching changed entries): see [`landed`]. The
+//!   steward proves it against the base's pinned tip; any doubt or read error
+//!   keeps the refusal.
 //! * Commits already on the base: P's set comes from the compare API
 //!   `base...head`, which lists only commits the base does not have.
 //! * A base whose policy does not require head approval: there every head is

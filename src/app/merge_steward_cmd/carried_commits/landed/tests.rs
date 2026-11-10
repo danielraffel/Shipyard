@@ -1,5 +1,6 @@
 use std::cell::Cell;
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 
 use serde_json::json;
 
@@ -16,6 +17,8 @@ const PICK: &str = "7600000000000000000000000000000000000000";
 const MAIN_COPY: &str = "7700000000000000000000000000000000000000";
 const PARENT: &str = "7800000000000000000000000000000000000000";
 const Q_HEAD: &str = "7900000000000000000000000000000000000000";
+const PICK_TREE: &str = "7b00000000000000000000000000000000000000";
+const PARENT_TREE: &str = "7c00000000000000000000000000000000000000";
 
 /// An in-memory repository answering the reads `landed` makes, in the shape
 /// its `--jq` filters leave them.
@@ -203,20 +206,20 @@ fn a_merge_in_a_new_directory_is_compared_to_the_tips_directory() {
 const DIFF: &str = "diff --git a/a.rs b/a.rs\nindex 1111111..2222222 100644\n--- a/a.rs\n+++ b/a.rs\n@@ -3,1 +3,2 @@\n x\n+y\n";
 const DIFF_MOVED: &str = "diff --git a/a.rs b/a.rs\nindex 3333333..4444444 100644\n--- a/a.rs\n+++ b/a.rs\n@@ -90,1 +90,2 @@\n x\n+y\n";
 const DIFF_OTHER: &str = "diff --git a/a.rs b/a.rs\nindex 1111111..2222222 100644\n--- a/a.rs\n+++ b/a.rs\n@@ -3,1 +3,2 @@\n x\n+z\n";
+const DIFF_INDENTED: &str = "diff --git a/a.rs b/a.rs\nindex 1111111..2222222 100644\n--- a/a.rs\n+++ b/a.rs\n@@ -3,1 +3,2 @@\n x\n+    y\n";
 
 fn pick_fake(on_main: &str) -> Fake {
     let mut fake = Fake::default();
     fake.commit(TIP, TIP_TREE, &[PARENT]);
-    fake.commit(PICK, "7b00000000000000000000000000000000000000", &[PARENT]);
-    fake.commit(
-        MAIN_COPY,
-        "7c00000000000000000000000000000000000000",
-        &[PARENT],
-    );
+    fake.commit(PARENT, PARENT_TREE, &[]);
+    fake.commit(PICK, PICK_TREE, &[PARENT]);
+    fake.commit(MAIN_COPY, PICK_TREE, &[PARENT]);
     fake.diffs.insert(PICK.to_owned(), DIFF.to_owned());
     fake.diffs.insert(MAIN_COPY.to_owned(), on_main.to_owned());
     fake.tip_listing = vec![MAIN_COPY.to_owned()];
-    fake.tree(TIP_TREE, &[]);
+    fake.tree(TIP_TREE, &[("a.rs", "100644", "blob", "bbbb")]);
+    fake.tree(PICK_TREE, &[("a.rs", "100644", "blob", "bbbb")]);
+    fake.tree(PARENT_TREE, &[("a.rs", "100644", "blob", "aaaa")]);
     fake
 }
 
@@ -234,6 +237,31 @@ fn a_commit_whose_patch_differs_from_main_is_refused() {
 fn a_commit_with_no_equivalent_on_main_is_refused() {
     let mut fake = pick_fake(DIFF_MOVED);
     fake.tip_listing.clear();
+    assert_eq!(check(&fake, PICK), Some(shares(PICK)));
+}
+
+#[test]
+fn a_matching_change_reverted_from_the_tip_is_refused() {
+    let mut fake = pick_fake(DIFF_MOVED);
+    fake.tree(TIP_TREE, &[("a.rs", "100644", "blob", "aaaa")]);
+    assert_eq!(check(&fake, PICK), Some(shares(PICK)));
+}
+
+#[test]
+fn a_whitespace_only_patch_id_match_with_different_content_is_refused() {
+    let mut fake = pick_fake(DIFF_INDENTED);
+    fake.tree(TIP_TREE, &[("a.rs", "100644", "blob", "cccc")]);
+    assert_eq!(check(&fake, PICK), Some(shares(PICK)));
+}
+
+#[test]
+fn a_diff_at_githubs_file_cap_is_refused() {
+    let mut fake = pick_fake(DIFF_MOVED);
+    let mut diff = String::new();
+    for n in 0..super::MAX_DIFF_FILES {
+        writeln!(diff, "diff --git a/file{n} b/file{n}").expect("writing to a string");
+    }
+    fake.diffs.insert(PICK.to_owned(), diff);
     assert_eq!(check(&fake, PICK), Some(shares(PICK)));
 }
 

@@ -9,10 +9,11 @@
 //! pinned by sha. Nothing is taken from pull request metadata.
 //!
 //! * A non-merge commit is equivalent when its `git patch-id --stable` equals
-//!   that of a single-parent commit reachable from the tip. Candidates are the
-//!   tip's commits that touch the commit's first changed file since the
-//!   commit's author date (a cherry-pick or rebase keeps the author date), at
-//!   most [`MAX_PATCH_CANDIDATES`] of them.
+//!   that of a single-parent commit reachable from the tip and the candidate's
+//!   changed entries (mode, type and blob) are still identical on the pinned
+//!   tip. Candidates are the tip's commits that touch the commit's first
+//!   changed file since the commit's author date (a cherry-pick or rebase keeps
+//!   the author date), at most [`MAX_PATCH_CANDIDATES`] of them.
 //! * A merge commit is equivalent when every path it changes relative to its
 //!   first parent has, on the tip, an identical entry (mode, type and blob).
 //!   The changed paths come from a tree-to-tree walk of the merge against its
@@ -37,6 +38,9 @@ const MAX_PATCH_CANDIDATES: usize = 20;
 
 /// Most tree reads for one overlap.
 const MAX_TREE_READS: usize = 150;
+
+/// GitHub's commit diff endpoint can omit files at this cap.
+const MAX_DIFF_FILES: usize = 300;
 
 /// Deepest tree level walked.
 const MAX_DEPTH: usize = 40;
@@ -176,18 +180,29 @@ impl<'a> Reader<'a> {
 
     fn diff(&self, sha: &str) -> Result<String, String> {
         let repo = self.repo;
-        (self.run_gh)(&[
+        let diff = (self.run_gh)(&[
             "api".to_owned(),
             "-H".to_owned(),
             "Accept: application/vnd.github.diff".to_owned(),
             format!("repos/{repo}/commits/{sha}"),
         ])
-        .map_err(|error| format!("diff of {sha} unreadable: {error}"))
+        .map_err(|error| format!("diff of {sha} unreadable: {error}"))?;
+        if diff
+            .lines()
+            .filter(|line| line.starts_with("diff --git "))
+            .count()
+            >= MAX_DIFF_FILES
+        {
+            return Err(format!(
+                "diff of {sha} has at least {MAX_DIFF_FILES} files and may be truncated"
+            ));
+        }
+        Ok(diff)
     }
 
     /// A single-parent commit is on the tip when a tip commit has its
-    /// patch-id.
-    fn patch_on_tip(&self, sha: &str, commit: &Commit, tip: &Tip) -> Result<bool, String> {
+    /// patch-id and the matching change is still present on the pinned tip.
+    fn patch_on_tip(&mut self, sha: &str, commit: &Commit, tip: &Tip) -> Result<bool, String> {
         let diff = self.diff(sha)?;
         let Some(id) = crate::head_approval::patch_id(&diff)? else {
             return Ok(false);
@@ -217,7 +232,19 @@ impl<'a> Reader<'a> {
                 continue;
             }
             if crate::head_approval::patch_id(&self.diff(candidate)?)?.as_deref() == Some(&id) {
-                return Ok(true);
+                let candidate = self.commit(candidate)?;
+                let [parent] = candidate.parents.as_slice() else {
+                    return Err("a matching tip commit is not single-parent".to_owned());
+                };
+                let parent = self.commit(parent)?;
+                if self.same_as_tip(
+                    Some(&candidate.tree),
+                    Some(&parent.tree),
+                    Some(&tip.tree),
+                    0,
+                )? {
+                    return Ok(true);
+                }
             }
         }
         Ok(false)
