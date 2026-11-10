@@ -827,8 +827,7 @@ fn the_handbook_base_keeps_its_signer_and_session_rules_under_the_list_default()
     // A host that opted out does not apply the list: nothing is required, so
     // the steward's approved-heads-only merge path refuses rather than merging.
     assert!(
-        !ApprovalPolicy::from_table_for_repo(&table, "danielraffel/fleet-handbook", false)
-            .required
+        !ApprovalPolicy::from_table_for_repo(&table, "danielraffel/fleet-handbook", false).required
     );
     // Setting the key, even to true, selects the strict rule: the fleet App's
     // verdict never counts there, which is why the handbook must drop it.
