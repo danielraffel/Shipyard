@@ -387,14 +387,21 @@ fn the_policy_reads_its_table() {
 
     std::fs::write(
         root.path().join("config.toml"),
-        "[github.job_logs]\nmax_fetches_per_pass = -1\nadmission_auth = \"yes\"\n",
+        "[github.job_logs]\nmax_fetches_per_pass = -1\nadmission_auth = \"yes\"\n\
+         max_wait_seconds = 18446744073709551\n",
     )
     .expect("config");
     let config =
         LoadedConfig::load_machine_global_from_dir(root.path().to_path_buf()).expect("load");
     let (policy, warnings) = JobLogPolicy::from_config(&config);
-    assert_eq!(policy, JobLogPolicy::default());
-    assert_eq!(warnings.len(), 2, "{warnings:?}");
+    assert_eq!(
+        policy,
+        JobLogPolicy {
+            max_wait: MAX_WAIT_CEILING,
+            ..JobLogPolicy::default()
+        }
+    );
+    assert_eq!(warnings.len(), 3, "{warnings:?}");
 }
 
 #[test]

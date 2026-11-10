@@ -295,7 +295,14 @@ pub(super) fn landing_command<W: Write>(
                     .join(repo.replace('/', "__").to_ascii_lowercase()),
                 std::time::SystemTime::now(),
             )
-            .with_job_logs(crate::job_logs::JobLogPass::for_state_dir(&dir, &config).0)
+            .with_job_logs({
+                let (job_logs, warnings) =
+                    crate::job_logs::JobLogPass::for_state_dir(&dir, &config);
+                for warning in warnings {
+                    eprintln!("shipyard: {warning}");
+                }
+                job_logs
+            })
         });
         let report = pr_state::gather_cached(&actions, &repo, pr, environment_opt_in, &cache);
         if json {

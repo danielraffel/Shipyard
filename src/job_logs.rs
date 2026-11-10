@@ -60,6 +60,8 @@ const LOG_MAGIC: &str = "shipyard-job-log/v1";
 const MISSING_MAGIC: &str = "shipyard-job-log-missing/v1";
 /// Bound on taking the writer-domain lease for one cache write.
 const LEASE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Longest a read may be configured to wait for a per-minute slot.
+const MAX_WAIT_CEILING: Duration = Duration::from_mins(10);
 /// Longest a 404 is remembered (see [`JobLogPolicy::missing_ttl`]).
 pub const NOT_FOUND_TTL: Duration = Duration::from_hours(1);
 
@@ -155,6 +157,14 @@ impl JobLogPolicy {
                 defaults.cache_max_bytes / (1024 * 1024)
             ));
             cache_mb = defaults.cache_max_bytes / (1024 * 1024);
+        }
+        if wait_secs > MAX_WAIT_CEILING.as_secs() {
+            warnings.push(format!(
+                "[{TABLE}] max_wait_seconds is above {}; using {}",
+                MAX_WAIT_CEILING.as_secs(),
+                MAX_WAIT_CEILING.as_secs()
+            ));
+            wait_secs = MAX_WAIT_CEILING.as_secs();
         }
         if missing_hours.checked_mul(3600).is_none() {
             warnings.push(format!(

@@ -568,6 +568,12 @@ after a job completes, before its log is uploaded. `pr-watch --no-cache` and
 `--record` read every log unbudgeted, since a recording must hold every
 answer.
 
+The per-minute wait paces a pass: at the defaults one repository with a
+backlog can spend about three and a half minutes waiting for slots in a
+pass, so several such repositories can stretch a daemon pass past its
+fifteen-minute cadence. The next pass then starts when the running one ends;
+passes never overlap.
+
 `admission_auth = true` sends Generous-Corp log requests with the
 `[github.admission_auth]` credential above (its App is installed on
 Generous-Corp repositories only, and needs Actions read). That moves log reads
