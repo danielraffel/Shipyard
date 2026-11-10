@@ -101,8 +101,8 @@ APPROVE), P is refused with `blocked_on=carries_unapproved_commits:#Q`, and
 `blocked_detail` names the shared commits and why Q is not approved. Commits
 already on the base never count, nor does a shared commit whose change the base tip
 already has under other shas (a non-merge commit with the patch-id of a
-single-parent tip commit and whose changed entries still have an identical
-mode, type and blob on the pinned tip, or a merge whose every path differing
+single-parent tip commit, where both that commit's and the carried commit's own
+changed entries still have an identical mode, type and blob on the pinned tip, or a merge whose every path differing
 from its first parent has an identical mode, type and blob on the tip; proven
 by the steward against the tip, all shared commits must qualify, any doubt or
 read error, including a diff at GitHub's file cap, keeps the refusal), nor does

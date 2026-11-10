@@ -9,9 +9,9 @@
 //! pinned by sha. Nothing is taken from pull request metadata.
 //!
 //! * A non-merge commit is equivalent when its `git patch-id --stable` equals
-//!   that of a single-parent commit reachable from the tip and the candidate's
-//!   changed entries (mode, type and blob) are still identical on the pinned
-//!   tip. Candidates are the tip's commits that touch the commit's first
+//!   that of a single-parent commit reachable from the tip, and both the
+//!   candidate's and the carried commit's own changed entries (mode, type and
+//!   blob) are still identical on the pinned tip. Candidates are the tip's commits that touch the commit's first
 //!   changed file since the commit's author date (a cherry-pick or rebase keeps
 //!   the author date), at most [`MAX_PATCH_CANDIDATES`] of them.
 //! * A merge commit is equivalent when every path it changes relative to its
