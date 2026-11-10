@@ -107,7 +107,10 @@ from its first parent has an identical mode, type and blob on the tip; proven
 by the steward against the tip, all shared commits must qualify, any doubt or
 read error, including a diff at GitHub's file cap, keeps the refusal), nor does
 Q when it is P's own base-branch
-pull request, is stacked on P (following its base branch through other open
+pull request, targets the base but contains P's whole head (P's head is a
+proper ancestor of Q's head, so Q is above P and the shared commits are P's;
+an over-cap listing, equal heads, a diverged pair or an unreadable compare keep
+the refusal), is stacked on P (following its base branch through other open
 pull requests' head branches reaches P's head branch), only inherits the
 commit (a commit counts as Q's only if it is in Q's own diff against Q's own
 base branch), merged P's branch without being stacked on it, or is a Shipyard
