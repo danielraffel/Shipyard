@@ -210,6 +210,16 @@ impl<'a> Reader<'a> {
         let Some(path) = first_changed_path(&diff) else {
             return Ok(false);
         };
+        // The carried commit's own change, not only an equivalent commit's,
+        // must be what the tip has now: a patch-id match proves a similar
+        // patch landed once, not that this one is present.
+        let [parent] = commit.parents.as_slice() else {
+            return Ok(false);
+        };
+        let parent = self.commit(parent)?;
+        if !self.same_as_tip(Some(&commit.tree), Some(&parent.tree), Some(&tip.tree), 0)? {
+            return Ok(false);
+        }
         let repo = self.repo;
         let listed = self.json(
             &[

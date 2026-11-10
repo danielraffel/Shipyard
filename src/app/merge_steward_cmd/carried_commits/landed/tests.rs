@@ -18,6 +18,7 @@ const MAIN_COPY: &str = "7700000000000000000000000000000000000000";
 const PARENT: &str = "7800000000000000000000000000000000000000";
 const Q_HEAD: &str = "7900000000000000000000000000000000000000";
 const PICK_TREE: &str = "7b00000000000000000000000000000000000000";
+const MAIN_COPY_TREE: &str = "7d00000000000000000000000000000000000000";
 const PARENT_TREE: &str = "7c00000000000000000000000000000000000000";
 
 /// An in-memory repository answering the reads `landed` makes, in the shape
@@ -252,6 +253,37 @@ fn a_whitespace_only_patch_id_match_with_different_content_is_refused() {
     let mut fake = pick_fake(DIFF_INDENTED);
     fake.tree(TIP_TREE, &[("a.rs", "100644", "blob", "cccc")]);
     assert_eq!(check(&fake, PICK), Some(shares(PICK)));
+}
+
+#[test]
+fn a_carried_commit_whose_own_blob_differs_from_the_tip_is_refused() {
+    // The matched tip commit's change is still on the tip, but the carried
+    // commit produced a different blob (same stable patch-id).
+    let mut fake = pick_fake(DIFF_MOVED);
+    fake.tree(PICK_TREE, &[("a.rs", "100644", "blob", "dddd")]);
+    fake.commit(MAIN_COPY, MAIN_COPY_TREE, &[PARENT]);
+    fake.tree(MAIN_COPY_TREE, &[("a.rs", "100644", "blob", "bbbb")]);
+    assert_eq!(check(&fake, PICK), Some(shares(PICK)));
+}
+
+#[test]
+fn a_matched_change_overwritten_on_the_tip_is_refused() {
+    let mut fake = pick_fake(DIFF_MOVED);
+    fake.tree(TIP_TREE, &[("a.rs", "100644", "blob", "eeee")]);
+    assert_eq!(check(&fake, PICK), Some(shares(PICK)));
+}
+
+#[test]
+fn a_matched_change_still_present_on_the_tip_is_admitted() {
+    let mut fake = pick_fake(DIFF_MOVED);
+    fake.tree(
+        TIP_TREE,
+        &[
+            ("a.rs", "100644", "blob", "bbbb"),
+            ("other.rs", "100644", "blob", "ffff"),
+        ],
+    );
+    assert_eq!(check(&fake, PICK), None);
 }
 
 #[test]
