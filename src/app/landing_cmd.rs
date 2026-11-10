@@ -295,6 +295,7 @@ pub(super) fn landing_command<W: Write>(
                     .join(repo.replace('/', "__").to_ascii_lowercase()),
                 std::time::SystemTime::now(),
             )
+            .with_job_logs(crate::job_logs::JobLogPass::for_state_dir(&dir, &config).0)
         });
         let report = pr_state::gather_cached(&actions, &repo, pr, environment_opt_in, &cache);
         if json {

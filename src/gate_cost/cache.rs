@@ -138,8 +138,27 @@ impl ReadCache {
     pub fn job_log(
         &self,
         gh: &crate::job_logs::Reader<'_>,
-        repo: &str, job_id: u64) -> Result<String, String> {
+        repo: &str,
+        job_id: u64,
+    ) -> Result<String, String> {
         self.job_logs.read(gh, repo, job_id)
+    }
+
+    /// A job's log from the job-log disk cache only; never a request.
+    #[must_use]
+    pub fn job_log_cached(&self, repo: &str, job_id: u64) -> Option<Result<String, String>> {
+        self.job_logs.cached(repo, job_id)
+    }
+
+    /// Job-log requests this report may still send.
+    #[must_use]
+    pub fn job_log_fetches_left(&self) -> usize {
+        self.job_logs.fetches_left()
+    }
+
+    /// Count job-log reads the caller deferred past the budget.
+    pub fn note_job_logs_deferred(&self, count: usize) {
+        self.job_logs.note_deferred(count);
     }
 
     /// Where this report's job-log reads came from.

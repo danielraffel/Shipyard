@@ -576,6 +576,11 @@ fn fill_signatures(
             budget -= 1;
             match signatures(gh, cache, repo, check.id) {
                 Ok(found) => check.signatures = found,
+                // The job-log budget, like this function's own, skipped it.
+                Err(error) if crate::job_logs::is_deferred(&error) => {
+                    unreadable.insert(check.id);
+                    skipped += 1;
+                }
                 Err(error) => {
                     unreadable.insert(check.id);
                     gaps.push(format!("log of job {} unreadable: {error}", check.id));
@@ -1000,6 +1005,9 @@ fn shared_scan(
             }
             match signatures(gh, cache, scan.repo, job.id) {
                 Ok(found) => job.signatures = found,
+                Err(error) if crate::job_logs::is_deferred(&error) => {
+                    gaps.push(format!("log of job {} deferred: {error}", job.id));
+                }
                 Err(error) => gaps.push(format!("log of job {} unreadable: {error}", job.id)),
             }
             for sig in &job.signatures {

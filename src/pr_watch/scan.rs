@@ -905,12 +905,9 @@ fn daemon_job_logs(
     repo: &str,
     pass: &mut DaemonPass,
 ) -> crate::job_logs::JobLogPass {
-    let (policy, warnings) = crate::job_logs::JobLogPolicy::from_config(config);
+    let (job_logs, warnings) = crate::job_logs::JobLogPass::for_state_dir(state_dir, config);
     pass.warnings.extend(warnings);
-    let store = crate::job_logs::JobLogStore::open(&state_dir.join("job-logs"), &policy);
-    let admission = policy.admission_auth && admission_eligible(repo);
-    let job_logs = crate::job_logs::JobLogPass::new(store, policy);
-    if !admission {
+    if !(job_logs.policy().admission_auth && admission_eligible(repo)) {
         return job_logs;
     }
     match admission_log_reader(config, cwd, repo) {
@@ -950,7 +947,11 @@ fn admission_log_reader(
     let repo = repo.to_owned();
     Ok(Box::new(move |argv: &[String]| {
         actions
-            .run_gh_with_timeout_env(argv, StdDuration::from_mins(2), &[("GH_REPO", repo.as_str())])
+            .run_gh_with_timeout_env(
+                argv,
+                StdDuration::from_mins(2),
+                &[("GH_REPO", repo.as_str())],
+            )
             .map_err(|error| error.to_string())
     }))
 }

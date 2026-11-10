@@ -173,7 +173,7 @@ fn with_reader<T>(
                 Ok(answer)
             };
             // A recording must hold every answer, so it never reads the cache.
-            let cache = cache_for(runtime_paths, repo, *no_cache || record.is_some());
+            let cache = cache_for(runtime_paths, config, repo, *no_cache || record.is_some());
             read(&reader, &cache)
         }
     }
