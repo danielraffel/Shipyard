@@ -558,6 +558,11 @@ it unset), or `SHIPYARD_GITHUB_READS=gh` for one process;
 `SHIPYARD_GITHUB_READS=inproc` opts one process in. `shipyard runner
 steward-read-probe --repo OWNER/REPO --pr N` times the hottest reads through
 both transports side by side and checks their output matches.
+Job-log reads are budgeted separately by `[github.job_logs]` (per pass, per
+minute, and a disk cache of completed jobs' logs under `<state>/job-logs/`);
+a pr-watch gap `N failed job log(s) deferred by the [github.job_logs] fetch
+budget` is that cap working, and a later pass reads the rest. See
+`docs/github-app-quota.md#job-log-reads`.
 A repository that makes the pass exit 1 also carries `exit_reasons`, one
 entry per cause (`repo_errors:N`, `pr_errors:#A,#B`, `cancellation_errors:<run ids>`,
 `rate_limited`, `uncertain_mutations`, or `unclassified`), so a non-zero exit

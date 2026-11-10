@@ -375,9 +375,23 @@ pub(super) fn actions_for(
     }
 }
 
-pub(super) fn cache_for(runtime_paths: &RuntimePaths, repo: &str, no_cache: bool) -> ReadCache {
+/// The read cache for one command over `repo`. With `no_cache` nothing is
+/// served from disk and nothing is deferred, because a recording must hold
+/// every answer; otherwise job logs come through the `[github.job_logs]`
+/// disk cache and budgets.
+pub(super) fn cache_for(
+    runtime_paths: &RuntimePaths,
+    config: &LoadedConfig,
+    repo: &str,
+    no_cache: bool,
+) -> ReadCache {
     if no_cache {
         return ReadCache::disabled();
+    }
+    let (job_logs, warnings) =
+        crate::job_logs::JobLogPass::for_state_dir(&runtime_paths.state_dir, config);
+    for warning in warnings {
+        eprintln!("shipyard: {warning}");
     }
     ReadCache::open(
         &runtime_paths
@@ -387,6 +401,7 @@ pub(super) fn cache_for(runtime_paths: &RuntimePaths, repo: &str, no_cache: bool
             .join(repo.replace('/', "__").to_ascii_lowercase()),
         SystemTime::now(),
     )
+    .with_job_logs(job_logs)
 }
 
 fn scan_command<W: Write>(
@@ -450,7 +465,7 @@ fn scan_command<W: Write>(
     };
     let digest_argv = watch.digest_command.clone();
     let mut sender = |payload: &str| run_digest_command(&digest_argv, payload);
-    let cache = cache_for(runtime_paths, &repo, args.no_cache);
+    let cache = cache_for(runtime_paths, config, &repo, args.no_cache);
     let request = ScanRequest {
         repo,
         config: watch,
@@ -705,7 +720,12 @@ fn replay_command<W: Write>(
             Ok(answer)
         };
         // A recording must hold every answer, so it never reads the cache.
-        let cache = cache_for(runtime_paths, &repo, args.no_cache || args.record.is_some());
+        let cache = cache_for(
+            runtime_paths,
+            config,
+            &repo,
+            args.no_cache || args.record.is_some(),
+        );
         gather(&reader, &cache, &query, &watch.thresholds)
     }
     .map_err(|error| CliFailure::new(1, format!("pr-watch replay read failed: {error}")))?;

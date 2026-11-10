@@ -158,6 +158,8 @@ pub mod init_config;
 pub mod inspect;
 /// Job and target-result domain types used by executors and queues.
 pub mod job;
+/// Bounded, cached reads of GitHub Actions job logs.
+pub mod job_logs;
 pub mod landability;
 /// Reporting how work actually merges in a repository.
 pub mod landing;
