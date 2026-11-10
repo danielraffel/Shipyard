@@ -438,6 +438,9 @@ fn merge_queue_snapshot_with_deadline(
     Ok(snapshot)
 }
 
+/// One page of a base branch's merge queue.
+pub(super) const MERGE_QUEUE_QUERY: &str = "query($owner:String!,$name:String!,$branch:String!,$cursor:String){repository(owner:$owner,name:$name){mergeQueue(branch:$branch){entries(first:100,after:$cursor){nodes{position enqueuedAt headCommit{oid} pullRequest{number}} pageInfo{hasNextPage endCursor}}}}}";
+
 fn load_merge_queue_snapshot_once(
     actions: &GitHubActions,
     repo: &str,
@@ -451,7 +454,7 @@ fn load_merge_queue_snapshot_once(
     let (owner, name) = repo
         .split_once('/')
         .ok_or_else(|| format!("invalid repository slug `{repo}`"))?;
-    let query = "query($owner:String!,$name:String!,$branch:String!,$cursor:String){repository(owner:$owner,name:$name){mergeQueue(branch:$branch){entries(first:100,after:$cursor){nodes{position enqueuedAt headCommit{oid} pullRequest{number}} pageInfo{hasNextPage endCursor}}}}}";
+    let query = MERGE_QUEUE_QUERY;
     let mut positions = BTreeMap::new();
     let mut heads = BTreeMap::new();
     let mut enqueued = BTreeMap::new();
@@ -1065,10 +1068,19 @@ pub(super) fn hydrate_census_check_identities_with_history(
             None,
         )
     })?;
+    // The batch size follows measured rollup latency when the pass reads in
+    // process ([`crate::github_read::batch`]); otherwise it stays fixed.
+    let heads_per_query = actions
+        .inproc_reads()
+        .and_then(crate::github_read::InprocReads::batch)
+        .map_or(
+            super::head_rollup::HEADS_PER_QUERY,
+            crate::github_read::batch::BatchSizer::size,
+        );
     let mut batches: Vec<Vec<&mut ObservedPr>> = Vec::new();
     for pr in complete {
         match batches.last_mut() {
-            Some(batch) if batch.len() < super::head_rollup::HEADS_PER_QUERY => batch.push(pr),
+            Some(batch) if batch.len() < heads_per_query => batch.push(pr),
             _ => batches.push(vec![pr]),
         }
     }
@@ -1100,7 +1112,15 @@ fn hydrate_complete_head_checks_batch(
         .iter()
         .map(|pr| pr.fact.head_sha.clone())
         .collect::<Vec<_>>();
-    let rollups = match super::head_rollup::read_rollups(actions, repo, &heads, None) {
+    let started = Instant::now();
+    let read = super::head_rollup::read_rollups(actions, repo, &heads, None);
+    if let Some(sizer) = actions
+        .inproc_reads()
+        .and_then(crate::github_read::InprocReads::batch)
+    {
+        sizer.record(started.elapsed(), read.is_ok());
+    }
+    let rollups = match read {
         Ok(rollups) => rollups,
         // A spent rate limit is not cured by spending two REST reads per head
         // from the same installation; the pass defers instead.

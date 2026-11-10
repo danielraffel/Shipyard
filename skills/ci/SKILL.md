@@ -524,6 +524,40 @@ repository is diagnosed from a dry run's numbers, not by guessing. Published
 failures cost no read in later passes, and the census reads current-head checks
 through batched rollup queries (site `graphql query checkRollup0`) instead of
 two REST reads per head.
+
+The steward can read GitHub in process instead of through `gh`. This release
+ships it off: the default is `[github.reads] transport = "gh"`. m3 opts in as
+the canary with `transport = "inproc"` in its machine-global config. The
+default flips to `inproc` only after canary passes show `api_calls.fallbacks`
+empty and a re-run of `runner steward-read-probe` matches gh on every answer.
+A `gh` read runs the
+whole `ghapp` chain (about ten processes, 1.4 to 5.5 s, and 15 s timeouts when
+the host stalls); in process, Shipyard mints the App installation token itself
+from the machine-global `[github.auth] token_command` (same App, key and
+per-repository installation the wrapper uses), caches it until five minutes
+before expiry, keeps HTTPS connections alive, revalidates repeated REST reads
+with their ETag, and retries only transport failures and 5xx with jittered
+backoff inside the call's timeout. Only reads move: `gh api repos/...` with no
+flags, a read-only `gh api graphql` query, and `gh pr view --json` for the
+steward's field set, each printed exactly as `gh` would print it. Every write,
+every queue call and every other shape still runs `gh` and the wrapper's
+guards. Any landing request (`pr merge`, an arm or enqueue mutation, even a
+bare `gh api repos/O/R/pulls/N/merge`) is never answered in process.
+`api_calls.latency` gives p50/p90/max and timeouts per transport
+(`gh`, `inproc`); `api_calls.api_cost` gives requests, retries, `304` hits,
+token mints and the lowest rate-limit remaining per resource;
+`api_calls.rollup_batch` gives the adaptive rollup batch size (it grows by two
+while batches answer under 2.5 s and halves on a failure or a batch over 5 s,
+within 2 to 12, and is kept in `github-read-batch.json` in the state dir).
+A credential problem hands the read back to `gh` (and holds that repository
+on `gh` for a minute) and shows in `api_calls.fallbacks` as `in-process read ->
+gh`. A read whose caller set no timeout gets 60 s in process; a timeout is
+reported, never re-spent on `gh`. To force `gh` for every read,
+set `[github.reads] transport = "gh"` in the machine-global config (or leave
+it unset), or `SHIPYARD_GITHUB_READS=gh` for one process;
+`SHIPYARD_GITHUB_READS=inproc` opts one process in. `shipyard runner
+steward-read-probe --repo OWNER/REPO --pr N` times the hottest reads through
+both transports side by side and checks their output matches.
 A repository that makes the pass exit 1 also carries `exit_reasons`, one
 entry per cause (`repo_errors:N`, `pr_errors:#A,#B`, `cancellation_errors:<run ids>`,
 `rate_limited`, `uncertain_mutations`, or `unclassified`), so a non-zero exit

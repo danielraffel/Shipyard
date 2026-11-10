@@ -287,6 +287,35 @@ spelling), and `shipyard wait` event filters compare the payload's
 `owner/Repo` case-insensitively, so a lowercased remote still wakes on its
 webhook events.
 
+## Steward reads mint their own token and never spawn `gh`
+
+Off by default (`[github.reads] transport = "gh"`). m3 canaries it with
+`transport = "inproc"` in its machine-global config. The default flips once
+canary passes show `api_calls.fallbacks` empty and the read probe matches.
+When on, the steward's reads (`src/github_read`) do not spawn `gh`, so the `ghapp`
+wrapper never re-mints for them. Shipyard parses the canonical
+`[github.auth] token_command` (`[WRAPPER, "token", "--app-id", ID,
+"--private-key", PATH, "--repo", "{repo_slug}"]`, optional
+`--scope-repository`). Any other shape keeps every read on `gh`. It checks the
+key exactly as the helper does: a regular file, mode 0600, owned by the user,
+in a 0700 directory. It signs the App JWT in process, looks up
+`repos/R/installation`, and mints. The token stays in memory (`Zeroizing`,
+with `Debug` redacted) until 5 minutes before it expires. A 401 re-mints once.
+A refused credential sends that repository's reads to `gh` for 60 s.
+Gotchas:
+
+- Parity is gh's *printed* shape, not GitHub's. For `pr view`, a bot author
+  is `app/<login>` and a pending check has conclusion `""` and completedAt
+  `0001-01-01T00:00:00Z`. A status context reports `startedAt`, and a head
+  with no checks is `[]`. Changing a field set in a steward `pr view` means
+  adding it to `PrField`, or that read silently goes back to `gh`.
+- A new steward read is in process only if it is a bare `gh api repos/...`, a
+  read-only `gh api graphql`, or a supported `pr view`. Adding `--jq`,
+  `--paginate` or `-H` sends it back through the wrapper chain. That is
+  correct, but it brings back the slow path.
+- `runner steward-read-probe --repo R --pr N` is the parity and latency check
+  to run after touching any of this.
+
 ## The writer-domain lease, for tools outside Shipyard
 
 Any tool that writes under a protected root (`~/.local/bin`, Shipyard's state

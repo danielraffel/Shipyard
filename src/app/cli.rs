@@ -3231,6 +3231,24 @@ pub(super) enum RunnerCommand {
         #[arg(long = "ledger", hide = true)]
         ledger: Option<PathBuf>,
     },
+    /// Time the steward's hottest GitHub reads through `gh` and in process,
+    /// side by side, and check that both paths print the same JSON. Read-only;
+    /// prints latency and parity, never response bodies.
+    #[command(name = "steward-read-probe", hide = true)]
+    StewardReadProbe {
+        /// Exact OWNER/REPO.
+        #[arg(long)]
+        repo: String,
+        /// An open pull request to read.
+        #[arg(long)]
+        pr: u64,
+        /// Base branch for the merge-queue read.
+        #[arg(long, default_value = "main")]
+        base: String,
+        /// Rounds; each round makes every read once per transport.
+        #[arg(long, default_value_t = 5)]
+        rounds: u32,
+    },
     /// Plan, and optionally apply, the unattended carrier's mechanical
     /// actions on armed, approved pull requests: rerun a cancelled required
     /// run, re-arm a head the queue removed because its batch starved, and
