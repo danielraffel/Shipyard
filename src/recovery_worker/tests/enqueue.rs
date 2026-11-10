@@ -228,3 +228,54 @@ fn deterministic_clear_supersedes_all_active_exact_target_work() {
     );
     assert!(store.pending(10).expect("pending").is_empty());
 }
+
+/// `settled_existing` answers `Some` only where `enqueue` would answer
+/// `Existing` and save nothing, so a caller that skips the write on `Some`
+/// leaves the store exactly as the write would have.
+#[test]
+fn settled_existing_agrees_with_a_write_free_existing_enqueue() {
+    let assert_agrees = |store: &RecoveryStore, request: RecoveryRequest, settled: bool| {
+        let before = store.get(&request.id).expect("load before");
+        let probe = store.settled_existing(&request).expect("probe");
+        assert_eq!(probe.is_some(), settled, "{request:?}");
+        if settled {
+            assert_eq!(probe, before, "the probe returns the stored record");
+            assert_eq!(
+                store.enqueue(request.clone()).expect("enqueue"),
+                EnqueueOutcome::Existing
+            );
+            assert_eq!(
+                store.get(&request.id).expect("load after"),
+                before,
+                "a settled enqueue writes nothing"
+            );
+        }
+    };
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let store = RecoveryStore::new(temp.path()).expect("store");
+    // Not in the store: enqueue would create it.
+    assert_agrees(&store, request(HEAD_A, "config-v1"), false);
+
+    let pending = request(HEAD_A, "config-v1");
+    store.enqueue(pending.clone()).expect("enqueue");
+    assert_agrees(&store, pending.clone(), true);
+    // Same identity, new worker config: enqueue would replace it.
+    assert_agrees(&store, request(HEAD_A, "config-v2"), false);
+
+    let running = store
+        .begin(&pending.id, "config-v1", "generation-a")
+        .expect("claim");
+    assert_eq!(running.receipt.attempt, 1);
+    assert_agrees(&store, pending.clone(), true);
+    // A spent attempt under a drifted config is refused, not settled.
+    assert_agrees(&store, request(HEAD_A, "config-v2"), false);
+
+    // An unattempted superseded request can be reactivated: not settled.
+    let other = request(HEAD_B, "config-v1");
+    store.enqueue(other.clone()).expect("enqueue other");
+    store
+        .supersede(&other.id, None, "superseded before claim")
+        .expect("supersede");
+    assert_agrees(&store, other, false);
+}

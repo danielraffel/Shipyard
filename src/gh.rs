@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::config::LoadedConfig;
 use crate::identity::RuntimeMode;
@@ -180,6 +181,14 @@ impl GhClient {
         Ok(Self::new(auth))
     }
 
+    /// The client for `[github.admission_auth]`, or `None` when the machine
+    /// configures no dedicated admission credential.
+    pub(crate) fn admission_from_loaded_config(
+        config: &LoadedConfig,
+    ) -> Result<Option<Self>, GhConfigError> {
+        Ok(GhAuthConfig::admission_from_loaded_config(config)?.map(Self::new))
+    }
+
     /// The executables this client's auth config would run itself: the
     /// token helper's program and any configured `gh` or `git` binary.
     #[cfg(all(test, unix))]
@@ -201,6 +210,17 @@ impl GhClient {
             .cloned(),
         );
         executables
+    }
+
+    /// The configured `token_command` argv, when auth comes from a command.
+    /// In-process reads derive their App credential from it, so they use the
+    /// same App and key the `ghapp` wrapper resolves through
+    /// `shipyard auth helper-argv`.
+    pub(crate) fn command_token_argv(&self) -> Option<&[String]> {
+        match &self.auth.source {
+            GhAuthSource::Command { token_command, .. } => Some(token_command),
+            _ => None,
+        }
     }
 
     /// Build a client that uses ambient `gh` auth.
@@ -227,6 +247,27 @@ impl GhClient {
             return None;
         }
         self.clone().with_repo_override(slug).ok()
+    }
+
+    /// Return a stable, non-secret identity for the credential scope used by
+    /// a repository read.  Steward rate-limit cooldowns are keyed by this
+    /// value plus the repository, so one App/token cannot pause an unrelated
+    /// installation.  The token itself is never written to the ledger.
+    pub(crate) fn rate_limit_scope_key(&self, repo: &str) -> String {
+        let repo = repo.to_ascii_lowercase();
+        let identity = match &self.auth.source {
+            GhAuthSource::GhCli => env::var("GH_TOKEN")
+                .or_else(|_| env::var("GITHUB_TOKEN"))
+                .map_or_else(|_| "gh-cli".to_owned(), |token| format!("token:{token}")),
+            GhAuthSource::Env { token_env } => env::var(token_env).map_or_else(
+                |_| format!("env:{token_env}"),
+                |token| format!("token:{token}"),
+            ),
+            GhAuthSource::Command { token_command, .. } => {
+                format!("command:{}:{repo}", token_command.join("\u{1f}"))
+            }
+        };
+        format!("{:x}", Sha256::digest(identity.as_bytes()))
     }
 
     /// Force token-command repository placeholders to use an explicit target.

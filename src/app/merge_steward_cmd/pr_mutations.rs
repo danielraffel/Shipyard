@@ -145,7 +145,12 @@ pub(super) fn read_head_gate_with_queue_state(
         read_head_gate_for(context.actions, context.observation, pr, ledger)?;
     context.approval_blockers.borrow_mut().insert(
         pr.fact.number,
-        super::blocked_on::GateRecord::new(&pr.fact.head_sha, blocker, &queue),
+        super::blocked_on::GateRecord::new(
+            &pr.fact.head_sha,
+            blocker,
+            &queue,
+            context.ejection_guards.infra_only_retry,
+        ),
     );
     Ok((gate, events, queue))
 }
@@ -588,6 +593,29 @@ fn enqueue_unstacked_pull_request(
             }
         };
     }
+    // Two heads that change one generated path fail together in a batch;
+    // a same-head retry fixes neither. Wait for the queued one to leave.
+    if let Some(skip) = super::generated_paths::batch_refusal(context, &policy.ejection_guards, &pr)
+    {
+        return match skip {
+            Ok(outcome) => match guard.finish(&outcome) {
+                Ok(()) => (Some(outcome), None),
+                Err(error) => (
+                    Some(outcome),
+                    Some(format!("enqueue skip mutation audit failed: {error}")),
+                ),
+            },
+            Err(error) => {
+                let audit_error = guard.finish("generated_paths_unreadable").err();
+                (
+                    None,
+                    Some(audit_error.map_or(error.clone(), |audit_error| {
+                        format!("{error}; mutation audit also failed: {audit_error}")
+                    })),
+                )
+            }
+        };
+    }
     if let Some(observed_recovery) = recovery {
         match recovery_evidence(context.actions, context.observation, &pr, ledger) {
             Ok(Some(live_recovery)) if live_recovery == *observed_recovery => {}
@@ -1004,6 +1032,10 @@ fn record_definitive_refusal(
     )
 }
 
+/// Suffix of a same-head ejection token under the retry discipline: the
+/// head is not retried, and only a new head moves it.
+pub(super) const NEEDS_NEW_HEAD: &str = "needs_new_head";
+
 /// The head-scoped queue verdict for an ordinary steward enqueue.
 ///
 /// `None` admits. `Some(Ok(outcome))` is a deliberate skip of a head the queue
@@ -1026,7 +1058,12 @@ fn same_head_enqueue_refusal(
         }
     };
     let report = crate::pr_queue_state::explain_pr_queue_state(&response);
-    let verdict = crate::pr_queue_state::internal_enqueue_verdict(&report, &pr.fact.head_sha);
+    let discipline = context.ejection_guards.infra_only_retry;
+    let verdict = crate::pr_queue_state::internal_enqueue_verdict_with(
+        &report,
+        &pr.fact.head_sha,
+        discipline,
+    );
     if crate::merge_steward::arm_survives_queue_state(&StewardDecision::ArmMergeQueue, &verdict) {
         return None;
     }
@@ -1036,9 +1073,14 @@ fn same_head_enqueue_refusal(
             // not its own fault: the same classifier the native-arm backstop
             // and `shipyard ship` consult, read live from this queue answer.
             // The approval gate was already read live for this head above.
-            let retry = same_head_retry_verdict(context.actions, context.observation, &report)
-                .as_ref()
-                .map(super::blocked_on::SameHeadRetry::from_verdict);
+            let retry = same_head_retry_verdict(
+                context.actions,
+                context.observation,
+                &report,
+                &context.ejection_guards,
+            )
+            .as_ref()
+            .map(super::blocked_on::SameHeadRetry::from_verdict);
             if let Some(ejection) = context
                 .approval_blockers
                 .borrow_mut()
@@ -1051,7 +1093,13 @@ fn same_head_enqueue_refusal(
             if retry.is_some_and(|retry| retry.allowed) {
                 return None;
             }
-            Ok(format!("skipped_ejected_same_head:{reason}"))
+            // Under the retry discipline the refusal names its one way out:
+            // a new head. Without it the reason alone is reported, as before.
+            Ok(if discipline {
+                format!("skipped_ejected_same_head:{reason}:{NEEDS_NEW_HEAD}")
+            } else {
+                format!("skipped_ejected_same_head:{reason}")
+            })
         }
         other => Err(other
             .refusal(pr.fact.number, &pr.fact.head_sha)
@@ -1067,15 +1115,22 @@ pub(super) fn same_head_retry_verdict(
     actions: &GitHubActions,
     observation: &RepoObservation,
     report: &crate::pr_queue_state::PrQueueReport,
+    guards: &crate::merge_steward::EjectionGuards,
 ) -> Option<crate::environment_requeue::EnvironmentRequeue> {
     if !crate::environment_requeue::applies(report) {
         return None;
     }
     let run_gh = |args: &[String]| actions.run_gh(args).map_err(|error| error.to_string());
     match crate::environment_requeue::read_opt_in(&run_gh, &observation.repo, &observation.base) {
-        Ok(opted_in) => {
-            crate::environment_requeue::assess(&run_gh, &observation.repo, report, opted_in)
-        }
+        Ok(opted_in) => crate::environment_requeue::assess_with(
+            &run_gh,
+            &observation.repo,
+            report,
+            opted_in,
+            guards
+                .infra_only_retry
+                .then_some(guards.known_flaky_tests.as_slice()),
+        ),
         Err(detail) => Some(crate::environment_requeue::EnvironmentRequeue::refused(
             format!("the re-enqueue policy is unreadable, so the head is not retried: {detail}"),
             None,

@@ -102,6 +102,84 @@ the final force-cancel boundary re-reads blocker, opt-out, management label,
 exact-head handoff status, PR number, and base; a late authority loss leaves the
 pending record and a durable rejected-revalidation audit without another POST.
 
+## What a pass costs GitHub (`api_calls`)
+
+Every repository in a `runner steward --json` report carries `api_calls`:
+REST and GraphQL children spawned, reads answered from the pass cache, summed
+child wall time, and a per-call-site breakdown (endpoint shape with SHAs and
+numbers elided). The human output prints one `github: rest= graphql=
+cache_hits=` line. Read it before guessing why a pass is slow or which budget
+it burns; a pass that times out reports nothing, so take the numbers from a dry
+run (`runner steward --repo <r> --base main --json`, no `--apply`).
+
+Two things keep a pass's cost tracking the pull requests that can move rather
+than every open one:
+
+- **Pass read cache** (`src/gh_pass.rs`). Within one repository's pass a
+  successful answer is reused only for content-addressed reads (a commit, tree
+  or blob by full SHA, a compare between two full SHAs) and the base's policy
+  (a file at a named ref such as `.shipyard/config.toml?ref=main`, the base's
+  evaluated rules, its branch protection). Nothing that decides whether a head
+  may land now is cached: reviews, comments, check runs, statuses, queue
+  state, the pull request and every GraphQL read are asked fresh each time, so
+  every live revalidation before a mutation still sees GitHub's live answer.
+  Failed reads are never cached. On Generous-Corp/pulp this removed ten of
+  eleven reads of the base config per pass.
+- **Settled recovery skips the live revalidation.** A pull request whose
+  required check failed and whose needs-agent signal is already in place was
+  re-proved live (merge-queue snapshot, PR read, check runs, statuses) every
+  pass only to find there was nothing to write. Now, under the same
+  publication lease, the steward first asks local durable state whether the
+  write would change anything: the exact-head actionable-failure record with
+  the census's failure facts (`actionable_failure_is_recorded`, the ledger
+  merge run on a copy) and the recovery request (`RecoveryStore::settled_existing`,
+  the branches of `enqueue` that answer `Existing` without saving, plus a
+  current witness). Only when both are settled does it return the outcome the
+  full path would (`actionable_failure_persisted` when model recovery is off,
+  nothing when it is on) without a GitHub read. Any change, doubt or read error
+  takes the full path, which still revalidates live before writing. A failure
+  whose checks change after the census is published by the next pass, whose
+  census sees them. Pulp carried 27 such pull requests on 2026-11-08, about 110
+  sequential reads per apply pass.
+
+The carried-commits guard and the other admission reads (exact-head approval,
+deferred tier, code-owner wait) already run only for a head that is green,
+`CLEAN` and approved: `mutate_pr_with_recovery` refuses an unapproved head
+from its census read before any snapshot, and the `--arm-unqueued` backstop
+reaches the guard only after the approval gate allows. Keep new expensive
+reads behind those gates.
+
+The census check hydration (the complete check set of each managed, unqueued,
+non-draft, non-conflicting head) reads those heads six at a time through one
+GraphQL `statusCheckRollup` query (`src/app/merge_steward_cmd/head_rollup.rs`),
+instead of a REST `check-runs` read plus a `statuses` read per head. Check runs
+come from the rollup, lowercased to the REST spelling; the rollup lists the
+same latest run per suite and name as `check-runs`. Commit statuses still come
+from the REST history, because the steward reads more than the newest status
+per context: the handoff check asks whether any handoff status succeeded, an
+app-bound rule can be satisfied by an older status from its app under a newer
+one from someone else, and the rerun budget and blocked-on report walk every
+observation. A head's history is kept beside the ledger, one file per
+repository (`merge-steward.status-history.<owner>~<name>.json`), and reused on the next pass only while the newest status of
+every context in it equals what the rollup reports now (context, state, time,
+target URL, creator) and the rollup names no other context; statuses are
+append-only, so that proves the history unchanged. Dry-run passes write that
+file too: it is a read cache, never a decision record. A write that dies before
+its rename leaves `<file>.json.<pid>.tmp`; the next load removes such files
+older than 30 minutes. A rate-limited rollup read fails the census, so the pass
+takes its rate-limit cooldown instead of spending two REST reads per head on
+the same installation. Any other rollup failure leaves the batch to the
+per-head REST reads and is counted in `api_calls.fallbacks` (reason such as
+`census check rollup -> REST: graphql_errors`, count, last message); a reason
+that recurs every pass is a schema change or a persistent failure. On Generous-Corp/pulp (17 hydrated heads,
+2026-11-08) this took the census from 34 REST calls to 3 GraphQL calls plus one
+status read; decisions matched a concurrent pass of the old binary on 28 of 29
+pull requests, the 29th being a check that completed between the two reads.
+`src/app/merge_steward_cmd/tests/head_rollup.rs` pins both claims, and
+`src/app/merge_steward_cmd/tests/api_budget.rs` the apply-phase one: once
+failures are published, ten more blocked pull requests add no GitHub call to a
+pass.
+
 ## Runner admission: a fence that must hold, not a fence that must never move
 
 Runner admission (the typed verdict tartci lanes read before claiming or

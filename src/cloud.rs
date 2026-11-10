@@ -17,6 +17,9 @@ use crate::config::LoadedConfig;
 use crate::gh::{GhAuthPolicy, GhClient, GhSupervision};
 use crate::identity::RuntimeMode;
 
+mod read_cache;
+pub(crate) use read_cache::ReadCache;
+
 const RUN_JSON_FIELDS: &str =
     "databaseId,status,conclusion,url,createdAt,updatedAt,workflowName,headBranch,headSha";
 const JOB_ACTIVE_STATUSES: [&str; 2] = ["queued", "in_progress"];
@@ -332,6 +335,15 @@ pub struct GitHubActions {
     /// needs `GH_REPO` even when the native `gh api` command has no `--repo`
     /// option.
     repo_override: Option<String>,
+    /// Admission-only reuse of argv-determined reads (see `read_cache`).
+    /// Shared across clones so every scoped copy of one client hits it.
+    read_cache: Option<std::sync::Arc<ReadCache>>,
+    /// The steward pass this client counts its `gh` children for, and whose
+    /// narrow read cache it consults ([`crate::gh_pass`]).
+    pass: Option<std::sync::Arc<crate::gh_pass::GhPass>>,
+    /// Reads this client may answer in process instead of spawning `gh`
+    /// ([`crate::github_read`]). Writes never use it.
+    inproc: Option<crate::github_read::InprocReads>,
 }
 
 impl PartialEq for GitHubActions {
@@ -361,6 +373,9 @@ impl GitHubActions {
             gh_binary_override: None,
             absolute_deadline: None,
             repo_override: None,
+            read_cache: None,
+            pass: None,
+            inproc: None,
         }
     }
 
@@ -376,7 +391,18 @@ impl GitHubActions {
             gh_binary_override: None,
             absolute_deadline: None,
             repo_override: None,
+            read_cache: None,
+            pass: None,
+            inproc: None,
         }
+    }
+
+    /// Count every `gh` child against `pass`, and let it answer the reads it
+    /// may cache ([`crate::gh_pass::pass_cacheable`]).
+    #[must_use]
+    pub(crate) fn with_pass(mut self, pass: std::sync::Arc<crate::gh_pass::GhPass>) -> Self {
+        self.pass = Some(pass);
+        self
     }
 
     /// Override repository placeholders used by configured token helpers.
@@ -430,6 +456,9 @@ impl GitHubActions {
             gh_binary_override: None,
             absolute_deadline: None,
             repo_override: None,
+            read_cache: None,
+            pass: None,
+            inproc: None,
         }
         .with_gh_binary_for_tests(gh_binary)
     }
@@ -446,7 +475,42 @@ impl GitHubActions {
             gh: Ok(GhClient::ambient()),
             absolute_deadline: None,
             repo_override: None,
+            read_cache: None,
+            pass: None,
+            inproc: None,
         }
+    }
+
+    /// Answer the reads [`crate::github_read::argv::classify`] accepts in
+    /// process through `reads`; every other command still runs `gh`.
+    #[must_use]
+    pub(crate) fn with_inproc_reads(
+        mut self,
+        reads: Option<crate::github_read::InprocReads>,
+    ) -> Self {
+        self.inproc = reads;
+        self
+    }
+
+    /// The in-process reader, when this client has one.
+    pub(crate) fn inproc_reads(&self) -> Option<&crate::github_read::InprocReads> {
+        self.inproc.as_ref()
+    }
+
+    /// Answer this client's cacheable GitHub reads from `cache` when it holds
+    /// a fresh copy, and store the live answers it does make.
+    #[must_use]
+    pub(crate) fn with_read_cache(mut self, cache: Option<ReadCache>) -> Self {
+        self.read_cache = cache.map(std::sync::Arc::new);
+        self
+    }
+
+    /// Use `client` for every command this client prepares, keeping its
+    /// working directory, deadline, repository scope and read cache.
+    #[must_use]
+    pub(crate) fn with_gh_client(mut self, client: GhClient) -> Self {
+        self.gh = Ok(client);
+        self
     }
 
     pub(crate) fn with_absolute_deadline(mut self, deadline: Instant) -> Self {
@@ -455,6 +519,16 @@ impl GitHubActions {
                 .map_or(deadline, |current| current.min(deadline)),
         );
         self
+    }
+
+    /// Stable, non-secret identity for the credential scope used by a repo.
+    /// The steward uses this to keep one installation's rate-limit cooldown
+    /// from suppressing another installation's observations.
+    pub(crate) fn rate_limit_scope_key(&self, repo: &str) -> String {
+        self.gh.as_ref().map_or_else(
+            |_| format!("auth-unavailable:{repo}"),
+            |client| client.rate_limit_scope_key(repo),
+        )
     }
 
     /// Dispatch a workflow with optional repository and input fields.
@@ -668,6 +742,17 @@ impl GitHubActions {
                     .collect()
             })
             .unwrap_or_default())
+    }
+
+    /// The pass this client counts against, if any ([`Self::with_pass`]).
+    pub(crate) fn gh_pass(&self) -> Option<&crate::gh_pass::GhPass> {
+        self.pass.as_deref()
+    }
+
+    /// Whether this client reads through a read cache ([`Self::with_read_cache`]).
+    #[cfg(test)]
+    pub(crate) const fn has_read_cache(&self) -> bool {
+        self.read_cache.is_some()
     }
 
     /// The most recent `base_ref_changed` event on a pull request's timeline.
@@ -1034,6 +1119,65 @@ impl GitHubActions {
         env: &[(&str, &str)],
         internal: bool,
     ) -> Result<String, GitHubError> {
+        if internal {
+            return self.run_gh_gated_uncached(args, env, internal);
+        }
+        if env.is_empty() {
+            return self.cached_read(args, || {
+                self.through_pass_cache(args, || self.run_gh_gated_uncached(args, env, internal))
+            });
+        }
+        self.through_pass_cache(args, || self.run_gh_gated_uncached(args, env, internal))
+    }
+
+    /// Serve `args` from the admission read cache when it is cacheable and
+    /// fresh; otherwise run `live` and remember a successful answer.
+    fn cached_read(
+        &self,
+        args: &[String],
+        live: impl FnOnce() -> Result<String, GitHubError>,
+    ) -> Result<String, GitHubError> {
+        let Some(cache) = self.read_cache.as_deref() else {
+            return live();
+        };
+        if let Some(body) = cache.get(args) {
+            return Ok(body);
+        }
+        let body = live()?;
+        cache.put(args, &body);
+        Ok(body)
+    }
+
+    /// Answer a read from the pass cache when it holds one, otherwise run
+    /// `spawn` and keep a successful answer the pass may reuse.
+    fn through_pass_cache(
+        &self,
+        args: &[String],
+        spawn: impl FnOnce() -> Result<String, GitHubError>,
+    ) -> Result<String, GitHubError> {
+        let Some(pass) = self.pass.as_deref() else {
+            return spawn();
+        };
+        if let Some(hit) = pass.cached(args) {
+            return Ok(hit);
+        }
+        let stdout = spawn()?;
+        pass.remember(args, &stdout);
+        Ok(stdout)
+    }
+
+    fn record_pass_call(&self, args: &[String], started: Instant) {
+        if let Some(pass) = self.pass.as_deref() {
+            pass.record(args, started.elapsed());
+        }
+    }
+
+    fn run_gh_gated_uncached(
+        &self,
+        args: &[String],
+        env: &[(&str, &str)],
+        internal: bool,
+    ) -> Result<String, GitHubError> {
         if let Some(timeout) = self.remaining_deadline()? {
             let output = self.run_gh_with_timeout_output_limits(
                 args,
@@ -1047,10 +1191,55 @@ impl GitHubActions {
             }
             return Ok(String::from_utf8_lossy(output.stdout()).to_string());
         }
+        let mut fallback_timeout = None;
+        if let Some((result, remaining)) =
+            self.try_inproc(args, INPROC_UNBOUNDED_READ_TIMEOUT, None, env, internal)
+        {
+            match result {
+                Some(Ok(output)) => {
+                    if !output.success() {
+                        return Err(output.command_error(args));
+                    }
+                    return Ok(String::from_utf8_lossy(output.stdout()).to_string());
+                }
+                Some(Err(error)) => return Err(error),
+                None => fallback_timeout = Some(remaining),
+            }
+        }
+        if let Some(remaining) = fallback_timeout {
+            if remaining < INPROC_FALLBACK_FLOOR {
+                return Err(GitHubError::new(format!(
+                    "gh {} timed out after {}ms",
+                    args.join(" "),
+                    INPROC_UNBOUNDED_READ_TIMEOUT.as_millis()
+                )));
+            }
+            // An in-process attempt spent part of the budget before handing
+            // the read back; `gh` gets the rest, bounded like any timed read.
+            let output = self.run_gh_with_timeout_output_limits_via(
+                args, remaining, None, env, internal, false,
+            )?;
+            if !output.success() {
+                return Err(output.command_error(args));
+            }
+            return Ok(String::from_utf8_lossy(output.stdout()).to_string());
+        }
         let mut command = self.prepare_gh_command(args)?;
         gate_landing(&mut command, args, internal)?;
         apply_repo_environment(&mut command, env, self.repo_override.as_deref());
-        let output = command.args(args).output().map_err(|error| {
+        let started = Instant::now();
+        let output = command.args(args).output();
+        self.record_pass_call(args, started);
+        self.record_transport(
+            crate::gh_pass::GH,
+            started,
+            if output.is_ok() {
+                crate::gh_pass::CallEnd::Answered
+            } else {
+                crate::gh_pass::CallEnd::Failed
+            },
+        );
+        let output = output.map_err(|error| {
             GitHubError::new(format!("failed to run gh {}: {error}", args.join(" ")))
         })?;
         if !output.status.success() {
@@ -1068,11 +1257,13 @@ impl GitHubActions {
         args: &[String],
         timeout: Duration,
     ) -> Result<String, GitHubError> {
-        let output = self.run_gh_with_timeout_output(args, timeout)?;
-        if !output.success() {
-            return Err(output.command_error(args));
-        }
-        Ok(String::from_utf8_lossy(output.stdout()).to_string())
+        self.through_pass_cache(args, || {
+            let output = self.run_gh_with_timeout_output(args, timeout)?;
+            if !output.success() {
+                return Err(output.command_error(args));
+            }
+            Ok(String::from_utf8_lossy(output.stdout()).to_string())
+        })
     }
 
     /// Like [`Self::run_gh_with_timeout`] with extra environment for the child,
@@ -1111,20 +1302,209 @@ impl GitHubActions {
                 "bounded gh output limits must be positive".to_owned(),
             ));
         }
-        let output = self.run_gh_with_timeout_output_limits(
-            args,
-            timeout,
-            Some((max_stdout_bytes, max_stderr_bytes)),
-            &[],
-            false,
-        )?;
-        if !output.success() {
-            return Err(output.command_error(args));
-        }
-        Ok(String::from_utf8_lossy(output.stdout()).to_string())
+        self.cached_read(args, || {
+            let output = self.run_gh_with_timeout_output_limits(
+                args,
+                timeout,
+                Some((max_stdout_bytes, max_stderr_bytes)),
+                &[],
+                false,
+            )?;
+            if !output.success() {
+                return Err(output.command_error(args));
+            }
+            Ok(String::from_utf8_lossy(output.stdout()).to_string())
+        })
     }
 
     fn run_gh_with_timeout_output_limits(
+        &self,
+        args: &[String],
+        timeout: Duration,
+        output_limits: Option<(usize, usize)>,
+        env: &[(&str, &str)],
+        internal: bool,
+    ) -> Result<GitHubCommandOutput, GitHubError> {
+        self.run_gh_with_timeout_output_limits_via(
+            args,
+            timeout,
+            output_limits,
+            env,
+            internal,
+            true,
+        )
+    }
+
+    fn run_gh_with_timeout_output_limits_via(
+        &self,
+        args: &[String],
+        timeout: Duration,
+        output_limits: Option<(usize, usize)>,
+        env: &[(&str, &str)],
+        internal: bool,
+        allow_inproc: bool,
+    ) -> Result<GitHubCommandOutput, GitHubError> {
+        let mut timeout = timeout;
+        if allow_inproc
+            && let Some((result, remaining)) =
+                self.try_inproc(args, timeout, output_limits, env, internal)
+        {
+            match result {
+                Some(result) => return result,
+                None if remaining < INPROC_FALLBACK_FLOOR => {
+                    return Err(GitHubError::new(format!(
+                        "gh {} timed out after {}ms",
+                        args.join(" "),
+                        timeout.as_millis()
+                    )));
+                }
+                None => timeout = remaining,
+            }
+        }
+        let started = Instant::now();
+        let output =
+            self.spawn_gh_with_timeout_output_limits(args, timeout, output_limits, env, internal);
+        self.record_pass_call(args, started);
+        let end = match &output {
+            Ok(_) => crate::gh_pass::CallEnd::Answered,
+            Err(error) if error.message().contains("timed out") => {
+                crate::gh_pass::CallEnd::TimedOut
+            }
+            Err(_) => crate::gh_pass::CallEnd::Failed,
+        };
+        self.record_transport(crate::gh_pass::GH, started, end);
+        output
+    }
+
+    fn record_transport(
+        &self,
+        transport: &'static str,
+        started: Instant,
+        end: crate::gh_pass::CallEnd,
+    ) {
+        if let Some(pass) = self.pass.as_deref() {
+            pass.record_transport(transport, started.elapsed(), end);
+        }
+    }
+
+    /// Try `args` in process. `None` when this client has no in-process
+    /// reader or the command is not one it may answer (a write, an internal
+    /// queue mutation, a call with extra environment, or a shape the
+    /// classifier declines); the caller then runs `gh`. Otherwise the second
+    /// element is the time left for `gh` if the first is `None` (the read was
+    /// eligible but handed back), and the first is the answer.
+    fn try_inproc(
+        &self,
+        args: &[String],
+        timeout: Duration,
+        output_limits: Option<(usize, usize)>,
+        env: &[(&str, &str)],
+        internal: bool,
+    ) -> Option<(Option<Result<GitHubCommandOutput, GitHubError>>, Duration)> {
+        use crate::github_read::{FailureKind, ReadOutcome};
+        let reads = self.inproc.as_ref()?;
+        // A landing request (`pr merge`, an arm or enqueue mutation, a bare
+        // `api repos/O/R/pulls/N/merge`) keeps the guarded `gh` path even when
+        // its shape reads like a GET.
+        if internal || !env.is_empty() || crate::queue_arm_gate::is_landing_request(args) {
+            return None;
+        }
+        let timeout = match self.remaining_deadline() {
+            Ok(Some(remaining)) => timeout.min(remaining),
+            Ok(None) => timeout,
+            Err(error) => return Some((Some(Err(error)), Duration::ZERO)),
+        };
+        let started = Instant::now();
+        let outcome = reads.try_read(
+            args,
+            self.repo_override.as_deref(),
+            timeout,
+            output_limits.map(|(stdout, _)| stdout),
+        );
+        let remaining = timeout.saturating_sub(started.elapsed());
+        let (result, end, meta) = match outcome {
+            ReadOutcome::Declined { reason: None } => return None,
+            ReadOutcome::Declined {
+                reason: Some(reason),
+            } => {
+                if let Some(pass) = self.pass.as_deref() {
+                    pass.record_fallback("in-process read -> gh", &reason);
+                }
+                return Some((None, remaining));
+            }
+            ReadOutcome::Answered {
+                success,
+                stdout,
+                stderr,
+                meta,
+            } => (
+                Ok(GitHubCommandOutput {
+                    status: synthetic_exit_status(i32::from(!success)),
+                    stdout,
+                    stderr: stderr.into_bytes(),
+                }),
+                crate::gh_pass::CallEnd::Answered,
+                meta,
+            ),
+            ReadOutcome::Failed {
+                kind: FailureKind::Transport,
+                detail,
+                meta,
+            } => {
+                // A transport this client cannot use (a proxy, a TLS
+                // interception) may still let `gh` through: hand it back.
+                if let Some(pass) = self.pass.as_deref() {
+                    pass.record_inproc_cost(&meta);
+                    pass.record_transport(
+                        crate::gh_pass::INPROC,
+                        started.elapsed(),
+                        crate::gh_pass::CallEnd::Failed,
+                    );
+                    pass.record_fallback("in-process transport -> gh", &detail);
+                }
+                return Some((None, remaining));
+            }
+            ReadOutcome::Failed {
+                kind: FailureKind::TimedOut,
+                meta,
+                ..
+            } => (
+                Err(GitHubError::new(format!(
+                    "gh {} timed out after {}ms",
+                    args.join(" "),
+                    timeout.as_millis()
+                ))),
+                crate::gh_pass::CallEnd::TimedOut,
+                meta,
+            ),
+            ReadOutcome::Failed {
+                kind: FailureKind::TooLarge,
+                meta,
+                ..
+            } => (
+                Err(GitHubError::new(match output_limits {
+                    Some((stdout, stderr)) => format!(
+                        "gh {} exceeded bounded output capture (stdout limit {stdout} bytes, stderr limit {stderr} bytes)",
+                        args.join(" ")
+                    ),
+                    None => format!(
+                        "gh {} answer exceeded the in-process read limit",
+                        args.join(" ")
+                    ),
+                })),
+                crate::gh_pass::CallEnd::Failed,
+                meta,
+            ),
+        };
+        self.record_pass_call(args, started);
+        if let Some(pass) = self.pass.as_deref() {
+            pass.record_inproc_cost(&meta);
+            pass.record_transport(crate::gh_pass::INPROC, started.elapsed(), end);
+        }
+        Some((Some(result), remaining))
+    }
+
+    fn spawn_gh_with_timeout_output_limits(
         &self,
         args: &[String],
         timeout: Duration,
@@ -1292,6 +1672,28 @@ impl GitHubActions {
                 timeout,
             )
             .map_err(|error| GitHubError::new(format!("failed to prepare gh command: {error}")))
+    }
+}
+
+/// Longest an in-process read may take when its caller set no timeout (a
+/// `gh` child in that position has none at all).
+const INPROC_UNBOUNDED_READ_TIMEOUT: Duration = Duration::from_mins(1);
+
+/// Less time than this left after an in-process read hands back is reported
+/// as the timeout it is, rather than starting a `gh` child that cannot finish.
+const INPROC_FALLBACK_FLOOR: Duration = Duration::from_secs(1);
+
+/// The exit status `gh` would have reported: 0 or 1.
+fn synthetic_exit_status(code: i32) -> std::process::ExitStatus {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt as _;
+        std::process::ExitStatus::from_raw(code << 8)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::ExitStatusExt as _;
+        std::process::ExitStatus::from_raw(code.unsigned_abs())
     }
 }
 

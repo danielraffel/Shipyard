@@ -541,6 +541,30 @@ pub(super) enum Command {
         #[command(subcommand)]
         command: RollupCommand,
     },
+    /// Pull requests that have sat in one blocked state past its dwell
+    /// limit, with the next action, owner and any act taken. Read-only.
+    ///
+    /// Reads the snapshot the merge steward's last `--apply` pass wrote
+    /// (`<state>/steward-dwell/<repo>.json`); never reads GitHub. Limits come
+    /// from `[auto_merge.dwell]` in the base's `.shipyard/config.toml`.
+    /// Without `--repo`, every repository the steward wrote a snapshot for.
+    Overdue {
+        /// Exact OWNER/REPO.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+    },
+    /// The pull requests closest to mergeable, in the order the merge
+    /// steward admits them, with the single action each needs. Read-only.
+    ///
+    /// Approved stack bases first, then approved and green, approved with
+    /// checks running, green but needing a review, then the rest; within a
+    /// tier, more unblocked pull requests first. Reads the steward's last
+    /// snapshot; never reads GitHub.
+    Next {
+        /// Exact OWNER/REPO.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+    },
     /// Which host and agent session armed, enqueued, merged or removed a
     /// pull request. Read-only.
     ///
@@ -550,13 +574,65 @@ pub(super) enum Command {
     /// time only breaks ties. An event no ledger explains (a landing through
     /// native `gh`) is `unattributed`, never guessed. Prints its own
     /// time to answer.
+    ///
+    /// `--contact [PR]` instead names the live address of the session that
+    /// owns the pull request (its owner record on any host, else its body
+    /// marker, else the last stamped verdict author) and probes it over cmux.
     Who {
         /// Pull request number.
         #[arg(long)]
-        pr: u64,
+        pr: Option<u64>,
         /// Exact OWNER/REPO. Defaults to the `origin` remote.
         #[arg(long, value_name = "OWNER/REPO")]
         repo: Option<String>,
+        /// Resolve and probe the owning session's cmux address. Takes the
+        /// pull request number, or uses `--pr`.
+        #[arg(long, value_name = "PR", num_args = 0..=1)]
+        #[allow(clippy::option_option)] // absent / bare flag / flag with a number
+        contact: Option<Option<u64>>,
+    },
+    /// Record, move or hand off the agent session that owns a pull request.
+    ///
+    /// The record (host, client, cmux socket and surface, agent id, session
+    /// id) is written to this host's state directory and as a
+    /// `shipyard-owner:` marker in the pull request body, so `shipyard relay`
+    /// can tell that session when the pull request changes. `shipyard pr` and
+    /// `shipyard ship` register the pushing session automatically.
+    Owner {
+        /// Owner subcommand.
+        #[command(subcommand)]
+        command: OwnerCommand,
+    },
+    /// Deliver pull-request events (merged, closed, ejected, verdict,
+    /// required red/green, conflicts after the base moved, repair claims,
+    /// stacked base merged) to the session that owns each pull request.
+    ///
+    /// Model-free. One batched GraphQL read per repository per pass; no REST.
+    /// Delivers over cmux (local, or ssh for another host), falling back to
+    /// the repository's lead, then its repair lane, then one PR comment.
+    /// `[relay]` in the machine config sets the repositories, mode, hosts and
+    /// fallbacks; `relay.enabled = false` turns it off. Never approves, arms,
+    /// merges or posts a verdict.
+    Relay {
+        /// Keep running, one pass every `--interval` seconds.
+        #[arg(long)]
+        follow: bool,
+        /// Seconds between passes with `--follow`. Defaults to
+        /// `relay.interval_secs` (120).
+        #[arg(long, value_parser = clap::value_parser!(u64).range(15..))]
+        interval: Option<u64>,
+        /// Repository to relay (repeatable). Defaults to `relay.repos`.
+        #[arg(long = "repo", value_name = "OWNER/REPO")]
+        repos: Vec<String>,
+        /// Deliver, overriding `relay.mode`.
+        #[arg(long, conflicts_with = "shadow")]
+        send: bool,
+        /// Log what would be delivered without sending, overriding `relay.mode`.
+        #[arg(long)]
+        shadow: bool,
+        /// Stop `--follow` after this many passes. Test and supervised-run hook.
+        #[arg(long = "max-passes", hide = true, value_parser = clap::value_parser!(u64).range(1..))]
+        max_passes: Option<u64>,
     },
     /// Read the repository's CI and say what to change. Read-only.
     ///
@@ -838,12 +914,21 @@ pub(super) enum Command {
         /// Skip the landability gate entirely for this invocation.
         #[arg(long = "skip-landability")]
         skip_landability: bool,
-        /// Open this pull request against a base that is not the configured
-        /// base branch, on purpose. The trigger verdict is printed either
-        /// way; without this flag a non-default base refuses with exit 8 and
-        /// creates nothing.
-        #[arg(long = "stacked")]
+        /// Retired: a stacked pull request now names its parent with
+        /// `--stacked-on <n>`. Passing `--stacked` alone refuses and says so.
+        #[arg(long = "stacked", hide = true)]
         stacked: bool,
+        /// Open this pull request stacked on open pull request `<n>`, whose
+        /// head branch must be `--base`. Without it a base other than the
+        /// configured base branch or an integration base (`[ship]
+        /// integration_bases`, default `develop/*`, `release/*`) refuses with
+        /// exit 8 and creates nothing.
+        /// The pull request is labelled `stacked:<n>` (a repair-lane marker
+        /// only; the steward's carried-commit guard still judges it like any
+        /// other open pull request), and its body says its required checks
+        /// run only after it is retargeted onto the base.
+        #[arg(long = "stacked-on", value_name = "PR")]
+        stacked_on: Option<u64>,
         /// Skip a target after preflight.
         #[arg(long = "skip-target")]
         skip_targets: Vec<String>,
@@ -3136,9 +3221,33 @@ pub(super) enum RunnerCommand {
         /// This is the B4 write; it never arms or merges.
         #[arg(long = "wake-owner")]
         wake_owner: bool,
+        /// Seconds, per repository, after which an apply pass starts no new per-PR work: the
+        /// remaining pull requests are reported `deferred_pass_budget` and
+        /// left for the next pass, which takes them first. Keep it under any
+        /// external timeout so the pass still prints its report. 0 disables.
+        #[arg(long = "pass-budget-secs", default_value_t = 240)]
+        pass_budget_secs: u64,
         /// Override the durable retry/audit ledger path. Test hook.
         #[arg(long = "ledger", hide = true)]
         ledger: Option<PathBuf>,
+    },
+    /// Time the steward's hottest GitHub reads through `gh` and in process,
+    /// side by side, and check that both paths print the same JSON. Read-only;
+    /// prints latency and parity, never response bodies.
+    #[command(name = "steward-read-probe", hide = true)]
+    StewardReadProbe {
+        /// Exact OWNER/REPO.
+        #[arg(long)]
+        repo: String,
+        /// An open pull request to read.
+        #[arg(long)]
+        pr: u64,
+        /// Base branch for the merge-queue read.
+        #[arg(long, default_value = "main")]
+        base: String,
+        /// Rounds; each round makes every read once per transport.
+        #[arg(long, default_value_t = 5)]
+        rounds: u32,
     },
     /// Plan, and optionally apply, the unattended carrier's mechanical
     /// actions on armed, approved pull requests: rerun a cancelled required
@@ -3361,6 +3470,34 @@ pub(super) enum DaemonLauncherCommand {
     /// Stop starting the daemon through launchd. The running daemon is left
     /// alone; the next refresh spawns it directly.
     Uninstall,
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum OwnerCommand {
+    /// Register this session as the owner of a pull request (default: the
+    /// open pull request for the current branch).
+    Register {
+        /// Pull request number.
+        #[arg(long, conflicts_with = "all")]
+        pr: Option<u64>,
+        /// Exact OWNER/REPO. Defaults to the `origin` remote.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+        /// Re-register every pull request this host's records give to this
+        /// session (same session id or cmux surface), e.g. after a restart.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Hand a pull request to the repository's repair lane: the relay stops
+    /// addressing this session and uses the configured fallbacks.
+    Release {
+        /// Pull request number.
+        #[arg(long)]
+        pr: u64,
+        /// Exact OWNER/REPO. Defaults to the `origin` remote.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -4167,7 +4304,8 @@ pub(super) enum WaitCommand {
         timeout: f64,
         /// Authoritative snapshot reconciliation cadence. Defaults to 30
         /// seconds, or 120 for `--state actionable`, whose snapshot is a
-        /// full admission read.
+        /// full admission read; an actionable wait doubles its cadence while
+        /// the classification is unchanged, up to 600 seconds.
         #[arg(long = "poll-interval")]
         poll_interval: Option<f64>,
         /// Fail with exit 6 rather than polling after the first snapshot miss.
@@ -4916,6 +5054,36 @@ mod tests {
             }
         ));
         assert!(Cli::try_parse_from(["shipyard", "dependency", "pulp"]).is_err());
+    }
+
+    #[test]
+    fn stacked_on_help_does_not_claim_the_steward_excuses_the_stack() {
+        // The steward's carried-commit guard judges a labelled stack like any
+        // other open PR (`carried_commits::unrelated` never reads the label),
+        // so `--help` must not promise that the label exempts it.
+        let help = std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                use clap::CommandFactory;
+                let mut command = Cli::command();
+                let pr = command.find_subcommand_mut("pr").expect("pr subcommand");
+                let stacked_on = pr
+                    .get_arguments()
+                    .find(|argument| argument.get_id() == "stacked_on")
+                    .expect("--stacked-on argument");
+                stacked_on
+                    .get_long_help()
+                    .or_else(|| stacked_on.get_help())
+                    .map(ToString::to_string)
+                    .unwrap_or_default()
+            })
+            .expect("spawn help thread")
+            .join()
+            .expect("help thread");
+        assert!(help.contains("stacked:<n>"), "{help}");
+        assert!(!help.contains("never holds other pull requests"), "{help}");
+        assert!(help.contains("repair-lane marker only"), "{help}");
+        assert!(help.contains("like any other open pull request"), "{help}");
     }
 
     #[test]

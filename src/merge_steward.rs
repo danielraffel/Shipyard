@@ -11,6 +11,11 @@ use serde::{Deserialize, Serialize};
 
 pub use crate::stale_pr_wedge::{StalePrRunWedgeCandidate, plan_stale_pr_run_wedges};
 
+pub mod dwell;
+pub mod ejection_guards;
+pub mod next_admit;
+pub use ejection_guards::EjectionGuards;
+
 /// One current-head check observed on a pull request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StewardCheck {
@@ -145,6 +150,9 @@ pub struct StewardPolicy {
     /// Transient reruns allowed per immutable head and required check. Values
     /// above [`crate::transient_interruption::RERUN_BUDGET`] are clamped to it.
     pub max_transient_reruns: u32,
+    /// The merge-queue ejection guards the base config switches
+    /// ([`ejection_guards`]). [`EjectionGuards::default`] is all off.
+    pub ejection_guards: EjectionGuards,
 }
 
 /// Default required approval context for the server-enforced exact-head merge.
@@ -446,6 +454,21 @@ pub fn classify_pr(
             reasons: vec![DirectMergeRefusal::ValidatedBaseRevisionNotAtomic],
         }
     }
+}
+
+/// Required contexts whose newest observation on this head is a terminal
+/// failure, sorted, whatever else is still running. A cancelled check the
+/// rerun budget still covers is not counted. [`classify_pr`] reports
+/// `WaitingRequired` while any required check runs, so recovery waits for a
+/// settled head; the `blocked_on` report reads this instead so a red head
+/// never reads as merely pending
+/// ([`ejection_guards::EjectionGuards::red_outranks_pending`]).
+#[must_use]
+pub fn failed_required_contexts(pr: &StewardPullRequest, policy: &StewardPolicy) -> Vec<String> {
+    let (_, mut failed, _) = bucket_required_checks(pr, policy, &BTreeMap::new());
+    failed.sort();
+    failed.dedup();
+    failed
 }
 
 /// Sort every required rule into waiting, failed and transient-interrupted.

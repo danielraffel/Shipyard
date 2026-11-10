@@ -32,6 +32,39 @@ no model call, starts a pass when a pull request becomes reviewable, or queues o
 Kick a pass by hand only once the checks are green, because the queue skips anything else.
 See `docs/automated-draining.md`.
 
+## PR stacking and admission
+
+`shipyard pr` requires `--stacked-on <n>` for a non-default base, and the
+parent must be an open pull request in the same repository whose head is the
+requested base branch. The `stacked:<n>` label is a repair-lane marker only:
+the steward's carried-commit guard judges a labelled stack like any other open
+PR. Fleet-pass verifies the named parent and head only when deciding whether to
+retarget; a forged, stale, closed, or unreadable parent is reported and never
+retargeted automatically.
+
+## Overdue pull requests and what lands next: `shipyard overdue`, `shipyard next`
+
+Before guessing what to work on, read the steward's own answer:
+`shipyard next [--repo R] [--json]` lists the five pull requests closest to
+mergeable (stack bases first, then approved green, approved pending, green
+needing review; a stack base must itself be approved to rank first), each
+with the single thing it needs; `shipyard overdue`
+lists every pull request past its `[auto_merge.dwell]` limit with its owner
+route and any act taken. Both read the snapshot the steward's last `--apply`
+pass wrote and print its age; neither costs GitHub API budget. The steward
+takes only contract-allowed acts (re-run a stale `review-verdict` after a live
+gate read, dispatch a never-ran required check from the base's
+`[auto_merge.dwell.dispatch]` map, evaluate an overstayed approved head first,
+retarget a stack whose parent merged from its exact base branch), each after a
+live re-read of the pull request, at most three per pass, once per pull
+request, state and head, and ships them in `shadow` until the base sets
+`act = "apply"`. It never
+touches a DIRTY or held head and never arms. Gotcha: stacked pull requests are
+seen only through the open-pull-request listing the carried-commit check reads
+in the same pass, so a pass with no admission candidate holds stacked entries
+(`stack_listing: not_read_this_pass`) rather than reading GitHub again. Full
+reference: `docs/automated-draining.md`, "Dwell-time limits".
+
 ## Durable work-item contract
 
 Shipyard's existing ShipState/lease/receipt primitives are the source of
@@ -253,6 +286,35 @@ the cache key lowercases the slug (the helper still receives the caller's
 spelling), and `shipyard wait` event filters compare the payload's
 `owner/Repo` case-insensitively, so a lowercased remote still wakes on its
 webhook events.
+
+## Steward reads mint their own token and never spawn `gh`
+
+Off by default (`[github.reads] transport = "gh"`). m3 canaries it with
+`transport = "inproc"` in its machine-global config. The default flips once
+canary passes show `api_calls.fallbacks` empty and the read probe matches.
+When on, the steward's reads (`src/github_read`) do not spawn `gh`, so the `ghapp`
+wrapper never re-mints for them. Shipyard parses the canonical
+`[github.auth] token_command` (`[WRAPPER, "token", "--app-id", ID,
+"--private-key", PATH, "--repo", "{repo_slug}"]`, optional
+`--scope-repository`). Any other shape keeps every read on `gh`. It checks the
+key exactly as the helper does: a regular file, mode 0600, owned by the user,
+in a 0700 directory. It signs the App JWT in process, looks up
+`repos/R/installation`, and mints. The token stays in memory (`Zeroizing`,
+with `Debug` redacted) until 5 minutes before it expires. A 401 re-mints once.
+A refused credential sends that repository's reads to `gh` for 60 s.
+Gotchas:
+
+- Parity is gh's *printed* shape, not GitHub's. For `pr view`, a bot author
+  is `app/<login>` and a pending check has conclusion `""` and completedAt
+  `0001-01-01T00:00:00Z`. A status context reports `startedAt`, and a head
+  with no checks is `[]`. Changing a field set in a steward `pr view` means
+  adding it to `PrField`, or that read silently goes back to `gh`.
+- A new steward read is in process only if it is a bare `gh api repos/...`, a
+  read-only `gh api graphql`, or a supported `pr view`. Adding `--jq`,
+  `--paginate` or `-H` sends it back through the wrapper chain. That is
+  correct, but it brings back the slow path.
+- `runner steward-read-probe --repo R --pr N` is the parity and latency check
+  to run after touching any of this.
 
 ## The writer-domain lease, for tools outside Shipyard
 
@@ -647,6 +709,27 @@ Every merge carry a landing accepts is logged to `carries.jsonl` with its
 verdict id and both merge bases. Read-only evaluations (`dry_run`: the
 `review-verdict` status, `train status`) never append a row.
 
+## A required check bound to Actions is not bound to a workflow
+
+A ruleset can bind a required context to the GitHub Actions app (15368) but
+not to a workflow file, so any workflow in the repository, including one the
+PR rewrote, can satisfy it. For a repo listed in
+`head_approval::trusted_signal::TRUSTED_SIGNAL_REPOS` (today
+`Generous-Corp/vellum` → `framework-trusted-verify`), or opted in with
+`trusted_signals = [{ name, workflow }]` in the head-approval config, the
+steward checks every same-named commit status on the exact head against its
+run (exact same-repo run URL, the named workflow path, `pull_request_target`,
+`head_sha` equal to the PR head, `head_branch` equal to the PR's head branch),
+then requires the workflow's newest run on that head to have succeeded and the
+newest status to be `success` and name that run. A same-named check run is a
+spoof, and every PR headed by this commit must target `main`.
+Enforcement starts once the base branch's current tip has the workflow file
+(never the PR's `base.sha` snapshot); otherwise the PR that adds the workflow
+could never land. A refusal or an API error never admits
+(`HeadGate::UntrustedSignal`). It guards against accidents, not a pusher;
+retargeting after the run and `merge_group` forgery remain open until a
+dedicated judge App exists.
+
 ## Rollups: several approved pull requests as one tested merge
 
 Off unless the base's `.shipyard/config.toml` sets `[train] enabled = true`
@@ -724,7 +807,7 @@ merge-only rule as an approval. The steward itself still requires the status
 on the head until the train admits PRs.
 Before it enqueues or merges a head, the steward also refuses one that carries
 commits of another open PR whose head is not approved
-(`carries_unapproved_commits:#Q`; see `docs/automated-draining.md`). A PR stacked on P, directly or through other open PRs' branches, or one that only inherits P's commit (not in its own diff against its own base), never counts as carrying. A PR whose listing is over the 250-commit cap is judged by its own diff against its own base, and an unapproved one whose own diff is still over the cap blocks P only if probing P's commits (at most 50) cannot rule out that it carries them (`carried_commits_over_cap:#Q`).
+(`carries_unapproved_commits:#Q`; see `docs/automated-draining.md`). A PR stacked on P, directly or through other open PRs' branches, or one that only inherits P's commit (not in its own diff against its own base), never counts as carrying. Nor does a PR that merged P's branch: a shared commit counts only if it is on Q's first-parent chain or not on P's own first-parent chain, so P's own commits reaching Q through a merge's second parent do not hold P, while P merging held work in or building on commits on Q's own first-parent chain is still refused (residual: P built on commits Q itself merged in as a second parent is cleared; see `docs/automated-draining.md`). A PR whose listing is over the 250-commit cap is judged by its own diff against its own base, and an unapproved one whose own diff is still over the cap blocks P only if probing P's commits (at most 50), or for a larger P the roots of P's commits (at most 50), cannot rule out that it carries them (`carried_commits_over_cap:#Q`). A P that is itself over the cap (a mirror-history import) is checked the other way: P's head is probed against the roots of each other open PR's own commits, so it is admitted unless it carries an unapproved PR's commit, or an unapproved PR is too large to settle.
 
 ## The carrier re-arms with `expectedHeadOid`, through the internal path
 
@@ -842,6 +925,16 @@ after a 20 minute grace, at most 3 attempts, then fails naming the failing
 steps (`scripts/release_draft_heal.py`). The signing job's Rust install retries
 3 times because the self-hosted runner has lost `static.rust-lang.org` for
 minutes at a time (v0.381.0, v0.383.0).
+
+A signing job stuck at "syncing channel updates" is usually LuLu, not the
+network: the release Macs' outbound firewall approves per executable path. The
+job therefore installs rustup and the pinned toolchain at a fixed path,
+`~/.shipyard-release-rust` on the runner user (`scripts/ci_macos_release_rust.py`),
+and the owner approves its `rustup` and toolchain `cargo` once per host
+(v0.393.0 and v0.394.0 stayed Linux-only drafts while it used a per-run path).
+A job that fails with "changed since it was installed and verified" found a
+modified toolchain: inspect it before removing the toolchain directory and its
+`toolchain-*.sha256` marker. Rerunning will not clear it.
 The identity manifest (`shipyard-release-manifest.json`) names each published
 asset once. Each per-target package directory holds its own unpublished
 `checksums.sha256`; v0.383.0's manifest listed both Linux copies, and
@@ -904,6 +997,23 @@ the one call was slow: `<N>` is whatever was left of the deadline. Each read
 inside it is capped per attempt and retried once on a timeout, 5xx or dropped
 connection, within the same deadline. The PR is decided again on the next
 pass; there is nothing to repair on the PR.
+
+When a steward pass is slow or times out, read its `api_calls` (per repository
+in `runner steward --json`: REST, GraphQL, cache hits and a per-call-site
+breakdown) from a dry run before changing anything. A pull request whose
+failure the steward already published costs no GitHub read in later passes;
+the pass cache reuses only base-policy and content-addressed reads, never a
+review, comment, check, status, queue or pull-request read. The census reads
+current-head checks six heads per GraphQL rollup query and rereads a head's
+status history over REST only when the rollup shows a new status. See the
+[merge-steward reference](references/merge-steward.md#what-a-pass-costs-github-api_calls).
+
+When a pass exits 1 but a repository's `errors` is empty, read that
+repository's `exit_reasons`: one entry per cause (`repo_errors:N`,
+`pr_errors:#A,#B` for pull-request refusals such as an unapproved carried
+commit, `cancellation_errors:<run ids>`, `rate_limited`,
+`uncertain_mutations`, or `unclassified`). It is omitted for a healthy
+repository.
 
 It judges each first-parent change since the last `Version-Bump-Applied` marker
 on its own, then takes the highest level per surface. A
@@ -1098,7 +1208,10 @@ malformed authority, and a non-null queue still stop or select the queue path.
 
 Never treat queue absence alone as permission to rearm. The PR must first have
 been observed in the queue (durably recorded across restarts), and only an
-`invalid_merge_commit` removal may be re-enqueued automatically. Admission is
+`invalid_merge_commit` removal may be re-enqueued automatically (except by the
+merge steward's own enqueue on a merge-queue base, whose retry discipline
+refuses it on the same head; the `--arm-unqueued` backstop does not apply the
+discipline; see `docs/automated-draining.md` "Ejection guards"). Admission is
 also head-scoped: `auto-merge` and the steward's ordinary enqueue read the PR's
 queue timeline and refuse a head removed for `failed_checks` /
 `merge_conflict` with no new head since, even from a ship-state created after
@@ -1640,6 +1753,13 @@ first). Naming `/usr/bin/python3` made every fleet-update to a Mac whose Xcode
 license had lapsed exit 69 -- including a rollback -- while a plain
 `shipyard update` on the same host worked. The immediate host fix is
 `sudo xcodebuild -license accept`.
+
+A refreshed daemon whose launch argv omits its watch set fails fleet-update's
+launch binding (`launch identity: rendered argv sha256 … != loaded argv
+sha256 …`) and rolls the host back. That was a refresh on a host with no
+running daemon: `daemon run` without `--repo` defaulted to the fleet. Spawn
+sites now pass the resolved default explicitly, so the refresh run by the
+release being installed binds whether or not a daemon was running.
 
 `--lagging-only` reads each selected host first and skips
 hosts already at or ahead of the target. Reinstalling such a host cannot be
@@ -2456,6 +2576,19 @@ Because TartCI invokes `shipyard` by name from `PATH`, a gate fix ships by
 replacing that binary. No TartCI generation, supervisor restart or `pool off` is
 involved — each admission call is a fresh process.
 
+- **Its REST cost lands on the installation everyone else spends.** A clean
+  `--apply` verdict reads each managed head's check runs and statuses once for
+  the observation, once for its fence, and again for the revalidation and its
+  fence. On Pulp with 14 managed heads that was 125 REST reads per verdict,
+  twice per VM, on the same installation the steward, reviewers and agents
+  use, so a busy hour starved the gate (`API rate limit exceeded for
+  installation`). Admission reuses argv-determined reads for three minutes
+  (`SHIPYARD_ADMISSION_READ_CACHE_SECS`, `0` disables) and, when the machine
+  config names `[github.admission_auth]`, reads with that credential instead
+  (see `docs/github-app-quota.md`). Do not "fix" this by putting
+  `statusCheckRollup` back on the census: that is the backlog-scaled snapshot
+  above.
+
 ## Runner Watchdog (self-hosted runner recovery)
 
 Shipyard ships a `runner` subcommand family for detecting and recovering from
@@ -2494,7 +2627,7 @@ hours.
   live serialized protected-main `Shipyard merge steward` workflow; its exact
   workflow ref, event, SHA, run, and attempt are re-read from GitHub and bound
   with the candidate fingerprint in the remote receipt.
-- `shipyard runner admission-clean --repo <owner/repo> --base main --labels self-hosted,<exact-labels> --apply --json` — TartCI's last pre-JIT correctness gate. It emits a flat schema-v1 verdict with exit 0 `admit`, 3 `defer`, 1 operational error, or 2 invalid configuration. It inspects only managed PR/merge-group runs: a compatible queued job inside a superseded queued workflow may authorize cancellation, while one inside an `in_progress` workflow blocks admission but is never cancelled. Every GitHub call made while holding the exact-key observation lock shares one 120-second absolute budget. Observation or stewardship contention returns typed `observation_in_progress` or `stewardship_in_progress` defer; a timeout or other non-contention observation or lock failure releases the lock and returns a typed error with bounded underlying detail. A non-authority machine returns `mutation_authority_required` instead of mutating. TartCI must treat every result except typed `admit` as fail-closed and discard the still-unregistered VM.
+- `shipyard runner admission-clean --repo <owner/repo> --base main --labels self-hosted,<exact-labels> --apply --json` — TartCI's last pre-JIT correctness gate. It emits a flat schema-v1 verdict with exit 0 `admit`, 3 `defer`, 1 operational error, or 2 invalid configuration. It inspects only managed PR/merge-group runs: a compatible queued job inside a superseded queued workflow may authorize cancellation, while one inside an `in_progress` workflow blocks admission but is never cancelled. Every GitHub call made while holding the exact-key observation lock shares one 120-second absolute budget. Observation contention returns typed `observation_in_progress` defer. A running steward apply pass returns `stewardship_in_progress` only when admission must resume a pending cancellation; cancelling a superseded run proceeds under the per-run mutation guard without waiting on the steward ledger lock, with its audit line written to `merge-steward-admission-audit.json` while a steward holds that lock, and a merge-queue control lock held by another process for its own mutation defers `mutation_in_progress`; read-only verdicts read the atomically published ledger snapshot instead of waiting on the steward's lock, and a pending cancellation there still defers `cancellation_pending`; a timeout or other non-contention observation or lock failure releases the lock and returns a typed error with bounded underlying detail. A non-authority machine returns `mutation_authority_required` instead of mutating. TartCI must treat every result except typed `admit` as fail-closed and discard the still-unregistered VM.
 - `shipyard runner kill --pid X --reason "..."` — kill a specific Worker; requires typed `KILL` confirmation
 
 ### `runner kill` recovery sequence
@@ -3640,6 +3773,8 @@ merges directly), the steward, as that base's single admission writer, also
 sweeps every open PR, owned or not, and withdraws what the exact-head gate does
 not admit. Other branches are covered only by running the steward per base.
 
+A pass past `--pass-budget-secs` (default 240; 0 disables), or after GitHub reports the API rate limit exceeded, starts no new per-PR work: remaining rows report `deferred_pass_budget`, are never admitted, armed, enqueued or dequeued, and are taken first next pass. Keep the budget under the scheduler's timeout so the report still prints.
+
 Every row of a steward pass also names why that pull request is not merging:
 `blocked_on` (one token, such as `no_verdict`, `held`,
 `approval_excluded:unattributed`, `required_never_ran:<contexts>`,
@@ -4251,7 +4386,26 @@ the live approval gate, so a HOLD still blocks) re-enqueues that exact head
 once. Anything else, or a second ejection, stays
 `blocked_on=ejected_same_head:<cause>` with the reason (failing job, whether the
 retry is spent) in `blocked_detail`: that is the repair lane's cue. `cancelled`
-alone is not infra; a cancelled check is placed by comparison. The `ghapp`
+alone is not infra; a cancelled check is placed by comparison.
+
+**On a merge-queue base the steward's retry discipline narrows that retry**
+(`[auto_merge] infra_only_same_head_retry`, default on with a merge queue): only
+infra clears a check (a runner conclusion or `cancelled`, a lost-runner
+annotation, a network/interruption signature, or a step-timeout / HTTP 5xx /
+rate-limit / runner-shutdown line at the failing step,
+`INFRA_STEP_SIGNATURES`; the widened readings and `cancelled` also need the same
+check passed on the head); "passed on the head" alone and "fails on the base"
+no longer do (except a listed `[auto_merge] known_flaky_tests` name, when the
+ctest FAILED block names only listed tests and the check passed on the head),
+and `invalid_merge_commit` is never re-enqueued on the same head. Refusals
+read `ejected_same_head:<cause>:needs_new_head`: push a fix, or for
+`invalid_merge_commit`/`merge_conflict` merge the base once and push once. The
+same `[auto_merge]` table holds `generated_paths` (globs) and
+`generated_path_batch_guard`: a head that changes a generated path a queued entry
+also changes waits as `generated_path_batch:#<n>` (no error, nothing to do; it
+arms on the next pass after `#<n>` leaves), and `red_check_outranks_pending`,
+under which a red required check reports `blocked_on=required_failed` while others still run (admission and recovery still wait for a settled head).
+See `docs/automated-draining.md` "Ejection guards". The `ghapp`
 Python guard does not mirror this class, so do not expect a manual `ghapp` arm
 of such a head to pass.
 
@@ -4321,7 +4475,9 @@ arm, the classic merge, the steward backstop), with no override: `--arm` only
 asks for an arm the verdict allows. An approval comment stamped (by `ghapp`) with the arming agent id
 (`SHIPYARD_AGENT_ID`) is `SelfApproved`: an agent cannot approve its own
 landing; a shared session alone never refuses, and unstamped verdicts count
-as before. `shipyard who --pr N` names the host and session (and agent, when
+as before. `shipyard who --contact N` names and probes the cmux address of the session
+that owns PR N (`shipyard owner register|release`; `shipyard relay` delivers
+PR events to it, docs/owner-relay.md). `shipyard who --pr N` names the host and session (and agent, when
 recorded) behind each
 queue and merge event from the guards' ledgers on every host. `shipyard
 review-verdict --pr N [--head SHA] --json` gives the same decision with the
@@ -4417,6 +4573,23 @@ and stop landings that never pass through `ghapp`
 (docs/review-verdict-status.md). It is `pending` while a head awaits its
 reviewer (the steward reads that as waiting, not `required_failed`; nothing for
 the author to do) and `failure` only for a counted HOLD or an unreadable review.
+
+A HOLD makes its head un-approvable, so posting an APPROVE of a held head
+only makes the pull request look approved. The managed
+`verdict-contradiction-guard` refuses that APPROVE before it posts (same
+counting rule as the gate, from any signer) and names the HOLD's signer and
+URL; the author pushes a new head (merging the base) and the reviewer
+reviews that. It also refuses a verdict that contradicts the same session's
+opposite verdict on the same head within ten minutes; a deliberate
+retraction of one's own APPROVE posts with `SHIPYARD_VERDICT_RETRACT=1`. The
+steward reports such a row as `held` with `blocked_detail` "held head: needs
+a new head", which `shipyard wait pr --state actionable` prints.
+
+`wait pr --state actionable` spends a full admission read per tick on the
+shared App installation budget. It backs off from 120 to 600 s while the
+classification is unchanged, shares the host's admission read cache, and
+reports its spend as `data.github_reads` in `--json`. Concurrent agent waits
+drained that budget before the backoff; keep to one wait per PR.
 
 Every rule above judges comments posted through the shared fleet App, which
 every agent can use, so none of it is proof of who reviewed. A base with
@@ -5353,7 +5526,7 @@ have deleted something load-bearing:
 |---|---|
 | `worker_process_custody.rs` | generic OS process custody, zero references to any workstream code. Only the word "custody" matched. |
 | `verify_current_companion_digest` | the parallel-proof canary's trust boundary (NOFOLLOW open, uid, `nlink == 1`, mode bits, TOCTOU dev/ino recheck). It merely *lived* in the deleted provider module. |
-| `runner steward --ledger` | the merge steward's retry/audit JSON file, not the work ledger. Pulp CI passes it on every run, so cutting it breaks Pulp. |
+| `runner steward --ledger` | the merge steward's retry/audit JSON file, not the work ledger. Pulp CI passes it on every run, so cutting it breaks Pulp. Superseded-run cancellations that `runner admission-clean` makes while a steward pass holds that ledger's lock are audited in `merge-steward-admission-audit.json` beside it instead; the durable per-mutation record for every cancellation is still the ship-state merge-queue guard audit (`guard.finish`). |
 | `shipyard-workstream-provider` | a release-pairing artifact. `package_release.py` fails the build without it, `install.sh` requires it, `fleet update` verifies its digest. Only one *entry point* was dead. |
 
 So when scoping a removal here, never decide by name match. Read the
@@ -5811,3 +5984,8 @@ validation failures are not retried. Deadline-bound observations retain their
 existing deadline. An enqueue mutation returning HTTP 502 has an unknown
 outcome: read back the live queue before reconciliation; these read retries do
 not authorize repeating an enqueue.
+
+The PR owner marker (`<!-- shipyard-owner: ... sid=<id> ... -->`) writes the
+session id as `sid=`, never `session=`: the ghapp stamp guard refuses any body
+comment containing the word "session" as a possible reviewer stamp. Readers
+still accept the legacy `session=` key.

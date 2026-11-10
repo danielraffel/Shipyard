@@ -372,7 +372,7 @@ repository with no required checks is watched for everything but red checks.
 | `queue_removed` | the merge queue removed it for any reason but a merge |
 | `queue_stuck` | it has been in the merge queue for `--queue-stuck-after` (90m) |
 | `approved_unarmed` | the head has been approved for `--approved-unarmed-after` (15m) and nothing armed or queued it |
-| `held_unrepaired` | a trusted HOLD names the current head (a later APPROVE of the same head does not clear it), nothing was pushed since (a push makes the verdict name an old head), and it is older than `--held-after` (60m). An armed or queued head is `armed_unapproved`'s, and a draft is skipped |
+| `held_unrepaired` | a trusted HOLD names the current head (a later APPROVE of the same head does not clear it), nothing was pushed since (a push makes the verdict name an old head), and it is older than `--held-after` (60m). Its summary and fix start "held head: needs a new head". An armed or queued head is `armed_unapproved`'s, and a draft is skipped |
 | `owner_decision`, `superseded`, `parked` | the pull request carries the label `owner-decision`, `superseded` or `PARKED/<why>` (case-insensitive; that precedence when several). It is reported once per head under its own state and **skipped by every stall rule** (`ready_unreviewed` through `approved_blocked`, `held_unrepaired`, `queue_*`), so a deliberately set-aside pull request does not alarm. `verdict_posted` still relays a verdict |
 | `approved_blocked` | the head is approved but `DIRTY` or `BEHIND` (live passes only: GitHub keeps no history of merge state) |
 | `host_alarm` | a `[tartci] ...` issue opened in `--alarm-repo` |

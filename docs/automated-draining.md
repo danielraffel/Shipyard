@@ -103,8 +103,22 @@ already on the base never count, nor does Q when it is P's own base-branch
 pull request, is stacked on P (following its base branch through other open
 pull requests' head branches reaches P's head branch), only inherits the
 commit (a commit counts as Q's only if it is in Q's own diff against Q's own
-base branch; a Q that merged P's branch still has it there and still holds
-P), or is a Shipyard rollup that merged P's head. Land or
+base branch), merged P's branch without being stacked on it, or is a Shipyard
+rollup that merged P's head. A shared commit counts against P only when it is
+on Q's first-parent chain (`Q.base..Q.head` followed through first parents) or
+is not on P's own first-parent chain (`base..P.head`): a commit on P's
+first-parent chain that reached Q only through a merge's second parent is P's
+own. When every shared commit is P's own, Q does not hold P, and a refusal P
+still gets from another pull request ends with `#Q merged #P's branch; not
+carried`. P merging held work in (the held commits are P's second parent) and
+P built straight on commits on Q's own first-parent chain (they are on both
+chains) are still refused, and a first-parent read that fails or is over the
+cap keeps the overlap. Q's own diff and its first-parent chain come from one
+read of `Q.base...Q.head`. Named residual: P built straight on commits that a
+held Q itself took in through a merge's second parent (Q = merge(Q.base, X)
+with P on X, or Q's tip re-hung as merge(Q.base, old tip)) is cleared, because
+the commit graph cannot tell that from Q having merged P's branch; X then
+lands under P's own approval, so P's reviewer reviews X as part of P's diff. Land or
 approve Q first, or drop its commits from P; a branch built on another pull
 request should target that pull request's branch. At most 250 commits are read
 per pull request. A Q whose listing is larger (for example a stacked pull
@@ -113,10 +127,33 @@ the steward reads Q's own diff against Q's own base (`Q.base...Q.head`, paged),
 and the cap applies to that. If Q's own diff is still over 250 commits, an
 approved Q is ignored, and for an unapproved Q each of P's commits (at most 50)
 is probed: it counts only if Q's head reaches it and Q's base does not. So an
-over-cap Q that carries none of P's commits never blocks P. Only when that
-cannot be settled (P has more than 50 commits to probe) does P fail closed
-(`carried_commits_over_cap:#Q`); a P that is itself over the cap fails closed as
-`carried_commits_over_cap:#P`. An unreadable listing, compare, probe or
+over-cap Q that carries none of P's commits never blocks P. When P has more
+than 50 commits to probe, the steward reads P's own commits not on the base
+with their parents (`base...P.head`) and probes whether Q's head reaches each
+root of that set (at most 50 roots). Every commit of P's set has its parents
+in the set or on the base, so a Q head that reaches any of P's commits reaches
+one of those roots; a Q head that reaches none of them shares no commit off the
+base with P and does not block it. This is the same as "every merge base of P
+and Q is on the base", without relying on the single merge base the compare API
+reports, which a criss-cross history can have several of. Only when that
+cannot be settled either (Q's head reaches a root of P's, P's graph is
+incomplete or has more than 50 roots) does P fail closed
+(`carried_commits_over_cap:#Q`); a failed read there fails closed as
+`carried_commits_unreadable:#Q`. A P that is itself over the cap (for example a
+mirror-history import of thousands of commits) cannot list its own commits, so
+the check runs the other way: for every other open Q (the same exclusions
+apply), the steward reads Q's own commits not on the base with their parents
+(`base...Q.head`, narrowed to `Q.base...Q.head` for a Q on another branch) and
+probes whether P's head reaches each root of that set (a commit none of whose
+parents is in it). P carries some commit of Q's exactly when it reaches a root,
+so a P that reaches none of an unapproved Q's roots is not held by Q, and one
+that does is refused with `carries_unapproved_commits:#Q` naming the roots it
+reaches. An unapproved Q whose own commits are over 250, with more than 50
+roots, or past the 100 probes one over-cap P may make in a pass, refuses P as
+`carried_commits_over_cap:#Q`. Each Q's roots are read once per pass and
+reused across candidates. A paged compare whose total or merge base changes
+between pages (the base moved mid-read) fails closed until the next pass.
+There is no label or override that skips the check. An unreadable listing, compare, probe or
 approval, or a Q pushed after the pass listed it, also fails closed
 (`carried_commits_unreadable`;
 the next pass re-reads it). The check applies only where the base
@@ -128,7 +165,39 @@ merged another branch that carried a held pull request's commits; its own
 diff was approved and the held code reached main. On 2026-11-05 one
 unapproved stacked pull request whose listing was over the cap refused every
 approved pull request on main, though it carried none of their commits; the
-own-diff read and the per-commit probe end that.)
+own-diff read and the per-commit probe end that. On 2026-11-07 an approved
+re-export carrying a 2,724-commit mirror-history import was refused only for
+its own size; the reverse root probe ends that. On 2026-11-08 three ready
+pull requests on main were each held by a stacked pull request that had merged
+their branch; every shared commit was on the held pull request's own
+first-parent chain, and the stacked pull request, whose base is not main, was
+never going to be reviewed. The first-parent rule ends that.)
+
+No stacking by default: `shipyard pr` refuses a base other than the
+configured one unless `--stacked-on <n>` names the open parent pull request,
+and then labels the new pull request `stacked:<n>`. Long-lived integration
+bases are not stacks and pass unstacked: `[ship] integration_bases` lists them
+as patterns (`*` within one path segment, `**` across segments), defaulting to
+`["develop/*", "release/*"]`; an explicit list replaces the defaults and `[]`
+allows none.
+
+```toml
+[ship]
+integration_bases = ["develop/*", "release/*"]
+```
+
+The `stacked:<n>` label records the parent of a stacked pull request and keeps
+that head out of review and admission until it is retargeted. It does not waive
+the carried-commit guard: an unrelated candidate is still held when it carries
+commits introduced by a labelled Q whose current head has no APPROVE (or has a
+HOLD). A label anyone added by hand, naming a pull request that is not the
+stack's parent, has no effect on that guard. When `<n>` merges, the repair and operator passes
+list the stack immediately as `STACK-BASE-MERGED parent:#<n>`; they retarget it
+onto main, merge main, push once and comment `retargeted: ...`. A parent closed
+without merging is `STACK-PARENT-CLOSED`, a label whose pull request's head is
+not the stack's base is `STACK-LABEL-MISMATCH`, and a parent that cannot be
+read (a bogus number) is `STACK-PARENT-UNREADABLE`, reported without aborting
+the rest of the listing. None of those three is retargeted.
 
 Labels keep a pull request out of admission, and the steward refuses it:
 `owner-decision`, `superseded` and `PARKED/<platform>`. `PARKED/<platform>`
@@ -283,7 +352,7 @@ not listed as blocked.
 | Token | Meaning | Who moves it |
 |---|---|---|
 | `no_verdict` | Green, and no reviewer verdict names this head: "awaiting the standing reviewer; nothing for the author to do" | reviewer |
-| `held` | A counting HOLD names this head | author: fix and push |
+| `held` | A counting HOLD names this head, so it is un-approvable and any APPROVE of it is ignored; `blocked_detail` reads "held head: needs a new head" | author: fix and push a new head (if the HOLD is wrong, push a new head anyway and comment `dispute: <reason>`) |
 | `approval_excluded:<reason>` | An APPROVE names this head but does not count. Reasons: `unattributed`, `no_stamp`, `noncanonical_stamp`, `session_not_allowed`, `unlisted_stamp_session`, `no_signer_list`, `no_signer_line`, `uncounted_signer`, `unbound_identity`, `pr_author`, `impersonated_app`, `untrusted_reviewer`, `unlisted_reviewer`, `unlisted_human`, `predates_head` (posted before the head commit), `stale_head` (only an earlier head is approved), `self_approved` | reviewer or fleet config |
 | `ejection_cap` | The queue removed this head too often since its last approval | reviewer, or a new push |
 | `approval_unread` | The approval gate could not be read this pass | next pass |
@@ -291,20 +360,23 @@ not listed as blocked.
 | `excluded_label:<label>` | `superseded`, `PARKED/<platform>` or the opt-out label | whoever owns the label |
 | `provenance_blocked:<labels>` | A provenance-blocking label | owner |
 | `required_never_ran:<contexts>` | A required context has no run on this head and nothing from its source is still queued or running (often a renamed check: merge the base to re-run CI) | repair lane |
-| `required_pending` | Required checks are queued or running, or have not appeared yet behind a running job. A `pending` `review-verdict` status (head awaiting its reviewer) also reads here, with the reviewer as actor, never as `required_failed` | CI, or the reviewer |
-| `required_failed:<contexts>` | A required check failed. When the only red context is the approval context (`review-verdict`), the row names the approval token instead; an apply pass that did not read the gate for that head keeps this token and says so in `blocked_detail` | author or repair lane |
+| `required_pending` | Required checks are queued or running, or have not appeared yet behind a running job, and none has failed. A `pending` `review-verdict` status (head awaiting its reviewer) also reads here, with the reviewer as actor, never as `required_failed` | CI, or the reviewer |
+| `required_failed:<contexts>` | A required check failed. On a merge-queue base (`red_check_outranks_pending`, see [Ejection guards](#ejection-guards)) this outranks `required_pending`: a red head reads failed while its other checks still run. No red required check is ever admitted, whichever token it reads. When the only red context is the approval context (`review-verdict`), the row names the approval token instead; an apply pass that did not read the gate for that head keeps this token and says so in `blocked_detail` | author or repair lane |
 | `transient_rerun` | The steward is rerunning an interrupted check | steward |
 | `merge_state:<STATE>` | GitHub says `DIRTY`, `BEHIND`, `UNSTABLE`, ... | repair lane: merge the base |
 | `ejected_same_head:<cause>` | The queue ejected this exact head and the steward will not re-enqueue it: the failure is the head's, could not be placed, or the head's one retry is spent. `blocked_detail` carries the classifier's reason (the failing job and whether the retry was spent). Read from the same queue state in a dry run and an apply pass; `since` is the removal | repair lane |
+| `ejected_same_head:<cause>:needs_new_head` | The same, under the retry discipline ([Ejection guards](#ejection-guards)): `<cause>` is `failed_checks` with no infrastructure signature, `merge_conflict`, or `invalid_merge_commit`. Only a new head moves it; for `invalid_merge_commit` or `merge_conflict`, merge the base once and push once | author or repair lane |
+| `generated_path_batch:#<n>` | Approved and green, but this head changes a generated path (`[auto_merge] generated_paths`) that queued entry `#<n>` also changes; `blocked_detail` names the shared paths. Not an error: the steward admits it on the first pass after `#<n>` leaves the queue | steward (nothing to do) |
 | `waiting_full_test_tier`, `waiting_enqueue_requirements` | Admission waits on a deferred check tier or a GitHub requirement | CI |
 | `carries_unapproved_commits:#Q` | Approved and green, but carries commits of open pull request #Q, whose head is not approved; `blocked_detail` names the commits | Q's reviewer, or the author: drop Q's commits |
-| `carried_commits_over_cap:#N`, `carried_commits_unreadable` | Whether the head carries unapproved commits could not be proven (P over 250 commits; or an unapproved #N whose own diff is over 250 commits while P has more than 50 commits to probe; or a failed read) | author, or next pass |
+| `carried_commits_over_cap:#N`, `carried_commits_unreadable` | Whether the head carries unapproved commits could not be proven (an unapproved #N whose own diff is over 250 commits while P has more than 50 commits to probe and #N's head reaches a root of P's commits, or P's commits have more than 50 roots; for a P over 250 commits, an unapproved #N whose own commits are over 250, have more than 50 roots, or exceed P's 100 probes; or a failed read) | author, or next pass |
 | `revalidating` | The head or queue changed during the pass | next pass |
 | `waiting_code_owner:<owners>` | Approved and green, but the base's ruleset requires a code-owner review and no owner `CODEOWNERS` (at the base) assigns to a changed file has approved this exact head. The steward asks GitHub nothing and records no mutation; it posts one comment per head mentioning the owners (`+`-joined in the token). It never reads `reviewDecision`, which is `null` on a base that requires zero approvals even after the owner approves. A team or e-mail owner, or a file the PR author owns, is left to GitHub | code owner |
 | `code_owner_review` | GitHub refused the enqueue: a code-owner review is outstanding. Recorded `rejected` with GitHub's message, never left uncertain | code owner |
 | `enqueue_refused:<message>` | GitHub definitively refused the enqueue for another reason, quoted | author or owner |
 | `uncertain_mutation` | An earlier enqueue of this pull request is still uncertain because GitHub's state could not be read; only this pull request waits | next pass, or operator |
 | `steward_error` | Admission failed; see `error` | operator |
+| `deferred_pass_budget` | The pass spent its time budget (or hit the API rate limit) before this row and did nothing for it; the next pass takes it first. See "Things that bite" | next pass |
 | `admission_pending` | Admission returned an outcome with no token of its own; see `blocked_detail` | next pass |
 | `queued` | In the merge queue | queue |
 | `admitted` | Enqueued or merged this pass (outranks any label) | nobody |
@@ -338,6 +410,225 @@ Reads are a full admission pass, so the default `--poll-interval` is 120
 seconds for this state. The ledger used for transient-rerun budgets is the
 local one; on the steward host it is the steward's own.
 
+## Ejection guards
+
+An ejected pull request costs the batch it broke a rebuild and costs itself
+hours: on Generous-Corp/pulp over one week (2026-11-02..09) an ejected pull
+request took a median of 231 minutes from first entry to merge, against 31
+minutes for one that merged first time. Of 59 ejections, 19 were two batch-mates
+changing the same generated file, 18 were flakes or infrastructure, and 4 were
+`invalid_merge_commit` (one head re-enqueued three times in 21 minutes). The
+steward runs three guards against what it can see coming. Each is a key in the
+**base** branch's `.shipyard/config.toml` `[auto_merge]` table (never read from a
+head) and each defaults **on** for a base with a merge queue, off otherwise:
+
+```toml
+[auto_merge]
+generated_paths = [                       # globs: `**` whole segments, `*` within one
+  "test/ctest_script_inputs.json",
+  "test/ctest_script_inputs/**",
+]
+generated_path_batch_guard = true         # default: on with a merge queue
+red_check_outranks_pending = true         # default: on with a merge queue
+infra_only_same_head_retry = true         # default: on with a merge queue
+known_flaky_tests = []                    # names or `*` globs; empty by default
+```
+
+- **Generated-path batch guard.** Before an enqueue the steward re-reads the
+  queue live; when another entry is queued it reads the candidate's changed
+  files (one GraphQL `files(first:100)` page, cached for the pass; paged to
+  GitHub's 3000-file limit only for a larger pull request). When the candidate
+  changes a generated path it reads each queued entry's files; the first entry that changes the same path defers
+  the candidate as `generated_path_batch:#<n>`, with no mutation and no error.
+  It is admitted on the first pass after `#<n>` leaves the queue. A file list
+  that cannot be read never admits (`steward_error`); one that is still
+  incomplete after paging is compared by the other side's generated paths, so
+  it can only defer. Two different files under one glob (two shards) do not
+  collide; only the same path does. With no `generated_paths` the guard never
+  defers. What it prevents: the two heads sharing one batch, so a textual
+  conflict or drift no longer ejects the batch-mate, and the deferred head
+  meets the other's change as a `DIRTY` merge state (merge the base) instead
+  of in the queue. A deferred head that merges textually but whose generated
+  file drifts against the merged tree can still be ejected once; it then
+  needs a regenerate commit either way. A deferred head gets no priority over
+  a fresh one in the next pass.
+- **A red required check outranks a pending one.** A head with a failed
+  required check reports `blocked_on=required_failed:<contexts>` (the running
+  contexts in `blocked_detail`) even while another required check is still
+  running, instead of `required_pending`. Only the report changes: admission
+  still waits, and the recovery worker still waits for a settled head before
+  it asks an agent. Every enqueue already re-reads the head's
+  checks live and refuses any red required check; Generous-Corp/pulp#11698's
+  red version check (cited as "armed red") went red at 03:21, after its last
+  enqueue at 03:05. What re-enqueued it was the next guard's gap.
+- **Retry discipline.** The one free same-head re-enqueue after a
+  `failed_checks` ejection is spent only on an infrastructure signature: a
+  runner conclusion (`timed_out`, `startup_failure`, `stale`) or `cancelled`, a
+  lost-runner annotation, a network or interruption signature, or, at the
+  failing step's own error, GitHub's step-timeout line (`has timed out after`),
+  an HTTP 5xx or `rate limit exceeded` download answer, or the runner's own
+  shutdown lines (`INFRA_STEP_SIGNATURES` in `src/environment_requeue.rs`). A
+  check that merely passed on the head, or also fails on the base tip, is not
+  retried: on Pulp every merge-group-only failure passed on its head; of 23
+  same-head retries 12 merged and 9 failed again the same way. The discipline
+  trades some of those 12 flake recoveries (which now need a new head) for
+  the 9 wasted group builds; turn it off per base if flakes dominate. The
+  widened readings (a step-timeout, HTTP 5xx or rate-limit line, a
+  `cancelled` conclusion) clear the head only when the same check passed on
+  the head itself. A ctest-level `***Timeout` is not an infrastructure line;
+  a step or job timeout is, deliberately, so a hang only the merged tree
+  exercises can still spend the head's one retry.
+
+  **Known flakes** (`known_flaky_tests`): under the discipline, a failing
+  required check also earns the one same-head retry when its name is listed,
+  or when every failing step's ctest `The following tests FAILED:` block names
+  only listed tests. The same check must have passed on the head, the retry is
+  still one per head, and `invalid_merge_commit` / `merge_conflict` are never
+  retried. A step that names no test (a compile error, a crash before the
+  summary) is never a known flake. Every FAILED block in the step counts (a
+  rerun's block cannot hide the first run's failure), each must end on a blank
+  line, `Errors while running CTest` or the step's `##[error]`, and the last
+  must sit within 60 lines of the error. Entries are exact test names or globs
+  where `*` matches anything; matching is case-sensitive, so copy names from
+  the ctest output. A check name is listed only by its exact name, never by a
+  glob, and a bare `*` lists nothing. A listed test that failed by `(Timeout)`
+  is accepted on purpose: flakes often time out, and listing a test is a
+  deliberate, issue-tracked decision. Keep the list to tests with a tracking issue, and remove
+  an entry when its issue closes. Pulp's tracked flakes at the time of
+  writing, as a starting list:
+
+  ```toml
+  known_flaky_tests = [
+    "ui-script-plugin-editor-au",          # #11861; the evidence suggests a real crash, review before listing
+    "a public WaveNet node runs its GPU path*",  # #11862
+    "AsyncBlockWorker: a fast pull without an offline flag waits in Auto mode",  # #11863
+    "WakeSignal: racing publish and park never lose a wakeup",  # #11864
+    "Staged GpuConvolver*",                # #11865
+    "inject-worktree-lineage-hook",        # #11866
+  ]
+  ``` `invalid_merge_commit` is never re-enqueued on the same
+  head (before, it reset the refusal: #11698 went `failed_checks`, then three
+  immediate `invalid_merge_commit` removals, each re-enqueued). Every refusal
+  reads `ejected_same_head:<cause>:needs_new_head`.
+
+Turn one off by setting its key to `false` in the base's config. If the
+pass-start config read fails, the guards keep their merge-queue defaults and
+the batch guard re-reads the config live before each enqueue; a second failure
+refuses the enqueue (`steward_error`) rather than admitting unguarded.
+
+Scope: the guards apply to the steward's own enqueue and its `blocked_on`
+report. The `--arm-unqueued` native-auto-merge backstop (for pull requests the
+steward does not own), `shipyard auto-merge`, `shipyard ship` and the `ghapp`
+arm guard keep their earlier same-head rules, including re-arming after
+`invalid_merge_commit`.
+
+## Dwell-time limits and the next-to-admit ranking
+
+A pull request should never sit in one state for hours with nobody told. Each
+pass, after every row has its `blocked_on`, the steward maps the token to a
+dwell state, remembers in its ledger (`dwell`) when the pull request entered it,
+and acts once the state outlives its limit. The limits are the **base** branch's
+`.shipyard/config.toml` `[auto_merge.dwell]` table (minutes; `0` stops tracking
+that state):
+
+```toml
+[auto_merge.dwell]
+needs_review = 20               # no_verdict, approval_excluded:stale_head|predates_head
+required_pending = 60
+required_failed_infra = 10      # transient_rerun: an interruption the steward is re-running
+required_failed = 45
+stale_verdict_check = 10        # only review-verdict red: re-run once if the gate admits the head
+dirty = 30                      # merge_state:DIRTY: escalate only, never touched
+held = 30                       # a HOLD names the head: escalate only
+required_never_ran = 30         # dispatch the mapped workflow once
+approved_green_not_queued = 5   # ready / admission_pending: evaluated first next pass
+carries_unapproved = 60         # escalate only
+stacked_base_merged = 10        # stacked on a merged base: retarget once
+act = "shadow"                  # "apply" runs the GitHub-writing acts; "off" runs none
+max_acts_per_pass = 3           # GitHub-writing acts per repository per pass
+max_escalations_per_pass = 25
+max_level = 4
+
+[auto_merge.dwell.dispatch]     # required context -> workflow file, for required_never_ran
+macos = "build.yml"
+```
+
+Past its limit a pull request is **overdue**. The steward then takes the one
+mechanical act its state allows, once per pull request, state and head, with the
+intent saved to the ledger before the side effect so a crash cannot repeat it.
+Every GitHub-writing act first re-reads the pull request live (still open, same
+head, head branch in the base repository, never a fork):
+
+| State | Act | Revalidation before it |
+|---|---|---|
+| `stale_verdict_check` | re-run the `review-verdict` run the required rule selects | that run is completed and red with none newer or running, and the approval gate, read live, returns an exact-head approval (`NotRequired` or any refusal, a HOLD above all, refuses) |
+| `required_never_ran` | `gh workflow run <file> --ref <head branch>` for each mapped context | the live head is the one observed |
+| `approved_green_not_queued` | evaluate it first in the next pass's admission (after the deferral carry) | none: it only reorders the steward's own admission, which keeps every gate |
+| `stacked_base_merged` | retarget it to the steward's base | the pull request is unchanged; its `stacked:<n>` parent merged into the steward's base from exactly the branch it is based on; and that branch still points at the parent's merged head, so nothing unlanded is carried |
+
+`done` and `failed` are final at that head (a `failed` act was attempted and
+may have reached GitHub: one of several dispatched workflows, or a call that
+timed out after GitHub took it, so it is never sent again). An act refused by
+a live revalidation, or deferred because a precondition could not be read,
+attempted nothing and is retried at most three times with a backoff (15, 30
+minutes); every act that did not happen escalates at once, within the per-pass
+cap. Act records outlive a pull request dropping out of a
+pass (kept 14 days), so a census gap or a close and reopen never repeats one.
+At most `max_acts_per_pass` GitHub-writing acts run per repository per pass,
+none past the pass time budget, and none on a row the pass budget deferred or
+a stacked pull request the pass could not list (those wait, `act_later`).
+Dwell state is keyed by repository and base, so a steward run for another base
+never touches it. The first pass that tracks a repository seeds its existing
+backlog as already escalated at its current level, so turning this on does not
+flood the feed.
+
+Everything else escalates: DIRTY (contract row 2: never touched unattended),
+held, carried-unapproved, needs-review, pending and failed checks. An act that
+did not clear the state escalates at the next level. Levels fire at the limit,
+then twice, four and eight times it; each level is emitted once, worst first,
+at most `max_escalations_per_pass` per repository per pass (the rest wait for
+the next pass). An escalation goes to the overdue feed
+(`<state>/steward-dwell/overdue.jsonl`, rotated past 4 MiB) for fleet-loop or a
+model pass. The author's own states (failed checks, DIRTY, HOLD, a stack to
+retarget), when an owner record names the pull request (`shipyard owner
+register`), also go to the owning session through `shipyard relay` (event
+`overdue`, once per state, head and level the steward has emitted, inside the
+relay's per-pull-request rate limit; a notice for a head that has since moved is
+dropped). Review, CI and steward states go only to the feed, where the party
+that can act reads them, and rows the steward is acting on this pass are not
+relayed. The GitHub-writing acts ship in `shadow`: they are reported as
+`would_act` and escalate until the base sets `act = "apply"`.
+
+No act arms, enqueues, merges, updates a branch or approves; the act interface
+has no method that could.
+
+**Ranking.** The same pass ranks every open pull request by closeness to
+mergeable: stack bases (pull requests others are stacked on or carry) that are
+themselves approved, then approved and green, approved with checks
+running, green but needing an exact-head review, then the rest. Within a tier,
+more unblocked pull requests first, then the longest in its state. A stack base
+still waiting on a review stays in its own tier, first within it, so it never
+spends admission work ahead of an admittable head. The next pass evaluates
+admission candidates in that order (after rows the pass budget deferred, then
+overstayed approved heads). The report lists the top five as
+`dwell.next_to_admit`, each with `needs` (the single thing it waits on) and the
+row's `next_action`.
+
+**Cost.** Nothing here polls. Ranking and tracking read only the rows and
+checks the pass already has; stacked pull requests are seen through the
+open-pull-request listing the carried-commit check read in the same pass
+(`dwell.stack_listing` says `reused`, or `not_read_this_pass`, when stacked
+entries simply hold). The base config read is the one the pass caches. The only
+extra calls are an act's own revalidation and mutation: at most
+`max_acts_per_pass` per repository per pass, each once per pull request, state
+and head (plus at most three retries). The tick JSON's top-level `api_cost` sums each repository's
+`api_calls` (REST, GraphQL, cache hits).
+
+**Read it.** `shipyard overdue [--repo R] [--json]` and `shipyard next [--repo
+R] [--json]` read the snapshot the last `--apply` pass wrote
+(`<state>/steward-dwell/<repo>@<base>.json`) and print its age; neither reads
+GitHub, and an unreadable snapshot is skipped with a warning.
+
 ## Things that bite
 
 These came from running it for real:
@@ -346,6 +637,22 @@ These came from running it for real:
   while it works, and TartCI's VM admission takes the same lock. Keep passes
   short (Shipyard hydrates only pull requests that could actually be
   admitted), and run repositories one after another, not in parallel.
+- **A pass that is killed reports nothing.** A pass reads GitHub per open
+  pull request, so a deep backlog on a slow token path can outrun a
+  scheduler's timeout, and a killed pass prints no report. Past
+  `--pass-budget-secs` (default 240; 0 disables) an apply pass starts no new
+  per-PR work, and it does the same once GitHub reports the token's API rate
+  limit exceeded. The budget is per repository: each repository's clock starts
+  when its observation starts, so an earlier repository never starves a later
+  one. A rate limit while observing a repository leaves the remaining
+  repositories of the invocation unread rather than erroring through them. Each remaining row is reported `deferred_pass_budget` with
+  its census decision, is never admitted, armed, enqueued or dequeued that
+  pass, and is evaluated first on the next pass, after admission candidates
+  and queued or armed rows. Deferred rows are taken oldest deferral first (a
+  deferred admission candidate also goes ahead of a fresh one), so a row
+  evaluated last pass goes to the back instead of re-taking the newest rows
+  every pass and starving the oldest. Keep the budget a few minutes under the
+  scheduler's timeout so the in-flight pull request and the report fit.
 - **A timer job that touches an external volume can hang.** On macOS a
   background job opening a path on `/Volumes` can wait forever on a privacy
   prompt nobody sees. Run the steward from the internal disk.
@@ -355,8 +662,11 @@ These came from running it for real:
   re-enqueues the same head once, through its exact-head path with the
   approval read live, when every failing required check on the ejecting merge
   group is a runner failure (`timed_out`, `startup_failure`, `stale`, a
-  lost-runner annotation, or a network signature), is also failing on the base
-  tip, or passed on the head itself; a check that passed on the base tip and
+  lost-runner annotation, or a network signature). On a base without the retry
+  discipline it also retries a check that is failing on the base tip or passed
+  on the head itself; on a merge-queue base the discipline is on by default and
+  those stay `ejected_same_head:failed_checks:needs_new_head` (see
+  [Ejection guards](#ejection-guards)). A check that passed on the base tip and
   not on the head, an unplaceable one, or a second ejection of the same head
   (counted from GitHub's own removal events) stays `ejected_same_head:<cause>`
   for repair.
@@ -438,3 +748,4 @@ These came from running it for real:
   pull requests, measured rather than read from config.
 - [TartCI](https://github.com/danielraffel/tartci) covers VM pools, images,
   leases and runner lifecycle.
+- The scheduled reviewer, repair and operator pass-runner used on m3 is versioned in [`tools/fleet-pass/`](../tools/fleet-pass/README.md).

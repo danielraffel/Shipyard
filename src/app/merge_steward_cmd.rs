@@ -59,6 +59,13 @@ pub(super) struct StewardCommandArgs {
     /// unapproved queue entries or only reports them. Read from the
     /// machine-global config by [`steward_command`].
     pub(super) unapproved_dequeue: unapproved_admission::DequeueMode,
+    /// Each repository's time budget (`--pass-budget-secs`); its clock
+    /// starts when that repository's observation starts, so a later
+    /// repository is never starved by an earlier one. `None` never defers.
+    pub(super) pass_budget: Option<Duration>,
+    /// Past this instant the current repository starts no new per-PR work;
+    /// see `pass_budget`. Set per repository from `pass_budget`.
+    pub(super) pass_deadline: Option<Instant>,
     pub(super) apply: bool,
     pub(super) ledger: Option<PathBuf>,
 }
@@ -146,6 +153,22 @@ struct RepoReport {
     /// left uncertain with the reason ([`mutation_outcome::reconcile`]).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     uncertain_mutations: Vec<crate::merge_queue_control::UncertainReconciliation>,
+    /// What this repository's pass asked GitHub, by call site
+    /// ([`crate::gh_pass`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    api_calls: Option<crate::gh_pass::GhPassReport>,
+    /// Durable provider cooldown that deferred this repository's observation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rate_limit_deferred: Option<pass_budget::RateLimitCooldown>,
+    /// Why this repository made the pass exit 1: each entry is a category,
+    /// then the PR numbers or count behind it. Absent when the repository
+    /// was healthy, so a non-zero exit with empty `errors` is explained here.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    exit_reasons: Vec<String>,
+    /// Dwell-time limits, overdue pull requests and the next-to-admit
+    /// ranking ([`dwell_pass`]). Absent when the repository was not observed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dwell: Option<dwell_pass::DwellRepoReport>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -190,6 +213,19 @@ struct StewardLedger {
     /// the head's ejection cap.
     #[serde(default)]
     steward_removals: BTreeMap<String, Vec<String>>,
+    /// Pull requests the last pass deferred (`pass_budget`), keyed by
+    /// lowercase repository; the next pass evaluates them first.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pass_budget_deferred: BTreeMap<String, Vec<u64>>,
+    /// Repository observations deferred after a provider rate-limit refusal,
+    /// keyed by credential-scope hash plus lowercase repository.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    rate_limit_cooldowns: BTreeMap<String, pass_budget::RateLimitCooldown>,
+    /// How long each open pull request has been in its blocked state, the
+    /// acts taken and the last ranking, keyed by lowercase repository. See
+    /// `dwell_pass`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    dwell: BTreeMap<String, crate::merge_steward::dwell::DwellRepoState>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -368,7 +404,7 @@ enum PendingMutationKind {
     ForceCancel,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct LedgerAudit {
     at: String,
     repo: String,
@@ -413,6 +449,11 @@ struct MutationApplyContext<'a> {
     /// Open pull requests' commits and approvals this pass read for the
     /// carried-commit admission guard. See `carried_commits`.
     carried_commits: std::cell::RefCell<carried_commits::PassCache>,
+    /// Changed files this pass read for the generated-path batch guard. See
+    /// `generated_paths`.
+    changed_files: std::cell::RefCell<generated_paths::PassCache>,
+    /// The base's ejection guards ([`crate::merge_steward::EjectionGuards`]).
+    ejection_guards: crate::merge_steward::EjectionGuards,
 }
 
 /// Exact-head approval gate reads made during one pass, by PR number.
@@ -817,13 +858,40 @@ fn admission_blocker_run_ids(
     run_ids
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[cfg(test)]
 pub(super) fn admission_clean_command<W: Write>(
     args: &AdmissionCleanArgs,
     cwd: &Path,
     mode: RuntimeMode,
     runtime_paths: &RuntimePaths,
     actions: &GitHubActions,
+    json_output: bool,
+    stdout: &mut W,
+) -> Result<ExitCode, CliFailure> {
+    admission_clean_command_with_reads(
+        args,
+        cwd,
+        mode,
+        runtime_paths,
+        actions,
+        actions,
+        json_output,
+        stdout,
+    )
+}
+
+/// `runner admission-clean`. `read_actions` makes every census, including
+/// the ones around a cancellation, so they spend a dedicated admission budget
+/// and reuse recent per-head reads; `actions` performs the cancellation and
+/// its recovery.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub(super) fn admission_clean_command_with_reads<W: Write>(
+    args: &AdmissionCleanArgs,
+    cwd: &Path,
+    mode: RuntimeMode,
+    runtime_paths: &RuntimePaths,
+    actions: &GitHubActions,
+    read_actions: &GitHubActions,
     json_output: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
@@ -853,12 +921,13 @@ pub(super) fn admission_clean_command<W: Write>(
         Ok(None) => return_verdict!(Defer, "observation_in_progress", &repo, &[], None),
         Err(error) => return_verdict!(Error, "observation_failed", &repo, &[], Some(&error)),
     };
-    let admission_actions = actions
-        .clone()
-        .with_absolute_deadline(Instant::now() + ADMISSION_OBSERVATION_TIMEOUT);
+    let deadline = Instant::now() + ADMISSION_OBSERVATION_TIMEOUT;
+    let admission_actions = actions.clone().with_absolute_deadline(deadline);
     let actions = &admission_actions;
+    let admission_read_actions = read_actions.clone().with_absolute_deadline(deadline);
+    let read_actions = &admission_read_actions;
     let (mut observation, mut candidates, mut blocking_only) =
-        match observe_admission_candidates(actions, &repo, &base, &labels, args.apply) {
+        match observe_admission_candidates(read_actions, &repo, &base, &labels, args.apply) {
             Ok(observation) => observation,
             Err(error) => return_verdict!(Error, "observation_failed", &repo, &[], Some(&error)),
         };
@@ -892,12 +961,20 @@ pub(super) fn admission_clean_command<W: Write>(
         pending_admission_cancellations(&observed_ledger, &canonical_repo, &base);
     let mut blocker_run_ids =
         admission_blocker_run_ids(&candidates, &blocking_only, &observed_pending);
+    // The steward ledger lock serializes ledger *writers*. A steward apply
+    // pass holds it for its whole multi-repo pass (minutes), so an admission
+    // that only reads must not wait on it or defer because of it: the ledger
+    // is published by atomic rename, so `load_ledger` without the lock is a
+    // consistent snapshot. Admission takes the lock only on the path where it
+    // resumes a pending cancellation or cancels a run itself; there a held
+    // lock is a real queue hold and still defers `stewardship_in_progress`.
+    // Holding the lock on a read-only path would not protect the JIT mint
+    // either, because the lock is released when this command returns.
+    //
     // Report-only admission is an observation, not a mutation precondition.
-    // Return the snapshot verdict after checking the ledger lock, without
-    // running a second full census; the apply path below performs the
-    // exact-head fence.
+    // Return the snapshot verdict without running a second full census; the
+    // apply path below performs the exact-head fence.
     if !args.apply {
-        let _ledger_lock = acquire_admission_ledger_lock!(&blocker_run_ids);
         if candidates.is_empty() && blocking_only.is_empty() && observed_pending.is_empty() {
             return_verdict!(Admit, "clean", &canonical_repo, &[], None);
         }
@@ -914,7 +991,9 @@ pub(super) fn admission_clean_command<W: Write>(
         );
     }
     if candidates.is_empty() && blocking_only.is_empty() && observed_pending.is_empty() {
-        let _ledger_lock = acquire_admission_ledger_lock!(&[]);
+        // Read-only clean path: a fresh lock-free snapshot (see above). A
+        // pending cancellation a running steward published since the first
+        // read still defers, as `cancellation_pending`.
         let ledger = load_ledger(&ledger_path)?;
         let final_pending = pending_admission_cancellations(&ledger, &canonical_repo, &base);
         if !final_pending.is_empty() {
@@ -928,7 +1007,7 @@ pub(super) fn admission_clean_command<W: Write>(
             );
         }
         let (final_candidates, final_blocking) =
-            match revalidate_active_admission_candidates(actions, &observation, &labels) {
+            match revalidate_active_admission_candidates(read_actions, &observation, &labels) {
                 Ok(candidates) => candidates,
                 Err(error) => return_verdict!(
                     Error,
@@ -974,9 +1053,62 @@ pub(super) fn admission_clean_command<W: Write>(
         );
     }
 
-    let _ledger_lock = acquire_admission_ledger_lock!(&blocker_run_ids);
-    let mut ledger = load_ledger(&ledger_path)?;
-    let pending = pending_admission_cancellations(&ledger, &canonical_repo, &base);
+    // A pending cancellation is steward-owned crash-recovery state: resuming
+    // it rewrites that record, so it needs the steward ledger lock and still
+    // defers while an apply pass holds it. Cancelling a superseded run does
+    // not: it writes no pending record, the per-run mutation guard serializes
+    // it against a steward cancelling the same run, and its only ledger write
+    // is an audit line. While a steward pass holds the lock (minutes), that
+    // audit line goes to an admission-owned sidecar instead of waiting, because
+    // the steward rewrites its whole in-memory ledger on save and would drop a
+    // line written into the shared file underneath it.
+    let ledger_lock = if observed_pending.is_empty() {
+        match try_acquire_ledger_lock(&ledger_path) {
+            Ok(lock) => lock,
+            Err(error) => return_verdict!(
+                Error,
+                "mutation_failed",
+                &canonical_repo,
+                &blocker_run_ids,
+                Some(error.message())
+            ),
+        }
+    } else {
+        Some(acquire_admission_ledger_lock!(&blocker_run_ids))
+    };
+    let audit_path = if ledger_lock.is_some() {
+        ledger_path.clone()
+    } else {
+        admission_audit_path(&ledger_path)
+    };
+    let (mut ledger, pending) = if ledger_lock.is_some() {
+        let ledger = load_ledger(&ledger_path)?;
+        let pending = pending_admission_cancellations(&ledger, &canonical_repo, &base);
+        (ledger, pending)
+    } else {
+        // A pending cancellation the running steward published since the
+        // first snapshot is still a queue hold the steward will resume.
+        let snapshot = load_ledger(&ledger_path)?;
+        let late_pending = pending_admission_cancellations(&snapshot, &canonical_repo, &base);
+        if !late_pending.is_empty() {
+            let blockers = admission_blocker_run_ids(&candidates, &blocking_only, &late_pending);
+            return_verdict!(
+                Defer,
+                "stewardship_in_progress",
+                &canonical_repo,
+                &blockers,
+                Some("another steward apply pass is already running")
+            );
+        }
+        (StewardLedger::default(), Vec::new())
+    };
+    let persist = |ledger: &StewardLedger| {
+        if ledger_lock.is_some() {
+            save_ledger(&ledger_path, ledger)
+        } else {
+            append_admission_audit(&audit_path, ledger)
+        }
+    };
     blocker_run_ids = admission_blocker_run_ids(&candidates, &blocking_only, &pending);
     // Reobserve all pre-lock blockers before deciding whether to admit or defer.
     let mutation_control = MutationControl {
@@ -1011,7 +1143,11 @@ pub(super) fn admission_clean_command<W: Write>(
             );
         }
     }
-    match observe_admission_candidates(actions, &canonical_repo, &base, &labels, true) {
+    // The pre-cancel and post-cancel censuses are reads, so they spend the
+    // admission credential and reuse its per-head cache. A cached head can
+    // only hide a newer handoff status, which skips a cancellation rather than
+    // adding one; `apply_run_cancellation` still acts with `[github.auth]`.
+    match observe_admission_candidates(read_actions, &canonical_repo, &base, &labels, true) {
         Ok((refreshed_observation, refreshed_candidates, refreshed_blocking)) => {
             observation = refreshed_observation;
             candidates = refreshed_candidates;
@@ -1050,12 +1186,24 @@ pub(super) fn admission_clean_command<W: Write>(
             MANAGED_LABEL,
             HANDOFF_CONTEXT,
             &default_provenance_blocking_labels(),
-            &ledger_path,
+            &audit_path,
             &mut ledger,
             &mutation_control,
         );
         if let Some(error) = error {
-            let _ = save_ledger(&ledger_path, &ledger);
+            let _ = persist(&ledger);
+            // The merge-queue control lock is taken without blocking, and a
+            // steward or another admission lane holds it for one GitHub call.
+            // That is a transient queue hold, not an operational failure.
+            if merge_queue_lock_contended(&error) {
+                return_verdict!(
+                    Defer,
+                    "mutation_in_progress",
+                    &canonical_repo,
+                    &blocker_run_ids,
+                    Some(&error)
+                );
+            }
             return_verdict!(
                 Error,
                 "mutation_failed",
@@ -1065,9 +1213,9 @@ pub(super) fn admission_clean_command<W: Write>(
             );
         }
     }
-    save_ledger(&ledger_path, &ledger)?;
+    persist(&ledger)?;
     let (remaining, remaining_blocking) =
-        match observe_admission_candidates(actions, &canonical_repo, &base, &labels, true) {
+        match observe_admission_candidates(read_actions, &canonical_repo, &base, &labels, true) {
             Ok((_, candidates, blocking)) => (candidates, blocking),
             Err(error) => return_verdict!(
                 Error,
@@ -1101,6 +1249,7 @@ pub(super) fn admission_clean_command<W: Write>(
     );
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) fn steward_command<W: Write>(
     args: &StewardCommandArgs,
     cwd: &Path,
@@ -1156,41 +1305,75 @@ pub(super) fn steward_command<W: Write>(
     let mut unhealthy = false;
     let mut remaining_preemptions =
         usize::from(!recovery_owned_preemption_budget && ledger.pending_cancellations.is_empty());
+    let mut rate_limited: Option<String> = None;
     for repo in repos {
-        // Scope the token helper to this exact repository: a scheduled pass
-        // runs from a directory that is not a checkout, and one checkout's
-        // remote must never mint the token for another repository.
-        let scoped_actions = actions.clone().with_repo_override(&repo);
-        let actions = &scoped_actions;
-        match observe_repo(actions, &repo, &args.base, args.preempt_capacity) {
-            Ok(observation) => {
-                let (mut report, failed, planned_preemptions) = apply_repo_plan(
-                    actions,
-                    args,
-                    &observation,
-                    &ledger_path,
-                    &mut ledger,
-                    remaining_preemptions,
-                    mutation_control.as_ref(),
-                );
-                if let Some(errors) = recovery_errors.remove(&observation.repo) {
-                    report.errors.extend(errors);
-                }
-                if let Some(cancellations) = recovery_cancellations.remove(&observation.repo) {
-                    report.cancellations.extend(cancellations);
-                }
-                if args.apply {
-                    reconcile_rollups(actions, &observation.repo, &args.base, &mut report);
-                }
-                remaining_preemptions = remaining_preemptions.saturating_sub(planned_preemptions);
-                unhealthy |= failed || !report.errors.is_empty();
-                reports.push(report);
-            }
-            Err(error) => {
-                unhealthy = true;
-                reports.push(unreadable_repo_report(&repo, &args.base, &ledger, error));
-            }
+        let scope_key = actions.rate_limit_scope_key(&repo);
+        let cooldown_key = pass_budget::rate_limit_cooldown_key(&scope_key, &repo);
+        let now_epoch = Utc::now().timestamp();
+        if let Some(cooldown) = pass_budget::active_rate_limit_cooldown(
+            &ledger.rate_limit_cooldowns,
+            &cooldown_key,
+            now_epoch,
+        ) {
+            unhealthy = true;
+            reports.push(deferred_rate_limit_repo_report(
+                &repo,
+                &args.base,
+                cooldown.clone(),
+                &ledger,
+            ));
+            continue;
         }
+        // Expiry is itself a state transition. Remove the stale receipt so a
+        // successful probe can clear it from the durable ledger.
+        ledger.rate_limit_cooldowns.remove(&cooldown_key);
+        // A rate limit spends the token for every repository alike: the rest
+        // are reported unread rather than spending the pass on errors.
+        if let Some(error) = rate_limited.as_ref() {
+            let cooldown = record_rate_limit_cooldown(
+                &repo,
+                &scope_key,
+                error,
+                &mut ledger,
+                args.apply.then_some(&ledger_path),
+            );
+            if let Ok(cooldown) = cooldown {
+                unhealthy = true;
+                reports.push(deferred_rate_limit_repo_report(
+                    &repo, &args.base, cooldown, &ledger,
+                ));
+            } else {
+                unhealthy = true;
+                reports.push(unreadable_repo_report(
+                    &repo,
+                    &args.base,
+                    &ledger,
+                    format!("{}: not observed this pass; {error}", pass_budget::DEFERRED),
+                ));
+            }
+            continue;
+        }
+        let (report, failed) = steward_repo(
+            actions,
+            args,
+            &repo,
+            &ledger_path,
+            &mut ledger,
+            &mut remaining_preemptions,
+            mutation_control.as_ref(),
+            &mut recovery_errors,
+            &mut recovery_cancellations,
+        );
+        if report.rate_limit_deferred.is_some()
+            || report
+                .errors
+                .iter()
+                .any(|error| pass_budget::is_rate_limited(error))
+        {
+            rate_limited = Some(format!("GitHub rate-limited observing {repo}"));
+        }
+        unhealthy |= failed;
+        reports.push(report);
     }
     append_unmatched_recovery_errors(
         recovery_errors,
@@ -1217,6 +1400,23 @@ pub(super) fn steward_command<W: Write>(
     })
 }
 
+/// `actions` for one repository's pass: scoped to `repo` for the token
+/// helper (a scheduled pass runs outside any checkout, and one checkout's
+/// remote must never mint the token for another repository), counting its
+/// GitHub reads and reusing the base-policy and content-addressed answers it
+/// may cache ([`crate::gh_pass`]).
+fn repo_pass_actions(
+    actions: &GitHubActions,
+    repo: &str,
+) -> (GitHubActions, std::sync::Arc<crate::gh_pass::GhPass>) {
+    let pass = std::sync::Arc::new(crate::gh_pass::GhPass::caching());
+    let scoped = actions
+        .clone()
+        .with_repo_override(repo)
+        .with_pass(std::sync::Arc::clone(&pass));
+    (scoped, pass)
+}
+
 /// Close the members of rollups that landed on `base` lately, however they
 /// landed ([`crate::rollup::reconcile_if_enabled`]); nothing on a base that
 /// does not take rollups.
@@ -1230,6 +1430,287 @@ fn reconcile_rollups(actions: &GitHubActions, repo: &str, base: &str, report: &m
     }
 }
 
+/// One repository of a steward pass: observe it, apply its plan, settle its
+/// rollups. Its own time budget starts here, so an earlier repository never
+/// spends a later one's. Returns the report and whether the repository is
+/// unhealthy.
+#[allow(clippy::too_many_arguments)]
+fn steward_repo(
+    actions: &GitHubActions,
+    pass_args: &StewardCommandArgs,
+    repo: &str,
+    ledger_path: &Path,
+    ledger: &mut StewardLedger,
+    remaining_preemptions: &mut usize,
+    mutation_control: Option<&MutationControl>,
+    recovery_errors: &mut BTreeMap<String, Vec<String>>,
+    recovery_cancellations: &mut BTreeMap<String, Vec<CancellationReport>>,
+) -> (RepoReport, bool) {
+    // Scope the token helper to this exact repository: a scheduled pass
+    // runs from a directory that is not a checkout, and one checkout's
+    // remote must never mint the token for another repository.
+    let (scoped_actions, pass) = repo_pass_actions(actions, repo);
+    let actions = &scoped_actions;
+    let (mut report, unhealthy) = steward_repo_observed(
+        actions,
+        pass_args,
+        repo,
+        ledger_path,
+        ledger,
+        remaining_preemptions,
+        mutation_control,
+        recovery_errors,
+        recovery_cancellations,
+    );
+    report.api_calls = Some(pass.report());
+    if let (Some(api_calls), Some(sizer)) = (
+        report.api_calls.as_mut(),
+        actions
+            .inproc_reads()
+            .and_then(crate::github_read::InprocReads::batch),
+    ) {
+        // A dry run reports the next size but leaves the live steward's state.
+        let next = if pass_args.apply {
+            sizer.save().unwrap_or_else(|error| {
+                api_calls.fallbacks.push(crate::gh_pass::FallbackReport {
+                    reason: "rollup batch size not saved".to_owned(),
+                    count: 1,
+                    last_detail: error,
+                });
+                sizer.next_size()
+            })
+        } else {
+            sizer.next_size()
+        };
+        api_calls.rollup_batch = Some(crate::gh_pass::RollupBatchReport {
+            heads_per_query: sizer.size(),
+            next_heads_per_query: next,
+        });
+    }
+    if pass_args.apply
+        && let (Some(control), Some(dwell)) = (mutation_control, report.dwell.as_mut())
+        && let Err(error) = dwell_pass::write_snapshot(
+            &control.state_dir,
+            &report.repo,
+            &report.base,
+            dwell,
+            report.api_calls.as_ref(),
+            Utc::now(),
+        )
+    {
+        dwell.errors.push(error);
+    }
+    if unhealthy {
+        report.exit_reasons = exit_reasons(&report);
+    }
+    (report, unhealthy)
+}
+
+/// The categories that make a repository's pass exit 1, derived from its
+/// report. Pull-request refusals (an unapproved carried commit, a failed
+/// mutation) land in `prs[].error` and leave `errors` empty, so they need
+/// their own entry; `unclassified` marks an unhealthy repository none of the
+/// report fields explain.
+fn exit_reasons(report: &RepoReport) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if !report.errors.is_empty() {
+        reasons.push(format!("repo_errors:{}", report.errors.len()));
+    }
+    let numbers = |numbers: Vec<String>| numbers.join(",");
+    let pr_errors = report
+        .prs
+        .iter()
+        .filter(|pr| pr.error.is_some())
+        .map(|pr| format!("#{}", pr.number))
+        .collect::<Vec<_>>();
+    if !pr_errors.is_empty() {
+        reasons.push(format!("pr_errors:{}", numbers(pr_errors)));
+    }
+    let failed_runs = report
+        .cancellations
+        .iter()
+        .filter(|cancellation| cancellation.error.is_some())
+        .map(|cancellation| cancellation.run_id.to_string())
+        .collect::<Vec<_>>();
+    if !failed_runs.is_empty() {
+        reasons.push(format!("cancellation_errors:{}", numbers(failed_runs)));
+    }
+    if report.rate_limit_deferred.is_some() {
+        reasons.push("rate_limited".to_owned());
+    }
+    if report
+        .uncertain_mutations
+        .iter()
+        .any(|result| result.outcome == "uncertain")
+    {
+        reasons.push("uncertain_mutations".to_owned());
+    }
+    if reasons.is_empty() {
+        reasons.push("unclassified".to_owned());
+    }
+    reasons
+}
+
+/// [`steward_repo`] once `actions` is scoped to `repo` and counting its
+/// GitHub reads.
+#[allow(clippy::too_many_arguments)]
+fn steward_repo_observed(
+    actions: &GitHubActions,
+    pass_args: &StewardCommandArgs,
+    repo: &str,
+    ledger_path: &Path,
+    ledger: &mut StewardLedger,
+    remaining_preemptions: &mut usize,
+    mutation_control: Option<&MutationControl>,
+    recovery_errors: &mut BTreeMap<String, Vec<String>>,
+    recovery_cancellations: &mut BTreeMap<String, Vec<CancellationReport>>,
+) -> (RepoReport, bool) {
+    let mut repo_args = pass_args.clone();
+    if let Some(budget) = pass_args.pass_budget {
+        repo_args.pass_deadline = Some(Instant::now() + budget);
+    }
+    let args = &repo_args;
+    match observe_repo_with_status_history(
+        actions,
+        repo,
+        &args.base,
+        args.preempt_capacity,
+        Some(&status_history_path(ledger_path, repo)),
+    ) {
+        Ok(observation) => {
+            let scope_key = actions.rate_limit_scope_key(repo);
+            let cooldown_key = pass_budget::rate_limit_cooldown_key(&scope_key, repo);
+            // A successful repository-wide probe proves this credential/repo
+            // scope is usable again; clear its stale receipt before planning.
+            ledger.rate_limit_cooldowns.remove(&cooldown_key);
+            let (mut report, failed, planned_preemptions) = apply_repo_plan(
+                actions,
+                args,
+                &observation,
+                ledger_path,
+                ledger,
+                *remaining_preemptions,
+                mutation_control,
+            );
+            if let Some(errors) = recovery_errors.remove(&observation.repo) {
+                report.errors.extend(errors);
+            }
+            if let Some(cancellations) = recovery_cancellations.remove(&observation.repo) {
+                report.cancellations.extend(cancellations);
+            }
+            if args.apply && pass_budget::deadline_passed(args.pass_deadline) {
+                report
+                    .rollup_reconciliation
+                    .push("deferred: the pass time budget is spent".to_owned());
+            } else if args.apply {
+                reconcile_rollups(actions, &observation.repo, &args.base, &mut report);
+            }
+            *remaining_preemptions = remaining_preemptions.saturating_sub(planned_preemptions);
+            let unhealthy = failed || !report.errors.is_empty();
+            (report, unhealthy)
+        }
+        Err(error) if pass_budget::is_rate_limited(&error) => {
+            let scope_key = actions.rate_limit_scope_key(repo);
+            let cooldown = record_rate_limit_cooldown(
+                repo,
+                &scope_key,
+                &error,
+                ledger,
+                args.apply.then_some(ledger_path),
+            );
+            match cooldown {
+                Ok(cooldown) => (
+                    deferred_rate_limit_repo_report(repo, &args.base, cooldown, ledger),
+                    true,
+                ),
+                Err(persist_error) => {
+                    let mut report = unreadable_repo_report(repo, &args.base, ledger, error);
+                    report.errors.push(persist_error);
+                    (report, true)
+                }
+            }
+        }
+        Err(error) => (
+            unreadable_repo_report(repo, &args.base, ledger, error),
+            true,
+        ),
+    }
+}
+
+/// Where the census keeps the commit-status histories it may reuse on the
+/// next pass of `repo`: beside the ledger, one file per repository, since
+/// several repositories' passes share one ledger and each rewrites its file.
+fn status_history_path(ledger_path: &Path, repo: &str) -> PathBuf {
+    let slug = repo
+        .to_ascii_lowercase()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '~'
+            }
+        })
+        .collect::<String>();
+    ledger_path.with_extension(format!("status-history.{slug}.json"))
+}
+
+fn record_rate_limit_cooldown(
+    repo: &str,
+    scope_key: &str,
+    error: &str,
+    ledger: &mut StewardLedger,
+    ledger_path: Option<&Path>,
+) -> Result<pass_budget::RateLimitCooldown, String> {
+    let observed_at_epoch = Utc::now().timestamp();
+    let cooldown = pass_budget::RateLimitCooldown {
+        repo: repo.to_owned(),
+        scope_key: scope_key.to_owned(),
+        until_epoch: pass_budget::rate_limit_cooldown_until(error, observed_at_epoch),
+        observed_at_epoch,
+        detail: error.to_owned(),
+    };
+    let key = pass_budget::rate_limit_cooldown_key(scope_key, repo);
+    ledger.rate_limit_cooldowns.insert(key, cooldown.clone());
+    if let Some(path) = ledger_path {
+        save_ledger(path, ledger).map_err(|error| {
+            format!(
+                "could not persist rate-limit cooldown receipt: {}",
+                error.message()
+            )
+        })?;
+    }
+    Ok(cooldown)
+}
+
+fn deferred_rate_limit_repo_report(
+    repo: &str,
+    base: &str,
+    cooldown: pass_budget::RateLimitCooldown,
+    ledger: &StewardLedger,
+) -> RepoReport {
+    RepoReport {
+        rollup_reconciliation: Vec::new(),
+        uncertain_mutations: Vec::new(),
+        repo: repo.to_owned(),
+        base: base.to_owned(),
+        allow_auto_merge: false,
+        merge_queue: false,
+        merge_path: "deferred_rate_limit".to_owned(),
+        required_contexts: Vec::new(),
+        prs: Vec::new(),
+        blocked_summary: blocked_on::BlockedSummary::default(),
+        cancellations: Vec::new(),
+        stale_pr_run_wedge: stale_pr_wedge::repo_status(None, Vec::new(), ledger, repo),
+        native_auto_merge_backstop: native_arm::NativeArmRepoStatus::default(),
+        errors: Vec::new(),
+        api_calls: None,
+        rate_limit_deferred: Some(cooldown),
+        exit_reasons: Vec::new(),
+        dwell: None,
+    }
+}
+
 fn unreadable_repo_report(
     repo: &str,
     base: &str,
@@ -1239,6 +1720,7 @@ fn unreadable_repo_report(
     RepoReport {
         rollup_reconciliation: Vec::new(),
         uncertain_mutations: Vec::new(),
+        api_calls: None,
         repo: repo.to_owned(),
         base: base.to_owned(),
         allow_auto_merge: false,
@@ -1251,6 +1733,9 @@ fn unreadable_repo_report(
         stale_pr_run_wedge: stale_pr_wedge::repo_status(None, Vec::new(), ledger, repo),
         native_auto_merge_backstop: native_arm::NativeArmRepoStatus::default(),
         errors: vec![error],
+        rate_limit_deferred: None,
+        exit_reasons: Vec::new(),
+        dwell: None,
     }
 }
 
@@ -1313,6 +1798,7 @@ fn append_unmatched_recovery_errors(
         reports.push(RepoReport {
             rollup_reconciliation: Vec::new(),
             uncertain_mutations: Vec::new(),
+            api_calls: None,
             repo: repo.clone(),
             base,
             allow_auto_merge: false,
@@ -1325,6 +1811,9 @@ fn append_unmatched_recovery_errors(
             stale_pr_run_wedge: stale_pr_wedge::repo_status(None, Vec::new(), ledger, &repo),
             native_auto_merge_backstop: native_arm::NativeArmRepoStatus::default(),
             errors,
+            rate_limit_deferred: None,
+            exit_reasons: Vec::new(),
+            dwell: None,
         });
     }
 }
@@ -1347,6 +1836,7 @@ fn persist_final_ledger(
         reports.push(RepoReport {
             rollup_reconciliation: Vec::new(),
             uncertain_mutations: Vec::new(),
+            api_calls: None,
             repo: "steward".to_owned(),
             base: base.to_owned(),
             allow_auto_merge: false,
@@ -1359,8 +1849,55 @@ fn persist_final_ledger(
             stale_pr_run_wedge: stale_pr_wedge::repo_status(None, Vec::new(), ledger, "steward"),
             native_auto_merge_backstop: native_arm::NativeArmRepoStatus::default(),
             errors: vec![message],
+            rate_limit_deferred: None,
+            exit_reasons: Vec::new(),
+            dwell: None,
         });
     }
+}
+
+/// Whether `error` is another Shipyard process holding the merge-queue
+/// mutation control lock or authority, which the guard takes without waiting.
+fn merge_queue_lock_contended(error: &str) -> bool {
+    error.contains("another Shipyard process is performing a merge-queue mutation")
+        || error.contains("another Shipyard process owns merge-queue mutation authority")
+}
+
+/// The admission-owned audit file beside the steward ledger. Admission writes
+/// here only while a steward apply pass holds the steward ledger lock.
+fn admission_audit_path(ledger_path: &Path) -> PathBuf {
+    ledger_path.with_file_name("merge-steward-admission-audit.json")
+}
+
+/// How long admission waits for another admission to finish appending to the
+/// audit sidecar. Each holder only reads, appends and renames one small file.
+const ADMISSION_AUDIT_LOCK_WAIT: Duration = Duration::from_secs(5);
+
+/// Append `ledger`'s audit lines to the admission audit sidecar under its own
+/// lock, which no steward pass ever holds.
+fn append_admission_audit(path: &Path, ledger: &StewardLedger) -> Result<(), CliFailure> {
+    if ledger.audit.is_empty() {
+        return Ok(());
+    }
+    let deadline = Instant::now() + ADMISSION_AUDIT_LOCK_WAIT;
+    let _lock = loop {
+        if let Some(lock) = try_acquire_ledger_lock(path)? {
+            break lock;
+        }
+        if Instant::now() >= deadline {
+            return Err(CliFailure::new(
+                1,
+                format!("could not lock admission audit {}", path.display()),
+            ));
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    let mut sidecar = load_ledger(path)?;
+    sidecar.audit.extend(ledger.audit.iter().cloned());
+    if sidecar.audit.len() > 1_000 {
+        sidecar.audit.drain(..sidecar.audit.len() - 1_000);
+    }
+    save_ledger(path, &sidecar)
 }
 
 fn try_acquire_ledger_lock(
@@ -1432,20 +1969,26 @@ mod cancellation_terminalization;
 mod capacity_cancellation;
 mod carried_commits;
 mod code_owner_wait;
+pub(super) mod dwell_pass;
 mod exact_head_merge;
+mod generated_paths;
+mod head_rollup;
 mod ledger;
 mod mutation_outcome;
 mod native_arm;
 mod next_action;
 mod observation;
+mod pass_budget;
 mod pr_mutations;
 pub(super) mod queue_drain;
 mod queue_priority_recovery;
+pub(super) mod read_probe;
 mod render;
 mod resume_record;
 mod terminal_handoff;
 pub(super) mod train;
 mod unapproved_admission;
+pub(super) use carried_commits::STACKED_LABEL_PREFIX;
 pub(super) use unapproved_admission::DequeueMode;
 
 use cancellation::{
@@ -1472,6 +2015,7 @@ use capacity_cancellation::{
     CapacityCancelError, apply_capacity_preemption, cancel_capacity_preemption_after_revalidation,
     mark_cancellation_skipped, persist_capacity_evidence,
 };
+use generated_paths::read_ejection_guards;
 use ledger::{attempt_key, check_attempt_key, load_ledger, record_audit, save_ledger};
 /// How `repo`'s `base` admits an approved head, for `shipyard pr`'s next-steps
 /// block. Read-only.
@@ -1623,6 +2167,8 @@ fn single_pr_dry_run(
         approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
         wake_owner: false,
         unapproved_dequeue: DequeueMode::Report,
+        pass_budget: None,
+        pass_deadline: None,
         apply: false,
         ledger: None,
     };
@@ -1678,8 +2224,9 @@ use observation::{
     active_runs, complete_checks_for_head, fetch_run_jobs, fetch_run_jobs_before, gh_json,
     gh_json_before, gh_json_timeout, hydrate_census_check_identities,
     hydrate_required_check_identities, hydrate_required_check_identities_before,
-    merge_queue_snapshot, merge_queue_snapshot_before, observe_repo, parse_job, parse_pr,
-    parse_run, pull_requests, required_checks, resolve_repos,
+    merge_queue_snapshot, merge_queue_snapshot_before, observe_repo,
+    observe_repo_with_status_history, parse_job, parse_pr, parse_run, pull_requests,
+    required_checks, resolve_repos,
 };
 #[cfg(test)]
 use pr_mutations::mutate_pr;

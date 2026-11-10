@@ -291,8 +291,8 @@ where
 }
 
 pub(crate) fn wait_for_condition_with_timeout<F, E, P>(
-    mut evaluator: E,
-    mut fetch_snapshot: F,
+    evaluator: E,
+    fetch_snapshot: F,
     event_filter: P,
     timeout_seconds: f64,
     poll_interval_seconds: f64,
@@ -304,9 +304,87 @@ where
     E: FnMut(Option<&Value>) -> WaitResult<TruthResult>,
     P: Fn(&Value) -> bool,
 {
+    wait_for_condition_with_backoff(
+        evaluator,
+        fetch_snapshot,
+        event_filter,
+        timeout_seconds,
+        poll_interval_seconds,
+        poll_interval_seconds,
+        no_fallback,
+        socket_path,
+    )
+}
+
+/// The reconciliation cadence of a wait whose snapshot is expensive.
+///
+/// A reconciliation tick that observes the same state as the snapshot before
+/// it doubles the wait before the next tick, up to `max`; a changed
+/// observation, or a fetch a daemon event asked for, returns to `base`. A wait
+/// on a pull request nobody is touching therefore stops spending a full read
+/// every `base` seconds, while one that is moving keeps its normal cadence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PollBackoff {
+    base: Duration,
+    max: Duration,
+    current: Duration,
+}
+
+impl PollBackoff {
+    #[must_use]
+    pub(crate) fn new(base: Duration, max: Duration) -> Self {
+        Self {
+            base,
+            max: max.max(base),
+            current: base,
+        }
+    }
+
+    /// How long to wait before the next reconciliation tick.
+    #[must_use]
+    pub(crate) const fn current(&self) -> Duration {
+        self.current
+    }
+
+    /// Account for one evaluated snapshot. `unchanged` is whether it observed
+    /// the same state as the one before; `from_event` is whether a daemon
+    /// event, rather than the tick, asked for it.
+    pub(crate) fn observe(&mut self, unchanged: bool, from_event: bool) {
+        self.current = if unchanged && !from_event {
+            self.current.saturating_mul(2).min(self.max)
+        } else {
+            self.base
+        };
+    }
+}
+
+/// [`wait_for_condition_with_timeout`] whose reconciliation tick backs off
+/// from `poll_interval_seconds` to `max_poll_interval_seconds` while the
+/// observed state stays the same ([`PollBackoff`]). Daemon events still
+/// re-snapshot at once.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub(crate) fn wait_for_condition_with_backoff<F, E, P>(
+    mut evaluator: E,
+    mut fetch_snapshot: F,
+    event_filter: P,
+    timeout_seconds: f64,
+    poll_interval_seconds: f64,
+    max_poll_interval_seconds: f64,
+    no_fallback: bool,
+    socket_path: &Path,
+) -> WaitResult<WaitOutcome>
+where
+    F: FnMut(Duration) -> WaitResult<Option<Value>>,
+    E: FnMut(Option<&Value>) -> WaitResult<TruthResult>,
+    P: Fn(&Value) -> bool,
+{
     let start = Instant::now();
     let timeout = Duration::from_secs_f64(timeout_seconds.max(0.0));
     let poll_interval = Duration::from_secs_f64(poll_interval_seconds.max(0.01));
+    let mut backoff = PollBackoff::new(
+        poll_interval,
+        Duration::from_secs_f64(max_poll_interval_seconds.max(0.01)),
+    );
     let mut connection = try_connect(socket_path);
     let mut outcome = if connection.is_some() {
         WaitOutcome::daemon_default()
@@ -345,9 +423,13 @@ where
                 return Ok(outcome);
             }
 
-            match connection.read_next_relevant_event(&event_filter, remaining.min(poll_interval)) {
+            let mut from_event = false;
+            match connection
+                .read_next_relevant_event(&event_filter, remaining.min(backoff.current()))
+            {
                 DaemonEventOutcome::Event(_event) => {
                     outcome.events_received += 1;
+                    from_event = true;
                 }
                 DaemonEventOutcome::Timeout => {}
                 DaemonEventOutcome::Disconnect => {
@@ -376,6 +458,7 @@ where
                 mark_timed_out(&mut outcome, &start);
                 return Ok(outcome);
             };
+            backoff.observe(result.observed == outcome.observed, from_event);
             if record_evaluation(&mut outcome, result, &start) {
                 return Ok(outcome);
             }
@@ -384,7 +467,7 @@ where
 
     while start.elapsed() < timeout {
         let remaining = timeout.saturating_sub(start.elapsed());
-        thread::sleep(poll_interval.min(remaining));
+        thread::sleep(backoff.current().min(remaining));
 
         let Some(result) = fetch_and_evaluate(
             &mut fetch_snapshot,
@@ -398,6 +481,7 @@ where
             mark_timed_out(&mut outcome, &start);
             return Ok(outcome);
         };
+        backoff.observe(result.observed == outcome.observed, false);
         if record_evaluation(&mut outcome, result, &start) {
             return Ok(outcome);
         }
@@ -1299,11 +1383,11 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        PR_CHECKS_JSON_FIELDS, PR_VIEW_JSON_FIELDS, SnapshotHeadChanged, WaitOutcome,
+        PR_CHECKS_JSON_FIELDS, PR_VIEW_JSON_FIELDS, PollBackoff, SnapshotHeadChanged, WaitOutcome,
         annotate_required_checks, ensure_snapshot_matches_live_head, is_transient_snapshot_error,
         pr_event_filter, read_snapshot_file, release_event_filter, remaining_snapshot_timeout,
         run_event_filter, snapshot_command_timeout, synthesize_pr_snapshot_from_rest,
-        wait_for_condition_with_timeout,
+        wait_for_condition_with_backoff, wait_for_condition_with_timeout,
     };
     #[cfg(unix)]
     use crate::daemon_ipc::{IpcServer, IpcState};
@@ -1586,6 +1670,80 @@ mod tests {
         assert!(outcome.timed_out);
         assert_eq!(outcome.transient_errors, 1);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn poll_backoff_doubles_while_unchanged_and_resets_on_change_or_event() {
+        let ms = Duration::from_millis;
+        let mut backoff = PollBackoff::new(ms(120), ms(600));
+        assert_eq!(backoff.current(), ms(120));
+        backoff.observe(true, false);
+        assert_eq!(backoff.current(), ms(240));
+        backoff.observe(true, false);
+        assert_eq!(backoff.current(), ms(480));
+        backoff.observe(true, false);
+        assert_eq!(backoff.current(), ms(600));
+        backoff.observe(true, false);
+        assert_eq!(backoff.current(), ms(600));
+        backoff.observe(false, false);
+        assert_eq!(backoff.current(), ms(120));
+        backoff.observe(true, false);
+        backoff.observe(true, true);
+        assert_eq!(backoff.current(), ms(120), "an event-driven fetch resets");
+        // A maximum below the base never shortens the tick.
+        let mut fixed = PollBackoff::new(ms(30), ms(10));
+        fixed.observe(true, false);
+        assert_eq!(fixed.current(), ms(30));
+    }
+
+    /// Fetches a polling-fallback wait makes in `timeout` when every snapshot
+    /// observes `observed(n)` for the n-th fetch.
+    fn polling_fetches(
+        base: f64,
+        max: f64,
+        timeout: f64,
+        observed: impl Fn(usize) -> u64 + 'static,
+    ) -> usize {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let socket_path = temp.path().join("daemon.sock");
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&fetches);
+        let outcome = wait_for_condition_with_backoff(
+            |snapshot| {
+                Ok(TruthResult {
+                    matched: false,
+                    observed: std::collections::BTreeMap::from([(
+                        "n".to_owned(),
+                        snapshot.cloned().unwrap_or(Value::Null),
+                    )]),
+                })
+            },
+            move |_| {
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                Ok(Some(Value::from(observed(n))))
+            },
+            |_| true,
+            timeout,
+            base,
+            max,
+            false,
+            &socket_path,
+        )
+        .expect("wait");
+        assert!(outcome.timed_out);
+        fetches.load(Ordering::SeqCst)
+    }
+
+    #[test]
+    fn an_unchanged_wait_backs_off_and_a_changing_one_keeps_its_cadence() {
+        // 1.2 s at a 20 ms tick: about 60 fixed-cadence fetches; backing off
+        // to 160 ms (20, 40, 80, 160, 160, ...) makes about 10.
+        let fixed = polling_fetches(0.02, 0.02, 1.2, |_| 0);
+        let backed_off = polling_fetches(0.02, 0.16, 1.2, |_| 0);
+        let changing = polling_fetches(0.02, 0.16, 1.2, |n| n as u64);
+        assert!(fixed >= 25, "fixed cadence made {fixed} fetches");
+        assert!(backed_off <= 14, "unchanged wait made {backed_off} fetches");
+        assert!(changing >= 25, "changing wait made {changing} fetches");
     }
 
     #[test]

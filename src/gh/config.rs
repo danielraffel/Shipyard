@@ -73,32 +73,52 @@ impl GhAuthConfig {
     }
 
     pub(super) fn from_loaded_config(config: &LoadedConfig) -> Result<Self, GhConfigError> {
-        reject_repository_controlled_auth(config)?;
-        let Some(value) = config.get("github.auth") else {
-            return Ok(Self::ambient());
+        Ok(Self::from_table(config, AUTH_TABLE)?.unwrap_or_else(Self::ambient))
+    }
+
+    /// The optional `[github.admission_auth]` credential that only JIT runner
+    /// admission reads use, so admission has a rate-limit budget no agent,
+    /// reviewer or steward pass shares. Same schema as `[github.auth]`;
+    /// `None` when the table is absent.
+    pub(super) fn admission_from_loaded_config(
+        config: &LoadedConfig,
+    ) -> Result<Option<Self>, GhConfigError> {
+        Self::from_table(config, ADMISSION_AUTH_TABLE)
+    }
+
+    fn from_table(config: &LoadedConfig, key: &str) -> Result<Option<Self>, GhConfigError> {
+        reject_repository_controlled_auth(config, key)?;
+        let Some(value) = config.get(key) else {
+            return Ok(None);
         };
         let raw = value
             .clone()
             .try_into::<RawGithubAuthConfig>()
             .map_err(|source| GhConfigError::Parse { source })?;
-        raw.into_config()
+        raw.into_config().map(Some)
     }
 }
+
+const AUTH_TABLE: &str = "github.auth";
+const ADMISSION_AUTH_TABLE: &str = "github.admission_auth";
 
 /// `github.auth` names a command to run and binaries to hand an App token to,
 /// so a branch must not be able to set it. Refuse rather than ignore, so a
 /// repository that committed it learns where the table belongs.
-fn reject_repository_controlled_auth(config: &LoadedConfig) -> Result<(), GhConfigError> {
+fn reject_repository_controlled_auth(
+    config: &LoadedConfig,
+    key: &str,
+) -> Result<(), GhConfigError> {
     let layers = config
-        .repository_controlled_layers(|table| table_get(table, "github.auth").is_some())
+        .repository_controlled_layers(|table| table_get(table, key).is_some())
         .map_err(GhConfigError::Load)?;
     let Some((path, _)) = layers.first() else {
         return Ok(());
     };
     Err(GhConfigError::Invalid {
         message: format!(
-            "`github.auth` is set in repository-controlled config {}; a tracked layer may not \
-             set github.auth. Move the [github.auth] table to the machine-global config {} or \
+            "`{key}` is set in repository-controlled config {}; a tracked layer may not \
+             set {key}. Move the [{key}] table to the machine-global config {} or \
              to an untracked .shipyard.local/config.toml",
             path.display(),
             config.global_dir.join("config.toml").display()

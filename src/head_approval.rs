@@ -101,6 +101,7 @@ use serde_json::Value;
 mod blocker;
 pub mod guard;
 mod rebase;
+pub mod trusted_signal;
 
 pub use blocker::ApprovalBlocker;
 pub use rebase::{
@@ -974,6 +975,11 @@ pub struct ApprovalPolicy {
     /// fleet's admission check run.
     #[serde(default)]
     pub source: guard::ApprovalSource,
+    /// Signals the base adds to [`trusted_signal::TRUSTED_SIGNAL_REPOS`]
+    /// (`[auto_merge] trusted_signals`): each must come from its own workflow's
+    /// run on the exact head before a head is admitted.
+    #[serde(default)]
+    pub trusted_signals: Vec<trusted_signal::TrustedSignal>,
 }
 
 /// Where an [`ApprovalPolicy`]'s signers came from.
@@ -1071,6 +1077,7 @@ impl ApprovalPolicy {
             carry_excluded: carry_paths(section).unwrap_or_else(|_| Some(vec!["**".to_owned()])),
             source: guard::source_from_section(Some(section))
                 .unwrap_or_else(|detail| guard::ApprovalSource::Misconfigured { detail }),
+            trusted_signals: trusted_signal::signals_from_section(Some(section)),
         }
         .with_source_required()
     }
@@ -1830,6 +1837,14 @@ pub enum HeadGate {
         /// Why: no run yet, a refusing run, or an unusable policy.
         detail: String,
     },
+    /// A required trusted signal ([`trusted_signal`]) on this head does not
+    /// come from its own workflow's successful run on this exact head.
+    UntrustedSignal {
+        /// The head.
+        head: String,
+        /// Which signal, and why it does not count.
+        detail: String,
+    },
 }
 
 impl HeadGate {
@@ -1860,6 +1875,11 @@ impl HeadGate {
                 "the approval of head {} was posted by this same agent ({agent}); an agent \
                  cannot approve its own landing. Left disarmed until another agent approves \
                  it",
+                short(head)
+            ),
+            Self::UntrustedSignal { head, detail } => format!(
+                "head {} is not admitted: {detail}. This repository requires that signal from \
+                 its own workflow's successful run on this exact head",
                 short(head)
             ),
             Self::NotAdmitted { head, detail } => format!(
@@ -2461,10 +2481,17 @@ pub fn evaluate_excusing_with_policy(
         queue,
         latest_was_interruption,
     )? {
-        return Ok(gate);
+        return trusted_signal::apply(run_gh, repo, pr, head, &policy.trusted_signals, gate);
     }
     if !policy.required {
-        return Ok(HeadGate::NotRequired);
+        return trusted_signal::apply(
+            run_gh,
+            repo,
+            pr,
+            head,
+            &policy.trusted_signals,
+            HeadGate::NotRequired,
+        );
     }
     let author = pr_author(run_gh, repo, pr, policy, None)?;
     let reviews = read_records(
@@ -2496,7 +2523,8 @@ pub fn evaluate_excusing_with_policy(
         author: author.as_deref(),
     };
     let gate = with_carry(run_gh, &input, gate);
-    Ok(with_rollup(run_gh, &input, gate))
+    let gate = with_rollup(run_gh, &input, gate);
+    trusted_signal::apply(run_gh, repo, pr, head, &policy.trusted_signals, gate)
 }
 
 /// The pull request's author, read when the policy turns on it: with no
@@ -2588,6 +2616,30 @@ pub fn evaluate_with_policy_for_author_with_diagnosis(
 /// rollup's own member, which is never itself a rollup.
 #[allow(clippy::too_many_arguments)]
 fn evaluate_events(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    pr: u64,
+    head: &str,
+    policy: &ApprovalPolicy,
+    queue: &Value,
+    author: Option<&str>,
+    rollups: bool,
+) -> Result<(HeadGate, Vec<String>, Option<ApprovalBlocker>), String> {
+    let (gate, events, blocker) =
+        evaluate_events_by_source(run_gh, repo, pr, head, policy, queue, author, rollups)?;
+    let gate = trusted_signal::apply(run_gh, repo, pr, head, &policy.trusted_signals, gate)?;
+    let blocker = match &gate {
+        HeadGate::UntrustedSignal { detail, .. } => Some(ApprovalBlocker::AdmissionMissing {
+            detail: detail.clone(),
+        }),
+        _ => blocker,
+    };
+    Ok((gate, events, blocker))
+}
+
+/// [`evaluate_events`] before the trusted signals are required.
+#[allow(clippy::too_many_arguments)]
+fn evaluate_events_by_source(
     run_gh: RunGh<'_>,
     repo: &str,
     pr: u64,

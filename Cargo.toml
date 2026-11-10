@@ -1,6 +1,6 @@
 [package]
 name = "shipyard"
-version = "0.389.0"
+version = "0.404.0"
 edition = "2024"
 description = "Cross-platform CI coordination for local, SSH, and cloud runners."
 repository = "https://github.com/danielraffel/Shipyard"
@@ -47,6 +47,9 @@ toml = "0.8.23"
 toml_edit = "0.22.27"
 wait-timeout = "0.2.1"
 zstd = { version = "0.13.3", default-features = false }
+ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
+ring = "0.17.14"
+zeroize = "1.8.1"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31.3", features = ["fs", "signal", "user"] }

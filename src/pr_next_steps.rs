@@ -179,6 +179,7 @@ mod tests {
             managed_label: None,
             handoff_context: String::new(),
             max_transient_reruns: 1,
+            ejection_guards: crate::merge_steward::EjectionGuards::default(),
         }
     }
 

@@ -105,8 +105,9 @@ pub(super) fn apply_repo_plan(
         managed_label: Some(args.managed_label.clone()),
         handoff_context: args.handoff_context.clone(),
         max_transient_reruns: args.max_transient_reruns,
+        ejection_guards: super::read_ejection_guards(actions, observation),
     };
-    let (mut reports, pr_mutation_failed) = apply_pr_plans(
+    let (mut reports, pr_mutation_failed, listing) = apply_pr_plans_with_listing(
         actions,
         args,
         observation,
@@ -115,34 +116,73 @@ pub(super) fn apply_repo_plan(
         ledger,
         mutation_control,
     );
-    // The backstop acts only on pull requests the steward declines to own, so
-    // it can never contend with the enqueue path above. See `native_arm`.
-    let (native_arm_status, native_arm_failed) = if args.arm_unqueued {
-        super::native_arm::apply_native_arm_backstop(
+    let dwell_policy =
+        super::dwell_pass::read_policy(actions, &observation.repo, &observation.base);
+    let dwell_report = super::dwell_pass::run(
+        &super::dwell_pass::DwellInput {
+            observation,
+            policy: &policy,
+            dwell_policy: &dwell_policy,
+            listing: listing.as_deref(),
+            apply: args.apply,
+            ledger_path,
+            state_dir: mutation_control.map(|control| control.state_dir.as_path()),
+            now: Utc::now(),
+            deadline: args.pass_deadline,
+        },
+        &reports,
+        ledger,
+        &super::dwell_pass::GitHubDwellActs {
             actions,
             observation,
-            &reports,
-            &args.opt_out_label,
-            args.apply,
-            || {
-                super::native_arm::arming_authority(
-                    mutation_control.expect("apply mode requires mutation control"),
-                    &observation.repo,
-                    &observation.base,
-                )
-            },
-        )
-    } else {
-        (
-            super::native_arm::NativeArmRepoStatus {
-                policy: "disabled: pass --arm-unqueued to arm green, unqueued, unarmed pull \
+            control: mutation_control,
+            approval: policy.required_checks.iter().find(|required| {
+                required
+                    .context
+                    .eq_ignore_ascii_case(policy.approval_context.trim())
+            }),
+        },
+    );
+    // The backstop acts only on pull requests the steward declines to own, so
+    // it can never contend with the enqueue path above. See `native_arm`.
+    let (native_arm_status, native_arm_failed) =
+        if args.arm_unqueued && super::pass_budget::deadline_passed(args.pass_deadline) {
+            (
+                super::native_arm::NativeArmRepoStatus {
+                    policy: format!(
+                        "deferred: the pass time budget is spent; nothing armed this pass ({})",
+                        super::pass_budget::DEFERRED
+                    ),
+                    results: Vec::new(),
+                },
+                false,
+            )
+        } else if args.arm_unqueued {
+            super::native_arm::apply_native_arm_backstop(
+                actions,
+                observation,
+                &reports,
+                &args.opt_out_label,
+                args.apply,
+                || {
+                    super::native_arm::arming_authority(
+                        mutation_control.expect("apply mode requires mutation control"),
+                        &observation.repo,
+                        &observation.base,
+                    )
+                },
+            )
+        } else {
+            (
+                super::native_arm::NativeArmRepoStatus {
+                    policy: "disabled: pass --arm-unqueued to arm green, unqueued, unarmed pull \
                          requests the steward declines to own"
-                    .to_owned(),
-                results: Vec::new(),
-            },
-            false,
-        )
-    };
+                        .to_owned(),
+                    results: Vec::new(),
+                },
+                false,
+            )
+        };
     super::native_arm::annotate_carried_refusals(&native_arm_status, &mut reports);
     let mut unhealthy = (args.preempt_capacity && observation.preemption_error.is_some())
         || native_arm_failed
@@ -244,6 +284,10 @@ pub(super) fn apply_repo_plan(
         RepoReport {
             rollup_reconciliation: Vec::new(),
             uncertain_mutations,
+            api_calls: None,
+            rate_limit_deferred: None,
+            exit_reasons: Vec::new(),
+            dwell: Some(dwell_report),
             repo: observation.repo.clone(),
             base: args.base.clone(),
             allow_auto_merge: observation.allow_auto_merge,
@@ -281,7 +325,8 @@ pub(super) fn apply_repo_plan(
     )
 }
 
-#[allow(clippy::too_many_lines)]
+/// [`apply_pr_plans_with_listing`] without the listing, for tests.
+#[cfg(test)]
 pub(super) fn apply_pr_plans(
     actions: &GitHubActions,
     args: &StewardCommandArgs,
@@ -291,6 +336,34 @@ pub(super) fn apply_pr_plans(
     ledger: &mut StewardLedger,
     mutation_control: Option<&MutationControl>,
 ) -> (Vec<PrReport>, bool) {
+    let (reports, unhealthy, _) = apply_pr_plans_with_listing(
+        actions,
+        args,
+        observation,
+        policy,
+        ledger_path,
+        ledger,
+        mutation_control,
+    );
+    (reports, unhealthy)
+}
+
+/// [`apply_pr_plans`], also handing back the open-pull-request listing the
+/// carried-commit check read this pass, when it read one.
+#[allow(clippy::too_many_lines)]
+pub(super) fn apply_pr_plans_with_listing(
+    actions: &GitHubActions,
+    args: &StewardCommandArgs,
+    observation: &RepoObservation,
+    policy: &StewardPolicy,
+    ledger_path: &Path,
+    ledger: &mut StewardLedger,
+    mutation_control: Option<&MutationControl>,
+) -> (
+    Vec<PrReport>,
+    bool,
+    Option<Vec<super::carried_commits::OpenPr>>,
+) {
     let mut unhealthy = false;
     let mutation_context = mutation_control.map(|mutation_control| MutationApplyContext {
         actions,
@@ -299,206 +372,247 @@ pub(super) fn apply_pr_plans(
         mutation_control,
         approval_blockers: std::cell::RefCell::default(),
         carried_commits: std::cell::RefCell::default(),
+        changed_files: std::cell::RefCell::default(),
+        ejection_guards: policy.ejection_guards.clone(),
     });
     let mut sweep_pass = super::unapproved_admission::SweepPass::new(args.unapproved_dequeue);
     if args.apply {
         super::unapproved_admission::prune(ledger, observation);
     }
-    let mut reports = observation
+    // Rows are evaluated in `pass_budget` order, so that admission work comes
+    // first and a row an earlier pass deferred is not deferred again, then
+    // reported in census order.
+    let census_decisions = observation
         .prs
         .iter()
         .map(|pr| {
-            let attempts = attempts_for(ledger, &observation.repo, &pr.fact);
-            let mut decision = classify_pr(&pr.fact, policy, &attempts);
-            let mut reobserved: Option<Box<ObservedPr>> = None;
-            // Every open PR on the base, owned or not, on every merge path:
-            // an arm or queue entry whose current head the approval gate does
-            // not admit is withdrawn before anything else acts on it. See
-            // `unapproved_admission`.
-            let (stale_mutation, stale_error) =
-                if super::unapproved_admission::applies(pr, &decision) {
-                    super::unapproved_admission::sweep(
-                        actions,
-                        observation,
-                        mutation_context.as_ref(),
-                        args.apply,
-                        pr,
-                        &decision,
-                        &mut sweep_pass,
-                        ledger,
-                    )
-                } else {
-                    (None, None)
-                };
-            unhealthy |= stale_error.is_some();
-            let fold = |mutation: Option<String>, error: Option<String>| {
-                (
-                    match (stale_mutation.clone(), mutation) {
-                        (Some(stale), Some(next)) => Some(format!("{stale},{next}")),
-                        (stale, next) => stale.or(next),
-                    },
-                    match (stale_error.clone(), error) {
-                        (Some(stale), Some(next)) => Some(format!("{stale}; {next}")),
-                        (stale, next) => stale.or(next),
-                    },
-                )
-            };
-            if let Some(mut report) =
-                provenance_blocked_report(mutation_context.as_ref(), pr, policy, &decision, ledger)
-            {
-                unhealthy |= report.error.is_some();
-                (report.mutation, report.error) = fold(report.mutation, report.error);
-                return report;
+            classify_pr(
+                &pr.fact,
+                policy,
+                &attempts_for(ledger, &observation.repo, &pr.fact),
+            )
+        })
+        .collect::<Vec<_>>();
+    let order = super::pass_budget::processing_order(
+        &observation.repo,
+        &observation.base,
+        &observation.prs,
+        &census_decisions,
+        ledger,
+    );
+    let mut budget = super::pass_budget::PassBudget::new(args.pass_deadline);
+    let mut evaluate = |pr: &ObservedPr| {
+        let attempts = attempts_for(ledger, &observation.repo, &pr.fact);
+        let mut decision = classify_pr(&pr.fact, policy, &attempts);
+        let mut reobserved: Option<Box<ObservedPr>> = None;
+        // Every open PR on the base, owned or not, on every merge path:
+        // an arm or queue entry whose current head the approval gate does
+        // not admit is withdrawn before anything else acts on it. See
+        // `unapproved_admission`.
+        let (stale_mutation, stale_error) = if super::unapproved_admission::applies(pr, &decision) {
+            super::unapproved_admission::sweep(
+                actions,
+                observation,
+                mutation_context.as_ref(),
+                args.apply,
+                pr,
+                &decision,
+                &mut sweep_pass,
+                ledger,
+            )
+        } else {
+            (None, None)
+        };
+        unhealthy |= stale_error.is_some();
+        let fold = |mutation: Option<String>, error: Option<String>| {
+            (
+                match (stale_mutation.clone(), mutation) {
+                    (Some(stale), Some(next)) => Some(format!("{stale},{next}")),
+                    (stale, next) => stale.or(next),
+                },
+                match (stale_error.clone(), error) {
+                    (Some(stale), Some(next)) => Some(format!("{stale}; {next}")),
+                    (stale, next) => stale.or(next),
+                },
+            )
+        };
+        if let Some(mut report) =
+            provenance_blocked_report(mutation_context.as_ref(), pr, policy, &decision, ledger)
+        {
+            unhealthy |= report.error.is_some();
+            (report.mutation, report.error) = fold(report.mutation, report.error);
+            return report;
+        }
+        let (mut mutation, mut error) = (None, None);
+        if args.apply && matches!(decision, StewardDecision::Queued { .. }) {
+            match reconcile_queued_success_continuation(
+                ledger_path,
+                ledger,
+                &observation.repo,
+                &observation.base,
+                pr.fact.number,
+                &pr.fact.head_sha,
+            ) {
+                Ok(true) => mutation = Some("success_continuation_reconciled".to_owned()),
+                Ok(false) => {}
+                Err(failure) => error = Some(failure.message),
             }
-            let (mut mutation, mut error) = (None, None);
-            if args.apply && matches!(decision, StewardDecision::Queued { .. }) {
-                match reconcile_queued_success_continuation(
-                    ledger_path,
-                    ledger,
-                    &observation.repo,
-                    &observation.base,
-                    pr.fact.number,
-                    &pr.fact.head_sha,
-                ) {
-                    Ok(true) => mutation = Some("success_continuation_reconciled".to_owned()),
-                    Ok(false) => {}
-                    Err(failure) => error = Some(failure.message),
+        }
+        if args.apply && error.is_none() {
+            if let Some(context) = mutation_context.as_ref() {
+                let (management_mutation, management_error) =
+                    reconcile_management_label(context, pr, policy, &decision, ledger);
+                if let Some(management_mutation) = management_mutation {
+                    mutation = Some(mutation.map_or(management_mutation.clone(), |prior| {
+                        format!("{prior},{management_mutation}")
+                    }));
                 }
+                error = management_error;
+            } else {
+                error = Some("management mutation requires mutation control".to_owned());
             }
-            if args.apply && error.is_none() {
-                if let Some(context) = mutation_context.as_ref() {
-                    let (management_mutation, management_error) =
-                        reconcile_management_label(context, pr, policy, &decision, ledger);
-                    if let Some(management_mutation) = management_mutation {
-                        mutation = Some(mutation.map_or(management_mutation.clone(), |prior| {
-                            format!("{prior},{management_mutation}")
-                        }));
-                    }
-                    error = management_error;
-                } else {
-                    error = Some("management mutation requires mutation control".to_owned());
-                }
-            }
-            if args.apply && error.is_none() {
-                if let Some(context) = mutation_context.as_ref() {
-                    let (recovery_mutation, recovery_error) =
-                        reconcile_recovery_signal(context, pr, policy, &decision, ledger);
-                    // A clear can lift the only thing the decision waited on;
-                    // act on the live head now rather than a pass later.
-                    let reclassification = if recovery_error.is_none() {
-                        super::recovery::reclassify_after_recovery_clear(
-                            context,
-                            pr,
-                            policy,
-                            &decision,
-                            recovery_mutation.as_deref(),
-                            ledger,
-                        )
-                    } else {
-                        RecoveryClearReclassification::Unchanged
-                    };
-                    if let Some(recovery_mutation) = recovery_mutation {
-                        mutation = Some(mutation.map_or(recovery_mutation.clone(), |prior| {
-                            format!("{prior},{recovery_mutation}")
-                        }));
-                    }
-                    match reclassification {
-                        RecoveryClearReclassification::Unchanged => {}
-                        RecoveryClearReclassification::Reclassified(live, live_decision) => {
-                            reobserved = Some(live);
-                            decision = live_decision;
-                        }
-                        RecoveryClearReclassification::ReadFailed(read_error) => {
-                            let note = format!("recovery_clear_reread_failed:{read_error}");
-                            mutation = Some(
-                                mutation.map_or(note.clone(), |prior| format!("{prior},{note}")),
-                            );
-                        }
-                    }
-                    error = recovery_error;
-                } else {
-                    error = Some("recovery mutation requires mutation control".to_owned());
-                }
-                if args.wake_owner
-                    && error.is_none()
-                    && super::recovery::should_wake_owner(
-                        &observation.repo,
-                        pr,
-                        &decision,
-                        ledger,
-                        chrono::Utc::now(),
-                    )
-                {
-                    if let Some(context) = mutation_context.as_ref() {
-                        match super::recovery::wake_owner_comment(context, pr, &decision, ledger) {
-                            Ok(action) => {
-                                mutation =
-                                    Some(mutation.map_or(action.clone(), |prior| {
-                                        format!("{prior},{action}")
-                                    }));
-                            }
-                            Err(wake_error) => error = Some(wake_error),
-                        }
-                    } else {
-                        error = Some("owner wake requires mutation control".to_owned());
-                    }
-                }
-            }
-            let pr = reobserved.as_deref().unwrap_or(pr);
-            if args.apply
-                && error.is_none()
-                && pr.fact.auto_merge_active
-                && super::exact_head_merge::owns_for_disarm(&decision)
-            {
-                // An armed request survives a later push by anyone with
-                // write access, and the steward admits an owned head itself,
-                // so none is left armed on an owned PR on any base, approved
-                // or not. See `exact_head_merge`.
-                if let Some(context) = mutation_context.as_ref() {
-                    let (disarm_mutation, disarm_error) =
-                        super::exact_head_merge::disarm_owned_auto_merge(context, pr, ledger);
-                    if let Some(disarm_mutation) = disarm_mutation {
-                        mutation = Some(mutation.map_or(disarm_mutation.clone(), |prior| {
-                            format!("{prior},{disarm_mutation}")
-                        }));
-                    }
-                    error = disarm_error;
-                } else {
-                    error = Some("auto-merge disarm requires mutation control".to_owned());
-                }
-            }
-            if args.apply && error.is_none() {
-                if let Some(context) = mutation_context.as_ref() {
-                    let (pr_mutation, pr_error) = mutate_pr_with_recovery(
+        }
+        if args.apply && error.is_none() {
+            if let Some(context) = mutation_context.as_ref() {
+                let (recovery_mutation, recovery_error) =
+                    reconcile_recovery_signal(context, pr, policy, &decision, ledger);
+                // A clear can lift the only thing the decision waited on;
+                // act on the live head now rather than a pass later.
+                let reclassification = if recovery_error.is_none() {
+                    super::recovery::reclassify_after_recovery_clear(
                         context,
                         pr,
                         policy,
                         &decision,
+                        recovery_mutation.as_deref(),
                         ledger,
-                        args.recover_hosted_setup_eviction_priority,
-                    );
-                    if let Some(pr_mutation) = pr_mutation {
-                        mutation = Some(mutation.map_or(pr_mutation.clone(), |prior| {
-                            format!("{prior},{pr_mutation}")
-                        }));
-                    }
-                    error = pr_error;
+                    )
                 } else {
-                    error = Some("PR mutation requires mutation control".to_owned());
+                    RecoveryClearReclassification::Unchanged
+                };
+                if let Some(recovery_mutation) = recovery_mutation {
+                    mutation = Some(mutation.map_or(recovery_mutation.clone(), |prior| {
+                        format!("{prior},{recovery_mutation}")
+                    }));
+                }
+                match reclassification {
+                    RecoveryClearReclassification::Unchanged => {}
+                    RecoveryClearReclassification::Reclassified(live, live_decision) => {
+                        reobserved = Some(live);
+                        decision = live_decision;
+                    }
+                    RecoveryClearReclassification::ReadFailed(read_error) => {
+                        let note = format!("recovery_clear_reread_failed:{read_error}");
+                        mutation =
+                            Some(mutation.map_or(note.clone(), |prior| format!("{prior},{note}")));
+                    }
+                }
+                error = recovery_error;
+            } else {
+                error = Some("recovery mutation requires mutation control".to_owned());
+            }
+            if args.wake_owner
+                && error.is_none()
+                && super::recovery::should_wake_owner(
+                    &observation.repo,
+                    pr,
+                    &decision,
+                    ledger,
+                    chrono::Utc::now(),
+                )
+            {
+                if let Some(context) = mutation_context.as_ref() {
+                    match super::recovery::wake_owner_comment(context, pr, &decision, ledger) {
+                        Ok(action) => {
+                            mutation = Some(
+                                mutation
+                                    .map_or(action.clone(), |prior| format!("{prior},{action}")),
+                            );
+                        }
+                        Err(wake_error) => error = Some(wake_error),
+                    }
+                } else {
+                    error = Some("owner wake requires mutation control".to_owned());
                 }
             }
-            unhealthy |= error.is_some();
-            let (mutation, error) = fold(mutation, error);
-            PrReport {
-                number: pr.fact.number,
-                head_sha: pr.fact.head_sha.clone(),
-                decision,
-                mutation,
-                error,
-                blocked: super::blocked_on::Stall::default(),
+        }
+        let pr = reobserved.as_deref().unwrap_or(pr);
+        if args.apply
+            && error.is_none()
+            && pr.fact.auto_merge_active
+            && super::exact_head_merge::owns_for_disarm(&decision)
+        {
+            // An armed request survives a later push by anyone with
+            // write access, and the steward admits an owned head itself,
+            // so none is left armed on an owned PR on any base, approved
+            // or not. See `exact_head_merge`.
+            if let Some(context) = mutation_context.as_ref() {
+                let (disarm_mutation, disarm_error) =
+                    super::exact_head_merge::disarm_owned_auto_merge(context, pr, ledger);
+                if let Some(disarm_mutation) = disarm_mutation {
+                    mutation = Some(mutation.map_or(disarm_mutation.clone(), |prior| {
+                        format!("{prior},{disarm_mutation}")
+                    }));
+                }
+                error = disarm_error;
+            } else {
+                error = Some("auto-merge disarm requires mutation control".to_owned());
             }
-        })
+        }
+        if args.apply && error.is_none() {
+            if let Some(context) = mutation_context.as_ref() {
+                let (pr_mutation, pr_error) = mutate_pr_with_recovery(
+                    context,
+                    pr,
+                    policy,
+                    &decision,
+                    ledger,
+                    args.recover_hosted_setup_eviction_priority,
+                );
+                if let Some(pr_mutation) = pr_mutation {
+                    mutation = Some(mutation.map_or(pr_mutation.clone(), |prior| {
+                        format!("{prior},{pr_mutation}")
+                    }));
+                }
+                error = pr_error;
+            } else {
+                error = Some("PR mutation requires mutation control".to_owned());
+            }
+        }
+        unhealthy |= error.is_some();
+        let (mutation, error) = fold(mutation, error);
+        PrReport {
+            number: pr.fact.number,
+            head_sha: pr.fact.head_sha.clone(),
+            decision,
+            mutation,
+            error,
+            blocked: super::blocked_on::Stall::default(),
+        }
+    };
+    let mut indexed = Vec::with_capacity(order.len());
+    for index in order {
+        let pr = &observation.prs[index];
+        // Past the budget nothing more is read or written for any row: the
+        // row keeps its census decision and is never admitted this pass.
+        let report = match budget.exhausted() {
+            Some(why) => {
+                super::pass_budget::deferred_report(pr, census_decisions[index].clone(), why)
+            }
+            None => evaluate(pr),
+        };
+        budget.observe(&report);
+        indexed.push((index, report));
+    }
+    indexed.sort_by_key(|(index, _)| *index);
+    let mut reports = indexed
+        .into_iter()
+        .map(|(_, report)| report)
         .collect::<Vec<_>>();
+    super::pass_budget::record_deferred(ledger, &observation.repo, &reports);
+    let listing = mutation_context
+        .as_ref()
+        .and_then(|context| context.carried_commits.borrow_mut().take_open());
     let approval_blockers = mutation_context
         .map(|context| context.approval_blockers.take())
         .unwrap_or_default();
@@ -511,7 +625,7 @@ pub(super) fn apply_pr_plans(
         !args.apply,
         &mut reports,
     );
-    (reports, unhealthy)
+    (reports, unhealthy, listing)
 }
 
 fn provenance_blocked_report(

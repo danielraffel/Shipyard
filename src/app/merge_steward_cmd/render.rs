@@ -1,5 +1,6 @@
 use super::{BTreeMap, CliFailure, Path, RepoReport, Value, Write, write_json_envelope};
 
+#[allow(clippy::too_many_lines)] // One flat text layout per field; splitting it hides the order.
 pub(super) fn render_report<W: Write>(
     stdout: &mut W,
     json_output: bool,
@@ -14,6 +15,7 @@ pub(super) fn render_report<W: Write>(
             "handoff_ledger".to_owned(),
             Value::from(ledger_path.display().to_string()),
         );
+        data.insert("api_cost".to_owned(), api_cost(reports));
         data.insert(
             "repos".to_owned(),
             serde_json::to_value(reports).map_err(|error| CliFailure::new(1, error.to_string()))?,
@@ -44,6 +46,31 @@ pub(super) fn render_report<W: Write>(
             }
         )
         .map_err(|error| io_failure(&error))?;
+        if let Some(api) = &repo.api_calls {
+            writeln!(
+                stdout,
+                "  github: rest={} graphql={} cache_hits={}",
+                api.rest, api.graphql, api.cache_hits
+            )
+            .map_err(|error| io_failure(&error))?;
+        }
+        if let Some(dwell) = &repo.dwell {
+            writeln!(
+                stdout,
+                "  dwell: tracked={} overdue={} escalations_new={} act_mode={:?} next={}",
+                dwell.tracked,
+                dwell.overdue.len(),
+                dwell.escalations_new,
+                dwell.act_mode,
+                dwell
+                    .next_to_admit
+                    .iter()
+                    .map(|row| format!("#{}", row.number))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+            .map_err(|error| io_failure(&error))?;
+        }
         writeln!(
             stdout,
             "  stale-pr-run-wedge policy={} candidates={} receipts={}",
@@ -98,6 +125,33 @@ pub(super) fn render_report<W: Write>(
         }
     }
     Ok(())
+}
+
+/// The whole pass's GitHub cost: REST and GraphQL children and cache hits,
+/// summed over every repository, plus the per-repository split.
+fn api_cost(reports: &[RepoReport]) -> Value {
+    let (mut rest, mut graphql, mut cache_hits, mut millis) = (0_u64, 0_u64, 0_u64, 0_u128);
+    let mut by_repo = serde_json::Map::new();
+    for report in reports {
+        let Some(api) = &report.api_calls else {
+            continue;
+        };
+        rest += api.rest;
+        graphql += api.graphql;
+        cache_hits += api.cache_hits;
+        millis += api.millis;
+        by_repo.insert(
+            report.repo.clone(),
+            serde_json::json!({"rest": api.rest, "graphql": api.graphql, "cache_hits": api.cache_hits}),
+        );
+    }
+    serde_json::json!({
+        "rest": rest,
+        "graphql": graphql,
+        "cache_hits": cache_hits,
+        "millis": u64::try_from(millis).unwrap_or(u64::MAX),
+        "by_repo": by_repo,
+    })
 }
 
 pub(super) fn io_failure(error: &std::io::Error) -> CliFailure {

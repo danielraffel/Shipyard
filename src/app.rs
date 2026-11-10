@@ -37,6 +37,7 @@ mod daemon_prune_cmd;
 mod dependency_cmd;
 mod diagnose_cmd;
 mod doctor_cmd;
+mod dwell_cmd;
 mod execution_worker_cmd;
 pub mod fleet_escalation_cmd;
 mod fleet_status_cmd;
@@ -53,6 +54,7 @@ mod merge_queue_control_cmd;
 mod merge_steward_cmd;
 mod metrics_cmd;
 mod metrics_gate_cost_cmd;
+mod owner_cmd;
 mod parallel_proof_canary_cmd;
 mod paths_cmd;
 mod pin_cmd;
@@ -67,6 +69,7 @@ mod queue_digest_cmd;
 mod queue_hold_cmd;
 mod queue_observer_cmd;
 mod queue_quarantine_cmd;
+mod relay_cmd;
 mod release_bot_cmd;
 mod reroute_cmd;
 mod rescue_cmd;
@@ -602,7 +605,47 @@ where
                 stdout,
             );
         }
-        Command::Who { pr, repo } => {
+        Command::Overdue { repo } => {
+            return dwell_cmd::dwell_view_command(
+                dwell_cmd::View::Overdue,
+                &runtime_paths.state_dir,
+                repo.as_deref(),
+                cli.json,
+                chrono::Utc::now(),
+                stdout,
+            );
+        }
+        Command::Next { repo } => {
+            return dwell_cmd::dwell_view_command(
+                dwell_cmd::View::Next,
+                &runtime_paths.state_dir,
+                repo.as_deref(),
+                cli.json,
+                chrono::Utc::now(),
+                stdout,
+            );
+        }
+        Command::Who { pr, repo, contact } => {
+            if let Some(contact) = contact {
+                let pr = contact.or(pr).ok_or_else(|| {
+                    CliFailure::new(
+                        2,
+                        "--contact needs a pull request: --contact 123 or --pr 123",
+                    )
+                })?;
+                return owner_cmd::who_contact_command(
+                    cli.mode.into(),
+                    &cwd,
+                    &runtime_paths,
+                    owner_cmd::ContactArgs {
+                        pr,
+                        repo,
+                        json: cli.json,
+                    },
+                    stdout,
+                );
+            }
+            let pr = pr.ok_or_else(|| CliFailure::new(2, "shipyard who needs --pr 123"))?;
             return who_cmd::who_command(
                 cli.mode.into(),
                 &cwd,
@@ -612,6 +655,40 @@ where
                     repo,
                     json: cli.json,
                 },
+                stdout,
+            );
+        }
+        Command::Owner { command } => {
+            return owner_cmd::owner_command(
+                command,
+                cli.mode.into(),
+                &cwd,
+                &runtime_paths,
+                cli.json,
+                stdout,
+            );
+        }
+        Command::Relay {
+            follow,
+            interval,
+            repos,
+            send,
+            shadow,
+            max_passes,
+        } => {
+            return relay_cmd::relay_command(
+                &relay_cmd::RelayArgs {
+                    follow,
+                    interval,
+                    repos,
+                    send,
+                    shadow,
+                    max_passes,
+                },
+                cli.mode.into(),
+                &cwd,
+                &runtime_paths,
+                cli.json,
                 stdout,
             );
         }
@@ -978,6 +1055,10 @@ fn handle_operational_variant<W: Write>(
         | Command::ReviewerClaim { .. }
         | Command::Rollup { .. }
         | Command::Who { .. }
+        | Command::Overdue { .. }
+        | Command::Next { .. }
+        | Command::Owner { .. }
+        | Command::Relay { .. }
         | Command::BaseHealth { .. }
         | Command::Train { .. }
         | Command::Diagnose { .. }
@@ -1391,6 +1472,7 @@ fn handle_ship_variant<W: Write>(
             arm_auto_merge,
             leave_unarmed: arm_auto_merge.leaves_unarmed(),
             body_append,
+            stacked_on: None,
             next_steps: None,
         },
         mode,
@@ -1420,6 +1502,7 @@ fn handle_pr_variant<W: Write>(
         allow_unreachable_triggers,
         skip_landability,
         stacked,
+        stacked_on,
         skip_targets,
         targets,
         skip_bump,
@@ -1468,6 +1551,7 @@ fn handle_pr_variant<W: Write>(
             allow_unreachable_triggers,
             skip_landability,
             stacked,
+            stacked_on,
             skip_targets,
             targets,
             skip_bump,

@@ -341,6 +341,41 @@ class ForeignStamps(unittest.TestCase):
         self.assertEqual(stamp.rewrite(literal), literal)
 
 
+class GhappOwnerMarker(unittest.TestCase):
+    """The owner marker `shipyard pr` writes passes ghapp's stamp text check
+    while every shape of the reviewer session stamp is still refused."""
+
+    def has_stamp(self, text: str) -> bool:
+        ghapp = (SCRIPT.parent / "ghapp").read_text(encoding="utf-8")
+        start = ghapp.index("ghapp_stamp_pattern=")
+        end = ghapp.index("# A verdict marker anywhere in a body")
+        script = ('trusted_path=/usr/bin:/bin\n' + ghapp[start:end]
+                  + 'ghapp_text_has_stamp "$1" && echo stamp || echo clean\n')
+        out = subprocess.run(["/bin/bash", "-c", script, "ghapp", text], capture_output=True,
+                             check=True, timeout=30,
+                             env={**os.environ, "PATH": f"{os.path.dirname(sys.executable)}:/usr/bin:/bin"})
+        return out.stdout.decode().strip() == "stamp"
+
+    def test_the_owner_marker_is_not_stamp_text(self) -> None:
+        marker = ("<!-- shipyard-owner: host=m3 client=claude-code surface=S1 "
+                  "socket=/tmp/cmux.sock sid=0f1e2d3c-aaaa-bbbb-cccc-1234567890ab "
+                  "agent=audio at=2026-11-09T12:05:00Z -->")
+        self.assertFalse(self.has_stamp(f"## Summary\n\n{marker}"))
+
+    def test_the_old_session_key_and_forged_stamps_are_still_refused(self) -> None:
+        for text in (
+            "<!-- shipyard-owner: host=m3 session=abc at=2026-11-09T12:05:00Z -->",
+            "<!-- session: m3/abc -->",
+            "<!-- SESSION: m3/abc agent: x -->",
+            "<!-- shipyard-owner: host=m3 sid=1 -->\n<!-- session: m1/forged -->",
+            "<!-- shipyard-owner: host=m3 owner_session=1 -->",
+            "&lt;!-- session: m3/abc --&gt;",
+            "\\u003c!-- session: m3/abc -->",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(self.has_stamp(text))
+
+
 class GhappStampWiring(unittest.TestCase):
     """The ghapp snippet that applies the stamper keeps the arguments intact."""
 

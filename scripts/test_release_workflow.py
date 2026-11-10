@@ -46,7 +46,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertNotIn("SHIPYARD_GHAPP_PATH", job)
         self.assertIn("GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}", steps)
         self.assertLess(steps.index("from release_macos_local import require_ci_gh"),
-                        steps.index("- name: Install Rust (attempt 1)"))
+                        steps.index("- name: Install pinned Rust toolchain at the fixed runner path"))
         self.assertLess(steps.index("from release_macos_local import require_ci_gh"),
                         steps.index("- name: Import Developer ID signing identity"))
 
@@ -256,28 +256,56 @@ class ReleaseWorkflowTests(unittest.TestCase):
         )
         self.assertGreater(publish_index, last_attest)
 
-    def test_macos_signing_job_builds_with_fresh_rust_homes(self) -> None:
+    def test_macos_signing_job_reuses_a_fixed_pinned_toolchain(self) -> None:
         steps = self._steps("sign-and-upload-macos")
         names = [step.split("\n", 1)[0] for step in steps]
-        isolate = names.index("name: Isolate the build from shared Rust homes")
-        # Before the toolchain install and every cargo invocation.
-        self.assertLess(isolate, names.index("name: Install Rust (attempt 1)"))
-        self.assertLess(isolate, next(
+        install = names.index("name: Install pinned Rust toolchain at the fixed runner path")
+        verify = names.index("name: Verify the release build uses the pinned toolchain")
+        build = next(
             index for index, step in enumerate(steps)
             if "scripts/release-macos-local.sh" in step
-        ))
-        step = steps[isolate]
-        self.assertIn('root="${RUNNER_TEMP:?}/shipyard-rust-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"', step)
-        self.assertIn('rm -rf "$root"', step)
-        self.assertIn('echo "CARGO_HOME=$root/cargo" >> "$GITHUB_ENV"', step)
-        self.assertIn('echo "RUSTUP_HOME=$root/rustup" >> "$GITHUB_ENV"', step)
+        )
+        # Installed and verified before every cargo invocation and before signing.
+        self.assertLess(install, verify)
+        self.assertLess(verify, build)
+        self.assertLess(verify, names.index("name: Import Developer ID signing identity"))
+        step = steps[install]
         self.assertNotIn("if:", step)
-        # Runner selection is unchanged by the isolation.
+        self.assertNotIn("uses:", step)
+        self.assertIn("python3 scripts/ci_macos_release_rust.py", step)
+        # One fixed path per runner user, outside _work and RUNNER_TEMP, so the
+        # outbound firewall approves its rustup and cargo once per host.
+        self.assertIn('--root "${HOME:?}/.shipyard-release-rust"', step)
+        # Crates stay per run; only the toolchain is shared.
+        self.assertIn(
+            '--run-cargo-home "${RUNNER_TEMP:?}/shipyard-cargo-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"',
+            step,
+        )
+        self.assertIn('--rustup-init-sha256 "$SHIPYARD_RELEASE_RUSTUP_INIT_SHA256"', step)
+        self.assertNotIn("toolchain: stable", "\n".join(steps))
+        self.assertIn('rustc --version | grep -q "^rustc ${SHIPYARD_RELEASE_RUST_TOOLCHAIN} "', steps[verify])
+        self.assertIn('"$RUSTUP_HOME/toolchains/$RUSTUP_TOOLCHAIN/bin/cargo"', steps[verify])
         job = RELEASE_WORKFLOW.read_text(encoding="utf-8").split("\n  sign-and-upload-macos:\n", 1)[1]
+        header = job.split("steps:", 1)[0]
+        self.assertRegex(header, r'SHIPYARD_RELEASE_RUST_TOOLCHAIN: "\d+\.\d+\.\d+"')
+        self.assertRegex(header, r'SHIPYARD_RELEASE_RUSTUP_VERSION: "\d+\.\d+\.\d+"')
+        self.assertRegex(header, r'SHIPYARD_RELEASE_RUSTUP_INIT_SHA256: "[0-9a-f]{64}"')
+        # Runner selection is unchanged.
         self.assertIn(
             "runs-on: ${{ fromJSON(needs.resolve-runners.outputs.macos_arm64_runs_on_json) }}",
-            job.split("steps:", 1)[0],
+            header,
         )
+
+    def test_toolchain_pin_is_at_least_the_crate_msrv(self) -> None:
+        msrv = re.search(
+            r'^rust-version = "([0-9.]+)"$',
+            (ROOT / "Cargo.toml").read_text(encoding="utf-8"),
+            re.MULTILINE,
+        ).group(1)
+        job = RELEASE_WORKFLOW.read_text(encoding="utf-8").split("\n  sign-and-upload-macos:\n", 1)[1]
+        pin = re.search(r'SHIPYARD_RELEASE_RUST_TOOLCHAIN: "([0-9.]+)"', job).group(1)
+        as_tuple = lambda value: tuple(int(part) for part in value.split("."))
+        self.assertGreaterEqual(as_tuple(pin)[:2], as_tuple(msrv)[:2])
 
     def test_rust_home_isolation_is_specific_to_the_signing_job(self) -> None:
         # Negative control: the unsigned build matrix keeps its runner homes.
@@ -285,6 +313,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
             with self.subTest(job=job):
                 self.assertFalse(any(
                     "CARGO_HOME" in step or "RUSTUP_HOME" in step
+                    or "ci_macos_release_rust" in step or ".shipyard-release-rust" in step
                     for step in self._steps(job)
                 ))
 
@@ -333,12 +362,66 @@ class ReleaseWorkflowTests(unittest.TestCase):
     def test_macos_job_retries_rust_install_and_restore_tolerates_unprepared_keychain(self) -> None:
         text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
         job = text.split("  sign-and-upload-macos:", 1)[1]
-        for n in (1, 2, 3):
-            self.assertIn(f"name: Install Rust (attempt {n})", job)
-        self.assertIn("steps.rust_2.outcome == 'failure'", job)
+        # Retries with backoff live in the install script (default 30s, 90s).
+        self.assertNotIn("--backoff", job)
+        script = (ROOT / "scripts" / "ci_macos_release_rust.py").read_text(encoding="utf-8")
+        self.assertIn("default=[30.0, 90.0]", script)
         restore = job.split("name: Restore user keychains", 1)[1]
         self.assertLess(restore.index('[ ! -e "$KEYCHAIN_STATE" ]'),
                         restore.index("ci_macos_signing_keychain.py restore"))
+
+    def _macos_job(self) -> dict:
+        import yaml
+
+        workflow = yaml.safe_load(RELEASE_WORKFLOW.read_text(encoding="utf-8"))
+        return workflow["jobs"]["sign-and-upload-macos"]
+
+    def test_macos_notarization_step_is_bounded_and_covers_its_retries(self) -> None:
+        job = self._macos_job()
+        step = next(
+            s for s in job["steps"]
+            if s.get("name") == "Sign, notarize, staple, and upload macOS DMG"
+        )
+        limit_secs = int(step["timeout-minutes"]) * 60
+        worst_case = (
+            package_release.NOTARY_CREDENTIAL_ATTEMPTS
+            * package_release.NOTARY_CREDENTIAL_TIMEOUT_SECS
+            + package_release.NOTARY_CREDENTIAL_BACKOFF_SECS
+            + package_release.NOTARY_SUBMIT_ATTEMPTS
+            * package_release.NOTARY_ATTEMPT_TIMEOUT_SECS
+            + sum(package_release.NOTARY_RETRY_BACKOFF_SECS)
+            + package_release.NOTARY_AUX_TIMEOUT_SECS
+            + 2 * package_release.STAPLER_TIMEOUT_SECS
+        )
+        # At most two retries, each one hard-capped above notarytool's own wait.
+        self.assertEqual(package_release.NOTARY_SUBMIT_ATTEMPTS, 3)
+        self.assertEqual(len(package_release.NOTARY_RETRY_BACKOFF_SECS), 2)
+        self.assertEqual(package_release.NOTARY_WAIT_TIMEOUT, "20m")
+        self.assertGreater(package_release.NOTARY_ATTEMPT_TIMEOUT_SECS, 20 * 60)
+        # The Python retries must finish (and report the submission id) before
+        # the runner kills the step: leave at least 15 minutes for the build,
+        # signing, DMG smoke and upload.
+        self.assertLessEqual(worst_case + 15 * 60, limit_secs)
+        # ...yet the step must not be allowed to idle for hours.
+        self.assertLessEqual(limit_secs, 2 * 60 * 60)
+
+    def test_macos_job_has_a_timeout_covering_its_bounded_steps(self) -> None:
+        job = self._macos_job()
+        self.assertIn("timeout-minutes", job)
+        job_limit = int(job["timeout-minutes"])
+        self.assertLess(job_limit, 360, "the 6-hour default is what stranded drafts")
+        bounded = 0
+        for step in job["steps"]:
+            name = step.get("name", "")
+            if "timeout-minutes" in step:
+                bounded += int(step["timeout-minutes"])
+            elif name.startswith("Back off before"):
+                bounded += 3  # a fixed sleep of at most 90s
+            elif name.startswith(
+                ("Sign, notarize", "Install pinned Rust", "Publish the", "Attest", "Import Developer ID")
+            ):
+                self.fail(f"long-running step {name!r} has no timeout-minutes")
+        self.assertLessEqual(bounded, job_limit)
 
     def test_heal_is_its_own_workflow_and_auto_release_is_untouched(self) -> None:
         import yaml

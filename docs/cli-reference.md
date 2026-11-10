@@ -112,7 +112,8 @@ shipyard cause advise --dir DIR --repo OWNER/REPO --head-sha SHA --query TEXT [-
 shipyard cause audit --dir DIR               # read-only local archive integrity report; exit 1 on findings
 
 # ghapp guards (queue-removal-guard, queue-arm-guard, branch-refresh-guard, merge-guard,
-#   verdict-hold-hook, verdict-session-stamp); see docs/ghapp-guards.md
+#   verdict-hold-hook, verdict-session-stamp, reviewer-claim-guard,
+#   verdict-contradiction-guard); see docs/ghapp-guards.md
 shipyard guards status                       # missing/stale/current vs this build's copies, plus whether
                                              #   review-before-arm is on (default) or OFF by opt-out; exit 1 unless all current
 shipyard guards install [--dir DIR] [--dry-run]  # install this build's copies atomically
@@ -121,9 +122,22 @@ shipyard guards install --opt-in-review-before-arm               # remove the op
 # Other per-host switches are files in the guards directory, all off by default:
 #   reviewer-signers.json (an App APPROVE needs a `reviewer: <name>` signer),
 #   rebase-carry (an approval carries across a pure rebase), hold-disarms (a HOLD dequeues its head)
+shipyard overdue [--repo OWNER/REPO] [--json] # pull requests past their [auto_merge.dwell] limit: state, age, level, act, owner route; reads the steward snapshot, never GitHub
+shipyard next [--repo OWNER/REPO] [--json]    # the top five to admit, closest to mergeable first, with the one thing each needs; reads the steward snapshot
 shipyard who --pr 123 [--repo OWNER/REPO]    # which host/session (and agent, if set) armed, enqueued, merged or removed it; joins every
                                              #   host's queue-arms.jsonl + queue-removals.jsonl to the PR timeline
                                              #   (repo+PR+verb+head; time breaks ties); unexplained = unattributed
+shipyard who --contact 123 [--repo OWNER/REPO] # the owning session's live cmux address (owner record on any host, else
+                                             #   the body marker), probed over cmux; plus the repo's fallbacks
+shipyard owner register [--pr 123 | --all] [--repo OWNER/REPO]
+                                             # record this session (host, client, cmux socket+surface, agent, session)
+                                             #   as the PR's owner: state dir + PR-body marker; shipyard pr/ship do it
+shipyard owner release --pr 123 [--repo OWNER/REPO]
+                                             # hand the PR to the repo's repair lane
+shipyard relay [--follow] [--interval SECS] [--repo OWNER/REPO]... [--send|--shadow]
+                                             # deliver merged/closed/ejected/verdict/required red-green/dirty-after-base-move/
+                                             #   claim/stacked-base-merged to each PR's owner over cmux; one GraphQL query per
+                                             #   repo per pass; see docs/owner-relay.md
 shipyard review-verdict --pr 123 [--repo OWNER/REPO] [--head SHA] [--no-rebase-carry] [--json]
                                              # may this head land, by the repository-side review rule (no host
                                              #   switch); merge-only and rebase carries apply; exit 0 allowed,

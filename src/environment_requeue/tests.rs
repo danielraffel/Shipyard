@@ -873,3 +873,366 @@ fn one_head_caused_check_refuses_even_beside_a_runner_failure() {
                 && matches!(check.attribution, FailureAttribution::Infra(_)))
     );
 }
+
+// ── retry discipline (`assess_with` infra_only) ────────────────────────────
+
+fn assess_strict(
+    answers: &HashMap<String, Result<String, String>>,
+    ejections: u32,
+) -> EnvironmentRequeue {
+    assess_flaky(answers, ejections, &[])
+}
+
+fn assess_flaky(
+    answers: &HashMap<String, Result<String, String>>,
+    ejections: u32,
+    known: &[&str],
+) -> EnvironmentRequeue {
+    let known = known
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect::<Vec<_>>();
+    let mut report =
+        explain_pr_queue_state(&fixture("pr_real_8678_first_environment_ejection.json"));
+    report.ejections_of_current_head = ejections;
+    if let Some(ejection) = report.last_ejection.as_mut() {
+        ejection.merge_group_commit = Some(GROUP.to_owned());
+    }
+    let gh = |args: &[String]| {
+        answers
+            .get(&args[1])
+            .cloned()
+            .unwrap_or_else(|| Err(format!("unexpected call {}", args[1])))
+    };
+    assess_with(&gh, REPO, &report, true, Some(&known)).expect("applies")
+}
+
+/// One failing `Run` step whose output ends at `lines`, the last of which is
+/// expected to be its `##[error]`.
+fn step_log(lines: &[&str]) -> String {
+    let mut log = String::from(
+        "2026-10-09T23:10:00.0000000Z ##[group]Run ./bootstrap.sh\n\
+         2026-10-09T23:10:00.0000000Z # retries HTTP Error 504 and rate limit exceeded itself\n\
+         2026-10-09T23:10:00.0000000Z ./bootstrap.sh\n\
+         2026-10-09T23:10:00.0000000Z ##[endgroup]\n",
+    );
+    for line in lines {
+        log.push_str("2026-10-09T23:20:00.0000000Z ");
+        log.push_str(line);
+        log.push('\n');
+    }
+    log
+}
+
+#[test]
+fn the_discipline_does_not_retry_a_failure_that_merely_passed_on_the_head() {
+    // #11471's shape: green on the head, red on the merge group, no signature.
+    let lenient = assess_group(&flake_group(Some("success"), Some("success")), 1);
+    assert!(lenient.allowed, "{}", lenient.reason);
+    let strict = assess_strict(&flake_group(Some("success"), Some("success")), 1);
+    assert!(!strict.allowed, "{}", strict.reason);
+    assert!(matches!(
+        only_cause(&strict),
+        FailureAttribution::NoInfraSignature(_)
+    ));
+    assert!(
+        strict.reason.contains("no infrastructure signature"),
+        "{}",
+        strict.reason
+    );
+    // Base poison is not a reason to retry the same head either: it fails
+    // again until the base is fixed.
+    let poisoned = assess_strict(&flake_group(Some("failure"), None), 1);
+    assert!(!poisoned.allowed, "{}", poisoned.reason);
+}
+
+#[test]
+fn the_discipline_still_retries_runner_conclusions_and_cancels() {
+    for conclusion in INFRA_CONCLUSIONS {
+        let verdict = assess_strict(&interrupted_group(conclusion, &test_failure_job(), ""), 1);
+        assert!(verdict.allowed, "{conclusion}: {}", verdict.reason);
+        assert_eq!(verdict.class, Some(RequeueClass::NotHeadCaused));
+    }
+    // #11451's shape: the macos job cancelled at a late step with a runner
+    // attached, so not starved. Under the discipline a cancel is
+    // infrastructure; without it, it is placed by comparison (unanswered
+    // here, so unknown).
+    let cancelled = queued_job(
+        "studio-pulp-gate-03",
+        "2026-11-03T10:00:00Z",
+        "2026-11-03T10:40:00Z",
+    );
+    let mut answers = interrupted_group("cancelled", &cancelled, "");
+    // Without the head's own pass a cancel is not cleared: a job timeout
+    // reads `cancelled`, and a head can hang only in the merged tree.
+    compare(&mut answers, Some("success"), None);
+    let unproven = assess_strict(&answers, 1);
+    assert!(!unproven.allowed, "{}", unproven.reason);
+    assert!(matches!(
+        only_cause(&unproven),
+        FailureAttribution::NoInfraSignature(_)
+    ));
+    compare(&mut answers, Some("success"), Some("success"));
+    let strict = assess_strict(&answers, 1);
+    assert!(strict.allowed, "{}", strict.reason);
+    assert!(
+        matches!(only_cause(&strict), FailureAttribution::Infra(detail) if detail.contains("cancelled"))
+    );
+    // The retry is still one per head.
+    let second = assess_strict(&answers, 2);
+    assert!(!second.allowed, "{}", second.reason);
+}
+
+#[test]
+fn the_discipline_reads_real_infrastructure_lines_at_the_failure() {
+    let cases: [(&str, &[&str]); 4] = [
+        // 11441/11446: drift-fast bootstrap FetchContent clones.
+        (
+            "has timed out after",
+            &[
+                "Cloning into 'skia'...",
+                "##[error]The action 'Bootstrap repository dependencies' has timed out after 10 minutes.",
+            ],
+        ),
+        // 11845: skia-builder release download.
+        (
+            "HTTP Error 403: rate limit exceeded",
+            &[
+                "urllib.error.HTTPError: HTTP Error 403: rate limit exceeded",
+                "##[error]Process completed with exit code 1.",
+            ],
+        ),
+        // Vellum artifact downloads.
+        (
+            "HTTP Error 504",
+            &[
+                "pulp-view-audio-archive: cannot download libpulp-view-audio.a: HTTP Error 504: Gateway Time-out",
+                "##[error]Process completed with exit code 1.",
+            ],
+        ),
+        (
+            "The requested URL returned error: 504",
+            &[
+                "curl: (22) The requested URL returned error: 504",
+                "##[error]Process completed with exit code 22.",
+            ],
+        ),
+    ];
+    for (signature, lines) in cases {
+        let log = step_log(lines);
+        let hit = infra_signature_at_failure(&log, "2026-10-09T23:10:00Z").expect(signature);
+        assert_eq!(hit.signature, signature);
+        let mut answers = interrupted_group("failure", &test_failure_job(), &log);
+        // Not cleared until the same check is seen passing on the head.
+        compare(&mut answers, Some("success"), Some("failure"));
+        let unproven = assess_strict(&answers, 1);
+        assert!(!unproven.allowed, "{signature}: {}", unproven.reason);
+        compare(&mut answers, Some("success"), Some("success"));
+        let strict = assess_strict(&answers, 1);
+        assert!(strict.allowed, "{signature}: {}", strict.reason);
+        assert!(
+            matches!(only_cause(&strict), FailureAttribution::Infra(detail) if detail.contains(signature))
+        );
+    }
+}
+
+#[test]
+fn infrastructure_lines_in_the_script_echo_or_far_from_the_failure_do_not_count() {
+    // The script echo quotes two signatures; the output is a test failure.
+    let log = step_log(&[
+        "1/2 Test #4: hosted_editor ....***Failed",
+        "##[error]Process completed with exit code 8.",
+    ]);
+    assert_eq!(
+        infra_signature_at_failure(&log, "2026-10-09T23:10:00Z"),
+        None
+    );
+    let strict = assess_strict(&interrupted_group("failure", &test_failure_job(), &log), 1);
+    assert!(!strict.allowed, "{}", strict.reason);
+    // A recovered 504 more than FAILURE_PROXIMITY_LINES before a compile error.
+    let mut lines = vec!["transient download failure (HTTP Error 504: Gateway Time-out); retrying"];
+    lines.extend(std::iter::repeat_n(
+        "[ 50%] Building CXX object",
+        FAILURE_PROXIMITY_LINES + 5,
+    ));
+    lines.push("error: no member named 'pos'");
+    lines.push("##[error]Process completed with exit code 2.");
+    let log = step_log(&lines);
+    assert_eq!(
+        infra_signature_at_failure(&log, "2026-10-09T23:10:00Z"),
+        None
+    );
+    // A ctest-level timeout is not an infrastructure line.
+    let log = step_log(&[
+        "5/9 Test #7: WakeSignal racing publish ...***Timeout 60.01 sec",
+        "##[error]Process completed with exit code 8.",
+    ]);
+    assert_eq!(
+        infra_signature_at_failure(&log, "2026-10-09T23:10:00Z"),
+        None
+    );
+}
+
+// ── known flakes (`known_flaky_tests`) ─────────────────────────────────────
+
+/// Pulp's ctest summary shape, naming `tests`.
+fn ctest_log(tests: &[&str]) -> String {
+    let mut lines = vec![
+        "99% tests passed, 1 tests failed out of 24365".to_owned(),
+        "The following tests FAILED:".to_owned(),
+    ];
+    for (index, test) in tests.iter().enumerate() {
+        lines.push(format!("\t{} - {test} (Failed)", 13_700 + index));
+    }
+    lines.push("Errors while running CTest".to_owned());
+    lines.push("##[error]Process completed with exit code 8.".to_owned());
+    step_log(&lines.iter().map(String::as_str).collect::<Vec<_>>())
+}
+
+const PULP_FLAKES: [&str; 3] = [
+    "ui-script-plugin-editor-au",
+    "AsyncBlockWorker: a fast pull without an offline flag waits in Auto mode",
+    "a public WaveNet node runs its GPU path*",
+];
+
+#[test]
+fn the_ctest_failed_block_names_the_failing_tests() {
+    let log = ctest_log(&[
+        "ui-script-plugin-editor-au",
+        "Graphite still shadows the coordinates",
+    ]);
+    assert_eq!(
+        failed_tests_in_step(&log, "2026-10-09T23:10:00Z"),
+        vec![
+            "ui-script-plugin-editor-au",
+            "Graphite still shadows the coordinates"
+        ]
+    );
+    assert!(failed_tests_in_step(TEST_FAILURE_LOG, "2026-10-09T23:10:00Z").is_empty());
+    assert!(known_flaky_match(
+        "a public WaveNet node runs its GPU path*",
+        "a public WaveNet node runs its GPU path on Metal"
+    ));
+    assert!(!known_flaky_match(
+        "ui-script-plugin-editor-au",
+        "ui-script-plugin-editor-au3"
+    ));
+}
+
+/// #11584's shape: only `ui-script-plugin-editor-au` failed in the merge
+/// group, and the same check passed on the head.
+#[test]
+fn a_listed_flake_that_passed_on_the_head_gets_the_one_retry() {
+    let mut answers = interrupted_group(
+        "failure",
+        &test_failure_job(),
+        &ctest_log(&["ui-script-plugin-editor-au"]),
+    );
+    compare(&mut answers, Some("success"), Some("success"));
+    let verdict = assess_flaky(&answers, 1, &PULP_FLAKES);
+    assert!(verdict.allowed, "{}", verdict.reason);
+    assert!(
+        matches!(only_cause(&verdict), FailureAttribution::KnownFlake(detail) if detail.contains("ui-script-plugin-editor-au"))
+    );
+    // Control: the same ejection with no list is refused under the discipline.
+    assert!(!assess_flaky(&answers, 1, &[]).allowed);
+    // Still one per head.
+    assert!(!assess_flaky(&answers, 2, &PULP_FLAKES).allowed);
+}
+
+#[test]
+fn a_listed_flake_beside_an_unlisted_failure_or_red_on_the_head_is_refused() {
+    // #11471's test beside a listed flake: the unlisted one decides.
+    let mut answers = interrupted_group(
+        "failure",
+        &test_failure_job(),
+        &ctest_log(&[
+            "ui-script-plugin-editor-au",
+            "every hosted format adapter builds its editor from hosted_editor()",
+        ]),
+    );
+    compare(&mut answers, Some("success"), Some("success"));
+    let mixed = assess_flaky(&answers, 1, &PULP_FLAKES);
+    assert!(!mixed.allowed, "{}", mixed.reason);
+    // A listed flake whose check did not pass on the head is not cleared.
+    let mut answers = interrupted_group(
+        "failure",
+        &test_failure_job(),
+        &ctest_log(&["ui-script-plugin-editor-au"]),
+    );
+    compare(&mut answers, Some("success"), Some("failure"));
+    let red_head = assess_flaky(&answers, 1, &PULP_FLAKES);
+    assert!(!red_head.allowed, "{}", red_head.reason);
+    assert!(matches!(
+        only_cause(&red_head),
+        FailureAttribution::NoInfraSignature(_)
+    ));
+    // A step that names no test is never a known flake.
+    let mut answers = interrupted_group("failure", &test_failure_job(), TEST_FAILURE_LOG);
+    compare(&mut answers, Some("success"), Some("success"));
+    assert!(!assess_flaky(&answers, 1, &["dylib-*"]).allowed);
+}
+
+/// A listed check name (a single-test job such as
+/// `inject-worktree-lineage-hook`) is a known flake by itself.
+#[test]
+fn a_listed_check_name_is_a_known_flake() {
+    let mut answers = interrupted_group("failure", &test_failure_job(), TEST_FAILURE_LOG);
+    compare(&mut answers, Some("success"), Some("success"));
+    let verdict = assess_flaky(&answers, 1, &["macos"]);
+    assert!(verdict.allowed, "{}", verdict.reason);
+}
+
+#[test]
+fn every_failed_block_counts_and_must_end_cleanly() {
+    let started = "2026-10-09T23:10:00Z";
+    // `ctest || ctest --rerun-failed`: the first block names an unlisted test.
+    let two = step_log(&[
+        "The following tests FAILED:",
+        "\t13716 - hosted_editor (Failed)",
+        "Errors while running CTest",
+        "The following tests FAILED:",
+        "\t13717 - ui-script-plugin-editor-au (Failed)",
+        "Errors while running CTest",
+        "##[error]Process completed with exit code 8.",
+    ]);
+    assert_eq!(
+        failed_tests_in_step(&two, started),
+        vec!["hosted_editor", "ui-script-plugin-editor-au"]
+    );
+    // An interleaved line inside the block grants nothing.
+    let torn = step_log(&[
+        "The following tests FAILED:",
+        "\t13717 - ui-script-plugin-editor-au (Failed)",
+        "[ 3%] some parallel output",
+        "\t13716 - hosted_editor (Failed)",
+        "Errors while running CTest",
+        "##[error]Process completed with exit code 8.",
+    ]);
+    assert!(failed_tests_in_step(&torn, started).is_empty());
+    // A flaky block, then something else in the step fails far later.
+    let mut lines = vec![
+        "The following tests FAILED:",
+        "\t13717 - ui-script-plugin-editor-au (Failed)",
+        "Errors while running CTest",
+    ];
+    lines.extend(std::iter::repeat_n(
+        "lint: checking",
+        FAILURE_PROXIMITY_LINES + 5,
+    ));
+    lines.push("##[error]Process completed with exit code 1.");
+    assert!(failed_tests_in_step(&step_log(&lines), started).is_empty());
+}
+
+#[test]
+fn a_bare_star_or_a_test_glob_never_lists_the_check() {
+    let mut answers = interrupted_group(
+        "failure",
+        &test_failure_job(),
+        &ctest_log(&["hosted_editor"]),
+    );
+    compare(&mut answers, Some("success"), Some("success"));
+    for pattern in ["*", "**", "mac*"] {
+        assert!(!assess_flaky(&answers, 1, &[pattern]).allowed, "{pattern}");
+    }
+}

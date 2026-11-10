@@ -492,6 +492,49 @@ Set `SHIPYARD_GITHUB_APP_INSTALLATION_ID` only for a separate, intentionally
 repo-less helper configuration. It is a compatibility fallback and is ignored
 whenever `--repo` is present.
 
+### A separate budget for JIT runner admission
+
+`shipyard runner admission-clean` runs before every VM a TartCI lane mints. On
+the shared installation it competes with the steward, reviewers and every agent
+session, so a busy hour can exhaust the installation and leave lanes refusing
+to start VMs with `observation_failed`. Give admission its own installation:
+
+```toml
+[github.admission_auth]
+source = "command"
+token_command = [
+  "/Users/you/.local/bin/ghapp",
+  "token",
+  "--app-id",
+  "654321",
+  "--private-key",
+  "/Users/you/.config/shipyard/github-apps/fleet-admission.private-key.pem",
+  "--repo",
+  "{repo_slug}",
+]
+```
+
+The table has the `[github.auth]` schema and the same placement rule: machine
+global or untracked local config only. Admission makes every census with it,
+including the ones before and after a cancellation, so the App needs read
+access alone: Actions, Checks, Commit statuses, Contents, Metadata and Pull
+requests (Administration read is optional; without it required checks come
+from the evaluated rulesets). The cancellation itself, and resuming a pending
+one, still use `[github.auth]`.
+
+If the table is absent, invalid, or its helper cannot mint a token for the
+repository (missing key, App not installed), admission prints one line to
+stderr and uses `[github.auth]`, which is the behaviour before this table
+existed.
+
+Admission also reuses, for three minutes, the reads whose answer is fixed by
+their argv: repository settings, branch rules, classic required checks, and the
+check runs and statuses of a full commit SHA. The open-PR list, merge queue and
+workflow runs are always read fresh. Set
+`SHIPYARD_ADMISSION_READ_CACHE_SECS` in the lane's environment to change the
+window (at most 600) or to `0` to turn the cache off. The cache lives under the
+state dir in `runner-admission-observation/read-cache/`.
+
 ## Validate the quota
 
 Run:
@@ -556,6 +599,20 @@ are rejected, and omitting the option preserves Shipyard's ambiguity refusal.
 The export contains the `[github.auth]` command configuration. It does not
 include GitHub tokens, token caches, private keys, Keychain items, or
 1Password sessions.
+
+## What the merge steward spends
+
+Every repository in `shipyard runner steward --json` reports `api_calls`: the
+REST and GraphQL children that pass spawned, the reads it answered from its
+pass cache, and a per-call-site breakdown. One App installation serves every
+consumer on its account (the steward, reviewers, watchers, CI helpers), so when
+an installation runs out compare the steward's per-pass total with the
+installation's hourly use before blaming the steward. On Generous-Corp/pulp on
+2026-11-08 a dry pass with 46 open pull requests spent 135 REST and 13 GraphQL
+calls. An apply pass adds a few reads per pull request it acts on; at four
+ticks an hour the steward spends well under 1,000 of the installation's 15,000
+REST calls. See the shipyard skill's merge-steward reference for
+what the steward caches and skips.
 
 ## Additional clients (the same App across several Macs)
 
