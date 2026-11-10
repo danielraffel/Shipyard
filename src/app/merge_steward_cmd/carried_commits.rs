@@ -42,6 +42,11 @@
 //!   tip re-hung as merge(Q.base, old tip)) is cleared. The commit graph
 //!   cannot tell that from Q having merged P's branch, so X lands under P's
 //!   own approval; P's reviewer reviews X as P's diff.
+//! * A carried commit whose change is already on the base under other shas
+//!   (a merge that only re-applies landed content, a cherry-pick with the
+//!   base's patch-id and matching changed entries): see [`landed`]. The
+//!   steward proves it against the base's pinned tip; any doubt or read error
+//!   keeps the refusal.
 //! * Commits already on the base: P's set comes from the compare API
 //!   `base...head`, which lists only commits the base does not have.
 //! * A base whose policy does not require head approval: there every head is
@@ -849,7 +854,11 @@ pub(super) fn refusal_with(
                 .and_then(|graph| first_parent_chain(&graph, chain_base, chain_head))
         };
         match without_own_commits(settled, base, head_sha, q, &mut chain) {
-            Some(settled) => judged.push(settled),
+            Some(settled) => {
+                if let Some(settled) = landed::without_landed_commits(run_gh, repo, base, settled) {
+                    judged.push(settled);
+                }
+            }
             None => merged_own.push(q.number),
         }
     }
@@ -1444,6 +1453,8 @@ fn rest_commits(run_gh: RunGh<'_>, repo: &str, number: u64) -> Result<BTreeSet<S
         .map(str::to_owned)
         .collect())
 }
+
+mod landed;
 
 #[cfg(test)]
 mod tests;
