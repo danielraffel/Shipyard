@@ -215,10 +215,18 @@ pub(super) fn label(
     run_gh: &dyn Fn(&[String]) -> Result<String, String>,
     now: DateTime<Utc>,
 ) {
-    let mut dispatched: BTreeMap<String, ControlRun> = open
+    // A control belongs to one episode start.  The streak and strict rules
+    // opened by the same pass share it, but a later episode for the same
+    // context must dispatch its own control.
+    let mut dispatched: BTreeMap<(String, String), ControlRun> = open
         .iter()
         .filter(|episode| episode.key == key)
-        .filter_map(|episode| Some((episode.context.clone(), episode.control.clone()?)))
+        .filter_map(|episode| {
+            Some((
+                (episode.context.clone(), episode.started_at.clone()),
+                episode.control.clone()?,
+            ))
+        })
         .filter(|(_, control)| control.conclusion.is_none())
         .collect();
     for episode in open.iter_mut().filter(|episode| episode.key == key) {
@@ -228,14 +236,15 @@ pub(super) fn label(
         let Some(workflow) = controls.get(&episode.context) else {
             continue;
         };
-        if let Some(shared) = dispatched.get(&episode.context) {
+        let control_key = (episode.context.clone(), episode.started_at.clone());
+        if let Some(shared) = dispatched.get(&control_key) {
             episode.control = Some(shared.clone());
             continue;
         }
         let mut control = ControlRun {
             workflow: workflow.clone(),
             base_sha: String::new(),
-            dispatched_at: now.to_rfc3339(),
+            dispatched_at: String::new(),
             conclusion: None,
             error: None,
         };
@@ -248,6 +257,10 @@ pub(super) fn label(
         match tip {
             Ok(sha) if sha.trim().len() == 40 => {
                 sha.trim().clone_into(&mut control.base_sha);
+                // The dispatch boundary is after the base-tip lookup.  A
+                // prior run that started just before this request is not the
+                // control for this episode.
+                control.dispatched_at = now.to_rfc3339();
                 if let Err(error) = run_gh(&[
                     "api".to_owned(),
                     "--method".to_owned(),
@@ -269,18 +282,19 @@ pub(super) fn label(
                 control.conclusion = Some("unlabelled".to_owned());
             }
         }
-        dispatched.insert(episode.context.clone(), control.clone());
+        dispatched.insert(control_key, control.clone());
         episode.control = Some(control);
     }
-    // Read each waiting control once per context.
-    let mut verdicts: BTreeMap<String, Option<String>> = BTreeMap::new();
+    // Read each waiting control once per episode start.
+    let mut verdicts: BTreeMap<(String, String), Option<String>> = BTreeMap::new();
     for episode in open.iter_mut().filter(|episode| episode.key == key) {
         let Some(control) = episode.control.as_mut() else {
             continue;
         };
         if control.conclusion.is_none() {
+            let verdict_key = (episode.context.clone(), episode.started_at.clone());
             let verdict = verdicts
-                .entry(episode.context.clone())
+                .entry(verdict_key)
                 .or_insert_with(|| control_verdict(control, &episode.context, repo, run_gh, now))
                 .clone();
             control.conclusion = verdict;
@@ -324,16 +338,16 @@ fn control_verdict(
         .flatten()
         .filter(|run| run.get("status").and_then(Value::as_str) == Some("completed"))
         .filter(|run| {
-            // Only a run started by the dispatch (a minute of clock slack).
+            // Only a run started at or after the dispatch boundary.
             run.get("started_at")
                 .and_then(Value::as_str)
                 .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
-                .is_some_and(|at| at.with_timezone(&Utc) >= since - chrono::Duration::minutes(1))
+                .is_some_and(|at| at.with_timezone(&Utc) >= since)
         })
         .filter_map(|run| run.get("conclusion").and_then(Value::as_str))
         .map(|conclusion| match conclusion {
             "success" => "success",
-            "failure" | "timed_out" => "failure",
+            "failure" => "failure",
             _ => "unlabelled",
         })
         .next()
