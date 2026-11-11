@@ -26,11 +26,11 @@
 //!   keeps P admissible when P's own commit reached Q through a chain. A pull
 //!   request that merges another pull request's branch still has those
 //!   commits in its own diff and is still caught.
-//! * Q contains P's head (P's head is a proper ancestor of Q's head) while
-//!   targeting the steward's base: Q is above P, and the commits both ranges
-//!   contain are P's, the bottom pair member's. Residual: held work that is
-//!   a prefix of Q's own history and sits in P's range is reviewed as P's
-//!   diff. P merging Q's work in is the reverse shape and is still refused.
+//! * Never excused by ancestry alone: a Q that contains P's whole head (Q
+//!   built on P while targeting the base, or Q merged P back in) is judged
+//!   like any other Q. Head ancestry cannot say which pull request introduced
+//!   a shared commit, so the commits both ranges hold clear P only while Q's
+//!   listed head is approved, without a HOLD, or once they are on the base.
 //! * Q merged P's branch without being stacked on it: a shared commit counts
 //!   against P only when it is on Q's first-parent chain (`Q.base..Q.head`
 //!   walked through first parents) or is not on P's own first-parent chain
@@ -841,9 +841,6 @@ pub(super) fn refusal_with(
             .iter()
             .find(|q| q.number == overlap.number())
             .expect("an overlap names a listed pull request");
-        if builds_on_candidate(run_gh, repo, head_sha, q) {
-            continue;
-        }
         let Some(settled) = resolve_overlap(
             run_gh,
             repo,
@@ -880,20 +877,6 @@ pub(super) fn refusal_with(
         }
         refusal
     })
-}
-
-/// Whether `q` contains P's whole head: P's head is a proper ancestor of `q`'s
-/// head. Then `q` sits above P whatever its base branch says (a pull request
-/// opened against the steward's base on top of P's commits), and the commits
-/// both ranges contain belong to P, the bottom of the pair. P merging `q`'s
-/// work in has the opposite shape (`q`'s head is an ancestor of P's) and is
-/// still caught. Equal heads, a diverged pair, an unreadable compare, and a
-/// `q` whose commit listing is over the cap (judged by the probes below
-/// instead) are not excused.
-fn builds_on_candidate(run_gh: RunGh<'_>, repo: &str, p_head: &str, q: &OpenPr) -> bool {
-    matches!(q.commits, CommitList::Complete(_))
-        && p_head != q.head_sha
-        && is_ancestor(run_gh, repo, p_head, &q.head_sha).unwrap_or(false)
 }
 
 /// Reads a `(base, head)` first-parent chain.
@@ -1479,7 +1462,7 @@ fn rest_commits(run_gh: RunGh<'_>, repo: &str, number: u64) -> Result<BTreeSet<S
 mod landed;
 
 #[cfg(test)]
-mod builds_on_tests;
+mod stacked_verdict_tests;
 
 #[cfg(test)]
 mod tests;

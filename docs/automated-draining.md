@@ -107,10 +107,7 @@ from its first parent has an identical mode, type and blob on the tip; proven
 by the steward against the tip, all shared commits must qualify, any doubt or
 read error, including a diff at GitHub's file cap, keeps the refusal), nor does
 Q when it is P's own base-branch
-pull request, targets the base but contains P's whole head (P's head is a
-proper ancestor of Q's head, so Q is above P and the shared commits are P's;
-an over-cap listing, equal heads, a diverged pair or an unreadable compare keep
-the refusal), is stacked on P (following its base branch through other open
+pull request, is stacked on P (following its base branch through other open
 pull requests' head branches reaches P's head branch), only inherits the
 commit (a commit counts as Q's only if it is in Q's own diff against Q's own
 base branch), merged P's branch without being stacked on it, or is a Shipyard
@@ -128,7 +125,12 @@ read of `Q.base...Q.head`. Named residual: P built straight on commits that a
 held Q itself took in through a merge's second parent (Q = merge(Q.base, X)
 with P on X, or Q's tip re-hung as merge(Q.base, old tip)) is cleared, because
 the commit graph cannot tell that from Q having merged P's branch; X then
-lands under P's own approval, so P's reviewer reviews X as part of P's diff. Land or
+lands under P's own approval, so P's reviewer reviews X as part of P's diff. Head
+ancestry never excuses Q on its own: a Q that targets the base and contains P's
+whole head (built on P, or P merged back into Q) is judged at its listed head
+like any other Q, because ancestry cannot show which pull request introduced a
+shared commit. The shared commits clear P only while Q's head is approved with
+no HOLD, or once they are on the base. Land or
 approve Q first, or drop its commits from P; a branch built on another pull
 request should target that pull request's branch. At most 250 commits are read
 per pull request. A Q whose listing is larger (for example a stacked pull
