@@ -239,6 +239,15 @@ struct StewardLedger {
     /// `dwell_pass`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     dwell: BTreeMap<String, crate::merge_steward::dwell::DwellRepoState>,
+    /// The last superseded check of each open head, keyed `repo#pr`
+    /// (lowercase repository). See `superseded`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    superseded_checks: BTreeMap<String, superseded::Check>,
+    /// This pass only: the rate-limit error that stopped the superseded
+    /// check, reported in the repository's `errors` so the pass's cooldown
+    /// sees it. Never persisted.
+    #[serde(skip)]
+    superseded_rate_limit: Option<String>,
     /// Queue entries removed while the base was poisoned, in queue order,
     /// keyed `repo@base`; restored first once the poison clears. See
     /// `poison_pause`.
@@ -2049,6 +2058,7 @@ pub(super) mod read_probe;
 mod render;
 mod resume_record;
 mod shadow_ledger;
+mod superseded;
 mod terminal_handoff;
 pub(super) mod train;
 mod unapproved_admission;

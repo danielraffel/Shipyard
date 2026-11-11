@@ -4751,3 +4751,7 @@ When two PRs share commits, the steward clears the earlier PR's overlap only
 while the later PR's listed head is approved with no HOLD, or once the shared
 commits are on the base. A later PR whose head merely contains the earlier
 head gets no shortcut: ancestry cannot say which PR introduced a shared commit.
+
+## Skill-sync gotcha
+
+Changes to CI-coordinated Rust steward paths must carry this note or a reviewed skill-sync exception so the version-and-skill gate records the operational impact.

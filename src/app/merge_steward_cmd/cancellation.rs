@@ -118,6 +118,10 @@ pub(super) fn apply_repo_plan(
         mutation_control,
         base_poison.as_ref(),
     );
+    let superseded_rate_limit = ledger
+        .superseded_rate_limit
+        .take()
+        .map(|error| format!("superseded check stopped: {error}"));
     let base_poison_report = base_poison.as_ref().map(|poison| {
         // The fast-track mutates (it cancels other runs and starts a review),
         // so it runs only under `merge_group_hold = "on"`; dry-run reports.
@@ -423,6 +427,7 @@ pub(super) fn apply_repo_plan(
                 .chain(terminal_handoff_reconcile_error)
                 .chain(wedge_reconcile_error)
                 .chain(wedge_observation_error)
+                .chain(superseded_rate_limit)
                 .collect(),
         },
         unhealthy,
@@ -784,6 +789,19 @@ pub(super) fn apply_pr_plans_with_poison(
         !args.apply,
         &mut reports,
     );
+    // Apply passes only: they persist the ledger, so the per-head cache holds
+    // and a blocked backlog costs nothing between rechecks.
+    if args.apply {
+        let stop = || budget.exhausted().is_some();
+        ledger.superseded_rate_limit = super::superseded::annotate(
+            actions,
+            observation,
+            ledger,
+            &mut reports,
+            Utc::now(),
+            &stop,
+        );
+    }
     (reports, unhealthy, listing)
 }
 
