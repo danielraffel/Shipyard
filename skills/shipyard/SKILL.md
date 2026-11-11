@@ -5838,7 +5838,11 @@ ejection guards from the base's `.shipyard/config.toml`
 read from the machine-global layer only, both keys in `MACHINE_ONLY_KEYS`;
 receipts in `<state>/base-health/fast-track.jsonl`; CI via
 `queue_drain::prioritize_named_fix` with the approval context excused). The
-fast-track mutates only under `merge_group_hold = "on"`.
+fast-track mutates only under `merge_group_hold = "on"`. Exactly one fix is fast-tracked per pass (`choose_fix`: label, then
+detector, then text, lowest number on a tie; a PR that rode a failing group is
+never chosen), its CI is prioritized only while a non-approval required check
+has not completed, and a dry-run hold never jumps. `base-health --act` is the
+manual path; leave `auto_jump` driving the steward alone so one writer jumps.
 
 ### The endpoint that lies by omission
 

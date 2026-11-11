@@ -166,3 +166,48 @@ fn a_dry_run_names_what_the_fast_track_would_do_and_nothing_when_clear() {
     };
     assert!(would_fast_track(&clear).is_empty());
 }
+
+#[test]
+fn one_fix_is_chosen_and_a_pr_that_rode_a_failing_group_is_never_it() {
+    let health = MergeGroupHealth::Poisoned {
+        contexts: vec![crate::base_health::merge_group::PoisonedContext {
+            context: "macos".to_owned(),
+            first_error: None,
+            groups: vec![crate::base_health::merge_group::GroupRef {
+                head_sha: "a".repeat(40),
+                prs: vec![5],
+            }],
+            latest_failure_at: None,
+            check_id: None,
+        }],
+    };
+    let text = || vec!["mentions red required check `macos`".to_owned()];
+    let fixes = BTreeMap::from([
+        (3, text()),
+        (5, vec!["label `shipyard:unblock`".to_owned()]),
+        (8, vec!["base-poison detector run 1 names it".to_owned()]),
+        (9, vec!["label `shipyard:unblock`".to_owned()]),
+    ]);
+    // #5 is labelled but already failed in a poisoned group: #9 wins.
+    assert_eq!(
+        choose_fix(fixes.clone(), &health)
+            .into_keys()
+            .collect::<Vec<_>>(),
+        vec![9]
+    );
+    // Without labels the detector outranks text.
+    let unlabelled = BTreeMap::from([(3, text()), (8, fixes[&8].clone())]);
+    assert_eq!(
+        choose_fix(unlabelled, &health)
+            .into_keys()
+            .collect::<Vec<_>>(),
+        vec![8]
+    );
+    // Control: a lone text match is still chosen.
+    assert_eq!(
+        choose_fix(BTreeMap::from([(3, text())]), &health)
+            .into_keys()
+            .collect::<Vec<_>>(),
+        vec![3]
+    );
+}

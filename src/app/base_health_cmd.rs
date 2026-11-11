@@ -362,8 +362,8 @@ fn jump(actions: &GitHubActions, repo: &str, pr: u64) -> String {
     match enqueue_outcome(mutate(base_health::PLAIN_ENQUEUE_MUTATION, &head_arg)) {
         Ok(()) => format!("failed: jump: {jump_error}; re-enqueued at the back"),
         Err(restore_error) => format!(
-            "failed: jump: {jump_error}; re-enqueue also failed, PR #{pr} is NOT queued: \
-             {restore_error}"
+            "failed: jump: {jump_error}; re-enqueue also failed, PR #{pr} may NOT be queued \
+             (re-read its queue state): {restore_error}"
         ),
     }
 }
@@ -661,7 +661,7 @@ esac
     #[test]
     fn a_fix_left_unqueued_says_so() {
         let (outcome, _calls) = run_jump(&jump_approval(), REFUSED, REFUSED);
-        assert!(outcome.contains("is NOT queued"), "{outcome}");
+        assert!(outcome.contains("may NOT be queued"), "{outcome}");
     }
 
     #[test]

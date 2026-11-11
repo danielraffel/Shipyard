@@ -207,6 +207,16 @@ fn the_named_fix_is_enqueued_without_a_jump_when_auto_jump_is_off() {
 }
 
 #[test]
+fn a_dry_run_hold_never_jumps_even_with_auto_jump_on() {
+    let poison = poisoned(PoisonHold::DryRun, AutoJump::On, &[42]);
+    let outcome = enqueue(Some(&poison), JUMP_ACCEPTED);
+    assert_eq!(outcome.mutation.as_deref(), Some("fast_track_fix,enqueued"));
+    let enqueues = enqueues(&outcome.calls);
+    assert_eq!(enqueues.len(), 1);
+    assert!(!enqueues[0].contains("jump:true"), "{}", enqueues[0]);
+}
+
+#[test]
 fn a_refused_jump_still_enqueues_the_fix_at_the_back() {
     let poison = poisoned(PoisonHold::On, AutoJump::On, &[42]);
     let outcome = enqueue(Some(&poison), JUMP_FORBIDDEN);

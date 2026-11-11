@@ -115,7 +115,8 @@ pub(super) fn admission(poison: Option<&RepoPoison>, pr: u64) -> Admission {
     }
     if poison.fixes.contains_key(&pr) {
         return Admission::FastTrack {
-            jump: poison.policy.auto_jump == AutoJump::On,
+            // A jump reorders the queue, so it is a mutation: dry-run never jumps.
+            jump: poison.policy.hold == PoisonHold::On && poison.policy.auto_jump == AutoJump::On,
         };
     }
     let contexts = contexts.join(",");
@@ -165,12 +166,52 @@ pub(super) fn observe(
             now,
         )
     };
+    let fixes = choose_fix(fixes, &health);
     Some(RepoPoison {
         policy: poison_policy,
         health,
         fixes,
         fix_read_error,
     })
+}
+
+/// The one fix this pass fast-tracks, out of every named candidate.
+///
+/// A pull request that rode one of the streak's failing groups demonstrably
+/// did not fix the context, so it is dropped. Of the rest, the strongest
+/// evidence wins: the `shipyard:unblock` label (only someone with write
+/// access can apply it), then the detector's naming, then title or
+/// description text; ties go to the lowest number. Exactly one fix keeps the
+/// per-pass reads and cancellations bounded and stops a pull request whose
+/// text merely mentions the context from being fast-tracked beside it.
+pub(super) fn choose_fix(
+    fixes: BTreeMap<u64, Vec<String>>,
+    health: &MergeGroupHealth,
+) -> BTreeMap<u64, Vec<String>> {
+    let rode_a_failing_group = |pr: u64| {
+        health
+            .poisoned()
+            .iter()
+            .any(|poison| poison.groups.iter().any(|group| group.prs.contains(&pr)))
+    };
+    let rank = |evidence: &[String]| {
+        if evidence.iter().any(|line| line.starts_with("label ")) {
+            0
+        } else if evidence
+            .iter()
+            .any(|line| line.starts_with("base-poison detector"))
+        {
+            1
+        } else {
+            2
+        }
+    };
+    fixes
+        .into_iter()
+        .filter(|(pr, _)| !rode_a_failing_group(*pr))
+        .min_by_key(|(pr, evidence)| (rank(evidence), *pr))
+        .into_iter()
+        .collect()
 }
 
 /// Open, non-draft pull requests named as the fix for one of `contexts`,
@@ -535,6 +576,20 @@ pub(super) fn fast_track(
                 &pr.fact.head_sha,
                 &contexts,
             ));
+        }
+        // Only a fix with a required check still to run has CI to move; a
+        // settled head would cost the full queue-drain read for nothing.
+        let settled = policy
+            .required_checks
+            .iter()
+            .filter(|rule| rule.context != policy.approval_context)
+            .all(|rule| {
+                crate::merge_steward::selected_required_check(&pr.fact.checks, rule)
+                    .is_some_and(|check| check.status.eq_ignore_ascii_case("COMPLETED"))
+            });
+        if settled {
+            lines.push(format!("#{number} ci: required checks already ran"));
+            continue;
         }
         lines.push(
             match super::queue_drain::prioritize_named_fix(
