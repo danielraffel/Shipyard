@@ -16,7 +16,7 @@ later attempt on the same head with nothing pushed in between (one Pulp head
 drew 146). The tier ladder already escalates those to the strongest model,
 which made each repeat more expensive, not more likely to finish.
 
-    repair_budget.py filter --log FILE [--max 3] [--window 21600] [--now EPOCH] < list > runnable
+    repair_budget.py filter --log FILE [--held-file FILE] [--max 3] [--window 21600] [--now EPOCH] < list > runnable
     repair_budget.py record --log FILE --line LINE [--now EPOCH]
 
 ``filter`` copies runnable lines to stdout in order and writes one
@@ -81,11 +81,21 @@ def record(log: str, line: str, now: float) -> None:
     os.replace(tmp, log)
 
 
+def write_held(path: str, held: list[tuple[str, int]], now: float) -> None:
+    """Publish the current held entries for the scheduled operator feed."""
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        for line, k in held:
+            f.write(f"{int(now)}\tHELD {line} attempts={k}\n")
+    os.replace(tmp, path)
+
+
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
     fp = sub.add_parser("filter")
     fp.add_argument("--log", required=True)
+    fp.add_argument("--held-file")
     fp.add_argument("--max", type=int, default=3)
     fp.add_argument("--window", type=float, default=6 * 3600)
     fp.add_argument("--now", type=float)
@@ -101,6 +111,8 @@ def main(argv: list[str]) -> int:
         run, held = runnable(sys.stdin.readlines(), a.log, now, a.max, a.window)
         for line in run:
             print(line)
+        if a.held_file:
+            write_held(a.held_file, held, now)
         for line, k in held:
             print(f"HELD {line} attempts={k}", file=sys.stderr)
         return 0

@@ -71,6 +71,17 @@ class Budget(unittest.TestCase):
         self.assertEqual(p.stdout.splitlines(), [F1])
         self.assertEqual(p.stderr.strip(), f"HELD {A} attempts=3")
 
+    def test_cli_filter_publishes_current_holds(self):
+        exe = [sys.executable, os.path.join(HERE, "repair_budget.py")]
+        held = os.path.join(os.path.dirname(self.log), "repair.held")
+        for _ in range(3):
+            subprocess.run(exe + ["record", "--log", self.log, "--line", A, "--now", str(NOW)], check=True)
+        subprocess.run(exe + ["filter", "--log", self.log, "--held-file", held,
+                              "--now", str(NOW)], input=f"{A}\n", text=True, check=True,
+                       capture_output=True)
+        with open(held) as f:
+            self.assertEqual(f.read(), f"{NOW}\tHELD {A} attempts=3\n")
+
 
 if __name__ == "__main__":
     unittest.main()

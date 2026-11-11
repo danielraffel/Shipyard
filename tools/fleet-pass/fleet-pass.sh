@@ -39,6 +39,7 @@ ALLOWED="${FLEET_PASS_ALLOWED_TOOLS:-Read Grep Glob Bash(ghapp:*) Bash(git:*) Ba
 ADD_DIR="${FLEET_PASS_ADD_DIR:-/Volumes/Workshop/Code}"
 WORKTREES_DIR="${FLEET_PASS_WORKTREES_DIR:-$ADD_DIR/agent-worktrees}"
 STATE="${FLEET_PASS_STATE:-$HOME/.local/share/shipyard-steward/pass-runner}"
+export FLEET_PASS_STATE="$STATE"
 LOGDIR="${FLEET_PASS_LOGDIR:-$HOME/Library/Logs/fleet-pass}"; LOG="$LOGDIR/$ROLE.log"
 LOCK="$STATE/$ROLE.lock"
 mkdir -p "$LOGDIR" "$STATE"
@@ -204,12 +205,29 @@ fi
 # checks are green and which have no verdict at their head; last pass's misses first.
 MUST_FILE="$STATE/$ROLE.must-review"; MISSED_FILE="$STATE/$ROLE.missed"
 MUST_ARGS=(); [ "$ROLE" = repair ] && MUST_ARGS=(--repair); [ "$ROLE" = adversary ] && MUST_ARGS=(--adversary)
+REPAIR_LINE=""
 if { [ "$ROLE" = reviewer ] || [ "$ROLE" = adversary ] || [ "$ROLE" = repair ]; } && [ $DRY = 0 ]; then
   # Take the lock before the (API-heavy) query so a short schedule never stacks passes.
   take_lock
   MUST_OK=1
   python3 "$STATE/must-review.py" ${MUST_ARGS[@]+"${MUST_ARGS[@]}"} --missed "$MISSED_FILE" > "$MUST_FILE.tmp" 2>>"$LOG" || MUST_OK=0
   mv "$MUST_FILE.tmp" "$MUST_FILE"
+  if [ "$ROLE" = repair ] && [ "$MUST_OK" = 1 ]; then
+    # Filter before the model claims work, and publish held entries for the operator.
+    python3 "$STATE/repair_budget.py" filter \
+      --log "$STATE/repair-attempts.log" \
+      --held-file "$STATE/repair.held" \
+      < "$MUST_FILE" > "$MUST_FILE.filtered" 2>>"$LOG" || MUST_OK=0
+    if [ "$MUST_OK" = 1 ]; then
+      mv "$MUST_FILE.filtered" "$MUST_FILE"
+      [ ! -s "$MUST_FILE" ] || REPAIR_LINE="$(head -n 1 "$MUST_FILE")"
+    else
+      rm -f "$MUST_FILE.filtered"
+    fi
+  fi
+  if [ "$ROLE" = repair ] && [ "$MUST_OK" = 0 ]; then
+    ENDED=refused; logline "$PROVIDER" "$MODEL" 5 0 "refused: repair queue filter failed"; exit 5
+  fi
   if [ -s "$MUST_FILE" ] && [ "$ROLE" = reviewer ]; then
     PROMPT="$PROMPT
 
@@ -310,6 +328,11 @@ export CODEX_COMPANION_SESSION_ID="${CODEX_COMPANION_SESSION_ID:-fleet-pass-$STA
 export SHIPYARD_STAMP_SESSION_ID="$CODEX_COMPANION_SESSION_ID"
 cd "$HOME" || exit 5
 OUT="$LOGDIR/$ROLE.last-output.txt"
+if [ "$ROLE" = repair ] && [ -n "$REPAIR_LINE" ]; then
+  if ! python3 "$STATE/repair_budget.py" record --log "$STATE/repair-attempts.log" --line "$REPAIR_LINE"; then
+    ENDED=refused; logline "$PROVIDER" "$MODEL" 5 0 "refused: could not record repair attempt"; exit 5
+  fi
+fi
 run_watched "$OUT" "${CMD[@]}"
 # A Claude account that is cooked, throttled or unauthorised fails fast; run the
 # same pass once on Codex instead of losing the cycle.

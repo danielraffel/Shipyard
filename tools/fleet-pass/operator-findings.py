@@ -18,6 +18,33 @@ NO_VERDICT_MIN = 45      # green with no verdict (reviewer missed it)
 HELD_IDLE_MIN = 60       # HOLD / required failure / conflict with no push (rescue missed it)
 
 
+def held_entries():
+    """Read the repair budget's current held entries for operator escalation."""
+    state = os.environ.get("FLEET_PASS_STATE", os.path.dirname(os.path.abspath(__file__)))
+    path = os.path.join(state, "repair.held")
+    try:
+        with open(path) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return []
+    out = []
+    for raw in lines:
+        _, sep, value = raw.partition("\t")
+        value = value if sep else raw
+        if not value.startswith("HELD "):
+            continue
+        value = value[5:]
+        line, sep, attempts = value.rpartition(" attempts=")
+        if not sep:
+            continue
+        parts = line.split(maxsplit=2)
+        if len(parts) != 3:
+            continue
+        key, sha, reason = parts
+        out.append(f"{key} {sha} REPAIR-BUDGET-HELD attempts={attempts} reason={reason}")
+    return out
+
+
 def steward_rows(repo):
     files = sorted(glob.glob(os.path.expanduser(
         f"~/Library/Logs/shipyard-steward-tick/{repo.replace('/', '_')}-*.json")))
@@ -34,6 +61,8 @@ def steward_rows(repo):
 def main():
     now = datetime.datetime.now(datetime.timezone.utc)
     failed = False
+    for entry in held_entries():
+        print(entry)
     for repo in mr.REPOS:
         try:
             req = mr.required(repo)
