@@ -135,6 +135,63 @@ pub(super) fn apply_repo_plan(
         };
         super::base_poison::report(poison, &fast_track)
     });
+    let pause_lines = if args.apply {
+        super::poison_pause::reconcile(ledger, observation, base_poison.as_ref(), Utc::now())
+    } else {
+        Vec::new()
+    };
+    // Shadow ledger: every would-fire episode per rule, labelled when it
+    // ends, and the promotion gate it feeds. Measurement only.
+    let shadow = match (args.apply, mutation_control, base_poison.as_ref()) {
+        (true, Some(control), Some(poison)) => {
+            // Real holds and pauses, and would-be ones under dry-run, are
+            // counted apart so the gate's cost side says which it measured.
+            let marked = |prefix: &str| {
+                reports
+                    .iter()
+                    .filter(|report| {
+                        report.mutation.as_deref().is_some_and(|mutation| {
+                            mutation.split(',').any(|part| {
+                                part.starts_with(prefix) && part.contains("base_poisoned")
+                            })
+                        })
+                    })
+                    .map(|report| report.number)
+                    .collect::<std::collections::BTreeSet<_>>()
+            };
+            let mut held = marked("held_");
+            held.extend(marked("paused_"));
+            let would = marked("would_");
+            Some(super::shadow_ledger::record_pass(
+                &control.state_dir,
+                &observation.repo,
+                &observation.base,
+                Some(poison),
+                &held,
+                &would,
+                Utc::now(),
+            ))
+        }
+        _ => None,
+    };
+    let base_poison_report = match base_poison_report {
+        Some(mut value) => {
+            if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "pause".to_owned(),
+                    super::poison_pause::report(observation, base_poison.as_ref(), &pause_lines),
+                );
+                if let Some(shadow) = shadow {
+                    object.insert("shadow".to_owned(), shadow);
+                }
+            }
+            Some(value)
+        }
+        None if !pause_lines.is_empty() => Some(serde_json::json!({
+            "pause": super::poison_pause::report(observation, None, &pause_lines),
+        })),
+        None => None,
+    };
     let dwell_policy =
         super::dwell_pass::read_policy(actions, &observation.repo, &observation.base);
     let dwell_report = super::dwell_pass::run(
@@ -487,6 +544,30 @@ pub(super) fn apply_pr_plans_with_poison(
                 },
             )
         };
+        if let Some(report) =
+            super::poison_pause::waiting_report(ledger, observation, pr, &decision)
+        {
+            return report;
+        }
+        // While the base is poisoned a queued entry only burns a gate:
+        // remove it and remember its place. See `poison_pause`.
+        if !stale_mutation
+            .as_deref()
+            .is_some_and(|mutation| mutation.contains("dequeued_"))
+            && let Some(mut report) = super::poison_pause::pause_pr(
+                mutation_context.as_ref(),
+                args.apply,
+                observation,
+                pr,
+                &decision,
+                base_poison,
+                ledger,
+            )
+        {
+            unhealthy |= report.error.is_some();
+            (report.mutation, report.error) = fold(report.mutation, report.error);
+            return report;
+        }
         if let Some(mut report) =
             provenance_blocked_report(mutation_context.as_ref(), pr, policy, &decision, ledger)
         {

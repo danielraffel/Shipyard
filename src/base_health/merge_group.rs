@@ -111,6 +111,11 @@ pub struct PoisonedContext {
     pub latest_failure_at: Option<DateTime<Utc>>,
     /// Check run of the newest failure.
     pub check_id: Option<u64>,
+    /// Shadow only: whether every group in the streak failed with the same
+    /// first error line (a stricter predicate under measurement; it changes
+    /// no decision). `None` when it was not read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub same_first_error: Option<bool>,
 }
 
 /// What the merge groups say about the base.
@@ -126,6 +131,11 @@ pub enum MergeGroupHealth {
     Clear {
         /// Why, for a person.
         detail: String,
+        /// The required contexts whose newest verdict in the sample is a
+        /// pass: the only evidence that the base is healthy again for them.
+        /// A stale streak or an empty sample passes nothing.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        passed: Vec<String>,
     },
     /// The merge groups could not be read. Callers keep their normal
     /// behaviour: an unread base is never treated as poisoned.
@@ -173,7 +183,7 @@ impl MergeGroupHealth {
                 })
                 .collect::<Vec<_>>()
                 .join("; "),
-            Self::Clear { detail } => format!("merge groups clear: {detail}"),
+            Self::Clear { detail, .. } => format!("merge groups clear: {detail}"),
             Self::Unknown { detail } => format!("merge groups unread: {detail}"),
         }
     }
@@ -221,6 +231,7 @@ pub fn detect(groups: &[MergeGroup], required: &[String], now: DateTime<Utc>) ->
     if groups.is_empty() {
         return MergeGroupHealth::Clear {
             detail: "no recent merge group".to_owned(),
+            passed: Vec::new(),
         };
     }
     let mut poisoned = Vec::new();
@@ -277,6 +288,7 @@ pub fn detect(groups: &[MergeGroup], required: &[String], now: DateTime<Utc>) ->
                 .collect(),
             latest_failure_at,
             check_id: newest_check.and_then(|check| check.check_id),
+            same_first_error: None,
         });
     }
     if poisoned.is_empty() {
@@ -286,6 +298,17 @@ pub fn detect(groups: &[MergeGroup], required: &[String], now: DateTime<Utc>) ->
             } else {
                 notes.join("; ")
             },
+            passed: contexts
+                .iter()
+                .filter(|context| {
+                    groups
+                        .iter()
+                        .map(|group| outcome(group.check(context)))
+                        .find(|outcome| *outcome != Outcome::NoVerdict)
+                        == Some(Outcome::Pass)
+                })
+                .cloned()
+                .collect(),
         }
     } else {
         MergeGroupHealth::Poisoned { contexts: poisoned }
@@ -314,6 +337,16 @@ fn parse_time(value: Option<&Value>) -> Option<DateTime<Utc>> {
         .and_then(Value::as_str)
         .and_then(|text| DateTime::parse_from_rfc3339(text).ok())
         .map(|time| time.with_timezone(&Utc))
+}
+
+/// The stricter predicate under shadow measurement: every failing group in
+/// the streak carries a readable first error line, and they are all equal.
+#[must_use]
+pub fn same_first_error(errors: &[Option<String>]) -> bool {
+    let Some(Some(first)) = errors.first() else {
+        return false;
+    };
+    errors.len() >= MIN_STREAK && errors.iter().all(|error| error.as_ref() == Some(first))
 }
 
 /// Pull requests named by `Merge pull request #<n>` commit subjects.
@@ -505,12 +538,25 @@ pub fn read(
     let mut health = detect(&groups, &contexts, now);
     if let MergeGroupHealth::Poisoned { contexts } = &mut health {
         for poison in contexts {
-            if let Some(line) = poison
-                .check_id
-                .and_then(|check_id| first_error_line(gh, repo, check_id))
-            {
-                poison.first_error = Some(line);
+            // The two newest groups of the streak only: one annotation read
+            // more than before, and only while poisoned.
+            let errors = poison
+                .groups
+                .iter()
+                .take(MIN_STREAK)
+                .map(|member| {
+                    groups
+                        .iter()
+                        .find(|group| group.head_sha == member.head_sha)
+                        .and_then(|group| group.check(&poison.context))
+                        .and_then(|check| check.check_id)
+                        .and_then(|check_id| first_error_line(gh, repo, check_id))
+                })
+                .collect::<Vec<_>>();
+            if let Some(Some(line)) = errors.first() {
+                poison.first_error = Some(line.clone());
             }
+            poison.same_first_error = Some(same_first_error(&errors));
         }
     }
     health

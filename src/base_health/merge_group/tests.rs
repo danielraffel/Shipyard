@@ -98,7 +98,7 @@ fn groups_sharing_one_pull_request_point_at_that_pull_request_not_the_base() {
         group("a", &[12016], &[(CONTEXT, "failure")]),
     ];
     let health = detect(&groups, &required(), now());
-    let MergeGroupHealth::Clear { detail } = health else {
+    let MergeGroupHealth::Clear { detail, .. } = health else {
         panic!("expected clear, got {health:?}");
     };
     assert!(detail.contains("#12016"), "{detail}");
@@ -152,7 +152,7 @@ fn a_stale_streak_is_not_acted_on() {
     ];
     let later = at("2026-11-11T09:00:00Z");
     let health = detect(&groups, &required(), later);
-    let MergeGroupHealth::Clear { detail } = health else {
+    let MergeGroupHealth::Clear { detail, .. } = health else {
         panic!("expected clear, got {health:?}");
     };
     assert!(detail.contains("stale"), "{detail}");
@@ -446,4 +446,14 @@ fn an_unreadable_run_list_is_unknown_never_poisoned() {
         matches!(health, MergeGroupHealth::Unknown { .. }),
         "{health:?}"
     );
+}
+
+#[test]
+fn the_strict_predicate_needs_one_readable_error_shared_by_every_group() {
+    let line = |text: &str| Some(text.to_owned());
+    assert!(same_first_error(&[line("overdue"), line("overdue")]));
+    assert!(!same_first_error(&[line("overdue"), line("timeout")]));
+    assert!(!same_first_error(&[line("overdue"), None]));
+    assert!(!same_first_error(&[None, None]));
+    assert!(!same_first_error(&[line("overdue")]));
 }
