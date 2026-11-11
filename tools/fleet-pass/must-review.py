@@ -32,6 +32,9 @@ be read, so the runner never mistakes a failed read for "nothing to do".
 """
 import datetime, json, os, re, subprocess, sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import review_queue  # noqa: E402  (sibling module; the runner installs both)
+
 REPOS = ["Generous-Corp/pulp", "Generous-Corp/vellum", "danielraffel/Shipyard", "danielraffel/tartci",
          "danielraffel/fleet-handbook"]
 HOLD_LABELS = {"owner-decision", "superseded"}
@@ -128,7 +131,7 @@ query($owner:String!,$name:String!,$after:String){
         commits(last:1){nodes{commit{committedDate statusCheckRollup{contexts(first:100){
           pageInfo{hasNextPage endCursor}
           nodes{__typename ... on CheckRun{name status conclusion databaseId}
-                ... on StatusContext{context state createdAt}}}}}}}
+                ... on StatusContext{context state createdAt description}}}}}}}
       }
     }
   }
@@ -138,7 +141,7 @@ query($id:ID!,$after:String){
   node(id:$id){... on PullRequest{commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100,after:$after){
     pageInfo{hasNextPage endCursor}
     nodes{__typename ... on CheckRun{name status conclusion databaseId}
-          ... on StatusContext{context state createdAt}}}}}}}}}
+          ... on StatusContext{context state createdAt description}}}}}}}}}
 }"""
 
 
@@ -168,7 +171,8 @@ def split_contexts(nodes):
         elif c.get("__typename") == "StatusContext":
             state = c["state"].lower()
             statuses.append({"context": c["context"], "created_at": c.get("createdAt") or "",
-                             "state": "pending" if state == "expected" else state})
+                             "state": "pending" if state == "expected" else state,
+                             "description": c.get("description") or ""})
     return runs, statuses
 
 
@@ -255,6 +259,20 @@ def verdict_at(cs, sha):
     return last
 
 
+def approved_heads(cs):
+    """Full shas named by a counted APPROVE in these comments."""
+    return {h for c in cs if counted(c.get("body") or "")
+            for v, h in VERDICT.findall(c.get("body") or "") if v == "APPROVE"}
+
+
+def gate_statuses(repo, sha):
+    """Commit statuses (with descriptions) for a head, from the GraphQL snapshot."""
+    for pr in _PRS.get(repo, ()):
+        if pr["head"]["sha"] == sha:
+            return pr["_statuses"]
+    return []
+
+
 def last_hold(cs):
     last = None
     for c in cs:
@@ -318,6 +336,8 @@ def review_candidates(repo, req, now):
         cs = comments(repo, pr["number"])
         if verdict_at(cs, sha)[0]:
             continue
+        if review_queue.gate_carried(gate_statuses(repo, sha), sha, approved_heads(cs), now.timestamp()):
+            continue  # the review gate carried a counted approval to this exact head
         out.append((f"{repo}#{pr['number']}", sha, pr["created_at"], "DISPUTED" if disputed(cs) else ""))
     return out
 
