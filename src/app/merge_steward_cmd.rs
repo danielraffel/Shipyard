@@ -1982,7 +1982,7 @@ pub(super) fn required_contexts(
     repo: &str,
     base: &str,
 ) -> Result<Vec<RequiredCheck>, String> {
-    Ok(observation::required_checks(actions, repo, base)?)
+    observation::required_checks(actions, repo, base)
 }
 
 /// The one fix for the poison `health` names ([`base_poison::named_fixes`]
