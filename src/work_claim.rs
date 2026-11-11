@@ -190,8 +190,8 @@ mod tests {
 
     use super::*;
 
-    fn at(minutes: i64) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 11, 11, 12, minutes as u32, 0)
+    fn at(minutes: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 11, 11, 12, minutes, 0)
             .single()
             .expect("timestamp")
     }
