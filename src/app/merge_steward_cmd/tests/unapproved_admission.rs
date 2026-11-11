@@ -1380,6 +1380,7 @@ fn an_approved_queued_head_is_paused_while_the_base_is_poisoned() {
     let poison = |hold| RepoPoison {
         policy: BasePoisonPolicy {
             hold,
+            control_workflows: std::collections::BTreeMap::new(),
             pause: hold,
             auto_jump: AutoJump::Off,
             read_error: None,

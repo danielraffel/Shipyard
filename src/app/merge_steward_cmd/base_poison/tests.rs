@@ -44,6 +44,20 @@ fn hold_and_jump_follow_the_base_config() {
             .as_deref()
             .is_some_and(|e| e.contains("merge_group_pause"))
     );
+    // Control workflows name a workflow file, never a path.
+    let controls = parse(
+        "[base_health.control_workflows]\n\"Enforce version & skill sync\" = \"version-skill-check.yml\"\nmacos = \"../evil.yml\"\n",
+        true,
+    );
+    assert_eq!(
+        controls
+            .control_workflows
+            .get("Enforce version & skill sync")
+            .map(String::as_str),
+        Some("version-skill-check.yml")
+    );
+    assert!(!controls.control_workflows.contains_key("macos"));
+    assert!(controls.read_error.is_some());
     // A base without a merge queue forms no merge groups to read.
     assert_eq!(
         parse("[base_health]\nmerge_group_hold = \"on\"\n", false).hold,

@@ -195,6 +195,14 @@ pub struct BasePoisonPolicy {
     /// nothing.
     #[serde(default)]
     pub pause: PoisonHold,
+    /// `[base_health.control_workflows]`: for each required context, the
+    /// workflow file that produces it and accepts `workflow_dispatch`. When
+    /// a context starts failing merge groups, the steward dispatches that
+    /// workflow once on the base branch as a PR-free control ("without
+    /// patch"): its verdict labels the episode true or false. List only
+    /// cheap checks; a context without an entry stays unlabelled.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub control_workflows: std::collections::BTreeMap<String, String>,
     /// A key that did not parse. Its setting falls back to the safe value
     /// (the hold to dry-run, the jump to off).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -218,6 +226,7 @@ impl BasePoisonPolicy {
             } else {
                 PoisonHold::Off
             },
+            control_workflows: std::collections::BTreeMap::new(),
             read_error: None,
         }
     }
@@ -249,6 +258,35 @@ impl BasePoisonPolicy {
                 Ok(Some(pause)) => policy.pause = pause,
                 Ok(None) => {}
                 Err(error) => errors.push(error.replace("merge_group_hold", "merge_group_pause")),
+            }
+        }
+        if let Some(controls) = section.get("control_workflows") {
+            match controls.as_table() {
+                Some(controls) => {
+                    for (context, workflow) in controls {
+                        match workflow.as_str().map(str::trim) {
+                            Some(file)
+                                if std::path::Path::new(file).extension().is_some_and(|extension| {
+                                    extension.eq_ignore_ascii_case("yml")
+                                        || extension.eq_ignore_ascii_case("yaml")
+                                })
+                                    && !file.contains('/')
+                                    && !file.contains("..") =>
+                            {
+                                policy
+                                    .control_workflows
+                                    .insert(context.clone(), file.to_owned());
+                            }
+                            _ => errors.push(format!(
+                                "base_health.control_workflows.{context:?} must be a workflow file name like \"build.yml\""
+                            )),
+                        }
+                    }
+                }
+                None => errors.push(
+                    "base_health.control_workflows must be a table of context = \"workflow.yml\""
+                        .to_owned(),
+                ),
             }
         }
         match AutoJump::parse(text("auto_jump")) {
