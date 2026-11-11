@@ -6006,3 +6006,10 @@ The PR owner marker (`<!-- shipyard-owner: ... sid=<id> ... -->`) writes the
 session id as `sid=`, never `session=`: the ghapp stamp guard refuses any body
 comment containing the word "session" as a possible reviewer stamp. Readers
 still accept the legacy `session=` key.
+
+### Carried-commit overlap is judged by verdict, never by ancestry
+
+When two PRs share commits, the steward clears the earlier PR's overlap only
+while the later PR's listed head is approved with no HOLD, or once the shared
+commits are on the base. A later PR whose head merely contains the earlier
+head gets no shortcut: ancestry cannot say which PR introduced a shared commit.
