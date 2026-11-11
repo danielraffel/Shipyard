@@ -5,6 +5,7 @@
 # hard ceiling, one log line.
 set -u
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 
 ROLE=""; DRY=0; SELFTEST=0
 for a in "$@"; do
@@ -39,8 +40,11 @@ ALLOWED="${FLEET_PASS_ALLOWED_TOOLS:-Read Grep Glob Bash(ghapp:*) Bash(git:*) Ba
 ADD_DIR="${FLEET_PASS_ADD_DIR:-/Volumes/Workshop/Code}"
 WORKTREES_DIR="${FLEET_PASS_WORKTREES_DIR:-$ADD_DIR/agent-worktrees}"
 STATE="${FLEET_PASS_STATE:-$HOME/.local/share/shipyard-steward/pass-runner}"
+export FLEET_PASS_STATE="$STATE"
 LOGDIR="${FLEET_PASS_LOGDIR:-$HOME/Library/Logs/fleet-pass}"; LOG="$LOGDIR/$ROLE.log"
 LOCK="$STATE/$ROLE.lock"
+CLAIMS_DIR="${FLEET_PASS_CLAIMS_DIR:-$STATE/review-claims}"
+CLAIM_CAP="${FLEET_PASS_CLAIM_CAP:-2}"
 mkdir -p "$LOGDIR" "$STATE"
 now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 ENDED=""
@@ -87,6 +91,25 @@ run_watched() {
 CPID=""
 cleanup() { [ -n "${CPID:-}" ] && kill_tree KILL "$CPID"; rm -rf "$LOCK"; }
 
+# Give each reviewer slot only the heads it exclusively claims. The claim
+# directory is shared by every slot and the claim helper publishes a pid-bearing
+# directory atomically, so a second slot cannot receive the same head.
+claim_review_queue() {
+  local source=$1 dest=$2
+  local pid=${3:-$$}
+  local helper="$SCRIPT_DIR/review_queue.py"
+  local tmp="$dest.tmp"
+  if [ ! -r "$helper" ]; then
+    echo "refusing: review queue helper is missing at $helper" >&2
+    return 1
+  fi
+  if ! python3 "$helper" claim --dir "$CLAIMS_DIR" --pid "$pid" --cap "$CLAIM_CAP" <"$source" >"$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  mv "$tmp" "$dest"
+}
+
 # --- lock (mkdir is atomic; stale if owner pid dead) ---
 take_lock() {
   if ! mkdir "$LOCK" 2>/dev/null; then
@@ -109,12 +132,33 @@ finish_pass() {
 }
 
 if [ $SELFTEST = 1 ]; then
-  T="$(mktemp -d "${TMPDIR:-/tmp}/fleet-pass-selftest.XXXXXX")" || exit 5
+  SELFTEST_ROOT="${TMPDIR:-$WORKTREES_DIR}"
+  if [ ! -d "$SELFTEST_ROOT" ] && ! mkdir -p "$SELFTEST_ROOT"; then
+    SELFTEST_ROOT="$HOME/agent-worktrees"
+    mkdir -p "$SELFTEST_ROOT" || exit 5
+  fi
+  T="$(mktemp -d "$SELFTEST_ROOT/fleet-pass-selftest.XXXXXX")" || exit 5
   STATE="$T/state"; LOGDIR="$T/logs"; LOG="$LOGDIR/selftest.log"; LOCK="$STATE/selftest.lock"
   mkdir -p "$STATE" "$LOGDIR"
   POLL_S=1; FAILS=0
   check() { if [ "$2" = "$3" ]; then echo "PASS $1 (got $2)"; else echo "FAIL $1: expected $3 got $2"; FAILS=$((FAILS+1)); fi; }
   take_lock
+  # Integration control for the runner's shared claim path: two live slots
+  # consume one queue without sharing a head.
+  CLAIMS_DIR="$T/review-claims"; CLAIM_CAP=2
+  printf '%s\n' 'o/r#1 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+    'o/r#2 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' \
+    'o/r#3 cccccccccccccccccccccccccccccccccccccccc' > "$T/queue"
+  mkdir -p "$CLAIMS_DIR"
+  claim_review_queue "$T/queue" "$T/q1"
+  claim_review_queue "$T/queue" "$T/q2" "$PPID"
+  if [ "$(wc -l < "$T/q1" | tr -d ' ')" = 2 ] && \
+     [ "$(wc -l < "$T/q2" | tr -d ' ')" = 1 ] && \
+     [ -z "$(grep -Fxf "$T/q1" "$T/q2")" ]; then
+    echo "PASS queue-claims-exclusive"
+  else
+    echo "FAIL queue-claims-exclusive"; FAILS=$((FAILS+1))
+  fi
   IDLE_S=3; CEILING_S=60
   run_watched "$T/o1" bash -c 'echo hello; sleep 120'; finish_pass fake fake
   check stall-detected "$ENDED" stalled; check stall-fast "$([ $DUR -lt 15 ] && echo y)" y
@@ -204,12 +248,38 @@ fi
 # checks are green and which have no verdict at their head; last pass's misses first.
 MUST_FILE="$STATE/$ROLE.must-review"; MISSED_FILE="$STATE/$ROLE.missed"
 MUST_ARGS=(); [ "$ROLE" = repair ] && MUST_ARGS=(--repair); [ "$ROLE" = adversary ] && MUST_ARGS=(--adversary)
+REPAIR_LINE=""
 if { [ "$ROLE" = reviewer ] || [ "$ROLE" = adversary ] || [ "$ROLE" = repair ]; } && [ $DRY = 0 ]; then
   # Take the lock before the (API-heavy) query so a short schedule never stacks passes.
   take_lock
   MUST_OK=1
   python3 "$STATE/must-review.py" ${MUST_ARGS[@]+"${MUST_ARGS[@]}"} --missed "$MISSED_FILE" > "$MUST_FILE.tmp" 2>>"$LOG" || MUST_OK=0
   mv "$MUST_FILE.tmp" "$MUST_FILE"
+  if [ "$ROLE" = repair ] && [ "$MUST_OK" = 1 ]; then
+    # Filter before the model claims work, and publish held entries for the operator.
+    python3 "$STATE/repair_budget.py" filter \
+      --log "$STATE/repair-attempts.log" \
+      --held-file "$STATE/repair.held" \
+      < "$MUST_FILE" > "$MUST_FILE.filtered" 2>>"$LOG" || MUST_OK=0
+    if [ "$MUST_OK" = 1 ]; then
+      mv "$MUST_FILE.filtered" "$MUST_FILE"
+      [ ! -s "$MUST_FILE" ] || REPAIR_LINE="$(head -n 1 "$MUST_FILE")"
+    else
+      rm -f "$MUST_FILE.filtered"
+    fi
+  fi
+  if [ "$ROLE" = repair ] && [ "$MUST_OK" = 0 ]; then
+    ENDED=refused; logline "$PROVIDER" "$MODEL" 5 0 "refused: repair queue filter failed"; exit 5
+  fi
+  if [ -s "$MUST_FILE" ] && { [ "$ROLE" = reviewer ] || [ "$ROLE" = adversary ]; }; then
+    if ! claim_review_queue "$MUST_FILE" "$MUST_FILE.claimed"; then
+      echo "refusing: could not establish exclusive review claims" >> "$LOG"
+      MUST_OK=0
+      : > "$MUST_FILE"
+    else
+      mv "$MUST_FILE.claimed" "$MUST_FILE"
+    fi
+  fi
   if [ -s "$MUST_FILE" ] && [ "$ROLE" = reviewer ]; then
     PROMPT="$PROMPT
 
@@ -310,6 +380,11 @@ export CODEX_COMPANION_SESSION_ID="${CODEX_COMPANION_SESSION_ID:-fleet-pass-$STA
 export SHIPYARD_STAMP_SESSION_ID="$CODEX_COMPANION_SESSION_ID"
 cd "$HOME" || exit 5
 OUT="$LOGDIR/$ROLE.last-output.txt"
+if [ "$ROLE" = repair ] && [ -n "$REPAIR_LINE" ]; then
+  if ! python3 "$STATE/repair_budget.py" record --log "$STATE/repair-attempts.log" --line "$REPAIR_LINE"; then
+    ENDED=refused; logline "$PROVIDER" "$MODEL" 5 0 "refused: could not record repair attempt"; exit 5
+  fi
+fi
 run_watched "$OUT" "${CMD[@]}"
 # A Claude account that is cooked, throttled or unauthorised fails fast; run the
 # same pass once on Codex instead of losing the cycle.

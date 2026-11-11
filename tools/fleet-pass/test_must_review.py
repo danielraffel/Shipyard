@@ -354,6 +354,68 @@ class ReviewCandidates(unittest.TestCase):
         api.assert_called_once()
 
 
+class GateCarried(unittest.TestCase):
+    """A head the review gate carried a counted approval to needs no model pass."""
+    REPO = "o/r"
+
+    def run_review(self, *nodes):
+        with serve(list(nodes)), mock.patch.object(mr, "overrides", return_value={}):
+            return mr.review_candidates(self.REPO, {"macos"}, NOW)
+
+    def gate(self, state, desc, at="2026-11-07T09:00:00Z"):
+        return [{"__typename": "StatusContext", "context": "review-verdict", "state": state.upper(),
+                 "createdAt": at, "description": desc}]
+
+    CARRY = f"approved: the approval of {OLD[:12]} carries to {SHA[:12]}: every commit since is a merge"
+    APPROVED_OLD = [comment(body(sha=OLD), "2026-11-07T08:00:00Z")]
+
+    def test_carried_head_is_not_queued(self):
+        out = self.run_review(node(1, states={"macos": "success"}, comments=self.APPROVED_OLD,
+                                   statuses=self.gate("success", self.CARRY)))
+        self.assertEqual(out, [])
+
+    def test_rebase_carry_is_not_queued(self):
+        desc = f"approved: the approval of {OLD[:12]} carries across the rebase to {SHA[:12]}: same patch-id"
+        out = self.run_review(node(1, states={"macos": "success"}, comments=self.APPROVED_OLD,
+                                   statuses=self.gate("success", desc)))
+        self.assertEqual(out, [])
+
+    def test_every_non_carry_success_keeps_head_queued(self):
+        cases = [
+            # The live fleet-handbook#54 description: allowed, but not a carry.
+            ("success", "approved: danielraffel/fleet-handbook does not require a review before arming", self.APPROVED_OLD),
+            # A carry to some other head.
+            ("success", f"approved: the approval of {OLD[:12]} carries to {'c' * 12}: x", self.APPROVED_OLD),
+            # A carry from an approval the queue does not count (no counted APPROVE of OLD).
+            ("success", self.CARRY, [comment(body(sha=OLD, signer="stranger"))]),
+            ("pending", "awaiting review", self.APPROVED_OLD),
+            ("failure", self.CARRY, self.APPROVED_OLD),
+        ]
+        for state, desc, cs in cases:
+            out = self.run_review(node(1, states={"macos": "success"}, comments=cs, statuses=self.gate(state, desc)))
+            self.assertEqual([o[0] for o in out], ["o/r#1"], desc)
+        out = self.run_review(node(1, states={"macos": "success"}, comments=self.APPROVED_OLD))
+        self.assertEqual([o[0] for o in out], ["o/r#1"])
+
+    def test_stale_carry_status_keeps_head_queued(self):
+        out = self.run_review(node(1, states={"macos": "success"}, comments=self.APPROVED_OLD,
+                                   statuses=self.gate("success", self.CARRY, at="2026-11-05T09:00:00Z")))
+        self.assertEqual([o[0] for o in out], ["o/r#1"])
+
+    def test_check_run_success_alone_is_not_a_carry(self):
+        out = self.run_review(node(1, states={"macos": "success", "review-verdict": "success"},
+                                   comments=self.APPROVED_OLD))
+        self.assertEqual([o[0] for o in out], ["o/r#1"])
+
+    def test_override_still_lists_a_carried_head(self):
+        since = datetime.datetime(2026, 11, 7, 9, 0, tzinfo=datetime.timezone.utc)
+        with serve([node(1, states={"macos": "success"}, comments=self.APPROVED_OLD,
+                         statuses=self.gate("success", self.CARRY))]), \
+             mock.patch.object(mr, "overrides", return_value={"o/r#1": (SHA, since)}):
+            out = mr.review_candidates(self.REPO, {"macos"}, NOW)
+        self.assertEqual([(o[0], o[3]) for o in out], [("o/r#1", "AUTHOR-SELF-APPROVED")])
+
+
 class ApiBudget(unittest.TestCase):
     """A run costs 2 REST reads (required) plus one GraphQL page per 30 open PRs, per repo."""
 

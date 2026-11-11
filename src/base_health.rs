@@ -189,6 +189,12 @@ pub struct BasePoisonPolicy {
     pub hold: PoisonHold,
     /// Whether a fast-tracked fix is enqueued with `jump: true`.
     pub auto_jump: AutoJump,
+    /// `merge_group_pause`: whether queued entries are removed while the
+    /// base is poisoned. It acts only when the hold is also `on`; it
+    /// defaults to `dry-run`, which reports `would_pause` and removes
+    /// nothing.
+    #[serde(default)]
+    pub pause: PoisonHold,
     /// A key that did not parse. Its setting falls back to the safe value
     /// (the hold to dry-run, the jump to off).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -207,8 +213,19 @@ impl BasePoisonPolicy {
                 PoisonHold::Off
             },
             auto_jump: AutoJump::Off,
+            pause: if merge_queue {
+                PoisonHold::DryRun
+            } else {
+                PoisonHold::Off
+            },
             read_error: None,
         }
+    }
+
+    /// Whether the pause removes entries: both the hold and the pause `on`.
+    #[must_use]
+    pub fn pauses(&self) -> bool {
+        self.hold == PoisonHold::On && self.pause == PoisonHold::On
     }
 
     /// The policy a parsed base config sets.
@@ -225,6 +242,13 @@ impl BasePoisonPolicy {
                 Ok(Some(hold)) => policy.hold = hold,
                 Ok(None) => {}
                 Err(error) => errors.push(error),
+            }
+        }
+        if merge_queue {
+            match PoisonHold::parse(text("merge_group_pause")) {
+                Ok(Some(pause)) => policy.pause = pause,
+                Ok(None) => {}
+                Err(error) => errors.push(error.replace("merge_group_hold", "merge_group_pause")),
             }
         }
         match AutoJump::parse(text("auto_jump")) {
