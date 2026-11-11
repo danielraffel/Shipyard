@@ -408,6 +408,42 @@ fn enqueue_pull_request_with_recovery(
     ledger: &mut StewardLedger,
     recover_hosted_setup_eviction_priority: bool,
 ) -> (Option<String>, Option<String>) {
+    // While the merge groups show the base poisoned, only a named fix is
+    // admitted; see `base_poison`. The fix still passes every gate below.
+    let admission = super::base_poison::admission(context.base_poison, pr.fact.number);
+    if matches!(admission, super::base_poison::Admission::Hold { .. }) {
+        return (admission.token(), None);
+    }
+    let fast_track_jump = matches!(
+        admission,
+        super::base_poison::Admission::FastTrack { jump: true }
+    );
+    let (mutation, error) = enqueue_admitted_pull_request(
+        context,
+        pr,
+        policy,
+        ledger,
+        recover_hosted_setup_eviction_priority,
+        fast_track_jump,
+    );
+    match admission.token() {
+        Some(token) => (
+            Some(mutation.map_or(token.clone(), |mutation| format!("{token},{mutation}"))),
+            error,
+        ),
+        None => (mutation, error),
+    }
+}
+
+#[allow(clippy::too_many_lines)] // The B1 approval re-read and the guarded enqueue stay together.
+fn enqueue_admitted_pull_request(
+    context: &MutationApplyContext<'_>,
+    pr: &ObservedPr,
+    policy: &StewardPolicy,
+    ledger: &mut StewardLedger,
+    recover_hosted_setup_eviction_priority: bool,
+    fast_track_jump: bool,
+) -> (Option<String>, Option<String>) {
     // B1: when the protected base requires head approval, re-read the
     // reviewer policy and the live review/comment records immediately before
     // the enqueue mutation. A stale local ship state or LGTM text is never
@@ -502,6 +538,7 @@ fn enqueue_pull_request_with_recovery(
                     guard,
                     recovery.as_ref(),
                     Some((approval_comment_id, approval_app_id, verdict_audit_events)),
+                    fast_track_jump,
                 );
             };
             let audit_error = guard.finish("rejected_stacked_pull_request").err();
@@ -524,7 +561,7 @@ fn enqueue_pull_request_with_recovery(
     }
 }
 
-#[allow(clippy::too_many_lines)] // One guarded transaction keeps revalidation and its receipt adjacent.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)] // One guarded transaction keeps revalidation and its receipt adjacent.
 fn enqueue_unstacked_pull_request(
     context: &MutationApplyContext<'_>,
     pr: &ObservedPr,
@@ -533,6 +570,7 @@ fn enqueue_unstacked_pull_request(
     guard: crate::merge_queue_control::MergeQueueMutationGuard,
     recovery: Option<&QueueRecoveryEvidence>,
     approval_evidence: Option<(Option<u64>, Option<u64>, Vec<String>)>,
+    fast_track_jump: bool,
 ) -> (Option<String>, Option<String>) {
     let mut guard = guard;
     let (approval_comment_id, approval_app_id, verdict_audit_events) =
@@ -813,21 +851,38 @@ fn enqueue_unstacked_pull_request(
             })),
         );
     }
-    let query = if recovery.is_some() {
-        "mutation($id:ID!,$head:GitObjectID!){enqueuePullRequest(input:{pullRequestId:$id,expectedHeadOid:$head,jump:true}){mergeQueueEntry{position}}}"
-    } else {
-        "mutation($id:ID!,$head:GitObjectID!){enqueuePullRequest(input:{pullRequestId:$id,expectedHeadOid:$head}){mergeQueueEntry{position}}}"
+    let jump_query = "mutation($id:ID!,$head:GitObjectID!){enqueuePullRequest(input:{pullRequestId:$id,expectedHeadOid:$head,jump:true}){mergeQueueEntry{position}}}";
+    let plain_query = "mutation($id:ID!,$head:GitObjectID!){enqueuePullRequest(input:{pullRequestId:$id,expectedHeadOid:$head}){mergeQueueEntry{position}}}";
+    let enqueue = |query: &str| {
+        context.actions.run_gh_internal_queue_mutation(&[
+            "api".to_owned(),
+            "graphql".to_owned(),
+            "-f".to_owned(),
+            format!("query={query}"),
+            "-F".to_owned(),
+            format!("id={}", pr.node_id),
+            "-F".to_owned(),
+            format!("head={}", pr.fact.head_sha),
+        ])
     };
-    let result = context.actions.run_gh_internal_queue_mutation(&[
-        "api".to_owned(),
-        "graphql".to_owned(),
-        "-f".to_owned(),
-        format!("query={query}"),
-        "-F".to_owned(),
-        format!("id={}", pr.node_id),
-        "-F".to_owned(),
-        format!("head={}", pr.fact.head_sha),
-    ]);
+    let mut result = enqueue(if recovery.is_some() || fast_track_jump {
+        jump_query
+    } else {
+        plain_query
+    });
+    // A fast-tracked fix whose jump GitHub refuses (the jump needs a bypass
+    // the token may lack) is still enqueued, at the back: losing the jump
+    // must never cost the fix its admission. Only a refusal that names the
+    // jump is retried; any other answer is handled as before.
+    if recovery.is_none() && fast_track_jump && super::base_poison::jump_was_refused(&result) {
+        record_audit(
+            ledger,
+            &context.observation.repo,
+            &format!("pr:{}:{}", pr.fact.number, pr.fact.head_sha),
+            "base_poison_jump_refused_enqueued_plain",
+        );
+        result = enqueue(plain_query);
+    }
     match result {
         Ok(raw)
             if serde_json::from_str::<Value>(&raw).is_ok_and(|value| {

@@ -23,6 +23,7 @@ use serde_json::Value;
 
 use crate::validation_signals::{Annotation, GhReader, parse_annotations};
 
+pub mod merge_group;
 pub mod tip;
 
 /// Annotation title the detector publishes.
@@ -35,6 +36,17 @@ pub const DEFAULT_WORKFLOW: &str = "main-health-detector.yml";
 pub const WORKFLOW_CONFIG_KEY: &str = "base_health.workflow";
 /// Config key selecting [`AutoJump`].
 pub const AUTO_JUMP_CONFIG_KEY: &str = "base_health.auto_jump";
+/// Config key selecting [`PoisonHold`].
+pub const HOLD_CONFIG_KEY: &str = "base_health.merge_group_hold";
+/// The base config table both keys live in.
+pub const CONFIG_TABLE: &str = "base_health";
+/// Machine-global key: argv run, with a reason appended, to start a review
+/// pass for a fast-tracked fix pull request (for example
+/// `["fleet-pass-kick", "reviewer"]`).
+pub const FIX_REVIEW_KICK_KEY: &str = "base_health.fix_review_kick";
+/// Machine-global key: a reviewer priority file whose lines are
+/// `OWNER/REPO#<n>`; a fast-tracked fix is written as its first line.
+pub const FIX_REVIEW_PRIORITY_FILE_KEY: &str = "base_health.fix_review_priority_file";
 /// Status the detector reports for a base whose own suite fails.
 pub const STATUS_POISONED: &str = "poisoned";
 /// Oldest signal that still produces jump advice.
@@ -137,6 +149,92 @@ impl AutoJump {
                 "{AUTO_JUMP_CONFIG_KEY} = {other:?} is not one of off, dry-run, on"
             )),
         }
+    }
+}
+
+/// Whether the steward holds admission while merge groups show the base
+/// poisoned ([`merge_group`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PoisonHold {
+    /// Merge groups are not read.
+    #[default]
+    Off,
+    /// Merge groups are read and every admission the hold would stop is
+    /// reported (`would_hold_base_poisoned:<context>`); nothing is held.
+    DryRun,
+    /// Only a pull request that fixes the poisoned context is admitted.
+    On,
+}
+
+impl PoisonHold {
+    /// Parse the config value; anything unrecognised is an error.
+    pub fn parse(value: Option<&str>) -> Result<Option<Self>, String> {
+        match value.map(str::trim) {
+            None => Ok(None),
+            Some("off" | "") => Ok(Some(Self::Off)),
+            Some("dry-run" | "dry_run") => Ok(Some(Self::DryRun)),
+            Some("on") => Ok(Some(Self::On)),
+            Some(other) => Err(format!(
+                "{HOLD_CONFIG_KEY} = {other:?} is not one of off, dry-run, on"
+            )),
+        }
+    }
+}
+
+/// What a base's `[base_health]` table asks of the steward.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct BasePoisonPolicy {
+    /// Admission hold while merge groups show poison.
+    pub hold: PoisonHold,
+    /// Whether a fast-tracked fix is enqueued with `jump: true`.
+    pub auto_jump: AutoJump,
+    /// A key that did not parse. Its setting falls back to the safe value
+    /// (the hold to dry-run, the jump to off).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_error: Option<String>,
+}
+
+impl BasePoisonPolicy {
+    /// The policy of a base with no `[base_health]` table: merge groups are
+    /// read and reported (dry-run) exactly when the base has a merge queue.
+    #[must_use]
+    pub fn for_base(merge_queue: bool) -> Self {
+        Self {
+            hold: if merge_queue {
+                PoisonHold::DryRun
+            } else {
+                PoisonHold::Off
+            },
+            auto_jump: AutoJump::Off,
+            read_error: None,
+        }
+    }
+
+    /// The policy a parsed base config sets.
+    #[must_use]
+    pub fn from_table(table: &toml::Table, merge_queue: bool) -> Self {
+        let mut policy = Self::for_base(merge_queue);
+        let Some(section) = table.get(CONFIG_TABLE).and_then(toml::Value::as_table) else {
+            return policy;
+        };
+        let text = |key: &str| section.get(key).and_then(toml::Value::as_str);
+        let mut errors = Vec::new();
+        if merge_queue {
+            match PoisonHold::parse(text("merge_group_hold")) {
+                Ok(Some(hold)) => policy.hold = hold,
+                Ok(None) => {}
+                Err(error) => errors.push(error),
+            }
+        }
+        match AutoJump::parse(text("auto_jump")) {
+            Ok(jump) => policy.auto_jump = jump,
+            Err(error) => errors.push(error),
+        }
+        if !errors.is_empty() {
+            policy.read_error = Some(errors.join("; "));
+        }
+        policy
     }
 }
 
@@ -294,6 +392,10 @@ pub const DEQUEUE_MUTATION: &str =
     "mutation($id:ID!){dequeuePullRequest(input:{id:$id}){mergeQueueEntry{id}}}";
 /// GraphQL that enqueues an exact head at the front of the merge queue.
 pub const JUMP_MUTATION: &str = "mutation($id:ID!,$head:GitObjectID!){enqueuePullRequest(input:{pullRequestId:$id,expectedHeadOid:$head,jump:true}){mergeQueueEntry{position}}}";
+
+/// GraphQL that enqueues an exact head at the back: the restore after a
+/// refused jump.
+pub const PLAIN_ENQUEUE_MUTATION: &str = "mutation($id:ID!,$head:GitObjectID!){enqueuePullRequest(input:{pullRequestId:$id,expectedHeadOid:$head}){mergeQueueEntry{position}}}";
 
 /// The by-hand jump. The dequeue fails harmlessly when the pull request is not
 /// queued; the enqueue pins the head it read so a later push is not jumped.

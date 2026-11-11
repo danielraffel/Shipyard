@@ -77,6 +77,9 @@ pub struct EjectionGuards {
     /// failing steps name only these tests (or whose check is one), and whose
     /// check passed on the head, still earns the one same-head retry.
     pub known_flaky_tests: Vec<String>,
+    /// The base-poison admission hold and fix fast-track, from the base
+    /// config's `[base_health]` table ([`crate::base_health::BasePoisonPolicy`]).
+    pub base_poison: crate::base_health::BasePoisonPolicy,
     /// Why the base config could not be read, when it could not. The guards
     /// then keep their merge-queue defaults (on) with no generated paths.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -94,6 +97,7 @@ impl EjectionGuards {
             red_outranks_pending: merge_queue,
             infra_only_retry: merge_queue,
             known_flaky_tests: Vec::new(),
+            base_poison: crate::base_health::BasePoisonPolicy::for_base(merge_queue),
             read_error: None,
         }
     }
@@ -103,6 +107,7 @@ impl EjectionGuards {
     #[must_use]
     pub fn from_table(table: &toml::Table, merge_queue: bool) -> Self {
         let mut guards = Self::for_base(merge_queue);
+        guards.base_poison = crate::base_health::BasePoisonPolicy::from_table(table, merge_queue);
         let Some(section) = table.get(CONFIG_TABLE).and_then(toml::Value::as_table) else {
             return guards;
         };

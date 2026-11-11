@@ -4343,7 +4343,32 @@ the same thing alone. Advice needs a fresh signal (under 2 h) and a named fix;
 `suspected` is never advice. `base_health.auto_jump` (`off` by default) turns
 `shipyard base-health --act` into a recorder (`dry-run`) or an actor (`on`);
 switching it to `on` is an owner decision, taken only after dry-run records
-show it picks the right pull request.
+show it picks the right pull request. An `on` jump refuses a head without a
+trusted reviewer's approval naming it exactly (`HeadGate::Approved`; "not
+required" is not enough), and when the jump enqueue fails after the dequeue it
+puts the same head back at the end of the queue rather than leave the fix
+unqueued.
+
+**A base can be poisoned only in its merge groups.** A context that runs only
+on `merge_group`, or one that starts failing on a date, never shows on main, so
+the main detector says "no signal" while every batch ejects. The steward reads
+the newest merge groups each pass (`[base_health] merge_group_hold`, default
+`dry-run` on a merge-queue base): a required context that failed in two or
+more consecutive groups carrying different pull requests, none common to all
+of them, is poisoned, and `runner steward --json` reports it under
+`repos[].base_poison` with the context and its first error line. With
+`merge_group_hold = "on"` the steward then enqueues only a named fix (label
+`shipyard:unblock`, a title or description naming the context next to a fix
+word, or the detector's `candidate_fix_pr`) and reports every other approved
+green head `held_base_poisoned:<context>`; it puts the fix's review first
+(machine-global `base_health.fix_review_priority_file` and
+`base_health.fix_review_kick`, once per head) and moves its waiting CI to the
+front, excusing only its red approval context. The approval is still required
+to enqueue it, with `jump: true` when `auto_jump = "on"` (a refused jump falls
+back to a plain enqueue). The hold lifts as soon as a merge group passes the
+context; an unreadable merge-group history never holds anything. `shipyard
+queue prioritize --pr <fix>` applies the same excuse, so a named fix is no
+longer refused as doomed while only its review-verdict is red.
 
 **When reporting a PR's state, quote the VERDICT line.** `shipyard landing
 --pr <n>` opens with one line, e.g. `VERDICT #8933 head fc399ea6: RED — macos

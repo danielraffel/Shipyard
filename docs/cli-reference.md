@@ -66,6 +66,9 @@ shipyard base-health                         # status; for `poisoned` + a named 
 shipyard base-health --workflow FILE         # detector workflow (default base_health.workflow, else main-health-detector.yml)
 shipyard base-health --act                   # apply base_health.auto_jump: off (default; reads nothing) | dry-run (records "would jump PR #n"
                                              #   once per episode in <state>/base-health/jump-decisions.jsonl) | on (dequeue + enqueue jump:true)
+                                             #   on: needs a trusted approval of the exact head; a failed jump re-enqueues the head at the back
+shipyard base-health --base BRANCH           # also judge BRANCH's newest merge groups (default main): a required context failing in
+                                             #   2+ consecutive groups with different PRs is poisoned; advice names a single labelled/titled fix
 
 # Is the merge queue fed? The merge train (off unless the base config sets `[train] enabled = true`)
 shipyard train status [--repo R] [--base main]  # switch + each open PR's stage and why (approval is head_approval's, carry included)

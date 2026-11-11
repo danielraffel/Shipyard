@@ -80,6 +80,7 @@ fn mutation_apply_context<'a>(
         carried_commits: std::cell::RefCell::default(),
         changed_files: std::cell::RefCell::default(),
         ejection_guards: crate::merge_steward::EjectionGuards::default(),
+        base_poison: None,
     }
 }
 
@@ -220,6 +221,8 @@ mod admission;
 mod api_budget;
 #[cfg(unix)]
 mod arm_guard;
+#[cfg(unix)]
+mod base_poison;
 mod blocked_on;
 #[cfg(unix)]
 mod capacity;

@@ -1,4 +1,5 @@
 //! Adapter tests against a fake `gh` that serves recorded GitHub API shapes.
+use crate::paths::RuntimePaths;
 
 use super::*;
 use serde_json::json;
@@ -271,7 +272,8 @@ fn runtime<'a>(
     QueueDrainRuntime {
         cwd: temp.path(),
         mode: RuntimeMode::Isolated,
-        runtime_paths: paths,
+        state_dir: &paths.state_dir,
+        global_dir: &paths.global_dir,
         actions,
     }
 }
