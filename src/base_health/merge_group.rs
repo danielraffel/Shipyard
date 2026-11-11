@@ -470,19 +470,21 @@ pub fn read(
         let group = &mut groups[index];
         // A group's own merge commits name every pull request it carried;
         // without them the branch's one named pull request stands alone.
-        if let Ok(compare) = read_json(
+        let compare = match read_json(
             gh,
             &format!("repos/{repo}/compare/{base}...{}", group.head_sha),
         ) {
-            let messages = compare
-                .get("commits")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(|commit| commit.pointer("/commit/message").and_then(Value::as_str))
-                .collect::<Vec<_>>();
-            group.prs.extend(merged_prs(&messages));
-        }
+            Ok(compare) => compare,
+            Err(detail) => return MergeGroupHealth::Unknown { detail },
+        };
+        let messages = compare
+            .get("commits")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|commit| commit.pointer("/commit/message").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        group.prs.extend(merged_prs(&messages));
     }
     let mut health = detect(&groups, required, now);
     if let MergeGroupHealth::Poisoned { contexts } = &mut health {

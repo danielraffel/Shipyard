@@ -194,7 +194,7 @@ fn merge_group_runs(heads: &[(&str, u64)]) -> Value {
 }
 
 #[test]
-fn read_names_the_context_its_first_error_and_every_carried_pr() {
+fn read_returns_unknown_when_a_failing_group_membership_compare_is_unreadable() {
     let canned = Canned {
         responses: BTreeMap::from([
             (
@@ -232,6 +232,57 @@ fn read_names_the_context_its_first_error_and_every_carried_pr() {
         calls: RefCell::default(),
     };
     let health = read(&|args| canned.call(args), "o/r", "main", &required(), now());
+    assert!(
+        matches!(health, MergeGroupHealth::Unknown { .. }),
+        "{health:?}"
+    );
+}
+
+#[test]
+fn read_names_the_context_its_first_error_and_every_carried_pr() {
+    let canned = Canned {
+        responses: BTreeMap::from([
+            (
+                "repos/o/r/actions/runs".to_owned(),
+                merge_group_runs(&[("bbb", 12016), ("bbb", 12016), ("aaa", 12001)]),
+            ),
+            (
+                "repos/o/r/commits/bbb/check-runs".to_owned(),
+                check_runs(&[
+                    (CONTEXT, "failure", 20),
+                    (CONTEXT, "success", 10),
+                    (GATE, "success", 21),
+                ]),
+            ),
+            (
+                "repos/o/r/commits/aaa/check-runs".to_owned(),
+                check_runs(&[(CONTEXT, "failure", 11), (GATE, "success", 12)]),
+            ),
+            (
+                "repos/o/r/compare/main...bbb".to_owned(),
+                json!({"commits": [
+                    {"commit": {"message": "Merge pull request #12015 from a/b"}},
+                    {"commit": {"message": "Merge pull request #12016 from c/d"}},
+                ]}),
+            ),
+            (
+                "repos/o/r/compare/main...aaa".to_owned(),
+                json!({"commits": [
+                    {"commit": {"message": "Merge pull request #12001 from e/f"}},
+                ]}),
+            ),
+            (
+                "repos/o/r/check-runs/20/annotations".to_owned(),
+                json!([
+                    {"annotation_level": "warning", "message": "not this"},
+                    {"annotation_level": "failure", "message": "Process completed with exit code 1."},
+                    {"annotation_level": "failure", "message": "\nsource-contract recheck overdue: figma due 2026-11-10\nmore"},
+                ]),
+            ),
+        ]),
+        calls: RefCell::default(),
+    };
+    let health = read(&|args| canned.call(args), "o/r", "main", &required(), now());
     let poison = health.poisoned().first().expect("poisoned").clone();
     assert_eq!(poison.context, CONTEXT);
     assert_eq!(
@@ -239,7 +290,6 @@ fn read_names_the_context_its_first_error_and_every_carried_pr() {
         Some("source-contract recheck overdue: figma due 2026-11-10")
     );
     assert_eq!(poison.groups[0].prs, vec![12015, 12016]);
-    // The second group's compare was unreadable: its branch PR stands alone.
     assert_eq!(poison.groups[1].prs, vec![12001]);
 }
 
