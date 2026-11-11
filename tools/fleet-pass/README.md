@@ -15,6 +15,17 @@ rollup, newest 100 comments, merge state) with one paginated GraphQL query per
 30 PRs, plus two REST reads for the required checks. Per-PR REST reads would
 spend the App's REST budget (a shared 15000/hour) several times per PR per run.
 - `test_must_review.py`: offline unit tests for `must-review.py` (no network).
+- `review_queue.py`: deterministic filters that keep model passes off heads that
+  need no new review. `gate_carried` drops a head only when its newest
+  `review-verdict` status says the gate carried an earlier approval to that exact
+  head (`approved: the approval of <12 hex> carries to|across the rebase to
+  <head>`), that approval is a counted APPROVE in the PR's comments, and the status
+  is under 24 h old. A plain `success` (for example "does not require a review")
+  never drops a head. `claim` gives each reviewer slot only the entries it holds an
+  exclusive claim on (`review_queue.py claim --dir <claims> --pid $$ --cap N`;
+  claims are published by rename with their pid inside), so two slots never review
+  one head; a slot holds at most N heads for its whole pass. Install it beside
+  `must-review.py`, before it, since `must-review.py` imports it. `test_review_queue.py` covers it offline.
 
 ## Install (m3)
 
