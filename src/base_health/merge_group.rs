@@ -29,6 +29,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::merge_steward::RequiredCheck;
 use crate::validation_signals::GhReader;
 
 /// Merge groups examined, newest first.
@@ -333,7 +334,7 @@ pub fn merged_prs(messages: &[&str]) -> BTreeSet<u64> {
 }
 
 /// The newest check per required context on one head.
-fn checks_for_head(value: &Value, required: &[String]) -> Vec<GroupCheck> {
+fn checks_for_head(value: &Value, required: &[RequiredCheck]) -> Vec<GroupCheck> {
     let mut out: Vec<GroupCheck> = Vec::new();
     for run in value
         .get("check_runs")
@@ -344,7 +345,13 @@ fn checks_for_head(value: &Value, required: &[String]) -> Vec<GroupCheck> {
         let Some(name) = run.get("name").and_then(Value::as_str) else {
             continue;
         };
-        if !required.iter().any(|context| context == name) {
+        let Some(rule) = required.iter().find(|rule| rule.context == name) else {
+            continue;
+        };
+        if rule
+            .app_id
+            .is_some_and(|app_id| run.pointer("/app/id").and_then(Value::as_u64) != Some(app_id))
+        {
             continue;
         }
         let id = run.get("id").and_then(Value::as_u64);
@@ -413,7 +420,7 @@ pub fn read(
     gh: &GhReader<'_>,
     repo: &str,
     base: &str,
-    required: &[String],
+    required: &[RequiredCheck],
     now: DateTime<Utc>,
 ) -> MergeGroupHealth {
     if required.is_empty() {
@@ -421,6 +428,10 @@ pub fn read(
             detail: "no required contexts to judge".to_owned(),
         };
     }
+    let contexts = required
+        .iter()
+        .map(|rule| rule.context.clone())
+        .collect::<Vec<_>>();
     let runs = match read_json(
         gh,
         &format!("repos/{repo}/actions/runs?event=merge_group&per_page={RUN_LIST_PAGE}"),
@@ -462,11 +473,11 @@ pub fn read(
             prs: top.into_iter().collect(),
             checks,
         });
-        if !undecided(&groups, required) {
+        if !undecided(&groups, &contexts) {
             break;
         }
     }
-    for index in groups_needing_members(&groups, required) {
+    for index in groups_needing_members(&groups, &contexts) {
         let group = &mut groups[index];
         // A group's own merge commits name every pull request it carried;
         // without them the branch's one named pull request stands alone.
@@ -477,16 +488,21 @@ pub fn read(
             Ok(compare) => compare,
             Err(detail) => return MergeGroupHealth::Unknown { detail },
         };
-        let messages = compare
-            .get("commits")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
+        let Some(commits) = compare.get("commits").and_then(Value::as_array) else {
+            return MergeGroupHealth::Unknown {
+                detail: format!(
+                    "merge-group membership compare for {} had no commits array",
+                    group.head_sha
+                ),
+            };
+        };
+        let messages = commits
+            .iter()
             .filter_map(|commit| commit.pointer("/commit/message").and_then(Value::as_str))
             .collect::<Vec<_>>();
         group.prs.extend(merged_prs(&messages));
     }
-    let mut health = detect(&groups, required, now);
+    let mut health = detect(&groups, &contexts, now);
     if let MergeGroupHealth::Poisoned { contexts } = &mut health {
         for poison in contexts {
             if let Some(line) = poison

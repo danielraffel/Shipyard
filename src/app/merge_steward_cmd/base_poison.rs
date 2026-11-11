@@ -140,18 +140,11 @@ pub(super) fn observe(
         return None;
     }
     let run_gh = |argv: &[String]| actions.run_gh(argv).map_err(|error| error.to_string());
-    let mut contexts = observation
-        .required_checks
-        .iter()
-        .map(|check| check.context.clone())
-        .collect::<Vec<_>>();
-    contexts.sort();
-    contexts.dedup();
     let health = merge_group::read(
         &run_gh,
         &observation.repo,
         &observation.base,
-        &contexts,
+        &observation.required_checks,
         now,
     );
     let poisoned = health.poisoned_contexts();

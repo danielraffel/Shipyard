@@ -43,6 +43,19 @@ fn required() -> Vec<String> {
     vec![CONTEXT.to_owned(), GATE.to_owned()]
 }
 
+fn required_rules() -> Vec<RequiredCheck> {
+    vec![
+        RequiredCheck {
+            context: CONTEXT.to_owned(),
+            app_id: None,
+        },
+        RequiredCheck {
+            context: GATE.to_owned(),
+            app_id: None,
+        },
+    ]
+}
+
 #[test]
 fn two_consecutive_groups_with_different_prs_failing_one_context_poison_it() {
     let groups = [
@@ -186,6 +199,18 @@ fn check_runs(rows: &[(&str, &str, u64)]) -> Value {
     })).collect::<Vec<_>>()})
 }
 
+fn check_runs_with_app(rows: &[(&str, &str, u64)], app_id: u64) -> Value {
+    json!({"check_runs": rows.iter().map(|(name, conclusion, id)| json!({
+        "id": id,
+        "name": name,
+        "status": "completed",
+        "conclusion": conclusion,
+        "completed_at": "2026-11-11T01:30:00Z",
+        "output": {"title": format!("{name} {conclusion}")},
+        "app": {"id": app_id},
+    })).collect::<Vec<_>>()})
+}
+
 fn merge_group_runs(heads: &[(&str, u64)]) -> Value {
     json!({"workflow_runs": heads.iter().map(|(sha, pr)| json!({
         "head_sha": sha,
@@ -231,9 +256,84 @@ fn read_returns_unknown_when_a_failing_group_membership_compare_is_unreadable() 
         ]),
         calls: RefCell::default(),
     };
-    let health = read(&|args| canned.call(args), "o/r", "main", &required(), now());
+    let health = read(
+        &|args| canned.call(args),
+        "o/r",
+        "main",
+        &required_rules(),
+        now(),
+    );
     assert!(
         matches!(health, MergeGroupHealth::Unknown { .. }),
+        "{health:?}"
+    );
+}
+
+#[test]
+fn read_returns_unknown_when_membership_compare_has_no_commits_array() {
+    let canned = Canned {
+        responses: BTreeMap::from([
+            (
+                "repos/o/r/actions/runs".to_owned(),
+                merge_group_runs(&[("bbb", 12016), ("aaa", 12001)]),
+            ),
+            (
+                "repos/o/r/commits/bbb/check-runs".to_owned(),
+                check_runs(&[(CONTEXT, "failure", 20), (GATE, "success", 21)]),
+            ),
+            (
+                "repos/o/r/commits/aaa/check-runs".to_owned(),
+                check_runs(&[(CONTEXT, "failure", 11), (GATE, "success", 12)]),
+            ),
+            ("repos/o/r/compare/main...bbb".to_owned(), json!({})),
+        ]),
+        calls: RefCell::default(),
+    };
+    let health = read(
+        &|args| canned.call(args),
+        "o/r",
+        "main",
+        &required_rules(),
+        now(),
+    );
+    assert!(
+        matches!(health, MergeGroupHealth::Unknown { .. }),
+        "{health:?}"
+    );
+}
+
+#[test]
+fn read_ignores_a_same_name_check_from_the_wrong_integration() {
+    let required = vec![
+        RequiredCheck {
+            context: CONTEXT.to_owned(),
+            app_id: Some(15_368),
+        },
+        RequiredCheck {
+            context: GATE.to_owned(),
+            app_id: None,
+        },
+    ];
+    let canned = Canned {
+        responses: BTreeMap::from([
+            (
+                "repos/o/r/actions/runs".to_owned(),
+                merge_group_runs(&[("bbb", 12016), ("aaa", 12001)]),
+            ),
+            (
+                "repos/o/r/commits/bbb/check-runs".to_owned(),
+                check_runs_with_app(&[(CONTEXT, "failure", 20), (GATE, "success", 21)], 99),
+            ),
+            (
+                "repos/o/r/commits/aaa/check-runs".to_owned(),
+                check_runs_with_app(&[(CONTEXT, "failure", 11), (GATE, "success", 12)], 99),
+            ),
+        ]),
+        calls: RefCell::default(),
+    };
+    let health = read(&|args| canned.call(args), "o/r", "main", &required, now());
+    assert!(
+        matches!(health, MergeGroupHealth::Clear { .. }),
         "{health:?}"
     );
 }
@@ -282,7 +382,13 @@ fn read_names_the_context_its_first_error_and_every_carried_pr() {
         ]),
         calls: RefCell::default(),
     };
-    let health = read(&|args| canned.call(args), "o/r", "main", &required(), now());
+    let health = read(
+        &|args| canned.call(args),
+        "o/r",
+        "main",
+        &required_rules(),
+        now(),
+    );
     let poison = health.poisoned().first().expect("poisoned").clone();
     assert_eq!(poison.context, CONTEXT);
     assert_eq!(
@@ -308,7 +414,13 @@ fn read_stops_after_the_newest_group_passes_everything() {
         ]),
         calls: RefCell::default(),
     };
-    let health = read(&|args| canned.call(args), "o/r", "main", &required(), now());
+    let health = read(
+        &|args| canned.call(args),
+        "o/r",
+        "main",
+        &required_rules(),
+        now(),
+    );
     assert!(
         matches!(health, MergeGroupHealth::Clear { .. }),
         "{health:?}"
@@ -323,7 +435,13 @@ fn an_unreadable_run_list_is_unknown_never_poisoned() {
         responses: BTreeMap::new(),
         calls: RefCell::default(),
     };
-    let health = read(&|args| canned.call(args), "o/r", "main", &required(), now());
+    let health = read(
+        &|args| canned.call(args),
+        "o/r",
+        "main",
+        &required_rules(),
+        now(),
+    );
     assert!(
         matches!(health, MergeGroupHealth::Unknown { .. }),
         "{health:?}"

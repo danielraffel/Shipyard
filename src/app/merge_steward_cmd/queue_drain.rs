@@ -1003,18 +1003,11 @@ fn merge_group_poison(
     observation: &Observation,
 ) -> crate::base_health::merge_group::MergeGroupHealth {
     let run_gh = |argv: &[String]| actions.run_gh(argv).map_err(|error| error.to_string());
-    let mut contexts = observation
-        .required
-        .iter()
-        .map(|rule| rule.context.clone())
-        .collect::<Vec<_>>();
-    contexts.sort();
-    contexts.dedup();
     crate::base_health::merge_group::read(
         &run_gh,
         &observation.repo,
         &observation.base,
-        &contexts,
+        &observation.required,
         Utc::now(),
     )
 }

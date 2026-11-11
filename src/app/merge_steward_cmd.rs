@@ -1975,20 +1975,14 @@ fn acquire_ledger_lock(path: &Path) -> Result<crate::file_lock::LockedFile, CliF
 
 mod base_poison;
 
-/// The required contexts of `base`, for a caller outside the steward that
+/// The required checks of `base`, for a caller outside the steward that
 /// judges merge groups ([`crate::base_health::merge_group`]).
 pub(super) fn required_contexts(
     actions: &GitHubActions,
     repo: &str,
     base: &str,
-) -> Result<Vec<String>, String> {
-    let mut contexts = observation::required_checks(actions, repo, base)?
-        .into_iter()
-        .map(|check| check.context)
-        .collect::<Vec<_>>();
-    contexts.sort();
-    contexts.dedup();
-    Ok(contexts)
+) -> Result<Vec<RequiredCheck>, String> {
+    Ok(observation::required_checks(actions, repo, base)?)
 }
 
 /// The one fix for the poison `health` names ([`base_poison::named_fixes`]
