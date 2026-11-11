@@ -1840,3 +1840,64 @@ printf '%s' '{{"check_runs":[{{"name":"macos","status":"completed","conclusion":
     assert_eq!(lines.len(), 2);
     assert_eq!(lines[0], lines[1]);
 }
+
+/// A consumer that pins an approval script from before `pending` posts
+/// `failure` with "no reviewer verdict names head" for an unreviewed head.
+/// That head waits on its reviewer: it reads as pending, so the census routes
+/// it to the reviewer and never tells the author to "fix, push once". Any
+/// other refusal (a HOLD, an excluded approval) stays a failure.
+#[test]
+fn a_legacy_no_verdict_failure_status_reads_as_awaiting_the_reviewer() {
+    let row = |state: &str, description: &str| {
+        let mut row = rest_status_row(
+            state,
+            "2026-11-11T11:25:01Z",
+            "github-actions[bot]",
+            41_898_282,
+        );
+        row["description"] = serde_json::json!(description);
+        crate::app::merge_steward_cmd::observation::parse_rest_status(&row).expect("status")
+    };
+    let awaiting = row(
+        "failure",
+        "no reviewer verdict names head bbbc56cc9825; it needs a comment whose last line is \
+         `verdict: APPROVE head:bbbc56cc98256c…",
+    );
+    assert_eq!(awaiting.status, "IN_PROGRESS");
+    assert_eq!(awaiting.conclusion, None);
+
+    let held = row("failure", "HOLD at head bbbc56cc9825 by infra-review2");
+    assert_eq!(held.status, "COMPLETED");
+    assert_eq!(held.conclusion.as_deref(), Some("FAILURE"));
+    let approved = row("success", "approved: head bbbc56cc9825 carries `APPROVE`");
+    assert_eq!(approved.conclusion.as_deref(), Some("SUCCESS"));
+
+    // End to end: the same head with the approval job's red check run is
+    // waiting on review, and with a HOLD status it is red.
+    let mut policy = queue_policy();
+    policy.required_checks.push(actions_bound_review_verdict());
+    let run = parse_rest_check(&serde_json::json!({
+        "id": 99,
+        "name": "review-verdict",
+        "status": "completed",
+        "conclusion": "failure",
+        "completed_at": "2026-11-11T11:25:05Z",
+        "app": {"id": crate::merge_steward::GITHUB_ACTIONS_APP_ID}
+    }))
+    .expect("check run");
+    let pr_with = |status: StewardCheck| {
+        let mut pr = ready_pr().fact;
+        pr.checks.extend([status, run.clone()]);
+        pr
+    };
+    let decision = crate::merge_steward::classify_pr(&pr_with(awaiting), &policy, &BTreeMap::new());
+    assert!(
+        matches!(decision, StewardDecision::WaitingRequired { .. }),
+        "{decision:?}"
+    );
+    let decision = crate::merge_steward::classify_pr(&pr_with(held), &policy, &BTreeMap::new());
+    assert!(
+        matches!(decision, StewardDecision::RequiredFailed { .. }),
+        "{decision:?}"
+    );
+}

@@ -254,9 +254,23 @@ pub fn failed_required_contexts(
     required: &[RequiredCheck],
     ignore_run_id: Option<u64>,
 ) -> Vec<String> {
+    // A head that only awaits its reviewer is not doomed: the approval
+    // context's pending status means no verdict yet, not a refusal.
+    let approval = crate::merge_steward::DEFAULT_APPROVAL_CONTEXT;
+    let awaiting = crate::merge_steward::approval_awaiting(
+        checks,
+        approval,
+        required
+            .iter()
+            .find(|rule| rule.context.eq_ignore_ascii_case(approval))
+            .and_then(|rule| rule.app_id),
+    );
     let mut failed = required
         .iter()
         .filter_map(|rule| {
+            if awaiting && rule.context.eq_ignore_ascii_case(approval) {
+                return None;
+            }
             let check = selected_required_check(checks, rule)?;
             let terminal_failure = check.status.eq_ignore_ascii_case("completed")
                 && check.conclusion.as_deref().is_some_and(|conclusion| {
