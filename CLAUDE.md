@@ -29,7 +29,7 @@ scripts the edited file sat in.)
 
 | Layer | Where | Mode |
 |---|---|---|
-| 1 (pre-push)   | `.githooks/pre-push` (install via `scripts/install-githooks.sh`) | `--mode=report` advisory by default; `SHIPYARD_ENFORCE_PREPUSH=1` upgrades to hard fail |
+| 1 (pre-push)   | `.githooks/pre-push` (install via `scripts/install-githooks.sh`) | `--mode=report` hard-fails by default; only an explicit `SHIPYARD_ENFORCE_PREPUSH=0` keeps local warnings advisory |
 | 2 (CI)         | `.github/workflows/version-skill-check.yml` | `--mode=report` with `SHIPYARD_ENFORCE_PREPUSH=1` — blocks merge |
 
 Scripts:

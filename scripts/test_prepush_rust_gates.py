@@ -13,12 +13,20 @@ ROOT = Path(__file__).resolve().parents[1]
 HOOK = ROOT / ".githooks/pre-push"
 
 
-def run_hook(extra_env: dict[str, str], timeout: float | None = None) -> subprocess.CompletedProcess[str]:
+def run_hook(
+    extra_env: dict[str, str],
+    timeout: float | None = None,
+    *,
+    enforce: str | None = "0",
+) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env.pop("RUSTUP_AUTO_INSTALL", None)
     env.update(extra_env)
     env["SHIPYARD_PREPUSH_BASE"] = "HEAD"
-    env["SHIPYARD_ENFORCE_PREPUSH"] = "0"
+    if enforce is not None:
+        env["SHIPYARD_ENFORCE_PREPUSH"] = enforce
+    else:
+        env.pop("SHIPYARD_ENFORCE_PREPUSH", None)
     return subprocess.run(
         ["bash", str(HOOK), "origin", "refs/heads/test", "refs/heads/test", "0000000", "0000000"],
         cwd=ROOT, env=env, text=True, capture_output=True, timeout=timeout,
@@ -167,6 +175,14 @@ class PrePushRustGateTests(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("cargo clippy -D warnings failed", proc.stderr)
         self.assertNotIn("cargo fmt --check failed", proc.stderr)
+
+    def test_gate_failure_refuses_by_default_without_an_override(self) -> None:
+        # Negative control for the protection: an agent that forgets to set the
+        # explicit advisory escape cannot push after a measured gate failure.
+        with tempfile.TemporaryDirectory() as td:
+            proc = run_hook(provision(Path(td), fmt_status=1), enforce=None)
+        self.assertNotEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("push refused", proc.stderr)
 
     def test_a_rustc_that_is_not_the_rustup_proxy_refuses(self) -> None:
         with tempfile.TemporaryDirectory() as td:

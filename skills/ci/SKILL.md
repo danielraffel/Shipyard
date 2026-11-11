@@ -4716,6 +4716,13 @@ the local formatting and lint gates; m1 is a fallback, not a universal gate.
 These checks are a push safeguard only. GitHub CI, branch protection, and the
 configured Shipyard mutation machine remain the landing authority.
 
+The hook is fail-closed by default: a missing gate input, a gate that cannot
+measure, or a measured failure refuses the push. `SHIPYARD_ENFORCE_PREPUSH=0`
+is an explicit diagnostic-only escape; sanctioned `shipyard pr` pushes do not
+set it. Shipyard also captures the remote branch head before local preflight
+and pushes with `--force-with-lease`, so a duplicate repair cannot overwrite a
+newer writer.
+
 ## Authenticated wrapper repository provenance
 
 When a Shipyard GitHub client targets a repository outside its checkout, its

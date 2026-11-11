@@ -37,9 +37,7 @@ use crate::job::{Job, Priority, TargetResult, TargetStatus, ValidationMode};
 use crate::lane_policy::{LanePolicy, resolve_lane_policy};
 use crate::output::write_json_envelope;
 use crate::paths::RuntimePaths;
-use crate::pr::{
-    PrInfo, create_pr, find_pr_for_branch, get_pr_checkout_status, push_branch_with_env,
-};
+use crate::pr::{PrInfo, create_pr, find_pr_for_branch, get_pr_checkout_status};
 use crate::pr_text::{compose_pr_body_with_policy, compose_pr_title};
 use crate::preflight::{
     EXIT_BACKEND_UNREACHABLE, EXIT_FLEET_EPOCH_DRIFT, EXIT_HOST_UNHEALTHY, EXIT_LANE_UNSERVED,
@@ -182,6 +180,10 @@ pub(super) fn ship_command<W: Write>(
         config.get_str("github.auth.source"),
     )?;
     let branch = git_required(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    // Capture the remote lease before local preflight and gates. The final
+    // push must still name this exact head, otherwise a second repair lane can
+    // spend the same merge work and race a first lane's push.
+    let expected_remote_head = origin_branch_sha(cwd, &branch).unwrap_or_else(|| "0".repeat(40));
     let sha = git_required(cwd, &["rev-parse", "HEAD"])?;
     let commit_subject =
         git_optional(cwd, &["log", "-1", "--format=%s", "HEAD"]).unwrap_or_default();
@@ -267,6 +269,7 @@ pub(super) fn ship_command<W: Write>(
             head: &sha,
         },
         &lane_policy,
+        &expected_remote_head,
         prospective_push.as_mut(),
     )?;
     if let Some(prospective) = prospective_push.as_ref()
@@ -1175,6 +1178,7 @@ fn push_pr_branch(
     config: &LoadedConfig,
     cwd: &Path,
     branch: &str,
+    expected_remote_head: &str,
     mut prospective_push: Option<&mut prepush_changed_surface::ProspectivePush>,
 ) -> Result<(), CliFailure> {
     let mut environment = crate::pr::scoped_push_environment(&config.global_dir)
@@ -1188,7 +1192,7 @@ fn push_pr_branch(
                 environment
             }),
     );
-    push_branch_with_env(cwd, branch, environment)
+    crate::pr::push_branch_with_expected_head(cwd, branch, expected_remote_head, environment)
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     if let Some(push) = prospective_push {
         // This private state transition is the pass authority. The hook result
@@ -1205,6 +1209,7 @@ fn resolve_pr_context(
     cwd: &Path,
     checkout: CheckoutIdentity<'_>,
     lane_policy: &LanePolicy,
+    expected_remote_head: &str,
     prospective_push: Option<&mut prepush_changed_surface::ProspectivePush>,
 ) -> Result<ResolvedPrContext, CliFailure> {
     if let Some(number) = args.pr {
@@ -1269,7 +1274,13 @@ fn resolve_pr_context(
         });
     }
 
-    push_pr_branch(config, cwd, checkout.branch, prospective_push)?;
+    push_pr_branch(
+        config,
+        cwd,
+        checkout.branch,
+        expected_remote_head,
+        prospective_push,
+    )?;
     let info = find_pr_for_branch(config, cwd, args.gh_command.as_deref(), checkout.branch)
         .map_err(|error| CliFailure::new(1, error.to_string()))?
         .map_or_else(
