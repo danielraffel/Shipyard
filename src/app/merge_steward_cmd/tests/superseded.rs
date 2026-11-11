@@ -506,7 +506,7 @@ fn absence_needs_a_resolved_base_as_its_control() {
             }
             Ok(r#"{"ahead_by":1,"files":[{"filename":"gone.txt","status":"removed"}]}"#.to_owned())
         };
-        let found = superseded::tree_evidence(&read, REPO, "main", HEAD);
+        let found = superseded::tree_evidence(&read, REPO, "main", HEAD, &|| false);
         if expect {
             assert_eq!(found.expect("read").expect("equal").kind, "tree_equal");
         } else {
@@ -569,6 +569,43 @@ fn a_spent_budget_does_not_read_named_successors_after_mentions() {
     assert!(error.is_none());
     assert!(verdicts.is_empty(), "the unread head stays due");
     assert_eq!(calls.borrow().len(), 1, "mentions is the last read");
+}
+
+#[test]
+fn a_budget_spent_after_the_compare_skips_the_blob_read() {
+    let calls = RefCell::new(Vec::new());
+    let read = |args: &[String]| -> Result<String, String> {
+        let joined = args.join(" ");
+        calls.borrow_mut().push(joined.clone());
+        if joined.contains("timelineItems") {
+            return Ok(r#"{"data":{"repository":{"p15":{"body":"","merged":false,
+                "isInMergeQueue":false,"author":{"__typename":"Bot","login":"shipyard-local[bot]"},
+                "labels":{"nodes":[]},"comments":{"nodes":[]},
+                "queue":{"nodes":[]},"timelineItems":{"nodes":[]}}}}}"#
+                .to_owned());
+        }
+        if joined.contains("/compare/") {
+            return Ok(r#"{"ahead_by":1,"base_commit":{"sha":"cafe"},
+                "files":[{"filename":"a.txt","status":"modified","sha":"d1"}]}"#
+                .to_owned());
+        }
+        Err(format!("unexpected read: {joined}"))
+    };
+    // Unspent through the mention read, the successor guard and the guard
+    // before the compare; spent once the compare has run.
+    let stop = || calls.borrow().iter().any(|c| c.contains("/compare/"));
+    let (verdicts, error) =
+        superseded::check_repo(&read, REPO, "main", &[(15, HEAD.to_owned())], &stop);
+    assert!(error.is_none());
+    assert!(verdicts.is_empty(), "the unread head stays due");
+    assert!(
+        calls
+            .borrow()
+            .iter()
+            .all(|c| !c.contains("object(expression:")),
+        "no blob read after the budget is spent: {:?}",
+        calls.borrow()
+    );
 }
 
 #[test]

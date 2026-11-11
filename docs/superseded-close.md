@@ -17,7 +17,7 @@ of the steward tick JSON only on deterministic evidence:
 | `kind` | Evidence |
 |---|---|
 | `contained` | `compare <base>...<head>` is `ahead_by` 0: every commit of the head is on the base |
-| `tree_equal` | every path the head changes has the head's blob on the base, every path it removes is gone, every rename's old path is gone (two three-dot compares from the shared merge base; a list of 300 or more files proves nothing) |
+| `tree_equal` | every path the head changes has the head's blob on the base, every path it removes is gone, every rename's old path is gone (one REST three-dot compare `<base>...<head>` for the changed paths and their head blobs, then one GraphQL read of those paths' blobs on the base tip; a list of 300 or more files proves nothing) |
 | `named_by` | a merged pull request in the same repository says `Supersedes #<n>` (GitHub cross-reference) |
 | `label_successor` | labelled `superseded`, its body or a comment names `superseded by #<m>`, and `#<m>` merged |
 

@@ -545,13 +545,20 @@ fn compare(read: Read<'_>, repo: &str, from: &str, to: &str) -> Result<Value, St
     )
 }
 
-/// Tree evidence for one head: `contained` or `tree_equal`, from one compare
-/// against `base` and, unless it is `contained`, one blob read of its paths.
+/// The error `tree_evidence` returns when the pass budget ran out between
+/// its compare and its blob read: the head is left unread, so it stays due.
+pub(super) const BUDGET_SPENT: &str = "pass budget spent before the blob read";
+
+/// Tree evidence for one head: `contained` or `tree_equal`, from one REST
+/// compare against `base` and, unless it is `contained`, one GraphQL blob
+/// read of its paths on `base`. `stop` (the pass budget) is asked before the
+/// blob read; when it fires the result is `Err(BUDGET_SPENT)`.
 pub(super) fn tree_evidence(
     read: Read<'_>,
     repo: &str,
     base: &str,
     head: &str,
+    stop: &dyn Fn() -> bool,
 ) -> Result<Option<Evidence>, String> {
     let forward = compare(read, repo, base, head)?;
     let base_sha = forward
@@ -575,6 +582,9 @@ pub(super) fn tree_evidence(
     };
     if head_files.is_empty() || head_files.len() >= COMPARE_FILE_CAP {
         return Ok(None);
+    }
+    if stop() {
+        return Err(BUDGET_SPENT.to_owned());
     }
     let (blobs, tip) = base_blobs(read, repo, base, &paths_to_read(&head_files))?;
     let base_sha = tip.or(base_sha);
@@ -878,7 +888,8 @@ pub(super) fn check_repo(
             if stop() {
                 return (out, None);
             }
-            match tree_evidence(read, repo, base, head) {
+            match tree_evidence(read, repo, base, head, stop) {
+                Err(error) if error == BUDGET_SPENT => return (out, None),
                 Err(error) if limited(&error) => return (out, Some(error)),
                 verdict => {
                     let (body, fleet) = mentions.own.get(number).cloned().unwrap_or_default();
