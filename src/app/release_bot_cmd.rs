@@ -1816,7 +1816,7 @@ fn run_git(cwd: &Path, args: &[&str]) -> Result<(), String> {
 }
 
 fn run_git_supervised(cwd: &Path, args: &[&str]) -> Result<(), String> {
-    let output = crate::supervised::git_push_supervised()
+    let output = crate::supervised::git_push_supervised(cwd)
         .args(args)
         .current_dir(cwd)
         .output()

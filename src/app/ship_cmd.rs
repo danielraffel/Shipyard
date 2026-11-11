@@ -1108,7 +1108,7 @@ fn maybe_auto_create_base_branch(
         return;
     };
     let refspec = format!("{base_sha}:refs/heads/{base}");
-    let Ok(push) = crate::supervised::git_supervised()
+    let Ok(push) = crate::supervised::git_push_supervised(cwd)
         .args(["push", "origin", &refspec])
         .current_dir(cwd)
         .output()

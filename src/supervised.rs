@@ -29,10 +29,9 @@ pub const SUPERVISED_ENV_VAR: &str = "SHIPYARD_PR_RUNNING";
 /// Value set on every supervised subprocess.
 pub const SUPERVISED_ENV_VALUE: &str = "1";
 
-/// Default OpenSSH command for pushes whose local pre-push gate can run for
-/// much longer than GitHub's idle SSH timeout.
-pub const PUSH_SSH_KEEPALIVE_COMMAND: &str =
-    "ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=3";
+/// OpenSSH options appended to the push transport command so an idle
+/// connection survives a long local pre-push gate.
+pub const PUSH_SSH_KEEPALIVE_OPTIONS: &str = "-o ServerAliveInterval=30 -o ServerAliveCountMax=10";
 
 /// Mark a `Command` as supervised. Returns the same command for
 /// fluent chaining.
@@ -57,20 +56,46 @@ pub fn git_supervised() -> Command {
     supervised(Command::new("git"))
 }
 
-/// Build a supervised `git push` command with an SSH keepalive when the user
-/// has not supplied a custom SSH command. Git opens the transport before it
-/// invokes `pre-push`; without traffic, a long local gate can finish only to
-/// discover that the remote closed the idle connection.
+/// Build a supervised `git push` run in `cwd` with an SSH keepalive. Git opens
+/// the transport before it invokes `pre-push`; without traffic, a long local
+/// gate can finish only to find the remote closed the idle connection. The
+/// keepalive options are appended to the operator's own SSH command
+/// (`GIT_SSH_COMMAND`, else the repo's `core.sshCommand`, else `ssh`), never
+/// replacing it, and only for this command. HTTPS remotes ignore the variable.
 #[must_use]
-pub fn git_push_supervised() -> Command {
-    git_push_supervised_for(std::env::var_os("GIT_SSH_COMMAND").as_deref())
+pub fn git_push_supervised(cwd: &Path) -> Command {
+    let existing = std::env::var_os("GIT_SSH_COMMAND")
+        .map(|value| value.to_string_lossy().into_owned())
+        .or_else(|| configured_ssh_command(cwd));
+    git_push_supervised_for(existing.as_deref())
 }
 
-fn git_push_supervised_for(existing_ssh_command: Option<&std::ffi::OsStr>) -> Command {
-    let mut command = git_supervised();
-    if existing_ssh_command.is_none() {
-        command.env("GIT_SSH_COMMAND", PUSH_SSH_KEEPALIVE_COMMAND);
+fn configured_ssh_command(cwd: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["config", "--get", "core.sshCommand"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
     }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    (!value.is_empty()).then_some(value)
+}
+
+fn git_push_supervised_for(existing_ssh_command: Option<&str>) -> Command {
+    let mut command = git_supervised();
+    let base = existing_ssh_command
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("ssh");
+    let merged = if base.contains("ServerAliveInterval") {
+        base.to_owned()
+    } else {
+        format!("{base} {PUSH_SSH_KEEPALIVE_OPTIONS}")
+    };
+    command.env("GIT_SSH_COMMAND", merged);
     command
 }
 
@@ -135,7 +160,10 @@ mod tests {
         assert_eq!(cmd.get_program(), std::ffi::OsStr::new("git"));
         assert_eq!(
             env_value(&cmd, "GIT_SSH_COMMAND").as_deref(),
-            Some(OsString::from(PUSH_SSH_KEEPALIVE_COMMAND).as_os_str())
+            Some(
+                OsString::from("ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=10")
+                    .as_os_str()
+            )
         );
         assert_eq!(
             env_value(&cmd, SUPERVISED_ENV_VAR).as_deref(),
@@ -144,10 +172,47 @@ mod tests {
     }
 
     #[test]
-    fn git_push_supervised_preserves_explicit_ssh_policy() {
-        let explicit = std::ffi::OsStr::new("ssh -i /tmp/operator-key");
-        let cmd = git_push_supervised_for(Some(explicit));
-        assert_eq!(env_value(&cmd, "GIT_SSH_COMMAND"), None);
+    fn git_push_supervised_extends_explicit_ssh_command() {
+        let cmd = git_push_supervised_for(Some("ssh -i /tmp/operator-key"));
+        assert_eq!(
+            env_value(&cmd, "GIT_SSH_COMMAND").as_deref(),
+            Some(
+                OsString::from(
+                    "ssh -i /tmp/operator-key -o ServerAliveInterval=30 -o ServerAliveCountMax=10"
+                )
+                .as_os_str()
+            )
+        );
+    }
+
+    #[test]
+    fn git_push_supervised_keeps_operator_keepalive() {
+        let cmd = git_push_supervised_for(Some("ssh -o ServerAliveInterval=5"));
+        assert_eq!(
+            env_value(&cmd, "GIT_SSH_COMMAND").as_deref(),
+            Some(OsString::from("ssh -o ServerAliveInterval=5").as_os_str())
+        );
+    }
+
+    #[test]
+    fn push_extends_repo_core_ssh_command() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let init = Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg(dir.path())
+            .status();
+        assert!(init.expect("git init").success());
+        let set = Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(["config", "core.sshCommand", "ssh -i /tmp/repo-key"])
+            .status();
+        assert!(set.expect("git config").success());
+        assert_eq!(
+            configured_ssh_command(dir.path()).as_deref(),
+            Some("ssh -i /tmp/repo-key")
+        );
     }
 
     // End-to-end: spawn a real subprocess and assert it sees the env.

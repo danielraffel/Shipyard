@@ -84,7 +84,7 @@ pub fn push_branch_with_env(
         (key == crate::writer_domain_lease::CHILD_WRITER_PATH_ENV)
             .then(|| std::path::PathBuf::from(value))
     });
-    let mut command = crate::supervised::git_push_supervised();
+    let mut command = crate::supervised::git_push_supervised(cwd);
     command
         .envs(environment)
         .args(["push", "-u", "origin", branch])
