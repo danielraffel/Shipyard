@@ -62,6 +62,10 @@ pub(super) struct ControlRun {
     pub(super) base_sha: String,
     /// RFC 3339.
     pub(super) dispatched_at: String,
+    /// The GitHub Actions run created by this dispatch, once it is visible.
+    /// Check runs are accepted only when their check suite points at this run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) workflow_run_id: Option<u64>,
     /// `success`, `failure`, or `unlabelled`, once known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) conclusion: Option<String>,
@@ -245,6 +249,7 @@ pub(super) fn label(
             workflow: workflow.clone(),
             base_sha: String::new(),
             dispatched_at: String::new(),
+            workflow_run_id: None,
             conclusion: None,
             error: None,
         };
@@ -309,7 +314,7 @@ pub(super) fn label(
 
 /// The control's verdict for `context`, `None` while it is still running.
 fn control_verdict(
-    control: &ControlRun,
+    control: &mut ControlRun,
     context: &str,
     repo: &str,
     run_gh: &dyn Fn(&[String]) -> Result<String, String>,
@@ -321,6 +326,38 @@ fn control_verdict(
     if now - since > chrono::Duration::hours(CONTROL_TIMEOUT_HOURS) {
         return Some("unlabelled".to_owned());
     }
+    if control.workflow_run_id.is_none() {
+        let raw = run_gh(&[
+            "api".to_owned(),
+            format!(
+                "repos/{repo}/actions/workflows/{}/runs?head_sha={}&event=workflow_dispatch&per_page=20",
+                control.workflow, control.base_sha
+            ),
+        ])
+        .ok()?;
+        let value = serde_json::from_str::<Value>(&raw).ok()?;
+        control.workflow_run_id = value
+            .get("workflow_runs")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|run| {
+                run.get("head_sha").and_then(Value::as_str) == Some(control.base_sha.as_str())
+            })
+            .filter_map(|run| {
+                let created_at = run.get("created_at").and_then(Value::as_str)?;
+                let created_at = DateTime::parse_from_rfc3339(created_at)
+                    .ok()?
+                    .with_timezone(&Utc);
+                if created_at < since {
+                    return None;
+                }
+                Some((created_at, run.get("id").and_then(Value::as_u64)?))
+            })
+            .min_by_key(|(created_at, _)| *created_at)
+            .map(|(_, id)| id);
+    }
+    let workflow_run_id = control.workflow_run_id?;
     let raw = run_gh(&[
         "api".to_owned(),
         format!(
@@ -343,6 +380,13 @@ fn control_verdict(
                 .and_then(Value::as_str)
                 .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
                 .is_some_and(|at| at.with_timezone(&Utc) >= since)
+        })
+        .filter(|run| {
+            run.get("check_suite")
+                .and_then(|suite| suite.get("workflow_run"))
+                .and_then(|workflow_run| workflow_run.get("id"))
+                .and_then(Value::as_u64)
+                == Some(workflow_run_id)
         })
         .filter_map(|run| run.get("conclusion").and_then(Value::as_str))
         .map(|conclusion| match conclusion {

@@ -739,13 +739,18 @@ fn the_shadow_ledger_labels_episodes_by_a_pr_free_control_run() {
         if line.ends_with("--jq .sha") {
             return Ok(tip.clone());
         }
+        if line.contains("/actions/workflows/version-skill-check.yml/runs?") {
+            return Ok(format!(
+                r#"{{"workflow_runs":[{{"id":42,"head_sha":"{tip}","created_at":"2026-11-12T23:00:00Z"}}]}}"#
+            ));
+        }
         if line.contains("/check-runs?check_name=Enforce%20version%20%26%20skill%20sync") {
             let conclusion = *verdict.borrow();
             if conclusion.is_empty() {
                 return Ok(r#"{"check_runs":[]}"#.to_owned());
             }
             return Ok(format!(
-                r#"{{"check_runs":[{{"status":"completed","conclusion":"{conclusion}","started_at":"2026-11-12T23:00:00Z"}}]}}"#
+                r#"{{"check_runs":[{{"status":"completed","conclusion":"{conclusion}","started_at":"2026-11-12T23:00:00Z","check_suite":{{"workflow_run":{{"id":42}}}}}}]}}"#
             ));
         }
         Err(format!("unexpected: {line}"))
@@ -893,8 +898,10 @@ fn a_timed_out_control_leaves_the_episode_unlabelled() {
         let line = argv.join(" ");
         Ok(if line.ends_with("--jq .sha") {
             "3".repeat(40)
+        } else if line.contains("/actions/workflows/version-skill-check.yml/runs?") {
+            r#"{"workflow_runs":[{"id":42,"head_sha":"3333333333333333333333333333333333333333","created_at":"2026-11-12T23:00:00Z"}]}"#.to_owned()
         } else if line.contains("/check-runs?") {
-            r#"{"check_runs":[{"status":"completed","conclusion":"timed_out","started_at":"2026-11-12T23:00:00Z"}]}"#.to_owned()
+            r#"{"check_runs":[{"status":"completed","conclusion":"timed_out","started_at":"2026-11-12T23:00:00Z","check_suite":{"workflow_run":{"id":42}}}]}"#.to_owned()
         } else {
             String::new()
         })
@@ -930,6 +937,16 @@ fn overlapping_episodes_dispatch_distinct_controls() {
             *dispatches.borrow_mut() += 1;
             return Ok(String::new());
         }
+        if line.contains("/actions/workflows/version-skill-check.yml/runs?") {
+            let (sha, id) = if line.contains(&format!("head_sha={first_sha}")) {
+                (&first_sha, 41)
+            } else {
+                (&second_sha, 42)
+            };
+            return Ok(format!(
+                r#"{{"workflow_runs":[{{"id":{id},"head_sha":"{sha}","created_at":"2026-11-12T23:00:00Z"}}]}}"#
+            ));
+        }
         if line.contains("/check-runs?") {
             if line.contains(&format!("commits/{first_sha}/")) && first_poll.replace(false) {
                 return Ok(r#"{"check_runs":[]}"#.to_owned());
@@ -939,9 +956,20 @@ fn overlapping_episodes_dispatch_distinct_controls() {
             } else {
                 "success"
             };
-            return Ok(format!(
-                r#"{{"check_runs":[{{"status":"completed","conclusion":"{conclusion}","started_at":"2026-11-12T23:00:00Z"}}]}}"#
-            ));
+            let id = if line.contains(&format!("commits/{first_sha}/")) {
+                41
+            } else {
+                42
+            };
+            return Ok(serde_json::json!({
+                "check_runs": [{
+                    "status": "completed",
+                    "conclusion": conclusion,
+                    "started_at": "2026-11-12T23:00:00Z",
+                    "check_suite": {"workflow_run": {"id": id}},
+                }]
+            })
+            .to_string());
         }
         Err(format!("unexpected: {line}"))
     };
@@ -961,6 +989,44 @@ fn overlapping_episodes_dispatch_distinct_controls() {
         .map(|control| control.base_sha.clone())
         .collect::<Vec<_>>();
     assert_eq!(controls, vec![first_sha, second_sha]);
+}
+
+#[test]
+fn a_same_context_check_from_another_workflow_is_ignored() {
+    use crate::app::merge_steward_cmd::shadow_ledger::{self, Episode};
+    let key = "generous-corp/pulp@main";
+    let controls = BTreeMap::from([(CONTEXT.to_owned(), "version-skill-check.yml".to_owned())]);
+    let firing = BTreeMap::from([((CONTEXT.to_owned(), "streak".to_owned()), 2)]);
+    let base_sha = "4".repeat(40);
+    let run_gh = |argv: &[String]| -> Result<String, String> {
+        let line = argv.join(" ");
+        if line.ends_with("--jq .sha") {
+            return Ok(base_sha.clone());
+        }
+        if line.contains("/dispatches") {
+            return Ok(String::new());
+        }
+        if line.contains("/actions/workflows/version-skill-check.yml/runs?") {
+            return Ok(format!(
+                r#"{{"workflow_runs":[{{"id":42,"head_sha":"{base_sha}","created_at":"2026-11-12T23:00:00Z"}}]}}"#
+            ));
+        }
+        if line.contains("/check-runs?") {
+            return Ok(
+                r#"{"check_runs":[
+                    {"status":"completed","conclusion":"failure","started_at":"2026-11-12T23:00:00Z","check_suite":{"workflow_run":{"id":99}}},
+                    {"status":"completed","conclusion":"success","started_at":"2026-11-12T23:01:00Z","check_suite":{"workflow_run":{"id":42}}}
+                ]}"#
+                .to_owned(),
+            );
+        }
+        Err(format!("unexpected: {line}"))
+    };
+    let mut open: Vec<Episode> = Vec::new();
+    let none = BTreeSet::new();
+    shadow_ledger::advance(&mut open, key, &firing, &none, &none, at(24, 0));
+    shadow_ledger::label(&mut open, key, REPO, "main", &controls, &run_gh, at(24, 0));
+    assert_eq!(open[0].corroborated, Some(false));
 }
 
 #[test]
