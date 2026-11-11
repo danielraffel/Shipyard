@@ -588,3 +588,109 @@ fn live_run_must_match_the_recorded_pull_request_run() {
     assert!(verify_live_run(&recorded, &unassociated, Some("branch-9")).is_err());
     assert!(verify_live_run(&recorded, &unassociated, None).is_err());
 }
+
+/// A named fix whose only red is the approval context: before review that
+/// context is red on every head.
+fn fix_awaiting_review() -> (Vec<RequiredCheck>, Vec<DrainPullRequest>, Vec<DrainRun>) {
+    let mut required = required();
+    required.push(RequiredCheck {
+        context: "review-verdict".to_owned(),
+        app_id: None,
+    });
+    let mut fix = pr(
+        12025,
+        HEAD_A,
+        "BLOCKED",
+        vec![check("review-verdict", "completed", Some("failure"), 90)],
+    );
+    fix.pr.labels.push(UNBLOCK_LABEL.to_owned());
+    let other = pr(12030, HEAD_B, "CLEAN", Vec::new());
+    let runs = vec![
+        drain(
+            run(200, 12025, HEAD_A, "queued", "pull_request"),
+            vec![job(2, "queued", 30, &MAC)],
+        ),
+        drain(
+            run(100, 12030, HEAD_B, "queued", "pull_request"),
+            vec![job(1, "queued", 10, &MAC)],
+        ),
+    ];
+    (required, vec![fix, other], runs)
+}
+
+#[test]
+fn a_named_fix_red_only_on_its_approval_moves_to_the_front_when_excused() {
+    let (required, prs, runs) = fix_awaiting_review();
+    let excused = ["review-verdict".to_owned()];
+    let plan = plan_prioritize_excusing(12025, &runs, &prs, &required, &excused);
+    assert_eq!(plan.refusal, None, "{plan:?}");
+    assert_eq!(plan.yields.len(), 1);
+    assert_eq!(plan.yields[0].pr_number, Some(12030));
+    // Negative control: without the excuse the same fix is "doomed".
+    let plan = plan_prioritize(12025, &runs, &prs, &required);
+    assert!(
+        matches!(plan.refusal, Some(PrioritizeRefusal::Doomed { .. })),
+        "{plan:?}"
+    );
+}
+
+#[test]
+fn the_excuse_covers_only_the_named_contexts() {
+    let (required, mut prs, runs) = fix_awaiting_review();
+    prs[0]
+        .pr
+        .checks
+        .push(check("macos", "completed", Some("failure"), 91));
+    let excused = ["review-verdict".to_owned()];
+    let plan = plan_prioritize_excusing(12025, &runs, &prs, &required, &excused);
+    let Some(PrioritizeRefusal::Doomed {
+        reason: DoomReason::RequiredCheckFailed { contexts },
+    }) = plan.refusal
+    else {
+        panic!("a real red still dooms the fix: {plan:?}");
+    };
+    assert_eq!(contexts, vec!["macos".to_owned()]);
+}
+
+#[test]
+fn fix_evidence_reads_the_label_or_a_fix_word_next_to_the_context() {
+    let contexts = ["Versioning & Skill-Sync".to_owned()];
+    assert!(
+        !fix_evidence(
+            "fix(ci): Versioning & Skill-Sync cadence warns before the due date",
+            "",
+            &[],
+            &contexts,
+        )
+        .is_empty()
+    );
+    assert!(
+        !fix_evidence(
+            "chore: recheck contracts",
+            "",
+            &[UNBLOCK_LABEL.to_owned()],
+            &contexts
+        )
+        .is_empty()
+    );
+    // Negative controls: naming the context without a fix word, or a fix
+    // word without the context, is not a fix.
+    assert!(fix_evidence("Versioning & Skill-Sync notes", "", &[], &contexts).is_empty());
+    assert!(fix_evidence("fix: unrelated", "", &[], &contexts).is_empty());
+}
+
+#[test]
+fn unblocking_candidates_excuse_the_approval_red_only_when_asked() {
+    let (required, prs, _) = fix_awaiting_review();
+    let red = ["drift-fast".to_owned()];
+    assert!(unblocking_candidates(&prs, &red, &required).is_empty());
+    let excused = ["review-verdict".to_owned()];
+    let candidates = unblocking_candidates_excusing(&prs, &red, &required, &excused);
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|candidate| candidate.pr_number)
+            .collect::<Vec<_>>(),
+        vec![12025]
+    );
+}

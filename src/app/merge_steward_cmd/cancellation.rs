@@ -107,7 +107,8 @@ pub(super) fn apply_repo_plan(
         max_transient_reruns: args.max_transient_reruns,
         ejection_guards: super::read_ejection_guards(actions, observation),
     };
-    let (mut reports, pr_mutation_failed, listing) = apply_pr_plans_with_listing(
+    let base_poison = super::base_poison::observe(actions, observation, &policy, Utc::now());
+    let (mut reports, pr_mutation_failed, listing) = apply_pr_plans_with_poison(
         actions,
         args,
         observation,
@@ -115,7 +116,21 @@ pub(super) fn apply_repo_plan(
         ledger_path,
         ledger,
         mutation_control,
+        base_poison.as_ref(),
     );
+    let base_poison_report = base_poison.as_ref().map(|poison| {
+        // The fast-track mutates (it cancels other runs and starts a review),
+        // so it runs only under `merge_group_hold = "on"`; dry-run reports.
+        let fast_track = match mutation_control {
+            Some(control)
+                if args.apply && poison.policy.hold == crate::base_health::PoisonHold::On =>
+            {
+                super::base_poison::fast_track(actions, control, observation, &policy, poison)
+            }
+            _ => super::base_poison::would_fast_track(poison),
+        };
+        super::base_poison::report(poison, &fast_track)
+    });
     let dwell_policy =
         super::dwell_pass::read_policy(actions, &observation.repo, &observation.base);
     let dwell_report = super::dwell_pass::run(
@@ -282,6 +297,7 @@ pub(super) fn apply_repo_plan(
     }
     (
         RepoReport {
+            base_poison: base_poison_report,
             rollup_reconciliation: Vec::new(),
             uncertain_mutations,
             api_calls: None,
@@ -350,7 +366,7 @@ pub(super) fn apply_pr_plans(
 
 /// [`apply_pr_plans`], also handing back the open-pull-request listing the
 /// carried-commit check read this pass, when it read one.
-#[allow(clippy::too_many_lines)]
+#[cfg(test)]
 pub(super) fn apply_pr_plans_with_listing(
     actions: &GitHubActions,
     args: &StewardCommandArgs,
@@ -359,6 +375,35 @@ pub(super) fn apply_pr_plans_with_listing(
     ledger_path: &Path,
     ledger: &mut StewardLedger,
     mutation_control: Option<&MutationControl>,
+) -> (
+    Vec<PrReport>,
+    bool,
+    Option<Vec<super::carried_commits::OpenPr>>,
+) {
+    apply_pr_plans_with_poison(
+        actions,
+        args,
+        observation,
+        policy,
+        ledger_path,
+        ledger,
+        mutation_control,
+        None,
+    )
+}
+
+/// [`apply_pr_plans_with_listing`] under this pass's merge-group reading
+/// ([`super::base_poison`]).
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+pub(super) fn apply_pr_plans_with_poison(
+    actions: &GitHubActions,
+    args: &StewardCommandArgs,
+    observation: &RepoObservation,
+    policy: &StewardPolicy,
+    ledger_path: &Path,
+    ledger: &mut StewardLedger,
+    mutation_control: Option<&MutationControl>,
+    base_poison: Option<&super::base_poison::RepoPoison>,
 ) -> (
     Vec<PrReport>,
     bool,
@@ -374,6 +419,7 @@ pub(super) fn apply_pr_plans_with_listing(
         carried_commits: std::cell::RefCell::default(),
         changed_files: std::cell::RefCell::default(),
         ejection_guards: policy.ejection_guards.clone(),
+        base_poison,
     });
     let mut sweep_pass = super::unapproved_admission::SweepPass::new(args.unapproved_dequeue);
     if args.apply {

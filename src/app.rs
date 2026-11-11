@@ -518,12 +518,14 @@ where
         }
         Command::BaseHealth {
             repo,
+            base,
             workflow,
             act,
         } => {
             return base_health_cmd::base_health_command(
                 base_health_cmd::BaseHealthArgs {
                     repo,
+                    base,
                     workflow,
                     act,
                     json: cli.json,
@@ -1109,7 +1111,8 @@ fn handle_queue_drain_command<W: Write>(
     let runtime = QueueDrainRuntime {
         cwd,
         mode,
-        runtime_paths,
+        state_dir: &runtime_paths.state_dir,
+        global_dir: &runtime_paths.global_dir,
         actions: &actions,
     };
     match command {

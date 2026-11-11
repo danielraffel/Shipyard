@@ -14,13 +14,14 @@ use super::observation::{
 };
 use super::{
     BTreeMap, BTreeSet, CliFailure, ExitCode, GitHubActions, MergeQueueMutationGuard, OpenOptions,
-    Path, PathBuf, RequiredCheck, RuntimeMode, RuntimePaths, ShipState, ShipStateStore, StewardRun,
-    Utc, Value, Write, acquire_ledger_lock, fs, is_full_sha, json, write_json_envelope,
+    Path, PathBuf, RequiredCheck, RuntimeMode, ShipState, ShipStateStore, StewardRun, Utc, Value,
+    Write, acquire_ledger_lock, fs, is_full_sha, json, write_json_envelope,
 };
 use crate::queue_drain::{
-    CancelCause, DrainJob, DrainPullRequest, DrainRun, PrioritizePlan, RestoreEntry, RestoreLedger,
-    ResumeDecision, RunTriage, RunVerdict, UnblockCandidate, job_is_waiting, plan_prioritize,
-    plan_triage, red_required_contexts, resume_decision, unblocking_candidates,
+    CancelCause, DoomReason, DrainJob, DrainPullRequest, DrainRun, PrioritizePlan,
+    PrioritizeRefusal, RestoreEntry, RestoreLedger, ResumeDecision, RunTriage, RunVerdict,
+    UnblockCandidate, job_is_waiting, plan_prioritize, plan_prioritize_excusing, plan_triage,
+    red_required_contexts, resume_decision, unblocking_candidates_excusing,
 };
 
 const MAX_OPEN_PR_ROWS: usize = 1000;
@@ -38,7 +39,10 @@ pub(in crate::app) struct QueueDrainArgs {
 pub(in crate::app) struct QueueDrainRuntime<'a> {
     pub(in crate::app) cwd: &'a Path,
     pub(in crate::app) mode: RuntimeMode,
-    pub(in crate::app) runtime_paths: &'a RuntimePaths,
+    /// Machine-global state directory (restore ledger, mutation state).
+    pub(in crate::app) state_dir: &'a Path,
+    /// Machine-global configuration directory.
+    pub(in crate::app) global_dir: &'a Path,
     pub(in crate::app) actions: &'a GitHubActions,
 }
 
@@ -62,7 +66,7 @@ struct MutationResult {
 fn ledger_path(args: &QueueDrainArgs, runtime: &QueueDrainRuntime<'_>) -> PathBuf {
     args.ledger
         .clone()
-        .unwrap_or_else(|| runtime.runtime_paths.state_dir.join(LEDGER_FILE))
+        .unwrap_or_else(|| runtime.state_dir.join(LEDGER_FILE))
 }
 
 fn scoped_actions(actions: &GitHubActions, repo: &str) -> GitHubActions {
@@ -387,7 +391,7 @@ fn mutation_guard(
     head_sha: &str,
     action: &str,
 ) -> Result<MergeQueueMutationGuard, String> {
-    let store = ShipStateStore::new(runtime.runtime_paths.state_dir.join("ship"))
+    let store = ShipStateStore::new(runtime.state_dir.join("ship"))
         .map_err(|error| format!("could not open merge-queue mutation state: {error}"))?;
     let branch = observation
         .prs
@@ -406,7 +410,7 @@ fn mutation_guard(
         &store,
         runtime.cwd,
         runtime.mode,
-        &runtime.runtime_paths.global_dir,
+        runtime.global_dir,
         &state,
         action,
     )
@@ -712,11 +716,26 @@ pub(in crate::app) fn queue_triage_command<W: Write>(
         .map_err(|error| CliFailure::new(1, error))?;
     let base_checks = complete_checks_for_head(&actions, &observation.repo, &base_sha)
         .map_err(|error| CliFailure::new(1, error))?;
-    let red = red_required_contexts(&base_checks, &observation.required);
+    let mut red = red_required_contexts(&base_checks, &observation.required);
+    // A base can be poisoned only in its merge groups (a context that runs
+    // on `merge_group` alone, or one that starts failing on a date).
+    let poisoned = merge_group_poison(&actions, &observation).poisoned_contexts();
+    for context in poisoned {
+        if !red.contains(&context) {
+            red.push(context);
+        }
+    }
+    red.sort();
+    let excused = if red.is_empty() {
+        Vec::new()
+    } else {
+        vec![crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned()]
+    };
     if !red.is_empty() {
         hydrate_bodies(&actions, &mut observation).map_err(|error| CliFailure::new(1, error))?;
     }
-    let mut candidates = unblocking_candidates(&observation.prs, &red, &observation.required);
+    let mut candidates =
+        unblocking_candidates_excusing(&observation.prs, &red, &observation.required, &excused);
     if !candidates.is_empty() {
         // Re-check candidates against their own complete head checks: a pull
         // request whose own required checks already failed fixes nothing.
@@ -726,7 +745,8 @@ pub(in crate::app) fn queue_triage_command<W: Write>(
             .collect();
         hydrate_checks(&actions, &mut observation, &numbers)
             .map_err(|error| CliFailure::new(1, error))?;
-        candidates = unblocking_candidates(&observation.prs, &red, &observation.required);
+        candidates =
+            unblocking_candidates_excusing(&observation.prs, &red, &observation.required, &excused);
     }
     let unblock_target =
         (prioritize_unblocking && candidates.len() == 1).then(|| candidates[0].pr_number);
@@ -734,11 +754,12 @@ pub(in crate::app) fn queue_triage_command<W: Write>(
         Some(target) => {
             let drains = hydrate_drain_runs(&actions, &observation, target)
                 .map_err(|error| CliFailure::new(1, error))?;
-            Some(plan_prioritize(
+            Some(plan_prioritize_excusing(
                 target,
                 &drains,
                 &observation.prs,
                 &observation.required,
+                &excused,
             ))
         }
         None => None,
@@ -922,7 +943,21 @@ pub(in crate::app) fn queue_prioritize_command<W: Write>(
         .map_err(|error| CliFailure::new(1, error))?;
     let drains = hydrate_drain_runs(&actions, &observation, pr)
         .map_err(|error| CliFailure::new(1, error))?;
-    let plan = plan_prioritize(pr, &drains, &observation.prs, &observation.required);
+    let mut plan = plan_prioritize(pr, &drains, &observation.prs, &observation.required);
+    let mut base_poison = Value::Null;
+    if only_approval_failed(&plan) {
+        let (excused, report) = named_fix_excuse(&actions, &observation, pr);
+        base_poison = report;
+        if !excused.is_empty() {
+            plan = plan_prioritize_excusing(
+                pr,
+                &drains,
+                &observation.prs,
+                &observation.required,
+                &excused,
+            );
+        }
+    }
     let ledger_path = ledger_path(args, runtime);
     let results = if args.apply && plan.refusal.is_none() {
         let _lock = acquire_ledger_lock(&ledger_path)?;
@@ -943,6 +978,7 @@ pub(in crate::app) fn queue_prioritize_command<W: Write>(
     data.insert("base".to_owned(), json!(observation.base));
     data.insert("apply".to_owned(), json!(args.apply));
     data.insert("plan".to_owned(), to_value(&plan));
+    data.insert("base_poison".to_owned(), base_poison);
     data.insert("cancellations".to_owned(), to_value(&results));
     data.insert(
         "ledger".to_owned(),
@@ -959,6 +995,134 @@ pub(in crate::app) fn queue_prioritize_command<W: Write>(
         return Ok(ExitCode::from(2));
     }
     Ok(exit_for(&results))
+}
+
+/// The merge groups' verdict on the observed base.
+fn merge_group_poison(
+    actions: &GitHubActions,
+    observation: &Observation,
+) -> crate::base_health::merge_group::MergeGroupHealth {
+    let run_gh = |argv: &[String]| actions.run_gh(argv).map_err(|error| error.to_string());
+    let mut contexts = observation
+        .required
+        .iter()
+        .map(|rule| rule.context.clone())
+        .collect::<Vec<_>>();
+    contexts.sort();
+    contexts.dedup();
+    crate::base_health::merge_group::read(
+        &run_gh,
+        &observation.repo,
+        &observation.base,
+        &contexts,
+        Utc::now(),
+    )
+}
+
+/// Whether the plan was refused only because the approval context is red.
+fn only_approval_failed(plan: &PrioritizePlan) -> bool {
+    let approval = crate::merge_steward::DEFAULT_APPROVAL_CONTEXT;
+    matches!(
+        &plan.refusal,
+        Some(PrioritizeRefusal::Doomed {
+            reason: DoomReason::RequiredCheckFailed { contexts },
+        }) if !contexts.is_empty()
+            && contexts
+                .iter()
+                .all(|context| context == approval || context.starts_with(&format!("{approval} (")))
+    )
+}
+
+/// The contexts `target` is excused from counting as doom: the approval
+/// context, when the merge groups show the base poisoned and `target` is a
+/// named fix for a poisoned context. Returns the reading for the report.
+fn named_fix_excuse(
+    actions: &GitHubActions,
+    observation: &Observation,
+    target: u64,
+) -> (Vec<String>, Value) {
+    let health = merge_group_poison(actions, observation);
+    let poisoned = health.poisoned_contexts();
+    if poisoned.is_empty() {
+        return (Vec::new(), json!({"health": health, "named_fix": false}));
+    }
+    let run_gh = |argv: &[String]| actions.run_gh(argv).map_err(|error| error.to_string());
+    let (fixes, fix_read_error) = super::base_poison::named_fixes(
+        &run_gh,
+        &observation.repo,
+        &observation.base,
+        &poisoned,
+        Utc::now(),
+    );
+    let evidence = fixes.get(&target).cloned();
+    let excused = if evidence.is_some() {
+        vec![crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned()]
+    } else {
+        Vec::new()
+    };
+    (
+        excused,
+        json!({
+            "health": health,
+            "named_fix": evidence.is_some(),
+            "evidence": evidence,
+            "fix_read_error": fix_read_error,
+        }),
+    )
+}
+
+/// Move a named fix's waiting CI jobs to the front, excusing `excused`
+/// contexts' red on it. The steward's fast-track calls this once per pass
+/// while the base is poisoned; it returns one line for the report.
+pub(in crate::app) fn prioritize_named_fix(
+    runtime: &QueueDrainRuntime<'_>,
+    repo: &str,
+    base: &str,
+    pr: u64,
+    excused: &[String],
+) -> Result<String, String> {
+    let actions = scoped_actions(runtime.actions, repo);
+    let mut observation = observe(&actions, repo, base)?;
+    hydrate_checks(&actions, &mut observation, &BTreeSet::from([pr]))?;
+    let drains = hydrate_drain_runs(&actions, &observation, pr)?;
+    let plan = plan_prioritize_excusing(
+        pr,
+        &drains,
+        &observation.prs,
+        &observation.required,
+        excused,
+    );
+    if let Some(refusal) = &plan.refusal {
+        return Ok(format!("not prioritized: {}", to_value(refusal)));
+    }
+    let ledger_path = runtime.state_dir.join(LEDGER_FILE);
+    let _lock = acquire_ledger_lock(&ledger_path).map_err(|failure| failure.message)?;
+    let mut ledger = load_ledger(&ledger_path).map_err(|failure| failure.message)?;
+    let results = apply_prioritize(
+        runtime,
+        &actions,
+        &observation,
+        &ledger_path,
+        &mut ledger,
+        &plan,
+    );
+    let cancelled = results
+        .iter()
+        .filter(|result| result.error.is_none() && result.outcome == "cancelled")
+        .count();
+    let failed = results
+        .iter()
+        .filter_map(|result| result.error.as_deref())
+        .collect::<Vec<_>>();
+    Ok(format!(
+        "{} waiting job(s); {cancelled} run(s) yielded{}",
+        plan.target_jobs.len(),
+        if failed.is_empty() {
+            String::new()
+        } else {
+            format!("; errors: {}", failed.join("; "))
+        }
+    ))
 }
 
 #[derive(serde::Serialize)]

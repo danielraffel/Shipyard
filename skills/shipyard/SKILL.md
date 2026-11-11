@@ -5813,7 +5813,32 @@ hours old. `landing` renders it; `shipyard base-health --act` applies
 `would_jump` line per (repo, base run, PR) episode to
 `<state>/base-health/jump-decisions.jsonl`; `on` dequeues and re-enqueues the
 exact head with `jump: true`, and a `failed` attempt may retry). An unknown
-config value is an error, never a silent `off`.
+config value is an error, never a silent `off`. The `on` jump first requires
+`head_approval::evaluate` to return `HeadGate::Approved` for the exact head,
+and after a dequeue a failed jump is followed by a plain enqueue of the same
+head (`PLAIN_ENQUEUE_MUTATION`), reported `failed: jump: ...; re-enqueued at
+the back` or `... is NOT queued`.
+
+`src/base_health/merge_group.rs` judges the base from merge groups rather
+than from main or its tip: `actions/runs?event=merge_group` (one page,
+distinct `gh-readonly-queue/<base>/` heads, at most six), each head's check
+runs (stopping once every required context passed in its newest verdict),
+`compare/<base>...<head>` merge-commit subjects for the pull-request sets of
+groups in a failing streak only, and the poisoned check's first failure
+annotation that is not GitHub's generic `Process completed with exit code`
+line. Poisoned = at least two consecutive failures of one required context
+(cancelled or running checks neither break nor extend a streak) whose
+pull-request sets differ and share no pull request; stale after two hours;
+cleared by the next pass. `[base_health] merge_group_hold` (`off` / `dry-run`
+default on a merge-queue base / `on`) and `auto_jump` are read with the
+ejection guards from the base's `.shipyard/config.toml`
+(`EjectionGuards::base_poison`); a typo falls back to dry-run and off.
+`src/app/merge_steward_cmd/base_poison.rs` holds admission at the top of
+`enqueue_pull_request_with_recovery` and runs the fast-track (review hooks
+read from the machine-global layer only, both keys in `MACHINE_ONLY_KEYS`;
+receipts in `<state>/base-health/fast-track.jsonl`; CI via
+`queue_drain::prioritize_named_fix` with the approval context excused). The
+fast-track mutates only under `merge_group_hold = "on"`.
 
 ### The endpoint that lies by omission
 

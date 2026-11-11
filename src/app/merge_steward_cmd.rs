@@ -169,6 +169,11 @@ struct RepoReport {
     /// ranking ([`dwell_pass`]). Absent when the repository was not observed.
     #[serde(skip_serializing_if = "Option::is_none")]
     dwell: Option<dwell_pass::DwellRepoReport>,
+    /// The merge groups' verdict on the base, and what the hold and the fix
+    /// fast-track did this pass ([`base_poison`]). Absent when the base does
+    /// not ask for it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_poison: Option<Value>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -454,6 +459,9 @@ struct MutationApplyContext<'a> {
     changed_files: std::cell::RefCell<generated_paths::PassCache>,
     /// The base's ejection guards ([`crate::merge_steward::EjectionGuards`]).
     ejection_guards: crate::merge_steward::EjectionGuards,
+    /// This pass's merge-group reading, when the base asks for one. See
+    /// `base_poison`.
+    base_poison: Option<&'a base_poison::RepoPoison>,
 }
 
 /// Exact-head approval gate reads made during one pass, by PR number.
@@ -1690,6 +1698,7 @@ fn deferred_rate_limit_repo_report(
     ledger: &StewardLedger,
 ) -> RepoReport {
     RepoReport {
+        base_poison: None,
         rollup_reconciliation: Vec::new(),
         uncertain_mutations: Vec::new(),
         repo: repo.to_owned(),
@@ -1718,6 +1727,7 @@ fn unreadable_repo_report(
     error: String,
 ) -> RepoReport {
     RepoReport {
+        base_poison: None,
         rollup_reconciliation: Vec::new(),
         uncertain_mutations: Vec::new(),
         api_calls: None,
@@ -1796,6 +1806,7 @@ fn append_unmatched_recovery_errors(
             .find(|pending| pending.repo == repo)
             .map_or_else(|| default_base.to_owned(), |pending| pending.base.clone());
         reports.push(RepoReport {
+            base_poison: None,
             rollup_reconciliation: Vec::new(),
             uncertain_mutations: Vec::new(),
             api_calls: None,
@@ -1834,6 +1845,7 @@ fn persist_final_ledger(
         report.errors.push(message);
     } else {
         reports.push(RepoReport {
+            base_poison: None,
             rollup_reconciliation: Vec::new(),
             uncertain_mutations: Vec::new(),
             api_calls: None,
@@ -1961,6 +1973,33 @@ fn acquire_ledger_lock(path: &Path) -> Result<crate::file_lock::LockedFile, CliF
     })
 }
 
+mod base_poison;
+
+/// The required contexts of `base`, for a caller outside the steward that
+/// judges merge groups ([`crate::base_health::merge_group`]).
+pub(super) fn required_contexts(
+    actions: &GitHubActions,
+    repo: &str,
+    base: &str,
+) -> Result<Vec<String>, String> {
+    let mut contexts = observation::required_checks(actions, repo, base)?
+        .into_iter()
+        .map(|check| check.context)
+        .collect::<Vec<_>>();
+    contexts.sort();
+    contexts.dedup();
+    Ok(contexts)
+}
+
+/// Named fixes for poisoned `contexts` ([`base_poison::named_fixes`]).
+pub(super) fn named_fixes(
+    run_gh: &dyn Fn(&[String]) -> Result<String, String>,
+    repo: &str,
+    base: &str,
+    contexts: &[String],
+) -> (BTreeMap<u64, Vec<String>>, Option<String>) {
+    base_poison::named_fixes(run_gh, repo, base, contexts, Utc::now())
+}
 mod blocked_on;
 mod cancellation;
 mod cancellation_recovery;

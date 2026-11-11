@@ -207,6 +207,23 @@ pub fn doom_reason(
     pr: &DrainPullRequest,
     required: &[RequiredCheck],
 ) -> Option<DoomReason> {
+    doom_reason_excusing(run_id, run_head, pr, required, &[])
+}
+
+/// [`doom_reason`], not counting a failure of any context in `excused`.
+///
+/// A named fix for a poisoned base is excused its approval context: before
+/// review that context is red on every head, and holding the fix's CI until
+/// a reviewer reaches it is exactly the wait a poisoned base cannot afford.
+/// The approval is still required to enqueue it.
+#[must_use]
+pub fn doom_reason_excusing(
+    run_id: Option<u64>,
+    run_head: &str,
+    pr: &DrainPullRequest,
+    required: &[RequiredCheck],
+    excused: &[String],
+) -> Option<DoomReason> {
     if is_full_sha(&pr.pr.head_sha) && !pr.pr.head_sha.eq_ignore_ascii_case(run_head) {
         return Some(DoomReason::SupersededHead {
             current_head: pr.pr.head_sha.clone(),
@@ -218,7 +235,12 @@ pub fn doom_reason(
             merge_state: pr.pr.merge_state.clone(),
         });
     }
-    let contexts = failed_required_contexts(&pr.pr.checks, required, run_id);
+    let counted = required
+        .iter()
+        .filter(|rule| !excused.contains(&rule.context))
+        .cloned()
+        .collect::<Vec<_>>();
+    let contexts = failed_required_contexts(&pr.pr.checks, &counted, run_id);
     (!contexts.is_empty()).then_some(DoomReason::RequiredCheckFailed { contexts })
 }
 
@@ -400,6 +422,20 @@ pub fn plan_prioritize(
     prs: &[DrainPullRequest],
     required: &[RequiredCheck],
 ) -> PrioritizePlan {
+    plan_prioritize_excusing(target, runs, prs, required, &[])
+}
+
+/// [`plan_prioritize`], with the target's failures of `excused` contexts not
+/// counted as doom ([`doom_reason_excusing`]). Only the target is excused:
+/// whether another pull request's runs yield is unchanged.
+#[must_use]
+pub fn plan_prioritize_excusing(
+    target: u64,
+    runs: &[DrainRun],
+    prs: &[DrainPullRequest],
+    required: &[RequiredCheck],
+    excused: &[String],
+) -> PrioritizePlan {
     let mut plan = PrioritizePlan {
         pr_number: target,
         head_sha: None,
@@ -421,7 +457,7 @@ pub fn plan_prioritize(
         plan.refusal = Some(PrioritizeRefusal::InMergeQueue);
         return plan;
     }
-    if let Some(reason) = doom_reason(None, &pr.pr.head_sha, pr, required) {
+    if let Some(reason) = doom_reason_excusing(None, &pr.pr.head_sha, pr, required, excused) {
         plan.refusal = Some(PrioritizeRefusal::Doomed { reason });
         return plan;
     }
@@ -580,28 +616,26 @@ pub fn unblocking_candidates(
     red_contexts: &[String],
     required: &[RequiredCheck],
 ) -> Vec<UnblockCandidate> {
+    unblocking_candidates_excusing(prs, red_contexts, required, &[])
+}
+
+/// [`unblocking_candidates`], not counting a candidate's failures of the
+/// `excused` contexts against it ([`doom_reason_excusing`]).
+#[must_use]
+pub fn unblocking_candidates_excusing(
+    prs: &[DrainPullRequest],
+    red_contexts: &[String],
+    required: &[RequiredCheck],
+    excused: &[String],
+) -> Vec<UnblockCandidate> {
     let mut out = Vec::new();
     for pr in prs {
-        if pr.pr.draft || doom_reason(None, &pr.pr.head_sha, pr, required).is_some() {
+        if pr.pr.draft
+            || doom_reason_excusing(None, &pr.pr.head_sha, pr, required, excused).is_some()
+        {
             continue;
         }
-        let mut evidence = Vec::new();
-        if pr
-            .pr
-            .labels
-            .iter()
-            .any(|label| label.eq_ignore_ascii_case(UNBLOCK_LABEL))
-        {
-            evidence.push(format!("label `{UNBLOCK_LABEL}`"));
-        }
-        let text = format!("{}\n{}", pr.title, pr.body).to_ascii_lowercase();
-        if has_fix_word(&text) {
-            for context in red_contexts {
-                if contains_bounded(&text, &context.to_ascii_lowercase()) {
-                    evidence.push(format!("mentions red required check `{context}`"));
-                }
-            }
-        }
+        let evidence = fix_evidence(&pr.title, &pr.body, &pr.pr.labels, red_contexts);
         if !evidence.is_empty() {
             out.push(UnblockCandidate {
                 pr_number: pr.pr.number,
@@ -610,6 +644,34 @@ pub fn unblocking_candidates(
         }
     }
     out
+}
+
+/// Why a pull request reads as the fix for one of `red_contexts`: it carries
+/// [`UNBLOCK_LABEL`], or its title or description names a red context next
+/// to a fix word. Empty when it does not.
+#[must_use]
+pub fn fix_evidence(
+    title: &str,
+    body: &str,
+    labels: &[String],
+    red_contexts: &[String],
+) -> Vec<String> {
+    let mut evidence = Vec::new();
+    if labels
+        .iter()
+        .any(|label| label.eq_ignore_ascii_case(UNBLOCK_LABEL))
+    {
+        evidence.push(format!("label `{UNBLOCK_LABEL}`"));
+    }
+    let text = format!("{title}\n{body}").to_ascii_lowercase();
+    if has_fix_word(&text) {
+        for context in red_contexts {
+            if contains_bounded(&text, &context.to_ascii_lowercase()) {
+                evidence.push(format!("mentions red required check `{context}`"));
+            }
+        }
+    }
+    evidence
 }
 
 fn has_fix_word(text: &str) -> bool {

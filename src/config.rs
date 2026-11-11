@@ -17,6 +17,8 @@ pub type ConfigResult<T> = Result<T, ConfigLoadError>;
 /// overlay may set them: a branch that could would run its own code on the
 /// controller. See [`LoadedConfig::refuse_repository_controlled`].
 pub const MACHINE_ONLY_KEYS: &[&str] = &[
+    "base_health.fix_review_kick",
+    "base_health.fix_review_priority_file",
     "github.auth",
     "host_class",
     "pr_watch.digest.command",

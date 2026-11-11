@@ -714,6 +714,9 @@ pub(super) enum Command {
         /// Exact OWNER/REPO. Defaults to the `origin` remote.
         #[arg(long, value_name = "OWNER/REPO")]
         repo: Option<String>,
+        /// Base branch whose merge groups are also read for poison.
+        #[arg(long, default_value = "main")]
+        base: String,
         /// Detector workflow publishing the signal. Defaults to
         /// `base_health.workflow`, else `main-health-detector.yml`.
         #[arg(long, value_name = "FILE")]
