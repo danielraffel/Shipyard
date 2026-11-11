@@ -385,7 +385,9 @@ pub(super) struct StatusHistory {
     heads: BTreeMap<String, Vec<Value>>,
 }
 
-const HISTORY_SCHEMA: u64 = 1;
+/// 2: rows keep `description`, which `parse_rest_status` reads to tell a
+/// head awaiting review from a refused one; a schema-1 file lacks it.
+const HISTORY_SCHEMA: u64 = 2;
 
 /// A write that dies between creating its temp file and renaming it leaves
 /// `<file>.json.<pid>.tmp` behind. Remove those older than a pass could take,
@@ -439,6 +441,7 @@ fn trim_row(row: &Value) -> Value {
         "target_url",
         "created_at",
         "updated_at",
+        "description",
     ] {
         if let Some(value) = row.get(field) {
             kept.insert(field.to_owned(), value.clone());
@@ -534,7 +537,8 @@ mod tests {
             "id": id, "context": context, "state": state, "target_url": null,
             "created_at": at, "updated_at": at,
             "creator": {"login": "github-actions[bot]", "id": 41_898_282},
-            "description": "dropped when stored"
+            "description": "kept when stored",
+            "url": "dropped when stored"
         })
     }
 
@@ -637,9 +641,11 @@ mod tests {
         store.replace_and_save(BTreeMap::from([("a".to_owned(), vec![row.clone()])]));
         let reloaded = StatusHistory::load(&path, "o/r");
         let kept = reloaded.get("a").expect("kept");
-        assert!(
-            kept[0].get("description").is_none(),
-            "unread fields are dropped"
+        assert!(kept[0].get("url").is_none(), "unread fields are dropped");
+        assert_eq!(
+            kept[0].get("description").and_then(Value::as_str),
+            Some("kept when stored"),
+            "parse_rest_status reads the description"
         );
         assert_eq!(latest_status_keys(kept), latest_status_keys(&[row]));
         assert!(StatusHistory::load(&path, "o/other").get("a").is_none());

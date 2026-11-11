@@ -361,6 +361,13 @@ Per repository, `blocked_summary` holds `counts` (rows per token) and
 age_minutes}`. `admitted`, `queued`, `ready` and `draft` rows are counted but
 not listed as blocked.
 
+A row may also carry `superseded` (shadow mode): deterministic evidence that
+its change already landed another way (`contained`, `tree_equal`, `named_by`
+or `label_successor`), with the successor, the base SHA, the paths and
+blobs, and `closeable`. Merged and queue-landing pull requests are never
+judged. It never changes `blocked_on` or `next_action`, and Shipyard does not
+close anything. See [superseded-close.md](superseded-close.md).
+
 | Token | Meaning | Who moves it |
 |---|---|---|
 | `no_verdict` | Green, and no reviewer verdict names this head: "awaiting the standing reviewer; nothing for the author to do" | reviewer |
