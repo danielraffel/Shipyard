@@ -4704,3 +4704,10 @@ existing shared deadline and retry budget.
 `ServerAliveCountMax=10` appended to `GIT_SSH_COMMAND` or `core.sshCommand`
 (extended, never replaced), so a long pre-push hook does not drop the
 connection. HTTPS remotes are unaffected.
+
+### Carried-commit overlap is judged by verdict, never by ancestry
+
+When two PRs share commits, the steward clears the earlier PR's overlap only
+while the later PR's listed head is approved with no HOLD, or once the shared
+commits are on the base. A later PR whose head merely contains the earlier
+head gets no shortcut: ancestry cannot say which PR introduced a shared commit.
