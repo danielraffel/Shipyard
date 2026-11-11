@@ -57,6 +57,10 @@ pub(super) struct Stall {
     /// ([`super::next_action`]). Filled by [`annotate`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_action: Option<super::next_action::NextAction>,
+    /// Shadow: deterministic evidence that this change already landed
+    /// another way ([`super::superseded`]). Never changes `blocked_on`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub superseded: Option<super::superseded::Evidence>,
 }
 
 /// The HOLD behind a `held` token.
@@ -659,6 +663,7 @@ fn approval_blocked(blocker: &ApprovalBlocker, green_since: Option<String>) -> (
             blocked_detail: detail,
             held_by,
             next_action: None,
+            superseded: None,
         },
         hint,
     )
@@ -788,6 +793,7 @@ fn dated(
             blocked_detail: detail,
             held_by: None,
             next_action: None,
+            superseded: None,
         },
         hint,
     )

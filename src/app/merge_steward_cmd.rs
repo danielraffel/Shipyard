@@ -231,6 +231,10 @@ struct StewardLedger {
     /// `dwell_pass`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     dwell: BTreeMap<String, crate::merge_steward::dwell::DwellRepoState>,
+    /// The last superseded check of each open head, keyed `repo#pr`
+    /// (lowercase repository). See `superseded`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    superseded_checks: BTreeMap<String, superseded::Check>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2021,6 +2025,7 @@ mod queue_priority_recovery;
 pub(super) mod read_probe;
 mod render;
 mod resume_record;
+mod superseded;
 mod terminal_handoff;
 pub(super) mod train;
 mod unapproved_admission;

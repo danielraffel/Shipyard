@@ -244,6 +244,7 @@ mod next_action;
 mod observation;
 #[cfg(unix)]
 mod recovery;
+mod superseded;
 #[cfg(unix)]
 mod train_off;
 #[cfg(unix)]

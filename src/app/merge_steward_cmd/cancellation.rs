@@ -671,6 +671,11 @@ pub(super) fn apply_pr_plans_with_poison(
         !args.apply,
         &mut reports,
     );
+    // Apply passes only: they persist the ledger, so the per-head cache holds
+    // and a blocked backlog costs nothing between rechecks.
+    if args.apply {
+        super::superseded::annotate(actions, observation, ledger, &mut reports, Utc::now());
+    }
     (reports, unhealthy, listing)
 }
 
