@@ -26,6 +26,11 @@
 //!   keeps P admissible when P's own commit reached Q through a chain. A pull
 //!   request that merges another pull request's branch still has those
 //!   commits in its own diff and is still caught.
+//! * Never excused by ancestry alone: a Q that contains P's whole head (Q
+//!   built on P while targeting the base, or Q merged P back in) is judged
+//!   like any other Q. Head ancestry cannot say which pull request introduced
+//!   a shared commit, so the commits both ranges hold clear P only while Q's
+//!   listed head is approved, without a HOLD, or once they are on the base.
 //! * Q merged P's branch without being stacked on it: a shared commit counts
 //!   against P only when it is on Q's first-parent chain (`Q.base..Q.head`
 //!   walked through first parents) or is not on P's own first-parent chain
@@ -1455,6 +1460,9 @@ fn rest_commits(run_gh: RunGh<'_>, repo: &str, number: u64) -> Result<BTreeSet<S
 }
 
 mod landed;
+
+#[cfg(test)]
+mod stacked_verdict_tests;
 
 #[cfg(test)]
 mod tests;

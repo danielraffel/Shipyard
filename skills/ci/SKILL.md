@@ -4722,3 +4722,10 @@ Persistent failures still refuse the repository observation. Authentication,
 authorization, rate-limit, and malformed payload failures remain fail-closed;
 these retries never repeat admission mutations. Deadline-bound reads keep their
 existing shared deadline and retry budget.
+
+### Carried-commit overlap is judged by verdict, never by ancestry
+
+When two PRs share commits, the steward clears the earlier PR's overlap only
+while the later PR's listed head is approved with no HOLD, or once the shared
+commits are on the base. A later PR whose head merely contains the earlier
+head gets no shortcut: ancestry cannot say which PR introduced a shared commit.
