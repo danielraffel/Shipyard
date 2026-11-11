@@ -29,8 +29,15 @@ spend the App's REST budget (a shared 15000/hour) several times per PR per run.
 
 ## Install (m3)
 
-Copy the three scripts to `~/.local/share/shipyard-steward/pass-runner/`. They run
-from launchd jobs `com.danielraffel.fleet-pass.reviewer` and
+Install the tracked runner and all of its sibling helpers as one deployment unit:
+
+```sh
+tools/fleet-pass/install-pass-runner.sh
+```
+
+The installer targets `~/.local/share/shipyard-steward/pass-runner/` by default
+(`FLEET_PASS_INSTALL_DIR` overrides it), and is the deployment path used by the
+launchd jobs `com.danielraffel.fleet-pass.reviewer` and
 `com.danielraffel.fleet-pass.repair`. Paths are overridable with
 `FLEET_PASS_STATE`, `FLEET_PASS_LOGDIR`, `FLEET_PASS_ADD_DIR`,
 `FLEET_PASS_WORKTREES_DIR` and `FLEET_PASS_REVIEWER_SIGNERS`.
