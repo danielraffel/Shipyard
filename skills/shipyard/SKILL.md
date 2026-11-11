@@ -3766,7 +3766,12 @@ The watcher resolves the repository default branch; use `--fleet-base` or
 
 Use `shipyard runner steward` for agent-neutral merge-on-green reconciliation.
 It observes by default; `--apply` enables exact-head guarded queue admission,
-reruns, and narrowly policy-scoped capacity-preemption mutations. Client-side
+reruns, and narrowly policy-scoped capacity-preemption mutations. `--infra-rerun`
+(default `enforce` under `--apply`) re-runs a required check that failed for an
+infra reason (per `shipyard diagnose`) on any open pull request, never
+`review-verdict`, at most twice per head and check with a 20-minute backoff, and
+reports "infra outage suspected" in `infra_rerun.findings`; see
+[references/merge-steward.md](references/merge-steward.md#infra-reruns---infra-rerun-every-open-pull-request). Client-side
 REST direct merge is refused because GitHub cannot atomically bind both complete
 check materialization and the validated base revision; use a server-owned merge
 queue or the server-enforced exact-head merge below. A base with no merge queue (GitHub offers
