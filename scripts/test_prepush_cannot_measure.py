@@ -121,10 +121,10 @@ class PrePushBlocksUnmeasurableGateTest(unittest.TestCase):
                     self.assertIn("COULD NOT RUN", proc.stderr)
 
     def test_pre_versioning_skip_is_loud(self) -> None:
-        """The documented no-op is preserved, but can't be read as a pass."""
+        """A pre-versioning checkout refuses instead of being read as a pass."""
         source = PREPUSH.read_text(encoding="utf-8")
-        self.assertIn("SKIPPED", source)
-        self.assertIn("This is a SKIP, not a pass.", source)
+        self.assertIn("refusing push", source)
+        self.assertIn("this is a refusal, not a pass", source)
 
 
 if __name__ == "__main__":

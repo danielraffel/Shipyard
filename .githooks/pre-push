@@ -4,8 +4,9 @@ set -u
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
 cd "$ROOT" || exit 0
 if [ "${SHIPYARD_SKIP_PREPUSH:-0}" = "1" ]; then
-    echo "[pre-push] SHIPYARD_SKIP_PREPUSH=1 — skipping gates." >&2
-    exit 0
+    echo "[pre-push] refusing an ungated push: SHIPYARD_SKIP_PREPUSH=1." >&2
+    echo "[pre-push] run the repository gates, or use the sanctioned shipyard pr path." >&2
+    exit 1
 fi
 # Never let a rustup proxy invoked by this hook download a toolchain: a
 # missing pin is refused immediately below instead of stalling the push.
@@ -21,10 +22,10 @@ missing_gate_inputs=""
 [ -f "$SSC" ] || missing_gate_inputs="$missing_gate_inputs $SSC"
 [ -f "$CFG" ] || missing_gate_inputs="$missing_gate_inputs $CFG"
 if [ -n "$missing_gate_inputs" ]; then
-    echo "[pre-push] SKIPPED — version/skill gates did not run: pre-versioning checkout." >&2
+    echo "[pre-push] refusing push — version/skill gates could not run: pre-versioning checkout." >&2
     echo "[pre-push]   Missing:$missing_gate_inputs" >&2
-    echo "[pre-push]   Nothing was verified. This is a SKIP, not a pass." >&2
-    exit 0
+    echo "[pre-push]   Nothing was verified; this is a refusal, not a pass." >&2
+    exit 1
 fi
 gate_could_not_run() {
     local name="$1" status="$2"
@@ -131,9 +132,9 @@ if [ "$blocking_fail" != "0" ]; then
     echo "[pre-push] blocking Rust/source gates failed — push refused." >&2
     exit 1
 fi
-if [ "${SHIPYARD_ENFORCE_PREPUSH:-0}" = "1" ]; then
-    echo "[pre-push] SHIPYARD_ENFORCE_PREPUSH=1 — blocking push due to gate failures above." >&2
+if [ "${SHIPYARD_ENFORCE_PREPUSH:-1}" != "0" ]; then
+    echo "[pre-push] blocking push due to gate failures above." >&2
     exit 1
 fi
-echo "[pre-push] warnings above are advisory (export SHIPYARD_ENFORCE_PREPUSH=1 to block)." >&2
+echo "[pre-push] warnings above are advisory because SHIPYARD_ENFORCE_PREPUSH=0 was explicitly set." >&2
 exit 0

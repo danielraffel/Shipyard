@@ -779,6 +779,7 @@ exit 2
             head: &head,
         },
         &lane_policy,
+        &"0".repeat(40),
         None,
     )
     .expect("the exact live PR worktree remains supported");
