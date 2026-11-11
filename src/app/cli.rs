@@ -3239,7 +3239,7 @@ pub(super) enum RunnerCommand {
         /// as `shadow`.
         #[arg(
             long = "infra-rerun",
-            default_value = "shadow",
+            default_value = "enforce",
             value_parser = ["off", "shadow", "enforce"]
         )]
         infra_rerun: String,

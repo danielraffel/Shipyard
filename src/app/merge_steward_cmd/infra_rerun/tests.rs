@@ -228,7 +228,10 @@ fn next_budget_is_one_rerun_then_one_after_backoff_then_capped() {
         ..Record::default()
     };
     // The re-run's new attempt has not shown: the old red is still observed.
-    assert_eq!(next(Some(&record), 1, T0 + 60, Mode::Enforce), Next::Pending);
+    assert_eq!(
+        next(Some(&record), 1, T0 + 60, Mode::Enforce),
+        Next::Pending
+    );
     // The re-run failed again inside the backoff: wait.
     assert_eq!(
         next(Some(&record), 2, T0 + 5 * 60, Mode::Enforce),
@@ -236,7 +239,10 @@ fn next_budget_is_one_rerun_then_one_after_backoff_then_capped() {
             remaining_secs: BACKOFF_SECS - 5 * 60
         }
     );
-    assert_eq!(next(Some(&record), 2, T0 + BACKOFF_SECS, Mode::Enforce), Next::Diagnose);
+    assert_eq!(
+        next(Some(&record), 2, T0 + BACKOFF_SECS, Mode::Enforce),
+        Next::Diagnose
+    );
     record.reruns = 2;
     record.judged_check_id = Some(2);
     // A third red after two re-runs is classified once (so a real failure is
@@ -276,7 +282,10 @@ fn next_settles_a_declined_red_without_rereading_it() {
         verdict: "declined".to_owned(),
         ..Record::default()
     };
-    assert_eq!(next(Some(&record), 7, T0, Mode::Enforce), Next::Settled("declined".to_owned()));
+    assert_eq!(
+        next(Some(&record), 7, T0, Mode::Enforce),
+        Next::Settled("declined".to_owned())
+    );
     // A new red on the same head (someone re-ran it) is judged afresh.
     assert_eq!(next(Some(&record), 8, T0, Mode::Enforce), Next::Diagnose);
 }
@@ -289,8 +298,14 @@ fn next_retries_a_refused_rerun_only_after_the_backoff() {
         last_error_epoch: Some(T0),
         ..Record::default()
     };
-    assert!(matches!(next(Some(&record), 7, T0 + 60, Mode::Enforce), Next::Wait { .. }));
-    assert_eq!(next(Some(&record), 7, T0 + BACKOFF_SECS, Mode::Enforce), Next::Diagnose);
+    assert!(matches!(
+        next(Some(&record), 7, T0 + 60, Mode::Enforce),
+        Next::Wait { .. }
+    ));
+    assert_eq!(
+        next(Some(&record), 7, T0 + BACKOFF_SECS, Mode::Enforce),
+        Next::Diagnose
+    );
     let settled = Record {
         errors: MAX_ERRORS,
         ..record
@@ -319,7 +334,11 @@ fn review_verdict_is_never_a_candidate() {
     assert_eq!(found[0].check, "drift-fast");
     // Also when the steward is configured with another approval context.
     let found = candidates(&observation, &checks, "approval", &[]);
-    assert!(found.iter().all(|candidate| candidate.check != "review-verdict"));
+    assert!(
+        found
+            .iter()
+            .all(|candidate| candidate.check != "review-verdict")
+    );
 }
 
 #[test]
@@ -329,11 +348,23 @@ fn candidates_skip_unrequired_cancelled_opted_out_and_superseded() {
     let observation = observation(vec![
         pr(1, vec![check("lint", "FAILURE", 10, 100)], &[]),
         pr(2, vec![cancelled], &[]),
-        pr(3, vec![check("macos", "FAILURE", 13, 130)], &["shipyard:no-auto-merge"]),
+        pr(
+            3,
+            vec![check("macos", "FAILURE", 13, 130)],
+            &["shipyard:no-auto-merge"],
+        ),
         pr(4, vec![check("macos", "FAILURE", 14, 140)], &["superseded"]),
         pr(5, vec![check("macos", "FAILURE", 15, 150)], &[]),
-        pr(6, vec![check("macos", "FAILURE", 16, 160)], &["owner-decision"]),
-        pr(7, vec![check("macos", "FAILURE", 17, 170)], &["PARKED/linux"]),
+        pr(
+            6,
+            vec![check("macos", "FAILURE", 16, 160)],
+            &["owner-decision"],
+        ),
+        pr(
+            7,
+            vec![check("macos", "FAILURE", 17, 170)],
+            &["PARKED/linux"],
+        ),
     ]);
     let found = candidates(
         &observation,
@@ -363,9 +394,19 @@ fn candidates_use_the_newest_attempt_of_a_check() {
 
 #[test]
 fn judge_reruns_a_failed_install_dependencies_step() {
-    let jobs = [job(100, "drift-fast", 10, 1, HEAD, "Install Linux dependencies")];
+    let jobs = [job(
+        100,
+        "drift-fast",
+        10,
+        1,
+        HEAD,
+        "Install Linux dependencies",
+    )];
     let (doc, jobs) = diagnosed(&jobs, &[]);
-    assert_eq!(judge_run(10, HEAD, &doc, &jobs, "review-verdict", &["drift-fast"]), RunVerdict::Rerun);
+    assert_eq!(
+        judge_run(10, HEAD, &doc, &jobs, "review-verdict", &["drift-fast"]),
+        RunVerdict::Rerun
+    );
 }
 
 #[test]
@@ -416,9 +457,19 @@ fn judge_declines_a_run_in_which_review_verdict_failed() {
 
 #[test]
 fn judge_caps_on_githubs_own_attempt_count() {
-    let jobs = [job(100, "drift-fast", 10, 3, HEAD, "Install Linux dependencies")];
+    let jobs = [job(
+        100,
+        "drift-fast",
+        10,
+        3,
+        HEAD,
+        "Install Linux dependencies",
+    )];
     let (doc, jobs) = diagnosed(&jobs, &[]);
-    assert_eq!(judge_run(10, HEAD, &doc, &jobs, "review-verdict", &["drift-fast"]), RunVerdict::Capped);
+    assert_eq!(
+        judge_run(10, HEAD, &doc, &jobs, "review-verdict", &["drift-fast"]),
+        RunVerdict::Capped
+    );
 }
 
 #[test]
@@ -431,9 +482,19 @@ fn judge_waits_for_a_run_still_in_flight_and_refuses_another_head() {
         running,
     ];
     let (doc, jobs) = diagnosed(&jobs, &[]);
-    assert_eq!(judge_run(10, HEAD, &doc, &jobs, "review-verdict", &["drift-fast"]), RunVerdict::InFlight);
+    assert_eq!(
+        judge_run(10, HEAD, &doc, &jobs, "review-verdict", &["drift-fast"]),
+        RunVerdict::InFlight
+    );
 
-    let jobs = [job(100, "drift-fast", 10, 1, &head(9), "Install Linux dependencies")];
+    let jobs = [job(
+        100,
+        "drift-fast",
+        10,
+        1,
+        &head(9),
+        "Install Linux dependencies",
+    )];
     let (doc, jobs) = diagnosed(&jobs, &[]);
     assert!(matches!(
         judge_run(10, HEAD, &doc, &jobs, "review-verdict", &["drift-fast"]),
@@ -452,7 +513,11 @@ fn incident_reruns_each_pr_once_and_reports_one_outage() {
     let mut prs = Vec::new();
     for number in 1..=4 {
         let run = 1000 + number;
-        prs.push(pr(number, vec![check("drift-fast", "FAILURE", run, run * 10)], &[]));
+        prs.push(pr(
+            number,
+            vec![check("drift-fast", "FAILURE", run, run * 10)],
+            &[],
+        ));
         acts.set(
             run,
             vec![job(
@@ -494,7 +559,11 @@ fn incident_reruns_each_pr_once_and_reports_one_outage() {
     // The re-runs passed: the finding ends.
     let healed = observation_of((1..=4).map(|number| {
         let run = 1000 + number;
-        pr(number, vec![check("drift-fast", "SUCCESS", run, run * 10 + 1)], &[])
+        pr(
+            number,
+            vec![check("drift-fast", "SUCCESS", run, run * 10 + 1)],
+            &[],
+        )
     }));
     let status = run_sweep(&healed, Mode::Enforce, T0 + 900, &mut ledger, &acts);
     assert!(status.findings.is_empty());
@@ -507,7 +576,11 @@ fn the_cap_holds_across_passes() {
     let acts = FakeActs::default();
     let mut ledger = StewardLedger::default();
     let observe = |check_id: u64| {
-        observation(vec![pr(1, vec![check("drift-fast", "FAILURE", 10, check_id)], &[])])
+        observation(vec![pr(
+            1,
+            vec![check("drift-fast", "FAILURE", 10, check_id)],
+            &[],
+        )])
     };
     let attempt = |check_id: u64, attempt: u64| {
         acts.set(
@@ -533,7 +606,13 @@ fn the_cap_holds_across_passes() {
     assert_eq!(acts.diagnosed.borrow().len(), 1);
 
     // After the backoff: the second and last re-run.
-    let status = run_sweep(&observe(101), Mode::Enforce, T0 + BACKOFF_SECS, &mut ledger, &acts);
+    let status = run_sweep(
+        &observe(101),
+        Mode::Enforce,
+        T0 + BACKOFF_SECS,
+        &mut ledger,
+        &acts,
+    );
     assert_eq!(actions(&status), vec!["rerun"]);
 
     // It failed again: capped, reported, and never re-run again.
@@ -559,9 +638,20 @@ fn the_cap_survives_a_lost_ledger() {
     let acts = FakeActs::default();
     acts.set(
         10,
-        vec![job(102, "drift-fast", 10, 3, &head(1), "Install Linux dependencies")],
+        vec![job(
+            102,
+            "drift-fast",
+            10,
+            3,
+            &head(1),
+            "Install Linux dependencies",
+        )],
     );
-    let observation = observation(vec![pr(1, vec![check("drift-fast", "FAILURE", 10, 102)], &[])]);
+    let observation = observation(vec![pr(
+        1,
+        vec![check("drift-fast", "FAILURE", 10, 102)],
+        &[],
+    )]);
     let mut ledger = StewardLedger::default();
     let status = run_sweep(&observation, Mode::Enforce, T0, &mut ledger, &acts);
     assert_eq!(actions(&status), vec!["capped"]);
@@ -571,17 +661,30 @@ fn the_cap_survives_a_lost_ledger() {
 #[test]
 fn a_real_failure_is_declined_once_and_never_reread() {
     let acts = FakeActs::default();
-    acts.set(10, vec![job(100, "drift-fast", 10, 1, &head(1), "Run drift tests")]);
+    acts.set(
+        10,
+        vec![job(100, "drift-fast", 10, 1, &head(1), "Run drift tests")],
+    );
     acts.logs.borrow_mut().push((
         100,
         "2026-11-11T14:40:01.0000000Z The following tests FAILED:\n\
          2026-11-11T14:40:01.0000000Z \t 12 - census-drift (Failed)\n"
             .to_owned(),
     ));
-    let observation = observation(vec![pr(1, vec![check("drift-fast", "FAILURE", 10, 100)], &[])]);
+    let observation = observation(vec![pr(
+        1,
+        vec![check("drift-fast", "FAILURE", 10, 100)],
+        &[],
+    )]);
     let mut ledger = StewardLedger::default();
     for pass in 0..3 {
-        let status = run_sweep(&observation, Mode::Enforce, T0 + pass * 120, &mut ledger, &acts);
+        let status = run_sweep(
+            &observation,
+            Mode::Enforce,
+            T0 + pass * 120,
+            &mut ledger,
+            &acts,
+        );
         assert_eq!(actions(&status), vec!["declined"]);
         assert!(status.findings.is_empty());
     }
@@ -592,8 +695,22 @@ fn a_real_failure_is_declined_once_and_never_reread() {
 #[test]
 fn review_verdict_red_is_never_read_or_rerun() {
     let acts = FakeActs::default();
-    acts.set(10, vec![job(100, "review-verdict", 10, 1, &head(1), "Post review verdict")]);
-    let observation = observation(vec![pr(1, vec![check("review-verdict", "FAILURE", 10, 100)], &[])]);
+    acts.set(
+        10,
+        vec![job(
+            100,
+            "review-verdict",
+            10,
+            1,
+            &head(1),
+            "Post review verdict",
+        )],
+    );
+    let observation = observation(vec![pr(
+        1,
+        vec![check("review-verdict", "FAILURE", 10, 100)],
+        &[],
+    )]);
     let mut ledger = StewardLedger::default();
     let status = run_sweep(&observation, Mode::Enforce, T0, &mut ledger, &acts);
     assert!(status.outcomes.is_empty());
@@ -604,8 +721,22 @@ fn review_verdict_red_is_never_read_or_rerun() {
 #[test]
 fn shadow_reports_and_reruns_nothing() {
     let acts = FakeActs::default();
-    acts.set(10, vec![job(100, "drift-fast", 10, 1, &head(1), "Install Linux dependencies")]);
-    let observation = observation(vec![pr(1, vec![check("drift-fast", "FAILURE", 10, 100)], &[])]);
+    acts.set(
+        10,
+        vec![job(
+            100,
+            "drift-fast",
+            10,
+            1,
+            &head(1),
+            "Install Linux dependencies",
+        )],
+    );
+    let observation = observation(vec![pr(
+        1,
+        vec![check("drift-fast", "FAILURE", 10, 100)],
+        &[],
+    )]);
     let mut ledger = StewardLedger::default();
     let status = run_sweep(&observation, Mode::Shadow, T0, &mut ledger, &acts);
     assert_eq!(actions(&status), vec!["would_rerun"]);
@@ -621,8 +752,22 @@ fn a_refused_rerun_spends_no_budget_and_fails_the_pass() {
         refuse: true,
         ..FakeActs::default()
     };
-    acts.set(10, vec![job(100, "drift-fast", 10, 1, &head(1), "Install Linux dependencies")]);
-    let observation = observation(vec![pr(1, vec![check("drift-fast", "FAILURE", 10, 100)], &[])]);
+    acts.set(
+        10,
+        vec![job(
+            100,
+            "drift-fast",
+            10,
+            1,
+            &head(1),
+            "Install Linux dependencies",
+        )],
+    );
+    let observation = observation(vec![pr(
+        1,
+        vec![check("drift-fast", "FAILURE", 10, 100)],
+        &[],
+    )]);
     let mut ledger = StewardLedger::default();
     let (status, failed) = sweep(
         &Sweep {
@@ -646,15 +791,18 @@ fn a_refused_rerun_spends_no_budget_and_fails_the_pass() {
 #[test]
 fn records_of_closed_or_moved_heads_are_pruned() {
     let mut ledger = StewardLedger::default();
-    ledger
-        .infra_reruns
-        .insert(record_key("Owner/Repo", 1, &head(1), "drift-fast"), Record::default());
-    ledger
-        .infra_reruns
-        .insert(record_key("Owner/Repo", 2, &head(2), "drift-fast"), Record::default());
-    ledger
-        .infra_reruns
-        .insert(record_key("Other/Repo", 3, &head(3), "macos"), Record::default());
+    ledger.infra_reruns.insert(
+        record_key("Owner/Repo", 1, &head(1), "drift-fast"),
+        Record::default(),
+    );
+    ledger.infra_reruns.insert(
+        record_key("Owner/Repo", 2, &head(2), "drift-fast"),
+        Record::default(),
+    );
+    ledger.infra_reruns.insert(
+        record_key("Other/Repo", 3, &head(3), "macos"),
+        Record::default(),
+    );
     let observation = observation(vec![pr(1, Vec::new(), &[])]);
     let acts = FakeActs::default();
     run_sweep(&observation, Mode::Shadow, T0, &mut ledger, &acts);
@@ -671,7 +819,11 @@ fn the_diagnosis_budget_defers_the_rest_of_a_burst() {
     let count = u64::try_from(MAX_RUN_DIAGNOSES).unwrap() + 2;
     for number in 1..=count {
         let run = 1000 + number;
-        prs.push(pr(number, vec![check("drift-fast", "FAILURE", run, run * 10)], &[]));
+        prs.push(pr(
+            number,
+            vec![check("drift-fast", "FAILURE", run, run * 10)],
+            &[],
+        ));
         acts.set(
             run,
             vec![job(
@@ -687,11 +839,13 @@ fn the_diagnosis_budget_defers_the_rest_of_a_burst() {
     let observation = observation(prs);
     let mut ledger = StewardLedger::default();
     let status = run_sweep(&observation, Mode::Enforce, T0, &mut ledger, &acts);
-    let deferred = actions(&status).iter().filter(|action| **action == "deferred").count();
+    let deferred = actions(&status)
+        .iter()
+        .filter(|action| **action == "deferred")
+        .count();
     assert_eq!(deferred, 2);
     assert_eq!(acts.diagnosed.borrow().len(), MAX_RUN_DIAGNOSES);
 }
-
 
 #[test]
 fn judge_declines_when_a_non_required_job_failed_for_real_in_the_run() {
@@ -740,10 +894,24 @@ fn judge_declines_a_run_that_contains_an_approval_job_in_any_state() {
 
 #[test]
 fn judge_declines_a_candidate_it_did_not_diagnose() {
-    let jobs = [job(100, "drift-fast", 10, 1, HEAD, "Install Linux dependencies")];
+    let jobs = [job(
+        100,
+        "drift-fast",
+        10,
+        1,
+        HEAD,
+        "Install Linux dependencies",
+    )];
     let (doc, jobs) = diagnosed(&jobs, &[]);
     assert!(matches!(
-        judge_run(10, HEAD, &doc, &jobs, "review-verdict", &["drift-fast", "macos"]),
+        judge_run(
+            10,
+            HEAD,
+            &doc,
+            &jobs,
+            "review-verdict",
+            &["drift-fast", "macos"]
+        ),
         RunVerdict::Decline(_)
     ));
 }
@@ -753,11 +921,20 @@ fn judge_declines_a_candidate_it_did_not_diagnose() {
 #[test]
 fn unmanaged_prs_are_read_and_rerun() {
     let acts = FakeActs::default();
-    acts.rollups.borrow_mut().insert(
-        head(1),
-        vec![check("drift-fast", "failure", 10, 100)],
+    acts.rollups
+        .borrow_mut()
+        .insert(head(1), vec![check("drift-fast", "failure", 10, 100)]);
+    acts.set(
+        10,
+        vec![job(
+            100,
+            "drift-fast",
+            10,
+            1,
+            &head(1),
+            "Install Linux dependencies",
+        )],
     );
-    acts.set(10, vec![job(100, "drift-fast", 10, 1, &head(1), "Install Linux dependencies")]);
     let observation = observation(vec![pr(1, Vec::new(), &[]), {
         let mut draft = pr(2, Vec::new(), &[]);
         draft.fact.draft = true;
@@ -790,8 +967,22 @@ fn a_run_still_in_flight_in_the_census_costs_no_read() {
 #[test]
 fn shadow_then_enforce_still_reruns() {
     let acts = FakeActs::default();
-    acts.set(10, vec![job(100, "drift-fast", 10, 1, &head(1), "Install Linux dependencies")]);
-    let observation = observation(vec![pr(1, vec![check("drift-fast", "FAILURE", 10, 100)], &[])]);
+    acts.set(
+        10,
+        vec![job(
+            100,
+            "drift-fast",
+            10,
+            1,
+            &head(1),
+            "Install Linux dependencies",
+        )],
+    );
+    let observation = observation(vec![pr(
+        1,
+        vec![check("drift-fast", "FAILURE", 10, 100)],
+        &[],
+    )]);
     let mut ledger = StewardLedger::default();
     let status = run_sweep(&observation, Mode::Shadow, T0, &mut ledger, &acts);
     assert_eq!(actions(&status), vec!["would_rerun"]);
@@ -807,7 +998,10 @@ fn shadow_then_enforce_still_reruns() {
 #[test]
 fn a_real_failure_after_the_cap_is_not_an_outage() {
     let acts = FakeActs::default();
-    acts.set(10, vec![job(102, "drift-fast", 10, 3, &head(1), "Run drift tests")]);
+    acts.set(
+        10,
+        vec![job(102, "drift-fast", 10, 3, &head(1), "Run drift tests")],
+    );
     acts.logs.borrow_mut().push((
         102,
         "2026-11-11T14:40:01.0000000Z The following tests FAILED:\n\
@@ -828,8 +1022,18 @@ fn a_real_failure_after_the_cap_is_not_an_outage() {
             ..Record::default()
         },
     );
-    let observation = observation(vec![pr(1, vec![check("drift-fast", "FAILURE", 10, 102)], &[])]);
-    let status = run_sweep(&observation, Mode::Enforce, T0 + BACKOFF_SECS, &mut ledger, &acts);
+    let observation = observation(vec![pr(
+        1,
+        vec![check("drift-fast", "FAILURE", 10, 102)],
+        &[],
+    )]);
+    let status = run_sweep(
+        &observation,
+        Mode::Enforce,
+        T0 + BACKOFF_SECS,
+        &mut ledger,
+        &acts,
+    );
     assert_eq!(actions(&status), vec!["declined"]);
     assert!(status.findings.is_empty());
     assert!(acts.reran.borrow().is_empty());
@@ -913,7 +1117,10 @@ fn backtest_replay() {
             .into_iter()
             .flatten()
             .filter_map(|(id, notes)| {
-                Some((id.parse().ok()?, serde_json::from_value(notes.clone()).ok()?))
+                Some((
+                    id.parse().ok()?,
+                    serde_json::from_value(notes.clone()).ok()?,
+                ))
             })
             .collect();
         let doc = diagnose_gathered(&jobs, &logs, annotations, &with_approval);

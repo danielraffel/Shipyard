@@ -108,8 +108,12 @@ person notices. `--infra-rerun` (`off`, `shadow`, `enforce`; module
 - Known blind spot: a head can break a "non-content" step itself (a bad
   submodule pin breaks checkout, a changed lockfile breaks `Install …
   dependencies`). Such a red is re-run at most twice, then reported.
-- `shadow` reports `would_rerun` and writes nothing to GitHub; without
-  `--apply`, `enforce` reports as `shadow`.
+- `enforce` is the default. A 7-day back-test over the fleet's required
+  failures on pull-request heads (2026-11-04 to 11-11: 529 failures, 25
+  calls) found 22 of 23 verifiable calls passed on re-run or failed again as
+  infra at the same step (precision 0.957; the miss was a lost runner whose
+  re-run failed as infra at another step). `shadow` reports `would_rerun` and
+  writes nothing to GitHub; without `--apply`, `enforce` reports as `shadow`.
 
 Ownership is explicit. Before the steward may mutate a PR, the submitting
 agent writes an exact-head receipt and management label:
