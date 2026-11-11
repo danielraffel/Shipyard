@@ -58,6 +58,17 @@ def steward_rows(repo):
     return {}, {}
 
 
+def infra_outages(repo, rep):
+    """The steward's outage findings: a required check failing for an infra reason on
+    several PRs at one step, or past its re-run cap. One line per finding."""
+    out = []
+    for f in ((rep or {}).get("infra_rerun") or {}).get("findings") or []:
+        prs = ",".join(f"#{n}" for n in f.get("prs", []))
+        out.append(f"{repo} INFRA-OUTAGE-SUSPECTED {f.get('message', '')} prs={prs}"
+                   f" since={f.get('first_reported_at', '?')}{' capped' if f.get('capped') else ''}")
+    return out
+
+
 def main():
     now = datetime.datetime.now(datetime.timezone.utc)
     failed = False
@@ -111,6 +122,8 @@ def main():
                     print(f"{repo}#{n} {sha[:10]} GREEN-NO-VERDICT idle={int(idle)}m steward={why}")
                 elif (v == "HOLD" or not green) and idle > HELD_IDLE_MIN:
                     print(f"{repo}#{n} {sha[:10]} STALLED idle={int(idle)}m verdict={v or 'none'} steward={why} {detail}")
+            for line in infra_outages(repo, rep):
+                print(line)
             if rep.get("errors"):
                 print(f"{repo} STEWARD-ERRORS {json.dumps(rep.get('errors'))[:200]}")
         except RuntimeError as e:

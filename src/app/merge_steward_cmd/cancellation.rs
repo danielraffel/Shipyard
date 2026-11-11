@@ -260,8 +260,39 @@ pub(super) fn apply_repo_plan(
             )
         };
     super::native_arm::annotate_carried_refusals(&native_arm_status, &mut reports);
+    // Infra reruns act on every open pull request, owned or not. A dry run
+    // never writes, so it reports what an enforcing pass would re-run.
+    let infra_mode = match args.infra_rerun {
+        super::infra_rerun::Mode::Enforce if !args.apply => super::infra_rerun::Mode::Shadow,
+        mode => mode,
+    };
+    let mut infra_excluded = vec![args.opt_out_label.clone()];
+    infra_excluded.extend(args.provenance_blocking_labels.iter().cloned());
+    let (infra_rerun_status, infra_rerun_failed) = super::infra_rerun::sweep(
+        &super::infra_rerun::Sweep {
+            observation,
+            mode: infra_mode,
+            approval_context: &args.approval_context,
+            excluded_labels: &infra_excluded,
+            now_epoch: Utc::now().timestamp(),
+            deadline: args.pass_deadline,
+            ledger_path: args.apply.then_some(ledger_path),
+        },
+        ledger,
+        &super::infra_rerun::GitHubActs {
+            actions,
+            repo: &observation.repo,
+            required: observation
+                .required_checks
+                .iter()
+                .map(|check| check.context.clone())
+                .collect(),
+            deadline: args.pass_deadline,
+        },
+    );
     let mut unhealthy = (args.preempt_capacity && observation.preemption_error.is_some())
         || native_arm_failed
+        || infra_rerun_failed
         || pr_mutation_failed
         || recovery_witness_error.is_some()
         || terminal_handoff_reconcile_error.is_some()
@@ -365,6 +396,7 @@ pub(super) fn apply_repo_plan(
             rate_limit_deferred: None,
             exit_reasons: Vec::new(),
             dwell: Some(dwell_report),
+            infra_rerun: Some(infra_rerun_status),
             repo: observation.repo.clone(),
             base: args.base.clone(),
             allow_auto_merge: observation.allow_auto_merge,

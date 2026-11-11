@@ -3230,6 +3230,19 @@ pub(super) enum RunnerCommand {
         /// external timeout so the pass still prints its report. 0 disables.
         #[arg(long = "pass-budget-secs", default_value_t = 240)]
         pass_budget_secs: u64,
+        /// Re-run a required check that `shipyard diagnose` classifies as
+        /// infra (lost runner, checkout, `Install … dependencies`, package
+        /// mirror, GitHub 5xx) on any open pull request: once per head and
+        /// check, a second time after a 20-minute backoff, then an outage
+        /// finding. Never `review-verdict`. `shadow` reports what it would
+        /// re-run; `off` reads nothing. Without `--apply`, `enforce` reports
+        /// as `shadow`.
+        #[arg(
+            long = "infra-rerun",
+            default_value = "enforce",
+            value_parser = ["off", "shadow", "enforce"]
+        )]
+        infra_rerun: String,
         /// Override the durable retry/audit ledger path. Test hook.
         #[arg(long = "ledger", hide = true)]
         ledger: Option<PathBuf>,

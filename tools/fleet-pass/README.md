@@ -8,7 +8,9 @@ The scheduled reviewer, repair and operator passes that drain the fleet's PRs.
 - `must-review.py`: the deterministic work lists. Default mode lists green PRs with
   no counted verdict at their head; `--repair` is the rescue list (HOLD, FAILED,
   CONFLICT, STACK-BASE-MERGED); `--adversary` is the release-path second review.
-- `operator-findings.py`: the stuck-PR detector the operator pass reads.
+- `operator-findings.py`: the stuck-PR detector the operator pass reads. It also prints
+  the steward's infra-rerun outage findings (`INFRA-OUTAGE-SUSPECTED`, from the latest
+  tick JSON's `infra_rerun.findings`); `test_operator_findings.py` covers that reader.
 
 API use: each run reads every open PR of a repo (labels, head commit date, check
 rollup, newest 100 comments, merge state) with one paginated GraphQL query per

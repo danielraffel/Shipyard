@@ -28,6 +28,13 @@ retention and manual cause/private-corpus collection remain separate.
 
 ## Overdue pull requests and what lands next: `shipyard overdue`, `shipyard next`
 
+A required check that went red for an infrastructure reason (a lost runner, a
+checkout or `Install … dependencies` step, a package-mirror or GitHub 5xx) is
+re-run by the steward on its own, on any open pull request: once, then once more
+after 20 minutes, then reported as `INFRA-OUTAGE-SUSPECTED` by the operator
+pass. Do not re-run it by hand first; read `infra_rerun` in the steward's tick
+JSON. `review-verdict` is never re-run this way.
+
 Before guessing what to work on, read the steward's own answer:
 `shipyard next [--repo R] [--json]` lists the five pull requests closest to
 mergeable (stack bases first, then approved green, approved pending, green
