@@ -235,6 +235,11 @@ struct StewardLedger {
     /// (lowercase repository). See `superseded`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     superseded_checks: BTreeMap<String, superseded::Check>,
+    /// This pass only: the rate-limit error that stopped the superseded
+    /// check, reported in the repository's `errors` so the pass's cooldown
+    /// sees it. Never persisted.
+    #[serde(skip)]
+    superseded_rate_limit: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

@@ -363,8 +363,9 @@ not listed as blocked.
 
 A row may also carry `superseded` (shadow mode): deterministic evidence that
 its change already landed another way (`contained`, `tree_equal`, `named_by`
-or `label_successor`), with the successor, the base SHA and the paths and
-blobs. It never changes `blocked_on` or `next_action`, and Shipyard does not
+or `label_successor`), with the successor, the base SHA, the paths and
+blobs, and `closeable`. Merged and queue-landing pull requests are never
+judged. It never changes `blocked_on` or `next_action`, and Shipyard does not
 close anything. See [superseded-close.md](superseded-close.md).
 
 | Token | Meaning | Who moves it |

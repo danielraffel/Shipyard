@@ -23,11 +23,20 @@
 //! (`superseded`) and nothing is written to GitHub. Closing is a separate,
 //! owner-approved capability (`docs/superseded-close.md`).
 //!
+//! A pull request that is merged, in the merge queue, or has an
+//! `added_to_merge_queue` event with no later removal is never judged: a
+//! head the queue is landing reads `contained` for a moment before GitHub
+//! marks it merged.
+//!
 //! Cost: each open head is checked at most once per [`RECHECK_AFTER`]
-//! (sooner only when its head moves), whatever the outcome, so a blocked
-//! backlog costs nothing on the passes in between: at most
-//! [`MAX_CHECKS_PER_PASS`] heads per repository per pass, one compare and
-//! one small blob read each, and one batched GraphQL read of mentions. A pass that deferred rows for its budget
+//! (sooner only when its head moves), whatever the outcome (a failed read is
+//! recorded as `unknown`, never as "not superseded"), so a blocked backlog
+//! costs nothing on the passes in between. Per head and recheck: one
+//! compare and, unless it is `contained`, one small GraphQL blob read, plus
+//! its share of one GraphQL mention read per [`MENTION_BATCH`] heads: about
+//! two calls per open head per 30 minutes. At most [`MAX_CHECKS_PER_PASS`]
+//! heads per repository per pass; the pass budget is checked before each
+//! head, and the first rate-limit error stops the detector for the pass. A pass that deferred rows for its budget
 //! reads nothing here, and only `--apply` passes (which persist the ledger
 //! cache) run it. `SHIPYARD_STEWARD_SUPERSEDED=off` turns it off.
 
@@ -47,6 +56,8 @@ pub(super) const MAX_CHECKS_PER_PASS: usize = 25;
 /// GitHub's compare lists at most this many files; a list this long may be
 /// cut short and proves nothing.
 const COMPARE_FILE_CAP: usize = 300;
+/// Pull requests per mention read.
+pub(super) const MENTION_BATCH: usize = 10;
 /// Cached verdicts are dropped after this long without a check.
 const FORGET_AFTER: Duration = Duration::days(3);
 
@@ -65,6 +76,15 @@ pub(super) struct Evidence {
     pub detail: String,
     /// What an owner would do. Shadow: Shipyard does not do it.
     pub action: String,
+    /// Whether a future close-superseded could act on this evidence: only
+    /// tree evidence (`contained`, `tree_equal`), on a pull request a fleet
+    /// identity opened whose text closes no issue (`Fixes`/`Closes`/
+    /// `Resolves`). Shadow: nothing closes either way.
+    #[serde(default)]
+    pub closeable: bool,
+    /// Why it is not closeable, when it is not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_closeable: Option<String>,
 }
 
 /// One cached check of one head, in the steward ledger.
@@ -95,6 +115,8 @@ pub(super) struct Mention {
     pub number: u64,
     pub merged: bool,
     pub same_repo: bool,
+    /// The mentioning pull request's base branch.
+    pub base_ref: String,
     pub text: String,
 }
 
@@ -152,6 +174,14 @@ pub(super) fn tree_equal(
     let absent = |path: &str| matches!(base.get(path), Some(None));
     let mut shown = Vec::new();
     for change in head {
+        // `changed` (mode only), `copied` and `unchanged` prove nothing a blob
+        // comparison can see: no verdict.
+        if !matches!(
+            change.status.as_str(),
+            "added" | "modified" | "removed" | "renamed"
+        ) {
+            return None;
+        }
         let same = if change.status == "removed" {
             absent(&change.path)
         } else {
@@ -244,14 +274,22 @@ pub(super) fn base_blobs(
         .join(" ");
     let query = format!(
         "query($owner:String!,$name:String!){{repository(owner:$owner,name:$name){{\
-         tip: ref(qualifiedName:{}){{target{{oid}}}} {fields}}}}}",
-        graphql_string(&format!("refs/heads/{base}"))
+         tip: ref(qualifiedName:{}){{target{{oid}}}} root: object(expression:{}){{__typename}} \
+         {fields}}}}}",
+        graphql_string(&format!("refs/heads/{base}")),
+        graphql_string(&format!("{base}:"))
     );
     let data = graphql(read, repo, &query)?;
+    // The control: a null path means "absent" only when the same read
+    // resolved the base and its root tree.
     let tip = data
         .pointer("/tip/target/oid")
         .and_then(Value::as_str)
-        .map(str::to_owned);
+        .map(str::to_owned)
+        .ok_or_else(|| format!("blob read could not resolve {base}"))?;
+    if data.pointer("/root/__typename").and_then(Value::as_str) != Some("Tree") {
+        return Err(format!("blob read could not resolve {base}'s root tree"));
+    }
     let mut out = BTreeMap::new();
     for (i, path) in paths.iter().enumerate() {
         let node = data
@@ -272,7 +310,7 @@ pub(super) fn base_blobs(
         };
         out.insert(path.clone(), blob);
     }
-    Ok((out, tip))
+    Ok((out, Some(tip)))
 }
 
 static SUPERSEDES: LazyLock<Regex> = LazyLock::new(|| {
@@ -282,11 +320,23 @@ static SUPERSEDED_BY: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\bsuperseded\s+by\s+(?:pr\s+|pull request\s+)?#(\d+)\b").expect("regex")
 });
 static NUMBER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"#(\d+)").expect("regex"));
+/// A qualifier just before the phrase that makes it not a full supersession.
+static QUALIFIED: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:not|never|partly|partially|partial|only\s+partly|does\s+not|doesn't|isn't|is\s+not)\s+(?:\w+\s+)?$")
+        .expect("regex")
+});
+
+fn qualified(text: &str, start: usize) -> bool {
+    let before = &text[..start];
+    let from = before.char_indices().rev().nth(30).map_or(0, |(i, _)| i);
+    QUALIFIED.is_match(&before[from..])
+}
 
 /// The numbers a text says it supersedes (`Supersedes #14, #15`).
 pub(super) fn superseded_numbers(text: &str) -> BTreeSet<u64> {
     SUPERSEDES
         .captures_iter(text)
+        .filter(|caps| !caps.get(0).is_some_and(|m| qualified(text, m.start())))
         .flat_map(|caps| {
             NUMBER
                 .captures_iter(caps.get(1).map_or("", |m| m.as_str()))
@@ -303,6 +353,7 @@ pub(super) fn named_successors(texts: &[String]) -> BTreeSet<u64> {
         .flat_map(|text| {
             SUPERSEDED_BY
                 .captures_iter(text)
+                .filter(|caps| !caps.get(0).is_some_and(|m| qualified(text, m.start())))
                 .filter_map(|caps| caps[1].parse().ok())
                 .collect::<Vec<u64>>()
         })
@@ -311,10 +362,11 @@ pub(super) fn named_successors(texts: &[String]) -> BTreeSet<u64> {
 
 /// `named_by` evidence: a merged pull request in the same repository that
 /// says it supersedes `number`.
-pub(super) fn named_by(number: u64, mentions: &[Mention]) -> Option<(u64, String)> {
+pub(super) fn named_by(number: u64, base: &str, mentions: &[Mention]) -> Option<(u64, String)> {
     mentions
         .iter()
-        .filter(|m| m.merged && m.same_repo && m.number != number)
+        .filter(|m| m.merged && m.same_repo && m.number != number && m.base_ref == base)
+        .filter(|m| !is_revert(&m.text))
         .find(|m| superseded_numbers(&m.text).contains(&number))
         .map(|m| {
             (
@@ -324,8 +376,15 @@ pub(super) fn named_by(number: u64, mentions: &[Mention]) -> Option<(u64, String
         })
 }
 
+/// A revert undoes rather than supersedes: its text never counts.
+fn is_revert(text: &str) -> bool {
+    let title = text.lines().next().unwrap_or("").trim_start();
+    title.len() >= 6 && title[..6].eq_ignore_ascii_case("revert")
+}
+
 /// `label_successor` evidence: labelled `superseded`, names a successor,
-/// and that successor merged (`merged` maps a number to its merged state).
+/// and that successor merged into the same base (`merged` maps a number to
+/// whether it merged into this pull request's base).
 pub(super) fn label_successor(
     number: u64,
     labelled: bool,
@@ -365,13 +424,47 @@ pub(super) fn evidence(
     base_sha: Option<String>,
     detail: String,
 ) -> Evidence {
+    let tree = matches!(kind, "contained" | "tree_equal");
     Evidence {
         kind: kind.to_owned(),
         successor,
         base_sha,
         detail,
         action: action(successor),
+        closeable: tree,
+        not_closeable: (!tree).then(|| "text evidence never closes".to_owned()),
     }
+}
+
+static CLOSING_KEYWORD: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*:?\s+(?:[\w.-]+/[\w.-]+)?#\d+")
+        .expect("regex")
+});
+
+/// Whether a pull request body closes an issue on merge. Closing such a
+/// pull request would leave that issue open without anyone deciding so.
+pub(super) fn closes_issues(body: &str) -> bool {
+    CLOSING_KEYWORD.is_match(body)
+}
+
+/// Mark tree evidence not closeable when the pull request closes an issue or
+/// a non-fleet identity opened it.
+pub(super) fn gate_close(mut found: Evidence, body: &str, fleet_author: bool) -> Evidence {
+    if !found.closeable {
+        return found;
+    }
+    let why = if closes_issues(body) {
+        Some("its body closes an issue (Fixes/Closes/Resolves)")
+    } else if !fleet_author {
+        Some("a non-fleet author opened it")
+    } else {
+        None
+    };
+    if let Some(why) = why {
+        found.closeable = false;
+        found.not_closeable = Some(why.to_owned());
+    }
+    found
 }
 
 /// Which heads to check this pass: those with no cached verdict for their
@@ -448,8 +541,8 @@ fn compare(read: Read<'_>, repo: &str, from: &str, to: &str) -> Result<Value, St
     )
 }
 
-/// Tree evidence for one head: `contained` or `tree_equal`, from two
-/// compares against `base`.
+/// Tree evidence for one head: `contained` or `tree_equal`, from one compare
+/// against `base` and, unless it is `contained`, one blob read of its paths.
 pub(super) fn tree_evidence(
     read: Read<'_>,
     repo: &str,
@@ -496,6 +589,12 @@ pub(super) fn tree_evidence(
 #[derive(Debug, Default)]
 pub(super) struct Mentions {
     pub by_pr: BTreeMap<u64, (Vec<Mention>, Vec<String>, bool)>,
+    /// Merged, in the merge queue, or added to it with no later removal (or
+    /// any of those unreadable): never judged.
+    pub landing: BTreeSet<u64>,
+    /// Each pull request's own body and whether a fleet identity (a GitHub
+    /// App) opened it.
+    pub own: BTreeMap<u64, (String, bool)>,
 }
 
 pub(super) fn mentions_query(numbers: &[u64]) -> String {
@@ -503,11 +602,13 @@ pub(super) fn mentions_query(numbers: &[u64]) -> String {
         .iter()
         .map(|n| {
             format!(
-                "p{n}: pullRequest(number:{n}){{ body labels(first:30){{nodes{{name}}}} \
-                 comments(last:30){{nodes{{body}}}} \
+                "p{n}: pullRequest(number:{n}){{ body merged isInMergeQueue author{{__typename}} \
+                 labels(first:30){{nodes{{name}}}} comments(last:30){{nodes{{body authorAssociation}}}} \
+                 queue: timelineItems(last:10,itemTypes:[ADDED_TO_MERGE_QUEUE_EVENT,\
+                 REMOVED_FROM_MERGE_QUEUE_EVENT]){{nodes{{__typename}}}} \
                  timelineItems(last:40,itemTypes:[CROSS_REFERENCED_EVENT]){{nodes{{... on \
-                 CrossReferencedEvent{{source{{... on PullRequest{{number merged title body \
-                 repository{{nameWithOwner}}}}}}}}}}}} }}"
+                 CrossReferencedEvent{{source{{... on PullRequest{{number merged baseRefName \
+                 title body repository{{nameWithOwner}}}}}}}}}}}} }}"
             )
         })
         .collect::<Vec<_>>()
@@ -563,6 +664,11 @@ pub(super) fn parse_mentions(repo: &str, numbers: &[u64], data: &Value) -> Menti
                         .pointer("/repository/nameWithOwner")
                         .and_then(Value::as_str)
                         .is_some_and(|r| r.eq_ignore_ascii_case(repo)),
+                    base_ref: source
+                        .get("baseRefName")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned(),
                     text: format!(
                         "{}\n{}",
                         source.get("title").and_then(Value::as_str).unwrap_or(""),
@@ -582,6 +688,13 @@ pub(super) fn parse_mentions(repo: &str, numbers: &[u64], data: &Value) -> Menti
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
+                // Only a repository member's comment can name a successor.
+                .filter(|c| {
+                    matches!(
+                        c.get("authorAssociation").and_then(Value::as_str),
+                        Some("OWNER" | "MEMBER" | "COLLABORATOR")
+                    )
+                })
                 .filter_map(|c| c.get("body").and_then(Value::as_str).map(str::to_owned)),
         );
         let labelled = node
@@ -591,7 +704,27 @@ pub(super) fn parse_mentions(repo: &str, numbers: &[u64], data: &Value) -> Menti
             .flatten()
             .filter_map(|l| l.get("name").and_then(Value::as_str))
             .any(|l| l.eq_ignore_ascii_case(crate::merge_steward::SUPERSEDED_LABEL));
+        let last_queue_event = node
+            .pointer("/queue/nodes")
+            .and_then(Value::as_array)
+            .and_then(|nodes| nodes.last())
+            .and_then(|e| e.get("__typename"))
+            .and_then(Value::as_str);
+        let landing = node.get("merged").and_then(Value::as_bool) != Some(false)
+            || node.get("isInMergeQueue").and_then(Value::as_bool) != Some(false)
+            || last_queue_event == Some("AddedToMergeQueueEvent");
+        let body = node
+            .get("body")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let fleet_author =
+            node.pointer("/author/__typename").and_then(Value::as_str) == Some("Bot");
+        out.own.insert(*n, (body, fleet_author));
         out.by_pr.insert(*n, (mentions, texts, labelled));
+        if landing {
+            out.landing.insert(*n);
+        }
     }
     out
 }
@@ -600,6 +733,7 @@ pub(super) fn parse_mentions(repo: &str, numbers: &[u64], data: &Value) -> Menti
 fn successors_merged(
     read: Read<'_>,
     repo: &str,
+    base: &str,
     numbers: &BTreeSet<u64>,
 ) -> Result<BTreeMap<u64, bool>, String> {
     if numbers.is_empty() {
@@ -607,7 +741,7 @@ fn successors_merged(
     }
     let fields = numbers
         .iter()
-        .map(|n| format!("s{n}: pullRequest(number:{n}){{ merged }}"))
+        .map(|n| format!("s{n}: pullRequest(number:{n}){{ merged baseRefName }}"))
         .collect::<Vec<_>>()
         .join(" ");
     let query = format!(
@@ -617,89 +751,130 @@ fn successors_merged(
     Ok(numbers
         .iter()
         .filter_map(|n| {
-            data.get(format!("s{n}"))
-                .and_then(|v| v.get("merged"))
-                .and_then(Value::as_bool)
-                .map(|m| (*n, m))
+            let node = data.get(format!("s{n}"))?;
+            let merged = node.get("merged").and_then(Value::as_bool)?;
+            let same_base = node.get("baseRefName").and_then(Value::as_str) == Some(base);
+            Some((*n, merged && same_base))
         })
         .collect())
 }
 
-/// Check the due heads of one repository and return each one's evidence
-/// (`None` when it is not superseded). Errors for one head leave it unchecked
-/// (no cache entry), never a verdict.
+/// What one repository's check found: each checked head's verdict
+/// (`Err`: unknown), and the rate-limit error that stopped it, if any.
+pub(super) type RepoVerdicts = (
+    BTreeMap<u64, Result<Option<Evidence>, String>>,
+    Option<String>,
+);
+
+/// Check the due heads of one repository. `stop` is the pass budget, asked
+/// before every read; the first rate-limit error stops the check. A head
+/// left unread has no entry, so it stays due.
 pub(super) fn check_repo(
     read: Read<'_>,
     repo: &str,
     base: &str,
     heads: &[(u64, String)],
-) -> BTreeMap<u64, Result<Option<Evidence>, String>> {
+    stop: &dyn Fn() -> bool,
+) -> RepoVerdicts {
     let mut out = BTreeMap::new();
-    if heads.is_empty() {
-        return out;
-    }
-    let numbers: Vec<u64> = heads.iter().map(|(n, _)| *n).collect();
-    let mentions = graphql(read, repo, &mentions_query(&numbers))
-        .map(|data| parse_mentions(repo, &numbers, &data))
-        .ok();
-    let mut wanted = BTreeSet::new();
-    if let Some(m) = &mentions {
-        for (mentions, texts, labelled) in m.by_pr.values() {
+    let limited = |error: &str| super::pass_budget::is_rate_limited(error);
+    for chunk in heads.chunks(MENTION_BATCH) {
+        if stop() {
+            return (out, None);
+        }
+        let numbers: Vec<u64> = chunk.iter().map(|(n, _)| *n).collect();
+        let mentions = match graphql(read, repo, &mentions_query(&numbers)) {
+            Ok(data) => parse_mentions(repo, &numbers, &data),
+            Err(error) if limited(&error) => return (out, Some(error)),
+            Err(error) => {
+                // Without the mention read neither the text evidence nor the
+                // queue state is known: every head of the batch is unknown.
+                for n in &numbers {
+                    out.insert(*n, Err(format!("mention read failed: {error}")));
+                }
+                continue;
+            }
+        };
+        let mut wanted = BTreeSet::new();
+        for (refs, texts, labelled) in mentions.by_pr.values() {
             if *labelled {
                 for s in named_successors(texts) {
-                    if !mentions.iter().any(|x| x.number == s && x.same_repo) {
+                    if !refs.iter().any(|x| x.number == s && x.same_repo) {
                         wanted.insert(s);
                     }
                 }
             }
         }
-    }
-    let extra = successors_merged(read, repo, &wanted).unwrap_or_default();
-    for (number, head) in heads {
-        let from_text = mentions
-            .as_ref()
-            .and_then(|m| m.by_pr.get(number))
-            .and_then(|(mentions, texts, labelled)| {
-                if let Some((m, detail)) = named_by(*number, mentions) {
-                    return Some(evidence("named_by", Some(m), None, detail));
-                }
-                let mut merged: BTreeMap<u64, bool> = mentions
-                    .iter()
-                    .filter(|x| x.same_repo)
-                    .map(|x| (x.number, x.merged))
-                    .collect();
-                merged.extend(extra.iter().map(|(k, v)| (*k, *v)));
-                label_successor(*number, *labelled, &named_successors(texts), &merged)
-                    .map(|(m, detail)| evidence("label_successor", Some(m), None, detail))
-            });
-        if let Some(found) = from_text {
-            out.insert(*number, Ok(Some(found)));
-            continue;
-        }
-        let verdict = match tree_evidence(read, repo, base, head) {
-            Ok(found) if found.is_some() || mentions.is_some() => Ok(found),
-            // The mention read failed and the tree shows nothing: unknown,
-            // never cached as "not superseded".
-            Ok(_) => Err("mention read failed".to_owned()),
-            Err(error) => Err(error),
+        let extra = match successors_merged(read, repo, base, &wanted) {
+            Ok(extra) => extra,
+            Err(error) if limited(&error) => return (out, Some(error)),
+            Err(_) => BTreeMap::new(),
         };
-        out.insert(*number, verdict);
+        for (number, head) in chunk {
+            let Some((refs, texts, labelled)) = mentions.by_pr.get(number) else {
+                out.insert(
+                    *number,
+                    Err("pull request missing from the mention read".to_owned()),
+                );
+                continue;
+            };
+            if mentions.landing.contains(number) {
+                // Merged or being landed by the queue: not this detector's.
+                out.insert(*number, Ok(None));
+                continue;
+            }
+            if let Some((m, detail)) = named_by(*number, base, refs) {
+                out.insert(
+                    *number,
+                    Ok(Some(evidence("named_by", Some(m), None, detail))),
+                );
+                continue;
+            }
+            let mut merged: BTreeMap<u64, bool> = refs
+                .iter()
+                .filter(|x| x.same_repo)
+                .map(|x| (x.number, x.merged && x.base_ref == base))
+                .collect();
+            merged.extend(extra.iter().map(|(k, v)| (*k, *v)));
+            if let Some((m, detail)) =
+                label_successor(*number, *labelled, &named_successors(texts), &merged)
+            {
+                out.insert(
+                    *number,
+                    Ok(Some(evidence("label_successor", Some(m), None, detail))),
+                );
+                continue;
+            }
+            if stop() {
+                return (out, None);
+            }
+            match tree_evidence(read, repo, base, head) {
+                Err(error) if limited(&error) => return (out, Some(error)),
+                verdict => {
+                    let (body, fleet) = mentions.own.get(number).cloned().unwrap_or_default();
+                    out.insert(
+                        *number,
+                        verdict.map(|found| found.map(|f| gate_close(f, &body, fleet))),
+                    );
+                }
+            }
+        }
     }
-    out
+    (out, None)
 }
 
 /// Attach cached or fresh evidence to every open row of one repository
 /// (shadow: reads only). Queued, admitted and draft rows are skipped.
+/// Returns the rate-limit error that stopped the check, for the pass's
+/// rate-limit cooldown.
 pub(super) fn annotate(
     actions: &super::GitHubActions,
     observation: &super::RepoObservation,
     ledger: &mut super::StewardLedger,
     reports: &mut [super::PrReport],
     now: DateTime<Utc>,
-) {
-    if !enabled() {
-        return;
-    }
+    stop: &dyn Fn() -> bool,
+) -> Option<String> {
     let read = |args: &[String]| actions.run_gh(args).map_err(|e| e.to_string());
     annotate_with(
         &read,
@@ -708,7 +883,8 @@ pub(super) fn annotate(
         ledger,
         reports,
         now,
-    );
+        &|| !enabled() || stop(),
+    )
 }
 
 pub(super) fn annotate_with(
@@ -718,13 +894,15 @@ pub(super) fn annotate_with(
     ledger: &mut super::StewardLedger,
     reports: &mut [super::PrReport],
     now: DateTime<Utc>,
-) {
+    stop: &dyn Fn() -> bool,
+) -> Option<String> {
     // A pass that spent its budget reads nothing more (pass_budget).
-    if reports
-        .iter()
-        .any(|r| r.blocked.blocked_on == "deferred_pass_budget")
+    if stop()
+        || reports
+            .iter()
+            .any(|r| r.blocked.blocked_on == "deferred_pass_budget")
     {
-        return;
+        return None;
     }
     let skip = |token: &str| matches!(token, "queued" | "admitted" | "draft");
     let heads: Vec<(u64, String)> = reports
@@ -741,7 +919,8 @@ pub(super) fn annotate_with(
         .filter(|(n, _)| due_numbers.contains(n))
         .cloned()
         .collect();
-    for (number, found) in check_repo(read, repo, base, &due_heads) {
+    let (verdicts, rate_limited) = check_repo(read, repo, base, &due_heads, stop);
+    for (number, found) in verdicts {
         if let Some((_, head)) = due_heads.iter().find(|(n, _)| *n == number) {
             cache.insert(
                 key(repo, number),
@@ -763,4 +942,5 @@ pub(super) fn annotate_with(
             .filter(|c| c.head == report.head_sha)
             .and_then(|c| c.evidence.clone());
     }
+    rate_limited
 }

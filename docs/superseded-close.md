@@ -25,73 +25,103 @@ Titles, similar diffs and authorship are never evidence. `blocked_on` and
 `next_action` are unchanged. The object carries `action`, which reads "close as
 superseded by #M (shadow: Shipyard does not close it)".
 
-Cost: each open head is checked once, then again only when the head moves or
-30 minutes have passed, whatever the result, so a blocked backlog costs nothing
-on the passes in between. A pass reads at most 25 heads per repository: one
-compare and one small blob read (GraphQL `object(expression: "<base>:<path>")`)
-each, plus one batched GraphQL read of mentions. Only `--apply` passes run it,
-because they persist the ledger cache. A pass that deferred rows for its budget
-reads nothing. `SHIPYARD_STEWARD_SUPERSEDED=off` turns detection off.
+A pull request that is merged, in the merge queue, or has an
+`added_to_merge_queue` event with no later removal is never judged. A head the
+queue is landing reads `contained` for a moment before GitHub marks it merged:
+pulp#12014 was queued at 07:35:47Z, removed at 08:04:26Z and merged at
+08:04:27Z. `named_by` and `label_successor` need the successor merged into the
+same base, ignore reverts and qualified wording ("partly supersedes", "not
+superseded by"), and read a successor name only from the pull request's body
+or a repository member's comment. An absent path counts as absent only when
+the same read resolved the base and its root tree. Status `changed` (mode
+only), `copied` and `unchanged` prove nothing.
 
-A failed read records `unknown`, never "not superseded". If the mention read
-failed and the tree shows nothing, the result is unknown too, so a merged
-`Supersedes #n` cannot be missed silently.
+Each row's evidence also carries `closeable`, which is true only for tree
+evidence on a pull request that a fleet identity (a GitHub App) opened and
+whose body closes no issue (`Fixes`/`Closes`/`Resolves #n`). Otherwise it
+carries `not_closeable` with the reason. Detection still reports such pull
+requests; a future close would never act on them.
 
-## Closing (proposed: needs the owner's approval)
+Cost: each open head is checked at most once per 30 minutes, sooner only when
+its head moves. A failed read is recorded as `unknown`, never as "not
+superseded", so a blocked backlog costs nothing on the passes in between. Per
+head and recheck there is one compare, and, unless the head is `contained`,
+one small GraphQL blob read. Each head also has a share of one GraphQL mention
+read per 10 heads. That comes to about two calls per open head per 30 minutes,
+at most 25 heads per repository per pass. The pass budget is checked before
+each read. The first rate-limit error stops the detector and is reported in
+the repository's `errors`, which starts the pass's rate-limit cooldown. Only
+`--apply` passes run it, because they persist the cache.
+`SHIPYARD_STEWARD_SUPERSEDED=off` turns detection off.
+
+`Superseded` is one condition the steward derives per head, beside its other
+conditions such as review awaiting and owner active. New behavior should read
+it from the tick row rather than re-derive it.
+
+## Closing (proposed: owner approval required; not implemented)
 
 This is a new write capability, so it is not in this change. The proposal is
-one narrow capability, **close-superseded**, and nothing broader.
+one narrow capability, **close-superseded**, reviewed by Fable as APPROVE WITH
+CHANGES under these conditions.
 
-1. **Who:** the steward, through the Shipyard App identity, on an `--apply`
-   pass. It never acts as an agent's own token.
-2. **When:** the row has carried the same `superseded` evidence for the same
-   head on two passes at least 30 minutes apart, the pull request is not
-   queued or armed, and its head has not moved in the last 2 hours. The
-   evidence `kind` must be `contained` or `tree_equal`. `named_by` and
-   `label_successor` alone never close; they are reported only. The tree is
-   the one fact that makes closing lossless.
-3. **Proof at close time:** the close goes through the existing
-   `pr-close-guard` (`scripts/ghapp_pr_close_guard.py`). It re-reads the live
-   base and head, proves containment from Git tree entries (mode, type and
-   blob), and refuses if the head or base moved during the proof. Detection is
-   advisory; the guard is the gate. No guard override (no
-   `GHAPP_ALLOW_UNINTEGRATED_PR_CLOSE`).
-4. **Fixed comment, posted before the close:**
+1. **Evidence:** only `contained` and `tree_equal` with `closeable: true` may
+   close. `named_by` and `label_successor` never close; they are reported only.
+2. **Proof at close time:** every close goes through the existing
+   `pr-close-guard` (`scripts/ghapp_pr_close_guard.py`). The guard re-proves
+   containment from Git tree entries (mode, type and blob) on the live base
+   and head, and refuses if either moved during the proof. No override
+   (`GHAPP_ALLOW_UNINTEGRATED_PR_CLOSE`) is ever used. If the guard is not
+   installed, nothing closes.
+3. **Never closed:**
+   - pull requests labelled `owner-decision`, or with a HOLD at the head;
+   - queued or armed pull requests, and stacked ones (base is not the default branch);
+   - heads that moved in the last 2 hours;
+   - pull requests with any steward act or repair claim in the last 2 hours;
+   - pull requests whose body closes an issue, or that a non-fleet author opened.
+   The same evidence must be seen for the same head on two passes at least 30
+   minutes apart.
+4. **Where:** only on the `mutation_machine` host (m3), through the Shipyard App identity.
+5. **Limits:**
+   - 3 closes per repository per pass, 10 per repository per day, and 20 fleet-wide per day;
+   - one reopen within 7 days pauses closing for that repository;
+   - a reopened head is `do-not-close` forever.
+6. **Fixed comment, posted before the close:**
 
    ```
    Closed as superseded (shipyard steward, close-superseded).
    Evidence: <kind> against <base>@<base_sha>: <paths@blobs> [successor #M]
-   Head <head_sha> is unchanged; reopen to restore it ("Reopen pull request"),
+   Head <head_sha> is unchanged and its branch is kept; reopen to restore it,
    and the steward will not close this head again.
    ```
 
-   Reopening is the undo. A reopened pull request's head is written to the
-   ledger as `do-not-close`, and the steward never closes that head again.
-5. **Audit:** each close appends a ledger audit record (`LedgerAudit`) with the
-   repository, pull request, head, base SHA, evidence and comment id. The
-   steward's tick JSON names it under `mutation` as `closed_superseded`.
-6. **Limits:** at most 3 closes per repository per pass, and 10 per day per
-   repository. Repositories opt in through `[steward] close_superseded = true`
-   in the base's `.shipyard/config.toml`, off by default. There is a kill
-   switch (`SHIPYARD_STEWARD_SUPERSEDED_CLOSE=off`).
-7. **Wake the blocked:** the close is a pull-request state change, so any
-   session whose declared blocker is that pull request is woken through the
-   owner relay ([owner-relay.md](owner-relay.md)) with the successor's number.
-   A blocker declared on a superseded pull request is also reported as
-   superseded before the close.
+   The head branch is never deleted.
+7. **Audit:** each close writes the ledger audit record (repository, pull
+   request, head, `base_sha`, evidence, paths@blobs, successor, comment id,
+   host, session), and the guard writes its own `pr-closes.jsonl` line. The
+   tick names it under `mutation` as `closed_superseded`.
+8. **Opt-in:** `[steward] close_superseded = true` in the base's
+   `.shipyard/config.toml`, off by default. It is enabled first on fleet-ssh and
+   fleet-handbook, after 7 days of shadow detection with zero false positives.
+   `SHIPYARD_STEWARD_SUPERSEDED_CLOSE=off` is the kill switch.
+9. **Wake the blocked:** a declared blocker on that pull request is reported as
+   superseded, and the session is woken through the owner relay
+   ([owner-relay.md](owner-relay.md)) with the successor's number.
+10. **Retirement:** once close-superseded lands, the raw-API close path that
+    fleet-handbook #53 documents for agents is retired. Closing superseded
+    pull requests becomes the steward's alone.
+
+**Owner-only, always:** closing on text evidence, closing `owner-decision` or
+held pull requests, the unintegrated-close override, deleting a head branch,
+and enabling the capability per repository.
 
 ### Where it sits in the privileged grammar
 
 `docs/ghapp-guards.md` lists the guard family. Closing a pull request is
-already governed there by `pr-close-guard`, which allows a close only for a
-head contained by its live base. close-superseded adds no new guard bypass. It
-adds a steward write path (as the rollup reconciler's `close_landed_members`
-already does for landed rollup members) that calls the same close, so the
-guard judges it like any other close. The owner approves:
-
-- the capability (the steward may close, under the rules above);
-- the per-repository opt-in in each base config;
-- the evidence kinds that may close (proposed: `contained` and `tree_equal` only).
+already governed by `pr-close-guard`, which allows a close only for a head
+contained by its live base. close-superseded adds no guard bypass. It adds a
+steward write path that calls the same close, so the guard judges it like any
+other close. The rollup reconciler's `close_landed_members` already works this
+way for landed rollup members.
 
 ## Prior art
 

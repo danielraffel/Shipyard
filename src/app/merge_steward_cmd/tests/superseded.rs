@@ -3,10 +3,24 @@ use std::cell::RefCell;
 
 use super::*;
 use crate::app::merge_steward_cmd::blocked_on::Stall;
+#[cfg(unix)]
+use crate::app::merge_steward_cmd::cancellation::apply_pr_plans;
 use crate::app::merge_steward_cmd::superseded::{
-    self, FileChange, Mention, annotate_with, label_successor, named_by, named_successors,
-    superseded_numbers, tree_equal,
+    self, FileChange, Mention, annotate_with as annotate_raw, label_successor, named_by,
+    named_successors, superseded_numbers, tree_equal,
 };
+
+/// One shadow pass with an unspent budget.
+fn annotate_with(
+    read: superseded::Read<'_>,
+    repo: &str,
+    base: &str,
+    ledger: &mut StewardLedger,
+    reports: &mut [PrReport],
+    now: DateTime<Utc>,
+) -> Option<String> {
+    annotate_raw(read, repo, base, ledger, reports, now, &|| false)
+}
 
 const REPO: &str = "danielraffel/fleet-ssh";
 const HEAD: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -133,6 +147,7 @@ fn mention(number: u64, merged: bool, same_repo: bool, text: &str) -> Mention {
         number,
         merged,
         same_repo,
+        base_ref: "main".to_owned(),
         text: text.to_owned(),
     }
 }
@@ -140,13 +155,13 @@ fn mention(number: u64, merged: bool, same_repo: bool, text: &str) -> Mention {
 #[test]
 fn named_by_needs_a_merged_pr_in_the_same_repo() {
     let open = [mention(16, false, true, "Supersedes #15")];
-    assert_eq!(named_by(15, &open), None, "not merged yet");
+    assert_eq!(named_by(15, "main", &open), None, "not merged yet");
     let other_repo = [mention(16, true, false, "Supersedes #15")];
-    assert_eq!(named_by(15, &other_repo), None);
+    assert_eq!(named_by(15, "main", &other_repo), None);
     let merged = [mention(16, true, true, "Supersedes #15")];
-    assert_eq!(named_by(15, &merged).map(|(n, _)| n), Some(16));
+    assert_eq!(named_by(15, "main", &merged).map(|(n, _)| n), Some(16));
     let mere_mention = [mention(16, true, true, "Related to #15")];
-    assert_eq!(named_by(15, &mere_mention), None);
+    assert_eq!(named_by(15, "main", &mere_mention), None);
 }
 
 #[test]
@@ -193,7 +208,7 @@ fn fake(calls: &RefCell<Vec<String>>) -> impl Fn(&[String]) -> Result<String, St
         calls.borrow_mut().push(joined.clone());
         if joined.contains("timelineItems") {
             return Ok(
-                r#"{"data":{"repository":{"p15":{"body":"","labels":{"nodes":[]},
+                r#"{"data":{"repository":{"p15":{"body":"","merged":false,"isInMergeQueue":false,"labels":{"nodes":[]},
                 "comments":{"nodes":[]},"timelineItems":{"nodes":[]}}}}}"#
                     .to_owned(),
             );
@@ -210,7 +225,7 @@ fn fake(calls: &RefCell<Vec<String>>) -> impl Fn(&[String]) -> Result<String, St
                 "{joined}"
             );
             return Ok(format!(
-                r#"{{"data":{{"repository":{{"tip":{{"target":{{"oid":"cafe1111"}}}},
+                r#"{{"data":{{"repository":{{"tip":{{"target":{{"oid":"cafe1111"}}}},"root":{{"__typename":"Tree"}},
                 "f0":{{"__typename":"Blob","oid":"{LABELS_BLOB}"}}}}}}}}"#
             ));
         }
@@ -295,9 +310,9 @@ fn a_merged_pr_naming_it_wins_without_any_compare() {
     let read = |args: &[String]| -> Result<String, String> {
         calls.borrow_mut().push(args.join(" "));
         Ok(
-            r#"{"data":{"repository":{"p15":{"body":"","labels":{"nodes":[]},
+            r#"{"data":{"repository":{"p15":{"body":"","merged":false,"isInMergeQueue":false,"labels":{"nodes":[]},
             "comments":{"nodes":[]},"timelineItems":{"nodes":[{"source":{"number":16,
-            "merged":true,"title":"labels","body":"Supersedes #15",
+            "merged":true,"baseRefName":"main","title":"labels","body":"Supersedes #15",
             "repository":{"nameWithOwner":"danielraffel/fleet-ssh"}}}]}}}}}"#
                 .to_owned(),
         )
@@ -340,6 +355,11 @@ fn a_clean_tree_with_an_unreadable_mention_read_is_not_cached_clean() {
     assert!(
         check.unknown,
         "a clean tree without the mention read is unknown, not clean"
+    );
+    assert_eq!(
+        *blob_reads.borrow(),
+        0,
+        "without the queue state no tree is judged"
     );
 }
 
@@ -387,4 +407,365 @@ fn a_failed_head_is_not_read_again_until_the_recheck_interval() {
         now() + chrono::Duration::minutes(31),
     );
     assert!(*calls.borrow() > first);
+}
+
+/// A mention read for #15 with the given queue facts and no mentions.
+fn queue_facts(merged: bool, in_queue: bool, events: &[&str]) -> String {
+    let nodes: Vec<String> = events
+        .iter()
+        .map(|e| format!(r#"{{"__typename":"{e}"}}"#))
+        .collect();
+    format!(
+        r#"{{"data":{{"repository":{{"p15":{{"body":"","merged":{merged},"isInMergeQueue":{in_queue},
+        "labels":{{"nodes":[]}},"comments":{{"nodes":[]}},"queue":{{"nodes":[{}]}},
+        "timelineItems":{{"nodes":[]}}}}}}}}}}"#,
+        nodes.join(",")
+    )
+}
+
+/// GitHub where #15's head is fully on main (`ahead_by` 0).
+fn contained_github(
+    mentions: String,
+    calls: &RefCell<Vec<String>>,
+) -> impl Fn(&[String]) -> Result<String, String> + '_ {
+    move |args: &[String]| {
+        let joined = args.join(" ");
+        calls.borrow_mut().push(joined.clone());
+        if joined.contains("timelineItems") {
+            return Ok(mentions.clone());
+        }
+        if joined.contains("/compare/") {
+            return Ok(r#"{"ahead_by":0,"base_commit":{"sha":"cafe0000"},"files":[]}"#.to_owned());
+        }
+        Err(format!("unexpected read: {joined}"))
+    }
+}
+
+#[test]
+fn a_contained_head_out_of_the_queue_is_contained() {
+    let calls = RefCell::new(Vec::new());
+    let read = contained_github(
+        queue_facts(
+            false,
+            false,
+            &["AddedToMergeQueueEvent", "RemovedFromMergeQueueEvent"],
+        ),
+        &calls,
+    );
+    let mut ledger = StewardLedger::default();
+    let mut reports = vec![report(15, "merge_state:CLEAN")];
+    annotate_with(&read, REPO, "main", &mut ledger, &mut reports, now());
+    let found = reports[0].blocked.superseded.as_ref().expect("contained");
+    assert_eq!(found.kind, "contained");
+}
+
+#[test]
+fn a_head_the_queue_is_landing_is_never_judged() {
+    // pulp#12014: queued 07:35:47Z, removed 08:04:26Z, merged 08:04:27Z.
+    // In between its row did not read `queued`, yet main held its head.
+    for facts in [
+        queue_facts(false, true, &["AddedToMergeQueueEvent"]),
+        queue_facts(false, false, &["AddedToMergeQueueEvent"]),
+        queue_facts(
+            true,
+            false,
+            &["AddedToMergeQueueEvent", "RemovedFromMergeQueueEvent"],
+        ),
+    ] {
+        let calls = RefCell::new(Vec::new());
+        let read = contained_github(facts.clone(), &calls);
+        let mut ledger = StewardLedger::default();
+        let mut reports = vec![report(15, "no_verdict")];
+        annotate_with(&read, REPO, "main", &mut ledger, &mut reports, now());
+        assert!(reports[0].blocked.superseded.is_none(), "{facts}");
+        assert!(
+            calls.borrow().iter().all(|c| !c.contains("/compare/")),
+            "a landing head is not even compared: {facts}"
+        );
+    }
+}
+
+fn blob_reply(tip: &str, root: &str) -> String {
+    format!(r#"{{"data":{{"repository":{{"tip":{tip},"root":{root},"f0":null}}}}}}"#)
+}
+
+#[test]
+fn absence_needs_a_resolved_base_as_its_control() {
+    // A delete-only PR: main must be proven to lack the file.
+    let ok_reply = blob_reply(r#"{"target":{"oid":"cafe"}}"#, r#"{"__typename":"Tree"}"#);
+    for (reply, expect) in [
+        (ok_reply, true),
+        (blob_reply("null", r#"{"__typename":"Tree"}"#), false),
+        (blob_reply(r#"{"target":{"oid":"cafe"}}"#, "null"), false),
+    ] {
+        let reply_clone = reply.clone();
+        let read = move |args: &[String]| -> Result<String, String> {
+            let joined = args.join(" ");
+            if joined.contains("object(expression:") {
+                return Ok(reply_clone.clone());
+            }
+            Ok(r#"{"ahead_by":1,"files":[{"filename":"gone.txt","status":"removed"}]}"#.to_owned())
+        };
+        let found = superseded::tree_evidence(&read, REPO, "main", HEAD);
+        if expect {
+            assert_eq!(found.expect("read").expect("equal").kind, "tree_equal");
+        } else {
+            assert!(
+                found.is_err(),
+                "an unresolved base is unknown, never absent: {reply}"
+            );
+        }
+    }
+}
+
+#[test]
+fn successors_must_land_on_the_same_base_and_text_must_be_unqualified() {
+    let mut other_base = mention(16, true, true, "Supersedes #15");
+    other_base.base_ref = "release/1.x".to_owned();
+    assert_eq!(named_by(15, "main", &[other_base]), None);
+    let revert = mention(16, true, true, "Revert \"labels\"\nSupersedes #15");
+    assert_eq!(named_by(15, "main", &[revert]), None);
+    for text in [
+        "This does not supersede #15",
+        "partly supersedes #15",
+        "It is not superseded by #16",
+        "only partly superseded by #16",
+    ] {
+        assert!(superseded_numbers(text).is_empty(), "{text}");
+        assert!(named_successors(&[text.to_owned()]).is_empty(), "{text}");
+    }
+    assert_eq!(
+        named_successors(&["Superseded by #16.".to_owned()])
+            .into_iter()
+            .collect::<Vec<_>>(),
+        vec![16]
+    );
+}
+
+#[test]
+fn only_a_members_comment_names_a_successor() {
+    let data = serde_json::json!({"p15": {"body": "", "merged": false, "isInMergeQueue": false,
+        "labels": {"nodes": [{"name": "superseded"}]},
+        "comments": {"nodes": [
+            {"body": "superseded by #16", "authorAssociation": "NONE"},
+            {"body": "superseded by #17", "authorAssociation": "MEMBER"}]},
+        "queue": {"nodes": []}, "timelineItems": {"nodes": []}}});
+    let parsed = superseded::parse_mentions(REPO, &[15], &data);
+    let (_, texts, labelled) = parsed.by_pr.get(&15).expect("parsed");
+    assert!(labelled);
+    assert_eq!(
+        named_successors(texts).into_iter().collect::<Vec<_>>(),
+        vec![17]
+    );
+}
+
+#[test]
+fn mode_changes_copies_and_unchanged_prove_nothing() {
+    for status in ["changed", "copied", "unchanged"] {
+        let head = [file("a.sh", status, Some("s1"))];
+        let tip = base(&[("a.sh", Some("s1"))]);
+        assert!(tree_equal(&head, &tip).is_none(), "{status}");
+    }
+}
+
+#[test]
+fn the_budget_is_asked_before_every_head_and_a_rate_limit_stops_the_check() {
+    // Budget: spent after the mention read, so no head is compared.
+    let calls = RefCell::new(Vec::new());
+    let read = contained_github(queue_facts(false, false, &[]), &calls);
+    let asked = RefCell::new(0);
+    // Asked before the pass, before the mention batch, then before the head:
+    // spent at the third ask, after the mention read.
+    let stop = || {
+        *asked.borrow_mut() += 1;
+        *asked.borrow() > 2
+    };
+    let mut ledger = StewardLedger::default();
+    let mut reports = vec![report(15, "no_verdict")];
+    annotate_raw(&read, REPO, "main", &mut ledger, &mut reports, now(), &stop);
+    assert!(
+        calls.borrow().iter().all(|c| !c.contains("/compare/")),
+        "{:?}",
+        calls.borrow()
+    );
+    assert!(
+        calls.borrow().iter().any(|c| c.contains("timelineItems")),
+        "the mention batch was read before the budget ran out"
+    );
+    assert!(
+        ledger.superseded_checks.is_empty(),
+        "an unread head stays due"
+    );
+    // A rate limit stops the check and is handed back for the cooldown.
+    let limited = |_: &[String]| -> Result<String, String> {
+        Err("HTTP 403: API rate limit exceeded for installation ID 1".to_owned())
+    };
+    let mut ledger = StewardLedger::default();
+    let mut reports = vec![report(15, "no_verdict"), report(16, "no_verdict")];
+    let error = annotate_with(&limited, REPO, "main", &mut ledger, &mut reports, now());
+    assert!(error.is_some_and(|e| e.contains("rate limit")));
+    assert!(ledger.superseded_checks.is_empty());
+}
+
+#[test]
+fn mentions_are_read_in_batches_of_ten() {
+    let calls = RefCell::new(Vec::new());
+    let read = |args: &[String]| -> Result<String, String> {
+        calls.borrow_mut().push(args.join(" "));
+        Err("not found".to_owned())
+    };
+    let mut ledger = StewardLedger::default();
+    let mut reports: Vec<PrReport> = (1..=12).map(|n| report(n, "no_verdict")).collect();
+    annotate_with(&read, REPO, "main", &mut ledger, &mut reports, now());
+    let mention_reads = calls
+        .borrow()
+        .iter()
+        .filter(|c| c.contains("timelineItems"))
+        .count();
+    assert_eq!(mention_reads, 2);
+    assert_eq!(
+        ledger.superseded_checks.len(),
+        12,
+        "every head recorded unknown"
+    );
+}
+
+#[test]
+fn a_spent_budget_or_the_kill_switch_reads_nothing() {
+    // `annotate` folds `SHIPYARD_STEWARD_SUPERSEDED=off` into `stop`.
+    let calls = RefCell::new(Vec::new());
+    let read = |args: &[String]| -> Result<String, String> {
+        calls.borrow_mut().push(args.join(" "));
+        Err("x".to_owned())
+    };
+    let mut ledger = StewardLedger::default();
+    let mut reports = vec![report(15, "no_verdict")];
+    annotate_raw(
+        &read,
+        REPO,
+        "main",
+        &mut ledger,
+        &mut reports,
+        now(),
+        &|| true,
+    );
+    assert!(calls.borrow().is_empty());
+}
+
+#[cfg(unix)]
+fn pass_args(apply: bool) -> StewardCommandArgs {
+    StewardCommandArgs {
+        repos: vec!["owner/repo".to_owned()],
+        base: "main".to_owned(),
+        opt_out_label: "steward:skip".to_owned(),
+        provenance_blocking_labels: default_provenance_blocking_labels(),
+        managed_label: MANAGED_LABEL.to_owned(),
+        handoff_context: HANDOFF_CONTEXT.to_owned(),
+        max_transient_reruns: 1,
+        recover_hosted_setup_eviction_priority: false,
+        coalesce: true,
+        preempt_capacity: false,
+        max_preemptions_per_head: 1,
+        arm_unqueued: false,
+        approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
+        wake_owner: false,
+        unapproved_dequeue: crate::app::merge_steward_cmd::DequeueMode::Report,
+        pass_budget: None,
+        pass_deadline: None,
+        apply,
+        ledger: None,
+    }
+}
+
+/// Only an apply pass (which persists the ledger cache) runs the detector.
+#[cfg(unix)]
+#[test]
+fn only_an_apply_pass_reads_for_superseded_evidence() {
+    for apply in [false, true] {
+        let temp = tempfile::tempdir().expect("temp");
+        let log = temp.path().join("calls");
+        let actions = fake_gh(
+            &temp,
+            &format!(
+                "printf '%s\\n' \"$*\" >> '{}'\necho \"unexpected: $*\" >&2; exit 90\n",
+                log.display()
+            ),
+        );
+        let mut pr = ready_pr();
+        "DIRTY".clone_into(&mut pr.fact.merge_state);
+        let observation = observation_for(pr, true);
+        let control = mutation_control(&temp, "studio", "studio");
+        let mut ledger = StewardLedger::default();
+        let _ = apply_pr_plans(
+            &actions,
+            &pass_args(apply),
+            &observation,
+            &queue_policy(),
+            &temp.path().join("ledger.json"),
+            &mut ledger,
+            apply.then_some(&control),
+        );
+        let calls = fs::read_to_string(&log).unwrap_or_default();
+        assert_eq!(
+            calls.contains("timelineItems"),
+            apply,
+            "apply={apply}: {calls}"
+        );
+        assert_eq!(!ledger.superseded_checks.is_empty(), apply, "apply={apply}");
+    }
+}
+
+#[test]
+fn tree_evidence_is_closeable_only_for_a_fleet_pr_that_closes_no_issue() {
+    let tree = || superseded::evidence("contained", None, None, "d".to_owned());
+    assert!(superseded::gate_close(tree(), "Regenerates labels.", true).closeable);
+    for (body, fleet) in [
+        ("Fixes #12", true),
+        ("closes owner/repo#3", true),
+        ("ok", false),
+    ] {
+        let gated = superseded::gate_close(tree(), body, fleet);
+        assert!(!gated.closeable, "{body} {fleet}");
+        assert!(gated.not_closeable.is_some());
+    }
+    let text = superseded::evidence("named_by", Some(16), None, "d".to_owned());
+    assert!(
+        !superseded::gate_close(text, "", true).closeable,
+        "text evidence never closes"
+    );
+}
+
+#[test]
+fn a_named_successor_merged_into_another_base_does_not_count() {
+    let reply = |base: &str| {
+        format!(
+            r#"{{"data":{{"repository":{{"p15":{{"body":"","merged":false,"isInMergeQueue":false,
+            "labels":{{"nodes":[{{"name":"superseded"}}]}},
+            "comments":{{"nodes":[{{"body":"superseded by #16","authorAssociation":"OWNER"}}]}},
+            "queue":{{"nodes":[]}},"timelineItems":{{"nodes":[{{"source":{{"number":16,"merged":true,
+            "baseRefName":"{base}","title":"x","body":"",
+            "repository":{{"nameWithOwner":"danielraffel/fleet-ssh"}}}}}}]}}}}}}}}}}"#
+        )
+    };
+    for (base, expect) in [("main", true), ("release/1.x", false)] {
+        let body = reply(base);
+        let read = move |args: &[String]| -> Result<String, String> {
+            if args.join(" ").contains("timelineItems") {
+                return Ok(body.clone());
+            }
+            Ok(r#"{"ahead_by":1,"files":[]}"#.to_owned())
+        };
+        let mut ledger = StewardLedger::default();
+        let mut reports = vec![report(15, "no_verdict")];
+        annotate_with(&read, REPO, "main", &mut ledger, &mut reports, now());
+        assert_eq!(
+            reports[0]
+                .blocked
+                .superseded
+                .as_ref()
+                .map(|e| e.kind.as_str()),
+            expect.then_some("label_successor"),
+            "{base}"
+        );
+    }
 }
