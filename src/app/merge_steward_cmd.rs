@@ -231,6 +231,11 @@ struct StewardLedger {
     /// `dwell_pass`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     dwell: BTreeMap<String, crate::merge_steward::dwell::DwellRepoState>,
+    /// Queue entries removed while the base was poisoned, in queue order,
+    /// keyed `repo@base`; restored first once the poison clears. See
+    /// `poison_pause`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    poison_paused: BTreeMap<String, Vec<poison_pause::PausedEntry>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2015,12 +2020,14 @@ mod native_arm;
 mod next_action;
 mod observation;
 mod pass_budget;
+mod poison_pause;
 mod pr_mutations;
 pub(super) mod queue_drain;
 mod queue_priority_recovery;
 pub(super) mod read_probe;
 mod render;
 mod resume_record;
+mod shadow_ledger;
 mod terminal_handoff;
 pub(super) mod train;
 mod unapproved_admission;

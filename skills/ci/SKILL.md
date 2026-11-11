@@ -4366,7 +4366,15 @@ green head `held_base_poisoned:<context>`; it puts the fix's review first
 front, excusing only its red approval context. The approval is still required
 to enqueue it, with `jump: true` when `auto_jump = "on"` (a refused jump falls
 back to a plain enqueue). The hold lifts as soon as a merge group passes the
-context; an unreadable merge-group history never holds anything. `shipyard
+context; an unreadable merge-group history never holds anything. With
+`merge_group_pause = "on"` as well (default `dry-run`, report only) the
+steward **pauses** the queue: every entry it admitted that is not a candidate
+fix is dequeued (`paused_base_poisoned:<head>`), and once a merge group passes
+the context those entries are admitted first, in their old queue order, with
+no human step. When no fix is named it opens one tracking issue per poisoned
+context and lists it first in the priority file. `repos[].base_poison.shadow`
+reports each rule's would-fire episodes and its promotion gate. Undo with
+`merge_group_pause = "dry-run"`, or the hold `off` to restore at once. `shipyard
 queue prioritize --pr <fix>` applies the same excuse, so a named fix is no
 longer refused as doomed while only its review-verdict is red.
 

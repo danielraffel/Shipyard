@@ -242,6 +242,7 @@ mod mutations;
 #[cfg(unix)]
 mod next_action;
 mod observation;
+mod poison_pause;
 #[cfg(unix)]
 mod recovery;
 #[cfg(unix)]

@@ -23,6 +23,27 @@ fn hold_and_jump_follow_the_base_config() {
         (PoisonHold::DryRun, AutoJump::Off)
     );
     assert!(typo.read_error.is_some());
+    // The pause is its own key, shadow by default, and acts only with the
+    // hold on.
+    assert_eq!(default.pause, PoisonHold::DryRun);
+    assert!(!on.pauses());
+    let pausing = parse(
+        "[base_health]\nmerge_group_hold = \"on\"\nmerge_group_pause = \"on\"\n",
+        true,
+    );
+    assert!(pausing.pauses());
+    let hold_dry = parse(
+        "[base_health]\nmerge_group_hold = \"dry-run\"\nmerge_group_pause = \"on\"\n",
+        true,
+    );
+    assert!(!hold_dry.pauses());
+    let bad = parse("[base_health]\nmerge_group_pause = \"yes\"\n", true);
+    assert_eq!(bad.pause, PoisonHold::DryRun);
+    assert!(
+        bad.read_error
+            .as_deref()
+            .is_some_and(|e| e.contains("merge_group_pause"))
+    );
     // A base without a merge queue forms no merge groups to read.
     assert_eq!(
         parse("[base_health]\nmerge_group_hold = \"on\"\n", false).hold,
@@ -149,10 +170,12 @@ fn a_dry_run_names_what_the_fast_track_would_do_and_nothing_when_clear() {
                 groups: Vec::new(),
                 latest_failure_at: None,
                 check_id: None,
+                same_first_error: None,
             }],
         },
         fixes: BTreeMap::from([(7, vec!["label `shipyard:unblock`".to_owned()])]),
         fix_read_error: None,
+        candidates: std::collections::BTreeSet::default(),
     };
     assert_eq!(
         would_fast_track(&poison),
@@ -161,6 +184,7 @@ fn a_dry_run_names_what_the_fast_track_would_do_and_nothing_when_clear() {
     let clear = RepoPoison {
         health: MergeGroupHealth::Clear {
             detail: String::new(),
+            passed: Vec::new(),
         },
         ..poison
     };
@@ -179,6 +203,7 @@ fn one_fix_is_chosen_and_a_pr_that_rode_a_failing_group_is_never_it() {
             }],
             latest_failure_at: None,
             check_id: None,
+            same_first_error: None,
         }],
     };
     let text = || vec!["mentions red required check `macos`".to_owned()];

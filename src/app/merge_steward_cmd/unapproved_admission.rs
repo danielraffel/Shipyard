@@ -591,12 +591,14 @@ fn plan(
     }
 }
 
-/// Remove `pr` from its merge queue under an already-held guard.
-fn dequeue_under_guard(
+/// Remove `pr` from its merge queue under an already-held guard, recording
+/// `audit` and the removal so it never counts toward the head's ejection cap.
+pub(super) fn dequeue_under_guard(
     context: &MutationApplyContext<'_>,
     pr: &ObservedPr,
     head: &str,
     ledger: &mut StewardLedger,
+    audit: &str,
 ) -> Result<(), String> {
     if pr.node_id.is_empty() {
         return Err(format!("PR #{} node ID unavailable", pr.fact.number));
@@ -630,7 +632,7 @@ fn dequeue_under_guard(
         ledger,
         &context.observation.repo,
         &format!("pr:{}:{head}", pr.fact.number),
-        DEQUEUE_AUDIT,
+        audit,
     );
     ledger
         .steward_removals
@@ -787,7 +789,7 @@ pub(super) fn sweep(
     if let Some((head, reason, (label, _))) = &dequeue
         && error.is_none()
     {
-        if let Err(failure) = dequeue_under_guard(context, pr, head, ledger) {
+        if let Err(failure) = dequeue_under_guard(context, pr, head, ledger, DEQUEUE_AUDIT) {
             error = Some(format!("{failure} (dequeuing because {reason})"));
         } else {
             ledger
