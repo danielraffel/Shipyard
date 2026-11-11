@@ -1054,6 +1054,7 @@ fn named_fix_excuse(
         &poisoned,
         Utc::now(),
     );
+    let fixes = super::base_poison::choose_fix(fixes, &health);
     let evidence = fixes.get(&target).cloned();
     let excused = if evidence.is_some() {
         vec![crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned()]

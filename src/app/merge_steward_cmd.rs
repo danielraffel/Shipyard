@@ -1991,14 +1991,17 @@ pub(super) fn required_contexts(
     Ok(contexts)
 }
 
-/// Named fixes for poisoned `contexts` ([`base_poison::named_fixes`]).
+/// The one fix for the poison `health` names ([`base_poison::named_fixes`]
+/// narrowed by [`base_poison::choose_fix`]), the same pick the steward makes.
 pub(super) fn named_fixes(
     run_gh: &dyn Fn(&[String]) -> Result<String, String>,
     repo: &str,
     base: &str,
-    contexts: &[String],
+    health: &crate::base_health::merge_group::MergeGroupHealth,
 ) -> (BTreeMap<u64, Vec<String>>, Option<String>) {
-    base_poison::named_fixes(run_gh, repo, base, contexts, Utc::now())
+    let (fixes, error) =
+        base_poison::named_fixes(run_gh, repo, base, &health.poisoned_contexts(), Utc::now());
+    (base_poison::choose_fix(fixes, health), error)
 }
 mod blocked_on;
 mod cancellation;

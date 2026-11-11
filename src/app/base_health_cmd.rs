@@ -132,7 +132,7 @@ fn merge_group_advice(
     let poisoned = health.poisoned();
     let first = poisoned.first()?;
     let contexts = health.poisoned_contexts();
-    let (fixes, _) = super::merge_steward_cmd::named_fixes(reader, repo, base, &contexts);
+    let (fixes, _) = super::merge_steward_cmd::named_fixes(reader, repo, base, health);
     let mut fixes = fixes.into_keys();
     let pr = fixes.next()?;
     if fixes.next().is_some() {
