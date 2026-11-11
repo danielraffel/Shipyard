@@ -18,6 +18,33 @@ NO_VERDICT_MIN = 45      # green with no verdict (reviewer missed it)
 HELD_IDLE_MIN = 60       # HOLD / required failure / conflict with no push (rescue missed it)
 
 
+def held_entries():
+    """Read the repair budget's current held entries for operator escalation."""
+    state = os.environ.get("FLEET_PASS_STATE", os.path.dirname(os.path.abspath(__file__)))
+    path = os.path.join(state, "repair.held")
+    try:
+        with open(path) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return []
+    out = []
+    for raw in lines:
+        _, sep, value = raw.partition("\t")
+        value = value if sep else raw
+        if not value.startswith("HELD "):
+            continue
+        value = value[5:]
+        line, sep, attempts = value.rpartition(" attempts=")
+        if not sep:
+            continue
+        parts = line.split(maxsplit=2)
+        if len(parts) != 3:
+            continue
+        key, sha, reason = parts
+        out.append(f"{key} {sha} REPAIR-BUDGET-HELD attempts={attempts} reason={reason}")
+    return out
+
+
 def steward_rows(repo):
     files = sorted(glob.glob(os.path.expanduser(
         f"~/Library/Logs/shipyard-steward-tick/{repo.replace('/', '_')}-*.json")))
@@ -31,9 +58,22 @@ def steward_rows(repo):
     return {}, {}
 
 
+def infra_outages(repo, rep):
+    """The steward's outage findings: a required check failing for an infra reason on
+    several PRs at one step, or past its re-run cap. One line per finding."""
+    out = []
+    for f in ((rep or {}).get("infra_rerun") or {}).get("findings") or []:
+        prs = ",".join(f"#{n}" for n in f.get("prs", []))
+        out.append(f"{repo} INFRA-OUTAGE-SUSPECTED {f.get('message', '')} prs={prs}"
+                   f" since={f.get('first_reported_at', '?')}{' capped' if f.get('capped') else ''}")
+    return out
+
+
 def main():
     now = datetime.datetime.now(datetime.timezone.utc)
     failed = False
+    for entry in held_entries():
+        print(entry)
     for repo in mr.REPOS:
         try:
             req = mr.required(repo)
@@ -82,6 +122,8 @@ def main():
                     print(f"{repo}#{n} {sha[:10]} GREEN-NO-VERDICT idle={int(idle)}m steward={why}")
                 elif (v == "HOLD" or not green) and idle > HELD_IDLE_MIN:
                     print(f"{repo}#{n} {sha[:10]} STALLED idle={int(idle)}m verdict={v or 'none'} steward={why} {detail}")
+            for line in infra_outages(repo, rep):
+                print(line)
             if rep.get("errors"):
                 print(f"{repo} STEWARD-ERRORS {json.dumps(rep.get('errors'))[:200]}")
         except RuntimeError as e:
