@@ -4,6 +4,7 @@ import importlib.util
 import io
 import json
 import os
+import pathlib
 import subprocess
 import tempfile
 import time
@@ -11,8 +12,10 @@ import unittest
 
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+HERE_PATH = pathlib.Path(HERE)
 RUNNER = os.path.join(HERE, "fleet-pass.sh")
-SCRATCH_ROOT = os.environ.get("FLEET_PASS_TEST_TMP", "/Volumes/Workshop/Code/agent-worktrees")
+# None falls back to the platform temp dir, which exists on every runner.
+SCRATCH_ROOT = os.environ.get("FLEET_PASS_TEST_TMP") or None
 SHA = "b" * 40
 LINE = f"danielraffel/Shipyard#1225 {SHA} HOLD"
 
@@ -95,6 +98,26 @@ fi
                 f"danielraffel/Shipyard#1225 {SHA} REPAIR-BUDGET-HELD attempts=3 reason=HOLD",
                 output.getvalue(),
             )
+
+
+
+class FleetPassSelftest(unittest.TestCase):
+    def test_selftest_exercises_two_slot_shared_claims(self):
+        # Keep every temporary file under the repository worktree.
+        with tempfile.TemporaryDirectory(dir=HERE_PATH.parent.parent) as scratch:
+            env = os.environ.copy()
+            env["TMPDIR"] = scratch
+            result = subprocess.run(
+                [str(HERE_PATH / "fleet-pass.sh"), "--selftest"],
+                cwd=HERE_PATH.parent.parent,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("PASS queue-claims-exclusive", result.stdout)
+        self.assertIn("SELFTEST OK", result.stdout)
 
 
 if __name__ == "__main__":

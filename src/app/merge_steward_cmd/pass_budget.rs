@@ -253,7 +253,11 @@ pub(super) fn processing_order(
         let overstayed = usize::from(!readmit.contains(&number));
         let carry_rank = carried.get(&number).copied().unwrap_or(usize::MAX);
         let rank = ranked.get(&number).copied().unwrap_or(usize::MAX);
-        (group, carry_rank, overstayed, rank, index)
+        // Entries paused while the base was poisoned are admitted first, in
+        // the order they held in the queue. See `poison_pause`.
+        let restore =
+            super::poison_pause::restore_rank(ledger, repo, base, number).unwrap_or(usize::MAX);
+        (group, restore, carry_rank, overstayed, rank, index)
     });
     order
 }

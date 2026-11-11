@@ -4,7 +4,6 @@
 //! request. The fake `gh` runs the real `ghapp` queue-removal guard on each
 //! removal, as the wrapper would.
 use super::*;
-use crate::app::merge_steward_cmd::cancellation::apply_pr_plans;
 
 const HEAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const OLD_HEAD: &str = "ca1f305c00000000000000000000000000000000";
@@ -293,7 +292,16 @@ fn run(fixture: &Fixture) -> Outcome {
 }
 
 /// One steward pass over `fixture`, carrying `ledger` from earlier passes.
-fn run_with(fixture: &Fixture, mut ledger: StewardLedger) -> Outcome {
+fn run_with(fixture: &Fixture, ledger: StewardLedger) -> Outcome {
+    run_poisoned(fixture, ledger, None)
+}
+
+/// [`run_with`] under a preset merge-group reading.
+fn run_poisoned(
+    fixture: &Fixture,
+    mut ledger: StewardLedger,
+    poison: Option<&crate::app::merge_steward_cmd::base_poison::RepoPoison>,
+) -> Outcome {
     let temp = tempfile::tempdir().expect("temp");
     let log = temp.path().join("calls");
     let actions = fake_gh(&temp, &fixture.script(&log));
@@ -350,15 +358,17 @@ fn run_with(fixture: &Fixture, mut ledger: StewardLedger) -> Outcome {
         }
     };
     let control = mutation_control(&temp, "studio", "studio");
-    let (reports, unhealthy) = apply_pr_plans(
-        &actions,
-        &args,
-        &observation,
-        &policy,
-        &temp.path().join("ledger.json"),
-        &mut ledger,
-        fixture.apply.then_some(&control),
-    );
+    let (reports, unhealthy, _) =
+        crate::app::merge_steward_cmd::cancellation::apply_pr_plans_with_poison(
+            &actions,
+            &args,
+            &observation,
+            &policy,
+            &temp.path().join("ledger.json"),
+            &mut ledger,
+            fixture.apply.then_some(&control),
+            poison,
+        );
     Outcome {
         unhealthy,
         report: reports[0].clone(),
@@ -1357,4 +1367,72 @@ fn assert_left_alone_writes(outcome: &Outcome) {
     for write in ["disablePullRequestAutoMerge", "dequeuePullRequest"] {
         assert!(!outcome.calls.contains(write), "{write}\n{}", outcome.calls);
     }
+}
+
+/// While the base is poisoned an approved queued head is paused, not left to
+/// burn a gate, through the same audited internal removal path, and its
+/// place is kept for the restore. See `poison_pause`.
+#[test]
+fn an_approved_queued_head_is_paused_while_the_base_is_poisoned() {
+    use crate::app::merge_steward_cmd::base_poison::RepoPoison;
+    use crate::base_health::merge_group::{GroupRef, MergeGroupHealth, PoisonedContext};
+    use crate::base_health::{AutoJump, BasePoisonPolicy, PoisonHold};
+    let poison = |hold| RepoPoison {
+        policy: BasePoisonPolicy {
+            hold,
+            pause: hold,
+            auto_jump: AutoJump::Off,
+            read_error: None,
+        },
+        health: MergeGroupHealth::Poisoned {
+            contexts: vec![PoisonedContext {
+                context: "Enforce version & skill sync".to_owned(),
+                first_error: None,
+                groups: vec![
+                    GroupRef {
+                        head_sha: "b".repeat(40),
+                        prs: vec![12012],
+                    },
+                    GroupRef {
+                        head_sha: "c".repeat(40),
+                        prs: vec![11890],
+                    },
+                ],
+                latest_failure_at: None,
+                check_id: None,
+                same_first_error: None,
+            }],
+        },
+        fixes: BTreeMap::new(),
+        fix_read_error: None,
+        candidates: std::collections::BTreeSet::default(),
+    };
+    let on = poison(PoisonHold::On);
+    // Only an entry the steward owns is paused: it is the steward's to restore.
+    let owned = Fixture {
+        owned: true,
+        ..queued_approved()
+    };
+    let unowned = run_poisoned(&queued_approved(), StewardLedger::default(), Some(&on));
+    assert_left_alone(&unowned);
+    let outcome = run_poisoned(&owned, StewardLedger::default(), Some(&on));
+    assert_eq!(
+        outcome.report.mutation.as_deref(),
+        Some(format!("paused_base_poisoned:{HEAD}").as_str()),
+        "{:?}\n{}",
+        outcome.report,
+        outcome.calls
+    );
+    assert_no_withdrawal_error(&outcome);
+    assert_guard_accepted(&outcome);
+    assert_audited(
+        &outcome,
+        crate::app::merge_steward_cmd::poison_pause::PAUSE_AUDIT,
+    );
+    assert!(!outcome.ledger.poison_paused.is_empty());
+    // The same pass without the poison leaves the approved entry queued.
+    assert_left_alone(&run(&owned));
+    // Dry-run reports and removes nothing.
+    let dry = poison(PoisonHold::DryRun);
+    assert_left_alone(&run_poisoned(&owned, StewardLedger::default(), Some(&dry)));
 }
