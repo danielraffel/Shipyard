@@ -15,6 +15,15 @@ rollup, newest 100 comments, merge state) with one paginated GraphQL query per
 30 PRs, plus two REST reads for the required checks. Per-PR REST reads would
 spend the App's REST budget (a shared 15000/hour) several times per PR per run.
 - `test_must_review.py`: offline unit tests for `must-review.py` (no network).
+- `repair_budget.py`: holds a rescue entry once its exact line (`<repo>#<n> <sha>
+  <REASON>`) has been attempted `--max` times (default 3) inside `--window` seconds
+  (default 6 h). The line carries every input a repair pass acts on, so an unchanged
+  line means another pass would see what the last ones saw. The runner filters the
+  rescue list through `repair_budget.py filter` before claiming and records only the
+  first line when a model pass starts with `repair_budget.py record`; current held
+  entries are written to `repair.held` for `operator-findings.py` and come back when
+  a push, a check result or the reason changes it.
+  `test_repair_budget.py` covers it offline.
 - `review_queue.py`: deterministic filters that keep model passes off heads that
   need no new review. `gate_carried` drops a head only when its newest
   `review-verdict` status says the gate carried an earlier approval to that exact
