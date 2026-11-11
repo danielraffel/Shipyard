@@ -176,7 +176,7 @@ impl ClaimRegistry {
         token: String,
         now: DateTime<Utc>,
     ) -> Result<WorkLease, ClaimError> {
-        let current = self.leases.get_mut(&key).ok_or(ClaimError::Missing)?;
+        let current = self.leases.get_mut(key).ok_or(ClaimError::Missing)?;
         current.heartbeat_at = now;
         current.expires_at = now + self.ttl;
         current.token = token;
