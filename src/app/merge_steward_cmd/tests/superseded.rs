@@ -769,3 +769,36 @@ fn a_named_successor_merged_into_another_base_does_not_count() {
         );
     }
 }
+
+#[test]
+fn a_failed_successor_read_leaves_a_labelled_head_unknown_not_clean() {
+    // Labelled, names #16 in a member comment, no cross-reference to #16; the
+    // successor read fails (not a rate limit) while the tree looks clean.
+    let mentions = r#"{"data":{"repository":{"p15":{"body":"","merged":false,"isInMergeQueue":false,
+        "labels":{"nodes":[{"name":"superseded"}]},
+        "comments":{"nodes":[{"body":"superseded by #16","authorAssociation":"OWNER"}]},
+        "queue":{"nodes":[]},"timelineItems":{"nodes":[]}}}}}"#;
+    let read = |args: &[String]| -> Result<String, String> {
+        let joined = args.join(" ");
+        if joined.contains("timelineItems") {
+            return Ok(mentions.to_owned());
+        }
+        if joined.contains("s16: pullRequest") {
+            return Err("graphql 502 bad gateway".to_owned());
+        }
+        if joined.contains("object(expression:") {
+            return Ok(
+                r#"{"data":{"repository":{"tip":{"target":{"oid":"c"}},"root":{"__typename":"Tree"},
+                "f0":{"__typename":"Blob","oid":"9"}}}}"#
+                    .to_owned(),
+            );
+        }
+        Ok(r#"{"ahead_by":1,"base_commit":{"sha":"c"},"files":[{"filename":"a","status":"modified","sha":"1"}]}"#.to_owned())
+    };
+    let mut ledger = StewardLedger::default();
+    let mut reports = vec![report(15, "no_verdict")];
+    annotate_with(&read, REPO, "main", &mut ledger, &mut reports, now());
+    let check = ledger.superseded_checks.values().next().expect("recorded");
+    assert!(check.unknown, "a failed successor read is unknown, not clean");
+    assert!(reports[0].blocked.superseded.is_none());
+}

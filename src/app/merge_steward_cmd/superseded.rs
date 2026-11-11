@@ -805,10 +805,10 @@ pub(super) fn check_repo(
                 }
             }
         }
-        let extra = match successors_merged(read, repo, base, &wanted) {
-            Ok(extra) => extra,
+        let (extra, successor_error) = match successors_merged(read, repo, base, &wanted) {
+            Ok(extra) => (extra, None),
             Err(error) if limited(&error) => return (out, Some(error)),
-            Err(_) => BTreeMap::new(),
+            Err(error) => (BTreeMap::new(), Some(error)),
         };
         for (number, head) in chunk {
             let Some((refs, texts, labelled)) = mentions.by_pr.get(number) else {
@@ -829,6 +829,18 @@ pub(super) fn check_repo(
                     Ok(Some(evidence("named_by", Some(m), None, detail))),
                 );
                 continue;
+            }
+            if let Some(error) = &successor_error {
+                // The named successor could not be read: a merged one may be
+                // hidden, so a labelled head naming one is unknown, never clean.
+                let unread = *labelled
+                    && named_successors(texts).iter().any(|s| {
+                        wanted.contains(s) && !refs.iter().any(|x| x.number == *s && x.same_repo)
+                    });
+                if unread {
+                    out.insert(*number, Err(format!("successor read failed: {error}")));
+                    continue;
+                }
             }
             let mut merged: BTreeMap<u64, bool> = refs
                 .iter()
