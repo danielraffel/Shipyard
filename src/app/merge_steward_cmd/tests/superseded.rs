@@ -799,6 +799,9 @@ fn a_failed_successor_read_leaves_a_labelled_head_unknown_not_clean() {
     let mut reports = vec![report(15, "no_verdict")];
     annotate_with(&read, REPO, "main", &mut ledger, &mut reports, now());
     let check = ledger.superseded_checks.values().next().expect("recorded");
-    assert!(check.unknown, "a failed successor read is unknown, not clean");
+    assert!(
+        check.unknown,
+        "a failed successor read is unknown, not clean"
+    );
     assert!(reports[0].blocked.superseded.is_none());
 }
