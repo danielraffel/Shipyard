@@ -59,6 +59,9 @@ pub(super) struct StewardCommandArgs {
     /// unapproved queue entries or only reports them. Read from the
     /// machine-global config by [`steward_command`].
     pub(super) unapproved_dequeue: unapproved_admission::DequeueMode,
+    /// `--infra-rerun`: re-run required checks that failed for an
+    /// infrastructure reason, on every open pull request. See `infra_rerun`.
+    pub(super) infra_rerun: infra_rerun::Mode,
     /// Each repository's time budget (`--pass-budget-secs`); its clock
     /// starts when that repository's observation starts, so a later
     /// repository is never starved by an earlier one. `None` never defers.
@@ -174,6 +177,11 @@ struct RepoReport {
     /// not ask for it.
     #[serde(skip_serializing_if = "Option::is_none")]
     base_poison: Option<Value>,
+    /// Required checks re-run (or, in shadow, that would be) because they
+    /// failed for an infrastructure reason, and outage findings
+    /// ([`infra_rerun`]). Absent when the repository was not observed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    infra_rerun: Option<infra_rerun::RepoStatus>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -231,6 +239,19 @@ struct StewardLedger {
     /// `dwell_pass`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     dwell: BTreeMap<String, crate::merge_steward::dwell::DwellRepoState>,
+    /// Queue entries removed while the base was poisoned, in queue order,
+    /// keyed `repo@base`; restored first once the poison clears. See
+    /// `poison_pause`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    poison_paused: BTreeMap<String, Vec<poison_pause::PausedEntry>>,
+    /// Infra re-runs per check on an exact head, keyed
+    /// `repo#pr@head:check`. See `infra_rerun`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    infra_reruns: BTreeMap<String, infra_rerun::Record>,
+    /// When each outage finding was first reported and last seen, keyed
+    /// `repo|check|step`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    infra_outages: BTreeMap<String, infra_rerun::OutageSeen>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1717,6 +1738,7 @@ fn deferred_rate_limit_repo_report(
         rate_limit_deferred: Some(cooldown),
         exit_reasons: Vec::new(),
         dwell: None,
+        infra_rerun: None,
     }
 }
 
@@ -1746,6 +1768,7 @@ fn unreadable_repo_report(
         rate_limit_deferred: None,
         exit_reasons: Vec::new(),
         dwell: None,
+        infra_rerun: None,
     }
 }
 
@@ -1825,6 +1848,7 @@ fn append_unmatched_recovery_errors(
             rate_limit_deferred: None,
             exit_reasons: Vec::new(),
             dwell: None,
+            infra_rerun: None,
         });
     }
 }
@@ -1864,6 +1888,7 @@ fn persist_final_ledger(
             rate_limit_deferred: None,
             exit_reasons: Vec::new(),
             dwell: None,
+            infra_rerun: None,
         });
     }
 }
@@ -2009,22 +2034,26 @@ pub(super) mod dwell_pass;
 mod exact_head_merge;
 mod generated_paths;
 mod head_rollup;
+pub(super) mod infra_rerun;
 mod ledger;
 mod mutation_outcome;
 mod native_arm;
 mod next_action;
 mod observation;
 mod pass_budget;
+mod poison_pause;
 mod pr_mutations;
 pub(super) mod queue_drain;
 mod queue_priority_recovery;
 pub(super) mod read_probe;
 mod render;
 mod resume_record;
+mod shadow_ledger;
 mod terminal_handoff;
 pub(super) mod train;
 mod unapproved_admission;
 pub(super) use carried_commits::STACKED_LABEL_PREFIX;
+pub(super) use infra_rerun::Mode as InfraRerunMode;
 pub(super) use unapproved_admission::DequeueMode;
 
 use cancellation::{
@@ -2203,6 +2232,7 @@ fn single_pr_dry_run(
         approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
         wake_owner: false,
         unapproved_dequeue: DequeueMode::Report,
+        infra_rerun: InfraRerunMode::Off,
         pass_budget: None,
         pass_deadline: None,
         apply: false,

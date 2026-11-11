@@ -131,6 +131,63 @@ pub(super) fn apply_repo_plan(
         };
         super::base_poison::report(poison, &fast_track)
     });
+    let pause_lines = if args.apply {
+        super::poison_pause::reconcile(ledger, observation, base_poison.as_ref(), Utc::now())
+    } else {
+        Vec::new()
+    };
+    // Shadow ledger: every would-fire episode per rule, labelled when it
+    // ends, and the promotion gate it feeds. Measurement only.
+    let shadow = match (args.apply, mutation_control, base_poison.as_ref()) {
+        (true, Some(control), Some(poison)) => {
+            // Real holds and pauses, and would-be ones under dry-run, are
+            // counted apart so the gate's cost side says which it measured.
+            let marked = |prefix: &str| {
+                reports
+                    .iter()
+                    .filter(|report| {
+                        report.mutation.as_deref().is_some_and(|mutation| {
+                            mutation.split(',').any(|part| {
+                                part.starts_with(prefix) && part.contains("base_poisoned")
+                            })
+                        })
+                    })
+                    .map(|report| report.number)
+                    .collect::<std::collections::BTreeSet<_>>()
+            };
+            let mut held = marked("held_");
+            held.extend(marked("paused_"));
+            let would = marked("would_");
+            Some(super::shadow_ledger::record_pass(
+                &control.state_dir,
+                &observation.repo,
+                &observation.base,
+                Some(poison),
+                &held,
+                &would,
+                Utc::now(),
+            ))
+        }
+        _ => None,
+    };
+    let base_poison_report = match base_poison_report {
+        Some(mut value) => {
+            if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "pause".to_owned(),
+                    super::poison_pause::report(observation, base_poison.as_ref(), &pause_lines),
+                );
+                if let Some(shadow) = shadow {
+                    object.insert("shadow".to_owned(), shadow);
+                }
+            }
+            Some(value)
+        }
+        None if !pause_lines.is_empty() => Some(serde_json::json!({
+            "pause": super::poison_pause::report(observation, None, &pause_lines),
+        })),
+        None => None,
+    };
     let dwell_policy =
         super::dwell_pass::read_policy(actions, &observation.repo, &observation.base);
     let dwell_report = super::dwell_pass::run(
@@ -199,8 +256,39 @@ pub(super) fn apply_repo_plan(
             )
         };
     super::native_arm::annotate_carried_refusals(&native_arm_status, &mut reports);
+    // Infra reruns act on every open pull request, owned or not. A dry run
+    // never writes, so it reports what an enforcing pass would re-run.
+    let infra_mode = match args.infra_rerun {
+        super::infra_rerun::Mode::Enforce if !args.apply => super::infra_rerun::Mode::Shadow,
+        mode => mode,
+    };
+    let mut infra_excluded = vec![args.opt_out_label.clone()];
+    infra_excluded.extend(args.provenance_blocking_labels.iter().cloned());
+    let (infra_rerun_status, infra_rerun_failed) = super::infra_rerun::sweep(
+        &super::infra_rerun::Sweep {
+            observation,
+            mode: infra_mode,
+            approval_context: &args.approval_context,
+            excluded_labels: &infra_excluded,
+            now_epoch: Utc::now().timestamp(),
+            deadline: args.pass_deadline,
+            ledger_path: args.apply.then_some(ledger_path),
+        },
+        ledger,
+        &super::infra_rerun::GitHubActs {
+            actions,
+            repo: &observation.repo,
+            required: observation
+                .required_checks
+                .iter()
+                .map(|check| check.context.clone())
+                .collect(),
+            deadline: args.pass_deadline,
+        },
+    );
     let mut unhealthy = (args.preempt_capacity && observation.preemption_error.is_some())
         || native_arm_failed
+        || infra_rerun_failed
         || pr_mutation_failed
         || recovery_witness_error.is_some()
         || terminal_handoff_reconcile_error.is_some()
@@ -304,6 +392,7 @@ pub(super) fn apply_repo_plan(
             rate_limit_deferred: None,
             exit_reasons: Vec::new(),
             dwell: Some(dwell_report),
+            infra_rerun: Some(infra_rerun_status),
             repo: observation.repo.clone(),
             base: args.base.clone(),
             allow_auto_merge: observation.allow_auto_merge,
@@ -482,6 +571,30 @@ pub(super) fn apply_pr_plans_with_poison(
                 },
             )
         };
+        if let Some(report) =
+            super::poison_pause::waiting_report(ledger, observation, pr, &decision)
+        {
+            return report;
+        }
+        // While the base is poisoned a queued entry only burns a gate:
+        // remove it and remember its place. See `poison_pause`.
+        if !stale_mutation
+            .as_deref()
+            .is_some_and(|mutation| mutation.contains("dequeued_"))
+            && let Some(mut report) = super::poison_pause::pause_pr(
+                mutation_context.as_ref(),
+                args.apply,
+                observation,
+                pr,
+                &decision,
+                base_poison,
+                ledger,
+            )
+        {
+            unhealthy |= report.error.is_some();
+            (report.mutation, report.error) = fold(report.mutation, report.error);
+            return report;
+        }
         if let Some(mut report) =
             provenance_blocked_report(mutation_context.as_ref(), pr, policy, &decision, ledger)
         {

@@ -62,6 +62,7 @@ fn poisoned(hold: PoisonHold, auto_jump: AutoJump, fixes: &[u64]) -> RepoPoison 
     RepoPoison {
         policy: BasePoisonPolicy {
             hold,
+            pause: hold,
             auto_jump,
             read_error: None,
         },
@@ -81,6 +82,7 @@ fn poisoned(hold: PoisonHold, auto_jump: AutoJump, fixes: &[u64]) -> RepoPoison 
                 ],
                 latest_failure_at: None,
                 check_id: Some(1),
+                same_first_error: None,
             }],
         },
         fixes: fixes
@@ -88,6 +90,7 @@ fn poisoned(hold: PoisonHold, auto_jump: AutoJump, fixes: &[u64]) -> RepoPoison 
             .map(|pr| (*pr, vec!["label `shipyard:unblock`".to_owned()]))
             .collect(),
         fix_read_error: None,
+        candidates: std::collections::BTreeSet::default(),
     }
 }
 
@@ -259,6 +262,7 @@ fn every_named_fix_is_admitted_and_every_other_pull_request_held() {
     let clear = RepoPoison {
         health: MergeGroupHealth::Clear {
             detail: "newest merge group passed".to_owned(),
+            passed: Vec::new(),
         },
         ..poison.clone()
     };

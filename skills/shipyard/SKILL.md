@@ -3766,7 +3766,12 @@ The watcher resolves the repository default branch; use `--fleet-base` or
 
 Use `shipyard runner steward` for agent-neutral merge-on-green reconciliation.
 It observes by default; `--apply` enables exact-head guarded queue admission,
-reruns, and narrowly policy-scoped capacity-preemption mutations. Client-side
+reruns, and narrowly policy-scoped capacity-preemption mutations. `--infra-rerun`
+(default `enforce` under `--apply`) re-runs a required check that failed for an
+infra reason (per `shipyard diagnose`) on any open pull request, never
+`review-verdict`, at most twice per head and check with a 20-minute backoff, and
+reports "infra outage suspected" in `infra_rerun.findings`; see
+[references/merge-steward.md](references/merge-steward.md#infra-reruns---infra-rerun-every-open-pull-request). Client-side
 REST direct merge is refused because GitHub cannot atomically bind both complete
 check materialization and the validated base revision; use a server-owned merge
 queue or the server-enforced exact-head merge below. A base with no merge queue (GitHub offers
@@ -5843,6 +5848,32 @@ detector, then text, lowest number on a tie; a PR that rode a failing group is
 never chosen), its CI is prioritized only while a non-approval required check
 has not completed, and a dry-run hold never jumps. `base-health --act` is the
 manual path; leave `auto_jump` driving the steward alone so one writer jumps.
+`src/app/merge_steward_cmd/poison_pause.rs` adds a queue pause behind its
+own key, `[base_health] merge_group_pause` (default `dry-run`: reports
+`would_pause` and removes nothing; it removes entries only when it and the
+hold are both `on`). A paused entry is one the steward admitted (`Queued`)
+and that is not a candidate fix; it is dequeued on the audited internal path
+(`PAUSE_AUDIT`, a steward removal, so it never counts toward the ejection
+cap) and its place is kept in the ledger's `poison_paused`. Entries are
+admitted first, in queue order, through `pass_budget::processing_order` only
+after a merge group passes that context (`MergeGroupHealth::Clear.passed`) or
+the hold is `off`; until then normal admission skips them too
+(`paused_awaiting_pass`), so a stale streak or an unread history never
+refills a still-broken base. A head that passes the context after the newest failing
+group while two or more open heads fail it (`passing_head_fixes`) is a
+measured candidate (never one that rode a failing group): exempt from the
+pause and admitted plainly, never fast-tracked or jumped. With no fix named, `route_root_cause` opens one
+marker-keyed tracking issue per context (`<!-- shipyard-base-poison: `,
+receipts in `<state>/base-health/poison-issues.jsonl`, failures back off 30
+min) and lists it first in the reviewer priority file. Every rule is
+measured in `shadow_ledger.rs` (`<state>/base-health/shadow-open.json` and
+`shadow-ended.jsonl`; reported under `repos[].base_poison.shadow`): episodes
+per rule (`streak`, and `strict` = every group failed with the same first
+error line), labelled true when the streak grew past two groups, and a
+promotion `gate` per rule (>= 10 ended episodes and >= 14 days, precision
+>= 0.9, false-fire PR-minutes below savings). Replayed over 2026-11-04..11
+the `streak` rule was right in 2 of 12 Pulp episodes and 0-1 of 10 Vellum
+ones, which is why every act here starts in shadow.
 
 ### The endpoint that lies by omission
 

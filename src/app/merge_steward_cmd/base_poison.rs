@@ -15,8 +15,13 @@
 //!   enqueued as before and reported `would_hold_base_poisoned:<context>`.
 //! * **Fast-track the fix.** A pull request is a named fix when it carries
 //!   [`crate::queue_drain::UNBLOCK_LABEL`], when its title or description
-//!   names the poisoned context next to a fix word, or when the base-poison
-//!   detector names it as `candidate_fix_pr`. For each one [`fast_track`]
+//!   names the poisoned context next to a fix word, when the base-poison
+//!   detector names it as `candidate_fix_pr`. A head that passes the context
+//!   after the newest failing group while at least two other open heads fail
+//!   it ([`super::poison_pause::passing_head_fixes`]) is only exempt from the
+//!   pause, never fast-tracked. When nothing names a fix, the steward opens one tracking issue per
+//!   poisoned context ([`ensure_tracking_issue`]) and puts it first in the
+//!   machine's priority file, so the repair lane starts on the root cause. For each one [`fast_track`]
 //!   puts its review first (the machine's reviewer priority file and kick
 //!   command, once per head) and moves its waiting CI jobs to the front of
 //!   the runner queue, excusing only the approval context's red, which every
@@ -43,7 +48,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::{GitHubActions, MutationControl, RepoObservation, StewardPolicy};
-use crate::base_health::merge_group::{self, MergeGroupHealth};
+use crate::base_health::merge_group::{self, MergeGroupHealth, PoisonedContext};
 use crate::base_health::{
     self, AutoJump, BasePoisonPolicy, FIX_REVIEW_KICK_KEY, FIX_REVIEW_PRIORITY_FILE_KEY, PoisonHold,
 };
@@ -64,6 +69,11 @@ pub(super) struct RepoPoison {
     pub(super) health: MergeGroupHealth,
     /// Named fixes for a poisoned context, with why each counts.
     pub(super) fixes: BTreeMap<u64, Vec<String>>,
+    /// Every candidate fix, named or measured, before [`choose_fix`]
+    /// narrows them to one. The pause never removes any of them, so a fix
+    /// already in the queue keeps its group even when the pick changes.
+    #[serde(default)]
+    pub(super) candidates: std::collections::BTreeSet<u64>,
     /// Why named fixes could not be listed, when they could not.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) fix_read_error: Option<String>,
@@ -113,6 +123,12 @@ pub(super) fn admission(poison: Option<&RepoPoison>, pr: u64) -> Admission {
     if contexts.is_empty() {
         return Admission::Proceed;
     }
+    // A measured candidate (its head passes the context while others fail
+    // it) is admitted as usual, with no jump and no fast-track: at worst it
+    // costs the one group it forms.
+    if !poison.fixes.contains_key(&pr) && poison.candidates.contains(&pr) {
+        return Admission::Proceed;
+    }
     if poison.fixes.contains_key(&pr) {
         return Admission::FastTrack {
             // A jump reorders the queue, so it is a mutation: dry-run never jumps.
@@ -159,13 +175,39 @@ pub(super) fn observe(
             now,
         )
     };
-    let fixes = choose_fix(fixes, &health);
+    let (fixes, candidates) = assemble_fixes(fixes, &observation.prs, &health);
     Some(RepoPoison {
+        candidates,
         policy: poison_policy,
         health,
         fixes,
         fix_read_error,
     })
+}
+
+/// The one named fix this pass fast-tracks ([`choose_fix`]), and every
+/// candidate the pause must leave alone: the named ones plus the measured
+/// ones ([`super::poison_pause::passing_head_fixes`]). Measured evidence only
+/// exempts a pull request from the pause; it never fast-tracks, cancels or
+/// jumps, because a path-filtered check can pass on an unrelated head.
+pub(super) fn assemble_fixes(
+    named: BTreeMap<u64, Vec<String>>,
+    prs: &[super::ObservedPr],
+    health: &MergeGroupHealth,
+) -> (BTreeMap<u64, Vec<String>>, std::collections::BTreeSet<u64>) {
+    let mut candidates = named
+        .keys()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    candidates.extend(super::poison_pause::passing_head_fixes(prs, health).into_keys());
+    // A pull request that rode a failing group demonstrably did not fix it.
+    candidates.retain(|pr| {
+        !health
+            .poisoned()
+            .iter()
+            .any(|poison| poison.groups.iter().any(|group| group.prs.contains(pr)))
+    });
+    (choose_fix(named, health), candidates)
 }
 
 /// The one fix this pass fast-tracks, out of every named candidate.
@@ -536,11 +578,30 @@ pub(super) fn fast_track(
     poison: &RepoPoison,
 ) -> Vec<String> {
     let contexts = poison.health.poisoned_contexts();
-    if contexts.is_empty() || poison.fixes.is_empty() {
+    if contexts.is_empty() {
         return Vec::new();
     }
-    let contexts = contexts.join(",");
     let hooks = ReviewHooks::from_machine_global(&control.global_dir);
+    if poison.fixes.is_empty() {
+        let run_gh = |argv: &[String]| actions.run_gh(argv).map_err(|error| error.to_string());
+        return poison
+            .health
+            .poisoned()
+            .iter()
+            .flat_map(|poisoned| {
+                route_root_cause(
+                    &run_gh,
+                    &hooks,
+                    &control.state_dir,
+                    &observation.repo,
+                    &observation.base,
+                    poisoned,
+                    Utc::now(),
+                )
+            })
+            .collect();
+    }
+    let contexts = contexts.join(",");
     let runtime = super::queue_drain::QueueDrainRuntime {
         cwd: &control.cwd,
         mode: control.mode,
@@ -598,6 +659,231 @@ pub(super) fn fast_track(
         );
     }
     lines
+}
+
+/// Tracking-issue receipts, one line per issue opened or found.
+const ISSUE_FILE: &str = "base-health/poison-issues.jsonl";
+/// Marker that makes a tracking issue the steward's own.
+pub(super) const ISSUE_MARKER: &str = "<!-- shipyard-base-poison: ";
+/// How long a receipt is trusted before the open issues are listed again.
+const ISSUE_RECEIPT_HOURS: i64 = 24;
+/// How long a failed listing or open waits before it is tried again, so a
+/// broken read does not page every open issue on every pass.
+const ISSUE_RETRY_MINUTES: i64 = 30;
+
+/// One tracking issue the steward opened or found for a poisoned context.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub(super) struct IssueReceipt {
+    /// `OWNER/REPO@BASE#CONTEXT`.
+    pub(super) key: String,
+    /// The issue.
+    pub(super) issue: u64,
+    /// RFC 3339.
+    pub(super) at: String,
+}
+
+/// The marker key of the tracking issue for one poisoned context.
+pub(super) fn issue_key(repo: &str, base: &str, context: &str) -> String {
+    format!("{}@{base}#{context}", repo.to_ascii_lowercase())
+}
+
+/// The body of a new tracking issue.
+pub(super) fn issue_body(repo: &str, base: &str, poisoned: &PoisonedContext) -> String {
+    let groups = poisoned
+        .groups
+        .iter()
+        .map(|group| {
+            format!(
+                "- merge group `{}` carrying {}",
+                group.head_sha.get(..12).unwrap_or(&group.head_sha),
+                group
+                    .prs
+                    .iter()
+                    .map(|pr| format!("#{pr}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "The required check `{context}` failed in {n} consecutive merge groups on `{base}` that \
+carried different pull requests, so the base itself is broken, not a pull request.\n\n\
+First error: `{error}`\n\n{groups}\n\n\
+While this lasts the steward holds admission and pauses the queue (`merge_group_hold = \"on\"`). \
+A pull request that fixes it is fast-tracked once it carries the `{label}` label or names \
+`{context}` next to a fix word in its title or description. When a merge group passes \
+`{context}`, the paused entries are restored in their queue order with no further step.\n\n\
+{marker}{key} -->",
+        context = poisoned.context,
+        n = poisoned.groups.len(),
+        error = poisoned
+            .first_error
+            .as_deref()
+            .unwrap_or("(no annotation)")
+            .replace('`', "'"),
+        label = crate::queue_drain::UNBLOCK_LABEL,
+        marker = ISSUE_MARKER,
+        key = issue_key(repo, base, &poisoned.context),
+    )
+}
+
+/// When nothing names a fix, open (or find) the context's tracking issue and
+/// put it first in the priority file, with a kick, so the root cause is the
+/// next thing worked. Returns report lines.
+pub(super) fn route_root_cause(
+    run_gh: &dyn Fn(&[String]) -> Result<String, String>,
+    hooks: &ReviewHooks,
+    state_dir: &Path,
+    repo: &str,
+    base: &str,
+    poisoned: &PoisonedContext,
+    now: DateTime<Utc>,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    let issue = match ensure_tracking_issue(run_gh, state_dir, repo, base, poisoned, now) {
+        Ok((issue, how)) => {
+            lines.push(format!(
+                "`{}` tracking issue #{issue}: {how}",
+                poisoned.context
+            ));
+            issue
+        }
+        Err(error) => {
+            lines.push(format!(
+                "`{}` tracking issue: failed: {error}",
+                poisoned.context
+            ));
+            return lines;
+        }
+    };
+    let entry = format!("{repo}#{issue}");
+    if let Some(file) = hooks.priority_file.as_ref() {
+        lines.push(match prioritize_line(file, &entry) {
+            Ok(true) => format!("{entry} listed first"),
+            Ok(false) => format!("{entry} already first"),
+            Err(error) => format!("{entry} priority: failed: {error}"),
+        });
+    }
+    if !hooks.kick.is_empty() {
+        let reason = format!(
+            "base poisoned ({}); no fix is named; root cause tracked in {entry}",
+            poisoned.context
+        );
+        let path = state_dir.join(FAST_TRACK_FILE);
+        let kicked = load_receipts(&path).iter().any(|receipt| {
+            receipt.repo.eq_ignore_ascii_case(repo)
+                && receipt.pr == issue
+                && receipt.action == "root_cause_kick"
+                && !receipt.outcome.starts_with("failed")
+        });
+        if !kicked {
+            let outcome = run_kick(&hooks.kick, &reason);
+            lines.push(format!("{entry} root_cause_kick: {outcome}"));
+            let receipt = FastTrackReceipt {
+                repo: repo.to_owned(),
+                pr: issue,
+                head: String::new(),
+                action: "root_cause_kick".to_owned(),
+                at: now.to_rfc3339(),
+                outcome,
+            };
+            if let Err(error) = append_receipt(&path, &receipt) {
+                lines.push(format!(
+                    "{entry} root_cause_kick: receipt not recorded: {error}"
+                ));
+            }
+        }
+    }
+    lines
+}
+
+/// The tracking issue for one poisoned context: a fresh receipt, then an
+/// open issue carrying the marker, then a new issue. Returns the number and
+/// how it was found.
+pub(super) fn ensure_tracking_issue(
+    run_gh: &dyn Fn(&[String]) -> Result<String, String>,
+    state_dir: &Path,
+    repo: &str,
+    base: &str,
+    poisoned: &PoisonedContext,
+    now: DateTime<Utc>,
+) -> Result<(u64, &'static str), String> {
+    let key = issue_key(repo, base, &poisoned.context);
+    let path = state_dir.join(ISSUE_FILE);
+    let fresh = fs::read_to_string(&path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<IssueReceipt>(line).ok())
+        .rfind(|receipt| {
+            if receipt.key != key {
+                return false;
+            }
+            let window = if receipt.issue == 0 {
+                chrono::Duration::minutes(ISSUE_RETRY_MINUTES)
+            } else {
+                chrono::Duration::hours(ISSUE_RECEIPT_HOURS)
+            };
+            DateTime::parse_from_rfc3339(&receipt.at)
+                .is_ok_and(|at| now - at.with_timezone(&Utc) < window)
+        });
+    if let Some(receipt) = fresh {
+        return if receipt.issue == 0 {
+            Err("an earlier attempt failed; retrying later".to_owned())
+        } else {
+            Ok((receipt.issue, "recorded"))
+        };
+    }
+    let record = |issue: u64| {
+        let receipt = IssueReceipt {
+            key: key.clone(),
+            issue,
+            at: now.to_rfc3339(),
+        };
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = writeln!(
+                file,
+                "{}",
+                serde_json::to_string(&receipt).unwrap_or_default()
+            );
+        }
+    };
+    let failed = |error: String| {
+        record(0);
+        error
+    };
+    let open = run_gh(&crate::marked_issue::list_open_args(repo)).map_err(failed)?;
+    if let Some(found) = crate::marked_issue::parse(&open, ISSUE_MARKER)
+        .into_iter()
+        .find(|issue| issue.key == key)
+    {
+        record(found.number);
+        return Ok((found.number, "already open"));
+    }
+    let title = format!(
+        "Base poisoned: `{}` fails every merge group on {base}",
+        poisoned.context
+    );
+    let raw = run_gh(&[
+        "api".to_owned(),
+        "--method".to_owned(),
+        "POST".to_owned(),
+        format!("repos/{repo}/issues"),
+        "-f".to_owned(),
+        format!("title={title}"),
+        "-f".to_owned(),
+        format!("body={}", issue_body(repo, base, poisoned)),
+    ])
+    .map_err(failed)?;
+    let number = serde_json::from_str::<Value>(&raw)
+        .ok()
+        .and_then(|value| value.get("number").and_then(Value::as_u64))
+        .ok_or_else(|| failed("the new issue's number was not returned".to_owned()))?;
+    record(number);
+    Ok((number, "opened"))
 }
 
 #[cfg(test)]
