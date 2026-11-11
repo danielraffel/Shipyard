@@ -560,6 +560,94 @@ fn read_logs(read: &Read<'_>, repo: &str, target: &Target) -> HashMap<i64, Strin
         .collect()
 }
 
+/// Byte cap for a diagnosis that is decided on, never printed: large enough
+/// that [`diagnose::fit`] drops no check the caller needs to judge.
+pub(super) const DECISION_MAX_BYTES: usize = 1 << 20;
+
+/// The latest attempt of each run in `runs`, diagnosed against `required`
+/// exactly as `shipyard diagnose --run` does, with no history (history only
+/// ever yields `flake_candidate`) and the default fail-closed marker. Returns
+/// the diagnosis and the jobs it read. Used by the steward's infra rerun, so
+/// it fails closed where the printed diagnosis degrades: an unreadable
+/// annotation (it could turn a superseded sibling into a starved one) is an
+/// error, and a run with a job still in flight reads no logs at all.
+pub(super) fn diagnose_runs(
+    read: &Read<'_>,
+    repo: &str,
+    runs: &[u64],
+    required: &[String],
+) -> Result<(Diagnosis, Vec<Job>), String> {
+    let mut target = Target {
+        required: required.to_vec(),
+        ..Target::default()
+    };
+    for run in runs {
+        let value = read_json(
+            read,
+            &[
+                "api",
+                &format!("repos/{repo}/actions/runs/{run}/jobs?per_page=100"),
+            ],
+        )?;
+        let rows = value
+            .get("jobs")
+            .cloned()
+            .ok_or_else(|| format!("jobs of run {run}: no jobs list"))?;
+        let jobs: Vec<Job> =
+            serde_json::from_value(rows).map_err(|error| format!("jobs of run {run}: {error}"))?;
+        // A second page could hold a failure this decision never sees.
+        if value.get("total_count").and_then(Value::as_u64) != Some(jobs.len() as u64) {
+            return Err(format!(
+                "jobs of run {run} could not be read completely; refusing a partial read"
+            ));
+        }
+        target.jobs.extend(jobs);
+    }
+    if target
+        .jobs
+        .iter()
+        .any(|job| job.status.as_deref() != Some("completed"))
+    {
+        let doc = diagnose_gathered(&target.jobs, &HashMap::new(), HashMap::new(), required);
+        return Ok((doc, target.jobs));
+    }
+    let mut annotations = HashMap::new();
+    for id in annotation_targets(&target) {
+        let value = read_json(
+            read,
+            &[
+                "api",
+                &format!("repos/{repo}/check-runs/{id}/annotations?per_page=50"),
+            ],
+        )?;
+        let messages = value
+            .as_array()
+            .ok_or_else(|| format!("annotations of check run {id} are not a list"))?
+            .iter()
+            .filter_map(|item| item.get("message").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect();
+        annotations.insert(id, messages);
+    }
+    let logs = read_logs(read, repo, &target);
+    let doc = diagnose_gathered(&target.jobs, &logs, annotations, required);
+    Ok((doc, target.jobs))
+}
+
+/// The pure half of [`diagnose_runs`]: gathered jobs, logs and annotations
+/// in, diagnosis out. The infra-rerun back-test replays recorded runs
+/// through this same function.
+pub(super) fn diagnose_gathered(
+    jobs: &[Job],
+    logs: &HashMap<i64, String>,
+    annotations: HashMap<i64, Vec<String>>,
+    required: &[String],
+) -> Diagnosis {
+    let mut context = Context::new();
+    context.annotations = annotations;
+    diagnose::build(jobs, logs, required, &context, DECISION_MAX_BYTES)
+}
+
 fn queue_pr(job: &Job) -> Option<u64> {
     let branch = job.head_branch.as_deref()?;
     QUEUE_BRANCH.captures(branch)?[1].parse().ok()

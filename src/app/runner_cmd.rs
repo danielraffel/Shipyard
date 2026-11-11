@@ -452,6 +452,7 @@ fn runner_command_with_actions<W: Write>(
             approval_context,
             wake_owner,
             pass_budget_secs,
+            infra_rerun,
             apply,
             ledger,
         } => super::merge_steward_cmd::steward_command(
@@ -471,6 +472,7 @@ fn runner_command_with_actions<W: Write>(
                 approval_context,
                 wake_owner,
                 unapproved_dequeue: super::merge_steward_cmd::DequeueMode::default(),
+                infra_rerun: super::merge_steward_cmd::InfraRerunMode::parse(&infra_rerun).unwrap_or_default(),
                 pass_budget: (pass_budget_secs > 0).then(|| Duration::from_secs(pass_budget_secs)),
                 pass_deadline: None,
                 apply,

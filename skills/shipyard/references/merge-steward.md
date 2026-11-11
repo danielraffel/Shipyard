@@ -59,6 +59,58 @@ by check as well as by run, so a fresh run of the same check on the same head
 cannot buy a second rerun. The carrier's `redispatch` class uses the same
 classifier and the same budget of one.
 
+### Infra reruns (`--infra-rerun`, every open pull request)
+
+A required check that FAILED for an infrastructure reason is a separate case
+from an interruption, and it is not limited to owned or armed pull requests:
+an apt-mirror outage turns `drift-fast` red at `Install Linux dependencies` on
+every pull request pushed in the window, and nothing re-runs them until a
+person notices. `--infra-rerun` (`off`, `shadow`, `enforce`; module
+`merge_steward_cmd::infra_rerun`) handles it on every repository pass:
+
+- Candidates: a required check-run whose newest attempt on the current head is
+  `COMPLETED`/`FAILURE`. Managed heads come from the census the pass already
+  read; heads the census skipped (unmanaged pull requests that are not draft,
+  queued or conflicting) are read in batched rollup queries of six heads, at
+  most 60 per pass. `review-verdict` (and `--approval-context`) is never a
+  candidate: its red means "awaiting a reviewer", and its failing step is a
+  non-content one, so the classifier alone would call it infra. Pull requests
+  labelled `superseded`, `owner-decision`, `PARKED/*`, the opt-out label or a
+  provenance-blocking label are skipped. Cancelled and timed-out checks stay
+  with the transient path above.
+- A run that the rollup still shows in flight costs no read. Otherwise each
+  candidate run is diagnosed once per red observation with
+  `shipyard diagnose`'s own classifier (`diagnose_cmd::diagnose_runs`, which
+  fails closed on an unreadable annotation or a partial jobs page): the run's
+  jobs, the failing required jobs' logs, and any annotations a cancel needs.
+  At most 8 runs per repository pass, newest first, inside the pass budget; a
+  rate-limit error stops the sweep's reads. The ledger remembers the check id
+  it judged, so a declined red is never re-read.
+- A run is re-run (`POST /actions/runs/{id}/rerun-failed-jobs`) only when every
+  failed, timed-out or startup-failed job in it, required or not, is a
+  diagnosed infra failure of a required job (cancelled fail-fast siblings are
+  tolerated), no job in it is the approval context, all its jobs are complete,
+  and it is of the current head. `rerun-failed-jobs` re-runs every failed job
+  and its dependents, so one real failure anywhere declines the whole run.
+- Budget per (head SHA, check): one re-run; a second only after 20 minutes and
+  only if the re-run failed as infra again; then `capped`. The intent is saved
+  before the POST, and GitHub's `run_attempt` fences the cap too, so a crash
+  or a lost ledger cannot buy a third. A red after the cap is classified once:
+  infra is `capped`, anything else `declined`. A refused POST or an unreadable
+  diagnosis is retried after 20 minutes, twice at most (`refused`).
+- Outage finding: when a check is capped, or 3 or more open pull requests are
+  still red or re-running on the same check after an infra call at the same
+  step, the repository report's `infra_rerun.findings` carries one line,
+  "infra outage suspected: <check> failing on N PRs at step '<step>'". It is
+  one finding per episode (`first_reported_at`, `new`, remembered 40 minutes
+  past its last sighting) and `tools/fleet-pass/operator-findings.py` prints
+  it as `INFRA-OUTAGE-SUSPECTED`.
+- Known blind spot: a head can break a "non-content" step itself (a bad
+  submodule pin breaks checkout, a changed lockfile breaks `Install …
+  dependencies`). Such a red is re-run at most twice, then reported.
+- `shadow` reports `would_rerun` and writes nothing to GitHub; without
+  `--apply`, `enforce` reports as `shadow`.
+
 Ownership is explicit. Before the steward may mutate a PR, the submitting
 agent writes an exact-head receipt and management label:
 
