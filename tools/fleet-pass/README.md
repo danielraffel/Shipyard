@@ -15,6 +15,20 @@ rollup, newest 100 comments, merge state) with one paginated GraphQL query per
 30 PRs, plus two REST reads for the required checks. Per-PR REST reads would
 spend the App's REST budget (a shared 15000/hour) several times per PR per run.
 - `test_must_review.py`: offline unit tests for `must-review.py` (no network).
+- `version_only.py`: the version-bump-only diff class and its consistency check,
+  in SHADOW. `classify` admits a diff only when every file is one of
+  `CMakeLists.txt`, `CHANGELOG.md`, `.claude-plugin/plugin.json`,
+  `.claude-plugin/marketplace.json`, `tools/shipyard.toml`, none is carry-excluded
+  by the base, every changed line in the first four is a version line, and
+  CHANGELOG.md gains exactly one release block at its top (anchor, heading, plain
+  pull-request-title bullets linking this repository's pull requests) plus its one
+  link reference. Anything else goes to the full reviewer. `check` applies the
+  base's `versioning.json` surfaces: each surface's files agree, a moved surface goes
+  to the next patch, minor or major release, a changed file no surface owns is a
+  HOLD, and the new release block names the version the base carried. The runner
+  calls `shadow` on the reviewer queue, which appends the script verdict to a log
+  and decides nothing; `shadow-report` compares that log with the counted verdicts
+  and reports `may_decide` only after ten agreements and no disagreement. `test_version_only.py` covers it offline.
 
 ## Install (m3)
 
