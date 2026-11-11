@@ -1622,3 +1622,46 @@ fn a_red_required_check_never_arms_whatever_the_guards() {
         StewardDecision::WaitingRequired { .. }
     ));
 }
+
+/// The awaiting reading counts only the bound app's statuses, and prefers the
+/// REST history over a description-less rollup copy of the same status.
+#[test]
+fn approval_awaiting_ignores_other_creators_and_rollup_copies() {
+    let status =
+        |state: &str, conclusion: Option<&str>, app: Option<u64>, id: Option<u64>| StewardCheck {
+            name: "review-verdict".to_owned(),
+            source: StewardCheckSource::StatusContext,
+            app_id: app,
+            status: state.to_owned(),
+            conclusion: conclusion.map(str::to_owned),
+            run_id: None,
+            observed_at: Some("2026-11-11T11:25:01Z".to_owned()),
+            check_id: id,
+        };
+    let held = status("COMPLETED", Some("FAILURE"), Some(15368), Some(1));
+    // Someone else's newer pending status cannot mask the bound app's HOLD.
+    let mut spoof = status("IN_PROGRESS", None, None, Some(2));
+    spoof.observed_at = Some("2026-11-11T12:00:00Z".to_owned());
+    assert!(!approval_awaiting(
+        &[held.clone(), spoof.clone()],
+        "review-verdict",
+        Some(15368)
+    ));
+    // Control: an unbound rule does read it.
+    assert!(approval_awaiting(&[held, spoof], "review-verdict", None));
+    // A rollup copy (no id, read as failure) at the same time as the REST row
+    // the parser read as pending: the REST row decides.
+    let rollup_copy = status("COMPLETED", Some("FAILURE"), Some(15368), None);
+    let rest_pending = status("IN_PROGRESS", None, Some(15368), Some(3));
+    assert!(approval_awaiting(
+        &[rollup_copy.clone(), rest_pending],
+        "review-verdict",
+        Some(15368)
+    ));
+    // Only the rollup copy: it is what we have, and it reads red.
+    assert!(!approval_awaiting(
+        &[rollup_copy],
+        "review-verdict",
+        Some(15368)
+    ));
+}

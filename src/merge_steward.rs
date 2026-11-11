@@ -724,16 +724,64 @@ fn approval_status_refusal(
 #[must_use]
 pub fn approval_status_pending(pr: &StewardPullRequest, policy: &StewardPolicy) -> bool {
     let context = policy.approval_context.trim();
-    !context.is_empty()
-        && pr
-            .checks
-            .iter()
-            .filter(|check| {
-                check.source == StewardCheckSource::StatusContext
-                    && check.name.eq_ignore_ascii_case(context)
-            })
-            .max_by(|left, right| cmp_recency(left, right))
-            .is_some_and(|status| !status.status.eq_ignore_ascii_case("COMPLETED"))
+    let app_id = policy
+        .required_checks
+        .iter()
+        .find(|rule| rule.context.eq_ignore_ascii_case(context))
+        .and_then(|rule| rule.app_id);
+    approval_awaiting(&pr.checks, context, app_id)
+}
+
+/// Whether the newest commit status named `approval_context` on these checks
+/// is `pending`: the head awaits a reviewer's verdict and nothing failed.
+/// The steward's census and queue triage share this one reading, so a head
+/// that has not been reviewed yet is waiting everywhere, never red.
+///
+/// When the rule is bound to an app (`app_id`), only that app's statuses
+/// count, so another creator's status cannot mask a refusal. When the REST
+/// history was read (rows carry an id), only those rows count: a rollup copy
+/// of the same status has no description, so it cannot tell a legacy
+/// "no verdict yet" refusal from a HOLD and must not outrank the REST row.
+#[must_use]
+pub fn approval_awaiting(
+    checks: &[StewardCheck],
+    approval_context: &str,
+    app_id: Option<u64>,
+) -> bool {
+    let context = approval_context.trim();
+    if context.is_empty() {
+        return false;
+    }
+    let statuses: Vec<&StewardCheck> = checks
+        .iter()
+        .filter(|check| {
+            check.source == StewardCheckSource::StatusContext
+                && check.name.eq_ignore_ascii_case(context)
+                && app_id.is_none_or(|app_id| check.app_id == Some(app_id))
+        })
+        .collect();
+    let rest_read = statuses.iter().any(|status| status.check_id.is_some());
+    statuses
+        .into_iter()
+        .filter(|status| !rest_read || status.check_id.is_some())
+        .max_by(|left, right| cmp_recency(left, right))
+        .is_some_and(|status| !status.status.eq_ignore_ascii_case("COMPLETED"))
+}
+
+/// The description the approval status script gave a head with no verdict
+/// yet, before it learned to post `pending` for that case. Consumers that pin
+/// such a script still post `failure` with this text; it means "awaiting the
+/// reviewer", exactly what the newer script says with `pending`.
+pub const AWAITING_VERDICT_FAILURE_PREFIX: &str = "no reviewer verdict names head ";
+
+/// Whether a commit status is the approval script's "no verdict yet" refusal
+/// (see [`AWAITING_VERDICT_FAILURE_PREFIX`]): read it as pending. A pending
+/// status never satisfies a rule, so this can only turn red into waiting,
+/// never into green.
+#[must_use]
+pub fn is_awaiting_verdict_failure(state: &str, description: Option<&str>) -> bool {
+    state.eq_ignore_ascii_case("failure")
+        && description.is_some_and(|text| text.starts_with(AWAITING_VERDICT_FAILURE_PREFIX))
 }
 
 /// Whether the newest commit status named after the approval context, if

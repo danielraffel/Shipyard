@@ -1468,6 +1468,16 @@ pub(super) fn parse_rest_check(value: &Value) -> Option<StewardCheck> {
 
 pub(super) fn parse_rest_status(value: &Value) -> Option<StewardCheck> {
     let state = value.get("state")?.as_str()?;
+    // An approval script that predates `pending` for "no verdict yet" posts
+    // `failure` with a fixed description; that head is waiting on review.
+    let state = if crate::merge_steward::is_awaiting_verdict_failure(
+        state,
+        value.get("description").and_then(Value::as_str),
+    ) {
+        "pending"
+    } else {
+        state
+    };
     Some(StewardCheck {
         name: value.get("context")?.as_str()?.to_owned(),
         source: crate::merge_steward::StewardCheckSource::StatusContext,

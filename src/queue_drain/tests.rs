@@ -694,3 +694,61 @@ fn unblocking_candidates_excuse_the_approval_red_only_when_asked() {
         vec![12025]
     );
 }
+
+/// A head that only awaits its reviewer is not doomed: its approval check run
+/// is red, but the approval status reads pending. Triage keeps its runs and
+/// prioritize admits it. A failed approval status (a HOLD) still dooms it, and
+/// so does a real red on any other context.
+#[test]
+fn an_unreviewed_head_is_viable_and_a_held_head_is_doomed() {
+    let (required, mut prs, runs) = fix_awaiting_review();
+    prs[0].pr.labels.clear();
+    let status = |state: &str, conclusion: Option<&str>| StewardCheck {
+        name: "review-verdict".to_owned(),
+        source: StewardCheckSource::StatusContext,
+        app_id: None,
+        status: state.to_owned(),
+        conclusion: conclusion.map(str::to_owned),
+        run_id: None,
+        observed_at: Some("2026-10-24T09:59:00Z".to_owned()),
+        check_id: Some(5),
+    };
+
+    let mut awaiting = prs.clone();
+    awaiting[0].pr.checks.push(status("IN_PROGRESS", None));
+    assert_eq!(
+        doom_reason(Some(200), HEAD_A, &awaiting[0], &required),
+        None
+    );
+    let plan = plan_prioritize(12025, &runs, &awaiting, &required);
+    assert_eq!(plan.refusal, None, "{plan:?}");
+
+    let mut held = prs.clone();
+    held[0].pr.checks.push(status("COMPLETED", Some("FAILURE")));
+    assert!(matches!(
+        doom_reason(Some(200), HEAD_A, &held[0], &required),
+        Some(DoomReason::RequiredCheckFailed { .. })
+    ));
+
+    let mut approved = prs.clone();
+    approved[0].pr.checks = vec![
+        check("review-verdict", "completed", Some("success"), 92),
+        status("COMPLETED", Some("SUCCESS")),
+    ];
+    assert_eq!(
+        doom_reason(Some(200), HEAD_A, &approved[0], &required),
+        None
+    );
+
+    let mut red_elsewhere = awaiting.clone();
+    red_elsewhere[0]
+        .pr
+        .checks
+        .push(check("macos", "completed", Some("failure"), 93));
+    let Some(DoomReason::RequiredCheckFailed { contexts }) =
+        doom_reason(Some(200), HEAD_A, &red_elsewhere[0], &required)
+    else {
+        panic!("a real red still dooms an unreviewed head");
+    };
+    assert_eq!(contexts, vec!["macos".to_owned()]);
+}
