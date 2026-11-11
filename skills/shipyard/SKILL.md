@@ -6006,3 +6006,10 @@ The PR owner marker (`<!-- shipyard-owner: ... sid=<id> ... -->`) writes the
 session id as `sid=`, never `session=`: the ghapp stamp guard refuses any body
 comment containing the word "session" as a possible reviewer stamp. Readers
 still accept the legacy `session=` key.
+
+### Push keeps the SSH connection alive during the pre-push hook
+
+`shipyard pr` and `shipyard ship` push with `ServerAliveInterval=30` and
+`ServerAliveCountMax=10` appended to `GIT_SSH_COMMAND` or `core.sshCommand`
+(extended, never replaced), so a long pre-push hook does not drop the
+connection. HTTPS remotes are unaffected.
