@@ -60,6 +60,8 @@ const COMPARE_FILE_CAP: usize = 300;
 pub(super) const MENTION_BATCH: usize = 10;
 /// Cached verdicts are dropped after this long without a check.
 const FORGET_AFTER: Duration = Duration::days(3);
+/// The only GitHub App identity that the steward treats as a fleet author.
+const FLEET_APP_LOGINS: &[&str] = &["shipyard-local"];
 
 /// The deterministic evidence that a pull request's change already landed.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -379,7 +381,9 @@ pub(super) fn named_by(number: u64, base: &str, mentions: &[Mention]) -> Option<
 /// A revert undoes rather than supersedes: its text never counts.
 fn is_revert(text: &str) -> bool {
     let title = text.lines().next().unwrap_or("").trim_start();
-    title.len() >= 6 && title[..6].eq_ignore_ascii_case("revert")
+    title
+        .get(..6)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("revert"))
 }
 
 /// `label_successor` evidence: labelled `superseded`, names a successor,
@@ -602,7 +606,7 @@ pub(super) fn mentions_query(numbers: &[u64]) -> String {
         .iter()
         .map(|n| {
             format!(
-                "p{n}: pullRequest(number:{n}){{ body merged isInMergeQueue author{{__typename}} \
+                "p{n}: pullRequest(number:{n}){{ body merged isInMergeQueue author{{__typename login}} \
                  labels(first:30){{nodes{{name}}}} comments(last:30){{nodes{{body authorAssociation}}}} \
                  queue: timelineItems(last:10,itemTypes:[ADDED_TO_MERGE_QUEUE_EVENT,\
                  REMOVED_FROM_MERGE_QUEUE_EVENT]){{nodes{{__typename}}}} \
@@ -718,8 +722,19 @@ pub(super) fn parse_mentions(repo: &str, numbers: &[u64], data: &Value) -> Menti
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_owned();
-        let fleet_author =
-            node.pointer("/author/__typename").and_then(Value::as_str) == Some("Bot");
+        let fleet_author = node
+            .pointer("/author/__typename")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind == "Bot")
+            && node
+                .pointer("/author/login")
+                .and_then(Value::as_str)
+                .is_some_and(|login| {
+                    let login = login.strip_prefix("app/").unwrap_or(login);
+                    let login = login.strip_suffix("[bot]").unwrap_or(login);
+                    let login = login.to_ascii_lowercase();
+                    FLEET_APP_LOGINS.contains(&login.as_str())
+                });
         out.own.insert(*n, (body, fleet_author));
         out.by_pr.insert(*n, (mentions, texts, labelled));
         if landing {
@@ -804,6 +819,9 @@ pub(super) fn check_repo(
                     }
                 }
             }
+        }
+        if stop() {
+            return (out, None);
         }
         let (extra, successor_error) = match successors_merged(read, repo, base, &wanted) {
             Ok(extra) => (extra, None),

@@ -543,6 +543,41 @@ fn successors_must_land_on_the_same_base_and_text_must_be_unqualified() {
 }
 
 #[test]
+fn a_spent_budget_does_not_read_named_successors_after_mentions() {
+    let calls = RefCell::new(Vec::new());
+    let read = |args: &[String]| -> Result<String, String> {
+        let joined = args.join(" ");
+        calls.borrow_mut().push(joined.clone());
+        if joined.contains("timelineItems") {
+            return Ok(
+                r#"{"data":{"repository":{"p15":{"body":"superseded by #16","merged":false,
+                "isInMergeQueue":false,"author":{"__typename":"Bot","login":"shipyard-local[bot]"},
+                "labels":{"nodes":[{"name":"superseded"}]},"comments":{"nodes":[]},
+                "queue":{"nodes":[]},"timelineItems":{"nodes":[]}}}}}"#
+                    .to_owned(),
+            );
+        }
+        Err(format!("unexpected read: {joined}"))
+    };
+    let asked = RefCell::new(0);
+    let stop = || {
+        *asked.borrow_mut() += 1;
+        *asked.borrow() > 1
+    };
+    let (verdicts, error) =
+        superseded::check_repo(&read, REPO, "main", &[(15, HEAD.to_owned())], &stop);
+    assert!(error.is_none());
+    assert!(verdicts.is_empty(), "the unread head stays due");
+    assert_eq!(calls.borrow().len(), 1, "mentions is the last read");
+}
+
+#[test]
+fn a_unicode_title_does_not_panic_revert_detection() {
+    let mention = mention(16, true, true, "Reveré\nSupersedes #15");
+    assert_eq!(named_by(15, "main", &[mention]).map(|(n, _)| n), Some(16));
+}
+
+#[test]
 fn only_a_members_comment_names_a_successor() {
     let data = serde_json::json!({"p15": {"body": "", "merged": false, "isInMergeQueue": false,
         "labels": {"nodes": [{"name": "superseded"}]},
@@ -557,6 +592,20 @@ fn only_a_members_comment_names_a_successor() {
         named_successors(texts).into_iter().collect::<Vec<_>>(),
         vec![17]
     );
+}
+
+#[test]
+fn only_the_allowlisted_fleet_bot_is_a_fleet_author() {
+    let data = |login: &str| {
+        serde_json::json!({"p15": {"body": "", "merged": false, "isInMergeQueue": false,
+            "author": {"__typename": "Bot", "login": login},
+            "labels": {"nodes": []}, "comments": {"nodes": []},
+            "queue": {"nodes": []}, "timelineItems": {"nodes": []}}})
+    };
+    let unknown = superseded::parse_mentions(REPO, &[15], &data("other-bot"));
+    assert!(!unknown.own.get(&15).expect("own row").1);
+    let fleet = superseded::parse_mentions(REPO, &[15], &data("shipyard-local[bot]"));
+    assert!(fleet.own.get(&15).expect("own row").1);
 }
 
 #[test]
@@ -670,6 +719,7 @@ fn pass_args(apply: bool) -> StewardCommandArgs {
         approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
         wake_owner: false,
         unapproved_dequeue: crate::app::merge_steward_cmd::DequeueMode::Report,
+        infra_rerun: crate::app::merge_steward_cmd::InfraRerunMode::Off,
         pass_budget: None,
         pass_deadline: None,
         apply,
