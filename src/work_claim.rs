@@ -96,7 +96,7 @@ impl ClaimRegistry {
                 });
             }
             if current.expires_at > now && current.holder == holder {
-                return Ok(self.renew(key, current.token.clone(), now)?);
+                return self.renew(&key, current.token.clone(), now);
             }
         }
         let lease = WorkLease {
@@ -124,7 +124,7 @@ impl ClaimRegistry {
         if current.token != token {
             return Err(ClaimError::TokenMismatch);
         }
-        self.renew(key.clone(), token.to_owned(), now)
+        self.renew(key, token.to_owned(), now)
     }
 
     /// Release a live lease held by `token`.
@@ -172,7 +172,7 @@ impl ClaimRegistry {
 
     fn renew(
         &mut self,
-        key: ClaimKey,
+        key: &ClaimKey,
         token: String,
         now: DateTime<Utc>,
     ) -> Result<WorkLease, ClaimError> {
