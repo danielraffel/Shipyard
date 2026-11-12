@@ -340,3 +340,45 @@ fn an_older_parent_that_merged_in_the_childs_held_work_is_refused() {
     let (refusal, _) = run(&merged_in, &|_| Judgement::Approved);
     assert_eq!(refusal, None);
 }
+
+/// The residual the PR body names: P was opened first (empty), then reset
+/// onto C, a commit a newer Q introduced and is held on, and Q was then built
+/// on P's current head. From the graph and the opening order alone this is
+/// the older-parent stack above, so the opening-order tie-breaker admits P
+/// and C would land under P's exact-head approval.
+///
+/// This test pins that behaviour so it is visible, not implied. It is the
+/// open governance question on this rule (opening order versus a declared
+/// `stacked:<n>` / `Supersedes #n` relation): if the ruling picks a declared
+/// relation, the first assertion flips to a refusal naming C.
+#[test]
+fn residual_an_older_p_reset_onto_a_newer_held_qs_commits_is_admitted_by_opening_order() {
+    let reset_onto_q = Fixture {
+        p_number: OLDER_P,
+        p_head: C,
+        p_range: &[(C, &[BASE_TIP])],
+        q_head: F,
+        q_range: &[(C, &[BASE_TIP]), (F, &[C])],
+    };
+    let (refusal, judged) = run(&reset_onto_q, &|_| Judgement::Held("HOLD on C".to_owned()));
+    assert_eq!(
+        refusal, None,
+        "opening order clears C as the older P's own first-parent commit"
+    );
+    assert!(
+        judged.is_empty() || judged == vec![F.to_owned()],
+        "Q is judged, if at all, at its listed head: {judged:?}"
+    );
+
+    // Control: the same graph with P opened after Q is refused and names C,
+    // so only the opening order separates the two outcomes.
+    let newer = Fixture {
+        p_number: NEWER_P,
+        ..reset_onto_q
+    };
+    let refusal = run(&newer, &|_| Judgement::Held("HOLD on C".to_owned()))
+        .0
+        .expect("refused");
+    assert_eq!(refusal.token, CARRIES_Q);
+    assert!(refusal.detail.contains(C), "names C: {}", refusal.detail);
+}
