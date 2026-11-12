@@ -77,6 +77,27 @@ pub fn push_branch_with_env(
     branch: &str,
     environment: impl IntoIterator<Item = (OsString, OsString)>,
 ) -> Result<(), PrError> {
+    push_branch_internal(cwd, branch, None, environment)
+}
+
+/// Push the branch while asserting the remote head observed before the local
+/// gates ran. Git refuses the push when another actor moved the branch in the
+/// meantime, which makes duplicate repairs and stale repair jobs cheap no-ops.
+pub(crate) fn push_branch_with_expected_head(
+    cwd: &Path,
+    branch: &str,
+    expected_remote_head: &str,
+    environment: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Result<(), PrError> {
+    push_branch_internal(cwd, branch, Some(expected_remote_head), environment)
+}
+
+fn push_branch_internal(
+    cwd: &Path,
+    branch: &str,
+    expected_remote_head: Option<&str>,
+    environment: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Result<(), PrError> {
     // Supervised git push — sets SHIPYARD_PR_RUNNING=1 so downstream
     // pre-push hooks know this push originated from `shipyard pr`.
     let environment: Vec<_> = environment.into_iter().collect();
@@ -87,8 +108,11 @@ pub fn push_branch_with_env(
     let mut command = crate::supervised::git_push_supervised(cwd);
     command
         .envs(environment)
-        .args(["push", "-u", "origin", branch])
-        .current_dir(cwd);
+        .args(["push", "-u", "origin", branch]);
+    if let Some(expected) = expected_remote_head {
+        command.arg(format!("--force-with-lease=refs/heads/{branch}:{expected}"));
+    }
+    command.current_dir(cwd);
     let mut command = if let Some(path) = child_writer_path {
         crate::writer_domain_lease::guarded_child_command(&command, &path)
             .map_err(|error| PrError::new(format!("git push guardian failed to start: {error}")))?
@@ -837,8 +861,8 @@ mod tests {
         PrInfo, is_graphql_pr_create_integration_blocked, is_graphql_rate_limited,
         is_integration_blocked, parse_github_remote_slug, parse_pr_checkout_info,
         parse_pr_checkout_rest_info, parse_pr_info, parse_pr_list, parse_pr_rest_info,
-        parse_pr_rest_list, scoped_push_environment, select_unique_head_match, selector_pr_number,
-        shell_single_quote, url_encode,
+        parse_pr_rest_list, push_branch_with_expected_head, scoped_push_environment,
+        select_unique_head_match, selector_pr_number, shell_single_quote, url_encode,
     };
     use std::process::Command;
 
@@ -907,6 +931,81 @@ mod tests {
             ])
             .trim(),
             "true"
+        );
+    }
+
+    #[test]
+    fn stale_expected_head_refuses_a_duplicate_push() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bare = temp.path().join("origin.git");
+        let seed = temp.path().join("seed");
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        let run = |cwd: &std::path::Path, args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .expect("git");
+            assert!(output.status.success(), "{}: {:?}", args.join(" "), output);
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        run(
+            temp.path(),
+            &["init", "--bare", "-q", bare.to_str().unwrap()],
+        );
+        run(temp.path(), &["init", "-q", seed.to_str().unwrap()]);
+        run(&seed, &["config", "user.email", "test@example.com"]);
+        run(&seed, &["config", "user.name", "Test"]);
+        std::fs::write(seed.join("README"), "base\n").expect("base");
+        run(&seed, &["add", "README"]);
+        run(&seed, &["commit", "-qm", "base"]);
+        run(&seed, &["branch", "-M", "feature/repair"]);
+        run(&seed, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        run(&seed, &["push", "-qu", "origin", "feature/repair"]);
+        run(
+            temp.path(),
+            &[
+                "clone",
+                "-q",
+                bare.to_str().unwrap(),
+                first.to_str().unwrap(),
+            ],
+        );
+        run(
+            temp.path(),
+            &[
+                "clone",
+                "-q",
+                bare.to_str().unwrap(),
+                second.to_str().unwrap(),
+            ],
+        );
+        for checkout in [&first, &second] {
+            run(checkout, &["config", "user.email", "test@example.com"]);
+            run(checkout, &["config", "user.name", "Test"]);
+            run(checkout, &["switch", "-q", "feature/repair"]);
+        }
+        let expected = run(&first, &["rev-parse", "origin/feature/repair"]);
+        std::fs::write(first.join("README"), "first\n").expect("first edit");
+        run(&first, &["commit", "-qam", "first repair"]);
+        std::fs::write(second.join("README"), "second\n").expect("second edit");
+        run(&second, &["commit", "-qam", "duplicate repair"]);
+        push_branch_with_expected_head(&first, "feature/repair", &expected, std::iter::empty())
+            .expect("first repair push");
+        let duplicate = push_branch_with_expected_head(
+            &second,
+            "feature/repair",
+            &expected,
+            std::iter::empty(),
+        )
+        .expect_err("stale lease must refuse duplicate push");
+        assert!(
+            duplicate.to_string().contains("stale info")
+                || duplicate.to_string().contains("rejected"),
+            "{duplicate}"
         );
     }
 

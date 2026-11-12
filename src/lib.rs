@@ -340,6 +340,8 @@ pub mod warm_pool;
 pub mod watch;
 /// GitHub webhook signature validation and event decoding.
 pub mod webhook;
+/// Lease decision core for PR work claims and final push preconditions.
+pub(crate) mod work_claim;
 
 pub mod webhook_prune;
 pub mod webhook_reconcile;

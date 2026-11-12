@@ -460,7 +460,14 @@ authoritative even when an unrelated hosted check has a similar target name.
 - **Trigger:** `shipyard ship` on a branch
 - **Writes:** `ShipStateStore.save(ShipState(..., dispatched_runs=[], evidence_snapshot={}))` at cli.py:2675 — **before** preflight runs at cli.py:2679
 - **Externals:** `git push -u origin <branch>` at cli.py:2602 (return code ignored — see "External matrix" below), `gh pr list` / `gh pr create` for PR number. The Rust implementation falls back to REST `gh api repos/<owner>/<repo>/pulls` when GitHub GraphQL is rate-limited, so PR creation can still produce a tracked ship-state record. A PR Shipyard creates is titled and described from the non-merge commits in `origin/<base>..HEAD` (`src/pr_text.rs`): the body is never empty, and `pr.body.attribution` closes it with a configured line. `--body-append` adds text to the live body once, before the provenance block, after the provenance hook and before arming; a failed append only warns. Right after that, a run that pushed (no `--pr`) on a host with a `[relay]` table registers the pushing session as the pull request's owner (`docs/owner-relay.md`): a record in `<state_dir>/owners/` and a `shipyard-owner:` body marker written over GraphQL only when the address changed. It writes no `ShipState`, never fails the ship, and `SHIPYARD_OWNER_REGISTER=0` turns it off.
-- **Push transport:** supervised `git push` appends SSH keepalive options to the operator's `GIT_SSH_COMMAND`, repository `core.sshCommand`, or the default `ssh` command for the duration of the push. HTTPS remotes are unaffected, and an existing `ServerAliveInterval` is preserved.
+- **Push transport:** before local preflight, Shipyard records the remote head
+  for the branch. The supervised `git push` appends SSH keepalive options to
+  the operator's `GIT_SSH_COMMAND`, repository `core.sshCommand`, or the
+  default `ssh` command for the duration of the push, and carries
+  `--force-with-lease` for that exact head. HTTPS remotes are unaffected, and
+  an existing `ServerAliveInterval` is preserved. A concurrent writer is
+  refused at the push boundary, so a duplicate repair does not overwrite the
+  first writer.
 - **Failure modes**
   - Explicit `shipyard ship --pr <n>` runs from a checkout whose canonical
     GitHub repository, local branch, or full `HEAD` differs from the
@@ -481,7 +488,10 @@ authoritative even when an unrelated hosted check has a similar target name.
     then rerun with explicit `--adopt-head`; never automate that flag.*
   - Configured PR provenance is malformed, cannot start, or exits nonzero while required → `shipyard pr` exits before the steward status/label or queue/validation state is created. The argv is executed directly, exact PR facts are expanded and exported as `SHIPYARD_PR_*`, and the submitting process environment supplies agent/router context. *Recovery: repair provenance and rerun `shipyard pr`; do not use a recovery agent to overwrite submitter attribution.*
   - Requested steward handoff fails (invalid workstream/context, GitHub write denial, closed PR, exact-head mismatch, conflicting route ownership, or ambiguous provider identity) → `shipyard pr` exits before queue or validation state is created. Private intent is crash-consistent before the first GitHub mutation; status is written before the label and the head is re-read between them, so a concurrent head move can leave only a harmless stale-head status, never a managed label authorized by that stale receipt. Replay paginates status observations and uses the newest matching status to reconcile an uncertain write. Intentional owner replacement requires an explicit transfer with the same immutable work identity. *Recovery: resolve the failure and resubmit the current exact head; do not infer a transfer from an existing receipt.*
-  - `git push` fails silently → `find_pr_for_branch` may still find an existing PR; the local SHA may not match the remote. A fresh state is saved for a branch whose tip may not be pushed. *Recovery: none automatic — the drift check on the next resume will catch it, but between the stale push and the next resume the state claims a SHA that doesn't exist on the remote.*
+  - `git push` fails or loses its expected-head lease → PR discovery and state
+    submission stop before a stale head is recorded. *Recovery: refresh the
+    branch, reclaim the exact work claim if it expired, rerun the repository
+    gates, and retry the current head.*
   - `gh pr create` fails after the REST fallback also fails → `create_pr` raises `GhError`; `ship` exits without saving state because the save at cli.py:2675 runs only after the PR has been found or created. *Recovery: retry or create the PR through REST and run `shipyard ship --pr <n>` to track it.*
   - `save` fails (disk, permission) → `save` raises; tmp file is cleaned up by the `except` branch in `core/ship_state.py`. *Recovery: resolve disk issue, retry.*
 
@@ -1197,8 +1207,9 @@ Both landed in a follow-up PR:
 1. **Doc-sync hook.** `scripts/doc_sync_check.py` + `scripts/doc_sync_map.json`
    enforce that changes to mapped Rust ship-state or command modules
    include an update to this doc. Runs in
-   `.githooks/pre-push` (advisory; `SHIPYARD_ENFORCE_PREPUSH=1`
-   upgrades to block) and in `.github/workflows/version-skill-check.yml`
+   `.githooks/pre-push` (hard fail by default; an explicit
+   `SHIPYARD_ENFORCE_PREPUSH=0` is diagnostic-only) and in
+   `.github/workflows/version-skill-check.yml`
    as a hard CI gate. Bypass via a `Doc-Update: skip doc=<path>
    reason="..."` trailer on any commit in the diff range.
 2. **Dedicated state-machine coverage.** Rust unit tests exercise the

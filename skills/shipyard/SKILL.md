@@ -522,13 +522,19 @@ before `case` consumes `$?`. Two things follow:
   `scripts/test_prepush_cannot_measure.py` fails if any catch-all still falls
   open, and its control counts *both* halves so a drifted regex cannot report
   "nothing falls open" over zero coverage.
-* **A pre-versioning checkout still skips**, but loudly: it now names the
-  missing inputs and says nothing was verified. A silent `exit 0` there reads
-  exactly like a clean run.
+* **A pre-versioning checkout refuses**, but loudly: it names the missing
+  inputs and says nothing was verified. A missing gate can never be read as a
+  clean run.
 
 When asserting a gate "ran", check for `rc in (0, 1)` — not `rc == 0`. Zero is
 "ran and passed"; conflating it with "ran" is the same mistake one level up.
 `scripts/**` maps to this skill, so a change to either gate needs a note here.
+
+The supervised push also captures the remote branch head before local
+preflight and uses `--force-with-lease`; a second repair therefore stops at
+the push fence instead of repeating a successful write. The pre-push hook is
+hard-fail by default; `SHIPYARD_ENFORCE_PREPUSH=0` is an explicit diagnostic
+escape only.
 
 
 ## A repository without the gates opts out of them explicitly
