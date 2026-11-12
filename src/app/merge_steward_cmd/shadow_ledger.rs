@@ -62,7 +62,8 @@ pub(super) struct ControlRun {
     pub(super) base_sha: String,
     /// RFC 3339.
     pub(super) dispatched_at: String,
-    /// The GitHub Actions run created by this dispatch, once it is visible.
+    /// The GitHub Actions run this dispatch created, as the dispatch response
+    /// reported it (`workflow_run_id`).
     /// Check runs are accepted only when their check suite points at this run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) workflow_run_id: Option<u64>,
@@ -266,7 +267,12 @@ pub(super) fn label(
                 // prior run that started just before this request is not the
                 // control for this episode.
                 control.dispatched_at = now.to_rfc3339();
-                if let Err(error) = run_gh(&[
+                // The dispatch response names the exact run it created
+                // (`workflow_run_id`).  That ID is the only correlation we
+                // trust: a concurrent or manual run of the same workflow on
+                // the same base is never selected by searching.  A response
+                // without it leaves the episode unlabelled.
+                match run_gh(&[
                     "api".to_owned(),
                     "--method".to_owned(),
                     "POST".to_owned(),
@@ -274,8 +280,21 @@ pub(super) fn label(
                     "-f".to_owned(),
                     format!("ref={base}"),
                 ]) {
-                    control.error = Some(error);
-                    control.conclusion = Some("unlabelled".to_owned());
+                    Ok(body) => {
+                        if let Some(id) = dispatched_run_id(&body) {
+                            control.workflow_run_id = Some(id);
+                        } else {
+                            control.error = Some(format!(
+                                "dispatch returned no workflow_run_id: {:?}",
+                                body.trim()
+                            ));
+                            control.conclusion = Some("unlabelled".to_owned());
+                        }
+                    }
+                    Err(error) => {
+                        control.error = Some(error);
+                        control.conclusion = Some("unlabelled".to_owned());
+                    }
                 }
             }
             Ok(other) => {
@@ -312,9 +331,17 @@ pub(super) fn label(
     }
 }
 
+/// The run ID a `workflow_dispatch` POST reported, if any.
+fn dispatched_run_id(body: &str) -> Option<u64> {
+    serde_json::from_str::<Value>(body)
+        .ok()?
+        .get("workflow_run_id")
+        .and_then(Value::as_u64)
+}
+
 /// The control's verdict for `context`, `None` while it is still running.
 fn control_verdict(
-    control: &mut ControlRun,
+    control: &ControlRun,
     context: &str,
     repo: &str,
     run_gh: &dyn Fn(&[String]) -> Result<String, String>,
@@ -326,44 +353,12 @@ fn control_verdict(
     if now - since > chrono::Duration::hours(CONTROL_TIMEOUT_HOURS) {
         return Some("unlabelled".to_owned());
     }
-    if control.workflow_run_id.is_none() {
-        let raw = run_gh(&[
-            "api".to_owned(),
-            format!(
-                "repos/{repo}/actions/workflows/{}/runs?head_sha={}&event=workflow_dispatch&per_page=20",
-                control.workflow, control.base_sha
-            ),
-        ])
-        .ok()?;
-        let value = serde_json::from_str::<Value>(&raw).ok()?;
-        let candidates = value
-            .get("workflow_runs")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter(|run| {
-                run.get("head_sha").and_then(Value::as_str) == Some(control.base_sha.as_str())
-            })
-            .filter_map(|run| {
-                let created_at = run.get("created_at").and_then(Value::as_str)?;
-                let created_at = DateTime::parse_from_rfc3339(created_at)
-                    .ok()?
-                    .with_timezone(&Utc);
-                if created_at < since {
-                    return None;
-                }
-                Some((created_at, run.get("id").and_then(Value::as_u64)?))
-            })
-            .collect::<Vec<_>>();
-        // A workflow dispatch returns no run ID.  If more than one same-workflow
-        // run appeared after the boundary, a concurrent/manual dispatch has
-        // collided with ours; selecting either would mislabel the episode.
-        // Leave it pending until the six-hour timeout makes it unlabelled.
-        if candidates.len() == 1 {
-            control.workflow_run_id = candidates.first().map(|(_, id)| *id);
-        }
-    }
-    let workflow_run_id = control.workflow_run_id?;
+    // Only the run the dispatch itself reported is the control.  A control
+    // with no reported run ID (a dispatch response without one, or a ledger
+    // entry written before the ID was recorded) is never matched by search.
+    let Some(workflow_run_id) = control.workflow_run_id else {
+        return Some("unlabelled".to_owned());
+    };
     let raw = run_gh(&[
         "api".to_owned(),
         format!(
@@ -580,17 +575,79 @@ mod tests {
     use super::*;
     use chrono::TimeZone as _;
 
-    #[test]
-    fn same_workflow_collision_is_left_unlabelled() {
-        let key = "owner/repo@main";
-        let context = "required";
-        let controls = BTreeMap::from([(context.to_owned(), "control.yml".to_owned())]);
-        let firing = BTreeMap::from([((context.to_owned(), "streak".to_owned()), 2)]);
-        let base_sha = "a".repeat(40);
-        let now = Utc
-            .with_ymd_and_hms(2026, 11, 11, 0, 0, 0)
+    fn at(minute: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 11, 11, 0, minute, 0)
             .single()
-            .expect("test time");
+            .expect("test time")
+    }
+
+    fn one_episode(
+        run_gh: &dyn Fn(&[String]) -> Result<String, String>,
+        now: DateTime<Utc>,
+        open: &mut Vec<Episode>,
+    ) {
+        let key = "owner/repo@main";
+        let controls = BTreeMap::from([("required".to_owned(), "control.yml".to_owned())]);
+        if open.is_empty() {
+            let firing = BTreeMap::from([(("required".to_owned(), "streak".to_owned()), 2)]);
+            advance(open, key, &firing, &BTreeSet::new(), &BTreeSet::new(), now);
+        }
+        label(open, key, "owner/repo", "main", &controls, run_gh, now);
+    }
+
+    /// An unrelated same-workflow run on the same base is visible (and
+    /// already failed) before the dispatched run appears.  Only the run the
+    /// dispatch reported may label the episode.
+    #[test]
+    fn an_unrelated_same_workflow_run_never_labels_the_episode() {
+        let base_sha = "a".repeat(40);
+        let ours_done = std::cell::Cell::new(false);
+        let run_gh = |argv: &[String]| -> Result<String, String> {
+            let line = argv.join(" ");
+            if line.ends_with("--jq .sha") {
+                return Ok(base_sha.clone());
+            }
+            if line.contains("/dispatches") {
+                return Ok(r#"{"workflow_run_id":43,"run_url":"u","html_url":"h"}"#.to_owned());
+            }
+            if line.contains("/actions/workflows/control.yml/runs?") {
+                return Ok(format!(
+                    r#"{{"workflow_runs":[{{"id":41,"head_sha":"{base_sha}","created_at":"2026-11-11T00:00:30Z"}}]}}"#
+                ));
+            }
+            if line.contains("/check-runs?") {
+                let mut runs = vec![serde_json::json!({
+                    "status": "completed", "conclusion": "failure",
+                    "started_at": "2026-11-11T00:00:30Z",
+                    "check_suite": {"workflow_run": {"id": 41}},
+                })];
+                if ours_done.get() {
+                    runs.push(serde_json::json!({
+                        "status": "completed", "conclusion": "success",
+                        "started_at": "2026-11-11T00:01:00Z",
+                        "check_suite": {"workflow_run": {"id": 43}},
+                    }));
+                }
+                return Ok(serde_json::json!({ "check_runs": runs }).to_string());
+            }
+            Err(format!("unexpected call: {line}"))
+        };
+        let mut open = Vec::new();
+        one_episode(&run_gh, at(0), &mut open);
+        let control = open[0].control.clone().expect("control");
+        assert_eq!(control.workflow_run_id, Some(43));
+        assert_eq!(control.conclusion, None, "unrelated run 41 must not label");
+        assert_eq!(open[0].corroborated, None);
+        ours_done.set(true);
+        one_episode(&run_gh, at(5), &mut open);
+        assert_eq!(open[0].corroborated, Some(false));
+    }
+
+    /// A dispatch whose response names no run cannot be correlated, so the
+    /// episode is unlabelled and no check run is read for it.
+    #[test]
+    fn a_dispatch_without_a_run_id_is_left_unlabelled() {
+        let base_sha = "b".repeat(40);
         let run_gh = |argv: &[String]| -> Result<String, String> {
             let line = argv.join(" ");
             if line.ends_with("--jq .sha") {
@@ -599,42 +656,36 @@ mod tests {
             if line.contains("/dispatches") {
                 return Ok(String::new());
             }
-            if line.contains("/actions/workflows/control.yml/runs?") {
-                return Ok(format!(
-                    r#"{{"workflow_runs":[
-                        {{"id":41,"head_sha":"{base_sha}","created_at":"2026-11-11T00:01:00Z"}},
-                        {{"id":42,"head_sha":"{base_sha}","created_at":"2026-11-11T00:02:00Z"}}
-                    ]}}"#
-                ));
-            }
-            if line.contains("/check-runs?") {
-                return Err("ambiguous dispatch must not read a check run".to_owned());
-            }
-            Err(format!("unexpected call: {line}"))
+            Err(format!(
+                "an uncorrelated dispatch must not be searched: {line}"
+            ))
         };
         let mut open = Vec::new();
-        advance(
-            &mut open,
-            key,
-            &firing,
-            &BTreeSet::new(),
-            &BTreeSet::new(),
-            now,
-        );
-        label(
-            &mut open,
-            key,
-            "owner/repo",
-            "main",
-            &controls,
-            &run_gh,
-            now,
-        );
-        assert_eq!(open.len(), 1);
+        one_episode(&run_gh, at(0), &mut open);
+        let control = open[0].control.clone().expect("control");
+        assert_eq!(control.workflow_run_id, None);
+        assert_eq!(control.conclusion.as_deref(), Some("unlabelled"));
         assert_eq!(open[0].corroborated, None);
-        assert_eq!(
-            open[0].control.as_ref().and_then(|c| c.workflow_run_id),
-            None
-        );
+    }
+
+    /// A pending control recorded before run IDs were captured is never
+    /// resolved by searching for a run; it becomes unlabelled.
+    #[test]
+    fn a_legacy_pending_control_without_a_run_id_is_unlabelled() {
+        let run_gh = |argv: &[String]| -> Result<String, String> {
+            Err(format!("no lookup expected: {}", argv.join(" ")))
+        };
+        let mut control = ControlRun {
+            workflow: "control.yml".to_owned(),
+            base_sha: "c".repeat(40),
+            dispatched_at: at(0).to_rfc3339(),
+            workflow_run_id: None,
+            conclusion: None,
+            error: None,
+        };
+        let verdict = control_verdict(&control, "required", "owner/repo", &run_gh, at(5));
+        assert_eq!(verdict.as_deref(), Some("unlabelled"));
+        control.conclusion = verdict;
+        assert!(control.conclusion.is_some());
     }
 }

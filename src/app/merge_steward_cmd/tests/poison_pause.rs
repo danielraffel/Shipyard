@@ -734,15 +734,10 @@ fn the_shadow_ledger_labels_episodes_by_a_pr_free_control_run() {
         calls.borrow_mut().push(line.clone());
         if line.contains("/dispatches") {
             assert!(line.contains("ref=main"), "{line}");
-            return Ok(String::new());
+            return Ok(r#"{"workflow_run_id":42}"#.to_owned());
         }
         if line.ends_with("--jq .sha") {
             return Ok(tip.clone());
-        }
-        if line.contains("/actions/workflows/version-skill-check.yml/runs?") {
-            return Ok(format!(
-                r#"{{"workflow_runs":[{{"id":42,"head_sha":"{tip}","created_at":"2026-11-12T23:00:00Z"}}]}}"#
-            ));
         }
         if line.contains("/check-runs?check_name=Enforce%20version%20%26%20skill%20sync") {
             let conclusion = *verdict.borrow();
@@ -857,6 +852,8 @@ fn a_control_that_never_reports_leaves_the_episode_unlabelled() {
         let line = argv.join(" ");
         Ok(if line.ends_with("--jq .sha") {
             "2".repeat(40)
+        } else if line.contains("/dispatches") {
+            r#"{"workflow_run_id":42}"#.to_owned()
         } else {
             r#"{"check_runs":[]}"#.to_owned()
         })
@@ -869,6 +866,8 @@ fn a_control_that_never_reports_leaves_the_episode_unlabelled() {
         let line = argv.join(" ");
         Ok(if line.ends_with("--jq .sha") {
             "2".repeat(40)
+        } else if line.contains("/dispatches") {
+            r#"{"workflow_run_id":42}"#.to_owned()
         } else {
             r#"{"check_runs":[{"status":"completed","conclusion":"failure","started_at":"2026-11-10T23:59:30Z"}]}"#.to_owned()
         })
@@ -898,8 +897,8 @@ fn a_timed_out_control_leaves_the_episode_unlabelled() {
         let line = argv.join(" ");
         Ok(if line.ends_with("--jq .sha") {
             "3".repeat(40)
-        } else if line.contains("/actions/workflows/version-skill-check.yml/runs?") {
-            r#"{"workflow_runs":[{"id":42,"head_sha":"3333333333333333333333333333333333333333","created_at":"2026-11-12T23:00:00Z"}]}"#.to_owned()
+        } else if line.contains("/dispatches") {
+            r#"{"workflow_run_id":42}"#.to_owned()
         } else if line.contains("/check-runs?") {
             r#"{"check_runs":[{"status":"completed","conclusion":"timed_out","started_at":"2026-11-12T23:00:00Z","check_suite":{"workflow_run":{"id":42}}}]}"#.to_owned()
         } else {
@@ -935,17 +934,8 @@ fn overlapping_episodes_dispatch_distinct_controls() {
         }
         if line.contains("/dispatches") {
             *dispatches.borrow_mut() += 1;
-            return Ok(String::new());
-        }
-        if line.contains("/actions/workflows/version-skill-check.yml/runs?") {
-            let (sha, id) = if line.contains(&format!("head_sha={first_sha}")) {
-                (&first_sha, 41)
-            } else {
-                (&second_sha, 42)
-            };
-            return Ok(format!(
-                r#"{{"workflow_runs":[{{"id":{id},"head_sha":"{sha}","created_at":"2026-11-12T23:00:00Z"}}]}}"#
-            ));
+            let id = 40 + *dispatches.borrow();
+            return Ok(format!(r#"{{"workflow_run_id":{id}}}"#));
         }
         if line.contains("/check-runs?") {
             if line.contains(&format!("commits/{first_sha}/")) && first_poll.replace(false) {
@@ -1004,12 +994,7 @@ fn a_same_context_check_from_another_workflow_is_ignored() {
             return Ok(base_sha.clone());
         }
         if line.contains("/dispatches") {
-            return Ok(String::new());
-        }
-        if line.contains("/actions/workflows/version-skill-check.yml/runs?") {
-            return Ok(format!(
-                r#"{{"workflow_runs":[{{"id":42,"head_sha":"{base_sha}","created_at":"2026-11-12T23:00:00Z"}}]}}"#
-            ));
+            return Ok(r#"{"workflow_run_id":42}"#.to_owned());
         }
         if line.contains("/check-runs?") {
             return Ok(
