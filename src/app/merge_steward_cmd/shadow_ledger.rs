@@ -336,7 +336,7 @@ fn control_verdict(
         ])
         .ok()?;
         let value = serde_json::from_str::<Value>(&raw).ok()?;
-        control.workflow_run_id = value
+        let candidates = value
             .get("workflow_runs")
             .and_then(Value::as_array)
             .into_iter()
@@ -354,8 +354,14 @@ fn control_verdict(
                 }
                 Some((created_at, run.get("id").and_then(Value::as_u64)?))
             })
-            .min_by_key(|(created_at, _)| *created_at)
-            .map(|(_, id)| id);
+            .collect::<Vec<_>>();
+        // A workflow dispatch returns no run ID.  If more than one same-workflow
+        // run appeared after the boundary, a concurrent/manual dispatch has
+        // collided with ours; selecting either would mislabel the episode.
+        // Leave it pending until the six-hour timeout makes it unlabelled.
+        if candidates.len() == 1 {
+            control.workflow_run_id = candidates.first().map(|(_, id)| *id);
+        }
     }
     let workflow_run_id = control.workflow_run_id?;
     let raw = run_gh(&[
@@ -567,4 +573,58 @@ pub(super) fn record_pass(
         "gate": gates,
         "error": error,
     })
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone as _;
+
+    #[test]
+    fn same_workflow_collision_is_left_unlabelled() {
+        let key = "owner/repo@main";
+        let context = "required";
+        let controls = BTreeMap::from([(context.to_owned(), "control.yml".to_owned())]);
+        let firing = BTreeMap::from([((context.to_owned(), "streak".to_owned()), 2)]);
+        let base_sha = "a".repeat(40);
+        let now = Utc
+            .with_ymd_and_hms(2026, 11, 11, 0, 0, 0)
+            .single()
+            .expect("test time");
+        let run_gh = |argv: &[String]| -> Result<String, String> {
+            let line = argv.join(" ");
+            if line.ends_with("--jq .sha") {
+                return Ok(base_sha.clone());
+            }
+            if line.contains("/dispatches") {
+                return Ok(String::new());
+            }
+            if line.contains("/actions/workflows/control.yml/runs?") {
+                return Ok(format!(
+                    r#"{{"workflow_runs":[
+                        {{"id":41,"head_sha":"{base_sha}","created_at":"2026-11-11T00:01:00Z"}},
+                        {{"id":42,"head_sha":"{base_sha}","created_at":"2026-11-11T00:02:00Z"}}
+                    ]}}"#
+                ));
+            }
+            if line.contains("/check-runs?") {
+                return Err("ambiguous dispatch must not read a check run".to_owned());
+            }
+            Err(format!("unexpected call: {line}"))
+        };
+        let mut open = Vec::new();
+        advance(
+            &mut open,
+            key,
+            &firing,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            now,
+        );
+        label(&mut open, key, "owner/repo", "main", &controls, &run_gh, now);
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].corroborated, None);
+        assert_eq!(open[0].control.as_ref().and_then(|c| c.workflow_run_id), None);
+    }
 }
