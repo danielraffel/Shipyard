@@ -54,6 +54,24 @@ pub(super) fn render_report<W: Write>(
             )
             .map_err(|error| io_failure(&error))?;
         }
+        if !repo.invariants.is_empty() {
+            writeln!(
+                stdout,
+                "  invariants={}",
+                super::invariants::summary_token(&repo.invariants)
+            )
+            .map_err(|error| io_failure(&error))?;
+            for invariant in repo.invariants.iter().filter(|row| row.incident()) {
+                writeln!(
+                    stdout,
+                    "  INCIDENT {}: {} fix: {}",
+                    invariant.id,
+                    invariant.detail,
+                    invariant.fix.as_deref().unwrap_or_default()
+                )
+                .map_err(|error| io_failure(&error))?;
+            }
+        }
         if let Some(dwell) = &repo.dwell {
             writeln!(
                 stdout,

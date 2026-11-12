@@ -35,6 +35,15 @@ after 20 minutes, then reported as `INFRA-OUTAGE-SUSPECTED` by the operator
 pass. Do not re-run it by hand first; read `infra_rerun` in the steward's tick
 JSON. `review-verdict` is never re-run this way.
 
+When nothing in a repository is merging but its pass reads `rc=0` with no
+errors, read `repos[].invariants` in the tick JSON (or `invariants=` on the
+summary log line) before debugging any single pull request. A failing row
+(`required_context_producer`, `approval_admission_config`,
+`required_never_ran`, `reviewer_verdicts_counted`, or the tick's fleet-level
+`config_clone`) names a set-up fault and carries its own `fix`; pushing to
+or re-running CI on the waiting heads will not clear it. See
+[`docs/automated-draining.md`](../../docs/automated-draining.md#when-the-set-up-itself-is-wrong-tick-start-invariants).
+
 Before guessing what to work on, read the steward's own answer:
 `shipyard next [--repo R] [--json]` lists the five pull requests closest to
 mergeable (stack bases first, then approved green, approved pending, green

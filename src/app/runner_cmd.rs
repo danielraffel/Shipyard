@@ -453,6 +453,7 @@ fn runner_command_with_actions<W: Write>(
             wake_owner,
             pass_budget_secs,
             infra_rerun,
+            no_invariants,
             apply,
             ledger,
         } => super::merge_steward_cmd::steward_command(
@@ -476,6 +477,8 @@ fn runner_command_with_actions<W: Write>(
                     .unwrap_or_default(),
                 pass_budget: (pass_budget_secs > 0).then(|| Duration::from_secs(pass_budget_secs)),
                 pass_deadline: None,
+                invariants: (!no_invariants)
+                    .then(super::merge_steward_cmd::invariants::Settings::default),
                 apply,
                 ledger,
             },
@@ -488,6 +491,19 @@ fn runner_command_with_actions<W: Write>(
                     config,
                     &runtime_paths.state_dir,
                 )),
+            json,
+            stdout,
+        ),
+        RunnerCommand::StewardInvariants {
+            fleet_repos,
+            clones,
+            heal,
+        } => super::merge_steward_cmd::invariants::clones::command(
+            &super::merge_steward_cmd::invariants::clones::CloneArgs {
+                fleet_repos,
+                clones,
+                heal,
+            },
             json,
             stdout,
         ),

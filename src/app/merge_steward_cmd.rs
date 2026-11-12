@@ -71,6 +71,9 @@ pub(super) struct StewardCommandArgs {
     pub(super) pass_deadline: Option<Instant>,
     pub(super) apply: bool,
     pub(super) ledger: Option<PathBuf>,
+    /// Tick-start invariants ([`invariants`]); `None` is `--no-invariants`.
+    /// [`steward_command`] fills in the checkout and the follow-up switch.
+    pub(super) invariants: Option<invariants::Settings>,
 }
 
 pub(super) struct AdmissionCleanArgs {
@@ -182,6 +185,11 @@ struct RepoReport {
     /// ([`infra_rerun`]). Absent when the repository was not observed.
     #[serde(skip_serializing_if = "Option::is_none")]
     infra_rerun: Option<infra_rerun::RepoStatus>,
+    /// The tick-start invariants ([`invariants`]): `{id, ok, detail, fix}`
+    /// per check. Absent when they are off or the repository was not
+    /// observed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    invariants: Vec<invariants::Invariant>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1301,6 +1309,15 @@ pub(super) fn steward_command<W: Write>(
     normalized_args.unapproved_dequeue =
         unapproved_admission::DequeueMode::from_machine_global(&runtime_paths.global_dir)
             .map_err(|error| CliFailure::new(2, error))?;
+    if normalized_args.invariants.is_some() {
+        normalized_args.invariants = Some(
+            invariants::Settings::from_machine_global(
+                &runtime_paths.global_dir,
+                Some(cwd.to_path_buf()),
+            )
+            .map_err(|error| CliFailure::new(2, error))?,
+        );
+    }
     let args = &normalized_args;
     let ledger_path = args
         .ledger
@@ -1644,6 +1661,19 @@ fn steward_repo_observed(
                 reconcile_rollups(actions, &observation.repo, &args.base, &mut report);
             }
             *remaining_preemptions = remaining_preemptions.saturating_sub(planned_preemptions);
+            if let Some(settings) = args.invariants.as_ref() {
+                report.invariants = invariants::run(
+                    actions,
+                    settings,
+                    &observation,
+                    &report.prs,
+                    &report.merge_path,
+                    &args.approval_context,
+                    &invariants::state_path(ledger_path),
+                    args.apply,
+                    Utc::now(),
+                );
+            }
             let unhealthy = failed || !report.errors.is_empty();
             (report, unhealthy)
         }
@@ -1748,6 +1778,7 @@ fn deferred_rate_limit_repo_report(
         exit_reasons: Vec::new(),
         dwell: None,
         infra_rerun: None,
+        invariants: Vec::new(),
     }
 }
 
@@ -1778,6 +1809,7 @@ fn unreadable_repo_report(
         exit_reasons: Vec::new(),
         dwell: None,
         infra_rerun: None,
+        invariants: Vec::new(),
     }
 }
 
@@ -1858,6 +1890,7 @@ fn append_unmatched_recovery_errors(
             exit_reasons: Vec::new(),
             dwell: None,
             infra_rerun: None,
+            invariants: Vec::new(),
         });
     }
 }
@@ -1898,6 +1931,7 @@ fn persist_final_ledger(
             exit_reasons: Vec::new(),
             dwell: None,
             infra_rerun: None,
+            invariants: Vec::new(),
         });
     }
 }
@@ -2044,6 +2078,7 @@ mod exact_head_merge;
 mod generated_paths;
 mod head_rollup;
 pub(super) mod infra_rerun;
+pub(super) mod invariants;
 mod ledger;
 mod mutation_outcome;
 mod native_arm;
@@ -2245,6 +2280,7 @@ fn single_pr_dry_run(
         infra_rerun: InfraRerunMode::Off,
         pass_budget: None,
         pass_deadline: None,
+        invariants: None,
         apply: false,
         ledger: None,
     };

@@ -450,6 +450,34 @@ Reads are a full admission pass, so the default `--poll-interval` is 120
 seconds for this state. The ledger used for transient-rerun budgets is the
 local one; on the steward host it is the steward's own.
 
+## When the set-up itself is wrong: tick-start invariants
+
+A steward pass can finish cleanly (`rc=0`, no errors) while a repository
+admits nothing, because what is broken is the set-up around it rather than any
+one pull request. On 2026-11-11 and 2026-11-12 the fleet lost hours that way:
+a fleet repository with no config clone was skipped on every tick, a required
+check had no workflow to post it, and approvals were posted but never counted.
+So each pass checks its own preconditions first and reports them in
+`repos[].invariants`, one `{id, ok, detail, fix}` row per check:
+
+| id | Holds when | What it caught |
+|---|---|---|
+| `config_clone` (fleet level, once per tick) | every repository in the fleet list has a steward config clone with a readable `.shipyard/config.toml`. With `--heal` a missing clone is created, idempotently, and logged as `healed` | fleet-ssh listed in the fleet with no clone, skipped silently |
+| `required_context_producer` | every required context on the base is produced by a workflow on the base, an open head, another app, or a declared external producer | a watchdog `review-verdict` required with no workflow on main |
+| `approval_admission_config` | a repository that needs exact-head approval has `[auto_merge] reviewer_signers` and `reviewer_stamp_sessions`, has the approval rule apply (`REVIEW_REQUIRED_REPOS` or `arm_requires_head_approval`) wherever its ruleset requires the approval context, and has a path to automatic admission | fleet-ssh #18 and #19; the watchdog missing from `REVIEW_REQUIRED_REPOS` |
+| `required_never_ran` | no required context has waited unrun on every open head for an hour | watchdog #7 and #8 waiting 10+ hours |
+| `reviewer_verdicts_counted` | the approval gate counted at least one verdict, or none has been excluded for an hour | a pass-runner install made verdicts comment-only |
+
+The checks only read and report: a failing invariant never changes the exit
+code or what the pass admits. A standing incident is dated once (`since`) and
+appears as one `invariants=FAIL:<id>` token per tick in the summary log, not
+as a new event each pass. Filing a `fleet-followup` issue for it is off by
+default; turn it on with `[merge_steward.invariants] followup_issues = true`
+in the steward host's machine-global config. `--no-invariants` (or
+`SHIPYARD_STEWARD_INVARIANTS=0` for the reference tick script in
+`tools/steward-tick/`) turns all of it off. Full detail, costs and the heal
+rules: the [merge-steward reference](../skills/shipyard/references/merge-steward.md#tick-start-invariants).
+
 ## Ejection guards
 
 An ejected pull request costs the batch it broke a rebuild and costs itself
