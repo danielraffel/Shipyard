@@ -116,8 +116,8 @@ on Q's first-parent chain (`Q.base..Q.head` followed through first parents) or
 is not on P's own first-parent chain (`base..P.head`): a commit on P's
 first-parent chain that reached Q only through a merge's second parent is P's
 own. When every shared commit is P's own, Q does not hold P, and a refusal P
-still gets from another pull request ends with `#Q merged #P's branch; not
-carried`. P merging held work in (the held commits are P's second parent) and
+still gets from another pull request ends with `#Q merged or built on #P's
+branch; not carried`. P merging held work in (the held commits are P's second parent) and
 P built straight on commits on Q's own first-parent chain (they are on both
 chains) are still refused, and a first-parent read that fails or is over the
 cap keeps the overlap. Q's own diff and its first-parent chain come from one
@@ -130,7 +130,27 @@ ancestry never excuses Q on its own: a Q that targets the base and contains P's
 whole head (built on P, or P merged back into Q) is judged at its listed head
 like any other Q, because ancestry cannot show which pull request introduced a
 shared commit. The shared commits clear P only while Q's head is approved with
-no HOLD, or once they are on the base. Land or
+no HOLD, or once they are on the base, with one exception, the declared older
+parent: when Q declares the stack (Q is labelled `stacked:<P>`, or reaches P
+through a chain of open pull requests' `stacked:<n>` labels and base
+branches), P was opened before Q (a lower pull request number), and Q's own
+diff holds P's exact current head, a shared commit on P's own first-parent
+chain is P's own even when it is on Q's first-parent chain too, because Q
+branched off P's line. This is the stack whose child targets the base while
+it is held or unreviewed; without it the approved parent and the held child
+wait on each other. The label never clears anything by itself: it only
+unlocks that graph proof, and its `labeled` event names who declared the
+stack. `Supersedes #n` and the clean-replacement marker never admit P: they
+say P is to be closed, not merged. Commits P merged in (off P's first-parent
+chain) are still refused, and so are the three misses, each with its fix in
+the refusal detail: an undeclared Q (`#Q built on #P's head but is not
+labelled stacked:P: label it (shipyard pr --stacked-on P) or retarget #Q onto
+#P's branch`), a P opened after Q (`#Q built on #P's head but #P was opened
+after #Q: retarget #Q onto #P's branch`), and a Q that took an older head of
+P's (`#Q is on an older head of #P: merge #P into #Q`). Named residual: a Q
+labelled `stacked:P` whose author opened P first and reset it onto Q's held
+commits is cleared; those commits land under P's exact-head approval, and the
+label event names who declared the stack. Land or
 approve Q first, or drop its commits from P; a branch built on another pull
 request should target that pull request's branch. At most 250 commits are read
 per pull request. A Q whose listing is larger (for example a stacked pull
