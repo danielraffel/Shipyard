@@ -175,6 +175,7 @@ REVIEW_REQUIRED_REPOS = (
     "danielraffel/fleet-handbook",
     "danielraffel/tartci",
     "danielraffel/Shipyard",
+    "danielraffel/cmux-capacity-watchdog",
 )
 FLEET_AUTHOR = "shipyard-local"
 REVIEW_OVERRIDE_ENV = "GHAPP_ALLOW_UNREVIEWED_ARM"

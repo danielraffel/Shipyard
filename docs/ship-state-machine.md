@@ -349,8 +349,8 @@ document:
   already-armed or already-queued pull request is left alone.
 * On a host that turns it on (`SHIPYARD_REVIEW_BEFORE_ARM=1`, or a
   `review-before-arm` file in the guards directory), `Generous-Corp/pulp`,
-  `Generous-Corp/vellum`, `danielraffel/fleet-handbook`, `danielraffel/tartci` and
-  `danielraffel/Shipyard` require an approval when their base does not set the key. With no identity
+  `Generous-Corp/vellum`, `danielraffel/fleet-handbook`, `danielraffel/tartci`,
+  `danielraffel/Shipyard` and `danielraffel/cmux-capacity-watchdog` require an approval when their base does not set the key. With no identity
   listed, a verdict counts from the fleet App or an `OWNER`, `MEMBER` or
   `COLLABORATOR`, never from the PR's distinguishable author. A merge-only
   update carries the approval only when every file the PR changes keeps its

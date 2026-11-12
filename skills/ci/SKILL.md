@@ -383,7 +383,7 @@ applies.
 
 **Head approval.** A repository whose base branch sets
 `[auto_merge] arm_requires_head_approval = true` (the default for pulp, vellum,
-fleet-handbook, tartci and Shipyard when their base is silent, on every host unless the host
+fleet-handbook, tartci, Shipyard and cmux-capacity-watchdog when their base is silent, on every host unless the host
 has a `review-before-arm.opt-out` file, written with a reason by
 `shipyard guards install --opt-out-review-before-arm "<reason>"`, and only
 that written record counts; there,
