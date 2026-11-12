@@ -432,6 +432,18 @@ static UNTRUSTED_TRIGGER: LazyLock<Regex> = LazyLock::new(|| {
 static RENOVATE_AGE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#""?minimumReleaseAge"?\s*:\s*["']?(\d+)\s*days?"#).expect("valid renovate regex")
 });
+static RENOVATE_WEEKLY_SCHEDULE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?is)(?:["']?schedule["']?)\s*:\s*(?:\[\s*)?["'][^"']*(?:weekly|every\s+week(?:end)?|monday|tuesday|wednesday|thursday|friday|saturday|sunday)[^"']*["']"#,
+    )
+    .expect("valid renovate schedule regex")
+});
+static ZIZMOR_HIGH_SEVERITY: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"--min-severity(?:=|\s+)high(?:\s|$)").expect("valid severity regex")
+});
+static ZIZMOR_HIGH_CONFIDENCE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"--min-confidence(?:=|\s+)high(?:\s|$)").expect("valid confidence regex")
+});
 
 /// Classify one `uses:` value; `comment` is the rest of the line after `#`.
 #[must_use]
@@ -745,15 +757,19 @@ fn check_updates_bot(snapshot: &RepoSnapshot, policy: &AuditPolicy) -> AuditRow 
                 .captures(&config.content)
                 .and_then(|captures| captures[1].parse::<u32>().ok());
             let grouped = config.content.contains("groupName");
+            let weekly = RENOVATE_WEEKLY_SCHEDULE.is_match(&config.content);
             match age {
-                Some(days) if days >= policy.cooldown_days && grouped => row(
+                Some(days) if days >= policy.cooldown_days && grouped && weekly => row(
                     Setting::UpdatesBot,
                     AuditStatus::Pass,
                     format!(
-                        "renovate {}: minimumReleaseAge {days} days, grouped (schedule not text-checked){other}",
+                        "renovate {}: weekly schedule, minimumReleaseAge {days} days, grouped{other}",
                         config.path
                     ),
                 ),
+                Some(days) if days >= policy.cooldown_days && grouped => {
+                    drift(&format!("renovate {}: no weekly schedule", config.path))
+                }
                 Some(days) if days >= policy.cooldown_days => {
                     drift(&format!("renovate {}: no groupName", config.path))
                 }
@@ -800,7 +816,9 @@ fn check_zizmor_enforce(snapshot: &RepoSnapshot) -> AuditRow {
         );
     }
     match workflows.iter().find(|workflow| {
-        workflow.content.contains("min-severity") && !workflow.content.contains("--no-exit-codes")
+        ZIZMOR_HIGH_SEVERITY.is_match(&workflow.content)
+            && ZIZMOR_HIGH_CONFIDENCE.is_match(&workflow.content)
+            && !workflow.content.contains("--no-exit-codes")
     }) {
         Some(workflow) => row(
             Setting::ZizmorEnforce,
@@ -1089,39 +1107,65 @@ fn fetch_workflow_files(
     reader: &dyn GithubReader,
     contents: &dyn Fn(&str) -> String,
 ) {
-    match reader.get_json(&contents(".github/workflows")) {
-        Ok(Some(JsonValue::Array(entries))) => {
-            for entry in entries {
-                let (Some(name), Some(path)) = (entry["name"].as_str(), entry["path"].as_str())
-                else {
-                    continue;
-                };
-                let is_workflow = std::path::Path::new(name).extension().is_some_and(|ext| {
-                    ext.eq_ignore_ascii_case("yml") || ext.eq_ignore_ascii_case("yaml")
-                });
-                if name != "actions.lock" && !is_workflow {
-                    continue;
+    const PAGE_SIZE: usize = 30;
+    let listing_path = contents(".github/workflows");
+    let mut page = 1;
+    loop {
+        let path = if page == 1 {
+            listing_path.clone()
+        } else {
+            format!("{listing_path}&page={page}")
+        };
+        let entries = match reader.get_json(&path) {
+            Ok(Some(JsonValue::Array(entries))) => entries,
+            Ok(Some(_)) => {
+                snapshot.read_errors.insert(
+                    "workflows".to_owned(),
+                    "workflow listing was not an array".to_owned(),
+                );
+                break;
+            }
+            Ok(None) => {
+                snapshot
+                    .read_errors
+                    .insert("workflows".to_owned(), "HTTP 404".to_owned());
+                break;
+            }
+            Err(error) => {
+                snapshot.read_errors.insert("workflows".to_owned(), error);
+                break;
+            }
+        };
+        let count = entries.len();
+        for entry in entries {
+            let (Some(name), Some(path)) = (entry["name"].as_str(), entry["path"].as_str()) else {
+                continue;
+            };
+            let is_workflow = std::path::Path::new(name).extension().is_some_and(|ext| {
+                ext.eq_ignore_ascii_case("yml") || ext.eq_ignore_ascii_case("yaml")
+            });
+            if name != "actions.lock" && !is_workflow {
+                continue;
+            }
+            match reader.get_raw(&contents(path)) {
+                Ok(Some(text)) if is_workflow => snapshot.workflows.push(WorkflowFile {
+                    path: path.to_owned(),
+                    content: text,
+                }),
+                Ok(text) => {
+                    if !is_workflow {
+                        snapshot.lockfile = text;
+                    }
                 }
-                match reader.get_raw(&contents(path)) {
-                    Ok(Some(text)) if is_workflow => snapshot.workflows.push(WorkflowFile {
-                        path: path.to_owned(),
-                        content: text,
-                    }),
-                    Ok(text) => {
-                        if !is_workflow {
-                            snapshot.lockfile = text;
-                        }
-                    }
-                    Err(error) => {
-                        snapshot.read_errors.insert("workflows".to_owned(), error);
-                    }
+                Err(error) => {
+                    snapshot.read_errors.insert("workflows".to_owned(), error);
                 }
             }
         }
-        Ok(Some(_) | None) => {}
-        Err(error) => {
-            snapshot.read_errors.insert("workflows".to_owned(), error);
+        if count < PAGE_SIZE {
+            break;
         }
+        page += 1;
     }
 }
 
