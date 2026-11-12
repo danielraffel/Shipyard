@@ -7,6 +7,10 @@ stacked_pr_mode = "off"
 
 [project]
 name = "shipyard"
+# Governance profile (docs/governance.md). Every row is a target for this
+# repository until `shipyard governance audit --repo danielraffel/Shipyard`
+# prints PASS for it.
+profile = "solo"
 type = "rust"
 platforms = ["macos", "linux", "windows"]
 

@@ -1,0 +1,40 @@
+{
+  "repo": "example/compliant",
+  "default_branch": "main",
+  "workflows": [
+    {
+      "path": ".github/workflows/ci.yml",
+      "content": "name: CI\non: [pull_request, push]\npermissions: {}\njobs:\n  test:\n    runs-on: ubuntu-latest\n    permissions:\n      contents: read\n    steps:\n      - uses: actions/checkout@v7.0.1 # locked in actions.lock\n        with:\n          persist-credentials: false\n      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c3a2a0e2f3e8f9b2f8a1f4e55 # v1.0.0\n      - uses: ./.github/actions/setup\n      # - uses: actions/cache@v4   (commented out, must not count)\n      - if: github.event_name == 'workflow_run'\n        run: echo \"an expression in a job is not a trigger\"\n      - run: cargo test\n"
+    },
+    {
+      "path": ".github/workflows/lockfile.yml",
+      "content": "name: Lockfile\non:\n  pull_request:\n  push:\n    branches: [main]\npermissions: {}\njobs:\n  lockfile:\n    runs-on: ubuntu-latest\n    permissions:\n      contents: read\n    env:\n      GH_TOKEN: ${{ github.token }}\n    steps:\n      - uses: actions/checkout@v7.0.1\n        with:\n          persist-credentials: false\n      - run: gh extension install github/gh-actions-lock --pin 0123456789abcdef0123456789abcdef01234567  # v0.4.1\n      - run: gh actions-lock --verify\n"
+    },
+    {
+      "path": ".github/workflows/zizmor.yml",
+      "content": "name: zizmor\non: [pull_request]  # never pull_request_target\npermissions: {}\njobs:\n  zizmor:\n    runs-on: ubuntu-latest\n    permissions:\n      contents: read\n    steps:\n      - uses: actions/checkout@v7.0.1\n        with:\n          persist-credentials: false\n      - run: uvx --from zizmor==1.32.0 zizmor --persona regular --min-severity high --min-confidence high --format github .github/workflows\n"
+    }
+  ],
+  "lockfile": "# Do not edit by hand; run `gh actions-lock` to update.\nversion: v0.0.3\n",
+  "dependabot": "version: 2\nupdates:\n  - package-ecosystem: cargo\n    directory: /\n    schedule:\n      interval: daily\n    open-pull-requests-limit: 5\n  - package-ecosystem: github-actions\n    directory: /\n    schedule:\n      interval: weekly\n    open-pull-requests-limit: 1\n    cooldown:\n      default-days: 7\n    groups:\n      github-actions:\n        patterns:\n          - \"*\"\n",
+  "renovate": null,
+  "required_contexts": [
+    "test"
+  ],
+  "tag_rulesets": [
+    {
+      "name": "protect-release-tags",
+      "enforcement": "active",
+      "include": [
+        "refs/tags/v*"
+      ],
+      "rules": [
+        "update",
+        "deletion",
+        "non_fast_forward"
+      ]
+    }
+  ],
+  "immutable_releases": true,
+  "default_workflow_permissions": "read"
+}

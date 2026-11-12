@@ -97,6 +97,46 @@ impl GovernanceGh {
             )
             .map_err(|error| error.to_string())
     }
+
+    /// `gh api --method GET <path>`; `Ok(None)` when GitHub answers 404.
+    ///
+    /// The method is explicit so a read-only wrapper (`ghread`) accepts it
+    /// and no flag added later can turn the call into a write.
+    pub(crate) fn api_get(
+        &self,
+        path: &str,
+        accept: Option<&str>,
+    ) -> Result<Option<String>, String> {
+        let mut command = self.command()?;
+        command.args(["api", "--method", "GET", path]);
+        if let Some(accept) = accept {
+            command.args(["-H", accept]);
+        }
+        let output = command
+            .output()
+            .map_err(|error| format!("failed to run gh api: {error}"))?;
+        if output.status.success() {
+            return Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()));
+        }
+        let detail = String::from_utf8_lossy(if output.stderr.is_empty() {
+            &output.stdout
+        } else {
+            &output.stderr
+        })
+        .trim()
+        .to_owned();
+        if detail.contains("HTTP 404") || detail.contains("Not Found") {
+            return Ok(None);
+        }
+        Err(format!(
+            "{path}: {}",
+            if detail.is_empty() {
+                "no detail"
+            } else {
+                &detail
+            }
+        ))
+    }
 }
 
 /// A field-level drift status for one branch-protection knob.
