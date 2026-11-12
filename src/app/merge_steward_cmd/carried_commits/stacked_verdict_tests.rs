@@ -1,13 +1,20 @@
 //! A candidate P that shares commits with another open pull request Q is
 //! cleared by Q's verdict at Q's listed head, never by the ancestry of the
-//! two heads. Each test runs one fixture twice, varying only Q's verdict (or
-//! only whether the shared commits are on the base), and asserts the two
-//! outcomes differ, so a pass cannot come from a read failing closed.
+//! two heads alone. Each test runs one fixture twice, varying only Q's
+//! verdict, P's age, or whether the shared commits are on the base, and
+//! asserts the two outcomes differ, so a pass cannot come from a read failing
+//! closed.
 //!
 //! The fixture serves every compare the guard makes, including the
 //! `<Q head>...<P head>` ancestry read as `behind` (P's head is in Q's
 //! history), so a guard that excused Q on ancestry would admit P in the held
 //! and unapproved cases.
+//!
+//! The one stack that is excused without Q's approval: P is the older pull
+//! request, Q's head contains P's exact head, and the shared commits are on
+//! P's first-parent chain (the parent of a stack whose child targets the base
+//! and is held or unreviewed). Work P merged in, a Q built on an older head
+//! of P's, and a P newer than Q stay refused.
 
 use std::cell::{Cell, RefCell};
 
@@ -20,7 +27,10 @@ const C: &str = "c100000000000000000000000000000000000000";
 const E: &str = "c200000000000000000000000000000000000000";
 const F: &str = "c300000000000000000000000000000000000000";
 const OLD_Q: &str = "c400000000000000000000000000000000000000";
-const P_NUMBER: u64 = 11930;
+/// A P opened after Q.
+const NEWER_P: u64 = 11940;
+/// A P opened before Q.
+const OLDER_P: u64 = 11930;
 const Q_NUMBER: u64 = 11932;
 const P_BRANCH: &str = "feature/p";
 const Q_BRANCH: &str = "feature/q";
@@ -31,6 +41,7 @@ type Node = (&'static str, &'static [&'static str]);
 /// P's range `main...P.head` and Q's listed head and range `main...Q.head`,
 /// each a linear chain given oldest first.
 struct Fixture {
+    p_number: u64,
     p_head: &'static str,
     p_range: &'static [Node],
     q_head: &'static str,
@@ -115,7 +126,7 @@ fn run(fixture: &Fixture, verdict: &dyn Fn(&str) -> Judgement) -> (Option<Refusa
         &run_gh,
         "Generous-Corp/pulp",
         "main",
-        P_NUMBER,
+        fixture.p_number,
         P_BRANCH,
         fixture.p_head,
         &mut PassCache::default(),
@@ -132,16 +143,18 @@ const CARRIES_Q: &str = "carries_unapproved_commits:#11932";
 
 /// P stacks on Q: Q's range is `C`, P's range is `C, E` with P built on C.
 const P_ON_Q: Fixture = Fixture {
+    p_number: NEWER_P,
     p_head: E,
     p_range: &[(C, &[BASE_TIP]), (E, &[C])],
     q_head: C,
     q_range: &[(C, &[BASE_TIP])],
 };
 
-/// The merge-back graph from the HOLD: Q introduced C, P built E on C, then Q
-/// advanced to F on top of E. P's head E is a proper ancestor of Q's head F,
-/// and C is Q's commit.
+/// The merge-back graph from the HOLD: Q introduced C, P (opened after Q)
+/// built E on C, then Q advanced to F on top of E. P's head E is a proper
+/// ancestor of Q's head F, and C is Q's commit.
 const Q_ABOVE_P: Fixture = Fixture {
+    p_number: NEWER_P,
     p_head: E,
     p_range: &[(C, &[BASE_TIP]), (E, &[C])],
     q_head: F,
@@ -206,6 +219,7 @@ fn p_carrying_q_commits_already_on_the_base_is_admitted() {
     // C landed on main: P's range is only E, while the still-open Q (held)
     // lists C.
     let landed = Fixture {
+        p_number: NEWER_P,
         p_head: E,
         p_range: &[(E, &[C])],
         q_head: C,
@@ -242,5 +256,87 @@ fn a_held_q_that_contains_p_head_still_refuses_p() {
 
     // Control: once Q's head is approved, P is admitted.
     let (refusal, _) = run(&Q_ABOVE_P, &|_| Judgement::Approved);
+    assert_eq!(refusal, None);
+}
+
+/// The stack from the deadlock: P (opened first) is C then E; Q, opened
+/// later and targeting the base, branched off P's head and added F. The same
+/// graph as [`Q_ABOVE_P`], with P the older pull request.
+const STACK_ON_OLDER_P: Fixture = Fixture {
+    p_number: OLDER_P,
+    ..Q_ABOVE_P
+};
+
+#[test]
+fn an_older_parent_is_admitted_past_its_held_or_unreviewed_child() {
+    for verdict in [
+        Judgement::Held("HOLD: carries the parent's commits".to_owned()),
+        Judgement::Unapproved("no APPROVE".to_owned()),
+    ] {
+        let (refusal, _) = run(&STACK_ON_OLDER_P, &|_| verdict.clone());
+        assert_eq!(
+            refusal, None,
+            "parent admitted past a child judged {verdict:?}"
+        );
+    }
+
+    // Control: the same graph and verdict with P opened after Q is the HOLD's
+    // counterexample, and is refused.
+    let (refusal, _) = run(&Q_ABOVE_P, &|_| Judgement::Held("HOLD".to_owned()));
+    assert_eq!(refused_token(refusal), CARRIES_Q);
+}
+
+#[test]
+fn an_older_parent_whose_head_the_child_lacks_is_refused() {
+    // P moved on to G after Q branched off E: Q carries P's older head, not
+    // the head P is admitted at.
+    const G: &str = "c500000000000000000000000000000000000000";
+    let moved = Fixture {
+        p_number: OLDER_P,
+        p_head: G,
+        p_range: &[(C, &[BASE_TIP]), (E, &[C]), (G, &[E])],
+        q_head: F,
+        q_range: &[(C, &[BASE_TIP]), (E, &[C]), (F, &[E])],
+    };
+    let (refusal, _) = run(&moved, &|_| Judgement::Held("HOLD".to_owned()));
+    assert_eq!(refused_token(refusal), CARRIES_Q);
+
+    // Control: once Q contains P's current head, P is admitted.
+    let caught_up = Fixture {
+        q_head: F,
+        q_range: &[(C, &[BASE_TIP]), (E, &[C]), (G, &[E]), (F, &[G])],
+        ..moved
+    };
+    let (refusal, _) = run(&caught_up, &|_| Judgement::Held("HOLD".to_owned()));
+    assert_eq!(refusal, None);
+}
+
+#[test]
+fn an_older_parent_that_merged_in_the_childs_held_work_is_refused() {
+    // P (older) merged Y, a commit off its own first-parent chain, and Q,
+    // built on P's head, holds Y. Only the commits on P's first-parent chain
+    // are P's own, so Y still refuses P.
+    const Y: &str = "c600000000000000000000000000000000000000";
+    const M: &str = "c700000000000000000000000000000000000000";
+    let merged_in = Fixture {
+        p_number: OLDER_P,
+        p_head: M,
+        p_range: &[(C, &[BASE_TIP]), (Y, &[BASE_TIP]), (M, &[C, Y])],
+        q_head: F,
+        q_range: &[(C, &[BASE_TIP]), (Y, &[BASE_TIP]), (M, &[C, Y]), (F, &[M])],
+    };
+    let refusal = run(&merged_in, &|_| Judgement::Held("HOLD on Y".to_owned()))
+        .0
+        .expect("refused");
+    assert_eq!(refusal.token, CARRIES_Q);
+    assert!(refusal.detail.contains(Y), "names Y: {}", refusal.detail);
+    assert!(
+        !refusal.detail.contains(C),
+        "C is on P's first-parent chain, so P's own: {}",
+        refusal.detail
+    );
+
+    // Control: approving Q admits P.
+    let (refusal, _) = run(&merged_in, &|_| Judgement::Approved);
     assert_eq!(refusal, None);
 }

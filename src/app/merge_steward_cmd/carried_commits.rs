@@ -30,14 +30,23 @@
 //!   built on P while targeting the base, or Q merged P back in) is judged
 //!   like any other Q. Head ancestry cannot say which pull request introduced
 //!   a shared commit, so the commits both ranges hold clear P only while Q's
-//!   listed head is approved, without a HOLD, or once they are on the base.
+//!   listed head is approved, without a HOLD, or once they are on the base,
+//!   with one exception, the older parent: when P was opened before Q and
+//!   Q's own diff holds P's exact head, a shared commit on P's first-parent
+//!   chain is P's own even though it is on Q's first-parent chain too (Q
+//!   branched off P's line). The pull request opened first proposed those
+//!   commits first. Commits P merged in (off P's first-parent chain), a Q
+//!   built on an older head of P's, and a P opened after Q stay refused.
+//!   Named residual: a P opened first and later reset onto commits a newer,
+//!   held Q introduced, after which Q built on P's head, is cleared.
 //! * Q merged P's branch without being stacked on it: a shared commit counts
 //!   against P only when it is on Q's first-parent chain (`Q.base..Q.head`
 //!   walked through first parents) or is not on P's own first-parent chain
 //!   (`base..P.head`). A commit on P's first-parent chain that reached Q only
 //!   through a merge's second parent is P's own, so it does not hold P; when
 //!   every shared commit is P's own, Q is cleared, and a refusal P still gets
-//!   from another pull request says "#Q merged #P's branch; not carried".
+//!   from another pull request says "#Q merged or built on #P's branch; not
+//!   carried".
 //!   The real catches remain: P merging held work in (the held commits are
 //!   P's second parent, so not on P's first-parent chain) and P built
 //!   straight on commits on Q's own first-parent chain (on both chains). A
@@ -854,11 +863,28 @@ pub(super) fn refusal_with(
         ) else {
             continue;
         };
+        let graphs = std::cell::RefCell::new(&mut cache.graphs);
         let mut chain = |chain_base: &str, chain_head: &str| {
-            cached_graph(run_gh, repo, &mut cache.graphs, chain_base, chain_head)
-                .and_then(|graph| first_parent_chain(&graph, chain_base, chain_head))
+            cached_graph(
+                run_gh,
+                repo,
+                &mut graphs.borrow_mut(),
+                chain_base,
+                chain_head,
+            )
+            .and_then(|graph| first_parent_chain(&graph, chain_base, chain_head))
         };
-        match without_own_commits(settled, base, head_sha, q, &mut chain) {
+        let mut older_parent = || {
+            let graph = cached_graph(
+                run_gh,
+                repo,
+                &mut graphs.borrow_mut(),
+                &q.base_ref,
+                &q.head_sha,
+            );
+            older_parent_of(number, head_sha, q, graph.as_ref())
+        };
+        match without_own_commits(settled, base, head_sha, q, &mut older_parent, &mut chain) {
             Some(settled) => {
                 if let Some(settled) = landed::without_landed_commits(run_gh, repo, base, settled) {
                     judged.push(settled);
@@ -872,7 +898,7 @@ pub(super) fn refusal_with(
             use std::fmt::Write as _;
             let _ = write!(
                 refusal.detail,
-                "; #{q} merged #{number}'s branch; not carried"
+                "; #{q} merged or built on #{number}'s branch; not carried"
             );
         }
         refusal
@@ -882,17 +908,42 @@ pub(super) fn refusal_with(
 /// Reads a `(base, head)` first-parent chain.
 type ChainReader<'a> = dyn FnMut(&str, &str) -> Result<BTreeSet<String>, String> + 'a;
 
+/// Whether `q` builds on P as an older parent: P (`number`) was opened before
+/// `q`, and `q`'s own diff (`graph`, `q.base...q.head`) holds P's exact head,
+/// so `q`'s head contains every commit P has. Pure.
+///
+/// This is the evidence the commit graph alone lacks. When P's and `q`'s
+/// first-parent chains share a run of commits, the graph cannot say whether
+/// `q` branched off P or P branched off `q`; the pull request opened first
+/// proposed those commits first, and P's exact-head approval reviewed them as
+/// P's own diff. A `q` that is older than P, or that does not contain P's
+/// current head (P moved on since `q` took it), is not an older parent.
+fn older_parent_of(
+    number: u64,
+    p_head: &str,
+    q: &OpenPr,
+    graph: Result<&CommitGraph, &String>,
+) -> bool {
+    number < q.number
+        && matches!(graph, Ok(CommitGraph::Complete(introduced)) if introduced.contains_key(p_head))
+}
+
 /// Drop from a refusing overlap with `q` the commits that are P's own: on P's
-/// first-parent chain (`base..p_head`) and not on `q`'s (`q.base..q.head`).
-/// Such a commit reached `q` only through a merge's second parent, so `q`
-/// merged P's branch and P carries nothing of `q`'s. `None` when every shared
-/// commit is P's own. An approved `q`, an unbounded overlap, and any chain
-/// that cannot be read keep the overlap as it is.
+/// first-parent chain (`base..p_head`) and either not on `q`'s
+/// (`q.base..q.head`), or on both chains while P is `q`'s older parent
+/// (`older_parent`, see [`older_parent_of`]). A commit of the first kind
+/// reached `q` only through a merge's second parent, so `q` merged P's branch;
+/// one of the second kind is P's line that `q` built on. Either way P carries
+/// nothing of `q`'s through it. A shared commit off P's first-parent chain
+/// (work P merged in) is never P's own. `None` when every shared commit is
+/// P's own. An approved `q`, an unbounded overlap, and any chain that cannot
+/// be read keep the overlap as it is.
 fn without_own_commits(
     settled: (Carried, Judgement),
     base: &str,
     p_head: &str,
     q: &OpenPr,
+    older_parent: &mut dyn FnMut() -> bool,
     chain: &mut ChainReader<'_>,
 ) -> Option<(Carried, Judgement)> {
     let (
@@ -912,9 +963,10 @@ fn without_own_commits(
     let (Ok(p_chain), Ok(q_chain)) = (chain(base, p_head), chain(&q.base_ref, &q.head_sha)) else {
         return Some(settled);
     };
+    let older_parent = older_parent();
     let kept: Vec<String> = shared
         .iter()
-        .filter(|sha| q_chain.contains(*sha) || !p_chain.contains(*sha))
+        .filter(|sha| !p_chain.contains(*sha) || (q_chain.contains(*sha) && !older_parent))
         .cloned()
         .collect();
     if kept.is_empty() {

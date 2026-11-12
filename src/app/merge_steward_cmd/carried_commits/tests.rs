@@ -621,7 +621,7 @@ fn a_stacked_pr_that_merged_the_candidates_branch_does_not_hold_it() {
     assert!(
         refusal
             .detail
-            .contains("#21 merged #11363's branch; not carried"),
+            .contains("#21 merged or built on #11363's branch; not carried"),
         "{}",
         refusal.detail
     );
