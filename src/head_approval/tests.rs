@@ -810,6 +810,31 @@ fn fleet_ssh_requires_an_exact_head_approval_from_the_reviewer_pass() {
     assert!(allows(&policy, &approve, author));
 }
 
+#[test]
+fn spectr_requires_an_exact_head_approval_from_the_reviewer_pass() {
+    // Its base config sets no `arm_requires_head_approval`: only the list default gates it.
+    let policy = by_default("danielraffel/spectr");
+    assert!(policy.required);
+    assert!(policy.any_reviewer_but_author);
+    assert!(policy.validate().is_ok());
+    assert!(by_default("DanielRaffel/Spectr").required);
+    assert_eq!(by_default("danielraffel/spec"), ApprovalPolicy::default());
+    let author = Some("shipyard-local[bot]");
+    assert!(
+        !allows(&policy, &[], author),
+        "an unapproved head is refused"
+    );
+    let approve = [fleet(
+        "2026-11-11T01:00:00Z",
+        &format!(
+            "Reviewed.\n\nreviewer: infra-review2\n\
+             <!-- session: Daniels-Mac-Studio-m3/fleet-pass-reviewer-m3-20261111T010000Z-1 agent: infra-review2 -->\n\
+             verdict: APPROVE head:{HEAD}\n"
+        ),
+    )];
+    assert!(allows(&policy, &approve, author));
+}
+
 /// The handbook's base config once it drops `arm_requires_head_approval`
 /// (it keeps `reviewer_signers` and `reviewer_stamp_sessions`): the list
 /// default applies, and the base's own signer and session rules still bind
