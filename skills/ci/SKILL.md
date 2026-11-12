@@ -369,7 +369,7 @@ wrapper. Each attempt, allowed or refused, appends a line to
 `verb`, `verdict`, `verdict_comment_id`, `signer`, `caller`; override the path
 with `SHIPYARD_QUEUE_ARMS_LOG`). A guard that cannot run (no `python3` 3.11+)
 refuses. The steward reports a refusal as `waiting_head_approval`; its pass
-JSON also names the reason per PR in `blocked_on` (`no_verdict`, `held`,
+JSON also names the reason per PR in `blocked_on` (`no_verdict`, `held:review-verdict`,
 `approval_excluded:<reason>`, ...) with a `since` time, so read that rather
 than the mutation when diagnosing a stall. A pass past `--pass-budget-secs` (default 240; 0 disables), or after GitHub reports the API rate limit exceeded, starts no new per-PR work: remaining rows report `deferred_pass_budget`, are never admitted, armed, enqueued or dequeued, and are taken first next pass, oldest deferral first, after queued/armed rows and enqueueable rows (a deferred enqueueable row goes ahead of a fresh one). Keep the budget under the scheduler's timeout so the report still prints. The steward also refuses a head
 that carries another open PR's commits whose head is not approved
@@ -4705,7 +4705,7 @@ URL; the author pushes a new head (merging the base) and the reviewer
 reviews that. It also refuses a verdict that contradicts the same session's
 opposite verdict on the same head within ten minutes; a deliberate
 retraction of one's own APPROVE posts with `SHIPYARD_VERDICT_RETRACT=1`. The
-steward reports such a row as `held` with `blocked_detail` "held head: needs
+steward reports such a row as `held:review-verdict` with `blocked_detail` "held head: needs
 a new head", which `shipyard wait pr --state actionable` prints.
 
 # Local Rust gate placement

@@ -24,6 +24,7 @@ fn green_pr() -> StewardPullRequest {
             run_id: Some(10),
             observed_at: Some("2026-07-26T00:00:00Z".to_owned()),
             check_id: None,
+            description: None,
         }],
     }
 }
@@ -71,6 +72,7 @@ fn explicit_management_requires_label_and_current_head_receipt() {
         run_id: None,
         observed_at: Some("2026-08-13T00:00:00Z".to_owned()),
         check_id: None,
+        description: None,
     });
     assert_eq!(
         classify_pr(&pr, &policy, &BTreeMap::new()),
@@ -165,6 +167,7 @@ fn check_run_cannot_impersonate_handoff_status_context() {
         run_id: Some(99),
         observed_at: Some("2026-08-13T00:00:00Z".to_owned()),
         check_id: None,
+        description: None,
     });
     assert_eq!(
         classify_pr(&pr, &policy, &BTreeMap::new()),
@@ -254,6 +257,7 @@ fn ignores_advisory_failure_when_required_context_is_green() {
         run_id: Some(11),
         observed_at: Some("2026-07-26T00:00:00Z".to_owned()),
         check_id: None,
+        description: None,
     });
     assert_eq!(
         classify_pr(&pr, &queue_policy(), &BTreeMap::new()),
@@ -275,6 +279,7 @@ fn newest_duplicate_required_context_is_authoritative() {
         run_id: Some(12),
         observed_at: Some("2026-07-26T00:00:00Z".to_owned()),
         check_id: None,
+        description: None,
     });
     assert_eq!(
         classify_pr(&pr, &queue_policy(), &BTreeMap::new()),
@@ -295,6 +300,7 @@ fn undated_pending_duplicate_blocks_older_success() {
         run_id: Some(12),
         observed_at: None,
         check_id: None,
+        description: None,
     });
     assert!(matches!(
         classify_pr(&pr, &queue_policy(), &BTreeMap::new()),
@@ -398,6 +404,7 @@ fn direct_merge_refuses_unvalidated_base_advance_even_with_authoritative_checks(
         run_id: Some(12),
         observed_at: Some("2026-07-26T00:00:00Z".to_owned()),
         check_id: None,
+        description: None,
     });
 
     assert_eq!(
@@ -1301,6 +1308,7 @@ fn run_check(conclusion: &str, observed_at: &str, check_id: Option<u64>) -> Stew
         run_id: Some(10),
         observed_at: Some(observed_at.to_owned()),
         check_id,
+        description: None,
     }
 }
 
@@ -1362,6 +1370,7 @@ fn status_context_uses_status_id_over_skewed_timestamp() {
         run_id: None,
         observed_at: Some(at.to_owned()),
         check_id: Some(id),
+        description: None,
     };
     let mut pr = green_pr();
     pr.checks = vec![
@@ -1421,6 +1430,7 @@ fn awaiting_verdict_pr(status_state: &str, status_conclusion: Option<&str>) -> S
         run_id: None,
         observed_at: Some("2026-11-03T10:00:00Z".to_owned()),
         check_id: Some(7),
+        description: None,
     });
     pr.checks.push(StewardCheck {
         name: context.to_owned(),
@@ -1431,6 +1441,7 @@ fn awaiting_verdict_pr(status_state: &str, status_conclusion: Option<&str>) -> S
         run_id: Some(11),
         observed_at: Some("2026-11-03T10:00:05Z".to_owned()),
         check_id: Some(99),
+        description: None,
     });
     pr
 }
@@ -1486,6 +1497,7 @@ fn a_pending_approval_status_never_agrees_or_arms() {
         run_id: Some(12),
         observed_at: Some("2026-11-03T10:00:01Z".to_owned()),
         check_id: Some(100),
+        description: None,
     });
     assert_ne!(
         classify_pr(&pr, &approval_policy(), &BTreeMap::new()),
@@ -1512,6 +1524,7 @@ fn a_pending_approval_status_on_an_exact_head_base_is_waiting_not_failed() {
         run_id: Some(12),
         observed_at: Some("2026-11-03T10:00:01Z".to_owned()),
         check_id: Some(100),
+        description: None,
     });
     assert!(policy.server_enforced_exact_head_merge());
     assert!(matches!(
@@ -1556,6 +1569,7 @@ fn check(name: &str, status: &str, conclusion: Option<&str>) -> StewardCheck {
         run_id: Some(11),
         observed_at: Some("2026-11-07T03:24:29Z".to_owned()),
         check_id: None,
+        description: None,
     }
 }
 
@@ -1637,6 +1651,7 @@ fn approval_awaiting_ignores_other_creators_and_rollup_copies() {
             run_id: None,
             observed_at: Some("2026-11-11T11:25:01Z".to_owned()),
             check_id: id,
+            description: None,
         };
     let held = status("COMPLETED", Some("FAILURE"), Some(15368), Some(1));
     // Someone else's newer pending status cannot mask the bound app's HOLD.

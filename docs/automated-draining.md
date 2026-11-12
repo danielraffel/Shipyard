@@ -371,7 +371,7 @@ close anything. See [superseded-close.md](superseded-close.md).
 | Token | Meaning | Who moves it |
 |---|---|---|
 | `no_verdict` | Green, and no reviewer verdict names this head: "awaiting the standing reviewer; nothing for the author to do" | reviewer |
-| `held` | A counting HOLD names this head, so it is un-approvable and any APPROVE of it is ignored; `blocked_detail` reads "held head: needs a new head" | author: fix and push a new head (if the HOLD is wrong, push a new head anyway and comment `dispute: <reason>`) |
+| `held:review-verdict` | A counting HOLD names this head, so it is un-approvable and any APPROVE of it is ignored. `blocked_detail` reads "held head: needs a new head" when the pass read the gate, or the review-verdict status's own description (`a HOLD naming head <sha> makes it un-approvable (held by ...)`) when it did not. Consumers that key on the token's kind (before `:`) still read `held` | repair lane: address the HOLD's named items, then push a new head (if the HOLD is wrong, push a new head anyway and comment `dispute: <reason>`) |
 | `approval_excluded:<reason>` | An APPROVE names this head but does not count. Reasons: `unattributed`, `no_stamp`, `noncanonical_stamp`, `session_not_allowed`, `unlisted_stamp_session`, `no_signer_list`, `no_signer_line`, `uncounted_signer`, `unbound_identity`, `pr_author`, `impersonated_app`, `untrusted_reviewer`, `unlisted_reviewer`, `unlisted_human`, `predates_head` (posted before the head commit), `stale_head` (only an earlier head is approved), `self_approved` | reviewer or fleet config |
 | `ejection_cap` | The queue removed this head too often since its last approval | reviewer, or a new push |
 | `approval_unread` | The approval gate could not be read this pass | next pass |
@@ -380,7 +380,7 @@ close anything. See [superseded-close.md](superseded-close.md).
 | `provenance_blocked:<labels>` | A provenance-blocking label | owner |
 | `required_never_ran:<contexts>` | A required context has no run on this head and nothing from its source is still queued or running (often a renamed check: merge the base to re-run CI) | repair lane |
 | `required_pending` | Required checks are queued or running, or have not appeared yet behind a running job, and none has failed. A `pending` `review-verdict` status (head awaiting its reviewer) also reads here, with the reviewer as actor, never as `required_failed` | CI, or the reviewer |
-| `required_failed:<contexts>` | A required check failed. On a merge-queue base (`red_check_outranks_pending`, see [Ejection guards](#ejection-guards)) this outranks `required_pending`: a red head reads failed while its other checks still run. No red required check is ever admitted, whichever token it reads. When the only red context is the approval context (`review-verdict`), the row names the approval token instead; an apply pass that did not read the gate for that head keeps this token and says so in `blocked_detail` | author or repair lane |
+| `required_failed:<contexts>` | A required check failed. On a merge-queue base (`red_check_outranks_pending`, see [Ejection guards](#ejection-guards)) this outranks `required_pending`: a red head reads failed while its other checks still run. No red required check is ever admitted, whichever token it reads. When the only red context is the approval context (`review-verdict`), the row names the approval token instead; an apply pass that did not read the gate for that head reads the approval status's own description instead: a HOLD naming this head reads `held:<context>` (repair lane), "no reviewer verdict names head" reads `no_verdict` (reviewer), and only an absent or unrecognised description keeps this token and says so in `blocked_detail` | author or repair lane |
 | `transient_rerun` | The steward is rerunning an interrupted check | steward |
 | `merge_state:<STATE>` | GitHub says `DIRTY`, `BEHIND`, `UNSTABLE`, ... | repair lane: merge the base |
 | `ejected_same_head:<cause>` | The queue ejected this exact head and the steward will not re-enqueue it: the failure is the head's, could not be placed, or the head's one retry is spent. `blocked_detail` carries the classifier's reason (the failing job and whether the retry was spent). Read from the same queue state in a dry run and an apply pass; `since` is the removal | repair lane |
@@ -420,7 +420,8 @@ Every steward pass row carries the same `next_action`.
 
 | `actor` | Meaning |
 |---|---|
-| `author` | Act now: the action names the HOLD (with its link), the failed required check, the conflict, or the dropped change. |
+| `author` | Act now: the action names the failed required check, the conflict, or the dropped change. |
+| `repair` | Act now (the repair lane, or the author doing its job): a HOLD names this head; the action links it. Address the HOLD's named items, then push a new head. |
 | `owner` | `stop: true`: `owner-decision`, `superseded`, `PARKED/*`, or no automatic admission. Report and stop. |
 | `nobody` | `stop: true`: merged or closed. A merged answer says to retarget stacked children to the base. |
 | `reviewer`, `ci`, `steward`, `operator` | Nothing to do; keep waiting. Includes green-with-no-verdict, checks running, queued, and BEHIND on a merge-queue base (never merge main for that). |

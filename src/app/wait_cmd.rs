@@ -1901,7 +1901,7 @@ artifacts = [
             "merged": false,
             "headRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "merge_state": "CLEAN",
-            "blocked_on": if actionable { "held" } else { "no_verdict" },
+            "blocked_on": if actionable { "held:review-verdict" } else { "no_verdict" },
             "since": "2026-11-01T10:10:00Z",
             "held_by": if actionable {
                 serde_json::json!({"holder": "infra-review2", "record": "comment", "id": 1})
@@ -1909,7 +1909,7 @@ artifacts = [
                 Value::Null
             },
             "next_action": {
-                "actor": if actionable { "author" } else { "reviewer" },
+                "actor": if actionable { "repair" } else { "reviewer" },
                 "action": if actionable { "HOLD by infra-review2: fix it." } else { "Nothing to do." },
                 "stop": false
             },
@@ -1951,11 +1951,13 @@ artifacts = [
         assert_eq!(code, ExitCode::SUCCESS);
         assert!(text.starts_with("matched after "), "{text}");
         assert!(
-            text.contains("#11364 head aaaaaaaaaaaa blocked_on=held since 2026-11-01T10:10:00Z"),
+            text.contains(
+                "#11364 head aaaaaaaaaaaa blocked_on=held:review-verdict since 2026-11-01T10:10:00Z"
+            ),
             "{text}"
         );
         assert!(
-            text.contains("next (author): HOLD by infra-review2: fix it."),
+            text.contains("next (repair): HOLD by infra-review2: fix it."),
             "{text}"
         );
     }
@@ -1980,9 +1982,9 @@ artifacts = [
         let envelope: Value = serde_json::from_str(text.trim()).expect("json");
         assert_eq!(envelope["matched"], true);
         assert_eq!(envelope["condition"]["type"], "pr_actionable");
-        assert_eq!(envelope["observed"]["blocked_on"], "held");
+        assert_eq!(envelope["observed"]["blocked_on"], "held:review-verdict");
         assert_eq!(envelope["observed"]["actionable"], true);
-        assert_eq!(envelope["observed"]["next_action"]["actor"], "author");
+        assert_eq!(envelope["observed"]["next_action"]["actor"], "repair");
         assert_eq!(envelope["observed"]["held_by"]["holder"], "infra-review2");
 
         let mut snapshot = actionable_snapshot(true);

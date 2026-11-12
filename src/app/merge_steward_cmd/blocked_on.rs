@@ -31,6 +31,16 @@ use crate::merge_steward::{OWNER_DECISION_LABEL, PARKED_LABEL_PREFIX, SUPERSEDED
 /// list.
 const NOT_BLOCKED: [&str; 4] = ["admitted", "queued", "ready", "draft"];
 
+/// The approval status description for a counted HOLD on the head:
+/// `a HOLD naming head <sha> makes it un-approvable (held by <signer> at
+/// <comment|review> <id>, posted <time>)`.
+const HOLD_STATUS_PREFIX: &str = "a HOLD naming head ";
+/// The approval status description for a head no verdict names yet:
+/// `no reviewer verdict names head <sha>; it needs ...`.
+const NO_VERDICT_STATUS_PREFIX: &str = crate::merge_steward::AWAITING_VERDICT_FAILURE_PREFIX;
+/// The older approval script's description for the same wait.
+const AWAITING_STATUS_PREFIX: &str = "awaiting reviewer verdict";
+
 /// `blocked_detail` of a `held` row: the one move that unblocks it.
 pub(super) const HELD_DETAIL: &str = "held head: needs a new head";
 
@@ -243,6 +253,15 @@ pub(super) struct RowFacts<'a> {
 #[must_use]
 pub(super) fn classify(facts: &RowFacts<'_>, policy: &StewardPolicy) -> (Stall, SinceHint) {
     let (mut stall, hint) = classify_token(facts, policy);
+    // A HOLD is the approval context's refusal: name it, as the status-read
+    // path does, so every held row reads `held:<context>`. Consumers that key
+    // on the token's kind (before `:`) still read `held`.
+    if stall.blocked_on == "held" {
+        let context = policy.approval_context.trim();
+        if !context.is_empty() {
+            stall.blocked_on = format!("held:{context}");
+        }
+    }
     if stall.held_by.is_none()
         && let GateRead::Refused(ApprovalBlocker::Held {
             holder, record, id, ..
@@ -566,17 +585,110 @@ fn approval_context_only(
         // A verdict job still running is pending, not failed: keep the check
         // token (`required_pending`) rather than synthesizing a failure.
         GateRead::Unread if !failed => None,
-        GateRead::Unread => Some(dated(
-            format!("required_failed:{}", context_names(policy, contexts)),
+        GateRead::Unread => Some(
+            unread_gate_from_status(facts, policy, since.clone()).unwrap_or_else(|| {
+                dated(
+                    format!("required_failed:{}", context_names(policy, contexts)),
+                    since,
+                    "check_completed",
+                    Some(
+                        "only the approval context is not green; this pass did not read the \
+                         approval gate for this head, so a dry run (without --apply) names the \
+                         reason"
+                            .to_owned(),
+                    ),
+                )
+            }),
+        ),
+    }
+}
+
+/// With the gate unread, the approval status's own description still says
+/// why it is red: a HOLD on this head (`held`, named `held:<context>` by
+/// [`classify`]; the repair lane's
+/// move) or no verdict yet (`no_verdict`, the reviewer's). `None` when the
+/// description is absent, names another head, or reads otherwise.
+fn unread_gate_from_status(
+    facts: &RowFacts<'_>,
+    policy: &StewardPolicy,
+    since: Option<String>,
+) -> Option<(Stall, SinceHint)> {
+    let app_id = policy
+        .required_checks
+        .iter()
+        .find(|required| {
+            required
+                .context
+                .eq_ignore_ascii_case(policy.approval_context.trim())
+        })
+        .and_then(|required| required.app_id);
+    let description = crate::merge_steward::approval_status_description(
+        &facts.pr.checks,
+        &policy.approval_context,
+        app_id,
+    )?
+    .trim();
+    let names_head = |rest: &str| {
+        let short = rest
+            .split(|c: char| !c.is_ascii_hexdigit())
+            .next()
+            .unwrap_or_default();
+        short.len() >= 7
+            && facts
+                .pr
+                .head_sha
+                .to_ascii_lowercase()
+                .starts_with(&short.to_ascii_lowercase())
+    };
+    if let Some(rest) = description.strip_prefix(HOLD_STATUS_PREFIX) {
+        if !names_head(rest) {
+            return None;
+        }
+        let (mut stall, hint) = dated(
+            "held".to_owned(),
             since,
             "check_completed",
-            Some(
-                "only the approval context is not green; this pass did not read the approval \
-                 gate for this head, so a dry run (without --apply) names the reason"
-                    .to_owned(),
-            ),
-        )),
+            Some(description.to_owned()),
+        );
+        stall.held_by = held_by_from_status(rest);
+        return Some((stall, hint));
     }
+    if let Some(rest) = description.strip_prefix(NO_VERDICT_STATUS_PREFIX) {
+        if !names_head(rest) {
+            return None;
+        }
+    } else if !description.starts_with(AWAITING_STATUS_PREFIX) {
+        return None;
+    }
+    Some(dated(
+        "no_verdict".to_owned(),
+        since,
+        "check_completed",
+        Some(description.to_owned()),
+    ))
+}
+
+/// The holder and record from a HOLD status description's
+/// `(held by <signer> at <comment|review> <id>, ...)` clause.
+fn held_by_from_status(rest: &str) -> Option<HeldBy> {
+    let clause = rest.split_once("(held by ")?.1;
+    let (holder, rest) = clause.split_once(" at ")?;
+    let (record, rest) = rest.split_once(' ')?;
+    let record = match record {
+        "comment" => "comment",
+        "review" => "review",
+        _ => return None,
+    };
+    let id = rest
+        .split(|c: char| !c.is_ascii_digit())
+        .next()
+        .and_then(|id| id.parse().ok());
+    let holder = holder.trim();
+    (!holder.is_empty()).then(|| HeldBy {
+        holder: holder.to_owned(),
+        record,
+        id,
+    })
 }
 
 /// Whether `contexts` (required-check labels) are all the approval context.

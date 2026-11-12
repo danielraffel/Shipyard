@@ -1869,6 +1869,10 @@ fn a_legacy_no_verdict_failure_status_reads_as_awaiting_the_reviewer() {
     let held = row("failure", "HOLD at head bbbc56cc9825 by infra-review2");
     assert_eq!(held.status, "COMPLETED");
     assert_eq!(held.conclusion.as_deref(), Some("FAILURE"));
+    assert_eq!(
+        held.description.as_deref(),
+        Some("HOLD at head bbbc56cc9825 by infra-review2")
+    );
     let approved = row("success", "approved: head bbbc56cc9825 carries `APPROVE`");
     assert_eq!(approved.conclusion.as_deref(), Some("SUCCESS"));
 

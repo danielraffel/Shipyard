@@ -80,7 +80,7 @@ fn green_rollup() -> String {
 
 #[cfg(unix)]
 #[test]
-fn a_hold_at_the_exact_head_is_the_authors_move_with_the_record_linked() {
+fn a_hold_at_the_exact_head_is_the_repair_lanes_move_with_the_record_linked() {
     let temp = tempfile::tempdir().expect("temp");
     let log = temp.path().join("calls");
     let hold = format!(
@@ -93,9 +93,12 @@ fn a_hold_at_the_exact_head_is_the_authors_move_with_the_record_linked() {
         "",
     );
     let (snapshot, calls) = read_snapshot(&temp, &body);
-    assert_eq!(snapshot["blocked_on"], "held", "{snapshot:#}\n{calls}");
+    assert_eq!(
+        snapshot["blocked_on"], "held:review-verdict",
+        "{snapshot:#}\n{calls}"
+    );
     assert_eq!(snapshot["actionable"], true);
-    assert_eq!(snapshot["next_action"]["actor"], "author");
+    assert_eq!(snapshot["next_action"]["actor"], "repair");
     assert_eq!(snapshot["next_action"]["stop"], false);
     let action = snapshot["next_action"]["action"]
         .as_str()
