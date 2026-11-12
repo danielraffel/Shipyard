@@ -112,6 +112,7 @@ esac
         infra_rerun: crate::app::merge_steward_cmd::InfraRerunMode::Off,
         pass_budget: None,
         pass_deadline: None,
+        invariants: None,
         apply: true,
         ledger: None,
     };
@@ -2237,6 +2238,7 @@ esac
         infra_rerun: crate::app::merge_steward_cmd::InfraRerunMode::Off,
         pass_budget: None,
         pass_deadline: None,
+        invariants: None,
         apply: true,
         ledger: None,
     };
@@ -2381,6 +2383,7 @@ fn steward_dry_run_needs_no_mutation_authority_and_makes_no_remote_write() {
         infra_rerun: crate::app::merge_steward_cmd::InfraRerunMode::Off,
         pass_budget: None,
         pass_deadline: None,
+        invariants: None,
         apply: false,
         ledger: None,
     };
@@ -2443,6 +2446,7 @@ echo "unexpected: $*" >&2; exit 90
         infra_rerun: crate::app::merge_steward_cmd::InfraRerunMode::Off,
         pass_budget: None,
         pass_deadline: Some(std::time::Instant::now()),
+        invariants: None,
         apply: true,
         ledger: None,
     };
@@ -2540,6 +2544,7 @@ echo "gh: API rate limit exceeded for installation ID 147677577. (HTTP 403)" >&2
         infra_rerun: crate::app::merge_steward_cmd::InfraRerunMode::Off,
         pass_budget: None,
         pass_deadline: None,
+        invariants: None,
         apply: true,
         ledger: None,
     };
@@ -2643,6 +2648,7 @@ esac
             infra_rerun: crate::app::merge_steward_cmd::InfraRerunMode::Off,
             pass_budget: None,
             pass_deadline: None,
+            invariants: None,
             apply: true,
             ledger: None,
         }
@@ -2999,6 +3005,7 @@ fi
         infra_rerun: crate::app::merge_steward_cmd::InfraRerunMode::Off,
         pass_budget: None,
         pass_deadline: None,
+        invariants: None,
         apply: true,
         ledger: None,
     };
@@ -3064,6 +3071,7 @@ fn routing_readiness_hold_does_not_suppress_an_unrelated_pr_in_repo_plan() {
         infra_rerun: crate::app::merge_steward_cmd::InfraRerunMode::Off,
         pass_budget: None,
         pass_deadline: None,
+        invariants: None,
         apply: false,
         ledger: None,
     };
@@ -3112,6 +3120,7 @@ fn disabled_preemption_ignores_preemption_only_observation_errors() {
         infra_rerun: crate::app::merge_steward_cmd::InfraRerunMode::Off,
         pass_budget: None,
         pass_deadline: None,
+        invariants: None,
         apply: false,
         ledger: None,
     };

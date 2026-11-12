@@ -398,6 +398,7 @@ pub(super) fn apply_repo_plan(
             exit_reasons: Vec::new(),
             dwell: Some(dwell_report),
             infra_rerun: Some(infra_rerun_status),
+            invariants: Vec::new(),
             repo: observation.repo.clone(),
             base: args.base.clone(),
             allow_auto_merge: observation.allow_auto_merge,

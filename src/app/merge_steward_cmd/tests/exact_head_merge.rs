@@ -514,6 +514,7 @@ fn an_armed_request_on_an_unapproved_waiting_head_is_disarmed() {
         infra_rerun: crate::app::merge_steward_cmd::InfraRerunMode::Off,
         pass_budget: None,
         pass_deadline: None,
+        invariants: None,
         apply: true,
         ledger: None,
     };
@@ -712,6 +713,7 @@ fn run_recovery_clear_pass(cleared_merge_state: &str) -> (PrReport, String) {
         infra_rerun: crate::app::merge_steward_cmd::InfraRerunMode::Off,
         pass_budget: None,
         pass_deadline: None,
+        invariants: None,
         apply: true,
         ledger: None,
     };

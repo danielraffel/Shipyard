@@ -3243,9 +3243,33 @@ pub(super) enum RunnerCommand {
             value_parser = ["off", "shadow", "enforce"]
         )]
         infra_rerun: String,
+        /// Skip the tick-start invariants (required contexts with no
+        /// producer, a base with no automatic admission, a required check
+        /// that never runs, approvals that never count). They only read and
+        /// report; this is the escape hatch if one misbehaves.
+        #[arg(long = "no-invariants")]
+        no_invariants: bool,
         /// Override the durable retry/audit ledger path. Test hook.
         #[arg(long = "ledger", hide = true)]
         ledger: Option<PathBuf>,
+    },
+    /// Fleet-level tick-start invariant: every repository in the fleet list
+    /// has a steward config clone with a readable `.shipyard/config.toml`.
+    /// With `--heal`, clone a missing one (same remote form as the existing
+    /// clones, sparse to `.shipyard` and `.github/workflows`) and add
+    /// `.github/workflows` to a sparse clone that lacks it. Exits 1 when an
+    /// invariant still fails.
+    #[command(name = "steward-invariants")]
+    StewardInvariants {
+        /// The fleet list: one OWNER/REPO per line.
+        #[arg(long = "fleet-repos")]
+        fleet_repos: PathBuf,
+        /// Directory holding one config clone per repository, by name.
+        #[arg(long)]
+        clones: PathBuf,
+        /// Repair what can be repaired safely (clone, widen sparse checkout).
+        #[arg(long)]
+        heal: bool,
     },
     /// Time the steward's hottest GitHub reads through `gh` and in process,
     /// side by side, and check that both paths print the same JSON. Read-only;

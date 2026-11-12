@@ -108,6 +108,7 @@ esac
             infra_rerun: crate::app::merge_steward_cmd::InfraRerunMode::Off,
             pass_budget: None,
             pass_deadline: None,
+            invariants: None,
             apply: true,
             ledger: None,
         };

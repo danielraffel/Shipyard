@@ -119,6 +119,7 @@ fn apply_args() -> StewardCommandArgs {
         ledger: None,
         pass_budget: None,
         pass_deadline: None,
+        invariants: None,
     }
 }
 

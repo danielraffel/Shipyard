@@ -158,6 +158,48 @@ the final force-cancel boundary re-reads blocker, opt-out, management label,
 exact-head handoff status, PR number, and base; a late authority loss leaves the
 pending record and a durable rejected-revalidation audit without another POST.
 
+## Tick-start invariants
+
+A pass can finish with `rc=0` and no errors while a repository admits nothing,
+because what is wrong is the set-up around it rather than any pull request.
+Every repository pass therefore reports `repos[].invariants`, one row per
+check, `{id, ok, detail, fix}` (plus `skipped`, `since`, `healed`, `followup`
+when they apply). Module: `merge_steward_cmd::invariants`.
+
+| id | fails when | incident it replays |
+|---|---|---|
+| `required_context_producer` | a required context (bound to GitHub Actions, or unbound) is named by no workflow on the base, carried by no open head, and not listed in `[merge_steward.invariants] external_producers` in the base's `.shipyard/config.toml` | watchdog `review-verdict` required with no workflow, 2026-11-11 |
+| `approval_admission_config` | the merge path is `direct_merge_refused_server_enforcement_required`; or exact-head approval is required (ruleset, `REVIEW_REQUIRED_REPOS`, or `arm_requires_head_approval`) and `[auto_merge] reviewer_signers` or `reviewer_stamp_sessions` is unset; or the ruleset requires the approval context but the approval rule does not apply to the repository (a row's error reads "head approval is not required here") | fleet-ssh #18, #19; watchdog missing from `REVIEW_REQUIRED_REPOS` |
+| `required_never_ran` | a `required_never_ran:<ctx>` row is over 60 minutes old and `<ctx>` runs on no open head | watchdog #8/#7 waiting 10+ hours |
+| `reviewer_verdicts_counted` | an `approval_excluded:<reason>` row (not `stale_head`/`predates_head`) is over 60 minutes old and no head counted an approval this pass | pass-runner install made verdicts comment-only, 2026-11-12 03:42Z |
+
+Cost: the base config is the pass's own cached read. Workflows are read from
+the directory the pass runs in when it is a checkout of the repository with the
+base checked out (the tick's config clone), otherwise one contents listing per
+pass with blobs cached by SHA beside the ledger. Nothing else is read. A
+failing invariant never changes the exit code. Under `--apply` the first failing
+pass is recorded in `<ledger>.invariants.json` and reported as `since`, so a
+standing incident is one row per tick, not a new event. Filing is off by
+default: with `[merge_steward.invariants] followup_issues = true` in the
+machine-global config, the steward opens one `fleet-followup` issue per
+invariant per repository in `followup_repo` (default
+`danielraffel/fleet-handbook`), and comments on it only when the finding (its
+`fix`) changes. `--no-invariants` turns all of it off.
+
+The fleet-level check runs once at tick start, outside any pass: `shipyard
+runner steward-invariants --fleet-repos <fleet-repos.txt> --clones <dir>
+[--heal] [--json]` reports `config_clone` for every row (a clone at
+`<dir>/<name>` with a readable `.shipyard/config.toml`). `--heal` clones a
+missing repository with the existing clones' remote form (`git@github.com:` stays
+SSH), `--filter=blob:none --sparse --depth 1`, sparse to `.shipyard` and
+`.github/workflows`, and adds `.github/workflows` to an existing sparse clone
+that lacks it. Both heals are idempotent and listed in `healed`; a missing
+`.shipyard/config.toml` is an incident only a change on the repository fixes.
+The reference tick script is `tools/steward-tick/shipyard-steward-tick.sh`; it
+writes `invariants=ok|FAIL:<id>,...|off` on each repository's summary line and
+`fleet invariants=...` once per tick, and `SHIPYARD_STEWARD_INVARIANTS=0` turns
+both off.
+
 ## What a pass costs GitHub (`api_calls`)
 
 Every repository in a `runner steward --json` report carries `api_calls`:

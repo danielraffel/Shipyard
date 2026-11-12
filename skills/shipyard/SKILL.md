@@ -3777,7 +3777,15 @@ reruns, and narrowly policy-scoped capacity-preemption mutations. `--infra-rerun
 infra reason (per `shipyard diagnose`) on any open pull request, never
 `review-verdict`, at most twice per head and check with a 20-minute backoff, and
 reports "infra outage suspected" in `infra_rerun.findings`; see
-[references/merge-steward.md](references/merge-steward.md#infra-reruns---infra-rerun-every-open-pull-request). Client-side
+[references/merge-steward.md](references/merge-steward.md#infra-reruns---infra-rerun-every-open-pull-request).
+Every pass also reports tick-start invariants in `repos[].invariants`
+(`{id, ok, detail, fix}`: `required_context_producer`,
+`approval_admission_config`, `required_never_ran`, `reviewer_verdicts_counted`);
+they only read and report, and `--no-invariants` turns them off. `shipyard runner
+steward-invariants --fleet-repos F --clones D [--heal]` checks, once per tick,
+that every fleet repository has a steward config clone, and with `--heal` clones a
+missing one; see
+[references/merge-steward.md](references/merge-steward.md#tick-start-invariants). Client-side
 REST direct merge is refused because GitHub cannot atomically bind both complete
 check materialization and the validated base revision; use a server-owned merge
 queue or the server-enforced exact-head merge below. A base with no merge queue (GitHub offers
