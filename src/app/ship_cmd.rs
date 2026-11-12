@@ -390,7 +390,12 @@ pub(super) fn ship_command<W: Write>(
     // admitted delegated head from an unrelated native merge. If this write
     // fails, do not arm: an arm without a durable witness cannot produce a
     // gate-bound receipt safely.
-    let mut delegated_witness = if targets.is_empty() && !repo.is_empty() {
+    let mut delegated_witness = if delegated_witness_wanted(
+        targets.is_empty(),
+        !repo.is_empty(),
+        args.stacked_on,
+        args.arm_auto_merge,
+    ) {
         let policy_snapshot =
             crate::wait_transport::fetch_pr_snapshot(&repo, pr_context.number, cwd)
                 .map_err(|error| {
@@ -428,6 +433,19 @@ pub(super) fn ship_command<W: Write>(
         })?;
         Some(witness)
     } else {
+        if targets.is_empty() && !repo.is_empty() {
+            let reason = if args.stacked_on.is_some() {
+                "stacked"
+            } else {
+                "--no-arm"
+            };
+            let line = format!("delegated arm withheld: {reason}\n");
+            if json_mode {
+                let _ = crate::writer_domain_lease::write_stderr(format_args!("{line}"));
+            } else {
+                write!(stdout, "{line}").map_err(|error| CliFailure::new(1, error.to_string()))?;
+            }
+        }
         None
     };
 
@@ -1586,3 +1604,60 @@ mod stacked_label_tests;
 #[cfg(test)]
 #[path = "ship_cmd/test_support.rs"]
 mod test_support;
+
+/// A delegated-validation witness exists only to bind a delegated arm. A
+/// stacked PR stays out of admission until retargeted and `--no-arm` never
+/// arms, so neither needs (or may fail on) the base's protected-branch policy.
+pub(super) const fn delegated_witness_wanted(
+    no_local_targets: bool,
+    has_repo: bool,
+    stacked_on: Option<u64>,
+    arm: super::cli::ArmRequest,
+) -> bool {
+    no_local_targets && has_repo && stacked_on.is_none() && !arm.leaves_unarmed()
+}
+
+#[cfg(test)]
+mod delegated_witness_tests {
+    use super::delegated_witness_wanted;
+    use crate::app::cli::ArmRequest;
+
+    #[test]
+    fn stacked_or_unarmed_ships_skip_the_witness() {
+        assert!(!delegated_witness_wanted(
+            true,
+            true,
+            Some(12137),
+            ArmRequest::Off
+        ));
+        assert!(!delegated_witness_wanted(
+            true,
+            true,
+            Some(12137),
+            ArmRequest::Default
+        ));
+        assert!(!delegated_witness_wanted(true, true, None, ArmRequest::Off));
+    }
+
+    #[test]
+    fn armed_unstacked_delegated_ship_still_builds_the_witness() {
+        assert!(delegated_witness_wanted(
+            true,
+            true,
+            None,
+            ArmRequest::Default
+        ));
+        assert!(!delegated_witness_wanted(
+            false,
+            true,
+            None,
+            ArmRequest::Default
+        ));
+        assert!(!delegated_witness_wanted(
+            true,
+            false,
+            None,
+            ArmRequest::Default
+        ));
+    }
+}
