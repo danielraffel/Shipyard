@@ -411,7 +411,7 @@ With it on, the guard reads `.shipyard/config.toml` on the PR's base:
 `[auto_merge] arm_requires_head_approval` decides when set, either way. When
 the base is silent, the repositories in `REVIEW_REQUIRED_REPOS`
 (`Generous-Corp/pulp`, `Generous-Corp/vellum`, `danielraffel/fleet-handbook`, `danielraffel/tartci`,
-`danielraffel/Shipyard`, `danielraffel/cmux-capacity-watchdog`) require review. A config that exists but cannot be
+`danielraffel/Shipyard`, `danielraffel/cmux-capacity-watchdog`, `danielraffel/fleet-ssh`) require review. A config that exists but cannot be
 read or parsed (invalid TOML, or a Python without `tomllib`) refuses rather
 than loosening. Shipyard's own arming and merge paths use the same switch for
 the list default; a repository's own config key applies to them on any host.
