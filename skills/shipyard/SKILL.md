@@ -5874,10 +5874,17 @@ receipts in `<state>/base-health/poison-issues.jsonl`, failures back off 30
 min) and lists it first in the reviewer priority file. Every rule is
 measured in `shadow_ledger.rs` (`<state>/base-health/shadow-open.json` and
 `shadow-ended.jsonl`; reported under `repos[].base_poison.shadow`): episodes
-per rule (`streak`, and `strict` = every group failed with the same first
-error line), labelled true when the streak grew past two groups, and a
-promotion `gate` per rule (>= 10 ended episodes and >= 14 days, precision
->= 0.9, false-fire PR-minutes below savings). Replayed over 2026-11-04..11
+per rule (`streak`, and `strict` = the two newest groups failed with the same
+first error line), each labelled by a PR-free control: when a context starts
+failing, the workflow named for it in `[base_health.control_workflows]`
+(context = "workflow.yml", cheap checks only) is dispatched once on the base
+branch, and that run's verdict for the context on the base tip makes the
+episode true (failed without any pull request) or false (passed). No control,
+or none within 6 h, leaves it unlabelled and out of the gate. The promotion
+`gate` per rule needs >= 10 control-labelled episodes and >= 14 days,
+precision >= 0.9 and false-fire PR-minutes below savings. In shadow
+(`merge_group_hold` not `on`) the root-cause route only reports what it
+would open. Replayed over 2026-11-04..11
 the `streak` rule was right in 2 of 12 Pulp episodes and 0-1 of 10 Vellum
 ones, which is why every act here starts in shadow.
 

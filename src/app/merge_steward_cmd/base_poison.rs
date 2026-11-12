@@ -557,6 +557,20 @@ pub(super) fn would_fast_track(poison: &RepoPoison) -> Vec<String> {
     if poison.health.poisoned_contexts().is_empty() {
         return Vec::new();
     }
+    if poison.fixes.is_empty() {
+        return poison
+            .health
+            .poisoned()
+            .iter()
+            .map(|poisoned| {
+                format!(
+                    "`{}` would open or find the tracking issue `{}` and list it first in the priority file (no fix is named)",
+                    poisoned.context,
+                    issue_key("<repo>", "<base>", &poisoned.context)
+                )
+            })
+            .collect();
+    }
     poison
         .fixes
         .iter()
@@ -580,6 +594,10 @@ pub(super) fn fast_track(
     let contexts = poison.health.poisoned_contexts();
     if contexts.is_empty() {
         return Vec::new();
+    }
+    // Shadow never opens an issue or touches the priority file.
+    if poison.policy.hold != PoisonHold::On {
+        return would_fast_track(poison);
     }
     let hooks = ReviewHooks::from_machine_global(&control.global_dir);
     if poison.fixes.is_empty() {

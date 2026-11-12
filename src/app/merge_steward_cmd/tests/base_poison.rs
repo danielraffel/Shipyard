@@ -62,6 +62,7 @@ fn poisoned(hold: PoisonHold, auto_jump: AutoJump, fixes: &[u64]) -> RepoPoison 
     RepoPoison {
         policy: BasePoisonPolicy {
             hold,
+            control_workflows: std::collections::BTreeMap::new(),
             pause: hold,
             auto_jump,
             read_error: None,

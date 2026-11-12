@@ -169,6 +169,7 @@ pub(super) fn apply_repo_plan(
                 Some(poison),
                 &held,
                 &would,
+                &|argv: &[String]| actions.run_gh(argv).map_err(|error| error.to_string()),
                 Utc::now(),
             ))
         }

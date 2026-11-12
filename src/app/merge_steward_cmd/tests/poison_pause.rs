@@ -108,6 +108,7 @@ fn poison(health: MergeGroupHealth, hold: PoisonHold, prs: &[ObservedPr]) -> Rep
     RepoPoison {
         policy: BasePoisonPolicy {
             hold,
+            control_workflows: std::collections::BTreeMap::new(),
             pause: hold,
             auto_jump: AutoJump::On,
             read_error: None,
@@ -710,79 +711,108 @@ fn the_pause_defaults_to_shadow_and_skips_entries_the_steward_did_not_admit() {
 }
 
 #[test]
-fn the_shadow_ledger_labels_episodes_and_gates_promotion() {
+#[allow(clippy::too_many_lines)] // Dispatch, read, settle and gate in one place.
+fn the_shadow_ledger_labels_episodes_by_a_pr_free_control_run() {
     use crate::app::merge_steward_cmd::shadow_ledger::{self, Episode};
     let key = "generous-corp/pulp@main";
-    let firing = |streak: usize, strict: bool| {
+    let firing = |strict: bool| {
         let mut map = BTreeMap::new();
-        map.insert((CONTEXT.to_owned(), "streak".to_owned()), streak);
+        map.insert((CONTEXT.to_owned(), "streak".to_owned()), 2);
         if strict {
-            map.insert((CONTEXT.to_owned(), "strict".to_owned()), streak);
+            map.insert((CONTEXT.to_owned(), "strict".to_owned()), 2);
         }
         map
     };
+    let controls = BTreeMap::from([(CONTEXT.to_owned(), "version-skill-check.yml".to_owned())]);
     let held = BTreeSet::from([12028, 12030]);
-    // A flake: two groups, then a pass. A false fire.
-    let mut open = Vec::new();
+    let none = BTreeSet::new();
+    let calls = std::cell::RefCell::new(Vec::<String>::new());
+    let verdict = std::cell::RefCell::new("");
+    let tip = "1".repeat(40);
+    let run_gh = |argv: &[String]| -> Result<String, String> {
+        let line = argv.join(" ");
+        calls.borrow_mut().push(line.clone());
+        if line.contains("/dispatches") {
+            assert!(line.contains("ref=main"), "{line}");
+            return Ok(r#"{"workflow_run_id":42}"#.to_owned());
+        }
+        if line.ends_with("--jq .sha") {
+            return Ok(tip.clone());
+        }
+        if line.contains("/check-runs?check_name=Enforce%20version%20%26%20skill%20sync") {
+            let conclusion = *verdict.borrow();
+            if conclusion.is_empty() {
+                return Ok(r#"{"check_runs":[]}"#.to_owned());
+            }
+            return Ok(format!(
+                r#"{{"check_runs":[{{"status":"completed","conclusion":"{conclusion}","started_at":"2026-11-12T23:00:00Z","check_suite":{{"workflow_run":{{"id":42}}}}}}]}}"#
+            ));
+        }
+        Err(format!("unexpected: {line}"))
+    };
+    // 00:30Z the streak and strict rules fire together: one control is
+    // dispatched for the context, shared by both.
+    let mut open: Vec<Episode> = Vec::new();
+    shadow_ledger::advance(&mut open, key, &firing(true), &held, &none, at(24, 30));
+    shadow_ledger::label(&mut open, key, REPO, "main", &controls, &run_gh, at(24, 30));
+    let dispatches = calls
+        .borrow()
+        .iter()
+        .filter(|line| line.contains("/dispatches"))
+        .count();
+    assert_eq!(dispatches, 1);
     assert!(
-        shadow_ledger::advance(
-            &mut open,
-            key,
-            &firing(2, false),
-            &held,
-            &BTreeSet::new(),
-            at(24, 0)
-        )
-        .is_empty()
+        open.iter()
+            .all(|episode| episode.control.as_ref().is_some_and(|c| c.base_sha == tip))
     );
-    let ended = shadow_ledger::advance(
-        &mut open,
-        key,
-        &BTreeMap::new(),
-        &held,
-        &BTreeSet::new(),
-        at(24, 20),
-    );
-    assert_eq!(ended.len(), 1);
-    assert_eq!(ended[0].corroborated, Some(false));
-    // A real poison: the streak grows to three before the fix's group passes.
-    shadow_ledger::advance(
-        &mut open,
-        key,
-        &firing(2, true),
-        &held,
-        &BTreeSet::new(),
-        at(24, 30),
-    );
-    shadow_ledger::advance(
-        &mut open,
-        key,
-        &firing(3, true),
-        &held,
-        &BTreeSet::new(),
-        at(25, 0),
-    );
-    let real = shadow_ledger::advance(
-        &mut open,
-        key,
-        &BTreeMap::new(),
-        &held,
-        &BTreeSet::new(),
-        at(29, 0),
-    );
+    // The groups recover before the control reports: the episodes end but
+    // wait for their label; nothing settles unlabelled.
+    shadow_ledger::advance(&mut open, key, &BTreeMap::new(), &held, &none, at(24, 50));
+    shadow_ledger::label(&mut open, key, REPO, "main", &controls, &run_gh, at(24, 50));
+    assert!(shadow_ledger::settle(&mut open, key).is_empty());
+    // The control fails on the base without any pull request: a true fire.
+    *verdict.borrow_mut() = "failure";
+    shadow_ledger::label(&mut open, key, REPO, "main", &controls, &run_gh, at(25, 0));
+    let real = shadow_ledger::settle(&mut open, key);
     assert_eq!(real.len(), 2);
     assert!(
         real.iter()
-            .all(|episode| episode.corroborated == Some(true))
+            .all(|episode| episode.corroborated == Some(true)),
+        "{real:?}"
     );
-    // Gate: one false and one true streak fire is far from enough evidence.
-    let mut history: Vec<Episode> = ended.into_iter().chain(real).collect();
-    let gate = shadow_ledger::gate("streak", &history, at(30, 0));
-    assert_eq!(gate["fires"], 2);
+    // A later flake: the control passes on the base, so it is a false fire,
+    // however long the streak looked.
+    *verdict.borrow_mut() = "success";
+    shadow_ledger::advance(&mut open, key, &firing(false), &held, &none, at(30, 0));
+    shadow_ledger::label(&mut open, key, REPO, "main", &controls, &run_gh, at(30, 0));
+    shadow_ledger::advance(&mut open, key, &BTreeMap::new(), &held, &none, at(30, 30));
+    let flake = shadow_ledger::settle(&mut open, key);
+    assert_eq!(flake.len(), 1);
+    assert_eq!(flake[0].corroborated, Some(false));
+    // A context with no control workflow is unlabelled and counts toward
+    // no gate.
+    let mut other: Vec<Episode> = Vec::new();
+    shadow_ledger::advance(&mut other, key, &firing(false), &held, &none, at(31, 0));
+    shadow_ledger::label(
+        &mut other,
+        key,
+        REPO,
+        "main",
+        &BTreeMap::new(),
+        &run_gh,
+        at(31, 0),
+    );
+    shadow_ledger::advance(&mut other, key, &BTreeMap::new(), &held, &none, at(31, 30));
+    let unlabelled = shadow_ledger::settle(&mut other, key);
+    assert_eq!(unlabelled[0].corroborated, None);
+
+    let mut history: Vec<Episode> = real.into_iter().chain(flake).chain(unlabelled).collect();
+    let gate = shadow_ledger::gate("streak", &history, at(32, 0));
+    assert_eq!(gate["fires"], 2, "{gate}");
+    assert_eq!(gate["unlabelled"], 1, "{gate}");
     assert_eq!(gate["precision"], 0.5);
     assert_eq!(gate["eligible_to_enforce"], false);
-    // Ten true strict fires across two weeks pass it; one stale false fire
-    // that held two entries for an hour does not outweigh their savings.
+    // Ten control-confirmed strict fires across two weeks pass the gate...
     let strict = history
         .iter()
         .find(|episode| episode.rule == "strict")
@@ -792,19 +822,209 @@ fn the_shadow_ledger_labels_episodes_and_gates_promotion() {
         let mut copy = strict.clone();
         copy.started_at =
             (at(0, 0) - chrono::Duration::days(15) + chrono::Duration::days(day)).to_rfc3339();
-        copy.last_seen_at = copy.started_at.clone();
+        copy.last_seen_at.clone_from(&copy.started_at);
+        copy.ended_at = Some(copy.started_at.clone());
         history.push(copy);
     }
-    let gate = shadow_ledger::gate("strict", &history, at(30, 0));
-    assert_eq!(gate["eligible_to_enforce"], true, "{gate}");
-    // Negative control: the same record at precision below 0.9 is refused.
+    assert_eq!(
+        shadow_ledger::gate("strict", &history, at(32, 0))["eligible_to_enforce"],
+        true
+    );
+    // ...and the same record below precision 0.9 does not.
     for _ in 0..3 {
         let mut miss = strict.clone();
         miss.corroborated = Some(false);
         history.push(miss);
     }
-    let gate = shadow_ledger::gate("strict", &history, at(30, 0));
-    assert_eq!(gate["eligible_to_enforce"], false, "{gate}");
+    assert_eq!(
+        shadow_ledger::gate("strict", &history, at(32, 0))["eligible_to_enforce"],
+        false
+    );
+}
+
+#[test]
+fn a_control_that_never_reports_leaves_the_episode_unlabelled() {
+    use crate::app::merge_steward_cmd::shadow_ledger::{self, Episode};
+    let key = "generous-corp/pulp@main";
+    let controls = BTreeMap::from([(CONTEXT.to_owned(), "version-skill-check.yml".to_owned())]);
+    let firing = BTreeMap::from([((CONTEXT.to_owned(), "streak".to_owned()), 2)]);
+    let run_gh = |argv: &[String]| -> Result<String, String> {
+        let line = argv.join(" ");
+        Ok(if line.ends_with("--jq .sha") {
+            "2".repeat(40)
+        } else if line.contains("/dispatches") {
+            r#"{"workflow_run_id":42}"#.to_owned()
+        } else {
+            r#"{"check_runs":[]}"#.to_owned()
+        })
+    };
+    let mut open: Vec<Episode> = Vec::new();
+    let none = BTreeSet::new();
+    // A run of the context that started just before the dispatch is not the
+    // control and must not label anything.
+    let stale = |argv: &[String]| -> Result<String, String> {
+        let line = argv.join(" ");
+        Ok(if line.ends_with("--jq .sha") {
+            "2".repeat(40)
+        } else if line.contains("/dispatches") {
+            r#"{"workflow_run_id":42}"#.to_owned()
+        } else {
+            r#"{"check_runs":[{"status":"completed","conclusion":"failure","started_at":"2026-11-10T23:59:30Z"}]}"#.to_owned()
+        })
+    };
+    let mut old: Vec<Episode> = Vec::new();
+    shadow_ledger::advance(&mut old, key, &firing, &none, &none, at(24, 0));
+    shadow_ledger::label(&mut old, key, REPO, "main", &controls, &stale, at(24, 0));
+    assert_eq!(old[0].corroborated, None);
+    shadow_ledger::advance(&mut open, key, &firing, &none, &none, at(24, 0));
+    shadow_ledger::label(&mut open, key, REPO, "main", &controls, &run_gh, at(24, 0));
+    shadow_ledger::advance(&mut open, key, &BTreeMap::new(), &none, &none, at(24, 10));
+    shadow_ledger::label(&mut open, key, REPO, "main", &controls, &run_gh, at(29, 0));
+    assert!(shadow_ledger::settle(&mut open, key).is_empty());
+    shadow_ledger::label(&mut open, key, REPO, "main", &controls, &run_gh, at(31, 0));
+    let done = shadow_ledger::settle(&mut open, key);
+    assert_eq!(done.len(), 1);
+    assert_eq!(done[0].corroborated, None);
+}
+
+#[test]
+fn a_timed_out_control_leaves_the_episode_unlabelled() {
+    use crate::app::merge_steward_cmd::shadow_ledger::{self, Episode};
+    let key = "generous-corp/pulp@main";
+    let controls = BTreeMap::from([(CONTEXT.to_owned(), "version-skill-check.yml".to_owned())]);
+    let firing = BTreeMap::from([((CONTEXT.to_owned(), "streak".to_owned()), 2)]);
+    let run_gh = |argv: &[String]| -> Result<String, String> {
+        let line = argv.join(" ");
+        Ok(if line.ends_with("--jq .sha") {
+            "3".repeat(40)
+        } else if line.contains("/dispatches") {
+            r#"{"workflow_run_id":42}"#.to_owned()
+        } else if line.contains("/check-runs?") {
+            r#"{"check_runs":[{"status":"completed","conclusion":"timed_out","started_at":"2026-11-12T23:00:00Z","check_suite":{"workflow_run":{"id":42}}}]}"#.to_owned()
+        } else {
+            String::new()
+        })
+    };
+    let mut open: Vec<Episode> = Vec::new();
+    let none = BTreeSet::new();
+    shadow_ledger::advance(&mut open, key, &firing, &none, &none, at(24, 0));
+    shadow_ledger::label(&mut open, key, REPO, "main", &controls, &run_gh, at(24, 0));
+    shadow_ledger::advance(&mut open, key, &BTreeMap::new(), &none, &none, at(24, 10));
+    shadow_ledger::label(&mut open, key, REPO, "main", &controls, &run_gh, at(24, 10));
+    let done = shadow_ledger::settle(&mut open, key);
+    assert_eq!(done.len(), 1);
+    assert_eq!(done[0].corroborated, None);
+}
+
+#[test]
+fn overlapping_episodes_dispatch_distinct_controls() {
+    use crate::app::merge_steward_cmd::shadow_ledger::{self, Episode};
+    let key = "generous-corp/pulp@main";
+    let controls = BTreeMap::from([(CONTEXT.to_owned(), "version-skill-check.yml".to_owned())]);
+    let firing = BTreeMap::from([((CONTEXT.to_owned(), "streak".to_owned()), 2)]);
+    let first_sha = "1".repeat(40);
+    let second_sha = "2".repeat(40);
+    let tips = std::cell::RefCell::new(vec![first_sha.clone(), second_sha.clone()]);
+    let first_poll = std::cell::Cell::new(true);
+    let dispatches = std::cell::RefCell::new(0usize);
+    let run_gh = |argv: &[String]| -> Result<String, String> {
+        let line = argv.join(" ");
+        if line.ends_with("--jq .sha") {
+            return Ok(tips.borrow_mut().remove(0));
+        }
+        if line.contains("/dispatches") {
+            *dispatches.borrow_mut() += 1;
+            let id = 40 + *dispatches.borrow();
+            return Ok(format!(r#"{{"workflow_run_id":{id}}}"#));
+        }
+        if line.contains("/check-runs?") {
+            if line.contains(&format!("commits/{first_sha}/")) && first_poll.replace(false) {
+                return Ok(r#"{"check_runs":[]}"#.to_owned());
+            }
+            let conclusion = if line.contains(&format!("commits/{first_sha}/")) {
+                "failure"
+            } else {
+                "success"
+            };
+            let id = if line.contains(&format!("commits/{first_sha}/")) {
+                41
+            } else {
+                42
+            };
+            return Ok(serde_json::json!({
+                "check_runs": [{
+                    "status": "completed",
+                    "conclusion": conclusion,
+                    "started_at": "2026-11-12T23:00:00Z",
+                    "check_suite": {"workflow_run": {"id": id}},
+                }]
+            })
+            .to_string());
+        }
+        Err(format!("unexpected: {line}"))
+    };
+    let mut open: Vec<Episode> = Vec::new();
+    let none = BTreeSet::new();
+    shadow_ledger::advance(&mut open, key, &firing, &none, &none, at(24, 0));
+    shadow_ledger::label(&mut open, key, REPO, "main", &controls, &run_gh, at(24, 0));
+    shadow_ledger::advance(&mut open, key, &BTreeMap::new(), &none, &none, at(24, 5));
+    shadow_ledger::advance(&mut open, key, &firing, &none, &none, at(24, 10));
+    shadow_ledger::label(&mut open, key, REPO, "main", &controls, &run_gh, at(24, 10));
+    assert_eq!(*dispatches.borrow(), 2);
+    assert_eq!(open[0].corroborated, Some(true));
+    assert_eq!(open[1].corroborated, Some(false));
+    let controls = open
+        .iter()
+        .filter_map(|episode| episode.control.as_ref())
+        .map(|control| control.base_sha.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(controls, vec![first_sha, second_sha]);
+}
+
+#[test]
+fn a_same_context_check_from_another_workflow_is_ignored() {
+    use crate::app::merge_steward_cmd::shadow_ledger::{self, Episode};
+    let key = "generous-corp/pulp@main";
+    let controls = BTreeMap::from([(CONTEXT.to_owned(), "version-skill-check.yml".to_owned())]);
+    let firing = BTreeMap::from([((CONTEXT.to_owned(), "streak".to_owned()), 2)]);
+    let base_sha = "4".repeat(40);
+    let run_gh = |argv: &[String]| -> Result<String, String> {
+        let line = argv.join(" ");
+        if line.ends_with("--jq .sha") {
+            return Ok(base_sha.clone());
+        }
+        if line.contains("/dispatches") {
+            return Ok(r#"{"workflow_run_id":42}"#.to_owned());
+        }
+        if line.contains("/check-runs?") {
+            return Ok(
+                r#"{"check_runs":[
+                    {"status":"completed","conclusion":"failure","started_at":"2026-11-12T23:00:00Z","check_suite":{"workflow_run":{"id":99}}},
+                    {"status":"completed","conclusion":"success","started_at":"2026-11-12T23:01:00Z","check_suite":{"workflow_run":{"id":42}}}
+                ]}"#
+                .to_owned(),
+            );
+        }
+        Err(format!("unexpected: {line}"))
+    };
+    let mut open: Vec<Episode> = Vec::new();
+    let none = BTreeSet::new();
+    shadow_ledger::advance(&mut open, key, &firing, &none, &none, at(24, 0));
+    shadow_ledger::label(&mut open, key, REPO, "main", &controls, &run_gh, at(24, 0));
+    assert_eq!(open[0].corroborated, Some(false));
+}
+
+#[test]
+fn in_shadow_the_root_cause_route_only_reports() {
+    let health = detect(&groups_at_0030(), &required(), at(24, 30));
+    let dry = poison(health, PoisonHold::DryRun, &[]);
+    assert!(dry.fixes.is_empty());
+    let lines = base_poison::would_fast_track(&dry);
+    assert_eq!(lines.len(), 1);
+    assert!(
+        lines[0].contains("would open or find the tracking issue"),
+        "{lines:?}"
+    );
 }
 
 #[test]
