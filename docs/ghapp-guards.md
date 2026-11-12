@@ -838,10 +838,11 @@ repository than the one `ghapp` is bound to. A verdict marker on an issue,
 not a pull request, is not judged. A request with no verdict reads nothing;
 each verdict costs up to four App API reads.
 
-**What the rest of the fleet sees.** A held head reads `blocked_on=held` with
-`blocked_detail` "held head: needs a new head" in the steward's report and in
-`shipyard wait pr --state actionable`; its `next_action` starts "Held head:
-needs a new head" and tells the author to push a new head (or, when the HOLD
+**What the rest of the fleet sees.** A held head reads
+`blocked_on=held:review-verdict` with the gate's HOLD description in
+`blocked_detail` in the steward's report and in `shipyard wait pr --state
+actionable`; its `next_action` starts "Held head: needs a new head" and tells
+the repair lane to address the HOLD's named items and push a new head (or, when the HOLD
 is wrong, push a new head anyway and comment `dispute: <reason>`). `pr-watch`'s
 `held_unrepaired` event says the same.
 

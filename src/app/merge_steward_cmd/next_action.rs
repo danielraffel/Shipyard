@@ -35,6 +35,8 @@ pub(crate) enum Actor {
     Owner,
     /// The fleet operator; the caller waits for the next pass.
     Operator,
+    /// The standing repair lane fixes the head; the caller waits.
+    Repair,
     /// Nobody: the pull request is terminal.
     Nobody,
 }
@@ -54,7 +56,7 @@ impl NextAction {
     /// Whether the caller has something to do (act, or stop).
     #[must_use]
     pub const fn actionable(&self) -> bool {
-        matches!(self.actor, Actor::Author | Actor::Owner) || self.stop
+        matches!(self.actor, Actor::Author | Actor::Repair | Actor::Owner) || self.stop
     }
 
     fn new(actor: Actor, action: String) -> Self {
@@ -597,7 +599,7 @@ fn held(stall: &Stall, repo: &str, base: &str, number: u64) -> NextAction {
         },
     );
     NextAction::new(
-        Actor::Author,
+        Actor::Repair,
         format!(
             "Held head: needs a new head. HOLD by {holder} on this head{link} makes it \
              un-approvable, and any APPROVE of this same head is ignored: fix what it names \
@@ -677,7 +679,7 @@ mod tests {
     }
 
     #[test]
-    fn a_hold_names_the_holder_links_the_record_and_is_the_authors_move() {
+    fn a_hold_names_the_holder_links_the_record_and_is_the_repair_lanes_move() {
         let mut held = stall("held", None);
         held.held_by = Some(HeldBy {
             holder: "infra-review2".to_owned(),
@@ -696,7 +698,7 @@ mod tests {
             },
             &held,
         );
-        assert_eq!(next.actor, Actor::Author);
+        assert_eq!(next.actor, Actor::Repair);
         assert!(next.actionable());
         assert!(!next.stop);
         assert!(next.action.contains("HOLD by infra-review2"), "{next:?}");

@@ -981,6 +981,7 @@ pub(super) fn parse_check(value: &Value) -> Option<StewardCheck> {
                     .and_then(Value::as_str)
                     .and_then(crate::merge_steward::job_id_from_url)
             }),
+            description: None,
         }),
         "StatusContext" => {
             let state = value.get("state")?.as_str()?;
@@ -1008,6 +1009,7 @@ pub(super) fn parse_check(value: &Value) -> Option<StewardCheck> {
                     .and_then(Value::as_str)
                     .map(str::to_owned),
                 check_id: None,
+                description: None,
             })
         }
         _ => None,
@@ -1463,6 +1465,7 @@ pub(super) fn parse_rest_check(value: &Value) -> Option<StewardCheck> {
             .or_else(|| value.get("started_at").and_then(Value::as_str))
             .map(str::to_owned),
         check_id: value.get("id").and_then(Value::as_u64),
+        description: None,
     })
 }
 
@@ -1508,6 +1511,10 @@ pub(super) fn parse_rest_status(value: &Value) -> Option<StewardCheck> {
             .or_else(|| value.get("created_at").and_then(Value::as_str))
             .map(str::to_owned),
         check_id: value.get("id").and_then(Value::as_u64),
+        description: value
+            .get("description")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
     })
 }
 

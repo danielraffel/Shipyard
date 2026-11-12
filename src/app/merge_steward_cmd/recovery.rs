@@ -1322,6 +1322,7 @@ mod tests {
                         run_id: None,
                         observed_at: Some(observed_at.to_owned()),
                         check_id: None,
+                        description: None,
                     })
                     .collect(),
             },
@@ -1382,6 +1383,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn recovery_facts_are_normalized_without_contributor_prose() {
         let decision = StewardDecision::RequiredFailed {
             contexts: vec!["macos".to_owned(), "linux".to_owned(), "macos".to_owned()],
@@ -1417,6 +1419,7 @@ mod tests {
                 run_id: Some(101),
                 observed_at: Some("2026-08-21T08:00:00Z".to_owned()),
                 check_id: None,
+                description: None,
             },
             StewardCheck {
                 name: "macos".to_owned(),
@@ -1427,6 +1430,7 @@ mod tests {
                 run_id: None,
                 observed_at: Some("2026-08-21T08:00:00Z".to_owned()),
                 check_id: None,
+                description: None,
             },
         ];
         let (summary, contexts) = normalized_recovery_facts(&decision, &policy, &checks)
@@ -1470,6 +1474,7 @@ mod tests {
             run_id: None,
             observed_at: Some("2026-08-21T08:00:00Z".to_owned()),
             check_id: None,
+            description: None,
         }];
         let (_, facts) = normalized_recovery_facts(&literal, &literal_policy, &literal_checks)
             .expect("literal label is unambiguous")

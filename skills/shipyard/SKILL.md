@@ -3804,7 +3804,7 @@ not admit. Other branches are covered only by running the steward per base.
 A pass past `--pass-budget-secs` (default 240; 0 disables), or after GitHub reports the API rate limit exceeded, starts no new per-PR work: remaining rows report `deferred_pass_budget`, are never admitted, armed, enqueued or dequeued, and are taken first next pass. Keep the budget under the scheduler's timeout so the report still prints.
 
 Every row of a steward pass also names why that pull request is not merging:
-`blocked_on` (one token, such as `no_verdict`, `held`,
+`blocked_on` (one token, such as `no_verdict`, `held:review-verdict`,
 `approval_excluded:unattributed`, `required_never_ran:<contexts>`,
 `merge_state:DIRTY` or `owner_decision`) and `since` (when that state began,
 UTC), and each repository carries `blocked_summary` (counts per token and the
@@ -4610,7 +4610,7 @@ URL; the author pushes a new head (merging the base) and the reviewer
 reviews that. It also refuses a verdict that contradicts the same session's
 opposite verdict on the same head within ten minutes; a deliberate
 retraction of one's own APPROVE posts with `SHIPYARD_VERDICT_RETRACT=1`. The
-steward reports such a row as `held` with `blocked_detail` "held head: needs
+steward reports such a row as `held:review-verdict` with `blocked_detail` "held head: needs
 a new head", which `shipyard wait pr --state actionable` prints.
 
 `wait pr --state actionable` spends a full admission read per tick on the

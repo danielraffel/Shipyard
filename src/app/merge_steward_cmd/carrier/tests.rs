@@ -155,6 +155,7 @@ fn ejected_observation() -> RepoObservation {
         run_id: Some(100),
         observed_at: Some("2026-10-09T09:00:00Z".to_owned()),
         check_id: None,
+        description: None,
     }];
     RepoObservation {
         repo: "owner/repo".to_owned(),
