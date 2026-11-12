@@ -195,13 +195,14 @@ pub const CONFIG_PATH: &str = ".shipyard/config.toml";
 /// Repositories that require an approval of the exact head when their base
 /// config does not say. Kept equal to `REVIEW_REQUIRED_REPOS` in
 /// `scripts/ghapp_queue_arm_guard.py` (a test reads both).
-pub const REVIEW_REQUIRED_REPOS: [&str; 6] = [
+pub const REVIEW_REQUIRED_REPOS: [&str; 7] = [
     "Generous-Corp/pulp",
     "Generous-Corp/vellum",
     "danielraffel/fleet-handbook",
     "danielraffel/tartci",
     "danielraffel/Shipyard",
     "danielraffel/cmux-capacity-watchdog",
+    "danielraffel/fleet-ssh",
 ];
 
 /// Whether `repo` is one of [`REVIEW_REQUIRED_REPOS`].
