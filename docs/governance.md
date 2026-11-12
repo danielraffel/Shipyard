@@ -271,3 +271,22 @@ between `solo` and `multi` is a one-line edit to `[project].profile`.
 Which repositories run which profile, and which rows each meets, is
 recorded by whoever operates them, from audit output with a date; this
 document names no repository.
+
+## Owner-out-of-the-loop onboarding
+
+`shipyard governance onboard --repo OWNER/NAME` plans Design A's ten-step
+onboarding flow. It is plan-only unless `--apply` is explicit: the command
+audits ownership and the protected base, renders the pinned review-verdict
+workflows and minimal `[auto_merge]` policy, checks the path allowlist, and
+prints bounded approval and first-evaluation waits. `--profile builder` is for
+artifact repositories; `--require-check NAME` adds an existing CI context;
+`--through STEP` stops at a checkpoint and `--no-enroll` stops after auditing.
+Applied runs back up the ruleset and refuse removals, lowered enforcement, or
+bypass-actor changes. Receipts are stored under
+`~/.local/state/shipyard/onboarding/`.
+
+The protected base may set `[auto_merge] fleet_review_required = true`. The
+setting is read from the base and the compiled compatibility list remains a
+floor. The rendered `review-verdict.yml` includes a `workflow_dispatch`
+`pull_request` input for the first-evaluation sweep, with an issue-comment
+fallback for older templates.

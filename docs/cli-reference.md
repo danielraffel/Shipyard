@@ -261,6 +261,7 @@ shipyard governance apply --yes  # write live state to match config (without --y
 shipyard governance export     # snapshot to TOML
 shipyard governance use <name> # switch profile (solo / multi / custom)
 shipyard governance audit --repo owner/repo [--repo ...] [--gh-binary ghapp]  # read-only PASS/DRIFT/UNKNOWN per supply-chain row
+shipyard governance onboard --repo owner/repo [--profile fleet|builder] [--require-check NAME]... [--through STEP] [--no-enroll] [--apply]
 
 # Cloud
 shipyard cloud workflows       # list dispatchable workflows

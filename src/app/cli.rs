@@ -3838,6 +3838,27 @@ pub(super) enum BranchCommand {
 
 #[derive(Debug, Subcommand)]
 pub(super) enum GovernanceCommand {
+    /// Plan or apply Design A governance onboarding for one repository.
+    Onboard {
+        /// Repository to onboard.
+        #[arg(long = "repo", value_name = "OWNER/NAME")]
+        repo: String,
+        /// Artifact-producing repository profile.
+        #[arg(long, value_parser = ["fleet", "builder"], default_value = "fleet")]
+        profile: String,
+        /// Existing CI context to require. Repeatable; otherwise observed from main.
+        #[arg(long = "require-check")]
+        require_checks: Vec<String>,
+        /// Stop after a named onboarding step.
+        #[arg(long, value_parser = ["preflight", "pr", "approved", "merged", "tightened", "evaluated", "audited", "enrolled"])]
+        through: Option<String>,
+        /// Alias for --through audited.
+        #[arg(long, conflicts_with = "through")]
+        no_enroll: bool,
+        /// Execute the printed plan. Without this flag onboarding is read-only.
+        #[arg(long)]
+        apply: bool,
+    },
     /// Report declared-vs-live governance drift per branch.
     Status {
         /// Branches to check. Defaults to main.

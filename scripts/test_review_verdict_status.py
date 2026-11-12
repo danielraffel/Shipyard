@@ -522,7 +522,7 @@ class ReviewVerdictStatus(unittest.TestCase):
     def test_the_workflow_can_re_run_and_still_runs_on_verdicts(self) -> None:
         root = STATUS.parent.parent / ".github" / "workflows"
         workflow = (root / "review-verdict.yml").read_text(encoding="utf-8")
-        for needed in ("pull_request_target:", "issue_comment:", "workflow_run:",
+        for needed in ("workflow_dispatch:", "pull_request:", "pull_request_target:", "issue_comment:", "workflow_run:",
                        "actions: write", "scripts/review_verdict_status.py"):
             self.assertIn(needed, workflow)
         self.assertNotIn("continue-on-error", workflow)

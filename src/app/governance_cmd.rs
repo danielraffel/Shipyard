@@ -25,6 +25,28 @@ pub(super) fn governance_command<W: Write>(
     json_mode: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
+    if let GovernanceCommand::Onboard {
+        repo,
+        profile,
+        require_checks,
+        through,
+        no_enroll,
+        apply,
+    } = command
+    {
+        return super::governance_onboard_cmd::governance_onboard(
+            &repo,
+            &profile,
+            &require_checks,
+            through.as_deref(),
+            no_enroll,
+            apply,
+            mode,
+            cwd,
+            json_mode,
+            stdout,
+        );
+    }
     if let GovernanceCommand::Audit {
         repos,
         gh_binary,
@@ -140,6 +162,10 @@ fn governance_command_with<W: Write>(
         GovernanceCommand::Audit { .. } => Err(CliFailure::new(
             1,
             "governance audit is dispatched before config loading",
+        )),
+        GovernanceCommand::Onboard { .. } => Err(CliFailure::new(
+            1,
+            "governance onboard is dispatched before config loading",
         )),
     }
 }

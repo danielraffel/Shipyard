@@ -1139,8 +1139,14 @@ def review_policy(config_text: str | None, repo: str, host_default: bool) -> dic
             raise GuardError(f"the base's .shipyard/config.toml does not parse: {error}") from error
     section = section if isinstance(section, dict) else {}
     required = section.get("arm_requires_head_approval")
+    fleet_required = section.get("fleet_review_required")
+    if fleet_required is not None and not isinstance(fleet_required, bool):
+        raise GuardError("the base's .shipyard/config.toml [auto_merge] fleet_review_required "
+                         f"must be a boolean, not {fleet_required!r}")
     reviewers = section.get("reviewer_identities", section.get("reviewer_logins")) or []
     from_default = not isinstance(required, bool) and default
+    if fleet_required is True:
+        from_default = True
     humans = section.get("human_reviewers") or []
     # The protected base may name its own signers; otherwise this host's
     # signers file decides (see reviewer_signers).

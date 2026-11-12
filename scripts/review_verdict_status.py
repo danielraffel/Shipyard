@@ -20,7 +20,7 @@ bindings are enforced by that same guard, including the stamped host and
 ``agent:`` value.
 
 It runs from a workflow triggered by ``pull_request_target``,
-``issue_comment`` and ``workflow_run`` (a review reaches it through a
+``workflow_dispatch``, ``issue_comment`` and ``workflow_run`` (a review reaches it through a
 permission-less trigger workflow), all of which run the default branch's
 definition. It never checks out or runs the pull request's code, and it reads
 every comment and review from the API rather than trusting the event, so a
@@ -72,7 +72,7 @@ WORKFLOW_NAME = "Review verdict"
 # ``workflow_run``) leaves its check run on the default branch's tip, where it
 # gates nothing; those runs refresh the head's check instead (see
 # ``refresh_head_check``).
-HEAD_CHECK_EVENTS = frozenset({"pull_request_target"})
+HEAD_CHECK_EVENTS = frozenset({"pull_request_target", "workflow_dispatch"})
 # The guard's refusal causes that mean "no counted verdict yet": the head has
 # no verdict, or only an earlier head's approval that does not carry. Every
 # other refusal (a HOLD, an unreadable review, a self-approval) is a failure.
@@ -116,6 +116,14 @@ def event_target(event_name: str, event: dict[str, Any]) -> tuple[int | None, st
     if event_name == "pull_request_target":
         number = (event.get("pull_request") or {}).get("number")
         return (number if isinstance(number, int) else None), None
+    if event_name == "workflow_dispatch":
+        inputs = event.get("inputs") or {}
+        value = inputs.get("pull_request")
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            number = None
+        return number, None
     if event_name == "issue_comment":
         issue = event.get("issue") or {}
         number = issue.get("number") if issue.get("pull_request") else None

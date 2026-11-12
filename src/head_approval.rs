@@ -115,6 +115,10 @@ pub const CONFIG_TABLE: &str = "auto_merge";
 pub const REQUIRED_KEY: &str = "arm_requires_head_approval";
 /// Key listing logins whose `reviewed:<sha>` comments count as approval.
 pub const REVIEWERS_KEY: &str = "reviewer_logins";
+/// Base-branch data switch that enables fleet review for this repository.
+/// Unlike the compiled compatibility floor, this is read from the protected
+/// base and therefore cannot be granted by the pull request being evaluated.
+pub const FLEET_REVIEW_REQUIRED_KEY: &str = "fleet_review_required";
 /// New spelling for the configured reviewer identities.
 pub const REVIEWER_IDENTITIES_KEY: &str = "reviewer_identities";
 /// Human accounts whose approvals count when no reviewer is listed. Empty by
@@ -680,6 +684,24 @@ pub fn stamp_sessions_shape(table: &toml::Table) -> Result<(), String> {
     }
 }
 
+/// Validate the base-branch fleet review switch.
+pub fn fleet_review_required_shape(table: &toml::Table) -> Result<(), String> {
+    let Some(value) = table
+        .get(CONFIG_TABLE)
+        .and_then(toml::Value::as_table)
+        .and_then(|section| section.get(FLEET_REVIEW_REQUIRED_KEY))
+    else {
+        return Ok(());
+    };
+    if value.is_bool() {
+        Ok(())
+    } else {
+        Err(format!(
+            "[{CONFIG_TABLE}] {FLEET_REVIEW_REQUIRED_KEY} must be a boolean, not {value}"
+        ))
+    }
+}
+
 /// The `sessions` key of [`SIGNERS_FILE`]: the exact `session:` lines a
 /// reviewer writes on its verdicts. The queue-arm guard reads the same key.
 pub const SESSIONS_KEY: &str = "sessions";
@@ -1119,6 +1141,16 @@ impl ApprovalPolicy {
             .and_then(toml::Value::as_table)
             .is_some_and(|section| section.contains_key(REQUIRED_KEY));
         if !set && host_default && requires_review_by_default(repo) {
+            policy.required = true;
+            policy.any_reviewer_but_author = true;
+        }
+        let base_required = table
+            .get(CONFIG_TABLE)
+            .and_then(toml::Value::as_table)
+            .and_then(|section| section.get(FLEET_REVIEW_REQUIRED_KEY))
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(false);
+        if base_required {
             policy.required = true;
             policy.any_reviewer_but_author = true;
         }
@@ -2207,6 +2239,9 @@ fn read_policy_inner(
         PolicyReadError::Unreadable(format!("{CONFIG_PATH} on {base}: {error}"))
     })?;
     stamp_sessions_shape(&table).map_err(|error| {
+        PolicyReadError::Unreadable(format!("{CONFIG_PATH} on {base}: {error}"))
+    })?;
+    fleet_review_required_shape(&table).map_err(|error| {
         PolicyReadError::Unreadable(format!("{CONFIG_PATH} on {base}: {error}"))
     })?;
     guard::source_from_section(table.get(CONFIG_TABLE).and_then(toml::Value::as_table)).map_err(
