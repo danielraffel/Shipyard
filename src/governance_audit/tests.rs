@@ -345,15 +345,37 @@ fn renovate_is_one_config_value_with_the_same_semantics() {
     );
     snapshot.renovate = Some(WorkflowFile {
         path: ".github/renovate.json".to_owned(),
-        content: r#"{"packageRules": [{"matchManagers": ["github-actions"], "groupName": "actions"}], "minimumReleaseAge": "7 days"}"#.to_owned(),
+        content: r#"{"schedule": ["weekly"], "packageRules": [{"matchManagers": ["github-actions"], "groupName": "actions"}], "minimumReleaseAge": "7 days"}"#.to_owned(),
     });
+    assert_status(&snapshot, &policy, Setting::UpdatesBot, AuditStatus::Pass);
+    let renovate = snapshot.renovate.as_mut().expect("renovate");
+    renovate.content = renovate.content.replace("weekly", "before 4am on monday");
     assert_status(&snapshot, &policy, Setting::UpdatesBot, AuditStatus::Pass);
     let renovate = snapshot.renovate.as_mut().expect("renovate");
     renovate.content = renovate.content.replace("7 days", "3 days");
     assert_drift_with(&snapshot, &policy, Setting::UpdatesBot, "3 days");
     let renovate = snapshot.renovate.as_mut().expect("renovate");
-    renovate.content = r#"{"minimumReleaseAge": "7 days"}"#.to_owned();
+    renovate.content = r#"{"schedule": ["weekly"], "minimumReleaseAge": "7 days"}"#.to_owned();
     assert_drift_with(&snapshot, &policy, Setting::UpdatesBot, "no groupName");
+}
+
+#[test]
+fn renovate_requires_a_weekly_schedule() {
+    let policy = AuditPolicy {
+        updates_bot: UpdatesBot::Renovate,
+        ..AuditPolicy::default()
+    };
+    let mut snapshot = compliant();
+    snapshot.renovate = Some(WorkflowFile {
+        path: "renovate.json".to_owned(),
+        content: r#"{"packageRules": [{"matchManagers": ["github-actions"], "groupName": "actions"}], "minimumReleaseAge": "7 days"}"#.to_owned(),
+    });
+    assert_drift_with(&snapshot, &policy, Setting::UpdatesBot, "schedule");
+
+    let renovate = snapshot.renovate.as_mut().expect("renovate");
+    renovate.content =
+        r#"{"schedule": ["daily"], "packageRules": [{"matchManagers": ["github-actions"], "groupName": "actions"}], "minimumReleaseAge": "7 days"}"#.to_owned();
+    assert_drift_with(&snapshot, &policy, Setting::UpdatesBot, "schedule");
 }
 
 #[test]
@@ -433,6 +455,37 @@ fn report_only_zizmor_passes_report_and_drifts_enforce() {
         "",
     );
     assert_drift(&no_floor, Setting::ZizmorEnforce, "report mode only");
+}
+
+#[test]
+fn zizmor_enforce_requires_high_severity_and_confidence() {
+    let mut low_severity = compliant();
+    replace_in(
+        &mut low_severity,
+        "zizmor.yml",
+        "--min-severity high",
+        "--min-severity medium",
+    );
+    assert_status(
+        &low_severity,
+        &AuditPolicy::default(),
+        Setting::ZizmorEnforce,
+        AuditStatus::Drift,
+    );
+
+    let mut low_confidence = compliant();
+    replace_in(
+        &mut low_confidence,
+        "zizmor.yml",
+        "--min-confidence high",
+        "--min-confidence medium",
+    );
+    assert_status(
+        &low_confidence,
+        &AuditPolicy::default(),
+        Setting::ZizmorEnforce,
+        AuditStatus::Drift,
+    );
 }
 
 #[test]
@@ -773,4 +826,61 @@ fn fetch_reports_unreadable_settings_as_unknown() {
             .iter()
             .all(|row| row.status == AuditStatus::Unknown)
     );
+}
+
+#[test]
+fn malformed_workflow_listing_is_unknown() {
+    let expected = compliant();
+    let repo = "example/compliant";
+    let mut reader = reader_for(&expected, repo);
+    reader.json.insert(
+        format!("repos/{repo}/contents/.github/workflows?ref=trunk"),
+        json!({"message": "not a directory"}),
+    );
+    let snapshot = fetch_snapshot(repo, &reader);
+    assert!(snapshot.read_errors.contains_key("workflows"));
+    assert_eq!(
+        audit_row(&snapshot, &AuditPolicy::default(), Setting::ExactRefs).status,
+        AuditStatus::Unknown
+    );
+}
+
+#[test]
+fn workflow_listing_paginates_at_the_api_default_page_size() {
+    let expected = compliant();
+    let repo = "example/compliant";
+    let mut reader = reader_for(&expected, repo);
+    let first_page_path = format!("repos/{repo}/contents/.github/workflows?ref=trunk");
+    let mut first_page = reader
+        .json
+        .remove(&first_page_path)
+        .expect("workflow listing");
+    let entries = first_page.as_array_mut().expect("array listing");
+    for index in 0..(30 - entries.len()) {
+        let path = format!(".github/workflows/filler-{index}.yml");
+        entries.push(json!({"name": format!("filler-{index}.yml"), "path": path}));
+        reader.raw.insert(
+            format!("repos/{repo}/contents/{path}?ref=trunk"),
+            "name: filler\n".to_owned(),
+        );
+    }
+    reader.json.insert(first_page_path.clone(), first_page);
+    let extra_path = ".github/workflows/page-two.yml";
+    reader.json.insert(
+        format!("{first_page_path}&page=2"),
+        json!([{"name": "page-two.yml", "path": extra_path}]),
+    );
+    reader.raw.insert(
+        format!("repos/{repo}/contents/{extra_path}?ref=trunk"),
+        "name: page two\n".to_owned(),
+    );
+
+    let snapshot = fetch_snapshot(repo, &reader);
+    assert!(
+        snapshot
+            .workflows
+            .iter()
+            .any(|workflow| workflow.path == extra_path)
+    );
+    assert!(!snapshot.read_errors.contains_key("workflows"));
 }
