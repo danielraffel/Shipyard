@@ -575,7 +575,6 @@ pub(super) fn record_pass(
     })
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -622,9 +621,20 @@ mod tests {
             &BTreeSet::new(),
             now,
         );
-        label(&mut open, key, "owner/repo", "main", &controls, &run_gh, now);
+        label(
+            &mut open,
+            key,
+            "owner/repo",
+            "main",
+            &controls,
+            &run_gh,
+            now,
+        );
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].corroborated, None);
-        assert_eq!(open[0].control.as_ref().and_then(|c| c.workflow_run_id), None);
+        assert_eq!(
+            open[0].control.as_ref().and_then(|c| c.workflow_run_id),
+            None
+        );
     }
 }
