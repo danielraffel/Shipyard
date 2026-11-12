@@ -734,6 +734,7 @@ fn watchdog_observation() -> crate::app::merge_steward_cmd::RepoObservation {
                     run_id: None,
                     observed_at: None,
                     check_id: None,
+                    description: None,
                 })
                 .collect(),
         },
