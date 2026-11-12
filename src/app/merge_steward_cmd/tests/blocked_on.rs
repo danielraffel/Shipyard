@@ -4,6 +4,7 @@ use crate::app::merge_steward_cmd::blocked_on::{
     self, GateRead, RowFacts, SinceHint, Stall, classify, summarize,
 };
 use crate::head_approval::ApprovalBlocker;
+use crate::merge_steward::StewardCheckSource;
 
 const HEAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const CHECKS_GREEN_AT: &str = "2026-07-26T00:00:00Z";
@@ -80,7 +81,7 @@ fn a_held_head_names_holder_and_comment() {
         at: Some("2026-10-31T15:00:00Z".to_owned()),
     };
     let (blocked, _) = row(&pr, Some("waiting_head_approval"), GateRead::Refused(&hold));
-    assert_eq!(blocked.blocked_on, "held");
+    assert_eq!(blocked.blocked_on, "held:review-verdict");
     assert_eq!(blocked.since.as_deref(), Some("2026-10-31T15:00:00Z"));
     assert_eq!(blocked.since_source, Some("hold_posted"));
     assert_eq!(
@@ -597,6 +598,20 @@ fn app_check(name: &str, status: &str, conclusion: Option<&str>, at: &str) -> Va
            "checkSuite": {"app": {"databaseId": 15368}}})
 }
 
+fn review_status(description: Option<&str>) -> StewardCheck {
+    StewardCheck {
+        name: "review-verdict".to_owned(),
+        source: StewardCheckSource::StatusContext,
+        app_id: Some(15368),
+        status: "COMPLETED".to_owned(),
+        conclusion: Some("FAILURE".to_owned()),
+        run_id: None,
+        observed_at: Some("2026-11-11T11:25:01Z".to_owned()),
+        check_id: Some(7),
+        description: description.map(str::to_owned),
+    }
+}
+
 /// Generous-Corp/vellum#126: `sterile-consumer` `needs:` `gpu-macos-arm64`,
 /// which is still running, so the context has not appeared yet. That is
 /// pending; only an absent context with nothing in flight never ran.
@@ -725,6 +740,7 @@ fn a_pending_review_verdict_under_a_failed_check_run_waits_on_the_reviewer() {
         run_id: None,
         observed_at: Some("2026-11-03T10:00:00Z".to_owned()),
         check_id: Some(5),
+        description: None,
     });
     let decision = classify_pr(&pr.fact, &policy, &BTreeMap::new());
     assert!(
@@ -805,6 +821,7 @@ fn a_failed_macos_check_is_not_hidden_by_a_pending_review_verdict() {
         run_id: None,
         observed_at: Some("2026-11-03T10:00:00Z".to_owned()),
         check_id: Some(5),
+        description: None,
     });
     let decision = classify_pr(&pr.fact, &policy, &BTreeMap::new());
     let StewardDecision::RequiredFailed { contexts } = &decision else {
@@ -911,6 +928,218 @@ fn a_red_review_verdict_names_the_approval_not_the_check() {
         &policy,
     );
     assert_eq!(red.blocked_on, "required_failed:macos,review-verdict");
+}
+
+#[test]
+fn a_hold_status_routes_to_the_repair_lane() {
+    let policy = app_bound_policy(&["macos", "review-verdict"]);
+    let mut pr = pr_with(
+        12035,
+        &[],
+        "CLEAN",
+        &json!([app_check(
+            "macos",
+            "COMPLETED",
+            Some("SUCCESS"),
+            "2026-11-11T11:20:00Z"
+        )]),
+    );
+    pr.fact.checks.push(review_status(Some(
+        "a HOLD naming head aaaaaaaaaaaa makes it un-approvable (held by pulp-review at comment \
+         6788738268, posted 2026-11-11T06:40:00Z)",
+    )));
+    let decision = StewardDecision::RequiredFailed {
+        contexts: vec!["review-verdict (app_id=15368)".to_owned()],
+    };
+    let (blocked, _) = classify(
+        &RowFacts {
+            pr: &pr.fact,
+            decision: &decision,
+            mutation: None,
+            error: None,
+            approval: GateRead::Unread,
+            enqueued_at: None,
+            ejection: None,
+        },
+        &policy,
+    );
+    assert_eq!(blocked.blocked_on, "held:review-verdict");
+    assert!(
+        blocked
+            .blocked_detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("makes it un-approvable"))
+    );
+    let held_by = blocked
+        .held_by
+        .as_ref()
+        .expect("holder parsed from the status");
+    assert_eq!(held_by.holder, "pulp-review");
+    assert_eq!(held_by.record, "comment");
+    assert_eq!(held_by.id, Some(6_788_738_268));
+    let next = crate::app::merge_steward_cmd::next_action::for_row(
+        &crate::app::merge_steward_cmd::next_action::RowContext {
+            repo: "owner/repo",
+            base: "main",
+            pr: &pr.fact,
+            policy: &policy,
+            error: None,
+        },
+        &blocked,
+    );
+    assert_eq!(
+        next.actor,
+        crate::app::merge_steward_cmd::next_action::Actor::Repair
+    );
+    assert!(next.actionable());
+    assert!(next.action.contains("HOLD by pulp-review"), "{next:?}");
+    assert!(next.action.contains("issuecomment-6788738268"), "{next:?}");
+    assert!(next.action.contains("fix what it names"), "{next:?}");
+    assert!(next.action.contains("push once"), "{next:?}");
+}
+
+#[test]
+fn awaiting_verdict_statuses_route_to_the_reviewer() {
+    let policy = app_bound_policy(&["macos", "review-verdict"]);
+    for description in [
+        "awaiting reviewer verdict for head aaaaaaaaaaaa",
+        "no reviewer verdict names head aaaaaaaaaaaa; it needs a verdict",
+    ] {
+        let mut pr = pr_with(
+            12036,
+            &[],
+            "CLEAN",
+            &json!([app_check(
+                "macos",
+                "COMPLETED",
+                Some("SUCCESS"),
+                "2026-11-11T11:20:00Z"
+            )]),
+        );
+        pr.fact.checks.push(review_status(Some(description)));
+        let decision = StewardDecision::RequiredFailed {
+            contexts: vec!["review-verdict (app_id=15368)".to_owned()],
+        };
+        let (blocked, _) = classify(
+            &RowFacts {
+                pr: &pr.fact,
+                decision: &decision,
+                mutation: None,
+                error: None,
+                approval: GateRead::Unread,
+                enqueued_at: None,
+                ejection: None,
+            },
+            &policy,
+        );
+        assert_eq!(blocked.blocked_on, "no_verdict", "{description}");
+        let next = crate::app::merge_steward_cmd::next_action::for_row(
+            &crate::app::merge_steward_cmd::next_action::RowContext {
+                repo: "owner/repo",
+                base: "main",
+                pr: &pr.fact,
+                policy: &policy,
+                error: None,
+            },
+            &blocked,
+        );
+        assert_eq!(
+            next.actor,
+            crate::app::merge_steward_cmd::next_action::Actor::Reviewer
+        );
+        assert!(!next.actionable());
+    }
+}
+
+#[test]
+fn an_unreadable_review_verdict_description_keeps_the_failed_fallback() {
+    let policy = app_bound_policy(&["macos", "review-verdict"]);
+    let mut pr = pr_with(
+        12037,
+        &[],
+        "CLEAN",
+        &json!([app_check(
+            "macos",
+            "COMPLETED",
+            Some("SUCCESS"),
+            "2026-11-11T11:20:00Z"
+        )]),
+    );
+    let base_checks = pr.fact.checks.clone();
+    for description in [
+        None,
+        Some("Needs agent: review-verdict (app_id=15368)"),
+        // A HOLD that names another head says nothing about this one.
+        Some(
+            "a HOLD naming head bbbbbbbbbbbb makes it un-approvable (held by pulp-review at \
+             comment 1, posted 2026-11-11T06:40:00Z)",
+        ),
+        Some("no reviewer verdict names head bbbbbbbbbbbb; it needs a verdict"),
+    ] {
+        pr.fact.checks.clone_from(&base_checks);
+        pr.fact.checks.push(review_status(description));
+        let decision = StewardDecision::RequiredFailed {
+            contexts: vec!["review-verdict (app_id=15368)".to_owned()],
+        };
+        let (blocked, _) = classify(
+            &RowFacts {
+                pr: &pr.fact,
+                decision: &decision,
+                mutation: None,
+                error: None,
+                approval: GateRead::Unread,
+                enqueued_at: None,
+                ejection: None,
+            },
+            &policy,
+        );
+        assert_eq!(
+            blocked.blocked_on, "required_failed:review-verdict",
+            "{description:?}"
+        );
+        assert!(blocked.held_by.is_none(), "{description:?}");
+    }
+}
+
+/// A gate read outranks the status description: the gate saw the record.
+#[test]
+fn a_gate_read_outranks_the_status_description() {
+    let policy = app_bound_policy(&["macos", "review-verdict"]);
+    let mut pr = pr_with(
+        12038,
+        &[],
+        "CLEAN",
+        &json!([app_check(
+            "macos",
+            "COMPLETED",
+            Some("SUCCESS"),
+            "2026-11-11T11:20:00Z"
+        )]),
+    );
+    pr.fact.checks.push(review_status(Some(
+        "a HOLD naming head aaaaaaaaaaaa makes it un-approvable (held by pulp-review at comment \
+         1, posted 2026-11-11T06:40:00Z)",
+    )));
+    let decision = StewardDecision::RequiredFailed {
+        contexts: vec!["review-verdict (app_id=15368)".to_owned()],
+    };
+    let stale = ApprovalBlocker::StaleHead {
+        approved_head: "bbbbbbbbbbbb".to_owned(),
+        at: None,
+    };
+    let (blocked, _) = classify(
+        &RowFacts {
+            pr: &pr.fact,
+            decision: &decision,
+            mutation: None,
+            error: None,
+            approval: GateRead::Refused(&stale),
+            enqueued_at: None,
+            ejection: None,
+        },
+        &policy,
+    );
+    assert_eq!(blocked.blocked_on, "approval_excluded:stale_head");
 }
 
 /// The dry run reads the gate for a review-verdict-red head and names the

@@ -839,6 +839,7 @@ esac
             run_id: None,
             observed_at: None,
             check_id: None,
+            description: None,
         });
         let mut old = StewardRun {
             id: 100,

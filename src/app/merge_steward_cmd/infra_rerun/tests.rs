@@ -23,6 +23,7 @@ fn check(name: &str, conclusion: &str, run_id: u64, check_id: u64) -> StewardChe
         run_id: Some(run_id),
         observed_at: None,
         check_id: Some(check_id),
+        description: None,
     }
 }
 

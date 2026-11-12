@@ -27,6 +27,7 @@ fn check(name: &str, source: StewardCheckSource, conclusion: &str) -> StewardChe
         run_id: None,
         observed_at: Some("2026-11-08T00:00:00Z".to_owned()),
         check_id: None,
+        description: None,
     }
 }
 

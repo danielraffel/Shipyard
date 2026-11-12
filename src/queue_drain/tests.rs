@@ -34,6 +34,7 @@ fn check(name: &str, status: &str, conclusion: Option<&str>, run_id: u64) -> Ste
         run_id: Some(run_id),
         observed_at: Some("2026-10-24T10:00:00Z".to_owned()),
         check_id: None,
+        description: None,
     }
 }
 
@@ -712,6 +713,7 @@ fn an_unreviewed_head_is_viable_and_a_held_head_is_doomed() {
         run_id: None,
         observed_at: Some("2026-10-24T09:59:00Z".to_owned()),
         check_id: Some(5),
+        description: None,
     };
 
     let mut awaiting = prs.clone();

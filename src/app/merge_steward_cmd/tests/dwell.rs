@@ -736,6 +736,7 @@ fn verdict_check(
         run_id: Some(run),
         observed_at: None,
         check_id: Some(id),
+        description: None,
     }
 }
 

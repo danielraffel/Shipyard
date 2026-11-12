@@ -37,7 +37,7 @@ import review_queue  # noqa: E402  (sibling module; the runner installs both)
 
 REPOS = ["Generous-Corp/pulp", "Generous-Corp/vellum", "danielraffel/Shipyard", "danielraffel/tartci",
          "danielraffel/fleet-handbook", "danielraffel/cmux-capacity-watchdog",
-         "danielraffel/fleet-ssh"]
+         "danielraffel/fleet-ssh", "danielraffel/spectr"]
 HOLD_LABELS = {"owner-decision", "superseded"}
 # Statuses that wait on a review cannot gate the review itself.
 SELF = {"review-verdict", "post-review-verdict", "release-path-review"}

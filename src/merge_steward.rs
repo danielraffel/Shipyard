@@ -42,6 +42,9 @@ pub struct StewardCheck {
     /// Actions job id) for a check run, the status id for a commit status.
     /// A rerun is a new check run, so a later attempt always has a larger id.
     pub check_id: Option<u64>,
+    /// Description from a commit status, when this is a status context.
+    /// Check runs and GraphQL rollup copies do not carry one.
+    pub description: Option<String>,
 }
 
 /// GitHub check-rollup surface that produced a check observation.
@@ -766,6 +769,35 @@ pub fn approval_awaiting(
         .filter(|status| !rest_read || status.check_id.is_some())
         .max_by(|left, right| cmp_recency(left, right))
         .is_some_and(|status| !status.status.eq_ignore_ascii_case("COMPLETED"))
+}
+
+/// The newest app-bound approval status description for this head, when the
+/// status was read from REST. GraphQL rollup copies do not carry descriptions,
+/// so a REST row always wins over a description-less copy of the same status.
+#[must_use]
+pub fn approval_status_description<'a>(
+    checks: &'a [StewardCheck],
+    approval_context: &str,
+    app_id: Option<u64>,
+) -> Option<&'a str> {
+    let context = approval_context.trim();
+    if context.is_empty() {
+        return None;
+    }
+    let statuses: Vec<&StewardCheck> = checks
+        .iter()
+        .filter(|check| {
+            check.source == StewardCheckSource::StatusContext
+                && check.name.eq_ignore_ascii_case(context)
+                && app_id.is_none_or(|app_id| check.app_id == Some(app_id))
+        })
+        .collect();
+    let rest_read = statuses.iter().any(|status| status.check_id.is_some());
+    statuses
+        .into_iter()
+        .filter(|status| !rest_read || status.check_id.is_some())
+        .max_by(|left, right| cmp_recency(left, right))
+        .and_then(|status| status.description.as_deref())
 }
 
 /// The description the approval status script gave a head with no verdict
