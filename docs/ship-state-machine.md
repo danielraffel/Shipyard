@@ -350,7 +350,7 @@ document:
 * On a host that turns it on (`SHIPYARD_REVIEW_BEFORE_ARM=1`, or a
   `review-before-arm` file in the guards directory), `Generous-Corp/pulp`,
   `Generous-Corp/vellum`, `danielraffel/fleet-handbook`, `danielraffel/tartci`,
-  `danielraffel/Shipyard`, `danielraffel/cmux-capacity-watchdog` and `danielraffel/fleet-ssh` require an approval when their base does not set the key. With no identity
+  `danielraffel/Shipyard`, `danielraffel/cmux-capacity-watchdog`, `danielraffel/fleet-ssh` and `danielraffel/spectr` require an approval when their base does not set the key. With no identity
   listed, a verdict counts from the fleet App or an `OWNER`, `MEMBER` or
   `COLLABORATOR`, never from the PR's distinguishable author. A merge-only
   update carries the approval only when every file the PR changes keeps its
