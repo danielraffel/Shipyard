@@ -157,12 +157,27 @@ def load_ticks(log_dir, start, end):
                     "actor": na.get("actor"), "stop": bool(na.get("stop")),
                     "since": parse_iso(p.get("since")),
                     "sup_detected": bool(p.get("superseded")),
+                    "deferred": read_deferred(p),
                     "red_everywhere": _red_everywhere(p),
                 }
             per_repo[r["repo"]].append((t, rows))
     for v in per_repo.values():
         v.sort(key=lambda x: x[0])
     return per_repo, st
+
+
+READ_ERROR_RE = re.compile(r"HTTP 50\d|timed out|unreadable|cannot read|read failed")
+
+
+def read_deferred(p):
+    """A PR the pass could not read this tick (a transient 5xx or timeout): it was
+    neither judged nor refused, so it is unobserved, never an event. Mirrors the
+    `read_deferred=` split in shipyard-steward-tick.sh."""
+    err = p.get("error")
+    if err is None:
+        return False
+    kind = p.get("error_kind")
+    return kind == "read" or (kind is None and bool(READ_ERROR_RE.search(str(err))))
 
 
 def _red_everywhere(p):
@@ -200,6 +215,8 @@ def build_episodes(per_repo, gap):
                     ep["end"], ep["end_kind"] = t, "left_list"
                     eps.append(ep)
             for pr, o in rows.items():
+                if o["deferred"]:
+                    continue  # unread this tick: keeps any open episode open, starts none
                 ep = open_ep.get(pr)
                 if ep and ep["head"] == o["head"] and ep["token"] == o["token"]:
                     ep["last_obs"] = t
