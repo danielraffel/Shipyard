@@ -440,9 +440,9 @@ Every steward pass row carries the same `next_action`.
 
 | `actor` | Meaning |
 |---|---|
-| `author` | Act now: the action names the failed required check, the conflict, or the dropped change. |
+| `author` | Act now: the action names the failed required check, the conflict, or the dropped change. A `superseded` pull request also answers `author` with `stop: true`: confirm the successor, close this one with a comment naming it, and move on. No owner is needed. |
 | `repair` | Act now (the repair lane, or the author doing its job): a HOLD names this head; the action links it. Address the HOLD's named items, then push a new head. |
-| `owner` | `stop: true`: `owner-decision`, `superseded`, `PARKED/*`, or no automatic admission. Report and stop. |
+| `owner` | `stop: true`: `owner-decision`, `PARKED/*`, or no automatic admission. Report and stop. |
 | `nobody` | `stop: true`: merged or closed. A merged answer says to retarget stacked children to the base. |
 | `reviewer`, `ci`, `steward`, `operator` | Nothing to do; keep waiting. Includes green-with-no-verdict, checks running, queued, and BEHIND on a merge-queue base (never merge main for that). |
 

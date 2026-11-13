@@ -534,10 +534,13 @@ fn ejected_same_head(facts: &Facts<'_>) -> NextAction {
 
 fn excluded_label(label: &str) -> NextAction {
     if label.eq_ignore_ascii_case(SUPERSEDED_LABEL) {
+        // A superseded pull request needs no owner: the author confirms the
+        // successor and closes it. Naming the owner here made agents wait for
+        // a human on work that was already done (fleet-ssh#15, 2026-11-11).
         NextAction::stop(
-            Actor::Owner,
+            Actor::Author,
             format!(
-                "Labelled {label}: replaced by another pull request. Stop; work on the successor."
+                "Labelled {label}: replaced by another pull request. Confirm the successor named in the body or comments merged or carries this change, close this pull request with a comment naming it, then work on the successor. No owner is needed."
             ),
         )
     } else if label.to_ascii_lowercase().starts_with(PARKED_LABEL_PREFIX) {
@@ -836,10 +839,20 @@ mod tests {
     }
 
     #[test]
+    fn superseded_is_closed_by_the_author_not_the_owner() {
+        let next = next("excluded_label:superseded", None, true, "CLEAN");
+        assert_eq!(next.actor, Actor::Author);
+        assert!(next.stop);
+        assert!(next.actionable());
+        assert!(next.action.contains("close this pull request"), "{next:?}");
+        assert!(next.action.contains("successor"), "{next:?}");
+        assert!(!next.action.contains("owner decides"), "{next:?}");
+    }
+
+    #[test]
     fn owner_decision_and_fleet_hold_labels_stop_the_caller() {
         for (token, needle) in [
             ("owner_decision", "owner decides"),
-            ("excluded_label:superseded", "successor"),
             ("excluded_label:PARKED/windows", "parked"),
             ("provenance_blocked:5·unresolved", "provenance"),
             ("direct_merge_refused", "maintainer merges"),
