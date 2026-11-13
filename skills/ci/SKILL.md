@@ -4838,7 +4838,7 @@ the command's environment (a guard, not a sandbox). With `read_token = "ghread"`
 tokens minted by `ghread` (the read-only admission-reader App; GET calls only):
 `GH_TOKEN` for the repo under test, `SHIPYARD_CANARY_READ_TOKEN_<OWNER>_<NAME>`
 for each `read_repos` entry (e.g. for an https clone URL), and a `gh` on PATH
-that is `ghread`. Tokens are redacted from the issue tail. An exit code listed
+that is `ghread` and also allows `gh run download <id>` (flags -R, -n, -D, -p only; run by the real gh with the named repo's read token, refused if that repo has none). Every other `gh run` subcommand is refused. Tokens are redacted from the issue tail. An exit code listed
 in `inconclusive_exit_codes` is not a failure: the issue is left as it is and
 the run retries on the hourly error backoff.
 

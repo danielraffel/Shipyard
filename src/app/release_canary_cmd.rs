@@ -90,10 +90,15 @@ pub(super) fn release_canary_command<W: Write>(
         .unwrap_or_default();
     let ghread = std::env::var_os("SHIPYARD_CANARY_GHREAD")
         .map_or_else(|| home.join(".local/bin/ghread"), std::path::PathBuf::from);
+    let real_gh = std::env::var_os("GHREAD_GH").map_or_else(
+        || std::path::PathBuf::from("/opt/homebrew/bin/gh"),
+        std::path::PathBuf::from,
+    );
     let ghread_cache = std::env::var_os("GHREAD_CACHE_DIR")
         .map_or_else(|| home.join(".cache/ghread"), std::path::PathBuf::from);
     let request = Request {
         ghread: &ghread,
+        real_gh: &real_gh,
         ghread_cache: &ghread_cache,
         repo: &repo,
         base: &base,
@@ -174,6 +179,8 @@ pub(crate) struct Request<'a> {
     pub work_root: &'a Path,
     /// The read-only `ghread` wrapper, and the cache it keeps its tokens in.
     pub ghread: &'a Path,
+    /// The real gh (not the ghapp wrapper), by absolute path.
+    pub real_gh: &'a Path,
     pub ghread_cache: &'a Path,
     pub daily: bool,
     pub apply: bool,
@@ -308,6 +315,7 @@ fn run_once(request: &Request<'_>, gh: Gh<'_>) -> Result<Report, String> {
             read_tokens: &read_tokens,
             repo: request.repo,
             ghread: request.ghread,
+            real_gh: request.real_gh,
         },
         scratch.path(),
     )?;
@@ -403,6 +411,7 @@ struct Launch<'a> {
     read_tokens: &'a [ReadToken],
     repo: &'a str,
     ghread: &'a Path,
+    real_gh: &'a Path,
 }
 
 /// Mint read-only tokens through `ghread` and nothing else: it is the
@@ -460,17 +469,67 @@ fn mint_read_tokens(
     Ok(tokens)
 }
 
-/// A `gh` that only `ghread` can run: GET `api` calls, no writes, whichever
-/// repository the path names. Put first on the child's PATH.
-fn write_gh_shim(dir: &Path, ghread: &Path) -> Result<(), String> {
+const GH_SHIM: &str = r#"#!/bin/sh
+# Read-only gh for the release canary. Everything goes to ghread (GET api
+# calls) except `run download`, which only reads and is run with the real gh
+# and the read token of the repository it names. Nothing else is allowed.
+GHREAD=__GHREAD__
+REAL_GH=__REAL_GH__
+DEFAULT_REPO=__REPO__
+refuse() { echo "release canary gh shim: refused: $*" >&2; exit 64; }
+if [ "$1" != run ]; then exec "$GHREAD" "$@"; fi
+[ "$2" = download ] || refuse "gh run ${2:-} (only 'run download' is allowed)"
+shift 2
+repo=$DEFAULT_REPO
+id=
+n=$#
+i=0
+while [ "$i" -lt "$n" ]; do
+  a=$1; shift; i=$((i + 1))
+  case "$a" in
+    -R|--repo|-n|--name|-D|--dir|-p|--pattern)
+      [ "$i" -lt "$n" ] || refuse "$a needs a value"
+      v=$1; shift; i=$((i + 1))
+      case "$a" in -R|--repo) repo=$v ;; esac
+      set -- "$@" "$a" "$v" ;;
+    --repo=*) repo=${a#--repo=}; set -- "$@" "$a" ;;
+    --name=*|--dir=*|--pattern=*) set -- "$@" "$a" ;;
+    -*) refuse "unknown flag $a" ;;
+    *)
+      case "$a" in ''|*[!0-9]*) refuse "run id must be a number" ;; esac
+      [ -z "$id" ] || refuse "more than one run id"
+      id=$a; set -- "$@" "$a" ;;
+  esac
+done
+[ -n "$id" ] || refuse "a run id is required"
+case "$repo" in */*) ;; *) refuse "repository must be owner/name" ;; esac
+case "$repo" in *[!A-Za-z0-9._/-]*) refuse "bad repository" ;; esac
+var=SHIPYARD_CANARY_READ_TOKEN_$(printf %s "$repo" | tr 'a-z' 'A-Z' | tr -c 'A-Z0-9' '_')
+eval "tok=\${$var:-}"
+[ -n "$tok" ] || refuse "no read token for $repo"
+GH_TOKEN=$tok exec "$REAL_GH" run download "$@"
+"#;
+
+fn sh_quote(value: &str) -> Result<String, String> {
+    if value.contains('\n') {
+        return Err("newline in a shim value".to_owned());
+    }
+    Ok(format!("'{}'", value.replace('\'', "'\\''")))
+}
+
+/// A `gh` limited to reads: GET `api` calls through `ghread` and
+/// `run download` through the real `gh` with a read token. Put first on the
+/// child's PATH; `real_gh` was resolved by absolute path before that, so the
+/// shim cannot call itself.
+fn write_gh_shim(dir: &Path, ghread: &Path, real_gh: &Path, repo: &str) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
     fs::create_dir_all(dir).map_err(|error| error.to_string())?;
     let path = dir.join("gh");
-    fs::write(
-        &path,
-        format!("#!/bin/sh\nexec \"{}\" \"$@\"\n", ghread.display()),
-    )
-    .map_err(|error| error.to_string())?;
+    let script = GH_SHIM
+        .replace("__GHREAD__", &sh_quote(&ghread.to_string_lossy())?)
+        .replace("__REAL_GH__", &sh_quote(&real_gh.to_string_lossy())?)
+        .replace("__REPO__", &sh_quote(repo)?);
+    fs::write(&path, script).map_err(|error| error.to_string())?;
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())
 }
 
@@ -527,7 +586,7 @@ fn run_command(
             }
         }
         let shim = scratch.join("shim");
-        write_gh_shim(&shim, launch.ghread)?;
+        write_gh_shim(&shim, launch.ghread, launch.real_gh, launch.repo)?;
         let path = std::env::var_os("PATH").unwrap_or_default();
         let mut parts = vec![shim];
         parts.extend(std::env::split_paths(&path));
@@ -749,6 +808,7 @@ mod tests {
             load_canary: &|_| Ok(Some(cfg.clone())),
             work_root: &dir.join("state"),
             ghread: Path::new("/nonexistent/ghread"),
+            real_gh: Path::new("/nonexistent/gh"),
             ghread_cache: Path::new("/nonexistent"),
             daily,
             apply: true,
@@ -853,6 +913,7 @@ mod tests {
             load_canary: &|_| Ok(Some(cfg.clone())),
             work_root: &dir.path().join("state"),
             ghread: Path::new("/nonexistent/ghread"),
+            real_gh: Path::new("/nonexistent/gh"),
             ghread_cache: Path::new("/nonexistent"),
             daily: false,
             apply: true,
@@ -885,6 +946,7 @@ mod tests {
             load_canary: &|_| Ok(Some(cfg.clone())),
             work_root: &dir.path().join("state"),
             ghread: Path::new("/nonexistent/ghread"),
+            real_gh: Path::new("/nonexistent/gh"),
             ghread_cache: Path::new("/nonexistent"),
             daily: false,
             apply: false,
@@ -908,6 +970,7 @@ mod tests {
             load_canary: load,
             work_root: state,
             ghread: Path::new("/nonexistent/ghread"),
+            real_gh: Path::new("/nonexistent/gh"),
             ghread_cache: Path::new("/nonexistent"),
             daily,
             apply: true,
@@ -1121,6 +1184,7 @@ mod tests {
             fake,
             Path::new("/nonexistent/ghread"),
             Path::new("/nonexistent"),
+            Path::new("/nonexistent/gh"),
         )
     }
 
@@ -1130,6 +1194,7 @@ mod tests {
         fake: &Fake,
         ghread: &Path,
         cache: &Path,
+        real_gh_path: &Path,
     ) -> Result<Report, String> {
         let origin = origin_once(dir);
         let request = Request {
@@ -1139,6 +1204,7 @@ mod tests {
             load_canary: &|_| Ok(Some(cfg.clone())),
             work_root: &dir.join("state"),
             ghread,
+            real_gh: real_gh_path,
             ghread_cache: cache,
             daily: true,
             apply: true,
@@ -1161,7 +1227,7 @@ mod tests {
         let plain = canary("exit 2", 30);
         let fake = Fake::new("");
         let report = run_with(dir.path().join("b").as_path(), &plain, &fake);
-        assert!(report.is_err() || report.unwrap().status == "fail");
+        assert_eq!(report.unwrap().status, "fail");
     }
 
     fn fake_ghread(dir: &Path) -> PathBuf {
@@ -1202,6 +1268,7 @@ mod tests {
             &fake,
             &ghread,
             &dir.path().join("cache"),
+            Path::new("/nonexistent/gh"),
         )
         .unwrap();
         let body = fake_body(&fake);
@@ -1228,5 +1295,78 @@ mod tests {
         assert!(mint.contains("Command::new(ghread)"));
         assert!(!mint.contains("ghapp"));
         assert!(!mint.contains("GH_TOKEN"));
+    }
+
+    fn fake_real_gh(dir: &Path) -> PathBuf {
+        let path = dir.join("real-gh");
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\necho \"$GH_TOKEN|$*\" >> {}\n",
+                dir.join("real-gh.log").display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// Run `gh_line` under the shim; returns (status, real-gh log).
+    fn under_shim(gh_line: &str, with_other_token: bool) -> (String, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let ghread = fake_ghread(dir.path());
+        let real = fake_real_gh(dir.path());
+        let mut cfg = canary(&format!("{gh_line}; echo shim-exit=$?; exit 1"), 30);
+        cfg.read_token = true;
+        if with_other_token {
+            cfg.read_repos = vec!["o/other".to_owned()];
+        }
+        let fake = Fake::new("");
+        run_with_ghread(
+            dir.path(),
+            &cfg,
+            &fake,
+            &ghread,
+            &dir.path().join("cache"),
+            &real,
+        )
+        .unwrap();
+        let body = fake_body(&fake);
+        let log = fs::read_to_string(dir.path().join("real-gh.log")).unwrap_or_default();
+        (body, log)
+    }
+
+    #[test]
+    fn the_shim_allows_run_download_with_the_named_repos_read_token() {
+        let (body, log) = under_shim("gh run download 123 -R o/other -n x -D d", true);
+        assert!(body.contains("shim-exit=0"), "{body}");
+        assert_eq!(
+            log.trim(),
+            "READ-OTHER|run download 123 -R o/other -n x -D d"
+        );
+        // Default repo is the one under test.
+        let (_, log) = under_shim("gh run download 7 --name=y", false);
+        assert_eq!(log.trim(), "READ-R|run download 7 --name=y");
+    }
+
+    #[test]
+    fn the_shim_refuses_other_run_commands_unknown_flags_and_tokenless_repos() {
+        for line in [
+            "gh run rerun 123",
+            "gh run cancel 123",
+            "gh run watch 123",
+            "gh run download 123 --unknown",
+            "gh run download abc",
+            "gh run download",
+            "gh run download 1 2",
+        ] {
+            let (body, log) = under_shim(line, true);
+            assert!(body.contains("shim-exit=64"), "{line}: {body}");
+            assert!(log.is_empty(), "{line} reached the real gh: {log}");
+        }
+        // Pulp-like repo that was not listed in read_repos has no token.
+        let (body, log) = under_shim("gh run download 5 -R o/unlisted", true);
+        assert!(body.contains("shim-exit=64"), "{body}");
+        assert!(log.is_empty(), "{log}");
     }
 }
