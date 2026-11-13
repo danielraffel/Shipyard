@@ -121,7 +121,7 @@ fn a_queued_pull_request_is_never_required_red() {
 }
 
 #[test]
-fn a_stuck_group_outranks_the_queue_and_a_quarantine_outranks_the_token() {
+fn a_stuck_group_outranks_the_queue_and_a_quarantine_replaces_awaiting_review() {
     let queued = StewardDecision::Queued { position: 1 };
     assert_eq!(
         state_for("merge_group_stalled:x", &queued, true),
@@ -134,7 +134,8 @@ fn a_stuck_group_outranks_the_queue_and_a_quarantine_outranks_the_token() {
     );
     assert_eq!(
         state_for("held:review-verdict", &ARM, true),
-        Some(LoopState::Quarantined)
+        Some(LoopState::Hold),
+        "a quarantine replaces awaiting_review only"
     );
     assert_eq!(
         state_for("draft", &ARM, true),
@@ -190,11 +191,7 @@ fn each_missed_deadline_raises_the_level_one_rung() {
     );
     assert_eq!(at(LoopState::Quarantined, 31).actor, LoopActor::Coordinator);
     // No deadline while the queue or CI acts.
-    for state in [
-        LoopState::Queued,
-        LoopState::CheckRunning,
-        LoopState::CapacityQueued,
-    ] {
+    for state in [LoopState::Queued, LoopState::CapacityQueued] {
         let waiting = at(state, 600);
         assert_eq!((waiting.level, waiting.deadline_at), (0, None), "{state:?}");
     }
@@ -208,6 +205,7 @@ fn since_is_the_earliest_evidence_at_this_head_and_a_new_head_starts_over() {
         token: "required_failed:macos",
         decision: &ARM,
         since,
+        since_source: None,
         dwell_since: None,
         enqueued_at: None,
     };
@@ -216,6 +214,7 @@ fn since_is_the_earliest_evidence_at_this_head_and_a_new_head_starts_over() {
         state: LoopState::RequiredRed,
         head: HEAD.to_owned(),
         since: ago(90),
+        observed_at: Some(ago(5)),
     };
     let (carried, _) = for_row(
         REPO,
@@ -260,6 +259,7 @@ fn the_quarantine_file_names_heads_and_only_the_current_head_is_quarantined() {
         token: "no_verdict",
         decision: &ARM,
         since: None,
+        since_source: None,
         dwell_since: None,
         enqueued_at: None,
     };
@@ -347,4 +347,178 @@ fn the_row_carries_the_loop_object_and_only_an_applying_pass_keeps_records() {
         now(),
     );
     assert_eq!(seen.len(), 1);
+}
+
+/// Review finding 1: the quarantine file is never pruned, so it applies only
+/// while the head still waits on review. The same head, since approved and
+/// green (or held, or red), is classified by its real state.
+#[test]
+fn a_quarantined_head_that_is_now_approved_is_ready_not_quarantined() {
+    let quarantine = parse_quarantine(&format!(
+        "Generous-Corp/vellum#5\t{HEAD}\treviewer_unverified_exhausted\tsince=1763049600\n"
+    ));
+    let facts = |token: &'static str| RowFacts {
+        number: 5,
+        head: HEAD,
+        token,
+        decision: &ARM,
+        since: None,
+        since_source: None,
+        dwell_since: None,
+        enqueued_at: None,
+    };
+    for (token, want) in [
+        ("ready", LoopState::Ready),
+        ("held:review-verdict", LoopState::Hold),
+        ("required_failed:macos", LoopState::RequiredRed),
+        ("required_pending", LoopState::CheckRunning),
+        ("no_verdict", LoopState::Quarantined),
+    ] {
+        let (state, _) = for_row(REPO, &facts(token), None, &quarantine, now()).expect("covered");
+        assert_eq!(state.state, want, "{token}");
+    }
+}
+
+/// Review finding 2: `awaiting_review` to `ready` at the same head. The row's
+/// green time predates the approval; `ready` starts at the first pass that
+/// saw it, at level 0, and does not page repair.
+#[test]
+fn a_state_change_at_the_same_head_starts_when_first_seen() {
+    let waiting = Seen {
+        state: LoopState::AwaitingReview,
+        head: HEAD.to_owned(),
+        since: ago(100),
+        observed_at: Some(ago(5)),
+    };
+    let ready = RowFacts {
+        number: 5,
+        head: HEAD,
+        token: "ready",
+        decision: &ARM,
+        since: Some(ago(100)),
+        since_source: Some("checks_green"),
+        dwell_since: None,
+        enqueued_at: None,
+    };
+    let (state, record) =
+        for_row(REPO, &ready, Some(&waiting), &BTreeMap::new(), now()).expect("covered");
+    assert_eq!(state.state, LoopState::Ready);
+    assert_eq!(state.since, now().to_rfc3339());
+    assert_eq!((state.level, state.actor), (0, LoopActor::Steward));
+    assert_eq!(record.observed_at, Some(now()));
+    // check_running to ready: the same.
+    let running = Seen {
+        state: LoopState::CheckRunning,
+        ..waiting.clone()
+    };
+    let (state, _) =
+        for_row(REPO, &ready, Some(&running), &BTreeMap::new(), now()).expect("covered");
+    assert_eq!(state.level, 0);
+    // Evidence specific to the new state, after the old state was last
+    // seen, dates it: the required check that failed two minutes ago.
+    let red = RowFacts {
+        token: "required_failed:macos",
+        since: Some(ago(2)),
+        since_source: Some("check_completed"),
+        ..ready.clone()
+    };
+    let (state, _) = for_row(REPO, &red, Some(&running), &BTreeMap::new(), now()).expect("covered");
+    assert_eq!(state.since, ago(2).to_rfc3339());
+    // Evidence older than the last sighting of the old state is not trusted.
+    let older = RowFacts {
+        since: Some(ago(40)),
+        ..red
+    };
+    let (state, _) =
+        for_row(REPO, &older, Some(&running), &BTreeMap::new(), now()).expect("covered");
+    assert_eq!(state.since, now().to_rfc3339());
+}
+
+/// Review finding 3: `admission_pending` is ready; a merge state GitHub keeps
+/// BLOCKED (or UNKNOWN, UNSTABLE) is `check_running` and escalates after an
+/// hour instead of never.
+#[test]
+fn admission_pending_is_ready_and_a_lasting_merge_state_escalates() {
+    assert_eq!(
+        state_for("admission_pending", &ARM, false),
+        Some(LoopState::Ready)
+    );
+    for token in [
+        "merge_state:BLOCKED",
+        "merge_state:UNKNOWN",
+        "merge_state:UNSTABLE",
+    ] {
+        assert_eq!(
+            state_for(token, &ARM, false),
+            Some(LoopState::CheckRunning),
+            "{token}"
+        );
+    }
+    let early = classify(LoopState::CheckRunning, ago(59), now());
+    assert_eq!((early.level, early.actor), (0, LoopActor::Queue));
+    let late = classify(LoopState::CheckRunning, ago(61), now());
+    assert_eq!((late.level, late.actor), (1, LoopActor::Repair));
+}
+
+/// Review finding 4: a pull request missing from this pass's rows (a
+/// partial or deferred report) keeps its record; only a pull request no
+/// longer open loses it. A deferred row keeps the state it had.
+#[test]
+fn a_partial_report_keeps_records_and_only_closed_pull_requests_drop() {
+    let mut observation = observation_for(ready_pr(), true);
+    observation.repo = REPO.to_owned();
+    // ready_pr is #42 and open; #7 is not in the open list (merged).
+    let open_key = "generous-corp/vellum#42".to_owned();
+    let closed_key = "generous-corp/vellum#7".to_owned();
+    let record = Seen {
+        state: LoopState::RequiredRed,
+        head: HEAD.to_owned(),
+        since: ago(90),
+        observed_at: Some(ago(5)),
+    };
+    let mut seen = BTreeMap::from([
+        (open_key.clone(), record.clone()),
+        (closed_key.clone(), record.clone()),
+    ]);
+    let mut reports: Vec<PrReport> = Vec::new();
+    scheduling_loop::annotate(
+        &mut reports,
+        &observation,
+        None,
+        &mut seen,
+        &BTreeMap::new(),
+        true,
+        now(),
+    );
+    assert!(
+        seen.contains_key(&open_key),
+        "missing from the rows, still open: kept"
+    );
+    assert!(!seen.contains_key(&closed_key), "no longer open: dropped");
+    // A deferred row keeps its state and since.
+    let mut deferred = vec![row(42, ARM, "deferred_pass_budget", None)];
+    deferred[0].mutation = Some(crate::app::merge_steward_cmd::pass_budget::DEFERRED.to_owned());
+    scheduling_loop::annotate(
+        &mut deferred,
+        &observation,
+        None,
+        &mut seen,
+        &BTreeMap::new(),
+        true,
+        now(),
+    );
+    let state = deferred[0].blocked.loop_state.as_ref().expect("kept");
+    assert_eq!(state.state, LoopState::RequiredRed);
+    assert_eq!(state.since, ago(90).to_rfc3339());
+}
+
+/// Review finding 6: the pass-runner's real line is tab-separated, with
+/// extra fields.
+#[test]
+fn the_real_tab_separated_quarantine_line_parses() {
+    let line = "Generous-Corp/pulp#12192\teadd0feb4c53603d07151cc1938eb26257eb87d1\treviewer_unverified_exhausted\tattempts=2\tproviders=claude,codex\tsince=1794581918\n";
+    let quarantine = parse_quarantine(line);
+    let (head, since) = quarantine.get("generous-corp/pulp#12192").expect("parsed");
+    assert_eq!(head, "eadd0feb4c53603d07151cc1938eb26257eb87d1");
+    assert_eq!(*since, DateTime::from_timestamp(1_794_581_918, 0));
 }

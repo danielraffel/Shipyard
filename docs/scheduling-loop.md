@@ -1,7 +1,8 @@
 # The steward's scheduling loop
 
 Every steward tick gives each open pull request the loop covers one `loop`
-object on its row in the tick JSON (`repos[].prs[].loop`). The review,
+object on its row in the tick JSON, at the top level of the row beside
+`blocked_on` (`repos[].prs[].loop`). The review,
 runner and ledger lanes, and the escalation ladder, read it instead of
 deriving state themselves. The steward is the single writer, so it is also
 the single scheduler.
@@ -49,12 +50,11 @@ The first match wins:
 
 1. `stuck_group`: the row reads `merge_group_stalled:<context>`, so its merge group can never finish.
 2. `queued`: the pull request is in the merge queue (or was enqueued this pass). A queued pull request is never `required_red` or `hold`, whatever a check on its head says.
-3. `quarantined`: the quarantine file lists this pull request at its current head.
-4. Otherwise the state the `blocked_on` token names:
+3. Otherwise the state the `blocked_on` token names (below). When that state is `awaiting_review` and the quarantine file lists this pull request at its current head, it is `quarantined` instead. The file is never pruned, so a quarantine line never overrides an approved, green, red or held head.
 
 | `blocked_on` | `state` |
 |---|---|
-| `ready`, `merge_state:BEHIND` (the queue tests on top of main, so behind is never an act), `enqueue_refused:*`, `generated_path_batch:*`, `defect_fix_removed:*` | `ready` |
+| `ready`, `admission_pending`, `merge_state:BEHIND` (the queue tests on top of main, so behind is never an act), `enqueue_refused:*`, `generated_path_batch:*`, `defect_fix_removed:*` | `ready` |
 | `no_verdict`, `waiting_head_approval`, `approval_excluded:*`, `waiting_code_owner:*`, `code_owner_review`, `carries_unapproved_commits:*` | `awaiting_review` |
 | `required_pending`, `waiting_full_test_tier`, `waiting_enqueue_requirements`, `merge_state:` other than `DIRTY`/`BEHIND` | `check_running` |
 | `capacity_queued` | `capacity_queued` |
@@ -62,7 +62,12 @@ The first match wins:
 | `held:*` | `hold` |
 | `merge_state:DIRTY` | `dirty` |
 | `ejected_same_head:*`, `ejection_cap` | `ejected` |
-| anything else: `transient_rerun`, `required_never_ran:*`, `approval_unread`, `steward_error`, `uncertain_mutation`, `revalidating`, `deferred_pass_budget`, `admission_pending`, `required_policy_unknown`, `carried_commits_*`, and any token added later | `tooling` |
+| anything else: `transient_rerun`, `required_never_ran:*`, `approval_unread`, `steward_error`, `uncertain_mutation`, `revalidating`, `required_policy_unknown`, `carried_commits_*`, and any token added later | `tooling` |
+
+`revalidating` and `uncertain_mutation` normally clear on the next pass, so
+they reach the 10-minute `tooling` deadline only when they persist. A row the
+pass deferred (`deferred_pass_budget`) is not reclassified: it keeps the
+state and `since` it had.
 
 ## Acts and deadlines
 
@@ -77,7 +82,12 @@ The first match wins:
 | `ejected` | re-queue the same head or push a new one | 0, `steward` | 10 min | +30, +30 |
 | `stuck_group` | dequeue as defect-fix | 0, `steward` | 30 min | +30, +30 |
 | `tooling` | re-run on another slot | 0, `steward` | 10 min (the next tick or two) | +30, +30 |
-| `queued`, `check_running`, `capacity_queued` | wait (the host is watched for capacity) | 0, `queue` | none | none |
+| `check_running` | wait for required checks | 0, `queue` | 60 min | `repair`, +60, +60 |
+| `queued`, `capacity_queued` | wait (the host is watched for capacity) | 0, `queue` | none | none |
+
+`check_running` also covers a merge state GitHub keeps at `BLOCKED`,
+`UNKNOWN` or `UNSTABLE`, so a pull request stuck there escalates after an
+hour instead of never.
 
 Each missed deadline raises the level by one rung. After the state's own
 actor at L0, L1 is `repair` (the `adversary` after a reviewer), L2 is
@@ -106,9 +116,26 @@ variable `SHIPYARD_REVIEW_QUARANTINE` names, else the machine-global key
 unreadable, no pull request is ever `quarantined`. Only the head the line
 names is quarantined; a new head is classified normally.
 
+## How `since` is dated
+
+- The same state at the same head as the last pass: `since` is unchanged.
+- A different state at the same head: the state began after the last pass
+  that saw the old one. `since` is this pass, unless the row carries evidence
+  specific to the new state that is newer than that pass: the required check
+  completing red (`required_red`), the HOLD being posted (`hold`), the removal
+  from the queue (`ejected`), the enqueue (`queued`), the quarantine line
+  (`quarantined`), the checks turning green (`awaiting_review`), a required
+  check starting (`check_running`). A green time that predates an approval
+  never dates `ready`, so `ready` starts at level 0.
+- A head seen for the first time (a push, or the first pass after a
+  deploy): the earliest evidence the pass has, else this pass.
+
 ## Records
 
 An applying steward pass keeps, per pull request, the state and head it
-last classified and when it entered them (`loop_seen` in the steward
-ledger), so `since` survives ticks for states no read dates. A report pass
-keeps nothing.
+last classified, when it entered them and the last pass that saw them
+(`loop_seen` in the steward ledger). A record is dropped only when its pull
+request is no longer open; a row missing from a partial report keeps its
+record. A report pass keeps nothing. If the ledger cannot be saved, the next
+pass dates states from the evidence again, so a level can only come out
+lower, never higher.

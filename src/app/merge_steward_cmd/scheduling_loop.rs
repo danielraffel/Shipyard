@@ -142,9 +142,9 @@ pub(crate) const TABLE: [Row; 12] = [
         action: "wait for required checks",
         first: LoopActor::Queue,
         second: LoopActor::Repair,
-        first_minutes: None,
-        second_minutes: 0,
-        third_minutes: 0,
+        first_minutes: Some(60),
+        second_minutes: 60,
+        third_minutes: 60,
     },
     Row {
         start: 0,
@@ -260,8 +260,9 @@ pub(crate) struct Loop {
 /// the opt-out label, provenance labels).
 ///
 /// Precedence: a merge group that can never finish, then the merge queue,
-/// then a quarantined review of the current head, then the state the row's
-/// `blocked_on` token names (the steward already chose one token per row).
+/// then the state the row's `blocked_on` token names (the steward already
+/// chose one token per row), with a quarantined review of the current head
+/// replacing `awaiting_review` only.
 #[must_use]
 pub(crate) fn state_for(
     token: &str,
@@ -288,13 +289,12 @@ pub(crate) fn state_for(
     ) {
         return None;
     }
-    if quarantined {
-        return Some(LoopState::Quarantined);
-    }
-    Some(match kind {
-        "ready" | "enqueue_refused" | "generated_path_batch" | "defect_fix_removed" => {
-            LoopState::Ready
-        }
+    let state = match kind {
+        "ready"
+        | "admission_pending"
+        | "enqueue_refused"
+        | "generated_path_batch"
+        | "defect_fix_removed" => LoopState::Ready,
         "no_verdict"
         | "waiting_head_approval"
         | "approval_excluded"
@@ -318,6 +318,14 @@ pub(crate) fn state_for(
         // a steward error, and any token this table does not know yet: the
         // tooling around the PR, re-run next tick and escalated if it stays.
         _ => LoopState::Tooling,
+    };
+    // The quarantine file is never pruned: it only means "the review gave
+    // up", so it applies only while the head still waits on review. An
+    // approved, green, red or held head is classified by its real state.
+    Some(if quarantined && state == LoopState::AwaitingReview {
+        LoopState::Quarantined
+    } else {
+        state
     })
 }
 
@@ -443,6 +451,10 @@ pub(crate) struct Seen {
     pub(crate) state: LoopState,
     pub(crate) head: String,
     pub(crate) since: DateTime<Utc>,
+    /// The last pass that saw it in this state: a later state at the same
+    /// head cannot have begun before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) observed_at: Option<DateTime<Utc>>,
 }
 
 /// The facts one row brings.
@@ -454,6 +466,9 @@ pub(crate) struct RowFacts<'a> {
     pub(crate) decision: &'a StewardDecision,
     /// The row's own `since` (the steward's dated reads).
     pub(crate) since: Option<DateTime<Utc>>,
+    /// Which GitHub time `since` came from (`check_completed`,
+    /// `hold_posted`, ...).
+    pub(crate) since_source: Option<&'a str>,
     /// When the dwell entry at this head began, when its state maps to the
     /// same loop state.
     pub(crate) dwell_since: Option<DateTime<Utc>>,
@@ -476,29 +491,61 @@ pub(crate) fn for_row(
         .get(&key)
         .filter(|(head, _)| head.eq_ignore_ascii_case(facts.head));
     let state = state_for(facts.token, facts.decision, quarantined_at.is_some())?;
-    let carried = seen
-        .filter(|seen| seen.state == state && seen.head.eq_ignore_ascii_case(facts.head))
-        .map(|seen| seen.since);
-    // The earliest evidence of entering this state at this head.
-    let evidence = match state {
-        LoopState::Queued => facts.enqueued_at,
-        LoopState::Quarantined => quarantined_at.and_then(|(_, since)| *since),
-        _ => facts.dwell_since.or(facts.since),
-    };
-    let since = [carried, evidence]
-        .into_iter()
-        .flatten()
-        .min()
-        .unwrap_or(now)
-        .min(now);
+    let same_head = seen.filter(|seen| seen.head.eq_ignore_ascii_case(facts.head));
+    let since = match same_head {
+        // Unchanged state at this head: the clock keeps running.
+        Some(seen) if seen.state == state => seen.since,
+        // The state changed at this head: it began after the last pass that
+        // saw the old one. Only evidence specific to the new state dates it
+        // earlier than this pass; anything else (a green time that predates
+        // an approval, say) would start it at a later level than it earned.
+        Some(seen) => specific_evidence(state, facts, quarantined_at)
+            .filter(|at| seen.observed_at.is_none_or(|floor| *at >= floor))
+            .unwrap_or(now),
+        // First sight of this head (a push, or the first pass after a
+        // deploy): the earliest evidence the pass has.
+        None => specific_evidence(state, facts, quarantined_at)
+            .or(facts.dwell_since)
+            .or(facts.since)
+            .unwrap_or(now),
+    }
+    .min(now);
     Some((
         classify(state, since, now),
         Seen {
             state,
             head: facts.head.to_ascii_lowercase(),
             since,
+            observed_at: Some(now),
         },
     ))
+}
+
+/// A time that dates entering `state` itself: the check that failed, the
+/// HOLD that was posted, the removal from the queue, the enqueue, the
+/// quarantine line, the first required check starting. `None` when the row
+/// has none.
+fn specific_evidence(
+    state: LoopState,
+    facts: &RowFacts<'_>,
+    quarantined_at: Option<&(String, Option<DateTime<Utc>>)>,
+) -> Option<DateTime<Utc>> {
+    let source = |want: &[&str]| {
+        facts
+            .since_source
+            .filter(|source| want.contains(source))
+            .and(facts.since)
+    };
+    match state {
+        LoopState::Queued => facts.enqueued_at,
+        LoopState::Quarantined => quarantined_at.and_then(|(_, since)| *since),
+        LoopState::RequiredRed => source(&["check_completed"]),
+        LoopState::Hold => source(&["hold_posted"]),
+        LoopState::Ejected => source(&["queue_removed"]),
+        LoopState::AwaitingReview => source(&["checks_green"]),
+        LoopState::CheckRunning | LoopState::CapacityQueued => source(&["check_started"]),
+        LoopState::Ready | LoopState::Dirty | LoopState::StuckGroup | LoopState::Tooling => None,
+    }
 }
 
 /// Fill `loop` on every covered row of one pass. Reads nothing from GitHub;
@@ -537,26 +584,45 @@ pub(super) fn annotate(
                     && kind(&entry.token) == kind(&token)
             })
             .map(|entry| entry.entered_at);
+        let key = format!("{prefix}{}", report.number);
+        // A row the pass deferred was not classified this pass: it keeps the
+        // state it had, so its clock neither restarts nor jumps.
+        if super::pass_budget::is_deferred(report) {
+            if let Some(record) = seen
+                .get(&key)
+                .filter(|record| record.head.eq_ignore_ascii_case(&report.head_sha))
+            {
+                report.blocked.loop_state = Some(classify(record.state, record.since, now));
+            }
+            continue;
+        }
         let facts = RowFacts {
             number: report.number,
             head: &report.head_sha,
             token: &token,
             decision: &report.decision,
             since: report.blocked.since.as_deref().and_then(time),
+            since_source: report.blocked.since_source,
             dwell_since,
             enqueued_at: observation
                 .merge_group_enqueued_at
                 .get(&report.number)
                 .and_then(|at| time(at)),
         };
-        let key = format!("{prefix}{}", report.number);
         if let Some((state, record)) = for_row(repo, &facts, seen.get(&key), quarantine, now) {
             report.blocked.loop_state = Some(state);
             next.insert(key, record);
         }
     }
     if apply {
-        seen.retain(|key, _| !key.starts_with(&prefix));
+        // Drop only pull requests no longer open (merged or closed). A row
+        // missing from a partial or deferred report keeps its record.
+        let open = observation
+            .prs
+            .iter()
+            .map(|pr| format!("{prefix}{}", pr.fact.number))
+            .collect::<std::collections::BTreeSet<_>>();
+        seen.retain(|key, _| !key.starts_with(&prefix) || open.contains(key));
         seen.extend(next);
     }
 }
