@@ -3874,6 +3874,23 @@ pub(super) enum GovernanceCommand {
         #[arg(long = "output", short = 'o')]
         output: Option<PathBuf>,
     },
+    /// Read-only supply-chain audit: report each profile setting as PASS,
+    /// DRIFT or UNKNOWN for one or more repositories. Never writes.
+    Audit {
+        /// Repository to audit (owner/repo). Repeatable. Defaults to the
+        /// current checkout's remote.
+        #[arg(long = "repo", value_name = "OWNER/REPO")]
+        repos: Vec<String>,
+        /// gh-compatible CLI used for the reads (for example ghapp or ghread).
+        #[arg(long = "gh-binary", value_name = "PATH")]
+        gh_binary: Option<PathBuf>,
+        /// Override `[project].profile` (solo, multi, custom).
+        #[arg(long = "profile")]
+        profile: Option<String>,
+        /// Override `[governance.updates].bot` (dependabot or renovate).
+        #[arg(long = "updates-bot")]
+        updates_bot: Option<String>,
+    },
     /// Switch governance profile and apply.
     Use {
         /// Profile to activate: solo, multi, or custom.

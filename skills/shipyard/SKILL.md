@@ -671,6 +671,25 @@ before trusting the answer. `governance apply` without `--yes` prints the plan,
 writes nothing and exits 2; status and diff name `apply --yes` only next to
 the field list it would write.
 
+## `governance audit` is read-only, and a row is a target until it passes
+
+`shipyard governance audit --repo <owner/repo> [--repo ...]` reports the
+supply-chain rows of `docs/governance.md` (`exact-refs`, `lockfile`,
+`updates-bot`, `zizmor-report`, `zizmor-enforce`, `workflow-permissions`,
+`permissions-empty`, `untrusted-triggers`, `tag-protection`,
+`immutable-releases`, `default-token`) as PASS, DRIFT or UNKNOWN, using only
+`gh api --method GET`. Pass `--gh-binary` with the App wrapper for the repo
+(`ghapp` for `danielraffel/*`; `ghread` reads workflows on Generous-Corp but
+gets 403 on `immutable-releases` and the default token, which then print
+UNKNOWN, never PASS). Exit 1 means drift, 2 means only unreadable rows. A
+row is a **target** for a repository until the audit prints PASS for it;
+record which repository meets which row (with the audit date) where the
+fleet keeps its status table, never in `docs/governance.md`. The updates bot
+is one config value, `[governance.updates].bot` (default `dependabot`, 7-day
+cooldown, limit 1); the lockfile mode is `[governance.lockfile].mode`
+(`advisory` until promoted). The audit's workflow checks are textual: a
+version comment after a SHA must look like `# v1.2.3`.
+
 ## merge-guard is versioned and tested here
 
 `merge-guard` (refuses `pr merge` on a private repo that cannot enforce
