@@ -98,10 +98,8 @@ refused, held or unapproved head. A read or post error fails the job too (it
 never passes by default). The commit status is posted exactly as before.
 
 Only the `pull_request_target` run leaves its check run on the pull request's
-head; a dispatched (`workflow_dispatch`, input `pull_request`), a comment's
-(`issue_comment`) or a review's (`workflow_run`) run leaves its check run on
-the default branch's tip when dispatched on the required default ref. Dispatch
-to any other ref fails the job. Those runs
+head; a comment's (`issue_comment`) or a review's (`workflow_run`) run leaves
+its check run on the default branch's tip. Those runs
 post the status and then re-run the head's newest `pull_request_target` run
 (`actions: write`), so an APPROVE or a HOLD changes the head's check without a
 new push. A re-run that cannot be requested fails the job.
@@ -112,9 +110,6 @@ listing that is unreadable, malformed, or shorter than its `total_count`
 fails the job instead of standing in for the whole one.
 
 ## Trust
-
-Dispatch selects its workflow definition from the requested ref. The job fails
-when dispatch targets anything other than the default branch, before posting.
 
 - `pull_request_target` and `issue_comment` use the default branch's definition;
 - a review is different: `pull_request_review` runs the pull request's own
@@ -236,12 +231,6 @@ jobs:
 name: Review verdict
 
 on:
-  workflow_dispatch:
-    inputs:
-      pull_request:
-        description: Pull request number to evaluate
-        required: true
-        type: string
   pull_request_target:
     types: [opened, reopened, synchronize, ready_for_review]
   issue_comment:
@@ -260,7 +249,7 @@ permissions:
   actions: write
 
 concurrency:
-  group: review-verdict-${{ github.event.pull_request.number || github.event.inputs.pull_request || github.event.issue.number || github.event.workflow_run.pull_requests[0].number || github.event.check_run.pull_requests[0].number || github.event.workflow_run.head_sha || github.event.check_run.head_sha }}
+  group: review-verdict-${{ github.event.pull_request.number || github.event.issue.number || github.event.workflow_run.pull_requests[0].number || github.event.check_run.pull_requests[0].number || github.event.workflow_run.head_sha || github.event.check_run.head_sha }}
   cancel-in-progress: false
 
 jobs:
@@ -271,14 +260,6 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - name: Refuse dispatch outside the default branch
-        env:
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-        run: |
-          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] && { [ -z "$DEFAULT_BRANCH" ] || [ "$GITHUB_REF" != "refs/heads/$DEFAULT_BRANCH" ]; }; then
-            echo "review-verdict: dispatch must target the default branch" >&2
-            exit 1
-          fi
       - name: Check out the pinned rule
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

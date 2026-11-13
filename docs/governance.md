@@ -302,7 +302,7 @@ rather than printing an empty value. It refuses (exit 1) a repository outside
 - the sha256 of each rendered file, the rulesets observed, and the
   first-evaluation sweep: every open, non-draft PR, marked `skip-existing`
   when its head already carries a `review-verdict` commit status or an
-  Actions `review-verdict` check run, and `workflow_dispatch` otherwise.
+  Actions `review-verdict` check run, and `pull_request_target` otherwise.
 
 `--through STEP` (any step name the plan prints) and `--no-enroll` (same as
 `--through audited`) mark which steps are included. `--gh-binary` selects the
@@ -316,6 +316,6 @@ unreadable. The merge steward's `approval_admission_config` invariant counts
 the switch as list membership. It is distinct from
 `arm_requires_head_approval = true`, which selects the strict
 `reviewer_identities` rule. Shipyard's own `review-verdict.yml` also
-accepts `workflow_dispatch` with a `pull_request` input only on the default
-branch; a dispatched run posts the status on the head and re-runs the head's
-own check, like a comment's run.
+uses only trusted default-branch event paths; existing heads are evaluated by
+their `pull_request_target` event or by the trusted comment and review
+re-evaluation paths.

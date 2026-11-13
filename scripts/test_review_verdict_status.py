@@ -407,7 +407,6 @@ class ReviewVerdictStatus(unittest.TestCase):
                       if line.strip().startswith("group: review-verdict-")]
             self.assertEqual(groups, [
                 "group: review-verdict-${{ github.event.pull_request.number || "
-                "github.event.inputs.pull_request || "
                 "github.event.issue.number || github.event.workflow_run.pull_requests[0].number "
                 "|| github.event.check_run.pull_requests[0].number "
                 "|| github.event.workflow_run.head_sha || github.event.check_run.head_sha }}"],
@@ -484,52 +483,6 @@ class ReviewVerdictStatus(unittest.TestCase):
                 self.assertIn(f"actions/runs?head_sha={HEAD}&event=pull_request_target", calls)
                 self.assertIn("-X POST repos/danielraffel/Shipyard/actions/runs/555/rerun", calls)
                 self.assertNotIn("/actions/runs/500/rerun", calls)
-
-    def test_a_dispatch_posts_on_the_head_and_re_runs_its_check(self) -> None:
-        # A dispatched run's own check run sits on the default branch's tip, like
-        # a comment's: it posts the status on the head, re-runs the head's run
-        # and exits 0, so the onboarding sweep never reads it as the head's check.
-        event = {"inputs": {"pull_request": "784"}}
-        result = self.post(self.answers(self.refused_trail()), "workflow_dispatch", event)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.posted()["url"], f"repos/{REPO}/statuses/{HEAD}")
-        self.assertIn("-X POST repos/danielraffel/Shipyard/actions/runs/555/rerun", self.calls())
-
-    def test_dispatch_on_other_or_missing_ref_fails_before_any_api_call(self) -> None:
-        for ref in ("refs/heads/feature", "", "refs/tags/main"):
-            for inputs in ({}, {"pull_request": "784"}):
-                with self.subTest(ref=ref, inputs=inputs):
-                    result = self.post(self.answers(self.refused_trail()), "workflow_dispatch",
-                                       {"inputs": inputs}, ref=ref)
-                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-                    self.assertIn("dispatch", result.stderr)
-                    self.assertFalse((self.root / "calls").exists())
-
-    def test_dispatch_with_unreadable_default_branch_fails_closed(self) -> None:
-        for repository in (None, {}, {"default_branch": ""}, {"default_branch": 1}):
-            with self.subTest(repository=repository):
-                result = self.post(self.answers(self.refused_trail()), "workflow_dispatch",
-                                   {"inputs": {"pull_request": "784"}, "repository": repository})
-                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertFalse((self.root / "calls").exists())
-
-    def test_a_dispatch_names_a_pull_request_only_by_a_positive_decimal(self) -> None:
-        import importlib.util
-        spec = importlib.util.spec_from_file_location("review_verdict_status", STATUS)
-        assert spec is not None and spec.loader is not None
-        status = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(status)
-        self.assertNotIn("workflow_dispatch", status.HEAD_CHECK_EVENTS)
-        self.assertEqual(status.event_target("workflow_dispatch",
-                                             {"inputs": {"pull_request": "784"}}), (784, None))
-        for inputs in ({}, {"pull_request": ""}, {"pull_request": "abc"},
-                       {"pull_request": "-3"}, {"pull_request": "0"}, {"pull_request": "1e3"},
-                       {"pull_request": " 7"}, {"pull_request": "\u0663"},
-                       {"pull_request": 784}, {"pull_request": True}):
-            with self.subTest(inputs=inputs):
-                self.assertEqual(status.event_target("workflow_dispatch", {"inputs": inputs}),
-                                 (None, None))
-        self.assertEqual(status.event_target("workflow_dispatch", {}), (None, None))
 
     def test_a_held_pull_request_on_a_later_page_still_fails_the_head(self) -> None:
         # The 101st open pull request on a shared head is on page two; its HOLD
@@ -627,33 +580,23 @@ class ReviewVerdictStatus(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("error", result.stderr)
 
-    def test_each_workflow_dispatch_guard_fails_the_job_off_default(self) -> None:
+    def test_review_verdict_cannot_be_manually_dispatched(self) -> None:
         root = STATUS.parent.parent
         paths = (root / ".github/workflows/review-verdict.yml",
                  root / "src/governance_onboard.rs",
                  root / "docs/review-verdict-status.md")
         for path in paths:
             content = path.read_text(encoding="utf-8")
-            step = content.split("      - name: Refuse dispatch outside the default branch\n", 1)[1]
-            shell = step.split("        run: |\n", 1)[1].split("      - name:", 1)[0]
-            shell = "\n".join(line[10:] for line in shell.splitlines())
-            for event, ref, default, expected in (
-                ("workflow_dispatch", "refs/heads/topic", "main", 1),
-                ("workflow_dispatch", "", "main", 1),
-                ("workflow_dispatch", "refs/heads/main", "", 1),
-                ("workflow_dispatch", "refs/heads/main", "main", 0),
-                ("pull_request_target", "refs/heads/topic", "main", 0),
-            ):
-                with self.subTest(path=path, event=event, ref=ref, default=default):
-                    result = subprocess.run(["/bin/sh", "-c", shell], env={
-                        "GITHUB_EVENT_NAME": event, "GITHUB_REF": ref,
-                        "DEFAULT_BRANCH": default}, capture_output=True, text=True, check=False)
-                    self.assertEqual(result.returncode, expected, result.stderr)
+            self.assertNotIn("workflow_dispatch", content, path)
+            self.assertNotIn("Refuse dispatch outside the default branch", content, path)
+        workflow = (root / ".github/workflows/review-verdict.yml").read_text(encoding="utf-8")
+        self.assertIn("pull_request_target:", workflow)
+        self.assertIn("workflow_run:", workflow)
 
     def test_the_workflow_can_re_run_and_still_runs_on_verdicts(self) -> None:
         root = STATUS.parent.parent / ".github" / "workflows"
         workflow = (root / "review-verdict.yml").read_text(encoding="utf-8")
-        for needed in ("workflow_dispatch:", "pull_request:", "pull_request_target:",
+        for needed in ("pull_request_target:",
                        "issue_comment:", "workflow_run:",
                        "actions: write", "scripts/review_verdict_status.py"):
             self.assertIn(needed, workflow)

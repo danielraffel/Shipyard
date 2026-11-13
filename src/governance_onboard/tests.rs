@@ -189,9 +189,9 @@ fn the_rendered_workflow_runs_the_pinned_shipyard_commit() {
         !rendered.contains("ref: ${{ github.event.repository.default_branch }}"),
         "{rendered}"
     );
-    assert!(rendered.contains("DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}"));
+    assert!(!rendered.contains("DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}"));
     assert!(!rendered.contains("@COMMIT@") && !rendered.contains("@VERSION@"));
-    assert!(rendered.contains("  workflow_dispatch:\n    inputs:\n      pull_request:\n"));
+    assert!(!rendered.contains("workflow_dispatch"));
 }
 
 #[test]
@@ -383,7 +383,7 @@ fn the_sweep_skips_heads_that_already_carry_a_verdict() {
         vec![
             (1, "skip-existing"),
             (2, "skip-existing"),
-            (3, "workflow_dispatch")
+            (3, "pull_request_target")
         ],
         "a draft is never swept"
     );
@@ -403,7 +403,7 @@ fn a_check_run_from_another_app_does_not_count() {
     );
     let pulls = read_all_pages(&fake, &format!("repos/{REPO}/pulls?state=open")).expect("pulls");
     let rows = sweep_rows(&fake, REPO, &pulls).expect("sweep");
-    assert_eq!(rows[2].trigger, "workflow_dispatch");
+    assert_eq!(rows[2].trigger, "pull_request_target");
     assert_eq!(rows[2].check_run_id, None);
 }
 
