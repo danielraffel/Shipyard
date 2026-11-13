@@ -30,7 +30,6 @@ use serde::{Deserialize, Serialize};
 
 use super::infra_rerun::{self, record_key};
 use super::{PrReport, RepoObservation, StewardLedger};
-use crate::merge_steward::StewardCheck;
 
 /// Distinct pull requests failing the same way that make an episode.
 pub(crate) const MIN_PRS: usize = 3;

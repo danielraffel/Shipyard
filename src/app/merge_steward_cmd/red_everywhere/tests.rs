@@ -6,7 +6,7 @@ use crate::app::merge_steward_cmd::blocked_on::Stall;
 use crate::app::merge_steward_cmd::infra_rerun::Record;
 use crate::app::merge_steward_cmd::next_action::{Actor, NextAction};
 use crate::merge_steward::{
-    CapacityPreemptionPolicy, RequiredCheck, StewardCheckSource, StewardDecision,
+    CapacityPreemptionPolicy, RequiredCheck, StewardCheck, StewardCheckSource, StewardDecision,
     StewardPullRequest,
 };
 
@@ -445,7 +445,13 @@ fn observe_before_mutation_holds_a_new_episode_and_releases_a_recovered_head() {
         pr.fact.checks[0].conclusion = Some("SUCCESS".to_owned());
     }
     let reds_later = reds(&recovered, &ledger, "review-verdict", &[]);
-    observe(Mode::Enforce, &recovered, &reds_later, &mut ledger, T0 + 300);
+    observe(
+        Mode::Enforce,
+        &recovered,
+        &reds_later,
+        &mut ledger,
+        T0 + 300,
+    );
     for pr in [12147, 12152, 12160] {
         assert_eq!(
             held(Mode::Enforce, &ledger, &recovered.repo, pr, &head(pr)),
