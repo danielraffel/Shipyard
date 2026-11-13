@@ -1452,3 +1452,42 @@ fn a_red_required_check_outranks_a_pending_one_in_the_report() {
     policy.ejection_guards = crate::merge_steward::EjectionGuards::default();
     assert_eq!(read(&policy).blocked_on, "required_pending");
 }
+
+#[test]
+fn a_pr_error_is_serialized_with_its_kind() {
+    let pr = |error: Option<&str>| PrReport {
+        number: 1,
+        head_sha: HEAD.to_owned(),
+        decision: StewardDecision::ArmMergeQueue,
+        mutation: None,
+        error: error.map(str::to_owned),
+        blocked: Stall::default(),
+    };
+    let kind = |error: Option<&str>| {
+        let value = serde_json::to_value(pr(error)).expect("serialize");
+        // The wire shape keeps every existing field.
+        assert_eq!(value["number"], 1);
+        assert!(value.get("blocked_on").is_some());
+        value["error_kind"].clone()
+    };
+    for read in [
+        "queue-arm-guard: cannot read live PR state: gh: HTTP 503 refusing to land it unreviewed",
+        "pull-request handoff preflight failed: gh api repos/o/r/pulls/1 failed: gh: HTTP 503",
+        "current-head check identities failed after one retry: gh api x timed out after 15000ms",
+        "queue entry not judged, dequeue deferred: head approval unreadable: gh api y",
+        "gh api failed: Remote end closed connection without response",
+        "gh: HTTP 429 secondary rate limit",
+    ] {
+        assert_eq!(kind(Some(read)), "read", "{read}");
+    }
+    for policy in [
+        "needs an exact-head approval",
+        "carries 1 commit(s) of #6 not on main",
+        "dequeue deferred",
+    ] {
+        assert_eq!(kind(Some(policy)), "policy", "{policy}");
+    }
+    // No error, no kind.
+    assert!(kind(None).is_null());
+    assert_eq!(classify_pr_error("HTTP 404 not found"), ErrorKind::Policy);
+}

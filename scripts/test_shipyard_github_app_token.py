@@ -749,6 +749,68 @@ class GitHubAppTokenHelperTests(unittest.TestCase):
         self.assertEqual(urlopen.call_count, 2)
         sleep.assert_called_once_with(1)
 
+    def test_api_request_retries_a_connection_dropped_while_reading_the_response(self) -> None:
+        import http.client
+
+        request = shipyard_github_app_token.urllib.request.Request(
+            "https://api.github.com/test"
+        )
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b'{"id":123}'
+        for dropped in (
+            http.client.RemoteDisconnected("Remote end closed connection without response"),
+            ConnectionResetError(104, "Connection reset by peer"),
+            http.client.IncompleteRead(b"{"),
+            TimeoutError("read timed out"),
+        ):
+            with self.subTest(error=type(dropped).__name__):
+                with mock.patch.object(
+                    shipyard_github_app_token.urllib.request,
+                    "urlopen",
+                    side_effect=[dropped, response],
+                ) as urlopen, mock.patch.object(
+                    shipyard_github_app_token.time,
+                    "sleep",
+                ) as sleep:
+                    payload = shipyard_github_app_token.api_request(request, "jwt")
+                self.assertEqual(payload, {"id": 123})
+                self.assertEqual(urlopen.call_count, 2)
+                sleep.assert_called_once_with(1)
+
+    def test_api_request_gives_up_on_a_persistent_drop_with_a_helper_error(self) -> None:
+        import http.client
+
+        request = shipyard_github_app_token.urllib.request.Request(
+            "https://api.github.com/test"
+        )
+        attempts = len(shipyard_github_app_token.API_RETRY_DELAYS_SECONDS) + 1
+        with mock.patch.object(
+            shipyard_github_app_token.urllib.request,
+            "urlopen",
+            side_effect=http.client.RemoteDisconnected("closed"),
+        ) as urlopen, mock.patch.object(
+            shipyard_github_app_token.time,
+            "sleep",
+        ) as sleep:
+            with self.assertRaises(shipyard_github_app_token.HelperError) as ctx:
+                shipyard_github_app_token.api_request(request, "jwt")
+        self.assertEqual(urlopen.call_count, attempts)
+        self.assertEqual(sleep.call_count, attempts - 1)
+        self.assertIn("RemoteDisconnected", str(ctx.exception))
+
+    def test_a_certificate_failure_is_not_retried_as_a_dropped_connection(self) -> None:
+        request = shipyard_github_app_token.urllib.request.Request(
+            "https://api.github.com/test"
+        )
+        failure = shipyard_github_app_token.ssl.SSLCertVerificationError("bad cert")
+        with mock.patch.object(
+            shipyard_github_app_token.urllib.request, "urlopen", side_effect=failure
+        ) as urlopen, mock.patch.object(shipyard_github_app_token.time, "sleep") as sleep:
+            with self.assertRaises(shipyard_github_app_token.ssl.SSLCertVerificationError):
+                shipyard_github_app_token.api_request(request, "jwt")
+        self.assertEqual(urlopen.call_count, 1)
+        sleep.assert_not_called()
+
     def test_api_request_does_not_retry_permission_failure(self) -> None:
         request = shipyard_github_app_token.urllib.request.Request(
             "https://api.github.com/test"

@@ -13,6 +13,7 @@ import base64
 import datetime
 import errno
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -55,6 +56,14 @@ INSTALLATION_SCOPE = "installation"
 REPOSITORY_SCOPE = "repository"
 RETRYABLE_HTTP_STATUS = frozenset({429, 502, 503, 504})
 API_RETRY_DELAYS_SECONDS = (1, 2, 3)
+# urllib wraps only errors raised while sending the request in URLError; a
+# connection dropped while the response is read escapes it unwrapped.
+TRANSIENT_CONNECTION_ERRORS = (
+    http.client.RemoteDisconnected,
+    http.client.IncompleteRead,
+    ConnectionResetError,
+    TimeoutError,
+)
 WRITER_DOMAIN_LOCK_NAME = ".sandbox-writer-domain.lock"
 WRITER_DOMAIN_TURNSTILE_NAME = ".sandbox-writer-domain.turnstile.lock"
 WRITER_DOMAIN_OVERLAP_CLASSIFICATION = "sandbox_writer_domain_overlap"
@@ -814,6 +823,14 @@ def api_request(request: urllib.request.Request, jwt: str) -> dict[str, Any]:
                 transient_retries += 1
                 continue
             raise HelperError(f"GitHub API request failed: {error.reason}") from error
+        except TRANSIENT_CONNECTION_ERRORS as error:
+            if transient_retries < len(API_RETRY_DELAYS_SECONDS):
+                time.sleep(API_RETRY_DELAYS_SECONDS[transient_retries])
+                transient_retries += 1
+                continue
+            raise HelperError(
+                f"GitHub API request failed: {type(error).__name__}: {error}"
+            ) from error
     try:
         payload = json.loads(body)
     except json.JSONDecodeError as error:
