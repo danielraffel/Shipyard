@@ -91,6 +91,19 @@ as `shipyard landing --pr <n>` (see `docs/landing-model.md`).
 A GraphQL body read from stdin (`--input -`, `query=@-`) cannot be inspected
 and is refused as ambiguous.
 
+**One retry for a read that failed on the wire.** Every GitHub read the guard
+makes (`run_real_gh`: the live-state query, the pull request, its comments
+and reviews, compares, check runs) is retried exactly once, two seconds
+later, when `gh` fails with an HTTP 502, 503 or 504, a dropped or reset
+connection (`RemoteDisconnected`), or a timeout, and only when the request can
+do nothing but read (`api`, GET, no `--input`, and a GraphQL document that is
+a query, never a mutation). The retry is noted on stderr
+(`queue-arm-guard: note: ... retrying once`). A 4xx is an answer and is not
+retried; a `gh` that cannot run is not retried; and when the retry fails too
+the guard refuses as before, with `(after one retry)` on the message. One 503
+a pass apart otherwise reads as a policy refusal of an approved head
+(Shipyard#1309).
+
 ### A tiered required check must prove its full lane
 
 A repository can gate an expensive lane behind a fleet-App dispatch. On a
