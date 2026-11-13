@@ -152,19 +152,31 @@ def load_ticks(log_dir, start, end):
             rows = {}
             for p in r["prs"]:
                 na = p.get("next_action") or {}
-                blob = " ".join(str(x) for x in (p.get("blocked_on"), p.get("blocked_detail"),
-                                                 json.dumps(p.get("decision"))))
                 rows[p["number"]] = {
                     "head": p.get("head_sha"), "token": p.get("blocked_on") or "unknown",
                     "actor": na.get("actor"), "stop": bool(na.get("stop")),
                     "since": parse_iso(p.get("since")),
                     "sup_detected": bool(p.get("superseded")),
-                    "red_everywhere": "red_everywhere" in blob,
+                    "red_everywhere": _red_everywhere(p),
                 }
             per_repo[r["repo"]].append((t, rows))
     for v in per_repo.values():
         v.sort(key=lambda x: x[0])
     return per_repo, st
+
+
+def _red_everywhere(p):
+    """True only when the row names red_everywhere as a token or detail, or its
+    decision carries a true `red_everywhere` boolean. A decision of
+    {"red_everywhere": false} is a negative, never a hit."""
+    if p.get("blocked_on") == "red_everywhere":
+        return True
+    if "red_everywhere" in str(p.get("blocked_detail") or ""):
+        return True
+    d = p.get("decision")
+    if isinstance(d, dict):
+        return d.get("red_everywhere") is True
+    return isinstance(d, str) and "red_everywhere" in d
 
 
 # --------------------------------------------------------------- episodes
@@ -233,7 +245,9 @@ def load_github_cache(path):
         for it in items:
             if not isinstance(it, dict):
                 continue
-            if "issue_url" in it and "id" in it:
+            # an issue comment: not a pull-request or issue object, which also carry issue_url
+            if ("issue_url" in it and "id" in it and "body" in it
+                    and not any(k in it for k in ("number", "base", "head", "merged_at"))):
                 m = re.search(r"/repos/([^/]+/[^/]+)/issues/(\d+)$", it["issue_url"])
                 if m:
                     comments[it["id"]] = (m.group(1), int(m.group(2)), parse_iso(it.get("created_at")), it.get("body") or "")
