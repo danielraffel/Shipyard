@@ -71,6 +71,11 @@ pub(super) struct Stall {
     /// another way ([`super::superseded`]). Never changes `blocked_on`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub superseded: Option<super::superseded::Evidence>,
+    /// This head fails a required check the same way as other open pull
+    /// requests: a base-level episode ([`super::red_everywhere`]). Never
+    /// changes `blocked_on`; `repair_skip` is set under enforce.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub red_everywhere: Option<super::red_everywhere::RowMark>,
 }
 
 /// The HOLD behind a `held` token.
@@ -776,6 +781,7 @@ fn approval_blocked(blocker: &ApprovalBlocker, green_since: Option<String>) -> (
             held_by,
             next_action: None,
             superseded: None,
+            red_everywhere: None,
         },
         hint,
     )
@@ -969,6 +975,7 @@ fn dated(
             held_by: None,
             next_action: None,
             superseded: None,
+            red_everywhere: None,
         },
         hint,
     )

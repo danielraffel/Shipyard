@@ -185,6 +185,11 @@ struct RepoReport {
     /// ([`infra_rerun`]). Absent when the repository was not observed.
     #[serde(skip_serializing_if = "Option::is_none")]
     infra_rerun: Option<infra_rerun::RepoStatus>,
+    /// The same required check failing the same test on many open pull
+    /// requests: base-level episodes ([`red_everywhere`]). Absent when the
+    /// repository was not observed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    red_everywhere: Option<red_everywhere::RepoStatus>,
     /// The tick-start invariants ([`invariants`]): `{id, ok, detail, fix}`
     /// per check. Absent when they are off or the repository was not
     /// observed.
@@ -269,6 +274,10 @@ struct StewardLedger {
     /// `repo|check|step`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     infra_outages: BTreeMap<String, infra_rerun::OutageSeen>,
+    /// Red-everywhere episodes keyed `repo|check|test`: first sighting and
+    /// member heads. See `red_everywhere`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    red_everywhere: BTreeMap<String, red_everywhere::Episode>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1778,6 +1787,7 @@ fn deferred_rate_limit_repo_report(
         exit_reasons: Vec::new(),
         dwell: None,
         infra_rerun: None,
+        red_everywhere: None,
         invariants: Vec::new(),
     }
 }
@@ -1809,6 +1819,7 @@ fn unreadable_repo_report(
         exit_reasons: Vec::new(),
         dwell: None,
         infra_rerun: None,
+        red_everywhere: None,
         invariants: Vec::new(),
     }
 }
@@ -1890,6 +1901,7 @@ fn append_unmatched_recovery_errors(
             exit_reasons: Vec::new(),
             dwell: None,
             infra_rerun: None,
+            red_everywhere: None,
             invariants: Vec::new(),
         });
     }
@@ -1931,6 +1943,7 @@ fn persist_final_ledger(
             exit_reasons: Vec::new(),
             dwell: None,
             infra_rerun: None,
+            red_everywhere: None,
             invariants: Vec::new(),
         });
     }
@@ -2090,6 +2103,7 @@ mod pr_mutations;
 pub(super) mod queue_drain;
 mod queue_priority_recovery;
 pub(super) mod read_probe;
+mod red_everywhere;
 mod render;
 mod resume_record;
 mod shadow_ledger;

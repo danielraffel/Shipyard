@@ -4474,6 +4474,17 @@ See `docs/automated-draining.md` "Ejection guards". The `ghapp`
 Python guard does not mirror this class, so do not expect a manual `ghapp` arm
 of such a head to pass.
 
+**A row marked `red_everywhere` is a base-level failure, not yours to repair.**
+When one required check fails the same test on three or more open pull requests,
+the steward reports the episode in the repository's `red_everywhere` section and
+marks each member row (`red_everywhere: {check, test, prs, repair_skip}`), and the
+row's `next_action` reads "Failing on N PRs with the same test ... do not repair
+this PR, wait for the base fix or merge main once main is green". Do that: wait
+for the fix on the base, then merge the base once and push once. `[auto_merge]
+red_everywhere` is `shadow` by default; under `enforce` an unchanged member head
+is not enqueued (`held_red_everywhere:<check>`) and `repair_skip` is true. See
+`docs/automated-draining.md` "Red everywhere".
+
 **One same-head re-enqueue after an ENVIRONMENT ejection needs no new push**
 when the repo sets `[queue.environment_requeue] enabled = true`: every failing
 required check on the removal's merge-group commit must be an Actions job whose

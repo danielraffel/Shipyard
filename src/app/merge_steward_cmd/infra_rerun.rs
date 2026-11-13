@@ -153,6 +153,10 @@ pub(super) struct Record {
     /// Failing step of the red last judged.
     #[serde(default)]
     pub(super) step: String,
+    /// Failing test names the diagnosis of the red last judged named (sorted),
+    /// for red-everywhere grouping ([`super::red_everywhere`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) tests: Vec<String>,
     /// Errors on the red last judged.
     #[serde(default)]
     pub(super) errors: u32,
@@ -273,6 +277,35 @@ fn latest_checks(checks: &[StewardCheck]) -> Vec<&StewardCheck> {
 
 fn is(value: Option<&str>, expected: &str) -> bool {
     value.is_some_and(|value| value.eq_ignore_ascii_case(expected))
+}
+
+/// Every failed required check on each open pull request's current head:
+/// the newest observation of each name, completed `FAILURE`, from a check run
+/// or a commit status, with or without Actions ids, not the approval context,
+/// on a pull request not excluded. Unlike [`candidates`] it keeps checks no
+/// re-run could act on, because red-everywhere grouping
+/// ([`super::red_everywhere`]) needs every red. Reads nothing.
+pub(super) fn failed_required<'a>(
+    observation: &'a RepoObservation,
+    approval_context: &str,
+    excluded_labels: &[String],
+) -> Vec<(&'a ObservedPr, &'a StewardCheck)> {
+    let mut out = Vec::new();
+    for pr in &observation.prs {
+        if pr_excluded(pr, excluded_labels) {
+            continue;
+        }
+        for check in latest_checks(&pr.fact.checks) {
+            if is(Some(&check.status), "completed")
+                && is(check.conclusion.as_deref(), "failure")
+                && !is_approval_context(&check.name, approval_context)
+                && required(check, &observation.required_checks)
+            {
+                out.push((pr, check));
+            }
+        }
+    }
+    out
 }
 
 /// Every failed required Actions check on a current head that may be infra:
@@ -576,6 +609,15 @@ fn step_of(doc: &Diagnosis, run_id: u64, check: &str) -> String {
     }
 }
 
+fn tests_of(doc: &Diagnosis, run_id: u64, check: &str) -> Vec<String> {
+    let mut names = diagnosis_of(doc, run_id, check)
+        .map(|item| item.failing_tests.names.clone())
+        .unwrap_or_default();
+    names.sort();
+    names.dedup();
+    names
+}
+
 fn rule_of(doc: &Diagnosis, run_id: u64, check: &str) -> String {
     diagnosis_of(doc, run_id, check)
         .map(|item| format!("{}/{}", item.classification.class, item.classification.rule))
@@ -600,6 +642,10 @@ fn record_for<'a>(
     record.check.clone_from(&candidate.check);
     if record.judged_check_id != Some(candidate.check_id) {
         record.errors = 0;
+        // A newer red: the older red's test names no longer describe it. They
+        // come back only from this red's own diagnosis, so a failed diagnosis
+        // never leaves stale names under a matching id (red_everywhere).
+        record.tests.clear();
     }
     record.judged_check_id = Some(candidate.check_id);
     record
@@ -785,6 +831,7 @@ pub(super) fn sweep(
                     record.reruns = record.reruns.max(MAX_RERUNS);
                     "capped".clone_into(&mut record.verdict);
                     record.step = step_of(&doc, run_id, &candidate.check);
+                    record.tests = tests_of(&doc, run_id, &candidate.check);
                     record.why = format!(
                         "re-run {MAX_RERUNS} times and still {}",
                         rule_of(&doc, run_id, &candidate.check)
@@ -797,6 +844,7 @@ pub(super) fn sweep(
                     let record = record_for(ledger, repo, candidate);
                     "declined".clone_into(&mut record.verdict);
                     record.step = step_of(&doc, run_id, &candidate.check);
+                    record.tests = tests_of(&doc, run_id, &candidate.check);
                     record.why.clone_from(&reason);
                     push(&mut status, candidate, "declined", reason.clone());
                 }
@@ -819,8 +867,10 @@ pub(super) fn sweep(
                 for candidate in &members {
                     let rule = rule_of(&doc, run_id, &candidate.check);
                     let step = step_of(&doc, run_id, &candidate.check);
+                    let tests = tests_of(&doc, run_id, &candidate.check);
                     let record = record_for(ledger, repo, candidate);
                     record.step.clone_from(&step);
+                    record.tests = tests;
                     record.why.clone_from(&rule);
                     if spent {
                         "capped".clone_into(&mut record.verdict);

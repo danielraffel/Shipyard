@@ -37,7 +37,12 @@
 //! red_check_outranks_pending = true   # default: on when the base has a merge queue
 //! infra_only_same_head_retry = true   # default: on when the base has a merge queue
 //! known_flaky_tests = ["ui-script-plugin-editor-au"]  # names or `*` globs
+//! red_everywhere = "shadow"           # off | shadow (default) | enforce
 //! ```
+//!
+//! `red_everywhere` is not an ejection guard but lives in the same table: it
+//! reports (and under `enforce` holds) pull requests that fail a required
+//! check the same way as two or more others, a base-level cause.
 //!
 //! The batch guard needs `generated_paths`; with none listed it never defers.
 
@@ -56,6 +61,45 @@ pub const INFRA_ONLY_RETRY_KEY: &str = "infra_only_same_head_retry";
 /// Test or check names (or `*` globs) whose failure earns the retry under
 /// the discipline ([`EjectionGuards::known_flaky_tests`]).
 pub const KNOWN_FLAKY_TESTS_KEY: &str = "known_flaky_tests";
+/// The red-everywhere mode: `off`, `shadow` (default) or `enforce`.
+pub const RED_EVERYWHERE_KEY: &str = "red_everywhere";
+
+/// What the steward does when the same required check fails the same way on
+/// many open pull requests (`[auto_merge] red_everywhere`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RedEverywhereMode {
+    /// Nothing.
+    Off,
+    /// Report episodes and mark member rows. The default.
+    #[default]
+    Shadow,
+    /// As shadow, and hold a member's unchanged head from the queue.
+    Enforce,
+}
+
+impl RedEverywhereMode {
+    /// Parse `off`, `shadow` or `enforce`; anything else is `None`.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "off" => Some(Self::Off),
+            "shadow" => Some(Self::Shadow),
+            "enforce" => Some(Self::Enforce),
+            _ => None,
+        }
+    }
+
+    /// The config value.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Shadow => "shadow",
+            Self::Enforce => "enforce",
+        }
+    }
+}
 
 /// The ejection guards one base runs under.
 ///
@@ -77,6 +121,10 @@ pub struct EjectionGuards {
     /// failing steps name only these tests (or whose check is one), and whose
     /// check passed on the head, still earns the one same-head retry.
     pub known_flaky_tests: Vec<String>,
+    /// What the steward does when the same required check fails the same way
+    /// on many open pull requests (`[auto_merge] red_everywhere`). Shadow
+    /// unless the base config says otherwise; an unknown value keeps shadow.
+    pub red_everywhere: RedEverywhereMode,
     /// The base-poison admission hold and fix fast-track, from the base
     /// config's `[base_health]` table ([`crate::base_health::BasePoisonPolicy`]).
     pub base_poison: crate::base_health::BasePoisonPolicy,
@@ -97,6 +145,7 @@ impl EjectionGuards {
             red_outranks_pending: merge_queue,
             infra_only_retry: merge_queue,
             known_flaky_tests: Vec::new(),
+            red_everywhere: RedEverywhereMode::Shadow,
             base_poison: crate::base_health::BasePoisonPolicy::for_base(merge_queue),
             read_error: None,
         }
@@ -120,6 +169,13 @@ impl EjectionGuards {
         guards.batch_guard = flag(BATCH_GUARD_KEY, guards.batch_guard);
         guards.red_outranks_pending = flag(RED_OUTRANKS_PENDING_KEY, guards.red_outranks_pending);
         guards.infra_only_retry = flag(INFRA_ONLY_RETRY_KEY, guards.infra_only_retry);
+        if let Some(mode) = section
+            .get(RED_EVERYWHERE_KEY)
+            .and_then(toml::Value::as_str)
+            .and_then(RedEverywhereMode::parse)
+        {
+            guards.red_everywhere = mode;
+        }
         guards.known_flaky_tests = section
             .get(KNOWN_FLAKY_TESTS_KEY)
             .and_then(toml::Value::as_array)
