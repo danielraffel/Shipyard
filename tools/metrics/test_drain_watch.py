@@ -157,7 +157,7 @@ class DetectionTests(Base):
         (self.fleet / "repair.log").write_text(
             "ok\nPermissionError: [Errno 1] Operation not permitted: '/x/.cache/ghread/a'\nfine\n")
         (self.fleet / "reviewer.launchd.log").write_text("fleet-pass.sh: line 3: rg: command not found\nUnable to read current working directory\n")
-        (self.fleet / "reviewer.last-output.txt").write_text("Traceback (most recent call last):\n")
+        (self.fleet / "reviewer.log").write_text("Traceback (most recent call last):\n")
         self.args.from_start = True
         _, _, f = self.run_once()
         got = {(x["lane"], x["detail"]) for x in f}
@@ -166,6 +166,41 @@ class DetectionTests(Base):
         self.assertIn(("reviewer", "command not found x1"), got)
         self.assertIn(("reviewer", "Unable to read current working directory x1"), got)
         self.assertIn(("reviewer", "Traceback x1"), got)
+
+
+class TranscriptAndTimeTests(Base):
+    def test_transcripts_are_not_scanned_but_runner_lines_are(self):
+        (self.fleet / "repair.last-output.txt").write_text(
+            "the agent wrote: Traceback (most recent call last)\nand a getcwd error, quoting PermissionError\n")
+        (self.fleet / "repair.last-output.txt.codex-failed").write_text("Traceback\n")
+        (self.fleet / "repair.launchd.log").write_text("fleet-pass.sh: line 9: rg: command not found\n")
+        self.args.from_start = True
+        _, _, f = self.run_once()
+        self.assertEqual([(x["lane"], x["detail"]) for x in f], [("repair", "command not found x1")])
+
+    def test_timestamps_attribute_a_line_to_its_own_or_the_preceding_time(self):
+        log = self.fleet / "repair.log"
+        log.write_text("2026-11-13T10:00:00Z role=repair ok\n")
+        self.run_once()                                    # seed; last_run = NOW
+        old = "2026-11-10T09:00:00Z"
+        new = "2026-11-13T11:55:00Z"
+        with open(log, "a") as fh:
+            fh.write(f"{old} role=repair quoted old PermissionError\n"
+                     "  continuation line with Traceback\n"           # belongs to the old line
+                     f"{new} role=repair new getcwd failure\n"
+                     "  second line: Operation not permitted\n"       # belongs to the new line
+                     "role=repair untimestamped but after a new line: command not found\n")
+        _, _, f = self.run_once()
+        got = sorted(x["detail"] for x in f)
+        self.assertEqual(got, ["Operation not permitted x1", "command not found x1", "getcwd x1"])
+
+    def test_preceding_timestamp_carries_across_runs(self):
+        log = self.fleet / "repair.log"
+        log.write_text("2026-11-01T00:00:00Z old entry\n")
+        self.run_once()
+        with open(log, "a") as fh:
+            fh.write("  stack continues: Traceback\n")        # still the old entry's time
+        self.assertEqual(self.run_once(NOW + dt.timedelta(minutes=5))[2], [])
 
 
 class StateTests(Base):
