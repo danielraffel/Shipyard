@@ -38,7 +38,7 @@ INTENTIONAL = {"draft"}
 SYSTEM_WAIT = {
     "queued", "admitted", "ready", "deferred_pass_budget", "revalidating",
     "transient_rerun", "carried_commits_over_cap", "carried_commits_unreadable",
-    "capacity_queued",
+    "capacity_queued", "required_pending",
 }
 OWNER_STOP = {"excluded_label", "direct_merge_refused", "owner_decision"}
 
@@ -147,6 +147,7 @@ def load_ticks(log_dir, start, end):
         for r in repos:
             if "prs" not in r or r.get("errors"):
                 st["no_pr_list"] += 1
+                per_repo[r["repo"]].append((t, None))  # invalid tick: a gap, never a clear
                 continue
             rows = {}
             for p in r["prs"]:
@@ -172,6 +173,8 @@ def build_episodes(per_repo, gap):
     for repo, ticks in per_repo.items():
         open_ep, prev_t = {}, None
         for t, rows in ticks:
+            if rows is None:
+                continue  # unobserved interval: open episodes stay open
             if prev_t is not None and t - prev_t > gap:
                 gaps += 1
                 for ep in open_ep.values():
@@ -256,7 +259,7 @@ def build_report(log_dir, since, now, github=None, gap_minutes=120):
     eps, gaps = build_episodes(per_repo, dt.timedelta(minutes=gap_minutes))
     closed, comments = load_github_cache(github) if github else ({}, [])
     # PRs listed in a repo's last tick are open; GitHub cache decides the rest
-    last_open = {r: set(t[-1][1]) for r, t in per_repo.items()}
+    last_open = {r: set(([x for x in t if x[1] is not None] or [(None, {})])[-1][1]) for r, t in per_repo.items()}
     for e in eps:
         if e["pr"] in last_open.get(e["repo"], ()):
             e["outcome"] = "open"
@@ -334,10 +337,11 @@ def build_report(log_dir, since, now, github=None, gap_minutes=120):
 
     ticks_total = st["live_files"] + st["archive_files"]
     observed_days = sum(1 for dd in days if n_ticks_days.get(dd, 0))
-    window_cov = cov("available" if observed_days == len(days) and not gaps and not st["bad_archives"] else
+    window_cov = cov("available" if observed_days == len(days) and not gaps and not st["bad_archives"] and not st["no_pr_list"] else
                      "partial" if ticks_total else "unavailable",
                      f"{observed_days} of {len(days)} UTC days have tick files; {gaps} gap(s) over {gap_minutes} min; "
-                     f"{st['unreadable']} unreadable, {st['bad_archives']} unreadable archive(s)")
+                     f"{st['unreadable']} unreadable, {st['bad_archives']} unreadable archive(s), "
+                     f"{st['no_pr_list']} repo tick(s) with errors or no PR list treated as gaps")
     gh_cov = (cov("partial", f"cached GitHub reads: {len(closed)} closed PRs, {len(comments)} comments; the cache may not span the window")
               if github else cov("unavailable", "no --github cache: closed-unmerged and repaired/dispute comments are not read"))
     gh_null = lambda v: v if github else None
