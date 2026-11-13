@@ -1522,7 +1522,7 @@ fn push_via_handoff(
                 .current_dir(cwd)
                 .status()
                 .is_ok_and(|status| status.success());
-        if !merged && tip != head {
+        if !merged {
             return Err(format!(
                 "branch `{pr_branch}` already exists on `{}` with no matching `{HANDOFF_LABEL}` bot pull request and unmerged commits; refusing to overwrite it",
                 config.remote
@@ -3697,6 +3697,38 @@ app_client_id = "Iv1.abc"
         assert_eq!(
             remote_ref(&remote, "refs/heads/release/changelog-sync").as_deref(),
             Some(theirs.as_str())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handoff_refuses_an_unmerged_branch_even_when_its_tip_is_the_generated_head() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (repo, remote) = handoff_fixture(temp.path());
+        let config = HookConfig {
+            push_mode: String::from("handoff"),
+            ..HookConfig::default()
+        };
+        fs::write(repo.join("CHANGELOG.md"), "new\n").expect("write");
+        git(&repo, &["add", "CHANGELOG.md"]);
+        git(&repo, &["commit", "-m", "docs"]);
+        git(
+            &repo,
+            &["push", "origin", "HEAD:refs/heads/release/changelog-sync"],
+        );
+        let tip = remote_ref(&remote, "refs/heads/release/changelog-sync").expect("branch");
+        let api = |_: &Path, args: &[&str]| -> Result<Value, String> {
+            assert!(args[0].contains("/pulls?state=open"), "listing only");
+            Ok(serde_json::json!([]))
+        };
+        let mut result = HookResult::default();
+        let error =
+            push_via_handoff(&repo, &config, "v1", &mut result, &api, "o/r").expect_err("refused");
+        assert!(error.contains("release/changelog-sync"));
+        assert!(!result.pushed);
+        assert_eq!(
+            remote_ref(&remote, "refs/heads/release/changelog-sync").as_deref(),
+            Some(tip.as_str())
         );
     }
 
