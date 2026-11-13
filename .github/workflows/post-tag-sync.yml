@@ -12,7 +12,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: read
   pull-requests: write
 
 env:
@@ -45,11 +45,24 @@ jobs:
           echo "$GITHUB_WORKSPACE/target/release" >> "$GITHUB_PATH"
           target/release/shipyard --version
 
+      - name: Mint release App token
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          # Public client ID of the repository's release App. With no owner or
+          # repositories input the token is scoped to this repository only.
+          client-id: Iv23liTCzDQWqmMjkDTI
+          private-key: ${{ secrets.SHIPYARD_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-statuses: write
+          permission-workflows: write
 
       - name: Run post-tag docs sync
         shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN || secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
           # Git credentials for this step only; nothing is written to .git/config.

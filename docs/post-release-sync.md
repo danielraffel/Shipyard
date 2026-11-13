@@ -115,6 +115,39 @@ waits for required checks, revalidates the head/base, then calls GitHub's
 exact-head queue admission mutation. A workflow retry resumes that PR and head;
 it never force-pushes or leaves ordinary auto-merge authority attached.
 
+### `push_mode = "handoff"` (protected default branch)
+
+Direct mode pushes to the default branch, which a ruleset that requires checks
+and a review refuses (the push fails with `git push failed after N attempt(s)`).
+`handoff` is the mode for that case and mirrors `version-at-land.yml`:
+
+- The hook force-pushes the regenerated commit to one bot-owned branch
+  (`handoff_branch`, default `release/changelog-sync`) with a lease, so each
+  tag replaces the previous head. `CHANGELOG.md` is rebuilt from the whole tag
+  graph, so the single pull request is always cumulative.
+- It opens that pull request or updates the open one, labels it
+  `shipyard:managed`, posts the exact-head `shipyard/steward-handoff` status,
+  and exits. It never waits for checks, never enqueues and never merges: the
+  required checks, a reviewer's exact-head approval and the merge steward land
+  it. The commit carries the three `*: skip` trailers so its merge triggers no
+  version bump and no release.
+- The workflow mints a GitHub App installation token with
+  `actions/create-github-app-token` from `app_client_id` (the App's public
+  client ID, required in this mode) and the `SHIPYARD_APP_PRIVATE_KEY`
+  repository secret. The default workflow token is not used, because events it
+  causes start no workflows and the required checks would never run, and no
+  personal token is involved. The App needs Contents, Pull requests, Commit
+  statuses and Workflows write on the repository, the same as version-at-land.
+- Editing the workflow file is a workflow change, so the PR that switches a
+  repository to `handoff` may need the owner's admission.
+
+```toml
+[release.post_tag_hook]
+push_mode     = "handoff"
+app_client_id = "Iv23li..."          # public client ID of the release App
+# handoff_branch = "release/changelog-sync"
+```
+
 > **0.79 migration:** Existing PR-mode workflows that still run on
 > `ubuntu-latest` cannot mutate a merge queue after upgrading. Configure
 > `[merge_queue].mutation_machine` in trusted machine-global config, set the
@@ -123,7 +156,7 @@ it never force-pushes or leaves ordinary auto-merge authority attached.
 
 ## Best-effort semantics
 
-Docs sync never rolls back a tag. If the hook's command fails, the push races out, or rebase-retry exhausts, the GitHub Release still exists — only the follow-up commit is missing. Re-run `shipyard changelog regenerate` locally and open a normal PR to recover.
+Docs sync never rolls back a tag. If the hook's command fails, the push races out, rebase-retry exhausts, or (handoff) the changelog pull request has not landed yet, the GitHub Release still exists — only the follow-up commit is missing. Re-run `shipyard changelog regenerate` locally and open a normal PR to recover.
 
 ## Drift gate for CI
 
@@ -152,7 +185,7 @@ The byte-identical gate is the migration guarantee: pulp sees no output change.
 
 **CHANGELOG didn't update after tag landed.** Check the workflow run under "Actions" in GitHub. Common causes:
 
-- `RELEASE_BOT_TOKEN` missing or expired → run `shipyard doctor --release-chain`.
+- `RELEASE_BOT_TOKEN` missing or expired (direct mode) → run `shipyard doctor --release-chain`. In `handoff` mode check that `SHIPYARD_APP_PRIVATE_KEY` exists and the App has the four permissions above.
 - `only_for_tag_pattern` doesn't match (e.g., `plugin-v*` tags when pattern is `v*`).
 - Generator command exited non-zero → the step logs show the reason.
 

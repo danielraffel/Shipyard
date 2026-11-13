@@ -317,6 +317,20 @@ class ReleaseWorkflowTests(unittest.TestCase):
                     for step in self._steps(job)
                 ))
 
+    def test_post_tag_sync_never_pushes_to_protected_main(self) -> None:
+        # Main's ruleset requires checks only a pull request carries, so the
+        # changelog bot hands one coalesced PR to the steward instead of
+        # pushing, using a release App token (never the default or a PAT).
+        text = POST_TAG_SYNC_WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("actions/create-github-app-token@", text)
+        self.assertIn("secrets.SHIPYARD_APP_PRIVATE_KEY", text)
+        self.assertNotIn("secrets.GITHUB_TOKEN", text)
+        self.assertNotIn("RELEASE_BOT_TOKEN", text)
+        self.assertIn("permissions:\n  contents: read\n", text)
+        self.assertNotRegex(text, r"git push\b[^\n]*\bmain\b")
+        config = (ROOT / ".shipyard" / "config.toml").read_text(encoding="utf-8")
+        self.assertRegex(config, r'(?m)^push_mode\s*=\s*"handoff"')
+
     def test_release_path_actions_are_pinned_to_commit_shas(self) -> None:
         uses = re.compile(r"^\s*(?:- )?uses: ([^\s@]+)@(\S+)(.*)$")
         for workflow in (
