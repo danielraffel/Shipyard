@@ -479,6 +479,9 @@ class PageFilterTests(Base):
         self.run_once(NOW + dt.timedelta(minutes=1))
         self.assertEqual(self.state()["suppressed"]["2026-11-13"], {"non_required": 1})
 
+    def test_an_undated_queued_row_pages(self):
+        self.assertIsNone(dw.no_page_reason({"token": "queued", "loop": None, "since": None, "required": []}, NOW))
+
     def test_app_bound_required_label_matches_a_bare_token_context(self):
         self.assertIsNone(dw.no_page_reason(
             {"token": "required_failed:macos", "loop": None, "since": None, "required": ["macos (app_id=15368)"]}, NOW))

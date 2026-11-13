@@ -105,9 +105,10 @@ def no_page_reason(o, ref):
     # When the tick carries a scheduling-loop state it wins; the token is the fallback.
     state = o.get("loop") or o["token"]
     if state.split(":", 1)[0] in NEVER_PAGE_STATES:
-        if o.get("since") is None or ref - o["since"] < QUEUED_BOUND:
+        # Fail closed: an undated queued row cannot be shown to be young, so it pages.
+        if o.get("since") is not None and ref - o["since"] < QUEUED_BOUND:
             return "queued"
-        return None  # queued past the bound: the queue is stuck, so page
+        return None  # queued past the bound or undated: page
     ctxs = token_contexts(o["token"])
     required = {norm_ctx(c) for c in o.get("required") or []}
     # An unknown (empty) required list cannot prove a context is non-required.
