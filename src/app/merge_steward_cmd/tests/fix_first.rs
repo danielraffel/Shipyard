@@ -650,3 +650,153 @@ fn a_confirmed_context_without_a_red_time_exempts_nobody() {
         Admission::Hold { .. }
     ));
 }
+
+/// A queued head named or measured for one red context is paused while
+/// another context is also confirmed; only a head covering every confirmed
+/// context keeps its place.
+#[test]
+fn the_pause_keeps_only_a_head_that_covers_every_confirmed_context() {
+    let mut half = pr_with_greens(500, 'c', &[(CONTEXT, "2026-11-13T10:40:00Z")]);
+    half.fact.queue_position = Some(1);
+    let mut whole = pr_with_greens(
+        501,
+        'd',
+        &[
+            (CONTEXT, "2026-11-13T10:40:00Z"),
+            (OTHER, "2026-11-13T10:41:00Z"),
+        ],
+    );
+    whole.fact.queue_position = Some(2);
+    let mut poison = two_context_poison(&[half.clone(), whole.clone()], red_on_both());
+    poison.candidates.insert(500);
+    poison
+        .fixes
+        .insert(500, vec!["label `shipyard:unblock`".to_owned()]);
+    let queued = |position| StewardDecision::Queued { position };
+    assert!(matches!(
+        poison_pause::verdict(Some(&poison), &half.fact, &queued(1)),
+        Verdict::Pause { .. }
+    ));
+    assert_eq!(
+        poison_pause::verdict(Some(&poison), &whole.fact, &queued(2)),
+        Verdict::Keep
+    );
+}
+
+/// A check from another app never makes a head cover a context whose
+/// required rule pins GitHub Actions.
+#[test]
+fn coverage_needs_the_required_app_identity() {
+    let mut rollup_pr = pr_with_greens(502, 'e', &[(CONTEXT, "2026-11-13T10:40:00Z")]);
+    for check in &mut rollup_pr.fact.checks {
+        if check.name == CONTEXT {
+            check.app_id = Some(999);
+        }
+    }
+    let health = streak();
+    let tip = BTreeMap::from([(CONTEXT.to_owned(), tip_red())]);
+    let pinned = [crate::merge_steward::RequiredCheck {
+        context: CONTEXT.to_owned(),
+        app_id: Some(15_368),
+    }];
+    let (_, covering) = base_poison::green_head_fix(
+        std::slice::from_ref(&rollup_pr),
+        &pinned,
+        APPROVAL,
+        &health,
+        &tip,
+    );
+    assert!(covering.is_empty(), "{covering:?}");
+    let (_, unpinned) = base_poison::green_head_fix(
+        std::slice::from_ref(&rollup_pr),
+        &[],
+        APPROVAL,
+        &health,
+        &tip,
+    );
+    assert_eq!(unpinned.into_iter().collect::<Vec<_>>(), vec![502]);
+}
+
+/// A pass that cannot read the tip neither ends a `tip_red` episode nor
+/// lets it count as clean evidence: it stays open, marked partial, and a
+/// partial episode never enters the gate.
+#[test]
+fn an_unread_tip_keeps_the_tip_red_episode_open_and_out_of_the_gate() {
+    use crate::app::merge_steward_cmd::shadow_ledger;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let prs = [pr_408(), pr_409()];
+    let no_call = |argv: &[String]| -> Result<String, String> {
+        Err(format!("no call expected: {}", argv.join(" ")))
+    };
+    let record = |poison: &RepoPoison| {
+        shadow_ledger::record_pass(
+            dir.path(),
+            "Generous-Corp/vellum",
+            "main",
+            Some(poison),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &no_call,
+            Utc::now(),
+        )
+    };
+    let red = poison(PoisonHold::DryRun, &prs, streak(), tip_red());
+    let first = record(&red);
+    let open_rules = |report: &serde_json::Value| {
+        report["open"]
+            .as_array()
+            .expect("open")
+            .iter()
+            .map(|episode| episode["rule"].as_str().unwrap_or("").to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        open_rules(&first).contains(&"tip_red".to_owned()),
+        "{first}"
+    );
+    let unread = poison(
+        PoisonHold::DryRun,
+        &prs,
+        streak(),
+        TipReading {
+            error: Some("HTTP 502".to_owned()),
+            ..TipReading::default()
+        },
+    );
+    let second = record(&unread);
+    assert!(
+        second["ended_this_pass"]
+            .as_array()
+            .expect("ended")
+            .iter()
+            .all(|episode| episode["rule"] != "tip_red"),
+        "{second}"
+    );
+    let tip_red = second["open"]
+        .as_array()
+        .expect("open")
+        .iter()
+        .find(|episode| episode["rule"] == "tip_red")
+        .expect("still open");
+    assert_eq!(tip_red["partial"], true);
+    // Clear: it ends now, partial, and the gate does not count it.
+    let clear = RepoPoison {
+        health: MergeGroupHealth::Clear {
+            detail: "passed".to_owned(),
+            passed: vec![CONTEXT.to_owned()],
+            passed_by: BTreeMap::from([(CONTEXT.to_owned(), vec![409])]),
+        },
+        ..poison(PoisonHold::DryRun, &prs, streak(), tip_green())
+    };
+    let third = record(&clear);
+    let gate = third["gate"]
+        .as_array()
+        .expect("gate")
+        .iter()
+        .find(|gate| gate["rule"] == "tip_red")
+        .expect("tip_red gate")
+        .clone();
+    assert_eq!(gate["partial"], 1, "{gate}");
+    assert_eq!(gate["fires"], 0, "a partial episode is never evidence");
+    assert_eq!(third["fix_first"]["pick_repaired"], 0);
+}

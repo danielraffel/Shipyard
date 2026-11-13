@@ -82,14 +82,19 @@ pub(super) fn base_health_command<W: Write>(
     let reader = |gh_args: &[String]| actions.run_gh(gh_args).map_err(|error| error.to_string());
     let finding = base_health::read_latest(&reader, &repo, &workflow);
     let base = args.base.clone();
-    let merge_groups = match super::merge_steward_cmd::required_contexts(&actions, &repo, &base) {
-        Ok(contexts) => {
-            base_health::merge_group::read(&reader, &repo, &base, &contexts, Utc::now())
-        }
-        Err(detail) => base_health::merge_group::MergeGroupHealth::Unknown { detail },
-    };
+    let (merge_groups, required) =
+        match super::merge_steward_cmd::required_contexts(&actions, &repo, &base) {
+            Ok(contexts) => (
+                base_health::merge_group::read(&reader, &repo, &base, &contexts, Utc::now()),
+                contexts,
+            ),
+            Err(detail) => (
+                base_health::merge_group::MergeGroupHealth::Unknown { detail },
+                Vec::new(),
+            ),
+        };
     let advice = base_health::jump_advice(&repo, &finding, Utc::now())
-        .or_else(|| merge_group_advice(&reader, &repo, &base, &merge_groups));
+        .or_else(|| merge_group_advice(&reader, &repo, &base, &merge_groups, &required));
 
     let decision = if args.act {
         advice
@@ -207,17 +212,25 @@ fn merge_group_advice(
     repo: &str,
     base: &str,
     health: &base_health::merge_group::MergeGroupHealth,
+    required: &[crate::merge_steward::RequiredCheck],
 ) -> Option<JumpAdvice> {
     let poisoned = health.poisoned();
     let first = poisoned.first()?;
+    // Each context is read from the app its required rule names, the same
+    // identity the steward uses: a same-named check from another app never
+    // confirms poison.
     let tip_red = |context: &str| {
+        let app_id = required
+            .iter()
+            .find(|rule| rule.context == context)
+            .and_then(|rule| rule.app_id);
         reader(&[
             "api".to_owned(),
             fix_first::tip_check_path(repo, base, context),
         ])
         .ok()
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .is_some_and(|value| fix_first::parse_tip(&value, context, None).red)
+        .is_some_and(|value| fix_first::parse_tip(&value, context, app_id).red)
     };
     if !poisoned.iter().all(|poison| tip_red(&poison.context)) {
         return None;
@@ -643,10 +656,26 @@ mod tests {
         };
         let red = r#"{"check_runs":[{"id":2,"name":"provenance-verify","status":"completed","conclusion":"failure","completed_at":"2026-11-13T10:32:36Z","head_sha":"c"}]}"#;
         let green = r#"{"check_runs":[{"id":2,"name":"provenance-verify","status":"completed","conclusion":"success","completed_at":"2026-11-13T10:32:36Z","head_sha":"c"}]}"#;
-        let advice = merge_group_advice(&reader_with(red), "o/r", "main", &health);
+        let advice = merge_group_advice(&reader_with(red), "o/r", "main", &health, &[]);
         assert_eq!(advice.map(|advice| advice.pr), Some(409));
-        assert!(merge_group_advice(&reader_with(green), "o/r", "main", &health).is_none());
-        assert!(merge_group_advice(&reader_with(""), "o/r", "main", &health).is_none());
+        assert!(merge_group_advice(&reader_with(green), "o/r", "main", &health, &[]).is_none());
+        assert!(merge_group_advice(&reader_with(""), "o/r", "main", &health, &[]).is_none());
+        // A same-named check from another app never confirms poison when
+        // the required rule pins GitHub Actions.
+        let pinned = [crate::merge_steward::RequiredCheck {
+            context: "provenance-verify".to_owned(),
+            app_id: Some(15_368),
+        }];
+        let other_app = r#"{"check_runs":[{"id":2,"name":"provenance-verify","status":"completed","conclusion":"failure","completed_at":"2026-11-13T10:32:36Z","head_sha":"c","app":{"id":999}}]}"#;
+        let actions_app = r#"{"check_runs":[{"id":2,"name":"provenance-verify","status":"completed","conclusion":"failure","completed_at":"2026-11-13T10:32:36Z","head_sha":"c","app":{"id":15368}}]}"#;
+        assert!(
+            merge_group_advice(&reader_with(other_app), "o/r", "main", &health, &pinned).is_none()
+        );
+        assert_eq!(
+            merge_group_advice(&reader_with(actions_app), "o/r", "main", &health, &pinned)
+                .map(|advice| advice.pr),
+            Some(409)
+        );
     }
 
     #[test]
