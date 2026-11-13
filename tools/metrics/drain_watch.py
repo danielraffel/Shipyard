@@ -64,7 +64,7 @@ def classify(token, actor, stop):
         return "intentional"
     if stop or actor == "owner" or fam in OWNER_STOP:
         return "human_stop"
-    if fam in SYSTEM_WAIT or actor in ("steward", "nobody", "ci"):
+    if fam in SYSTEM_WAIT or actor in ("steward", "nobody", "ci", "reviewer", "operator"):
         return "normal_wait"
     return "actionable"
 

@@ -131,10 +131,17 @@ class EpisodeTests(Fixture):
         self.assertEqual(r["series_per_day"]["red_everywhere_episodes"]["2026-11-12"], 1)
         self.assertEqual(r["series_per_day"]["superseded_detected_episodes"]["2026-11-12"], 1)
 
-    def test_actor_change_inside_an_episode_keeps_it_actionable(self):
+    def test_ci_to_reviewer_episode_stays_a_normal_wait(self):
         t = dt.datetime(2026, 11, 12, 1, 0, tzinfo=UTC)
-        self.live(t, [(1, "a", "no_verdict", "ci", None)])
-        self.live(t + dt.timedelta(minutes=5), [(1, "a", "no_verdict", "reviewer", None)])
+        self.live(t, [(1, "a", "no_verdict", "ci", None), (2, "b", "x_token", "operator", None)])
+        self.live(t + dt.timedelta(minutes=5), [(1, "a", "no_verdict", "reviewer", None), (2, "b", "x_token", "reviewer", None)])
+        self.assertEqual(self.report()["totals"]["by_class"], {"normal_wait": 2})
+
+    def test_any_actionable_observation_makes_the_episode_actionable(self):
+        t = dt.datetime(2026, 11, 12, 1, 0, tzinfo=UTC)
+        self.live(t, [(1, "a", "x_token", "ci", None)])
+        self.live(t + dt.timedelta(minutes=5), [(1, "a", "x_token", "author", None)])
+        self.live(t + dt.timedelta(minutes=10), [(1, "a", "x_token", "ci", None)])
         self.assertEqual(self.report()["totals"]["by_class"], {"actionable": 1})
 
     def test_required_pending_is_a_normal_wait_whatever_the_actor(self):
