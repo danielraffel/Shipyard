@@ -24,6 +24,6 @@ shipyard changelog $ARGUMENTS
 
 ## Post-tag sync workflow
 
-After `shipyard changelog init`, run `shipyard release-bot hook install` to drop `.github/workflows/post-tag-sync.yml`. That workflow fires on tag push, installs shipyard, and runs `shipyard release-bot hook run` — which regenerates the CHANGELOG, commits with `[skip ci]` + the three skip trailers, and pushes back to main with a rebase-retry loop.
+After `shipyard changelog init`, run `shipyard release-bot hook install` to drop `.github/workflows/post-tag-sync.yml`. That workflow fires on tag push, installs shipyard, and runs `shipyard release-bot hook run` — which regenerates the CHANGELOG, commits with the three skip trailers, then either pushes to main with a rebase-retry loop and `[skip ci]` (`push_mode = "direct"`), or, on a protected main, opens or updates one coalesced bot PR for the merge steward (`push_mode = "handoff"`, the Shipyard repo's mode).
 
 The config block is the opt-in signal. No HTML marker, no state file, no `--adopt` flag. If you ran `init`, you opted in.
