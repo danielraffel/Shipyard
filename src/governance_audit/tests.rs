@@ -845,42 +845,57 @@ fn malformed_workflow_listing_is_unknown() {
     );
 }
 
-#[test]
-fn workflow_listing_paginates_at_the_api_default_page_size() {
-    let expected = compliant();
-    let repo = "example/compliant";
-    let mut reader = reader_for(&expected, repo);
-    let first_page_path = format!("repos/{repo}/contents/.github/workflows?ref=trunk");
-    let mut first_page = reader
-        .json
-        .remove(&first_page_path)
-        .expect("workflow listing");
-    let entries = first_page.as_array_mut().expect("array listing");
-    for index in 0..(30 - entries.len()) {
-        let path = format!(".github/workflows/filler-{index}.yml");
-        entries.push(json!({"name": format!("filler-{index}.yml"), "path": path}));
+fn pad_workflow_listing(reader: &mut FakeReader, repo: &str, total: usize) {
+    let path = format!("repos/{repo}/contents/.github/workflows?ref=trunk");
+    let mut listing = reader.json.remove(&path).expect("workflow listing");
+    let entries = listing.as_array_mut().expect("array listing");
+    for index in 0..total.saturating_sub(entries.len()) {
+        let file = format!(".github/workflows/filler-{index}.yml");
+        entries.push(json!({"name": format!("filler-{index}.yml"), "path": file}));
         reader.raw.insert(
-            format!("repos/{repo}/contents/{path}?ref=trunk"),
+            format!("repos/{repo}/contents/{file}?ref=trunk"),
             "name: filler\n".to_owned(),
         );
     }
-    reader.json.insert(first_page_path.clone(), first_page);
-    let extra_path = ".github/workflows/page-two.yml";
-    reader.json.insert(
-        format!("{first_page_path}&page=2"),
-        json!([{"name": "page-two.yml", "path": extra_path}]),
-    );
-    reader.raw.insert(
-        format!("repos/{repo}/contents/{extra_path}?ref=trunk"),
-        "name: page two\n".to_owned(),
-    );
+    reader.json.insert(path, listing);
+}
+
+#[test]
+fn large_workflow_listing_is_read_once_without_duplicates() {
+    let expected = compliant();
+    let repo = "example/compliant";
+    let mut reader = reader_for(&expected, repo);
+    pad_workflow_listing(&mut reader, repo, 104);
+    // The contents API ignores `page`: any paged request would return the
+    // same full listing, so the fetch must not page at all.
+    let path = format!("repos/{repo}/contents/.github/workflows?ref=trunk");
+    let full = reader.json.get(&path).cloned().expect("listing");
+    for page in 2..=4 {
+        reader
+            .json
+            .insert(format!("{path}&page={page}"), full.clone());
+    }
 
     let snapshot = fetch_snapshot(repo, &reader);
-    assert!(
-        snapshot
-            .workflows
-            .iter()
-            .any(|workflow| workflow.path == extra_path)
-    );
     assert!(!snapshot.read_errors.contains_key("workflows"));
+    let mut paths: Vec<_> = snapshot.workflows.iter().map(|w| w.path.clone()).collect();
+    let before = paths.len();
+    paths.sort();
+    paths.dedup();
+    assert_eq!(before, paths.len(), "workflows must not be duplicated");
+    assert!(before >= 100);
+}
+
+#[test]
+fn workflow_listing_at_the_api_cap_is_unknown() {
+    let expected = compliant();
+    let repo = "example/compliant";
+    let mut reader = reader_for(&expected, repo);
+    pad_workflow_listing(&mut reader, repo, 1000);
+    let snapshot = fetch_snapshot(repo, &reader);
+    assert!(snapshot.read_errors.contains_key("workflows"));
+    assert_eq!(
+        audit_row(&snapshot, &AuditPolicy::default(), Setting::ExactRefs).status,
+        AuditStatus::Unknown
+    );
 }
