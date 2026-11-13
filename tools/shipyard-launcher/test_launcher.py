@@ -44,8 +44,9 @@ def compile_launcher(app: pathlib.Path, testing: bool) -> pathlib.Path:
     return exe
 
 
-@unittest.skipUnless(ON_MAC, "needs macOS with xcrun swiftc")
-class LauncherTests(unittest.TestCase):
+class LauncherBase(unittest.TestCase):
+    """Builds the launchers once per class and a private home per test."""
+
     @classmethod
     def setUpClass(cls):
         cls.build = tempfile.TemporaryDirectory()
@@ -106,6 +107,10 @@ class LauncherTests(unittest.TestCase):
         path = self.home / "Library" / "Logs" / "shipyard-launcher.log"
         return path.read_text() if path.exists() else ""
 
+
+
+@unittest.skipUnless(ON_MAC, "needs macOS with xcrun swiftc")
+class LauncherTests(LauncherBase):
     # -- resolution and refusal ---------------------------------------------
 
     def test_runs_the_release_the_pointer_names(self):
@@ -339,6 +344,151 @@ class LauncherTests(unittest.TestCase):
         result = self.launch("--launcher-verify", launcher=self.prod_launcher)
         self.assertEqual(result.returncode, 77)
         self.assertIn("Developer ID", result.stderr)
+
+
+FAKE_OPEN = """#!/bin/bash
+# Stand-in for /usr/bin/open: answer the grant probe as a launchd-started launcher.
+echo "$*" >> "$FAKE_OPEN_LOG"
+[ -n "${FAKE_OPEN_FAILS:-}" ] && exit 1
+result="${@: -1}"
+printf '{"schema":1,"full_disk_access":"%s","errno":0,"ppid":%s}\\n' "${FAKE_FDA:-granted}" "${FAKE_PPID:-1}" > "$result"
+"""
+
+
+@unittest.skipUnless(ON_MAC, "needs macOS with xcrun swiftc")
+class ActivationTests(LauncherBase):
+    """--launcher-active: the record must name this exact bundle and a live grant."""
+
+    def setUp(self):
+        super().setUp()
+        self.install_release()
+        self.installed_app = self.home / ".local" / "libexec" / "ShipyardLauncher.app"
+        self.installed_app.parent.mkdir(parents=True, mode=0o755)
+        subprocess.run(["ditto", str(self.app), str(self.installed_app)], check=True)
+        self.sign_installed()
+        self.installed = self.installed_app / "Contents" / "MacOS" / "shipyard-launcher"
+        self.record = self.home / ".local" / "share" / "shipyard" / "launcher" / "activation.json"
+        self.record.parent.mkdir(parents=True, mode=0o700)
+        tools = pathlib.Path(self.tmp.name) / "tools"
+        tools.mkdir()
+        (tools / "open").write_text(FAKE_OPEN)
+        (tools / "open").chmod(0o755)
+        self.open_log = tools / "open.log"
+        self.env.update(SHIPYARD_LAUNCHER_TEST_OPEN=str(tools / "open"), FAKE_OPEN_LOG=str(self.open_log))
+
+    def sign_installed(self):
+        subprocess.run(["codesign", "--force", "-s", "-", "-i", "com.danielraffel.shipyard.launcher",
+                        str(self.installed_app)], check=True, capture_output=True)
+
+    def cdhash(self):
+        out = subprocess.run(["codesign", "-dvvv", str(self.installed_app)], capture_output=True, text=True).stderr
+        return next(line.split("=", 1)[1] for line in out.splitlines() if line.startswith("CDHash="))
+
+    def write_record(self, age=0.0, **overrides):
+        record = {
+            "schema": 2, "app": str(self.installed_app), "identifier": "com.danielraffel.shipyard.launcher",
+            "team": "TESTTEAM00", "cdhash": self.cdhash(), "fda_checked_at": time.time() - age,
+        }
+        record.update(overrides)
+        self.record.write_text(json.dumps(record))
+        self.record.chmod(0o600)
+
+    def active(self, **env):
+        result = self.launch("--launcher-active", env=env, launcher=self.installed)
+        report = json.loads(result.stdout) if result.stdout.strip() else {}
+        return result.returncode, report.get("reason", result.stderr)
+
+    def probed(self):
+        return self.open_log.exists()
+
+    def test_not_activated(self):
+        self.assertEqual(self.active(), (1, "not_activated"))
+
+    def test_fresh_grant_is_active_without_probing(self):
+        self.write_record()
+        self.assertEqual(self.active(), (0, "grant_cached"))
+        self.assertFalse(self.probed())
+
+    def test_stale_grant_is_rechecked_and_refreshed(self):
+        self.write_record(age=7200)
+        self.assertEqual(self.active(), (0, "grant_rechecked"))
+        self.assertIn("--launcher-check-access", self.open_log.read_text())
+        self.assertGreater(json.loads(self.record.read_text())["fda_checked_at"], time.time() - 60)
+
+    def test_revoked_grant_demotes_the_record(self):
+        self.write_record(age=7200)
+        code, reason = self.active(FAKE_FDA="denied")
+        self.assertEqual(code, 1)
+        self.assertTrue(reason.startswith("grant_revoked: demoted"), reason)
+        self.assertFalse(self.record.exists())
+        self.assertEqual(len(list(self.record.parent.glob("activation.json.demoted-*"))), 1)
+        self.assertEqual(self.active(), (1, "not_activated"))
+
+    def test_unknown_grant_is_not_active_and_keeps_the_record(self):
+        for env in ({"FAKE_FDA": "unknown"}, {"FAKE_PPID": "4242"}, {"FAKE_OPEN_FAILS": "1"}):
+            with self.subTest(env=env):
+                self.write_record(age=7200)
+                code, reason = self.active(**env)
+                self.assertEqual(code, 1)
+                self.assertTrue(reason.startswith("grant_unknown"), reason)
+                self.assertTrue(self.record.exists())
+
+    def test_cache_window_is_bounded(self):
+        self.write_record(age=30)
+        self.assertEqual(self.active(SHIPYARD_LAUNCHER_TEST_GRANT_CACHE_SECS="10"), (0, "grant_rechecked"))
+        self.write_record(age=-600)  # a clock that ran backwards is not a fresh check
+        self.assertEqual(self.active(), (0, "grant_rechecked"))
+
+    def test_replaced_bundle_is_not_active(self):
+        self.write_record()
+        info = self.installed_app / "Contents" / "Info.plist"
+        info.write_text(info.read_text().replace("Shipyard Launcher", "Shipyard Launcher 2"))
+        self.sign_installed()
+        code, reason = self.active()
+        self.assertEqual(code, 1)
+        self.assertTrue(reason.startswith("bundle_replaced"), reason)
+
+    def test_record_mismatches_are_not_active(self):
+        cases = {
+            "record_team_mismatch": {"team": "OTHERTEAM1"},
+            "record_identifier_mismatch": {"identifier": "com.example.other"},
+            "record_names_another_bundle": {"app": "/Applications/ShipyardLauncher.app"},
+            "record_schema": {"schema": 1},
+            "record_unreadable": {"fda_checked_at": "yesterday"},
+        }
+        for reason, overrides in cases.items():
+            with self.subTest(reason):
+                self.write_record(**overrides)
+                self.assertEqual(self.active(), (1, reason))
+                self.assertFalse(self.probed())
+
+    def test_untrusted_or_unreadable_record_is_not_active(self):
+        self.record.write_text("{not json")
+        self.record.chmod(0o600)
+        self.assertEqual(self.active(), (1, "record_unreadable"))
+        self.write_record()
+        self.record.chmod(0o666)
+        self.assertTrue(self.active()[1].startswith("record_untrusted"))
+        real = self.record.with_name("real.json")
+        self.record.chmod(0o600)
+        self.record.rename(real)
+        self.record.symlink_to(real)
+        self.assertTrue(self.active()[1].startswith("record_untrusted"))
+
+    def test_record_in_a_writable_directory_is_not_active(self):
+        self.write_record()
+        self.record.parent.chmod(0o777)
+        try:
+            code, reason = self.active()
+        finally:
+            self.record.parent.chmod(0o700)
+        self.assertEqual(code, 1)
+        self.assertTrue(reason.startswith("record_untrusted"), reason)
+
+    def test_a_launcher_outside_the_install_path_is_never_active(self):
+        self.write_record(app=str(self.app))
+        code, reason = self.active()
+        self.assertEqual((code, reason), (1, "record_names_another_bundle"))
 
 
 if __name__ == "__main__":

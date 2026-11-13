@@ -13,7 +13,11 @@ CHECK = pathlib.Path(__file__).resolve().with_name("shipyard-launcher-check")
 
 FAKE_CODESIGN = """#!/bin/bash
 case "$1" in
-  -dv) echo "TeamIdentifier=${FAKE_TEAM:-TEAM123456}" >&2; exit 0 ;;
+  -dv) case "${@: -1}" in
+         *.app) echo "TeamIdentifier=${FAKE_BUNDLE_TEAM:-${FAKE_TEAM:-TEAM123456}}" >&2 ;;
+         *) echo "TeamIdentifier=${FAKE_TEAM:-TEAM123456}" >&2 ;;
+       esac; exit 0 ;;
+  -dvvv) echo "TeamIdentifier=${FAKE_BUNDLE_TEAM:-${FAKE_TEAM:-TEAM123456}}" >&2; echo "CDHash=${FAKE_CDHASH:-0123456789abcdef0123456789abcdef01234567}" >&2; exit 0 ;;
   --verify)
     for arg; do case "$arg" in -R=*) echo "$arg" > "$FAKE_TOOLS/requirement" ;; esac; done
     [ -f "$FAKE_TOOLS/codesign-refuses" ] && { echo "a sealed resource is missing or invalid" >&2; exit 1; }
@@ -34,6 +38,13 @@ result="${@: -1}"
 printf '{"schema":1,"full_disk_access":"%s","errno":%s,"ppid":%s}\\n' "${FAKE_FDA:-denied}" "${FAKE_ERRNO:-1}" "${FAKE_PPID:-1}" > "$result"
 """
 FAKE_LAUNCHER = """#!/bin/bash
+if [ "$1" = --launcher-active ]; then
+  record="$SHIPYARD_LAUNCHER_CHECK_HOME/.local/share/shipyard/launcher/activation.json"
+  [ -f "$record" ] || { echo '{"active":false,"reason":"not_activated"}'; exit 1; }
+  [ -f "$FAKE_TOOLS/launcher-inactive" ] && { echo '{"active":false,"reason":"bundle_replaced: code directory hash differs"}'; exit 1; }
+  cp "$record" "$FAKE_TOOLS/seen-record"
+  echo '{"active":true,"reason":"grant_cached"}'; exit 0
+fi
 [ "$1" = --launcher-verify ] || exit 64
 [ -f "$FAKE_TOOLS/launcher-refuses" ] && { echo "shipyard-launcher: not a Developer ID signed Shipyard" >&2; exit 77; }
 [ -f "$FAKE_TOOLS/launcher-says-not-ok" ] && { echo '{"ok":false}'; exit 0; }
@@ -157,13 +168,43 @@ class LauncherCheckTests(unittest.TestCase):
         result = self.check("--activate", FAKE_FDA="granted", FAKE_ERRNO="0")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         record = json.loads(self.record.read_text())
-        self.assertEqual(record["schema"], 1)
+        self.assertEqual(record["schema"], 2)
         self.assertEqual(record["team"], "TEAM123456")
+        self.assertEqual(record["identifier"], "com.danielraffel.shipyard.launcher")
+        self.assertEqual(record["cdhash"], "0123456789abcdef0123456789abcdef01234567")
+        self.assertEqual(record["app"], os.path.realpath(self.app))
+        self.assertIn('certificate leaf[subject.OU] = "TEAM123456"', record["designated_requirement"])
         self.assertEqual(stat.S_IMODE(self.record.stat().st_mode), 0o600)
         self.assertIn("activated: yes", result.stdout)
         result = self.check("--deactivate")
         self.assertEqual(result.returncode, 0)
         self.assertFalse(self.record.exists())
+
+    def test_activation_the_launcher_rejects_is_removed(self):
+        self.install()
+        self.flag("launcher-inactive")
+        result = self.check("--activate", FAKE_FDA="granted", FAKE_ERRNO="0")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("did not accept the new record", result.stderr)
+        self.assertFalse(self.record.exists())
+
+    def test_activation_needs_the_bundle_team_and_a_cdhash(self):
+        self.install()
+        result = self.check("--activate", FAKE_FDA="granted", FAKE_ERRNO="0", FAKE_BUNDLE_TEAM="OTHERTEAM1")
+        self.assertEqual(result.returncode, 1)
+        self.assertFalse(self.record.exists())
+        result = self.check("--activate", FAKE_FDA="granted", FAKE_ERRNO="0", FAKE_CDHASH="not-a-hash")
+        self.assertEqual(result.returncode, 1)
+        self.assertFalse(self.record.exists())
+
+    def test_status_reports_the_launchers_verdict_not_the_file(self):
+        self.install()
+        self.record.parent.mkdir(parents=True)
+        self.record.write_text('{"schema": 2}')
+        self.flag("launcher-inactive")
+        report = json.loads(self.check("--json").stdout)
+        self.assertFalse(report["activated"])
+        self.assertTrue(report["activation"].startswith("bundle_replaced"))
 
     def test_launch_services_unavailable_is_unknown(self):
         self.install()

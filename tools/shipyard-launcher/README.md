@@ -33,6 +33,7 @@ The design follows TartCI's `TartCILauncher.app`.
 | `shipyard-launcher <args...>` | Runs the current Shipyard release with `<args...>` as a child |
 | `shipyard-launcher --launcher-script steward-tick [args...]` | Runs `~/.local/libexec/shipyard-steward-tick.sh` with `/bin/bash` as a child |
 | `shipyard-launcher --launcher-verify` | Checks everything a run would check, prints JSON, runs nothing |
+| `shipyard-launcher --launcher-active` | Whether routing may use the launcher now (activation, below) |
 | `shipyard-launcher --launcher-check-access [--launcher-result FILE]` | Reports whether the launcher holds Full Disk Access (read-only) |
 | `shipyard-launcher --launcher-version` | Prints the launcher version |
 
@@ -88,7 +89,7 @@ failed, 127 target missing.
 
 This change adds the bundle, its build, the check and the activation record.
 No entry point uses it yet. A follow-up change routes these, each only while
-the activation record exists, logging `launcher=app` or `launcher=direct
+`--launcher-active` says so, logging `launcher=app` or `launcher=direct
 reason=...` and falling back to the direct call:
 
 | Entry point | Planned routing |
@@ -179,9 +180,42 @@ LaunchServices may refuse, and the check reports `unknown`.
 
 `--activate` writes `~/.local/share/shipyard/launcher/activation.json` only when
 every check passes, and only when the access answer came from a launcher whose
-parent is launchd (anything else is reported as `unknown`). Routing will read
-only that record, so a launcher without a grant can never raise a new
-unattended prompt. `--deactivate` removes it.
+parent is launchd (anything else is reported as `unknown`). The record is
+bound to this exact bundle: its canonical path, bundle identifier, team, code
+directory hash (cdhash) and designated requirement, plus `fda_checked_at`, the
+time the grant was confirmed. `--activate` then asks the launcher for its
+verdict and removes the record again if the launcher does not accept it.
+`--deactivate` removes it.
+
+Nothing trusts the file by itself. Every consumer asks the launcher:
+
+```bash
+~/.local/libexec/ShipyardLauncher.app/Contents/MacOS/shipyard-launcher --launcher-active
+# exit 0 {"active":true,"reason":"grant_cached"}   or   exit 1 {"active":false,"reason":"..."}
+```
+
+`--launcher-active` first does everything `--launcher-verify` does (its own
+signature and the current release; failures exit 77). It then reports active
+only when all of these hold:
+
+| Check | Reason when it fails | Record |
+| --- | --- | --- |
+| The record exists | `not_activated` | |
+| It is a regular file owned by the user, not group- or world-writable, not a symlink, in private directories up to home | `record_untrusted: ...` | kept |
+| It parses, with schema 2 and a numeric `fda_checked_at` | `record_unreadable`, `record_schema` | kept |
+| Its `app` is this bundle, at `~/.local/libexec/ShipyardLauncher.app` | `record_names_another_bundle` | kept |
+| Its identifier and team are this bundle's own | `record_identifier_mismatch`, `record_team_mismatch` | kept |
+| Its cdhash is this bundle's own (a rebuilt or replaced bundle needs `--activate` again; the grant itself carries over) | `bundle_replaced: ...` | kept |
+| The grant was confirmed less than an hour ago, or is confirmed again now | `grant_unknown: ...` | kept |
+| The recheck does not say the grant is gone | `grant_revoked: demoted to ...` | renamed to `activation.json.demoted-<time>` |
+
+The recheck is the same probe the check tool uses: a fresh copy of the bundle
+started through LaunchServices opens the system TCC database. It never
+prompts, never touches `/Volumes`, and takes at most 20 seconds. Its answer
+counts only when that copy's parent is launchd. A confirmed grant refreshes
+`fda_checked_at`, so the probe runs at most about once an hour per host. A
+clock that moved backwards counts as stale. Every verdict is one line in
+`~/Library/Logs/shipyard-launcher.log`.
 
 ## Tests
 

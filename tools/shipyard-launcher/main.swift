@@ -19,6 +19,7 @@
 //   shipyard-launcher [shipyard arguments...]
 //   shipyard-launcher --launcher-script <name> [script arguments...]
 //   shipyard-launcher --launcher-verify
+//   shipyard-launcher --launcher-active
 //   shipyard-launcher --launcher-check-access [--launcher-result <file>]
 //   shipyard-launcher --launcher-version
 //
@@ -372,6 +373,149 @@ func checkAccess(result: String?) -> Never {
     exit(state == "granted" ? 0 : (state == "denied" ? 1 : 2))
 }
 
+// MARK: activation
+
+/// How long a confirmed Full Disk Access grant is trusted before
+/// --launcher-active asks macOS again. The recheck never prompts.
+let grantCacheSeconds = Double(testOverride("SHIPYARD_LAUNCHER_TEST_GRANT_CACHE_SECS") ?? "") ?? 3600
+let grantProbeSeconds = 20.0
+
+/// This bundle's code directory hash, from its own signature.
+func ownCDHash() -> String? {
+    var code: SecStaticCode?
+    guard SecStaticCodeCreateWithPath(bundleRoot() as CFURL, SecCSFlags(), &code) == errSecSuccess, let code else { return nil }
+    var info: CFDictionary?
+    guard SecCodeCopySigningInformation(code, SecCSFlags(), &info) == errSecSuccess,
+          let values = info as? [String: Any],
+          let unique = values[kSecCodeInfoUnique as String] as? Data, !unique.isEmpty else { return nil }
+    return unique.map { String(format: "%02x", $0) }.joined()
+}
+
+func activeReport(_ active: Bool, _ reason: String) -> Never {
+    let report: [String: Any] = ["schema": 1, "active": active, "reason": reason]
+    if let data = try? JSONSerialization.data(withJSONObject: report, options: [.sortedKeys]) {
+        FileHandle.standardOutput.write(data + Data("\n".utf8))
+    }
+    logLine("active=\(active) reason=\(reason)")
+    exit(active ? 0 : 1)
+}
+
+/// The problem with `path` as a trusted file, or nil: a regular file, not a
+/// symlink, owned by this user, not group- or world-writable.
+func untrustedFile(_ path: String) -> String? {
+    var info = stat()
+    guard lstat(path, &info) == 0 else { return "cannot inspect: \(String(cString: strerror(errno)))" }
+    guard (info.st_mode & S_IFMT) == S_IFREG else { return "not a regular file" }
+    guard info.st_uid == getuid() else { return "not owned by this user" }
+    guard info.st_mode & 0o022 == 0 else { return "group- or world-writable" }
+    return nil
+}
+
+/// Write `record` over `path` atomically (temporary file, then rename).
+func replaceRecord(_ path: String, _ record: [String: Any]) -> Bool {
+    guard let data = try? JSONSerialization.data(withJSONObject: record, options: [.sortedKeys, .prettyPrinted]) else { return false }
+    let temporary = path + ".\(getpid()).tmp"
+    let fd = open(temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
+    guard fd >= 0 else { return false }
+    let wrote = data.withUnsafeBytes { write(fd, $0.baseAddress, data.count) }
+    let synced = fsync(fd) == 0
+    close(fd)
+    guard wrote == data.count, synced, rename(temporary, path) == 0 else { unlink(temporary); return false }
+    return true
+}
+
+/// Ask macOS, through LaunchServices, whether this bundle holds Full Disk
+/// Access: `open` starts a fresh copy of the bundle as its own responsible
+/// process (parent launchd), which answers --launcher-check-access. Only that
+/// answer counts; anything else is "unknown".
+func probeGrant() -> (String, String) {
+    var template = Array((NSTemporaryDirectory() + "shipyard-launcher-grant.XXXXXX").utf8CString)
+    guard let made = mkdtemp(&template) else { return ("unknown", "cannot create a private directory") }
+    let directory = String(cString: made)
+    defer { try? FileManager.default.removeItem(atPath: directory) }
+    let result = directory + "/access.json"
+    let opener = Process()
+    opener.executableURL = URL(fileURLWithPath: testOverride("SHIPYARD_LAUNCHER_TEST_OPEN") ?? "/usr/bin/open")
+    opener.arguments = ["-n", "-g", "-a", bundleRoot().path, "--args", "--launcher-check-access", "--launcher-result", result]
+    opener.standardInput = FileHandle.nullDevice
+    opener.standardOutput = FileHandle.nullDevice
+    opener.standardError = FileHandle.nullDevice
+    do { try opener.run() } catch { return ("unknown", "cannot run open: \(error)") }
+    opener.waitUntilExit()
+    guard opener.terminationReason == .exit, opener.terminationStatus == 0 else {
+        return ("unknown", "open exited \(opener.terminationStatus)")
+    }
+    let deadline = Date().addingTimeInterval(grantProbeSeconds)
+    while Date() < deadline {
+        if let data = FileManager.default.contents(atPath: result),
+           let report = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            guard let state = report["full_disk_access"] as? String, ["granted", "denied", "unknown"].contains(state) else {
+                return ("unknown", "unexpected access report")
+            }
+            guard (report["ppid"] as? Int) == 1 else { return ("unknown", "the access answer did not come from a launchd-started launcher") }
+            return (state, "errno=\(report["errno"] ?? "?")")
+        }
+        usleep(200_000)
+    }
+    return ("unknown", "no access report within \(Int(grantProbeSeconds))s")
+}
+
+/// Whether Shipyard may route through this launcher now. Active only when the
+/// activation record is readable and trusted, names this exact bundle (path,
+/// identifier, team, code directory hash), and the Full Disk Access grant was
+/// confirmed within grantCacheSeconds or is confirmed again now. A revoked
+/// grant demotes the record (renamed to activation.json.demoted-<time>), so
+/// nothing routes until --activate runs again. Every other doubt is
+/// "not active" and leaves the record alone. Exit 0 active, 1 not.
+func launcherActive(home: String, team: String) -> Never {
+    let path = home + "/.local/share/shipyard/launcher/activation.json"
+    var info = stat()
+    guard lstat(path, &info) == 0 else { activeReport(false, "not_activated") }
+    if let problem = untrustedFile(path) { activeReport(false, "record_untrusted: \(problem)") }
+    var directory = (path as NSString).deletingLastPathComponent
+    while directory.hasPrefix(home + "/") || directory == home {
+        var dirInfo = stat()
+        guard lstat(directory, &dirInfo) == 0, (dirInfo.st_mode & S_IFMT) == S_IFDIR,
+              dirInfo.st_uid == getuid() || dirInfo.st_uid == 0, dirInfo.st_mode & 0o022 == 0 else {
+            activeReport(false, "record_untrusted: \(directory) is not a private directory")
+        }
+        if directory == home { break }
+        directory = (directory as NSString).deletingLastPathComponent
+    }
+    let fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+    guard fd >= 0 else { activeReport(false, "record_unreadable") }
+    let data = FileHandle(fileDescriptor: fd, closeOnDealloc: true).readDataToEndOfFile()
+    guard var record = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+        activeReport(false, "record_unreadable")
+    }
+    guard (record["schema"] as? Int) == 2 else { activeReport(false, "record_schema") }
+    let installed = canonical(home + "/.local/libexec/ShipyardLauncher.app")
+    guard let app = record["app"] as? String, app == bundleRoot().path, installed == app else {
+        activeReport(false, "record_names_another_bundle")
+    }
+    guard (record["identifier"] as? String) == bundleIdentifier else { activeReport(false, "record_identifier_mismatch") }
+    guard (record["team"] as? String) == team else { activeReport(false, "record_team_mismatch") }
+    guard let cdhash = ownCDHash(), (record["cdhash"] as? String) == cdhash else {
+        activeReport(false, "bundle_replaced: code directory hash differs from the activated bundle")
+    }
+    guard let checked = record["fda_checked_at"] as? Double else { activeReport(false, "record_unreadable") }
+    let age = Date().timeIntervalSince1970 - checked
+    if age >= 0 && age < grantCacheSeconds { activeReport(true, "grant_cached") }
+    let (state, detail) = probeGrant()
+    switch state {
+    case "granted":
+        record["fda_checked_at"] = Date().timeIntervalSince1970
+        if !replaceRecord(path, record) { logLine("could not refresh fda_checked_at; probing again next time") }
+        activeReport(true, "grant_rechecked")
+    case "denied":
+        let demoted = path + ".demoted-\(Int(Date().timeIntervalSince1970))"
+        let moved = rename(path, demoted) == 0
+        activeReport(false, "grant_revoked: \(moved ? "demoted to \(demoted)" : "could not demote the record") (\(detail))")
+    default:
+        activeReport(false, "grant_unknown: \(detail)")
+    }
+}
+
 // MARK: main
 
 let arguments = Array(CommandLine.arguments.dropFirst())
@@ -386,7 +530,7 @@ if first == "--launcher-check-access" {
     else if arguments.count != 1 { fail("usage: --launcher-check-access [--launcher-result <file>]", code: 64) }
     checkAccess(result: result)
 }
-if first.hasPrefix("--launcher-") && !["--launcher-verify", "--launcher-script"].contains(first) {
+if first.hasPrefix("--launcher-") && !["--launcher-verify", "--launcher-active", "--launcher-script"].contains(first) {
     fail("unknown launcher option \(first)", code: 64)
 }
 let home = accountHome()
@@ -413,5 +557,9 @@ if first == "--launcher-verify" {
         FileHandle.standardOutput.write(data + Data("\n".utf8))
     }
     exit(0)
+}
+if first == "--launcher-active" {
+    guard arguments.count == 1 else { fail("usage: --launcher-active", code: 64) }
+    launcherActive(home: home, team: team)
 }
 run(target, arguments, script: false, requirement: requirement, mode: "shipyard")
