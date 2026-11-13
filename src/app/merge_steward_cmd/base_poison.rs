@@ -392,16 +392,12 @@ pub(super) fn green_head_fix(
                 .as_deref()
                 .is_some_and(|conclusion| conclusion.eq_ignore_ascii_case("SUCCESS"))
     };
-    let mut found: Vec<(fix_first::GreenFix, String)> = Vec::new();
-    let mut covering: Option<BTreeSet<u64>> = None;
+    // Per confirmed context: its red time and every open head's facts for
+    // it. The decision itself is [`fix_first::decide`], shared with replay.
+    let mut per_context: Vec<(String, Option<DateTime<Utc>>, Vec<fix_first::FixCandidate>)> =
+        Vec::new();
     for poisoned in health.poisoned() {
         let Some(reading) = tip.get(&poisoned.context).filter(|tip| tip.red) else {
-            continue;
-        };
-        // Confirmed but with no time the base went red: nothing can be shown
-        // to pass it after the break, so nothing is exempt.
-        let Some(red_since) = reading.red_since else {
-            covering = Some(BTreeSet::new());
             continue;
         };
         let rule = required
@@ -444,45 +440,30 @@ pub(super) fn green_head_fix(
                 }),
             })
             .collect::<Vec<_>>();
-        // The heads that passed this context after it went red, approved
-        // or not: a head must pass every confirmed context to be exempt.
-        let passing = candidates
-            .iter()
-            .filter(|candidate| fix_first::passed_after(candidate, red_since))
-            .map(|candidate| candidate.number)
-            .collect::<BTreeSet<_>>();
-        covering = Some(match covering {
-            None => passing,
-            Some(so_far) => so_far.intersection(&passing).copied().collect(),
-        });
-        for fix in fix_first::green_head_fixes(&candidates, red_since) {
-            let evidence = fix.evidence(&poisoned.context, red_since);
-            found.push((fix, evidence));
-        }
+        per_context.push((poisoned.context.clone(), reading.red_since, candidates));
     }
-    let covering = covering.unwrap_or_default();
-    // A fix must repair every confirmed context: one that passes A but not B
-    // would form a group that still fails B.
-    let mut fixes: Vec<fix_first::GreenFix> = Vec::new();
-    let mut evidence: BTreeMap<u64, Vec<String>> = BTreeMap::new();
-    for (fix, line) in found {
-        if !covering.contains(&fix.pr) {
-            continue;
-        }
-        evidence.entry(fix.pr).or_default().push(line);
-        if !fixes.iter().any(|known| known.pr == fix.pr) {
-            fixes.push(fix);
-        }
-    }
-    let green = match fix_first::pick(&fixes) {
+    let facts = per_context
+        .iter()
+        .map(|(context, red_since, candidates)| fix_first::ContextFacts {
+            context,
+            red_since: *red_since,
+            candidates,
+        })
+        .collect::<Vec<_>>();
+    let mut decision = fix_first::decide(&facts);
+    let green = match decision.pick {
         fix_first::Pick::None => GreenHead::None,
         fix_first::Pick::Ambiguous { prs } => GreenHead::Ambiguous(prs),
         fix_first::Pick::One(chosen) => GreenHead::One(
             chosen.pr,
-            evidence.remove(&chosen.pr).unwrap_or_default().join("; "),
+            decision
+                .evidence
+                .remove(&chosen.pr)
+                .unwrap_or_default()
+                .join("; "),
         ),
     };
-    (green, covering)
+    (green, decision.covering)
 }
 
 /// The one named fix this pass fast-tracks ([`choose_fix`]), and every

@@ -267,3 +267,52 @@ fn pulp_replay_does_not_fire_without_a_tip_run_and_holds_with_a_control() {
     assert_eq!(control.held, vec![12140, 12148]);
     assert!(!control.actual_fix_held);
 }
+
+/// A labelled fix is picked while a second approved head also passed the
+/// context after the break. Production admits that rival (it covers every
+/// confirmed context), so the replay must not report it held.
+#[test]
+fn a_rival_green_head_beside_a_labelled_fix_is_not_held_in_replay() {
+    let mut labelled = candidate(
+        1,
+        Some("2026-11-13T10:30:00Z"),
+        Some("2026-11-13T10:20:00Z"),
+    );
+    labelled.labels = vec![FIX_LABEL.to_owned()];
+    let rival = candidate(
+        2,
+        Some("2026-11-13T10:31:00Z"),
+        Some("2026-11-13T10:21:00Z"),
+    );
+    let stale = candidate(
+        3,
+        Some("2026-11-13T10:32:00Z"),
+        Some("2026-11-13T09:00:00Z"),
+    );
+    let episode = ReplayEpisode {
+        key: "o/r@main".to_owned(),
+        context: "ctx".to_owned(),
+        started_at: at("2026-11-13T10:00:00Z"),
+        ended_at: None,
+        max_streak: 2,
+        would_hold: Vec::new(),
+        decided_at: at("2026-11-13T11:00:00Z"),
+        tip_runs: vec![run(1, "failure", "2026-11-13T10:00:00Z")],
+        prs: vec![labelled.clone(), rival.clone(), stale.clone()],
+        actual_fix: Some(1),
+        note: String::new(),
+    };
+    let outcome = replay(&episode);
+    assert_eq!(outcome.fix, Some(1));
+    assert_eq!(outcome.held, vec![3], "the rival is admitted, as live");
+    // The live decision over the same facts says the same.
+    let prs = [labelled, rival, stale];
+    let decision = decide(&[ContextFacts {
+        context: "ctx",
+        red_since: Some(at("2026-11-13T10:00:00Z")),
+        candidates: &prs,
+    }]);
+    assert!(matches!(decision.pick, Pick::One(ref fix) if fix.pr == 1));
+    assert!(!decision.holds(2));
+    assert!(decision.holds(3));
+}

@@ -827,3 +827,31 @@ fn with_nothing_confirmed_every_pull_request_proceeds() {
         }
     }
 }
+
+/// Live admission for the case the replay test mirrors: a labelled fix is
+/// jumped and a second approved head that also passed after the break is
+/// admitted, not held.
+#[test]
+fn live_admission_admits_a_rival_green_head_beside_the_labelled_fix() {
+    let mut labelled = pr_409();
+    labelled.fact.labels = vec![crate::base_health::fix_first::FIX_LABEL.to_owned()];
+    let rival = open_pr(
+        410,
+        'c',
+        None,
+        Some("2026-11-13T10:36:00Z"),
+        Some("2026-11-13T10:42:00Z"),
+    );
+    let prs = [pr_408(), labelled, rival];
+    let on = poison(PoisonHold::On, &prs, streak(), tip_red());
+    assert_eq!(on.fixes.keys().copied().collect::<Vec<_>>(), vec![409]);
+    assert_eq!(
+        base_poison::admission(Some(&on), 409),
+        Admission::FastTrack { jump: true }
+    );
+    assert_eq!(base_poison::admission(Some(&on), 410), Admission::Proceed);
+    assert!(matches!(
+        base_poison::admission(Some(&on), 408),
+        Admission::Hold { .. }
+    ));
+}
