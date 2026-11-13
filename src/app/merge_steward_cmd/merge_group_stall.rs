@@ -225,6 +225,22 @@ fn time(value: Option<&Value>) -> Option<DateTime<Utc>> {
         .map(|at| at.with_timezone(&Utc))
 }
 
+/// Prove one page holds the whole answer: `total_count` must be present, a
+/// number, and no larger than the rows returned. Missing or malformed
+/// metadata cannot prove completeness, so the reading is refused.
+pub(super) fn complete_page(answer: &Value, rows: usize, what: &str) -> Result<(), String> {
+    let total = answer
+        .get("total_count")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("{what} answer had no numeric total_count; refusing a reading that cannot be shown complete"))?;
+    if total > rows as u64 {
+        return Err(format!(
+            "more than one page of {what}; refusing a partial reading"
+        ));
+    }
+    Ok(())
+}
+
 /// The three reads for one group head. Any failure, or a page that may not
 /// hold everything, fails the whole reading: a partial reading decides
 /// nothing.
@@ -241,9 +257,7 @@ pub(super) fn read_group(
         .get("workflow_runs")
         .and_then(Value::as_array)
         .ok_or_else(|| "workflow runs answer had no workflow_runs".to_owned())?;
-    if runs.get("total_count").and_then(Value::as_u64).unwrap_or(0) > rows.len() as u64 {
-        return Err("more than one page of workflow runs; refusing a partial reading".to_owned());
-    }
+    complete_page(&runs, rows.len(), "workflow runs")?;
     let mut facts = GroupFacts::default();
     for row in rows {
         // The filter is GitHub's; re-check it so another commit's run never
@@ -277,14 +291,7 @@ pub(super) fn read_group(
         .get("check_runs")
         .and_then(Value::as_array)
         .ok_or_else(|| "check runs answer had no check_runs".to_owned())?;
-    if checks
-        .get("total_count")
-        .and_then(Value::as_u64)
-        .unwrap_or(0)
-        > rows.len() as u64
-    {
-        return Err("more than one page of check runs; refusing a partial reading".to_owned());
-    }
+    complete_page(&checks, rows.len(), "check runs")?;
     facts.checks = rows
         .iter()
         .filter_map(|row| {

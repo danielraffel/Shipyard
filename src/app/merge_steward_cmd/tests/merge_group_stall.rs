@@ -736,3 +736,36 @@ fn a_completed_run_in_the_census_does_not_suppress_the_reading() {
         entry.verdict
     );
 }
+
+/// Pagination metadata must prove the page is complete: a missing or
+/// non-numeric `total_count` refuses the reading for runs and check runs.
+#[test]
+fn missing_or_malformed_pagination_metadata_refuses_the_reading() {
+    for runs_total in ["", r#""total_count": "2","#, r#""total_count": null,"#] {
+        let runs = format!(r#"{{{runs_total} "workflow_runs": []}}"#);
+        let reader = |argv: &[String]| -> Result<String, String> {
+            let line = argv.join(" ");
+            if line.contains("actions/runs?head_sha=") {
+                return Ok(runs.clone());
+            }
+            Err(format!("unexpected {line}"))
+        };
+        let error = merge_group_stall::read_group(&reader, REPO, GROUP).expect_err("refused");
+        assert!(error.contains("total_count"), "{runs_total}: {error}");
+    }
+    for checks_total in ["", r#""total_count": "1","#] {
+        let checks = format!(r#"{{{checks_total} "check_runs": []}}"#);
+        let reader = |argv: &[String]| -> Result<String, String> {
+            let line = argv.join(" ");
+            if line.contains("actions/runs?head_sha=") {
+                return Ok(r#"{"total_count": 0, "workflow_runs": []}"#.to_owned());
+            }
+            if line.contains("/check-runs") {
+                return Ok(checks.clone());
+            }
+            Err(format!("unexpected {line}"))
+        };
+        let error = merge_group_stall::read_group(&reader, REPO, GROUP).expect_err("refused");
+        assert!(error.contains("total_count"), "{checks_total}: {error}");
+    }
+}
