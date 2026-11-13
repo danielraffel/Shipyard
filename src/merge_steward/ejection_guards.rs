@@ -128,11 +128,24 @@ pub struct EjectionGuards {
     /// The base-poison admission hold and fix fast-track, from the base
     /// config's `[base_health]` table ([`crate::base_health::BasePoisonPolicy`]).
     pub base_poison: crate::base_health::BasePoisonPolicy,
+    /// `[merge_queue] dequeue_doomed_groups`: whether the steward removes a
+    /// queue entry whose merge group can never finish (every run done, a
+    /// required context absent, and its producing run failed). `dry-run` on
+    /// a merge-queue base unless the base config says otherwise; a value that
+    /// does not parse keeps `dry-run` and is reported in
+    /// [`Self::dequeue_doomed_groups_error`].
+    pub dequeue_doomed_groups: crate::base_health::PoisonHold,
+    /// Why `dequeue_doomed_groups` did not parse, when it did not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dequeue_doomed_groups_error: Option<String>,
     /// Why the base config could not be read, when it could not. The guards
     /// then keep their merge-queue defaults (on) with no generated paths.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read_error: Option<String>,
 }
+
+/// `[merge_queue]` key selecting [`EjectionGuards::dequeue_doomed_groups`].
+pub const DEQUEUE_DOOMED_KEY: &str = "dequeue_doomed_groups";
 
 impl EjectionGuards {
     /// The guards of a base with no config: on exactly when it has a merge
@@ -147,6 +160,12 @@ impl EjectionGuards {
             known_flaky_tests: Vec::new(),
             red_everywhere: RedEverywhereMode::Shadow,
             base_poison: crate::base_health::BasePoisonPolicy::for_base(merge_queue),
+            dequeue_doomed_groups: if merge_queue {
+                crate::base_health::PoisonHold::DryRun
+            } else {
+                crate::base_health::PoisonHold::Off
+            },
+            dequeue_doomed_groups_error: None,
             read_error: None,
         }
     }
@@ -157,6 +176,23 @@ impl EjectionGuards {
     pub fn from_table(table: &toml::Table, merge_queue: bool) -> Self {
         let mut guards = Self::for_base(merge_queue);
         guards.base_poison = crate::base_health::BasePoisonPolicy::from_table(table, merge_queue);
+        if merge_queue {
+            let value = table
+                .get("merge_queue")
+                .and_then(toml::Value::as_table)
+                .and_then(|section| section.get(DEQUEUE_DOOMED_KEY))
+                .and_then(toml::Value::as_str);
+            match crate::base_health::PoisonHold::parse(value) {
+                Ok(Some(mode)) => guards.dequeue_doomed_groups = mode,
+                Ok(None) => {}
+                Err(error) => {
+                    guards.dequeue_doomed_groups_error = Some(error.replace(
+                        crate::base_health::HOLD_CONFIG_KEY,
+                        &format!("merge_queue.{DEQUEUE_DOOMED_KEY}"),
+                    ));
+                }
+            }
+        }
         let Some(section) = table.get(CONFIG_TABLE).and_then(toml::Value::as_table) else {
             return guards;
         };

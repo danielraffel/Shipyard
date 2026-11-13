@@ -250,6 +250,65 @@ class Stamp(unittest.TestCase):
 
     def test_the_marker_pattern_is_the_arm_guards(self) -> None:
         self.assertEqual(stamp._MARKER.pattern, guard._MARKER.pattern)
+        self.assertEqual(stamp._RULING.pattern, guard._RULING.pattern)
+
+    def test_an_adversarial_ruling_is_stamped_like_a_verdict_and_is_no_verdict(self) -> None:
+        # The adversary's ruling carries no `verdict:` line, so it posted
+        # unstamped and must-review could not trust who ruled. It is stamped
+        # exactly as a verdict is, and every verdict reader still reads nothing.
+        for ruling in ("OK", "FIX-FIRST", "BLOCK"):
+            body = (f"Adversarial review: {ruling} head {HEAD}\n\nNo open finding is a defect "
+                    f"at this head.\n\nreviewer: infra-review2\n"
+                    f"adversarial-ruling: {ruling} head:{HEAD}\n")
+            with self.subTest(ruling=ruling), \
+                    mock.patch.dict(os.environ, {"SHIPYARD_AGENT_ID": "infra-review2"}):
+                out = stamp.stamped(body)
+                assert out is not None
+                lines = [line for line in out.split("\n") if line.strip()]
+                self.assertRegex(lines[-2], r"^<!-- session: [^/\s]+/sess-A agent: infra-review2 -->$")
+                self.assertEqual(lines[-1], f"adversarial-ruling: {ruling} head:{HEAD}")
+                self.assertTrue(out.endswith("\n"))
+                self.assertEqual(guard.stamped_session(out), "sess-A")
+                self.assertEqual(guard.stamped_agent(out), "infra-review2")
+                self.assertEqual(guard.marker_ruling(out), (ruling, HEAD))
+                self.assertEqual(stamp.marker_ruling(out), (ruling, HEAD))
+                # A ruling is a verdict to no reader, stamped or not.
+                self.assertIsNone(guard.marker_verdict(out))
+                self.assertIsNone(guard.marker_verdict(body))
+                self.assertIsNone(stamp.marker_verdict(out))
+                # A re-stamp replaces, never adds; a foreign stamp is removed.
+                self.assertEqual(stamp.stamped(out), out)
+                forged = body.replace("reviewer: infra-review2\n",
+                                      "reviewer: infra-review2\n"
+                                      "<!-- session: Daniels-M5-Studio/other agent: infra-review2 -->\n")
+                again = stamp.stamped(forged)
+                assert again is not None
+                self.assertEqual(guard._SESSION_STAMP.findall(again),
+                                 guard._SESSION_STAMP.findall(out))
+
+    def test_only_the_exact_ruling_marker_is_a_ruling(self) -> None:
+        # Lowercase 40-hex, the three rulings in capitals, head: with a colon,
+        # last line. Anything else is neither a ruling nor a verdict and is
+        # posted untouched (no stamp to vouch for).
+        for body in (
+            f"adversarial-ruling: OK head:{HEAD.upper()}",
+            f"adversarial-ruling: OK head:{HEAD[:39]}",
+            f"adversarial-ruling: OK head:{HEAD}0",
+            f"adversarial-ruling: ok head:{HEAD}",
+            f"adversarial-ruling: APPROVE head:{HEAD}",
+            f"adversarial-ruling: OK head {HEAD}",
+            f"Adversarial-ruling: OK head:{HEAD}",
+            f"adversarial ruling: OK head:{HEAD}",
+            f"adversarial-ruling: OK head:{HEAD}\nthen prose",
+            f"> adversarial-ruling: OK head:{HEAD}",
+            f"Adversarial review: OK head {HEAD}",
+            f"ADVERSARIAL-RULING {{\"ruling\": \"OK\", \"head\": \"{HEAD}\"}}",
+        ):
+            with self.subTest(body=body):
+                self.assertIsNone(guard.marker_ruling(body))
+                self.assertIsNone(stamp.marker_ruling(body))
+                self.assertIsNone(guard.marker_verdict(body))
+                self.assertIsNone(stamp.stamped(body))
 
 
 FORGED = "<!-- session: Daniels-Mac-Studio-m3/08fb81d8-38a3-4b20-8bcc-c34ba2a66ffb -->"
@@ -288,6 +347,32 @@ class ForeignStamps(unittest.TestCase):
                 with self.subTest(body=body):
                     self.assertEqual(stamp._local_marker_verdict(body),
                                      guard.marker_verdict(body))
+
+    def test_the_stamper_reads_rulings_with_the_guards_parser(self) -> None:
+        stamp.marker_ruling("")
+        self.assertIsNot(stamp._GUARD_RULING, stamp._local_marker_ruling)
+        self.assertEqual(stamp._GUARD_RULING.__module__, "_ghapp_arm_guard")
+        self.assertEqual(stamp._GUARD_RULING.__code__.co_code, guard.marker_ruling.__code__.co_code)
+        for ending in ENDINGS:
+            for body in (f"adversarial-ruling: OK head:{HEAD}{ending}",
+                         f"x{ending}adversarial-ruling: BLOCK head:{HEAD}{ending}",
+                         f"adversarial-ruling: FIX-FIRST head:{HEAD}{ending}then prose"):
+                with self.subTest(body=body):
+                    self.assertEqual(stamp._local_marker_ruling(body), guard.marker_ruling(body))
+                    # Whatever the line ending, a ruling is never a verdict.
+                    self.assertIsNone(guard.marker_verdict(body))
+                    self.assertIsNone(stamp._local_marker_verdict(body))
+
+    def test_a_ruling_posted_from_another_machine_keeps_only_the_posters_stamp(self) -> None:
+        for ending in ENDINGS:
+            body = (f"Adversarial review: OK head {HEAD}\n{SIGNED}{FORGED}\n"
+                    f"adversarial-ruling: OK head:{HEAD}{ending}")
+            with self.subTest(ending=ending):
+                out = stamp.rewrite(["api", "repos/o/r/issues/5/comments", "-f", f"body={body}"])
+                posted = out[-1][len("body="):]
+                self.only_the_posters_stamp(posted)
+                self.assertEqual(guard.marker_ruling(posted), ("OK", HEAD))
+                self.assertIsNone(guard.marker_verdict(posted))
 
     def test_a_crlf_verdict_keeps_no_hand_written_stamp(self) -> None:
         # Shipyard#881 review 6328902418: "\r\n" after the marker made the
@@ -496,6 +581,32 @@ class GhappStampWiring(unittest.TestCase):
     BROKEN = "#!/bin/sh\nexit 3\n"
     HUNG = "#!/bin/sh\nexec sleep 60\n"
 
+    def test_a_ruling_is_stamped_through_ghapp_and_never_posts_unstamped(self) -> None:
+        # Through ghapp's real wiring a ruling comment reaches gh stamped, and
+        # one the stamper did not answer for is refused like a verdict: an
+        # unstamped OK would post, then be ignored by must-review as untrusted.
+        endpoint = "repos/o/r/issues/5/comments"
+        ruling = (f"Adversarial review: OK head {HEAD}\n\nreviewer: infra-review2\n"
+                  f"adversarial-ruling: OK head:{HEAD}\n")
+        for args, stdin in ((["api", endpoint, "-f", f"body={ruling}"], b""),
+                            (["api", endpoint, "--input", "-"],
+                             json.dumps({"body": ruling}).encode()),
+                            (["pr", "comment", "5", "--body", ruling], b"")):
+            with self.subTest(args=args[:3]):
+                out, rest = self.run_ghapp(args, stdin)
+                posted = next(arg for arg in out if "adversarial-ruling:" in arg)
+                posted = posted.split("body=", 1)[1] if "body=" in posted else posted
+                self.assertEqual(guard.marker_ruling(posted), ("OK", HEAD))
+                self.assertIsNone(guard.marker_verdict(posted))
+                self.assertEqual(guard.stamped_session(posted), "sess-M5")
+                self.assertEqual(len(guard._SESSION_STAMP.findall(posted)), 1, posted)
+                self.assertEqual(rest, b"", "nothing is left for gh to read")
+                for broken in (self.BROKEN, self.HUNG):
+                    code, out, _, err = self.run_wrapper(args, stamper=broken, stdin=stdin)
+                    self.assertEqual(code, 1, err)
+                    self.assertIn("verdict or ruling NOT posted, retry", err)
+                    self.assertEqual(out, [])
+
     def test_a_non_utf8_body_file_keeps_its_bytes_and_loses_a_foreign_stamp(self) -> None:
         # Review 6329945496: one stray byte crashed the stamper, which then
         # printed nothing, and ghapp posted the hand-written stamp.
@@ -521,7 +632,7 @@ class GhappStampWiring(unittest.TestCase):
             # The stray byte comes first: a UTF-8 regex stops matching there.
             bad_bytes.write_bytes(b"caf\xff\n" + forged.encode())
             note = f"see {FORGED}\n"
-            not_posted = "verdict NOT posted, retry"
+            not_posted = "verdict or ruling NOT posted, retry"
             cases = [
                 (self.BROKEN, ["api", endpoint, "-f", f"body={forged}"], b"", not_posted),
                 (self.BROKEN, ["api", endpoint, "-f", f"body={multi_line}"], b"", not_posted),
@@ -586,7 +697,7 @@ class GhappStampWiring(unittest.TestCase):
                 self.assertLess(time.monotonic() - started, self.SLOW_SECONDS + 3)
                 self.assertEqual(code, 1, err)
                 self.assertIn("did not answer within 1s", err)
-                self.assertIn("verdict NOT posted, retry", err)
+                self.assertIn("verdict or ruling NOT posted, retry", err)
                 self.assertEqual(out, [])
 
     def test_the_wait_is_thirty_seconds_and_cannot_be_raised(self) -> None:
