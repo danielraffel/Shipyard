@@ -6206,6 +6206,15 @@ while the later PR's listed head is approved with no HOLD, or once the shared
 commits are on the base. A later PR whose head merely contains the earlier
 head gets no shortcut: ancestry cannot say which PR introduced a shared commit.
 
+## Release-readiness canary
+
+`[release.canary]` in a repo's `.shipyard/config.toml` opts it into a daily,
+read-only rehearsal of the next release (`shipyard release-canary run`): the
+configured `command` (`{next_version}` / `{next_tag}` placeholders) runs on a
+clean clone of `main`; a failure opens or edits one `release canary: vX.Y.Z
+would fail` issue and a later pass closes it. The steward tick runs it daily per
+fleet repo. Full config and exit codes are in the `ci` skill.
+
 ## Skill-sync gotcha
 
 Changes to Shipyard steward behavior must carry this note or a reviewed skill-sync exception so the version-and-skill gate records the operational impact.
