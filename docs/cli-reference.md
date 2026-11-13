@@ -260,6 +260,7 @@ shipyard governance diff       # dry-run apply
 shipyard governance apply --yes  # write live state to match config (without --yes: preview only)
 shipyard governance export     # snapshot to TOML
 shipyard governance use <name> # switch profile (solo / multi / custom)
+shipyard governance audit --repo owner/repo [--repo ...] [--gh-binary ghapp]  # read-only PASS/DRIFT/UNKNOWN per supply-chain row
 
 # Cloud
 shipyard cloud workflows       # list dispatchable workflows

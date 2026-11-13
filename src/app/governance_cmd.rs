@@ -25,6 +25,32 @@ pub(super) fn governance_command<W: Write>(
     json_mode: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
+    if let GovernanceCommand::Audit {
+        repos,
+        gh_binary,
+        profile,
+        updates_bot,
+    } = command
+    {
+        // The audit works on any repository, so a missing or unreadable
+        // local config means profile defaults rather than an error.
+        let config = LoadedConfig::load_from_cwd(mode, cwd)
+            .ok()
+            .map(|config| policy_from_base(&config, mode, cwd).0);
+        let request = super::governance_audit_cmd::AuditRequest {
+            repos,
+            gh_binary,
+            profile,
+            updates_bot,
+        };
+        return super::governance_audit_cmd::governance_audit(
+            &request,
+            config.as_ref(),
+            cwd,
+            json_mode,
+            stdout,
+        );
+    }
     let config = LoadedConfig::load_from_cwd(mode, cwd)
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     let (config, source) = policy_from_base(&config, mode, cwd);
@@ -111,6 +137,10 @@ fn governance_command_with<W: Write>(
             yes,
             dry_run,
         } => governance_use(&repo, config, &profile_name, yes, dry_run, stdout, &gh),
+        GovernanceCommand::Audit { .. } => Err(CliFailure::new(
+            1,
+            "governance audit is dispatched before config loading",
+        )),
     }
 }
 

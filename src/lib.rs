@@ -134,6 +134,8 @@ pub mod ghapp_guards;
 pub mod github_read;
 /// Branch governance profiles and GitHub branch-protection helpers.
 pub mod governance;
+/// Read-only supply-chain compliance audit against a governance profile.
+pub mod governance_audit;
 /// Arm native auto-merge only on a head a reviewer approved.
 pub mod head_approval;
 /// Optional host-health pre-dispatch gate (reads the `host_vitals` signal).
