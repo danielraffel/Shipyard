@@ -28,11 +28,23 @@ pub(super) fn governance_onboard<W: Write>(
              read-only plan. Nothing was read or written.",
         ));
     }
-    let gh = match (gh_binary, LoadedConfig::load_from_cwd(mode, cwd).ok()) {
-        (Some(binary), _) => GovernanceGh::ambient(cwd, Some(binary)),
-        (None, Some(config)) => GovernanceGh::from_loaded_config(cwd, &config, None)
-            .map_err(|error| CliFailure::new(9, error))?,
-        (None, None) => GovernanceGh::ambient(cwd, None),
+    // An explicit --gh-binary names the identity. Otherwise the identity comes
+    // from the config, and a config that cannot be read stops the plan: falling
+    // back to ambient gh would silently change who the governance reads run as.
+    let gh = if let Some(binary) = gh_binary {
+        GovernanceGh::ambient(cwd, Some(binary))
+    } else {
+        let config = LoadedConfig::load_from_cwd(mode, cwd).map_err(|error| {
+            CliFailure::new(
+                1,
+                format!(
+                    "governance onboard: cannot read the Shipyard config ({error}); fix it \
+                     or pass --gh-binary. Nothing was read from GitHub."
+                ),
+            )
+        })?;
+        GovernanceGh::from_loaded_config(cwd, &config, None)
+            .map_err(|error| CliFailure::new(9, error))?
     };
     let plan = build_plan(&gh, request)
         .map_err(|error| CliFailure::new(error.exit_code(), error.message().to_owned()))?;
