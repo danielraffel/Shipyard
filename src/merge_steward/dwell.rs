@@ -488,13 +488,11 @@ pub struct DwellRepoState {
     /// Every retrigger attempted, per pull request and head. Unlike act
     /// records these outlive [`ACT_TTL_DAYS`]: a reopen keeps the head, so a
     /// head whose ledger record expired would otherwise be retriggered again
-    /// every two weeks.
+    /// every two weeks. The history is durable and intentionally unbounded so
+    /// an active head can never lose its lifetime retrigger mark.
     #[serde(default)]
     pub retriggers: Vec<RetriggerMark>,
 }
-
-/// Retrigger marks kept per repository; the oldest are dropped past this.
-const RETRIGGER_MARKS_KEPT: usize = 2048;
 
 /// The retrigger history of one pull request head.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -565,10 +563,6 @@ impl DwellRepoState {
         mark.done |= done;
         mark.at = at;
         self.retriggers.push(mark);
-        if self.retriggers.len() > RETRIGGER_MARKS_KEPT {
-            self.retriggers
-                .drain(..self.retriggers.len() - RETRIGGER_MARKS_KEPT);
-        }
     }
 
     /// Whether an act of `kind` was already taken for `state` at `head`.

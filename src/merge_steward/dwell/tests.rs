@@ -95,6 +95,20 @@ fn defaults_are_the_specified_limits() {
 }
 
 #[test]
+fn retrigger_marks_are_retained_when_history_grows() {
+    let mut state = established();
+    state.mark_retrigger(1, HEAD, true, true, now());
+
+    for number in 2..=2049 {
+        let head = format!("{number:040x}");
+        state.mark_retrigger(number, &head, true, true, now());
+    }
+
+    assert_eq!(state.retriggers.len(), 2049);
+    assert!(state.retrigger_spent(1, HEAD).is_some());
+}
+
+#[test]
 fn every_state_is_overdue_exactly_at_its_limit() {
     let policy = DwellPolicy::default();
     for state in DwellState::ALL {

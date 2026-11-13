@@ -245,6 +245,11 @@ struct RepoReport {
     /// not ask for it.
     #[serde(skip_serializing_if = "Option::is_none")]
     base_poison: Option<Value>,
+    /// Merge groups that can never finish: every run completed and a
+    /// required context still absent ([`merge_group_stall`]). Absent when
+    /// the repository was not observed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    merge_group_stalled: Option<Value>,
     /// Required checks re-run (or, in shadow, that would be) because they
     /// failed for an infrastructure reason, and outage findings
     /// ([`infra_rerun`]). Absent when the repository was not observed.
@@ -331,6 +336,15 @@ struct StewardLedger {
     /// `poison_pause`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     poison_paused: BTreeMap<String, Vec<poison_pause::PausedEntry>>,
+    /// Doomed merge groups the steward decided on, keyed
+    /// `repo#pr@group-sha`: once per (pull request, group head). See
+    /// `merge_group_stall`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    doomed_dequeues: BTreeMap<String, merge_group_stall::Receipt>,
+    /// The last good read of the queue-removals ledger, honoured while the
+    /// file cannot be read. See `defect_fix_removals`.
+    #[serde(default)]
+    removal_ledger: defect_fix_removals::Cache,
     /// Infra re-runs per check on an exact head, keyed
     /// `repo#pr@head:check`. See `infra_rerun`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -574,6 +588,9 @@ struct MutationApplyContext<'a> {
     /// This pass's merge-group reading, when the base asks for one. See
     /// `base_poison`.
     base_poison: Option<&'a base_poison::RepoPoison>,
+    /// This pass's reading of the queue-removals ledger: a `defect-fix`
+    /// removal of a head refuses its admission. See `defect_fix_removals`.
+    defect_fix: Option<&'a defect_fix_removals::Reading>,
 }
 
 /// Exact-head approval gate reads made during one pass, by PR number.
@@ -1833,6 +1850,7 @@ fn deferred_rate_limit_repo_report(
 ) -> RepoReport {
     RepoReport {
         base_poison: None,
+        merge_group_stalled: None,
         rollup_reconciliation: Vec::new(),
         uncertain_mutations: Vec::new(),
         repo: repo.to_owned(),
@@ -1865,6 +1883,7 @@ fn unreadable_repo_report(
 ) -> RepoReport {
     RepoReport {
         base_poison: None,
+        merge_group_stalled: None,
         rollup_reconciliation: Vec::new(),
         uncertain_mutations: Vec::new(),
         api_calls: None,
@@ -1947,6 +1966,7 @@ fn append_unmatched_recovery_errors(
             .map_or_else(|| default_base.to_owned(), |pending| pending.base.clone());
         reports.push(RepoReport {
             base_poison: None,
+            merge_group_stalled: None,
             rollup_reconciliation: Vec::new(),
             uncertain_mutations: Vec::new(),
             api_calls: None,
@@ -1989,6 +2009,7 @@ fn persist_final_ledger(
     } else {
         reports.push(RepoReport {
             base_poison: None,
+            merge_group_stalled: None,
             rollup_reconciliation: Vec::new(),
             uncertain_mutations: Vec::new(),
             api_calls: None,
@@ -2151,6 +2172,7 @@ mod cancellation_terminalization;
 mod capacity_cancellation;
 mod carried_commits;
 mod code_owner_wait;
+mod defect_fix_removals;
 pub(super) mod dwell_pass;
 mod exact_head_merge;
 mod generated_paths;
@@ -2158,6 +2180,7 @@ mod head_rollup;
 pub(super) mod infra_rerun;
 pub(super) mod invariants;
 mod ledger;
+mod merge_group_stall;
 mod mutation_outcome;
 mod native_arm;
 mod next_action;
