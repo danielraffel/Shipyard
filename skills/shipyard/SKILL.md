@@ -3849,6 +3849,7 @@ UTC), and each repository carries `blocked_summary` (counts per token and the
 three oldest blocked rows with `age_minutes`). Read those instead of inferring
 the state from `mutation`: `waiting_head_approval` alone does not say whether
 nobody reviewed the head, a reviewer holds it, or its approval is excluded.
+A row with an `error` also carries `error_kind`: `read` (a 5xx, timeout, dropped connection or rate limit while reading; the next pass retries it, so treat the row as unobserved, not refused) or `policy` (a decision or a failed action). The steward tick logs the first as `read_deferred=` and the second as `pr_refused=`.
 The full token list is in `docs/automated-draining.md`. Each row also carries
 `next_action` (`actor`, `action`, `stop`), and `shipyard wait pr <n> --state
 actionable --timeout <s> --json` gives one pull request that answer live and
