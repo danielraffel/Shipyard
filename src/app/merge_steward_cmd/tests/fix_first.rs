@@ -1341,7 +1341,7 @@ fn coverage_needs_the_required_app_identity() {
         &pinned,
         APPROVAL,
         &health,
-        &tip,
+        &base_poison::confirmed_red_since(&health, &tip, &BTreeMap::new()),
     );
     assert!(covering.is_empty(), "{covering:?}");
     let (_, unpinned) = base_poison::green_head_fix(
@@ -1349,7 +1349,7 @@ fn coverage_needs_the_required_app_identity() {
         &[],
         APPROVAL,
         &health,
-        &tip,
+        &base_poison::confirmed_red_since(&health, &tip, &BTreeMap::new()),
     );
     assert_eq!(unpinned.into_iter().collect::<Vec<_>>(), vec![502]);
 }
