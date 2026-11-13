@@ -193,6 +193,35 @@ pub(super) fn reconcile(
     lines
 }
 
+/// The pass step in either mode. An applying pass records and releases in
+/// the steward ledger. A report pass runs the same reconcile on a scratch
+/// copy of the entries at no more than `dry-run`, so it reports what the act
+/// would do and persists nothing.
+pub(super) fn reconcile_for_pass(
+    mode: PoisonHold,
+    apply: bool,
+    ledger: &mut StewardLedger,
+    observation: &RepoObservation,
+    poison: Option<&RepoPoison>,
+    now: DateTime<Utc>,
+) -> Vec<String> {
+    if apply {
+        return reconcile(mode, true, ledger, observation, poison, now);
+    }
+    let mut scratch = StewardLedger {
+        red_base_ejections: ledger.red_base_ejections.clone(),
+        ..StewardLedger::default()
+    };
+    reconcile(
+        mode.min_dry_run(),
+        false,
+        &mut scratch,
+        observation,
+        poison,
+        now,
+    )
+}
+
 fn short(head: &str) -> &str {
     head.get(..12).unwrap_or(head)
 }

@@ -155,13 +155,18 @@ impl RepoPoison {
         (!gaps.is_empty()).then(|| gaps.join("; "))
     }
 
-    /// Whether every one of `contexts` was read on the tip this pass and is
-    /// no longer confirmed red: the episode for them is over even if the
+    /// Whether every one of `contexts` was read on the tip this pass, its
+    /// newest completed verdict passed, and it is no longer confirmed red: the episode for them is over even if the
     /// merge-group streak is not.
     pub(super) fn tip_green_for(&self, contexts: &str) -> bool {
         let confirmed = self.confirmed_contexts();
         contexts.split(',').all(|context| {
-            self.tip.get(context).is_some_and(|tip| tip.error.is_none())
+            // Green needs evidence: a read without error whose newest
+            // completed verdict passed. A pending or empty answer has no
+            // verdict and ends nothing.
+            self.tip
+                .get(context)
+                .is_some_and(|tip| tip.error.is_none() && tip.newest_at.is_some() && !tip.red)
                 && !confirmed.iter().any(|red| red == context)
         })
     }

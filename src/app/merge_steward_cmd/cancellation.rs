@@ -186,20 +186,22 @@ pub(super) fn apply_repo_plan(
     } else {
         Vec::new()
     };
-    if args.apply {
-        triage_lines.extend(super::red_base_ejections::reconcile(
-            policy
-                .ejection_guards
-                .base_poison
-                .acts
-                .reenqueue_red_base_ejections,
-            args.apply,
-            ledger,
-            observation,
-            base_poison.as_ref(),
-            Utc::now(),
-        ));
-    }
+    // Both modes report what the act does; only an applying pass keeps the
+    // records. A report pass works on a scratch copy of the entries, so it
+    // says `would re-enqueue` and persists nothing.
+    let reenqueue_mode = policy
+        .ejection_guards
+        .base_poison
+        .acts
+        .reenqueue_red_base_ejections;
+    triage_lines.extend(super::red_base_ejections::reconcile_for_pass(
+        reenqueue_mode,
+        args.apply,
+        ledger,
+        observation,
+        base_poison.as_ref(),
+        Utc::now(),
+    ));
     // Shadow ledger: every would-fire episode per rule, labelled when it
     // ends, and the promotion gate it feeds. Measurement only.
     let shadow = match (args.apply, mutation_control, base_poison.as_ref()) {

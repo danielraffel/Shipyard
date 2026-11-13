@@ -94,6 +94,11 @@ fn tip_red() -> TipReading {
 fn tip_green() -> TipReading {
     TipReading {
         sha: Some("f".repeat(40)),
+        newest_at: Some(
+            chrono::DateTime::parse_from_rfc3339("2026-11-13T11:17:55Z")
+                .expect("time")
+                .with_timezone(&Utc),
+        ),
         ..TipReading::default()
     }
 }
@@ -1658,4 +1663,80 @@ fn an_unknown_onset_records_no_ejection_window_and_never_panics() {
     observation.prs = queued_prs;
     // Refused (nothing covers an unknown onset), without formatting it.
     assert!(fix_reorder::candidate(&queued, &observation).is_err());
+}
+
+/// A report (no-apply) pass runs the re-enqueue reconcile too: it says what
+/// it would do and leaves the steward ledger untouched.
+#[test]
+fn a_report_pass_reports_would_re_enqueue_and_persists_nothing() {
+    use crate::app::merge_steward_cmd::red_base_ejections;
+    let prs = [ejected_404(), pr_409()];
+    let mut observation = observation_for(prs[0].clone(), true);
+    observation.prs = prs.to_vec();
+    let red = poison(PoisonHold::On, &prs, streak(), tip_red());
+    let green = poison(PoisonHold::On, &prs, streak(), tip_green());
+    // An applying pass recorded the entry while the base was red.
+    let mut ledger = StewardLedger::default();
+    red_base_ejections::reconcile_for_pass(
+        PoisonHold::On,
+        true,
+        &mut ledger,
+        &observation,
+        Some(&red),
+        Utc::now(),
+    );
+    let before =
+        red_base_ejections::entries(&ledger, &observation.repo, &observation.base).to_vec();
+    assert_eq!(before.len(), 1);
+    // A report pass once the base is green: the line, and nothing written.
+    let lines = red_base_ejections::reconcile_for_pass(
+        PoisonHold::On,
+        false,
+        &mut ledger,
+        &observation,
+        Some(&green),
+        Utc::now(),
+    );
+    assert!(
+        lines.iter().any(|line| line.contains("would re-enqueue")),
+        "{lines:?}"
+    );
+    assert_eq!(
+        red_base_ejections::entries(&ledger, &observation.repo, &observation.base),
+        before.as_slice(),
+        "a report pass persists nothing"
+    );
+}
+
+/// A tip read with no completed verdict is not green: it ends no episode,
+/// releases no red-base ejection and restores no paused entry.
+#[test]
+fn a_tip_with_no_completed_verdict_ends_nothing() {
+    use crate::app::merge_steward_cmd::red_base_ejections;
+    let prs = [ejected_404(), pr_409()];
+    let mut observation = observation_for(prs[0].clone(), true);
+    observation.prs = prs.to_vec();
+    let red = poison(PoisonHold::On, &prs, streak(), tip_red());
+    let pending = poison(PoisonHold::On, &prs, streak(), TipReading::default());
+    assert!(!pending.tip_green_for(CONTEXT), "no verdict is not green");
+    let mut ledger = StewardLedger::default();
+    red_base_ejections::reconcile(
+        PoisonHold::On,
+        true,
+        &mut ledger,
+        &observation,
+        Some(&red),
+        Utc::now(),
+    );
+    red_base_ejections::reconcile(
+        PoisonHold::On,
+        true,
+        &mut ledger,
+        &observation,
+        Some(&pending),
+        Utc::now(),
+    );
+    assert!(!red_base_ejections::entries(&ledger, &observation.repo, &observation.base)[0].ready);
+    let green = poison(PoisonHold::On, &prs, streak(), tip_green());
+    assert!(green.tip_green_for(CONTEXT));
 }
