@@ -414,6 +414,17 @@ fn enqueue_pull_request_with_recovery(
     if matches!(admission, super::base_poison::Admission::Hold { .. }) {
         return (admission.token(), None);
     }
+    // Under `red_everywhere = "enforce"`, a head still in a base-level episode
+    // (unchanged since it failed the way the others do) waits for the base.
+    if let Some(check) = super::red_everywhere::held(
+        context.ejection_guards.red_everywhere,
+        ledger,
+        &context.observation.repo,
+        pr.fact.number,
+        &pr.fact.head_sha,
+    ) {
+        return (Some(format!("held_red_everywhere:{check}")), None);
+    }
     let fast_track_jump = matches!(
         admission,
         super::base_poison::Admission::FastTrack { jump: true }

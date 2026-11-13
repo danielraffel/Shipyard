@@ -277,3 +277,60 @@ fn every_named_fix_is_admitted_and_every_other_pull_request_held() {
     };
     assert!((1..12).all(|pr| admission(Some(&unread), pr) == Admission::Proceed));
 }
+
+/// Red everywhere under `enforce`: a head still in a base-level episode is not
+/// enqueued; under `shadow` (the default) the same head is enqueued as before.
+fn enqueue_in_episode(mode: crate::merge_steward::ejection_guards::RedEverywhereMode) -> Outcome {
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = steward_gh(&temp, JUMP_ACCEPTED, &approval());
+    let pr = ready_pr();
+    let mut observation = observation_for(pr.clone(), true);
+    observation.repo = "Generous-Corp/pulp".to_owned();
+    let mut ledger = StewardLedger::default();
+    ledger.red_everywhere.insert(
+        "generous-corp/pulp|Enforce version & skill sync|due_soon_fixture".to_owned(),
+        crate::app::merge_steward_cmd::red_everywhere::Episode {
+            first_epoch: 1,
+            last_seen_epoch: 1,
+            heads: [(pr.fact.number, pr.fact.head_sha.clone())]
+                .into_iter()
+                .collect(),
+        },
+    );
+    let mutation_control = mutation_control(&temp, "studio", "studio");
+    let ledger_path = temp.path().join("ledger.json");
+    let mut context =
+        mutation_apply_context(&actions, &observation, &ledger_path, &mutation_control);
+    context.ejection_guards.red_everywhere = mode;
+    let arms = temp
+        .path()
+        .join("state")
+        .join(crate::queue_arm_gate::ARMS_LEDGER);
+    let guards = temp.path().join("guards");
+    fs::create_dir_all(&guards).expect("guards");
+    let (mutation, error) = with_real_guard(&arms, &guards, || {
+        crate::head_approval::with_host_review_default(false, || {
+            enqueue_pull_request(&context, &pr, &queue_policy(), &mut ledger)
+        })
+    });
+    Outcome {
+        mutation,
+        error,
+        calls: fs::read_to_string(temp.path().join("calls")).unwrap_or_default(),
+    }
+}
+
+#[test]
+fn red_everywhere_enforce_holds_an_unchanged_member_head_from_the_queue() {
+    use crate::merge_steward::ejection_guards::RedEverywhereMode;
+    let held = enqueue_in_episode(RedEverywhereMode::Enforce);
+    assert_eq!(
+        held.mutation.as_deref(),
+        Some("held_red_everywhere:Enforce version & skill sync"),
+        "{:?}",
+        held.error
+    );
+    assert!(enqueues(&held.calls).is_empty(), "{}", held.calls);
+    let shadow = enqueue_in_episode(RedEverywhereMode::Shadow);
+    assert_eq!(enqueues(&shadow.calls).len(), 1, "{}", shadow.calls);
+}

@@ -1152,3 +1152,60 @@ fn backtest_replay() {
         }
     }
 }
+
+#[test]
+fn a_newer_red_whose_diagnosis_fails_keeps_no_stale_test_names() {
+    struct Broken;
+    impl Acts for Broken {
+        fn rollups(&self, _: &[String]) -> Result<BTreeMap<String, Vec<StewardCheck>>, String> {
+            Ok(BTreeMap::new())
+        }
+        fn diagnose(&self, _: u64) -> Result<(Diagnosis, Vec<Job>), String> {
+            Err("HTTP 502".to_owned())
+        }
+        fn rerun_failed_jobs(&self, _: u64) -> Result<(), String> {
+            panic!("no re-run without a diagnosis")
+        }
+    }
+    // The red judged earlier (check id 100) named a test; a re-run made a
+    // newer red (check id 200) on the same head, and its diagnosis fails.
+    let observation = observation(vec![pr(
+        1,
+        vec![check("drift-fast", "FAILURE", 20, 200)],
+        &[],
+    )]);
+    let mut ledger = StewardLedger::default();
+    let key = record_key(&observation.repo, 1, &head(1), "drift-fast");
+    ledger.infra_reruns.insert(
+        key.clone(),
+        Record {
+            pr: 1,
+            check: "drift-fast".to_owned(),
+            judged_check_id: Some(100),
+            verdict: "declined".to_owned(),
+            tests: vec!["old_test".to_owned()],
+            ..Record::default()
+        },
+    );
+    let (status, _) = sweep(
+        &Sweep {
+            observation: &observation,
+            mode: Mode::Enforce,
+            approval_context: "review-verdict",
+            excluded_labels: &[],
+            now_epoch: T0,
+            deadline: None,
+            ledger_path: None,
+        },
+        &mut ledger,
+        &Broken,
+    );
+    assert_eq!(actions(&status), vec!["error"]);
+    let record = &ledger.infra_reruns[&key];
+    assert_eq!(record.judged_check_id, Some(200));
+    assert!(
+        record.tests.is_empty(),
+        "stale names under the new id: {:?}",
+        record.tests
+    );
+}
