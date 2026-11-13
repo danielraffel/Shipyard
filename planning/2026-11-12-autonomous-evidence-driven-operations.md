@@ -173,23 +173,26 @@ Outcome measures tracked together, so that none is traded for another:
 - unnecessary work: wasted compute, duplicate reviews, repeated retries;
 - human interventions per 100 PRs.
 
-## What main already has
+## Existing implementation pointers
 
-The plan must build on these, not re-create them.
+The plan builds on these implementation pointers, not on unverified enforcement
+claims. The entries below identify code and documentation to inspect; they do
+not attach a current receipt or test result. Until that evidence is recorded,
+the mode remains `Verification required`.
 
-| Revision 1 proposed | On main today | Mode |
+| Revision 1 proposed | Implementation pointer on main | Evidence status |
 | --- | --- | --- |
-| Typed classification set | `blocked_on` tokens with `since`, and `next_action {actor, action, stop}`, one per open PR per steward pass (`src/app/merge_steward_cmd/blocked_on.rs`, `next_action.rs`, `docs/automated-draining.md`) | Enforced |
-| "Recommend one recovery loop" | Infra rerun for required checks (`infra_rerun.rs`, back-test 22 of 23 correct) | Enforced |
+| Typed classification set | `blocked_on` tokens with `since`, and `next_action {actor, action, stop}`, one per open PR per steward pass (`src/app/merge_steward_cmd/blocked_on.rs`, `next_action.rs`, `docs/automated-draining.md`) | Verification required |
+| "Recommend one recovery loop" | Infra rerun for required checks (`infra_rerun.rs`) | Verification required |
 | | Known-flake and not-head-caused same-head retry | On with a merge queue; `known_flaky_tests` empty by default |
 | | Dwell-time acts: stale verdict re-run, `required_never_ran` dispatch, reorder, retarget (`[auto_merge.dwell]`) | Shadow |
 | | Superseded detection (`docs/superseded-close.md`) | Shadow; closing not built |
 | | Base-poison hold, fast-track, pause (`[base_health]`) | Pause dry-run, `auto_jump` off |
 | | Environment requeue, queue-absent recovery | Opt-in, off by default |
 | | Runner watchdog | Report-only without `--fix` |
-| Failure classification | `ci.cause/v1` cause records, `FailureClass` in `src/classify.rs`, `src/diagnose/classify.rs`: three vocabularies | Enforced, rules only |
-| Historical benchmark | `shipyard metrics scorecard`, `gate_cost` weekly scorecard, hourly baseline collector joining GitHub timing and TartCI exports, merge-receipt contract | Running; primary metric `unavailable` without merge receipts and fleet capacity |
-| Review usefulness contract | `verdict: APPROVE head:<sha>` / HOLD, `review-verdict` status, reviewer claims and receipts, repair budget | Enforced |
+| Failure classification | `ci.cause/v1` cause records, `FailureClass` in `src/classify.rs`, `src/diagnose/classify.rs`: three vocabularies | Verification required |
+| Historical benchmark | `shipyard metrics scorecard`, `gate_cost` weekly scorecard, hourly baseline collector joining GitHub timing and TartCI exports, merge-receipt contract | Verification required |
+| Review usefulness contract | `verdict: APPROVE head:<sha>` / HOLD, `review-verdict` status, reviewer claims and receipts, repair budget | Verification required |
 | Low-risk fast path | `tools/fleet-pass/version_only.py` | Shadow, decides after 10 agreements |
 | Risk tier | `docs/risk-tier.md` | Report-only; does not route reviewers or models |
 | Model escalation receipt | fleet-pass logs the requested model only | Absent |
