@@ -128,6 +128,25 @@ class StewardTickArchiveTests(unittest.TestCase):
         self.assertTrue(second.exists())
         self.assertIn("day=", (self.log_dir / "archive.log").read_text())
 
+    def test_a_slow_deploy_does_not_hold_the_tick(self):
+        libexec = self.home / ".local" / "libexec"
+        libexec.mkdir(parents=True)
+        marker = self.home / "deployed"
+        deploy = libexec / "shipyard-fleet-deploy.sh"
+        deploy.write_text(f"#!/bin/bash\nsleep 6\necho \"$FLEET_DEPLOY_LOG\" > {marker}\n")
+        deploy.chmod(0o755)
+        started = time.monotonic()
+        result = self.run_tick()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertFalse(marker.exists())
+        for _ in range(60):
+            if marker.exists():
+                break
+            time.sleep(0.25)
+        self.assertTrue(marker.exists(), "the detached deploy never ran")
+        self.assertEqual(marker.read_text().strip(), str(self.log_dir / "summary.log"))
+
     def test_old_archives_are_pruned(self):
         self.run_tick()
         archive_dir = self.log_dir / "archive"
