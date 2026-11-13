@@ -229,6 +229,16 @@ class TranscriptAndTimeTests(Base):
         got = sorted(x["detail"] for x in f)
         self.assertEqual(got, ["Operation not permitted x1", "command not found x1", "getcwd x1"])
 
+    def test_from_start_counts_old_timestamped_lines_on_the_first_run_only(self):
+        log = self.fleet / "repair.log"
+        log.write_text("2026-11-01T00:00:00Z role=repair old getcwd failure\n")
+        self.args.from_start = True
+        _, _, f = self.run_once()
+        self.assertEqual([x["detail"] for x in f], ["getcwd x1"])
+        with open(log, "a") as fh:                         # a later run filters old lines again
+            fh.write("2026-11-01T00:01:00Z role=repair another old getcwd\n")
+        self.assertEqual(self.run_once(NOW + dt.timedelta(minutes=5))[2], [])
+
     def test_preceding_timestamp_carries_across_runs(self):
         log = self.fleet / "repair.log"
         log.write_text("2026-11-01T00:00:00Z old entry\n")

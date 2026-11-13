@@ -251,7 +251,12 @@ def scan_logs(fleet_dir, state, from_start, now=None):
     """
     now = now or dt.datetime.now(UTC)
     last_run = parse_iso(state.get("last_run"))
-    cutoff = (last_run - CUTOFF_SLACK) if last_run else (now - FIRST_RUN_LOOKBACK)
+    if last_run:
+        cutoff = last_run - CUTOFF_SLACK
+    elif from_start:
+        cutoff = None  # --from-start with no prior run: count everything, however old
+    else:
+        cutoff = now - FIRST_RUN_LOOKBACK
     state["last_run"] = now.isoformat(timespec="seconds")
     offs = state.setdefault("offsets", {})
     found = {}
@@ -306,7 +311,7 @@ def scan_logs(fleet_dir, state, from_start, now=None):
             m = LINE_TS.match(line)
             if m:
                 line_ts = parse_iso(m.group(1)) or line_ts
-            if line_ts is not None and line_ts < cutoff:
+            if cutoff is not None and line_ts is not None and line_ts < cutoff:
                 continue
             for sig in SIGNATURES:
                 if sig in line:
