@@ -54,14 +54,14 @@ The first match wins:
 
 | `blocked_on` | `state` |
 |---|---|
-| `ready`, `admission_pending`, `merge_state:BEHIND` (the queue tests on top of main, so behind is never an act), `enqueue_refused:*`, `generated_path_batch:*`, `defect_fix_removed:*` | `ready` |
+| `ready`, `admission_pending`, `merge_state:BEHIND` (the queue tests on top of main, so behind is never an act), `enqueue_refused:*`, `generated_path_batch:*` | `ready` |
 | `no_verdict`, `waiting_head_approval`, `approval_excluded:*`, `waiting_code_owner:*`, `code_owner_review`, `carries_unapproved_commits:*` | `awaiting_review` |
 | `required_pending`, `waiting_full_test_tier`, `waiting_enqueue_requirements`, `merge_state:` other than `DIRTY`/`BEHIND` | `check_running` |
 | `capacity_queued` | `capacity_queued` |
 | `required_failed:*` | `required_red` |
 | `held:*` | `hold` |
 | `merge_state:DIRTY` | `dirty` |
-| `ejected_same_head:*`, `ejection_cap` | `ejected` |
+| `ejected_same_head:*`, `ejection_cap`, `defect_fix_removed:*` (removed for a defect; this head is never put back) | `ejected` |
 | anything else: `transient_rerun`, `required_never_ran:*`, `approval_unread`, `steward_error`, `uncertain_mutation`, `revalidating`, `required_policy_unknown`, `carried_commits_*`, and any token added later | `tooling` |
 
 `revalidating` and `uncertain_mutation` normally clear on the next pass, so

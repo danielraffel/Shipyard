@@ -290,11 +290,9 @@ pub(crate) fn state_for(
         return None;
     }
     let state = match kind {
-        "ready"
-        | "admission_pending"
-        | "enqueue_refused"
-        | "generated_path_batch"
-        | "defect_fix_removed" => LoopState::Ready,
+        "ready" | "admission_pending" | "enqueue_refused" | "generated_path_batch" => {
+            LoopState::Ready
+        }
         "no_verdict"
         | "waiting_head_approval"
         | "approval_excluded"
@@ -307,7 +305,9 @@ pub(crate) fn state_for(
         "capacity_queued" => LoopState::CapacityQueued,
         "required_failed" => LoopState::RequiredRed,
         "held" => LoopState::Hold,
-        "ejected_same_head" | "ejection_cap" => LoopState::Ejected,
+        // Removed from the queue and not put back at this head: a new head
+        // is the way forward (a defect-fix removal included).
+        "ejected_same_head" | "ejection_cap" | "defect_fix_removed" => LoopState::Ejected,
         "merge_state" => match token.split_once(':').map_or("", |(_, state)| state) {
             "DIRTY" => LoopState::Dirty,
             // Behind is never an act: the merge queue tests on top of main.

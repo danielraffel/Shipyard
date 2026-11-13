@@ -50,6 +50,7 @@ fn every_blocked_on_token_maps_to_exactly_one_state_or_is_outside_the_loop() {
         ("merge_state:DIRTY", Some(LoopState::Dirty)),
         ("ejected_same_head:failed_checks", Some(LoopState::Ejected)),
         ("ejection_cap", Some(LoopState::Ejected)),
+        ("defect_fix_removed:defect-fix", Some(LoopState::Ejected)),
         (
             "merge_group_stalled:framework-trusted-verify",
             Some(LoopState::StuckGroup),
