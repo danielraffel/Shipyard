@@ -857,12 +857,75 @@ fn waiting_required(
             .filter_map(|check| check.observed_at.clone())
             .min()
     });
+    // Every pending required check is a check run that is still queued, and
+    // none has started: the head waits for a runner, not for code or a person.
+    // Agents read a long queue as "blocked" and stopped (2026-11-12, all macOS
+    // slots busy), so this wait gets its own token and plain next action.
+    let token = if waiting_for_capacity(pr, policy, contexts) {
+        "capacity_queued"
+    } else {
+        "required_pending"
+    };
     dated(
-        "required_pending".to_owned(),
+        token.to_owned(),
         since,
         "check_started",
         Some(context_names(policy, contexts)),
     )
+}
+
+/// A check run GitHub has accepted but no runner has started.
+fn not_started(check: &crate::merge_steward::StewardCheck) -> bool {
+    check.source == crate::merge_steward::StewardCheckSource::CheckRun
+        && ["QUEUED", "WAITING", "PENDING", "REQUESTED"]
+            .iter()
+            .any(|state| check.status.eq_ignore_ascii_case(state))
+}
+
+/// Whether every pending required check is a queued check run and none is
+/// running. A pending commit status (such as `review-verdict`) or any running
+/// job makes the answer no.
+fn waiting_for_capacity(
+    pr: &StewardPullRequest,
+    policy: &StewardPolicy,
+    contexts: &[String],
+) -> bool {
+    let mut pending = 0_usize;
+    for required in policy
+        .required_checks
+        .iter()
+        .filter(|required| contexts.contains(&required.label()))
+    {
+        match selected_required_check(&pr.checks, required) {
+            Some(check) if check.status.eq_ignore_ascii_case("COMPLETED") => {}
+            Some(check) => {
+                if !not_started(check) {
+                    return false;
+                }
+                pending += 1;
+            }
+            None => {
+                // Not reported yet: it waits behind jobs from the same source,
+                // all of which must be queued too.
+                let mut behind = pr.checks.iter().filter(|check| {
+                    !check.status.eq_ignore_ascii_case("COMPLETED")
+                        && required
+                            .app_id
+                            .is_none_or(|app_id| check.app_id == Some(app_id))
+                });
+                let mut any = false;
+                if !behind.all(|check| {
+                    any = true;
+                    not_started(check)
+                }) || !any
+                {
+                    return false;
+                }
+                pending += 1;
+            }
+        }
+    }
+    pending > 0
 }
 
 /// The newest observed time among the checks satisfying `labels`.

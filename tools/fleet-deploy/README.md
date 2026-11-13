@@ -3,7 +3,7 @@
 Installs merged fleet scripts on a host so that a fix on `main` reaches the
 machine that runs it, and a host that falls behind says so.
 
-The steward tick runs `~/.local/libexec/shipyard-fleet-deploy.sh` at its start.
+The steward tick starts `~/.local/libexec/shipyard-fleet-deploy.sh` at its start, detached in its own session so the tick never waits for it.
 At most every 10 minutes it fetches `main` of Shipyard and fleet-handbook into
 private clones under `~/.local/share/shipyard-steward/deploy/` and installs:
 

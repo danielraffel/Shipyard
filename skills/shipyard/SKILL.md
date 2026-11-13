@@ -3896,6 +3896,11 @@ reporting `required_never_ran:<context>` while GitHub shows the rule green.
   or comments merged or carries the change, close the PR with a comment
   naming it, and move on. It no longer names the owner, so no agent waits for
   Daniel on work that already landed.
+- **A queued required job is not a blocker.** When every pending required check
+  is a check run still queued for a runner, `blocked_on` is `capacity_queued`
+  and `next_action` (`actor: ci`, `stop: false`) begins "Not blocked": take
+  other work, do not push, do not stop. Dwell limits treat it like
+  `required_pending`.
 - **Labels.** `owner-decision`, `superseded` and `PARKED/<platform>` PRs are not
   exempt: they should never be queued, so on positive evidence they are
   dequeued like any other. The same three labels also deny admission:
@@ -6140,3 +6145,11 @@ head gets no shortcut: ancestry cannot say which PR introduced a shared commit.
 ## Skill-sync gotcha
 
 Changes to Shipyard steward behavior must carry this note or a reviewed skill-sync exception so the version-and-skill gate records the operational impact.
+
+Since 2026-11-13 a generic `src/` change needs a note in this skill only (not
+also in `ci`), while generic `docs/` and `planning/` changes need no skill
+note. Path matches are additive: the explicit `src/changelog.rs` and
+`src/app/changelog_cmd.rs` paths remain mapped to `changelog` as well, and
+explicit paths mapped to another skill, such as the external-contributor
+review documents, remain governed by that mapping. `scripts/skill_path_map.json`
+is the map.

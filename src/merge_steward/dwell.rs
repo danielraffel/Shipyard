@@ -349,7 +349,7 @@ pub fn state_for_token(token: &str, approval_context: &str) -> Option<DwellState
         "approval_excluded" if matches!(arg, "stale_head" | "predates_head") => {
             Some(DwellState::NeedsReview)
         }
-        "required_pending" => Some(DwellState::RequiredPending),
+        "required_pending" | "capacity_queued" => Some(DwellState::RequiredPending),
         "transient_rerun" => Some(DwellState::RequiredFailedInfra),
         "required_failed" => {
             let approval = approval_context.trim();
