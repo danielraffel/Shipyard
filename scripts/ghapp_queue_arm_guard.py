@@ -3451,7 +3451,8 @@ def read_only_gh_arguments(arguments: list[str]) -> bool:
     """Whether ``arguments`` can only read GitHub, so repeating them is safe:
     ``api``, no method other than GET, no ``--input`` body, and either no
     fields at all or a ``graphql`` document that is a query, never a mutation
-    (``gh api`` sends fields with POST). Anything else is never retried."""
+    (``gh api`` sends fields with POST). A field value that starts with ``@`` is
+    read from a file the check cannot see, so it is never retried. Anything else is never retried."""
     if not arguments or arguments[0] != "api":
         return False
     method: str | None = None
@@ -3483,6 +3484,8 @@ def read_only_gh_arguments(arguments: list[str]) -> bool:
     if previous in _GH_API_VALUE_OPTIONS:
         return False
     if method not in (None, "GET"):
+        return False
+    if any(field.partition("=")[2].startswith("@") for field in fields):
         return False
     if not fields:
         return True
