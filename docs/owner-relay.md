@@ -92,7 +92,7 @@ One pass per repository:
 | `ejected` | it left the merge queue without merging (reason: red checks, conflict, merge state) |
 | `enqueued` | it entered the merge queue (off by default) |
 | `verdict` | a `verdict: APPROVE\|HOLD head:<sha>` names the current head |
-| `required_check` | the required checks went red (or a different set went red), or went green; review gates (`review-verdict`, `post-review-verdict`, `release-path-review`) do not count |
+| `required_check` | the required checks went red (or a different set went red), or went green; review gates (`review-verdict`, `post-review-verdict`, `release-path-review`) do not count; never `red` while the pull request is in the merge queue (its group is the queue's to judge); an ejection names the red instead |
 | `dirty_after_base_move` | it became `DIRTY` while its head did not move |
 | `claim_taken` | a new `repair-claim: <lane> until <time>` comment |
 | `stacked_base_merged` | the pull request whose head is its base merged, or it was retargeted to the default branch |

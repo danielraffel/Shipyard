@@ -1713,3 +1713,47 @@ fn a_pending_overdue_notice_for_a_head_that_moved_is_dropped() {
         "{sends:?}"
     );
 }
+
+/// vellum#412: queued at position 1, with a red `judge` check run on the
+/// head that GitHub still reports. A pull request in the merge queue is
+/// never red to its owner, whatever its head's checks say.
+#[test]
+fn a_queued_pull_request_is_never_reported_red() {
+    let mut before = Pr::open(412);
+    before.in_queue = true;
+    before.checks = vec![check("macos", "COMPLETED", Some("SUCCESS"))];
+    let mut after = before.clone();
+    after.checks = vec![
+        check("macos", "COMPLETED", Some("SUCCESS")),
+        // Even when GitHub flags it required, a queued head is not red.
+        check("judge", "COMPLETED", Some("FAILURE")),
+    ];
+    let events = derive_events(Some(&digest(&before)), &digest(&after));
+    assert!(
+        !events.iter().any(
+            |event| matches!(event, RelayEvent::RequiredCheck { result, .. } if result == "red")
+        ),
+        "{events:?}"
+    );
+}
+
+/// Queued, red on its head while queued (not reported), then ejected at the
+/// same head with the same red: the ejection reports the red, so the owner
+/// is told even though no new `required_check` event fires.
+#[test]
+fn a_queued_pull_request_ejected_still_red_is_reported_red() {
+    let mut queued = Pr::open(412);
+    queued.in_queue = true;
+    queued.checks = vec![check("judge", "COMPLETED", Some("FAILURE"))];
+    let mut ejected = queued.clone();
+    ejected.in_queue = false;
+    let events = derive_events(Some(&digest(&queued)), &digest(&ejected));
+    assert!(
+        events.iter().any(
+            |event| matches!(event, RelayEvent::Ejected { reason, .. } if reason == "red: judge")
+        ),
+        "{events:?}"
+    );
+    let message = render_message(REPO, 412, &digest(&ejected), &events, None);
+    assert!(message.contains("red: judge"), "{message}");
+}
