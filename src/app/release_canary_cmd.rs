@@ -192,12 +192,15 @@ fn epoch_secs() -> u64 {
 pub(crate) fn run_canary(request: &Request<'_>, gh: Gh<'_>) -> Result<Report, String> {
     fs::create_dir_all(request.work_root).map_err(|error| error.to_string())?;
     let slug = request.repo.replace('/', "_");
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(request.work_root.join(format!("{slug}.lock")))
-        .map_err(|error| error.to_string())?;
+    // Released explicitly on every path, early returns included (see file_lock).
+    let lock = crate::file_lock::LockedFile::new(
+        OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(request.work_root.join(format!("{slug}.lock")))
+            .map_err(|error| error.to_string())?,
+    );
     if lock.try_lock_exclusive().is_err() {
         return Ok(skipped("another canary run holds the lock"));
     }
@@ -231,7 +234,6 @@ pub(crate) fn run_canary(request: &Request<'_>, gh: Gh<'_>) -> Result<Report, St
         };
         let _ = fs::write(&stamp_path, format!("{today} {status}\n"));
     }
-    let _ = FileExt::unlock(&lock);
     result
 }
 
@@ -360,7 +362,13 @@ fn run_command(
     scratch: &Path,
 ) -> Result<Outcome, String> {
     let output_path = scratch.join("canary-output.log");
-    let mut sink = File::create(&output_path).map_err(|error| error.to_string())?;
+    let mut sink = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&output_path)
+        .map_err(|error| error.to_string())?;
     let mut shell = Command::new("sh");
     shell
         .arg("-c")
@@ -604,7 +612,7 @@ mod tests {
         let fake = Fake::new("");
         let report = run(
             dir.path(),
-            "echo rehearsing {next_tag}; echo parity waiver missing >&2; exit 3",
+            "echo rehearsing {next_tag}; echo parity-$((1+1))-missing >&2; exit 3",
             30,
             &fake,
             false,
@@ -619,7 +627,7 @@ mod tests {
             .flatten()
             .find(|a| a.starts_with("body="))
             .unwrap();
-        assert!(body.contains("parity waiver missing"));
+        assert!(body.contains("parity-2-missing"));
         assert!(body.contains("exit 3"));
         assert!(
             calls
@@ -769,7 +777,7 @@ mod tests {
         let fake = Fake::new("");
         let report = run(
             dir.path(),
-            "yes noise | head -c 20000000; echo FINAL-LINE; exit 1",
+            "yes noise | head -c 20000000; echo FINAL-$((2*3)); exit 1",
             120,
             &fake,
             false,
@@ -782,11 +790,18 @@ mod tests {
             .flatten()
             .find(|a| a.starts_with("body="))
             .unwrap();
-        assert!(body.contains("FINAL-LINE"));
+        assert!(body.contains("FINAL-6"));
         drop(calls);
 
         let fake = Fake::new("");
-        let report = run(dir.path(), "echo partial-output; sleep 30", 1, &fake, false).unwrap();
+        let report = run(
+            dir.path(),
+            "echo partial-$((1+1)); sleep 30",
+            1,
+            &fake,
+            false,
+        )
+        .unwrap();
         assert!(report.detail.contains("timed out"));
         let calls = fake.calls.borrow();
         let body = calls
@@ -794,7 +809,7 @@ mod tests {
             .flatten()
             .find(|a| a.starts_with("body="))
             .unwrap();
-        assert!(body.contains("partial-output"));
+        assert!(body.contains("partial-2"));
     }
 
     #[test]
@@ -868,5 +883,68 @@ mod tests {
         });
         assert!(result.is_err());
         assert_eq!(*calls.borrow(), ["PATCH repos/o/r/issues/3"]);
+    }
+
+    fn alive(pid: &str) -> bool {
+        Command::new("kill")
+            .args(["-0", pid])
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    #[test]
+    fn a_timed_out_command_leaves_no_surviving_descendant() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("child.pid");
+        let fake = Fake::new("");
+        let command = format!("sleep 300 & echo $! > {}; sleep 30", pid_file.display());
+        let report = run(dir.path(), &command, 1, &fake, false).unwrap();
+        assert!(report.detail.contains("timed out"));
+        let pid = fs::read_to_string(&pid_file).unwrap().trim().to_owned();
+        let mut gone = false;
+        for _ in 0..50 {
+            if !alive(&pid) {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(gone, "background child {pid} survived the timeout");
+    }
+
+    #[test]
+    fn a_run_killed_midway_leaves_a_stamp_that_blocks_the_next_daily_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Fake::new("");
+        // While the command runs, the stamp already says `running`.
+        let report = run(dir.path(), "cat ../../o_r.stamp; exit 1", 30, &fake, true).unwrap();
+        assert_eq!(report.status, "fail");
+        let calls = fake.calls.borrow();
+        let body = calls
+            .iter()
+            .flatten()
+            .find(|a| a.starts_with("body="))
+            .unwrap();
+        let running = body
+            .lines()
+            .find(|line| line.contains(" running "))
+            .unwrap_or_else(|| panic!("no running stamp in: {body}"))
+            .to_owned();
+        drop(calls);
+
+        // Simulate the host killing the process: the stamp is what it left.
+        let state = dir.path().join("state");
+        fs::write(state.join("o_r.stamp"), format!("{running}\n")).unwrap();
+        let cfg = canary("true", 30);
+        let load = |_: &Path| -> Result<Option<CanaryConfig>, String> {
+            panic!("a clone and config read started despite the in-progress stamp")
+        };
+        let _ = &cfg;
+        let origin = dir.path().join("origin");
+        let req = request(&origin, &load, &state, true);
+        let report = run_canary(&req, &|_| Err("must not be called".to_owned())).unwrap();
+        assert_eq!(report.status, "skipped");
+        assert_eq!(report.detail, "already ran today");
     }
 }
