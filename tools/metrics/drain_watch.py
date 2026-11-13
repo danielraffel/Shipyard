@@ -373,21 +373,39 @@ def run(a, now=None, issues=None):
         if new:
             lines.append(f"{stamp} drain-watch kind={f['kind']} repo={f['repo']} lane={f['lane']} "
                          f"detail={f['detail'].replace(' ', '_')} first_seen={st['first_seen']} count={st['runs']}")
-        if st["runs"] >= 2:
-            due = not st["issue"] or time.time() - st.get("issue_updated", 0) >= ISSUE_UPDATE_EVERY
-            if due:
-                actions.append(f"would file/update issue for {f['key']}" if a.dry_run else None)
-                if not a.dry_run:
-                    try:
-                        st["issue"] = issues.upsert(f, st)
-                        st["issue_updated"] = time.time()
-                    except Exception as exc:
-                        lines.append(f"{stamp} drain-watch ERROR issue {f['key']}: {str(exc)[:100]}")
+        st["evidence"] = (st.get("evidence", []) + [e for e in f["evidence"] if e not in st.get("evidence", [])])[:6]
+    # File or refresh issues. A finding whose issue call failed stays `pending` in the
+    # state with its evidence and is retried on later runs even if its log lines are
+    # gone (the log offset has already moved past them).
+    current = {f["key"]: f for f in findings}
+    for key, st in findings_state.items():
+        if st["runs"] < 2:
+            continue
+        pending = st.get("pending")
+        f = current.get(key)
+        if f is None and pending is None:
+            continue
+        f = dict(f or pending, evidence=st.get("evidence") or (pending or f)["evidence"])
+        due = pending is not None or not st["issue"] or time.time() - st.get("issue_updated", 0) >= ISSUE_UPDATE_EVERY
+        if not due:
+            continue
+        if a.dry_run:
+            actions.append(f"would file/update issue for {key}")
+            continue
+        try:
+            st["issue"] = issues.upsert(f, st)
+            st["issue_updated"] = time.time()
+            st.pop("pending", None)
+        except Exception as exc:
+            st["pending"] = {k: f[k] for k in ("kind", "repo", "lane", "key", "detail", "evidence")}
+            lines.append(f"{stamp} drain-watch ERROR issue {key}: {str(exc)[:100]}")
     for key in list(findings_state):
         if key in seen:
             continue
         st = findings_state[key]
         st["absent"] = st.get("absent", 0) + 1
+        if st.get("pending") and not st.get("issue"):
+            continue  # no issue could be filed yet: keep it until one is
         if st["absent"] >= CLEAR_RUNS:
             if st.get("issue"):
                 if a.dry_run:

@@ -242,6 +242,30 @@ class StateTests(Base):
         _, _, f = self.run_once()
         self.assertEqual([x["detail"] for x in f], ["PermissionError x1"])
 
+    def test_failed_issue_call_is_retried_with_original_evidence(self):
+        log = self.fleet / "repair.log"
+        log.write_text("start\n")
+        self.run_once()                                   # seeds offsets
+        good = self.args.ghapp
+        with open(log, "a") as fh:
+            fh.write("PermissionError: first sighting evidence\n")
+        self.run_once()                                   # run 1 of the finding
+        with open(log, "a") as fh:
+            fh.write("PermissionError: second sighting\n")
+        self.args.ghapp = "/nonexistent/ghapp"
+        self.run_once()                                   # run 2: issue call fails
+        self.assertTrue(any("ERROR issue" in l for l in self.summary()))
+        self.assertIn("pending", self.state()["findings"]["pass_fault:repair:PermissionError"])
+        self.args.ghapp = good
+        _, _, f = self.run_once()                         # run 3: no new log lines, offsets are past them
+        self.assertEqual(f, [])
+        issues = self.store()["issues"]
+        self.assertEqual(len(issues), 1)
+        self.assertIn("first sighting evidence", issues[0]["body"])
+        self.assertNotIn("pending", self.state()["findings"]["pass_fault:repair:PermissionError"])
+        self.run_once()
+        self.assertEqual(len(self.store()["issues"]), 1)
+
     def test_issue_failure_is_logged_not_raised(self):
         self.stalled()
         self.args.ghapp = "/nonexistent/ghapp"
