@@ -120,3 +120,43 @@ fn an_unreadable_config_fails_instead_of_falling_back_to_ambient_gh() {
     );
     assert!(log.exists(), "control: --gh-binary reaches the fake CLI");
 }
+
+#[test]
+fn an_unreadable_local_overlay_fails_instead_of_falling_back_to_ambient_gh() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(root.join(".shipyard-dev.local")).unwrap();
+    std::fs::write(
+        root.join(".shipyard-dev.local/config.toml"),
+        "this is = = not toml [\n",
+    )
+    .unwrap();
+    let log = root.join("gh.log");
+    for name in ["gh", "ghapp", "ghread"] {
+        logging_gh(&bin, name, &log);
+    }
+
+    // The malformed local overlay must stop the plan before any CLI runs.
+    let output = onboard_with_args(root, &[]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("config"),
+        "{output:?}"
+    );
+    assert!(
+        !log.exists(),
+        "a gh-compatible CLI was started: {}",
+        std::fs::read_to_string(&log).unwrap_or_default()
+    );
+
+    // Control: an explicit --gh-binary bypasses config loading by design.
+    let output = onboard(root, &[]);
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "the fake answers nothing usable"
+    );
+    assert!(log.exists(), "control: --gh-binary reaches the fake CLI");
+}
