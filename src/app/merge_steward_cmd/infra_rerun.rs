@@ -153,6 +153,10 @@ pub(super) struct Record {
     /// Failing step of the red last judged.
     #[serde(default)]
     pub(super) step: String,
+    /// Failing test names the diagnosis of the red last judged named (sorted),
+    /// for red-everywhere grouping ([`super::red_everywhere`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) tests: Vec<String>,
     /// Errors on the red last judged.
     #[serde(default)]
     pub(super) errors: u32,
@@ -576,6 +580,15 @@ fn step_of(doc: &Diagnosis, run_id: u64, check: &str) -> String {
     }
 }
 
+fn tests_of(doc: &Diagnosis, run_id: u64, check: &str) -> Vec<String> {
+    let mut names = diagnosis_of(doc, run_id, check)
+        .map(|item| item.failing_tests.names.clone())
+        .unwrap_or_default();
+    names.sort();
+    names.dedup();
+    names
+}
+
 fn rule_of(doc: &Diagnosis, run_id: u64, check: &str) -> String {
     diagnosis_of(doc, run_id, check)
         .map(|item| format!("{}/{}", item.classification.class, item.classification.rule))
@@ -785,6 +798,7 @@ pub(super) fn sweep(
                     record.reruns = record.reruns.max(MAX_RERUNS);
                     "capped".clone_into(&mut record.verdict);
                     record.step = step_of(&doc, run_id, &candidate.check);
+                    record.tests = tests_of(&doc, run_id, &candidate.check);
                     record.why = format!(
                         "re-run {MAX_RERUNS} times and still {}",
                         rule_of(&doc, run_id, &candidate.check)
@@ -797,6 +811,7 @@ pub(super) fn sweep(
                     let record = record_for(ledger, repo, candidate);
                     "declined".clone_into(&mut record.verdict);
                     record.step = step_of(&doc, run_id, &candidate.check);
+                    record.tests = tests_of(&doc, run_id, &candidate.check);
                     record.why.clone_from(&reason);
                     push(&mut status, candidate, "declined", reason.clone());
                 }
@@ -819,8 +834,10 @@ pub(super) fn sweep(
                 for candidate in &members {
                     let rule = rule_of(&doc, run_id, &candidate.check);
                     let step = step_of(&doc, run_id, &candidate.check);
+                    let tests = tests_of(&doc, run_id, &candidate.check);
                     let record = record_for(ledger, repo, candidate);
                     record.step.clone_from(&step);
+                    record.tests = tests;
                     record.why.clone_from(&rule);
                     if spent {
                         "capped".clone_into(&mut record.verdict);

@@ -590,6 +590,35 @@ steward does not own), `shipyard auto-merge`, `shipyard ship` and the `ghapp`
 arm guard keep their earlier same-head rules, including re-arming after
 `invalid_merge_commit`.
 
+## Red everywhere: one cause on the base
+
+When one required check fails the same way on three or more open pull requests
+at once, the cause is almost always on the base, not in those pull requests (for
+example, a test that depends on today's date and was fixed on `main`). Each pass
+groups the open pull requests whose current head fails a required check by
+(check, failing test name). The test names are the ones the infra re-run sweep
+already read when it diagnosed that head's red run; a head whose run was not
+diagnosed groups by the check alone, and never joins a named test's group. A
+group of three or more distinct pull requests is an episode. The approval check
+(`review-verdict`) never groups. It adds no GitHub reads.
+
+```toml
+[auto_merge]
+red_everywhere = "shadow"   # off | shadow (default) | enforce
+```
+
+| Where | What it shows |
+|---|---|
+| repository report `red_everywhere` | `mode`, and one entry per episode: `check`, `test` (or `null` for the check alone), `prs`, `first_seen`, `new` |
+| row `red_everywhere` | `check`, `test`, `prs` (members), `repair_skip` (true only under enforce); `blocked_on` is unchanged |
+| row `next_action.action` | "Failing on N PRs with the same test: <check> (<test>). Likely a base-level cause; do not repair this PR, wait for the base fix or merge main once main is green." The actor is unchanged |
+| `summary.log` | `red_everywhere=<episodes>` on each repository line |
+| enqueue (enforce only) | a member whose head has not changed since the episode began is not enqueued: `held_red_everywhere:<check>`. Nothing is dequeued or closed |
+
+A member that pushes a new head leaves the episode; the episode ends (and is
+forgotten) when fewer than three members remain. Not yet built: filing an
+issue when an episode lasts a second pass.
+
 ## Dwell-time limits and the next-to-admit ranking
 
 A pull request should never sit in one state for hours with nobody told. Each

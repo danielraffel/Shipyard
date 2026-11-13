@@ -85,7 +85,9 @@ steward_one() {
     # --no-invariants, or a repository it could not observe).
     invariants=$(jq -r '[.repos[]? | select(has("invariants"))] as $r | if ($r|length)==0 then "off" else ([$r[].invariants[] | select(.ok==false and (.skipped|not)) | .id] | if length==0 then "ok" else "FAIL:"+join(",") end) end' "$out" 2>/dev/null || echo ERROR)
     oldest=$(jq -r '[.repos[]?.blocked_summary?.oldest[]?|"#\(.number):\(.blocked_on):\(.age_minutes)m"]|join(",")' "$out" 2>/dev/null || true)
-    echo "$stamp $repo rc=$rc $counts took=${took}s ver=$steward_ver invariants=$invariants${oldest:+ oldest=$oldest}" >> "$log_dir/summary.log"
+    # Base-level episodes: one required check failing the same test on 3+ open PRs.
+    red_everywhere=$(jq -r '[.repos[]?.red_everywhere?.groups[]?]|length' "$out" 2>/dev/null || echo ERROR)
+    echo "$stamp $repo rc=$rc $counts took=${took}s ver=$steward_ver invariants=$invariants red_everywhere=$red_everywhere${oldest:+ oldest=$oldest}" >> "$log_dir/summary.log"
   elif grep -q "another steward apply pass is already running" "$out.err" 2>/dev/null; then
     echo "$stamp $repo skipped=lock_busy" >> "$log_dir/summary.log"
   else

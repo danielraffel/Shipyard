@@ -291,6 +291,18 @@ pub(super) fn apply_repo_plan(
             deadline: args.pass_deadline,
         },
     );
+    // Red everywhere: the same check failing the same test on many heads.
+    // Reads nothing: the census's checks and the sweep's ledger records.
+    let red_everywhere_reds =
+        super::red_everywhere::reds(observation, ledger, &args.approval_context, &infra_excluded);
+    let red_everywhere_status = super::red_everywhere::run(
+        policy.ejection_guards.red_everywhere,
+        observation,
+        &red_everywhere_reds,
+        ledger,
+        &mut reports,
+        Utc::now().timestamp(),
+    );
     let mut unhealthy = (args.preempt_capacity && observation.preemption_error.is_some())
         || native_arm_failed
         || infra_rerun_failed
@@ -398,6 +410,7 @@ pub(super) fn apply_repo_plan(
             exit_reasons: Vec::new(),
             dwell: Some(dwell_report),
             infra_rerun: Some(infra_rerun_status),
+            red_everywhere: Some(red_everywhere_status),
             invariants: Vec::new(),
             repo: observation.repo.clone(),
             base: args.base.clone(),
