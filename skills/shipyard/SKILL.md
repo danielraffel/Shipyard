@@ -5990,7 +5990,8 @@ dry-run). Confirmation also accepts red everywhere
 (`fix_first::confirmed_since`: tip red, or a `red_everywhere` episode on the
 check that began after the tip's newest verdict; unread tip never), so
 `base_poison::observe` now runs after `red_everywhere::observe` and takes
-`Pass::checks_first_seen`. `fix_reorder.rs`: queued fix at position > 1,
+`Pass::checks_first_seen`. `fix_reorder.rs`: queued fix at position > 1, in `covering`, on a pass
+with no `partial()`,
 `base_health_cmd::jump(.., Some(census head))` under the PR mutation guard,
 `JumpDecision` per episode (`<context>@<red_since>`) in
 `base-health/fix-reorders.jsonl`, failures retried. `orphan_groups.rs`:
@@ -6000,7 +6001,8 @@ per suspect branch, only `HTTP 404` cancels (run mutation guard), receipts
 in `base-health/orphan-cancels.jsonl`. `red_base_ejections.rs`: ledger
 `red_base_ejections` (`repo@base`) records group PRs at their census head
 while confirmed (window from `red_since - 2h`), closes the window when
-`tip_green_for` or a passing group, then `excused_queue` (called in
+`tip_green_for` or a passing group, on a pass with no `partial()` and no
+confirmed context, then `excused_queue` (called in
 `evaluate_head_gate_with` after `without_steward_removals`) drops the head's
 in-window `failed_checks` removals when the latest removal is one; dropped
 on re-enqueue, head move, close or 48 h.

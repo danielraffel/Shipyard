@@ -1492,3 +1492,132 @@ fn live_admission_admits_a_rival_green_head_beside_the_labelled_fix() {
         Admission::Hold { .. }
     ));
 }
+
+/// The reorder follows admission's rules: a named fix that does not pass
+/// every confirmed context, or any fix on a partial pass, is never moved.
+#[test]
+fn the_reorder_needs_a_covering_fix_and_a_fully_read_pass() {
+    use crate::app::merge_steward_cmd::fix_reorder;
+    let mut half = pr_with_greens(500, 'c', &[(CONTEXT, "2026-11-13T10:40:00Z")]);
+    half.fact.queue_position = Some(2);
+    let mut front = pr_with_greens(
+        501,
+        'd',
+        &[
+            (CONTEXT, "2026-11-13T10:40:00Z"),
+            (OTHER, "2026-11-13T10:41:00Z"),
+        ],
+    );
+    front.fact.queue_position = Some(1);
+    let prs = [front, half];
+    let mut poison = with_acts(two_context_poison(&prs, red_on_both()), PoisonHold::On);
+    poison.fixes = BTreeMap::from([(500, vec!["label `shipyard:unblock`".to_owned()])]);
+    let mut observation = observation_for(prs[0].clone(), true);
+    observation.prs = prs.to_vec();
+    let refused = fix_reorder::candidate(&poison, &observation).expect_err("not covering");
+    assert!(
+        refused.contains("does not pass every confirmed context"),
+        "{refused}"
+    );
+    // A covering fix on a partial pass is not moved either.
+    let mut whole = pr_with_greens(
+        502,
+        'e',
+        &[
+            (CONTEXT, "2026-11-13T10:40:00Z"),
+            (OTHER, "2026-11-13T10:41:00Z"),
+        ],
+    );
+    whole.fact.queue_position = Some(3);
+    let prs = [prs[0].clone(), whole];
+    let mut tip = red_on_both();
+    tip.insert(
+        "third".to_owned(),
+        TipReading {
+            error: Some("HTTP 502".to_owned()),
+            ..TipReading::default()
+        },
+    );
+    let mut partial = with_acts(two_context_poison(&prs, tip), PoisonHold::On);
+    partial.fixes = BTreeMap::from([(502, vec!["green head".to_owned()])]);
+    observation.prs = prs.to_vec();
+    assert!(partial.covering.contains(&502));
+    let refused = fix_reorder::candidate(&partial, &observation).expect_err("partial");
+    assert!(refused.contains("partial read"), "{refused}");
+}
+
+/// Red-base ejections are not released while another context is still
+/// confirmed, or on a partial pass.
+#[test]
+fn red_base_ejections_wait_for_every_context_and_a_full_read() {
+    use crate::app::merge_steward_cmd::red_base_ejections;
+    let prs = [ejected_404(), pr_409()];
+    let mut observation = observation_for(prs[0].clone(), true);
+    observation.prs = prs.to_vec();
+    let mut ledger = StewardLedger::default();
+    let both = with_acts(two_context_poison(&prs, red_on_both()), PoisonHold::On);
+    red_base_ejections::reconcile(
+        PoisonHold::On,
+        true,
+        &mut ledger,
+        &observation,
+        Some(&both),
+        Utc::now(),
+    );
+    assert_eq!(
+        red_base_ejections::entries(&ledger, &observation.repo, &observation.base).len(),
+        1
+    );
+    // CONTEXT goes green on the tip; OTHER is still red.
+    let mut tip = red_on_both();
+    tip.insert(CONTEXT.to_owned(), tip_green());
+    let one_left = two_context_poison(&prs, tip);
+    red_base_ejections::reconcile(
+        PoisonHold::On,
+        true,
+        &mut ledger,
+        &observation,
+        Some(&one_left),
+        Utc::now(),
+    );
+    assert!(!red_base_ejections::entries(&ledger, &observation.repo, &observation.base)[0].ready);
+    // Both green but a third read failed: still not released.
+    let mut tip = BTreeMap::from([
+        (CONTEXT.to_owned(), tip_green()),
+        (OTHER.to_owned(), tip_green()),
+    ]);
+    tip.insert(
+        "third".to_owned(),
+        TipReading {
+            error: Some("HTTP 502".to_owned()),
+            ..TipReading::default()
+        },
+    );
+    let partial = two_context_poison(&prs, tip);
+    red_base_ejections::reconcile(
+        PoisonHold::On,
+        true,
+        &mut ledger,
+        &observation,
+        Some(&partial),
+        Utc::now(),
+    );
+    assert!(!red_base_ejections::entries(&ledger, &observation.repo, &observation.base)[0].ready);
+    // Fully read, nothing confirmed: released.
+    let green = two_context_poison(
+        &prs,
+        BTreeMap::from([
+            (CONTEXT.to_owned(), tip_green()),
+            (OTHER.to_owned(), tip_green()),
+        ]),
+    );
+    red_base_ejections::reconcile(
+        PoisonHold::On,
+        true,
+        &mut ledger,
+        &observation,
+        Some(&green),
+        Utc::now(),
+    );
+    assert!(red_base_ejections::entries(&ledger, &observation.repo, &observation.base)[0].ready);
+}

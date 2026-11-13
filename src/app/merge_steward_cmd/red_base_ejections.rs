@@ -12,9 +12,10 @@
 //!   request that rode one of its failing merge groups is recorded at its
 //!   current head, with the episode's window (from [`LOOKBACK`] before the
 //!   base went red, so the streak's own groups count).
-//! * **Release.** The first pass that reads the episode over (the tip read
-//!   and no longer confirmed, or a merge group passing the context) closes
-//!   the window and marks the entry ready.
+//! * **Release.** The first fully read pass with no context confirmed that
+//!   reads the episode over (the tip read and no longer confirmed, or a
+//!   merge group passing the context) closes the window and marks the entry
+//!   ready.
 //! * **Excuse.** At admission ([`excused_queue`]), a ready entry removes from
 //!   the head's queue timeline its `failed_checks` removals inside the
 //!   window, but only when the head's latest removal is one of them: a head
@@ -81,6 +82,11 @@ fn episode_over(poison: Option<&RepoPoison>, context: &str) -> bool {
     let Some(poison) = poison else {
         return false;
     };
+    // Nothing is released on a partial pass, or while any context is still
+    // confirmed: a head excused now would only be held again.
+    if poison.partial().is_some() || !poison.confirmed_contexts().is_empty() {
+        return false;
+    }
     match &poison.health {
         MergeGroupHealth::Clear { passed, .. } => passed.iter().any(|done| done == context),
         MergeGroupHealth::Poisoned { .. } => poison.tip_green_for(context),

@@ -9,8 +9,11 @@
 //! ([`crate::app::base_health_cmd::jump`]).
 //!
 //! It acts only while a context is confirmed red
-//! ([`super::base_poison::RepoPoison::confirmed_contexts`]) and only on the
-//! one fix the pass named. An entry at position 1 is left alone: its group
+//! ([`super::base_poison::RepoPoison::confirmed_contexts`]), only on a pass
+//! that read everything (no `partial`), and only on the one fix the pass
+//! named when that fix passed every confirmed context after the break
+//! ([`super::base_poison::RepoPoison::covering`], the same set admission
+//! uses). An entry at position 1 is left alone: its group
 //! is the one already building. The jump is bound to the repository, the
 //! base and the head the census read; a head that moved or a different base
 //! is refused before anything changes, and the jump re-reads the exact-head
@@ -64,6 +67,18 @@ pub(super) fn candidate(
     let Some(number) = poison.fixes.keys().next().copied() else {
         return Ok(None);
     };
+    // A pass that could not read everything decides nothing that reorders.
+    if let Some(gap) = poison.partial() {
+        return Err(format!("#{number}: partial read ({gap}); not reordered"));
+    }
+    // The same rule as admission: only a fix that passed every confirmed
+    // context after the break is moved; a fix for one context would form a
+    // group that still fails another.
+    if !poison.covering.contains(&number) {
+        return Err(format!(
+            "#{number}: does not pass every confirmed context; not reordered"
+        ));
+    }
     let Some(pr) = observation.prs.iter().find(|pr| pr.fact.number == number) else {
         return Err(format!("#{number}: not open on {}", observation.base));
     };
