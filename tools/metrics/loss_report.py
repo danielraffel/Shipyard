@@ -283,6 +283,67 @@ def load_github_cache(path):
     return closed, list(comments.values())
 
 
+
+# ------------------------------------------------- idle gate-slot minutes
+def idle_slots(log_dir, start, now, days):
+    """Per UTC day: gate-slot minutes that sat idle while PRs waited, with the top 3 reasons.
+
+    Reads idle-slots.jsonl, one sample per steward tick written by drain_watch.py. A sample
+    counts (`counted`) only when a probe was verified, at least one PR waited, and the
+    previous sample gave an interval. Each counted sample's minutes are split over the
+    waiting states in proportion to the PRs in each. A day with no samples is null.
+    """
+    per = {d: {"samples": 0, "counted": 0, "minutes": 0.0, "waiting_minutes": 0.0, "reasons": collections.Counter(),
+               "probe_failures": 0, "unverified_samples": 0, "capped": 0, "loop_samples": 0} for d in days}
+    try:
+        with open(os.path.join(log_dir, "idle-slots.jsonl")) as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        try:
+            s = json.loads(line)
+            t = parse_iso(s["t"])
+        except Exception:
+            continue
+        day = t.strftime("%Y-%m-%d") if t else None
+        if day not in per or t < start or t > now:
+            continue
+        d = per[day]
+        d["samples"] += 1
+        d["capped"] += bool(s.get("interval_capped"))
+        d["loop_samples"] += bool(s.get("loop_source"))
+        pr = s.get("probes") or []
+        d["probe_failures"] += sum(1 for p in pr if not p.get("ok"))
+        d["unverified_samples"] += s.get("idle_slots") is None
+        if s.get("counted"):
+            d["counted"] += 1
+            d["minutes"] += s.get("minutes") or 0.0
+            tot = s.get("waiting_total") or 0
+            for state, n in (s.get("waiting") or {}).items():
+                d["reasons"][state] += (s.get("minutes") or 0.0) * n / tot if tot else 0
+    out = {}
+    for day, d in per.items():
+        if not d["samples"]:
+            out[day] = None
+            continue
+        mins = d["minutes"]
+        top = [{"state": k, "minutes": round(v, 1), "share_pct": round(100.0 * v / mins, 1) if mins else None}
+               for k, v in d["reasons"].most_common(3)]
+        if d["unverified_samples"] == d["samples"]:
+            status, why = "unavailable", "no probe was verified in any sample"
+        elif d["probe_failures"] or d["unverified_samples"] or d["capped"]:
+            status, why = "partial", (f"{d['probe_failures']} unverified or failed probe(s), {d['unverified_samples']} sample(s) "
+                                      f"with no verified probe, {d['capped']} sample(s) with a capped or unknown interval")
+        else:
+            status, why = "available", "every probe verified, every interval measured"
+        out[day] = {"idle_slot_minutes": round(mins, 1) if d["counted"] or status != "unavailable" else None,
+                    "samples": d["samples"], "counted_samples": d["counted"], "top_reasons": top,
+                    "reasons_source": "loop.state" if d["loop_samples"] == d["samples"] else
+                    ("blocked_on mapping" if not d["loop_samples"] else "mixed"),
+                    "coverage": cov(status, why)}
+    return out
+
 # ------------------------------------------------------------------ report
 def pct(n, d):
     return None if not d else round(100.0 * n / d, 1)
@@ -418,6 +479,7 @@ def build_report(log_dir, since, now, github=None, gap_minutes=120):
                                                           "token seen" if red_seen else "never seen in the window: not emitted by this binary, or none occurred; cannot tell"),
                             "default": cov("available", "null on a UTC day with no tick files; a day is the UTC day an episode was first seen")},
         "by_repo_token": table,
+        "idle_gate_slots": idle_slots(log_dir, start, now, days),
     }
     return report
 
@@ -435,6 +497,14 @@ def markdown(r):
         for k, v in r["series_per_day"].items():
             cells.append("unavail" if v is None or v.get(day) is None else str(v[day]))
         out.append(f"| {day} | " + " | ".join(cells) + " |")
+    out += ["", "## Idle gate-slot minutes while PRs waited", "", "| day | idle slot minutes | top reasons | coverage |", "|---|---|---|---|"]
+    for day, v in r["idle_gate_slots"].items():
+        if v is None:
+            out.append(f"| {day} | unavail | | no samples |")
+        else:
+            top = ", ".join(f"{x['state']} {x['share_pct']}%" for x in v["top_reasons"]) or "-"
+            m = "unavail" if v["idle_slot_minutes"] is None else v["idle_slot_minutes"]
+            out.append(f"| {day} | {m} | {top} | {v['coverage']['status']} |")
     out += ["", "## Top actionable by repo and token", "", "| repo | token | episodes | actionable | normal wait | closed unmerged | fix pushes |", "|---|---|---|---|---|---|---|"]
     for row in r["by_repo_token"][:15]:
         cu = row.get("closed_unmerged", 0) if r["coverage"]["github"]["status"] != "unavailable" else "unavail"
@@ -451,6 +521,16 @@ def summary_line(r, stamp):
             f"agent_free_strict={a['rate_strict_pct']}% denom={a['denominator_resolved_actionable']} "
             f"owner_stops_per_100={o['per_100_prs']} rv_same_head_no_push={rvs} "
             f"coverage={r['coverage']['window']['status']}")
+
+
+def idle_summary_line(r, stamp, day):
+    v = (r.get("idle_gate_slots") or {}).get(day)
+    if v is None:
+        return f"{stamp} idle-slots day={day} idle_slot_minutes=unavailable top=- coverage=unavailable samples=0"
+    m = "unavailable" if v["idle_slot_minutes"] is None else v["idle_slot_minutes"]
+    top = ",".join(f"{x['state']}:{x['share_pct']}%" for x in v["top_reasons"]) or "-"
+    return (f"{stamp} idle-slots day={day} idle_slot_minutes={m} top={top} coverage={v['coverage']['status']} "
+            f"samples={v['samples']} reasons={v['reasons_source'].replace(' ', '_')}")
 
 
 # ------------------------------------------------------------------- daily
@@ -501,6 +581,7 @@ def daily(log_dir, now=None, since=dt.timedelta(days=7), github=None):
                 fh.write(text)
             os.replace(tmp, path)
         say(summary_line(rep, stamp))
+        say(idle_summary_line(rep, stamp, (now - dt.timedelta(days=1)).strftime("%Y-%m-%d")))
     except BaseException as exc:  # a report must never fail the tick
         say(f"{stamp} loss-report ERROR {type(exc).__name__}: {str(exc)[:120]}")
     finally:

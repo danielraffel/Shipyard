@@ -38,3 +38,45 @@ new. A line with no timestamp before it cannot be proven old and is counted.
 `python3 -I tools/metrics/drain_watch.py --dry-run [--from-start]` prints what
 would be announced and filed and changes nothing. `--from-start` counts log
 lines from the beginning on a first run.
+
+## Idle gate-slot minutes
+
+One number for the daily report: gate-VM slots that sat idle while PRs waited.
+Each watch run (every steward tick) takes one sample and appends it to
+`idle-slots.jsonl` in the tick log directory (35 days kept):
+
+- **Idle slots:** `tartci fleet capacity --repo R --target T --json` on this host and, for each
+  host in `SHIPYARD_IDLE_SLOT_HOSTS` (space separated, over `ssh -o BatchMode=yes`), for
+  each target in `SHIPYARD_IDLE_SLOT_TARGETS` (default `macos`). The probe is
+  observation-only and reports one host at a time: `free_slots`, `eligible_slots`,
+  `verification` and `pool_state`. A fleet total is the sum of `free_slots` over the
+  probes whose `verification` is `verified`; a probe that failed or is `unknown` adds
+  nothing and makes the day `partial`. Hosts are not hard-coded: set the variable on the
+  steward host. `SHIPYARD_IDLE_SLOT_REPO` (default `danielraffel/Shipyard`) only selects the
+  profile the probe hashes. `SHIPYARD_IDLE_SLOTS=off` disables sampling.
+- **PRs waiting:** open PRs whose `loop.state` is anything except `running` or `queued`. Until
+  the tick JSON carries `loop`, the `blocked_on` token is mapped onto the same names
+  (`merge_state:DIRTY` is `dirty`, `BEHIND` is `behind`, `required_failed` and
+  `required_never_ran` are `red`, `held*` and carried commits are `hold`, `ejected_same_head`
+  is `ejected`, `no_verdict`, `approval_excluded` and a reviewer-owned `required_pending` are
+  `awaiting_review`; running checks, queue states, drafts and human stops do not wait). The
+  report says which source a day used (`reasons_source`).
+- **Minutes:** idle slots x seconds since the previous sample (capped at 10 minutes, so a gap
+  in sampling is not billed), counted only while at least one PR waited and at least one
+  probe was verified. The first sample ever has no interval and is not counted.
+- **Reasons:** each counted sample's minutes are split over the waiting states in proportion
+  to the PRs in each; the top 3 by minutes are reported with their share.
+
+The slot count is not matched to the repository whose PRs wait (a macOS slot idle while only
+Linux PRs wait still counts). That makes the figure an upper bound on avoidable idleness;
+`--gate-target` and the probe hosts narrow it.
+
+The loss report (`tools/metrics/loss_report.py`) reads the file: `idle_gate_slots` per day in
+its JSON and markdown, and its daily run logs one line for the previous UTC day:
+
+```
+<stamp> idle-slots day=2026-11-12 idle_slot_minutes=20.0 top=dirty:47.5%,ejected:20.0%,red:12.5% coverage=available samples=288 reasons=blocked_on_mapping
+```
+
+A day with no samples is `unavailable`, never 0. Coverage is `available` when every probe was
+verified and every interval measured, `partial` otherwise, `unavailable` when no probe was verified.

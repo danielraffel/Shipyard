@@ -20,6 +20,7 @@ Kinds:
 from __future__ import annotations
 
 import argparse
+import collections
 import datetime as dt
 import glob
 import json
@@ -123,7 +124,8 @@ def recent_ticks(log_dir, now, span):
                 na = p.get("next_action") or {}
                 rows[p["number"]] = {"head": p.get("head_sha"), "token": p.get("blocked_on") or "unknown",
                                      "actor": na.get("actor"), "stop": bool(na.get("stop")),
-                                     "since": parse_iso(p.get("since")), "deferred": read_deferred(p)}
+                                     "since": parse_iso(p.get("since")), "deferred": read_deferred(p),
+                                     "loop_state": (p.get("loop") or {}).get("state") if isinstance(p.get("loop"), dict) else None}
             per_repo.setdefault(r["repo"], []).append((t, rows))
     for v in per_repo.values():
         v.sort(key=lambda x: x[0])
@@ -194,6 +196,123 @@ def check_stale_hold(per_repo, now):
                             detail=f"{len(old)} held PR(s) 45m+ with no new head: " + ",".join(f"#{n}" for n in sorted(old)[:5]),
                             evidence=[f"{repo}#{n} {rows[n]['token']} since {rows[n]['since'].isoformat()}" for n in sorted(old)[:5]]))
     return out
+
+
+# ------------------------------------------------------- idle gate slots
+IDLE_FILE = "idle-slots.jsonl"
+IDLE_CAP_SECONDS = 600
+RUNNING_LIKE = {"required_pending", "capacity_queued", "transient_rerun", "revalidating"}
+QUEUED_LIKE = {"queued", "admitted", "ready", "deferred_pass_budget",
+               "carried_commits_over_cap", "carried_commits_unreadable"}
+
+
+def waiting_state(o):
+    """The state a PR is waiting in, or None when it is not waiting.
+
+    With the steward's `loop.state` (behind|dirty|running|red|hold|awaiting_review|
+    quarantined|ejected|queued) a PR waits in any state except running or queued.
+    Until `loop` is in the tick JSON, the blocked_on token is mapped onto the same
+    names. Drafts and human stops are not waiting for a gate.
+    """
+    if o.get("loop_state"):
+        return None if o["loop_state"] in ("running", "queued") else o["loop_state"]
+    token, fam = o["token"], o["token"].split(":", 1)[0]
+    klass = classify(token, o["actor"], o["stop"])
+    if klass in ("intentional", "human_stop"):
+        return None
+    if fam in RUNNING_LIKE:
+        return "awaiting_review" if o["actor"] == "reviewer" else None
+    if fam in QUEUED_LIKE:
+        return None
+    if fam == "merge_state":
+        detail = token.partition(":")[2].upper()
+        return {"DIRTY": "dirty", "BEHIND": "behind"}.get(detail, "merge_state_" + detail.lower())
+    return {"required_failed": "red", "required_never_ran": "red", "ejected_same_head": "ejected",
+            "held": "hold", "carries_unapproved_commits": "hold", "no_verdict": "awaiting_review",
+            "approval_excluded": "awaiting_review"}.get(fam, fam)
+
+
+def probe_capacity(a, host, repo, target):
+    """One read-only `tartci fleet capacity` probe. Returns a small dict, never raises."""
+    base = [a.tartci, "fleet", "capacity", "--repo", repo, "--target", target, "--json"]
+    cmd = base if host == "local" else [a.ssh, "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", host,
+                                        'PATH="$HOME/.local/bin:/opt/homebrew/bin:$PATH" ' + " ".join(base)]
+    rec = {"host": host, "target": target, "ok": False, "free": None, "eligible": None, "verification": None}
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
+        d = json.loads(r.stdout)
+        rec["verification"] = d.get("verification")
+        rec["pool_state"] = d.get("pool_state")
+        rec["host_id"] = d.get("host_id")
+        if d.get("verification") == "verified" and isinstance(d.get("free_slots"), int):
+            rec["ok"], rec["free"], rec["eligible"] = True, d["free_slots"], d.get("eligible_slots")
+        else:
+            rec["reason"] = str(d.get("reason") or "unverified")[:60]
+    except Exception as exc:
+        rec["reason"] = f"probe failed: {type(exc).__name__}"
+    return rec
+
+
+def sample_idle_slots(a, now, per_repo):
+    """One sample per tick: idle gate slots across the probed hosts and the PRs waiting.
+
+    Minutes are idle slots x seconds since the previous sample (capped), and only
+    while at least one PR was waiting and at least one probe was verified.
+    """
+    path = os.path.join(a.log_dir, IDLE_FILE)
+    prev = None
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(max(0, os.path.getsize(path) - 4096))
+            tail = fh.read().decode("utf-8", "replace").splitlines()
+        for line in reversed(tail):
+            try:
+                prev = parse_iso(json.loads(line)["t"])
+                break
+            except Exception:
+                continue
+    except OSError:
+        pass
+    interval = IDLE_CAP_SECONDS if prev is None else (now - prev).total_seconds()
+    capped = interval > a.idle_cap_seconds or prev is None
+    interval = max(0.0, min(interval, a.idle_cap_seconds))
+    waiting, stale_repos = collections.Counter(), []
+    for repo, ticks in per_repo.items():
+        t_last, rows = latest_valid(ticks)
+        if rows is None or now - t_last > dt.timedelta(minutes=10):
+            stale_repos.append(repo)
+            continue
+        for o in rows.values():
+            st = waiting_state(o)
+            if st:
+                waiting[st] += 1
+    probes = [probe_capacity(a, h, a.probe_repo, t) for h in ["local"] + list(a.probe_host) for t in a.gate_target]
+    ok = [p for p in probes if p["ok"]]
+    idle = sum(p["free"] for p in ok) if ok else None
+    total_waiting = sum(waiting.values())
+    counted = idle is not None and total_waiting > 0 and prev is not None
+    return {"t": now.isoformat(timespec="seconds"), "interval_s": round(interval), "interval_capped": capped,
+            "idle_slots": idle, "waiting": dict(waiting), "waiting_total": total_waiting,
+            "probes": probes, "stale_repos": stale_repos, "loop_source": any(
+                o.get("loop_state") for ticks in per_repo.values() for _, rows in ticks[-1:] if rows for o in rows.values()),
+            "minutes": round(idle * interval / 60.0, 2) if counted else 0.0, "counted": counted}
+
+
+def write_idle_sample(a, now, sample):
+    path = os.path.join(a.log_dir, IDLE_FILE)
+    with open(path, "a") as fh:
+        fh.write(json.dumps(sample, separators=(",", ":")) + "\n")
+    if now.hour == 0 and now.minute < 6:  # once a day, drop samples older than 35 days
+        try:
+            keep = now - dt.timedelta(days=35)
+            with open(path) as fh:
+                lines = [l for l in fh if (parse_iso(json.loads(l).get("t")) or now) >= keep]
+            tmp = path + ".tmp"
+            with open(tmp, "w") as fh:
+                fh.writelines(lines)
+            os.replace(tmp, path)
+        except Exception:
+            pass
 
 
 # ----------------------------------------------------------------- claims
@@ -413,6 +532,18 @@ def run(a, now=None, issues=None):
     state = load_state(a.state)
     findings_state = state.setdefault("findings", {})
     findings = collect(a, now, state)
+    idle_line = None
+    if getattr(a, "idle_sample", False):
+        try:
+            sample = sample_idle_slots(a, now, recent_ticks(a.log_dir, now, STALL_WINDOW + dt.timedelta(minutes=30)))
+            idle_line = sample
+            if not a.dry_run:
+                write_idle_sample(a, now, sample)
+        except Exception as exc:  # sampling must never stop the watch
+            findings_state_err = f"{stamp} drain-watch ERROR idle sample: {type(exc).__name__}: {str(exc)[:80]}"
+            if not a.dry_run:
+                with open(a.summary, "a") as fh:
+                    fh.write(findings_state_err + "\n")
     seen = {f["key"] for f in findings}
     lines, actions = [], []
     issues = issues or Issues(a.ghapp)
@@ -478,6 +609,8 @@ def run(a, now=None, issues=None):
         if lines:
             with open(a.summary, "a") as fh:
                 fh.write("\n".join(lines) + "\n")
+    if idle_line is not None and a.dry_run:
+        actions.append("idle sample: " + json.dumps(idle_line, separators=(",", ":")))
     return lines, [x for x in actions if x], findings
 
 
@@ -492,8 +625,20 @@ def main(argv=None):
     ap.add_argument("--now")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--from-start", action="store_true", help="count log lines from the start on the first run instead of seeding at the end")
+    ap.add_argument("--probe-host", action="append", default=None,
+                    help="also probe this host over ssh (repeatable; default SHIPYARD_IDLE_SLOT_HOSTS, space separated)")
+    ap.add_argument("--gate-target", action="append", default=None,
+                    help="gate target label to probe (repeatable; default SHIPYARD_IDLE_SLOT_TARGETS or macos)")
+    ap.add_argument("--probe-repo", default=os.environ.get("SHIPYARD_IDLE_SLOT_REPO", "danielraffel/Shipyard"))
+    ap.add_argument("--tartci", default="tartci")
+    ap.add_argument("--ssh", default="ssh")
+    ap.add_argument("--idle-cap-seconds", type=int, default=IDLE_CAP_SECONDS)
+    ap.add_argument("--no-idle-sample", action="store_true")
     ap.add_argument("--tick", action="store_true", help="always exit 0; take a lock; log failures as one line")
     a = ap.parse_args(argv)
+    a.probe_host = a.probe_host if a.probe_host is not None else os.environ.get("SHIPYARD_IDLE_SLOT_HOSTS", "").split()
+    a.gate_target = a.gate_target or os.environ.get("SHIPYARD_IDLE_SLOT_TARGETS", "macos").split()
+    a.idle_sample = not a.no_idle_sample and os.environ.get("SHIPYARD_IDLE_SLOTS", "on") != "off"
     a.state = a.state or os.path.join(a.log_dir, "drain-watch-state.json")
     a.summary = a.summary or os.path.join(a.log_dir, "summary.log")
     now = parse_iso(a.now) if a.now else None
