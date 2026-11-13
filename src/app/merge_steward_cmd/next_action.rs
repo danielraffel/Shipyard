@@ -388,6 +388,14 @@ fn someone_elses_move(kind: &str, facts: &Facts<'_>) -> Option<NextAction> {
             ),
         ),
         "required_pending" if awaiting_reviewer(facts) => awaiting_reviewer_action(),
+        "capacity_queued" => NextAction::new(
+            Actor::Ci,
+            format!(
+                "Not blocked: required check(s) {detail} are queued for a runner and none has \
+                 started. Nothing to do on this pull request and nothing for anyone to fix; do \
+                 not push (a push requeues them) and do not stop. Take other work and come back."
+            ),
+        ),
         "required_pending" => NextAction::new(
             Actor::Ci,
             format!(
@@ -772,6 +780,17 @@ mod tests {
             let other = next("required_pending", Some(detail), true, "CLEAN");
             assert_eq!(other.actor, Actor::Ci, "{detail}");
         }
+    }
+
+    #[test]
+    fn a_capacity_queue_is_not_blocked_and_says_so() {
+        let next = next("capacity_queued", Some("macos"), true, "CLEAN");
+        assert_eq!(next.actor, Actor::Ci);
+        assert!(!next.stop);
+        assert!(!next.actionable());
+        assert!(next.action.starts_with("Not blocked"), "{next:?}");
+        assert!(next.action.contains("macos"), "{next:?}");
+        assert!(next.action.contains("do not stop"), "{next:?}");
     }
 
     #[test]
