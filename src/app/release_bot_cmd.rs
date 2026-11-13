@@ -1402,6 +1402,7 @@ fn bot_owned_handoff_pull(
     listing: &Value,
     branch: &str,
     repo: &str,
+    base: &str,
 ) -> Result<Option<u64>, String> {
     let mut owned = Vec::new();
     for pull in listing.as_array().into_iter().flatten() {
@@ -1420,9 +1421,24 @@ fn bot_owned_handoff_pull(
                 "open pull request #{number} on `{branch}` was not opened by the release bot with the `{HANDOFF_LABEL}` label; refusing to update, label or push over it"
             ));
         }
+        if pull["base"]["ref"] != base {
+            return Err(format!(
+                "open pull request #{number} on `{branch}` targets a base other than `{base}`; refusing to update, label or push over it"
+            ));
+        }
         owned.push(number);
     }
-    Ok(owned.into_iter().min())
+    if owned.len() > 1 {
+        let names = owned
+            .iter()
+            .map(|number| format!("#{number}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "several open pull requests use `{branch}` ({names}); refusing to choose one, close the extras"
+        ));
+    }
+    Ok(owned.into_iter().next())
 }
 
 /// Injectable `gh api` caller so tests can record the calls.
@@ -1468,7 +1484,7 @@ fn push_via_handoff(
             "repos/{repo}/pulls?state=open&head={owner}:{pr_branch}&per_page=100"
         )],
     )?;
-    let number = bot_owned_handoff_pull(&listing, pr_branch, repo)?;
+    let number = bot_owned_handoff_pull(&listing, pr_branch, repo, &config.branch)?;
     let existing = run_git_capture(
         cwd,
         &[
@@ -3466,6 +3482,7 @@ app_client_id = "Iv1.abc"
                         "number": 77,
                         "user": { "type": "Bot" },
                         "labels": [{ "name": "shipyard:managed" }],
+                        "base": { "ref": "main" },
                         "head": { "ref": "release/changelog-sync",
                                   "repo": { "full_name": "owner/repo" } }
                     }])
@@ -3561,6 +3578,7 @@ app_client_id = "Iv1.abc"
                 "number": 9,
                 "user": { "type": user },
                 "labels": label.map(|l| vec![serde_json::json!({ "name": l })]).unwrap_or_default(),
+                "base": { "ref": "main" },
                 "head": { "ref": "release/changelog-sync", "repo": { "full_name": "o/r" } }
             }])
         };
@@ -3568,6 +3586,7 @@ app_client_id = "Iv1.abc"
             &pull("Bot", Some("shipyard:managed")),
             "release/changelog-sync",
             "o/r",
+            "main",
         );
         assert_eq!(ours, Ok(Some(9)));
         for unrelated in [
@@ -3575,13 +3594,43 @@ app_client_id = "Iv1.abc"
             pull("Bot", None),
             pull("User", None),
         ] {
-            let error = bot_owned_handoff_pull(&unrelated, "release/changelog-sync", "o/r")
+            let error = bot_owned_handoff_pull(&unrelated, "release/changelog-sync", "o/r", "main")
                 .expect_err("refused");
             assert!(error.contains("#9"));
         }
         assert_eq!(
-            bot_owned_handoff_pull(&serde_json::json!([]), "release/changelog-sync", "o/r"),
+            bot_owned_handoff_pull(
+                &serde_json::json!([]),
+                "release/changelog-sync",
+                "o/r",
+                "main"
+            ),
             Ok(None)
+        );
+    }
+
+    #[test]
+    fn handoff_refuses_a_different_base_and_ambiguous_candidates() {
+        let pull = |number: u64, base: &str| {
+            serde_json::json!({
+                "number": number,
+                "user": { "type": "Bot" },
+                "labels": [{ "name": "shipyard:managed" }],
+                "base": { "ref": base },
+                "head": { "ref": "release/changelog-sync", "repo": { "full_name": "o/r" } }
+            })
+        };
+        let branch = "release/changelog-sync";
+        let other_base = serde_json::json!([pull(4, "develop")]);
+        let error = bot_owned_handoff_pull(&other_base, branch, "o/r", "main").expect_err("base");
+        assert!(error.contains("#4") && error.contains("base"));
+        let two = serde_json::json!([pull(8, "main"), pull(3, "main")]);
+        let error = bot_owned_handoff_pull(&two, branch, "o/r", "main").expect_err("two");
+        assert!(error.contains("#8") && error.contains("#3"));
+        let one = serde_json::json!([pull(8, "main")]);
+        assert_eq!(
+            bot_owned_handoff_pull(&one, branch, "o/r", "main"),
+            Ok(Some(8))
         );
     }
 
