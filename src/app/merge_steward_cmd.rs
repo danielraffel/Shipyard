@@ -331,6 +331,10 @@ struct StewardLedger {
     /// `poison_pause`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     poison_paused: BTreeMap<String, Vec<poison_pause::PausedEntry>>,
+    /// When each covered pull request entered its loop state at its head,
+    /// keyed `repo#pr`. See `scheduling_loop`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    loop_seen: BTreeMap<String, scheduling_loop::Seen>,
     /// Infra re-runs per check on an exact head, keyed
     /// `repo#pr@head:check`. See `infra_rerun`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -2171,6 +2175,7 @@ pub(super) mod read_probe;
 mod red_everywhere;
 mod render;
 mod resume_record;
+mod scheduling_loop;
 mod shadow_ledger;
 mod superseded;
 mod terminal_handoff;

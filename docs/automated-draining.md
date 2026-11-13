@@ -375,6 +375,9 @@ Per row, beside `decision`, `mutation` and `error`:
 - `blocked_detail`: the contexts, reason or record id behind the token.
 - `held_by`: `{holder, record, id}` whenever a HOLD names the head, even when a
   label or another state outranks it in `blocked_on`.
+- `loop`: the scheduling loop's `{state, since, action, actor, deadline_at,
+  level}` for the row, derived from the fields above with no further read
+  (see [scheduling-loop.md](scheduling-loop.md)).
 
 Per repository, `blocked_summary` holds `counts` (rows per token) and
 `oldest`: the three longest-blocked rows as `{number, blocked_on,
