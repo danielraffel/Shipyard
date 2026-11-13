@@ -3891,6 +3891,11 @@ reporting `required_never_ran:<context>` while GitHub shows the rule green.
   matched to a timeline removal within three minutes) are not counted toward
   `EJECTION_CAP` on the steward's own gate. `queue-arm-guard` has no ejection
   cap of its own.
+- **Superseded is the author's to close.** `next_action` for a `superseded`
+  PR is `actor: author, stop: true`: confirm the successor named in the body
+  or comments merged or carries the change, close the PR with a comment
+  naming it, and move on. It no longer names the owner, so no agent waits for
+  Daniel on work that already landed.
 - **Labels.** `owner-decision`, `superseded` and `PARKED/<platform>` PRs are not
   exempt: they should never be queued, so on positive evidence they are
   dequeued like any other. The same three labels also deny admission:
