@@ -4,13 +4,17 @@
 //! Read-only toward the repository: it clones, runs the configured command in
 //! the clone, and throws the clone away. The only writes are to the one issue
 //! the canary owns and to its own stamp file under the state directory.
+//!
+//! The child is not a sandbox, but it is given nothing to publish with: the
+//! clone has no remote, git's ssh and credential helpers are disabled, and
+//! tokens and keys are stripped from its environment.
 
 use std::collections::BTreeMap;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::process::{Command, ExitCode};
-use std::time::{Duration, Instant, SystemTime};
+use std::process::{Command, ExitCode, Stdio};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::Utc;
 use fs2::FileExt;
@@ -22,16 +26,21 @@ use crate::config::LoadedConfig;
 use crate::identity::RuntimeMode;
 use crate::marked_issue;
 use crate::output::write_json_envelope;
-use crate::process::{BoundedOutputError, run_output_until};
+use crate::process::{ProcessTree, run_output_until};
 use crate::release_canary::{
-    CanaryConfig, IssueAction, MARKER_PREFIX, Outcome, daily_due, decide, load_config,
-    next_version, output_tail, render_command,
+    CanaryConfig, IssueAction, MARKER_PREFIX, Outcome, daily_due, decide, is_secret_env,
+    load_config, next_version, output_tail, render_command,
 };
 
 const CLONE_TIMEOUT: Duration = Duration::from_mins(10);
 const GH_TIMEOUT: Duration = Duration::from_mins(1);
+/// The command's output is cut off, and the run failed, past this size.
+const OUTPUT_CAP_BYTES: u64 = 64 * 1024 * 1024;
+/// Bytes of the output file read back for the issue tail.
+const READ_BACK_BYTES: u64 = 64 * 1024;
 
 type Gh<'a> = &'a dyn Fn(&[String]) -> Result<String, String>;
+type LoadCanary<'a> = &'a dyn Fn(&Path) -> Result<Option<CanaryConfig>, String>;
 
 pub(super) fn release_canary_command<W: Write>(
     command: ReleaseCanaryCommand,
@@ -49,20 +58,20 @@ pub(super) fn release_canary_command<W: Write>(
     } = command;
     let config = LoadedConfig::load_from_cwd(mode, cwd)
         .map_err(|error| CliFailure::new(2, error.to_string()))?;
-    let Some(canary) = load_config(&config).map_err(|error| CliFailure::new(2, error))? else {
-        return emit(
-            json,
-            stdout,
-            "skipped",
-            "",
-            "",
-            "no [release.canary] section",
-            0,
-        );
-    };
+    let detected = detect_repo_from_remote(cwd, None);
     let repo = repo
-        .or_else(|| detect_repo_from_remote(cwd, None))
+        .or_else(|| detected.clone())
         .ok_or_else(|| CliFailure::new(2, "Can't detect owner/repo; pass --repo."))?;
+    // Two owners can share a repository name, and the caller picks a config
+    // clone by name alone: refuse a clone that belongs to another repository.
+    if let Some(found) = &detected
+        && !found.eq_ignore_ascii_case(&repo)
+    {
+        return Err(CliFailure::new(
+            2,
+            format!("{} is a clone of {found}, not {repo}", cwd.display()),
+        ));
+    }
     let origin = git_origin(cwd).ok_or_else(|| CliFailure::new(2, "no git origin remote"))?;
     let actions = GitHubActions::from_loaded_config(cwd, &config).with_repo_override(&repo);
     let gh = |argv: &[String]| {
@@ -70,11 +79,17 @@ pub(super) fn release_canary_command<W: Write>(
             .run_gh_with_timeout_env(argv, GH_TIMEOUT, &[("GH_REPO", repo.as_str())])
             .map_err(|error| error.to_string())
     };
+    // The canary section comes from the fresh clone of the base branch, not
+    // from the local config clone, which can lag behind main.
+    let load = |checkout: &Path| {
+        let loaded = LoadedConfig::load_from_cwd(mode, checkout).map_err(|e| e.to_string())?;
+        load_config(&loaded)
+    };
     let request = Request {
         repo: &repo,
         base: &base,
         origin: &origin,
-        canary: &canary,
+        load_canary: &load,
         work_root: &state_dir.join("release-canary"),
         daily,
         apply,
@@ -141,7 +156,8 @@ pub(crate) struct Request<'a> {
     pub repo: &'a str,
     pub base: &'a str,
     pub origin: &'a str,
-    pub canary: &'a CanaryConfig,
+    /// Reads `[release.canary]` from the fresh checkout.
+    pub load_canary: LoadCanary<'a>,
     pub work_root: &'a Path,
     pub daily: bool,
     pub apply: bool,
@@ -165,8 +181,14 @@ fn skipped(detail: &str) -> Report {
     }
 }
 
-/// Run one canary. `Err` is an infrastructure problem (clone, tags, GitHub),
-/// never a canary failure: it opens no issue.
+fn epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Run one canary. `Err` is an infrastructure problem (clone, GitHub), never a
+/// canary failure: it opens no issue.
 pub(crate) fn run_canary(request: &Request<'_>, gh: Gh<'_>) -> Result<Report, String> {
     fs::create_dir_all(request.work_root).map_err(|error| error.to_string())?;
     let slug = request.repo.replace('/', "_");
@@ -181,6 +203,7 @@ pub(crate) fn run_canary(request: &Request<'_>, gh: Gh<'_>) -> Result<Report, St
     }
     let stamp_path = request.work_root.join(format!("{slug}.stamp"));
     let today = Utc::now().format("%Y-%m-%d").to_string();
+    let stamping = request.daily && request.apply;
     if request.daily {
         let content = fs::read_to_string(&stamp_path).ok();
         let age = fs::metadata(&stamp_path)
@@ -192,8 +215,16 @@ pub(crate) fn run_canary(request: &Request<'_>, gh: Gh<'_>) -> Result<Report, St
             return Ok(skipped("already ran today"));
         }
     }
+    // We hold the lock, so every `clone-*` directory is a leak from a run that
+    // was killed before it could clean up.
+    sweep_stale_clones(request.work_root);
+    if stamping {
+        // Written before the run: if the host kills this process, the next
+        // tick sees a recent `running` stamp instead of starting over.
+        let _ = fs::write(&stamp_path, format!("{today} running {}\n", epoch_secs()));
+    }
     let result = run_once(request, gh);
-    if request.daily {
+    if stamping {
         let status = match &result {
             Ok(report) => report.status,
             Err(_) => "error",
@@ -204,6 +235,17 @@ pub(crate) fn run_canary(request: &Request<'_>, gh: Gh<'_>) -> Result<Report, St
     result
 }
 
+fn sweep_stale_clones(work_root: &Path) {
+    let Ok(entries) = fs::read_dir(work_root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_name().to_string_lossy().starts_with("clone-") {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
 fn run_once(request: &Request<'_>, gh: Gh<'_>) -> Result<Report, String> {
     let scratch = tempfile::Builder::new()
         .prefix("clone-")
@@ -211,13 +253,27 @@ fn run_once(request: &Request<'_>, gh: Gh<'_>) -> Result<Report, String> {
         .map_err(|error| error.to_string())?;
     let checkout = scratch.path().join("repo");
     clone_base(request, &checkout)?;
+    let Some(canary) = (request.load_canary)(&checkout)? else {
+        return Ok(skipped("no [release.canary] section on the base branch"));
+    };
     let tags = git_lines(&checkout, &["tag", "--list"])?;
-    let prefix = &request.canary.tag_prefix;
-    let version = next_version(&tags, prefix, request.canary.bump)
-        .ok_or_else(|| format!("no {prefix}X.Y.Z tag in {}", request.repo))?;
+    let prefix = &canary.tag_prefix;
+    let Some(version) = next_version(&tags, prefix, canary.bump) else {
+        // Nothing to bump from: not a failure and not worth retrying today.
+        return Ok(skipped(&format!(
+            "no {prefix}X.Y.Z tag in {}",
+            request.repo
+        )));
+    };
     let tag = format!("{prefix}{version}");
-    let command = render_command(&request.canary.command, &version, prefix);
-    let outcome = run_command(&command, &checkout, &version, request.canary.timeout_secs)?;
+    let command = render_command(&canary.command, &version, prefix);
+    let outcome = run_command(
+        &command,
+        &checkout,
+        &version,
+        canary.timeout_secs,
+        scratch.path(),
+    )?;
 
     let raw = gh(&marked_issue::list_open_args(request.repo))?;
     let existing: Vec<_> = marked_issue::parse(&raw, MARKER_PREFIX)
@@ -248,13 +304,24 @@ fn clone_base(request: &Request<'_>, checkout: &Path) -> Result<(), String> {
         .env("GIT_TERMINAL_PROMPT", "0");
     let output = run_output_until(&mut clone, Instant::now() + CLONE_TIMEOUT, "git clone")
         .map_err(|error| error.to_string())?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(format!(
+    if !output.status.success() {
+        return Err(format!(
             "git clone failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
-        ))
+        ));
+    }
+    // Cut the clone off from the real repository before anything runs in it.
+    // The history and tags are already local; a push has nowhere to go.
+    let removed = Command::new("git")
+        .arg("-C")
+        .arg(checkout)
+        .args(["remote", "remove", "origin"])
+        .output()
+        .map_err(|error| error.to_string())?;
+    if removed.status.success() {
+        Ok(())
+    } else {
+        Err("could not detach the clone from origin".to_owned())
     }
 }
 
@@ -274,40 +341,92 @@ fn git_lines(checkout: &Path, args: &[&str]) -> Result<Vec<String>, String> {
         .collect())
 }
 
+/// The last `READ_BACK_BYTES` of `file`, lossily decoded.
+fn read_back(file: &mut File) -> String {
+    let length = file.metadata().map_or(0, |meta| meta.len());
+    let start = length.saturating_sub(READ_BACK_BYTES);
+    let mut bytes = Vec::new();
+    if file.seek(SeekFrom::Start(start)).is_ok() {
+        let _ = file.take(READ_BACK_BYTES).read_to_end(&mut bytes);
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
 fn run_command(
     command: &str,
     checkout: &Path,
     version: &str,
     timeout_secs: u64,
+    scratch: &Path,
 ) -> Result<Outcome, String> {
+    let output_path = scratch.join("canary-output.log");
+    let mut sink = File::create(&output_path).map_err(|error| error.to_string())?;
     let mut shell = Command::new("sh");
     shell
         .arg("-c")
         .arg(command)
         .current_dir(checkout)
-        .env("SHIPYARD_RELEASE_CANARY", "1")
-        .env("SHIPYARD_CANARY_NEXT_VERSION", version)
-        .env("GIT_TERMINAL_PROMPT", "0");
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-    match run_output_until(&mut shell, deadline, "release canary command") {
-        Ok(output) if output.status.success() => Ok(Outcome::Pass),
-        Ok(output) => {
-            let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-            text.push_str(&String::from_utf8_lossy(&output.stderr));
-            Ok(Outcome::Fail {
-                reason: output
-                    .status
-                    .code()
-                    .map_or_else(|| "killed by a signal".to_owned(), |c| format!("exit {c}")),
-                tail: output_tail(&text),
-            })
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(
+            sink.try_clone().map_err(|error| error.to_string())?,
+        ))
+        .stderr(Stdio::from(
+            sink.try_clone().map_err(|error| error.to_string())?,
+        ));
+    for (key, _) in std::env::vars_os() {
+        if key.to_str().is_none_or(is_secret_env) {
+            shell.env_remove(key);
         }
-        Err(BoundedOutputError::TimedOut { .. }) => Ok(Outcome::Fail {
-            reason: format!("timed out after {timeout_secs}s"),
-            tail: String::new(),
-        }),
-        Err(error) => Err(error.to_string()),
     }
+    shell
+        // git cannot reach any remote over ssh, and has no credential helper.
+        .env("GIT_SSH_COMMAND", "false")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "credential.helper")
+        .env("GIT_CONFIG_VALUE_0", "")
+        .env("SHIPYARD_RELEASE_CANARY", "1")
+        .env("SHIPYARD_CANARY_NEXT_VERSION", version);
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let mut tree = ProcessTree::spawn(&mut shell).map_err(|error| error.to_string())?;
+    let (reason, status) = loop {
+        match tree.try_wait() {
+            Ok(Some(status)) => break (None, Some(status)),
+            Ok(None) => {}
+            Err(error) => {
+                tree.terminate_until(Instant::now() + Duration::from_secs(5));
+                return Err(error.to_string());
+            }
+        }
+        if Instant::now() >= deadline {
+            break (Some(format!("timed out after {timeout_secs}s")), None);
+        }
+        if sink.metadata().map_or(0, |meta| meta.len()) > OUTPUT_CAP_BYTES {
+            break (
+                Some(format!("output exceeded {OUTPUT_CAP_BYTES} bytes; stopped")),
+                None,
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    // Reap the whole tree whatever happened, so no descendant outlives the run.
+    tree.terminate_until(Instant::now() + Duration::from_secs(5));
+    let tail = output_tail(&read_back(&mut sink));
+    let _ = sink.flush();
+    Ok(match (reason, status) {
+        (Some(reason), _) => Outcome::Fail { reason, tail },
+        (None, Some(status)) if status.success() => Outcome::Pass,
+        (None, Some(status)) => Outcome::Fail {
+            reason: status
+                .code()
+                .map_or_else(|| "killed by a signal".to_owned(), |c| format!("exit {c}")),
+            tail,
+        },
+        (None, None) => Outcome::Fail {
+            reason: "no exit status".to_owned(),
+            tail,
+        },
+    })
 }
 
 fn apply_action(request: &Request<'_>, gh: Gh<'_>, action: &IssueAction) -> Result<String, String> {
@@ -360,16 +479,19 @@ fn apply_action(request: &Request<'_>, gh: Gh<'_>, action: &IssueAction) -> Resu
             Ok(format!("updated #{number}"))
         }
         IssueAction::Close { number, comment } => {
-            gh(&args(
-                "POST",
-                format!("repos/{repo}/issues/{number}/comments"),
-                &[("body", comment)],
-            ))?;
+            // Close first: a failure leaves the issue open and the next run
+            // retries the whole close. The comment is best effort, so a failed
+            // one is never posted twice.
             gh(&args(
                 "PATCH",
                 format!("repos/{repo}/issues/{number}"),
                 &[("state", "closed"), ("state_reason", "completed")],
             ))?;
+            let _ = gh(&args(
+                "POST",
+                format!("repos/{repo}/issues/{number}/comments"),
+                &[("body", comment)],
+            ));
             Ok(format!("closed #{number}"))
         }
     }
@@ -458,7 +580,7 @@ mod tests {
             repo: "o/r",
             base: "main",
             origin: origin.to_str().unwrap(),
-            canary: &cfg,
+            load_canary: &|_| Ok(Some(cfg.clone())),
             work_root: &dir.join("state"),
             daily,
             apply: true,
@@ -520,8 +642,8 @@ mod tests {
         assert_eq!(
             fake.mutations(),
             [
-                "POST repos/o/r/issues/3/comments",
-                "PATCH repos/o/r/issues/3"
+                "PATCH repos/o/r/issues/3",
+                "POST repos/o/r/issues/3/comments"
             ]
         );
     }
@@ -560,7 +682,7 @@ mod tests {
             repo: "o/r",
             base: "main",
             origin: origin.to_str().unwrap(),
-            canary: &cfg,
+            load_canary: &|_| Ok(Some(cfg.clone())),
             work_root: &dir.path().join("state"),
             daily: false,
             apply: true,
@@ -590,7 +712,7 @@ mod tests {
             repo: "o/r",
             base: "main",
             origin: origin.to_str().unwrap(),
-            canary: &cfg,
+            load_canary: &|_| Ok(Some(cfg.clone())),
             work_root: &dir.path().join("state"),
             daily: false,
             apply: false,
@@ -599,5 +721,152 @@ mod tests {
         let report = run_canary(&request, &|argv| Ok(fake.gh(argv))).unwrap();
         assert_eq!(report.status, "fail");
         assert!(fake.mutations().is_empty());
+    }
+
+    fn request<'a>(
+        origin: &'a Path,
+        load: LoadCanary<'a>,
+        state: &'a Path,
+        daily: bool,
+    ) -> Request<'a> {
+        Request {
+            repo: "o/r",
+            base: "main",
+            origin: origin.to_str().unwrap(),
+            load_canary: load,
+            work_root: state,
+            daily,
+            apply: true,
+        }
+    }
+
+    #[test]
+    fn the_command_cannot_push_a_tag_to_the_real_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Fake::new("");
+        let report = run(
+            dir.path(),
+            "git push origin HEAD:refs/tags/leaked && exit 0; exit 7",
+            30,
+            &fake,
+            false,
+        )
+        .unwrap();
+        assert_eq!(report.status, "fail");
+        assert!(report.detail.contains("exit 7"));
+        let tags = Command::new("git")
+            .arg("-C")
+            .arg(dir.path().join("origin"))
+            .args(["tag", "--list"])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&tags.stdout).trim(), "v0.2.0");
+    }
+
+    #[test]
+    fn verbose_failures_and_timeouts_keep_the_captured_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Fake::new("");
+        let report = run(
+            dir.path(),
+            "yes noise | head -c 20000000; echo FINAL-LINE; exit 1",
+            120,
+            &fake,
+            false,
+        )
+        .unwrap();
+        assert_eq!(report.status, "fail");
+        let calls = fake.calls.borrow();
+        let body = calls
+            .iter()
+            .flatten()
+            .find(|a| a.starts_with("body="))
+            .unwrap();
+        assert!(body.contains("FINAL-LINE"));
+        drop(calls);
+
+        let fake = Fake::new("");
+        let report = run(dir.path(), "echo partial-output; sleep 30", 1, &fake, false).unwrap();
+        assert!(report.detail.contains("timed out"));
+        let calls = fake.calls.borrow();
+        let body = calls
+            .iter()
+            .flatten()
+            .find(|a| a.starts_with("body="))
+            .unwrap();
+        assert!(body.contains("partial-output"));
+    }
+
+    #[test]
+    fn no_tag_is_a_daily_skip_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = dir.path().join("origin");
+        fs::create_dir_all(&bare).unwrap();
+        git(&bare, &["init", "-q", "-b", "main"]);
+        fs::write(bare.join("f"), "x").unwrap();
+        git(&bare, &["add", "."]);
+        git(&bare, &["commit", "-q", "-m", "init"]);
+        let cfg = canary("true", 30);
+        let state = dir.path().join("state");
+        let load = |_: &Path| Ok(Some(cfg.clone()));
+        let req = request(&bare, &load, &state, true);
+        let report = run_canary(&req, &|_| Ok(String::new())).unwrap();
+        assert_eq!(report.status, "skipped");
+        let stamp = fs::read_to_string(state.join("o_r.stamp")).unwrap();
+        assert!(stamp.trim().ends_with("skipped"), "{stamp}");
+    }
+
+    #[test]
+    fn no_section_on_the_fresh_clone_is_a_skip() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = origin(dir.path());
+        let state = dir.path().join("state");
+        let load = |_: &Path| Ok(None);
+        let req = request(&origin, &load, &state, false);
+        let report = run_canary(&req, &|_| Err("must not be called".to_owned())).unwrap();
+        assert_eq!(report.status, "skipped");
+    }
+
+    #[test]
+    fn a_running_stamp_blocks_reruns_and_stale_clones_are_swept() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = origin(dir.path());
+        let cfg = canary("true", 30);
+        let state = dir.path().join("state");
+        fs::create_dir_all(state.join("clone-leaked")).unwrap();
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        fs::write(state.join("o_r.stamp"), format!("{today} running 1\n")).unwrap();
+        let load = |_: &Path| Ok(Some(cfg.clone()));
+        let req = request(&origin, &load, &state, true);
+        let report = run_canary(&req, &|_| Err("unused".to_owned())).unwrap();
+        assert_eq!(report.status, "skipped");
+        assert!(state.join("clone-leaked").exists(), "skip must not sweep");
+
+        fs::remove_file(state.join("o_r.stamp")).unwrap();
+        run_canary(&req, &|_| Ok(String::new())).unwrap();
+        assert!(!state.join("clone-leaked").exists());
+        let stamp = fs::read_to_string(state.join("o_r.stamp")).unwrap();
+        assert!(stamp.trim().ends_with("pass"), "{stamp}");
+    }
+
+    #[test]
+    fn a_failed_close_is_retried_whole_and_never_comments_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = origin(dir.path());
+        let cfg = canary("true", 30);
+        let state = dir.path().join("state");
+        let load = |_: &Path| Ok(Some(cfg.clone()));
+        let req = request(&origin, &load, &state, false);
+        let calls = RefCell::new(Vec::<String>::new());
+        let issues = marked_issue_line();
+        let result = run_canary(&req, &|argv| {
+            if argv.iter().any(|a| a == "--paginate") {
+                return Ok(issues.clone());
+            }
+            calls.borrow_mut().push(argv[2..4].join(" "));
+            Err("HTTP 502".to_owned())
+        });
+        assert!(result.is_err());
+        assert_eq!(*calls.borrow(), ["PATCH repos/o/r/issues/3"]);
     }
 }

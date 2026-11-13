@@ -316,7 +316,7 @@ os.execv("/bin/bash", ["bash", "-c", sys.argv[1], "release-canary"] + sys.argv[2
   bin=$1 clones=$2 log=$3 stamp=$4; shift 4
   for repo in "$@"; do
     [ -d "$clones/${repo#*/}/.git" ] || continue
-    line=$(cd "$clones/${repo#*/}" && timeout 1800 "$bin" release-canary run --repo "$repo" --daily --apply 2>&1 | tail -n 1)
+    line=$(cd "$clones/${repo#*/}" && timeout 3600 "$bin" release-canary run --repo "$repo" --daily --apply 2>&1 | tail -n 1)
     case "$line" in
       "release-canary status=skipped"*|"") ;;
       *) echo "$stamp $repo $line" >> "$log/summary.log" ;;

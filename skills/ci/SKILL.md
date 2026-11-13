@@ -4818,7 +4818,7 @@ break, not on release day.
 ```toml
 [release.canary]
 command = "python3 tools/rehearse_tag_pipeline.py --simulate --tag {next_tag}"
-timeout_secs = 1800   # default 900
+timeout_secs = 1800   # default 900, at most 1800
 bump = "patch"        # or "minor"; default patch
 tag_prefix = "v"      # default v
 # enabled = false     # switch off without deleting the section
@@ -4827,7 +4827,11 @@ tag_prefix = "v"      # default v
 `{next_version}` is bare (`0.2.1`), `{next_tag}` has the prefix (`v0.2.1`); the
 command also sees `SHIPYARD_CANARY_NEXT_VERSION`. The next version is the
 highest stable `<prefix>X.Y.Z` tag plus the bump. The command runs in the clone
-and the clone is deleted; nothing is tagged, pushed or edited.
+and the clone is deleted; nothing is tagged, pushed or edited. The config is
+read from the fresh clone of `main`, not from the steward's local config clone.
+The clone has no remote, git's ssh and credential helpers are off, and tokens,
+keys, `GH_*`, `GITHUB_*`, `SHIPYARD_*` and `SSH_*` variables are stripped from
+the command's environment (a guard, not a sandbox).
 
 `shipyard release-canary run [--repo o/r] [--base main] [--daily] [--apply]`:
 on failure or timeout it opens or edits ONE issue per repo, titled

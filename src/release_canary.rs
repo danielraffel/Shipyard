@@ -15,6 +15,13 @@ use crate::marked_issue::MarkedIssue;
 /// Marker prefix embedded in the body of the one issue the canary owns.
 pub const MARKER_PREFIX: &str = "<!-- shipyard-release-canary: ";
 
+/// Longest `timeout_secs` accepted. The steward tick's outer limit is an hour:
+/// a clone (10 minutes) plus this must fit inside it.
+pub const MAX_TIMEOUT_SECS: u64 = 1800;
+
+/// An in-progress stamp older than this is from a killed run.
+const RUNNING_STALE_SECS: u64 = 4000;
+
 /// Largest number of output bytes quoted in an issue body.
 const TAIL_BYTES: usize = 6000;
 
@@ -68,8 +75,12 @@ pub fn load_config(config: &LoadedConfig) -> Result<Option<CanaryConfig>, String
         Some(value) => value
             .as_integer()
             .and_then(|n| u64::try_from(n).ok())
-            .filter(|n| *n > 0)
-            .ok_or("release.canary.timeout_secs must be a positive integer")?,
+            .filter(|n| (1..=MAX_TIMEOUT_SECS).contains(n))
+            .ok_or_else(|| {
+                format!(
+                    "release.canary.timeout_secs must be an integer from 1 to {MAX_TIMEOUT_SECS}"
+                )
+            })?,
     };
     let bump = match section.get("bump").and_then(toml::Value::as_str) {
         None | Some("patch") => Bump::Patch,
@@ -112,6 +123,29 @@ pub fn next_version(tags: &[String], prefix: &str, bump: Bump) -> Option<String>
         Bump::Patch => format!("{major}.{minor}.{}", patch + 1),
         Bump::Minor => format!("{major}.{}.0", minor + 1),
     })
+}
+
+const PREFIXES: [&str; 5] = ["GH_", "GITHUB_", "SHIPYARD_", "AWS_", "GIT_ASKPASS"];
+const FRAGMENTS: [&str; 9] = [
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "PASSWD",
+    "PRIVATE_KEY",
+    "APP_KEY",
+    "API_KEY",
+    "CREDENTIAL",
+    "_PEM",
+];
+
+/// Whether an environment variable must not reach the canary command: tokens,
+/// keys and agent sockets, GitHub and App variables, and Shipyard's own.
+#[must_use]
+pub fn is_secret_env(key: &str) -> bool {
+    let key = key.to_ascii_uppercase();
+    PREFIXES.iter().any(|prefix| key.starts_with(prefix))
+        || key.starts_with("SSH_")
+        || FRAGMENTS.iter().any(|fragment| key.contains(fragment))
 }
 
 /// Substitute `{next_version}` (bare) and `{next_tag}` (with prefix).
@@ -232,8 +266,9 @@ pub fn decide(
 
 /// Whether a daily run is due, from the stamp file's content and age.
 ///
-/// The stamp reads `YYYY-MM-DD status`. A pass or fail stamps the day; an
-/// infrastructure `error` is retried after an hour.
+/// The stamp reads `YYYY-MM-DD status`. A pass, fail or skip stamps the day; an
+/// infrastructure `error` is retried after an hour; a `running` stamp (written
+/// before the run) blocks reruns until it is too old to be a live run.
 #[must_use]
 pub fn daily_due(stamp: Option<(&str, u64)>, today: &str) -> bool {
     let Some((content, age_secs)) = stamp else {
@@ -245,6 +280,9 @@ pub fn daily_due(stamp: Option<(&str, u64)>, today: &str) -> bool {
     };
     if status == "error" {
         return age_secs >= 3600;
+    }
+    if status == "running" {
+        return age_secs >= RUNNING_STALE_SECS;
     }
     day != today
 }
@@ -305,6 +343,33 @@ mod tests {
             Some("0.11.0")
         );
         assert_eq!(next_version(&tags(&["nightly"]), "v", Bump::Patch), None);
+    }
+
+    #[test]
+    fn secret_env_filter_strips_tokens_keys_and_sockets_but_keeps_path() {
+        for key in [
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "gh_app_private_key",
+            "SHIPYARD_APP_KEY_PATH",
+            "SSH_AUTH_SOCK",
+            "AWS_SECRET_ACCESS_KEY",
+            "NPM_TOKEN",
+            "GIT_ASKPASS",
+        ] {
+            assert!(is_secret_env(key), "{key}");
+        }
+        for key in ["PATH", "HOME", "LANG", "TMPDIR", "USER"] {
+            assert!(!is_secret_env(key), "{key}");
+        }
+    }
+
+    #[test]
+    fn timeout_is_capped_at_load() {
+        let too_long = "[release.canary]\ncommand = \"x\"\ntimeout_secs = 99999\n";
+        assert!(load_config(&config_from_toml(too_long)).is_err());
+        let ok = "[release.canary]\ncommand = \"x\"\ntimeout_secs = 1800\n";
+        assert!(load_config(&config_from_toml(ok)).is_ok());
     }
 
     #[test]
@@ -372,5 +437,18 @@ mod tests {
         assert!(!daily_due(Some(("2026-11-13 error", 60)), "2026-11-13"));
         assert!(daily_due(Some(("2026-11-13 error", 3600)), "2026-11-13"));
         assert!(daily_due(Some(("garbage", 1)), "2026-11-13"));
+        assert!(!daily_due(
+            Some(("2026-11-13 running 99", 60)),
+            "2026-11-13"
+        ));
+        assert!(!daily_due(
+            Some(("2026-11-12 running 99", 60)),
+            "2026-11-13"
+        ));
+        assert!(daily_due(
+            Some(("2026-11-13 running 99", 4000)),
+            "2026-11-13"
+        ));
+        assert!(!daily_due(Some(("2026-11-13 skipped", 5)), "2026-11-13"));
     }
 }
