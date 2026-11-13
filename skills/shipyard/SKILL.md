@@ -5949,8 +5949,14 @@ lifts holds and restores paused entries in the same pass
 only `RepoPoison::covering`: heads that passed every confirmed context after
 `red_since` (`fix_first::passed_after`, intersected across contexts; a
 confirmed context with no `red_since` empties it). A named fix outside it is
-held, and `candidates` exempt from the pause only. `base-health --act`'s
-merge-group advice also requires every poisoned context red on the tip. `green_head_fix` names the fix from the census
+held. The pause keeps only `covering` while a context is confirmed
+(`candidates` and named fixes exempt only when nothing is confirmed, where
+nothing is paused). Coverage reads each context through its required rule's
+app id. `base-health --act`'s merge-group advice also requires every
+poisoned context red on the tip, read with the required app id. A pass with
+an unread tip keeps open `tip_red` episodes open and marks them `partial`;
+the gate and `fix_first_score` count partial episodes but never use them as
+evidence. `green_head_fix` names the fix from the census
 with no read: not draft, approval status successful at the head, every
 confirmed context's selected check green with `observed_at > red_since`, never a PR
 that rode a failing group. `fix_first::pick` names it only when it is the

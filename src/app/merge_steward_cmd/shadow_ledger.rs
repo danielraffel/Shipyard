@@ -195,7 +195,8 @@ pub(super) fn fix_first_score(ended: &[Episode]) -> Value {
         .iter()
         .filter(|episode| episode.rule == "tip_red")
         .collect::<Vec<_>>();
-    let known = |episode: &&&Episode| !episode.fixed_by.is_empty();
+    // A partial episode is counted but never scored.
+    let known = |episode: &&&Episode| !episode.partial && !episode.fixed_by.is_empty();
     let picked = |episode: &&&Episode| !episode.fix_picks.is_empty();
     let hit = |episode: &&&Episode| {
         episode
@@ -502,10 +503,18 @@ pub(super) fn gate(rule: &str, ended: &[Episode], now: DateTime<Utc>) -> Value {
         .iter()
         .filter(|episode| episode.rule == rule && episode.corroborated.is_none())
         .count();
-    // Only a control-labelled episode is evidence either way.
+    // An episode any pass of which could not read the tip or the open pull
+    // requests rests on partial data: it is counted, never evidence.
+    let partial = ended
+        .iter()
+        .filter(|episode| episode.rule == rule && episode.partial)
+        .count();
+    // Only a control-labelled, fully read episode is evidence either way.
     let episodes = ended
         .iter()
-        .filter(|episode| episode.rule == rule && episode.corroborated.is_some())
+        .filter(|episode| {
+            episode.rule == rule && episode.corroborated.is_some() && !episode.partial
+        })
         .collect::<Vec<_>>();
     let fires = episodes.len();
     let true_fires = episodes
@@ -537,6 +546,7 @@ pub(super) fn gate(rule: &str, ended: &[Episode], now: DateTime<Utc>) -> Value {
         "rule": rule,
         "fires": fires,
         "unlabelled": unlabelled,
+        "partial": partial,
         "true_fires": true_fires,
         "days": days,
         "precision": precision,
@@ -578,7 +588,7 @@ pub(super) fn record_pass(
     now: DateTime<Utc>,
 ) -> Value {
     let key = format!("{}@{base}", repo.to_ascii_lowercase());
-    let firing = poison.map(firing).unwrap_or_default();
+    let mut firing = poison.map(firing).unwrap_or_default();
     // An unread history neither extends nor ends an episode.
     if poison.is_some_and(|poison| {
         matches!(
@@ -589,6 +599,18 @@ pub(super) fn record_pass(
         return json!({"skipped": "merge groups unread"});
     }
     let mut open = read_open(state_dir);
+    // A pass that could not read the tip cannot say a `tip_red` episode is
+    // over: an unread tip confirms nothing, which must not read as green.
+    // Such an episode stays open (and is marked partial below).
+    if poison.is_some_and(|poison| poison.partial().is_some()) {
+        for episode in open.iter().filter(|episode| {
+            episode.key == key && episode.ended_at.is_none() && episode.rule == "tip_red"
+        }) {
+            firing
+                .entry((episode.context.clone(), episode.rule.clone()))
+                .or_insert(episode.max_streak);
+        }
+    }
     advance(&mut open, &key, &firing, held, would, now);
     if let Some(poison) = poison {
         let passed_by = match &poison.health {
@@ -694,6 +716,36 @@ mod tests {
             advance(open, key, &firing, &BTreeSet::new(), &BTreeSet::new(), now);
         }
         label(open, key, "owner/repo", "main", &controls, run_gh, now);
+    }
+
+    /// A control-labelled episode that rests on a partial pass is counted
+    /// as partial and never as a fire.
+    #[test]
+    fn a_partial_episode_is_never_gate_evidence() {
+        let episode = |partial| Episode {
+            key: "owner/repo@main".to_owned(),
+            context: "required".to_owned(),
+            rule: "tip_red".to_owned(),
+            started_at: at(0).to_rfc3339(),
+            last_seen_at: at(10).to_rfc3339(),
+            max_streak: 2,
+            held: BTreeSet::new(),
+            would_hold: BTreeSet::from([1]),
+            corroborated: Some(true),
+            ended_at: Some(at(20).to_rfc3339()),
+            control: None,
+            fix_picks: BTreeSet::from([7]),
+            fixed_by: vec![7],
+            partial,
+        };
+        let gate = gate("tip_red", &[episode(true), episode(false)], at(30));
+        assert_eq!(gate["fires"], 1);
+        assert_eq!(gate["partial"], 1);
+        let score = fix_first_score(&[episode(true), episode(false)]);
+        assert_eq!(
+            score["pick_repaired"], 1,
+            "only the fully read episode is scored"
+        );
     }
 
     /// An unrelated same-workflow run on the same base is visible (and

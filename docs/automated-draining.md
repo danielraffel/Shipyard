@@ -640,8 +640,12 @@ While both hold:
 - **The episode ends as soon as the base tip reads green.** Holds lift in
   the same pass.
 - **An unread tip confirms nothing.** The pass reports `partial` with the
-  failed read and tries again next pass; the shadow ledger marks the
-  episode `partial`.
+  failed read and tries again next pass. The shadow ledger keeps the episode
+  open, marks it `partial`, and never counts a partial episode as evidence
+  for promotion.
+- **Checks are read by app.** A check is matched to the app its required
+  rule names, so a same-named check from another app neither confirms the
+  base red nor makes a pull request the fix.
 
 A tip that only ever ran the context in its own merge group (for example a
 test that starts failing on a date) never shows red on its own. Name a

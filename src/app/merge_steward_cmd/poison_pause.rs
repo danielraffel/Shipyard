@@ -102,8 +102,9 @@ pub(super) enum Verdict {
 /// Decide one pull request's pause from the pass's merge-group reading.
 /// Only an entry the steward itself admitted (`Queued`) is ever paused: an
 /// opted-out or unowned entry would not be restored by the steward's
-/// admission, so it is left alone. No candidate fix is paused, named or
-/// measured, so a fix already in the queue keeps its group.
+/// admission, so it is left alone. While a context is confirmed, only a head
+/// that passed every confirmed context after the break keeps its place; a
+/// fix named or measured for one context is no exemption from another.
 pub(super) fn verdict(
     poison: Option<&RepoPoison>,
     pr: &StewardPullRequest,
@@ -116,15 +117,26 @@ pub(super) fn verdict(
         return Verdict::Keep;
     }
     let contexts = poison.health.poisoned_contexts();
-    if contexts.is_empty()
-        || poison.fixes.contains_key(&pr.number)
-        || poison.candidates.contains(&pr.number)
-    {
+    if contexts.is_empty() {
+        return Verdict::Keep;
+    }
+    let confirmed = poison.confirmed_contexts();
+    // While a context is confirmed, the only entry kept is a head that passed
+    // every confirmed context after the base went red, each check from the
+    // app its required rule names (`RepoPoison::covering`). A named or
+    // measured fix for one context is no exemption from another. With
+    // nothing confirmed nothing is paused, and named or measured fixes are
+    // left out of the `would_pause` report as before.
+    let exempt = if confirmed.is_empty() {
+        poison.fixes.contains_key(&pr.number) || poison.candidates.contains(&pr.number)
+    } else {
+        poison.covering.contains(&pr.number)
+    };
+    if exempt {
         return Verdict::Keep;
     }
     // Only a context the base tip also fails removes work; a streak alone
     // is reported.
-    let confirmed = poison.confirmed_contexts();
     if poison.policy.pauses() && !confirmed.is_empty() {
         Verdict::Pause {
             contexts: confirmed.join(","),
