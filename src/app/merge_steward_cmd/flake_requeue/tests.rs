@@ -3,15 +3,21 @@ use std::cell::RefCell;
 use chrono::{DateTime, Utc};
 
 use super::*;
+use crate::base_health::fix_first::TipReading;
+use crate::base_health::merge_group::{GroupRef, PoisonedContext};
 use crate::environment_requeue::{CheckAttribution, StepEvidence, StepReading};
 
 const REPO: &str = "Generous-Corp/pulp";
 const MIDI: &str = "CoreMIDI virtual port delivers SysEx";
 
-fn now() -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339("2026-11-13T23:00:00Z")
+fn at(text: &str) -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339(text)
         .expect("time")
         .with_timezone(&Utc)
+}
+
+fn now() -> DateTime<Utc> {
+    at("2026-11-13T23:00:00Z")
 }
 
 /// A refused classifier verdict: `check` failed on merge group `group`,
@@ -41,6 +47,7 @@ fn apply() -> FlakePolicy {
     FlakePolicy {
         mode: FlakeMode::Apply,
         window_hours: 24,
+        max_requeues: 3,
     }
 }
 
@@ -51,7 +58,8 @@ struct Case<'a> {
     at: &'a str,
     verdict: EnvironmentRequeue,
     defect_fix_removed: bool,
-    base_red: Vec<String>,
+    poison: Option<RepoPoison>,
+    now: DateTime<Utc>,
 }
 
 impl<'a> Case<'a> {
@@ -63,11 +71,12 @@ impl<'a> Case<'a> {
             at,
             verdict: verdict(group, "macos", &[MIDI]),
             defect_fix_removed: false,
-            base_red: Vec::new(),
+            poison: Some(green_base(&["macos"])),
+            now: now(),
         }
     }
 
-    fn run(&self, ledger: &mut StewardLedger) -> Option<Verdict> {
+    fn run_at(&self, ledger: &mut StewardLedger, path: Option<&Path>) -> Option<Verdict> {
         consider(
             &Ejection {
                 policy: &self.policy,
@@ -77,17 +86,36 @@ impl<'a> Case<'a> {
                 at: Some(self.at),
                 verdict: &self.verdict,
                 defect_fix_removed: self.defect_fix_removed,
-                base_red: &self.base_red,
+                poison: self.poison.as_ref(),
             },
             ledger,
-            None,
-            now(),
+            path,
+            self.now,
         )
+    }
+
+    fn run(&self, ledger: &mut StewardLedger) -> Option<Verdict> {
+        self.run_at(ledger, None)
     }
 }
 
 fn requeued(verdict: Option<&Verdict>) -> bool {
     matches!(verdict, Some(Verdict::Requeue(_)))
+}
+
+fn last_outcome(ledger: &StewardLedger) -> &'static str {
+    ledger
+        .flake_requeue
+        .pass
+        .last()
+        .expect("a decision")
+        .outcome
+}
+
+/// Mark a head's pending receipt done, as the enqueue path does once GitHub
+/// accepts the enqueue.
+fn accepted(ledger: &mut StewardLedger, pr: u64, head: &str) {
+    settle(ledger, None, REPO, pr, head, Some("enqueued"));
 }
 
 #[test]
@@ -99,16 +127,17 @@ fn two_prs_ejected_on_the_same_signature_are_flake_and_requeue_once() {
     // A second pull request, a different merge group, the same test.
     let second = Case::new(12202, "bbbb", "2026-11-13T21:00:00Z", "g2");
     let verdict = second.run(&mut ledger);
-    assert!(requeued(verdict.as_ref()), "{verdict:?}");
     let Some(Verdict::Requeue(detail)) = verdict else {
-        unreachable!()
+        panic!("{verdict:?}")
     };
     assert!(
         detail.contains(&format!("flake:macos: {MIDI}")) && detail.contains("#12201"),
         "{detail}"
     );
+    accepted(&mut ledger, 12202, "bbbb");
     // The first one is now corroborated too, and gets its own one requeue.
     assert!(requeued(first.run(&mut ledger).as_ref()));
+    accepted(&mut ledger, 12201, "aaaa");
     // No second requeue at the same head, for either.
     for case in [&first, &second] {
         match case.run(&mut ledger) {
@@ -116,7 +145,6 @@ fn two_prs_ejected_on_the_same_signature_are_flake_and_requeue_once() {
             other => panic!("expected the spent refusal, got {other:?}"),
         }
     }
-    assert_eq!(ledger.flake_requeue.requeued.len(), 2);
     let outcomes = ledger
         .flake_requeue
         .pass
@@ -132,10 +160,13 @@ fn two_prs_ejected_on_the_same_signature_are_flake_and_requeue_once() {
             (12202, "already_requeued"),
         ]
     );
-    // A new head of the same pull request is a new head: it may be
-    // requeued once more if the flake ejects it again.
-    let pushed = Case::new(12201, "cccc", "2026-11-13T22:00:00Z", "g3");
-    assert!(requeued(pushed.run(&mut ledger).as_ref()));
+    assert!(
+        ledger
+            .flake_requeue
+            .requeued
+            .values()
+            .all(|receipt| receipt.state == ReceiptState::Done)
+    );
 }
 
 #[test]
@@ -143,7 +174,6 @@ fn a_single_ejection_is_not_a_flake() {
     let mut ledger = StewardLedger::default();
     let case = Case::new(12201, "aaaa", "2026-11-13T20:00:00Z", "g1");
     assert_eq!(case.run(&mut ledger), None);
-    // Seen again on a later pass: still one pull request.
     assert_eq!(case.run(&mut ledger), None);
     assert_eq!(ledger.flake_requeue.sightings.len(), 1);
     assert!(ledger.flake_requeue.requeued.is_empty());
@@ -152,7 +182,6 @@ fn a_single_ejection_is_not_a_flake() {
 
 #[test]
 fn one_group_ejecting_two_members_or_a_far_or_different_failure_is_not_a_flake() {
-    // One merge group that ejected two of its members is one failure.
     let mut ledger = StewardLedger::default();
     assert_eq!(
         Case::new(1, "aaaa", "2026-11-13T20:00:00Z", "g1").run(&mut ledger),
@@ -162,20 +191,17 @@ fn one_group_ejecting_two_members_or_a_far_or_different_failure_is_not_a_flake()
         Case::new(2, "bbbb", "2026-11-13T20:00:00Z", "g1").run(&mut ledger),
         None
     );
-    // Outside the window.
     let mut ledger = StewardLedger::default();
     Case::new(1, "aaaa", "2026-11-11T20:00:00Z", "g1").run(&mut ledger);
     assert_eq!(
         Case::new(2, "bbbb", "2026-11-13T21:00:00Z", "g2").run(&mut ledger),
         None
     );
-    // A different test.
     let mut ledger = StewardLedger::default();
     Case::new(1, "aaaa", "2026-11-13T20:00:00Z", "g1").run(&mut ledger);
     let mut other = Case::new(2, "bbbb", "2026-11-13T21:00:00Z", "g2");
     other.verdict = verdict("g2", "macos", &["Graphite shadows"]);
     assert_eq!(other.run(&mut ledger), None);
-    // A failure that names no test has no signature at all.
     let mut ledger = StewardLedger::default();
     let mut bare = Case::new(1, "aaaa", "2026-11-13T20:00:00Z", "g1");
     bare.verdict = verdict("g1", "macos", &[]);
@@ -198,12 +224,7 @@ fn a_defect_fix_removed_head_is_never_requeued() {
             other => panic!("a defect-fix head must keep its refusal, got {other:?}"),
         }
     }
-    assert!(
-        !ledger
-            .flake_requeue
-            .requeued
-            .contains_key(&receipt_key(REPO, 12202, "bbbb"))
-    );
+    assert!(ledger.flake_requeue.requeued.is_empty());
 }
 
 #[test]
@@ -219,8 +240,7 @@ fn shadow_reports_would_requeue_and_records_nothing_to_spend() {
         other => panic!("{other:?}"),
     }
     assert!(ledger.flake_requeue.requeued.is_empty());
-    assert_eq!(ledger.flake_requeue.pass[0].outcome, "would_requeue");
-    // Off records nothing at all.
+    assert_eq!(last_outcome(&ledger), "would_requeue");
     let mut ledger = StewardLedger::default();
     let mut off = Case::new(12201, "aaaa", "2026-11-13T20:00:00Z", "g1");
     off.policy.mode = FlakeMode::Off;
@@ -228,28 +248,249 @@ fn shadow_reports_would_requeue_and_records_nothing_to_spend() {
     assert!(ledger.flake_requeue.is_empty());
 }
 
+// ── the base reading fails closed ──────────────────────────────────────────
+
+fn poisoned_macos(tip: TipReading) -> RepoPoison {
+    RepoPoison {
+        health: MergeGroupHealth::Poisoned {
+            contexts: vec![PoisonedContext {
+                context: "macos".to_owned(),
+                first_error: None,
+                groups: vec![GroupRef {
+                    head_sha: "g1".to_owned(),
+                    prs: vec![12201],
+                }],
+                latest_failure_at: None,
+                check_id: None,
+                same_first_error: None,
+            }],
+        },
+        tip: BTreeMap::from([("macos".to_owned(), tip)]),
+        ..green_base(&[])
+    }
+}
+
+fn tip(red: bool, error: Option<&str>) -> TipReading {
+    TipReading {
+        sha: None,
+        red,
+        red_since: None,
+        error: error.map(str::to_owned),
+    }
+}
+
 #[test]
-fn a_base_red_on_the_check_or_an_allowed_retry_is_not_a_flake_requeue() {
+fn only_a_base_read_green_for_the_checks_allows_a_requeue() {
+    let cases: Vec<(Option<RepoPoison>, &str)> = vec![
+        // Base poison off, or not read this pass.
+        (None, "base_unknown"),
+        // The merge groups could not be read.
+        (
+            Some(RepoPoison {
+                health: MergeGroupHealth::Unknown {
+                    detail: "HTTP 502".to_owned(),
+                },
+                ..green_base(&[])
+            }),
+            "base_unknown",
+        ),
+        // Clear, but the check has no recorded pass.
+        (Some(green_base(&["linux"])), "base_unknown"),
+        // A streak whose tip read failed: partial.
+        (
+            Some(poisoned_macos(tip(false, Some("HTTP 502")))),
+            "base_unknown",
+        ),
+        // A partial reading of the named fixes.
+        (
+            Some(RepoPoison {
+                fix_read_error: Some("fixes unread".to_owned()),
+                ..green_base(&["macos"])
+            }),
+            "base_unknown",
+        ),
+        // Confirmed red on the check.
+        (Some(poisoned_macos(tip(true, None))), "base_red"),
+        // A streak, but the tip read green: a flake, not the base.
+        (Some(poisoned_macos(tip(false, None))), "requeued"),
+        (Some(green_base(&["macos"])), "requeued"),
+    ];
+    for (poison, expected) in cases {
+        let mut ledger = StewardLedger::default();
+        Case::new(12201, "aaaa", "2026-11-13T20:00:00Z", "g1").run(&mut ledger);
+        let mut case = Case::new(12202, "bbbb", "2026-11-13T21:00:00Z", "g2");
+        case.poison = poison.clone();
+        let verdict = case.run(&mut ledger);
+        assert_eq!(last_outcome(&ledger), expected, "{poison:?}: {verdict:?}");
+        assert_eq!(requeued(verdict.as_ref()), expected == "requeued");
+        assert_eq!(
+            ledger.flake_requeue.requeued.is_empty(),
+            expected != "requeued"
+        );
+    }
+}
+
+#[test]
+fn an_allowed_classifier_retry_is_left_to_the_classifier() {
     let mut ledger = StewardLedger::default();
     Case::new(12201, "aaaa", "2026-11-13T20:00:00Z", "g1").run(&mut ledger);
-    let mut red = Case::new(12202, "bbbb", "2026-11-13T21:00:00Z", "g2");
-    red.base_red = vec!["macos".to_owned()];
-    assert!(
-        matches!(red.run(&mut ledger), Some(Verdict::Keep(detail)) if detail.contains("confirmed red"))
-    );
-    // The classifier already allows a retry: nothing to add.
     let mut allowed = Case::new(12203, "dddd", "2026-11-13T21:30:00Z", "g3");
     allowed.verdict.allowed = true;
     assert_eq!(allowed.run(&mut ledger), None);
 }
 
+// ── the breaker and the cap ────────────────────────────────────────────────
+
+#[test]
+fn a_requeued_head_ejected_again_trips_the_signature() {
+    let mut ledger = StewardLedger::default();
+    Case::new(1, "aaaa", "2026-11-13T20:00:00Z", "g1").run(&mut ledger);
+    let second = Case::new(2, "bbbb", "2026-11-13T21:00:00Z", "g2");
+    assert!(requeued(second.run(&mut ledger).as_ref()));
+    accepted(&mut ledger, 2, "bbbb");
+    // The re-enqueued head is ejected again, after the re-enqueue, the same
+    // way: not a flake.
+    let mut again = Case::new(2, "bbbb", "2026-11-13T23:20:00Z", "g4");
+    again.now = at("2026-11-13T23:30:00Z");
+    assert!(!requeued(again.run(&mut ledger).as_ref()));
+    assert_eq!(last_outcome(&ledger), "signature_tripped");
+    let trip = ledger
+        .flake_requeue
+        .tripped
+        .values()
+        .next()
+        .expect("tripped");
+    assert_eq!((trip.pr, trip.at.as_str()), (2, "2026-11-13T23:20:00Z"));
+    // Every later pull request on the signature, and the first one, is
+    // refused.
+    for (pr, head) in [(1, "aaaa"), (3, "cccc")] {
+        let mut later = Case::new(pr, head, "2026-11-13T23:25:00Z", "g5");
+        later.now = at("2026-11-13T23:40:00Z");
+        assert!(!requeued(later.run(&mut ledger).as_ref()));
+        assert_eq!(last_outcome(&ledger), "signature_tripped");
+    }
+    // The root cause says so.
+    let gh = FakeGh::new("");
+    let status = finish(
+        &|argv: &[String]| gh.run(argv),
+        &FlakePolicy {
+            mode: FlakeMode::Shadow,
+            ..apply()
+        },
+        REPO,
+        "main",
+        &mut ledger,
+        true,
+        at("2026-11-13T23:40:00Z"),
+    );
+    let cause = &status.flake_root_cause[0];
+    assert_eq!(cause.state, "signature_tripped");
+    assert!(
+        cause
+            .tripped_by
+            .as_deref()
+            .is_some_and(|by| by.contains("#2")),
+        "{cause:?}"
+    );
+}
+
+#[test]
+fn a_signature_stops_after_its_requeue_cap_within_the_window() {
+    let mut ledger = StewardLedger::default();
+    let policy = FlakePolicy {
+        max_requeues: 2,
+        ..apply()
+    };
+    let heads = ["h1", "h2", "h3", "h4"];
+    let times = (0..heads.len())
+        .map(|index| format!("2026-11-13T2{index}:00:00Z"))
+        .collect::<Vec<_>>();
+    let mut outcomes = Vec::new();
+    for (index, head) in heads.iter().enumerate() {
+        let mut case = Case::new(
+            u64::try_from(index).expect("index") + 1,
+            head,
+            &times[index],
+            &format!("g{index}"),
+        );
+        case.policy = policy.clone();
+        if case.run(&mut ledger).is_some() {
+            outcomes.push((case.pr, last_outcome(&ledger)));
+        }
+    }
+    assert_eq!(
+        outcomes,
+        vec![(2, "requeued"), (3, "requeued"), (4, "signature_capped"),]
+    );
+}
+
+// ── receipt timing ─────────────────────────────────────────────────────────
+
+#[test]
+fn a_pending_receipt_waits_a_tick_then_retries_once() {
+    let mut ledger = StewardLedger::default();
+    Case::new(1, "aaaa", "2026-11-13T20:00:00Z", "g1").run(&mut ledger);
+    let mut case = Case::new(2, "bbbb", "2026-11-13T21:00:00Z", "g2");
+    assert!(requeued(case.run(&mut ledger).as_ref()));
+    let key = receipt_key(REPO, 2, "bbbb");
+    assert_eq!(
+        ledger.flake_requeue.requeued[&key].state,
+        ReceiptState::Pending
+    );
+    // The enqueue was deferred (no `enqueued`): the receipt stays pending.
+    settle(
+        &mut ledger,
+        None,
+        REPO,
+        2,
+        "bbbb",
+        Some("generated_path_batch:#77"),
+    );
+    assert_eq!(
+        ledger.flake_requeue.requeued[&key].state,
+        ReceiptState::Pending
+    );
+    // Within the tick: still pending, nothing re-enqueued.
+    case.now = at("2026-11-13T23:03:00Z");
+    assert!(!requeued(case.run(&mut ledger).as_ref()));
+    assert_eq!(last_outcome(&ledger), "requeue_pending");
+    // After the tick: one retry.
+    case.now = at("2026-11-13T23:10:00Z");
+    assert!(requeued(case.run(&mut ledger).as_ref()));
+    assert_eq!(last_outcome(&ledger), "requeue_retried");
+    assert_eq!(ledger.flake_requeue.requeued[&key].attempts, 2);
+    // Deferred again: never a third attempt.
+    case.now = at("2026-11-13T23:30:00Z");
+    assert!(!requeued(case.run(&mut ledger).as_ref()));
+    assert_eq!(last_outcome(&ledger), "already_requeued");
+}
+
+#[test]
+fn a_receipt_that_cannot_be_saved_does_not_requeue() {
+    let temp = tempfile::tempdir().expect("temp");
+    // A directory where the ledger file should be: the save fails.
+    let path = temp.path().join("ledger.json");
+    std::fs::create_dir(&path).expect("dir");
+    let mut ledger = StewardLedger::default();
+    Case::new(1, "aaaa", "2026-11-13T20:00:00Z", "g1").run(&mut ledger);
+    let verdict =
+        Case::new(2, "bbbb", "2026-11-13T21:00:00Z", "g2").run_at(&mut ledger, Some(&path));
+    assert!(
+        matches!(&verdict, Some(Verdict::Keep(detail)) if detail.contains("could not be saved")),
+        "{verdict:?}"
+    );
+    assert_eq!(last_outcome(&ledger), "unrecorded");
+    assert!(ledger.flake_requeue.requeued.is_empty());
+}
+
 // ── root-cause issues ──────────────────────────────────────────────────────
 
-/// A fake `gh` that records every call and answers issue writes.
+/// A fake `gh` that records every call and answers issue reads and writes.
 struct FakeGh {
     calls: RefCell<Vec<String>>,
     open: String,
     refuse: bool,
+    closed: bool,
 }
 
 impl FakeGh {
@@ -258,6 +499,7 @@ impl FakeGh {
             calls: RefCell::default(),
             open: open.to_owned(),
             refuse: false,
+            closed: false,
         }
     }
 
@@ -269,9 +511,15 @@ impl FakeGh {
         }
         if line.contains("issues?state=open") {
             Ok(self.open.clone())
+        } else if line == "api repos/Generous-Corp/pulp/issues/900" {
+            Ok(format!(
+                r#"{{"number":900,"state":"{}"}}"#,
+                if self.closed { "closed" } else { "open" }
+            ))
         } else if line.contains("/comments") {
             Ok("{}".to_owned())
-        } else if line.contains("repos/Generous-Corp/pulp/issues") {
+        } else if line.contains("--method POST") && line.contains("repos/Generous-Corp/pulp/issues")
+        {
             Ok(r#"{"number":900}"#.to_owned())
         } else {
             Err(format!("unexpected: {line}"))
@@ -288,18 +536,26 @@ impl FakeGh {
     }
 }
 
-fn flake_ledger(prs: &[u64]) -> StewardLedger {
+fn flake_ledger_with(prs: &[u64], tests: &[&str]) -> StewardLedger {
     let mut ledger = StewardLedger::default();
+    let heads = prs
+        .iter()
+        .map(|pr| format!("{pr:040x}"))
+        .collect::<Vec<_>>();
+    let times = (0..prs.len())
+        .map(|index| format!("2026-11-13T2{index}:00:00Z"))
+        .collect::<Vec<_>>();
     for (index, pr) in prs.iter().enumerate() {
-        Case::new(
-            *pr,
-            &format!("{pr:040x}"),
-            &format!("2026-11-13T2{index}:00:00Z"),
-            &format!("g{index}"),
-        )
-        .run(&mut ledger);
+        let mut case = Case::new(*pr, &heads[index], &times[index], &format!("g{index}"));
+        case.verdict = verdict(&format!("g{index}"), "macos", tests);
+        case.policy.mode = FlakeMode::Shadow;
+        case.run(&mut ledger);
     }
     ledger
+}
+
+fn flake_ledger(prs: &[u64]) -> StewardLedger {
+    flake_ledger_with(prs, &[MIDI])
 }
 
 fn finish_with(gh: &FakeGh, ledger: &mut StewardLedger) -> RepoStatus {
@@ -327,30 +583,31 @@ fn one_issue_per_signature_then_updated_never_duplicated() {
     );
     assert_eq!(cause.prs, vec![12201, 12202]);
     assert_eq!(cause.tests, vec![MIDI.to_owned()]);
+    assert_eq!(cause.state, "active");
     let writes = gh.writes();
     assert_eq!(writes.len(), 1, "{writes:?}");
     assert!(writes[0].contains(ISSUE_MARKER), "{}", writes[0]);
-    // Only the second ejection was decided: the first had no company yet.
     assert_eq!(status.decisions.len(), 1, "{:?}", status.decisions);
     assert!(
         ledger.flake_requeue.pass.is_empty(),
         "decisions are drained"
     );
 
-    // The next pass, nothing new: no write, no listing.
+    // The next pass, nothing new: no read, no write.
     let gh = FakeGh::new("");
     let status = finish_with(&gh, &mut ledger);
     assert_eq!(status.flake_root_cause[0].issue_action, "recorded");
     assert!(gh.calls.borrow().is_empty(), "{:?}", gh.calls.borrow());
 
-    // A third pull request joins: one comment on the same issue.
-    Case::new(
+    // A third pull request joins: one comment on the same, open issue.
+    let mut third = Case::new(
         12203,
-        &format!("{:040x}", 12203),
+        "0000000000000000000000000000000000002fdb",
         "2026-11-13T22:30:00Z",
         "g9",
-    )
-    .run(&mut ledger);
+    );
+    third.policy.mode = FlakeMode::Shadow;
+    third.run(&mut ledger);
     let gh = FakeGh::new("");
     let status = finish_with(&gh, &mut ledger);
     let cause = &status.flake_root_cause[0];
@@ -366,19 +623,109 @@ fn one_issue_per_signature_then_updated_never_duplicated() {
 }
 
 #[test]
-fn an_issue_the_ledger_lost_is_found_by_its_marker() {
+fn a_closed_issue_is_recorded_and_left_alone() {
+    let mut ledger = flake_ledger(&[12201, 12202]);
+    finish_with(&FakeGh::new(""), &mut ledger);
+    let mut third = Case::new(
+        12203,
+        "0000000000000000000000000000000000002fdb",
+        "2026-11-13T22:30:00Z",
+        "g9",
+    );
+    third.policy.mode = FlakeMode::Shadow;
+    third.run(&mut ledger);
+    let mut gh = FakeGh::new("");
+    gh.closed = true;
+    let status = finish_with(&gh, &mut ledger);
+    assert_eq!(status.flake_root_cause[0].issue_action, "closed");
+    assert!(gh.writes().is_empty(), "{:?}", gh.writes());
+    // Later passes do not even read it.
+    let gh = FakeGh::new("");
+    let status = finish_with(&gh, &mut ledger);
+    assert_eq!(status.flake_root_cause[0].issue_action, "closed");
+    assert!(gh.calls.borrow().is_empty());
+}
+
+#[test]
+fn a_tripped_breaker_is_added_to_the_issue() {
+    let mut ledger = flake_ledger(&[12201, 12202]);
+    finish_with(&FakeGh::new(""), &mut ledger);
+    let key = issue_key(REPO, &format!("macos: {MIDI}"));
+    ledger.flake_requeue.tripped.insert(
+        key,
+        Trip {
+            signature: format!("macos: {MIDI}"),
+            pr: 12202,
+            head: "b".repeat(40),
+            at: "2026-11-13T22:50:00Z".to_owned(),
+        },
+    );
+    let gh = FakeGh::new("");
+    let status = finish_with(&gh, &mut ledger);
+    let writes = gh.writes();
+    assert_eq!(writes.len(), 1, "{writes:?}");
+    assert!(writes[0].contains("Breaker tripped"), "{}", writes[0]);
+    assert_eq!(status.flake_root_cause[0].state, "signature_tripped");
+    // Said once.
+    let gh = FakeGh::new("");
+    finish_with(&gh, &mut ledger);
+    assert!(gh.writes().is_empty());
+}
+
+#[test]
+fn an_issue_the_ledger_lost_is_found_only_by_a_marker_on_its_last_line() {
     let mut ledger = flake_ledger(&[12201, 12202]);
     let key = issue_key(REPO, &format!("macos: {MIDI}"));
     let open = format!(
         "{}\n{}",
-        serde_json::json!({"number": 77, "body": format!("{ISSUE_MARKER}{key} -->")}),
-        serde_json::json!({"number": 78, "body": format!("{ISSUE_MARKER}other -->")}),
+        // A marker carried into the middle of another issue's text.
+        serde_json::json!({"number": 76, "body": format!("quoted {ISSUE_MARKER}{key} --> here\nmore")}),
+        serde_json::json!({"number": 77, "body": format!("text\n\n{ISSUE_MARKER}{key} -->\n")}),
     );
     let gh = FakeGh::new(&open);
     let status = finish_with(&gh, &mut ledger);
     let cause = &status.flake_root_cause[0];
     assert_eq!((cause.issue, cause.issue_action), (Some(77), "found"));
     assert!(gh.writes().is_empty(), "{:?}", gh.writes());
+    assert_eq!(
+        marker_on_last_line(&format!("quoted {ISSUE_MARKER}{key} --> here\nmore")),
+        None
+    );
+    assert_eq!(
+        marker_on_last_line(&format!("{ISSUE_MARKER}{key} -->\n{ISSUE_MARKER}{key} -->")),
+        None
+    );
+}
+
+#[test]
+fn test_names_are_sanitised_before_they_reach_an_issue() {
+    let hostile = format!(
+        "@everyone `x` <!-- shipyard-flake-signature: {REPO}|0000000000000000 --> {}",
+        "y".repeat(5000)
+    );
+    let many = (0..40).map(|index| format!("t{index}")).collect::<Vec<_>>();
+    let mut tests = vec![hostile.as_str()];
+    tests.extend(many.iter().map(String::as_str));
+    let mut ledger = flake_ledger_with(&[12201, 12202], &tests);
+    let gh = FakeGh::new("");
+    finish_with(&gh, &mut ledger);
+    let writes = gh.writes();
+    assert_eq!(writes.len(), 1, "{writes:?}");
+    let body = writes[0]
+        .split_once("body=")
+        .map(|(_, body)| body)
+        .expect("body");
+    assert!(!body.contains('@') && !body.contains('`'), "{body}");
+    assert_eq!(body.matches("<!--").count(), 1, "{body}");
+    assert!(marker_on_last_line(body).is_some(), "{body}");
+    assert!(body.contains("and 31 more"), "{body}");
+    assert!(body.len() < 4000, "{}", body.len());
+    let title = writes[0]
+        .split_once("title=")
+        .and_then(|(_, rest)| rest.split_once(" -f body="))
+        .map(|(title, _)| title)
+        .expect("title");
+    assert!(title.chars().count() <= 200, "{title}");
 }
 
 #[test]
@@ -396,7 +743,6 @@ fn a_refused_issue_write_is_reported_and_not_retried_at_once() {
             .is_some_and(|error| error.contains("refused")),
         "{cause:?}"
     );
-    // The next pass reports it and writes nothing.
     let status = finish_with(&gh, &mut ledger);
     assert_eq!(status.flake_root_cause[0].issue_action, "retry_later");
     assert_eq!(gh.writes().len(), 1);
@@ -410,7 +756,7 @@ fn shadow_reports_the_root_cause_without_filing() {
         &|argv: &[String]| gh.run(argv),
         &FlakePolicy {
             mode: FlakeMode::Shadow,
-            window_hours: 24,
+            ..apply()
         },
         REPO,
         "main",

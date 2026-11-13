@@ -607,6 +607,7 @@ pull requests.
 [auto_merge]
 flake_requeue = "shadow"    # off | shadow | apply
 flake_window_hours = 24     # 1..=168
+flake_max_requeues = 3      # 1..=50 re-enqueues per signature per window
 ```
 
 Without `flake_requeue` a merge-queue base runs `shadow`, or `apply` when its
@@ -625,25 +626,45 @@ dwell acts already apply (`[auto_merge.dwell] act = "apply"`).
   within the window. One group ejecting several of its own members is one
   failure, not two; a single ejection is never a flake.
 - **Re-enqueue.** Under `apply`, each flake-ejected head is re-enqueued once,
-  unchanged. By then the enqueue path has re-read the exact-head approval and
-  the head's required checks live. Never when a `defect-fix` removal names the
-  head, never when the base is confirmed red on a signature check (that is
-  base poison, not a flake), and never twice for the same head: the receipt
-  (`repo#pr@head`) is saved to the steward ledger before the enqueue. This is
-  separate from the classifier's one free retry, but the head-approval ejection
-  cap (two removals) still applies, so a head ejected again after its flake
-  re-enqueue is left for repair. Under `shadow` the row keeps its refusal and
-  `blocked_detail` says it would re-enqueue.
+  unchanged, and only through the steward's own enqueue path: the exact-head
+  approval and the head's required checks are re-read live first, and a HOLD,
+  a missing approval, a moved head, a draft or an excluded label stops it
+  there. The flake class never approves anything. It also refuses:
+  - `defect_fix_removed`: a `defect-fix` removal names the head;
+  - `base_red`: the base is confirmed red on a signature check (base poison);
+  - `base_unknown`: this pass did not read the base green for every signature
+    check. Green means the merge groups were read with no gaps and the check
+    last passed there, or the base tip was read green for it. Base poison
+    off, an unread or partial reading, or a check with no recorded pass all
+    refuse;
+  - `signature_tripped`: the breaker. A head this class re-enqueued that the
+    queue ejected again with the same signature says it is not a flake (a
+    break the base has not shown red yet: a runner image, a certificate, a
+    date), and the signature re-enqueues nothing more;
+  - `signature_capped`: the signature spent `flake_max_requeues` within the
+    window;
+  - `already_requeued`: this head had its re-enqueue.
+- **Receipts.** The receipt (`repo#pr@head`) is saved `pending` before the
+  enqueue and marked `done` once GitHub accepts it, so a crash never buys a
+  second one. A head the enqueue path then deferred (a generated-path batch, a
+  refusal from GitHub) stays `pending` (`requeue_pending`); a tick later
+  (5 minutes) it is retried once (`requeue_retried`), never again. The
+  head-approval ejection cap (two removals) still applies, so a head ejected
+  again after its flake re-enqueue is left for repair. Under `shadow` the row
+  keeps its refusal and `blocked_detail` says it would re-enqueue.
 - **Root cause.** The repository report's `flake_requeue` section lists this
-  pass's `decisions` (`requeued`, `would_requeue`, `already_requeued`,
-  `defect_fix_removed`, `base_red`, `unrecorded`) and one `flake_root_cause`
-  record per signature: `signature`, `checks`, `tests`, `prs`,
-  `first_ejection`, `last_ejection`, `issue`, `issue_action`, `issue_error`.
-  Under `apply` the steward files one issue per signature, found again by a
-  `<!-- shipyard-flake-signature: ... -->` marker. A pull request that joins
-  the signature later adds a comment to that issue instead of opening a
-  second one. A failed or refused issue write is reported (`issue_action =
-  "failed"`, then `"retry_later"` for six hours) and never routed around; the
+  pass's `decisions` and one `flake_root_cause` record per signature:
+  `signature`, `checks`, `tests`, `prs`, `first_ejection`, `last_ejection`,
+  `state` (`active` or `signature_tripped`), `tripped_by`, `requeues`,
+  `issue`, `issue_action`, `issue_error`. Under `apply` the steward files one
+  issue per signature, found again only by a
+  `<!-- shipyard-flake-signature: ... -->` marker on the body's last line.
+  New pull requests on the signature, or the breaker tripping, add one comment
+  to that issue; an issue found closed is recorded and left alone. Test names
+  are sanitised before they reach an issue (no mentions, backticks, HTML
+  comments or brackets; long names and long lists are cut). A failed or
+  refused issue write is reported (`issue_action = "failed"`, then
+  `"retry_later"` for six hours) and never routed around; the
   `flake_root_cause` record is the coordinator's copy either way.
 
 ## When the base itself is red: land the fix first

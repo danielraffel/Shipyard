@@ -489,6 +489,16 @@ fn enqueue_pull_request_with_recovery(
         recover_hosted_setup_eviction_priority,
         fast_track_jump,
     );
+    // A flake re-enqueue's `pending` receipt is `done` only once GitHub
+    // accepted the enqueue; a deferral or refusal leaves it pending.
+    super::flake_requeue::settle(
+        ledger,
+        Some(context.ledger_path),
+        &context.observation.repo,
+        pr.fact.number,
+        &pr.fact.head_sha,
+        mutation.as_deref(),
+    );
     match admission.token() {
         Some(token) => (
             Some(mutation.map_or(token.clone(), |mutation| format!("{token},{mutation}"))),
@@ -1246,7 +1256,7 @@ fn same_head_enqueue_refusal(
 
 /// The flake class's reading of one refused same-head ejection
 /// ([`super::flake_requeue::consider`]), with this pass's defect-fix and
-/// base-poison readings.
+/// base-poison readings. A base this pass did not read green refuses.
 fn flake_requeue_verdict(
     context: &MutationApplyContext<'_>,
     pr: &ObservedPr,
@@ -1254,10 +1264,6 @@ fn flake_requeue_verdict(
     at: Option<&str>,
     verdict: &crate::environment_requeue::EnvironmentRequeue,
 ) -> Option<super::flake_requeue::Verdict> {
-    let base_red = context
-        .base_poison
-        .map(super::base_poison::RepoPoison::confirmed_contexts)
-        .unwrap_or_default();
     super::flake_requeue::consider(
         &super::flake_requeue::Ejection {
             policy: &context.ejection_guards.flake_requeue,
@@ -1267,7 +1273,7 @@ fn flake_requeue_verdict(
             at,
             verdict,
             defect_fix_removed: defect_fix_block(context, pr).is_some(),
-            base_red: &base_red,
+            poison: context.base_poison,
         },
         ledger,
         Some(context.ledger_path),

@@ -1,37 +1,44 @@
-//! The flake class through the real enqueue path: an approved head the
-//! queue ejected for a test that also ejected another pull request's head is
-//! re-enqueued once, and never when a defect-fix removal names it.
+//! The flake class through the real enqueue path, on a base that requires
+//! an exact-head approval: an approved head the queue ejected for a test
+//! that also ejected another pull request's head is re-enqueued once, and
+//! never when the approval, the head, the base reading or the receipt says
+//! otherwise.
 use super::*;
+use crate::app::merge_steward_cmd::base_poison::RepoPoison;
 use crate::app::merge_steward_cmd::defect_fix_removals::{Reading, Removal};
-use crate::app::merge_steward_cmd::flake_requeue::{Sighting, Signature, receipt_key};
+use crate::app::merge_steward_cmd::flake_requeue::{
+    ReceiptState, Sighting, Signature, green_base, receipt_key,
+};
 use crate::app::merge_steward_cmd::pr_mutations::mutate_pr;
 use crate::merge_steward::EjectionGuards;
 use crate::merge_steward::flake_requeue::{FlakeMode, FlakePolicy};
 
 const HEAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const OLD_HEAD: &str = "9999999999999999999999999999999999999999";
+const MOVED: &str = "cccccccccccccccccccccccccccccccccccccccc";
 const GROUP: &str = "c0ffee0000000000000000000000000000000001";
 const BASE_TIP: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const MIDI: &str = "CoreMIDI virtual port delivers SysEx";
-const CONFIG: &str = r"printf '%s\n' '[auto_merge]' 'arm_requires_head_approval = false' '[queue.environment_requeue]' 'enabled = true'";
-/// A base that requires an exact-head approval from the review App.
-const APPROVAL_REQUIRED: &str = r#"printf '%s\n' '[auto_merge]' 'arm_requires_head_approval = true' 'reviewer_identities = ["shipyard-review[bot]"]' '[queue.environment_requeue]' 'enabled = true'"#;
-/// A HOLD on the ejected head.
-const HOLD: &str = r#"{"id":12345,"login":"shipyard-review[bot]","type":"Bot","at":"2026-10-31T22:00:00Z","body":"verdict: HOLD head:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","performed_via_github_app_id":99}"#;
+const GENERATED: &str = "test/ctest_script_inputs.json";
+/// The base requires an exact-head approval from the review App.
+const CONFIG: &str = r#"printf '%s\n' '[auto_merge]' 'arm_requires_head_approval = true' 'reviewer_identities = ["shipyard-review[bot]"]' '[queue.environment_requeue]' 'enabled = true'"#;
 
-/// What the fake `gh` serves beyond the fixed answers.
-#[derive(Clone, Copy)]
-struct Serve<'a> {
-    config: &'a str,
-    comments: &'a str,
-    /// Serve the failing job's log; `false` makes it unreadable.
-    log: bool,
+fn verdict_comment(id: u64, at: &str, verdict: &str, head: &str) -> String {
+    format!(
+        r#"{{"id":{id},"login":"shipyard-review[bot]","type":"Bot","at":"{at}","body":"verdict: {verdict} head:{head}","performed_via_github_app_id":99}}"#
+    )
 }
 
-const PLAIN: Serve<'static> = Serve {
-    config: CONFIG,
-    comments: "",
-    log: true,
-};
+fn approve() -> String {
+    verdict_comment(12001, "2026-10-31T20:00:00Z", "APPROVE", HEAD)
+}
+
+/// The live pull request as `pr view` answers it.
+fn live_pr(head: &str, draft: bool, labels: &str) -> String {
+    format!(
+        r#"{{"id":"PR_kw","number":42,"state":"OPEN","isDraft":{draft},"baseRefName":"main","headRefOid":"{head}","headRefName":"feature","mergeStateStatus":"CLEAN","autoMergeRequest":null,"labels":[{labels}],"statusCheckRollup":[{{"__typename":"CheckRun","name":"macos","status":"COMPLETED","conclusion":"SUCCESS","detailsUrl":"https://github.com/owner/repo/actions/runs/100"}}]}}"#
+    )
+}
 
 /// The merge group's `macos` job log: ctest names one failing test.
 fn job_log() -> String {
@@ -49,22 +56,63 @@ fn job_log() -> String {
         + "\n"
 }
 
+/// A `files(first:100)` answer.
+fn files_answer(paths: &[&str]) -> String {
+    let nodes = paths
+        .iter()
+        .map(|path| format!(r#"{{"path":"{path}"}}"#))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        r#"{{"data":{{"repository":{{"pullRequest":{{"files":{{"nodes":[{nodes}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}"#
+    )
+}
+
+/// What the fake `gh` serves for one pass.
+struct Serve {
+    comments: String,
+    /// Serve the failing job's log; `false` makes it unreadable.
+    log: bool,
+    /// The live `pr view` answer.
+    pr_view: String,
+    /// Another queue entry (#77) that changes the generated path PR 42 also
+    /// changes: the generated-path batch guard defers the enqueue.
+    batch_mate: bool,
+}
+
+impl Serve {
+    fn approved() -> Self {
+        Self {
+            comments: approve(),
+            log: true,
+            pr_view: live_pr(HEAD, false, ""),
+            batch_mate: false,
+        }
+    }
+}
+
 /// A fake `gh` for PR 42, whose unchanged head the queue ejected once for
 /// `failed_checks` from [`GROUP`], whose `macos` job failed on [`MIDI`].
-fn script(temp: &tempfile::TempDir, serve: Serve<'_>) -> String {
+fn script(temp: &tempfile::TempDir, serve: &Serve) -> String {
     let log = temp.path().join("calls");
     let log_path = temp.path().join("job.log");
     fs::write(&log_path, job_log()).expect("job log");
+    let entries = if serve.batch_mate {
+        r#"{"position":1,"enqueuedAt":"2026-11-06T10:00:00Z","headCommit":{"oid":"dddddddddddddddddddddddddddddddddddddddd"},"pullRequest":{"number":77}}"#
+    } else {
+        ""
+    };
     r#"
 # CONFIG_ERROR: this fixture serves its own policy file
 printf '%s\n' "$*" >> '__LOG__'
 case "$*" in
   *"contents/.shipyard/config.toml"*) __CONFIG__ ;;
+  *"files(first:100"*"number=42"*) printf '%s' '__FILES__' ;;
+  *"files(first:100"*"number=77"*) printf '%s' '__FILES__' ;;
   *"isInMergeQueue"*) printf '%s' '{"data":{"repository":{"pullRequest":{"number":42,"state":"OPEN","headRefOid":"__HEAD__","isInMergeQueue":false,"mergeQueueEntry":null,"autoMergeRequest":null,"timelineItems":{"pageInfo":{"hasPreviousPage":false},"nodes":[{"__typename":"PullRequestCommit","commit":{"oid":"__HEAD__"}},{"__typename":"AddedToMergeQueueEvent","createdAt":"2026-10-31T21:00:00Z"},{"__typename":"RemovedFromMergeQueueEvent","createdAt":"2026-10-31T21:10:00Z","reason":"failed_checks","beforeCommit":{"oid":"__GROUP__","parents":{"nodes":[{"oid":"__BASE_TIP__"},{"oid":"__HEAD__"}]}}}]}}}}}' ;;
   *"query=query("*"mergeQueue"*)
-    printf '%s' '{"data":{"repository":{"mergeQueue":{"entries":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}}' ;;
-  "pr view "*)
-    printf '%s' '{"id":"PR_kw","number":42,"state":"OPEN","isDraft":false,"baseRefName":"main","headRefOid":"__HEAD__","headRefName":"feature","mergeStateStatus":"CLEAN","autoMergeRequest":null,"labels":[],"statusCheckRollup":[{"__typename":"CheckRun","name":"macos","status":"COMPLETED","conclusion":"SUCCESS","detailsUrl":"https://github.com/owner/repo/actions/runs/100"}]}' ;;
+    printf '%s' '{"data":{"repository":{"mergeQueue":{"entries":{"nodes":[__ENTRIES__],"pageInfo":{"hasNextPage":false}}}}}}' ;;
+  "pr view "*) printf '%s' '__PR_VIEW__' ;;
   *"pulls/42/reviews"*) printf '' ;;
   *"issues/42/comments"*) printf '%s\n' '__COMMENTS__' ;;
   *"commits/__HEAD__"*) printf '%s' '2026-10-31T00:00:00Z' ;;
@@ -91,8 +139,11 @@ esac
             "echo 'HTTP 502: Bad Gateway' >&2; exit 1".to_owned()
         },
     )
-    .replace("__CONFIG__", serve.config)
-    .replace("__COMMENTS__", serve.comments)
+    .replace("__CONFIG__", CONFIG)
+    .replace("__COMMENTS__", &serve.comments)
+    .replace("__PR_VIEW__", &serve.pr_view)
+    .replace("__ENTRIES__", entries)
+    .replace("__FILES__", &files_answer(&[GENERATED]))
     .replace("__HEAD__", HEAD)
     .replace("__GROUP__", GROUP)
     .replace("__BASE_TIP__", BASE_TIP)
@@ -116,17 +167,31 @@ fn other_pr_sighting() -> Sighting {
     }
 }
 
+fn seeded() -> StewardLedger {
+    let mut ledger = StewardLedger::default();
+    ledger.flake_requeue.sightings.push(other_pr_sighting());
+    ledger
+}
+
 struct Pass {
     mutation: Option<String>,
     error: Option<String>,
     calls: String,
 }
 
+impl Pass {
+    fn enqueued(&self) -> bool {
+        self.calls.contains("enqueuePullRequest")
+    }
+}
+
+/// One steward pass over PR 42 with the flake class on `apply`.
 fn pass(
     temp: &tempfile::TempDir,
     ledger: &mut StewardLedger,
+    serve: &Serve,
     defect_fix: Option<&Reading>,
-    serve: Serve<'_>,
+    poison: Option<&RepoPoison>,
 ) -> Pass {
     let log = temp.path().join("calls");
     let _ = fs::remove_file(&log);
@@ -135,19 +200,25 @@ fn pass(
     let observation = observation_for(pr.clone(), true);
     let control = mutation_control(temp, "studio", "studio");
     let ledger_path = temp.path().join("ledger.json");
-    let mut context = mutation_apply_context(&actions, &observation, &ledger_path, &control);
-    context.ejection_guards = EjectionGuards {
+    let guards = EjectionGuards {
         flake_requeue: FlakePolicy {
             mode: FlakeMode::Apply,
             window_hours: 24,
+            max_requeues: 3,
         },
+        generated_paths: vec![GENERATED.to_owned()],
         ..EjectionGuards::for_base(true)
     };
+    let mut context = mutation_apply_context(&actions, &observation, &ledger_path, &control);
+    context.ejection_guards = guards.clone();
     context.defect_fix = defect_fix;
+    context.base_poison = poison;
+    let mut policy = queue_policy();
+    policy.ejection_guards = guards;
     let (mutation, error) = mutate_pr(
         &context,
         &pr,
-        &queue_policy(),
+        &policy,
         &StewardDecision::ArmMergeQueue,
         ledger,
     );
@@ -158,13 +229,19 @@ fn pass(
     }
 }
 
+const REFUSED: &str = "skipped_ejected_same_head:failed_checks:needs_new_head";
+
+fn key() -> String {
+    receipt_key("owner/repo", 42, HEAD)
+}
+
 #[cfg(unix)]
 #[test]
-fn a_flake_ejection_corroborated_by_another_pr_is_requeued_once() {
+fn an_approved_flake_ejection_corroborated_by_another_pr_is_requeued_once() {
     let temp = tempfile::tempdir().expect("temp");
-    let mut ledger = StewardLedger::default();
-    ledger.flake_requeue.sightings.push(other_pr_sighting());
-    let first = pass(&temp, &mut ledger, None, PLAIN);
+    let green = green_base(&["macos"]);
+    let mut ledger = seeded();
+    let first = pass(&temp, &mut ledger, &Serve::approved(), None, Some(&green));
     assert!(first.error.is_none(), "{:?}\n{}", first.error, first.calls);
     assert!(
         first
@@ -175,21 +252,17 @@ fn a_flake_ejection_corroborated_by_another_pr_is_requeued_once() {
         first.mutation,
         first.calls
     );
-    let key = receipt_key("owner/repo", 42, HEAD);
-    assert!(ledger.flake_requeue.requeued.contains_key(&key));
-    // The receipt was saved before the enqueue.
+    let receipt = &ledger.flake_requeue.requeued[&key()];
+    assert_eq!(receipt.state, ReceiptState::Done);
+    // The receipt reached disk before the enqueue, and its `done` after.
     let saved = fs::read_to_string(temp.path().join("ledger.json")).expect("ledger saved");
-    assert!(saved.contains(&key), "{saved}");
+    assert!(saved.contains(&key()), "{saved}");
     // The same head ejected again: no second flake requeue.
-    let second = pass(&temp, &mut ledger, None, PLAIN);
-    assert!(
-        !second.calls.contains("enqueuePullRequest"),
-        "{}",
-        second.calls
-    );
+    let second = pass(&temp, &mut ledger, &Serve::approved(), None, Some(&green));
+    assert!(!second.enqueued(), "{}", second.calls);
     assert_eq!(
         second.mutation.as_deref(),
-        Some("skipped_ejected_same_head:failed_checks:needs_new_head"),
+        Some(REFUSED),
         "{:?}",
         second.error
     );
@@ -199,17 +272,17 @@ fn a_flake_ejection_corroborated_by_another_pr_is_requeued_once() {
 #[test]
 fn a_lone_flake_ejection_keeps_the_refusal() {
     let temp = tempfile::tempdir().expect("temp");
+    let green = green_base(&["macos"]);
     let mut ledger = StewardLedger::default();
-    let pass = pass(&temp, &mut ledger, None, PLAIN);
-    assert!(!pass.calls.contains("enqueuePullRequest"), "{}", pass.calls);
+    let pass = pass(&temp, &mut ledger, &Serve::approved(), None, Some(&green));
+    assert!(!pass.enqueued(), "{}", pass.calls);
     assert_eq!(
         pass.mutation.as_deref(),
-        Some("skipped_ejected_same_head:failed_checks:needs_new_head"),
+        Some(REFUSED),
         "{:?}\n{}",
         pass.error,
         pass.calls
     );
-    // It was read and remembered, so a second pull request can corroborate it.
     assert_eq!(ledger.flake_requeue.sightings.len(), 1);
     assert_eq!(
         ledger.flake_requeue.sightings[0].signature.text,
@@ -217,12 +290,194 @@ fn a_lone_flake_ejection_keeps_the_refusal() {
     );
 }
 
+/// The flake class never stands in for approval or for a live head: each
+/// case stops before any flake re-enqueue and writes no receipt.
+#[cfg(unix)]
+#[test]
+fn no_requeue_without_the_live_approved_unchanged_ready_head() {
+    let green = green_base(&["macos"]);
+    let held = format!(
+        "{}\n{}",
+        approve(),
+        verdict_comment(12002, "2026-10-31T22:00:00Z", "HOLD", HEAD)
+    );
+    let cases = [
+        (
+            "withdrawn approval (a later HOLD)",
+            held,
+            live_pr(HEAD, false, ""),
+        ),
+        (
+            "no approval at all",
+            String::new(),
+            live_pr(HEAD, false, ""),
+        ),
+        (
+            "approval of an older head",
+            verdict_comment(12003, "2026-10-30T20:00:00Z", "APPROVE", OLD_HEAD),
+            live_pr(HEAD, false, ""),
+        ),
+        ("moved head", approve(), live_pr(MOVED, false, "")),
+        ("draft", approve(), live_pr(HEAD, true, "")),
+        (
+            "owner-decision label",
+            approve(),
+            live_pr(HEAD, false, r#"{"name":"owner-decision"}"#),
+        ),
+    ];
+    for (case, comments, pr_view) in cases {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut ledger = seeded();
+        let serve = Serve {
+            comments,
+            pr_view,
+            ..Serve::approved()
+        };
+        let pass = pass(&temp, &mut ledger, &serve, None, Some(&green));
+        assert!(!pass.enqueued(), "{case}: {}", pass.calls);
+        assert!(
+            !pass
+                .mutation
+                .as_deref()
+                .is_some_and(|mutation| mutation.contains("enqueued")),
+            "{case}: {:?}",
+            pass.mutation
+        );
+        assert!(ledger.flake_requeue.requeued.is_empty(), "{case}");
+    }
+}
+
+/// The base reading through the real path: unread, partial or red refuses.
+#[cfg(unix)]
+#[test]
+fn an_unread_partial_or_red_base_never_requeues() {
+    let partial = RepoPoison {
+        fix_read_error: Some("fixes unread".to_owned()),
+        ..green_base(&["macos"])
+    };
+    let red = RepoPoison {
+        health: crate::base_health::merge_group::MergeGroupHealth::Poisoned {
+            contexts: vec![crate::base_health::merge_group::PoisonedContext {
+                context: "macos".to_owned(),
+                first_error: None,
+                groups: Vec::new(),
+                latest_failure_at: None,
+                check_id: None,
+                same_first_error: None,
+            }],
+        },
+        tip: std::collections::BTreeMap::from([(
+            "macos".to_owned(),
+            crate::base_health::fix_first::TipReading {
+                sha: None,
+                red: true,
+                red_since: None,
+                error: None,
+            },
+        )]),
+        ..green_base(&[])
+    };
+    for (poison, outcome) in [
+        (None, "base_unknown"),
+        (Some(&partial), "base_unknown"),
+        (Some(&red), "base_red"),
+    ] {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut ledger = seeded();
+        let pass = pass(&temp, &mut ledger, &Serve::approved(), None, poison);
+        assert!(!pass.enqueued(), "{outcome}: {}", pass.calls);
+        assert!(ledger.flake_requeue.requeued.is_empty());
+        assert_eq!(
+            ledger
+                .flake_requeue
+                .pass
+                .last()
+                .map(|decision| decision.outcome),
+            Some(outcome)
+        );
+    }
+}
+
+/// A deferral after the receipt was saved strands nothing: the receipt
+/// stays `pending`, waits a tick, and is retried once.
+#[cfg(unix)]
+#[test]
+fn a_deferred_requeue_stays_pending_and_is_retried_once() {
+    let temp = tempfile::tempdir().expect("temp");
+    let green = green_base(&["macos"]);
+    let mut ledger = seeded();
+    let deferred = Serve {
+        batch_mate: true,
+        ..Serve::approved()
+    };
+    let first = pass(&temp, &mut ledger, &deferred, None, Some(&green));
+    assert!(!first.enqueued(), "{}", first.calls);
+    assert!(
+        first
+            .mutation
+            .as_deref()
+            .is_some_and(|mutation| mutation.starts_with("generated_path_batch:#77")),
+        "{:?}\n{}",
+        first.mutation,
+        first.calls
+    );
+    assert_eq!(
+        ledger.flake_requeue.requeued[&key()].state,
+        ReceiptState::Pending
+    );
+    // Within the tick: still pending.
+    let second = pass(&temp, &mut ledger, &deferred, None, Some(&green));
+    assert!(!second.enqueued(), "{}", second.calls);
+    assert_eq!(
+        ledger
+            .flake_requeue
+            .pass
+            .last()
+            .map(|decision| decision.outcome),
+        Some("requeue_pending")
+    );
+    // A tick later, the batch-mate gone: retried once and done.
+    let receipt = ledger
+        .flake_requeue
+        .requeued
+        .get_mut(&key())
+        .expect("receipt");
+    receipt.at = (chrono::Utc::now() - chrono::Duration::minutes(10)).to_rfc3339();
+    let third = pass(&temp, &mut ledger, &Serve::approved(), None, Some(&green));
+    assert!(third.enqueued(), "{:?}\n{}", third.mutation, third.calls);
+    let receipt = &ledger.flake_requeue.requeued[&key()];
+    assert_eq!((receipt.state, receipt.attempts), (ReceiptState::Done, 2));
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unreadable_job_log_never_requeues() {
+    let temp = tempfile::tempdir().expect("temp");
+    let green = green_base(&["macos"]);
+    let mut ledger = seeded();
+    let serve = Serve {
+        log: false,
+        ..Serve::approved()
+    };
+    let pass = pass(&temp, &mut ledger, &serve, None, Some(&green));
+    assert!(!pass.enqueued(), "{}", pass.calls);
+    assert_eq!(
+        pass.mutation.as_deref(),
+        Some(REFUSED),
+        "{:?}\n{}",
+        pass.error,
+        pass.calls
+    );
+    assert!(ledger.flake_requeue.requeued.is_empty());
+    assert_eq!(ledger.flake_requeue.sightings.len(), 1);
+}
+
 #[cfg(unix)]
 #[test]
 fn a_defect_fix_removed_flake_head_is_never_requeued() {
     let temp = tempfile::tempdir().expect("temp");
-    let mut ledger = StewardLedger::default();
-    ledger.flake_requeue.sightings.push(other_pr_sighting());
+    let green = green_base(&["macos"]);
+    let mut ledger = seeded();
     let reading = Reading {
         removals: vec![Removal {
             repo: "owner/repo".to_owned(),
@@ -235,74 +490,17 @@ fn a_defect_fix_removed_flake_head_is_never_requeued() {
         }],
         ..Reading::default()
     };
-    let pass = pass(&temp, &mut ledger, Some(&reading), PLAIN);
-    assert!(!pass.calls.contains("enqueuePullRequest"), "{}", pass.calls);
+    let pass = pass(
+        &temp,
+        &mut ledger,
+        &Serve::approved(),
+        Some(&reading),
+        Some(&green),
+    );
+    assert!(!pass.enqueued(), "{}", pass.calls);
     assert_eq!(
         pass.mutation.as_deref(),
         Some("defect_fix_removed:defect-fix")
     );
     assert!(ledger.flake_requeue.requeued.is_empty());
-}
-
-/// The flake class never stands in for approval: the requeue goes through
-/// the steward's live exact-head approval read, and a HOLD, or no approval
-/// at all, stops it before the flake class is consulted.
-#[cfg(unix)]
-#[test]
-fn a_flake_requeue_needs_the_live_exact_head_approval() {
-    for comments in [HOLD, ""] {
-        let temp = tempfile::tempdir().expect("temp");
-        let mut ledger = StewardLedger::default();
-        ledger.flake_requeue.sightings.push(other_pr_sighting());
-        let pass = pass(
-            &temp,
-            &mut ledger,
-            None,
-            Serve {
-                config: APPROVAL_REQUIRED,
-                comments,
-                log: true,
-            },
-        );
-        assert!(!pass.calls.contains("enqueuePullRequest"), "{}", pass.calls);
-        assert_eq!(
-            pass.mutation.as_deref(),
-            Some("waiting_head_approval"),
-            "{:?}\n{}",
-            pass.error,
-            pass.calls
-        );
-        assert!(ledger.flake_requeue.requeued.is_empty());
-        assert!(ledger.flake_requeue.pass.is_empty());
-    }
-}
-
-/// A read the signature needs that fails never requeues: no signature, the
-/// classifier's refusal stands.
-#[cfg(unix)]
-#[test]
-fn an_unreadable_job_log_never_requeues() {
-    let temp = tempfile::tempdir().expect("temp");
-    let mut ledger = StewardLedger::default();
-    ledger.flake_requeue.sightings.push(other_pr_sighting());
-    let pass = pass(
-        &temp,
-        &mut ledger,
-        None,
-        Serve {
-            log: false,
-            ..PLAIN
-        },
-    );
-    assert!(!pass.calls.contains("enqueuePullRequest"), "{}", pass.calls);
-    assert_eq!(
-        pass.mutation.as_deref(),
-        Some("skipped_ejected_same_head:failed_checks:needs_new_head"),
-        "{:?}\n{}",
-        pass.error,
-        pass.calls
-    );
-    assert!(ledger.flake_requeue.requeued.is_empty());
-    // Only the seeded sighting: the unread ejection recorded nothing.
-    assert_eq!(ledger.flake_requeue.sightings.len(), 1);
 }

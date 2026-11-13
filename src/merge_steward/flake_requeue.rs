@@ -17,6 +17,7 @@
 //! [auto_merge]
 //! flake_requeue = "shadow"     # off | shadow | apply
 //! flake_window_hours = 24      # 1..=168
+//! flake_max_requeues = 3       # 1..=50 flake re-enqueues per signature per window
 //! ```
 //!
 //! Without `flake_requeue`, a merge-queue base runs `shadow` (report
@@ -36,6 +37,10 @@ pub const WINDOW_KEY: &str = "flake_window_hours";
 pub const DEFAULT_WINDOW_HOURS: u32 = 24;
 /// The longest window a config may set.
 pub const MAX_WINDOW_HOURS: u32 = 168;
+/// `[auto_merge]` key selecting [`FlakePolicy::max_requeues`].
+pub const MAX_REQUEUES_KEY: &str = "flake_max_requeues";
+/// The default cap on flake re-enqueues per signature per window.
+pub const DEFAULT_MAX_REQUEUES: u32 = 3;
 
 /// Whether the flake class re-enqueues and files issues.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
@@ -83,6 +88,9 @@ pub struct FlakePolicy {
     /// Two ejections of the same signature count together only when they
     /// happened within this many hours of each other.
     pub window_hours: u32,
+    /// The most flake re-enqueues one signature may spend within the
+    /// window, across all pull requests.
+    pub max_requeues: u32,
 }
 
 impl Default for FlakePolicy {
@@ -90,6 +98,7 @@ impl Default for FlakePolicy {
         Self {
             mode: FlakeMode::Off,
             window_hours: DEFAULT_WINDOW_HOURS,
+            max_requeues: DEFAULT_MAX_REQUEUES,
         }
     }
 }
@@ -137,6 +146,14 @@ impl FlakePolicy {
         {
             policy.window_hours = hours;
         }
+        if let Some(cap) = section
+            .and_then(|section| section.get(MAX_REQUEUES_KEY))
+            .and_then(toml::Value::as_integer)
+            .and_then(|cap| u32::try_from(cap).ok())
+            .filter(|cap| (1..=50).contains(cap))
+        {
+            policy.max_requeues = cap;
+        }
         policy
     }
 }
@@ -176,12 +193,14 @@ mod tests {
         let policy = FlakePolicy::from_table(
             &table(
                 "[auto_merge]\nflake_requeue = \"shadow\"\nflake_window_hours = 6\n\
+                 flake_max_requeues = 5\n\
                  [auto_merge.dwell]\nact = \"apply\"\n",
             ),
             true,
         );
         assert_eq!(policy.mode, FlakeMode::Shadow);
         assert_eq!(policy.window_hours, 6);
+        assert_eq!(policy.max_requeues, 5);
         let off = FlakePolicy::from_table(&table("[auto_merge]\nflake_requeue = \"off\"\n"), true);
         assert_eq!(off.mode, FlakeMode::Off);
         // Out of range or unknown values keep the defaults.

@@ -37,17 +37,32 @@
 //!   checks live before it reaches this point;
 //! * no `defect-fix` removal names the head (the defect-fix block runs first
 //!   and is checked again here);
-//! * no signature check is a context the base itself is confirmed red on
-//!   (that is `base_poison`'s case, not a flake);
-//! * no earlier flake re-enqueue of this exact head is on record. The receipt
-//!   is saved before the enqueue, so a crash cannot buy a second one.
+//! * this pass read the base **green** for every signature check
+//!   ([`base_read`]): a merge-group reading with no gaps in which the check
+//!   last passed, or a base-tip reading that is green. A red base is
+//!   `base_poison`'s case (`base_red`); an unread, partial or unavailable
+//!   reading refuses too (`base_unknown`);
+//! * the signature has not tripped its breaker: a head the flake class
+//!   re-enqueued that the queue ejected **again** with the same signature
+//!   says the failure is not a flake (a break the base has not shown red
+//!   yet, such as a runner image, a certificate or a date), so the signature
+//!   is `signature_tripped` and re-enqueues nothing more;
+//! * the signature has spent fewer than `flake_max_requeues` re-enqueues
+//!   within the window (`signature_capped`);
+//! * no earlier flake re-enqueue of this exact head is on record.
+//!
+//! The receipt is saved `pending` before the enqueue and marked `done` once
+//! GitHub accepts it, so a crash cannot buy a second re-enqueue. A head the
+//! enqueue path then deferred (a generated-path batch, a refusal from
+//! GitHub) keeps a `pending` receipt; after one steward tick
+//! ([`PENDING_RETRY_MINUTES`]) it may be retried once, and never again.
 //!
 //! The flake class never approves anything. It runs only after the
 //! steward's own live exact-head approval read has admitted the head, and
 //! its ledger (sightings and receipts) can only refuse a re-enqueue, never
 //! stand in for approval. Any read it depends on that fails (the merge
-//! group's checks or a job log, the removal time, the receipt save) leaves
-//! the ordinary refusal in place.
+//! group's checks or a job log, the removal time, the base health, the
+//! receipt save) leaves the ordinary refusal in place.
 //!
 //! The re-enqueue is separate from the classifier's one free retry: a head
 //! the classifier refused still gets it. It does not lift the head-approval
@@ -57,12 +72,14 @@
 //! ## The root cause
 //!
 //! Each flake signature is reported in the tick as a `flake_root_cause`
-//! record (signature, checks, tests, pull requests, ejection window, issue).
-//! Under `apply` the steward also files one issue per signature, found again
-//! by a marker in its body: a new pull request joining the signature adds a
-//! comment to the same issue instead of a second issue. A failed or refused
-//! write is reported and retried after [`ISSUE_RETRY_HOURS`], never routed
-//! around.
+//! record (signature, checks, tests, pull requests, ejection window,
+//! breaker state, issue). Under `apply` the steward also files one issue per
+//! signature, found again by a marker on its last line: a new pull request
+//! joining the signature, or the breaker tripping, adds a comment to the
+//! same issue instead of a second issue, and a closed issue is recorded and
+//! left alone. Test names are sanitised before they reach an issue. A failed
+//! or refused write is reported and retried after [`ISSUE_RETRY_HOURS`],
+//! never routed around.
 //!
 //! Mode: `[auto_merge] flake_requeue` ([`crate::merge_steward::flake_requeue`]).
 
@@ -75,17 +92,32 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::StewardLedger;
+use super::base_poison::RepoPoison;
+use crate::base_health::merge_group::MergeGroupHealth;
 use crate::environment_requeue::{EnvironmentRequeue, FailureAttribution};
 use crate::merge_steward::flake_requeue::{FlakeMode, FlakePolicy};
 
 /// How long a sighting is kept after the steward last saw its head ejected.
 pub(super) const RETENTION_DAYS: i64 = 7;
-/// How long a re-enqueue receipt is kept: longer than any head waits.
+/// How long a re-enqueue receipt, a breaker trip and an issue record are
+/// kept: longer than any head waits.
 pub(super) const RECEIPT_DAYS: i64 = 30;
 /// How long after a failed issue write the next attempt waits.
 pub(super) const ISSUE_RETRY_HOURS: i64 = 6;
-/// The marker that finds a flake issue again.
+/// One steward tick: a `pending` receipt older than this whose head was not
+/// enqueued may be retried once.
+pub(super) const PENDING_RETRY_MINUTES: i64 = 5;
+/// Attempts one head's flake re-enqueue may take: the first, and the one
+/// retry of a `pending` receipt.
+pub(super) const MAX_ATTEMPTS: u32 = 2;
+/// The marker that finds a flake issue again: the last line of its body.
 pub(super) const ISSUE_MARKER: &str = "<!-- shipyard-flake-signature: ";
+/// Longest test or check name an issue shows.
+const NAME_CHARS: usize = 120;
+/// Most test names an issue shows per signature.
+const NAMES_SHOWN: usize = 10;
+/// Most ejections an issue body or comment lists.
+const LINES_SHOWN: usize = 30;
 
 /// What the steward ledger keeps between passes.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -96,6 +128,9 @@ pub(super) struct State {
     /// Flake re-enqueues taken, keyed `repo#pr@head`: one per head, ever.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(super) requeued: BTreeMap<String, Receipt>,
+    /// Signatures whose breaker tripped, keyed [`issue_key`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(super) tripped: BTreeMap<String, Trip>,
     /// The root-cause issue per signature, keyed [`issue_key`].
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(super) issues: BTreeMap<String, IssueRecord>,
@@ -107,7 +142,10 @@ pub(super) struct State {
 impl State {
     /// Whether there is nothing to persist.
     pub(super) fn is_empty(&self) -> bool {
-        self.sightings.is_empty() && self.requeued.is_empty() && self.issues.is_empty()
+        self.sightings.is_empty()
+            && self.requeued.is_empty()
+            && self.tripped.is_empty()
+            && self.issues.is_empty()
     }
 }
 
@@ -136,14 +174,60 @@ pub(super) struct Signature {
     pub(super) tests: Vec<String>,
 }
 
-/// One flake re-enqueue.
+/// Where one head's flake re-enqueue stands.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ReceiptState {
+    /// Recorded before the enqueue; GitHub has not accepted it yet.
+    Pending,
+    /// GitHub accepted the enqueue, or the queue has since ejected the head
+    /// again (so it was enqueued). An unknown value reads as spent.
+    #[default]
+    Done,
+}
+
+/// One head's flake re-enqueue.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub(super) struct Receipt {
+    /// Lowercase repository.
+    #[serde(default)]
+    pub(super) repo: String,
     pub(super) signature: String,
     /// The ejection it answered (RFC 3339).
     pub(super) ejection_at: String,
-    /// When it was taken (RFC 3339).
+    /// When it was last attempted (RFC 3339).
     pub(super) at: String,
+    #[serde(default)]
+    pub(super) state: ReceiptState,
+    /// Attempts taken, at most [`MAX_ATTEMPTS`].
+    #[serde(default = "one")]
+    pub(super) attempts: u32,
+}
+
+const fn one() -> u32 {
+    1
+}
+
+/// A signature's tripped breaker: the head that was ejected again.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub(super) struct Trip {
+    pub(super) signature: String,
+    pub(super) pr: u64,
+    pub(super) head: String,
+    /// The second ejection (RFC 3339).
+    pub(super) at: String,
+}
+
+impl Trip {
+    fn describe(&self) -> String {
+        format!(
+            "#{} at head {} was ejected again with the same signature at {} after its flake \
+             re-enqueue",
+            self.pr,
+            short(&self.head),
+            self.at
+        )
+    }
 }
 
 /// The root-cause issue of one signature.
@@ -154,6 +238,12 @@ pub(super) struct IssueRecord {
     /// The pull requests the issue names.
     #[serde(default)]
     pub(super) prs: Vec<u64>,
+    /// The issue says the breaker tripped.
+    #[serde(default)]
+    pub(super) tripped: bool,
+    /// The issue was found closed: it is left alone.
+    #[serde(default)]
+    pub(super) closed: bool,
     /// When it was last written or attempted (RFC 3339).
     pub(super) at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -169,8 +259,9 @@ pub(super) struct Decision {
     pub(super) head: String,
     /// `flake:<signature>`.
     pub(super) class: String,
-    /// `requeued`, `would_requeue`, `already_requeued`, `defect_fix_removed`,
-    /// `base_red` or `unrecorded`.
+    /// `requeued`, `requeue_retried`, `would_requeue`, `requeue_pending`,
+    /// `already_requeued`, `defect_fix_removed`, `base_red`, `base_unknown`,
+    /// `signature_tripped`, `signature_capped` or `unrecorded`.
     pub(super) outcome: &'static str,
     /// The other pull requests the same signature ejected.
     pub(super) with: Vec<u64>,
@@ -185,11 +276,17 @@ pub(super) struct RootCause {
     pub(super) prs: Vec<u64>,
     pub(super) first_ejection: String,
     pub(super) last_ejection: String,
+    /// `active`, or `signature_tripped` once the breaker tripped.
+    pub(super) state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) tripped_by: Option<String>,
+    /// Flake re-enqueues this signature spent within the window.
+    pub(super) requeues: usize,
     /// The issue, when one is filed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) issue: Option<u64>,
-    /// `opened`, `found`, `updated`, `recorded`, `would_file`, `retry_later`
-    /// or `failed`.
+    /// `opened`, `found`, `updated`, `recorded`, `closed`, `would_file`,
+    /// `retry_later` or `failed`.
     pub(super) issue_action: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) issue_error: Option<String>,
@@ -200,6 +297,7 @@ pub(super) struct RootCause {
 pub(crate) struct RepoStatus {
     pub(super) mode: String,
     pub(super) window_hours: u32,
+    pub(super) max_requeues: u32,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(super) decisions: Vec<Decision>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -259,10 +357,65 @@ pub(super) fn signature(verdict: &EnvironmentRequeue) -> Option<Signature> {
     })
 }
 
+/// What this pass knows about the base for a signature's checks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum BaseRead {
+    /// Read green for every check: the merge groups were read with no gaps
+    /// and each check last passed there, or the base tip was read green.
+    Green,
+    /// The base is confirmed red on this check.
+    Red(String),
+    /// Not known: why.
+    Unknown(String),
+}
+
+/// The base reading for `checks`. Only a positive green reading is
+/// [`BaseRead::Green`]: base poison off, an unread or partial reading, or a
+/// check with no recorded pass is [`BaseRead::Unknown`].
+pub(super) fn base_read(poison: Option<&RepoPoison>, checks: &[String]) -> BaseRead {
+    let Some(poison) = poison else {
+        return BaseRead::Unknown(
+            "the base's merge-group health was not read this pass (base poison off or \
+             unavailable)"
+                .to_owned(),
+        );
+    };
+    let confirmed = poison.confirmed_contexts();
+    if let Some(check) = checks.iter().find(|check| confirmed.contains(check)) {
+        return BaseRead::Red(check.clone());
+    }
+    if let Some(gap) = poison.partial() {
+        return BaseRead::Unknown(format!("the base reading is partial: {gap}"));
+    }
+    let passed: &[String] = match &poison.health {
+        MergeGroupHealth::Unknown { detail } => {
+            return BaseRead::Unknown(format!("the merge groups were not read: {detail}"));
+        }
+        MergeGroupHealth::Clear { passed, .. } => passed,
+        MergeGroupHealth::Poisoned { .. } => &[],
+    };
+    for check in checks {
+        let tip_green = poison
+            .tip
+            .get(check)
+            .is_some_and(|tip| !tip.red && tip.error.is_none());
+        if !tip_green && !passed.contains(check) {
+            return BaseRead::Unknown(format!(
+                "no merge group or base-tip reading shows `{check}` green"
+            ));
+        }
+    }
+    BaseRead::Green
+}
+
 fn time(text: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(text)
         .ok()
         .map(|at| at.with_timezone(&Utc))
+}
+
+fn short(sha: &str) -> &str {
+    sha.get(..12).unwrap_or(sha)
 }
 
 pub(super) fn receipt_key(repo: &str, pr: u64, head: &str) -> String {
@@ -273,8 +426,8 @@ pub(super) fn receipt_key(repo: &str, pr: u64, head: &str) -> String {
     )
 }
 
-/// The issue key of one signature: the repository and a digest of the
-/// signature, so the marker never carries a test name.
+/// The key of one signature (issue and breaker): the repository and a
+/// digest of the signature, so the marker never carries a test name.
 pub(super) fn issue_key(repo: &str, signature: &str) -> String {
     let digest = Sha256::digest(signature.as_bytes());
     let hex = digest.iter().take(8).fold(String::new(), |mut hex, byte| {
@@ -307,6 +460,29 @@ pub(super) fn corroborating(state: &State, this: &Sighting, window: Duration) ->
         .collect()
 }
 
+/// Flake re-enqueues `signature` spent in `repo` within `window` of `now`,
+/// leaving out the receipt keyed `except`.
+fn requeues_in_window(
+    state: &State,
+    repo: &str,
+    signature: &str,
+    window: Duration,
+    now: DateTime<Utc>,
+    except: Option<&str>,
+) -> usize {
+    let prefix = format!("{}#", repo.to_ascii_lowercase());
+    state
+        .requeued
+        .iter()
+        .filter(|(key, receipt)| {
+            key.starts_with(&prefix)
+                && Some(key.as_str()) != except
+                && receipt.signature == signature
+                && time(&receipt.at).is_some_and(|at| now - at <= window)
+        })
+        .count()
+}
+
 /// One ejection the enqueue path refused, as the steward read it.
 pub(super) struct Ejection<'a> {
     pub(super) policy: &'a FlakePolicy,
@@ -319,14 +495,14 @@ pub(super) struct Ejection<'a> {
     pub(super) verdict: &'a EnvironmentRequeue,
     /// A `defect-fix` removal names this head.
     pub(super) defect_fix_removed: bool,
-    /// Contexts the base is confirmed red on.
-    pub(super) base_red: &'a [String],
+    /// This pass's base-poison reading, when one was made.
+    pub(super) poison: Option<&'a RepoPoison>,
 }
 
 /// What the enqueue path should do with a flake-classified ejection.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Verdict {
-    /// Re-enqueue the head now; the receipt is saved.
+    /// Re-enqueue the head now; the `pending` receipt is saved.
     Requeue(String),
     /// Keep the refusal, with this added to the retry detail.
     Keep(String),
@@ -336,9 +512,9 @@ pub(super) enum Verdict {
 /// the classifier already allows a retry, or the ejection has no signature
 /// or no corroborating pull request (a single ejection is never a flake).
 ///
-/// Under `apply`, an eligible head's receipt is recorded and the ledger
-/// saved to `ledger_path` before this returns [`Verdict::Requeue`]; a save
-/// that fails keeps the refusal.
+/// Under `apply`, an eligible head's `pending` receipt is recorded and the
+/// ledger saved to `ledger_path` before this returns [`Verdict::Requeue`];
+/// a save that fails keeps the refusal.
 pub(super) fn consider(
     ejection: &Ejection<'_>,
     ledger: &mut StewardLedger,
@@ -349,21 +525,26 @@ pub(super) fn consider(
         return None;
     }
     let this = record(ejection, &mut ledger.flake_requeue, now)?;
+    let key = receipt_key(ejection.repo, ejection.pr, ejection.head);
+    trip_on_second_ejection(&mut ledger.flake_requeue, &this, &key);
     let window = Duration::hours(i64::from(ejection.policy.window_hours));
     let with = corroborating(&ledger.flake_requeue, &this, window);
     if with.is_empty() {
         return None;
     }
     let class = format!("flake:{}", this.signature.text);
-    let key = receipt_key(ejection.repo, ejection.pr, ejection.head);
-    let (mut outcome, detail) = decide(ejection, &ledger.flake_requeue, &this, &with, &key);
-    let verdict = if outcome == "requeued" {
+    let (mut outcome, detail) = decide(ejection, &ledger.flake_requeue, &this, &with, &key, now);
+    let verdict = if matches!(outcome, "requeued" | "requeue_retried") {
+        let previous = ledger.flake_requeue.requeued.get(&key).cloned();
         ledger.flake_requeue.requeued.insert(
             key.clone(),
             Receipt {
+                repo: ejection.repo.to_ascii_lowercase(),
                 signature: this.signature.text.clone(),
                 ejection_at: this.at.clone(),
                 at: now.to_rfc3339(),
+                state: ReceiptState::Pending,
+                attempts: previous.as_ref().map_or(1, |receipt| receipt.attempts + 1),
             },
         );
         let saved = ledger_path.map_or(Ok(()), |path| {
@@ -372,7 +553,14 @@ pub(super) fn consider(
         match saved {
             Ok(()) => Verdict::Requeue(detail),
             Err(error) => {
-                ledger.flake_requeue.requeued.remove(&key);
+                match previous {
+                    Some(previous) => {
+                        ledger.flake_requeue.requeued.insert(key.clone(), previous);
+                    }
+                    None => {
+                        ledger.flake_requeue.requeued.remove(&key);
+                    }
+                }
                 outcome = "unrecorded";
                 Verdict::Keep(format!(
                     "{class}: the re-enqueue receipt could not be saved ({error}), so the head \
@@ -422,65 +610,201 @@ fn record(ejection: &Ejection<'_>, state: &mut State, now: DateTime<Utc>) -> Opt
     Some(this)
 }
 
+/// The breaker: a head this class re-enqueued that the queue removed again,
+/// after the re-enqueue, with the same signature. The re-enqueue reached the
+/// queue (so the receipt is `done`), and the signature trips.
+fn trip_on_second_ejection(state: &mut State, this: &Sighting, key: &str) {
+    let Some(receipt) = state.requeued.get_mut(key) else {
+        return;
+    };
+    let after = time(&this.at)
+        .zip(time(&receipt.at))
+        .is_some_and(|(ejected, requeued)| ejected > requeued);
+    if !after {
+        return;
+    }
+    receipt.state = ReceiptState::Done;
+    if receipt.signature != this.signature.text {
+        return;
+    }
+    state
+        .tripped
+        .entry(issue_key(&this.repo, &this.signature.text))
+        .or_insert_with(|| Trip {
+            signature: this.signature.text.clone(),
+            pr: this.pr,
+            head: this.head.clone(),
+            at: this.at.clone(),
+        });
+}
+
 /// What to do with a corroborated flake ejection: `(outcome, detail)`.
-/// `requeued` is the only outcome that re-enqueues.
+/// `requeued` and `requeue_retried` are the only outcomes that re-enqueue.
 fn decide(
     ejection: &Ejection<'_>,
     state: &State,
     this: &Sighting,
     with: &[u64],
     key: &str,
+    now: DateTime<Utc>,
 ) -> (&'static str, String) {
     let class = format!("flake:{}", this.signature.text);
+    let keep = |outcome: &'static str, why: String| (outcome, format!("{class}: {why}"));
+    if ejection.defect_fix_removed {
+        return keep(
+            "defect_fix_removed",
+            "a defect-fix removal names this head, so it is not re-enqueued".to_owned(),
+        );
+    }
+    match base_read(ejection.poison, &this.signature.checks) {
+        BaseRead::Green => {}
+        BaseRead::Red(context) => {
+            return keep(
+                "base_red",
+                format!(
+                    "the base is confirmed red on `{context}`, which is the base's failure, not \
+                     a flake; not re-enqueued"
+                ),
+            );
+        }
+        BaseRead::Unknown(why) => {
+            return keep(
+                "base_unknown",
+                format!("{why}; a flake re-enqueue needs the base read green, so it waits"),
+            );
+        }
+    }
+    if let Some(trip) = state
+        .tripped
+        .get(&issue_key(ejection.repo, &this.signature.text))
+    {
+        return keep(
+            "signature_tripped",
+            format!(
+                "the breaker tripped ({}); this signature is not a flake and re-enqueues \
+                 nothing more",
+                trip.describe()
+            ),
+        );
+    }
+    let retry = match receipt_gate(state, key, now) {
+        Ok(retry) => retry,
+        Err((outcome, why)) => return keep(outcome, why),
+    };
+    let window = Duration::hours(i64::from(ejection.policy.window_hours));
+    let spent = requeues_in_window(
+        state,
+        ejection.repo,
+        &this.signature.text,
+        window,
+        now,
+        Some(key),
+    );
+    if spent >= ejection.policy.max_requeues as usize {
+        return keep(
+            "signature_capped",
+            format!(
+                "this signature spent {spent} flake re-enqueues within {}h (cap {}); not \
+                 re-enqueued",
+                ejection.policy.window_hours, ejection.policy.max_requeues
+            ),
+        );
+    }
     let others = with
         .iter()
         .map(|pr| format!("#{pr}"))
         .collect::<Vec<_>>()
         .join(", ");
-    if ejection.defect_fix_removed {
-        return (
-            "defect_fix_removed",
-            format!("{class}: a defect-fix removal names this head, so it is not re-enqueued"),
-        );
-    }
-    if let Some(context) = ejection
-        .base_red
-        .iter()
-        .find(|context| this.signature.checks.contains(context))
-    {
-        return (
-            "base_red",
-            format!(
-                "{class}: the base is confirmed red on `{context}`, which is the base's \
-                 failure, not a flake; not re-enqueued"
-            ),
-        );
-    }
-    if let Some(receipt) = state.requeued.get(key) {
-        return (
-            "already_requeued",
-            format!(
-                "{class}: this head's one flake re-enqueue was spent at {}",
-                receipt.at
-            ),
-        );
-    }
     if ejection.policy.mode == FlakeMode::Shadow {
-        return (
+        return keep(
             "would_requeue",
             format!(
-                "{class}: the same test ejected {others} too; would re-enqueue this head once \
+                "the same test ejected {others} too; would re-enqueue this head once \
                  (flake_requeue = \"shadow\")"
             ),
         );
     }
-    (
+    if retry {
+        return keep(
+            "requeue_retried",
+            "the earlier flake re-enqueue never reached the queue; retried once".to_owned(),
+        );
+    }
+    keep(
         "requeued",
         format!(
-            "{class}: the same test ejected {others} too, so this unchanged, approved, green \
-             head is re-enqueued once"
+            "the same test ejected {others} too, so this unchanged, approved, green head is \
+             re-enqueued once"
         ),
     )
+}
+
+/// This head's receipt: `Ok(false)` when there is none, `Ok(true)` when a
+/// `pending` one older than a tick may take its one retry, else the refusal.
+fn receipt_gate(
+    state: &State,
+    key: &str,
+    now: DateTime<Utc>,
+) -> Result<bool, (&'static str, String)> {
+    let Some(receipt) = state.requeued.get(key) else {
+        return Ok(false);
+    };
+    let age = time(&receipt.at).map(|at| now - at);
+    match receipt.state {
+        ReceiptState::Pending
+            if age.is_some_and(|age| age < Duration::minutes(PENDING_RETRY_MINUTES)) =>
+        {
+            Err((
+                "requeue_pending",
+                format!(
+                    "this head's flake re-enqueue from {} is still pending",
+                    receipt.at
+                ),
+            ))
+        }
+        ReceiptState::Pending if receipt.attempts < MAX_ATTEMPTS && age.is_some() => Ok(true),
+        _ => Err((
+            "already_requeued",
+            format!(
+                "this head's one flake re-enqueue was spent at {}",
+                receipt.at
+            ),
+        )),
+    }
+}
+
+/// After the enqueue path ran: a `pending` receipt for this exact head whose
+/// enqueue GitHub accepted (`mutation` has an `enqueued` part) is `done`,
+/// and saved. Anything else leaves it `pending`.
+pub(super) fn settle(
+    ledger: &mut StewardLedger,
+    ledger_path: Option<&Path>,
+    repo: &str,
+    pr: u64,
+    head: &str,
+    mutation: Option<&str>,
+) {
+    let enqueued = mutation
+        .is_some_and(|mutation| mutation.split(',').any(|part| part.starts_with("enqueued")));
+    if !enqueued {
+        return;
+    }
+    let Some(receipt) = ledger
+        .flake_requeue
+        .requeued
+        .get_mut(&receipt_key(repo, pr, head))
+        .filter(|receipt| receipt.state == ReceiptState::Pending)
+    else {
+        return;
+    };
+    receipt.state = ReceiptState::Done;
+    // Best effort: the pass saves the ledger at its end too, and a receipt
+    // left `pending` by a crash here is still spent once the queue ejects
+    // the head again (`trip_on_second_ejection`), and cannot be retried
+    // while the head sits in the queue.
+    if let Some(path) = ledger_path {
+        let _ = super::ledger::save_ledger(path, ledger);
+    }
 }
 
 fn prune(state: &mut State, now: DateTime<Utc>) {
@@ -488,13 +812,16 @@ fn prune(state: &mut State, now: DateTime<Utc>) {
     state
         .sightings
         .retain(|sighting| sighting.seen_epoch >= seen_floor);
-    let receipt_floor = now - Duration::days(RECEIPT_DAYS);
+    let floor = now - Duration::days(RECEIPT_DAYS);
     state
         .requeued
-        .retain(|_, receipt| time(&receipt.at).is_some_and(|at| at >= receipt_floor));
+        .retain(|_, receipt| time(&receipt.at).is_some_and(|at| at >= floor));
+    state
+        .tripped
+        .retain(|_, trip| time(&trip.at).is_some_and(|at| at >= floor));
     state
         .issues
-        .retain(|_, issue| time(&issue.at).is_some_and(|at| at >= receipt_floor));
+        .retain(|_, issue| time(&issue.at).is_some_and(|at| at >= floor));
 }
 
 /// One flake signature in this repository: its sightings, every one
@@ -502,6 +829,7 @@ fn prune(state: &mut State, now: DateTime<Utc>) {
 struct Class {
     signature: Signature,
     sightings: Vec<Sighting>,
+    trip: Option<Trip>,
 }
 
 fn classes(state: &State, repo: &str, window: Duration) -> Vec<Class> {
@@ -517,6 +845,10 @@ fn classes(state: &State, repo: &str, window: Duration) -> Vec<Class> {
             .or_insert_with(|| Class {
                 signature: sighting.signature.clone(),
                 sightings: Vec::new(),
+                trip: state
+                    .tripped
+                    .get(&issue_key(repo, &sighting.signature.text))
+                    .cloned(),
             })
             .sightings
             .push(sighting.clone());
@@ -547,6 +879,7 @@ pub(super) fn finish(
     let mut status = RepoStatus {
         mode: policy.mode.label().to_owned(),
         window_hours: policy.window_hours,
+        max_requeues: policy.max_requeues,
         decisions,
         flake_root_cause: Vec::new(),
     };
@@ -577,6 +910,13 @@ pub(super) fn finish(
             prs: prs.clone(),
             first_ejection: times.first().cloned().unwrap_or_default(),
             last_ejection: times.last().cloned().unwrap_or_default(),
+            state: if class.trip.is_some() {
+                "signature_tripped"
+            } else {
+                "active"
+            },
+            tripped_by: class.trip.as_ref().map(Trip::describe),
+            requeues: requeues_in_window(state, repo, &class.signature.text, window, now, None),
             issue: None,
             issue_action: "would_file",
             issue_error: None,
@@ -599,7 +939,8 @@ pub(super) fn finish(
     status
 }
 
-/// Open issues carrying [`ISSUE_MARKER`], listed at most once per pass.
+/// Open issues carrying [`ISSUE_MARKER`] on their last line, listed at most
+/// once per pass.
 type OpenIssues = Option<Result<Vec<crate::marked_issue::MarkedIssue>, String>>;
 
 /// File, find or update the root-cause issue of one signature, recording
@@ -618,43 +959,63 @@ fn ensure_issue(
 ) {
     let key = issue_key(repo, &class.signature.text);
     let recorded = issues.get(&key).cloned();
-    if let Some(record) = &recorded
-        && record.number == 0
-        && time(&record.at).is_some_and(|at| now - at < Duration::hours(ISSUE_RETRY_HOURS))
-    {
-        cause.issue_action = "retry_later";
-        cause.issue_error.clone_from(&record.error);
-        return;
+    if let Some(record) = &recorded {
+        if record.closed {
+            cause.issue = Some(record.number);
+            cause.issue_action = "closed";
+            return;
+        }
+        if record.number == 0
+            && time(&record.at).is_some_and(|at| now - at < Duration::hours(ISSUE_RETRY_HOURS))
+        {
+            cause.issue_action = "retry_later";
+            cause.issue_error.clone_from(&record.error);
+            return;
+        }
     }
     let filed = recorded.as_ref().filter(|record| record.number > 0);
     let result = write_issue(run_gh, open_issues, repo, base, class, prs, filed, &key);
-    let (number, action, error) = match result {
-        Ok((number, action)) => (number, action, None),
-        Err(error) => (0, "failed", Some(error)),
-    };
-    issues.insert(
-        key,
-        IssueRecord {
-            number,
-            // A failed write keeps the pull requests the issue already names.
-            prs: if number > 0 {
-                prs.to_vec()
-            } else {
-                recorded.map(|record| record.prs).unwrap_or_default()
+    let (record, action, error) = match result {
+        Ok((number, action)) => (
+            IssueRecord {
+                number,
+                prs: prs.to_vec(),
+                tripped: class.trip.is_some(),
+                closed: action == "closed",
+                at: now.to_rfc3339(),
+                error: None,
             },
-            at: now.to_rfc3339(),
-            error: error.clone(),
-        },
-    );
-    cause.issue = (number > 0).then_some(number);
+            action,
+            None,
+        ),
+        // A failed write keeps what the issue already says.
+        Err(error) => (
+            IssueRecord {
+                number: 0,
+                prs: recorded
+                    .as_ref()
+                    .map(|record| record.prs.clone())
+                    .unwrap_or_default(),
+                tripped: recorded.as_ref().is_some_and(|record| record.tripped),
+                closed: false,
+                at: now.to_rfc3339(),
+                error: Some(error.clone()),
+            },
+            "failed",
+            Some(error),
+        ),
+    };
+    cause.issue = (record.number > 0).then_some(record.number);
     cause.issue_action = action;
     cause.issue_error = error;
+    issues.insert(key, record);
 }
 
 /// The issue write itself: the recorded issue, else one an open issue's
-/// marker names, else a new one. A recorded issue gains one comment naming
-/// the pull requests it did not name yet. Returns the number and what was
-/// done.
+/// marker names, else a new one. A recorded issue that is still open gains
+/// one comment naming what it does not say yet (new pull requests, a tripped
+/// breaker); a closed one is recorded and left alone. Returns the number
+/// and what was done.
 #[allow(clippy::too_many_arguments)]
 fn write_issue(
     run_gh: RunGh<'_>,
@@ -673,8 +1034,25 @@ fn write_issue(
             .iter()
             .filter(|sighting| !known.contains(&sighting.pr))
             .collect::<Vec<_>>();
-        if new.is_empty() {
+        let trip = class.trip.as_ref().filter(|_| !record.tripped);
+        if new.is_empty() && trip.is_none() {
             return Ok((record.number, "recorded"));
+        }
+        let raw = run_gh(&[
+            "api".to_owned(),
+            format!("repos/{repo}/issues/{}", record.number),
+        ])?;
+        let state = serde_json::from_str::<Value>(&raw)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("state")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .ok_or_else(|| format!("issue #{} state unreadable", record.number))?;
+        if state != "open" {
+            return Ok((record.number, "closed"));
         }
         return run_gh(&[
             "api".to_owned(),
@@ -682,14 +1060,18 @@ fn write_issue(
             "POST".to_owned(),
             format!("repos/{repo}/issues/{}/comments", record.number),
             "-f".to_owned(),
-            format!("body={}", update_body(&class.signature, &new, prs)),
+            format!("body={}", update_body(&class.signature, &new, prs, trip)),
         ])
         .map(|_| (record.number, "updated"));
     }
     let listed = open_issues
         .get_or_insert_with(|| {
-            run_gh(&crate::marked_issue::list_open_args(repo))
-                .map(|raw| crate::marked_issue::parse(&raw, ISSUE_MARKER))
+            run_gh(&crate::marked_issue::list_open_args(repo)).map(|raw| {
+                crate::marked_issue::parse(&raw, ISSUE_MARKER)
+                    .into_iter()
+                    .filter(|issue| marker_on_last_line(&issue.body) == Some(issue.key.as_str()))
+                    .collect()
+            })
         })
         .as_ref()
         .map_err(|error| format!("open issues could not be listed: {error}"))?;
@@ -715,59 +1097,165 @@ fn write_issue(
         .ok_or_else(|| "the new issue's number was not returned".to_owned())
 }
 
-fn issue_title(signature: &Signature) -> String {
-    let mut title = format!(
-        "Flaky merge-group test ejects approved PRs: {}",
-        signature.text
-    );
-    if title.chars().count() > 200 {
-        title = title.chars().take(197).collect::<String>() + "...";
+/// The key of a body whose marker is its last line and appears once. A
+/// marker anywhere else (quoted, or carried in by text) is not one.
+pub(super) fn marker_on_last_line(body: &str) -> Option<&str> {
+    if body.matches(ISSUE_MARKER).count() != 1 {
+        return None;
     }
-    title
+    let key = body
+        .trim_end()
+        .lines()
+        .last()?
+        .trim()
+        .strip_prefix(ISSUE_MARKER)?
+        .strip_suffix("-->")?
+        .trim();
+    let (repo, digest) = key.split_once('|')?;
+    (!repo.is_empty()
+        && !repo.contains(char::is_whitespace)
+        && digest.len() == 16
+        && digest.chars().all(|c| c.is_ascii_hexdigit()))
+    .then_some(key)
 }
 
-fn sighting_line(sighting: &Sighting) -> String {
+/// A name as an issue may show it: no mention, markup, comment or code
+/// delimiters, no control characters, at most [`NAME_CHARS`] characters.
+pub(super) fn clean(name: &str) -> String {
+    let mut text = name.replace("<!--", "").replace("-->", "");
+    text.retain(|c| !matches!(c, '@' | '`' | '<' | '>' | '[' | ']') && !c.is_control());
+    let text = text.trim();
+    if text.chars().count() > NAME_CHARS {
+        text.chars().take(NAME_CHARS - 3).collect::<String>() + "..."
+    } else {
+        text.to_owned()
+    }
+}
+
+/// A signature as an issue shows it: cleaned names, at most
+/// [`NAMES_SHOWN`] tests.
+fn shown(signature: &Signature) -> String {
+    let tests = signature
+        .tests
+        .iter()
+        .take(NAMES_SHOWN)
+        .map(|test| clean(test))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = signature.tests.len().saturating_sub(NAMES_SHOWN);
     format!(
-        "- #{} at head `{}`, merge group `{}`, ejected {}",
-        sighting.pr,
-        sighting.head.get(..12).unwrap_or(&sighting.head),
-        sighting
-            .merge_group
-            .get(..12)
-            .unwrap_or(&sighting.merge_group),
-        sighting.at
+        "{}: {tests}{}",
+        signature
+            .checks
+            .iter()
+            .map(|check| clean(check))
+            .collect::<Vec<_>>()
+            .join(" + "),
+        if more > 0 {
+            format!(" and {more} more")
+        } else {
+            String::new()
+        }
     )
+}
+
+fn issue_title(signature: &Signature) -> String {
+    let title = format!(
+        "Flaky merge-group test ejects approved PRs: {}",
+        shown(signature)
+    );
+    if title.chars().count() > 200 {
+        title.chars().take(197).collect::<String>() + "..."
+    } else {
+        title
+    }
+}
+
+fn sighting_lines(sightings: &[&Sighting]) -> String {
+    let mut lines = sightings
+        .iter()
+        .take(LINES_SHOWN)
+        .map(|sighting| {
+            format!(
+                "- #{} at head {}, merge group {}, ejected {}",
+                sighting.pr,
+                clean(short(&sighting.head)),
+                clean(short(&sighting.merge_group)),
+                clean(&sighting.at)
+            )
+        })
+        .collect::<Vec<_>>();
+    if sightings.len() > LINES_SHOWN {
+        lines.push(format!("- and {} more", sightings.len() - LINES_SHOWN));
+    }
+    lines.join("\n")
 }
 
 fn issue_body(repo: &str, base: &str, class: &Class, key: &str) -> String {
-    let lines = class
-        .sightings
-        .iter()
-        .map(sighting_line)
-        .collect::<Vec<_>>()
-        .join("\n");
+    let sightings = class.sightings.iter().collect::<Vec<_>>();
+    let trip = class.trip.as_ref().map_or_else(String::new, |trip| {
+        format!(
+            "\n\n**Breaker tripped:** {}. This signature is not treated as a flake any more.",
+            trip.describe()
+        )
+    });
     format!(
-        "The merge queue on `{repo}` (`{base}`) ejected approved, green heads of different pull \
+        "The merge queue on {repo} ({base}) ejected approved, green heads of different pull \
 requests for the same failing test, from different merge groups, so the Shipyard steward \
-classifies it as a flake.\n\n**Signature:** `{signature}`\n\n{lines}\n\n\
-Each such head is re-enqueued once, unchanged (`[auto_merge] flake_requeue`). Every batch the \
+classifies it as a flake.\n\n**Signature:** {signature}\n\n{lines}{trip}\n\n\
+Each such head is re-enqueued once, unchanged ([auto_merge] flake_requeue). Every batch the \
 test fails still costs a rebuild and an ejection: fix or quarantine the test, or list it in \
-`[auto_merge] known_flaky_tests` while it is fixed. Later ejections with the same signature are \
+[auto_merge] known_flaky_tests while it is fixed. Later ejections with the same signature are \
 added here as comments.\n\n{ISSUE_MARKER}{key} -->",
-        signature = class.signature.text.replace('`', "'"),
+        repo = clean(repo),
+        base = clean(base),
+        signature = shown(&class.signature),
+        lines = sighting_lines(&sightings),
     )
 }
 
-fn update_body(signature: &Signature, new: &[&Sighting], prs: &[u64]) -> String {
-    format!(
-        "The same signature (`{}`) ejected more pull requests; {} in all.\n\n{}",
-        signature.text.replace('`', "'"),
-        prs.len(),
-        new.iter()
-            .map(|sighting| sighting_line(sighting))
-            .collect::<Vec<_>>()
-            .join("\n")
-    )
+fn update_body(
+    signature: &Signature,
+    new: &[&Sighting],
+    prs: &[u64],
+    trip: Option<&Trip>,
+) -> String {
+    let mut parts = Vec::new();
+    if !new.is_empty() {
+        parts.push(format!(
+            "The same signature ({}) ejected more pull requests; {} in all.\n\n{}",
+            shown(signature),
+            prs.len(),
+            sighting_lines(new)
+        ));
+    }
+    if let Some(trip) = trip {
+        parts.push(format!(
+            "**Breaker tripped:** {}. The steward re-enqueues nothing more for this signature.",
+            trip.describe()
+        ));
+    }
+    parts.join("\n\n")
+}
+
+/// A base reading that shows `checks` green: the merge groups were read
+/// clear and each check last passed there.
+#[cfg(test)]
+pub(super) fn green_base(checks: &[&str]) -> RepoPoison {
+    RepoPoison {
+        policy: crate::base_health::BasePoisonPolicy::for_base(true),
+        health: MergeGroupHealth::Clear {
+            detail: "newest merge group passed".to_owned(),
+            passed: checks.iter().map(|check| (*check).to_owned()).collect(),
+            passed_by: BTreeMap::new(),
+        },
+        fixes: BTreeMap::new(),
+        candidates: BTreeSet::new(),
+        fix_read_error: None,
+        tip: BTreeMap::new(),
+        covering: BTreeSet::new(),
+        fix_ambiguity: None,
+    }
 }
 
 #[cfg(test)]
