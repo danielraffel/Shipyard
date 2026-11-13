@@ -142,12 +142,14 @@ class DetectionTests(Base):
             d = self.runner / "repair-claims" / f"acme_repo_{pr}"
             d.mkdir()
             (d / "pid").write_text("1\n")
-            old = time.time() - 3600
+            old = (NOW - dt.timedelta(hours=1)).timestamp()
             os.utime(d / "pid", (old, old))
         # claim for PR 7 is fresh
         d = self.runner / "repair-claims" / "acme_repo_7"
         d.mkdir()
         (d / "pid").write_text("1\n")
+        fresh = (NOW - dt.timedelta(minutes=5)).timestamp()
+        os.utime(d / "pid", (fresh, fresh))
         _, _, f = self.run_once()
         self.assertEqual([x["key"] for x in f if x["kind"] == "stuck_claim"], ["stuck_claim:acme/repo#5"])  # 6 pushed, 7 fresh
 

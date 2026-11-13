@@ -49,6 +49,12 @@ trailers = [
 ]
 only_for_tag_pattern = "v*"
 max_push_attempts    = 5
+# Main is protected (required checks plus a reviewer), so the bot never pushes
+# to it. `handoff` keeps one bot-owned branch and pull request, hands it to the
+# merge steward and returns; the release App's token (SHIPYARD_APP_PRIVATE_KEY)
+# does the push, as in version-at-land.yml.
+push_mode            = "handoff"
+app_client_id        = "Iv23liTCzDQWqmMjkDTI"
 # Shipyard dogfoods its hook while the triggering release is still a draft,
 # so it builds the CLI from the tagged checkout instead of racing the new
 # tag's assets or trusting whatever release is `latest`. Only this repository
