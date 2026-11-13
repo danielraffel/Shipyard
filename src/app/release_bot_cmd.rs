@@ -378,6 +378,10 @@ fn hook_install<W: Write>(
         .app_client_id
         .as_deref()
         .filter(|_| hook_config.push_mode == "handoff");
+    if hook_config.push_mode == "handoff" {
+        validate_handoff_branch(&hook_config.handoff_branch, &hook_config.branch)
+            .map_err(|error| CliFailure::new(1, error))?;
+    }
     if hook_config.push_mode == "handoff" && app_client_id.is_none() {
         return Err(CliFailure::new(
             1,
@@ -1124,6 +1128,9 @@ fn commit_and_push_docs(
     result: &mut HookResult,
 ) -> Result<(), String> {
     validate_hook_push_mode(&config.push_mode)?;
+    if config.push_mode == "handoff" {
+        validate_handoff_branch(&config.handoff_branch, &config.branch)?;
+    }
     let mut add_args = vec![String::from("add"), String::from("--")];
     add_args.extend(diffed.iter().cloned());
     run_git_owned(cwd, &add_args)?;
@@ -1360,6 +1367,64 @@ fn gh_api_json(cwd: &Path, args: &[&str]) -> Result<Value, String> {
         .map_err(|error| format!("gh {} returned malformed JSON: {error}", full.join(" ")))
 }
 
+/// The handoff branch is force-pushed, so it must be a bot-owned branch and
+/// never the protected base: a valid name under `release/`, not the base.
+fn validate_handoff_branch(branch: &str, base: &str) -> Result<(), String> {
+    let valid_chars = branch
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-'));
+    let valid = valid_chars
+        && branch.starts_with("release/")
+        && branch.len() > "release/".len()
+        && !branch.contains("..")
+        && !branch.contains("//")
+        && !branch.ends_with('/')
+        && !branch.to_ascii_lowercase().ends_with(".lock")
+        && branch.split('/').all(|part| !part.starts_with('.'));
+    if !valid {
+        return Err(format!(
+            "release.post_tag_hook.handoff_branch {branch:?} must be a valid branch name under `release/`; it is force-pushed"
+        ));
+    }
+    if branch == base {
+        return Err(format!(
+            "release.post_tag_hook.handoff_branch {branch:?} is the base branch; refusing to force-push it"
+        ));
+    }
+    Ok(())
+}
+
+/// The open pull request to reuse for the handoff branch, if any. Only a pull
+/// request opened by a bot account that already carries the managed label is
+/// ours; any other open pull request on this head refuses the run, before
+/// anything is pushed.
+fn bot_owned_handoff_pull(
+    listing: &Value,
+    branch: &str,
+    repo: &str,
+) -> Result<Option<u64>, String> {
+    let mut owned = Vec::new();
+    for pull in listing.as_array().into_iter().flatten() {
+        if pull["head"]["ref"] != branch || pull["head"]["repo"]["full_name"] != repo {
+            continue;
+        }
+        let number = pull["number"].as_u64().unwrap_or_default();
+        let by_bot = pull["user"]["type"] == "Bot";
+        let managed = pull["labels"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|label| label["name"] == HANDOFF_LABEL);
+        if !(by_bot && managed) {
+            return Err(format!(
+                "open pull request #{number} on `{branch}` was not opened by the release bot with the `{HANDOFF_LABEL}` label; refusing to update, label or push over it"
+            ));
+        }
+        owned.push(number);
+    }
+    Ok(owned.into_iter().min())
+}
+
 /// Injectable `gh api` caller so tests can record the calls.
 type GhApi<'a> = dyn Fn(&Path, &[&str]) -> Result<Value, String> + 'a;
 
@@ -1392,9 +1457,18 @@ fn push_via_handoff(
     api: &GhApi<'_>,
     repo: &str,
 ) -> Result<(), String> {
+    validate_handoff_branch(&config.handoff_branch, &config.branch)?;
     ensure_release_commit_is_based_on_target(cwd, config)?;
     let head = run_git_capture(cwd, &["rev-parse", "HEAD"])?;
     let pr_branch = config.handoff_branch.as_str();
+    let owner = repo.split('/').next().unwrap_or_default();
+    let listing = api(
+        cwd,
+        &[&format!(
+            "repos/{repo}/pulls?state=open&head={owner}:{pr_branch}&per_page=100"
+        )],
+    )?;
+    let number = bot_owned_handoff_pull(&listing, pr_branch, repo)?;
     let existing = run_git_capture(
         cwd,
         &[
@@ -1428,23 +1502,6 @@ fn push_via_handoff(
         )?;
         result.pushed = true;
     }
-    let owner = repo.split('/').next().unwrap_or_default();
-    let listing = api(
-        cwd,
-        &[&format!(
-            "repos/{repo}/pulls?state=open&base={}&head={owner}:{pr_branch}&per_page=100",
-            config.branch
-        )],
-    )?;
-    let number = listing
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|pull| {
-            pull["head"]["ref"] == pr_branch && pull["head"]["repo"]["full_name"] == repo
-        })
-        .filter_map(|pull| pull["number"].as_u64())
-        .min();
     let title = handoff_pull_title(tag);
     let body = handoff_pull_body(tag, &config.branch);
     let number = if let Some(number) = number {
@@ -3407,6 +3464,8 @@ app_client_id = "Iv1.abc"
                 return Ok(if open_pr.get() {
                     serde_json::json!([{
                         "number": 77,
+                        "user": { "type": "Bot" },
+                        "labels": [{ "name": "shipyard:managed" }],
                         "head": { "ref": "release/changelog-sync",
                                   "repo": { "full_name": "owner/repo" } }
                     }])
@@ -3446,6 +3505,115 @@ app_client_id = "Iv1.abc"
             .output()
             .expect("show");
         assert!(String::from_utf8_lossy(&on_branch.stdout).contains("two"));
+    }
+
+    #[test]
+    fn handoff_branch_is_validated_before_any_force_push() {
+        assert!(validate_handoff_branch("release/changelog-sync", "main").is_ok());
+        for bad in [
+            "main",
+            "master",
+            "feature/x",
+            "release/",
+            "release/a..b",
+            "release/x.lock",
+            "release/a b",
+            "release//x",
+        ] {
+            assert!(validate_handoff_branch(bad, "main").is_err(), "{bad}");
+        }
+        let error = validate_handoff_branch("release/base", "release/base").expect_err("base");
+        assert!(error.contains("base branch"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handoff_with_main_as_branch_refuses_without_pushing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (repo, remote) = handoff_fixture(temp.path());
+        let main_before = remote_ref(&remote, "refs/heads/main").expect("main");
+        let config = HookConfig {
+            push_mode: String::from("handoff"),
+            handoff_branch: String::from("main"),
+            ..HookConfig::default()
+        };
+        let api = |_: &Path, _: &[&str]| -> Result<Value, String> { panic!("no API call") };
+        let error = push_via_handoff(
+            &repo,
+            &config,
+            "v1",
+            &mut HookResult::default(),
+            &api,
+            "o/r",
+        )
+        .expect_err("refused");
+        assert!(error.contains("handoff_branch"));
+        assert_eq!(
+            remote_ref(&remote, "refs/heads/main").expect("main"),
+            main_before
+        );
+    }
+
+    #[test]
+    fn handoff_reuses_only_the_bots_own_managed_pull_request() {
+        let pull = |user: &str, label: Option<&str>| {
+            serde_json::json!([{
+                "number": 9,
+                "user": { "type": user },
+                "labels": label.map(|l| vec![serde_json::json!({ "name": l })]).unwrap_or_default(),
+                "head": { "ref": "release/changelog-sync", "repo": { "full_name": "o/r" } }
+            }])
+        };
+        let ours = bot_owned_handoff_pull(
+            &pull("Bot", Some("shipyard:managed")),
+            "release/changelog-sync",
+            "o/r",
+        );
+        assert_eq!(ours, Ok(Some(9)));
+        for unrelated in [
+            pull("User", Some("shipyard:managed")),
+            pull("Bot", None),
+            pull("User", None),
+        ] {
+            let error = bot_owned_handoff_pull(&unrelated, "release/changelog-sync", "o/r")
+                .expect_err("refused");
+            assert!(error.contains("#9"));
+        }
+        assert_eq!(
+            bot_owned_handoff_pull(&serde_json::json!([]), "release/changelog-sync", "o/r"),
+            Ok(None)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handoff_refuses_an_unrelated_pr_before_pushing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (repo, remote) = handoff_fixture(temp.path());
+        fs::write(repo.join("CHANGELOG.md"), "x\n").expect("write");
+        git(&repo, &["add", "CHANGELOG.md"]);
+        git(&repo, &["commit", "-m", "docs"]);
+        let config = HookConfig {
+            push_mode: String::from("handoff"),
+            ..HookConfig::default()
+        };
+        let api = |_: &Path, args: &[&str]| -> Result<Value, String> {
+            assert!(
+                args[0].contains("/pulls?state=open"),
+                "only the listing is allowed"
+            );
+            Ok(serde_json::json!([{
+                "number": 5, "user": { "type": "User" }, "labels": [],
+                "head": { "ref": "release/changelog-sync", "repo": { "full_name": "o/r" } }
+            }]))
+        };
+        let mut result = HookResult::default();
+        push_via_handoff(&repo, &config, "v1", &mut result, &api, "o/r").expect_err("refused");
+        assert!(!result.pushed);
+        assert_eq!(
+            remote_ref(&remote, "refs/heads/release/changelog-sync"),
+            None
+        );
     }
 
     #[test]
