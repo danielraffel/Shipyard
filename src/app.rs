@@ -11,6 +11,7 @@ use crate::paths::RuntimePaths;
 use crate::ship_state::ShipStateStore;
 use clap::Parser;
 
+mod advance_cmd;
 mod auth_cmd;
 mod auto_merge_cmd;
 mod base_health_cmd;
@@ -571,6 +572,32 @@ where
                 stdout,
             );
         }
+        Command::Advance {
+            target,
+            retrigger,
+            release_hold,
+            reason,
+            decision,
+            head,
+            dry_run,
+        } => {
+            return advance_cmd::advance_command(
+                cli.mode.into(),
+                &cwd,
+                &runtime_paths.state_dir,
+                &advance_cmd::AdvanceArgs {
+                    target,
+                    retrigger,
+                    release_hold,
+                    reason,
+                    decision,
+                    head,
+                    dry_run,
+                    json: cli.json,
+                },
+                stdout,
+            );
+        }
         Command::ReviewVerdict {
             pr,
             repo,
@@ -1055,6 +1082,7 @@ fn handle_operational_variant<W: Write>(
         | Command::Landability { .. }
         | Command::Landing { .. }
         | Command::Inspect { .. }
+        | Command::Advance { .. }
         | Command::ReviewVerdict { .. }
         | Command::ReviewerDispatch { .. }
         | Command::ReviewerClaim { .. }

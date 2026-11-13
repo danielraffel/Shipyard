@@ -2114,6 +2114,9 @@ mod unapproved_admission;
 pub(super) use carried_commits::STACKED_LABEL_PREFIX;
 pub(super) use infra_rerun::Mode as InfraRerunMode;
 pub(super) use unapproved_admission::DequeueMode;
+// `shipyard advance` reads checks and protection exactly as the steward does.
+pub(super) use observation::{parse_rest_check, parse_rest_status};
+pub(super) use render::{is_admin_protection_denied, is_private_free_entitlement};
 
 use cancellation::{
     apply_repo_plan, cancellation_reason_label, queue_front_head, timestamp_old_enough,
@@ -2356,10 +2359,7 @@ use observation::{
 };
 #[cfg(test)]
 use pr_mutations::mutate_pr;
-use render::{
-    enqueue_requirements_pending, is_admin_protection_denied, is_private_free_entitlement,
-    render_report,
-};
+use render::{enqueue_requirements_pending, render_report};
 
 #[cfg(test)]
 mod tests;

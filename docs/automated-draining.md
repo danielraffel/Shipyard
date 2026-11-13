@@ -397,6 +397,7 @@ close anything. See [superseded-close.md](superseded-close.md).
 | `approval_unread` | The approval gate could not be read this pass | next pass |
 | `owner_decision` | Labelled `owner-decision` | owner |
 | `excluded_label:<label>` | `superseded`, `PARKED/<platform>` or the opt-out label | whoever owns the label |
+| `excluded_label:shipyard:no-auto-merge` | A hold: the opt-out label, with a comment naming what it waits for (`hold-condition:` lines) | any agent that neither wrote nor approved it: `shipyard advance OWNER/REPO#N --release-hold` once every named condition is met, or with `--decision` naming the DECISIONS entry that releases it. It checks green required checks and the steward's exact-head approval itself, writes through `ghapp`, and audits the act ([advance](advance.md)) |
 | `provenance_blocked:<labels>` | A provenance-blocking label | owner |
 | `required_never_ran:<contexts>` | A required context has no run on this head and nothing from its source is still queued or running (often a renamed check: merge the base to re-run CI) | repair lane |
 | `required_pending` | Required checks are queued or running, or have not appeared yet behind a running job, and none has failed. A `pending` `review-verdict` status (head awaiting its reviewer) also reads here, with the reviewer as actor, never as `required_failed` | CI, or the reviewer |

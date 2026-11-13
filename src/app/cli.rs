@@ -493,6 +493,45 @@ pub(super) enum Command {
         #[arg(long, value_name = "NUMBER")]
         pr: Option<u64>,
     },
+    /// Perform one routine release-movement act after checking its policy.
+    ///
+    /// `--retrigger` closes and reopens a pull request so GitHub rebuilds a
+    /// stale merge ref: only when it is open, not queued or armed, no live
+    /// repair claim holds it, required runs reported at the exact head and
+    /// none is running, and `--reason` says why. `--release-hold` removes
+    /// `shipyard:no-auto-merge`: only when every required check is green at
+    /// the exact head, the steward's gate counts an exact-head APPROVE, and
+    /// every `hold-condition:` the hold comment names is met, or `--decision`
+    /// names a DECISIONS entry that names this pull request. Never on a pull
+    /// request the caller authored or approved. Writes go through `ghapp`
+    /// and its guards; each act posts one audit comment and appends one line
+    /// to `advance.jsonl` in the state directory. Defect dequeues are not an
+    /// act here: they keep their own audited path. Exits 0 acted, 1 refused,
+    /// 2 a fact could not be read, 3 the act did not finish cleanly.
+    Advance {
+        /// The pull request, `OWNER/REPO#NUMBER`.
+        #[arg(value_name = "OWNER/REPO#NUMBER")]
+        target: String,
+        /// Close and reopen to rebuild a stale merge ref.
+        #[arg(long, conflicts_with = "release_hold")]
+        retrigger: bool,
+        /// Remove the `shipyard:no-auto-merge` label.
+        #[arg(long)]
+        release_hold: bool,
+        /// Why (required for `--retrigger`).
+        #[arg(long, value_name = "TEXT")]
+        reason: Option<String>,
+        /// A DECISIONS entry releasing the hold: `OWNER/REPO:PATH[#anchor]`
+        /// or a GitHub blob URL. The file must name this pull request.
+        #[arg(long, value_name = "REF", requires = "release_hold")]
+        decision: Option<String>,
+        /// The head the caller expects; a different live head refuses.
+        #[arg(long, value_name = "SHA")]
+        head: Option<String>,
+        /// Print the decision and change nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Whether a pull request's head may land, by the repository-side
     /// review rule. Read-only.
     ///

@@ -1444,7 +1444,7 @@ pub(super) fn commit_status_rows_for_head_with_deadline(
     Err("current-head commit statuses exceed 1000; refusing partial status scan".to_owned())
 }
 
-pub(super) fn parse_rest_check(value: &Value) -> Option<StewardCheck> {
+pub(crate) fn parse_rest_check(value: &Value) -> Option<StewardCheck> {
     Some(StewardCheck {
         name: value.get("name")?.as_str()?.to_owned(),
         source: crate::merge_steward::StewardCheckSource::CheckRun,
@@ -1469,7 +1469,7 @@ pub(super) fn parse_rest_check(value: &Value) -> Option<StewardCheck> {
     })
 }
 
-pub(super) fn parse_rest_status(value: &Value) -> Option<StewardCheck> {
+pub(crate) fn parse_rest_status(value: &Value) -> Option<StewardCheck> {
     let state = value.get("state")?.as_str()?;
     // An approval script that predates `pending` for "no verdict yet" posts
     // `failure` with a fixed description; that head is waiting on review.
