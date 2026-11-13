@@ -61,6 +61,8 @@ const JUMP_FORBIDDEN: &str = r#"{"data":{"enqueuePullRequest":null},"errors":[{"
 fn poisoned(hold: PoisonHold, auto_jump: AutoJump, fixes: &[u64]) -> RepoPoison {
     let mut poison = streak_only(hold, auto_jump, fixes);
     poison.tip = crate::app::merge_steward_cmd::base_poison::red_tip(&poison.health);
+    // The named fix's head passed the context after the base went red.
+    poison.covering = poison.fixes.keys().copied().collect();
     poison
 }
 
@@ -99,6 +101,7 @@ fn streak_only(hold: PoisonHold, auto_jump: AutoJump, fixes: &[u64]) -> RepoPois
             .collect(),
         fix_read_error: None,
         fix_ambiguity: None,
+        covering: std::collections::BTreeSet::new(),
         candidates: std::collections::BTreeSet::default(),
         tip: std::collections::BTreeMap::new(),
     }

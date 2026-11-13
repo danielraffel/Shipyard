@@ -615,9 +615,10 @@ only while the streak is firing.
 While both hold:
 
 - **The fix is found without a repository-specific detector.** It is an open
-  pull request whose current head is approved and whose own run of the
-  failing context passed after the base tip went red: the check is green on
-  the pull request while red on the base. A pull request whose green run
+  pull request whose current head is approved and whose own run of every
+  failing context passed after the base tip went red: the checks are green
+  on the pull request while red on the base. A head that passes one red
+  context but not another is not a fix. A pull request whose green run
   predates the break never ran against the broken base and does not count.
   When more than one pull request qualifies, the one carrying a
   `main-red-fix` or `fixes-main` label is the fix; if no single label
@@ -628,7 +629,10 @@ While both hold:
 - **The fix goes first.** It is enqueued with `jump: true` and is never
   held.
 - **Every other approved pull request waits** (`held_base_poisoned:<context>`)
-  instead of being enqueued into a group that cannot pass. Nothing already
+  instead of being enqueued into a group that cannot pass. The only
+  exemption is a head that passed every confirmed context after the break;
+  a label, the detector or a measured pass on one context never exempts a
+  head from another. Nothing already
   queued is removed unless `merge_group_pause = "on"` as well.
 - **The episode ends as soon as the base tip reads green.** Holds lift in
   the same pass.

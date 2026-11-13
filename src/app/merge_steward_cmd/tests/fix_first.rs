@@ -106,7 +106,7 @@ fn poison(
 ) -> RepoPoison {
     let tip = BTreeMap::from([(CONTEXT.to_owned(), tip)]);
     let mut named = BTreeMap::new();
-    let green = base_poison::green_head_fix(prs, &[], APPROVAL, &health, &tip);
+    let (green, covering) = base_poison::green_head_fix(prs, &[], APPROVAL, &health, &tip);
     if let GreenHead::One(pr, evidence) = &green {
         named.insert(*pr, vec![evidence.clone()]);
     }
@@ -132,6 +132,7 @@ fn poison(
         fix_read_error: None,
         fix_ambiguity,
         tip,
+        covering,
     }
 }
 
@@ -160,7 +161,7 @@ fn the_fix_is_the_approved_head_that_passed_the_context_after_the_tip_went_red()
     let prs = [pr_408(), pr_409()];
     let tip = BTreeMap::from([(CONTEXT.to_owned(), tip_red())]);
     let GreenHead::One(pr, evidence) =
-        base_poison::green_head_fix(&prs, &[], APPROVAL, &streak(), &tip)
+        base_poison::green_head_fix(&prs, &[], APPROVAL, &streak(), &tip).0
     else {
         panic!("a green head is named");
     };
@@ -493,4 +494,159 @@ fn the_shadow_ledger_marks_an_episode_built_on_an_unread_tip_partial() {
         open.iter().all(|episode| episode["partial"] == true),
         "{report}"
     );
+}
+
+const OTHER: &str = "macos-gpu";
+
+/// An approved open pull request with the given contexts green at times.
+fn pr_with_greens(number: u64, head: char, greens: &[(&str, &str)]) -> ObservedPr {
+    let mut rollup = greens
+        .iter()
+        .map(|(context, at)| {
+            serde_json::json!({
+                "__typename": "CheckRun", "name": context, "status": "COMPLETED",
+                "conclusion": "SUCCESS", "completedAt": at
+            })
+        })
+        .collect::<Vec<_>>();
+    rollup.push(serde_json::json!({
+        "__typename": "StatusContext", "context": APPROVAL, "state": "SUCCESS",
+        "createdAt": "2026-11-13T10:50:00Z"
+    }));
+    parse_pr(
+        &serde_json::json!({
+            "id": format!("PR_{number}"), "number": number, "state": "OPEN", "isDraft": false,
+            "baseRefName": "main", "headRefOid": head.to_string().repeat(40),
+            "headRefName": format!("branch-{number}"), "mergeStateStatus": "CLEAN",
+            "autoMergeRequest": null, "labels": [], "statusCheckRollup": rollup,
+        }),
+        &BTreeMap::new(),
+    )
+    .expect("PR")
+}
+
+/// Both contexts fail the same streak of groups.
+fn two_context_streak() -> MergeGroupHealth {
+    let MergeGroupHealth::Poisoned { contexts } = streak() else {
+        unreachable!()
+    };
+    let mut other = contexts[0].clone();
+    other.context = OTHER.to_owned();
+    let mut both = contexts;
+    both.push(other);
+    MergeGroupHealth::Poisoned { contexts: both }
+}
+
+fn red_on_both() -> BTreeMap<String, TipReading> {
+    [CONTEXT, OTHER]
+        .iter()
+        .map(|context| ((*context).to_owned(), tip_red()))
+        .collect()
+}
+
+fn two_context_poison(prs: &[ObservedPr], tip: BTreeMap<String, TipReading>) -> RepoPoison {
+    let health = two_context_streak();
+    let (green, covering) = base_poison::green_head_fix(prs, &[], APPROVAL, &health, &tip);
+    let mut named = BTreeMap::new();
+    if let GreenHead::One(pr, evidence) = green {
+        named.insert(pr, vec![evidence]);
+    }
+    let (fixes, candidates) = base_poison::assemble_fixes(named, prs, &health);
+    RepoPoison {
+        policy: BasePoisonPolicy {
+            hold: PoisonHold::On,
+            control_workflows: BTreeMap::new(),
+            pause: PoisonHold::On,
+            auto_jump: AutoJump::On,
+            read_error: None,
+        },
+        health,
+        fixes,
+        candidates,
+        fix_read_error: None,
+        fix_ambiguity: None,
+        tip,
+        covering,
+    }
+}
+
+/// With two contexts red, a head that passes only one of them is neither
+/// the fix nor exempt: it would form a group that still fails the other.
+#[test]
+fn a_fix_must_pass_every_confirmed_context() {
+    let half = pr_with_greens(500, 'c', &[(CONTEXT, "2026-11-13T10:40:00Z")]);
+    let whole = pr_with_greens(
+        501,
+        'd',
+        &[
+            (CONTEXT, "2026-11-13T10:40:00Z"),
+            (OTHER, "2026-11-13T10:41:00Z"),
+        ],
+    );
+    let only_half = two_context_poison(std::slice::from_ref(&half), red_on_both());
+    assert!(only_half.fixes.is_empty(), "{:?}", only_half.fixes);
+    assert!(only_half.covering.is_empty());
+    assert!(matches!(
+        base_poison::admission(Some(&only_half), 500),
+        Admission::Hold { .. }
+    ));
+    let both = two_context_poison(&[half, whole], red_on_both());
+    assert_eq!(both.fixes.keys().copied().collect::<Vec<_>>(), vec![501]);
+    let evidence = both.fixes[&501].join(" | ");
+    assert!(
+        evidence.contains(CONTEXT) && evidence.contains(OTHER),
+        "evidence names both contexts: {evidence}"
+    );
+    assert_eq!(
+        base_poison::admission(Some(&both), 501),
+        Admission::FastTrack { jump: true }
+    );
+    assert!(matches!(
+        base_poison::admission(Some(&both), 500),
+        Admission::Hold { .. }
+    ));
+}
+
+/// A named or measured exemption for one context never bypasses the hold
+/// for another confirmed context.
+#[test]
+fn an_exemption_for_one_context_does_not_bypass_another() {
+    let half = pr_with_greens(500, 'c', &[(CONTEXT, "2026-11-13T10:40:00Z")]);
+    let mut poison = two_context_poison(std::slice::from_ref(&half), red_on_both());
+    poison.candidates.insert(500);
+    poison
+        .fixes
+        .insert(500, vec!["label `shipyard:unblock`".to_owned()]);
+    assert!(matches!(
+        base_poison::admission(Some(&poison), 500),
+        Admission::Hold { .. }
+    ));
+}
+
+/// A confirmed context whose red time is unknown exempts nobody.
+#[test]
+fn a_confirmed_context_without_a_red_time_exempts_nobody() {
+    let whole = pr_with_greens(
+        501,
+        'd',
+        &[
+            (CONTEXT, "2026-11-13T10:40:00Z"),
+            (OTHER, "2026-11-13T10:41:00Z"),
+        ],
+    );
+    let mut tip = red_on_both();
+    tip.insert(
+        OTHER.to_owned(),
+        TipReading {
+            red: true,
+            ..TipReading::default()
+        },
+    );
+    let poison = two_context_poison(&[whole], tip);
+    assert!(poison.covering.is_empty());
+    assert!(poison.fixes.is_empty());
+    assert!(matches!(
+        base_poison::admission(Some(&poison), 501),
+        Admission::Hold { .. }
+    ));
 }

@@ -219,6 +219,16 @@ impl GreenFix {
     }
 }
 
+/// Whether a candidate's head passed the context after the base went red,
+/// approved or not: not a draft, never on a failing group, green after
+/// `red_since`.
+#[must_use]
+pub fn passed_after(candidate: &FixCandidate, red_since: DateTime<Utc>) -> bool {
+    !candidate.draft
+        && !candidate.rode_failing_group
+        && candidate.context_green_at.is_some_and(|at| at > red_since)
+}
+
 /// Every candidate that qualifies as the fix for a context red on the tip
 /// since `red_since`: approved at its head, and its head's run of the
 /// context passed after the tip went red. A green run that predates the
@@ -227,9 +237,9 @@ impl GreenFix {
 pub fn green_head_fixes(candidates: &[FixCandidate], red_since: DateTime<Utc>) -> Vec<GreenFix> {
     candidates
         .iter()
-        .filter(|candidate| !candidate.draft && !candidate.rode_failing_group)
+        .filter(|candidate| passed_after(candidate, red_since))
         .filter_map(|candidate| {
-            let green_at = candidate.context_green_at.filter(|at| *at > red_since)?;
+            let green_at = candidate.context_green_at?;
             Some(GreenFix {
                 pr: candidate.number,
                 approved_at: candidate.approved_at?,

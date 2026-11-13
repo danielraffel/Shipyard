@@ -48,7 +48,7 @@
 //! ranks below a label and the detector's naming and above title text, and it
 //! is never held: it is enqueued with `jump: true` when `auto_jump = "on"`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -93,6 +93,11 @@ pub(super) struct RepoPoison {
     /// The base tip's own verdict for each poisoned context.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(super) tip: BTreeMap<String, TipReading>,
+    /// Open heads that passed every confirmed context after the base went
+    /// red (not drafts, none that rode a failing group): the only pull
+    /// requests a confirmed episode admits, and the only fix it jumps.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub(super) covering: BTreeSet<u64>,
     /// Set when several pull requests qualified as the green-head fix and
     /// nothing singled one out. They are admitted plainly ([`Self::candidates`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -203,26 +208,32 @@ pub(super) fn admission(poison: Option<&RepoPoison>, pr: u64) -> Admission {
     if contexts.is_empty() {
         return Admission::Proceed;
     }
-    // A measured candidate (its head passes the context while others fail
-    // it) is admitted as usual, with no jump and no fast-track: at worst it
-    // costs the one group it forms.
-    if !poison.fixes.contains_key(&pr) && poison.candidates.contains(&pr) {
-        return Admission::Proceed;
-    }
     let confirmed = poison.confirmed_contexts();
-    if poison.fixes.contains_key(&pr) {
-        return Admission::FastTrack {
-            // A jump reorders the queue, so it is a mutation: dry-run never
-            // jumps, and neither does a streak the base tip does not confirm.
-            jump: poison.policy.hold == PoisonHold::On
-                && poison.policy.auto_jump == AutoJump::On
-                && !confirmed.is_empty(),
+    let named = poison.fixes.contains_key(&pr);
+    // A streak alone holds and jumps nothing: one flaky group pair must not
+    // stop the queue. The hold needs the base tip red on the same context.
+    if confirmed.is_empty() {
+        return if named {
+            Admission::FastTrack { jump: false }
+        } else {
+            Admission::Proceed
         };
     }
-    // A streak alone holds nothing: one flaky group pair must not stop the
-    // queue. The hold needs the base tip red on the same context.
-    if confirmed.is_empty() {
-        return Admission::Proceed;
+    // Confirmed: only a head that passed every confirmed context after the
+    // base went red is admitted. Exemptions are never per context: a head
+    // that passes one red context but not another forms a doomed group.
+    if poison.covering.contains(&pr) {
+        return if named {
+            Admission::FastTrack {
+                // A jump reorders the queue, so it is a mutation: dry-run
+                // never jumps.
+                jump: poison.policy.hold == PoisonHold::On
+                    && poison.policy.auto_jump == AutoJump::On,
+            }
+        } else {
+            // An ambiguous or measured fix: admitted plainly, never jumped.
+            Admission::Proceed
+        };
     }
     let contexts = confirmed.join(",");
     match poison.policy.hold {
@@ -283,7 +294,7 @@ pub(super) fn observe(
             )
         })
         .collect::<BTreeMap<_, _>>();
-    let green = green_head_fix(
+    let (green, covering) = green_head_fix(
         &observation.prs,
         &observation.required_checks,
         &policy.approval_context,
@@ -308,6 +319,7 @@ pub(super) fn observe(
         fixes,
         fix_read_error,
         tip,
+        covering,
         fix_ambiguity,
     })
 }
@@ -358,8 +370,10 @@ pub(super) enum GreenHead {
 }
 
 /// The one green-head fix across the confirmed contexts, with its evidence:
-/// an open pull request whose current head is approved and passed the
-/// context after the base tip went red. Read from the census; no call. The
+/// an open pull request whose current head is approved and passed every
+/// confirmed context after the base tip went red. Also returns every open
+/// head that passed every confirmed context, approved or not
+/// ([`RepoPoison::covering`]). Read from the census; no call. The
 /// facts belong to the head the census read; the enqueue that acts on them
 /// pins that head (`expectedHeadOid`) and re-reads its exact-head approval,
 /// so a head that moved in between is never jumped.
@@ -369,7 +383,7 @@ pub(super) fn green_head_fix(
     approval_context: &str,
     health: &MergeGroupHealth,
     tip: &BTreeMap<String, TipReading>,
-) -> GreenHead {
+) -> (GreenHead, BTreeSet<u64>) {
     let time = |text: Option<&str>| {
         text.and_then(|text| DateTime::parse_from_rfc3339(text).ok())
             .map(|at| at.with_timezone(&Utc))
@@ -382,12 +396,15 @@ pub(super) fn green_head_fix(
                 .is_some_and(|conclusion| conclusion.eq_ignore_ascii_case("SUCCESS"))
     };
     let mut found: Vec<(fix_first::GreenFix, String)> = Vec::new();
+    let mut covering: Option<BTreeSet<u64>> = None;
     for poisoned in health.poisoned() {
-        let Some(red_since) = tip
-            .get(&poisoned.context)
-            .filter(|tip| tip.red)
-            .and_then(|tip| tip.red_since)
-        else {
+        let Some(reading) = tip.get(&poisoned.context).filter(|tip| tip.red) else {
+            continue;
+        };
+        // Confirmed but with no time the base went red: nothing can be shown
+        // to pass it after the break, so nothing is exempt.
+        let Some(red_since) = reading.red_since else {
+            covering = Some(BTreeSet::new());
             continue;
         };
         let rule = required
@@ -430,22 +447,45 @@ pub(super) fn green_head_fix(
                 }),
             })
             .collect::<Vec<_>>();
+        // The heads that passed this context after it went red, approved
+        // or not: a head must pass every confirmed context to be exempt.
+        let passing = candidates
+            .iter()
+            .filter(|candidate| fix_first::passed_after(candidate, red_since))
+            .map(|candidate| candidate.number)
+            .collect::<BTreeSet<_>>();
+        covering = Some(match covering {
+            None => passing,
+            Some(so_far) => so_far.intersection(&passing).copied().collect(),
+        });
         for fix in fix_first::green_head_fixes(&candidates, red_since) {
             let evidence = fix.evidence(&poisoned.context, red_since);
             found.push((fix, evidence));
         }
     }
-    let fixes = found.iter().map(|(fix, _)| fix.clone()).collect::<Vec<_>>();
-    match fix_first::pick(&fixes) {
+    let covering = covering.unwrap_or_default();
+    // A fix must repair every confirmed context: one that passes A but not B
+    // would form a group that still fails B.
+    let mut fixes: Vec<fix_first::GreenFix> = Vec::new();
+    let mut evidence: BTreeMap<u64, Vec<String>> = BTreeMap::new();
+    for (fix, line) in found {
+        if !covering.contains(&fix.pr) {
+            continue;
+        }
+        evidence.entry(fix.pr).or_default().push(line);
+        if !fixes.iter().any(|known| known.pr == fix.pr) {
+            fixes.push(fix);
+        }
+    }
+    let green = match fix_first::pick(&fixes) {
         fix_first::Pick::None => GreenHead::None,
         fix_first::Pick::Ambiguous { prs } => GreenHead::Ambiguous(prs),
-        fix_first::Pick::One(chosen) => found
-            .into_iter()
-            .find(|(fix, _)| fix.pr == chosen.pr)
-            .map_or(GreenHead::None, |(fix, evidence)| {
-                GreenHead::One(fix.pr, evidence)
-            }),
-    }
+        fix_first::Pick::One(chosen) => GreenHead::One(
+            chosen.pr,
+            evidence.remove(&chosen.pr).unwrap_or_default().join("; "),
+        ),
+    };
+    (green, covering)
 }
 
 /// The one named fix this pass fast-tracks ([`choose_fix`]), and every

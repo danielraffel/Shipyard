@@ -197,9 +197,11 @@ fn replay_command<W: Write>(
     Ok(std::process::ExitCode::SUCCESS)
 }
 
-/// Jump advice from merge-group poison: only when exactly one open pull
-/// request is named as the fix, so the advice never picks between rivals.
-/// Its episode key is the newest failing merge-group head.
+/// Jump advice from merge-group poison: only when the base tip's own newest
+/// run of every poisoned context failed too (the steward's confirmation,
+/// [`fix_first::parse_tip`]; an unread tip confirms nothing), and exactly one
+/// open pull request is named as the fix, so the advice never picks between
+/// rivals. Its episode key is the newest failing merge-group head.
 fn merge_group_advice(
     reader: &dyn Fn(&[String]) -> Result<String, String>,
     repo: &str,
@@ -208,6 +210,18 @@ fn merge_group_advice(
 ) -> Option<JumpAdvice> {
     let poisoned = health.poisoned();
     let first = poisoned.first()?;
+    let tip_red = |context: &str| {
+        reader(&[
+            "api".to_owned(),
+            fix_first::tip_check_path(repo, base, context),
+        ])
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .is_some_and(|value| fix_first::parse_tip(&value, context, None).red)
+    };
+    if !poisoned.iter().all(|poison| tip_red(&poison.context)) {
+        return None;
+    }
     let contexts = health.poisoned_contexts();
     let (fixes, _) = super::merge_steward_cmd::named_fixes(reader, repo, base, health);
     let mut fixes = fixes.into_keys();
@@ -584,6 +598,55 @@ mod tests {
             text.contains("score: 2 episodes, 2 fired, 1 named a fix, 1 correct, 0 wrong, 0 held the actual fix"),
             "{text}"
         );
+    }
+
+    /// The merge-group advice jumps nothing on a streak alone: the base tip's
+    /// own run of the context must have failed too, and an unread tip
+    /// confirms nothing.
+    #[test]
+    fn merge_group_advice_needs_the_base_tip_red() {
+        use crate::base_health::merge_group::{GroupRef, MergeGroupHealth, PoisonedContext};
+        let health = MergeGroupHealth::Poisoned {
+            contexts: vec![PoisonedContext {
+                context: "provenance-verify".to_owned(),
+                first_error: None,
+                groups: vec![
+                    GroupRef {
+                        head_sha: "a".repeat(40),
+                        prs: vec![405],
+                    },
+                    GroupRef {
+                        head_sha: "b".repeat(40),
+                        prs: vec![404],
+                    },
+                ],
+                latest_failure_at: None,
+                check_id: Some(9),
+                same_first_error: None,
+            }],
+        };
+        let reader_with = |tip: &'static str| {
+            move |argv: &[String]| -> Result<String, String> {
+                let line = argv.join(" ");
+                if line.contains("/check-runs?check_name=") {
+                    return if tip.is_empty() {
+                        Err("HTTP 502".to_owned())
+                    } else {
+                        Ok(tip.to_owned())
+                    };
+                }
+                if line.starts_with("pr list") {
+                    return Ok(r#"[{"number":409,"title":"fix provenance-verify","body":"","labels":[{"name":"shipyard:unblock"}],"isDraft":false}]"#.to_owned());
+                }
+                Err("gh: Not Found (HTTP 404)".to_owned())
+            }
+        };
+        let red = r#"{"check_runs":[{"id":2,"name":"provenance-verify","status":"completed","conclusion":"failure","completed_at":"2026-11-13T10:32:36Z","head_sha":"c"}]}"#;
+        let green = r#"{"check_runs":[{"id":2,"name":"provenance-verify","status":"completed","conclusion":"success","completed_at":"2026-11-13T10:32:36Z","head_sha":"c"}]}"#;
+        let advice = merge_group_advice(&reader_with(red), "o/r", "main", &health);
+        assert_eq!(advice.map(|advice| advice.pr), Some(409));
+        assert!(merge_group_advice(&reader_with(green), "o/r", "main", &health).is_none());
+        assert!(merge_group_advice(&reader_with(""), "o/r", "main", &health).is_none());
     }
 
     #[test]

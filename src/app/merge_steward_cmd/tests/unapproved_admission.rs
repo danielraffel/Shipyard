@@ -1409,6 +1409,7 @@ fn an_approved_queued_head_is_paused_while_the_base_is_poisoned() {
         fixes: BTreeMap::new(),
         fix_read_error: None,
         fix_ambiguity: None,
+        covering: std::collections::BTreeSet::new(),
         candidates: std::collections::BTreeSet::default(),
         tip: BTreeMap::from([(
             "Enforce version & skill sync".to_owned(),

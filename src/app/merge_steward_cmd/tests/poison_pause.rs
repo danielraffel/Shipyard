@@ -105,6 +105,23 @@ fn observation(prs: Vec<ObservedPr>) -> RepoObservation {
 
 fn poison(health: MergeGroupHealth, hold: PoisonHold, prs: &[ObservedPr]) -> RepoPoison {
     let (fixes, candidates) = base_poison::assemble_fixes(BTreeMap::new(), prs, &health);
+    // The tip went red with the newest failing group: a head that passed
+    // after it covers the context.
+    let tip = health
+        .poisoned()
+        .iter()
+        .map(|poisoned| {
+            (
+                poisoned.context.clone(),
+                crate::base_health::fix_first::TipReading {
+                    red: true,
+                    red_since: poisoned.latest_failure_at,
+                    ..Default::default()
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let covering = base_poison::green_head_fix(prs, &[], "review-verdict", &health, &tip).1;
     RepoPoison {
         policy: BasePoisonPolicy {
             hold,
@@ -114,10 +131,11 @@ fn poison(health: MergeGroupHealth, hold: PoisonHold, prs: &[ObservedPr]) -> Rep
             read_error: None,
         },
         fixes,
-        tip: base_poison::red_tip(&health),
+        tip,
         health,
         fix_read_error: None,
         fix_ambiguity: None,
+        covering,
         candidates,
     }
 }
