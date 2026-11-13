@@ -4501,6 +4501,21 @@ See `docs/automated-draining.md` "Ejection guards". The `ghapp`
 Python guard does not mirror this class, so do not expect a manual `ghapp` arm
 of such a head to pass.
 
+**A flake that ejected several approved pull requests is re-enqueued once.**
+When the same failing test signature (each failing required check with the
+ctest tests it named, read by the same-head retry classifier) ejects heads of
+two or more different pull requests from different merge groups within
+`[auto_merge] flake_window_hours` (24), the ejection is `flake:<signature>`.
+Under `[auto_merge] flake_requeue = "apply"` (default `shadow`, or `apply` when
+`[auto_merge.dwell] act = "apply"`) each such head is re-enqueued once,
+unchanged, with a ledger receipt saved first. This never happens for a
+`defect-fix`-removed head, a context the base is confirmed red on, or a head
+already re-enqueued once. The repository report's `flake_requeue` section
+carries `decisions` and one `flake_root_cause` record per signature, and under
+apply one issue per signature (marker `shipyard-flake-signature`, updated by
+comment, never duplicated). Do not push a no-op head for such a row; fix or
+list the flaky test. See `docs/automated-draining.md` "Flakes".
+
 **A row marked `red_everywhere` is a base-level failure, not yours to repair.**
 When one required check fails the same test on three or more open pull requests,
 the steward reports the episode in the repository's `red_everywhere` section and

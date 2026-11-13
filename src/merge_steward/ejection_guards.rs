@@ -38,6 +38,7 @@
 //! infra_only_same_head_retry = true   # default: on when the base has a merge queue
 //! known_flaky_tests = ["ui-script-plugin-editor-au"]  # names or `*` globs
 //! red_everywhere = "shadow"           # off | shadow (default) | enforce
+//! flake_requeue = "shadow"            # off | shadow | apply (see `flake_requeue`)
 //! ```
 //!
 //! `red_everywhere` is not an ejection guard but lives in the same table: it
@@ -138,6 +139,10 @@ pub struct EjectionGuards {
     /// Why `dequeue_doomed_groups` did not parse, when it did not.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dequeue_doomed_groups_error: Option<String>,
+    /// The flake class: re-enqueue once a head the same failing test
+    /// ejected along with another pull request's
+    /// ([`super::flake_requeue::FlakePolicy`]).
+    pub flake_requeue: super::flake_requeue::FlakePolicy,
     /// Why the base config could not be read, when it could not. The guards
     /// then keep their merge-queue defaults (on) with no generated paths.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -166,6 +171,7 @@ impl EjectionGuards {
                 crate::base_health::PoisonHold::Off
             },
             dequeue_doomed_groups_error: None,
+            flake_requeue: super::flake_requeue::FlakePolicy::for_base(merge_queue),
             read_error: None,
         }
     }
@@ -176,6 +182,7 @@ impl EjectionGuards {
     pub fn from_table(table: &toml::Table, merge_queue: bool) -> Self {
         let mut guards = Self::for_base(merge_queue);
         guards.base_poison = crate::base_health::BasePoisonPolicy::from_table(table, merge_queue);
+        guards.flake_requeue = super::flake_requeue::FlakePolicy::from_table(table, merge_queue);
         if merge_queue {
             let value = table
                 .get("merge_queue")

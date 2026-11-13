@@ -673,7 +673,7 @@ fn enqueue_unstacked_pull_request(
     // Hosted-setup recovery deliberately re-enqueues the same head: its
     // evidence attributes the removal to infrastructure, not to the head.
     if recovery.is_none()
-        && let Some(skip) = same_head_enqueue_refusal(context, &pr)
+        && let Some(skip) = same_head_enqueue_refusal(context, &pr, ledger)
     {
         return match skip {
             Ok(outcome) => match guard.finish(&outcome) {
@@ -1162,6 +1162,7 @@ pub(super) const NEEDS_NEW_HEAD: &str = "needs_new_head";
 fn same_head_enqueue_refusal(
     context: &MutationApplyContext<'_>,
     pr: &ObservedPr,
+    ledger: &mut StewardLedger,
 ) -> Option<Result<String, String>> {
     let response = match super::native_arm::read_queue_state(
         context.actions,
@@ -1186,19 +1187,37 @@ fn same_head_enqueue_refusal(
         return None;
     }
     Some(match verdict {
-        crate::pr_queue_state::InternalEnqueueVerdict::RefuseEjectedSameHead { reason, .. } => {
+        crate::pr_queue_state::InternalEnqueueVerdict::RefuseEjectedSameHead { reason, at } => {
             // The one bounded retry of a head whose merge-group failure is
             // not its own fault: the same classifier the native-arm backstop
             // and `shipyard ship` consult, read live from this queue answer.
             // The approval gate was already read live for this head above.
-            let retry = same_head_retry_verdict(
+            let verdict = same_head_retry_verdict(
                 context.actions,
                 context.observation,
                 &report,
                 &context.ejection_guards,
-            )
-            .as_ref()
-            .map(super::blocked_on::SameHeadRetry::from_verdict);
+            );
+            let mut retry = verdict
+                .as_ref()
+                .map(super::blocked_on::SameHeadRetry::from_verdict);
+            // The flake class: the same failing test ejected another pull
+            // request's head too. One re-enqueue of this head, outside the
+            // classifier's retry. See `flake_requeue`.
+            if let (Some(verdict), Some(retry)) = (verdict.as_ref(), retry.as_mut())
+                && let Some(flake) =
+                    flake_requeue_verdict(context, pr, ledger, at.as_deref(), verdict)
+            {
+                match flake {
+                    super::flake_requeue::Verdict::Requeue(detail) => {
+                        retry.allowed = true;
+                        retry.detail = detail;
+                    }
+                    super::flake_requeue::Verdict::Keep(detail) => {
+                        retry.detail = format!("{}; {detail}", retry.detail);
+                    }
+                }
+            }
             if let Some(ejection) = context
                 .approval_blockers
                 .borrow_mut()
@@ -1223,6 +1242,37 @@ fn same_head_enqueue_refusal(
             .refusal(pr.fact.number, &pr.fact.head_sha)
             .unwrap_or_else(|| "merge-queue state refused enqueue".to_owned())),
     })
+}
+
+/// The flake class's reading of one refused same-head ejection
+/// ([`super::flake_requeue::consider`]), with this pass's defect-fix and
+/// base-poison readings.
+fn flake_requeue_verdict(
+    context: &MutationApplyContext<'_>,
+    pr: &ObservedPr,
+    ledger: &mut StewardLedger,
+    at: Option<&str>,
+    verdict: &crate::environment_requeue::EnvironmentRequeue,
+) -> Option<super::flake_requeue::Verdict> {
+    let base_red = context
+        .base_poison
+        .map(super::base_poison::RepoPoison::confirmed_contexts)
+        .unwrap_or_default();
+    super::flake_requeue::consider(
+        &super::flake_requeue::Ejection {
+            policy: &context.ejection_guards.flake_requeue,
+            repo: &context.observation.repo,
+            pr: pr.fact.number,
+            head: &pr.fact.head_sha,
+            at,
+            verdict,
+            defect_fix_removed: defect_fix_block(context, pr).is_some(),
+            base_red: &base_red,
+        },
+        ledger,
+        Some(context.ledger_path),
+        chrono::Utc::now(),
+    )
 }
 
 /// The classifier's verdict on one same-head `failed_checks` ejection

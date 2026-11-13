@@ -593,6 +593,59 @@ steward does not own), `shipyard auto-merge`, `shipyard ship` and the `ghapp`
 arm guard keep their earlier same-head rules, including re-arming after
 `invalid_merge_commit`.
 
+### Flakes: one test ejecting several pull requests
+
+A flaky test that fails one merge group in several ejects a different,
+innocent pull request each time. Under the retry discipline none of them earns
+the one free same-head retry (no infrastructure signature, and the test is not
+yet in `known_flaky_tests`), so each approved head waits at
+`ejected_same_head:failed_checks:needs_new_head` for a push that changes
+nothing. On 2026-11-13 one flaky CoreMIDI test did this to three approved Pulp
+pull requests.
+
+```toml
+[auto_merge]
+flake_requeue = "shadow"    # off | shadow | apply
+flake_window_hours = 24     # 1..=168
+```
+
+Without `flake_requeue` a merge-queue base runs `shadow`, or `apply` when its
+dwell acts already apply (`[auto_merge.dwell] act = "apply"`).
+
+- **Signature.** No new log reads. When the steward meets an ejected head it
+  already runs the same-head retry classifier, which reads each failing
+  required check of the ejecting merge group and each failing step's ctest
+  `The following tests FAILED:` block. The signature is that reading: each
+  failing required check with the tests it named
+  (`macos: CoreMIDI virtual port delivers SysEx`). A failure that names no
+  test (a compile error, a crashed step), or that the classifier attributed to
+  the head, has no signature and is never a flake.
+- **Classification.** An ejection is `flake:<signature>` when another pull
+  request's head was ejected with the same signature by a different merge group
+  within the window. One group ejecting several of its own members is one
+  failure, not two; a single ejection is never a flake.
+- **Re-enqueue.** Under `apply`, each flake-ejected head is re-enqueued once,
+  unchanged. By then the enqueue path has re-read the exact-head approval and
+  the head's required checks live. Never when a `defect-fix` removal names the
+  head, never when the base is confirmed red on a signature check (that is
+  base poison, not a flake), and never twice for the same head: the receipt
+  (`repo#pr@head`) is saved to the steward ledger before the enqueue. This is
+  separate from the classifier's one free retry, but the head-approval ejection
+  cap (two removals) still applies, so a head ejected again after its flake
+  re-enqueue is left for repair. Under `shadow` the row keeps its refusal and
+  `blocked_detail` says it would re-enqueue.
+- **Root cause.** The repository report's `flake_requeue` section lists this
+  pass's `decisions` (`requeued`, `would_requeue`, `already_requeued`,
+  `defect_fix_removed`, `base_red`, `unrecorded`) and one `flake_root_cause`
+  record per signature: `signature`, `checks`, `tests`, `prs`,
+  `first_ejection`, `last_ejection`, `issue`, `issue_action`, `issue_error`.
+  Under `apply` the steward files one issue per signature, found again by a
+  `<!-- shipyard-flake-signature: ... -->` marker. A pull request that joins
+  the signature later adds a comment to that issue instead of opening a
+  second one. A failed or refused issue write is reported (`issue_action =
+  "failed"`, then `"retry_later"` for six hours) and never routed around; the
+  `flake_root_cause` record is the coordinator's copy either way.
+
 ## When the base itself is red: land the fix first
 
 When a required check is broken on the base, every merge group formed on top
