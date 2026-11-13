@@ -41,6 +41,14 @@ pub(super) fn mutate_pr_with_recovery(
     ) {
         return (None, None);
     }
+    // A head removed from the queue for a defect is not put back until it
+    // changes. Checked on the census head before any read, and again on the
+    // live head below. See `defect_fix_removals`.
+    if matches!(decision, StewardDecision::ArmMergeQueue)
+        && let Some(token) = defect_fix_block(context, pr)
+    {
+        return (Some(token), None);
+    }
     // Cheap, fail-open-to-the-full-path pre-filter: an arm candidate whose
     // census head has no exact-head approval is refused here, before the
     // merge-queue snapshot and the full PR/check re-read. Only a definitive
@@ -87,6 +95,11 @@ pub(super) fn mutate_pr_with_recovery(
         return (Some("skipped_after_live_revalidation".to_owned()), None);
     }
     let pr = &live_pr;
+    if matches!(decision, StewardDecision::ArmMergeQueue)
+        && let Some(refused) = defect_fix_refusal_live(context, pr)
+    {
+        return refused;
+    }
     // A HOLD on another open pull request must not reach the base through
     // this one: refuse a head that carries its unapproved commits.
     if matches!(decision, StewardDecision::ArmMergeQueue)
@@ -119,6 +132,45 @@ pub(super) fn mutate_pr_with_recovery(
         }
         _ => (None, None),
     }
+}
+
+/// The live-head check: a `defect-fix` removal of this head, or, while the
+/// removal ledger's read error is fresh, a head that left the queue after
+/// the last good read (one queue-state read).
+fn defect_fix_refusal_live(
+    context: &MutationApplyContext<'_>,
+    pr: &ObservedPr,
+) -> Option<(Option<String>, Option<String>)> {
+    if let Some(token) = defect_fix_block(context, pr) {
+        return Some((Some(token), None));
+    }
+    let reading = context.defect_fix.filter(|reading| reading.fresh_error)?;
+    match super::native_arm::read_queue_state(
+        context.actions,
+        &context.observation.repo,
+        pr.fact.number,
+    ) {
+        Ok(queue)
+            if super::defect_fix_removals::unjudgeable(reading, &queue, &pr.fact.head_sha) =>
+        {
+            Some((Some("defect_fix_ledger_unjudged".to_owned()), None))
+        }
+        Ok(_) => None,
+        Err(error) => Some((
+            Some("defect_fix_ledger_unjudged".to_owned()),
+            Some(format!(
+                "queue state unreadable while the removal ledger is unread: {error}"
+            )),
+        )),
+    }
+}
+
+/// The `defect_fix_removed:<reason>` token when this pass's removal ledger
+/// holds a `defect-fix` removal of `pr`'s exact head.
+fn defect_fix_block(context: &MutationApplyContext<'_>, pr: &ObservedPr) -> Option<String> {
+    let reading = context.defect_fix?;
+    let removal = reading.blocking(&context.observation.repo, pr.fact.number, &pr.fact.head_sha)?;
+    Some(super::defect_fix_removals::refusal(removal).0)
 }
 
 /// Read the exact-head approval gate for `pr`'s census head: reviewer policy,

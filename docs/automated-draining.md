@@ -419,6 +419,8 @@ close anything. See [superseded-close.md](superseded-close.md).
 | `deferred_pass_budget` | The pass spent its time budget (or hit the API rate limit) before this row and did nothing for it; the next pass takes it first. See "Things that bite" | next pass |
 | `admission_pending` | Admission returned an outcome with no token of its own; see `blocked_detail` | next pass |
 | `queued` | In the merge queue | queue |
+| `merge_group_stalled:<contexts>` | In the merge queue, but its merge group can never finish: every workflow run on the group head completed and a required context (from the app its rule names) never reported. Reported at once when the run that produces the context failed (`blocked_detail` starts `doomed:` and names the run), otherwise after 30 minutes. See [Merge groups that can never finish](#merge-groups-that-can-never-finish) | steward under `dequeue_doomed_groups = "on"`, else operator |
+| `defect_fix_removed:<reason>` | This exact head was removed from the merge queue for a defect (a `defect-fix` line in the queue-removals ledger, written by the ghapp queue-removal guard or by the steward's own `dequeue_doomed_groups`), so the steward does not enqueue or arm it again; `blocked_detail` names when, from which host, and the note. `defect_fix_removed:unjudged` means the ledger could not be read and this head left the queue after its last good read. A new head is admitted as usual | repair lane: fix the defect and push a new head |
 | `admitted` | Enqueued or merged this pass (outranks any label) | nobody |
 | `ready` | Approved and green; a dry run would admit it | steward |
 | `draft`, `unmanaged`, `handoff_missing`, `invalid_head`, `direct_merge_refused`, `required_policy_unknown` | The steward does not own or cannot admit it yet | author or config |
@@ -686,6 +688,52 @@ they did:
 rule and scores each pick against the pull request that repaired the base.
 The steward's shadow ledger records the same thing live under the `tip_red`
 rule (`fix_picks`, `fixed_by`, and the `fix_first` score in the pass report).
+
+## Merge groups that can never finish
+
+A merge group waits until every required context reports on its head. When
+the workflow that should post one fails before posting it, nothing ever will:
+the entry sits `AWAITING_CHECKS` until the ruleset's check timeout (six hours
+on some bases) and blocks every entry behind it.
+
+Each pass, for every queue entry whose group head has no workflow run still
+active, the steward reads the group's runs, check runs and statuses (three
+reads per such entry; none for an entry whose group is still building). When
+every run completed and a required context is still absent, the row reads
+`merge_group_stalled:<context>` and the repository report has a
+`merge-group-stalled` line (drain watch files it as `merge_group_stalled`).
+It is `doomed` when a completed run that produces the context failed: its
+workflow name or file name is the context, or
+`[base_health.control_workflows]` names its file for it. Without a failed
+producer the row is reported once the last run has been done 30 minutes. A
+run still going, or any read that failed or came back partial, decides
+nothing.
+
+```toml
+[merge_queue]
+dequeue_doomed_groups = "dry-run"   # off | dry-run (default) | on
+```
+
+Under `on` a doomed entry, and only a doomed one, is removed from the queue
+through the steward's guarded dequeue (audit `defect-fix`; it never counts
+toward the head's ejection cap), after a fresh read shows the same pull
+request head and the same group head still queued. One comment on the pull
+request names the context, the failed run and its conclusion. It happens once
+per pull request and group head; a failed dequeue is retried next pass, and
+a comment that failed is retried until posted. The pull request is never
+closed. `dry-run` reports `would_dequeue_doomed_group:<context>:<group>`.
+
+A head removed for a defect stays out. The ghapp queue-removal guard records
+every removal it allows in `$XDG_STATE_HOME/shipyard/queue-removals.jsonl`
+(default `~/.local/state/shipyard/`), and the steward's own doomed-group
+dequeue appends there too. Each pass reads it once; a `defect-fix` removal of
+head X of a pull request refuses the steward's enqueue, exact-head merge and
+native-arm backstop for X until the head changes
+(`defect_fix_removed:<reason>`, repair lane next). A missing file is no
+record. A file that cannot be read never stalls the queue: the last good read
+(kept in the steward ledger) is still honoured, and for 30 minutes after it
+only a head that left the queue since that read is held
+(`defect_fix_removed:unjudged`); after that the error is only logged.
 
 ## Red everywhere: one cause on the base
 
