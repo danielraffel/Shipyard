@@ -119,6 +119,7 @@ func ownTeam() -> String {
           let code else { fail("cannot inspect the launcher's own signature", code: 77) }
     let flags = SecCSFlags(rawValue: kSecCSStrictValidate | kSecCSCheckAllArchitectures)
     let ownRequirement = "identifier \"\(bundleIdentifier)\" and anchor apple generic"
+        + " and certificate 1[field.1.2.840.113635.100.6.2.6] exists"
         + " and certificate leaf[field.1.2.840.113635.100.6.1.13] exists"
     var requirement: SecRequirement?
     guard SecRequirementCreateWithString(ownRequirement as CFString, SecCSFlags(), &requirement) == errSecSuccess,

@@ -157,7 +157,8 @@ def notarize(app: Path, package_release) -> None:
         capture_output=True, text=True, check=False,
     )
     detail = (assessment.stdout + assessment.stderr).strip()
-    if assessment.returncode != 0 or "Notarized Developer ID" not in detail:
+    lines = [line.strip() for line in detail.splitlines()]
+    if assessment.returncode != 0 or "source=Notarized Developer ID" not in lines:
         raise SystemExit(f"spctl did not accept the stapled launcher:\n{detail}")
     say(detail)
 

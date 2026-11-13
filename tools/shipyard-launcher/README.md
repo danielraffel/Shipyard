@@ -84,31 +84,25 @@ Pass-through:
 Launcher exit codes: 64 usage, 70 internal error, 77 refused, 126 spawn
 failed, 127 target missing.
 
-## Which jobs use it
+## Which jobs will use it
 
-Routing starts only after the host is *activated* (below). Until then nothing
-changes.
+This change adds the bundle, its build, the check and the activation record.
+No entry point uses it yet. A follow-up change routes these, each only while
+the activation record exists, logging `launcher=app` or `launcher=direct
+reason=...` and falling back to the direct call:
 
-| Entry point | How it routes | Log |
-| --- | --- | --- |
-| Any LaunchAgent whose program is the Shipyard release (today `com.danielraffel.shipyard.fleet-reconcile`) | At startup Shipyard checks that it is a launchd job's own program (parent pid 1 and `XPC_SERVICE_NAME` set), not already under the launcher, and running the same file the launcher would run. It then `exec`s the launcher with the same arguments. `exec` keeps the job's pid, and the job's identity becomes the bundle (`src/launcher_app.rs`). | `shipyard-launcher.log`: `job=<label> launcher=app` or `launcher=direct reason=...` |
-| The daemon agent (`com.danielraffel.shipyard.daemon.<id>`) | On `shipyard daemon refresh`, the agent plist names the bundle as its program with the same arguments; the bundle runs the current release's `daemon supervise` (`daemon_launcher::daemon_program_arguments`). Hosts without `shipyard daemon launcher install` keep spawning the daemon directly. | `shipyard-launcher.log`: `daemon=<label> launcher=app` or `launcher=direct reason=...` |
-| The steward tick (`com.danielraffel.shipyard.steward-tick`, program `/bin/bash`) | The installed tick `exec`s `shipyard-launcher --launcher-script steward-tick`, which runs the same file again as its child. | `summary.log`: `launcher=app` or `launcher=direct` on every repo line |
+| Entry point | Planned routing |
+| --- | --- |
+| A LaunchAgent whose program is the Shipyard release (today `com.danielraffel.shipyard.fleet-reconcile`) | At startup Shipyard, as a launchd job's own program, `exec`s the launcher with the same arguments. `exec` keeps the job's pid, so the job's identity becomes the bundle. |
+| The daemon agent (`com.danielraffel.shipyard.daemon.<id>`) | The agent plist names the bundle as its program, with the same arguments. |
+| The steward tick (program `/bin/bash`) | The installed tick `exec`s `shipyard-launcher --launcher-script steward-tick`. |
+| fleet-deploy | Installs a bundle staged at `~/.local/share/shipyard/launcher/staged/ShipyardLauncher.app` only when `shipyard-launcher-check --verify-bundle` accepts it. It never activates it. |
 
-If the launcher is activated but missing, or `--launcher-verify` refuses, each
-entry point logs why and runs directly, as before. `SHIPYARD_LAUNCHER_ROUTING=off`
-(Shipyard) and `SHIPYARD_STEWARD_LAUNCHER=off` (tick) turn routing off.
-
-Not covered here, and still their own identities:
-
-- `com.danielraffel.fleet-pass.*` (`fleet-pass.sh`, installed from
-  fleet-handbook) runs agents with `--add-dir /Volumes/Workshop/Code`. It can
-  use the same preamble as the steward tick once a `fleet-pass` entry is added
-  to the launcher's script allowlist.
-- Processes the tick starts detached with `setsid` (fleet-deploy, drain watch,
-  loss report) outlive it. Once their responsible process exits, macOS
-  attributes them to themselves (`/bin/bash`, `/usr/bin/python3`).
-- tartci's own agents (queue tick, watchdog) belong to TartCILauncher.app.
+Still their own identities after that: the `com.danielraffel.fleet-pass.*`
+agents (installed from fleet-handbook; they need a `fleet-pass` allowlist
+entry), processes the tick detaches with `setsid` (once their responsible
+process exits, macOS attributes them to themselves), and tartci's agents
+(TartCILauncher.app).
 
 ## Build, sign and notarize (maintainer's Mac)
 
@@ -135,21 +129,19 @@ as the bundle identifier and team stay the same.
 
 ## Install on a host
 
-Stage the signed bundle, and the next fleet-deploy run (the steward tick starts
-it at most every 10 minutes) installs it:
+Until fleet-deploy installs it (follow-up), install a verified bundle by hand:
 
 ```bash
 mkdir -p ~/.local/share/shipyard/launcher/staged
 ditto -x -k ShipyardLauncher-macos-arm64.zip ~/.local/share/shipyard/launcher/staged/
+tools/shipyard-launcher/shipyard-launcher-check \
+  --verify-bundle ~/.local/share/shipyard/launcher/staged/ShipyardLauncher.app \
+  && ditto ~/.local/share/shipyard/launcher/staged/ShipyardLauncher.app ~/.local/libexec/ShipyardLauncher.app
 ```
 
-fleet-deploy installs it to `~/.local/libexec/ShipyardLauncher.app` only when
-`shipyard-launcher-check --verify-bundle` accepts it (Developer ID, the
-installed Shipyard's team, the bundle identifier, notarized), copies it with
-`ditto`, verifies the copy, and keeps the previous bundle as
-`ShipyardLauncher.app.bak-<stamp>`. Otherwise it logs `unit=launcher absent`
-or `unit=launcher refused reason=...` once and changes nothing. Installing never
-activates it.
+`--verify-bundle` requires a Developer ID signature with the launcher's bundle
+identifier, by the installed Shipyard's team, and `spctl` reporting
+`source=Notarized Developer ID`.
 
 The path sits beside `TartCILauncher.app` and the daemon's stable launcher
 copy: on the internal disk, owned by the user (no sudo), and outside
@@ -186,10 +178,10 @@ touches `/Volumes`. Run it in the logged-in GUI session; over plain SSH
 LaunchServices may refuse, and the check reports `unknown`.
 
 `--activate` writes `~/.local/share/shipyard/launcher/activation.json` only when
-every check passes. Routing reads only that record, so a launcher without a
-grant can never raise a new unattended prompt. `--deactivate` removes it and
-every job runs directly again on its next start (the daemon on its next
-`shipyard daemon refresh`).
+every check passes, and only when the access answer came from a launcher whose
+parent is launchd (anything else is reported as `unknown`). Routing will read
+only that record, so a launcher without a grant can never raise a new
+unattended prompt. `--deactivate` removes it.
 
 ## Tests
 
@@ -197,9 +189,6 @@ every job runs directly again on its next start (the daemon on its next
 python3 -m unittest tools/shipyard-launcher/test_launcher.py        # compiles main.swift; macOS only
 python3 -m unittest tools/shipyard-launcher/test_launcher_check.py
 python3 -m unittest tools/shipyard-launcher/test_build_launcher.py
-python3 -m unittest tools/steward-tick/test_steward_tick.py
-python3 -m unittest tools/fleet-deploy/test_fleet_deploy.py
-cargo test --lib launcher
 ```
 
 `test_launcher.py` builds `main.swift` twice. The test build
@@ -214,9 +203,8 @@ Only a real signed build on a real host can show:
 - that a Developer ID release of the same team is accepted under the real
   requirement, and that `build_launcher.py --sign --notarize` produces a bundle
   `spctl` accepts as `Notarized Developer ID`;
-- that macOS attributes a job routed by `exec` into the bundle, and the
-  bundle's children, to `com.danielraffel.shipyard.launcher` (check with
-  `/usr/bin/log show --info --predicate 'process == "tccd"'` around a routed
-  job's first `/Volumes` access, or with `responsibility_get_pid_responsible_for_pid`);
+- that macOS attributes a launchd job run through the bundle, and the
+  bundle's children, to `com.danielraffel.shipyard.launcher` (the PR checklist
+  has the exact steps);
 - that the Full Disk Access grant survives a launcher rebuild and a Shipyard
   release, which is the point of the bundle.

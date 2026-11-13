@@ -29,6 +29,7 @@ import datetime
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import tempfile
@@ -46,8 +47,26 @@ OPEN = os.environ.get("SHIPYARD_LAUNCHER_CHECK_OPEN", "/usr/bin/open")
 ACCESS_WAIT_SECS = float(os.environ.get("SHIPYARD_LAUNCHER_CHECK_WAIT_SECS", "20"))
 
 
+TOOL_TIMEOUT_SECS = float(os.environ.get("SHIPYARD_LAUNCHER_CHECK_TOOL_TIMEOUT_SECS", "60"))
+
+
 def tool(args: list[str]) -> subprocess.CompletedProcess:
-    return subprocess.run(args, capture_output=True, text=True, check=False, stdin=subprocess.DEVNULL)
+    """Run a tool; a hang or a missing tool is a failed result, never a pass."""
+    try:
+        return subprocess.run(
+            args, capture_output=True, text=True, check=False,
+            stdin=subprocess.DEVNULL, timeout=TOOL_TIMEOUT_SECS,
+        )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(args, 124, "", f"{args[0]} timed out after {TOOL_TIMEOUT_SECS:.0f}s")
+    except OSError as error:
+        return subprocess.CompletedProcess(args, 127, "", f"cannot run {args[0]}: {error}")
+
+
+def notarized(assessment: subprocess.CompletedProcess) -> bool:
+    """spctl accepted it and named the source exactly."""
+    lines = [line.strip() for line in (assessment.stdout + assessment.stderr).splitlines()]
+    return assessment.returncode == 0 and "source=Notarized Developer ID" in lines
 
 
 def team_of(path: pathlib.Path) -> str | None:
@@ -73,14 +92,14 @@ def verify_bundle(app: pathlib.Path) -> tuple[bool, str]:
     if not app.is_dir() or app.is_symlink():
         return False, f"{app} is not a bundle directory"
     team = team_of(SHIPYARD.resolve()) if SHIPYARD.exists() else None
-    if not team:
+    if not team or not re.fullmatch(r"[A-Z0-9]{10}", team):
         return False, f"cannot read the Team ID of {SHIPYARD}; refusing to trust any launcher"
     result = tool([CODESIGN, "--verify", "--strict", "--deep", f"-R={requirement(team)}", str(app)])
     if result.returncode != 0:
         return False, f"signature does not satisfy the {team} Developer ID launcher requirement: {(result.stderr or result.stdout).strip()}"
     assessment = tool([SPCTL, "--assess", "--type", "execute", "-vv", str(app)])
     detail = (assessment.stdout + assessment.stderr).strip()
-    if assessment.returncode != 0 or "Notarized Developer ID" not in detail:
+    if not notarized(assessment):
         return False, f"not notarized: {detail}"
     return True, f"Developer ID {team}, notarized"
 
@@ -93,7 +112,9 @@ def launcher_verify() -> tuple[bool, str]:
         report = json.loads(result.stdout)
     except ValueError:
         return False, f"unreadable --launcher-verify output: {result.stdout!r}"
-    return True, report.get("target", "")
+    if not isinstance(report, dict) or report.get("ok") is not True or not report.get("target"):
+        return False, f"--launcher-verify did not report ok: {result.stdout!r}"
+    return True, report["target"]
 
 
 def full_disk_access() -> tuple[str, str]:
@@ -113,9 +134,13 @@ def full_disk_access() -> tuple[str, str]:
                 time.sleep(0.2)
         else:
             return "unknown", f"the launcher did not report within {ACCESS_WAIT_SECS:.0f}s"
-    state = report.get("full_disk_access")
+    state = report.get("full_disk_access") if isinstance(report, dict) else None
     if state not in ("granted", "denied", "unknown"):
         return "unknown", f"unexpected report {report}"
+    # Only a launcher that LaunchServices started (parent launchd) is its own
+    # responsible process; any other parent makes the answer someone else's.
+    if report.get("ppid") != 1:
+        return "unknown", f"the launcher's parent was pid {report.get('ppid')}, not launchd; the answer is not the launcher's own"
     return state, f"errno={report.get('errno')}"
 
 
@@ -147,8 +172,8 @@ def check() -> dict:
 def next_step(report: dict) -> str:
     checks = report["checks"]
     if not checks["bundle"]["ok"]:
-        return ("Install a signed, notarized ShipyardLauncher.app: stage it at "
-                "~/.local/share/shipyard/launcher/staged/ShipyardLauncher.app and let fleet-deploy install it.")
+        return ("Install a signed, notarized ShipyardLauncher.app at ~/.local/libexec/ShipyardLauncher.app "
+                "(tools/shipyard-launcher/README.md, Install on a host).")
     if not checks.get("release", {}).get("ok"):
         return "The launcher refused the current release; see the detail above."
     access = checks.get("full_disk_access", {})

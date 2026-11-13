@@ -22,6 +22,7 @@ esac
 exit 2
 """
 FAKE_SPCTL = """#!/bin/bash
+if [ -f "$FAKE_TOOLS/spctl-mentions" ]; then echo "accepted"; echo "source=Developer ID (not Notarized Developer ID)"; exit 0; fi
 if [ -f "$FAKE_TOOLS/unnotarized" ]; then echo "rejected"; echo "source=Unnotarized Developer ID"; exit 3; fi
 echo "accepted"; echo "source=Notarized Developer ID"
 """
@@ -30,11 +31,12 @@ FAKE_OPEN = """#!/bin/bash
 [ -f "$FAKE_TOOLS/open-fails" ] && { echo "LSOpenURLsWithRole() failed with error -10810" >&2; exit 1; }
 echo "$*" > "$FAKE_TOOLS/open-args"
 result="${@: -1}"
-printf '{"schema":1,"full_disk_access":"%s","errno":%s}\\n' "${FAKE_FDA:-denied}" "${FAKE_ERRNO:-1}" > "$result"
+printf '{"schema":1,"full_disk_access":"%s","errno":%s,"ppid":%s}\\n' "${FAKE_FDA:-denied}" "${FAKE_ERRNO:-1}" "${FAKE_PPID:-1}" > "$result"
 """
 FAKE_LAUNCHER = """#!/bin/bash
 [ "$1" = --launcher-verify ] || exit 64
 [ -f "$FAKE_TOOLS/launcher-refuses" ] && { echo "shipyard-launcher: not a Developer ID signed Shipyard" >&2; exit 77; }
+[ -f "$FAKE_TOOLS/launcher-says-not-ok" ] && { echo '{"ok":false}'; exit 0; }
 echo '{"ok":true,"target":"/h/.local/share/shipyard/auth-generations/x/shipyard"}'
 """
 
@@ -83,7 +85,7 @@ class LauncherCheckTests(unittest.TestCase):
         result = self.check()
         self.assertEqual(result.returncode, 1)
         self.assertIn("FAIL bundle", result.stdout)
-        self.assertIn("staged/ShipyardLauncher.app", result.stdout)
+        self.assertIn("Install on a host", result.stdout)
 
     def test_requirement_pins_developer_id_identifier_and_the_shipyard_team(self):
         self.install()
@@ -104,6 +106,30 @@ class LauncherCheckTests(unittest.TestCase):
         result = self.check("--verify-bundle", str(self.app))
         self.assertEqual(result.returncode, 1)
         self.assertIn("not notarized", result.stdout)
+
+    def test_ambiguous_answers_are_never_a_pass(self):
+        self.install()
+        # A notarization source that only mentions the phrase is not one.
+        self.flag("spctl-mentions")
+        self.assertEqual(self.check("--verify-bundle", str(self.app)).returncode, 1)
+        (self.tools / "spctl-mentions").unlink()
+        # Exit 0 without ok:true from --launcher-verify is a refusal.
+        self.flag("launcher-says-not-ok")
+        self.assertIn("did not report ok", self.check().stdout)
+        (self.tools / "launcher-says-not-ok").unlink()
+        # A granted answer from a launcher not started by launchd is not the launcher's own.
+        result = self.check("--activate", FAKE_FDA="granted", FAKE_ERRNO="0", FAKE_PPID="4242")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("not launchd", result.stdout)
+        self.assertFalse(self.record.exists())
+        # A malformed team is refused.
+        self.assertEqual(self.check("--verify-bundle", str(self.app), FAKE_TEAM="not set").returncode, 1)
+
+    def test_a_hung_tool_fails(self):
+        self.install()
+        (self.tools / "codesign").write_text("#!/bin/bash\nsleep 30\n")
+        result = self.check("--verify-bundle", str(self.app), SHIPYARD_LAUNCHER_CHECK_TOOL_TIMEOUT_SECS="1")
+        self.assertEqual(result.returncode, 1)
 
     def test_refused_release_is_not_ready(self):
         self.install()

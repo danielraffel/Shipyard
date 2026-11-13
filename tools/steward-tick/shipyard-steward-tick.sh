@@ -8,30 +8,6 @@ export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/us
 case "$(command -v gh)" in "$HOME/.local/bin/gh") ;; *) echo "refusing: gh is not the ghapp wrapper" >&2; exit 2;; esac
 log_dir="$HOME/Library/Logs/shipyard-steward-tick"
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
-# Run the tick under ShipyardLauncher.app once this host activated it
-# (tools/shipyard-launcher/README.md). launchd starts this script with
-# /bin/bash, so every Shipyard it runs is attributed to bash for macOS privacy
-# consent. exec keeps the job's pid and makes the launcher bundle that
-# identity; the launcher then runs this same installed file as its child, with
-# SHIPYARD_LAUNCHER_APP set so it does not route again. Only the installed copy
-# routes (the launcher runs nothing else), and only when the launcher accepts
-# the current release; otherwise the tick runs directly, as before. Each repo
-# line in summary.log says launcher=app or launcher=direct.
-# SHIPYARD_STEWARD_LAUNCHER=off turns it off.
-launcher_exe="$HOME/.local/libexec/ShipyardLauncher.app/Contents/MacOS/shipyard-launcher"
-launcher_record="$HOME/.local/share/shipyard/launcher/activation.json"
-tick_installed="$HOME/.local/libexec/shipyard-steward-tick.sh"
-launcher_path=direct
-if [ -n "${SHIPYARD_LAUNCHER_APP:-}" ]; then
-  launcher_path=app
-elif [ "${SHIPYARD_STEWARD_LAUNCHER:-on}" != off ] && [ -f "$launcher_record" ] && [ -x "$launcher_exe" ] \
-  && [ "$(cd "$(dirname "$0")" 2>/dev/null && pwd -P)/$(basename "$0")" \
-     = "$(cd "$(dirname "$tick_installed")" 2>/dev/null && pwd -P)/$(basename "$tick_installed")" ]; then
-  if launcher_err=$("$launcher_exe" --launcher-verify 2>&1 >/dev/null); then
-    exec "$launcher_exe" --launcher-script steward-tick "$@"
-  fi
-  echo "$stamp launcher=direct reason=verify_failed: $(printf '%s' "$launcher_err" | head -c 160 | tr '\n' ' ')" >> "$log_dir/summary.log"
-fi
 # Config-only sparse clones live on the internal disk: a launchd job that opens
 # a path on /Volumes blocks in the kernel waiting on an invisible privacy prompt.
 clones="$HOME/.local/share/shipyard-steward"
@@ -127,7 +103,7 @@ steward_one() {
     oldest=$(jq -r '[.repos[]?.blocked_summary?.oldest[]?|"#\(.number):\(.blocked_on):\(.age_minutes)m"]|join(",")' "$out" 2>/dev/null || true)
     # Base-level episodes: one required check failing the same test on 3+ open PRs.
     red_everywhere=$(jq -r '[.repos[]?.red_everywhere?.groups[]?]|length' "$out" 2>/dev/null || echo ERROR)
-    echo "$stamp $repo rc=$rc $counts took=${took}s ver=$steward_ver launcher=$launcher_path invariants=$invariants red_everywhere=$red_everywhere${oldest:+ oldest=$oldest}" >> "$log_dir/summary.log"
+    echo "$stamp $repo rc=$rc $counts took=${took}s ver=$steward_ver invariants=$invariants red_everywhere=$red_everywhere${oldest:+ oldest=$oldest}" >> "$log_dir/summary.log"
   elif grep -q "another steward apply pass is already running" "$out.err" 2>/dev/null; then
     echo "$stamp $repo skipped=lock_busy" >> "$log_dir/summary.log"
   else
