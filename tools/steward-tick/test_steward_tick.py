@@ -105,6 +105,29 @@ class StewardTickArchiveTests(unittest.TestCase):
             self.assertIn("./first.json", names)
             self.assertIn("./second.json", names)
 
+    def test_later_day_failure_keeps_earlier_day_files(self):
+        self.run_tick()
+        first = self.add_old_tick("first.json", days=6)
+        second = self.add_old_tick("second.json", days=5)
+        tar_state = self.home / "tar-calls"
+        (self.home / ".local" / "bin" / "tar").write_text(
+            "#!/bin/bash\n"
+            "if [ \"$1\" = \"-czf\" ]; then\n"
+            "  count=0\n"
+            "  [ -f \"$TAR_FAIL_STATE\" ] && count=$(cat \"$TAR_FAIL_STATE\")\n"
+            "  count=$((count + 1))\n"
+            "  printf '%s' \"$count\" >\"$TAR_FAIL_STATE\"\n"
+            "  [ \"$count\" -eq 2 ] && exit 1\n"
+            "fi\n"
+            "exec /usr/bin/tar \"$@\"\n"
+        )
+        (self.home / ".local" / "bin" / "tar").chmod(0o755)
+        result = self.run_tick(TAR_FAIL_STATE=str(tar_state))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(first.exists())
+        self.assertTrue(second.exists())
+        self.assertIn("day=", (self.log_dir / "archive.log").read_text())
+
     def test_old_archives_are_pruned(self):
         self.run_tick()
         archive_dir = self.log_dir / "archive"

@@ -93,7 +93,7 @@ done
 archive_old_tick_files() {
   local live_days="${SHIPYARD_STEWARD_LIVE_DAYS:-3}"
   local archive_days="${SHIPYARD_STEWARD_ARCHIVE_RETENTION_DAYS:-180}"
-  local today cutoff_day archive_dir candidates work file day list archive tmp stage listing base archive_failed=0
+  local today cutoff_day archive_dir candidates work file day list archive tmp stage listing base deletions archive_failed=0
   archive_dir="$log_dir/archive"
   candidates=$(mktemp "${TMPDIR:-/tmp}/shipyard-steward-tick-candidates.XXXXXX") || {
     echo "$stamp evidence archive failed: cannot create candidate list" >> "$log_dir/archive.log"
@@ -138,6 +138,7 @@ archive_old_tick_files() {
     return 0
   fi
   find "$archive_dir" -type f -name '.ticks-*.tar.gz.tmp.*' -delete 2>/dev/null || true
+  deletions="$work/deletions"
   for list in "$work"/*.list; do
     [ -f "$list" ] || continue
     day=${list##*/}
@@ -191,12 +192,16 @@ archive_old_tick_files() {
       echo "$stamp evidence archive failed day=$day: cannot install archive" >> "$log_dir/archive.log"
       continue
     fi
-    if [ "$archive_failed" -eq 0 ]; then
-      while IFS= read -r file; do
-        [ -n "$file" ] && rm -f "$file"
-      done < "$list"
-    fi
+    cat "$list" >> "$deletions"
   done
+  # Do not delete any live evidence until every archive in this pass has been
+  # installed and verified. A later-day failure must leave earlier-day sources
+  # available for the next retry alongside their installed archive.
+  if [ "$archive_failed" -eq 0 ] && [ -f "$deletions" ]; then
+    while IFS= read -r file; do
+      [ -n "$file" ] && rm -f "$file"
+    done < "$deletions"
+  fi
   find "$archive_dir" -type f -name 'ticks-*.tar.gz' -mtime +"$archive_days" -delete 2>/dev/null || true
   find "$work" -type f -delete 2>/dev/null || true
   find "$work" -depth -type d -empty -delete 2>/dev/null || true
