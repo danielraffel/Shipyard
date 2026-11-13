@@ -21,8 +21,9 @@ bindings are enforced by that same guard, including the stamped host and
 
 It runs from a workflow triggered by ``pull_request_target``,
 ``workflow_dispatch``, ``issue_comment`` and ``workflow_run`` (a review reaches it through a
-permission-less trigger workflow), all of which run the default branch's
-definition. It never checks out or runs the pull request's code, and it reads
+permission-less trigger workflow). Dispatch may select any ref and is
+refused unless it selects the default branch. It never checks out or runs the
+pull request's code, and it reads
 every comment and review from the API rather than trusting the event, so a
 comment from an untrusted account counts only as the guard's rules allow.
 
@@ -349,6 +350,13 @@ def main() -> int:
     # Fail closed: any read or post error is a failed job, never a pass.
     try:
         event = json.loads(pathlib.Path(event_path).read_text(encoding="utf-8"))
+        if event_name == "workflow_dispatch":
+            repository = event.get("repository")
+            default_branch = repository.get("default_branch") if isinstance(repository, dict) else None
+            if (not isinstance(default_branch, str) or not default_branch
+                    or os.environ.get("GITHUB_REF") != f"refs/heads/{default_branch}"):
+                print("review-verdict: dispatch must target the default branch", file=sys.stderr)
+                return 1
         return run(event_name, event, repo, run_url)
     except Exception as error:  # noqa: BLE001 - every failure must fail the job
         print(f"review-verdict: error: {error}", file=sys.stderr)

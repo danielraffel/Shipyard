@@ -54,7 +54,8 @@ const REVIEW_VERDICT_TEMPLATE: &str = r#"# Posts the `review-verdict` commit sta
 # the `review-verdict` check run and fails unless the head is allowed, so a
 # required check cannot be green on a refused head. The rule runs from a pinned
 # Shipyard commit, never from the pull request's code, on triggers that all run
-# the default branch's definition of this file. Rendered by
+# the default branch's definition except dispatch, which fails off the default
+# branch. Rendered by
 # `shipyard governance onboard`; see Shipyard's docs/review-verdict-status.md.
 name: Review verdict
 
@@ -94,6 +95,14 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
+      - name: Refuse dispatch outside the default branch
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] && { [ -z "$DEFAULT_BRANCH" ] || [ "$GITHUB_REF" != "refs/heads/$DEFAULT_BRANCH" ]; }; then
+            echo "review-verdict: dispatch must target the default branch" >&2
+            exit 1
+          fi
       - name: Check out the pinned rule
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

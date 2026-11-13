@@ -316,5 +316,6 @@ unreadable. The merge steward's `approval_admission_config` invariant counts
 the switch as list membership. It is distinct from
 `arm_requires_head_approval = true`, which selects the strict
 `reviewer_identities` rule. Shipyard's own `review-verdict.yml` also
-accepts `workflow_dispatch` with a `pull_request` input; a dispatched run posts
-the status on the head and re-runs the head's own check, like a comment's run.
+accepts `workflow_dispatch` with a `pull_request` input only on the default
+branch; a dispatched run posts the status on the head and re-runs the head's
+own check, like a comment's run.

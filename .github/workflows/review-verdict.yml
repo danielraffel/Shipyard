@@ -5,7 +5,8 @@
 # green on a refused head. The status itself is `pending` while a head only
 # awaits its reviewer and `failure` for a real refusal.
 #
-# Every trigger here runs the default branch's definition of this file:
+# Dispatch can select any ref; the job fails if it is not the default branch.
+# Other triggers run the default branch's definition of this file:
 # pull_request_target and issue_comment always do, and a review reaches it
 # through workflow_run of the permission-less "Review verdict trigger". The
 # job checks out the default branch and never the pull request's code.
@@ -54,6 +55,14 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
+      - name: Refuse dispatch outside the default branch
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] && { [ -z "$DEFAULT_BRANCH" ] || [ "$GITHUB_REF" != "refs/heads/$DEFAULT_BRANCH" ]; }; then
+            echo "review-verdict: dispatch must target the default branch" >&2
+            exit 1
+          fi
       - name: Check out the default branch's rule
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

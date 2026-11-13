@@ -154,16 +154,18 @@ class ReviewVerdictStatus(unittest.TestCase):
         return arm.comment_like(template, body=body, created_at=at, **change)
 
     def post(self, answers: list[tuple[str, dict[str, Any]]], event_name: str = "issue_comment",
-             event: dict[str, Any] | None = None) -> subprocess.CompletedProcess:
+             event: dict[str, Any] | None = None, ref: str = "refs/heads/main") -> subprocess.CompletedProcess:
         (self.root / "calls").unlink(missing_ok=True)
         fake = self.install(answers)
         payload = event if event is not None else {
             "issue": {"number": 784, "pull_request": {"url": "x"}}}
         event_path = self.root / "event.json"
+        payload.setdefault("repository", {"default_branch": "main"})
         event_path.write_text(json.dumps(payload), encoding="utf-8")
         environment = {"PATH": "/usr/bin:/bin", "GHAPP_REAL_GH": str(fake), "HOME": str(self.root),
                        "GITHUB_EVENT_NAME": event_name, "GITHUB_EVENT_PATH": str(event_path),
-                       "GITHUB_REPOSITORY": REPO, "GITHUB_RUN_ID": "99",
+                       "GITHUB_REPOSITORY": REPO, "GITHUB_RUN_ID": "99", "GITHUB_REF": ref,
+                       "TMPDIR": str(self.root),
                        # A host's own switches must not reach the status.
                        "SHIPYARD_REBASE_CARRY": "0", "SHIPYARD_REVIEW_BEFORE_ARM": "0",
                        # Nor its signers file, which would allow anyone here.
@@ -493,6 +495,24 @@ class ReviewVerdictStatus(unittest.TestCase):
         self.assertEqual(self.posted()["url"], f"repos/{REPO}/statuses/{HEAD}")
         self.assertIn("-X POST repos/danielraffel/Shipyard/actions/runs/555/rerun", self.calls())
 
+    def test_dispatch_on_other_or_missing_ref_fails_before_any_api_call(self) -> None:
+        for ref in ("refs/heads/feature", "", "refs/tags/main"):
+            for inputs in ({}, {"pull_request": "784"}):
+                with self.subTest(ref=ref, inputs=inputs):
+                    result = self.post(self.answers(self.refused_trail()), "workflow_dispatch",
+                                       {"inputs": inputs}, ref=ref)
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn("dispatch", result.stderr)
+                    self.assertFalse((self.root / "calls").exists())
+
+    def test_dispatch_with_unreadable_default_branch_fails_closed(self) -> None:
+        for repository in (None, {}, {"default_branch": ""}, {"default_branch": 1}):
+            with self.subTest(repository=repository):
+                result = self.post(self.answers(self.refused_trail()), "workflow_dispatch",
+                                   {"inputs": {"pull_request": "784"}, "repository": repository})
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertFalse((self.root / "calls").exists())
+
     def test_a_dispatch_names_a_pull_request_only_by_a_positive_decimal(self) -> None:
         import importlib.util
         spec = importlib.util.spec_from_file_location("review_verdict_status", STATUS)
@@ -606,6 +626,29 @@ class ReviewVerdictStatus(unittest.TestCase):
                                 check=False, stdin=subprocess.DEVNULL)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("error", result.stderr)
+
+    def test_each_workflow_dispatch_guard_fails_the_job_off_default(self) -> None:
+        root = STATUS.parent.parent
+        paths = (root / ".github/workflows/review-verdict.yml",
+                 root / "src/governance_onboard.rs",
+                 root / "docs/review-verdict-status.md")
+        for path in paths:
+            content = path.read_text(encoding="utf-8")
+            step = content.split("      - name: Refuse dispatch outside the default branch\n", 1)[1]
+            shell = step.split("        run: |\n", 1)[1].split("      - name:", 1)[0]
+            shell = "\n".join(line[10:] for line in shell.splitlines())
+            for event, ref, default, expected in (
+                ("workflow_dispatch", "refs/heads/topic", "main", 1),
+                ("workflow_dispatch", "", "main", 1),
+                ("workflow_dispatch", "refs/heads/main", "", 1),
+                ("workflow_dispatch", "refs/heads/main", "main", 0),
+                ("pull_request_target", "refs/heads/topic", "main", 0),
+            ):
+                with self.subTest(path=path, event=event, ref=ref, default=default):
+                    result = subprocess.run(["/bin/sh", "-c", shell], env={
+                        "GITHUB_EVENT_NAME": event, "GITHUB_REF": ref,
+                        "DEFAULT_BRANCH": default}, capture_output=True, text=True, check=False)
+                    self.assertEqual(result.returncode, expected, result.stderr)
 
     def test_the_workflow_can_re_run_and_still_runs_on_verdicts(self) -> None:
         root = STATUS.parent.parent / ".github" / "workflows"

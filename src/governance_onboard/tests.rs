@@ -185,7 +185,11 @@ fn the_rendered_workflow_runs_the_pinned_shipyard_commit() {
     assert!(rendered.contains(&format!(
         "          # Shipyard v{VERSION}\n          ref: {PIN}\n"
     )));
-    assert!(!rendered.contains("default_branch"), "{rendered}");
+    assert!(
+        !rendered.contains("ref: ${{ github.event.repository.default_branch }}"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}"));
     assert!(!rendered.contains("@COMMIT@") && !rendered.contains("@VERSION@"));
     assert!(rendered.contains("  workflow_dispatch:\n    inputs:\n      pull_request:\n"));
 }

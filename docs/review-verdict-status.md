@@ -100,7 +100,8 @@ never passes by default). The commit status is posted exactly as before.
 Only the `pull_request_target` run leaves its check run on the pull request's
 head; a dispatched (`workflow_dispatch`, input `pull_request`), a comment's
 (`issue_comment`) or a review's (`workflow_run`) run leaves its check run on
-the default branch's tip, where it gates nothing. Those runs
+the default branch's tip when dispatched on the required default ref. Dispatch
+to any other ref fails the job. Those runs
 post the status and then re-run the head's newest `pull_request_target` run
 (`actions: write`), so an APPROVE or a HOLD changes the head's check without a
 new push. A re-run that cannot be requested fails the job.
@@ -112,9 +113,10 @@ fails the job instead of standing in for the whole one.
 
 ## Trust
 
-Every trigger runs the default branch's definition of the poster:
+Dispatch selects its workflow definition from the requested ref. The job fails
+when dispatch targets anything other than the default branch, before posting.
 
-- `pull_request_target`, `workflow_dispatch` and `issue_comment` always do;
+- `pull_request_target` and `issue_comment` use the default branch's definition;
 - a review is different: `pull_request_review` runs the pull request's own
   copy of the workflow file, so a same-repository pull request could rewrite
   a job that holds `statuses: write`. Reviews therefore start
@@ -269,6 +271,14 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
+      - name: Refuse dispatch outside the default branch
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] && { [ -z "$DEFAULT_BRANCH" ] || [ "$GITHUB_REF" != "refs/heads/$DEFAULT_BRANCH" ]; }; then
+            echo "review-verdict: dispatch must target the default branch" >&2
+            exit 1
+          fi
       - name: Check out the pinned rule
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
