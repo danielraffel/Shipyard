@@ -266,6 +266,10 @@ struct StewardLedger {
     /// `poison_pause`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     poison_paused: BTreeMap<String, Vec<poison_pause::PausedEntry>>,
+    /// Heads the red base ejected, keyed `repo@base`; excused from the
+    /// ejection cap once the base is green. See `red_base_ejections`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    red_base_ejections: BTreeMap<String, Vec<red_base_ejections::Entry>>,
     /// Infra re-runs per check on an exact head, keyed
     /// `repo#pr@head:check`. See `infra_rerun`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -2088,6 +2092,7 @@ mod carried_commits;
 mod code_owner_wait;
 pub(super) mod dwell_pass;
 mod exact_head_merge;
+mod fix_reorder;
 mod generated_paths;
 mod head_rollup;
 pub(super) mod infra_rerun;
@@ -2097,12 +2102,14 @@ mod mutation_outcome;
 mod native_arm;
 mod next_action;
 mod observation;
+mod orphan_groups;
 mod pass_budget;
 mod poison_pause;
 mod pr_mutations;
 pub(super) mod queue_drain;
 mod queue_priority_recovery;
 pub(super) mod read_probe;
+mod red_base_ejections;
 mod red_everywhere;
 mod render;
 mod resume_record;

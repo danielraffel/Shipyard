@@ -265,6 +265,25 @@ pub(super) fn observe(
 }
 
 impl Pass {
+    /// Each check with a base-level episode this pass, and when that
+    /// episode was first seen: a signal, beside the base tip, that the base
+    /// is the cause ([`super::base_poison::RepoPoison::confirmed_contexts`]).
+    pub(super) fn checks_first_seen(&self) -> BTreeMap<String, chrono::DateTime<chrono::Utc>> {
+        let mut out: BTreeMap<String, chrono::DateTime<chrono::Utc>> = BTreeMap::new();
+        for group in &self.status.groups {
+            let Some(at) = chrono::DateTime::parse_from_rfc3339(&group.first_seen)
+                .ok()
+                .map(|at| at.with_timezone(&chrono::Utc))
+            else {
+                continue;
+            };
+            out.entry(group.check.clone())
+                .and_modify(|first| *first = (*first).min(at))
+                .or_insert(at);
+        }
+        out
+    }
+
     /// Mark each member's row and return the report section.
     pub(super) fn annotate(mut self, reports: &mut [PrReport]) -> RepoStatus {
         for report in reports.iter_mut() {

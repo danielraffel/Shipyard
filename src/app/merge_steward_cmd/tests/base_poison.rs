@@ -70,6 +70,7 @@ fn poisoned(hold: PoisonHold, auto_jump: AutoJump, fixes: &[u64]) -> RepoPoison 
 fn streak_only(hold: PoisonHold, auto_jump: AutoJump, fixes: &[u64]) -> RepoPoison {
     RepoPoison {
         policy: BasePoisonPolicy {
+            acts: crate::base_health::TriageActs::default(),
             hold,
             control_workflows: std::collections::BTreeMap::new(),
             pause: hold,
@@ -101,6 +102,7 @@ fn streak_only(hold: PoisonHold, auto_jump: AutoJump, fixes: &[u64]) -> RepoPois
             .collect(),
         fix_read_error: None,
         fix_ambiguity: None,
+        red_everywhere: std::collections::BTreeMap::new(),
         covering: std::collections::BTreeSet::new(),
         candidates: std::collections::BTreeSet::default(),
         tip: std::collections::BTreeMap::new(),

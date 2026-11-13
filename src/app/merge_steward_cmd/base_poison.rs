@@ -93,6 +93,10 @@ pub(super) struct RepoPoison {
     /// The base tip's own verdict for each poisoned context.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(super) tip: BTreeMap<String, TipReading>,
+    /// Checks with a red-everywhere episode this pass, and when each began:
+    /// the second signal [`Self::confirmed_contexts`] accepts.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(super) red_everywhere: BTreeMap<String, DateTime<Utc>>,
     /// Open heads that passed every confirmed context after the base went
     /// red (not drafts, none that rode a failing group): the only pull
     /// requests a confirmed episode admits, and the only fix it jumps.
@@ -104,14 +108,33 @@ pub(super) struct RepoPoison {
     pub(super) fix_ambiguity: Option<String>,
 }
 
+/// For each poisoned context the base is confirmed red on
+/// ([`fix_first::confirmed_since`]), when it went red.
+pub(super) fn confirmed_red_since(
+    health: &MergeGroupHealth,
+    tip: &BTreeMap<String, TipReading>,
+    red_everywhere: &BTreeMap<String, DateTime<Utc>>,
+) -> BTreeMap<String, DateTime<Utc>> {
+    health
+        .poisoned_contexts()
+        .into_iter()
+        .filter_map(|context| {
+            let since = fix_first::confirmed_since(
+                tip.get(&context)?,
+                red_everywhere.get(&context).copied(),
+            )?;
+            Some((context, since))
+        })
+        .collect()
+}
+
 impl RepoPoison {
-    /// Poisoned contexts the base tip also fails: the only ones that hold,
-    /// pause or jump. An unread tip confirms nothing.
+    /// Poisoned contexts the base is confirmed red on: the base tip's own
+    /// newest verdict failed, or a red-everywhere episode began after it.
+    /// Only these hold, pause or jump. An unread tip confirms nothing.
     pub(super) fn confirmed_contexts(&self) -> Vec<String> {
-        self.health
-            .poisoned_contexts()
-            .into_iter()
-            .filter(|context| self.tip.get(context).is_some_and(|tip| tip.red))
+        confirmed_red_since(&self.health, &self.tip, &self.red_everywhere)
+            .into_keys()
             .collect()
     }
 
@@ -132,13 +155,14 @@ impl RepoPoison {
         (!gaps.is_empty()).then(|| gaps.join("; "))
     }
 
-    /// Whether every one of `contexts` was read green on the tip this pass:
-    /// the episode for them is over even if the merge-group streak is not.
+    /// Whether every one of `contexts` was read on the tip this pass and is
+    /// no longer confirmed red: the episode for them is over even if the
+    /// merge-group streak is not.
     pub(super) fn tip_green_for(&self, contexts: &str) -> bool {
+        let confirmed = self.confirmed_contexts();
         contexts.split(',').all(|context| {
-            self.tip
-                .get(context)
-                .is_some_and(|tip| !tip.red && tip.error.is_none())
+            self.tip.get(context).is_some_and(|tip| tip.error.is_none())
+                && !confirmed.iter().any(|red| red == context)
         })
     }
 }
@@ -154,10 +178,8 @@ pub(super) fn red_tip(health: &MergeGroupHealth) -> BTreeMap<String, TipReading>
             (
                 context,
                 TipReading {
-                    sha: None,
                     red: true,
-                    red_since: None,
-                    error: None,
+                    ..TipReading::default()
                 },
             )
         })
@@ -249,6 +271,7 @@ pub(super) fn observe(
     actions: &GitHubActions,
     observation: &RepoObservation,
     policy: &StewardPolicy,
+    red_everywhere: &BTreeMap<String, DateTime<Utc>>,
     now: DateTime<Utc>,
 ) -> Option<RepoPoison> {
     let poison_policy = policy.ejection_guards.base_poison.clone();
@@ -299,7 +322,7 @@ pub(super) fn observe(
         &observation.required_checks,
         &policy.approval_context,
         &health,
-        &tip,
+        &confirmed_red_since(&health, &tip, red_everywhere),
     );
     if let GreenHead::One(pr, evidence) = &green {
         fixes.entry(*pr).or_default().push(evidence.clone());
@@ -319,6 +342,7 @@ pub(super) fn observe(
         fixes,
         fix_read_error,
         tip,
+        red_everywhere: red_everywhere.clone(),
         covering,
         fix_ambiguity,
     })
@@ -382,7 +406,7 @@ pub(super) fn green_head_fix(
     required: &[crate::merge_steward::RequiredCheck],
     approval_context: &str,
     health: &MergeGroupHealth,
-    tip: &BTreeMap<String, TipReading>,
+    red_since: &BTreeMap<String, DateTime<Utc>>,
 ) -> (GreenHead, BTreeSet<u64>) {
     let time = |text: Option<&str>| {
         text.and_then(|text| DateTime::parse_from_rfc3339(text).ok())
@@ -398,13 +422,10 @@ pub(super) fn green_head_fix(
     let mut found: Vec<(fix_first::GreenFix, String)> = Vec::new();
     let mut covering: Option<BTreeSet<u64>> = None;
     for poisoned in health.poisoned() {
-        let Some(reading) = tip.get(&poisoned.context).filter(|tip| tip.red) else {
-            continue;
-        };
-        // Confirmed but with no time the base went red: nothing can be shown
-        // to pass it after the break, so nothing is exempt.
-        let Some(red_since) = reading.red_since else {
-            covering = Some(BTreeSet::new());
+        // Only a confirmed context counts; one whose red time is unknown
+        // reads as red since the end of time, so nothing passes after it
+        // and nothing is exempt ([`fix_first::confirmed_since`]).
+        let Some(red_since) = red_since.get(&poisoned.context).copied() else {
             continue;
         };
         let rule = required
