@@ -125,6 +125,8 @@ def recent_ticks(log_dir, now, span):
                 rows[p["number"]] = {"head": p.get("head_sha"), "token": p.get("blocked_on") or "unknown",
                                      "actor": na.get("actor"), "stop": bool(na.get("stop")),
                                      "since": parse_iso(p.get("since")), "deferred": read_deferred(p),
+                                     "decision_action": (p.get("decision") or {}).get("action") if isinstance(p.get("decision"), dict) else None,
+                                     "detail": p.get("blocked_detail"),
                                      "loop_state": (p.get("loop") or {}).get("state") if isinstance(p.get("loop"), dict) else None}
             per_repo.setdefault(r["repo"], []).append((t, rows))
     for v in per_repo.values():
@@ -199,37 +201,55 @@ def check_stale_hold(per_repo, now):
 
 
 # ------------------------------------------------------- idle gate slots
+# Waiting definition: vendored from the m3 coordinator's idle_gate.py (pulp-planning,
+# architecture/2026-11-09-continuous-supply-data/idle_gate.py at commit 1200a0775) so that the
+# steward's live sample and the coordinator's drain report use the same state names and the
+# same notion of "waiting". Keep this function identical to its `waiting_state`.
+def coordinator_waiting_state(p):
+    b = p.get("blocked_on") or "none"
+    act = (p.get("decision") or {}).get("action")
+    if b in ("queued", "admitted", "draft", "required_pending") or b.startswith("excluded_label"):
+        return None
+    if act in ("queued", "excluded_label", "draft"):
+        return None
+    if b == "capacity_queued":
+        return "awaiting_slot"
+    if act == "waiting_required":
+        return None
+    if b.startswith("merge_state"):
+        return "dirty" if "DIRTY" in b or p.get("blocked_detail") == "DIRTY" else "behind"
+    if b.startswith("held"):
+        return "held"
+    if b.startswith("ejected"):
+        return "ejected"
+    if "quarantine" in b:
+        return "quarantined"
+    if b in ("required_failed:review-verdict", "no_verdict") or b.startswith("carries_unapproved"):
+        return "awaiting_review"
+    if b.startswith("required_never_ran"):
+        return "never_ran"
+    if b.startswith("required_failed"):
+        return "red"
+    return b.split(":")[0]
+
+
 IDLE_FILE = "idle-slots.jsonl"
-IDLE_CAP_SECONDS = 600
-RUNNING_LIKE = {"required_pending", "capacity_queued", "transient_rerun", "revalidating"}
-QUEUED_LIKE = {"queued", "admitted", "ready", "deferred_pass_budget",
-               "carried_commits_over_cap", "carried_commits_unreadable"}
 
 
 def waiting_state(o):
     """The state a PR is waiting in, or None when it is not waiting.
 
-    With the steward's `loop.state` (behind|dirty|running|red|hold|awaiting_review|
-    quarantined|ejected|queued) a PR waits in any state except running or queued.
-    Until `loop` is in the tick JSON, the blocked_on token is mapped onto the same
-    names. Drafts and human stops are not waiting for a gate.
+    Same definition as the coordinator's: not queued or admitted, not a draft, not
+    excluded by label, not blocked only on its own running required checks;
+    `capacity_queued` (a check queued for a VM) is waiting (`awaiting_slot`). When the tick
+    row carries the steward's `loop.state`, it is used instead and `running` and `queued` do
+    not wait; the one rename is `hold` -> `held`.
     """
     if o.get("loop_state"):
-        return None if o["loop_state"] in ("running", "queued") else o["loop_state"]
-    token, fam = o["token"], o["token"].split(":", 1)[0]
-    klass = classify(token, o["actor"], o["stop"])
-    if klass in ("intentional", "human_stop"):
-        return None
-    if fam in RUNNING_LIKE:
-        return "awaiting_review" if o["actor"] == "reviewer" else None
-    if fam in QUEUED_LIKE:
-        return None
-    if fam == "merge_state":
-        detail = token.partition(":")[2].upper()
-        return {"DIRTY": "dirty", "BEHIND": "behind"}.get(detail, "merge_state_" + detail.lower())
-    return {"required_failed": "red", "required_never_ran": "red", "ejected_same_head": "ejected",
-            "held": "hold", "carries_unapproved_commits": "hold", "no_verdict": "awaiting_review",
-            "approval_excluded": "awaiting_review"}.get(fam, fam)
+        st = o["loop_state"]
+        return None if st in ("running", "queued") else {"hold": "held"}.get(st, st)
+    return coordinator_waiting_state({"blocked_on": o["token"], "decision": {"action": o.get("decision_action")},
+                                      "blocked_detail": o.get("detail")})
 
 
 def probe_capacity(a, host, repo, target):
@@ -254,48 +274,28 @@ def probe_capacity(a, host, repo, target):
 
 
 def sample_idle_slots(a, now, per_repo):
-    """One sample per tick: idle gate slots across the probed hosts and the PRs waiting.
-
-    Minutes are idle slots x seconds since the previous sample (capped), and only
-    while at least one PR was waiting and at least one probe was verified.
+    """One sample per tick: idle gate slots across the probed hosts, and per repository the
+    states of its waiting PRs. Minutes are computed by the reader (loss_report.idle_slots) the
+    way the coordinator does: idle slots x time to the next sample (capped), counted only
+    while the repository had a waiting PR.
     """
-    path = os.path.join(a.log_dir, IDLE_FILE)
-    prev = None
-    try:
-        with open(path, "rb") as fh:
-            fh.seek(max(0, os.path.getsize(path) - 4096))
-            tail = fh.read().decode("utf-8", "replace").splitlines()
-        for line in reversed(tail):
-            try:
-                prev = parse_iso(json.loads(line)["t"])
-                break
-            except Exception:
-                continue
-    except OSError:
-        pass
-    interval = IDLE_CAP_SECONDS if prev is None else (now - prev).total_seconds()
-    capped = interval > a.idle_cap_seconds or prev is None
-    interval = max(0.0, min(interval, a.idle_cap_seconds))
-    waiting, stale_repos = collections.Counter(), []
+    waiting, stale_repos, loop_source = {}, [], False
     for repo, ticks in per_repo.items():
         t_last, rows = latest_valid(ticks)
         if rows is None or now - t_last > dt.timedelta(minutes=10):
             stale_repos.append(repo)
             continue
+        c = collections.Counter()
         for o in rows.values():
+            loop_source = loop_source or bool(o.get("loop_state"))
             st = waiting_state(o)
             if st:
-                waiting[st] += 1
+                c[st] += 1
+        waiting[repo] = dict(c)
     probes = [probe_capacity(a, h, a.probe_repo, t) for h in ["local"] + list(a.probe_host) for t in a.gate_target]
     ok = [p for p in probes if p["ok"]]
-    idle = sum(p["free"] for p in ok) if ok else None
-    total_waiting = sum(waiting.values())
-    counted = idle is not None and total_waiting > 0 and prev is not None
-    return {"t": now.isoformat(timespec="seconds"), "interval_s": round(interval), "interval_capped": capped,
-            "idle_slots": idle, "waiting": dict(waiting), "waiting_total": total_waiting,
-            "probes": probes, "stale_repos": stale_repos, "loop_source": any(
-                o.get("loop_state") for ticks in per_repo.values() for _, rows in ticks[-1:] if rows for o in rows.values()),
-            "minutes": round(idle * interval / 60.0, 2) if counted else 0.0, "counted": counted}
+    return {"t": now.isoformat(timespec="seconds"), "idle_slots": sum(p["free"] for p in ok) if ok else None,
+            "waiting": waiting, "probes": probes, "stale_repos": stale_repos, "loop_source": loop_source}
 
 
 def write_idle_sample(a, now, sample):
@@ -632,7 +632,6 @@ def main(argv=None):
     ap.add_argument("--probe-repo", default=os.environ.get("SHIPYARD_IDLE_SLOT_REPO", "danielraffel/Shipyard"))
     ap.add_argument("--tartci", default="tartci")
     ap.add_argument("--ssh", default="ssh")
-    ap.add_argument("--idle-cap-seconds", type=int, default=IDLE_CAP_SECONDS)
     ap.add_argument("--no-idle-sample", action="store_true")
     ap.add_argument("--tick", action="store_true", help="always exit 0; take a lock; log failures as one line")
     a = ap.parse_args(argv)

@@ -285,64 +285,99 @@ def load_github_cache(path):
 
 
 # ------------------------------------------------- idle gate-slot minutes
-def idle_slots(log_dir, start, now, days):
-    """Per UTC day: gate-slot minutes that sat idle while PRs waited, with the top 3 reasons.
+IDLE_TICK_CAP = dt.timedelta(minutes=30)
 
-    Reads idle-slots.jsonl, one sample per steward tick written by drain_watch.py. A sample
-    counts (`counted`) only when a probe was verified, at least one PR waited, and the
-    previous sample gave an interval. Each counted sample's minutes are split over the
-    waiting states in proportion to the PRs in each. A day with no samples is null.
+
+def idle_slots(log_dir, start, now, days):
+    """Per UTC day and repository: gate-slot minutes that sat idle while a PR of that repository waited.
+
+    Same definition as the m3 coordinator's idle_gate.py (pulp-planning): a sample's weight is the
+    time to the next sample, capped at 30 minutes; the sample counts for a repository only when
+    that repository had a waiting PR; slot-minutes are idle slots times the weight; the waiting
+    states are summed in PR-minutes over the same idle minutes and the top 3 are reported. The
+    last sample has no next sample and weighs nothing. Idle slots come from verified
+    `tartci fleet capacity` probes; a sample with no verified probe is not counted and lowers
+    coverage. A day with no samples is null. `all_repos` counts a sample once when any repository
+    waited (slots are shared), with the states summed over repositories.
     """
-    per = {d: {"samples": 0, "counted": 0, "minutes": 0.0, "waiting_minutes": 0.0, "reasons": collections.Counter(),
-               "probe_failures": 0, "unverified_samples": 0, "capped": 0, "loop_samples": 0} for d in days}
     try:
         with open(os.path.join(log_dir, "idle-slots.jsonl")) as fh:
             lines = fh.read().splitlines()
     except OSError:
         lines = []
+    samples = []
     for line in lines:
         try:
-            s = json.loads(line)
-            t = parse_iso(s["t"])
+            x = json.loads(line)
+            t = parse_iso(x["t"])
         except Exception:
             continue
-        day = t.strftime("%Y-%m-%d") if t else None
-        if day not in per or t < start or t > now:
+        if t and start - IDLE_TICK_CAP <= t <= now:
+            samples.append((t, x))
+    samples.sort(key=lambda z: z[0])
+    per = {d: {"samples": 0, "unverified": 0, "probe_failures": 0, "capped": 0, "loop": 0,
+               "scopes": collections.defaultdict(lambda: {"minutes": 0.0, "states": collections.Counter()})} for d in days}
+    for i, (t, x) in enumerate(samples):
+        day = t.strftime("%Y-%m-%d")
+        if day not in per or t < start:
             continue
         d = per[day]
         d["samples"] += 1
-        d["capped"] += bool(s.get("interval_capped"))
-        d["loop_samples"] += bool(s.get("loop_source"))
-        pr = s.get("probes") or []
-        d["probe_failures"] += sum(1 for p in pr if not p.get("ok"))
-        d["unverified_samples"] += s.get("idle_slots") is None
-        if s.get("counted"):
-            d["counted"] += 1
-            d["minutes"] += s.get("minutes") or 0.0
-            tot = s.get("waiting_total") or 0
-            for state, n in (s.get("waiting") or {}).items():
-                d["reasons"][state] += (s.get("minutes") or 0.0) * n / tot if tot else 0
+        d["loop"] += bool(x.get("loop_source"))
+        d["probe_failures"] += sum(1 for p in (x.get("probes") or []) if not p.get("ok"))
+        idle = x.get("idle_slots")
+        if idle is None:
+            d["unverified"] += 1
+            continue
+        nxt = samples[i + 1][0] if i + 1 < len(samples) else t
+        gap = nxt - t
+        if gap > IDLE_TICK_CAP:
+            d["capped"] += 1
+        w = min(gap, IDLE_TICK_CAP).total_seconds() / 60.0
+        if idle <= 0 or w <= 0:
+            continue
+        waiting = x.get("waiting") or {}
+        union = collections.Counter()
+        for repo, states in waiting.items():
+            n = sum(states.values())
+            if not n:
+                continue
+            sc = d["scopes"][repo]
+            sc["minutes"] += idle * w
+            for st, c in states.items():
+                sc["states"][st] += c * w
+                union[st] += c * w
+        if union:
+            sc = d["scopes"]["all_repos"]
+            sc["minutes"] += idle * w
+            sc["states"].update(union)
     out = {}
     for day, d in per.items():
         if not d["samples"]:
             out[day] = None
             continue
-        mins = d["minutes"]
-        top = [{"state": k, "minutes": round(v, 1), "share_pct": round(100.0 * v / mins, 1) if mins else None}
-               for k, v in d["reasons"].most_common(3)]
-        if d["unverified_samples"] == d["samples"]:
+        if d["unverified"] == d["samples"]:
             status, why = "unavailable", "no probe was verified in any sample"
-        elif d["probe_failures"] or d["unverified_samples"] or d["capped"]:
-            status, why = "partial", (f"{d['probe_failures']} unverified or failed probe(s), {d['unverified_samples']} sample(s) "
-                                      f"with no verified probe, {d['capped']} sample(s) with a capped or unknown interval")
+        elif d["probe_failures"] or d["unverified"] or d["capped"]:
+            status, why = "partial", (f"{d['probe_failures']} failed or unverified probe(s), {d['unverified']} sample(s) with no "
+                                      f"verified probe, {d['capped']} interval(s) longer than 30 min")
         else:
             status, why = "available", "every probe verified, every interval measured"
-        out[day] = {"idle_slot_minutes": round(mins, 1) if d["counted"] or status != "unavailable" else None,
-                    "samples": d["samples"], "counted_samples": d["counted"], "top_reasons": top,
-                    "reasons_source": "loop.state" if d["loop_samples"] == d["samples"] else
-                    ("blocked_on mapping" if not d["loop_samples"] else "mixed"),
-                    "coverage": cov(status, why)}
+        scopes = {}
+        for name, sc in sorted(d["scopes"].items()):
+            top = sorted(sc["states"].items(), key=lambda kv: (-kv[1], kv[0]))[:3]
+            scopes[name] = {"idle_slot_minutes": round(sc["minutes"], 1),
+                            "top_states_pr_minutes": [{"state": k, "pr_minutes": round(v, 1)} for k, v in top]}
+        out[day] = {"samples": d["samples"], "coverage": cov(status, why),
+                    "waiting_source": "loop.state" if d["loop"] == d["samples"] else ("blocked_on" if not d["loop"] else "mixed"),
+                    "all_repos": scopes.pop("all_repos", {"idle_slot_minutes": 0.0 if status != "unavailable" else None,
+                                                          "top_states_pr_minutes": []}),
+                    "repos": scopes}
+        if status == "unavailable":
+            out[day]["all_repos"] = {"idle_slot_minutes": None, "top_states_pr_minutes": []}
+            out[day]["repos"] = {}
     return out
+
 
 # ------------------------------------------------------------------ report
 def pct(n, d):
@@ -497,14 +532,15 @@ def markdown(r):
         for k, v in r["series_per_day"].items():
             cells.append("unavail" if v is None or v.get(day) is None else str(v[day]))
         out.append(f"| {day} | " + " | ".join(cells) + " |")
-    out += ["", "## Idle gate-slot minutes while PRs waited", "", "| day | idle slot minutes | top reasons | coverage |", "|---|---|---|---|"]
+    out += ["", "## Idle gate-slot minutes while PRs waited", "", "| day | repo | idle slot minutes | top waiting states (PR-minutes) | coverage |", "|---|---|---|---|---|"]
     for day, v in r["idle_gate_slots"].items():
         if v is None:
-            out.append(f"| {day} | unavail | | no samples |")
-        else:
-            top = ", ".join(f"{x['state']} {x['share_pct']}%" for x in v["top_reasons"]) or "-"
-            m = "unavail" if v["idle_slot_minutes"] is None else v["idle_slot_minutes"]
-            out.append(f"| {day} | {m} | {top} | {v['coverage']['status']} |")
+            out.append(f"| {day} | - | unavail | | no samples |")
+            continue
+        for name, sc in [("all repos", v["all_repos"])] + sorted(v["repos"].items()):
+            m = "unavail" if sc["idle_slot_minutes"] is None else sc["idle_slot_minutes"]
+            top = ", ".join(f"{x['state']} {x['pr_minutes']}" for x in sc["top_states_pr_minutes"]) or "-"
+            out.append(f"| {day} | {name} | {m} | {top} | {v['coverage']['status']} |")
     out += ["", "## Top actionable by repo and token", "", "| repo | token | episodes | actionable | normal wait | closed unmerged | fix pushes |", "|---|---|---|---|---|---|---|"]
     for row in r["by_repo_token"][:15]:
         cu = row.get("closed_unmerged", 0) if r["coverage"]["github"]["status"] != "unavailable" else "unavail"
@@ -523,14 +559,18 @@ def summary_line(r, stamp):
             f"coverage={r['coverage']['window']['status']}")
 
 
-def idle_summary_line(r, stamp, day):
+def idle_summary_lines(r, stamp, day):
+    """One grep-able line per repository and one for all repositories, for one UTC day."""
     v = (r.get("idle_gate_slots") or {}).get(day)
     if v is None:
-        return f"{stamp} idle-slots day={day} idle_slot_minutes=unavailable top=- coverage=unavailable samples=0"
-    m = "unavailable" if v["idle_slot_minutes"] is None else v["idle_slot_minutes"]
-    top = ",".join(f"{x['state']}:{x['share_pct']}%" for x in v["top_reasons"]) or "-"
-    return (f"{stamp} idle-slots day={day} idle_slot_minutes={m} top={top} coverage={v['coverage']['status']} "
-            f"samples={v['samples']} reasons={v['reasons_source'].replace(' ', '_')}")
+        return [f"{stamp} idle-slots day={day} repo=all idle_slot_minutes=unavailable top=- coverage=unavailable samples=0"]
+    lines = []
+    for name, sc in [("all", v["all_repos"])] + sorted(v["repos"].items()):
+        m = "unavailable" if sc["idle_slot_minutes"] is None else sc["idle_slot_minutes"]
+        top = ",".join(f"{x['state']}:{x['pr_minutes']:g}" for x in sc["top_states_pr_minutes"]) or "-"
+        lines.append(f"{stamp} idle-slots day={day} repo={name} idle_slot_minutes={m} top={top} "
+                     f"coverage={v['coverage']['status']} samples={v['samples']} waiting_source={v['waiting_source']}")
+    return lines
 
 
 # ------------------------------------------------------------------- daily
@@ -581,7 +621,8 @@ def daily(log_dir, now=None, since=dt.timedelta(days=7), github=None):
                 fh.write(text)
             os.replace(tmp, path)
         say(summary_line(rep, stamp))
-        say(idle_summary_line(rep, stamp, (now - dt.timedelta(days=1)).strftime("%Y-%m-%d")))
+        for line in idle_summary_lines(rep, stamp, (now - dt.timedelta(days=1)).strftime("%Y-%m-%d")):
+            say(line)
     except BaseException as exc:  # a report must never fail the tick
         say(f"{stamp} loss-report ERROR {type(exc).__name__}: {str(exc)[:120]}")
     finally:

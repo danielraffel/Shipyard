@@ -39,7 +39,7 @@ class Base(unittest.TestCase):
             log_dir=str(self.log), fleet_dir=str(r / "fleet"), runner_dir=str(r / "runner"), state=str(r / "state.json"),
             summary=str(self.log / "summary.log"), ghapp="x", dry_run=False, from_start=False, idle_sample=True,
             probe_host=[], gate_target=["macos"], probe_repo=REPO, tartci=str(self.stubs / "tartci"),
-            ssh=str(self.stubs / "ssh"), idle_cap_seconds=600)
+            ssh=str(self.stubs / "ssh"))
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -68,83 +68,64 @@ class Base(unittest.TestCase):
 
 
 class WaitingStateTests(unittest.TestCase):
-    def row(self, token, actor="author", loop=None, stop=False):
-        return {"token": token, "actor": actor, "stop": stop, "loop_state": loop}
+    def row(self, token, actor="author", loop=None, action=None, detail=None):
+        return {"token": token, "actor": actor, "stop": False, "loop_state": loop, "decision_action": action, "detail": detail}
+
+    def test_matches_the_coordinators_definition(self):
+        # (blocked_on, decision.action, expected) cases from idle_gate.py at pulp-planning 1200a0775;
+        # the same function was also checked row for row against 8,853 real tick rows.
+        cases = [
+            ("queued", None, None), ("admitted", None, None), ("draft", None, None), ("required_pending", None, None),
+            ("excluded_label:superseded", None, None), ("owner_decision", "excluded_label", None),
+            ("required_failed:macos", "waiting_required", None),
+            ("capacity_queued", "waiting_required", "awaiting_slot"),
+            ("merge_state:DIRTY", None, "dirty"), ("merge_state:BEHIND", None, "behind"), ("merge_state:UNSTABLE", None, "behind"),
+            ("held:review-verdict", None, "held"), ("ejected_same_head:failed_checks", None, "ejected"),
+            ("quarantine_x", None, "quarantined"), ("required_failed:review-verdict", None, "awaiting_review"),
+            ("no_verdict", None, "awaiting_review"), ("carries_unapproved_commits:#1", None, "awaiting_review"),
+            ("required_never_ran:review-verdict", None, "never_ran"), ("required_failed:macos,review-verdict", None, "red"),
+            ("unmanaged", None, "unmanaged"), ("direct_merge_refused", None, "direct_merge_refused"), ("ready", None, "ready"),
+        ]
+        for token, action, want in cases:
+            self.assertEqual(dw.waiting_state(self.row(token, action=action)), want, token)
 
     def test_loop_state_wins_and_running_or_queued_do_not_wait(self):
         self.assertIsNone(dw.waiting_state(self.row("required_failed:macos", loop="running")))
         self.assertIsNone(dw.waiting_state(self.row("required_failed:macos", loop="queued")))
-        for s in ("behind", "dirty", "red", "hold", "awaiting_review", "quarantined", "ejected"):
+        self.assertEqual(dw.waiting_state(self.row("required_pending", "ci", loop="hold")), "held")
+        for s in ("behind", "dirty", "red", "awaiting_review", "quarantined", "ejected"):
             self.assertEqual(dw.waiting_state(self.row("required_pending", "ci", loop=s)), s)
-
-    def test_fallback_maps_blocked_on(self):
-        w = dw.waiting_state
-        self.assertEqual(w(self.row("merge_state:DIRTY")), "dirty")
-        self.assertEqual(w(self.row("merge_state:BEHIND")), "behind")
-        self.assertEqual(w(self.row("required_failed:macos,review-verdict")), "red")
-        self.assertEqual(w(self.row("held:review-verdict")), "hold")
-        self.assertEqual(w(self.row("ejected_same_head:failed_checks")), "ejected")
-        self.assertEqual(w(self.row("no_verdict", "reviewer")), "awaiting_review")
-        self.assertEqual(w(self.row("required_pending", "reviewer")), "awaiting_review")
-        for token, actor in (("required_pending", "ci"), ("capacity_queued", "ci"), ("queued", "steward"),
-                             ("draft", "author"), ("owner_decision", "owner"), ("ready", "steward")):
-            self.assertIsNone(w(self.row(token, actor)), token)
 
 
 class SamplerTests(Base):
-    def test_minutes_are_idle_slots_times_interval_only_while_prs_wait(self):
+    def test_sample_records_idle_slots_and_per_repo_waiting_states(self):
         self.probe("local", cap(3))
-        self.tick(NOW, [(1, "merge_state:DIRTY", "author", None), (2, "required_pending", "ci", None)])
-        first = self.sample_at(0)
-        self.assertFalse(first["counted"])                       # no previous sample: interval unknown
-        self.tick(NOW + dt.timedelta(minutes=5), [(1, "merge_state:DIRTY", "author", None)])
-        s = self.sample_at(5)
-        self.assertEqual((s["idle_slots"], s["interval_s"], s["minutes"], s["counted"]), (3, 300, 15.0, True))
-        self.assertEqual(s["waiting"], {"dirty": 1})
-        # nobody waiting: idle slots are not counted
-        self.tick(NOW + dt.timedelta(minutes=10), [(2, "required_pending", "ci", None), (3, "queued", "steward", None)])
-        s = self.sample_at(10)
-        self.assertEqual((s["idle_slots"], s["waiting_total"], s["minutes"], s["counted"]), (3, 0, 0.0, False))
+        self.tick(NOW, [(1, "merge_state:DIRTY", "author", None), (2, "required_pending", "ci", None),
+                        (3, "capacity_queued", "ci", None)])
+        s = self.sample_at(0)
+        self.assertEqual(s["idle_slots"], 3)
+        self.assertEqual(s["waiting"], {REPO: {"dirty": 1, "awaiting_slot": 1}})
 
-    def test_hosts_are_summed_and_a_failed_probe_is_partial_not_zero(self):
+    def test_hosts_are_summed_and_a_failed_probe_is_kept_not_zeroed(self):
         self.probe("local", cap(1))
         self.probe("m5s", cap(2, host="m5s"))
         self.args.probe_host = ["m5s", "m1"]                     # m1 has no stub: ssh exits 255
         self.tick(NOW, [(1, "required_failed:macos", "author", None)])
-        self.sample_at(0)
-        self.tick(NOW + dt.timedelta(minutes=5), [(1, "required_failed:macos", "author", None)])
-        s = self.sample_at(5)
-        self.assertEqual((s["idle_slots"], s["minutes"]), (3, 15.0))
+        s = self.sample_at(0)
+        self.assertEqual(s["idle_slots"], 3)
         self.assertEqual([(p["host"], p["ok"]) for p in s["probes"]], [("local", True), ("m5s", True), ("m1", False)])
 
-    def test_unverified_everywhere_is_unavailable_never_zero(self):
+    def test_unverified_everywhere_is_null_never_zero(self):
         self.probe("local", cap(0, verification="unknown"))
         self.tick(NOW, [(1, "required_failed:macos", "author", None)])
-        self.sample_at(0)
-        self.tick(NOW + dt.timedelta(minutes=5), [(1, "required_failed:macos", "author", None)])
-        s = self.sample_at(5)
-        self.assertIsNone(s["idle_slots"])
-        self.assertFalse(s["counted"])
-        rep = lr.idle_slots(str(self.log), NOW - dt.timedelta(hours=1), NOW + dt.timedelta(hours=1), ["2026-11-13"])
-        self.assertIsNone(rep["2026-11-13"]["idle_slot_minutes"])
-        self.assertEqual(rep["2026-11-13"]["coverage"]["status"], "unavailable")
-
-    def test_interval_is_capped_after_a_gap(self):
-        self.probe("local", cap(2))
-        self.tick(NOW, [(1, "merge_state:DIRTY", "author", None)])
-        self.sample_at(0)
-        self.tick(NOW + dt.timedelta(minutes=60), [(1, "merge_state:DIRTY", "author", None)])
-        s = self.sample_at(60)
-        self.assertEqual((s["interval_s"], s["interval_capped"], s["minutes"]), (600, True, 20.0))
+        self.assertIsNone(self.sample_at(0)["idle_slots"])
 
     def test_loop_state_from_the_tick_is_used_when_present(self):
         self.probe("local", cap(1))
-        rows = [(1, "required_pending", "ci", {"loop": {"state": "red"}}), (2, "merge_state:DIRTY", "author", {"loop": {"state": "running"}})]
-        self.tick(NOW, rows)
-        self.sample_at(0)
-        self.tick(NOW + dt.timedelta(minutes=5), rows)
-        s = self.sample_at(5)
-        self.assertEqual(s["waiting"], {"red": 1})
+        self.tick(NOW, [(1, "required_pending", "ci", {"loop": {"state": "red"}}),
+                        (2, "merge_state:DIRTY", "author", {"loop": {"state": "running"}})])
+        s = self.sample_at(0)
+        self.assertEqual(s["waiting"], {REPO: {"red": 1}})
         self.assertTrue(s["loop_source"])
 
     def test_dry_run_writes_nothing_and_a_broken_probe_does_not_stop_the_watch(self):
@@ -160,50 +141,70 @@ class SamplerTests(Base):
         self.assertFalse(self.samples()[-1]["probes"][0]["ok"])
 
 
+def sample(t, idle, waiting, probes=None, **kw):
+    d = {"t": t, "idle_slots": idle, "waiting": waiting, "probes": probes if probes is not None else [{"ok": idle is not None}],
+         "stale_repos": [], "loop_source": False}
+    d.update(kw)
+    return d
+
+
 class ReportTests(Base):
     def write(self, rows):
         with open(self.log / "idle-slots.jsonl", "w") as fh:
             for r in rows:
                 fh.write(json.dumps(r) + "\n")
 
-    def test_per_day_minutes_top_three_reasons_and_summary_line(self):
-        def s(t, minutes, waiting, **kw):
-            d = {"t": t, "interval_s": 300, "interval_capped": False, "idle_slots": 2, "waiting": waiting,
-                 "waiting_total": sum(waiting.values()), "probes": [{"ok": True}], "minutes": minutes, "counted": minutes > 0}
-            d.update(kw)
-            return d
-        self.write([
-            s("2026-11-12T10:00:00+00:00", 10.0, {"dirty": 3, "red": 1}),
-            s("2026-11-12T10:05:00+00:00", 10.0, {"hold": 1, "awaiting_review": 1, "ejected": 2, "dirty": 1}),
-            s("2026-11-12T10:10:00+00:00", 0.0, {}),
-        ])
-        days = ["2026-11-11", "2026-11-12", "2026-11-13"]
-        rep = lr.idle_slots(str(self.log), NOW - dt.timedelta(days=3), NOW, days)
-        self.assertIsNone(rep["2026-11-11"])                      # no samples: null, not 0
-        d = rep["2026-11-12"]
-        self.assertEqual(d["idle_slot_minutes"], 20.0)
-        self.assertEqual([(x["state"], x["minutes"]) for x in d["top_reasons"]], [("dirty", 9.5), ("ejected", 4.0), ("red", 2.5)])
-        self.assertEqual(d["coverage"]["status"], "available")
-        self.assertEqual(d["reasons_source"], "blocked_on mapping")
-        line = lr.idle_summary_line({"idle_gate_slots": rep}, "20261113T000500Z", "2026-11-12")
-        self.assertIn("idle-slots day=2026-11-12 idle_slot_minutes=20.0 top=dirty:47.5%,ejected:20.0%,red:12.5%", line)
-        self.assertIn("coverage=available", line)
-        self.assertIn("idle_slot_minutes=unavailable", lr.idle_summary_line({"idle_gate_slots": rep}, "x", "2026-11-11"))
+    def rep(self, days=("2026-11-11", "2026-11-12", "2026-11-13")):
+        return lr.idle_slots(str(self.log), NOW - dt.timedelta(days=3), NOW, list(days))
 
-    def test_daily_run_logs_the_idle_line_for_yesterday(self):
-        self.write([{"t": "2026-11-12T10:00:00+00:00", "interval_s": 300, "interval_capped": False, "idle_slots": 1,
-                     "waiting": {"red": 1}, "waiting_total": 1, "probes": [{"ok": True}], "minutes": 5.0, "counted": True}])
+    def test_minutes_weight_is_time_to_the_next_sample_and_only_while_the_repo_waits(self):
+        a, b = "acme/a", "acme/b"
+        self.write([
+            sample("2026-11-12T10:00:00+00:00", 2, {a: {"held": 3, "red": 1}, b: {}}),        # 5 min, a waits
+            sample("2026-11-12T10:05:00+00:00", 0, {a: {"red": 4}}),                          # no idle slots
+            sample("2026-11-12T10:10:00+00:00", 2, {a: {}, b: {"dirty": 2}}),                 # 20 min, b waits
+            sample("2026-11-12T10:30:00+00:00", 1, {a: {"red": 1}}),                          # last: weighs nothing
+        ])
+        v = self.rep()["2026-11-12"]
+        self.assertEqual(v["repos"][a]["idle_slot_minutes"], 10.0)
+        self.assertEqual(v["repos"][a]["top_states_pr_minutes"], [{"state": "held", "pr_minutes": 15.0}, {"state": "red", "pr_minutes": 5.0}])
+        self.assertEqual(v["repos"][b]["idle_slot_minutes"], 40.0)
+        self.assertEqual(v["repos"][b]["top_states_pr_minutes"], [{"state": "dirty", "pr_minutes": 40.0}])
+        self.assertEqual(v["all_repos"]["idle_slot_minutes"], 50.0)      # a sample counts once when any repo waits
+        self.assertEqual(v["coverage"]["status"], "available")
+        self.assertEqual(v["waiting_source"], "blocked_on")
+
+    def test_the_tick_weight_is_capped_at_thirty_minutes(self):
+        self.write([sample("2026-11-12T10:00:00+00:00", 1, {"a": {"red": 1}}), sample("2026-11-12T12:00:00+00:00", 1, {"a": {}})])
+        v = self.rep()["2026-11-12"]
+        self.assertEqual(v["repos"]["a"]["idle_slot_minutes"], 30.0)
+        self.assertEqual(v["coverage"]["status"], "partial")
+
+    def test_top_three_states_and_null_and_unavailable_days(self):
+        w = {"a": {"held": 5, "red": 4, "dirty": 3, "unmanaged": 1}}
+        self.write([sample("2026-11-12T10:00:00+00:00", 1, w), sample("2026-11-12T10:05:00+00:00", 1, {}),
+                    sample("2026-11-13T10:00:00+00:00", None, w)])
+        r = self.rep()
+        self.assertIsNone(r["2026-11-11"])                                              # no samples: null, not 0
+        self.assertEqual([x["state"] for x in r["2026-11-12"]["repos"]["a"]["top_states_pr_minutes"]], ["held", "red", "dirty"])
+        self.assertEqual(r["2026-11-13"]["coverage"]["status"], "unavailable")
+        self.assertIsNone(r["2026-11-13"]["all_repos"]["idle_slot_minutes"])
+
+    def test_failed_probe_makes_the_day_partial(self):
+        self.write([sample("2026-11-12T10:00:00+00:00", 1, {"a": {"red": 1}}, probes=[{"ok": True}, {"ok": False}]),
+                    sample("2026-11-12T10:05:00+00:00", 1, {})])
+        self.assertEqual(self.rep()["2026-11-12"]["coverage"]["status"], "partial")
+
+    def test_summary_lines_and_the_daily_run(self):
+        self.write([sample("2026-11-12T10:00:00+00:00", 2, {"acme/a": {"held": 2382, "red": 2024, "unmanaged": 606, "x": 1}}),
+                    sample("2026-11-12T10:05:00+00:00", 2, {})])
         lr.daily(str(self.log), NOW)
         text = (self.log / "summary.log").read_text()
-        self.assertIn(" idle-slots day=2026-11-12 idle_slot_minutes=5.0 top=red:100.0%", text)
+        self.assertIn("idle-slots day=2026-11-12 repo=all idle_slot_minutes=10.0 top=held:11910,red:10120,unmanaged:3030", text)
+        self.assertIn("idle-slots day=2026-11-12 repo=acme/a idle_slot_minutes=10.0 ", text)
         rep = json.loads((self.log / "loss-report-20261113.json").read_text())
-        self.assertEqual(rep["idle_gate_slots"]["2026-11-12"]["idle_slot_minutes"], 5.0)
-
-    def test_failed_probes_make_the_day_partial(self):
-        self.write([{"t": "2026-11-12T10:00:00+00:00", "interval_s": 300, "interval_capped": False, "idle_slots": 1,
-                     "waiting": {"red": 1}, "waiting_total": 1, "probes": [{"ok": True}, {"ok": False}], "minutes": 5.0, "counted": True}])
-        rep = lr.idle_slots(str(self.log), NOW - dt.timedelta(days=2), NOW, ["2026-11-12"])
-        self.assertEqual(rep["2026-11-12"]["coverage"]["status"], "partial")
+        self.assertEqual(rep["idle_gate_slots"]["2026-11-12"]["repos"]["acme/a"]["idle_slot_minutes"], 10.0)
+        self.assertIn("repo=all idle_slot_minutes=unavailable", lr.idle_summary_lines({"idle_gate_slots": {"d": None}}, "x", "d")[0])
 
 
 if __name__ == "__main__":

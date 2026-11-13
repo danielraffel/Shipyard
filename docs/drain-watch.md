@@ -41,42 +41,52 @@ lines from the beginning on a first run.
 
 ## Idle gate-slot minutes
 
-One number for the daily report: gate-VM slots that sat idle while PRs waited.
-Each watch run (every steward tick) takes one sample and appends it to
-`idle-slots.jsonl` in the tick log directory (35 days kept):
+One number for the daily report: gate-VM slots that sat idle while PRs waited. It follows the
+m3 coordinator's `idle_gate_slot_minutes_while_waiting` (pulp-planning,
+`architecture/2026-11-09-continuous-supply-data/idle_gate.py`, commit 1200a0775) so the two
+numbers can be compared.
 
-- **Idle slots:** `tartci fleet capacity --repo R --target T --json` on this host and, for each
-  host in `SHIPYARD_IDLE_SLOT_HOSTS` (space separated, over `ssh -o BatchMode=yes`), for
-  each target in `SHIPYARD_IDLE_SLOT_TARGETS` (default `macos`). The probe is
-  observation-only and reports one host at a time: `free_slots`, `eligible_slots`,
-  `verification` and `pool_state`. A fleet total is the sum of `free_slots` over the
-  probes whose `verification` is `verified`; a probe that failed or is `unknown` adds
-  nothing and makes the day `partial`. Hosts are not hard-coded: set the variable on the
-  steward host. `SHIPYARD_IDLE_SLOT_REPO` (default `danielraffel/Shipyard`) only selects the
-  profile the probe hashes. `SHIPYARD_IDLE_SLOTS=off` disables sampling.
-- **PRs waiting:** open PRs whose `loop.state` is anything except `running` or `queued`. Until
-  the tick JSON carries `loop`, the `blocked_on` token is mapped onto the same names
-  (`merge_state:DIRTY` is `dirty`, `BEHIND` is `behind`, `required_failed` and
-  `required_never_ran` are `red`, `held*` and carried commits are `hold`, `ejected_same_head`
-  is `ejected`, `no_verdict`, `approval_excluded` and a reviewer-owned `required_pending` are
-  `awaiting_review`; running checks, queue states, drafts and human stops do not wait). The
-  report says which source a day used (`reasons_source`).
-- **Minutes:** idle slots x seconds since the previous sample (capped at 10 minutes, so a gap
-  in sampling is not billed), counted only while at least one PR waited and at least one
-  probe was verified. The first sample ever has no interval and is not counted.
-- **Reasons:** each counted sample's minutes are split over the waiting states in proportion
-  to the PRs in each; the top 3 by minutes are reported with their share.
+Same as the coordinator:
 
-The slot count is not matched to the repository whose PRs wait (a macOS slot idle while only
-Linux PRs wait still counts). That makes the figure an upper bound on avoidable idleness;
-`--gate-target` and the probe hosts narrow it.
+- **Waiting** is the coordinator's `waiting_state`, vendored unchanged into `drain_watch.py`
+  (checked row for row on 8,853 real tick rows, no difference): not `queued` or `admitted`,
+  not a draft, not label-excluded, not blocked only on its own running required checks;
+  `capacity_queued` waits as `awaiting_slot`. State names are theirs: `dirty`, `behind`,
+  `held`, `ejected`, `quarantined`, `awaiting_review`, `never_ran`, `red`, `awaiting_slot`,
+  otherwise the first part of the `blocked_on` token. When the tick row carries `loop.state`
+  it is used instead (`running` and `queued` do not wait; `hold` is renamed `held`).
+- **Per repository**: a sample counts for a repository only while that repository has a
+  waiting PR. `all_repos` counts a sample once when any repository waits (slots are shared).
+- **Minutes**: idle slots times the time to the next sample, capped at 30 minutes; the last
+  sample weighs nothing. The top 3 waiting states are PR-minutes over the same idle minutes.
 
-The loss report (`tools/metrics/loss_report.py`) reads the file: `idle_gate_slots` per day in
-its JSON and markdown, and its daily run logs one line for the previous UTC day:
+Different, and why:
+
+- **Idle slots are measured, not inferred.** Each watch run (every steward tick) probes
+  `tartci fleet capacity --repo R --target T --json` on this host and on each host in
+  `SHIPYARD_IDLE_SLOT_HOSTS` (space separated, over `ssh -o BatchMode=yes`) for each target in
+  `SHIPYARD_IDLE_SLOT_TARGETS` (default `macos`), and sums `free_slots` over the probes whose
+  `verification` is `verified`. The coordinator assumes 2 slots on each of m3, m5, m5s and m1
+  and subtracts the VMs alive in lane data. The probe reflects tartci's own pool state, so a
+  host with its pool off or no configured slots (m3 reports `configured_slots` 0 for macOS)
+  adds nothing here but 2 slots there. Expect the coordinator's figure to be the larger one
+  until that is reconciled. A failed or unverified probe adds nothing and makes the day
+  `partial`; a day with no verified probe is `unavailable`, never 0.
+- Samples are written to `idle-slots.jsonl` in the tick log directory (35 days kept) by
+  `drain_watch.py`; `SHIPYARD_IDLE_SLOTS=off` disables sampling. `SHIPYARD_IDLE_SLOT_REPO`
+  (default `danielraffel/Shipyard`) only selects the profile the probe hashes. Hosts are not
+  hard-coded: set the variable on the steward host, for this fleet `m5 m5s m1` (m3 is local),
+  with `SHIPYARD_IDLE_SLOT_TARGETS="macos linux"`.
+
+The loss report (`tools/metrics/loss_report.py`) reads the file: `idle_gate_slots` per day, per
+repository and for `all_repos`, in its JSON and markdown. Its daily run logs, for the previous UTC
+day, one line per repository and one for all:
 
 ```
-<stamp> idle-slots day=2026-11-12 idle_slot_minutes=20.0 top=dirty:47.5%,ejected:20.0%,red:12.5% coverage=available samples=288 reasons=blocked_on_mapping
+<stamp> idle-slots day=2026-11-12 repo=Generous-Corp/pulp idle_slot_minutes=1666.0 top=held:2382,red:2024,unmanaged:606 coverage=available samples=288 waiting_source=blocked_on
 ```
 
-A day with no samples is `unavailable`, never 0. Coverage is `available` when every probe was
-verified and every interval measured, `partial` otherwise, `unavailable` when no probe was verified.
+Known weaknesses shared with the coordinator's definition: `ready` (approved and green, admitted
+next pass), `deferred_pass_budget` and `direct_merge_refused` (a manual-merge repository) count as
+waiting, although an idle slot beside them is not a gate defect, and `unmanaged` counts although
+the steward does not own the PR. They inflate the figure; they are left as is so the numbers agree.

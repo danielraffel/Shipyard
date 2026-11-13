@@ -227,7 +227,7 @@ python3 -I tools/metrics/loss_report.py --log-dir DIR [--since 7d] [--github CAC
 | `capacity_queued`, superseded | Episodes with that token; superseded counts the `excluded_label:superseded` label and, apart, rows carrying the steward's `superseded` detection. |
 | `red_everywhere` | Episodes whose token, detail or decision names it. `unavailable` when it never appears in the window, since silence cannot tell "none occurred" from "not emitted". |
 | Per-day series | Counted on the UTC day an episode was first seen. A day with no tick files is `null`, never `0`. |
-| Idle gate-slot minutes | Idle verified gate slots (summed over probed hosts) times the interval since the previous steward-tick sample, counted only while at least one PR waited (`loop.state` not `running` or `queued`, or the mapped `blocked_on`). Top 3 reasons are the waiting states weighted by those minutes. Definition and probe details in docs/drain-watch.md. A day with no verified probe is `unavailable`. |
+| Idle gate-slot minutes | Per repository and UTC day: idle verified gate slots (summed over probed hosts) times the time to the next steward-tick sample (capped at 30 minutes), counted only while a PR of that repository was waiting, as the m3 coordinator defines it. Top 3 reasons are the waiting states in PR-minutes over those idle minutes. Definition, differences and probe details in docs/drain-watch.md. A day with no verified probe is `unavailable`. |
 
 Coverage is `available`, `partial` or `unavailable` for the window (days with
 ticks, gaps, unreadable files), GitHub reads, agent work, CI compute and owner
