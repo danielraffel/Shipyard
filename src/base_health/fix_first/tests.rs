@@ -401,3 +401,56 @@ fn a_rival_green_head_beside_a_labelled_fix_is_not_held_in_replay() {
     assert!(!decision.holds(2));
     assert!(decision.holds(3));
 }
+
+/// The unknown-onset sentinel is never formatted: RFC 3339 cannot represent
+/// it, and formatting it would panic the steward.
+#[test]
+fn an_unknown_onset_is_never_formatted() {
+    assert_eq!(onset_text(UNKNOWN_ONSET), "an unknown time");
+    assert_eq!(known_onset(UNKNOWN_ONSET), None);
+    let known = at("2026-11-13T10:32:36Z");
+    assert_eq!(onset_text(known), known.to_rfc3339());
+    let fix = GreenFix {
+        pr: 1,
+        approved_at: known,
+        green_at: known,
+        labelled: false,
+    };
+    assert!(
+        fix.evidence("ctx", UNKNOWN_ONSET)
+            .contains("after the base tip went red at an unknown time")
+    );
+}
+
+/// A replay whose red tip run carries no completion time does not panic and
+/// keeps the onset unknown rather than inventing one.
+#[test]
+fn a_replay_with_a_red_tip_and_no_completion_time_does_not_panic() {
+    let episode = ReplayEpisode {
+        key: "o/r@main".to_owned(),
+        context: "ctx".to_owned(),
+        started_at: at("2026-11-13T10:00:00Z"),
+        ended_at: None,
+        max_streak: 2,
+        would_hold: Vec::new(),
+        decided_at: at("2026-11-13T11:00:00Z"),
+        tip_runs: vec![TipRun {
+            id: 1,
+            conclusion: "failure".to_owned(),
+            completed_at: None,
+        }],
+        red_everywhere_since: Some(at("2026-11-13T10:30:00Z")),
+        prs: vec![candidate(
+            1,
+            Some("2026-11-13T10:40:00Z"),
+            Some("2026-11-13T10:35:00Z"),
+        )],
+        actual_fix: Some(1),
+        note: String::new(),
+    };
+    let outcome = replay(&episode);
+    // A run with no completion time is unseen at any decision time, so the
+    // tip has no verdict and red everywhere cannot stand in for it.
+    assert!(!outcome.fires, "{}", outcome.why);
+    assert_eq!(outcome.fix, None);
+}

@@ -92,7 +92,11 @@ pub(super) fn candidate(
             head: pr.fact.head_sha.clone(),
             position,
             context: context.clone(),
-            episode: format!("{context}@{}", since.to_rfc3339()),
+            episode: format!(
+                "{context}@{}",
+                crate::base_health::fix_first::known_onset(*since)
+                    .map_or_else(|| "unknown".to_owned(), |at| at.to_rfc3339())
+            ),
         })),
     }
 }

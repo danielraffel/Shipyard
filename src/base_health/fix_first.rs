@@ -107,6 +107,24 @@ pub fn newest_verdict_at(runs: &[TipRun]) -> Option<DateTime<Utc>> {
         .and_then(|run| run.completed_at)
 }
 
+/// The red time of a confirmed context whose onset is unknown: no head can
+/// pass after it, so it exempts nobody. It is a sentinel, never a time to
+/// print or store: [`known_onset`] and [`onset_text`] are the only ways out.
+pub const UNKNOWN_ONSET: DateTime<Utc> = DateTime::<Utc>::MAX_UTC;
+
+/// The onset when it is known, `None` for [`UNKNOWN_ONSET`].
+#[must_use]
+pub fn known_onset(since: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    (since != UNKNOWN_ONSET).then_some(since)
+}
+
+/// The onset for a person: RFC 3339, or "an unknown time". Never formats
+/// [`UNKNOWN_ONSET`], which RFC 3339 cannot represent.
+#[must_use]
+pub fn onset_text(since: DateTime<Utc>) -> String {
+    known_onset(since).map_or_else(|| "an unknown time".to_owned(), |at| at.to_rfc3339())
+}
+
 /// Whether the base is confirmed broken on a context the merge groups
 /// already show failing. The tip's own newest verdict failing confirms it.
 /// So does a red-everywhere episode on the same check (three or more open
@@ -128,7 +146,7 @@ pub fn confirmed_since(
         // since the end of time, so no head can be shown to pass after the
         // break. The red-everywhere start never stands in for the tip's own
         // onset.
-        return Some(tip.red_since.unwrap_or(DateTime::<Utc>::MAX_UTC));
+        return Some(tip.red_since.unwrap_or(UNKNOWN_ONSET));
     }
     // Red everywhere confirms only over a tip whose newest verdict is known
     // and strictly older than the episode. A read with no completed verdict
@@ -253,7 +271,7 @@ impl GreenFix {
         format!(
             "green head: `{context}` passed on its head at {} after the base tip went red at {}; approved at {}{}",
             self.green_at.to_rfc3339(),
-            red_since.to_rfc3339(),
+            onset_text(red_since),
             self.approved_at.to_rfc3339(),
             if self.labelled {
                 "; fix label".to_owned()
@@ -533,7 +551,7 @@ pub fn replay(episode: &ReplayEpisode) -> ReplayOutcome {
         (true, true) => format!(
             "streak {} and the base red since {} ({})",
             episode.max_streak,
-            red_since.map_or_else(|| "an unknown time".to_owned(), |at| at.to_rfc3339()),
+            red_since.map_or_else(|| "an unknown time".to_owned(), onset_text),
             if tip_red {
                 "base tip red"
             } else {

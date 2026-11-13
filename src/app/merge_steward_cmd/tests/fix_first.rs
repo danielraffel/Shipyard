@@ -1621,3 +1621,41 @@ fn red_base_ejections_wait_for_every_context_and_a_full_read() {
     );
     assert!(red_base_ejections::entries(&ledger, &observation.repo, &observation.base)[0].ready);
 }
+
+/// A red tip with no red time of its own: nothing is recorded for
+/// re-enqueue (no window can be shown) and the reorder never formats the
+/// unknown onset. Neither panics.
+#[test]
+fn an_unknown_onset_records_no_ejection_window_and_never_panics() {
+    use crate::app::merge_steward_cmd::{fix_reorder, red_base_ejections};
+    let prs = [ejected_404(), pr_409()];
+    let mut observation = observation_for(prs[0].clone(), true);
+    observation.prs = prs.to_vec();
+    let unknown = TipReading {
+        red: true,
+        ..TipReading::default()
+    };
+    let red = with_acts(
+        poison(PoisonHold::On, &prs, streak(), unknown),
+        PoisonHold::On,
+    );
+    assert_eq!(red.confirmed_contexts(), vec![CONTEXT.to_owned()]);
+    let mut ledger = StewardLedger::default();
+    let lines = red_base_ejections::reconcile(
+        PoisonHold::On,
+        true,
+        &mut ledger,
+        &observation,
+        Some(&red),
+        Utc::now(),
+    );
+    assert!(lines.is_empty(), "{lines:?}");
+    assert!(red_base_ejections::entries(&ledger, &observation.repo, &observation.base).is_empty());
+    let mut queued = red.clone();
+    queued.fixes = BTreeMap::from([(409, vec!["label `shipyard:unblock`".to_owned()])]);
+    let mut queued_prs = prs.to_vec();
+    queued_prs[1].fact.queue_position = Some(2);
+    observation.prs = queued_prs;
+    // Refused (nothing covers an unknown onset), without formatting it.
+    assert!(fix_reorder::candidate(&queued, &observation).is_err());
+}

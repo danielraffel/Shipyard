@@ -115,7 +115,12 @@ pub(super) fn reconcile(
     if let Some(poison) = poison {
         let confirmed = confirmed_red_since(&poison.health, &poison.tip, &poison.red_everywhere);
         for poisoned in poison.health.poisoned() {
-            let Some(since) = confirmed.get(&poisoned.context) else {
+            // An unknown onset gives no window an ejection can be shown to
+            // fall in, so nothing is recorded and nothing is excused.
+            let Some(since) = confirmed
+                .get(&poisoned.context)
+                .and_then(|since| crate::base_health::fix_first::known_onset(*since))
+            else {
                 continue;
             };
             for number in poisoned.groups.iter().flat_map(|group| group.prs.iter()) {
@@ -133,7 +138,7 @@ pub(super) fn reconcile(
                     pr: *number,
                     head: pr.fact.head_sha.clone(),
                     context: poisoned.context.clone(),
-                    from: (*since - LOOKBACK).to_rfc3339(),
+                    from: (since - LOOKBACK).to_rfc3339(),
                     until: None,
                     ready: false,
                     recorded_at: now.to_rfc3339(),
