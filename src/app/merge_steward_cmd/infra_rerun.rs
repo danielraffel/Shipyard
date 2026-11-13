@@ -279,6 +279,35 @@ fn is(value: Option<&str>, expected: &str) -> bool {
     value.is_some_and(|value| value.eq_ignore_ascii_case(expected))
 }
 
+/// Every failed required check on each open pull request's current head:
+/// the newest observation of each name, completed `FAILURE`, from a check run
+/// or a commit status, with or without Actions ids, not the approval context,
+/// on a pull request not excluded. Unlike [`candidates`] it keeps checks no
+/// re-run could act on, because red-everywhere grouping
+/// ([`super::red_everywhere`]) needs every red. Reads nothing.
+pub(super) fn failed_required<'a>(
+    observation: &'a RepoObservation,
+    approval_context: &str,
+    excluded_labels: &[String],
+) -> Vec<(&'a ObservedPr, &'a StewardCheck)> {
+    let mut out = Vec::new();
+    for pr in &observation.prs {
+        if pr_excluded(pr, excluded_labels) {
+            continue;
+        }
+        for check in latest_checks(&pr.fact.checks) {
+            if is(Some(&check.status), "completed")
+                && is(check.conclusion.as_deref(), "failure")
+                && !is_approval_context(&check.name, approval_context)
+                && required(check, &observation.required_checks)
+            {
+                out.push((pr, check));
+            }
+        }
+    }
+    out
+}
+
 /// Every failed required Actions check on a current head that may be infra:
 /// completed `FAILURE`, with a run and a job id, not the approval context,
 /// on a pull request not excluded. `checks` holds each pull request's

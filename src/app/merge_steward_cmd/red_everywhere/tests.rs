@@ -169,6 +169,7 @@ fn ledger_with_tests(obs: &RepoObservation, test: &str) -> StewardLedger {
                 pr: pr.fact.number,
                 check: CHECK.to_owned(),
                 verdict: "declined".to_owned(),
+                judged_check_id: pr.fact.checks.first().and_then(|check| check.check_id),
                 tests: vec![test.to_owned()],
                 ..Record::default()
             },
@@ -371,5 +372,85 @@ fn the_base_config_sets_the_mode_and_defaults_to_shadow() {
             true,
         );
         assert_eq!(guards.red_everywhere, want, "{value}");
+    }
+}
+
+fn status_failed(name: &str) -> StewardCheck {
+    StewardCheck {
+        name: name.to_owned(),
+        source: StewardCheckSource::StatusContext,
+        app_id: Some(15_368),
+        status: "COMPLETED".to_owned(),
+        conclusion: Some("FAILURE".to_owned()),
+        run_id: None,
+        observed_at: None,
+        check_id: None,
+        description: None,
+    }
+}
+
+#[test]
+fn required_status_contexts_and_id_less_check_runs_still_group_by_check() {
+    let mut id_less = failed(CHECK, 3);
+    id_less.run_id = None;
+    id_less.check_id = None;
+    let obs = observation(vec![
+        observed(1, head(1), vec![status_failed(CHECK)]),
+        observed(2, head(2), vec![status_failed(CHECK)]),
+        observed(3, head(3), vec![id_less]),
+    ]);
+    let reds = reds(&obs, &StewardLedger::default(), "review-verdict", &[]);
+    assert_eq!(reds.len(), 3, "{reds:?}");
+    assert_eq!(keys(&group(&reds)), vec![(None, vec![1, 2, 3])]);
+}
+
+#[test]
+fn a_newer_run_on_the_same_head_does_not_reuse_an_older_runs_tests() {
+    let obs = three_red_prs();
+    let mut ledger = ledger_with_tests(&obs, "due_soon_fixture");
+    // #12160's record judged an older job of the same check on the same head.
+    let key = record_key(&obs.repo, 12160, &head(12160), CHECK);
+    ledger
+        .infra_reruns
+        .get_mut(&key)
+        .expect("record")
+        .judged_check_id = Some(1);
+    let reds = reds(&obs, &ledger, "review-verdict", &[]);
+    let tests: Vec<usize> = reds.iter().map(|red| red.tests.len()).collect();
+    assert_eq!(tests, vec![1, 1, 0]);
+    assert!(
+        group(&reds).is_empty(),
+        "two on the stale test and one unread never form a false group"
+    );
+}
+
+#[test]
+fn observe_before_mutation_holds_a_new_episode_and_releases_a_recovered_head() {
+    let obs = three_red_prs();
+    let mut ledger = ledger_with_tests(&obs, "due_soon_fixture");
+    // First sighting: held at once, with no rows marked yet.
+    let reds_now = reds(&obs, &ledger, "review-verdict", &[]);
+    let pass = observe(Mode::Enforce, &obs, &reds_now, &mut ledger, T0);
+    assert_eq!(
+        held(Mode::Enforce, &ledger, &obs.repo, 12147, &head(12147)),
+        Some(CHECK.to_owned())
+    );
+    let mut reports = vec![report(12147)];
+    pass.annotate(&mut reports);
+    assert!(reports[0].blocked.red_everywhere.is_some());
+    // The check re-runs green on the same heads of #12152 and #12160: the
+    // next pass's observe prunes the episode before any enqueue reads it.
+    let mut recovered = three_red_prs();
+    for pr in &mut recovered.prs[1..] {
+        pr.fact.checks[0].conclusion = Some("SUCCESS".to_owned());
+    }
+    let reds_later = reds(&recovered, &ledger, "review-verdict", &[]);
+    observe(Mode::Enforce, &recovered, &reds_later, &mut ledger, T0 + 300);
+    for pr in [12147, 12152, 12160] {
+        assert_eq!(
+            held(Mode::Enforce, &ledger, &recovered.repo, pr, &head(pr)),
+            None,
+            "{pr}"
+        );
     }
 }

@@ -21,7 +21,8 @@
 //!   dequeued or closed.
 //!
 //! Reads: none. The grouping uses the census's current-head checks and the
-//! sweep's ledger records.
+//! sweep's ledger records. Episodes are computed before any pull request is
+//! mutated ([`observe`]) and member rows are marked after ([`Pass::annotate`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -130,62 +131,82 @@ fn repo_prefix(repo: &str) -> String {
 
 /// The red required checks of every open pull request's current head, with
 /// the failing tests the ledger holds for that exact head and check.
+///
+/// Every failed required check counts, a commit status or a check run without
+/// Actions ids included ([`infra_rerun::failed_required`]); such a red has no
+/// diagnosis and groups by the check alone. The ledger's tests are reused only
+/// when the record judged this very observation (`judged_check_id` equals the
+/// check's id): a newer run of the same check on the same head groups by the
+/// check alone until it is read, never by an older run's tests.
 pub(super) fn reds(
     observation: &RepoObservation,
     ledger: &StewardLedger,
     approval_context: &str,
     excluded_labels: &[String],
 ) -> Vec<Red> {
-    let checks: BTreeMap<u64, Vec<StewardCheck>> = observation
-        .prs
-        .iter()
-        .filter(|pr| !pr.fact.checks.is_empty())
-        .map(|pr| (pr.fact.number, pr.fact.checks.clone()))
-        .collect();
-    infra_rerun::candidates(observation, &checks, approval_context, excluded_labels)
+    infra_rerun::failed_required(observation, approval_context, excluded_labels)
         .into_iter()
-        .map(|candidate| {
-            let tests = ledger
-                .infra_reruns
-                .get(&record_key(
-                    &observation.repo,
-                    candidate.pr,
-                    &candidate.head_sha,
-                    &candidate.check,
-                ))
+        .map(|(pr, check)| {
+            let tests = check
+                .check_id
+                .and_then(|check_id| {
+                    ledger
+                        .infra_reruns
+                        .get(&record_key(
+                            &observation.repo,
+                            pr.fact.number,
+                            &pr.fact.head_sha,
+                            &check.name,
+                        ))
+                        .filter(|record| record.judged_check_id == Some(check_id))
+                })
                 .map(|record| record.tests.clone())
                 .unwrap_or_default();
             Red {
-                pr: candidate.pr,
-                head: candidate.head_sha,
-                check: candidate.check,
+                pr: pr.fact.number,
+                head: pr.fact.head_sha.clone(),
+                check: check.name.clone(),
                 tests,
             }
         })
         .collect()
 }
 
-/// The pass step: group, remember each episode in the ledger (its first
-/// sighting and member heads; an episode no longer seen is dropped), mark
-/// member rows, and return the report section.
-pub(super) fn run(
+/// One pass's episodes: the report section, and the marks still to put on
+/// member rows once the rows exist ([`Self::annotate`]).
+#[derive(Debug)]
+pub(super) struct Pass {
+    status: RepoStatus,
+    marks: BTreeMap<u64, RowMark>,
+}
+
+/// The pass step that runs before any pull request is mutated: group,
+/// remember each episode in the ledger (its first sighting and member heads;
+/// an episode no longer seen is dropped, and a member no longer red the same
+/// way leaves it), and return what to report and mark. Running it before the
+/// enqueue path means [`held`] sees this pass's episodes: a newly detected
+/// one holds at once, and a head that recovered is never held on last pass's
+/// record.
+pub(super) fn observe(
     mode: Mode,
     observation: &RepoObservation,
     reds: &[Red],
     ledger: &mut StewardLedger,
-    reports: &mut [PrReport],
     now_epoch: i64,
-) -> RepoStatus {
+) -> Pass {
     let prefix = repo_prefix(&observation.repo);
-    let mut status = RepoStatus {
-        mode: mode.label().to_owned(),
-        groups: Vec::new(),
+    let mut pass = Pass {
+        status: RepoStatus {
+            mode: mode.label().to_owned(),
+            groups: Vec::new(),
+        },
+        marks: BTreeMap::new(),
     };
     if mode == Mode::Off {
         ledger
             .red_everywhere
             .retain(|key, _| !key.starts_with(&prefix));
-        return status;
+        return pass;
     }
     let groups = group(reds);
     let live: BTreeSet<String> = groups
@@ -195,7 +216,6 @@ pub(super) fn run(
     ledger
         .red_everywhere
         .retain(|key, _| !key.starts_with(&prefix) || live.contains(key));
-    let mut marks: BTreeMap<u64, RowMark> = BTreeMap::new();
     for ((check, test), members) in groups {
         let key = episode_key(&observation.repo, &check, test.as_deref());
         let new = !ledger.red_everywhere.contains_key(&key);
@@ -213,14 +233,14 @@ pub(super) fn run(
         episode.heads.retain(|pr, _| members.contains_key(pr));
         let count = members.len();
         for pr in members.keys() {
-            marks.entry(*pr).or_insert_with(|| RowMark {
+            pass.marks.entry(*pr).or_insert_with(|| RowMark {
                 check: check.clone(),
                 test: test.clone(),
                 prs: count,
                 repair_skip: mode == Mode::Enforce,
             });
         }
-        status.groups.push(Group {
+        pass.status.groups.push(Group {
             check,
             test,
             prs: members.into_keys().collect(),
@@ -230,16 +250,37 @@ pub(super) fn run(
             new,
         });
     }
-    for report in reports.iter_mut() {
-        let Some(mark) = marks.remove(&report.number) else {
-            continue;
-        };
-        if let Some(next) = report.blocked.next_action.as_mut() {
-            next.action = advice(&mark);
+    pass
+}
+
+impl Pass {
+    /// Mark each member's row and return the report section.
+    pub(super) fn annotate(mut self, reports: &mut [PrReport]) -> RepoStatus {
+        for report in reports.iter_mut() {
+            let Some(mark) = self.marks.remove(&report.number) else {
+                continue;
+            };
+            if let Some(next) = report.blocked.next_action.as_mut() {
+                next.action = advice(&mark);
+            }
+            report.blocked.red_everywhere = Some(mark);
         }
-        report.blocked.red_everywhere = Some(mark);
+        self.status
     }
-    status
+}
+
+/// [`observe`] then [`Pass::annotate`], for tests that need no mutation in
+/// between.
+#[cfg(test)]
+pub(super) fn run(
+    mode: Mode,
+    observation: &RepoObservation,
+    reds: &[Red],
+    ledger: &mut StewardLedger,
+    reports: &mut [PrReport],
+    now_epoch: i64,
+) -> RepoStatus {
+    observe(mode, observation, reds, ledger, now_epoch).annotate(reports)
 }
 
 /// The row's next action while it is in an episode.

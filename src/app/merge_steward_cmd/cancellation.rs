@@ -108,6 +108,22 @@ pub(super) fn apply_repo_plan(
         ejection_guards: super::read_ejection_guards(actions, observation),
     };
     let base_poison = super::base_poison::observe(actions, observation, &policy, Utc::now());
+    // Infra reruns and red everywhere skip the same labels.
+    let mut infra_excluded = vec![args.opt_out_label.clone()];
+    infra_excluded.extend(args.provenance_blocking_labels.iter().cloned());
+    // Red everywhere: the same check failing the same test on many heads.
+    // Reads nothing: the census's current-head checks and the ledger's infra
+    // records. Computed before any PR mutation so the enqueue guard
+    // (`red_everywhere::held`) sees this pass's episodes, never last pass's.
+    let red_everywhere_reds =
+        super::red_everywhere::reds(observation, ledger, &args.approval_context, &infra_excluded);
+    let red_everywhere_pass = super::red_everywhere::observe(
+        policy.ejection_guards.red_everywhere,
+        observation,
+        &red_everywhere_reds,
+        ledger,
+        Utc::now().timestamp(),
+    );
     let (mut reports, pr_mutation_failed, listing) = apply_pr_plans_with_poison(
         actions,
         args,
@@ -267,8 +283,6 @@ pub(super) fn apply_repo_plan(
         super::infra_rerun::Mode::Enforce if !args.apply => super::infra_rerun::Mode::Shadow,
         mode => mode,
     };
-    let mut infra_excluded = vec![args.opt_out_label.clone()];
-    infra_excluded.extend(args.provenance_blocking_labels.iter().cloned());
     let (infra_rerun_status, infra_rerun_failed) = super::infra_rerun::sweep(
         &super::infra_rerun::Sweep {
             observation,
@@ -291,18 +305,9 @@ pub(super) fn apply_repo_plan(
             deadline: args.pass_deadline,
         },
     );
-    // Red everywhere: the same check failing the same test on many heads.
-    // Reads nothing: the census's checks and the sweep's ledger records.
-    let red_everywhere_reds =
-        super::red_everywhere::reds(observation, ledger, &args.approval_context, &infra_excluded);
-    let red_everywhere_status = super::red_everywhere::run(
-        policy.ejection_guards.red_everywhere,
-        observation,
-        &red_everywhere_reds,
-        ledger,
-        &mut reports,
-        Utc::now().timestamp(),
-    );
+    // Mark the member rows of this pass's red-everywhere episodes, computed
+    // before the PR mutations above.
+    let red_everywhere_status = red_everywhere_pass.annotate(&mut reports);
     let mut unhealthy = (args.preempt_capacity && observation.preemption_error.is_some())
         || native_arm_failed
         || infra_rerun_failed
