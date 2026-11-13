@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Stamp a verdict comment with the session that posts it.
+"""Stamp a verdict or adversarial-ruling comment with the session that posts it.
 
 ``ghapp`` runs this before native ``gh``. When the request posts or edits a
 pull-request comment whose last non-blank line is a verdict marker
-(``verdict: APPROVE|HOLD head:<sha>`` or ``reviewed: <sha>``), the body gets
+(``verdict: APPROVE|HOLD head:<sha>`` or ``reviewed: <sha>``) or an
+adversary's ruling (``adversarial-ruling: OK|FIX-FIRST|BLOCK head:<sha>``,
+which no guard ever counts as a verdict), the body gets
 one more line just above that marker::
 
     <!-- session: <host>/<session>[ agent: <id>] -->
@@ -85,6 +87,12 @@ _MARKER = re.compile(
     r"^[ \t]*(?:reviewed:[ \t]*([0-9a-f]{40})"
     r"|verdict:[ \t]*(APPROVE|HOLD)[ \t]+head:[ \t]*([0-9a-f]{40}))[ \t]*$"
 )
+# Same pattern as queue-arm-guard's _RULING: the adversary's ruling, stamped so
+# must-review can trust who ruled, and a verdict to no guard. Used only when
+# queue-arm-guard's own marker_ruling cannot be loaded.
+_RULING = re.compile(
+    r"^[ \t]*adversarial-ruling:[ \t]*(OK|FIX-FIRST|BLOCK)[ \t]+head:[ \t]*([0-9a-f]{40})[ \t]*$"
+)
 # Any stamp already in a body, whole line or inline. The stamper replaces it:
 # the arm guard checks the stamp's host against the `session:` line, so a
 # stamp written by hand (or copied with the rest of a verdict) must not stand.
@@ -127,7 +135,18 @@ def _local_marker_verdict(body: str) -> Optional[Tuple[str, str]]:
     return ("APPROVE", match.group(1)) if match.group(1) else (match.group(2), match.group(3))
 
 
+def _local_marker_ruling(body: str) -> Optional[Tuple[str, str]]:
+    """queue-arm-guard's ``marker_ruling``, for a host whose guard cannot be
+    loaded or predates rulings: the last non-blank line by ``str.splitlines``."""
+    lines = [line for line in body.splitlines() if line.strip()]
+    match = _RULING.match(lines[-1]) if lines else None
+    return (match.group(1), match.group(2)) if match else None
+
+
 _GUARD_MARKER: Optional[Callable[[str], Any]] = None
+_GUARD_RULING: Optional[Callable[[str], Any]] = None
+# The sibling guard once loaded (None: not tried yet; False: not loadable).
+_GUARD_MODULE: Any = None
 
 
 def marker_verdict(body: str) -> Optional[Tuple[str, str]]:
@@ -137,11 +156,28 @@ def marker_verdict(body: str) -> Optional[Tuple[str, str]]:
     passes over (a `\\r\\n` ending once was)."""
     global _GUARD_MARKER
     if _GUARD_MARKER is None:
-        _GUARD_MARKER = _load_guard_marker() or _local_marker_verdict
+        _GUARD_MARKER = _load_guard_function("marker_verdict") or _local_marker_verdict
     return _GUARD_MARKER(body)
 
 
-def _load_guard_marker() -> Optional[Callable[[str], Any]]:
+def marker_ruling(body: str) -> Optional[Tuple[str, str]]:
+    """The adversary's ruling in ``body``, read with the guard's own
+    ``marker_ruling`` so the two agree; the local copy serves a host whose
+    installed guard predates rulings. Never a verdict: ``marker_verdict`` is
+    ``None`` for the same body, in the guard and here."""
+    global _GUARD_RULING
+    if _GUARD_RULING is None:
+        _GUARD_RULING = _load_guard_function("marker_ruling") or _local_marker_ruling
+    return _GUARD_RULING(body)
+
+
+def _load_guard_module() -> Any:
+    """The sibling queue-arm-guard as a module, loaded once; ``None`` when no
+    candidate loads or the one that loads has no ``marker_verdict``."""
+    global _GUARD_MODULE
+    if _GUARD_MODULE is not None:
+        return _GUARD_MODULE or None
+    _GUARD_MODULE = False
     here = pathlib.Path(__file__).resolve().parent
     for name in ("ghapp_queue_arm_guard.py", "queue-arm-guard"):
         candidate = here / name
@@ -157,8 +193,18 @@ def _load_guard_marker() -> Optional[Callable[[str], Any]]:
         except Exception:  # noqa: BLE001 - fall back to the local copy
             continue
         if callable(getattr(module, "marker_verdict", None)):
-            return module.marker_verdict
+            _GUARD_MODULE = module
+            return module
     return None
+
+
+def _load_guard_function(name: str) -> Optional[Callable[[str], Any]]:
+    function = getattr(_load_guard_module(), name, None)
+    return function if callable(function) else None
+
+
+def _load_guard_marker() -> Optional[Callable[[str], Any]]:
+    return _load_guard_function("marker_verdict")
 
 
 def strip_stamps(body: str) -> str:
@@ -174,12 +220,11 @@ def strip_stamps(body: str) -> str:
 
 
 def stamped(body: str) -> str | None:
-    """``body`` without any stamp it carried and, when it is a verdict, with
-    this session's stamp above its verdict line; ``None`` when there is
-    nothing to change (not a verdict, no stamp)."""
+    """``body`` without any stamp it carried and, when it is a verdict or an
+    adversarial ruling, with this session's stamp above its marker line;
+    ``None`` when there is nothing to change (neither, and no stamp)."""
     clean = strip_stamps(body)
-    verdict = marker_verdict(clean)
-    if verdict is None:
+    if marker_verdict(clean) is None and marker_ruling(clean) is None:
         return clean if clean != body else None
     lines = clean.splitlines()
     index = max(i for i, line in enumerate(lines) if line.strip())

@@ -160,6 +160,16 @@ class VerdictHoldHook(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.logged(), [], "only a HOLD on the last line acts")
 
+    def test_an_adversarial_ruling_is_not_a_hold(self) -> None:
+        # A BLOCK or FIX-FIRST ruling is stamped like a verdict but is not one:
+        # it never disarms or dequeues the head it names.
+        for ruling in ("BLOCK", "FIX-FIRST", "OK"):
+            body = (f"Adversarial review: {ruling} head {HEAD}\n\nreviewer: infra-review2\n"
+                    f"adversarial-ruling: {ruling} head:{HEAD}\n")
+            result = self.run_hook(self.comment(body), self.state(armed=True, queued=True))
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.logged(), [], "a ruling reads and mutates nothing")
+
     def test_off_reads_nothing(self) -> None:
         for switch in ("0", None):
             result = self.run_hook(self.comment(f"verdict: HOLD head:{HEAD}"),
