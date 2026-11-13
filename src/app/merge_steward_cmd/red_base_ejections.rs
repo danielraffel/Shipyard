@@ -127,10 +127,16 @@ pub(super) fn reconcile(
                 let Some(pr) = observation.prs.iter().find(|pr| pr.fact.number == *number) else {
                     continue;
                 };
+                // One window per (pull request, head, context): a head that
+                // rode the failing groups of two contexts with different red
+                // onsets keeps both windows, so an ejection in either is
+                // excused.
                 if pr.fact.queue_position.is_some()
-                    || entries
-                        .iter()
-                        .any(|entry| entry.pr == *number && entry.head == pr.fact.head_sha)
+                    || entries.iter().any(|entry| {
+                        entry.pr == *number
+                            && entry.head == pr.fact.head_sha
+                            && entry.context == poisoned.context
+                    })
                 {
                     continue;
                 }

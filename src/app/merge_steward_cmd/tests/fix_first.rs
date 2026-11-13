@@ -1571,7 +1571,8 @@ fn red_base_ejections_wait_for_every_context_and_a_full_read() {
     );
     assert_eq!(
         red_base_ejections::entries(&ledger, &observation.repo, &observation.base).len(),
-        1
+        2,
+        "one window per context"
     );
     // CONTEXT goes green on the tip; OTHER is still red.
     let mut tip = red_on_both();
@@ -1585,7 +1586,11 @@ fn red_base_ejections_wait_for_every_context_and_a_full_read() {
         Some(&one_left),
         Utc::now(),
     );
-    assert!(!red_base_ejections::entries(&ledger, &observation.repo, &observation.base)[0].ready);
+    assert!(
+        red_base_ejections::entries(&ledger, &observation.repo, &observation.base)
+            .iter()
+            .all(|entry| !entry.ready)
+    );
     // Both green but a third read failed: still not released.
     let mut tip = BTreeMap::from([
         (CONTEXT.to_owned(), tip_green()),
@@ -1607,7 +1612,11 @@ fn red_base_ejections_wait_for_every_context_and_a_full_read() {
         Some(&partial),
         Utc::now(),
     );
-    assert!(!red_base_ejections::entries(&ledger, &observation.repo, &observation.base)[0].ready);
+    assert!(
+        red_base_ejections::entries(&ledger, &observation.repo, &observation.base)
+            .iter()
+            .all(|entry| !entry.ready)
+    );
     // Fully read, nothing confirmed: released.
     let green = two_context_poison(
         &prs,
@@ -1624,7 +1633,11 @@ fn red_base_ejections_wait_for_every_context_and_a_full_read() {
         Some(&green),
         Utc::now(),
     );
-    assert!(red_base_ejections::entries(&ledger, &observation.repo, &observation.base)[0].ready);
+    assert!(
+        red_base_ejections::entries(&ledger, &observation.repo, &observation.base)
+            .iter()
+            .all(|entry| entry.ready)
+    );
 }
 
 /// A red tip with no red time of its own: nothing is recorded for
@@ -1739,4 +1752,86 @@ fn a_tip_with_no_completed_verdict_ends_nothing() {
     assert!(!red_base_ejections::entries(&ledger, &observation.repo, &observation.base)[0].ready);
     let green = poison(PoisonHold::On, &prs, streak(), tip_green());
     assert!(green.tip_green_for(CONTEXT));
+}
+
+/// A head that rode the failing groups of two confirmed contexts with
+/// different red onsets keeps one window per context, so an ejection inside
+/// the later context's window is excused too.
+#[test]
+fn a_head_red_on_two_contexts_keeps_a_window_for_each() {
+    use crate::app::merge_steward_cmd::red_base_ejections;
+    let prs = [ejected_404(), pr_409()];
+    let mut observation = observation_for(prs[0].clone(), true);
+    observation.prs = prs.to_vec();
+    let at = |text: &str| {
+        chrono::DateTime::parse_from_rfc3339(text)
+            .expect("time")
+            .with_timezone(&Utc)
+    };
+    let red_at = |text: &str| TipReading {
+        red: true,
+        red_since: Some(at(text)),
+        newest_at: Some(at(text)),
+        ..TipReading::default()
+    };
+    // CONTEXT went red at 10:00, OTHER at 14:00.
+    let mut red = two_context_poison(
+        &prs,
+        BTreeMap::from([
+            (CONTEXT.to_owned(), red_at("2026-11-13T10:00:00Z")),
+            (OTHER.to_owned(), red_at("2026-11-13T14:00:00Z")),
+        ]),
+    );
+    red.policy.acts = crate::base_health::TriageActs::all(PoisonHold::On);
+    let mut ledger = StewardLedger::default();
+    red_base_ejections::reconcile(
+        PoisonHold::On,
+        true,
+        &mut ledger,
+        &observation,
+        Some(&red),
+        at("2026-11-13T14:30:00Z"),
+    );
+    let entries = red_base_ejections::entries(&ledger, &observation.repo, &observation.base);
+    assert_eq!(entries.len(), 2, "one window per context: {entries:?}");
+    // Both green, fully read: both windows close.
+    let green = two_context_poison(
+        &prs,
+        BTreeMap::from([
+            (CONTEXT.to_owned(), tip_green()),
+            (OTHER.to_owned(), tip_green()),
+        ]),
+    );
+    red_base_ejections::reconcile(
+        PoisonHold::On,
+        true,
+        &mut ledger,
+        &observation,
+        Some(&green),
+        at("2026-11-13T15:00:00Z"),
+    );
+    // An ejection at 14:20 lies only in OTHER's window (from 12:00, two
+    // hours before its onset, to 15:00); CONTEXT's window starts at 08:00 so
+    // it covers it too, and one at 07:30 lies in neither.
+    let head = "a".repeat(40);
+    let late = removals(&head, &[("failed_checks", "2026-11-13T14:20:00Z")]);
+    let excused = red_base_ejections::excused_queue(
+        &ledger,
+        &observation.repo,
+        &observation.base,
+        404,
+        &head,
+        &late,
+    );
+    assert_eq!(removal_count(&excused), 0);
+    let early = removals(&head, &[("failed_checks", "2026-11-13T07:30:00Z")]);
+    let kept = red_base_ejections::excused_queue(
+        &ledger,
+        &observation.repo,
+        &observation.base,
+        404,
+        &head,
+        &early,
+    );
+    assert_eq!(removal_count(&kept), 1);
 }
