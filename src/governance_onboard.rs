@@ -358,7 +358,14 @@ pub fn render_config(
         "reviewer_stamp_sessions",
         toml_edit::value(string_array(&sessions)),
     );
-    set_key(auto_merge, "fleet_review_required", toml_edit::value(true));
+    let strict_review = before
+        .get("auto_merge")
+        .and_then(|section| section.get("arm_requires_head_approval"))
+        .and_then(toml::Value::as_bool)
+        == Some(true);
+    if !strict_review {
+        set_key(auto_merge, "fleet_review_required", toml_edit::value(true));
+    }
     let pr_gates_set = before
         .get("validation")
         .and_then(|validation| validation.get("pr_gates"))

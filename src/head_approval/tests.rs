@@ -4017,6 +4017,13 @@ fn the_base_fleet_review_switch_requires_review_off_the_compiled_list() {
     assert!(
         ApprovalPolicy::from_table_for_repo(&strict_off, "danielraffel/not-listed", false).required
     );
+    let strict_on: toml::Table = "[auto_merge]\narm_requires_head_approval = true\nreviewer_identities = [\"reviewer\"]\nfleet_review_required = true\n"
+        .parse()
+        .expect("toml");
+    let policy = ApprovalPolicy::from_table_for_repo(&strict_on, "danielraffel/not-listed", false);
+    assert!(policy.required);
+    assert!(!policy.any_reviewer_but_author);
+    assert_eq!(policy.reviewer_logins, ["reviewer"]);
     for silent in [
         "[auto_merge]\nfleet_review_required = false\n",
         "[auto_merge]\n",

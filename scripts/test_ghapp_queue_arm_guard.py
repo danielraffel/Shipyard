@@ -3516,6 +3516,14 @@ class FleetReviewRequiredConfig(unittest.TestCase):
             "[auto_merge]\narm_requires_head_approval = false\nfleet_review_required = true\n",
             "danielraffel/not-listed", False)
         self.assertIs(strict_off["required"], True)
+        strict_on = guard.review_policy(
+            "[auto_merge]\narm_requires_head_approval = true\n"
+            "reviewer_identities = [\"reviewer\"]\n"
+            "fleet_review_required = true\n",
+            "danielraffel/not-listed", False)
+        self.assertIs(strict_on["required"], True)
+        self.assertIs(strict_on["any_but_author"], False)
+        self.assertEqual(strict_on["reviewers"], ["reviewer"])
 
     def test_false_or_absent_changes_nothing(self) -> None:
         for config in ("[auto_merge]\nfleet_review_required = false\n", "[auto_merge]\n", None):

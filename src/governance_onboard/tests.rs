@@ -260,9 +260,9 @@ extra = 3
         assert!(rendered.text.contains(kept), "{kept}\n{}", rendered.text);
     }
     let table: toml::Table = toml::from_str(&rendered.text).expect("toml");
-    assert_eq!(
-        table["auto_merge"]["fleet_review_required"].as_bool(),
-        Some(true)
+    assert!(
+        table["auto_merge"].get("fleet_review_required").is_none(),
+        "strict reviewer policy must not gain the looser fleet switch"
     );
     assert_eq!(
         table["validation"]["pr_gates"].as_bool(),
@@ -271,10 +271,7 @@ extra = 3
     );
     assert_eq!(
         rendered.changed_keys,
-        vec![
-            "auto_merge.reviewer_stamp_sessions",
-            "auto_merge.fleet_review_required",
-        ]
+        vec!["auto_merge.reviewer_stamp_sessions"]
     );
 }
 

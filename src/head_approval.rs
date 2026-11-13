@@ -1152,7 +1152,19 @@ impl ApprovalPolicy {
             .unwrap_or(false);
         if base_required {
             policy.required = true;
-            policy.any_reviewer_but_author = true;
+            // An explicit `arm_requires_head_approval = true` selects the
+            // strict reviewer_identities rule.  The fleet switch is the
+            // looser default rule and must not widen that policy when both
+            // keys are present.
+            let strict = table
+                .get(CONFIG_TABLE)
+                .and_then(toml::Value::as_table)
+                .and_then(|section| section.get(REQUIRED_KEY))
+                .and_then(toml::Value::as_bool)
+                == Some(true);
+            if !strict {
+                policy.any_reviewer_but_author = true;
+            }
         }
         policy
     }

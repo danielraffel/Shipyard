@@ -1169,12 +1169,16 @@ def review_policy(config_text: str | None, repo: str, host_default: bool) -> dic
                          f"must be a boolean, not {fleet_required!r}")
     reviewers = section.get("reviewer_identities", section.get("reviewer_logins")) or []
     from_default = not isinstance(required, bool) and default
+    strict = required is True
     if fleet_required is True:
         # The base's switch has the exact semantics of REVIEW_REQUIRED_REPOS
         # membership: review is required and fleet App approvals count, as
         # src/head_approval.rs reads it.
         required = True
-        from_default = True
+        # An explicit arm_requires_head_approval=true selects the strict
+        # reviewer_identities rule. Do not widen it when both keys are set.
+        if not strict:
+            from_default = True
     humans = section.get("human_reviewers") or []
     # The protected base may name its own signers; otherwise this host's
     # signers file decides (see reviewer_signers).
