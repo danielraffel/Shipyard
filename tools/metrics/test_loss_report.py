@@ -103,6 +103,22 @@ class EpisodeTests(Fixture):
         self.assertEqual(r["sources"]["repo_ticks_without_pr_list"], 1)
         self.assertEqual(r["coverage"]["window"]["status"], "partial")
 
+    def test_malformed_tick_makes_coverage_partial_then_unavailable(self):
+        rows = [(1, "a", "required_failed:macos", "author", None)]
+        day = dt.datetime(2026, 11, 13, 1, 0, tzinfo=UTC)
+        self.live(day, rows)
+        self.live(day + dt.timedelta(hours=1), rows)
+        clean = lr.build_report(str(self.dir), dt.timedelta(hours=12), self.now)
+        self.assertEqual(clean["coverage"]["window"]["status"], "available")
+        (self.dir / f"acme_repo-{stamp(day + dt.timedelta(minutes=90))}.json").write_text("{")
+        r = lr.build_report(str(self.dir), dt.timedelta(hours=12), self.now)
+        self.assertEqual(r["coverage"]["window"]["status"], "partial")
+        for f in self.dir.glob("acme_repo-*.json"):
+            if f.read_text() != "{":
+                f.unlink()
+        r = lr.build_report(str(self.dir), dt.timedelta(hours=12), self.now)
+        self.assertEqual(r["coverage"]["window"]["status"], "unavailable")
+
     def test_required_pending_is_a_normal_wait_whatever_the_actor(self):
         self.live(dt.datetime(2026, 11, 12, 1, 0, tzinfo=UTC), [
             (1, "a", "required_pending", "author", None), (2, "b", "required_pending", "repair", None),

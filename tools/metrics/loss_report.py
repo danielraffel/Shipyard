@@ -337,7 +337,7 @@ def build_report(log_dir, since, now, github=None, gap_minutes=120):
 
     ticks_total = st["live_files"] + st["archive_files"]
     observed_days = sum(1 for dd in days if n_ticks_days.get(dd, 0))
-    window_cov = cov("available" if observed_days == len(days) and not gaps and not st["bad_archives"] and not st["no_pr_list"] else
+    window_cov = cov("available" if observed_days == len(days) and not gaps and not st["bad_archives"] and not st["no_pr_list"] and not st["unreadable"] else
                      "partial" if ticks_total else "unavailable",
                      f"{observed_days} of {len(days)} UTC days have tick files; {gaps} gap(s) over {gap_minutes} min; "
                      f"{st['unreadable']} unreadable, {st['bad_archives']} unreadable archive(s), "
