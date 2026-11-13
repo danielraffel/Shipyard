@@ -1973,6 +1973,23 @@ artifacts = [
         assert!(text.contains("next (reviewer): Nothing to do."), "{text}");
     }
 
+    /// A capacity queue is "not blocked": the wait never matches on it and the
+    /// printed next action says so (the invariant `page_only_on_merge_blocking`).
+    #[test]
+    fn wait_pr_actionable_reports_capacity_queued_as_not_blocked() {
+        let mut snapshot = actionable_snapshot(false);
+        snapshot["blocked_on"] = Value::from("capacity_queued");
+        snapshot["next_action"] = serde_json::json!({
+            "actor": "ci",
+            "action": "Not blocked: required check(s) macos are queued for a runner.",
+            "stop": false
+        });
+        let (code, text) = run_actionable_wait(&snapshot, false);
+        assert_eq!(code, ExitCode::from(WAIT_EXIT_TIMEOUT));
+        assert!(text.contains("blocked_on=capacity_queued"), "{text}");
+        assert!(text.contains("next (ci): Not blocked"), "{text}");
+    }
+
     /// The JSON envelope carries the whole answer under `observed`, from the
     /// snapshot's own `actionable` flag, never re-derived from the token.
     #[test]
