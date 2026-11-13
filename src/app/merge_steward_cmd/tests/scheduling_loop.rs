@@ -523,3 +523,47 @@ fn the_real_tab_separated_quarantine_line_parses() {
     assert_eq!(head, "eadd0feb4c53603d07151cc1938eb26257eb87d1");
     assert_eq!(*since, DateTime::from_timestamp(1_794_581_918, 0));
 }
+
+/// On first sight the clock starts at the earliest applicable timestamp:
+/// an older dwell or row time is never discarded for a later preferred one.
+#[test]
+fn first_sight_uses_the_earliest_applicable_timestamp() {
+    let base = RowFacts {
+        number: 5,
+        head: HEAD,
+        token: "required_failed:macos",
+        decision: &ARM,
+        since: Some(ago(20)),
+        since_source: Some("check_completed"),
+        dwell_since: Some(ago(45)),
+        enqueued_at: None,
+    };
+    let (state, _) = for_row(REPO, &base, None, &BTreeMap::new(), now()).expect("covered");
+    assert_eq!(
+        state.since,
+        ago(45).to_rfc3339(),
+        "the older dwell entry wins"
+    );
+    assert_eq!(
+        state.level, 1,
+        "45 minutes red is past the 10-minute claim deadline"
+    );
+    let row_older = RowFacts {
+        since: Some(ago(70)),
+        since_source: Some("head_commit"),
+        ..base.clone()
+    };
+    let (state, _) = for_row(REPO, &row_older, None, &BTreeMap::new(), now()).expect("covered");
+    assert_eq!(state.since, ago(70).to_rfc3339(), "the older row time wins");
+    // A state change at the same head still starts no earlier than the
+    // last sighting of the old state.
+    let running = Seen {
+        state: LoopState::CheckRunning,
+        head: HEAD.to_owned(),
+        since: ago(120),
+        observed_at: Some(ago(5)),
+    };
+    let (state, _) =
+        for_row(REPO, &base, Some(&running), &BTreeMap::new(), now()).expect("covered");
+    assert_eq!(state.since, now().to_rfc3339());
+}

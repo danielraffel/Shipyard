@@ -128,7 +128,11 @@ names is quarantined; a new head is classified normally.
   check starting (`check_running`). A green time that predates an approval
   never dates `ready`, so `ready` starts at level 0.
 - A head seen for the first time (a push, or the first pass after a
-  deploy): the earliest evidence the pass has, else this pass.
+  deploy): the earliest of every applicable timestamp the pass has (the
+  state-specific evidence above, the dwell entry for the same token at this
+  head, the row's own `since`), else this pass. For `queued` and
+  `quarantined` only the enqueue and the quarantine line count, since the
+  row's token and its times describe another state.
 
 ## Records
 

@@ -503,11 +503,22 @@ pub(crate) fn for_row(
             .filter(|at| seen.observed_at.is_none_or(|floor| *at >= floor))
             .unwrap_or(now),
         // First sight of this head (a push, or the first pass after a
-        // deploy): the earliest evidence the pass has.
-        None => specific_evidence(state, facts, quarantined_at)
-            .or(facts.dwell_since)
-            .or(facts.since)
-            .unwrap_or(now),
+        // deploy): the earliest of every applicable timestamp the pass has,
+        // so an older dwell or row time is never discarded. `queued` and
+        // `quarantined` are decided by the queue and the file, not the row's
+        // token, so the row's and dwell's times date another state there.
+        None => {
+            let token_dated = !matches!(state, LoopState::Queued | LoopState::Quarantined);
+            [
+                specific_evidence(state, facts, quarantined_at),
+                facts.dwell_since.filter(|_| token_dated),
+                facts.since.filter(|_| token_dated),
+            ]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(now)
+        }
     }
     .min(now);
     Some((
