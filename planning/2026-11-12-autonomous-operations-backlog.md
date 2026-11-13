@@ -6,6 +6,12 @@ says what is in progress and why. Everything here outside the core is a
 ranked candidate, not a commitment: an item starts only when the ledger shows
 a repeated, attributable loss it would remove.
 
+Statements below about what main does today (a mode, a default, a caller
+that does or does not exist) come from a reading of code and documentation
+on 2026-11-12. They are reported, not verified, and none describes a fleet
+host's effective configuration. Whoever takes an item confirms its premise
+first.
+
 Findings from 2026-11-12 that change items below:
 
 - **C (conflicts).** Classification is done. 18 percent of 144 conflict

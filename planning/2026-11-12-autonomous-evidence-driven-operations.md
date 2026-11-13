@@ -184,28 +184,33 @@ the mode remains `Verification required`.
 | --- | --- | --- |
 | Typed classification set | `blocked_on` tokens with `since`, and `next_action {actor, action, stop}`, one per open PR per steward pass (`src/app/merge_steward_cmd/blocked_on.rs`, `next_action.rs`, `docs/automated-draining.md`) | Verification required |
 | "Recommend one recovery loop" | Infra rerun for required checks (`infra_rerun.rs`) | Verification required |
-| | Known-flake and not-head-caused same-head retry | On with a merge queue; `known_flaky_tests` empty by default |
-| | Dwell-time acts: stale verdict re-run, `required_never_ran` dispatch, reorder, retarget (`[auto_merge.dwell]`) | Shadow |
-| | Superseded detection (`docs/superseded-close.md`) | Shadow; closing not built |
-| | Base-poison hold, fast-track, pause (`[base_health]`) | Pause dry-run, `auto_jump` off |
-| | Environment requeue, queue-absent recovery | Opt-in, off by default |
-| | Runner watchdog | Report-only without `--fix` |
+| | Known-flake and not-head-caused same-head retry | Reported: on with a merge queue; `known_flaky_tests` empty by default. Verification required |
+| | Dwell-time acts: stale verdict re-run, `required_never_ran` dispatch, reorder, retarget (`[auto_merge.dwell]`) | Reported: shadow. Verification required |
+| | Superseded detection (`docs/superseded-close.md`) | Reported: shadow; closing not built. Verification required |
+| | Base-poison hold, fast-track, pause (`[base_health]`) | Reported: pause dry-run, `auto_jump` off. Verification required |
+| | Environment requeue, queue-absent recovery | Reported: opt-in, off by default. Verification required |
+| | Runner watchdog | Reported: report-only without `--fix`. Verification required |
 | Failure classification | `ci.cause/v1` cause records, `FailureClass` in `src/classify.rs`, `src/diagnose/classify.rs`: three vocabularies | Verification required |
 | Historical benchmark | `shipyard metrics scorecard`, `gate_cost` weekly scorecard, hourly baseline collector joining GitHub timing and TartCI exports, merge-receipt contract | Verification required |
 | Review usefulness contract | `verdict: APPROVE head:<sha>` / HOLD, `review-verdict` status, reviewer claims and receipts, repair budget | Verification required |
-| Low-risk fast path | `tools/fleet-pass/version_only.py` | Shadow, decides after 10 agreements |
-| Risk tier | `docs/risk-tier.md` | Report-only; does not route reviewers or models |
-| Model escalation receipt | fleet-pass logs the requested model only | Absent |
-| Autonomy rollout | `docs/autonomy-contract.md` (A1 to A12, F1 to F8), `planning/autonomy-recovery-rollout-20261027.md` | Contract and evidence in progress, default-off |
+| Low-risk fast path | `tools/fleet-pass/version_only.py` | Reported: shadow, decides after 10 agreements. Verification required |
+| Risk tier | `docs/risk-tier.md` | Reported: report-only; does not route reviewers or models. Verification required |
+| Model escalation receipt | fleet-pass logs the requested model only (`tools/fleet-pass/fleet-pass.sh`, `logline`) | Reported: absent. Verification required |
+| Autonomy rollout | `docs/autonomy-contract.md` (A1 to A12, F1 to F8), `planning/autonomy-recovery-rollout-20261027.md` | Reported: contract and evidence in progress, default-off. Verification required |
 
-Read the Mode column strictly. "Enforced" means the code runs in the fleet
-today. Several rows are capabilities that exist but are not doing anything:
-`known_flaky_tests` is empty by default, so flake retry has nothing to act
-on; the verdict format is enforced but nothing requires a HOLD to carry a
-finding; the scorecards run but there is no durable per-PR, per-token
-transition record, which is why L1 exists. No metric in this plan is called
-running until its source, retention, denominator, and completeness have been
-shown.
+Every status in this table is a reading of code and documentation on
+2026-11-12, not a receipt. None of it says what is configured on a fleet
+host: a default in code and the effective mode on m3 can differ, and this
+plan has not read m3's configuration. Two gaps are visible from the reading
+alone: nothing requires a HOLD to carry a finding, and there is no durable
+per-PR, per-token transition record, which is why L1 exists. No metric in
+this plan is called running until its source, retention, denominator, and
+completeness have been shown.
+
+The first use of the ledger work is therefore a **mode register**: one
+command, run on each host, that prints every recovery's effective mode with
+the config key and value it came from. Until that exists, every mode named
+in this plan is a reported default.
 
 Consequences for this plan:
 
@@ -425,17 +430,19 @@ and quarantine behavior; the receipt it writes; terminal states and
 escalation conditions; the expected reduction in interventions; and its
 negative tests with a planted negative.
 
-Current standing against the ladder:
+Standing against the ladder, as reported:
 
-| Recovery | Now | Next step |
+| Recovery | Reported default (not verified, not the host's effective mode) | Next step |
 | --- | --- | --- |
-| Infra rerun | `enforce` | Add to loop verification |
-| Superseded close | `shadow`, close not built | Build close; score; canary |
-| Dwell acts | `shadow` | Score each act type separately; canary the two re-run acts first |
-| Version-only review | `shadow` | Score; canary on Shipyard |
-| Base-poison pause | `dry-run` | Stays shadow: replay showed the verdict was rarely right. Fix the detector before any promotion |
-| Environment requeue, queue-absent recovery | opt-in off | Enter shadow with scoring |
-| Conflict repair | does not exist | See C1 |
+| Infra rerun | reported `enforce` | Confirm in the mode register; add to weekly verification |
+| Superseded close | reported `shadow`, close not built | Confirm; build close; score; canary |
+| Dwell acts | reported `shadow` | Confirm; score each act type separately; canary the two re-run acts first |
+| Version-only review | reported `shadow` | Confirm; score; canary on Shipyard |
+| Base-poison pause | reported `dry-run` | Confirm; stays shadow until the detector is fixed, per `docs/automated-draining.md` |
+| Environment requeue, queue-absent recovery | reported opt-in, off | Confirm; enter shadow with scoring |
+| Conflict repair | does not exist | Not started |
+
+The mode register replaces the middle column with verified values.
 
 ## Confidence
 
