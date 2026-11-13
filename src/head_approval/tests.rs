@@ -3585,6 +3585,37 @@ fn a_verdict_line_ends_where_the_python_readers_end_it() {
     }
 }
 
+/// The adversary's ruling marker, `adversarial-ruling: OK|FIX-FIRST|BLOCK
+/// head:<sha>`, is stamped like a verdict (so must-review can trust who ruled)
+/// and is a verdict to nothing: this twin and the Python guard's
+/// `marker_verdict` both read `None` from it, stamped or bare, whatever the
+/// line ending, so no ruling approves or holds a head.
+#[test]
+fn an_adversarial_ruling_is_never_a_verdict() {
+    let head = "a".repeat(40);
+    for ruling in ["OK", "FIX-FIRST", "BLOCK"] {
+        for ending in ["\n", "\r\n", "\r", "\u{2028}", ""] {
+            for body in [
+                format!("adversarial-ruling: {ruling} head:{head}{ending}"),
+                format!(
+                    "Adversarial review: {ruling} head {head}\n\nNo open finding is a defect.\n\n\
+                     reviewer: infra-review2\n\
+                     <!-- session: Daniels-Mac-Studio-m3/fleet-pass-reviewer-adversarial-1 \
+                     agent: infra-review2 -->\n\
+                     adversarial-ruling: {ruling} head:{head}{ending}"
+                ),
+                format!(
+                    "verdict: APPROVE head:{head}\nadversarial-ruling: {ruling} head:{head}{ending}"
+                ),
+            ] {
+                assert_eq!(super::marker_verdict(&body), None, "{body:?}");
+                assert_eq!(super::verdict_line(&body), None, "{body:?}");
+                assert!(!super::marker_names_head(&body, &head), "{body:?}");
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Carry guardrails (the twin of the Python guard's carry_excluded,
 // carry_limits and MAX_CARRY_MERGES).

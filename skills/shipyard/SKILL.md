@@ -690,6 +690,21 @@ cooldown, limit 1); the lockfile mode is `[governance.lockfile].mode`
 (`advisory` until promoted). The audit's workflow checks are textual: a
 version comment after a SHA must look like `# v1.2.3`.
 
+## An adversarial ruling is stamped like a verdict and counted by nothing
+
+A comment whose last line is exactly `adversarial-ruling: OK|FIX-FIRST|BLOCK
+head:<40 lowercase hex>` gets the same `<!-- session: ... -->` stamp a verdict
+gets (so the handbook's must-review can trust who ruled), and `ghapp` refuses
+to post one the stamper did not answer for, "verdict or ruling NOT posted,
+retry". It is not a verdict: `marker_verdict` in `ghapp_queue_arm_guard.py`,
+`review_verdict_status.py`, `src/head_approval.rs`, the hold hook, the
+contradiction guard and the claim guard all read `verdict:` / `reviewed:`
+lines only, so a ruling can neither approve nor hold a head. When adding a
+reader of verdict lines, keep it on `marker_verdict` (or the Rust twin); never
+match on `head:<sha>` alone, or a ruling would count. Tests:
+`AdversarialRulingIsNoVerdict` (arm guard), the `Stamp` ruling cases (stamper),
+`an_adversarial_ruling_is_never_a_verdict` (Rust).
+
 ## merge-guard is versioned and tested here
 
 `merge-guard` (refuses `pr merge` on a private repo that cannot enforce
@@ -3849,6 +3864,7 @@ UTC), and each repository carries `blocked_summary` (counts per token and the
 three oldest blocked rows with `age_minutes`). Read those instead of inferring
 the state from `mutation`: `waiting_head_approval` alone does not say whether
 nobody reviewed the head, a reviewer holds it, or its approval is excluded.
+A row with an `error` also carries `error_kind`: `read` (a 5xx, timeout, dropped connection or rate limit while reading; the next pass retries it, so treat the row as unobserved, not refused) or `policy` (a decision or a failed action). The steward tick logs the first as `read_deferred=` and the second as `pr_refused=`.
 The full token list is in `docs/automated-draining.md`. Each row also carries
 `next_action` (`actor`, `action`, `stop`), and `shipyard wait pr <n> --state
 actionable --timeout <s> --json` gives one pull request that answer live and

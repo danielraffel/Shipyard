@@ -3386,6 +3386,39 @@ class ShipyardReviewOnly(unittest.TestCase):
                               body=f"Reviewed.\nreviewer: {signer}\n"
                                    f"verdict: APPROVE head:{HEAD_784}")]]
 
+    def ruled(self, ruling: str, signer: str = "infra-review2") -> list[list[dict[str, Any]]]:
+        """The fleet App's stamped adversarial ruling on the head, as the
+        handbook's adversary pass posts it through the stamper."""
+        pages = review_fixture("shipyard-784-comments.json")
+        approve = next(c for c in pages[0] if c["id"] == APPROVE_784_COMMENT)
+        return [[comment_like(
+            approve, created_at="2026-10-12T15:00:00Z",
+            body=f"Adversarial review: {ruling} head {HEAD_784}\n\nNo open finding is a defect "
+                 f"at this head.\n\nreviewer: {signer}\n"
+                 f"<!-- session: Daniels-Mac-Studio-m3/fleet-pass-reviewer-adversarial-1 "
+                 f"agent: {signer} -->\nadversarial-ruling: {ruling} head:{HEAD_784}\n")]]
+
+    def test_an_adversarial_ruling_never_approves_a_head(self) -> None:
+        # The ruling is stamped and signed exactly like a counting APPROVE from
+        # the same signer, and names the exact head: the only difference is the
+        # marker line, and that difference alone must keep the head unapproved.
+        signers = self.guards / "reviewer-signers.json"
+        signers.write_text(json.dumps({"default": ["infra-review2"]}), encoding="utf-8")
+        for ruling in ("OK", "FIX-FIRST", "BLOCK"):
+            with self.subTest(ruling=ruling):
+                result = self.land(self.approved_784(comments=self.ruled(ruling), reviews=[[]]))
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("no reviewer verdict names head fd0e94e25f44", result.stderr)
+                self.assertNotIn("makes it un-approvable", result.stderr,
+                                 "a BLOCK or FIX-FIRST ruling is not a HOLD either")
+                entry = self.ledger()[-1]
+                self.assertEqual((entry["verdict"], entry["pr"], entry["head"]),
+                                 ("refused", 784, HEAD_784))
+        # Control: the same signer's verdict line, same stamp shape, is counted.
+        control = self.land(self.approved_784(comments=self.signed("infra-review2")))
+        self.assertEqual(control.returncode, 0, control.stderr)
+        self.assertEqual(self.ledger()[-1]["verdict"], "allowed")
+
     def test_an_unverdicted_head_is_refused_and_recorded(self) -> None:
         result = self.land(self.approved_784(comments=[[]], reviews=[[]]))
         self.assertEqual(result.returncode, 1, result.stderr)
@@ -4890,3 +4923,60 @@ class ReviewerClaimReviewGate(unittest.TestCase):
         self.assertFalse(allowed, message)
         self.assertIn("reviewer claim receipt refused", message)
         self.assertEqual(fix["cause"], "unreviewed")
+
+
+class AdversarialRulingIsNoVerdict(unittest.TestCase):
+    """`adversarial-ruling: OK|FIX-FIRST|BLOCK head:<sha>` is stamped like a
+    verdict so must-review can trust who ruled, and is a verdict to nothing
+    that counts approvals: `marker_verdict` reads None from it, so the arm
+    guard, `review_verdict_status.py` (which calls this guard) and every
+    comment scan here skip it."""
+
+    ENDINGS = ("\n", "\r\n", "\r", " ", "\n\r\n \r\n", "")
+
+    def test_marker_ruling_reads_exactly_the_marker(self) -> None:
+        for ruling in ("OK", "FIX-FIRST", "BLOCK"):
+            for ending in self.ENDINGS:
+                body = f"Adversarial review: {ruling} head {HEAD_784}\n\nreviewer: infra-review2\n" \
+                       f"adversarial-ruling: {ruling} head:{HEAD_784}{ending}"
+                with self.subTest(ruling=ruling, ending=ending):
+                    self.assertEqual(guard.marker_ruling(body), (ruling, HEAD_784))
+                    self.assertIsNone(guard.marker_verdict(body))
+        for body in (f"adversarial-ruling: OK head:{HEAD_784.upper()}",
+                     f"adversarial-ruling: ok head:{HEAD_784}",
+                     f"adversarial-ruling: OK head:{HEAD_784[:39]}",
+                     f"adversarial-ruling: OK head {HEAD_784}",
+                     f"adversarial-ruling: OK head:{HEAD_784}\nthen prose",
+                     f"Adversarial review: OK head {HEAD_784}", ""):
+            with self.subTest(body=body):
+                self.assertIsNone(guard.marker_ruling(body))
+                self.assertIsNone(guard.marker_verdict(body))
+
+    def test_the_ruling_pattern_shares_the_verdict_patterns_shape(self) -> None:
+        # Same anchors, same whitespace, same lowercase 40-hex head: a body is
+        # a ruling to the stamper exactly when it is one here.
+        self.assertEqual(
+            guard._RULING.pattern,
+            r"^[ \t]*adversarial-ruling:[ \t]*(OK|FIX-FIRST|BLOCK)[ \t]+head:[ \t]*([0-9a-f]{40})[ \t]*$")
+        self.assertIn("([0-9a-f]{40})", guard._MARKER.pattern)
+        self.assertNotIn("adversarial", guard._MARKER.pattern)
+
+    def test_a_stamped_ruling_counts_as_no_verdict_in_a_comment_scan(self) -> None:
+        pages = review_fixture("shipyard-784-comments.json")
+        approve = next(c for c in pages[0] if c["id"] == APPROVE_784_COMMENT)
+        policy = {"reviewers": [], "any_but_author": True, "humans": []}
+        for ruling in ("OK", "FIX-FIRST", "BLOCK"):
+            comment = comment_like(
+                approve, body=f"Adversarial review: {ruling} head {HEAD_784}\n\nreviewer: infra-review2\n"
+                              f"<!-- session: m3/fleet-pass-reviewer-adversarial-1 agent: infra-review2 -->\n"
+                              f"adversarial-ruling: {ruling} head:{HEAD_784}\n")
+            with self.subTest(ruling=ruling):
+                self.assertEqual(guard.counting_verdicts(None, [comment], [], policy), [])
+        # Control: the same App comment with a verdict last line is read (a
+        # HOLD, which no stamp or signer rule qualifies), so the scan above
+        # skipped the rulings for their marker, not for their author.
+        hold = comment_like(approve, body=f"Adversarial review: BLOCK head {HEAD_784}\n\n"
+                                          f"reviewer: infra-review2\n"
+                                          f"verdict: HOLD head:{HEAD_784}\n")
+        found = guard.counting_verdicts(None, [hold], [], policy)
+        self.assertEqual([(entry[1], entry[2]) for entry in found], [("HOLD", HEAD_784)])

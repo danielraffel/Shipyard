@@ -236,6 +236,16 @@ named in code; the next release or reconcile tick rolls and verifies it like
 every other host.
 `shipyard doctor` reports each host's version against the latest release.
 
+## ShipyardLauncher.app is signed separately and rarely
+
+`tools/shipyard-launcher/build_launcher.py --sign --notarize` builds, signs,
+notarizes and staples the launcher bundle on the maintainer's Mac, with the
+same signing environment as the release DMG. It is not part of a CLI release:
+the bundle changes rarely, and each host's Full Disk Access grant survives a
+rebuild as long as the bundle identifier and team stay the same. See
+`tools/shipyard-launcher/README.md` for staging, the owner's one-time grant and
+activation.
+
 ## Preferred runner provider
 
 Shipyard's own CI defaults to GitHub-hosted runners. Namespace remains an
