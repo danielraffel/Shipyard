@@ -98,8 +98,9 @@ refused, held or unapproved head. A read or post error fails the job too (it
 never passes by default). The commit status is posted exactly as before.
 
 Only the `pull_request_target` run leaves its check run on the pull request's
-head; a comment's (`issue_comment`) or a review's (`workflow_run`) run leaves
-its check run on the default branch's tip, where it gates nothing. Those runs
+head; a dispatched (`workflow_dispatch`, input `pull_request`), a comment's
+(`issue_comment`) or a review's (`workflow_run`) run leaves its check run on
+the default branch's tip, where it gates nothing. Those runs
 post the status and then re-run the head's newest `pull_request_target` run
 (`actions: write`), so an APPROVE or a HOLD changes the head's check without a
 new push. A re-run that cannot be requested fails the job.
@@ -108,7 +109,7 @@ new push. A re-run that cannot be requested fails the job.
 
 Every trigger runs the default branch's definition of the poster:
 
-- `pull_request_target` and `issue_comment` always do;
+- `pull_request_target`, `workflow_dispatch` and `issue_comment` always do;
 - a review is different: `pull_request_review` runs the pull request's own
   copy of the workflow file, so a same-repository pull request could rewrite
   a job that holds `statuses: write`. Reviews therefore start
@@ -228,6 +229,12 @@ jobs:
 name: Review verdict
 
 on:
+  workflow_dispatch:
+    inputs:
+      pull_request:
+        description: Pull request number to evaluate
+        required: true
+        type: string
   pull_request_target:
     types: [opened, reopened, synchronize, ready_for_review]
   issue_comment:
@@ -246,7 +253,7 @@ permissions:
   actions: write
 
 concurrency:
-  group: review-verdict-${{ github.event.pull_request.number || github.event.issue.number || github.event.workflow_run.pull_requests[0].number || github.event.check_run.pull_requests[0].number || github.event.workflow_run.head_sha || github.event.check_run.head_sha }}
+  group: review-verdict-${{ github.event.pull_request.number || github.event.inputs.pull_request || github.event.issue.number || github.event.workflow_run.pull_requests[0].number || github.event.check_run.pull_requests[0].number || github.event.workflow_run.head_sha || github.event.check_run.head_sha }}
   cancel-in-progress: false
 
 jobs:

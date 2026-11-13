@@ -1146,6 +1146,10 @@ def review_policy(config_text: str | None, repo: str, host_default: bool) -> dic
     reviewers = section.get("reviewer_identities", section.get("reviewer_logins")) or []
     from_default = not isinstance(required, bool) and default
     if fleet_required is True:
+        # The base's switch has the exact semantics of REVIEW_REQUIRED_REPOS
+        # membership: review is required and fleet App approvals count, as
+        # src/head_approval.rs reads it.
+        required = True
         from_default = True
     humans = section.get("human_reviewers") or []
     # The protected base may name its own signers; otherwise this host's

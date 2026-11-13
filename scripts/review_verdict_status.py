@@ -68,11 +68,12 @@ DESCRIPTION_LIMIT = 140
 GUARD = pathlib.Path(__file__).with_name("ghapp_queue_arm_guard.py")
 WORKFLOW_NAME = "Review verdict"
 # Only a ``pull_request_target`` run leaves its check run on the pull
-# request's head. A comment's or a review's run (``issue_comment``,
-# ``workflow_run``) leaves its check run on the default branch's tip, where it
+# request's head. A dispatched, comment's or review's run
+# (``workflow_dispatch``, ``issue_comment``, ``workflow_run``) leaves its
+# check run on the default branch's tip, where it
 # gates nothing; those runs refresh the head's check instead (see
 # ``refresh_head_check``).
-HEAD_CHECK_EVENTS = frozenset({"pull_request_target", "workflow_dispatch"})
+HEAD_CHECK_EVENTS = frozenset({"pull_request_target"})
 # The guard's refusal causes that mean "no counted verdict yet": the head has
 # no verdict, or only an earlier head's approval that does not carry. Every
 # other refusal (a HOLD, an unreadable review, a self-approval) is a failure.
@@ -117,13 +118,12 @@ def event_target(event_name: str, event: dict[str, Any]) -> tuple[int | None, st
         number = (event.get("pull_request") or {}).get("number")
         return (number if isinstance(number, int) else None), None
     if event_name == "workflow_dispatch":
-        inputs = event.get("inputs") or {}
-        value = inputs.get("pull_request")
-        try:
-            number = int(value)
-        except (TypeError, ValueError):
-            number = None
-        return number, None
+        # The input is always a string; only a plain positive decimal names
+        # a pull request.
+        value = (event.get("inputs") or {}).get("pull_request")
+        if isinstance(value, str) and value.isascii() and value.isdecimal() and int(value) > 0:
+            return int(value), None
+        return None, None
     if event_name == "issue_comment":
         issue = event.get("issue") or {}
         number = issue.get("number") if issue.get("pull_request") else None

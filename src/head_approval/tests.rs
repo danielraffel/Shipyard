@@ -3964,3 +3964,52 @@ fn a_dry_evaluation_judges_carries_without_logging_them() {
     assert_eq!(rows[1]["kind"], "merge");
     assert_eq!(rows[2]["kind"], "rebase");
 }
+
+#[test]
+fn the_base_fleet_review_switch_requires_review_off_the_compiled_list() {
+    let on: toml::Table = "[auto_merge]\nfleet_review_required = true\n"
+        .parse()
+        .expect("toml");
+    for host_default in [false, true] {
+        let policy =
+            ApprovalPolicy::from_table_for_repo(&on, "danielraffel/not-listed", host_default);
+        assert!(policy.required, "host_default={host_default}");
+        assert!(
+            policy.any_reviewer_but_author,
+            "host_default={host_default}"
+        );
+    }
+    let strict_off: toml::Table =
+        "[auto_merge]\narm_requires_head_approval = false\nfleet_review_required = true\n"
+            .parse()
+            .expect("toml");
+    assert!(
+        ApprovalPolicy::from_table_for_repo(&strict_off, "danielraffel/not-listed", false).required
+    );
+    for silent in [
+        "[auto_merge]\nfleet_review_required = false\n",
+        "[auto_merge]\n",
+    ] {
+        let table: toml::Table = silent.parse().expect("toml");
+        let policy = ApprovalPolicy::from_table_for_repo(&table, "danielraffel/not-listed", false);
+        assert!(!policy.required, "{silent}");
+        assert!(!policy.any_reviewer_but_author, "{silent}");
+    }
+}
+
+#[test]
+fn a_non_boolean_fleet_review_switch_is_refused() {
+    for value in ["\"yes\"", "1", "[]"] {
+        let table: toml::Table = format!("[auto_merge]\nfleet_review_required = {value}\n")
+            .parse()
+            .expect("toml");
+        assert!(
+            super::fleet_review_required_shape(&table).is_err(),
+            "{value}"
+        );
+    }
+    let table: toml::Table = "[auto_merge]\nfleet_review_required = true\n"
+        .parse()
+        .expect("toml");
+    assert!(super::fleet_review_required_shape(&table).is_ok());
+}

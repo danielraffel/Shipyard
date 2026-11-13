@@ -6127,9 +6127,12 @@ Changes to Shipyard steward behavior must carry this note or a reviewed skill-sy
 
 ### `governance onboard`
 
-Design A onboarding is invoked as `shipyard governance onboard --repo OWNER/NAME`.
-The command prints a complete plan without `--apply`, including the preflight,
-render hashes, bounded waits, add-only ruleset diff, and per-PR review-verdict
-sweep. The protected base may enable `[auto_merge] fleet_review_required = true`;
-the compiled compatibility list remains a floor. The onboarding PR path is
-strictly limited to the two review-verdict workflows and the named config keys.
+`shipyard governance onboard --repo OWNER/NAME` prints a read-only plan:
+preflight, render hashes, bounded waits, observed rulesets and the per-PR
+review-verdict sweep. `--apply` is not implemented yet and refuses; the plan
+performs GET requests only and stops with exit 9 on any failed read. The
+protected base may enable `[auto_merge] fleet_review_required = true`, which
+requires review exactly as `REVIEW_REQUIRED_REPOS` membership does, in both
+the Rust policy and `ghapp_queue_arm_guard.py`; the compiled list remains a
+floor. The rendered onboarding PR is limited to the two review-verdict
+workflows and the named config keys.

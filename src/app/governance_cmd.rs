@@ -31,15 +31,25 @@ pub(super) fn governance_command<W: Write>(
         require_checks,
         through,
         no_enroll,
+        reviewer_signers,
+        stamp_sessions,
+        gh_binary,
         apply,
     } = command
     {
-        return super::governance_onboard_cmd::governance_onboard(
-            &repo,
-            &profile,
-            &require_checks,
-            through.as_deref(),
+        let request = crate::governance_onboard::OnboardRequest {
+            repo,
+            profile,
+            require_checks,
+            through,
             no_enroll,
+            reviewer_signers,
+            stamp_sessions,
+            shipyard_version: env!("CARGO_PKG_VERSION").to_owned(),
+        };
+        return super::governance_onboard_cmd::governance_onboard(
+            &request,
+            gh_binary.as_ref(),
             apply,
             mode,
             cwd,

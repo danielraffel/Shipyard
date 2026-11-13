@@ -4793,9 +4793,10 @@ Changes to CI-coordinated Rust steward paths must carry this note or a reviewed 
 
 ### Design A governance onboarding
 
-`shipyard governance onboard --repo OWNER/NAME` is the bounded, plan-only-by-default
-onboarding flow. It renders only the two review-verdict workflows and the named
-`.shipyard/config.toml` keys, requires an exact-head approval from a different
-`fleet-pass-reviewer-*` session, and prints the first-evaluation sweep. `--apply`
-is the only write mode; ruleset changes are backed up and must pass the add-only
-guard. Use `--no-enroll` for repositories that should remain outside the fleet.
+`shipyard governance onboard --repo OWNER/NAME` is a read-only plan.
+`--apply` is not implemented yet and refuses before any read; nothing is
+executed or written. The plan renders the two review-verdict workflows (the
+poster pinned to the running release's 40-hex Shipyard commit) and edits only
+the named `.shipyard/config.toml` keys, keeping every other key. Any failed
+GitHub read stops it with exit 9. Use `--gh-binary ghapp` for the reads, and
+`--reviewer-signer`/`--stamp-session` when the base lists none.

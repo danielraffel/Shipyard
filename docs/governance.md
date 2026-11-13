@@ -272,21 +272,40 @@ Which repositories run which profile, and which rows each meets, is
 recorded by whoever operates them, from audit output with a date; this
 document names no repository.
 
-## Owner-out-of-the-loop onboarding
+## Owner-out-of-the-loop onboarding (plan only)
 
-`shipyard governance onboard --repo OWNER/NAME` plans Design A's ten-step
-onboarding flow. It is plan-only unless `--apply` is explicit: the command
-audits ownership and the protected base, renders the pinned review-verdict
-workflows and minimal `[auto_merge]` policy, checks the path allowlist, and
-prints bounded approval and first-evaluation waits. `--profile builder` is for
-artifact repositories; `--require-check NAME` adds an existing CI context;
-`--through STEP` stops at a checkpoint and `--no-enroll` stops after auditing.
-Applied runs back up the ruleset and refuse removals, lowered enforcement, or
-bypass-actor changes. Receipts are stored under
-`~/.local/state/shipyard/onboarding/`.
+`shipyard governance onboard --repo OWNER/NAME` prints a read-only plan of
+Design A's onboarding steps. **`--apply` is not implemented yet**: the command
+refuses it before any read, and no step of the plan is executed. Nothing is
+written to GitHub, to a ruleset, or to local state.
 
-The protected base may set `[auto_merge] fleet_review_required = true`. The
-setting is read from the base and the compiled compatibility list remains a
-floor. The rendered `review-verdict.yml` includes a `workflow_dispatch`
-`pull_request` input for the first-evaluation sweep, with an issue-comment
-fallback for older templates.
+The plan makes GET requests only, and any read that fails stops it with exit 9
+rather than printing an empty value. It refuses (exit 1) a repository outside
+`danielraffel/*` and `Generous-Corp/*` before the first read. It shows:
+
+- the rendered `.github/workflows/review-verdict.yml`, which checks out
+  `danielraffel/Shipyard` at the 40-hex commit of the running release's
+  `v<version>` tag (with a `# Shipyard v<version>` comment), and the
+  permission-less `review-verdict-trigger.yml`;
+- the rendered `.shipyard/config.toml`: the base's own file with only
+  `[auto_merge] reviewer_signers`, `reviewer_stamp_sessions`,
+  `fleet_review_required = true` and `[validation] pr_gates = false` set.
+  Every other key and comment is kept, and the render refuses if anything
+  else changed. `--reviewer-signer` and `--stamp-session` supply the lists;
+  without them the base's own lists are kept, and with neither the plan
+  refuses;
+- the sha256 of each rendered file, the rulesets observed, and the
+  first-evaluation sweep: every open, non-draft PR, marked `skip-existing`
+  when its head already carries a `review-verdict` commit status or an
+  Actions `review-verdict` check run, and `workflow_dispatch` otherwise.
+
+`--through STEP` (any step name the plan prints) and `--no-enroll` (same as
+`--through audited`) mark which steps are included. `--gh-binary` selects the
+gh-compatible CLI for the reads, for example `ghapp`.
+
+The protected base may set `[auto_merge] fleet_review_required = true`: it has
+the semantics of `REVIEW_REQUIRED_REPOS` membership (review required, fleet App
+approvals count), is read from the base so a head cannot grant it to itself,
+and the compiled list remains a floor. Shipyard's own `review-verdict.yml` also
+accepts `workflow_dispatch` with a `pull_request` input; a dispatched run posts
+the status on the head and re-runs the head's own check, like a comment's run.
