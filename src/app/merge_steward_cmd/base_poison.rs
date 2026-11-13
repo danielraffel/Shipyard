@@ -232,14 +232,11 @@ pub(super) fn admission(poison: Option<&RepoPoison>, pr: u64) -> Admission {
     }
     let confirmed = poison.confirmed_contexts();
     let named = poison.fixes.contains_key(&pr);
-    // A streak alone holds and jumps nothing: one flaky group pair must not
-    // stop the queue. The hold needs the base tip red on the same context.
+    // A streak alone changes nothing at admission: one flaky group pair must
+    // not stop the queue, and nothing is fast-tracked on it. Every pull
+    // request, named fix or not, is admitted as usual.
     if confirmed.is_empty() {
-        return if named {
-            Admission::FastTrack { jump: false }
-        } else {
-            Admission::Proceed
-        };
+        return Admission::Proceed;
     }
     // Confirmed: only a head that passed every confirmed context after the
     // base went red is admitted. Exemptions are never per context: a head

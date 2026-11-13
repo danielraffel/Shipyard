@@ -186,8 +186,8 @@ fn a_streak_the_base_tip_does_not_confirm_neither_holds_nor_jumps() {
     let outcome = enqueue(Some(&fix), JUMP_ACCEPTED);
     assert_eq!(
         outcome.mutation.as_deref(),
-        Some("fast_track_fix,enqueued"),
-        "{:?}",
+        Some("enqueued"),
+        "a named fix on an unconfirmed streak is admitted plainly: {:?}",
         outcome.error
     );
     let enqueues = enqueues(&outcome.calls);

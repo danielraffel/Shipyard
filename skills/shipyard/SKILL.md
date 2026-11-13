@@ -5945,7 +5945,8 @@ poisoned context (`commits/<base>/check-runs?check_name=...&filter=all`, one
 passing verdict). Only a confirmed context yields `Hold`, `Pause`, a jump, or the
 review/root-cause fast-track; an unread tip confirms nothing, and a green tip
 lifts holds and restores paused entries in the same pass
-(`RepoPoison::tip_green_for`). Under a confirmed context, admission exempts
+(`RepoPoison::tip_green_for`). With nothing confirmed, admission returns
+`Proceed` for every PR, named fix or not. Under a confirmed context, admission exempts
 only `RepoPoison::covering`: heads that passed every confirmed context after
 `red_since` (`fix_first::passed_after`, intersected across contexts; a
 confirmed context with no `red_since` empties it). A named fix outside it is
