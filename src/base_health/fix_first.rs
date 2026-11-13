@@ -335,6 +335,89 @@ pub fn pick(fixes: &[GreenFix]) -> Pick {
     Pick::Ambiguous { prs }
 }
 
+/// One confirmed context, as fix-first judges it.
+#[derive(Clone, Copy, Debug)]
+pub struct ContextFacts<'a> {
+    /// The context.
+    pub context: &'a str,
+    /// When the base went red on it; `None` when unknown, which exempts
+    /// nobody.
+    pub red_since: Option<DateTime<Utc>>,
+    /// Every open pull request, with this context's facts.
+    pub candidates: &'a [FixCandidate],
+}
+
+/// What fix-first decides over the confirmed contexts. The steward's
+/// admission and [`replay`] both read it, so a replay scores exactly what
+/// production would do.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Decision {
+    /// Heads that passed every confirmed context after it went red, approved
+    /// or not. Under a confirmed context they are the only ones admitted
+    /// (the fix among them jumped), and every other approved head is held.
+    pub covering: std::collections::BTreeSet<u64>,
+    /// The fix, or why there is none.
+    pub pick: Pick,
+    /// Evidence lines per qualifying fix, one per context.
+    pub evidence: std::collections::BTreeMap<u64, Vec<String>>,
+}
+
+impl Decision {
+    /// Whether a confirmed episode holds this approved, non-draft head.
+    #[must_use]
+    pub fn holds(&self, pr: u64) -> bool {
+        !self.covering.contains(&pr)
+    }
+}
+
+/// Decide over the confirmed contexts. A head covers them only if it passed
+/// each one after it went red ([`passed_after`]); a context with no known
+/// red time empties the set. The fix must be in the set, so one that passes
+/// context A but not B is never picked.
+#[must_use]
+pub fn decide(contexts: &[ContextFacts<'_>]) -> Decision {
+    let mut covering: Option<std::collections::BTreeSet<u64>> = None;
+    let mut found: Vec<(GreenFix, String)> = Vec::new();
+    for facts in contexts {
+        let Some(red_since) = facts.red_since else {
+            covering = Some(std::collections::BTreeSet::new());
+            continue;
+        };
+        let passing = facts
+            .candidates
+            .iter()
+            .filter(|candidate| passed_after(candidate, red_since))
+            .map(|candidate| candidate.number)
+            .collect::<std::collections::BTreeSet<_>>();
+        covering = Some(match covering {
+            None => passing,
+            Some(so_far) => so_far.intersection(&passing).copied().collect(),
+        });
+        for fix in green_head_fixes(facts.candidates, red_since) {
+            let line = fix.evidence(facts.context, red_since);
+            found.push((fix, line));
+        }
+    }
+    let covering = covering.unwrap_or_default();
+    let mut fixes: Vec<GreenFix> = Vec::new();
+    let mut evidence: std::collections::BTreeMap<u64, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for (fix, line) in found {
+        if !covering.contains(&fix.pr) {
+            continue;
+        }
+        evidence.entry(fix.pr).or_default().push(line);
+        if !fixes.iter().any(|known| known.pr == fix.pr) {
+            fixes.push(fix);
+        }
+    }
+    Decision {
+        pick: pick(&fixes),
+        covering,
+        evidence,
+    }
+}
+
 /// One recorded episode with the facts needed to replay it.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct ReplayEpisode {
@@ -456,28 +539,25 @@ pub fn replay(episode: &ReplayEpisode) -> ReplayOutcome {
             }
         ),
     };
-    let picked = match (fires, red_since) {
-        (true, Some(since)) => pick(&green_head_fixes(&prs, since)),
-        _ => Pick::None,
+    // The same decision the steward makes live ([`decide`]).
+    let decision = fires.then(|| {
+        decide(&[ContextFacts {
+            context: &episode.context,
+            red_since,
+            candidates: &prs,
+        }])
+    });
+    let (fix, ambiguous) = match decision.as_ref().map(|decision| &decision.pick) {
+        Some(Pick::One(fix)) => (Some(fix.pr), Vec::new()),
+        Some(Pick::Ambiguous { prs }) => (None, prs.clone()),
+        _ => (None, Vec::new()),
     };
-    let (fix, ambiguous) = match picked {
-        Pick::One(fix) => (Some(fix.pr), Vec::new()),
-        Pick::Ambiguous { prs } => (None, prs),
-        Pick::None => (None, Vec::new()),
-    };
-    let held = if fires {
+    let held = decision.as_ref().map_or_else(Vec::new, |decision| {
         prs.iter()
-            .filter(|pr| {
-                !pr.draft
-                    && pr.approved_at.is_some()
-                    && Some(pr.number) != fix
-                    && !ambiguous.contains(&pr.number)
-            })
+            .filter(|pr| !pr.draft && pr.approved_at.is_some() && decision.holds(pr.number))
             .map(|pr| pr.number)
             .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
+    });
     ReplayOutcome {
         key: episode.key.clone(),
         context: episode.context.clone(),
