@@ -1147,6 +1147,16 @@ means classifying it in `scripts/test_workflow_secret_environments.py`.
 `SHIPYARD_APP_PRIVATE_KEY` and post-tag-sync's `RELEASE_BOT_TOKEN` stay
 repository secrets too.
 
+On a protected default branch the post-tag hook must not push: set
+`release.post_tag_hook.push_mode = "handoff"` and `app_client_id`. The hook then
+force-pushes one bot branch (`release/changelog-sync`), opens or updates its
+single pull request, labels it `shipyard:managed`, posts the exact-head
+`shipyard/steward-handoff` status and exits; checks, review and the merge
+steward land it. The workflow mints a GitHub App token from
+`SHIPYARD_APP_PRIVATE_KEY` (the default token starts no workflows, and no PAT is
+used), so a workflow rendered for `handoff` no longer references
+`RELEASE_BOT_TOKEN`. Shipyard itself uses this mode.
+
 ## Release publication waits for attestation
 
 `release.yml` keeps the release a draft until the macOS DMG is attested:

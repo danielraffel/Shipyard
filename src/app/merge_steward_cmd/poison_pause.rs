@@ -102,8 +102,9 @@ pub(super) enum Verdict {
 /// Decide one pull request's pause from the pass's merge-group reading.
 /// Only an entry the steward itself admitted (`Queued`) is ever paused: an
 /// opted-out or unowned entry would not be restored by the steward's
-/// admission, so it is left alone. No candidate fix is paused, named or
-/// measured, so a fix already in the queue keeps its group.
+/// admission, so it is left alone. While a context is confirmed, only a head
+/// that passed every confirmed context after the break keeps its place; a
+/// fix named or measured for one context is no exemption from another.
 pub(super) fn verdict(
     poison: Option<&RepoPoison>,
     pr: &StewardPullRequest,
@@ -116,19 +117,37 @@ pub(super) fn verdict(
         return Verdict::Keep;
     }
     let contexts = poison.health.poisoned_contexts();
-    if contexts.is_empty()
-        || poison.fixes.contains_key(&pr.number)
-        || poison.candidates.contains(&pr.number)
-    {
+    if contexts.is_empty() {
         return Verdict::Keep;
     }
-    let contexts = contexts.join(",");
-    if poison.policy.pauses() {
-        Verdict::Pause { contexts, position }
+    let confirmed = poison.confirmed_contexts();
+    // While a context is confirmed, the only entry kept is a head that passed
+    // every confirmed context after the base went red, each check from the
+    // app its required rule names (`RepoPoison::covering`). A named or
+    // measured fix for one context is no exemption from another. With
+    // nothing confirmed nothing is paused, and named or measured fixes are
+    // left out of the `would_pause` report as before.
+    let exempt = if confirmed.is_empty() {
+        poison.fixes.contains_key(&pr.number) || poison.candidates.contains(&pr.number)
+    } else {
+        poison.covering.contains(&pr.number)
+    };
+    if exempt {
+        return Verdict::Keep;
+    }
+    // Only a context the base tip also fails removes work; a streak alone
+    // is reported.
+    if poison.policy.pauses() && !confirmed.is_empty() {
+        Verdict::Pause {
+            contexts: confirmed.join(","),
+            position,
+        }
     } else if poison.policy.hold == PoisonHold::Off {
         Verdict::Keep
     } else {
-        Verdict::WouldPause { contexts }
+        Verdict::WouldPause {
+            contexts: contexts.join(","),
+        }
     }
 }
 
@@ -250,8 +269,8 @@ pub(super) fn restore_rank(
 }
 
 /// Whether this pass's reading lets an entry paused for `contexts` come
-/// back: the hold is off (the operator's undo), or a merge group passed every
-/// one of those contexts. A stale streak, an empty sample, a shared-PR note
+/// back: the hold is off (the operator's undo), a merge group passed every
+/// one of those contexts, or the base tip reads every one of them green. A stale streak, an empty sample, a shared-PR note
 /// and an unread history pass nothing, so they keep it waiting.
 fn restorable(poison: Option<&RepoPoison>, contexts: &str) -> bool {
     use crate::base_health::merge_group::MergeGroupHealth;
@@ -265,7 +284,10 @@ fn restorable(poison: Option<&RepoPoison>, contexts: &str) -> bool {
         MergeGroupHealth::Clear { passed, .. } => contexts
             .split(',')
             .all(|context| passed.iter().any(|done| done == context)),
-        MergeGroupHealth::Poisoned { .. } | MergeGroupHealth::Unknown { .. } => false,
+        // The episode ends when the base tip reads green again, even while
+        // older merge groups still make up a streak.
+        MergeGroupHealth::Poisoned { .. } => poison.tip_green_for(contexts),
+        MergeGroupHealth::Unknown { .. } => false,
     }
 }
 

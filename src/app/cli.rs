@@ -724,6 +724,12 @@ pub(super) enum Command {
         /// Apply `base_health.auto_jump` to the advice.
         #[arg(long)]
         act: bool,
+        /// Replay recorded base-poison episodes (a JSON array of replay
+        /// facts) through the fix-first rule, and score each pick against
+        /// the pull request that repaired the base. Reads nothing from
+        /// GitHub and changes nothing.
+        #[arg(long, value_name = "FILE", conflicts_with = "act")]
+        replay: Option<std::path::PathBuf>,
     },
     Doctor {
         /// Exact OWNER/REPO used to resolve configured auth token placeholders.

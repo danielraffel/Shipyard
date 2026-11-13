@@ -23,7 +23,7 @@
 //! groups, and it stops reading groups as soon as every required context has
 //! passed in the newest group that reported it.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -136,6 +136,12 @@ pub enum MergeGroupHealth {
         /// A stale streak or an empty sample passes nothing.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         passed: Vec<String>,
+        /// For each context in `passed`, the pull requests of the newest
+        /// group that passed it: what actually repaired the base, for
+        /// scoring a fix pick. A group outside a failing streak is known by
+        /// the one pull request its queue branch names.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        passed_by: BTreeMap<String, Vec<u64>>,
     },
     /// The merge groups could not be read. Callers keep their normal
     /// behaviour: an unread base is never treated as poisoned.
@@ -232,6 +238,7 @@ pub fn detect(groups: &[MergeGroup], required: &[String], now: DateTime<Utc>) ->
         return MergeGroupHealth::Clear {
             detail: "no recent merge group".to_owned(),
             passed: Vec::new(),
+            passed_by: BTreeMap::new(),
         };
     }
     let mut poisoned = Vec::new();
@@ -292,23 +299,27 @@ pub fn detect(groups: &[MergeGroup], required: &[String], now: DateTime<Utc>) ->
         });
     }
     if poisoned.is_empty() {
+        let newest_verdict = |context: &str| {
+            groups
+                .iter()
+                .find(|group| outcome(group.check(context)) != Outcome::NoVerdict)
+                .filter(|group| outcome(group.check(context)) == Outcome::Pass)
+        };
+        let passed_by = contexts
+            .iter()
+            .filter_map(|context| {
+                newest_verdict(context)
+                    .map(|group| (context.clone(), group.prs.iter().copied().collect()))
+            })
+            .collect::<BTreeMap<_, _>>();
         MergeGroupHealth::Clear {
             detail: if notes.is_empty() {
                 "no required context failed in two consecutive merge groups".to_owned()
             } else {
                 notes.join("; ")
             },
-            passed: contexts
-                .iter()
-                .filter(|context| {
-                    groups
-                        .iter()
-                        .map(|group| outcome(group.check(context)))
-                        .find(|outcome| *outcome != Outcome::NoVerdict)
-                        == Some(Outcome::Pass)
-                })
-                .cloned()
-                .collect(),
+            passed: passed_by.keys().cloned().collect(),
+            passed_by,
         }
     } else {
         MergeGroupHealth::Poisoned { contexts: poisoned }

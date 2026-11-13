@@ -523,6 +523,7 @@ where
             base,
             workflow,
             act,
+            replay,
         } => {
             return base_health_cmd::base_health_command(
                 base_health_cmd::BaseHealthArgs {
@@ -530,6 +531,7 @@ where
                     base,
                     workflow,
                     act,
+                    replay,
                     json: cli.json,
                 },
                 cli.mode.into(),

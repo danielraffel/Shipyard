@@ -1,0 +1,93 @@
+[
+  {
+    "key": "generous-corp/pulp@main",
+    "context": "Enforce version & skill sync",
+    "started_at": "2026-11-13T00:36:49Z",
+    "ended_at": "2026-11-13T01:18:39Z",
+    "max_streak": 2,
+    "would_hold": [
+      12140,
+      12148
+    ],
+    "prs": [
+      {
+        "number": 12140,
+        "approved_at": "2026-11-13T00:22:37Z",
+        "rode_failing_group": true
+      },
+      {
+        "number": 12148,
+        "approved_at": "2026-11-13T00:30:41Z",
+        "rode_failing_group": true
+      },
+      {
+        "number": 12153,
+        "approved_at": "2026-11-13T02:03:18Z",
+        "context_green_at": "2026-11-13T01:40:45Z"
+      },
+      {
+        "number": 12154,
+        "approved_at": "2026-11-13T02:02:33Z",
+        "context_green_at": "2026-11-13T00:57:49Z"
+      }
+    ],
+    "actual_fix": 12153,
+    "decided_at": "2026-11-13T00:40:00Z",
+    "tip_runs": [
+      {
+        "id": 131569241475,
+        "conclusion": "success",
+        "completed_at": "2026-11-12T23:28:44Z"
+      }
+    ],
+    "note": "Real facts read from Generous-Corp/pulp on 2026-11-13. Shadow episode from m3 shadow-ended.jsonl. Tip 7e2b00a4 (#12151): its only run of the context is the merge-group pass at 2026-11-12T23:28; the date-dependent test broke after midnight and nothing re-ran the tip. Merge groups for #12140 (00:28) and #12148 (00:34) failed the context; approved_at for those two is the time their group formed. #12154's group passed at 01:08 and ended the streak, but #12154 closed superseded; the fix e8e0507a landed in #12153."
+  },
+  {
+    "key": "generous-corp/pulp@main",
+    "context": "Enforce version & skill sync",
+    "started_at": "2026-11-13T00:36:49Z",
+    "ended_at": "2026-11-13T01:18:39Z",
+    "max_streak": 2,
+    "would_hold": [
+      12140,
+      12148
+    ],
+    "prs": [
+      {
+        "number": 12140,
+        "approved_at": "2026-11-13T00:22:37Z",
+        "rode_failing_group": true
+      },
+      {
+        "number": 12148,
+        "approved_at": "2026-11-13T00:30:41Z",
+        "rode_failing_group": true
+      },
+      {
+        "number": 12153,
+        "approved_at": "2026-11-13T02:03:18Z",
+        "context_green_at": "2026-11-13T01:40:45Z"
+      },
+      {
+        "number": 12154,
+        "approved_at": "2026-11-13T02:02:33Z",
+        "context_green_at": "2026-11-13T00:57:49Z"
+      }
+    ],
+    "actual_fix": 12153,
+    "decided_at": "2026-11-13T01:00:00Z",
+    "tip_runs": [
+      {
+        "id": 131569241475,
+        "conclusion": "success",
+        "completed_at": "2026-11-12T23:28:44Z"
+      },
+      {
+        "id": 131569241476,
+        "conclusion": "failure",
+        "completed_at": "2026-11-13T00:41:00Z"
+      }
+    ],
+    "note": "Real facts read from Generous-Corp/pulp on 2026-11-13. Shadow episode from m3 shadow-ended.jsonl. Tip 7e2b00a4 (#12151): its only run of the context is the merge-group pass at 2026-11-12T23:28; the date-dependent test broke after midnight and nothing re-ran the tip. Merge groups for #12140 (00:28) and #12148 (00:34) failed the context; approved_at for those two is the time their group formed. #12154's group passed at 01:08 and ended the streak, but #12154 closed superseded; the fix e8e0507a landed in #12153. COUNTERFACTUAL: adds the PR-free control run that [base_health.control_workflows] \"Enforce version & skill sync\" = \"version-skill-check.yml\" would dispatch on the tip at episode start, assumed to fail like every merge group did then."
+  }
+]

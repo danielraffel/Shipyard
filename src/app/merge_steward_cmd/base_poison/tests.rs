@@ -189,7 +189,10 @@ fn a_dry_run_names_what_the_fast_track_would_do_and_nothing_when_clear() {
         },
         fixes: BTreeMap::from([(7, vec!["label `shipyard:unblock`".to_owned()])]),
         fix_read_error: None,
+        fix_ambiguity: None,
+        covering: std::collections::BTreeSet::new(),
         candidates: std::collections::BTreeSet::default(),
+        tip: BTreeMap::new(),
     };
     assert_eq!(
         would_fast_track(&poison),
@@ -199,6 +202,7 @@ fn a_dry_run_names_what_the_fast_track_would_do_and_nothing_when_clear() {
         health: MergeGroupHealth::Clear {
             detail: String::new(),
             passed: Vec::new(),
+            passed_by: std::collections::BTreeMap::new(),
         },
         ..poison
     };

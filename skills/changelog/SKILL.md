@@ -64,6 +64,7 @@ Exit codes: `0` clean, `1` drift, `2` config missing / tag missing.
 
 ## Two capabilities, separately usable
 
+- **Protected main** — set `push_mode = "handoff"` and `app_client_id`: the hook force-pushes one bot branch (`release/changelog-sync`), opens or updates its single PR, labels it `shipyard:managed`, posts the steward-handoff status and exits. It never pushes to main, waits, enqueues or merges; checks, review and the steward land it. Token is a GitHub App installation token (`SHIPYARD_APP_PRIVATE_KEY`), never a PAT.
 - **Hook only** — point `command` at your own script, keep shipyard's rebase-retry + trailer plumbing.
 - **Generator only** — run `shipyard changelog regenerate` from your own workflow if you don't want shipyard to own the committing side.
 
