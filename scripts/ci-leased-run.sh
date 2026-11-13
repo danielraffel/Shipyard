@@ -18,7 +18,16 @@
 #
 # tartci keeps its lease store in the invoking user's home. A runner that runs
 # as its own user only competes with the host's gate lanes if its environment
-# sets TARTCI_LEASE_DIR to the store those lanes use.
+# sets TARTCI_LEASE_DIR to the store those lanes use. Without that it gets no
+# lease and runs at the floor, which still bounds the load.
+#
+# Optional owner setup on m1, where the runner runs as `ci` (uid 401, not in
+# `staff`). Both steps need sudo and let `ci` write the operator's lease store:
+#   1. give `ci` write access to /Users/danielraffel/.tartci/state/leases
+#      (an ACL or a shared group; it is drwxr-xr-x danielraffel:staff);
+#   2. add to the runner's .env in /Users/ci:
+#        TARTCI_LEASE_DIR=/Users/danielraffel/.tartci/state/leases
+#        SHIPYARD_TARTCI_BIN=/Users/danielraffel/.local/bin/tartci
 #
 # On a GitHub-hosted runner the command runs unchanged.
 set -euo pipefail
