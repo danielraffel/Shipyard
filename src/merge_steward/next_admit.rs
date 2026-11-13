@@ -181,6 +181,7 @@ fn needs(input: &RankInput, tier: Tier) -> String {
             "required_never_ran" => "the required check to be dispatched",
             "carries_unapproved_commits" => "the carried pull request to be approved or land",
             "required_pending" => "required checks to finish",
+            "capacity_queued" => "a runner for the queued required checks",
             "no_verdict" => "an exact-head review verdict",
             "ejected_same_head" => "a new head",
             _ => "see next_action",

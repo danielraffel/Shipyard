@@ -204,6 +204,32 @@ fn shipyard_1082_a_required_check_that_never_ran_is_named() {
     assert_eq!(hint, SinceHint::HeadPushed);
 }
 
+/// 2026-11-12: an agent read "required macOS job queued, all slots busy" as an
+/// external blocker and stopped four times. A required check run that is only
+/// queued is `capacity_queued`, with a next action that says it is not blocked.
+#[test]
+fn a_queued_required_job_is_capacity_queued_and_not_blocked() {
+    let queued = pr_with(
+        14,
+        &[],
+        "CLEAN",
+        &json!([{"__typename": "CheckRun", "name": "macos", "status": "QUEUED",
+                "startedAt": "2026-11-12T17:00:00Z"}]),
+    );
+    let (blocked, _) = row(&queued, None, GateRead::Unread);
+    assert_eq!(blocked.blocked_on, "capacity_queued");
+    assert_eq!(blocked.since.as_deref(), Some("2026-11-12T17:00:00Z"));
+    // Control: the same required job once a runner has started it.
+    let running = pr_with(
+        15,
+        &[],
+        "CLEAN",
+        &json!([{"__typename": "CheckRun", "name": "macos", "status": "IN_PROGRESS",
+                "startedAt": "2026-11-12T17:00:00Z"}]),
+    );
+    assert_eq!(token(&running, None), "required_pending");
+}
+
 #[test]
 fn pending_and_failed_required_checks_are_told_apart_and_dated() {
     let pending = pr_with(

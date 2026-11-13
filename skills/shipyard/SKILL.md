@@ -3896,6 +3896,11 @@ reporting `required_never_ran:<context>` while GitHub shows the rule green.
   or comments merged or carries the change, close the PR with a comment
   naming it, and move on. It no longer names the owner, so no agent waits for
   Daniel on work that already landed.
+- **A queued required job is not a blocker.** When every pending required check
+  is a check run still queued for a runner, `blocked_on` is `capacity_queued`
+  and `next_action` (`actor: ci`, `stop: false`) begins "Not blocked": take
+  other work, do not push, do not stop. Dwell limits treat it like
+  `required_pending`.
 - **Labels.** `owner-decision`, `superseded` and `PARKED/<platform>` PRs are not
   exempt: they should never be queued, so on positive evidence they are
   dequeued like any other. The same three labels also deny admission:
