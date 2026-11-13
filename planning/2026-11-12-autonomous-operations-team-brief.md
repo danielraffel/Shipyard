@@ -13,7 +13,7 @@ and a queue of small PRs. Lanes do not share files, so they do not conflict.
 
 | Lane | Items | Owns | Model | Starts |
 | --- | --- | --- | --- | --- |
-| Lead | sequencing, gates, the plan file | `planning/2026-11-12-*` | Opus or Fable | first |
+| Lead | sequencing, gates, the plan file | `planning/2026-11-12-*` | Fable, for planning and re-ranking only | first |
 | Ledger | L1, L2, L3, L5 | `src/metrics/` new `loss` and `recovery_score` modules, `docs/rollups.md` | Sonnet | first |
 | Conflicts | C1 (read-only), then C2 to C5 | new `src/conflict_repair/`, `docs/conflict-repair.md` | Sonnet; Opus for C3 push path | C1 at once; the rest after L1 |
 | Promotion | ladder config, superseded close, dwell scoring, S1 arbiter | `src/app/merge_steward_cmd/` recovery modules, `docs/automated-draining.md` | Opus (steward admission code) | after L3 |
@@ -22,6 +22,14 @@ and a queue of small PRs. Lanes do not share files, so they do not conflict.
 | Fleet | T1 to T5, in Shipyard and TartCI | `src/metrics/` TartCI import, TartCI export and receipt schema, both repos' contract fixtures | Sonnet; Opus for anything touching leases or reaping | first (T1 is read-only joins) |
 | Hygiene | X1 to X5, P1 | new `src/census/`, `docs/orphan-census.md`, lesson-to-gate table in fleet-handbook | Sonnet, Haiku for the census sweeps | first (X1 and X3 start as reports) |
 | Audit | S2, S3, S4, O1, prior-art checks, T6 (all read-only studies) | `planning/` notes only | Sonnet, Haiku for counting | first |
+
+Model rule: Fable plans and re-ranks and does no lane work. Lanes run on the
+smallest model that does the job: Haiku or Codex Luna for counting, sweeps and
+mechanical merges; Sonnet or Codex Terra for code, scripts and reports; Opus
+or Codex Astra only for admission, verdict-gate, lease, credential and
+release changes. Independent challenge and review of a lane's work goes to a
+different provider than the one that wrote it. The lead sets the model when
+it launches a lane and records it in the lane's tracking issue.
 
 `src/app/merge_steward_cmd/` has one writer at a time: the Promotion lane.
 Any other lane that needs a change there files it to Promotion.
