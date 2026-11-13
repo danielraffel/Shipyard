@@ -33,17 +33,21 @@ a PR row is dropped from a finding (and counted as suppressed) when
   them from the rulesets, never the classic branch-protection endpoint). An empty list
   means unknown and filters nothing.
 
-A `stuck_claim` is also dropped when a file other than `pid` in the claim directory was
-written in the last 10 minutes. Drain-watch reads local files only and cannot see a
-session's subagent transcripts, so that claim-dir output is the only recent-output signal
-it has; wiring a real subagent-activity source in is left open.
+A `loop.state` in the tick wins over the token. A queued PR is only suppressed while it has
+been queued under 2 hours (`DRAIN_WATCH_QUEUED_BOUND_MIN`); past that the queue is stuck and
+it pages. `merge_group_stalled` is never suppressed. Token and required names are compared
+without a trailing ` (app_id=N)`, which the steward's required list carries for app-bound checks.
+
+`stuck_claim` is never silenced by activity in the claim directory: drain-watch reads local
+files only, cannot see a session's subagent transcripts and cannot tell progress from a
+heartbeat. A real subagent-activity source is still open.
 
 `shipyard wait pr --state actionable` already answers `capacity_queued` with "Not blocked"
 and never matches on it.
 
 Pages (a finding announced for the first time) are counted per kind and day in
 `drain-watch-state.json` (`pages`), and suppressed candidates per reason (`suppressed`,
-once per run). The daily loss report prints both under "Pages per class".
+once per PR and reason per day). The daily loss report prints both under "Pages per class".
 
 ## Output
 

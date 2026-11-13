@@ -83,31 +83,42 @@ def classify(token, actor, stop):
 # rulesets) or a merge-blocking state, never a queued PR, and never a session whose
 # subagents produced output in the last 10 minutes.
 NEVER_PAGE_STATES = {"queued", "capacity_queued"}
-RECENT_OUTPUT = dt.timedelta(minutes=10)
+# A queued PR is not paged about until it has sat queued this long: past it, the
+# queue itself is stuck. Minutes, from DRAIN_WATCH_QUEUED_BOUND_MIN.
+QUEUED_BOUND = dt.timedelta(minutes=int(os.environ.get("DRAIN_WATCH_QUEUED_BOUND_MIN", "120") or 120))
+APP_BOUND = re.compile(r"\s*\(app_id=\d+\)\s*$")
+
+
+def norm_ctx(c):
+    """`macos (app_id=15368)` (a RequiredCheck label) and `macos` (a token context) compare equal."""
+    return APP_BOUND.sub("", c).strip()
 
 
 def token_contexts(token):
     """Contexts a `kind:ctx1,ctx2` token names ([] when it names none)."""
     _, _, arg = token.partition(":")
-    return [c.strip() for c in arg.split(",") if c.strip()] if arg else []
+    return [norm_ctx(c) for c in arg.split(",") if c.strip()] if arg else []
 
 
-def no_page_reason(o):
-    """Why this PR row must not be paged about, or None. `o` is a tick row."""
-    for st in (o.get("loop"), o["token"]):
-        if st and st.split(":", 1)[0] in NEVER_PAGE_STATES:
+def no_page_reason(o, ref):
+    """Why this PR row must not be paged about, or None. `ref` is the tick time."""
+    # When the tick carries a scheduling-loop state it wins; the token is the fallback.
+    state = o.get("loop") or o["token"]
+    if state.split(":", 1)[0] in NEVER_PAGE_STATES:
+        if o.get("since") is None or ref - o["since"] < QUEUED_BOUND:
             return "queued"
+        return None  # queued past the bound: the queue is stuck, so page
     ctxs = token_contexts(o["token"])
-    required = o.get("required") or []
+    required = {norm_ctx(c) for c in o.get("required") or []}
     # An unknown (empty) required list cannot prove a context is non-required.
     if ctxs and required and not any(c in required for c in ctxs):
         return "non_required"
     return None
 
 
-def count_suppressed(sup, reason):
+def count_suppressed(sup, key):
     if sup is not None:
-        sup[reason] = sup.get(reason, 0) + 1
+        sup.add(key)
 
 
 def parse_stamp(s):
@@ -205,9 +216,9 @@ def check_drain_stall(per_repo, now, sup=None):
             if (o["deferred"] or classify(o["token"], o["actor"], o["stop"]) != "actionable"
                     or (o["since"] or t_last) > t_last - STALL_WINDOW):
                 continue
-            why = no_page_reason(o)
+            why = no_page_reason(o, t_last)
             if why:
-                count_suppressed(sup, why)
+                count_suppressed(sup, (repo, pr, why))
             else:
                 waiting.append(pr)
         if not waiting:
@@ -236,9 +247,9 @@ def check_stale_hold(per_repo, now, sup=None):
             if (o["deferred"] or not (o["token"] == "held" or o["token"].startswith("held:")) or not o["since"]
                     or t_last - o["since"] < STALE_HOLD):
                 continue
-            why = no_page_reason(o)
+            why = no_page_reason(o, t_last)
             if why:
-                count_suppressed(sup, why)
+                count_suppressed(sup, (repo, pr, why))
             else:
                 old.append(pr)
         if old:
@@ -255,17 +266,8 @@ def check_merge_group_stalled(per_repo, now, sup=None):
         t_last, rows = latest_valid(ticks)
         if rows is None or now - t_last > dt.timedelta(minutes=30):
             continue
-        stalled = []
-        for pr, o in sorted(rows.items()):
-            if not o["token"].startswith("merge_group_stalled:"):
-                continue
-            # The token itself is the steward's word that a merge group can never
-            # finish, so its own `queued` never applies; only a non-required context does.
-            why = no_page_reason(dict(o, loop=None))
-            if why:
-                count_suppressed(sup, why)
-            else:
-                stalled.append(pr)
+        # Never suppressed: the steward says this merge group can never finish.
+        stalled = sorted(pr for pr, o in rows.items() if o["token"].startswith("merge_group_stalled:"))
         if stalled:
             out.append(dict(kind="merge_group_stalled", repo=repo, lane="-", key=f"merge_group_stalled:{repo}",
                             detail=f"{len(stalled)} merge group(s) can never finish: " + ",".join(f"#{n}" for n in stalled[:5]),
@@ -309,15 +311,11 @@ def check_stuck_claims(per_repo, runner_dir, now, sup=None):
         age = now - claimed
         if age < STUCK_CLAIM:
             continue
-        why = no_page_reason(rows[int(pr)])
+        # Drain-watch cannot tell progress from a heartbeat in the claim dir, so a
+        # stuck claim keeps paging whatever was written there.
+        why = no_page_reason(rows[int(pr)], t_last)
         if why:
-            count_suppressed(sup, why)
-            continue
-        # Drain-watch cannot see a session's subagent transcripts. The only output it
-        # can see is files the claim holder wrote into its claim dir after `pid`.
-        newest = max((os.path.getmtime(f) for f in glob.glob(os.path.join(d, "*")) if os.path.isfile(f)), default=0)
-        if now - dt.datetime.fromtimestamp(newest, UTC) < RECENT_OUTPUT:
-            count_suppressed(sup, "recent_output")
+            count_suppressed(sup, (repo, int(pr), why))
             continue
         claim_head = attempts.get((repo, int(pr)))
         if claim_head and rows[int(pr)]["head"] == claim_head:
@@ -487,8 +485,8 @@ def save_state(path, s):
 def collect(a, now, state):
     per_repo = recent_ticks(a.log_dir, now, STALL_WINDOW + dt.timedelta(minutes=30))
     f = []
-    sup = state.setdefault("_sup_run", {})
-    sup.clear()
+    sup = set()
+    state["_sup_run"] = sup
     f += check_drain_stall(per_repo, now, sup)
     f += check_stale_hold(per_repo, now, sup)
     f += check_merge_group_stalled(per_repo, now, sup)
@@ -506,12 +504,16 @@ def run(a, now=None, issues=None):
     findings = collect(a, now, state)
     seen = {f["key"] for f in findings}
     day = now.strftime("%Y-%m-%d")
-    for k in ("pages", "suppressed"):
+    for k in ("pages", "suppressed", "suppressed_seen"):
         for old in sorted(state.get(k, {}))[:-14]:
             del state[k][old]  # keep two weeks of daily counts
-    for reason, n in state.pop("_sup_run", {}).items():
-        d = state.setdefault("suppressed", {}).setdefault(day, {})
-        d[reason] = d.get(reason, 0) + n
+    seen_sup = state.setdefault("suppressed_seen", {}).setdefault(day, [])
+    for repo_, pr_, reason in sorted(state.pop("_sup_run", set())):
+        k = f"{repo_}#{pr_}:{reason}"  # distinct (PR, reason) per day, not per tick
+        if k not in seen_sup:
+            seen_sup.append(k)
+            d = state.setdefault("suppressed", {}).setdefault(day, {})
+            d[reason] = d.get(reason, 0) + 1
     lines, actions = [], []
     issues = issues or Issues(a.ghapp)
     for f in findings:

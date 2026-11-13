@@ -289,7 +289,7 @@ def page_counts(log_dir, days):
 
     A page is a drain-watch finding announced for the first time (it asks an agent to
     act). `suppressed` counts candidates the page_only_on_merge_blocking filter dropped
-    (queued PR, non-required context, recent output), once per drain-watch run.
+    (queued PR under the bound, non-required context), once per PR and reason per day.
     """
     try:
         with open(os.path.join(log_dir, "drain-watch-state.json")) as fh:
