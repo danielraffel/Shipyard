@@ -276,6 +276,10 @@ struct StewardLedger {
     /// `merge_group_stall`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     doomed_dequeues: BTreeMap<String, merge_group_stall::Receipt>,
+    /// The last good read of the queue-removals ledger, honoured while the
+    /// file cannot be read. See `defect_fix_removals`.
+    #[serde(default)]
+    removal_ledger: defect_fix_removals::Cache,
     /// Infra re-runs per check on an exact head, keyed
     /// `repo#pr@head:check`. See `infra_rerun`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -519,6 +523,9 @@ struct MutationApplyContext<'a> {
     /// This pass's merge-group reading, when the base asks for one. See
     /// `base_poison`.
     base_poison: Option<&'a base_poison::RepoPoison>,
+    /// This pass's reading of the queue-removals ledger: a `defect-fix`
+    /// removal of a head refuses its admission. See `defect_fix_removals`.
+    defect_fix: Option<&'a defect_fix_removals::Reading>,
 }
 
 /// Exact-head approval gate reads made during one pass, by PR number.
@@ -2100,6 +2107,7 @@ mod cancellation_terminalization;
 mod capacity_cancellation;
 mod carried_commits;
 mod code_owner_wait;
+mod defect_fix_removals;
 pub(super) mod dwell_pass;
 mod exact_head_merge;
 mod generated_paths;

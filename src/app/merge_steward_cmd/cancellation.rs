@@ -126,13 +126,24 @@ pub(super) fn apply_repo_plan(
     );
     // Merge groups that can never finish: read before any pull request is
     // mutated, so the dequeue below acts on this pass's reading.
-    let stall_pass = super::merge_group_stall::observe(
+    let mut stall_pass = super::merge_group_stall::observe(
         &|argv: &[String]| actions.run_gh(argv).map_err(|error| error.to_string()),
         observation,
         policy.ejection_guards.dequeue_doomed_groups,
         &policy.ejection_guards.base_poison.control_workflows,
         Utc::now(),
     );
+    // Defect-fix removals: read once, honoured by every admission below.
+    // Only an applying pass updates the cached last good read.
+    let mut removal_cache = ledger.removal_ledger.clone();
+    stall_pass.defect_fix = super::defect_fix_removals::read(
+        &super::defect_fix_removals::ledger_path(),
+        &mut removal_cache,
+        Utc::now(),
+    );
+    if args.apply {
+        ledger.removal_ledger = removal_cache;
+    }
     let (mut reports, pr_mutation_failed, listing) = apply_pr_plans_with_poison(
         actions,
         args,
@@ -145,6 +156,7 @@ pub(super) fn apply_repo_plan(
         Some(&stall_pass),
     );
     let mut stall_lines = stall_pass.lines();
+    stall_lines.extend(stall_pass.defect_fix.lines());
     if args.apply {
         stall_lines.extend(super::merge_group_stall::retry_comments(
             ledger,
@@ -274,7 +286,18 @@ pub(super) fn apply_repo_plan(
             super::native_arm::apply_native_arm_backstop(
                 actions,
                 observation,
-                &reports,
+                // A head a defect-fix removal blocks is never offered to the
+                // backstop: a pull request with no row is no candidate.
+                &reports
+                    .iter()
+                    .filter(|report| {
+                        stall_pass
+                            .defect_fix
+                            .blocking(&observation.repo, report.number, &report.head_sha)
+                            .is_none()
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>(),
                 &args.opt_out_label,
                 args.apply,
                 || {
@@ -563,6 +586,7 @@ pub(super) fn apply_pr_plans_with_poison(
         changed_files: std::cell::RefCell::default(),
         ejection_guards: policy.ejection_guards.clone(),
         base_poison,
+        defect_fix: merge_group_stall.map(|stall| &stall.defect_fix),
     });
     let mut sweep_pass = super::unapproved_admission::SweepPass::new(args.unapproved_dequeue);
     if args.apply {
@@ -873,6 +897,11 @@ pub(super) fn apply_pr_plans_with_poison(
     );
     if let Some(stall) = merge_group_stall {
         super::merge_group_stall::annotate(stall, &mut reports);
+        super::merge_group_stall::annotate_defect_fix(
+            &stall.defect_fix,
+            &observation.repo,
+            &mut reports,
+        );
     }
     // Apply passes only: they persist the ledger, so the per-head cache holds
     // and a blocked backlog costs nothing between rechecks.

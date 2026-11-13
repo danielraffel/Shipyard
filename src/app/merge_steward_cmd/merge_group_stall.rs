@@ -337,6 +337,9 @@ pub(super) struct StallPass {
     pub(super) entries: BTreeMap<u64, Entry>,
     /// Entries whose group could not be read, with why.
     pub(super) unread: BTreeMap<u64, String>,
+    /// The queue-removals ledger read this pass
+    /// ([`super::defect_fix_removals`]).
+    pub(super) defect_fix: super::defect_fix_removals::Reading,
 }
 
 impl StallPass {
@@ -445,6 +448,47 @@ pub(super) fn observe(
         }
     }
     pass
+}
+
+/// Mark rows the steward refused because a `defect-fix` removal blocks their
+/// head: `blocked_on` `defect_fix_removed:<reason>`, repair lane next.
+pub(super) fn annotate_defect_fix(
+    reading: &super::defect_fix_removals::Reading,
+    repo: &str,
+    reports: &mut [PrReport],
+) {
+    for report in reports.iter_mut() {
+        let refused = report.mutation.as_deref().is_some_and(|mutation| {
+            mutation.split(',').any(|part| {
+                part.starts_with("defect_fix_removed:") || part == "defect_fix_ledger_unjudged"
+            })
+        });
+        // A dry-run pass mutates nothing, so its arm-ready rows are checked
+        // directly.
+        let would_refuse = matches!(report.decision, StewardDecision::ArmMergeQueue)
+            && reading
+                .blocking(repo, report.number, &report.head_sha)
+                .is_some();
+        if !refused && !would_refuse {
+            continue;
+        }
+        let (token, detail) = match reading.blocking(repo, report.number, &report.head_sha) {
+            Some(removal) => super::defect_fix_removals::refusal(removal),
+            None => (
+                "defect_fix_removed:unjudged".to_owned(),
+                "the queue-removals ledger could not be read, and this head left the queue after its last good read: held until the ledger reads again".to_owned(),
+            ),
+        };
+        report.blocked.blocked_on = token;
+        report.blocked.blocked_detail = Some(detail);
+        report.blocked.next_action = Some(super::next_action::NextAction {
+            actor: super::next_action::Actor::Repair,
+            action:
+                "fix the defect and push a new head; this head is not put back in the merge queue"
+                    .to_owned(),
+            stop: false,
+        });
+    }
 }
 
 /// Mark stalled rows: `blocked_on` `merge_group_stalled:<context>`.
@@ -762,15 +806,32 @@ impl Acts for GitHubActs<'_, '_> {
             ledger,
             DEQUEUE_AUDIT,
         );
+        // Record the removal where every steward (and `shipyard who`) reads
+        // it, so this head is not put back until it changes.
+        let appended = if result.is_ok() {
+            super::defect_fix_removals::append(
+                &super::defect_fix_removals::ledger_path(),
+                &self.context.observation.repo,
+                pr.fact.number,
+                &pr.fact.head_sha,
+                "merge group can never finish: a required context's producing run failed",
+                Utc::now(),
+            )
+            .err()
+        } else {
+            None
+        };
         let outcome = if result.is_ok() {
             "doomed_group_dequeued"
         } else {
             "doomed_group_dequeue_failed"
         };
+        let appended = appended.map(|error| format!("queue-removals ledger not written: {error}"));
         match (guard.finish(outcome), result) {
-            (Ok(()), result) => result.map(|()| None),
+            (Ok(()), result) => result.map(|()| appended),
             (Err(audit), Ok(())) => Ok(Some(format!(
-                "dequeued, but the mutation audit failed: {audit}"
+                "dequeued, but the mutation audit failed: {audit}{}",
+                appended.map_or_else(String::new, |line| format!("; {line}"))
             ))),
             (Err(audit), Err(error)) => {
                 Err(format!("{error}; mutation audit also failed: {audit}"))

@@ -5930,6 +5930,16 @@ GraphQL re-read binds PR head and group head, via `dequeue_under_guard`
 (audit `defect-fix`) under the PR mutation guard, then one comment; ledger
 `doomed_dequeues` (`repo#pr@group`) makes it once per group head, failed
 outcomes retry, `retry_comments` reposts a failed comment.
+`defect_fix_removals.rs`: reads `$XDG_STATE_HOME/shipyard/queue-removals.jsonl`
+(the ghapp queue-removal guard's ledger; `targets[{repo,pr,head}]`) once per
+pass into `StallPass.defect_fix`; a `defect-fix` removal of the exact head
+refuses `mutate_pr_with_recovery` for `ArmMergeQueue` (census head before any
+read, live head after revalidation) and drops the row from the native-arm
+backstop's reports; rows read `defect_fix_removed:<reason>`, actor repair.
+Missing file = no record; unreadable = honour `StewardLedger.removal_ledger`
+(last good read) and, within `FRESH_ERROR_MINUTES` (30) of it, hold a head
+whose latest queue removal is after that read (`defect_fix_ledger_unjudged`,
+one queue-state read). The doomed-group dequeue appends its own line.
 `src/app/merge_steward_cmd/poison_pause.rs` adds a queue pause behind its
 own key, `[base_health] merge_group_pause` (default `dry-run`: reports
 `would_pause` and removes nothing; it removes entries only when it and the

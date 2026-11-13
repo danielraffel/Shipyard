@@ -261,6 +261,7 @@ fn doomed_pass(mode: PoisonHold) -> StallPass {
             },
         )]),
         unread: BTreeMap::new(),
+        defect_fix: crate::app::merge_steward_cmd::defect_fix_removals::Reading::default(),
     }
 }
 

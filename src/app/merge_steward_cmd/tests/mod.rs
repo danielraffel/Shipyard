@@ -81,6 +81,7 @@ fn mutation_apply_context<'a>(
         changed_files: std::cell::RefCell::default(),
         ejection_guards: crate::merge_steward::EjectionGuards::default(),
         base_poison: None,
+        defect_fix: None,
     }
 }
 
@@ -228,6 +229,7 @@ mod blocked_on;
 mod capacity;
 #[cfg(unix)]
 mod code_owner_wait;
+mod defect_fix_removals;
 mod dwell;
 #[cfg(unix)]
 mod ejected_retry;
