@@ -147,6 +147,52 @@ class StewardTickArchiveTests(unittest.TestCase):
         self.assertTrue(marker.exists(), "the detached deploy never ran")
         self.assertEqual(marker.read_text().strip(), str(self.log_dir / "summary.log"))
 
+    def steward_prints(self, prs, rc):
+        import json
+        body = json.dumps({"repos": [{"repo": "acme/repo", "prs": prs, "errors": []}]})
+        (self.home / "pass.json").write_text(body)
+        stub = self.home / ".local" / "bin" / "shipyard"
+        stub.write_text(
+            "#!/bin/bash\n"
+            "if [ \"$1\" = --version ]; then echo 'shipyard 1.0'; exit 0; fi\n"
+            f"cat '{self.home / 'pass.json'}'\nexit {rc}\n"
+        )
+        stub.chmod(0o755)
+
+    def summary_line(self):
+        lines = [l for l in (self.log_dir / "summary.log").read_text().splitlines() if "acme/repo" in l]
+        self.assertTrue(lines, "no summary line")
+        return lines[-1]
+
+    POLICY = {"number": 11, "mutation": "none", "error": "needs an exact-head approval"}
+    READ = {"number": 12, "mutation": "none",
+            "error": "queue-arm-guard: cannot read live PR state: gh: HTTP 503 refusing to land it unreviewed"}
+
+    def test_a_read_error_is_read_deferred_not_a_refusal(self):
+        self.steward_prints([self.POLICY, self.READ], rc=1)
+        self.run_tick()
+        line = self.summary_line()
+        self.assertIn("pr_refused=#11 read_deferred=#12", line)
+        self.assertIn("rc=1", line)
+
+    def test_only_a_read_error_is_not_a_failed_tick(self):
+        self.steward_prints([self.READ], rc=1)
+        self.run_tick()
+        line = self.summary_line()
+        self.assertIn("pr_refused=0 read_deferred=#12", line)
+        self.assertIn("rc=0", line)
+
+    def test_the_pass_may_name_the_error_kind(self):
+        self.steward_prints([{"number": 5, "error": "odd text", "error_kind": "read"},
+                             {"number": 6, "error": "HTTP 503 in a policy text", "error_kind": "policy"}], rc=1)
+        self.run_tick()
+        self.assertIn("pr_refused=#6 read_deferred=#5", self.summary_line())
+
+    def test_clean_pass_reports_zero_for_both(self):
+        self.steward_prints([{"number": 1, "mutation": "enqueued"}], rc=0)
+        self.run_tick()
+        self.assertIn("pr_refused=0 read_deferred=0", self.summary_line())
+
     def test_old_archives_are_pruned(self):
         self.run_tick()
         archive_dir = self.log_dir / "archive"

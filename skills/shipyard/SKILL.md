@@ -2391,6 +2391,7 @@ a missing macOS `.dmg` — run `gh auth login` (or export `GITHUB_TOKEN`) and re
 To raise the quota above the ambient `gh` user token's 5,000/hr, point
 `[github.auth]` at a GitHub App installation token helper
 (`scripts/shipyard-github-app-token`) for the 12,500/hr installation bucket.
+The helper retries a dropped connection (`RemoteDisconnected`, `ConnectionResetError`, `IncompleteRead`, a read timeout) with the same bounded delays as a 502/503/504, then fails with a plain `GitHub API request failed` error, not a traceback.
 Put the block in the **global** config dir (find it with `shipyard paths`;
 macOS `~/Library/Application Support/shipyard/config.toml`) to cover every repo
 on the machine — not the tracked project config. A tracked layer may not set
