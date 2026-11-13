@@ -346,12 +346,17 @@ pub fn policy_checks_from_snapshot(snapshot: &Value) -> Result<Vec<String>, Stri
         };
         checks.push(format!("{context}@app:{app}"));
     }
-    let mut sorted = checks.clone();
-    sorted.sort();
-    if checks.is_empty() || sorted.windows(2).any(|pair| pair[0] == pair[1]) {
+    if checks.is_empty() {
         return Err(
-            "delegated receipt refused: protected-branch policy identity is empty or duplicated"
+            "delegated receipt refused: no required checks on the base branch (protected-branch policy is empty)"
                 .to_owned(),
+        );
+    }
+    let mut sorted = checks;
+    sorted.sort();
+    if sorted.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(
+            "delegated receipt refused: protected-branch policy identity is duplicated".to_owned(),
         );
     }
     Ok(sorted)
@@ -595,6 +600,16 @@ mod tests {
                 {"context":"macos","app_id":1}
             ]
         });
-        assert!(policy_checks_from_snapshot(&duplicate).is_err());
+        let error = policy_checks_from_snapshot(&duplicate).expect_err("duplicate refused");
+        assert!(error.contains("duplicated"), "{error}");
+        assert!(!error.contains("empty"), "{error}");
+    }
+
+    #[test]
+    fn empty_policy_is_reported_as_empty_not_duplicated() {
+        let empty = serde_json::json!({"_required_check_policy": []});
+        let error = policy_checks_from_snapshot(&empty).expect_err("empty refused");
+        assert!(error.contains("no required checks"), "{error}");
+        assert!(!error.contains("duplicated"), "{error}");
     }
 }

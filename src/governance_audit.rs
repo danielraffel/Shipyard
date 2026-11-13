@@ -1107,65 +1107,62 @@ fn fetch_workflow_files(
     reader: &dyn GithubReader,
     contents: &dyn Fn(&str) -> String,
 ) {
-    const PAGE_SIZE: usize = 30;
-    let listing_path = contents(".github/workflows");
-    let mut page = 1;
-    loop {
-        let path = if page == 1 {
-            listing_path.clone()
-        } else {
-            format!("{listing_path}&page={page}")
+    // The contents API returns the whole directory (capped at 1000 entries)
+    // and ignores page/per_page, so read the listing exactly once.
+    const LISTING_CAP: usize = 1000;
+    let entries = match reader.get_json(&contents(".github/workflows")) {
+        Ok(Some(JsonValue::Array(entries))) => entries,
+        Ok(Some(_)) => {
+            snapshot.read_errors.insert(
+                "workflows".to_owned(),
+                "workflow listing was not an array".to_owned(),
+            );
+            return;
+        }
+        Ok(None) => {
+            snapshot
+                .read_errors
+                .insert("workflows".to_owned(), "HTTP 404".to_owned());
+            return;
+        }
+        Err(error) => {
+            snapshot.read_errors.insert("workflows".to_owned(), error);
+            return;
+        }
+    };
+    if entries.len() >= LISTING_CAP {
+        snapshot.read_errors.insert(
+            "workflows".to_owned(),
+            format!(
+                "workflow listing reached the {LISTING_CAP}-entry API cap and may be truncated"
+            ),
+        );
+        return;
+    }
+    for entry in entries {
+        let (Some(name), Some(path)) = (entry["name"].as_str(), entry["path"].as_str()) else {
+            continue;
         };
-        let entries = match reader.get_json(&path) {
-            Ok(Some(JsonValue::Array(entries))) => entries,
-            Ok(Some(_)) => {
-                snapshot.read_errors.insert(
-                    "workflows".to_owned(),
-                    "workflow listing was not an array".to_owned(),
-                );
-                break;
-            }
-            Ok(None) => {
-                snapshot
-                    .read_errors
-                    .insert("workflows".to_owned(), "HTTP 404".to_owned());
-                break;
+        let is_workflow = std::path::Path::new(name)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("yml") || ext.eq_ignore_ascii_case("yaml"));
+        if name != "actions.lock" && !is_workflow {
+            continue;
+        }
+        match reader.get_raw(&contents(path)) {
+            Ok(Some(text)) if is_workflow => snapshot.workflows.push(WorkflowFile {
+                path: path.to_owned(),
+                content: text,
+            }),
+            Ok(text) => {
+                if !is_workflow {
+                    snapshot.lockfile = text;
+                }
             }
             Err(error) => {
                 snapshot.read_errors.insert("workflows".to_owned(), error);
-                break;
-            }
-        };
-        let count = entries.len();
-        for entry in entries {
-            let (Some(name), Some(path)) = (entry["name"].as_str(), entry["path"].as_str()) else {
-                continue;
-            };
-            let is_workflow = std::path::Path::new(name).extension().is_some_and(|ext| {
-                ext.eq_ignore_ascii_case("yml") || ext.eq_ignore_ascii_case("yaml")
-            });
-            if name != "actions.lock" && !is_workflow {
-                continue;
-            }
-            match reader.get_raw(&contents(path)) {
-                Ok(Some(text)) if is_workflow => snapshot.workflows.push(WorkflowFile {
-                    path: path.to_owned(),
-                    content: text,
-                }),
-                Ok(text) => {
-                    if !is_workflow {
-                        snapshot.lockfile = text;
-                    }
-                }
-                Err(error) => {
-                    snapshot.read_errors.insert("workflows".to_owned(), error);
-                }
             }
         }
-        if count < PAGE_SIZE {
-            break;
-        }
-        page += 1;
     }
 }
 
