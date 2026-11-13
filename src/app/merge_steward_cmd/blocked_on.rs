@@ -71,10 +71,6 @@ pub(super) struct Stall {
     /// another way ([`super::superseded`]). Never changes `blocked_on`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub superseded: Option<super::superseded::Evidence>,
-    /// When the pull request became stuck on a red required context or a
-    /// HOLD at this head ([`super::stuck`]); a push starts it over.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stuck_since: Option<String>,
     /// This head fails a required check the same way as other open pull
     /// requests: a base-level episode ([`super::red_everywhere`]). Never
     /// changes `blocked_on`; `repair_skip` is set under enforce.
@@ -786,7 +782,6 @@ fn approval_blocked(blocker: &ApprovalBlocker, green_since: Option<String>) -> (
             next_action: None,
             superseded: None,
             red_everywhere: None,
-            stuck_since: None,
         },
         hint,
     )
@@ -981,7 +976,6 @@ fn dated(
             next_action: None,
             superseded: None,
             red_everywhere: None,
-            stuck_since: None,
         },
         hint,
     )

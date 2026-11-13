@@ -9,8 +9,7 @@
 //! rate_limit_minutes = 10   # one message per pull request per window
 //! repos = ["Generous-Corp/pulp", "Generous-Corp/vellum"]
 //! events = ["merged", "closed", "ejected", "verdict", "required_check",
-//!           "dirty_after_base_move", "claim_taken", "stacked_base_merged", "overdue",
-//!           "stuck"]
+//!           "dirty_after_base_move", "claim_taken", "stacked_base_merged", "overdue"]
 //! sockets = ["/tmp/cmux-nightly.sock", ""]   # "" is cmux's default socket
 //! comment_fallback = true
 //! steward_tick_dir = "/Users/me/Library/Logs/shipyard-steward-tick"
@@ -116,7 +115,7 @@ pub(crate) struct RelayConfig {
 }
 
 /// Events delivered when `relay.events` is absent.
-pub(crate) const DEFAULT_EVENTS: [&str; 10] = [
+pub(crate) const DEFAULT_EVENTS: [&str; 9] = [
     "merged",
     "closed",
     "ejected",
@@ -126,11 +125,10 @@ pub(crate) const DEFAULT_EVENTS: [&str; 10] = [
     "claim_taken",
     "stacked_base_merged",
     "overdue",
-    "stuck",
 ];
 
 /// Every event name the relay knows.
-pub(crate) const KNOWN_EVENTS: [&str; 11] = [
+pub(crate) const KNOWN_EVENTS: [&str; 10] = [
     "merged",
     "closed",
     "ejected",
@@ -141,7 +139,6 @@ pub(crate) const KNOWN_EVENTS: [&str; 11] = [
     "claim_taken",
     "stacked_base_merged",
     "overdue",
-    "stuck",
 ];
 
 impl Default for RelayConfig {

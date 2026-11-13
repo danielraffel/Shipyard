@@ -50,13 +50,6 @@ pub(crate) struct NextAction {
     pub action: String,
     /// The caller may stop: the owner must act, or the PR is terminal.
     pub stop: bool,
-    /// Set on a pull request stuck red on a required context or held at its
-    /// head with nothing pushed for a while ([`super::stuck`]): `owner` once
-    /// [`crate::merge_steward::stuck::OWNER_MINUTES`] pass, `repair` once
-    /// [`crate::merge_steward::stuck::REPAIR_MINUTES`] do. `shipyard relay`
-    /// delivers it.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub escalate: Option<crate::merge_steward::stuck::Escalate>,
 }
 
 impl NextAction {
@@ -71,7 +64,6 @@ impl NextAction {
             actor,
             action,
             stop: false,
-            escalate: None,
         }
     }
 
@@ -80,7 +72,6 @@ impl NextAction {
             actor,
             action,
             stop: true,
-            escalate: None,
         }
     }
 

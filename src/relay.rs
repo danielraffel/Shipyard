@@ -69,10 +69,6 @@ pub(crate) enum Checks {
 pub(crate) struct Claim {
     pub(crate) by: String,
     pub(crate) until: String,
-    /// When the claim comment was written: a claim touches the pull request
-    /// and starts a stuck clock over ([`stuck_level`]).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) at: Option<String>,
 }
 
 /// The facts the relay compares between passes for one pull request.
@@ -176,19 +172,6 @@ pub(crate) enum RelayEvent {
         #[serde(default)]
         limit_minutes: u32,
     },
-    /// The steward marked the pull request stuck: red on a required
-    /// context, or held at the head, with nothing pushed
-    /// (`next_action.escalate`). One per head, level and clock start.
-    Stuck {
-        head: String,
-        /// `owner` or `repair`.
-        escalate: String,
-        /// When the clock started: the steward's `stuck_since`, or a newer
-        /// repair claim.
-        since: String,
-        #[serde(default)]
-        minutes: i64,
-    },
 }
 
 impl RelayEvent {
@@ -216,7 +199,6 @@ impl RelayEvent {
             Self::ClaimTaken { .. } => "claim_taken",
             Self::StackedBaseMerged { .. } => "stacked_base_merged",
             Self::Overdue { .. } => "overdue",
-            Self::Stuck { .. } => "stuck",
         }
     }
 
@@ -250,12 +232,6 @@ impl RelayEvent {
             Self::Overdue {
                 state, head, level, ..
             } => format!("{head}:{state}:{level}"),
-            Self::Stuck {
-                head,
-                escalate,
-                since,
-                ..
-            } => format!("{head}:{escalate}:{since}"),
         };
         format!("{repo}#{pr}:{}:{detail}", self.name())
     }
@@ -303,19 +279,6 @@ impl RelayEvent {
                 limit_minutes,
                 ..
             } => format!("overdue: {state} for {age_minutes} min (limit {limit_minutes} min)"),
-            Self::Stuck {
-                escalate, minutes, ..
-            } => {
-                if escalate == "repair" {
-                    format!(
-                        "stuck {minutes} min red on a required check or held at the head, with no push or claim: repair lane, take it"
-                    )
-                } else {
-                    format!(
-                        "stuck {minutes} min red on a required check or held at the head, with no push or claim: fix and push, or claim it"
-                    )
-                }
-            }
         }
     }
 }
@@ -368,7 +331,8 @@ pub(crate) fn derive_events(old: Option<&PrDigest>, new: &PrDigest) -> Vec<Relay
     match new.checks {
         // A pull request in the merge queue is never red to its owner: its
         // group is the queue's to judge, and a check on its head (a stale or
-        // non-required one) is not the author's to fix (vellum#412).
+        // non-required one) is not the author's to fix (vellum#412). If the
+        // queue ejects it, the `ejected` event above names the red.
         Checks::Failure if new.in_queue => {}
         Checks::Failure if old.checks != Checks::Failure || old.red != new.red || head_moved => {
             events.push(RelayEvent::RequiredCheck {
@@ -526,10 +490,6 @@ fn scan_comments(pr: &Value, head: &str) -> (Option<String>, Option<Claim>, Opti
             claim = Some(Claim {
                 by: found[1].to_owned(),
                 until: found[2].to_owned(),
-                at: comment
-                    .get("createdAt")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
             });
         }
     }
@@ -863,32 +823,6 @@ pub(crate) fn steward_next_actions(report: &Value) -> BTreeMap<u64, (String, Str
 /// gets its chance before anyone is told.
 pub(crate) fn steward_overdue(report: &Value) -> BTreeMap<u64, Vec<RelayEvent>> {
     let mut out: BTreeMap<u64, Vec<RelayEvent>> = BTreeMap::new();
-    // Stuck rows (`stuck_since` and `next_action.escalate`), at their head.
-    let mut stuck_heads: BTreeSet<(u64, String)> = BTreeSet::new();
-    for row in report
-        .get("repos")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|repo| repo.get("prs").and_then(Value::as_array))
-        .flatten()
-    {
-        let (Some(pr), Some(head), Some(since), Some(escalate)) = (
-            row.get("number").and_then(Value::as_u64),
-            row.get("head_sha").and_then(Value::as_str),
-            row.get("stuck_since").and_then(Value::as_str),
-            row.pointer("/next_action/escalate").and_then(Value::as_str),
-        ) else {
-            continue;
-        };
-        stuck_heads.insert((pr, head.to_owned()));
-        out.entry(pr).or_default().push(RelayEvent::Stuck {
-            head: head.to_owned(),
-            escalate: escalate.to_owned(),
-            since: since.to_owned(),
-            minutes: 0,
-        });
-    }
     let rows = report
         .get("repos")
         .and_then(Value::as_array)
@@ -919,13 +853,6 @@ pub(crate) fn steward_overdue(report: &Value) -> BTreeMap<u64, Vec<RelayEvent>> 
         ) else {
             continue;
         };
-        // The stuck signal carries a red required context or a HOLD for
-        // this head; its dwell notice would say the same thing twice.
-        if matches!(state, "required_failed" | "held")
-            && stuck_heads.contains(&(pr, head.to_owned()))
-        {
-            continue;
-        }
         out.entry(pr).or_default().push(RelayEvent::Overdue {
             state: state.to_owned(),
             head: head.to_owned(),
@@ -939,35 +866,6 @@ pub(crate) fn steward_overdue(report: &Value) -> BTreeMap<u64, Vec<RelayEvent>> 
         });
     }
     out
-}
-
-/// The stuck level for a pull request the steward marked stuck since
-/// `since`, taking a newer repair claim as a touch that starts the clock
-/// over. `None` before [`crate::merge_steward::stuck::OWNER_MINUTES`], or
-/// when `since` cannot be read. Returns the level, the clock start and the
-/// minutes on it.
-pub(crate) fn stuck_level(
-    since: &str,
-    claim: Option<&Claim>,
-    now: DateTime<Utc>,
-) -> Option<(crate::merge_steward::stuck::Escalate, String, i64)> {
-    let parse = |text: &str| {
-        DateTime::parse_from_rfc3339(text)
-            .ok()
-            .map(|at| at.with_timezone(&Utc))
-    };
-    let mut start = parse(since)?;
-    let mut start_text = since.to_owned();
-    if let Some(at) = claim.and_then(|claim| claim.at.as_deref())
-        && let Some(claimed) = parse(at)
-        && claimed > start
-    {
-        start = claimed;
-        at.clone_into(&mut start_text);
-    }
-    let minutes = (now - start).num_minutes();
-    crate::merge_steward::stuck::Escalate::for_minutes(minutes)
-        .map(|level| (level, start_text, minutes))
 }
 
 /// One delivery, as appended to the delivery log.

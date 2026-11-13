@@ -97,7 +97,6 @@ fn report(number: u64) -> PrReport {
                 actor: Actor::Author,
                 action: "Required check(s) failed on this head: fix, push once.".to_owned(),
                 stop: false,
-                escalate: None,
             }),
             ..Stall::default()
         },
