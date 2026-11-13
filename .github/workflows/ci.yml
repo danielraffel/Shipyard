@@ -207,6 +207,9 @@ jobs:
       - name: Run fleet pass-runner tests
         run: python3 scripts/run_unittest_strict.py -s tools/fleet-pass -p 'test_*.py'
 
+      - name: Run loss report tests
+        run: python3 scripts/run_unittest_strict.py -s tools/metrics -p 'test_*.py'
+
   # Names the cause of each failed job in this run as a `ci.cause/v1` record,
   # printed as a `::notice title=ci-cause::` annotation. A job's own log can be
   # downloaded only once it has finished, so this job reads the failed jobs'

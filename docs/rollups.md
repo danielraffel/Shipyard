@@ -190,3 +190,46 @@ shipyard rollup split --members 11,12,13,14 [--passed] [--first-passed BOOL --se
 ```
 
 All of them exit 0 when done, 1 when refused and 2 when unreadable.
+
+## Daily loss report
+
+`tools/metrics/loss_report.py` turns the steward's per-tick JSON into a daily
+account of what blocked pull requests cost. It is the one definitions table for
+the loss numbers: the plan, the scorecard and the summary line use these terms.
+
+The steward tick keeps each tick's JSON live for three days, then bundles it by
+UTC day under `archive/ticks-YYYYMMDD.tar.gz` for 180 days. The report reads
+both, once per file, for a window (`--since`, default `7d`). It reads no
+GitHub data unless `--github DIR` names a directory of cached REST answers, and
+then it still reads only that directory.
+
+Once per UTC day the tick starts it detached (same pattern as fleet-deploy), from
+the deploy clone at `origin/main`. It writes
+`~/Library/Logs/shipyard-steward-tick/loss-report-YYYYMMDD.{json,md}` and one
+`loss-report` line to `summary.log`. It takes its own lock, marks the day when it
+starts, and exits 0 whatever happens; a failure is one `loss-report ERROR` line
+and a retry the next UTC day. `SHIPYARD_LOSS_REPORT=off` turns it off.
+
+```
+python3 -I tools/metrics/loss_report.py --log-dir DIR [--since 7d] [--github CACHE] [--json-out F] [--md-out F]
+```
+
+| Term | Definition |
+| --- | --- |
+| Episode | One contiguous interval in which one PR head carried one `blocked_on` token. Repeated tick observations count once. A change of head or token ends it; so does a gap of more than 120 minutes between a repository's ticks (the episode is then neither cleared nor counted resolved). |
+| Class | `actionable`: `next_action.actor` is author, reviewer, repair or operator. `normal_wait`: actor `ci`, `steward` or `nobody`, or a waiting token such as `queued`, `capacity_queued`, `required_pending` on a live run. `human_stop`: `next_action.stop`, or `excluded_label`, `direct_merge_refused`, `owner_decision`. `intentional`: `draft`. `closed_unmerged`: the PR was later closed unmerged (needs `--github`). |
+| Resolved | An actionable episode that ended by a push, a same-head token change, or the PR leaving the list. |
+| Agent-free resolution, upper | Resolved episodes that cleared on the same head with no `repaired:` or `dispute:` comment inside the episode, over resolved episodes. An upper bound: a rerun or label with no comment still counts. |
+| Agent-free resolution, strict | The same, and the next token is a normal wait (the system moved it along). |
+| Owner stops per 100 PRs | PRs with a `human_stop` episode over PRs seen, excluding closed-unmerged ones when known. Stops raised, not answered. |
+| Fix push | An episode of a token that ended with a new head. |
+| `review_verdict_same_head_no_push` | Actionable `required_failed` episodes naming `review-verdict` that cleared on the same head with no push. |
+| `capacity_queued`, superseded | Episodes with that token; superseded counts the `excluded_label:superseded` label and, apart, rows carrying the steward's `superseded` detection. |
+| `red_everywhere` | Episodes whose token, detail or decision names it. `unavailable` when it never appears in the window, since silence cannot tell "none occurred" from "not emitted". |
+| Per-day series | Counted on the UTC day an episode was first seen. A day with no tick files is `null`, never `0`. |
+
+Coverage is `available`, `partial` or `unavailable` for the window (days with
+ticks, gaps, unreadable files), GitHub reads, agent work, CI compute and owner
+stops answered. CI compute per episode and owner stops answered are always
+`unavailable` today: tick JSON does not carry them. Elapsed time appears only as
+context in the JSON; no number in the summary is a duration.
