@@ -173,6 +173,28 @@ class CoverageTests(Fixture):
         r = self.report()
         self.assertEqual(r["series_per_day"]["red_everywhere_episodes"]["2026-11-12"], 1)
 
+    def test_red_everywhere_false_decision_is_not_a_hit(self):
+        self.live(dt.datetime(2026, 11, 12, 2, 0, tzinfo=UTC),
+                  [(2, "b", "required_failed:macos", "author", {"decision": {"red_everywhere": False}})])
+        r = self.report()
+        self.assertIsNone(r["series_per_day"]["red_everywhere_episodes"])
+        self.live(dt.datetime(2026, 11, 12, 3, 0, tzinfo=UTC),
+                  [(3, "c", "required_failed:macos", "author", {"decision": {"red_everywhere": True}})])
+        self.assertEqual(self.report()["series_per_day"]["red_everywhere_episodes"]["2026-11-12"], 1)
+
+    def test_pull_request_payload_is_not_an_issue_comment(self):
+        t = dt.datetime(2026, 11, 12, 1, 0, tzinfo=UTC)
+        self.live(t, [(10, "a", "required_failed:macos", "author", None)])
+        self.live(t + dt.timedelta(minutes=5), [(10, "a", "required_pending", "ci", None)])
+        cache = self.dir / "cache"
+        cache.mkdir()
+        (cache / "pr.json").write_text(json.dumps({
+            "id": 77, "number": 10, "state": "open", "body": "repaired: not a comment",
+            "issue_url": f"https://api.github.com/repos/{REPO}/issues/10",
+            "created_at": "2026-11-12T01:02:00Z", "base": {"repo": {"full_name": REPO}}}))
+        closed, comments = lr.load_github_cache(str(cache))
+        self.assertEqual(comments, [])
+
     def test_github_cache_separates_abandoned_and_counts_comments(self):
         t = dt.datetime(2026, 11, 12, 1, 0, tzinfo=UTC)
         self.live(t, [(9, "a", "merge_state:DIRTY", "author", None), (10, "a", "required_failed:macos", "author", None)])
