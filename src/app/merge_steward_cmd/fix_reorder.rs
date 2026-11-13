@@ -11,9 +11,10 @@
 //! It acts only while a context is confirmed red
 //! ([`super::base_poison::RepoPoison::confirmed_contexts`]) and only on the
 //! one fix the pass named. An entry at position 1 is left alone: its group
-//! is the one already building. The jump is bound to the head the census
-//! read; a head that moved is refused before anything changes, and the jump
-//! re-reads the exact-head approval. One decision per episode (context and
+//! is the one already building. The jump is bound to the repository, the
+//! base and the head the census read; a head that moved or a different base
+//! is refused before anything changes, and the jump re-reads the exact-head
+//! approval. One decision per episode (context and
 //! the time the base went red) is recorded in
 //! `<state>/base-health/fix-reorders.jsonl`; a failed attempt is recorded as
 //! failed and retried by the next pass. `dry-run` records `would_reorder`
@@ -206,7 +207,10 @@ pub(super) fn run(
                 actions,
                 &observation.repo,
                 candidate.pr,
-                Some(&candidate.head),
+                Some(crate::app::base_health_cmd::Expected {
+                    head: &candidate.head,
+                    base: &observation.base,
+                }),
             );
             let token = if outcome == "jumped" {
                 "base_fix_reordered"

@@ -1105,6 +1105,24 @@ fn red_everywhere_over_a_stale_tip_confirms_and_names_the_fix() {
     // Without red everywhere the stale tip confirms nothing.
     let alone = poison(PoisonHold::On, &prs, streak(), stale);
     assert!(alone.confirmed_contexts().is_empty());
+    // Red everywhere never confirms over a fresh green or an unread tip.
+    let fresh = TipReading {
+        newest_at: Some(since + chrono::Duration::minutes(5)),
+        ..TipReading::default()
+    };
+    let unread = TipReading {
+        error: Some("HTTP 502".to_owned()),
+        ..TipReading::default()
+    };
+    for tip in [fresh, unread] {
+        let mut not_confirmed = poison(PoisonHold::On, &prs, streak(), tip);
+        not_confirmed.red_everywhere = BTreeMap::from([(CONTEXT.to_owned(), since)]);
+        assert!(not_confirmed.confirmed_contexts().is_empty());
+        assert!(matches!(
+            base_poison::admission(Some(&not_confirmed), 408),
+            Admission::Proceed
+        ));
+    }
 }
 
 const OTHER: &str = "macos-gpu";

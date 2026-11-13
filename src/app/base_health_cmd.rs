@@ -362,14 +362,24 @@ fn act(
     Ok(decision)
 }
 
+/// What the caller read and the jump must still find: the exact head and
+/// the base branch.
+#[derive(Clone, Copy, Debug)]
+pub(in crate::app) struct Expected<'a> {
+    /// The head the caller read.
+    pub(in crate::app) head: &'a str,
+    /// The base the caller judged.
+    pub(in crate::app) base: &'a str,
+}
+
 /// Dequeue and re-enqueue the fix pull request's exact head at the front.
-/// With `expected_head`, a head that moved since the caller read it is
-/// refused before anything changes.
+/// With `expected`, a head that moved or a base that differs since the
+/// caller read it is refused before anything changes.
 pub(in crate::app) fn jump(
     actions: &GitHubActions,
     repo: &str,
     pr: u64,
-    expected_head: Option<&str>,
+    expected: Option<Expected<'_>>,
 ) -> String {
     let Some((owner, name)) = repo.split_once('/') else {
         return format!("failed: repo `{repo}` is not OWNER/REPO");
@@ -404,10 +414,14 @@ pub(in crate::app) fn jump(
     if field("state") != "OPEN" {
         return "not_open".to_owned();
     }
-    if let Some(expected) = expected_head
-        && !expected.eq_ignore_ascii_case(&head)
-    {
-        return format!("refused: head moved from {expected} to {head}");
+    if let Some(expected) = expected {
+        if !expected.head.eq_ignore_ascii_case(&head) {
+            return format!("refused: head moved from {} to {head}", expected.head);
+        }
+        let base = field("baseRefName");
+        if base != expected.base {
+            return format!("refused: base is `{base}`, not `{}`", expected.base);
+        }
     }
     let position = node
         .pointer("/mergeQueueEntry/position")
@@ -755,7 +769,7 @@ esac
         comments: &str,
         jump_answer: &str,
         plain_answer: &str,
-        expected_head: Option<&str>,
+        expected: Option<Expected<'_>>,
     ) -> (String, String) {
         let temp = tempfile::tempdir().expect("temp");
         let log = temp.path().join("calls.log");
@@ -789,7 +803,7 @@ esac
         };
         let actions =
             GitHubActions::from_loaded_config(temp.path(), &config).with_gh_binary_for_tests(gh);
-        let outcome = jump(&actions, "o/r", 8933, expected_head);
+        let outcome = jump(&actions, "o/r", 8933, expected);
         (outcome, std::fs::read_to_string(&log).unwrap_or_default())
     }
 
@@ -799,19 +813,36 @@ esac
         r#"{"data":{"enqueuePullRequest":{"mergeQueueEntry":{"position":4}}}}"#;
     const REFUSED: &str = r#"{"data":{"enqueuePullRequest":null},"errors":[{"type":"FORBIDDEN","message":"no jump"}]}"#;
 
-    /// A head that moved between the steward's read and the jump is never
-    /// dequeued or jumped.
+    /// A head that moved, or a base other than the one judged, between the
+    /// steward's read and the jump is never dequeued or jumped.
     #[cfg(unix)]
     #[test]
-    fn a_jump_bound_to_a_head_refuses_a_moved_head_before_any_mutation() {
+    fn a_jump_bound_to_a_head_and_base_refuses_either_change_before_any_mutation() {
         let moved = "b".repeat(40);
-        let (outcome, calls) =
-            run_jump_expecting(&jump_approval(), QUEUED_FIRST, QUEUED_LAST, Some(&moved));
+        let expect = |head, base| Some(Expected { head, base });
+        let (outcome, calls) = run_jump_expecting(
+            &jump_approval(),
+            QUEUED_FIRST,
+            QUEUED_LAST,
+            expect(&moved, "main"),
+        );
         assert!(outcome.starts_with("refused: head moved"), "{outcome}");
         assert!(!calls.contains("dequeuePullRequest"), "{calls}");
         assert!(!calls.contains("enqueuePullRequest"), "{calls}");
-        let (outcome, _calls) =
-            run_jump_expecting(&jump_approval(), QUEUED_FIRST, QUEUED_LAST, Some(HEAD));
+        let (outcome, calls) = run_jump_expecting(
+            &jump_approval(),
+            QUEUED_FIRST,
+            QUEUED_LAST,
+            expect(HEAD, "release/1.0"),
+        );
+        assert!(outcome.starts_with("refused: base is `main`"), "{outcome}");
+        assert!(!calls.contains("dequeuePullRequest"), "{calls}");
+        let (outcome, _calls) = run_jump_expecting(
+            &jump_approval(),
+            QUEUED_FIRST,
+            QUEUED_LAST,
+            expect(HEAD, "main"),
+        );
         assert_eq!(outcome, "jumped");
     }
 
