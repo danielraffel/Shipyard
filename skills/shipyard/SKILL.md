@@ -5946,6 +5946,43 @@ would open. Replayed over 2026-11-04..11
 the `streak` rule was right in 2 of 12 Pulp episodes and 0-1 of 10 Vellum
 ones, which is why every act here starts in shadow.
 
+Fix-first (`src/base_health/fix_first.rs`): the streak alone no longer holds,
+pauses, fast-tracks or jumps. `observe` reads the base tip's own runs of each
+poisoned context (`commits/<base>/check-runs?check_name=...&filter=all`, one
+`GET` per poisoned context, only while the streak fires; app pin honoured);
+`RepoPoison::confirmed_contexts` keeps those whose newest tip verdict failed
+(`judge_tip`; `red_since` = completion of the first failure after the last
+passing verdict). Only a confirmed context yields `Hold`, `Pause`, a jump, or the
+review/root-cause fast-track; an unread tip confirms nothing, and a green tip
+lifts holds and restores paused entries in the same pass
+(`RepoPoison::tip_green_for`). With nothing confirmed, admission returns
+`Proceed` for every PR, named fix or not. Under a confirmed context, admission exempts
+only `RepoPoison::covering`: heads that passed every confirmed context after
+`red_since` (`fix_first::passed_after`, intersected across contexts; a
+confirmed context with no `red_since` empties it). A named fix outside it is
+held. The pause keeps only `covering` while a context is confirmed
+(`candidates` and named fixes exempt only when nothing is confirmed, where
+nothing is paused). Coverage reads each context through its required rule's
+app id. `base-health --act`'s merge-group advice also requires every
+poisoned context red on the tip, read with the required app id. A pass with
+an unread tip keeps open `tip_red` episodes open and marks them `partial`;
+the gate and `fix_first_score` count partial episodes but never use them as
+evidence. `green_head_fix` names the fix from the census
+with no read: not draft, approval status successful at the head, every
+confirmed context's selected check green with `observed_at > red_since`, never a PR
+that rode a failing group. `fix_first::pick` names it only when it is the
+sole candidate or the sole one labelled `main-red-fix`/`fixes-main`;
+otherwise `GreenHead::Ambiguous`: none jumped or held, all added to
+`candidates` (admitted plainly, never paused), `fix_ambiguity` reported.
+`RepoPoison::partial` reports an unread tip or fix listing and the shadow
+ledger marks the episode `partial`. Its evidence starts `green head` and `choose_fix` ranks it
+label 0, detector 1, green head 2, text 3. The shadow ledger adds rule
+`tip_red`, records `fix_picks` per pass and `fixed_by` from
+`MergeGroupHealth::Clear.passed_by` (the newest passing group's PRs) when an
+episode ends, and reports `fix_first_score`. `shipyard base-health --replay
+FILE` replays `ReplayEpisode` facts offline; the 2026-11-13 Vellum and Pulp
+episodes are fixtures under `tests/fixtures/base_health/`.
+
 ### The endpoint that lies by omission
 
 `GET /repos/{o}/{r}/branches/{b}/protection` has **no merge-queue field at

@@ -23,7 +23,7 @@ use serde_json::Value;
 
 use super::CliFailure;
 use crate::base_health::{
-    self, AutoJump, BaseHealthFinding, JumpAdvice, JumpDecision, already_recorded,
+    self, AutoJump, BaseHealthFinding, JumpAdvice, JumpDecision, already_recorded, fix_first,
 };
 use crate::cloud::GitHubActions;
 use crate::config::LoadedConfig;
@@ -36,6 +36,7 @@ pub(super) struct BaseHealthArgs {
     pub(super) base: String,
     pub(super) workflow: Option<String>,
     pub(super) act: bool,
+    pub(super) replay: Option<PathBuf>,
     pub(super) json: bool,
 }
 
@@ -47,6 +48,9 @@ pub(super) fn base_health_command<W: Write>(
     state_dir: &Path,
     stdout: &mut W,
 ) -> Result<std::process::ExitCode, CliFailure> {
+    if let Some(path) = args.replay.as_deref() {
+        return replay_command(path, args.json, stdout);
+    }
     let config = LoadedConfig::load_from_cwd(mode, cwd)
         .map_err(|error| CliFailure::new(2, format!("config error: {error}")))?;
     let auto_jump = AutoJump::parse(config.get_str(base_health::AUTO_JUMP_CONFIG_KEY))
@@ -78,14 +82,19 @@ pub(super) fn base_health_command<W: Write>(
     let reader = |gh_args: &[String]| actions.run_gh(gh_args).map_err(|error| error.to_string());
     let finding = base_health::read_latest(&reader, &repo, &workflow);
     let base = args.base.clone();
-    let merge_groups = match super::merge_steward_cmd::required_contexts(&actions, &repo, &base) {
-        Ok(contexts) => {
-            base_health::merge_group::read(&reader, &repo, &base, &contexts, Utc::now())
-        }
-        Err(detail) => base_health::merge_group::MergeGroupHealth::Unknown { detail },
-    };
+    let (merge_groups, required) =
+        match super::merge_steward_cmd::required_contexts(&actions, &repo, &base) {
+            Ok(contexts) => (
+                base_health::merge_group::read(&reader, &repo, &base, &contexts, Utc::now()),
+                contexts,
+            ),
+            Err(detail) => (
+                base_health::merge_group::MergeGroupHealth::Unknown { detail },
+                Vec::new(),
+            ),
+        };
     let advice = base_health::jump_advice(&repo, &finding, Utc::now())
-        .or_else(|| merge_group_advice(&reader, &repo, &base, &merge_groups));
+        .or_else(|| merge_group_advice(&reader, &repo, &base, &merge_groups, &required));
 
     let decision = if args.act {
         advice
@@ -120,17 +129,112 @@ pub(super) fn base_health_command<W: Write>(
     Ok(std::process::ExitCode::SUCCESS)
 }
 
-/// Jump advice from merge-group poison: only when exactly one open pull
-/// request is named as the fix, so the advice never picks between rivals.
-/// Its episode key is the newest failing merge-group head.
+/// `--replay FILE`: run recorded episodes through the fix-first rule and
+/// score the picks. Pure: no GitHub read, no state written.
+fn replay_command<W: Write>(
+    path: &Path,
+    json: bool,
+    stdout: &mut W,
+) -> Result<std::process::ExitCode, CliFailure> {
+    let text = fs::read_to_string(path)
+        .map_err(|error| CliFailure::new(2, format!("{}: {error}", path.display())))?;
+    let episodes: Vec<fix_first::ReplayEpisode> = serde_json::from_str(&text)
+        .map_err(|error| CliFailure::new(2, format!("{}: {error}", path.display())))?;
+    let outcomes = episodes.iter().map(fix_first::replay).collect::<Vec<_>>();
+    let score = fix_first::score(&outcomes);
+    let io = |error: std::io::Error| CliFailure::new(1, error.to_string());
+    if json {
+        let payload = serde_json::json!({"outcomes": outcomes, "score": score});
+        writeln!(
+            stdout,
+            "{}",
+            serde_json::to_string_pretty(&payload).unwrap_or_default()
+        )
+        .map_err(io)?;
+        return Ok(std::process::ExitCode::SUCCESS);
+    }
+    let list = |prs: &[u64]| {
+        if prs.is_empty() {
+            "none".to_owned()
+        } else {
+            prs.iter()
+                .map(|pr| format!("#{pr}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    };
+    for outcome in &outcomes {
+        writeln!(
+            stdout,
+            "{} `{}` at {}: {}",
+            outcome.key,
+            outcome.context,
+            outcome.decided_at.to_rfc3339(),
+            if outcome.fires { "FIRES" } else { "quiet" }
+        )
+        .map_err(io)?;
+        writeln!(stdout, "  {}", outcome.why).map_err(io)?;
+        writeln!(
+            stdout,
+            "  fix: {}; held: {}; shadow would-hold: {}; actual fix: {}{}",
+            outcome
+                .fix
+                .map_or_else(|| "none".to_owned(), |pr| format!("#{pr} (jump)")),
+            list(&outcome.held),
+            list(&outcome.shadow_would_hold),
+            outcome
+                .actual_fix
+                .map_or_else(|| "unknown".to_owned(), |pr| format!("#{pr}")),
+            if outcome.actual_fix_held {
+                "; ACTUAL FIX HELD"
+            } else {
+                ""
+            }
+        )
+        .map_err(io)?;
+    }
+    writeln!(
+        stdout,
+        "score: {} episodes, {} fired, {} named a fix, {} correct, {} wrong, {} held the actual fix",
+        score.episodes, score.fired, score.named, score.correct, score.wrong, score.actual_fix_held
+    )
+    .map_err(io)?;
+    Ok(std::process::ExitCode::SUCCESS)
+}
+
+/// Jump advice from merge-group poison: only when the base tip's own newest
+/// run of every poisoned context failed too (the steward's confirmation,
+/// [`fix_first::parse_tip`]; an unread tip confirms nothing), and exactly one
+/// open pull request is named as the fix, so the advice never picks between
+/// rivals. Its episode key is the newest failing merge-group head.
 fn merge_group_advice(
     reader: &dyn Fn(&[String]) -> Result<String, String>,
     repo: &str,
     base: &str,
     health: &base_health::merge_group::MergeGroupHealth,
+    required: &[crate::merge_steward::RequiredCheck],
 ) -> Option<JumpAdvice> {
     let poisoned = health.poisoned();
     let first = poisoned.first()?;
+    // Each context is read from the app its required rule names, the same
+    // identity the steward uses: a same-named check from another app never
+    // confirms poison.
+    let tip_red = |context: &str| {
+        let app_id = required
+            .iter()
+            .find(|rule| rule.context == context)
+            .and_then(|rule| rule.app_id);
+        reader(&[
+            "api".to_owned(),
+            fix_first::tip_check_path(repo, base, context),
+        ])
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .is_some_and(|value| fix_first::parse_tip(&value, context, app_id).red)
+    };
+    if !poisoned.iter().all(|poison| tip_red(&poison.context)) {
+        return None;
+    }
     let contexts = health.poisoned_contexts();
     let (fixes, _) = super::merge_steward_cmd::named_fixes(reader, repo, base, health);
     let mut fixes = fixes.into_keys();
@@ -478,6 +582,102 @@ mod tests {
         assert_eq!(recorded[1].main_run_id.as_deref(), Some("901"));
     }
 
+    /// The replay reads the real Vellum episode and names #409, holding
+    /// #408, without loading config or reading GitHub.
+    #[test]
+    fn replay_scores_the_vellum_episode_offline() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let facts = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/base_health/vellum-2026-11-13.json");
+        let mut out = Vec::new();
+        base_health_command(
+            BaseHealthArgs {
+                repo: None,
+                base: "main".to_owned(),
+                workflow: None,
+                act: false,
+                replay: Some(facts),
+                json: false,
+            },
+            RuntimeMode::Isolated,
+            dir.path(),
+            dir.path(),
+            &mut out,
+        )
+        .expect("replay runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("fix: #409 (jump); held: #408"), "{text}");
+        assert!(
+            text.contains("score: 2 episodes, 2 fired, 1 named a fix, 1 correct, 0 wrong, 0 held the actual fix"),
+            "{text}"
+        );
+    }
+
+    /// The merge-group advice jumps nothing on a streak alone: the base tip's
+    /// own run of the context must have failed too, and an unread tip
+    /// confirms nothing.
+    #[test]
+    fn merge_group_advice_needs_the_base_tip_red() {
+        use crate::base_health::merge_group::{GroupRef, MergeGroupHealth, PoisonedContext};
+        let health = MergeGroupHealth::Poisoned {
+            contexts: vec![PoisonedContext {
+                context: "provenance-verify".to_owned(),
+                first_error: None,
+                groups: vec![
+                    GroupRef {
+                        head_sha: "a".repeat(40),
+                        prs: vec![405],
+                    },
+                    GroupRef {
+                        head_sha: "b".repeat(40),
+                        prs: vec![404],
+                    },
+                ],
+                latest_failure_at: None,
+                check_id: Some(9),
+                same_first_error: None,
+            }],
+        };
+        let reader_with = |tip: &'static str| {
+            move |argv: &[String]| -> Result<String, String> {
+                let line = argv.join(" ");
+                if line.contains("/check-runs?check_name=") {
+                    return if tip.is_empty() {
+                        Err("HTTP 502".to_owned())
+                    } else {
+                        Ok(tip.to_owned())
+                    };
+                }
+                if line.starts_with("pr list") {
+                    return Ok(r#"[{"number":409,"title":"fix provenance-verify","body":"","labels":[{"name":"shipyard:unblock"}],"isDraft":false}]"#.to_owned());
+                }
+                Err("gh: Not Found (HTTP 404)".to_owned())
+            }
+        };
+        let red = r#"{"check_runs":[{"id":2,"name":"provenance-verify","status":"completed","conclusion":"failure","completed_at":"2026-11-13T10:32:36Z","head_sha":"c"}]}"#;
+        let green = r#"{"check_runs":[{"id":2,"name":"provenance-verify","status":"completed","conclusion":"success","completed_at":"2026-11-13T10:32:36Z","head_sha":"c"}]}"#;
+        let advice = merge_group_advice(&reader_with(red), "o/r", "main", &health, &[]);
+        assert_eq!(advice.map(|advice| advice.pr), Some(409));
+        assert!(merge_group_advice(&reader_with(green), "o/r", "main", &health, &[]).is_none());
+        assert!(merge_group_advice(&reader_with(""), "o/r", "main", &health, &[]).is_none());
+        // A same-named check from another app never confirms poison when
+        // the required rule pins GitHub Actions.
+        let pinned = [crate::merge_steward::RequiredCheck {
+            context: "provenance-verify".to_owned(),
+            app_id: Some(15_368),
+        }];
+        let other_app = r#"{"check_runs":[{"id":2,"name":"provenance-verify","status":"completed","conclusion":"failure","completed_at":"2026-11-13T10:32:36Z","head_sha":"c","app":{"id":999}}]}"#;
+        let actions_app = r#"{"check_runs":[{"id":2,"name":"provenance-verify","status":"completed","conclusion":"failure","completed_at":"2026-11-13T10:32:36Z","head_sha":"c","app":{"id":15368}}]}"#;
+        assert!(
+            merge_group_advice(&reader_with(other_app), "o/r", "main", &health, &pinned).is_none()
+        );
+        assert_eq!(
+            merge_group_advice(&reader_with(actions_app), "o/r", "main", &health, &pinned)
+                .map(|advice| advice.pr),
+            Some(409)
+        );
+    }
+
     #[test]
     fn act_with_auto_jump_off_reads_nothing_and_records_nothing() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -488,6 +688,7 @@ mod tests {
                 base: "main".to_owned(),
                 workflow: None,
                 act: true,
+                replay: None,
                 json: false,
             },
             RuntimeMode::Isolated,

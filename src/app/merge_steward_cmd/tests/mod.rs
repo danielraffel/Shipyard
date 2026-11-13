@@ -234,6 +234,7 @@ mod ejected_retry;
 #[cfg(unix)]
 mod ejection_guards;
 mod exact_head_merge;
+mod fix_first;
 #[cfg(unix)]
 mod head_rollup;
 #[cfg(unix)]
