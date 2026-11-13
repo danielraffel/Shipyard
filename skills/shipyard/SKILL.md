@@ -1988,6 +1988,16 @@ must remain literal Bash, `tag="${GITHUB_REF#refs/tags/}"`; the double-braced
 workflow checks out the release tag in detached-HEAD state, branch pushes must
 first attach the deterministic local PR branch and then use Shipyard's
 supervised push with the fully qualified `HEAD:refs/heads/<branch>` refspec.
+
+On a protected default branch the post-tag hook must not push: set
+`release.post_tag_hook.push_mode = "handoff"` and `app_client_id`. The hook then
+force-pushes one bot branch (`release/changelog-sync`), opens or updates its
+single pull request, labels it `shipyard:managed`, posts the exact-head
+`shipyard/steward-handoff` status and exits; checks, review and the merge
+steward land it. The workflow mints a GitHub App token from
+`SHIPYARD_APP_PRIVATE_KEY` (the default token starts no workflows, and no PAT is
+used), so a workflow rendered for `handoff` no longer references
+`RELEASE_BOT_TOKEN`. Shipyard itself uses this mode.
 The full refspec alone is insufficient in repositories whose pre-push hook
 rejects detached HEAD or requires `SHIPYARD_PR_RUNNING=1`.
 Generated consumer workflows install the exact generating CLI by default. A
