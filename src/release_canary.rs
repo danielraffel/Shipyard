@@ -16,8 +16,8 @@ use crate::marked_issue::MarkedIssue;
 pub const MARKER_PREFIX: &str = "<!-- shipyard-release-canary: ";
 
 /// Longest `timeout_secs` accepted. The steward tick's outer limit is an hour:
-/// a clone (10 minutes) plus this must fit inside it.
-pub const MAX_TIMEOUT_SECS: u64 = 1800;
+/// a clone (10 minutes) plus this (40) must fit inside it.
+pub const MAX_TIMEOUT_SECS: u64 = 2400;
 
 /// An in-progress stamp older than this is from a killed run.
 const RUNNING_STALE_SECS: u64 = 4000;
@@ -45,6 +45,13 @@ pub struct CanaryConfig {
     pub bump: Bump,
     /// Tag prefix, `v` by default.
     pub tag_prefix: String,
+    /// Exit codes that mean "could not decide": no issue change, retried.
+    pub inconclusive_exit_codes: Vec<i32>,
+    /// Opt in to a read-only GitHub token for the child (`ghread` only).
+    pub read_token: bool,
+    /// Extra repositories (`owner/name`) the child may read; each gets a
+    /// `SHIPYARD_CANARY_READ_TOKEN_<OWNER>_<NAME>` variable.
+    pub read_repos: Vec<String>,
 }
 
 /// Read `[release.canary]`. An absent section, or `enabled = false`, is `None`.
@@ -96,11 +103,59 @@ pub fn load_config(config: &LoadedConfig) -> Result<Option<CanaryConfig>, String
         .and_then(toml::Value::as_str)
         .unwrap_or("v")
         .to_owned();
+    let inconclusive_exit_codes = match section.get("inconclusive_exit_codes") {
+        None => Vec::new(),
+        Some(value) => value
+            .as_array()
+            .and_then(|items| {
+                items
+                    .iter()
+                    .map(|item| item.as_integer().and_then(|n| i32::try_from(n).ok()))
+                    .collect::<Option<Vec<_>>>()
+            })
+            .filter(|codes| codes.iter().all(|code| *code > 0))
+            .ok_or(
+                "release.canary.inconclusive_exit_codes must be an array of positive integers",
+            )?,
+    };
+    let read_token = match section.get("read_token").and_then(toml::Value::as_str) {
+        None => false,
+        Some("ghread") => true,
+        Some(other) => {
+            return Err(format!(
+                "invalid release.canary.read_token {other:?}; only `ghread` (a read-only App) is supported"
+            ));
+        }
+    };
+    let read_repos = match section.get("read_repos") {
+        None => Vec::new(),
+        Some(value) => value
+            .as_array()
+            .and_then(|items| {
+                items
+                    .iter()
+                    .map(|item| item.as_str().map(ToOwned::to_owned))
+                    .collect::<Option<Vec<_>>>()
+            })
+            .filter(|repos| {
+                repos.iter().all(|repo| {
+                    repo.split_once('/')
+                        .is_some_and(|(owner, name)| !owner.is_empty() && !name.is_empty())
+                })
+            })
+            .ok_or("release.canary.read_repos must be an array of owner/name strings")?,
+    };
+    if !read_repos.is_empty() && !read_token {
+        return Err("release.canary.read_repos requires read_token = \"ghread\"".to_owned());
+    }
     Ok(Some(CanaryConfig {
         command,
         timeout_secs,
         bump,
         tag_prefix,
+        inconclusive_exit_codes,
+        read_token,
+        read_repos,
     }))
 }
 
@@ -137,6 +192,22 @@ const FRAGMENTS: [&str; 9] = [
     "CREDENTIAL",
     "_PEM",
 ];
+
+/// The env variable carrying the read token for `repo`.
+#[must_use]
+pub fn read_token_var(repo: &str) -> String {
+    let name: String = repo
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("SHIPYARD_CANARY_READ_TOKEN_{name}")
+}
 
 /// Whether an environment variable must not reach the canary command: tokens,
 /// keys and agent sockets, GitHub and App variables, and Shipyard's own.
@@ -176,6 +247,11 @@ pub fn output_tail(output: &str) -> String {
 pub enum Outcome {
     /// The command exited 0.
     Pass,
+    /// The command exited with a configured "could not decide" code.
+    Inconclusive {
+        /// One line: the exit code.
+        reason: String,
+    },
     /// The command failed or timed out; `detail` says how and quotes the tail.
     Fail {
         /// One line: exit code or timeout.
@@ -247,7 +323,8 @@ pub fn decide(
 ) -> IssueAction {
     let current = existing.iter().min_by_key(|issue| issue.number);
     match (outcome, current) {
-        (Outcome::Pass, None) => IssueAction::Nothing,
+        (Outcome::Inconclusive { .. } | Outcome::Pass, None)
+        | (Outcome::Inconclusive { .. }, Some(_)) => IssueAction::Nothing,
         (Outcome::Pass, Some(issue)) => IssueAction::Close {
             number: issue.number,
             comment: format!("The release canary for `{tag}` passes again; closing."),
@@ -319,6 +396,32 @@ mod tests {
         assert_eq!(cfg.bump, Bump::Minor);
         assert_eq!(cfg.tag_prefix, "v");
         assert!(load_config(&config_from_toml("[release.canary]\n")).is_err());
+        let full = load_config(&config_from_toml(
+            "[release.canary]\ncommand = \"x\"\ntimeout_secs = 2400\ninconclusive_exit_codes = [2]\nread_token = \"ghread\"\nread_repos = [\"o/p\"]\n",
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(full.timeout_secs, 2400);
+        assert_eq!(full.inconclusive_exit_codes, vec![2]);
+        assert!(full.read_token);
+        assert!(
+            load_config(&config_from_toml(
+                "[release.canary]\ncommand = \"x\"\nread_token = \"ghapp\"\n"
+            ))
+            .is_err()
+        );
+        assert!(
+            load_config(&config_from_toml(
+                "[release.canary]\ncommand = \"x\"\nread_repos = [\"o/p\"]\n"
+            ))
+            .is_err()
+        );
+        assert!(
+            load_config(&config_from_toml(
+                "[release.canary]\ncommand = \"x\"\ninconclusive_exit_codes = [0]\n"
+            ))
+            .is_err()
+        );
         assert!(
             load_config(&config_from_toml(
                 "[release.canary]\ncommand = \"x\"\nbump = \"major\"\n"
@@ -366,9 +469,9 @@ mod tests {
 
     #[test]
     fn timeout_is_capped_at_load() {
-        let too_long = "[release.canary]\ncommand = \"x\"\ntimeout_secs = 99999\n";
+        let too_long = "[release.canary]\ncommand = \"x\"\ntimeout_secs = 2401\n";
         assert!(load_config(&config_from_toml(too_long)).is_err());
-        let ok = "[release.canary]\ncommand = \"x\"\ntimeout_secs = 1800\n";
+        let ok = "[release.canary]\ncommand = \"x\"\ntimeout_secs = 2400\n";
         assert!(load_config(&config_from_toml(ok)).is_ok());
     }
 

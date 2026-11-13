@@ -29,7 +29,7 @@ use crate::output::write_json_envelope;
 use crate::process::{ProcessTree, run_output_until};
 use crate::release_canary::{
     CanaryConfig, IssueAction, MARKER_PREFIX, Outcome, daily_due, decide, is_secret_env,
-    load_config, next_version, output_tail, render_command,
+    load_config, next_version, output_tail, read_token_var, render_command,
 };
 
 const CLONE_TIMEOUT: Duration = Duration::from_mins(10);
@@ -85,7 +85,16 @@ pub(super) fn release_canary_command<W: Write>(
         let loaded = LoadedConfig::load_from_cwd(mode, checkout).map_err(|e| e.to_string())?;
         load_config(&loaded)
     };
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    let ghread = std::env::var_os("SHIPYARD_CANARY_GHREAD")
+        .map_or_else(|| home.join(".local/bin/ghread"), std::path::PathBuf::from);
+    let ghread_cache = std::env::var_os("GHREAD_CACHE_DIR")
+        .map_or_else(|| home.join(".cache/ghread"), std::path::PathBuf::from);
     let request = Request {
+        ghread: &ghread,
+        ghread_cache: &ghread_cache,
         repo: &repo,
         base: &base,
         origin: &origin,
@@ -96,7 +105,11 @@ pub(super) fn release_canary_command<W: Write>(
     };
     match run_canary(&request, &gh) {
         Ok(report) => {
-            let code = u8::from(report.status == "fail");
+            let code = match report.status {
+                "fail" => 1,
+                "inconclusive" => 2,
+                _ => 0,
+            };
             emit(
                 json,
                 stdout,
@@ -159,6 +172,9 @@ pub(crate) struct Request<'a> {
     /// Reads `[release.canary]` from the fresh checkout.
     pub load_canary: LoadCanary<'a>,
     pub work_root: &'a Path,
+    /// The read-only `ghread` wrapper, and the cache it keeps its tokens in.
+    pub ghread: &'a Path,
+    pub ghread_cache: &'a Path,
     pub daily: bool,
     pub apply: bool,
 }
@@ -228,7 +244,10 @@ pub(crate) fn run_canary(request: &Request<'_>, gh: Gh<'_>) -> Result<Report, St
     }
     let result = run_once(request, gh);
     if stamping {
+        // An inconclusive run is stamped like an infrastructure error, so it
+        // retries on the hourly backoff instead of waiting a day.
         let status = match &result {
+            Ok(report) if report.status == "inconclusive" => "error",
             Ok(report) => report.status,
             Err(_) => "error",
         };
@@ -269,11 +288,27 @@ fn run_once(request: &Request<'_>, gh: Gh<'_>) -> Result<Report, String> {
     };
     let tag = format!("{prefix}{version}");
     let command = render_command(&canary.command, &version, prefix);
+    let read_tokens = if canary.read_token {
+        mint_read_tokens(
+            request.ghread,
+            request.ghread_cache,
+            request.repo,
+            &canary.read_repos,
+        )?
+    } else {
+        Vec::new()
+    };
     let outcome = run_command(
         &command,
         &checkout,
-        &version,
-        canary.timeout_secs,
+        &Launch {
+            version: &version,
+            timeout_secs: canary.timeout_secs,
+            inconclusive: &canary.inconclusive_exit_codes,
+            read_tokens: &read_tokens,
+            repo: request.repo,
+            ghread: request.ghread,
+        },
         scratch.path(),
     )?;
 
@@ -287,6 +322,7 @@ fn run_once(request: &Request<'_>, gh: Gh<'_>) -> Result<Report, String> {
     let (status, detail) = match &outcome {
         Outcome::Pass => ("pass", "canary passed".to_owned()),
         Outcome::Fail { reason, .. } => ("fail", reason.clone()),
+        Outcome::Inconclusive { reason } => ("inconclusive", reason.clone()),
     };
     Ok(Report {
         status,
@@ -354,13 +390,98 @@ fn read_back(file: &mut File) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+/// A read-only GitHub token minted for one repository.
+struct ReadToken {
+    repo: String,
+    token: String,
+}
+
+struct Launch<'a> {
+    version: &'a str,
+    timeout_secs: u64,
+    inconclusive: &'a [i32],
+    read_tokens: &'a [ReadToken],
+    repo: &'a str,
+    ghread: &'a Path,
+}
+
+/// Mint read-only tokens through `ghread` and nothing else: it is the
+/// admission-reader App, which accepts GET calls only, and it caches the
+/// per-repository installation token it uses (`$GHREAD_CACHE_DIR`, default
+/// `~/.cache/ghread`). No write credential is ever consulted, and a failed mint
+/// is an infrastructure error, never a fallback.
+fn mint_read_tokens(
+    ghread: &Path,
+    cache: &Path,
+    repo: &str,
+    extra: &[String],
+) -> Result<Vec<ReadToken>, String> {
+    let mut repos = vec![repo.to_owned()];
+    repos.extend(
+        extra
+            .iter()
+            .filter(|r| !r.eq_ignore_ascii_case(repo))
+            .cloned(),
+    );
+    let mut tokens = Vec::new();
+    for target in repos {
+        let output = Command::new(ghread)
+            .args([
+                "api",
+                "rate_limit",
+                "--repo",
+                &target,
+                "--jq",
+                ".rate.limit",
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|error| format!("ghread could not start: {error}"))?;
+        if !output.status.success() {
+            return Err(format!("ghread could not mint a read token for {target}"));
+        }
+        let cached = fs::read_to_string(cache.join(format!("{}.json", target.replace('/', "__"))))
+            .map_err(|error| format!("ghread token cache for {target}: {error}"))?;
+        let token = serde_json::from_str::<Value>(&cached)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("token")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .filter(|token| !token.is_empty())
+            .ok_or_else(|| format!("ghread token cache for {target} has no token"))?;
+        tokens.push(ReadToken {
+            repo: target,
+            token,
+        });
+    }
+    Ok(tokens)
+}
+
+/// A `gh` that only `ghread` can run: GET `api` calls, no writes, whichever
+/// repository the path names. Put first on the child's PATH.
+fn write_gh_shim(dir: &Path, ghread: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::create_dir_all(dir).map_err(|error| error.to_string())?;
+    let path = dir.join("gh");
+    fs::write(
+        &path,
+        format!("#!/bin/sh\nexec \"{}\" \"$@\"\n", ghread.display()),
+    )
+    .map_err(|error| error.to_string())?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())
+}
+
+#[allow(clippy::too_many_lines)]
 fn run_command(
     command: &str,
     checkout: &Path,
-    version: &str,
-    timeout_secs: u64,
+    launch: &Launch<'_>,
     scratch: &Path,
 ) -> Result<Outcome, String> {
+    let (version, timeout_secs) = (launch.version, launch.timeout_secs);
     let output_path = scratch.join("canary-output.log");
     let mut sink = OpenOptions::new()
         .read(true)
@@ -395,6 +516,26 @@ fn run_command(
         .env("GIT_CONFIG_VALUE_0", "")
         .env("SHIPYARD_RELEASE_CANARY", "1")
         .env("SHIPYARD_CANARY_NEXT_VERSION", version);
+    // Opted-in read access only: tokens come from `ghread` (read-only App).
+    // GH_TOKEN covers the repository under test; `gh` is a ghread shim so API
+    // reads of the other listed repositories get their own read token.
+    if !launch.read_tokens.is_empty() {
+        for read in launch.read_tokens {
+            shell.env(read_token_var(&read.repo), &read.token);
+            if read.repo.eq_ignore_ascii_case(launch.repo) {
+                shell.env("GH_TOKEN", &read.token);
+            }
+        }
+        let shim = scratch.join("shim");
+        write_gh_shim(&shim, launch.ghread)?;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let mut parts = vec![shim];
+        parts.extend(std::env::split_paths(&path));
+        shell.env(
+            "PATH",
+            std::env::join_paths(parts).map_err(|e| e.to_string())?,
+        );
+    }
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     let mut tree = ProcessTree::spawn(&mut shell).map_err(|error| error.to_string())?;
     let (reason, status) = loop {
@@ -419,11 +560,24 @@ fn run_command(
     };
     // Reap the whole tree whatever happened, so no descendant outlives the run.
     tree.terminate_until(Instant::now() + Duration::from_secs(5));
-    let tail = output_tail(&read_back(&mut sink));
+    let mut text = read_back(&mut sink);
+    for read in launch.read_tokens {
+        text = text.replace(&read.token, "***");
+    }
+    let tail = output_tail(&text);
     let _ = sink.flush();
     Ok(match (reason, status) {
         (Some(reason), _) => Outcome::Fail { reason, tail },
         (None, Some(status)) if status.success() => Outcome::Pass,
+        (None, Some(status))
+            if status
+                .code()
+                .is_some_and(|code| launch.inconclusive.contains(&code)) =>
+        {
+            Outcome::Inconclusive {
+                reason: format!("exit {} (could not decide)", status.code().unwrap_or(0)),
+            }
+        }
         (None, Some(status)) => Outcome::Fail {
             reason: status
                 .code()
@@ -508,6 +662,7 @@ fn apply_action(request: &Request<'_>, gh: Gh<'_>, action: &IssueAction) -> Resu
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
     use super::*;
@@ -542,6 +697,9 @@ mod tests {
             timeout_secs,
             bump: Bump::Patch,
             tag_prefix: "v".to_owned(),
+            inconclusive_exit_codes: Vec::new(),
+            read_token: false,
+            read_repos: Vec::new(),
         }
     }
 
@@ -590,6 +748,8 @@ mod tests {
             origin: origin.to_str().unwrap(),
             load_canary: &|_| Ok(Some(cfg.clone())),
             work_root: &dir.join("state"),
+            ghread: Path::new("/nonexistent/ghread"),
+            ghread_cache: Path::new("/nonexistent"),
             daily,
             apply: true,
         };
@@ -692,6 +852,8 @@ mod tests {
             origin: origin.to_str().unwrap(),
             load_canary: &|_| Ok(Some(cfg.clone())),
             work_root: &dir.path().join("state"),
+            ghread: Path::new("/nonexistent/ghread"),
+            ghread_cache: Path::new("/nonexistent"),
             daily: false,
             apply: true,
         };
@@ -722,6 +884,8 @@ mod tests {
             origin: origin.to_str().unwrap(),
             load_canary: &|_| Ok(Some(cfg.clone())),
             work_root: &dir.path().join("state"),
+            ghread: Path::new("/nonexistent/ghread"),
+            ghread_cache: Path::new("/nonexistent"),
             daily: false,
             apply: false,
         };
@@ -743,6 +907,8 @@ mod tests {
             origin: origin.to_str().unwrap(),
             load_canary: load,
             work_root: state,
+            ghread: Path::new("/nonexistent/ghread"),
+            ghread_cache: Path::new("/nonexistent"),
             daily,
             apply: true,
         }
@@ -946,5 +1112,121 @@ mod tests {
         let report = run_canary(&req, &|_| Err("must not be called".to_owned())).unwrap();
         assert_eq!(report.status, "skipped");
         assert_eq!(report.detail, "already ran today");
+    }
+
+    fn run_with(dir: &Path, cfg: &CanaryConfig, fake: &Fake) -> Result<Report, String> {
+        run_with_ghread(
+            dir,
+            cfg,
+            fake,
+            Path::new("/nonexistent/ghread"),
+            Path::new("/nonexistent"),
+        )
+    }
+
+    fn run_with_ghread(
+        dir: &Path,
+        cfg: &CanaryConfig,
+        fake: &Fake,
+        ghread: &Path,
+        cache: &Path,
+    ) -> Result<Report, String> {
+        let origin = origin_once(dir);
+        let request = Request {
+            repo: "o/r",
+            base: "main",
+            origin: origin.to_str().unwrap(),
+            load_canary: &|_| Ok(Some(cfg.clone())),
+            work_root: &dir.join("state"),
+            ghread,
+            ghread_cache: cache,
+            daily: true,
+            apply: true,
+        };
+        run_canary(&request, &|argv| Ok(fake.gh(argv)))
+    }
+
+    #[test]
+    fn an_inconclusive_exit_changes_no_issue_and_retries_on_the_error_backoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = canary("echo moving; exit 2", 30);
+        cfg.inconclusive_exit_codes = vec![2];
+        let fake = Fake::new(&marked_issue_line());
+        let report = run_with(dir.path(), &cfg, &fake).unwrap();
+        assert_eq!(report.status, "inconclusive");
+        assert!(fake.mutations().is_empty(), "open issue must stay as is");
+        let stamp = fs::read_to_string(dir.path().join("state/o_r.stamp")).unwrap();
+        assert!(stamp.trim().ends_with("error"), "{stamp}");
+        // Without the opt-in, the same exit code is a refusal.
+        let plain = canary("exit 2", 30);
+        let fake = Fake::new("");
+        let report = run_with(dir.path().join("b").as_path(), &plain, &fake);
+        assert!(report.is_err() || report.unwrap().status == "fail");
+    }
+
+    fn fake_ghread(dir: &Path) -> PathBuf {
+        let cache = dir.join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        for (repo, token) in [("o__r", "READ-R"), ("o__other", "READ-OTHER")] {
+            fs::write(
+                cache.join(format!("{repo}.json")),
+                format!("{{\"token\":\"{token}\"}}"),
+            )
+            .unwrap();
+        }
+        let path = dir.join("ghread");
+        fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[test]
+    fn read_tokens_reach_the_child_only_when_opted_in_and_come_from_ghread() {
+        let dir = tempfile::tempdir().unwrap();
+        let ghread = fake_ghread(dir.path());
+        let probe = "echo \"gh=$GH_TOKEN other=$SHIPYARD_CANARY_READ_TOKEN_O_OTHER self=$SHIPYARD_CANARY_READ_TOKEN_O_R\"; which gh; exit 1";
+
+        let plain = canary(probe, 30);
+        let fake = Fake::new("");
+        run_with(&dir.path().join("a"), &plain, &fake).unwrap();
+        let body = fake_body(&fake);
+        assert!(body.contains("gh= other= self="), "{body}");
+
+        let mut opted = canary(probe, 30);
+        opted.read_token = true;
+        opted.read_repos = vec!["o/other".to_owned()];
+        let fake = Fake::new("");
+        run_with_ghread(
+            &dir.path().join("b"),
+            &opted,
+            &fake,
+            &ghread,
+            &dir.path().join("cache"),
+        )
+        .unwrap();
+        let body = fake_body(&fake);
+        // Tokens are redacted in the issue; their presence shows as ***.
+        assert!(body.contains("gh=*** other=*** self=***"), "{body}");
+        assert!(body.contains("shim/gh"), "{body}");
+    }
+
+    fn fake_body(fake: &Fake) -> String {
+        fake.calls
+            .borrow()
+            .iter()
+            .flatten()
+            .find(|a| a.starts_with("body="))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn the_read_token_source_is_ghread_alone() {
+        let source = include_str!("release_canary_cmd.rs");
+        let mint = source.split("fn mint_read_tokens").nth(1).unwrap();
+        let mint = mint.split("\n}\n").next().unwrap();
+        assert!(mint.contains("Command::new(ghread)"));
+        assert!(!mint.contains("ghapp"));
+        assert!(!mint.contains("GH_TOKEN"));
     }
 }
