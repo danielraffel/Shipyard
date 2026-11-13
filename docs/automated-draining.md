@@ -610,8 +610,10 @@ context: the context failed in at least two consecutive merge groups that
 carried different pull requests, and the base tip's own newest run of that
 context failed too. A red-everywhere episode on the same check (three or
 more open pull requests failing it the same way) stands in for the tip when
-the tip's newest verdict predates the episode, as when a date-dependent test
-breaks and nothing re-runs the tip. A single flaky failure, or a streak the tip does not
+the tip has a completed verdict and it is strictly older than the episode, as
+when a date-dependent test breaks and nothing re-runs the tip. A tip with no
+completed verdict, or a red tip with no known red time, never takes its
+timing from the episode. A single flaky failure, or a streak the tip does not
 show, holds nothing. The tip reading is one `GET` per poisoned context, made
 only while the streak is firing.
 

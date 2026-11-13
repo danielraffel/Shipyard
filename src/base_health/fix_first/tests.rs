@@ -314,6 +314,24 @@ fn red_everywhere_confirms_only_over_a_stale_or_red_tip() {
         confirmed_since(&red, episode),
         Some(at("2026-11-13T00:30:00Z"))
     );
+    // A red tip with no red time of its own never borrows the episode's
+    // start: it reads red since the end of time, so nothing passes after it.
+    let red_unknown = TipReading {
+        red: true,
+        ..TipReading::default()
+    };
+    assert_eq!(
+        confirmed_since(&red_unknown, episode),
+        Some(DateTime::<Utc>::MAX_UTC)
+    );
+    // A tip read with no completed verdict at all confirms nothing.
+    assert_eq!(confirmed_since(&TipReading::default(), episode), None);
+    // Equal times are not strictly before.
+    let same_time = TipReading {
+        newest_at: episode,
+        ..TipReading::default()
+    };
+    assert_eq!(confirmed_since(&same_time, episode), None);
 }
 
 /// The Pulp tip never re-ran after the date-dependent break. A

@@ -5988,7 +5988,9 @@ Red-base triage acts (`BasePoisonPolicy.acts`, `TriageActs`: `reorder_fix`,
 dry-run | on`, default dry-run with a merge queue; a typo falls back to
 dry-run). Confirmation also accepts red everywhere
 (`fix_first::confirmed_since`: tip red, or a `red_everywhere` episode on the
-check that began after the tip's newest verdict; unread tip never), so
+check that began strictly after the tip's newest verdict, which must be known;
+unread tip or no verdict never; a red tip without `red_since` reads
+`MAX_UTC`, never the episode start), so
 `base_poison::observe` now runs after `red_everywhere::observe` and takes
 `Pass::checks_first_seen`. `fix_reorder.rs`: queued fix at position > 1, in `covering`, on a pass
 with no `partial()`,

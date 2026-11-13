@@ -124,16 +124,18 @@ pub fn confirmed_since(
         return None;
     }
     if tip.red {
-        // A red tip with no known red time: confirmed, but read as red since
-        // the end of time, so no head can be shown to pass after the break.
-        return tip
-            .red_since
-            .or(red_everywhere_since)
-            .or(Some(DateTime::<Utc>::MAX_UTC));
+        // A red tip with no red time of its own: confirmed, but read as red
+        // since the end of time, so no head can be shown to pass after the
+        // break. The red-everywhere start never stands in for the tip's own
+        // onset.
+        return Some(tip.red_since.unwrap_or(DateTime::<Utc>::MAX_UTC));
     }
+    // Red everywhere confirms only over a tip whose newest verdict is known
+    // and strictly older than the episode. A read with no completed verdict
+    // proves nothing about when the tip was last judged.
     let since = red_everywhere_since?;
     tip.newest_at
-        .is_none_or(|newest| newest < since)
+        .is_some_and(|newest| newest < since)
         .then_some(since)
 }
 
