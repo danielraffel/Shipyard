@@ -11,6 +11,10 @@ stamp=$(date -u +%Y%m%dT%H%M%SZ)
 # Config-only sparse clones live on the internal disk: a launchd job that opens
 # a path on /Volumes blocks in the kernel waiting on an invisible privacy prompt.
 clones="$HOME/.local/share/shipyard-steward"
+# Evidence retention: per-tick JSON stays live for SHIPYARD_STEWARD_LIVE_DAYS
+# days (default 3), then is bundled by UTC day. Bundled ticks stay for
+# SHIPYARD_STEWARD_ARCHIVE_RETENTION_DAYS days (default 180). Archive problems
+# are logged to archive.log, never to summary.log, and never fail the tick.
 # The tick previously pinned its own Shipyard build; a hand pin silently missed
 # merged steward fixes (2026-11-08: #1165), so it now follows the fleet release.
 # Use the fleet-updated Shipyard (tartci tool-freshness keeps ~/.local/bin/shipyard on the
@@ -85,4 +89,122 @@ for repo in "${repos[@]}"; do
   # Sequential: every repo's pass takes the same steward state lock.
   steward_one "$repo"
 done
-find "$log_dir" -name '*.json*' -mtime +3 -delete
+
+archive_old_tick_files() {
+  local live_days="${SHIPYARD_STEWARD_LIVE_DAYS:-3}"
+  local archive_days="${SHIPYARD_STEWARD_ARCHIVE_RETENTION_DAYS:-180}"
+  local today cutoff_day archive_dir candidates work file day list archive tmp stage listing base deletions archive_failed=0
+  archive_dir="$log_dir/archive"
+  candidates=$(mktemp "${TMPDIR:-/tmp}/shipyard-steward-tick-candidates.XXXXXX") || {
+    echo "$stamp evidence archive failed: cannot create candidate list" >> "$log_dir/archive.log"
+    return 0
+  }
+  work=$(mktemp -d "${TMPDIR:-/tmp}/shipyard-steward-tick-archive.XXXXXX") || {
+    rm -f "$candidates"
+    echo "$stamp evidence archive failed: cannot create temporary directory" >> "$log_dir/archive.log"
+    return 0
+  }
+  if ! find "$log_dir" -type f -name '*.json*' ! -path "$archive_dir/*" -mtime +"$live_days" -print >"$candidates"; then
+    rm -f "$candidates"
+    find "$work" -type f -delete 2>/dev/null || true
+    find "$work" -depth -type d -empty -delete 2>/dev/null || true
+    echo "$stamp evidence archive failed: cannot list candidates" >> "$log_dir/archive.log"
+    return 0
+  fi
+  today=$(date -u +%Y%m%d)
+  # Archive a UTC day only once every file of that day has left the live
+  # window, so each day is bundled once instead of being rebuilt every tick.
+  cutoff_day=$(date -u -v-"$((live_days + 1))"d +%Y%m%d 2>/dev/null) || cutoff_day=""
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    if ! day=$(date -u -r "$(stat -f %m "$file")" +%Y%m%d 2>/dev/null); then
+      archive_failed=1
+      echo "$stamp evidence archive failed: cannot determine UTC day for $(basename "$file")" >> "$log_dir/archive.log"
+      continue
+    fi
+    [ "$day" = "$today" ] && continue
+    if [ -n "$cutoff_day" ] && [ ! "$day" \< "$cutoff_day" ]; then
+      continue
+    fi
+    list="$work/$day.list"
+    printf '%s\n' "$file" >> "$list"
+  done < "$candidates"
+  rm -f "$candidates"
+
+  if ! mkdir -p "$archive_dir"; then
+    find "$work" -type f -delete 2>/dev/null || true
+    find "$work" -depth -type d -empty -delete 2>/dev/null || true
+    echo "$stamp evidence archive failed: cannot create archive directory" >> "$log_dir/archive.log"
+    return 0
+  fi
+  find "$archive_dir" -type f -name '.ticks-*.tar.gz.tmp.*' -delete 2>/dev/null || true
+  deletions="$work/deletions"
+  for list in "$work"/*.list; do
+    [ -f "$list" ] || continue
+    day=${list##*/}
+    day=${day%.list}
+    archive="$archive_dir/ticks-$day.tar.gz"
+    tmp="$archive_dir/.ticks-$day.tar.gz.tmp.$$"
+    stage="$work/$day"
+    mkdir "$stage" 2>/dev/null || true
+    if [ -f "$archive" ] && ! tar -xzf "$archive" -C "$stage"; then
+      rm -f "$tmp"
+      archive_failed=1
+      echo "$stamp evidence archive failed day=$day: cannot extract existing archive" >> "$log_dir/archive.log"
+      continue
+    fi
+    while IFS= read -r file; do
+      [ -f "$file" ] || continue
+      base=${file##*/}
+      if ! cp "$file" "$stage/$base"; then
+        rm -f "$tmp"
+        archive_failed=1
+        echo "$stamp evidence archive failed day=$day: cannot stage $base" >> "$log_dir/archive.log"
+        continue 2
+      fi
+    done < "$list"
+    if ! tar -czf "$tmp" -C "$stage" .; then
+      rm -f "$tmp"
+      archive_failed=1
+      echo "$stamp evidence archive failed day=$day: tar failed" >> "$log_dir/archive.log"
+      continue
+    fi
+    listing="$work/$day.listing"
+    if ! tar -tzf "$tmp" > "$listing"; then
+      rm -f "$tmp"
+      archive_failed=1
+      echo "$stamp evidence archive failed day=$day: archive verification failed" >> "$log_dir/archive.log"
+      continue
+    fi
+    while IFS= read -r file; do
+      [ -f "$file" ] || continue
+      base=${file##*/}
+      if ! grep -Fqx "./$base" "$listing" && ! grep -Fqx "$base" "$listing"; then
+        rm -f "$tmp"
+        archive_failed=1
+        echo "$stamp evidence archive failed day=$day: missing member $base" >> "$log_dir/archive.log"
+        continue 2
+      fi
+    done < "$list"
+    if ! mv "$tmp" "$archive"; then
+      rm -f "$tmp"
+      archive_failed=1
+      echo "$stamp evidence archive failed day=$day: cannot install archive" >> "$log_dir/archive.log"
+      continue
+    fi
+    cat "$list" >> "$deletions"
+  done
+  # Do not delete any live evidence until every archive in this pass has been
+  # installed and verified. A later-day failure must leave earlier-day sources
+  # available for the next retry alongside their installed archive.
+  if [ "$archive_failed" -eq 0 ] && [ -f "$deletions" ]; then
+    while IFS= read -r file; do
+      [ -n "$file" ] && rm -f "$file"
+    done < "$deletions"
+  fi
+  find "$archive_dir" -type f -name 'ticks-*.tar.gz' -mtime +"$archive_days" -delete 2>/dev/null || true
+  find "$work" -type f -delete 2>/dev/null || true
+  find "$work" -depth -type d -empty -delete 2>/dev/null || true
+}
+
+archive_old_tick_files
