@@ -9,6 +9,13 @@
 //!   groups that carried different pull requests).
 //! * `strict`: `streak`, and every group in it failed with the same first
 //!   error line.
+//! * `tip_red`: `streak`, and the base tip's own newest verdict for the
+//!   context is a failure. The only rule that holds, pauses or jumps.
+//!
+//! Each episode also records the fix the pass picked (`fix_picks`) and, once
+//! it ends on a passing merge group, the pull requests that group carried
+//! (`fixed_by`). [`fix_first_score`] compares the two, so the fix pick is
+//! scored against what actually repaired the base.
 //!
 //! An episode is labelled by a **PR-free control** (Chromium CQ's "without
 //! patch" retry): when a context starts failing merge groups, the steward
@@ -110,6 +117,16 @@ pub(super) struct Episode {
     /// The PR-free control for this episode's context.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) control: Option<ControlRun>,
+    /// Every pull request a pass picked as the fix while it was open.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub(super) fix_picks: BTreeSet<u64>,
+    /// The pull requests of the merge group whose pass ended it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) fixed_by: Vec<u64>,
+    /// Set when any pass while it was open could not read the base tip or
+    /// the open pull requests: its picks and holds rest on partial data.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(super) partial: bool,
 }
 
 impl Episode {
@@ -141,7 +158,65 @@ pub(super) fn firing(poison: &RepoPoison) -> BTreeMap<(String, String), usize> {
             out.insert((context.context.clone(), "strict".to_owned()), streak);
         }
     }
+    for context in poison.confirmed_contexts() {
+        let streak = out
+            .get(&(context.clone(), "streak".to_owned()))
+            .copied()
+            .unwrap_or_default();
+        out.insert((context, "tip_red".to_owned()), streak);
+    }
     out
+}
+
+/// Record this pass's fix pick on every open episode, and on an episode
+/// that just ended, the pull requests of the merge group that passed its
+/// context.
+pub(super) fn note_fix_first(
+    open: &mut [Episode],
+    key: &str,
+    pick: Option<u64>,
+    passed_by: &BTreeMap<String, Vec<u64>>,
+) {
+    for episode in open.iter_mut().filter(|episode| episode.key == key) {
+        if episode.ended_at.is_none() {
+            episode.fix_picks.extend(pick);
+        } else if episode.fixed_by.is_empty()
+            && let Some(prs) = passed_by.get(&episode.context)
+        {
+            episode.fixed_by.clone_from(prs);
+        }
+    }
+}
+
+/// Score the fix picks of ended `tip_red` episodes against what repaired
+/// the base.
+pub(super) fn fix_first_score(ended: &[Episode]) -> Value {
+    let episodes = ended
+        .iter()
+        .filter(|episode| episode.rule == "tip_red")
+        .collect::<Vec<_>>();
+    let known = |episode: &&&Episode| !episode.fixed_by.is_empty();
+    let picked = |episode: &&&Episode| !episode.fix_picks.is_empty();
+    let hit = |episode: &&&Episode| {
+        episode
+            .fix_picks
+            .iter()
+            .any(|pr| episode.fixed_by.contains(pr))
+    };
+    json!({
+        "rule": "tip_red",
+        "episodes": episodes.len(),
+        "partial": episodes.iter().filter(|episode| episode.partial).count(),
+        "picked": episodes.iter().filter(picked).count(),
+        "repair_known": episodes.iter().filter(known).count(),
+        "pick_repaired": episodes.iter().filter(known).filter(picked).filter(hit).count(),
+        "pick_missed": episodes
+            .iter()
+            .filter(known)
+            .filter(picked)
+            .filter(|episode| !hit(episode))
+            .count(),
+    })
 }
 
 /// Advance the open episodes with this pass's reading: extend the ones still
@@ -189,6 +264,9 @@ pub(super) fn advance(
                 corroborated: None,
                 ended_at: None,
                 control: None,
+                fix_picks: BTreeSet::new(),
+                fixed_by: Vec::new(),
+                partial: false,
             });
         }
     }
@@ -513,6 +591,28 @@ pub(super) fn record_pass(
     let mut open = read_open(state_dir);
     advance(&mut open, &key, &firing, held, would, now);
     if let Some(poison) = poison {
+        let passed_by = match &poison.health {
+            crate::base_health::merge_group::MergeGroupHealth::Clear { passed_by, .. } => {
+                passed_by.clone()
+            }
+            _ => BTreeMap::new(),
+        };
+        note_fix_first(
+            &mut open,
+            &key,
+            poison.fixes.keys().next().copied(),
+            &passed_by,
+        );
+        if poison.partial().is_some() {
+            for episode in open
+                .iter_mut()
+                .filter(|episode| episode.key == key && episode.ended_at.is_none())
+            {
+                episode.partial = true;
+            }
+        }
+    }
+    if let Some(poison) = poison {
         label(
             &mut open,
             &key,
@@ -558,7 +658,7 @@ pub(super) fn record_pass(
         .into_iter()
         .filter(|episode| episode.key == key)
         .collect::<Vec<_>>();
-    let gates = ["streak", "strict"]
+    let gates = ["streak", "strict", "tip_red"]
         .iter()
         .map(|rule| gate(rule, &history, now))
         .collect::<Vec<_>>();
@@ -566,6 +666,7 @@ pub(super) fn record_pass(
         "open": open.iter().filter(|episode| episode.key == key).collect::<Vec<_>>(),
         "ended_this_pass": ended,
         "gate": gates,
+        "fix_first": fix_first_score(&history),
         "error": error,
     })
 }

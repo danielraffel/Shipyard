@@ -1408,7 +1408,15 @@ fn an_approved_queued_head_is_paused_while_the_base_is_poisoned() {
         },
         fixes: BTreeMap::new(),
         fix_read_error: None,
+        fix_ambiguity: None,
         candidates: std::collections::BTreeSet::default(),
+        tip: BTreeMap::from([(
+            "Enforce version & skill sync".to_owned(),
+            crate::base_health::fix_first::TipReading {
+                red: true,
+                ..Default::default()
+            },
+        )]),
     };
     let on = poison(PoisonHold::On);
     // Only an entry the steward owns is paused: it is the steward's to restore.

@@ -122,13 +122,20 @@ pub(super) fn verdict(
     {
         return Verdict::Keep;
     }
-    let contexts = contexts.join(",");
-    if poison.policy.pauses() {
-        Verdict::Pause { contexts, position }
+    // Only a context the base tip also fails removes work; a streak alone
+    // is reported.
+    let confirmed = poison.confirmed_contexts();
+    if poison.policy.pauses() && !confirmed.is_empty() {
+        Verdict::Pause {
+            contexts: confirmed.join(","),
+            position,
+        }
     } else if poison.policy.hold == PoisonHold::Off {
         Verdict::Keep
     } else {
-        Verdict::WouldPause { contexts }
+        Verdict::WouldPause {
+            contexts: contexts.join(","),
+        }
     }
 }
 
@@ -250,8 +257,8 @@ pub(super) fn restore_rank(
 }
 
 /// Whether this pass's reading lets an entry paused for `contexts` come
-/// back: the hold is off (the operator's undo), or a merge group passed every
-/// one of those contexts. A stale streak, an empty sample, a shared-PR note
+/// back: the hold is off (the operator's undo), a merge group passed every
+/// one of those contexts, or the base tip reads every one of them green. A stale streak, an empty sample, a shared-PR note
 /// and an unread history pass nothing, so they keep it waiting.
 fn restorable(poison: Option<&RepoPoison>, contexts: &str) -> bool {
     use crate::base_health::merge_group::MergeGroupHealth;
@@ -265,7 +272,10 @@ fn restorable(poison: Option<&RepoPoison>, contexts: &str) -> bool {
         MergeGroupHealth::Clear { passed, .. } => contexts
             .split(',')
             .all(|context| passed.iter().any(|done| done == context)),
-        MergeGroupHealth::Poisoned { .. } | MergeGroupHealth::Unknown { .. } => false,
+        // The episode ends when the base tip reads green again, even while
+        // older merge groups still make up a streak.
+        MergeGroupHealth::Poisoned { .. } => poison.tip_green_for(contexts),
+        MergeGroupHealth::Unknown { .. } => false,
     }
 }
 

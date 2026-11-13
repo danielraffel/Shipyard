@@ -23,7 +23,7 @@ use serde_json::Value;
 
 use super::CliFailure;
 use crate::base_health::{
-    self, AutoJump, BaseHealthFinding, JumpAdvice, JumpDecision, already_recorded,
+    self, AutoJump, BaseHealthFinding, JumpAdvice, JumpDecision, already_recorded, fix_first,
 };
 use crate::cloud::GitHubActions;
 use crate::config::LoadedConfig;
@@ -36,6 +36,7 @@ pub(super) struct BaseHealthArgs {
     pub(super) base: String,
     pub(super) workflow: Option<String>,
     pub(super) act: bool,
+    pub(super) replay: Option<PathBuf>,
     pub(super) json: bool,
 }
 
@@ -47,6 +48,9 @@ pub(super) fn base_health_command<W: Write>(
     state_dir: &Path,
     stdout: &mut W,
 ) -> Result<std::process::ExitCode, CliFailure> {
+    if let Some(path) = args.replay.as_deref() {
+        return replay_command(path, args.json, stdout);
+    }
     let config = LoadedConfig::load_from_cwd(mode, cwd)
         .map_err(|error| CliFailure::new(2, format!("config error: {error}")))?;
     let auto_jump = AutoJump::parse(config.get_str(base_health::AUTO_JUMP_CONFIG_KEY))
@@ -117,6 +121,79 @@ pub(super) fn base_health_command<W: Write>(
             .and_then(|()| writeln!(stdout, "{}", merge_groups.summary()))
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
     }
+    Ok(std::process::ExitCode::SUCCESS)
+}
+
+/// `--replay FILE`: run recorded episodes through the fix-first rule and
+/// score the picks. Pure: no GitHub read, no state written.
+fn replay_command<W: Write>(
+    path: &Path,
+    json: bool,
+    stdout: &mut W,
+) -> Result<std::process::ExitCode, CliFailure> {
+    let text = fs::read_to_string(path)
+        .map_err(|error| CliFailure::new(2, format!("{}: {error}", path.display())))?;
+    let episodes: Vec<fix_first::ReplayEpisode> = serde_json::from_str(&text)
+        .map_err(|error| CliFailure::new(2, format!("{}: {error}", path.display())))?;
+    let outcomes = episodes.iter().map(fix_first::replay).collect::<Vec<_>>();
+    let score = fix_first::score(&outcomes);
+    let io = |error: std::io::Error| CliFailure::new(1, error.to_string());
+    if json {
+        let payload = serde_json::json!({"outcomes": outcomes, "score": score});
+        writeln!(
+            stdout,
+            "{}",
+            serde_json::to_string_pretty(&payload).unwrap_or_default()
+        )
+        .map_err(io)?;
+        return Ok(std::process::ExitCode::SUCCESS);
+    }
+    let list = |prs: &[u64]| {
+        if prs.is_empty() {
+            "none".to_owned()
+        } else {
+            prs.iter()
+                .map(|pr| format!("#{pr}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    };
+    for outcome in &outcomes {
+        writeln!(
+            stdout,
+            "{} `{}` at {}: {}",
+            outcome.key,
+            outcome.context,
+            outcome.decided_at.to_rfc3339(),
+            if outcome.fires { "FIRES" } else { "quiet" }
+        )
+        .map_err(io)?;
+        writeln!(stdout, "  {}", outcome.why).map_err(io)?;
+        writeln!(
+            stdout,
+            "  fix: {}; held: {}; shadow would-hold: {}; actual fix: {}{}",
+            outcome
+                .fix
+                .map_or_else(|| "none".to_owned(), |pr| format!("#{pr} (jump)")),
+            list(&outcome.held),
+            list(&outcome.shadow_would_hold),
+            outcome
+                .actual_fix
+                .map_or_else(|| "unknown".to_owned(), |pr| format!("#{pr}")),
+            if outcome.actual_fix_held {
+                "; ACTUAL FIX HELD"
+            } else {
+                ""
+            }
+        )
+        .map_err(io)?;
+    }
+    writeln!(
+        stdout,
+        "score: {} episodes, {} fired, {} named a fix, {} correct, {} wrong, {} held the actual fix",
+        score.episodes, score.fired, score.named, score.correct, score.wrong, score.actual_fix_held
+    )
+    .map_err(io)?;
     Ok(std::process::ExitCode::SUCCESS)
 }
 
@@ -478,6 +555,37 @@ mod tests {
         assert_eq!(recorded[1].main_run_id.as_deref(), Some("901"));
     }
 
+    /// The replay reads the real Vellum episode and names #409, holding
+    /// #408, without loading config or reading GitHub.
+    #[test]
+    fn replay_scores_the_vellum_episode_offline() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let facts = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/base_health/vellum-2026-11-13.json");
+        let mut out = Vec::new();
+        base_health_command(
+            BaseHealthArgs {
+                repo: None,
+                base: "main".to_owned(),
+                workflow: None,
+                act: false,
+                replay: Some(facts),
+                json: false,
+            },
+            RuntimeMode::Isolated,
+            dir.path(),
+            dir.path(),
+            &mut out,
+        )
+        .expect("replay runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("fix: #409 (jump); held: #408"), "{text}");
+        assert!(
+            text.contains("score: 2 episodes, 2 fired, 1 named a fix, 1 correct, 0 wrong, 0 held the actual fix"),
+            "{text}"
+        );
+    }
+
     #[test]
     fn act_with_auto_jump_off_reads_nothing_and_records_nothing() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -488,6 +596,7 @@ mod tests {
                 base: "main".to_owned(),
                 workflow: None,
                 act: true,
+                replay: None,
                 json: false,
             },
             RuntimeMode::Isolated,

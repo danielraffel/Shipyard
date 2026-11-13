@@ -114,8 +114,10 @@ fn poison(health: MergeGroupHealth, hold: PoisonHold, prs: &[ObservedPr]) -> Rep
             read_error: None,
         },
         fixes,
+        tip: base_poison::red_tip(&health),
         health,
         fix_read_error: None,
+        fix_ambiguity: None,
         candidates,
     }
 }
@@ -656,6 +658,7 @@ fn a_stale_or_unread_poison_restores_nothing_but_the_hold_off_does() {
         MergeGroupHealth::Clear {
             detail: "`x` streak is stale (newest failure older than 2 h)".to_owned(),
             passed: Vec::new(),
+            passed_by: std::collections::BTreeMap::new(),
         },
         MergeGroupHealth::Unknown {
             detail: "HTTP 502".to_owned(),
@@ -1049,6 +1052,7 @@ fn a_paused_head_is_not_readmitted_until_a_group_passes_its_context() {
         let health = MergeGroupHealth::Clear {
             detail: detail.to_owned(),
             passed: Vec::new(),
+            passed_by: std::collections::BTreeMap::new(),
         };
         poison_pause::reconcile(
             &mut ledger,
@@ -1067,6 +1071,7 @@ fn a_paused_head_is_not_readmitted_until_a_group_passes_its_context() {
     let other = MergeGroupHealth::Clear {
         detail: "clear".to_owned(),
         passed: vec!["macos".to_owned()],
+        passed_by: std::collections::BTreeMap::new(),
     };
     poison_pause::reconcile(
         &mut ledger,
@@ -1079,6 +1084,7 @@ fn a_paused_head_is_not_readmitted_until_a_group_passes_its_context() {
     let passed = MergeGroupHealth::Clear {
         detail: "clear".to_owned(),
         passed: vec![CONTEXT.to_owned()],
+        passed_by: std::collections::BTreeMap::new(),
     };
     poison_pause::reconcile(
         &mut ledger,

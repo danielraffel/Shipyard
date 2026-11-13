@@ -591,6 +591,62 @@ steward does not own), `shipyard auto-merge`, `shipyard ship` and the `ghapp`
 arm guard keep their earlier same-head rules, including re-arming after
 `invalid_merge_commit`.
 
+## When the base itself is red: land the fix first
+
+When a required check is broken on the base, every merge group formed on top
+of it fails, costs a full gate, and ejects pull requests that did nothing
+wrong. The steward then has two jobs, in order: stop forming groups that are
+certain to fail, and land the fix ahead of everything else. Both are keys in
+the base's `.shipyard/config.toml`:
+
+```toml
+[base_health]
+merge_group_hold = "on"   # off | dry-run | on (dry-run: report, change nothing)
+auto_jump = "on"          # off | dry-run | on: enqueue the fix with jump: true
+```
+
+The steward acts only when two independent readings agree on one required
+context: the context failed in at least two consecutive merge groups that
+carried different pull requests, and the base tip's own newest run of that
+context failed too. A single flaky failure, or a streak the tip does not
+show, holds nothing. The tip reading is one `GET` per poisoned context, made
+only while the streak is firing.
+
+While both hold:
+
+- **The fix is found without a repository-specific detector.** It is an open
+  pull request whose current head is approved and whose own run of the
+  failing context passed after the base tip went red: the check is green on
+  the pull request while red on the base. A pull request whose green run
+  predates the break never ran against the broken base and does not count.
+  When more than one pull request qualifies, the one carrying a
+  `main-red-fix` or `fixes-main` label is the fix; if no single label
+  separates them, none is jumped or held, all are admitted plainly, and the
+  pass reports `fix ambiguous: ...`. A `shipyard:unblock` label or the
+  repository's own detector still takes priority where it names one. There
+  is never more than one fix.
+- **The fix goes first.** It is enqueued with `jump: true` and is never
+  held.
+- **Every other approved pull request waits** (`held_base_poisoned:<context>`)
+  instead of being enqueued into a group that cannot pass. Nothing already
+  queued is removed unless `merge_group_pause = "on"` as well.
+- **The episode ends as soon as the base tip reads green.** Holds lift in
+  the same pass.
+- **An unread tip confirms nothing.** The pass reports `partial` with the
+  failed read and tries again next pass; the shadow ledger marks the
+  episode `partial`.
+
+A tip that only ever ran the context in its own merge group (for example a
+test that starts failing on a date) never shows red on its own. Name a
+cheap workflow that produces the context under
+`[base_health.control_workflows]` and the steward dispatches it once on the
+base when the streak starts; that run is the tip's own verdict.
+
+`shipyard base-health --replay FILE` runs recorded episodes through the same
+rule and scores each pick against the pull request that repaired the base.
+The steward's shadow ledger records the same thing live under the `tip_red`
+rule (`fix_picks`, `fixed_by`, and the `fix_first` score in the pass report).
+
 ## Red everywhere: one cause on the base
 
 When one required check fails the same way on three or more open pull requests

@@ -59,6 +59,13 @@ const JUMP_ACCEPTED: &str = r#"{"data":{"enqueuePullRequest":{"mergeQueueEntry":
 const JUMP_FORBIDDEN: &str = r#"{"data":{"enqueuePullRequest":null},"errors":[{"type":"FORBIDDEN","message":"Viewer is not allowed to jump the queue"}]}"#;
 
 fn poisoned(hold: PoisonHold, auto_jump: AutoJump, fixes: &[u64]) -> RepoPoison {
+    let mut poison = streak_only(hold, auto_jump, fixes);
+    poison.tip = crate::app::merge_steward_cmd::base_poison::red_tip(&poison.health);
+    poison
+}
+
+/// The merge-group streak with the base tip not read red.
+fn streak_only(hold: PoisonHold, auto_jump: AutoJump, fixes: &[u64]) -> RepoPoison {
     RepoPoison {
         policy: BasePoisonPolicy {
             hold,
@@ -91,7 +98,9 @@ fn poisoned(hold: PoisonHold, auto_jump: AutoJump, fixes: &[u64]) -> RepoPoison 
             .map(|pr| (*pr, vec!["label `shipyard:unblock`".to_owned()]))
             .collect(),
         fix_read_error: None,
+        fix_ambiguity: None,
         candidates: std::collections::BTreeSet::default(),
+        tip: std::collections::BTreeMap::new(),
     }
 }
 
@@ -154,6 +163,31 @@ fn a_poisoned_base_holds_an_approved_green_pull_request_that_is_not_the_fix() {
     );
     assert_eq!(outcome.error, None);
     assert!(enqueues(&outcome.calls).is_empty(), "{}", outcome.calls);
+}
+
+/// The merge-group streak alone, with the base tip not read red, holds
+/// nothing and jumps nothing: the enqueue goes through plainly.
+#[test]
+fn a_streak_the_base_tip_does_not_confirm_neither_holds_nor_jumps() {
+    let other = streak_only(PoisonHold::On, AutoJump::On, &[12025]);
+    let outcome = enqueue(Some(&other), JUMP_ACCEPTED);
+    assert_eq!(
+        outcome.mutation.as_deref(),
+        Some("enqueued"),
+        "{:?}",
+        outcome.error
+    );
+    let fix = streak_only(PoisonHold::On, AutoJump::On, &[42]);
+    let outcome = enqueue(Some(&fix), JUMP_ACCEPTED);
+    assert_eq!(
+        outcome.mutation.as_deref(),
+        Some("fast_track_fix,enqueued"),
+        "{:?}",
+        outcome.error
+    );
+    let enqueues = enqueues(&outcome.calls);
+    assert_eq!(enqueues.len(), 1);
+    assert!(!enqueues[0].contains("jump:true"), "{}", enqueues[0]);
 }
 
 #[test]
@@ -264,6 +298,7 @@ fn every_named_fix_is_admitted_and_every_other_pull_request_held() {
         health: MergeGroupHealth::Clear {
             detail: "newest merge group passed".to_owned(),
             passed: Vec::new(),
+            passed_by: std::collections::BTreeMap::new(),
         },
         ..poison.clone()
     };

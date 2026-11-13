@@ -35,6 +35,18 @@
 //! The hold lifts by itself once a merge group passes the context, because
 //! the streak is counted from the newest verdict. An unreadable merge-group
 //! history never holds anything.
+//!
+//! **Fix-first** ([`crate::base_health::fix_first`]). The streak alone never
+//! holds or jumps anything. Each poisoned context also has the base tip's own
+//! newest verdict read (one `GET` per poisoned context, only while the streak
+//! fires); a context is **confirmed** when that verdict is a failure too. Only
+//! a confirmed context holds admission (`held_base_poisoned:<context>`),
+//! pauses the queue, or jumps the fix, and the hold lifts in the same pass
+//! the tip goes green. While a context is confirmed, an open pull request
+//! whose head is approved and passed the context after the tip went red is
+//! a fix (`green head`), found from the census the pass already read. It
+//! ranks below a label and the detector's naming and above title text, and it
+//! is never held: it is enqueued with `jump: true` when `auto_jump = "on"`.
 
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
@@ -48,6 +60,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::{GitHubActions, MutationControl, RepoObservation, StewardPolicy};
+use crate::base_health::fix_first::{self, TipReading};
 use crate::base_health::merge_group::{self, MergeGroupHealth, PoisonedContext};
 use crate::base_health::{
     self, AutoJump, BasePoisonPolicy, FIX_REVIEW_KICK_KEY, FIX_REVIEW_PRIORITY_FILE_KEY, PoisonHold,
@@ -77,6 +90,73 @@ pub(super) struct RepoPoison {
     /// Why named fixes could not be listed, when they could not.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) fix_read_error: Option<String>,
+    /// The base tip's own verdict for each poisoned context.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(super) tip: BTreeMap<String, TipReading>,
+    /// Set when several pull requests qualified as the green-head fix and
+    /// nothing singled one out. They are admitted plainly ([`Self::candidates`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) fix_ambiguity: Option<String>,
+}
+
+impl RepoPoison {
+    /// Poisoned contexts the base tip also fails: the only ones that hold,
+    /// pause or jump. An unread tip confirms nothing.
+    pub(super) fn confirmed_contexts(&self) -> Vec<String> {
+        self.health
+            .poisoned_contexts()
+            .into_iter()
+            .filter(|context| self.tip.get(context).is_some_and(|tip| tip.red))
+            .collect()
+    }
+
+    /// What this pass could not read, when anything: a tip that failed to
+    /// read, or the open pull requests behind the named fixes. A decision
+    /// built on it is reported as partial, never as clean.
+    pub(super) fn partial(&self) -> Option<String> {
+        let mut gaps = self
+            .tip
+            .iter()
+            .filter_map(|(context, tip)| {
+                tip.error
+                    .as_ref()
+                    .map(|error| format!("tip `{context}`: {error}"))
+            })
+            .collect::<Vec<_>>();
+        gaps.extend(self.fix_read_error.clone());
+        (!gaps.is_empty()).then(|| gaps.join("; "))
+    }
+
+    /// Whether every one of `contexts` was read green on the tip this pass:
+    /// the episode for them is over even if the merge-group streak is not.
+    pub(super) fn tip_green_for(&self, contexts: &str) -> bool {
+        contexts.split(',').all(|context| {
+            self.tip
+                .get(context)
+                .is_some_and(|tip| !tip.red && tip.error.is_none())
+        })
+    }
+}
+
+/// A tip reading that is red for each poisoned context of `health`, for
+/// tests that exercise a confirmed episode.
+#[cfg(test)]
+pub(super) fn red_tip(health: &MergeGroupHealth) -> BTreeMap<String, TipReading> {
+    health
+        .poisoned_contexts()
+        .into_iter()
+        .map(|context| {
+            (
+                context,
+                TipReading {
+                    sha: None,
+                    red: true,
+                    red_since: None,
+                    error: None,
+                },
+            )
+        })
+        .collect()
 }
 
 /// What admission does with one approved, green pull request.
@@ -129,13 +209,22 @@ pub(super) fn admission(poison: Option<&RepoPoison>, pr: u64) -> Admission {
     if !poison.fixes.contains_key(&pr) && poison.candidates.contains(&pr) {
         return Admission::Proceed;
     }
+    let confirmed = poison.confirmed_contexts();
     if poison.fixes.contains_key(&pr) {
         return Admission::FastTrack {
-            // A jump reorders the queue, so it is a mutation: dry-run never jumps.
-            jump: poison.policy.hold == PoisonHold::On && poison.policy.auto_jump == AutoJump::On,
+            // A jump reorders the queue, so it is a mutation: dry-run never
+            // jumps, and neither does a streak the base tip does not confirm.
+            jump: poison.policy.hold == PoisonHold::On
+                && poison.policy.auto_jump == AutoJump::On
+                && !confirmed.is_empty(),
         };
     }
-    let contexts = contexts.join(",");
+    // A streak alone holds nothing: one flaky group pair must not stop the
+    // queue. The hold needs the base tip red on the same context.
+    if confirmed.is_empty() {
+        return Admission::Proceed;
+    }
+    let contexts = confirmed.join(",");
     match poison.policy.hold {
         PoisonHold::On => Admission::Hold { contexts },
         PoisonHold::DryRun => Admission::WouldHold { contexts },
@@ -164,7 +253,7 @@ pub(super) fn observe(
         now,
     );
     let poisoned = health.poisoned_contexts();
-    let (fixes, fix_read_error) = if poisoned.is_empty() {
+    let (mut fixes, fix_read_error) = if poisoned.is_empty() {
         (BTreeMap::new(), None)
     } else {
         named_fixes(
@@ -175,14 +264,188 @@ pub(super) fn observe(
             now,
         )
     };
-    let (fixes, candidates) = assemble_fixes(fixes, &observation.prs, &health);
+    let tip = poisoned
+        .iter()
+        .map(|context| {
+            let rule = observation
+                .required_checks
+                .iter()
+                .find(|rule| &rule.context == context);
+            (
+                context.clone(),
+                read_tip(
+                    &run_gh,
+                    &observation.repo,
+                    &observation.base,
+                    context,
+                    rule.and_then(|rule| rule.app_id),
+                ),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let green = green_head_fix(
+        &observation.prs,
+        &observation.required_checks,
+        &policy.approval_context,
+        &health,
+        &tip,
+    );
+    if let GreenHead::One(pr, evidence) = &green {
+        fixes.entry(*pr).or_default().push(evidence.clone());
+    }
+    let (fixes, mut candidates) = assemble_fixes(fixes, &observation.prs, &health);
+    let fix_ambiguity = match green {
+        GreenHead::Ambiguous(prs) => {
+            candidates.extend(prs.iter().copied());
+            Some(ambiguity_line(&prs))
+        }
+        _ => None,
+    };
     Some(RepoPoison {
         candidates,
         policy: poison_policy,
         health,
         fixes,
         fix_read_error,
+        tip,
+        fix_ambiguity,
     })
+}
+
+/// The report line for an ambiguous green-head reading.
+pub(super) fn ambiguity_line(prs: &[u64]) -> String {
+    format!(
+        "fix ambiguous: {} all pass the red context on an approved head; none is jumped or held \
+         (add `main-red-fix` or `fixes-main` to exactly one)",
+        prs.iter()
+            .map(|pr| format!("#{pr}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+/// The base tip's verdict for one context: one read.
+pub(super) fn read_tip(
+    run_gh: &dyn Fn(&[String]) -> Result<String, String>,
+    repo: &str,
+    base: &str,
+    context: &str,
+    app_id: Option<u64>,
+) -> TipReading {
+    match run_gh(&[
+        "api".to_owned(),
+        fix_first::tip_check_path(repo, base, context),
+    ])
+    .and_then(|raw| serde_json::from_str::<Value>(&raw).map_err(|error| error.to_string()))
+    {
+        Ok(value) => fix_first::parse_tip(&value, context, app_id),
+        Err(error) => TipReading {
+            error: Some(error),
+            ..TipReading::default()
+        },
+    }
+}
+
+/// What the green-head reading found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum GreenHead {
+    /// No pull request qualifies.
+    None,
+    /// The fix, with its evidence line.
+    One(u64, String),
+    /// Several qualify and nothing singles one out: none is jumped or held.
+    Ambiguous(Vec<u64>),
+}
+
+/// The one green-head fix across the confirmed contexts, with its evidence:
+/// an open pull request whose current head is approved and passed the
+/// context after the base tip went red. Read from the census; no call. The
+/// facts belong to the head the census read; the enqueue that acts on them
+/// pins that head (`expectedHeadOid`) and re-reads its exact-head approval,
+/// so a head that moved in between is never jumped.
+pub(super) fn green_head_fix(
+    prs: &[super::ObservedPr],
+    required: &[crate::merge_steward::RequiredCheck],
+    approval_context: &str,
+    health: &MergeGroupHealth,
+    tip: &BTreeMap<String, TipReading>,
+) -> GreenHead {
+    let time = |text: Option<&str>| {
+        text.and_then(|text| DateTime::parse_from_rfc3339(text).ok())
+            .map(|at| at.with_timezone(&Utc))
+    };
+    let succeeded = |check: &crate::merge_steward::StewardCheck| {
+        check.status.eq_ignore_ascii_case("COMPLETED")
+            && check
+                .conclusion
+                .as_deref()
+                .is_some_and(|conclusion| conclusion.eq_ignore_ascii_case("SUCCESS"))
+    };
+    let mut found: Vec<(fix_first::GreenFix, String)> = Vec::new();
+    for poisoned in health.poisoned() {
+        let Some(red_since) = tip
+            .get(&poisoned.context)
+            .filter(|tip| tip.red)
+            .and_then(|tip| tip.red_since)
+        else {
+            continue;
+        };
+        let rule = required
+            .iter()
+            .find(|rule| rule.context == poisoned.context)
+            .cloned()
+            .unwrap_or_else(|| crate::merge_steward::RequiredCheck {
+                context: poisoned.context.clone(),
+                app_id: None,
+            });
+        let candidates = prs
+            .iter()
+            .map(|pr| fix_first::FixCandidate {
+                number: pr.fact.number,
+                draft: pr.fact.draft,
+                labels: pr.fact.labels.clone(),
+                approved_at: pr
+                    .fact
+                    .checks
+                    .iter()
+                    .filter(|check| {
+                        check.name.eq_ignore_ascii_case(approval_context)
+                            && check.source
+                                == crate::merge_steward::StewardCheckSource::StatusContext
+                            && succeeded(check)
+                    })
+                    .filter_map(|check| time(check.observed_at.as_deref()))
+                    .min(),
+                context_green_at: crate::merge_steward::selected_required_check(
+                    &pr.fact.checks,
+                    &rule,
+                )
+                .filter(|check| succeeded(check))
+                .and_then(|check| time(check.observed_at.as_deref())),
+                rode_failing_group: health.poisoned().iter().any(|poison| {
+                    poison
+                        .groups
+                        .iter()
+                        .any(|group| group.prs.contains(&pr.fact.number))
+                }),
+            })
+            .collect::<Vec<_>>();
+        for fix in fix_first::green_head_fixes(&candidates, red_since) {
+            let evidence = fix.evidence(&poisoned.context, red_since);
+            found.push((fix, evidence));
+        }
+    }
+    let fixes = found.iter().map(|(fix, _)| fix.clone()).collect::<Vec<_>>();
+    match fix_first::pick(&fixes) {
+        fix_first::Pick::None => GreenHead::None,
+        fix_first::Pick::Ambiguous { prs } => GreenHead::Ambiguous(prs),
+        fix_first::Pick::One(chosen) => found
+            .into_iter()
+            .find(|(fix, _)| fix.pr == chosen.pr)
+            .map_or(GreenHead::None, |(fix, evidence)| {
+                GreenHead::One(fix.pr, evidence)
+            }),
+    }
 }
 
 /// The one named fix this pass fast-tracks ([`choose_fix`]), and every
@@ -215,8 +478,9 @@ pub(super) fn assemble_fixes(
 /// A pull request that rode one of the streak's failing groups demonstrably
 /// did not fix the context, so it is dropped. Of the rest, the strongest
 /// evidence wins: the `shipyard:unblock` label (only someone with write
-/// access can apply it), then the detector's naming, then title or
-/// description text; ties go to the lowest number. Exactly one fix keeps the
+/// access can apply it), then the detector's naming, then a green head
+/// ([`green_head_fix`]), then title or description text; ties go to the
+/// lowest number. Exactly one fix keeps the
 /// per-pass reads and cancellations bounded and stops a pull request whose
 /// text merely mentions the context from being fast-tracked beside it.
 pub(super) fn choose_fix(
@@ -237,8 +501,10 @@ pub(super) fn choose_fix(
             .any(|line| line.starts_with("base-poison detector"))
         {
             1
-        } else {
+        } else if evidence.iter().any(|line| line.starts_with("green head")) {
             2
+        } else {
+            3
         }
     };
     fixes
@@ -329,6 +595,10 @@ pub(super) fn report(poison: &RepoPoison, fast_track: &[String]) -> Value {
         "auto_jump": poison.policy.auto_jump,
         "health": poison.health,
         "fixes": poison.fixes,
+        "tip": poison.tip,
+        "confirmed": poison.confirmed_contexts(),
+        "fix_ambiguity": poison.fix_ambiguity,
+        "partial": poison.partial(),
         "fix_read_error": poison.fix_read_error,
         "config_error": poison.policy.read_error,
         "fast_track": fast_track,
@@ -595,8 +865,9 @@ pub(super) fn fast_track(
     if contexts.is_empty() {
         return Vec::new();
     }
-    // Shadow never opens an issue or touches the priority file.
-    if poison.policy.hold != PoisonHold::On {
+    // Shadow never opens an issue or touches the priority file, and neither
+    // does a streak the base tip does not confirm.
+    if poison.policy.hold != PoisonHold::On || poison.confirmed_contexts().is_empty() {
         return would_fast_track(poison);
     }
     let hooks = ReviewHooks::from_machine_global(&control.global_dir);

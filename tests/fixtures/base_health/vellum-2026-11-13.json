@@ -1,0 +1,78 @@
+[
+  {
+    "key": "generous-corp/vellum@main",
+    "context": "provenance-verify",
+    "started_at": "2026-11-13T10:27:25Z",
+    "ended_at": "2026-11-13T11:10:03Z",
+    "max_streak": 3,
+    "would_hold": [
+      408,
+      409
+    ],
+    "tip_runs": [
+      {
+        "id": 131813536030,
+        "conclusion": "success",
+        "completed_at": "2026-11-13T09:53:01Z"
+      },
+      {
+        "id": 131829205683,
+        "conclusion": "failure",
+        "completed_at": "2026-11-13T10:32:36Z"
+      }
+    ],
+    "prs": [
+      {
+        "number": 408,
+        "approved_at": "2026-11-13T10:03:24Z",
+        "context_green_at": "2026-11-13T09:58:37Z"
+      },
+      {
+        "number": 409,
+        "approved_at": "2026-11-13T10:41:08Z",
+        "context_green_at": "2026-11-13T10:35:37Z"
+      }
+    ],
+    "actual_fix": 409,
+    "decided_at": "2026-11-13T10:37:47Z",
+    "note": "Real facts read from Generous-Corp/vellum on 2026-11-13. Shadow episode from m3 shadow-ended.jsonl. Tip 8c606bc7 (#405): provenance-verify passed at 09:53 (merge group) and failed at 10:32 (push run on the same commit). #408 head 93e07b86 passed provenance-verify at 09:58, before the tip went red; #409 head 6dbc6ada passed it at 10:35 and was approved at 10:41. #409 is the fix that was reordered by hand at 11:02. Replayed when #408's merge group formed."
+  },
+  {
+    "key": "generous-corp/vellum@main",
+    "context": "provenance-verify",
+    "started_at": "2026-11-13T10:27:25Z",
+    "ended_at": "2026-11-13T11:10:03Z",
+    "max_streak": 3,
+    "would_hold": [
+      408,
+      409
+    ],
+    "tip_runs": [
+      {
+        "id": 131813536030,
+        "conclusion": "success",
+        "completed_at": "2026-11-13T09:53:01Z"
+      },
+      {
+        "id": 131829205683,
+        "conclusion": "failure",
+        "completed_at": "2026-11-13T10:32:36Z"
+      }
+    ],
+    "prs": [
+      {
+        "number": 408,
+        "approved_at": "2026-11-13T10:03:24Z",
+        "context_green_at": "2026-11-13T09:58:37Z"
+      },
+      {
+        "number": 409,
+        "approved_at": "2026-11-13T10:41:08Z",
+        "context_green_at": "2026-11-13T10:35:37Z"
+      }
+    ],
+    "actual_fix": 409,
+    "decided_at": "2026-11-13T10:46:00Z",
+    "note": "Real facts read from Generous-Corp/vellum on 2026-11-13. Shadow episode from m3 shadow-ended.jsonl. Tip 8c606bc7 (#405): provenance-verify passed at 09:53 (merge group) and failed at 10:32 (push run on the same commit). #408 head 93e07b86 passed provenance-verify at 09:58, before the tip went red; #409 head 6dbc6ada passed it at 10:35 and was approved at 10:41. #409 is the fix that was reordered by hand at 11:02. Replayed when #409 was enqueued at the back."
+  }
+]

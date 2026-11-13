@@ -23,6 +23,7 @@ use serde_json::Value;
 
 use crate::validation_signals::{Annotation, GhReader, parse_annotations};
 
+pub mod fix_first;
 pub mod merge_group;
 pub mod tip;
 

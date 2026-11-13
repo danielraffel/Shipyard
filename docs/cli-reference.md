@@ -69,6 +69,9 @@ shipyard base-health --act                   # apply base_health.auto_jump: off 
                                              #   on: needs a trusted approval of the exact head; a failed jump re-enqueues the head at the back
 shipyard base-health --base BRANCH           # also judge BRANCH's newest merge groups (default main): a required context failing in
                                              #   2+ consecutive groups with different PRs is poisoned; advice names a single labelled/titled fix
+shipyard base-health --replay FILE [--json]  # replay recorded episodes (JSON array) through the fix-first rule: fires only on the streak
+                                             #   plus a red base tip; names the approved head that passed the context after the tip went red;
+                                             #   scores the pick against the PR that repaired the base. Offline: no GitHub read, no state
 
 # Is the merge queue fed? The merge train (off unless the base config sets `[train] enabled = true`)
 shipyard train status [--repo R] [--base main]  # switch + each open PR's stage and why (approval is head_approval's, carry included)
