@@ -989,6 +989,16 @@ logs first read as a broken reader:
 Job logs also disappear (`BlobNotFound`, HTTP 404) for some older attempts;
 treat that as unread, never as no failures.
 
+## The same test red on three pull requests is the base's
+
+Before repairing a red required check, look at the steward row. When the row
+carries `red_everywhere` (one required check failing the same test on three or
+more open pull requests in one pass), the failure is almost certainly on the
+base: do not change code in this pull request for it. Wait for the fix on the
+base, then merge the base once and push once. The row's `next_action` says so,
+and `[auto_merge] red_everywhere = "enforce"` also holds the unchanged head out
+of the queue. See `docs/automated-draining.md` "Red everywhere".
+
 ## A dispatched gate run checks out the bare branch head
 
 A `pull_request` run checks out GitHub's merge of the head into the base, so
