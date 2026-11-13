@@ -800,3 +800,30 @@ fn an_unread_tip_keeps_the_tip_red_episode_open_and_out_of_the_gate() {
     assert_eq!(gate["fires"], 0, "a partial episode is never evidence");
     assert_eq!(third["fix_first"]["pick_repaired"], 0);
 }
+
+/// With nothing confirmed, every pull request is admitted as usual: a named
+/// fix gets no fast-track and no jump, and no other head is held.
+#[test]
+fn with_nothing_confirmed_every_pull_request_proceeds() {
+    let prs = [pr_408(), pr_409()];
+    for tip in [
+        tip_green(),
+        TipReading {
+            error: Some("HTTP 502".to_owned()),
+            ..TipReading::default()
+        },
+    ] {
+        let mut unconfirmed = poison(PoisonHold::On, &prs, streak(), tip);
+        unconfirmed
+            .fixes
+            .insert(409, vec!["label `shipyard:unblock`".to_owned()]);
+        assert!(unconfirmed.confirmed_contexts().is_empty());
+        for pr in [408, 409] {
+            assert_eq!(
+                base_poison::admission(Some(&unconfirmed), pr),
+                Admission::Proceed,
+                "#{pr}"
+            );
+        }
+    }
+}
