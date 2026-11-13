@@ -11,7 +11,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -224,7 +224,7 @@ pub(crate) fn run_canary(request: &Request<'_>, gh: Gh<'_>) -> Result<Report, St
             .open(request.work_root.join(format!("{slug}.lock")))
             .map_err(|error| error.to_string())?,
     );
-    if lock.try_lock_exclusive().is_err() {
+    if !classify_lock_attempt(lock.try_lock_exclusive())? {
         return Ok(skipped("another canary run holds the lock"));
     }
     let stamp_path = request.work_root.join(format!("{slug}.stamp"));
@@ -385,6 +385,14 @@ fn git_lines(checkout: &Path, args: &[&str]) -> Result<Vec<String>, String> {
         .lines()
         .map(ToOwned::to_owned)
         .collect())
+}
+
+fn classify_lock_attempt(result: std::io::Result<()>) -> Result<bool, String> {
+    match result {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == ErrorKind::WouldBlock => Ok(false),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 /// The last `READ_BACK_BYTES` of `file`, lossily decoded.
@@ -598,8 +606,22 @@ fn run_command(
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     let mut tree = ProcessTree::spawn(&mut shell).map_err(|error| error.to_string())?;
     let (reason, status) = loop {
+        if sink.metadata().map_or(0, |meta| meta.len()) > OUTPUT_CAP_BYTES {
+            break (
+                Some(format!("output exceeded {OUTPUT_CAP_BYTES} bytes; stopped")),
+                None,
+            );
+        }
         match tree.try_wait() {
-            Ok(Some(status)) => break (None, Some(status)),
+            Ok(Some(status)) => {
+                if sink.metadata().map_or(0, |meta| meta.len()) > OUTPUT_CAP_BYTES {
+                    break (
+                        Some(format!("output exceeded {OUTPUT_CAP_BYTES} bytes; stopped")),
+                        None,
+                    );
+                }
+                break (None, Some(status));
+            }
             Ok(None) => {}
             Err(error) => {
                 tree.terminate_until(Instant::now() + Duration::from_secs(5));
@@ -608,12 +630,6 @@ fn run_command(
         }
         if Instant::now() >= deadline {
             break (Some(format!("timed out after {timeout_secs}s")), None);
-        }
-        if sink.metadata().map_or(0, |meta| meta.len()) > OUTPUT_CAP_BYTES {
-            break (
-                Some(format!("output exceeded {OUTPUT_CAP_BYTES} bytes; stopped")),
-                None,
-            );
         }
         std::thread::sleep(Duration::from_millis(20));
     };
@@ -902,6 +918,17 @@ mod tests {
     }
 
     #[test]
+    fn only_would_block_is_lock_contention() {
+        assert_eq!(
+            classify_lock_attempt(Err(std::io::Error::from(ErrorKind::WouldBlock))),
+            Ok(false)
+        );
+        let error = classify_lock_attempt(Err(std::io::Error::from(ErrorKind::PermissionDenied)))
+            .expect_err("non-contention lock errors must be infrastructure failures");
+        assert!(error.contains("permission denied"), "{error}");
+    }
+
+    #[test]
     fn unreadable_issue_list_is_an_error_not_an_empty_list() {
         let dir = tempfile::tempdir().unwrap();
         let origin = origin(dir.path());
@@ -1039,6 +1066,15 @@ mod tests {
             .find(|a| a.starts_with("body="))
             .unwrap();
         assert!(body.contains("partial-2"));
+    }
+
+    #[test]
+    fn output_cap_is_enforced_after_a_child_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Fake::new("");
+        let report = run(dir.path(), "head -c 67108865 /dev/zero", 30, &fake, false).unwrap();
+        assert_eq!(report.status, "fail");
+        assert!(report.detail.contains("output exceeded 67108864 bytes"));
     }
 
     #[test]
@@ -1288,13 +1324,23 @@ mod tests {
     }
 
     #[test]
-    fn the_read_token_source_is_ghread_alone() {
-        let source = include_str!("release_canary_cmd.rs");
-        let mint = source.split("fn mint_read_tokens").nth(1).unwrap();
-        let mint = mint.split("\n}\n").next().unwrap();
-        assert!(mint.contains("Command::new(ghread)"));
-        assert!(!mint.contains("ghapp"));
-        assert!(!mint.contains("GH_TOKEN"));
+    fn read_tokens_are_minted_from_ghread_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let ghread = fake_ghread(dir.path());
+        let tokens = mint_read_tokens(
+            &ghread,
+            &dir.path().join("cache"),
+            "o/r",
+            &["o/other".to_owned()],
+        )
+        .unwrap();
+        assert_eq!(
+            tokens
+                .iter()
+                .map(|token| (token.repo.as_str(), token.token.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("o/r", "READ-R"), ("o/other", "READ-OTHER")]
+        );
     }
 
     fn fake_real_gh(dir: &Path) -> PathBuf {
