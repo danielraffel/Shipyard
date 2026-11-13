@@ -42,7 +42,12 @@ SIGNATURES = [
     "Unable to read current working directory", "sr status timed out", "Traceback",
 ]
 MERGE_FROM = {"queued", "admitted", "ready"}
-LOG_GLOBS = ("*.log", "*.last-output.txt")
+# Only the runner's own logs (<lane>.log, <lane>.launchd.log). The *.last-output.txt files
+# are agent transcripts that quote these strings in prose and code, so they are not scanned.
+LOG_GLOBS = ("*.log",)
+LINE_TS = re.compile(r"^\s*(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)")
+CUTOFF_SLACK = dt.timedelta(minutes=15)
+FIRST_RUN_LOOKBACK = dt.timedelta(hours=2)
 MAX_READ = 8 * 1024 * 1024
 
 
@@ -118,11 +123,25 @@ def recent_ticks(log_dir, now, span):
                 na = p.get("next_action") or {}
                 rows[p["number"]] = {"head": p.get("head_sha"), "token": p.get("blocked_on") or "unknown",
                                      "actor": na.get("actor"), "stop": bool(na.get("stop")),
-                                     "since": parse_iso(p.get("since"))}
+                                     "since": parse_iso(p.get("since")), "deferred": read_deferred(p)}
             per_repo.setdefault(r["repo"], []).append((t, rows))
     for v in per_repo.values():
         v.sort(key=lambda x: x[0])
     return per_repo
+
+
+READ_ERROR_RE = re.compile(r"HTTP 50\d|timed out|unreadable|cannot read|read failed")
+
+
+def read_deferred(p):
+    """A PR the pass could not read this tick (a transient 5xx or timeout): it was
+    neither judged nor refused, so it is unobserved, never an event. Mirrors the
+    `read_deferred=` split in shipyard-steward-tick.sh."""
+    err = p.get("error")
+    if err is None:
+        return False
+    kind = p.get("error_kind")
+    return kind == "read" or (kind is None and bool(READ_ERROR_RE.search(str(err))))
 
 
 def latest_valid(ticks):
@@ -144,7 +163,7 @@ def check_drain_stall(per_repo, now):
         if t_last - valid[0][0] < STALL_WINDOW - dt.timedelta(minutes=15):
             continue  # not enough history to say nothing merged in 2 h
         waiting = [pr for pr, o in rows.items()
-                   if classify(o["token"], o["actor"], o["stop"]) == "actionable"
+                   if not o["deferred"] and classify(o["token"], o["actor"], o["stop"]) == "actionable"
                    and (o["since"] or t_last) <= t_last - STALL_WINDOW]
         if not waiting:
             continue
@@ -168,7 +187,7 @@ def check_stale_hold(per_repo, now):
         if rows is None or now - t_last > dt.timedelta(minutes=30):
             continue
         old = [pr for pr, o in rows.items()
-               if (o["token"] == "held" or o["token"].startswith("held:")) and o["since"]
+               if not o["deferred"] and (o["token"] == "held" or o["token"].startswith("held:")) and o["since"]
                and t_last - o["since"] >= STALE_HOLD]
         if old:
             out.append(dict(kind="stale_hold", repo=repo, lane="-", key=f"stale_hold:{repo}",
@@ -221,8 +240,24 @@ def check_stuck_claims(per_repo, runner_dir, now):
 
 
 # ------------------------------------------------------------ pass faults
-def scan_logs(fleet_dir, state, from_start):
-    """Count new matching lines since the stored offsets. Mutates state['offsets']."""
+def scan_logs(fleet_dir, state, from_start, now=None):
+    """Count new matching lines since the stored offsets. Mutates state['offsets'].
+
+    A line with a leading ISO timestamp is attributed to that time; a line without
+    one to the preceding timestamped line (carried across runs per file). A line
+    attributed to a time before the cutoff (last run minus 15 min, or 2 h before
+    now on a first run) is old content, not a new fault, and is not counted. A line
+    with no timestamp anywhere before it cannot be proven old and is counted.
+    """
+    now = now or dt.datetime.now(UTC)
+    last_run = parse_iso(state.get("last_run"))
+    if last_run:
+        cutoff = last_run - CUTOFF_SLACK
+    elif from_start:
+        cutoff = None  # --from-start with no prior run: count everything, however old
+    else:
+        cutoff = now - FIRST_RUN_LOOKBACK
+    state["last_run"] = now.isoformat(timespec="seconds")
     offs = state.setdefault("offsets", {})
     found = {}
     seeded = bool(offs) or from_start
@@ -236,11 +271,25 @@ def scan_logs(fleet_dir, state, from_start):
             continue
         rec = offs.get(f)
         if rec is None and not seeded:
-            offs[f] = {"inode": st.st_ino, "offset": st.st_size}  # first ever run: do not count history
+            # first ever run: do not count history, but remember its last timestamp so
+            # an untimestamped continuation line later is attributed to it
+            ts = None
+            try:
+                with open(f, "rb") as fh:
+                    fh.seek(max(0, st.st_size - 65536))
+                    for line in fh.read().decode("utf-8", "replace").splitlines():
+                        m = LINE_TS.match(line)
+                        if m:
+                            ts = parse_iso(m.group(1)) or ts
+            except OSError:
+                pass
+            offs[f] = {"inode": st.st_ino, "offset": st.st_size, "ts": ts.isoformat() if ts else None}
             continue
         start = 0
+        line_ts = None
         if rec and rec["inode"] == st.st_ino and rec["offset"] <= st.st_size:
             start = rec["offset"]
+            line_ts = parse_iso(rec.get("ts"))
         end = st.st_size
         if end - start > MAX_READ:
             start = end - MAX_READ
@@ -257,15 +306,21 @@ def scan_logs(fleet_dir, state, from_start):
         else:
             consumed = cut + 1
             text = data[:consumed]
-        offs[f] = {"inode": st.st_ino, "offset": start + consumed}
         lane = os.path.basename(f).split(".")[0]
         for line in text.decode("utf-8", "replace").splitlines():
+            m = LINE_TS.match(line)
+            if m:
+                line_ts = parse_iso(m.group(1)) or line_ts
+            if cutoff is not None and line_ts is not None and line_ts < cutoff:
+                continue
             for sig in SIGNATURES:
                 if sig in line:
                     e = found.setdefault((lane, sig), {"count": 0, "evidence": []})
                     e["count"] += 1
                     if len(e["evidence"]) < 3:
                         e["evidence"].append(f"{os.path.basename(f)}: {line.strip()[:200]}")
+        offs[f] = {"inode": st.st_ino, "offset": start + consumed,
+                   "ts": line_ts.isoformat() if line_ts else None}
     out = []
     for (lane, sig), e in sorted(found.items()):
         out.append(dict(kind="pass_fault", repo="-", lane=lane, key=f"pass_fault:{lane}:{sig}",
@@ -347,7 +402,7 @@ def collect(a, now, state):
     f += check_drain_stall(per_repo, now)
     f += check_stale_hold(per_repo, now)
     f += check_stuck_claims(per_repo, a.runner_dir, now)
-    f += scan_logs(a.fleet_dir, state, a.from_start)
+    f += scan_logs(a.fleet_dir, state, a.from_start, now)
     return f
 
 

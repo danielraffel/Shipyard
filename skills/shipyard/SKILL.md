@@ -2404,6 +2404,7 @@ a missing macOS `.dmg` — run `gh auth login` (or export `GITHUB_TOKEN`) and re
 To raise the quota above the ambient `gh` user token's 5,000/hr, point
 `[github.auth]` at a GitHub App installation token helper
 (`scripts/shipyard-github-app-token`) for the 12,500/hr installation bucket.
+The helper retries a dropped connection (`RemoteDisconnected`, `ConnectionResetError`, `IncompleteRead`, a read timeout) with the same bounded delays as a 502/503/504, then fails with a plain `GitHub API request failed` error, not a traceback.
 Put the block in the **global** config dir (find it with `shipyard paths`;
 macOS `~/Library/Application Support/shipyard/config.toml`) to cover every repo
 on the machine — not the tracked project config. A tracked layer may not set
@@ -3861,6 +3862,7 @@ UTC), and each repository carries `blocked_summary` (counts per token and the
 three oldest blocked rows with `age_minutes`). Read those instead of inferring
 the state from `mutation`: `waiting_head_approval` alone does not say whether
 nobody reviewed the head, a reviewer holds it, or its approval is excluded.
+A row with an `error` also carries `error_kind`: `read` (a 5xx, timeout, dropped connection or rate limit while reading; the next pass retries it, so treat the row as unobserved, not refused) or `policy` (a decision or a failed action). The steward tick logs the first as `read_deferred=` and the second as `pr_refused=`.
 The full token list is in `docs/automated-draining.md`. Each row also carries
 `next_action` (`actor`, `action`, `stop`), and `shipyard wait pr <n> --state
 actionable --timeout <s> --json` gives one pull request that answer live and

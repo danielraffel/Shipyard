@@ -74,6 +74,26 @@ class EpisodeTests(Fixture):
         self.assertEqual(r["totals"]["rows_observed"], 3)
         self.assertEqual(r["totals"]["episodes"], 1)
 
+    def test_a_read_deferred_row_neither_ends_nor_extends_an_episode(self):
+        t1 = dt.datetime(2026, 11, 12, 1, 0, tzinfo=UTC)
+        t2, t3 = t1 + dt.timedelta(minutes=5), t1 + dt.timedelta(minutes=10)
+        rows = [(7, "aaa", "required_failed:macos", "author", None)]
+        self.live(t1, rows)
+        # A pass that could not read #7 reports a different (meaningless) token.
+        self.live(t2, [(7, "aaa", "unknown", "author", {"error": "gh: HTTP 503"})])
+        self.live(t3, rows)
+        r = self.report()
+        self.assertEqual(r["totals"]["episodes"], 1)
+        self.assertEqual(r["totals"]["rows_observed"], 2)
+
+    def test_the_same_change_without_an_error_splits_the_episode(self):
+        t1 = dt.datetime(2026, 11, 12, 1, 0, tzinfo=UTC)
+        rows = [(7, "aaa", "required_failed:macos", "author", None)]
+        self.live(t1, rows)
+        self.live(t1 + dt.timedelta(minutes=5), [(7, "aaa", "unknown", "author", None)])
+        self.live(t1 + dt.timedelta(minutes=10), rows)
+        self.assertEqual(self.report()["totals"]["episodes"], 3)
+
     def test_file_in_both_live_and_archive_is_read_once(self):
         t = dt.datetime(2026, 11, 11, 10, 0, tzinfo=UTC)
         rows = [(1, "a", "required_pending", "ci", None)]

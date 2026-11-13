@@ -118,6 +118,41 @@ class DetectionTests(Base):
         _, _, f = self.run_once()
         self.assertEqual(f, [])
 
+    def _history_with_error(self, error):
+        old = NOW - dt.timedelta(hours=3)
+        for m in range(150, -1, -15):
+            t = NOW - dt.timedelta(minutes=m)
+            pr = {"number": 1, "head_sha": "a", "blocked_on": "required_failed:macos",
+                  "since": old.isoformat().replace("+00:00", "Z"),
+                  "next_action": {"actor": "author", "action": "x", "stop": False}}
+            if error and m <= 30:
+                pr["error"] = error
+            (self.log / f"acme_repo-{stamp(t)}.json").write_text(
+                json.dumps({"repos": [{"repo": REPO, "prs": [pr], "errors": []}]}))
+
+    def test_a_read_deferred_pr_is_unobserved_not_a_stall_input(self):
+        # Control: the same history with no error is a stall.
+        self._history_with_error(None)
+        _, _, f = self.run_once()
+        self.assertEqual([x["kind"] for x in f], ["drain_stall"])
+
+    def test_a_pr_unread_in_the_latest_tick_is_not_counted_as_waiting(self):
+        self._history_with_error("queue-arm-guard: cannot read live PR state: gh: HTTP 503")
+        _, _, f = self.run_once()
+        self.assertEqual(f, [])
+
+    def test_a_policy_error_is_still_observed(self):
+        self._history_with_error("needs an exact-head approval")
+        _, _, f = self.run_once()
+        self.assertEqual([x["kind"] for x in f], ["drain_stall"])
+
+    def test_read_deferred_classifier(self):
+        self.assertTrue(dw.read_deferred({"error": "gh: HTTP 503"}))
+        self.assertTrue(dw.read_deferred({"error": "x", "error_kind": "read"}))
+        self.assertFalse(dw.read_deferred({"error": "HTTP 503", "error_kind": "policy"}))
+        self.assertFalse(dw.read_deferred({"error": "needs an exact-head approval"}))
+        self.assertFalse(dw.read_deferred({"number": 1}))
+
     def test_normal_waits_and_short_history_do_not_stall(self):
         old = NOW - dt.timedelta(hours=3)
         self.history(lambda m: [(1, "a", "required_pending", "author", old)])
@@ -157,7 +192,7 @@ class DetectionTests(Base):
         (self.fleet / "repair.log").write_text(
             "ok\nPermissionError: [Errno 1] Operation not permitted: '/x/.cache/ghread/a'\nfine\n")
         (self.fleet / "reviewer.launchd.log").write_text("fleet-pass.sh: line 3: rg: command not found\nUnable to read current working directory\n")
-        (self.fleet / "reviewer.last-output.txt").write_text("Traceback (most recent call last):\n")
+        (self.fleet / "reviewer.log").write_text("Traceback (most recent call last):\n")
         self.args.from_start = True
         _, _, f = self.run_once()
         got = {(x["lane"], x["detail"]) for x in f}
@@ -166,6 +201,51 @@ class DetectionTests(Base):
         self.assertIn(("reviewer", "command not found x1"), got)
         self.assertIn(("reviewer", "Unable to read current working directory x1"), got)
         self.assertIn(("reviewer", "Traceback x1"), got)
+
+
+class TranscriptAndTimeTests(Base):
+    def test_transcripts_are_not_scanned_but_runner_lines_are(self):
+        (self.fleet / "repair.last-output.txt").write_text(
+            "the agent wrote: Traceback (most recent call last)\nand a getcwd error, quoting PermissionError\n")
+        (self.fleet / "repair.last-output.txt.codex-failed").write_text("Traceback\n")
+        (self.fleet / "repair.launchd.log").write_text("fleet-pass.sh: line 9: rg: command not found\n")
+        self.args.from_start = True
+        _, _, f = self.run_once()
+        self.assertEqual([(x["lane"], x["detail"]) for x in f], [("repair", "command not found x1")])
+
+    def test_timestamps_attribute_a_line_to_its_own_or_the_preceding_time(self):
+        log = self.fleet / "repair.log"
+        log.write_text("2026-11-13T10:00:00Z role=repair ok\n")
+        self.run_once()                                    # seed; last_run = NOW
+        old = "2026-11-10T09:00:00Z"
+        new = "2026-11-13T11:55:00Z"
+        with open(log, "a") as fh:
+            fh.write(f"{old} role=repair quoted old PermissionError\n"
+                     "  continuation line with Traceback\n"           # belongs to the old line
+                     f"{new} role=repair new getcwd failure\n"
+                     "  second line: Operation not permitted\n"       # belongs to the new line
+                     "role=repair untimestamped but after a new line: command not found\n")
+        _, _, f = self.run_once()
+        got = sorted(x["detail"] for x in f)
+        self.assertEqual(got, ["Operation not permitted x1", "command not found x1", "getcwd x1"])
+
+    def test_from_start_counts_old_timestamped_lines_on_the_first_run_only(self):
+        log = self.fleet / "repair.log"
+        log.write_text("2026-11-01T00:00:00Z role=repair old getcwd failure\n")
+        self.args.from_start = True
+        _, _, f = self.run_once()
+        self.assertEqual([x["detail"] for x in f], ["getcwd x1"])
+        with open(log, "a") as fh:                         # a later run filters old lines again
+            fh.write("2026-11-01T00:01:00Z role=repair another old getcwd\n")
+        self.assertEqual(self.run_once(NOW + dt.timedelta(minutes=5))[2], [])
+
+    def test_preceding_timestamp_carries_across_runs(self):
+        log = self.fleet / "repair.log"
+        log.write_text("2026-11-01T00:00:00Z old entry\n")
+        self.run_once()
+        with open(log, "a") as fh:
+            fh.write("  stack continues: Traceback\n")        # still the old entry's time
+        self.assertEqual(self.run_once(NOW + dt.timedelta(minutes=5))[2], [])
 
 
 class StateTests(Base):
