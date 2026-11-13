@@ -5929,6 +5929,34 @@ detector, then text, lowest number on a tie; a PR that rode a failing group is
 never chosen), its CI is prioritized only while a non-approval required check
 has not completed, and a dry-run hold never jumps. `base-health --act` is the
 manual path; leave `auto_jump` driving the steward alone so one writer jumps.
+`src/app/merge_steward_cmd/merge_group_stall.rs`: for each queue entry
+whose `merge_group_heads` sha has no active run in the census, three reads
+(`actions/runs?head_sha=`, `commits/<sha>/check-runs`, `commits/<sha>/statuses`;
+a second page or a failed read makes it unread). `judge`: any run not
+completed is `Running`; required contexts absent (check run or status from the
+rule's app) are `Stalled` at once with `doomed` when a failed run produces one
+(normalized workflow name or file stem equals the context, or
+`[base_health.control_workflows]` names its file), else after
+`STALL_MINUTES` (30) since the last run completed. Rows get
+`merge_group_stalled:<contexts>`; report `merge_group_stalled.lines` carry
+`merge-group-stalled ...` (drain watch kind `merge_group_stalled`).
+`[merge_queue] dequeue_doomed_groups` (`EjectionGuards::dequeue_doomed_groups`,
+default dry-run with a merge queue, typo keeps dry-run in
+`dequeue_doomed_groups_error`): `decide` dequeues doomed entries only, after a
+GraphQL re-read binds PR head and group head, via `dequeue_under_guard`
+(audit `defect-fix`) under the PR mutation guard, then one comment; ledger
+`doomed_dequeues` (`repo#pr@group`) makes it once per group head, failed
+outcomes retry, `retry_comments` reposts a failed comment.
+`defect_fix_removals.rs`: reads `$XDG_STATE_HOME/shipyard/queue-removals.jsonl`
+(the ghapp queue-removal guard's ledger; `targets[{repo,pr,head}]`) once per
+pass into `StallPass.defect_fix`; a `defect-fix` removal of the exact head
+refuses `mutate_pr_with_recovery` for `ArmMergeQueue` (census head before any
+read, live head after revalidation) and drops the row from the native-arm
+backstop's reports; rows read `defect_fix_removed:<reason>`, actor repair.
+Missing file = no record; unreadable = honour `StewardLedger.removal_ledger`
+(last good read) and, within `FRESH_ERROR_MINUTES` (30) of it, hold a head
+whose latest queue removal is after that read (`defect_fix_ledger_unjudged`,
+one queue-state read). The doomed-group dequeue appends its own line.
 `src/app/merge_steward_cmd/poison_pause.rs` adds a queue pause behind its
 own key, `[base_health] merge_group_pause` (default `dry-run`: reports
 `would_pause` and removes nothing; it removes entries only when it and the

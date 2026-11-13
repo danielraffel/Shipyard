@@ -370,6 +370,7 @@ fn run_poisoned(
             &mut ledger,
             fixture.apply.then_some(&control),
             poison,
+            None,
         );
     Outcome {
         unhealthy,
