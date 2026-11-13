@@ -3,11 +3,14 @@
 //!
 //! After every row is classified, a row whose token says a required check is
 //! red or never ran is re-read as `stale_merge_ref:<contexts>` when the
-//! newest required run at its head is older than the base's movement allows
-//! and the approval gate approves that exact head. Nothing is read unless
-//! such a row exists: one base-config read (the pass cache answers it), one
-//! page of base commits, and one gate read per stale candidate. A failed read
-//! leaves the row as it was.
+//! newest required run at its head is older than the base's movement allows,
+//! every one of those contexts is green on the base tip (the same checks
+//! pass on the base, so the red is the ref's, not the change's), and the
+//! approval gate approves that exact head. Nothing is read unless such a row
+//! exists: one base-config read (the pass cache answers it), one page of base
+//! commits, one tip read per distinct red context (the read red-main triage
+//! makes, [`super::base_poison::read_tip`]) and one gate read per stale
+//! candidate. A failed read leaves the row as it was.
 //!
 //! The dwell pass then takes [`crate::merge_steward::dwell::ActKind::RetriggerStaleRef`]
 //! on it, by running this binary's own `shipyard advance OWNER/REPO#N
@@ -48,6 +51,25 @@ pub(super) fn annotate(
             .stale_merge_ref
     };
     let read_commits = |count: u32| base_commit_times(actions, observation, count);
+    let run_gh = |argv: &[String]| actions.run_gh(argv).map_err(|error| error.to_string());
+    let tip_green = |context: &str| {
+        let app_id = policy
+            .required_checks
+            .iter()
+            .find(|rule| rule.context.eq_ignore_ascii_case(context))
+            .and_then(|rule| rule.app_id);
+        let tip = super::base_poison::read_tip(
+            &run_gh,
+            &observation.repo,
+            &observation.base,
+            context,
+            app_id,
+        );
+        match tip.error {
+            Some(error) => Err(error),
+            None => Ok(!tip.red && tip.sha.is_some()),
+        }
+    };
     let approves = |pr: &ObservedPr| {
         matches!(
             super::pr_mutations::read_head_gate_for_report(actions, observation, pr, ledger),
@@ -60,6 +82,7 @@ pub(super) fn annotate(
         reports,
         &read_policy,
         &read_commits,
+        &tip_green,
         &approves,
     );
 }
@@ -71,8 +94,18 @@ pub(super) fn annotate_with(
     reports: &mut [PrReport],
     read_policy: &dyn Fn() -> StaleRefPolicy,
     read_commits: &dyn Fn(u32) -> Result<Vec<DateTime<Utc>>, String>,
+    tip_green: &dyn Fn(&str) -> Result<bool, String>,
     approves: &dyn Fn(&ObservedPr) -> bool,
 ) {
+    // One tip read per context per pass, whatever number of rows name it.
+    let mut tip_cache: std::collections::BTreeMap<String, Result<bool, String>> =
+        std::collections::BTreeMap::new();
+    let mut tip = |context: &str| {
+        tip_cache
+            .entry(context.to_owned())
+            .or_insert_with(|| tip_green(context))
+            .clone()
+    };
     let candidates: Vec<(usize, String, DateTime<Utc>)> = reports
         .iter()
         .enumerate()
@@ -98,6 +131,9 @@ pub(super) fn annotate_with(
         let Some(staleness) = stale_merge_ref::judge(stale_policy, runs_at, &commits) else {
             continue;
         };
+        if !stale_merge_ref::all_green_on_tip(&contexts, &mut tip) {
+            continue;
+        }
         let report = &mut reports[index];
         let Some(pr) = find(observation, report) else {
             continue;
@@ -128,8 +164,9 @@ fn rewrite(
     let blocked = &mut report.blocked;
     blocked.blocked_on = stale_merge_ref::token(contexts);
     blocked.blocked_detail = Some(format!(
-        "approved; the newest required run at this head is from {}, and {} has moved on {} \
-         day(s) and at least {} commit(s) since, so the merge ref those checks ran on is stale",
+        "approved; the newest required run at this head is from {}, {} has moved on {} \
+         day(s) and at least {} commit(s) since, and the same checks pass on its tip, so the \
+         merge ref those checks ran on is stale",
         staleness
             .runs_at
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),

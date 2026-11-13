@@ -39,7 +39,7 @@ fn the_policy_defaults_and_reads_the_base_config() {
     assert_eq!(
         StaleRefPolicy::default(),
         StaleRefPolicy {
-            max_lag_days: 3,
+            max_lag_days: 0,
             max_base_commits: 30
         }
     );
@@ -71,23 +71,31 @@ fn the_policy_defaults_and_reads_the_base_config() {
 }
 
 #[test]
-fn a_base_that_moved_on_for_days_makes_the_ref_stale() {
+fn lagging_the_base_alone_is_not_stale_by_default() {
     let runs = at("2026-11-04T12:00:00Z");
-    let stale = judge(
-        StaleRefPolicy::default(),
-        runs,
-        &commits("2026-11-13T12:00:00Z", 5),
-    )
-    .expect("stale");
-    assert_eq!(stale.lag_days, 9);
-    assert_eq!(stale.base_commits_since, 5);
     assert!(
         judge(
             StaleRefPolicy::default(),
             runs,
-            &commits("2026-11-06T12:00:00Z", 5)
+            &commits("2026-11-13T12:00:00Z", 5)
         )
         .is_none(),
+        "nine days behind with five commits: the merge queue's to test, not stale"
+    );
+}
+
+#[test]
+fn a_base_that_moved_on_for_days_is_stale_when_the_lag_criterion_is_on() {
+    let lag = StaleRefPolicy {
+        max_lag_days: 3,
+        max_base_commits: 30,
+    };
+    let runs = at("2026-11-04T12:00:00Z");
+    let stale = judge(lag, runs, &commits("2026-11-13T12:00:00Z", 5)).expect("stale");
+    assert_eq!(stale.lag_days, 9);
+    assert_eq!(stale.base_commits_since, 5);
+    assert!(
+        judge(lag, runs, &commits("2026-11-06T12:00:00Z", 5)).is_none(),
         "two days and five commits is within both limits"
     );
 }
@@ -209,4 +217,30 @@ fn an_advance_run_is_read_by_its_exit_and_envelope() {
             "{exit:?} {stdout}"
         );
     }
+}
+
+#[test]
+fn a_ref_is_stale_only_when_every_red_context_is_green_on_the_tip() {
+    let tip = |green: &'static [&'static str], unread: &'static [&'static str]| {
+        move |context: &str| {
+            if unread.contains(&context) {
+                Err("HTTP 502".to_owned())
+            } else {
+                Ok(green.contains(&context))
+            }
+        }
+    };
+    assert!(all_green_on_tip(
+        "macos,linux",
+        &mut tip(&["macos", "linux"], &[])
+    ));
+    assert!(
+        !all_green_on_tip("macos,linux", &mut tip(&["macos"], &[])),
+        "linux is red on the base too: a real failure, not a stale ref"
+    );
+    assert!(
+        !all_green_on_tip("macos", &mut tip(&["macos"], &["macos"])),
+        "an unread tip is not green"
+    );
+    assert!(!all_green_on_tip("", &mut tip(&[], &[])));
 }

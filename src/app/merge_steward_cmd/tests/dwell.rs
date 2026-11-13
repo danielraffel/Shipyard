@@ -1016,11 +1016,29 @@ mod stale_annotate {
         observation
     }
 
+    /// The lag criterion on, as a base that wants it sets it.
+    fn lagging() -> StaleRefPolicy {
+        StaleRefPolicy {
+            max_lag_days: 3,
+            max_base_commits: 30,
+        }
+    }
+
     fn run(
         reports: &mut [PrReport],
         base: &Result<Vec<DateTime<Utc>>, String>,
         approved: bool,
         stale: StaleRefPolicy,
+    ) {
+        run_tip(reports, base, approved, stale, &|_| Ok(true));
+    }
+
+    fn run_tip(
+        reports: &mut [PrReport],
+        base: &Result<Vec<DateTime<Utc>>, String>,
+        approved: bool,
+        stale: StaleRefPolicy,
+        tip: &dyn Fn(&str) -> Result<bool, String>,
     ) {
         let observation = observation(vec![pr(1, Some("FAILURE"), Some("SUCCESS"), &[])]);
         annotate_with(
@@ -1029,6 +1047,7 @@ mod stale_annotate {
             reports,
             &|| stale,
             &|_| base.clone(),
+            tip,
             &|_| approved,
         );
     }
@@ -1041,7 +1060,7 @@ mod stale_annotate {
             &mut reports,
             &Ok(commits("2026-11-13T12:00:00Z", 5)),
             true,
-            StaleRefPolicy::default(),
+            lagging(),
         );
         let blocked = &reports[0].blocked;
         assert_eq!(blocked.blocked_on, "stale_merge_ref:macos");
@@ -1058,17 +1077,15 @@ mod stale_annotate {
     #[test]
     fn an_unapproved_fresh_or_unread_row_keeps_its_token() {
         for (base, approved, stale) in [
+            (Ok(commits("2026-11-13T12:00:00Z", 5)), false, lagging()),
+            (Ok(commits("2026-11-09T12:00:00Z", 5)), true, lagging()),
+            (Err("HTTP 502".to_owned()), true, lagging()),
+            // Nine days behind, five commits: lag alone is off by default.
             (
                 Ok(commits("2026-11-13T12:00:00Z", 5)),
-                false,
-                StaleRefPolicy::default(),
-            ),
-            (
-                Ok(commits("2026-11-09T12:00:00Z", 5)),
                 true,
                 StaleRefPolicy::default(),
             ),
-            (Err("HTTP 502".to_owned()), true, StaleRefPolicy::default()),
             (
                 Ok(commits("2026-11-13T12:00:00Z", 5)),
                 true,
@@ -1097,9 +1114,79 @@ mod stale_annotate {
             &mut reports,
             &|| panic!("no candidate, no config read"),
             &|_| panic!("no candidate, no commit read"),
+            &|_| panic!("no candidate, no tip read"),
             &|_| panic!("no candidate, no gate read"),
         );
         assert_eq!(reports[0].blocked.blocked_on, "no_verdict");
+    }
+
+    #[test]
+    fn a_red_row_whose_checks_also_fail_on_the_base_tip_is_not_stale() {
+        // 40 hourly commits since the run: stale by count, but the tip is red
+        // too (or unread), so the red is the change's, not the ref's.
+        let red: &dyn Fn(&str) -> Result<bool, String> = &|_| Ok(false);
+        let unread: &dyn Fn(&str) -> Result<bool, String> = &|_| Err("HTTP 502".to_owned());
+        for tip in [red, unread] {
+            let mut reports = vec![report(1, "required_failed:macos", Some(60))];
+            run_tip(
+                &mut reports,
+                &Ok(commits("2026-11-11T00:00:00Z", 40)),
+                true,
+                StaleRefPolicy::default(),
+                tip,
+            );
+            assert_eq!(reports[0].blocked.blocked_on, "required_failed:macos");
+        }
+        let mut reports = vec![report(1, "required_failed:macos", Some(60))];
+        run_tip(
+            &mut reports,
+            &Ok(commits("2026-11-11T00:00:00Z", 40)),
+            true,
+            StaleRefPolicy::default(),
+            &|_| Ok(true),
+        );
+        assert_eq!(
+            reports[0].blocked.blocked_on, "stale_merge_ref:macos",
+            "stale by base commits and green on the tip"
+        );
+    }
+
+    #[test]
+    fn a_dirty_pull_request_is_never_named_stale_or_retriggered() {
+        let observation = observation(vec![pr(1, Some("FAILURE"), Some("SUCCESS"), &[])]);
+        let mut reports = vec![report(1, "merge_state:DIRTY", Some(60 * 24 * 9))];
+        annotate_with(
+            &observation,
+            &policy(),
+            &mut reports,
+            &|| panic!("a DIRTY row is never a candidate"),
+            &|_| panic!("a DIRTY row is never a candidate"),
+            &|_| panic!("a DIRTY row is never a candidate"),
+            &|_| panic!("a DIRTY row is never a candidate"),
+        );
+        assert_eq!(reports[0].blocked.blocked_on, "merge_state:DIRTY");
+        // However long it sits, the dwell pass takes no act on it.
+        let temp = tempfile::tempdir().unwrap();
+        let mut pass = pass(
+            &temp,
+            vec![pr(1, Some("FAILURE"), Some("SUCCESS"), &[])],
+            reports,
+        );
+        let mut ledger = established();
+        let acts = FakeActs::default();
+        for days in [0, 1, 3, 9] {
+            pass.now = now() + chrono::Duration::days(days);
+            let report = pass.run(&mut ledger, &acts);
+            assert!(
+                report
+                    .overdue
+                    .iter()
+                    .all(|row| matches!(row.act, Disposition::NoAct)),
+                "{:?}",
+                report.overdue
+            );
+        }
+        assert!(acts.calls.borrow().is_empty(), "{:?}", acts.calls.borrow());
     }
 
     #[test]

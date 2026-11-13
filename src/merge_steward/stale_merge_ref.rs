@@ -12,10 +12,16 @@
 //! ([`super::dwell::ActKind::RetriggerStaleRef`]).
 //!
 //! The newest required run at the head dates the merge ref: it ran on the
-//! ref that existed then. A ref is stale when the base has moved on by more
-//! than [`StaleRefPolicy::max_lag_days`] since that run, or has taken at
-//! least [`StaleRefPolicy::max_base_commits`] commits since it. Either limit
-//! set to 0 turns that criterion off.
+//! ref that existed then. A ref is stale when the base has taken at least
+//! [`StaleRefPolicy::max_base_commits`] commits since that run, or (off by
+//! default) has moved on by more than [`StaleRefPolicy::max_lag_days`].
+//! Either limit set to 0 turns that criterion off. Age alone is not enough:
+//! a pull request that only lags its base is the merge queue's to test on
+//! top of it, so the lag criterion is off unless a base turns it on.
+//!
+//! Staleness alone does not tell a stale ref from a real failure that is
+//! simply old, so the steward also requires every red context to be green
+//! on the base tip ([`all_green_on_tip`]) before it names the ref stale.
 //!
 //! Pure: no reads, no clock.
 
@@ -28,8 +34,9 @@ use super::{RequiredCheck, StewardCheck, selected_required_check};
 pub const TOKEN: &str = "stale_merge_ref";
 /// `[auto_merge.stale_merge_ref]` in the base branch's `.shipyard/config.toml`.
 pub const CONFIG_TABLE: &str = "stale_merge_ref";
-/// Default: days the base may move on past the newest required run.
-pub const DEFAULT_MAX_LAG_DAYS: u32 = 3;
+/// Default: days the base may move on past the newest required run. Off:
+/// lagging the base is not by itself a reason to retrigger.
+pub const DEFAULT_MAX_LAG_DAYS: u32 = 0;
 /// Default: commits the base may take after the newest required run.
 pub const DEFAULT_MAX_BASE_COMMITS: u32 = 30;
 /// The most base commits one read lists (one page).
@@ -160,6 +167,25 @@ pub fn judge(
         lag_days: lag.num_days(),
         base_commits_since: since,
     })
+}
+
+/// Whether every context in `contexts` (comma-joined, as a token carries
+/// them) reads green on the base tip, by `tip_green`. A context it could
+/// not read, or one with no completed run on the tip, is not green: a red
+/// pull request is called stale only when the same checks pass on the base.
+#[must_use]
+pub fn all_green_on_tip(
+    contexts: &str,
+    tip_green: &mut dyn FnMut(&str) -> Result<bool, String>,
+) -> bool {
+    contexts
+        .split(',')
+        .map(str::trim)
+        .filter(|context| !context.is_empty())
+        .all(|context| tip_green(context).unwrap_or(false))
+        && contexts
+            .split(',')
+            .any(|context| !context.trim().is_empty())
 }
 
 /// What one `shipyard advance --retrigger --json` run came to.

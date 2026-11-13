@@ -398,7 +398,7 @@ close anything. See [superseded-close.md](superseded-close.md).
 | `owner_decision` | Labelled `owner-decision` | owner |
 | `excluded_label:<label>` | `superseded`, `PARKED/<platform>` or the opt-out label | whoever owns the label |
 | `provenance_blocked:<labels>` | A provenance-blocking label | owner |
-| `stale_merge_ref:<contexts>` | Approved (the gate approves this exact head), and the red or never-run required contexts ran on a stale merge ref: the newest required run at the head is older than `[auto_merge.stale_merge_ref]` allows (the base moved on more than `max_lag_days`, default 3, or took at least `max_base_commits`, default 30, commits since). `since` is that run; `blocked_detail` gives the lag. See [Stale merge refs](#stale-merge-refs) | steward: retriggers it through `shipyard advance --retrigger` |
+| `stale_merge_ref:<contexts>` | Approved (the gate approves this exact head), and the red or never-run required contexts ran on a stale merge ref: the base took at least `max_base_commits` (default 30) commits since the newest required run at the head, and every one of those contexts is green on the base tip. `since` is that run; `blocked_detail` gives the lag. See [Stale merge refs](#stale-merge-refs) | steward: retriggers it through `shipyard advance --retrigger` |
 | `required_never_ran:<contexts>` | A required context has no run on this head and nothing from its source is still queued or running (often a renamed check: merge the base to re-run CI) | repair lane |
 | `required_pending` | Required checks are queued or running, or have not appeared yet behind a running job, and none has failed. A `pending` `review-verdict` status (head awaiting its reviewer) also reads here, with the reviewer as actor, never as `required_failed` | CI, or the reviewer |
 | `capacity_queued` | Every pending required check is a check run still queued for a runner, and none has started. The pull request is not blocked: `next_action` is `ci` with `stop: false` and says to take other work. Dwell limits treat it like `required_pending`. |
@@ -692,20 +692,27 @@ into the base as it stood when the ref was built. Nothing rebuilds that ref
 without a push or a reopen, so an approved pull request whose required checks
 went red against an old base stays red however far the base moves on. After
 every row has its token, the steward re-reads a `required_failed` or
-`required_never_ran` row as `stale_merge_ref:<contexts>` when the newest
-required run at its head is too old for the base, and the approval gate
-approves that exact head:
+`required_never_ran` row as `stale_merge_ref:<contexts>` when all three hold:
+
+- the newest required run at its head is too old for the base;
+- every one of those contexts is green on the base tip, so the same checks
+  pass on the base and the red belongs to the ref, not the change (a context
+  red, unread or never run on the tip leaves the row alone);
+- the approval gate approves that exact head.
 
 ```toml
 [auto_merge.stale_merge_ref]
-max_lag_days = 3        # the base's tip is this many days past the newest required run
-max_base_commits = 30   # or the base took this many commits since it (one page, at most 100)
+max_base_commits = 30   # the base took this many commits since the newest required run (one page, at most 100)
+max_lag_days = 0        # off by default: lagging the base alone is the merge queue's to test, not a reason to retrigger
 ```
 
-Either set to `0` turns that criterion off; both `0` turns detection off. It
-costs nothing unless a red row exists: then one base-config read (the pass
-cache answers it), one page of base commits and one gate read per stale
-candidate. A failed read leaves the row's token as it was.
+Either set to `0` turns that criterion off; both `0` turns detection off. A
+plain BEHIND pull request never reads this token (it is not red), and a DIRTY
+one never does either (`merge_state:DIRTY` has no act). It costs nothing
+unless a red row exists: then one base-config read (the pass cache answers
+it), one page of base commits, one tip read per distinct red context (the
+read red-main triage makes) and one gate read per stale candidate. A failed
+read leaves the row's token as it was.
 
 The dwell pass then retriggers it (`stale_merge_ref` above) through `shipyard
 advance --retrigger`, which closes and reopens the pull request after its own
