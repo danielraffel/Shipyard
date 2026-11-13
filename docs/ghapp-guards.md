@@ -51,7 +51,7 @@ its binary and needs only step 1.
 | `branch-refresh-guard` | `scripts/ghapp_branch_refresh_guard.py` | `pr update-branch`, REST `pulls/<n>/update-branch`, `updatePullRequestBranch`, only when the base's `[merge] refresh_branch` policy is `"only-if-conflicting"` and the refresh is provably pointless (below) |
 | `merge-guard` | `scripts/ghapp_merge_guard.sh` | `pr merge` on a repository listed in `~/.config/shipyard/merge-guard.json` (one that cannot enforce required checks server-side) until every listed check reads `pass`, and `--auto` there outright; inert for unlisted repositories and when that file is missing or malformed |
 | `verdict-hold-hook` | `scripts/ghapp_verdict_hold_hook.py` | nothing: before a HOLD verdict posts, it dequeues or disarms that pull request when it is queued or armed at exactly the HOLD's head ([A HOLD takes its head out of the landing path](#a-hold-takes-its-head-out-of-the-landing-path)) |
-| `verdict-session-stamp` | `scripts/ghapp_verdict_session_stamp.py` | nothing: it adds a `<!-- session: <host>/<session> -->` stamp to a verdict comment before it posts, so the arm guard can tell who approved ([An agent cannot approve its own landing](#review-before-arm-or-merge)) |
+| `verdict-session-stamp` | `scripts/ghapp_verdict_session_stamp.py` | nothing: it adds a `<!-- session: <host>/<session> -->` stamp to a verdict comment, or to an adversary's ruling comment (`adversarial-ruling: OK|FIX-FIRST|BLOCK head:<sha>`, which no guard counts as a verdict), before it posts, so the arm guard can tell who approved and must-review who ruled ([An agent cannot approve its own landing](#review-before-arm-or-merge)) |
 | `reviewer-claim-guard` | `scripts/ghapp_reviewer_claim_guard.py` | a verdict when the protected base enables reviewer-claim receipts and the posting reviewer has no current exact-head claim |
 | `verdict-contradiction-guard` | `scripts/ghapp_verdict_contradiction_guard.py` | an APPROVE of a head a counting HOLD already names (from any signer), and a verdict that contradicts the same session's opposite verdict on that head within ten minutes ([A held head is not approvable](#a-held-head-is-not-approvable)) |
 
@@ -316,8 +316,8 @@ the base config says and on any Python.
 
 **An agent cannot approve its own landing.** `verdict-session-stamp` (run by
 `ghapp` before native `gh`; `ghapp` waits up to 30 seconds for its answer,
-and refuses a verdict it did not answer for, "verdict NOT posted, retry",
-rather than post it unstamped) adds
+and refuses a verdict it did not answer for, "verdict or ruling NOT posted,
+retry", rather than post it unstamped) adds
 `<!-- session: <host>/<session> agent: <id> -->` above the marker line of a
 verdict comment, posted with `--body`, `--body-file <file>`, an `api`
 `body=` field (a typed `-F body=@<file>` is read), or `--input`; `ghapp`
@@ -326,7 +326,23 @@ first spools a body read from stdin (`--body-file -`, `--input -`,
 verdict is the arm guard's own `marker_verdict`, loaded from the installed
 `queue-arm-guard`, so a body ending in `\r\n`, a lone `\r` or U+2028 is a
 verdict to the stamper exactly when it is to the guards (`head_approval`
-splits lines the same way). Every stamp already in any comment body, verdict
+splits lines the same way).
+
+**An adversary's ruling is stamped the same way and is never a verdict.** The
+fleet's adversarial reviewer posts `Adversarial review: OK|FIX-FIRST|BLOCK
+head <sha>` comments; the handbook's `must-review` closes a finding on an OK
+only when it can trust who ruled, which needs the stamp, and a ruling carries
+no `verdict:` line. So the stamper also stamps a comment whose last non-blank
+line is exactly `adversarial-ruling: OK|FIX-FIRST|BLOCK head:<sha>` (the
+ruling in capitals, a lowercase 40-hex sha, read by the arm guard's own
+`marker_ruling`, loaded like `marker_verdict`), and `ghapp` refuses a ruling
+the stamper did not answer for just as it refuses such a verdict. That marker
+is a verdict to nothing: `marker_verdict` (this guard, the review-verdict
+status, `head_approval`), the hold hook, the contradiction guard and the
+reviewer-claim guard all read `verdict:` / `reviewed:` lines only, so a
+stamped ruling can neither approve nor hold a head
+(`AdversarialRulingIsNoVerdict` and `an_adversarial_ruling_is_never_a_verdict`
+prove it on both twins). Every stamp already in any comment body, verdict
 or not, whether written by hand or copied with the rest of a verdict, is
 removed, repeatedly until none is left, since one pass can join the pieces
 around a removed stamp into a new one; only a verdict then gets this

@@ -1844,9 +1844,10 @@ print("stamp" if re.search(r"!--[^>]*session", text, re.IGNORECASE) else "clean"
     return 0
 }
 
-# A verdict marker anywhere in a body: the guards read the last line, but a
-# request the stamper did not vouch for is judged on any line.
-ghapp_verdict_pattern='(verdict:[[:space:]]*(APPROVE|HOLD)[[:space:]]+head:[[:space:]]*[0-9a-fA-F]{40}|reviewed:[[:space:]]*[0-9a-fA-F]{40})'
+# A verdict marker anywhere in a body, or an adversary's ruling marker
+# (stamped the same way, counted by no guard): the guards read the last line,
+# but a request the stamper did not vouch for is judged on any line.
+ghapp_verdict_pattern='(verdict:[[:space:]]*(APPROVE|HOLD)[[:space:]]+head:[[:space:]]*[0-9a-fA-F]{40}|reviewed:[[:space:]]*[0-9a-fA-F]{40}|adversarial-ruling:[[:space:]]*(OK|FIX-FIRST|BLOCK)[[:space:]]+head:[[:space:]]*[0-9a-fA-F]{40})'
 
 # ghapp_stamp_text_refusal MODE OWN ARGS...: prints why ARGS cannot be sent
 # and returns 1. MODE `stamp`: ARGS, or a file they name, carry stamp text
@@ -1992,7 +1993,7 @@ if [[ "$ghapp_stamp_check" == 1 ]]; then
         [[ -z "$ghapp_stdin_file" ]] || /bin/rm -f -- "$ghapp_stdin_file"
         echo "ghapp: refused: the verdict stamper did not answer within" \
             "${ghapp_stamp_deadline}s (timed out or failed) and $ghapp_stamp_reason;" \
-            "verdict NOT posted, retry." >&2
+            "verdict or ruling NOT posted, retry." >&2
         exit 1
     fi
     if ! ghapp_stamp_reason="$(ghapp_stamp_text_refusal stamp "$ghapp_own_stamp" "$@")"; then
