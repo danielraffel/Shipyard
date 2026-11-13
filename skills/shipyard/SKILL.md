@@ -67,17 +67,16 @@ reference: `docs/automated-draining.md`, "Dwell-time limits".
 
 ## Stale merge refs: `stale_merge_ref`
 
-An approved pull request whose required checks ran on a merge ref the base
-has long moved past reads `stale_merge_ref:<contexts>` (actor `steward`): the
-base took at least `[auto_merge.stale_merge_ref] max_base_commits` (default
-30) commits since the newest required run at the head, and the same contexts
-are green on the base tip (`max_lag_days` adds a pure age rule; off by
-default). Lagging alone, BEHIND or DIRTY never reads this token. Do not push
-to "refresh" it and do not close and reopen it by hand: the dwell pass runs
-`shipyard advance --retrigger` for it once per head, with every refusal that
-command applies. An act outcome `retrigger_blocked: guard` means pr-close-guard
-refused the close and nothing changed; it is retried only after a day, at most
-three times. Full reference: `docs/automated-draining.md`, "Stale merge refs".
+An approved pull request whose required checks went red on a test merge
+commit that no longer exists reads `stale_merge_ref:<contexts>` (actor
+`steward`): each red run is a `pull_request` run of the head whose tested base
+is not the base of the current `merge_commit_sha`, and the same contexts are
+green on the base tip. A red on the current merge ref never reads it, however
+old; BEHIND and DIRTY never do. Do not push to "refresh" it and do not close
+and reopen it by hand: the dwell pass runs `shipyard advance --retrigger` for
+it, at most once per head ever. An act outcome `retrigger_blocked: guard`
+means pr-close-guard refused the close and nothing changed. Full reference:
+`docs/automated-draining.md`, "Stale merge refs".
 
 ## Durable work-item contract
 

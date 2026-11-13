@@ -1,16 +1,23 @@
 //! Name a stale merge ref in the census, and retrigger it through
 //! `shipyard advance` ([`crate::merge_steward::stale_merge_ref`]).
 //!
-//! After every row is classified, a row whose token says a required check is
-//! red or never ran is re-read as `stale_merge_ref:<contexts>` when the
-//! newest required run at its head is older than the base's movement allows,
-//! every one of those contexts is green on the base tip (the same checks
-//! pass on the base, so the red is the ref's, not the change's), and the
-//! approval gate approves that exact head. Nothing is read unless such a row
-//! exists: one base-config read (the pass cache answers it), one page of base
-//! commits, one tip read per distinct red context (the read red-main triage
-//! makes, [`super::base_poison::read_tip`]) and one gate read per stale
-//! candidate. A failed read leaves the row as it was.
+//! After every row is classified, a `required_failed:<contexts>` row is
+//! re-read as `stale_merge_ref:<contexts>` only on evidence that the red was
+//! measured on a test merge commit that no longer exists: every red
+//! context's failing run is a `pull_request` run of this head whose tested
+//! base is not the base of the pull request's current `merge_commit_sha`.
+//! Then every one of those contexts must be green on the base tip (the read
+//! red-main triage makes, [`super::base_poison::read_tip`]) and the approval
+//! gate must approve the exact head. A red on the current merge ref is never
+//! stale, however old.
+//!
+//! Reads: for a red row with an Actions run behind each red context, one
+//! pull-request read, one commit read and one run read per red run, at most
+//! [`MAX_FRESH_PER_PASS`] pull requests per pass; the verdict is kept in the
+//! ledger ([`StaleMemo`]) so the same red is not read again (a "not stale"
+//! verdict is re-read after six hours, since GitHub may rebuild the ref).
+//! A stale verdict then costs one tip read per context and one gate read.
+//! A failed read leaves the row as it was.
 //!
 //! The dwell pass then takes [`crate::merge_steward::dwell::ActKind::RetriggerStaleRef`]
 //! on it, by running this binary's own `shipyard advance OWNER/REPO#N
@@ -18,6 +25,7 @@
 //! its writes go through `ghapp` and its guards, and it audits the act. The
 //! steward never closes a pull request itself.
 
+use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -29,7 +37,7 @@ use wait_timeout::ChildExt as _;
 use super::dwell_pass::ActOutcome;
 use super::{GitHubActions, ObservedPr, PrReport, RepoObservation, StewardLedger, StewardPolicy};
 use crate::merge_steward::stale_merge_ref::{
-    self, RetriggerResult, StaleRefPolicy, Staleness, candidate_contexts, newest_required_run,
+    self, MAX_FRESH_PER_PASS, RetriggerResult, StaleMemo, candidate_contexts, red_runs,
 };
 
 /// The agent id the steward's `advance` child carries, so `advance` can tell
@@ -38,19 +46,68 @@ pub(super) const STEWARD_AGENT_ID: &str = "shipyard-merge-steward";
 /// How long one `advance` run may take.
 const ADVANCE_TIMEOUT: Duration = Duration::from_mins(5);
 
+/// A read answering a sha, `None` when there is none to answer.
+type ShaRead = Result<Option<String>, String>;
+
+/// The reads [`annotate_with`] makes.
+pub(super) struct StaleReads<'a> {
+    /// The base of the pull request's current test merge commit, or `None`
+    /// when it has none at the observed head.
+    pub merge_base: &'a dyn Fn(&ObservedPr) -> ShaRead,
+    /// The base one run was tested on, or `None` when it is not a
+    /// `pull_request` run of this pull request at this head.
+    pub run_base: &'a dyn Fn(u64, &ObservedPr) -> ShaRead,
+    /// Whether a context is green on the base tip.
+    pub tip_green: &'a dyn Fn(&str) -> Result<bool, String>,
+    /// Whether the approval gate approves the exact head.
+    pub approves: &'a dyn Fn(&ObservedPr) -> bool,
+}
+
 /// Re-read stale rows of one pass. See the module documentation.
 pub(super) fn annotate(
     actions: &GitHubActions,
     observation: &RepoObservation,
     policy: &StewardPolicy,
-    ledger: &StewardLedger,
+    ledger: &mut StewardLedger,
     reports: &mut [PrReport],
 ) {
-    let read_policy = || {
-        super::dwell_pass::read_policy(actions, &observation.repo, &observation.base)
-            .stale_merge_ref
+    let key = super::dwell_pass::dwell_key(&observation.repo, &observation.base);
+    let mut memo = ledger
+        .dwell
+        .get_mut(&key)
+        .map(|state| std::mem::take(&mut state.stale_ref))
+        .unwrap_or_default();
+    let repo = observation.repo.as_str();
+    let json = |path: String| -> Result<Value, String> {
+        let raw = actions
+            .run_gh(&["api".to_owned(), path])
+            .map_err(|error| error.to_string())?;
+        serde_json::from_str(raw.trim()).map_err(|error| error.to_string())
     };
-    let read_commits = |count: u32| base_commit_times(actions, observation, count);
+    let merge_base = |pr: &ObservedPr| -> Result<Option<String>, String> {
+        let live = json(format!("repos/{repo}/pulls/{}", pr.fact.number))?;
+        let head = &pr.fact.head_sha;
+        if !live
+            .pointer("/head/sha")
+            .and_then(Value::as_str)
+            .is_some_and(|sha| sha.eq_ignore_ascii_case(head))
+        {
+            return Ok(None);
+        }
+        let Some(merge) = live.get("merge_commit_sha").and_then(Value::as_str) else {
+            return Ok(None);
+        };
+        let commit = json(format!("repos/{repo}/commits/{merge}"))?;
+        Ok(stale_merge_ref::merge_base_of(&commit, head))
+    };
+    let run_base = |run: u64, pr: &ObservedPr| -> Result<Option<String>, String> {
+        let value = json(format!("repos/{repo}/actions/runs/{run}"))?;
+        Ok(stale_merge_ref::run_tested_base(
+            &value,
+            pr.fact.number,
+            &pr.fact.head_sha,
+        ))
+    };
     let run_gh = |argv: &[String]| actions.run_gh(argv).map_err(|error| error.to_string());
     let tip_green = |context: &str| {
         let app_id = policy
@@ -70,79 +127,103 @@ pub(super) fn annotate(
             None => Ok(!tip.red && tip.sha.is_some()),
         }
     };
+    let gate_ledger: &StewardLedger = ledger;
     let approves = |pr: &ObservedPr| {
         matches!(
-            super::pr_mutations::read_head_gate_for_report(actions, observation, pr, ledger),
+            super::pr_mutations::read_head_gate_for_report(actions, observation, pr, gate_ledger),
             Ok((crate::head_approval::HeadGate::Approved { .. }, _, None))
         )
     };
     annotate_with(
         observation,
         policy,
+        &mut memo,
+        Utc::now(),
         reports,
-        &read_policy,
-        &read_commits,
-        &tip_green,
-        &approves,
+        &StaleReads {
+            merge_base: &merge_base,
+            run_base: &run_base,
+            tip_green: &tip_green,
+            approves: &approves,
+        },
     );
+    ledger.dwell.entry(key).or_default().stale_ref = memo;
 }
 
-/// [`annotate`] over injected reads.
+/// [`annotate`] over injected reads and an explicit memo and time.
 pub(super) fn annotate_with(
     observation: &RepoObservation,
     policy: &StewardPolicy,
+    memo: &mut BTreeMap<u64, StaleMemo>,
+    now: DateTime<Utc>,
     reports: &mut [PrReport],
-    read_policy: &dyn Fn() -> StaleRefPolicy,
-    read_commits: &dyn Fn(u32) -> Result<Vec<DateTime<Utc>>, String>,
-    tip_green: &dyn Fn(&str) -> Result<bool, String>,
-    approves: &dyn Fn(&ObservedPr) -> bool,
+    reads: &StaleReads<'_>,
 ) {
+    memo.retain(|number, _| observation.prs.iter().any(|pr| pr.fact.number == *number));
+    let mut fresh_left = MAX_FRESH_PER_PASS;
     // One tip read per context per pass, whatever number of rows name it.
-    let mut tip_cache: std::collections::BTreeMap<String, Result<bool, String>> =
-        std::collections::BTreeMap::new();
+    let mut tip_cache: BTreeMap<String, Result<bool, String>> = BTreeMap::new();
     let mut tip = |context: &str| {
         tip_cache
             .entry(context.to_owned())
-            .or_insert_with(|| tip_green(context))
+            .or_insert_with(|| (reads.tip_green)(context))
             .clone()
     };
-    let candidates: Vec<(usize, String, DateTime<Utc>)> = reports
-        .iter()
-        .enumerate()
-        .filter(|(_, report)| !super::pass_budget::is_deferred(report))
-        .filter_map(|(index, report)| {
-            let contexts = candidate_contexts(&report.blocked.blocked_on)?;
-            let pr = find(observation, report)?;
-            let runs_at = newest_required_run(&pr.fact.checks, &policy.required_checks)?;
-            Some((index, contexts.to_owned(), runs_at))
-        })
-        .collect();
-    if candidates.is_empty() {
-        return;
-    }
-    let stale_policy = read_policy();
-    if !stale_policy.enabled() {
-        return;
-    }
-    let Ok(commits) = read_commits(stale_policy.commits_to_read()) else {
-        return;
-    };
-    for (index, contexts, runs_at) in candidates {
-        let Some(staleness) = stale_merge_ref::judge(stale_policy, runs_at, &commits) else {
-            continue;
-        };
-        if !stale_merge_ref::all_green_on_tip(&contexts, &mut tip) {
+    for report in reports.iter_mut() {
+        if super::pass_budget::is_deferred(report) {
             continue;
         }
-        let report = &mut reports[index];
+        let Some(contexts) = candidate_contexts(&report.blocked.blocked_on).map(str::to_owned)
+        else {
+            continue;
+        };
         let Some(pr) = find(observation, report) else {
             continue;
         };
-        if !approves(pr) {
+        let Some(runs) = red_runs(&contexts, &pr.fact.checks, &policy.required_checks) else {
             continue;
+        };
+        let reused = memo
+            .get(&pr.fact.number)
+            .and_then(|memo| memo.reuse(&pr.fact.head_sha, &runs, now));
+        let stale = match reused {
+            Some(stale) => stale,
+            None if fresh_left == 0 => continue,
+            None => {
+                fresh_left -= 1;
+                let Some(stale) = judge_live(pr, &runs, reads) else {
+                    continue;
+                };
+                memo.insert(
+                    pr.fact.number,
+                    StaleMemo {
+                        head: pr.fact.head_sha.clone(),
+                        runs: runs.clone(),
+                        stale,
+                        at: now,
+                    },
+                );
+                stale
+            }
+        };
+        if stale && stale_merge_ref::all_green_on_tip(&contexts, &mut tip) && (reads.approves)(pr) {
+            rewrite(observation, policy, pr, report, &contexts);
         }
-        rewrite(observation, policy, pr, report, &contexts, staleness);
     }
+}
+
+/// Read whether `runs` were measured on a merge commit that no longer
+/// exists; `None` when a read failed (nothing is remembered then).
+fn judge_live(pr: &ObservedPr, runs: &[u64], reads: &StaleReads<'_>) -> Option<bool> {
+    let Some(current) = (reads.merge_base)(pr).ok()? else {
+        return Some(false);
+    };
+    let tested = runs
+        .iter()
+        .map(|run| (reads.run_base)(*run, pr))
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    Some(stale_merge_ref::measured_on_old_merge(&current, &tested))
 }
 
 fn find<'a>(observation: &'a RepoObservation, report: &PrReport) -> Option<&'a ObservedPr> {
@@ -159,27 +240,15 @@ fn rewrite(
     pr: &ObservedPr,
     report: &mut PrReport,
     contexts: &str,
-    staleness: Staleness,
 ) {
     let blocked = &mut report.blocked;
     blocked.blocked_on = stale_merge_ref::token(contexts);
     blocked.blocked_detail = Some(format!(
-        "approved; the newest required run at this head is from {}, {} has moved on {} \
-         day(s) and at least {} commit(s) since, and the same checks pass on its tip, so the \
-         merge ref those checks ran on is stale",
-        staleness
-            .runs_at
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-        observation.base,
-        staleness.lag_days,
-        staleness.base_commits_since
+        "approved; {contexts} went red on a test merge commit that no longer exists (the \
+         pull request's merge ref has since been rebuilt on a newer {}), and the same checks \
+         pass on its tip",
+        observation.base
     ));
-    blocked.since = Some(
-        staleness
-            .runs_at
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-    );
-    blocked.since_source = Some("required_run");
     blocked.next_action = Some(super::next_action::for_row(
         &super::next_action::RowContext {
             repo: &observation.repo,
@@ -190,43 +259,6 @@ fn rewrite(
         },
         blocked,
     ));
-}
-
-/// The base's commit times, newest first: one page of `count`.
-fn base_commit_times(
-    actions: &GitHubActions,
-    observation: &RepoObservation,
-    count: u32,
-) -> Result<Vec<DateTime<Utc>>, String> {
-    let raw = actions
-        .run_gh(&[
-            "api".to_owned(),
-            format!(
-                "repos/{}/commits?sha={}&per_page={count}",
-                observation.repo,
-                crate::required_check_policy::encode_path_segment(&observation.base)
-            ),
-        ])
-        .map_err(|error| error.to_string())?;
-    parse_commit_times(&raw)
-}
-
-/// Commit times from a `repos/<repo>/commits` page, refusing a malformed one.
-pub(super) fn parse_commit_times(raw: &str) -> Result<Vec<DateTime<Utc>>, String> {
-    let value: Value = serde_json::from_str(raw.trim()).map_err(|error| error.to_string())?;
-    value
-        .as_array()
-        .ok_or_else(|| "base commits were not an array".to_owned())?
-        .iter()
-        .map(|commit| {
-            commit
-                .pointer("/commit/committer/date")
-                .and_then(Value::as_str)
-                .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
-                .map(|at| at.with_timezone(&Utc))
-                .ok_or_else(|| "a base commit has no readable committer date".to_owned())
-        })
-        .collect()
 }
 
 /// Run `shipyard advance OWNER/REPO#N --retrigger --head <sha> --json` with

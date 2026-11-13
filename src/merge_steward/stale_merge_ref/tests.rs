@@ -1,20 +1,21 @@
+use chrono::{DateTime, Duration, Utc};
+use serde_json::json;
+
 use super::*;
 
-fn at(text: &str) -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339(text)
-        .expect("time")
-        .with_timezone(&Utc)
-}
+const HEAD: &str = "1111111111111111111111111111111111111111";
+const OLD_BASE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const NEW_BASE: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
-fn check(name: &str, observed_at: &str) -> StewardCheck {
+fn check(name: &str, conclusion: &str, run: Option<u64>) -> StewardCheck {
     StewardCheck {
         name: name.to_owned(),
         source: super::super::StewardCheckSource::CheckRun,
         app_id: None,
         status: "COMPLETED".to_owned(),
-        conclusion: Some("FAILURE".to_owned()),
-        run_id: None,
-        observed_at: Some(observed_at.to_owned()),
+        conclusion: Some(conclusion.to_owned()),
+        run_id: run,
+        observed_at: Some("2026-11-04T12:00:00Z".to_owned()),
         check_id: Some(1),
         description: None,
     }
@@ -27,141 +28,24 @@ fn rule(name: &str) -> RequiredCheck {
     }
 }
 
-/// Base commit times, newest first: one per hour back from `tip`.
-fn commits(tip: &str, count: i64) -> Vec<DateTime<Utc>> {
-    (0..count)
-        .map(|hour| at(tip) - Duration::hours(hour))
-        .collect()
+fn run(event: &str, number: u64, head: &str, base: &str) -> Value {
+    json!({"event": event, "pull_requests": [
+        {"number": number, "head": {"sha": head}, "base": {"sha": base}}]})
 }
 
 #[test]
-fn the_policy_defaults_and_reads_the_base_config() {
-    assert_eq!(
-        StaleRefPolicy::default(),
-        StaleRefPolicy {
-            max_lag_days: 0,
-            max_base_commits: 30
-        }
-    );
-    let table: toml::Table =
-        "[auto_merge.stale_merge_ref]\nmax_lag_days = 7\nmax_base_commits = 0\n"
-            .parse()
-            .expect("toml");
-    let policy = StaleRefPolicy::from_table(&table);
-    assert_eq!(policy.max_lag_days, 7);
-    assert_eq!(policy.max_base_commits, 0);
-    assert!(policy.enabled());
-    assert_eq!(policy.commits_to_read(), 1, "the tip is always read");
-    let off: toml::Table = "[auto_merge.stale_merge_ref]\nmax_lag_days = 0\nmax_base_commits = 0\n"
-        .parse()
-        .expect("toml");
-    assert!(!StaleRefPolicy::from_table(&off).enabled());
-    let mistyped: toml::Table = "[auto_merge.stale_merge_ref]\nmax_lag_days = \"x\"\n"
-        .parse()
-        .expect("toml");
-    assert_eq!(
-        StaleRefPolicy::from_table(&mistyped),
-        StaleRefPolicy::default()
-    );
-    let big = StaleRefPolicy {
-        max_lag_days: 0,
-        max_base_commits: 500,
-    };
-    assert_eq!(big.commits_to_read(), BASE_COMMITS_PAGE);
-}
-
-#[test]
-fn lagging_the_base_alone_is_not_stale_by_default() {
-    let runs = at("2026-11-04T12:00:00Z");
-    assert!(
-        judge(
-            StaleRefPolicy::default(),
-            runs,
-            &commits("2026-11-13T12:00:00Z", 5)
-        )
-        .is_none(),
-        "nine days behind with five commits: the merge queue's to test, not stale"
-    );
-}
-
-#[test]
-fn a_base_that_moved_on_for_days_is_stale_when_the_lag_criterion_is_on() {
-    let lag = StaleRefPolicy {
-        max_lag_days: 3,
-        max_base_commits: 30,
-    };
-    let runs = at("2026-11-04T12:00:00Z");
-    let stale = judge(lag, runs, &commits("2026-11-13T12:00:00Z", 5)).expect("stale");
-    assert_eq!(stale.lag_days, 9);
-    assert_eq!(stale.base_commits_since, 5);
-    assert!(
-        judge(lag, runs, &commits("2026-11-06T12:00:00Z", 5)).is_none(),
-        "two days and five commits is within both limits"
-    );
-}
-
-#[test]
-fn enough_base_commits_make_the_ref_stale_within_a_day() {
-    let runs = at("2026-11-13T00:00:00Z");
-    // Hourly commits from 06:00 the next day back: 30 land after the run.
-    let stale = judge(
-        StaleRefPolicy::default(),
-        runs,
-        &commits("2026-11-14T06:00:00Z", 40),
-    )
-    .expect("stale");
-    assert_eq!(stale.base_commits_since, 30);
-    assert_eq!(stale.lag_days, 1);
-    // 23 commits after the run, under a day: within both limits.
-    assert!(
-        judge(
-            StaleRefPolicy::default(),
-            runs,
-            &commits("2026-11-13T23:00:00Z", 40)
-        )
-        .is_none()
-    );
-    let lag_only = StaleRefPolicy {
-        max_lag_days: 3,
-        max_base_commits: 0,
-    };
-    assert!(judge(lag_only, runs, &commits("2026-11-14T06:00:00Z", 40)).is_none());
-}
-
-#[test]
-fn nothing_is_judged_without_base_commits_or_required_runs() {
-    assert!(judge(StaleRefPolicy::default(), at("2026-11-01T00:00:00Z"), &[]).is_none());
-    assert!(
-        newest_required_run(&[check("lint", "2026-11-01T00:00:00Z")], &[rule("macos")]).is_none()
-    );
-    assert_eq!(
-        newest_required_run(
-            &[
-                check("macos", "2026-11-01T00:00:00Z"),
-                check("linux", "2026-11-02T00:00:00Z"),
-                check("lint", "2026-11-09T00:00:00Z"),
-            ],
-            &[rule("macos"), rule("linux")]
-        ),
-        Some(at("2026-11-02T00:00:00Z")),
-        "the newest required run; checks that are not required are ignored"
-    );
-}
-
-#[test]
-fn only_red_and_never_ran_tokens_are_candidates() {
+fn only_a_red_token_is_a_candidate() {
     assert_eq!(
         candidate_contexts("required_failed:macos,linux"),
         Some("macos,linux")
     );
-    assert_eq!(
-        candidate_contexts("required_never_ran:macos"),
-        Some("macos")
-    );
     for token in [
+        "required_never_ran:macos",
         "required_pending",
         "required_failed:",
         "ready",
+        "merge_state:DIRTY",
+        "merge_state:BEHIND",
         "held:review-verdict",
     ] {
         assert_eq!(candidate_contexts(token), None, "{token}");
@@ -170,11 +54,132 @@ fn only_red_and_never_ran_tokens_are_candidates() {
 }
 
 #[test]
+fn every_red_context_needs_its_actions_run() {
+    let required = [rule("macos"), rule("linux")];
+    let checks = [
+        check("macos", "FAILURE", Some(10)),
+        check("linux", "FAILURE", Some(11)),
+    ];
+    assert_eq!(
+        red_runs("macos,linux", &checks, &required),
+        Some(vec![10, 11])
+    );
+    let no_run = [check("macos", "FAILURE", None)];
+    assert_eq!(
+        red_runs("macos", &no_run, &required),
+        None,
+        "not an Actions run"
+    );
+    let green = [check("macos", "SUCCESS", Some(10))];
+    assert_eq!(red_runs("macos", &green, &required), None);
+    assert_eq!(red_runs("lint", &checks, &required), None, "not required");
+}
+
+#[test]
+fn the_current_merge_refs_base_is_its_first_parent_over_the_head() {
+    let commit = json!({"parents": [{"sha": NEW_BASE}, {"sha": HEAD}]});
+    assert_eq!(merge_base_of(&commit, HEAD).as_deref(), Some(NEW_BASE));
+    assert_eq!(
+        merge_base_of(&commit, OLD_BASE),
+        None,
+        "built on another head"
+    );
+    assert_eq!(
+        merge_base_of(&json!({"parents": [{"sha": HEAD}]}), HEAD),
+        None
+    );
+    assert_eq!(merge_base_of(&json!({}), HEAD), None);
+}
+
+#[test]
+fn only_a_pull_request_run_of_this_head_names_a_tested_base() {
+    assert_eq!(
+        run_tested_base(&run("pull_request", 7, HEAD, OLD_BASE), 7, HEAD).as_deref(),
+        Some(OLD_BASE)
+    );
+    for other in [
+        run("push", 7, HEAD, OLD_BASE),
+        run("merge_group", 7, HEAD, OLD_BASE),
+        run("pull_request", 8, HEAD, OLD_BASE),
+        run("pull_request", 7, OLD_BASE, OLD_BASE),
+    ] {
+        assert_eq!(run_tested_base(&other, 7, HEAD), None, "{other}");
+    }
+}
+
+#[test]
+fn a_red_on_the_current_merge_ref_is_never_stale_however_old() {
+    // The vellum case: red measured on a merge commit GitHub has since
+    // rebuilt.
+    assert!(measured_on_old_merge(
+        NEW_BASE,
+        &[Some(OLD_BASE.to_owned())]
+    ));
+    // A genuine red on the merge ref that exists now: never stale.
+    assert!(!measured_on_old_merge(
+        NEW_BASE,
+        &[Some(NEW_BASE.to_owned())]
+    ));
+    assert!(
+        !measured_on_old_merge(
+            NEW_BASE,
+            &[Some(OLD_BASE.to_owned()), Some(NEW_BASE.to_owned())]
+        ),
+        "one red on the current ref is a real failure"
+    );
+    assert!(!measured_on_old_merge(
+        NEW_BASE,
+        &[Some(OLD_BASE.to_owned()), None]
+    ));
+    assert!(!measured_on_old_merge(NEW_BASE, &[]));
+}
+
+#[test]
+fn a_memo_answers_until_the_head_or_runs_change_and_rechecks_not_stale() {
+    let at = DateTime::parse_from_rfc3339("2026-11-13T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let memo = |stale| StaleMemo {
+        head: HEAD.to_owned(),
+        runs: vec![10],
+        stale,
+        at,
+    };
+    assert_eq!(
+        memo(true).reuse(HEAD, &[10], at + Duration::days(30)),
+        Some(true)
+    );
+    assert_eq!(
+        memo(false).reuse(HEAD, &[10], at + Duration::hours(1)),
+        Some(false)
+    );
+    assert_eq!(
+        memo(false).reuse(HEAD, &[10], at + Duration::hours(7)),
+        None
+    );
+    assert_eq!(
+        memo(true).reuse(HEAD, &[11], at),
+        None,
+        "a rerun is judged again"
+    );
+    assert_eq!(memo(true).reuse(OLD_BASE, &[10], at), None);
+}
+
+#[test]
 fn an_advance_run_is_read_by_its_exit_and_envelope() {
     assert!(matches!(
         classify_advance(Some(0), r#"{"outcome": "closed and reopened at head x"}"#, ""),
         RetriggerResult::Done(detail) if detail.contains("reopened")
     ));
+    for unreadable in ["", "not json", r#"{"acted": true}"#] {
+        assert!(
+            matches!(
+                classify_advance(Some(0), unreadable, ""),
+                RetriggerResult::Failed(_)
+            ),
+            "exit 0 without an outcome is unknown, never done: {unreadable:?}"
+        );
+    }
     let guard = classify_advance(
         Some(1),
         r#"{"acted": false, "refused": {"condition": "close_refused", "detail": "pr-close-guard: refusing PR #7"}}"#,

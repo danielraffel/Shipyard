@@ -329,6 +329,13 @@ pub(super) fn run(
             ActKind::RetargetStacked if !stacked_now.contains(&row.number) => {
                 Actable::NotNow("stacked pull requests were not listed this pass".to_owned())
             }
+            // At most one retrigger succeeds per head, ever: the marks
+            // outlive the act-record TTL, and a reopen keeps the head.
+            ActKind::RetriggerStaleRef
+                if state.retrigger_spent(row.number, &row.head).is_some() =>
+            {
+                Actable::Never
+            }
             _ => Actable::Yes,
         }
     };
@@ -532,6 +539,9 @@ fn take_act(
     // nothing is recorded and the act is retried next pass.
     let mut staged = state.clone();
     staged.record_act(number, record("intent", None));
+    if kind == ActKind::RetriggerStaleRef {
+        staged.mark_retrigger(number, &row.overdue.head, true, false, input.now);
+    }
     ledger.dwell.insert(repo_key.to_owned(), staged.clone());
     let saved = super::save_ledger(input.ledger_path, ledger);
     ledger.dwell.remove(repo_key);
@@ -581,6 +591,9 @@ fn take_act(
         number,
         record(outcome.status(), Some(outcome.detail().to_owned())),
     );
+    if kind == ActKind::RetriggerStaleRef && matches!(outcome, ActOutcome::Done(_)) {
+        state.mark_retrigger(number, &row.overdue.head, false, true, input.now);
+    }
     Ok((text, matches!(outcome, ActOutcome::Done(_))))
 }
 
@@ -977,6 +990,48 @@ pub(super) fn live_pr_matches(live: &Value, repo: &str, head: &str) -> Result<()
     Ok(())
 }
 
+/// What a retrigger needs at act time, read live: the pull request open at
+/// the observed head, in the base repository, not a draft, not DIRTY (a
+/// conflict needs a merge, never a retrigger), not in the merge queue and
+/// not armed (a close would drop the entry or the arm). `advance` checks the
+/// queue and the arm again itself; the steward does not rely on it.
+pub(super) fn retrigger_preconditions(
+    live: &Value,
+    queue: &Value,
+    repo: &str,
+    head: &str,
+) -> Result<(), String> {
+    live_pr_matches(live, repo, head)?;
+    if live.get("draft").and_then(Value::as_bool) != Some(false) {
+        return Err("a draft, or its draft state unread".to_owned());
+    }
+    let mergeable = live
+        .get("mergeable_state")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if mergeable.eq_ignore_ascii_case("dirty") {
+        return Err("DIRTY: a conflict needs a merge of the base, not a retrigger".to_owned());
+    }
+    let node = queue
+        .pointer("/data/repository/pullRequest")
+        .filter(|node| node.is_object())
+        .ok_or_else(|| "merge-queue state carried no pull request".to_owned())?;
+    if node.get("isInMergeQueue").and_then(Value::as_bool) != Some(false)
+        || node
+            .get("mergeQueueEntry")
+            .is_some_and(|entry| !entry.is_null())
+    {
+        return Err("in the merge queue, or its queue state unread".to_owned());
+    }
+    if node
+        .get("autoMergeRequest")
+        .is_some_and(|request| !request.is_null())
+    {
+        return Err("auto-merge is armed".to_owned());
+    }
+    Ok(())
+}
+
 /// Every fact a retarget needs, read live. Pure: refuses unless the stacked
 /// pull request is unchanged, its `stacked:<n>` parent merged into the
 /// steward's base from the very branch it is based on, and that branch still
@@ -1113,8 +1168,24 @@ impl GitHubDwellActs<'_> {
 
 impl DwellActs for GitHubDwellActs<'_> {
     fn retrigger(&self, pr: &ObservedPr, ledger: &StewardLedger) -> ActOutcome {
-        if let Some(outcome) = self.revalidate(pr) {
-            return outcome;
+        let live = match self.live_pr(pr.fact.number) {
+            Ok(live) => live,
+            Err(error) => {
+                return ActOutcome::Deferred(format!("pull request unreadable: {error}"));
+            }
+        };
+        let queue = match super::pr_mutations::read_pr_queue_state_strict(
+            self.actions,
+            self.observation,
+            pr.fact.number,
+        ) {
+            Ok(queue) => queue,
+            Err(error) => return ActOutcome::Deferred(error),
+        };
+        if let Err(why) =
+            retrigger_preconditions(&live, &queue, &self.observation.repo, &pr.fact.head_sha)
+        {
+            return ActOutcome::Refused(why);
         }
         match super::pr_mutations::read_head_gate_for_report(
             self.actions,

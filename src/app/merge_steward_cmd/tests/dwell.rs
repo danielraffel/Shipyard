@@ -993,22 +993,94 @@ fn a_stale_merge_ref_in_shadow_mode_only_says_it_would_act() {
     ));
 }
 
-mod stale_annotate {
-    use super::*;
-    use crate::app::merge_steward_cmd::stale_merge_ref::{
-        advance_args, annotate_with, outcome, parse_commit_times,
-    };
-    use crate::merge_steward::stale_merge_ref::{RetriggerResult, StaleRefPolicy};
-
-    /// Hourly base commits back from `tip`, newest first.
-    fn commits(tip: &str, count: i64) -> Vec<DateTime<Utc>> {
-        let tip = DateTime::parse_from_rfc3339(tip)
-            .unwrap()
-            .with_timezone(&Utc);
-        (0..count)
-            .map(|hour| tip - chrono::Duration::hours(hour))
-            .collect()
+#[test]
+fn a_retriggered_head_is_never_retriggered_again_after_the_act_record_expires() {
+    let temp = tempfile::tempdir().unwrap();
+    let prs = vec![pr(1, Some("FAILURE"), Some("SUCCESS"), &[])];
+    let mut pass = pass(
+        &temp,
+        prs,
+        vec![report(1, "stale_merge_ref:macos", Some(15))],
+    );
+    let mut ledger = established();
+    let acts = FakeActs::default();
+    let _ = pass.run(&mut ledger, &acts);
+    // Reopened at the same head and red again: past the 14-day act TTL,
+    // then a year on.
+    for days in [15, 30, 365] {
+        pass.now = now() + chrono::Duration::days(days);
+        let report = pass.run(&mut ledger, &acts);
+        assert!(
+            matches!(report.overdue[0].act, Disposition::NoAct),
+            "{days}: {:?}",
+            report.overdue[0].act
+        );
     }
+    assert_eq!(*acts.calls.borrow(), vec!["retrigger #1".to_owned()]);
+    let mark = &ledger.dwell["owner/repo@main"].retriggers[0];
+    assert!(mark.done && mark.attempts == 1, "{mark:?}");
+}
+
+#[test]
+fn blocked_retriggers_stop_at_max_attempts_across_act_record_expiry() {
+    let temp = tempfile::tempdir().unwrap();
+    let prs = vec![pr(1, Some("FAILURE"), Some("SUCCESS"), &[])];
+    let mut pass = pass(
+        &temp,
+        prs,
+        vec![report(1, "stale_merge_ref:macos", Some(15))],
+    );
+    let mut ledger = established();
+    let acts = FakeActs {
+        retrigger_outcome: Some(blocked_by_guard()),
+        ..FakeActs::default()
+    };
+    for days in [0, 2, 5, 20, 40, 80, 160] {
+        pass.now = now() + chrono::Duration::days(days);
+        let _ = pass.run(&mut ledger, &acts);
+    }
+    assert_eq!(
+        acts.calls.borrow().len(),
+        3,
+        "three attempts per head, ever: {:?}",
+        acts.calls.borrow()
+    );
+}
+
+#[test]
+fn a_new_head_may_be_retriggered_again() {
+    let temp = tempfile::tempdir().unwrap();
+    let prs = vec![pr(1, Some("FAILURE"), Some("SUCCESS"), &[])];
+    let mut pass = pass(
+        &temp,
+        prs,
+        vec![report(1, "stale_merge_ref:macos", Some(15))],
+    );
+    let mut ledger = established();
+    let acts = FakeActs::default();
+    let _ = pass.run(&mut ledger, &acts);
+    let new_head = "f".repeat(40);
+    pass.reports[0].head_sha.clone_from(&new_head);
+    pass.observation.prs[0].fact.head_sha = new_head;
+    pass.now = now() + chrono::Duration::hours(1);
+    let _ = pass.run(&mut ledger, &acts);
+    pass.now = now() + chrono::Duration::hours(2);
+    let _ = pass.run(&mut ledger, &acts);
+    assert_eq!(acts.calls.borrow().len(), 2, "{:?}", acts.calls.borrow());
+}
+
+mod stale_annotate {
+    use std::cell::Cell;
+
+    use super::*;
+    use crate::app::merge_steward_cmd::dwell_pass::retrigger_preconditions;
+    use crate::app::merge_steward_cmd::stale_merge_ref::{
+        StaleReads, advance_args, annotate_with, outcome,
+    };
+    use crate::merge_steward::stale_merge_ref::{RetriggerResult, StaleMemo};
+
+    const OLD_BASE: &str = "cccccccccccccccccccccccccccccccccccccccc";
+    const NEW_BASE: &str = "dddddddddddddddddddddddddddddddddddddddd";
 
     fn observation(prs: Vec<ObservedPr>) -> RepoObservation {
         let mut observation = observation_for(prs[0].clone(), true);
@@ -1016,58 +1088,73 @@ mod stale_annotate {
         observation
     }
 
-    /// The lag criterion on, as a base that wants it sets it.
-    fn lagging() -> StaleRefPolicy {
-        StaleRefPolicy {
-            max_lag_days: 3,
-            max_base_commits: 30,
+    /// The facts one annotate call reads, and how many reads it made.
+    struct World {
+        /// The base of the current merge ref (`None`: no merge commit).
+        merge_base: Result<Option<String>, String>,
+        /// The base the red run was tested on.
+        run_base: Result<Option<String>, String>,
+        tip: Result<bool, String>,
+        approved: bool,
+        reads: Cell<usize>,
+    }
+
+    impl World {
+        /// The vellum case: red measured on a merge commit since rebuilt.
+        fn stale() -> Self {
+            Self {
+                merge_base: Ok(Some(NEW_BASE.to_owned())),
+                run_base: Ok(Some(OLD_BASE.to_owned())),
+                tip: Ok(true),
+                approved: true,
+                reads: Cell::new(0),
+            }
+        }
+
+        fn annotate(&self, memo: &mut BTreeMap<u64, StaleMemo>, reports: &mut [PrReport]) {
+            let observation = observation(vec![pr(1, Some("FAILURE"), Some("SUCCESS"), &[])]);
+            let merge_base = |_: &ObservedPr| {
+                self.reads.set(self.reads.get() + 1);
+                self.merge_base.clone()
+            };
+            let run_base = |run: u64, _: &ObservedPr| {
+                assert_eq!(run, 101, "the red macos run");
+                self.reads.set(self.reads.get() + 1);
+                self.run_base.clone()
+            };
+            let tip_green = |_: &str| self.tip.clone();
+            let approves = |_: &ObservedPr| self.approved;
+            annotate_with(
+                &observation,
+                &policy(),
+                memo,
+                now(),
+                reports,
+                &StaleReads {
+                    merge_base: &merge_base,
+                    run_base: &run_base,
+                    tip_green: &tip_green,
+                    approves: &approves,
+                },
+            );
+        }
+
+        fn token(&self) -> String {
+            let mut reports = vec![report(1, "required_failed:macos", Some(60))];
+            self.annotate(&mut BTreeMap::new(), &mut reports);
+            reports[0].blocked.blocked_on.clone()
         }
     }
 
-    fn run(
-        reports: &mut [PrReport],
-        base: &Result<Vec<DateTime<Utc>>, String>,
-        approved: bool,
-        stale: StaleRefPolicy,
-    ) {
-        run_tip(reports, base, approved, stale, &|_| Ok(true));
-    }
-
-    fn run_tip(
-        reports: &mut [PrReport],
-        base: &Result<Vec<DateTime<Utc>>, String>,
-        approved: bool,
-        stale: StaleRefPolicy,
-        tip: &dyn Fn(&str) -> Result<bool, String>,
-    ) {
-        let observation = observation(vec![pr(1, Some("FAILURE"), Some("SUCCESS"), &[])]);
-        annotate_with(
-            &observation,
-            &policy(),
-            reports,
-            &|| stale,
-            &|_| base.clone(),
-            tip,
-            &|_| approved,
-        );
-    }
-
     #[test]
-    fn an_approved_red_head_on_an_old_merge_ref_reads_stale() {
-        // The required runs completed 2026-11-09T11:00; the base moved 4 days.
+    fn a_red_measured_on_a_merge_commit_that_no_longer_exists_reads_stale() {
+        let world = World::stale();
         let mut reports = vec![report(1, "required_failed:macos", Some(60))];
-        run(
-            &mut reports,
-            &Ok(commits("2026-11-13T12:00:00Z", 5)),
-            true,
-            lagging(),
-        );
+        world.annotate(&mut BTreeMap::new(), &mut reports);
         let blocked = &reports[0].blocked;
         assert_eq!(blocked.blocked_on, "stale_merge_ref:macos");
-        assert_eq!(blocked.since.as_deref(), Some("2026-11-09T11:00:00Z"));
-        assert_eq!(blocked.since_source, Some("required_run"));
         let detail = blocked.blocked_detail.clone().unwrap_or_default();
-        assert!(detail.contains("moved on 4 day(s)"), "{detail}");
+        assert!(detail.contains("no longer exists"), "{detail}");
         assert_eq!(
             blocked.next_action.as_ref().map(|next| next.actor),
             Some(Actor::Steward)
@@ -1075,96 +1162,119 @@ mod stale_annotate {
     }
 
     #[test]
-    fn an_unapproved_fresh_or_unread_row_keeps_its_token() {
-        for (base, approved, stale) in [
-            (Ok(commits("2026-11-13T12:00:00Z", 5)), false, lagging()),
-            (Ok(commits("2026-11-09T12:00:00Z", 5)), true, lagging()),
-            (Err("HTTP 502".to_owned()), true, lagging()),
-            // Nine days behind, five commits: lag alone is off by default.
+    fn a_genuine_red_on_the_current_merge_ref_is_never_a_candidate_however_old() {
+        let world = World {
+            run_base: Ok(Some(NEW_BASE.to_owned())),
+            ..World::stale()
+        };
+        // Red for nine days, on the merge commit that exists now.
+        let mut reports = vec![report(1, "required_failed:macos", Some(60 * 24 * 9))];
+        world.annotate(&mut BTreeMap::new(), &mut reports);
+        assert_eq!(reports[0].blocked.blocked_on, "required_failed:macos");
+    }
+
+    #[test]
+    fn missing_evidence_keeps_the_red_token() {
+        for (why, world) in [
             (
-                Ok(commits("2026-11-13T12:00:00Z", 5)),
-                true,
-                StaleRefPolicy::default(),
+                "not a pull_request run of this head",
+                World {
+                    run_base: Ok(None),
+                    ..World::stale()
+                },
             ),
             (
-                Ok(commits("2026-11-13T12:00:00Z", 5)),
-                true,
-                StaleRefPolicy {
-                    max_lag_days: 0,
-                    max_base_commits: 0,
+                "no current merge commit",
+                World {
+                    merge_base: Ok(None),
+                    ..World::stale()
+                },
+            ),
+            (
+                "run unread",
+                World {
+                    run_base: Err("HTTP 502".to_owned()),
+                    ..World::stale()
+                },
+            ),
+            (
+                "merge ref unread",
+                World {
+                    merge_base: Err("HTTP 502".to_owned()),
+                    ..World::stale()
+                },
+            ),
+            (
+                "red on the base tip too",
+                World {
+                    tip: Ok(false),
+                    ..World::stale()
+                },
+            ),
+            (
+                "tip unread",
+                World {
+                    tip: Err("HTTP 502".to_owned()),
+                    ..World::stale()
+                },
+            ),
+            (
+                "not approved",
+                World {
+                    approved: false,
+                    ..World::stale()
                 },
             ),
         ] {
-            let mut reports = vec![report(1, "required_failed:macos", Some(60))];
-            run(&mut reports, &base, approved, stale);
-            assert_eq!(
-                reports[0].blocked.blocked_on, "required_failed:macos",
-                "{base:?} {approved} {stale:?}"
-            );
+            assert_eq!(world.token(), "required_failed:macos", "{why}");
         }
+    }
+
+    #[test]
+    fn a_verdict_is_remembered_so_the_same_red_is_not_read_every_pass() {
+        let world = World::stale();
+        let mut memo = BTreeMap::new();
+        for _ in 0..3 {
+            let mut reports = vec![report(1, "required_failed:macos", Some(60))];
+            world.annotate(&mut memo, &mut reports);
+            assert_eq!(reports[0].blocked.blocked_on, "stale_merge_ref:macos");
+        }
+        assert_eq!(world.reads.get(), 2, "one merge-ref and one run read, once");
+        let fresh = World {
+            run_base: Ok(Some(NEW_BASE.to_owned())),
+            ..World::stale()
+        };
+        let mut memo = BTreeMap::new();
+        for _ in 0..3 {
+            let mut reports = vec![report(1, "required_failed:macos", Some(60))];
+            fresh.annotate(&mut memo, &mut reports);
+        }
+        assert_eq!(fresh.reads.get(), 2, "a not-stale verdict holds for hours");
     }
 
     #[test]
     fn rows_that_are_not_red_cost_no_read() {
-        let observation = observation(vec![pr(1, Some("SUCCESS"), Some("SUCCESS"), &[])]);
-        let mut reports = vec![report(1, "no_verdict", Some(60))];
-        annotate_with(
-            &observation,
-            &policy(),
-            &mut reports,
-            &|| panic!("no candidate, no config read"),
-            &|_| panic!("no candidate, no commit read"),
-            &|_| panic!("no candidate, no tip read"),
-            &|_| panic!("no candidate, no gate read"),
-        );
-        assert_eq!(reports[0].blocked.blocked_on, "no_verdict");
-    }
-
-    #[test]
-    fn a_red_row_whose_checks_also_fail_on_the_base_tip_is_not_stale() {
-        // 40 hourly commits since the run: stale by count, but the tip is red
-        // too (or unread), so the red is the change's, not the ref's.
-        let red: &dyn Fn(&str) -> Result<bool, String> = &|_| Ok(false);
-        let unread: &dyn Fn(&str) -> Result<bool, String> = &|_| Err("HTTP 502".to_owned());
-        for tip in [red, unread] {
-            let mut reports = vec![report(1, "required_failed:macos", Some(60))];
-            run_tip(
-                &mut reports,
-                &Ok(commits("2026-11-11T00:00:00Z", 40)),
-                true,
-                StaleRefPolicy::default(),
-                tip,
-            );
-            assert_eq!(reports[0].blocked.blocked_on, "required_failed:macos");
+        for token in [
+            "no_verdict",
+            "required_never_ran:macos",
+            "merge_state:BEHIND",
+            "ready",
+        ] {
+            let world = World::stale();
+            let mut reports = vec![report(1, token, Some(60))];
+            world.annotate(&mut BTreeMap::new(), &mut reports);
+            assert_eq!(reports[0].blocked.blocked_on, token);
+            assert_eq!(world.reads.get(), 0, "{token}");
         }
-        let mut reports = vec![report(1, "required_failed:macos", Some(60))];
-        run_tip(
-            &mut reports,
-            &Ok(commits("2026-11-11T00:00:00Z", 40)),
-            true,
-            StaleRefPolicy::default(),
-            &|_| Ok(true),
-        );
-        assert_eq!(
-            reports[0].blocked.blocked_on, "stale_merge_ref:macos",
-            "stale by base commits and green on the tip"
-        );
     }
 
     #[test]
     fn a_dirty_pull_request_is_never_named_stale_or_retriggered() {
-        let observation = observation(vec![pr(1, Some("FAILURE"), Some("SUCCESS"), &[])]);
+        let world = World::stale();
         let mut reports = vec![report(1, "merge_state:DIRTY", Some(60 * 24 * 9))];
-        annotate_with(
-            &observation,
-            &policy(),
-            &mut reports,
-            &|| panic!("a DIRTY row is never a candidate"),
-            &|_| panic!("a DIRTY row is never a candidate"),
-            &|_| panic!("a DIRTY row is never a candidate"),
-            &|_| panic!("a DIRTY row is never a candidate"),
-        );
+        world.annotate(&mut BTreeMap::new(), &mut reports);
         assert_eq!(reports[0].blocked.blocked_on, "merge_state:DIRTY");
+        assert_eq!(world.reads.get(), 0);
         // However long it sits, the dwell pass takes no act on it.
         let temp = tempfile::tempdir().unwrap();
         let mut pass = pass(
@@ -1189,13 +1299,36 @@ mod stale_annotate {
         assert!(acts.calls.borrow().is_empty(), "{:?}", acts.calls.borrow());
     }
 
+    fn live(draft: bool, mergeable: &str) -> Value {
+        json!({"state": "open", "draft": draft, "mergeable_state": mergeable,
+               "head": {"sha": HEAD, "repo": {"full_name": "owner/repo"}}})
+    }
+
+    fn queue(in_queue: bool, armed: bool) -> Value {
+        json!({"data": {"repository": {"pullRequest": {
+            "isInMergeQueue": in_queue,
+            "mergeQueueEntry": if in_queue { json!({"state": "QUEUED"}) } else { Value::Null },
+            "autoMergeRequest": if armed { json!({"enabledAt": "x"}) } else { Value::Null }}}}})
+    }
+
     #[test]
-    fn base_commit_pages_parse_or_refuse() {
-        let page = r#"[{"commit": {"committer": {"date": "2026-11-13T12:00:00Z"}}},
-                      {"commit": {"committer": {"date": "2026-11-12T12:00:00Z"}}}]"#;
-        assert_eq!(parse_commit_times(page).expect("parsed").len(), 2);
-        assert!(parse_commit_times(r#"[{"commit": {}}]"#).is_err());
-        assert!(parse_commit_times(r#"{"message": "Not Found"}"#).is_err());
+    fn the_steward_refuses_a_draft_dirty_queued_or_armed_head_at_act_time() {
+        let check =
+            |live: &Value, queue: &Value| retrigger_preconditions(live, queue, "owner/repo", HEAD);
+        assert!(check(&live(false, "unstable"), &queue(false, false)).is_ok());
+        assert!(check(&live(false, "behind"), &queue(false, false)).is_ok());
+        for (why, live, queue) in [
+            ("draft", live(true, "unstable"), queue(false, false)),
+            ("dirty", live(false, "dirty"), queue(false, false)),
+            ("queued", live(false, "clean"), queue(true, false)),
+            ("armed", live(false, "clean"), queue(false, true)),
+            ("queue unread", live(false, "clean"), json!({"errors": []})),
+        ] {
+            assert!(check(&live, &queue).is_err(), "{why}");
+        }
+        let mut moved = live(false, "clean");
+        moved["head"]["sha"] = json!("e".repeat(40));
+        assert!(check(&moved, &queue(false, false)).is_err(), "head moved");
     }
 
     #[test]

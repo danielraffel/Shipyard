@@ -1,128 +1,50 @@
-//! A stale merge ref: an approved pull request whose required checks ran
-//! against a merge ref GitHub built long ago, so they cannot go green on
-//! their own.
+//! A stale merge ref: an approved pull request whose required checks went
+//! red on a test merge commit that no longer exists, so they cannot go green
+//! on their own.
 //!
-//! GitHub runs a pull request's checks on `refs/pull/<n>/merge`, the head
-//! merged into the base as it stood when the ref was built. When nothing
-//! rebuilds the ref (no push, no reopen), a red required check stays red
-//! however far the base moves on: one approved pull request sat red for nine
-//! days that way. The fix is a close and reopen, which rebuilds the ref and
-//! reruns the checks; `shipyard advance --retrigger` does that after checking
-//! its own policy, and the steward's dwell pass calls it
-//! ([`super::dwell::ActKind::RetriggerStaleRef`]).
+//! GitHub runs a `pull_request` workflow on `refs/pull/<n>/merge`, the head
+//! merged into the base as it stood then. GitHub later rebuilds that ref when
+//! the base moves, but nothing reruns the checks: a red measured on the old
+//! merge commit stays red. One approved pull request sat red for nine days
+//! that way. Age and base movement are not evidence of this (a real failure
+//! is often old too); the evidence is the run itself:
 //!
-//! The newest required run at the head dates the merge ref: it ran on the
-//! ref that existed then. A ref is stale when the base has taken at least
-//! [`StaleRefPolicy::max_base_commits`] commits since that run, or (off by
-//! default) has moved on by more than [`StaleRefPolicy::max_lag_days`].
-//! Either limit set to 0 turns that criterion off. Age alone is not enough:
-//! a pull request that only lags its base is the merge queue's to test on
-//! top of it, so the lag criterion is off unless a base turns it on.
+//! * every red required context's failing run is a `pull_request` run for
+//!   this pull request at its current head ([`run_tested_base`]), and
+//! * the base that run was tested on is not the first parent of the pull
+//!   request's current test merge commit ([`merge_base_of`]): the red was
+//!   measured on a merge commit that no longer exists
+//!   ([`measured_on_old_merge`]);
+//! * and every one of those contexts is green on the base tip
+//!   ([`all_green_on_tip`]), so the same checks pass on the base.
 //!
-//! Staleness alone does not tell a stale ref from a real failure that is
-//! simply old, so the steward also requires every red context to be green
-//! on the base tip ([`all_green_on_tip`]) before it names the ref stale.
+//! A red on the current merge ref is never stale, however old. The fix is a
+//! close and reopen, which reruns the checks on the current ref; `shipyard
+//! advance --retrigger` does that after checking its own policy, and the
+//! steward's dwell pass calls it ([`super::dwell::ActKind::RetriggerStaleRef`]).
 //!
 //! Pure: no reads, no clock.
 
-use chrono::{DateTime, Duration, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use super::{RequiredCheck, StewardCheck, selected_required_check};
 
 /// The `blocked_on` token kind.
 pub const TOKEN: &str = "stale_merge_ref";
-/// `[auto_merge.stale_merge_ref]` in the base branch's `.shipyard/config.toml`.
-pub const CONFIG_TABLE: &str = "stale_merge_ref";
-/// Default: days the base may move on past the newest required run. Off:
-/// lagging the base is not by itself a reason to retrigger.
-pub const DEFAULT_MAX_LAG_DAYS: u32 = 0;
-/// Default: commits the base may take after the newest required run.
-pub const DEFAULT_MAX_BASE_COMMITS: u32 = 30;
-/// The most base commits one read lists (one page).
-pub const BASE_COMMITS_PAGE: u32 = 100;
-
-/// `[auto_merge.stale_merge_ref]`, as the base config sets it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-pub struct StaleRefPolicy {
-    /// Days; 0 turns the lag criterion off.
-    pub max_lag_days: u32,
-    /// Commits; 0 turns the commit-count criterion off.
-    pub max_base_commits: u32,
-}
-
-impl Default for StaleRefPolicy {
-    fn default() -> Self {
-        Self {
-            max_lag_days: DEFAULT_MAX_LAG_DAYS,
-            max_base_commits: DEFAULT_MAX_BASE_COMMITS,
-        }
-    }
-}
-
-impl StaleRefPolicy {
-    /// The policy a parsed base config sets. Absent or mistyped keys keep
-    /// their defaults.
-    #[must_use]
-    pub fn from_table(table: &toml::Table) -> Self {
-        let mut policy = Self::default();
-        let Some(section) = table
-            .get(super::ejection_guards::CONFIG_TABLE)
-            .and_then(toml::Value::as_table)
-            .and_then(|auto| auto.get(CONFIG_TABLE))
-            .and_then(toml::Value::as_table)
-        else {
-            return policy;
-        };
-        let number = |key: &str| {
-            section
-                .get(key)
-                .and_then(toml::Value::as_integer)
-                .and_then(|value| u32::try_from(value).ok())
-        };
-        if let Some(days) = number("max_lag_days") {
-            policy.max_lag_days = days;
-        }
-        if let Some(commits) = number("max_base_commits") {
-            policy.max_base_commits = commits;
-        }
-        policy
-    }
-
-    /// Whether either criterion is on.
-    #[must_use]
-    pub const fn enabled(self) -> bool {
-        self.max_lag_days > 0 || self.max_base_commits > 0
-    }
-
-    /// How many base commits one read must list: enough to count to
-    /// [`Self::max_base_commits`], within one page, and at least the tip.
-    #[must_use]
-    pub fn commits_to_read(self) -> u32 {
-        self.max_base_commits.clamp(1, BASE_COMMITS_PAGE)
-    }
-}
-
-/// How far the base moved past the newest required run.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-pub struct Staleness {
-    /// The newest required run at the head.
-    pub runs_at: DateTime<Utc>,
-    /// Whole days from that run to the base's tip commit.
-    pub lag_days: i64,
-    /// Base commits after that run, counted in the window read (a lower
-    /// bound when the window is full).
-    pub base_commits_since: usize,
-}
+/// How long a "not stale" verdict is reused before the merge ref is read
+/// again (GitHub may rebuild it in between).
+pub const NOT_STALE_RECHECK_MINUTES: i64 = 6 * 60;
+/// Most pull requests whose merge ref one pass reads fresh, per repository;
+/// the rest wait for the next pass.
+pub const MAX_FRESH_PER_PASS: usize = 5;
 
 /// The red required contexts a token names, when the token is one a stale
-/// merge ref can explain: `required_failed:<contexts>` or
-/// `required_never_ran:<contexts>`.
+/// merge ref can explain: `required_failed:<contexts>`.
 #[must_use]
 pub fn candidate_contexts(token: &str) -> Option<&str> {
-    let (kind, contexts) = token.split_once(':')?;
-    (matches!(kind, "required_failed" | "required_never_ran") && !contexts.is_empty())
-        .then_some(contexts)
+    let contexts = token.strip_prefix("required_failed:")?;
+    (!contexts.is_empty()).then_some(contexts)
 }
 
 /// `stale_merge_ref:<contexts>`.
@@ -131,48 +53,93 @@ pub fn token(contexts: &str) -> String {
     format!("{TOKEN}:{contexts}")
 }
 
-/// When the newest required observation at the head was made, or `None`
-/// when no required rule has one: then nothing dates the merge ref, and
-/// a retrigger would be refused anyway.
+/// The Actions run behind each red context in `contexts` (comma-joined), as
+/// the required rule selects it at this head. `None` when any context has
+/// no required rule, no completed non-green observation, or no Actions run:
+/// then nothing can show which merge commit it was measured on.
 #[must_use]
-pub fn newest_required_run(
+pub fn red_runs(
+    contexts: &str,
     checks: &[StewardCheck],
     required: &[RequiredCheck],
-) -> Option<DateTime<Utc>> {
-    required
-        .iter()
-        .filter_map(|rule| selected_required_check(checks, rule))
-        .filter_map(|check| check.observed_at.as_deref())
-        .filter_map(|at| DateTime::parse_from_rfc3339(at).ok())
-        .map(|at| at.with_timezone(&Utc))
-        .max()
+) -> Option<Vec<u64>> {
+    let mut runs = Vec::new();
+    for context in contexts.split(',').map(str::trim) {
+        if context.is_empty() {
+            return None;
+        }
+        let rule = required
+            .iter()
+            .find(|rule| rule.context.eq_ignore_ascii_case(context))?;
+        let check = selected_required_check(checks, rule)?;
+        let green = check.conclusion.as_deref().is_some_and(|conclusion| {
+            matches!(
+                conclusion.to_ascii_uppercase().as_str(),
+                "SUCCESS" | "NEUTRAL" | "SKIPPED"
+            )
+        });
+        if !check.status.eq_ignore_ascii_case("COMPLETED") || green {
+            return None;
+        }
+        runs.push(check.run_id?);
+    }
+    (!runs.is_empty()).then_some(runs)
 }
 
-/// Judge one head. `base_commits` are the base's commit times, newest first,
-/// as one read listed them; an empty list judges nothing.
+/// The base commit the pull request's current test merge commit was built
+/// on: its first parent, when it has exactly two and the second is `head`.
 #[must_use]
-pub fn judge(
-    policy: StaleRefPolicy,
-    runs_at: DateTime<Utc>,
-    base_commits: &[DateTime<Utc>],
-) -> Option<Staleness> {
-    let tip = *base_commits.first()?;
-    let lag = tip - runs_at;
-    let since = base_commits.iter().filter(|at| **at > runs_at).count();
-    let lagging = policy.max_lag_days > 0 && lag >= Duration::days(i64::from(policy.max_lag_days));
-    let moved = policy.max_base_commits > 0
-        && u32::try_from(since).unwrap_or(u32::MAX) >= policy.max_base_commits;
-    (lagging || moved).then_some(Staleness {
-        runs_at,
-        lag_days: lag.num_days(),
-        base_commits_since: since,
-    })
+pub fn merge_base_of(merge_commit: &Value, head: &str) -> Option<String> {
+    let parents = merge_commit.get("parents")?.as_array()?;
+    let sha = |index: usize| {
+        parents
+            .get(index)?
+            .get("sha")?
+            .as_str()
+            .map(str::to_ascii_lowercase)
+    };
+    (parents.len() == 2 && sha(1)?.eq_ignore_ascii_case(head)).then(|| sha(0))?
+}
+
+/// The base a workflow run was tested on: for a `pull_request` run of pull
+/// request `number` at `head`, its recorded base sha. `None` for any other
+/// run (a push, a merge group, another pull request or head): it says
+/// nothing about this pull request's merge ref.
+#[must_use]
+pub fn run_tested_base(run: &Value, number: u64, head: &str) -> Option<String> {
+    if run.get("event").and_then(Value::as_str) != Some("pull_request") {
+        return None;
+    }
+    run.get("pull_requests")?
+        .as_array()?
+        .iter()
+        .find(|pr| {
+            pr.get("number").and_then(Value::as_u64) == Some(number)
+                && pr
+                    .pointer("/head/sha")
+                    .and_then(Value::as_str)
+                    .is_some_and(|sha| sha.eq_ignore_ascii_case(head))
+        })?
+        .pointer("/base/sha")?
+        .as_str()
+        .map(str::to_ascii_lowercase)
+}
+
+/// Whether every red run was measured on a merge commit that no longer
+/// exists: each one's tested base is known and differs from the current
+/// merge ref's base. One unknown, or one on the current ref, is not stale.
+#[must_use]
+pub fn measured_on_old_merge(current_base: &str, tested: &[Option<String>]) -> bool {
+    !tested.is_empty()
+        && tested.iter().all(|base| {
+            base.as_deref()
+                .is_some_and(|base| !base.eq_ignore_ascii_case(current_base))
+        })
 }
 
 /// Whether every context in `contexts` (comma-joined, as a token carries
 /// them) reads green on the base tip, by `tip_green`. A context it could
-/// not read, or one with no completed run on the tip, is not green: a red
-/// pull request is called stale only when the same checks pass on the base.
+/// not read, or one with no completed run on the tip, is not green.
 #[must_use]
 pub fn all_green_on_tip(
     contexts: &str,
@@ -186,6 +153,38 @@ pub fn all_green_on_tip(
         && contexts
             .split(',')
             .any(|context| !context.trim().is_empty())
+}
+
+/// One pull request's last merge-ref verdict, kept in the steward ledger so
+/// the same red is not read every pass.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct StaleMemo {
+    /// The head judged.
+    pub head: String,
+    /// The red runs judged.
+    pub runs: Vec<u64>,
+    /// Whether they were measured on a merge commit that no longer exists.
+    pub stale: bool,
+    /// When.
+    pub at: chrono::DateTime<chrono::Utc>,
+}
+
+impl StaleMemo {
+    /// The verdict, when it still answers for `head` and `runs` at `now`: a
+    /// stale verdict holds until the head or the runs change; a "not stale"
+    /// one for [`NOT_STALE_RECHECK_MINUTES`].
+    #[must_use]
+    pub fn reuse(
+        &self,
+        head: &str,
+        runs: &[u64],
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Option<bool> {
+        (self.head.eq_ignore_ascii_case(head)
+            && self.runs == runs
+            && (self.stale || now - self.at < chrono::Duration::minutes(NOT_STALE_RECHECK_MINUTES)))
+        .then_some(self.stale)
+    }
 }
 
 /// What one `shipyard advance --retrigger --json` run came to.
@@ -225,8 +224,16 @@ pub fn classify_advance(exit: Option<i32>, stdout: &str, stderr: &str) -> Retrig
             .map(str::to_owned)
     };
     match exit {
-        Some(0) => RetriggerResult::Done(
-            field("/outcome").unwrap_or_else(|| "closed and reopened".to_owned()),
+        // Success needs the envelope that says what happened: an exit 0 with
+        // no readable answer is unknown, and an unknown act is never retried.
+        Some(0) => field("/outcome").map_or_else(
+            || {
+                RetriggerResult::Failed(format!(
+                    "advance exited 0 without a readable outcome: {}",
+                    stdout.trim()
+                ))
+            },
+            RetriggerResult::Done,
         ),
         Some(1) => match field("/refused/condition") {
             Some(condition) if condition == "close_refused" => RetriggerResult::Blocked(format!(

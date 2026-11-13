@@ -69,8 +69,8 @@ pub enum DwellState {
     CarriesUnapproved,
     /// Stacked on a pull request that merged; still based on its branch.
     StackedBaseMerged,
-    /// Approved, with required checks that ran on a merge ref the base has
-    /// long moved past ([`super::stale_merge_ref`]).
+    /// Approved, with required checks that went red on a test merge commit
+    /// that no longer exists ([`super::stale_merge_ref`]).
     StaleMergeRef,
 }
 
@@ -240,8 +240,6 @@ pub struct DwellPolicy {
     pub max_acts_per_pass: usize,
     /// Highest escalation level: level `n` fires at `limit * 2^(n-1)`.
     pub max_level: u32,
-    /// `[auto_merge.stale_merge_ref]`: when a merge ref counts as stale.
-    pub stale_merge_ref: super::stale_merge_ref::StaleRefPolicy,
     /// Why the config could not be read, when it could not; the defaults
     /// apply.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -260,7 +258,6 @@ impl Default for DwellPolicy {
             max_escalations_per_pass: 25,
             max_acts_per_pass: 3,
             max_level: 4,
-            stale_merge_ref: super::stale_merge_ref::StaleRefPolicy::default(),
             read_error: None,
         }
     }
@@ -271,10 +268,7 @@ impl DwellPolicy {
     /// their defaults; an unknown key is ignored.
     #[must_use]
     pub fn from_table(table: &toml::Table) -> Self {
-        let mut policy = Self {
-            stale_merge_ref: super::stale_merge_ref::StaleRefPolicy::from_table(table),
-            ..Self::default()
-        };
+        let mut policy = Self::default();
         let Some(section) = table
             .get(super::ejection_guards::CONFIG_TABLE)
             .and_then(toml::Value::as_table)
@@ -487,9 +481,96 @@ pub struct DwellRepoState {
     /// backlog it found was seeded, not escalated.
     #[serde(default)]
     pub initialized: bool,
+    /// The last merge-ref verdict per pull request
+    /// ([`super::stale_merge_ref`]), so one red is not read every pass.
+    #[serde(default)]
+    pub stale_ref: BTreeMap<u64, super::stale_merge_ref::StaleMemo>,
+    /// Every retrigger attempted, per pull request and head. Unlike act
+    /// records these outlive [`ACT_TTL_DAYS`]: a reopen keeps the head, so a
+    /// head whose ledger record expired would otherwise be retriggered again
+    /// every two weeks.
+    #[serde(default)]
+    pub retriggers: Vec<RetriggerMark>,
+}
+
+/// Retrigger marks kept per repository; the oldest are dropped past this.
+const RETRIGGER_MARKS_KEPT: usize = 2048;
+
+/// The retrigger history of one pull request head.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RetriggerMark {
+    /// Pull request number.
+    pub pr: u64,
+    /// The head.
+    pub head: String,
+    /// Retriggers attempted at this head.
+    pub attempts: u32,
+    /// One succeeded: never again at this head.
+    pub done: bool,
+    /// The last attempt.
+    pub at: DateTime<Utc>,
 }
 
 impl DwellRepoState {
+    /// Why `head` of pull request `number` may not be retriggered again, if
+    /// it may not: one retrigger succeeded there, or [`MAX_ATTEMPTS`] were
+    /// spent. Whatever the act-record TTL.
+    #[must_use]
+    pub fn retrigger_spent(&self, number: u64, head: &str) -> Option<String> {
+        let mark = self
+            .retriggers
+            .iter()
+            .find(|mark| mark.pr == number && mark.head.eq_ignore_ascii_case(head))?;
+        if mark.done {
+            Some(
+                "retriggered once at this head already; only a new head retriggers again"
+                    .to_owned(),
+            )
+        } else if mark.attempts >= MAX_ATTEMPTS {
+            Some(format!(
+                "{} retrigger attempts spent at this head",
+                mark.attempts
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// Count one retrigger attempt at `head`, and whether it succeeded.
+    pub fn mark_retrigger(
+        &mut self,
+        number: u64,
+        head: &str,
+        attempt: bool,
+        done: bool,
+        at: DateTime<Utc>,
+    ) {
+        let index = self
+            .retriggers
+            .iter()
+            .position(|mark| mark.pr == number && mark.head.eq_ignore_ascii_case(head));
+        let mut mark = index.map_or_else(
+            || RetriggerMark {
+                pr: number,
+                head: head.to_owned(),
+                attempts: 0,
+                done: false,
+                at,
+            },
+            |index| self.retriggers.remove(index),
+        );
+        if attempt {
+            mark.attempts += 1;
+        }
+        mark.done |= done;
+        mark.at = at;
+        self.retriggers.push(mark);
+        if self.retriggers.len() > RETRIGGER_MARKS_KEPT {
+            self.retriggers
+                .drain(..self.retriggers.len() - RETRIGGER_MARKS_KEPT);
+        }
+    }
+
     /// Whether an act of `kind` was already taken for `state` at `head`.
     #[must_use]
     pub fn acted(&self, number: u64, state: DwellState, head: &str) -> Option<&ActRecord> {
