@@ -238,8 +238,13 @@ reviewer_signers = [\"infra-review2\"]
 pr_gates = true
 extra = 3
 ";
-    let rendered =
-        render_config(Some(existing), &[], &["fleet-pass-reviewer-*".to_owned()]).expect("render");
+    let rendered = render_config(
+        Some(existing),
+        &[],
+        &["fleet-pass-reviewer-*".to_owned()],
+        false,
+    )
+    .expect("render");
     for kept in [
         "# project policy",
         "profile = \"multi\"",
@@ -255,24 +260,96 @@ extra = 3
         table["auto_merge"]["fleet_review_required"].as_bool(),
         Some(true)
     );
-    assert_eq!(table["validation"]["pr_gates"].as_bool(), Some(false));
+    assert_eq!(
+        table["validation"]["pr_gates"].as_bool(),
+        Some(true),
+        "an existing true is never lowered"
+    );
     assert_eq!(
         rendered.changed_keys,
         vec![
             "auto_merge.reviewer_stamp_sessions",
             "auto_merge.fleet_review_required",
-            "validation.pr_gates",
         ]
     );
 }
 
 #[test]
+fn pr_gates_is_added_only_when_absent_and_the_repo_has_no_gate_scripts() {
+    let s = ["s".to_owned()];
+    let g = ["g".to_owned()];
+    let pr_gates = |existing: Option<&str>, gates: bool| -> Option<bool> {
+        let rendered = render_config(existing, &s, &g, gates).expect("render");
+        let table: toml::Table = toml::from_str(&rendered.text).expect("toml");
+        table
+            .get("validation")
+            .and_then(|validation| validation.get("pr_gates"))
+            .and_then(toml::Value::as_bool)
+    };
+    assert_eq!(pr_gates(None, false), Some(false));
+    assert_eq!(
+        pr_gates(None, true),
+        None,
+        "a repo with gate scripts keeps its gates"
+    );
+    for gates in [false, true] {
+        assert_eq!(
+            pr_gates(Some("[validation]\npr_gates = true\n"), gates),
+            Some(true)
+        );
+        assert_eq!(
+            pr_gates(Some("[validation]\npr_gates = false\n"), gates),
+            Some(false)
+        );
+    }
+}
+
+#[test]
+fn gate_script_paths_follow_the_config_overrides() {
+    assert_eq!(
+        gate_script_paths(None),
+        [
+            "tools/scripts/skill_sync_check.py",
+            "scripts/skill_sync_check.py",
+            "tools/scripts/version_bump_check.py",
+            "scripts/version_bump_check.py",
+        ]
+    );
+    assert_eq!(
+        gate_script_paths(Some(
+            "[validation]\nskill_sync_script = \"./ci/skills.py\"\n"
+        )),
+        [
+            "ci/skills.py",
+            "tools/scripts/version_bump_check.py",
+            "scripts/version_bump_check.py",
+        ]
+    );
+}
+
+#[test]
+fn a_key_replacing_a_table_header_is_written_with_spaces() {
+    let rendered = render_config(
+        Some("[auto_merge.reviewer_signers]\nx = 1\n"),
+        &["s".to_owned()],
+        &["g".to_owned()],
+        false,
+    )
+    .expect("render");
+    assert!(
+        rendered.text.contains("reviewer_signers = [\"s\"]"),
+        "{}",
+        rendered.text
+    );
+}
+
+#[test]
 fn config_render_without_signers_anywhere_is_refused() {
-    let error = render_config(None, &[], &["s".to_owned()]).expect_err("no signers");
+    let error = render_config(None, &[], &["s".to_owned()], false).expect_err("no signers");
     assert_eq!(error.exit_code(), 1);
-    let error = render_config(None, &["s".to_owned()], &[]).expect_err("no sessions");
+    let error = render_config(None, &["s".to_owned()], &[], false).expect_err("no sessions");
     assert_eq!(error.exit_code(), 1);
-    let fresh = render_config(None, &["s".to_owned()], &["g".to_owned()]).expect("fresh");
+    let fresh = render_config(None, &["s".to_owned()], &["g".to_owned()], false).expect("fresh");
     assert!(fresh.text.contains("fleet_review_required = true"));
 }
 
@@ -354,6 +431,39 @@ fn every_failed_read_stops_the_plan_with_exit_9() {
         let error = build_plan(&fake, &request()).expect_err(&path);
         assert_eq!(error.exit_code(), 9, "404 {path}: {error:?}");
     }
+}
+
+#[test]
+fn a_gate_script_on_the_base_keeps_pr_gates_unset_in_the_plan() {
+    let mut fake = healthy();
+    fake.raw.insert(
+        format!("repos/{REPO}/contents/scripts/version_bump_check.py?ref=main"),
+        "#!/usr/bin/env python3\n".to_owned(),
+    );
+    let plan = build_plan(&fake, &request()).expect("plan");
+    let config = plan["rendered"][".shipyard/config.toml"]
+        .as_str()
+        .expect("config");
+    assert!(!config.contains("pr_gates"), "{config}");
+    let control = build_plan(&healthy(), &request()).expect("plan");
+    assert!(
+        control["rendered"][".shipyard/config.toml"]
+            .as_str()
+            .expect("config")
+            .contains("pr_gates = false"),
+        "control: no gate scripts adds the opt-out"
+    );
+    let mut broken = healthy();
+    broken.errors.insert(
+        format!("repos/{REPO}/contents/tools/scripts/skill_sync_check.py?ref=main"),
+        "HTTP 502".to_owned(),
+    );
+    assert_eq!(
+        build_plan(&broken, &request())
+            .expect_err("unreadable")
+            .exit_code(),
+        9
+    );
 }
 
 #[test]

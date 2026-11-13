@@ -297,7 +297,10 @@ pub fn render_review_verdict(pin: &ShipyardPin) -> String {
 }
 
 /// Render `.shipyard/config.toml`: `existing` with only [`AUTO_MERGE_KEYS`]
-/// and `[validation] pr_gates` set. Every other key, table and comment is kept.
+/// set, and `[validation] pr_gates = false` added only when the base sets no
+/// `pr_gates` and has no gate scripts. An existing `pr_gates` is never changed
+/// (a `true` is never lowered), and `shipyard pr` refuses `false` beside gate
+/// scripts. Every other key, table and comment is kept.
 ///
 /// An empty `signers` or `sessions` keeps the base's own list; when the base
 /// has none either, the render refuses.
@@ -305,6 +308,7 @@ pub fn render_config(
     existing: Option<&str>,
     signers: &[String],
     sessions: &[String],
+    gate_scripts_present: bool,
 ) -> Result<RenderedConfig, OnboardError> {
     let source = existing.unwrap_or("");
     let mut document: toml_edit::DocumentMut = source.parse().map_err(|error| {
@@ -350,11 +354,25 @@ pub fn render_config(
     })?;
 
     let auto_merge = table_mut(&mut document, "auto_merge")?;
-    auto_merge["reviewer_signers"] = toml_edit::value(string_array(&signers));
-    auto_merge["reviewer_stamp_sessions"] = toml_edit::value(string_array(&sessions));
-    auto_merge["fleet_review_required"] = toml_edit::value(true);
-    let validation = table_mut(&mut document, "validation")?;
-    validation["pr_gates"] = toml_edit::value(false);
+    set_key(
+        auto_merge,
+        "reviewer_signers",
+        toml_edit::value(string_array(&signers)),
+    );
+    set_key(
+        auto_merge,
+        "reviewer_stamp_sessions",
+        toml_edit::value(string_array(&sessions)),
+    );
+    set_key(auto_merge, "fleet_review_required", toml_edit::value(true));
+    let pr_gates_set = before
+        .get("validation")
+        .and_then(|validation| validation.get("pr_gates"))
+        .is_some();
+    if !pr_gates_set && !gate_scripts_present {
+        let validation = table_mut(&mut document, "validation")?;
+        set_key(validation, "pr_gates", toml_edit::value(false));
+    }
     let text = document.to_string();
 
     let after: toml::Table = toml::from_str(&text).map_err(|error| {
@@ -378,6 +396,48 @@ fn table_mut<'a>(
                 "the base's .shipyard/config.toml [{name}] is not a table"
             ))
         })
+}
+
+/// Set `key`, writing `key = value` even when the key existed as a table
+/// header (whose decor has no space before `=`).
+fn set_key(table: &mut toml_edit::Table, key: &str, item: toml_edit::Item) {
+    table[key] = item;
+    if let Some(mut key) = table.key_mut(key) {
+        key.leaf_decor_mut().set_suffix(" ");
+    }
+}
+
+/// Where `shipyard pr` looks for the skill-sync and version-bump gate
+/// scripts: the base config's `validation.*_script` paths when set, otherwise
+/// the default script directories.
+#[must_use]
+pub fn gate_script_paths(existing: Option<&str>) -> Vec<String> {
+    let table: toml::Table = existing
+        .and_then(|text| toml::from_str(text).ok())
+        .unwrap_or_default();
+    let configured = |key: &str| {
+        table
+            .get("validation")
+            .and_then(|validation| validation.get(key))
+            .and_then(toml::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
+    let mut paths = Vec::new();
+    for (key, filename) in [
+        ("skill_sync_script", "skill_sync_check.py"),
+        ("version_bump_script", "version_bump_check.py"),
+    ] {
+        match configured(key) {
+            Some(path) => paths.push(path.trim_start_matches("./").to_owned()),
+            None => paths.extend(
+                ["tools/scripts", "scripts"]
+                    .iter()
+                    .map(|dir| format!("{dir}/{filename}")),
+            ),
+        }
+    }
+    paths
 }
 
 fn string_array(values: &[String]) -> toml_edit::Array {
@@ -590,11 +650,25 @@ pub fn build_plan(
         .get_raw(&config_path)
         .map_err(OnboardError::Unreadable)?;
 
+    let mut gate_scripts_present = false;
+    for path in gate_script_paths(existing_config.as_deref()) {
+        let path = format!("repos/{repo}/contents/{path}?ref={default_branch}");
+        if reader
+            .get_raw(&path)
+            .map_err(OnboardError::Unreadable)?
+            .is_some()
+        {
+            gate_scripts_present = true;
+            break;
+        }
+    }
+
     let review = render_review_verdict(&pin);
     let config = render_config(
         existing_config.as_deref(),
         &request.reviewer_signers,
         &request.stamp_sessions,
+        gate_scripts_present,
     )?;
     let hashes = rendered_hashes(&review, REVIEW_VERDICT_TRIGGER, &config.text);
     validate_path_allowlist(&hashes.keys().cloned().collect::<Vec<_>>())

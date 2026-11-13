@@ -288,10 +288,12 @@ rather than printing an empty value. It refuses (exit 1) a repository outside
   `v<version>` tag (with a `# Shipyard v<version>` comment), and the
   permission-less `review-verdict-trigger.yml`;
 - the rendered `.shipyard/config.toml`: the base's own file with only
-  `[auto_merge] reviewer_signers`, `reviewer_stamp_sessions`,
-  `fleet_review_required = true` and `[validation] pr_gates = false` set.
-  Every other key and comment is kept, and the render refuses if anything
-  else changed. `--reviewer-signer` and `--stamp-session` supply the lists;
+  `[auto_merge] reviewer_signers`, `reviewer_stamp_sessions` and
+  `fleet_review_required = true` set. `[validation] pr_gates = false` is
+  added only when the base sets no `pr_gates` and has no skill-sync or
+  version-bump gate script (`shipyard pr` refuses the opt-out beside one); an
+  existing `pr_gates` is never changed. Every other key and comment is kept,
+  and the render refuses if anything else changed. `--reviewer-signer` and `--stamp-session` supply the lists;
   without them the base's own lists are kept, and with neither the plan
   refuses;
 - the sha256 of each rendered file, the rulesets observed, and the
@@ -306,6 +308,10 @@ gh-compatible CLI for the reads, for example `ghapp`.
 The protected base may set `[auto_merge] fleet_review_required = true`: it has
 the semantics of `REVIEW_REQUIRED_REPOS` membership (review required, fleet App
 approvals count), is read from the base so a head cannot grant it to itself,
-and the compiled list remains a floor. Shipyard's own `review-verdict.yml` also
+and the compiled list remains a floor. A non-boolean value makes the policy
+unreadable. The merge steward's `approval_admission_config` invariant counts
+the switch as list membership. It is distinct from
+`arm_requires_head_approval = true`, which selects the strict
+`reviewer_identities` rule. Shipyard's own `review-verdict.yml` also
 accepts `workflow_dispatch` with a `pull_request` input; a dispatched run posts
 the status on the head and re-runs the head's own check, like a comment's run.

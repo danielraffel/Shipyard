@@ -4013,3 +4013,41 @@ fn a_non_boolean_fleet_review_switch_is_refused() {
         .expect("toml");
     assert!(super::fleet_review_required_shape(&table).is_ok());
 }
+
+/// A string `"true"` (or any non-boolean) for `fleet_review_required` read
+/// from the base is an unreadable policy, never a switch that reads as off.
+#[test]
+fn a_non_boolean_fleet_review_switch_on_the_base_is_unreadable() {
+    super::with_host_review_default(true, || {
+        let typo = |argv: &[String]| -> Result<String, String> {
+            let joined = argv.join(" ");
+            if joined.contains("contents/.shipyard/config.toml") {
+                Ok("[auto_merge]\nfleet_review_required = \"true\"\n".to_owned())
+            } else if joined.contains("/branches/") {
+                Ok("main\n".to_owned())
+            } else {
+                Err(format!("unexpected: {joined}"))
+            }
+        };
+        let error = super::read_policy_required(&typo, "danielraffel/not-listed", "main")
+            .expect_err("a string switch is unreadable");
+        let detail = String::from(error);
+        assert!(
+            detail.contains("fleet_review_required must be a boolean"),
+            "{detail}"
+        );
+        let on = |argv: &[String]| -> Result<String, String> {
+            let joined = argv.join(" ");
+            if joined.contains("contents/.shipyard/config.toml") {
+                Ok("[auto_merge]\nfleet_review_required = true\n".to_owned())
+            } else if joined.contains("/branches/") {
+                Ok("main\n".to_owned())
+            } else {
+                Err(format!("unexpected: {joined}"))
+            }
+        };
+        let policy = super::read_policy_required(&on, "danielraffel/not-listed", "main")
+            .expect("a boolean switch reads");
+        assert!(policy.required, "{policy:?}");
+    });
+}
