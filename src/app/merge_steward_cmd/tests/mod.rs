@@ -237,6 +237,7 @@ mod exact_head_merge;
 mod fix_first;
 #[cfg(unix)]
 mod head_rollup;
+mod merge_group_stall;
 #[cfg(unix)]
 mod mutation_outcome;
 mod mutations;

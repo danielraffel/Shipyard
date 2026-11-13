@@ -180,6 +180,11 @@ struct RepoReport {
     /// not ask for it.
     #[serde(skip_serializing_if = "Option::is_none")]
     base_poison: Option<Value>,
+    /// Merge groups that can never finish: every run completed and a
+    /// required context still absent ([`merge_group_stall`]). Absent when
+    /// the repository was not observed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    merge_group_stalled: Option<Value>,
     /// Required checks re-run (or, in shadow, that would be) because they
     /// failed for an infrastructure reason, and outage findings
     /// ([`infra_rerun`]). Absent when the repository was not observed.
@@ -266,6 +271,11 @@ struct StewardLedger {
     /// `poison_pause`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     poison_paused: BTreeMap<String, Vec<poison_pause::PausedEntry>>,
+    /// Doomed merge groups the steward decided on, keyed
+    /// `repo#pr@group-sha`: once per (pull request, group head). See
+    /// `merge_group_stall`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    doomed_dequeues: BTreeMap<String, merge_group_stall::Receipt>,
     /// Infra re-runs per check on an exact head, keyed
     /// `repo#pr@head:check`. See `infra_rerun`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -1768,6 +1778,7 @@ fn deferred_rate_limit_repo_report(
 ) -> RepoReport {
     RepoReport {
         base_poison: None,
+        merge_group_stalled: None,
         rollup_reconciliation: Vec::new(),
         uncertain_mutations: Vec::new(),
         repo: repo.to_owned(),
@@ -1800,6 +1811,7 @@ fn unreadable_repo_report(
 ) -> RepoReport {
     RepoReport {
         base_poison: None,
+        merge_group_stalled: None,
         rollup_reconciliation: Vec::new(),
         uncertain_mutations: Vec::new(),
         api_calls: None,
@@ -1882,6 +1894,7 @@ fn append_unmatched_recovery_errors(
             .map_or_else(|| default_base.to_owned(), |pending| pending.base.clone());
         reports.push(RepoReport {
             base_poison: None,
+            merge_group_stalled: None,
             rollup_reconciliation: Vec::new(),
             uncertain_mutations: Vec::new(),
             api_calls: None,
@@ -1924,6 +1937,7 @@ fn persist_final_ledger(
     } else {
         reports.push(RepoReport {
             base_poison: None,
+            merge_group_stalled: None,
             rollup_reconciliation: Vec::new(),
             uncertain_mutations: Vec::new(),
             api_calls: None,
@@ -2093,6 +2107,7 @@ mod head_rollup;
 pub(super) mod infra_rerun;
 pub(super) mod invariants;
 mod ledger;
+mod merge_group_stall;
 mod mutation_outcome;
 mod native_arm;
 mod next_action;

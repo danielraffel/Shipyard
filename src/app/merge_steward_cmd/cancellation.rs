@@ -124,6 +124,15 @@ pub(super) fn apply_repo_plan(
         ledger,
         Utc::now().timestamp(),
     );
+    // Merge groups that can never finish: read before any pull request is
+    // mutated, so the dequeue below acts on this pass's reading.
+    let stall_pass = super::merge_group_stall::observe(
+        &|argv: &[String]| actions.run_gh(argv).map_err(|error| error.to_string()),
+        observation,
+        policy.ejection_guards.dequeue_doomed_groups,
+        &policy.ejection_guards.base_poison.control_workflows,
+        Utc::now(),
+    );
     let (mut reports, pr_mutation_failed, listing) = apply_pr_plans_with_poison(
         actions,
         args,
@@ -133,7 +142,18 @@ pub(super) fn apply_repo_plan(
         ledger,
         mutation_control,
         base_poison.as_ref(),
+        Some(&stall_pass),
     );
+    let mut stall_lines = stall_pass.lines();
+    if args.apply {
+        stall_lines.extend(super::merge_group_stall::retry_comments(
+            ledger,
+            &observation.repo,
+            &|pr, body| {
+                super::merge_group_stall::post_comment(actions, &observation.repo, pr, body)
+            },
+        ));
+    }
     let superseded_rate_limit = ledger
         .superseded_rate_limit
         .take()
@@ -408,6 +428,13 @@ pub(super) fn apply_repo_plan(
     (
         RepoReport {
             base_poison: base_poison_report,
+            merge_group_stalled: Some(serde_json::json!({
+                "mode": stall_pass.mode,
+                "config_error": policy.ejection_guards.dequeue_doomed_groups_error,
+                "lines": stall_lines,
+                "entries": stall_pass.entries,
+                "reads": "three per queue entry whose group head has no active run",
+            })),
             rollup_reconciliation: Vec::new(),
             uncertain_mutations,
             api_calls: None,
@@ -503,6 +530,7 @@ pub(super) fn apply_pr_plans_with_listing(
         ledger,
         mutation_control,
         None,
+        None,
     )
 }
 
@@ -518,6 +546,7 @@ pub(super) fn apply_pr_plans_with_poison(
     ledger: &mut StewardLedger,
     mutation_control: Option<&MutationControl>,
     base_poison: Option<&super::base_poison::RepoPoison>,
+    merge_group_stall: Option<&super::merge_group_stall::StallPass>,
 ) -> (
     Vec<PrReport>,
     bool,
@@ -615,6 +644,39 @@ pub(super) fn apply_pr_plans_with_poison(
                 base_poison,
                 ledger,
             )
+        {
+            unhealthy |= report.error.is_some();
+            (report.mutation, report.error) = fold(report.mutation, report.error);
+            return report;
+        }
+        // A merge group that can never finish: dequeue the doomed entry
+        // (or say it would). See `merge_group_stall`.
+        if !stale_mutation
+            .as_deref()
+            .is_some_and(|mutation| mutation.contains("dequeued_"))
+            && let Some(stall) = merge_group_stall
+            && let Some(mut report) = match mutation_context.as_ref() {
+                Some(context) => super::merge_group_stall::decide(
+                    stall,
+                    args.apply,
+                    &observation.repo,
+                    pr,
+                    &decision,
+                    ledger,
+                    &super::merge_group_stall::GitHubActs { context },
+                    Utc::now(),
+                ),
+                None => super::merge_group_stall::decide(
+                    stall,
+                    false,
+                    &observation.repo,
+                    pr,
+                    &decision,
+                    ledger,
+                    &super::merge_group_stall::NoActs,
+                    Utc::now(),
+                ),
+            }
         {
             unhealthy |= report.error.is_some();
             (report.mutation, report.error) = fold(report.mutation, report.error);
@@ -809,6 +871,9 @@ pub(super) fn apply_pr_plans_with_poison(
         !args.apply,
         &mut reports,
     );
+    if let Some(stall) = merge_group_stall {
+        super::merge_group_stall::annotate(stall, &mut reports);
+    }
     // Apply passes only: they persist the ledger, so the per-head cache holds
     // and a blocked backlog costs nothing between rechecks.
     if args.apply {
