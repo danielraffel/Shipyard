@@ -11,6 +11,10 @@ Kinds:
   drain_stall    actionable PRs wait (for 2 h or more) while none of the repository's PRs
                  merged in the last 2 h
   stale_hold     a held PR row with the same head for 45 min or more
+  merge_group_stalled
+                 a queued PR row whose merge group can never finish (the steward's
+                 `merge_group_stalled:<context>` token: every run done, a required
+                 context absent)
   stuck_claim    a repair claim 30 min or more old whose PR head has not moved
   pass_fault     new log lines matching a fault signature, per signature and lane
 
@@ -193,6 +197,22 @@ def check_stale_hold(per_repo, now):
             out.append(dict(kind="stale_hold", repo=repo, lane="-", key=f"stale_hold:{repo}",
                             detail=f"{len(old)} held PR(s) 45m+ with no new head: " + ",".join(f"#{n}" for n in sorted(old)[:5]),
                             evidence=[f"{repo}#{n} {rows[n]['token']} since {rows[n]['since'].isoformat()}" for n in sorted(old)[:5]]))
+    return out
+
+
+def check_merge_group_stalled(per_repo, now):
+    """Rows the steward marked `merge_group_stalled:<context>` in its latest tick."""
+    out = []
+    for repo, ticks in per_repo.items():
+        t_last, rows = latest_valid(ticks)
+        if rows is None or now - t_last > dt.timedelta(minutes=30):
+            continue
+        stalled = sorted(pr for pr, o in rows.items() if o["token"].startswith("merge_group_stalled:"))
+        if stalled:
+            out.append(dict(kind="merge_group_stalled", repo=repo, lane="-", key=f"merge_group_stalled:{repo}",
+                            detail=f"{len(stalled)} merge group(s) can never finish: " + ",".join(f"#{n}" for n in stalled[:5]),
+                            evidence=[f"{repo}#{n} {rows[n]['token']} since {rows[n]['since'].isoformat() if rows[n]['since'] else 'unknown'}"
+                                      for n in stalled[:5]]))
     return out
 
 
@@ -401,6 +421,7 @@ def collect(a, now, state):
     f = []
     f += check_drain_stall(per_repo, now)
     f += check_stale_hold(per_repo, now)
+    f += check_merge_group_stalled(per_repo, now)
     f += check_stuck_claims(per_repo, a.runner_dir, now)
     f += scan_logs(a.fleet_dir, state, a.from_start, now)
     return f

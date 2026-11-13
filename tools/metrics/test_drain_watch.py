@@ -168,6 +168,13 @@ class DetectionTests(Base):
         _, _, f = self.run_once()
         self.assertEqual([(x["kind"], x["detail"].split(":")[1].strip()) for x in f], [("stale_hold", "#7")])
 
+    def test_merge_group_stalled_rows_are_found(self):
+        self.tick(NOW, [(406, "h", "merge_group_stalled:framework-trusted-verify", "steward", NOW - dt.timedelta(minutes=65)),
+                        (411, "i", "queued", "steward", NOW - dt.timedelta(minutes=10))])
+        _, _, f = self.run_once()
+        self.assertEqual([(x["kind"], x["detail"].split(":")[1].strip()) for x in f], [("merge_group_stalled", "#406")])
+        self.assertIn("merge_group_stalled:framework-trusted-verify", f[0]["evidence"][0])
+
     def test_stuck_claim_needs_age_and_unmoved_head(self):
         self.tick(NOW, [(5, "H1", "required_failed:macos", "repair", NOW - dt.timedelta(hours=1)),
                         (6, "H3", "required_failed:macos", "repair", NOW - dt.timedelta(hours=1))])
