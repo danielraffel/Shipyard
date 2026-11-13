@@ -42,6 +42,13 @@
 //! * no earlier flake re-enqueue of this exact head is on record. The receipt
 //!   is saved before the enqueue, so a crash cannot buy a second one.
 //!
+//! The flake class never approves anything. It runs only after the
+//! steward's own live exact-head approval read has admitted the head, and
+//! its ledger (sightings and receipts) can only refuse a re-enqueue, never
+//! stand in for approval. Any read it depends on that fails (the merge
+//! group's checks or a job log, the removal time, the receipt save) leaves
+//! the ordinary refusal in place.
+//!
 //! The re-enqueue is separate from the classifier's one free retry: a head
 //! the classifier refused still gets it. It does not lift the head-approval
 //! ejection cap ([`crate::head_approval::EJECTION_CAP`]); a head ejected
