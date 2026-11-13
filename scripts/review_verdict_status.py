@@ -191,11 +191,29 @@ def awaiting_description(head: str, excluded: list[str], admission: bool = False
     return text if len(text) <= DESCRIPTION_LIMIT else text[: DESCRIPTION_LIMIT - 1] + "…"
 
 
+def read_pages(guard: ModuleType, path: str, what: str) -> list[Any]:
+    """Every page of a paginated REST listing (``gh api --paginate --slurp``).
+
+    A listing that is not a list of pages, or any page that is not an array or
+    an object, raises: a partial listing can omit the pull request or run that
+    decides the status, so it never stands in for the whole one."""
+    pages = guard.run_real_gh(["api", "--paginate", "--slurp", path])
+    if not isinstance(pages, list) or not pages:
+        raise guard.GuardError(f"{what} are unreadable (no page list)")
+    for page in pages:
+        if not isinstance(page, (list, dict)):
+            raise guard.GuardError(f"{what} are unreadable (a page is not JSON data)")
+    return pages
+
+
 def open_pulls_on(guard: ModuleType, repo: str, head: str) -> list[int]:
-    """Every open pull request whose head is ``head``."""
-    pulls = guard.run_real_gh(["api", f"repos/{repo}/commits/{head}/pulls?per_page=100"])
-    if not isinstance(pulls, list):
-        raise guard.GuardError(f"the pull requests on {head[:12]} are unreadable")
+    """Every open pull request whose head is ``head``, across every page."""
+    what = f"the pull requests on {head[:12]}"
+    pulls: list[Any] = []
+    for page in read_pages(guard, f"repos/{repo}/commits/{head}/pulls?per_page=100", what):
+        if not isinstance(page, list):
+            raise guard.GuardError(f"{what} are unreadable")
+        pulls.extend(page)
     return sorted(
         pull["number"] for pull in pulls
         if isinstance(pull, dict) and isinstance(pull.get("number"), int)
@@ -211,11 +229,22 @@ def refresh_head_check(guard: ModuleType, repo: str, head: str) -> None:
     a refused head merge. Raises when the re-run cannot be requested (the job
     fails closed); nothing to re-run is not an error, because a head with no
     check run is a missing required check, not a green one."""
-    listing = guard.run_real_gh([
-        "api", f"repos/{repo}/actions/runs?head_sha={head}&event=pull_request_target&per_page=100"])
-    runs = listing.get("workflow_runs") if isinstance(listing, dict) else None
-    if not isinstance(runs, list):
-        raise guard.GuardError(f"the workflow runs on {head[:12]} are unreadable")
+    what = f"the workflow runs on {head[:12]}"
+    runs: list[Any] = []
+    total = 0
+    for page in read_pages(
+            guard, f"repos/{repo}/actions/runs?head_sha={head}&event=pull_request_target"
+            "&per_page=100", what):
+        rows = page.get("workflow_runs") if isinstance(page, dict) else None
+        count = page.get("total_count") if isinstance(page, dict) else None
+        if not isinstance(rows, list) or not isinstance(count, int) or isinstance(count, bool):
+            raise guard.GuardError(f"{what} are unreadable")
+        runs.extend(rows)
+        total = max(total, count)
+    if len(runs) < total:
+        # A truncated listing can hide the head's own run, and "no run" must
+        # only ever mean there is none.
+        raise guard.GuardError(f"{what} are incomplete: {len(runs)} of {total} read")
     ours = [r for r in runs if isinstance(r, dict) and r.get("name") == WORKFLOW_NAME
             and isinstance(r.get("id"), int)]
     if not ours:

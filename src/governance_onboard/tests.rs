@@ -530,3 +530,43 @@ fn the_plan_is_read_only_and_marks_the_included_steps() {
         assert!(!path.contains("-X") && !path.contains("--method"), "{path}");
     }
 }
+
+#[test]
+fn require_checks_reach_the_tightening_step_bound_to_actions() {
+    let fake = healthy();
+    let mut request = request();
+    request.require_checks = vec![
+        "macos".to_owned(),
+        " lint ".to_owned(),
+        "macos".to_owned(),
+        "review-verdict".to_owned(),
+    ];
+    let plan = build_plan(&fake, &request).expect("plan");
+    let expected = json!([
+        {"context": "review-verdict", "integration_id": 15368},
+        {"context": "macos", "integration_id": 15368},
+        {"context": "lint", "integration_id": 15368},
+    ]);
+    let tightened = &plan["steps"][5];
+    assert_eq!(tightened["name"], "tightened");
+    assert_eq!(tightened["required_status_checks_to_add"], expected);
+    assert_eq!(plan["required_status_checks_to_add"], expected);
+
+    let control = build_plan(&fake, &self::request()).expect("plan");
+    assert_eq!(
+        control["steps"][5]["required_status_checks_to_add"],
+        json!([{"context": "review-verdict", "integration_id": 15368}])
+    );
+}
+
+#[test]
+fn a_blank_require_check_is_refused_before_any_read() {
+    let fake = healthy();
+    let mut request = request();
+    request.require_checks = vec!["  ".to_owned()];
+    assert_eq!(
+        build_plan(&fake, &request).expect_err("blank").exit_code(),
+        1
+    );
+    assert!(fake.calls.borrow().is_empty());
+}

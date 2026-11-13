@@ -296,6 +296,9 @@ rather than printing an empty value. It refuses (exit 1) a repository outside
   and the render refuses if anything else changed. `--reviewer-signer` and `--stamp-session` supply the lists;
   without them the base's own lists are kept, and with neither the plan
   refuses;
+- the `required_status_checks` entries the tightening step would add:
+  `review-verdict` and each `--require-check` (trimmed, deduplicated, a blank
+  name refused), each bound to the GitHub Actions app (integration 15368);
 - the sha256 of each rendered file, the rulesets observed, and the
   first-evaluation sweep: every open, non-draft PR, marked `skip-existing`
   when its head already carries a `review-verdict` commit status or an

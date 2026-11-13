@@ -616,6 +616,28 @@ pub fn sweep_rows(
     Ok(rows)
 }
 
+/// The `required_status_checks` entries the tightening step adds:
+/// `review-verdict` and each `--require-check`, in order, without duplicates,
+/// each bound to the GitHub Actions app. A blank name is refused.
+pub fn planned_required_checks(require_checks: &[String]) -> Result<Vec<Value>, OnboardError> {
+    let mut names: Vec<&str> = vec![REVIEW_VERDICT_CONTEXT];
+    for name in require_checks {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(OnboardError::Refused(
+                "--require-check names an empty context".to_owned(),
+            ));
+        }
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    Ok(names
+        .into_iter()
+        .map(|context| json!({"context": context, "integration_id": ACTIONS_INTEGRATION_ID}))
+        .collect())
+}
+
 /// Build the read-only onboarding plan. Only GET requests are made, and the
 /// ownership and argument guards run before the first one.
 pub fn build_plan(
@@ -631,6 +653,7 @@ pub fn build_plan(
     }
     let through = resolve_through(request.through.as_deref(), request.no_enroll)
         .map_err(OnboardError::Refused)?;
+    let required_checks = planned_required_checks(&request.require_checks)?;
     if !is_owned_repo(repo) {
         return Err(OnboardError::Refused(format!(
             "refusing non-owned repository {repo}"
@@ -681,7 +704,14 @@ pub fn build_plan(
     let pulls = read_all_pages(reader, &format!("repos/{repo}/pulls?state=open"))?;
     let sweep = sweep_rows(reader, repo, &pulls)?;
 
-    let steps = plan_steps(through, &hashes, &config.changed_keys, &rulesets, &sweep);
+    let steps = plan_steps(
+        through,
+        &hashes,
+        &config.changed_keys,
+        &rulesets,
+        &required_checks,
+        &sweep,
+    );
 
     Ok(json!({
         "command": "governance onboard",
@@ -690,6 +720,7 @@ pub fn build_plan(
         "repo": repo,
         "profile": request.profile,
         "require_checks": request.require_checks,
+        "required_status_checks_to_add": required_checks,
         "default_branch": default_branch,
         "through": through,
         "shipyard_pin": pin,
@@ -708,6 +739,7 @@ fn plan_steps(
     hashes: &BTreeMap<String, String>,
     changed_keys: &[String],
     rulesets: &[Value],
+    required_checks: &[Value],
     sweep: &[SweepRow],
 ) -> Vec<Value> {
     let last = STEPS
@@ -732,6 +764,7 @@ fn plan_steps(
             "merged" => json!({"action": "mergePullRequest(expectedHeadOid)"}),
             "tightened" => json!({
                 "action": "back up and add to the ruleset",
+                "required_status_checks_to_add": required_checks,
                 "rulesets_observed": rulesets,
             }),
             "evaluated" => json!({

@@ -105,6 +105,11 @@ post the status and then re-run the head's newest `pull_request_target` run
 (`actions: write`), so an APPROVE or a HOLD changes the head's check without a
 new push. A re-run that cannot be requested fails the job.
 
+Both listings the poster reads are paginated in full: every open pull request
+sharing the head is judged, and the head's own run is found on any page. A
+listing that is unreadable, malformed, or shorter than its `total_count`
+fails the job instead of standing in for the whole one.
+
 ## Trust
 
 Every trigger runs the default branch's definition of the poster:
