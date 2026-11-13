@@ -258,3 +258,25 @@ for n in (0, 1, 2):
 os.execv("/usr/bin/python3", ["python3", "-I", sys.argv[1], "--daily", "--log-dir", sys.argv[2]])
 ' "$loss_report" "$log_dir" || true
 fi
+
+# Drain and fault watch (docs/drain-watch.md): stalled drains, stale HOLDs, stuck
+# repair claims and new pass-runner fault signatures, from local files only. It
+# announces each finding once as a `drain-watch` line in summary.log and, when a
+# finding persists into a second run, files one issue via ghapp. Detached like
+# the others; its own lock; exits 0 whatever happens. SHIPYARD_DRAIN_WATCH=off
+# turns it off.
+drain_watch="${SHIPYARD_DRAIN_WATCH_SCRIPT:-$clones/deploy/Shipyard/tools/metrics/drain_watch.py}"
+if [ "${SHIPYARD_DRAIN_WATCH:-on}" != "off" ] && [ -f "$drain_watch" ]; then
+  /usr/bin/python3 -c '
+import os, sys
+if os.fork():
+    sys.exit(0)
+os.setsid()
+if os.fork():
+    os._exit(0)
+fd = os.open(os.devnull, os.O_RDWR)
+for n in (0, 1, 2):
+    os.dup2(fd, n)
+os.execv("/usr/bin/python3", ["python3", "-I", sys.argv[1], "--tick", "--log-dir", sys.argv[2]])
+' "$drain_watch" "$log_dir" || true
+fi
