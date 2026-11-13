@@ -6135,8 +6135,10 @@ head gets no shortcut: ancestry cannot say which PR introduced a shared commit.
 
 Changes to Shipyard steward behavior must carry this note or a reviewed skill-sync exception so the version-and-skill gate records the operational impact.
 
-Since 2026-11-13 a `src/` change needs a note in this skill only (not also in
-`ci`), while generic `docs/` and `planning/` changes need no skill note.
-Explicit paths mapped to another skill, such as the external-contributor review
-documents, remain governed by that mapping. `scripts/skill_path_map.json` is
-the map.
+Since 2026-11-13 a generic `src/` change needs a note in this skill only (not
+also in `ci`), while generic `docs/` and `planning/` changes need no skill
+note. Path matches are additive: the explicit `src/changelog.rs` and
+`src/app/changelog_cmd.rs` paths remain mapped to `changelog` as well, and
+explicit paths mapped to another skill, such as the external-contributor
+review documents, remain governed by that mapping. `scripts/skill_path_map.json`
+is the map.
