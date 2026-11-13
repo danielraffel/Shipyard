@@ -5,6 +5,7 @@
 #   tick         Shipyard tools/steward-tick/shipyard-steward-tick.sh -> FLEET_DEPLOY_TICK_DEST
 #   deploy       Shipyard tools/fleet-deploy/fleet-deploy.sh          -> FLEET_DEPLOY_SELF_DEST
 #   pass-runner  fleet-handbook scripts/pass-runner, through its own scripts/install-pass-runner.sh
+#   launcher     a staged, signed ShipyardLauncher.app      -> FLEET_DEPLOY_LAUNCHER_DEST
 #
 # These scripts used to be copied to a host by hand, so a merged fix could sit
 # undeployed with nothing noticing (2026-11-12: m3 ran a steward tick from
@@ -30,6 +31,8 @@ handbook_remote="${FLEET_DEPLOY_HANDBOOK_REMOTE:-git@github.com:danielraffel/fle
 tick_dest="${FLEET_DEPLOY_TICK_DEST:-$HOME/.local/libexec/shipyard-steward-tick.sh}"
 self_dest="${FLEET_DEPLOY_SELF_DEST:-$HOME/.local/libexec/shipyard-fleet-deploy.sh}"
 keep_backups="${FLEET_DEPLOY_KEEP_BACKUPS:-5}"
+launcher_staged="${FLEET_DEPLOY_LAUNCHER_STAGED:-$HOME/.local/share/shipyard/launcher/staged/ShipyardLauncher.app}"
+launcher_dest="${FLEET_DEPLOY_LAUNCHER_DEST:-$HOME/.local/libexec/ShipyardLauncher.app}"
 export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o BatchMode=yes -o ConnectTimeout=15}"
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 
@@ -82,9 +85,64 @@ install_file() {
   say "unit=$unit installed rev=$rev dest=$dest"
 }
 
+# say_once UNIT LINE: log a standing state (nothing staged, already current, a
+# refusal) once when it changes, not on every run.
+say_once() {
+  local file="$root/$1.state"
+  [ "$(cat "$file" 2>/dev/null)" = "$2" ] && return 0
+  printf '%s\n' "$2" > "$file"
+  say "$2"
+}
+
+# install_launcher REV: ShipyardLauncher.app (tools/shipyard-launcher/README.md).
+# It is built, signed and notarized on the maintainer's Mac, never here, and
+# staged on this host by hand. A staged bundle is installed only when
+# shipyard-launcher-check --verify-bundle accepts it: Developer ID signed by
+# the installed Shipyard's team, with the launcher's bundle identifier, and
+# notarized. The copy is verified again before it replaces the installed
+# bundle, and the previous bundle is kept as <dest>.bak-<stamp>. Installing
+# never activates the launcher: routing waits for the owner's Full Disk Access
+# grant and shipyard-launcher-check --activate.
+install_launcher() {
+  local rev=$1 check="$root/Shipyard/tools/shipyard-launcher/shipyard-launcher-check" tmp out
+  [ "$(uname -s)" = Darwin ] || return 0
+  if [ ! -d "$launcher_staged" ]; then
+    say_once launcher "unit=launcher absent staged=$launcher_staged"
+    return 0
+  fi
+  if [ -d "$launcher_dest" ] && diff -rq "$launcher_staged" "$launcher_dest" >/dev/null 2>&1; then
+    say_once launcher "unit=launcher current dest=$launcher_dest"
+    return 0
+  fi
+  if ! out=$(/usr/bin/python3 "$check" --verify-bundle "$launcher_staged" 2>&1); then
+    say_once launcher "unit=launcher refused rev=$rev reason=$(printf '%s' "$out" | head -c 200 | tr '\n' ' ')"
+    return 0
+  fi
+  tmp="$launcher_dest.tmp.$$"
+  if ! mkdir -p "$(dirname "$launcher_dest")" || ! ditto "$launcher_staged" "$tmp" \
+    || ! /usr/bin/python3 "$check" --verify-bundle "$tmp" >/dev/null 2>&1; then
+    rm -rf "$tmp"; say "unit=launcher refused rev=$rev reason=copy"; return 0
+  fi
+  if [ -d "$launcher_dest" ] && ! mv "$launcher_dest" "$launcher_dest.bak-$stamp"; then
+    rm -rf "$tmp"; say "unit=launcher refused rev=$rev reason=backup"; return 0
+  fi
+  if ! mv "$tmp" "$launcher_dest"; then
+    [ -d "$launcher_dest.bak-$stamp" ] && mv "$launcher_dest.bak-$stamp" "$launcher_dest"
+    rm -rf "$tmp"; say "unit=launcher refused rev=$rev reason=install"; return 0
+  fi
+  local n=0 old
+  for old in $(ls -1dt "$launcher_dest".bak-* 2>/dev/null); do
+    n=$((n + 1))
+    [ "$n" -gt "$keep_backups" ] && rm -rf "$old"
+  done
+  say "unit=launcher installed rev=$rev dest=$launcher_dest"
+  printf '%s\n' "unit=launcher current dest=$launcher_dest" > "$root/launcher.state"
+}
+
 if rev=$(sync_clone Shipyard "$shipyard_remote"); then
   install_file tick "$root/Shipyard/tools/steward-tick/shipyard-steward-tick.sh" "$tick_dest" "$rev"
   install_file deploy "$root/Shipyard/tools/fleet-deploy/fleet-deploy.sh" "$self_dest" "$rev"
+  install_launcher "$rev"
 else
   say "unit=tick refused reason=fetch_failed"
 fi

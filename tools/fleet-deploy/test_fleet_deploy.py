@@ -2,11 +2,26 @@
 import os
 import pathlib
 import subprocess
+import sys
 import tempfile
 import unittest
 
 HERE = pathlib.Path(__file__).resolve().parent
 SCRIPT = HERE / "fleet-deploy.sh"
+CHECK = HERE.parent / "shipyard-launcher" / "shipyard-launcher-check"
+
+FAKE_CODESIGN = """#!/bin/bash
+# Stand-in for /usr/bin/codesign: -dv reports a team, --verify obeys the test.
+case "$1" in
+  -dv) echo "TeamIdentifier=TEAM123456" >&2; exit 0 ;;
+  --verify) [ -f "$FAKE_TOOLS/codesign-refuses" ] && { echo "invalid signature" >&2; exit 1; }; exit 0 ;;
+esac
+exit 2
+"""
+FAKE_SPCTL = """#!/bin/bash
+echo "$4: accepted"
+echo "source=Notarized Developer ID"
+"""
 
 FAKE_INSTALLER = """#!/bin/bash
 # Stand-in for fleet-handbook's install-pass-runner.sh.
@@ -31,6 +46,7 @@ class FleetDeployTests(unittest.TestCase):
         self.shipyard = self.make_repo("Shipyard", {
             "tools/steward-tick/shipyard-steward-tick.sh": "#!/bin/bash\necho tick v1\n",
             "tools/fleet-deploy/fleet-deploy.sh": SCRIPT.read_text(),
+            "tools/shipyard-launcher/shipyard-launcher-check": CHECK.read_text(),
         })
         self.handbook = self.make_repo("fleet-handbook", {
             "scripts/install-pass-runner.sh": FAKE_INSTALLER,
@@ -49,7 +65,18 @@ class FleetDeployTests(unittest.TestCase):
             "FLEET_DEPLOY_SELF_DEST": str(self.self_dest),
             "FLEET_PASS_LIVE": str(self.live),
             "GIT_CONFIG_GLOBAL": str(t / "gitconfig"),
+            "FAKE_TOOLS": str(t / "tools"),
+            "SHIPYARD_LAUNCHER_CHECK_CODESIGN": str(t / "tools" / "codesign"),
+            "SHIPYARD_LAUNCHER_CHECK_SPCTL": str(t / "tools" / "spctl"),
         })
+        (t / "tools").mkdir()
+        for name, text in (("codesign", FAKE_CODESIGN), ("spctl", FAKE_SPCTL)):
+            (t / "tools" / name).write_text(text)
+            (t / "tools" / name).chmod(0o755)
+        (t / ".local" / "bin").mkdir(parents=True)
+        (t / ".local" / "bin" / "shipyard").write_text("#!/bin/sh\n")
+        self.staged = t / ".local" / "share" / "shipyard" / "launcher" / "staged" / "ShipyardLauncher.app"
+        self.launcher_dest = t / ".local" / "libexec" / "ShipyardLauncher.app"
         (t / "gitconfig").write_text("[user]\n\tname = t\n\temail = t@example.invalid\n[init]\n\tdefaultBranch = main\n")
 
     def tearDown(self):
@@ -159,6 +186,54 @@ class FleetDeployTests(unittest.TestCase):
         self.commit("Shipyard", "tools/steward-tick/shipyard-steward-tick.sh", "#!/bin/bash\necho tick v3\n")
         self.run_deploy(FLEET_DEPLOY_INTERVAL_S="3600")
         self.assertIn("tick v1", self.tick_dest.read_text())
+
+    # -- launcher unit (macOS only: it needs ditto) --------------------------
+
+    def stage_launcher(self, version):
+        exe = self.staged / "Contents" / "MacOS" / "shipyard-launcher"
+        exe.parent.mkdir(parents=True, exist_ok=True)
+        exe.write_text(f"#!/bin/sh\necho {version}\n")
+        exe.chmod(0o755)
+
+    @unittest.skipUnless(sys.platform == "darwin", "the launcher unit runs on macOS only")
+    def test_launcher_absent_is_logged_once(self):
+        self.run_deploy()
+        self.run_deploy()
+        self.assertEqual(self.log.read_text().count("unit=launcher absent"), 1)
+        self.assertFalse(self.launcher_dest.exists())
+
+    @unittest.skipUnless(sys.platform == "darwin", "the launcher unit runs on macOS only")
+    def test_verified_launcher_is_installed_backed_up_and_never_activated(self):
+        self.stage_launcher("v1")
+        self.run_deploy()
+        exe = self.launcher_dest / "Contents" / "MacOS" / "shipyard-launcher"
+        self.assertIn("v1", exe.read_text())
+        self.assertIn("unit=launcher installed", self.log.read_text())
+        before = self.log.read_text()
+        self.run_deploy()
+        self.assertEqual(self.log.read_text(), before, "an unchanged bundle is not reinstalled")
+        self.stage_launcher("v2")
+        self.run_deploy()
+        self.assertIn("v2", exe.read_text())
+        backups = list(self.launcher_dest.parent.glob("ShipyardLauncher.app.bak-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertIn("v1", (backups[0] / "Contents" / "MacOS" / "shipyard-launcher").read_text())
+        self.assertFalse((self.t / ".local" / "share" / "shipyard" / "launcher" / "activation.json").exists())
+
+    @unittest.skipUnless(sys.platform == "darwin", "the launcher unit runs on macOS only")
+    def test_unverified_launcher_is_refused_and_installed_one_kept(self):
+        self.stage_launcher("v1")
+        self.run_deploy()
+        (self.t / "tools" / "codesign-refuses").write_text("")
+        self.stage_launcher("v2-unsigned")
+        self.run_deploy()
+        self.run_deploy()
+        exe = self.launcher_dest / "Contents" / "MacOS" / "shipyard-launcher"
+        self.assertIn("v1", exe.read_text())
+        log = self.log.read_text()
+        self.assertEqual(log.count("unit=launcher refused"), 1, log)
+        self.assertIn("signature does not satisfy", log)
+        self.assertEqual(list(self.launcher_dest.parent.glob("*.tmp.*")), [])
 
 
 if __name__ == "__main__":

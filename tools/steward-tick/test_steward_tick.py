@@ -160,5 +160,88 @@ class StewardTickArchiveTests(unittest.TestCase):
         self.assertFalse(old_archive.exists())
 
 
+FAKE_LAUNCHER = """#!/bin/bash
+# Stand-in for ShipyardLauncher.app's executable.
+echo "$*" >> "$HOME/launcher-calls"
+if [ "$1" = --launcher-verify ]; then
+  [ "${FAKE_VERIFY_RC:-0}" = 0 ] || { echo "refused: not a Developer ID signed Shipyard" >&2; exit "$FAKE_VERIFY_RC"; }
+  echo '{"ok":true}'; exit 0
+fi
+if [ "$1" = --launcher-script ] && [ "$2" = steward-tick ]; then
+  SHIPYARD_LAUNCHER_APP=/fake/ShipyardLauncher.app exec /bin/bash --noprofile --norc "$HOME/.local/libexec/shipyard-steward-tick.sh"
+fi
+exit 64
+"""
+
+
+class StewardTickLauncherTests(unittest.TestCase):
+    """The tick routes itself through ShipyardLauncher.app once activated."""
+
+    run_tick = StewardTickArchiveTests.run_tick
+    tearDown = StewardTickArchiveTests.tearDown
+
+    def setUp(self):
+        StewardTickArchiveTests.setUp(self)
+        libexec = self.home / ".local" / "libexec"
+        libexec.mkdir(parents=True)
+        self.installed = libexec / "shipyard-steward-tick.sh"
+        self.installed.write_text(SCRIPT.read_text())
+        self.installed.chmod(0o755)
+        exe = libexec / "ShipyardLauncher.app" / "Contents" / "MacOS" / "shipyard-launcher"
+        exe.parent.mkdir(parents=True)
+        exe.write_text(FAKE_LAUNCHER)
+        exe.chmod(0o755)
+        self.record = self.home / ".local" / "share" / "shipyard" / "launcher" / "activation.json"
+        self.calls = self.home / "launcher-calls"
+
+    def activate(self):
+        self.record.parent.mkdir(parents=True, exist_ok=True)
+        self.record.write_text('{"schema": 1}\n')
+
+    def run_installed(self, **env):
+        current = self.env.copy()
+        current.update(env)
+        return subprocess.run(["/bin/bash", str(self.installed)], env=current, text=True, capture_output=True)
+
+    def summary(self):
+        return (self.log_dir / "summary.log").read_text()
+
+    def test_not_activated_runs_directly_without_calling_the_launcher(self):
+        result = self.run_installed()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("launcher=direct", self.summary())
+        self.assertFalse(self.calls.exists())
+
+    def test_activated_tick_runs_under_the_launcher(self):
+        self.activate()
+        result = self.run_installed()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.calls.read_text().splitlines(), ["--launcher-verify", "--launcher-script steward-tick"])
+        self.assertIn("acme/repo rc=0", self.summary())
+        self.assertIn("launcher=app", self.summary())
+        self.assertNotIn("launcher=direct", self.summary())
+
+    def test_launcher_refusal_falls_back_and_says_why(self):
+        self.activate()
+        result = self.run_installed(FAKE_VERIFY_RC="77")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.calls.read_text().splitlines(), ["--launcher-verify"])
+        self.assertIn("launcher=direct reason=verify_failed: refused: not a Developer ID signed Shipyard", self.summary())
+        self.assertIn("acme/repo rc=0", self.summary())
+
+    def test_only_the_installed_copy_routes(self):
+        self.activate()
+        result = self.run_tick()  # the repository copy, not ~/.local/libexec
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.calls.exists())
+        self.assertIn("launcher=direct", self.summary())
+
+    def test_off_switch(self):
+        self.activate()
+        result = self.run_installed(SHIPYARD_STEWARD_LAUNCHER="off")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.calls.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

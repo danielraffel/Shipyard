@@ -1,0 +1,153 @@
+"""Tests for shipyard-launcher-check with fake codesign, spctl and open."""
+
+import json
+import os
+import pathlib
+import stat
+import subprocess
+import sys
+import tempfile
+import unittest
+
+CHECK = pathlib.Path(__file__).resolve().with_name("shipyard-launcher-check")
+
+FAKE_CODESIGN = """#!/bin/bash
+case "$1" in
+  -dv) echo "TeamIdentifier=${FAKE_TEAM:-TEAM123456}" >&2; exit 0 ;;
+  --verify)
+    for arg; do case "$arg" in -R=*) echo "$arg" > "$FAKE_TOOLS/requirement" ;; esac; done
+    [ -f "$FAKE_TOOLS/codesign-refuses" ] && { echo "a sealed resource is missing or invalid" >&2; exit 1; }
+    exit 0 ;;
+esac
+exit 2
+"""
+FAKE_SPCTL = """#!/bin/bash
+if [ -f "$FAKE_TOOLS/unnotarized" ]; then echo "rejected"; echo "source=Unnotarized Developer ID"; exit 3; fi
+echo "accepted"; echo "source=Notarized Developer ID"
+"""
+# `open -n -g -a APP --args --launcher-check-access --launcher-result FILE`
+FAKE_OPEN = """#!/bin/bash
+[ -f "$FAKE_TOOLS/open-fails" ] && { echo "LSOpenURLsWithRole() failed with error -10810" >&2; exit 1; }
+echo "$*" > "$FAKE_TOOLS/open-args"
+result="${@: -1}"
+printf '{"schema":1,"full_disk_access":"%s","errno":%s}\\n' "${FAKE_FDA:-denied}" "${FAKE_ERRNO:-1}" > "$result"
+"""
+FAKE_LAUNCHER = """#!/bin/bash
+[ "$1" = --launcher-verify ] || exit 64
+[ -f "$FAKE_TOOLS/launcher-refuses" ] && { echo "shipyard-launcher: not a Developer ID signed Shipyard" >&2; exit 77; }
+echo '{"ok":true,"target":"/h/.local/share/shipyard/auth-generations/x/shipyard"}'
+"""
+
+
+class LauncherCheckTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = pathlib.Path(self.tmp.name)
+        self.tools = self.home / "tools"
+        self.tools.mkdir()
+        for name, text in (("codesign", FAKE_CODESIGN), ("spctl", FAKE_SPCTL), ("open", FAKE_OPEN)):
+            (self.tools / name).write_text(text)
+            (self.tools / name).chmod(0o755)
+        (self.home / ".local" / "bin").mkdir(parents=True)
+        (self.home / ".local" / "bin" / "shipyard").write_text("#!/bin/sh\n")
+        self.app = self.home / ".local" / "libexec" / "ShipyardLauncher.app"
+        self.record = self.home / ".local" / "share" / "shipyard" / "launcher" / "activation.json"
+        self.env = dict(
+            os.environ,
+            SHIPYARD_LAUNCHER_CHECK_HOME=str(self.home),
+            SHIPYARD_LAUNCHER_CHECK_CODESIGN=str(self.tools / "codesign"),
+            SHIPYARD_LAUNCHER_CHECK_SPCTL=str(self.tools / "spctl"),
+            SHIPYARD_LAUNCHER_CHECK_OPEN=str(self.tools / "open"),
+            SHIPYARD_LAUNCHER_CHECK_WAIT_SECS="3",
+            FAKE_TOOLS=str(self.tools),
+        )
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def install(self):
+        exe = self.app / "Contents" / "MacOS" / "shipyard-launcher"
+        exe.parent.mkdir(parents=True)
+        exe.write_text(FAKE_LAUNCHER)
+        exe.chmod(0o755)
+
+    def flag(self, name):
+        (self.tools / name).write_text("")
+
+    def check(self, *args, **env):
+        merged = dict(self.env)
+        merged.update(env)
+        return subprocess.run([sys.executable, str(CHECK), *args], env=merged, capture_output=True, text=True)
+
+    def test_not_installed(self):
+        result = self.check()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("FAIL bundle", result.stdout)
+        self.assertIn("staged/ShipyardLauncher.app", result.stdout)
+
+    def test_requirement_pins_developer_id_identifier_and_the_shipyard_team(self):
+        self.install()
+        self.check("--json", FAKE_TEAM="ABCDE12345")
+        requirement = (self.tools / "requirement").read_text()
+        self.assertIn('identifier "com.danielraffel.shipyard.launcher"', requirement)
+        self.assertIn("anchor apple generic", requirement)
+        self.assertIn("certificate 1[field.1.2.840.113635.100.6.2.6] exists", requirement)
+        self.assertIn("certificate leaf[field.1.2.840.113635.100.6.1.13] exists", requirement)
+        self.assertIn('certificate leaf[subject.OU] = "ABCDE12345"', requirement)
+
+    def test_bad_signature_or_missing_notarization_is_not_ready(self):
+        self.install()
+        self.flag("codesign-refuses")
+        self.assertIn("signature does not satisfy", self.check().stdout)
+        (self.tools / "codesign-refuses").unlink()
+        self.flag("unnotarized")
+        result = self.check("--verify-bundle", str(self.app))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("not notarized", result.stdout)
+
+    def test_refused_release_is_not_ready(self):
+        self.install()
+        self.flag("launcher-refuses")
+        result = self.check()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("FAIL release", result.stdout)
+
+    def test_without_full_disk_access_names_the_owner_step_and_will_not_activate(self):
+        self.install()
+        result = self.check("--activate")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("FAIL full_disk_access: denied", result.stdout)
+        self.assertIn("Privacy & Security > Full Disk Access", result.stdout)
+        self.assertFalse(self.record.exists())
+        args = (self.tools / "open-args").read_text()
+        self.assertIn(f"-n -g -a {self.app} --args --launcher-check-access --launcher-result", args)
+
+    def test_granted_then_activate_and_deactivate(self):
+        self.install()
+        result = self.check(FAKE_FDA="granted", FAKE_ERRNO="0")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("Ready: run with --activate", result.stdout)
+        self.assertFalse(self.record.exists(), "a plain check is read-only")
+        result = self.check("--activate", FAKE_FDA="granted", FAKE_ERRNO="0")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        record = json.loads(self.record.read_text())
+        self.assertEqual(record["schema"], 1)
+        self.assertEqual(record["team"], "TEAM123456")
+        self.assertEqual(stat.S_IMODE(self.record.stat().st_mode), 0o600)
+        self.assertIn("activated: yes", result.stdout)
+        result = self.check("--deactivate")
+        self.assertEqual(result.returncode, 0)
+        self.assertFalse(self.record.exists())
+
+    def test_launch_services_unavailable_is_unknown(self):
+        self.install()
+        self.flag("open-fails")
+        result = self.check("--json")
+        self.assertEqual(result.returncode, 1)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["checks"]["full_disk_access"]["state"], "unknown")
+        self.assertIn("GUI session", self.check().stdout)
+
+
+if __name__ == "__main__":
+    unittest.main()
