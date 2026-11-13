@@ -118,11 +118,25 @@ def recent_ticks(log_dir, now, span):
                 na = p.get("next_action") or {}
                 rows[p["number"]] = {"head": p.get("head_sha"), "token": p.get("blocked_on") or "unknown",
                                      "actor": na.get("actor"), "stop": bool(na.get("stop")),
-                                     "since": parse_iso(p.get("since"))}
+                                     "since": parse_iso(p.get("since")), "deferred": read_deferred(p)}
             per_repo.setdefault(r["repo"], []).append((t, rows))
     for v in per_repo.values():
         v.sort(key=lambda x: x[0])
     return per_repo
+
+
+READ_ERROR_RE = re.compile(r"HTTP 50\d|timed out|unreadable|cannot read|read failed")
+
+
+def read_deferred(p):
+    """A PR the pass could not read this tick (a transient 5xx or timeout): it was
+    neither judged nor refused, so it is unobserved, never an event. Mirrors the
+    `read_deferred=` split in shipyard-steward-tick.sh."""
+    err = p.get("error")
+    if err is None:
+        return False
+    kind = p.get("error_kind")
+    return kind == "read" or (kind is None and bool(READ_ERROR_RE.search(str(err))))
 
 
 def latest_valid(ticks):
@@ -144,7 +158,7 @@ def check_drain_stall(per_repo, now):
         if t_last - valid[0][0] < STALL_WINDOW - dt.timedelta(minutes=15):
             continue  # not enough history to say nothing merged in 2 h
         waiting = [pr for pr, o in rows.items()
-                   if classify(o["token"], o["actor"], o["stop"]) == "actionable"
+                   if not o["deferred"] and classify(o["token"], o["actor"], o["stop"]) == "actionable"
                    and (o["since"] or t_last) <= t_last - STALL_WINDOW]
         if not waiting:
             continue
@@ -168,7 +182,7 @@ def check_stale_hold(per_repo, now):
         if rows is None or now - t_last > dt.timedelta(minutes=30):
             continue
         old = [pr for pr, o in rows.items()
-               if (o["token"] == "held" or o["token"].startswith("held:")) and o["since"]
+               if not o["deferred"] and (o["token"] == "held" or o["token"].startswith("held:")) and o["since"]
                and t_last - o["since"] >= STALE_HOLD]
         if old:
             out.append(dict(kind="stale_hold", repo=repo, lane="-", key=f"stale_hold:{repo}",

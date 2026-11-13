@@ -93,10 +93,21 @@ steward_one() {
   rc=$?
   local took=$((SECONDS - t0))
   # Three outcomes: a completed pass (rc 0, or rc 1 when it only refused some
-  # PRs; pr_refused names them, since repos[].errors does not count them) prints counts; a pass that could not take the steward lock (a gate
+  # PRs; pr_refused names them, since repos[].errors does not count them; read_deferred names PRs the pass could not read) prints counts; a pass that could not take the steward lock (a gate
   # VM's admission check held it) is a skip; anything else is an ERROR line.
   if [ -s "$out" ]; then
-    counts=$(jq -r '. as $root | ([.repos[]?.errors[]?]|length) as $e | [.repos[]?.prs[]?|.mutation|tostring] | "enqueued=\(map(select(test("enqueued|merged_exact_head")))|length) waiting_approval=\(map(select(.=="waiting_head_approval"))|length) errors=\($e) pr_refused=\([$root.repos[]?.prs[]?|select(.error!=null)|"#\(.number)"]|join(",")|if .=="" then "0" else . end)"' "$out" 2>/dev/null || echo "ERROR unreadable-output")
+    # A PR error is a transient read failure (HTTP 5xx, a timeout, an unreadable
+    # approval) or a policy refusal. The pass may name the kind (`error_kind`:
+    # read | policy); an older binary does not, so fall back to the error text.
+    # Failing closed on an unread PR is right, but it is not a refusal: those PRs
+    # go to read_deferred=, and only real refusals go to pr_refused=.
+    counts=$(jq -r '
+      def deferred: .error != null and (.error_kind == "read" or (.error_kind == null and ((.error|tostring)|test("HTTP 50[0-9]|timed out|unreadable|cannot read|read failed"))));
+      def names(f): [. as $root | $root.repos[]?.prs[]? | select(f) | "#\(.number)"] | join(",") | if . == "" then "0" else . end;
+      . as $root | ([.repos[]?.errors[]?]|length) as $e | [.repos[]?.prs[]?|.mutation|tostring] |
+      "enqueued=\(map(select(test("enqueued|merged_exact_head")))|length) waiting_approval=\(map(select(.=="waiting_head_approval"))|length) errors=\($e) pr_refused=\($root|names(.error != null and (deferred|not))) read_deferred=\($root|names(deferred))"' "$out" 2>/dev/null || echo "ERROR unreadable-output")
+    # rc=1 from a pass whose only per-PR errors were transient reads is not a failed tick.
+    if [ "$rc" = 1 ] && [[ "$counts" == *"errors=0 pr_refused=0 read_deferred="* ]] && [[ "$counts" != *"read_deferred=0" ]]; then rc=0; fi
     # ok, FAIL:<id>,<id>, or off when the pass reported none (an older binary,
     # --no-invariants, or a repository it could not observe).
     invariants=$(jq -r '[.repos[]? | select(has("invariants"))] as $r | if ($r|length)==0 then "off" else ([$r[].invariants[] | select(.ok==false and (.skipped|not)) | .id] | if length==0 then "ok" else "FAIL:"+join(",") end) end' "$out" 2>/dev/null || echo ERROR)
