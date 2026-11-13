@@ -20,9 +20,25 @@ clones="$HOME/.local/share/shipyard-steward"
 # (2026-11-12). It acts at most every 10 minutes, installs only what validates,
 # logs "fleet-deploy" lines here, and never fails the tick. The new tick takes
 # effect on the next run. SHIPYARD_FLEET_DEPLOY=off turns it off.
+# It runs detached in its own session: the pass-runner installer's self-tests
+# take minutes, and waiting on them ate the tick's admission budget
+# (2026-11-13, about 4 minutes). launchd ends the job's process group when
+# the tick exits, so the deploy is started with setsid to outlive it; its own
+# lock stops two deploys overlapping.
 fleet_deploy="$HOME/.local/libexec/shipyard-fleet-deploy.sh"
 if [ -x "$fleet_deploy" ]; then
-  FLEET_DEPLOY_LOG="$log_dir/summary.log" "$fleet_deploy" </dev/null >/dev/null 2>&1 || true
+  FLEET_DEPLOY_LOG="$log_dir/summary.log" /usr/bin/python3 -c '
+import os, sys
+if os.fork():
+    sys.exit(0)
+os.setsid()
+if os.fork():
+    os._exit(0)
+fd = os.open(os.devnull, os.O_RDWR)
+for n in (0, 1, 2):
+    os.dup2(fd, n)
+os.execv("/bin/bash", ["bash", sys.argv[1]])
+' "$fleet_deploy" || true
 fi
 # The tick previously pinned its own Shipyard build; a hand pin silently missed
 # merged steward fixes (2026-11-08: #1165), so it now follows the fleet release.
