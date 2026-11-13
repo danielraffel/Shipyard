@@ -1498,6 +1498,37 @@ fn push_via_handoff(
     .next()
     .map(str::to_owned);
     result.attempts = 1;
+    if let (Some(tip), None) = (existing.as_deref(), number) {
+        // A branch with no managed PR is only ours when it is a leftover of a
+        // merged handoff, i.e. its tip is already on the base. Anything else
+        // may be someone's work and is never overwritten.
+        let merged = run_git(
+            cwd,
+            &[
+                "fetch",
+                "--quiet",
+                &config.remote,
+                &format!("refs/heads/{pr_branch}"),
+            ],
+        )
+        .is_ok()
+            && Command::new("git")
+                .args([
+                    "merge-base",
+                    "--is-ancestor",
+                    tip,
+                    &format!("{}/{}", config.remote, config.branch),
+                ])
+                .current_dir(cwd)
+                .status()
+                .is_ok_and(|status| status.success());
+        if !merged && tip != head {
+            return Err(format!(
+                "branch `{pr_branch}` already exists on `{}` with no matching `{HANDOFF_LABEL}` bot pull request and unmerged commits; refusing to overwrite it",
+                config.remote
+            ));
+        }
+    }
     if existing.as_deref() != Some(head.as_str()) {
         // The bot owns this branch; replacing it is how the changelog
         // coalesces. The lease refuses to clobber a head this run did not
@@ -3631,6 +3662,78 @@ app_client_id = "Iv1.abc"
         assert_eq!(
             bot_owned_handoff_pull(&one, branch, "o/r", "main"),
             Ok(Some(8))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handoff_never_overwrites_an_existing_branch_without_a_managed_pr() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (repo, remote) = handoff_fixture(temp.path());
+        let config = HookConfig {
+            push_mode: String::from("handoff"),
+            ..HookConfig::default()
+        };
+        // Someone's branch with unmerged work.
+        git(&repo, &["switch", "-c", "release/changelog-sync"]);
+        fs::write(repo.join("mine.txt"), "work\n").expect("write");
+        git(&repo, &["add", "mine.txt"]);
+        git(&repo, &["commit", "-m", "user work"]);
+        git(&repo, &["push", "origin", "release/changelog-sync"]);
+        let theirs = remote_ref(&remote, "refs/heads/release/changelog-sync").expect("branch");
+        git(&repo, &["checkout", "--detach", "origin/main"]);
+        fs::write(repo.join("CHANGELOG.md"), "new\n").expect("write");
+        git(&repo, &["add", "CHANGELOG.md"]);
+        git(&repo, &["commit", "-m", "docs"]);
+        let api = |_: &Path, args: &[&str]| -> Result<Value, String> {
+            assert!(args[0].contains("/pulls?state=open"), "listing only");
+            Ok(serde_json::json!([]))
+        };
+        let mut result = HookResult::default();
+        let error =
+            push_via_handoff(&repo, &config, "v1", &mut result, &api, "o/r").expect_err("refused");
+        assert!(error.contains("release/changelog-sync"));
+        assert!(!result.pushed);
+        assert_eq!(
+            remote_ref(&remote, "refs/heads/release/changelog-sync").as_deref(),
+            Some(theirs.as_str())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handoff_reuses_a_branch_left_over_from_a_merged_handoff() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (repo, remote) = handoff_fixture(temp.path());
+        let config = HookConfig {
+            push_mode: String::from("handoff"),
+            ..HookConfig::default()
+        };
+        // The branch tip is already on main (its PR merged, branch kept).
+        git(
+            &repo,
+            &[
+                "push",
+                "origin",
+                "origin/main:refs/heads/release/changelog-sync",
+            ],
+        );
+        fs::write(repo.join("CHANGELOG.md"), "new\n").expect("write");
+        git(&repo, &["add", "CHANGELOG.md"]);
+        git(&repo, &["commit", "-m", "docs"]);
+        let api = |_: &Path, args: &[&str]| -> Result<Value, String> {
+            Ok(if args[0].contains("/pulls?state=open") {
+                serde_json::json!([])
+            } else {
+                serde_json::json!({ "number": 2 })
+            })
+        };
+        let mut result = HookResult::default();
+        push_via_handoff(&repo, &config, "v2", &mut result, &api, "o/r").expect("handoff");
+        let head = run_git_capture(&repo, &["rev-parse", "HEAD"]).expect("head");
+        assert_eq!(
+            remote_ref(&remote, "refs/heads/release/changelog-sync").as_deref(),
+            Some(head.as_str())
         );
     }
 
