@@ -89,6 +89,7 @@ fn report(number: u64, token: &str, since_minutes: Option<i64>) -> PrReport {
                 actor: Actor::Steward,
                 action: format!("next for #{number}"),
                 stop: false,
+                escalate: None,
             }),
             ..Stall::default()
         },

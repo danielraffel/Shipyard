@@ -92,11 +92,12 @@ One pass per repository:
 | `ejected` | it left the merge queue without merging (reason: red checks, conflict, merge state) |
 | `enqueued` | it entered the merge queue (off by default) |
 | `verdict` | a `verdict: APPROVE\|HOLD head:<sha>` names the current head |
-| `required_check` | the required checks went red (or a different set went red), or went green; review gates (`review-verdict`, `post-review-verdict`, `release-path-review`) do not count |
+| `required_check` | the required checks went red (or a different set went red), or went green; review gates (`review-verdict`, `post-review-verdict`, `release-path-review`) do not count; never `red` while the pull request is in the merge queue (its group is the queue's to judge; an ejection names the red instead) |
 | `dirty_after_base_move` | it became `DIRTY` while its head did not move |
 | `claim_taken` | a new `repair-claim: <lane> until <time>` comment |
 | `stacked_base_merged` | the pull request whose head is its base merged, or it was retargeted to the default branch |
 | `overdue` | the steward's fresh tick report (`steward_tick_dir`) names it past an `[auto_merge.dwell]` limit at the current head; once per state, head and escalation level, never while the steward is acting on it that pass (see `automated-draining.md`, "Dwell-time limits") |
+| `stuck` | the steward's fresh tick report marks the row `stuck_since` with `next_action.escalate` (red on a required context, or held at the head, with no push): `owner` at 30 minutes, `repair` at 60, counted from `stuck_since` or from a repair claim the relay read after it, whichever is newer. `repair` goes to the repository's repair lane, never back to the owner. Never for a pull request in the merge queue. It replaces the same row's `overdue` notice for `required_failed` and `held`. Once per head, level and clock start |
 
 4. **Delivery.** Each event has an idempotency key (`repo#pr:event:head:detail`)
    and is delivered once. Repeatable events (`enqueued`, `ejected`,
@@ -180,7 +181,8 @@ interval_secs = 120
 rate_limit_minutes = 10
 repos = ["Generous-Corp/pulp", "Generous-Corp/vellum"]
 events = ["merged", "closed", "ejected", "verdict", "required_check",
-          "dirty_after_base_move", "claim_taken", "stacked_base_merged", "overdue"]
+          "dirty_after_base_move", "claim_taken", "stacked_base_merged", "overdue",
+          "stuck"]
 sockets = ["/tmp/cmux-nightly.sock", ""]   # "" is cmux's default socket
 comment_fallback = true
 steward_tick_dir = "/Users/me/Library/Logs/shipyard-steward-tick"

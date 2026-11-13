@@ -375,6 +375,13 @@ Per row, beside `decision`, `mutation` and `error`:
 - `blocked_detail`: the contexts, reason or record id behind the token.
 - `held_by`: `{holder, record, id}` whenever a HOLD names the head, even when a
   label or another state outranks it in `blocked_on`.
+- `stuck_since`: set on a `required_failed:<contexts>` or `held:<context>` row
+  (required contexts only, never a merge-queue entry, never a head the steward
+  is re-running for an infrastructure failure): when the state began at this
+  head. A push starts it over. With it, `next_action.escalate` is `owner` once
+  30 minutes have passed and `repair` once 60 have. The steward only publishes
+  this; `shipyard relay` delivers it, and holds it back while a repair claim
+  newer than `stuck_since` is under 30 minutes old (docs/owner-relay.md).
 
 Per repository, `blocked_summary` holds `counts` (rows per token) and
 `oldest`: the three longest-blocked rows as `{number, blocked_on,

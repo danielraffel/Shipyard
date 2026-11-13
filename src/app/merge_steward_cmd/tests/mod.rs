@@ -246,6 +246,7 @@ mod observation;
 mod poison_pause;
 #[cfg(unix)]
 mod recovery;
+mod stuck;
 mod superseded;
 #[cfg(unix)]
 mod train_off;

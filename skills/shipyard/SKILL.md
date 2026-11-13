@@ -4580,7 +4580,15 @@ asks for an arm the verdict allows. An approval comment stamped (by `ghapp`) wit
 landing; a shared session alone never refuses, and unstamped verdicts count
 as before. `shipyard who --contact N` names and probes the cmux address of the session
 that owns PR N (`shipyard owner register|release`; `shipyard relay` delivers
-PR events to it, docs/owner-relay.md). `shipyard who --pr N` names the host and session (and agent, when
+PR events to it, docs/owner-relay.md). Stuck rows: `app::merge_steward_cmd::stuck`
+sets `stuck_since` (dwell `entered_at` at the head, else the row's `since`) and
+`next_action.escalate` (`owner` at 30 min, `repair` at 60;
+`merge_steward::stuck`) on `required_failed`/`held` rows only, never
+`Queued` decisions or `RequiredFailedInfra`; reads nothing. The relay turns
+them into `stuck` events (`steward_overdue`), re-judges the level with the
+newest repair claim (`Claim.at`, `stuck_level`), routes `repair` to the
+repair lane only, drops the row's `required_failed`/`held` `overdue` notice,
+and never emits a red `required_check` while `in_queue`. `shipyard who --pr N` names the host and session (and agent, when
 recorded) behind each
 queue and merge event from the guards' ledgers on every host. `shipyard
 review-verdict --pr N [--head SHA] --json` gives the same decision with the

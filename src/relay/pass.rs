@@ -296,14 +296,34 @@ fn run_repo(
         infer_actions(tracked, &digest, input.now, log);
         // Overdue rows are the steward's, at this exact head; the rest are
         // derived from the change since the last pass.
-        let overdue_now = overdue
-            .get(number)
-            .into_iter()
-            .flatten()
-            .filter(
-                |event| matches!(event, RelayEvent::Overdue { head, .. } if *head == digest.head),
-            )
-            .cloned();
+        let overdue_now =
+            overdue
+                .get(number)
+                .into_iter()
+                .flatten()
+                .filter_map(|event| match event {
+                    RelayEvent::Overdue { head, .. } if *head == digest.head => Some(event.clone()),
+                    // Stuck: re-judged here with the newest repair claim this
+                    // pass read (a claim starts the clock over), never for a
+                    // pull request in the merge queue.
+                    RelayEvent::Stuck { head, since, .. }
+                        if *head == digest.head && !digest.in_queue =>
+                    {
+                        super::stuck_level(since, digest.claim.as_ref(), input.now).map(
+                            |(level, since, minutes)| RelayEvent::Stuck {
+                                head: head.clone(),
+                                escalate: match level {
+                                    crate::merge_steward::stuck::Escalate::Owner => "owner",
+                                    crate::merge_steward::stuck::Escalate::Repair => "repair",
+                                }
+                                .to_owned(),
+                                since,
+                                minutes,
+                            },
+                        )
+                    }
+                    _ => None,
+                });
         let mut events: Vec<RelayEvent> = derive_events(tracked.digest.as_ref(), &digest)
             .into_iter()
             .chain(overdue_now)
@@ -342,7 +362,10 @@ fn run_repo(
         }
         // An overdue notice for a head that has since moved is stale.
         tracked.pending.retain(|event| match event {
-            RelayEvent::Overdue { head, .. } => *head == digest.head,
+            RelayEvent::Overdue { head, .. } | RelayEvent::Stuck { head, .. } => {
+                *head == digest.head
+                    && !(digest.in_queue && matches!(event, RelayEvent::Stuck { .. }))
+            }
             _ => true,
         });
         let first_sighting = tracked.digest.is_none();
@@ -520,7 +543,16 @@ fn deliver(
         record.refused = Some("message contains verdict text; never sent".to_owned());
         return record;
     }
-    let chain = chain(input.config, repo, tracked.owner.as_ref());
+    let mut chain = chain(input.config, repo, tracked.owner.as_ref());
+    // A pull request stuck past the repair limit goes to the repair lane,
+    // not back to the owner who has not moved it.
+    if tracked
+        .pending
+        .iter()
+        .any(|event| matches!(event, RelayEvent::Stuck { escalate, .. } if escalate == "repair"))
+    {
+        chain.retain(|(tier, _)| *tier == "repair_lane");
+    }
     if input.mode == Mode::Shadow {
         match chain.first() {
             Some((tier, address)) => {

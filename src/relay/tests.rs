@@ -164,7 +164,8 @@ fn the_digest_reads_claims_merges_and_stacking() {
         d.claim,
         Some(Claim {
             by: "m1-repair".to_owned(),
-            until: "2026-11-09T13:00Z".to_owned()
+            until: "2026-11-09T13:00Z".to_owned(),
+            at: Some("2026-11-09T12:01:00Z".to_owned()),
         })
     );
     assert_eq!(
@@ -1711,5 +1712,184 @@ fn a_pending_overdue_notice_for_a_head_that_moved_is_dropped() {
             .iter()
             .all(|send| !send.2.as_deref().unwrap_or("").contains("overdue")),
         "{sends:?}"
+    );
+}
+
+/// vellum#412: queued at position 1, with a red `judge` check run on the
+/// head that GitHub still reports. A pull request in the merge queue is
+/// never red to its owner, whatever its head's checks say.
+#[test]
+fn a_queued_pull_request_is_never_reported_red() {
+    let mut before = Pr::open(412);
+    before.in_queue = true;
+    before.checks = vec![check("macos", "COMPLETED", Some("SUCCESS"))];
+    let mut after = before.clone();
+    after.checks = vec![
+        check("macos", "COMPLETED", Some("SUCCESS")),
+        // Even when GitHub flags it required, a queued head is not red.
+        check("judge", "COMPLETED", Some("FAILURE")),
+    ];
+    let events = derive_events(Some(&digest(&before)), &digest(&after));
+    assert!(
+        !events.iter().any(
+            |event| matches!(event, RelayEvent::RequiredCheck { result, .. } if result == "red")
+        ),
+        "{events:?}"
+    );
+    // Ejected from the queue, the owner is told why: the ejection names
+    // the red.
+    let mut ejected = after.clone();
+    ejected.in_queue = false;
+    let events = derive_events(Some(&digest(&after)), &digest(&ejected));
+    assert!(
+        events.iter().any(
+            |event| matches!(event, RelayEvent::Ejected { reason, .. } if reason.contains("judge"))
+        ),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn the_stuck_level_counts_from_the_newest_push_or_claim() {
+    let since = at(0).to_rfc3339();
+    assert_eq!(super::stuck_level(&since, None, at(29)), None);
+    let owner = super::stuck_level(&since, None, at(30)).expect("owner");
+    assert_eq!(owner.0, crate::merge_steward::stuck::Escalate::Owner);
+    let repair = super::stuck_level(&since, None, at(60)).expect("repair");
+    assert_eq!(repair.0, crate::merge_steward::stuck::Escalate::Repair);
+    let claim = |minute: i64| Claim {
+        by: "m1-repair".to_owned(),
+        until: "2026-11-09T15:00Z".to_owned(),
+        at: Some(at(minute).to_rfc3339()),
+    };
+    // A claim at minute 40 starts the clock over: at minute 60 it is 20 min.
+    assert_eq!(super::stuck_level(&since, Some(&claim(40)), at(60)), None);
+    let after_claim = super::stuck_level(&since, Some(&claim(40)), at(75)).expect("owner");
+    assert_eq!(after_claim.0, crate::merge_steward::stuck::Escalate::Owner);
+    assert_eq!(after_claim.1, at(40).to_rfc3339());
+    // A claim older than the stuck state is no touch.
+    let old = super::stuck_level(&since, Some(&claim(-10)), at(60)).expect("repair");
+    assert_eq!(old.0, crate::merge_steward::stuck::Escalate::Repair);
+}
+
+#[test]
+fn stuck_rows_come_from_the_steward_tick_and_replace_the_same_dwell_notice() {
+    let report = json!({"repos": [{
+        "prs": [
+            {"number": 397, "head_sha": HEAD_A, "blocked_on": "required_failed:macos",
+             "stuck_since": "2026-11-09T11:00:00+00:00",
+             "next_action": {"actor": "author", "action": "fix", "stop": false, "escalate": "repair"}},
+            {"number": 398, "head_sha": HEAD_B, "blocked_on": "queued",
+             "next_action": {"actor": "steward", "action": "wait", "stop": false}},
+        ],
+        "dwell": {"overdue": [
+            {"pr": 397, "state": "required_failed", "head": HEAD_A, "level": 1, "escalated_level": 1,
+             "owner": {"role": "author"}, "age_minutes": 60, "limit_minutes": 45},
+            {"pr": 397, "state": "dirty", "head": HEAD_A, "level": 1, "escalated_level": 1,
+             "owner": {"role": "author"}, "age_minutes": 40, "limit_minutes": 30},
+        ]},
+    }]});
+    let events = super::steward_overdue(&report);
+    let for_397 = &events[&397];
+    assert!(for_397.iter().any(|event| matches!(
+        event,
+        RelayEvent::Stuck { escalate, since, .. }
+            if escalate == "repair" && since == "2026-11-09T11:00:00+00:00"
+    )));
+    assert!(
+        !for_397.iter().any(
+            |event| matches!(event, RelayEvent::Overdue { state, .. } if state == "required_failed")
+        ),
+        "the stuck signal replaces the same dwell notice"
+    );
+    assert!(
+        for_397
+            .iter()
+            .any(|event| matches!(event, RelayEvent::Overdue { state, .. } if state == "dirty"))
+    );
+    assert!(!events.contains_key(&398), "a queued row is never stuck");
+}
+
+/// vellum#397's shape through a pass: the owner is told at 30 minutes, the
+/// repair lane (not the owner) at 60, and a claim holds it back.
+#[test]
+fn a_stuck_pull_request_goes_to_its_owner_then_to_the_repair_lane() {
+    let mut pr = Pr::open(397);
+    pr.checks = red();
+    let cmux = FakeCmux::with(&[
+        ("m5", "/tmp/cmux-nightly.sock", "OWNER"),
+        ("m1", "/tmp/cmux-nightly.sock", "REPAIR"),
+    ]);
+    let mut h = Harness::new(std::slice::from_ref(&pr), cmux);
+    h.config.repo.insert(
+        REPO.to_owned(),
+        config::RepoFallbacks {
+            lead: None,
+            repair_lane: Some(address("m1", "REPAIR")),
+        },
+    );
+    h.own(&owner(397, "m5", "OWNER"));
+    let stuck = |escalate: &str| RelayEvent::Stuck {
+        head: HEAD_A.to_owned(),
+        escalate: escalate.to_owned(),
+        since: at(-35).to_rfc3339(),
+        minutes: 0,
+    };
+    h.overdue.insert(397, vec![stuck("owner")]);
+    h.pass(0, Mode::Send);
+    let first = h.deliveries()[0].clone();
+    assert_eq!(first["tier"], "owner");
+    assert!(first["message"].as_str().unwrap().contains("stuck 35 min"));
+    // An hour in: the repair lane, though the owner is still reachable.
+    h.overdue.insert(397, vec![stuck("repair")]);
+    h.pass(30, Mode::Send);
+    let second = h.deliveries()[1].clone();
+    assert_eq!(second["tier"], "repair_lane");
+    assert!(
+        second["message"]
+            .as_str()
+            .unwrap()
+            .contains("repair lane, take it")
+    );
+    // Same level, same clock: never delivered twice.
+    h.pass(45, Mode::Send);
+    assert_eq!(h.deliveries().len(), 2);
+}
+
+#[test]
+fn a_fresh_claim_or_the_merge_queue_holds_a_stuck_escalation_back() {
+    let mut pr = Pr::open(397);
+    pr.checks = red();
+    pr.comments.push((
+        "repair-claim: m1-repair until 2026-11-09T14:00Z".to_owned(),
+        at(-10).to_rfc3339(),
+    ));
+    let mut h = Harness::new(
+        std::slice::from_ref(&pr),
+        FakeCmux::with(&[("m5", "/tmp/cmux-nightly.sock", "OWNER")]),
+    );
+    h.own(&owner(397, "m5", "OWNER"));
+    h.overdue.insert(
+        397,
+        vec![RelayEvent::Stuck {
+            head: HEAD_A.to_owned(),
+            escalate: "repair".to_owned(),
+            since: at(-90).to_rfc3339(),
+            minutes: 0,
+        }],
+    );
+    h.pass(0, Mode::Send);
+    assert!(h.deliveries().is_empty(), "claimed 10 minutes ago");
+    let mut queued = pr.clone();
+    queued.comments.clear();
+    queued.in_queue = true;
+    h.gh.set(queued);
+    h.pass(20, Mode::Send);
+    assert!(
+        !h.deliveries()
+            .iter()
+            .any(|delivery| delivery["message"].as_str().unwrap().contains("stuck")),
+        "{:?}",
+        h.deliveries()
     );
 }

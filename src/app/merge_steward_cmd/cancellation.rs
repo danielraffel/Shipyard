@@ -236,6 +236,16 @@ pub(super) fn apply_repo_plan(
             }),
         },
     );
+    // Stuck red or held rows: publish `stuck_since` and the escalation level
+    // for `shipyard relay`. Reads nothing. See `stuck`.
+    super::stuck::annotate(
+        &mut reports,
+        ledger.dwell.get(&super::dwell_pass::dwell_key(
+            &observation.repo,
+            &observation.base,
+        )),
+        Utc::now(),
+    );
     // The backstop acts only on pull requests the steward declines to own, so
     // it can never contend with the enqueue path above. See `native_arm`.
     let (native_arm_status, native_arm_failed) =
