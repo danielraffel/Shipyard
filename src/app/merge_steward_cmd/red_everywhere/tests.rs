@@ -460,3 +460,105 @@ fn observe_before_mutation_holds_a_new_episode_and_releases_a_recovered_head() {
         );
     }
 }
+
+#[test]
+fn a_member_that_pushed_a_new_head_leaves_the_episode_even_when_still_red_the_same_way() {
+    let four = |moved: bool| {
+        observation(
+            [12147_u64, 12152, 12160, 12171]
+                .into_iter()
+                .map(|n| {
+                    let h = if moved && n == 12171 {
+                        head(7)
+                    } else {
+                        head(n)
+                    };
+                    observed(n, h, vec![failed(CHECK, n)])
+                })
+                .collect(),
+        )
+    };
+    let before = four(false);
+    let mut ledger = ledger_with_tests(&before, "due_soon_fixture");
+    let reds_before = reds(&before, &ledger, "review-verdict", &[]);
+    let mut rows = vec![report(12147), report(12152), report(12160), report(12171)];
+    let status = run(
+        Mode::Enforce,
+        &before,
+        &reds_before,
+        &mut ledger,
+        &mut rows,
+        T0,
+    );
+    assert_eq!(status.groups[0].prs, vec![12147, 12152, 12160, 12171]);
+    // #12171 pushes a new head that fails the same check with the same test.
+    let after = four(true);
+    let mut seeded = ledger_with_tests(&after, "due_soon_fixture");
+    ledger.infra_reruns = std::mem::take(&mut seeded.infra_reruns);
+    let reds_after = reds(&after, &ledger, "review-verdict", &[]);
+    assert!(
+        reds_after
+            .iter()
+            .any(|red| red.pr == 12171 && red.tests == ["due_soon_fixture"])
+    );
+    let mut rows = vec![report(12147), report(12152), report(12160), report(12171)];
+    let status = run(
+        Mode::Enforce,
+        &after,
+        &reds_after,
+        &mut ledger,
+        &mut rows,
+        T0 + 300,
+    );
+    assert_eq!(
+        status.groups[0].prs,
+        vec![12147, 12152, 12160],
+        "the moved member is not counted"
+    );
+    assert!(
+        rows[3].blocked.red_everywhere.is_none(),
+        "the moved member is not marked"
+    );
+    assert_eq!(
+        rows[0].blocked.red_everywhere.as_ref().map(|mark| mark.prs),
+        Some(3)
+    );
+    assert_eq!(
+        held(Mode::Enforce, &ledger, &after.repo, 12171, &head(7)),
+        None
+    );
+    assert_eq!(
+        held(Mode::Enforce, &ledger, &after.repo, 12147, &head(12147)),
+        Some(CHECK.to_owned())
+    );
+}
+
+#[test]
+fn an_episode_that_drops_under_three_unchanged_members_ends() {
+    let obs = three_red_prs();
+    let mut ledger = ledger_with_tests(&obs, "due_soon_fixture");
+    let reds_now = reds(&obs, &ledger, "review-verdict", &[]);
+    let mut rows = vec![report(12147), report(12152), report(12160)];
+    run(Mode::Enforce, &obs, &reds_now, &mut ledger, &mut rows, T0);
+    let mut moved = three_red_prs();
+    moved.prs[2] = observed(12160, head(7), vec![failed(CHECK, 12160)]);
+    let mut seeded = ledger_with_tests(&moved, "due_soon_fixture");
+    ledger.infra_reruns = std::mem::take(&mut seeded.infra_reruns);
+    let reds_later = reds(&moved, &ledger, "review-verdict", &[]);
+    let mut rows = vec![report(12147), report(12152), report(12160)];
+    let status = run(
+        Mode::Enforce,
+        &moved,
+        &reds_later,
+        &mut ledger,
+        &mut rows,
+        T0 + 300,
+    );
+    assert!(status.groups.is_empty());
+    assert!(rows.iter().all(|row| row.blocked.red_everywhere.is_none()));
+    assert!(ledger.red_everywhere.is_empty());
+    assert_eq!(
+        held(Mode::Enforce, &ledger, &moved.repo, 12147, &head(12147)),
+        None
+    );
+}

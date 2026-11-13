@@ -224,12 +224,24 @@ pub(super) fn observe(
             heads: BTreeMap::new(),
         });
         episode.last_seen_epoch = now_epoch;
-        // A member keeps the head it first failed on: a new head leaves the
-        // episode (it is not red the same way) and is never held.
-        for (pr, head) in &members {
-            episode.heads.entry(*pr).or_insert_with(|| head.clone());
-        }
+        // A member keeps the head it first failed on. A member that pushed a
+        // new head has left the episode, even when the new head fails the same
+        // way: it is not counted, marked or held. Its first head stays on
+        // record so it does not rejoin as a new member while the episode lasts.
         episode.heads.retain(|pr, _| members.contains_key(pr));
+        let mut members = members;
+        members.retain(|pr, head| {
+            episode
+                .heads
+                .entry(*pr)
+                .or_insert_with(|| head.clone())
+                .eq_ignore_ascii_case(head)
+        });
+        if members.len() < MIN_PRS {
+            let key = episode_key(&observation.repo, &check, test.as_deref());
+            ledger.red_everywhere.remove(&key);
+            continue;
+        }
         let count = members.len();
         for pr in members.keys() {
             pass.marks.entry(*pr).or_insert_with(|| RowMark {

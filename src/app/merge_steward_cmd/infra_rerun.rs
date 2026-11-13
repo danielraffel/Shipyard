@@ -642,6 +642,10 @@ fn record_for<'a>(
     record.check.clone_from(&candidate.check);
     if record.judged_check_id != Some(candidate.check_id) {
         record.errors = 0;
+        // A newer red: the older red's test names no longer describe it. They
+        // come back only from this red's own diagnosis, so a failed diagnosis
+        // never leaves stale names under a matching id (red_everywhere).
+        record.tests.clear();
     }
     record.judged_check_id = Some(candidate.check_id);
     record
