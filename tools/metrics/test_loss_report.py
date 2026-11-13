@@ -119,6 +119,24 @@ class EpisodeTests(Fixture):
         r = lr.build_report(str(self.dir), dt.timedelta(hours=12), self.now)
         self.assertEqual(r["coverage"]["window"]["status"], "unavailable")
 
+    def test_flags_first_seen_on_a_later_tick_are_kept(self):
+        t = dt.datetime(2026, 11, 12, 1, 0, tzinfo=UTC)
+        tok = "required_failed:macos"
+        self.live(t, [(1, "a", tok, "author", None)])
+        self.live(t + dt.timedelta(minutes=5), [(1, "a", tok, "author", None)])
+        self.live(t + dt.timedelta(minutes=10), [(1, "a", tok, "author",
+                  {"superseded": {"closeable": True}, "blocked_detail": "red_everywhere: macos"})])
+        r = self.report()
+        self.assertEqual(r["totals"]["episodes"], 1)
+        self.assertEqual(r["series_per_day"]["red_everywhere_episodes"]["2026-11-12"], 1)
+        self.assertEqual(r["series_per_day"]["superseded_detected_episodes"]["2026-11-12"], 1)
+
+    def test_actor_change_inside_an_episode_keeps_it_actionable(self):
+        t = dt.datetime(2026, 11, 12, 1, 0, tzinfo=UTC)
+        self.live(t, [(1, "a", "no_verdict", "ci", None)])
+        self.live(t + dt.timedelta(minutes=5), [(1, "a", "no_verdict", "reviewer", None)])
+        self.assertEqual(self.report()["totals"]["by_class"], {"actionable": 1})
+
     def test_required_pending_is_a_normal_wait_whatever_the_actor(self):
         self.live(dt.datetime(2026, 11, 12, 1, 0, tzinfo=UTC), [
             (1, "a", "required_pending", "author", None), (2, "b", "required_pending", "repair", None),

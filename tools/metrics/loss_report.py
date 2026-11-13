@@ -204,6 +204,14 @@ def build_episodes(per_repo, gap):
                 if ep and ep["head"] == o["head"] and ep["token"] == o["token"]:
                     ep["last_obs"] = t
                     ep["n_obs"] += 1
+                    # Every observation counts: flags are OR-ed, the earliest `since` wins, and
+                    # an episode that was actionable on any observation stays actionable.
+                    ep["sup_detected"] = ep["sup_detected"] or o["sup_detected"]
+                    ep["red_everywhere"] = ep["red_everywhere"] or o["red_everywhere"]
+                    if o["since"] and (ep["since"] is None or o["since"] < ep["since"]):
+                        ep["since"] = o["since"]
+                    if classify(o["token"], o["actor"], o["stop"]) == "actionable":
+                        ep["klass"] = "actionable"
                     continue
                 if ep:
                     ep["end"] = t
