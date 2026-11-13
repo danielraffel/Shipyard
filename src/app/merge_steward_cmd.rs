@@ -116,6 +116,7 @@ type MergeQueueSnapshot = (
 );
 
 #[derive(Clone, Debug, Serialize)]
+#[serde(into = "PrReportWire")]
 struct PrReport {
     number: u64,
     head_sha: String,
@@ -123,8 +124,72 @@ struct PrReport {
     mutation: Option<String>,
     error: Option<String>,
     /// Why this pull request is not merging, and since when.
+    blocked: blocked_on::Stall,
+}
+
+/// Whether a pull request's `error` is a failed read this pass could not
+/// complete (`read`: a 5xx, a timeout, a dropped connection, a rate limit; the
+/// next pass reads it again) or a decision or failed action (`policy`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum ErrorKind {
+    Read,
+    Policy,
+}
+
+fn classify_pr_error(error: &str) -> ErrorKind {
+    let lower = error.to_ascii_lowercase();
+    let unread = [
+        "cannot read",
+        "unreadable",
+        "read failed",
+        "failed after one retry",
+        "bad gateway",
+        "service unavailable",
+        "gateway timeout",
+        "connection aborted",
+        "connection closed",
+        "connection refused",
+        "remote end closed",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    if unread
+        || observation::is_retryable_read_failure(error)
+        || pass_budget::is_rate_limited(error)
+    {
+        ErrorKind::Read
+    } else {
+        ErrorKind::Policy
+    }
+}
+
+/// The serialized shape of [`PrReport`]: the same fields plus `error_kind`,
+/// derived once here so no report constructor can forget it.
+#[derive(Serialize)]
+struct PrReportWire {
+    number: u64,
+    head_sha: String,
+    decision: StewardDecision,
+    mutation: Option<String>,
+    error: Option<String>,
+    error_kind: Option<ErrorKind>,
     #[serde(flatten)]
     blocked: blocked_on::Stall,
+}
+
+impl From<PrReport> for PrReportWire {
+    fn from(report: PrReport) -> Self {
+        Self {
+            error_kind: report.error.as_deref().map(classify_pr_error),
+            number: report.number,
+            head_sha: report.head_sha,
+            decision: report.decision,
+            mutation: report.mutation,
+            error: report.error,
+            blocked: report.blocked,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]

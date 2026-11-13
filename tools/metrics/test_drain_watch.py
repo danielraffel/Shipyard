@@ -118,6 +118,41 @@ class DetectionTests(Base):
         _, _, f = self.run_once()
         self.assertEqual(f, [])
 
+    def _history_with_error(self, error):
+        old = NOW - dt.timedelta(hours=3)
+        for m in range(150, -1, -15):
+            t = NOW - dt.timedelta(minutes=m)
+            pr = {"number": 1, "head_sha": "a", "blocked_on": "required_failed:macos",
+                  "since": old.isoformat().replace("+00:00", "Z"),
+                  "next_action": {"actor": "author", "action": "x", "stop": False}}
+            if error and m <= 30:
+                pr["error"] = error
+            (self.log / f"acme_repo-{stamp(t)}.json").write_text(
+                json.dumps({"repos": [{"repo": REPO, "prs": [pr], "errors": []}]}))
+
+    def test_a_read_deferred_pr_is_unobserved_not_a_stall_input(self):
+        # Control: the same history with no error is a stall.
+        self._history_with_error(None)
+        _, _, f = self.run_once()
+        self.assertEqual([x["kind"] for x in f], ["drain_stall"])
+
+    def test_a_pr_unread_in_the_latest_tick_is_not_counted_as_waiting(self):
+        self._history_with_error("queue-arm-guard: cannot read live PR state: gh: HTTP 503")
+        _, _, f = self.run_once()
+        self.assertEqual(f, [])
+
+    def test_a_policy_error_is_still_observed(self):
+        self._history_with_error("needs an exact-head approval")
+        _, _, f = self.run_once()
+        self.assertEqual([x["kind"] for x in f], ["drain_stall"])
+
+    def test_read_deferred_classifier(self):
+        self.assertTrue(dw.read_deferred({"error": "gh: HTTP 503"}))
+        self.assertTrue(dw.read_deferred({"error": "x", "error_kind": "read"}))
+        self.assertFalse(dw.read_deferred({"error": "HTTP 503", "error_kind": "policy"}))
+        self.assertFalse(dw.read_deferred({"error": "needs an exact-head approval"}))
+        self.assertFalse(dw.read_deferred({"number": 1}))
+
     def test_normal_waits_and_short_history_do_not_stall(self):
         old = NOW - dt.timedelta(hours=3)
         self.history(lambda m: [(1, "a", "required_pending", "author", old)])
