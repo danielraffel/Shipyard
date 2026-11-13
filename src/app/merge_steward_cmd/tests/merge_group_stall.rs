@@ -515,11 +515,35 @@ fn a_failed_comment_is_reported_and_retried_once_posted() {
         "{report:?}"
     );
     let posted = RefCell::new(Vec::new());
-    let lines = merge_group_stall::retry_comments(&mut ledger, REPO, &|pr, _| {
-        posted.borrow_mut().push(pr);
+    let lines = merge_group_stall::retry_comments(&mut ledger, REPO, &|pr, body| {
+        posted.borrow_mut().push((pr, body.to_owned()));
         Ok(())
     });
-    assert_eq!(*posted.borrow(), vec![406]);
+    let posted = posted.into_inner();
+    assert_eq!(posted.len(), 1);
+    assert_eq!(posted[0].0, 406);
+    // The retry posts the same detail as the first attempt: the context,
+    // the failed run and its conclusion.
+    assert_eq!(
+        posted[0].1,
+        acts.comments.borrow()[0],
+        "the exact first comment"
+    );
+    assert!(
+        posted[0].1.contains("`framework-trusted-verify`"),
+        "{}",
+        posted[0].1
+    );
+    assert!(
+        posted[0].1.contains("actions/runs/43437128609"),
+        "{}",
+        posted[0].1
+    );
+    assert!(
+        posted[0].1.contains("concluded `failure`"),
+        "{}",
+        posted[0].1
+    );
     assert!(lines[0].contains("comment posted on retry"), "{lines:?}");
     assert!(
         merge_group_stall::retry_comments(&mut ledger, REPO, &|_, _| panic!("once")).is_empty()
@@ -627,5 +651,88 @@ fn the_mode_defaults_to_dry_run_and_a_typo_never_turns_it_on() {
     assert_eq!(
         guards.read_error, None,
         "a typo here never degrades the other guards"
+    );
+}
+
+/// A receipt with no recorded comment text is never retried with a generic
+/// comment that would omit the context and the run.
+#[test]
+fn a_receipt_without_its_comment_text_is_not_retried_generically() {
+    let mut ledger = StewardLedger::default();
+    ledger.doomed_dequeues.insert(
+        merge_group_stall::receipt_key(REPO, 406, GROUP),
+        merge_group_stall::Receipt {
+            at: "2026-11-13T17:05:03Z".to_owned(),
+            outcome: "dequeued".to_owned(),
+            commented: false,
+            comment: None,
+        },
+    );
+    let lines = merge_group_stall::retry_comments(&mut ledger, REPO, &|_, _| {
+        panic!("no generic comment is posted")
+    });
+    assert!(lines[0].contains("not recorded; not retried"), "{lines:?}");
+}
+
+/// A completed run on the group head in the census does not suppress the
+/// reading: the doomed group is still found.
+#[test]
+fn a_completed_run_in_the_census_does_not_suppress_the_reading() {
+    let mut observation = observation_for(queued_pr(), true);
+    observation.repo = REPO.to_owned();
+    observation.required_checks = required();
+    observation.merge_group_heads = BTreeMap::from([(406, GROUP.to_owned())]);
+    observation.runs = vec![crate::merge_steward::StewardRun {
+        id: 43_437_128_609,
+        workflow_id: 1,
+        run_attempt: 1,
+        workflow: "Framework trusted verify".to_owned(),
+        head_sha: GROUP.to_owned(),
+        head_branch: "gh-readonly-queue/main/pr-406-x".to_owned(),
+        status: "completed".to_owned(),
+        event: "merge_group".to_owned(),
+        pull_request_number: None,
+        created_at: "2026-11-13T13:49:00Z".to_owned(),
+        jobs: Vec::new(),
+    }];
+    let reads = RefCell::new(0);
+    let run_gh = |argv: &[String]| -> Result<String, String> {
+        *reads.borrow_mut() += 1;
+        let line = argv.join(" ");
+        if line.contains("actions/runs?head_sha=") {
+            return Ok(serde_json::json!({"total_count": 2, "workflow_runs": [
+                {"id": 43_437_128_575_u64, "name": "Release policy", "path": ".github/workflows/release-policy.yml",
+                 "status": "completed", "conclusion": "success", "updated_at": "2026-11-13T13:51:39Z", "head_sha": GROUP},
+                {"id": 43_437_128_609_u64, "name": "Framework trusted verify", "path": ".github/workflows/framework-trusted-verify.yml",
+                 "status": "completed", "conclusion": "failure", "updated_at": "2026-11-13T13:50:16Z", "head_sha": GROUP,
+                 "html_url": "https://github.com/Generous-Corp/vellum/actions/runs/43437128609"},
+            ]}).to_string());
+        }
+        if line.contains("/check-runs") {
+            return Ok(serde_json::json!({"total_count": 1, "check_runs": [
+                {"name": "release-policy", "app": {"id": ACTIONS}},
+            ]})
+            .to_string());
+        }
+        if line.contains("/statuses") {
+            return Ok(serde_json::json!([
+                {"context": "release-path-review", "creator": {"login": "github-actions[bot]", "id": 41_898_282}},
+            ]).to_string());
+        }
+        Err(format!("unexpected {line}"))
+    };
+    let pass = merge_group_stall::observe(
+        &run_gh,
+        &observation,
+        PoisonHold::On,
+        &BTreeMap::new(),
+        at("2026-11-13T14:00:00Z"),
+    );
+    assert_eq!(*reads.borrow(), 3, "the group is read");
+    let entry = pass.stalled(406).expect("found");
+    assert!(
+        matches!(&entry.verdict, Verdict::Stalled { doomed: Some(failed), .. } if failed.context == "framework-trusted-verify"),
+        "{:?}",
+        entry.verdict
     );
 }

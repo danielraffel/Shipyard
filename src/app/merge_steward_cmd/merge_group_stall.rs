@@ -411,11 +411,12 @@ pub(super) fn observe(
         let Some(group_sha) = observation.merge_group_heads.get(&pr.fact.number) else {
             continue;
         };
-        if observation
-            .runs
-            .iter()
-            .any(|run| run.head_sha.eq_ignore_ascii_case(group_sha))
-        {
+        // Only a run still going means the group is still building; a
+        // completed run in the census must not suppress the reading.
+        if observation.runs.iter().any(|run| {
+            run.head_sha.eq_ignore_ascii_case(group_sha)
+                && !run.status.eq_ignore_ascii_case("completed")
+        }) {
             continue;
         }
         let enqueued_at = observation
@@ -536,6 +537,10 @@ pub(super) struct Receipt {
     /// Whether the comment was posted.
     #[serde(default)]
     pub(super) commented: bool,
+    /// The exact comment for a dequeue (context, failed run, conclusion),
+    /// kept so a retry posts the same detail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) comment: Option<String>,
 }
 
 /// The ledger key for one decision.
@@ -656,14 +661,16 @@ pub(super) fn decide(
             Err(error) => (format!("failed: {error}"), Some(error)),
         },
     };
+    let body = comment_body(entry, failed);
     let mut receipt = Receipt {
         at: now.to_rfc3339(),
         outcome: outcome.clone(),
         commented: false,
+        comment: (outcome == "dequeued").then(|| body.clone()),
     };
     let mut error = error;
     if outcome == "dequeued" {
-        match acts.comment(pr.fact.number, &comment_body(entry, failed)) {
+        match acts.comment(pr.fact.number, &body) {
             Ok(()) => receipt.commented = true,
             Err(comment_error) => {
                 let line =
@@ -688,7 +695,8 @@ pub(super) fn decide(
     ))
 }
 
-/// Retry the comment of a dequeue whose comment failed, once per pass.
+/// Retry the comment of a dequeue whose comment failed, once per pass, with
+/// the exact text recorded at the dequeue.
 /// Returns report lines.
 pub(super) fn retry_comments(
     ledger: &mut StewardLedger,
@@ -707,9 +715,14 @@ pub(super) fn retry_comments(
         else {
             continue;
         };
-        let body = format!(
-            "Shipyard removed this pull request from the merge queue (`{DEQUEUE_AUDIT}`): its merge group could never finish because a required context was never reported. See the steward report for the run."
-        );
+        // The exact comment recorded at the dequeue; without it nothing is
+        // posted, never a comment missing the context and the run.
+        let Some(body) = receipt.comment.clone() else {
+            lines.push(format!(
+                "merge-group-stalled #{pr}: comment not posted and its text was not recorded; not retried"
+            ));
+            continue;
+        };
         match comment(pr, &body) {
             Ok(()) => {
                 receipt.commented = true;
