@@ -15,6 +15,15 @@ clones="$HOME/.local/share/shipyard-steward"
 # days (default 3), then is bundled by UTC day. Bundled ticks stay for
 # SHIPYARD_STEWARD_ARCHIVE_RETENTION_DAYS days (default 180). Archive problems
 # are logged to archive.log, never to summary.log, and never fail the tick.
+# Deploy merged fleet scripts first (this tick, the deploy script, the reviewer
+# pass-runner): copied by hand, they drifted for days with nothing noticing
+# (2026-11-12). It acts at most every 10 minutes, installs only what validates,
+# logs "fleet-deploy" lines here, and never fails the tick. The new tick takes
+# effect on the next run. SHIPYARD_FLEET_DEPLOY=off turns it off.
+fleet_deploy="$HOME/.local/libexec/shipyard-fleet-deploy.sh"
+if [ -x "$fleet_deploy" ]; then
+  FLEET_DEPLOY_LOG="$log_dir/summary.log" "$fleet_deploy" </dev/null >/dev/null 2>&1 || true
+fi
 # The tick previously pinned its own Shipyard build; a hand pin silently missed
 # merged steward fixes (2026-11-08: #1165), so it now follows the fleet release.
 # Use the fleet-updated Shipyard (tartci tool-freshness keeps ~/.local/bin/shipyard on the
