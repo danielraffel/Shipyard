@@ -69,11 +69,14 @@ pub enum DwellState {
     CarriesUnapproved,
     /// Stacked on a pull request that merged; still based on its branch.
     StackedBaseMerged,
+    /// Approved, with required checks that ran on a merge ref the base has
+    /// long moved past ([`super::stale_merge_ref`]).
+    StaleMergeRef,
 }
 
 impl DwellState {
     /// Every state, in report order.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::NeedsReview,
         Self::RequiredPending,
         Self::RequiredFailedInfra,
@@ -85,6 +88,7 @@ impl DwellState {
         Self::ApprovedGreenNotQueued,
         Self::CarriesUnapproved,
         Self::StackedBaseMerged,
+        Self::StaleMergeRef,
     ];
 
     /// The config key and report name.
@@ -102,6 +106,7 @@ impl DwellState {
             Self::ApprovedGreenNotQueued => "approved_green_not_queued",
             Self::CarriesUnapproved => "carries_unapproved",
             Self::StackedBaseMerged => "stacked_base_merged",
+            Self::StaleMergeRef => "stale_merge_ref",
         }
     }
 
@@ -110,7 +115,10 @@ impl DwellState {
     pub const fn default_limit_minutes(self) -> u32 {
         match self {
             Self::NeedsReview => 20,
-            Self::StackedBaseMerged | Self::RequiredFailedInfra | Self::StaleVerdictCheck => 10,
+            Self::StackedBaseMerged
+            | Self::RequiredFailedInfra
+            | Self::StaleVerdictCheck
+            | Self::StaleMergeRef => 10,
             Self::RequiredPending | Self::CarriesUnapproved => 60,
             Self::RequiredFailed => 45,
             Self::Dirty | Self::Held | Self::RequiredNeverRan => 30,
@@ -129,6 +137,7 @@ impl DwellState {
             Self::RequiredNeverRan => Some(ActKind::DispatchNeverRan),
             Self::ApprovedGreenNotQueued => Some(ActKind::Readmit),
             Self::StackedBaseMerged => Some(ActKind::RetargetStacked),
+            Self::StaleMergeRef => Some(ActKind::RetriggerStaleRef),
             Self::NeedsReview
             | Self::RequiredPending
             | Self::RequiredFailedInfra
@@ -144,9 +153,10 @@ impl DwellState {
     pub const fn escalation_role(self) -> &'static str {
         match self {
             Self::NeedsReview | Self::StaleVerdictCheck | Self::CarriesUnapproved => "reviewer",
-            Self::RequiredPending | Self::RequiredFailedInfra | Self::RequiredNeverRan => {
-                "operator"
-            }
+            Self::RequiredPending
+            | Self::RequiredFailedInfra
+            | Self::RequiredNeverRan
+            | Self::StaleMergeRef => "operator",
             Self::ApprovedGreenNotQueued => "steward",
             Self::RequiredFailed | Self::Dirty | Self::Held | Self::StackedBaseMerged => "author",
         }
@@ -173,6 +183,9 @@ pub enum ActKind {
     Readmit,
     /// Retarget a pull request stacked on a merged base to the steward's base.
     RetargetStacked,
+    /// Close and reopen an approved pull request whose merge ref is stale,
+    /// through `shipyard advance --retrigger` and every refusal it applies.
+    RetriggerStaleRef,
 }
 
 impl ActKind {
@@ -184,6 +197,7 @@ impl ActKind {
             Self::DispatchNeverRan => "dispatch_never_ran",
             Self::Readmit => "readmit",
             Self::RetargetStacked => "retarget_stacked",
+            Self::RetriggerStaleRef => "retrigger_stale_ref",
         }
     }
 
@@ -226,6 +240,8 @@ pub struct DwellPolicy {
     pub max_acts_per_pass: usize,
     /// Highest escalation level: level `n` fires at `limit * 2^(n-1)`.
     pub max_level: u32,
+    /// `[auto_merge.stale_merge_ref]`: when a merge ref counts as stale.
+    pub stale_merge_ref: super::stale_merge_ref::StaleRefPolicy,
     /// Why the config could not be read, when it could not; the defaults
     /// apply.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -244,6 +260,7 @@ impl Default for DwellPolicy {
             max_escalations_per_pass: 25,
             max_acts_per_pass: 3,
             max_level: 4,
+            stale_merge_ref: super::stale_merge_ref::StaleRefPolicy::default(),
             read_error: None,
         }
     }
@@ -254,7 +271,10 @@ impl DwellPolicy {
     /// their defaults; an unknown key is ignored.
     #[must_use]
     pub fn from_table(table: &toml::Table) -> Self {
-        let mut policy = Self::default();
+        let mut policy = Self {
+            stale_merge_ref: super::stale_merge_ref::StaleRefPolicy::from_table(table),
+            ..Self::default()
+        };
         let Some(section) = table
             .get(super::ejection_guards::CONFIG_TABLE)
             .and_then(toml::Value::as_table)
@@ -370,6 +390,7 @@ pub fn state_for_token(token: &str, approval_context: &str) -> Option<DwellState
         "ready" | "admission_pending" => Some(DwellState::ApprovedGreenNotQueued),
         "carries_unapproved_commits" => Some(DwellState::CarriesUnapproved),
         STACKED_BASE_MERGED => Some(DwellState::StackedBaseMerged),
+        super::stale_merge_ref::TOKEN => Some(DwellState::StaleMergeRef),
         _ => None,
     }
 }
@@ -406,8 +427,9 @@ pub struct ActRecord {
     pub head: String,
     /// `intent` (recorded before the side effect), `done`, `failed` (the
     /// side effect was attempted and GitHub refused it), `refused` (a live
-    /// revalidation said no) or `deferred` (a precondition could not be
-    /// read; nothing was attempted).
+    /// revalidation said no), `deferred` (a precondition could not be
+    /// read; nothing was attempted) or `blocked` (a guard refused the write,
+    /// or the command it needs is not in this build; nothing changed).
     pub status: String,
     /// When it was recorded.
     pub at: DateTime<Utc>,
@@ -434,6 +456,9 @@ const ACT_TTL_DAYS: i64 = 14;
 pub const MAX_ATTEMPTS: u32 = 3;
 /// Wait before the first retry; doubles per attempt.
 const RETRY_BASE_MINUTES: i64 = 15;
+/// Wait before retrying a `blocked` act (a guard refused it, or the command
+/// it needs is not in this build): a day, doubling. Never a loop.
+const BLOCKED_RETRY_BASE_MINUTES: i64 = 24 * 60;
 
 /// One repository's dwell state, in the steward ledger.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -501,21 +526,26 @@ impl DwellRepoState {
 }
 
 /// Whether a recorded act may be tried again now: only after `refused` or
-/// `deferred` (nothing was attempted), never after `done`, `failed` or a bare
-/// `intent` (each may have reached GitHub), and never past [`MAX_ATTEMPTS`];
-/// after a backoff that doubles per attempt.
+/// `deferred` (nothing was attempted), or `blocked` (a guard refused the
+/// write and nothing changed) after a day; never after `done`, `failed` or a
+/// bare `intent` (each may have reached GitHub), and never past
+/// [`MAX_ATTEMPTS`]; after a backoff that doubles per attempt.
 #[must_use]
 pub fn retry_due(record: &ActRecord, now: DateTime<Utc>) -> bool {
     // `failed` means the side effect was attempted: GitHub may have taken
     // part of it (a dispatch of several workflows, or a call that timed out
     // after GitHub accepted it), so it is never tried again at this head.
     // Only `refused` and `deferred`, which attempted nothing, retry.
-    if !matches!(record.status.as_str(), "refused" | "deferred") || record.attempts >= MAX_ATTEMPTS
-    {
+    let base = match record.status.as_str() {
+        "refused" | "deferred" => RETRY_BASE_MINUTES,
+        "blocked" => BLOCKED_RETRY_BASE_MINUTES,
+        _ => return false,
+    };
+    if record.attempts >= MAX_ATTEMPTS {
         return false;
     }
     let shift = record.attempts.saturating_sub(1).min(8);
-    now - record.at >= Duration::minutes(RETRY_BASE_MINUTES << shift)
+    now - record.at >= Duration::minutes(base << shift)
 }
 
 /// What one pass saw of one pull request.

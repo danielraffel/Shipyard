@@ -65,6 +65,18 @@ in the same pass, so a pass with no admission candidate holds stacked entries
 (`stack_listing: not_read_this_pass`) rather than reading GitHub again. Full
 reference: `docs/automated-draining.md`, "Dwell-time limits".
 
+## Stale merge refs: `stale_merge_ref`
+
+An approved pull request whose required checks ran on a merge ref the base
+has long moved past reads `stale_merge_ref:<contexts>` (actor `steward`): the
+newest required run at the head is older than `[auto_merge.stale_merge_ref]`
+allows (`max_lag_days`, default 3; `max_base_commits`, default 30). Do not push
+to "refresh" it and do not close and reopen it by hand: the dwell pass runs
+`shipyard advance --retrigger` for it once per head, with every refusal that
+command applies. An act outcome `retrigger_blocked: guard` means pr-close-guard
+refused the close and nothing changed; it is retried only after a day, at most
+three times. Full reference: `docs/automated-draining.md`, "Stale merge refs".
+
 ## Durable work-item contract
 
 Shipyard's existing ShipState/lease/receipt primitives are the source of

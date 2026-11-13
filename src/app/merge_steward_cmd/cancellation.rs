@@ -809,6 +809,9 @@ pub(super) fn apply_pr_plans_with_poison(
         !args.apply,
         &mut reports,
     );
+    // A red row whose checks ran on a long-stale merge ref, on an approved
+    // head, reads `stale_merge_ref`; the dwell pass retriggers it.
+    super::stale_merge_ref::annotate(actions, observation, policy, ledger, &mut reports);
     // Apply passes only: they persist the ledger, so the per-head cache holds
     // and a blocked backlog costs nothing between rechecks.
     if args.apply {

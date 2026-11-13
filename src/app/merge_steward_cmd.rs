@@ -2172,6 +2172,7 @@ mod red_everywhere;
 mod render;
 mod resume_record;
 mod shadow_ledger;
+mod stale_merge_ref;
 mod superseded;
 mod terminal_handoff;
 pub(super) mod train;

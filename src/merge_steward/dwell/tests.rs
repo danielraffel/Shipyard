@@ -26,6 +26,7 @@ fn token(state: DwellState) -> &'static str {
         DwellState::ApprovedGreenNotQueued => "ready",
         DwellState::CarriesUnapproved => "carries_unapproved_commits:#7",
         DwellState::StackedBaseMerged => STACKED_BASE_MERGED,
+        DwellState::StaleMergeRef => "stale_merge_ref:macos",
     }
 }
 
@@ -864,4 +865,40 @@ fn a_pass_with_no_open_pull_requests_does_not_reseed_the_next() {
         &|_, _| Actable::Yes,
     );
     assert!(planned[0].escalate, "only the very first pass seeds");
+}
+
+#[test]
+fn a_blocked_act_retries_after_a_day_doubling_and_at_most_max_attempts() {
+    let record = |attempts: u32| ActRecord {
+        kind: ActKind::RetriggerStaleRef,
+        state: DwellState::StaleMergeRef,
+        head: HEAD.to_owned(),
+        status: "blocked".to_owned(),
+        at: now(),
+        detail: Some("retrigger_blocked: guard".to_owned()),
+        attempts,
+    };
+    let later = |minutes: i64| now() + Duration::minutes(minutes);
+    assert!(!retry_due(&record(1), later(60)), "not within the hour");
+    assert!(!retry_due(&record(1), later(23 * 60)), "not within the day");
+    assert!(retry_due(&record(1), later(24 * 60)));
+    assert!(
+        !retry_due(&record(2), later(24 * 60)),
+        "the second wait doubles"
+    );
+    assert!(retry_due(&record(2), later(48 * 60)));
+    assert!(!retry_due(&record(MAX_ATTEMPTS), later(100 * 24 * 60)));
+}
+
+#[test]
+fn a_stale_merge_ref_token_has_the_retrigger_act() {
+    assert_eq!(
+        state_for_token("stale_merge_ref:macos,linux", APPROVAL),
+        Some(DwellState::StaleMergeRef)
+    );
+    assert_eq!(
+        DwellState::StaleMergeRef.mechanical_act(),
+        Some(ActKind::RetriggerStaleRef)
+    );
+    assert!(ActKind::RetriggerStaleRef.writes_github());
 }

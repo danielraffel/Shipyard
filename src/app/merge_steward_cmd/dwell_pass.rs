@@ -163,6 +163,9 @@ pub(super) enum ActOutcome {
     Failed(String),
     /// A precondition could not be read; nothing was attempted.
     Deferred(String),
+    /// A guard refused the write, or the command it needs is not in this
+    /// build; nothing changed. Retried only after a day.
+    Blocked(String),
 }
 
 impl ActOutcome {
@@ -172,6 +175,7 @@ impl ActOutcome {
             Self::Refused(_) => "refused",
             Self::Failed(_) => "failed",
             Self::Deferred(_) => "deferred",
+            Self::Blocked(_) => "blocked",
         }
     }
 
@@ -180,7 +184,8 @@ impl ActOutcome {
             Self::Done(detail)
             | Self::Refused(detail)
             | Self::Failed(detail)
-            | Self::Deferred(detail) => detail,
+            | Self::Deferred(detail)
+            | Self::Blocked(detail) => detail,
         }
     }
 }
@@ -195,6 +200,10 @@ pub(super) trait DwellActs {
     fn dispatch(&self, pr: &ObservedPr, workflows: &[String]) -> ActOutcome;
     /// Retarget stacked `pr` to the steward's base once its parent merged.
     fn retarget(&self, pr: &OpenPr) -> ActOutcome;
+    /// Close and reopen `pr` to rebuild its stale merge ref, through
+    /// `shipyard advance --retrigger`, after the approval gate, read live,
+    /// approves the exact head.
+    fn retrigger(&self, pr: &ObservedPr, ledger: &StewardLedger) -> ActOutcome;
 }
 
 /// Everything one repository's dwell step reads.
@@ -535,7 +544,7 @@ fn take_act(
     })?;
     *state = staged;
     let outcome = match kind {
-        ActKind::RerunVerdictCheck | ActKind::DispatchNeverRan => {
+        ActKind::RerunVerdictCheck | ActKind::DispatchNeverRan | ActKind::RetriggerStaleRef => {
             match input
                 .observation
                 .prs
@@ -545,6 +554,7 @@ fn take_act(
             {
                 None => ActOutcome::Refused("head moved since it was observed".to_owned()),
                 Some(pr) if kind == ActKind::RerunVerdictCheck => acts.rerun_verdict(pr, ledger),
+                Some(pr) if kind == ActKind::RetriggerStaleRef => acts.retrigger(pr, ledger),
                 // The token the entry was tracked under, never this pass's
                 // report row (a deferred row has none).
                 Some(pr) => acts.dispatch(
@@ -1041,6 +1051,19 @@ impl GitHubDwellActs<'_> {
         action: &str,
         effect: impl FnOnce() -> Result<String, String>,
     ) -> ActOutcome {
+        self.guarded_outcome(pr, action, || match effect() {
+            Ok(detail) => ActOutcome::Done(detail),
+            Err(error) => ActOutcome::Failed(error),
+        })
+    }
+
+    /// [`Self::guarded`] for an effect that names its own outcome.
+    fn guarded_outcome(
+        &self,
+        pr: &ObservedPr,
+        action: &str,
+        effect: impl FnOnce() -> ActOutcome,
+    ) -> ActOutcome {
         let Some(control) = self.control else {
             return ActOutcome::Deferred("no mutation control (dry run)".to_owned());
         };
@@ -1049,13 +1072,13 @@ impl GitHubDwellActs<'_> {
             Err(error) => return ActOutcome::Deferred(format!("mutation guard: {error}")),
         };
         match effect() {
-            Ok(detail) => match guard.finish("dwell_act_accepted") {
+            ActOutcome::Done(detail) => match guard.finish("dwell_act_accepted") {
                 Ok(()) => ActOutcome::Done(detail),
                 Err(error) => ActOutcome::Done(format!("{detail}; audit failed: {error}")),
             },
-            Err(error) => {
+            other => {
                 let _ = guard.finish("dwell_act_failed");
-                ActOutcome::Failed(error)
+                other
             }
         }
     }
@@ -1089,6 +1112,32 @@ impl GitHubDwellActs<'_> {
 }
 
 impl DwellActs for GitHubDwellActs<'_> {
+    fn retrigger(&self, pr: &ObservedPr, ledger: &StewardLedger) -> ActOutcome {
+        if let Some(outcome) = self.revalidate(pr) {
+            return outcome;
+        }
+        match super::pr_mutations::read_head_gate_for_report(
+            self.actions,
+            self.observation,
+            pr,
+            ledger,
+        ) {
+            Err(error) => {
+                return ActOutcome::Deferred(format!("approval gate unreadable: {error}"));
+            }
+            Ok((crate::head_approval::HeadGate::Approved { .. }, _, None)) => {}
+            Ok((gate, _, _)) => {
+                return ActOutcome::Refused(format!(
+                    "the head is no longer approved: {}",
+                    gate.explain()
+                ));
+            }
+        }
+        self.guarded_outcome(pr, "runner steward dwell retrigger stale merge ref", || {
+            super::stale_merge_ref::run_advance(&self.observation.repo, pr)
+        })
+    }
+
     fn rerun_verdict(&self, pr: &ObservedPr, ledger: &StewardLedger) -> ActOutcome {
         let Some(required) = self.approval else {
             return ActOutcome::Refused("no required approval context".to_owned());

@@ -103,6 +103,8 @@ struct FakeActs {
     /// The ledger file, read at the moment of each side effect.
     ledger_path: Option<std::path::PathBuf>,
     intent_on_disk: RefCell<Vec<bool>>,
+    /// What a retrigger answers; done when unset.
+    retrigger_outcome: Option<ActOutcome>,
 }
 
 impl DwellActs for FakeActs {
@@ -134,6 +136,14 @@ impl DwellActs for FakeActs {
             .borrow_mut()
             .push(format!("retarget #{}", pr.number));
         ActOutcome::Done("retargeted".to_owned())
+    }
+    fn retrigger(&self, pr: &ObservedPr, _ledger: &StewardLedger) -> ActOutcome {
+        self.calls
+            .borrow_mut()
+            .push(format!("retrigger #{}", pr.fact.number));
+        self.retrigger_outcome
+            .clone()
+            .unwrap_or_else(|| ActOutcome::Done("closed and reopened".to_owned()))
     }
 }
 
@@ -889,4 +899,233 @@ fn a_seeded_backlog_is_not_reported_as_emitted_to_the_relay() {
         report.overdue[0].escalated_level, 0,
         "seeded, never emitted"
     );
+}
+
+fn blocked_by_guard() -> ActOutcome {
+    ActOutcome::Blocked("retrigger_blocked: guard (pr-close-guard: refusing PR #1)".to_owned())
+}
+
+#[test]
+fn a_stale_merge_ref_is_retriggered_and_a_guard_refusal_waits_a_day() {
+    let temp = tempfile::tempdir().unwrap();
+    let prs = vec![pr(1, Some("FAILURE"), Some("SUCCESS"), &[])];
+    let mut pass = pass(
+        &temp,
+        prs,
+        vec![report(1, "stale_merge_ref:macos", Some(15))],
+    );
+    let mut ledger = established();
+    let acts = FakeActs {
+        retrigger_outcome: Some(blocked_by_guard()),
+        ..FakeActs::default()
+    };
+    let first = pass.run(&mut ledger, &acts);
+    assert_eq!(*acts.calls.borrow(), vec!["retrigger #1".to_owned()]);
+    assert_eq!(first.overdue[0].state, DwellState::StaleMergeRef);
+    let outcome = first.overdue[0].act_outcome.clone().unwrap_or_default();
+    assert!(
+        outcome.contains("blocked") && outcome.contains("retrigger_blocked: guard"),
+        "{outcome}"
+    );
+    let record = ledger.dwell["owner/repo@main"]
+        .acted(1, DwellState::StaleMergeRef, HEAD)
+        .expect("recorded")
+        .clone();
+    assert_eq!(record.status, "blocked");
+    // Every pass for the next day: never tried again.
+    for minutes in [10, 60, 600, 1400] {
+        pass.now = now() + chrono::Duration::minutes(minutes);
+        let report = pass.run(&mut ledger, &acts);
+        assert!(
+            matches!(&report.overdue[0].act, Disposition::Acted { status, .. } if status == "blocked"),
+            "{:?}",
+            report.overdue[0].act
+        );
+    }
+    assert_eq!(acts.calls.borrow().len(), 1, "{:?}", acts.calls.borrow());
+    // A day later one more try, then two days after that, then never.
+    for minutes in [1500, 1600, 4400, 4500, 20_000] {
+        pass.now = now() + chrono::Duration::minutes(minutes);
+        let _ = pass.run(&mut ledger, &acts);
+    }
+    assert_eq!(
+        acts.calls.borrow().len(),
+        3,
+        "bounded by MAX_ATTEMPTS: {:?}",
+        acts.calls.borrow()
+    );
+}
+
+#[test]
+fn a_retrigger_that_happened_is_never_repeated_at_the_head() {
+    let temp = tempfile::tempdir().unwrap();
+    let prs = vec![pr(1, Some("FAILURE"), Some("SUCCESS"), &[])];
+    let mut pass = pass(
+        &temp,
+        prs,
+        vec![report(1, "stale_merge_ref:macos", Some(15))],
+    );
+    let mut ledger = established();
+    let acts = FakeActs::default();
+    let _ = pass.run(&mut ledger, &acts);
+    pass.now = now() + chrono::Duration::days(3);
+    let _ = pass.run(&mut ledger, &acts);
+    assert_eq!(*acts.calls.borrow(), vec!["retrigger #1".to_owned()]);
+}
+
+#[test]
+fn a_stale_merge_ref_in_shadow_mode_only_says_it_would_act() {
+    let temp = tempfile::tempdir().unwrap();
+    let prs = vec![pr(1, Some("FAILURE"), Some("SUCCESS"), &[])];
+    let mut pass = pass(
+        &temp,
+        prs,
+        vec![report(1, "stale_merge_ref:macos", Some(15))],
+    );
+    pass.dwell_policy.act = ActMode::Shadow;
+    let mut ledger = established();
+    let acts = FakeActs::default();
+    let report = pass.run(&mut ledger, &acts);
+    assert!(acts.calls.borrow().is_empty());
+    assert!(matches!(
+        report.overdue[0].act,
+        Disposition::WouldAct { .. }
+    ));
+}
+
+mod stale_annotate {
+    use super::*;
+    use crate::app::merge_steward_cmd::stale_merge_ref::{
+        advance_args, annotate_with, outcome, parse_commit_times,
+    };
+    use crate::merge_steward::stale_merge_ref::{RetriggerResult, StaleRefPolicy};
+
+    /// Hourly base commits back from `tip`, newest first.
+    fn commits(tip: &str, count: i64) -> Vec<DateTime<Utc>> {
+        let tip = DateTime::parse_from_rfc3339(tip)
+            .unwrap()
+            .with_timezone(&Utc);
+        (0..count)
+            .map(|hour| tip - chrono::Duration::hours(hour))
+            .collect()
+    }
+
+    fn observation(prs: Vec<ObservedPr>) -> RepoObservation {
+        let mut observation = observation_for(prs[0].clone(), true);
+        observation.prs = prs;
+        observation
+    }
+
+    fn run(
+        reports: &mut [PrReport],
+        base: &Result<Vec<DateTime<Utc>>, String>,
+        approved: bool,
+        stale: StaleRefPolicy,
+    ) {
+        let observation = observation(vec![pr(1, Some("FAILURE"), Some("SUCCESS"), &[])]);
+        annotate_with(
+            &observation,
+            &policy(),
+            reports,
+            &|| stale,
+            &|_| base.clone(),
+            &|_| approved,
+        );
+    }
+
+    #[test]
+    fn an_approved_red_head_on_an_old_merge_ref_reads_stale() {
+        // The required runs completed 2026-11-09T11:00; the base moved 4 days.
+        let mut reports = vec![report(1, "required_failed:macos", Some(60))];
+        run(
+            &mut reports,
+            &Ok(commits("2026-11-13T12:00:00Z", 5)),
+            true,
+            StaleRefPolicy::default(),
+        );
+        let blocked = &reports[0].blocked;
+        assert_eq!(blocked.blocked_on, "stale_merge_ref:macos");
+        assert_eq!(blocked.since.as_deref(), Some("2026-11-09T11:00:00Z"));
+        assert_eq!(blocked.since_source, Some("required_run"));
+        let detail = blocked.blocked_detail.clone().unwrap_or_default();
+        assert!(detail.contains("moved on 4 day(s)"), "{detail}");
+        assert_eq!(
+            blocked.next_action.as_ref().map(|next| next.actor),
+            Some(Actor::Steward)
+        );
+    }
+
+    #[test]
+    fn an_unapproved_fresh_or_unread_row_keeps_its_token() {
+        for (base, approved, stale) in [
+            (
+                Ok(commits("2026-11-13T12:00:00Z", 5)),
+                false,
+                StaleRefPolicy::default(),
+            ),
+            (
+                Ok(commits("2026-11-09T12:00:00Z", 5)),
+                true,
+                StaleRefPolicy::default(),
+            ),
+            (Err("HTTP 502".to_owned()), true, StaleRefPolicy::default()),
+            (
+                Ok(commits("2026-11-13T12:00:00Z", 5)),
+                true,
+                StaleRefPolicy {
+                    max_lag_days: 0,
+                    max_base_commits: 0,
+                },
+            ),
+        ] {
+            let mut reports = vec![report(1, "required_failed:macos", Some(60))];
+            run(&mut reports, &base, approved, stale);
+            assert_eq!(
+                reports[0].blocked.blocked_on, "required_failed:macos",
+                "{base:?} {approved} {stale:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rows_that_are_not_red_cost_no_read() {
+        let observation = observation(vec![pr(1, Some("SUCCESS"), Some("SUCCESS"), &[])]);
+        let mut reports = vec![report(1, "no_verdict", Some(60))];
+        annotate_with(
+            &observation,
+            &policy(),
+            &mut reports,
+            &|| panic!("no candidate, no config read"),
+            &|_| panic!("no candidate, no commit read"),
+            &|_| panic!("no candidate, no gate read"),
+        );
+        assert_eq!(reports[0].blocked.blocked_on, "no_verdict");
+    }
+
+    #[test]
+    fn base_commit_pages_parse_or_refuse() {
+        let page = r#"[{"commit": {"committer": {"date": "2026-11-13T12:00:00Z"}}},
+                      {"commit": {"committer": {"date": "2026-11-12T12:00:00Z"}}}]"#;
+        assert_eq!(parse_commit_times(page).expect("parsed").len(), 2);
+        assert!(parse_commit_times(r#"[{"commit": {}}]"#).is_err());
+        assert!(parse_commit_times(r#"{"message": "Not Found"}"#).is_err());
+    }
+
+    #[test]
+    fn the_steward_calls_advance_for_the_exact_head_and_maps_its_answer() {
+        let args = advance_args("owner/repo", 7, HEAD);
+        assert_eq!(args[..3], ["advance", "owner/repo#7", "--retrigger"]);
+        assert!(args.windows(2).any(|pair| pair == ["--head", HEAD]));
+        assert!(args.contains(&"--json".to_owned()));
+        assert!(matches!(
+            outcome(RetriggerResult::Blocked(
+                "retrigger_blocked: guard".to_owned()
+            )),
+            ActOutcome::Blocked(_)
+        ));
+        assert!(matches!(
+            outcome(RetriggerResult::Failed("x".to_owned())),
+            ActOutcome::Failed(_)
+        ));
+    }
 }
