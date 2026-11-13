@@ -4807,6 +4807,37 @@ while the later PR's listed head is approved with no HOLD, or once the shared
 commits are on the base. A later PR whose head merely contains the earlier
 head gets no shortcut: ancestry cannot say which PR introduced a shared commit.
 
+## Release-readiness canary (`shipyard release-canary`)
+
+A repo opts in with `[release.canary]` in `.shipyard/config.toml`; an absent
+section is a no-op. The canary rehearses the NEXT version on a clean clone of
+`main` every day, so rules that only apply to the real next version (a parity
+waiver, a pretag expression, a test that hard-codes a version) fail the day they
+break, not on release day.
+
+```toml
+[release.canary]
+command = "python3 tools/rehearse_tag_pipeline.py --simulate --tag {next_tag}"
+timeout_secs = 1800   # default 900
+bump = "patch"        # or "minor"; default patch
+tag_prefix = "v"      # default v
+# enabled = false     # switch off without deleting the section
+```
+
+`{next_version}` is bare (`0.2.1`), `{next_tag}` has the prefix (`v0.2.1`); the
+command also sees `SHIPYARD_CANARY_NEXT_VERSION`. The next version is the
+highest stable `<prefix>X.Y.Z` tag plus the bump. The command runs in the clone
+and the clone is deleted; nothing is tagged, pushed or edited.
+
+`shipyard release-canary run [--repo o/r] [--base main] [--daily] [--apply]`:
+on failure or timeout it opens or edits ONE issue per repo, titled
+`release canary: vX.Y.Z would fail`, found by a body marker, quoting the output
+tail; on a later pass it comments and closes it. Without `--apply` it only
+reports. Exit 0 pass/skip, 1 canary failed, 2 infrastructure error (clone,
+tags, an unreadable issue list: never opens an issue). `--daily` stamps the UTC
+day per repo (errors retry hourly). The steward tick runs it detached for every
+fleet repo with `--daily --apply`; `SHIPYARD_RELEASE_CANARY=off` disables that.
+
 ## Skill-sync gotcha
 
 Changes to CI-coordinated Rust steward paths must carry this note or a reviewed skill-sync exception so the version-and-skill gate records the operational impact.

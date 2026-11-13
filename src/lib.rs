@@ -274,6 +274,7 @@ pub mod recovery_worker;
 pub mod registrar;
 /// PR event relay: deliver pull-request events to the owning session.
 pub(crate) mod relay;
+pub mod release_canary;
 /// Canonical identity of a watched repository after a rename or transfer.
 pub mod repo_slug;
 /// Read and write one GitHub Actions repository variable.

@@ -68,6 +68,33 @@ class StewardTickArchiveTests(unittest.TestCase):
         with tarfile.open(archives[0], "r:gz") as archive:
             self.assertIn("./old.json", archive.getnames())
 
+    def test_release_canary_runs_detached_and_logs_only_real_results(self):
+        shipyard = self.home / ".local" / "bin" / "shipyard"
+        shipyard.write_text(
+            "#!/bin/bash\n"
+            "if [ \"$1\" = --version ]; then echo 'shipyard 1.0'; exit 0; fi\n"
+            "if [ \"$1\" = release-canary ]; then\n"
+            "  [ \"$3\" = --help ] && exit 0\n"
+            "  echo \"$*\" > \"$HOME/canary-args\"\n"
+            "  echo 'release-canary status=fail tag=v1.0.1 issue=opened #5 exit 1'; exit 1\n"
+            "fi\n"
+            "printf '%s\\n' '{\"repos\":[]}'\n"
+        )
+        result = self.run_tick()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        summary = self.log_dir / "summary.log"
+        for _ in range(100):
+            if "release-canary status=fail" in summary.read_text():
+                break
+            time.sleep(0.1)
+        self.assertIn("acme/repo release-canary status=fail tag=v1.0.1", summary.read_text())
+        self.assertIn("--repo acme/repo --daily --apply", (self.home / "canary-args").read_text())
+
+    def test_release_canary_off_switch(self):
+        result = self.run_tick(SHIPYARD_RELEASE_CANARY="off")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.home / "canary-args").exists())
+
     def test_archive_failure_keeps_files_and_exit_status(self):
         self.run_tick()
         old = self.add_old_tick()

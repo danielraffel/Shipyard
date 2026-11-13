@@ -17,7 +17,9 @@
         "scripts/ci_matrix.py",
         "scripts/package_release.py",
         "scripts/release_macos_local.py",
-        "scripts/release-macos-local.sh"
+        "scripts/release-macos-local.sh",
+        "src/release_canary.rs",
+        "src/app/release_canary_cmd.rs"
       ]
     },
     "changelog": {
