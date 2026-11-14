@@ -340,6 +340,10 @@ struct StewardLedger {
     /// ejection cap once the base is green. See `red_base_ejections`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     red_base_ejections: BTreeMap<String, Vec<red_base_ejections::Entry>>,
+    /// When each covered pull request entered its loop state at its head,
+    /// keyed `repo#pr`. See `scheduling_loop`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    loop_seen: BTreeMap<String, scheduling_loop::Seen>,
     /// Doomed merge groups the steward decided on, keyed
     /// `repo#pr@group-sha`: once per (pull request, group head). See
     /// `merge_group_stall`.
@@ -1511,6 +1515,7 @@ pub(super) fn steward_command<W: Write>(
             &mut ledger,
             &mut remaining_preemptions,
             mutation_control.as_ref(),
+            &runtime_paths.global_dir,
             &mut recovery_errors,
             &mut recovery_cancellations,
         );
@@ -1593,6 +1598,7 @@ fn steward_repo(
     ledger: &mut StewardLedger,
     remaining_preemptions: &mut usize,
     mutation_control: Option<&MutationControl>,
+    global_dir: &Path,
     recovery_errors: &mut BTreeMap<String, Vec<String>>,
     recovery_cancellations: &mut BTreeMap<String, Vec<CancellationReport>>,
 ) -> (RepoReport, bool) {
@@ -1609,6 +1615,7 @@ fn steward_repo(
         ledger,
         remaining_preemptions,
         mutation_control,
+        global_dir,
         recovery_errors,
         recovery_cancellations,
     );
@@ -1712,6 +1719,7 @@ fn steward_repo_observed(
     ledger: &mut StewardLedger,
     remaining_preemptions: &mut usize,
     mutation_control: Option<&MutationControl>,
+    global_dir: &Path,
     recovery_errors: &mut BTreeMap<String, Vec<String>>,
     recovery_cancellations: &mut BTreeMap<String, Vec<CancellationReport>>,
 ) -> (RepoReport, bool) {
@@ -1741,6 +1749,7 @@ fn steward_repo_observed(
                 ledger,
                 *remaining_preemptions,
                 mutation_control,
+                Some(global_dir),
             );
             if let Some(errors) = recovery_errors.remove(&observation.repo) {
                 report.errors.extend(errors);
@@ -2201,6 +2210,7 @@ mod red_base_ejections;
 mod red_everywhere;
 mod render;
 mod resume_record;
+mod scheduling_loop;
 mod shadow_ledger;
 mod superseded;
 mod terminal_handoff;
@@ -2259,6 +2269,7 @@ pub(super) fn observe_next_steps(
 pub(super) fn pr_next_action_snapshot(
     actions: &GitHubActions,
     state_dir: &Path,
+    global_dir: &Path,
     repo: &str,
     number: u64,
 ) -> Result<Value, String> {
@@ -2336,7 +2347,7 @@ pub(super) fn pr_next_action_snapshot(
     }
     let observation = observation::observe_pull_request(actions, &settings, &base, &row)?;
     let (pr, merge_state, required_contexts, errors) =
-        single_pr_dry_run(actions, state_dir, &observation, number)?;
+        single_pr_dry_run(actions, state_dir, global_dir, &observation, number)?;
     let actionable = pr
         .blocked
         .next_action
@@ -2365,6 +2376,7 @@ pub(super) fn pr_next_action_snapshot(
 fn single_pr_dry_run(
     actions: &GitHubActions,
     state_dir: &Path,
+    global_dir: &Path,
     observation: &RepoObservation,
     number: u64,
 ) -> Result<(PrReport, String, Vec<String>, Vec<String>), String> {
@@ -2401,6 +2413,7 @@ fn single_pr_dry_run(
         &mut ledger,
         0,
         None,
+        Some(global_dir),
     );
     let pr = report
         .prs
