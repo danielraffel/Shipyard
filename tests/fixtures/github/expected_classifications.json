@@ -42,10 +42,10 @@
     "pr": 8638,
     "class": "armed_not_queued",
     "enabled_at": "2026-09-22T18:57:52Z",
-    "requeues_without_new_head": 4,
-    "ejections_of_current_head": 0,
+    "requeues_without_new_head": 5,
+    "ejections_of_current_head": 6,
     "last_ejection_reason": "failed_checks",
-    "last_ejection_new_head_since": true,
+    "last_ejection_new_head_since": false,
     "guard": "refuse"
   },
   "pr_merged.json": {
@@ -60,12 +60,12 @@
     "pr": 8722,
     "class": "ejected",
     "reason": "manual",
-    "new_head_since_removal": true,
+    "new_head_since_removal": false,
     "requeues_without_new_head": 0,
     "ejections_of_current_head": 0,
     "last_ejection_reason": "manual",
-    "last_ejection_new_head_since": true,
-    "guard": "allow"
+    "last_ejection_new_head_since": false,
+    "guard": "refuse"
   },
   "pr_rearmed_after_manual_removal.json": {
     "pr": 8688,
@@ -74,7 +74,7 @@
     "requeues_without_new_head": 0,
     "ejections_of_current_head": 0,
     "last_ejection_reason": "manual",
-    "last_ejection_new_head_since": true,
+    "last_ejection_new_head_since": false,
     "guard": "refuse"
   },
   "pr_synthetic_truncated_window.json": {
@@ -92,8 +92,8 @@
     "class": "ejected",
     "reason": "failed_checks",
     "new_head_since_removal": false,
-    "requeues_without_new_head": 3,
-    "ejections_of_current_head": 4,
+    "requeues_without_new_head": 4,
+    "ejections_of_current_head": 5,
     "last_ejection_reason": "failed_checks",
     "last_ejection_new_head_since": false,
     "guard": "refuse"
@@ -166,11 +166,11 @@
     "pr": 9653,
     "class": "ejected",
     "reason": "merge_conflict",
-    "new_head_since_removal": true,
+    "new_head_since_removal": false,
     "requeues_without_new_head": 0,
     "ejections_of_current_head": 1,
     "last_ejection_reason": "merge_conflict",
-    "last_ejection_new_head_since": true,
-    "guard": "allow"
+    "last_ejection_new_head_since": false,
+    "guard": "refuse"
   }
 }

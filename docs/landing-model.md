@@ -230,9 +230,11 @@ refused a legitimate re-arm that way). The removed head is the second parent
 of `RemovedFromMergeQueueEvent.beforeCommit`, which is the merge-group commit
 the queue built, not the PR head; it is trusted only when it is a commit the PR
 is seen to have had. When the removal names no head (`merge_conflict` removals
-never built a merge group) the fallback is push-time evidence: a
-`HeadRefForcePushedEvent` or `PullRequestCommit` after the removal whose oid is
-`headRefOid`. With neither, no new head is assumed and a re-arm is refused.
+never built a merge group) the fallback is server-timestamped push-time
+evidence: a `HeadRefForcePushedEvent` after the removal whose oid is
+`headRefOid`. `PullRequestCommit` timeline order is author-controlled and is
+not push evidence. With no authoritative event, no new head is assumed and a
+re-arm is refused.
 `shipyard landing` prints the removed head, the current head, and which basis
 decided. `requeues_without_new_head` counts `AddedToMergeQueueEvent`s that
 directly follow a `failed_checks`/`merge_conflict` removal and re-add the same

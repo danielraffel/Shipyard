@@ -334,7 +334,7 @@ _TIMELINE = (
     "timelineItems(last:100,itemTypes:[PULL_REQUEST_COMMIT,HEAD_REF_FORCE_PUSHED_EVENT,"
     "ADDED_TO_MERGE_QUEUE_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT,AUTO_MERGE_ENABLED_EVENT,"
     "AUTO_MERGE_DISABLED_EVENT,MERGED_EVENT]){pageInfo{hasPreviousPage} nodes{__typename "
-    "... on PullRequestCommit{commit{oid checkSuites(first:1){nodes{createdAt}}}} "
+    "... on PullRequestCommit{commit{oid}} "
     "... on HeadRefForcePushedEvent{createdAt afterCommit{oid}} "
     "... on AddedToMergeQueueEvent{createdAt} "
     "... on RemovedFromMergeQueueEvent{createdAt reason beforeCommit{oid parents(first:3){nodes{oid}}}} "
@@ -430,6 +430,13 @@ def _pushed_oid(node: Any) -> str | None:
     return None
 
 
+def _authoritative_push_oid(node: Any) -> str | None:
+    """The commit a server-timestamped force-push event put on the branch."""
+    if _typename(node) != "HeadRefForcePushedEvent":
+        return None
+    return _oid(node.get("afterCommit"))
+
+
 def _removed_head(node: dict[str, Any], known: list[str]) -> str | None:
     """The head a ``RemovedFromMergeQueueEvent`` removed.
 
@@ -453,6 +460,24 @@ def _removed_head(node: dict[str, Any], known: list[str]) -> str | None:
     if len(oids) == 2 and oids[1] and oids[1].lower() in lowered:
         return oids[1]
     return None
+
+
+def _removal_of(node: dict[str, Any], head: str) -> str:
+    """Classify whether a removal names ``head``, another head, or neither."""
+    before = node.get("beforeCommit")
+    if not isinstance(before, dict):
+        return "unattributable"
+    oid = _oid(before)
+    if oid and oid.lower() == head.lower():
+        return "head"
+    parents = before.get("parents")
+    parent_nodes = parents.get("nodes") if isinstance(parents, dict) else None
+    if not isinstance(parent_nodes, list):
+        return "unattributable"
+    oids = [_oid(parent) for parent in parent_nodes]
+    if any(oid and oid.lower() == head.lower() for oid in oids):
+        return "head"
+    return "other" if len(oids) == 2 else "unattributable"
 
 
 def _same_head_re_add(
@@ -486,32 +511,20 @@ def _new_head_since(
 ) -> tuple[bool, str]:
     """Whether ``head`` differs from the head removed at ``index``, and on what basis.
 
-    By SHA when the removal names its head. Otherwise a force-push or commit
-    after the removal (timeline order) whose oid is ``head``, or a commit of
-    ``head`` whose earliest check suite was created after the removal event,
-    wherever GitHub sorted it. With none of these, no new head is assumed, so a
-    re-arm is refused. Commit dates are never consulted: GitHub sorts a
-    back-dated commit before a removal it was pushed after. Mirrors
-    ``new_head_since`` in ``src/pr_queue_state.rs``, which documents why the
-    check suite stands in for the push time.
+    By SHA when the removal names its head. Otherwise only a later
+    server-timestamped ``HeadRefForcePushedEvent`` whose oid is ``head`` is
+    accepted. Commit timeline order and check-suite creation time are not push
+    evidence. With no authoritative push event, no new head is assumed, so a
+    re-arm is refused. Mirrors ``new_head_since`` in ``src/pr_queue_state.rs``.
     """
     if head is None:
         return False, "no_evidence"
     if removed is not None:
         return removed.lower() != head.lower(), "removed_head_sha"
     for node in nodes[index + 1 :]:
-        oid = _pushed_oid(node)
+        oid = _authoritative_push_oid(node)
         if oid and oid.lower() == head.lower():
             return True, "push_after_removal"
-    removed_at = _timestamp(nodes[index].get("createdAt"))
-    if removed_at is not None:
-        for node in nodes:
-            if not isinstance(node, dict) or node.get("__typename") != "PullRequestCommit":
-                continue
-            oid = _pushed_oid(node)
-            suite = _earliest_suite(node)
-            if oid and oid.lower() == head.lower() and suite is not None and suite > removed_at:
-                return True, "suite_after_removal"
     return False, "no_evidence"
 
 
@@ -524,16 +537,21 @@ def _timestamp(value: Any) -> datetime | None:
         return None
 
 
-def _earliest_suite(node: dict[str, Any]) -> datetime | None:
-    """When the commit's earliest check suite was created: its push time to
-    within a second, since ``Commit.pushedDate`` is null."""
-    suites = (((node.get("commit") or {}).get("checkSuites") or {}).get("nodes")) or []
-    times = [
-        time
-        for time in (_timestamp(suite.get("createdAt")) for suite in suites if isinstance(suite, dict))
-        if time is not None
-    ]
-    return min(times) if times else None
+def _push_after_removal(nodes: list[Any], index: int, head: str) -> bool:
+    """Whether a later server-timestamped force-push put ``head`` on the branch."""
+    # A force-push back to a head already visible before this removal is not a
+    # new arrival; it only proves the branch was rewritten to the same SHA.
+    if any(
+        oid and oid.lower() == head.lower()
+        for node in nodes[:index]
+        if (oid := _authoritative_push_oid(node))
+    ):
+        return False
+    return any(
+        oid and oid.lower() == head.lower()
+        for node in nodes[index + 1 :]
+        if (oid := _authoritative_push_oid(node))
+    )
 
 
 def _ejections_of_head(
@@ -542,21 +560,12 @@ def _ejections_of_head(
     """``failed_checks`` / ``merge_conflict`` removals of ``head``.
 
     A removal that names its head counts when that head is ``head``; one that
-    names none counts once it follows the first push of ``head`` (or when no
-    push of it is visible), so an unattributable removal is charged to the
-    current head rather than assumed away. Mirrors
+    names none counts unless a later server-timestamped force-push proves that
+    it predates the current head. Mirrors
     ``PrQueueReport::ejections_of_current_head``.
     """
     if head is None:
         return 0
-    first_push = next(
-        (
-            index
-            for index, node in enumerate(nodes)
-            if (_pushed_oid(node) or "").lower() == head.lower()
-        ),
-        None,
-    )
     count = 0
     for index, node in enumerate(nodes):
         if _typename(node) != "RemovedFromMergeQueueEvent":
@@ -564,11 +573,13 @@ def _ejections_of_head(
         reason = node.get("reason") if isinstance(node.get("reason"), str) else ""
         if reason.lower() not in RETRY_HAZARD_REASONS:
             continue
-        removed = removed_heads[index]
-        if removed is not None:
-            charged = removed.lower() == head.lower()
+        removal_kind = _removal_of(node, head)
+        if removal_kind == "head":
+            charged = True
+        elif removal_kind == "other":
+            charged = False
         else:
-            charged = first_push is None or index > first_push
+            charged = not _push_after_removal(nodes, index, head)
         if charged:
             count += 1
     return count
@@ -620,7 +631,7 @@ def classify_pr_queue_state(response: Any) -> dict[str, Any]:
     for index, node in enumerate(nodes):
         typename = _typename(node)
         if typename in ("PullRequestCommit", "HeadRefForcePushedEvent"):
-            if hazard_pending is not None:
+            if _authoritative_push_oid(node) is not None and hazard_pending is not None:
                 hazard_pending = (hazard_pending[0], True)
             last_new_head = index
         elif typename == "RemovedFromMergeQueueEvent":

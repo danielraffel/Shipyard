@@ -4464,10 +4464,10 @@ or removed from the queue with no new head since. "New head" is decided by SHA
 `beforeCommit` merge-group commit), never by commit date or timeline position:
 GitHub sorts a fix committed before an ejection but pushed after it *before* the
 removal. Only a removal that names no head (`merge_conflict`) falls back to
-push time: a push of the current head after it in timeline order, or the
-head's earliest check suite created after the removal (`suite_after_removal`;
-`Commit.pushedDate` is null). Without either, including a head with no suite,
-it refuses. A same-head
+server-timestamped push time: a later `HeadRefForcePushedEvent` for the current
+head after the removal. `PullRequestCommit` timeline order is author-controlled,
+and check-suite creation is not push evidence because it can lag the push.
+Without that signal, it refuses. A same-head
 removal for `failed_checks`/`merge_conflict` is the ALLGREEN cascade (push a
 fix first); any other reason except `invalid_merge_commit` is refused with
 "confirm with whoever dequeued it". Shipyard's own enqueue is recognised
@@ -4783,7 +4783,12 @@ binding that head. The steward, `shipyard review-verdict`, the
 `review-verdict` status and the `ghapp` queue-arm guard all switch together;
 no comment or review counts and no approval carries to a new head. The
 ejection cap still holds: an admitted head the queue removed twice is not
-re-enqueued, and only a new head lifts it. A
+re-enqueued, and only a new head lifts it. A removal is the head's when the
+head is the removal's `beforeCommit` or a parent of that two-parent
+merge-group commit. One the timeline cannot attribute (no `beforeCommit`, as
+for every `merge_conflict` removal, parents unread, or any parent count but
+two) counts against the head unless a later server-timestamped
+`HeadRefForcePushedEvent` identifies the current head. A
 malformed guard setting refuses every head rather than falling back to
 comments, and a `require-guard-admission` file in a host's guards directory
 refuses comment mode on that host. Do not post a verdict comment to unblock

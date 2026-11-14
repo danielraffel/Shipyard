@@ -19,10 +19,18 @@ pub(crate) const PR_9438_HEADS: &[&str] = &[
 
 /// #9438's merge-queue timeline as `PR_QUEUE_STATE_QUERY` returned it just
 /// after the force-push to `head`: every event up to and including that push.
+///
+/// Each removal's `beforeCommit` is the merge-group commit, carrying the
+/// parents `PR_QUEUE_STATE_QUERY` selects. The parents were read from
+/// `repos/Generous-Corp/pulp/commits/<group>` on 2026-11-13: the second is the
+/// head the queue removed (an earlier head, `PR_9438_HEADS[2]`, then
+/// `PR_9438_HEADS[5]`), the first the queue base.
 pub(crate) fn pr_9438_queue(head: &str) -> Value {
-    let removal = |at: &str, reason: &str, oid: &str| {
+    let removal = |at: &str, reason: &str, oid: &str, parents: [&str; 2]| {
         json!({"__typename": "RemovedFromMergeQueueEvent", "createdAt": at, "reason": reason,
-               "actor": {"login": "shipyard-local"}, "beforeCommit": {"oid": oid}})
+               "actor": {"login": "shipyard-local"},
+               "beforeCommit": {"oid": oid, "parents": {"nodes": [
+                   {"oid": parents[0]}, {"oid": parents[1]}]}}})
     };
     let push = |at: &str, oid: &str| {
         json!({"__typename": "HeadRefForcePushedEvent", "createdAt": at,
@@ -33,6 +41,10 @@ pub(crate) fn pr_9438_queue(head: &str) -> Value {
             "2026-10-04T00:48:52Z",
             "manual",
             "0394ac44cd909550325cf0095ef4e68e9ca2654e",
+            [
+                "3737efba9caf8cd45e48d92f15841b562df48a94",
+                "51e3eb42c77a52a08604dfef29b234c39d23aa13",
+            ],
         ),
         push("2026-10-04T00:50:06Z", PR_9438_HEADS[0]),
         push("2026-10-04T01:04:25Z", PR_9438_HEADS[1]),
@@ -41,6 +53,7 @@ pub(crate) fn pr_9438_queue(head: &str) -> Value {
             "2026-10-04T02:20:39Z",
             "manual",
             "cca4ee6c25a8b4fda6b97e6e9993994c34a69eb2",
+            ["fe3da67476fba2c34fdc32eb3ffad39b30851eac", PR_9438_HEADS[2]],
         ),
         push("2026-10-04T02:29:36Z", PR_9438_HEADS[3]),
         push("2026-10-04T03:44:17Z", PR_9438_HEADS[4]),
@@ -49,6 +62,7 @@ pub(crate) fn pr_9438_queue(head: &str) -> Value {
             "2026-10-04T04:41:55Z",
             "manual",
             "a436b80422de2da55e96c5e05ec8d8077940eb8e",
+            ["930553a61cc009f73fe851ae2d5ff03dff433a6d", PR_9438_HEADS[5]],
         ),
         push("2026-10-04T04:43:06Z", PR_9438_HEADS[6]),
     ];
@@ -494,18 +508,44 @@ fn a_repository_that_does_not_require_approval_arms_without_one() {
 // Ejections
 // ---------------------------------------------------------------------------
 
-fn ejected_twice(head: &str) -> Value {
+const BASE: &str = "cccccccccccccccccccccccccccccccccccccccc";
+const GROUP_1: &str = "1111111111111111111111111111111111111111";
+const GROUP_2: &str = "2222222222222222222222222222222222222222";
+const GROUP_3: &str = "3333333333333333333333333333333333333333";
+const GROUP_4: &str = "4444444444444444444444444444444444444444";
+
+/// A `RemovedFromMergeQueueEvent` in the shape GitHub returns it for a queue
+/// that built a group: `beforeCommit` is the merge-group commit `group`, whose
+/// second parent is the removed `head` (`tests/fixtures/github/README.md`).
+fn group_removal(at: &str, reason: &str, group: &str, head: &str) -> Value {
+    json!({"__typename": "RemovedFromMergeQueueEvent", "createdAt": at, "reason": reason,
+           "beforeCommit": {"oid": group, "parents": {"nodes": [
+               {"oid": BASE}, {"oid": head}]}}})
+}
+
+fn timeline(head: &str, nodes: Vec<Value>) -> Value {
     json!({"data": {"repository": {"pullRequest": {"headRefOid": head,
-    "timelineItems": {"nodes": [
-        {"__typename": "RemovedFromMergeQueueEvent", "createdAt": "2026-10-04T01:00:00Z",
-         "reason": "FAILED_CHECKS", "beforeCommit": {"oid": head}},
-        {"__typename": "RemovedFromMergeQueueEvent", "createdAt": "2026-10-04T02:00:00Z",
-         "reason": "INVALID_MERGE_COMMIT", "beforeCommit": {"oid": head}},
-        {"__typename": "RemovedFromMergeQueueEvent", "createdAt": "2026-10-04T03:00:00Z",
-         "reason": "MANUAL", "beforeCommit": {"oid": OTHER}},
-        {"__typename": "RemovedFromMergeQueueEvent", "createdAt": "2026-10-04T04:00:00Z",
-         "reason": "MERGED", "beforeCommit": {"oid": head}},
-    ]}}}}})
+        "timelineItems": {"pageInfo": {"hasPreviousPage": false},
+                          "nodes": Value::Array(nodes)}}}}})
+}
+
+/// `head` removed from two merge groups, plus a removal of another head's
+/// group and a merge, none of which is `head`'s ejection.
+fn ejected_twice(head: &str) -> Value {
+    timeline(
+        head,
+        vec![
+            group_removal("2026-10-04T01:00:00Z", "FAILED_CHECKS", GROUP_1, head),
+            group_removal(
+                "2026-10-04T02:00:00Z",
+                "INVALID_MERGE_COMMIT",
+                GROUP_2,
+                head,
+            ),
+            group_removal("2026-10-04T03:00:00Z", "MANUAL", GROUP_3, OTHER),
+            group_removal("2026-10-04T04:00:00Z", "MERGED", GROUP_4, head),
+        ],
+    )
 }
 
 #[test]
@@ -519,6 +559,273 @@ fn ejections_are_counted_per_head_with_their_cause_and_merges_excluded() {
     );
     assert_eq!(ejections[1].cause, "main moved under it");
     assert_eq!(head_ejections(&ejected_twice(HEAD), OTHER).len(), 1);
+}
+
+/// The merge-group commit itself is never the head, so a reader that matched
+/// `beforeCommit.oid` against the head counted none of these.
+#[test]
+fn a_merge_group_removal_counts_against_the_head_that_is_its_parent() {
+    let queue = timeline(
+        HEAD,
+        vec![group_removal(
+            "2026-10-04T01:00:00Z",
+            "failed_checks",
+            GROUP_1,
+            HEAD,
+        )],
+    );
+    assert_eq!(head_ejections(&queue, HEAD).len(), 1);
+    assert!(
+        head_ejections(&queue, GROUP_1).len() == 1,
+        "beforeCommit itself"
+    );
+    assert!(head_ejections(&queue, OTHER).is_empty());
+}
+
+#[test]
+fn two_merge_group_failed_checks_removals_reach_the_cap() {
+    let queue = timeline(
+        HEAD,
+        vec![
+            group_removal("2026-10-04T01:00:00Z", "failed_checks", GROUP_1, HEAD),
+            group_removal("2026-10-04T02:00:00Z", "failed_checks", GROUP_2, HEAD),
+        ],
+    );
+    let old = [review(
+        "someone",
+        "User",
+        "APPROVED",
+        HEAD,
+        "2026-10-04T00:30:00Z",
+    )];
+    assert!(matches!(
+        decide(&required(&[]), HEAD, &old, &[], &queue),
+        HeadGate::EjectionCap { ref ejections, .. } if ejections.len() == 2
+    ));
+}
+
+#[test]
+fn a_removal_of_another_heads_merge_group_does_not_count() {
+    // Two removals of OTHER's groups (an earlier head of the pull request):
+    // every parent was read and none is HEAD.
+    let queue = timeline(
+        HEAD,
+        vec![
+            group_removal("2026-10-04T01:00:00Z", "failed_checks", GROUP_1, OTHER),
+            group_removal("2026-10-04T02:00:00Z", "failed_checks", GROUP_2, OTHER),
+        ],
+    );
+    assert!(head_ejections(&queue, HEAD).is_empty());
+    let old = [review(
+        "someone",
+        "User",
+        "APPROVED",
+        HEAD,
+        "2026-10-04T00:30:00Z",
+    )];
+    assert!(decide(&required(&[]), HEAD, &old, &[], &queue).allows());
+}
+
+/// A removal the response cannot attribute counts against the head (fail
+/// closed): no `beforeCommit` (every `merge_conflict` removal, and some
+/// `manual` ones), a `beforeCommit` without `parents`, a parent without an
+/// oid, and a full `parents(first:3)` page that may have been cut.
+#[test]
+fn an_unattributable_removal_counts_against_the_head() {
+    let unattributable = [
+        json!(null),
+        json!({"oid": GROUP_1}),
+        json!({"oid": GROUP_1, "parents": null}),
+        json!({"oid": GROUP_1, "parents": {"nodes": [{"oid": BASE}, {}]}}),
+        json!({"oid": GROUP_1, "parents": {"nodes": []}}),
+        // A single-parent commit, as a squash or rebase queue would build.
+        json!({"oid": GROUP_1, "parents": {"nodes": [{"oid": BASE}]}}),
+        json!({"oid": GROUP_1, "parents": {"nodes": [
+            {"oid": BASE}, {"oid": OTHER}, {"oid": GROUP_2}]}}),
+    ];
+    for before in unattributable {
+        let removal = |at: &str| {
+            json!({"__typename": "RemovedFromMergeQueueEvent", "createdAt": at,
+                   "reason": "merge_conflict", "beforeCommit": before.clone()})
+        };
+        let queue = timeline(
+            HEAD,
+            vec![
+                removal("2026-10-04T01:00:00Z"),
+                removal("2026-10-04T02:00:00Z"),
+            ],
+        );
+        assert_eq!(head_ejections(&queue, HEAD).len(), 2, "{before}");
+        let old = [review(
+            "someone",
+            "User",
+            "APPROVED",
+            HEAD,
+            "2026-10-04T00:30:00Z",
+        )];
+        assert!(
+            matches!(
+                decide(&required(&[]), HEAD, &old, &[], &queue),
+                HeadGate::EjectionCap { .. }
+            ),
+            "{before}"
+        );
+    }
+}
+
+fn conflict_removal(at: &str) -> Value {
+    json!({"__typename": "RemovedFromMergeQueueEvent", "createdAt": at,
+           "reason": "merge_conflict", "beforeCommit": null})
+}
+
+fn force_push(at: &str, head: &str) -> Value {
+    json!({"__typename": "HeadRefForcePushedEvent", "createdAt": at,
+           "afterCommit": {"oid": head}})
+}
+
+fn commit(head: &str, suite: Option<&str>) -> Value {
+    let suites = suite.map_or_else(Vec::new, |at| vec![json!({"createdAt": at})]);
+    json!({"__typename": "PullRequestCommit",
+           "commit": {"oid": head, "checkSuites": {"nodes": suites}}})
+}
+
+/// An unattributable removal remains charged without authoritative push
+/// evidence. Check-suite creation and commit timeline order are not push
+/// evidence; a server-timestamped force-push of the current head is.
+#[test]
+fn an_unattributable_removal_requires_authoritative_push_evidence_to_clear() {
+    let removals = || {
+        vec![
+            conflict_removal("2026-10-04T01:00:00Z"),
+            conflict_removal("2026-10-04T02:00:00Z"),
+        ]
+    };
+    let with = |extra: Vec<Value>| {
+        let mut nodes = removals();
+        nodes.extend(extra);
+        timeline(HEAD, nodes)
+    };
+    let suite_after = with(vec![commit(HEAD, Some("2026-10-04T03:00:00Z"))]);
+    let with_window = |queue: &Value, page_info: Value| {
+        let mut queue = queue.clone();
+        queue["data"]["repository"]["pullRequest"]["timelineItems"]["pageInfo"] = page_info;
+        queue
+    };
+    for queue in [
+        // A suite created after the removals can lag the push.
+        suite_after.clone(),
+        // Pushed before the removals, with a later suite on its commit.
+        {
+            let mut nodes = vec![force_push("2026-10-04T00:30:00Z", HEAD)];
+            nodes.extend(removals());
+            nodes.push(commit(HEAD, Some("2026-10-04T03:00:00Z")));
+            timeline(HEAD, nodes)
+        },
+        with_window(&suite_after, json!({"hasPreviousPage": true})),
+        with_window(&suite_after, json!({})),
+        with_window(&suite_after, Value::Null),
+        // A later head's arrival says nothing about this one.
+        with(vec![commit(OTHER, Some("2026-10-04T03:00:00Z"))]),
+    ] {
+        assert_eq!(head_ejections(&queue, HEAD).len(), 2, "{queue}");
+    }
+    // A force-push away and back after the removals is authoritative evidence
+    // that both removals predate the current head.
+    let mut force_pushed_back = vec![commit(HEAD, None)];
+    force_pushed_back.extend(removals());
+    force_pushed_back.push(force_push("2026-10-04T02:30:00Z", OTHER));
+    force_pushed_back.push(force_push("2026-10-04T03:00:00Z", HEAD));
+    assert!(head_ejections(&timeline(HEAD, force_pushed_back), HEAD).is_empty());
+    // A server-timestamped force-push after the removals proves that both
+    // removals predate the current head and must not cap it.
+    let queue = with(vec![force_push("2026-10-04T03:00:00Z", HEAD)]);
+    assert!(head_ejections(&queue, HEAD).is_empty());
+    // A later commit timeline item is not authoritative push evidence, even
+    // without a check suite, so both unattributable removals stay charged.
+    assert_eq!(
+        head_ejections(&with(vec![commit(HEAD, None)]), HEAD).len(),
+        2
+    );
+    assert_eq!(
+        head_ejections(
+            &with(vec![json!({"__typename": "PullRequestCommit",
+                         "commit": {"oid": HEAD, "checkSuites": null}})]),
+            HEAD
+        )
+        .len(),
+        2
+    );
+}
+
+/// pulp#9653, captured live: a `merge_conflict` removal (no `beforeCommit`),
+/// then head `99403d83` whose commit sorts before the removal. Without a
+/// server-timestamped force-push in the captured window, the removal is charged.
+#[test]
+fn the_real_9653_capture_charges_a_conflict_removal_to_the_later_head() {
+    let queue = real_capture("pr_real_9653_merge_conflict_backdated_push.json");
+    assert_eq!(
+        head_ejections(&queue, "99403d83614a0e535a3d2a5bac391e5ab326b639").len(),
+        1
+    );
+}
+
+#[test]
+fn a_removal_without_a_reason_counts_against_the_head() {
+    let mut removal = group_removal("2026-10-04T01:00:00Z", "failed_checks", GROUP_1, HEAD);
+    removal.as_object_mut().expect("object").remove("reason");
+    let ejections = head_ejections(&timeline(HEAD, vec![removal]), HEAD);
+    assert_eq!(ejections.len(), 1);
+    assert_eq!(ejections[0].reason, "unknown");
+}
+
+fn real_capture(name: &str) -> Value {
+    let path = format!(
+        "{}/tests/fixtures/github/{name}",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    serde_json::from_str(&std::fs::read_to_string(path).expect("fixture")).expect("fixture JSON")
+}
+
+/// pulp#8678, captured live: head `f0fb2fb3` removed for `failed_checks` from
+/// merge groups `2410ca49` and `b82856ec`, each with the head as its second
+/// parent. That is the cap.
+#[test]
+fn the_real_8678_capture_reaches_the_cap_on_its_merge_group_removals() {
+    let queue = real_capture("pr_real_8678_second_ejection_same_head.json");
+    let head = "f0fb2fb38ef5c900efad7ea0630906f081db53a9";
+    let ejections = head_ejections(&queue, head);
+    let failed = ejections
+        .iter()
+        .filter(|ejection| ejection.reason.eq_ignore_ascii_case("failed_checks"))
+        .count();
+    assert_eq!(failed, 2);
+    // Its earlier `manual` removal has `beforeCommit: null`: unattributable,
+    // so it is charged to the head as well.
+    assert_eq!(ejections.len(), 3);
+    let old = [review(
+        "someone",
+        "User",
+        "APPROVED",
+        head,
+        "2026-09-23T03:00:00Z",
+    )];
+    assert!(matches!(
+        decide(&required(&[]), head, &old, &[], &queue),
+        HeadGate::EjectionCap { .. }
+    ));
+}
+
+/// pulp#8912, captured live: one removal, from merge group `3dba2caa` whose
+/// second parent `f4b97cb8` is the removed head. The new head `c246e05b` is
+/// not charged with it.
+#[test]
+fn the_real_8912_capture_charges_the_removed_head_not_the_next_one() {
+    let queue = real_capture("pr_real_8912_backdated_fix_after_ejection.json");
+    assert_eq!(
+        head_ejections(&queue, "f4b97cb8e4458072e2ff10429c2361ec3b446b5e").len(),
+        1
+    );
+    assert!(head_ejections(&queue, "c246e05b54069e800a8d1e5f8f4c9d5e841818d7").is_empty());
 }
 
 #[test]
@@ -577,9 +884,15 @@ fn an_interruption_ejection_does_not_count_toward_the_cap() {
 
 #[test]
 fn a_head_ejected_once_keeps_its_earlier_approval() {
-    let queue = json!({"data": {"repository": {"pullRequest": {"timelineItems": {"nodes": [
-        {"__typename": "RemovedFromMergeQueueEvent", "createdAt": "2026-10-04T02:00:00Z",
-         "reason": "MANUAL", "beforeCommit": {"oid": HEAD}}]}}}}});
+    let queue = timeline(
+        HEAD,
+        vec![group_removal(
+            "2026-10-04T02:00:00Z",
+            "failed_checks",
+            GROUP_1,
+            HEAD,
+        )],
+    );
     let old = [review(
         "someone",
         "User",

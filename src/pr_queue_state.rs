@@ -24,23 +24,12 @@
 //! request is seen to have had (a `PullRequestCommit`, a force-push
 //! `afterCommit`, or `headRefOid`). A removal GitHub never built a merge group
 //! for (`merge_conflict`) has no `beforeCommit`; there, and whenever the
-//! removed head cannot be established, the classifier falls back to push-time
-//! evidence: a `HeadRefForcePushedEvent` or `PullRequestCommit` *after* the
-//! removal in timeline order whose oid is the current head, or, wherever its
-//! timeline item sits, a `PullRequestCommit` of the current head whose earliest
-//! check suite was created after the removal event. With neither, the answer is
-//! "no new head", which refuses a re-arm (fail closed).
-//!
-//! The check suite stands in for the push time because GitHub exposes none on
-//! the commit (`Commit.pushedDate` is null) and the suites are created when the
-//! push arrives: for Generous-Corp/pulp#9653 the earliest suite of each pushed
-//! head trailed the push the repository activity API recorded by one second.
-//! A commit that first reached GitHub on another branch before the removal
-//! carries that earlier suite and reads "no new head", the safe direction; a
-//! head with no check suite at all keeps the timeline-order rule. If this ever
-//! misreads a live push, the repository activity API
-//! (`repos/{owner}/{repo}/activity`, push events with timestamps) is the
-//! authoritative source to escalate to.
+//! removed head cannot be established, the classifier falls back only to a
+//! later `HeadRefForcePushedEvent` whose server timestamp and oid identify the
+//! current head. A commit timeline item is author-controlled and is not push
+//! evidence; a check suite's creation time can lag the push and is not evidence
+//! either. With no authoritative push event, the answer is "no new head", which
+//! refuses a re-arm (fail closed).
 //!
 //! ## Limits
 //!
@@ -297,13 +286,9 @@ pub struct Ejection {
 pub enum NewHeadBasis {
     /// `headRefOid` compared with the head the removal names.
     RemovedHeadSha,
-    /// The removal names no head; a force-push or commit after it in timeline
-    /// order whose oid is `headRefOid`.
+    /// The removal names no head; a later server-timestamped force-push event
+    /// put `headRefOid` on the branch.
     PushAfterRemoval,
-    /// The removal names no head; a commit whose oid is `headRefOid` has its
-    /// earliest check suite created after the removal event, wherever GitHub
-    /// sorted it in the timeline.
-    SuiteAfterRemoval,
     /// Neither: no evidence of a new head, so none is assumed.
     NoEvidence,
 }
@@ -325,10 +310,10 @@ pub struct PrQueueReport {
     /// the visible timeline: the removals a same-head re-enqueue would repeat.
     /// A `manual` or `invalid_merge_commit` removal says nothing against the
     /// head and is not counted. A removal that names its head counts when that head is
-    /// `headRefOid`; one that names none counts when it follows the first
-    /// timeline item that pushed `headRefOid` (or when no such item is
-    /// visible), so an unattributable removal is charged to the current head
-    /// rather than assumed away.
+    /// `headRefOid`; one that names none counts unless a later
+    /// server-timestamped force-push event proves it predates the current head
+    /// (or when no such event is visible), so an unattributable removal is
+    /// charged to the current head rather than assumed away.
     pub ejections_of_current_head: u32,
     /// `Some(true)` when the timeline window reached the start of history,
     /// `Some(false)` when older items were cut off, `None` when unmeasured.
@@ -399,15 +384,108 @@ fn removed_head(node: &Value, known: &[&str]) -> Option<String> {
     {
         return Some(oid.to_owned());
     }
-    let parents = before
+    match merge_group_parents(before)?.as_slice() {
+        [_, head] if is_known(head) => Some((*head).to_owned()),
+        _ => None,
+    }
+}
+
+/// The parent oids of a removal's `beforeCommit` merge-group commit, or
+/// `None` when the response does not carry them all (`parents` not selected,
+/// a parent without an oid).
+fn merge_group_parents(before: &Value) -> Option<Vec<&str>> {
+    before
         .pointer("/parents/nodes")
         .and_then(Value::as_array)?
         .iter()
         .map(|parent| parent.get("oid").and_then(Value::as_str))
-        .collect::<Option<Vec<_>>>()?;
-    match parents.as_slice() {
-        [_, head] if is_known(head) => Some((*head).to_owned()),
-        _ => None,
+        .collect()
+}
+
+/// Whose removal one `RemovedFromMergeQueueEvent` was, judged against one
+/// head. See [`removal_of`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RemovalOf {
+    /// The removal names the head: `beforeCommit` is the head, or the head is
+    /// a parent of the `beforeCommit` merge-group commit.
+    Head,
+    /// The removal names another commit: `beforeCommit` is a two-parent
+    /// merge-group commit, and neither it nor either parent is the head.
+    OtherHead,
+    /// The response cannot say: no `beforeCommit` (a `merge_conflict`
+    /// removal, for which GitHub built no group), its parents not read or
+    /// unreadable, or any count of parents other than two.
+    Unattributable,
+}
+
+impl RemovalOf {
+    /// Whether the removal must be charged to the head: it names the head,
+    /// or it cannot be shown to name another one.
+    #[must_use]
+    pub const fn charges_head(self) -> bool {
+        !matches!(self, Self::OtherHead)
+    }
+}
+
+/// Whose removal the `RemovedFromMergeQueueEvent` `node` was, judged against
+/// `head`, by the same reading of `beforeCommit` this module's classifier
+/// uses: `beforeCommit` is the merge-group commit the queue built, and the
+/// head it removed is one of that commit's parents (the second, as GitHub
+/// builds it). A `beforeCommit` equal to the head is also the head's.
+///
+/// Unlike [`removed_head`], this does not need the head to be a commit the
+/// pull request was seen to have: the caller names it, so the question is
+/// only whether this removal involved it.
+#[must_use]
+pub fn removal_of(node: &Value, head: &str) -> RemovalOf {
+    let Some(before) = node.get("beforeCommit").filter(|value| value.is_object()) else {
+        return RemovalOf::Unattributable;
+    };
+    let Some(oid) = before.get("oid").and_then(Value::as_str) else {
+        return RemovalOf::Unattributable;
+    };
+    if oid.eq_ignore_ascii_case(head) {
+        return RemovalOf::Head;
+    }
+    let Some(parents) = merge_group_parents(before) else {
+        return RemovalOf::Unattributable;
+    };
+    if parents
+        .iter()
+        .any(|parent| parent.eq_ignore_ascii_case(head))
+    {
+        RemovalOf::Head
+    } else if parents.len() == 2 {
+        RemovalOf::OtherHead
+    } else {
+        // Only a two-parent merge group names its head. One parent (a squash
+        // or rebase queue), none, or a full `parents(first:3)` page that may
+        // be cut cannot rule the head out.
+        RemovalOf::Unattributable
+    }
+}
+
+/// Whether the removal at `nodes[index]` is charged to `head`: it names the
+/// head ([`RemovalOf::Head`]), or it names no head ([`RemovalOf::Unattributable`]).
+///
+/// An unattributable removal is charged unless a later, server-timestamped
+/// `HeadRefForcePushedEvent` identifies the current head. Commit timeline items
+/// are author-controlled and cannot prove push order; check-suite creation is
+/// also deliberately ignored because it can lag the push. Without an
+/// authoritative push event the removal counts: counting costs at most one
+/// approval newer than the removal, while dropping it could let a head that
+/// keeps failing in the queue be re-armed without a fresh review. Only a removal
+/// that names another head ([`RemovalOf::OtherHead`]) or demonstrably predates a
+/// later force-push arrival is left out.
+#[must_use]
+pub fn removal_charges_head(nodes: &[Value], index: usize, head: &str) -> bool {
+    let Some(node) = nodes.get(index) else {
+        return true;
+    };
+    match removal_of(node, head) {
+        RemovalOf::OtherHead => false,
+        RemovalOf::Head => true,
+        RemovalOf::Unattributable => !push_after_removal(nodes, index, head),
     }
 }
 
@@ -453,44 +531,36 @@ fn new_head_since(
     if nodes
         .iter()
         .skip(index + 1)
-        .filter_map(pushed_oid)
+        .filter_map(authoritative_push_oid)
         .any(|oid| oid.eq_ignore_ascii_case(head))
     {
         return (true, NewHeadBasis::PushAfterRemoval);
     }
-    let removed_at = nodes[index]
-        .get("createdAt")
-        .and_then(Value::as_str)
-        .and_then(parse_timestamp);
-    let suite_after_removal = removed_at.is_some_and(|removed_at| {
-        nodes.iter().any(|node| {
-            node.get("__typename").and_then(Value::as_str) == Some("PullRequestCommit")
-                && pushed_oid(node).is_some_and(|oid| oid.eq_ignore_ascii_case(head))
-                && earliest_suite(node).is_some_and(|suite| suite > removed_at)
-        })
-    });
-    if suite_after_removal {
-        (true, NewHeadBasis::SuiteAfterRemoval)
-    } else {
-        (false, NewHeadBasis::NoEvidence)
-    }
+    (false, NewHeadBasis::NoEvidence)
 }
 
-fn parse_timestamp(text: &str) -> Option<chrono::DateTime<chrono::Utc>> {
-    chrono::DateTime::parse_from_rfc3339(text)
-        .ok()
-        .map(|time| time.with_timezone(&chrono::Utc))
-}
-
-/// When the commit's earliest check suite was created: its push time to
-/// within a second, since `Commit.pushedDate` is null.
-fn earliest_suite(node: &Value) -> Option<chrono::DateTime<chrono::Utc>> {
-    node.pointer("/commit/checkSuites/nodes")
-        .and_then(Value::as_array)?
+fn push_after_removal(nodes: &[Value], index: usize, head: &str) -> bool {
+    // A force-push back to a head already visible before this removal is not a
+    // new arrival; it only proves the branch was rewritten to the same SHA.
+    if nodes[..index]
         .iter()
-        .filter_map(|suite| suite.get("createdAt").and_then(Value::as_str))
-        .filter_map(parse_timestamp)
-        .min()
+        .filter_map(authoritative_push_oid)
+        .any(|oid| oid.eq_ignore_ascii_case(head))
+    {
+        return false;
+    }
+    nodes
+        .iter()
+        .skip(index + 1)
+        .filter_map(authoritative_push_oid)
+        .any(|oid| oid.eq_ignore_ascii_case(head))
+}
+
+/// The only timeline item with authoritative server push timing.
+fn authoritative_push_oid(node: &Value) -> Option<&str> {
+    (node.get("__typename").and_then(Value::as_str) == Some("HeadRefForcePushedEvent"))
+        .then(|| node.pointer("/afterCommit/oid").and_then(Value::as_str))
+        .flatten()
 }
 
 /// Classify and report every fact, with the field path it came from.
@@ -584,15 +654,18 @@ pub fn explain_pr_queue_state(response: &Value) -> PrQueueReport {
     // Walk the timeline once, in its own order.
     let mut requeues = 0_u32;
     let mut requeue_indices = Vec::new();
-    // The hazard removal awaiting its first re-add, and whether a push has
-    // followed it in timeline order (the fallback when SHAs cannot decide).
+    // The hazard removal awaiting its first re-add, and whether an authoritative
+    // server-timestamped push has followed it (the fallback when SHAs cannot
+    // decide).
     let mut hazard_pending: Option<(usize, bool)> = None;
     let mut last_removal: Option<(usize, String, Option<String>)> = None;
     let mut last_new_head: Option<usize> = None;
     for (index, node) in nodes.iter().enumerate() {
         let typename = node.get("__typename").and_then(Value::as_str).unwrap_or("");
         if is_new_head(typename) {
-            if let Some((_, pushed)) = hazard_pending.as_mut() {
+            if authoritative_push_oid(node).is_some()
+                && let Some((_, pushed)) = hazard_pending.as_mut()
+            {
                 *pushed = true;
             }
             last_new_head = Some(index);
@@ -663,15 +736,14 @@ pub fn explain_pr_queue_state(response: &Value) -> PrQueueReport {
                     .map(ToOwned::to_owned),
             }
         });
-    let ejections_of_current_head =
-        count_ejections_of_head(nodes, &removed_heads, head_oid.as_deref());
+    let ejections_of_current_head = count_ejections_of_head(nodes, head_oid.as_deref());
     fact(
         &mut facts,
         "ejections_of_current_head",
         Value::from(ejections_of_current_head),
         "timelineItems.nodes[] (failed_checks/merge_conflict RemovedFromMergeQueueEvent whose \
-         removed head is headRefOid; a removal naming no head counts once it follows the first \
-         push of headRefOid)",
+         removed head is headRefOid; a removal naming no head counts unless a later \
+         server-timestamped force-push event identifies headRefOid)",
     );
     if let Some(ejection) = &last_ejection {
         fact(
@@ -692,11 +764,8 @@ pub fn explain_pr_queue_state(response: &Value) -> PrQueueReport {
                     NewHeadBasis::RemovedHeadSha =>
                         "new head = headRefOid differs from beforeCommit's second parent",
                     NewHeadBasis::PushAfterRemoval =>
-                        "no removed head named; new head = a later PullRequestCommit or \
-                         HeadRefForcePushedEvent whose oid is headRefOid",
-                    NewHeadBasis::SuiteAfterRemoval =>
-                        "no removed head named; new head = headRefOid's earliest check suite \
-                         was created after this removal",
+                        "no removed head named; new head = a later server-timestamped \
+                         force-push event whose oid is headRefOid",
                     NewHeadBasis::NoEvidence =>
                         "no removed head named and no later push of headRefOid; no new head \
                          assumed",
@@ -775,17 +844,10 @@ pub fn explain_pr_queue_state(response: &Value) -> PrQueueReport {
 
 /// `failed_checks` / `merge_conflict` removals of `head`; see
 /// [`PrQueueReport::ejections_of_current_head`].
-fn count_ejections_of_head(
-    nodes: &[Value],
-    removed_heads: &[Option<String>],
-    head: Option<&str>,
-) -> u32 {
+fn count_ejections_of_head(nodes: &[Value], head: Option<&str>) -> u32 {
     let Some(head) = head else {
         return 0;
     };
-    let first_push = nodes
-        .iter()
-        .position(|node| pushed_oid(node).is_some_and(|oid| oid.eq_ignore_ascii_case(head)));
     let mut count = 0_u32;
     for (index, node) in nodes.iter().enumerate() {
         if node.get("__typename").and_then(Value::as_str) != Some("RemovedFromMergeQueueEvent") {
@@ -795,11 +857,7 @@ fn count_ejections_of_head(
         if !same_head_requeue_cascades(reason) {
             continue;
         }
-        let charged = match removed_heads.get(index).and_then(Option::as_deref) {
-            Some(removed) => removed.eq_ignore_ascii_case(head),
-            None => first_push.is_none_or(|first| index > first),
-        };
-        if charged {
+        if removal_charges_head(nodes, index, head) {
             count += 1;
         }
     }
@@ -850,6 +908,54 @@ mod tests {
     }
 
     const HEAD_8811: &str = "e147f2d09972babcc9977e82a46470e17f9de538";
+
+    /// Across every real capture, [`removal_of`] (the ejection cap's reading)
+    /// charges each removal to the head [`removed_head`] (the classifier's
+    /// reading) names, and to no other commit the pull request had.
+    #[test]
+    fn removal_of_agrees_with_removed_head_on_every_real_capture() {
+        let mut checked = 0;
+        for entry in std::fs::read_dir(FIXTURES).expect("fixtures") {
+            let path = entry.expect("entry").path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if !name.starts_with("pr_real_")
+                || path.extension().and_then(|ext| ext.to_str()) != Some("json")
+            {
+                continue;
+            }
+            let value = fixture(name);
+            let Some(nodes) = value
+                .pointer("/data/repository/pullRequest/timelineItems/nodes")
+                .and_then(Value::as_array)
+            else {
+                continue;
+            };
+            let known = nodes.iter().filter_map(pushed_oid).collect::<Vec<_>>();
+            for node in nodes.iter().filter(|node| {
+                node.get("__typename").and_then(Value::as_str) == Some("RemovedFromMergeQueueEvent")
+            }) {
+                match removed_head(node, &known) {
+                    Some(head) => {
+                        assert_eq!(removal_of(node, &head), RemovalOf::Head, "{name}");
+                        for other in known.iter().filter(|oid| !oid.eq_ignore_ascii_case(&head)) {
+                            assert_eq!(removal_of(node, other), RemovalOf::OtherHead, "{name}");
+                        }
+                        checked += 1;
+                    }
+                    // No `beforeCommit` (`merge_conflict`, some `manual`):
+                    // charged to every head.
+                    None if node.get("beforeCommit").is_none_or(Value::is_null) => {
+                        for oid in &known {
+                            assert!(removal_of(node, oid).charges_head(), "{name}");
+                        }
+                    }
+                    // A group whose head is outside this window's commits.
+                    None => {}
+                }
+            }
+        }
+        assert!(checked >= 4, "only {checked} attributed removals checked");
+    }
 
     #[test]
     fn internal_enqueue_refuses_the_same_head_after_failed_checks() {
@@ -966,21 +1072,22 @@ mod tests {
     }
 
     #[test]
-    fn ejection_history_counts_same_head_requeues_but_not_the_fixed_conflict() {
+    fn ejection_history_counts_same_head_requeues_without_unproven_push_timing() {
         let report = explain_pr_queue_state(&fixture("pr_ejected_history.json"));
-        // The merge_conflict removal is followed by a commit before its re-add,
-        // so it is not counted; each of the four failed_checks re-adds is.
-        assert_eq!(report.requeues_without_new_head, 4);
+        // The merge_conflict removal is followed only by an author-controlled
+        // commit timeline item, so it remains charged; the four failed_checks
+        // re-adds are charged too.
+        assert_eq!(report.requeues_without_new_head, 5);
         assert_eq!(
             report.state,
             PrQueueState::ArmedNotQueued {
                 enabled_at: Some("2026-09-22T18:57:52Z".to_owned()),
-                requeues_without_new_head: 4,
+                requeues_without_new_head: 5,
             }
         );
         let ejection = report.last_ejection.expect("ejection history");
         assert_eq!(ejection.reason, "failed_checks");
-        assert!(ejection.new_head_since);
+        assert!(!ejection.new_head_since);
     }
 
     #[test]
@@ -1162,7 +1269,7 @@ mod tests {
                 reason: "failed_checks".to_owned(),
                 at: Some("2026-09-22T10:26:42Z".to_owned()),
                 new_head_since_removal: false,
-                requeues_without_new_head: 3,
+                requeues_without_new_head: 4,
             }
         );
     }
@@ -1220,82 +1327,6 @@ mod tests {
             .iter()
             .rposition(|node| node["__typename"] == "RemovedFromMergeQueueEvent")
             .expect("removal")
-    }
-
-    const MERGE_CONFLICT_FIXTURE: &str = "pr_real_9653_merge_conflict_backdated_push.json";
-    /// 9653's head after the ejection: committed before it, pushed after it.
-    const PUSHED_9653: &str = "99403d83614a0e535a3d2a5bac391e5ab326b639";
-
-    fn set_head_suites(value: &mut Value, suites: &Value) {
-        for node in nodes_mut(value) {
-            if node["commit"]["oid"] == PUSHED_9653 {
-                node["commit"]["checkSuites"] = suites.clone();
-            }
-        }
-    }
-
-    #[test]
-    fn a_merge_conflict_head_pushed_after_the_ejection_is_new_by_its_first_suite() {
-        let value = fixture(MERGE_CONFLICT_FIXTURE);
-        assert_eq!(value["_provenance"]["source_pr"], "Generous-Corp/pulp#9653");
-        // Control: the removal names no head and GitHub sorts the pushed
-        // commit BEFORE it, so neither the SHA nor the timeline can answer.
-        let nodes = value["data"]["repository"]["pullRequest"]["timelineItems"]["nodes"]
-            .as_array()
-            .expect("nodes");
-        let pushed = nodes
-            .iter()
-            .position(|node| node["commit"]["oid"] == PUSHED_9653)
-            .expect("pushed commit");
-        assert!(pushed < removal_index(&value));
-        assert!(nodes[removal_index(&value)]["beforeCommit"].is_null());
-        let report = explain_pr_queue_state(&value);
-        let ejection = report.last_ejection.expect("ejection");
-        assert_eq!(ejection.removed_head, None);
-        assert_eq!(ejection.new_head_basis, NewHeadBasis::SuiteAfterRemoval);
-        assert!(ejection.new_head_since);
-        assert_eq!(
-            report.state,
-            PrQueueState::Ejected {
-                reason: "merge_conflict".to_owned(),
-                at: Some("2026-10-05T23:59:14Z".to_owned()),
-                new_head_since_removal: true,
-                requeues_without_new_head: 0,
-            }
-        );
-    }
-
-    #[test]
-    fn a_head_whose_first_suite_predates_the_ejection_is_not_new() {
-        let mut value = fixture(MERGE_CONFLICT_FIXTURE);
-        set_head_suites(
-            &mut value,
-            &serde_json::json!({"nodes": [{"createdAt": "2026-10-05T23:58:00Z"}]}),
-        );
-        let ejection = explain_pr_queue_state(&value)
-            .last_ejection
-            .expect("ejection");
-        assert!(
-            !ejection.new_head_since,
-            "the head reached GitHub before the removal"
-        );
-        assert_eq!(ejection.new_head_basis, NewHeadBasis::NoEvidence);
-    }
-
-    #[test]
-    fn a_head_with_no_check_suite_keeps_the_timeline_rule() {
-        for suites in [serde_json::json!({"nodes": []}), Value::Null] {
-            let mut value = fixture(MERGE_CONFLICT_FIXTURE);
-            set_head_suites(&mut value, &suites);
-            let ejection = explain_pr_queue_state(&value)
-                .last_ejection
-                .expect("ejection");
-            assert!(
-                !ejection.new_head_since,
-                "no push-time evidence: fail closed"
-            );
-            assert_eq!(ejection.new_head_basis, NewHeadBasis::NoEvidence);
-        }
     }
 
     #[test]
@@ -1395,8 +1426,20 @@ mod tests {
                 .expect("ejection")
                 .new_head_since
         );
-        // A later push of the current head is.
+        // A later server-timestamped force-push of the current head is.
         pr_mut(&mut value)["headRefOid"] = Value::from(PUSHED_HEAD);
+        assert!(
+            !explain_pr_queue_state(&value)
+                .last_ejection
+                .expect("ejection")
+                .new_head_since,
+            "a later PullRequestCommit is not authoritative push evidence"
+        );
+        nodes_mut(&mut value).push(serde_json::json!({
+            "__typename": "HeadRefForcePushedEvent",
+            "createdAt": "2026-09-27T06:00:00Z",
+            "afterCommit": {"oid": PUSHED_HEAD},
+        }));
         let ejection = explain_pr_queue_state(&value)
             .last_ejection
             .expect("ejection");

@@ -153,7 +153,7 @@ class ClassifierAgreesWithSharedCorpus(unittest.TestCase):
         self.assertEqual(got["class"], "ejected")
         self.assertEqual(got["reason"], "failed_checks")
         self.assertIs(got["new_head_since_removal"], False)
-        self.assertEqual(got["requeues_without_new_head"], 3)
+        self.assertEqual(got["requeues_without_new_head"], 4)
         allowed, _ = guard.decide(got)
         self.assertFalse(allowed)
 
@@ -211,7 +211,7 @@ MERGE_CONFLICT_FIXTURE = "pr_real_9653_merge_conflict_backdated_push.json"
 PUSHED_9653 = "99403d83614a0e535a3d2a5bac391e5ab326b639"
 
 
-class MergeConflictHeadIsDecidedByFirstSuite(unittest.TestCase):
+class MergeConflictHeadNeedsAuthoritativePush(unittest.TestCase):
     """Twin of the Rust merge_conflict push-time tests."""
 
     def setUp(self) -> None:
@@ -223,7 +223,7 @@ class MergeConflictHeadIsDecidedByFirstSuite(unittest.TestCase):
             if node.get("commit", {}).get("oid") == PUSHED_9653:
                 node["commit"]["checkSuites"] = suites
 
-    def test_a_head_pushed_after_a_merge_conflict_ejection_is_new_by_its_first_suite(self) -> None:
+    def test_a_head_with_a_late_suite_is_not_new_without_push_event(self) -> None:
         self.assertEqual(self.response["_provenance"]["source_pr"], "Generous-Corp/pulp#9653")
         # Control: the removal names no head and GitHub sorts the pushed
         # commit BEFORE it, so neither the SHA nor the timeline can answer.
@@ -231,10 +231,10 @@ class MergeConflictHeadIsDecidedByFirstSuite(unittest.TestCase):
         self.assertLess(pushed, _removal_index(self.nodes))
         self.assertIsNone(self.nodes[_removal_index(self.nodes)].get("beforeCommit"))
         got = guard.classify_pr_queue_state(self.response)
-        self.assertIs(got["new_head_since_removal"], True)
-        self.assertEqual(got["last_ejection"]["new_head_basis"], "suite_after_removal")
+        self.assertIs(got["new_head_since_removal"], False)
+        self.assertEqual(got["last_ejection"]["new_head_basis"], "no_evidence")
         allowed, message = guard.decide(got)
-        self.assertTrue(allowed, message)
+        self.assertFalse(allowed, message)
 
     def test_a_head_whose_first_suite_predates_the_ejection_is_not_new(self) -> None:
         self.set_head_suites({"nodes": [{"createdAt": "2026-10-05T23:58:00Z"}]})
@@ -308,8 +308,20 @@ class NewHeadIsDecidedBySha(unittest.TestCase):
         # A later push of some other commit is still not the current head.
         self.nodes.append({"__typename": "PullRequestCommit", "commit": {"oid": PUSHED_HEAD}})
         self.assertIs(self.classify()["new_head_since_removal"], False)
-        # A later push of the current head is.
+        # A later commit timeline item is not authoritative push evidence,
+        # even after the current head changes to that commit.
         self.pr["headRefOid"] = PUSHED_HEAD
+        got = self.classify()
+        self.assertEqual(got["last_ejection"]["new_head_basis"], "no_evidence")
+        self.assertIs(got["new_head_since_removal"], False)
+        # A later server-timestamped force-push of the current head is.
+        self.nodes.append(
+            {
+                "__typename": "HeadRefForcePushedEvent",
+                "createdAt": "2026-09-27T06:00:00Z",
+                "afterCommit": {"oid": PUSHED_HEAD},
+            }
+        )
         got = self.classify()
         self.assertEqual(got["last_ejection"]["new_head_basis"], "push_after_removal")
         self.assertIs(got["new_head_since_removal"], True)
@@ -515,8 +527,9 @@ class QueueArmGuardTests(unittest.TestCase):
         pr["mergeQueueEntry"] = None
         pr["headRefOid"] = "f" * 40
         pr["timelineItems"]["nodes"][-1] = {
-            "__typename": "PullRequestCommit",
-            "commit": {"oid": "f" * 40},
+            "__typename": "HeadRefForcePushedEvent",
+            "createdAt": "2026-09-22T21:00:00Z",
+            "afterCommit": {"oid": "f" * 40},
         }
         code, _, _ = self.run_guard(["pr", "merge", "8702", "--auto"], [response])
         self.assertEqual(code, 0)
