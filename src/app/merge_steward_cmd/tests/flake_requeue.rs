@@ -7,7 +7,7 @@ use super::*;
 use crate::app::merge_steward_cmd::base_poison::RepoPoison;
 use crate::app::merge_steward_cmd::defect_fix_removals::{Reading, Removal};
 use crate::app::merge_steward_cmd::flake_requeue::{
-    ReceiptState, Sighting, Signature, green_base, receipt_key,
+    Receipt, ReceiptState, Sighting, Signature, green_base, receipt_key,
 };
 use crate::app::merge_steward_cmd::pr_mutations::mutate_pr;
 use crate::merge_steward::EjectionGuards;
@@ -399,6 +399,7 @@ fn an_unread_partial_or_red_base_never_requeues() {
                 sha: None,
                 red: true,
                 red_since: None,
+                newest_at: None,
                 error: None,
             },
         )]),
@@ -712,6 +713,58 @@ fn the_sweep_trips_on_an_unread_re_ejection_and_holds_on_an_unread_timeline() {
         &crate::app::merge_steward_cmd::flake_requeue::SweepReads {
             queue: &|_| Err("HTTP 502".to_owned()),
             assess: &|_| None,
+        },
+    );
+    assert!(ledger.flake_requeue.tripped.is_empty());
+    assert_eq!(ledger.flake_requeue.unswept.len(), 1);
+    assert!(!ledger.flake_requeue.requeued[&key()].swept);
+}
+
+/// A readable queue response that lacks the removal, head, or timestamp
+/// evidence needed to prove a second ejection keeps the receipt unswept.
+#[cfg(unix)]
+#[test]
+fn the_sweep_holds_when_the_queue_report_has_no_removal() {
+    let temp = tempfile::tempdir().expect("temp");
+    let serve = Serve {
+        removals: Vec::new(),
+        ..Serve::approved()
+    };
+    let actions = fake_gh(&temp, &script(&temp, &serve));
+    let observation = observation_for(ready_pr(), true);
+    let mut ledger = StewardLedger::default();
+    ledger.flake_requeue.requeued.insert(
+        key(),
+        Receipt {
+            repo: "owner/repo".to_owned(),
+            signature: format!("macos: {MIDI}"),
+            ejection_at: "2026-10-31T21:10:00Z".to_owned(),
+            at: "2026-10-31T21:20:00Z".to_owned(),
+            state: ReceiptState::Done,
+            attempts: 1,
+            swept: false,
+        },
+    );
+    let run_gh = |argv: &[String]| actions.run_gh(argv).map_err(|error| error.to_string());
+    crate::app::merge_steward_cmd::flake_requeue::sweep(
+        &FlakePolicy {
+            mode: FlakeMode::Apply,
+            window_hours: 24,
+            max_requeues: 3,
+        },
+        &observation,
+        &mut ledger,
+        &crate::app::merge_steward_cmd::flake_requeue::SweepReads {
+            queue: &|pr| {
+                crate::app::merge_steward_cmd::native_arm::read_queue_state(
+                    &actions,
+                    "owner/repo",
+                    pr,
+                )
+            },
+            assess: &|report| {
+                crate::environment_requeue::assess_with(&run_gh, "owner/repo", report, true, None)
+            },
         },
     );
     assert!(ledger.flake_requeue.tripped.is_empty());

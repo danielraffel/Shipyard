@@ -764,6 +764,46 @@ pub(super) struct SweepReads<'a> {
     pub(super) assess: &'a dyn Fn(&PrQueueReport) -> Option<EnvironmentRequeue>,
 }
 
+/// Return the removal that proves this receipt's head was ejected again.
+///
+/// A queue response without the required removal, live head, or timestamps is
+/// incomplete evidence. Treat it as unreadable so the receipt remains
+/// unswept and the signature stays blocked until a later pass can read it.
+fn post_requeue_ejection<'a>(
+    report: &'a PrQueueReport,
+    head: &str,
+    requeued_at: &str,
+) -> Result<&'a crate::pr_queue_state::Ejection, String> {
+    let removal = report
+        .last_ejection
+        .as_ref()
+        .ok_or_else(|| "missing last queue removal".to_owned())?;
+    let live_head = report
+        .head_oid
+        .as_deref()
+        .ok_or_else(|| "missing live head oid".to_owned())?;
+    if !live_head.eq_ignore_ascii_case(head) {
+        return Err(format!(
+            "live head {live_head} does not match receipt head {head}"
+        ));
+    }
+    let removed_at = removal
+        .at
+        .as_deref()
+        .and_then(time)
+        .ok_or_else(|| "missing or invalid removal timestamp".to_owned())?;
+    let requeued_at =
+        time(requeued_at).ok_or_else(|| "missing or invalid re-enqueue timestamp".to_owned())?;
+    if removed_at <= requeued_at {
+        return Err(format!(
+            "removal timestamp {} is not after re-enqueue timestamp {}",
+            removal.at.as_deref().unwrap_or("<missing>"),
+            requeued_at.to_rfc3339(),
+        ));
+    }
+    Ok(removal)
+}
+
 /// The breaker, outside the admission path. A head this class re-enqueued
 /// that the queue ejects again has two removals, so the approval gate stops
 /// it at the ejection cap before [`consider`] ever sees it. Each pass, every
@@ -833,25 +873,15 @@ pub(super) fn sweep(
             }
         };
         let report = crate::pr_queue_state::explain_pr_queue_state(&queue);
-        let Some(removal) = report
-            .last_ejection
-            .clone()
-            .filter(|_| {
-                report
-                    .head_oid
-                    .as_deref()
-                    .is_some_and(|oid| oid.eq_ignore_ascii_case(&head))
-            })
-            .filter(|removal| {
-                removal
-                    .at
-                    .as_deref()
-                    .and_then(time)
-                    .zip(time(&receipt.at))
-                    .is_some_and(|(removed, requeued)| removed > requeued)
-            })
-        else {
-            continue;
+        let removal = match post_requeue_ejection(&report, &head, &receipt.at) {
+            Ok(removal) => removal,
+            Err(detail) => {
+                state.unswept.insert(
+                    signature_key,
+                    format!("#{pr} queue report unread: {detail}"),
+                );
+                continue;
+            }
         };
         if let Some(receipt) = state.requeued.get_mut(&key) {
             receipt.state = ReceiptState::Done;
@@ -1507,6 +1537,7 @@ pub(super) fn green_base(checks: &[&str]) -> RepoPoison {
         tip: BTreeMap::new(),
         covering: BTreeSet::new(),
         fix_ambiguity: None,
+        red_everywhere: BTreeMap::new(),
     }
 }
 

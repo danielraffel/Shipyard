@@ -280,6 +280,7 @@ fn tip(red: bool, error: Option<&str>) -> TipReading {
         sha: None,
         red,
         red_since: None,
+        newest_at: None,
         error: error.map(str::to_owned),
     }
 }
