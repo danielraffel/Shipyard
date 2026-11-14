@@ -1589,6 +1589,34 @@ fn reconcile_rollups(actions: &GitHubActions, repo: &str, base: &str, report: &m
     }
 }
 
+/// The rollup a backed-up base without a merge queue would form this pass
+/// ([`rollup_pass`]), stamped under the steward's state directory.
+fn plan_rollup(
+    actions: &GitHubActions,
+    args: &StewardCommandArgs,
+    observation: &RepoObservation,
+    ledger_path: &Path,
+    report: &RepoReport,
+) -> Option<rollup_pass::Report> {
+    let run_gh = |gh_args: &[String]| actions.run_gh(gh_args).map_err(|error| error.to_string());
+    let cache = ledger_path
+        .parent()
+        .map(|state| state.join(rollup_pass::CACHE_DIR));
+    let expired = || pass_budget::deadline_passed(args.pass_deadline);
+    rollup_pass::run(
+        &run_gh,
+        observation,
+        &report.merge_path,
+        &report.prs,
+        &rollup_pass::Throttle {
+            dir: cache.as_deref(),
+            write: args.apply,
+            now: Utc::now(),
+            expired: &expired,
+        },
+    )
+}
+
 /// One repository of a steward pass: observe it, apply its plan, settle its
 /// rollups. Its own time budget starts here, so an earlier repository never
 /// spends a later one's. Returns the report and whether the repository is
@@ -1762,24 +1790,7 @@ fn steward_repo_observed(
                 report.cancellations.extend(cancellations);
             }
             if !pass_budget::deadline_passed(args.pass_deadline) {
-                let run_gh =
-                    |gh_args: &[String]| actions.run_gh(gh_args).map_err(|error| error.to_string());
-                let cache = ledger_path
-                    .parent()
-                    .map(|state| state.join(rollup_pass::CACHE_DIR));
-                let expired = || pass_budget::deadline_passed(args.pass_deadline);
-                report.rollup = rollup_pass::run(
-                    &run_gh,
-                    &observation,
-                    &report.merge_path,
-                    &report.prs,
-                    &rollup_pass::Throttle {
-                        dir: cache.as_deref(),
-                        write: args.apply,
-                        now: Utc::now(),
-                        expired: &expired,
-                    },
-                );
+                report.rollup = plan_rollup(actions, args, &observation, ledger_path, &report);
             }
             if args.apply && pass_budget::deadline_passed(args.pass_deadline) {
                 report
