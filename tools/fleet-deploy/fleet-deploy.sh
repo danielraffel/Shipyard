@@ -5,6 +5,8 @@
 #   tick         Shipyard tools/steward-tick/shipyard-steward-tick.sh -> FLEET_DEPLOY_TICK_DEST
 #   deploy       Shipyard tools/fleet-deploy/fleet-deploy.sh          -> FLEET_DEPLOY_SELF_DEST
 #   pass-runner  fleet-handbook scripts/pass-runner, through its own scripts/install-pass-runner.sh
+#   launcher     a staged, signed ShipyardLauncher.app      -> FLEET_DEPLOY_LAUNCHER_DEST,
+#                then activated once the owner's Full Disk Access grant is in place
 #
 # These scripts used to be copied to a host by hand, so a merged fix could sit
 # undeployed with nothing noticing (2026-11-12: m3 ran a steward tick from
@@ -30,6 +32,8 @@ handbook_remote="${FLEET_DEPLOY_HANDBOOK_REMOTE:-git@github.com:danielraffel/fle
 tick_dest="${FLEET_DEPLOY_TICK_DEST:-$HOME/.local/libexec/shipyard-steward-tick.sh}"
 self_dest="${FLEET_DEPLOY_SELF_DEST:-$HOME/.local/libexec/shipyard-fleet-deploy.sh}"
 keep_backups="${FLEET_DEPLOY_KEEP_BACKUPS:-5}"
+launcher_staged="${FLEET_DEPLOY_LAUNCHER_STAGED:-$HOME/.local/share/shipyard/launcher/staged/ShipyardLauncher.app}"
+launcher_dest="${FLEET_DEPLOY_LAUNCHER_DEST:-$HOME/.local/libexec/ShipyardLauncher.app}"
 export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o BatchMode=yes -o ConnectTimeout=15}"
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 
@@ -82,9 +86,105 @@ install_file() {
   say "unit=$unit installed rev=$rev dest=$dest"
 }
 
+# say_once UNIT LINE: log a standing state (nothing staged, already current, a
+# refusal) once when it changes, not on every run.
+say_once() {
+  local file="$root/$1.state"
+  [ "$(cat "$file" 2>/dev/null)" = "$2" ] && return 0
+  printf '%s\n' "$2" > "$file"
+  say "$2"
+}
+
+# install_launcher REV: ShipyardLauncher.app (tools/shipyard-launcher/README.md).
+# It is built, signed and notarized on the maintainer's Mac, never here, and
+# staged on this host by hand. A staged bundle is installed only when
+# shipyard-launcher-check --verify-bundle accepts it: Developer ID signed by
+# the installed Shipyard's team, with the launcher's bundle identifier, and
+# notarized. The copy is verified again before it replaces the installed
+# bundle, and the previous bundle is kept as <dest>.bak-<stamp>. Installing
+# alone never routes anything: activate_launcher below activates only once the
+# owner's Full Disk Access grant is in place.
+install_launcher() {
+  local rev=$1 check="$root/Shipyard/tools/shipyard-launcher/shipyard-launcher-check" tmp out
+  [ "$(uname -s)" = Darwin ] || return 0
+  if [ ! -d "$launcher_staged" ]; then
+    say_once launcher "unit=launcher absent staged=$launcher_staged"
+    return 0
+  fi
+  if [ -d "$launcher_dest" ] && diff -rq "$launcher_staged" "$launcher_dest" >/dev/null 2>&1; then
+    say_once launcher "unit=launcher current dest=$launcher_dest"
+    return 0
+  fi
+  if ! out=$(/usr/bin/python3 "$check" --verify-bundle "$launcher_staged" 2>&1); then
+    say_once launcher "unit=launcher refused rev=$rev reason=$(printf '%s' "$out" | head -c 200 | tr '\n' ' ')"
+    return 0
+  fi
+  tmp="$launcher_dest.tmp.$$"
+  if ! mkdir -p "$(dirname "$launcher_dest")" || ! ditto "$launcher_staged" "$tmp" \
+    || ! /usr/bin/python3 "$check" --verify-bundle "$tmp" >/dev/null 2>&1; then
+    rm -rf "$tmp"; say "unit=launcher refused rev=$rev reason=copy"; return 0
+  fi
+  if [ -d "$launcher_dest" ] && ! mv "$launcher_dest" "$launcher_dest.bak-$stamp"; then
+    rm -rf "$tmp"; say "unit=launcher refused rev=$rev reason=backup"; return 0
+  fi
+  if ! mv "$tmp" "$launcher_dest"; then
+    [ -d "$launcher_dest.bak-$stamp" ] && mv "$launcher_dest.bak-$stamp" "$launcher_dest"
+    rm -rf "$tmp"; say "unit=launcher refused rev=$rev reason=install"; return 0
+  fi
+  local n=0 old
+  for old in $(ls -1dt "$launcher_dest".bak-* 2>/dev/null); do
+    n=$((n + 1))
+    [ "$n" -gt "$keep_backups" ] && rm -rf "$old"
+  done
+  say "unit=launcher installed rev=$rev dest=$launcher_dest"
+  printf '%s\n' "unit=launcher current dest=$launcher_dest" > "$root/launcher.state"
+}
+
+# activate_launcher: when the installed launcher is not active, try
+# shipyard-launcher-check --activate. It writes the activation record only
+# when the bundle verifies and the launcher already holds Full Disk Access
+# (the owner's one-time grant); checking the grant never prompts. So a new or
+# reinstalled bundle (a new cdhash) becomes active without anyone running a
+# command, and a host without the grant just logs that it waits for it.
+# SHIPYARD_LAUNCHER_AUTO_ACTIVATE=off turns it off.
+activate_launcher() {
+  local check="$root/Shipyard/tools/shipyard-launcher/shipyard-launcher-check"
+  local exe="$launcher_dest/Contents/MacOS/shipyard-launcher" out why
+  [ "$(uname -s)" = Darwin ] || return 0
+  [ "${SHIPYARD_LAUNCHER_AUTO_ACTIVATE:-on}" = off ] && return 0
+  [ -x "$exe" ] || return 0
+  if [ "$("$exe" --launcher-active 2>/dev/null | /usr/bin/python3 -c '
+import json, sys
+try:
+    print(json.load(sys.stdin).get("active") is True)
+except (ValueError, AttributeError):
+    print(False)
+' 2>/dev/null)" = True ]; then
+    say_once launcher-activation "unit=launcher-activation active"
+    return 0
+  fi
+  if out=$(/usr/bin/python3 "$check" --activate --json 2>/dev/null); then
+    say "unit=launcher-activation activated"
+    printf '%s\n' "unit=launcher-activation active" > "$root/launcher-activation.state"
+    return 0
+  fi
+  why=$(printf '%s' "$out" | /usr/bin/python3 -c '
+import json, sys
+try:
+    report = json.load(sys.stdin)
+except ValueError:
+    print("unreadable"); sys.exit(0)
+failed = [name + "=" + str(check.get("state", "fail")) for name, check in report.get("checks", {}).items() if not check.get("ok")]
+print(",".join(failed) or report.get("activation", "unknown"))
+' 2>/dev/null)
+  say_once launcher-activation "unit=launcher-activation waiting reason=${why:-unknown}"
+}
+
 if rev=$(sync_clone Shipyard "$shipyard_remote"); then
   install_file tick "$root/Shipyard/tools/steward-tick/shipyard-steward-tick.sh" "$tick_dest" "$rev"
   install_file deploy "$root/Shipyard/tools/fleet-deploy/fleet-deploy.sh" "$self_dest" "$rev"
+  install_launcher "$rev"
+  activate_launcher
 else
   say "unit=tick refused reason=fetch_failed"
 fi

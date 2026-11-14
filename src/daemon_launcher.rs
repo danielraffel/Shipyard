@@ -444,9 +444,15 @@ pub fn start_via_launchd_with(
     launchctl: &mut dyn Launchctl,
 ) -> Result<(), String> {
     let plist = plist_path(home, &launcher.label);
+    let program_arguments = daemon_program_arguments(
+        request,
+        launcher,
+        home,
+        &crate::launcher_app::launcher_active,
+    );
     let rendered = render_plist(
         &launcher.label,
-        &launcher_arguments(&launcher.path, request),
+        &program_arguments,
         &launcher_log_path(home),
         home,
         &crate::paths::unattended_tool_path(),
@@ -459,6 +465,36 @@ pub fn start_via_launchd_with(
         .map_err(|error| format!("failed to write {}: {error}", plist.display()))?;
     launchctl.bootstrap(&plist)?;
     launchctl.kickstart(&launcher.label)
+}
+
+/// The daemon agent's `ProgramArguments`. When the host activated
+/// `ShipyardLauncher.app`, the bundle is the program and runs the current
+/// release's `daemon supervise` as its child, so the daemon's privacy identity
+/// is the bundle; otherwise it is the stable launcher copy, as before. Which
+/// one is logged to the launcher log.
+pub fn daemon_program_arguments(
+    request: &SpawnRequest,
+    launcher: &ActiveLauncher,
+    home: &Path,
+    verify: &dyn Fn(&Path) -> Result<(), String>,
+) -> Vec<OsString> {
+    let mut arguments = launcher_arguments(&launcher.path, request);
+    match crate::launcher_app::active_executable(home, verify) {
+        Ok(executable) => {
+            crate::launcher_app::log(home, &format!("daemon={} launcher=app", launcher.label));
+            arguments[0] = executable.into();
+        }
+        Err(crate::launcher_app::Direct::NotActivated) => {}
+        Err(direct) => crate::launcher_app::log(
+            home,
+            &format!(
+                "daemon={} launcher=direct reason={}",
+                launcher.label,
+                direct.reason()
+            ),
+        ),
+    }
+    arguments
 }
 
 /// Arguments for the in-place step: `request.binary`, run by the resident

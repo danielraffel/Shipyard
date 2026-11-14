@@ -85,24 +85,27 @@ Pass-through:
 Launcher exit codes: 64 usage, 70 internal error, 77 refused, 126 spawn
 failed, 127 target missing.
 
-## Which jobs will use it
+## Which jobs use it
 
-This change adds the bundle, its build, the check and the activation record.
-No entry point uses it yet. A follow-up change routes these, each only while
-`--launcher-active` says so, logging `launcher=app` or `launcher=direct
-reason=...` and falling back to the direct call:
+Each entry point routes only while `shipyard-launcher --launcher-active`
+answers active (see Check and activate). On any other answer, or with no
+launcher installed, it runs exactly as before and logs why.
 
-| Entry point | Planned routing |
-| --- | --- |
-| A LaunchAgent whose program is the Shipyard release (today `com.danielraffel.shipyard.fleet-reconcile`) | At startup Shipyard, as a launchd job's own program, `exec`s the launcher with the same arguments. `exec` keeps the job's pid, so the job's identity becomes the bundle. |
-| The daemon agent (`com.danielraffel.shipyard.daemon.<id>`) | The agent plist names the bundle as its program, with the same arguments. |
-| The steward tick (program `/bin/bash`) | The installed tick `exec`s `shipyard-launcher --launcher-script steward-tick`. |
-| fleet-deploy | Installs a bundle staged at `~/.local/share/shipyard/launcher/staged/ShipyardLauncher.app` only when `shipyard-launcher-check --verify-bundle` accepts it. It never activates it. |
+| Entry point | How it routes | Log |
+| --- | --- | --- |
+| A LaunchAgent whose program is the Shipyard release (today `com.danielraffel.shipyard.fleet-reconcile`) | At startup Shipyard checks it is a launchd job's own program (parent pid 1, `XPC_SERVICE_NAME` set), not already under the launcher, not the daemon itself, and the same file `~/.local/bin/shipyard` resolves to. It then `exec`s the launcher with the same arguments. `exec` keeps the job's pid, so the job's identity becomes the bundle (`src/launcher_app.rs`). | `shipyard-launcher.log`: `job=<label> launcher=app`, or `launcher=direct reason=...` |
+| The daemon agent (`com.danielraffel.shipyard.daemon.<id>`, hosts with `shipyard daemon launcher install`) | On `shipyard daemon refresh` the agent plist names the bundle as its program with the same arguments; the bundle runs the current release's `daemon supervise`. | `shipyard-launcher.log`: `daemon=<label> launcher=app` or `launcher=direct reason=...` |
+| The steward tick (program `/bin/bash`) | The installed tick `exec`s `shipyard-launcher --launcher-script steward-tick`, which runs the same file again as its child. | `summary.log`: `launcher=app` or `launcher=direct` on every repo line, plus a `reason=not_active` line |
+| fleet-deploy (`unit=launcher`) | Installs a bundle staged at `~/.local/share/shipyard/launcher/staged/ShipyardLauncher.app` only when `shipyard-launcher-check --verify-bundle` accepts it and its copy. Then, when the installed launcher is not active, runs `shipyard-launcher-check --activate`, which succeeds only once the owner's grant is in place. | `summary.log`: `unit=launcher ...`, `unit=launcher-activation activated` or `waiting reason=full_disk_access=denied` |
 
-Still their own identities after that: the `com.danielraffel.fleet-pass.*`
-agents (installed from fleet-handbook; they need a `fleet-pass` allowlist
-entry), processes the tick detaches with `setsid` (once their responsible
-process exits, macOS attributes them to themselves), and tartci's agents
+`SHIPYARD_LAUNCHER_ROUTING=off` (Shipyard), `SHIPYARD_STEWARD_LAUNCHER=off`
+(tick) and `SHIPYARD_LAUNCHER_AUTO_ACTIVATE=off` (fleet-deploy) turn routing
+off.
+
+Still their own identities: the `com.danielraffel.fleet-pass.*` agents
+(installed from fleet-handbook; they need a `fleet-pass` allowlist entry),
+processes the tick detaches with `setsid` (once their responsible process
+exits, macOS attributes them to themselves), and tartci's agents
 (TartCILauncher.app).
 
 ## Build, sign and notarize (maintainer's Mac)
@@ -130,14 +133,13 @@ as the bundle identifier and team stay the same.
 
 ## Install on a host
 
-Until fleet-deploy installs it (follow-up), install a verified bundle by hand:
+Stage the signed bundle; fleet-deploy (started by the steward tick at most
+every 10 minutes) verifies and installs it, then activates it once the grant
+is in place:
 
 ```bash
 mkdir -p ~/.local/share/shipyard/launcher/staged
 ditto -x -k ShipyardLauncher-macos-arm64.zip ~/.local/share/shipyard/launcher/staged/
-tools/shipyard-launcher/shipyard-launcher-check \
-  --verify-bundle ~/.local/share/shipyard/launcher/staged/ShipyardLauncher.app \
-  && ditto ~/.local/share/shipyard/launcher/staged/ShipyardLauncher.app ~/.local/libexec/ShipyardLauncher.app
 ```
 
 `--verify-bundle` requires a Developer ID signature with the launcher's bundle
