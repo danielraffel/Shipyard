@@ -2972,7 +2972,8 @@ mod tests {
         env:
           SHIPYARD_TEST_HOME: ${{ runner.temp }}
           RUST_MIN_STACK: 8388608
-        run: cargo test --all-targets --locked --features ci-test-home,experimental-authority-v5";
+        shell: bash
+        run: scripts/ci-capped-run.sh cargo test --all-targets --locked --features ci-test-home,experimental-authority-v5";
     const REFUSAL_ONLY_GUIDANCE: [&str; 4] = [
         "docs/pulp-mac-cache-readiness.md",
         "docs/ship-state-machine.md",

@@ -401,7 +401,9 @@ close anything. See [superseded-close.md](superseded-close.md).
 | `approval_unread` | The approval gate could not be read this pass | next pass |
 | `owner_decision` | Labelled `owner-decision` | owner |
 | `excluded_label:<label>` | `superseded`, `PARKED/<platform>` or the opt-out label | whoever owns the label |
+| `excluded_label:shipyard:no-auto-merge` | A hold: the opt-out label, with a comment naming what it waits for (`hold-condition:` lines) | any agent that neither wrote nor approved it: `shipyard advance OWNER/REPO#N --release-hold` once every named condition is met, or with `--decision` naming the DECISIONS entry that releases it. It checks green required checks and the steward's exact-head approval itself, writes through `ghapp`, and audits the act ([advance](advance.md)) |
 | `provenance_blocked:<labels>` | A provenance-blocking label | owner |
+| `stale_merge_ref:<contexts>` | Approved (the gate approves this exact head), and every red required context went red on a test merge commit that no longer exists: its failing run is a `pull_request` run of this head whose tested base is not the base of the pull request's current `merge_commit_sha`, and the same context is green on the base tip. A red on the current merge ref never reads this, however old. See [Stale merge refs](#stale-merge-refs) | steward: retriggers it through `shipyard advance --retrigger` |
 | `required_never_ran:<contexts>` | A required context has no run on this head and nothing from its source is still queued or running (often a renamed check: merge the base to re-run CI) | repair lane |
 | `required_pending` | Required checks are queued or running, or have not appeared yet behind a running job, and none has failed. A `pending` `review-verdict` status (head awaiting its reviewer) also reads here, with the reviewer as actor, never as `required_failed` | CI, or the reviewer |
 | `capacity_queued` | Every pending required check is a check run still queued for a runner, and none has started. The pull request is not blocked: `next_action` is `ci` with `stop: false` and says to take other work. Dwell limits treat it like `required_pending`. |
@@ -778,6 +780,51 @@ A member that pushes a new head leaves the episode; the episode ends (and is
 forgotten) when fewer than three members remain. Not yet built: filing an
 issue when an episode lasts a second pass.
 
+## Stale merge refs
+
+GitHub runs a `pull_request` workflow on `refs/pull/<n>/merge`, the head
+merged into the base as it stood then. GitHub rebuilds that ref when the base
+moves, but nothing reruns the checks, so a red measured on the old merge
+commit stays red. Age and base movement are not evidence of that, since a
+real failure is often old too. The evidence is the run itself. After every
+row has its token, the steward re-reads a `required_failed:<contexts>` row as
+`stale_merge_ref:<contexts>` only when all of these hold:
+
+- each red context's failing run is a GitHub Actions `pull_request` run of
+  this pull request at its current head;
+- the base each run was tested on (the run's recorded pull-request base sha)
+  is not the first parent of the pull request's current `merge_commit_sha`:
+  the red was measured on a merge commit that no longer exists;
+- each of those contexts is green on the base tip (the read red-main triage
+  makes); red, unread or never run there leaves the row alone;
+- the approval gate approves the exact head.
+
+A red on the current merge ref is never stale, however old. A plain BEHIND
+pull request never reads this token (it is not red; the merge queue tests it
+on top of the base), and neither does a DIRTY one (`merge_state:DIRTY` has no
+act). Reads happen only for red rows with an Actions run behind each red
+context: one pull-request read, one commit read and one run read per red run,
+at most five pull requests per pass, and the verdict is kept in the steward
+ledger, so the same red is not read again until the head or the runs change
+(a "not stale" verdict is re-read after six hours, since GitHub may rebuild the
+ref). A failed read leaves the row's token as it was.
+
+The dwell pass then retriggers it (`stale_merge_ref` below) through `shipyard
+advance --retrigger`, which closes and reopens the pull request after its own
+checks and audits the act. Before that, the steward re-reads the pull request
+and its merge-queue state and refuses a moved head, a fork, a draft, a DIRTY
+head, a queued entry and an armed one. At most one retrigger succeeds per
+head, ever, and at most three are attempted per head: these marks outlive the
+14-day act-record TTL, because a reopen keeps the head. A `done` act is final,
+a `failed` one (it started and did not finish, its answer was unreadable, or it
+timed out) is never retried, and a `blocked` one (a guard refused the close,
+reported as `retrigger_blocked: guard`, or this build has no `advance`
+command, `retrigger_blocked: advance_unavailable`) changed nothing and is
+retried only after a day, then two. `pr-close-guard` refuses every such close
+until it learns the nonce-bound allowance proposed in [advance](advance.md);
+until then each stale pull request reads `retrigger_blocked: guard` in its act
+outcome and escalates to the feed.
+
 ## Dwell-time limits and the next-to-admit ranking
 
 A pull request should never sit in one state for hours with nobody told. Each
@@ -800,6 +847,7 @@ required_never_ran = 30         # dispatch the mapped workflow once
 approved_green_not_queued = 5   # ready / admission_pending: evaluated first next pass
 carries_unapproved = 60         # escalate only
 stacked_base_merged = 10        # stacked on a merged base: retarget once
+stale_merge_ref = 10            # approved, red on a stale merge ref: retrigger once
 act = "shadow"                  # "apply" runs the GitHub-writing acts; "off" runs none
 max_acts_per_pass = 3           # GitHub-writing acts per repository per pass
 max_escalations_per_pass = 25
@@ -820,6 +868,7 @@ head, head branch in the base repository, never a fork):
 | `stale_verdict_check` | re-run the `review-verdict` run the required rule selects | that run is completed and red with none newer or running, and the approval gate, read live, returns an exact-head approval (`NotRequired` or any refusal, a HOLD above all, refuses) |
 | `required_never_ran` | `gh workflow run <file> --ref <head branch>` for each mapped context | the live head is the one observed |
 | `approved_green_not_queued` | evaluate it first in the next pass's admission (after the deferral carry) | none: it only reorders the steward's own admission, which keeps every gate |
+| `stale_merge_ref` | run this binary's `shipyard advance OWNER/REPO#N --retrigger --head <sha> --json` as agent `shipyard-merge-steward`, at most once per head ever | open at the observed head, not a fork, not a draft, not DIRTY, not queued, not armed, and the approval gate, read live, approves it; then every refusal `advance` applies, and its writes go through `ghapp` and its guards |
 | `stacked_base_merged` | retarget it to the steward's base | the pull request is unchanged; its `stacked:<n>` parent merged into the steward's base from exactly the branch it is based on; and that branch still points at the parent's merged head, so nothing unlanded is carried |
 
 `done` and `failed` are final at that head (a `failed` act was attempted and

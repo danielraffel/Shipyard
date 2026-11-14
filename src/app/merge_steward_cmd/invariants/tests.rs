@@ -291,7 +291,7 @@ fn an_approval_rule_that_does_not_apply_is_an_incident() {
             .fix
             .as_deref()
             .expect("fix")
-            .contains("arm_requires_head_approval = true"),
+            .contains("fleet_review_required = true"),
         "{admission:?}"
     );
     // The base config saying so is enough.
@@ -301,6 +301,55 @@ fn an_approval_rule_that_does_not_apply_is_an_incident() {
     ));
     fixture.rows.clear();
     assert!(find(&fixture.evaluate(), ADMISSION).ok);
+}
+
+/// A base that sets `fleet_review_required = true` has the semantics of
+/// `REVIEW_REQUIRED_REPOS` membership, so the approval rule applies to a repo
+/// off the compiled list, even beside an explicit
+/// `arm_requires_head_approval = false`. The same fixture without the switch is
+/// still an incident.
+#[test]
+fn the_base_fleet_review_switch_makes_the_approval_rule_apply() {
+    let mut fixture = Fixture::clean();
+    fixture.repo = "danielraffel/not-in-the-list";
+    fixture.base_config = config(FLEET_CONFIG);
+    assert!(
+        find(&fixture.evaluate(), ADMISSION).incident(),
+        "control: without the switch the rule does not apply"
+    );
+    for strict in ["", "arm_requires_head_approval = false\n"] {
+        fixture.base_config = config(&format!(
+            "[auto_merge]\n{strict}fleet_review_required = true\n{}",
+            FLEET_CONFIG.trim_start_matches("[auto_merge]\n")
+        ));
+        let admission = find(&fixture.evaluate(), ADMISSION).clone();
+        assert!(admission.ok, "{strict:?}: {admission:?}");
+    }
+}
+
+/// Before the ruleset requires `review-verdict`, the base switch alone still
+/// means approval is needed, so a missing signer list is reported. The same
+/// base without the switch needs no signers.
+#[test]
+fn the_base_fleet_review_switch_needs_signers_before_the_ruleset_requires_review() {
+    let mut fixture = Fixture::clean();
+    fixture.repo = "danielraffel/not-in-the-list";
+    fixture.required = vec![required("test")];
+    fixture.head_checks = ["test"].map(str::to_owned).into();
+    fixture.base_config = config("[auto_merge]\nqueue = true\n");
+    assert!(
+        find(&fixture.evaluate(), ADMISSION).ok,
+        "control: without the switch no approval is needed"
+    );
+    fixture.base_config = config("[auto_merge]\nfleet_review_required = true\n");
+    let admission = find(&fixture.evaluate(), ADMISSION).clone();
+    assert!(admission.incident(), "{admission:?}");
+    assert!(
+        admission
+            .detail
+            .contains("reviewer_signers and reviewer_stamp_sessions"),
+        "{admission:?}"
+    );
 }
 
 /// `required_never_ran` for over an hour on a context no open head carries

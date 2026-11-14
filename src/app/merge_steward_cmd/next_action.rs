@@ -403,6 +403,15 @@ fn someone_elses_move(kind: &str, facts: &Facts<'_>) -> Option<NextAction> {
                  restarts them). Checks that are not required do not gate."
             ),
         ),
+        "stale_merge_ref" => NextAction::new(
+            Actor::Steward,
+            format!(
+                "Approved, but required check(s) {arg} ran on a stale merge ref{detail_suffix}. \
+                 The steward closes and reopens it through `shipyard advance --retrigger`, which \
+                 rebuilds the ref and reruns the checks. Nothing for the author to do; do not \
+                 push."
+            ),
+        ),
         "transient_rerun" => NextAction::new(
             Actor::Steward,
             format!(
@@ -914,6 +923,20 @@ mod tests {
             assert!(next.action.contains("Nothing to do"), "{token}: {next:?}");
         }
         assert_eq!(next("admitted", None, true, "CLEAN").actor, Actor::Nobody);
+    }
+
+    #[test]
+    fn a_stale_merge_ref_is_the_stewards_to_retrigger() {
+        let next = next(
+            "stale_merge_ref:macos",
+            Some("approved; base moved"),
+            true,
+            "CLEAN",
+        );
+        assert_eq!(next.actor, Actor::Steward);
+        assert!(!next.actionable(), "{next:?}");
+        assert!(next.action.contains("advance --retrigger"), "{next:?}");
+        assert!(next.action.contains("Nothing for the author"), "{next:?}");
     }
 
     #[test]

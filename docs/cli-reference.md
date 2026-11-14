@@ -265,6 +265,7 @@ shipyard governance apply --yes  # write live state to match config (without --y
 shipyard governance export     # snapshot to TOML
 shipyard governance use <name> # switch profile (solo / multi / custom)
 shipyard governance audit --repo owner/repo [--repo ...] [--gh-binary ghapp]  # read-only PASS/DRIFT/UNKNOWN per supply-chain row
+shipyard governance onboard --repo owner/repo [--profile fleet|builder] [--require-check NAME]... [--through STEP] [--no-enroll] [--reviewer-signer NAME]... [--stamp-session GLOB]... [--gh-binary ghapp]  # read-only plan; --apply is not implemented and refuses
 
 # Cloud
 shipyard cloud workflows       # list dispatchable workflows
@@ -300,6 +301,7 @@ shipyard runner steward --approval-context review-verdict  # no-queue base: exac
                                                     #   [merge_steward] unapproved_dequeue = "report" (default: report
                                                     #   would_dequeue_*, remove nothing) | "apply"
 shipyard runner steward --no-invariants            # skip the tick-start invariants (repos[].invariants)
+shipyard runner steward-admit-ready --repo OWNER/REPO --pr 123 --head "$SHA" [--apply]  # admit one ready head now, through the tick's path (docs/scheduling-loop.md)
 shipyard runner steward-invariants --fleet-repos F --clones D [--heal] [--json]  # every fleet repo has a config clone; --heal clones it
 shipyard runner steward-handoff --repo OWNER/REPO --pr 123 --head "$SHA" --workstream-id GEN-7 --context-url https://linear.app/... --apply
 shipyard runner steward-handoff --repo OWNER/REPO --pr 123 --head "$SHA" --workstream-id GEN-7 --context-url https://linear.app/... --agent-provider codex --agent-session-id NEW_SESSION --transfer-agent-owner --apply
