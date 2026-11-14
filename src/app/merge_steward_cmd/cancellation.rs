@@ -19,6 +19,7 @@ use super::{
 };
 
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 pub(super) fn apply_repo_plan(
     actions: &GitHubActions,
     args: &StewardCommandArgs,
@@ -27,6 +28,7 @@ pub(super) fn apply_repo_plan(
     ledger: &mut StewardLedger,
     remaining_preemptions: usize,
     mutation_control: Option<&MutationControl>,
+    global_dir: Option<&Path>,
 ) -> (RepoReport, bool, usize) {
     // Settle earlier uncertain admissions first, so a pull request whose
     // enqueue GitHub plainly took or refused is not held behind it.
@@ -107,7 +109,6 @@ pub(super) fn apply_repo_plan(
         max_transient_reruns: args.max_transient_reruns,
         ejection_guards: super::read_ejection_guards(actions, observation),
     };
-    let base_poison = super::base_poison::observe(actions, observation, &policy, Utc::now());
     // Infra reruns and red everywhere skip the same labels.
     let mut infra_excluded = vec![args.opt_out_label.clone()];
     infra_excluded.extend(args.provenance_blocking_labels.iter().cloned());
@@ -123,6 +124,15 @@ pub(super) fn apply_repo_plan(
         &red_everywhere_reds,
         ledger,
         Utc::now().timestamp(),
+    );
+    // Read after red everywhere: an episode on a check the merge groups
+    // also fail is the second signal that the base is the cause.
+    let base_poison = super::base_poison::observe(
+        actions,
+        observation,
+        &policy,
+        &red_everywhere_pass.checks_first_seen(),
+        Utc::now(),
     );
     // Merge groups that can never finish: read before any pull request is
     // mutated, so the dequeue below acts on this pass's reading.
@@ -183,11 +193,49 @@ pub(super) fn apply_repo_plan(
         };
         super::base_poison::report(poison, &fast_track)
     });
+    // The red-base triage acts, each under its own `[base_health]` key; one
+    // `<act>: ...` line each when it has something to say.
+    let mut triage_lines = super::orphan_groups::run(
+        policy
+            .ejection_guards
+            .base_poison
+            .acts
+            .cancel_orphaned_groups,
+        actions,
+        mutation_control,
+        args.apply,
+        observation,
+    );
+    if let Some(poison) = base_poison.as_ref() {
+        triage_lines.extend(super::fix_reorder::run(
+            actions,
+            mutation_control,
+            args.apply,
+            observation,
+            poison,
+        ));
+    }
     let pause_lines = if args.apply {
         super::poison_pause::reconcile(ledger, observation, base_poison.as_ref(), Utc::now())
     } else {
         Vec::new()
     };
+    // Both modes report what the act does; only an applying pass keeps the
+    // records. A report pass works on a scratch copy of the entries, so it
+    // says `would re-enqueue` and persists nothing.
+    let reenqueue_mode = policy
+        .ejection_guards
+        .base_poison
+        .acts
+        .reenqueue_red_base_ejections;
+    triage_lines.extend(super::red_base_ejections::reconcile_for_pass(
+        reenqueue_mode,
+        args.apply,
+        ledger,
+        observation,
+        base_poison.as_ref(),
+        Utc::now(),
+    ));
     // Shadow ledger: every would-fire episode per rule, labelled when it
     // ends, and the promotion gate it feeds. Measurement only.
     let shadow = match (args.apply, mutation_control, base_poison.as_ref()) {
@@ -230,14 +278,16 @@ pub(super) fn apply_repo_plan(
                     "pause".to_owned(),
                     super::poison_pause::report(observation, base_poison.as_ref(), &pause_lines),
                 );
+                object.insert("acts".to_owned(), serde_json::json!(triage_lines));
                 if let Some(shadow) = shadow {
                     object.insert("shadow".to_owned(), shadow);
                 }
             }
             Some(value)
         }
-        None if !pause_lines.is_empty() => Some(serde_json::json!({
+        None if !pause_lines.is_empty() || !triage_lines.is_empty() => Some(serde_json::json!({
             "pause": super::poison_pause::report(observation, None, &pause_lines),
+            "acts": triage_lines,
         })),
         None => None,
     };
@@ -268,6 +318,32 @@ pub(super) fn apply_repo_plan(
             }),
         },
     );
+    // The scheduling loop: one state, act, deadline and level per covered
+    // row, from what this pass already read. See `scheduling_loop`.
+    let quarantine = super::scheduling_loop::read_quarantine(
+        super::scheduling_loop::quarantine_path(
+            global_dir.or_else(|| mutation_control.map(|control| control.global_dir.as_path())),
+        )
+        .as_deref(),
+    );
+    {
+        let dwell = ledger
+            .dwell
+            .get(&super::dwell_pass::dwell_key(
+                &observation.repo,
+                &observation.base,
+            ))
+            .cloned();
+        super::scheduling_loop::annotate(
+            &mut reports,
+            observation,
+            dwell.as_ref(),
+            &mut ledger.loop_seen,
+            &quarantine,
+            args.apply,
+            Utc::now(),
+        );
+    }
     // The backstop acts only on pull requests the steward declines to own, so
     // it can never contend with the enqueue path above. See `native_arm`.
     let (native_arm_status, native_arm_failed) =
