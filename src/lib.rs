@@ -13,6 +13,8 @@
 // Windows release builds retain selected Unix controller modules so their
 // explicit fail-closed stubs remain type-checked. Keep lint accommodations on
 // those modules instead of suppressing Windows diagnostics crate-wide.
+/// Policy-checked release-movement acts (`shipyard advance`).
+pub(crate) mod advance;
 /// CLI entrypoint and command dispatch.
 pub mod app;
 /// Immutable artifact manifests, resumable receiver-pull planning, and verified publication.

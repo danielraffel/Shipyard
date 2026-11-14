@@ -198,11 +198,11 @@ pub(super) fn io_failure(error: &std::io::Error) -> CliFailure {
     CliFailure::new(1, error.to_string())
 }
 
-pub(super) fn is_private_free_entitlement(message: &str) -> bool {
+pub(crate) fn is_private_free_entitlement(message: &str) -> bool {
     message.contains("Upgrade to GitHub Pro or make this repository public")
 }
 
-pub(super) fn is_admin_protection_denied(message: &str) -> bool {
+pub(crate) fn is_admin_protection_denied(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     lower.contains("http 403")
         && (lower.contains("must have admin rights")

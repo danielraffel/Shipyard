@@ -163,6 +163,9 @@ pub(super) enum ActOutcome {
     Failed(String),
     /// A precondition could not be read; nothing was attempted.
     Deferred(String),
+    /// A guard refused the write, or the command it needs is not in this
+    /// build; nothing changed. Retried only after a day.
+    Blocked(String),
 }
 
 impl ActOutcome {
@@ -172,6 +175,7 @@ impl ActOutcome {
             Self::Refused(_) => "refused",
             Self::Failed(_) => "failed",
             Self::Deferred(_) => "deferred",
+            Self::Blocked(_) => "blocked",
         }
     }
 
@@ -180,7 +184,8 @@ impl ActOutcome {
             Self::Done(detail)
             | Self::Refused(detail)
             | Self::Failed(detail)
-            | Self::Deferred(detail) => detail,
+            | Self::Deferred(detail)
+            | Self::Blocked(detail) => detail,
         }
     }
 }
@@ -195,6 +200,10 @@ pub(super) trait DwellActs {
     fn dispatch(&self, pr: &ObservedPr, workflows: &[String]) -> ActOutcome;
     /// Retarget stacked `pr` to the steward's base once its parent merged.
     fn retarget(&self, pr: &OpenPr) -> ActOutcome;
+    /// Close and reopen `pr` to rebuild its stale merge ref, through
+    /// `shipyard advance --retrigger`, after the approval gate, read live,
+    /// approves the exact head.
+    fn retrigger(&self, pr: &ObservedPr, ledger: &StewardLedger) -> ActOutcome;
 }
 
 /// Everything one repository's dwell step reads.
@@ -319,6 +328,13 @@ pub(super) fn run(
             }
             ActKind::RetargetStacked if !stacked_now.contains(&row.number) => {
                 Actable::NotNow("stacked pull requests were not listed this pass".to_owned())
+            }
+            // At most one retrigger succeeds per head, ever: the marks
+            // outlive the act-record TTL, and a reopen keeps the head.
+            ActKind::RetriggerStaleRef
+                if state.retrigger_spent(row.number, &row.head).is_some() =>
+            {
+                Actable::Never
             }
             _ => Actable::Yes,
         }
@@ -523,6 +539,9 @@ fn take_act(
     // nothing is recorded and the act is retried next pass.
     let mut staged = state.clone();
     staged.record_act(number, record("intent", None));
+    if kind == ActKind::RetriggerStaleRef {
+        staged.mark_retrigger(number, &row.overdue.head, true, false, input.now);
+    }
     ledger.dwell.insert(repo_key.to_owned(), staged.clone());
     let saved = super::save_ledger(input.ledger_path, ledger);
     ledger.dwell.remove(repo_key);
@@ -535,7 +554,7 @@ fn take_act(
     })?;
     *state = staged;
     let outcome = match kind {
-        ActKind::RerunVerdictCheck | ActKind::DispatchNeverRan => {
+        ActKind::RerunVerdictCheck | ActKind::DispatchNeverRan | ActKind::RetriggerStaleRef => {
             match input
                 .observation
                 .prs
@@ -545,6 +564,7 @@ fn take_act(
             {
                 None => ActOutcome::Refused("head moved since it was observed".to_owned()),
                 Some(pr) if kind == ActKind::RerunVerdictCheck => acts.rerun_verdict(pr, ledger),
+                Some(pr) if kind == ActKind::RetriggerStaleRef => acts.retrigger(pr, ledger),
                 // The token the entry was tracked under, never this pass's
                 // report row (a deferred row has none).
                 Some(pr) => acts.dispatch(
@@ -571,6 +591,9 @@ fn take_act(
         number,
         record(outcome.status(), Some(outcome.detail().to_owned())),
     );
+    if kind == ActKind::RetriggerStaleRef && matches!(outcome, ActOutcome::Done(_)) {
+        state.mark_retrigger(number, &row.overdue.head, false, true, input.now);
+    }
     Ok((text, matches!(outcome, ActOutcome::Done(_))))
 }
 
@@ -967,6 +990,45 @@ pub(super) fn live_pr_matches(live: &Value, repo: &str, head: &str) -> Result<()
     Ok(())
 }
 
+/// What a retrigger needs at act time, read live: the pull request open at
+/// the observed head, in the base repository, not a draft, not DIRTY (a
+/// conflict needs a merge, never a retrigger), not in the merge queue and
+/// not armed (a close would drop the entry or the arm). `advance` checks the
+/// queue and the arm again itself; the steward does not rely on it.
+pub(super) fn retrigger_preconditions(
+    live: &Value,
+    queue: &Value,
+    repo: &str,
+    head: &str,
+) -> Result<(), String> {
+    live_pr_matches(live, repo, head)?;
+    if live.get("draft").and_then(Value::as_bool) != Some(false) {
+        return Err("a draft, or its draft state unread".to_owned());
+    }
+    let mergeable = live
+        .get("mergeable_state")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if mergeable.eq_ignore_ascii_case("dirty") {
+        return Err("DIRTY: a conflict needs a merge of the base, not a retrigger".to_owned());
+    }
+    let node = queue
+        .pointer("/data/repository/pullRequest")
+        .filter(|node| node.is_object())
+        .ok_or_else(|| "merge-queue state carried no pull request".to_owned())?;
+    // Each field must be present and read as "not queued", "no entry" and
+    // "not armed": an omitted field is an unread state, never a safe one.
+    if node.get("isInMergeQueue").and_then(Value::as_bool) != Some(false)
+        || !node.get("mergeQueueEntry").is_some_and(Value::is_null)
+    {
+        return Err("in the merge queue, or its queue state unread".to_owned());
+    }
+    if !node.get("autoMergeRequest").is_some_and(Value::is_null) {
+        return Err("auto-merge is armed, or its auto-merge state unread".to_owned());
+    }
+    Ok(())
+}
+
 /// Every fact a retarget needs, read live. Pure: refuses unless the stacked
 /// pull request is unchanged, its `stacked:<n>` parent merged into the
 /// steward's base from the very branch it is based on, and that branch still
@@ -1041,6 +1103,19 @@ impl GitHubDwellActs<'_> {
         action: &str,
         effect: impl FnOnce() -> Result<String, String>,
     ) -> ActOutcome {
+        self.guarded_outcome(pr, action, || match effect() {
+            Ok(detail) => ActOutcome::Done(detail),
+            Err(error) => ActOutcome::Failed(error),
+        })
+    }
+
+    /// [`Self::guarded`] for an effect that names its own outcome.
+    fn guarded_outcome(
+        &self,
+        pr: &ObservedPr,
+        action: &str,
+        effect: impl FnOnce() -> ActOutcome,
+    ) -> ActOutcome {
         let Some(control) = self.control else {
             return ActOutcome::Deferred("no mutation control (dry run)".to_owned());
         };
@@ -1049,13 +1124,13 @@ impl GitHubDwellActs<'_> {
             Err(error) => return ActOutcome::Deferred(format!("mutation guard: {error}")),
         };
         match effect() {
-            Ok(detail) => match guard.finish("dwell_act_accepted") {
+            ActOutcome::Done(detail) => match guard.finish("dwell_act_accepted") {
                 Ok(()) => ActOutcome::Done(detail),
                 Err(error) => ActOutcome::Done(format!("{detail}; audit failed: {error}")),
             },
-            Err(error) => {
+            other => {
                 let _ = guard.finish("dwell_act_failed");
-                ActOutcome::Failed(error)
+                other
             }
         }
     }
@@ -1089,6 +1164,48 @@ impl GitHubDwellActs<'_> {
 }
 
 impl DwellActs for GitHubDwellActs<'_> {
+    fn retrigger(&self, pr: &ObservedPr, ledger: &StewardLedger) -> ActOutcome {
+        let live = match self.live_pr(pr.fact.number) {
+            Ok(live) => live,
+            Err(error) => {
+                return ActOutcome::Deferred(format!("pull request unreadable: {error}"));
+            }
+        };
+        let queue = match super::pr_mutations::read_pr_queue_state_strict(
+            self.actions,
+            self.observation,
+            pr.fact.number,
+        ) {
+            Ok(queue) => queue,
+            Err(error) => return ActOutcome::Deferred(error),
+        };
+        if let Err(why) =
+            retrigger_preconditions(&live, &queue, &self.observation.repo, &pr.fact.head_sha)
+        {
+            return ActOutcome::Refused(why);
+        }
+        match super::pr_mutations::read_head_gate_for_report(
+            self.actions,
+            self.observation,
+            pr,
+            ledger,
+        ) {
+            Err(error) => {
+                return ActOutcome::Deferred(format!("approval gate unreadable: {error}"));
+            }
+            Ok((crate::head_approval::HeadGate::Approved { .. }, _, None)) => {}
+            Ok((gate, _, _)) => {
+                return ActOutcome::Refused(format!(
+                    "the head is no longer approved: {}",
+                    gate.explain()
+                ));
+            }
+        }
+        self.guarded_outcome(pr, "runner steward dwell retrigger stale merge ref", || {
+            super::stale_merge_ref::run_advance(&self.observation.repo, pr)
+        })
+    }
+
     fn rerun_verdict(&self, pr: &ObservedPr, ledger: &StewardLedger) -> ActOutcome {
         let Some(required) = self.approval else {
             return ActOutcome::Refused("no required approval context".to_owned());
