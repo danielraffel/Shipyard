@@ -11,6 +11,10 @@ Kinds:
   drain_stall    actionable PRs wait (for 2 h or more) while none of the repository's PRs
                  merged in the last 2 h
   stale_hold     a held PR row with the same head for 45 min or more
+  merge_group_stalled
+                 a queued PR row whose merge group can never finish (the steward's
+                 `merge_group_stalled:<context>` token: every run done, a required
+                 context absent)
   stuck_claim    a repair claim 30 min or more old whose PR head has not moved
   pass_fault     new log lines matching a fault signature, per signature and lane
 
@@ -42,7 +46,12 @@ SIGNATURES = [
     "Unable to read current working directory", "sr status timed out", "Traceback",
 ]
 MERGE_FROM = {"queued", "admitted", "ready"}
-LOG_GLOBS = ("*.log", "*.last-output.txt")
+# Only the runner's own logs (<lane>.log, <lane>.launchd.log). The *.last-output.txt files
+# are agent transcripts that quote these strings in prose and code, so they are not scanned.
+LOG_GLOBS = ("*.log",)
+LINE_TS = re.compile(r"^\s*(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)")
+CUTOFF_SLACK = dt.timedelta(minutes=15)
+FIRST_RUN_LOOKBACK = dt.timedelta(hours=2)
 MAX_READ = 8 * 1024 * 1024
 
 
@@ -67,6 +76,50 @@ def classify(token, actor, stop):
     if fam in SYSTEM_WAIT or actor in ("steward", "nobody", "ci", "reviewer", "operator"):
         return "normal_wait"
     return "actionable"
+
+
+# A page asks an agent to act. Invariant `page_only_on_merge_blocking`: it needs a
+# REQUIRED context (the steward's `required_contexts`, read from the repository
+# rulesets) or a merge-blocking state, never a queued PR, and never a session whose
+# subagents produced output in the last 10 minutes.
+NEVER_PAGE_STATES = {"queued", "capacity_queued"}
+# A queued PR is not paged about until it has sat queued this long: past it, the
+# queue itself is stuck. Minutes, from DRAIN_WATCH_QUEUED_BOUND_MIN.
+QUEUED_BOUND = dt.timedelta(minutes=int(os.environ.get("DRAIN_WATCH_QUEUED_BOUND_MIN", "120") or 120))
+APP_BOUND = re.compile(r"\s*\(app_id=\d+\)\s*$")
+
+
+def norm_ctx(c):
+    """`macos (app_id=15368)` (a RequiredCheck label) and `macos` (a token context) compare equal."""
+    return APP_BOUND.sub("", c).strip()
+
+
+def token_contexts(token):
+    """Contexts a `kind:ctx1,ctx2` token names ([] when it names none)."""
+    _, _, arg = token.partition(":")
+    return [norm_ctx(c) for c in arg.split(",") if c.strip()] if arg else []
+
+
+def no_page_reason(o, ref):
+    """Why this PR row must not be paged about, or None. `ref` is the tick time."""
+    # When the tick carries a scheduling-loop state it wins; the token is the fallback.
+    state = o.get("loop") or o["token"]
+    if state.split(":", 1)[0] in NEVER_PAGE_STATES:
+        # Fail closed: an undated queued row cannot be shown to be young, so it pages.
+        if o.get("since") is not None and ref - o["since"] < QUEUED_BOUND:
+            return "queued"
+        return None  # queued past the bound or undated: page
+    ctxs = token_contexts(o["token"])
+    required = {norm_ctx(c) for c in o.get("required") or []}
+    # An unknown (empty) required list cannot prove a context is non-required.
+    if ctxs and required and not any(c in required for c in ctxs):
+        return "non_required"
+    return None
+
+
+def count_suppressed(sup, key):
+    if sup is not None:
+        sup.add(key)
 
 
 def parse_stamp(s):
@@ -118,11 +171,27 @@ def recent_ticks(log_dir, now, span):
                 na = p.get("next_action") or {}
                 rows[p["number"]] = {"head": p.get("head_sha"), "token": p.get("blocked_on") or "unknown",
                                      "actor": na.get("actor"), "stop": bool(na.get("stop")),
-                                     "since": parse_iso(p.get("since"))}
+                                     "since": parse_iso(p.get("since")), "deferred": read_deferred(p),
+                                     "loop": (p.get("loop") or {}).get("state") if isinstance(p.get("loop"), dict) else None,
+                                     "required": [c for c in (r.get("required_contexts") or []) if isinstance(c, str)]}
             per_repo.setdefault(r["repo"], []).append((t, rows))
     for v in per_repo.values():
         v.sort(key=lambda x: x[0])
     return per_repo
+
+
+READ_ERROR_RE = re.compile(r"HTTP 50\d|timed out|unreadable|cannot read|read failed")
+
+
+def read_deferred(p):
+    """A PR the pass could not read this tick (a transient 5xx or timeout): it was
+    neither judged nor refused, so it is unobserved, never an event. Mirrors the
+    `read_deferred=` split in shipyard-steward-tick.sh."""
+    err = p.get("error")
+    if err is None:
+        return False
+    kind = p.get("error_kind")
+    return kind == "read" or (kind is None and bool(READ_ERROR_RE.search(str(err))))
 
 
 def latest_valid(ticks):
@@ -132,7 +201,7 @@ def latest_valid(ticks):
     return None, None
 
 
-def check_drain_stall(per_repo, now):
+def check_drain_stall(per_repo, now, sup=None):
     out = []
     for repo, ticks in per_repo.items():
         valid = [(t, r) for t, r in ticks if r is not None]
@@ -143,9 +212,16 @@ def check_drain_stall(per_repo, now):
             continue  # no fresh observation: not a verdict
         if t_last - valid[0][0] < STALL_WINDOW - dt.timedelta(minutes=15):
             continue  # not enough history to say nothing merged in 2 h
-        waiting = [pr for pr, o in rows.items()
-                   if classify(o["token"], o["actor"], o["stop"]) == "actionable"
-                   and (o["since"] or t_last) <= t_last - STALL_WINDOW]
+        waiting = []
+        for pr, o in rows.items():
+            if (o["deferred"] or classify(o["token"], o["actor"], o["stop"]) != "actionable"
+                    or (o["since"] or t_last) > t_last - STALL_WINDOW):
+                continue
+            why = no_page_reason(o, t_last)
+            if why:
+                count_suppressed(sup, (repo, pr, why))
+            else:
+                waiting.append(pr)
         if not waiting:
             continue
         merged = 0
@@ -161,19 +237,43 @@ def check_drain_stall(per_repo, now):
     return out
 
 
-def check_stale_hold(per_repo, now):
+def check_stale_hold(per_repo, now, sup=None):
     out = []
     for repo, ticks in per_repo.items():
         t_last, rows = latest_valid(ticks)
         if rows is None or now - t_last > dt.timedelta(minutes=30):
             continue
-        old = [pr for pr, o in rows.items()
-               if (o["token"] == "held" or o["token"].startswith("held:")) and o["since"]
-               and t_last - o["since"] >= STALE_HOLD]
+        old = []
+        for pr, o in rows.items():
+            if (o["deferred"] or not (o["token"] == "held" or o["token"].startswith("held:")) or not o["since"]
+                    or t_last - o["since"] < STALE_HOLD):
+                continue
+            why = no_page_reason(o, t_last)
+            if why:
+                count_suppressed(sup, (repo, pr, why))
+            else:
+                old.append(pr)
         if old:
             out.append(dict(kind="stale_hold", repo=repo, lane="-", key=f"stale_hold:{repo}",
                             detail=f"{len(old)} held PR(s) 45m+ with no new head: " + ",".join(f"#{n}" for n in sorted(old)[:5]),
                             evidence=[f"{repo}#{n} {rows[n]['token']} since {rows[n]['since'].isoformat()}" for n in sorted(old)[:5]]))
+    return out
+
+
+def check_merge_group_stalled(per_repo, now, sup=None):
+    """Rows the steward marked `merge_group_stalled:<context>` in its latest tick."""
+    out = []
+    for repo, ticks in per_repo.items():
+        t_last, rows = latest_valid(ticks)
+        if rows is None or now - t_last > dt.timedelta(minutes=30):
+            continue
+        # Never suppressed: the steward says this merge group can never finish.
+        stalled = sorted(pr for pr, o in rows.items() if o["token"].startswith("merge_group_stalled:"))
+        if stalled:
+            out.append(dict(kind="merge_group_stalled", repo=repo, lane="-", key=f"merge_group_stalled:{repo}",
+                            detail=f"{len(stalled)} merge group(s) can never finish: " + ",".join(f"#{n}" for n in stalled[:5]),
+                            evidence=[f"{repo}#{n} {rows[n]['token']} since {rows[n]['since'].isoformat() if rows[n]['since'] else 'unknown'}"
+                                      for n in stalled[:5]]))
     return out
 
 
@@ -194,7 +294,7 @@ def latest_attempts(runner_dir):
     return res
 
 
-def check_stuck_claims(per_repo, runner_dir, now):
+def check_stuck_claims(per_repo, runner_dir, now, sup=None):
     out = []
     names = {r.replace("/", "_"): r for r in per_repo}
     attempts = latest_attempts(runner_dir)
@@ -212,6 +312,12 @@ def check_stuck_claims(per_repo, runner_dir, now):
         age = now - claimed
         if age < STUCK_CLAIM:
             continue
+        # Drain-watch cannot tell progress from a heartbeat in the claim dir, so a
+        # stuck claim keeps paging whatever was written there.
+        why = no_page_reason(rows[int(pr)], t_last)
+        if why:
+            count_suppressed(sup, (repo, int(pr), why))
+            continue
         claim_head = attempts.get((repo, int(pr)))
         if claim_head and rows[int(pr)]["head"] == claim_head:
             out.append(dict(kind="stuck_claim", repo=repo, lane="repair", key=f"stuck_claim:{repo}#{pr}",
@@ -221,8 +327,24 @@ def check_stuck_claims(per_repo, runner_dir, now):
 
 
 # ------------------------------------------------------------ pass faults
-def scan_logs(fleet_dir, state, from_start):
-    """Count new matching lines since the stored offsets. Mutates state['offsets']."""
+def scan_logs(fleet_dir, state, from_start, now=None):
+    """Count new matching lines since the stored offsets. Mutates state['offsets'].
+
+    A line with a leading ISO timestamp is attributed to that time; a line without
+    one to the preceding timestamped line (carried across runs per file). A line
+    attributed to a time before the cutoff (last run minus 15 min, or 2 h before
+    now on a first run) is old content, not a new fault, and is not counted. A line
+    with no timestamp anywhere before it cannot be proven old and is counted.
+    """
+    now = now or dt.datetime.now(UTC)
+    last_run = parse_iso(state.get("last_run"))
+    if last_run:
+        cutoff = last_run - CUTOFF_SLACK
+    elif from_start:
+        cutoff = None  # --from-start with no prior run: count everything, however old
+    else:
+        cutoff = now - FIRST_RUN_LOOKBACK
+    state["last_run"] = now.isoformat(timespec="seconds")
     offs = state.setdefault("offsets", {})
     found = {}
     seeded = bool(offs) or from_start
@@ -236,11 +358,25 @@ def scan_logs(fleet_dir, state, from_start):
             continue
         rec = offs.get(f)
         if rec is None and not seeded:
-            offs[f] = {"inode": st.st_ino, "offset": st.st_size}  # first ever run: do not count history
+            # first ever run: do not count history, but remember its last timestamp so
+            # an untimestamped continuation line later is attributed to it
+            ts = None
+            try:
+                with open(f, "rb") as fh:
+                    fh.seek(max(0, st.st_size - 65536))
+                    for line in fh.read().decode("utf-8", "replace").splitlines():
+                        m = LINE_TS.match(line)
+                        if m:
+                            ts = parse_iso(m.group(1)) or ts
+            except OSError:
+                pass
+            offs[f] = {"inode": st.st_ino, "offset": st.st_size, "ts": ts.isoformat() if ts else None}
             continue
         start = 0
+        line_ts = None
         if rec and rec["inode"] == st.st_ino and rec["offset"] <= st.st_size:
             start = rec["offset"]
+            line_ts = parse_iso(rec.get("ts"))
         end = st.st_size
         if end - start > MAX_READ:
             start = end - MAX_READ
@@ -257,15 +393,21 @@ def scan_logs(fleet_dir, state, from_start):
         else:
             consumed = cut + 1
             text = data[:consumed]
-        offs[f] = {"inode": st.st_ino, "offset": start + consumed}
         lane = os.path.basename(f).split(".")[0]
         for line in text.decode("utf-8", "replace").splitlines():
+            m = LINE_TS.match(line)
+            if m:
+                line_ts = parse_iso(m.group(1)) or line_ts
+            if cutoff is not None and line_ts is not None and line_ts < cutoff:
+                continue
             for sig in SIGNATURES:
                 if sig in line:
                     e = found.setdefault((lane, sig), {"count": 0, "evidence": []})
                     e["count"] += 1
                     if len(e["evidence"]) < 3:
                         e["evidence"].append(f"{os.path.basename(f)}: {line.strip()[:200]}")
+        offs[f] = {"inode": st.st_ino, "offset": start + consumed,
+                   "ts": line_ts.isoformat() if line_ts else None}
     out = []
     for (lane, sig), e in sorted(found.items()):
         out.append(dict(kind="pass_fault", repo="-", lane=lane, key=f"pass_fault:{lane}:{sig}",
@@ -344,10 +486,13 @@ def save_state(path, s):
 def collect(a, now, state):
     per_repo = recent_ticks(a.log_dir, now, STALL_WINDOW + dt.timedelta(minutes=30))
     f = []
-    f += check_drain_stall(per_repo, now)
-    f += check_stale_hold(per_repo, now)
-    f += check_stuck_claims(per_repo, a.runner_dir, now)
-    f += scan_logs(a.fleet_dir, state, a.from_start)
+    sup = set()
+    state["_sup_run"] = sup
+    f += check_drain_stall(per_repo, now, sup)
+    f += check_stale_hold(per_repo, now, sup)
+    f += check_merge_group_stalled(per_repo, now, sup)
+    f += check_stuck_claims(per_repo, a.runner_dir, now, sup)
+    f += scan_logs(a.fleet_dir, state, a.from_start, now)
     return f
 
 
@@ -359,6 +504,17 @@ def run(a, now=None, issues=None):
     findings_state = state.setdefault("findings", {})
     findings = collect(a, now, state)
     seen = {f["key"] for f in findings}
+    day = now.strftime("%Y-%m-%d")
+    for k in ("pages", "suppressed", "suppressed_seen"):
+        for old in sorted(state.get(k, {}))[:-14]:
+            del state[k][old]  # keep two weeks of daily counts
+    seen_sup = state.setdefault("suppressed_seen", {}).setdefault(day, [])
+    for repo_, pr_, reason in sorted(state.pop("_sup_run", set())):
+        k = f"{repo_}#{pr_}:{reason}"  # distinct (PR, reason) per day, not per tick
+        if k not in seen_sup:
+            seen_sup.append(k)
+            d = state.setdefault("suppressed", {}).setdefault(day, {})
+            d[reason] = d.get(reason, 0) + 1
     lines, actions = [], []
     issues = issues or Issues(a.ghapp)
     for f in findings:
@@ -371,6 +527,8 @@ def run(a, now=None, issues=None):
         st["absent"] = 0
         st["occurrences"] += f.get("occurrences", 1)
         if new:
+            d = state.setdefault("pages", {}).setdefault(day, {})
+            d[f["kind"]] = d.get(f["kind"], 0) + 1
             lines.append(f"{stamp} drain-watch kind={f['kind']} repo={f['repo']} lane={f['lane']} "
                          f"detail={f['detail'].replace(' ', '_')} first_seen={st['first_seen']} count={st['runs']}")
         st["evidence"] = (st.get("evidence", []) + [e for e in f["evidence"] if e not in st.get("evidence", [])])[:6]

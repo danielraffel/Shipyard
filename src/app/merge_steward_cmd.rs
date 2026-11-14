@@ -116,6 +116,7 @@ type MergeQueueSnapshot = (
 );
 
 #[derive(Clone, Debug, Serialize)]
+#[serde(into = "PrReportWire")]
 struct PrReport {
     number: u64,
     head_sha: String,
@@ -123,8 +124,72 @@ struct PrReport {
     mutation: Option<String>,
     error: Option<String>,
     /// Why this pull request is not merging, and since when.
+    blocked: blocked_on::Stall,
+}
+
+/// Whether a pull request's `error` is a failed read this pass could not
+/// complete (`read`: a 5xx, a timeout, a dropped connection, a rate limit; the
+/// next pass reads it again) or a decision or failed action (`policy`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum ErrorKind {
+    Read,
+    Policy,
+}
+
+fn classify_pr_error(error: &str) -> ErrorKind {
+    let lower = error.to_ascii_lowercase();
+    let unread = [
+        "cannot read",
+        "unreadable",
+        "read failed",
+        "failed after one retry",
+        "bad gateway",
+        "service unavailable",
+        "gateway timeout",
+        "connection aborted",
+        "connection closed",
+        "connection refused",
+        "remote end closed",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    if unread
+        || observation::is_retryable_read_failure(error)
+        || pass_budget::is_rate_limited(error)
+    {
+        ErrorKind::Read
+    } else {
+        ErrorKind::Policy
+    }
+}
+
+/// The serialized shape of [`PrReport`]: the same fields plus `error_kind`,
+/// derived once here so no report constructor can forget it.
+#[derive(Serialize)]
+struct PrReportWire {
+    number: u64,
+    head_sha: String,
+    decision: StewardDecision,
+    mutation: Option<String>,
+    error: Option<String>,
+    error_kind: Option<ErrorKind>,
     #[serde(flatten)]
     blocked: blocked_on::Stall,
+}
+
+impl From<PrReport> for PrReportWire {
+    fn from(report: PrReport) -> Self {
+        Self {
+            error_kind: report.error.as_deref().map(classify_pr_error),
+            number: report.number,
+            head_sha: report.head_sha,
+            decision: report.decision,
+            mutation: report.mutation,
+            error: report.error,
+            blocked: report.blocked,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -180,6 +245,11 @@ struct RepoReport {
     /// not ask for it.
     #[serde(skip_serializing_if = "Option::is_none")]
     base_poison: Option<Value>,
+    /// Merge groups that can never finish: every run completed and a
+    /// required context still absent ([`merge_group_stall`]). Absent when
+    /// the repository was not observed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    merge_group_stalled: Option<Value>,
     /// Required checks re-run (or, in shadow, that would be) because they
     /// failed for an infrastructure reason, and outage findings
     /// ([`infra_rerun`]). Absent when the repository was not observed.
@@ -266,6 +336,15 @@ struct StewardLedger {
     /// `poison_pause`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     poison_paused: BTreeMap<String, Vec<poison_pause::PausedEntry>>,
+    /// Doomed merge groups the steward decided on, keyed
+    /// `repo#pr@group-sha`: once per (pull request, group head). See
+    /// `merge_group_stall`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    doomed_dequeues: BTreeMap<String, merge_group_stall::Receipt>,
+    /// The last good read of the queue-removals ledger, honoured while the
+    /// file cannot be read. See `defect_fix_removals`.
+    #[serde(default)]
+    removal_ledger: defect_fix_removals::Cache,
     /// Infra re-runs per check on an exact head, keyed
     /// `repo#pr@head:check`. See `infra_rerun`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -509,6 +588,9 @@ struct MutationApplyContext<'a> {
     /// This pass's merge-group reading, when the base asks for one. See
     /// `base_poison`.
     base_poison: Option<&'a base_poison::RepoPoison>,
+    /// This pass's reading of the queue-removals ledger: a `defect-fix`
+    /// removal of a head refuses its admission. See `defect_fix_removals`.
+    defect_fix: Option<&'a defect_fix_removals::Reading>,
 }
 
 /// Exact-head approval gate reads made during one pass, by PR number.
@@ -1768,6 +1850,7 @@ fn deferred_rate_limit_repo_report(
 ) -> RepoReport {
     RepoReport {
         base_poison: None,
+        merge_group_stalled: None,
         rollup_reconciliation: Vec::new(),
         uncertain_mutations: Vec::new(),
         repo: repo.to_owned(),
@@ -1800,6 +1883,7 @@ fn unreadable_repo_report(
 ) -> RepoReport {
     RepoReport {
         base_poison: None,
+        merge_group_stalled: None,
         rollup_reconciliation: Vec::new(),
         uncertain_mutations: Vec::new(),
         api_calls: None,
@@ -1882,6 +1966,7 @@ fn append_unmatched_recovery_errors(
             .map_or_else(|| default_base.to_owned(), |pending| pending.base.clone());
         reports.push(RepoReport {
             base_poison: None,
+            merge_group_stalled: None,
             rollup_reconciliation: Vec::new(),
             uncertain_mutations: Vec::new(),
             api_calls: None,
@@ -1924,6 +2009,7 @@ fn persist_final_ledger(
     } else {
         reports.push(RepoReport {
             base_poison: None,
+            merge_group_stalled: None,
             rollup_reconciliation: Vec::new(),
             uncertain_mutations: Vec::new(),
             api_calls: None,
@@ -2086,6 +2172,7 @@ mod cancellation_terminalization;
 mod capacity_cancellation;
 mod carried_commits;
 mod code_owner_wait;
+mod defect_fix_removals;
 pub(super) mod dwell_pass;
 mod exact_head_merge;
 mod generated_paths;
@@ -2093,6 +2180,7 @@ mod head_rollup;
 pub(super) mod infra_rerun;
 pub(super) mod invariants;
 mod ledger;
+mod merge_group_stall;
 mod mutation_outcome;
 mod native_arm;
 mod next_action;
@@ -2107,6 +2195,7 @@ mod red_everywhere;
 mod render;
 mod resume_record;
 mod shadow_ledger;
+mod stale_merge_ref;
 mod superseded;
 mod terminal_handoff;
 pub(super) mod train;

@@ -399,6 +399,7 @@ close anything. See [superseded-close.md](superseded-close.md).
 | `excluded_label:<label>` | `superseded`, `PARKED/<platform>` or the opt-out label | whoever owns the label |
 | `excluded_label:shipyard:no-auto-merge` | A hold: the opt-out label, with a comment naming what it waits for (`hold-condition:` lines) | any agent that neither wrote nor approved it: `shipyard advance OWNER/REPO#N --release-hold` once every named condition is met, or with `--decision` naming the DECISIONS entry that releases it. It checks green required checks and the steward's exact-head approval itself, writes through `ghapp`, and audits the act ([advance](advance.md)) |
 | `provenance_blocked:<labels>` | A provenance-blocking label | owner |
+| `stale_merge_ref:<contexts>` | Approved (the gate approves this exact head), and every red required context went red on a test merge commit that no longer exists: its failing run is a `pull_request` run of this head whose tested base is not the base of the pull request's current `merge_commit_sha`, and the same context is green on the base tip. A red on the current merge ref never reads this, however old. See [Stale merge refs](#stale-merge-refs) | steward: retriggers it through `shipyard advance --retrigger` |
 | `required_never_ran:<contexts>` | A required context has no run on this head and nothing from its source is still queued or running (often a renamed check: merge the base to re-run CI) | repair lane |
 | `required_pending` | Required checks are queued or running, or have not appeared yet behind a running job, and none has failed. A `pending` `review-verdict` status (head awaiting its reviewer) also reads here, with the reviewer as actor, never as `required_failed` | CI, or the reviewer |
 | `capacity_queued` | Every pending required check is a check run still queued for a runner, and none has started. The pull request is not blocked: `next_action` is `ci` with `stop: false` and says to take other work. Dwell limits treat it like `required_pending`. |
@@ -420,6 +421,8 @@ close anything. See [superseded-close.md](superseded-close.md).
 | `deferred_pass_budget` | The pass spent its time budget (or hit the API rate limit) before this row and did nothing for it; the next pass takes it first. See "Things that bite" | next pass |
 | `admission_pending` | Admission returned an outcome with no token of its own; see `blocked_detail` | next pass |
 | `queued` | In the merge queue | queue |
+| `merge_group_stalled:<contexts>` | In the merge queue, but its merge group can never finish: every workflow run on the group head completed and a required context (from the app its rule names) never reported. Reported at once when the run that produces the context failed (`blocked_detail` starts `doomed:` and names the run), otherwise after 30 minutes. See [Merge groups that can never finish](#merge-groups-that-can-never-finish) | steward under `dequeue_doomed_groups = "on"`, else operator |
+| `defect_fix_removed:<reason>` | This exact head was removed from the merge queue for a defect (a `defect-fix` line in the queue-removals ledger, written by the ghapp queue-removal guard or by the steward's own `dequeue_doomed_groups`), so the steward does not enqueue or arm it again; `blocked_detail` names when, from which host, and the note. `defect_fix_removed:unjudged` means the ledger could not be read and this head left the queue after its last good read. A new head is admitted as usual | repair lane: fix the defect and push a new head |
 | `admitted` | Enqueued or merged this pass (outranks any label) | nobody |
 | `ready` | Approved and green; a dry run would admit it | steward |
 | `draft`, `unmanaged`, `handoff_missing`, `invalid_head`, `direct_merge_refused`, `required_policy_unknown` | The steward does not own or cannot admit it yet | author or config |
@@ -656,6 +659,52 @@ rule and scores each pick against the pull request that repaired the base.
 The steward's shadow ledger records the same thing live under the `tip_red`
 rule (`fix_picks`, `fixed_by`, and the `fix_first` score in the pass report).
 
+## Merge groups that can never finish
+
+A merge group waits until every required context reports on its head. When
+the workflow that should post one fails before posting it, nothing ever will:
+the entry sits `AWAITING_CHECKS` until the ruleset's check timeout (six hours
+on some bases) and blocks every entry behind it.
+
+Each pass, for every queue entry whose group head has no workflow run still
+active, the steward reads the group's runs, check runs and statuses (three
+reads per such entry; none for an entry whose group is still building). When
+every run completed and a required context is still absent, the row reads
+`merge_group_stalled:<context>` and the repository report has a
+`merge-group-stalled` line (drain watch files it as `merge_group_stalled`).
+It is `doomed` when a completed run that produces the context failed: its
+workflow name or file name is the context, or
+`[base_health.control_workflows]` names its file for it. Without a failed
+producer the row is reported once the last run has been done 30 minutes. A
+run still going, or any read that failed or came back partial, decides
+nothing.
+
+```toml
+[merge_queue]
+dequeue_doomed_groups = "dry-run"   # off | dry-run (default) | on
+```
+
+Under `on` a doomed entry, and only a doomed one, is removed from the queue
+through the steward's guarded dequeue (audit `defect-fix`; it never counts
+toward the head's ejection cap), after a fresh read shows the same pull
+request head and the same group head still queued. One comment on the pull
+request names the context, the failed run and its conclusion. It happens once
+per pull request and group head; a failed dequeue is retried next pass, and
+a comment that failed is retried until posted. The pull request is never
+closed. `dry-run` reports `would_dequeue_doomed_group:<context>:<group>`.
+
+A head removed for a defect stays out. The ghapp queue-removal guard records
+every removal it allows in `$XDG_STATE_HOME/shipyard/queue-removals.jsonl`
+(default `~/.local/state/shipyard/`), and the steward's own doomed-group
+dequeue appends there too. Each pass reads it once; a `defect-fix` removal of
+head X of a pull request refuses the steward's enqueue, exact-head merge and
+native-arm backstop for X until the head changes
+(`defect_fix_removed:<reason>`, repair lane next). A missing file is no
+record. A file that cannot be read never stalls the queue: the last good read
+(kept in the steward ledger) is still honoured, and for 30 minutes after it
+only a head that left the queue since that read is held
+(`defect_fix_removed:unjudged`); after that the error is only logged.
+
 ## Red everywhere: one cause on the base
 
 When one required check fails the same way on three or more open pull requests
@@ -685,6 +734,51 @@ A member that pushes a new head leaves the episode; the episode ends (and is
 forgotten) when fewer than three members remain. Not yet built: filing an
 issue when an episode lasts a second pass.
 
+## Stale merge refs
+
+GitHub runs a `pull_request` workflow on `refs/pull/<n>/merge`, the head
+merged into the base as it stood then. GitHub rebuilds that ref when the base
+moves, but nothing reruns the checks, so a red measured on the old merge
+commit stays red. Age and base movement are not evidence of that, since a
+real failure is often old too. The evidence is the run itself. After every
+row has its token, the steward re-reads a `required_failed:<contexts>` row as
+`stale_merge_ref:<contexts>` only when all of these hold:
+
+- each red context's failing run is a GitHub Actions `pull_request` run of
+  this pull request at its current head;
+- the base each run was tested on (the run's recorded pull-request base sha)
+  is not the first parent of the pull request's current `merge_commit_sha`:
+  the red was measured on a merge commit that no longer exists;
+- each of those contexts is green on the base tip (the read red-main triage
+  makes); red, unread or never run there leaves the row alone;
+- the approval gate approves the exact head.
+
+A red on the current merge ref is never stale, however old. A plain BEHIND
+pull request never reads this token (it is not red; the merge queue tests it
+on top of the base), and neither does a DIRTY one (`merge_state:DIRTY` has no
+act). Reads happen only for red rows with an Actions run behind each red
+context: one pull-request read, one commit read and one run read per red run,
+at most five pull requests per pass, and the verdict is kept in the steward
+ledger, so the same red is not read again until the head or the runs change
+(a "not stale" verdict is re-read after six hours, since GitHub may rebuild the
+ref). A failed read leaves the row's token as it was.
+
+The dwell pass then retriggers it (`stale_merge_ref` below) through `shipyard
+advance --retrigger`, which closes and reopens the pull request after its own
+checks and audits the act. Before that, the steward re-reads the pull request
+and its merge-queue state and refuses a moved head, a fork, a draft, a DIRTY
+head, a queued entry and an armed one. At most one retrigger succeeds per
+head, ever, and at most three are attempted per head: these marks outlive the
+14-day act-record TTL, because a reopen keeps the head. A `done` act is final,
+a `failed` one (it started and did not finish, its answer was unreadable, or it
+timed out) is never retried, and a `blocked` one (a guard refused the close,
+reported as `retrigger_blocked: guard`, or this build has no `advance`
+command, `retrigger_blocked: advance_unavailable`) changed nothing and is
+retried only after a day, then two. `pr-close-guard` refuses every such close
+until it learns the nonce-bound allowance proposed with `shipyard advance`;
+until then each stale pull request reads `retrigger_blocked: guard` in its act
+outcome and escalates to the feed.
+
 ## Dwell-time limits and the next-to-admit ranking
 
 A pull request should never sit in one state for hours with nobody told. Each
@@ -707,6 +801,7 @@ required_never_ran = 30         # dispatch the mapped workflow once
 approved_green_not_queued = 5   # ready / admission_pending: evaluated first next pass
 carries_unapproved = 60         # escalate only
 stacked_base_merged = 10        # stacked on a merged base: retarget once
+stale_merge_ref = 10            # approved, red on a stale merge ref: retrigger once
 act = "shadow"                  # "apply" runs the GitHub-writing acts; "off" runs none
 max_acts_per_pass = 3           # GitHub-writing acts per repository per pass
 max_escalations_per_pass = 25
@@ -727,6 +822,7 @@ head, head branch in the base repository, never a fork):
 | `stale_verdict_check` | re-run the `review-verdict` run the required rule selects | that run is completed and red with none newer or running, and the approval gate, read live, returns an exact-head approval (`NotRequired` or any refusal, a HOLD above all, refuses) |
 | `required_never_ran` | `gh workflow run <file> --ref <head branch>` for each mapped context | the live head is the one observed |
 | `approved_green_not_queued` | evaluate it first in the next pass's admission (after the deferral carry) | none: it only reorders the steward's own admission, which keeps every gate |
+| `stale_merge_ref` | run this binary's `shipyard advance OWNER/REPO#N --retrigger --head <sha> --json` as agent `shipyard-merge-steward`, at most once per head ever | open at the observed head, not a fork, not a draft, not DIRTY, not queued, not armed, and the approval gate, read live, approves it; then every refusal `advance` applies, and its writes go through `ghapp` and its guards |
 | `stacked_base_merged` | retarget it to the steward's base | the pull request is unchanged; its `stacked:<n>` parent merged into the steward's base from exactly the branch it is based on; and that branch still points at the parent's merged head, so nothing unlanded is carried |
 
 `done` and `failed` are final at that head (a `failed` act was attempted and

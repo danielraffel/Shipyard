@@ -87,6 +87,19 @@ as `hold-condition:` lines so it can be released this way. Gotcha:
 `docs/advance.md` lands; the refusal changes nothing. Defect dequeues keep
 their own path. Full reference: `docs/advance.md`.
 
+## Stale merge refs: `stale_merge_ref`
+
+An approved pull request whose required checks went red on a test merge
+commit that no longer exists reads `stale_merge_ref:<contexts>` (actor
+`steward`): each red run is a `pull_request` run of the head whose tested base
+is not the base of the current `merge_commit_sha`, and the same contexts are
+green on the base tip. A red on the current merge ref never reads it, however
+old; BEHIND and DIRTY never do. Do not push to "refresh" it and do not close
+and reopen it by hand: the dwell pass runs `shipyard advance --retrigger` for
+it, at most once per head ever. An act outcome `retrigger_blocked: guard`
+means pr-close-guard refused the close and nothing changed. Full reference:
+`docs/automated-draining.md`, "Stale merge refs".
+
 ## Durable work-item contract
 
 Shipyard's existing ShipState/lease/receipt primitives are the source of
@@ -711,6 +724,21 @@ is one config value, `[governance.updates].bot` (default `dependabot`, 7-day
 cooldown, limit 1); the lockfile mode is `[governance.lockfile].mode`
 (`advisory` until promoted). The audit's workflow checks are textual: a
 version comment after a SHA must look like `# v1.2.3`.
+
+## An adversarial ruling is stamped like a verdict and counted by nothing
+
+A comment whose last line is exactly `adversarial-ruling: OK|FIX-FIRST|BLOCK
+head:<40 lowercase hex>` gets the same `<!-- session: ... -->` stamp a verdict
+gets (so the handbook's must-review can trust who ruled), and `ghapp` refuses
+to post one the stamper did not answer for, "verdict or ruling NOT posted,
+retry". It is not a verdict: `marker_verdict` in `ghapp_queue_arm_guard.py`,
+`review_verdict_status.py`, `src/head_approval.rs`, the hold hook, the
+contradiction guard and the claim guard all read `verdict:` / `reviewed:`
+lines only, so a ruling can neither approve nor hold a head. When adding a
+reader of verdict lines, keep it on `marker_verdict` (or the Rust twin); never
+match on `head:<sha>` alone, or a ruling would count. Tests:
+`AdversarialRulingIsNoVerdict` (arm guard), the `Stamp` ruling cases (stamper),
+`an_adversarial_ruling_is_never_a_verdict` (Rust).
 
 ## merge-guard is versioned and tested here
 
@@ -2413,6 +2441,7 @@ a missing macOS `.dmg` — run `gh auth login` (or export `GITHUB_TOKEN`) and re
 To raise the quota above the ambient `gh` user token's 5,000/hr, point
 `[github.auth]` at a GitHub App installation token helper
 (`scripts/shipyard-github-app-token`) for the 12,500/hr installation bucket.
+The helper retries a dropped connection (`RemoteDisconnected`, `ConnectionResetError`, `IncompleteRead`, a read timeout) with the same bounded delays as a 502/503/504, then fails with a plain `GitHub API request failed` error, not a traceback.
 Put the block in the **global** config dir (find it with `shipyard paths`;
 macOS `~/Library/Application Support/shipyard/config.toml`) to cover every repo
 on the machine — not the tracked project config. A tracked layer may not set
@@ -3870,6 +3899,7 @@ UTC), and each repository carries `blocked_summary` (counts per token and the
 three oldest blocked rows with `age_minutes`). Read those instead of inferring
 the state from `mutation`: `waiting_head_approval` alone does not say whether
 nobody reviewed the head, a reviewer holds it, or its approval is excluded.
+A row with an `error` also carries `error_kind`: `read` (a 5xx, timeout, dropped connection or rate limit while reading; the next pass retries it, so treat the row as unobserved, not refused) or `policy` (a decision or a failed action). The steward tick logs the first as `read_deferred=` and the second as `pr_refused=`.
 The full token list is in `docs/automated-draining.md`. Each row also carries
 `next_action` (`actor`, `action`, `stop`), and `shipyard wait pr <n> --state
 actionable --timeout <s> --json` gives one pull request that answer live and
@@ -4585,7 +4615,7 @@ asks for an arm the verdict allows. An approval comment stamped (by `ghapp`) wit
 landing; a shared session alone never refuses, and unstamped verdicts count
 as before. `shipyard who --contact N` names and probes the cmux address of the session
 that owns PR N (`shipyard owner register|release`; `shipyard relay` delivers
-PR events to it, docs/owner-relay.md). `shipyard who --pr N` names the host and session (and agent, when
+PR events to it, docs/owner-relay.md; `relay::derive_events` never emits a red `required_check` while the PR is `in_queue`, and an ejection at the same head names the red instead). `shipyard who --pr N` names the host and session (and agent, when
 recorded) behind each
 queue and merge event from the guards' ledgers on every host. `shipyard
 review-verdict --pr N [--head SHA] --json` gives the same decision with the
@@ -5934,6 +5964,34 @@ detector, then text, lowest number on a tie; a PR that rode a failing group is
 never chosen), its CI is prioritized only while a non-approval required check
 has not completed, and a dry-run hold never jumps. `base-health --act` is the
 manual path; leave `auto_jump` driving the steward alone so one writer jumps.
+`src/app/merge_steward_cmd/merge_group_stall.rs`: for each queue entry
+whose `merge_group_heads` sha has no active run in the census, three reads
+(`actions/runs?head_sha=`, `commits/<sha>/check-runs`, `commits/<sha>/statuses`;
+a second page or a failed read makes it unread). `judge`: any run not
+completed is `Running`; required contexts absent (check run or status from the
+rule's app) are `Stalled` at once with `doomed` when a failed run produces one
+(normalized workflow name or file stem equals the context, or
+`[base_health.control_workflows]` names its file), else after
+`STALL_MINUTES` (30) since the last run completed. Rows get
+`merge_group_stalled:<contexts>`; report `merge_group_stalled.lines` carry
+`merge-group-stalled ...` (drain watch kind `merge_group_stalled`).
+`[merge_queue] dequeue_doomed_groups` (`EjectionGuards::dequeue_doomed_groups`,
+default dry-run with a merge queue, typo keeps dry-run in
+`dequeue_doomed_groups_error`): `decide` dequeues doomed entries only, after a
+GraphQL re-read binds PR head and group head, via `dequeue_under_guard`
+(audit `defect-fix`) under the PR mutation guard, then one comment; ledger
+`doomed_dequeues` (`repo#pr@group`) makes it once per group head, failed
+outcomes retry, `retry_comments` reposts a failed comment.
+`defect_fix_removals.rs`: reads `$XDG_STATE_HOME/shipyard/queue-removals.jsonl`
+(the ghapp queue-removal guard's ledger; `targets[{repo,pr,head}]`) once per
+pass into `StallPass.defect_fix`; a `defect-fix` removal of the exact head
+refuses `mutate_pr_with_recovery` for `ArmMergeQueue` (census head before any
+read, live head after revalidation) and drops the row from the native-arm
+backstop's reports; rows read `defect_fix_removed:<reason>`, actor repair.
+Missing file = no record; unreadable = honour `StewardLedger.removal_ledger`
+(last good read) and, within `FRESH_ERROR_MINUTES` (30) of it, hold a head
+whose latest queue removal is after that read (`defect_fix_ledger_unjudged`,
+one queue-state read). The doomed-group dequeue appends its own line.
 `src/app/merge_steward_cmd/poison_pause.rs` adds a queue pause behind its
 own key, `[base_health] merge_group_pause` (default `dry-run`: reports
 `would_pause` and removes nothing; it removes entries only when it and the
