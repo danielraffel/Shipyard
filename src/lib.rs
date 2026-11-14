@@ -138,6 +138,8 @@ pub mod github_read;
 pub mod governance;
 /// Read-only supply-chain compliance audit against a governance profile.
 pub mod governance_audit;
+/// Design A governance onboarding planner and fail-closed guards.
+pub mod governance_onboard;
 /// Arm native auto-merge only on a head a reviewer approved.
 pub mod head_approval;
 /// Optional host-health pre-dispatch gate (reads the `host_vitals` signal).
@@ -169,6 +171,9 @@ pub mod landability;
 pub mod landing;
 /// Advisory-vs-required lane policy resolution.
 pub mod lane_policy;
+/// Routes launchd jobs through `ShipyardLauncher.app` once a host activates it.
+#[cfg(unix)]
+pub mod launcher_app;
 /// Bounded log rotation, terminal classification, and retention primitives.
 pub mod log_retention;
 /// Merge-queue enqueue / poll / eviction supervision engine.
@@ -276,6 +281,7 @@ pub mod recovery_worker;
 pub mod registrar;
 /// PR event relay: deliver pull-request events to the owning session.
 pub(crate) mod relay;
+pub mod release_canary;
 /// Canonical identity of a watched repository after a rename or transfer.
 pub mod repo_slug;
 /// Read and write one GitHub Actions repository variable.

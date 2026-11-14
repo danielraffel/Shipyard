@@ -3995,3 +3995,97 @@ fn a_dry_evaluation_judges_carries_without_logging_them() {
     assert_eq!(rows[1]["kind"], "merge");
     assert_eq!(rows[2]["kind"], "rebase");
 }
+
+#[test]
+fn the_base_fleet_review_switch_requires_review_off_the_compiled_list() {
+    let on: toml::Table = "[auto_merge]\nfleet_review_required = true\n"
+        .parse()
+        .expect("toml");
+    for host_default in [false, true] {
+        let policy =
+            ApprovalPolicy::from_table_for_repo(&on, "danielraffel/not-listed", host_default);
+        assert!(policy.required, "host_default={host_default}");
+        assert!(
+            policy.any_reviewer_but_author,
+            "host_default={host_default}"
+        );
+    }
+    let strict_off: toml::Table =
+        "[auto_merge]\narm_requires_head_approval = false\nfleet_review_required = true\n"
+            .parse()
+            .expect("toml");
+    assert!(
+        ApprovalPolicy::from_table_for_repo(&strict_off, "danielraffel/not-listed", false).required
+    );
+    let strict_on: toml::Table = "[auto_merge]\narm_requires_head_approval = true\nreviewer_identities = [\"reviewer\"]\nfleet_review_required = true\n"
+        .parse()
+        .expect("toml");
+    let policy = ApprovalPolicy::from_table_for_repo(&strict_on, "danielraffel/not-listed", false);
+    assert!(policy.required);
+    assert!(!policy.any_reviewer_but_author);
+    assert_eq!(policy.reviewer_logins, ["reviewer"]);
+    for silent in [
+        "[auto_merge]\nfleet_review_required = false\n",
+        "[auto_merge]\n",
+    ] {
+        let table: toml::Table = silent.parse().expect("toml");
+        let policy = ApprovalPolicy::from_table_for_repo(&table, "danielraffel/not-listed", false);
+        assert!(!policy.required, "{silent}");
+        assert!(!policy.any_reviewer_but_author, "{silent}");
+    }
+}
+
+#[test]
+fn a_non_boolean_fleet_review_switch_is_refused() {
+    for value in ["\"yes\"", "1", "[]"] {
+        let table: toml::Table = format!("[auto_merge]\nfleet_review_required = {value}\n")
+            .parse()
+            .expect("toml");
+        assert!(
+            super::fleet_review_required_shape(&table).is_err(),
+            "{value}"
+        );
+    }
+    let table: toml::Table = "[auto_merge]\nfleet_review_required = true\n"
+        .parse()
+        .expect("toml");
+    assert!(super::fleet_review_required_shape(&table).is_ok());
+}
+
+/// A string `"true"` (or any non-boolean) for `fleet_review_required` read
+/// from the base is an unreadable policy, never a switch that reads as off.
+#[test]
+fn a_non_boolean_fleet_review_switch_on_the_base_is_unreadable() {
+    super::with_host_review_default(true, || {
+        let typo = |argv: &[String]| -> Result<String, String> {
+            let joined = argv.join(" ");
+            if joined.contains("contents/.shipyard/config.toml") {
+                Ok("[auto_merge]\nfleet_review_required = \"true\"\n".to_owned())
+            } else if joined.contains("/branches/") {
+                Ok("main\n".to_owned())
+            } else {
+                Err(format!("unexpected: {joined}"))
+            }
+        };
+        let error = super::read_policy_required(&typo, "danielraffel/not-listed", "main")
+            .expect_err("a string switch is unreadable");
+        let detail = String::from(error);
+        assert!(
+            detail.contains("fleet_review_required must be a boolean"),
+            "{detail}"
+        );
+        let on = |argv: &[String]| -> Result<String, String> {
+            let joined = argv.join(" ");
+            if joined.contains("contents/.shipyard/config.toml") {
+                Ok("[auto_merge]\nfleet_review_required = true\n".to_owned())
+            } else if joined.contains("/branches/") {
+                Ok("main\n".to_owned())
+            } else {
+                Err(format!("unexpected: {joined}"))
+            }
+        };
+        let policy = super::read_policy_required(&on, "danielraffel/not-listed", "main")
+            .expect("a boolean switch reads");
+        assert!(policy.required, "{policy:?}");
+    });
+}

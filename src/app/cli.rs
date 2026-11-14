@@ -192,6 +192,13 @@ pub(super) enum Command {
         #[command(subcommand)]
         command: GovernanceCommand,
     },
+    /// Daily read-only release-readiness canary for the next version.
+    #[command(name = "release-canary")]
+    ReleaseCanary {
+        /// Release-canary subcommand.
+        #[command(subcommand)]
+        command: ReleaseCanaryCommand,
+    },
     /// Guided `RELEASE_BOT_TOKEN` provisioning and diagnosis.
     #[command(name = "release-bot")]
     ReleaseBot {
@@ -3872,6 +3879,29 @@ pub(super) enum AuthConfigScope {
 }
 
 #[derive(Debug, Subcommand)]
+pub(super) enum ReleaseCanaryCommand {
+    /// Rehearse the next release on a clean checkout of the base branch.
+    ///
+    /// Reads `[release.canary]` from the current repo's config; an absent
+    /// section is a no-op. Exits 0 on pass or skip, 1 when the canary fails,
+    /// 2 on an infrastructure error.
+    Run {
+        /// owner/name; detected from the git remote when omitted.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Branch to clone and rehearse.
+        #[arg(long, default_value = "main")]
+        base: String,
+        /// Run at most once per UTC day (an infrastructure error retries hourly).
+        #[arg(long)]
+        daily: bool,
+        /// Open, update or close the tracking issue. Without it, report only.
+        #[arg(long)]
+        apply: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 pub(super) enum ChangelogCommand {
     /// Rebuild CHANGELOG.md from the configured tag graph.
     Regenerate {
@@ -3918,6 +3948,39 @@ pub(super) enum BranchCommand {
 
 #[derive(Debug, Subcommand)]
 pub(super) enum GovernanceCommand {
+    /// Print the read-only Design A onboarding plan for one repository.
+    /// `--apply` is not implemented yet and refuses.
+    Onboard {
+        /// Repository to onboard.
+        #[arg(long = "repo", value_name = "OWNER/NAME")]
+        repo: String,
+        /// Artifact-producing repository profile.
+        #[arg(long, value_parser = ["fleet", "builder"], default_value = "fleet")]
+        profile: String,
+        /// Existing CI context to require. Repeatable.
+        #[arg(long = "require-check")]
+        require_checks: Vec<String>,
+        /// Last onboarding step the plan includes.
+        #[arg(long, value_parser = ["preflight", "pr", "approved", "green", "merged", "tightened", "evaluated", "verified", "handed_over", "audited", "enrolled"])]
+        through: Option<String>,
+        /// Alias for --through audited.
+        #[arg(long, conflicts_with = "through")]
+        no_enroll: bool,
+        /// `[auto_merge] reviewer_signers` entry to render. Repeatable;
+        /// defaults to the base's own list.
+        #[arg(long = "reviewer-signer", value_name = "NAME")]
+        reviewer_signers: Vec<String>,
+        /// `[auto_merge] reviewer_stamp_sessions` glob to render. Repeatable;
+        /// defaults to the base's own list.
+        #[arg(long = "stamp-session", value_name = "GLOB")]
+        stamp_sessions: Vec<String>,
+        /// gh-compatible CLI used for the reads (for example ghapp or ghread).
+        #[arg(long = "gh-binary", value_name = "PATH")]
+        gh_binary: Option<PathBuf>,
+        /// Not implemented yet: refuses before any read or write.
+        #[arg(long)]
+        apply: bool,
+    },
     /// Report declared-vs-live governance drift per branch.
     Status {
         /// Branches to check. Defaults to main.

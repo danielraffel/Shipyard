@@ -5566,6 +5566,34 @@ launch is speculative, and a busy host can defer it indefinitely (`runs = 0`,
 `pended nondemand spawn = speculative`), which the probe wait would otherwise
 misreport as an unanswered privacy prompt.
 
+The daemon launcher covers only the daemon, and it is a bare binary, so its
+grant is tied to its path. `ShipyardLauncher.app` (`tools/shipyard-launcher`,
+`src/launcher_app.rs`) is one bundle identity (`com.danielraffel.shipyard.launcher`
+plus the Developer ID team) for every Shipyard launchd job, which survives
+rebuilds. It verifies the release `~/.local/bin/shipyard` resolves to
+(Developer ID, its own team, identifier `shipyard`; checked again on the
+suspended child) and spawns it, never execs it. Routing is gated on the
+launcher's own `--launcher-active` verdict, never on the activation file: the
+record (written by `shipyard-launcher-check --activate`, which fleet-deploy
+runs once the owner granted Full Disk Access) must name this exact bundle
+(path, identifier, team, cdhash), and the grant must be confirmed within an
+hour or reconfirmed without a prompt; a revoked grant demotes the record.
+While active: a launchd job whose program is the release binary (parent 1,
+`XPC_SERVICE_NAME` set, same file as the pointer) `exec`s the bundle with the
+same argv at startup (the check is bounded at 45 s, and a failed `exec` falls
+back to running directly), and the installed steward tick `exec`s `shipyard-launcher --launcher-script
+steward-tick`. `exec` *into* the bundle is what moves the identity: the pid
+stays the job's responsible process and now runs the bundle. When the
+launcher is missing or not active, everything runs directly as before, so an
+ungranted launcher never prompts.
+Routing decisions go to `~/Library/Logs/shipyard-launcher.log` and the tick's
+`launcher=app|direct` summary token. The daemon and its supervisor are never
+routed: the daemon agent keeps its stable launcher copy as its program, so a
+missing or refusing launcher can never keep a KeepAlive restart down. The
+team is pinned (`95CX6P84C4`) in both the launcher and the check tool, never
+read from `~/.local/bin/shipyard`; fleet-deploy refuses to install or
+activate a bundle older (CFBundleVersion) than the highest it installed.
+
 A launcher host changes the daemon's parent: it is the resident launcher, not
 launchd (1). Any check that the production daemon "is still launchd-owned"
 must accept both shapes and nothing else. The Sandbox E2E M3 invariant does
@@ -6329,6 +6357,15 @@ while the later PR's listed head is approved with no HOLD, or once the shared
 commits are on the base. A later PR whose head merely contains the earlier
 head gets no shortcut: ancestry cannot say which PR introduced a shared commit.
 
+## Release-readiness canary
+
+`[release.canary]` in a repo's `.shipyard/config.toml` opts it into a daily,
+read-only rehearsal of the next release (`shipyard release-canary run`): the
+configured `command` (`{next_version}` / `{next_tag}` placeholders) runs on a
+clean clone of `main`; a failure opens or edits one `release canary: vX.Y.Z
+would fail` issue and a later pass closes it. The steward tick runs it daily per
+fleet repo. Full config and exit codes are in the `ci` skill.
+
 ## Skill-sync gotcha
 
 Changes to Shipyard steward behavior must carry this note or a reviewed skill-sync exception so the version-and-skill gate records the operational impact.
@@ -6340,3 +6377,15 @@ note. Path matches are additive: the explicit `src/changelog.rs` and
 explicit paths mapped to another skill, such as the external-contributor
 review documents, remain governed by that mapping. `scripts/skill_path_map.json`
 is the map.
+
+### `governance onboard`
+
+`shipyard governance onboard --repo OWNER/NAME` prints a read-only plan:
+preflight, render hashes, bounded waits, observed rulesets and the per-PR
+review-verdict sweep. `--apply` is not implemented yet and refuses; the plan
+performs GET requests only and stops with exit 9 on any failed read. The
+protected base may enable `[auto_merge] fleet_review_required = true`, which
+requires review exactly as `REVIEW_REQUIRED_REPOS` membership does, in both
+the Rust policy and `ghapp_queue_arm_guard.py`; the compiled list remains a
+floor. The rendered onboarding PR is limited to the two review-verdict
+workflows and the named config keys.

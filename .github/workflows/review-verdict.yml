@@ -5,7 +5,7 @@
 # green on a refused head. The status itself is `pending` while a head only
 # awaits its reviewer and `failure` for a real refusal.
 #
-# Every trigger here runs the default branch's definition of this file:
+# All triggers run the default branch's definition of this file:
 # pull_request_target and issue_comment always do, and a review reaches it
 # through workflow_run of the permission-less "Review verdict trigger". The
 # job checks out the default branch and never the pull request's code.
