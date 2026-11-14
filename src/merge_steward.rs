@@ -832,11 +832,18 @@ pub fn is_review_gate(name: &str, approval_context: &str) -> bool {
 /// APPROVEs of head <head> ...", `no_verdict` for "no reviewer verdict
 /// names head <head>" or "awaiting reviewer verdict for head <head>". Any
 /// other text, a description that names another head, or one that mentions a
-/// HOLD returns `None`, so the status stays red (fail closed).
+/// HOLD in any case (`hold`, `held by`) returns `None`, so the status stays
+/// red (fail closed).
 #[must_use]
 pub fn review_waiting(description: &str, head: &str) -> Option<&'static str> {
     let text = description.trim();
-    if text.contains("HOLD") {
+    // Any HOLD, in any case ("HOLD", "hold", "held by ..."), is never a wait.
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("held by")
+        || lower
+            .split(|ch: char| !ch.is_ascii_alphanumeric())
+            .any(|word| word == "hold" || word == "holds")
+    {
         return None;
     }
     let names_head = |rest: &str| {

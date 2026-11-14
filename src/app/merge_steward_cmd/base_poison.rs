@@ -240,20 +240,6 @@ pub(super) fn admission(poison: Option<&RepoPoison>, pr: u64) -> Admission {
     }
 }
 
-/// The required contexts merge-group poison is judged on: every one but the
-/// review statuses ([`crate::merge_steward::is_review_gate`]), which are red
-/// per pull request by nature and never evidence that the base is broken.
-pub(super) fn judged_contexts(
-    required: &[crate::merge_steward::RequiredCheck],
-    approval_context: &str,
-) -> Vec<crate::merge_steward::RequiredCheck> {
-    required
-        .iter()
-        .filter(|rule| !crate::merge_steward::is_review_gate(&rule.context, approval_context))
-        .cloned()
-        .collect()
-}
-
 /// Read the merge groups for this pass, and the named fixes when poisoned.
 /// `None` when the base does not ask for it.
 pub(super) fn observe(
@@ -267,7 +253,10 @@ pub(super) fn observe(
         return None;
     }
     let run_gh = |argv: &[String]| actions.run_gh(argv).map_err(|error| error.to_string());
-    let judged = judged_contexts(&observation.required_checks, &policy.approval_context);
+    // Every required context is judged. Merge groups are read from their
+    // check runs only, so a review status (which only waits on reviewers)
+    // never poisons a group, while a crashing review check run still does.
+    let judged = observation.required_checks.clone();
     let health = merge_group::read(&run_gh, &observation.repo, &observation.base, &judged, now);
     let poisoned = health.poisoned_contexts();
     let (mut fixes, fix_read_error) = if poisoned.is_empty() {

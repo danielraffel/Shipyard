@@ -683,13 +683,16 @@ fn review_statuses_waiting(
         if !crate::merge_steward::is_review_gate(context, &policy.approval_context) {
             return None;
         }
+        // Only a status bound to the app its rule names is trusted: a rule
+        // with no app binding would accept a status any writer posted, so it
+        // never reads as waiting (the row stays `required_failed`).
         let app_id = policy
             .required_checks
             .iter()
             .find(|required| required.context.eq_ignore_ascii_case(context))
-            .and_then(|required| required.app_id);
+            .and_then(|required| required.app_id)?;
         let description =
-            crate::merge_steward::approval_status_description(&pr.checks, context, app_id)?;
+            crate::merge_steward::approval_status_description(&pr.checks, context, Some(app_id))?;
         let why = crate::merge_steward::review_waiting(description, &pr.head_sha)?;
         details.push(format!("{context}: {why} ({})", description.trim()));
     }

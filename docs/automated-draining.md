@@ -719,11 +719,15 @@ diagnosed groups by the check alone, and never joins a named test's group. A
 group of three or more distinct pull requests is an episode. The approval check
 (`review-verdict`) never groups. It adds no GitHub reads.
 
-Review statuses (`review-verdict`, `post-review-verdict`,
-`release-path-review`, and the configured approval context) never count:
-they are red per pull request (no verdict yet, approvals missing, a HOLD),
-so many of them red at once is reviewer throughput, not the base. The same
-statuses are left out of merge-group poison detection.
+A review status (`review-verdict`, `post-review-verdict`,
+`release-path-review`, or the configured approval context, posted as a
+commit status by the app its rule names) whose own description says it only
+waits on reviewers at this head ("needs N counted APPROVEs", "awaiting
+reviewer verdict") never counts: many of them red at once is reviewer
+throughput, not the base. A failing review check run (a crashing review
+workflow), or a review status with any other description, still counts.
+Merge-group poison is read from check runs only, so a waiting review status
+never poisons a group while a crashing review check run still does.
 
 ```toml
 [auto_merge]

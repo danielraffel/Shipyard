@@ -564,19 +564,23 @@ fn an_episode_that_drops_under_three_unchanged_members_ends() {
 }
 
 /// Vellum #415, #418, #419, #423: `release-path-review` red on four pull
-/// requests is reviewer throughput, never a base-level episode. A genuine
-/// red check on three or more still groups.
+/// requests only because approvals are missing is reviewer throughput, never
+/// a base-level episode. A genuine red check on three or more still groups.
 #[test]
-fn review_statuses_red_on_many_prs_are_never_a_base_level_episode() {
-    let review = |number: u64| {
+fn waiting_review_statuses_on_many_prs_are_never_a_base_level_episode() {
+    let waiting = |number: u64| {
         let mut check = failed("release-path-review", number);
         check.source = StewardCheckSource::StatusContext;
+        check.description = Some(format!(
+            ".github/workflows/x.yml and 1 more: needs 2 counted APPROVEs of head {} from different signers and sessions; has 0",
+            &head(number)[..12]
+        ));
         check
     };
     let mut obs = observation(
         [415_u64, 418, 419, 423]
             .into_iter()
-            .map(|n| observed(n, head(n), vec![review(n)]))
+            .map(|n| observed(n, head(n), vec![waiting(n)]))
             .collect(),
     );
     obs.required_checks.push(RequiredCheck {
@@ -586,9 +590,54 @@ fn review_statuses_red_on_many_prs_are_never_a_base_level_episode() {
     let ledger = StewardLedger::default();
     assert!(
         reds(&obs, &ledger, "review-verdict", &[]).is_empty(),
-        "a review status is never counted"
+        "a waiting review status is never counted"
     );
     let real = three_red_prs();
     let groups = super::group(&reds(&real, &ledger, "review-verdict", &[]));
     assert_eq!(groups.len(), 1, "a genuine red check still groups");
+}
+
+/// A crashing review workflow is a base-level cause: a failing review CHECK
+/// RUN, or a review status whose description is not a waiting shape (a crash
+/// message), still counts toward the episode.
+#[test]
+fn a_crashing_review_check_or_unknown_review_status_still_groups() {
+    let ledger = StewardLedger::default();
+    let required = |obs: &mut RepoObservation, context: &str| {
+        obs.required_checks.push(RequiredCheck {
+            context: context.to_owned(),
+            app_id: Some(15_368),
+        });
+    };
+    // post-review-verdict as a failing check run on three PRs.
+    let mut crashed_runs = observation(
+        [1_u64, 2, 3]
+            .into_iter()
+            .map(|n| observed(n, head(n), vec![failed("post-review-verdict", n)]))
+            .collect(),
+    );
+    required(&mut crashed_runs, "post-review-verdict");
+    let groups = super::group(&reds(&crashed_runs, &ledger, "review-verdict", &[]));
+    assert_eq!(groups.len(), 1, "a crashing review check run groups");
+    // release-path-review as a status with a crash message on three PRs.
+    let crash = |number: u64| {
+        let mut check = failed("release-path-review", number);
+        check.source = StewardCheckSource::StatusContext;
+        check.description =
+            Some("Traceback (most recent call last): KeyError 'codeowners'".to_owned());
+        check
+    };
+    let mut crashed_status = observation(
+        [4_u64, 5, 6]
+            .into_iter()
+            .map(|n| observed(n, head(n), vec![crash(n)]))
+            .collect(),
+    );
+    required(&mut crashed_status, "release-path-review");
+    let groups = super::group(&reds(&crashed_status, &ledger, "review-verdict", &[]));
+    assert_eq!(
+        groups.len(),
+        1,
+        "an unrecognised review status description groups"
+    );
 }

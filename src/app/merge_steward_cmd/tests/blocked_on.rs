@@ -1623,3 +1623,48 @@ fn a_hold_stays_a_hold_beside_approvals_missing() {
     );
     assert_eq!(stall.blocked_on, "held:review-verdict");
 }
+
+/// A HOLD in a review status's own description (here release-path-review and
+/// post-review-verdict, in any case) is never a wait: the row stays red.
+#[test]
+fn a_hold_in_a_review_status_description_stays_red() {
+    let policy = app_bound_policy(&["release-path-review", "post-review-verdict"]);
+    for (context, description) in [
+        (
+            "release-path-review",
+            "x: needs 2 counted APPROVEs of head aaaaaaaaaaaa; HOLD by pulp-review",
+        ),
+        (
+            "post-review-verdict",
+            "x: needs 2 counted APPROVEs of head aaaaaaaaaaaa; held by infra-review2",
+        ),
+    ] {
+        let mut pr = pr_with(9, &[], "BLOCKED", &json!([]));
+        pr.fact.checks.push(status(context, description));
+        let label = format!("{context} (app_id=15368)");
+        assert_eq!(
+            classify_failed(&pr, &policy, &[label.as_str()]).blocked_on,
+            format!("required_failed:{context}"),
+            "{description}"
+        );
+    }
+}
+
+/// A rule with no app binding accepts a status any writer could post, so a
+/// waiting-shaped description there is never trusted: `required_failed`.
+#[test]
+fn an_unbound_review_rule_never_reads_as_awaiting_review() {
+    let mut policy = app_bound_policy(&["release-path-review"]);
+    policy.required_checks[0].app_id = None;
+    let mut pr = pr_with(415, &[], "BLOCKED", &json!([]));
+    let mut forged = status(
+        "release-path-review",
+        "x: needs 2 counted APPROVEs of head aaaaaaaaaaaa from different signers and sessions; has 0",
+    );
+    forged.app_id = None;
+    pr.fact.checks.push(forged);
+    assert_eq!(
+        classify_failed(&pr, &policy, &["release-path-review"]).blocked_on,
+        "required_failed:release-path-review"
+    );
+}

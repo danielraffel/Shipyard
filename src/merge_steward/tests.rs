@@ -1713,12 +1713,23 @@ fn review_status_descriptions_that_only_wait_on_reviewers() {
     );
     for red in [
         "a HOLD naming head bc24e3defdf4 makes it un-approvable",
+        "x: needs 2 counted APPROVEs of head bc24e3defdf4; on hold until the owner decides",
+        "x: needs 2 counted APPROVEs of head bc24e3defdf4; held by pulp-review",
+        "awaiting reviewer verdict for head bc24e3defdf4 (Hold requested)",
         "x: needs 2 counted APPROVEs of head 0000000aaaaa from different signers; has 0",
         "release-path files changed without CODEOWNERS",
         "",
     ] {
         assert_eq!(review_waiting(red, head), None, "{red:?}");
     }
+    // A word that merely contains "hold" is not a HOLD.
+    assert_eq!(
+        review_waiting(
+            "x: needs 2 counted APPROVEs of head bc24e3defdf4; threshold 2",
+            head
+        ),
+        Some("approvals_missing")
+    );
     assert!(is_review_gate("release-path-review", "review-verdict"));
     assert!(is_review_gate("post-review-verdict", ""));
     assert!(is_review_gate("custom-approval", "custom-approval"));
