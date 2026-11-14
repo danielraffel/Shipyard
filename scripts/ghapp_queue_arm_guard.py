@@ -141,6 +141,7 @@ import posixpath
 import re
 import subprocess
 import sys
+import time
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 from types import ModuleType
@@ -3458,27 +3459,127 @@ def audit_override(message: str, **fields: Any) -> None:
 # ---------------------------------------------------------------------------
 
 
+READ_TIMEOUT_SECONDS = 30
+# A read that failed on the network or on GitHub's side is retried exactly
+# once, this long after. One HTTP 503 a pass apart made the guard refuse
+# pulp#12121 and #12123 as if their heads were unreviewed (Shipyard#1309); a
+# second failure is final, so the guard still fails closed.
+READ_RETRY_DELAY_SECONDS = 2.0
+# What gh prints for a failure that may not recur: a 502/503/504 from GitHub,
+# a dropped or reset connection, or a timeout. A 4xx is an answer, not a blip.
+_TRANSIENT_READ = re.compile(
+    r"HTTP 50[234]\b|RemoteDisconnected|Remote end closed|connection reset|ECONNRESET"
+    r"|unexpected EOF|EOF occurred|timed out|timeout|Timeout",
+)
+_MUTATION_WORD = re.compile(r"\bmutation\b", re.IGNORECASE)
+# `gh api` options that take a value in the next argument.
+_GH_API_VALUE_OPTIONS = frozenset((
+    "-X", "--method", "-f", "--raw-field", "-F", "--field", "-H", "--header", "--input",
+    "-q", "--jq", "-t", "--template", "--hostname", "--cache", "-p", "--preview",
+))
+
+
+def _is_method_override_header(value: str) -> bool:
+    """Treat GitHub method-override headers as writes even when the verb is GET."""
+    return value.partition(":")[0].strip().casefold() == "x-http-method-override"
+
+
+def read_only_gh_arguments(arguments: list[str]) -> bool:
+    """Whether ``arguments`` can only read GitHub, so repeating them is safe:
+    ``api``, no method other than GET, no ``--input`` body, and either no
+    fields at all or a ``graphql`` document that is a query, never a mutation
+    (``gh api`` sends fields with POST). A field value that starts with ``@`` is
+    read from a file the check cannot see, so it is never retried. Anything else is never retried."""
+    if not arguments or arguments[0] != "api":
+        return False
+    method: str | None = None
+    endpoint: str | None = None
+    fields: list[str] = []
+    headers: list[str] = []
+    previous = ""
+    for argument in arguments[1:]:
+        if previous in ("-X", "--method"):
+            method = argument.upper()
+        elif previous in ("-f", "--raw-field", "-F", "--field"):
+            fields.append(argument)
+        elif previous == "--input":
+            return False
+        elif previous in ("-H", "--header"):
+            headers.append(argument)
+        elif previous in _GH_API_VALUE_OPTIONS:
+            pass
+        elif argument.startswith("--method="):
+            method = argument.partition("=")[2].upper()
+        elif argument.startswith("-X") and argument != "-X":
+            method = argument[2:].upper()
+        elif argument.startswith(("--input=",)) or argument == "--input":
+            return False
+        elif argument.startswith("--header="):
+            headers.append(argument.partition("=")[2])
+        elif argument.startswith("-H") and argument != "-H":
+            headers.append(argument[2:])
+        elif argument.startswith(("--field=", "--raw-field=")):
+            fields.append(argument.partition("=")[2])
+        elif argument.startswith(("-f", "-F")) and argument not in ("-f", "-F"):
+            fields.append(argument[2:])
+        elif not argument.startswith("-") and endpoint is None:
+            endpoint = argument
+        previous = argument
+    if previous in _GH_API_VALUE_OPTIONS:
+        return False
+    if method not in (None, "GET"):
+        return False
+    if any(field.partition("=")[2].startswith("@") for field in fields):
+        return False
+    if any(_is_method_override_header(header) for header in headers):
+        return False
+    if not fields:
+        return True
+    if (endpoint or "").strip("/").split("?", 1)[0] != "graphql":
+        return method == "GET"
+    return not any(_MUTATION_WORD.search(field) for field in fields)
+
+
 def run_real_gh(arguments: list[str]) -> Any:
+    """``gh`` read as JSON, through the real binary and the App token.
+
+    A failure that reads as transient (``_TRANSIENT_READ``) on a request that
+    can only read (``read_only_gh_arguments``) is retried once after
+    ``READ_RETRY_DELAY_SECONDS``, with a note on stderr. A 4xx, a missing or
+    unrunnable ``gh``, a non-JSON answer, a request that could write, and
+    the retry's own failure are final: the guard fails closed as before."""
     real_gh = os.environ.get("GHAPP_REAL_GH", "/opt/homebrew/bin/gh")
-    try:
-        completed = subprocess.run(
-            [real_gh, *arguments],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-    except (OSError, subprocess.TimeoutExpired) as error:
-        raise GuardError(f"cannot read live PR state: {error}") from error
-    if completed.returncode != 0:
-        detail = completed.stderr.strip().splitlines()
-        raise GuardError(
-            "cannot read live PR state: " + (detail[-1] if detail else f"exit {completed.returncode}")
-        )
-    try:
-        return json.loads(completed.stdout)
-    except json.JSONDecodeError as error:
-        raise GuardError(f"live PR state was not JSON: {error}") from error
+    may_retry = read_only_gh_arguments(arguments)
+    for attempt in (1, 2):
+        try:
+            completed = subprocess.run(
+                [real_gh, *arguments],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=READ_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as error:
+            failure, transient = f"cannot read live PR state: {error}", True
+        except OSError as error:
+            raise GuardError(f"cannot read live PR state: {error}") from error
+        else:
+            if completed.returncode == 0:
+                try:
+                    return json.loads(completed.stdout)
+                except json.JSONDecodeError as error:
+                    raise GuardError(f"live PR state was not JSON: {error}") from error
+            detail = completed.stderr.strip().splitlines()
+            failure = "cannot read live PR state: " + (
+                detail[-1] if detail else f"exit {completed.returncode}")
+            transient = _TRANSIENT_READ.search(completed.stderr) is not None
+        if attempt == 1 and may_retry and transient:
+            print(f"queue-arm-guard: note: {failure}; a transient GitHub read, retrying once "
+                  f"in {READ_RETRY_DELAY_SECONDS:g}s", file=sys.stderr)
+            time.sleep(READ_RETRY_DELAY_SECONDS)
+            continue
+        raise GuardError(failure + (" (after one retry)" if attempt == 2 else ""))
+    raise GuardError("cannot read live PR state")  # unreachable; keeps the type checker honest
 
 
 def graphql(query: str, variables: dict[str, str]) -> Any:

@@ -3457,6 +3457,53 @@ class ShipyardReviewOnly(unittest.TestCase):
                          ("allowed", APPROVE_784_COMMENT, "pulp-review",
                           "shipyard merge-steward"))
 
+    def flaky(self, token: str, times: int) -> pathlib.Path:
+        """A gh that answers the first ``times`` calls carrying the exact argv
+        ``token`` with HTTP 503, then defers to the table-driven fake."""
+        counter = self.root / "flaky-count"
+        counter.unlink(missing_ok=True)
+        wrapper = self.root / "gh-flaky"
+        wrapper.write_text(
+            f"#!{sys.executable}\n"
+            "import os, subprocess, sys\n"
+            f"counter = {str(counter)!r}\n"
+            f"if {token!r} in sys.argv[1:]:\n"
+            "    n = int(open(counter).read()) if os.path.exists(counter) else 0\n"
+            "    open(counter, 'w').write(str(n + 1))\n"
+            f"    if n < {times}:\n"
+            "        sys.stderr.write('gh: Service Unavailable (HTTP 503)\\n'); sys.exit(1)\n"
+            f"sys.exit(subprocess.call([{str(self.root / 'gh')!r}, *sys.argv[1:]]))\n",
+            encoding="utf-8")
+        wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
+        return wrapper
+
+    def flaky_calls(self) -> int:
+        counter = self.root / "flaky-count"
+        return int(counter.read_text()) if counter.is_file() else 0
+
+    def test_a_read_blip_is_retried_once_and_a_second_failure_still_refuses(self) -> None:
+        # Shipyard#1309: one HTTP 503 on the pull-request read refused approved
+        # heads as if unreviewed. The guard now reads once more, two seconds
+        # later; a second failure is final and the landing stays refused.
+        signers = self.guards / "reviewer-signers.json"
+        signers.write_text(json.dumps({"default": ["pulp-review"]}), encoding="utf-8")
+        answers = self.approved_784(comments=self.signed("pulp-review"))
+        pull = "repos/danielraffel/Shipyard/pulls/784"
+        blip = self.land(answers, GHAPP_REAL_GH=str(self.flaky(pull, times=1)))
+        self.assertEqual(blip.returncode, 0, blip.stderr)
+        self.assertIn("queue-arm-guard: note: cannot read live PR state: gh: Service Unavailable "
+                      "(HTTP 503); a transient GitHub read, retrying once in 2s", blip.stderr)
+        self.assertEqual(self.flaky_calls(), 2, "the failed read and its one retry")
+        self.assertEqual(self.ledger()[-1]["verdict"], "allowed")
+        # Negative control: the retry fails too, so the guard fails closed,
+        # says so, and never reads a third time.
+        outage = self.land(answers, GHAPP_REAL_GH=str(self.flaky(pull, times=5)))
+        self.assertEqual(outage.returncode, 1, outage.stderr)
+        self.assertIn("cannot read live PR state: gh: Service Unavailable (HTTP 503) "
+                      "(after one retry)", outage.stderr)
+        self.assertEqual(self.flaky_calls(), 2, "exactly one retry, never a third read")
+        self.assertEqual(self.ledger()[-1]["verdict"], "refused")
+
     def test_a_signer_not_on_the_list_is_refused(self) -> None:
         signers = self.guards / "reviewer-signers.json"
         signers.write_text(json.dumps({"default": ["pulp-review"]}), encoding="utf-8")
@@ -4941,6 +4988,156 @@ class ReviewerClaimReviewGate(unittest.TestCase):
         self.assertFalse(allowed, message)
         self.assertIn("reviewer claim receipt refused", message)
         self.assertEqual(fix["cause"], "unreviewed")
+
+
+class TransientReadRetry(unittest.TestCase):
+    """``run_real_gh`` retries one transient failure of a read, then fails
+    closed (Shipyard#1309 item 3: a single 503 read as a policy refusal)."""
+
+    TRANSIENT = (
+        "gh: Service Unavailable (HTTP 503)\n",
+        "gh: HTTP 502: Bad Gateway (https://api.github.com/repos/o/r/pulls/1)\n",
+        "gh: Gateway Timeout (HTTP 504)\n",
+        "Post \"https://api.github.com/graphql\": http: server closed idle connection "
+        "(RemoteDisconnected)\n",
+        "read tcp 10.0.0.2:51234->140.82.112.6:443: read: connection reset by peer\n",
+        "net/http: TLS handshake timeout\n",
+    )
+    FINAL = (
+        "gh: Not Found (HTTP 404)\n",
+        "gh: Validation Failed (HTTP 422)\n",
+        "gh: Bad credentials (HTTP 401)\n",
+        "gh: You have exceeded a secondary rate limit (HTTP 403)\n",
+    )
+
+    def setUp(self) -> None:
+        self.sleeps: list[float] = []
+        for patch in (mock.patch.object(guard.time, "sleep", side_effect=self.sleeps.append),
+                      mock.patch.dict(os.environ, {"GHAPP_REAL_GH": "/nonexistent/gh"})):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.stderr = io.StringIO()
+        redirect = contextlib.redirect_stderr(self.stderr)
+        redirect.__enter__()
+        self.addCleanup(redirect.__exit__, None, None, None)
+
+    @staticmethod
+    def done(code: int, stdout: str = "", stderr: str = "") -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess(["gh"], code, stdout, stderr)
+
+    @staticmethod
+    def timeout() -> subprocess.TimeoutExpired:
+        return subprocess.TimeoutExpired(["gh"], guard.READ_TIMEOUT_SECONDS)
+
+    def read(self, answers: list[Any], arguments: tuple[str, ...] = ("api", "repos/o/r/pulls/1")
+             ) -> tuple[Any, mock.MagicMock]:
+        with mock.patch.object(guard.subprocess, "run", side_effect=answers) as run:
+            try:
+                return guard.run_real_gh(list(arguments)), run
+            except guard.GuardError as error:
+                return error, run
+
+    def test_one_transient_failure_is_retried_and_the_retry_answers(self) -> None:
+        failures = [self.done(1, stderr=text) for text in self.TRANSIENT] + [self.timeout()]
+        for failure in failures:
+            with self.subTest(failure=getattr(failure, "stderr", failure)):
+                self.sleeps.clear()
+                value, run = self.read([failure, self.done(0, '{"ok": 1}')])
+                self.assertEqual(value, {"ok": 1})
+                self.assertEqual(run.call_count, 2)
+                self.assertEqual(run.call_args_list[0], run.call_args_list[1],
+                                 "the retry repeats the same read")
+                self.assertEqual(run.call_args.kwargs["timeout"], guard.READ_TIMEOUT_SECONDS)
+                self.assertEqual(self.sleeps, [guard.READ_RETRY_DELAY_SECONDS])
+        self.assertIn("queue-arm-guard: note: cannot read live PR state: gh: Service Unavailable "
+                      "(HTTP 503); a transient GitHub read, retrying once in 2s",
+                      self.stderr.getvalue())
+
+    def test_a_second_failure_still_refuses_and_says_it_retried(self) -> None:
+        for second in (self.done(1, stderr="gh: HTTP 502: Bad Gateway\n"), self.timeout()):
+            with self.subTest(second=second):
+                self.sleeps.clear()
+                error, run = self.read([self.done(1, stderr=self.TRANSIENT[0]), second])
+                self.assertIsInstance(error, guard.GuardError)
+                self.assertTrue(str(error).startswith("cannot read live PR state: "), error)
+                self.assertTrue(str(error).endswith(" (after one retry)"), error)
+                self.assertEqual(run.call_count, 2, "exactly one retry, never a third read")
+                self.assertEqual(self.sleeps, [guard.READ_RETRY_DELAY_SECONDS])
+
+    def test_an_answer_or_an_unrunnable_gh_is_never_retried(self) -> None:
+        cases: list[tuple[Any, str]] = [(self.done(1, stderr=text), text.strip())
+                                        for text in self.FINAL]
+        cases += [(FileNotFoundError(2, "No such file", "/nonexistent/gh"), "No such file"),
+                  (self.done(0, "not json"), "live PR state was not JSON")]
+        for failure, expected in cases:
+            with self.subTest(failure=failure):
+                error, run = self.read([failure, self.done(0, "{}")])
+                self.assertIsInstance(error, guard.GuardError)
+                self.assertIn(expected, str(error))
+                self.assertNotIn("after one retry", str(error))
+                self.assertEqual(run.call_count, 1)
+                self.assertEqual(self.sleeps, [])
+        self.assertEqual(self.stderr.getvalue(), "")
+
+    def test_only_a_request_that_can_only_read_is_retried(self) -> None:
+        reads = (
+            ("api", "repos/o/r/pulls/1"),
+            ("api", "--paginate", "--slurp", "repos/o/r/issues/1/comments?per_page=100"),
+            ("api", "graphql", "-f", "query=query($n:Int!){repository{pullRequest(number:$n){id}}}",
+             "-F", "number=1"),
+            ("api", "-H", "Accept: application/vnd.github.raw+json",
+             "repos/o/r/contents/.shipyard/config.toml?ref=main"),
+            ("api", "-X", "GET", "repos/o/r/pulls/1", "-f", "per_page=5"),
+            ("api", "--method=GET", "repos/o/r/pulls/1"),
+        )
+        writes = (
+            ("api", "-H", "X-HTTP-Method-Override: POST", "repos/o/r/pulls/1"),
+            ("api", "--header", "x-http-method-override: DELETE", "repos/o/r/pulls/1"),
+            ("api", "--header=X-HTTP-METHOD-OVERRIDE: PATCH", "repos/o/r/pulls/1"),
+            ("api", "-HX-Http-Method-Override: PUT", "repos/o/r/pulls/1"),
+            ("api", "-X", "POST", "repos/o/r/issues/1/comments", "-f", "body=hi"),
+            ("api", "--method", "PUT", "repos/o/r/pulls/1/merge"),
+            ("api", "-XDELETE", "repos/o/r/issues/comments/5"),
+            ("api", "repos/o/r/issues/1/comments", "-f", "body=hi"),
+            ("api", "repos/o/r/issues/1/comments", "--field=body=hi"),
+            ("api", "graphql", "-f",
+             "query=mutation{enablePullRequestAutoMerge(input:{pullRequestId:\"PR_1\"}){clientMutationId}}"),
+            ("api", "graphql", "-F", "query=@document.graphql", "-f", "op=Mutation"),
+            ("api", "graphql", "--input", "body.json"),
+            ("api", "graphql", "--input=body.json"),
+            ("api", "graphql", "-F", "query=@document.graphql"),
+            ("api", "graphql", "--field", "query=@document.graphql"),
+            ("api", "graphql", "--field=query=@document.graphql"),
+            ("api", "graphql", "-fquery=@document.graphql"),
+            ("api", "-X", "GET", "repos/o/r/pulls/1", "-f", "body=@x"),
+            ("api", "repos/o/r/pulls/1", "-X"),
+            ("pr", "merge", "1", "--auto"),
+            ("pr", "view", "1", "--json", "headRefOid"),
+        )
+        for arguments in reads:
+            with self.subTest(arguments=arguments):
+                self.assertTrue(guard.read_only_gh_arguments(list(arguments)))
+        for arguments in writes:
+            with self.subTest(arguments=arguments):
+                self.assertFalse(guard.read_only_gh_arguments(list(arguments)))
+                self.sleeps.clear()
+                error, run = self.read([self.done(1, stderr=self.TRANSIENT[0]), self.done(0, "{}")],
+                                       arguments)
+                self.assertIsInstance(error, guard.GuardError, "a write is never repeated")
+                self.assertEqual(run.call_count, 1)
+                self.assertEqual(self.sleeps, [])
+
+    def test_every_read_in_the_guard_goes_through_the_retrying_reader(self) -> None:
+        # Only `run_real_gh` retries. The other three readers (`run_real_gh_text`,
+        # `base_config_text`, the binary-range probe) are bounded as before; this
+        # pins which reads the fix covers so a new raw `subprocess.run` of gh is
+        # noticed and routed through the retrying reader on purpose.
+        source = SCRIPT.read_text(encoding="utf-8")
+        raw = [line.strip() for line in source.splitlines()
+               if "[real_gh, *arguments]" in line or "[real_gh, \"api\"" in line]
+        self.assertEqual(len(raw), 4, raw)
+        self.assertEqual(guard.READ_TIMEOUT_SECONDS, 30)
+        self.assertEqual(guard.READ_RETRY_DELAY_SECONDS, 2.0)
 
 
 class AdversarialRulingIsNoVerdict(unittest.TestCase):

@@ -13,6 +13,7 @@ pub use crate::stale_pr_wedge::{StalePrRunWedgeCandidate, plan_stale_pr_run_wedg
 
 pub mod dwell;
 pub mod ejection_guards;
+pub mod flake_requeue;
 pub mod next_admit;
 pub mod stale_merge_ref;
 pub use ejection_guards::EjectionGuards;
