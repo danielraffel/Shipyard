@@ -362,7 +362,6 @@ fn someone_elses_move(kind: &str, facts: &Facts<'_>) -> Option<NextAction> {
         detail,
         detail_suffix,
         base,
-        required,
         ..
     } = facts;
     let detail = detail.unwrap_or("");
@@ -419,6 +418,39 @@ fn someone_elses_move(kind: &str, facts: &Facts<'_>) -> Option<NextAction> {
                  to do."
             ),
         ),
+        "waiting_full_test_tier" | "waiting_enqueue_requirements" => NextAction::new(
+            Actor::Ci,
+            format!("Admission waits on {token}. Nothing to do."),
+        ),
+        "generated_path_batch" => NextAction::new(
+            Actor::Steward,
+            format!(
+                "Waits for queued {arg} to leave the merge queue: both change a generated \
+                 path{detail_suffix}. Nothing to do; the steward admits it on the next pass after \
+                 that. Do not push or merge {base} for this."
+            ),
+        ),
+        "revalidating" | "admission_pending" => NextAction::new(
+            Actor::Steward,
+            format!(
+                "The steward's last pass ended in {token}{detail_suffix}. Nothing to do; next \
+                 pass."
+            ),
+        ),
+        _ => return reviewers_move(kind, facts).or_else(|| operators_move(kind, facts)),
+    })
+}
+
+/// The review-wait tokens: the standing reviewer moves.
+fn reviewers_move(kind: &str, facts: &Facts<'_>) -> Option<NextAction> {
+    let Facts {
+        arg,
+        detail_suffix,
+        base,
+        required,
+        ..
+    } = facts;
+    Some(match kind {
         "no_verdict" => NextAction::new(
             Actor::Reviewer,
             format!(
@@ -442,26 +474,7 @@ fn someone_elses_move(kind: &str, facts: &Facts<'_>) -> Option<NextAction> {
                  to do: a listed reviewer must post it."
             ),
         ),
-        "waiting_full_test_tier" | "waiting_enqueue_requirements" => NextAction::new(
-            Actor::Ci,
-            format!("Admission waits on {token}. Nothing to do."),
-        ),
-        "generated_path_batch" => NextAction::new(
-            Actor::Steward,
-            format!(
-                "Waits for queued {arg} to leave the merge queue: both change a generated \
-                 path{detail_suffix}. Nothing to do; the steward admits it on the next pass after \
-                 that. Do not push or merge {base} for this."
-            ),
-        ),
-        "revalidating" | "admission_pending" => NextAction::new(
-            Actor::Steward,
-            format!(
-                "The steward's last pass ended in {token}{detail_suffix}. Nothing to do; next \
-                 pass."
-            ),
-        ),
-        _ => return operators_move(kind, facts),
+        _ => return None,
     })
 }
 
