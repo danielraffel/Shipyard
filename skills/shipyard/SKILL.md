@@ -5934,6 +5934,18 @@ detector, then text, lowest number on a tie; a PR that rode a failing group is
 never chosen), its CI is prioritized only while a non-approval required check
 has not completed, and a dry-run hold never jumps. `base-health --act` is the
 manual path; leave `auto_jump` driving the steward alone so one writer jumps.
+`src/app/merge_steward_cmd/scheduling_loop.rs`: the loop contract
+(docs/scheduling-loop.md). `state_for` maps a row to one `LoopState` (precedence
+`merge_group_stalled` > `Queued` decision or `queued`/`admitted` > quarantined at
+the head > the `blocked_on` table; drafts, unowned and skip-labelled rows get
+none; unknown tokens are `tooling`). `classify` applies `TABLE` (start level,
+first actor, first deadline, then two more; L1 repair or adversary, L2
+`stronger_model`, L3 `coordinator`). `since` = earliest of the
+`loop_seen` record at the same state and head, the dwell entry at the head
+with the same token kind, the row's `since` (or `merge_group_enqueued_at`,
+or the quarantine line's `since=`), else now. Quarantine file: env
+`SHIPYARD_REVIEW_QUARANTINE` or machine-global `loop.review_quarantine_file`.
+No GitHub reads; `loop_seen` is kept only by applying passes.
 `src/app/merge_steward_cmd/merge_group_stall.rs`: for each queue entry
 whose `merge_group_heads` sha has no active run in the census, three reads
 (`actions/runs?head_sha=`, `commits/<sha>/check-runs`, `commits/<sha>/statuses`;

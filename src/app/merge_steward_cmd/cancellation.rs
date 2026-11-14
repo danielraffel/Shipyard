@@ -19,6 +19,7 @@ use super::{
 };
 
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 pub(super) fn apply_repo_plan(
     actions: &GitHubActions,
     args: &StewardCommandArgs,
@@ -27,6 +28,7 @@ pub(super) fn apply_repo_plan(
     ledger: &mut StewardLedger,
     remaining_preemptions: usize,
     mutation_control: Option<&MutationControl>,
+    global_dir: Option<&Path>,
 ) -> (RepoReport, bool, usize) {
     // Settle earlier uncertain admissions first, so a pull request whose
     // enqueue GitHub plainly took or refused is not held behind it.
@@ -268,6 +270,32 @@ pub(super) fn apply_repo_plan(
             }),
         },
     );
+    // The scheduling loop: one state, act, deadline and level per covered
+    // row, from what this pass already read. See `scheduling_loop`.
+    let quarantine = super::scheduling_loop::read_quarantine(
+        super::scheduling_loop::quarantine_path(
+            global_dir.or_else(|| mutation_control.map(|control| control.global_dir.as_path())),
+        )
+        .as_deref(),
+    );
+    {
+        let dwell = ledger
+            .dwell
+            .get(&super::dwell_pass::dwell_key(
+                &observation.repo,
+                &observation.base,
+            ))
+            .cloned();
+        super::scheduling_loop::annotate(
+            &mut reports,
+            observation,
+            dwell.as_ref(),
+            &mut ledger.loop_seen,
+            &quarantine,
+            args.apply,
+            Utc::now(),
+        );
+    }
     // The backstop acts only on pull requests the steward declines to own, so
     // it can never contend with the enqueue path above. See `native_arm`.
     let (native_arm_status, native_arm_failed) =
