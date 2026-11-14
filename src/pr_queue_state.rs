@@ -469,7 +469,8 @@ pub fn removal_of(node: &Value, head: &str) -> RemovalOf {
 /// head ([`RemovalOf::Head`]), or it names no head ([`RemovalOf::Unattributable`]).
 ///
 /// An unattributable removal is charged unless a later, server-timestamped
-/// `HeadRefForcePushedEvent` identifies the current head, no earlier one does,
+/// `HeadRefForcePushedEvent` identifies the current head, no earlier force-push
+/// or `PullRequestCommit` of it does,
 /// and `timeline_complete` is `Some(true)` (`hasPreviousPage: false`). In a
 /// truncated or unmeasured window an earlier push of the same head can sit on
 /// a page that was never read, so a later push proves nothing and the removal
@@ -527,7 +528,7 @@ fn same_head_re_add(
 ///
 /// A removal that names no head credits a later push only under the same rule
 /// as [`removal_charges_head`]: a later `HeadRefForcePushedEvent` of `head`, no
-/// earlier one, and a complete window (`timeline_complete == Some(true)`). In
+/// earlier force-push or `PullRequestCommit` of it, and a complete window (`timeline_complete == Some(true)`). In
 /// a truncated or unmeasured window an earlier push of `head` may be on an
 /// unread page, so there is no credit and the re-arm or requeue fails closed.
 fn new_head_since(
@@ -553,11 +554,14 @@ fn new_head_since(
 }
 
 fn push_after_removal(nodes: &[Value], index: usize, head: &str) -> bool {
-    // A force-push back to a head already visible before this removal is not a
-    // new arrival; it only proves the branch was rewritten to the same SHA.
+    // A force-push back to a head already visible before this removal (by an
+    // earlier force-push or an earlier `PullRequestCommit`) is not a new
+    // arrival; it only proves the branch was rewritten to the same SHA. A
+    // `PullRequestCommit`'s placement is author-controlled, but here it can
+    // only keep the removal charged, so trusting it fails closed.
     if nodes[..index]
         .iter()
-        .filter_map(authoritative_push_oid)
+        .filter_map(pushed_oid)
         .any(|oid| oid.eq_ignore_ascii_case(head))
     {
         return false;
@@ -1689,5 +1693,44 @@ mod tests {
         ));
         assert!(!back.new_head_since);
         assert_eq!(back.new_head_basis, NewHeadBasis::NoEvidence);
+    }
+
+    /// A head that arrived by a normal push (`PullRequestCommit`) before an
+    /// unattributable removal, then was force-pushed away and back, is the
+    /// same head: the removal stays charged and there is no new-head credit.
+    #[test]
+    fn a_force_push_back_to_a_normally_pushed_head_is_not_new() {
+        let head = "1111111111111111111111111111111111111111";
+        let other = "2222222222222222222222222222222222222222";
+        let response = |earlier_commit: bool| {
+            let mut nodes = Vec::new();
+            if earlier_commit {
+                nodes.push(
+                    serde_json::json!({"__typename":"PullRequestCommit","commit":{"oid":head}}),
+                );
+            }
+            nodes.extend([
+                serde_json::json!({"__typename":"RemovedFromMergeQueueEvent",
+                    "createdAt":"2026-10-04T01:00:00Z","reason":"merge_conflict","beforeCommit":null}),
+                serde_json::json!({"__typename":"HeadRefForcePushedEvent",
+                    "createdAt":"2026-10-04T02:00:00Z","afterCommit":{"oid":other}}),
+                serde_json::json!({"__typename":"HeadRefForcePushedEvent",
+                    "createdAt":"2026-10-04T03:00:00Z","afterCommit":{"oid":head}}),
+            ]);
+            serde_json::json!({"data":{"repository":{"pullRequest":{
+                "number":1,"state":"OPEN","headRefOid":head,"isInMergeQueue":false,
+                "mergeQueueEntry":null,"autoMergeRequest":null,
+                "timelineItems":{"pageInfo":{"hasPreviousPage":false},"nodes":nodes}}}}})
+        };
+        // Control: without the earlier commit the later force-push is a new head.
+        let control = explain_pr_queue_state(&response(false));
+        assert_eq!(control.ejections_of_current_head, 0);
+        assert!(control.last_ejection.expect("ejection").new_head_since);
+
+        let report = explain_pr_queue_state(&response(true));
+        assert_eq!(report.ejections_of_current_head, 1);
+        let ejection = report.last_ejection.expect("ejection");
+        assert!(!ejection.new_head_since);
+        assert_eq!(ejection.new_head_basis, NewHeadBasis::NoEvidence);
     }
 }

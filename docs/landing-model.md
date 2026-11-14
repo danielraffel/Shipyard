@@ -232,7 +232,7 @@ the queue built, not the PR head; it is trusted only when it is a commit the PR
 is seen to have had. When the removal names no head (`merge_conflict` removals
 never built a merge group) the fallback is server-timestamped push-time
 evidence: a `HeadRefForcePushedEvent` after the removal whose oid is
-`headRefOid`, with no earlier one for that oid and a complete timeline window
+`headRefOid`, with no earlier force-push or `PullRequestCommit` of that oid and a complete timeline window
 (`hasPreviousPage: false`); in a truncated or unmeasured window an earlier push
 of the head may be on an unread page. `PullRequestCommit` timeline order is author-controlled and is
 not push evidence. With no authoritative event, no new head is assumed and a

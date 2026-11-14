@@ -4789,7 +4789,8 @@ head is the removal's `beforeCommit` or a parent of that two-parent
 merge-group commit. One the timeline cannot attribute (no `beforeCommit`, as
 for every `merge_conflict` removal, parents unread, or any parent count but
 two) counts against the head unless a later server-timestamped
-`HeadRefForcePushedEvent` identifies the current head, no earlier one does,
+`HeadRefForcePushedEvent` identifies the current head, no earlier force-push
+or `PullRequestCommit` of it does,
 and the timeline window is complete (`hasPreviousPage: false`). In a
 truncated or unmeasured window an earlier push of the same head may be on an
 unread page, so the removal stays charged. A

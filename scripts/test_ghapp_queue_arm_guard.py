@@ -327,6 +327,19 @@ class PushAfterRemovalNeedsCompleteWindow(unittest.TestCase):
         self.assertIs(got["new_head_since_removal"], False)
         self.assertFalse(guard.decide(got)[0])
 
+    def test_a_force_push_back_to_a_normally_pushed_head_is_not_new(self) -> None:
+        # H arrives by a normal push (PullRequestCommit), is removed for
+        # merge_conflict, then is force-pushed away and back: still H, so the
+        # removal stays charged and the re-arm is refused.
+        response = self.response({"hasPreviousPage": False})
+        nodes = response["data"]["repository"]["pullRequest"]["timelineItems"]["nodes"]
+        nodes.insert(0, {"__typename": "PullRequestCommit", "commit": {"oid": self.HEAD}})
+        got = guard.classify_pr_queue_state(response)
+        self.assertIs(got["new_head_since_removal"], False)
+        self.assertEqual(got["last_ejection"]["new_head_basis"], "no_evidence")
+        self.assertEqual(got["ejections_of_current_head"], 1)
+        self.assertFalse(guard.decide(got)[0])
+
 
 class NewHeadIsDecidedBySha(unittest.TestCase):
     """Twin of the Rust ``pr_queue_state`` new-head tests."""

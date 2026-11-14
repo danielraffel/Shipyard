@@ -729,13 +729,20 @@ fn an_unattributable_removal_requires_authoritative_push_evidence_to_clear() {
     ] {
         assert_eq!(head_ejections(&queue, HEAD).len(), 2, "{queue}");
     }
-    // A force-push away and back after the removals is authoritative evidence
-    // that both removals predate the current head.
-    let mut force_pushed_back = vec![commit(HEAD, None)];
-    force_pushed_back.extend(removals());
-    force_pushed_back.push(force_push("2026-10-04T02:30:00Z", OTHER));
-    force_pushed_back.push(force_push("2026-10-04T03:00:00Z", HEAD));
-    assert!(head_ejections(&timeline(HEAD, force_pushed_back), HEAD).is_empty());
+    // A force-push away and back after the removals, to a head that was
+    // already on the branch before them (a normal push, seen as a
+    // PullRequestCommit), is the same head: both removals stay charged.
+    let force_pushed_back = |earlier: &str| {
+        let mut nodes = vec![commit(earlier, None)];
+        nodes.extend(removals());
+        nodes.push(force_push("2026-10-04T02:30:00Z", OTHER));
+        nodes.push(force_push("2026-10-04T03:00:00Z", HEAD));
+        timeline(HEAD, nodes)
+    };
+    assert_eq!(head_ejections(&force_pushed_back(HEAD), HEAD).len(), 2);
+    // Control: when the earlier commit was another head, the later force-push
+    // is the first arrival of HEAD and proves both removals predate it.
+    assert!(head_ejections(&force_pushed_back(OTHER), HEAD).is_empty());
     // A server-timestamped force-push after the removals proves that both
     // removals predate the current head and must not cap it.
     let queue = with(vec![force_push("2026-10-04T03:00:00Z", HEAD)]);

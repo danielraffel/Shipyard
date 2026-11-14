@@ -517,7 +517,7 @@ def _new_head_since(
 
     By SHA when the removal names its head. Otherwise only a later
     server-timestamped ``HeadRefForcePushedEvent`` whose oid is ``head`` is
-    accepted, only when no earlier one names ``head`` and the window is
+    accepted, only when no earlier force-push or PullRequestCommit names ``head`` and the window is
     complete (``timeline_complete is True``): in a truncated or unmeasured
     window an earlier push of ``head`` may be on an unread page. Commit
     timeline order and check-suite creation time are not push evidence. With
@@ -544,12 +544,15 @@ def _timestamp(value: Any) -> datetime | None:
 
 def _push_after_removal(nodes: list[Any], index: int, head: str) -> bool:
     """Whether a later server-timestamped force-push put ``head`` on the branch."""
-    # A force-push back to a head already visible before this removal is not a
-    # new arrival; it only proves the branch was rewritten to the same SHA.
+    # A force-push back to a head already visible before this removal (by an
+    # earlier force-push or an earlier PullRequestCommit) is not a new
+    # arrival; it only proves the branch was rewritten to the same SHA. A
+    # PullRequestCommit's placement is author-controlled, but here it can only
+    # keep the removal charged, so trusting it fails closed.
     if any(
         oid and oid.lower() == head.lower()
         for node in nodes[:index]
-        if (oid := _authoritative_push_oid(node))
+        if (oid := _pushed_oid(node))
     ):
         return False
     return any(
