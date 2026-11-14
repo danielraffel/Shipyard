@@ -26,23 +26,28 @@ pub(super) struct RepoSpec {
     pub(super) workflow: String,
 }
 
-pub(super) fn parse_repo_spec(text: &str, default_workflow: &str) -> Result<RepoSpec, String> {
+fn parse_repo_spec_with_overrides(
+    text: &str,
+    default_workflow: &str,
+    overrides: &std::collections::BTreeMap<String, String>,
+) -> Result<RepoSpec, String> {
     let (repo, workflow) = text
         .split_once('@')
-        .map_or((text, default_workflow), |(repo, workflow)| {
-            (repo, workflow)
-        });
+        .map_or((text, None), |(repo, workflow)| (repo, Some(workflow)));
     let valid = repo
         .split_once('/')
         .is_some_and(|(owner, name)| !owner.is_empty() && !name.is_empty() && !name.contains('/'));
-    if !valid || workflow.is_empty() {
+    if !valid || workflow.is_some_and(str::is_empty) {
         return Err(format!(
             "--repo {text:?} must look like OWNER/REPO or OWNER/REPO@workflow.yml"
         ));
     }
     Ok(RepoSpec {
         repo: repo.to_owned(),
-        workflow: workflow.to_owned(),
+        workflow: workflow
+            .map(str::to_owned)
+            .or_else(|| overrides.get(&repo.to_ascii_lowercase()).cloned())
+            .unwrap_or_else(|| default_workflow.to_owned()),
     })
 }
 
@@ -190,7 +195,8 @@ fn read_input(
 ) -> Result<WatchInput, CliFailure> {
     let mut input = WatchInput::default();
     for text in &args.repos {
-        let spec = parse_repo_spec(text, &watch.workflow).map_err(invalid)?;
+        let spec = parse_repo_spec_with_overrides(text, &watch.workflow, &watch.workflow_overrides)
+            .map_err(invalid)?;
         let query = WatchQuery {
             repo: spec.repo.clone(),
             base: watch.base.clone(),
@@ -362,7 +368,9 @@ pub(super) fn rules_command<W: Write>(
         .source
         .repos
         .iter()
-        .map(|text| parse_repo_spec(text, &watch.workflow))
+        .map(|text| {
+            parse_repo_spec_with_overrides(text, &watch.workflow, &watch.workflow_overrides)
+        })
         .collect::<Result<Vec<_>, _>>()
         .map_err(invalid)?;
     let repos: Vec<String> = specs.iter().map(|spec| spec.repo.clone()).collect();
@@ -555,6 +563,35 @@ mod tests {
         json!({"resources": {"core": {"remaining": core, "reset": 1_791_860_000},
                              "graphql": {"remaining": 5000, "reset": 1_791_861_000}}})
         .to_string()
+    }
+
+    #[test]
+    fn a_repository_workflow_override_is_used_unless_cli_qualifies_it() {
+        assert_eq!(
+            parse_repo_spec_with_overrides(
+                "owner/repo",
+                "build.yml",
+                &std::collections::BTreeMap::default()
+            )
+            .unwrap()
+            .workflow,
+            "build.yml"
+        );
+        let mut overrides = std::collections::BTreeMap::new();
+        overrides.insert(
+            "danielraffel/spectr".to_owned(),
+            "m5-product-acceptance.yml".to_owned(),
+        );
+        let mapped = parse_repo_spec_with_overrides("danielraffel/spectr", "build.yml", &overrides)
+            .expect("mapped repo");
+        assert_eq!(mapped.workflow, "m5-product-acceptance.yml");
+        let explicit = parse_repo_spec_with_overrides(
+            "danielraffel/spectr@other.yml",
+            "build.yml",
+            &overrides,
+        )
+        .expect("explicit repo");
+        assert_eq!(explicit.workflow, "other.yml");
     }
 
     #[test]
