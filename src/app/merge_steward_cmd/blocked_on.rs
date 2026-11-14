@@ -39,7 +39,7 @@ const HOLD_STATUS_PREFIX: &str = "a HOLD naming head ";
 /// `no reviewer verdict names head <sha>; it needs ...`.
 const NO_VERDICT_STATUS_PREFIX: &str = crate::merge_steward::AWAITING_VERDICT_FAILURE_PREFIX;
 /// The older approval script's description for the same wait.
-const AWAITING_STATUS_PREFIX: &str = "awaiting reviewer verdict";
+const AWAITING_STATUS_PREFIX: &str = "awaiting reviewer verdict for head ";
 
 /// `blocked_detail` of a `held` row: the one move that unblocks it.
 pub(super) const HELD_DETAIL: &str = "held head: needs a new head";
@@ -728,9 +728,16 @@ fn unread_gate_from_status(
     )?
     .trim();
     let names_head = |rest: &str| {
-        let head = facts.pr.head_sha.to_ascii_lowercase();
-        rest.split(|c: char| !c.is_ascii_hexdigit())
-            .any(|short| short.len() >= 7 && head.starts_with(&short.to_ascii_lowercase()))
+        let short = rest
+            .split(|c: char| !c.is_ascii_hexdigit())
+            .next()
+            .unwrap_or_default();
+        short.len() >= 7
+            && facts
+                .pr
+                .head_sha
+                .to_ascii_lowercase()
+                .starts_with(&short.to_ascii_lowercase())
     };
     if let Some(rest) = description.strip_prefix(HOLD_STATUS_PREFIX) {
         if !names_head(rest) {

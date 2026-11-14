@@ -1087,6 +1087,10 @@ fn legacy_awaiting_verdict_status_must_name_the_current_head() {
             "required_failed:review-verdict",
         ),
         (
+            "awaiting reviewer verdict for head bbbbbbbbbbbb; current head aaaaaaa",
+            "required_failed:review-verdict",
+        ),
+        (
             "awaiting reviewer verdict for head aaaaaaaaaaaa",
             "no_verdict",
         ),
