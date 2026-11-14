@@ -104,6 +104,61 @@ def expectations() -> dict[str, Any]:
     }
 
 
+def with_fixture_activity(name: str, want: dict[str, Any]) -> dict[str, Any]:
+    """Fixture ``name`` with the activity page its expectation names attached."""
+    response = fixture(name)
+    if isinstance(want.get("push_activity"), str):
+        page = fixture(want["push_activity"])
+        response[guard.PUSH_ACTIVITY_KEY] = {
+            "headRef": page["head_ref"], "crossRepository": False, "rows": page["rows"],
+        }
+    return response
+
+
+ACT_HEAD = "1" * 40
+ACT_FIRST = "3" * 40
+ACT_SECOND = "4" * 40
+ACT_OTHER = "2" * 40
+
+
+def activity_row(at: str, kind: str, after: str) -> dict[str, Any]:
+    return {"activity_type": kind, "after": after, "ref": "refs/heads/feature", "timestamp": at}
+
+
+def two_conflicts_then_normal_push() -> dict[str, Any]:
+    """Two merge_conflict removals, then a normal push (only a PullRequestCommit)."""
+    return {"data": {"repository": {"pullRequest": {
+        "number": 7, "state": "OPEN", "headRefOid": ACT_HEAD, "headRefName": "feature",
+        "isCrossRepository": False, "isInMergeQueue": False, "mergeQueueEntry": None,
+        "autoMergeRequest": None, "repository": {"nameWithOwner": "owner/repo"},
+        "timelineItems": {"pageInfo": {"hasPreviousPage": False}, "nodes": [
+            {"__typename": "PullRequestCommit", "commit": {"oid": ACT_FIRST}},
+            {"__typename": "RemovedFromMergeQueueEvent", "createdAt": "2026-10-04T01:00:00Z",
+             "reason": "merge_conflict", "beforeCommit": None},
+            {"__typename": "PullRequestCommit", "commit": {"oid": ACT_SECOND}},
+            {"__typename": "RemovedFromMergeQueueEvent", "createdAt": "2026-10-04T02:00:00Z",
+             "reason": "merge_conflict", "beforeCommit": None},
+            {"__typename": "PullRequestCommit", "commit": {"oid": ACT_HEAD}},
+        ]}}}}}
+
+
+def matching_rows() -> list[dict[str, Any]]:
+    return [
+        activity_row("2026-10-04T03:00:00Z", "push", ACT_HEAD),
+        activity_row("2026-10-04T01:30:00Z", "push", ACT_SECOND),
+        activity_row("2026-10-04T00:30:00Z", "push", ACT_FIRST),
+        activity_row("2026-10-04T00:10:00Z", "branch_creation", "5" * 40),
+    ]
+
+
+def with_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    response = two_conflicts_then_normal_push()
+    response[guard.PUSH_ACTIVITY_KEY] = {
+        "headRef": "feature", "crossRepository": False, "rows": rows,
+    }
+    return response
+
+
 def with_base(response: dict[str, Any], base: str = "main") -> dict[str, Any]:
     response = copy.deepcopy(response)
     response["data"]["repository"]["pullRequest"]["baseRefName"] = base
@@ -121,7 +176,7 @@ class ClassifierAgreesWithSharedCorpus(unittest.TestCase):
         checked = 0
         for name, want in expectations().items():
             with self.subTest(fixture=name):
-                got = guard.classify_pr_queue_state(fixture(name))
+                got = guard.classify_pr_queue_state(with_fixture_activity(name, want))
                 self.assertEqual(got["class"], want["class"])
                 self.assertEqual(got["pr"], want["pr"])
                 self.assertEqual(got["requeues_without_new_head"], want["requeues_without_new_head"])
@@ -143,6 +198,15 @@ class ClassifierAgreesWithSharedCorpus(unittest.TestCase):
                 checked += 1
         # Control: the whole corpus, real and labelled-synthetic, was visited.
         self.assertEqual(checked, 16)
+
+    def test_real_9653_and_8722_without_activity_still_refuse(self) -> None:
+        for name in ("pr_real_9653_merge_conflict_backdated_push.json", "pr_ejected_new_head.json"):
+            with self.subTest(fixture=name):
+                got = guard.classify_pr_queue_state(fixture(name))
+                self.assertIs(got["new_head_since_removal"], False)
+                self.assertEqual(got["last_ejection"]["new_head_basis"], "no_evidence")
+                allowed, _ = guard.decide(got)
+                self.assertFalse(allowed)
 
     def test_real_truncated_same_head_ejection_is_ejected_and_refused(self) -> None:
         response = fixture("pr_real_truncated_same_head_ejected.json")
@@ -2251,6 +2315,154 @@ class EnvironmentRequeueWorkedExamples(unittest.TestCase):
             self.assertFalse(guard.environment_requeue_enabled(nested))
             config.write_text("[queue]\n", encoding="utf-8")
             self.assertFalse(guard.environment_requeue_enabled(nested))
+
+
+class NormalPushActivityEvidence(unittest.TestCase):
+    """Twin of the activity tests in src/pr_queue_state.rs."""
+
+    def charged(self, response: dict[str, Any]) -> tuple[int, bool, str]:
+        got = guard.classify_pr_queue_state(response)
+        return (got["ejections_of_current_head"], got["last_ejection"]["new_head_since"],
+                got["last_ejection"]["new_head_basis"])
+
+    NONE = (2, False, "no_evidence")
+
+    def test_matching_activity_clears_both_conflict_removals(self) -> None:
+        self.assertEqual(self.charged(with_rows(matching_rows())),
+                         (0, True, "activity_push_after_removal"))
+        rows = matching_rows()
+        rows[0]["activity_type"] = "force_push"
+        self.assertEqual(self.charged(with_rows(rows))[0], 0)
+        allowed, _ = guard.decide(guard.classify_pr_queue_state(with_rows(matching_rows())))
+        self.assertTrue(allowed)
+
+    def test_without_usable_activity_both_stay_charged(self) -> None:
+        self.assertEqual(self.charged(two_conflicts_then_normal_push()), self.NONE)
+        error = two_conflicts_then_normal_push()
+        error[guard.PUSH_ACTIVITY_KEY] = {"error": "HTTP 502"}
+        self.assertEqual(self.charged(error), self.NONE)
+        self.assertEqual(self.charged(with_rows([])), self.NONE)
+        mismatch = matching_rows()
+        mismatch[0]["after"] = ACT_OTHER
+        self.assertEqual(self.charged(with_rows(mismatch)), self.NONE)
+        early = matching_rows()[1:] + [activity_row("2026-10-04T00:05:00Z", "push", ACT_HEAD)]
+        self.assertEqual(self.charged(with_rows(early)), self.NONE)
+        same_second = matching_rows()
+        same_second[0]["timestamp"] = "2026-10-04T02:00:00Z"
+        self.assertEqual(self.charged(with_rows(same_second)), (1, False, "no_evidence"))
+        allowed, _ = guard.decide(guard.classify_pr_queue_state(two_conflicts_then_normal_push()))
+        self.assertFalse(allowed)
+
+    def test_a_fork_head_or_another_ref_gives_no_credit(self) -> None:
+        fork = with_rows(matching_rows())
+        fork["data"]["repository"]["pullRequest"]["isCrossRepository"] = True
+        self.assertEqual(self.charged(fork), self.NONE)
+        unproven = with_rows(matching_rows())
+        unproven[guard.PUSH_ACTIVITY_KEY]["crossRepository"] = None
+        self.assertEqual(self.charged(unproven), self.NONE)
+        renamed = with_rows(matching_rows())
+        renamed["data"]["repository"]["pullRequest"]["headRefName"] = "other"
+        self.assertEqual(self.charged(renamed), self.NONE)
+        rows = matching_rows()
+        rows[0]["ref"] = "refs/heads/other"
+        self.assertEqual(self.charged(with_rows(rows)), self.NONE)
+
+    def test_a_malformed_or_short_page_gives_no_credit(self) -> None:
+        missing = matching_rows()
+        del missing[2]["timestamp"]
+        self.assertEqual(self.charged(with_rows(missing)), self.NONE)
+        unordered = matching_rows()
+        unordered[0], unordered[1] = unordered[1], unordered[0]
+        self.assertEqual(self.charged(with_rows(unordered)), self.NONE)
+        not_rows = with_rows(matching_rows())
+        not_rows[guard.PUSH_ACTIVITY_KEY]["rows"] = {"0": {}}
+        self.assertEqual(self.charged(not_rows), self.NONE)
+        too_many = matching_rows() + [
+            activity_row("2026-10-04T00:00:00Z", "push", ACT_OTHER)
+        ] * guard.PUSH_ACTIVITY_PAGE
+        self.assertEqual(self.charged(with_rows(too_many)), self.NONE)
+        self.assertEqual(self.charged(with_rows(matching_rows()[:2])),
+                         (1, True, "activity_push_after_removal"))
+        self.assertEqual(self.charged(with_rows(matching_rows()[:1])), self.NONE)
+
+    def test_the_earlier_visibility_veto_still_applies(self) -> None:
+        rows = matching_rows()
+        rows.insert(1, activity_row("2026-10-04T02:30:00Z", "force_push", ACT_OTHER))
+        rows.insert(2, activity_row("2026-10-04T01:45:00Z", "push", ACT_HEAD))
+        count, new_head, _ = self.charged(with_rows(rows))
+        self.assertEqual((count, new_head), (1, False))
+        forced = with_rows(matching_rows())
+        forced["data"]["repository"]["pullRequest"]["timelineItems"]["nodes"].insert(0, {
+            "__typename": "HeadRefForcePushedEvent", "createdAt": "2026-10-04T00:20:00Z",
+            "afterCommit": {"oid": ACT_HEAD}})
+        self.assertEqual(self.charged(forced), self.NONE)
+
+    def test_activity_is_read_only_when_it_can_matter(self) -> None:
+        self.assertTrue(guard.push_activity_wanted(two_conflicts_then_normal_push()))
+        settled = two_conflicts_then_normal_push()
+        nodes = settled["data"]["repository"]["pullRequest"]["timelineItems"]["nodes"]
+        nodes[-1] = {"__typename": "HeadRefForcePushedEvent", "createdAt": "2026-10-04T03:00:00Z",
+                     "afterCommit": {"oid": ACT_HEAD}}
+        self.assertFalse(guard.push_activity_wanted(settled))
+        calls: list[str] = []
+        self.assertNotIn(guard.PUSH_ACTIVITY_KEY,
+                         guard.attach_push_activity(settled, "owner/repo", calls.append))
+        self.assertEqual(calls, [])
+
+    def test_attach_reads_one_page_and_fails_closed(self) -> None:
+        def numbered(number: int) -> dict[str, Any]:
+            response = two_conflicts_then_normal_push()
+            response["data"]["repository"]["pullRequest"]["number"] = number
+            return response
+
+        paths: list[str] = []
+
+        def fetch(path: str) -> Any:
+            paths.append(path)
+            return matching_rows()
+
+        with mock.patch.dict(guard._ACTIVITY_CACHE, clear=True):
+            got = guard.attach_push_activity(numbered(1), "owner/repo", fetch)
+            self.assertEqual(paths,
+                             ["repos/owner/repo/activity?ref=refs/heads/feature&per_page=100"])
+            self.assertEqual(self.charged(got)[0], 0)
+            again = guard.attach_push_activity(numbered(1), "owner/repo", fetch)
+            self.assertEqual(len(paths), 1)
+            self.assertEqual(self.charged(again)[0], 0)
+
+            def failing(path: str) -> Any:
+                raise guard.GuardError("HTTP 404")
+
+            failed = guard.attach_push_activity(numbered(2), "owner/repo", failing)
+            self.assertIn("error", failed[guard.PUSH_ACTIVITY_KEY])
+            self.assertEqual(self.charged(failed)[0], 2)
+            odd = guard.attach_push_activity(numbered(3), "owner/repo", lambda _: {"message": "x"})
+            self.assertIn("error", odd[guard.PUSH_ACTIVITY_KEY])
+            self.assertEqual(self.charged(odd)[0], 2)
+            for cross in (True, None):
+                fork = numbered(4)
+                fork["data"]["repository"]["pullRequest"]["isCrossRepository"] = cross
+                got = guard.attach_push_activity(fork, "owner/repo", fetch)
+                self.assertIn("error", got[guard.PUSH_ACTIVITY_KEY])
+                self.assertEqual(self.charged(got)[0], 2)
+            self.assertEqual(len(paths), 1)
+        self.assertIsNone(guard.push_activity_path("owner/repo", "a&b"))
+        self.assertIsNone(guard.push_activity_path("owner/repo", "a b"))
+
+    def test_the_landing_target_reads_activity_through_the_app_token(self) -> None:
+        calls: list[list[str]] = []
+
+        def real_gh(arguments: list[str]) -> Any:
+            calls.append(arguments)
+            return matching_rows()
+
+        with mock.patch.dict(guard._ACTIVITY_CACHE, clear=True), \
+                mock.patch.object(guard, "run_real_gh", real_gh):
+            target = guard._target(two_conflicts_then_normal_push(), "arm", None)
+        self.assertEqual(calls, [["api",
+                                  "repos/owner/repo/activity?ref=refs/heads/feature&per_page=100"]])
+        self.assertEqual(target["ejections_of_current_head"], 0)
+        self.assertIs(target["new_head_since_removal"], True)
 
 
 if __name__ == "__main__":

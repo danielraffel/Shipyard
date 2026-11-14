@@ -480,7 +480,12 @@ fn read_queue_state(run_gh: RunGh<'_>, repo: &str, pr: u64) -> Result<Value, Str
         "-F".to_owned(),
         format!("number={pr}"),
     ])?;
-    serde_json::from_str(&raw).map_err(|error| format!("malformed GraphQL JSON: {error}"))
+    let mut queue: Value =
+        serde_json::from_str(&raw).map_err(|error| format!("malformed GraphQL JSON: {error}"))?;
+    crate::pr_queue_state::attach_push_activity(&mut queue, repo, |path| {
+        run_gh(&["api".to_owned(), path.to_owned()])
+    });
+    Ok(queue)
 }
 
 /// Collapse a multi-line `gh` diagnostic so one arm result stays one line.

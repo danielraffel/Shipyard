@@ -342,7 +342,7 @@ _TIMELINE = (
     "... on MergedEvent{createdAt}}}"
 )
 _PR_FIELDS = (
-    "number state headRefOid baseRefName isInMergeQueue mergeQueueEntry{state position} "
+    "number state headRefOid headRefName isCrossRepository baseRefName isInMergeQueue mergeQueueEntry{state position} "
     "autoMergeRequest{enabledAt} repository{nameWithOwner} " + _TIMELINE
 )
 PR_BY_NUMBER_QUERY = (
@@ -512,6 +512,7 @@ def _new_head_since(
     removed: str | None,
     head: str | None,
     timeline_complete: bool | None,
+    evidence: tuple[Any, Any] = (None, None),
 ) -> tuple[bool, str]:
     """Whether ``head`` differs from the head removed at ``index``, and on what basis.
 
@@ -520,9 +521,11 @@ def _new_head_since(
     accepted, only when no earlier force-push or PullRequestCommit names ``head`` and the window is
     complete (``timeline_complete is True``): in a truncated or unmeasured
     window an earlier push of ``head`` may be on an unread page. Commit
-    timeline order and check-suite creation time are not push evidence. With
-    no authoritative push event, no new head is assumed, so a re-arm is
-    refused. Mirrors ``new_head_since`` in ``src/pr_queue_state.rs``.
+    timeline order and check-suite creation time are not push evidence. A
+    normal push is accepted on an attached repository activity row
+    (``_activity_push_after_removal``, basis ``activity_push_after_removal``).
+    With neither, no new head is assumed, so a re-arm is refused. Mirrors
+    ``new_head_since`` in ``src/pr_queue_state.rs``.
     """
     if head is None:
         return False, "no_evidence"
@@ -530,6 +533,8 @@ def _new_head_since(
         return removed.lower() != head.lower(), "removed_head_sha"
     if timeline_complete is True and _push_after_removal(nodes, index, head):
         return True, "push_after_removal"
+    if _activity_push_after_removal(evidence, nodes, index, head):
+        return True, "activity_push_after_removal"
     return False, "no_evidence"
 
 
@@ -562,11 +567,180 @@ def _push_after_removal(nodes: list[Any], index: int, head: str) -> bool:
     )
 
 
+PUSH_ACTIVITY_KEY = "pushActivity"
+PUSH_ACTIVITY_PAGE = 100
+_ACTIVITY_CACHE: dict[tuple[str, int, str, str], Any] = {}
+
+
+def _evidence(response: Any) -> tuple[Any, Any]:
+    """``(pull request node, pushActivity attachment)`` of a queue response."""
+    activity = response.get(PUSH_ACTIVITY_KEY) if isinstance(response, dict) else None
+    return _pull_request(response), activity
+
+
+def _activity_rows(evidence: tuple[Any, Any]) -> list[tuple[str, str, datetime]] | None:
+    """The attached activity rows as ``(after, activity_type, timestamp)``, newest first.
+
+    ``None`` when there is no usable page: nothing attached, a fetch error, a
+    fork or unknown head repository, a head ref that differs from the pull
+    request's, more than one page of rows, rows out of order, or any row that
+    is not a well-formed activity on ``refs/heads/<headRef>``. One bad row
+    voids the page. Mirrors ``activity_rows`` in ``src/pr_queue_state.rs``.
+    """
+    pr, activity = evidence
+    if not isinstance(activity, dict) or "error" in activity:
+        return None
+    if activity.get("crossRepository") is not False:
+        return None
+    head_ref = activity.get("headRef")
+    if not isinstance(head_ref, str) or not head_ref:
+        return None
+    if isinstance(pr, dict):
+        if pr.get("isCrossRepository") is True:
+            return None
+        name = pr.get("headRefName")
+        if isinstance(name, str) and name != head_ref:
+            return None
+    rows = activity.get("rows")
+    if not isinstance(rows, list) or len(rows) > PUSH_ACTIVITY_PAGE:
+        return None
+    full_ref = f"refs/heads/{head_ref}"
+    parsed: list[tuple[str, str, datetime]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            return None
+        after, kind = row.get("after"), row.get("activity_type")
+        if not isinstance(after, str) or not after or not isinstance(kind, str):
+            return None
+        if row.get("ref") != full_ref:
+            return None
+        at = _timestamp(row.get("timestamp"))
+        if at is None or (parsed and parsed[-1][2] < at):
+            return None
+        parsed.append((after, kind, at))
+    return parsed
+
+
+def _activity_push_after_removal(
+    evidence: tuple[Any, Any], nodes: list[Any], index: int, head: str
+) -> bool:
+    """Whether the attached activity page proves ``head`` was pushed after the removal.
+
+    Needs a usable page that reaches back past the removal (a row strictly
+    older than its ``createdAt``), no row at or before the removal and no
+    earlier ``HeadRefForcePushedEvent`` naming ``head``, and a ``push`` or
+    ``force_push`` row of ``head`` strictly later than the removal. A
+    PullRequestCommit's timeline position is author-controlled and is not
+    consulted. Mirrors ``activity_push_after_removal`` in
+    ``src/pr_queue_state.rs``.
+    """
+    rows = _activity_rows(evidence)
+    if rows is None or not 0 <= index < len(nodes) or not isinstance(nodes[index], dict):
+        return False
+    removed_at = _timestamp(nodes[index].get("createdAt"))
+    if removed_at is None:
+        return False
+    lowered = head.lower()
+    if not any(at < removed_at for _, _, at in rows):
+        return False
+    if any(at <= removed_at and after.lower() == lowered for after, _, at in rows):
+        return False
+    if any(
+        oid and oid.lower() == lowered
+        for node in nodes[:index]
+        if (oid := _authoritative_push_oid(node))
+    ):
+        return False
+    return any(
+        at > removed_at and after.lower() == lowered and kind in ("push", "force_push")
+        for after, kind, at in rows
+    )
+
+
+def push_activity_wanted(response: Any) -> bool:
+    """Whether a removal naming no head is left that the timeline force-push rule does not settle."""
+    pr = _pull_request(response)
+    if pr is None:
+        return False
+    head = pr.get("headRefOid")
+    timeline = pr.get("timelineItems")
+    nodes = timeline.get("nodes") if isinstance(timeline, dict) else None
+    if not isinstance(head, str) or not head or not isinstance(nodes, list):
+        return False
+    page_info = timeline.get("pageInfo")
+    has_previous = page_info.get("hasPreviousPage") if isinstance(page_info, dict) else None
+    complete = (not has_previous) if isinstance(has_previous, bool) else None
+    known = [oid for oid in (_pushed_oid(node) for node in nodes) if oid] + [head]
+    for index, node in enumerate(nodes):
+        if _typename(node) != "RemovedFromMergeQueueEvent":
+            continue
+        reason = node.get("reason")
+        if isinstance(reason, str) and reason.lower() == "merged":
+            continue
+        if _removal_of(node, head) != "unattributable" and _removed_head(node, known) is not None:
+            continue
+        if complete is True and _push_after_removal(nodes, index, head):
+            continue
+        return True
+    return False
+
+
+def push_activity_path(repo: str, head_ref: str) -> str | None:
+    """The one activity page's REST path, or ``None`` for a name that would need escaping."""
+    plain = re.compile(r"[A-Za-z0-9._/-]+")
+    if not plain.fullmatch(repo or "") or not plain.fullmatch(head_ref or ""):
+        return None
+    return f"repos/{repo}/activity?ref=refs/heads/{head_ref}&per_page={PUSH_ACTIVITY_PAGE}"
+
+
+def attach_push_activity(response: Any, repo: str | None, fetch: Any) -> Any:
+    """``response`` with the head branch's activity page under ``PUSH_ACTIVITY_KEY``.
+
+    Read only when ``push_activity_wanted``; one page per (pull request, head)
+    for this process. ``fetch(path)`` is the App-token REST read; it raises
+    ``GuardError`` on a failed or non-2xx read. A fork head, an unreadable head
+    ref, a fetch error or a body that is not a list attaches ``{"error": ...}``,
+    which the classifier reads as no evidence. Mirrors
+    ``attach_push_activity`` in ``src/pr_queue_state.rs``.
+    """
+    if not isinstance(response, dict) or PUSH_ACTIVITY_KEY in response:
+        return response
+    if not push_activity_wanted(response):
+        return response
+    pr = _pull_request(response) or {}
+    attachment: Any
+    head_ref, number, head = pr.get("headRefName"), pr.get("number"), pr.get("headRefOid")
+    if pr.get("isCrossRepository") is not False:
+        attachment = {"error": "the head is not proven to be in the base repository"}
+    elif not isinstance(head_ref, str) or not isinstance(number, int) or not isinstance(head, str):
+        attachment = {"error": "headRefName, number or headRefOid is missing"}
+    elif not isinstance(repo, str) or (path := push_activity_path(repo, head_ref)) is None:
+        attachment = {"error": "the repository or head ref name cannot be put in a query string"}
+    else:
+        key = (repo.lower(), number, head.lower(), head_ref)
+        if key in _ACTIVITY_CACHE:
+            attachment = _ACTIVITY_CACHE[key]
+        else:
+            try:
+                rows = fetch(path)
+            except GuardError as error:
+                attachment = {"error": f"the activity page is unreadable: {error}"}
+            else:
+                attachment = (
+                    {"headRef": head_ref, "crossRepository": False, "rows": rows}
+                    if isinstance(rows, list)
+                    else {"error": "the activity page is not a JSON array"}
+                )
+            _ACTIVITY_CACHE[key] = attachment
+    return {**response, PUSH_ACTIVITY_KEY: attachment}
+
+
 def _ejections_of_head(
     nodes: list[Any],
     removed_heads: list[str | None],
     head: str | None,
     timeline_complete: bool | None,
+    evidence: tuple[Any, Any] = (None, None),
 ) -> int:
     """``failed_checks`` / ``merge_conflict`` removals of ``head``.
 
@@ -574,7 +748,9 @@ def _ejections_of_head(
     names none counts unless a later server-timestamped force-push proves that
     it predates the current head, and that proof needs a complete timeline
     (``hasPreviousPage: false``): in a truncated or unmeasured window an
-    earlier push of the same head may be on an unread page. Mirrors
+    earlier push of the same head may be on an unread page. An attached
+    repository activity push row of the head after the removal
+    (``_activity_push_after_removal``) also clears it. Mirrors
     ``PrQueueReport::ejections_of_current_head``.
     """
     if head is None:
@@ -592,8 +768,9 @@ def _ejections_of_head(
         elif removal_kind == "other":
             charged = False
         else:
-            charged = timeline_complete is not True or not _push_after_removal(
-                nodes, index, head
+            charged = not (
+                (timeline_complete is True and _push_after_removal(nodes, index, head))
+                or _activity_push_after_removal(evidence, nodes, index, head)
             )
         if charged:
             count += 1
@@ -627,6 +804,7 @@ def classify_pr_queue_state(response: Any) -> dict[str, Any]:
 
     head = pr.get("headRefOid")
     head = head if isinstance(head, str) and head else None
+    evidence = _evidence(response)
     # Every commit this pull request is seen to have had: a removed head read
     # off a merge-group commit is trusted only when it is one of these.
     known_heads = [oid for oid in (_pushed_oid(node) for node in nodes) if oid]
@@ -669,7 +847,7 @@ def classify_pr_queue_state(response: Any) -> dict[str, Any]:
         index, reason, at = last_removal
         removed = removed_heads[index]
         new_head_since, basis = _new_head_since(
-            nodes, index, removed, head, timeline_complete
+            nodes, index, removed, head, timeline_complete, evidence
         )
         last_ejection = {
             "reason": reason,
@@ -691,7 +869,7 @@ def classify_pr_queue_state(response: Any) -> dict[str, Any]:
         "repo": repository.get("nameWithOwner") if isinstance(repository, dict) else None,
         "requeues_without_new_head": requeues,
         "ejections_of_current_head": _ejections_of_head(
-            nodes, removed_heads, head, timeline_complete
+            nodes, removed_heads, head, timeline_complete, evidence
         ),
         "last_ejection": last_ejection,
         "timeline_complete": timeline_complete,
@@ -4537,8 +4715,17 @@ def rest_fields(args: list[str]) -> dict[str, Any]:
     return fields
 
 
+def _with_push_activity(response: Any) -> Any:
+    """``response`` with its head branch's activity page attached, when it can matter."""
+    pr = _pull_request(response)
+    repository = pr.get("repository") if isinstance(pr, dict) else None
+    repo = repository.get("nameWithOwner") if isinstance(repository, dict) else None
+    return attach_push_activity(response, repo, lambda path: run_real_gh(["api", path]))
+
+
 def _target(response: Any, action: str, bound: Any) -> dict[str, Any]:
     """One classified landing target, with the base its required checks are read from."""
+    response = _with_push_activity(response)
     return {**classify_pr_queue_state(response), "action": action, "base": _base_ref(response),
             "bound_head": bound if isinstance(bound, str) else None}
 

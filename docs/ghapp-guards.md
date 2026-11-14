@@ -1211,13 +1211,21 @@ because GitHub sorts a fix committed before an ejection but pushed after it
 *before* the removal. A removal that names no head (`merge_conflict`) falls back
 to server-timestamped push-time evidence: a `HeadRefForcePushedEvent` for the
 current head after the removal, none before it, and a complete timeline window
-(`hasPreviousPage: false`). `PullRequestCommit` timeline order is
-author-controlled and check-suite
-creation can lag the push, so neither is arrival proof. A head with no
-authoritative event is treated as unchanged by both guards. If a live push is
-ever misread, the repository activity API
-(`repos/{owner}/{repo}/activity`, push events with timestamps) is the
-authoritative source.
+(`hasPreviousPage: false`). A normal push leaves no such event, so the guard
+also reads one page of the branch's repository activity
+(`repos/{owner}/{repo}/activity?ref=refs/heads/<head_ref>&per_page=100`, App
+token) when a removal that names no head is not already settled by a
+force-push. A `push` or `force_push` row whose `after` is the current head,
+with a server `timestamp` strictly later than the removal, counts as the new
+head (basis `activity_push_after_removal`), provided the page reaches back
+past the removal and no row at or before the removal, and no earlier
+force-push event, names that head. The page is read only for a head in the
+base repository and at most once per pull request and head per guard run. A
+fork head, a failed or non-2xx read, a malformed row, or a page that stops
+short of the removal gives no credit. `PullRequestCommit` timeline order is
+author-controlled and check-suite creation can lag the push, so neither is
+arrival proof. A head with no authoritative evidence is treated as unchanged
+by both guards.
 
 The two unreadable rows are asymmetric on purpose: arming blind can fail
 innocent batch-mates, while a blind refresh costs at most one gate run. Every

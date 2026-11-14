@@ -396,6 +396,19 @@ def read_queue_classification(owner: str, name: str, number: int) -> dict[str, A
         response = run_real_gh(arguments)
     except GuardError:
         return None
+    attach = getattr(ARM_GUARD, "attach_push_activity", None)
+    if attach is not None:
+        # The same normal-push evidence the arm guard reads: a repository
+        # activity row of the head after a removal that names no head.
+        arm_error = ARM_GUARD.GuardError
+
+        def fetch(path: str) -> Any:
+            try:
+                return run_real_gh(["api", path])
+            except GuardError as error:
+                raise arm_error(str(error)) from error
+
+        response = attach(response, f"{owner}/{name}", fetch)
     return ARM_GUARD.classify_pr_queue_state(response)
 
 

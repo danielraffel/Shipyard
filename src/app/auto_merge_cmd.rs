@@ -1450,8 +1450,19 @@ fn fetch_pr_queue_state(
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    let body: Value = serde_json::from_slice(&output.stdout)
+    let mut body: Value = serde_json::from_slice(&output.stdout)
         .map_err(|error| format!("merge-queue timeline returned invalid JSON: {error}"))?;
+    crate::pr_queue_state::attach_push_activity(&mut body, &state.repo, |path| {
+        let output = gh(client, cwd)?
+            .args(["api", path])
+            .output()
+            .map_err(|error| error.to_string())?;
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+        }
+    });
     Ok(crate::pr_queue_state::explain_pr_queue_state(&body))
 }
 

@@ -234,9 +234,19 @@ never built a merge group) the fallback is server-timestamped push-time
 evidence: a `HeadRefForcePushedEvent` after the removal whose oid is
 `headRefOid`, with no earlier force-push or `PullRequestCommit` of that oid and a complete timeline window
 (`hasPreviousPage: false`); in a truncated or unmeasured window an earlier push
-of the head may be on an unread page. `PullRequestCommit` timeline order is author-controlled and is
-not push evidence. With no authoritative event, no new head is assumed and a
-re-arm is refused.
+of the head may be on an unread page. A normal push (the mandated repair:
+merge main, push, never force-push) leaves no such event, so the reader also
+attaches one page of the branch's repository activity
+(`repos/{o}/{r}/activity?ref=refs/heads/<head_ref>`, `pushActivity`) when an
+unattributable removal is not settled by a force-push. A `push` or
+`force_push` row whose `after` is `headRefOid`, on the PR's own head ref in
+the base repository, with a server `timestamp` strictly later than the
+removal, is a new head (basis `activity_push_after_removal`). The page must
+reach back past the removal, and a row at or before the removal (or an
+earlier force-push event) naming the head vetoes it. A fork head, a failed
+read, a malformed row or a short page gives no credit. `PullRequestCommit`
+timeline order is author-controlled and is not push evidence. With no
+authoritative evidence, no new head is assumed and a re-arm is refused.
 `shipyard landing` prints the removed head, the current head, and which basis
 decided. `requeues_without_new_head` counts `AddedToMergeQueueEvent`s that
 directly follow a `failed_checks`/`merge_conflict` removal and re-add the same

@@ -31,6 +31,16 @@
 //! either. With no authoritative push event, the answer is "no new head", which
 //! refuses a re-arm (fail closed).
 //!
+//! A normal (non-force) push leaves no server-timestamped timeline item, so
+//! the caller may attach the branch's repository activity page (see
+//! [`attach_push_activity`]) under [`PUSH_ACTIVITY_KEY`]. A `push` or
+//! `force_push` row whose `after` is the current head, on the pull request's
+//! own head ref in the base repository, with a server `timestamp` strictly
+//! later than the removal, is then accepted as that push. The classifier only
+//! reads the attached rows; it never fetches. A missing, failed or malformed
+//! attachment, a fork head, or a page that does not reach back past the
+//! removal gives no credit.
+//!
 //! ## Limits
 //!
 //! The query reads `timelineItems(last: 100)`. That is a window: when
@@ -53,7 +63,7 @@ use serde_json::Value;
 /// GraphQL document whose response [`classify_pr_queue_state`] consumes.
 ///
 /// Variables: `owner`, `name`, `number`.
-pub const PR_QUEUE_STATE_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){number state headRefOid isInMergeQueue mergeQueueEntry{state position} autoMergeRequest{enabledAt} timelineItems(last:100,itemTypes:[PULL_REQUEST_COMMIT,HEAD_REF_FORCE_PUSHED_EVENT,ADDED_TO_MERGE_QUEUE_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT,AUTO_MERGE_ENABLED_EVENT,AUTO_MERGE_DISABLED_EVENT,MERGED_EVENT]){pageInfo{hasPreviousPage} nodes{__typename ... on PullRequestCommit{commit{oid checkSuites(first:1){nodes{createdAt}}}} ... on HeadRefForcePushedEvent{createdAt afterCommit{oid}} ... on AddedToMergeQueueEvent{createdAt actor{login}} ... on RemovedFromMergeQueueEvent{createdAt reason actor{login} beforeCommit{oid parents(first:3){nodes{oid}}}} ... on AutoMergeEnabledEvent{createdAt actor{login}} ... on AutoMergeDisabledEvent{createdAt reason actor{login}} ... on MergedEvent{createdAt}}}}}}";
+pub const PR_QUEUE_STATE_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){number state headRefOid headRefName isCrossRepository isInMergeQueue mergeQueueEntry{state position} autoMergeRequest{enabledAt} timelineItems(last:100,itemTypes:[PULL_REQUEST_COMMIT,HEAD_REF_FORCE_PUSHED_EVENT,ADDED_TO_MERGE_QUEUE_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT,AUTO_MERGE_ENABLED_EVENT,AUTO_MERGE_DISABLED_EVENT,MERGED_EVENT]){pageInfo{hasPreviousPage} nodes{__typename ... on PullRequestCommit{commit{oid checkSuites(first:1){nodes{createdAt}}}} ... on HeadRefForcePushedEvent{createdAt afterCommit{oid}} ... on AddedToMergeQueueEvent{createdAt actor{login}} ... on RemovedFromMergeQueueEvent{createdAt reason actor{login} beforeCommit{oid parents(first:3){nodes{oid}}}} ... on AutoMergeEnabledEvent{createdAt actor{login}} ... on AutoMergeDisabledEvent{createdAt reason actor{login}} ... on MergedEvent{createdAt}}}}}}";
 
 /// Fixed preface printed ahead of every classification a human or agent reads.
 pub const REST_AUTO_MERGE_PREFACE: &str = "REST pulls/<n>.auto_merge is null for every queued PR \
@@ -289,6 +299,10 @@ pub enum NewHeadBasis {
     /// The removal names no head; a later server-timestamped force-push event
     /// put `headRefOid` on the branch.
     PushAfterRemoval,
+    /// The removal names no head; a repository activity row (attached under
+    /// [`PUSH_ACTIVITY_KEY`]) shows a push of `headRefOid` to the pull
+    /// request's head ref strictly after the removal.
+    ActivityPushAfterRemoval,
     /// Neither: no evidence of a new head, so none is assumed.
     NoEvidence,
 }
@@ -465,29 +479,57 @@ pub fn removal_of(node: &Value, head: &str) -> RemovalOf {
     }
 }
 
+/// The normal-push evidence a caller attached to a queue response: the pull
+/// request node (for `headRefName` / `isCrossRepository`) and the activity
+/// attachment under [`PUSH_ACTIVITY_KEY`]. With no attachment only a
+/// timeline force-push can clear an unattributable removal.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PushEvidence<'a> {
+    pr: Option<&'a Value>,
+    activity: Option<&'a Value>,
+}
+
+impl<'a> PushEvidence<'a> {
+    /// The evidence attached to `response` (a [`PR_QUEUE_STATE_QUERY`]
+    /// answer), if any.
+    #[must_use]
+    pub fn of(response: &'a Value) -> Self {
+        Self {
+            pr: pull_request_node(response).map(|(node, _)| node),
+            activity: response.get(PUSH_ACTIVITY_KEY),
+        }
+    }
+}
+
 /// Whether the removal at `nodes[index]` is charged to `head`: it names the
 /// head ([`RemovalOf::Head`]), or it names no head ([`RemovalOf::Unattributable`]).
 ///
-/// An unattributable removal is charged unless a later, server-timestamped
-/// `HeadRefForcePushedEvent` identifies the current head, no earlier force-push
-/// or `PullRequestCommit` of it does,
-/// and `timeline_complete` is `Some(true)` (`hasPreviousPage: false`). In a
-/// truncated or unmeasured window an earlier push of the same head can sit on
-/// a page that was never read, so a later push proves nothing and the removal
-/// stays charged. Commit timeline items
-/// are author-controlled and cannot prove push order; check-suite creation is
-/// also deliberately ignored because it can lag the push. Without an
-/// authoritative push event the removal counts: counting costs at most one
-/// approval newer than the removal, while dropping it could let a head that
-/// keeps failing in the queue be re-armed without a fresh review. Only a removal
-/// that names another head ([`RemovalOf::OtherHead`]) or demonstrably predates a
-/// later force-push arrival is left out.
+/// An unattributable removal is charged unless authoritative evidence shows
+/// the current head arrived after it:
+///
+/// - a later, server-timestamped `HeadRefForcePushedEvent` identifies the
+///   current head, no earlier force-push or `PullRequestCommit` of it does,
+///   and `timeline_complete` is `Some(true)` (`hasPreviousPage: false`). In a
+///   truncated or unmeasured window an earlier push of the same head can sit
+///   on a page that was never read, so a later push proves nothing; or
+/// - the attached repository activity page (`evidence`) has a `push` or
+///   `force_push` row of the current head strictly after the removal, and no
+///   row at or before it names that head (see [`activity_push_after_removal`]).
+///
+/// Commit timeline items are author-controlled and cannot prove push order;
+/// check-suite creation is also deliberately ignored because it can lag the
+/// push. Without authoritative evidence the removal counts: counting costs at
+/// most one approval newer than the removal, while dropping it could let a
+/// head that keeps failing in the queue be re-armed without a fresh review.
+/// Only a removal that names another head ([`RemovalOf::OtherHead`]) or
+/// demonstrably predates the current head's arrival is left out.
 #[must_use]
 pub fn removal_charges_head(
     nodes: &[Value],
     index: usize,
     head: &str,
     timeline_complete: Option<bool>,
+    evidence: PushEvidence<'_>,
 ) -> bool {
     let Some(node) = nodes.get(index) else {
         return true;
@@ -496,9 +538,21 @@ pub fn removal_charges_head(
         RemovalOf::OtherHead => false,
         RemovalOf::Head => true,
         RemovalOf::Unattributable => {
-            timeline_complete != Some(true) || !push_after_removal(nodes, index, head)
+            !(timeline_settles(nodes, index, head, timeline_complete)
+                || activity_push_after_removal(evidence, nodes, index, head))
         }
     }
+}
+
+/// The timeline-only rule: a later force-push of `head`, none earlier, in a
+/// complete window.
+fn timeline_settles(
+    nodes: &[Value],
+    index: usize,
+    head: &str,
+    timeline_complete: Option<bool>,
+) -> bool {
+    timeline_complete == Some(true) && push_after_removal(nodes, index, head)
 }
 
 /// Whether the first re-add (at `add`) after the hazard removal at `removal`
@@ -526,17 +580,19 @@ fn same_head_re_add(
 
 /// Whether `head` is a new head since the removal at `index`, and on what basis.
 ///
-/// A removal that names no head credits a later push only under the same rule
-/// as [`removal_charges_head`]: a later `HeadRefForcePushedEvent` of `head`, no
-/// earlier force-push or `PullRequestCommit` of it, and a complete window (`timeline_complete == Some(true)`). In
-/// a truncated or unmeasured window an earlier push of `head` may be on an
-/// unread page, so there is no credit and the re-arm or requeue fails closed.
+/// A removal that names no head credits a later push only under the same
+/// rules as [`removal_charges_head`]: a later `HeadRefForcePushedEvent` of
+/// `head` with no earlier force-push or `PullRequestCommit` of it in a complete
+/// window ([`NewHeadBasis::PushAfterRemoval`]), or an attached activity row
+/// ([`NewHeadBasis::ActivityPushAfterRemoval`]). Anything else is no credit,
+/// so the re-arm or requeue fails closed.
 fn new_head_since(
     nodes: &[Value],
     index: usize,
     removed: Option<&str>,
     head: Option<&str>,
     timeline_complete: Option<bool>,
+    evidence: PushEvidence<'_>,
 ) -> (bool, NewHeadBasis) {
     let Some(head) = head else {
         return (false, NewHeadBasis::NoEvidence);
@@ -547,8 +603,11 @@ fn new_head_since(
             NewHeadBasis::RemovedHeadSha,
         );
     }
-    if timeline_complete == Some(true) && push_after_removal(nodes, index, head) {
+    if timeline_settles(nodes, index, head, timeline_complete) {
         return (true, NewHeadBasis::PushAfterRemoval);
+    }
+    if activity_push_after_removal(evidence, nodes, index, head) {
+        return (true, NewHeadBasis::ActivityPushAfterRemoval);
     }
     (false, NewHeadBasis::NoEvidence)
 }
@@ -580,6 +639,281 @@ fn authoritative_push_oid(node: &Value) -> Option<&str> {
         .flatten()
 }
 
+/// Top-level key, beside `data`, under which a caller attaches the head
+/// branch's repository activity page to a [`PR_QUEUE_STATE_QUERY`] response.
+///
+/// Shape: `{"headRef": <name>, "crossRepository": false, "rows": [...]}` for a
+/// page that was read, `{"error": <detail>}` for one that was not. GitHub's
+/// GraphQL responses carry only `data`, `errors` and `extensions`, so the key
+/// can only come from the caller.
+pub const PUSH_ACTIVITY_KEY: &str = "pushActivity";
+
+/// The one activity page read per pull request and head.
+pub const PUSH_ACTIVITY_PAGE: usize = 100;
+
+/// One validated activity row.
+struct ActivityRow<'a> {
+    after: &'a str,
+    kind: &'a str,
+    at: chrono::DateTime<chrono::Utc>,
+}
+
+fn parse_time(value: Option<&Value>) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(value?.as_str()?)
+        .ok()
+        .map(|at| at.with_timezone(&chrono::Utc))
+}
+
+/// The attached activity rows, newest first, or `None` when there is no
+/// usable page: nothing attached, a fetch error, a fork or unknown head
+/// repository, a head ref that differs from the pull request's, more rows
+/// than one page holds, rows out of order, or any row that is not a
+/// well-formed activity on `refs/heads/<headRef>`. One bad row voids the page.
+fn activity_rows(evidence: PushEvidence<'_>) -> Option<Vec<ActivityRow<'_>>> {
+    let activity = evidence.activity?.as_object()?;
+    if activity.contains_key("error") {
+        return None;
+    }
+    if activity.get("crossRepository") != Some(&Value::Bool(false)) {
+        return None;
+    }
+    let head_ref = activity
+        .get("headRef")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())?;
+    if let Some(pr) = evidence.pr {
+        if pr.get("isCrossRepository").and_then(Value::as_bool) == Some(true) {
+            return None;
+        }
+        if let Some(name) = pr.get("headRefName").and_then(Value::as_str)
+            && name != head_ref
+        {
+            return None;
+        }
+    }
+    let rows = activity.get("rows")?.as_array()?;
+    if rows.len() > PUSH_ACTIVITY_PAGE {
+        return None;
+    }
+    let full_ref = format!("refs/heads/{head_ref}");
+    let mut parsed = Vec::with_capacity(rows.len());
+    for row in rows {
+        let after = row
+            .get("after")
+            .and_then(Value::as_str)
+            .filter(|oid| !oid.is_empty())?;
+        let kind = row.get("activity_type").and_then(Value::as_str)?;
+        if row.get("ref").and_then(Value::as_str) != Some(full_ref.as_str()) {
+            return None;
+        }
+        let at = parse_time(row.get("timestamp"))?;
+        if parsed
+            .last()
+            .is_some_and(|newer: &ActivityRow<'_>| newer.at < at)
+        {
+            return None;
+        }
+        parsed.push(ActivityRow { after, kind, at });
+    }
+    Some(parsed)
+}
+
+/// Whether the attached activity page proves `head` was pushed to the pull
+/// request's head ref after the removal at `nodes[index]`, which names no head.
+///
+/// Credit needs all of:
+///
+/// - a usable page ([`activity_rows`]) that reaches back past the removal: a
+///   row strictly older than the removal's `createdAt`, so every push between
+///   that row and now is on the page;
+/// - no row at or before the removal whose `after` is `head`, and no
+///   `HeadRefForcePushedEvent` of `head` before the removal in the timeline:
+///   a head already on the branch then is not a new arrival;
+/// - a `push` or `force_push` row whose `after` is `head`, with a server
+///   `timestamp` strictly later than the removal.
+///
+/// A `PullRequestCommit`'s timeline position is not consulted here: GitHub
+/// sorts it by the author-controlled commit date, so a fix committed before
+/// the removal and pushed after it sits before the removal (the real 9653
+/// capture). The activity rows are server-timestamped and say when it arrived.
+#[must_use]
+pub fn activity_push_after_removal(
+    evidence: PushEvidence<'_>,
+    nodes: &[Value],
+    index: usize,
+    head: &str,
+) -> bool {
+    let Some(rows) = activity_rows(evidence) else {
+        return false;
+    };
+    let Some(removed_at) = nodes
+        .get(index)
+        .and_then(|node| parse_time(node.get("createdAt")))
+    else {
+        return false;
+    };
+    let names_head = |row: &ActivityRow<'_>| row.after.eq_ignore_ascii_case(head);
+    if !rows.iter().any(|row| row.at < removed_at) {
+        return false;
+    }
+    if rows
+        .iter()
+        .any(|row| row.at <= removed_at && names_head(row))
+    {
+        return false;
+    }
+    if nodes[..index]
+        .iter()
+        .filter_map(authoritative_push_oid)
+        .any(|oid| oid.eq_ignore_ascii_case(head))
+    {
+        return false;
+    }
+    rows.iter().any(|row| {
+        row.at > removed_at && names_head(row) && matches!(row.kind, "push" | "force_push")
+    })
+}
+
+/// Whether `response` has a non-merge removal that names no head (or whose
+/// removed head cannot be established) and that the timeline's own force-push
+/// rule does not settle: the only case in which the activity page can change
+/// the classification, so the only case worth a fetch.
+#[must_use]
+pub fn push_activity_wanted(response: &Value) -> bool {
+    let Some((pr, _)) = pull_request_node(response) else {
+        return false;
+    };
+    let Some(head) = pr.get("headRefOid").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(nodes) = pr.pointer("/timelineItems/nodes").and_then(Value::as_array) else {
+        return false;
+    };
+    let timeline_complete = pr
+        .pointer("/timelineItems/pageInfo/hasPreviousPage")
+        .and_then(Value::as_bool)
+        .map(|has_previous| !has_previous);
+    let known = nodes
+        .iter()
+        .filter_map(pushed_oid)
+        .chain(Some(head))
+        .collect::<Vec<_>>();
+    nodes.iter().enumerate().any(|(index, node)| {
+        node.get("__typename").and_then(Value::as_str) == Some("RemovedFromMergeQueueEvent")
+            && !node
+                .get("reason")
+                .and_then(Value::as_str)
+                .is_some_and(|reason| reason.eq_ignore_ascii_case("merged"))
+            && (removal_of(node, head) == RemovalOf::Unattributable
+                || removed_head(node, &known).is_none())
+            && !timeline_settles(nodes, index, head, timeline_complete)
+    })
+}
+
+/// The REST path of the one activity page read for `head_ref` in `repo`, or
+/// `None` when the ref name has a character that would need escaping in a
+/// query string (then no page is read and the removal stays charged).
+#[must_use]
+pub fn push_activity_path(repo: &str, head_ref: &str) -> Option<String> {
+    let plain = |text: &str| {
+        !text.is_empty()
+            && text
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
+    };
+    (plain(repo) && plain(head_ref)).then(|| {
+        format!("repos/{repo}/activity?ref=refs/heads/{head_ref}&per_page={PUSH_ACTIVITY_PAGE}")
+    })
+}
+
+type ActivityCacheKey = (String, u64, String, String);
+
+/// Activity pages already read, by (repository, pull request, head, head ref).
+/// An entry lives [`ACTIVITY_CACHE_TTL`], about one steward pass.
+static ACTIVITY_CACHE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<ActivityCacheKey, (std::time::Instant, Value)>>,
+> = std::sync::LazyLock::new(Default::default);
+
+const ACTIVITY_CACHE_TTL: std::time::Duration = std::time::Duration::from_mins(4);
+
+/// Attach the head branch's activity page to `response` (a
+/// [`PR_QUEUE_STATE_QUERY`] answer for a pull request in `repo`) under
+/// [`PUSH_ACTIVITY_KEY`], when [`push_activity_wanted`] says it can matter.
+///
+/// `fetch` is the caller's App-authenticated REST read (`gh api <path>`
+/// through its existing client); it returns the body or an error for a failed
+/// or non-2xx read. One page is read per (pull request, head) and reused for
+/// [`ACTIVITY_CACHE_TTL`]. A fork head, an unreadable head ref, a fetch error
+/// or a body that is not a JSON array attaches `{"error": ...}`, which the
+/// classifier reads as no evidence. A response that already carries the key is
+/// left alone.
+pub fn attach_push_activity<F>(response: &mut Value, repo: &str, fetch: F)
+where
+    F: FnOnce(&str) -> Result<String, String>,
+{
+    if response.get(PUSH_ACTIVITY_KEY).is_some() || !push_activity_wanted(response) {
+        return;
+    }
+    let attachment = read_push_activity(response, repo, fetch);
+    if let Some(object) = response.as_object_mut() {
+        object.insert(PUSH_ACTIVITY_KEY.to_owned(), attachment);
+    }
+}
+
+fn read_push_activity<F>(response: &Value, repo: &str, fetch: F) -> Value
+where
+    F: FnOnce(&str) -> Result<String, String>,
+{
+    let error = |detail: &str| serde_json::json!({ "error": detail });
+    let Some((pr, _)) = pull_request_node(response) else {
+        return error("no pull request in the response");
+    };
+    if pr.get("isCrossRepository").and_then(Value::as_bool) != Some(false) {
+        return error("the head is not proven to be in the base repository (fork or unread)");
+    }
+    let Some(head_ref) = pr.get("headRefName").and_then(Value::as_str) else {
+        return error("headRefName is missing");
+    };
+    let (Some(number), Some(head)) = (
+        pr.get("number").and_then(Value::as_u64),
+        pr.get("headRefOid").and_then(Value::as_str),
+    ) else {
+        return error("number or headRefOid is missing");
+    };
+    let Some(path) = push_activity_path(repo, head_ref) else {
+        return error("the repository or head ref name cannot be put in a query string");
+    };
+    let key = (
+        repo.to_ascii_lowercase(),
+        number,
+        head.to_ascii_lowercase(),
+        head_ref.to_owned(),
+    );
+    if let Ok(cache) = ACTIVITY_CACHE.lock()
+        && let Some((at, value)) = cache.get(&key)
+        && at.elapsed() < ACTIVITY_CACHE_TTL
+    {
+        return value.clone();
+    }
+    let attachment = match fetch(&path) {
+        Ok(body) => match serde_json::from_str::<Value>(&body) {
+            Ok(Value::Array(rows)) => serde_json::json!({
+                "headRef": head_ref,
+                "crossRepository": false,
+                "rows": rows,
+            }),
+            Ok(_) => error("the activity page is not a JSON array"),
+            Err(parse) => error(&format!("the activity page is not JSON: {parse}")),
+        },
+        Err(detail) => error(&format!("the activity page is unreadable: {detail}")),
+    };
+    if let Ok(mut cache) = ACTIVITY_CACHE.lock() {
+        cache.retain(|_, (at, _)| at.elapsed() < ACTIVITY_CACHE_TTL);
+        cache.insert(key, (std::time::Instant::now(), attachment.clone()));
+    }
+    attachment
+}
+
 /// Classify and report every fact, with the field path it came from.
 #[must_use]
 #[allow(clippy::too_many_lines)]
@@ -598,6 +932,7 @@ pub fn explain_pr_queue_state(response: &Value) -> PrQueueReport {
     let Some((pr, root)) = pull_request_node(response) else {
         return unknown("response carries no pull request object", facts);
     };
+    let evidence = PushEvidence::of(response);
     let fact = |facts: &mut Vec<QueueFact>, name: &str, value: Value, field: &str| {
         facts.push(QueueFact {
             name: name.to_owned(),
@@ -651,6 +986,16 @@ pub fn explain_pr_queue_state(response: &Value) -> PrQueueReport {
         timeline_complete.map_or(Value::Null, Value::from),
         "timelineItems.pageInfo.hasPreviousPage",
     );
+    if let Some(activity) = evidence.activity {
+        facts.push(QueueFact {
+            name: "push_activity".to_owned(),
+            value: match activity.get("rows").and_then(Value::as_array) {
+                Some(rows) => serde_json::json!({ "rows": rows.len() }),
+                None => serde_json::json!({ "error": activity.get("error").cloned() }),
+            },
+            source: PUSH_ACTIVITY_KEY.to_owned(),
+        });
+    }
 
     // Every commit this pull request is seen to have had: a removed head read
     // off a merge-group commit is trusted only when it is one of these.
@@ -744,6 +1089,7 @@ pub fn explain_pr_queue_state(response: &Value) -> PrQueueReport {
                 removed_head.as_deref(),
                 head_oid.as_deref(),
                 timeline_complete,
+                evidence,
             );
             Ejection {
                 new_head_since,
@@ -759,14 +1105,15 @@ pub fn explain_pr_queue_state(response: &Value) -> PrQueueReport {
             }
         });
     let ejections_of_current_head =
-        count_ejections_of_head(nodes, head_oid.as_deref(), timeline_complete);
+        count_ejections_of_head(nodes, head_oid.as_deref(), timeline_complete, evidence);
     fact(
         &mut facts,
         "ejections_of_current_head",
         Value::from(ejections_of_current_head),
         "timelineItems.nodes[] (failed_checks/merge_conflict RemovedFromMergeQueueEvent whose \
          removed head is headRefOid; a removal naming no head counts unless a later \
-         server-timestamped force-push event identifies headRefOid)",
+         server-timestamped force-push event or an attached repository activity push row \
+         identifies headRefOid)",
     );
     if let Some(ejection) = &last_ejection {
         fact(
@@ -789,6 +1136,9 @@ pub fn explain_pr_queue_state(response: &Value) -> PrQueueReport {
                     NewHeadBasis::PushAfterRemoval =>
                         "no removed head named; new head = a later server-timestamped \
                          force-push event whose oid is headRefOid",
+                    NewHeadBasis::ActivityPushAfterRemoval =>
+                        "no removed head named; new head = a repository activity push row \
+                         (pushActivity) whose after is headRefOid, later than the removal",
                     NewHeadBasis::NoEvidence =>
                         "no removed head named and no later push of headRefOid; no new head \
                          assumed",
@@ -871,6 +1221,7 @@ fn count_ejections_of_head(
     nodes: &[Value],
     head: Option<&str>,
     timeline_complete: Option<bool>,
+    evidence: PushEvidence<'_>,
 ) -> u32 {
     let Some(head) = head else {
         return 0;
@@ -884,7 +1235,7 @@ fn count_ejections_of_head(
         if !same_head_requeue_cascades(reason) {
             continue;
         }
-        if removal_charges_head(nodes, index, head, timeline_complete) {
+        if removal_charges_head(nodes, index, head, timeline_complete, evidence) {
             count += 1;
         }
     }
@@ -920,6 +1271,21 @@ mod tests {
 
     fn expected() -> Value {
         fixture("expected_classifications.json")
+    }
+
+    /// Fixture `name` with the activity page its expectation names under
+    /// `push_activity` attached, as [`attach_push_activity`] would.
+    fn with_fixture_activity(name: &str, want: &Value) -> Value {
+        let mut response = fixture(name);
+        if let Some(activity) = want.get("push_activity").and_then(Value::as_str) {
+            let page = fixture(activity);
+            response[PUSH_ACTIVITY_KEY] = serde_json::json!({
+                "headRef": page["head_ref"],
+                "crossRepository": false,
+                "rows": page["rows"],
+            });
+        }
+        response
     }
 
     /// The #8811 capture with its removal reason replaced.
@@ -1137,7 +1503,7 @@ mod tests {
             if name.starts_with('_') {
                 continue;
             }
-            let report = explain_pr_queue_state(&fixture(name));
+            let report = explain_pr_queue_state(&with_fixture_activity(name, want));
             assert_eq!(report.state.class(), want["class"], "{name}");
             assert_eq!(report.pr, want["pr"].as_u64(), "{name}");
             assert_eq!(
@@ -1732,5 +2098,288 @@ mod tests {
         let ejection = report.last_ejection.expect("ejection");
         assert!(!ejection.new_head_since);
         assert_eq!(ejection.new_head_basis, NewHeadBasis::NoEvidence);
+    }
+
+    const ACT_HEAD: &str = "1111111111111111111111111111111111111111";
+    const ACT_FIRST: &str = "3333333333333333333333333333333333333333";
+    const ACT_SECOND: &str = "4444444444444444444444444444444444444444";
+    const ACT_OTHER: &str = "2222222222222222222222222222222222222222";
+
+    fn activity_row(at: &str, kind: &str, after: &str) -> Value {
+        serde_json::json!({"activity_type": kind, "after": after,
+                           "ref": "refs/heads/feature", "timestamp": at})
+    }
+
+    /// Two `merge_conflict` removals (no `beforeCommit`), then the mandated
+    /// repair: merge main and push normally, which leaves only a
+    /// `PullRequestCommit` of the new head in the timeline.
+    fn two_conflicts_then_normal_push() -> Value {
+        serde_json::json!({"data":{"repository":{"pullRequest":{
+            "number":7,"state":"OPEN","headRefOid":ACT_HEAD,"headRefName":"feature",
+            "isCrossRepository":false,"isInMergeQueue":false,
+            "mergeQueueEntry":null,"autoMergeRequest":null,
+            "timelineItems":{"pageInfo":{"hasPreviousPage":false},"nodes":[
+                {"__typename":"PullRequestCommit","commit":{"oid":ACT_FIRST}},
+                {"__typename":"RemovedFromMergeQueueEvent","createdAt":"2026-10-04T01:00:00Z",
+                 "reason":"merge_conflict","beforeCommit":null},
+                {"__typename":"PullRequestCommit","commit":{"oid":ACT_SECOND}},
+                {"__typename":"RemovedFromMergeQueueEvent","createdAt":"2026-10-04T02:00:00Z",
+                 "reason":"merge_conflict","beforeCommit":null},
+                {"__typename":"PullRequestCommit","commit":{"oid":ACT_HEAD}}]}}}}})
+    }
+
+    fn matching_rows() -> Vec<Value> {
+        vec![
+            activity_row("2026-10-04T03:00:00Z", "push", ACT_HEAD),
+            activity_row("2026-10-04T01:30:00Z", "push", ACT_SECOND),
+            activity_row("2026-10-04T00:30:00Z", "push", ACT_FIRST),
+            activity_row(
+                "2026-10-04T00:10:00Z",
+                "branch_creation",
+                "5555555555555555555555555555555555555555",
+            ),
+        ]
+    }
+
+    fn with_rows(rows: Vec<Value>) -> Value {
+        let mut response = two_conflicts_then_normal_push();
+        response[PUSH_ACTIVITY_KEY] = serde_json::json!({"headRef":"feature","crossRepository":false,"rows":Value::Array(rows)});
+        response
+    }
+
+    fn charged(response: &Value) -> (u32, bool, NewHeadBasis) {
+        let report = explain_pr_queue_state(response);
+        let ejection = report.last_ejection.expect("ejection");
+        (
+            report.ejections_of_current_head,
+            ejection.new_head_since,
+            ejection.new_head_basis,
+        )
+    }
+
+    #[test]
+    fn a_normal_push_after_conflict_removals_clears_them_on_matching_activity() {
+        assert_eq!(
+            charged(&with_rows(matching_rows())),
+            (0, true, NewHeadBasis::ActivityPushAfterRemoval)
+        );
+        // A force_push row is a push too.
+        let mut rows = matching_rows();
+        rows[0]["activity_type"] = Value::from("force_push");
+        assert_eq!(charged(&with_rows(rows)).0, 0);
+    }
+
+    #[test]
+    fn without_usable_activity_conflict_removals_stay_charged() {
+        let none = (2, false, NewHeadBasis::NoEvidence);
+        assert_eq!(
+            charged(&two_conflicts_then_normal_push()),
+            none,
+            "no activity"
+        );
+        let mut error = two_conflicts_then_normal_push();
+        error[PUSH_ACTIVITY_KEY] = serde_json::json!({"error": "HTTP 502"});
+        assert_eq!(charged(&error), none, "fetch error");
+        assert_eq!(charged(&with_rows(Vec::new())), none, "empty page");
+
+        let mut mismatch = matching_rows();
+        mismatch[0]["after"] = Value::from(ACT_OTHER);
+        assert_eq!(charged(&with_rows(mismatch)), none, "after mismatch");
+
+        // The head's push is timestamped before the first removal, so it was
+        // already on the branch: not a new arrival for either removal.
+        let mut early = matching_rows();
+        early.remove(0);
+        early.push(activity_row("2026-10-04T00:05:00Z", "push", ACT_HEAD));
+        assert_eq!(charged(&with_rows(early)), none, "push before the removal");
+
+        // A push at the second removal's own second is not strictly later
+        // than it (and is a sighting at it), so only the first one clears.
+        let mut same_second = matching_rows();
+        same_second[0]["timestamp"] = Value::from("2026-10-04T02:00:00Z");
+        assert_eq!(
+            charged(&with_rows(same_second)),
+            (1, false, NewHeadBasis::NoEvidence),
+            "same second"
+        );
+    }
+
+    #[test]
+    fn a_fork_head_or_another_ref_gives_no_activity_credit() {
+        let none = (2, false, NewHeadBasis::NoEvidence);
+        let mut fork = with_rows(matching_rows());
+        fork["data"]["repository"]["pullRequest"]["isCrossRepository"] = Value::Bool(true);
+        assert_eq!(charged(&fork), none, "fork pull request");
+        let mut unproven = with_rows(matching_rows());
+        unproven[PUSH_ACTIVITY_KEY]["crossRepository"] = Value::Null;
+        assert_eq!(charged(&unproven), none, "head repository unproven");
+        let mut renamed = with_rows(matching_rows());
+        renamed["data"]["repository"]["pullRequest"]["headRefName"] = Value::from("other");
+        assert_eq!(charged(&renamed), none, "activity for another head ref");
+        let mut rows = matching_rows();
+        rows[0]["ref"] = Value::from("refs/heads/other");
+        assert_eq!(charged(&with_rows(rows)), none, "a row on another ref");
+    }
+
+    #[test]
+    fn a_malformed_or_short_activity_page_gives_no_credit() {
+        let none = (2, false, NewHeadBasis::NoEvidence);
+        let mut missing = matching_rows();
+        missing[2].as_object_mut().expect("row").remove("timestamp");
+        assert_eq!(
+            charged(&with_rows(missing)),
+            none,
+            "row without a timestamp"
+        );
+        let mut unordered = matching_rows();
+        unordered.swap(0, 1);
+        assert_eq!(charged(&with_rows(unordered)), none, "rows out of order");
+        let mut not_rows = with_rows(matching_rows());
+        not_rows[PUSH_ACTIVITY_KEY]["rows"] = serde_json::json!({"0": {}});
+        assert_eq!(charged(&not_rows), none, "rows not a list");
+        let mut too_many = matching_rows();
+        too_many.extend(
+            (0..PUSH_ACTIVITY_PAGE)
+                .map(|_| activity_row("2026-10-04T00:00:00Z", "push", ACT_OTHER)),
+        );
+        assert_eq!(charged(&with_rows(too_many)), none, "more than one page");
+
+        // A page that does not reach back past the first removal leaves that
+        // removal charged; the second, which the page does reach, clears.
+        let short = matching_rows()[..2].to_vec();
+        let (count, new_head, basis) = charged(&with_rows(short));
+        assert_eq!(count, 1);
+        assert!(new_head);
+        assert_eq!(basis, NewHeadBasis::ActivityPushAfterRemoval);
+        let shorter = matching_rows()[..1].to_vec();
+        assert_eq!(
+            charged(&with_rows(shorter)),
+            none,
+            "page reaches neither removal"
+        );
+    }
+
+    /// Away and back: the head was on the branch before the removal (an
+    /// earlier activity row or timeline force-push names it), so a later
+    /// push of it is not a new arrival.
+    #[test]
+    fn activity_keeps_the_earlier_visibility_veto() {
+        let mut rows = matching_rows();
+        rows.insert(
+            1,
+            activity_row("2026-10-04T02:30:00Z", "force_push", ACT_OTHER),
+        );
+        rows.insert(2, activity_row("2026-10-04T01:45:00Z", "push", ACT_HEAD));
+        let (count, new_head, _) = charged(&with_rows(rows));
+        // The first removal predates every sighting of the head and clears;
+        // the second followed one and stays charged.
+        assert_eq!(count, 1);
+        assert!(!new_head);
+
+        let mut forced = with_rows(matching_rows());
+        forced["data"]["repository"]["pullRequest"]["timelineItems"]["nodes"]
+            .as_array_mut()
+            .expect("nodes")
+            .insert(
+                0,
+                serde_json::json!({"__typename":"HeadRefForcePushedEvent",
+                    "createdAt":"2026-10-04T00:20:00Z","afterCommit":{"oid":ACT_HEAD}}),
+            );
+        assert_eq!(charged(&forced), (2, false, NewHeadBasis::NoEvidence));
+    }
+
+    #[test]
+    fn real_9653_and_8722_without_activity_still_refuse() {
+        for name in [
+            "pr_real_9653_merge_conflict_backdated_push.json",
+            "pr_ejected_new_head.json",
+        ] {
+            let ejection = explain_pr_queue_state(&fixture(name))
+                .last_ejection
+                .expect("ejection");
+            assert!(!ejection.new_head_since, "{name}");
+            assert_eq!(ejection.new_head_basis, NewHeadBasis::NoEvidence, "{name}");
+        }
+    }
+
+    fn wanting_activity() -> Value {
+        two_conflicts_then_normal_push()
+    }
+
+    #[test]
+    fn activity_is_read_only_when_an_unsettled_unattributable_removal_exists() {
+        assert!(push_activity_wanted(&wanting_activity()));
+        // Settled by a timeline force-push in a complete window: no read.
+        let mut settled = wanting_activity();
+        let nodes = settled["data"]["repository"]["pullRequest"]["timelineItems"]["nodes"]
+            .as_array_mut()
+            .expect("nodes");
+        nodes.pop();
+        nodes.push(serde_json::json!({"__typename":"HeadRefForcePushedEvent",
+            "createdAt":"2026-10-04T03:00:00Z","afterCommit":{"oid":ACT_HEAD}}));
+        assert!(!push_activity_wanted(&settled));
+        let mut never = wanting_activity();
+        never["data"]["repository"]["pullRequest"]["timelineItems"]["nodes"] =
+            serde_json::json!([]);
+        assert!(!push_activity_wanted(&never));
+        let fetched = std::cell::Cell::new(0);
+        let mut response = never.clone();
+        attach_push_activity(&mut response, "owner/repo", |_| {
+            fetched.set(fetched.get() + 1);
+            Ok("[]".to_owned())
+        });
+        assert_eq!(fetched.get(), 0);
+        assert!(response.get(PUSH_ACTIVITY_KEY).is_none());
+    }
+
+    #[test]
+    fn attach_reads_one_page_and_fails_closed() {
+        let rows = Value::Array(matching_rows()).to_string();
+        let mut response = wanting_activity();
+        // A distinct PR number keeps this test's cache entries its own.
+        response["data"]["repository"]["pullRequest"]["number"] = Value::from(970_001);
+        let paths = std::cell::RefCell::new(Vec::new());
+        attach_push_activity(&mut response, "owner/repo", |path| {
+            paths.borrow_mut().push(path.to_owned());
+            Ok(rows.clone())
+        });
+        assert_eq!(
+            *paths.borrow(),
+            ["repos/owner/repo/activity?ref=refs/heads/feature&per_page=100"]
+        );
+        assert_eq!(charged(&response).0, 0);
+        // Same PR and head: the cached page, no second read.
+        let mut again = wanting_activity();
+        again["data"]["repository"]["pullRequest"]["number"] = Value::from(970_001);
+        attach_push_activity(&mut again, "owner/repo", |_| panic!("read twice"));
+        assert_eq!(charged(&again).0, 0);
+
+        let mut failed = wanting_activity();
+        failed["data"]["repository"]["pullRequest"]["number"] = Value::from(970_002);
+        attach_push_activity(&mut failed, "owner/repo", |_| Err("HTTP 404".to_owned()));
+        assert!(failed[PUSH_ACTIVITY_KEY]["error"].is_string());
+        assert_eq!(charged(&failed).0, 2);
+
+        let mut odd = wanting_activity();
+        odd["data"]["repository"]["pullRequest"]["number"] = Value::from(970_003);
+        attach_push_activity(&mut odd, "owner/repo", |_| {
+            Ok("{\"message\":\"x\"}".to_owned())
+        });
+        assert!(odd[PUSH_ACTIVITY_KEY]["error"].is_string());
+        assert_eq!(charged(&odd).0, 2);
+
+        // A fork head, or one whose repository the response does not prove,
+        // is never read.
+        for cross in [Value::Bool(true), Value::Null] {
+            let mut fork = wanting_activity();
+            fork["data"]["repository"]["pullRequest"]["number"] = Value::from(970_004);
+            fork["data"]["repository"]["pullRequest"]["isCrossRepository"] = cross.clone();
+            attach_push_activity(&mut fork, "owner/repo", |_| panic!("fork read"));
+            assert!(fork[PUSH_ACTIVITY_KEY]["error"].is_string(), "{cross}");
+            assert_eq!(charged(&fork).0, 2);
+        }
+        // A ref name that would need escaping is never put in a query string.
+        assert_eq!(push_activity_path("owner/repo", "a&b"), None);
+        assert_eq!(push_activity_path("owner/repo", "a b"), None);
     }
 }

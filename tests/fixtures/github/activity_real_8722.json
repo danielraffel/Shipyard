@@ -1,0 +1,59 @@
+{
+  "_provenance": {
+    "source": "GET repos/Generous-Corp/pulp/activity?ref=refs/heads/feat/pr-flow-audit-20260922&per_page=100",
+    "captured": "2026-11-14T19:45:44Z",
+    "cut": "none: headRefOid 99d205a2 is still the branch head",
+    "trimmed": "actor reduced to login; every other field unedited"
+  },
+  "head_ref": "feat/pr-flow-audit-20260922",
+  "rows": [
+    {
+      "id": 44302560631,
+      "node_id": "PSH_kwLOR7YGt88AAAAKUKNtdw",
+      "before": "93ca4e1541f332acc42767a0aa07e6fd81d8a3b5",
+      "after": "99d205a231abc1056db3b001d535af50582086ac",
+      "ref": "refs/heads/feat/pr-flow-audit-20260922",
+      "timestamp": "2026-09-22T21:56:29Z",
+      "activity_type": "push",
+      "actor": {
+        "login": "danielraffel"
+      }
+    },
+    {
+      "id": 44302342699,
+      "node_id": "PSH_kwLOR7YGt88AAAAKUKAaKw",
+      "before": "3fcc068e6e9500ef21aebb8af98c75d0ec86b2bf",
+      "after": "93ca4e1541f332acc42767a0aa07e6fd81d8a3b5",
+      "ref": "refs/heads/feat/pr-flow-audit-20260922",
+      "timestamp": "2026-09-22T21:53:00Z",
+      "activity_type": "push",
+      "actor": {
+        "login": "danielraffel"
+      }
+    },
+    {
+      "id": 44290320082,
+      "node_id": "PSH_kwLOR7YGt88AAAAKT-im0g",
+      "before": "a2220ea32dbcfd504ec3e01e0e48aba728ceced6",
+      "after": "3fcc068e6e9500ef21aebb8af98c75d0ec86b2bf",
+      "ref": "refs/heads/feat/pr-flow-audit-20260922",
+      "timestamp": "2026-09-22T19:06:20Z",
+      "activity_type": "push",
+      "actor": {
+        "login": "danielraffel"
+      }
+    },
+    {
+      "id": 44289922356,
+      "node_id": "PSH_kwLOR7YGt88AAAAKT-KVNA",
+      "before": "0000000000000000000000000000000000000000",
+      "after": "a2220ea32dbcfd504ec3e01e0e48aba728ceced6",
+      "ref": "refs/heads/feat/pr-flow-audit-20260922",
+      "timestamp": "2026-09-22T19:01:18Z",
+      "activity_type": "branch_creation",
+      "actor": {
+        "login": "danielraffel"
+      }
+    }
+  ]
+}

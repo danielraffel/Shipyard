@@ -272,8 +272,14 @@ pub(super) fn read_pr_queue_state(
             format!("number={number}"),
         ])
         .map_err(|error| format!("merge-queue observation unreadable: {error}"))?;
-    serde_json::from_str::<Value>(&raw)
-        .map_err(|error| format!("merge-queue observation unreadable: {error}"))
+    let mut queue = serde_json::from_str::<Value>(&raw)
+        .map_err(|error| format!("merge-queue observation unreadable: {error}"))?;
+    crate::pr_queue_state::attach_push_activity(&mut queue, &observation.repo, |path| {
+        actions
+            .run_gh(&["api".to_owned(), path.to_owned()])
+            .map_err(|error| error.to_string())
+    });
+    Ok(queue)
 }
 
 /// [`read_pr_queue_state`], refusing a 200 answer that carries no pull

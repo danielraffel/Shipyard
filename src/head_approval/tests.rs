@@ -764,6 +764,71 @@ fn an_unattributable_removal_requires_authoritative_push_evidence_to_clear() {
     );
 }
 
+/// `queue` with an activity page for head ref `feature` attached, as the
+/// steward's read attaches it.
+fn with_activity(mut queue: Value, rows: Vec<Value>) -> Value {
+    queue["data"]["repository"]["pullRequest"]["headRefName"] = json!("feature");
+    queue["data"]["repository"]["pullRequest"]["isCrossRepository"] = json!(false);
+    queue[crate::pr_queue_state::PUSH_ACTIVITY_KEY] =
+        json!({"headRef": "feature", "crossRepository": false, "rows": Value::Array(rows)});
+    queue
+}
+
+fn push_row(at: &str, after: &str) -> Value {
+    json!({"activity_type": "push", "after": after, "ref": "refs/heads/feature",
+           "timestamp": at})
+}
+
+/// The mandated repair after two `merge_conflict` removals (merge main, push
+/// normally) leaves only a `PullRequestCommit`; a repository activity row of
+/// the head after the removals clears both from the ejection cap.
+#[test]
+fn a_normal_push_with_activity_evidence_clears_conflict_removals() {
+    let queue = || {
+        let mut nodes = vec![commit(OTHER, None)];
+        nodes.extend([
+            conflict_removal("2026-10-04T01:00:00Z"),
+            conflict_removal("2026-10-04T02:00:00Z"),
+            commit(HEAD, None),
+        ]);
+        timeline(HEAD, nodes)
+    };
+    let rows = |head_at: &str, after: &str| {
+        vec![
+            push_row(head_at, after),
+            push_row("2026-10-04T00:30:00Z", OTHER),
+        ]
+    };
+    assert!(
+        head_ejections(
+            &with_activity(queue(), rows("2026-10-04T03:00:00Z", HEAD)),
+            HEAD
+        )
+        .is_empty()
+    );
+    // No activity, a fetch error, another head, a push before the removals,
+    // a fork head: both stay charged.
+    let mut error = queue();
+    error[crate::pr_queue_state::PUSH_ACTIVITY_KEY] = json!({"error": "HTTP 502"});
+    let mut fork = with_activity(queue(), rows("2026-10-04T03:00:00Z", HEAD));
+    fork["data"]["repository"]["pullRequest"]["isCrossRepository"] = json!(true);
+    for charged in [
+        queue(),
+        error,
+        with_activity(queue(), rows("2026-10-04T03:00:00Z", OTHER)),
+        with_activity(
+            queue(),
+            vec![
+                push_row("2026-10-04T00:40:00Z", HEAD),
+                push_row("2026-10-04T00:30:00Z", OTHER),
+            ],
+        ),
+        fork,
+    ] {
+        assert_eq!(head_ejections(&charged, HEAD).len(), 2, "{charged}");
+    }
+}
+
 /// A later force-push of the current head clears an unattributable removal
 /// only when the timeline window is complete. In a truncated or unmeasured
 /// window an earlier push of the same head can sit on an unread page, so the
