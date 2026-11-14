@@ -469,7 +469,11 @@ pub fn removal_of(node: &Value, head: &str) -> RemovalOf {
 /// head ([`RemovalOf::Head`]), or it names no head ([`RemovalOf::Unattributable`]).
 ///
 /// An unattributable removal is charged unless a later, server-timestamped
-/// `HeadRefForcePushedEvent` identifies the current head. Commit timeline items
+/// `HeadRefForcePushedEvent` identifies the current head, no earlier one does,
+/// and `timeline_complete` is `Some(true)` (`hasPreviousPage: false`). In a
+/// truncated or unmeasured window an earlier push of the same head can sit on
+/// a page that was never read, so a later push proves nothing and the removal
+/// stays charged. Commit timeline items
 /// are author-controlled and cannot prove push order; check-suite creation is
 /// also deliberately ignored because it can lag the push. Without an
 /// authoritative push event the removal counts: counting costs at most one
@@ -478,14 +482,21 @@ pub fn removal_of(node: &Value, head: &str) -> RemovalOf {
 /// that names another head ([`RemovalOf::OtherHead`]) or demonstrably predates a
 /// later force-push arrival is left out.
 #[must_use]
-pub fn removal_charges_head(nodes: &[Value], index: usize, head: &str) -> bool {
+pub fn removal_charges_head(
+    nodes: &[Value],
+    index: usize,
+    head: &str,
+    timeline_complete: Option<bool>,
+) -> bool {
     let Some(node) = nodes.get(index) else {
         return true;
     };
     match removal_of(node, head) {
         RemovalOf::OtherHead => false,
         RemovalOf::Head => true,
-        RemovalOf::Unattributable => !push_after_removal(nodes, index, head),
+        RemovalOf::Unattributable => {
+            timeline_complete != Some(true) || !push_after_removal(nodes, index, head)
+        }
     }
 }
 
@@ -736,7 +747,8 @@ pub fn explain_pr_queue_state(response: &Value) -> PrQueueReport {
                     .map(ToOwned::to_owned),
             }
         });
-    let ejections_of_current_head = count_ejections_of_head(nodes, head_oid.as_deref());
+    let ejections_of_current_head =
+        count_ejections_of_head(nodes, head_oid.as_deref(), timeline_complete);
     fact(
         &mut facts,
         "ejections_of_current_head",
@@ -844,7 +856,11 @@ pub fn explain_pr_queue_state(response: &Value) -> PrQueueReport {
 
 /// `failed_checks` / `merge_conflict` removals of `head`; see
 /// [`PrQueueReport::ejections_of_current_head`].
-fn count_ejections_of_head(nodes: &[Value], head: Option<&str>) -> u32 {
+fn count_ejections_of_head(
+    nodes: &[Value],
+    head: Option<&str>,
+    timeline_complete: Option<bool>,
+) -> u32 {
     let Some(head) = head else {
         return 0;
     };
@@ -857,7 +873,7 @@ fn count_ejections_of_head(nodes: &[Value], head: Option<&str>) -> u32 {
         if !same_head_requeue_cascades(reason) {
             continue;
         }
-        if removal_charges_head(nodes, index, head) {
+        if removal_charges_head(nodes, index, head, timeline_complete) {
             count += 1;
         }
     }
@@ -1566,5 +1582,37 @@ mod tests {
         );
         assert!(same_head_requeue_refused_by_discipline("merge_conflict"));
         assert!(!same_head_requeue_refused_by_discipline("manual"));
+    }
+
+    /// A hidden earlier push of the head in a truncated or unmeasured window
+    /// means a visible later push is no proof of a new arrival, so the
+    /// unattributable removal stays in `ejections_of_current_head`.
+    #[test]
+    fn a_later_push_clears_an_unattributable_ejection_only_in_a_complete_window() {
+        let head = "1111111111111111111111111111111111111111";
+        let other = "2222222222222222222222222222222222222222";
+        let response = |page_info: Value| {
+            serde_json::json!({"data":{"repository":{"pullRequest":{
+                "number":1,"state":"OPEN","headRefOid":head,"isInMergeQueue":false,
+                "mergeQueueEntry":null,"autoMergeRequest":null,
+                "timelineItems":{"pageInfo":page_info,"nodes":[
+                    {"__typename":"RemovedFromMergeQueueEvent","createdAt":"2026-10-04T01:00:00Z",
+                     "reason":"merge_conflict","beforeCommit":null},
+                    {"__typename":"HeadRefForcePushedEvent","createdAt":"2026-10-04T02:00:00Z",
+                     "afterCommit":{"oid":other}},
+                    {"__typename":"HeadRefForcePushedEvent","createdAt":"2026-10-04T03:00:00Z",
+                     "afterCommit":{"oid":head}}]}}}}})
+        };
+        let complete =
+            explain_pr_queue_state(&response(serde_json::json!({"hasPreviousPage": false})));
+        assert_eq!(complete.ejections_of_current_head, 0);
+        for page_info in [
+            serde_json::json!({"hasPreviousPage": true}),
+            serde_json::json!({}),
+            Value::Null,
+        ] {
+            let report = explain_pr_queue_state(&response(page_info.clone()));
+            assert_eq!(report.ejections_of_current_head, 1, "{page_info}");
+        }
     }
 }

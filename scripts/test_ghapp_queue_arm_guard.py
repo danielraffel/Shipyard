@@ -253,6 +253,35 @@ class MergeConflictHeadNeedsAuthoritativePush(unittest.TestCase):
                 self.assertFalse(guard.decide(got)[0])
 
 
+class UnattributedRemovalNeedsCompleteWindow(unittest.TestCase):
+    """Twin of the Rust truncated-window ejection-cap tests."""
+
+    HEAD = "1" * 40
+    OTHER = "2" * 40
+
+    def response(self, page_info: Any) -> dict[str, Any]:
+        return {"data": {"repository": {"pullRequest": {
+            "number": 1, "state": "OPEN", "headRefOid": self.HEAD,
+            "isInMergeQueue": False, "mergeQueueEntry": None, "autoMergeRequest": None,
+            "timelineItems": {"pageInfo": page_info, "nodes": [
+                {"__typename": "RemovedFromMergeQueueEvent", "createdAt": "2026-10-04T01:00:00Z",
+                 "reason": "merge_conflict", "beforeCommit": None},
+                {"__typename": "HeadRefForcePushedEvent", "createdAt": "2026-10-04T02:00:00Z",
+                 "afterCommit": {"oid": self.OTHER}},
+                {"__typename": "HeadRefForcePushedEvent", "createdAt": "2026-10-04T03:00:00Z",
+                 "afterCommit": {"oid": self.HEAD}},
+            ]},
+        }}}}
+
+    def test_a_later_push_clears_the_removal_only_in_a_complete_window(self) -> None:
+        got = guard.classify_pr_queue_state(self.response({"hasPreviousPage": False}))
+        self.assertEqual(got["ejections_of_current_head"], 0)
+        for page_info in ({"hasPreviousPage": True}, {}, None):
+            with self.subTest(page_info=page_info):
+                got = guard.classify_pr_queue_state(self.response(page_info))
+                self.assertEqual(got["ejections_of_current_head"], 1)
+
+
 class NewHeadIsDecidedBySha(unittest.TestCase):
     """Twin of the Rust ``pr_queue_state`` new-head tests."""
 

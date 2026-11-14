@@ -555,13 +555,18 @@ def _push_after_removal(nodes: list[Any], index: int, head: str) -> bool:
 
 
 def _ejections_of_head(
-    nodes: list[Any], removed_heads: list[str | None], head: str | None
+    nodes: list[Any],
+    removed_heads: list[str | None],
+    head: str | None,
+    timeline_complete: bool | None,
 ) -> int:
     """``failed_checks`` / ``merge_conflict`` removals of ``head``.
 
     A removal that names its head counts when that head is ``head``; one that
     names none counts unless a later server-timestamped force-push proves that
-    it predates the current head. Mirrors
+    it predates the current head, and that proof needs a complete timeline
+    (``hasPreviousPage: false``): in a truncated or unmeasured window an
+    earlier push of the same head may be on an unread page. Mirrors
     ``PrQueueReport::ejections_of_current_head``.
     """
     if head is None:
@@ -579,7 +584,9 @@ def _ejections_of_head(
         elif removal_kind == "other":
             charged = False
         else:
-            charged = not _push_after_removal(nodes, index, head)
+            charged = timeline_complete is not True or not _push_after_removal(
+                nodes, index, head
+            )
         if charged:
             count += 1
     return count
@@ -673,7 +680,9 @@ def classify_pr_queue_state(response: Any) -> dict[str, Any]:
         "head": head,
         "repo": repository.get("nameWithOwner") if isinstance(repository, dict) else None,
         "requeues_without_new_head": requeues,
-        "ejections_of_current_head": _ejections_of_head(nodes, removed_heads, head),
+        "ejections_of_current_head": _ejections_of_head(
+            nodes, removed_heads, head, timeline_complete
+        ),
         "last_ejection": last_ejection,
         "timeline_complete": timeline_complete,
     }

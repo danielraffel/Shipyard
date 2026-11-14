@@ -1357,13 +1357,21 @@ pub fn head_ejections(queue: &Value, head: &str) -> Vec<Ejection> {
         .pointer("/data/repository/pullRequest/timelineItems/nodes")
         .and_then(Value::as_array)
         .map_or(&[][..], Vec::as_slice);
+    // `None` (pageInfo missing) is treated like a truncated window: an
+    // unattributable removal then stays charged.
+    let timeline_complete = queue
+        .pointer("/data/repository/pullRequest/timelineItems/pageInfo/hasPreviousPage")
+        .and_then(Value::as_bool)
+        .map(|has_previous| !has_previous);
     nodes
         .iter()
         .enumerate()
         .filter(|(_, node)| {
             node.get("__typename").and_then(Value::as_str) == Some("RemovedFromMergeQueueEvent")
         })
-        .filter(|(index, _)| crate::pr_queue_state::removal_charges_head(nodes, *index, head))
+        .filter(|(index, _)| {
+            crate::pr_queue_state::removal_charges_head(nodes, *index, head, timeline_complete)
+        })
         .filter_map(|(_, node)| {
             // A removal without a readable reason is not proven a merge, so
             // it counts too.

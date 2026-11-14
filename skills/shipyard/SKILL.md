@@ -4788,7 +4788,10 @@ head is the removal's `beforeCommit` or a parent of that two-parent
 merge-group commit. One the timeline cannot attribute (no `beforeCommit`, as
 for every `merge_conflict` removal, parents unread, or any parent count but
 two) counts against the head unless a later server-timestamped
-`HeadRefForcePushedEvent` identifies the current head. A
+`HeadRefForcePushedEvent` identifies the current head, no earlier one does,
+and the timeline window is complete (`hasPreviousPage: false`). In a
+truncated or unmeasured window an earlier push of the same head may be on an
+unread page, so the removal stays charged. A
 malformed guard setting refuses every head rather than falling back to
 comments, and a `require-guard-admission` file in a host's guards directory
 refuses comment mode on that host. Do not post a verdict comment to unblock

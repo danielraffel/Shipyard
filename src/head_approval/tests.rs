@@ -757,6 +757,38 @@ fn an_unattributable_removal_requires_authoritative_push_evidence_to_clear() {
     );
 }
 
+/// A later force-push of the current head clears an unattributable removal
+/// only when the timeline window is complete. In a truncated or unmeasured
+/// window an earlier push of the same head can sit on an unread page, so the
+/// visible later push does not prove the head arrived after the removal.
+#[test]
+fn a_later_force_push_clears_an_unattributable_removal_only_in_a_complete_window() {
+    let nodes = vec![
+        conflict_removal("2026-10-04T01:00:00Z"),
+        conflict_removal("2026-10-04T02:00:00Z"),
+        force_push("2026-10-04T02:30:00Z", OTHER),
+        force_push("2026-10-04T03:00:00Z", HEAD),
+    ];
+    let complete = timeline(HEAD, nodes);
+    assert!(head_ejections(&complete, HEAD).is_empty());
+    for page_info in [
+        json!({"hasPreviousPage": true}),
+        json!({}),
+        json!({"hasPreviousPage": null}),
+        Value::Null,
+    ] {
+        let mut queue = complete.clone();
+        queue["data"]["repository"]["pullRequest"]["timelineItems"]["pageInfo"] = page_info.clone();
+        assert_eq!(head_ejections(&queue, HEAD).len(), 2, "{page_info}");
+    }
+    let mut no_page_info = complete;
+    no_page_info["data"]["repository"]["pullRequest"]["timelineItems"]
+        .as_object_mut()
+        .unwrap()
+        .remove("pageInfo");
+    assert_eq!(head_ejections(&no_page_info, HEAD).len(), 2);
+}
+
 /// pulp#9653, captured live: a `merge_conflict` removal (no `beforeCommit`),
 /// then head `99403d83` whose commit sorts before the removal. Without a
 /// server-timestamped force-push in the captured window, the removal is charged.
