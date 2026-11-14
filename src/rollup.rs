@@ -488,7 +488,7 @@ fn member_pr(
 }
 
 /// Whether one member's gate lets it into a rollup.
-fn member_refusal(pr: u64, gate: &HeadGate, counted: bool) -> Option<String> {
+pub(crate) fn member_refusal(pr: u64, gate: &HeadGate, counted: bool) -> Option<String> {
     match gate {
         HeadGate::Approved {
             approval: Approval::Carried { .. },
@@ -508,6 +508,23 @@ type Files = BTreeMap<String, (String, String, bool)>;
 
 fn touched(files: &Files, sources: &BTreeMap<String, String>) -> BTreeSet<String> {
     files.keys().chain(sources.values()).cloned().collect()
+}
+
+/// The files `head` changes against `base`, renames' sources included, as
+/// [`candidates`] lists them. GitHub's compare cap refuses
+/// ([`head_approval::compare_files`]).
+///
+/// # Errors
+///
+/// When the comparison cannot be read or may be partial.
+pub(crate) fn member_files(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    base: &str,
+    head: &str,
+) -> Result<Vec<String>, String> {
+    head_approval::compare_files(run_gh, repo, &format!("{base}...{head}"))
+        .map(|(files, _, sources)| touched(&files, &sources).into_iter().collect())
 }
 
 fn same_change(
@@ -1497,8 +1514,7 @@ pub fn candidates(
         if out.len() == limit {
             break;
         }
-        let files = head_approval::compare_files(run_gh, repo, &format!("{base}...{head}"))
-            .map(|(files, _, sources)| touched(&files, &sources).into_iter().collect());
+        let files = member_files(run_gh, repo, base, head);
         let blocked = if pull.get("draft").and_then(Value::as_bool) == Some(true) {
             Some("a draft".to_owned())
         } else {

@@ -51,6 +51,53 @@ On a host, `SHIPYARD_TRAIN=off` (or `0` or `false`), optionally scoped as
 guards directory. Both stop the guard from accepting a rollup too, not only
 the CLI from forming one.
 
+## When a base without a merge queue backs up
+
+The merge steward plans a rollup on its own for a base that has no merge
+queue (it merges each approved head with `expectedHeadOid` instead). The
+plan is read-only today. It is set in the base branch's
+`.shipyard/config.toml`, read through the GitHub API:
+
+```toml
+[auto_merge.rollup]
+mode = "shadow"        # off | shadow (default) | apply
+min_ready = 3          # plan only when at least this many are ready
+max_members = 4        # 2 to 4
+sensitive_paths = []   # globs that keep a pull request out, added to the defaults
+```
+
+Each pass, after the steward's own decisions, it counts the `ready` pull
+requests (approved at the exact head, required checks green, `CLEAN`). Below
+`min_ready` it reads nothing more and the pass is exactly as before. At or
+above it, a pull request joins only when:
+
+- it is not a draft and carries no `owner-decision`, `superseded` or
+  `PARKED/*` label;
+- the exact-head approval gate, read live as a dry run, approves its current
+  head with a verdict that names that head (a carried approval, a HOLD, the
+  ejection cap or a base that requires no approval keeps it out);
+- its changed files (from the compare API, renames' sources included; the
+  300-file cap keeps it out) match no sensitive path: the defaults
+  (`.github/workflows/**`, `scripts/ghapp*`, `scripts/*guard*`,
+  `src/head_approval*`, the rollup and exact-head merge code), the configured
+  `sensitive_paths`, `[train] exclude_paths`, or the base's carry exclusions;
+- it shares no file with an older member and no `[train] hot_files` glob.
+
+Members are taken oldest first, at most `max_members`. Fewer than two is no
+rollup. The plan appears in the steward's JSON as `repos[].rollup`, with an
+`action` of `below_threshold`, `no_batch`, `shadow`, `apply_unavailable` or
+`unreadable`, the members' exact heads and why each other ready pull request
+was left out.
+
+`shadow` writes nothing: the pass takes no ledger and no mutation guard, and
+issues reads only. `apply` reports the same plan and still merges each pull
+request on its own (`apply_unavailable`), because forming a rollup needs the
+steward to push a `shipyard-train/rollup-*` branch and open its pull request,
+which it is not authorised to do, and landing one needs the base to take
+direct rollups (`[train] enabled = true`, `mode = "rollup"`, `landing =
+"direct"`). Until then a rollup is formed and landed by hand with the
+commands below.
+
 ## The shape
 
 The branch is `shipyard-train/rollup-<n>`, `n` being the oldest member. It

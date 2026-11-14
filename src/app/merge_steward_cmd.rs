@@ -220,6 +220,10 @@ struct RepoReport {
     /// takes rollups.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     rollup_reconciliation: Vec<String>,
+    /// The rollup a backed-up base without a merge queue would form this
+    /// pass ([`rollup_pass`]). Absent when it does not apply.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rollup: Option<rollup_pass::Report>,
     /// Uncertain merge-queue admissions this pass settled from GitHub, or
     /// left uncertain with the reason ([`mutation_outcome::reconcile`]).
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -1757,6 +1761,12 @@ fn steward_repo_observed(
             if let Some(cancellations) = recovery_cancellations.remove(&observation.repo) {
                 report.cancellations.extend(cancellations);
             }
+            if !pass_budget::deadline_passed(args.pass_deadline) {
+                let run_gh =
+                    |gh_args: &[String]| actions.run_gh(gh_args).map_err(|error| error.to_string());
+                report.rollup =
+                    rollup_pass::run(&run_gh, &observation, &report.merge_path, &report.prs);
+            }
             if args.apply && pass_budget::deadline_passed(args.pass_deadline) {
                 report
                     .rollup_reconciliation
@@ -1865,6 +1875,7 @@ fn deferred_rate_limit_repo_report(
         base_poison: None,
         merge_group_stalled: None,
         rollup_reconciliation: Vec::new(),
+        rollup: None,
         uncertain_mutations: Vec::new(),
         repo: repo.to_owned(),
         base: base.to_owned(),
@@ -1898,6 +1909,7 @@ fn unreadable_repo_report(
         base_poison: None,
         merge_group_stalled: None,
         rollup_reconciliation: Vec::new(),
+        rollup: None,
         uncertain_mutations: Vec::new(),
         api_calls: None,
         repo: repo.to_owned(),
@@ -1981,6 +1993,7 @@ fn append_unmatched_recovery_errors(
             base_poison: None,
             merge_group_stalled: None,
             rollup_reconciliation: Vec::new(),
+            rollup: None,
             uncertain_mutations: Vec::new(),
             api_calls: None,
             repo: repo.clone(),
@@ -2024,6 +2037,7 @@ fn persist_final_ledger(
             base_poison: None,
             merge_group_stalled: None,
             rollup_reconciliation: Vec::new(),
+            rollup: None,
             uncertain_mutations: Vec::new(),
             api_calls: None,
             repo: "steward".to_owned(),
@@ -2210,6 +2224,7 @@ mod red_base_ejections;
 mod red_everywhere;
 mod render;
 mod resume_record;
+mod rollup_pass;
 mod scheduling_loop;
 mod shadow_ledger;
 mod superseded;

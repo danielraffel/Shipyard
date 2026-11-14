@@ -54,6 +54,31 @@ pub(super) fn render_report<W: Write>(
             )
             .map_err(|error| io_failure(&error))?;
         }
+        if let Some(rollup) = &repo.rollup {
+            let members = rollup
+                .members
+                .iter()
+                .map(|member| format!("#{}", member.pr))
+                .collect::<Vec<_>>()
+                .join(",");
+            writeln!(
+                stdout,
+                "  rollup: mode={} action={} ready={} members={}{}",
+                serde_json::to_value(rollup.mode)
+                    .ok()
+                    .and_then(|mode| mode.as_str().map(str::to_owned))
+                    .unwrap_or_default(),
+                rollup.action,
+                rollup.ready.len(),
+                if members.is_empty() { "-" } else { &members },
+                rollup
+                    .detail
+                    .as_deref()
+                    .map(|detail| format!(" ({detail})"))
+                    .unwrap_or_default()
+            )
+            .map_err(|error| io_failure(&error))?;
+        }
         if !repo.invariants.is_empty() {
             writeln!(
                 stdout,
