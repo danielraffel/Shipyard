@@ -156,6 +156,10 @@ shipyard runner steward-admit-ready --repo OWNER/REPO --pr N --head SHA         
 shipyard runner steward-admit-ready --repo OWNER/REPO --pr N --head SHA --apply  # admit
 ```
 
+`--apply` is for the steward host and its relay only. An agent never runs
+it, for the same reason it never arms or enqueues a pull request itself:
+admission has one writer.
+
 `shipyard relay` runs it for the pull requests it tracks when
 `[relay] admit_ready = "apply"` (or `"report"`; the default is `"off"`), on a
 pass where it sees the approval or the green checks and the pull request is
@@ -165,18 +169,29 @@ admission uses that host's steward lock, ledger and mutation authority.
 
 The event is only a trigger; nothing in it is trusted. The admission:
 
-1. Records one attempt per head per window (`--min-interval-secs`, 60 by
-   default) in `merge-steward.ready-events.json` beside the steward ledger,
-   before any GitHub read. A repeat within the window does nothing.
-2. Reads the pull request again. A head other than the one the event named,
+1. Refuses a repository that is not in the steward's fleet list
+   (`~/.local/share/shipyard-steward/fleet-repos.txt`, the file the tick
+   reads, or `$SHIPYARD_STEWARD_FLEET_REPOS`) with `not_fleet_repo`, and an
+   unreadable list too, before any GitHub read.
+2. Records one attempt per head per window (`--min-interval-secs`, 60 by
+   default and at least 30) in `merge-steward.ready-events.json` beside the
+   steward ledger, before any GitHub read. A repeat within the window does
+   nothing.
+3. Follows the tick's rate-limit rules: a repository in a recorded
+   rate-limit cooldown, or whose REST budget is under 300 or unreadable, is
+   refused with `rate_limited` and not read.
+4. Reads the pull request again. A head other than the one the event named,
    a pull request that is not open or not on the default branch, one already
    queued or armed, or one the tick's policy does not classify as ready, is
    left alone.
-3. Leaves to the tick a base whose merge groups read anything but clear, a
+5. Leaves to the tick a base whose merge groups read anything but clear, a
    paused queue entry, and a pending run cancellation.
-4. Takes the steward's ledger lock without waiting. If a tick or an
+6. A report (no `--apply`, or `admit_ready = "report"`) stops here after
+   reading the live exact-head approval gate: it says `would_admit` only for
+   an approved head, `waiting_head_approval` otherwise.
+7. Takes the steward's ledger lock without waiting. If a tick or an
    `admission-clean` gate holds it, it does nothing: that pass sees the head.
-5. Admits through the tick's own path: the live exact-head approval gate, the
+8. Admits through the tick's own path: the live exact-head approval gate, the
    carried-commit, code-owner and defect-fix guards, the final revalidation,
    and the enqueue (or exact-head merge) pinned to the head with
    `expectedHeadOid`. Its result is saved in the steward ledger.

@@ -5947,10 +5947,13 @@ No GitHub reads; `loop_seen` is kept only by applying passes.
 `[relay] admit_ready = "apply"` when a verdict or green-check event finds the
 PR open, approved at its head, green and unqueued (`relay::pass::became_ready`;
 a shadow relay only reports), runs the tick's `mutate_pr_with_recovery` for
-that one PR: live gate, final revalidation, `expectedHeadOid`. One attempt per
-head per 60 s (`merge-steward.ready-events.json`), a moved head, a non-ready
-classification, a non-clear base poison, a paused entry or a pending
-cancellation is skipped; the ledger lock is tried, never waited on
+that one PR: live gate, final revalidation, `expectedHeadOid`. `--apply` is for
+the steward host and its relay only: agents never run it, as they never arm or
+enqueue. Only fleet-list repos (`not_fleet_repo`); a ledger rate-limit cooldown
+or REST under 300 is `rate_limited` before any read; one attempt per head per
+60 s, at least 30 (`merge-steward.ready-events.json`); a report reads the live
+gate before `would_admit`. A moved head, a non-ready classification, a
+non-clear base poison, a paused entry or a pending cancellation is skipped; the ledger lock is tried, never waited on
 (`steward_busy`). The tick's own lock now waits up to 30 s
 (`acquire_ledger_lock_within`).
 `src/app/merge_steward_cmd/merge_group_stall.rs`: for each queue entry

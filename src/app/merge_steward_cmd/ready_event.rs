@@ -11,8 +11,11 @@
 //! lock. Anything this path cannot read, or any state it does not own, is
 //! left for the tick:
 //!
-//! - one attempt per head per window (`claim_attempt`), recorded before any
-//!   GitHub read;
+//! - only a repository in the steward's fleet list (`fleet_repos`);
+//! - one attempt per head per window (`claim_attempt`, at least 30 seconds),
+//!   recorded before any GitHub read;
+//! - a repository in a rate-limit cooldown, or with under 300 REST calls
+//!   left, is not read;
 //! - a head that moved, a pull request that is not open, not on the default
 //!   branch, already queued or armed, or that the policy does not classify
 //!   as ready, is skipped;
@@ -41,6 +44,14 @@ use crate::base_health::merge_group::MergeGroupHealth;
 
 /// The default minimum time between two admission attempts on one head.
 pub(crate) const DEFAULT_MIN_INTERVAL: Duration = Duration::from_mins(1);
+
+/// The shortest window `--min-interval-secs` may set: a shorter one would let
+/// a burst of events spend the fleet's GitHub budget.
+pub(crate) const MIN_INTERVAL_FLOOR: Duration = Duration::from_secs(30);
+
+/// The tick skips a repository whose REST budget is below this
+/// (`tools/steward-tick/shipyard-steward-tick.sh`); so does an event.
+pub(crate) const MIN_REST_REMAINING: u64 = 300;
 
 /// How long an attempt record is kept.
 const ATTEMPT_RETENTION_SECS: i64 = 24 * 60 * 60;
@@ -201,10 +212,59 @@ pub(super) fn observe_event_pr(
     observation::observe_pull_request(actions, &settings, base, &row)
 }
 
+/// What an admission reads besides GitHub's answers about the pull request,
+/// so a test can stand each one in.
+pub(super) struct ReadyReads<'a> {
+    /// The one pull request, as a one-row observation ([`observe_event_pr`]).
+    pub(super) observe: &'a dyn Fn() -> Result<RepoObservation, String>,
+    /// The steward's fleet list, the file the tick reads ([`fleet_repos`]).
+    pub(super) fleet_repos: &'a dyn Fn() -> Result<Vec<String>, String>,
+    /// The REST budget left for this repository's credential
+    /// ([`rest_remaining`]).
+    pub(super) rest_remaining: &'a dyn Fn() -> Result<u64, String>,
+    /// The queue-removals ledger ([`super::defect_fix_removals::ledger_path`]).
+    pub(super) defect_fix_ledger: PathBuf,
+}
+
+/// The steward's fleet list: `$SHIPYARD_STEWARD_FLEET_REPOS`, else
+/// `~/.local/share/shipyard-steward/fleet-repos.txt`, the file the tick and
+/// the standing reviewer read. Missing or unreadable is an error.
+pub(super) fn fleet_repos() -> Result<Vec<String>, String> {
+    let path = std::env::var_os("SHIPYARD_STEWARD_FLEET_REPOS")
+        .filter(|value| !value.is_empty())
+        .map_or_else(
+            || {
+                std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_default()
+                    .join(".local/share/shipyard-steward/fleet-repos.txt")
+            },
+            PathBuf::from,
+        );
+    std::fs::read_to_string(&path)
+        .map(|text| super::invariants::clones::fleet_repos(&text))
+        .map_err(|error| format!("{}: {error}", path.display()))
+}
+
+/// The core REST budget left for the credential `actions` uses on its
+/// repository (`gh api rate_limit`, which spends none of it).
+pub(super) fn rest_remaining(actions: &GitHubActions) -> Result<u64, String> {
+    let limits = observation::gh_json(
+        actions,
+        &["api".to_owned(), "rate_limit".to_owned()],
+        "rate limit",
+    )?;
+    limits
+        .pointer("/resources/core/remaining")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "rate limit carried no core remaining".to_owned())
+}
+
 /// Run the steward's admission for the one pull request `event` names.
 ///
-/// `observe` reads that pull request ([`observe_event_pr`] in production).
-/// Without `apply`, nothing is locked, recorded or mutated.
+/// Without `apply`, nothing is locked, recorded or mutated, and the live
+/// exact-head approval gate is read so `would_admit` is never claimed for an
+/// unapproved head.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(super) fn admit_ready_event(
     actions: &GitHubActions,
@@ -213,18 +273,30 @@ pub(super) fn admit_ready_event(
     event: &ReadyEvent,
     apply: bool,
     min_interval: Duration,
-    observe: &dyn Fn() -> Result<RepoObservation, String>,
+    reads: &ReadyReads<'_>,
     now: DateTime<Utc>,
 ) -> ReadyEventOutcome {
     if !crate::merge_steward::is_full_sha(&event.head) {
         return ReadyEventOutcome::skipped(event, apply, "invalid_head");
+    }
+    // Only the repositories the tick stewards. Anything else, or a list that
+    // cannot be read, is refused before any GitHub read.
+    match (reads.fleet_repos)() {
+        Ok(repos)
+            if repos
+                .iter()
+                .any(|repo| repo.eq_ignore_ascii_case(&event.repo)) => {}
+        Ok(_) => return ReadyEventOutcome::skipped(event, apply, "not_fleet_repo"),
+        Err(error) => {
+            return ReadyEventOutcome::skipped(event, apply, format!("fleet_list_unread:{error}"));
+        }
     }
     if apply {
         match claim_attempt(
             &attempts_path(ledger_path),
             &attempt_key(event),
             now,
-            min_interval,
+            min_interval.max(MIN_INTERVAL_FLOOR),
         ) {
             Ok(true) => {}
             Ok(false) => return ReadyEventOutcome::skipped(event, apply, "duplicate_event"),
@@ -250,7 +322,39 @@ pub(super) fn admit_ready_event(
             );
         }
     };
-    let observation = match observe() {
+    // The tick's rate-limit rules: a repository in a recorded cooldown, or
+    // whose REST budget is low or unreadable, is not read at all.
+    let cooldown_key = super::pass_budget::rate_limit_cooldown_key(
+        &actions.rate_limit_scope_key(&event.repo),
+        &event.repo,
+    );
+    if super::pass_budget::active_rate_limit_cooldown(
+        &unlocked_ledger.rate_limit_cooldowns,
+        &cooldown_key,
+        now.timestamp(),
+    )
+    .is_some()
+    {
+        return ReadyEventOutcome::skipped(event, apply, "rate_limited:cooldown");
+    }
+    match (reads.rest_remaining)() {
+        Ok(remaining) if remaining >= MIN_REST_REMAINING => {}
+        Ok(remaining) => {
+            return ReadyEventOutcome::skipped(
+                event,
+                apply,
+                format!("rate_limited:rest_remaining={remaining}"),
+            );
+        }
+        Err(error) => {
+            return ReadyEventOutcome::skipped(
+                event,
+                apply,
+                format!("rate_limited:unread:{error}"),
+            );
+        }
+    }
+    let observation = match (reads.observe)() {
         Ok(observation) => observation,
         Err(error) => {
             return ReadyEventOutcome::skipped(event, apply, format!("unread:{error}"));
@@ -285,13 +389,29 @@ pub(super) fn admit_ready_event(
     }
     // A base the merge groups show poisoned, or that could not be read, is
     // the tick's: it pauses, fast-tracks and restores the queue as a whole.
-    let base_poison = super::base_poison::observe(actions, &observation, &policy, now);
+    // Red everywhere only confirms a poisoned context; any reading other than
+    // clear is refused here whatever it confirms, so none is passed.
+    let base_poison =
+        super::base_poison::observe(actions, &observation, &policy, &BTreeMap::new(), now);
     if let Some(poison) = base_poison.as_ref()
         && !matches!(poison.health, MergeGroupHealth::Clear { .. })
     {
         return ReadyEventOutcome::skipped(event, apply, "base_poison_not_clear");
     }
     if !apply {
+        // A report never claims an unapproved head: the live exact-head gate,
+        // read as the admission reads it.
+        match super::pr_mutations::read_head_gate_for(actions, &observation, pr, &unlocked_ledger) {
+            Ok((gate, ..)) if gate.allows() => {}
+            Ok((gate, ..)) => {
+                let mut outcome = ReadyEventOutcome::skipped(event, apply, "waiting_head_approval");
+                outcome.error = Some(gate.explain());
+                return outcome;
+            }
+            Err(error) => {
+                return ReadyEventOutcome::skipped(event, apply, format!("gate_unread:{error}"));
+            }
+        }
         let mut outcome = ReadyEventOutcome::new(event, apply, "would_admit", "ready");
         outcome.mutation = Some("would_enqueue".to_owned());
         return outcome;
@@ -343,11 +463,8 @@ pub(super) fn admit_ready_event(
     // defect-fix removal blocks is refused inside the admission. The cached
     // last good read is the tick's to update.
     let mut removal_cache = ledger.removal_ledger.clone();
-    let defect_fix = super::defect_fix_removals::read(
-        &super::defect_fix_removals::ledger_path(),
-        &mut removal_cache,
-        now,
-    );
+    let defect_fix =
+        super::defect_fix_removals::read(&reads.defect_fix_ledger, &mut removal_cache, now);
     let context = MutationApplyContext {
         actions,
         observation: &observation,
@@ -453,6 +570,8 @@ pub(crate) fn admit_ready(
     };
     let scoped = actions.clone().with_repo_override(&args.repo);
     let ledger_path = runtime_paths.state_dir.join("merge-steward.json");
+    let observe = || observe_event_pr(&scoped, &event);
+    let remaining = || rest_remaining(&scoped);
     admit_ready_event(
         &scoped,
         &control,
@@ -460,7 +579,12 @@ pub(crate) fn admit_ready(
         &event,
         args.apply,
         args.min_interval,
-        &|| observe_event_pr(&scoped, &event),
+        &ReadyReads {
+            observe: &observe,
+            fleet_repos: &fleet_repos,
+            rest_remaining: &remaining,
+            defect_fix_ledger: super::defect_fix_removals::ledger_path(),
+        },
         Utc::now(),
     )
 }

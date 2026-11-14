@@ -147,6 +147,15 @@ fn append_log(path: &Path, records: &[Value]) -> Result<(), CliFailure> {
     file.sync_all().map_err(io_failure)
 }
 
+/// The ready admission a relay in `mode` runs: a shadow relay mutates
+/// nothing, so `apply` there only reports.
+pub(crate) fn effective_admit_ready(configured: AdmitReady, mode: Mode) -> AdmitReady {
+    match (configured, mode) {
+        (AdmitReady::Apply, Mode::Shadow) => AdmitReady::Report,
+        (admit, _) => admit,
+    }
+}
+
 /// Run `shipyard relay`.
 #[allow(clippy::too_many_lines)]
 pub(super) fn relay_command<W: Write>(
@@ -218,10 +227,7 @@ pub(super) fn relay_command<W: Write>(
     // `relay.admit_ready`: when an event makes a pull request ready, run the
     // steward's own admission for it (see `merge_steward_cmd::ready_event`).
     // A shadow relay mutates nothing, so there it only reports.
-    let admit_ready = match (relay.admit_ready, mode) {
-        (AdmitReady::Apply, Mode::Shadow) => AdmitReady::Report,
-        (admit, _) => admit,
-    };
+    let admit_ready = effective_admit_ready(relay.admit_ready, mode);
     let steward_reads = GitHubActions::from_loaded_config(cwd, &config).with_inproc_reads(
         crate::github_read::for_steward(&config, &runtime_paths.state_dir),
     );
@@ -395,6 +401,26 @@ mod tests {
             "a stale report is not reused"
         );
         assert!(steward_actions(None, "Generous-Corp/pulp", Duration::from_secs(600)).is_empty());
+    }
+
+    #[test]
+    fn a_shadow_relay_only_reports_the_ready_admission() {
+        assert_eq!(
+            effective_admit_ready(AdmitReady::Apply, Mode::Shadow),
+            AdmitReady::Report
+        );
+        assert_eq!(
+            effective_admit_ready(AdmitReady::Apply, Mode::Send),
+            AdmitReady::Apply
+        );
+        assert_eq!(
+            effective_admit_ready(AdmitReady::Report, Mode::Send),
+            AdmitReady::Report
+        );
+        assert_eq!(
+            effective_admit_ready(AdmitReady::Off, Mode::Send),
+            AdmitReady::Off
+        );
     }
 
     #[test]

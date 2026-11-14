@@ -3,12 +3,15 @@
 //! through the tick's path under the steward lock.
 use super::*;
 use crate::app::merge_steward_cmd::ready_event::{
-    ReadyEvent, ReadyEventOutcome, admit_ready_event, attempts_path, claim_attempt,
+    ReadyEvent, ReadyEventOutcome, ReadyReads, admit_ready_event, attempts_path, claim_attempt,
 };
 
 const HEAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const MOVED: &str = "cccccccccccccccccccccccccccccccccccccccc";
 const POLICY_REQUIRED: &str = r#"printf '%s\n' '[auto_merge]' 'arm_requires_head_approval = true' 'reviewer_identities = ["shipyard-review[bot]"]'"#;
+/// [`POLICY_REQUIRED`], with the base's merge groups read (`merge_group_hold`).
+const POLICY_WITH_HOLD: &str = r#"printf '%s\n' '[auto_merge]' 'arm_requires_head_approval = true' 'reviewer_identities = ["shipyard-review[bot]"]' '[base_health]' 'merge_group_hold = "on"'"#;
+const ACTIONS_APP: u64 = 15368;
 
 /// A fleet-authored (so managed) pull request, green on `macos`.
 fn pr_json(head: &str) -> String {
@@ -26,6 +29,32 @@ fn observed(head: &str) -> RepoObservation {
     observation_for(pr, true)
 }
 
+/// The app-bound `review-verdict` check run a base with no queue requires.
+fn review_check_run(head: &str) -> String {
+    format!(
+        r#"{{"id":9001,"name":"review-verdict","head_sha":"{head}","status":"completed","conclusion":"success","started_at":"2026-11-13T00:00:30Z","completed_at":"2026-11-13T00:01:00Z","details_url":"https://github.com/owner/repo/actions/runs/101/job/9001","app":{{"id":{ACTIONS_APP},"slug":"github-actions"}}}}"#
+    )
+}
+
+/// A base with no merge queue that GitHub admits only through the app-bound
+/// `review-verdict` check: the steward merges the exact head there.
+fn observed_no_queue(head: &str) -> RepoObservation {
+    let mut observation = observed(head);
+    observation.merge_queue = false;
+    observation.allow_auto_merge = true;
+    observation.required_checks.push(RequiredCheck {
+        context: "review-verdict".to_owned(),
+        app_id: Some(ACTIONS_APP),
+    });
+    observation.prs[0].fact.checks.push(
+        crate::app::merge_steward_cmd::observation::parse_rest_check(
+            &serde_json::from_str(&review_check_run(head)).expect("check run"),
+        )
+        .expect("check run"),
+    );
+    observation
+}
+
 fn approved_comment(head: &str) -> String {
     format!(
         r#"{{"id":12345,"login":"shipyard-review[bot]","type":"Bot","at":"2026-11-13T00:05:00Z","body":"LGTM\nreviewed: {head}","performed_via_github_app_id":99}}"#
@@ -39,6 +68,10 @@ struct Fixture {
     approved: &'static str,
     /// The head every live read reports.
     live_head: &'static str,
+    /// The answer to the merge-group run list.
+    merge_groups: &'static str,
+    /// The base has no merge queue (an exact-head merge base).
+    no_queue: bool,
 }
 
 impl Fixture {
@@ -47,6 +80,8 @@ impl Fixture {
             policy: Some(POLICY_REQUIRED),
             approved: HEAD,
             live_head: HEAD,
+            merge_groups: r#"printf '%s' '{"workflow_runs":[]}'"#,
+            no_queue: false,
         }
     }
 
@@ -58,6 +93,18 @@ impl Fixture {
         let live_head = self.live_head;
         let comments = approved_comment(self.approved);
         let live_pr = pr_json(live_head);
+        let merge_groups = self.merge_groups;
+        let (check_runs, merge_queue) = if self.no_queue {
+            (
+                format!(r#"{{"check_runs":[{}]}}"#, review_check_run(live_head)),
+                r#"{"data":{"repository":{"mergeQueue":null}}}"#,
+            )
+        } else {
+            (
+                r#"{"check_runs":[]}"#.to_owned(),
+                r#"{"data":{"repository":{"mergeQueue":{"entries":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}}"#,
+            )
+        };
         let script = format!(
             r#"
 # CONFIG_ERROR: this fixture serves its own policy file
@@ -66,12 +113,13 @@ case "$*" in
   *"contents/.shipyard/config.toml"*) {policy} ;;
   *"pulls/42/reviews"*) printf '' ;;
   *"issues/42/comments"*) printf '%s\n' '{comments}' ;;
-  *"/check-runs?"*) printf '%s' '{{"check_runs":[]}}' ;;
+  *"/check-runs?"*) printf '%s' '{check_runs}' ;;
   *"/statuses?"*) printf '%s' '[]' ;;
   *"commits/{live_head}"*) printf '%s' '2026-11-13T00:00:00Z' ;;
   *"isInMergeQueue"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"number":42,"state":"OPEN","headRefOid":"{live_head}","isInMergeQueue":false,"mergeQueueEntry":null,"autoMergeRequest":null,"timelineItems":{{"pageInfo":{{"hasPreviousPage":false}},"nodes":[]}}}}}}}}}}' ;;
-  *"actions/runs?event=merge_group"*) printf '%s' '{{"workflow_runs":[]}}' ;;
-  *"query=query("*"mergeQueue"*) printf '%s' '{{"data":{{"repository":{{"mergeQueue":{{"entries":{{"nodes":[],"pageInfo":{{"hasNextPage":false}}}}}}}}}}}}' ;;
+  *"actions/runs?event=merge_group"*) {merge_groups} ;;
+  *"query=query("*"mergeQueue"*) printf '%s' '{merge_queue}' ;;
+  *"mergePullRequest("*) printf '%s' '{{"data":{{"mergePullRequest":{{"pullRequest":{{"number":42,"merged":true}}}}}}}}' ;;
   "pr view "*) printf '%s' '{live_pr}' ;;
   *"stackConfig"*) printf '%s' '{{"data":{{"repository":{{"stackConfig":{{"text":"stacked_pr_mode = \"observe\"\n"}},"pullRequest":{{"headRefOid":"{live_head}","stack":null,"stackEntry":null}}}}}}}}' ;;
   *"stackEntry"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"stack":null,"stackEntry":null}}}}}}}}' ;;
@@ -91,6 +139,10 @@ struct Harness {
     log: PathBuf,
     control: MutationControl,
     ledger_path: PathBuf,
+    /// The steward's fleet list.
+    fleet: Vec<String>,
+    /// The REST budget read.
+    rest: Result<u64, String>,
 }
 
 impl Harness {
@@ -105,7 +157,43 @@ impl Harness {
             log,
             control,
             ledger_path,
+            fleet: vec!["Owner/Repo".to_owned()],
+            rest: Ok(5_000),
         }
+    }
+
+    fn defect_fix_ledger(&self) -> PathBuf {
+        self.temp.path().join("queue-removals.jsonl")
+    }
+
+    fn run(
+        &self,
+        head: &str,
+        observe: &dyn Fn() -> Result<RepoObservation, String>,
+        apply: bool,
+        now: DateTime<Utc>,
+    ) -> ReadyEventOutcome {
+        let fleet = || Ok(self.fleet.clone());
+        let rest = || self.rest.clone();
+        admit_ready_event(
+            &self.actions,
+            &self.control,
+            &self.ledger_path,
+            &Self::event(head),
+            apply,
+            Duration::from_secs(60),
+            &ReadyReads {
+                observe,
+                fleet_repos: &fleet,
+                rest_remaining: &rest,
+                defect_fix_ledger: self.defect_fix_ledger(),
+            },
+            now,
+        )
+    }
+
+    fn save(&self, ledger: &StewardLedger) {
+        save_ledger(&self.ledger_path, ledger).expect("save ledger");
     }
 
     fn event(head: &str) -> ReadyEvent {
@@ -125,16 +213,7 @@ impl Harness {
         now: DateTime<Utc>,
     ) -> ReadyEventOutcome {
         let observe = || Ok(observation.clone());
-        admit_ready_event(
-            &self.actions,
-            &self.control,
-            &self.ledger_path,
-            &Self::event(head),
-            apply,
-            Duration::from_secs(60),
-            &observe,
-            now,
-        )
+        self.run(head, &observe, apply, now)
     }
 
     fn admit(&self, head: &str, observation: &RepoObservation) -> ReadyEventOutcome {
@@ -325,16 +404,7 @@ fn an_unreadable_pull_request_does_nothing_and_takes_no_lock() {
         .expect("lock")
         .expect("uncontended");
     let observe = || Err::<RepoObservation, String>("HTTP 502".to_owned());
-    let outcome = admit_ready_event(
-        &harness.actions,
-        &harness.control,
-        &harness.ledger_path,
-        &Harness::event(HEAD),
-        true,
-        Duration::from_secs(60),
-        &observe,
-        Utc::now(),
-    );
+    let outcome = harness.run(HEAD, &observe, true, Utc::now());
     assert_eq!(outcome.outcome, "skipped");
     assert_eq!(outcome.reason, "unread:HTTP 502");
     assert_eq!(harness.enqueues(), 0);
@@ -386,4 +456,194 @@ fn attempts_are_one_per_head_per_window_and_fail_closed_when_unreadable() {
     );
     fs::write(&path, "{not json").expect("corrupt");
     assert!(claim_attempt(&path, "k@c", now, window).is_err());
+}
+
+#[test]
+fn a_repository_outside_the_fleet_list_is_refused_before_any_read() {
+    let mut harness = Harness::new(&Fixture::approved());
+    harness.fleet = vec!["owner/other".to_owned()];
+    let outcome = harness.admit(HEAD, &observed(HEAD));
+    assert_eq!(outcome.reason, "not_fleet_repo");
+    assert!(harness.calls().is_empty(), "{}", harness.calls());
+    assert!(!attempts_path(&harness.ledger_path).exists());
+}
+
+#[test]
+fn a_rate_limited_repository_is_not_read() {
+    let mut harness = Harness::new(&Fixture::approved());
+    harness.rest = Ok(299);
+    let low = harness.admit(HEAD, &observed(HEAD));
+    assert_eq!(low.reason, "rate_limited:rest_remaining=299");
+    harness.rest = Err("HTTP 502".to_owned());
+    let unread = harness.admit_at(
+        HEAD,
+        &observed(HEAD),
+        true,
+        Utc::now() + chrono::Duration::seconds(120),
+    );
+    assert_eq!(unread.reason, "rate_limited:unread:HTTP 502");
+    assert!(harness.calls().is_empty(), "{}", harness.calls());
+
+    // A cooldown the tick recorded for this credential and repository.
+    harness.rest = Ok(5_000);
+    let key = crate::app::merge_steward_cmd::pass_budget::rate_limit_cooldown_key(
+        &harness.actions.rate_limit_scope_key("owner/repo"),
+        "owner/repo",
+    );
+    let now = Utc::now();
+    let mut ledger = StewardLedger::default();
+    ledger.rate_limit_cooldowns.insert(
+        key,
+        crate::app::merge_steward_cmd::pass_budget::RateLimitCooldown {
+            repo: "owner/repo".to_owned(),
+            scope_key: "scope".to_owned(),
+            until_epoch: now.timestamp() + 600,
+            observed_at_epoch: now.timestamp(),
+            detail: "secondary rate limit".to_owned(),
+        },
+    );
+    harness.save(&ledger);
+    let cooled = harness.admit_at(
+        HEAD,
+        &observed(HEAD),
+        true,
+        now + chrono::Duration::seconds(240),
+    );
+    assert_eq!(cooled.reason, "rate_limited:cooldown");
+    assert!(harness.calls().is_empty(), "{}", harness.calls());
+}
+
+#[test]
+fn a_dry_run_reads_the_gate_and_never_claims_an_unapproved_head() {
+    let harness = Harness::new(&Fixture {
+        approved: MOVED,
+        ..Fixture::approved()
+    });
+    let outcome = harness.admit_at(HEAD, &observed(HEAD), false, Utc::now());
+    assert_eq!(outcome.outcome, "skipped", "{outcome:?}");
+    assert_eq!(outcome.reason, "waiting_head_approval");
+    assert!(harness.calls().contains("issues/42/comments"));
+    assert_eq!(harness.enqueues(), 0);
+
+    let unread = Harness::new(&Fixture {
+        policy: None,
+        ..Fixture::approved()
+    });
+    let outcome = unread.admit_at(HEAD, &observed(HEAD), false, Utc::now());
+    assert!(outcome.reason.starts_with("gate_unread:"), "{outcome:?}");
+}
+
+#[test]
+fn a_base_whose_merge_groups_are_not_clear_is_left_to_the_tick() {
+    let harness = Harness::new(&Fixture {
+        policy: Some(POLICY_WITH_HOLD),
+        merge_groups: "echo 'HTTP 502: bad gateway' >&2; exit 1",
+        ..Fixture::approved()
+    });
+    let outcome = harness.admit(HEAD, &observed(HEAD));
+    assert_eq!(outcome.reason, "base_poison_not_clear", "{outcome:?}");
+    assert_eq!(harness.enqueues(), 0);
+    assert!(!harness.calls().contains("issues/42/comments"));
+}
+
+#[test]
+fn a_poison_paused_entry_is_left_to_the_tick() {
+    let harness = Harness::new(&Fixture::approved());
+    let mut ledger = StewardLedger::default();
+    ledger.poison_paused.insert(
+        "owner/repo@main".to_owned(),
+        vec![
+            serde_json::from_value(serde_json::json!({
+                "pr": 42,
+                "head": HEAD,
+                "position": 1,
+                "contexts": "macos",
+                "paused_at": "2026-11-13T00:00:00Z",
+            }))
+            .expect("paused entry"),
+        ],
+    );
+    harness.save(&ledger);
+    let outcome = harness.admit(HEAD, &observed(HEAD));
+    assert_eq!(outcome.reason, "poison_paused", "{outcome:?}");
+    assert_eq!(harness.enqueues(), 0);
+}
+
+#[test]
+fn pending_cancellations_leave_the_head_to_the_tick() {
+    let harness = Harness::new(&Fixture::approved());
+    let mut ledger = StewardLedger::default();
+    ledger
+        .pending_cancellations
+        .insert("owner/repo:100".to_owned(), pending_cancellation_record());
+    harness.save(&ledger);
+    let outcome = harness.admit(HEAD, &observed(HEAD));
+    assert_eq!(outcome.reason, "pending_cancellations", "{outcome:?}");
+    assert_eq!(harness.enqueues(), 0);
+}
+
+#[test]
+fn a_head_removed_for_a_defect_is_refused_by_the_admission() {
+    let harness = Harness::new(&Fixture::approved());
+    fs::write(
+        harness.defect_fix_ledger(),
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "at": "2026-11-13T00:10:00Z",
+                "reason": "defect-fix",
+                "note": "doomed group",
+                "host": "m3",
+                "session": "s",
+                "targets": [{"repo": "owner/repo", "pr": 42, "head": HEAD}],
+            })
+        ),
+    )
+    .expect("removal");
+    let outcome = harness.admit(HEAD, &observed(HEAD));
+    assert_eq!(outcome.outcome, "refused", "{outcome:?}");
+    assert!(
+        outcome
+            .mutation
+            .as_deref()
+            .is_some_and(|mutation| mutation.starts_with("defect_fix_removed")),
+        "{outcome:?}"
+    );
+    assert_eq!(harness.enqueues(), 0);
+}
+
+#[test]
+fn an_armed_pull_request_is_left_to_the_tick() {
+    let harness = Harness::new(&Fixture::approved());
+    let mut armed = observed(HEAD);
+    armed.prs[0].fact.auto_merge_active = true;
+    let outcome = harness.admit(HEAD, &armed);
+    assert_eq!(outcome.reason, "already_queued_or_armed");
+    assert!(harness.calls().is_empty(), "{}", harness.calls());
+}
+
+#[test]
+fn a_base_with_no_queue_merges_the_exact_head() {
+    let harness = Harness::new(&Fixture {
+        no_queue: true,
+        ..Fixture::approved()
+    });
+    let outcome = harness.admit(HEAD, &observed_no_queue(HEAD));
+    assert_eq!(
+        outcome.outcome,
+        "admitted",
+        "{outcome:?}\n{}",
+        harness.calls()
+    );
+    assert!(
+        outcome
+            .mutation
+            .as_deref()
+            .is_some_and(|mutation| mutation.starts_with("merged_exact_head")),
+        "{outcome:?}"
+    );
+    let calls = harness.calls();
+    assert!(calls.contains("mergePullRequest("), "{calls}");
+    assert!(calls.contains("expectedHeadOid"), "{calls}");
+    assert!(!calls.contains("enqueuePullRequest"), "{calls}");
 }
