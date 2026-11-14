@@ -205,6 +205,14 @@ def open_pulls_on(guard: ModuleType, repo: str, head: str) -> list[int]:
     for page in read_pages(guard, f"repos/{repo}/commits/{head}/pulls?per_page=100", what):
         if not isinstance(page, list):
             raise guard.GuardError(f"{what} are unreadable")
+        for pull in page:
+            if (not isinstance(pull, dict)
+                    or not isinstance(pull.get("number"), int)
+                    or isinstance(pull.get("number"), bool)
+                    or not isinstance(pull.get("state"), str)
+                    or not isinstance(pull.get("head"), dict)
+                    or not isinstance(pull["head"].get("sha"), str)):
+                raise guard.GuardError(f"{what} contain a malformed pull request")
         pulls.extend(page)
     return sorted(
         pull["number"] for pull in pulls
@@ -231,6 +239,13 @@ def refresh_head_check(guard: ModuleType, repo: str, head: str) -> None:
         count = page.get("total_count") if isinstance(page, dict) else None
         if not isinstance(rows, list) or not isinstance(count, int) or isinstance(count, bool):
             raise guard.GuardError(f"{what} are unreadable")
+        for run in rows:
+            if (not isinstance(run, dict)
+                    or not isinstance(run.get("id"), int)
+                    or isinstance(run.get("id"), bool)
+                    or not isinstance(run.get("name"), str)
+                    or not isinstance(run.get("event"), str)):
+                raise guard.GuardError(f"{what} contain a malformed workflow run")
         runs.extend(rows)
         total = max(total, count)
     if len(runs) < total:

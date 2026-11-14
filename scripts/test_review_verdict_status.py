@@ -521,6 +521,35 @@ class ReviewVerdictStatus(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("-X POST repos/danielraffel/Shipyard/actions/runs/555/rerun", self.calls())
 
+    def test_a_malformed_pull_row_fails_closed_instead_of_being_dropped(self) -> None:
+        answers = self.answers(self.approved_trail(), SIGNERS)
+        answers = [
+            (needle, {"pages": [[
+                {"number": 784, "state": "open", "head": {"sha": HEAD}},
+                {},
+            ]]}) if needle == f"/commits/{HEAD}/pulls" else (needle, answer)
+            for needle, answer in answers
+        ]
+        result = self.post(answers)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("pull requests on", result.stderr)
+        self.assertNotIn("/statuses/", self.calls())
+
+    def test_a_malformed_workflow_run_fails_closed_before_refresh(self) -> None:
+        answers = self.answers(self.refused_trail())
+        answers = [
+            (needle, {"pages": [{"total_count": 3, "workflow_runs": [
+                {"id": 555, "name": "Review verdict", "event": "pull_request_target"},
+                {},
+                {"id": 600, "name": "Other", "event": "pull_request_target"},
+            ]}]}) if needle == "actions/runs?head_sha" else (needle, answer)
+            for needle, answer in answers
+        ]
+        result = self.post(answers)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("workflow runs on", result.stderr)
+        self.assertNotIn("/actions/runs/555/rerun", self.calls())
+
     def test_an_incomplete_or_malformed_listing_fails_the_job(self) -> None:
         cases = {
             "runs short of total_count": ("actions/runs?head_sha", {"pages": [
