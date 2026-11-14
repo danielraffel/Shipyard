@@ -6052,6 +6052,32 @@ episode ends, and reports `fix_first_score`. `shipyard base-health --replay
 FILE` replays `ReplayEpisode` facts offline; the 2026-11-13 Vellum and Pulp
 episodes are fixtures under `tests/fixtures/base_health/`.
 
+Red-base triage acts (`BasePoisonPolicy.acts`, `TriageActs`: `reorder_fix`,
+`cancel_orphaned_groups`, `reenqueue_red_base_ejections`; each `off |
+dry-run | on`, default dry-run with a merge queue; a typo falls back to
+dry-run). Confirmation also accepts red everywhere
+(`fix_first::confirmed_since`: tip red, or a `red_everywhere` episode on the
+check that began strictly after the tip's newest verdict, which must be known;
+unread tip or no verdict never; a red tip without `red_since` reads
+`MAX_UTC`, never the episode start), so
+`base_poison::observe` now runs after `red_everywhere::observe` and takes
+`Pass::checks_first_seen`. `fix_reorder.rs`: queued fix at position > 1, in `covering`, on a pass
+with no `partial()`,
+`base_health_cmd::jump(.., Some(census head))` under the PR mutation guard,
+`JumpDecision` per episode (`<context>@<red_since>`) in
+`base-health/fix-reorders.jsonl`, failures retried. `orphan_groups.rs`:
+suspects = unfinished `merge_group` runs on `gh-readonly-queue/<base>/`
+whose head is no `merge_group_heads` value; `git/ref/heads/<branch>` read
+per suspect branch, only `HTTP 404` cancels (run mutation guard), receipts
+in `base-health/orphan-cancels.jsonl`. `red_base_ejections.rs`: ledger
+`red_base_ejections` (`repo@base`) records group PRs at their census head
+while confirmed (window from `red_since - 2h`), closes the window when
+`tip_green_for` or a passing group, on a pass with no `partial()` and no
+confirmed context, then `excused_queue` (called in
+`evaluate_head_gate_with` after `without_steward_removals`) drops the head's
+in-window `failed_checks` removals when the latest removal is one; dropped
+on re-enqueue, head move, close or 48 h.
+
 ### The endpoint that lies by omission
 
 `GET /repos/{o}/{r}/branches/{b}/protection` has **no merge-queue field at

@@ -613,7 +613,12 @@ auto_jump = "on"          # off | dry-run | on: enqueue the fix with jump: true
 The steward acts only when two independent readings agree on one required
 context: the context failed in at least two consecutive merge groups that
 carried different pull requests, and the base tip's own newest run of that
-context failed too. A single flaky failure, or a streak the tip does not
+context failed too. A red-everywhere episode on the same check (three or
+more open pull requests failing it the same way) stands in for the tip when
+the tip has a completed verdict and it is strictly older than the episode, as
+when a date-dependent test breaks and nothing re-runs the tip. A tip with no
+completed verdict, or a red tip with no known red time, never takes its
+timing from the episode. A single flaky failure, or a streak the tip does not
 show, holds nothing. The tip reading is one `GET` per poisoned context, made
 only while the streak is firing.
 
@@ -654,6 +659,33 @@ test that starts failing on a date) never shows red on its own. Name a
 cheap workflow that produces the context under
 `[base_health.control_workflows]` and the steward dispatches it once on the
 base when the streak starts; that run is the tip's own verdict.
+
+Three further acts each have their own key under `[base_health]`
+(`off | dry-run | on`, default `dry-run` on a merge-queue base), write one
+`<act>: ...` line in the pass report's `base_poison.acts`, and record what
+they did:
+
+- `reorder_fix`: a fix that is already queued behind other entries is
+  moved to the front (dequeue, then its exact head enqueued with
+  `jump: true`), once per episode. Only the fix admission would jump is
+  moved: it must have passed every confirmed check after the break, and the
+  pass must have read everything. A fix at position 1 is left alone: its
+  group is already building. A head that moved since the steward read it is
+  refused. Decisions: `<state>/base-health/fix-reorders.jsonl`.
+- `cancel_orphaned_groups`: a `merge_group` run still going on a
+  `gh-readonly-queue/<base>/pr-<n>-<sha>` branch that no longer exists (the
+  queue was rebuilt) is cancelled. This act does not wait for a red base:
+  an orphaned run is waste whatever the base's state, and its own evidence
+  is the missing branch. The ref is read in the same pass, and only a `404`
+  counts; `push` and `pull_request` runs are never touched. Receipts:
+  `<state>/base-health/orphan-cancels.jsonl`.
+- `reenqueue_red_base_ejections`: a pull request that rode a failing group
+  while the base was red is recorded at its head. Once a fully read pass
+  finds no check confirmed red,
+  its `failed_checks` ejections from the episode stop counting toward the
+  ejection cap, if its latest removal was one of them, and the steward
+  enqueues it as usual: exact head, approval and checks still required,
+  once per head.
 
 `shipyard base-health --replay FILE` runs recorded episodes through the same
 rule and scores each pick against the pull request that repaired the base.
