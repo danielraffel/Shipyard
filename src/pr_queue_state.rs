@@ -1428,12 +1428,11 @@ mod tests {
         );
         // A later server-timestamped force-push of the current head is.
         pr_mut(&mut value)["headRefOid"] = Value::from(PUSHED_HEAD);
-        assert_eq!(
-            explain_pr_queue_state(&value)
+        assert!(
+            !explain_pr_queue_state(&value)
                 .last_ejection
                 .expect("ejection")
                 .new_head_since,
-            false,
             "a later PullRequestCommit is not authoritative push evidence"
         );
         nodes_mut(&mut value).push(serde_json::json!({
