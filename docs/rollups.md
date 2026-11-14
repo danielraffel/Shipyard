@@ -98,6 +98,15 @@ direct rollups (`[train] enabled = true`, `mode = "rollup"`, `landing =
 "direct"`). Until then a rollup is formed and landed by hand with the
 commands below.
 
+The daily loss report (below) turns these plans into a counterfactual per
+repository per UTC day, `rollup_counterfactual.per_repo_per_day`: would have
+batched K pull requests into J rollups, saving about K minus J CI runs.
+Consecutive passes repeat a plan, so each pull request at a head counts once,
+in the first plan that names it, and a plan counts as a rollup only when it
+brings at least two members no earlier plan took. It is an estimate: it
+assumes each rollup passes its one run. It is the evidence for moving a base
+from `shadow` to `apply`.
+
 ## The shape
 
 The branch is `shipyard-train/rollup-<n>`, `n` being the oldest member. It
