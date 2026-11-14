@@ -530,7 +530,6 @@ fn sh_quote(value: &str) -> Result<String, String> {
 /// child's PATH; `real_gh` was resolved by absolute path before that, so the
 /// shim cannot call itself.
 fn write_gh_shim(dir: &Path, ghread: &Path, real_gh: &Path, repo: &str) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
     fs::create_dir_all(dir).map_err(|error| error.to_string())?;
     let path = dir.join("gh");
     let script = GH_SHIM
@@ -538,7 +537,24 @@ fn write_gh_shim(dir: &Path, ghread: &Path, real_gh: &Path, repo: &str) -> Resul
         .replace("__REAL_GH__", &sh_quote(&real_gh.to_string_lossy())?)
         .replace("__REPO__", &sh_quote(repo)?);
     fs::write(&path, script).map_err(|error| error.to_string())?;
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())
+    make_shim_executable(&path)
+}
+
+fn make_shim_executable(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+            .map_err(|error| error.to_string())
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows has no POSIX executable bit. The canary invokes this
+        // extensionless script through `sh`, so there is no mode to set.
+        let _ = path;
+        Ok(())
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -737,7 +753,6 @@ fn apply_action(request: &Request<'_>, gh: Gh<'_>, action: &IssueAction) -> Resu
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
     use super::*;
@@ -1266,6 +1281,7 @@ mod tests {
         assert_eq!(report.unwrap().status, "fail");
     }
 
+    #[cfg(unix)]
     fn fake_ghread(dir: &Path) -> PathBuf {
         let cache = dir.join("cache");
         fs::create_dir_all(&cache).unwrap();
@@ -1278,11 +1294,12 @@ mod tests {
         }
         let path = dir.join("ghread");
         fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        make_shim_executable(&path).unwrap();
         path
     }
 
     #[test]
+    #[cfg(unix)]
     fn read_tokens_reach_the_child_only_when_opted_in_and_come_from_ghread() {
         let dir = tempfile::tempdir().unwrap();
         let ghread = fake_ghread(dir.path());
@@ -1324,6 +1341,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn read_tokens_are_minted_from_ghread_cache() {
         let dir = tempfile::tempdir().unwrap();
         let ghread = fake_ghread(dir.path());
@@ -1343,6 +1361,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     fn fake_real_gh(dir: &Path) -> PathBuf {
         let path = dir.join("real-gh");
         fs::write(
@@ -1353,11 +1372,12 @@ mod tests {
             ),
         )
         .unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        make_shim_executable(&path).unwrap();
         path
     }
 
     /// Run `gh_line` under the shim; returns (status, real-gh log).
+    #[cfg(unix)]
     fn under_shim(gh_line: &str, with_other_token: bool) -> (String, String) {
         let dir = tempfile::tempdir().unwrap();
         let ghread = fake_ghread(dir.path());
@@ -1383,6 +1403,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn the_shim_allows_run_download_with_the_named_repos_read_token() {
         let (body, log) = under_shim("gh run download 123 -R o/other -n x -D d", true);
         assert!(body.contains("shim-exit=0"), "{body}");
@@ -1396,6 +1417,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn the_shim_refuses_other_run_commands_unknown_flags_and_tokenless_repos() {
         for line in [
             "gh run rerun 123",
