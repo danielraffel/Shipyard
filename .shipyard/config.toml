@@ -75,6 +75,7 @@ enabled         = true
 repos           = ["danielraffel/Shipyard"]
 base            = "main"
 workflow        = "ci.yml"
+workflow_overrides = { "danielraffel/spectr" = "m5-product-acceptance.yml" }
 lookback        = "7d"
 post_comments   = false
 stale_after_minutes = 45
