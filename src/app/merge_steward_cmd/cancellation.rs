@@ -18,6 +18,29 @@ use super::{
     },
 };
 
+/// The admission policy a pass applies to `observation`: the repository's
+/// merge path and required checks, the pass's labels and approval context,
+/// and the base's ejection guards. Shared by the tick and the ready-on-event
+/// admission (`ready_event`), so both judge a head by the same rules.
+pub(super) fn pass_policy(
+    actions: &GitHubActions,
+    args: &StewardCommandArgs,
+    observation: &RepoObservation,
+) -> StewardPolicy {
+    StewardPolicy {
+        merge_queue: observation.merge_queue,
+        native_auto_merge: observation.allow_auto_merge,
+        approval_context: args.approval_context.clone(),
+        required_checks: observation.required_checks.clone(),
+        opt_out_label: args.opt_out_label.clone(),
+        provenance_blocking_labels: args.provenance_blocking_labels.clone(),
+        managed_label: Some(args.managed_label.clone()),
+        handoff_context: args.handoff_context.clone(),
+        max_transient_reruns: args.max_transient_reruns,
+        ejection_guards: super::read_ejection_guards(actions, observation),
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn apply_repo_plan(
@@ -97,18 +120,7 @@ pub(super) fn apply_repo_plan(
     } else {
         None
     };
-    let policy = StewardPolicy {
-        merge_queue: observation.merge_queue,
-        native_auto_merge: observation.allow_auto_merge,
-        approval_context: args.approval_context.clone(),
-        required_checks: observation.required_checks.clone(),
-        opt_out_label: args.opt_out_label.clone(),
-        provenance_blocking_labels: args.provenance_blocking_labels.clone(),
-        managed_label: Some(args.managed_label.clone()),
-        handoff_context: args.handoff_context.clone(),
-        max_transient_reruns: args.max_transient_reruns,
-        ejection_guards: super::read_ejection_guards(actions, observation),
-    };
+    let policy = pass_policy(actions, args, observation);
     let base_poison = super::base_poison::observe(actions, observation, &policy, Utc::now());
     // Infra reruns and red everywhere skip the same labels.
     let mut infra_excluded = vec![args.opt_out_label.clone()];

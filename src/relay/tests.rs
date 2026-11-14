@@ -682,6 +682,9 @@ fn owner(pr: u64, host: &str, surface: &str) -> OwnerRecord {
     record
 }
 
+/// The ready admissions a pass ran: repository, number, head, base.
+type Admissions = std::rc::Rc<RefCell<Vec<(String, u64, String, String)>>>;
+
 struct Harness {
     temp: tempfile::TempDir,
     config: RelayConfig,
@@ -691,6 +694,8 @@ struct Harness {
     log: Vec<Value>,
     steward: BTreeMap<u64, (String, String)>,
     overdue: BTreeMap<u64, Vec<RelayEvent>>,
+    /// `Some` runs the ready admission hook and records each call.
+    admissions: Option<Admissions>,
 }
 
 impl Harness {
@@ -704,6 +709,7 @@ impl Harness {
             log: Vec::new(),
             steward: BTreeMap::new(),
             overdue: BTreeMap::new(),
+            admissions: None,
         }
     }
 
@@ -718,6 +724,17 @@ impl Harness {
         let steward = move |_: &str| steward_map.clone();
         let overdue_map = self.overdue.clone();
         let steward_overdue = move |_: &str| overdue_map.clone();
+        let admissions = self.admissions.clone();
+        let admit = move |repo: &str, pr: u64, head: &str, base: &str| {
+            if let Some(calls) = admissions.as_ref() {
+                calls
+                    .borrow_mut()
+                    .push((repo.to_owned(), pr, head.to_owned(), base.to_owned()));
+            }
+            json!({"outcome": "admitted"})
+        };
+        let ready: Option<&super::pass::ReadyAdmission<'_>> =
+            self.admissions.is_some().then_some(&admit);
         let input = PassInput {
             config: &self.config,
             repos: &repos,
@@ -730,6 +747,7 @@ impl Harness {
             steward: &steward,
             steward_overdue: &steward_overdue,
             persist: None,
+            ready,
         };
         let report = run_pass(&input, &mut self.state);
         self.log.extend(report.log.clone());
@@ -1145,6 +1163,7 @@ fn a_recorded_day_replays_into_the_expected_deliveries() {
             steward: &steward,
             steward_overdue: &steward_overdue,
             persist: None,
+            ready: None,
         };
         let report = run_pass(&input, &mut h.state);
         let got: Vec<String> = report
@@ -1475,6 +1494,7 @@ fn each_delivery_is_persisted_before_the_next_one_is_sent() {
         steward: &steward,
         steward_overdue: &steward_overdue,
         persist: Some(&persist),
+        ready: None,
     };
     let mut state = h.state.clone();
     let report = run_pass(&input, &mut state);
@@ -1540,6 +1560,7 @@ fn the_relay_table_parses_and_rejects_what_it_cannot_honour() {
         repos = ["Generous-Corp/pulp"]
         events = ["merged", "closed"]
         sockets = ["/tmp/cmux-nightly.sock"]
+        admit_ready = "apply"
         [relay.hosts.m5]
         ssh = "m5"
         cmux = "/opt/homebrew/bin/cmux"
@@ -1550,6 +1571,12 @@ fn the_relay_table_parses_and_rejects_what_it_cannot_honour() {
     .unwrap();
     let parsed = config::parse(&table).expect("parses");
     assert_eq!(parsed.mode, Mode::Send);
+    assert_eq!(parsed.admit_ready, config::AdmitReady::Apply);
+    assert_eq!(
+        config::parse(&toml::Table::new()).unwrap().admit_ready,
+        config::AdmitReady::Off,
+        "the ready admission is off unless a host turns it on"
+    );
     assert_eq!(parsed.events.len(), 2);
     assert_eq!(parsed.route("m5", "m3").ssh.as_deref(), Some("m5"));
     assert_eq!(parsed.route("m3", "m3").ssh, None);
@@ -1575,6 +1602,7 @@ fn the_relay_table_parses_and_rejects_what_it_cannot_honour() {
         "[relay.hosts.m5]\nssh = \"m5; rm -rf /\"",
         "[relay.repo.\"o/r\"]\nlead = \"no-slash\"",
         "[relay]\nenabled = \"yes\"",
+        "[relay]\nadmit_ready = \"always\"",
     ] {
         let table: toml::Table = toml::from_str(bad).unwrap();
         assert!(config::parse(&table).is_err(), "{bad}");
@@ -1756,4 +1784,95 @@ fn a_queued_pull_request_ejected_still_red_is_reported_red() {
     );
     let message = render_message(REPO, 412, &digest(&ejected), &events, None);
     assert!(message.contains("red: judge"), "{message}");
+}
+
+// ---------------------------------------------------------------- ready admission
+
+#[test]
+fn only_the_event_that_makes_a_pull_request_ready_triggers_the_admission() {
+    let digest_of = |pr: &Pr| digest(pr);
+    let mut approved_green = Pr::open(7);
+    approved_green.checks = green();
+    approved_green.comments.push(verdict("APPROVE", HEAD_A));
+    let ready = digest_of(&approved_green);
+    let approval = vec![RelayEvent::Verdict {
+        verdict: "APPROVE".to_owned(),
+        head: HEAD_A.to_owned(),
+    }];
+    let green_event = vec![RelayEvent::RequiredCheck {
+        result: "green".to_owned(),
+        names: Vec::new(),
+        head: HEAD_A.to_owned(),
+        seq: 0,
+    }];
+    assert!(pass::became_ready(&approval, &ready));
+    assert!(pass::became_ready(&green_event, &ready));
+    assert!(!pass::became_ready(&[], &ready), "no event, no trigger");
+
+    let mut queued = ready.clone();
+    queued.in_queue = true;
+    assert!(!pass::became_ready(&approval, &queued));
+    let mut pending = Pr::open(7);
+    pending.comments.push(verdict("APPROVE", HEAD_A));
+    assert!(!pass::became_ready(&approval, &digest_of(&pending)));
+    let mut held = approved_green.clone();
+    held.comments.push(verdict("HOLD", HEAD_A));
+    let hold_event = vec![RelayEvent::Verdict {
+        verdict: "HOLD".to_owned(),
+        head: HEAD_A.to_owned(),
+    }];
+    assert!(!pass::became_ready(&hold_event, &digest_of(&held)));
+    let stale = vec![RelayEvent::Verdict {
+        verdict: "APPROVE".to_owned(),
+        head: HEAD_B.to_owned(),
+    }];
+    assert!(!pass::became_ready(&stale, &ready), "another head's event");
+}
+
+#[test]
+fn an_approval_on_a_green_head_runs_the_admission_once() {
+    let mut pr = Pr::open(12);
+    pr.checks = green();
+    let mut h = Harness::new(std::slice::from_ref(&pr), FakeCmux::with(&[]));
+    h.own(&owner(12, "m5", "S-YUP"));
+    let calls = std::rc::Rc::new(RefCell::new(Vec::new()));
+    h.admissions = Some(std::rc::Rc::clone(&calls));
+    h.pass(0, Mode::Shadow);
+    assert!(calls.borrow().is_empty(), "the first pass is the baseline");
+
+    let mut approved = pr.clone();
+    approved.comments.push(verdict("APPROVE", HEAD_A));
+    h.gh.set(approved);
+    h.pass(1, Mode::Shadow);
+    assert_eq!(
+        calls.borrow().as_slice(),
+        [(REPO.to_owned(), 12, HEAD_A.to_owned(), "main".to_owned())]
+    );
+    assert!(
+        h.log
+            .iter()
+            .any(|record| record["kind"] == "ready_admission" && record["outcome"] == "admitted")
+    );
+    h.pass(2, Mode::Shadow);
+    assert_eq!(
+        calls.borrow().len(),
+        1,
+        "an unchanged pull request is no event"
+    );
+}
+
+#[test]
+fn checks_going_green_after_the_approval_run_the_admission() {
+    let mut pr = Pr::open(13);
+    pr.comments.push(verdict("APPROVE", HEAD_A));
+    let mut h = Harness::new(std::slice::from_ref(&pr), FakeCmux::with(&[]));
+    h.own(&owner(13, "m5", "S-YUP"));
+    let calls = std::rc::Rc::new(RefCell::new(Vec::new()));
+    h.admissions = Some(std::rc::Rc::clone(&calls));
+    h.pass(0, Mode::Shadow);
+    let mut green_pr = pr.clone();
+    green_pr.checks = green();
+    h.gh.set(green_pr);
+    h.pass(1, Mode::Shadow);
+    assert_eq!(calls.borrow().len(), 1);
 }

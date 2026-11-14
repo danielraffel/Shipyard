@@ -5941,6 +5941,18 @@ with the same token kind, the row's `since` (or `merge_group_enqueued_at`,
 or the quarantine line's `since=`), else now. Quarantine file: env
 `SHIPYARD_REVIEW_QUARANTINE` or machine-global `loop.review_quarantine_file`.
 No GitHub reads; `loop_seen` is kept only by applying passes.
+`src/app/merge_steward_cmd/ready_event.rs`: ready on event
+(docs/scheduling-loop.md, "Ready on event"). `runner steward-admit-ready
+--repo R --pr N --head SHA [--apply]`, or `shipyard relay` with
+`[relay] admit_ready = "apply"` when a verdict or green-check event finds the
+PR open, approved at its head, green and unqueued (`relay::pass::became_ready`;
+a shadow relay only reports), runs the tick's `mutate_pr_with_recovery` for
+that one PR: live gate, final revalidation, `expectedHeadOid`. One attempt per
+head per 60 s (`merge-steward.ready-events.json`), a moved head, a non-ready
+classification, a non-clear base poison, a paused entry or a pending
+cancellation is skipped; the ledger lock is tried, never waited on
+(`steward_busy`). The tick's own lock now waits up to 30 s
+(`acquire_ledger_lock_within`).
 `src/app/merge_steward_cmd/merge_group_stall.rs`: for each queue entry
 whose `merge_group_heads` sha has no active run in the census, three reads
 (`actions/runs?head_sha=`, `commits/<sha>/check-runs`, `commits/<sha>/statuses`;

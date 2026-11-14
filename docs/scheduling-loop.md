@@ -143,3 +143,44 @@ request is no longer open; a row missing from a partial report keeps its
 record. A report pass keeps nothing. If the ledger cannot be saved, the next
 pass dates states from the evidence again, so a level can only come out
 lower, never higher.
+
+## Ready on event
+
+A `ready` head is enqueued by the next tick, which can be minutes away. When
+the event that made it ready arrives (its exact-head approval posts, or its
+last required check turns green), the steward's own admission can run for
+that one pull request at once:
+
+```bash
+shipyard runner steward-admit-ready --repo OWNER/REPO --pr N --head SHA          # report
+shipyard runner steward-admit-ready --repo OWNER/REPO --pr N --head SHA --apply  # admit
+```
+
+`shipyard relay` runs it for the pull requests it tracks when
+`[relay] admit_ready = "apply"` (or `"report"`; the default is `"off"`), on a
+pass where it sees the approval or the green checks and the pull request is
+open, approved at its head, green and not queued. A shadow relay only
+reports. Turn `apply` on only on the host that runs the steward: the
+admission uses that host's steward lock, ledger and mutation authority.
+
+The event is only a trigger; nothing in it is trusted. The admission:
+
+1. Records one attempt per head per window (`--min-interval-secs`, 60 by
+   default) in `merge-steward.ready-events.json` beside the steward ledger,
+   before any GitHub read. A repeat within the window does nothing.
+2. Reads the pull request again. A head other than the one the event named,
+   a pull request that is not open or not on the default branch, one already
+   queued or armed, or one the tick's policy does not classify as ready, is
+   left alone.
+3. Leaves to the tick a base whose merge groups read anything but clear, a
+   paused queue entry, and a pending run cancellation.
+4. Takes the steward's ledger lock without waiting. If a tick or an
+   `admission-clean` gate holds it, it does nothing: that pass sees the head.
+5. Admits through the tick's own path: the live exact-head approval gate, the
+   carried-commit, code-owner and defect-fix guards, the final revalidation,
+   and the enqueue (or exact-head merge) pinned to the head with
+   `expectedHeadOid`. Its result is saved in the steward ledger.
+
+Anything it cannot read means it does nothing, and the tick handles the pull
+request as before. A tick that finds the lock held waits up to 30 seconds for
+it instead of skipping its pass.

@@ -20,8 +20,8 @@ use crate::gh_pass::GhPass;
 use crate::identity::RuntimeMode;
 use crate::output::write_json_envelope;
 use crate::paths::RuntimePaths;
-use crate::relay::config::{Mode, RelayConfig};
-use crate::relay::pass::{PassInput, RelayState, run_pass};
+use crate::relay::config::{AdmitReady, Mode, RelayConfig};
+use crate::relay::pass::{PassInput, ReadyAdmission, RelayState, run_pass};
 use crate::relay::transport::ProcessRunner;
 
 /// Each GitHub read may take this long.
@@ -160,6 +160,7 @@ pub(super) fn relay_command<W: Write>(
     let config =
         LoadedConfig::load_from_cwd_with_global_dir(mode, cwd, runtime_paths.global_dir.clone())
             .map_err(|error| CliFailure::new(2, format!("config error: {error}")))?;
+    let runtime_mode = mode;
     let relay: RelayConfig = machine_relay_config(runtime_paths)?;
     if !relay.enabled {
         writeln!(
@@ -214,6 +215,35 @@ pub(super) fn relay_command<W: Write>(
     let interval = Duration::from_secs(args.interval.unwrap_or(relay.interval_secs));
     let tick_dir = relay.steward_tick_dir.clone();
     let tick_age = Duration::from_secs(relay.steward_tick_max_age_secs);
+    // `relay.admit_ready`: when an event makes a pull request ready, run the
+    // steward's own admission for it (see `merge_steward_cmd::ready_event`).
+    // A shadow relay mutates nothing, so there it only reports.
+    let admit_ready = match (relay.admit_ready, mode) {
+        (AdmitReady::Apply, Mode::Shadow) => AdmitReady::Report,
+        (admit, _) => admit,
+    };
+    let steward_reads = GitHubActions::from_loaded_config(cwd, &config).with_inproc_reads(
+        crate::github_read::for_steward(&config, &runtime_paths.state_dir),
+    );
+    let ready = |repo: &str, pr: u64, head: &str, base: &str| -> Value {
+        let outcome = super::merge_steward_cmd::ready_event::admit_ready(
+            &steward_reads,
+            cwd,
+            runtime_mode,
+            runtime_paths,
+            &super::merge_steward_cmd::ready_event::AdmitReadyArgs {
+                repo: repo.to_owned(),
+                base: base.to_owned(),
+                pr,
+                head: head.to_owned(),
+                min_interval: super::merge_steward_cmd::ready_event::DEFAULT_MIN_INTERVAL,
+                apply: admit_ready == AdmitReady::Apply,
+            },
+        );
+        serde_json::to_value(outcome).unwrap_or(Value::Null)
+    };
+    let ready_hook: Option<&ReadyAdmission<'_>> =
+        (admit_ready != AdmitReady::Off).then_some(&ready);
     let mut passes = 0_u64;
     let mut unhealthy;
     loop {
@@ -255,6 +285,7 @@ pub(super) fn relay_command<W: Write>(
                 steward: &steward,
                 steward_overdue: &steward_overdue,
                 persist: Some(&persist),
+                ready: ready_hook,
             };
             let report = run_pass(&input, &mut state);
             log.extend(report.log);
