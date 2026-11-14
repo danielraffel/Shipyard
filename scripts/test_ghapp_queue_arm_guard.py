@@ -5044,6 +5044,10 @@ class TransientReadRetry(unittest.TestCase):
             ("api", "--method=GET", "repos/o/r/pulls/1"),
         )
         writes = (
+            ("api", "-H", "X-HTTP-Method-Override: POST", "repos/o/r/pulls/1"),
+            ("api", "--header", "x-http-method-override: DELETE", "repos/o/r/pulls/1"),
+            ("api", "--header=X-HTTP-METHOD-OVERRIDE: PATCH", "repos/o/r/pulls/1"),
+            ("api", "-HX-Http-Method-Override: PUT", "repos/o/r/pulls/1"),
             ("api", "-X", "POST", "repos/o/r/issues/1/comments", "-f", "body=hi"),
             ("api", "--method", "PUT", "repos/o/r/pulls/1/merge"),
             ("api", "-XDELETE", "repos/o/r/issues/comments/5"),

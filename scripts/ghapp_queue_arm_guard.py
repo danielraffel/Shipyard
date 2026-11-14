@@ -3471,6 +3471,11 @@ _GH_API_VALUE_OPTIONS = frozenset((
 ))
 
 
+def _is_method_override_header(value: str) -> bool:
+    """Treat GitHub method-override headers as writes even when the verb is GET."""
+    return value.partition(":")[0].strip().casefold() == "x-http-method-override"
+
+
 def read_only_gh_arguments(arguments: list[str]) -> bool:
     """Whether ``arguments`` can only read GitHub, so repeating them is safe:
     ``api``, no method other than GET, no ``--input`` body, and either no
@@ -3482,6 +3487,7 @@ def read_only_gh_arguments(arguments: list[str]) -> bool:
     method: str | None = None
     endpoint: str | None = None
     fields: list[str] = []
+    headers: list[str] = []
     previous = ""
     for argument in arguments[1:]:
         if previous in ("-X", "--method"):
@@ -3490,6 +3496,8 @@ def read_only_gh_arguments(arguments: list[str]) -> bool:
             fields.append(argument)
         elif previous == "--input":
             return False
+        elif previous in ("-H", "--header"):
+            headers.append(argument)
         elif previous in _GH_API_VALUE_OPTIONS:
             pass
         elif argument.startswith("--method="):
@@ -3498,6 +3506,10 @@ def read_only_gh_arguments(arguments: list[str]) -> bool:
             method = argument[2:].upper()
         elif argument.startswith(("--input=",)) or argument == "--input":
             return False
+        elif argument.startswith("--header="):
+            headers.append(argument.partition("=")[2])
+        elif argument.startswith("-H") and argument != "-H":
+            headers.append(argument[2:])
         elif argument.startswith(("--field=", "--raw-field=")):
             fields.append(argument.partition("=")[2])
         elif argument.startswith(("-f", "-F")) and argument not in ("-f", "-F"):
@@ -3510,6 +3522,8 @@ def read_only_gh_arguments(arguments: list[str]) -> bool:
     if method not in (None, "GET"):
         return False
     if any(field.partition("=")[2].startswith("@") for field in fields):
+        return False
+    if any(_is_method_override_header(header) for header in headers):
         return False
     if not fields:
         return True
