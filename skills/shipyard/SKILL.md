@@ -65,6 +65,41 @@ in the same pass, so a pass with no admission candidate holds stacked entries
 (`stack_listing: not_read_this_pass`) rather than reading GitHub again. Full
 reference: `docs/automated-draining.md`, "Dwell-time limits".
 
+## Routine release-movement acts: `shipyard advance`
+
+Do not ask the owner, and do not hand-type `ghapp` writes, to release a hold
+or retrigger a stale merge ref. `shipyard advance OWNER/REPO#N
+--release-hold [--decision REF]` removes `shipyard:no-auto-merge` only when
+every required check is green at the exact head, the steward's own gate
+counts an exact-head APPROVE (a review on that commit, or a `ghapp`-stamped
+verdict), and every `hold-condition:` line in the comment that added the
+label is met (`merged OWNER/REPO#N`, `after <RFC 3339>`, `approved`,
+`green`), or `--decision` names a `DECISIONS*` file that names the pull
+request. `--retrigger --reason "..."` closes and reopens only an open pull
+request that is not queued or armed, has no live `repair-claim:`, and whose
+required runs reported at the exact head with none still running. Both
+refuse a pull request the caller authored or approved, read everything again
+before writing, exit 1 naming the failed condition (2 when a fact is
+unreadable), and post one audit comment plus one `advance.jsonl` line per
+act. `--dry-run` changes nothing. When writing a hold, name its conditions
+as `hold-condition:` lines so it can be released this way. Gotcha:
+`pr-close-guard` refuses every retrigger until the guard change proposed in
+`docs/advance.md` lands; the refusal changes nothing. Defect dequeues keep
+their own path. Full reference: `docs/advance.md`.
+
+## Stale merge refs: `stale_merge_ref`
+
+An approved pull request whose required checks went red on a test merge
+commit that no longer exists reads `stale_merge_ref:<contexts>` (actor
+`steward`): each red run is a `pull_request` run of the head whose tested base
+is not the base of the current `merge_commit_sha`, and the same contexts are
+green on the base tip. A red on the current merge ref never reads it, however
+old; BEHIND and DIRTY never do. Do not push to "refresh" it and do not close
+and reopen it by hand: the dwell pass runs `shipyard advance --retrigger` for
+it, at most once per head ever. An act outcome `retrigger_blocked: guard`
+means pr-close-guard refused the close and nothing changed. Full reference:
+`docs/automated-draining.md`, "Stale merge refs".
+
 ## Durable work-item contract
 
 Shipyard's existing ShipState/lease/receipt primitives are the source of
