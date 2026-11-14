@@ -63,7 +63,13 @@ fn read_snapshot(temp: &tempfile::TempDir, body: &str) -> (Value, String) {
     let state_dir = temp.path().join("state");
     fs::create_dir_all(&state_dir).expect("state dir");
     let snapshot = crate::head_approval::with_host_review_default(true, || {
-        pr_next_action_snapshot(&actions, &state_dir, "owner/repo", 42)
+        pr_next_action_snapshot(
+            &actions,
+            &state_dir,
+            &temp.path().join("global"),
+            "owner/repo",
+            42,
+        )
     })
     .expect("snapshot");
     let calls = fs::read_to_string(log).unwrap_or_default();
@@ -76,6 +82,44 @@ fn green_rollup() -> String {
         check("macos", "SUCCESS", "2026-11-01T10:00:00Z"),
         check("review-verdict", "FAILURE", "2026-11-01T10:05:00Z")
     )
+}
+
+#[cfg(unix)]
+#[test]
+fn a_dry_run_reads_the_machine_global_quarantine_file() {
+    let temp = tempfile::tempdir().expect("temp");
+    let log = temp.path().join("calls");
+    let global = temp.path().join("global");
+    fs::create_dir_all(&global).expect("global");
+    let quarantine = temp.path().join("review-quarantine.txt");
+    fs::write(
+        &quarantine,
+        format!("owner/repo#42 {HEAD} reviewer_unverified_exhausted since=1763049600\n"),
+    )
+    .expect("quarantine");
+    fs::write(
+        global.join("config.toml"),
+        format!(
+            "[loop]\nreview_quarantine_file = \"{}\"\n",
+            quarantine.display()
+        ),
+    )
+    .expect("config");
+    let body = script(
+        &log,
+        &pr_row("OPEN", "main", "CLEAN", 3, &green_rollup()),
+        "",
+        "",
+    );
+    let actions = fake_gh(&temp, &body);
+    let state_dir = temp.path().join("state");
+    fs::create_dir_all(&state_dir).expect("state dir");
+    let snapshot = crate::head_approval::with_host_review_default(true, || {
+        pr_next_action_snapshot(&actions, &state_dir, &global, "owner/repo", 42)
+    })
+    .expect("snapshot");
+    assert_eq!(snapshot["blocked_on"], "no_verdict");
+    assert_eq!(snapshot["loop"]["state"], "quarantined", "{snapshot:#}");
 }
 
 #[cfg(unix)]
@@ -282,11 +326,22 @@ fn a_missing_pull_request_is_an_error_the_wait_reports_as_absent() {
         &temp,
         r"echo 'GraphQL: Could not resolve to a PullRequest with the number of 42. (repository.pullRequest)' >&2; exit 1",
     );
-    let error =
-        pr_next_action_snapshot(&actions, temp.path(), "owner/repo", 42).expect_err("absent PR");
+    let error = pr_next_action_snapshot(
+        &actions,
+        temp.path(),
+        &temp.path().join("global"),
+        "owner/repo",
+        42,
+    )
+    .expect_err("absent PR");
     assert!(error.starts_with("pull request failed"), "{error}");
-    let fetched =
-        crate::app::wait_cmd::fetch_pr_actionable_snapshot(&actions, temp.path(), "owner/repo", 42)
-            .expect("absent is Ok(None)");
+    let fetched = crate::app::wait_cmd::fetch_pr_actionable_snapshot(
+        &actions,
+        temp.path(),
+        &temp.path().join("global"),
+        "owner/repo",
+        42,
+    )
+    .expect("absent is Ok(None)");
     assert!(fetched.is_none());
 }

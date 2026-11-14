@@ -19,6 +19,7 @@ use super::{
 };
 
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 pub(super) fn apply_repo_plan(
     actions: &GitHubActions,
     args: &StewardCommandArgs,
@@ -27,6 +28,7 @@ pub(super) fn apply_repo_plan(
     ledger: &mut StewardLedger,
     remaining_preemptions: usize,
     mutation_control: Option<&MutationControl>,
+    global_dir: Option<&Path>,
 ) -> (RepoReport, bool, usize) {
     // Settle earlier uncertain admissions first, so a pull request whose
     // enqueue GitHub plainly took or refused is not held behind it.
@@ -124,6 +126,26 @@ pub(super) fn apply_repo_plan(
         ledger,
         Utc::now().timestamp(),
     );
+    // Merge groups that can never finish: read before any pull request is
+    // mutated, so the dequeue below acts on this pass's reading.
+    let mut stall_pass = super::merge_group_stall::observe(
+        &|argv: &[String]| actions.run_gh(argv).map_err(|error| error.to_string()),
+        observation,
+        policy.ejection_guards.dequeue_doomed_groups,
+        &policy.ejection_guards.base_poison.control_workflows,
+        Utc::now(),
+    );
+    // Defect-fix removals: read once, honoured by every admission below.
+    // Only an applying pass updates the cached last good read.
+    let mut removal_cache = ledger.removal_ledger.clone();
+    stall_pass.defect_fix = super::defect_fix_removals::read(
+        &super::defect_fix_removals::ledger_path(),
+        &mut removal_cache,
+        Utc::now(),
+    );
+    if args.apply {
+        ledger.removal_ledger = removal_cache;
+    }
     let (mut reports, pr_mutation_failed, listing) = apply_pr_plans_with_poison(
         actions,
         args,
@@ -133,7 +155,19 @@ pub(super) fn apply_repo_plan(
         ledger,
         mutation_control,
         base_poison.as_ref(),
+        Some(&stall_pass),
     );
+    let mut stall_lines = stall_pass.lines();
+    stall_lines.extend(stall_pass.defect_fix.lines());
+    if args.apply {
+        stall_lines.extend(super::merge_group_stall::retry_comments(
+            ledger,
+            &observation.repo,
+            &|pr, body| {
+                super::merge_group_stall::post_comment(actions, &observation.repo, pr, body)
+            },
+        ));
+    }
     let superseded_rate_limit = ledger
         .superseded_rate_limit
         .take()
@@ -236,6 +270,32 @@ pub(super) fn apply_repo_plan(
             }),
         },
     );
+    // The scheduling loop: one state, act, deadline and level per covered
+    // row, from what this pass already read. See `scheduling_loop`.
+    let quarantine = super::scheduling_loop::read_quarantine(
+        super::scheduling_loop::quarantine_path(
+            global_dir.or_else(|| mutation_control.map(|control| control.global_dir.as_path())),
+        )
+        .as_deref(),
+    );
+    {
+        let dwell = ledger
+            .dwell
+            .get(&super::dwell_pass::dwell_key(
+                &observation.repo,
+                &observation.base,
+            ))
+            .cloned();
+        super::scheduling_loop::annotate(
+            &mut reports,
+            observation,
+            dwell.as_ref(),
+            &mut ledger.loop_seen,
+            &quarantine,
+            args.apply,
+            Utc::now(),
+        );
+    }
     // The backstop acts only on pull requests the steward declines to own, so
     // it can never contend with the enqueue path above. See `native_arm`.
     let (native_arm_status, native_arm_failed) =
@@ -254,7 +314,18 @@ pub(super) fn apply_repo_plan(
             super::native_arm::apply_native_arm_backstop(
                 actions,
                 observation,
-                &reports,
+                // A head a defect-fix removal blocks is never offered to the
+                // backstop: a pull request with no row is no candidate.
+                &reports
+                    .iter()
+                    .filter(|report| {
+                        stall_pass
+                            .defect_fix
+                            .blocking(&observation.repo, report.number, &report.head_sha)
+                            .is_none()
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>(),
                 &args.opt_out_label,
                 args.apply,
                 || {
@@ -408,6 +479,13 @@ pub(super) fn apply_repo_plan(
     (
         RepoReport {
             base_poison: base_poison_report,
+            merge_group_stalled: Some(serde_json::json!({
+                "mode": stall_pass.mode,
+                "config_error": policy.ejection_guards.dequeue_doomed_groups_error,
+                "lines": stall_lines,
+                "entries": stall_pass.entries,
+                "reads": "three per queue entry whose group head has no active run",
+            })),
             rollup_reconciliation: Vec::new(),
             uncertain_mutations,
             api_calls: None,
@@ -503,6 +581,7 @@ pub(super) fn apply_pr_plans_with_listing(
         ledger,
         mutation_control,
         None,
+        None,
     )
 }
 
@@ -518,6 +597,7 @@ pub(super) fn apply_pr_plans_with_poison(
     ledger: &mut StewardLedger,
     mutation_control: Option<&MutationControl>,
     base_poison: Option<&super::base_poison::RepoPoison>,
+    merge_group_stall: Option<&super::merge_group_stall::StallPass>,
 ) -> (
     Vec<PrReport>,
     bool,
@@ -534,6 +614,7 @@ pub(super) fn apply_pr_plans_with_poison(
         changed_files: std::cell::RefCell::default(),
         ejection_guards: policy.ejection_guards.clone(),
         base_poison,
+        defect_fix: merge_group_stall.map(|stall| &stall.defect_fix),
     });
     let mut sweep_pass = super::unapproved_admission::SweepPass::new(args.unapproved_dequeue);
     if args.apply {
@@ -615,6 +696,39 @@ pub(super) fn apply_pr_plans_with_poison(
                 base_poison,
                 ledger,
             )
+        {
+            unhealthy |= report.error.is_some();
+            (report.mutation, report.error) = fold(report.mutation, report.error);
+            return report;
+        }
+        // A merge group that can never finish: dequeue the doomed entry
+        // (or say it would). See `merge_group_stall`.
+        if !stale_mutation
+            .as_deref()
+            .is_some_and(|mutation| mutation.contains("dequeued_"))
+            && let Some(stall) = merge_group_stall
+            && let Some(mut report) = match mutation_context.as_ref() {
+                Some(context) => super::merge_group_stall::decide(
+                    stall,
+                    args.apply,
+                    &observation.repo,
+                    pr,
+                    &decision,
+                    ledger,
+                    &super::merge_group_stall::GitHubActs { context },
+                    Utc::now(),
+                ),
+                None => super::merge_group_stall::decide(
+                    stall,
+                    false,
+                    &observation.repo,
+                    pr,
+                    &decision,
+                    ledger,
+                    &super::merge_group_stall::NoActs,
+                    Utc::now(),
+                ),
+            }
         {
             unhealthy |= report.error.is_some();
             (report.mutation, report.error) = fold(report.mutation, report.error);
@@ -809,6 +923,14 @@ pub(super) fn apply_pr_plans_with_poison(
         !args.apply,
         &mut reports,
     );
+    if let Some(stall) = merge_group_stall {
+        super::merge_group_stall::annotate(stall, &mut reports);
+        super::merge_group_stall::annotate_defect_fix(
+            &stall.defect_fix,
+            &observation.repo,
+            &mut reports,
+        );
+    }
     // Apply passes only: they persist the ledger, so the per-head cache holds
     // and a blocked backlog costs nothing between rechecks.
     if args.apply {

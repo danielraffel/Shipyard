@@ -86,6 +86,10 @@ the head being armed.
 A verdict is the last non-blank line of a pull-request comment,
 ``verdict: APPROVE head:<sha>`` or ``reviewed: <sha>`` (``verdict: HOLD
 head:<sha>`` holds), or a review in state APPROVED / CHANGES_REQUESTED on the
+head. An adversary's ruling, ``adversarial-ruling: OK|FIX-FIRST|BLOCK
+head:<sha>`` on the last line (``marker_ruling``), is stamped like a verdict
+so the fleet's must-review can trust who ruled, and is never a verdict here:
+``marker_verdict`` reads nothing from it, so no ruling approves or holds a
 head. A counting HOLD naming the head is final for it: no APPROVE naming the
 same head, from any reviewer, before or after the HOLD, counts, and an
 approval does not carry from a held head; only a new head (a push) can be
@@ -308,6 +312,15 @@ MERGE_MUTATIONS = ("mergepullrequest",)
 _MARKER = re.compile(
     r"^[ \t]*(?:reviewed:[ \t]*([0-9a-f]{40})"
     r"|verdict:[ \t]*(APPROVE|HOLD)[ \t]+head:[ \t]*([0-9a-f]{40}))[ \t]*$"
+)
+# The adversary's ruling on the last line of an "Adversarial review" comment,
+# exactly `adversarial-ruling: OK|FIX-FIRST|BLOCK head:<40 lowercase hex>`.
+# verdict-session-stamp stamps it with the posting session, so the fleet's
+# must-review can trust who ruled; nothing that counts approvals reads it:
+# _MARKER does not match it, so marker_verdict (this guard, the review-verdict
+# status, every twin) returns None for a ruling. Same pattern as the stamper's.
+_RULING = re.compile(
+    r"^[ \t]*adversarial-ruling:[ \t]*(OK|FIX-FIRST|BLOCK)[ \t]+head:[ \t]*([0-9a-f]{40})[ \t]*$"
 )
 OPERATOR_NOTE = (
     "An explicit authority override exists for operators; see docs/ghapp-guards.md."
@@ -806,6 +819,17 @@ def marker_verdict(body: str) -> tuple[str, str] | None:
     if match.group(1):
         return "APPROVE", match.group(1)
     return match.group(2), match.group(3)
+
+
+def marker_ruling(body: str) -> tuple[str, str] | None:
+    """``(OK|FIX-FIRST|BLOCK, head)`` from a comment's last non-blank line.
+
+    Never an approval and never a HOLD: ``marker_verdict`` returns ``None``
+    for the same body. The stamper stamps a body this reads, so the fleet's
+    must-review can trust who ruled."""
+    lines = [line for line in body.splitlines() if line.strip()]
+    match = _RULING.match(lines[-1]) if lines else None
+    return (match.group(1), match.group(2)) if match else None
 
 
 def valid_opt_out() -> str | None:

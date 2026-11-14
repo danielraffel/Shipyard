@@ -168,6 +168,13 @@ class DetectionTests(Base):
         _, _, f = self.run_once()
         self.assertEqual([(x["kind"], x["detail"].split(":")[1].strip()) for x in f], [("stale_hold", "#7")])
 
+    def test_merge_group_stalled_rows_are_found(self):
+        self.tick(NOW, [(406, "h", "merge_group_stalled:framework-trusted-verify", "steward", NOW - dt.timedelta(minutes=65)),
+                        (411, "i", "queued", "steward", NOW - dt.timedelta(minutes=10))])
+        _, _, f = self.run_once()
+        self.assertEqual([(x["kind"], x["detail"].split(":")[1].strip()) for x in f], [("merge_group_stalled", "#406")])
+        self.assertIn("merge_group_stalled:framework-trusted-verify", f[0]["evidence"][0])
+
     def test_stuck_claim_needs_age_and_unmoved_head(self):
         self.tick(NOW, [(5, "H1", "required_failed:macos", "repair", NOW - dt.timedelta(hours=1)),
                         (6, "H3", "required_failed:macos", "repair", NOW - dt.timedelta(hours=1))])
@@ -378,6 +385,130 @@ class TickSafetyTests(Base):
         self.assertEqual(r.returncode, 0)
         (self.log / ".drain-watch.lock").mkdir()
         self.assertEqual(self.cli().returncode, 0)
+
+
+class PageFilterTests(Base):
+    def tick_ctx(self, t, rows, required=None, loop=None):
+        prs = []
+        for n, head, token, actor, since in rows:
+            pr = {"number": n, "head_sha": head, "blocked_on": token, "since": since.isoformat().replace("+00:00", "Z"),
+                  "next_action": {"actor": actor, "action": "x", "stop": False}}
+            if loop:
+                pr["loop"] = {"state": loop}
+            prs.append(pr)
+        (self.log / f"acme_repo-{stamp(t)}.json").write_text(
+            json.dumps({"repos": [{"repo": REPO, "prs": prs, "errors": [], "required_contexts": required or []}]}))
+
+    def test_a_non_required_red_is_not_a_page(self):
+        old = NOW - dt.timedelta(hours=3)
+        for m in range(150, -1, -15):
+            self.tick_ctx(NOW - dt.timedelta(minutes=m), [(1, "a", "required_failed:judge", "author", old)], required=["macos (app_id=15368)"])
+        _, _, f = self.run_once()
+        self.assertEqual(f, [])
+        self.assertEqual(self.state()["suppressed"]["2026-11-13"], {"non_required": 1})
+
+    def test_a_required_red_still_pages(self):
+        old = NOW - dt.timedelta(hours=3)
+        for m in range(150, -1, -15):
+            self.tick_ctx(NOW - dt.timedelta(minutes=m), [(1, "a", "required_failed:macos", "author", old)], required=["macos (app_id=15368)"])
+        _, _, f = self.run_once()
+        self.assertEqual([x["kind"] for x in f], ["drain_stall"])
+        self.assertEqual(self.state()["pages"]["2026-11-13"], {"drain_stall": 1})
+
+    def test_a_queued_or_capacity_queued_pr_is_not_a_page(self):
+        old = NOW - dt.timedelta(hours=3)
+        saved = dw.QUEUED_BOUND
+        dw.QUEUED_BOUND = dt.timedelta(hours=4)
+        self.addCleanup(setattr, dw, "QUEUED_BOUND", saved)
+        for loop in ("queued", "capacity_queued"):
+            for f in self.log.glob("*.json"):
+                f.unlink()
+            for m in range(150, -1, -15):
+                # loop state wins over a token that would otherwise be actionable
+                self.tick_ctx(NOW - dt.timedelta(minutes=m), [(1, "a", "required_failed:macos", "author", old)],
+                              required=["macos (app_id=15368)"], loop=loop)
+            self.assertEqual(self.run_once()[2], [], loop)
+        for f in self.log.glob("*.json"):
+            f.unlink()
+        for m in range(150, -1, -15):
+            self.tick_ctx(NOW - dt.timedelta(minutes=m), [(1, "a", "capacity_queued", "author", old)])
+        self.assertEqual(self.run_once()[2], [])
+
+    def test_a_stale_hold_on_a_non_required_context_is_not_a_page(self):
+        self.tick_ctx(NOW, [(7, "h", "held:judge", "author", NOW - dt.timedelta(minutes=50))], required=["macos (app_id=15368)"])
+        self.assertEqual(self.run_once()[2], [])
+
+    def test_a_heartbeat_in_the_claim_dir_never_silences_stuck_claim(self):
+        self.tick(NOW, [(5, "H1", "required_failed:macos", "repair", NOW - dt.timedelta(hours=1))])
+        (self.runner / "repair-attempts.log").write_text("1 acme/repo#5 H1 code\n")
+        d = self.runner / "repair-claims" / "acme_repo_5"
+        d.mkdir()
+        (d / "pid").write_text("1\n")
+        old = (NOW - dt.timedelta(hours=1)).timestamp()
+        os.utime(d / "pid", (old, old))
+        (d / "heartbeat.log").write_text("alive")
+        recent = (NOW - dt.timedelta(minutes=1)).timestamp()
+        os.utime(d / "heartbeat.log", (recent, recent))
+        self.assertEqual([x["kind"] for x in self.run_once()[2]], ["stuck_claim"])
+
+    def test_queued_past_the_bound_still_pages_and_loop_wins_over_token(self):
+        old = NOW - dt.timedelta(hours=3)
+        for m in range(150, -1, -15):
+            self.tick_ctx(NOW - dt.timedelta(minutes=m), [(1, "a", "required_failed:macos", "author", old)],
+                          required=["macos (app_id=15368)"], loop="queued")
+        self.assertEqual([x["kind"] for x in self.run_once()[2]], ["drain_stall"])
+        # loop present and not queued: a queued-looking token does not suppress
+        for f in self.log.glob("*.json"):
+            f.unlink()
+        for m in range(150, -1, -15):
+            self.tick_ctx(NOW - dt.timedelta(minutes=m), [(1, "a", "required_failed:macos", "author", old)],
+                          required=["macos (app_id=15368)"], loop="required_red")
+        self.assertEqual([x["kind"] for x in self.run_once()[2]], ["drain_stall"])
+
+    def test_merge_group_stalled_is_never_suppressed(self):
+        self.tick_ctx(NOW, [(406, "h", "merge_group_stalled:other", "steward", NOW - dt.timedelta(minutes=65))],
+                      required=["macos (app_id=15368)"], loop="queued")
+        self.assertEqual([x["kind"] for x in self.run_once()[2]], ["merge_group_stalled"])
+
+    def test_suppressions_count_once_per_pr_and_reason_per_day(self):
+        old = NOW - dt.timedelta(hours=3)
+        for m in range(150, -1, -15):
+            self.tick_ctx(NOW - dt.timedelta(minutes=m), [(1, "a", "required_failed:judge", "author", old)],
+                          required=["macos (app_id=15368)"])
+        self.run_once()
+        self.run_once(NOW + dt.timedelta(minutes=1))
+        self.assertEqual(self.state()["suppressed"]["2026-11-13"], {"non_required": 1})
+
+    def test_an_undated_queued_row_pages(self):
+        self.assertIsNone(dw.no_page_reason({"token": "queued", "loop": None, "since": None, "required": []}, NOW))
+
+    def test_app_bound_required_label_matches_a_bare_token_context(self):
+        self.assertIsNone(dw.no_page_reason(
+            {"token": "required_failed:macos", "loop": None, "since": None, "required": ["macos (app_id=15368)"]}, NOW))
+        self.assertEqual(dw.no_page_reason(
+            {"token": "required_failed:judge", "loop": None, "since": None, "required": ["macos (app_id=15368)"]}, NOW), "non_required")
+
+
+class PageReportTests(Base):
+    def test_loss_report_shows_pages_per_class(self):
+        import loss_report as lr
+        (self.log / "drain-watch-state.json").write_text(json.dumps(
+            {"pages": {"2026-11-13": {"drain_stall": 2, "stale_hold": 1}}, "suppressed": {"2026-11-13": {"queued": 4}}}))
+        c, pages, sup = lr.page_counts(str(self.log), ["2026-11-12", "2026-11-13"])
+        self.assertEqual(c["status"], "available")
+        self.assertEqual(pages, {"2026-11-13": {"drain_stall": 2, "stale_hold": 1}})
+        self.assertEqual(sup, {"2026-11-13": {"queued": 4}})
+        md = lr.markdown({"window": {"since": "2026-11-12", "until": "2026-11-13", "days": []},
+                          "totals": {"episodes": 0, "prs": 0, "rows_observed": 0, "by_class": {}},
+                          "coverage": {"window": {"status": "a", "reason": "r"}, "github": {"status": "unavailable"}},
+                          "agent_free_resolution": {"rate_upper_pct": 0, "rate_strict_pct": 0, "denominator_resolved_actionable": 0,
+                                                    "coverage": {"status": "a", "reason": "r"}},
+                          "owner_stops": {"per_100_prs": 0, "prs_with_owner_stop": 0, "prs": 0},
+                          "series_per_day": {}, "by_repo_token": [],
+                          "pages": {"per_day_by_class": pages, "suppressed_per_day_by_reason": sup}})
+        self.assertIn("2026-11-13: drain_stall 2, stale_hold 1", md)
+        self.assertIn("suppressed: queued 4", md)
+        self.assertEqual(lr.page_counts(str(self.log / "none"), [])[1], None)
 
 
 class TickIntegrationTests(unittest.TestCase):

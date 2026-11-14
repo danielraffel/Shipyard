@@ -2260,6 +2260,7 @@ esac
         &mut ledger,
         0,
         Some(&control),
+        None,
     );
 
     assert!(!failed, "a central HOLD is a healthy refusal: {report:?}");
@@ -3142,6 +3143,7 @@ fn disabled_preemption_ignores_preemption_only_observation_errors() {
         &temp.path().join("ledger.json"),
         &mut ledger,
         1,
+        None,
         None,
     );
 
