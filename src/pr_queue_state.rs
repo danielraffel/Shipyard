@@ -24,11 +24,12 @@
 //! request is seen to have had (a `PullRequestCommit`, a force-push
 //! `afterCommit`, or `headRefOid`). A removal GitHub never built a merge group
 //! for (`merge_conflict`) has no `beforeCommit`; there, and whenever the
-//! removed head cannot be established, the classifier falls back to a later
-//! push item in the timeline whose oid is the current head. A check suite's
-//! creation time is never used: it can lag the push and cannot establish
-//! arrival. With no push item, the answer is "no new head", which refuses a
-//! re-arm (fail closed).
+//! removed head cannot be established, the classifier falls back only to a
+//! later `HeadRefForcePushedEvent` whose server timestamp and oid identify the
+//! current head. A commit timeline item is author-controlled and is not push
+//! evidence; a check suite's creation time can lag the push and is not evidence
+//! either. With no authoritative push event, the answer is "no new head", which
+//! refuses a re-arm (fail closed).
 //!
 //! ## Limits
 //!
@@ -285,8 +286,8 @@ pub struct Ejection {
 pub enum NewHeadBasis {
     /// `headRefOid` compared with the head the removal names.
     RemovedHeadSha,
-    /// The removal names no head; a later timeline push item put
-    /// `headRefOid` on the branch.
+    /// The removal names no head; a later server-timestamped force-push event
+    /// put `headRefOid` on the branch.
     PushAfterRemoval,
     /// Neither: no evidence of a new head, so none is assumed.
     NoEvidence,
@@ -309,10 +310,10 @@ pub struct PrQueueReport {
     /// the visible timeline: the removals a same-head re-enqueue would repeat.
     /// A `manual` or `invalid_merge_commit` removal says nothing against the
     /// head and is not counted. A removal that names its head counts when that head is
-    /// `headRefOid`; one that names none counts when it follows the first
-    /// timeline item that pushed `headRefOid` (or when no such item is
-    /// visible), so an unattributable removal is charged to the current head
-    /// rather than assumed away.
+    /// `headRefOid`; one that names none counts unless a later
+    /// server-timestamped force-push event proves it predates the current head
+    /// (or when no such event is visible), so an unattributable removal is
+    /// charged to the current head rather than assumed away.
     pub ejections_of_current_head: u32,
     /// `Some(true)` when the timeline window reached the start of history,
     /// `Some(false)` when older items were cut off, `None` when unmeasured.
@@ -467,14 +468,15 @@ pub fn removal_of(node: &Value, head: &str) -> RemovalOf {
 /// Whether the removal at `nodes[index]` is charged to `head`: it names the
 /// head ([`RemovalOf::Head`]), or it names no head ([`RemovalOf::Unattributable`]).
 ///
-/// An unattributable removal is charged unless a later timeline push item
-/// identifies the current head. Check-suite creation is deliberately ignored:
-/// it can lag the push and therefore cannot establish arrival. Without a push
-/// item the removal counts: counting costs at most one approval newer than the
-/// removal, while dropping it could let a head that keeps failing in the queue
-/// be re-armed without a fresh review. Only a removal that names another head
-/// ([`RemovalOf::OtherHead`]) or demonstrably predates a later head arrival is
-/// left out.
+/// An unattributable removal is charged unless a later, server-timestamped
+/// `HeadRefForcePushedEvent` identifies the current head. Commit timeline items
+/// are author-controlled and cannot prove push order; check-suite creation is
+/// also deliberately ignored because it can lag the push. Without an
+/// authoritative push event the removal counts: counting costs at most one
+/// approval newer than the removal, while dropping it could let a head that
+/// keeps failing in the queue be re-armed without a fresh review. Only a removal
+/// that names another head ([`RemovalOf::OtherHead`]) or demonstrably predates a
+/// later force-push arrival is left out.
 #[must_use]
 pub fn removal_charges_head(nodes: &[Value], index: usize, head: &str) -> bool {
     let Some(node) = nodes.get(index) else {
@@ -529,7 +531,7 @@ fn new_head_since(
     if nodes
         .iter()
         .skip(index + 1)
-        .filter_map(pushed_oid)
+        .filter_map(authoritative_push_oid)
         .any(|oid| oid.eq_ignore_ascii_case(head))
     {
         return (true, NewHeadBasis::PushAfterRemoval);
@@ -540,26 +542,25 @@ fn new_head_since(
 fn push_after_removal(nodes: &[Value], index: usize, head: &str) -> bool {
     // A force-push back to a head already visible before this removal is not a
     // new arrival; it only proves the branch was rewritten to the same SHA.
-    if nodes[..index].iter().any(|node| {
-        let oid = pushed_oid(node);
-        let usable_commit = node
-            .pointer("/commit/checkSuites/nodes")
-            .is_none_or(|suites| suites.as_array().is_some_and(Vec::is_empty));
-        oid.is_some_and(|oid| oid.eq_ignore_ascii_case(head))
-            && (node.get("__typename").and_then(Value::as_str) != Some("PullRequestCommit")
-                || usable_commit)
-    }) {
+    if nodes[..index]
+        .iter()
+        .filter_map(authoritative_push_oid)
+        .any(|oid| oid.eq_ignore_ascii_case(head))
+    {
         return false;
     }
-    nodes.iter().skip(index + 1).any(|node| {
-        let oid = pushed_oid(node);
-        let usable_commit = node
-            .pointer("/commit/checkSuites/nodes")
-            .is_none_or(|suites| suites.as_array().is_some_and(Vec::is_empty));
-        oid.is_some_and(|oid| oid.eq_ignore_ascii_case(head))
-            && (node.get("__typename").and_then(Value::as_str) != Some("PullRequestCommit")
-                || usable_commit)
-    })
+    nodes
+        .iter()
+        .skip(index + 1)
+        .filter_map(authoritative_push_oid)
+        .any(|oid| oid.eq_ignore_ascii_case(head))
+}
+
+/// The only timeline item with authoritative server push timing.
+fn authoritative_push_oid(node: &Value) -> Option<&str> {
+    (node.get("__typename").and_then(Value::as_str) == Some("HeadRefForcePushedEvent"))
+        .then(|| node.pointer("/afterCommit/oid").and_then(Value::as_str))
+        .flatten()
 }
 
 /// Classify and report every fact, with the field path it came from.
@@ -653,15 +654,18 @@ pub fn explain_pr_queue_state(response: &Value) -> PrQueueReport {
     // Walk the timeline once, in its own order.
     let mut requeues = 0_u32;
     let mut requeue_indices = Vec::new();
-    // The hazard removal awaiting its first re-add, and whether a push has
-    // followed it in timeline order (the fallback when SHAs cannot decide).
+    // The hazard removal awaiting its first re-add, and whether an authoritative
+    // server-timestamped push has followed it (the fallback when SHAs cannot
+    // decide).
     let mut hazard_pending: Option<(usize, bool)> = None;
     let mut last_removal: Option<(usize, String, Option<String>)> = None;
     let mut last_new_head: Option<usize> = None;
     for (index, node) in nodes.iter().enumerate() {
         let typename = node.get("__typename").and_then(Value::as_str).unwrap_or("");
         if is_new_head(typename) {
-            if let Some((_, pushed)) = hazard_pending.as_mut() {
+            if authoritative_push_oid(node).is_some()
+                && let Some((_, pushed)) = hazard_pending.as_mut()
+            {
                 *pushed = true;
             }
             last_new_head = Some(index);
@@ -738,8 +742,8 @@ pub fn explain_pr_queue_state(response: &Value) -> PrQueueReport {
         "ejections_of_current_head",
         Value::from(ejections_of_current_head),
         "timelineItems.nodes[] (failed_checks/merge_conflict RemovedFromMergeQueueEvent whose \
-         removed head is headRefOid; a removal naming no head counts once it follows the first \
-         push of headRefOid)",
+         removed head is headRefOid; a removal naming no head counts unless a later \
+         server-timestamped force-push event identifies headRefOid)",
     );
     if let Some(ejection) = &last_ejection {
         fact(
@@ -760,8 +764,8 @@ pub fn explain_pr_queue_state(response: &Value) -> PrQueueReport {
                     NewHeadBasis::RemovedHeadSha =>
                         "new head = headRefOid differs from beforeCommit's second parent",
                     NewHeadBasis::PushAfterRemoval =>
-                        "no removed head named; new head = a later timeline push item \
-                         whose oid is headRefOid",
+                        "no removed head named; new head = a later server-timestamped \
+                         force-push event whose oid is headRefOid",
                     NewHeadBasis::NoEvidence =>
                         "no removed head named and no later push of headRefOid; no new head \
                          assumed",
@@ -1068,21 +1072,22 @@ mod tests {
     }
 
     #[test]
-    fn ejection_history_counts_same_head_requeues_but_not_the_fixed_conflict() {
+    fn ejection_history_counts_same_head_requeues_without_unproven_push_timing() {
         let report = explain_pr_queue_state(&fixture("pr_ejected_history.json"));
-        // The merge_conflict removal is followed by a commit before its re-add,
-        // so it is not counted; each of the four failed_checks re-adds is.
-        assert_eq!(report.requeues_without_new_head, 4);
+        // The merge_conflict removal is followed only by an author-controlled
+        // commit timeline item, so it remains charged; the four failed_checks
+        // re-adds are charged too.
+        assert_eq!(report.requeues_without_new_head, 5);
         assert_eq!(
             report.state,
             PrQueueState::ArmedNotQueued {
                 enabled_at: Some("2026-09-22T18:57:52Z".to_owned()),
-                requeues_without_new_head: 4,
+                requeues_without_new_head: 5,
             }
         );
         let ejection = report.last_ejection.expect("ejection history");
         assert_eq!(ejection.reason, "failed_checks");
-        assert!(ejection.new_head_since);
+        assert!(!ejection.new_head_since);
     }
 
     #[test]
@@ -1264,7 +1269,7 @@ mod tests {
                 reason: "failed_checks".to_owned(),
                 at: Some("2026-09-22T10:26:42Z".to_owned()),
                 new_head_since_removal: false,
-                requeues_without_new_head: 3,
+                requeues_without_new_head: 4,
             }
         );
     }
@@ -1423,6 +1428,14 @@ mod tests {
         );
         // A later server-timestamped force-push of the current head is.
         pr_mut(&mut value)["headRefOid"] = Value::from(PUSHED_HEAD);
+        assert_eq!(
+            explain_pr_queue_state(&value)
+                .last_ejection
+                .expect("ejection")
+                .new_head_since,
+            false,
+            "a later PullRequestCommit is not authoritative push evidence"
+        );
         nodes_mut(&mut value).push(serde_json::json!({
             "__typename": "HeadRefForcePushedEvent",
             "createdAt": "2026-09-27T06:00:00Z",

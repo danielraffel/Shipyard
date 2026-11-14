@@ -714,15 +714,6 @@ fn an_unattributable_removal_requires_authoritative_push_evidence_to_clear() {
     for queue in [
         // A suite created after the removals can lag the push.
         suite_after.clone(),
-        // A normal push with no suite, then force-pushed away and back: the
-        // commit timeline is still not authoritative by itself.
-        {
-            let mut nodes = vec![commit(HEAD, None)];
-            nodes.extend(removals());
-            nodes.push(force_push("2026-10-04T02:30:00Z", OTHER));
-            nodes.push(force_push("2026-10-04T03:00:00Z", HEAD));
-            timeline(HEAD, nodes)
-        },
         // Pushed before the removals, with a later suite on its commit.
         {
             let mut nodes = vec![force_push("2026-10-04T00:30:00Z", HEAD)];
@@ -738,19 +729,31 @@ fn an_unattributable_removal_requires_authoritative_push_evidence_to_clear() {
     ] {
         assert_eq!(head_ejections(&queue, HEAD).len(), 2, "{queue}");
     }
+    // A force-push away and back after the removals is authoritative evidence
+    // that both removals predate the current head.
+    let mut force_pushed_back = vec![commit(HEAD, None)];
+    force_pushed_back.extend(removals());
+    force_pushed_back.push(force_push("2026-10-04T02:30:00Z", OTHER));
+    force_pushed_back.push(force_push("2026-10-04T03:00:00Z", HEAD));
+    assert!(head_ejections(&timeline(HEAD, force_pushed_back), HEAD).is_empty());
     // A server-timestamped force-push after the removals proves that both
     // removals predate the current head and must not cap it.
     let queue = with(vec![force_push("2026-10-04T03:00:00Z", HEAD)]);
     assert!(head_ejections(&queue, HEAD).is_empty());
-    // A later commit with no suite is the ordinary timeline push evidence.
-    assert!(head_ejections(&with(vec![commit(HEAD, None)]), HEAD).is_empty());
-    assert!(
+    // A later commit timeline item is not authoritative push evidence, even
+    // without a check suite, so both unattributable removals stay charged.
+    assert_eq!(
+        head_ejections(&with(vec![commit(HEAD, None)]), HEAD).len(),
+        2
+    );
+    assert_eq!(
         head_ejections(
             &with(vec![json!({"__typename": "PullRequestCommit",
                          "commit": {"oid": HEAD, "checkSuites": null}})]),
             HEAD
         )
-        .is_empty()
+        .len(),
+        2
     );
 }
 

@@ -430,6 +430,13 @@ def _pushed_oid(node: Any) -> str | None:
     return None
 
 
+def _authoritative_push_oid(node: Any) -> str | None:
+    """The commit a server-timestamped force-push event put on the branch."""
+    if _typename(node) != "HeadRefForcePushedEvent":
+        return None
+    return _oid(node.get("afterCommit"))
+
+
 def _removed_head(node: dict[str, Any], known: list[str]) -> str | None:
     """The head a ``RemovedFromMergeQueueEvent`` removed.
 
@@ -453,6 +460,24 @@ def _removed_head(node: dict[str, Any], known: list[str]) -> str | None:
     if len(oids) == 2 and oids[1] and oids[1].lower() in lowered:
         return oids[1]
     return None
+
+
+def _removal_of(node: dict[str, Any], head: str) -> str:
+    """Classify whether a removal names ``head``, another head, or neither."""
+    before = node.get("beforeCommit")
+    if not isinstance(before, dict):
+        return "unattributable"
+    oid = _oid(before)
+    if oid and oid.lower() == head.lower():
+        return "head"
+    parents = before.get("parents")
+    parent_nodes = parents.get("nodes") if isinstance(parents, dict) else None
+    if not isinstance(parent_nodes, list):
+        return "unattributable"
+    oids = [_oid(parent) for parent in parent_nodes]
+    if any(oid and oid.lower() == head.lower() for oid in oids):
+        return "head"
+    return "other" if len(oids) == 2 else "unattributable"
 
 
 def _same_head_re_add(
@@ -486,18 +511,18 @@ def _new_head_since(
 ) -> tuple[bool, str]:
     """Whether ``head`` differs from the head removed at ``index``, and on what basis.
 
-    By SHA when the removal names its head. Otherwise a later timeline push
-    item whose oid is ``head`` is accepted. Check-suite creation time is not
-    push evidence because it can lag the push. With no push item, no new head
-    is assumed, so a re-arm is refused. Mirrors ``new_head_since`` in
-    ``src/pr_queue_state.rs``.
+    By SHA when the removal names its head. Otherwise only a later
+    server-timestamped ``HeadRefForcePushedEvent`` whose oid is ``head`` is
+    accepted. Commit timeline order and check-suite creation time are not push
+    evidence. With no authoritative push event, no new head is assumed, so a
+    re-arm is refused. Mirrors ``new_head_since`` in ``src/pr_queue_state.rs``.
     """
     if head is None:
         return False, "no_evidence"
     if removed is not None:
         return removed.lower() != head.lower(), "removed_head_sha"
     for node in nodes[index + 1 :]:
-        oid = _pushed_oid(node)
+        oid = _authoritative_push_oid(node)
         if oid and oid.lower() == head.lower():
             return True, "push_after_removal"
     return False, "no_evidence"
@@ -513,30 +538,20 @@ def _timestamp(value: Any) -> datetime | None:
 
 
 def _push_after_removal(nodes: list[Any], index: int, head: str) -> bool:
-    """Whether a later timeline push item put ``head`` on the branch."""
+    """Whether a later server-timestamped force-push put ``head`` on the branch."""
     # A force-push back to a head already visible before this removal is not a
     # new arrival; it only proves the branch was rewritten to the same SHA.
-    for node in nodes[:index]:
-        oid = _pushed_oid(node)
-        if not oid or oid.lower() != head.lower():
-            continue
-        if _typename(node) != "PullRequestCommit":
-            return False
-        suites = ((node.get("commit") or {}).get("checkSuites")) if isinstance(node, dict) else None
-        suite_nodes = suites.get("nodes") if isinstance(suites, dict) else None
-        if suite_nodes is None or suite_nodes == []:
-            return False
-    for node in nodes[index + 1 :]:
-        oid = _pushed_oid(node)
-        if not oid or oid.lower() != head.lower():
-            continue
-        if _typename(node) != "PullRequestCommit":
-            return True
-        suites = ((node.get("commit") or {}).get("checkSuites")) if isinstance(node, dict) else None
-        suite_nodes = suites.get("nodes") if isinstance(suites, dict) else None
-        if suite_nodes is None or suite_nodes == []:
-            return True
-    return False
+    if any(
+        oid and oid.lower() == head.lower()
+        for node in nodes[:index]
+        if (oid := _authoritative_push_oid(node))
+    ):
+        return False
+    return any(
+        oid and oid.lower() == head.lower()
+        for node in nodes[index + 1 :]
+        if (oid := _authoritative_push_oid(node))
+    )
 
 
 def _ejections_of_head(
@@ -545,8 +560,8 @@ def _ejections_of_head(
     """``failed_checks`` / ``merge_conflict`` removals of ``head``.
 
     A removal that names its head counts when that head is ``head``; one that
-    names none counts unless a later timeline push item proves that it
-    predates the current head. Mirrors
+    names none counts unless a later server-timestamped force-push proves that
+    it predates the current head. Mirrors
     ``PrQueueReport::ejections_of_current_head``.
     """
     if head is None:
@@ -558,9 +573,11 @@ def _ejections_of_head(
         reason = node.get("reason") if isinstance(node.get("reason"), str) else ""
         if reason.lower() not in RETRY_HAZARD_REASONS:
             continue
-        removed = removed_heads[index]
-        if removed is not None:
-            charged = removed.lower() == head.lower()
+        removal_kind = _removal_of(node, head)
+        if removal_kind == "head":
+            charged = True
+        elif removal_kind == "other":
+            charged = False
         else:
             charged = not _push_after_removal(nodes, index, head)
         if charged:
@@ -614,7 +631,7 @@ def classify_pr_queue_state(response: Any) -> dict[str, Any]:
     for index, node in enumerate(nodes):
         typename = _typename(node)
         if typename in ("PullRequestCommit", "HeadRefForcePushedEvent"):
-            if hazard_pending is not None:
+            if _authoritative_push_oid(node) is not None and hazard_pending is not None:
                 hazard_pending = (hazard_pending[0], True)
             last_new_head = index
         elif typename == "RemovedFromMergeQueueEvent":

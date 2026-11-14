@@ -153,7 +153,7 @@ class ClassifierAgreesWithSharedCorpus(unittest.TestCase):
         self.assertEqual(got["class"], "ejected")
         self.assertEqual(got["reason"], "failed_checks")
         self.assertIs(got["new_head_since_removal"], False)
-        self.assertEqual(got["requeues_without_new_head"], 3)
+        self.assertEqual(got["requeues_without_new_head"], 4)
         allowed, _ = guard.decide(got)
         self.assertFalse(allowed)
 
@@ -308,11 +308,13 @@ class NewHeadIsDecidedBySha(unittest.TestCase):
         # A later push of some other commit is still not the current head.
         self.nodes.append({"__typename": "PullRequestCommit", "commit": {"oid": PUSHED_HEAD}})
         self.assertIs(self.classify()["new_head_since_removal"], False)
-        # A later push of the current head is.
+        # A later commit timeline item is not authoritative push evidence,
+        # even after the current head changes to that commit.
         self.pr["headRefOid"] = PUSHED_HEAD
         got = self.classify()
-        self.assertEqual(got["last_ejection"]["new_head_basis"], "push_after_removal")
-        self.assertIs(got["new_head_since_removal"], True)
+        self.assertEqual(got["last_ejection"]["new_head_basis"], "no_evidence")
+        self.assertIs(got["new_head_since_removal"], False)
+        # A later server-timestamped force-push of the current head is.
         self.nodes.append(
             {
                 "__typename": "HeadRefForcePushedEvent",
@@ -525,8 +527,9 @@ class QueueArmGuardTests(unittest.TestCase):
         pr["mergeQueueEntry"] = None
         pr["headRefOid"] = "f" * 40
         pr["timelineItems"]["nodes"][-1] = {
-            "__typename": "PullRequestCommit",
-            "commit": {"oid": "f" * 40},
+            "__typename": "HeadRefForcePushedEvent",
+            "createdAt": "2026-09-22T21:00:00Z",
+            "afterCommit": {"oid": "f" * 40},
         }
         code, _, _ = self.run_guard(["pr", "merge", "8702", "--auto"], [response])
         self.assertEqual(code, 0)

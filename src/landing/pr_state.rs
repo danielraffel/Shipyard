@@ -324,7 +324,9 @@ pub fn write_human<W: Write>(stdout: &mut W, report: &PrStateReport) -> std::io:
                 classification.head_oid.as_deref().unwrap_or("UNKNOWN"),
                 match ejection.new_head_basis {
                     NewHeadBasis::RemovedHeadSha => "compared by SHA",
-                    NewHeadBasis::PushAfterRemoval => "a later timeline push follows it",
+                    NewHeadBasis::PushAfterRemoval => {
+                        "a later server-timestamped force-push follows it"
+                    }
                     NewHeadBasis::NoEvidence => "no evidence of a new head",
                 }
             )?;
