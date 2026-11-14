@@ -709,6 +709,9 @@ fn unread_gate_from_status(
     policy: &StewardPolicy,
     since: Option<String>,
 ) -> Option<(Stall, SinceHint)> {
+    // Only a status bound to the app the approval rule names is trusted. An
+    // unbound rule would accept a status any writer posted, so the row stays
+    // `required_failed` (the caller's fallback).
     let app_id = policy
         .required_checks
         .iter()
@@ -717,11 +720,11 @@ fn unread_gate_from_status(
                 .context
                 .eq_ignore_ascii_case(policy.approval_context.trim())
         })
-        .and_then(|required| required.app_id);
+        .and_then(|required| required.app_id)?;
     let description = crate::merge_steward::approval_status_description(
         &facts.pr.checks,
         &policy.approval_context,
-        app_id,
+        Some(app_id),
     )?
     .trim();
     let names_head = |rest: &str| {

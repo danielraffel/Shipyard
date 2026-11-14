@@ -5931,9 +5931,11 @@ has not completed, and a dry-run hold never jumps. `base-health --act` is the
 manual path; leave `auto_jump` driving the steward alone so one writer jumps.
 Review statuses (`merge_steward::REVIEW_GATES` plus the approval context,
 `is_review_gate`) are per PR: `red_everywhere::reds` drops only a
-`StatusContext` whose description passes `review_waiting` at the head
-(`waiting_review_status`); a failing review check run or an unknown
-description still groups. Merge-group poison judges every required context
+`StatusContext` whose description passes `review_waiting` at the head and
+whose rule binds an app the status came from (`waiting_review_status`); a
+failing review check run, an unknown description, or an unbound rule still
+groups. `unread_gate_from_status` likewise reads the approval status only
+under a bound rule, else the row stays `required_failed`. Merge-group poison judges every required context
 (it reads check runs only). `blocked_on` reads a `RequiredFailed` whose
 contexts are all review statuses as the approval gate's own token when it
 refuses (a HOLD stays `held`), else `awaiting_review:<contexts>` (actor

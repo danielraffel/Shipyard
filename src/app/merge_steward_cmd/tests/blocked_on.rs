@@ -1668,3 +1668,40 @@ fn an_unbound_review_rule_never_reads_as_awaiting_review() {
         "required_failed:release-path-review"
     );
 }
+
+/// With the approval gate unread and the approval rule unbound (no app id),
+/// a matching review-verdict status could have been posted by anyone: it is
+/// never read as `no_verdict` or `held`, the row stays `required_failed`.
+#[test]
+fn an_unbound_approval_rule_never_trusts_its_status() {
+    let mut policy = app_bound_policy(&["macos", "review-verdict"]);
+    for rule in &mut policy.required_checks {
+        if rule.context == "review-verdict" {
+            rule.app_id = None;
+        }
+    }
+    for description in [
+        "no reviewer verdict names head aaaaaaaaaaaa; it needs a review",
+        "a HOLD naming head aaaaaaaaaaaa makes it un-approvable (held by x at comment 1, posted 2026-11-14T00:00:00Z)",
+    ] {
+        let mut pr = pr_with(
+            7,
+            &[],
+            "BLOCKED",
+            &json!([app_check(
+                "macos",
+                "COMPLETED",
+                Some("SUCCESS"),
+                "2026-11-14T00:00:00Z"
+            )]),
+        );
+        let mut forged = review_status(Some(description));
+        forged.app_id = None;
+        pr.fact.checks.push(forged);
+        assert_eq!(
+            classify_failed(&pr, &policy, &["review-verdict"]).blocked_on,
+            "required_failed:review-verdict",
+            "{description}"
+        );
+    }
+}

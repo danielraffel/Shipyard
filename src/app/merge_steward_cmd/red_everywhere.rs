@@ -150,7 +150,14 @@ pub(super) fn reds(
         // base-level cause. A failing review CHECK RUN (a crashing review
         // workflow) or a review status with any other description still
         // counts.
-        .filter(|(pr, check)| !waiting_review_status(check, &pr.fact.head_sha, approval_context))
+        .filter(|(pr, check)| {
+            !waiting_review_status(
+                check,
+                &pr.fact.head_sha,
+                approval_context,
+                &observation.required_checks,
+            )
+        })
         .map(|(pr, check)| {
             let tests = check
                 .check_id
@@ -177,14 +184,23 @@ pub(super) fn reds(
         .collect()
 }
 
-/// Whether `check` is a review status (a commit status, not a check run)
-/// whose own description says it only waits on reviewers at `head`.
+/// Whether `check` is a review status (a commit status, not a check run),
+/// posted by the app its required rule binds, whose own description says it
+/// only waits on reviewers at `head`. A status under an unbound rule, or from
+/// another creator, is never trusted to leave the count.
 pub(super) fn waiting_review_status(
     check: &crate::merge_steward::StewardCheck,
     head: &str,
     approval_context: &str,
+    required: &[crate::merge_steward::RequiredCheck],
 ) -> bool {
-    check.source == crate::merge_steward::StewardCheckSource::StatusContext
+    let bound = required
+        .iter()
+        .find(|rule| rule.context.eq_ignore_ascii_case(&check.name))
+        .and_then(|rule| rule.app_id)
+        .is_some_and(|app_id| check.app_id == Some(app_id));
+    bound
+        && check.source == crate::merge_steward::StewardCheckSource::StatusContext
         && crate::merge_steward::is_review_gate(&check.name, approval_context)
         && check
             .description
