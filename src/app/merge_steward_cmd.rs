@@ -336,6 +336,14 @@ struct StewardLedger {
     /// `poison_pause`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     poison_paused: BTreeMap<String, Vec<poison_pause::PausedEntry>>,
+    /// Heads the red base ejected, keyed `repo@base`; excused from the
+    /// ejection cap once the base is green. See `red_base_ejections`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    red_base_ejections: BTreeMap<String, Vec<red_base_ejections::Entry>>,
+    /// When each covered pull request entered its loop state at its head,
+    /// keyed `repo#pr`. See `scheduling_loop`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    loop_seen: BTreeMap<String, scheduling_loop::Seen>,
     /// Doomed merge groups the steward decided on, keyed
     /// `repo#pr@group-sha`: once per (pull request, group head). See
     /// `merge_group_stall`.
@@ -1507,6 +1515,7 @@ pub(super) fn steward_command<W: Write>(
             &mut ledger,
             &mut remaining_preemptions,
             mutation_control.as_ref(),
+            &runtime_paths.global_dir,
             &mut recovery_errors,
             &mut recovery_cancellations,
         );
@@ -1589,6 +1598,7 @@ fn steward_repo(
     ledger: &mut StewardLedger,
     remaining_preemptions: &mut usize,
     mutation_control: Option<&MutationControl>,
+    global_dir: &Path,
     recovery_errors: &mut BTreeMap<String, Vec<String>>,
     recovery_cancellations: &mut BTreeMap<String, Vec<CancellationReport>>,
 ) -> (RepoReport, bool) {
@@ -1605,6 +1615,7 @@ fn steward_repo(
         ledger,
         remaining_preemptions,
         mutation_control,
+        global_dir,
         recovery_errors,
         recovery_cancellations,
     );
@@ -1708,6 +1719,7 @@ fn steward_repo_observed(
     ledger: &mut StewardLedger,
     remaining_preemptions: &mut usize,
     mutation_control: Option<&MutationControl>,
+    global_dir: &Path,
     recovery_errors: &mut BTreeMap<String, Vec<String>>,
     recovery_cancellations: &mut BTreeMap<String, Vec<CancellationReport>>,
 ) -> (RepoReport, bool) {
@@ -1737,6 +1749,7 @@ fn steward_repo_observed(
                 ledger,
                 *remaining_preemptions,
                 mutation_control,
+                Some(global_dir),
             );
             if let Some(errors) = recovery_errors.remove(&observation.repo) {
                 report.errors.extend(errors);
@@ -2128,16 +2141,35 @@ fn try_acquire_ledger_lock(
     }
 }
 
+/// How long an apply pass waits for the steward lock before it gives up. A
+/// ready-on-event admission (`ready_event`) or an `admission-clean` gate
+/// holds it for seconds; a tick waits that out instead of skipping its pass.
+const LEDGER_LOCK_WAIT: Duration = Duration::from_secs(30);
+
 fn acquire_ledger_lock(path: &Path) -> Result<crate::file_lock::LockedFile, CliFailure> {
-    try_acquire_ledger_lock(path)?.ok_or_else(|| {
-        CliFailure::new(
-            1,
-            format!(
-                "could not lock steward state {}: another steward apply pass is already running",
-                path.with_extension("json.lock").display()
-            ),
-        )
-    })
+    acquire_ledger_lock_within(path, LEDGER_LOCK_WAIT)
+}
+
+fn acquire_ledger_lock_within(
+    path: &Path,
+    wait: Duration,
+) -> Result<crate::file_lock::LockedFile, CliFailure> {
+    let deadline = Instant::now() + wait;
+    loop {
+        if let Some(lock) = try_acquire_ledger_lock(path)? {
+            return Ok(lock);
+        }
+        if Instant::now() >= deadline {
+            return Err(CliFailure::new(
+                1,
+                format!(
+                    "could not lock steward state {}: another steward apply pass is already running",
+                    path.with_extension("json.lock").display()
+                ),
+            ));
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
 }
 
 mod base_poison;
@@ -2175,6 +2207,7 @@ mod code_owner_wait;
 mod defect_fix_removals;
 pub(super) mod dwell_pass;
 mod exact_head_merge;
+mod fix_reorder;
 mod generated_paths;
 mod head_rollup;
 pub(super) mod infra_rerun;
@@ -2185,16 +2218,21 @@ mod mutation_outcome;
 mod native_arm;
 mod next_action;
 mod observation;
+mod orphan_groups;
 mod pass_budget;
 mod poison_pause;
 mod pr_mutations;
 pub(super) mod queue_drain;
 mod queue_priority_recovery;
 pub(super) mod read_probe;
+pub(super) mod ready_event;
+mod red_base_ejections;
 mod red_everywhere;
 mod render;
 mod resume_record;
+mod scheduling_loop;
 mod shadow_ledger;
+mod stale_merge_ref;
 mod superseded;
 mod terminal_handoff;
 pub(super) mod train;
@@ -2202,6 +2240,9 @@ mod unapproved_admission;
 pub(super) use carried_commits::STACKED_LABEL_PREFIX;
 pub(super) use infra_rerun::Mode as InfraRerunMode;
 pub(super) use unapproved_admission::DequeueMode;
+// `shipyard advance` reads checks and protection exactly as the steward does.
+pub(super) use observation::{parse_rest_check, parse_rest_status};
+pub(super) use render::{is_admin_protection_denied, is_private_free_entitlement};
 
 use cancellation::{
     apply_repo_plan, cancellation_reason_label, queue_front_head, timestamp_old_enough,
@@ -2252,6 +2293,7 @@ pub(super) fn observe_next_steps(
 pub(super) fn pr_next_action_snapshot(
     actions: &GitHubActions,
     state_dir: &Path,
+    global_dir: &Path,
     repo: &str,
     number: u64,
 ) -> Result<Value, String> {
@@ -2329,7 +2371,7 @@ pub(super) fn pr_next_action_snapshot(
     }
     let observation = observation::observe_pull_request(actions, &settings, &base, &row)?;
     let (pr, merge_state, required_contexts, errors) =
-        single_pr_dry_run(actions, state_dir, &observation, number)?;
+        single_pr_dry_run(actions, state_dir, global_dir, &observation, number)?;
     let actionable = pr
         .blocked
         .next_action
@@ -2358,14 +2400,44 @@ pub(super) fn pr_next_action_snapshot(
 fn single_pr_dry_run(
     actions: &GitHubActions,
     state_dir: &Path,
+    global_dir: &Path,
     observation: &RepoObservation,
     number: u64,
 ) -> Result<(PrReport, String, Vec<String>, Vec<String>), String> {
     let ledger_path = state_dir.join("merge-steward.json");
     let mut ledger = load_ledger(&ledger_path).map_err(|error| error.message().to_owned())?;
-    let args = StewardCommandArgs {
-        repos: vec![observation.repo.clone()],
-        base: observation.base.clone(),
+    let args = single_repo_args(&observation.repo, &observation.base, false);
+    let (report, _, _) = apply_repo_plan(
+        actions,
+        &args,
+        observation,
+        &ledger_path,
+        &mut ledger,
+        0,
+        None,
+        Some(global_dir),
+    );
+    let pr = report
+        .prs
+        .into_iter()
+        .find(|pr| pr.number == number)
+        .ok_or_else(|| format!("the admission pass produced no row for #{number}"))?;
+    let merge_state = observation
+        .prs
+        .first()
+        .map(|observed| observed.fact.merge_state.clone())
+        .unwrap_or_default();
+    Ok((pr, merge_state, report.required_contexts, report.errors))
+}
+
+/// The arguments the scheduled tick passes (`runner steward --repo <repo>
+/// --base <base>`), for a pass over one repository with every coalescing,
+/// preemption, backstop and sweep plan off. `apply` only marks whether the
+/// caller may mutate; the caller decides what it runs.
+fn single_repo_args(repo: &str, base: &str, apply: bool) -> StewardCommandArgs {
+    StewardCommandArgs {
+        repos: vec![repo.to_owned()],
+        base: base.to_owned(),
         opt_out_label: "shipyard:no-auto-merge".to_owned(),
         provenance_blocking_labels: default_provenance_blocking_labels(),
         managed_label: MANAGED_LABEL.to_owned(),
@@ -2383,29 +2455,9 @@ fn single_pr_dry_run(
         pass_budget: None,
         pass_deadline: None,
         invariants: None,
-        apply: false,
+        apply,
         ledger: None,
-    };
-    let (report, _, _) = apply_repo_plan(
-        actions,
-        &args,
-        observation,
-        &ledger_path,
-        &mut ledger,
-        0,
-        None,
-    );
-    let pr = report
-        .prs
-        .into_iter()
-        .find(|pr| pr.number == number)
-        .ok_or_else(|| format!("the admission pass produced no row for #{number}"))?;
-    let merge_state = observation
-        .prs
-        .first()
-        .map(|observed| observed.fact.merge_state.clone())
-        .unwrap_or_default();
-    Ok((pr, merge_state, report.required_contexts, report.errors))
+    }
 }
 
 /// The open pull request whose head is `branch`, when exactly one exists.
@@ -2444,10 +2496,7 @@ use observation::{
 };
 #[cfg(test)]
 use pr_mutations::mutate_pr;
-use render::{
-    enqueue_requirements_pending, is_admin_protection_denied, is_private_free_entitlement,
-    render_report,
-};
+use render::{enqueue_requirements_pending, render_report};
 
 #[cfg(test)]
 mod tests;

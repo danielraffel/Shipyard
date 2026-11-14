@@ -175,6 +175,7 @@ fn passes_over(failing: u64, passes: usize) -> PassCost {
                 &mut ledger,
                 0,
                 Some(&control),
+                None,
             );
             let after = fs::read_to_string(&log).map_or(0, |calls| calls.lines().count());
             cost.calls.push(after - before);

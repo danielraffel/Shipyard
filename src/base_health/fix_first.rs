@@ -62,6 +62,9 @@ pub struct TipReading {
     /// oldest failure after its last passing verdict. `None` unless `red`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub red_since: Option<DateTime<Utc>>,
+    /// When the tip's newest verdict for the context completed, red or not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub newest_at: Option<DateTime<Utc>>,
     /// Why the tip could not be read, when it could not. An unread tip is
     /// never red.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -93,6 +96,65 @@ pub fn judge_tip(runs: &[TipRun]) -> (bool, Option<DateTime<Utc>>) {
         return (false, None);
     }
     (true, failures.last().and_then(|run| run.completed_at))
+}
+
+/// When the newest verdict (pass or fail) among `runs` completed.
+#[must_use]
+pub fn newest_verdict_at(runs: &[TipRun]) -> Option<DateTime<Utc>> {
+    runs.iter()
+        .filter(|run| is_pass(&run.conclusion) || is_fail(&run.conclusion))
+        .max_by_key(|run| run.id)
+        .and_then(|run| run.completed_at)
+}
+
+/// The red time of a confirmed context whose onset is unknown: no head can
+/// pass after it, so it exempts nobody. It is a sentinel, never a time to
+/// print or store: [`known_onset`] and [`onset_text`] are the only ways out.
+pub const UNKNOWN_ONSET: DateTime<Utc> = DateTime::<Utc>::MAX_UTC;
+
+/// The onset when it is known, `None` for [`UNKNOWN_ONSET`].
+#[must_use]
+pub fn known_onset(since: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    (since != UNKNOWN_ONSET).then_some(since)
+}
+
+/// The onset for a person: RFC 3339, or "an unknown time". Never formats
+/// [`UNKNOWN_ONSET`], which RFC 3339 cannot represent.
+#[must_use]
+pub fn onset_text(since: DateTime<Utc>) -> String {
+    known_onset(since).map_or_else(|| "an unknown time".to_owned(), |at| at.to_rfc3339())
+}
+
+/// Whether the base is confirmed broken on a context the merge groups
+/// already show failing. The tip's own newest verdict failing confirms it.
+/// So does a red-everywhere episode on the same check (three or more open
+/// pull requests failing it the same way) that began after the tip's newest
+/// verdict: a tip green only from before the episode is stale, as when a
+/// date-dependent test breaks with nothing re-running the tip. A tip read
+/// green after the episode began, or not read at all, confirms nothing.
+/// Returns when the base went red.
+#[must_use]
+pub fn confirmed_since(
+    tip: &TipReading,
+    red_everywhere_since: Option<DateTime<Utc>>,
+) -> Option<DateTime<Utc>> {
+    if tip.error.is_some() {
+        return None;
+    }
+    if tip.red {
+        // A red tip with no red time of its own: confirmed, but read as red
+        // since the end of time, so no head can be shown to pass after the
+        // break. The red-everywhere start never stands in for the tip's own
+        // onset.
+        return Some(tip.red_since.unwrap_or(UNKNOWN_ONSET));
+    }
+    // Red everywhere confirms only over a tip whose newest verdict is known
+    // and strictly older than the episode. A read with no completed verdict
+    // proves nothing about when the tip was last judged.
+    let since = red_everywhere_since?;
+    tip.newest_at
+        .is_some_and(|newest| newest < since)
+        .then_some(since)
 }
 
 /// The one read the tip needs: the context's check runs on the commit the
@@ -161,6 +223,7 @@ pub fn parse_tip(value: &Value, context: &str, app_id: Option<u64>) -> TipReadin
         sha,
         red,
         red_since,
+        newest_at: newest_verdict_at(&runs),
         error: None,
     }
 }
@@ -208,7 +271,7 @@ impl GreenFix {
         format!(
             "green head: `{context}` passed on its head at {} after the base tip went red at {}; approved at {}{}",
             self.green_at.to_rfc3339(),
-            red_since.to_rfc3339(),
+            onset_text(red_since),
             self.approved_at.to_rfc3339(),
             if self.labelled {
                 "; fix label".to_owned()
@@ -397,6 +460,10 @@ pub struct ReplayEpisode {
     /// The tip's completed runs of the context.
     #[serde(default)]
     pub tip_runs: Vec<TipRun>,
+    /// When a red-everywhere episode on the context's check began, if one
+    /// did.
+    #[serde(default)]
+    pub red_everywhere_since: Option<DateTime<Utc>>,
     /// Open pull requests at `decided_at`.
     #[serde(default)]
     pub prs: Vec<FixCandidate>,
@@ -451,7 +518,16 @@ pub fn replay(episode: &ReplayEpisode) -> ReplayOutcome {
         .filter(|run| seen(run.completed_at).is_some())
         .cloned()
         .collect::<Vec<_>>();
-    let (red, red_since) = judge_tip(&tip_runs);
+    let (tip_red, tip_red_since) = judge_tip(&tip_runs);
+    let tip = TipReading {
+        sha: None,
+        red: tip_red,
+        red_since: tip_red_since,
+        newest_at: newest_verdict_at(&tip_runs),
+        error: None,
+    };
+    let red_since = confirmed_since(&tip, seen(episode.red_everywhere_since));
+    let red = red_since.is_some();
     let streak = episode.max_streak >= MIN_STREAK;
     let prs = episode
         .prs
@@ -469,12 +545,18 @@ pub fn replay(episode: &ReplayEpisode) -> ReplayOutcome {
             episode.max_streak
         ),
         (true, false) => {
-            "the base tip's own newest run of the context passed: nothing acts".to_owned()
+            "neither the base tip nor a red-everywhere episode shows the base red: nothing acts"
+                .to_owned()
         }
         (true, true) => format!(
-            "streak {} and the base tip red since {}",
+            "streak {} and the base red since {} ({})",
             episode.max_streak,
-            red_since.map_or_else(|| "an unknown time".to_owned(), |at| at.to_rfc3339())
+            red_since.map_or_else(|| "an unknown time".to_owned(), onset_text),
+            if tip_red {
+                "base tip red"
+            } else {
+                "red everywhere, tip verdict stale"
+            }
         ),
     };
     // The same decision the steward makes live ([`decide`]).

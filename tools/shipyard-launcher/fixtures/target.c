@@ -15,6 +15,11 @@ static void on_signal(int number) {
 
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
+    if (!strcmp(mode, "--version")) {
+        const char *version = getenv("FIXTURE_VERSION");
+        printf("shipyard %s\n", version ? version : "1.0.0");
+        return getenv("FIXTURE_VERSION_FAILS") ? 1 : 0;
+    }
     if (!strcmp(mode, "args")) {
         for (int i = 2; i < argc; i++) printf("ARG:%s\n", argv[i]);
         return 0;

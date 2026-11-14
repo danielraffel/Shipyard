@@ -13,6 +13,8 @@
 // Windows release builds retain selected Unix controller modules so their
 // explicit fail-closed stubs remain type-checked. Keep lint accommodations on
 // those modules instead of suppressing Windows diagnostics crate-wide.
+/// Policy-checked release-movement acts (`shipyard advance`).
+pub(crate) mod advance;
 /// CLI entrypoint and command dispatch.
 pub mod app;
 /// Immutable artifact manifests, resumable receiver-pull planning, and verified publication.
@@ -169,6 +171,9 @@ pub mod landability;
 pub mod landing;
 /// Advisory-vs-required lane policy resolution.
 pub mod lane_policy;
+/// Routes launchd jobs through `ShipyardLauncher.app` once a host activates it.
+#[cfg(unix)]
+pub mod launcher_app;
 /// Bounded log rotation, terminal classification, and retention primitives.
 pub mod log_retention;
 /// Merge-queue enqueue / poll / eviction supervision engine.

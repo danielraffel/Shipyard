@@ -1,0 +1,201 @@
+# The steward's scheduling loop
+
+Every steward tick gives each open pull request the loop covers one `loop`
+object on its row in the tick JSON, at the top level of the row beside
+`blocked_on` (`repos[].prs[].loop`). The review,
+runner and ledger lanes, and the escalation ladder, read it instead of
+deriving state themselves. The steward is the single writer, so it is also
+the single scheduler.
+
+The loop adds no GitHub read. It comes from what the pass already read:
+
+- the row's `blocked_on` token, which counts required contexts only (rulesets
+  and branch protection, from the app each rule names) and is already one
+  token per row in the steward's own precedence;
+- the row's decision (merge-queue membership);
+- the dwell entry, which dates when the state began at this head;
+- the pass-runner's review quarantine file on this host, when one is named.
+
+## Schema
+
+```json
+"loop": {
+  "state": "required_red",
+  "since": "2026-11-13T15:00:00+00:00",
+  "action": "claim and fix the red required check",
+  "actor": "repair",
+  "deadline_at": "2026-11-13T16:00:00+00:00",
+  "level": 1
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `state` | Exactly one of the states below. |
+| `since` | When the pull request entered this state at this head (RFC 3339). A push starts it over. |
+| `action` | The act, a short verb phrase. |
+| `actor` | Who acts at the current level: `steward`, `queue` (the merge queue or CI; nothing for anyone to do), `reviewer`, `adversary`, `repair`, `stronger_model`, `coordinator`. |
+| `deadline_at` | When the current level's deadline passes; `null` while the queue or CI acts, and at the last level. |
+| `level` | 0 at entry; one more for each missed deadline, at most 3. |
+
+A row has no `loop` when the loop does not cover it: a draft, a pull request
+the steward does not own (`unmanaged`, `handoff_missing`, `invalid_head`,
+`direct_merge_refused`), or one carrying a label the pipeline skips by
+design (`owner-decision`, `superseded`, `PARKED/*`, the opt-out label, a
+provenance label).
+
+## States, in precedence
+
+The first match wins:
+
+1. `stuck_group`: the row reads `merge_group_stalled:<context>`, so its merge group can never finish.
+2. `queued`: the pull request is in the merge queue (or was enqueued this pass). A queued pull request is never `required_red` or `hold`, whatever a check on its head says.
+3. Otherwise the state the `blocked_on` token names (below). When that state is `awaiting_review` and the quarantine file lists this pull request at its current head, it is `quarantined` instead. The file is never pruned, so a quarantine line never overrides an approved, green, red or held head.
+
+| `blocked_on` | `state` |
+|---|---|
+| `ready`, `admission_pending`, `merge_state:BEHIND` (the queue tests on top of main, so behind is never an act), `enqueue_refused:*`, `generated_path_batch:*` | `ready` |
+| `no_verdict`, `waiting_head_approval`, `approval_excluded:*`, `waiting_code_owner:*`, `code_owner_review`, `carries_unapproved_commits:*` | `awaiting_review` |
+| `required_pending`, `waiting_full_test_tier`, `waiting_enqueue_requirements`, `merge_state:` other than `DIRTY`/`BEHIND` | `check_running` |
+| `capacity_queued` | `capacity_queued` |
+| `required_failed:*` | `required_red` |
+| `held:*` | `hold` |
+| `merge_state:DIRTY` | `dirty` |
+| `ejected_same_head:*`, `ejection_cap`, `defect_fix_removed:*` (removed for a defect; this head is never put back) | `ejected` |
+| anything else: `transient_rerun`, `required_never_ran:*`, `approval_unread`, `steward_error`, `uncertain_mutation`, `revalidating`, `required_policy_unknown`, `carried_commits_*`, and any token added later | `tooling` |
+
+`revalidating` and `uncertain_mutation` normally clear on the next pass, so
+they reach the 10-minute `tooling` deadline only when they persist. A row the
+pass deferred (`deferred_pass_budget`) is not reclassified: it keeps the
+state and `since` it had.
+
+## Acts and deadlines
+
+| `state` | `action` | Level at entry, actor | First deadline | Then |
+|---|---|---|---|---|
+| `ready` | enqueue the exact head | 0, `steward` | 2 min | +30, +30 |
+| `awaiting_review` | review the exact head | 0, `reviewer` | 30 min | `adversary`, +30, +30 |
+| `required_red` | claim and fix the red required check | 0, `repair` | 10 min (a repair claim) | takeover at 60 min without a push, +60 |
+| `hold` | claim and address the HOLD | 0, `repair` | 10 min | takeover at 60 min without a push, +60 |
+| `dirty` | merge origin/main and regenerate | 0, `repair` | 5 min | +30, +30 |
+| `quarantined` | review the exact head with a stronger model | 2, `stronger_model` (at once) | 30 min | `coordinator` |
+| `ejected` | re-queue the same head or push a new one | 0, `steward` | 10 min | +30, +30 |
+| `stuck_group` | dequeue as defect-fix | 0, `steward` | 30 min | +30, +30 |
+| `tooling` | re-run on another slot | 0, `steward` | 10 min (the next tick or two) | +30, +30 |
+| `check_running` | wait for required checks | 0, `queue` | 60 min | `repair`, +60, +60 |
+| `queued`, `capacity_queued` | wait (the host is watched for capacity) | 0, `queue` | none | none |
+
+`check_running` also covers a merge state GitHub keeps at `BLOCKED`,
+`UNKNOWN` or `UNSTABLE`, so a pull request stuck there escalates after an
+hour instead of never.
+
+Each missed deadline raises the level by one rung. After the state's own
+actor at L0, L1 is `repair` (the `adversary` after a reviewer), L2 is
+`stronger_model` on the exact head, and L3 is `coordinator`
+(`FLEET_PASS_ESCALATION_TARGET`). It never goes to the fleet's owner.
+
+## What the steward cannot see
+
+- **Repair claims.** The steward reads no PR comments. A `required_red` or
+  `hold` row reaches level 1 at 10 minutes whether or not a repair claim was
+  posted. A consumer that reads claims (the escalation ladder, `shipyard
+  relay`) holds level 1 back while a claim is fresh, and acts on level 2
+  (60 minutes with no push) regardless.
+- **Ejection causes.** The flake (re-queue once within 10 minutes) and
+  main-red (re-queue when main is green) branches need the ejection cause.
+  The row token carries it as `ejected_same_head:<cause>`. Both branches
+  start at the same 10-minute deadline here; the act that tells them apart
+  ships with the ejected re-queue.
+
+## The quarantine file
+
+The pass-runner appends `<repo>#<pr> <head> <reason> [since=<epoch>]` to
+`$STATE/review-quarantine.txt`. The steward reads the file the environment
+variable `SHIPYARD_REVIEW_QUARANTINE` names, else the machine-global key
+`[loop] review_quarantine_file`. With neither set, or the file absent or
+unreadable, no pull request is ever `quarantined`. Only the head the line
+names is quarantined; a new head is classified normally.
+
+## How `since` is dated
+
+- The same state at the same head as the last pass: `since` is unchanged.
+- A different state at the same head: the state began after the last pass
+  that saw the old one. `since` is this pass, unless the row carries evidence
+  specific to the new state that is newer than that pass: the required check
+  completing red (`required_red`), the HOLD being posted (`hold`), the removal
+  from the queue (`ejected`), the enqueue (`queued`), the quarantine line
+  (`quarantined`), the checks turning green (`awaiting_review`), a required
+  check starting (`check_running`). A green time that predates an approval
+  never dates `ready`, so `ready` starts at level 0.
+- A head seen for the first time (a push, or the first pass after a
+  deploy): the earliest of every applicable timestamp the pass has (the
+  state-specific evidence above, the dwell entry for the same token at this
+  head, the row's own `since`), else this pass. For `queued` and
+  `quarantined` only the enqueue and the quarantine line count, since the
+  row's token and its times describe another state.
+
+## Records
+
+An applying steward pass keeps, per pull request, the state and head it
+last classified, when it entered them and the last pass that saw them
+(`loop_seen` in the steward ledger). A record is dropped only when its pull
+request is no longer open; a row missing from a partial report keeps its
+record. A report pass keeps nothing. If the ledger cannot be saved, the next
+pass dates states from the evidence again, so a level can only come out
+lower, never higher.
+
+## Ready on event
+
+A `ready` head is enqueued by the next tick, which can be minutes away. When
+the event that made it ready arrives (its exact-head approval posts, or its
+last required check turns green), the steward's own admission can run for
+that one pull request at once:
+
+```bash
+shipyard runner steward-admit-ready --repo OWNER/REPO --pr N --head SHA          # report
+shipyard runner steward-admit-ready --repo OWNER/REPO --pr N --head SHA --apply  # admit
+```
+
+`--apply` is for the steward host and its relay only. An agent never runs
+it, for the same reason it never arms or enqueues a pull request itself:
+admission has one writer.
+
+`shipyard relay` runs it for the pull requests it tracks when
+`[relay] admit_ready = "apply"` (or `"report"`; the default is `"off"`), on a
+pass where it sees the approval or the green checks and the pull request is
+open, approved at its head, green and not queued. A shadow relay only
+reports. Turn `apply` on only on the host that runs the steward: the
+admission uses that host's steward lock, ledger and mutation authority.
+
+The event is only a trigger; nothing in it is trusted. The admission:
+
+1. Refuses a repository that is not in the steward's fleet list
+   (`~/.local/share/shipyard-steward/fleet-repos.txt`, the file the tick
+   reads, or `$SHIPYARD_STEWARD_FLEET_REPOS`) with `not_fleet_repo`, and an
+   unreadable list too, before any GitHub read.
+2. Records one attempt per head per window (`--min-interval-secs`, 60 by
+   default and at least 30) in `merge-steward.ready-events.json` beside the
+   steward ledger, before any GitHub read. A repeat within the window does
+   nothing.
+3. Follows the tick's rate-limit rules: a repository in a recorded
+   rate-limit cooldown, or whose REST budget is under 300 or unreadable, is
+   refused with `rate_limited` and not read.
+4. Reads the pull request again. A head other than the one the event named,
+   a pull request that is not open or not on the default branch, one already
+   queued or armed, or one the tick's policy does not classify as ready, is
+   left alone.
+5. Leaves to the tick a base whose merge groups read anything but clear, a
+   paused queue entry, and a pending run cancellation.
+6. A report (no `--apply`, or `admit_ready = "report"`) stops here after
+   reading the live exact-head approval gate: it says `would_admit` only for
+   an approved head, `waiting_head_approval` otherwise.
+7. Takes the steward's ledger lock without waiting. If a tick or an
+   `admission-clean` gate holds it, it does nothing: that pass sees the head.
+8. Admits through the tick's own path: the live exact-head approval gate, the
+   carried-commit, code-owner and defect-fix guards, the final revalidation,
+   and the enqueue (or exact-head merge) pinned to the head with
+   `expectedHeadOid`. Its result is saved in the steward ledger.
+
+Anything it cannot read means it does nothing, and the tick handles the pull
+request as before. A tick that finds the lock held waits up to 30 seconds for
+it instead of skipping its pass.

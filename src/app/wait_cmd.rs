@@ -261,10 +261,13 @@ impl WaitReadCost {
 pub(super) fn fetch_pr_actionable_snapshot(
     actions: &crate::cloud::GitHubActions,
     state_dir: &Path,
+    global_dir: &Path,
     repo: &str,
     pr_number: u64,
 ) -> wait_transport::WaitResult<Option<Value>> {
-    match super::merge_steward_cmd::pr_next_action_snapshot(actions, state_dir, repo, pr_number) {
+    match super::merge_steward_cmd::pr_next_action_snapshot(
+        actions, state_dir, global_dir, repo, pr_number,
+    ) {
         Ok(snapshot) => Ok(Some(snapshot)),
         Err(error) if pull_request_absent(&error) => Ok(None),
         Err(error) => Err(error.into()),
@@ -421,8 +424,13 @@ fn wait_pr<W: Write>(
                         Instant::now() + remaining,
                         &pass,
                     );
-                    let snapshot =
-                        fetch_pr_actionable_snapshot(&actions, state_dir, &repo, pr_number);
+                    let snapshot = fetch_pr_actionable_snapshot(
+                        &actions,
+                        state_dir,
+                        &config.global_dir,
+                        &repo,
+                        pr_number,
+                    );
                     read_cost.add(&pass.report());
                     snapshot
                 }
@@ -1971,6 +1979,23 @@ artifacts = [
         assert!(text.starts_with("timeout after "), "{text}");
         assert!(text.contains("blocked_on=no_verdict"), "{text}");
         assert!(text.contains("next (reviewer): Nothing to do."), "{text}");
+    }
+
+    /// A capacity queue is "not blocked": the wait never matches on it and the
+    /// printed next action says so (the invariant `page_only_on_merge_blocking`).
+    #[test]
+    fn wait_pr_actionable_reports_capacity_queued_as_not_blocked() {
+        let mut snapshot = actionable_snapshot(false);
+        snapshot["blocked_on"] = Value::from("capacity_queued");
+        snapshot["next_action"] = serde_json::json!({
+            "actor": "ci",
+            "action": "Not blocked: required check(s) macos are queued for a runner.",
+            "stop": false
+        });
+        let (code, text) = run_actionable_wait(&snapshot, false);
+        assert_eq!(code, ExitCode::from(WAIT_EXIT_TIMEOUT));
+        assert!(text.contains("blocked_on=capacity_queued"), "{text}");
+        assert!(text.contains("next (ci): Not blocked"), "{text}");
     }
 
     /// The JSON envelope carries the whole answer under `observed`, from the
