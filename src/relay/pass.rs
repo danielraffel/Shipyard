@@ -87,6 +87,12 @@ pub(crate) type StewardActions<'a> = dyn Fn(&str) -> BTreeMap<u64, (String, Stri
 /// The steward's overdue rows per pull request, as relay events, for a repo.
 pub(crate) type StewardOverdue<'a> = dyn Fn(&str) -> BTreeMap<u64, Vec<RelayEvent>> + 'a;
 
+/// Runs the steward's admission for one pull request an event made ready
+/// (repository, number, head, base) and returns the log record of what it
+/// did. The relay passes only what it saw; the admission reads everything
+/// again and trusts none of it.
+pub(crate) type ReadyAdmission<'a> = dyn Fn(&str, u64, &str, &str) -> Value + 'a;
+
 /// Persists the state and one log record right after a delivery, so a
 /// crash later in the pass cannot send it again.
 pub(crate) type Persist<'a> = dyn Fn(&RelayState, &Value) -> Result<(), String> + 'a;
@@ -113,6 +119,8 @@ pub(crate) struct PassInput<'a> {
     pub(crate) steward_overdue: &'a StewardOverdue<'a>,
     /// Durable write after each delivery; `None` keeps records in the report.
     pub(crate) persist: Option<&'a Persist<'a>>,
+    /// The steward's admission, when `relay.admit_ready` is on.
+    pub(crate) ready: Option<&'a ReadyAdmission<'a>>,
 }
 
 /// One repository's share of a pass.
@@ -304,7 +312,18 @@ fn run_repo(
                 |event| matches!(event, RelayEvent::Overdue { head, .. } if *head == digest.head),
             )
             .cloned();
-        let mut events: Vec<RelayEvent> = derive_events(tracked.digest.as_ref(), &digest)
+        let derived = derive_events(tracked.digest.as_ref(), &digest);
+        if let Some(admit) = input.ready
+            && became_ready(&derived, &digest)
+        {
+            let mut record = admit(repo, *number, &digest.head, &digest.base);
+            if let Some(object) = record.as_object_mut() {
+                object.insert("kind".to_owned(), Value::from("ready_admission"));
+                object.insert("at".to_owned(), Value::from(input.now.to_rfc3339()));
+            }
+            log.push(record);
+        }
+        let mut events: Vec<RelayEvent> = derived
             .into_iter()
             .chain(overdue_now)
             .filter(|event| input.config.events.contains(event.name()))
@@ -408,6 +427,24 @@ fn run_repo(
         }
     }
     Ok(())
+}
+
+/// Whether this pass saw the event that made the pull request ready: its
+/// approval at the current head, or its required checks turning green, while
+/// it is open, approved at that head, green, and not in the merge queue.
+pub(crate) fn became_ready(events: &[RelayEvent], digest: &PrDigest) -> bool {
+    let ready = digest.state == "OPEN"
+        && !digest.in_queue
+        && digest.checks == super::Checks::Success
+        && digest.verdict.as_deref() == Some("APPROVE");
+    ready
+        && events.iter().any(|event| match event {
+            RelayEvent::Verdict { verdict, head } => verdict == "APPROVE" && *head == digest.head,
+            RelayEvent::RequiredCheck { result, head, .. } => {
+                result == "green" && *head == digest.head
+            }
+            _ => false,
+        })
 }
 
 fn infer_actions(

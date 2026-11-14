@@ -3298,6 +3298,41 @@ pub(super) enum RunnerCommand {
         #[arg(long = "ledger", hide = true)]
         ledger: Option<PathBuf>,
     },
+    /// Run the steward's admission for one pull request now, because the
+    /// event that made it ready arrived (its exact-head approval posted, or
+    /// its last required check went green). The event is only a trigger:
+    /// the head is read again and admitted through the tick's own path (live
+    /// exact-head approval, final revalidation, `expectedHeadOid`), under the
+    /// steward lock. A busy lock, a moved head, a repeat within
+    /// `--min-interval-secs`, or anything unreadable does nothing and leaves
+    /// the pull request to the next tick. Dry-run is the default. `--apply`
+    /// is for the steward host and its relay only; an agent never runs it,
+    /// as it never arms or enqueues a pull request itself.
+    #[command(name = "steward-admit-ready")]
+    StewardAdmitReady {
+        /// Exact OWNER/REPO.
+        #[arg(long)]
+        repo: String,
+        /// The pull request.
+        #[arg(long)]
+        pr: u64,
+        /// The full head SHA the event named.
+        #[arg(long)]
+        head: String,
+        /// Target branch.
+        #[arg(long, default_value = "main")]
+        base: String,
+        /// One attempt per head within this many seconds (at least 30).
+        #[arg(
+            long = "min-interval-secs",
+            default_value_t = 60,
+            value_parser = clap::value_parser!(u64).range(30..)
+        )]
+        min_interval_secs: u64,
+        /// Admit the head. Without this flag, only report.
+        #[arg(long)]
+        apply: bool,
+    },
     /// Fleet-level tick-start invariant: every repository in the fleet list
     /// has a steward config clone with a readable `.shipyard/config.toml`.
     /// With `--heal`, clone a missing one (same remote form as the existing

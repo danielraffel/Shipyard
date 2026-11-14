@@ -494,6 +494,35 @@ fn runner_command_with_actions<W: Write>(
             json,
             stdout,
         ),
+        RunnerCommand::StewardAdmitReady {
+            repo,
+            pr,
+            head,
+            base,
+            min_interval_secs,
+            apply,
+        } => {
+            let actions = actions_for_explicit_repo(actions, &repo);
+            super::merge_steward_cmd::ready_event::admit_ready_command(
+                &super::merge_steward_cmd::ready_event::AdmitReadyArgs {
+                    repo,
+                    base,
+                    pr,
+                    head,
+                    min_interval: Duration::from_secs(min_interval_secs),
+                    apply,
+                },
+                cwd,
+                mode,
+                runtime_paths,
+                &actions.with_inproc_reads(crate::github_read::for_steward(
+                    config,
+                    &runtime_paths.state_dir,
+                )),
+                json,
+                stdout,
+            )
+        }
         RunnerCommand::StewardInvariants {
             fleet_repos,
             clones,
