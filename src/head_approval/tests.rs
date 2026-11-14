@@ -525,7 +525,8 @@ fn group_removal(at: &str, reason: &str, group: &str, head: &str) -> Value {
 
 fn timeline(head: &str, nodes: Vec<Value>) -> Value {
     json!({"data": {"repository": {"pullRequest": {"headRefOid": head,
-        "timelineItems": {"nodes": Value::Array(nodes)}}}}})
+        "timelineItems": {"pageInfo": {"hasPreviousPage": false},
+                          "nodes": Value::Array(nodes)}}}}})
 }
 
 /// `head` removed from two merge groups, plus a removal of another head's
@@ -637,6 +638,8 @@ fn an_unattributable_removal_counts_against_the_head() {
         json!({"oid": GROUP_1, "parents": null}),
         json!({"oid": GROUP_1, "parents": {"nodes": [{"oid": BASE}, {}]}}),
         json!({"oid": GROUP_1, "parents": {"nodes": []}}),
+        // A single-parent commit, as a squash or rebase queue would build.
+        json!({"oid": GROUP_1, "parents": {"nodes": [{"oid": BASE}]}}),
         json!({"oid": GROUP_1, "parents": {"nodes": [
             {"oid": BASE}, {"oid": OTHER}, {"oid": GROUP_2}]}}),
     ];
@@ -686,10 +689,13 @@ fn commit(head: &str, suite: Option<&str>) -> Value {
            "commit": {"oid": head, "checkSuites": {"nodes": suites}}})
 }
 
-/// An unattributable removal is not charged to a head that server-set times
-/// prove reached GitHub after it: a force-push to it, or its earliest check
-/// suite. Without that proof, including a commit merely sorted after the
-/// removals (GitHub sorts commits by their author-controlled date), it counts.
+/// An unattributable removal is not charged to a head whose own commit, in a
+/// complete timeline window, has a readable earliest check suite created
+/// after it, with no force-push to the head at or before the removal. A
+/// force-push can only veto, never prove a late arrival alone. Anything less
+/// (no suite, an unparseable time, a truncated or unread window, or a commit
+/// merely sorted after the removals, which GitHub orders by author date)
+/// leaves the removal charged.
 #[test]
 fn an_unattributable_removal_is_not_charged_to_a_head_proven_to_come_after_it() {
     let removals = || {
@@ -703,32 +709,63 @@ fn an_unattributable_removal_is_not_charged_to_a_head_proven_to_come_after_it() 
         nodes.extend(extra);
         timeline(HEAD, nodes)
     };
-    let pushed_after = with(vec![force_push("2026-10-04T03:00:00Z", HEAD)]);
-    assert!(head_ejections(&pushed_after, HEAD).is_empty());
     let suite_after = with(vec![commit(HEAD, Some("2026-10-04T03:00:00Z"))]);
     assert!(head_ejections(&suite_after, HEAD).is_empty());
+    let suite_and_push_after = with(vec![
+        commit(HEAD, Some("2026-10-04T03:00:00Z")),
+        force_push("2026-10-04T03:00:01Z", HEAD),
+    ]);
+    assert!(head_ejections(&suite_and_push_after, HEAD).is_empty());
 
-    // Not proven: sorted after but no suite; a suite older than the
-    // removals; pushed before them and force-pushed back after; an
-    // unreadable push time.
+    let with_window = |queue: &Value, page_info: Value| {
+        let mut queue = queue.clone();
+        queue["data"]["repository"]["pullRequest"]["timelineItems"]["pageInfo"] = page_info;
+        queue
+    };
+    let unparseable = json!({"__typename": "PullRequestCommit", "commit": {"oid": HEAD,
+        "checkSuites": {"nodes": [{"createdAt": "2026-10-04T03:00:00Z"},
+                                  {"createdAt": "not a time"}]}}});
     let unproven = [
-        with(vec![commit(HEAD, None)]),
-        with(vec![commit(HEAD, Some("2026-10-04T00:30:00Z"))]),
+        // A force-push after the removals alone.
+        with(vec![force_push("2026-10-04T03:00:00Z", HEAD)]),
+        // A normal push with no suite, then force-pushed away and back.
         {
-            let mut nodes = vec![force_push("2026-10-04T00:30:00Z", HEAD)];
+            let mut nodes = vec![commit(HEAD, None)];
             nodes.extend(removals());
             nodes.push(force_push("2026-10-04T02:30:00Z", OTHER));
             nodes.push(force_push("2026-10-04T03:00:00Z", HEAD));
             timeline(HEAD, nodes)
         },
-        with(vec![json!({"__typename": "HeadRefForcePushedEvent",
-                         "afterCommit": {"oid": HEAD}})]),
+        // Sorted after the removals but no suite; null suites.
+        with(vec![commit(HEAD, None)]),
+        with(vec![json!({"__typename": "PullRequestCommit",
+                         "commit": {"oid": HEAD, "checkSuites": null}})]),
+        // A suite older than the removals.
+        with(vec![commit(HEAD, Some("2026-10-04T00:30:00Z"))]),
+        // A suite time that does not parse.
+        with(vec![unparseable]),
+        // Pushed before the removals, with a later suite on its commit.
+        {
+            let mut nodes = vec![force_push("2026-10-04T00:30:00Z", HEAD)];
+            nodes.extend(removals());
+            nodes.push(commit(HEAD, Some("2026-10-04T03:00:00Z")));
+            timeline(HEAD, nodes)
+        },
+        // A force-push to the head with no readable time.
+        with(vec![
+            commit(HEAD, Some("2026-10-04T03:00:00Z")),
+            json!({"__typename": "HeadRefForcePushedEvent", "afterCommit": {"oid": HEAD}}),
+        ]),
+        // The proof itself, in a truncated or unread window.
+        with_window(&suite_after, json!({"hasPreviousPage": true})),
+        with_window(&suite_after, json!({})),
+        with_window(&suite_after, Value::Null),
     ];
     for queue in unproven {
         assert_eq!(head_ejections(&queue, HEAD).len(), 2, "{queue}");
     }
     // A later head's arrival says nothing about this one.
-    let other_pushed = with(vec![force_push("2026-10-04T03:00:00Z", OTHER)]);
+    let other_pushed = with(vec![commit(OTHER, Some("2026-10-04T03:00:00Z"))]);
     assert_eq!(head_ejections(&other_pushed, HEAD).len(), 2);
 }
 

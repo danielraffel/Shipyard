@@ -417,10 +417,6 @@ fn merge_group_parents(before: &Value) -> Option<Vec<&str>> {
         .collect()
 }
 
-/// The most parents [`PR_QUEUE_STATE_QUERY`] reads off a merge-group commit
-/// (`parents(first:3)`). A commit showing this many may have more.
-const MERGE_GROUP_PARENTS_READ: usize = 3;
-
 /// Whose removal one `RemovedFromMergeQueueEvent` was, judged against one
 /// head. See [`removal_of`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -428,12 +424,12 @@ pub enum RemovalOf {
     /// The removal names the head: `beforeCommit` is the head, or the head is
     /// a parent of the `beforeCommit` merge-group commit.
     Head,
-    /// The removal names another commit: `beforeCommit` and every one of its
-    /// parents (all of them read) differ from the head.
+    /// The removal names another commit: `beforeCommit` is a two-parent
+    /// merge-group commit, and neither it nor either parent is the head.
     OtherHead,
     /// The response cannot say: no `beforeCommit` (a `merge_conflict`
     /// removal, for which GitHub built no group), its parents not read or
-    /// unreadable, or possibly truncated by the query's parent limit.
+    /// unreadable, or any count of parents other than two.
     Unattributable,
 }
 
@@ -474,11 +470,13 @@ pub fn removal_of(node: &Value, head: &str) -> RemovalOf {
         .any(|parent| parent.eq_ignore_ascii_case(head))
     {
         RemovalOf::Head
-    } else if parents.is_empty() || parents.len() >= MERGE_GROUP_PARENTS_READ {
-        // No parents is not a merge-group commit; a full page may be cut.
-        RemovalOf::Unattributable
-    } else {
+    } else if parents.len() == 2 {
         RemovalOf::OtherHead
+    } else {
+        // Only a two-parent merge group names its head. One parent (a squash
+        // or rebase queue), none, or a full `parents(first:3)` page that may
+        // be cut cannot rule the head out.
+        RemovalOf::Unattributable
     }
 }
 
@@ -486,9 +484,10 @@ pub fn removal_of(node: &Value, head: &str) -> RemovalOf {
 /// head ([`RemovalOf::Head`]), or it names no head ([`RemovalOf::Unattributable`])
 /// and `head` is not proven to have reached GitHub after it.
 ///
-/// The proof uses server-set times only: a `HeadRefForcePushedEvent` to
-/// `head` created after the removal, or `head`'s earliest check suite created
-/// after it. Timeline position is not proof: GitHub orders a
+/// The proof uses server-set times only: `head`'s earliest check suite,
+/// created after the removal, in a complete timeline window
+/// (`window_complete`), with no force-push to `head` at or before it (see
+/// `arrived_after`). Timeline position is not proof: GitHub orders a
 /// `PullRequestCommit` by its author-controlled date, so a commit dated in the
 /// future would sort after every removal. Without the proof the removal
 /// counts. Every `merge_conflict` removal names no head, so without this
@@ -496,23 +495,38 @@ pub fn removal_of(node: &Value, head: &str) -> RemovalOf {
 /// head, and a guard-mode head (which no fresh approval can lift) would stay
 /// at the cap forever.
 #[must_use]
-pub fn removal_charges_head(nodes: &[Value], index: usize, head: &str) -> bool {
+pub fn removal_charges_head(
+    nodes: &[Value],
+    index: usize,
+    head: &str,
+    window_complete: bool,
+) -> bool {
     let Some(node) = nodes.get(index) else {
         return true;
     };
     match removal_of(node, head) {
         RemovalOf::Head => true,
         RemovalOf::OtherHead => false,
-        RemovalOf::Unattributable => !arrived_after(nodes, node, head),
+        RemovalOf::Unattributable => !arrived_after(nodes, node, head, window_complete),
     }
 }
 
-/// Whether server-set times prove `head` reached GitHub after `removal`:
-/// at least one of them (a force-push to `head`, `head`'s earliest check
-/// suite) is later than the removal and none is earlier or unreadable, so a
-/// head pushed before the removal and force-pushed back after it is not
-/// excused.
-fn arrived_after(nodes: &[Value], removal: &Value, head: &str) -> bool {
+/// Whether server-set times prove `head` reached GitHub after `removal`.
+///
+/// The proof is `head`'s own `PullRequestCommit` in a complete window
+/// (`window_complete`: `pageInfo.hasPreviousPage` read as `false`) whose
+/// earliest check suite is readable and later than the removal. Every
+/// `PullRequestCommit` of `head` must give such a time, and every force-push
+/// to `head` must be readable and later too: a force-push can only veto (show
+/// the head was there before), never prove a late arrival by itself, since a
+/// head pushed before the removal can be force-pushed away and back after it.
+/// A suite time is an upper bound on the push (sound where an app creates a
+/// suite on push), and `checkSuites(first:1)` is taken to be the oldest.
+/// Anything missing, empty or unparseable is no proof, and the removal counts.
+fn arrived_after(nodes: &[Value], removal: &Value, head: &str, window_complete: bool) -> bool {
+    if !window_complete {
+        return false;
+    }
     let Some(removed_at) = removal
         .get("createdAt")
         .and_then(Value::as_str)
@@ -520,27 +534,45 @@ fn arrived_after(nodes: &[Value], removal: &Value, head: &str) -> bool {
     else {
         return false;
     };
-    let mut seen = Vec::new();
+    let mut suite_proof = false;
     for node in nodes {
         if !pushed_oid(node).is_some_and(|oid| oid.eq_ignore_ascii_case(head)) {
             continue;
         }
-        match node.get("__typename").and_then(Value::as_str) {
-            Some("HeadRefForcePushedEvent") => seen.push(
-                node.get("createdAt")
-                    .and_then(Value::as_str)
-                    .and_then(parse_timestamp),
-            ),
-            // A commit without a check suite says nothing about when it came.
+        let at = match node.get("__typename").and_then(Value::as_str) {
+            Some("HeadRefForcePushedEvent") => node
+                .get("createdAt")
+                .and_then(Value::as_str)
+                .and_then(parse_timestamp),
             Some("PullRequestCommit") => {
-                if let Some(suite) = earliest_suite(node) {
-                    seen.push(Some(suite));
-                }
+                let suite = strict_earliest_suite(node);
+                suite_proof |= suite.is_some();
+                suite
             }
-            _ => {}
+            _ => continue,
+        };
+        if at.is_none_or(|at| at <= removed_at) {
+            return false;
         }
     }
-    !seen.is_empty() && seen.iter().all(|at| at.is_some_and(|at| at > removed_at))
+    suite_proof
+}
+
+/// [`earliest_suite`], but `None` unless the commit carries at least one
+/// suite and every suite's `createdAt` parses.
+fn strict_earliest_suite(node: &Value) -> Option<chrono::DateTime<chrono::Utc>> {
+    let suites = node.pointer("/commit/checkSuites/nodes")?.as_array()?;
+    suites
+        .iter()
+        .map(|suite| {
+            suite
+                .get("createdAt")
+                .and_then(Value::as_str)
+                .and_then(parse_timestamp)
+        })
+        .collect::<Option<Vec<_>>>()?
+        .into_iter()
+        .min()
 }
 
 /// Whether the first re-add (at `add`) after the hazard removal at `removal`
