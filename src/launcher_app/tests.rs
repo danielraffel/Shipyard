@@ -277,3 +277,10 @@ fn not_active_or_missing_never_execs() {
     daemon.daemon_internal = true;
     assert_eq!(route_with(&daemon, refused.path(), &accept, &exec), None);
 }
+
+#[test]
+fn a_launcher_fallback_is_never_routed_again() {
+    assert!(is_marked(|name| name == "SHIPYARD_LAUNCHER_FALLBACK"));
+    assert!(is_marked(|name| name == "SHIPYARD_LAUNCHER_APP"));
+    assert!(!is_marked(|_| false));
+}

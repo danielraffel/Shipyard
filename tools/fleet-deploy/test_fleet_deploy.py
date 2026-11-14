@@ -321,6 +321,22 @@ class FleetDeployTests(unittest.TestCase):
         self.assertFalse((self.t / ".local" / "share" / "shipyard" / "launcher" / "activation.json").exists())
         self.assertIn("unit=launcher-activation waiting", self.log.read_text())
 
+    @unittest.skipUnless(sys.platform == "darwin", "the launcher unit runs on macOS only")
+    def test_the_tick_from_main_is_bound_and_a_local_edit_never_is(self):
+        import hashlib
+        installed = self.t / ".local" / "libexec" / "shipyard-steward-tick.sh"
+        record = self.t / ".local" / "share" / "shipyard" / "launcher" / "activation.json"
+        self.stage_launcher("v1")
+        self.run_deploy(FAKE_FDA="granted", FLEET_DEPLOY_TICK_DEST=str(installed))
+        bound = json.loads(record.read_text())["scripts"]["steward-tick"]
+        self.assertEqual(bound["sha256"], hashlib.sha256(installed.read_bytes()).hexdigest())
+        self.assertIn("unit=launcher-bind bound steward-tick", self.log.read_text())
+        # A local edit is never bound: the next run puts main's tick back and the
+        # binding is unchanged (the check tool's own test covers a refused bind).
+        installed.write_text("#!/bin/bash\necho edited\n")
+        self.run_deploy(FAKE_FDA="granted", FLEET_DEPLOY_TICK_DEST=str(installed), FLEET_DEPLOY_INTERVAL_S="0")
+        self.assertEqual(json.loads(record.read_text())["scripts"]["steward-tick"], bound)
+
 
 if __name__ == "__main__":
     unittest.main()

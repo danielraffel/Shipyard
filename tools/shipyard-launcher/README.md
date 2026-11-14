@@ -57,19 +57,51 @@ Rules, all fail closed (exit 77, nothing runs):
   then resumed. A file swapped between the static check and the spawn is
   killed.
 - Scripts come from a compiled-in allowlist (only the steward tick today).
-  A shell script cannot carry a code signature, so it is trusted by the
-  allowlist and the same ownership checks, which is the trust launchd already
-  gives it. `BASH_ENV`, `ENV`, `SHELLOPTS`, `BASHOPTS`, `CDPATH`, `GLOBIGNORE`,
-  `PS4` and exported functions are removed, and bash runs with
-  `--noprofile --norc`.
+  A shell script cannot carry a code signature, so it is bound by content
+  instead: the activation record holds its SHA-256, which fleet-deploy
+  records (`shipyard-launcher-check --bind-script`) only when the installed
+  file is byte-identical to the tick it installed from main. On every run the
+  launcher re-hashes the file, copies the verified bytes into a private
+  directory and runs that copy, so a write after the check changes nothing.
+  If anything is off (no bound record, a different hash, an untrusted or
+  symlinked file), it does not run the script under its identity: it `exec`s
+  plain `/bin/bash` on the installed file with the caller's environment and
+  `SHIPYARD_LAUNCHER_FALLBACK=launcher-script-mismatch`, which is what the
+  LaunchAgent would run without the launcher, and logs
+  `launcher-script-mismatch`. `BASH_ENV`, `ENV`, `SHELLOPTS`, `BASHOPTS`,
+  `CDPATH`, `GLOBIGNORE`, `PS4` and exported functions are removed from a
+  verified run, and bash runs with `--noprofile --norc`.
+
+- Downgrades fall back. Before running a release the launcher runs its
+  `--version` the same verified way (spawned suspended, checked, resumed,
+  bounded at 15 s) and keeps the newest version it has run in
+  `~/.local/share/shipyard/launcher/release-floor.json`. A release older than
+  that, a version it cannot read, or a floor file it cannot trust is not run
+  under the launcher: it `exec`s the release directly with the caller's
+  environment and `SHIPYARD_LAUNCHER_FALLBACK=launcher-release-fallback`
+  (which also stops Shipyard routing again) and logs
+  `launcher-release-fallback`. `--launcher-active` reports such a release as
+  `release_downgrade`. A newer release passes at once. There is deliberately
+  no exact path or cdhash pin: every install changes both, so a pin would make
+  each new release fall back to its own per-generation identity until someone
+  re-recorded it, which is the prompt this bundle exists to prevent. The
+  Developer ID, team, identifier and `auth-generations` checks already limit
+  the choice to genuine Shipyard releases.
 
 Pass-through:
 
 - Arguments are passed verbatim. Only a first argument starting with
   `--launcher-` is the launcher's own.
-- The environment is passed unchanged except that `DYLD_*` is removed, and
+- The environment is passed unchanged except that `DYLD_*` is removed,
   `SHIPYARD_LAUNCHER_APP=<bundle>` is added so nothing routes through the
-  launcher twice.
+  launcher twice, and `PATH` is set by the launcher, never taken from the
+  caller. A script gets `/usr/bin:/bin:/usr/sbin:/sbin` plus the bundle's
+  `Contents/MacOS`. Shipyard gets its fixed unattended tool path
+  (`/opt/homebrew/bin:/usr/local/bin:~/.local/bin` then the system
+  directories), the list its LaunchAgents already use, because it finds the
+  guarded `gh` wrapper by name. The steward tick sets its own documented
+  `PATH` on its first line for the same reason: `gh` must resolve to the
+  ghapp wrapper in `~/.local/bin`.
 - The child stays in the launcher's process group, so launchd's process-group
   handling (`AbandonProcessGroup`) is unchanged.
 - SIGTERM, SIGINT, SIGHUP, SIGQUIT, SIGUSR1, SIGUSR2 and SIGWINCH are
@@ -113,6 +145,37 @@ Still their own identities: the `com.danielraffel.fleet-pass.*` agents
 processes the tick detaches with `setsid` (once their responsible process
 exits, macOS attributes them to themselves), and tartci's agents
 (TartCILauncher.app).
+
+## What the steward tick needs
+
+The tick sets `PATH=~/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`
+on its first line and refuses to run unless `gh` resolves to
+`~/.local/bin/gh` (the ghapp wrapper, so admissions stay guarded). It uses:
+`~/.local/bin/shipyard`, `~/.local/bin/ghapp`, `jq`, `timeout` (Homebrew
+coreutils), `git`, `/usr/bin/python3`, and system `tar`, `find`, `stat`,
+`date`, `mktemp`, `head`, `tr`, `grep`, `cat`, `awk`. It starts
+`~/.local/libexec/shipyard-fleet-deploy.sh` and two Python scripts from the
+deploy clone, detached.
+
+## What Full Disk Access reaches once active
+
+The launcher itself gains no authority beyond running these. Every child
+inherits its Full Disk Access:
+
+| Child | How it is bound | What it can still reach |
+| --- | --- | --- |
+| The Shipyard release (`~/.local/bin/shipyard` resolved) | Developer ID, team `95CX6P84C4`, identifier `shipyard`, under `auth-generations/<id>/`, checked on the file and again on the suspended process; never older than the newest version run here (the floor) | Every tool Shipyard runs: `gh` (through the ghapp wrapper), `git`, `ssh`, `python3`, from its fixed tool path, which includes the user-writable `~/.local/bin` and `/opt/homebrew/bin` |
+| The steward tick (`~/.local/libexec/shipyard-steward-tick.sh`) | SHA-256 bound at deploy time; a verified private copy runs | `~/.local/bin/ghapp`, `~/.local/bin/shipyard`, `jq`, `timeout`, `git`, `/usr/bin/python3`, and the scripts the tick starts (fleet-deploy, drain watch, loss report; detached, so they keep the grant only while the tick runs) |
+
+The bindings hold against changes made by anything that does not also rewrite
+`~/.local/share/shipyard/launcher/activation.json`. That record, the tick's
+tools and the Homebrew and `~/.local/bin` directories are writable by the same
+user, so a process running as that user can still reach Full Disk Access
+through them. Closing that needs an anchor the user cannot write: the tick
+sealed inside the signed bundle (every tick change would then need a new
+signed launcher, so it is not done), or a root-owned record. The defence for
+untrusted code is to keep it off the host: the repair lane's author filter and
+running untrusted work in tartci VMs. Weigh this before granting.
 
 ## Build, sign and notarize (maintainer's Mac)
 

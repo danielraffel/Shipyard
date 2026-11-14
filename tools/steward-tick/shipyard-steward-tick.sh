@@ -24,6 +24,11 @@ tick_installed="$HOME/.local/libexec/shipyard-steward-tick.sh"
 launcher_path=direct
 if [ -n "${SHIPYARD_LAUNCHER_APP:-}" ]; then
   launcher_path=app
+elif [ -n "${SHIPYARD_LAUNCHER_FALLBACK:-}" ]; then
+  # The launcher refused to run this file under its identity (its bytes are
+  # not the ones fleet-deploy bound) and handed it to plain /bin/bash. Do not
+  # route again.
+  echo "$stamp launcher=direct reason=$SHIPYARD_LAUNCHER_FALLBACK" >> "$log_dir/summary.log"
 elif [ "${SHIPYARD_STEWARD_LAUNCHER:-on}" != off ] && [ -f "$launcher_record" ] && [ -x "$launcher_exe" ] \
   && [ "$(cd "$(dirname "$0")" 2>/dev/null && pwd -P)/$(basename "$0")" \
      = "$(cd "$(dirname "$tick_installed")" 2>/dev/null && pwd -P)/$(basename "$tick_installed")" ]; then

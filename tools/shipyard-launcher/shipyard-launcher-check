@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import hashlib
 import json
 import os
 import pathlib
@@ -245,6 +246,55 @@ def next_step(report: dict) -> str:
     return "Active: launchd jobs run under ShipyardLauncher.app."
 
 
+# Scripts the launcher may run, as in main.swift's allowedScripts.
+SCRIPTS = {"steward-tick": HOME / ".local" / "libexec" / "shipyard-steward-tick.sh"}
+
+
+def replace_record(record: dict) -> None:
+    staged = RECORD.with_name(f".{RECORD.name}.{os.getpid()}.tmp")
+    descriptor = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "w") as handle:
+        json.dump(record, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(staged, RECORD)
+
+
+def bind_script(spec: str) -> tuple[bool, str]:
+    """Record the SHA-256 of an installed script, only when its bytes equal
+    `source` (fleet-deploy passes the copy it just installed from main). The
+    launcher runs the script under its identity only while the hashes match."""
+    name, _, source = spec.partition("=")
+    installed = SCRIPTS.get(name)
+    if installed is None or not source:
+        return False, f"usage: --bind-script {'|'.join(SCRIPTS)}=SOURCE"
+    try:
+        record = json.loads(RECORD.read_text())
+    except (OSError, ValueError):
+        return False, "no readable activation record; activate first"
+    if not isinstance(record, dict) or record.get("schema") != 2:
+        return False, "the activation record is not schema 2"
+    if installed.is_symlink() or not installed.is_file():
+        return False, f"{installed} is not a regular file"
+    try:
+        wanted = pathlib.Path(source).read_bytes()
+        actual = installed.read_bytes()
+    except OSError as error:
+        return False, f"cannot read: {error}"
+    if wanted != actual:
+        return False, f"{installed} differs from {source}; not binding it"
+    digest = hashlib.sha256(actual).hexdigest()
+    entry = {"path": str(installed), "sha256": digest}
+    scripts = record.get("scripts") if isinstance(record.get("scripts"), dict) else {}
+    if scripts.get(name) == entry:
+        return True, f"{name} already bound to {digest}"
+    scripts[name] = entry
+    record["scripts"] = scripts
+    replace_record(record)
+    return True, f"bound {name} to {digest}"
+
+
 def write_record(report: dict) -> tuple[bool, str]:
     """Bind the activation to this exact bundle and the grant just confirmed,
     then ask the launcher whether it agrees. A record it does not accept is
@@ -268,14 +318,7 @@ def write_record(report: dict) -> tuple[bool, str]:
         "activated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "checks": report["checks"],
     }
-    staged = RECORD.with_name(f".{RECORD.name}.{os.getpid()}.tmp")
-    descriptor = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(descriptor, "w") as handle:
-        json.dump(record, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(staged, RECORD)
+    replace_record(record)
     active, reason = launcher_active()
     if not active:
         RECORD.unlink(missing_ok=True)
@@ -297,11 +340,16 @@ def main(argv: list[str]) -> int:
     action.add_argument("--deactivate", action="store_true")
     action.add_argument("--verify-bundle", type=pathlib.Path)
     action.add_argument("--bundle-version", type=pathlib.Path)
+    action.add_argument("--bind-script", metavar="NAME=SOURCE")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     if sys.platform != "darwin" and not TEST_MODE:
         print("ShipyardLauncher.app exists on macOS only", file=sys.stderr)
         return 2
+    if args.bind_script:
+        ok, detail = bind_script(args.bind_script)
+        print(detail, file=sys.stdout if ok else sys.stderr)
+        return 0 if ok else 1
     if args.bundle_version:
         version = bundle_version(args.bundle_version)
         if version is None:

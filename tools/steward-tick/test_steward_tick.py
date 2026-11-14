@@ -303,6 +303,14 @@ class StewardTickLauncherTests(unittest.TestCase):
         self.assertIn("acme/repo rc=0", self.summary())
         self.assertIn("launcher=direct", self.summary().splitlines()[-1])
 
+    def test_a_launcher_fallback_never_routes_again(self):
+        self.activate()
+        result = self.run_installed(SHIPYARD_LAUNCHER_FALLBACK="launcher-script-mismatch")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.calls.exists())
+        self.assertIn("launcher=direct reason=launcher-script-mismatch", self.summary())
+        self.assertIn("launcher=direct invariants", self.summary().replace("launcher=direct reason", "x"))
+
     def test_only_the_installed_copy_routes(self):
         self.activate()
         result = self.run_tick()  # the repository copy, not ~/.local/libexec

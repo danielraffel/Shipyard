@@ -34,6 +34,10 @@ use wait_timeout::ChildExt;
 /// Set by the launcher in its child's environment; its presence means this
 /// process already runs under the launcher.
 pub const LAUNCHER_ENV: &str = "SHIPYARD_LAUNCHER_APP";
+/// Set by the launcher when it hands a job back to run without it (a release
+/// below its version floor, an unverifiable release, a script whose hash does
+/// not match). Its presence also stops routing, so a fallback never loops.
+pub const FALLBACK_ENV: &str = "SHIPYARD_LAUNCHER_FALLBACK";
 /// Turns routing off for one process (`off`).
 pub const ROUTING_ENV: &str = "SHIPYARD_LAUNCHER_ROUTING";
 /// How long `--launcher-active` may take (it may reconfirm the grant, up to
@@ -171,7 +175,7 @@ pub struct JobFacts {
     pub ppid: i32,
     /// `XPC_SERVICE_NAME`: launchd sets it to the job label.
     pub xpc_service_name: Option<String>,
-    /// [`LAUNCHER_ENV`] is set.
+    /// [`LAUNCHER_ENV`] or [`FALLBACK_ENV`] is set.
     pub under_launcher: bool,
     /// [`ROUTING_ENV`] is `off`.
     pub routing_off: bool,
@@ -193,7 +197,7 @@ impl JobFacts {
         Self {
             ppid: nix::unistd::getppid().as_raw(),
             xpc_service_name: std::env::var("XPC_SERVICE_NAME").ok(),
-            under_launcher: std::env::var_os(LAUNCHER_ENV).is_some(),
+            under_launcher: is_marked(|name| std::env::var_os(name).is_some()),
             routing_off: std::env::var(ROUTING_ENV).is_ok_and(|value| value == "off"),
             current_exe: std::env::current_exe()
                 .ok()
@@ -227,6 +231,14 @@ impl JobFacts {
             && !self.daemon_internal
             && self.current_exe == self.pointer_target
     }
+}
+
+/// This process already went through the launcher: it runs under it
+/// ([`LAUNCHER_ENV`]) or the launcher handed it back ([`FALLBACK_ENV`]).
+/// Either way it must not route again.
+#[must_use]
+pub fn is_marked(present: impl Fn(&str) -> bool) -> bool {
+    present(LAUNCHER_ENV) || present(FALLBACK_ENV)
 }
 
 /// `daemon run` or `daemon supervise` (either step). The daemon and its

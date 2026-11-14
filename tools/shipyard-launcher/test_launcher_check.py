@@ -250,6 +250,30 @@ class LauncherCheckTests(CheckHarness):
         self.assertFalse(report["activated"])
         self.assertTrue(report["activation"].startswith("bundle_replaced"))
 
+    def test_bind_script_records_only_the_installed_copy_of_source(self):
+        import hashlib
+        tick = self.home / ".local" / "libexec" / "shipyard-steward-tick.sh"
+        source = self.home / "main-tick.sh"
+        source.write_text("#!/bin/bash\necho tick\n")
+        self.assertIn("activate first", self.check("--bind-script", f"steward-tick={source}").stderr)
+        self.record.parent.mkdir(parents=True)
+        self.record.write_text(json.dumps({"schema": 2, "cdhash": "x"}))
+        tick.parent.mkdir(parents=True, exist_ok=True)
+        tick.write_text("#!/bin/bash\necho modified\n")
+        result = self.check("--bind-script", f"steward-tick={source}")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("differs", result.stderr)
+        self.assertNotIn("scripts", json.loads(self.record.read_text()))
+        tick.write_text(source.read_text())
+        result = self.check("--bind-script", f"steward-tick={source}")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        record = json.loads(self.record.read_text())
+        self.assertEqual(record["cdhash"], "x", "the rest of the record is kept")
+        self.assertEqual(record["scripts"]["steward-tick"], {
+            "path": str(tick), "sha256": hashlib.sha256(source.read_bytes()).hexdigest()})
+        self.assertEqual(stat.S_IMODE(self.record.stat().st_mode), 0o600)
+        self.assertEqual(self.check("--bind-script", f"other={source}").returncode, 1)
+
     def test_launch_services_unavailable_is_unknown(self):
         self.install()
         self.flag("open-fails")

@@ -234,11 +234,32 @@ print(",".join(failed) or report.get("activation", "unknown"))
   say_once launcher-activation "unit=launcher-activation waiting reason=${why:-unknown}"
 }
 
+# bind_tick: record the SHA-256 of the installed steward tick in the launcher's
+# activation record, so the launcher runs it under its identity. The check
+# tool binds only when the installed file is byte-identical to the tick on
+# main that this script installs; any other content stays unbound, and the
+# launcher then hands the tick to plain /bin/bash (launcher-script-mismatch).
+bind_tick() {
+  local check="$root/Shipyard/tools/shipyard-launcher/shipyard-launcher-check" out
+  [ "$(uname -s)" = Darwin ] || return 0
+  [ -f "$HOME/.local/share/shipyard/launcher/activation.json" ] || return 0
+  if out=$(bounded 60 /usr/bin/python3 "$check" --bind-script \
+      "steward-tick=$root/Shipyard/tools/steward-tick/shipyard-steward-tick.sh"); then
+    case "$out" in
+      bound*) say "unit=launcher-bind $out" ;;
+      *) say_once launcher-bind "unit=launcher-bind current" ;;
+    esac
+  else
+    say_once launcher-bind "unit=launcher-bind refused reason=installed tick differs from main or no record"
+  fi
+}
+
 if rev=$(sync_clone Shipyard "$shipyard_remote"); then
   install_file tick "$root/Shipyard/tools/steward-tick/shipyard-steward-tick.sh" "$tick_dest" "$rev"
   install_file deploy "$root/Shipyard/tools/fleet-deploy/fleet-deploy.sh" "$self_dest" "$rev"
   install_launcher "$rev"
   activate_launcher
+  bind_tick
 else
   say "unit=tick refused reason=fetch_failed"
 fi
