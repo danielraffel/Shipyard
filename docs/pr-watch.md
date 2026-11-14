@@ -369,6 +369,16 @@ shipyard pr-watch rules --repo Generous-Corp/pulp \
 `--repo` takes `OWNER/REPO@workflow.yml` when the gate workflow is not
 `[pr_watch] workflow`: its pull-request runs mark when each head was pushed. A
 repository with no required checks is watched for everything but red checks.
+For a fleet that watches several repositories, set a durable mapping once so
+scheduled commands do not silently query a nonexistent `build.yml`:
+
+```toml
+[pr_watch.workflow_overrides]
+"danielraffel/spectr" = "m5-product-acceptance.yml"
+```
+
+The mapping is case-insensitive by repository slug. An explicit
+`OWNER/REPO@workflow.yml` on the command line still takes precedence.
 
 | kind | fires when |
 |---|---|
