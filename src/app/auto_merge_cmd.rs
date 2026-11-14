@@ -2364,6 +2364,12 @@ fn approval_verdict(
         format!("number={}", state.pr),
     ])?)
     .map_err(|error| format!("merge-queue timeline returned invalid JSON: {error}"))?;
+    // The same normal-push evidence fetch_pr_queue_state attaches, so the
+    // gate and the timeline read agree.
+    let mut queue = queue;
+    crate::pr_queue_state::attach_push_activity(&mut queue, &state.repo, |path| {
+        run_gh(&["api".to_owned(), path.to_owned()])
+    });
     let gate = crate::head_approval::evaluate_with_policy(
         run_gh,
         &state.repo,

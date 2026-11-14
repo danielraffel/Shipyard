@@ -775,7 +775,7 @@ fn with_activity(mut queue: Value, rows: Vec<Value>) -> Value {
 }
 
 fn push_row(at: &str, after: &str) -> Value {
-    json!({"activity_type": "push", "after": after, "ref": "refs/heads/feature",
+    json!({"activity_type": "push", "after": after, "before": "9999999999999999999999999999999999999999", "ref": "refs/heads/feature",
            "timestamp": at})
 }
 

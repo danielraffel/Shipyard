@@ -578,8 +578,10 @@ def _evidence(response: Any) -> tuple[Any, Any]:
     return _pull_request(response), activity
 
 
-def _activity_rows(evidence: tuple[Any, Any]) -> list[tuple[str, str, datetime]] | None:
-    """The attached activity rows as ``(after, activity_type, timestamp)``, newest first.
+def _activity_rows(
+    evidence: tuple[Any, Any],
+) -> list[tuple[str, str, datetime, str]] | None:
+    """The attached activity rows as ``(after, activity_type, timestamp, before)``, newest first.
 
     ``None`` when there is no usable page: nothing attached, a fetch error, a
     fork or unknown head repository, a head ref that differs from the pull
@@ -605,19 +607,21 @@ def _activity_rows(evidence: tuple[Any, Any]) -> list[tuple[str, str, datetime]]
     if not isinstance(rows, list) or len(rows) > PUSH_ACTIVITY_PAGE:
         return None
     full_ref = f"refs/heads/{head_ref}"
-    parsed: list[tuple[str, str, datetime]] = []
+    parsed: list[tuple[str, str, datetime, str]] = []
     for row in rows:
         if not isinstance(row, dict):
             return None
-        after, kind = row.get("after"), row.get("activity_type")
+        after, kind, before = row.get("after"), row.get("activity_type"), row.get("before")
         if not isinstance(after, str) or not after or not isinstance(kind, str):
+            return None
+        if not isinstance(before, str) or not before:
             return None
         if row.get("ref") != full_ref:
             return None
         at = _timestamp(row.get("timestamp"))
         if at is None or (parsed and parsed[-1][2] < at):
             return None
-        parsed.append((after, kind, at))
+        parsed.append((after, kind, at, before))
     return parsed
 
 
@@ -627,7 +631,9 @@ def _activity_push_after_removal(
     """Whether the attached activity page proves ``head`` was pushed after the removal.
 
     Needs a usable page that reaches back past the removal (a row strictly
-    older than its ``createdAt``), no row at or before the removal and no
+    older than its ``createdAt``) and is not full unless its oldest row is
+    ``branch_creation``, a first row after the removal whose ``before`` is not
+    ``head``, no row at or before the removal and no
     earlier ``HeadRefForcePushedEvent`` naming ``head``, and a ``push`` or
     ``force_push`` row of ``head`` strictly later than the removal. A
     PullRequestCommit's timeline position is author-controlled and is not
@@ -641,9 +647,17 @@ def _activity_push_after_removal(
     if removed_at is None:
         return False
     lowered = head.lower()
-    if not any(at < removed_at for _, _, at in rows):
+    if not any(at < removed_at for _, _, at, _ in rows):
         return False
-    if any(at <= removed_at and after.lower() == lowered for after, _, at in rows):
+    # A full page proves nothing about older pushes unless its oldest row is
+    # the branch's creation: an earlier push of the head may be on the next page.
+    if len(rows) >= PUSH_ACTIVITY_PAGE and rows[-1][1] != "branch_creation":
+        return False
+    # The first push after the removal must move the branch off another commit.
+    later = [row for row in rows if row[2] > removed_at]
+    if later and later[-1][3].lower() == lowered:
+        return False
+    if any(at <= removed_at and after.lower() == lowered for after, _, at, _ in rows):
         return False
     if any(
         oid and oid.lower() == lowered
@@ -653,7 +667,7 @@ def _activity_push_after_removal(
         return False
     return any(
         at > removed_at and after.lower() == lowered and kind in ("push", "force_push")
-        for after, kind, at in rows
+        for after, kind, at, _ in rows
     )
 
 
@@ -661,6 +675,9 @@ def push_activity_wanted(response: Any) -> bool:
     """Whether a removal naming no head is left that the timeline force-push rule does not settle."""
     pr = _pull_request(response)
     if pr is None:
+        return False
+    state = pr.get("state")
+    if not isinstance(state, str) or state.upper() != "OPEN":
         return False
     head = pr.get("headRefOid")
     timeline = pr.get("timelineItems")

@@ -122,7 +122,8 @@ ACT_OTHER = "2" * 40
 
 
 def activity_row(at: str, kind: str, after: str) -> dict[str, Any]:
-    return {"activity_type": kind, "after": after, "ref": "refs/heads/feature", "timestamp": at}
+    return {"activity_type": kind, "after": after, "before": "9" * 40,
+            "ref": "refs/heads/feature", "timestamp": at}
 
 
 def two_conflicts_then_normal_push() -> dict[str, Any]:
@@ -2396,6 +2397,61 @@ class NormalPushActivityEvidence(unittest.TestCase):
             "__typename": "HeadRefForcePushedEvent", "createdAt": "2026-10-04T00:20:00Z",
             "afterCommit": {"oid": ACT_HEAD}})
         self.assertEqual(self.charged(forced), self.NONE)
+
+    def test_a_full_page_cannot_prove_a_head_is_new(self) -> None:
+        x = "6" * 40
+
+        def page(later_pushes: int, oldest_creation: bool) -> dict[str, Any]:
+            response: dict[str, Any] = {"data": {"repository": {"pullRequest": {
+                "number": 8, "state": "OPEN", "headRefOid": ACT_HEAD, "headRefName": "feature",
+                "isCrossRepository": False, "isInMergeQueue": False, "mergeQueueEntry": None,
+                "autoMergeRequest": None,
+                "timelineItems": {"pageInfo": {"hasPreviousPage": True}, "nodes": [
+                    {"__typename": "PullRequestCommit", "commit": {"oid": x}},
+                    {"__typename": "RemovedFromMergeQueueEvent",
+                     "createdAt": "2026-10-04T01:00:00Z", "reason": "merge_conflict",
+                     "beforeCommit": None},
+                    {"__typename": "HeadRefForcePushedEvent", "createdAt": "2026-10-05T00:00:00Z",
+                     "afterCommit": {"oid": ACT_HEAD}},
+                ]}}}}}
+            pushes = [
+                activity_row(f"2026-10-04T{2 + n // 60:02d}:{n % 60:02d}:00Z", "push", f"{n:040x}")
+                for n in range(later_pushes)
+            ]
+            rows = [activity_row("2026-10-05T00:00:00Z", "force_push", ACT_HEAD),
+                    *reversed(pushes),
+                    activity_row("2026-10-04T00:30:00Z",
+                                 "branch_creation" if oldest_creation else "push", x)]
+            response[guard.PUSH_ACTIVITY_KEY] = {
+                "headRef": "feature", "crossRepository": False, "rows": rows,
+            }
+            return response
+
+        full = page(guard.PUSH_ACTIVITY_PAGE - 2, False)
+        self.assertEqual(len(full[guard.PUSH_ACTIVITY_KEY]["rows"]), guard.PUSH_ACTIVITY_PAGE)
+        self.assertEqual(self.charged(full), (1, False, "no_evidence"))
+        self.assertEqual(self.charged(page(guard.PUSH_ACTIVITY_PAGE - 2, True)),
+                         (0, True, "activity_push_after_removal"))
+        self.assertEqual(self.charged(page(guard.PUSH_ACTIVITY_PAGE - 3, False)),
+                         (0, True, "activity_push_after_removal"))
+
+    def test_a_first_push_off_the_head_gives_no_credit(self) -> None:
+        second = matching_rows()
+        second[0]["before"] = ACT_HEAD
+        self.assertEqual(self.charged(with_rows(second)), (1, False, "no_evidence"))
+        first = matching_rows()
+        first[1]["before"] = ACT_HEAD
+        self.assertEqual(self.charged(with_rows(first)), (1, True, "activity_push_after_removal"))
+        missing = matching_rows()
+        del missing[0]["before"]
+        self.assertEqual(self.charged(with_rows(missing)), self.NONE)
+
+    def test_a_closed_or_merged_pull_request_never_reads_activity(self) -> None:
+        for state in ("MERGED", "CLOSED", "", None):
+            with self.subTest(state=state):
+                response = two_conflicts_then_normal_push()
+                response["data"]["repository"]["pullRequest"]["state"] = state
+                self.assertFalse(guard.push_activity_wanted(response))
 
     def test_activity_is_read_only_when_it_can_matter(self) -> None:
         self.assertTrue(guard.push_activity_wanted(two_conflicts_then_normal_push()))

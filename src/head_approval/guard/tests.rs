@@ -448,7 +448,7 @@ fn a_normal_push_with_activity_evidence_clears_conflict_removals_in_guard_mode()
         queue
     };
     let row = |at: &str, after: &str| {
-        json!({"activity_type": "push", "after": after, "ref": "refs/heads/feature",
+        json!({"activity_type": "push", "after": after, "before": "9999999999999999999999999999999999999999", "ref": "refs/heads/feature",
                "timestamp": at})
     };
     let with_rows = |rows: Vec<Value>| {

@@ -1219,7 +1219,11 @@ force-push. A `push` or `force_push` row whose `after` is the current head,
 with a server `timestamp` strictly later than the removal, counts as the new
 head (basis `activity_push_after_removal`), provided the page reaches back
 past the removal and no row at or before the removal, and no earlier
-force-push event, names that head. The page is read only for a head in the
+force-push event, names that head. A full page (100 rows) counts only when
+its oldest row is the branch's `branch_creation`, since an earlier push of the
+head may be on the next page, and the first row after the removal must not
+have `before` equal to the head. The page is read only for an open pull
+request and only for a head in the
 base repository and at most once per pull request and head per guard run. A
 fork head, a failed or non-2xx read, a malformed row, or a page that stops
 short of the removal gives no credit. `PullRequestCommit` timeline order is

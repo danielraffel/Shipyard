@@ -242,8 +242,11 @@ unattributable removal is not settled by a force-push. A `push` or
 `force_push` row whose `after` is `headRefOid`, on the PR's own head ref in
 the base repository, with a server `timestamp` strictly later than the
 removal, is a new head (basis `activity_push_after_removal`). The page must
-reach back past the removal, and a row at or before the removal (or an
-earlier force-push event) naming the head vetoes it. A fork head, a failed
+reach back past the removal and must not be full (100 rows) unless its oldest
+row is the branch's `branch_creation`; the first row after the removal must
+not have `before` equal to the head; and a row at or before the removal (or
+an earlier force-push event) naming the head vetoes it. Closed and merged pull
+requests never read the page. A fork head, a failed
 read, a malformed row or a short page gives no credit. `PullRequestCommit`
 timeline order is author-controlled and is not push evidence. With no
 authoritative evidence, no new head is assumed and a re-arm is refused.

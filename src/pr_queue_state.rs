@@ -653,6 +653,7 @@ pub const PUSH_ACTIVITY_PAGE: usize = 100;
 
 /// One validated activity row.
 struct ActivityRow<'a> {
+    before: &'a str,
     after: &'a str,
     kind: &'a str,
     at: chrono::DateTime<chrono::Utc>,
@@ -702,6 +703,10 @@ fn activity_rows(evidence: PushEvidence<'_>) -> Option<Vec<ActivityRow<'_>>> {
             .get("after")
             .and_then(Value::as_str)
             .filter(|oid| !oid.is_empty())?;
+        let before = row
+            .get("before")
+            .and_then(Value::as_str)
+            .filter(|oid| !oid.is_empty())?;
         let kind = row.get("activity_type").and_then(Value::as_str)?;
         if row.get("ref").and_then(Value::as_str) != Some(full_ref.as_str()) {
             return None;
@@ -713,7 +718,12 @@ fn activity_rows(evidence: PushEvidence<'_>) -> Option<Vec<ActivityRow<'_>>> {
         {
             return None;
         }
-        parsed.push(ActivityRow { after, kind, at });
+        parsed.push(ActivityRow {
+            before,
+            after,
+            kind,
+            at,
+        });
     }
     Some(parsed)
 }
@@ -729,6 +739,11 @@ fn activity_rows(evidence: PushEvidence<'_>) -> Option<Vec<ActivityRow<'_>>> {
 /// - no row at or before the removal whose `after` is `head`, and no
 ///   `HeadRefForcePushedEvent` of `head` before the removal in the timeline:
 ///   a head already on the branch then is not a new arrival;
+/// - a page that is not full (fewer than [`PUSH_ACTIVITY_PAGE`] rows), or
+///   whose oldest row is the branch's `branch_creation`: otherwise an earlier
+///   push of `head` may be on a page that was never read;
+/// - the oldest row strictly after the removal has a `before` other than
+///   `head`;
 /// - a `push` or `force_push` row whose `after` is `head`, with a server
 ///   `timestamp` strictly later than the removal.
 ///
@@ -754,6 +769,25 @@ pub fn activity_push_after_removal(
     };
     let names_head = |row: &ActivityRow<'_>| row.after.eq_ignore_ascii_case(head);
     if !rows.iter().any(|row| row.at < removed_at) {
+        return false;
+    }
+    // A full page proves nothing about older pushes: an earlier push of the
+    // head can sit on the next page, out of the veto's sight. Only a page
+    // whose oldest row is the branch's creation is the whole history.
+    if rows.len() >= PUSH_ACTIVITY_PAGE
+        && rows.last().is_none_or(|row| row.kind != "branch_creation")
+    {
+        return false;
+    }
+    // The first push after the removal must move the branch off some other
+    // commit: one whose `before` is the head says the head was already the
+    // tip when it was pushed.
+    if rows
+        .iter()
+        .rev()
+        .find(|row| row.at > removed_at)
+        .is_some_and(|first| first.before.eq_ignore_ascii_case(head))
+    {
         return false;
     }
     if rows
@@ -783,6 +817,13 @@ pub fn push_activity_wanted(response: &Value) -> bool {
     let Some((pr, _)) = pull_request_node(response) else {
         return false;
     };
+    if !pr
+        .get("state")
+        .and_then(Value::as_str)
+        .is_some_and(|state| state.eq_ignore_ascii_case("OPEN"))
+    {
+        return false;
+    }
     let Some(head) = pr.get("headRefOid").and_then(Value::as_str) else {
         return false;
     };
@@ -2107,6 +2148,7 @@ mod tests {
 
     fn activity_row(at: &str, kind: &str, after: &str) -> Value {
         serde_json::json!({"activity_type": kind, "after": after,
+                           "before": "9999999999999999999999999999999999999999",
                            "ref": "refs/heads/feature", "timestamp": at})
     }
 
@@ -2381,5 +2423,104 @@ mod tests {
         // A ref name that would need escaping is never put in a query string.
         assert_eq!(push_activity_path("owner/repo", "a&b"), None);
         assert_eq!(push_activity_path("owner/repo", "a b"), None);
+    }
+
+    /// The audit's scenario: H was pushed long ago and replaced by X; X is
+    /// conflict-removed; many more pushes follow; then a force-push back to
+    /// H. A full page shows an older row (X's) but not H's first push, so it
+    /// cannot prove H is new.
+    #[test]
+    fn a_full_activity_page_cannot_prove_a_head_is_new() {
+        let x = "6666666666666666666666666666666666666666";
+        let page = |later_pushes: usize, oldest_creation: bool| {
+            let mut response = serde_json::json!({"data":{"repository":{"pullRequest":{
+                "number":8,"state":"OPEN","headRefOid":ACT_HEAD,"headRefName":"feature",
+                "isCrossRepository":false,"isInMergeQueue":false,
+                "mergeQueueEntry":null,"autoMergeRequest":null,
+                "timelineItems":{"pageInfo":{"hasPreviousPage":true},"nodes":[
+                    {"__typename":"PullRequestCommit","commit":{"oid":x}},
+                    {"__typename":"RemovedFromMergeQueueEvent","createdAt":"2026-10-04T01:00:00Z",
+                     "reason":"merge_conflict","beforeCommit":null},
+                    {"__typename":"HeadRefForcePushedEvent","createdAt":"2026-10-05T00:00:00Z",
+                     "afterCommit":{"oid":ACT_HEAD}}]}}}}});
+            let mut rows = vec![activity_row("2026-10-05T00:00:00Z", "force_push", ACT_HEAD)];
+            rows.extend((0..later_pushes).map(|n| {
+                activity_row(
+                    &format!("2026-10-04T{:02}:{:02}:00Z", 2 + n / 60, n % 60),
+                    "push",
+                    &format!("{n:040x}"),
+                )
+            }));
+            rows[1..].reverse();
+            rows.push(activity_row(
+                "2026-10-04T00:30:00Z",
+                if oldest_creation {
+                    "branch_creation"
+                } else {
+                    "push"
+                },
+                x,
+            ));
+            response[PUSH_ACTIVITY_KEY] = serde_json::json!(
+                {"headRef":"feature","crossRepository":false,"rows":Value::Array(rows)});
+            response
+        };
+        // 1 + 98 + 1 rows: a full page whose oldest row is a push.
+        let full = page(PUSH_ACTIVITY_PAGE - 2, false);
+        assert_eq!(
+            full[PUSH_ACTIVITY_KEY]["rows"].as_array().map(Vec::len),
+            Some(PUSH_ACTIVITY_PAGE)
+        );
+        assert_eq!(charged(&full), (1, false, NewHeadBasis::NoEvidence));
+        // A full page that reaches the branch's creation is the whole history.
+        assert_eq!(
+            charged(&page(PUSH_ACTIVITY_PAGE - 2, true)),
+            (0, true, NewHeadBasis::ActivityPushAfterRemoval)
+        );
+        // One row short of full: the page is the whole history.
+        assert_eq!(
+            charged(&page(PUSH_ACTIVITY_PAGE - 3, false)),
+            (0, true, NewHeadBasis::ActivityPushAfterRemoval)
+        );
+    }
+
+    /// The first push after a removal moving the branch off the head means
+    /// the head was already the tip: no credit for that removal.
+    #[test]
+    fn a_first_push_off_the_head_after_the_removal_gives_no_credit() {
+        let mut second = matching_rows();
+        second[0]["before"] = Value::from(ACT_HEAD);
+        assert_eq!(
+            charged(&with_rows(second)),
+            (1, false, NewHeadBasis::NoEvidence)
+        );
+        let mut first = matching_rows();
+        first[1]["before"] = Value::from(ACT_HEAD);
+        assert_eq!(
+            charged(&with_rows(first)),
+            (1, true, NewHeadBasis::ActivityPushAfterRemoval)
+        );
+        // `before` is required: a row without it voids the page.
+        let mut missing = matching_rows();
+        missing[0].as_object_mut().expect("row").remove("before");
+        assert_eq!(
+            charged(&with_rows(missing)),
+            (2, false, NewHeadBasis::NoEvidence)
+        );
+    }
+
+    #[test]
+    fn a_closed_or_merged_pull_request_never_reads_activity() {
+        for state in ["MERGED", "CLOSED", ""] {
+            let mut response = two_conflicts_then_normal_push();
+            response["data"]["repository"]["pullRequest"]["state"] = Value::from(state);
+            assert!(!push_activity_wanted(&response), "{state}");
+        }
+        let mut missing = two_conflicts_then_normal_push();
+        missing["data"]["repository"]["pullRequest"]
+            .as_object_mut()
+            .expect("pr")
+            .remove("state");
+        assert!(!push_activity_wanted(&missing));
     }
 }
