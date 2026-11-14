@@ -307,6 +307,42 @@ class DailyTests(Fixture):
         self.assertEqual(lr.daily(str(self.dir / "missing"), self.now), 0)
 
 
+class RollupCounterfactualTests(Fixture):
+    def tick(self, t, plan):
+        body = {"repos": [{"repo": REPO, "prs": [], "errors": [], "rollup": plan}]}
+        (self.dir / f"acme_repo-{stamp(t)}.json").write_text(json.dumps(body))
+
+    @staticmethod
+    def plan(action, *members):
+        return {"mode": "shadow", "action": action, "ready": [], "min_ready": 3,
+                "members": [{"pr": pr, "head": head} for pr, head in members]}
+
+    def test_absent_plans_are_unavailable_not_zero(self):
+        self.live(dt.datetime(2026, 11, 12, 1, 0, tzinfo=UTC), [(1, "a", "ready", "steward", None)])
+        rc = self.report()["rollup_counterfactual"]
+        self.assertEqual(rc["coverage"]["status"], "unavailable")
+        self.assertIsNone(rc["per_repo_per_day"])
+
+    def test_a_repeated_plan_counts_once_and_saves_prs_minus_rollups(self):
+        d1 = dt.datetime(2026, 11, 11, 1, 0, tzinfo=UTC)
+        self.tick(d1, self.plan("shadow", (1, "a"), (2, "b"), (3, "c")))
+        self.tick(d1 + dt.timedelta(minutes=5), self.plan("shadow", (1, "a"), (2, "b"), (3, "c")))
+        # One newcomer alone would land on its own: no rollup.
+        self.tick(d1 + dt.timedelta(minutes=10), self.plan("shadow", (1, "a"), (4, "d")))
+        # A new head of #2 is a new member.
+        d2 = d1 + dt.timedelta(days=1)
+        self.tick(d2, self.plan("apply_unavailable", (2, "b2"), (5, "e"), (6, "f")))
+        self.tick(d2 + dt.timedelta(minutes=5), self.plan("below_threshold"))
+        self.tick(d2 + dt.timedelta(minutes=10), self.plan("no_batch", (7, "g"), (8, "h")))
+        r = self.report()
+        days = r["rollup_counterfactual"]["per_repo_per_day"][REPO]
+        self.assertEqual(days, {
+            "2026-11-11": {"prs": 3, "rollups": 1, "ci_runs_saved": 2},
+            "2026-11-12": {"prs": 3, "rollups": 1, "ci_runs_saved": 2},
+        })
+        self.assertIn("would have batched 3 PRs into 1 rollups, saving ~2 CI runs", lr.markdown(r))
+
+
 class TickIntegrationTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

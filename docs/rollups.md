@@ -51,6 +51,73 @@ On a host, `SHIPYARD_TRAIN=off` (or `0` or `false`), optionally scoped as
 guards directory. Both stop the guard from accepting a rollup too, not only
 the CLI from forming one.
 
+## When a base without a merge queue backs up
+
+The merge steward plans a rollup on its own for a base that has no merge
+queue (it merges each approved head with `expectedHeadOid` instead). The
+plan is read-only today. It is set in the base branch's
+`.shipyard/config.toml`, read through the GitHub API:
+
+```toml
+[auto_merge.rollup]
+mode = "shadow"        # off | shadow (default) | apply
+min_ready = 3          # plan only when at least this many are ready
+max_members = 4        # 2 to 4
+sensitive_paths = []   # globs that keep a pull request out, added to the defaults
+max_ready = 12         # more ready than this skips the plan (skipped_too_many)
+interval_minutes = 30  # plan at most this often per repository; 0 plans every pass
+```
+
+Each pass, after the steward's own decisions, it counts the `ready` pull
+requests (approved at the exact head, required checks green, `CLEAN`). Below
+`min_ready` it reads nothing more and the pass is exactly as before. At or
+above it, a pull request joins only when:
+
+- it is not a draft and carries no `owner-decision`, `superseded` or
+  `PARKED/*` label;
+- the exact-head approval gate, read live as a dry run, approves its current
+  head with a verdict that names that head (a carried approval, a HOLD, the
+  ejection cap or a base that requires no approval keeps it out);
+- its changed files (from the compare API, renames' sources included; the
+  300-file cap keeps it out) match no sensitive path: the defaults
+  (`.github/workflows/**`, `scripts/ghapp*`, `scripts/*guard*`,
+  `src/head_approval*`, the rollup and exact-head merge code), the configured
+  `sensitive_paths`, `[train] exclude_paths`, or the base's carry exclusions;
+- it shares no file with an older member and no `[train] hot_files` glob.
+
+Members are taken oldest first, at most `max_members`. Fewer than two is no
+rollup. The plan appears in the steward's JSON as `repos[].rollup`, with an
+`action` of `below_threshold`, `skipped_too_many`, `no_batch`, `shadow`,
+`apply_unavailable`, `deadline` or `unreadable`, the members' exact heads and why each other ready pull request
+was left out.
+
+Its GitHub reads are bounded. A repository is planned at most once per
+`interval_minutes`: an applied pass stamps the plan in the steward's state
+directory (`rollup-plan/`), and the passes in between report that plan with
+`cached_at` and read nothing. More than `max_ready` ready pull requests skips
+the plan. Reading stops once `max_members` members are chosen, and when the
+pass's time budget runs out (`action = "deadline"`, the partial plan, never
+stamped). Pull requests the pass merged or enqueued this tick are not counted
+as ready.
+
+`shadow` changes nothing on GitHub: the pass takes no ledger and no mutation
+guard, issues reads only, and its one local write is the plan stamp. `apply` reports the same plan and still merges each pull
+request on its own (`apply_unavailable`), because forming a rollup needs the
+steward to push a `shipyard-train/rollup-*` branch and open its pull request,
+which it is not authorised to do, and landing one needs the base to take
+direct rollups (`[train] enabled = true`, `mode = "rollup"`, `landing =
+"direct"`). Until then a rollup is formed and landed by hand with the
+commands below.
+
+The daily loss report (below) turns these plans into a counterfactual per
+repository per UTC day, `rollup_counterfactual.per_repo_per_day`: would have
+batched K pull requests into J rollups, saving about K minus J CI runs.
+Consecutive passes repeat a plan, so each pull request at a head counts once,
+in the first plan that names it, and a plan counts as a rollup only when it
+brings at least two members no earlier plan took. It is an estimate: it
+assumes each rollup passes its one run. It is the evidence for moving a base
+from `shadow` to `apply`.
+
 ## The shape
 
 The branch is `shipyard-train/rollup-<n>`, `n` being the oldest member. It

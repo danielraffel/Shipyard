@@ -54,6 +54,28 @@ pub(super) fn render_report<W: Write>(
             )
             .map_err(|error| io_failure(&error))?;
         }
+        if let Some(rollup) = &repo.rollup {
+            let members = rollup
+                .members
+                .iter()
+                .map(|member| format!("#{}", member.pr))
+                .collect::<Vec<_>>()
+                .join(",");
+            writeln!(
+                stdout,
+                "  rollup: mode={} action={} ready={} members={}{}",
+                label(&rollup.mode),
+                label(&rollup.action),
+                rollup.ready.len(),
+                if members.is_empty() { "-" } else { &members },
+                rollup
+                    .detail
+                    .as_deref()
+                    .map(|detail| format!(" ({detail})"))
+                    .unwrap_or_default()
+            )
+            .map_err(|error| io_failure(&error))?;
+        }
         if !repo.invariants.is_empty() {
             writeln!(
                 stdout,
@@ -209,4 +231,12 @@ pub(super) fn enqueue_requirements_pending(message: &str) -> bool {
         || lower.contains("required approving review")
         || lower.contains("required review")
         || lower.contains("requirements are not met")
+}
+
+/// A serde enum's snake-case label.
+fn label<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_default()
 }

@@ -125,7 +125,8 @@ def tick_sources(log_dir, start):
 def load_ticks(log_dir, start, end):
     per_repo = collections.defaultdict(list)
     st = {"live_files": 0, "archive_files": 0, "unreadable": 0, "bad_archives": 0, "no_pr_list": 0,
-          "ticks_per_day": collections.Counter()}
+          "ticks_per_day": collections.Counter(), "rollup_plans": collections.defaultdict(list),
+          "rollup_seen": False}
     for base, t, (kind, payload) in tick_sources(log_dir, start):
         if kind == "bad_archive":
             st["bad_archives"] += 1
@@ -145,6 +146,13 @@ def load_ticks(log_dir, start, end):
         st["live_files" if kind == "live" else "archive_files"] += 1
         st["ticks_per_day"][t.strftime("%Y-%m-%d")] += 1
         for r in repos:
+            plan = r.get("rollup")
+            if isinstance(plan, dict):
+                st["rollup_seen"] = True
+                if plan.get("action") in ROLLUP_PLANNED:
+                    members = [(m.get("pr"), m.get("head")) for m in plan.get("members") or []]
+                    if len(members) >= 2:
+                        st["rollup_plans"][r["repo"]].append((t, members))
             if "prs" not in r or r.get("errors"):
                 st["no_pr_list"] += 1
                 per_repo[r["repo"]].append((t, None))  # invalid tick: a gap, never a clear
@@ -164,6 +172,38 @@ def load_ticks(log_dir, start, end):
     for v in per_repo.values():
         v.sort(key=lambda x: x[0])
     return per_repo, st
+
+
+# Steward rollup plans (`repos[].rollup.action`) that name a batch.
+ROLLUP_PLANNED = ("shadow", "apply_unavailable")
+
+
+def rollup_counterfactual(plans):
+    """Per repo, per UTC day: the PRs the steward's rollup plans would have
+    batched, into how many rollups, and the CI runs that saves.
+
+    Consecutive ticks repeat a plan, so each pr@head counts once, in the first
+    plan (in tick order) that names it. A plan forms a rollup only when it
+    brings at least two members no earlier plan took; a lone newcomer would
+    have landed on its own. Each rollup of n members costs one CI run instead
+    of n, so the saving is prs - rollups. An estimate: it assumes every rollup
+    would have passed its one run."""
+    out = {}
+    for repo, items in plans.items():
+        taken = set()
+        days = {}
+        for t, members in sorted(items, key=lambda x: x[0]):
+            new = [m for m in members if m not in taken]
+            if len(new) < 2:
+                continue
+            taken.update(new)
+            day = days.setdefault(t.strftime("%Y-%m-%d"), {"prs": 0, "rollups": 0})
+            day["prs"] += len(new)
+            day["rollups"] += 1
+        for day in days.values():
+            day["ci_runs_saved"] = day["prs"] - day["rollups"]
+        out[repo] = dict(sorted(days.items()))
+    return out
 
 
 READ_ERROR_RE = re.compile(r"HTTP 50\d|timed out|unreadable|cannot read|read failed")
@@ -436,6 +476,11 @@ def build_report(log_dir, since, now, github=None, gap_minutes=120):
                             "default": cov("available", "null on a UTC day with no tick files; a day is the UTC day an episode was first seen")},
         "by_repo_token": table,
     }
+    report["rollup_counterfactual"] = {
+        "coverage": cov("partial", "an estimate from the steward's shadow plans: each rollup assumed to pass its one run")
+        if st["rollup_seen"] else cov("unavailable", "no tick in the window carries a rollup plan"),
+        "per_repo_per_day": rollup_counterfactual(st["rollup_plans"]) if st["rollup_seen"] else None,
+    }
     pc_cov, pc_pages, pc_sup = page_counts(log_dir, days)
     report["pages"] = {"coverage": pc_cov, "per_day_by_class": pc_pages, "suppressed_per_day_by_reason": pc_sup}
     return report
@@ -467,6 +512,16 @@ def markdown(r):
             out.append(f"- {day}: " + ", ".join(f"{k} {n}" for k, n in sorted(kinds.items())))
         for day, why in sorted((pg.get("suppressed_per_day_by_reason") or {}).items()):
             out.append(f"- {day} suppressed: " + ", ".join(f"{k} {n}" for k, n in sorted(why.items())))
+    rc = r.get("rollup_counterfactual") or {}
+    out += ["", "## Rollup counterfactual", ""]
+    if rc.get("per_repo_per_day") is None:
+        out.append("unavailable: " + rc.get("coverage", {}).get("reason", ""))
+    else:
+        out.append(rc["coverage"]["reason"] + ".")
+        for repo, days in sorted(rc["per_repo_per_day"].items()):
+            for day, n in days.items():
+                out.append(f"- {repo} {day}: would have batched {n['prs']} PRs into {n['rollups']} rollups, "
+                           f"saving ~{n['ci_runs_saved']} CI runs")
     out += ["", "Unavailable: CI compute per episode, owner stops answered, dispute outcomes. Elapsed time is context only."]
     return "\n".join(out) + "\n"
 
