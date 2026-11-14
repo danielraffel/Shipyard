@@ -328,6 +328,23 @@ fn ejected(head: &str, count: usize) -> Value {
     json!({"data": {"repository": {"pullRequest": {"timelineItems": {"nodes": nodes}}}}})
 }
 
+fn unattributed_ejected(head: &str, count: usize) -> Value {
+    let nodes = (0..count)
+        .map(|index| {
+            json!({
+                "__typename": "RemovedFromMergeQueueEvent",
+                "createdAt": format!("2026-11-04T0{index}:30:00Z"),
+                "reason": "merge_conflict",
+                "beforeCommit": null,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({"data": {"repository": {"pullRequest": {
+        "headRefOid": head,
+        "timelineItems": {"nodes": nodes}
+    }}}})
+}
+
 fn gate_with_queue(queue: &Value, latest_was_interruption: bool) -> HeadGate {
     let calls = RefCell::new(Vec::new());
     let runs = [run(10)];
@@ -382,6 +399,24 @@ fn an_interruption_excuses_the_newest_removal_in_guard_mode_too() {
     let cap = crate::head_approval::EJECTION_CAP;
     assert!(gate_with_queue(&ejected(HEAD, cap), true).allows());
     assert!(!gate_with_queue(&ejected(HEAD, cap + 1), true).allows());
+}
+
+#[test]
+fn a_force_pushed_new_head_clears_historical_unattributed_removals() {
+    let queue = {
+        let mut queue = unattributed_ejected(HEAD, crate::head_approval::EJECTION_CAP);
+        queue["data"]["repository"]["pullRequest"]["timelineItems"]["nodes"]
+            .as_array_mut()
+            .expect("nodes")
+            .push(json!({
+                "__typename": "HeadRefForcePushedEvent",
+                "createdAt": "2026-11-04T02:30:00Z",
+                "afterCommit": {"oid": HEAD},
+            }));
+        queue
+    };
+    let gate = gate_with_queue(&queue, false);
+    assert!(gate.allows(), "{gate:?}");
 }
 
 /// A fake GitHub for a comment-mode base: `config` and `comments` answer as

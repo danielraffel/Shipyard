@@ -689,13 +689,11 @@ fn commit(head: &str, suite: Option<&str>) -> Value {
            "commit": {"oid": head, "checkSuites": {"nodes": suites}}})
 }
 
-/// An unattributable removal is charged to every head: no timeline fact
-/// proves when the head reached GitHub. A check suite created after the
-/// removal (suite creation can lag the push), a commit sorted after it (GitHub
-/// orders by author date), and a force-push (it shows a re-push, not the first
-/// arrival) each leave the removal charged, in a complete window or not.
+/// An unattributable removal remains charged without authoritative push
+/// evidence. Check-suite creation and commit timeline order are not push
+/// evidence; a server-timestamped force-push of the current head is.
 #[test]
-fn an_unattributable_removal_is_charged_whatever_suite_or_push_evidence_follows() {
+fn an_unattributable_removal_requires_authoritative_push_evidence_to_clear() {
     let removals = || {
         vec![
             conflict_removal("2026-10-04T01:00:00Z"),
@@ -713,16 +711,11 @@ fn an_unattributable_removal_is_charged_whatever_suite_or_push_evidence_follows(
         queue["data"]["repository"]["pullRequest"]["timelineItems"]["pageInfo"] = page_info;
         queue
     };
-    let cases = [
-        // A suite created after the removals, in a complete window.
+    for queue in [
+        // A suite created after the removals can lag the push.
         suite_after.clone(),
-        with(vec![
-            commit(HEAD, Some("2026-10-04T03:00:00Z")),
-            force_push("2026-10-04T03:00:01Z", HEAD),
-        ]),
-        // A force-push after the removals alone.
-        with(vec![force_push("2026-10-04T03:00:00Z", HEAD)]),
-        // A normal push with no suite, then force-pushed away and back.
+        // A normal push with no suite, then force-pushed away and back: the
+        // commit timeline is still not authoritative by itself.
         {
             let mut nodes = vec![commit(HEAD, None)];
             nodes.extend(removals());
@@ -730,10 +723,6 @@ fn an_unattributable_removal_is_charged_whatever_suite_or_push_evidence_follows(
             nodes.push(force_push("2026-10-04T03:00:00Z", HEAD));
             timeline(HEAD, nodes)
         },
-        // Sorted after the removals but no suite; null suites.
-        with(vec![commit(HEAD, None)]),
-        with(vec![json!({"__typename": "PullRequestCommit",
-                         "commit": {"oid": HEAD, "checkSuites": null}})]),
         // Pushed before the removals, with a later suite on its commit.
         {
             let mut nodes = vec![force_push("2026-10-04T00:30:00Z", HEAD)];
@@ -746,15 +735,28 @@ fn an_unattributable_removal_is_charged_whatever_suite_or_push_evidence_follows(
         with_window(&suite_after, Value::Null),
         // A later head's arrival says nothing about this one.
         with(vec![commit(OTHER, Some("2026-10-04T03:00:00Z"))]),
-    ];
-    for queue in cases {
+    ] {
         assert_eq!(head_ejections(&queue, HEAD).len(), 2, "{queue}");
     }
+    // A server-timestamped force-push after the removals proves that both
+    // removals predate the current head and must not cap it.
+    let queue = with(vec![force_push("2026-10-04T03:00:00Z", HEAD)]);
+    assert!(head_ejections(&queue, HEAD).is_empty());
+    // A later commit with no suite is the ordinary timeline push evidence.
+    assert!(head_ejections(&with(vec![commit(HEAD, None)]), HEAD).is_empty());
+    assert!(
+        head_ejections(
+            &with(vec![json!({"__typename": "PullRequestCommit",
+                         "commit": {"oid": HEAD, "checkSuites": null}})]),
+            HEAD
+        )
+        .is_empty()
+    );
 }
 
 /// pulp#9653, captured live: a `merge_conflict` removal (no `beforeCommit`),
-/// then head `99403d83` whose earliest check suite follows the removal. The
-/// suite time is not authoritative push evidence, so the removal is charged.
+/// then head `99403d83` whose commit sorts before the removal. Without a
+/// server-timestamped force-push in the captured window, the removal is charged.
 #[test]
 fn the_real_9653_capture_charges_a_conflict_removal_to_the_later_head() {
     let queue = real_capture("pr_real_9653_merge_conflict_backdated_push.json");

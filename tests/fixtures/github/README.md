@@ -67,6 +67,11 @@ A disagreement between them fails one of the two test suites.
 
 ## Source query
 
+The `pr_real_9653_merge_conflict_backdated_push.json` capture predates the
+current fail-closed rule: its check-suite timestamp is not treated as push
+evidence, so the unattributed removal remains charged until a later timeline
+push item identifies the current head.
+
 The `pr_*.json` files are shaped by this GraphQL query (variables
 `owner`, `name`, `number`). Re-running it against PR 8721 on the capture date
 reproduced `pr_merged.json` byte-for-byte apart from `pageInfo`, which the
