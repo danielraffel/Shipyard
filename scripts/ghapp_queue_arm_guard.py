@@ -507,24 +507,29 @@ def _same_head_re_add(
 
 
 def _new_head_since(
-    nodes: list[Any], index: int, removed: str | None, head: str | None
+    nodes: list[Any],
+    index: int,
+    removed: str | None,
+    head: str | None,
+    timeline_complete: bool | None,
 ) -> tuple[bool, str]:
     """Whether ``head`` differs from the head removed at ``index``, and on what basis.
 
     By SHA when the removal names its head. Otherwise only a later
     server-timestamped ``HeadRefForcePushedEvent`` whose oid is ``head`` is
-    accepted. Commit timeline order and check-suite creation time are not push
-    evidence. With no authoritative push event, no new head is assumed, so a
-    re-arm is refused. Mirrors ``new_head_since`` in ``src/pr_queue_state.rs``.
+    accepted, only when no earlier one names ``head`` and the window is
+    complete (``timeline_complete is True``): in a truncated or unmeasured
+    window an earlier push of ``head`` may be on an unread page. Commit
+    timeline order and check-suite creation time are not push evidence. With
+    no authoritative push event, no new head is assumed, so a re-arm is
+    refused. Mirrors ``new_head_since`` in ``src/pr_queue_state.rs``.
     """
     if head is None:
         return False, "no_evidence"
     if removed is not None:
         return removed.lower() != head.lower(), "removed_head_sha"
-    for node in nodes[index + 1 :]:
-        oid = _authoritative_push_oid(node)
-        if oid and oid.lower() == head.lower():
-            return True, "push_after_removal"
+    if timeline_complete is True and _push_after_removal(nodes, index, head):
+        return True, "push_after_removal"
     return False, "no_evidence"
 
 
@@ -660,7 +665,9 @@ def classify_pr_queue_state(response: Any) -> dict[str, Any]:
     if last_removal is not None and last_removal[1].lower() != "merged":
         index, reason, at = last_removal
         removed = removed_heads[index]
-        new_head_since, basis = _new_head_since(nodes, index, removed, head)
+        new_head_since, basis = _new_head_since(
+            nodes, index, removed, head, timeline_complete
+        )
         last_ejection = {
             "reason": reason,
             "at": at,

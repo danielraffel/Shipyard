@@ -1210,7 +1210,8 @@ merge-group commit). Commit dates and timeline position are not consulted,
 because GitHub sorts a fix committed before an ejection but pushed after it
 *before* the removal. A removal that names no head (`merge_conflict`) falls back
 to server-timestamped push-time evidence: a `HeadRefForcePushedEvent` for the
-current head after the removal. `PullRequestCommit` timeline order is
+current head after the removal, none before it, and a complete timeline window
+(`hasPreviousPage: false`). `PullRequestCommit` timeline order is
 author-controlled and check-suite
 creation can lag the push, so neither is arrival proof. A head with no
 authoritative event is treated as unchanged by both guards. If a live push is

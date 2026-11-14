@@ -524,11 +524,18 @@ fn same_head_re_add(
 }
 
 /// Whether `head` is a new head since the removal at `index`, and on what basis.
+///
+/// A removal that names no head credits a later push only under the same rule
+/// as [`removal_charges_head`]: a later `HeadRefForcePushedEvent` of `head`, no
+/// earlier one, and a complete window (`timeline_complete == Some(true)`). In
+/// a truncated or unmeasured window an earlier push of `head` may be on an
+/// unread page, so there is no credit and the re-arm or requeue fails closed.
 fn new_head_since(
     nodes: &[Value],
     index: usize,
     removed: Option<&str>,
     head: Option<&str>,
+    timeline_complete: Option<bool>,
 ) -> (bool, NewHeadBasis) {
     let Some(head) = head else {
         return (false, NewHeadBasis::NoEvidence);
@@ -539,12 +546,7 @@ fn new_head_since(
             NewHeadBasis::RemovedHeadSha,
         );
     }
-    if nodes
-        .iter()
-        .skip(index + 1)
-        .filter_map(authoritative_push_oid)
-        .any(|oid| oid.eq_ignore_ascii_case(head))
-    {
+    if timeline_complete == Some(true) && push_after_removal(nodes, index, head) {
         return (true, NewHeadBasis::PushAfterRemoval);
     }
     (false, NewHeadBasis::NoEvidence)
@@ -732,8 +734,13 @@ pub fn explain_pr_queue_state(response: &Value) -> PrQueueReport {
         .filter(|(_, reason, _)| !reason.eq_ignore_ascii_case("merged"))
         .map(|(index, reason, at)| {
             let removed_head = removed_heads[index].clone();
-            let (new_head_since, new_head_basis) =
-                new_head_since(nodes, index, removed_head.as_deref(), head_oid.as_deref());
+            let (new_head_since, new_head_basis) = new_head_since(
+                nodes,
+                index,
+                removed_head.as_deref(),
+                head_oid.as_deref(),
+                timeline_complete,
+            );
             Ejection {
                 new_head_since,
                 removed_head,
@@ -1245,6 +1252,17 @@ mod tests {
                 "__typename": "HeadRefForcePushedEvent",
                 "afterCommit": {"oid": PUSHED_HEAD},
             }));
+        // This fixture carries no pageInfo, so an earlier push of the head may
+        // be unread and the later push is no proof yet.
+        assert!(matches!(
+            classify_pr_queue_state(&value),
+            PrQueueState::Ejected {
+                new_head_since_removal: false,
+                ..
+            }
+        ));
+        value["data"]["repository"]["pullRequest"]["timelineItems"]["pageInfo"] =
+            serde_json::json!({"hasPreviousPage": false});
         assert!(matches!(
             classify_pr_queue_state(&value),
             PrQueueState::Ejected {
@@ -1614,5 +1632,62 @@ mod tests {
             let report = explain_pr_queue_state(&response(page_info.clone()));
             assert_eq!(report.ejections_of_current_head, 1, "{page_info}");
         }
+    }
+
+    /// The last removal names no head, so a new head needs a later push of
+    /// it, no earlier one, and a complete window; otherwise the classifier
+    /// reports no new head and a re-arm or requeue is refused.
+    #[test]
+    fn a_later_push_is_a_new_head_only_in_a_complete_window() {
+        let head = "1111111111111111111111111111111111111111";
+        let other = "2222222222222222222222222222222222222222";
+        let push = |at: &str, oid: &str| {
+            serde_json::json!({"__typename":"HeadRefForcePushedEvent","createdAt":at,
+                               "afterCommit":{"oid":oid}})
+        };
+        let response = |page_info: Value, earlier_push: bool| {
+            let mut nodes = Vec::new();
+            if earlier_push {
+                nodes.push(push("2026-10-04T00:30:00Z", head));
+            }
+            nodes.push(
+                serde_json::json!({"__typename":"RemovedFromMergeQueueEvent",
+                "createdAt":"2026-10-04T01:00:00Z","reason":"merge_conflict","beforeCommit":null}),
+            );
+            nodes.push(push("2026-10-04T02:00:00Z", other));
+            nodes.push(push("2026-10-04T03:00:00Z", head));
+            serde_json::json!({"data":{"repository":{"pullRequest":{
+                "number":1,"state":"OPEN","headRefOid":head,"isInMergeQueue":false,
+                "mergeQueueEntry":null,"autoMergeRequest":null,
+                "timelineItems":{"pageInfo":page_info,"nodes":nodes}}}}})
+        };
+        let ejection = |value: &Value| {
+            explain_pr_queue_state(value)
+                .last_ejection
+                .expect("ejection")
+        };
+        let complete = ejection(&response(
+            serde_json::json!({"hasPreviousPage": false}),
+            false,
+        ));
+        assert!(complete.new_head_since);
+        assert_eq!(complete.new_head_basis, NewHeadBasis::PushAfterRemoval);
+        for page_info in [
+            serde_json::json!({"hasPreviousPage": true}),
+            serde_json::json!({}),
+            Value::Null,
+        ] {
+            let truncated = ejection(&response(page_info.clone(), false));
+            assert!(!truncated.new_head_since, "{page_info}");
+            assert_eq!(truncated.new_head_basis, NewHeadBasis::NoEvidence);
+        }
+        // A force-push back to a head already pushed before the removal is
+        // not a new arrival, even in a complete window.
+        let back = ejection(&response(
+            serde_json::json!({"hasPreviousPage": false}),
+            true,
+        ));
+        assert!(!back.new_head_since);
+        assert_eq!(back.new_head_basis, NewHeadBasis::NoEvidence);
     }
 }

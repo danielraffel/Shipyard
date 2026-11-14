@@ -181,11 +181,14 @@ class ClassifierAgreesWithSharedCorpus(unittest.TestCase):
         # A force-push that names no commit is not evidence of a new head.
         pr["timelineItems"]["nodes"].append({"__typename": "HeadRefForcePushedEvent"})
         self.assertFalse(guard.classify_pr_queue_state(response)["new_head_since_removal"])
-        # One that put the current head on the branch is.
+        # One that put the current head on the branch is, once the window is
+        # known to be complete (this fixture carries no pageInfo).
         pr["headRefOid"] = PUSHED_HEAD
         pr["timelineItems"]["nodes"].append(
             {"__typename": "HeadRefForcePushedEvent", "afterCommit": {"oid": PUSHED_HEAD}}
         )
+        self.assertFalse(guard.classify_pr_queue_state(response)["new_head_since_removal"])
+        pr["timelineItems"]["pageInfo"] = {"hasPreviousPage": False}
         self.assertTrue(guard.classify_pr_queue_state(response)["new_head_since_removal"])
 
     def test_unreadable_is_unknown(self) -> None:
@@ -280,6 +283,49 @@ class UnattributedRemovalNeedsCompleteWindow(unittest.TestCase):
             with self.subTest(page_info=page_info):
                 got = guard.classify_pr_queue_state(self.response(page_info))
                 self.assertEqual(got["ejections_of_current_head"], 1)
+
+
+class PushAfterRemovalNeedsCompleteWindow(unittest.TestCase):
+    """Twin of the Rust ``a_later_push_is_a_new_head_only_in_a_complete_window``."""
+
+    HEAD = "1" * 40
+    OTHER = "2" * 40
+
+    def response(self, page_info: Any, earlier_push: bool = False) -> dict[str, Any]:
+        def push(at: str, oid: str) -> dict[str, Any]:
+            return {"__typename": "HeadRefForcePushedEvent", "createdAt": at,
+                    "afterCommit": {"oid": oid}}
+
+        nodes: list[Any] = [push("2026-10-04T00:30:00Z", self.HEAD)] if earlier_push else []
+        nodes += [
+            {"__typename": "RemovedFromMergeQueueEvent", "createdAt": "2026-10-04T01:00:00Z",
+             "reason": "merge_conflict", "beforeCommit": None},
+            push("2026-10-04T02:00:00Z", self.OTHER),
+            push("2026-10-04T03:00:00Z", self.HEAD),
+        ]
+        return {"data": {"repository": {"pullRequest": {
+            "number": 1, "state": "OPEN", "headRefOid": self.HEAD,
+            "isInMergeQueue": False, "mergeQueueEntry": None, "autoMergeRequest": None,
+            "timelineItems": {"pageInfo": page_info, "nodes": nodes},
+        }}}}
+
+    def test_a_later_push_is_a_new_head_only_in_a_complete_window(self) -> None:
+        got = guard.classify_pr_queue_state(self.response({"hasPreviousPage": False}))
+        self.assertIs(got["new_head_since_removal"], True)
+        self.assertEqual(got["last_ejection"]["new_head_basis"], "push_after_removal")
+        for page_info in ({"hasPreviousPage": True}, {}, None):
+            with self.subTest(page_info=page_info):
+                got = guard.classify_pr_queue_state(self.response(page_info))
+                self.assertIs(got["new_head_since_removal"], False)
+                self.assertEqual(got["last_ejection"]["new_head_basis"], "no_evidence")
+                self.assertFalse(guard.decide(got)[0])
+
+    def test_a_push_back_to_an_earlier_head_is_not_new(self) -> None:
+        got = guard.classify_pr_queue_state(
+            self.response({"hasPreviousPage": False}, earlier_push=True)
+        )
+        self.assertIs(got["new_head_since_removal"], False)
+        self.assertFalse(guard.decide(got)[0])
 
 
 class NewHeadIsDecidedBySha(unittest.TestCase):
@@ -555,6 +601,7 @@ class QueueArmGuardTests(unittest.TestCase):
         pr["isInMergeQueue"] = False
         pr["mergeQueueEntry"] = None
         pr["headRefOid"] = "f" * 40
+        pr["timelineItems"]["pageInfo"] = {"hasPreviousPage": False}
         pr["timelineItems"]["nodes"][-1] = {
             "__typename": "HeadRefForcePushedEvent",
             "createdAt": "2026-09-22T21:00:00Z",

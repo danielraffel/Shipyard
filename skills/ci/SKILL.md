@@ -2998,7 +2998,7 @@ even by a fresh ship-state for the same SHA, so re-shipping from another host
 does not re-enqueue it. Push a fix. For a `merge_conflict` ejection, a fix that
 was committed before it but pushed after it counts as new only when a
 server-timestamped `HeadRefForcePushedEvent` for the current head follows the
-removal. Commit timeline order and check-suite creation are not push evidence.
+removal, none precedes it, and the timeline window is complete. Commit timeline order and check-suite creation are not push evidence.
 
 ### "Validated green but not merged" — read the status before blaming the PR
 

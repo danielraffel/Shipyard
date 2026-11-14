@@ -4465,7 +4465,8 @@ or removed from the queue with no new head since. "New head" is decided by SHA
 GitHub sorts a fix committed before an ejection but pushed after it *before* the
 removal. Only a removal that names no head (`merge_conflict`) falls back to
 server-timestamped push time: a later `HeadRefForcePushedEvent` for the current
-head after the removal. `PullRequestCommit` timeline order is author-controlled,
+head after the removal, none before it, in a complete timeline window
+(`hasPreviousPage: false`). `PullRequestCommit` timeline order is author-controlled,
 and check-suite creation is not push evidence because it can lag the push.
 Without that signal, it refuses. A same-head
 removal for `failed_checks`/`merge_conflict` is the ALLGREEN cascade (push a
