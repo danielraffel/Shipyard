@@ -1079,6 +1079,50 @@ fn awaiting_verdict_statuses_route_to_the_reviewer() {
 }
 
 #[test]
+fn legacy_awaiting_verdict_status_must_name_the_current_head() {
+    let policy = app_bound_policy(&["macos", "review-verdict"]);
+    for (description, expected) in [
+        (
+            "awaiting reviewer verdict for head bbbbbbbbbbbb",
+            "required_failed:review-verdict",
+        ),
+        (
+            "awaiting reviewer verdict for head aaaaaaaaaaaa",
+            "no_verdict",
+        ),
+    ] {
+        let mut pr = pr_with(
+            12038,
+            &[],
+            "CLEAN",
+            &json!([app_check(
+                "macos",
+                "COMPLETED",
+                Some("SUCCESS"),
+                "2026-11-11T11:20:00Z"
+            )]),
+        );
+        pr.fact.checks.push(review_status(Some(description)));
+        let decision = StewardDecision::RequiredFailed {
+            contexts: vec!["review-verdict (app_id=15368)".to_owned()],
+        };
+        let (blocked, _) = classify(
+            &RowFacts {
+                pr: &pr.fact,
+                decision: &decision,
+                mutation: None,
+                error: None,
+                approval: GateRead::Unread,
+                enqueued_at: None,
+                ejection: None,
+            },
+            &policy,
+        );
+        assert_eq!(blocked.blocked_on, expected, "{description}");
+    }
+}
+
+#[test]
 fn an_unreadable_review_verdict_description_keeps_the_failed_fallback() {
     let policy = app_bound_policy(&["macos", "review-verdict"]);
     let mut pr = pr_with(

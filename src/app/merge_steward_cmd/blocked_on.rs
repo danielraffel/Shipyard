@@ -728,16 +728,9 @@ fn unread_gate_from_status(
     )?
     .trim();
     let names_head = |rest: &str| {
-        let short = rest
-            .split(|c: char| !c.is_ascii_hexdigit())
-            .next()
-            .unwrap_or_default();
-        short.len() >= 7
-            && facts
-                .pr
-                .head_sha
-                .to_ascii_lowercase()
-                .starts_with(&short.to_ascii_lowercase())
+        let head = facts.pr.head_sha.to_ascii_lowercase();
+        rest.split(|c: char| !c.is_ascii_hexdigit())
+            .any(|short| short.len() >= 7 && head.starts_with(&short.to_ascii_lowercase()))
     };
     if let Some(rest) = description.strip_prefix(HOLD_STATUS_PREFIX) {
         if !names_head(rest) {
@@ -756,8 +749,11 @@ fn unread_gate_from_status(
         if !names_head(rest) {
             return None;
         }
-    } else if !description.starts_with(AWAITING_STATUS_PREFIX) {
-        return None;
+    } else {
+        let rest = description.strip_prefix(AWAITING_STATUS_PREFIX)?;
+        if !names_head(rest) {
+            return None;
+        }
     }
     Some(dated(
         "no_verdict".to_owned(),
