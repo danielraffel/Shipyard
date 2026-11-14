@@ -425,13 +425,20 @@ fn signer_config(
 }
 
 fn admission(facts: &Facts<'_>) -> Invariant {
-    use crate::head_approval::REQUIRED_KEY;
+    use crate::head_approval::{FLEET_REVIEW_REQUIRED_KEY, REQUIRED_KEY};
     let context = facts.approval_context;
     let auto = auto_merge_table(facts.base_config);
     let arm_requires = auto
         .and_then(|table| table.get(REQUIRED_KEY))
         .and_then(toml::Value::as_bool);
-    let listed = crate::head_approval::requires_review_by_default(facts.repo);
+    // The base's `fleet_review_required = true` has the semantics of list
+    // membership (see `ApprovalPolicy::from_table_for_repo`), and overrides an
+    // explicit `arm_requires_head_approval = false` there too.
+    let fleet_required = auto
+        .and_then(|table| table.get(FLEET_REVIEW_REQUIRED_KEY))
+        .and_then(toml::Value::as_bool)
+        == Some(true);
+    let listed = crate::head_approval::requires_review_by_default(facts.repo) || fleet_required;
     let ruleset_requires = facts
         .required
         .iter()
@@ -474,13 +481,15 @@ fn admission(facts: &Facts<'_>) -> Invariant {
                 .is_some_and(|error| error.contains(APPROVAL_NOT_REQUIRED))
         })
         .collect();
-    let rule_off =
-        ruleset_requires && (arm_requires == Some(false) || (arm_requires.is_none() && !listed));
+    let rule_off = ruleset_requires
+        && !fleet_required
+        && (arm_requires == Some(false) || (arm_requires.is_none() && !listed));
     if rule_off || !uncounted.is_empty() {
         problems.push(format!(
             "the {base} ruleset requires `{context}` but the approval rule does not apply to \
-             {repo} (not in REVIEW_REQUIRED_REPOS, and [auto_merge] {REQUIRED_KEY} is not true), \
-             so exact-head approvals are never counted{on}",
+             {repo} (not in REVIEW_REQUIRED_REPOS, and neither [auto_merge] \
+             {FLEET_REVIEW_REQUIRED_KEY} nor {REQUIRED_KEY} is true), so exact-head approvals \
+             are never counted{on}",
             base = facts.base,
             repo = facts.repo,
             on = if uncounted.is_empty() {
@@ -490,7 +499,9 @@ fn admission(facts: &Facts<'_>) -> Invariant {
             }
         ));
         fixes.push(format!(
-            "set [auto_merge] {REQUIRED_KEY} = true in .shipyard/config.toml on {base}, or add \
+            "set [auto_merge] {FLEET_REVIEW_REQUIRED_KEY} = true in .shipyard/config.toml on \
+             {base} (fleet App approvals then count, as for REVIEW_REQUIRED_REPOS; \
+             {REQUIRED_KEY} = true is the different, strict reviewer_identities rule), or add \
              {repo} to REVIEW_REQUIRED_REPOS (src/head_approval.rs and \
              scripts/ghapp_queue_arm_guard.py)",
             base = facts.base,

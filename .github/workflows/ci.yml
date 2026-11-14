@@ -127,17 +127,22 @@ jobs:
           # The CLI dispatch enum is sized for the executable's normal stack.
           # Rust test-harness worker threads default smaller on Linux/Windows.
           RUST_MIN_STACK: 8388608
-        run: cargo test --all-targets --locked --features ci-test-home
+        # Self-hosted Macs are shared gate hosts: cap parallelism there
+        # (scripts/ci-capped-run.sh). Unchanged elsewhere.
+        shell: bash
+        run: scripts/ci-capped-run.sh cargo test --all-targets --locked --features ci-test-home
 
       - name: Run experimental authority refusal tests
         if: runner.os == 'Linux'
         env:
           SHIPYARD_TEST_HOME: ${{ runner.temp }}
           RUST_MIN_STACK: 8388608
-        run: cargo test --all-targets --locked --features ci-test-home,experimental-authority-v5
+        shell: bash
+        run: scripts/ci-capped-run.sh cargo test --all-targets --locked --features ci-test-home,experimental-authority-v5
 
       - name: Run clippy
-        run: cargo clippy --all-targets --locked -- -D warnings
+        shell: bash
+        run: scripts/ci-capped-run.sh cargo clippy --all-targets --locked -- -D warnings
 
   coverage:
     needs: resolve-runners

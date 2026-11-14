@@ -376,6 +376,15 @@ pub(super) fn evaluate_head_gate_with(
         head,
     );
     let queue = &super::unapproved_admission::without_steward_removals(queue, head, &recorded);
+    // Ejections the red base caused do not count once the base is green.
+    let queue = &super::red_base_ejections::excused_queue(
+        ledger,
+        &observation.repo,
+        &observation.base,
+        pr.fact.number,
+        head,
+        queue,
+    );
     crate::head_approval::evaluate_with_policy_for_author_with_diagnosis(
         run_gh,
         &observation.repo,

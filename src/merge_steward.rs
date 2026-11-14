@@ -15,6 +15,7 @@ pub mod dwell;
 pub mod ejection_guards;
 pub mod flake_requeue;
 pub mod next_admit;
+pub mod stale_merge_ref;
 pub use ejection_guards::EjectionGuards;
 
 /// One current-head check observed on a pull request.

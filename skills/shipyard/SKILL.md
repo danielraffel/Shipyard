@@ -65,6 +65,41 @@ in the same pass, so a pass with no admission candidate holds stacked entries
 (`stack_listing: not_read_this_pass`) rather than reading GitHub again. Full
 reference: `docs/automated-draining.md`, "Dwell-time limits".
 
+## Routine release-movement acts: `shipyard advance`
+
+Do not ask the owner, and do not hand-type `ghapp` writes, to release a hold
+or retrigger a stale merge ref. `shipyard advance OWNER/REPO#N
+--release-hold [--decision REF]` removes `shipyard:no-auto-merge` only when
+every required check is green at the exact head, the steward's own gate
+counts an exact-head APPROVE (a review on that commit, or a `ghapp`-stamped
+verdict), and every `hold-condition:` line in the comment that added the
+label is met (`merged OWNER/REPO#N`, `after <RFC 3339>`, `approved`,
+`green`), or `--decision` names a `DECISIONS*` file that names the pull
+request. `--retrigger --reason "..."` closes and reopens only an open pull
+request that is not queued or armed, has no live `repair-claim:`, and whose
+required runs reported at the exact head with none still running. Both
+refuse a pull request the caller authored or approved, read everything again
+before writing, exit 1 naming the failed condition (2 when a fact is
+unreadable), and post one audit comment plus one `advance.jsonl` line per
+act. `--dry-run` changes nothing. When writing a hold, name its conditions
+as `hold-condition:` lines so it can be released this way. Gotcha:
+`pr-close-guard` refuses every retrigger until the guard change proposed in
+`docs/advance.md` lands; the refusal changes nothing. Defect dequeues keep
+their own path. Full reference: `docs/advance.md`.
+
+## Stale merge refs: `stale_merge_ref`
+
+An approved pull request whose required checks went red on a test merge
+commit that no longer exists reads `stale_merge_ref:<contexts>` (actor
+`steward`): each red run is a `pull_request` run of the head whose tested base
+is not the base of the current `merge_commit_sha`, and the same contexts are
+green on the base tip. A red on the current merge ref never reads it, however
+old; BEHIND and DIRTY never do. Do not push to "refresh" it and do not close
+and reopen it by hand: the dwell pass runs `shipyard advance --retrigger` for
+it, at most once per head ever. An act outcome `retrigger_blocked: guard`
+means pr-close-guard refused the close and nothing changed. Full reference:
+`docs/automated-draining.md`, "Stale merge refs".
+
 ## Durable work-item contract
 
 Shipyard's existing ShipState/lease/receipt primitives are the source of
@@ -5548,6 +5583,34 @@ launch is speculative, and a busy host can defer it indefinitely (`runs = 0`,
 `pended nondemand spawn = speculative`), which the probe wait would otherwise
 misreport as an unanswered privacy prompt.
 
+The daemon launcher covers only the daemon, and it is a bare binary, so its
+grant is tied to its path. `ShipyardLauncher.app` (`tools/shipyard-launcher`,
+`src/launcher_app.rs`) is one bundle identity (`com.danielraffel.shipyard.launcher`
+plus the Developer ID team) for every Shipyard launchd job, which survives
+rebuilds. It verifies the release `~/.local/bin/shipyard` resolves to
+(Developer ID, its own team, identifier `shipyard`; checked again on the
+suspended child) and spawns it, never execs it. Routing is gated on the
+launcher's own `--launcher-active` verdict, never on the activation file: the
+record (written by `shipyard-launcher-check --activate`, which fleet-deploy
+runs once the owner granted Full Disk Access) must name this exact bundle
+(path, identifier, team, cdhash), and the grant must be confirmed within an
+hour or reconfirmed without a prompt; a revoked grant demotes the record.
+While active: a launchd job whose program is the release binary (parent 1,
+`XPC_SERVICE_NAME` set, same file as the pointer) `exec`s the bundle with the
+same argv at startup (the check is bounded at 45 s, and a failed `exec` falls
+back to running directly), and the installed steward tick `exec`s `shipyard-launcher --launcher-script
+steward-tick`. `exec` *into* the bundle is what moves the identity: the pid
+stays the job's responsible process and now runs the bundle. When the
+launcher is missing or not active, everything runs directly as before, so an
+ungranted launcher never prompts.
+Routing decisions go to `~/Library/Logs/shipyard-launcher.log` and the tick's
+`launcher=app|direct` summary token. The daemon and its supervisor are never
+routed: the daemon agent keeps its stable launcher copy as its program, so a
+missing or refusing launcher can never keep a KeepAlive restart down. The
+team is pinned (`95CX6P84C4`) in both the launcher and the check tool, never
+read from `~/.local/bin/shipyard`; fleet-deploy refuses to install or
+activate a bundle older (CFBundleVersion) than the highest it installed.
+
 A launcher host changes the daemon's parent: it is the resident launcher, not
 launchd (1). Any check that the production daemon "is still launchd-owned"
 must accept both shapes and nothing else. The Sandbox E2E M3 invariant does
@@ -5953,6 +6016,33 @@ detector, then text, lowest number on a tie; a PR that rode a failing group is
 never chosen), its CI is prioritized only while a non-approval required check
 has not completed, and a dry-run hold never jumps. `base-health --act` is the
 manual path; leave `auto_jump` driving the steward alone so one writer jumps.
+`src/app/merge_steward_cmd/scheduling_loop.rs`: the loop contract
+(docs/scheduling-loop.md). `state_for` maps a row to one `LoopState` (precedence
+`merge_group_stalled` > `Queued` decision or `queued`/`admitted` > quarantined at
+the head > the `blocked_on` table; drafts, unowned and skip-labelled rows get
+none; unknown tokens are `tooling`). `classify` applies `TABLE` (start level,
+first actor, first deadline, then two more; L1 repair or adversary, L2
+`stronger_model`, L3 `coordinator`). `since` = earliest of the
+`loop_seen` record at the same state and head, the dwell entry at the head
+with the same token kind, the row's `since` (or `merge_group_enqueued_at`,
+or the quarantine line's `since=`), else now. Quarantine file: env
+`SHIPYARD_REVIEW_QUARANTINE` or machine-global `loop.review_quarantine_file`.
+No GitHub reads; `loop_seen` is kept only by applying passes.
+`src/app/merge_steward_cmd/ready_event.rs`: ready on event
+(docs/scheduling-loop.md, "Ready on event"). `runner steward-admit-ready
+--repo R --pr N --head SHA [--apply]`, or `shipyard relay` with
+`[relay] admit_ready = "apply"` when a verdict or green-check event finds the
+PR open, approved at its head, green and unqueued (`relay::pass::became_ready`;
+a shadow relay only reports), runs the tick's `mutate_pr_with_recovery` for
+that one PR: live gate, final revalidation, `expectedHeadOid`. `--apply` is for
+the steward host and its relay only: agents never run it, as they never arm or
+enqueue. Only fleet-list repos (`not_fleet_repo`); a ledger rate-limit cooldown
+or REST under 300 is `rate_limited` before any read; one attempt per head per
+60 s, at least 30 (`merge-steward.ready-events.json`); a report reads the live
+gate before `would_admit`. A moved head, a non-ready classification, a
+non-clear base poison, a paused entry or a pending cancellation is skipped; the ledger lock is tried, never waited on
+(`steward_busy`). The tick's own lock now waits up to 30 s
+(`acquire_ledger_lock_within`).
 `src/app/merge_steward_cmd/merge_group_stall.rs`: for each queue entry
 whose `merge_group_heads` sha has no active run in the census, three reads
 (`actions/runs?head_sha=`, `commits/<sha>/check-runs`, `commits/<sha>/statuses`;
@@ -6051,6 +6141,32 @@ label 0, detector 1, green head 2, text 3. The shadow ledger adds rule
 episode ends, and reports `fix_first_score`. `shipyard base-health --replay
 FILE` replays `ReplayEpisode` facts offline; the 2026-11-13 Vellum and Pulp
 episodes are fixtures under `tests/fixtures/base_health/`.
+
+Red-base triage acts (`BasePoisonPolicy.acts`, `TriageActs`: `reorder_fix`,
+`cancel_orphaned_groups`, `reenqueue_red_base_ejections`; each `off |
+dry-run | on`, default dry-run with a merge queue; a typo falls back to
+dry-run). Confirmation also accepts red everywhere
+(`fix_first::confirmed_since`: tip red, or a `red_everywhere` episode on the
+check that began strictly after the tip's newest verdict, which must be known;
+unread tip or no verdict never; a red tip without `red_since` reads
+`MAX_UTC`, never the episode start), so
+`base_poison::observe` now runs after `red_everywhere::observe` and takes
+`Pass::checks_first_seen`. `fix_reorder.rs`: queued fix at position > 1, in `covering`, on a pass
+with no `partial()`,
+`base_health_cmd::jump(.., Some(census head))` under the PR mutation guard,
+`JumpDecision` per episode (`<context>@<red_since>`) in
+`base-health/fix-reorders.jsonl`, failures retried. `orphan_groups.rs`:
+suspects = unfinished `merge_group` runs on `gh-readonly-queue/<base>/`
+whose head is no `merge_group_heads` value; `git/ref/heads/<branch>` read
+per suspect branch, only `HTTP 404` cancels (run mutation guard), receipts
+in `base-health/orphan-cancels.jsonl`. `red_base_ejections.rs`: ledger
+`red_base_ejections` (`repo@base`) records group PRs at their census head
+while confirmed (window from `red_since - 2h`), closes the window when
+`tip_green_for` or a passing group, on a pass with no `partial()` and no
+confirmed context, then `excused_queue` (called in
+`evaluate_head_gate_with` after `without_steward_removals`) drops the head's
+in-window `failed_checks` removals when the latest removal is one; dropped
+on re-enqueue, head move, close or 48 h.
 
 ### The endpoint that lies by omission
 
@@ -6258,6 +6374,15 @@ while the later PR's listed head is approved with no HOLD, or once the shared
 commits are on the base. A later PR whose head merely contains the earlier
 head gets no shortcut: ancestry cannot say which PR introduced a shared commit.
 
+## Release-readiness canary
+
+`[release.canary]` in a repo's `.shipyard/config.toml` opts it into a daily,
+read-only rehearsal of the next release (`shipyard release-canary run`): the
+configured `command` (`{next_version}` / `{next_tag}` placeholders) runs on a
+clean clone of `main`; a failure opens or edits one `release canary: vX.Y.Z
+would fail` issue and a later pass closes it. The steward tick runs it daily per
+fleet repo. Full config and exit codes are in the `ci` skill.
+
 ## Skill-sync gotcha
 
 Changes to Shipyard steward behavior must carry this note or a reviewed skill-sync exception so the version-and-skill gate records the operational impact.
@@ -6269,3 +6394,15 @@ note. Path matches are additive: the explicit `src/changelog.rs` and
 explicit paths mapped to another skill, such as the external-contributor
 review documents, remain governed by that mapping. `scripts/skill_path_map.json`
 is the map.
+
+### `governance onboard`
+
+`shipyard governance onboard --repo OWNER/NAME` prints a read-only plan:
+preflight, render hashes, bounded waits, observed rulesets and the per-PR
+review-verdict sweep. `--apply` is not implemented yet and refuses; the plan
+performs GET requests only and stops with exit 9 on any failed read. The
+protected base may enable `[auto_merge] fleet_review_required = true`, which
+requires review exactly as `REVIEW_REQUIRED_REPOS` membership does, in both
+the Rust policy and `ghapp_queue_arm_guard.py`; the compiled list remains a
+floor. The rendered onboarding PR is limited to the two review-verdict
+workflows and the named config keys.

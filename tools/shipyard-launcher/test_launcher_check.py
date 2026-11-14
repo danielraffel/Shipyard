@@ -1,6 +1,7 @@
 """Tests for shipyard-launcher-check with fake codesign, spctl and open."""
 
 import json
+import plistlib
 import os
 import pathlib
 import stat
@@ -52,7 +53,9 @@ echo '{"ok":true,"target":"/h/.local/share/shipyard/auth-generations/x/shipyard"
 """
 
 
-class LauncherCheckTests(unittest.TestCase):
+class CheckHarness(unittest.TestCase):
+    """A private home, fake tools, and the check tool in test mode."""
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.home = pathlib.Path(self.tmp.name)
@@ -67,6 +70,8 @@ class LauncherCheckTests(unittest.TestCase):
         self.record = self.home / ".local" / "share" / "shipyard" / "launcher" / "activation.json"
         self.env = dict(
             os.environ,
+            SHIPYARD_LAUNCHER_CHECK_TEST_MODE="1",
+            SHIPYARD_LAUNCHER_CHECK_TEAM="TEAM123456",
             SHIPYARD_LAUNCHER_CHECK_HOME=str(self.home),
             SHIPYARD_LAUNCHER_CHECK_CODESIGN=str(self.tools / "codesign"),
             SHIPYARD_LAUNCHER_CHECK_SPCTL=str(self.tools / "spctl"),
@@ -83,6 +88,14 @@ class LauncherCheckTests(unittest.TestCase):
         exe.parent.mkdir(parents=True)
         exe.write_text(FAKE_LAUNCHER)
         exe.chmod(0o755)
+        self.write_info(self.app, "1")
+
+    @staticmethod
+    def write_info(app, version):
+        info = {"CFBundleIdentifier": "com.danielraffel.shipyard.launcher", "CFBundleExecutable": "shipyard-launcher"}
+        if version is not None:
+            info["CFBundleVersion"] = version
+        (app / "Contents" / "Info.plist").write_bytes(plistlib.dumps(info))
 
     def flag(self, name):
         (self.tools / name).write_text("")
@@ -92,15 +105,18 @@ class LauncherCheckTests(unittest.TestCase):
         merged.update(env)
         return subprocess.run([sys.executable, str(CHECK), *args], env=merged, capture_output=True, text=True)
 
+
+
+class LauncherCheckTests(CheckHarness):
     def test_not_installed(self):
         result = self.check()
         self.assertEqual(result.returncode, 1)
         self.assertIn("FAIL bundle", result.stdout)
         self.assertIn("Install on a host", result.stdout)
 
-    def test_requirement_pins_developer_id_identifier_and_the_shipyard_team(self):
+    def test_requirement_pins_developer_id_identifier_and_the_pinned_team(self):
         self.install()
-        self.check("--json", FAKE_TEAM="ABCDE12345")
+        self.check("--json", SHIPYARD_LAUNCHER_CHECK_TEAM="ABCDE12345", FAKE_TEAM="ABCDE12345")
         requirement = (self.tools / "requirement").read_text()
         self.assertIn('identifier "com.danielraffel.shipyard.launcher"', requirement)
         self.assertIn("anchor apple generic", requirement)
@@ -135,6 +151,34 @@ class LauncherCheckTests(unittest.TestCase):
         self.assertFalse(self.record.exists())
         # A malformed team is refused.
         self.assertEqual(self.check("--verify-bundle", str(self.app), FAKE_TEAM="not set").returncode, 1)
+
+    def test_another_teams_bundle_is_refused_even_if_shipyard_is_theirs(self):
+        # The team is pinned; it is never read from ~/.local/bin/shipyard.
+        self.install()
+        result = self.check("--verify-bundle", str(self.app), FAKE_TEAM="EVILTEAM00")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("not the pinned team TEAM123456", result.stdout)
+
+    def test_bundle_version_must_be_an_integer(self):
+        self.install()
+        self.assertEqual(self.check("--bundle-version", str(self.app)).stdout.strip(), "1")
+        for bad in ("1.2", "", None):
+            with self.subTest(version=bad):
+                self.write_info(self.app, bad)
+                self.assertEqual(self.check("--bundle-version", str(self.app)).returncode, 1)
+                self.assertEqual(self.check("--verify-bundle", str(self.app)).returncode, 1)
+
+    def test_production_ignores_the_test_overrides(self):
+        # Without test mode the fakes, home and team are ignored: real codesign
+        # judges this unsigned bundle, and it fails.
+        self.install()
+        env = dict(self.env)
+        env.pop("SHIPYARD_LAUNCHER_CHECK_TEST_MODE")
+        result = subprocess.run([sys.executable, str(CHECK), "--verify-bundle", str(self.app)],
+                                env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("not the pinned team 95CX6P84C4", result.stdout)
+        self.assertFalse((self.tools / "requirement").exists(), "the fake codesign was not used")
 
     def test_a_hung_tool_fails(self):
         self.install()
@@ -206,6 +250,30 @@ class LauncherCheckTests(unittest.TestCase):
         self.assertFalse(report["activated"])
         self.assertTrue(report["activation"].startswith("bundle_replaced"))
 
+    def test_bind_script_records_only_the_installed_copy_of_source(self):
+        import hashlib
+        tick = self.home / ".local" / "libexec" / "shipyard-steward-tick.sh"
+        source = self.home / "main-tick.sh"
+        source.write_text("#!/bin/bash\necho tick\n")
+        self.assertIn("activate first", self.check("--bind-script", f"steward-tick={source}").stderr)
+        self.record.parent.mkdir(parents=True)
+        self.record.write_text(json.dumps({"schema": 2, "cdhash": "x"}))
+        tick.parent.mkdir(parents=True, exist_ok=True)
+        tick.write_text("#!/bin/bash\necho modified\n")
+        result = self.check("--bind-script", f"steward-tick={source}")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("differs", result.stderr)
+        self.assertNotIn("scripts", json.loads(self.record.read_text()))
+        tick.write_text(source.read_text())
+        result = self.check("--bind-script", f"steward-tick={source}")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        record = json.loads(self.record.read_text())
+        self.assertEqual(record["cdhash"], "x", "the rest of the record is kept")
+        self.assertEqual(record["scripts"]["steward-tick"], {
+            "path": str(tick), "sha256": hashlib.sha256(source.read_bytes()).hexdigest()})
+        self.assertEqual(stat.S_IMODE(self.record.stat().st_mode), 0o600)
+        self.assertEqual(self.check("--bind-script", f"other={source}").returncode, 1)
+
     def test_launch_services_unavailable_is_unknown(self):
         self.install()
         self.flag("open-fails")
@@ -218,3 +286,42 @@ class LauncherCheckTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+REAL_CODESIGN_WITH_TEAM = """#!/bin/bash
+# Real /usr/bin/codesign, except that -dv reports a team (ad-hoc has none).
+case "$1" in -dv|-dvvv) echo "TeamIdentifier=TEAM123456" >&2 ;; esac
+[ "$1" = -dv ] && exit 0
+exec /usr/bin/codesign "$@"
+"""
+
+
+@unittest.skipUnless(sys.platform == "darwin", "needs /usr/bin/codesign")
+class RealSignatureTests(CheckHarness):
+    """--verify-bundle against signatures real codesign evaluates."""
+
+    def setUp(self):
+        super().setUp()
+        (self.tools / "codesign").write_text(REAL_CODESIGN_WITH_TEAM)
+        self.install()
+        subprocess.run(["codesign", "--force", "-s", "-", "-i", "com.danielraffel.shipyard.launcher", str(self.app)],
+                       check=True, capture_output=True)
+
+    def verify(self, **env):
+        return self.check("--verify-bundle", str(self.app), **env)
+
+    def test_an_ad_hoc_bundle_fails_the_developer_id_team_requirement(self):
+        result = self.verify()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("signature does not satisfy the TEAM123456 Developer ID", result.stdout)
+
+    def test_a_resource_modified_after_signing_fails(self):
+        weak = {"SHIPYARD_LAUNCHER_CHECK_REQUIREMENT": 'identifier "com.danielraffel.shipyard.launcher"'}
+        self.assertEqual(self.verify(**weak).returncode, 0, self.verify(**weak).stdout)
+        resources = self.app / "Contents" / "Resources"
+        resources.mkdir(exist_ok=True)
+        (self.app / "Contents" / "Info.plist").write_bytes(
+            (self.app / "Contents" / "Info.plist").read_bytes().replace(b"shipyard-launcher<", b"shipyard-launcher <"))
+        result = self.verify(**weak)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("signature does not satisfy", result.stdout)

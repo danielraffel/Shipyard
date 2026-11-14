@@ -94,6 +94,11 @@ fn tip_red() -> TipReading {
 fn tip_green() -> TipReading {
     TipReading {
         sha: Some("f".repeat(40)),
+        newest_at: Some(
+            chrono::DateTime::parse_from_rfc3339("2026-11-13T11:17:55Z")
+                .expect("time")
+                .with_timezone(&Utc),
+        ),
         ..TipReading::default()
     }
 }
@@ -106,7 +111,13 @@ fn poison(
 ) -> RepoPoison {
     let tip = BTreeMap::from([(CONTEXT.to_owned(), tip)]);
     let mut named = BTreeMap::new();
-    let (green, covering) = base_poison::green_head_fix(prs, &[], APPROVAL, &health, &tip);
+    let (green, covering) = base_poison::green_head_fix(
+        prs,
+        &[],
+        APPROVAL,
+        &health,
+        &base_poison::confirmed_red_since(&health, &tip, &BTreeMap::new()),
+    );
     if let GreenHead::One(pr, evidence) = &green {
         named.insert(*pr, vec![evidence.clone()]);
     }
@@ -120,6 +131,7 @@ fn poison(
     };
     RepoPoison {
         policy: BasePoisonPolicy {
+            acts: crate::base_health::TriageActs::default(),
             hold,
             control_workflows: BTreeMap::new(),
             pause: hold,
@@ -131,6 +143,7 @@ fn poison(
         candidates,
         fix_read_error: None,
         fix_ambiguity,
+        red_everywhere: std::collections::BTreeMap::new(),
         tip,
         covering,
     }
@@ -160,8 +173,14 @@ fn pr_409() -> ObservedPr {
 fn the_fix_is_the_approved_head_that_passed_the_context_after_the_tip_went_red() {
     let prs = [pr_408(), pr_409()];
     let tip = BTreeMap::from([(CONTEXT.to_owned(), tip_red())]);
-    let GreenHead::One(pr, evidence) =
-        base_poison::green_head_fix(&prs, &[], APPROVAL, &streak(), &tip).0
+    let GreenHead::One(pr, evidence) = base_poison::green_head_fix(
+        &prs,
+        &[],
+        APPROVAL,
+        &streak(),
+        &base_poison::confirmed_red_since(&streak(), &tip, &BTreeMap::new()),
+    )
+    .0
     else {
         panic!("a green head is named");
     };
@@ -496,6 +515,621 @@ fn the_shadow_ledger_marks_an_episode_built_on_an_unread_tip_partial() {
     );
 }
 
+fn with_acts(mut poison: RepoPoison, mode: PoisonHold) -> RepoPoison {
+    poison.policy.acts = crate::base_health::TriageActs::all(mode);
+    poison
+}
+
+/// #409 was enqueued behind #408 before the episode was confirmed: the
+/// steward moves it to the front, bound to its head, once per episode.
+#[test]
+fn a_queued_fix_behind_other_entries_is_reordered_once_per_episode() {
+    use crate::app::merge_steward_cmd::fix_reorder;
+    let fix = open_pr(
+        409,
+        'b',
+        Some(2),
+        Some("2026-11-13T10:35:37Z"),
+        Some("2026-11-13T10:41:08Z"),
+    );
+    let other = open_pr(
+        408,
+        'a',
+        Some(1),
+        Some("2026-11-13T09:58:37Z"),
+        Some("2026-11-13T10:34:36Z"),
+    );
+    let prs = [other, fix];
+    let on = with_acts(
+        poison(PoisonHold::On, &prs, streak(), tip_red()),
+        PoisonHold::On,
+    );
+    let mut observation = observation_for(prs[0].clone(), true);
+    observation.prs = prs.to_vec();
+    let candidate = fix_reorder::candidate(&on, &observation)
+        .expect("no refusal")
+        .expect("a candidate");
+    assert_eq!((candidate.pr, candidate.position), (409, 2));
+    assert_eq!(candidate.head, "b".repeat(40), "bound to the census head");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let now = Utc::now();
+    let calls = std::cell::Cell::new(0);
+    // A failed attempt is recorded as failed and retried by the next pass.
+    let line = fix_reorder::decide(
+        dir.path(),
+        &observation.repo,
+        PoisonHold::On,
+        &candidate,
+        now,
+        || {
+            calls.set(calls.get() + 1);
+            "failed: dequeue: HTTP 502".to_owned()
+        },
+    );
+    assert!(line.contains("failed: dequeue"), "{line}");
+    let line = fix_reorder::decide(
+        dir.path(),
+        &observation.repo,
+        PoisonHold::On,
+        &candidate,
+        now,
+        || {
+            calls.set(calls.get() + 1);
+            "jumped".to_owned()
+        },
+    );
+    assert!(line.ends_with("jumped"), "{line}");
+    let line = fix_reorder::decide(
+        dir.path(),
+        &observation.repo,
+        PoisonHold::On,
+        &candidate,
+        now,
+        || {
+            calls.set(calls.get() + 1);
+            "jumped".to_owned()
+        },
+    );
+    assert!(line.contains("already decided"), "{line}");
+    assert_eq!(
+        calls.get(),
+        2,
+        "one retry after the failure, then never again"
+    );
+    assert_eq!(fix_reorder::load(dir.path()).len(), 2);
+}
+
+#[test]
+fn a_fix_at_the_front_or_unqueued_or_unconfirmed_is_never_reordered() {
+    use crate::app::merge_steward_cmd::fix_reorder;
+    let front = open_pr(
+        409,
+        'b',
+        Some(1),
+        Some("2026-11-13T10:35:37Z"),
+        Some("2026-11-13T10:41:08Z"),
+    );
+    let prs = [pr_408(), front];
+    let on = with_acts(
+        poison(PoisonHold::On, &prs, streak(), tip_red()),
+        PoisonHold::On,
+    );
+    let mut observation = observation_for(prs[0].clone(), true);
+    observation.prs = prs.to_vec();
+    let refused = fix_reorder::candidate(&on, &observation).expect_err("position 1");
+    assert!(refused.contains("already first"), "{refused}");
+    let unqueued = [pr_408(), pr_409()];
+    let on = with_acts(
+        poison(PoisonHold::On, &unqueued, streak(), tip_red()),
+        PoisonHold::On,
+    );
+    observation.prs = unqueued.to_vec();
+    assert_eq!(
+        fix_reorder::candidate(&on, &observation),
+        Ok(None),
+        "an unqueued fix is jumped by the enqueue itself"
+    );
+    let queued = [
+        pr_408(),
+        open_pr(
+            409,
+            'b',
+            Some(3),
+            Some("2026-11-13T10:35:37Z"),
+            Some("2026-11-13T10:41:08Z"),
+        ),
+    ];
+    observation.prs = queued.to_vec();
+    let unconfirmed = with_acts(
+        poison(PoisonHold::On, &queued, streak(), tip_green()),
+        PoisonHold::On,
+    );
+    assert_eq!(fix_reorder::candidate(&unconfirmed, &observation), Ok(None));
+    let off = with_acts(
+        poison(PoisonHold::On, &queued, streak(), tip_red()),
+        PoisonHold::Off,
+    );
+    assert_eq!(fix_reorder::candidate(&off, &observation), Ok(None));
+}
+
+#[test]
+fn a_dry_run_reorder_records_would_reorder_and_never_acts() {
+    use crate::app::merge_steward_cmd::fix_reorder;
+    let queued = [
+        pr_408(),
+        open_pr(
+            409,
+            'b',
+            Some(2),
+            Some("2026-11-13T10:35:37Z"),
+            Some("2026-11-13T10:41:08Z"),
+        ),
+    ];
+    let dry = with_acts(
+        poison(PoisonHold::On, &queued, streak(), tip_red()),
+        PoisonHold::DryRun,
+    );
+    let mut observation = observation_for(queued[0].clone(), true);
+    observation.prs = queued.to_vec();
+    let candidate = fix_reorder::candidate(&dry, &observation)
+        .expect("ok")
+        .expect("candidate");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let line = fix_reorder::decide(
+        dir.path(),
+        &observation.repo,
+        PoisonHold::DryRun,
+        &candidate,
+        Utc::now(),
+        || panic!("dry-run never acts"),
+    );
+    assert!(line.contains("would_reorder from position 2"), "{line}");
+}
+
+fn run(
+    id: u64,
+    event: &str,
+    branch: &str,
+    head: char,
+    status: &str,
+) -> crate::merge_steward::StewardRun {
+    crate::merge_steward::StewardRun {
+        id,
+        workflow_id: 1,
+        run_attempt: 1,
+        workflow: "macOS GPU".to_owned(),
+        head_sha: head.to_string().repeat(40),
+        head_branch: branch.to_owned(),
+        status: status.to_owned(),
+        event: event.to_owned(),
+        pull_request_number: None,
+        created_at: "2026-11-13T10:50:00Z".to_owned(),
+        jobs: Vec::new(),
+    }
+}
+
+struct FakeActs {
+    refs: BTreeMap<String, Result<String, String>>,
+    cancel: Result<(), String>,
+    reads: std::cell::RefCell<Vec<String>>,
+    cancels: std::cell::RefCell<Vec<u64>>,
+}
+
+impl crate::app::merge_steward_cmd::orphan_groups::Acts for FakeActs {
+    fn read_ref(&self, branch: &str) -> Result<String, String> {
+        self.reads.borrow_mut().push(branch.to_owned());
+        self.refs
+            .get(branch)
+            .cloned()
+            .unwrap_or_else(|| Err("gh: Not Found (HTTP 404)".to_owned()))
+    }
+    fn cancel(&self, run: &crate::merge_steward::StewardRun) -> Result<(), String> {
+        self.cancels.borrow_mut().push(run.id);
+        self.cancel.clone()
+    }
+}
+
+/// Vellum, 11:02Z: the reorder rebuilt the queue; the run on
+/// `pr-408-8c606bc7` kept going. Only that run is cancelled: the live
+/// group, a push run and a `pull_request` run are never touched, and a ref
+/// that cannot be read leaves its run alone.
+#[test]
+fn only_a_merge_group_run_whose_queue_branch_is_confirmed_gone_is_cancelled() {
+    use crate::app::merge_steward_cmd::orphan_groups;
+    let orphan = "gh-readonly-queue/main/pr-408-8c606bc733cb0104495158fdab5eb8e63b48c850";
+    let live = "gh-readonly-queue/main/pr-409-8c606bc733cb0104495158fdab5eb8e63b48c850";
+    let flaky = "gh-readonly-queue/main/pr-410-8c606bc733cb0104495158fdab5eb8e63b48c850";
+    let mut observation = observation_for(pr_408(), true);
+    observation.merge_group_heads = BTreeMap::from([(409, "e".repeat(40))]);
+    observation.runs = vec![
+        run(43_410_542_522, "merge_group", orphan, 'd', "in_progress"),
+        run(2, "merge_group", live, 'e', "in_progress"),
+        run(3, "push", "main", 'f', "in_progress"),
+        run(4, "pull_request", "branch-408", 'a', "in_progress"),
+        run(5, "merge_group", flaky, 'c', "queued"),
+        run(6, "merge_group", orphan, 'd', "completed"),
+    ];
+    let acts = FakeActs {
+        refs: BTreeMap::from([(flaky.to_owned(), Err("HTTP 502".to_owned()))]),
+        cancel: Ok(()),
+        reads: std::cell::RefCell::default(),
+        cancels: std::cell::RefCell::default(),
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let lines = orphan_groups::decide(
+        PoisonHold::On,
+        Some(dir.path()),
+        &observation,
+        &acts,
+        Utc::now(),
+    );
+    assert_eq!(*acts.cancels.borrow(), vec![43_410_542_522]);
+    assert_eq!(
+        acts.reads.borrow().len(),
+        2,
+        "one read per suspect branch only"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("43410542522") && line.ends_with("cancelled")),
+        "{lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("ref unread, left running")),
+        "{lines:?}"
+    );
+    // Recorded: the next pass does not cancel it again.
+    let again = orphan_groups::decide(
+        PoisonHold::On,
+        Some(dir.path()),
+        &observation,
+        &acts,
+        Utc::now(),
+    );
+    assert_eq!(acts.cancels.borrow().len(), 1);
+    assert!(
+        again.iter().any(|line| line.contains("already cancelled")),
+        "{again:?}"
+    );
+}
+
+#[test]
+fn a_failed_orphan_cancel_is_retried_and_dry_run_never_cancels() {
+    use crate::app::merge_steward_cmd::orphan_groups;
+    let orphan = "gh-readonly-queue/main/pr-408-8c606bc733cb0104495158fdab5eb8e63b48c850";
+    let mut observation = observation_for(pr_408(), true);
+    observation.runs = vec![run(7, "merge_group", orphan, 'd', "in_progress")];
+    let failing = FakeActs {
+        refs: BTreeMap::new(),
+        cancel: Err("HTTP 500".to_owned()),
+        reads: std::cell::RefCell::default(),
+        cancels: std::cell::RefCell::default(),
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let first = orphan_groups::decide(
+        PoisonHold::On,
+        Some(dir.path()),
+        &observation,
+        &failing,
+        Utc::now(),
+    );
+    assert!(first[0].ends_with("failed: HTTP 500"), "{first:?}");
+    let _ = orphan_groups::decide(
+        PoisonHold::On,
+        Some(dir.path()),
+        &observation,
+        &failing,
+        Utc::now(),
+    );
+    assert_eq!(
+        failing.cancels.borrow().len(),
+        2,
+        "a failed cancel is retried"
+    );
+    let dry = FakeActs {
+        refs: BTreeMap::new(),
+        cancel: Ok(()),
+        reads: std::cell::RefCell::default(),
+        cancels: std::cell::RefCell::default(),
+    };
+    let lines = orphan_groups::decide(
+        PoisonHold::DryRun,
+        Some(dir.path()),
+        &observation,
+        &dry,
+        Utc::now(),
+    );
+    assert!(dry.cancels.borrow().is_empty());
+    assert!(lines[0].contains("would cancel run 7"), "{lines:?}");
+    assert!(
+        orphan_groups::decide(
+            PoisonHold::Off,
+            Some(dir.path()),
+            &observation,
+            &dry,
+            Utc::now()
+        )
+        .is_empty()
+    );
+}
+
+/// The streak's groups carried #405, #404 and #403 (see [`streak`]); #404
+/// is still open and unqueued at head 'a' after its ejection.
+fn ejected_404() -> ObservedPr {
+    open_pr(404, 'a', None, None, Some("2026-11-13T09:30:00Z"))
+}
+
+fn removals(head: &str, at: &[(&str, &str)]) -> serde_json::Value {
+    let nodes = at
+        .iter()
+        .map(|(reason, created)| {
+            serde_json::json!({
+                "__typename": "RemovedFromMergeQueueEvent",
+                "reason": reason,
+                "createdAt": created,
+                "beforeCommit": {"oid": head},
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({"data": {"repository": {"pullRequest": {"timelineItems": {"nodes": nodes}}}}})
+}
+
+fn removal_count(queue: &serde_json::Value) -> usize {
+    queue
+        .pointer("/data/repository/pullRequest/timelineItems/nodes")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len)
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // One episode, read from record to re-enqueue.
+fn a_red_base_ejection_is_excused_once_the_base_is_green_and_only_for_that_head() {
+    use crate::app::merge_steward_cmd::red_base_ejections;
+    let prs = [ejected_404(), pr_409()];
+    let mut observation = observation_for(prs[0].clone(), true);
+    observation.prs = prs.to_vec();
+    let red = poison(PoisonHold::On, &prs, streak(), tip_red());
+    let green = poison(PoisonHold::On, &prs, streak(), tip_green());
+    let mut ledger = StewardLedger::default();
+    let at = |text: &str| {
+        chrono::DateTime::parse_from_rfc3339(text)
+            .expect("time")
+            .with_timezone(&Utc)
+    };
+    // While red: recorded, nothing excused.
+    let lines = red_base_ejections::reconcile(
+        PoisonHold::On,
+        true,
+        &mut ledger,
+        &observation,
+        Some(&red),
+        at("2026-11-13T10:40:00Z"),
+    );
+    assert!(lines.is_empty(), "{lines:?}");
+    let entries = red_base_ejections::entries(&ledger, &observation.repo, &observation.base);
+    assert_eq!(entries.len(), 1);
+    assert_eq!((entries[0].pr, entries[0].ready), (404, false));
+    let head = "a".repeat(40);
+    let queue = removals(
+        &head,
+        &[
+            ("FAILED_CHECKS", "2026-11-13T10:20:00Z"),
+            ("failed_checks", "2026-11-13T10:38:00Z"),
+        ],
+    );
+    let before = red_base_ejections::excused_queue(
+        &ledger,
+        &observation.repo,
+        &observation.base,
+        404,
+        &head,
+        &queue,
+    );
+    assert_eq!(removal_count(&before), 2, "nothing excused while red");
+    // An unread tip does not end the episode.
+    let unread = poison(
+        PoisonHold::On,
+        &prs,
+        streak(),
+        TipReading {
+            error: Some("HTTP 502".to_owned()),
+            ..TipReading::default()
+        },
+    );
+    red_base_ejections::reconcile(
+        PoisonHold::On,
+        true,
+        &mut ledger,
+        &observation,
+        Some(&unread),
+        at("2026-11-13T11:00:00Z"),
+    );
+    assert!(!red_base_ejections::entries(&ledger, &observation.repo, &observation.base)[0].ready);
+    // Green: the window closes and the ejections inside it are excused.
+    let lines = red_base_ejections::reconcile(
+        PoisonHold::On,
+        true,
+        &mut ledger,
+        &observation,
+        Some(&green),
+        at("2026-11-13T11:10:00Z"),
+    );
+    assert!(
+        lines[0].contains("excused from the ejection cap"),
+        "{lines:?}"
+    );
+    let after = red_base_ejections::excused_queue(
+        &ledger,
+        &observation.repo,
+        &observation.base,
+        404,
+        &head,
+        &queue,
+    );
+    assert_eq!(removal_count(&after), 0);
+    // Another head of the same pull request is never excused.
+    let moved = red_base_ejections::excused_queue(
+        &ledger,
+        &observation.repo,
+        &observation.base,
+        404,
+        &"b".repeat(40),
+        &removals(
+            &"b".repeat(40),
+            &[("failed_checks", "2026-11-13T10:38:00Z")],
+        ),
+    );
+    assert_eq!(removal_count(&moved), 1);
+    // A later ejection after the base went green is judged as usual.
+    let later = removals(
+        &head,
+        &[
+            ("failed_checks", "2026-11-13T10:38:00Z"),
+            ("failed_checks", "2026-11-13T12:00:00Z"),
+        ],
+    );
+    let kept = red_base_ejections::excused_queue(
+        &ledger,
+        &observation.repo,
+        &observation.base,
+        404,
+        &head,
+        &later,
+    );
+    assert_eq!(removal_count(&kept), 2);
+    // Once queued again at that head, the entry is done: once per head.
+    let requeued = open_pr(404, 'a', Some(1), None, Some("2026-11-13T09:30:00Z"));
+    observation.prs = vec![requeued, pr_409()];
+    let lines = red_base_ejections::reconcile(
+        PoisonHold::On,
+        true,
+        &mut ledger,
+        &observation,
+        Some(&green),
+        at("2026-11-13T11:20:00Z"),
+    );
+    assert!(lines[0].ends_with("re-enqueued"), "{lines:?}");
+    assert!(red_base_ejections::entries(&ledger, &observation.repo, &observation.base).is_empty());
+}
+
+#[test]
+fn a_dry_run_reenqueue_reports_and_excuses_nothing_and_a_moved_head_is_dropped() {
+    use crate::app::merge_steward_cmd::red_base_ejections;
+    let prs = [ejected_404(), pr_409()];
+    let mut observation = observation_for(prs[0].clone(), true);
+    observation.prs = prs.to_vec();
+    let red = poison(PoisonHold::On, &prs, streak(), tip_red());
+    let green = poison(PoisonHold::On, &prs, streak(), tip_green());
+    let mut ledger = StewardLedger::default();
+    red_base_ejections::reconcile(
+        PoisonHold::DryRun,
+        true,
+        &mut ledger,
+        &observation,
+        Some(&red),
+        Utc::now(),
+    );
+    let lines = red_base_ejections::reconcile(
+        PoisonHold::DryRun,
+        true,
+        &mut ledger,
+        &observation,
+        Some(&green),
+        Utc::now(),
+    );
+    assert!(lines[0].contains("would re-enqueue"), "{lines:?}");
+    let head = "a".repeat(40);
+    let queue = removals(&head, &[("failed_checks", &Utc::now().to_rfc3339())]);
+    let same = red_base_ejections::excused_queue(
+        &ledger,
+        &observation.repo,
+        &observation.base,
+        404,
+        &head,
+        &queue,
+    );
+    assert_eq!(removal_count(&same), 1, "dry-run excuses nothing");
+    observation.prs = vec![open_pr(404, 'c', None, None, None), pr_409()];
+    let lines = red_base_ejections::reconcile(
+        PoisonHold::DryRun,
+        true,
+        &mut ledger,
+        &observation,
+        Some(&green),
+        Utc::now(),
+    );
+    assert!(lines[0].ends_with("head moved"), "{lines:?}");
+    assert!(red_base_ejections::entries(&ledger, &observation.repo, &observation.base).is_empty());
+    red_base_ejections::reconcile(
+        PoisonHold::Off,
+        true,
+        &mut ledger,
+        &observation,
+        Some(&red),
+        Utc::now(),
+    );
+    assert!(
+        red_base_ejections::entries(&ledger, &observation.repo, &observation.base).is_empty(),
+        "off records nothing"
+    );
+}
+
+/// A red-everywhere episode on the context's check confirms the streak
+/// over a stale tip, and the green-head fix is measured from when it began.
+#[test]
+fn red_everywhere_over_a_stale_tip_confirms_and_names_the_fix() {
+    let prs = [pr_408(), pr_409()];
+    let stale = TipReading {
+        newest_at: Some(
+            chrono::DateTime::parse_from_rfc3339("2026-11-13T09:53:01Z")
+                .expect("time")
+                .with_timezone(&Utc),
+        ),
+        ..TipReading::default()
+    };
+    let since = chrono::DateTime::parse_from_rfc3339("2026-11-13T10:30:00Z")
+        .expect("time")
+        .with_timezone(&Utc);
+    let mut confirmed = poison(PoisonHold::On, &prs, streak(), stale.clone());
+    confirmed.red_everywhere = BTreeMap::from([(CONTEXT.to_owned(), since)]);
+    assert_eq!(confirmed.confirmed_contexts(), vec![CONTEXT.to_owned()]);
+    let red_since = base_poison::confirmed_red_since(
+        &confirmed.health,
+        &confirmed.tip,
+        &confirmed.red_everywhere,
+    );
+    let GreenHead::One(pr, _) =
+        base_poison::green_head_fix(&prs, &[], APPROVAL, &streak(), &red_since).0
+    else {
+        panic!("a fix");
+    };
+    assert_eq!(pr, 409, "#408 passed before the episode began");
+    // Without red everywhere the stale tip confirms nothing.
+    let alone = poison(PoisonHold::On, &prs, streak(), stale);
+    assert!(alone.confirmed_contexts().is_empty());
+    // Red everywhere never confirms over a fresh green or an unread tip.
+    let fresh = TipReading {
+        newest_at: Some(since + chrono::Duration::minutes(5)),
+        ..TipReading::default()
+    };
+    let unread = TipReading {
+        error: Some("HTTP 502".to_owned()),
+        ..TipReading::default()
+    };
+    for tip in [fresh, unread] {
+        let mut not_confirmed = poison(PoisonHold::On, &prs, streak(), tip);
+        not_confirmed.red_everywhere = BTreeMap::from([(CONTEXT.to_owned(), since)]);
+        assert!(not_confirmed.confirmed_contexts().is_empty());
+        assert!(matches!(
+            base_poison::admission(Some(&not_confirmed), 408),
+            Admission::Proceed
+        ));
+    }
+}
+
 const OTHER: &str = "macos-gpu";
 
 /// An approved open pull request with the given contexts green at times.
@@ -546,7 +1180,13 @@ fn red_on_both() -> BTreeMap<String, TipReading> {
 
 fn two_context_poison(prs: &[ObservedPr], tip: BTreeMap<String, TipReading>) -> RepoPoison {
     let health = two_context_streak();
-    let (green, covering) = base_poison::green_head_fix(prs, &[], APPROVAL, &health, &tip);
+    let (green, covering) = base_poison::green_head_fix(
+        prs,
+        &[],
+        APPROVAL,
+        &health,
+        &base_poison::confirmed_red_since(&health, &tip, &BTreeMap::new()),
+    );
     let mut named = BTreeMap::new();
     if let GreenHead::One(pr, evidence) = green {
         named.insert(pr, vec![evidence]);
@@ -554,6 +1194,7 @@ fn two_context_poison(prs: &[ObservedPr], tip: BTreeMap<String, TipReading>) -> 
     let (fixes, candidates) = base_poison::assemble_fixes(named, prs, &health);
     RepoPoison {
         policy: BasePoisonPolicy {
+            acts: crate::base_health::TriageActs::default(),
             hold: PoisonHold::On,
             control_workflows: BTreeMap::new(),
             pause: PoisonHold::On,
@@ -565,6 +1206,7 @@ fn two_context_poison(prs: &[ObservedPr], tip: BTreeMap<String, TipReading>) -> 
         candidates,
         fix_read_error: None,
         fix_ambiguity: None,
+        red_everywhere: BTreeMap::new(),
         tip,
         covering,
     }
@@ -704,7 +1346,7 @@ fn coverage_needs_the_required_app_identity() {
         &pinned,
         APPROVAL,
         &health,
-        &tip,
+        &base_poison::confirmed_red_since(&health, &tip, &BTreeMap::new()),
     );
     assert!(covering.is_empty(), "{covering:?}");
     let (_, unpinned) = base_poison::green_head_fix(
@@ -712,7 +1354,7 @@ fn coverage_needs_the_required_app_identity() {
         &[],
         APPROVAL,
         &health,
-        &tip,
+        &base_poison::confirmed_red_since(&health, &tip, &BTreeMap::new()),
     );
     assert_eq!(unpinned.into_iter().collect::<Vec<_>>(), vec![502]);
 }
@@ -854,4 +1496,342 @@ fn live_admission_admits_a_rival_green_head_beside_the_labelled_fix() {
         base_poison::admission(Some(&on), 408),
         Admission::Hold { .. }
     ));
+}
+
+/// The reorder follows admission's rules: a named fix that does not pass
+/// every confirmed context, or any fix on a partial pass, is never moved.
+#[test]
+fn the_reorder_needs_a_covering_fix_and_a_fully_read_pass() {
+    use crate::app::merge_steward_cmd::fix_reorder;
+    let mut half = pr_with_greens(500, 'c', &[(CONTEXT, "2026-11-13T10:40:00Z")]);
+    half.fact.queue_position = Some(2);
+    let mut front = pr_with_greens(
+        501,
+        'd',
+        &[
+            (CONTEXT, "2026-11-13T10:40:00Z"),
+            (OTHER, "2026-11-13T10:41:00Z"),
+        ],
+    );
+    front.fact.queue_position = Some(1);
+    let prs = [front, half];
+    let mut poison = with_acts(two_context_poison(&prs, red_on_both()), PoisonHold::On);
+    poison.fixes = BTreeMap::from([(500, vec!["label `shipyard:unblock`".to_owned()])]);
+    let mut observation = observation_for(prs[0].clone(), true);
+    observation.prs = prs.to_vec();
+    let refused = fix_reorder::candidate(&poison, &observation).expect_err("not covering");
+    assert!(
+        refused.contains("does not pass every confirmed context"),
+        "{refused}"
+    );
+    // A covering fix on a partial pass is not moved either.
+    let mut whole = pr_with_greens(
+        502,
+        'e',
+        &[
+            (CONTEXT, "2026-11-13T10:40:00Z"),
+            (OTHER, "2026-11-13T10:41:00Z"),
+        ],
+    );
+    whole.fact.queue_position = Some(3);
+    let prs = [prs[0].clone(), whole];
+    let mut tip = red_on_both();
+    tip.insert(
+        "third".to_owned(),
+        TipReading {
+            error: Some("HTTP 502".to_owned()),
+            ..TipReading::default()
+        },
+    );
+    let mut partial = with_acts(two_context_poison(&prs, tip), PoisonHold::On);
+    partial.fixes = BTreeMap::from([(502, vec!["green head".to_owned()])]);
+    observation.prs = prs.to_vec();
+    assert!(partial.covering.contains(&502));
+    let refused = fix_reorder::candidate(&partial, &observation).expect_err("partial");
+    assert!(refused.contains("partial read"), "{refused}");
+}
+
+/// Red-base ejections are not released while another context is still
+/// confirmed, or on a partial pass.
+#[test]
+fn red_base_ejections_wait_for_every_context_and_a_full_read() {
+    use crate::app::merge_steward_cmd::red_base_ejections;
+    let prs = [ejected_404(), pr_409()];
+    let mut observation = observation_for(prs[0].clone(), true);
+    observation.prs = prs.to_vec();
+    let mut ledger = StewardLedger::default();
+    let both = with_acts(two_context_poison(&prs, red_on_both()), PoisonHold::On);
+    red_base_ejections::reconcile(
+        PoisonHold::On,
+        true,
+        &mut ledger,
+        &observation,
+        Some(&both),
+        Utc::now(),
+    );
+    assert_eq!(
+        red_base_ejections::entries(&ledger, &observation.repo, &observation.base).len(),
+        2,
+        "one window per context"
+    );
+    // CONTEXT goes green on the tip; OTHER is still red.
+    let mut tip = red_on_both();
+    tip.insert(CONTEXT.to_owned(), tip_green());
+    let one_left = two_context_poison(&prs, tip);
+    red_base_ejections::reconcile(
+        PoisonHold::On,
+        true,
+        &mut ledger,
+        &observation,
+        Some(&one_left),
+        Utc::now(),
+    );
+    assert!(
+        red_base_ejections::entries(&ledger, &observation.repo, &observation.base)
+            .iter()
+            .all(|entry| !entry.ready)
+    );
+    // Both green but a third read failed: still not released.
+    let mut tip = BTreeMap::from([
+        (CONTEXT.to_owned(), tip_green()),
+        (OTHER.to_owned(), tip_green()),
+    ]);
+    tip.insert(
+        "third".to_owned(),
+        TipReading {
+            error: Some("HTTP 502".to_owned()),
+            ..TipReading::default()
+        },
+    );
+    let partial = two_context_poison(&prs, tip);
+    red_base_ejections::reconcile(
+        PoisonHold::On,
+        true,
+        &mut ledger,
+        &observation,
+        Some(&partial),
+        Utc::now(),
+    );
+    assert!(
+        red_base_ejections::entries(&ledger, &observation.repo, &observation.base)
+            .iter()
+            .all(|entry| !entry.ready)
+    );
+    // Fully read, nothing confirmed: released.
+    let green = two_context_poison(
+        &prs,
+        BTreeMap::from([
+            (CONTEXT.to_owned(), tip_green()),
+            (OTHER.to_owned(), tip_green()),
+        ]),
+    );
+    red_base_ejections::reconcile(
+        PoisonHold::On,
+        true,
+        &mut ledger,
+        &observation,
+        Some(&green),
+        Utc::now(),
+    );
+    assert!(
+        red_base_ejections::entries(&ledger, &observation.repo, &observation.base)
+            .iter()
+            .all(|entry| entry.ready)
+    );
+}
+
+/// A red tip with no red time of its own: nothing is recorded for
+/// re-enqueue (no window can be shown) and the reorder never formats the
+/// unknown onset. Neither panics.
+#[test]
+fn an_unknown_onset_records_no_ejection_window_and_never_panics() {
+    use crate::app::merge_steward_cmd::{fix_reorder, red_base_ejections};
+    let prs = [ejected_404(), pr_409()];
+    let mut observation = observation_for(prs[0].clone(), true);
+    observation.prs = prs.to_vec();
+    let unknown = TipReading {
+        red: true,
+        ..TipReading::default()
+    };
+    let red = with_acts(
+        poison(PoisonHold::On, &prs, streak(), unknown),
+        PoisonHold::On,
+    );
+    assert_eq!(red.confirmed_contexts(), vec![CONTEXT.to_owned()]);
+    let mut ledger = StewardLedger::default();
+    let lines = red_base_ejections::reconcile(
+        PoisonHold::On,
+        true,
+        &mut ledger,
+        &observation,
+        Some(&red),
+        Utc::now(),
+    );
+    assert!(lines.is_empty(), "{lines:?}");
+    assert!(red_base_ejections::entries(&ledger, &observation.repo, &observation.base).is_empty());
+    let mut queued = red.clone();
+    queued.fixes = BTreeMap::from([(409, vec!["label `shipyard:unblock`".to_owned()])]);
+    let mut queued_prs = prs.to_vec();
+    queued_prs[1].fact.queue_position = Some(2);
+    observation.prs = queued_prs;
+    // Refused (nothing covers an unknown onset), without formatting it.
+    assert!(fix_reorder::candidate(&queued, &observation).is_err());
+}
+
+/// A report (no-apply) pass runs the re-enqueue reconcile too: it says what
+/// it would do and leaves the steward ledger untouched.
+#[test]
+fn a_report_pass_reports_would_re_enqueue_and_persists_nothing() {
+    use crate::app::merge_steward_cmd::red_base_ejections;
+    let prs = [ejected_404(), pr_409()];
+    let mut observation = observation_for(prs[0].clone(), true);
+    observation.prs = prs.to_vec();
+    let red = poison(PoisonHold::On, &prs, streak(), tip_red());
+    let green = poison(PoisonHold::On, &prs, streak(), tip_green());
+    // An applying pass recorded the entry while the base was red.
+    let mut ledger = StewardLedger::default();
+    red_base_ejections::reconcile_for_pass(
+        PoisonHold::On,
+        true,
+        &mut ledger,
+        &observation,
+        Some(&red),
+        Utc::now(),
+    );
+    let before =
+        red_base_ejections::entries(&ledger, &observation.repo, &observation.base).to_vec();
+    assert_eq!(before.len(), 1);
+    // A report pass once the base is green: the line, and nothing written.
+    let lines = red_base_ejections::reconcile_for_pass(
+        PoisonHold::On,
+        false,
+        &mut ledger,
+        &observation,
+        Some(&green),
+        Utc::now(),
+    );
+    assert!(
+        lines.iter().any(|line| line.contains("would re-enqueue")),
+        "{lines:?}"
+    );
+    assert_eq!(
+        red_base_ejections::entries(&ledger, &observation.repo, &observation.base),
+        before.as_slice(),
+        "a report pass persists nothing"
+    );
+}
+
+/// A tip read with no completed verdict is not green: it ends no episode,
+/// releases no red-base ejection and restores no paused entry.
+#[test]
+fn a_tip_with_no_completed_verdict_ends_nothing() {
+    use crate::app::merge_steward_cmd::red_base_ejections;
+    let prs = [ejected_404(), pr_409()];
+    let mut observation = observation_for(prs[0].clone(), true);
+    observation.prs = prs.to_vec();
+    let red = poison(PoisonHold::On, &prs, streak(), tip_red());
+    let pending = poison(PoisonHold::On, &prs, streak(), TipReading::default());
+    assert!(!pending.tip_green_for(CONTEXT), "no verdict is not green");
+    let mut ledger = StewardLedger::default();
+    red_base_ejections::reconcile(
+        PoisonHold::On,
+        true,
+        &mut ledger,
+        &observation,
+        Some(&red),
+        Utc::now(),
+    );
+    red_base_ejections::reconcile(
+        PoisonHold::On,
+        true,
+        &mut ledger,
+        &observation,
+        Some(&pending),
+        Utc::now(),
+    );
+    assert!(!red_base_ejections::entries(&ledger, &observation.repo, &observation.base)[0].ready);
+    let green = poison(PoisonHold::On, &prs, streak(), tip_green());
+    assert!(green.tip_green_for(CONTEXT));
+}
+
+/// A head that rode the failing groups of two confirmed contexts with
+/// different red onsets keeps one window per context, so an ejection inside
+/// the later context's window is excused too.
+#[test]
+fn a_head_red_on_two_contexts_keeps_a_window_for_each() {
+    use crate::app::merge_steward_cmd::red_base_ejections;
+    let prs = [ejected_404(), pr_409()];
+    let mut observation = observation_for(prs[0].clone(), true);
+    observation.prs = prs.to_vec();
+    let at = |text: &str| {
+        chrono::DateTime::parse_from_rfc3339(text)
+            .expect("time")
+            .with_timezone(&Utc)
+    };
+    let red_at = |text: &str| TipReading {
+        red: true,
+        red_since: Some(at(text)),
+        newest_at: Some(at(text)),
+        ..TipReading::default()
+    };
+    // CONTEXT went red at 10:00, OTHER at 14:00.
+    let mut red = two_context_poison(
+        &prs,
+        BTreeMap::from([
+            (CONTEXT.to_owned(), red_at("2026-11-13T10:00:00Z")),
+            (OTHER.to_owned(), red_at("2026-11-13T14:00:00Z")),
+        ]),
+    );
+    red.policy.acts = crate::base_health::TriageActs::all(PoisonHold::On);
+    let mut ledger = StewardLedger::default();
+    red_base_ejections::reconcile(
+        PoisonHold::On,
+        true,
+        &mut ledger,
+        &observation,
+        Some(&red),
+        at("2026-11-13T14:30:00Z"),
+    );
+    let entries = red_base_ejections::entries(&ledger, &observation.repo, &observation.base);
+    assert_eq!(entries.len(), 2, "one window per context: {entries:?}");
+    // Both green, fully read: both windows close.
+    let green = two_context_poison(
+        &prs,
+        BTreeMap::from([
+            (CONTEXT.to_owned(), tip_green()),
+            (OTHER.to_owned(), tip_green()),
+        ]),
+    );
+    red_base_ejections::reconcile(
+        PoisonHold::On,
+        true,
+        &mut ledger,
+        &observation,
+        Some(&green),
+        at("2026-11-13T15:00:00Z"),
+    );
+    // An ejection at 14:20 lies only in OTHER's window (from 12:00, two
+    // hours before its onset, to 15:00); CONTEXT's window starts at 08:00 so
+    // it covers it too, and one at 07:30 lies in neither.
+    let head = "a".repeat(40);
+    let late = removals(&head, &[("failed_checks", "2026-11-13T14:20:00Z")]);
+    let excused = red_base_ejections::excused_queue(
+        &ledger,
+        &observation.repo,
+        &observation.base,
+        404,
+        &head,
+        &late,
+    );
+    assert_eq!(removal_count(&excused), 0);
+    let early = removals(&head, &[("failed_checks", "2026-11-13T07:30:00Z")]);
+    let kept = red_base_ejections::excused_queue(
+        &ledger,
+        &observation.repo,
+        &observation.base,
+        404,
+        &head,
+        &early,
+    );
+    assert_eq!(removal_count(&kept), 1);
 }

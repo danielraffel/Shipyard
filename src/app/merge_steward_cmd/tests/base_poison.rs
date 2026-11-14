@@ -49,6 +49,36 @@ esac
     )
 }
 
+#[test]
+fn triage_acts_are_observed_when_hold_is_off() {
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = fake_gh(
+        &temp,
+        r#"
+case "$*" in
+  *"actions/runs"*"event=merge_group"*) printf '%s' '{"workflow_runs":[]}' ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+    );
+    let observation = observation_for(ready_pr(), true);
+    let mut policy = queue_policy();
+    policy.ejection_guards.base_poison.hold = PoisonHold::Off;
+    policy.ejection_guards.base_poison.acts.reorder_fix = PoisonHold::DryRun;
+
+    let poison = crate::app::merge_steward_cmd::base_poison::observe(
+        &actions,
+        &observation,
+        &policy,
+        &BTreeMap::new(),
+        chrono::Utc::now(),
+    );
+    assert!(
+        poison.is_some(),
+        "an enabled triage act must still read base health"
+    );
+}
+
 fn approval() -> String {
     format!(
         r#"{{"id":6390564321,"user":{{"login":"shipyard-local[bot]","type":"Bot"}},"author_association":"CONTRIBUTOR","created_at":"2026-11-11T01:53:36Z","body":"reviewer: pulp-review\n<!-- session: Daniels-Mac-Studio-m3/08fb81d8 -->\nverdict: APPROVE head:{HEAD}"}}"#
@@ -70,6 +100,7 @@ fn poisoned(hold: PoisonHold, auto_jump: AutoJump, fixes: &[u64]) -> RepoPoison 
 fn streak_only(hold: PoisonHold, auto_jump: AutoJump, fixes: &[u64]) -> RepoPoison {
     RepoPoison {
         policy: BasePoisonPolicy {
+            acts: crate::base_health::TriageActs::default(),
             hold,
             control_workflows: std::collections::BTreeMap::new(),
             pause: hold,
@@ -101,6 +132,7 @@ fn streak_only(hold: PoisonHold, auto_jump: AutoJump, fixes: &[u64]) -> RepoPois
             .collect(),
         fix_read_error: None,
         fix_ambiguity: None,
+        red_everywhere: std::collections::BTreeMap::new(),
         covering: std::collections::BTreeSet::new(),
         candidates: std::collections::BTreeSet::default(),
         tip: std::collections::BTreeMap::new(),
