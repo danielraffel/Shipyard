@@ -64,6 +64,8 @@ mode = "shadow"        # off | shadow (default) | apply
 min_ready = 3          # plan only when at least this many are ready
 max_members = 4        # 2 to 4
 sensitive_paths = []   # globs that keep a pull request out, added to the defaults
+max_ready = 12         # more ready than this skips the plan (skipped_too_many)
+interval_minutes = 30  # plan at most this often per repository; 0 plans every pass
 ```
 
 Each pass, after the steward's own decisions, it counts the `ready` pull
@@ -85,12 +87,21 @@ above it, a pull request joins only when:
 
 Members are taken oldest first, at most `max_members`. Fewer than two is no
 rollup. The plan appears in the steward's JSON as `repos[].rollup`, with an
-`action` of `below_threshold`, `no_batch`, `shadow`, `apply_unavailable` or
-`unreadable`, the members' exact heads and why each other ready pull request
+`action` of `below_threshold`, `skipped_too_many`, `no_batch`, `shadow`,
+`apply_unavailable`, `deadline` or `unreadable`, the members' exact heads and why each other ready pull request
 was left out.
 
-`shadow` writes nothing: the pass takes no ledger and no mutation guard, and
-issues reads only. `apply` reports the same plan and still merges each pull
+Its GitHub reads are bounded. A repository is planned at most once per
+`interval_minutes`: an applied pass stamps the plan in the steward's state
+directory (`rollup-plan/`), and the passes in between report that plan with
+`cached_at` and read nothing. More than `max_ready` ready pull requests skips
+the plan. Reading stops once `max_members` members are chosen, and when the
+pass's time budget runs out (`action = "deadline"`, the partial plan, never
+stamped). Pull requests the pass merged or enqueued this tick are not counted
+as ready.
+
+`shadow` changes nothing on GitHub: the pass takes no ledger and no mutation
+guard, issues reads only, and its one local write is the plan stamp. `apply` reports the same plan and still merges each pull
 request on its own (`apply_unavailable`), because forming a rollup needs the
 steward to push a `shipyard-train/rollup-*` branch and open its pull request,
 which it is not authorised to do, and landing one needs the base to take

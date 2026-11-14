@@ -60,6 +60,16 @@ impl Fake {
     }
 
     fn plan_with(&self, policy: &Policy, train: &rollup::Config, ready: &[Ready]) -> Report {
+        self.plan_until(policy, train, ready, &|| false)
+    }
+
+    fn plan_until(
+        &self,
+        policy: &Policy,
+        train: &rollup::Config,
+        ready: &[Ready],
+        expired: &dyn Fn() -> bool,
+    ) -> Report {
         let gate = |pr: u64, sha: &str| {
             self.reads.borrow_mut().push(format!("gate #{pr}@{sha}"));
             Ok(self.gates.get(&pr).cloned().unwrap_or_else(approved))
@@ -79,8 +89,17 @@ impl Fake {
             &Readers {
                 gate: &gate,
                 files: &files,
+                expired,
             },
         )
+    }
+
+    fn reads_of(&self, kind: &str) -> usize {
+        self.reads
+            .borrow()
+            .iter()
+            .filter(|read| read.starts_with(kind))
+            .count()
     }
 }
 
@@ -144,7 +163,7 @@ fn bad_values_never_widen_anything() {
 fn below_the_threshold_there_is_no_rollup_and_no_read() {
     let fake = Fake::new(&[(1, &["a.rs"]), (2, &["b.rs"])]);
     let report = fake.plan(&Policy::default(), &[ready(1), ready(2)]);
-    assert_eq!(report.action, "below_threshold");
+    assert_eq!(report.action, Action::BelowThreshold);
     assert!(report.members.is_empty());
     assert!(fake.reads.borrow().is_empty(), "{:?}", fake.reads.borrow());
 }
@@ -160,7 +179,7 @@ fn a_backlog_of_disjoint_approved_heads_forms_one_rollup_oldest_first() {
     ]);
     let ready: Vec<Ready> = [11, 12, 13, 14, 15].into_iter().map(ready).collect();
     let report = fake.plan(&Policy::default(), &ready);
-    assert_eq!(report.action, "shadow");
+    assert_eq!(report.action, Action::Shadow);
     assert_eq!(members(&report), vec![11, 12, 13, 14]);
     assert_eq!(report.members[0].head, head(11), "members name exact heads");
     assert!(skipped(&report, 15).contains("full"));
@@ -287,7 +306,8 @@ fn drafts_and_fleet_hold_labels_stay_out_without_a_read() {
     owner.labels = vec!["owner-decision".to_owned()];
     let report = fake.plan(&Policy::default(), &[ready(1), draft, parked, owner]);
     assert_eq!(
-        report.action, "no_batch",
+        report.action,
+        Action::NoBatch,
         "one eligible member is no rollup"
     );
     assert!(report.members.is_empty());
@@ -313,7 +333,7 @@ fn apply_fails_closed_and_merges_nothing_as_a_batch() {
         &policy("[auto_merge.rollup]\nmode = \"apply\"\n"),
         &[ready(1), ready(2), ready(3)],
     );
-    assert_eq!(report.action, "apply_unavailable");
+    assert_eq!(report.action, Action::ApplyUnavailable);
     assert_eq!(members(&report), vec![1, 2, 3]);
     let detail = report.detail.unwrap_or_default();
     assert!(detail.contains("merges on its own"), "{detail}");
@@ -397,6 +417,24 @@ fn only_ready_rows_at_the_observed_head_count() {
 
 /// `run` through a recording `gh` that answers only the base config read.
 fn run_with(config: &str, merge_queue: bool, merge_path: &str) -> (Option<Report>, Vec<String>) {
+    run_throttled(
+        config,
+        merge_queue,
+        merge_path,
+        None,
+        false,
+        chrono::Utc::now(),
+    )
+}
+
+fn run_throttled(
+    config: &str,
+    merge_queue: bool,
+    merge_path: &str,
+    dir: Option<&std::path::Path>,
+    write: bool,
+    now: chrono::DateTime<chrono::Utc>,
+) -> (Option<Report>, Vec<String>) {
     let calls = RefCell::new(Vec::new());
     let run_gh = |argv: &[String]| {
         calls.borrow_mut().push(argv.join(" "));
@@ -416,7 +454,18 @@ fn run_with(config: &str, merge_queue: bool, merge_path: &str) -> (Option<Report
     let rows: Vec<PrReport> = (1..=3)
         .map(|pr| row(pr, StewardDecision::ArmMergeQueue))
         .collect();
-    let report = run(&run_gh, &observation, merge_path, &rows);
+    let report = run(
+        &run_gh,
+        &observation,
+        merge_path,
+        &rows,
+        &Throttle {
+            dir,
+            write,
+            now,
+            expired: &|| false,
+        },
+    );
     (report, calls.into_inner())
 }
 
@@ -445,7 +494,7 @@ fn below_threshold_reads_only_the_base_config_and_writes_nothing() {
         "server_enforced_exact_head_merge",
     );
     let report = report.expect("report");
-    assert_eq!(report.action, "below_threshold");
+    assert_eq!(report.action, Action::BelowThreshold);
     assert_eq!(report.ready, vec![1, 2, 3]);
     assert_eq!(calls.len(), 1, "{calls:?}");
     assert!(
@@ -462,7 +511,7 @@ fn unreadable_approval_reads_form_nothing() {
     let (report, calls) = run_with("", false, "server_enforced_exact_head_merge");
     let report = report.expect("report");
     assert!(
-        ["unreadable", "no_batch"].contains(&report.action),
+        [Action::Unreadable, Action::NoBatch].contains(&report.action),
         "{report:?}"
     );
     assert!(report.members.is_empty());
@@ -471,5 +520,127 @@ fn unreadable_approval_reads_form_nothing() {
             .iter()
             .all(|call| !call.contains("-X") && !call.contains("mutation")),
         "{calls:?}"
+    );
+}
+
+#[test]
+fn a_stamped_plan_stands_for_its_interval_and_reads_nothing() {
+    let temp = tempfile::tempdir().expect("temp");
+    let config = "[auto_merge.rollup]\nmin_ready = 4\ninterval_minutes = 30\n";
+    let path = "server_enforced_exact_head_merge";
+    let t0 = chrono::Utc::now();
+    let (first, calls) = run_throttled(config, false, path, Some(temp.path()), true, t0);
+    assert_eq!(first.expect("plan").action, Action::BelowThreshold);
+    assert_eq!(calls.len(), 1);
+    let later = t0 + chrono::Duration::minutes(29);
+    let (cached, calls) = run_throttled(config, false, path, Some(temp.path()), true, later);
+    let cached = cached.expect("cached plan");
+    assert!(calls.is_empty(), "a fresh stamp reads nothing: {calls:?}");
+    assert!(cached.cached_at.is_some());
+    assert_eq!(cached.action, Action::BelowThreshold);
+    let expired = t0 + chrono::Duration::minutes(31);
+    let (fresh, calls) = run_throttled(config, false, path, Some(temp.path()), true, expired);
+    assert_eq!(calls.len(), 1, "a stale stamp plans again");
+    assert!(fresh.expect("plan").cached_at.is_none());
+}
+
+#[test]
+fn a_dry_run_or_a_zero_interval_never_stamps() {
+    let path = "server_enforced_exact_head_merge";
+    let now = chrono::Utc::now();
+    for (config, write) in [
+        ("[auto_merge.rollup]\nmin_ready = 4\n", false),
+        (
+            "[auto_merge.rollup]\nmin_ready = 4\ninterval_minutes = 0\n",
+            true,
+        ),
+    ] {
+        let temp = tempfile::tempdir().expect("temp");
+        run_throttled(config, false, path, Some(temp.path()), write, now);
+        let (_, calls) = run_throttled(config, false, path, Some(temp.path()), write, now);
+        assert_eq!(calls.len(), 1, "{config} write={write}: plans again");
+    }
+}
+
+#[test]
+fn more_than_max_ready_skips_the_plan_without_a_read() {
+    let fake = Fake::new(&[]);
+    let ready: Vec<Ready> = (1..=13).map(ready).collect();
+    let report = fake.plan(&Policy::default(), &ready);
+    assert_eq!(report.action, Action::SkippedTooMany);
+    assert!(report.members.is_empty());
+    assert!(fake.reads.borrow().is_empty());
+    let report = fake.plan(&policy("[auto_merge.rollup]\nmax_ready = 20\n"), &ready);
+    assert_ne!(report.action, Action::SkippedTooMany);
+}
+
+#[test]
+fn reading_stops_once_the_rollup_is_full() {
+    let files: Vec<(u64, Vec<String>)> =
+        (1..=8).map(|pr| (pr, vec![format!("f{pr}.rs")])).collect();
+    let borrowed: Vec<(u64, Vec<&str>)> = files
+        .iter()
+        .map(|(pr, names)| (*pr, names.iter().map(String::as_str).collect()))
+        .collect();
+    let slices: Vec<(u64, &[&str])> = borrowed
+        .iter()
+        .map(|(pr, names)| (*pr, names.as_slice()))
+        .collect();
+    let fake = Fake::new(&slices);
+    let ready: Vec<Ready> = (1..=8).map(ready).collect();
+    let report = fake.plan(&Policy::default(), &ready);
+    assert_eq!(report.action, Action::Shadow);
+    assert_eq!(members(&report), vec![1, 2, 3, 4]);
+    assert_eq!(fake.reads_of("gate"), 4);
+    assert_eq!(fake.reads_of("files"), 4);
+    for pr in 5..=8 {
+        assert!(skipped(&report, pr).contains("not read"), "#{pr}");
+    }
+}
+
+#[test]
+fn a_spent_budget_stops_the_plan_and_reports_deadline() {
+    let fake = Fake::new(&[
+        (1, &["a.rs"]),
+        (2, &["b.rs"]),
+        (3, &["c.rs"]),
+        (4, &["d.rs"]),
+    ]);
+    let checks = std::cell::Cell::new(0);
+    let expired = || {
+        checks.set(checks.get() + 1);
+        checks.get() > 2
+    };
+    let ready: Vec<Ready> = (1..=4).map(ready).collect();
+    let report = fake.plan_until(
+        &Policy::default(),
+        &rollup::Config::default(),
+        &ready,
+        &expired,
+    );
+    assert_eq!(report.action, Action::Deadline);
+    assert_eq!(
+        members(&report),
+        vec![1, 2],
+        "the partial result is reported"
+    );
+    assert_eq!(fake.reads_of("gate"), 2);
+    assert!(skipped(&report, 3).contains("budget"));
+    assert!(skipped(&report, 4).contains("budget"));
+}
+
+#[test]
+fn rows_merged_or_enqueued_this_tick_are_not_ready() {
+    let observation = observation((1..=3).map(|pr| observed(pr, &head(pr))).collect(), false);
+    let mut merged = row(1, StewardDecision::ArmMergeQueue);
+    merged.mutation = Some(format!("merged_exact_head:{}", head(1)));
+    let mut enqueued = row(2, StewardDecision::ArmMergeQueue);
+    enqueued.mutation = Some("enqueued".to_owned());
+    let mut waiting = row(3, StewardDecision::ArmMergeQueue);
+    waiting.mutation = Some("waiting_required".to_owned());
+    let ready = ready_rows(&observation, &[merged, enqueued, waiting]);
+    assert_eq!(
+        ready.iter().map(|ready| ready.pr).collect::<Vec<_>>(),
+        vec![3]
     );
 }

@@ -1764,8 +1764,22 @@ fn steward_repo_observed(
             if !pass_budget::deadline_passed(args.pass_deadline) {
                 let run_gh =
                     |gh_args: &[String]| actions.run_gh(gh_args).map_err(|error| error.to_string());
-                report.rollup =
-                    rollup_pass::run(&run_gh, &observation, &report.merge_path, &report.prs);
+                let cache = ledger_path
+                    .parent()
+                    .map(|state| state.join(rollup_pass::CACHE_DIR));
+                let expired = || pass_budget::deadline_passed(args.pass_deadline);
+                report.rollup = rollup_pass::run(
+                    &run_gh,
+                    &observation,
+                    &report.merge_path,
+                    &report.prs,
+                    &rollup_pass::Throttle {
+                        dir: cache.as_deref(),
+                        write: args.apply,
+                        now: Utc::now(),
+                        expired: &expired,
+                    },
+                );
             }
             if args.apply && pass_budget::deadline_passed(args.pass_deadline) {
                 report

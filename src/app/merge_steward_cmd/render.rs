@@ -64,11 +64,8 @@ pub(super) fn render_report<W: Write>(
             writeln!(
                 stdout,
                 "  rollup: mode={} action={} ready={} members={}{}",
-                serde_json::to_value(rollup.mode)
-                    .ok()
-                    .and_then(|mode| mode.as_str().map(str::to_owned))
-                    .unwrap_or_default(),
-                rollup.action,
+                label(&rollup.mode),
+                label(&rollup.action),
                 rollup.ready.len(),
                 if members.is_empty() { "-" } else { &members },
                 rollup
@@ -234,4 +231,12 @@ pub(super) fn enqueue_requirements_pending(message: &str) -> bool {
         || lower.contains("required approving review")
         || lower.contains("required review")
         || lower.contains("requirements are not met")
+}
+
+/// A serde enum's snake-case label.
+fn label<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_default()
 }
