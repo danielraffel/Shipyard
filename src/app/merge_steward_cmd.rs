@@ -264,6 +264,12 @@ struct RepoReport {
     /// repository was not observed.
     #[serde(skip_serializing_if = "Option::is_none")]
     red_everywhere: Option<red_everywhere::RepoStatus>,
+    /// Ejections the same failing test caused on different pull requests:
+    /// the one re-enqueue each such head gets, and each signature's
+    /// `flake_root_cause` ([`flake_requeue`]). Absent when the repository
+    /// was not observed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    flake_requeue: Option<flake_requeue::RepoStatus>,
     /// The tick-start invariants ([`invariants`]): `{id, ok, detail, fix}`
     /// per check. Absent when they are off or the repository was not
     /// observed.
@@ -369,6 +375,10 @@ struct StewardLedger {
     /// member heads. See `red_everywhere`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     red_everywhere: BTreeMap<String, red_everywhere::Episode>,
+    /// Flake-classified ejections, one-per-head re-enqueue receipts and
+    /// root-cause issues. See `flake_requeue`.
+    #[serde(default, skip_serializing_if = "flake_requeue::State::is_empty")]
+    flake_requeue: flake_requeue::State,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1920,6 +1930,7 @@ fn deferred_rate_limit_repo_report(
         dwell: None,
         infra_rerun: None,
         red_everywhere: None,
+        flake_requeue: None,
         invariants: Vec::new(),
     }
 }
@@ -1954,6 +1965,7 @@ fn unreadable_repo_report(
         dwell: None,
         infra_rerun: None,
         red_everywhere: None,
+        flake_requeue: None,
         invariants: Vec::new(),
     }
 }
@@ -2038,6 +2050,7 @@ fn append_unmatched_recovery_errors(
             dwell: None,
             infra_rerun: None,
             red_everywhere: None,
+            flake_requeue: None,
             invariants: Vec::new(),
         });
     }
@@ -2082,6 +2095,7 @@ fn persist_final_ledger(
             dwell: None,
             infra_rerun: None,
             red_everywhere: None,
+            flake_requeue: None,
             invariants: Vec::new(),
         });
     }
@@ -2247,6 +2261,7 @@ mod defect_fix_removals;
 pub(super) mod dwell_pass;
 mod exact_head_merge;
 mod fix_reorder;
+mod flake_requeue;
 mod generated_paths;
 mod head_rollup;
 pub(super) mod infra_rerun;

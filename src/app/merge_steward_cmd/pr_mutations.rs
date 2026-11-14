@@ -498,6 +498,16 @@ fn enqueue_pull_request_with_recovery(
         recover_hosted_setup_eviction_priority,
         fast_track_jump,
     );
+    // A flake re-enqueue's `pending` receipt is `done` only once GitHub
+    // accepted the enqueue; a deferral or refusal leaves it pending.
+    super::flake_requeue::settle(
+        ledger,
+        Some(context.ledger_path),
+        &context.observation.repo,
+        pr.fact.number,
+        &pr.fact.head_sha,
+        mutation.as_deref(),
+    );
     match admission.token() {
         Some(token) => (
             Some(mutation.map_or(token.clone(), |mutation| format!("{token},{mutation}"))),
@@ -682,7 +692,7 @@ fn enqueue_unstacked_pull_request(
     // Hosted-setup recovery deliberately re-enqueues the same head: its
     // evidence attributes the removal to infrastructure, not to the head.
     if recovery.is_none()
-        && let Some(skip) = same_head_enqueue_refusal(context, &pr)
+        && let Some(skip) = same_head_enqueue_refusal(context, &pr, ledger)
     {
         return match skip {
             Ok(outcome) => match guard.finish(&outcome) {
@@ -1171,6 +1181,7 @@ pub(super) const NEEDS_NEW_HEAD: &str = "needs_new_head";
 fn same_head_enqueue_refusal(
     context: &MutationApplyContext<'_>,
     pr: &ObservedPr,
+    ledger: &mut StewardLedger,
 ) -> Option<Result<String, String>> {
     let response = match super::native_arm::read_queue_state(
         context.actions,
@@ -1195,19 +1206,37 @@ fn same_head_enqueue_refusal(
         return None;
     }
     Some(match verdict {
-        crate::pr_queue_state::InternalEnqueueVerdict::RefuseEjectedSameHead { reason, .. } => {
+        crate::pr_queue_state::InternalEnqueueVerdict::RefuseEjectedSameHead { reason, at } => {
             // The one bounded retry of a head whose merge-group failure is
             // not its own fault: the same classifier the native-arm backstop
             // and `shipyard ship` consult, read live from this queue answer.
             // The approval gate was already read live for this head above.
-            let retry = same_head_retry_verdict(
+            let verdict = same_head_retry_verdict(
                 context.actions,
                 context.observation,
                 &report,
                 &context.ejection_guards,
-            )
-            .as_ref()
-            .map(super::blocked_on::SameHeadRetry::from_verdict);
+            );
+            let mut retry = verdict
+                .as_ref()
+                .map(super::blocked_on::SameHeadRetry::from_verdict);
+            // The flake class: the same failing test ejected another pull
+            // request's head too. One re-enqueue of this head, outside the
+            // classifier's retry. See `flake_requeue`.
+            if let (Some(verdict), Some(retry)) = (verdict.as_ref(), retry.as_mut())
+                && let Some(flake) =
+                    flake_requeue_verdict(context, pr, ledger, at.as_deref(), verdict)
+            {
+                match flake {
+                    super::flake_requeue::Verdict::Requeue(detail) => {
+                        retry.allowed = true;
+                        retry.detail = detail;
+                    }
+                    super::flake_requeue::Verdict::Keep(detail) => {
+                        retry.detail = format!("{}; {detail}", retry.detail);
+                    }
+                }
+            }
             if let Some(ejection) = context
                 .approval_blockers
                 .borrow_mut()
@@ -1232,6 +1261,60 @@ fn same_head_enqueue_refusal(
             .refusal(pr.fact.number, &pr.fact.head_sha)
             .unwrap_or_else(|| "merge-queue state refused enqueue".to_owned())),
     })
+}
+
+/// The flake class's reading of one refused same-head ejection
+/// ([`super::flake_requeue::consider`]), with this pass's defect-fix and
+/// base-poison readings. A base this pass did not read green refuses.
+fn flake_requeue_verdict(
+    context: &MutationApplyContext<'_>,
+    pr: &ObservedPr,
+    ledger: &mut StewardLedger,
+    at: Option<&str>,
+    verdict: &crate::environment_requeue::EnvironmentRequeue,
+) -> Option<super::flake_requeue::Verdict> {
+    // The base tip's newest completed verdict for one check, read live, only
+    // when every other condition already allows the re-enqueue.
+    let tip = |check: &str| -> Result<Option<String>, String> {
+        let app_id = context
+            .observation
+            .required_checks
+            .iter()
+            .find(|rule| rule.context == check)
+            .and_then(|rule| rule.app_id);
+        let raw = context
+            .actions
+            .run_gh(&[
+                "api".to_owned(),
+                crate::base_health::fix_first::tip_check_path(
+                    &context.observation.repo,
+                    &context.observation.base,
+                    check,
+                ),
+            ])
+            .map_err(|error| error.to_string())?;
+        let value = serde_json::from_str::<Value>(&raw)
+            .map_err(|error| format!("the base tip's check runs were not JSON: {error}"))?;
+        Ok(super::flake_requeue::newest_tip_verdict(
+            &value, check, app_id,
+        ))
+    };
+    super::flake_requeue::consider(
+        &super::flake_requeue::Ejection {
+            policy: &context.ejection_guards.flake_requeue,
+            repo: &context.observation.repo,
+            pr: pr.fact.number,
+            head: &pr.fact.head_sha,
+            at,
+            verdict,
+            defect_fix_removed: defect_fix_block(context, pr).is_some(),
+            poison: context.base_poison,
+            tip: &tip,
+        },
+        ledger,
+        Some(context.ledger_path),
+        chrono::Utc::now(),
+    )
 }
 
 /// The classifier's verdict on one same-head `failed_checks` ejection
