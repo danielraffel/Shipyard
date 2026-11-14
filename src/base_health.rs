@@ -169,6 +169,15 @@ pub enum PoisonHold {
 }
 
 impl PoisonHold {
+    /// `on` lowered to `dry-run`, for a pass that must not mutate.
+    #[must_use]
+    pub const fn min_dry_run(self) -> Self {
+        match self {
+            Self::On => Self::DryRun,
+            other => other,
+        }
+    }
+
     /// Parse the config value; anything unrecognised is an error.
     pub fn parse(value: Option<&str>) -> Result<Option<Self>, String> {
         match value.map(str::trim) {
@@ -204,10 +213,72 @@ pub struct BasePoisonPolicy {
     /// cheap checks; a context without an entry stays unlabelled.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub control_workflows: std::collections::BTreeMap<String, String>,
+    /// The red-base triage acts, each switched on its own.
+    #[serde(default)]
+    pub acts: TriageActs,
     /// A key that did not parse. Its setting falls back to the safe value
     /// (the hold to dry-run, the jump to off).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read_error: Option<String>,
+}
+
+/// The red-base triage acts. Each is `off | dry-run | on` under
+/// `[base_health]`, defaults to `dry-run` on a merge-queue base, and reports
+/// one line per act and pass whatever its mode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct TriageActs {
+    /// `reorder_fix`: move a fix that is already queued behind other
+    /// entries to the front (dequeue, then enqueue its exact head with
+    /// `jump: true`), once per episode.
+    pub reorder_fix: PoisonHold,
+    /// `cancel_orphaned_groups`: cancel `merge_group` runs whose
+    /// `gh-readonly-queue/<base>/pr-<n>-<sha>` ref no longer exists.
+    pub cancel_orphaned_groups: PoisonHold,
+    /// `reenqueue_red_base_ejections`: once the base is green, excuse from
+    /// the ejection cap a head whose last removal was a `failed_checks`
+    /// ejection during the episode, so the steward enqueues it again, once.
+    pub reenqueue_red_base_ejections: PoisonHold,
+}
+
+impl TriageActs {
+    /// Config keys, in report order.
+    pub const KEYS: [&'static str; 3] = [
+        "reorder_fix",
+        "cancel_orphaned_groups",
+        "reenqueue_red_base_ejections",
+    ];
+
+    /// Every act at `mode`.
+    #[must_use]
+    pub const fn all(mode: PoisonHold) -> Self {
+        Self {
+            reorder_fix: mode,
+            cancel_orphaned_groups: mode,
+            reenqueue_red_base_ejections: mode,
+        }
+    }
+
+    /// Whether every triage act is disabled.
+    #[must_use]
+    pub const fn all_off(self) -> bool {
+        matches!(
+            self,
+            Self {
+                reorder_fix: PoisonHold::Off,
+                cancel_orphaned_groups: PoisonHold::Off,
+                reenqueue_red_base_ejections: PoisonHold::Off,
+            }
+        )
+    }
+
+    fn slot(&mut self, key: &str) -> Option<&mut PoisonHold> {
+        match key {
+            "reorder_fix" => Some(&mut self.reorder_fix),
+            "cancel_orphaned_groups" => Some(&mut self.cancel_orphaned_groups),
+            "reenqueue_red_base_ejections" => Some(&mut self.reenqueue_red_base_ejections),
+            _ => None,
+        }
+    }
 }
 
 impl BasePoisonPolicy {
@@ -228,6 +299,11 @@ impl BasePoisonPolicy {
                 PoisonHold::Off
             },
             control_workflows: std::collections::BTreeMap::new(),
+            acts: TriageActs::all(if merge_queue {
+                PoisonHold::DryRun
+            } else {
+                PoisonHold::Off
+            }),
             read_error: None,
         }
     }
@@ -288,6 +364,20 @@ impl BasePoisonPolicy {
                     "base_health.control_workflows must be a table of context = \"workflow.yml\""
                         .to_owned(),
                 ),
+            }
+        }
+        if merge_queue {
+            for key in TriageActs::KEYS {
+                match PoisonHold::parse(text(key)) {
+                    Ok(Some(mode)) => {
+                        if let Some(slot) = policy.acts.slot(key) {
+                            *slot = mode;
+                        }
+                    }
+                    Ok(None) => {}
+                    // A typo falls back to dry-run, never to `on`.
+                    Err(error) => errors.push(error.replace("merge_group_hold", key)),
+                }
             }
         }
         match AutoJump::parse(text("auto_jump")) {

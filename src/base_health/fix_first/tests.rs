@@ -164,6 +164,7 @@ fn an_ambiguous_replay_names_no_fix_and_holds_neither_candidate() {
         max_streak: 2,
         would_hold: Vec::new(),
         decided_at: at("2026-11-13T11:00:00Z"),
+        red_everywhere_since: None,
         tip_runs: vec![run(1, "failure", "2026-11-13T10:00:00Z")],
         prs: vec![
             candidate(
@@ -199,6 +200,7 @@ fn a_single_failure_without_the_streak_does_nothing() {
         max_streak: 1,
         would_hold: Vec::new(),
         decided_at: at("2026-11-13T11:00:00Z"),
+        red_everywhere_since: None,
         tip_runs: vec![run(1, "failure", "2026-11-13T10:00:00Z")],
         prs: vec![
             candidate(
@@ -268,6 +270,88 @@ fn pulp_replay_does_not_fire_without_a_tip_run_and_holds_with_a_control() {
     assert!(!control.actual_fix_held);
 }
 
+#[test]
+fn red_everywhere_confirms_only_over_a_stale_or_red_tip() {
+    let episode = Some(at("2026-11-13T00:40:00Z"));
+    let stale_green = TipReading {
+        newest_at: Some(at("2026-11-12T23:28:44Z")),
+        ..TipReading::default()
+    };
+    assert_eq!(
+        confirmed_since(&stale_green, episode),
+        episode,
+        "a tip green only from before the episode is stale"
+    );
+    let fresh_green = TipReading {
+        newest_at: Some(at("2026-11-13T00:50:00Z")),
+        ..TipReading::default()
+    };
+    assert_eq!(
+        confirmed_since(&fresh_green, episode),
+        None,
+        "a tip that passed after the episode began ends it"
+    );
+    assert_eq!(
+        confirmed_since(&stale_green, None),
+        None,
+        "the tip alone is green"
+    );
+    let unread = TipReading {
+        error: Some("HTTP 502".to_owned()),
+        ..TipReading::default()
+    };
+    assert_eq!(
+        confirmed_since(&unread, episode),
+        None,
+        "an unread tip confirms nothing"
+    );
+    let red = TipReading {
+        red: true,
+        red_since: Some(at("2026-11-13T00:30:00Z")),
+        ..TipReading::default()
+    };
+    assert_eq!(
+        confirmed_since(&red, episode),
+        Some(at("2026-11-13T00:30:00Z"))
+    );
+    // A red tip with no red time of its own never borrows the episode's
+    // start: it reads red since the end of time, so nothing passes after it.
+    let red_unknown = TipReading {
+        red: true,
+        ..TipReading::default()
+    };
+    assert_eq!(
+        confirmed_since(&red_unknown, episode),
+        Some(DateTime::<Utc>::MAX_UTC)
+    );
+    // A tip read with no completed verdict at all confirms nothing.
+    assert_eq!(confirmed_since(&TipReading::default(), episode), None);
+    // Equal times are not strictly before.
+    let same_time = TipReading {
+        newest_at: episode,
+        ..TipReading::default()
+    };
+    assert_eq!(confirmed_since(&same_time, episode), None);
+}
+
+/// The Pulp tip never re-ran after the date-dependent break. A
+/// red-everywhere episode on the same check, had one begun at 00:40, would
+/// confirm the streak without a control run.
+#[test]
+fn pulp_replay_fires_on_red_everywhere_over_the_stale_tip() {
+    let mut episodes = load(include_str!(
+        "../../../tests/fixtures/base_health/pulp-2026-11-13.json"
+    ));
+    let mut episode = episodes.remove(0);
+    episode.decided_at = at("2026-11-13T01:00:00Z");
+    episode.red_everywhere_since = Some(at("2026-11-13T00:40:00Z"));
+    let outcome = replay(&episode);
+    assert!(outcome.fires, "{}", outcome.why);
+    assert!(outcome.why.contains("tip verdict stale"), "{}", outcome.why);
+    assert_eq!(outcome.held, vec![12140, 12148]);
+    assert_eq!(outcome.fix, None);
+}
+
 /// A labelled fix is picked while a second approved head also passed the
 /// context after the break. Production admits that rival (it covers every
 /// confirmed context), so the replay must not report it held.
@@ -297,6 +381,7 @@ fn a_rival_green_head_beside_a_labelled_fix_is_not_held_in_replay() {
         max_streak: 2,
         would_hold: Vec::new(),
         decided_at: at("2026-11-13T11:00:00Z"),
+        red_everywhere_since: None,
         tip_runs: vec![run(1, "failure", "2026-11-13T10:00:00Z")],
         prs: vec![labelled.clone(), rival.clone(), stale.clone()],
         actual_fix: Some(1),
@@ -315,4 +400,57 @@ fn a_rival_green_head_beside_a_labelled_fix_is_not_held_in_replay() {
     assert!(matches!(decision.pick, Pick::One(ref fix) if fix.pr == 1));
     assert!(!decision.holds(2));
     assert!(decision.holds(3));
+}
+
+/// The unknown-onset sentinel is never formatted: RFC 3339 cannot represent
+/// it, and formatting it would panic the steward.
+#[test]
+fn an_unknown_onset_is_never_formatted() {
+    assert_eq!(onset_text(UNKNOWN_ONSET), "an unknown time");
+    assert_eq!(known_onset(UNKNOWN_ONSET), None);
+    let known = at("2026-11-13T10:32:36Z");
+    assert_eq!(onset_text(known), known.to_rfc3339());
+    let fix = GreenFix {
+        pr: 1,
+        approved_at: known,
+        green_at: known,
+        labelled: false,
+    };
+    assert!(
+        fix.evidence("ctx", UNKNOWN_ONSET)
+            .contains("after the base tip went red at an unknown time")
+    );
+}
+
+/// A replay whose red tip run carries no completion time does not panic and
+/// keeps the onset unknown rather than inventing one.
+#[test]
+fn a_replay_with_a_red_tip_and_no_completion_time_does_not_panic() {
+    let episode = ReplayEpisode {
+        key: "o/r@main".to_owned(),
+        context: "ctx".to_owned(),
+        started_at: at("2026-11-13T10:00:00Z"),
+        ended_at: None,
+        max_streak: 2,
+        would_hold: Vec::new(),
+        decided_at: at("2026-11-13T11:00:00Z"),
+        tip_runs: vec![TipRun {
+            id: 1,
+            conclusion: "failure".to_owned(),
+            completed_at: None,
+        }],
+        red_everywhere_since: Some(at("2026-11-13T10:30:00Z")),
+        prs: vec![candidate(
+            1,
+            Some("2026-11-13T10:40:00Z"),
+            Some("2026-11-13T10:35:00Z"),
+        )],
+        actual_fix: Some(1),
+        note: String::new(),
+    };
+    let outcome = replay(&episode);
+    // A run with no completion time is unseen at any decision time, so the
+    // tip has no verdict and red everywhere cannot stand in for it.
+    assert!(!outcome.fires, "{}", outcome.why);
+    assert_eq!(outcome.fix, None);
 }

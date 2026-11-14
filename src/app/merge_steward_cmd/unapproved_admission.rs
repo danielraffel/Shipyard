@@ -167,7 +167,7 @@ pub(super) fn steward_removal_times(
 }
 
 /// Whether timeline `node` is a non-merge queue removal of `head`.
-fn is_removal_of(node: &Value, head: &str) -> bool {
+pub(super) fn is_removal_of(node: &Value, head: &str) -> bool {
     node.get("__typename").and_then(Value::as_str) == Some("RemovedFromMergeQueueEvent")
         && node
             .pointer("/beforeCommit/oid")
@@ -181,7 +181,11 @@ fn is_removal_of(node: &Value, head: &str) -> bool {
 
 /// `queue` with the removals of `head` that `keep` rejects taken out of its
 /// timeline.
-fn filter_removals(queue: &Value, head: &str, mut keep: impl FnMut(&Value) -> bool) -> Value {
+pub(super) fn filter_removals(
+    queue: &Value,
+    head: &str,
+    mut keep: impl FnMut(&Value) -> bool,
+) -> Value {
     let mut queue = queue.clone();
     if let Some(nodes) = queue
         .pointer_mut("/data/repository/pullRequest/timelineItems/nodes")

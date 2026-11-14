@@ -329,6 +329,11 @@ pub(crate) fn derive_events(old: Option<&PrDigest>, new: &PrDigest) -> Vec<Relay
     }
     let head_moved = old.head != new.head;
     match new.checks {
+        // A pull request in the merge queue is never red to its owner: its
+        // group is the queue's to judge, and a check on its head (a stale or
+        // non-required one) is not the author's to fix (vellum#412). If the
+        // queue ejects it, the `ejected` event above names the red.
+        Checks::Failure if new.in_queue => {}
         Checks::Failure if old.checks != Checks::Failure || old.red != new.red || head_moved => {
             events.push(RelayEvent::RequiredCheck {
                 result: "red".to_owned(),

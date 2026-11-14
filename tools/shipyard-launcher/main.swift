@@ -28,6 +28,7 @@
 // exit status is passed through, and a child killed by signal N kills the
 // launcher with N.
 
+import CryptoKit
 import Darwin
 import Foundation
 import Security
@@ -36,8 +37,14 @@ let launcherVersion = "1"
 let bundleIdentifier = "com.danielraffel.shipyard.launcher"
 /// The codesign identifier of every Shipyard release binary.
 let targetIdentifier = "shipyard"
+/// The only Developer ID team this launcher runs as. A bundle re-signed by any
+/// other team refuses everything, even though its signature is valid.
+let expectedTeam = "95CX6P84C4"
 /// Set in the child's environment so wrappers never route through twice.
 let launcherEnv = "SHIPYARD_LAUNCHER_APP"
+/// Set when the launcher hands a script back to plain /bin/bash: the reason,
+/// so the script neither routes again nor claims the launcher's identity.
+let fallbackEnv = "SHIPYARD_LAUNCHER_FALLBACK"
 /// Scripts the launcher may run, relative to the account's home directory.
 /// They cannot carry a code signature, so they are trusted by this list and
 /// by ownership (see requireTrustedChain), the same trust launchd gives them.
@@ -134,6 +141,7 @@ func ownTeam() -> String {
           team.range(of: "^[A-Z0-9]{10}$", options: .regularExpression) != nil else {
         fail("the launcher has no Team ID", code: 77)
     }
+    guard team == expectedTeam else { fail("the launcher is signed by team \(team), not \(expectedTeam)", code: 77) }
     return team
 }
 
@@ -227,34 +235,113 @@ func resolveShipyard(home: String) -> String {
     return target
 }
 
-func resolveScript(home: String, name: String) -> String {
+// MARK: scripts
+
+/// Run an allowlisted script under the launcher's identity only when its
+/// bytes match the SHA-256 the activation record binds to it (fleet-deploy
+/// records it when it installs the script from main). The verified bytes are
+/// copied to a private directory and that copy runs, so a write after the
+/// check changes nothing. Any doubt (no binding, a different hash, an untrusted
+/// or unreadable file) hands the installed script to plain /bin/bash instead,
+/// exactly as its LaunchAgent would run it without the launcher.
+func runScript(home: String, team: String, name: String, arguments: [String]) -> Never {
     guard let relative = allowedScripts[name] else { fail("script \(name) is not in the launcher's allowlist", code: 77) }
     let path = home + "/" + relative
-    guard let realHome = canonical(home), realHome == home else { fail("home \(home) is not a canonical path", code: 77) }
+    func fallback(_ reason: String) -> Never {
+        logLine("launcher-script-mismatch script=\(name) reason=\(reason)")
+        FileHandle.standardError.write(Data("shipyard-launcher: launcher-script-mismatch: \(reason); running \(path) without the launcher\n".utf8))
+        var environment = ProcessInfo.processInfo.environment
+        environment.removeValue(forKey: launcherEnv)
+        environment[fallbackEnv] = "launcher-script-mismatch"
+        let argv = (["/bin/bash", path] + arguments).map { strdup($0) } + [nil]
+        let envp = environment.map { strdup("\($0.key)=\($0.value)") } + [nil]
+        // exec keeps this pid; its identity becomes /bin/bash, as without the launcher.
+        execve("/bin/bash", argv, envp)
+        fail("cannot exec /bin/bash: \(String(cString: strerror(errno)))", code: 126)
+    }
+    guard let realHome = canonical(home), realHome == home else { fallback("home is not a canonical path") }
+    if let problem = untrustedChain(path, upTo: home) { fallback(problem) }
+    let expected: String
+    switch boundRecord(home: home, team: team) {
+    case .failure(let error): fallback("no bound record: \(error.reason)")
+    case .success(let record):
+        guard let scripts = record["scripts"] as? [String: Any], let entry = scripts[name] as? [String: Any],
+              (entry["path"] as? String) == path, let sha = entry["sha256"] as? String,
+              sha.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil else {
+            fallback("no recorded hash for \(name)")
+        }
+        expected = sha
+    }
+    let fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+    guard fd >= 0 else { fallback("cannot open the script") }
+    let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
     var info = stat()
-    guard lstat(path, &info) == 0 else { fail("\(path) does not exist", code: 127) }
-    requireTrustedChain(path, upTo: home)
-    guard (info.st_mode & S_IFMT) == S_IFREG else { fail("\(path) is not a regular file", code: 77) }
-    return path
+    guard fstat(fd, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG, info.st_uid == getuid(),
+          info.st_mode & 0o022 == 0 else { fallback("the script is not a trusted regular file") }
+    let bytes = handle.readDataToEndOfFile()
+    let actual = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+    guard actual == expected else { fallback("sha256 \(actual) is not the recorded \(expected)") }
+    var template = Array((NSTemporaryDirectory() + "shipyard-launcher-script.XXXXXX").utf8CString)
+    guard let made = mkdtemp(&template) else { fail("cannot create a private directory", code: 70) }
+    let directory = String(cString: made)
+    let copy = directory + "/" + (relative as NSString).lastPathComponent
+    let out = open(copy, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o500)
+    let wrote = out >= 0 ? bytes.withUnsafeBytes { write(out, $0.baseAddress, bytes.count) } : -1
+    if out >= 0 { close(out) }
+    guard wrote == bytes.count else {
+        try? FileManager.default.removeItem(atPath: directory)
+        fail("cannot stage the verified script", code: 70)
+    }
+    run("/bin/bash", ["--noprofile", "--norc", copy] + arguments, script: true, requirement: nil,
+        mode: "script:\(name) sha256=\(actual)", home: home,
+        cleanup: { try? FileManager.default.removeItem(atPath: directory) })
+}
+
+/// Like requireTrustedChain, but returns the problem instead of exiting.
+func untrustedChain(_ path: String, upTo top: String) -> String? {
+    guard path.hasPrefix(top + "/") else { return "\(path) is outside \(top)" }
+    var current = path
+    while true {
+        var info = stat()
+        guard lstat(current, &info) == 0 else { return "cannot inspect \(current)" }
+        if (info.st_mode & S_IFMT) == S_IFLNK { return "\(current) is a symlink" }
+        if !(info.st_uid == getuid() || info.st_uid == 0) { return "\(current) is not owned by this user" }
+        if info.st_mode & 0o022 != 0 { return "\(current) is group- or world-writable" }
+        if current == top { return nil }
+        current = (current as NSString).deletingLastPathComponent
+    }
 }
 
 // MARK: spawning
 
-func childEnvironment(script: Bool) -> [String] {
+/// The system tool directories every child starts with.
+let systemPath = "/usr/bin:/bin:/usr/sbin:/sbin"
+
+/// The child's environment: the caller's, without `DYLD_*`, with the marker
+/// that stops routing twice, and a PATH the launcher sets rather than the
+/// caller. A script gets the system directories and the bundle's own
+/// directory. Shipyard gets its fixed unattended tool path (Homebrew,
+/// ~/.local/bin, then the system directories), the same list its LaunchAgents
+/// use, because it resolves the guarded `gh` wrapper by name.
+func childEnvironment(script: Bool, home: String) -> [String] {
     var environment = ProcessInfo.processInfo.environment
     for key in environment.keys where key.hasPrefix("DYLD_") { environment.removeValue(forKey: key) }
     if script {
         for key in environment.keys where scriptUnsafeEnv.contains(key) || key.hasPrefix("BASH_FUNC_") {
             environment.removeValue(forKey: key)
         }
+        environment["PATH"] = systemPath + ":" + bundleRoot().appendingPathComponent("Contents/MacOS").path
+    } else {
+        environment["PATH"] = "/opt/homebrew/bin:/usr/local/bin:\(home)/.local/bin:" + systemPath
     }
+    environment.removeValue(forKey: fallbackEnv)
     environment[launcherEnv] = bundleRoot().path
     return environment.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }
 }
 
 /// Spawn suspended, with default dispositions and an empty mask for every
 /// forwarded signal, in the launcher's own process group.
-func spawnSuspended(_ executable: String, _ arguments: [String], _ environment: [String]) -> pid_t {
+func spawnSuspended(_ executable: String, _ arguments: [String], _ environment: [String], stdout: Int32? = nil) -> pid_t {
     var attr: posix_spawnattr_t?
     guard posix_spawnattr_init(&attr) == 0 else { fail("cannot initialize spawn attributes", code: 70) }
     defer { posix_spawnattr_destroy(&attr) }
@@ -271,10 +358,19 @@ func spawnSuspended(_ executable: String, _ arguments: [String], _ environment: 
     defer { argv.forEach { free($0) }; envp.forEach { free($0) } }
     var argvPointers = argv + [nil]
     var envpPointers = envp + [nil]
+    var actions: posix_spawn_file_actions_t?
+    guard posix_spawn_file_actions_init(&actions) == 0 else { fail("cannot initialize spawn file actions", code: 70) }
+    defer { posix_spawn_file_actions_destroy(&actions) }
+    if let stdout {
+        guard posix_spawn_file_actions_adddup2(&actions, stdout, 1) == 0,
+              posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0) == 0 else {
+            fail("cannot redirect the child's output", code: 70)
+        }
+    }
     var pid: pid_t = 0
     let result = argvPointers.withUnsafeMutableBufferPointer { av in
         envpPointers.withUnsafeMutableBufferPointer { ep in
-            posix_spawn(&pid, executable, nil, &attr, av.baseAddress, ep.baseAddress)
+            posix_spawn(&pid, executable, &actions, &attr, av.baseAddress, ep.baseAddress)
         }
     }
     guard result == 0 else { fail("cannot spawn \(executable): \(String(cString: strerror(result)))", code: 126) }
@@ -314,7 +410,8 @@ func exitLikeChild(_ status: Int32) -> Never {
     exit(128 + signal)
 }
 
-func run(_ executable: String, _ arguments: [String], script: Bool, requirement: SecRequirement?, mode: String) -> Never {
+func run(_ executable: String, _ arguments: [String], script: Bool, requirement: SecRequirement?, mode: String,
+         home: String, cleanup: (() -> Void)? = nil) -> Never {
     // Hold the forwarded signals until the child is verified and the handlers
     // know its pid; any that arrive meanwhile are delivered on unblock.
     var blocked = sigset_t(), previous = sigset_t()
@@ -322,7 +419,7 @@ func run(_ executable: String, _ arguments: [String], script: Bool, requirement:
     for number in forwardedSignals { sigaddset(&blocked, number) }
     sigprocmask(SIG_BLOCK, &blocked, &previous)
     terminalForeground = isatty(0) == 1 && tcgetpgrp(0) == getpgrp()
-    let pid = spawnSuspended(executable, arguments, childEnvironment(script: script))
+    let pid = spawnSuspended(executable, arguments, childEnvironment(script: script, home: home))
     if let requirement, !childSatisfies(pid, requirement) {
         kill(pid, SIGKILL)
         var ignored: Int32 = 0
@@ -337,7 +434,7 @@ func run(_ executable: String, _ arguments: [String], script: Bool, requirement:
     var status: Int32 = 0
     while true {
         let result = waitpid(pid, &status, 0)
-        if result == pid { exitLikeChild(status) }
+        if result == pid { cleanup?(); exitLikeChild(status) }
         if result == -1 && errno != EINTR { fail("waitpid failed: \(String(cString: strerror(errno)))", code: 70) }
     }
 }
@@ -467,36 +564,54 @@ func probeGrant() -> (String, String) {
 /// grant demotes the record (renamed to activation.json.demoted-<time>), so
 /// nothing routes until --activate runs again. Every other doubt is
 /// "not active" and leaves the record alone. Exit 0 active, 1 not.
-func launcherActive(home: String, team: String) -> Never {
-    let path = home + "/.local/share/shipyard/launcher/activation.json"
+let activationRelative = "/.local/share/shipyard/launcher/activation.json"
+
+/// The activation record, only when it is trusted (a regular file owned by
+/// this user, not group- or world-writable, in private directories up to
+/// home), parses as schema 2, and names this exact bundle: path, identifier,
+/// team and code directory hash. Otherwise the reason it is not usable.
+func boundRecord(home: String, team: String) -> Result<[String: Any], ReasonError> {
+    let path = home + activationRelative
     var info = stat()
-    guard lstat(path, &info) == 0 else { activeReport(false, "not_activated") }
-    if let problem = untrustedFile(path) { activeReport(false, "record_untrusted: \(problem)") }
+    guard lstat(path, &info) == 0 else { return .failure(ReasonError("not_activated")) }
+    if let problem = untrustedFile(path) { return .failure(ReasonError("record_untrusted: \(problem)")) }
     var directory = (path as NSString).deletingLastPathComponent
     while directory.hasPrefix(home + "/") || directory == home {
         var dirInfo = stat()
         guard lstat(directory, &dirInfo) == 0, (dirInfo.st_mode & S_IFMT) == S_IFDIR,
               dirInfo.st_uid == getuid() || dirInfo.st_uid == 0, dirInfo.st_mode & 0o022 == 0 else {
-            activeReport(false, "record_untrusted: \(directory) is not a private directory")
+            return .failure(ReasonError("record_untrusted: \(directory) is not a private directory"))
         }
         if directory == home { break }
         directory = (directory as NSString).deletingLastPathComponent
     }
     let fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
-    guard fd >= 0 else { activeReport(false, "record_unreadable") }
+    guard fd >= 0 else { return .failure(ReasonError("record_unreadable")) }
     let data = FileHandle(fileDescriptor: fd, closeOnDealloc: true).readDataToEndOfFile()
-    guard var record = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
-        activeReport(false, "record_unreadable")
+    guard let record = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+        return .failure(ReasonError("record_unreadable"))
     }
-    guard (record["schema"] as? Int) == 2 else { activeReport(false, "record_schema") }
+    guard (record["schema"] as? Int) == 2 else { return .failure(ReasonError("record_schema")) }
     let installed = canonical(home + "/.local/libexec/ShipyardLauncher.app")
     guard let app = record["app"] as? String, app == bundleRoot().path, installed == app else {
-        activeReport(false, "record_names_another_bundle")
+        return .failure(ReasonError("record_names_another_bundle"))
     }
-    guard (record["identifier"] as? String) == bundleIdentifier else { activeReport(false, "record_identifier_mismatch") }
-    guard (record["team"] as? String) == team else { activeReport(false, "record_team_mismatch") }
+    guard (record["identifier"] as? String) == bundleIdentifier else { return .failure(ReasonError("record_identifier_mismatch")) }
+    guard (record["team"] as? String) == team else { return .failure(ReasonError("record_team_mismatch")) }
     guard let cdhash = ownCDHash(), (record["cdhash"] as? String) == cdhash else {
-        activeReport(false, "bundle_replaced: code directory hash differs from the activated bundle")
+        return .failure(ReasonError("bundle_replaced: code directory hash differs from the activated bundle"))
+    }
+    return .success(record)
+}
+
+struct ReasonError: Error { let reason: String; init(_ reason: String) { self.reason = reason } }
+
+func launcherActive(home: String, team: String) -> Never {
+    let path = home + activationRelative
+    var record: [String: Any]
+    switch boundRecord(home: home, team: team) {
+    case .success(let value): record = value
+    case .failure(let error): activeReport(false, error.reason)
     }
     guard let checked = record["fda_checked_at"] as? Double else { activeReport(false, "record_unreadable") }
     let age = Date().timeIntervalSince1970 - checked
@@ -514,6 +629,114 @@ func launcherActive(home: String, team: String) -> Never {
     default:
         activeReport(false, "grant_unknown: \(detail)")
     }
+}
+
+// MARK: release floor
+//
+// A downgrade guard without an exact pin. Every release that passes the
+// signature checks is accepted unless its version is below the newest one this
+// launcher has run on the host; a newer release passes at once, so a fresh
+// install never waits for anything. (An exact path and cdhash pin would make
+// every install fall back until someone re-recorded it, which is the prompt
+// window this bundle exists to close.)
+
+let floorRelative = "/.local/share/shipyard/launcher/release-floor.json"
+let versionSeconds = 15.0
+
+func parseVersion(_ text: String) -> [Int]? {
+    let line = text.split(separator: "\n").first.map(String.init) ?? ""
+    guard let match = line.range(of: "^shipyard [0-9]+\\.[0-9]+\\.[0-9]+", options: .regularExpression) else { return nil }
+    let parts = line[match].dropFirst("shipyard ".count).split(separator: ".").compactMap { Int($0) }
+    return parts.count == 3 ? parts : nil
+}
+
+/// The release's own `--version`, run the way the release itself will be run:
+/// spawned suspended, the loaded code checked against the requirement, then
+/// resumed and bounded. Nil when any of that fails or the output is not
+/// `shipyard X.Y.Z`.
+func releaseVersion(_ target: String, _ requirement: SecRequirement, home: String) -> [Int]? {
+    var fds: [Int32] = [0, 0]
+    guard pipe(&fds) == 0 else { return nil }
+    let pid = spawnSuspended(target, ["--version"], childEnvironment(script: false, home: home), stdout: fds[1])
+    close(fds[1])
+    defer { close(fds[0]) }
+    guard childSatisfies(pid, requirement) else {
+        kill(pid, SIGKILL); var ignored: Int32 = 0; waitpid(pid, &ignored, 0); return nil
+    }
+    kill(pid, SIGCONT)
+    _ = fcntl(fds[0], F_SETFL, O_NONBLOCK)
+    var output = Data()
+    var buffer = [UInt8](repeating: 0, count: 4096)
+    var status: Int32 = 0
+    let deadline = Date().addingTimeInterval(versionSeconds)
+    while true {
+        let count = read(fds[0], &buffer, buffer.count)
+        if count > 0 { output.append(buffer, count: count); if output.count > 65536 { break } }
+        if waitpid(pid, &status, WNOHANG) == pid { break }
+        if Date() >= deadline { kill(pid, SIGKILL); waitpid(pid, &status, 0); return nil }
+        if count <= 0 { usleep(20_000) }
+    }
+    while true {
+        let count = read(fds[0], &buffer, buffer.count)
+        if count <= 0 { break }
+        output.append(buffer, count: count)
+    }
+    guard status & 0x7f == 0, (status >> 8) & 0xff == 0 else { return nil }
+    return parseVersion(String(decoding: output, as: UTF8.self))
+}
+
+/// The newest version this launcher ran, nil before the first run, or the
+/// reason the floor file cannot be trusted (which fails closed).
+func readFloor(home: String) -> Result<[Int]?, ReasonError> {
+    let path = home + floorRelative
+    var info = stat()
+    guard lstat(path, &info) == 0 else { return .success(nil) }
+    if let problem = untrustedFile(path) { return .failure(ReasonError("release floor untrusted: \(problem)")) }
+    let fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+    guard fd >= 0 else { return .failure(ReasonError("release floor unreadable")) }
+    let data = FileHandle(fileDescriptor: fd, closeOnDealloc: true).readDataToEndOfFile()
+    guard let value = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+          (value["schema"] as? Int) == 1, let version = value["version"] as? String,
+          let parsed = parseVersion("shipyard " + version) else {
+        return .failure(ReasonError("release floor unreadable"))
+    }
+    return .success(parsed)
+}
+
+func versionText(_ version: [Int]) -> String { version.map(String.init).joined(separator: ".") }
+
+/// Nil when `version` may run, else why not.
+func belowFloor(_ version: [Int], home: String) -> String? {
+    switch readFloor(home: home) {
+    case .failure(let error): return error.reason
+    case .success(nil): return nil
+    case .success(let floor?):
+        return version.lexicographicallyPrecedes(floor)
+            ? "release_downgrade: \(versionText(version)) is older than \(versionText(floor)), the newest run here" : nil
+    }
+}
+
+func raiseFloor(_ version: [Int], home: String) {
+    if case .success(let floor?) = readFloor(home: home), !floor.lexicographicallyPrecedes(version) { return }
+    let path = home + floorRelative
+    let directory = (path as NSString).deletingLastPathComponent
+    mkdir(directory, 0o700)
+    let record: [String: Any] = ["schema": 1, "version": versionText(version), "raised_at": Date().timeIntervalSince1970]
+    if !replaceRecord(path, record) { logLine("could not raise the release floor to \(versionText(version))") }
+}
+
+/// Run the release without the launcher: exec keeps this pid, so it is
+/// exactly what the job would run on its own.
+func fallbackShipyard(_ target: String, _ arguments: [String], reason: String) -> Never {
+    logLine("launcher-release-fallback reason=\(reason)")
+    FileHandle.standardError.write(Data("shipyard-launcher: \(reason); running \(target) without the launcher\n".utf8))
+    var environment = ProcessInfo.processInfo.environment
+    environment.removeValue(forKey: launcherEnv)
+    environment[fallbackEnv] = "launcher-release-fallback"
+    let argv = ([target] + arguments).map { strdup($0) } + [nil]
+    let envp = environment.map { strdup("\($0.key)=\($0.value)") } + [nil]
+    execve(target, argv, envp)
+    fail("cannot exec \(target): \(String(cString: strerror(errno)))", code: 126)
 }
 
 // MARK: main
@@ -538,18 +761,10 @@ let team = ownTeam()
 let requirement = targetRequirement(team: team)
 if first == "--launcher-script" {
     guard arguments.count >= 2 else { fail("usage: --launcher-script <name> [arguments...]", code: 64) }
-    let script = resolveScript(home: home, name: arguments[1])
-    run("/bin/bash", ["--noprofile", "--norc", script] + arguments.dropFirst(2), script: true, requirement: nil, mode: "script:\(arguments[1])")
+    runScript(home: home, team: team, name: arguments[1], arguments: Array(arguments.dropFirst(2)))
 }
 let target = resolveShipyard(home: home)
 requireSignedFile(target, requirement)
-#if SHIPYARD_LAUNCHER_TESTING
-// Lets a test replace the release between the static check and the spawn,
-// the race the check of the suspended child exists for.
-if let swap = ProcessInfo.processInfo.environment["SHIPYARD_LAUNCHER_TEST_SWAP_IN"] {
-    guard rename(swap, target) == 0 else { fail("test swap failed", code: 70) }
-}
-#endif
 if first == "--launcher-verify" {
     guard arguments.count == 1 else { fail("usage: --launcher-verify", code: 64) }
     let report: [String: Any] = ["schema": 1, "ok": true, "launcher_version": launcherVersion, "team": team, "target": target]
@@ -558,8 +773,21 @@ if first == "--launcher-verify" {
     }
     exit(0)
 }
+let version = releaseVersion(target, requirement, home: home)
 if first == "--launcher-active" {
     guard arguments.count == 1 else { fail("usage: --launcher-active", code: 64) }
+    guard let version else { activeReport(false, "release_version_unreadable") }
+    if let reason = belowFloor(version, home: home) { activeReport(false, reason) }
     launcherActive(home: home, team: team)
 }
-run(target, arguments, script: false, requirement: requirement, mode: "shipyard")
+guard let version else { fallbackShipyard(target, arguments, reason: "release_version_unreadable") }
+if let reason = belowFloor(version, home: home) { fallbackShipyard(target, arguments, reason: reason) }
+raiseFloor(version, home: home)
+#if SHIPYARD_LAUNCHER_TESTING
+// Lets a test replace the release between the static check and the spawn,
+// the race the check of the suspended child exists for.
+if let swap = ProcessInfo.processInfo.environment["SHIPYARD_LAUNCHER_TEST_SWAP_IN"] {
+    guard rename(swap, target) == 0 else { fail("test swap failed", code: 70) }
+}
+#endif
+run(target, arguments, script: false, requirement: requirement, mode: "shipyard \(versionText(version))", home: home)

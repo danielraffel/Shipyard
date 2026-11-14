@@ -71,6 +71,10 @@ pub(super) struct Stall {
     /// another way ([`super::superseded`]). Never changes `blocked_on`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub superseded: Option<super::superseded::Evidence>,
+    /// The scheduling loop's state, act, actor, deadline and level for this
+    /// pull request ([`super::scheduling_loop`], `docs/scheduling-loop.md`).
+    #[serde(rename = "loop", skip_serializing_if = "Option::is_none")]
+    pub loop_state: Option<super::scheduling_loop::Loop>,
     /// This head fails a required check the same way as other open pull
     /// requests: a base-level episode ([`super::red_everywhere`]). Never
     /// changes `blocked_on`; `repair_skip` is set under enforce.
@@ -782,6 +786,7 @@ fn approval_blocked(blocker: &ApprovalBlocker, green_since: Option<String>) -> (
             next_action: None,
             superseded: None,
             red_everywhere: None,
+            loop_state: None,
         },
         hint,
     )
@@ -976,6 +981,7 @@ fn dated(
             next_action: None,
             superseded: None,
             red_everywhere: None,
+            loop_state: None,
         },
         hint,
     )
