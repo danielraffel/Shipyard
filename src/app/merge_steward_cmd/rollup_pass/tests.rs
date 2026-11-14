@@ -643,4 +643,10 @@ fn rows_merged_or_enqueued_this_tick_stay_in_the_pre_mutation_snapshot() {
         ready.iter().map(|ready| ready.pr).collect::<Vec<_>>(),
         vec![1, 2, 3]
     );
+    // The apply pass may have merged these rows before the report is
+    // rendered. Planning from the snapshot must still read and name all
+    // members of that original batch.
+    let fake = Fake::new(&[(1, &["a.rs"]), (2, &["b.rs"]), (3, &["c.rs"])]);
+    let report = fake.plan(&Policy::default(), &ready);
+    assert_eq!(members(&report), vec![1, 2, 3]);
 }

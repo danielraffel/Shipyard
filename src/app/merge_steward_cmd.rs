@@ -1606,7 +1606,8 @@ fn plan_rollup(
     args: &StewardCommandArgs,
     observation: &RepoObservation,
     ledger_path: &Path,
-    report: &RepoReport,
+    merge_path: &str,
+    prs: &[PrReport],
 ) -> Option<rollup_pass::Report> {
     let run_gh = |gh_args: &[String]| actions.run_gh(gh_args).map_err(|error| error.to_string());
     let cache = ledger_path
@@ -1616,14 +1617,52 @@ fn plan_rollup(
     rollup_pass::run(
         &run_gh,
         observation,
-        &report.merge_path,
-        &report.prs,
+        merge_path,
+        prs,
         &rollup_pass::Throttle {
             dir: cache.as_deref(),
             write: args.apply,
             now: Utc::now(),
             expired: &expired,
         },
+    )
+}
+
+/// Capture rollup inputs before an applying pass mutates any ready PR.
+fn pre_mutation_rollup(
+    actions: &GitHubActions,
+    args: &StewardCommandArgs,
+    observation: &RepoObservation,
+    ledger: &StewardLedger,
+    ledger_path: &Path,
+) -> Option<rollup_pass::Report> {
+    if !args.apply || pass_budget::deadline_passed(args.pass_deadline) {
+        return None;
+    }
+    let policy = pass_policy(actions, args, observation);
+    let prs = observation
+        .prs
+        .iter()
+        .map(|pr| PrReport {
+            number: pr.fact.number,
+            head_sha: pr.fact.head_sha.clone(),
+            decision: classify_pr(
+                &pr.fact,
+                &policy,
+                &attempts_for(ledger, &observation.repo, &pr.fact),
+            ),
+            mutation: None,
+            error: None,
+            blocked: blocked_on::Stall::default(),
+        })
+        .collect::<Vec<_>>();
+    plan_rollup(
+        actions,
+        args,
+        observation,
+        ledger_path,
+        policy.merge_path(),
+        &prs,
     )
 }
 
@@ -1783,6 +1822,12 @@ fn steward_repo_observed(
             // A successful repository-wide probe proves this credential/repo
             // scope is usable again; clear its stale receipt before planning.
             ledger.rate_limit_cooldowns.remove(&cooldown_key);
+            // Rollup planning reads each candidate's live approval and compare
+            // files. Capture those inputs before apply_repo_plan can merge or
+            // enqueue any of the ready pull requests; after mutation, the
+            // base and PR state no longer describe this batch.
+            let snapshot_rollup =
+                pre_mutation_rollup(actions, args, &observation, ledger, ledger_path);
             let (mut report, failed, planned_preemptions) = apply_repo_plan(
                 actions,
                 args,
@@ -1800,7 +1845,16 @@ fn steward_repo_observed(
                 report.cancellations.extend(cancellations);
             }
             if !pass_budget::deadline_passed(args.pass_deadline) {
-                report.rollup = plan_rollup(actions, args, &observation, ledger_path, &report);
+                report.rollup = snapshot_rollup.or_else(|| {
+                    plan_rollup(
+                        actions,
+                        args,
+                        &observation,
+                        ledger_path,
+                        &report.merge_path,
+                        &report.prs,
+                    )
+                });
             }
             if args.apply && pass_budget::deadline_passed(args.pass_deadline) {
                 report
@@ -2300,7 +2354,7 @@ pub(super) use observation::{parse_rest_check, parse_rest_status};
 pub(super) use render::{is_admin_protection_denied, is_private_free_entitlement};
 
 use cancellation::{
-    apply_repo_plan, cancellation_reason_label, queue_front_head, timestamp_old_enough,
+    apply_repo_plan, cancellation_reason_label, pass_policy, queue_front_head, timestamp_old_enough,
 };
 use cancellation_recovery::resume_pending_cancellations;
 use cancellation_revalidation::pull_request;
