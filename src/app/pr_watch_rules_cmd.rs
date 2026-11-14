@@ -568,7 +568,7 @@ mod tests {
     #[test]
     fn a_repository_workflow_override_is_used_unless_cli_qualifies_it() {
         assert_eq!(
-            parse_repo_spec_with_overrides("owner/repo", "build.yml", &Default::default())
+            parse_repo_spec_with_overrides("owner/repo", "build.yml", &std::collections::BTreeMap::default())
                 .unwrap()
                 .workflow,
             "build.yml"
