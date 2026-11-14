@@ -4593,7 +4593,7 @@ asks for an arm the verdict allows. An approval comment stamped (by `ghapp`) wit
 landing; a shared session alone never refuses, and unstamped verdicts count
 as before. `shipyard who --contact N` names and probes the cmux address of the session
 that owns PR N (`shipyard owner register|release`; `shipyard relay` delivers
-PR events to it, docs/owner-relay.md). `shipyard who --pr N` names the host and session (and agent, when
+PR events to it, docs/owner-relay.md; `relay::derive_events` never emits a red `required_check` while the PR is `in_queue`, and an ejection at the same head names the red instead). `shipyard who --pr N` names the host and session (and agent, when
 recorded) behind each
 queue and merge event from the guards' ledgers on every host. `shipyard
 review-verdict --pr N [--head SHA] --json` gives the same decision with the
