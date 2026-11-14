@@ -14,13 +14,13 @@
 //! Full Disk Access grant that is still in place. A launcher without a grant
 //! would raise its own prompt, so in every other case nothing changes.
 //!
-//! Two entry points use it:
-//! - [`route_launchd_job`]: a launchd job whose program is this binary (for
-//!   example `com.danielraffel.shipyard.fleet-reconcile`) replaces itself with
-//!   the launcher. `exec` keeps the pid, and the pid is the job's responsible
-//!   process, so the launcher bundle becomes the job's identity.
-//! - The daemon agent plist (`daemon_launcher::start_via_launchd_with`) names
-//!   the launcher as its program.
+//! [`route_launchd_job`] is the entry point here: a launchd job whose program
+//! is this binary (for example `com.danielraffel.shipyard.fleet-reconcile`)
+//! replaces itself with the launcher. `exec` keeps the pid, and the pid is the
+//! job's responsible process, so the launcher bundle becomes the job's
+//! identity. The daemon and its supervisor are never routed (they keep their
+//! own stable launcher copy, see `daemon_launcher`), so no launcher state can
+//! keep the daemon down.
 
 use std::ffi::OsString;
 use std::fs;
@@ -64,7 +64,7 @@ pub fn log_path(home: &Path) -> PathBuf {
     home.join("Library/Logs/shipyard-launcher.log")
 }
 
-/// Why a launchd job or the daemon ran Shipyard directly.
+/// Why a launchd job ran Shipyard directly.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Direct {
     /// No activation record: the host never confirmed the launcher's grant.
@@ -117,6 +117,12 @@ pub fn active_executable(
 /// release (as `--launcher-verify` does), then the activation record and the
 /// grant. Anything else, a timeout included, is the reason to run directly.
 pub fn launcher_active(executable: &Path) -> Result<(), String> {
+    launcher_active_within(executable, VERIFY_TIMEOUT)
+}
+
+/// [`launcher_active`] with an explicit bound; a launcher still running at
+/// `timeout` is killed and counts as not active.
+pub fn launcher_active_within(executable: &Path, timeout: Duration) -> Result<(), String> {
     let mut child = Command::new(executable)
         .arg("--launcher-active")
         .env_remove(LAUNCHER_ENV)
@@ -126,12 +132,12 @@ pub fn launcher_active(executable: &Path) -> Result<(), String> {
         .spawn()
         .map_err(|error| format!("cannot run {}: {error}", executable.display()))?;
     let Some(status) = child
-        .wait_timeout(VERIFY_TIMEOUT)
+        .wait_timeout(timeout)
         .map_err(|error| error.to_string())?
     else {
         let _ = child.kill();
         let _ = child.wait();
-        return Err(format!("timed out after {}s", VERIFY_TIMEOUT.as_secs()));
+        return Err(format!("timed out after {}s", timeout.as_secs()));
     };
     let mut stdout = String::new();
     if let Some(mut pipe) = child.stdout.take() {
@@ -223,14 +229,16 @@ impl JobFacts {
     }
 }
 
-/// `daemon run`, or `daemon supervise --in-place`.
+/// `daemon run` or `daemon supervise` (either step). The daemon and its
+/// supervisor are never routed: launchd restarts the daemon agent at login and
+/// after a failure, and no state of the launcher may keep it down.
 #[must_use]
 pub fn is_daemon_internal(arguments: impl Iterator<Item = OsString>) -> bool {
     let arguments: Vec<OsString> = arguments.collect();
     arguments.iter().any(|argument| argument == "--in-place")
         || arguments
             .windows(2)
-            .any(|pair| pair[0] == "daemon" && pair[1] == "run")
+            .any(|pair| pair[0] == "daemon" && (pair[1] == "run" || pair[1] == "supervise"))
 }
 
 /// When this process is a launchd job's own Shipyard program and the host
@@ -245,25 +253,34 @@ pub fn route_launchd_job() {
     }
     let home = crate::paths::home_dir();
     let facts = JobFacts::current(&home);
+    let _ = route_with(&facts, &home, &launcher_active, &exec_launcher);
+}
+
+/// [`route_launchd_job`] with its facts, verdict and `exec` injected. Returns
+/// the line it logged, if any. It returns at all only when nothing was
+/// exec'd: routing does not apply, the launcher is not active, or `exec`
+/// failed. In each case the caller goes on to run Shipyard directly.
+pub fn route_with(
+    facts: &JobFacts,
+    home: &Path,
+    active: &dyn Fn(&Path) -> Result<(), String>,
+    exec: &dyn Fn(&Path) -> std::io::Error,
+) -> Option<String> {
     if !facts.wants_routing() {
-        return;
+        return None;
     }
     let label = facts.xpc_service_name.clone().unwrap_or_default();
-    match active_executable(&home, &launcher_active) {
+    let line = match active_executable(home, active) {
         Ok(executable) => {
-            log(&home, &format!("job={label} launcher=app"));
-            let error = exec_launcher(&executable);
-            log(
-                &home,
-                &format!("job={label} launcher=direct reason=exec_failed: {error}"),
-            );
+            log(home, &format!("job={label} launcher=app"));
+            let error = exec(&executable);
+            format!("job={label} launcher=direct reason=exec_failed: {error}")
         }
-        Err(Direct::NotActivated) => {}
-        Err(direct) => log(
-            &home,
-            &format!("job={label} launcher=direct reason={}", direct.reason()),
-        ),
-    }
+        Err(Direct::NotActivated) => return None,
+        Err(direct) => format!("job={label} launcher=direct reason={}", direct.reason()),
+    };
+    log(home, &line);
+    Some(line)
 }
 
 fn exec_launcher(executable: &Path) -> std::io::Error {

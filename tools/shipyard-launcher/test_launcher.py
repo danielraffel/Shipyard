@@ -158,6 +158,15 @@ class LauncherTests(LauncherBase):
         self.assertIn("is not the verified Shipyard; killed it", result.stderr)
         self.assertNotIn("ARG:ran", result.stdout)
 
+    def test_a_team_pinned_requirement_refuses_a_release_without_that_team(self):
+        # The Security framework evaluates the OU pin itself: an ad-hoc release
+        # (no team) fails it, so a release of another team would too.
+        self.install_release()
+        pinned = 'identifier "shipyard" and certificate leaf[subject.OU] = "TESTTEAM00"'
+        result = self.launch("args", "ran", env={"SHIPYARD_LAUNCHER_TEST_REQUIREMENT": pinned})
+        self.assertEqual(result.returncode, 77, result.stderr)
+        self.assertNotIn("ARG:ran", result.stdout)
+
     def test_pointer_outside_generations_is_refused(self):
         elsewhere = self.home / "elsewhere"
         elsewhere.mkdir(mode=0o700)

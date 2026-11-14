@@ -12,7 +12,7 @@ private clones under `~/.local/share/shipyard-steward/deploy/` and installs:
 | `tick` | `tools/steward-tick/shipyard-steward-tick.sh` | `~/.local/libexec/shipyard-steward-tick.sh` | `bash -n` |
 | `deploy` | `tools/fleet-deploy/fleet-deploy.sh` | `~/.local/libexec/shipyard-fleet-deploy.sh` | `bash -n` |
 | `pass-runner` | fleet-handbook `scripts/pass-runner` | the live pass-runner directory | fleet-handbook's `install-pass-runner.sh`, which self-tests the source first and backs up what it replaces |
-| `launcher` | a signed bundle staged at `~/.local/share/shipyard/launcher/staged/ShipyardLauncher.app` (macOS only) | `~/.local/libexec/ShipyardLauncher.app` | `tools/shipyard-launcher/shipyard-launcher-check --verify-bundle` on the staged bundle and again on the copy: Developer ID, the installed Shipyard's team, the launcher's bundle identifier, notarized |
+| `launcher` | a signed bundle staged at `~/.local/share/shipyard/launcher/staged/ShipyardLauncher.app` (macOS only) | `~/.local/libexec/ShipyardLauncher.app` | `tools/shipyard-launcher/shipyard-launcher-check --verify-bundle` on the staged bundle and again on the copy: Developer ID by the pinned team, the launcher's bundle identifier, notarized, and a CFBundleVersion at or above the highest installed; then `--activate` once the owner's grant is in place |
 
 A unit is installed only when its source changed. Files are replaced through a
 temporary file and `mv`, so a running script keeps reading the old file, and
@@ -43,6 +43,8 @@ The script exits 0 in every case.
 | `FLEET_DEPLOY_KEEP_BACKUPS` | `5` |
 | `FLEET_DEPLOY_LAUNCHER_STAGED` | `~/.local/share/shipyard/launcher/staged/ShipyardLauncher.app` |
 | `FLEET_DEPLOY_LAUNCHER_DEST` | `~/.local/libexec/ShipyardLauncher.app` |
+| `FLEET_DEPLOY_LAUNCHER_TIMEOUT_S` | `45` (bound on each launcher call) |
+| `SHIPYARD_LAUNCHER_AUTO_ACTIVATE` | `on`; `off` leaves activation to `shipyard-launcher-check --activate` |
 
 ## First install on a host
 

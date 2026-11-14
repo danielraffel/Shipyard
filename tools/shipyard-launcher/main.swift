@@ -36,6 +36,9 @@ let launcherVersion = "1"
 let bundleIdentifier = "com.danielraffel.shipyard.launcher"
 /// The codesign identifier of every Shipyard release binary.
 let targetIdentifier = "shipyard"
+/// The only Developer ID team this launcher runs as. A bundle re-signed by any
+/// other team refuses everything, even though its signature is valid.
+let expectedTeam = "95CX6P84C4"
 /// Set in the child's environment so wrappers never route through twice.
 let launcherEnv = "SHIPYARD_LAUNCHER_APP"
 /// Scripts the launcher may run, relative to the account's home directory.
@@ -134,6 +137,7 @@ func ownTeam() -> String {
           team.range(of: "^[A-Z0-9]{10}$", options: .regularExpression) != nil else {
         fail("the launcher has no Team ID", code: 77)
     }
+    guard team == expectedTeam else { fail("the launcher is signed by team \(team), not \(expectedTeam)", code: 77) }
     return team
 }
 

@@ -5573,16 +5573,19 @@ runs once the owner granted Full Disk Access) must name this exact bundle
 hour or reconfirmed without a prompt; a revoked grant demotes the record.
 While active: a launchd job whose program is the release binary (parent 1,
 `XPC_SERVICE_NAME` set, same file as the pointer) `exec`s the bundle with the
-same argv at startup; the daemon agent plist names the bundle as its program;
-and the installed steward tick `exec`s `shipyard-launcher --launcher-script
+same argv at startup (the check is bounded at 45 s, and a failed `exec` falls
+back to running directly), and the installed steward tick `exec`s `shipyard-launcher --launcher-script
 steward-tick`. `exec` *into* the bundle is what moves the identity: the pid
 stays the job's responsible process and now runs the bundle. When the
 launcher is missing or not active, everything runs directly as before, so an
 ungranted launcher never prompts.
 Routing decisions go to `~/Library/Logs/shipyard-launcher.log` and the tick's
-`launcher=app|direct` summary token. On an activated host the daemon's parent
-is the release's `daemon supervise`, whose parent is the bundle under launchd;
-`scripts/production_daemon_parent.py` accepts that shape too.
+`launcher=app|direct` summary token. The daemon and its supervisor are never
+routed: the daemon agent keeps its stable launcher copy as its program, so a
+missing or refusing launcher can never keep a KeepAlive restart down. The
+team is pinned (`95CX6P84C4`) in both the launcher and the check tool, never
+read from `~/.local/bin/shipyard`; fleet-deploy refuses to install or
+activate a bundle older (CFBundleVersion) than the highest it installed.
 
 A launcher host changes the daemon's parent: it is the resident launcher, not
 launchd (1). Any check that the production daemon "is still launchd-owned"

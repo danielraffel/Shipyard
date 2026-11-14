@@ -207,7 +207,7 @@ fn the_daemon_itself_is_never_routed() {
         "--exec",
         "/x"
     ])));
-    assert!(!is_daemon_internal(args(&[
+    assert!(is_daemon_internal(args(&[
         "daemon",
         "supervise",
         "--exec",
@@ -222,4 +222,58 @@ fn the_daemon_itself_is_never_routed() {
     let mut daemon = launchd_job("/h/.local/share/shipyard/auth-generations/a/shipyard");
     daemon.daemon_internal = true;
     assert!(!daemon.wants_routing());
+}
+
+#[test]
+fn a_hung_launcher_is_not_active() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let script = fake_launcher(temp.path(), "sleep 30");
+    let started = std::time::Instant::now();
+    let error = launcher_active_within(&script, Duration::from_secs(1)).expect_err("timeout");
+    assert_eq!(error, "timed out after 1s");
+    assert!(started.elapsed() < Duration::from_secs(10));
+}
+
+#[test]
+fn an_exec_failure_is_logged_and_shipyard_runs_directly() {
+    let temp = activated_home();
+    fs::create_dir_all(temp.path().join("Library/Logs")).expect("logs");
+    let facts = launchd_job("/h/.local/share/shipyard/auth-generations/a/shipyard");
+    let execs = std::cell::RefCell::new(Vec::new());
+    let exec = |path: &Path| {
+        execs.borrow_mut().push(path.to_path_buf());
+        std::io::Error::from(std::io::ErrorKind::PermissionDenied)
+    };
+    let line = route_with(&facts, temp.path(), &accept, &exec).expect("logged");
+    assert_eq!(*execs.borrow(), [executable_path(temp.path())]);
+    assert!(
+        line.starts_with(
+            "job=com.danielraffel.shipyard.fleet-reconcile launcher=direct reason=exec_failed"
+        ),
+        "{line}"
+    );
+    let log = fs::read_to_string(log_path(temp.path())).expect("log");
+    assert!(log.contains("launcher=app") && log.contains("reason=exec_failed"));
+}
+
+#[test]
+fn not_active_or_missing_never_execs() {
+    let exec = |_: &Path| -> std::io::Error { panic!("must not exec") };
+    let facts = launchd_job("/h/.local/share/shipyard/auth-generations/a/shipyard");
+
+    let none = tempfile::tempdir().expect("tempdir");
+    assert_eq!(route_with(&facts, none.path(), &accept, &exec), None);
+
+    let refused = activated_home();
+    let line = route_with(&facts, refused.path(), &refuse, &exec).expect("logged");
+    assert!(line.contains("reason=verify_failed: exit 77"), "{line}");
+
+    let missing = activated_home();
+    fs::remove_file(executable_path(missing.path())).expect("remove");
+    let line = route_with(&facts, missing.path(), &accept, &exec).expect("logged");
+    assert!(line.ends_with("reason=launcher_missing"), "{line}");
+
+    let mut daemon = facts.clone();
+    daemon.daemon_internal = true;
+    assert_eq!(route_with(&daemon, refused.path(), &accept, &exec), None);
 }

@@ -93,14 +93,20 @@ launcher installed, it runs exactly as before and logs why.
 
 | Entry point | How it routes | Log |
 | --- | --- | --- |
-| A LaunchAgent whose program is the Shipyard release (today `com.danielraffel.shipyard.fleet-reconcile`) | At startup Shipyard checks it is a launchd job's own program (parent pid 1, `XPC_SERVICE_NAME` set), not already under the launcher, not the daemon itself, and the same file `~/.local/bin/shipyard` resolves to. It then `exec`s the launcher with the same arguments. `exec` keeps the job's pid, so the job's identity becomes the bundle (`src/launcher_app.rs`). | `shipyard-launcher.log`: `job=<label> launcher=app`, or `launcher=direct reason=...` |
-| The daemon agent (`com.danielraffel.shipyard.daemon.<id>`, hosts with `shipyard daemon launcher install`) | On `shipyard daemon refresh` the agent plist names the bundle as its program with the same arguments; the bundle runs the current release's `daemon supervise`. | `shipyard-launcher.log`: `daemon=<label> launcher=app` or `launcher=direct reason=...` |
-| The steward tick (program `/bin/bash`) | The installed tick `exec`s `shipyard-launcher --launcher-script steward-tick`, which runs the same file again as its child. | `summary.log`: `launcher=app` or `launcher=direct` on every repo line, plus a `reason=not_active` line |
-| fleet-deploy (`unit=launcher`) | Installs a bundle staged at `~/.local/share/shipyard/launcher/staged/ShipyardLauncher.app` only when `shipyard-launcher-check --verify-bundle` accepts it and its copy. Then, when the installed launcher is not active, runs `shipyard-launcher-check --activate`, which succeeds only once the owner's grant is in place. | `summary.log`: `unit=launcher ...`, `unit=launcher-activation activated` or `waiting reason=full_disk_access=denied` |
+| A LaunchAgent whose program is the Shipyard release (today `com.danielraffel.shipyard.fleet-reconcile`) | At startup Shipyard checks it is a launchd job's own program (parent pid 1, `XPC_SERVICE_NAME` set), not already under the launcher, not the daemon itself, and the same file `~/.local/bin/shipyard` resolves to. The `--launcher-active` check is bounded at 45 s. It then `exec`s the launcher with the same arguments; `exec` keeps the job's pid, so the job's identity becomes the bundle (`src/launcher_app.rs`). A failed `exec` is logged and Shipyard runs directly. | `shipyard-launcher.log`: `job=<label> launcher=app`, or `launcher=direct reason=...` |
+| The steward tick (program `/bin/bash`) | The installed tick asks `--launcher-active` (bounded, `SHIPYARD_STEWARD_LAUNCHER_TIMEOUT_S`, default 45 s), then `exec`s `shipyard-launcher --launcher-script steward-tick`, which runs the same file again as its child. A timeout or a failed `exec` runs the tick directly. | `summary.log`: `launcher=app` or `launcher=direct` on every repo line, plus a `reason=not_active` line |
+| fleet-deploy (`unit=launcher`) | Installs a bundle staged at `~/.local/share/shipyard/launcher/staged/ShipyardLauncher.app` only when `shipyard-launcher-check --verify-bundle` accepts it and its copy, and never one whose CFBundleVersion is below the installed one or the highest it ever installed (`launcher.version-floor`). Then, when the installed launcher is not active, runs `shipyard-launcher-check --activate`, which succeeds only once the owner's grant is in place. It never activates a bundle below the floor. Each call is bounded (`FLEET_DEPLOY_LAUNCHER_TIMEOUT_S`, default 45 s). | `summary.log`: `unit=launcher ...`, `unit=launcher-activation activated` or `waiting reason=full_disk_access=denied` |
 
 `SHIPYARD_LAUNCHER_ROUTING=off` (Shipyard), `SHIPYARD_STEWARD_LAUNCHER=off`
 (tick) and `SHIPYARD_LAUNCHER_AUTO_ACTIVATE=off` (fleet-deploy) turn routing
 off.
+
+The daemon agent (`com.danielraffel.shipyard.daemon.<id>`) is never routed.
+launchd restarts it at login and after any failure, so it keeps its stable
+launcher copy (`~/.local/libexec/shipyard/shipyard-daemon-launcher`) as its
+program, and no state of this bundle (missing, refusing, not active) can keep
+it down. Shipyard's startup routing skips `daemon run` and `daemon supervise`
+for the same reason.
 
 Still their own identities: the `com.danielraffel.fleet-pass.*` agents
 (installed from fleet-handbook; they need a `fleet-pass` allowlist entry),
@@ -143,8 +149,16 @@ ditto -x -k ShipyardLauncher-macos-arm64.zip ~/.local/share/shipyard/launcher/st
 ```
 
 `--verify-bundle` requires a Developer ID signature with the launcher's bundle
-identifier, by the installed Shipyard's team, and `spctl` reporting
-`source=Notarized Developer ID`.
+identifier, by the pinned team `95CX6P84C4` (a constant in the check tool and
+in the launcher, never read from `~/.local/bin/shipyard`), an unmodified
+bundle, `spctl` reporting `source=Notarized Developer ID`, and an integer
+`CFBundleVersion`. Raise `CFBundleVersion` in `Info.plist` for every new
+launcher build: fleet-deploy installs only versions at or above the highest it
+has installed.
+
+The check tool honours its `SHIPYARD_LAUNCHER_CHECK_*` overrides (tools, home,
+team, requirement) only with `SHIPYARD_LAUNCHER_CHECK_TEST_MODE=1`, which only
+the tests set.
 
 The path sits beside `TartCILauncher.app` and the daemon's stable launcher
 copy: on the internal disk, owned by the user (no sudo), and outside

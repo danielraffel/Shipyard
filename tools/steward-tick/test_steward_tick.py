@@ -210,6 +210,9 @@ FAKE_LAUNCHER = """#!/bin/bash
 # Stand-in for ShipyardLauncher.app's executable.
 echo "$*" >> "$HOME/launcher-calls"
 if [ "$1" = --launcher-active ]; then
+  [ -n "${FAKE_ACTIVE_HANG:-}" ] && sleep 30
+  # Answer active, then make the exec that follows fail.
+  [ -n "${FAKE_EXEC_FAILS:-}" ] && { chmod a-x "$0"; echo '{"active":true,"reason":"grant_cached"}'; exit 0; }
   [ "${FAKE_VERIFY_RC:-0}" = 0 ] || { echo '{"active":false,"reason":"grant_revoked: demoted"}'; exit "$FAKE_VERIFY_RC"; }
   [ -n "${FAKE_ACTIVE_NO_VERDICT:-}" ] && { echo '{"reason":"grant_cached"}'; exit 0; }
   echo '{"active":true,"reason":"grant_cached"}'; exit 0
@@ -282,6 +285,23 @@ class StewardTickLauncherTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.calls.read_text().splitlines(), ["--launcher-active"])
         self.assertIn("launcher=direct reason=not_active rc=0: grant_cached", self.summary())
+
+    def test_a_hung_launcher_cannot_stall_the_tick(self):
+        self.activate()
+        started = time.monotonic()
+        result = self.run_installed(FAKE_ACTIVE_HANG="1", SHIPYARD_STEWARD_LAUNCHER_TIMEOUT_S="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertLess(time.monotonic() - started, 20)
+        self.assertIn("launcher=direct reason=not_active rc=124: timed out after 1s", self.summary())
+        self.assertIn("acme/repo rc=0", self.summary())
+
+    def test_a_failed_exec_runs_the_tick_directly(self):
+        self.activate()
+        result = self.run_installed(FAKE_EXEC_FAILS="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("launcher=direct reason=not_active rc=exec_failed", self.summary())
+        self.assertIn("acme/repo rc=0", self.summary())
+        self.assertIn("launcher=direct", self.summary().splitlines()[-1])
 
     def test_only_the_installed_copy_routes(self):
         self.activate()

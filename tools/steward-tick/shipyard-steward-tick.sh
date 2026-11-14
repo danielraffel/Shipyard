@@ -30,12 +30,34 @@ elif [ "${SHIPYARD_STEWARD_LAUNCHER:-on}" != off ] && [ -f "$launcher_record" ] 
   # The launcher's own verdict: the activation record names this exact bundle
   # and a grant still in place (rechecked without a prompt). Only exit 0 with
   # "active": true routes; anything else runs the tick directly.
+  # The check is bounded (SHIPYARD_STEWARD_LAUNCHER_TIMEOUT_S, default 45 s,
+  # like Shipyard's own): a hung launcher is killed and counts as not active,
+  # so it can never stall the steward.
   launcher_rc=0
-  launcher_out=$("$launcher_exe" --launcher-active 2>/dev/null) || launcher_rc=$?
+  launcher_out=$(/usr/bin/python3 -c '
+import subprocess, sys
+try:
+    run = subprocess.run(sys.argv[2:], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                         stdin=subprocess.DEVNULL, timeout=float(sys.argv[1]))
+except subprocess.TimeoutExpired:
+    sys.exit(124)
+except OSError:
+    sys.exit(126)
+sys.stdout.buffer.write(run.stdout)
+sys.exit(run.returncode)
+' "${SHIPYARD_STEWARD_LAUNCHER_TIMEOUT_S:-45}" "$launcher_exe" --launcher-active 2>/dev/null) || launcher_rc=$?
   if [ "$launcher_rc" = 0 ] && [ "$(printf '%s' "$launcher_out" | jq -r '.active' 2>/dev/null)" = true ]; then
+    # execfail: if the exec itself fails, keep going directly instead of exiting.
+    shopt -s execfail
     exec "$launcher_exe" --launcher-script steward-tick "$@"
+    shopt -u execfail
+    launcher_rc=exec_failed
   fi
-  launcher_why=$(printf '%s' "$launcher_out" | jq -r '.reason // empty' 2>/dev/null)
+  if [ "$launcher_rc" = 124 ]; then
+    launcher_why="timed out after ${SHIPYARD_STEWARD_LAUNCHER_TIMEOUT_S:-45}s"
+  else
+    launcher_why=$(printf '%s' "$launcher_out" | jq -r '.reason // empty' 2>/dev/null)
+  fi
   echo "$stamp launcher=direct reason=not_active rc=$launcher_rc: $(printf '%s' "${launcher_why:-$launcher_out}" | head -c 160 | tr '\n' ' ')" >> "$log_dir/summary.log"
 fi
 # Config-only sparse clones live on the internal disk: a launchd job that opens

@@ -2,7 +2,9 @@
 import json
 import os
 import pathlib
+import shutil
 import subprocess
+import time
 import sys
 import tempfile
 import unittest
@@ -76,6 +78,9 @@ class FleetDeployTests(unittest.TestCase):
             "SHIPYARD_LAUNCHER_CHECK_CODESIGN": str(t / "tools" / "codesign"),
             "SHIPYARD_LAUNCHER_CHECK_SPCTL": str(t / "tools" / "spctl"),
             "SHIPYARD_LAUNCHER_CHECK_OPEN": str(t / "tools" / "open"),
+            "SHIPYARD_LAUNCHER_CHECK_TEST_MODE": "1",
+            "SHIPYARD_LAUNCHER_CHECK_TEAM": "TEAM123456",
+            "SHIPYARD_LAUNCHER_CHECK_HOME": str(t),
             "SHIPYARD_LAUNCHER_CHECK_WAIT_SECS": "3",
         })
         (t / "tools").mkdir()
@@ -198,15 +203,23 @@ class FleetDeployTests(unittest.TestCase):
 
     # -- launcher unit (macOS only: it needs ditto) --------------------------
 
-    def stage_launcher(self, version):
+    def stage_launcher(self, version, bundle_version="1", active_body=None):
+        info = self.staged / "Contents" / "Info.plist"
+        info.parent.mkdir(parents=True, exist_ok=True)
+        info.write_text(
+            '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict>'
+            f"<key>CFBundleVersion</key><string>{bundle_version}</string></dict></plist>\n"
+        )
         exe = self.staged / "Contents" / "MacOS" / "shipyard-launcher"
         exe.parent.mkdir(parents=True, exist_ok=True)
+        extra = f"    {active_body}\n" if active_body else ""
         exe.write_text(
             "#!/bin/sh\n"
             "# Stand-in for the launcher: active only once a record exists.\n"
             "case \"$1\" in\n"
             "  --launcher-active)\n"
-            "    [ -f \"$HOME/.local/share/shipyard/launcher/activation.json\" ] && "
+            + extra
+            + "    [ -f \"$HOME/.local/share/shipyard/launcher/activation.json\" ] && "
             "{ echo '{\"active\":true,\"reason\":\"grant_cached\"}'; exit 0; }\n"
             "    echo '{\"active\":false,\"reason\":\"not_activated\"}'; exit 1 ;;\n"
             "  --launcher-verify) echo '{\"ok\":true,\"target\":\"/x/shipyard\"}'; exit 0 ;;\n"
@@ -276,6 +289,37 @@ class FleetDeployTests(unittest.TestCase):
         self.assertEqual(log.count("unit=launcher refused"), 1, log)
         self.assertIn("signature does not satisfy", log)
         self.assertEqual(list(self.launcher_dest.parent.glob("*.tmp.*")), [])
+
+    @unittest.skipUnless(sys.platform == "darwin", "the launcher unit runs on macOS only")
+    def test_an_older_staged_launcher_is_never_installed_or_activated(self):
+        self.stage_launcher("v2", bundle_version="2")
+        self.run_deploy()
+        exe = self.launcher_dest / "Contents" / "MacOS" / "shipyard-launcher"
+        self.assertIn("v2", exe.read_text())
+        self.stage_launcher("v1", bundle_version="1")
+        self.run_deploy(FAKE_FDA="granted")
+        self.assertIn("v2", exe.read_text())
+        self.assertIn("unit=launcher refused rev=", self.log.read_text())
+        self.assertIn("reason=downgrade staged=1 installed_floor=2", self.log.read_text())
+        # A hand-copied older bundle at the install path is not activated either.
+        shutil.rmtree(self.launcher_dest)
+        subprocess.run(["ditto", str(self.staged), str(self.launcher_dest)], check=True)
+        shutil.rmtree(self.staged)
+        record = self.t / ".local" / "share" / "shipyard" / "launcher" / "activation.json"
+        record.unlink(missing_ok=True)
+        self.run_deploy(FAKE_FDA="granted")
+        self.assertIn("unit=launcher-activation waiting reason=downgraded installed=1 floor=2", self.log.read_text())
+        self.assertFalse((self.t / ".local" / "share" / "shipyard" / "launcher" / "activation.json").exists())
+
+    @unittest.skipUnless(sys.platform == "darwin", "the launcher unit runs on macOS only")
+    def test_a_hung_launcher_cannot_hold_the_deploy(self):
+        self.stage_launcher("v1", active_body="sleep 30")
+        started = time.monotonic()
+        r = self.run_deploy(FLEET_DEPLOY_LAUNCHER_TIMEOUT_S="1", SHIPYARD_LAUNCHER_CHECK_TOOL_TIMEOUT_SECS="1")
+        self.assertEqual(r.returncode, 0)
+        self.assertLess(time.monotonic() - started, 25)
+        self.assertFalse((self.t / ".local" / "share" / "shipyard" / "launcher" / "activation.json").exists())
+        self.assertIn("unit=launcher-activation waiting", self.log.read_text())
 
 
 if __name__ == "__main__":

@@ -9,7 +9,7 @@
                                         bundle (fleet-deploy uses this)
 
 "Ready" means: the installed bundle is Developer ID signed with the bundle
-identifier, by the same team as the installed Shipyard; it is notarized; the
+identifier, by the pinned team (EXPECTED_TEAM); it is notarized; the
 launcher accepts the current release; and the launcher holds Full Disk Access.
 
 The Full Disk Access check starts the launcher through LaunchServices (`open`),
@@ -34,6 +34,8 @@ import datetime
 import json
 import os
 import pathlib
+import plistlib
+import pwd
 import re
 import subprocess
 import sys
@@ -41,18 +43,32 @@ import tempfile
 import time
 
 BUNDLE_ID = "com.danielraffel.shipyard.launcher"
-HOME = pathlib.Path(os.environ.get("SHIPYARD_LAUNCHER_CHECK_HOME") or pathlib.Path.home())
+# The only Developer ID team whose launcher this tool accepts. Pinned here,
+# never read from a file the user can rewrite (such as ~/.local/bin/shipyard).
+EXPECTED_TEAM = "95CX6P84C4"
+
+# The environment can redirect tools, home or the team only in test mode
+# (SHIPYARD_LAUNCHER_CHECK_TEST_MODE=1), which nothing outside the tests sets.
+TEST_MODE = os.environ.get("SHIPYARD_LAUNCHER_CHECK_TEST_MODE") == "1"
+
+
+def setting(name: str, default: str) -> str:
+    return os.environ.get(name, default) if TEST_MODE else default
+
+
+EXPECTED_TEAM = setting("SHIPYARD_LAUNCHER_CHECK_TEAM", EXPECTED_TEAM)
+HOME = pathlib.Path(setting("SHIPYARD_LAUNCHER_CHECK_HOME", "") or pwd.getpwuid(os.getuid()).pw_dir)
 APP = HOME / ".local" / "libexec" / "ShipyardLauncher.app"
 EXECUTABLE = APP / "Contents" / "MacOS" / "shipyard-launcher"
 RECORD = HOME / ".local" / "share" / "shipyard" / "launcher" / "activation.json"
-SHIPYARD = HOME / ".local" / "bin" / "shipyard"
-CODESIGN = os.environ.get("SHIPYARD_LAUNCHER_CHECK_CODESIGN", "/usr/bin/codesign")
-SPCTL = os.environ.get("SHIPYARD_LAUNCHER_CHECK_SPCTL", "/usr/sbin/spctl")
-OPEN = os.environ.get("SHIPYARD_LAUNCHER_CHECK_OPEN", "/usr/bin/open")
-ACCESS_WAIT_SECS = float(os.environ.get("SHIPYARD_LAUNCHER_CHECK_WAIT_SECS", "20"))
-
-
-TOOL_TIMEOUT_SECS = float(os.environ.get("SHIPYARD_LAUNCHER_CHECK_TOOL_TIMEOUT_SECS", "60"))
+CODESIGN = setting("SHIPYARD_LAUNCHER_CHECK_CODESIGN", "/usr/bin/codesign")
+SPCTL = setting("SHIPYARD_LAUNCHER_CHECK_SPCTL", "/usr/sbin/spctl")
+OPEN = setting("SHIPYARD_LAUNCHER_CHECK_OPEN", "/usr/bin/open")
+ACCESS_WAIT_SECS = float(setting("SHIPYARD_LAUNCHER_CHECK_WAIT_SECS", "20"))
+TOOL_TIMEOUT_SECS = float(setting("SHIPYARD_LAUNCHER_CHECK_TOOL_TIMEOUT_SECS", "60"))
+# Test mode only: a weaker requirement, so real codesign can judge ad-hoc
+# signed test bundles (a tampered resource must still fail).
+REQUIREMENT_OVERRIDE = setting("SHIPYARD_LAUNCHER_CHECK_REQUIREMENT", "")
 
 
 def tool(args: list[str]) -> subprocess.CompletedProcess:
@@ -84,6 +100,8 @@ def team_of(path: pathlib.Path) -> str | None:
 
 
 def requirement(team: str) -> str:
+    if REQUIREMENT_OVERRIDE:
+        return REQUIREMENT_OVERRIDE
     return (
         f'identifier "{BUNDLE_ID}" and anchor apple generic'
         " and certificate 1[field.1.2.840.113635.100.6.2.6] exists"
@@ -92,13 +110,25 @@ def requirement(team: str) -> str:
     )
 
 
+def bundle_version(app: pathlib.Path) -> int | None:
+    """CFBundleVersion as an integer, or None when it is missing or not one."""
+    try:
+        info = plistlib.loads((app / "Contents" / "Info.plist").read_bytes())
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        return None
+    value = info.get("CFBundleVersion") if isinstance(info, dict) else None
+    return int(value) if isinstance(value, str) and re.fullmatch(r"[0-9]{1,9}", value) else None
+
+
 def verify_bundle(app: pathlib.Path) -> tuple[bool, str]:
-    """Developer ID signed launcher of the installed Shipyard's team, notarized."""
+    """Developer ID signed by the pinned team, with the launcher's identifier,
+    unmodified since signing, notarized, with an integer CFBundleVersion."""
     if not app.is_dir() or app.is_symlink():
         return False, f"{app} is not a bundle directory"
-    team = team_of(SHIPYARD.resolve()) if SHIPYARD.exists() else None
-    if not team or not re.fullmatch(r"[A-Z0-9]{10}", team):
-        return False, f"cannot read the Team ID of {SHIPYARD}; refusing to trust any launcher"
+    team = EXPECTED_TEAM
+    bundle_team = team_of(app)
+    if bundle_team != team:
+        return False, f"bundle is signed by team {bundle_team}, not the pinned team {team}"
     result = tool([CODESIGN, "--verify", "--strict", "--deep", f"-R={requirement(team)}", str(app)])
     if result.returncode != 0:
         return False, f"signature does not satisfy the {team} Developer ID launcher requirement: {(result.stderr or result.stdout).strip()}"
@@ -106,7 +136,9 @@ def verify_bundle(app: pathlib.Path) -> tuple[bool, str]:
     detail = (assessment.stdout + assessment.stderr).strip()
     if not notarized(assessment):
         return False, f"not notarized: {detail}"
-    return True, f"Developer ID {team}, notarized"
+    if bundle_version(app) is None:
+        return False, "CFBundleVersion is missing or not an integer"
+    return True, f"Developer ID {team}, notarized, version {bundle_version(app)}"
 
 
 def launcher_verify() -> tuple[bool, str]:
@@ -217,11 +249,11 @@ def write_record(report: dict) -> tuple[bool, str]:
     """Bind the activation to this exact bundle and the grant just confirmed,
     then ask the launcher whether it agrees. A record it does not accept is
     removed again."""
-    team = team_of(SHIPYARD.resolve())
+    team = EXPECTED_TEAM
     bundle_team = team_of(APP)
     cdhash = cdhash_of(APP)
-    if not team or team != bundle_team:
-        return False, f"bundle team {bundle_team} is not the Shipyard team {team}"
+    if bundle_team != team:
+        return False, f"bundle team {bundle_team} is not the pinned team {team}"
     if not cdhash:
         return False, "cannot read the bundle's code directory hash"
     RECORD.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -264,11 +296,19 @@ def main(argv: list[str]) -> int:
     action.add_argument("--activate", action="store_true")
     action.add_argument("--deactivate", action="store_true")
     action.add_argument("--verify-bundle", type=pathlib.Path)
+    action.add_argument("--bundle-version", type=pathlib.Path)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
-    if sys.platform != "darwin" and not os.environ.get("SHIPYARD_LAUNCHER_CHECK_HOME"):
+    if sys.platform != "darwin" and not TEST_MODE:
         print("ShipyardLauncher.app exists on macOS only", file=sys.stderr)
         return 2
+    if args.bundle_version:
+        version = bundle_version(args.bundle_version)
+        if version is None:
+            print("CFBundleVersion is missing or not an integer", file=sys.stderr)
+            return 1
+        print(version)
+        return 0
     if args.verify_bundle:
         ok, detail = verify_bundle(args.verify_bundle)
         print(detail)

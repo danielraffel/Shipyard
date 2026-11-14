@@ -573,7 +573,11 @@ fn supervise_passes_signals_through_to_the_daemon_child() {
 }
 
 #[test]
-fn an_activated_launcher_app_becomes_the_daemon_agents_program() {
+fn the_daemon_agent_never_depends_on_the_launcher_app() {
+    // launchd restarts the daemon agent at login and after any non-zero exit.
+    // Its program stays the stable launcher copy whatever ShipyardLauncher.app
+    // looks like (activated, removed, or refusing), so no state of the app can
+    // leave the daemon down.
     let temp = tempfile::tempdir().expect("tempdir");
     let home = temp.path().join("home");
     let state = temp.path().join("state");
@@ -581,32 +585,25 @@ fn an_activated_launcher_app_becomes_the_daemon_agents_program() {
         path: temp.path().join("launcher"),
         label: "com.example.daemon".to_owned(),
     };
-    let accept = |_: &Path| Ok(());
-    let refuse = |_: &Path| Err("exit 77: refused".to_owned());
-
-    // Not activated: today's stable launcher copy, unchanged.
-    let direct = daemon_program_arguments(&request(&state), &launcher, &home, &accept);
-    assert_eq!(direct, launcher_arguments(&launcher.path, &request(&state)));
-
-    let app = crate::launcher_app::executable_path(&home);
-    fs::create_dir_all(app.parent().expect("parent")).expect("bundle");
-    fs::write(&app, "#!/bin/sh\n").expect("app");
     let record = crate::launcher_app::activation_path(&home);
     fs::create_dir_all(record.parent().expect("parent")).expect("record dir");
-    fs::write(&record, r#"{"schema": 1}"#).expect("record");
-    fs::create_dir_all(home.join("Library/Logs")).expect("logs");
-
-    // Activated and verified: same arguments, the bundle as the program.
-    let routed = daemon_program_arguments(&request(&state), &launcher, &home, &accept);
-    assert_eq!(routed[0], OsString::from(&app));
-    assert_eq!(routed[1..], direct[1..]);
-
-    // Activated but the launcher refuses: back to the copy, and logged.
-    let refused = daemon_program_arguments(&request(&state), &launcher, &home, &refuse);
-    assert_eq!(refused, direct);
-    let log = fs::read_to_string(crate::launcher_app::log_path(&home)).expect("log");
-    assert!(log.contains("daemon=com.example.daemon launcher=app"));
-    assert!(log.contains(
-        "daemon=com.example.daemon launcher=direct reason=verify_failed: exit 77: refused"
-    ));
+    fs::write(&record, r#"{"schema": 2}"#).expect("record");
+    for app_present in [false, true] {
+        let app = crate::launcher_app::executable_path(&home);
+        if app_present {
+            fs::create_dir_all(app.parent().expect("parent")).expect("bundle");
+            fs::write(&app, "#!/bin/sh\nexit 77\n").expect("app");
+        }
+        let mut launchctl = FakeLaunchctl::default();
+        start_via_launchd_with(&request(&state), &launcher, &home, &mut launchctl).expect("start");
+        let written = fs::read_to_string(plist_path(&home, "com.example.daemon")).expect("plist");
+        let program = written
+            .split("<key>ProgramArguments</key>")
+            .nth(1)
+            .and_then(|rest| rest.split("<string>").nth(1))
+            .and_then(|first| first.split("</string>").next())
+            .expect("first program argument");
+        assert_eq!(program, launcher.path.display().to_string());
+        assert!(!written.contains("ShipyardLauncher.app"));
+    }
 }
