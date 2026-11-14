@@ -166,6 +166,26 @@ pub(super) fn apply_repo_plan(
     if args.apply {
         ledger.removal_ledger = removal_cache;
     }
+    // The flake breaker, before any admission: a re-enqueued head the queue
+    // ejected again trips its signature (the approval gate stops that head
+    // at the ejection cap, so admission never sees it). Reads only.
+    super::flake_requeue::sweep(
+        &policy.ejection_guards.flake_requeue,
+        observation,
+        ledger,
+        &super::flake_requeue::SweepReads {
+            queue: &|pr| super::native_arm::read_queue_state(actions, &observation.repo, pr),
+            assess: &|report| {
+                crate::environment_requeue::assess_with(
+                    &|argv: &[String]| actions.run_gh(argv).map_err(|error| error.to_string()),
+                    &observation.repo,
+                    report,
+                    true,
+                    None,
+                )
+            },
+        },
+    );
     let (mut reports, pr_mutation_failed, listing) = apply_pr_plans_with_poison(
         actions,
         args,
@@ -439,6 +459,17 @@ pub(super) fn apply_repo_plan(
     // Mark the member rows of this pass's red-everywhere episodes, computed
     // before the PR mutations above.
     let red_everywhere_status = red_everywhere_pass.annotate(&mut reports);
+    // Flake-classified ejections decided by the enqueue path above, each
+    // signature's root cause, and (under apply) its one issue.
+    let flake_requeue_status = super::flake_requeue::finish(
+        &|argv: &[String]| actions.run_gh(argv).map_err(|error| error.to_string()),
+        &policy.ejection_guards.flake_requeue,
+        &observation.repo,
+        &observation.base,
+        ledger,
+        args.apply,
+        Utc::now(),
+    );
     let mut unhealthy = (args.preempt_capacity && observation.preemption_error.is_some())
         || native_arm_failed
         || infra_rerun_failed
@@ -554,6 +585,7 @@ pub(super) fn apply_repo_plan(
             dwell: Some(dwell_report),
             infra_rerun: Some(infra_rerun_status),
             red_everywhere: Some(red_everywhere_status),
+            flake_requeue: Some(flake_requeue_status),
             invariants: Vec::new(),
             repo: observation.repo.clone(),
             base: args.base.clone(),
