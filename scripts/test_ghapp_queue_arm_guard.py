@@ -3502,6 +3502,43 @@ class WriterIdentity(unittest.TestCase):
             self.assertEqual(guard.writer_identity(), {"session": "unattributed"})
 
 
+class FleetReviewRequiredConfig(unittest.TestCase):
+    """The twin of src/head_approval/tests.rs's fleet_review_required tests."""
+
+    def test_the_base_switch_requires_review_on_a_repository_off_the_compiled_list(self) -> None:
+        for host_default in (False, True):
+            with self.subTest(host_default=host_default):
+                policy = guard.review_policy("[auto_merge]\nfleet_review_required = true\n",
+                                             "danielraffel/not-listed", host_default)
+                self.assertIs(policy["required"], True)
+                self.assertIs(policy["any_but_author"], True)
+        strict_off = guard.review_policy(
+            "[auto_merge]\narm_requires_head_approval = false\nfleet_review_required = true\n",
+            "danielraffel/not-listed", False)
+        self.assertIs(strict_off["required"], True)
+        strict_on = guard.review_policy(
+            "[auto_merge]\narm_requires_head_approval = true\n"
+            "reviewer_identities = [\"reviewer\"]\n"
+            "fleet_review_required = true\n",
+            "danielraffel/not-listed", False)
+        self.assertIs(strict_on["required"], True)
+        self.assertIs(strict_on["any_but_author"], False)
+        self.assertEqual(strict_on["reviewers"], ["reviewer"])
+
+    def test_false_or_absent_changes_nothing(self) -> None:
+        for config in ("[auto_merge]\nfleet_review_required = false\n", "[auto_merge]\n", None):
+            with self.subTest(config=config):
+                policy = guard.review_policy(config, "danielraffel/not-listed", False)
+                self.assertIs(policy["required"], False)
+                self.assertIs(policy["any_but_author"], False)
+
+    def test_a_non_boolean_switch_is_refused(self) -> None:
+        for value in ('"yes"', "1", "[]"):
+            with self.subTest(value=value), self.assertRaises(guard.GuardError):
+                guard.review_policy(f"[auto_merge]\nfleet_review_required = {value}\n",
+                                    "danielraffel/not-listed", False)
+
+
 class CarryExclusionConfig(unittest.TestCase):
     """The twin of src/head_approval/tests.rs's carry_paths tests."""
 

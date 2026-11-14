@@ -6356,6 +6356,15 @@ while the later PR's listed head is approved with no HOLD, or once the shared
 commits are on the base. A later PR whose head merely contains the earlier
 head gets no shortcut: ancestry cannot say which PR introduced a shared commit.
 
+## Release-readiness canary
+
+`[release.canary]` in a repo's `.shipyard/config.toml` opts it into a daily,
+read-only rehearsal of the next release (`shipyard release-canary run`): the
+configured `command` (`{next_version}` / `{next_tag}` placeholders) runs on a
+clean clone of `main`; a failure opens or edits one `release canary: vX.Y.Z
+would fail` issue and a later pass closes it. The steward tick runs it daily per
+fleet repo. Full config and exit codes are in the `ci` skill.
+
 ## Skill-sync gotcha
 
 Changes to Shipyard steward behavior must carry this note or a reviewed skill-sync exception so the version-and-skill gate records the operational impact.
@@ -6367,3 +6376,15 @@ note. Path matches are additive: the explicit `src/changelog.rs` and
 explicit paths mapped to another skill, such as the external-contributor
 review documents, remain governed by that mapping. `scripts/skill_path_map.json`
 is the map.
+
+### `governance onboard`
+
+`shipyard governance onboard --repo OWNER/NAME` prints a read-only plan:
+preflight, render hashes, bounded waits, observed rulesets and the per-PR
+review-verdict sweep. `--apply` is not implemented yet and refuses; the plan
+performs GET requests only and stops with exit 9 on any failed read. The
+protected base may enable `[auto_merge] fleet_review_required = true`, which
+requires review exactly as `REVIEW_REQUIRED_REPOS` membership does, in both
+the Rust policy and `ghapp_queue_arm_guard.py`; the compiled list remains a
+floor. The rendered onboarding PR is limited to the two review-verdict
+workflows and the named config keys.

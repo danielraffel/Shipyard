@@ -348,3 +348,36 @@ for n in (0, 1, 2):
 os.execv("/usr/bin/python3", ["python3", "-I", sys.argv[1], "--daily", "--log-dir", sys.argv[2]])
 ' "$loss_report" "$log_dir" || true
 fi
+
+# Release-readiness canary (`[release.canary]` in a repo's .shipyard/config.toml):
+# rehearses the NEXT version on a clean clone of main and opens, updates or
+# closes one issue per repo. `--daily` makes the command itself run at most once
+# per UTC day per repo (stamp file in the Shipyard state dir), so this every-
+# 5-minutes hook is cheap; a repo without the section is a no-op. Only results
+# that did something (pass, fail, error) reach summary.log as a `release-canary`
+# line. Detached like the others since a rehearsal can take many minutes; the
+# command takes its own per-repo lock. SHIPYARD_RELEASE_CANARY=off turns it off.
+if [ "${SHIPYARD_RELEASE_CANARY:-on}" != "off" ] && "$steward_bin" release-canary run --help >/dev/null 2>&1; then
+  /usr/bin/python3 -c '
+import os, sys
+if os.fork():
+    sys.exit(0)
+os.setsid()
+if os.fork():
+    os._exit(0)
+fd = os.open(os.devnull, os.O_RDWR)
+for n in (0, 1, 2):
+    os.dup2(fd, n)
+os.execv("/bin/bash", ["bash", "-c", sys.argv[1], "release-canary"] + sys.argv[2:])
+' '
+  bin=$1 clones=$2 log=$3 stamp=$4; shift 4
+  for repo in "$@"; do
+    [ -d "$clones/${repo#*/}/.git" ] || continue
+    line=$(cd "$clones/${repo#*/}" && timeout 3600 "$bin" release-canary run --repo "$repo" --daily --apply 2>&1 | tail -n 1)
+    case "$line" in
+      "release-canary status=skipped"*|"") ;;
+      *) echo "$stamp $repo $line" >> "$log/summary.log" ;;
+    esac
+  done
+' "$steward_bin" "$clones" "$log_dir" "$stamp" "${repos[@]}" || true
+fi
