@@ -6036,6 +6036,21 @@ detector, then text, lowest number on a tie; a PR that rode a failing group is
 never chosen), its CI is prioritized only while a non-approval required check
 has not completed, and a dry-run hold never jumps. `base-health --act` is the
 manual path; leave `auto_jump` driving the steward alone so one writer jumps.
+Review statuses (`merge_steward::REVIEW_GATES` plus the approval context,
+`is_review_gate`) are per PR: `red_everywhere::reds` drops only a
+`StatusContext` whose description passes `review_waiting` at the head and
+whose rule binds an app the status came from (`waiting_review_status`); a
+failing review check run, an unknown description, or an unbound rule still
+groups. `unread_gate_from_status` likewise reads the approval status only
+under a bound rule, else the row stays `required_failed`. Merge-group poison judges every required context
+(it reads check runs only). `blocked_on` reads a `RequiredFailed` whose
+contexts are all review statuses as the approval gate's own token when it
+refuses (a HOLD stays `held`), else `awaiting_review:<contexts>` (actor
+reviewer, dwell `needs_review`, loop `awaiting_review`) when every
+description, from a status bound to its rule's app (an unbound rule never
+qualifies), passes `merge_steward::review_waiting` ("needs N counted
+APPROVEs of head <head>", "awaiting reviewer verdict for head <head>",
+bound to this head; no `hold`/`held by` in any case), else `required_failed`.
 `src/app/merge_steward_cmd/scheduling_loop.rs`: the loop contract
 (docs/scheduling-loop.md). `state_for` maps a row to one `LoopState` (precedence
 `merge_group_stalled` > `Queued` decision or `queued`/`admitted` > quarantined at

@@ -457,3 +457,19 @@ fn the_strict_predicate_needs_one_readable_error_shared_by_every_group() {
     assert!(!same_first_error(&[None, None]));
     assert!(!same_first_error(&[line("overdue")]));
 }
+
+/// Merge groups are judged from check runs: a crashing review check run
+/// (here release-path-review) failing two groups with different pull
+/// requests still poisons, so a broken review workflow stays visible.
+#[test]
+fn a_crashing_review_check_run_still_poisons_merge_groups() {
+    let groups = [
+        group("e", &[2], &[("release-path-review", "failure")]),
+        group("d", &[1], &[("release-path-review", "failure")]),
+    ];
+    let health = detect(&groups, &["release-path-review".to_owned()], now());
+    assert_eq!(
+        health.poisoned_contexts(),
+        vec!["release-path-review".to_owned()]
+    );
+}

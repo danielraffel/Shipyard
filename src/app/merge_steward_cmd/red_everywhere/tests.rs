@@ -562,3 +562,131 @@ fn an_episode_that_drops_under_three_unchanged_members_ends() {
         None
     );
 }
+
+/// Vellum #415, #418, #419, #423: `release-path-review` red on four pull
+/// requests only because approvals are missing is reviewer throughput, never
+/// a base-level episode. A genuine red check on three or more still groups.
+#[test]
+fn waiting_review_statuses_on_many_prs_are_never_a_base_level_episode() {
+    let waiting = |number: u64| {
+        let mut check = failed("release-path-review", number);
+        check.source = StewardCheckSource::StatusContext;
+        check.description = Some(format!(
+            ".github/workflows/x.yml and 1 more: needs 2 counted APPROVEs of head {} from different signers and sessions; has 0",
+            &head(number)[..12]
+        ));
+        check
+    };
+    let mut obs = observation(
+        [415_u64, 418, 419, 423]
+            .into_iter()
+            .map(|n| observed(n, head(n), vec![waiting(n)]))
+            .collect(),
+    );
+    obs.required_checks.push(RequiredCheck {
+        context: "release-path-review".to_owned(),
+        app_id: Some(15_368),
+    });
+    let ledger = StewardLedger::default();
+    assert!(
+        reds(&obs, &ledger, "review-verdict", &[]).is_empty(),
+        "a waiting review status is never counted"
+    );
+    let real = three_red_prs();
+    let groups = super::group(&reds(&real, &ledger, "review-verdict", &[]));
+    assert_eq!(groups.len(), 1, "a genuine red check still groups");
+}
+
+/// A crashing review workflow is a base-level cause: a failing review CHECK
+/// RUN, or a review status whose description is not a waiting shape (a crash
+/// message), still counts toward the episode.
+#[test]
+fn a_crashing_review_check_or_unknown_review_status_still_groups() {
+    let ledger = StewardLedger::default();
+    let required = |obs: &mut RepoObservation, context: &str| {
+        obs.required_checks.push(RequiredCheck {
+            context: context.to_owned(),
+            app_id: Some(15_368),
+        });
+    };
+    // post-review-verdict as a failing check run on three PRs.
+    let mut crashed_runs = observation(
+        [1_u64, 2, 3]
+            .into_iter()
+            .map(|n| observed(n, head(n), vec![failed("post-review-verdict", n)]))
+            .collect(),
+    );
+    required(&mut crashed_runs, "post-review-verdict");
+    let groups = super::group(&reds(&crashed_runs, &ledger, "review-verdict", &[]));
+    assert_eq!(groups.len(), 1, "a crashing review check run groups");
+    // release-path-review as a status with a crash message on three PRs.
+    let crash = |number: u64| {
+        let mut check = failed("release-path-review", number);
+        check.source = StewardCheckSource::StatusContext;
+        check.description =
+            Some("Traceback (most recent call last): KeyError 'codeowners'".to_owned());
+        check
+    };
+    let mut crashed_status = observation(
+        [4_u64, 5, 6]
+            .into_iter()
+            .map(|n| observed(n, head(n), vec![crash(n)]))
+            .collect(),
+    );
+    required(&mut crashed_status, "release-path-review");
+    let groups = super::group(&reds(&crashed_status, &ledger, "review-verdict", &[]));
+    assert_eq!(
+        groups.len(),
+        1,
+        "an unrecognised review status description groups"
+    );
+}
+
+/// A waiting-shaped review status only leaves the count when its rule binds
+/// an app and the status comes from that app. Under an unbound rule, or from
+/// another app, it still groups.
+#[test]
+fn an_unbound_or_foreign_waiting_review_status_still_groups() {
+    let ledger = StewardLedger::default();
+    let waiting = |number: u64, app_id: Option<u64>| {
+        let mut check = failed("release-path-review", number);
+        check.source = StewardCheckSource::StatusContext;
+        check.app_id = app_id;
+        check.description = Some(format!(
+            "x: needs 2 counted APPROVEs of head {} from different signers and sessions; has 0",
+            &head(number)[..12]
+        ));
+        check
+    };
+    let observe = |rule_app: Option<u64>, status_app: Option<u64>| {
+        let mut obs = observation(
+            [1_u64, 2, 3]
+                .into_iter()
+                .map(|n| observed(n, head(n), vec![waiting(n, status_app)]))
+                .collect(),
+        );
+        obs.required_checks.push(RequiredCheck {
+            context: "release-path-review".to_owned(),
+            app_id: rule_app,
+        });
+        obs
+    };
+    // Unbound rule: a waiting-shaped status anyone could post still groups.
+    let unbound = observe(None, None);
+    let groups = super::group(&reds(&unbound, &ledger, "review-verdict", &[]));
+    assert_eq!(
+        groups.len(),
+        1,
+        "an unbound status is never trusted to leave the count"
+    );
+    // Bound rule, status from another app: not the required context at all,
+    // so it is neither a red nor a trusted wait.
+    let foreign = observe(Some(15_368), Some(999));
+    assert!(reds(&foreign, &ledger, "review-verdict", &[]).is_empty());
+    assert!(!super::waiting_review_status(
+        &foreign.prs[0].fact.checks[0],
+        &head(1),
+        "review-verdict",
+        &foreign.required_checks,
+    ));
+}

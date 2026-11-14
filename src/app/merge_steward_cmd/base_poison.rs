@@ -287,13 +287,11 @@ pub(super) fn observe(
         return None;
     }
     let run_gh = |argv: &[String]| actions.run_gh(argv).map_err(|error| error.to_string());
-    let health = merge_group::read(
-        &run_gh,
-        &observation.repo,
-        &observation.base,
-        &observation.required_checks,
-        now,
-    );
+    // Every required context is judged. Merge groups are read from their
+    // check runs only, so a review status (which only waits on reviewers)
+    // never poisons a group, while a crashing review check run still does.
+    let judged = observation.required_checks.clone();
+    let health = merge_group::read(&run_gh, &observation.repo, &observation.base, &judged, now);
     let poisoned = health.poisoned_contexts();
     let (mut fixes, fix_read_error) = if poisoned.is_empty() {
         (BTreeMap::new(), None)

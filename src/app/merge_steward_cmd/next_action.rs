@@ -362,7 +362,6 @@ fn someone_elses_move(kind: &str, facts: &Facts<'_>) -> Option<NextAction> {
         detail,
         detail_suffix,
         base,
-        required,
         ..
     } = facts;
     let detail = detail.unwrap_or("");
@@ -419,21 +418,6 @@ fn someone_elses_move(kind: &str, facts: &Facts<'_>) -> Option<NextAction> {
                  to do."
             ),
         ),
-        "no_verdict" => NextAction::new(
-            Actor::Reviewer,
-            format!(
-                "Awaiting the standing reviewer; nothing for the author to do. Green on every \
-                 required check ({required}); no reviewer verdict names this head. Do not push, \
-                 do not merge {base}; the reviewer posts APPROVE or HOLD."
-            ),
-        ),
-        "approval_excluded" => NextAction::new(
-            Actor::Reviewer,
-            format!(
-                "An APPROVE names this head but does not count ({arg}{detail_suffix}). Nothing \
-                 to do: a listed reviewer must post it."
-            ),
-        ),
         "waiting_full_test_tier" | "waiting_enqueue_requirements" => NextAction::new(
             Actor::Ci,
             format!("Admission waits on {token}. Nothing to do."),
@@ -453,7 +437,44 @@ fn someone_elses_move(kind: &str, facts: &Facts<'_>) -> Option<NextAction> {
                  pass."
             ),
         ),
-        _ => return operators_move(kind, facts),
+        _ => return reviewers_move(kind, facts).or_else(|| operators_move(kind, facts)),
+    })
+}
+
+/// The review-wait tokens: the standing reviewer moves.
+fn reviewers_move(kind: &str, facts: &Facts<'_>) -> Option<NextAction> {
+    let Facts {
+        arg,
+        detail_suffix,
+        base,
+        required,
+        ..
+    } = facts;
+    Some(match kind {
+        "no_verdict" => NextAction::new(
+            Actor::Reviewer,
+            format!(
+                "Awaiting the standing reviewer; nothing for the author to do. Green on every \
+                 required check ({required}); no reviewer verdict names this head. Do not push, \
+                 do not merge {base}; the reviewer posts APPROVE or HOLD."
+            ),
+        ),
+        "awaiting_review" => NextAction::new(
+            Actor::Reviewer,
+            format!(
+                "Awaiting reviewers; nothing for the author to do. The review status(es) {arg} \
+                 only wait on approvals or a verdict for this head{detail_suffix}. Do not push, \
+                 do not merge {base}; this is review throughput, not a base fault."
+            ),
+        ),
+        "approval_excluded" => NextAction::new(
+            Actor::Reviewer,
+            format!(
+                "An APPROVE names this head but does not count ({arg}{detail_suffix}). Nothing \
+                 to do: a listed reviewer must post it."
+            ),
+        ),
+        _ => return None,
     })
 }
 

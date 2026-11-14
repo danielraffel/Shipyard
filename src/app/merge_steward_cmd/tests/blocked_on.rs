@@ -1079,6 +1079,54 @@ fn awaiting_verdict_statuses_route_to_the_reviewer() {
 }
 
 #[test]
+fn legacy_awaiting_verdict_status_must_name_the_current_head() {
+    let policy = app_bound_policy(&["macos", "review-verdict"]);
+    for (description, expected) in [
+        (
+            "awaiting reviewer verdict for head bbbbbbbbbbbb",
+            "required_failed:review-verdict",
+        ),
+        (
+            "awaiting reviewer verdict for head bbbbbbbbbbbb; current head aaaaaaa",
+            "required_failed:review-verdict",
+        ),
+        (
+            "awaiting reviewer verdict for head aaaaaaaaaaaa",
+            "no_verdict",
+        ),
+    ] {
+        let mut pr = pr_with(
+            12038,
+            &[],
+            "CLEAN",
+            &json!([app_check(
+                "macos",
+                "COMPLETED",
+                Some("SUCCESS"),
+                "2026-11-11T11:20:00Z"
+            )]),
+        );
+        pr.fact.checks.push(review_status(Some(description)));
+        let decision = StewardDecision::RequiredFailed {
+            contexts: vec!["review-verdict (app_id=15368)".to_owned()],
+        };
+        let (blocked, _) = classify(
+            &RowFacts {
+                pr: &pr.fact,
+                decision: &decision,
+                mutation: None,
+                error: None,
+                approval: GateRead::Unread,
+                enqueued_at: None,
+                ejection: None,
+            },
+            &policy,
+        );
+        assert_eq!(blocked.blocked_on, expected, "{description}");
+    }
+}
+
+#[test]
 fn an_unreadable_review_verdict_description_keeps_the_failed_fallback() {
     let policy = app_bound_policy(&["macos", "review-verdict"]);
     let mut pr = pr_with(
@@ -1491,4 +1539,217 @@ fn a_pr_error_is_serialized_with_its_kind() {
     // No error, no kind.
     assert!(kind(None).is_null());
     assert_eq!(classify_pr_error("HTTP 404 not found"), ErrorKind::Policy);
+}
+
+fn status(name: &str, description: &str) -> StewardCheck {
+    StewardCheck {
+        name: name.to_owned(),
+        description: Some(description.to_owned()),
+        ..review_status(None)
+    }
+}
+
+fn classify_failed(pr: &ObservedPr, policy: &StewardPolicy, contexts: &[&str]) -> Stall {
+    let decision = StewardDecision::RequiredFailed {
+        contexts: contexts
+            .iter()
+            .map(|context| (*context).to_owned())
+            .collect(),
+    };
+    classify(
+        &RowFacts {
+            pr: &pr.fact,
+            decision: &decision,
+            mutation: None,
+            error: None,
+            approval: GateRead::Unread,
+            enqueued_at: None,
+            ejection: None,
+        },
+        policy,
+    )
+    .0
+}
+
+/// Vellum #415 and #418: `release-path-review` fails only because counted
+/// APPROVEs are missing. That is reviewer throughput: `awaiting_review`,
+/// the reviewer's move, never `required_failed` (which a base-level episode
+/// would reword as "wait for the base fix").
+#[test]
+fn approvals_missing_on_release_path_review_is_awaiting_review() {
+    let policy = app_bound_policy(&["macos", "release-path-review", "review-verdict"]);
+    let mut pr = pr_with(
+        415,
+        &[],
+        "BLOCKED",
+        &json!([app_check(
+            "macos",
+            "COMPLETED",
+            Some("SUCCESS"),
+            "2026-11-13T20:00:00Z"
+        )]),
+    );
+    pr.fact.checks.push(status(
+        "release-path-review",
+        ".github/workflows/x.yml and 1 more: needs 2 counted APPROVEs of head aaaaaaaaaaaa from different signers and sessions; has 0",
+    ));
+    let stall = classify_failed(&pr, &policy, &["release-path-review (app_id=15368)"]);
+    assert_eq!(stall.blocked_on, "awaiting_review:release-path-review");
+    assert!(
+        stall
+            .blocked_detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("approvals_missing"))
+    );
+    let next = crate::app::merge_steward_cmd::next_action::for_row(
+        &crate::app::merge_steward_cmd::next_action::RowContext {
+            repo: "Generous-Corp/vellum",
+            base: "main",
+            pr: &pr.fact,
+            policy: &policy,
+            error: None,
+        },
+        &stall,
+    );
+    assert_eq!(
+        next.actor,
+        crate::app::merge_steward_cmd::next_action::Actor::Reviewer
+    );
+    assert!(next.action.contains("not a base fault"), "{}", next.action);
+    // An unknown description stays red (fail closed), just not base-level.
+    let mut unknown = pr.clone();
+    unknown.fact.checks.pop();
+    unknown.fact.checks.push(status(
+        "release-path-review",
+        "workflow file outside the allow-list",
+    ));
+    assert_eq!(
+        classify_failed(&unknown, &policy, &["release-path-review (app_id=15368)"]).blocked_on,
+        "required_failed:release-path-review"
+    );
+    // A real red beside it keeps the row red.
+    assert_eq!(
+        classify_failed(
+            &pr,
+            &policy,
+            &["macos (app_id=15368)", "release-path-review (app_id=15368)"]
+        )
+        .blocked_on,
+        "required_failed:macos,release-path-review"
+    );
+}
+
+/// A HOLD on the head stays a HOLD, even beside approvals missing elsewhere.
+#[test]
+fn a_hold_stays_a_hold_beside_approvals_missing() {
+    let policy = app_bound_policy(&["macos", "release-path-review", "review-verdict"]);
+    let mut pr = pr_with(
+        418,
+        &[],
+        "BLOCKED",
+        &json!([app_check(
+            "macos",
+            "COMPLETED",
+            Some("SUCCESS"),
+            "2026-11-13T20:00:00Z"
+        )]),
+    );
+    pr.fact.checks.push(review_status(Some(
+        "a HOLD naming head aaaaaaaaaaaa makes it un-approvable (held by pulp-review at comment 1, posted 2026-11-13T20:00:00Z)",
+    )));
+    pr.fact.checks.push(status(
+        "release-path-review",
+        "x: needs 2 counted APPROVEs of head aaaaaaaaaaaa from different signers and sessions; has 1 (pulp-review)",
+    ));
+    let stall = classify_failed(
+        &pr,
+        &policy,
+        &[
+            "release-path-review (app_id=15368)",
+            "review-verdict (app_id=15368)",
+        ],
+    );
+    assert_eq!(stall.blocked_on, "held:review-verdict");
+}
+
+/// A HOLD in a review status's own description (here release-path-review and
+/// post-review-verdict, in any case) is never a wait: the row stays red.
+#[test]
+fn a_hold_in_a_review_status_description_stays_red() {
+    let policy = app_bound_policy(&["release-path-review", "post-review-verdict"]);
+    for (context, description) in [
+        (
+            "release-path-review",
+            "x: needs 2 counted APPROVEs of head aaaaaaaaaaaa; HOLD by pulp-review",
+        ),
+        (
+            "post-review-verdict",
+            "x: needs 2 counted APPROVEs of head aaaaaaaaaaaa; held by infra-review2",
+        ),
+    ] {
+        let mut pr = pr_with(9, &[], "BLOCKED", &json!([]));
+        pr.fact.checks.push(status(context, description));
+        let label = format!("{context} (app_id=15368)");
+        assert_eq!(
+            classify_failed(&pr, &policy, &[label.as_str()]).blocked_on,
+            format!("required_failed:{context}"),
+            "{description}"
+        );
+    }
+}
+
+/// A rule with no app binding accepts a status any writer could post, so a
+/// waiting-shaped description there is never trusted: `required_failed`.
+#[test]
+fn an_unbound_review_rule_never_reads_as_awaiting_review() {
+    let mut policy = app_bound_policy(&["release-path-review"]);
+    policy.required_checks[0].app_id = None;
+    let mut pr = pr_with(415, &[], "BLOCKED", &json!([]));
+    let mut forged = status(
+        "release-path-review",
+        "x: needs 2 counted APPROVEs of head aaaaaaaaaaaa from different signers and sessions; has 0",
+    );
+    forged.app_id = None;
+    pr.fact.checks.push(forged);
+    assert_eq!(
+        classify_failed(&pr, &policy, &["release-path-review"]).blocked_on,
+        "required_failed:release-path-review"
+    );
+}
+
+/// With the approval gate unread and the approval rule unbound (no app id),
+/// a matching review-verdict status could have been posted by anyone: it is
+/// never read as `no_verdict` or `held`, the row stays `required_failed`.
+#[test]
+fn an_unbound_approval_rule_never_trusts_its_status() {
+    let mut policy = app_bound_policy(&["macos", "review-verdict"]);
+    for rule in &mut policy.required_checks {
+        if rule.context == "review-verdict" {
+            rule.app_id = None;
+        }
+    }
+    for description in [
+        "no reviewer verdict names head aaaaaaaaaaaa; it needs a review",
+        "a HOLD naming head aaaaaaaaaaaa makes it un-approvable (held by x at comment 1, posted 2026-11-14T00:00:00Z)",
+    ] {
+        let mut pr = pr_with(
+            7,
+            &[],
+            "BLOCKED",
+            &json!([app_check(
+                "macos",
+                "COMPLETED",
+                Some("SUCCESS"),
+                "2026-11-14T00:00:00Z"
+            )]),
+        );
+        let mut forged = review_status(Some(description));
+        forged.app_id = None;
+        pr.fact.checks.push(forged);
+        assert_eq!(
+            classify_failed(&pr, &policy, &["review-verdict"]).blocked_on,
+            "required_failed:review-verdict",
+            "{description}"
+        );
+    }
 }

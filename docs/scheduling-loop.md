@@ -55,7 +55,7 @@ The first match wins:
 | `blocked_on` | `state` |
 |---|---|
 | `ready`, `admission_pending`, `merge_state:BEHIND` (the queue tests on top of main, so behind is never an act), `enqueue_refused:*`, `generated_path_batch:*` | `ready` |
-| `no_verdict`, `waiting_head_approval`, `approval_excluded:*`, `waiting_code_owner:*`, `code_owner_review`, `carries_unapproved_commits:*` | `awaiting_review` |
+| `no_verdict`, `awaiting_review:*`, `waiting_head_approval`, `approval_excluded:*`, `waiting_code_owner:*`, `code_owner_review`, `carries_unapproved_commits:*` | `awaiting_review` |
 | `required_pending`, `waiting_full_test_tier`, `waiting_enqueue_requirements`, `merge_state:` other than `DIRTY`/`BEHIND` | `check_running` |
 | `capacity_queued` | `capacity_queued` |
 | `required_failed:*` | `required_red` |
