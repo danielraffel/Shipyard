@@ -261,10 +261,13 @@ impl WaitReadCost {
 pub(super) fn fetch_pr_actionable_snapshot(
     actions: &crate::cloud::GitHubActions,
     state_dir: &Path,
+    global_dir: &Path,
     repo: &str,
     pr_number: u64,
 ) -> wait_transport::WaitResult<Option<Value>> {
-    match super::merge_steward_cmd::pr_next_action_snapshot(actions, state_dir, repo, pr_number) {
+    match super::merge_steward_cmd::pr_next_action_snapshot(
+        actions, state_dir, global_dir, repo, pr_number,
+    ) {
         Ok(snapshot) => Ok(Some(snapshot)),
         Err(error) if pull_request_absent(&error) => Ok(None),
         Err(error) => Err(error.into()),
@@ -421,8 +424,13 @@ fn wait_pr<W: Write>(
                         Instant::now() + remaining,
                         &pass,
                     );
-                    let snapshot =
-                        fetch_pr_actionable_snapshot(&actions, state_dir, &repo, pr_number);
+                    let snapshot = fetch_pr_actionable_snapshot(
+                        &actions,
+                        state_dir,
+                        &config.global_dir,
+                        &repo,
+                        pr_number,
+                    );
                     read_cost.add(&pass.report());
                     snapshot
                 }
