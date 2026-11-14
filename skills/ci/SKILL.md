@@ -4810,3 +4810,13 @@ head gets no shortcut: ancestry cannot say which PR introduced a shared commit.
 ## Skill-sync gotcha
 
 Changes to CI-coordinated Rust steward paths must carry this note or a reviewed skill-sync exception so the version-and-skill gate records the operational impact.
+
+### Design A governance onboarding
+
+`shipyard governance onboard --repo OWNER/NAME` is a read-only plan.
+`--apply` is not implemented yet and refuses before any read; nothing is
+executed or written. The plan renders the two review-verdict workflows (the
+poster pinned to the running release's 40-hex Shipyard commit) and edits only
+the named `.shipyard/config.toml` keys, keeping every other key. Any failed
+GitHub read stops it with exit 9. Use `--gh-binary ghapp` for the reads, and
+`--reviewer-signer`/`--stamp-session` when the base lists none.

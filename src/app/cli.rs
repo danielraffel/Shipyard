@@ -3918,6 +3918,39 @@ pub(super) enum BranchCommand {
 
 #[derive(Debug, Subcommand)]
 pub(super) enum GovernanceCommand {
+    /// Print the read-only Design A onboarding plan for one repository.
+    /// `--apply` is not implemented yet and refuses.
+    Onboard {
+        /// Repository to onboard.
+        #[arg(long = "repo", value_name = "OWNER/NAME")]
+        repo: String,
+        /// Artifact-producing repository profile.
+        #[arg(long, value_parser = ["fleet", "builder"], default_value = "fleet")]
+        profile: String,
+        /// Existing CI context to require. Repeatable.
+        #[arg(long = "require-check")]
+        require_checks: Vec<String>,
+        /// Last onboarding step the plan includes.
+        #[arg(long, value_parser = ["preflight", "pr", "approved", "green", "merged", "tightened", "evaluated", "verified", "handed_over", "audited", "enrolled"])]
+        through: Option<String>,
+        /// Alias for --through audited.
+        #[arg(long, conflicts_with = "through")]
+        no_enroll: bool,
+        /// `[auto_merge] reviewer_signers` entry to render. Repeatable;
+        /// defaults to the base's own list.
+        #[arg(long = "reviewer-signer", value_name = "NAME")]
+        reviewer_signers: Vec<String>,
+        /// `[auto_merge] reviewer_stamp_sessions` glob to render. Repeatable;
+        /// defaults to the base's own list.
+        #[arg(long = "stamp-session", value_name = "GLOB")]
+        stamp_sessions: Vec<String>,
+        /// gh-compatible CLI used for the reads (for example ghapp or ghread).
+        #[arg(long = "gh-binary", value_name = "PATH")]
+        gh_binary: Option<PathBuf>,
+        /// Not implemented yet: refuses before any read or write.
+        #[arg(long)]
+        apply: bool,
+    },
     /// Report declared-vs-live governance drift per branch.
     Status {
         /// Branches to check. Defaults to main.

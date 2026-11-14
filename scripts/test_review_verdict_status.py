@@ -137,14 +137,14 @@ class ReviewVerdictStatus(unittest.TestCase):
         # The head's own pull_request_target run, which a comment or review
         # re-runs so its check follows the verdict.
         answers.insert(0, ("/actions/runs/555/rerun", {"text": ""}))
-        answers.insert(0, ("actions/runs?head_sha", {"json": {"workflow_runs": [
+        answers.insert(0, ("actions/runs?head_sha", {"pages": [{"total_count": 3, "workflow_runs": [
             {"id": 500, "name": "Review verdict", "event": "pull_request_target"},
             {"id": 555, "name": "Review verdict", "event": "pull_request_target"},
-            {"id": 600, "name": "Other", "event": "pull_request_target"}]}}))
-        answers.insert(0, (f"/commits/{HEAD}/pulls", {"json": [
+            {"id": 600, "name": "Other", "event": "pull_request_target"}]}]}))
+        answers.insert(0, (f"/commits/{HEAD}/pulls", {"pages": [[
             {"number": 784, "state": "open", "head": {"sha": HEAD}},
             {"number": 700, "state": "closed", "head": {"sha": HEAD}},
-            {"number": 701, "state": "open", "head": {"sha": arm.HOLD_784}}]}))
+            {"number": 701, "state": "open", "head": {"sha": arm.HOLD_784}}]]}))
         return [(needle, {"json": pull}) if needle == "/pulls/" else (needle, answer)
                 for needle, answer in answers]
 
@@ -154,16 +154,18 @@ class ReviewVerdictStatus(unittest.TestCase):
         return arm.comment_like(template, body=body, created_at=at, **change)
 
     def post(self, answers: list[tuple[str, dict[str, Any]]], event_name: str = "issue_comment",
-             event: dict[str, Any] | None = None) -> subprocess.CompletedProcess:
+             event: dict[str, Any] | None = None, ref: str = "refs/heads/main") -> subprocess.CompletedProcess:
         (self.root / "calls").unlink(missing_ok=True)
         fake = self.install(answers)
         payload = event if event is not None else {
             "issue": {"number": 784, "pull_request": {"url": "x"}}}
         event_path = self.root / "event.json"
+        payload.setdefault("repository", {"default_branch": "main"})
         event_path.write_text(json.dumps(payload), encoding="utf-8")
         environment = {"PATH": "/usr/bin:/bin", "GHAPP_REAL_GH": str(fake), "HOME": str(self.root),
                        "GITHUB_EVENT_NAME": event_name, "GITHUB_EVENT_PATH": str(event_path),
-                       "GITHUB_REPOSITORY": REPO, "GITHUB_RUN_ID": "99",
+                       "GITHUB_REPOSITORY": REPO, "GITHUB_RUN_ID": "99", "GITHUB_REF": ref,
+                       "TMPDIR": str(self.root),
                        # A host's own switches must not reach the status.
                        "SHIPYARD_REBASE_CARRY": "0", "SHIPYARD_REVIEW_BEFORE_ARM": "0",
                        # Nor its signers file, which would allow anyone here.
@@ -338,9 +340,9 @@ class ReviewVerdictStatus(unittest.TestCase):
         pull.update(state="open", number=785)
         answers = self.answers(self.refused_trail())
         answers[:0] = [
-            (f"/commits/{HEAD}/pulls", {"json": [
+            (f"/commits/{HEAD}/pulls", {"pages": [[
                 {"number": 784, "state": "open", "head": {"sha": HEAD}},
-                {"number": 785, "state": "open", "head": {"sha": HEAD}}]}),
+                {"number": 785, "state": "open", "head": {"sha": HEAD}}]]}),
             ("issues/785/comments", {"pages": [[]]}),
             ("pulls/785/reviews", {"pages": [[]]}),
             ("pulls/785", {"json": pull}),
@@ -416,9 +418,9 @@ class ReviewVerdictStatus(unittest.TestCase):
         pull = copy.deepcopy(arm.review_fixture("shipyard-784-pull.json"))
         pull.update(state="open", number=785)
         answers[:0] = [
-            (f"/commits/{HEAD}/pulls", {"json": [
+            (f"/commits/{HEAD}/pulls", {"pages": [[
                 {"number": 784, "state": "open", "head": {"sha": HEAD}},
-                {"number": 785, "state": "open", "head": {"sha": HEAD}}]}),
+                {"number": 785, "state": "open", "head": {"sha": HEAD}}]]}),
             ("issues/785/comments", {"pages": [[]]}),
             ("pulls/785/reviews", {"pages": [[]]}),
             ("pulls/785", {"json": pull}),
@@ -482,6 +484,94 @@ class ReviewVerdictStatus(unittest.TestCase):
                 self.assertIn("-X POST repos/danielraffel/Shipyard/actions/runs/555/rerun", calls)
                 self.assertNotIn("/actions/runs/500/rerun", calls)
 
+    def test_a_held_pull_request_on_a_later_page_still_fails_the_head(self) -> None:
+        # The 101st open pull request on a shared head is on page two; its HOLD
+        # (or missing verdict) must still decide the status.
+        pull = copy.deepcopy(arm.review_fixture("shipyard-784-pull.json"))
+        pull.update(state="open", number=785)
+        filler = [{"number": 1000 + n, "state": "closed", "head": {"sha": HEAD}}
+                  for n in range(99)]
+        answers = self.answers(self.approved_trail(), SIGNERS)
+        answers[:0] = [
+            (f"/commits/{HEAD}/pulls", {"pages": [
+                [{"number": 784, "state": "open", "head": {"sha": HEAD}}, *filler],
+                [{"number": 785, "state": "open", "head": {"sha": HEAD}}]]}),
+            ("issues/785/comments", {"pages": [[]]}),
+            ("pulls/785/reviews", {"pages": [[]]}),
+            ("pulls/785", {"json": pull}),
+        ]
+        result = self.post(answers, "pull_request_target", {"pull_request": {"number": 784}})
+        self.assertIn("PR #785", result.stdout, result.stdout + result.stderr)
+        self.assertNotEqual(self.posted()["state"], "success")
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_the_heads_own_run_on_a_later_page_is_still_re_run(self) -> None:
+        # The head's pull_request_target run listed after the first 100 must
+        # still be found and re-run, or a refusal leaves its check green.
+        other = [{"id": 2000 + n, "name": "Other", "event": "pull_request_target"}
+                 for n in range(100)]
+        answers = [
+            ("actions/runs?head_sha", {"pages": [
+                {"total_count": 101, "workflow_runs": other},
+                {"total_count": 101, "workflow_runs": [
+                    {"id": 555, "name": "Review verdict", "event": "pull_request_target"}]}]})
+            if needle == "actions/runs?head_sha" else (needle, answer)
+            for needle, answer in self.answers(self.refused_trail())]
+        result = self.post(answers)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("-X POST repos/danielraffel/Shipyard/actions/runs/555/rerun", self.calls())
+
+    def test_a_malformed_pull_row_fails_closed_instead_of_being_dropped(self) -> None:
+        answers = self.answers(self.approved_trail(), SIGNERS)
+        answers = [
+            (needle, {"pages": [[
+                {"number": 784, "state": "open", "head": {"sha": HEAD}},
+                {},
+            ]]}) if needle == f"/commits/{HEAD}/pulls" else (needle, answer)
+            for needle, answer in answers
+        ]
+        result = self.post(answers)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("pull requests on", result.stderr)
+        self.assertNotIn("/statuses/", self.calls())
+
+    def test_a_malformed_workflow_run_fails_closed_before_refresh(self) -> None:
+        answers = self.answers(self.refused_trail())
+        answers = [
+            (needle, {"pages": [{"total_count": 3, "workflow_runs": [
+                {"id": 555, "name": "Review verdict", "event": "pull_request_target"},
+                {},
+                {"id": 600, "name": "Other", "event": "pull_request_target"},
+            ]}]}) if needle == "actions/runs?head_sha" else (needle, answer)
+            for needle, answer in answers
+        ]
+        result = self.post(answers)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("workflow runs on", result.stderr)
+        self.assertNotIn("/actions/runs/555/rerun", self.calls())
+
+    def test_an_incomplete_or_malformed_listing_fails_the_job(self) -> None:
+        cases = {
+            "runs short of total_count": ("actions/runs?head_sha", {"pages": [
+                {"total_count": 150, "workflow_runs": [
+                    {"id": 555, "name": "Review verdict", "event": "pull_request_target"}]}]}),
+            "runs page without total_count": ("actions/runs?head_sha", {"pages": [
+                {"workflow_runs": []}]}),
+            "runs page not an object": ("actions/runs?head_sha", {"pages": [[]]}),
+            "pulls page not a list": (f"/commits/{HEAD}/pulls", {"pages": [
+                {"number": 784}]}),
+            "pulls page unreadable": (f"/commits/{HEAD}/pulls", {"error": "gh: HTTP 502"}),
+        }
+        for label, replacement in cases.items():
+            with self.subTest(label):
+                answers = [replacement if needle == replacement[0] else (needle, answer)
+                           for needle, answer in self.answers(self.refused_trail())]
+                result = self.post(answers)
+                self.assertNotEqual(result.returncode, 0, label + ": " + result.stdout)
+                self.assertNotIn("actions/runs/555/rerun", self.calls(), label)
+                # A deliberate refusal that names the listing, not a crash.
+                self.assertRegex(result.stderr, r"are (unreadable|incomplete)|cannot read live PR state", label)
+
     def test_a_read_error_fails_the_job_instead_of_passing(self) -> None:
         for event_name, event in (("pull_request_target", {"pull_request": {"number": 784}}),
                                   ("issue_comment", None)):
@@ -519,10 +609,24 @@ class ReviewVerdictStatus(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("error", result.stderr)
 
+    def test_review_verdict_cannot_be_manually_dispatched(self) -> None:
+        root = STATUS.parent.parent
+        paths = (root / ".github/workflows/review-verdict.yml",
+                 root / "src/governance_onboard.rs",
+                 root / "docs/review-verdict-status.md")
+        for path in paths:
+            content = path.read_text(encoding="utf-8")
+            self.assertNotIn("workflow_dispatch", content, path)
+            self.assertNotIn("Refuse dispatch outside the default branch", content, path)
+        workflow = (root / ".github/workflows/review-verdict.yml").read_text(encoding="utf-8")
+        self.assertIn("pull_request_target:", workflow)
+        self.assertIn("workflow_run:", workflow)
+
     def test_the_workflow_can_re_run_and_still_runs_on_verdicts(self) -> None:
         root = STATUS.parent.parent / ".github" / "workflows"
         workflow = (root / "review-verdict.yml").read_text(encoding="utf-8")
-        for needed in ("pull_request_target:", "issue_comment:", "workflow_run:",
+        for needed in ("pull_request_target:",
+                       "issue_comment:", "workflow_run:",
                        "actions: write", "scripts/review_verdict_status.py"):
             self.assertIn(needed, workflow)
         self.assertNotIn("continue-on-error", workflow)
