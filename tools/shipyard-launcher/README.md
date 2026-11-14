@@ -57,19 +57,51 @@ Rules, all fail closed (exit 77, nothing runs):
   then resumed. A file swapped between the static check and the spawn is
   killed.
 - Scripts come from a compiled-in allowlist (only the steward tick today).
-  A shell script cannot carry a code signature, so it is trusted by the
-  allowlist and the same ownership checks, which is the trust launchd already
-  gives it. `BASH_ENV`, `ENV`, `SHELLOPTS`, `BASHOPTS`, `CDPATH`, `GLOBIGNORE`,
-  `PS4` and exported functions are removed, and bash runs with
-  `--noprofile --norc`.
+  A shell script cannot carry a code signature, so it is bound by content
+  instead: the activation record holds its SHA-256, which fleet-deploy
+  records (`shipyard-launcher-check --bind-script`) only when the installed
+  file is byte-identical to the tick it installed from main. On every run the
+  launcher re-hashes the file, copies the verified bytes into a private
+  directory and runs that copy, so a write after the check changes nothing.
+  If anything is off (no bound record, a different hash, an untrusted or
+  symlinked file), it does not run the script under its identity: it `exec`s
+  plain `/bin/bash` on the installed file with the caller's environment and
+  `SHIPYARD_LAUNCHER_FALLBACK=launcher-script-mismatch`, which is what the
+  LaunchAgent would run without the launcher, and logs
+  `launcher-script-mismatch`. `BASH_ENV`, `ENV`, `SHELLOPTS`, `BASHOPTS`,
+  `CDPATH`, `GLOBIGNORE`, `PS4` and exported functions are removed from a
+  verified run, and bash runs with `--noprofile --norc`.
+
+- Downgrades fall back. Before running a release the launcher runs its
+  `--version` the same verified way (spawned suspended, checked, resumed,
+  bounded at 15 s) and keeps the newest version it has run in
+  `~/.local/share/shipyard/launcher/release-floor.json`. A release older than
+  that, a version it cannot read, or a floor file it cannot trust is not run
+  under the launcher: it `exec`s the release directly with the caller's
+  environment and `SHIPYARD_LAUNCHER_FALLBACK=launcher-release-fallback`
+  (which also stops Shipyard routing again) and logs
+  `launcher-release-fallback`. `--launcher-active` reports such a release as
+  `release_downgrade`. A newer release passes at once. There is deliberately
+  no exact path or cdhash pin: every install changes both, so a pin would make
+  each new release fall back to its own per-generation identity until someone
+  re-recorded it, which is the prompt this bundle exists to prevent. The
+  Developer ID, team, identifier and `auth-generations` checks already limit
+  the choice to genuine Shipyard releases.
 
 Pass-through:
 
 - Arguments are passed verbatim. Only a first argument starting with
   `--launcher-` is the launcher's own.
-- The environment is passed unchanged except that `DYLD_*` is removed, and
+- The environment is passed unchanged except that `DYLD_*` is removed,
   `SHIPYARD_LAUNCHER_APP=<bundle>` is added so nothing routes through the
-  launcher twice.
+  launcher twice, and `PATH` is set by the launcher, never taken from the
+  caller. A script gets `/usr/bin:/bin:/usr/sbin:/sbin` plus the bundle's
+  `Contents/MacOS`. Shipyard gets its fixed unattended tool path
+  (`/opt/homebrew/bin:/usr/local/bin:~/.local/bin` then the system
+  directories), the list its LaunchAgents already use, because it finds the
+  guarded `gh` wrapper by name. The steward tick sets its own documented
+  `PATH` on its first line for the same reason: `gh` must resolve to the
+  ghapp wrapper in `~/.local/bin`.
 - The child stays in the launcher's process group, so launchd's process-group
   handling (`AbandonProcessGroup`) is unchanged.
 - SIGTERM, SIGINT, SIGHUP, SIGQUIT, SIGUSR1, SIGUSR2 and SIGWINCH are
@@ -85,25 +117,65 @@ Pass-through:
 Launcher exit codes: 64 usage, 70 internal error, 77 refused, 126 spawn
 failed, 127 target missing.
 
-## Which jobs will use it
+## Which jobs use it
 
-This change adds the bundle, its build, the check and the activation record.
-No entry point uses it yet. A follow-up change routes these, each only while
-`--launcher-active` says so, logging `launcher=app` or `launcher=direct
-reason=...` and falling back to the direct call:
+Each entry point routes only while `shipyard-launcher --launcher-active`
+answers active (see Check and activate). On any other answer, or with no
+launcher installed, it runs exactly as before and logs why.
 
-| Entry point | Planned routing |
-| --- | --- |
-| A LaunchAgent whose program is the Shipyard release (today `com.danielraffel.shipyard.fleet-reconcile`) | At startup Shipyard, as a launchd job's own program, `exec`s the launcher with the same arguments. `exec` keeps the job's pid, so the job's identity becomes the bundle. |
-| The daemon agent (`com.danielraffel.shipyard.daemon.<id>`) | The agent plist names the bundle as its program, with the same arguments. |
-| The steward tick (program `/bin/bash`) | The installed tick `exec`s `shipyard-launcher --launcher-script steward-tick`. |
-| fleet-deploy | Installs a bundle staged at `~/.local/share/shipyard/launcher/staged/ShipyardLauncher.app` only when `shipyard-launcher-check --verify-bundle` accepts it. It never activates it. |
+| Entry point | How it routes | Log |
+| --- | --- | --- |
+| A LaunchAgent whose program is the Shipyard release (today `com.danielraffel.shipyard.fleet-reconcile`) | At startup Shipyard checks it is a launchd job's own program (parent pid 1, `XPC_SERVICE_NAME` set), not already under the launcher, not the daemon itself, and the same file `~/.local/bin/shipyard` resolves to. The `--launcher-active` check is bounded at 45 s. It then `exec`s the launcher with the same arguments; `exec` keeps the job's pid, so the job's identity becomes the bundle (`src/launcher_app.rs`). A failed `exec` is logged and Shipyard runs directly. | `shipyard-launcher.log`: `job=<label> launcher=app`, or `launcher=direct reason=...` |
+| The steward tick (program `/bin/bash`) | The installed tick asks `--launcher-active` (bounded, `SHIPYARD_STEWARD_LAUNCHER_TIMEOUT_S`, default 45 s), then `exec`s `shipyard-launcher --launcher-script steward-tick`, which runs the same file again as its child. A timeout or a failed `exec` runs the tick directly. | `summary.log`: `launcher=app` or `launcher=direct` on every repo line, plus a `reason=not_active` line |
+| fleet-deploy (`unit=launcher`) | Installs a bundle staged at `~/.local/share/shipyard/launcher/staged/ShipyardLauncher.app` only when `shipyard-launcher-check --verify-bundle` accepts it and its copy, and never one whose CFBundleVersion is below the installed one or the highest it ever installed (`launcher.version-floor`). Then, when the installed launcher is not active, runs `shipyard-launcher-check --activate`, which succeeds only once the owner's grant is in place. It never activates a bundle below the floor. Each call is bounded (`FLEET_DEPLOY_LAUNCHER_TIMEOUT_S`, default 45 s). | `summary.log`: `unit=launcher ...`, `unit=launcher-activation activated` or `waiting reason=full_disk_access=denied` |
 
-Still their own identities after that: the `com.danielraffel.fleet-pass.*`
-agents (installed from fleet-handbook; they need a `fleet-pass` allowlist
-entry), processes the tick detaches with `setsid` (once their responsible
-process exits, macOS attributes them to themselves), and tartci's agents
+`SHIPYARD_LAUNCHER_ROUTING=off` (Shipyard), `SHIPYARD_STEWARD_LAUNCHER=off`
+(tick) and `SHIPYARD_LAUNCHER_AUTO_ACTIVATE=off` (fleet-deploy) turn routing
+off.
+
+The daemon agent (`com.danielraffel.shipyard.daemon.<id>`) is never routed.
+launchd restarts it at login and after any failure, so it keeps its stable
+launcher copy (`~/.local/libexec/shipyard/shipyard-daemon-launcher`) as its
+program, and no state of this bundle (missing, refusing, not active) can keep
+it down. Shipyard's startup routing skips `daemon run` and `daemon supervise`
+for the same reason.
+
+Still their own identities: the `com.danielraffel.fleet-pass.*` agents
+(installed from fleet-handbook; they need a `fleet-pass` allowlist entry),
+processes the tick detaches with `setsid` (once their responsible process
+exits, macOS attributes them to themselves), and tartci's agents
 (TartCILauncher.app).
+
+## What the steward tick needs
+
+The tick sets `PATH=~/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`
+on its first line and refuses to run unless `gh` resolves to
+`~/.local/bin/gh` (the ghapp wrapper, so admissions stay guarded). It uses:
+`~/.local/bin/shipyard`, `~/.local/bin/ghapp`, `jq`, `timeout` (Homebrew
+coreutils), `git`, `/usr/bin/python3`, and system `tar`, `find`, `stat`,
+`date`, `mktemp`, `head`, `tr`, `grep`, `cat`, `awk`. It starts
+`~/.local/libexec/shipyard-fleet-deploy.sh` and two Python scripts from the
+deploy clone, detached.
+
+## What Full Disk Access reaches once active
+
+The launcher itself gains no authority beyond running these. Every child
+inherits its Full Disk Access:
+
+| Child | How it is bound | What it can still reach |
+| --- | --- | --- |
+| The Shipyard release (`~/.local/bin/shipyard` resolved) | Developer ID, team `95CX6P84C4`, identifier `shipyard`, under `auth-generations/<id>/`, checked on the file and again on the suspended process; never older than the newest version run here (the floor) | Every tool Shipyard runs: `gh` (through the ghapp wrapper), `git`, `ssh`, `python3`, from its fixed tool path, which includes the user-writable `~/.local/bin` and `/opt/homebrew/bin` |
+| The steward tick (`~/.local/libexec/shipyard-steward-tick.sh`) | SHA-256 bound at deploy time; a verified private copy runs | `~/.local/bin/ghapp`, `~/.local/bin/shipyard`, `jq`, `timeout`, `git`, `/usr/bin/python3`, and the scripts the tick starts (fleet-deploy, drain watch, loss report; detached, so they keep the grant only while the tick runs) |
+
+The bindings hold against changes made by anything that does not also rewrite
+`~/.local/share/shipyard/launcher/activation.json`. That record, the tick's
+tools and the Homebrew and `~/.local/bin` directories are writable by the same
+user, so a process running as that user can still reach Full Disk Access
+through them. Closing that needs an anchor the user cannot write: the tick
+sealed inside the signed bundle (every tick change would then need a new
+signed launcher, so it is not done), or a root-owned record. The defence for
+untrusted code is to keep it off the host: the repair lane's author filter and
+running untrusted work in tartci VMs. Weigh this before granting.
 
 ## Build, sign and notarize (maintainer's Mac)
 
@@ -130,19 +202,26 @@ as the bundle identifier and team stay the same.
 
 ## Install on a host
 
-Until fleet-deploy installs it (follow-up), install a verified bundle by hand:
+Stage the signed bundle; fleet-deploy (started by the steward tick at most
+every 10 minutes) verifies and installs it, then activates it once the grant
+is in place:
 
 ```bash
 mkdir -p ~/.local/share/shipyard/launcher/staged
 ditto -x -k ShipyardLauncher-macos-arm64.zip ~/.local/share/shipyard/launcher/staged/
-tools/shipyard-launcher/shipyard-launcher-check \
-  --verify-bundle ~/.local/share/shipyard/launcher/staged/ShipyardLauncher.app \
-  && ditto ~/.local/share/shipyard/launcher/staged/ShipyardLauncher.app ~/.local/libexec/ShipyardLauncher.app
 ```
 
 `--verify-bundle` requires a Developer ID signature with the launcher's bundle
-identifier, by the installed Shipyard's team, and `spctl` reporting
-`source=Notarized Developer ID`.
+identifier, by the pinned team `95CX6P84C4` (a constant in the check tool and
+in the launcher, never read from `~/.local/bin/shipyard`), an unmodified
+bundle, `spctl` reporting `source=Notarized Developer ID`, and an integer
+`CFBundleVersion`. Raise `CFBundleVersion` in `Info.plist` for every new
+launcher build: fleet-deploy installs only versions at or above the highest it
+has installed.
+
+The check tool honours its `SHIPYARD_LAUNCHER_CHECK_*` overrides (tools, home,
+team, requirement) only with `SHIPYARD_LAUNCHER_CHECK_TEST_MODE=1`, which only
+the tests set.
 
 The path sits beside `TartCILauncher.app` and the daemon's stable launcher
 copy: on the internal disk, owned by the user (no sudo), and outside

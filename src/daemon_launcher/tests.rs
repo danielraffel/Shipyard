@@ -571,3 +571,39 @@ fn supervise_passes_signals_through_to_the_daemon_child() {
         "term"
     );
 }
+
+#[test]
+fn the_daemon_agent_never_depends_on_the_launcher_app() {
+    // launchd restarts the daemon agent at login and after any non-zero exit.
+    // Its program stays the stable launcher copy whatever ShipyardLauncher.app
+    // looks like (activated, removed, or refusing), so no state of the app can
+    // leave the daemon down.
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let launcher = ActiveLauncher {
+        path: temp.path().join("launcher"),
+        label: "com.example.daemon".to_owned(),
+    };
+    let record = crate::launcher_app::activation_path(&home);
+    fs::create_dir_all(record.parent().expect("parent")).expect("record dir");
+    fs::write(&record, r#"{"schema": 2}"#).expect("record");
+    for app_present in [false, true] {
+        let app = crate::launcher_app::executable_path(&home);
+        if app_present {
+            fs::create_dir_all(app.parent().expect("parent")).expect("bundle");
+            fs::write(&app, "#!/bin/sh\nexit 77\n").expect("app");
+        }
+        let mut launchctl = FakeLaunchctl::default();
+        start_via_launchd_with(&request(&state), &launcher, &home, &mut launchctl).expect("start");
+        let written = fs::read_to_string(plist_path(&home, "com.example.daemon")).expect("plist");
+        let program = written
+            .split("<key>ProgramArguments</key>")
+            .nth(1)
+            .and_then(|rest| rest.split("<string>").nth(1))
+            .and_then(|first| first.split("</string>").next())
+            .expect("first program argument");
+        assert_eq!(program, launcher.path.display().to_string());
+        assert!(!written.contains("ShipyardLauncher.app"));
+    }
+}

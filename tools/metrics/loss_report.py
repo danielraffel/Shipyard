@@ -284,6 +284,23 @@ def load_github_cache(path):
 
 
 # ------------------------------------------------------------------ report
+def page_counts(log_dir, days):
+    """Per-day pages by class and suppressed pages by reason, from drain-watch's state.
+
+    A page is a drain-watch finding announced for the first time (it asks an agent to
+    act). `suppressed` counts candidates the page_only_on_merge_blocking filter dropped
+    (queued PR under the bound, non-required context), once per PR and reason per day.
+    """
+    try:
+        with open(os.path.join(log_dir, "drain-watch-state.json")) as fh:
+            st = json.load(fh)
+    except Exception:
+        return cov("unavailable", "no drain-watch state in the log dir"), None, None
+    pages, sup = st.get("pages") or {}, st.get("suppressed") or {}
+    return (cov("available", "from drain-watch-state.json, two weeks kept"),
+            {d: pages[d] for d in days if d in pages}, {d: sup[d] for d in days if d in sup})
+
+
 def pct(n, d):
     return None if not d else round(100.0 * n / d, 1)
 
@@ -419,6 +436,8 @@ def build_report(log_dir, since, now, github=None, gap_minutes=120):
                             "default": cov("available", "null on a UTC day with no tick files; a day is the UTC day an episode was first seen")},
         "by_repo_token": table,
     }
+    pc_cov, pc_pages, pc_sup = page_counts(log_dir, days)
+    report["pages"] = {"coverage": pc_cov, "per_day_by_class": pc_pages, "suppressed_per_day_by_reason": pc_sup}
     return report
 
 
@@ -439,6 +458,15 @@ def markdown(r):
     for row in r["by_repo_token"][:15]:
         cu = row.get("closed_unmerged", 0) if r["coverage"]["github"]["status"] != "unavailable" else "unavail"
         out.append(f"| {row['repo']} | {row['token']} | {row['episodes']} | {row.get('actionable', 0)} | {row.get('normal_wait', 0)} | {cu} | {row.get('fix_pushes', 0)} |")
+    pg = r.get("pages") or {}
+    if pg.get("per_day_by_class") is None:
+        out += ["", "## Pages per class", "", "unavailable: " + pg.get("coverage", {}).get("reason", "")]
+    else:
+        out += ["", "## Pages per class", ""]
+        for day, kinds in sorted(pg["per_day_by_class"].items()):
+            out.append(f"- {day}: " + ", ".join(f"{k} {n}" for k, n in sorted(kinds.items())))
+        for day, why in sorted((pg.get("suppressed_per_day_by_reason") or {}).items()):
+            out.append(f"- {day} suppressed: " + ", ".join(f"{k} {n}" for k, n in sorted(why.items())))
     out += ["", "Unavailable: CI compute per episode, owner stops answered, dispute outcomes. Elapsed time is context only."]
     return "\n".join(out) + "\n"
 
