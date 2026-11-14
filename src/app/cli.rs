@@ -192,6 +192,13 @@ pub(super) enum Command {
         #[command(subcommand)]
         command: GovernanceCommand,
     },
+    /// Daily read-only release-readiness canary for the next version.
+    #[command(name = "release-canary")]
+    ReleaseCanary {
+        /// Release-canary subcommand.
+        #[command(subcommand)]
+        command: ReleaseCanaryCommand,
+    },
     /// Guided `RELEASE_BOT_TOKEN` provisioning and diagnosis.
     #[command(name = "release-bot")]
     ReleaseBot {
@@ -3869,6 +3876,29 @@ pub(super) enum AuthConfigScope {
     Project,
     /// Per-project local overlay config.
     Local,
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum ReleaseCanaryCommand {
+    /// Rehearse the next release on a clean checkout of the base branch.
+    ///
+    /// Reads `[release.canary]` from the current repo's config; an absent
+    /// section is a no-op. Exits 0 on pass or skip, 1 when the canary fails,
+    /// 2 on an infrastructure error.
+    Run {
+        /// owner/name; detected from the git remote when omitted.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Branch to clone and rehearse.
+        #[arg(long, default_value = "main")]
+        base: String,
+        /// Run at most once per UTC day (an infrastructure error retries hourly).
+        #[arg(long)]
+        daily: bool,
+        /// Open, update or close the tracking issue. Without it, report only.
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]

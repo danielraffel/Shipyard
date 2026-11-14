@@ -74,6 +74,7 @@ mod queue_observer_cmd;
 mod queue_quarantine_cmd;
 mod relay_cmd;
 mod release_bot_cmd;
+mod release_canary_cmd;
 mod reroute_cmd;
 mod rescue_cmd;
 mod reuse_cmd;
@@ -143,6 +144,7 @@ use self::queue_hold_cmd::queue_hold_command;
 use self::queue_observer_cmd::{QueueObserverArgs, queue_observer_command};
 use self::queue_quarantine_cmd::queue_quarantine_command;
 use self::release_bot_cmd::release_bot_command;
+use self::release_canary_cmd::release_canary_command;
 use self::rescue_cmd::rescue_command;
 use self::reviewer_dispatch_cmd::reviewer_dispatch_command;
 use self::run_cmd::{
@@ -428,7 +430,8 @@ where
         | Command::Changelog { .. }
         | Command::Branch { .. }
         | Command::Governance { .. }
-        | Command::ReleaseBot { .. }) => {
+        | Command::ReleaseBot { .. }
+        | Command::ReleaseCanary { .. }) => {
             return handle_setup_command(
                 command,
                 cli.mode.into(),
@@ -1060,6 +1063,7 @@ fn handle_operational_variant<W: Write>(
         | Command::Branch { .. }
         | Command::Governance { .. }
         | Command::ReleaseBot { .. }
+        | Command::ReleaseCanary { .. }
         | Command::Status
         | Command::Evidence { .. }
         | Command::Logs { .. }
@@ -1218,6 +1222,9 @@ fn handle_setup_command<W: Write>(
         Command::Governance { command } => governance_command(command, mode, cwd, json, stdout),
         Command::ReleaseBot { command } => {
             release_bot_command(command, mode, cwd, state_dir, json, stdout)
+        }
+        Command::ReleaseCanary { command } => {
+            release_canary_command(command, mode, cwd, state_dir, json, stdout)
         }
         _ => unreachable!("setup command helper only receives setup commands"),
     }
