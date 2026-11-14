@@ -185,6 +185,9 @@ pub struct WatchConfig {
     pub base: String,
     /// Gate workflow file.
     pub workflow: String,
+    /// Per-repository gate workflow overrides. Keys are case-insensitive
+    /// `OWNER/REPO` slugs; an explicit `OWNER/REPO@workflow.yml` always wins.
+    pub workflow_overrides: BTreeMap<String, String>,
     /// Required checks override.
     pub required_checks: Vec<String>,
     /// History window read per pass.
@@ -218,6 +221,7 @@ impl Default for WatchConfig {
             repos: Vec::new(),
             base: "main".to_owned(),
             workflow: "build.yml".to_owned(),
+            workflow_overrides: BTreeMap::new(),
             required_checks: Vec::new(),
             lookback: Duration::days(7),
             post_comments: false,
@@ -252,6 +256,18 @@ fn integer(config: &LoadedConfig, key: &str) -> Option<i64> {
 
 fn boolean(config: &LoadedConfig, key: &str) -> Option<bool> {
     config.get(key).and_then(toml::Value::as_bool)
+}
+
+fn string_map(config: &LoadedConfig, key: &str) -> BTreeMap<String, String> {
+    config
+        .get(key)
+        .and_then(toml::Value::as_table)
+        .into_iter()
+        .flat_map(|table| table.iter())
+        .filter_map(|(repo, workflow)| {
+            Some((repo.to_ascii_lowercase(), workflow.as_str()?.to_owned()))
+        })
+        .collect()
 }
 
 /// Resolve the daemon digest toggle.
@@ -310,6 +326,7 @@ impl WatchConfig {
             digest,
             warnings: digest_warning.into_iter().collect(),
             repos: strings(config, "pr_watch.repos").unwrap_or_default(),
+            workflow_overrides: string_map(config, "pr_watch.workflow_overrides"),
             handback: HandbackConfig::from_config(config),
             ..Self::default()
         };
@@ -367,6 +384,16 @@ impl WatchConfig {
             t.split_commits = u64::try_from(value.max(1)).unwrap_or(1);
         }
         Ok(out)
+    }
+
+    /// Resolve the gate workflow for one repository. An explicit command-line
+    /// `@workflow.yml` remains the highest-precedence override.
+    #[must_use]
+    pub fn workflow_for(&self, repo: &str) -> String {
+        self.workflow_overrides
+            .get(&repo.to_ascii_lowercase())
+            .cloned()
+            .unwrap_or_else(|| self.workflow.clone())
     }
 }
 
@@ -470,7 +497,7 @@ pub fn scan(
     let query = WatchQuery {
         repo: request.repo.clone(),
         base: config.base.clone(),
-        workflow: config.workflow.clone(),
+        workflow: config.workflow_for(&request.repo),
         required_checks: config.required_checks.clone(),
         from: now - config.lookback,
         to: now,

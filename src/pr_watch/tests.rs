@@ -2075,6 +2075,18 @@ fn a_digest_table_with_enabled_true_turns_the_digest_on() {
 }
 
 #[test]
+fn repository_workflow_overrides_are_case_insensitive() {
+    let watch = watch_config_from_toml(
+        "[pr_watch.workflow_overrides]\n\"danielraffel/spectr\" = \"m5-product-acceptance.yml\"\n",
+    );
+    assert_eq!(
+        watch.workflow_for("DanielRaffel/Spectr"),
+        "m5-product-acceptance.yml"
+    );
+    assert_eq!(watch.workflow_for("owner/other"), "build.yml");
+}
+
+#[test]
 fn a_bare_digest_boolean_without_a_table_is_still_honoured() {
     let on = watch_config_from_toml("[pr_watch]\ndigest = true\n");
     assert!(on.digest);
