@@ -493,6 +493,45 @@ pub(super) enum Command {
         #[arg(long, value_name = "NUMBER")]
         pr: Option<u64>,
     },
+    /// Perform one routine release-movement act after checking its policy.
+    ///
+    /// `--retrigger` closes and reopens a pull request so GitHub rebuilds a
+    /// stale merge ref: only when it is open, not queued or armed, no live
+    /// repair claim holds it, required runs reported at the exact head and
+    /// none is running, and `--reason` says why. `--release-hold` removes
+    /// `shipyard:no-auto-merge`: only when every required check is green at
+    /// the exact head, the steward's gate counts an exact-head APPROVE, and
+    /// every `hold-condition:` the hold comment names is met, or `--decision`
+    /// names a DECISIONS entry that names this pull request. Never on a pull
+    /// request the caller authored or approved. Writes go through `ghapp`
+    /// and its guards; each act posts one audit comment and appends one line
+    /// to `advance.jsonl` in the state directory. Defect dequeues are not an
+    /// act here: they keep their own audited path. Exits 0 acted, 1 refused,
+    /// 2 a fact could not be read, 3 the act did not finish cleanly.
+    Advance {
+        /// The pull request, `OWNER/REPO#NUMBER`.
+        #[arg(value_name = "OWNER/REPO#NUMBER")]
+        target: String,
+        /// Close and reopen to rebuild a stale merge ref.
+        #[arg(long, conflicts_with = "release_hold")]
+        retrigger: bool,
+        /// Remove the `shipyard:no-auto-merge` label.
+        #[arg(long)]
+        release_hold: bool,
+        /// Why (required for `--retrigger`).
+        #[arg(long, value_name = "TEXT")]
+        reason: Option<String>,
+        /// A DECISIONS entry releasing the hold: `OWNER/REPO:PATH[#anchor]`
+        /// or a GitHub blob URL. The file must name this pull request.
+        #[arg(long, value_name = "REF", requires = "release_hold")]
+        decision: Option<String>,
+        /// The head the caller expects; a different live head refuses.
+        #[arg(long, value_name = "SHA")]
+        head: Option<String>,
+        /// Print the decision and change nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Whether a pull request's head may land, by the repository-side
     /// review rule. Read-only.
     ///
@@ -3258,6 +3297,41 @@ pub(super) enum RunnerCommand {
         /// Override the durable retry/audit ledger path. Test hook.
         #[arg(long = "ledger", hide = true)]
         ledger: Option<PathBuf>,
+    },
+    /// Run the steward's admission for one pull request now, because the
+    /// event that made it ready arrived (its exact-head approval posted, or
+    /// its last required check went green). The event is only a trigger:
+    /// the head is read again and admitted through the tick's own path (live
+    /// exact-head approval, final revalidation, `expectedHeadOid`), under the
+    /// steward lock. A busy lock, a moved head, a repeat within
+    /// `--min-interval-secs`, or anything unreadable does nothing and leaves
+    /// the pull request to the next tick. Dry-run is the default. `--apply`
+    /// is for the steward host and its relay only; an agent never runs it,
+    /// as it never arms or enqueues a pull request itself.
+    #[command(name = "steward-admit-ready")]
+    StewardAdmitReady {
+        /// Exact OWNER/REPO.
+        #[arg(long)]
+        repo: String,
+        /// The pull request.
+        #[arg(long)]
+        pr: u64,
+        /// The full head SHA the event named.
+        #[arg(long)]
+        head: String,
+        /// Target branch.
+        #[arg(long, default_value = "main")]
+        base: String,
+        /// One attempt per head within this many seconds (at least 30).
+        #[arg(
+            long = "min-interval-secs",
+            default_value_t = 60,
+            value_parser = clap::value_parser!(u64).range(30..)
+        )]
+        min_interval_secs: u64,
+        /// Admit the head. Without this flag, only report.
+        #[arg(long)]
+        apply: bool,
     },
     /// Fleet-level tick-start invariant: every repository in the fleet list
     /// has a steward config clone with a readable `.shipyard/config.toml`.

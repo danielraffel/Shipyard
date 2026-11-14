@@ -14,6 +14,8 @@
 //! comment_fallback = true
 //! steward_tick_dir = "/Users/me/Library/Logs/shipyard-steward-tick"
 //! steward_tick_max_age_secs = 600
+//! admit_ready = "off"       # "report" or "apply": run the steward's admission
+//!                           # when a verdict or green check makes a PR ready
 //!
 //! [relay.hosts.m5]
 //! ssh = "m5"                # ssh destination; defaults to the host name
@@ -46,6 +48,19 @@ impl Mode {
             Self::Send => "send",
         }
     }
+}
+
+/// What the relay does when an event makes a pull request ready (approved at
+/// its head, required checks green, open, not queued): nothing, a dry-run of
+/// the steward's admission, or the admission itself. Enable `apply` only on
+/// the host that runs the steward: the admission takes that host's steward
+/// lock and mutation authority.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum AdmitReady {
+    #[default]
+    Off,
+    Report,
+    Apply,
 }
 
 /// How the relay reaches one host's cmux.
@@ -109,6 +124,7 @@ pub(crate) struct RelayConfig {
     pub(crate) comment_fallback: bool,
     pub(crate) steward_tick_dir: Option<PathBuf>,
     pub(crate) steward_tick_max_age_secs: u64,
+    pub(crate) admit_ready: AdmitReady,
     pub(crate) review_gates: BTreeSet<String>,
     pub(crate) hosts: BTreeMap<String, HostRoute>,
     pub(crate) repo: BTreeMap<String, RepoFallbacks>,
@@ -156,6 +172,7 @@ impl Default for RelayConfig {
             comment_fallback: true,
             steward_tick_dir: None,
             steward_tick_max_age_secs: 600,
+            admit_ready: AdmitReady::Off,
             review_gates: super::DEFAULT_REVIEW_GATES
                 .iter()
                 .map(|g| (*g).to_owned())
@@ -258,6 +275,18 @@ pub(crate) fn parse(data: &Table) -> Result<RelayConfig, String> {
             .ok_or_else(|| "relay.comment_fallback must be a boolean".to_owned())?;
     }
     config.steward_tick_dir = string(table, "steward_tick_dir", "relay")?.map(PathBuf::from);
+    if let Some(value) = string(table, "admit_ready", "relay")? {
+        config.admit_ready = match value.as_str() {
+            "off" => AdmitReady::Off,
+            "report" => AdmitReady::Report,
+            "apply" => AdmitReady::Apply,
+            other => {
+                return Err(format!(
+                    "relay.admit_ready must be \"off\", \"report\" or \"apply\", not {other:?}"
+                ));
+            }
+        };
+    }
     if let Some(value) = table.get("hosts") {
         let hosts = value
             .as_table()
