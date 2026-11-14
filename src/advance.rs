@@ -305,12 +305,16 @@ impl QueueFacts {
             .get("isInMergeQueue")
             .and_then(Value::as_bool)
             .ok_or_else(|| "merge-queue state carried no isInMergeQueue".to_owned())?;
-        let entry = pr
+        // Both fields must be present: an omitted one is an unread state,
+        // never an empty queue entry or an unarmed pull request.
+        let entry = !pr
             .get("mergeQueueEntry")
-            .is_some_and(|entry| !entry.is_null());
-        let auto_merge_armed = pr
+            .ok_or_else(|| "merge-queue state carried no mergeQueueEntry".to_owned())?
+            .is_null();
+        let auto_merge_armed = !pr
             .get("autoMergeRequest")
-            .is_some_and(|request| !request.is_null());
+            .ok_or_else(|| "merge-queue state carried no autoMergeRequest".to_owned())?
+            .is_null();
         Ok(Self {
             head,
             in_queue: in_queue || entry,
@@ -926,17 +930,19 @@ fn head_unchanged_since_required_run(head: &str, checks: &CheckFacts) -> Result<
 
 /// Every required check is green at the head.
 fn required_green(head: &str, checks: &CheckFacts) -> Result<String, Refusal> {
-    if crate::merge_steward::required_checks_green(&checks.checks, &checks.required) {
-        return Ok(format!(
-            "all {} required checks green at head {head}",
-            checks.required.len()
-        ) + &checks.source());
-    }
+    // Refused before anything else: with no required rule, "every required
+    // check is green" proves nothing, whatever the shared helper answers.
     if checks.required.is_empty() {
         return Err(Refusal::new(
             "required_checks_unknown",
             "the base names no required check, so green cannot be shown",
         ));
+    }
+    if crate::merge_steward::required_checks_green(&checks.checks, &checks.required) {
+        return Ok(format!(
+            "all {} required checks green at head {head}",
+            checks.required.len()
+        ) + &checks.source());
     }
     let not_green: Vec<String> = checks
         .required

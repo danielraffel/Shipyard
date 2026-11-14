@@ -631,6 +631,15 @@ fn queue_facts_refuse_a_partial_answer() {
         QueueFacts::parse(&json!({"data": {"repository": {"pullRequest": {"headRefOid": HEAD}}}}))
             .is_err()
     );
+    for omitted in ["mergeQueueEntry", "autoMergeRequest"] {
+        let mut node = json!({"headRefOid": HEAD, "isInMergeQueue": false,
+            "mergeQueueEntry": null, "autoMergeRequest": null});
+        node.as_object_mut().expect("object").remove(omitted);
+        assert!(
+            QueueFacts::parse(&json!({"data": {"repository": {"pullRequest": node}}})).is_err(),
+            "an omitted {omitted} is unread, not safe"
+        );
+    }
     let queued = QueueFacts::parse(&json!({"data": {"repository": {"pullRequest": {
         "headRefOid": HEAD, "isInMergeQueue": false, "mergeQueueEntry": {"state": "QUEUED"},
         "autoMergeRequest": null}}}}))
@@ -663,4 +672,11 @@ fn evidence_says_when_the_required_set_came_from_rulesets_only() {
         "{:?}",
         decision.evidence
     );
+}
+
+#[test]
+fn release_hold_refuses_an_empty_required_set_even_with_green_checks() {
+    let mut facts = hold_facts("hold-condition: green");
+    facts.checks.required.clear();
+    assert_eq!(refused(release(&facts)), "required_checks_unknown");
 }

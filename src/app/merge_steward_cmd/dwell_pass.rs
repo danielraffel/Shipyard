@@ -1016,18 +1016,15 @@ pub(super) fn retrigger_preconditions(
         .pointer("/data/repository/pullRequest")
         .filter(|node| node.is_object())
         .ok_or_else(|| "merge-queue state carried no pull request".to_owned())?;
+    // Each field must be present and read as "not queued", "no entry" and
+    // "not armed": an omitted field is an unread state, never a safe one.
     if node.get("isInMergeQueue").and_then(Value::as_bool) != Some(false)
-        || node
-            .get("mergeQueueEntry")
-            .is_some_and(|entry| !entry.is_null())
+        || !node.get("mergeQueueEntry").is_some_and(Value::is_null)
     {
         return Err("in the merge queue, or its queue state unread".to_owned());
     }
-    if node
-        .get("autoMergeRequest")
-        .is_some_and(|request| !request.is_null())
-    {
-        return Err("auto-merge is armed".to_owned());
+    if !node.get("autoMergeRequest").is_some_and(Value::is_null) {
+        return Err("auto-merge is armed, or its auto-merge state unread".to_owned());
     }
     Ok(())
 }

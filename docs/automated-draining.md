@@ -810,7 +810,7 @@ timed out) is never retried, and a `blocked` one (a guard refused the close,
 reported as `retrigger_blocked: guard`, or this build has no `advance`
 command, `retrigger_blocked: advance_unavailable`) changed nothing and is
 retried only after a day, then two. `pr-close-guard` refuses every such close
-until it learns the nonce-bound allowance proposed with `shipyard advance`;
+until it learns the nonce-bound allowance proposed in [advance](advance.md);
 until then each stale pull request reads `retrigger_blocked: guard` in its act
 outcome and escalates to the feed.
 

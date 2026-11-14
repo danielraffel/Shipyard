@@ -1323,6 +1323,18 @@ mod stale_annotate {
             ("queued", live(false, "clean"), queue(true, false)),
             ("armed", live(false, "clean"), queue(false, true)),
             ("queue unread", live(false, "clean"), json!({"errors": []})),
+            (
+                "entry omitted",
+                live(false, "clean"),
+                json!({"data": {"repository": {"pullRequest": {
+                    "isInMergeQueue": false, "autoMergeRequest": null}}}}),
+            ),
+            (
+                "auto-merge omitted",
+                live(false, "clean"),
+                json!({"data": {"repository": {"pullRequest": {
+                    "isInMergeQueue": false, "mergeQueueEntry": null}}}}),
+            ),
         ] {
             assert!(check(&live, &queue).is_err(), "{why}");
         }
