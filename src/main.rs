@@ -7,6 +7,11 @@ fn main() -> ExitCode {
     if let Some(code) = shipyard::queue_arm_gate::relaunch_without_inherited_queue_authority() {
         return code;
     }
+    // A launchd job whose program is this release binary becomes the stable
+    // ShipyardLauncher.app identity when the host activated it (returns only
+    // when it did not).
+    #[cfg(target_os = "macos")]
+    shipyard::launcher_app::route_launchd_job();
     shipyard::app::run()
 }
 

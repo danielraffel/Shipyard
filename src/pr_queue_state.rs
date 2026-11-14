@@ -481,98 +481,23 @@ pub fn removal_of(node: &Value, head: &str) -> RemovalOf {
 }
 
 /// Whether the removal at `nodes[index]` is charged to `head`: it names the
-/// head ([`RemovalOf::Head`]), or it names no head ([`RemovalOf::Unattributable`])
-/// and `head` is not proven to have reached GitHub after it.
+/// head ([`RemovalOf::Head`]), or it names no head ([`RemovalOf::Unattributable`]).
 ///
-/// The proof uses server-set times only: `head`'s earliest check suite,
-/// created after the removal, in a complete timeline window
-/// (`window_complete`), with no force-push to `head` at or before it (see
-/// `arrived_after`). Timeline position is not proof: GitHub orders a
-/// `PullRequestCommit` by its author-controlled date, so a commit dated in the
-/// future would sort after every removal. Without the proof the removal
-/// counts. Every `merge_conflict` removal names no head, so without this
-/// exception those removals of earlier heads would be charged to every later
-/// head, and a guard-mode head (which no fresh approval can lift) would stay
-/// at the cap forever.
+/// An unattributable removal is charged because nothing the timeline carries
+/// proves when `head` reached GitHub. A check suite's creation time can lag
+/// the push, a timeline position follows an author-controlled commit date, and
+/// a force-push event shows only that a head was re-pushed, not when it first
+/// arrived. Without authoritative push evidence the removal counts: counting
+/// costs at most one approval newer than the removal, while dropping it could
+/// let a head that keeps failing in the queue be re-armed without a fresh
+/// review. Only a removal that names another head ([`RemovalOf::OtherHead`])
+/// is left out.
 #[must_use]
-pub fn removal_charges_head(
-    nodes: &[Value],
-    index: usize,
-    head: &str,
-    window_complete: bool,
-) -> bool {
+pub fn removal_charges_head(nodes: &[Value], index: usize, head: &str) -> bool {
     let Some(node) = nodes.get(index) else {
         return true;
     };
-    match removal_of(node, head) {
-        RemovalOf::Head => true,
-        RemovalOf::OtherHead => false,
-        RemovalOf::Unattributable => !arrived_after(nodes, node, head, window_complete),
-    }
-}
-
-/// Whether server-set times prove `head` reached GitHub after `removal`.
-///
-/// The proof is `head`'s own `PullRequestCommit` in a complete window
-/// (`window_complete`: `pageInfo.hasPreviousPage` read as `false`) whose
-/// earliest check suite is readable and later than the removal. Every
-/// `PullRequestCommit` of `head` must give such a time, and every force-push
-/// to `head` must be readable and later too: a force-push can only veto (show
-/// the head was there before), never prove a late arrival by itself, since a
-/// head pushed before the removal can be force-pushed away and back after it.
-/// A suite time is an upper bound on the push (sound where an app creates a
-/// suite on push), and `checkSuites(first:1)` is taken to be the oldest.
-/// Anything missing, empty or unparseable is no proof, and the removal counts.
-fn arrived_after(nodes: &[Value], removal: &Value, head: &str, window_complete: bool) -> bool {
-    if !window_complete {
-        return false;
-    }
-    let Some(removed_at) = removal
-        .get("createdAt")
-        .and_then(Value::as_str)
-        .and_then(parse_timestamp)
-    else {
-        return false;
-    };
-    let mut suite_proof = false;
-    for node in nodes {
-        if !pushed_oid(node).is_some_and(|oid| oid.eq_ignore_ascii_case(head)) {
-            continue;
-        }
-        let at = match node.get("__typename").and_then(Value::as_str) {
-            Some("HeadRefForcePushedEvent") => node
-                .get("createdAt")
-                .and_then(Value::as_str)
-                .and_then(parse_timestamp),
-            Some("PullRequestCommit") => {
-                let suite = strict_earliest_suite(node);
-                suite_proof |= suite.is_some();
-                suite
-            }
-            _ => continue,
-        };
-        if at.is_none_or(|at| at <= removed_at) {
-            return false;
-        }
-    }
-    suite_proof
-}
-
-/// [`earliest_suite`], but `None` unless the commit carries at least one
-/// suite and every suite's `createdAt` parses.
-fn strict_earliest_suite(node: &Value) -> Option<chrono::DateTime<chrono::Utc>> {
-    let suites = node.pointer("/commit/checkSuites/nodes")?.as_array()?;
-    suites
-        .iter()
-        .map(|suite| {
-            suite
-                .get("createdAt")
-                .and_then(Value::as_str)
-                .and_then(parse_timestamp)
-        })
-        .collect::<Option<Vec<_>>>()?
-        .into_iter()
-        .min()
+    removal_of(node, head).charges_head()
 }
 
 /// Whether the first re-add (at `add`) after the hazard removal at `removal`

@@ -1303,8 +1303,7 @@ pub fn ejection_cause(reason: &str) -> &'static str {
 ///
 /// A removal the response cannot attribute (no `beforeCommit`, as for every
 /// `merge_conflict` removal, or parents missing or unreadable) is counted
-/// against `head` unless `head`'s earliest check suite, in a complete
-/// timeline window, proves it reached GitHub after it. This is the approval gate's ejection cap: dropping such a removal could
+/// against `head`. This is the approval gate's ejection cap: dropping such a removal could
 /// let a head that keeps failing in the queue be re-armed without a fresh
 /// review, while counting it costs at most one approval newer than the
 /// removal. When in doubt the gate refuses, never admits.
@@ -1314,21 +1313,13 @@ pub fn head_ejections(queue: &Value, head: &str) -> Vec<Ejection> {
         .pointer("/data/repository/pullRequest/timelineItems/nodes")
         .and_then(Value::as_array)
         .map_or(&[][..], Vec::as_slice);
-    // Only a window read as complete can prove a head arrived after a
-    // removal; an unread or `true` `hasPreviousPage` cannot.
-    let window_complete = queue
-        .pointer("/data/repository/pullRequest/timelineItems/pageInfo/hasPreviousPage")
-        .and_then(Value::as_bool)
-        == Some(false);
     nodes
         .iter()
         .enumerate()
         .filter(|(_, node)| {
             node.get("__typename").and_then(Value::as_str) == Some("RemovedFromMergeQueueEvent")
         })
-        .filter(|(index, _)| {
-            crate::pr_queue_state::removal_charges_head(nodes, *index, head, window_complete)
-        })
+        .filter(|(index, _)| crate::pr_queue_state::removal_charges_head(nodes, *index, head))
         .filter_map(|(_, node)| {
             // A removal without a readable reason is not proven a merge, so
             // it counts too.

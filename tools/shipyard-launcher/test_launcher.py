@@ -30,6 +30,16 @@ HERE = pathlib.Path(__file__).resolve().parent
 SOURCE = HERE / "main.swift"
 FIXTURE = HERE / "fixtures" / "target.c"
 GENERATION = "a" * 64
+TICK_REPORT = (
+    "#!/bin/bash\n"
+    'echo "args=$*"\n'
+    'echo "app=${SHIPYARD_LAUNCHER_APP:-none}"\n'
+    'echo "fallback=${SHIPYARD_LAUNCHER_FALLBACK:-none}"\n'
+    'echo "bash_env=${BASH_ENV:-unset}"\n'
+    'echo "path=$PATH"\n'
+    'echo "zero=$0"\n'
+    "exit 7\n"
+)
 ON_MAC = sys.platform == "darwin" and shutil.which("xcrun") is not None
 
 
@@ -103,6 +113,14 @@ class LauncherBase(unittest.TestCase):
             env=merged, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=30, **kwargs,
         )
 
+    def write_tick(self, body: str, mode=0o755) -> pathlib.Path:
+        libexec = self.home / ".local" / "libexec"
+        libexec.mkdir(parents=True, exist_ok=True, mode=0o755)
+        script = libexec / "shipyard-steward-tick.sh"
+        script.write_text(body)
+        script.chmod(mode)
+        return script
+
     def log(self) -> str:
         path = self.home / "Library" / "Logs" / "shipyard-launcher.log"
         return path.read_text() if path.exists() else ""
@@ -156,6 +174,15 @@ class LauncherTests(LauncherBase):
         result = self.launch("args", "ran", env={"SHIPYARD_LAUNCHER_TEST_SWAP_IN": str(impostor)})
         self.assertEqual(result.returncode, 77, result.stderr)
         self.assertIn("is not the verified Shipyard; killed it", result.stderr)
+        self.assertNotIn("ARG:ran", result.stdout)
+
+    def test_a_team_pinned_requirement_refuses_a_release_without_that_team(self):
+        # The Security framework evaluates the OU pin itself: an ad-hoc release
+        # (no team) fails it, so a release of another team would too.
+        self.install_release()
+        pinned = 'identifier "shipyard" and certificate leaf[subject.OU] = "TESTTEAM00"'
+        result = self.launch("args", "ran", env={"SHIPYARD_LAUNCHER_TEST_REQUIREMENT": pinned})
+        self.assertEqual(result.returncode, 77, result.stderr)
         self.assertNotIn("ARG:ran", result.stdout)
 
     def test_pointer_outside_generations_is_refused(self):
@@ -254,47 +281,91 @@ class LauncherTests(LauncherBase):
     def test_launch_is_logged(self):
         binary = self.install_release()
         self.launch("exit", "0")
-        self.assertIn(f"run mode=shipyard target={binary}", self.log())
+        self.assertIn(f"run mode=shipyard 1.0.0 target={binary}", self.log())
 
-    # -- scripts -------------------------------------------------------------
+    # -- scripts (no bound record: always handed back to plain bash) --------
 
-    def write_tick(self, body: str, mode=0o755) -> pathlib.Path:
-        libexec = self.home / ".local" / "libexec"
-        libexec.mkdir(parents=True, exist_ok=True, mode=0o755)
-        script = libexec / "shipyard-steward-tick.sh"
-        script.write_text(body)
-        script.chmod(mode)
-        return script
-
-    def test_script_runs_with_arguments_and_marker(self):
-        self.write_tick('#!/bin/bash\necho "args=$*"\necho "app=$SHIPYARD_LAUNCHER_APP"\necho "bash_env=${BASH_ENV:-unset}"\nexit 7\n')
+    def test_unbound_script_runs_without_the_launcher(self):
+        tick = self.write_tick(TICK_REPORT)
         result = self.launch("--launcher-script", "steward-tick", "one", "two", env={"BASH_ENV": "/tmp/evil"})
         self.assertEqual(result.returncode, 7, result.stderr)
-        self.assertIn("args=one two", result.stdout)
-        self.assertIn(f"app={self.app}", result.stdout)
-        self.assertIn("bash_env=unset", result.stdout)
+        report = dict(line.split("=", 1) for line in result.stdout.splitlines())
+        self.assertEqual(report["args"], "one two")
+        self.assertEqual(report["app"], "none")
+        self.assertEqual(report["fallback"], "launcher-script-mismatch")
+        self.assertEqual(report["zero"], str(tick))
+        self.assertEqual(report["path"], "/usr/bin:/bin", "the fallback keeps the caller's environment")
+        self.assertIn("launcher-script-mismatch script=steward-tick reason=no bound record", self.log())
 
     def test_script_outside_allowlist_is_refused(self):
         self.write_tick("#!/bin/bash\nexit 0\n")
         result = self.launch("--launcher-script", "anything")
         self.assertEqual(result.returncode, 77)
 
-    def test_world_writable_script_is_refused(self):
-        self.write_tick("#!/bin/bash\necho ran\n", mode=0o777)
+    def test_untrusted_scripts_never_run_under_the_launcher(self):
+        self.write_tick(TICK_REPORT, mode=0o777)
         result = self.launch("--launcher-script", "steward-tick")
-        self.assertEqual(result.returncode, 77)
-        self.assertNotIn("ran", result.stdout)
-
-    def test_symlinked_script_is_refused(self):
+        self.assertIn("app=none", result.stdout)
+        self.assertIn("group- or world-writable", self.log())
         real = self.home / "real-tick.sh"
-        real.write_text("#!/bin/bash\necho ran\n")
+        real.write_text(TICK_REPORT)
         real.chmod(0o755)
-        libexec = self.home / ".local" / "libexec"
-        libexec.mkdir(parents=True, mode=0o755)
-        (libexec / "shipyard-steward-tick.sh").symlink_to(real)
+        tick = self.home / ".local" / "libexec" / "shipyard-steward-tick.sh"
+        tick.unlink()
+        tick.symlink_to(real)
         result = self.launch("--launcher-script", "steward-tick")
-        self.assertEqual(result.returncode, 77)
-        self.assertNotIn("ran", result.stdout)
+        self.assertIn("app=none", result.stdout)
+        self.assertIn("is a symlink", self.log())
+
+    # -- release floor ---------------------------------------------------------
+
+    def floor(self):
+        path = self.home / ".local" / "share" / "shipyard" / "launcher" / "release-floor.json"
+        return json.loads(path.read_text())["version"] if path.exists() else None
+
+    def test_the_floor_rises_with_each_newer_release(self):
+        self.install_release()
+        self.assertEqual(self.launch("exit", "0", env={"FIXTURE_VERSION": "1.2.3"}).returncode, 0)
+        self.assertEqual(self.floor(), "1.2.3")
+        self.assertEqual(self.launch("exit", "0", env={"FIXTURE_VERSION": "1.10.0"}).returncode, 0)
+        self.assertEqual(self.floor(), "1.10.0", "versions compare numerically")
+        self.assertIn("run mode=shipyard 1.10.0", self.log())
+
+    def test_an_older_release_runs_without_the_launcher(self):
+        self.install_release()
+        self.launch("exit", "0", env={"FIXTURE_VERSION": "2.0.0"})
+        result = self.launch("env", "SHIPYARD_LAUNCHER_APP", "SHIPYARD_LAUNCHER_FALLBACK", "PATH",
+                             env={"FIXTURE_VERSION": "1.9.9", "PATH": "/caller/bin:/usr/bin"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = result.stdout.splitlines()
+        self.assertIn("ENV:SHIPYARD_LAUNCHER_APP=<unset>", lines)
+        self.assertIn("ENV:SHIPYARD_LAUNCHER_FALLBACK=launcher-release-fallback", lines)
+        self.assertIn("ENV:PATH=/caller/bin:/usr/bin", lines, "a fallback is the job as it would run alone")
+        self.assertIn("launcher-release-fallback reason=release_downgrade: 1.9.9 is older than 2.0.0", self.log())
+        self.assertEqual(self.floor(), "2.0.0")
+
+    def test_an_unreadable_version_or_floor_falls_back(self):
+        self.install_release()
+        result = self.launch("env", "SHIPYARD_LAUNCHER_FALLBACK", env={"FIXTURE_VERSION": "not-a-version"})
+        self.assertIn("ENV:SHIPYARD_LAUNCHER_FALLBACK=launcher-release-fallback", result.stdout)
+        result = self.launch("env", "SHIPYARD_LAUNCHER_FALLBACK", env={"FIXTURE_VERSION_FAILS": "1"})
+        self.assertIn("ENV:SHIPYARD_LAUNCHER_FALLBACK=launcher-release-fallback", result.stdout)
+        floor = self.home / ".local" / "share" / "shipyard" / "launcher" / "release-floor.json"
+        floor.parent.mkdir(parents=True, exist_ok=True)
+        floor.write_text("{garbage")
+        floor.chmod(0o600)
+        result = self.launch("env", "SHIPYARD_LAUNCHER_FALLBACK")
+        self.assertIn("ENV:SHIPYARD_LAUNCHER_FALLBACK=launcher-release-fallback", result.stdout)
+        self.assertIn("release floor unreadable", self.log())
+
+    def test_shipyard_children_get_the_fixed_tool_path(self):
+        self.install_release()
+        result = self.launch("env", "PATH", env={"PATH": "/tmp/evil:/usr/bin:/bin"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.strip(),
+            f"ENV:PATH=/opt/homebrew/bin:/usr/local/bin:{self.home}/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        )
 
     # -- read-only access check ---------------------------------------------
 
@@ -383,6 +454,13 @@ class ActivationTests(LauncherBase):
     def cdhash(self):
         out = subprocess.run(["codesign", "-dvvv", str(self.installed_app)], capture_output=True, text=True).stderr
         return next(line.split("=", 1)[1] for line in out.splitlines() if line.startswith("CDHash="))
+
+    def bind_tick(self, body=TICK_REPORT, sha=None, path=None):
+        import hashlib
+        tick = self.write_tick(body)
+        self.write_record(scripts={"steward-tick": {
+            "path": path or str(tick), "sha256": sha or hashlib.sha256(body.encode()).hexdigest()}})
+        return tick
 
     def write_record(self, age=0.0, **overrides):
         record = {
@@ -489,6 +567,59 @@ class ActivationTests(LauncherBase):
         self.write_record(app=str(self.app))
         code, reason = self.active()
         self.assertEqual((code, reason), (1, "record_names_another_bundle"))
+
+    # -- scripts bound by hash ------------------------------------------------
+
+    def run_tick(self, *args):
+        result = self.launch("--launcher-script", "steward-tick", *args, launcher=self.installed,
+                             env={"BASH_ENV": "/tmp/evil", "PATH": "/tmp/evil:/usr/bin:/bin"})
+        return result, dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+
+    def test_a_bound_script_runs_under_the_launcher_from_a_verified_copy(self):
+        tick = self.bind_tick()
+        result, report = self.run_tick("one")
+        self.assertEqual(result.returncode, 7, result.stderr)
+        self.assertEqual(report["app"], str(self.installed_app))
+        self.assertEqual(report["fallback"], "none")
+        self.assertEqual(report["bash_env"], "unset")
+        self.assertEqual(report["path"], f"/usr/bin:/bin:/usr/sbin:/sbin:{self.installed_app}/Contents/MacOS")
+        self.assertNotEqual(report["zero"], str(tick), "the verified copy runs, not the live file")
+        self.assertFalse(pathlib.Path(report["zero"]).exists(), "the copy is removed afterwards")
+
+    def test_a_modified_script_runs_without_the_launcher_and_is_logged(self):
+        tick = self.bind_tick()
+        tick.write_text(TICK_REPORT.replace("exit 7", "echo injected\nexit 7"))
+        result, report = self.run_tick()
+        self.assertEqual(result.returncode, 7, result.stderr)
+        self.assertEqual(report["app"], "none")
+        self.assertEqual(report["fallback"], "launcher-script-mismatch")
+        self.assertEqual(report["zero"], str(tick))
+        self.assertIn("injected", result.stdout)
+        self.assertIn("launcher-script-mismatch script=steward-tick reason=sha256", self.log())
+
+    def test_a_binding_for_another_path_or_a_bad_hash_falls_back(self):
+        for kwargs in ({"path": "/tmp/elsewhere.sh"}, {"sha": "abc"}):
+            with self.subTest(**kwargs):
+                self.bind_tick(**kwargs)
+                _, report = self.run_tick()
+                self.assertEqual(report["app"], "none")
+
+    def test_a_stale_bundle_record_falls_back_for_scripts_too(self):
+        self.bind_tick()
+        record = json.loads(self.record.read_text())
+        record["cdhash"] = "0" * 40
+        self.record.write_text(json.dumps(record))
+        _, report = self.run_tick()
+        self.assertEqual(report["app"], "none")
+        self.assertIn("bundle_replaced", self.log())
+
+    def test_launcher_active_refuses_a_release_below_the_floor(self):
+        self.write_record()
+        self.launch("exit", "0", launcher=self.installed, env={"FIXTURE_VERSION": "3.0.0"})
+        self.assertEqual(self.active(FIXTURE_VERSION="3.0.0"), (0, "grant_cached"))
+        code, reason = self.active(FIXTURE_VERSION="2.9.0")
+        self.assertEqual(code, 1)
+        self.assertTrue(reason.startswith("release_downgrade"), reason)
 
 
 if __name__ == "__main__":

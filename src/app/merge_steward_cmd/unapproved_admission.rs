@@ -171,12 +171,9 @@ pub(super) fn steward_removal_times(
 /// The attribution [`crate::head_approval::head_ejections`] counts toward
 /// the ejection cap ([`crate::pr_queue_state::removal_of`]): the head is
 /// `beforeCommit` or a parent of that merge-group commit, and a removal that
-/// cannot be attributed is treated as the head's. The cap also leaves out an
-/// unattributable removal the head provably arrived after
-/// ([`crate::pr_queue_state::removal_charges_head`]); this node-only test
-/// keeps it. The difference can only spend an excuse on a removal the cap
-/// did not count, which leaves the cap stricter, never looser.
-fn is_removal_of(node: &Value, head: &str) -> bool {
+/// cannot be attributed is treated as the head's
+/// ([`crate::pr_queue_state::removal_charges_head`]).
+pub(super) fn is_removal_of(node: &Value, head: &str) -> bool {
     node.get("__typename").and_then(Value::as_str) == Some("RemovedFromMergeQueueEvent")
         && crate::pr_queue_state::removal_of(node, head).charges_head()
         && !node
@@ -187,7 +184,11 @@ fn is_removal_of(node: &Value, head: &str) -> bool {
 
 /// `queue` with the removals of `head` that `keep` rejects taken out of its
 /// timeline.
-fn filter_removals(queue: &Value, head: &str, mut keep: impl FnMut(&Value) -> bool) -> Value {
+pub(super) fn filter_removals(
+    queue: &Value,
+    head: &str,
+    mut keep: impl FnMut(&Value) -> bool,
+) -> Value {
     let mut queue = queue.clone();
     if let Some(nodes) = queue
         .pointer_mut("/data/repository/pullRequest/timelineItems/nodes")
