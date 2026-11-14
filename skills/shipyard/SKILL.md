@@ -847,6 +847,13 @@ pass and refuses if the base moved. Never edit a rollup branch by hand: any
 commit that is not a member merge makes the guard refuse it. A failed rollup
 is bisected with `rollup split`. A `rollup-of:` comment is a notice, never
 evidence.
+
+On a base without a merge queue the steward also plans a rollup each pass
+once `[auto_merge.rollup] min_ready` (default 3) pull requests are ready, and
+reports it as `repos[].rollup` (`mode = "shadow"` by default). It is
+read-only: `apply` reports `apply_unavailable` and every pull request still
+merges on its own, so act on a plan with the commands above, never by
+hand-merging members together.
 ## A transient rerun needs the interruption signature, not a conclusion
 
 The steward's bounded rerun and the carrier's `redispatch` both rerun only a

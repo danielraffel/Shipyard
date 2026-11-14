@@ -251,7 +251,7 @@ decides which path a repo takes:
 | What the steward does | enqueues the approved head | merges the approved head with `expectedHeadOid` |
 | What tests the merge | the queue's merge-group run | the PR's own required checks |
 | What guarantees review | the steward's exact-head check | the same, plus a required `review-verdict` check |
-| Batching | up to five per run | none; keep CI per PR small |
+| Batching | up to five per run | none; keep CI per PR small (the steward plans a rollup in shadow, see [rollups.md](rollups.md)) |
 
 For the no-queue path to be safe, the branch ruleset has to require your CI and
 a `review-verdict` check, and **both must be bound to the app that produces
