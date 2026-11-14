@@ -1680,3 +1680,47 @@ fn approval_awaiting_ignores_other_creators_and_rollup_copies() {
         Some(15368)
     ));
 }
+
+/// The real Vellum descriptions (#415, #418, 2026-11-13) read as waiting on
+/// reviewers; a HOLD, another head, or any other text stays red.
+#[test]
+fn review_status_descriptions_that_only_wait_on_reviewers() {
+    let head = "bc24e3defdf4ea3e888977df308992d64d3f9ef0";
+    assert_eq!(
+        review_waiting(
+            ".github/workflows/observatory-overdue-issue.yml and 1 more: needs 2 counted APPROVEs of head bc24e3defdf4 from different signers and sessio…",
+            head
+        ),
+        Some("approvals_missing")
+    );
+    assert_eq!(
+        review_waiting(
+            ".shipyard/config.toml and 1 more: needs 2 counted APPROVEs of head bc24e3defdf4 from different signers and sessions; has 1 (pulp-review)",
+            head
+        ),
+        Some("approvals_missing")
+    );
+    assert_eq!(
+        review_waiting("awaiting reviewer verdict for head bc24e3defdf4", head),
+        Some("no_verdict")
+    );
+    assert_eq!(
+        review_waiting(
+            "no reviewer verdict names head bc24e3defdf4; it needs a review",
+            head
+        ),
+        Some("no_verdict")
+    );
+    for red in [
+        "a HOLD naming head bc24e3defdf4 makes it un-approvable",
+        "x: needs 2 counted APPROVEs of head 0000000aaaaa from different signers; has 0",
+        "release-path files changed without CODEOWNERS",
+        "",
+    ] {
+        assert_eq!(review_waiting(red, head), None, "{red:?}");
+    }
+    assert!(is_review_gate("release-path-review", "review-verdict"));
+    assert!(is_review_gate("post-review-verdict", ""));
+    assert!(is_review_gate("custom-approval", "custom-approval"));
+    assert!(!is_review_gate("macos", "review-verdict"));
+}

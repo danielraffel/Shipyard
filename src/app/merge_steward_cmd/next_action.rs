@@ -418,6 +418,14 @@ fn someone_elses_move(kind: &str, facts: &Facts<'_>) -> Option<NextAction> {
                  do not merge {base}; the reviewer posts APPROVE or HOLD."
             ),
         ),
+        "awaiting_review" => NextAction::new(
+            Actor::Reviewer,
+            format!(
+                "Awaiting reviewers; nothing for the author to do. The review status(es) {arg} \
+                 only wait on approvals or a verdict for this head{detail_suffix}. Do not push, \
+                 do not merge {base}; this is review throughput, not a base fault."
+            ),
+        ),
         "approval_excluded" => NextAction::new(
             Actor::Reviewer,
             format!(

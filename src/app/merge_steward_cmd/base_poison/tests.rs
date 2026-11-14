@@ -254,3 +254,27 @@ fn one_fix_is_chosen_and_a_pr_that_rode_a_failing_group_is_never_it() {
         vec![3]
     );
 }
+
+/// Merge-group poison is never judged on a review status.
+#[test]
+fn review_statuses_are_not_judged_for_merge_group_poison() {
+    use crate::merge_steward::RequiredCheck;
+    let rule = |context: &str| RequiredCheck {
+        context: context.to_owned(),
+        app_id: Some(15_368),
+    };
+    let required = [
+        rule("macos"),
+        rule("release-path-review"),
+        rule("review-verdict"),
+        rule("post-review-verdict"),
+    ];
+    let judged = judged_contexts(&required, "review-verdict");
+    assert_eq!(
+        judged
+            .iter()
+            .map(|rule| rule.context.as_str())
+            .collect::<Vec<_>>(),
+        vec!["macos"]
+    );
+}

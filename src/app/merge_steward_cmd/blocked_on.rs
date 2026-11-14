@@ -357,15 +357,17 @@ fn classify_token(facts: &RowFacts<'_>, policy: &StewardPolicy) -> (Stall, Since
             .or_else(|| approval_context_only(facts, policy, contexts, false))
             .unwrap_or_else(|| waiting_required(pr, policy, contexts)),
         StewardDecision::RequiredFailed { contexts } => {
-            approval_context_only(facts, policy, contexts, true).unwrap_or_else(|| {
-                let since = latest_check_time(pr, policy, contexts);
-                dated(
-                    format!("required_failed:{}", context_names(policy, contexts)),
-                    since,
-                    "check_completed",
-                    None,
-                )
-            })
+            approval_context_only(facts, policy, contexts, true)
+                .or_else(|| review_gates_waiting(facts, policy, contexts))
+                .unwrap_or_else(|| {
+                    let since = latest_check_time(pr, policy, contexts);
+                    dated(
+                        format!("required_failed:{}", context_names(policy, contexts)),
+                        since,
+                        "check_completed",
+                        None,
+                    )
+                })
         }
         StewardDecision::RerunTransient { run_ids } => undated(
             "transient_rerun".to_owned(),
@@ -400,7 +402,10 @@ fn red_while_pending(
         return None;
     }
     let red = crate::merge_steward::failed_required_contexts(pr, policy);
-    if red.is_empty() || only_approval_contexts(policy, &red) {
+    if red.is_empty()
+        || only_approval_contexts(policy, &red)
+        || review_statuses_waiting(pr, policy, &red).is_some()
+    {
         return None;
     }
     Some(dated(
@@ -610,6 +615,85 @@ fn approval_context_only(
             }),
         ),
     }
+}
+
+/// Every failing context is a review status (`release-path-review`,
+/// `post-review-verdict`, the approval context) whose own description says it
+/// only waits on reviewers: `awaiting_review:<contexts>`, the reviewer's
+/// move. The approval context keeps its own reading first, so a HOLD on the
+/// head stays `held`. `None` when any failing context is not a review status
+/// or any description reads otherwise (it stays `required_failed`).
+fn review_gates_waiting(
+    facts: &RowFacts<'_>,
+    policy: &StewardPolicy,
+    contexts: &[String],
+) -> Option<(Stall, SinceHint)> {
+    if contexts.is_empty()
+        || !contexts.iter().all(|label| {
+            crate::merge_steward::is_review_gate(
+                context_name(policy, label),
+                &policy.approval_context,
+            )
+        })
+    {
+        return None;
+    }
+    let approval = contexts
+        .iter()
+        .filter(|label| {
+            super::infra_rerun::is_approval_context(
+                context_name(policy, label),
+                &policy.approval_context,
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    // A HOLD (or any other refusal the approval gate names) outranks
+    // approvals missing elsewhere.
+    if !approval.is_empty()
+        && let Some(stall) = approval_context_only(facts, policy, &approval, true)
+            .filter(|(stall, _)| !stall.blocked_on.starts_with("no_verdict"))
+    {
+        return Some(stall);
+    }
+    let detail = review_statuses_waiting(facts.pr, policy, contexts)?;
+    let since = latest_check_time(facts.pr, policy, contexts);
+    Some(dated(
+        format!("awaiting_review:{}", context_names(policy, contexts)),
+        since,
+        "check_completed",
+        Some(detail),
+    ))
+}
+
+/// The detail when every one of `contexts` is a review status whose newest
+/// status description (from the app its rule names) says it only waits on
+/// reviewers at this head; `None` otherwise.
+fn review_statuses_waiting(
+    pr: &StewardPullRequest,
+    policy: &StewardPolicy,
+    contexts: &[String],
+) -> Option<String> {
+    if contexts.is_empty() {
+        return None;
+    }
+    let mut details = Vec::new();
+    for label in contexts {
+        let context = context_name(policy, label);
+        if !crate::merge_steward::is_review_gate(context, &policy.approval_context) {
+            return None;
+        }
+        let app_id = policy
+            .required_checks
+            .iter()
+            .find(|required| required.context.eq_ignore_ascii_case(context))
+            .and_then(|required| required.app_id);
+        let description =
+            crate::merge_steward::approval_status_description(&pr.checks, context, app_id)?;
+        let why = crate::merge_steward::review_waiting(description, &pr.head_sha)?;
+        details.push(format!("{context}: {why} ({})", description.trim()));
+    }
+    Some(details.join("; "))
 }
 
 /// With the gate unread, the approval status's own description still says

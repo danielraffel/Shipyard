@@ -294,6 +294,7 @@ pub(crate) fn state_for(
             LoopState::Ready
         }
         "no_verdict"
+        | "awaiting_review"
         | "waiting_head_approval"
         | "approval_excluded"
         | "waiting_code_owner"

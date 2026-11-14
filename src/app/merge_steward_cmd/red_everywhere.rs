@@ -145,6 +145,10 @@ pub(super) fn reds(
 ) -> Vec<Red> {
     infra_rerun::failed_required(observation, approval_context, excluded_labels)
         .into_iter()
+        // A review status is red per pull request (no verdict, approvals
+        // missing, a HOLD): many of them at once is reviewer throughput, never
+        // a base-level cause.
+        .filter(|(_, check)| !crate::merge_steward::is_review_gate(&check.name, approval_context))
         .map(|(pr, check)| {
             let tests = check
                 .check_id

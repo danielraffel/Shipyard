@@ -345,7 +345,7 @@ fn safe_workflow(workflow: &str) -> bool {
 pub fn state_for_token(token: &str, approval_context: &str) -> Option<DwellState> {
     let (kind, arg) = token.split_once(':').unwrap_or((token, ""));
     match kind {
-        "no_verdict" => Some(DwellState::NeedsReview),
+        "no_verdict" | "awaiting_review" => Some(DwellState::NeedsReview),
         "approval_excluded" if matches!(arg, "stale_head" | "predates_head") => {
             Some(DwellState::NeedsReview)
         }

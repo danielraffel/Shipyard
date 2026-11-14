@@ -562,3 +562,33 @@ fn an_episode_that_drops_under_three_unchanged_members_ends() {
         None
     );
 }
+
+/// Vellum #415, #418, #419, #423: `release-path-review` red on four pull
+/// requests is reviewer throughput, never a base-level episode. A genuine
+/// red check on three or more still groups.
+#[test]
+fn review_statuses_red_on_many_prs_are_never_a_base_level_episode() {
+    let review = |number: u64| {
+        let mut check = failed("release-path-review", number);
+        check.source = StewardCheckSource::StatusContext;
+        check
+    };
+    let mut obs = observation(
+        [415_u64, 418, 419, 423]
+            .into_iter()
+            .map(|n| observed(n, head(n), vec![review(n)]))
+            .collect(),
+    );
+    obs.required_checks.push(RequiredCheck {
+        context: "release-path-review".to_owned(),
+        app_id: Some(15_368),
+    });
+    let ledger = StewardLedger::default();
+    assert!(
+        reds(&obs, &ledger, "review-verdict", &[]).is_empty(),
+        "a review status is never counted"
+    );
+    let real = three_red_prs();
+    let groups = super::group(&reds(&real, &ledger, "review-verdict", &[]));
+    assert_eq!(groups.len(), 1, "a genuine red check still groups");
+}
