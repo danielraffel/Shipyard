@@ -1,6 +1,5 @@
 """Tests for scripts/ci-capped-run.sh."""
 
-import shutil
 import subprocess
 import unittest
 from pathlib import Path
@@ -38,10 +37,9 @@ class CiCappedRunTests(unittest.TestCase):
         result = run({"RUNNER_ENVIRONMENT": "self-hosted", "EXIT_WITH": "7"})
         self.assertEqual(result.returncode, 7)
 
-    @unittest.skipUnless(shutil.which("taskpolicy"), "macOS only")
-    def test_runs_under_utility_qos_on_macos(self):
-        result = run({"RUNNER_ENVIRONMENT": "self-hosted"}, cmd=["true"])
-        self.assertEqual(result.returncode, 0, result.stderr)
+    def test_does_not_lower_qos(self):
+        # Utility QoS coalesced timers and broke timing-sensitive tests.
+        self.assertNotIn("taskpolicy", SCRIPT.read_text())
 
 
 if __name__ == "__main__":

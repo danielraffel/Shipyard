@@ -7,8 +7,9 @@
 # Unbounded, `cargo test --all-targets` builds and tests with one job per core,
 # which on m1 pushed the load average past 100 and timed out the gate lanes
 # beside it. On a self-hosted runner this caps cargo's build jobs and the test
-# harness's threads at SHIPYARD_CI_JOBS (default 2) and runs the command under
-# utility QoS. The cap is intentional: it is the whole mechanism.
+# harness's threads at SHIPYARD_CI_JOBS (default 2). The cap is intentional: it
+# is the whole mechanism. It does not lower the QoS: utility QoS coalesces
+# timers and made timing-sensitive tests read five times too slow.
 #
 # On a GitHub-hosted runner the command runs unchanged.
 set -euo pipefail
@@ -27,7 +28,4 @@ case "$jobs" in ''|*[!0-9]*|0) jobs=2 ;; esac
 export CARGO_BUILD_JOBS="$jobs" RUST_TEST_THREADS="$jobs"
 echo "[ci-capped-run] CARGO_BUILD_JOBS=$jobs RUST_TEST_THREADS=$jobs: $*" >&2
 
-if command -v taskpolicy >/dev/null 2>&1; then
-  exec taskpolicy -c utility "$@"
-fi
 exec "$@"
