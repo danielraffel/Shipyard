@@ -691,6 +691,15 @@ fn review_statuses_waiting(
             .iter()
             .find(|required| required.context.eq_ignore_ascii_case(context))
             .and_then(|required| required.app_id)?;
+        // The red must come from that status alone: a check run of the same
+        // name (any app, any state) could be the failing observation, and a
+        // waiting status beside it must not hide a crashing workflow.
+        if pr.checks.iter().any(|check| {
+            check.source == crate::merge_steward::StewardCheckSource::CheckRun
+                && check.name.eq_ignore_ascii_case(context)
+        }) {
+            return None;
+        }
         let description =
             crate::merge_steward::approval_status_description(&pr.checks, context, Some(app_id))?;
         let why = crate::merge_steward::review_waiting(description, &pr.head_sha)?;

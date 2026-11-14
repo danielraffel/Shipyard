@@ -1698,6 +1698,32 @@ fn a_hold_in_a_review_status_description_stays_red() {
     }
 }
 
+/// A failing check run of the same name beside an older waiting status is
+/// the real red: the waiting status must not hide it as reviewer throughput.
+#[test]
+fn a_failing_check_run_beside_a_waiting_status_stays_required_failed() {
+    let policy = app_bound_policy(&["release-path-review"]);
+    let mut pr = pr_with(
+        415,
+        &[],
+        "BLOCKED",
+        &json!([app_check(
+            "release-path-review",
+            "COMPLETED",
+            Some("FAILURE"),
+            "2026-11-14T10:00:00Z"
+        )]),
+    );
+    pr.fact.checks.push(status(
+        "release-path-review",
+        "x: needs 2 counted APPROVEs of head aaaaaaaaaaaa from different signers and sessions; has 0",
+    ));
+    assert_eq!(
+        classify_failed(&pr, &policy, &["release-path-review (app_id=15368)"]).blocked_on,
+        "required_failed:release-path-review"
+    );
+}
+
 /// A rule with no app binding accepts a status any writer could post, so a
 /// waiting-shaped description there is never trusted: `required_failed`.
 #[test]
