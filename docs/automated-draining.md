@@ -394,6 +394,7 @@ close anything. See [superseded-close.md](superseded-close.md).
 | Token | Meaning | Who moves it |
 |---|---|---|
 | `no_verdict` | Green, and no reviewer verdict names this head: "awaiting the standing reviewer; nothing for the author to do" | reviewer |
+| `awaiting_review:<contexts>` | Every failing required context is a review status (`release-path-review`, `post-review-verdict`, the approval context) and each one's own status description, at this head, says it only waits on reviewers: "needs N counted APPROVEs of head ..." or "awaiting reviewer verdict". Reviewer throughput, never a base fault; any other description stays `required_failed`, and a HOLD on the head stays `held` | reviewer |
 | `held:review-verdict` | A counting HOLD names this head, so it is un-approvable and any APPROVE of it is ignored. `blocked_detail` reads "held head: needs a new head" when the pass read the gate, or the review-verdict status's own description (`a HOLD naming head <sha> makes it un-approvable (held by ...)`) when it did not. Consumers that key on the token's kind (before `:`) still read `held` | repair lane: address the HOLD's named items, then push a new head (if the HOLD is wrong, push a new head anyway and comment `dispute: <reason>`) |
 | `approval_excluded:<reason>` | An APPROVE names this head but does not count. Reasons: `unattributed`, `no_stamp`, `noncanonical_stamp`, `session_not_allowed`, `unlisted_stamp_session`, `no_signer_list`, `no_signer_line`, `uncounted_signer`, `unbound_identity`, `pr_author`, `impersonated_app`, `untrusted_reviewer`, `unlisted_reviewer`, `unlisted_human`, `predates_head` (posted before the head commit), `stale_head` (only an earlier head is approved), `self_approved` | reviewer or fleet config |
 | `ejection_cap` | The queue removed this head too often since its last approval | reviewer, or a new push |
@@ -832,6 +833,16 @@ already read when it diagnosed that head's red run; a head whose run was not
 diagnosed groups by the check alone, and never joins a named test's group. A
 group of three or more distinct pull requests is an episode. The approval check
 (`review-verdict`) never groups. It adds no GitHub reads.
+
+A review status (`review-verdict`, `post-review-verdict`,
+`release-path-review`, or the configured approval context, posted as a
+commit status by the app its rule names) whose own description says it only
+waits on reviewers at this head ("needs N counted APPROVEs", "awaiting
+reviewer verdict") never counts: many of them red at once is reviewer
+throughput, not the base. A failing review check run (a crashing review
+workflow), or a review status with any other description, still counts.
+Merge-group poison is read from check runs only, so a waiting review status
+never poisons a group while a crashing review check run still does.
 
 ```toml
 [auto_merge]

@@ -808,6 +808,78 @@ pub fn approval_status_description<'a>(
 /// reviewer", exactly what the newer script says with `pending`.
 pub const AWAITING_VERDICT_FAILURE_PREFIX: &str = "no reviewer verdict names head ";
 
+/// Required statuses that judge review, not the code: their red is per pull
+/// request (no verdict yet, approvals missing, a HOLD), never a sign the base
+/// is broken.
+pub const REVIEW_GATES: [&str; 3] = [
+    "review-verdict",
+    "post-review-verdict",
+    "release-path-review",
+];
+
+/// Whether `name` is a review status: one of [`REVIEW_GATES`] or the
+/// configured approval context.
+#[must_use]
+pub fn is_review_gate(name: &str, approval_context: &str) -> bool {
+    let name = name.trim();
+    REVIEW_GATES
+        .iter()
+        .any(|gate| name.eq_ignore_ascii_case(gate))
+        || (!approval_context.trim().is_empty()
+            && name.eq_ignore_ascii_case(approval_context.trim()))
+}
+
+/// Why a red review status only waits on reviewers, read from its own
+/// description and bound to `head`: `approvals_missing` for "needs N counted
+/// APPROVEs of head <head> ...", `no_verdict` for "no reviewer verdict
+/// names head <head>" or "awaiting reviewer verdict for head <head>". Any
+/// other text, a description that names another head, or one that mentions a
+/// HOLD in any case (`hold`, `held by`) returns `None`, so the status stays
+/// red (fail closed).
+#[must_use]
+pub fn review_waiting(description: &str, head: &str) -> Option<&'static str> {
+    let text = description.trim();
+    // Any HOLD, in any case ("HOLD", "hold", "held by ..."), is never a wait.
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("held by")
+        || lower
+            .split(|ch: char| !ch.is_ascii_alphanumeric())
+            .any(|word| word == "hold" || word == "holds")
+    {
+        return None;
+    }
+    let names_head = |rest: &str| {
+        let short = rest
+            .split(|ch: char| !ch.is_ascii_hexdigit())
+            .next()
+            .unwrap_or("");
+        short.len() >= 7
+            && head
+                .to_ascii_lowercase()
+                .starts_with(&short.to_ascii_lowercase())
+    };
+    // GitHub cuts a status description at 140 characters, so the trailing
+    // "; has M (...)" is often gone; "needs N counted APPROVEs of head <head>"
+    // is what identifies it.
+    if let Some((_, rest)) = text.split_once(" counted APPROVEs of head ")
+        && text.contains(": needs ")
+        && names_head(rest)
+    {
+        return Some("approvals_missing");
+    }
+    for prefix in [
+        AWAITING_VERDICT_FAILURE_PREFIX,
+        "awaiting reviewer verdict for head ",
+    ] {
+        if let Some(rest) = text.strip_prefix(prefix)
+            && names_head(rest)
+        {
+            return Some("no_verdict");
+        }
+    }
+    None
+}
+
 /// Whether a commit status is the approval script's "no verdict yet" refusal
 /// (see [`AWAITING_VERDICT_FAILURE_PREFIX`]): read it as pending. A pending
 /// status never satisfies a rule, so this can only turn red into waiting,

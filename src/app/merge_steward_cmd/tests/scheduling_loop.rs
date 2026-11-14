@@ -34,6 +34,10 @@ fn every_blocked_on_token_maps_to_exactly_one_state_or_is_outside_the_loop() {
         ("generated_path_batch:#7", Some(LoopState::Ready)),
         ("no_verdict", Some(LoopState::AwaitingReview)),
         (
+            "awaiting_review:release-path-review",
+            Some(LoopState::AwaitingReview),
+        ),
+        (
             "approval_excluded:unattributed",
             Some(LoopState::AwaitingReview),
         ),
