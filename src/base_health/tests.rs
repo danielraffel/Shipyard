@@ -218,3 +218,36 @@ fn one_episode_is_recorded_once_but_a_failed_live_jump_may_retry() {
         &decision("on", "900", 8933, "jumped")
     ));
 }
+
+#[test]
+fn triage_acts_default_to_dry_run_on_a_merge_queue_and_parse_each_key() {
+    let none: toml::Table = toml::from_str("").expect("toml");
+    assert_eq!(
+        BasePoisonPolicy::from_table(&none, true).acts,
+        TriageActs::all(PoisonHold::DryRun)
+    );
+    assert_eq!(
+        BasePoisonPolicy::from_table(&none, false).acts,
+        TriageActs::all(PoisonHold::Off)
+    );
+    let table: toml::Table = toml::from_str(
+        "[base_health]\nreorder_fix = \"on\"\ncancel_orphaned_groups = \"off\"\nreenqueue_red_base_ejections = \"onn\"\n",
+    )
+    .expect("toml");
+    let policy = BasePoisonPolicy::from_table(&table, true);
+    assert_eq!(policy.acts.reorder_fix, PoisonHold::On);
+    assert_eq!(policy.acts.cancel_orphaned_groups, PoisonHold::Off);
+    assert_eq!(
+        policy.acts.reenqueue_red_base_ejections,
+        PoisonHold::DryRun,
+        "a typo never turns an act on"
+    );
+    assert!(
+        policy
+            .read_error
+            .as_deref()
+            .is_some_and(|error| error.contains("reenqueue_red_base_ejections")),
+        "{:?}",
+        policy.read_error
+    );
+}

@@ -1382,6 +1382,7 @@ fn an_approved_queued_head_is_paused_while_the_base_is_poisoned() {
     use crate::base_health::{AutoJump, BasePoisonPolicy, PoisonHold};
     let poison = |hold| RepoPoison {
         policy: BasePoisonPolicy {
+            acts: crate::base_health::TriageActs::default(),
             hold,
             control_workflows: std::collections::BTreeMap::new(),
             pause: hold,
@@ -1410,6 +1411,7 @@ fn an_approved_queued_head_is_paused_while_the_base_is_poisoned() {
         fixes: BTreeMap::new(),
         fix_read_error: None,
         fix_ambiguity: None,
+        red_everywhere: std::collections::BTreeMap::new(),
         covering: std::collections::BTreeSet::new(),
         candidates: std::collections::BTreeSet::default(),
         tip: BTreeMap::from([(

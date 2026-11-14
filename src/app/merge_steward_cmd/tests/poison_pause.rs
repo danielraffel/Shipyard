@@ -121,9 +121,17 @@ fn poison(health: MergeGroupHealth, hold: PoisonHold, prs: &[ObservedPr]) -> Rep
             )
         })
         .collect::<BTreeMap<_, _>>();
-    let covering = base_poison::green_head_fix(prs, &[], "review-verdict", &health, &tip).1;
+    let covering = base_poison::green_head_fix(
+        prs,
+        &[],
+        "review-verdict",
+        &health,
+        &base_poison::confirmed_red_since(&health, &tip, &BTreeMap::new()),
+    )
+    .1;
     RepoPoison {
         policy: BasePoisonPolicy {
+            acts: crate::base_health::TriageActs::default(),
             hold,
             control_workflows: std::collections::BTreeMap::new(),
             pause: hold,
@@ -135,6 +143,7 @@ fn poison(health: MergeGroupHealth, hold: PoisonHold, prs: &[ObservedPr]) -> Rep
         health,
         fix_read_error: None,
         fix_ambiguity: None,
+        red_everywhere: std::collections::BTreeMap::new(),
         covering,
         candidates,
     }
