@@ -5559,6 +5559,34 @@ launch is speculative, and a busy host can defer it indefinitely (`runs = 0`,
 `pended nondemand spawn = speculative`), which the probe wait would otherwise
 misreport as an unanswered privacy prompt.
 
+The daemon launcher covers only the daemon, and it is a bare binary, so its
+grant is tied to its path. `ShipyardLauncher.app` (`tools/shipyard-launcher`,
+`src/launcher_app.rs`) is one bundle identity (`com.danielraffel.shipyard.launcher`
+plus the Developer ID team) for every Shipyard launchd job, which survives
+rebuilds. It verifies the release `~/.local/bin/shipyard` resolves to
+(Developer ID, its own team, identifier `shipyard`; checked again on the
+suspended child) and spawns it, never execs it. Routing is gated on the
+launcher's own `--launcher-active` verdict, never on the activation file: the
+record (written by `shipyard-launcher-check --activate`, which fleet-deploy
+runs once the owner granted Full Disk Access) must name this exact bundle
+(path, identifier, team, cdhash), and the grant must be confirmed within an
+hour or reconfirmed without a prompt; a revoked grant demotes the record.
+While active: a launchd job whose program is the release binary (parent 1,
+`XPC_SERVICE_NAME` set, same file as the pointer) `exec`s the bundle with the
+same argv at startup (the check is bounded at 45 s, and a failed `exec` falls
+back to running directly), and the installed steward tick `exec`s `shipyard-launcher --launcher-script
+steward-tick`. `exec` *into* the bundle is what moves the identity: the pid
+stays the job's responsible process and now runs the bundle. When the
+launcher is missing or not active, everything runs directly as before, so an
+ungranted launcher never prompts.
+Routing decisions go to `~/Library/Logs/shipyard-launcher.log` and the tick's
+`launcher=app|direct` summary token. The daemon and its supervisor are never
+routed: the daemon agent keeps its stable launcher copy as its program, so a
+missing or refusing launcher can never keep a KeepAlive restart down. The
+team is pinned (`95CX6P84C4`) in both the launcher and the check tool, never
+read from `~/.local/bin/shipyard`; fleet-deploy refuses to install or
+activate a bundle older (CFBundleVersion) than the highest it installed.
+
 A launcher host changes the daemon's parent: it is the resident launcher, not
 launchd (1). Any check that the production daemon "is still launchd-owned"
 must accept both shapes and nothing else. The Sandbox E2E M3 invariant does

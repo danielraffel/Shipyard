@@ -206,5 +206,124 @@ class StewardTickArchiveTests(unittest.TestCase):
         self.assertFalse(old_archive.exists())
 
 
+FAKE_LAUNCHER = """#!/bin/bash
+# Stand-in for ShipyardLauncher.app's executable.
+echo "$*" >> "$HOME/launcher-calls"
+if [ "$1" = --launcher-active ]; then
+  [ -n "${FAKE_ACTIVE_HANG:-}" ] && sleep 30
+  # Answer active, then make the exec that follows fail.
+  [ -n "${FAKE_EXEC_FAILS:-}" ] && { chmod a-x "$0"; echo '{"active":true,"reason":"grant_cached"}'; exit 0; }
+  [ "${FAKE_VERIFY_RC:-0}" = 0 ] || { echo '{"active":false,"reason":"grant_revoked: demoted"}'; exit "$FAKE_VERIFY_RC"; }
+  [ -n "${FAKE_ACTIVE_NO_VERDICT:-}" ] && { echo '{"reason":"grant_cached"}'; exit 0; }
+  echo '{"active":true,"reason":"grant_cached"}'; exit 0
+fi
+if [ "$1" = --launcher-script ] && [ "$2" = steward-tick ]; then
+  SHIPYARD_LAUNCHER_APP=/fake/ShipyardLauncher.app exec /bin/bash --noprofile --norc "$HOME/.local/libexec/shipyard-steward-tick.sh"
+fi
+exit 64
+"""
+
+
+class StewardTickLauncherTests(unittest.TestCase):
+    """The tick routes itself through ShipyardLauncher.app once activated."""
+
+    run_tick = StewardTickArchiveTests.run_tick
+    tearDown = StewardTickArchiveTests.tearDown
+
+    def setUp(self):
+        StewardTickArchiveTests.setUp(self)
+        libexec = self.home / ".local" / "libexec"
+        libexec.mkdir(parents=True)
+        self.installed = libexec / "shipyard-steward-tick.sh"
+        self.installed.write_text(SCRIPT.read_text())
+        self.installed.chmod(0o755)
+        exe = libexec / "ShipyardLauncher.app" / "Contents" / "MacOS" / "shipyard-launcher"
+        exe.parent.mkdir(parents=True)
+        exe.write_text(FAKE_LAUNCHER)
+        exe.chmod(0o755)
+        self.record = self.home / ".local" / "share" / "shipyard" / "launcher" / "activation.json"
+        self.calls = self.home / "launcher-calls"
+
+    def activate(self):
+        self.record.parent.mkdir(parents=True, exist_ok=True)
+        self.record.write_text('{"schema": 1}\n')
+
+    def run_installed(self, **env):
+        current = self.env.copy()
+        current.update(env)
+        return subprocess.run(["/bin/bash", str(self.installed)], env=current, text=True, capture_output=True)
+
+    def summary(self):
+        return (self.log_dir / "summary.log").read_text()
+
+    def test_not_activated_runs_directly_without_calling_the_launcher(self):
+        result = self.run_installed()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("launcher=direct", self.summary())
+        self.assertFalse(self.calls.exists())
+
+    def test_activated_tick_runs_under_the_launcher(self):
+        self.activate()
+        result = self.run_installed()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.calls.read_text().splitlines(), ["--launcher-active", "--launcher-script steward-tick"])
+        self.assertIn("acme/repo rc=0", self.summary())
+        self.assertIn("launcher=app", self.summary())
+        self.assertNotIn("launcher=direct", self.summary())
+
+    def test_launcher_refusal_falls_back_and_says_why(self):
+        self.activate()
+        result = self.run_installed(FAKE_VERIFY_RC="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.calls.read_text().splitlines(), ["--launcher-active"])
+        self.assertIn("launcher=direct reason=not_active rc=1: grant_revoked: demoted", self.summary())
+        self.assertIn("acme/repo rc=0", self.summary())
+
+    def test_exit_zero_without_an_active_verdict_runs_directly(self):
+        self.activate()
+        result = self.run_installed(FAKE_ACTIVE_NO_VERDICT="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.calls.read_text().splitlines(), ["--launcher-active"])
+        self.assertIn("launcher=direct reason=not_active rc=0: grant_cached", self.summary())
+
+    def test_a_hung_launcher_cannot_stall_the_tick(self):
+        self.activate()
+        started = time.monotonic()
+        result = self.run_installed(FAKE_ACTIVE_HANG="1", SHIPYARD_STEWARD_LAUNCHER_TIMEOUT_S="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertLess(time.monotonic() - started, 20)
+        self.assertIn("launcher=direct reason=not_active rc=124: timed out after 1s", self.summary())
+        self.assertIn("acme/repo rc=0", self.summary())
+
+    def test_a_failed_exec_runs_the_tick_directly(self):
+        self.activate()
+        result = self.run_installed(FAKE_EXEC_FAILS="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("launcher=direct reason=not_active rc=exec_failed", self.summary())
+        self.assertIn("acme/repo rc=0", self.summary())
+        self.assertIn("launcher=direct", self.summary().splitlines()[-1])
+
+    def test_a_launcher_fallback_never_routes_again(self):
+        self.activate()
+        result = self.run_installed(SHIPYARD_LAUNCHER_FALLBACK="launcher-script-mismatch")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.calls.exists())
+        self.assertIn("launcher=direct reason=launcher-script-mismatch", self.summary())
+        self.assertIn("launcher=direct invariants", self.summary().replace("launcher=direct reason", "x"))
+
+    def test_only_the_installed_copy_routes(self):
+        self.activate()
+        result = self.run_tick()  # the repository copy, not ~/.local/libexec
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.calls.exists())
+        self.assertIn("launcher=direct", self.summary())
+
+    def test_off_switch(self):
+        self.activate()
+        result = self.run_installed(SHIPYARD_STEWARD_LAUNCHER="off")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.calls.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

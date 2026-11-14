@@ -169,6 +169,9 @@ pub mod landability;
 pub mod landing;
 /// Advisory-vs-required lane policy resolution.
 pub mod lane_policy;
+/// Routes launchd jobs through `ShipyardLauncher.app` once a host activates it.
+#[cfg(unix)]
+pub mod launcher_app;
 /// Bounded log rotation, terminal classification, and retention primitives.
 pub mod log_retention;
 /// Merge-queue enqueue / poll / eviction supervision engine.
