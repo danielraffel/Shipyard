@@ -749,6 +749,19 @@ Its source is `scripts/ghapp_merge_guard.sh`, its test
 `scripts/test_ghapp_merge_guard.py` (CI's Python helper tests), and it is a
 managed guard, so `shipyard guards install` places the tested copy and
 `guards status` reports a drifted one.
+
+## queue-arm-guard retries one wire failure, then fails closed
+
+A `queue-arm-guard` refusal that reads `cannot read live PR state: gh: HTTP
+503` (or a timeout, or `RemoteDisconnected`) is a read that failed twice, two
+seconds apart: `run_real_gh` retries exactly one transient failure on a request
+that can only read (`api`, GET, no `--input`, a GraphQL query and never a
+mutation), notes it on stderr as `queue-arm-guard: note: ... retrying once`,
+and refuses with `(after one retry)` when the second read fails too. A 4xx is
+never retried. Do not add a second retry or a longer backoff in a caller: the
+pass already classifies this text as a read failure, not a policy refusal
+(Shipyard#1309), and a repeat here would stack on it. Tests:
+`TransientReadRetry` in `scripts/test_ghapp_queue_arm_guard.py`.
 ## The merge path arms native auto-merge; it never enqueues
 
 `shipyard auto-merge` / `ship` admit a PR to a merge queue by arming native
