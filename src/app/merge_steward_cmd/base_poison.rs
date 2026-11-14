@@ -277,7 +277,13 @@ pub(super) fn observe(
     now: DateTime<Utc>,
 ) -> Option<RepoPoison> {
     let poison_policy = policy.ejection_guards.base_poison.clone();
-    if !observation.merge_queue || poison_policy.hold == PoisonHold::Off {
+    // Triage acts are independent of admission hold: an operator can turn
+    // the hold off while still asking the steward to observe and report (or
+    // perform) an act. With no merge queue, or with every act off, there is
+    // still nothing to read.
+    if !observation.merge_queue
+        || (poison_policy.hold == PoisonHold::Off && poison_policy.acts.all_off())
+    {
         return None;
     }
     let run_gh = |argv: &[String]| actions.run_gh(argv).map_err(|error| error.to_string());

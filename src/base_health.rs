@@ -258,6 +258,19 @@ impl TriageActs {
         }
     }
 
+    /// Whether every triage act is disabled.
+    #[must_use]
+    pub const fn all_off(self) -> bool {
+        matches!(
+            self,
+            Self {
+                reorder_fix: PoisonHold::Off,
+                cancel_orphaned_groups: PoisonHold::Off,
+                reenqueue_red_base_ejections: PoisonHold::Off,
+            }
+        )
+    }
+
     fn slot(&mut self, key: &str) -> Option<&mut PoisonHold> {
         match key {
             "reorder_fix" => Some(&mut self.reorder_fix),
