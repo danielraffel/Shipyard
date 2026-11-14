@@ -630,7 +630,7 @@ fn a_spent_budget_stops_the_plan_and_reports_deadline() {
 }
 
 #[test]
-fn rows_merged_or_enqueued_this_tick_are_not_ready() {
+fn rows_merged_or_enqueued_this_tick_stay_in_the_pre_mutation_snapshot() {
     let observation = observation((1..=3).map(|pr| observed(pr, &head(pr))).collect(), false);
     let mut merged = row(1, StewardDecision::ArmMergeQueue);
     merged.mutation = Some(format!("merged_exact_head:{}", head(1)));
@@ -641,6 +641,6 @@ fn rows_merged_or_enqueued_this_tick_are_not_ready() {
     let ready = ready_rows(&observation, &[merged, enqueued, waiting]);
     assert_eq!(
         ready.iter().map(|ready| ready.pr).collect::<Vec<_>>(),
-        vec![3]
+        vec![1, 2, 3]
     );
 }

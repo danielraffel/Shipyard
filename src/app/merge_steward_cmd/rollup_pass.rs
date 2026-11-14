@@ -294,21 +294,14 @@ pub(super) struct Readers<'a> {
     pub expired: &'a dyn Fn() -> bool,
 }
 
-/// Whether a row's mutation this tick merged or enqueued it.
-fn landed_this_tick(row: &PrReport) -> bool {
-    row.mutation.as_deref().is_some_and(|mutation| {
-        let mutation = mutation.to_ascii_lowercase();
-        mutation.contains("merged") || mutation.contains("enqueued")
-    })
-}
-
 /// The ready rows of a server-enforced exact-head merge pass, oldest first:
-/// decided ready at the observed head, and not merged or enqueued this tick.
+/// decided ready at the observed head. Rows the apply pass merged or enqueued
+/// this tick stay in: the plan is the pre-mutation snapshot, so an applied
+/// pass still reports the rollup it did not form.
 pub(super) fn ready_rows(observation: &RepoObservation, prs: &[PrReport]) -> Vec<Ready> {
     let mut ready: Vec<Ready> = prs
         .iter()
         .filter(|row| matches!(row.decision, StewardDecision::ArmMergeQueue))
-        .filter(|row| !landed_this_tick(row))
         .filter_map(|row| {
             let pr = observation
                 .prs
