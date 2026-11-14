@@ -341,7 +341,7 @@ fn unattributed_ejected(head: &str, count: usize) -> Value {
         .collect::<Vec<_>>();
     json!({"data": {"repository": {"pullRequest": {
         "headRefOid": head,
-        "timelineItems": {"nodes": nodes}
+        "timelineItems": {"pageInfo": {"hasPreviousPage": false}, "nodes": nodes}
     }}}})
 }
 
@@ -417,6 +417,18 @@ fn a_force_pushed_new_head_clears_historical_unattributed_removals() {
     };
     let gate = gate_with_queue(&queue, false);
     assert!(gate.allows(), "{gate:?}");
+    // In a truncated or unmeasured window an earlier push of the same head
+    // may be on an unread page, so the later push proves nothing and the
+    // removals keep the head at the cap.
+    for page_info in [json!({"hasPreviousPage": true}), json!({}), Value::Null] {
+        let mut truncated = queue.clone();
+        truncated["data"]["repository"]["pullRequest"]["timelineItems"]["pageInfo"] = page_info;
+        let gate = gate_with_queue(&truncated, false);
+        assert!(
+            matches!(&gate, HeadGate::EjectionCap { .. }) && !gate.allows(),
+            "{gate:?}"
+        );
+    }
 }
 
 /// A fake GitHub for a comment-mode base: `config` and `comments` answer as
