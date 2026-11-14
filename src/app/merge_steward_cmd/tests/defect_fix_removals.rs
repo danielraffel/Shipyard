@@ -101,6 +101,38 @@ fn a_fresh_error_holds_only_a_head_removed_since_the_last_good_read() {
     ));
 }
 
+/// The same hold for a removal in GitHub's real shape: `beforeCommit` is the
+/// merge-group commit, with the head as its second parent. A removal of
+/// another head's group does not hold this one.
+#[test]
+fn a_fresh_error_holds_a_head_removed_from_a_merge_group() {
+    let reading = Reading {
+        error: Some("EIO".to_owned()),
+        last_good_at: Some(at("2026-11-13T17:00:00Z")),
+        fresh_error: true,
+        ..Reading::default()
+    };
+    let head = "e".repeat(40);
+    let queue = |removed: &str| {
+        serde_json::json!({"data": {"repository": {"pullRequest": {"timelineItems": {"nodes": [
+            {"__typename": "RemovedFromMergeQueueEvent", "reason": "failed_checks",
+             "createdAt": "2026-11-13T17:05:03Z",
+             "beforeCommit": {"oid": "1".repeat(40), "parents": {"nodes": [
+                 {"oid": "c".repeat(40)}, {"oid": removed}]}}}
+        ]}}}}})
+    };
+    assert!(defect_fix_removals::unjudgeable(
+        &reading,
+        &queue(&head),
+        &head
+    ));
+    assert!(!defect_fix_removals::unjudgeable(
+        &reading,
+        &queue(&"f".repeat(40)),
+        &head
+    ));
+}
+
 /// The #406 sequence through the steward's admission: the removal is
 /// recorded at 17:05:03Z, the pass at 17:05:43Z reads it and refuses to put
 /// the same head back, before reading anything from GitHub. A new head goes

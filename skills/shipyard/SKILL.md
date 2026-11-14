@@ -4704,7 +4704,12 @@ binding that head. The steward, `shipyard review-verdict`, the
 `review-verdict` status and the `ghapp` queue-arm guard all switch together;
 no comment or review counts and no approval carries to a new head. The
 ejection cap still holds: an admitted head the queue removed twice is not
-re-enqueued, and only a new head lifts it. A
+re-enqueued, and only a new head lifts it. A removal is the head's when the
+head is the removal's `beforeCommit` or a parent of that merge-group commit;
+one the timeline cannot attribute (no `beforeCommit`, as for every
+`merge_conflict` removal, or its parents unread) counts against the head
+unless a force-push to the head or its earliest check suite shows it reached
+GitHub after the removal. A
 malformed guard setting refuses every head rather than falling back to
 comments, and a `require-guard-admission` file in a host's guards directory
 refuses comment mode on that host. Do not post a verdict comment to unblock

@@ -399,16 +399,148 @@ fn removed_head(node: &Value, known: &[&str]) -> Option<String> {
     {
         return Some(oid.to_owned());
     }
-    let parents = before
+    match merge_group_parents(before)?.as_slice() {
+        [_, head] if is_known(head) => Some((*head).to_owned()),
+        _ => None,
+    }
+}
+
+/// The parent oids of a removal's `beforeCommit` merge-group commit, or
+/// `None` when the response does not carry them all (`parents` not selected,
+/// a parent without an oid).
+fn merge_group_parents(before: &Value) -> Option<Vec<&str>> {
+    before
         .pointer("/parents/nodes")
         .and_then(Value::as_array)?
         .iter()
         .map(|parent| parent.get("oid").and_then(Value::as_str))
-        .collect::<Option<Vec<_>>>()?;
-    match parents.as_slice() {
-        [_, head] if is_known(head) => Some((*head).to_owned()),
-        _ => None,
+        .collect()
+}
+
+/// The most parents [`PR_QUEUE_STATE_QUERY`] reads off a merge-group commit
+/// (`parents(first:3)`). A commit showing this many may have more.
+const MERGE_GROUP_PARENTS_READ: usize = 3;
+
+/// Whose removal one `RemovedFromMergeQueueEvent` was, judged against one
+/// head. See [`removal_of`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RemovalOf {
+    /// The removal names the head: `beforeCommit` is the head, or the head is
+    /// a parent of the `beforeCommit` merge-group commit.
+    Head,
+    /// The removal names another commit: `beforeCommit` and every one of its
+    /// parents (all of them read) differ from the head.
+    OtherHead,
+    /// The response cannot say: no `beforeCommit` (a `merge_conflict`
+    /// removal, for which GitHub built no group), its parents not read or
+    /// unreadable, or possibly truncated by the query's parent limit.
+    Unattributable,
+}
+
+impl RemovalOf {
+    /// Whether the removal must be charged to the head: it names the head,
+    /// or it cannot be shown to name another one.
+    #[must_use]
+    pub const fn charges_head(self) -> bool {
+        !matches!(self, Self::OtherHead)
     }
+}
+
+/// Whose removal the `RemovedFromMergeQueueEvent` `node` was, judged against
+/// `head`, by the same reading of `beforeCommit` this module's classifier
+/// uses: `beforeCommit` is the merge-group commit the queue built, and the
+/// head it removed is one of that commit's parents (the second, as GitHub
+/// builds it). A `beforeCommit` equal to the head is also the head's.
+///
+/// Unlike [`removed_head`], this does not need the head to be a commit the
+/// pull request was seen to have: the caller names it, so the question is
+/// only whether this removal involved it.
+#[must_use]
+pub fn removal_of(node: &Value, head: &str) -> RemovalOf {
+    let Some(before) = node.get("beforeCommit").filter(|value| value.is_object()) else {
+        return RemovalOf::Unattributable;
+    };
+    let Some(oid) = before.get("oid").and_then(Value::as_str) else {
+        return RemovalOf::Unattributable;
+    };
+    if oid.eq_ignore_ascii_case(head) {
+        return RemovalOf::Head;
+    }
+    let Some(parents) = merge_group_parents(before) else {
+        return RemovalOf::Unattributable;
+    };
+    if parents
+        .iter()
+        .any(|parent| parent.eq_ignore_ascii_case(head))
+    {
+        RemovalOf::Head
+    } else if parents.is_empty() || parents.len() >= MERGE_GROUP_PARENTS_READ {
+        // No parents is not a merge-group commit; a full page may be cut.
+        RemovalOf::Unattributable
+    } else {
+        RemovalOf::OtherHead
+    }
+}
+
+/// Whether the removal at `nodes[index]` is charged to `head`: it names the
+/// head ([`RemovalOf::Head`]), or it names no head ([`RemovalOf::Unattributable`])
+/// and `head` is not proven to have reached GitHub after it.
+///
+/// The proof uses server-set times only: a `HeadRefForcePushedEvent` to
+/// `head` created after the removal, or `head`'s earliest check suite created
+/// after it. Timeline position is not proof: GitHub orders a
+/// `PullRequestCommit` by its author-controlled date, so a commit dated in the
+/// future would sort after every removal. Without the proof the removal
+/// counts. Every `merge_conflict` removal names no head, so without this
+/// exception those removals of earlier heads would be charged to every later
+/// head, and a guard-mode head (which no fresh approval can lift) would stay
+/// at the cap forever.
+#[must_use]
+pub fn removal_charges_head(nodes: &[Value], index: usize, head: &str) -> bool {
+    let Some(node) = nodes.get(index) else {
+        return true;
+    };
+    match removal_of(node, head) {
+        RemovalOf::Head => true,
+        RemovalOf::OtherHead => false,
+        RemovalOf::Unattributable => !arrived_after(nodes, node, head),
+    }
+}
+
+/// Whether server-set times prove `head` reached GitHub after `removal`:
+/// at least one of them (a force-push to `head`, `head`'s earliest check
+/// suite) is later than the removal and none is earlier or unreadable, so a
+/// head pushed before the removal and force-pushed back after it is not
+/// excused.
+fn arrived_after(nodes: &[Value], removal: &Value, head: &str) -> bool {
+    let Some(removed_at) = removal
+        .get("createdAt")
+        .and_then(Value::as_str)
+        .and_then(parse_timestamp)
+    else {
+        return false;
+    };
+    let mut seen = Vec::new();
+    for node in nodes {
+        if !pushed_oid(node).is_some_and(|oid| oid.eq_ignore_ascii_case(head)) {
+            continue;
+        }
+        match node.get("__typename").and_then(Value::as_str) {
+            Some("HeadRefForcePushedEvent") => seen.push(
+                node.get("createdAt")
+                    .and_then(Value::as_str)
+                    .and_then(parse_timestamp),
+            ),
+            // A commit without a check suite says nothing about when it came.
+            Some("PullRequestCommit") => {
+                if let Some(suite) = earliest_suite(node) {
+                    seen.push(Some(suite));
+                }
+            }
+            _ => {}
+        }
+    }
+    !seen.is_empty() && seen.iter().all(|at| at.is_some_and(|at| at > removed_at))
 }
 
 /// Whether the first re-add (at `add`) after the hazard removal at `removal`
@@ -850,6 +982,54 @@ mod tests {
     }
 
     const HEAD_8811: &str = "e147f2d09972babcc9977e82a46470e17f9de538";
+
+    /// Across every real capture, [`removal_of`] (the ejection cap's reading)
+    /// charges each removal to the head [`removed_head`] (the classifier's
+    /// reading) names, and to no other commit the pull request had.
+    #[test]
+    fn removal_of_agrees_with_removed_head_on_every_real_capture() {
+        let mut checked = 0;
+        for entry in std::fs::read_dir(FIXTURES).expect("fixtures") {
+            let path = entry.expect("entry").path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if !name.starts_with("pr_real_")
+                || path.extension().and_then(|ext| ext.to_str()) != Some("json")
+            {
+                continue;
+            }
+            let value = fixture(name);
+            let Some(nodes) = value
+                .pointer("/data/repository/pullRequest/timelineItems/nodes")
+                .and_then(Value::as_array)
+            else {
+                continue;
+            };
+            let known = nodes.iter().filter_map(pushed_oid).collect::<Vec<_>>();
+            for node in nodes.iter().filter(|node| {
+                node.get("__typename").and_then(Value::as_str) == Some("RemovedFromMergeQueueEvent")
+            }) {
+                match removed_head(node, &known) {
+                    Some(head) => {
+                        assert_eq!(removal_of(node, &head), RemovalOf::Head, "{name}");
+                        for other in known.iter().filter(|oid| !oid.eq_ignore_ascii_case(&head)) {
+                            assert_eq!(removal_of(node, other), RemovalOf::OtherHead, "{name}");
+                        }
+                        checked += 1;
+                    }
+                    // No `beforeCommit` (`merge_conflict`, some `manual`):
+                    // charged to every head.
+                    None if node.get("beforeCommit").is_none_or(Value::is_null) => {
+                        for oid in &known {
+                            assert!(removal_of(node, oid).charges_head(), "{name}");
+                        }
+                    }
+                    // A group whose head is outside this window's commits.
+                    None => {}
+                }
+            }
+        }
+        assert!(checked >= 4, "only {checked} attributed removals checked");
+    }
 
     #[test]
     fn internal_enqueue_refuses_the_same_head_after_failed_checks() {

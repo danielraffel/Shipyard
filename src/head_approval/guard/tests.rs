@@ -306,7 +306,8 @@ fn a_guard_config_without_an_app_id_is_an_unreadable_policy() {
 }
 
 /// A queue-state response in which the merge queue removed `head` `count`
-/// times for a failure (never `merged`).
+/// times for a failure (never `merged`), in GitHub's shape: `beforeCommit` is
+/// the merge-group commit, with `head` as its second parent.
 fn ejected(head: &str, count: usize) -> Value {
     let nodes = (0..count)
         .map(|index| {
@@ -314,7 +315,13 @@ fn ejected(head: &str, count: usize) -> Value {
                 "__typename": "RemovedFromMergeQueueEvent",
                 "createdAt": format!("2026-11-04T0{index}:30:00Z"),
                 "reason": "failed_checks",
-                "beforeCommit": {"oid": head},
+                "beforeCommit": {
+                    "oid": format!("{index:040x}"),
+                    "parents": {"nodes": [
+                        {"oid": "cccccccccccccccccccccccccccccccccccccccc"},
+                        {"oid": head},
+                    ]},
+                },
             })
         })
         .collect::<Vec<_>>();

@@ -167,12 +167,18 @@ pub(super) fn steward_removal_times(
 }
 
 /// Whether timeline `node` is a non-merge queue removal of `head`.
+///
+/// The attribution [`crate::head_approval::head_ejections`] counts toward
+/// the ejection cap ([`crate::pr_queue_state::removal_of`]): the head is
+/// `beforeCommit` or a parent of that merge-group commit, and a removal that
+/// cannot be attributed is treated as the head's. The cap also leaves out an
+/// unattributable removal the head provably arrived after
+/// ([`crate::pr_queue_state::removal_charges_head`]); this node-only test
+/// keeps it. The difference can only spend an excuse on a removal the cap
+/// did not count, which leaves the cap stricter, never looser.
 fn is_removal_of(node: &Value, head: &str) -> bool {
     node.get("__typename").and_then(Value::as_str) == Some("RemovedFromMergeQueueEvent")
-        && node
-            .pointer("/beforeCommit/oid")
-            .and_then(Value::as_str)
-            .is_some_and(|oid| oid.eq_ignore_ascii_case(head))
+        && crate::pr_queue_state::removal_of(node, head).charges_head()
         && !node
             .get("reason")
             .and_then(Value::as_str)

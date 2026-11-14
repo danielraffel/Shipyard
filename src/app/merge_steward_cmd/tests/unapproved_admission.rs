@@ -8,6 +8,8 @@ use super::*;
 const HEAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const OLD_HEAD: &str = "ca1f305c00000000000000000000000000000000";
 const MOVED: &str = "cccccccccccccccccccccccccccccccccccccccc";
+/// The queue base each merge-group removal's `beforeCommit` sits on.
+const BASE_OID: &str = "dddddddddddddddddddddddddddddddddddddddd";
 const ACTIONS_APP: u64 = 15368;
 
 const POLICY_REQUIRED: &str = r#"printf '%s\n' '[auto_merge]' 'arm_requires_head_approval = true' 'reviewer_identities = ["shipyard-review[bot]"]'"#;
@@ -247,7 +249,7 @@ reviews = if self.reviews_unreadable {
             removals = (0..self.removals)
                 .map(|minute| (minute, if minute + 1 == self.removals { self.latest_removal_reason } else { "MANUAL" }))
                 .map(|(minute, reason)| format!(
-                    r#"{{"__typename":"RemovedFromMergeQueueEvent","createdAt":"2026-10-30T13:0{minute}:00Z","reason":"{reason}","actor":{{"login":"shipyard-local[bot]"}},"beforeCommit":{{"oid":"{HEAD}","parents":{{"nodes":[]}}}}}}"#
+                    r#"{{"__typename":"RemovedFromMergeQueueEvent","createdAt":"2026-10-30T13:0{minute}:00Z","reason":"{reason}","actor":{{"login":"shipyard-local[bot]"}},"beforeCommit":{{"oid":"{minute:040x}","parents":{{"nodes":[{{"oid":"{BASE_OID}"}},{{"oid":"{HEAD}"}}]}}}}}}"#
                 ))
                 .collect::<Vec<_>>()
                 .join(","),

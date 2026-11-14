@@ -1296,24 +1296,38 @@ pub fn ejection_cause(reason: &str) -> &'static str {
 
 /// Every non-merge queue removal of `head` in a [`crate::pr_queue_state`]
 /// timeline response, oldest first.
+///
+/// A removal is `head`'s when [`crate::pr_queue_state::removal_charges_head`]
+/// says so: GitHub's `beforeCommit` is the merge-group commit, so the head is
+/// one of its parents, not `beforeCommit` itself.
+///
+/// A removal the response cannot attribute (no `beforeCommit`, as for every
+/// `merge_conflict` removal, or parents missing or unreadable) is counted
+/// against `head` unless server-set times prove `head` reached GitHub after
+/// it. This is the approval gate's ejection cap: dropping such a removal could
+/// let a head that keeps failing in the queue be re-armed without a fresh
+/// review, while counting it costs at most one approval newer than the
+/// removal. When in doubt the gate refuses, never admits.
 #[must_use]
 pub fn head_ejections(queue: &Value, head: &str) -> Vec<Ejection> {
     let nodes = queue
         .pointer("/data/repository/pullRequest/timelineItems/nodes")
-        .and_then(Value::as_array);
+        .and_then(Value::as_array)
+        .map_or(&[][..], Vec::as_slice);
     nodes
-        .into_iter()
-        .flatten()
-        .filter(|node| {
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| {
             node.get("__typename").and_then(Value::as_str) == Some("RemovedFromMergeQueueEvent")
         })
-        .filter(|node| {
-            node.pointer("/beforeCommit/oid")
+        .filter(|(index, _)| crate::pr_queue_state::removal_charges_head(nodes, *index, head))
+        .filter_map(|(_, node)| {
+            // A removal without a readable reason is not proven a merge, so
+            // it counts too.
+            let reason = node
+                .get("reason")
                 .and_then(Value::as_str)
-                .is_some_and(|oid| oid.eq_ignore_ascii_case(head))
-        })
-        .filter_map(|node| {
-            let reason = node.get("reason").and_then(Value::as_str)?;
+                .unwrap_or("unknown");
             (!reason.eq_ignore_ascii_case("merged")).then(|| Ejection {
                 reason: reason.to_owned(),
                 cause: ejection_cause(reason),
