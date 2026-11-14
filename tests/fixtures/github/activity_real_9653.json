@@ -1,0 +1,47 @@
+{
+  "_provenance": {
+    "source": "GET repos/Generous-Corp/pulp/activity?ref=refs/heads/fix/safe-relative-path-helper&per_page=100",
+    "captured": "2026-11-14T19:45:44Z",
+    "cut": "rows at or after 2026-10-06T02:45:26Z (the push 99403d83 -> f18a1724) dropped, so the page is what the API returned while headRefOid was 99403d83, matching pr_real_9653_merge_conflict_backdated_push.json",
+    "trimmed": "actor reduced to login; every other field unedited"
+  },
+  "head_ref": "fix/safe-relative-path-helper",
+  "rows": [
+    {
+      "id": 45561108377,
+      "node_id": "PSH_kwLOR7YGt88AAAAKm6dXmQ",
+      "before": "a1bf4ad7f725471371371e7c6a4c9a1a58698fd8",
+      "after": "99403d83614a0e535a3d2a5bac391e5ab326b639",
+      "ref": "refs/heads/fix/safe-relative-path-helper",
+      "timestamp": "2026-10-06T00:01:06Z",
+      "activity_type": "push",
+      "actor": {
+        "login": "danielraffel"
+      }
+    },
+    {
+      "id": 45537755107,
+      "node_id": "PSH_kwLOR7YGt88AAAAKmkL_4w",
+      "before": "6a955ff812750aee7d7a5eb821017111b85d516d",
+      "after": "a1bf4ad7f725471371371e7c6a4c9a1a58698fd8",
+      "ref": "refs/heads/fix/safe-relative-path-helper",
+      "timestamp": "2026-10-05T18:40:56Z",
+      "activity_type": "push",
+      "actor": {
+        "login": "danielraffel"
+      }
+    },
+    {
+      "id": 45529682381,
+      "node_id": "PSH_kwLOR7YGt88AAAAKmcfRzQ",
+      "before": "0000000000000000000000000000000000000000",
+      "after": "6a955ff812750aee7d7a5eb821017111b85d516d",
+      "ref": "refs/heads/fix/safe-relative-path-helper",
+      "timestamp": "2026-10-05T17:10:18Z",
+      "activity_type": "branch_creation",
+      "actor": {
+        "login": "danielraffel"
+      }
+    }
+  ]
+}

@@ -165,7 +165,14 @@ fn read(actions: &GitHubActions, repo: &str, pr: u64) -> Result<Value, String> {
             format!("number={pr}"),
         ])
         .map_err(|error| error.to_string())?;
-    serde_json::from_str(&raw).map_err(|error| format!("malformed GraphQL JSON: {error}"))
+    let mut queue: Value =
+        serde_json::from_str(&raw).map_err(|error| format!("malformed GraphQL JSON: {error}"))?;
+    crate::pr_queue_state::attach_push_activity(&mut queue, repo, |path| {
+        actions
+            .run_gh(&["api".to_owned(), path.to_owned()])
+            .map_err(|error| error.to_string())
+    });
+    Ok(queue)
 }
 
 /// The one next step each class calls for.
@@ -324,9 +331,11 @@ pub fn write_human<W: Write>(stdout: &mut W, report: &PrStateReport) -> std::io:
                 classification.head_oid.as_deref().unwrap_or("UNKNOWN"),
                 match ejection.new_head_basis {
                     NewHeadBasis::RemovedHeadSha => "compared by SHA",
-                    NewHeadBasis::PushAfterRemoval => "a push of the current head follows it",
-                    NewHeadBasis::SuiteAfterRemoval => {
-                        "the current head's first check suite follows it"
+                    NewHeadBasis::PushAfterRemoval => {
+                        "a later server-timestamped force-push follows it"
+                    }
+                    NewHeadBasis::ActivityPushAfterRemoval => {
+                        "a later repository activity push of this head follows it"
                     }
                     NewHeadBasis::NoEvidence => "no evidence of a new head",
                 }

@@ -1450,8 +1450,19 @@ fn fetch_pr_queue_state(
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    let body: Value = serde_json::from_slice(&output.stdout)
+    let mut body: Value = serde_json::from_slice(&output.stdout)
         .map_err(|error| format!("merge-queue timeline returned invalid JSON: {error}"))?;
+    crate::pr_queue_state::attach_push_activity(&mut body, &state.repo, |path| {
+        let output = gh(client, cwd)?
+            .args(["api", path])
+            .output()
+            .map_err(|error| error.to_string())?;
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+        }
+    });
     Ok(crate::pr_queue_state::explain_pr_queue_state(&body))
 }
 
@@ -2353,6 +2364,12 @@ fn approval_verdict(
         format!("number={}", state.pr),
     ])?)
     .map_err(|error| format!("merge-queue timeline returned invalid JSON: {error}"))?;
+    // The same normal-push evidence fetch_pr_queue_state attaches, so the
+    // gate and the timeline read agree.
+    let mut queue = queue;
+    crate::pr_queue_state::attach_push_activity(&mut queue, &state.repo, |path| {
+        run_gh(&["api".to_owned(), path.to_owned()])
+    });
     let gate = crate::head_approval::evaluate_with_policy(
         run_gh,
         &state.repo,

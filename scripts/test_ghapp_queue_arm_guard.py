@@ -104,6 +104,62 @@ def expectations() -> dict[str, Any]:
     }
 
 
+def with_fixture_activity(name: str, want: dict[str, Any]) -> dict[str, Any]:
+    """Fixture ``name`` with the activity page its expectation names attached."""
+    response = fixture(name)
+    if isinstance(want.get("push_activity"), str):
+        page = fixture(want["push_activity"])
+        response[guard.PUSH_ACTIVITY_KEY] = {
+            "headRef": page["head_ref"], "crossRepository": False, "rows": page["rows"],
+        }
+    return response
+
+
+ACT_HEAD = "1" * 40
+ACT_FIRST = "3" * 40
+ACT_SECOND = "4" * 40
+ACT_OTHER = "2" * 40
+
+
+def activity_row(at: str, kind: str, after: str) -> dict[str, Any]:
+    return {"activity_type": kind, "after": after, "before": "9" * 40,
+            "ref": "refs/heads/feature", "timestamp": at}
+
+
+def two_conflicts_then_normal_push() -> dict[str, Any]:
+    """Two merge_conflict removals, then a normal push (only a PullRequestCommit)."""
+    return {"data": {"repository": {"pullRequest": {
+        "number": 7, "state": "OPEN", "headRefOid": ACT_HEAD, "headRefName": "feature",
+        "isCrossRepository": False, "isInMergeQueue": False, "mergeQueueEntry": None,
+        "autoMergeRequest": None, "repository": {"nameWithOwner": "owner/repo"},
+        "timelineItems": {"pageInfo": {"hasPreviousPage": False}, "nodes": [
+            {"__typename": "PullRequestCommit", "commit": {"oid": ACT_FIRST}},
+            {"__typename": "RemovedFromMergeQueueEvent", "createdAt": "2026-10-04T01:00:00Z",
+             "reason": "merge_conflict", "beforeCommit": None},
+            {"__typename": "PullRequestCommit", "commit": {"oid": ACT_SECOND}},
+            {"__typename": "RemovedFromMergeQueueEvent", "createdAt": "2026-10-04T02:00:00Z",
+             "reason": "merge_conflict", "beforeCommit": None},
+            {"__typename": "PullRequestCommit", "commit": {"oid": ACT_HEAD}},
+        ]}}}}}
+
+
+def matching_rows() -> list[dict[str, Any]]:
+    return [
+        activity_row("2026-10-04T03:00:00Z", "push", ACT_HEAD),
+        activity_row("2026-10-04T01:30:00Z", "push", ACT_SECOND),
+        activity_row("2026-10-04T00:30:00Z", "push", ACT_FIRST),
+        activity_row("2026-10-04T00:10:00Z", "branch_creation", "5" * 40),
+    ]
+
+
+def with_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    response = two_conflicts_then_normal_push()
+    response[guard.PUSH_ACTIVITY_KEY] = {
+        "headRef": "feature", "crossRepository": False, "rows": rows,
+    }
+    return response
+
+
 def with_base(response: dict[str, Any], base: str = "main") -> dict[str, Any]:
     response = copy.deepcopy(response)
     response["data"]["repository"]["pullRequest"]["baseRefName"] = base
@@ -121,7 +177,7 @@ class ClassifierAgreesWithSharedCorpus(unittest.TestCase):
         checked = 0
         for name, want in expectations().items():
             with self.subTest(fixture=name):
-                got = guard.classify_pr_queue_state(fixture(name))
+                got = guard.classify_pr_queue_state(with_fixture_activity(name, want))
                 self.assertEqual(got["class"], want["class"])
                 self.assertEqual(got["pr"], want["pr"])
                 self.assertEqual(got["requeues_without_new_head"], want["requeues_without_new_head"])
@@ -144,6 +200,15 @@ class ClassifierAgreesWithSharedCorpus(unittest.TestCase):
         # Control: the whole corpus, real and labelled-synthetic, was visited.
         self.assertEqual(checked, 16)
 
+    def test_real_9653_and_8722_without_activity_still_refuse(self) -> None:
+        for name in ("pr_real_9653_merge_conflict_backdated_push.json", "pr_ejected_new_head.json"):
+            with self.subTest(fixture=name):
+                got = guard.classify_pr_queue_state(fixture(name))
+                self.assertIs(got["new_head_since_removal"], False)
+                self.assertEqual(got["last_ejection"]["new_head_basis"], "no_evidence")
+                allowed, _ = guard.decide(got)
+                self.assertFalse(allowed)
+
     def test_real_truncated_same_head_ejection_is_ejected_and_refused(self) -> None:
         response = fixture("pr_real_truncated_same_head_ejected.json")
         provenance = response["_provenance"]
@@ -153,7 +218,7 @@ class ClassifierAgreesWithSharedCorpus(unittest.TestCase):
         self.assertEqual(got["class"], "ejected")
         self.assertEqual(got["reason"], "failed_checks")
         self.assertIs(got["new_head_since_removal"], False)
-        self.assertEqual(got["requeues_without_new_head"], 3)
+        self.assertEqual(got["requeues_without_new_head"], 4)
         allowed, _ = guard.decide(got)
         self.assertFalse(allowed)
 
@@ -181,11 +246,14 @@ class ClassifierAgreesWithSharedCorpus(unittest.TestCase):
         # A force-push that names no commit is not evidence of a new head.
         pr["timelineItems"]["nodes"].append({"__typename": "HeadRefForcePushedEvent"})
         self.assertFalse(guard.classify_pr_queue_state(response)["new_head_since_removal"])
-        # One that put the current head on the branch is.
+        # One that put the current head on the branch is, once the window is
+        # known to be complete (this fixture carries no pageInfo).
         pr["headRefOid"] = PUSHED_HEAD
         pr["timelineItems"]["nodes"].append(
             {"__typename": "HeadRefForcePushedEvent", "afterCommit": {"oid": PUSHED_HEAD}}
         )
+        self.assertFalse(guard.classify_pr_queue_state(response)["new_head_since_removal"])
+        pr["timelineItems"]["pageInfo"] = {"hasPreviousPage": False}
         self.assertTrue(guard.classify_pr_queue_state(response)["new_head_since_removal"])
 
     def test_unreadable_is_unknown(self) -> None:
@@ -211,7 +279,7 @@ MERGE_CONFLICT_FIXTURE = "pr_real_9653_merge_conflict_backdated_push.json"
 PUSHED_9653 = "99403d83614a0e535a3d2a5bac391e5ab326b639"
 
 
-class MergeConflictHeadIsDecidedByFirstSuite(unittest.TestCase):
+class MergeConflictHeadNeedsAuthoritativePush(unittest.TestCase):
     """Twin of the Rust merge_conflict push-time tests."""
 
     def setUp(self) -> None:
@@ -223,7 +291,7 @@ class MergeConflictHeadIsDecidedByFirstSuite(unittest.TestCase):
             if node.get("commit", {}).get("oid") == PUSHED_9653:
                 node["commit"]["checkSuites"] = suites
 
-    def test_a_head_pushed_after_a_merge_conflict_ejection_is_new_by_its_first_suite(self) -> None:
+    def test_a_head_with_a_late_suite_is_not_new_without_push_event(self) -> None:
         self.assertEqual(self.response["_provenance"]["source_pr"], "Generous-Corp/pulp#9653")
         # Control: the removal names no head and GitHub sorts the pushed
         # commit BEFORE it, so neither the SHA nor the timeline can answer.
@@ -231,10 +299,10 @@ class MergeConflictHeadIsDecidedByFirstSuite(unittest.TestCase):
         self.assertLess(pushed, _removal_index(self.nodes))
         self.assertIsNone(self.nodes[_removal_index(self.nodes)].get("beforeCommit"))
         got = guard.classify_pr_queue_state(self.response)
-        self.assertIs(got["new_head_since_removal"], True)
-        self.assertEqual(got["last_ejection"]["new_head_basis"], "suite_after_removal")
+        self.assertIs(got["new_head_since_removal"], False)
+        self.assertEqual(got["last_ejection"]["new_head_basis"], "no_evidence")
         allowed, message = guard.decide(got)
-        self.assertTrue(allowed, message)
+        self.assertFalse(allowed, message)
 
     def test_a_head_whose_first_suite_predates_the_ejection_is_not_new(self) -> None:
         self.set_head_suites({"nodes": [{"createdAt": "2026-10-05T23:58:00Z"}]})
@@ -251,6 +319,91 @@ class MergeConflictHeadIsDecidedByFirstSuite(unittest.TestCase):
                 got = guard.classify_pr_queue_state(self.response)
                 self.assertIs(got["new_head_since_removal"], False)
                 self.assertFalse(guard.decide(got)[0])
+
+
+class UnattributedRemovalNeedsCompleteWindow(unittest.TestCase):
+    """Twin of the Rust truncated-window ejection-cap tests."""
+
+    HEAD = "1" * 40
+    OTHER = "2" * 40
+
+    def response(self, page_info: Any) -> dict[str, Any]:
+        return {"data": {"repository": {"pullRequest": {
+            "number": 1, "state": "OPEN", "headRefOid": self.HEAD,
+            "isInMergeQueue": False, "mergeQueueEntry": None, "autoMergeRequest": None,
+            "timelineItems": {"pageInfo": page_info, "nodes": [
+                {"__typename": "RemovedFromMergeQueueEvent", "createdAt": "2026-10-04T01:00:00Z",
+                 "reason": "merge_conflict", "beforeCommit": None},
+                {"__typename": "HeadRefForcePushedEvent", "createdAt": "2026-10-04T02:00:00Z",
+                 "afterCommit": {"oid": self.OTHER}},
+                {"__typename": "HeadRefForcePushedEvent", "createdAt": "2026-10-04T03:00:00Z",
+                 "afterCommit": {"oid": self.HEAD}},
+            ]},
+        }}}}
+
+    def test_a_later_push_clears_the_removal_only_in_a_complete_window(self) -> None:
+        got = guard.classify_pr_queue_state(self.response({"hasPreviousPage": False}))
+        self.assertEqual(got["ejections_of_current_head"], 0)
+        for page_info in ({"hasPreviousPage": True}, {}, None):
+            with self.subTest(page_info=page_info):
+                got = guard.classify_pr_queue_state(self.response(page_info))
+                self.assertEqual(got["ejections_of_current_head"], 1)
+
+
+class PushAfterRemovalNeedsCompleteWindow(unittest.TestCase):
+    """Twin of the Rust ``a_later_push_is_a_new_head_only_in_a_complete_window``."""
+
+    HEAD = "1" * 40
+    OTHER = "2" * 40
+
+    def response(self, page_info: Any, earlier_push: bool = False) -> dict[str, Any]:
+        def push(at: str, oid: str) -> dict[str, Any]:
+            return {"__typename": "HeadRefForcePushedEvent", "createdAt": at,
+                    "afterCommit": {"oid": oid}}
+
+        nodes: list[Any] = [push("2026-10-04T00:30:00Z", self.HEAD)] if earlier_push else []
+        nodes += [
+            {"__typename": "RemovedFromMergeQueueEvent", "createdAt": "2026-10-04T01:00:00Z",
+             "reason": "merge_conflict", "beforeCommit": None},
+            push("2026-10-04T02:00:00Z", self.OTHER),
+            push("2026-10-04T03:00:00Z", self.HEAD),
+        ]
+        return {"data": {"repository": {"pullRequest": {
+            "number": 1, "state": "OPEN", "headRefOid": self.HEAD,
+            "isInMergeQueue": False, "mergeQueueEntry": None, "autoMergeRequest": None,
+            "timelineItems": {"pageInfo": page_info, "nodes": nodes},
+        }}}}
+
+    def test_a_later_push_is_a_new_head_only_in_a_complete_window(self) -> None:
+        got = guard.classify_pr_queue_state(self.response({"hasPreviousPage": False}))
+        self.assertIs(got["new_head_since_removal"], True)
+        self.assertEqual(got["last_ejection"]["new_head_basis"], "push_after_removal")
+        for page_info in ({"hasPreviousPage": True}, {}, None):
+            with self.subTest(page_info=page_info):
+                got = guard.classify_pr_queue_state(self.response(page_info))
+                self.assertIs(got["new_head_since_removal"], False)
+                self.assertEqual(got["last_ejection"]["new_head_basis"], "no_evidence")
+                self.assertFalse(guard.decide(got)[0])
+
+    def test_a_push_back_to_an_earlier_head_is_not_new(self) -> None:
+        got = guard.classify_pr_queue_state(
+            self.response({"hasPreviousPage": False}, earlier_push=True)
+        )
+        self.assertIs(got["new_head_since_removal"], False)
+        self.assertFalse(guard.decide(got)[0])
+
+    def test_a_force_push_back_to_a_normally_pushed_head_is_not_new(self) -> None:
+        # H arrives by a normal push (PullRequestCommit), is removed for
+        # merge_conflict, then is force-pushed away and back: still H, so the
+        # removal stays charged and the re-arm is refused.
+        response = self.response({"hasPreviousPage": False})
+        nodes = response["data"]["repository"]["pullRequest"]["timelineItems"]["nodes"]
+        nodes.insert(0, {"__typename": "PullRequestCommit", "commit": {"oid": self.HEAD}})
+        got = guard.classify_pr_queue_state(response)
+        self.assertIs(got["new_head_since_removal"], False)
+        self.assertEqual(got["last_ejection"]["new_head_basis"], "no_evidence")
+        self.assertEqual(got["ejections_of_current_head"], 1)
+        self.assertFalse(guard.decide(got)[0])
 
 
 class NewHeadIsDecidedBySha(unittest.TestCase):
@@ -308,8 +461,20 @@ class NewHeadIsDecidedBySha(unittest.TestCase):
         # A later push of some other commit is still not the current head.
         self.nodes.append({"__typename": "PullRequestCommit", "commit": {"oid": PUSHED_HEAD}})
         self.assertIs(self.classify()["new_head_since_removal"], False)
-        # A later push of the current head is.
+        # A later commit timeline item is not authoritative push evidence,
+        # even after the current head changes to that commit.
         self.pr["headRefOid"] = PUSHED_HEAD
+        got = self.classify()
+        self.assertEqual(got["last_ejection"]["new_head_basis"], "no_evidence")
+        self.assertIs(got["new_head_since_removal"], False)
+        # A later server-timestamped force-push of the current head is.
+        self.nodes.append(
+            {
+                "__typename": "HeadRefForcePushedEvent",
+                "createdAt": "2026-09-27T06:00:00Z",
+                "afterCommit": {"oid": PUSHED_HEAD},
+            }
+        )
         got = self.classify()
         self.assertEqual(got["last_ejection"]["new_head_basis"], "push_after_removal")
         self.assertIs(got["new_head_since_removal"], True)
@@ -514,9 +679,11 @@ class QueueArmGuardTests(unittest.TestCase):
         pr["isInMergeQueue"] = False
         pr["mergeQueueEntry"] = None
         pr["headRefOid"] = "f" * 40
+        pr["timelineItems"]["pageInfo"] = {"hasPreviousPage": False}
         pr["timelineItems"]["nodes"][-1] = {
-            "__typename": "PullRequestCommit",
-            "commit": {"oid": "f" * 40},
+            "__typename": "HeadRefForcePushedEvent",
+            "createdAt": "2026-09-22T21:00:00Z",
+            "afterCommit": {"oid": "f" * 40},
         }
         code, _, _ = self.run_guard(["pr", "merge", "8702", "--auto"], [response])
         self.assertEqual(code, 0)
@@ -2149,6 +2316,209 @@ class EnvironmentRequeueWorkedExamples(unittest.TestCase):
             self.assertFalse(guard.environment_requeue_enabled(nested))
             config.write_text("[queue]\n", encoding="utf-8")
             self.assertFalse(guard.environment_requeue_enabled(nested))
+
+
+class NormalPushActivityEvidence(unittest.TestCase):
+    """Twin of the activity tests in src/pr_queue_state.rs."""
+
+    def charged(self, response: dict[str, Any]) -> tuple[int, bool, str]:
+        got = guard.classify_pr_queue_state(response)
+        return (got["ejections_of_current_head"], got["last_ejection"]["new_head_since"],
+                got["last_ejection"]["new_head_basis"])
+
+    NONE = (2, False, "no_evidence")
+
+    def test_matching_activity_clears_both_conflict_removals(self) -> None:
+        self.assertEqual(self.charged(with_rows(matching_rows())),
+                         (0, True, "activity_push_after_removal"))
+        rows = matching_rows()
+        rows[0]["activity_type"] = "force_push"
+        self.assertEqual(self.charged(with_rows(rows))[0], 0)
+        allowed, _ = guard.decide(guard.classify_pr_queue_state(with_rows(matching_rows())))
+        self.assertTrue(allowed)
+
+    def test_without_usable_activity_both_stay_charged(self) -> None:
+        self.assertEqual(self.charged(two_conflicts_then_normal_push()), self.NONE)
+        error = two_conflicts_then_normal_push()
+        error[guard.PUSH_ACTIVITY_KEY] = {"error": "HTTP 502"}
+        self.assertEqual(self.charged(error), self.NONE)
+        self.assertEqual(self.charged(with_rows([])), self.NONE)
+        mismatch = matching_rows()
+        mismatch[0]["after"] = ACT_OTHER
+        self.assertEqual(self.charged(with_rows(mismatch)), self.NONE)
+        early = matching_rows()[1:] + [activity_row("2026-10-04T00:05:00Z", "push", ACT_HEAD)]
+        self.assertEqual(self.charged(with_rows(early)), self.NONE)
+        same_second = matching_rows()
+        same_second[0]["timestamp"] = "2026-10-04T02:00:00Z"
+        self.assertEqual(self.charged(with_rows(same_second)), (1, False, "no_evidence"))
+        allowed, _ = guard.decide(guard.classify_pr_queue_state(two_conflicts_then_normal_push()))
+        self.assertFalse(allowed)
+
+    def test_a_fork_head_or_another_ref_gives_no_credit(self) -> None:
+        fork = with_rows(matching_rows())
+        fork["data"]["repository"]["pullRequest"]["isCrossRepository"] = True
+        self.assertEqual(self.charged(fork), self.NONE)
+        unproven = with_rows(matching_rows())
+        unproven[guard.PUSH_ACTIVITY_KEY]["crossRepository"] = None
+        self.assertEqual(self.charged(unproven), self.NONE)
+        renamed = with_rows(matching_rows())
+        renamed["data"]["repository"]["pullRequest"]["headRefName"] = "other"
+        self.assertEqual(self.charged(renamed), self.NONE)
+        rows = matching_rows()
+        rows[0]["ref"] = "refs/heads/other"
+        self.assertEqual(self.charged(with_rows(rows)), self.NONE)
+
+    def test_a_malformed_or_short_page_gives_no_credit(self) -> None:
+        missing = matching_rows()
+        del missing[2]["timestamp"]
+        self.assertEqual(self.charged(with_rows(missing)), self.NONE)
+        unordered = matching_rows()
+        unordered[0], unordered[1] = unordered[1], unordered[0]
+        self.assertEqual(self.charged(with_rows(unordered)), self.NONE)
+        not_rows = with_rows(matching_rows())
+        not_rows[guard.PUSH_ACTIVITY_KEY]["rows"] = {"0": {}}
+        self.assertEqual(self.charged(not_rows), self.NONE)
+        too_many = matching_rows() + [
+            activity_row("2026-10-04T00:00:00Z", "push", ACT_OTHER)
+        ] * guard.PUSH_ACTIVITY_PAGE
+        self.assertEqual(self.charged(with_rows(too_many)), self.NONE)
+        self.assertEqual(self.charged(with_rows(matching_rows()[:2])),
+                         (1, True, "activity_push_after_removal"))
+        self.assertEqual(self.charged(with_rows(matching_rows()[:1])), self.NONE)
+
+    def test_the_earlier_visibility_veto_still_applies(self) -> None:
+        rows = matching_rows()
+        rows.insert(1, activity_row("2026-10-04T02:30:00Z", "force_push", ACT_OTHER))
+        rows.insert(2, activity_row("2026-10-04T01:45:00Z", "push", ACT_HEAD))
+        count, new_head, _ = self.charged(with_rows(rows))
+        self.assertEqual((count, new_head), (1, False))
+        forced = with_rows(matching_rows())
+        forced["data"]["repository"]["pullRequest"]["timelineItems"]["nodes"].insert(0, {
+            "__typename": "HeadRefForcePushedEvent", "createdAt": "2026-10-04T00:20:00Z",
+            "afterCommit": {"oid": ACT_HEAD}})
+        self.assertEqual(self.charged(forced), self.NONE)
+
+    def test_a_full_page_cannot_prove_a_head_is_new(self) -> None:
+        x = "6" * 40
+
+        def page(later_pushes: int, oldest_creation: bool) -> dict[str, Any]:
+            response: dict[str, Any] = {"data": {"repository": {"pullRequest": {
+                "number": 8, "state": "OPEN", "headRefOid": ACT_HEAD, "headRefName": "feature",
+                "isCrossRepository": False, "isInMergeQueue": False, "mergeQueueEntry": None,
+                "autoMergeRequest": None,
+                "timelineItems": {"pageInfo": {"hasPreviousPage": True}, "nodes": [
+                    {"__typename": "PullRequestCommit", "commit": {"oid": x}},
+                    {"__typename": "RemovedFromMergeQueueEvent",
+                     "createdAt": "2026-10-04T01:00:00Z", "reason": "merge_conflict",
+                     "beforeCommit": None},
+                    {"__typename": "HeadRefForcePushedEvent", "createdAt": "2026-10-05T00:00:00Z",
+                     "afterCommit": {"oid": ACT_HEAD}},
+                ]}}}}}
+            pushes = [
+                activity_row(f"2026-10-04T{2 + n // 60:02d}:{n % 60:02d}:00Z", "push", f"{n:040x}")
+                for n in range(later_pushes)
+            ]
+            rows = [activity_row("2026-10-05T00:00:00Z", "force_push", ACT_HEAD),
+                    *reversed(pushes),
+                    activity_row("2026-10-04T00:30:00Z",
+                                 "branch_creation" if oldest_creation else "push", x)]
+            response[guard.PUSH_ACTIVITY_KEY] = {
+                "headRef": "feature", "crossRepository": False, "rows": rows,
+            }
+            return response
+
+        full = page(guard.PUSH_ACTIVITY_PAGE - 2, False)
+        self.assertEqual(len(full[guard.PUSH_ACTIVITY_KEY]["rows"]), guard.PUSH_ACTIVITY_PAGE)
+        self.assertEqual(self.charged(full), (1, False, "no_evidence"))
+        self.assertEqual(self.charged(page(guard.PUSH_ACTIVITY_PAGE - 2, True)),
+                         (0, True, "activity_push_after_removal"))
+        self.assertEqual(self.charged(page(guard.PUSH_ACTIVITY_PAGE - 3, False)),
+                         (0, True, "activity_push_after_removal"))
+
+    def test_a_first_push_off_the_head_gives_no_credit(self) -> None:
+        second = matching_rows()
+        second[0]["before"] = ACT_HEAD
+        self.assertEqual(self.charged(with_rows(second)), (1, False, "no_evidence"))
+        first = matching_rows()
+        first[1]["before"] = ACT_HEAD
+        self.assertEqual(self.charged(with_rows(first)), (1, True, "activity_push_after_removal"))
+        missing = matching_rows()
+        del missing[0]["before"]
+        self.assertEqual(self.charged(with_rows(missing)), self.NONE)
+
+    def test_a_closed_or_merged_pull_request_never_reads_activity(self) -> None:
+        for state in ("MERGED", "CLOSED", "", None):
+            with self.subTest(state=state):
+                response = two_conflicts_then_normal_push()
+                response["data"]["repository"]["pullRequest"]["state"] = state
+                self.assertFalse(guard.push_activity_wanted(response))
+
+    def test_activity_is_read_only_when_it_can_matter(self) -> None:
+        self.assertTrue(guard.push_activity_wanted(two_conflicts_then_normal_push()))
+        settled = two_conflicts_then_normal_push()
+        nodes = settled["data"]["repository"]["pullRequest"]["timelineItems"]["nodes"]
+        nodes[-1] = {"__typename": "HeadRefForcePushedEvent", "createdAt": "2026-10-04T03:00:00Z",
+                     "afterCommit": {"oid": ACT_HEAD}}
+        self.assertFalse(guard.push_activity_wanted(settled))
+        calls: list[str] = []
+        self.assertNotIn(guard.PUSH_ACTIVITY_KEY,
+                         guard.attach_push_activity(settled, "owner/repo", calls.append))
+        self.assertEqual(calls, [])
+
+    def test_attach_reads_one_page_and_fails_closed(self) -> None:
+        def numbered(number: int) -> dict[str, Any]:
+            response = two_conflicts_then_normal_push()
+            response["data"]["repository"]["pullRequest"]["number"] = number
+            return response
+
+        paths: list[str] = []
+
+        def fetch(path: str) -> Any:
+            paths.append(path)
+            return matching_rows()
+
+        with mock.patch.dict(guard._ACTIVITY_CACHE, clear=True):
+            got = guard.attach_push_activity(numbered(1), "owner/repo", fetch)
+            self.assertEqual(paths,
+                             ["repos/owner/repo/activity?ref=refs/heads/feature&per_page=100"])
+            self.assertEqual(self.charged(got)[0], 0)
+            again = guard.attach_push_activity(numbered(1), "owner/repo", fetch)
+            self.assertEqual(len(paths), 1)
+            self.assertEqual(self.charged(again)[0], 0)
+
+            def failing(path: str) -> Any:
+                raise guard.GuardError("HTTP 404")
+
+            failed = guard.attach_push_activity(numbered(2), "owner/repo", failing)
+            self.assertIn("error", failed[guard.PUSH_ACTIVITY_KEY])
+            self.assertEqual(self.charged(failed)[0], 2)
+            odd = guard.attach_push_activity(numbered(3), "owner/repo", lambda _: {"message": "x"})
+            self.assertIn("error", odd[guard.PUSH_ACTIVITY_KEY])
+            self.assertEqual(self.charged(odd)[0], 2)
+            for cross in (True, None):
+                fork = numbered(4)
+                fork["data"]["repository"]["pullRequest"]["isCrossRepository"] = cross
+                got = guard.attach_push_activity(fork, "owner/repo", fetch)
+                self.assertIn("error", got[guard.PUSH_ACTIVITY_KEY])
+                self.assertEqual(self.charged(got)[0], 2)
+            self.assertEqual(len(paths), 1)
+        self.assertIsNone(guard.push_activity_path("owner/repo", "a&b"))
+        self.assertIsNone(guard.push_activity_path("owner/repo", "a b"))
+
+    def test_the_landing_target_reads_activity_through_the_app_token(self) -> None:
+        calls: list[list[str]] = []
+
+        def real_gh(arguments: list[str]) -> Any:
+            calls.append(arguments)
+            return matching_rows()
+
+        with mock.patch.dict(guard._ACTIVITY_CACHE, clear=True), \
+                mock.patch.object(guard, "run_real_gh", real_gh):
+            target = guard._target(two_conflicts_then_normal_push(), "arm", None)
+        self.assertEqual(calls, [["api",
+                                  "repos/owner/repo/activity?ref=refs/heads/feature&per_page=100"]])
+        self.assertEqual(target["ejections_of_current_head"], 0)
+        self.assertIs(target["new_head_since_removal"], True)
 
 
 if __name__ == "__main__":

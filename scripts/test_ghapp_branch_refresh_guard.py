@@ -34,6 +34,8 @@ def fixture(name: str) -> dict[str, Any]:
 SAME_HEAD_EJECTED = "pr_real_8811_same_head_ejected.json"
 # Generous-Corp/pulp#8722, removed (manual) and given a new head since.
 EJECTED_NEW_HEAD = "pr_ejected_new_head.json"
+# 8722's real activity page: the head 99d205a2 was pushed after the removal.
+EJECTED_NEW_HEAD_ACTIVITY = "activity_real_8722.json"
 # Generous-Corp/pulp#8672, never armed and never queued.
 NEVER_ARMED = "pr_never_armed.json"
 
@@ -229,10 +231,20 @@ class QueueEjection(unittest.TestCase):
         self.assertIsNone(guard.ejection_decision(classification))
 
     def test_ejected_then_new_head_follows_normal_policy(self) -> None:
-        classification = self.classify(EJECTED_NEW_HEAD)
+        page = fixture(EJECTED_NEW_HEAD_ACTIVITY)
+        response = fixture(EJECTED_NEW_HEAD)
+        response[guard.ARM_GUARD.PUSH_ACTIVITY_KEY] = {
+            "headRef": page["head_ref"], "crossRepository": False, "rows": page["rows"],
+        }
+        classification = guard.ARM_GUARD.classify_pr_queue_state(response)
         self.assertEqual(classification["class"], "ejected")
         self.assertTrue(classification["new_head_since_removal"])
         self.assertIsNone(guard.ejection_decision(classification))
+        # Without the activity page the normal push is not proven, so the
+        # head reads as unchanged and the refresh is the way back.
+        bare = self.classify(EJECTED_NEW_HEAD)
+        self.assertFalse(bare["new_head_since_removal"])
+        self.assertIsNotNone(guard.ejection_decision(bare))
 
     def test_never_queued_keeps_the_refusal(self) -> None:
         classification = self.classify(NEVER_ARMED)
@@ -327,12 +339,17 @@ class EndToEnd(unittest.TestCase):
         queue_state: dict[str, Any] | None = None,
         queue_readable: bool = True,
         env: dict[str, str] | None = None,
+        activity: list[dict[str, Any]] | None = None,
     ) -> tuple[int, str, list[list[str]]]:
         calls: list[list[str]] = []
 
         def fake(arguments: list[str]) -> tuple[int, str, str]:
             calls.append(arguments)
             joined = " ".join(arguments)
+            if "/activity?ref=" in joined:
+                if activity is None:
+                    return 1, "", "gh: Not Found (HTTP 404)\n"
+                return 0, json.dumps(activity), ""
             if "contents/.shipyard/config.toml" in joined:
                 if config is None:
                     return 1, "", 'gh: Not Found (HTTP 404)\n'
@@ -391,10 +408,17 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("failed_checks", stderr)
 
     def test_ejected_then_new_head_is_refused_under_normal_policy(self) -> None:
-        code, stderr, _ = self.run_main(
-            self.ARGS, config=self.ENABLED, queue_state=fixture(EJECTED_NEW_HEAD)
-        )
+        page = fixture(EJECTED_NEW_HEAD_ACTIVITY)
+        queue = fixture(EJECTED_NEW_HEAD)
+        pr = queue["data"]["repository"]["pullRequest"]
+        pr["headRefName"] = page["head_ref"]
+        pr["isCrossRepository"] = False
+        with mock.patch.dict(guard.ARM_GUARD._ACTIVITY_CACHE, clear=True):
+            code, stderr, calls = self.run_main(
+                self.ARGS, config=self.ENABLED, queue_state=queue, activity=page["rows"]
+            )
         self.assertEqual(code, 1, stderr)
+        self.assertTrue(any("/activity?ref=refs/heads/" in " ".join(call) for call in calls))
 
     def test_unreadable_queue_state_is_allowed(self) -> None:
         code, stderr, _ = self.run_main(self.ARGS, config=self.ENABLED, queue_readable=False)

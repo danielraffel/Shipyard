@@ -743,7 +743,14 @@ pub(super) fn read_queue_state(
             format!("number={pr}"),
         ])
         .map_err(|error| error.to_string())?;
-    serde_json::from_str(&raw).map_err(|error| format!("malformed GraphQL JSON: {error}"))
+    let mut queue: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|error| format!("malformed GraphQL JSON: {error}"))?;
+    crate::pr_queue_state::attach_push_activity(&mut queue, repo, |path| {
+        actions
+            .run_gh(&["api".to_owned(), path.to_owned()])
+            .map_err(|error| error.to_string())
+    });
+    Ok(queue)
 }
 
 #[cfg(test)]

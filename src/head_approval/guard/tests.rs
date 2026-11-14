@@ -306,7 +306,8 @@ fn a_guard_config_without_an_app_id_is_an_unreadable_policy() {
 }
 
 /// A queue-state response in which the merge queue removed `head` `count`
-/// times for a failure (never `merged`).
+/// times for a failure (never `merged`), in GitHub's shape: `beforeCommit` is
+/// the merge-group commit, with `head` as its second parent.
 fn ejected(head: &str, count: usize) -> Value {
     let nodes = (0..count)
         .map(|index| {
@@ -314,11 +315,34 @@ fn ejected(head: &str, count: usize) -> Value {
                 "__typename": "RemovedFromMergeQueueEvent",
                 "createdAt": format!("2026-11-04T0{index}:30:00Z"),
                 "reason": "failed_checks",
-                "beforeCommit": {"oid": head},
+                "beforeCommit": {
+                    "oid": format!("{index:040x}"),
+                    "parents": {"nodes": [
+                        {"oid": "cccccccccccccccccccccccccccccccccccccccc"},
+                        {"oid": head},
+                    ]},
+                },
             })
         })
         .collect::<Vec<_>>();
     json!({"data": {"repository": {"pullRequest": {"timelineItems": {"nodes": nodes}}}}})
+}
+
+fn unattributed_ejected(head: &str, count: usize) -> Value {
+    let nodes = (0..count)
+        .map(|index| {
+            json!({
+                "__typename": "RemovedFromMergeQueueEvent",
+                "createdAt": format!("2026-11-04T0{index}:30:00Z"),
+                "reason": "merge_conflict",
+                "beforeCommit": null,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({"data": {"repository": {"pullRequest": {
+        "headRefOid": head,
+        "timelineItems": {"pageInfo": {"hasPreviousPage": false}, "nodes": nodes}
+    }}}})
 }
 
 fn gate_with_queue(queue: &Value, latest_was_interruption: bool) -> HeadGate {
@@ -375,6 +399,95 @@ fn an_interruption_excuses_the_newest_removal_in_guard_mode_too() {
     let cap = crate::head_approval::EJECTION_CAP;
     assert!(gate_with_queue(&ejected(HEAD, cap), true).allows());
     assert!(!gate_with_queue(&ejected(HEAD, cap + 1), true).allows());
+}
+
+#[test]
+fn a_force_pushed_new_head_clears_historical_unattributed_removals() {
+    let queue = {
+        let mut queue = unattributed_ejected(HEAD, crate::head_approval::EJECTION_CAP);
+        queue["data"]["repository"]["pullRequest"]["timelineItems"]["nodes"]
+            .as_array_mut()
+            .expect("nodes")
+            .push(json!({
+                "__typename": "HeadRefForcePushedEvent",
+                "createdAt": "2026-11-04T02:30:00Z",
+                "afterCommit": {"oid": HEAD},
+            }));
+        queue
+    };
+    let gate = gate_with_queue(&queue, false);
+    assert!(gate.allows(), "{gate:?}");
+    // In a truncated or unmeasured window an earlier push of the same head
+    // may be on an unread page, so the later push proves nothing and the
+    // removals keep the head at the cap.
+    for page_info in [json!({"hasPreviousPage": true}), json!({}), Value::Null] {
+        let mut truncated = queue.clone();
+        truncated["data"]["repository"]["pullRequest"]["timelineItems"]["pageInfo"] = page_info;
+        let gate = gate_with_queue(&truncated, false);
+        assert!(
+            matches!(&gate, HeadGate::EjectionCap { .. }) && !gate.allows(),
+            "{gate:?}"
+        );
+    }
+}
+
+/// Guard mode: two historical `merge_conflict` removals, then the mandated
+/// repair (merge main, push normally). A repository activity row of the head
+/// after the removals lifts the cap; without one the head stays capped.
+#[test]
+fn a_normal_push_with_activity_evidence_clears_conflict_removals_in_guard_mode() {
+    let base = || {
+        let mut queue = unattributed_ejected(HEAD, crate::head_approval::EJECTION_CAP);
+        let pr = &mut queue["data"]["repository"]["pullRequest"];
+        pr["headRefName"] = json!("feature");
+        pr["isCrossRepository"] = json!(false);
+        pr["timelineItems"]["nodes"]
+            .as_array_mut()
+            .expect("nodes")
+            .push(json!({"__typename": "PullRequestCommit", "commit": {"oid": HEAD}}));
+        queue
+    };
+    let row = |at: &str, after: &str| {
+        json!({"activity_type": "push", "after": after, "before": "9999999999999999999999999999999999999999", "ref": "refs/heads/feature",
+               "timestamp": at})
+    };
+    let with_rows = |rows: Vec<Value>| {
+        let mut queue = base();
+        queue[crate::pr_queue_state::PUSH_ACTIVITY_KEY] =
+            json!({"headRef": "feature", "crossRepository": false, "rows": rows});
+        queue
+    };
+    let earlier = "cccccccccccccccccccccccccccccccccccccccc";
+    let cleared = with_rows(vec![
+        row("2026-11-04T09:00:00Z", HEAD),
+        row("2026-11-04T00:00:00Z", earlier),
+    ]);
+    let gate = gate_with_queue(&cleared, false);
+    assert!(gate.allows(), "{gate:?}");
+
+    let mut error = base();
+    error[crate::pr_queue_state::PUSH_ACTIVITY_KEY] = json!({"error": "HTTP 502"});
+    let mut fork = cleared.clone();
+    fork["data"]["repository"]["pullRequest"]["isCrossRepository"] = json!(true);
+    for capped in [
+        base(),
+        error,
+        fork,
+        with_rows(vec![
+            row("2026-11-04T09:00:00Z", earlier),
+            row("2026-11-04T00:00:00Z", earlier),
+        ]),
+        with_rows(vec![
+            row("2026-11-04T00:10:00Z", HEAD),
+            row("2026-11-04T00:00:00Z", earlier),
+        ]),
+    ] {
+        let gate = gate_with_queue(&capped, false);
+        assert!(
+            matches!(&gate, HeadGate::EjectionCap { .. }) && !gate.allows(),
+            "{gate:?}"
+        );
+    }
 }
 
 /// A fake GitHub for a comment-mode base: `config` and `comments` answer as

@@ -2996,8 +2996,14 @@ fail-closed. Admission reads the PR's queue timeline too: a head the queue
 removed for `failed_checks` / `merge_conflict` with no new head since is refused
 even by a fresh ship-state for the same SHA, so re-shipping from another host
 does not re-enqueue it. Push a fix. For a `merge_conflict` ejection, a fix that
-was committed before it but pushed after it counts as new, by its earliest
-check suite (`new_head_basis: suite_after_removal`), not by its commit date.
+was committed before it but pushed after it counts as new only on
+server-timestamped evidence: a `HeadRefForcePushedEvent` for the current head
+after the removal (none before it, complete timeline window), or, for a normal
+push, a repository activity row (`repos/{o}/{r}/activity`, read once per PR and
+head) whose `after` is the head and whose `timestamp` is later than the
+removal (`new_head_basis: activity_push_after_removal`). Commit timeline order
+and check-suite creation are not push evidence; a fork head or an unreadable
+activity page keeps the removal charged.
 
 ### "Validated green but not merged" — read the status before blaming the PR
 

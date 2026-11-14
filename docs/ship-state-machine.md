@@ -394,6 +394,15 @@ document:
   backstop arms the head later. At T5 the refusal fails the merge phase the
   same way an unapproved head does. Nothing overrides it.
 
+* The validated head-approval reads used by `shipyard auto-merge` attach the
+  same bounded repository-activity evidence used by the queue-state reader
+  before evaluating ejection history. This keeps the approval verdict and the
+  later arm decision on one view of an unattributable merge-queue removal. The
+  activity request is made only for an open PR when such evidence is needed;
+  failures, malformed rows, fork heads, and incomplete pages remain charged
+  fail-closed. The approval path therefore cannot silently clear the
+  `EJECTION_CAP` that the normal queue-state path would retain.
+
 The reason it exists is a gap this state machine cannot close by itself. T5
 (merge on PASS) is the only thing that enqueues a validated head, so a ship that
 never reaches T5 — orphaned, abandoned, or killed before its merge phase —

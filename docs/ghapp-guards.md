@@ -1209,16 +1209,27 @@ the head the queue removed (the second parent of the removal's `beforeCommit`
 merge-group commit). Commit dates and timeline position are not consulted,
 because GitHub sorts a fix committed before an ejection but pushed after it
 *before* the removal. A removal that names no head (`merge_conflict`) falls back
-to push-time evidence. That is a push of the current head after it in timeline
-order, or the current head's earliest check suite created after the removal
-event, wherever GitHub sorted its commit (basis `suite_after_removal`). The
-suite stands in for the push time because `Commit.pushedDate` is null. A head
-with neither, including one with no check suite, is treated as unchanged by
-both guards. A commit that first reached GitHub on another branch before the
-removal carries that earlier suite and also reads as unchanged. If a live push
-is ever misread, the repository activity API
-(`repos/{owner}/{repo}/activity`, push events with timestamps) is the
-authoritative source.
+to server-timestamped push-time evidence: a `HeadRefForcePushedEvent` for the
+current head after the removal, none before it, and a complete timeline window
+(`hasPreviousPage: false`). A normal push leaves no such event, so the guard
+also reads one page of the branch's repository activity
+(`repos/{owner}/{repo}/activity?ref=refs/heads/<head_ref>&per_page=100`, App
+token) when a removal that names no head is not already settled by a
+force-push. A `push` or `force_push` row whose `after` is the current head,
+with a server `timestamp` strictly later than the removal, counts as the new
+head (basis `activity_push_after_removal`), provided the page reaches back
+past the removal and no row at or before the removal, and no earlier
+force-push event, names that head. A full page (100 rows) counts only when
+its oldest row is the branch's `branch_creation`, since an earlier push of the
+head may be on the next page, and the first row after the removal must not
+have `before` equal to the head. The page is read only for an open pull
+request and only for a head in the
+base repository and at most once per pull request and head per guard run. A
+fork head, a failed or non-2xx read, a malformed row, or a page that stops
+short of the removal gives no credit. `PullRequestCommit` timeline order is
+author-controlled and check-suite creation can lag the push, so neither is
+arrival proof. A head with no authoritative evidence is treated as unchanged
+by both guards.
 
 The two unreadable rows are asymmetric on purpose: arming blind can fail
 innocent batch-mates, while a blind refresh costs at most one gate run. Every
