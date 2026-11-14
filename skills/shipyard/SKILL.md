@@ -4511,8 +4511,11 @@ Under `[auto_merge] flake_requeue = "apply"` (default `shadow`, or `apply` when
 unchanged, through the steward's normal enqueue path (live exact-head approval
 first; the flake class never approves). It refuses a `defect-fix`-removed head
 (`defect_fix_removed`), a base confirmed red on a signature check (`base_red`),
-a base this pass did not read green (`base_unknown`), a signature whose
-re-enqueued head was ejected again (`signature_tripped`, the breaker), a
+a base this pass did not read green (`base_unknown`: the base tip's newest
+completed run of each signature check must be a `success`), a signature whose
+re-enqueued head was ejected again (`signature_tripped`; a sweep before
+admissions reads each re-enqueued head's timeline, `breaker_unread` while it
+cannot), a
 signature past `flake_max_requeues` (3) in the window (`signature_capped`), and
 a second re-enqueue of the same head. The receipt is saved `pending` before the
 enqueue and `done` after GitHub accepts it; a deferred one is retried once a

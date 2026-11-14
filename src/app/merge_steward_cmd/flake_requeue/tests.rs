@@ -59,6 +59,8 @@ struct Case<'a> {
     verdict: EnvironmentRequeue,
     defect_fix_removed: bool,
     poison: Option<RepoPoison>,
+    /// What the base tip answers for every check.
+    tip: TipAnswer,
     now: DateTime<Utc>,
 }
 
@@ -72,11 +74,13 @@ impl<'a> Case<'a> {
             verdict: verdict(group, "macos", &[MIDI]),
             defect_fix_removed: false,
             poison: Some(green_base(&["macos"])),
+            tip: Ok(Some("success".to_owned())),
             now: now(),
         }
     }
 
     fn run_at(&self, ledger: &mut StewardLedger, path: Option<&Path>) -> Option<Verdict> {
+        let tip = |_: &str| self.tip.clone();
         consider(
             &Ejection {
                 policy: &self.policy,
@@ -87,6 +91,7 @@ impl<'a> Case<'a> {
                 verdict: &self.verdict,
                 defect_fix_removed: self.defect_fix_removed,
                 poison: self.poison.as_ref(),
+                tip: &tip,
             },
             ledger,
             path,
@@ -279,11 +284,15 @@ fn tip(red: bool, error: Option<&str>) -> TipReading {
     }
 }
 
+/// What the base tip answers for a check.
+type TipAnswer = Result<Option<String>, String>;
+
 #[test]
-fn only_a_base_read_green_for_the_checks_allows_a_requeue() {
-    let cases: Vec<(Option<RepoPoison>, &str)> = vec![
+fn only_a_base_tip_read_success_for_the_checks_allows_a_requeue() {
+    let success = || Ok(Some("success".to_owned()));
+    let cases: Vec<(Option<RepoPoison>, TipAnswer, &str)> = vec![
         // Base poison off, or not read this pass.
-        (None, "base_unknown"),
+        (None, success(), "base_unknown"),
         // The merge groups could not be read.
         (
             Some(RepoPoison {
@@ -292,13 +301,13 @@ fn only_a_base_read_green_for_the_checks_allows_a_requeue() {
                 },
                 ..green_base(&[])
             }),
+            success(),
             "base_unknown",
         ),
-        // Clear, but the check has no recorded pass.
-        (Some(green_base(&["linux"])), "base_unknown"),
         // A streak whose tip read failed: partial.
         (
             Some(poisoned_macos(tip(false, Some("HTTP 502")))),
+            success(),
             "base_unknown",
         ),
         // A partial reading of the named fixes.
@@ -307,27 +316,126 @@ fn only_a_base_read_green_for_the_checks_allows_a_requeue() {
                 fix_read_error: Some("fixes unread".to_owned()),
                 ..green_base(&["macos"])
             }),
+            success(),
             "base_unknown",
         ),
         // Confirmed red on the check.
-        (Some(poisoned_macos(tip(true, None))), "base_red"),
-        // A streak, but the tip read green: a flake, not the base.
-        (Some(poisoned_macos(tip(false, None))), "requeued"),
-        (Some(green_base(&["macos"])), "requeued"),
+        (Some(poisoned_macos(tip(true, None))), success(), "base_red"),
+        // The motivating case: a streak (the flake), the tip not red, and
+        // its newest completed run a success.
+        (
+            Some(poisoned_macos(tip(false, None))),
+            success(),
+            "requeued",
+        ),
+        (Some(green_base(&["macos"])), success(), "requeued"),
+        // The tip has no completed run (empty, pending, cancelled).
+        (
+            Some(poisoned_macos(tip(false, None))),
+            Ok(None),
+            "base_unknown",
+        ),
+        (Some(green_base(&["macos"])), Ok(None), "base_unknown"),
+        // Neutral or skipped is not a success.
+        (
+            Some(green_base(&["macos"])),
+            Ok(Some("neutral".to_owned())),
+            "base_unknown",
+        ),
+        (
+            Some(green_base(&["macos"])),
+            Ok(Some("skipped".to_owned())),
+            "base_unknown",
+        ),
+        // The tip failed it.
+        (
+            Some(green_base(&["macos"])),
+            Ok(Some("failure".to_owned())),
+            "base_red",
+        ),
+        // The tip could not be read.
+        (
+            Some(green_base(&["macos"])),
+            Err("HTTP 502".to_owned()),
+            "base_unknown",
+        ),
     ];
-    for (poison, expected) in cases {
+    for (poison, answer, expected) in cases {
         let mut ledger = StewardLedger::default();
         Case::new(12201, "aaaa", "2026-11-13T20:00:00Z", "g1").run(&mut ledger);
         let mut case = Case::new(12202, "bbbb", "2026-11-13T21:00:00Z", "g2");
         case.poison = poison.clone();
+        case.tip = answer.clone();
         let verdict = case.run(&mut ledger);
-        assert_eq!(last_outcome(&ledger), expected, "{poison:?}: {verdict:?}");
+        assert_eq!(
+            last_outcome(&ledger),
+            expected,
+            "{poison:?} / {answer:?}: {verdict:?}"
+        );
         assert_eq!(requeued(verdict.as_ref()), expected == "requeued");
         assert_eq!(
             ledger.flake_requeue.requeued.is_empty(),
             expected != "requeued"
         );
     }
+    // No checks: never green.
+    assert!(matches!(
+        base_read(Some(&green_base(&["macos"])), &[], &|_| success()),
+        BaseRead::Unknown(_)
+    ));
+}
+
+#[test]
+fn the_tip_verdict_is_the_newest_completed_pass_or_fail_run() {
+    let runs = |runs: serde_json::Value| serde_json::json!({ "check_runs": runs });
+    let run = |id: u64, status: &str, conclusion: Option<&str>| serde_json::json!({"id": id, "name": "macos", "status": status, "conclusion": conclusion});
+    // Empty.
+    assert_eq!(
+        newest_tip_verdict(&runs(serde_json::json!([])), "macos", None),
+        None
+    );
+    // Only pending, or only cancelled: nothing says anything.
+    assert_eq!(
+        newest_tip_verdict(
+            &runs(serde_json::json!([
+                run(1, "in_progress", None),
+                run(2, "queued", None)
+            ])),
+            "macos",
+            None
+        ),
+        None
+    );
+    assert_eq!(
+        newest_tip_verdict(
+            &runs(serde_json::json!([run(1, "completed", Some("cancelled"))])),
+            "macos",
+            None
+        ),
+        None
+    );
+    // A newer pending run does not hide the newest completed one; a newer
+    // cancel does not either.
+    assert_eq!(
+        newest_tip_verdict(
+            &runs(serde_json::json!([
+                run(1, "completed", Some("failure")),
+                run(2, "completed", Some("success")),
+                run(3, "in_progress", None),
+                run(4, "completed", Some("cancelled")),
+            ])),
+            "macos",
+            None
+        )
+        .as_deref(),
+        Some("success")
+    );
+    // Another check's run, or another app's, says nothing.
+    let other = serde_json::json!([
+        {"id": 5, "name": "linux", "status": "completed", "conclusion": "success"},
+        {"id": 6, "name": "macos", "status": "completed", "conclusion": "success", "app": {"id": 1}},
+    ]);
+    assert_eq!(newest_tip_verdict(&runs(other), "macos", Some(2)), None);
 }
 
 #[test]
@@ -392,6 +500,19 @@ fn a_requeued_head_ejected_again_trips_the_signature() {
             .is_some_and(|by| by.contains("#2")),
         "{cause:?}"
     );
+}
+
+#[test]
+fn a_signature_the_sweep_could_not_check_requeues_nothing_this_pass() {
+    let mut ledger = StewardLedger::default();
+    Case::new(1, "aaaa", "2026-11-13T20:00:00Z", "g1").run(&mut ledger);
+    ledger.flake_requeue.unswept.insert(
+        issue_key(REPO, &format!("macos: {MIDI}")),
+        "#9 timeline unread: HTTP 502".to_owned(),
+    );
+    let case = Case::new(2, "bbbb", "2026-11-13T21:00:00Z", "g2");
+    assert!(!requeued(case.run(&mut ledger).as_ref()));
+    assert_eq!(last_outcome(&ledger), "breaker_unread");
 }
 
 #[test]
@@ -658,6 +779,7 @@ fn a_tripped_breaker_is_added_to_the_issue() {
             pr: 12202,
             head: "b".repeat(40),
             at: "2026-11-13T22:50:00Z".to_owned(),
+            unread: false,
         },
     );
     let gh = FakeGh::new("");

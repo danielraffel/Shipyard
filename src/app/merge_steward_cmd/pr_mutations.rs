@@ -1264,6 +1264,32 @@ fn flake_requeue_verdict(
     at: Option<&str>,
     verdict: &crate::environment_requeue::EnvironmentRequeue,
 ) -> Option<super::flake_requeue::Verdict> {
+    // The base tip's newest completed verdict for one check, read live, only
+    // when every other condition already allows the re-enqueue.
+    let tip = |check: &str| -> Result<Option<String>, String> {
+        let app_id = context
+            .observation
+            .required_checks
+            .iter()
+            .find(|rule| rule.context == check)
+            .and_then(|rule| rule.app_id);
+        let raw = context
+            .actions
+            .run_gh(&[
+                "api".to_owned(),
+                crate::base_health::fix_first::tip_check_path(
+                    &context.observation.repo,
+                    &context.observation.base,
+                    check,
+                ),
+            ])
+            .map_err(|error| error.to_string())?;
+        let value = serde_json::from_str::<Value>(&raw)
+            .map_err(|error| format!("the base tip's check runs were not JSON: {error}"))?;
+        Ok(super::flake_requeue::newest_tip_verdict(
+            &value, check, app_id,
+        ))
+    };
     super::flake_requeue::consider(
         &super::flake_requeue::Ejection {
             policy: &context.ejection_guards.flake_requeue,
@@ -1274,6 +1300,7 @@ fn flake_requeue_verdict(
             verdict,
             defect_fix_removed: defect_fix_block(context, pr).is_some(),
             poison: context.base_poison,
+            tip: &tip,
         },
         ledger,
         Some(context.ledger_path),

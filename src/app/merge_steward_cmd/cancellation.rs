@@ -144,6 +144,26 @@ pub(super) fn apply_repo_plan(
     if args.apply {
         ledger.removal_ledger = removal_cache;
     }
+    // The flake breaker, before any admission: a re-enqueued head the queue
+    // ejected again trips its signature (the approval gate stops that head
+    // at the ejection cap, so admission never sees it). Reads only.
+    super::flake_requeue::sweep(
+        &policy.ejection_guards.flake_requeue,
+        observation,
+        ledger,
+        &super::flake_requeue::SweepReads {
+            queue: &|pr| super::native_arm::read_queue_state(actions, &observation.repo, pr),
+            assess: &|report| {
+                crate::environment_requeue::assess_with(
+                    &|argv: &[String]| actions.run_gh(argv).map_err(|error| error.to_string()),
+                    &observation.repo,
+                    report,
+                    true,
+                    None,
+                )
+            },
+        },
+    );
     let (mut reports, pr_mutation_failed, listing) = apply_pr_plans_with_poison(
         actions,
         args,

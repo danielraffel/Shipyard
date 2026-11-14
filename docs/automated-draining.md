@@ -633,14 +633,21 @@ dwell acts already apply (`[auto_merge.dwell] act = "apply"`).
   - `defect_fix_removed`: a `defect-fix` removal names the head;
   - `base_red`: the base is confirmed red on a signature check (base poison);
   - `base_unknown`: this pass did not read the base green for every signature
-    check. Green means the merge groups were read with no gaps and the check
-    last passed there, or the base tip was read green for it. Base poison
-    off, an unread or partial reading, or a check with no recorded pass all
-    refuse;
+    check. Green means the merge-group reading has no gaps and the check's
+    newest completed run on the base tip, read live, is a `success` (not
+    `neutral` or `skipped`). Base poison off, an unread or partial reading,
+    or a tip with no completed run (pending, cancelled, never run on a push)
+    all refuse; a failed newest run is `base_red`;
   - `signature_tripped`: the breaker. A head this class re-enqueued that the
     queue ejected again with the same signature says it is not a flake (a
     break the base has not shown red yet: a runner image, a certificate, a
-    date), and the signature re-enqueues nothing more;
+    date), and the signature re-enqueues nothing more. That head has two
+    removals, so the approval gate stops it at the ejection cap; the steward
+    therefore sweeps every re-enqueued head's timeline at the start of each
+    pass. A second removal whose signature cannot be read trips too; a
+    timeline that cannot be read holds the signature for that pass
+    (`breaker_unread`). A head that moved is not followed: a new head has
+    its own signature;
   - `signature_capped`: the signature spent `flake_max_requeues` within the
     window;
   - `already_requeued`: this head had its re-enqueue.

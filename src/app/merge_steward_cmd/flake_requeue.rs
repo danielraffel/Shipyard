@@ -38,15 +38,21 @@
 //! * no `defect-fix` removal names the head (the defect-fix block runs first
 //!   and is checked again here);
 //! * this pass read the base **green** for every signature check
-//!   ([`base_read`]): a merge-group reading with no gaps in which the check
-//!   last passed, or a base-tip reading that is green. A red base is
-//!   `base_poison`'s case (`base_red`); an unread, partial or unavailable
-//!   reading refuses too (`base_unknown`);
+//!   ([`base_read`]): the merge-group reading has no gaps, and the check's
+//!   newest completed run on the base tip, read live, is a `success` (not
+//!   `neutral` or `skipped`). A red base is `base_red`; an unread, partial or
+//!   unavailable reading, or a tip with no completed run, is `base_unknown`;
 //! * the signature has not tripped its breaker: a head the flake class
 //!   re-enqueued that the queue ejected **again** with the same signature
 //!   says the failure is not a flake (a break the base has not shown red
 //!   yet, such as a runner image, a certificate or a date), so the signature
-//!   is `signature_tripped` and re-enqueues nothing more;
+//!   is `signature_tripped` and re-enqueues nothing more. Such a head has two
+//!   removals, so the approval gate stops it at the ejection cap before this
+//!   class runs; the breaker is therefore read by [`sweep`], before any
+//!   admission, from each re-enqueued head's own timeline. A second removal
+//!   whose signature cannot be read trips too, and a timeline that cannot be
+//!   read holds the signature for the pass (`breaker_unread`). A head that
+//!   moved is not followed (its new head has its own signature);
 //! * the signature has spent fewer than `flake_max_requeues` re-enqueues
 //!   within the window (`signature_capped`);
 //! * no earlier flake re-enqueue of this exact head is on record.
@@ -94,8 +100,9 @@ use sha2::{Digest, Sha256};
 use super::StewardLedger;
 use super::base_poison::RepoPoison;
 use crate::base_health::merge_group::MergeGroupHealth;
-use crate::environment_requeue::{EnvironmentRequeue, FailureAttribution};
+use crate::environment_requeue::{EnvironmentRequeue, FailureAttribution, StepEvidence};
 use crate::merge_steward::flake_requeue::{FlakeMode, FlakePolicy};
+use crate::pr_queue_state::PrQueueReport;
 
 /// How long a sighting is kept after the steward last saw its head ejected.
 pub(super) const RETENTION_DAYS: i64 = 7;
@@ -137,6 +144,11 @@ pub(super) struct State {
     /// This pass's decisions, reported and dropped. Never persisted.
     #[serde(skip)]
     pub(super) pass: Vec<Decision>,
+    /// This pass only: signatures (keyed [`issue_key`]) with a re-enqueued
+    /// head whose second-ejection check could not be read ([`sweep`]), and
+    /// why. They re-enqueue nothing this pass. Never persisted.
+    #[serde(skip)]
+    pub(super) unswept: BTreeMap<String, String>,
 }
 
 impl State {
@@ -181,7 +193,8 @@ pub(super) enum ReceiptState {
     /// Recorded before the enqueue; GitHub has not accepted it yet.
     Pending,
     /// GitHub accepted the enqueue, or the queue has since ejected the head
-    /// again (so it was enqueued). An unknown value reads as spent.
+    /// again (so it was enqueued). A receipt written without a state reads
+    /// as `done`, so it is spent and never retried.
     #[default]
     Done,
 }
@@ -202,6 +215,10 @@ pub(super) struct Receipt {
     /// Attempts taken, at most [`MAX_ATTEMPTS`].
     #[serde(default = "one")]
     pub(super) attempts: u32,
+    /// The breaker sweep saw this head ejected again and judged it
+    /// ([`sweep`]); it is not read again.
+    #[serde(default)]
+    pub(super) swept: bool,
 }
 
 const fn one() -> u32 {
@@ -216,15 +233,22 @@ pub(super) struct Trip {
     pub(super) head: String,
     /// The second ejection (RFC 3339).
     pub(super) at: String,
+    /// The second ejection's signature could not be read: tripped closed.
+    #[serde(default)]
+    pub(super) unread: bool,
 }
 
 impl Trip {
     fn describe(&self) -> String {
         format!(
-            "#{} at head {} was ejected again with the same signature at {} after its flake \
-             re-enqueue",
+            "#{} at head {} was ejected again {} at {} after its flake re-enqueue",
             self.pr,
             short(&self.head),
+            if self.unread {
+                "(its signature could not be read)"
+            } else {
+                "with the same signature"
+            },
             self.at
         )
     }
@@ -302,6 +326,9 @@ pub(crate) struct RepoStatus {
     pub(super) decisions: Vec<Decision>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(super) flake_root_cause: Vec<RootCause>,
+    /// Signatures the breaker sweep could not check this pass, and why.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(super) breaker_unread: Vec<String>,
 }
 
 /// The signature of a classifier verdict, when it has one: every failing
@@ -316,22 +343,36 @@ pub(super) fn signature(verdict: &EnvironmentRequeue) -> Option<Signature> {
     {
         return None;
     }
+    signature_of(
+        &verdict.evidence,
+        verdict.attribution.iter().map(|check| check.check.as_str()),
+    )
+}
+
+/// The signature the step evidence of `checks` reads, when every one of
+/// them has failing steps and each step named at least one test.
+fn signature_of<'a>(
+    evidence: &[StepEvidence],
+    checks: impl IntoIterator<Item = &'a str>,
+) -> Option<Signature> {
     let mut by_check: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
-    for check in &verdict.attribution {
-        let steps = verdict
-            .evidence
+    for check in checks {
+        let steps = evidence
             .iter()
-            .filter(|step| step.check == check.check)
+            .filter(|step| step.check == check)
             .collect::<Vec<_>>();
         if steps.is_empty() || steps.iter().any(|step| step.failed_tests.is_empty()) {
             return None;
         }
-        by_check.entry(check.check.as_str()).or_default().extend(
+        by_check.entry(check).or_default().extend(
             steps
                 .iter()
                 .flat_map(|step| step.failed_tests.iter())
                 .map(String::as_str),
         );
+    }
+    if by_check.is_empty() {
+        return None;
     }
     let text = by_check
         .iter()
@@ -357,22 +398,46 @@ pub(super) fn signature(verdict: &EnvironmentRequeue) -> Option<Signature> {
     })
 }
 
+/// The signature of a re-ejection, read from its step evidence alone (the
+/// classifier attributes nothing after a head's first ejection).
+fn evidence_signature(verdict: &EnvironmentRequeue) -> Option<Signature> {
+    let checks = verdict
+        .evidence
+        .iter()
+        .map(|step| step.check.as_str())
+        .collect::<BTreeSet<_>>();
+    signature_of(&verdict.evidence, checks)
+}
+
 /// What this pass knows about the base for a signature's checks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum BaseRead {
-    /// Read green for every check: the merge groups were read with no gaps
-    /// and each check last passed there, or the base tip was read green.
+    /// Every check's newest completed run on the base tip is a `success`,
+    /// and the merge-group reading has no gaps.
     Green,
-    /// The base is confirmed red on this check.
+    /// The base is red on this check: confirmed by base poison, or its
+    /// newest completed run on the tip failed.
     Red(String),
     /// Not known: why.
     Unknown(String),
 }
 
+/// Reads one check's newest completed pass-or-fail conclusion on the base
+/// tip (`Ok(None)` when it has none).
+pub(super) type TipVerdict<'a> = &'a dyn Fn(&str) -> Result<Option<String>, String>;
+
 /// The base reading for `checks`. Only a positive green reading is
-/// [`BaseRead::Green`]: base poison off, an unread or partial reading, or a
-/// check with no recorded pass is [`BaseRead::Unknown`].
-pub(super) fn base_read(poison: Option<&RepoPoison>, checks: &[String]) -> BaseRead {
+/// [`BaseRead::Green`]: every check's newest completed run on the base tip
+/// is a `success` (not `neutral` or `skipped`), read this pass. Base poison
+/// off, an unread or partial merge-group reading, no checks, a tip with no
+/// completed run (pending, cancelled, never run on a push), a `neutral` or
+/// `skipped` newest run, or a tip that could not be read is
+/// [`BaseRead::Unknown`].
+pub(super) fn base_read(
+    poison: Option<&RepoPoison>,
+    checks: &[String],
+    tip: TipVerdict<'_>,
+) -> BaseRead {
     let Some(poison) = poison else {
         return BaseRead::Unknown(
             "the base's merge-group health was not read this pass (base poison off or \
@@ -387,25 +452,74 @@ pub(super) fn base_read(poison: Option<&RepoPoison>, checks: &[String]) -> BaseR
     if let Some(gap) = poison.partial() {
         return BaseRead::Unknown(format!("the base reading is partial: {gap}"));
     }
-    let passed: &[String] = match &poison.health {
-        MergeGroupHealth::Unknown { detail } => {
-            return BaseRead::Unknown(format!("the merge groups were not read: {detail}"));
-        }
-        MergeGroupHealth::Clear { passed, .. } => passed,
-        MergeGroupHealth::Poisoned { .. } => &[],
-    };
+    if let MergeGroupHealth::Unknown { detail } = &poison.health {
+        return BaseRead::Unknown(format!("the merge groups were not read: {detail}"));
+    }
+    if checks.is_empty() {
+        return BaseRead::Unknown("the signature names no check".to_owned());
+    }
     for check in checks {
-        let tip_green = poison
-            .tip
-            .get(check)
-            .is_some_and(|tip| !tip.red && tip.error.is_none());
-        if !tip_green && !passed.contains(check) {
-            return BaseRead::Unknown(format!(
-                "no merge group or base-tip reading shows `{check}` green"
-            ));
+        match tip(check) {
+            Ok(Some(conclusion)) if conclusion == "success" => {}
+            Ok(Some(conclusion)) if FAILING.contains(&conclusion.as_str()) => {
+                return BaseRead::Red(check.clone());
+            }
+            Ok(Some(conclusion)) => {
+                return BaseRead::Unknown(format!(
+                    "`{check}`'s newest completed run on the base tip is `{conclusion}`, not \
+                     `success`"
+                ));
+            }
+            Ok(None) => {
+                return BaseRead::Unknown(format!(
+                    "`{check}` has no completed run on the base tip"
+                ));
+            }
+            Err(error) => {
+                return BaseRead::Unknown(format!(
+                    "`{check}` on the base tip could not be read: {error}"
+                ));
+            }
         }
     }
     BaseRead::Green
+}
+
+/// Conclusions that pass a check, as the base-health readers count them.
+const PASSING: [&str; 3] = ["success", "neutral", "skipped"];
+/// Conclusions that fail a check.
+const FAILING: [&str; 3] = ["failure", "timed_out", "action_required"];
+
+/// The newest completed pass-or-fail conclusion of `check` in a
+/// [`crate::base_health::fix_first::tip_check_path`] answer, from `app_id`
+/// when the rule pins one. Cancelled, stale and running runs say nothing;
+/// `None` when no run says anything.
+pub(super) fn newest_tip_verdict(
+    value: &Value,
+    check: &str,
+    app_id: Option<u64>,
+) -> Option<String> {
+    value
+        .get("check_runs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|run| run.get("name").and_then(Value::as_str) == Some(check))
+        .filter(|run| {
+            app_id
+                .is_none_or(|app_id| run.pointer("/app/id").and_then(Value::as_u64) == Some(app_id))
+        })
+        .filter(|run| run.get("status").and_then(Value::as_str) == Some("completed"))
+        .filter_map(|run| {
+            let conclusion = run
+                .get("conclusion")
+                .and_then(Value::as_str)?
+                .to_ascii_lowercase();
+            (PASSING.contains(&conclusion.as_str()) || FAILING.contains(&conclusion.as_str()))
+                .then_some((run.get("id").and_then(Value::as_u64)?, conclusion))
+        })
+        .max_by_key(|(id, _)| *id)
+        .map(|(_, conclusion)| conclusion)
 }
 
 fn time(text: &str) -> Option<DateTime<Utc>> {
@@ -497,6 +611,8 @@ pub(super) struct Ejection<'a> {
     pub(super) defect_fix_removed: bool,
     /// This pass's base-poison reading, when one was made.
     pub(super) poison: Option<&'a RepoPoison>,
+    /// Reads a check's newest completed verdict on the base tip.
+    pub(super) tip: TipVerdict<'a>,
 }
 
 /// What the enqueue path should do with a flake-classified ejection.
@@ -545,6 +661,7 @@ pub(super) fn consider(
                 at: now.to_rfc3339(),
                 state: ReceiptState::Pending,
                 attempts: previous.as_ref().map_or(1, |receipt| receipt.attempts + 1),
+                swept: false,
             },
         );
         let saved = ledger_path.map_or(Ok(()), |path| {
@@ -635,7 +752,128 @@ fn trip_on_second_ejection(state: &mut State, this: &Sighting, key: &str) {
             pr: this.pr,
             head: this.head.clone(),
             at: this.at.clone(),
+            unread: false,
         });
+}
+
+/// What the breaker sweep reads for one re-enqueued head.
+pub(super) struct SweepReads<'a> {
+    /// The pull request's merge-queue timeline (a queue-state answer).
+    pub(super) queue: &'a dyn Fn(u64) -> Result<Value, String>,
+    /// The classifier's reading of the removal the timeline ends with.
+    pub(super) assess: &'a dyn Fn(&PrQueueReport) -> Option<EnvironmentRequeue>,
+}
+
+/// The breaker, outside the admission path. A head this class re-enqueued
+/// that the queue ejects again has two removals, so the approval gate stops
+/// it at the ejection cap before [`consider`] ever sees it. Each pass, every
+/// re-enqueued head that is still the open pull request's head and is not
+/// queued has its timeline read: a `failed_checks` removal after the
+/// re-enqueue whose evidence reads the same signature trips the signature,
+/// and so does one whose signature cannot be read (fail closed). A removal
+/// with another signature, or for another reason, is judged and not read
+/// again. A read that fails marks the signature `breaker_unread` for this
+/// pass: nothing on it is re-enqueued until the sweep can read it. A head
+/// that moved is not followed: its new head would need a new signature.
+pub(super) fn sweep(
+    policy: &FlakePolicy,
+    observation: &super::RepoObservation,
+    ledger: &mut StewardLedger,
+    reads: &SweepReads<'_>,
+) {
+    let repo = &observation.repo;
+    let state = &mut ledger.flake_requeue;
+    let signature_prefix = format!("{}|", repo.to_ascii_lowercase());
+    state
+        .unswept
+        .retain(|key, _| !key.starts_with(&signature_prefix));
+    if policy.mode == FlakeMode::Off {
+        return;
+    }
+    let prefix = format!("{}#", repo.to_ascii_lowercase());
+    let keys = state
+        .requeued
+        .iter()
+        .filter(|(key, receipt)| key.starts_with(&prefix) && !receipt.swept)
+        .map(|(key, _)| key.clone())
+        .collect::<Vec<_>>();
+    for key in keys {
+        let Some((pr, head)) = key[prefix.len()..]
+            .split_once('@')
+            .and_then(|(pr, head)| Some((pr.parse::<u64>().ok()?, head.to_owned())))
+        else {
+            continue;
+        };
+        let Some(open) = observation
+            .prs
+            .iter()
+            .find(|open| open.fact.number == pr)
+            .filter(|open| open.fact.head_sha.eq_ignore_ascii_case(&head))
+        else {
+            continue;
+        };
+        if open.fact.queue_position.is_some() {
+            continue;
+        }
+        let receipt = state.requeued[&key].clone();
+        let signature_key = issue_key(repo, &receipt.signature);
+        if state.tripped.contains_key(&signature_key) {
+            if let Some(receipt) = state.requeued.get_mut(&key) {
+                receipt.swept = true;
+            }
+            continue;
+        }
+        let queue = match (reads.queue)(pr) {
+            Ok(queue) => queue,
+            Err(error) => {
+                state
+                    .unswept
+                    .insert(signature_key, format!("#{pr} timeline unread: {error}"));
+                continue;
+            }
+        };
+        let report = crate::pr_queue_state::explain_pr_queue_state(&queue);
+        let Some(removal) = report
+            .last_ejection
+            .clone()
+            .filter(|_| {
+                report
+                    .head_oid
+                    .as_deref()
+                    .is_some_and(|oid| oid.eq_ignore_ascii_case(&head))
+            })
+            .filter(|removal| {
+                removal
+                    .at
+                    .as_deref()
+                    .and_then(time)
+                    .zip(time(&receipt.at))
+                    .is_some_and(|(removed, requeued)| removed > requeued)
+            })
+        else {
+            continue;
+        };
+        if let Some(receipt) = state.requeued.get_mut(&key) {
+            receipt.state = ReceiptState::Done;
+            receipt.swept = true;
+        }
+        if removal.reason != "failed_checks" {
+            continue;
+        }
+        let read = (reads.assess)(&report)
+            .as_ref()
+            .and_then(evidence_signature);
+        let unread = read.is_none();
+        if read.is_none_or(|read| read.text == receipt.signature) {
+            state.tripped.entry(signature_key).or_insert_with(|| Trip {
+                signature: receipt.signature.clone(),
+                pr,
+                head: head.clone(),
+                at: removal.at.clone().unwrap_or_default(),
+                unread,
+            });
+        }
+    }
 }
 
 /// What to do with a corroborated flake ejection: `(outcome, detail)`.
@@ -656,34 +894,23 @@ fn decide(
             "a defect-fix removal names this head, so it is not re-enqueued".to_owned(),
         );
     }
-    match base_read(ejection.poison, &this.signature.checks) {
-        BaseRead::Green => {}
-        BaseRead::Red(context) => {
-            return keep(
-                "base_red",
-                format!(
-                    "the base is confirmed red on `{context}`, which is the base's failure, not \
-                     a flake; not re-enqueued"
-                ),
-            );
-        }
-        BaseRead::Unknown(why) => {
-            return keep(
-                "base_unknown",
-                format!("{why}; a flake re-enqueue needs the base read green, so it waits"),
-            );
-        }
-    }
-    if let Some(trip) = state
-        .tripped
-        .get(&issue_key(ejection.repo, &this.signature.text))
-    {
+    let signature_key = issue_key(ejection.repo, &this.signature.text);
+    if let Some(trip) = state.tripped.get(&signature_key) {
         return keep(
             "signature_tripped",
             format!(
                 "the breaker tripped ({}); this signature is not a flake and re-enqueues \
                  nothing more",
                 trip.describe()
+            ),
+        );
+    }
+    if let Some(why) = state.unswept.get(&signature_key) {
+        return keep(
+            "breaker_unread",
+            format!(
+                "an earlier flake re-enqueue on this signature could not be checked for a \
+                 second ejection this pass ({why}); not re-enqueued"
             ),
         );
     }
@@ -709,6 +936,25 @@ fn decide(
                 ejection.policy.window_hours, ejection.policy.max_requeues
             ),
         );
+    }
+    // Last, so a refusal above costs no read.
+    match base_read(ejection.poison, &this.signature.checks, ejection.tip) {
+        BaseRead::Green => {}
+        BaseRead::Red(context) => {
+            return keep(
+                "base_red",
+                format!(
+                    "the base is red on `{context}`, which is the base's failure, not a flake; \
+                     not re-enqueued"
+                ),
+            );
+        }
+        BaseRead::Unknown(why) => {
+            return keep(
+                "base_unknown",
+                format!("{why}; a flake re-enqueue needs the base read green, so it waits"),
+            );
+        }
     }
     let others = with
         .iter()
@@ -882,6 +1128,12 @@ pub(super) fn finish(
         max_requeues: policy.max_requeues,
         decisions,
         flake_root_cause: Vec::new(),
+        breaker_unread: state
+            .unswept
+            .iter()
+            .filter(|(key, _)| key.starts_with(&format!("{}|", repo.to_ascii_lowercase())))
+            .map(|(_, why)| why.clone())
+            .collect(),
     };
     if policy.mode == FlakeMode::Off {
         return status;
@@ -1238,8 +1490,8 @@ fn update_body(
     parts.join("\n\n")
 }
 
-/// A base reading that shows `checks` green: the merge groups were read
-/// clear and each check last passed there.
+/// A merge-group reading with no gaps that shows `checks` passing; the
+/// base tip is read separately ([`TipVerdict`]).
 #[cfg(test)]
 pub(super) fn green_base(checks: &[&str]) -> RepoPoison {
     RepoPoison {

@@ -20,6 +20,13 @@ const GROUP: &str = "c0ffee0000000000000000000000000000000001";
 const BASE_TIP: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const MIDI: &str = "CoreMIDI virtual port delivers SysEx";
 const GENERATED: &str = "test/ctest_script_inputs.json";
+const GROUP_2: &str = "c0ffee0000000000000000000000000000000009";
+/// The base tip's newest completed `macos` run passed.
+const TIP_GREEN: &str = r#"{"total_count":1,"check_runs":[{"id":31,"name":"macos","status":"completed","conclusion":"success"}]}"#;
+/// The base tip has no completed `macos` run.
+const TIP_EMPTY: &str = r#"{"total_count":0,"check_runs":[]}"#;
+/// The base tip's only `macos` run is still running.
+const TIP_PENDING: &str = r#"{"total_count":1,"check_runs":[{"id":32,"name":"macos","status":"in_progress","conclusion":null}]}"#;
 /// The base requires an exact-head approval from the review App.
 const CONFIG: &str = r#"printf '%s\n' '[auto_merge]' 'arm_requires_head_approval = true' 'reviewer_identities = ["shipyard-review[bot]"]' '[queue.environment_requeue]' 'enabled = true'"#;
 
@@ -78,6 +85,10 @@ struct Serve {
     /// Another queue entry (#77) that changes the generated path PR 42 also
     /// changes: the generated-path batch guard defers the enqueue.
     batch_mate: bool,
+    /// The base tip's `macos` check runs (a check-runs answer).
+    tip: String,
+    /// The head's `failed_checks` removals: `(at, merge group)`.
+    removals: Vec<(&'static str, &'static str)>,
 }
 
 impl Serve {
@@ -87,6 +98,8 @@ impl Serve {
             log: true,
             pr_view: live_pr(HEAD, false, ""),
             batch_mate: false,
+            tip: TIP_GREEN.to_owned(),
+            removals: vec![("2026-10-31T21:10:00Z", GROUP)],
         }
     }
 }
@@ -109,7 +122,7 @@ case "$*" in
   *"contents/.shipyard/config.toml"*) __CONFIG__ ;;
   *"files(first:100"*"number=42"*) printf '%s' '__FILES__' ;;
   *"files(first:100"*"number=77"*) printf '%s' '__FILES__' ;;
-  *"isInMergeQueue"*) printf '%s' '{"data":{"repository":{"pullRequest":{"number":42,"state":"OPEN","headRefOid":"__HEAD__","isInMergeQueue":false,"mergeQueueEntry":null,"autoMergeRequest":null,"timelineItems":{"pageInfo":{"hasPreviousPage":false},"nodes":[{"__typename":"PullRequestCommit","commit":{"oid":"__HEAD__"}},{"__typename":"AddedToMergeQueueEvent","createdAt":"2026-10-31T21:00:00Z"},{"__typename":"RemovedFromMergeQueueEvent","createdAt":"2026-10-31T21:10:00Z","reason":"failed_checks","beforeCommit":{"oid":"__GROUP__","parents":{"nodes":[{"oid":"__BASE_TIP__"},{"oid":"__HEAD__"}]}}}]}}}}}' ;;
+  *"isInMergeQueue"*) printf '%s' '{"data":{"repository":{"pullRequest":{"number":42,"state":"OPEN","headRefOid":"__HEAD__","isInMergeQueue":false,"mergeQueueEntry":null,"autoMergeRequest":null,"timelineItems":{"pageInfo":{"hasPreviousPage":false},"nodes":[{"__typename":"PullRequestCommit","commit":{"oid":"__HEAD__"}},__REMOVALS__]}}}}}' ;;
   *"query=query("*"mergeQueue"*)
     printf '%s' '{"data":{"repository":{"mergeQueue":{"entries":{"nodes":[__ENTRIES__],"pageInfo":{"hasNextPage":false}}}}}}' ;;
   "pr view "*) printf '%s' '__PR_VIEW__' ;;
@@ -119,8 +132,9 @@ case "$*" in
   *"repos/owner/repo/pulls/42") printf '%s' '{"base":{"ref":"main"}}' ;;
   *"rules/branches/main"*) printf '%s' '[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"macos"}]}}]' ;;
   *"protection/required_status_checks"*) echo 'HTTP 404: Not Found' >&2; exit 1 ;;
-  *"commits/__GROUP__/check-runs"*) printf '%s' '{"total_count":1,"check_runs":[{"id":7,"name":"macos","status":"completed","conclusion":"failure","app":{"slug":"github-actions"}}]}' ;;
-  *"commits/__GROUP__/status"*) printf '%s' '{"statuses":[]}' ;;
+  *"commits/main/check-runs"*) printf '%s' '__TIP__' ;;
+  *"commits/c0ffee"*"/check-runs"*) printf '%s' '{"total_count":1,"check_runs":[{"id":7,"name":"macos","status":"completed","conclusion":"failure","app":{"slug":"github-actions"}}]}' ;;
+  *"commits/c0ffee"*"/status"*) printf '%s' '{"statuses":[]}' ;;
   *"actions/jobs/7/logs"*) __JOB_LOG_ANSWER__ ;;
   *"actions/jobs/7"*) printf '%s' '{"id":7,"status":"completed","conclusion":"failure","steps":[{"name":"Test","conclusion":"failure","started_at":"2026-10-31T21:05:00Z"}]}' ;;
   *"check-runs/7/annotations"*) printf '%s' '[]' ;;
@@ -143,9 +157,22 @@ esac
     .replace("__COMMENTS__", &serve.comments)
     .replace("__PR_VIEW__", &serve.pr_view)
     .replace("__ENTRIES__", entries)
+    .replace("__TIP__", &serve.tip)
+    .replace(
+        "__REMOVALS__",
+        &serve
+            .removals
+            .iter()
+            .map(|(at, group)| {
+                format!(
+                    r#"{{"__typename":"AddedToMergeQueueEvent","createdAt":"{at}"}},{{"__typename":"RemovedFromMergeQueueEvent","createdAt":"{at}","reason":"failed_checks","beforeCommit":{{"oid":"{group}","parents":{{"nodes":[{{"oid":"{BASE_TIP}"}},{{"oid":"{HEAD}"}}]}}}}}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+    )
     .replace("__FILES__", &files_answer(&[GENERATED]))
     .replace("__HEAD__", HEAD)
-    .replace("__GROUP__", GROUP)
     .replace("__BASE_TIP__", BASE_TIP)
 }
 
@@ -503,4 +530,191 @@ fn a_defect_fix_removed_flake_head_is_never_requeued() {
         Some("defect_fix_removed:defect-fix")
     );
     assert!(ledger.flake_requeue.requeued.is_empty());
+}
+
+/// The base tip must show a completed `success`: an empty or a pending tip
+/// is not green, through the real path.
+#[cfg(unix)]
+#[test]
+fn an_empty_or_pending_base_tip_never_requeues() {
+    let green = green_base(&["macos"]);
+    for tip in [TIP_EMPTY, TIP_PENDING] {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut ledger = seeded();
+        let serve = Serve {
+            tip: tip.to_owned(),
+            ..Serve::approved()
+        };
+        let pass = pass(&temp, &mut ledger, &serve, None, Some(&green));
+        assert!(!pass.enqueued(), "{tip}: {}", pass.calls);
+        assert_eq!(pass.mutation.as_deref(), Some(REFUSED), "{:?}", pass.error);
+        assert!(ledger.flake_requeue.requeued.is_empty());
+        assert_eq!(
+            ledger
+                .flake_requeue
+                .pass
+                .last()
+                .map(|decision| decision.outcome),
+            Some("base_unknown"),
+            "{tip}"
+        );
+    }
+}
+
+/// The breaker with required approval: a re-ejected head stops at the
+/// approval gate's ejection cap, so admission never sees it. The sweep reads
+/// the second ejection on its own, trips the signature, and a corroborated
+/// head with no receipt of its own is then refused through the real path.
+#[cfg(unix)]
+#[test]
+fn the_sweep_trips_a_signature_whose_requeued_head_was_ejected_again() {
+    let temp = tempfile::tempdir().expect("temp");
+    let green = green_base(&["macos"]);
+    let mut ledger = seeded();
+    // First ejection, flake re-enqueue.
+    let first = pass(&temp, &mut ledger, &Serve::approved(), None, Some(&green));
+    assert!(first.enqueued(), "{:?}\n{}", first.mutation, first.calls);
+    // The re-enqueue happened between the two removals.
+    ledger
+        .flake_requeue
+        .requeued
+        .get_mut(&key())
+        .expect("receipt")
+        .at = "2026-10-31T21:20:00Z".to_owned();
+    // Second ejection, same test, another merge group.
+    let again = Serve {
+        removals: vec![
+            ("2026-10-31T21:10:00Z", GROUP),
+            ("2026-10-31T21:40:00Z", GROUP_2),
+        ],
+        ..Serve::approved()
+    };
+    // No admission pass here: with required approval the gate stops a head
+    // the queue removed twice at the ejection cap, before the flake class
+    // runs, so only the sweep (which runs before admissions and reads no
+    // approval) can see the second ejection.
+    // The sweep, as the pass runs it before admissions.
+    let actions = fake_gh(&temp, &script(&temp, &again));
+    let observation = observation_for(ready_pr(), true);
+    let run_gh = |argv: &[String]| actions.run_gh(argv).map_err(|error| error.to_string());
+    crate::app::merge_steward_cmd::flake_requeue::sweep(
+        &FlakePolicy {
+            mode: FlakeMode::Apply,
+            window_hours: 24,
+            max_requeues: 3,
+        },
+        &observation,
+        &mut ledger,
+        &crate::app::merge_steward_cmd::flake_requeue::SweepReads {
+            queue: &|pr| {
+                crate::app::merge_steward_cmd::native_arm::read_queue_state(
+                    &actions,
+                    "owner/repo",
+                    pr,
+                )
+            },
+            assess: &|report| {
+                crate::environment_requeue::assess_with(&run_gh, "owner/repo", report, true, None)
+            },
+        },
+    );
+    let trip = ledger
+        .flake_requeue
+        .tripped
+        .values()
+        .next()
+        .expect("the signature tripped");
+    assert_eq!(
+        (trip.pr, trip.at.as_str(), trip.unread),
+        (42, "2026-10-31T21:40:00Z", false)
+    );
+    assert!(ledger.flake_requeue.requeued[&key()].swept);
+    // Another corroborated head on the signature, with no receipt of its
+    // own, is refused.
+    ledger.flake_requeue.requeued.clear();
+    let third = pass(&temp, &mut ledger, &Serve::approved(), None, Some(&green));
+    assert!(!third.enqueued(), "{}", third.calls);
+    assert_eq!(third.mutation.as_deref(), Some(REFUSED));
+    assert_eq!(
+        ledger
+            .flake_requeue
+            .pass
+            .last()
+            .map(|decision| decision.outcome),
+        Some("signature_tripped")
+    );
+}
+
+/// The sweep fails closed: a re-ejection whose signature cannot be read
+/// trips the signature, and a timeline it cannot read holds the signature
+/// for the pass (`breaker_unread`) without tripping it.
+#[cfg(unix)]
+#[test]
+fn the_sweep_trips_on_an_unread_re_ejection_and_holds_on_an_unread_timeline() {
+    let temp = tempfile::tempdir().expect("temp");
+    let again = Serve {
+        removals: vec![
+            ("2026-10-31T21:10:00Z", GROUP),
+            ("2026-10-31T21:40:00Z", GROUP_2),
+        ],
+        ..Serve::approved()
+    };
+    let actions = fake_gh(&temp, &script(&temp, &again));
+    let observation = observation_for(ready_pr(), true);
+    let policy = FlakePolicy {
+        mode: FlakeMode::Apply,
+        window_hours: 24,
+        max_requeues: 3,
+    };
+    let receipted = || {
+        let mut ledger = StewardLedger::default();
+        ledger.flake_requeue.requeued.insert(
+            key(),
+            crate::app::merge_steward_cmd::flake_requeue::Receipt {
+                repo: "owner/repo".to_owned(),
+                signature: format!("macos: {MIDI}"),
+                ejection_at: "2026-10-31T21:10:00Z".to_owned(),
+                at: "2026-10-31T21:20:00Z".to_owned(),
+                state: ReceiptState::Done,
+                attempts: 1,
+                swept: false,
+            },
+        );
+        ledger
+    };
+    let queue = |pr| {
+        crate::app::merge_steward_cmd::native_arm::read_queue_state(&actions, "owner/repo", pr)
+    };
+    // The classifier reads nothing: tripped, marked unread.
+    let mut ledger = receipted();
+    crate::app::merge_steward_cmd::flake_requeue::sweep(
+        &policy,
+        &observation,
+        &mut ledger,
+        &crate::app::merge_steward_cmd::flake_requeue::SweepReads {
+            queue: &queue,
+            assess: &|_| None,
+        },
+    );
+    let trip = ledger
+        .flake_requeue
+        .tripped
+        .values()
+        .next()
+        .expect("tripped closed");
+    assert!(trip.unread);
+    // The timeline cannot be read: not tripped, held for the pass.
+    let mut ledger = receipted();
+    crate::app::merge_steward_cmd::flake_requeue::sweep(
+        &policy,
+        &observation,
+        &mut ledger,
+        &crate::app::merge_steward_cmd::flake_requeue::SweepReads {
+            queue: &|_| Err("HTTP 502".to_owned()),
+            assess: &|_| None,
+        },
+    );
+    assert!(ledger.flake_requeue.tripped.is_empty());
+    assert_eq!(ledger.flake_requeue.unswept.len(), 1);
+    assert!(!ledger.flake_requeue.requeued[&key()].swept);
 }
