@@ -17,6 +17,12 @@ def run(env, cmd=SHOW):
 
 
 class CiCappedRunTests(unittest.TestCase):
+    def test_experimental_authority_workflow_uses_cap(self):
+        workflow = (SCRIPT.parent.parent / ".github/workflows/ci.yml").read_text()
+        step = workflow.split("- name: Run experimental authority refusal tests", 1)[1].split("- name:", 1)[0]
+        self.assertIn("shell: bash", step)
+        self.assertIn("run: scripts/ci-capped-run.sh cargo test --all-targets --locked --features ci-test-home,experimental-authority-v5", step)
+
     def test_github_hosted_runs_unchanged(self):
         result = run({"RUNNER_ENVIRONMENT": "github-hosted"})
         self.assertEqual(result.returncode, 0, result.stderr)
