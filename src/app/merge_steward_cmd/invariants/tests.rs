@@ -9,7 +9,8 @@ use chrono::{DateTime, Utc};
 
 use super::clones::{self, CloneArgs, RemoteForm};
 use super::{
-    ADMISSION, Facts, Invariant, NEVER_RAN, PRODUCER, VERDICTS, evaluate, record, summary_token,
+    ADMISSION, Facts, Invariant, NEVER_RAN, PRODUCER, VERDICTS, attach_fix_hints, evaluate,
+    fix_hint, record, summary_hints, summary_token,
 };
 use crate::app::merge_steward_cmd::PrReport;
 use crate::app::merge_steward_cmd::blocked_on::Stall;
@@ -968,4 +969,76 @@ fn a_templated_job_name_produces_a_context_with_its_prefix() {
         fixture.workflows = Ok(vec![text.to_owned()]);
         assert!(find(&fixture.evaluate(), PRODUCER).incident(), "{text}");
     }
+}
+
+#[test]
+fn an_older_host_gets_the_fix_release_and_an_eta() {
+    let hint = fix_hint(PRODUCER, "0.432.0", now(), || Some("v0.434.0".to_owned()))
+        .expect("known invariant")
+        .0;
+    assert!(hint.contains("ships in v0.433.0"), "{hint}");
+    assert!(hint.contains("host on v0.432.0"), "{hint}");
+    assert!(hint.contains("ETA 12:30Z"), "{hint}");
+    let token = fix_hint(PRODUCER, "0.432.0", now(), || Some("v0.434.0".to_owned()))
+        .expect("known invariant")
+        .1;
+    assert_eq!(token, "fix#1382@v0.433.0,host=v0.432.0,eta=12:30Z");
+}
+
+#[test]
+fn without_a_published_fix_the_eta_is_unknown() {
+    let hint = fix_hint(PRODUCER, "0.432.0", now(), || Some("v0.432.1".to_owned()))
+        .expect("known invariant")
+        .0;
+    assert!(hint.contains("ETA unknown"), "{hint}");
+    let hint = fix_hint(PRODUCER, "0.432.0", now(), || None)
+        .expect("known invariant")
+        .0;
+    assert!(hint.contains("ETA unknown"), "{hint}");
+}
+
+#[test]
+fn a_host_at_or_past_the_fix_says_the_failure_is_real_without_a_read() {
+    for running in ["0.433.0", "0.500.1"] {
+        let hint = fix_hint(PRODUCER, running, now(), || panic!("no release read"))
+            .expect("known invariant")
+            .0;
+        assert!(hint.contains("failure is real"), "{hint}");
+    }
+}
+
+#[test]
+fn an_unknown_invariant_has_no_hint() {
+    assert_eq!(
+        fix_hint(ADMISSION, "0.1.0", now(), || panic!("no release read")),
+        None
+    );
+}
+
+#[test]
+fn hints_reach_the_summary_line() {
+    let mut failing = Invariant::fails(PRODUCER, "d", "f");
+    failing.fix_hint = Some("fix X ships in v0.433.0".to_owned());
+    let line = summary_hints(&[failing, Invariant::holds(ADMISSION, "ok")]);
+    assert_eq!(line, format!(" [{PRODUCER}: fix X ships in v0.433.0]"));
+    assert_eq!(summary_hints(&[Invariant::holds(PRODUCER, "ok")]), "");
+}
+
+#[cfg(unix)]
+#[test]
+fn the_release_is_read_once_per_pass_and_never_when_everything_passes() {
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = followup_gh(temp.path(), "[]");
+    let log = temp.path().join("gh.log");
+    let mut passing = vec![Invariant::holds(PRODUCER, "ok")];
+    attach_fix_hints(&actions, &mut passing, "0.1.0", now());
+    assert!(!log.exists(), "a passing pass reads nothing");
+    let mut failing = vec![
+        Invariant::fails(PRODUCER, "d", "f"),
+        Invariant::fails(PRODUCER, "d2", "f2"),
+    ];
+    attach_fix_hints(&actions, &mut failing, "0.1.0", now());
+    let reads = std::fs::read_to_string(&log).expect("log");
+    assert_eq!(reads.matches("releases/latest").count(), 1, "{reads}");
+    assert!(failing.iter().all(|row| row.fix_hint.is_some()));
 }

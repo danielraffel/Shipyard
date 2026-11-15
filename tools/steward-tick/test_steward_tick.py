@@ -215,6 +215,38 @@ class StewardTickArchiveTests(unittest.TestCase):
         self.run_tick()
         self.assertIn("pr_refused=#6 read_deferred=#5", self.summary_line())
 
+    def steward_prints_invariants(self, invariants):
+        import json
+        body = json.dumps({"repos": [{"repo": "acme/repo", "prs": [], "errors": [], "invariants": invariants}]})
+        (self.home / "pass.json").write_text(body)
+        stub = self.home / ".local" / "bin" / "shipyard"
+        stub.write_text(
+            "#!/bin/bash\n"
+            "if [ \"$1\" = --version ]; then echo 'shipyard 1.0'; exit 0; fi\n"
+            f"cat '{self.home / 'pass.json'}'\n"
+        )
+        stub.chmod(0o755)
+
+    def test_a_failing_invariant_with_a_fix_hint_renders_as_one_token(self):
+        self.steward_prints_invariants([
+            {"id": "required_context_producer", "ok": False, "detail": "d",
+             "fix_hint": "fix #1382 ships in v0.433.0; host on v0.432.0",
+             "fix_hint_token": "fix#1382@v0.433.0,host=v0.432.0,eta=03:40Z"},
+            {"id": "required_never_ran", "ok": False, "detail": "d"},
+            {"id": "approval_admission_config", "ok": True, "detail": "d"},
+        ])
+        self.run_tick()
+        self.assertIn(
+            " invariants=FAIL:required_context_producer(fix#1382@v0.433.0,host=v0.432.0,eta=03:40Z),required_never_ran red_everywhere=",
+            self.summary_line(),
+        )
+
+    def test_a_spaced_hint_token_is_compacted(self):
+        self.steward_prints_invariants([
+            {"id": "required_context_producer", "ok": False, "detail": "d", "fix_hint_token": "a b;c"}])
+        self.run_tick()
+        self.assertIn(" invariants=FAIL:required_context_producer(a_b_c) ", self.summary_line())
+
     def test_clean_pass_reports_zero_for_both(self):
         self.steward_prints([{"number": 1, "mutation": "enqueued"}], rc=0)
         self.run_tick()

@@ -167,7 +167,7 @@ steward_one() {
     if [ "$rc" = 1 ] && [[ "$counts" == *"errors=0 pr_refused=0 read_deferred="* ]] && [[ "$counts" != *"read_deferred=0" ]]; then rc=0; fi
     # ok, FAIL:<id>,<id>, or off when the pass reported none (an older binary,
     # --no-invariants, or a repository it could not observe).
-    invariants=$(jq -r '[.repos[]? | select(has("invariants"))] as $r | if ($r|length)==0 then "off" else ([$r[].invariants[] | select(.ok==false and (.skipped|not)) | .id] | if length==0 then "ok" else "FAIL:"+join(",") end) end' "$out" 2>/dev/null || echo ERROR)
+    invariants=$(jq -r '[.repos[]? | select(has("invariants"))] as $r | if ($r|length)==0 then "off" else ([$r[].invariants[] | select(.ok==false and (.skipped|not)) | .id + (if (.fix_hint_token // "") != "" then "(" + (.fix_hint_token | gsub("[ ;]+";"_")) + ")" else "" end)] | if length==0 then "ok" else "FAIL:"+join(",") end) end' "$out" 2>/dev/null || echo ERROR)
     oldest=$(jq -r '[.repos[]?.blocked_summary?.oldest[]?|"#\(.number):\(.blocked_on):\(.age_minutes)m"]|join(",")' "$out" 2>/dev/null || true)
     # Base-level episodes: one required check failing the same test on 3+ open PRs.
     red_everywhere=$(jq -r '[.repos[]?.red_everywhere?.groups[]?]|length' "$out" 2>/dev/null || echo ERROR)
