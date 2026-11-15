@@ -5,7 +5,7 @@ Used by loss_report.py. Standard library only. Reads GitHub through `ghread api`
 keeping on disk, and stops at a per-run read cap (`truncated`). Anything it
 cannot read is "unknown" or null, never a zero.
 
-Definitions (also in docs/rollups.md, "End-to-end metrics"):
+Definitions (also in docs/metrics.md):
   autonomous merge rate  PRs merged that day with no owner action from opening to merge,
                          over PRs where that is determinable; the rest count as unknown.
   handoff-to-merge time  median and p90 minutes from the first ready-for-review moment

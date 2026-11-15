@@ -298,5 +298,15 @@ python3 -I tools/metrics/loss_report.py --log-dir DIR [--since 7d] [--github CAC
 | Agent-free resolution, strict | The same, and the next token is a normal wait (the system moved it along). |
 | Owner stops per 100 PRs | PRs with a `human_stop` episode over PRs seen, excluding closed-unmerged ones when known. Stops raised, not answered. |
 | Fix push | An episode of a token that ended with a new head. |
+| `review_verdict_same_head_no_push` | Actionable `required_failed` episodes naming `review-verdict` that cleared on the same head with no push. |
+| `capacity_queued`, superseded | Episodes with that token; superseded counts the `excluded_label:superseded` label and, apart, rows carrying the steward's `superseded` detection. |
+| `red_everywhere` | Episodes whose token, detail or decision names it. `unavailable` when it never appears in the window, since silence cannot tell "none occurred" from "not emitted". |
+| Per-day series | Counted on the UTC day an episode was first seen. A day with no tick files is `null`, never `0`. |
+
+Coverage is `available`, `partial` or `unavailable` for the window (days with
+ticks, gaps, unreadable files), GitHub reads, agent work, CI compute and owner
+stops answered. CI compute per episode and owner stops answered are always
+`unavailable` today: tick JSON does not carry them. Elapsed time appears only as
+context in the JSON; no number in the summary is a duration.
 
 The four end-to-end per-merged-PR metrics (autonomous merge rate, handoff-to-merge time, compute, correctness) are defined in [metrics.md](metrics.md).
