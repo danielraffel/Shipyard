@@ -521,13 +521,22 @@ def surface_trailer_override(
     trailers: dict[str, list[str]],
     trailer_key: str,
     surface_name: str,
+    honor_skip: bool = True,
 ) -> str | None:
-    """Parse `Version-Bump: <surface>=<level> reason="..."` from trailers."""
+    """Parse `Version-Bump: <surface>=<level> reason="..."` from trailers.
+
+    With `honor_skip` False (version-at-land), `skip` and `none` are not overrides: no
+    pull request gate asks for a bump, so the trailer decided nothing, and
+    honouring it suppressed the release (Shipyard #1393 waited 11.5 h). At land
+    only `Release: skip` opts a change out.
+    """
     for v in trailers.get(trailer_key.lower(), []):
         m = re.search(rf"{re.escape(surface_name)}\s*=\s*([A-Za-z]+)", v)
         if not m:
             continue
         level = m.group(1).lower()
+        if level in ("skip", "none") and not honor_skip:
+            continue
         if level in LEVELS or level == "skip":
             return level
     return None
@@ -606,13 +615,15 @@ def assess_surfaces(
     base: str,
     head: str,
     repo: Path,
+    honor_skip: bool = True,
 ) -> list[Verdict]:
     trailers = git_range_trailers(base, head)
     verdicts: list[Verdict] = []
     for s in cfg.surfaces:
         heur = heuristic_for_surface(s, changed, base, head)
 
-        override = surface_trailer_override(trailers, cfg.trailer_version_bump, s.name)
+        override = surface_trailer_override(trailers, cfg.trailer_version_bump, s.name,
+                                           honor_skip)
         final = heur
         skip_requested = (override == "skip")
         explicit_level = override in LEVELS

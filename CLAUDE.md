@@ -148,6 +148,8 @@ rather than stacking them.
 
 ### Bypass trailers (tip commit, never PR body)
 
+A PR needs no `Version-Bump:` trailer. At land, version-at-land takes versions from the change and ignores `Version-Bump: <surface>=skip` (it suppressed the release for #1393); only `Release: skip reason="..."` opts a change out.
+
 | Gate          | Trailer                                                      |
 |---------------|--------------------------------------------------------------|
 | Version bump  | `Version-Bump: <surface>=<patch\|minor\|major\|skip> reason="..."` |

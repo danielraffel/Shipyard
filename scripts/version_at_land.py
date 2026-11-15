@@ -3,8 +3,10 @@
 
 The PR gate deliberately owns no version counter. This command is the single
 writer that runs on ``main`` after a merge, computes the same semver level as
-the gate, updates every file in the surface, and commits a marker that makes
-the operation idempotent.
+the gate (except that ``Version-Bump`` overrides of ``skip`` and ``none`` are
+ignored at land; only ``Release: skip reason="..."`` opts a change out),
+updates every file in the surface, and commits a marker that makes the
+operation idempotent.
 
 Main's ruleset requires checks that only a pull request can carry, so the
 writer never pushes to main. With ``--pr-branch`` it rebuilds one bot-owned
@@ -21,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -31,6 +34,7 @@ from version_bump_check import (
     assess_surfaces,
     bump_version,
     git_diff_names,
+    git_range_trailers,
     load_config,
     max_level,
     read_version,
@@ -105,14 +109,28 @@ def drain_base(repo: Path, head: str, fallback: str | None) -> str:
     return git(repo, "rev-parse", f"{head}^1").stdout.strip()
 
 
+def release_skipped(parent: str, commit: str) -> bool:
+    """Whether the change opts out of a release with `Release: skip`.
+
+    `Version-Bump: <surface>=skip` no longer does at land: no pull request gate
+    asks for a bump, so agents wrote it by habit and it suppressed releases.
+    """
+    for value in git_range_trailers(parent, commit).get("release", []):
+        match = re.fullmatch(r'\s*skip\s+reason="([^"\n]*)"\s*', value, re.IGNORECASE)
+        if match and match.group(1).strip():
+            return True
+    return False
+
+
 def plan(repo: Path, config: Config, base: str, head: str) -> list[Assignment]:
     """Assess every change that landed on main since `base` on its own, then
     take the highest level per surface.
 
-    A `Version-Bump: <surface>=skip` trailer covers only the change that
-    carries it. Judging `base..head` as one range let a single skipped change
-    suppress every later release until the next marker, so nothing ever
-    released again.
+    `Version-Bump: <surface>=skip` and `=none` are ignored at land. Only a
+    `Release: skip reason="..."` trailer opts a change out, and it covers only
+    the change that carries it. Judging `base..head` as one range let a single
+    skipped change suppress every later release until the next marker, so
+    nothing ever released again.
     """
     levels: dict[str, str] = {}
     landed = git(repo, "rev-list", "--first-parent", "--reverse",
@@ -121,8 +139,11 @@ def plan(repo: Path, config: Config, base: str, head: str) -> list[Assignment]:
         if is_bump_landing(repo, commit):
             continue
         parent = git(repo, "rev-parse", f"{commit}^1").stdout.strip()
+        if release_skipped(parent, commit):
+            continue
         changed = git_diff_names(parent, commit)
-        for verdict in assess_surfaces(config, changed, parent, commit, repo):
+        for verdict in assess_surfaces(config, changed, parent, commit, repo,
+                                       honor_skip=False):
             name = verdict.surface.name
             levels[name] = max_level(levels.get(name, "none"), verdict.final_level)
     assignments: list[Assignment] = []
