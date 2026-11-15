@@ -215,17 +215,6 @@ struct RepoReport {
     stale_pr_run_wedge: StalePrRunWedgeRepoStatus,
     native_auto_merge_backstop: native_arm::NativeArmRepoStatus,
     errors: Vec<String>,
-    /// Members of rollups that landed lately (merge queue included), closed
-    /// or left open ([`crate::rollup::reconcile`]). Absent unless the base
-    /// takes rollups.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    rollup_reconciliation: Vec<String>,
-    /// The rollup a backed-up base without a merge queue would form this
-    /// pass ([`rollup_pass`]). Present on every observed repository, with
-    /// `not_applicable` or `off` when the planner does not run there; absent
-    /// only when the repository was not observed.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    rollup: Option<rollup_pass::Report>,
     /// Uncertain merge-queue admissions this pass settled from GitHub, or
     /// left uncertain with the reason ([`mutation_outcome::reconcile`]).
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -1588,88 +1577,8 @@ fn repo_pass_actions(
     (scoped, pass)
 }
 
-/// Close the members of rollups that landed on `base` lately, however they
-/// landed ([`crate::rollup::reconcile_if_enabled`]); nothing on a base that
-/// does not take rollups.
-fn reconcile_rollups(actions: &GitHubActions, repo: &str, base: &str, report: &mut RepoReport) {
-    let run_gh = |gh_args: &[String]| actions.run_gh(gh_args).map_err(|error| error.to_string());
-    match crate::rollup::reconcile_if_enabled(&run_gh, repo, base, chrono::Utc::now()) {
-        Ok(lines) => report.rollup_reconciliation = lines,
-        Err(error) => report
-            .errors
-            .push(format!("rollup reconciliation: {error}")),
-    }
-}
-
-/// The rollup a backed-up base without a merge queue would form this pass
-/// ([`rollup_pass`]), stamped under the steward's state directory.
-fn plan_rollup(
-    actions: &GitHubActions,
-    args: &StewardCommandArgs,
-    observation: &RepoObservation,
-    ledger_path: &Path,
-    merge_path: &str,
-    prs: &[PrReport],
-) -> rollup_pass::Report {
-    let run_gh = |gh_args: &[String]| actions.run_gh(gh_args).map_err(|error| error.to_string());
-    let cache = ledger_path
-        .parent()
-        .map(|state| state.join(rollup_pass::CACHE_DIR));
-    let expired = || pass_budget::deadline_passed(args.pass_deadline);
-    rollup_pass::run(
-        &run_gh,
-        observation,
-        merge_path,
-        prs,
-        &rollup_pass::Throttle {
-            dir: cache.as_deref(),
-            write: args.apply,
-            now: Utc::now(),
-            expired: &expired,
-        },
-    )
-}
-
-/// Capture rollup inputs before an applying pass mutates any ready PR.
-fn pre_mutation_rollup(
-    actions: &GitHubActions,
-    args: &StewardCommandArgs,
-    observation: &RepoObservation,
-    ledger: &StewardLedger,
-    ledger_path: &Path,
-) -> Option<rollup_pass::Report> {
-    if !args.apply || pass_budget::deadline_passed(args.pass_deadline) {
-        return None;
-    }
-    let policy = pass_policy(actions, args, observation);
-    let prs = observation
-        .prs
-        .iter()
-        .map(|pr| PrReport {
-            number: pr.fact.number,
-            head_sha: pr.fact.head_sha.clone(),
-            decision: classify_pr(
-                &pr.fact,
-                &policy,
-                &attempts_for(ledger, &observation.repo, &pr.fact),
-            ),
-            mutation: None,
-            error: None,
-            blocked: blocked_on::Stall::default(),
-        })
-        .collect::<Vec<_>>();
-    Some(plan_rollup(
-        actions,
-        args,
-        observation,
-        ledger_path,
-        policy.merge_path(),
-        &prs,
-    ))
-}
-
-/// One repository of a steward pass: observe it, apply its plan, settle its
-/// rollups. Its own time budget starts here, so an earlier repository never
+/// One repository of a steward pass: observe it and apply its plan. Its own
+/// time budget starts here, so an earlier repository never
 /// spends a later one's. Returns the report and whether the repository is
 /// unhealthy.
 #[allow(clippy::too_many_arguments)]
@@ -1824,12 +1733,6 @@ fn steward_repo_observed(
             // A successful repository-wide probe proves this credential/repo
             // scope is usable again; clear its stale receipt before planning.
             ledger.rate_limit_cooldowns.remove(&cooldown_key);
-            // Rollup planning reads each candidate's live approval and compare
-            // files. Capture those inputs before apply_repo_plan can merge or
-            // enqueue any of the ready pull requests; after mutation, the
-            // base and PR state no longer describe this batch.
-            let snapshot_rollup =
-                pre_mutation_rollup(actions, args, &observation, ledger, ledger_path);
             let (mut report, failed, planned_preemptions) = apply_repo_plan(
                 actions,
                 args,
@@ -1845,27 +1748,6 @@ fn steward_repo_observed(
             }
             if let Some(cancellations) = recovery_cancellations.remove(&observation.repo) {
                 report.cancellations.extend(cancellations);
-            }
-            report.rollup = Some(match snapshot_rollup {
-                Some(snapshot) => snapshot,
-                None if pass_budget::deadline_passed(args.pass_deadline) => {
-                    rollup_pass::budget_spent(&observation, &report.prs)
-                }
-                None => plan_rollup(
-                    actions,
-                    args,
-                    &observation,
-                    ledger_path,
-                    &report.merge_path,
-                    &report.prs,
-                ),
-            });
-            if args.apply && pass_budget::deadline_passed(args.pass_deadline) {
-                report
-                    .rollup_reconciliation
-                    .push("deferred: the pass time budget is spent".to_owned());
-            } else if args.apply {
-                reconcile_rollups(actions, &observation.repo, &args.base, &mut report);
             }
             *remaining_preemptions = remaining_preemptions.saturating_sub(planned_preemptions);
             if let Some(settings) = args.invariants.as_ref() {
@@ -1967,8 +1849,6 @@ fn deferred_rate_limit_repo_report(
     RepoReport {
         base_poison: None,
         merge_group_stalled: None,
-        rollup_reconciliation: Vec::new(),
-        rollup: None,
         uncertain_mutations: Vec::new(),
         repo: repo.to_owned(),
         base: base.to_owned(),
@@ -2002,8 +1882,6 @@ fn unreadable_repo_report(
     RepoReport {
         base_poison: None,
         merge_group_stalled: None,
-        rollup_reconciliation: Vec::new(),
-        rollup: None,
         uncertain_mutations: Vec::new(),
         api_calls: None,
         repo: repo.to_owned(),
@@ -2087,8 +1965,6 @@ fn append_unmatched_recovery_errors(
         reports.push(RepoReport {
             base_poison: None,
             merge_group_stalled: None,
-            rollup_reconciliation: Vec::new(),
-            rollup: None,
             uncertain_mutations: Vec::new(),
             api_calls: None,
             repo: repo.clone(),
@@ -2132,8 +2008,6 @@ fn persist_final_ledger(
         reports.push(RepoReport {
             base_poison: None,
             merge_group_stalled: None,
-            rollup_reconciliation: Vec::new(),
-            rollup: None,
             uncertain_mutations: Vec::new(),
             api_calls: None,
             repo: "steward".to_owned(),
@@ -2342,7 +2216,6 @@ mod red_base_ejections;
 mod red_everywhere;
 mod render;
 mod resume_record;
-mod rollup_pass;
 mod scheduling_loop;
 mod shadow_ledger;
 mod stale_merge_ref;
@@ -2358,7 +2231,7 @@ pub(super) use observation::{parse_rest_check, parse_rest_status};
 pub(super) use render::{is_admin_protection_denied, is_private_free_entitlement};
 
 use cancellation::{
-    apply_repo_plan, cancellation_reason_label, pass_policy, queue_front_head, timestamp_old_enough,
+    apply_repo_plan, cancellation_reason_label, queue_front_head, timestamp_old_enough,
 };
 use cancellation_recovery::resume_pending_cancellations;
 use cancellation_revalidation::pull_request;
