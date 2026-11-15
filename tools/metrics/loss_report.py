@@ -16,6 +16,8 @@ docs/rollups.md ("Daily loss report"). Coverage is `available`, `partial` or
   loss_report.py --log-dir DIR [--since 7d] [--json-out F] [--md-out F]
                  [--github CACHE_DIR] [--now ISO]
   loss_report.py --daily --log-dir DIR     # once per UTC day, never fails
+  --e2e-cache DIR [--read-cap N] [--owner LOGIN] [--repos A/B,C/D] [--baseline FROM:TO|none]
+      adds the four end-to-end per-merged-PR metrics (tools/metrics/pr_metrics.py); only this flag makes GitHub reads
 """
 from __future__ import annotations
 
@@ -43,6 +45,15 @@ SYSTEM_WAIT = {
     "capacity_queued", "required_pending",
 }
 OWNER_STOP = {"excluded_label", "direct_merge_refused", "owner_decision"}
+
+
+def _pr_metrics():
+    """The sibling module. `python3 -I` leaves the script's own directory off sys.path, so add it."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    import pr_metrics
+    return pr_metrics
 
 
 def parse_stamp(s):
@@ -130,7 +141,9 @@ def load_ticks(log_dir, start, end):
           "ticks_per_day": collections.Counter(), "rollup_plans": collections.defaultdict(list),
           "rollup_seen": False, "rollup_actions": collections.defaultdict(collections.Counter),
           "rollup_left_out": collections.defaultdict(collections.Counter),
-          "rollup_off_why": collections.defaultdict(collections.Counter)}
+          "rollup_off_why": collections.defaultdict(collections.Counter),
+          "poison_began": collections.defaultdict(set), "required": {}, "bases": {},
+          "dirty": collections.defaultdict(set), "refused": collections.defaultdict(set)}
     for base, t, (kind, payload) in tick_sources(log_dir, start):
         if kind == "bad_archive":
             st["bad_archives"] += 1
@@ -150,6 +163,15 @@ def load_ticks(log_dir, start, end):
         st["live_files" if kind == "live" else "archive_files"] += 1
         st["ticks_per_day"][t.strftime("%Y-%m-%d")] += 1
         for r in repos:
+            bp = r.get("base_poison")
+            if isinstance(bp, dict) and isinstance(bp.get("red_everywhere"), dict):
+                for began in bp["red_everywhere"].values():
+                    if parse_iso(began):
+                        st["poison_began"][r["repo"]].add(parse_iso(began))
+            if r.get("base"):
+                st["bases"][r["repo"]] = r["base"]
+            if r.get("required_contexts"):
+                st["required"][r["repo"]] = r["required_contexts"]  # ticks load oldest first: the latest wins
             plan = r.get("rollup")
             if not isinstance(plan, dict):
                 st["rollup_actions"][r["repo"]]["not_reported"] += 1
@@ -171,6 +193,11 @@ def load_ticks(log_dir, start, end):
                 continue
             rows = {}
             for p in r["prs"]:
+                tok = str(p.get("blocked_on") or "")
+                if "dirty" in tok.lower():
+                    st["dirty"][r["repo"]].add(p["number"])
+                if tok.startswith("direct_merge_refused") or tok.startswith("excluded_label:direct_merge"):
+                    st["refused"][r["repo"]].add(p["number"])
                 na = p.get("next_action") or {}
                 rows[p["number"]] = {
                     "head": p.get("head_sha"), "token": p.get("blocked_on") or "unknown",
@@ -398,7 +425,8 @@ def cov(status, reason):
     return {"status": status, "reason": reason}
 
 
-def build_report(log_dir, since, now, github=None, gap_minutes=120):
+def build_report(log_dir, since, now, github=None, gap_minutes=120, e2e=None):
+    """`e2e`: None, or a dict for pr_metrics.build: cache_dir, cap, owner, baseline, repos (optional), fetch (tests)."""
     start = now - since
     per_repo, st = load_ticks(log_dir, start, now)
     eps, gaps = build_episodes(per_repo, dt.timedelta(minutes=gap_minutes))
@@ -533,6 +561,15 @@ def build_report(log_dir, since, now, github=None, gap_minutes=120):
     }
     pc_cov, pc_pages, pc_sup = page_counts(log_dir, days)
     report["pages"] = {"coverage": pc_cov, "per_day_by_class": pc_pages, "suppressed_per_day_by_reason": pc_sup}
+    if e2e:
+        pr_metrics = _pr_metrics()
+        repos = e2e.get("repos") or sorted(per_repo)
+        report["end_to_end"] = pr_metrics.build(
+            repos, e2e["cache_dir"], e2e.get("cap", 100), e2e.get("owner", "danielraffel"), start, now,
+            {k: sorted(v) for k, v in st["poison_began"].items()}, st["required"], e2e.get("baseline"), e2e.get("fetch"), st["bases"],
+            st["dirty"], e2e.get("controls"), st["refused"])
+    else:
+        report["end_to_end"] = None
     return report
 
 
@@ -584,6 +621,10 @@ def markdown(r):
             for day, n in rc["per_repo_per_day"].get(repo, {}).items():
                 out.append(f"  - {day}: would have batched {n['prs']} PRs into {n['rollups']} rollups, "
                            f"saving ~{n['ci_runs_saved']} CI runs")
+    if r.get("end_to_end"):
+        out.append(_pr_metrics().markdown(r["end_to_end"]))
+    else:
+        out += ["", "## End-to-end per merged PR", "", "unavailable: no --e2e-cache, so no GitHub reads were made"]
     out += ["", "Unavailable: CI compute per episode, owner stops answered, dispute outcomes. Elapsed time is context only."]
     return "\n".join(out) + "\n"
 
@@ -599,7 +640,7 @@ def summary_line(r, stamp):
 
 
 # ------------------------------------------------------------------- daily
-def daily(log_dir, now=None, since=dt.timedelta(days=7), github=None):
+def daily(log_dir, now=None, since=dt.timedelta(days=7), github=None, e2e=None):
     """Once per UTC day. Never raises: any failure is one `loss-report ERROR` line."""
     now = now or dt.datetime.now(UTC)
     stamp = now.strftime("%Y%m%dT%H%M%SZ")
@@ -638,7 +679,7 @@ def daily(log_dir, now=None, since=dt.timedelta(days=7), github=None):
         # Marked at start: a report that fails is logged once and retried tomorrow, not every tick.
         with open(marker, "w") as fh:
             fh.write(day + "\n")
-        rep = build_report(log_dir, since, now, github)
+        rep = build_report(log_dir, since, now, github, e2e=e2e)
         jp, mp = (os.path.join(log_dir, f"loss-report-{day}.{x}") for x in ("json", "md"))
         for path, text in ((jp, json.dumps(rep, indent=1)), (mp, markdown(rep))):
             tmp = path + ".tmp"
@@ -663,18 +704,31 @@ def main(argv=None):
     ap.add_argument("--since", default="7d")
     ap.add_argument("--now", help="ISO time, for tests and replays")
     ap.add_argument("--github", help="directory of cached GitHub REST answers (never fetches)")
+    ap.add_argument("--e2e-cache", help="directory for the per-PR metrics cache; setting it turns on the GitHub reads for the end-to-end metrics")
+    ap.add_argument("--read-cap", type=int, default=100, help="most GitHub reads per run, shared across repos (default 100)")
+    ap.add_argument("--owner", default="danielraffel", help="the owner's personal GitHub login")
+    ap.add_argument("--repos", help="comma-separated owner/repo list for the end-to-end metrics (default: repos in the ticks)")
+    ap.add_argument("--baseline", default="2026-11-12:2026-11-14", help="FROM:TO UTC days for the Baseline section, or 'none'")
     ap.add_argument("--json-out")
     ap.add_argument("--md-out")
     ap.add_argument("--daily", action="store_true", help="once per UTC day; writes loss-report-YYYYMMDD.{json,md} and a summary.log line; always exits 0")
     a = ap.parse_args(argv)
     now = parse_iso(a.now) if a.now else dt.datetime.now(UTC)
+    e2e = None
+    if a.e2e_cache:
+        base = None
+        if a.baseline != "none":
+            b0, b1 = (dt.datetime.strptime(x, "%Y-%m-%d").replace(tzinfo=UTC) for x in a.baseline.split(":"))
+            base = (b0, b1)
+        e2e = {"cache_dir": a.e2e_cache, "cap": a.read_cap, "owner": a.owner, "baseline": base,
+               "repos": [x for x in (a.repos or "").split(",") if x] or None}
     if a.daily:
         try:
             since = parse_duration(a.since)
         except ValueError:
             since = dt.timedelta(days=7)
-        return daily(a.log_dir, now, since, a.github)
-    rep = build_report(a.log_dir, parse_duration(a.since), now, a.github)
+        return daily(a.log_dir, now, since, a.github, e2e)
+    rep = build_report(a.log_dir, parse_duration(a.since), now, a.github, e2e=e2e)
     if a.json_out:
         with open(a.json_out, "w") as fh:
             json.dump(rep, fh, indent=1)

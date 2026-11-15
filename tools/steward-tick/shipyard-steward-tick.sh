@@ -334,6 +334,11 @@ fi
 # at origin/main, detached the same way as fleet-deploy so the tick never waits
 # on it. SHIPYARD_LOSS_REPORT=off turns it off.
 loss_report="${SHIPYARD_LOSS_REPORT_SCRIPT:-$clones/deploy/Shipyard/tools/metrics/loss_report.py}"
+# SHIPYARD_PR_METRICS=off drops the end-to-end per-PR metrics (their GitHub reads, capped per run).
+pr_metrics_args=()
+if [ "${SHIPYARD_PR_METRICS:-on}" != "off" ]; then
+  pr_metrics_args=(--e2e-cache "$log_dir/pr-metrics-cache")
+fi
 if [ "${SHIPYARD_LOSS_REPORT:-on}" != "off" ] && [ -f "$loss_report" ]; then
   /usr/bin/python3 -c '
 import os, sys
@@ -345,8 +350,8 @@ if os.fork():
 fd = os.open(os.devnull, os.O_RDWR)
 for n in (0, 1, 2):
     os.dup2(fd, n)
-os.execv("/usr/bin/python3", ["python3", "-I", sys.argv[1], "--daily", "--log-dir", sys.argv[2]])
-' "$loss_report" "$log_dir" || true
+os.execv("/usr/bin/python3", ["python3", "-I", sys.argv[1], "--daily", "--log-dir", sys.argv[2]] + sys.argv[3:])
+' "$loss_report" "$log_dir" ${pr_metrics_args[@]+"${pr_metrics_args[@]}"} || true
 fi
 
 # Release-readiness canary (`[release.canary]` in a repo's .shipyard/config.toml):
