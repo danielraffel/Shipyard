@@ -39,6 +39,8 @@ pub(crate) enum Actor {
     Repair,
     /// Nobody: the pull request is terminal.
     Nobody,
+    /// The release automation lands it; the caller does nothing.
+    Automation,
 }
 
 /// What to do next, and who does it.
@@ -267,6 +269,10 @@ fn callers_move(kind: &str, facts: &Facts<'_>, stall: &Stall) -> Option<NextActi
         "provenance_blocked" => NextAction::stop(
             Actor::Owner,
             format!("Labelled {arg}: provenance unresolved; the owner clears it. Stop and report."),
+        ),
+        "unmanaged" if *arg == "automation" => NextAction::new(
+            Actor::Automation,
+            "Nothing to do: the release automation lands it.".to_owned(),
         ),
         "unmanaged" => NextAction::new(
             Actor::Author,
