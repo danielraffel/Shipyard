@@ -9,11 +9,13 @@
 //! (default `["release/*"]`), or when a repository ruleset that names it
 //! (not one that covers every branch) protects it as a landing target.
 //!
-//! The steward admits only the default branch. A release base therefore has
-//! a review path only when its rules require the approval context
-//! (`review-verdict`) and `[merge_steward] reviewed_release_bases` says the
-//! standing reviewer covers it; that list is empty by default, because the
-//! standing reviewer schedules only default-branch pull requests today.
+//! The steward admits only the default branch. A release base has a review
+//! path when its rules require a review context (`review-verdict` or
+//! `release-path-review`): the standing reviewer reviews any base whose rules
+//! require one (fleet-handbook PR 140), derived from the rulesets with no
+//! config, and this reads the same rules so the two cannot disagree.
+//! Otherwise, or when the rules cannot be read, the owner or coordinator
+//! lands it.
 
 use serde_json::Value;
 
@@ -21,19 +23,16 @@ use crate::config::LoadedConfig;
 
 /// `[merge_steward] release_bases`: the release-base patterns.
 pub const RELEASE_BASES_KEY: &str = "merge_steward.release_bases";
-/// `[merge_steward] reviewed_release_bases`: the release bases the standing
-/// reviewer covers.
-pub const REVIEWED_RELEASE_BASES_KEY: &str = "merge_steward.reviewed_release_bases";
+/// Required contexts that put a base on the standing reviewer's path.
+pub const REVIEW_PATH_CONTEXTS: [&str; 2] = ["review-verdict", "release-path-review"];
 /// Release-base patterns when the key is absent.
 pub const DEFAULT_RELEASE_BASES: [&str; 1] = ["release/*"];
 
-/// Which bases are release bases, and which of those the reviewer covers.
+/// Which bases are release bases.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReleaseBasePolicy {
     /// Patterns (`*` within one path segment, `**` across segments).
     pub patterns: Vec<String>,
-    /// Patterns of release bases the standing reviewer covers.
-    pub reviewed: Vec<String>,
 }
 
 impl Default for ReleaseBasePolicy {
@@ -43,7 +42,6 @@ impl Default for ReleaseBasePolicy {
                 .iter()
                 .map(|pattern| (*pattern).to_owned())
                 .collect(),
-            reviewed: Vec::new(),
         }
     }
 }
@@ -59,9 +57,6 @@ impl ReleaseBasePolicy {
         let mut policy = Self::default();
         if let Some(value) = config.get(RELEASE_BASES_KEY) {
             policy.patterns = string_list(RELEASE_BASES_KEY, value)?;
-        }
-        if let Some(value) = config.get(REVIEWED_RELEASE_BASES_KEY) {
-            policy.reviewed = string_list(REVIEWED_RELEASE_BASES_KEY, value)?;
         }
         Ok(policy)
     }
@@ -85,14 +80,15 @@ impl ReleaseBasePolicy {
             .find(|pattern| crate::head_approval::glob_match(pattern, base))
             .map(String::as_str)
     }
+}
 
-    /// Whether the standing reviewer covers `base`.
-    #[must_use]
-    pub fn reviewer_covers(&self, base: &str) -> bool {
-        self.reviewed
-            .iter()
-            .any(|pattern| crate::head_approval::glob_match(pattern, base))
-    }
+/// Whether `required` (the base's required contexts, from its rules) puts
+/// the base on the standing reviewer's path.
+#[must_use]
+pub fn requires_review<'a>(required: impl IntoIterator<Item = &'a str>) -> bool {
+    required
+        .into_iter()
+        .any(|context| REVIEW_PATH_CONTEXTS.contains(&context.trim()))
 }
 
 fn string_list(key: &str, value: &toml::Value) -> Result<Vec<String>, String> {
@@ -192,7 +188,9 @@ mod tests {
         );
         assert_eq!(policy.matching_pattern("feat/parent"), None);
         assert_eq!(policy.matching_pattern("release/v1/hotfix"), None);
-        assert!(!policy.reviewer_covers("release/v1.0.10"));
+        assert!(requires_review(["macos", "release-path-review"]));
+        assert!(requires_review(["review-verdict"]));
+        assert!(!requires_review(["macos", "post-review-verdict"]));
     }
 
     #[test]
@@ -200,13 +198,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp");
         std::fs::write(
             dir.path().join("config.toml"),
-            "[merge_steward]\nrelease_bases = [\"rel-*\"]\nreviewed_release_bases = [\"rel-*\"]\n",
+            "[merge_steward]\nrelease_bases = [\"rel-*\"]\n",
         )
         .expect("config");
         let policy = ReleaseBasePolicy::from_machine_global(dir.path()).expect("policy");
         assert_eq!(policy.matching_pattern("rel-2"), Some("rel-*"));
         assert_eq!(policy.matching_pattern("release/v1"), None);
-        assert!(policy.reviewer_covers("rel-2"));
 
         std::fs::write(
             dir.path().join("config.toml"),

@@ -37,10 +37,11 @@ See `docs/automated-draining.md`.
 A pull request on a release base (`[merge_steward] release_bases`, default
 `["release/*"]`, or a base a ruleset that names it protects) reads
 `blocked_on: release_base:<base>`, never `stacked_on`, and is never told to
-retarget to the default branch. With no standing review path (the default:
-`[merge_steward] reviewed_release_bases` is empty) the next action is `owner`,
-`stop: true`: the coordinator or owner lands the release branch. A covered
-release base whose rules require `review-verdict` is a reviewer wait.
+retarget to the default branch. When its rules require `review-verdict` or
+`release-path-review` it is a reviewer wait (the standing reviewer derives its
+coverage from the same rules). Otherwise, or when the rules cannot be read,
+the next action is `owner`, `stop: true`: the coordinator or owner lands the
+release branch.
 `shipyard pr --base release/...` prints this before opening and proceeds
 without `--stacked-on`.
 

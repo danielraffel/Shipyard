@@ -452,13 +452,14 @@ A base other than the default is a release base, read
 (default `["release/*"]`) or when a ruleset that names it (not a `~ALL`
 ruleset) protects it with a pull-request or required-checks rule. A release
 refresh is not a stack and is never told to retarget to the default branch.
-The steward admits only the default branch, so a release base has a review
-path only when its rules require `review-verdict` and `[merge_steward]
-reviewed_release_bases` (empty by default) says the standing reviewer covers
-it; then the reviewer acts. Otherwise the answer is `owner` with `stop: true`:
-the coordinator or owner runs the release-branch landing. A pattern costs no
-read; only a base no pattern names and no open pull request heads has its
-rules read, and an unreadable ruleset is an error, never the retarget advice.
+Its rules decide the rest, the same way the standing reviewer decides what
+it reviews (fleet-handbook PR 140), with no config: when they require
+`review-verdict` or `release-path-review` the reviewer acts and the caller
+waits. Otherwise, or when the rules cannot be read, the answer is `owner`
+with `stop: true`: the coordinator or owner runs the release-branch landing.
+A base no pattern names has its rules read only when no open pull request
+heads it; if they cannot be read the answer is an error, never the retarget
+advice.
 Anything else on a non-default base reads `stacked_on:<base>`.
 `shipyard pr` prints the same classification before it opens a pull request
 on a base `release_bases` names.

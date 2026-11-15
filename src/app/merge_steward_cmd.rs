@@ -2597,9 +2597,10 @@ fn non_default_base(
 > {
     use crate::release_base::{ReleaseBasePolicy, ReleaseSource};
     let policy = ReleaseBasePolicy::from_machine_global(global_dir)?;
+    // The same derivation the standing reviewer uses: a base whose rules
+    // require a review context is reviewed. Unreadable rules are the stop.
     let release = |source: ReleaseSource, rules: Option<Value>| {
-        let review_path =
-            policy.reviewer_covers(base) && release_requires_approval(actions, repo, base, rules)?;
+        let review_path = release_requires_review(actions, repo, base, rules);
         Ok::<_, String>((
             format!("release_base:{base}"),
             next_action::NextAction::release_base(base, default_branch, review_path),
@@ -2640,20 +2641,26 @@ fn ruleset_names_base(actions: &GitHubActions, repo: &str, rules: &Value) -> Res
     Ok(false)
 }
 
-/// Whether `base`'s rules require the approval context.
-fn release_requires_approval(
+/// Whether `base`'s rules require a review context
+/// ([`crate::release_base::REVIEW_PATH_CONTEXTS`]); false when they cannot
+/// be read, so the answer fails closed to the stop.
+fn release_requires_review(
     actions: &GitHubActions,
     repo: &str,
     base: &str,
     rules: Option<Value>,
-) -> Result<bool, String> {
+) -> bool {
     let rules = match rules {
-        Some(rules) => rules,
-        None => observation::evaluated_branch_rules(actions, repo, base)?,
+        Some(rules) => Ok(rules),
+        None => observation::evaluated_branch_rules(actions, repo, base),
     };
-    Ok(observation::evaluated_required_checks(&rules)?
-        .iter()
-        .any(|check| check.context == crate::merge_steward::DEFAULT_APPROVAL_CONTEXT))
+    rules
+        .and_then(|rules| observation::evaluated_required_checks(&rules))
+        .is_ok_and(|required| {
+            crate::release_base::requires_review(
+                required.iter().map(|check| check.context.as_str()),
+            )
+        })
 }
 
 fn open_pull_request_for_head(actions: &GitHubActions, repo: &str, branch: &str) -> Option<u64> {

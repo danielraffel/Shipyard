@@ -144,8 +144,8 @@ impl NextAction {
 
     /// A pull request on a release base (see [`crate::release_base`]): not a
     /// stack, and never retargeted to the default branch. `review_path` is
-    /// true when the base's rules require the approval context and the
-    /// standing reviewer covers the base.
+    /// true when the base's rules require a review context, which puts it on
+    /// the standing reviewer's path.
     #[must_use]
     pub fn release_base(base: &str, default_branch: &str, review_path: bool) -> Self {
         if review_path {
@@ -153,9 +153,9 @@ impl NextAction {
                 Actor::Reviewer,
                 format!(
                     "Release base `{base}`: not a stack, so do not retarget it to \
-                     `{default_branch}`. Its rules require the approval context and the standing \
-                     reviewer covers this base: nothing for the author to do until it posts \
-                     APPROVE or HOLD. The steward admits only `{default_branch}`; the coordinator \
+                     `{default_branch}`. Its rules require a review context, so the standing \
+                     reviewer reviews it: nothing for the author to do until it posts APPROVE \
+                     or HOLD. The steward admits only `{default_branch}`; the coordinator \
                      or owner lands the release branch."
                 ),
             )

@@ -292,21 +292,35 @@ fn a_stacked_pull_request_waits_for_its_open_parent() {
     );
 }
 
-/// A release refresh (spectr 348, 2026-11-15): a `release/*` base is a
-/// release base, not a stack. No parent lookup and no rules read, never
-/// `stacked_on`, never the retarget advice: the owner or coordinator lands it.
-#[cfg(unix)]
-#[test]
-fn a_release_base_stops_with_the_landing_path_and_is_never_a_stack() {
+fn release_snapshot(rules_case: &str) -> (Value, String) {
     let temp = tempfile::tempdir().expect("temp");
     let log = temp.path().join("calls");
     let body = script(
         &log,
         &pr_row("OPEN", "release/v1.0.10", "CLEAN", 3, &green_rollup()),
         "",
-        "",
+        rules_case,
     );
-    let (snapshot, calls) = read_snapshot(&temp, &body);
+    read_snapshot(&temp, &body)
+}
+
+fn release_rules(contexts: &str) -> String {
+    format!(
+        r#"  *"rules/branches/release%2Fv1.0.10"*) printf '%s' '[[{{"type":"required_status_checks","ruleset_id":5,"parameters":{{"required_status_checks":[{contexts}]}}}}]]' ;;
+"#
+    )
+}
+
+/// A release refresh (spectr 348, 2026-11-15): a `release/*` base is a
+/// release base, not a stack. No parent lookup, never `stacked_on`, never
+/// the retarget advice. Its rules require no review context, so the owner or
+/// coordinator lands it.
+#[cfg(unix)]
+#[test]
+fn a_release_base_with_no_review_rule_stops_and_is_never_a_stack() {
+    let (snapshot, calls) = release_snapshot(&release_rules(
+        r#"{"context":"macos","integration_id":15368}"#,
+    ));
     assert_eq!(
         snapshot["blocked_on"], "release_base:release/v1.0.10",
         "{snapshot:#}"
@@ -322,36 +336,44 @@ fn a_release_base_stops_with_the_landing_path_and_is_never_a_stack() {
     assert!(action.contains("Don't retarget to `main`"), "{action}");
     assert!(!action.contains("retarget this pull request"), "{action}");
     assert!(!calls.contains("pr list"), "{calls}");
-    assert!(!calls.contains("rules/branches"), "{calls}");
+    assert!(
+        calls.contains("rules/branches/release%2Fv1.0.10"),
+        "{calls}"
+    );
 }
 
-/// A release base the standing reviewer covers, whose rules require
-/// `review-verdict`, is a normal review wait.
+/// The standing reviewer's own derivation (fleet-handbook PR 140): a base
+/// whose rules require `review-verdict` or `release-path-review` is
+/// reviewed, so it is a reviewer wait, with no config.
 #[cfg(unix)]
 #[test]
-fn a_reviewed_release_base_requiring_the_verdict_is_a_review_wait() {
-    let temp = tempfile::tempdir().expect("temp");
-    let global = temp.path().join("global");
-    fs::create_dir_all(&global).expect("global");
-    fs::write(
-        global.join("config.toml"),
-        "[merge_steward]\nreviewed_release_bases = [\"release/*\"]\n",
-    )
-    .expect("config");
-    let log = temp.path().join("calls");
-    let rules = r#"  *"rules/branches/release%2Fv1.0.10"*) printf '%s' '[[{"type":"required_status_checks","ruleset_id":5,"parameters":{"required_status_checks":[{"context":"review-verdict","integration_id":15368}]}}]]' ;;
-"#;
-    let body = script(
-        &log,
-        &pr_row("OPEN", "release/v1.0.10", "CLEAN", 3, &green_rollup()),
-        "",
-        rules,
+fn a_release_base_whose_rules_require_a_review_context_is_a_review_wait() {
+    for context in ["review-verdict", "release-path-review"] {
+        let (snapshot, _) = release_snapshot(&release_rules(&format!(
+            r#"{{"context":"macos","integration_id":15368}},{{"context":"{context}"}}"#
+        )));
+        assert_eq!(snapshot["blocked_on"], "release_base:release/v1.0.10");
+        assert_eq!(
+            snapshot["next_action"]["actor"], "reviewer",
+            "{context}: {snapshot:#}"
+        );
+        assert_eq!(snapshot["next_action"]["stop"], false);
+        assert_eq!(snapshot["actionable"], false);
+    }
+}
+
+/// Rules that cannot be read fail closed to the stop, never to a review wait
+/// and never to the retarget advice.
+#[cfg(unix)]
+#[test]
+fn a_release_base_with_unreadable_rules_stops() {
+    let (snapshot, _) = release_snapshot(
+        r#"  *"rules/branches/release%2Fv1.0.10"*) echo 'HTTP 502: Bad Gateway' >&2; exit 1 ;;
+"#,
     );
-    let (snapshot, _) = read_snapshot(&temp, &body);
     assert_eq!(snapshot["blocked_on"], "release_base:release/v1.0.10");
-    assert_eq!(snapshot["next_action"]["actor"], "reviewer", "{snapshot:#}");
-    assert_eq!(snapshot["next_action"]["stop"], false);
-    assert_eq!(snapshot["actionable"], false);
+    assert_eq!(snapshot["next_action"]["actor"], "owner", "{snapshot:#}");
+    assert_eq!(snapshot["next_action"]["stop"], true);
 }
 
 /// A base no pattern names is a release base when a ruleset that names it
