@@ -3,8 +3,10 @@
 
 The PR gate deliberately owns no version counter. This command is the single
 writer that runs on ``main`` after a merge, computes the same semver level as
-the gate, updates every file in the surface, and commits a marker that makes
-the operation idempotent.
+the gate (except that ``Version-Bump`` overrides of ``skip`` and ``none`` are
+ignored at land; only ``Release: skip reason="..."`` opts a change out),
+updates every file in the surface, and commits a marker that makes the
+operation idempotent.
 
 Main's ruleset requires checks that only a pull request can carry, so the
 writer never pushes to main. With ``--pr-branch`` it rebuilds one bot-owned
@@ -124,10 +126,11 @@ def plan(repo: Path, config: Config, base: str, head: str) -> list[Assignment]:
     """Assess every change that landed on main since `base` on its own, then
     take the highest level per surface.
 
-    A `Version-Bump: <surface>=skip` trailer covers only the change that
-    carries it. Judging `base..head` as one range let a single skipped change
-    suppress every later release until the next marker, so nothing ever
-    released again.
+    `Version-Bump: <surface>=skip` and `=none` are ignored at land. Only a
+    `Release: skip reason="..."` trailer opts a change out, and it covers only
+    the change that carries it. Judging `base..head` as one range let a single
+    skipped change suppress every later release until the next marker, so
+    nothing ever released again.
     """
     levels: dict[str, str] = {}
     landed = git(repo, "rev-list", "--first-parent", "--reverse",
