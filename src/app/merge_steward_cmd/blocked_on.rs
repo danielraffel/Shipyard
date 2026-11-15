@@ -443,6 +443,13 @@ fn arm_candidate(facts: &RowFacts<'_>, policy: &StewardPolicy) -> (Stall, SinceH
             facts.error.map(str::to_owned),
         );
     }
+    // Another pull request holds this queue alone; see `solo_reservation`.
+    if let Some(part) = parts
+        .iter()
+        .find(|part| part.starts_with("held_solo_reservation"))
+    {
+        return green((*part).to_owned(), green_since(), None);
+    }
     if parts.contains(&"waiting_head_approval")
         || (facts.mutation.is_none() && facts.error.is_none())
     {

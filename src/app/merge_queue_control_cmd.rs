@@ -14,6 +14,7 @@ use crate::merge_queue_control::{
 };
 use crate::output::write_json_envelope;
 
+#[allow(clippy::too_many_lines)] // One dispatch over every `merge-queue` subcommand.
 pub(super) fn merge_queue_control_command<W: Write>(
     command: MergeQueueCommand,
     state_root: &Path,
@@ -45,6 +46,10 @@ pub(super) fn merge_queue_control_command<W: Write>(
                             .map_err(|error| CliFailure::new(1, error))?,
                     ),
                 );
+                data.insert(
+                    "solo_reservations".to_owned(),
+                    Value::Array(super::merge_queue_solo_cmd::status_report(state_root)),
+                );
                 let authority = authority
                     .as_object()
                     .expect("authority status is an object");
@@ -62,6 +67,7 @@ pub(super) fn merge_queue_control_command<W: Write>(
                 writeln!(stdout, "active").ok();
             }
             if !json {
+                super::merge_queue_solo_cmd::write_status_lines(state_root, stdout);
                 writeln!(
                     stdout,
                     "authority: machine={} configured={} matches={}",
@@ -103,6 +109,11 @@ pub(super) fn merge_queue_control_command<W: Write>(
             } else {
                 writeln!(stdout, "merge-queue mutations were already active").ok();
             }
+        }
+        command @ (MergeQueueCommand::Solo { .. } | MergeQueueCommand::SoloRelease { .. }) => {
+            super::merge_queue_solo_cmd::dispatch(
+                command, state_root, global_dir, cwd, mode, json, stdout,
+            )?;
         }
         MergeQueueCommand::Resolve {
             correlation_id,

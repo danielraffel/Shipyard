@@ -121,6 +121,18 @@ pub(super) fn apply_repo_plan(
         None
     };
     let policy = pass_policy(actions, args, observation);
+    // A solo reservation: end it if its pull request is done with the queue,
+    // before any admission below reads it. See `solo_reservation`.
+    let solo = mutation_control.map(|control| {
+        super::solo_reservation::reconcile(
+            actions,
+            &control.state_dir,
+            observation,
+            args.apply,
+            Utc::now(),
+        )
+    });
+    let (solo_report, solo_error) = solo.map_or((None, None), |pass| (pass.report, pass.error));
     // Infra reruns and red everywhere skip the same labels.
     let mut infra_excluded = vec![args.opt_out_label.clone()];
     infra_excluded.extend(args.provenance_blocking_labels.iter().cloned());
@@ -471,6 +483,7 @@ pub(super) fn apply_repo_plan(
         Utc::now(),
     );
     let mut unhealthy = (args.preempt_capacity && observation.preemption_error.is_some())
+        || solo_error.is_some()
         || native_arm_failed
         || infra_rerun_failed
         || pr_mutation_failed
@@ -583,6 +596,7 @@ pub(super) fn apply_repo_plan(
             api_calls: None,
             rate_limit_deferred: None,
             exit_reasons: Vec::new(),
+            solo_reservation: solo_report,
             dwell: Some(dwell_report),
             infra_rerun: Some(infra_rerun_status),
             red_everywhere: Some(red_everywhere_status),
@@ -619,6 +633,7 @@ pub(super) fn apply_repo_plan(
                 .chain(wedge_reconcile_error)
                 .chain(wedge_observation_error)
                 .chain(superseded_rate_limit)
+                .chain(solo_error)
                 .collect(),
         },
         unhealthy,

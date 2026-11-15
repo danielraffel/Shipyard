@@ -186,6 +186,7 @@ pub mod merge_queue;
 pub mod merge_queue_control;
 /// Read-only merge-queue front/check/fleet liveness correlation.
 pub mod merge_queue_liveness;
+pub mod merge_queue_solo;
 /// Conservative cross-repository merge and queued-run stewardship.
 pub mod merge_steward;
 /// The merge train: an off-by-default switch, per-PR stages on the way into

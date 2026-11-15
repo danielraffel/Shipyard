@@ -54,6 +54,7 @@ mod landability_cmd;
 mod landing_cmd;
 mod local_linux_lease_cmd;
 mod merge_queue_control_cmd;
+mod merge_queue_solo_cmd;
 mod merge_steward_cmd;
 mod metrics_cmd;
 mod metrics_gate_cost_cmd;

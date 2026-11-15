@@ -1470,3 +1470,70 @@ fn a_failed_required_check_still_stops_the_backstop() {
     assert!(status.results.is_empty(), "{status:?}");
     assert!(!log.exists(), "nothing may be read or armed for a red head");
 }
+
+/// A solo reservation for #7 in `control`'s state root, as
+/// `shipyard merge-queue solo` writes it.
+#[cfg(unix)]
+fn reserve_solo(control: &crate::app::merge_steward_cmd::MutationControl, pr: u64) {
+    let reservation = crate::merge_queue_solo::Reservation::new(
+        "owner/repo",
+        "main",
+        pr,
+        &"b".repeat(40),
+        crate::merge_queue_solo::SoloReason::Release,
+        "release coalesce lands alone",
+        "verdict comment 1",
+        crate::merge_queue_solo::DEFAULT_TTL_MINUTES,
+        chrono::Utc::now(),
+    )
+    .expect("reservation");
+    crate::merge_queue_solo::reserve(&control.state_dir, &reservation).expect("reserve");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_solo_reservation_arms_nothing_else_and_leaves_the_reserved_pull_request_to_its_gates() {
+    let temp = tempfile::tempdir().expect("temp");
+    let control = crate::app::merge_steward_cmd::tests::mutation_control(&temp, "studio", "studio");
+    reserve_solo(&control, 7);
+    let log = temp.path().join("calls.log");
+    let actions = fake_gh(&temp, &never_armed_then_arms(&log.display().to_string()));
+    let observation = observation(pr_row(&serde_json::json!({})), true);
+    let reports = report(StewardDecision::Unmanaged);
+
+    let (status, unhealthy) = apply_native_arm_backstop(
+        &actions,
+        &observation,
+        &reports,
+        "shipyard:no-auto-merge",
+        true,
+        || super::arming_authority(&control, "owner/repo", "main"),
+    );
+
+    assert!(!unhealthy, "{status:?}");
+    let held = &status.results[0];
+    assert_eq!(held.number, 42);
+    assert_eq!(held.outcome, "skipped", "{status:?}");
+    assert!(
+        matches!(&held.skip, Some(crate::auto_arm::ArmSkip::Unknown { detail }) if detail.contains("held_solo_reservation:#7")),
+        "{held:?}"
+    );
+    let calls = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !calls.contains("enablePullRequestAutoMerge"),
+        "a reserved queue armed another pull request: {calls}"
+    );
+
+    // The reservation is for #42 itself: it is armed through its usual gates.
+    crate::merge_queue_solo::release(&control.state_dir, "owner/repo", "test").expect("release");
+    reserve_solo(&control, 42);
+    let (status, _) = apply_native_arm_backstop(
+        &actions,
+        &observation,
+        &reports,
+        "shipyard:no-auto-merge",
+        true,
+        || super::arming_authority(&control, "owner/repo", "main"),
+    );
+    assert_eq!(status.results[0].outcome, "armed", "{status:?}");
+}

@@ -41,6 +41,13 @@ pub(super) fn mutate_pr_with_recovery(
     ) {
         return (None, None);
     }
+    // Another pull request holds this queue alone: admit nothing else, and
+    // read nothing for it. See `solo_reservation`.
+    if matches!(decision, StewardDecision::ArmMergeQueue)
+        && let Some(token) = super::solo_reservation::hold(context, pr)
+    {
+        return (Some(token), None);
+    }
     // A head removed from the queue for a defect is not put back until it
     // changes. Checked on the census head before any read, and again on the
     // live head below. See `defect_fix_removals`.
@@ -475,6 +482,9 @@ fn enqueue_pull_request_with_recovery(
     ledger: &mut StewardLedger,
     recover_hosted_setup_eviction_priority: bool,
 ) -> (Option<String>, Option<String>) {
+    if let Some(token) = super::solo_reservation::hold(context, pr) {
+        return (Some(token), None);
+    }
     // While the merge groups show the base poisoned, only a named fix is
     // admitted; see `base_poison`. The fix still passes every gate below.
     let admission = super::base_poison::admission(context.base_poison, pr.fact.number);

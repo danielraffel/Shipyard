@@ -36,6 +36,8 @@ shipyard ship --base develop   # target a different branch
 shipyard merge-queue status    # local mutation authority hold
 shipyard merge-queue hold --reason "incident"
 shipyard merge-queue resume
+shipyard merge-queue solo owner/repo#123 --reason release --note "..."  # hold one queue for one approved PR
+shipyard merge-queue solo-release owner/repo --reason "..."
 
 # Immutable Pulp dependency pins (opt-in tracked policy)
 shipyard dependency pulp show             # local policy + exact lock

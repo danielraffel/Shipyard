@@ -1787,6 +1787,20 @@ not resume until the incident owner has restored the intended queue order.
 Queue writes are serialized process-wide and recorded in machine-global
 `merge_queue/mutations.jsonl`.
 
+To land one PR alone (a release coalesce, a red-base fix) when the native queue
+would batch it with entries ahead of it, do not dequeue them as a `reorder`.
+On the mutation machine run `shipyard merge-queue solo <owner/repo>#<n>
+--reason release|main-red-fix|incident --note "<why>" [--ttl-minutes 120]`.
+It is refused unless the PR's current head carries a verified exact-head
+approval. While it is live the steward admits nothing else into that queue
+(`held_solo_reservation:#<n>`), and the `ghapp` removal guard accepts
+`GHAPP_QUEUE_REMOVAL_REASON=solo` for entries ahead of the reserved PR only.
+It ends on merge, close, a new head, leaving the queue after being seen there,
+or the TTL; `shipyard merge-queue solo-release <owner/repo> --reason "<why>"`
+ends it early. An unreadable reservation pauses the whole repository's queue
+and is a tick error until released. `merge-queue status` lists reservations.
+Details: `docs/ghapp-guards.md` "Solo reservations".
+
 For release rollout, configure absolute sibling `shipyard_bin` and `github_cli`
 paths named `shipyard` and `ghapp`. Machine-global command auth must be exactly
 wrapper + `token --app-id VALUE --private-key ABS --repo {repo_slug}`. Direct

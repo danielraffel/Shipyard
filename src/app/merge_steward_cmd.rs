@@ -242,6 +242,10 @@ struct RepoReport {
     /// was healthy, so a non-zero exit with empty `errors` is explained here.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     exit_reasons: Vec<String>,
+    /// The repository's solo merge-queue reservation and what this pass did
+    /// with it ([`solo_reservation`]). Absent when there is none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    solo_reservation: Option<serde_json::Value>,
     /// Dwell-time limits, overdue pull requests and the next-to-admit
     /// ranking ([`dwell_pass`]). Absent when the repository was not observed.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1985,6 +1989,7 @@ fn deferred_rate_limit_repo_report(
         api_calls: None,
         rate_limit_deferred: Some(cooldown),
         exit_reasons: Vec::new(),
+        solo_reservation: None,
         dwell: None,
         infra_rerun: None,
         red_everywhere: None,
@@ -2020,6 +2025,7 @@ fn unreadable_repo_report(
         errors: vec![error],
         rate_limit_deferred: None,
         exit_reasons: Vec::new(),
+        solo_reservation: None,
         dwell: None,
         infra_rerun: None,
         red_everywhere: None,
@@ -2105,6 +2111,7 @@ fn append_unmatched_recovery_errors(
             errors,
             rate_limit_deferred: None,
             exit_reasons: Vec::new(),
+            solo_reservation: None,
             dwell: None,
             infra_rerun: None,
             red_everywhere: None,
@@ -2150,6 +2157,7 @@ fn persist_final_ledger(
             errors: vec![message],
             rate_limit_deferred: None,
             exit_reasons: Vec::new(),
+            solo_reservation: None,
             dwell: None,
             infra_rerun: None,
             red_everywhere: None,
@@ -2345,6 +2353,7 @@ mod resume_record;
 mod rollup_pass;
 mod scheduling_loop;
 mod shadow_ledger;
+mod solo_reservation;
 mod stale_merge_ref;
 mod superseded;
 mod terminal_handoff;

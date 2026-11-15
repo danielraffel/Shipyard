@@ -254,7 +254,9 @@ HEALTHY_REFUSAL = (
 )
 REORDER_REFUSAL = (
     "Dequeuing other PRs to reorder the queue discards their merge-group runs; "
-    "enqueue the PR that must land first with the queue's jump option instead."
+    "enqueue the PR that must land first with the queue's jump option instead. "
+    "A PR that must land alone gets a solo reservation (`shipyard merge-queue solo`), "
+    "under which the `solo` reason may remove the entries ahead of it."
 )
 PR_MERGE_VALUE_OPTIONS = {
     "-A", "--author-email", "-b", "--body", "-F", "--body-file", "--match-head-commit",
@@ -265,7 +267,7 @@ NOTE_ENV = "GHAPP_QUEUE_REMOVAL_NOTE"
 FIX_PR_ENV = "GHAPP_QUEUE_REMOVAL_FIX_PR"
 LOG_ENV = "GHAPP_QUEUE_REMOVAL_LOG"
 # Reasons the override accepts. Anything else, including no reason, refuses.
-ALLOWED_REASONS = ("defect-fix", "reorder-main-red-fix")
+ALLOWED_REASONS = ("defect-fix", "reorder-main-red-fix", "solo")
 REFUSED_REASONS = {"rebase": HEALTHY_REFUSAL, "reorder": REORDER_REFUSAL}
 
 _TARGET_FIELDS = "number headRefOid isInMergeQueue mergeQueueEntry{state position}"
@@ -450,6 +452,174 @@ def read_target(target: dict[str, str]) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Solo reservations: `shipyard merge-queue solo` (src/merge_queue_solo.rs)
+# reserves a repository's queue for one exact-head-approved PR. While it is
+# live, a `solo` removal may take out entries AHEAD of that PR in the same
+# queue, and nothing else. The reservation file is read with the same checks
+# Shipyard writes it under (0600, owned by this user, never through a link);
+# a file that fails any check, has expired, or names a PR that is not queued
+# at its reserved head grants nothing.
+# ---------------------------------------------------------------------------
+
+SOLO_DIR_ENV = "SHIPYARD_SOLO_RESERVATION_DIR"
+SOLO_SCHEMA = 1
+SOLO_KIND = "shipyard.merge-queue-solo"
+# src/paths.rs: the state root per platform; src/merge_queue_solo.rs SOLO_DIR.
+SOLO_STATE_STEM = "shipyard"
+SOLO_SUBDIR = ("merge_queue", "solo")
+
+SOLO_ENTRY_QUERY = (
+    "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name)"
+    "{nameWithOwner pullRequest(number:$number){number state headRefOid baseRefName "
+    "isInMergeQueue mergeQueueEntry{state position}}}}"
+)
+SOLO_ENTRY_BY_ID_QUERY = (
+    "query($id:ID!){node(id:$id){... on PullRequest{number state headRefOid baseRefName "
+    "isInMergeQueue mergeQueueEntry{state position} repository{nameWithOwner}}}}"
+)
+
+
+def solo_reservation_dir() -> pathlib.Path:
+    configured = os.environ.get(SOLO_DIR_ENV)
+    if configured:
+        return pathlib.Path(configured)
+    home = pathlib.Path.home()
+    if sys.platform == "darwin":
+        root = home / "Library" / "Application Support" / SOLO_STATE_STEM
+    else:
+        root = home / ".local" / "state" / SOLO_STATE_STEM
+    return root.joinpath(*SOLO_SUBDIR)
+
+
+def _solo_key(repo: str) -> str:
+    parts = repo.strip().split("/")
+    allowed = re.compile(r"[A-Za-z0-9._-]+")
+    if (len(parts) != 2 or not all(allowed.fullmatch(part) for part in parts)
+            or any(part in (".", "..") for part in parts)):
+        raise GuardError(f"`{repo}` cannot name a solo reservation")
+    return f"{parts[0].lower()}__{parts[1].lower()}"
+
+
+def _parse_time(value: Any) -> datetime:
+    if not isinstance(value, str):
+        raise GuardError("the solo reservation has no valid time")
+    # Rust writes up to nanoseconds; Python reads up to microseconds.
+    text = re.sub(r"(\.\d{6})\d+", r"\1", value.strip()).replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError as error:
+        raise GuardError(f"the solo reservation has no valid time: {error}") from error
+    if parsed.tzinfo is None:
+        raise GuardError("the solo reservation's time has no zone")
+    return parsed
+
+
+def read_solo_reservation(repo: str, now: datetime) -> dict[str, Any]:
+    """The live reservation for ``repo``; raises GuardError for anything else."""
+    import stat
+
+    path = solo_reservation_dir() / f"{_solo_key(repo)}.json"
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError as error:
+        raise GuardError(f"{repo} has no solo reservation") from error
+    except OSError as error:
+        raise GuardError(f"the solo reservation for {repo} is unreadable: {error}") from error
+    try:
+        info = os.fstat(descriptor)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or info.st_mode & 0o077):
+            raise GuardError(f"the solo reservation for {repo} is not a private regular file")
+        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+            descriptor = -1
+            record = json.load(handle)
+    except (OSError, ValueError) as error:
+        raise GuardError(f"the solo reservation for {repo} is unreadable: {error}") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if not isinstance(record, dict) or record.get("schema") != SOLO_SCHEMA \
+            or record.get("kind") != SOLO_KIND:
+        raise GuardError(f"the solo reservation for {repo} is not a reservation record")
+    if str(record.get("repo", "")).lower() != repo.lower():
+        raise GuardError(f"the solo reservation filed for {repo} names {record.get('repo')}")
+    pr, head, base = record.get("pr"), record.get("head"), record.get("base")
+    if (not isinstance(pr, int) or isinstance(pr, bool) or pr <= 0
+            or not isinstance(head, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", head)
+            or not isinstance(base, str) or not base):
+        raise GuardError(f"the solo reservation for {repo} does not name a pull request head")
+    if now >= _parse_time(record.get("expires_at")):
+        raise GuardError(f"the solo reservation for {repo}#{pr} has expired")
+    return record
+
+
+def _solo_entry(response: Any) -> dict[str, Any]:
+    pr = _pull_request(response)
+    if pr is None or not isinstance(pr.get("number"), int):
+        raise GuardError("a pull request in the solo removal could not be read")
+    repository = pr.get("repository") if isinstance(pr.get("repository"), dict) else None
+    repo = (repository or {}).get("nameWithOwner")
+    if not repo and isinstance(response, dict):
+        repo = ((response.get("data") or {}).get("repository") or {}).get("nameWithOwner")
+    entry = pr.get("mergeQueueEntry") if isinstance(pr.get("mergeQueueEntry"), dict) else None
+    position = entry.get("position") if entry else None
+    return {
+        "repo": repo,
+        "pr": pr["number"],
+        "head": pr.get("headRefOid"),
+        "base": pr.get("baseRefName"),
+        "state": pr.get("state"),
+        "position": position if isinstance(position, int) and not isinstance(position, bool) else None,
+    }
+
+
+def judge_solo(args: list[str], now: datetime | None = None) -> tuple[bool, str, dict[str, Any]]:
+    """Whether a `solo` removal takes out only entries ahead of a reserved PR."""
+    now = now or datetime.now(timezone.utc)
+    entries = []
+    for target in removal_targets(args):
+        if "id" in target:
+            response = _graphql(SOLO_ENTRY_BY_ID_QUERY, {"id": target["id"]})
+        else:
+            response = _graphql(SOLO_ENTRY_QUERY, target)
+        entries.append(_solo_entry(response))
+    repos = {str(entry["repo"] or "").lower() for entry in entries}
+    if len(repos) != 1 or "" in repos:
+        return False, "a solo removal must target entries of one repository's queue", {}
+    repo = next(entry["repo"] for entry in entries)
+    reservation = read_solo_reservation(repo, now)
+    owner, name = _split_repo(repo)
+    reserved = _solo_entry(_graphql(
+        SOLO_ENTRY_QUERY, {"owner": owner, "name": name, "number": str(reservation["pr"])}))
+    if (reserved["state"] != "OPEN" or reserved["position"] is None
+            or str(reserved["head"]).lower() != reservation["head"].lower()
+            or reserved["base"] != reservation["base"]):
+        return False, (
+            f"{repo}#{reservation['pr']} is not queued at its reserved head "
+            f"{reservation['head'][:12]} on {reservation['base']}, so no entry is ahead of it"
+        ), {}
+    for entry in entries:
+        if entry["pr"] == reservation["pr"]:
+            return False, f"a solo removal never removes the reserved {repo}#{entry['pr']}", {}
+        if entry["position"] is None or entry["base"] != reservation["base"]:
+            return False, f"{repo}#{entry['pr']} is not in the reserved {reservation['base']} queue", {}
+        if entry["position"] >= reserved["position"]:
+            return False, (
+                f"{repo}#{entry['pr']} is at position {entry['position']}, behind the reserved "
+                f"#{reservation['pr']} at {reserved['position']}; a solo removal takes out only "
+                "entries ahead of it. " + REORDER_REFUSAL
+            ), {}
+    return True, f"ahead of the reserved {repo}#{reservation['pr']}", {
+        "reserved_pr": reservation["pr"],
+        "reserved_head": reservation["head"],
+        "reserved_position": reserved["position"],
+        "reservation_reason": reservation.get("reason"),
+        "expires_at": reservation.get("expires_at"),
+        "positions": {str(entry["pr"]): entry["position"] for entry in entries},
+    }
+
+
 def removal_log_path() -> pathlib.Path:
     configured = os.environ.get(LOG_ENV)
     if configured:
@@ -473,7 +643,9 @@ def judge_override(args: list[str]) -> tuple[bool, str]:
 
     The override must state why. A rebase or a reorder is refused whatever the
     queue looks like; a defect fix is allowed and logged; a main-red fix may
-    remove only the fix PR itself, so it can jump the queue.
+    remove only the fix PR itself, so it can jump the queue; a solo removal
+    may remove only entries ahead of the PR a live solo reservation names
+    (``judge_solo``).
     """
     reason = os.environ.get(REASON_ENV, "").strip().lower()
     note = os.environ.get(NOTE_ENV, "").strip()
@@ -488,6 +660,11 @@ def judge_override(args: list[str]) -> tuple[bool, str]:
         )
     if not note:
         return False, f"a `{reason}` removal needs {NOTE_ENV} saying what is wrong"
+    solo: dict[str, Any] = {}
+    if reason == "solo":
+        allowed, detail, solo = judge_solo(args)
+        if not allowed:
+            return False, detail
     targets = [read_target(target) for target in removal_targets(args)]
     if reason == "reorder-main-red-fix":
         fix_pr = os.environ.get(FIX_PR_ENV, "").strip().lstrip("#")
@@ -514,6 +691,7 @@ def judge_override(args: list[str]) -> tuple[bool, str]:
                 "reason": reason,
                 "note": note,
                 "fix_pr": os.environ.get(FIX_PR_ENV) or None,
+                **({"solo": solo} if solo else {}),
                 "targets": targets,
                 "argv": args,
             }

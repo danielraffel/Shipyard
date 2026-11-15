@@ -977,6 +977,7 @@ impl MergeQueueMutationGuard {
                 hold_path.display()
             ));
         }
+        crate::merge_queue_solo::refuse_admission(state_root, state, action)?;
         if let Some(uncertain) = uncertain_mutations(state_root)?.into_iter().find(|entry| {
             entry.get("repo").and_then(serde_json::Value::as_str) == Some(state.repo.as_str())
                 && entry.get("base").and_then(serde_json::Value::as_str)

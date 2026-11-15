@@ -273,6 +273,14 @@ fn admission_outcomes_are_named() {
         "waiting_full_test_tier"
     );
     assert_eq!(
+        token(&pr, Some("held_solo_reservation:#451")),
+        "held_solo_reservation:#451"
+    );
+    assert_eq!(
+        token(&pr, Some("held_solo_reservation_unreadable")),
+        "held_solo_reservation_unreadable"
+    );
+    assert_eq!(
         token(&pr, Some("skipped_after_live_revalidation")),
         "revalidating"
     );

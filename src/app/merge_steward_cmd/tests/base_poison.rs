@@ -404,3 +404,163 @@ fn red_everywhere_enforce_holds_an_unchanged_member_head_from_the_queue() {
     let shadow = enqueue_in_episode(RedEverywhereMode::Shadow);
     assert_eq!(enqueues(&shadow.calls).len(), 1, "{}", shadow.calls);
 }
+
+// Solo reservations on the same enqueue path. See `solo_reservation`.
+
+enum Solo {
+    For(u64),
+    Corrupt,
+}
+
+fn enqueue_under_solo(solo: &Solo, comments: &str) -> Outcome {
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = steward_gh(&temp, JUMP_ACCEPTED, comments);
+    let pr = ready_pr();
+    let mut observation = observation_for(pr.clone(), true);
+    observation.repo = "Generous-Corp/pulp".to_owned();
+    let mut ledger = StewardLedger::default();
+    let mutation_control = mutation_control(&temp, "studio", "studio");
+    match solo {
+        Solo::For(number) => {
+            let reservation = crate::merge_queue_solo::Reservation::new(
+                "Generous-Corp/pulp",
+                "main",
+                *number,
+                HEAD,
+                crate::merge_queue_solo::SoloReason::Release,
+                "release coalesce lands alone",
+                "verdict comment 1",
+                crate::merge_queue_solo::DEFAULT_TTL_MINUTES,
+                chrono::Utc::now(),
+            )
+            .expect("reservation");
+            crate::merge_queue_solo::reserve(&mutation_control.state_dir, &reservation)
+                .expect("reserve");
+        }
+        Solo::Corrupt => {
+            let path = crate::merge_queue_solo::reservation_path(
+                &mutation_control.state_dir,
+                "Generous-Corp/pulp",
+            )
+            .expect("path");
+            fs::create_dir_all(path.parent().expect("dir")).expect("dir");
+            fs::write(&path, "{").expect("corrupt");
+        }
+    }
+    let ledger_path = temp.path().join("ledger.json");
+    let context = mutation_apply_context(&actions, &observation, &ledger_path, &mutation_control);
+    let arms = temp
+        .path()
+        .join("state")
+        .join(crate::queue_arm_gate::ARMS_LEDGER);
+    let guards = temp.path().join("guards");
+    fs::create_dir_all(&guards).expect("guards");
+    let (mutation, error) = with_real_guard(&arms, &guards, || {
+        crate::head_approval::with_host_review_default(false, || {
+            enqueue_pull_request(&context, &pr, &queue_policy(), &mut ledger)
+        })
+    });
+    Outcome {
+        mutation,
+        error,
+        calls: fs::read_to_string(temp.path().join("calls")).unwrap_or_default(),
+    }
+}
+
+#[test]
+fn a_solo_reservation_for_another_pull_request_pauses_this_enqueue_before_any_read() {
+    let outcome = enqueue_under_solo(&Solo::For(451), &approval());
+    assert_eq!(
+        outcome.mutation.as_deref(),
+        Some("held_solo_reservation:#451"),
+        "{:?}",
+        outcome.error
+    );
+    assert_eq!(outcome.error, None);
+    assert!(outcome.calls.is_empty(), "{}", outcome.calls);
+}
+
+#[test]
+fn the_reserved_pull_request_is_enqueued_through_its_usual_gates() {
+    let outcome = enqueue_under_solo(&Solo::For(42), &approval());
+    assert_eq!(
+        outcome.mutation.as_deref(),
+        Some("enqueued"),
+        "{:?}",
+        outcome.error
+    );
+    assert_eq!(enqueues(&outcome.calls).len(), 1, "{}", outcome.calls);
+}
+
+/// A reservation is never approval: the reserved head still needs its own
+/// exact-head verdict.
+#[test]
+fn the_reserved_pull_request_without_an_exact_head_approval_still_waits_for_one() {
+    let hold = approval().replace("verdict: APPROVE", "verdict: HOLD");
+    let outcome = enqueue_under_solo(&Solo::For(42), &hold);
+    assert_eq!(
+        outcome.mutation.as_deref(),
+        Some("waiting_head_approval"),
+        "{:?}",
+        outcome.error
+    );
+    assert!(enqueues(&outcome.calls).is_empty(), "{}", outcome.calls);
+}
+
+#[test]
+fn an_unreadable_solo_reservation_pauses_every_enqueue_into_the_repository() {
+    let outcome = enqueue_under_solo(&Solo::Corrupt, &approval());
+    assert_eq!(
+        outcome.mutation.as_deref(),
+        Some("held_solo_reservation_unreadable"),
+        "{:?}",
+        outcome.error
+    );
+    assert!(outcome.calls.is_empty(), "{}", outcome.calls);
+}
+
+/// The audited mutation guard refuses an admission for another pull request
+/// itself, so a path that skipped the steward's check still cannot enqueue;
+/// a removal is not an admission and is not refused.
+#[test]
+fn the_mutation_guard_refuses_an_admission_into_a_reserved_queue() {
+    let temp = tempfile::tempdir().expect("temp");
+    let pr = ready_pr();
+    let mut observation = observation_for(pr.clone(), true);
+    observation.repo = "Generous-Corp/pulp".to_owned();
+    let control = mutation_control(&temp, "studio", "studio");
+    let reservation = crate::merge_queue_solo::Reservation::new(
+        "Generous-Corp/pulp",
+        "main",
+        451,
+        HEAD,
+        crate::merge_queue_solo::SoloReason::Release,
+        "release coalesce lands alone",
+        "verdict comment 1",
+        crate::merge_queue_solo::DEFAULT_TTL_MINUTES,
+        chrono::Utc::now(),
+    )
+    .expect("reservation");
+    crate::merge_queue_solo::reserve(&control.state_dir, &reservation).expect("reserve");
+    for action in [
+        "runner steward enqueue pull request",
+        crate::merge_queue_control::ARM_ACTION,
+        "runner steward exact-head merge on a server-enforced base",
+        "runner steward move the base fix to the front of the merge queue",
+    ] {
+        let error = super::acquire_pr_mutation_guard(&control, &observation, &pr, action)
+            .expect_err(action);
+        assert!(
+            error.contains("held_solo_reservation:#451"),
+            "{action}: {error}"
+        );
+    }
+    let guard = super::acquire_pr_mutation_guard(
+        &control,
+        &observation,
+        &pr,
+        "runner steward dequeue a merge group that can never finish",
+    )
+    .expect("a removal is not paused");
+    guard.finish("test").expect("finish");
+}

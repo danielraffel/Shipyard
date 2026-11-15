@@ -1317,6 +1317,36 @@ pub(super) enum MergeQueueCommand {
     },
     /// Remove the local hold. Machine-authority checks still apply.
     Resume,
+    /// Reserve a repository's merge queue for one approved pull request.
+    ///
+    /// While the reservation is active the steward admits nothing else into
+    /// that queue, and the `ghapp` removal guard accepts a `solo` removal of
+    /// an entry ahead of the reserved pull request. It ends when the pull
+    /// request merges, closes, changes head or leaves the queue, or after
+    /// `--ttl-minutes`. Refused unless the pull request's current head
+    /// carries a verified exact-head approval and this host is the
+    /// configured mutation machine.
+    Solo {
+        /// `owner/name#number`.
+        target: String,
+        /// Why it must land alone: release, main-red-fix or incident.
+        #[arg(long)]
+        reason: String,
+        /// What is landing and why it cannot share a merge group.
+        #[arg(long)]
+        note: String,
+        /// Lifetime in minutes (at most 480).
+        #[arg(long, default_value_t = crate::merge_queue_solo::DEFAULT_TTL_MINUTES)]
+        ttl_minutes: i64,
+    },
+    /// End a repository's solo reservation, including an unreadable one.
+    SoloRelease {
+        /// `owner/name`.
+        repo: String,
+        /// Why it is ended early.
+        #[arg(long)]
+        reason: String,
+    },
     /// Resolve an uncertain mutation after authoritative GitHub reconciliation.
     Resolve {
         /// Correlation id shown by `merge-queue status --json`.

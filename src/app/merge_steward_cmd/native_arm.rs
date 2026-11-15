@@ -122,6 +122,11 @@ pub(super) struct ArmAuthorityRefusal {
 pub(super) trait ArmAuthority {
     /// Whether `pr` has an unresolved merge-queue mutation of its own.
     fn uncertain(&self, pr: u64) -> bool;
+    /// The solo-reservation hold on `pr`, if another pull request holds the
+    /// queue alone or the reservation is unreadable. See `solo_reservation`.
+    fn solo_hold(&self, _pr: u64) -> Option<String> {
+        None
+    }
 }
 
 impl ArmAuthority for () {
@@ -135,11 +140,17 @@ impl ArmAuthority for () {
 pub(super) struct ArmingAuthority {
     _preflight: MergeQueueMutationPreflight,
     uncertain_prs: BTreeSet<u64>,
+    base: String,
+    solo: crate::merge_queue_solo::SoloState,
 }
 
 impl ArmAuthority for ArmingAuthority {
     fn uncertain(&self, pr: u64) -> bool {
         self.uncertain_prs.contains(&pr)
+    }
+
+    fn solo_hold(&self, pr: u64) -> Option<String> {
+        self.solo.admission_hold(&self.base, pr)
     }
 }
 
@@ -180,6 +191,9 @@ pub(super) fn arming_authority(
         .map(|(preflight, uncertain_prs)| ArmingAuthority {
             _preflight: preflight,
             uncertain_prs,
+            base: base.to_owned(),
+            // Read under the control lock the preflight holds.
+            solo: crate::merge_queue_solo::read(&control.state_dir, repo, chrono::Utc::now()),
         })
         .map_err(|reason| ArmAuthorityRefusal {
             reason: format!("declined: no merge-queue mutation authority: {reason}"),
@@ -273,6 +287,13 @@ pub(super) fn apply_native_arm_backstop<A: ArmAuthority>(
             results.push(held_by_uncertainty(pr));
             continue;
         }
+        if let Some(token) = authority
+            .as_ref()
+            .and_then(|authority| authority.solo_hold(pr.fact.number))
+        {
+            results.push(held_by_solo_reservation(pr, &token));
+            continue;
+        }
         let result = consider_candidate(
             actions,
             &observation.repo,
@@ -312,6 +333,22 @@ fn held_by_uncertainty(pr: &ObservedPr) -> NativeArmResult {
             detail: "an earlier merge-queue mutation for this pull request is still uncertain; \
                      only this pull request waits for it"
                 .to_owned(),
+        }),
+        error: None,
+    }
+}
+
+/// The result for a pull request another pull request's solo reservation
+/// keeps out of the queue.
+fn held_by_solo_reservation(pr: &ObservedPr, token: &str) -> NativeArmResult {
+    NativeArmResult {
+        number: pr.fact.number,
+        head_sha: pr.fact.head_sha.clone(),
+        outcome: "skipped".to_owned(),
+        skip: Some(ArmSkip::Unknown {
+            detail: format!(
+                "{token}: the merge queue is reserved for a solo landing, so nothing else is armed"
+            ),
         }),
         error: None,
     }
