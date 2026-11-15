@@ -80,6 +80,23 @@ class Base(unittest.TestCase):
         return {r["pr"]: r for r in out["repos"][REPO]["prs"]}
 
 
+class SharedCap(Base):
+    def test_total_reads_never_exceed_cap_when_cap_below_repo_count(self):
+        repos = [f"o/r{i}" for i in range(5)]
+        gh = world([pr(1, T(10, "10:00"), T(10, "11:00"))])
+        out = pm.build(repos, self.cache, 1, OWNER, START, NOW, {}, {}, None, gh)
+        self.assertLessEqual(out["reads"], 1)
+        self.assertLessEqual(len(gh.calls), 1)
+        self.assertTrue(out["truncated"])
+        self.assertEqual(out["coverage"]["status"], "partial")
+
+    def test_zero_cap_issues_no_reads(self):
+        gh = world([pr(1, T(10, "10:00"), T(10, "11:00"))])
+        out = pm.build([REPO, "o/other"], self.cache, 0, OWNER, START, NOW, {}, {}, None, gh)
+        self.assertEqual(len(gh.calls), 0)
+        self.assertTrue(out["truncated"])
+
+
 class Autonomy(Base):
     def test_owner_label_is_an_owner_action_and_bot_events_are_not(self):
         tl = {1: [{"event": "labeled", "actor": {"login": "shipyard-local[bot]"}, "created_at": T(10, "10:30")}],

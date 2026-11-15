@@ -725,7 +725,7 @@ def build(repos, cache_dir, cap, owner, start, now, ticks, tick_ctx, baseline=No
            "reads": 0, "coverage": {"status": "available", "reason": ""}, "baseline": None, "window": None, "controls_failed": False}
     notes = []
     for i, repo in enumerate(repos):
-        repo_cap = max(1, remaining // (len(repos) - i))
+        repo_cap = remaining // (len(repos) - i)  # may be 0: the shared total is never exceeded
         r = collect_repo(repo, cache_dir, repo_cap, owner, lo, now, now, ticks, tick_ctx, fetch,
                          (bases or {}).get(repo, "main"), (dirty or {}).get(repo, ()))
         excluded = collections.Counter(x["excluded_because"] for x in r["rows"] if not x["eligible"])
