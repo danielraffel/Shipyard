@@ -193,6 +193,11 @@ Full flow + env-var setup in `RELEASING.md` § "macOS release is a locally-signe
 
 ## Development
 
-- `uv sync` to install.
-- `pytest -x` for the test suite.
-- Never push directly to `main` — always PR → CI → merge.
+Shipyard is a Rust crate with Python helper scripts. CI runs:
+
+- `cargo fmt --all --check`
+- `cargo clippy --all-targets --locked -- -D warnings`
+- `cargo test --all-targets --locked --features ci-test-home`
+- `python3 scripts/run_unittest_strict.py -s scripts -p 'test_*.py'` (also `-s tools/metrics`)
+
+Never push directly to `main`; open a PR as described above.
