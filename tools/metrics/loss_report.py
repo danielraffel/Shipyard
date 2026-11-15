@@ -140,7 +140,8 @@ def load_ticks(log_dir, start, end):
           "rollup_seen": False, "rollup_actions": collections.defaultdict(collections.Counter),
           "rollup_left_out": collections.defaultdict(collections.Counter),
           "rollup_off_why": collections.defaultdict(collections.Counter),
-          "poison_began": collections.defaultdict(set), "required": {}, "bases": {}}
+          "poison_began": collections.defaultdict(set), "required": {}, "bases": {},
+          "dirty": collections.defaultdict(set), "refused": collections.defaultdict(set)}
     for base, t, (kind, payload) in tick_sources(log_dir, start):
         if kind == "bad_archive":
             st["bad_archives"] += 1
@@ -190,6 +191,11 @@ def load_ticks(log_dir, start, end):
                 continue
             rows = {}
             for p in r["prs"]:
+                tok = str(p.get("blocked_on") or "")
+                if "dirty" in tok.lower():
+                    st["dirty"][r["repo"]].add(p["number"])
+                if tok.startswith("direct_merge_refused") or tok.startswith("excluded_label:direct_merge"):
+                    st["refused"][r["repo"]].add(p["number"])
                 na = p.get("next_action") or {}
                 rows[p["number"]] = {
                     "head": p.get("head_sha"), "token": p.get("blocked_on") or "unknown",
@@ -558,7 +564,8 @@ def build_report(log_dir, since, now, github=None, gap_minutes=120, e2e=None):
         repos = e2e.get("repos") or sorted(per_repo)
         report["end_to_end"] = pr_metrics.build(
             repos, e2e["cache_dir"], e2e.get("cap", 100), e2e.get("owner", "danielraffel"), start, now,
-            {k: sorted(v) for k, v in st["poison_began"].items()}, st["required"], e2e.get("baseline"), e2e.get("fetch"), st["bases"])
+            {k: sorted(v) for k, v in st["poison_began"].items()}, st["required"], e2e.get("baseline"), e2e.get("fetch"), st["bases"],
+            st["dirty"], e2e.get("controls"), st["refused"])
     else:
         report["end_to_end"] = None
     return report

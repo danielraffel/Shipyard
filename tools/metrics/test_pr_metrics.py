@@ -24,7 +24,7 @@ def T(day, hm):
 
 def pr(n, created, merged, sha=None):
     return {"number": n, "created_at": created, "merged_at": merged, "updated_at": merged,
-            "merge_commit_sha": sha or f"m{n:040d}"[:40], "base": {"ref": "main"}, "head": {"sha": f"h{n:040d}"[:40]}}
+            "state": "closed", "merge_commit_sha": sha or f"m{n:040d}"[:40], "base": {"ref": "main"}, "head": {"sha": f"h{n:040d}"[:40]}}
 
 
 def commit(sha, login="shipyard-local[bot]", msg="x", date=T(1, "00:00")):
@@ -48,10 +48,12 @@ class Fake:
 
 def world(prs, timelines=None, commits=None, base_commits=None, runs=None, jobs=None, checks=None, required=("Test",)):
     timelines, commits, jobs, checks = timelines or {}, commits or {}, jobs or {}, checks or {}
-    routes = [(r"pulls\?state=closed", prs)]
+    routes = [(r"pulls\?state=all", prs)]
     for n in {p["number"] for p in prs}:
         routes.append((rf"issues/{n}/timeline", timelines.get(n, [])))
         routes.append((rf"pulls/{n}/commits", commits.get(n, [commit(f"c{n}")])))
+    for n in {p["number"] for p in prs}:
+        routes.append((rf"pulls/{n}$", {"additions": 300, "deletions": 100}))
     routes.append((r"/commits\?sha=main", base_commits or []))
     routes.append((r"actions/runs\?created", {"workflow_runs": runs or []}))
     for rid, js in jobs.items():
@@ -84,8 +86,8 @@ class Autonomy(Base):
               2: [{"event": "labeled", "actor": {"login": OWNER}, "created_at": T(10, "10:30")}]}
         out = self.build(world([pr(1, T(10, "10:00"), T(10, "11:00")), pr(2, T(10, "10:00"), T(10, "11:00"))], tl))
         r = self.rows(out)
-        self.assertEqual((r[1]["autonomy"], r[2]["autonomy"]), ("autonomous", "owner_action"))
-        a = out["repos"][REPO]["per_day"]["2026-11-10"]["autonomous"]
+        self.assertEqual((r[1]["north"], r[2]["north"]), ("autonomous", "owner_action"))
+        a = out["repos"][REPO]["per_day"]["2026-11-10"]["north_star"]
         self.assertEqual((a["autonomous"], a["owner_action"], a["unknown"], a["rate_pct"]), (1, 1, 0, 50.0))
 
     def test_owner_commit_without_agent_trailer_is_unknown_with_one_is_autonomous(self):
@@ -93,22 +95,22 @@ class Autonomy(Base):
               2: [commit("c2", OWNER, "fix it\n\nCo-Authored-By: Claude Sonnet <noreply@anthropic.com>")]}
         out = self.build(world([pr(1, T(10, "10:00"), T(10, "11:00")), pr(2, T(10, "10:00"), T(10, "11:00"))], commits=cm))
         r = self.rows(out)
-        self.assertEqual((r[1]["autonomy"], r[2]["autonomy"]), ("unknown", "autonomous"))
-        a = out["repos"][REPO]["per_day"]["2026-11-10"]["autonomous"]
-        self.assertEqual((a["unknown"], a["rate_pct"]), (1, 100.0))  # rate is over determinable PRs only
+        self.assertEqual((r[1]["north"], r[2]["north"]), ("unknown", "autonomous"))
+        a = out["repos"][REPO]["per_day"]["2026-11-10"]["north_star"]
+        self.assertEqual((a["unknown"], a["rate_pct"], a["rate_range_pct"]), (1, 50.0, [50.0, 100.0]))  # unknown PRs stay in the denominator
 
     def test_version_bump_trailer_marks_agent_work_and_github_only_ignores_commits(self):
         cm = {1: [commit("c1", OWNER, "chore\n\nVersion-Bump: cli=skip reason=x")], 2: [commit("c2", OWNER, "by hand")]}
         out = self.build(world([pr(1, T(10, "10:00"), T(10, "11:00")), pr(2, T(10, "10:00"), T(10, "11:00"))], commits=cm))
         r = self.rows(out)
-        self.assertEqual((r[1]["autonomy"], r[2]["autonomy"], r[2]["autonomy_github_only"]), ("autonomous", "unknown", "autonomous"))
-        a = out["repos"][REPO]["per_day"]["2026-11-10"]["autonomous"]
-        self.assertEqual((a["unknown_share_pct"], a["github_only"]["unknown"], a["github_only"]["rate_pct"]), (50.0, 0, 100.0))
+        self.assertEqual((r[1]["north"], r[2]["north"], r[2]["north_gh"]), ("autonomous", "unknown", "autonomous"))
+        a = out["repos"][REPO]["per_day"]["2026-11-10"]["north_star"]
+        self.assertEqual((a["unknown_share_pct"], a["github_only"]["unknown"], a["github_only"]["rate_pct"], a["unknown_over_20pct"]), (50.0, 0, 100.0, True))
 
     def test_a_definite_owner_action_beats_an_ambiguous_commit(self):
         tl = {1: [{"event": "commented", "user": {"login": OWNER}, "created_at": T(10, "10:30")}]}
         out = self.build(world([pr(1, T(10, "10:00"), T(10, "11:00"))], tl, {1: [commit("c1", OWNER)]}))
-        self.assertEqual(self.rows(out)[1]["autonomy"], "owner_action")
+        self.assertEqual(self.rows(out)[1]["north"], "owner_action")
 
     def test_unreadable_timeline_leaves_the_pr_unread_not_autonomous(self):
         gh = world([pr(1, T(10, "10:00"), T(10, "11:00"))])
@@ -178,7 +180,7 @@ class Compute(Base):
         gh = world([pr(1, T(10, "09:00"), T(10, "11:00"))], runs=self.runs, jobs={})
         out = self.build(gh)
         self.assertIsNone(self.rows(out)[1]["compute"])
-        self.assertEqual(out["repos"][REPO]["per_day"]["2026-11-10"]["compute_per_pr"]["prs_read"], 0)
+        self.assertEqual(out["repos"][REPO]["per_day"]["2026-11-10"]["compute_per_merged_pr"]["prs_read"], 0)
 
 
 class Correctness(Base):
@@ -255,9 +257,7 @@ class Correctness(Base):
         c = self.rows(out)[8]["correct"]
         self.assertTrue(c["provisional"])
         k = out["repos"][REPO]["per_day"]["2026-11-12"]["correctness"]
-        self.assertTrue(k["provisional"])
         self.assertEqual(k["provisional_prs"], 1)
-        self.assertIn("provisional", pm.markdown(out))
 
     def test_unreadable_checks_make_correctness_unknown(self):
         p = self.merged_old(6)
@@ -281,7 +281,7 @@ class Cohort(Base):
     def test_a_pr_is_assigned_to_the_day_it_became_ready_not_the_day_it_merged(self):
         out = self.build(world([pr(1, T(10, "22:00"), T(11, "02:00"))]))
         r = self.rows(out)[1]
-        self.assertEqual((r["day"], r["merge_day"]), ("2026-11-10", "2026-11-11"))
+        self.assertEqual((r["day"], r["merged_at"][:10]), ("2026-11-10", "2026-11-11"))
         self.assertIn("2026-11-10", out["repos"][REPO]["per_day"])
 
     def test_owner_actions_are_counted_apart_from_repair_cycles_and_holds(self):
@@ -289,13 +289,16 @@ class Cohort(Base):
         tl = {1: [{"event": "commented", "actor": bot, "body": "HOLD: red", "created_at": T(10, "10:10")},
                   {"event": "commented", "actor": bot, "body": "repaired: fix at abc", "created_at": T(10, "10:20")},
                   {"event": "commented", "actor": bot, "body": "repaired: again", "created_at": T(10, "10:30")},
+                  {"event": "commented", "actor": bot, "body": "verdict: HOLD head: abc", "created_at": T(10, "10:35")},
                   {"event": "labeled", "actor": {"login": OWNER}, "created_at": T(10, "10:40")},
                   {"event": "commented", "actor": {"login": OWNER}, "body": "ok", "created_at": T(10, "10:50")}]}
         out = self.build(world([pr(1, T(10, "10:00"), T(10, "11:00"))], tl))
         r = self.rows(out)[1]
-        self.assertEqual((r["owner_actions"], r["repair_cycles"], r["holds"]), (2, 2, 1))
-        iv = out["repos"][REPO]["per_day"]["2026-11-10"]["interventions"]
+        self.assertEqual((r["owner_actions"], r["repair_cycles"], r["holds"], r["re_holds"], r["size"]), (2, 2, 2, 1, 400))
+        day = out["repos"][REPO]["per_day"]["2026-11-10"]
+        iv = day["interventions"]
         self.assertEqual((iv["owner_actions_per_pr"], iv["repair_cycles_per_pr"], iv["prs_with_repair_cycle"]), (2.0, 2.0, 1))
+        self.assertEqual((day["rounds"]["re_hold_rate_pct"], day["rounds"]["by_size"]), (100.0, {"200-800": {"prs_with_hold": 1, "prs_with_re_hold": 1}}))
 
 
 class Escapes(Base):
@@ -319,6 +322,129 @@ class Escapes(Base):
         self.assertTrue(self.rows(out)[5]["correct"]["escape_provisional"])
 
 
+def unmerged(n, created, state="open", draft=False):
+    p = pr(n, created, None)
+    p.update({"merged_at": None, "merge_commit_sha": None, "state": state, "draft": draft, "updated_at": created})
+    return p
+
+
+class NorthStar(Base):
+    LATE = dt.datetime(2026, 11, 20, tzinfo=UTC)
+
+    def test_unmerged_ready_prs_stay_in_the_denominator(self):
+        prs = [pr(1, T(10, "10:00"), T(10, "11:00")), unmerged(2, T(10, "10:00")), pr(3, T(10, "10:00"), T(13, "10:00"))]  # #3 merged after 48h
+        ns = self.build(world(prs), now=self.LATE)["repos"][REPO]["per_day"]["2026-11-10"]["north_star"]
+        self.assertEqual((ns["autonomous"], ns["not_merged_in_48h"], ns["rate_pct"]), (1, 2, 33.3))
+
+    def test_an_owner_action_after_the_merge_does_not_count_but_one_before_it_does(self):
+        late = {"event": "commented", "actor": {"login": OWNER}, "created_at": T(10, "12:00")}
+        early = {"event": "commented", "actor": {"login": OWNER}, "created_at": T(10, "10:30")}
+        prs = [pr(1, T(10, "10:00"), T(10, "11:00")), pr(2, T(10, "10:00"), T(10, "11:00"))]
+        r = self.rows(self.build(world(prs, {1: [late], 2: [early]}), now=self.LATE))
+        self.assertEqual((r[1]["north"], r[2]["north"]), ("autonomous", "owner_action"))
+
+    def test_a_cohort_is_not_reported_until_its_48h_horizon_closes(self):
+        prs = [pr(1, T(12, "10:00"), T(12, "11:00"))]
+        early = self.build(world(prs), now=dt.datetime(2026, 11, 14, 12, tzinfo=UTC))  # horizon closes 11-15 00:00
+        self.assertFalse(early["repos"][REPO]["per_day"]["2026-11-12"]["closed"])
+        self.assertEqual(early["window"]["per_repo"][REPO]["ready_prs"], 0)
+        self.assertEqual(early["window"]["per_repo"][REPO]["open_days_not_reported"], ["2026-11-12"])
+        self.assertIn("horizon open: not reported", pm.markdown(early))
+        done = self.build(world(prs), now=dt.datetime(2026, 11, 15, 1, tzinfo=UTC))
+        self.assertEqual(done["window"]["per_repo"][REPO]["ready_prs"], 1)
+
+    def test_still_draft_pr_is_never_ready_and_leaves_the_cohort(self):
+        out = self.build(world([unmerged(1, T(10, "10:00"), draft=True)]), now=self.LATE)
+        self.assertEqual(out["repos"][REPO]["excluded"], {"never_ready": 1})
+
+    def test_unknown_above_20_percent_prints_a_range_and_small_n_is_insufficient(self):
+        cm = {1: [commit("c1", OWNER, "x")]}
+        prs = [pr(1, T(10, "10:00"), T(10, "11:00")), pr(2, T(10, "10:00"), T(10, "11:00"))]
+        out = self.build(world(prs, commits=cm), now=self.LATE)
+        ns = out["repos"][REPO]["per_day"]["2026-11-10"]["north_star"]
+        self.assertTrue(ns["unknown_over_20pct"] and ns["insufficient_sample"])
+        self.assertEqual(ns["rate_range_pct"], [50.0, 100.0])
+        md = pm.markdown(out)
+        self.assertIn("insufficient sample (n<50)", md)
+        self.assertIn("50.0-100.0%", md)
+
+
+class Proxies(Base):
+    LATE = dt.datetime(2026, 11, 20, tzinfo=UTC)
+
+    def test_pushes_split_into_repair_author_and_merge_main(self):
+        bot = {"login": "x[bot]"}
+        tl = {1: [{"event": "commented", "actor": bot, "body": "HOLD: red", "created_at": T(10, "10:30")}]}
+        cm = {1: [commit("a", date=T(10, "10:10")), commit("b", date=T(10, "10:40")),
+                  commit("c", msg="Merge branch 'main' into feat", date=T(10, "10:50")), commit("old", date=T(10, "09:00"))]}
+        out = self.build(world([pr(1, T(10, "10:00"), T(10, "11:00"))], tl, cm), now=self.LATE)
+        self.assertEqual(self.rows(out)[1]["pushes"], {"repair": 1, "author": 1, "merge_main": 1})
+
+    def test_queue_attempts_and_ejections_by_cause_exclude_the_merged_removal(self):
+        g = {"actor": {"login": "github-merge-queue[bot]"}}
+        tl = {1: [dict(g, event="added_to_merge_queue", created_at=T(10, "10:20")),
+                  dict(g, event="removed_from_merge_queue", reason="failed_checks", created_at=T(10, "10:30")),
+                  dict(g, event="added_to_merge_queue", created_at=T(10, "10:40")),
+                  dict(g, event="removed_from_merge_queue", reason="merged", created_at=T(10, "10:55"))]}
+        mq = self.build(world([pr(1, T(10, "10:00"), T(10, "11:00"))], tl), now=self.LATE)["repos"][REPO]["per_day"]["2026-11-10"]["merge_queue"]
+        self.assertEqual((mq["attempts_per_ready_pr"], mq["ejections_by_cause"]), (2.0, {"failed_checks": 1}))
+
+    def test_dirty_per_100_prs_uses_the_ticks(self):
+        prs = [pr(1, T(10, "10:00"), T(10, "11:00")), pr(2, T(10, "10:00"), T(10, "11:00"))]
+        out = pm.build([REPO], self.cache, 200, OWNER, START, self.LATE, {}, {}, None, world(prs), None, {REPO: {2}})
+        self.assertEqual(out["repos"][REPO]["per_day"]["2026-11-10"]["dirty_per_100_prs"], 50.0)
+
+    def test_a_push_on_a_merge_group_sha_counts_as_a_repeat_run(self):
+        p = pr(1, T(10, "09:00"), T(10, "11:00"))
+        runs = [{"id": 21, "head_sha": "grp", "event": "merge_group", "status": "completed", "name": "GPU", "head_branch": "gh-readonly-queue/main/pr-1-x"},
+                {"id": 22, "head_sha": "grp", "event": "push", "status": "completed", "name": "GPU", "head_branch": "main"},
+                {"id": 23, "head_sha": "zzz", "event": "push", "status": "completed", "name": "GPU", "head_branch": "main"}]
+        job = [{"labels": ["self-hosted"], "started_at": T(10, "10:00"), "completed_at": T(10, "10:10"), "conclusion": "success"}]
+        out = self.build(world([p], runs=runs, jobs={21: job, 22: job}), now=self.LATE)
+        c = self.rows(out)[1]["compute"]
+        self.assertEqual((c["runs"], c["repeat_runs"], c["group_runs"]), (2, 1, 1))
+
+
+class Controls(Base):
+    LATE = dt.datetime(2026, 11, 30, tzinfo=UTC)
+
+    def run_controls(self, with_revert):
+        p119 = pr(119, T(5, "09:00"), T(5, "10:00"), sha="s119" + "0" * 36)
+        p116 = pr(116, T(5, "11:00"), T(5, "12:00"), sha="s116" + "0" * 36)
+        p126 = pr(126, T(6, "09:00"), T(6, "10:00"))
+        p126["title"] = "fix flake from #116"
+        bc = [commit(p119["merge_commit_sha"], date=T(5, "10:00")), commit(p116["merge_commit_sha"], date=T(5, "12:00"))]
+        if with_revert:
+            bc.append(commit("rev", msg='Revert "x (#119)"', date=T(6, "08:00")))
+        ok = [{"name": "Test", "status": "completed", "conclusion": "success"}]
+        gh = world([p119, p116, p126], base_commits=bc, checks={p119["merge_commit_sha"]: ok, p116["merge_commit_sha"]: ok, "rev": ok})
+        ctl = {REPO: {"revert": [(119, 124)], "escape": [(116, 126)]}}
+        return pm.build([REPO], self.cache, 300, OWNER, START, self.LATE, {}, {}, None, gh, None, None, ctl)
+
+    def test_controls_found_report_normally_with_their_counts_beside_zeros(self):
+        out = self.run_controls(True)
+        c = out["repos"][REPO]["controls"]
+        self.assertEqual((c["status"], c["revert"]["found"], c["escape"]["found"]), ("ok", 1, 1))
+        self.assertFalse(out["controls_failed"])
+        self.assertIn("reverts 1/1, escapes 1/1", pm.markdown(out))
+
+    def test_a_missed_control_means_nothing_is_reported(self):
+        out = self.run_controls(False)
+        self.assertEqual(out["repos"][REPO]["controls"]["status"], "failed")
+        md = pm.markdown(out)
+        self.assertIn("CONTROL FAILED", md)
+        self.assertNotIn("| ready day |", md)
+
+    def test_owner_touched_prs_from_the_ticks_must_read_non_autonomous(self):
+        owner_pr = {1: [{"event": "merged", "actor": {"login": OWNER}, "created_at": T(10, "10:50")}]}
+        prs = [pr(1, T(10, "10:00"), T(10, "11:00"))]
+        ok = pm.build([REPO], self.cache, 200, OWNER, START, self.LATE, {}, {}, None, world(prs, owner_pr), None, None, {}, {REPO: {1}})
+        self.assertEqual(ok["repos"][REPO]["controls"]["owner_touched"], {"in_report": 1, "non_autonomous": 1, "not_in_window": 0})
+        with tempfile.TemporaryDirectory() as d2:
+            bad = pm.build([REPO], d2, 200, OWNER, START, self.LATE, {}, {}, None, world(prs), None, None, {}, {REPO: {1}})
+        self.assertEqual(bad["repos"][REPO]["controls"]["status"], "failed")
+
+
 class Intervals(unittest.TestCase):
     def test_wilson_interval(self):
         self.assertIsNone(pm.wilson(0, 0))
@@ -332,13 +458,16 @@ class WindowVsBaseline(Base):
     def test_window_and_baseline_print_side_by_side_with_n_and_interval(self):
         prs = [pr(1, T(12, "10:00"), T(12, "11:00")), pr(2, T(13, "10:00"), T(13, "11:00")), pr(3, T(14, "08:00"), T(14, "09:00"))]
         b = (dt.datetime(2026, 11, 12, tzinfo=UTC), dt.datetime(2026, 11, 13, tzinfo=UTC))
-        out = pm.build([REPO], self.cache, 200, OWNER, dt.datetime(2026, 11, 14, tzinfo=UTC), NOW, {}, {}, b, world(prs))
-        self.assertEqual(out["baseline"]["per_repo"][REPO]["merged"], 2)
-        self.assertEqual(out["window"]["per_repo"][REPO]["merged"], 1)
+        out = pm.build([REPO], self.cache, 200, OWNER, dt.datetime(2026, 11, 14, tzinfo=UTC), dt.datetime(2026, 11, 20, tzinfo=UTC), {}, {}, b, world(prs))
+        self.assertEqual(out["baseline"]["per_repo"][REPO]["ready_prs"], 2)
+        self.assertEqual(out["window"]["per_repo"][REPO]["ready_prs"], 1)
         md = pm.markdown(out)
         self.assertIn("## Window 2026-11-14", md)
         self.assertIn("## Baseline 2026-11-12 to 2026-11-13", md)
         self.assertIn("CI95", md)
+        self.assertIn("Scorecard " + pm.SCORECARD_VERSION, md)
+        self.assertIn("Baseline noise floor", md)
+        self.assertIn("truncated=false", md)
 
 
 class Caps(Base):
@@ -356,8 +485,8 @@ class Caps(Base):
     def test_baseline_pools_the_named_days_and_reaches_back_before_the_window(self):
         prs = [pr(1, T(12, "10:00"), T(12, "11:00")), pr(2, T(13, "10:00"), T(13, "12:00")), pr(3, T(9, "10:00"), T(9, "11:00"))]
         b = (dt.datetime(2026, 11, 12, tzinfo=UTC), dt.datetime(2026, 11, 14, tzinfo=UTC))
-        out = pm.build([REPO], self.cache, 200, OWNER, dt.datetime(2026, 11, 13, tzinfo=UTC), NOW, {}, {}, b, world(prs))
-        self.assertEqual(out["baseline"]["per_repo"][REPO]["merged"], 2)
+        out = pm.build([REPO], self.cache, 200, OWNER, dt.datetime(2026, 11, 13, tzinfo=UTC), dt.datetime(2026, 11, 20, tzinfo=UTC), {}, {}, b, world(prs))
+        self.assertEqual(out["baseline"]["per_repo"][REPO]["ready_prs"], 2)
         self.assertEqual(out["baseline"]["per_repo"][REPO]["handoff_min"]["median"], 90.0)
         self.assertIn("## Baseline 2026-11-12 to 2026-11-14", pm.markdown(out))
 
@@ -365,19 +494,19 @@ class Caps(Base):
 class Integrated(unittest.TestCase):
     def test_build_report_adds_the_section_and_markdown_without_e2e_says_unavailable(self):
         with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as c:
-            t = dt.datetime(2026, 11, 13, 9, 0, tzinfo=UTC)
+            t = dt.datetime(2026, 11, 11, 9, 0, tzinfo=UTC)
             tick = {"repos": [{"repo": REPO, "prs": [], "errors": [], "required_contexts": ["Test (app_id=1)"],
-                               "base_poison": {"red_everywhere": {"Test": "2026-11-13T09:30:00Z"}}}]}
+                               "base_poison": {"red_everywhere": {"Test": "2026-11-11T09:30:00Z"}}}]}
             (Path(d) / f"acme_repo-{lr.dt.datetime.strftime(t, '%Y%m%dT%H%M%SZ')}.json").write_text(json.dumps(tick))
-            p = pr(1, T(13, "08:00"), T(13, "09:00"))
-            gh = world([p], base_commits=[commit(p["merge_commit_sha"], date=T(13, "09:00"))])
-            rep = lr.build_report(d, dt.timedelta(days=3), NOW, e2e={"cache_dir": c, "cap": 50, "owner": OWNER, "fetch": gh})
+            p = pr(1, T(11, "08:00"), T(11, "09:00"))
+            gh = world([p], base_commits=[commit(p["merge_commit_sha"], date=T(11, "09:00"))])
+            rep = lr.build_report(d, dt.timedelta(days=4), NOW, e2e={"cache_dir": c, "cap": 50, "owner": OWNER, "fetch": gh})
             e = rep["end_to_end"]["repos"][REPO]
-            self.assertEqual(e["per_day"]["2026-11-13"]["merged"], 1)
+            self.assertEqual(e["per_day"]["2026-11-11"]["ready_prs"], 1)
             self.assertEqual(e["prs"][0]["correct"]["base_red_source"], "ticks")
-            self.assertIn("End-to-end per eligible PR", lr.markdown(rep))
+            self.assertIn("end-to-end per eligible PR", lr.markdown(rep))
             self.assertFalse([x for x in gh.calls if "rules/branches" in x])  # required contexts came from the tick
-            plain = lr.build_report(d, dt.timedelta(days=3), NOW)
+            plain = lr.build_report(d, dt.timedelta(days=4), NOW)
             self.assertIsNone(plain["end_to_end"])
             self.assertIn("no --e2e-cache", lr.markdown(plain))
 
