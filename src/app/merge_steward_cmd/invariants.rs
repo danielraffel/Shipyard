@@ -145,6 +145,13 @@ pub(crate) struct Invariant {
     /// What filing the `fleet-followup` issue did this pass, when it ran.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub followup: Option<String>,
+    /// For a failure with a known false-positive fix: which release carries
+    /// it and when this host should have it. See [`fix_hint`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fix_hint: Option<String>,
+    /// [`fix_hint`] as one space-free token for the tick's summary line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fix_hint_token: Option<String>,
 }
 
 impl Invariant {
@@ -203,6 +210,129 @@ pub(crate) fn summary_token(invariants: &[Invariant]) -> String {
         "ok".to_owned()
     } else {
         format!("FAIL:{}", failed.join(","))
+    }
+}
+
+/// Invariants with a known false positive: id, the fix's reference, the
+/// minimum release carrying it. A failure of one of these on a host older than
+/// the release is probably the old bug, not a real incident.
+const KNOWN_FIXES: [(&str, &str, &str); 1] = [(
+    PRODUCER,
+    "#1382 (a templated job name counts as a producer)",
+    "0.433.0",
+)];
+/// The repository whose releases carry the steward.
+const RELEASE_REPO: &str = "danielraffel/Shipyard";
+/// How long after a release publishes a host is assumed to have updated its
+/// tools. An assumption (the host's tool-freshness interval), not read from
+/// the host's config.
+pub(crate) const HOST_FRESHNESS_MINUTES: i64 = 30;
+
+fn parse_version(text: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = text.trim().trim_start_matches('v').split('.');
+    let mut next = || parts.next()?.split(['-', '+']).next()?.parse::<u64>().ok();
+    let version = (next()?, next()?, next()?);
+    parts.next().is_none().then_some(version)
+}
+
+/// The hint for a failing invariant, or `None` for an id with no known fix.
+/// `latest` reads the latest published release tag; it is called only when the
+/// running version is older than the fix.
+#[must_use]
+pub(crate) fn fix_hint(
+    id: &str,
+    running: &str,
+    now: DateTime<Utc>,
+    latest: impl FnOnce() -> Option<String>,
+) -> Option<(String, String)> {
+    let &(_, reference, fixed) = KNOWN_FIXES.iter().find(|(known, _, _)| *known == id)?;
+    let number = reference.split_whitespace().next()?;
+    let fixed_version = parse_version(fixed)?;
+    let running_version = parse_version(running)?;
+    if running_version >= fixed_version {
+        return Some((
+            format!(
+                "fix {reference} is present (host on v{running}, fix in v{fixed}); failure is real"
+            ),
+            format!("fix{number}@v{fixed},host=v{running},real"),
+        ));
+    }
+    let published = latest()
+        .and_then(|tag| parse_version(&tag))
+        .is_some_and(|tag| tag >= fixed_version);
+    let eta_time = (now + chrono::Duration::minutes(HOST_FRESHNESS_MINUTES))
+        .format("%H:%MZ")
+        .to_string();
+    let token = format!(
+        "fix{number}@v{fixed},host=v{running},eta={}",
+        if published {
+            eta_time.as_str()
+        } else {
+            "unknown"
+        }
+    );
+    let eta = if published {
+        format!(
+            "ETA {eta_time} (a release with the fix is published; assumes the host's {HOST_FRESHNESS_MINUTES} min tool-freshness interval)"
+        )
+    } else {
+        "ETA unknown (no published release with the fix yet)".to_owned()
+    };
+    Some((
+        format!("fix {reference} ships in v{fixed}; host on v{running}; {eta}"),
+        token,
+    ))
+}
+
+/// Attach [`fix_hint`] to each incident. The latest release is read at most
+/// once, through the argv the release observation uses so the pass cache
+/// answers it, and not at all when nothing fails.
+fn attach_fix_hints(
+    actions: &GitHubActions,
+    invariants: &mut [Invariant],
+    running: &str,
+    now: DateTime<Utc>,
+) {
+    let mut cached: Option<Option<String>> = None;
+    for invariant in invariants.iter_mut().filter(|row| row.incident()) {
+        let hint = fix_hint(&invariant.id, running, now, || {
+            cached
+                .get_or_insert_with(|| {
+                    let raw = actions
+                        .run_gh(&[
+                            "api".to_owned(),
+                            format!("repos/{RELEASE_REPO}/releases/latest"),
+                        ])
+                        .ok()?;
+                    let release: Value = serde_json::from_str(&raw).ok()?;
+                    release.get("tag_name")?.as_str().map(str::to_owned)
+                })
+                .clone()
+        });
+        if let Some((text, token)) = hint {
+            invariant.fix_hint = Some(text);
+            invariant.fix_hint_token = Some(token);
+        }
+    }
+}
+
+/// The incident hints for the summary line: ` [id: hint; ...]`, empty when
+/// none apply.
+#[must_use]
+pub(crate) fn summary_hints(invariants: &[Invariant]) -> String {
+    let hints: Vec<String> = invariants
+        .iter()
+        .filter(|row| row.incident())
+        .filter_map(|row| {
+            row.fix_hint
+                .as_ref()
+                .map(|hint| format!("{}: {hint}", row.id))
+        })
+        .collect();
+    if hints.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", hints.join("; "))
     }
 }
 
@@ -724,6 +854,7 @@ pub(super) fn run(
             });
         record(state_path, repo, &mut invariants, followup.as_ref(), now);
     }
+    attach_fix_hints(actions, &mut invariants, env!("CARGO_PKG_VERSION"), now);
     invariants
 }
 
