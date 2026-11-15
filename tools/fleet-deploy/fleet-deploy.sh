@@ -92,16 +92,23 @@ install_file() {
 # after SECONDS, so a hung launcher or check can never hold the deploy lock.
 bounded() {
   /usr/bin/python3 -c '
-import subprocess, sys
+import os, signal, subprocess, sys
 try:
-    run = subprocess.run(sys.argv[2:], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                         stdin=subprocess.DEVNULL, timeout=float(sys.argv[1]))
-except subprocess.TimeoutExpired:
-    sys.exit(124)
+    proc = subprocess.Popen(sys.argv[2:], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            stdin=subprocess.DEVNULL, start_new_session=True)
+    try:
+        out, _ = proc.communicate(timeout=float(sys.argv[1]))
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.communicate()
+        sys.exit(124)
 except OSError:
     sys.exit(126)
-sys.stdout.buffer.write(run.stdout)
-sys.exit(run.returncode)
+sys.stdout.buffer.write(out)
+sys.exit(proc.returncode)
 ' "$@"
 }
 launcher_timeout="${FLEET_DEPLOY_LAUNCHER_TIMEOUT_S:-45}"
@@ -298,27 +305,34 @@ if [ "${FLEET_DEPLOY_FLEET_LOOP:-on}" != off ] && [ -f "$root/fleet-handbook/scr
          "$(git -C "$hb" rev-parse HEAD:scripts/pass-runner/pr_trust.py 2>/dev/null)")
   have=$(cat "$root/fleet-loop.rev" 2>/dev/null || echo none)
   if [ "$want" != "$have" ]; then
-    # backup hosts: "mode": "backup" with "primary_host"
-    args=$(/usr/bin/python3 - "$fleet_loop_cfg" <<'PY' 2>/dev/null
-import json, sys
-c = json.load(open(sys.argv[1]))
-if c.get("mode") == "backup":
-    print("--backup-for", c["primary_host"])
-PY
-    ) || args="__unreadable__"
-    if [ "$args" = "__unreadable__" ]; then
+    # Validate the role and return only a single safe hostname for a backup.
+    host=$(/usr/bin/python3 - "$fleet_loop_cfg" <<'PYCONFIG' 2>/dev/null
+import json, re, sys
+with open(sys.argv[1]) as f:
+    c = json.load(f)
+if not isinstance(c, dict) or c.get("mode") not in ("primary", "backup"):
+    sys.exit(1)
+if c["mode"] == "backup":
+    host = c.get("primary_host")
+    if not isinstance(host, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", host):
+        sys.exit(1)
+    print(host)
+PYCONFIG
+    ) || host="__unreadable__"
+    if [ "$host" = "__unreadable__" ]; then
       say "unit=fleet-loop refused reason=config_unreadable"
     else
-      [ -f "$fleet_loop_webhook" ] && args="$args --webhook"
+      args=()
+      [ -n "$host" ] && args+=(--backup-for "$host")
+      [ -f "$fleet_loop_webhook" ] && args+=(--webhook)
       out="$root/fleet-loop-install-$stamp.log"
       export OUT="$out"
-      # shellcheck disable=SC2086
       bounded "$fleet_loop_timeout" /bin/bash -c 'cd "$1" && shift && bash scripts/fleet-loop/install-fleet-loop.sh "$@" >"$OUT" 2>&1' \
-        _ "$hb" $args >/dev/null 2>&1
+        _ "$hb" ${args[@]+"${args[@]}"} >/dev/null 2>&1
       rc=$?
       if [ "$rc" = 0 ]; then
         echo "$want" > "$root/fleet-loop.rev"
-        say "unit=fleet-loop installed rev=$(git -C "$hb" rev-parse --short=12 HEAD) args=[${args# }]"
+        say "unit=fleet-loop installed rev=$(git -C "$hb" rev-parse --short=12 HEAD) args=[${args[*]-}]"
       else
         say "unit=fleet-loop refused rc=$rc log=$out"
       fi

@@ -268,6 +268,25 @@ class FleetDeployTests(unittest.TestCase):
         self.assertLess(time.time() - started, 20)
         self.assertIn("unit=fleet-loop refused rc=124", self.log.read_text())
 
+    def test_fleet_loop_rejects_invalid_roles_and_hosts(self):
+        for config in ('{"mode":"unknown"}', '{"mode":"backup", "primary_host":""}',
+                       '{"mode":"backup", "primary_host":"bad host"}',
+                       '{"mode":"backup", "primary_host":"*.local"}'):
+            with self.subTest(config=config):
+                self.enable_loop(config)
+                self.run_deploy()
+                self.assertEqual(self.loop_installs(), [])
+                self.assertIn("unit=fleet-loop refused reason=config_unreadable", self.log.read_text())
+
+    def test_fleet_loop_timeout_kills_delayed_descendant(self):
+        self.enable_loop()
+        self.commit("fleet-handbook", "scripts/fleet-loop/install-fleet-loop.sh",
+                    "#!/bin/bash\n(sleep 3; echo escaped > \"$FLEET_PASS_LIVE/escaped\") &\nwait\n")
+        self.run_deploy(FLEET_DEPLOY_FLEET_LOOP_TIMEOUT_S="1")
+        time.sleep(4)
+        self.assertFalse((self.live / "escaped").exists())
+        self.assertIn("unit=fleet-loop refused rc=124", self.log.read_text())
+
     def test_fleet_loop_off_switch(self):
         self.enable_loop()
         self.run_deploy(FLEET_DEPLOY_FLEET_LOOP="off")
