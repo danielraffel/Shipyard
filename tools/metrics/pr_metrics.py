@@ -1,0 +1,842 @@
+"""End-to-end metrics per merged PR, per repo, per UTC day (merge day).
+
+Used by loss_report.py. Standard library only. Reads GitHub through `ghread api`
+(Generous-Corp) or `ghapp api` (everything else), caches every answer worth
+keeping on disk, and stops at a per-run read cap (`truncated`). Anything it
+cannot read is "unknown" or null, never a zero.
+
+Definitions (also in docs/metrics.md):
+  autonomous merge rate  PRs merged that day with no owner action from opening to merge,
+                         over PRs where that is determinable; the rest count as unknown.
+  handoff-to-merge time  median and p90 minutes from the first ready-for-review moment
+                         to merged_at.
+  compute per merged PR  Actions job minutes over runs on the PR's heads plus its
+                         merge_group runs, split self-hosted and hosted.
+  correctness            share of merged PRs with a revert or a red required check on the
+                         base within 7 days; provisional while the window is open.
+"""
+from __future__ import annotations
+
+import collections
+import datetime as dt
+import json
+import math
+import os
+import re
+import statistics
+import subprocess
+
+UTC = dt.timezone.utc
+WINDOW = dt.timedelta(days=7)
+# Timeline events that are an actor's own action on the PR (noise like
+# `subscribed` or `cross-referenced` is not).
+ACTION_EVENTS = {
+    "labeled", "unlabeled", "commented", "reviewed", "review_dismissed", "review_requested",
+    "review_request_removed", "closed", "reopened", "merged", "assigned", "unassigned",
+    "ready_for_review", "converted_to_draft", "auto_merge_enabled", "auto_merge_disabled",
+    "enqueued", "dequeued", "milestoned", "demilestoned", "renamed", "base_ref_changed",
+}
+AGENT_TRAILER_RE = re.compile(
+    r"co-authored-by:[^\n]*(claude|codex|anthropic|openai|copilot)|generated with[^\n]*(claude|codex)"
+    r"|^(version-bump|skill-update|release)\s*:", re.I | re.M)
+BAD_CONCLUSIONS = {"failure", "timed_out"}
+FACTS_VERSION = 3
+ESCAPE_WINDOW = dt.timedelta(days=14)
+HORIZON = dt.timedelta(hours=48)
+MIN_SAMPLE = 50
+UNKNOWN_RANGE_SHARE = 0.20
+SCORECARD_VERSION = "2026-11-15.1"
+MERGE_MAIN_RE = re.compile(r"^Merge (remote-tracking )?branch '?(origin/)?(main|master)'?|^Merge pull request .* from .*/main", re.I)
+# Positive controls: a real revert (#124 reverted #119), a real escaped defect (#126 names #116).
+DEFAULT_CONTROLS = {"danielraffel/fleet-handbook": {"revert": [(119, 124)], "escape": [(116, 126)]}}
+# Labels that take a PR out of the eligible cohort, with the reason reported.
+EXCLUDE_LABELS = {"automation": "automation", "shipyard:unmanaged": "unmanaged", "superseded": "superseded"}
+INTEGRATION_BASES = ("develop/", "release/")
+REPAIRED_RE = re.compile(r"^\s*repaired\s*:", re.I)
+HOLD_RE = re.compile(r"^\s*[*_#> ]*(HOLD\b|(?i:verdict)\s*:\s*HOLD\b)", re.M)
+ESCAPE_RE = r"(?i)\b(fix\w*|regress\w*|broke\w*|broken|caused|introduc\w*)\b[^\n]{0,60}?(?<![\w#])#%d(?!\d)"
+
+
+class Truncated(Exception):
+    """The per-run read cap was reached."""
+
+
+class ReadError(Exception):
+    pass
+
+
+def iso(s):
+    if not s:
+        return None
+    try:
+        d = dt.datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return d if d.tzinfo else d.replace(tzinfo=UTC)
+
+
+def fmt(t):
+    return t.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def gh_runner(repo):
+    """The command that reads `repo`: the read-only admission reader for Generous-Corp, else the App."""
+    tool = "ghread" if repo.startswith("Generous-Corp/") else "ghapp"
+
+    def run(path):
+        try:
+            p = subprocess.run([tool, "api", path], capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            raise ReadError(f"{tool}: {type(e).__name__}") from e
+        if p.returncode != 0:
+            raise ReadError(f"{tool} exit {p.returncode}: {p.stderr.strip()[:120]}")
+        try:
+            return json.loads(p.stdout)
+        except ValueError as e:
+            raise ReadError(f"{tool}: not JSON") from e
+    return run
+
+
+class Reader:
+    """GitHub GET with a hard cap on calls for one repo in one run, and an on-disk cache."""
+
+    def __init__(self, repo, cache_dir, cap, fetch=None):
+        self.repo, self.cap, self.calls = repo, cap, 0
+        self.fetch = fetch or gh_runner(repo)
+        self.root = os.path.join(cache_dir, repo.replace("/", "__"))
+        self.truncated = False
+        self.errors = 0
+
+    def get(self, path):
+        if self.calls >= self.cap:
+            self.truncated = True
+            raise Truncated()
+        self.calls += 1
+        try:
+            return self.fetch(f"repos/{self.repo}/{path}")
+        except ReadError:
+            self.errors += 1
+            raise
+
+    def pages(self, path, key=None, max_pages=3):
+        """All items of a paginated list (up to max_pages of 100). Returns (items, complete)."""
+        out = []
+        sep = "&" if "?" in path else "?"
+        for n in range(1, max_pages + 1):
+            d = self.get(f"{path}{sep}per_page=100&page={n}")
+            items = d.get(key, []) if key and isinstance(d, dict) else d
+            if not isinstance(items, list):
+                raise ReadError("unexpected shape")
+            out += items
+            if len(items) < 100:
+                return out, True
+        return out, False
+
+    def load(self, kind, name):
+        try:
+            with open(os.path.join(self.root, kind, f"{name}.json")) as fh:
+                return json.load(fh)
+        except (OSError, ValueError):
+            return None
+
+    def save(self, kind, name, data):
+        d = os.path.join(self.root, kind)
+        try:
+            os.makedirs(d, exist_ok=True)
+            tmp = os.path.join(d, f"{name}.json.tmp")
+            with open(tmp, "w") as fh:
+                json.dump(data, fh)
+            os.replace(tmp, os.path.join(d, f"{name}.json"))
+        except OSError:
+            pass  # a cache that cannot be written only costs a re-read
+
+
+# ----------------------------------------------------------- per-PR facts
+def commit_date(c):
+    return iso(((c.get("commit") or {}).get("committer") or {}).get("date"))
+
+
+def pr_facts(rd, pr, owner):
+    """Timeline and commits of one PR (merged or not), reduced to what the metrics need."""
+    n = pr["number"]
+    tl, tl_full = rd.pages(f"issues/{n}/timeline", max_pages=5)
+    commits, c_full = rd.pages(f"pulls/{n}/commits", max_pages=3)
+    created, merged = iso(pr["created_at"]), iso(pr.get("merged_at"))
+    # first ready-for-review: opened as a draft means ready at the first ready_for_review event;
+    # first lifecycle event a conversion to draft, or none on a non-draft PR, means ready when opened.
+    life = sorted((iso(e.get("created_at")), e["event"]) for e in tl
+                  if e.get("event") in ("ready_for_review", "converted_to_draft") and e.get("created_at"))
+    if life and life[0][1] == "ready_for_review":
+        ready = life[0][0]
+    elif life:
+        ready = created
+    else:
+        ready = None if pr.get("draft") else created
+    owner_events, repairs, holds, ejections, enqueues = [], [], [], [], 0
+    for e in tl:
+        ev, ts = e.get("event"), e.get("created_at") or e.get("submitted_at")
+        body = e.get("body") or ""
+        if ev in ("commented", "reviewed") and ts:
+            if REPAIRED_RE.search(body):
+                repairs.append(ts)
+            if HOLD_RE.search(body):
+                holds.append(ts)
+        if ev in ("added_to_merge_queue", "enqueued"):
+            enqueues += 1
+        if ev in ("removed_from_merge_queue", "dequeued") and (e.get("reason") or "unknown") != "merged":
+            ejections.append(e.get("reason") or "unknown")
+        if ev not in ACTION_EVENTS:
+            continue
+        who = ((e.get("actor") or e.get("user") or {}).get("login") or "")
+        if who.lower() == owner.lower() and ts:
+            owner_events.append([ev, ts])
+    heads = {pr["head"]["sha"]}
+    for e in tl:
+        if e.get("event") == "head_ref_force_pushed":
+            heads.update(x for x in (e.get("before_sha"), e.get("after_sha")) if x)
+    ambiguous, pushes = [], {}
+    for c in commits:
+        heads.add(c["sha"])
+        d = commit_date(c)
+        msg = (c.get("commit") or {}).get("message") or ""
+        logins = {((c.get("author") or {}).get("login") or "").lower(), ((c.get("committer") or {}).get("login") or "").lower()}
+        if owner.lower() in logins and not AGENT_TRAILER_RE.search(msg) and d:
+            ambiguous.append(fmt(d))
+        if ready and d and d > ready:  # a push after the first ready moment, one per distinct commit minute
+            pushes[fmt(d)[:16]] = (MERGE_MAIN_RE.search(msg.splitlines()[0] if msg else "") is not None, d)
+    split = {"repair": 0, "author": 0, "merge_main": 0}
+    pivot = min([iso(x) for x in holds + repairs], default=None)
+    for is_merge, d in pushes.values():
+        split["merge_main" if is_merge else "repair" if pivot and d > pivot else "author"] += 1
+    hs = sorted(iso(x) for x in holds)
+    rep = sorted(iso(x) for x in repairs)
+    pushd = sorted(d for _, d in pushes.values())
+    re_holds = sum(1 for i in range(1, len(hs)) if any(hs[i - 1] < x < hs[i] for x in rep + pushd))
+    size = None
+    if holds:  # the size bucket is only needed for re-HOLD rates, so only PRs with a HOLD cost a detail read
+        d = rd.get(f"pulls/{n}")
+        size = (d.get("additions") or 0) + (d.get("deletions") or 0)
+    heads.discard(None)
+    return {
+        "v": FACTS_VERSION, "number": n, "base": pr["base"]["ref"], "created_at": fmt(created),
+        "merged_at": fmt(merged) if merged else None, "state": pr.get("state"),
+        "merge_commit_sha": pr.get("merge_commit_sha"), "first_ready": fmt(ready) if ready else None,
+        "owner_events": owner_events, "ambiguous_commits": sorted(set(ambiguous)),
+        "repair_cycles": len(repairs), "holds": len(holds), "re_holds": re_holds, "size": size,
+        "pushes": split, "enqueues": enqueues, "ejections": ejections,
+        "labels": sorted(l["name"] for l in pr.get("labels") or []),
+        "heads": sorted(heads), "timeline_complete": tl_full, "commits_complete": c_full,
+    }
+
+
+def eligible(f, managed_base):
+    """(True, None) or (False, reason). Out: never ready (still a draft), a base that is not the managed
+    base or an integration base, or a label from EXCLUDE_LABELS."""
+    if not f.get("first_ready"):
+        return False, "never_ready"
+    for lab in f.get("labels") or []:
+        if lab in EXCLUDE_LABELS:
+            return False, EXCLUDE_LABELS[lab]
+    b = f["base"]
+    if b != managed_base and not b.startswith(INTEGRATION_BASES):
+        return False, "unmanaged_base"
+    return True, None
+
+
+def north_star(f, commits=True):
+    """autonomous, owner_action, unknown or not_merged for one ready PR, over the 48h horizon.
+
+    autonomous: merged within 48h of ready with no owner event between ready and merge.
+    owner_action: an owner-account timeline event in that interval.
+    unknown: merged in time with no such event, but an owner-identity commit with no agent trailer
+        (commits=True), or a timeline or commit list not read in full.
+    not_merged: not merged within 48h and no owner event.
+    commits=False ignores commits: only GitHub-side owner actions count."""
+    r = iso(f["first_ready"])
+    h = r + HORIZON
+    m = iso(f.get("merged_at"))
+    end = min(m, h) if m else h
+    if any(r <= iso(ts) <= end for _, ts in f["owner_events"]):
+        return "owner_action"
+    if not m or m > h:
+        return "not_merged"
+    if (commits and any(iso(d) <= end for d in f["ambiguous_commits"])) or not (f["timeline_complete"] and f["commits_complete"]):
+        return "unknown"
+    return "autonomous"
+
+
+# --------------------------------------------------------------- compute
+def job_minutes(rd, run):
+    """(self_hosted_min, hosted_min, complete) for one run, read once ever when it has completed."""
+    rid = run["id"]
+    cached = rd.load("jobs", str(rid))
+    if cached:
+        return cached["self_hosted"], cached["hosted"], True
+    jobs, full = rd.pages(f"actions/runs/{rid}/jobs?filter=all", key="jobs", max_pages=3)
+    sh = ho = 0.0
+    for j in jobs:
+        a, b = iso(j.get("started_at")), iso(j.get("completed_at"))
+        if not a or not b or j.get("conclusion") == "skipped":
+            continue
+        m = max(0.0, (b - a).total_seconds() / 60.0)
+        if "self-hosted" in (j.get("labels") or []):
+            sh += m
+        else:
+            ho += m
+    done = run.get("status") == "completed" and full
+    if done:
+        rd.save("jobs", str(rid), {"self_hosted": round(sh, 2), "hosted": round(ho, 2)})
+    return round(sh, 2), round(ho, 2), done
+
+
+def runs_index(rd, lo, hi):
+    """Runs created in [lo, hi]: (list, complete). One read per page, shared by every PR in the window."""
+    runs, full = rd.pages(f"actions/runs?created={fmt(lo)}..{fmt(hi)}", key="workflow_runs", max_pages=10)
+    return runs, full
+
+
+def push_repeats_of_group_shas(runs):
+    """(push runs, push runs that repeat a merge_group run of the same workflow on the same sha).
+    The queue fast-forwards the base to the group sha, so such a push re-runs what the group already proved."""
+    group = {(r.get("name"), r.get("head_sha")) for r in runs if r.get("event") == "merge_group"}
+    push = [r for r in runs if r.get("event") == "push"]
+    return len(push), sum(1 for r in push if (r.get("name"), r.get("head_sha")) in group)
+
+
+def pr_compute(rd, f, runs, runs_complete):
+    heads = set(f["heads"])
+    mg = re.compile(rf"^gh-readonly-queue/{re.escape(f['base'])}/pr-{f['number']}-")
+    mine, group_shas = {}, set()
+    for r in runs:
+        if r.get("head_sha") in heads or (r.get("event") == "merge_group" and mg.match(r.get("head_branch") or "")):
+            mine[r["id"]] = r
+            if r.get("event") == "merge_group":
+                group_shas.add(r.get("head_sha"))
+    # a push to the base on a sha a merge group already ran: the merge queue fast-forwards the base to the group
+    for r in runs:
+        if r["id"] not in mine and r.get("event") == "push" and r.get("head_sha") in group_shas:
+            mine[r["id"]] = r
+    # a repeat is a run of a workflow on a sha that workflow already ran on (reruns, a push on a merge-group sha)
+    seen, repeats = {}, 0
+    for r in sorted(mine.values(), key=lambda x: (x.get("event") != "merge_group", x["id"])):
+        k = (r.get("name"), r.get("head_sha"))
+        repeats += k in seen
+        seen[k] = True
+    sh = ho = 0.0
+    complete = runs_complete
+    for r in mine.values():
+        a, b, ok = job_minutes(rd, r)
+        sh += a
+        ho += b
+        complete = complete and ok
+    return {"self_hosted_min": round(sh, 1), "hosted_min": round(ho, 1), "runs": len(mine), "repeat_runs": repeats,
+            "group_runs": sum(1 for r in mine.values() if r.get("event") == "merge_group"), "complete": complete}
+
+
+# ----------------------------------------------------------- correctness
+def strip_app(ctx):
+    return re.sub(r"\s*\(app_id=\d+\)$", "", ctx)
+
+
+def required_contexts(rd, base, tick_ctx):
+    if tick_ctx:
+        return {strip_app(c) for c in tick_ctx}
+    try:
+        rules = rd.get(f"rules/branches/{base}")
+    except ReadError:
+        return None
+    out = set()
+    for r in rules if isinstance(rules, list) else []:
+        if r.get("type") == "required_status_checks":
+            out |= {c["context"] for c in (r.get("parameters") or {}).get("required_status_checks", [])}
+    return out or None
+
+
+def commit_red(rd, sha, required):
+    """(red_contexts, settled). Cached once every check run has completed."""
+    cached = rd.load("checks", sha)
+    if cached is not None:
+        return set(cached["red"]) & required, True
+    runs, _ = rd.pages(f"commits/{sha}/check-runs", key="check_runs", max_pages=2)
+    latest = {}
+    for c in runs:
+        k = c["name"]
+        if k not in latest or (c.get("started_at") or "") > (latest[k].get("started_at") or ""):
+            latest[k] = c
+    settled = bool(latest) and all(c.get("status") == "completed" for c in latest.values())
+    red = {k for k, c in latest.items() if c.get("conclusion") in BAD_CONCLUSIONS}
+    if settled:
+        rd.save("checks", sha, {"red": sorted(red)})
+    return red & required, settled
+
+
+def revert_of(commits, f):
+    """A commit in the 7 days after the merge whose message starts `Revert` and names the merge sha or PR."""
+    merged = iso(f["merged_at"])
+    sha = (f.get("merge_commit_sha") or "")
+    pat = re.compile(rf"(?<![\w#]){re.escape('#' + str(f['number']))}(?!\d)")
+    for c in commits:
+        t = iso(((c.get("commit") or {}).get("committer") or {}).get("date"))
+        msg = (c.get("commit") or {}).get("message") or ""
+        if not t or not (merged <= t <= merged + WINDOW) or c["sha"] == sha:
+            continue
+        if not msg.lstrip().lower().startswith("revert"):
+            continue
+        if (sha and sha[:7] in msg) or pat.search(msg):
+            return c["sha"]
+    return None
+
+
+def poison_hit(ticks, repo, merged, until):
+    """True when a tick of `repo` reports a base_poison red-everywhere episode that began in [merged, until]."""
+    for began in ticks.get(repo, []):
+        if merged <= began <= until:
+            return True
+    return False
+
+
+def escaped_by(later, f):
+    """Best effort: the number of a later PR, merged within 14 days after this one, whose title or body
+    says it fixes or follows from this PR (`fix ... #N`, `regression from #N`). None when unreadable."""
+    rx = re.compile(ESCAPE_RE % f["number"])
+    merged = iso(f["merged_at"])
+    for p in later:
+        m = iso(p.get("merged_at"))
+        if p["number"] == f["number"] or not m or not (merged < m <= merged + ESCAPE_WINDOW):
+            continue
+        if rx.search(f"{p.get('title') or ''}\n{p.get('body') or ''}"):
+            return p["number"]
+    return None
+
+
+def pr_correct(rd, f, base_commits, commits_ok, required, ticks, now, later=None, later_ok=False):
+    merged = iso(f["merged_at"])
+    provisional = now < merged + WINDOW
+    out = {"provisional": provisional, "reverted": None, "base_red": None, "bad": None,
+           "escape_provisional": now < merged + ESCAPE_WINDOW, "escaped": None, "escaped_by": None}
+    if later_ok:
+        out["escaped_by"] = escaped_by(later or [], f)
+        out["escaped"] = out["escaped_by"] is not None
+    if commits_ok:
+        out["reverted"] = revert_of(base_commits, f) is not None
+    # base red: the merge commit and the next push to the base
+    nxt = None
+    if commits_ok and f.get("merge_commit_sha"):
+        chron = sorted(base_commits, key=lambda c: ((c.get("commit") or {}).get("committer") or {}).get("date") or "")
+        shas = [c["sha"] for c in chron]
+        if f["merge_commit_sha"] in shas and shas.index(f["merge_commit_sha"]) + 1 < len(shas):
+            nxt = chron[shas.index(f["merge_commit_sha"]) + 1]
+    until = merged + dt.timedelta(hours=2)
+    if nxt:
+        until = max(until, iso(nxt["commit"]["committer"]["date"]))
+    if poison_hit(ticks, rd.repo, merged, until):
+        out["base_red"] = True
+        out["base_red_source"] = "ticks"
+    elif required and f.get("merge_commit_sha"):
+        red, settled = commit_red(rd, f["merge_commit_sha"], required)
+        if nxt and not red:
+            red2, settled2 = commit_red(rd, nxt["sha"], required)
+            red, settled = red | red2, settled and settled2
+        if red:
+            out["base_red"], out["base_red_source"] = True, "check_runs"
+        elif settled:
+            out["base_red"], out["base_red_source"] = False, "check_runs"
+    if out["reverted"] or out["base_red"]:
+        out["bad"] = True
+    elif out["reverted"] is False and out["base_red"] is False:
+        out["bad"] = False
+    return out
+
+
+# -------------------------------------------------------------- aggregate
+def wilson(k, n, z=1.96):
+    """95% Wilson score interval for k of n, in percent, or None when n is 0."""
+    if not n:
+        return None
+    p = k / n
+    d = 1 + z * z / n
+    c = (p + z * z / (2 * n)) / d
+    h = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / d
+    return [round(100 * max(0.0, c - h), 1), round(100 * min(1.0, c + h), 1)]
+
+
+def pct_of(a, b):
+    return None if not b else round(100.0 * a / b, 1)
+
+
+def pctile(xs, p):
+    xs = sorted(xs)
+    return None if not xs else round(xs[max(0, math.ceil(p * len(xs)) - 1)], 1)
+
+
+def med(xs):
+    return None if not xs else round(statistics.median(xs), 1)
+
+
+def bucket(size):
+    return "unknown" if size is None else "<200" if size < 200 else "200-800" if size <= 800 else ">800"
+
+
+def summarize(rows):
+    """The scorecard over a list of eligible ready PRs (one row each)."""
+    n = len(rows)
+    ns = collections.Counter(r["north"] for r in rows)
+    gh = collections.Counter(r["north_gh"] for r in rows)
+    auto, unk = ns["autonomous"], ns["unknown"]
+    merged = [r for r in rows if r["merged"]]
+    hand = [r["handoff_min"] for r in merged]
+    comp = [r for r in merged if r["compute"] and r["compute"]["complete"]]
+    held = [r for r in rows if r["holds"]]
+    rehold = [r for r in held if r["re_holds"]]
+    by_size = {}
+    for r in held:
+        b = by_size.setdefault(bucket(r["size"]), {"prs_with_hold": 0, "prs_with_re_hold": 0})
+        b["prs_with_hold"] += 1
+        b["prs_with_re_hold"] += bool(r["re_holds"])
+    push = {k: sum(r["pushes"].get(k, 0) for r in rows) for k in ("repair", "author", "merge_main")}
+    ej = collections.Counter(c for r in rows for c in r["ejections"])
+    good = [r for r in merged if r["correct"] and r["correct"]["bad"] is False]
+    bad = [r for r in merged if r["correct"] and r["correct"]["bad"]]
+    esc_known = [r for r in merged if r["correct"] and r["correct"].get("escaped") is not None]
+    esc = [r for r in esc_known if r["correct"]["escaped"]]
+    return {
+        "ready_prs": n, "merged": len(merged),
+        "north_star": {
+            "autonomous": auto, "owner_action": ns["owner_action"], "unknown": unk, "not_merged_in_48h": ns["not_merged"],
+            "rate_pct": pct_of(auto, n), "rate_ci95": wilson(auto, n),
+            "rate_range_pct": [pct_of(auto, n), pct_of(auto + unk, n)],
+            "unknown_share_pct": pct_of(unk, n), "unknown_over_20pct": bool(n) and unk / n > UNKNOWN_RANGE_SHARE,
+            "insufficient_sample": n < MIN_SAMPLE,
+            "github_only": {"autonomous": gh["autonomous"], "owner_action": gh["owner_action"], "unknown": gh["unknown"],
+                            "rate_pct": pct_of(gh["autonomous"], n), "rate_ci95": wilson(gh["autonomous"], n)},
+        },
+        "rounds": {
+            "holds_per_ready_pr": None if not n else round(sum(r["holds"] for r in rows) / n, 2),
+            "prs_with_hold": len(held), "prs_with_re_hold": len(rehold),
+            "re_hold_rate_pct": pct_of(len(rehold), len(held)), "re_hold_rate_ci95": wilson(len(rehold), len(held)),
+            "by_size": dict(sorted(by_size.items())),
+        },
+        "pushes_per_ready_pr": {k: None if not n else round(v / n, 2) for k, v in push.items()},
+        "pushes_total": push,
+        "merge_queue": {
+            "attempts_per_ready_pr": None if not n else round(sum(r["enqueues"] for r in rows) / n, 2),
+            "ejections_by_cause": dict(ej.most_common()),
+        },
+        "dirty_per_100_prs": None if not n else round(100.0 * sum(1 for r in rows if r["dirty"]) / n, 1),
+        "interventions": {
+            "owner_actions_per_pr": None if not n else round(sum(r["owner_actions"] for r in rows) / n, 2),
+            "repair_cycles_per_pr": None if not n else round(sum(r["repair_cycles"] for r in rows) / n, 2),
+            "prs_with_owner_action": sum(1 for r in rows if r["owner_actions"]),
+            "prs_with_repair_cycle": sum(1 for r in rows if r["repair_cycles"]),
+        },
+        "handoff_min": {"n": len(hand), "median": med(hand), "p90": pctile(hand, 0.9),
+                        "note": "load-dependent context, not the verdict"},
+        "compute_per_merged_pr": {
+            "prs_read": len(comp), "prs_unread_or_partial": len(merged) - len(comp),
+            "runs_median": med([r["compute"]["runs"] for r in comp]),
+            "runs_mean": None if not comp else round(sum(r["compute"]["runs"] for r in comp) / len(comp), 2),
+            "repeat_runs_total": sum(r["compute"]["repeat_runs"] for r in comp),
+            "runs_total": sum(r["compute"]["runs"] for r in comp),
+            "context_self_hosted_min_median": med([r["compute"]["self_hosted_min"] for r in comp]),
+            "context_hosted_min_median": med([r["compute"]["hosted_min"] for r in comp]),
+        },
+        "correctness": {
+            "bad": len(bad), "good": len(good), "unknown": len(merged) - len(bad) - len(good),
+            "reverted": sum(1 for r in merged if r["correct"] and r["correct"]["reverted"]),
+            "base_red": sum(1 for r in merged if r["correct"] and r["correct"]["base_red"]),
+            "bad_rate_pct": pct_of(len(bad), len(bad) + len(good)), "bad_rate_ci95": wilson(len(bad), len(bad) + len(good)),
+            "provisional_prs": sum(1 for r in merged if r["correct"] and r["correct"]["provisional"]),
+            "escaped": len(esc), "escaped_known": len(esc_known),
+            "escaped_rate_pct": pct_of(len(esc), len(esc_known)), "escaped_rate_ci95": wilson(len(esc), len(esc_known)),
+            "escape_provisional_prs": sum(1 for r in merged if r["correct"] and r["correct"].get("escape_provisional")),
+            "escape_floor": "titles and bodies of later PRs naming the PR only",
+        },
+    }
+
+
+def all_prs(rd, lo, hi):
+    """PRs created in [lo, hi], newest first. Returns (prs, complete)."""
+    out, n = [], 0
+    while n < 8:
+        n += 1
+        items = rd.get(f"pulls?state=all&sort=created&direction=desc&per_page=100&page={n}")
+        if not isinstance(items, list):
+            raise ReadError("unexpected shape")
+        for p in items:
+            c = iso(p.get("created_at"))
+            if c and lo <= c <= hi:
+                out.append(p)
+        if len(items) < 100 or (items and (iso(items[-1].get("created_at")) or hi) < lo):
+            return out, True
+    return out, False
+
+
+def collect_repo(repo, cache_dir, cap, owner, lo, hi, now, ticks, tick_ctx, fetch=None, managed_base="main", dirty=()):
+    rd = Reader(repo, cache_dir, cap, fetch)
+    res = {"repo": repo, "rows": [], "unread": 0, "listing_complete": False, "reads": 0, "truncated": False, "errors": 0}
+    try:
+        prs, res["listing_complete"] = all_prs(rd, lo, hi)
+    except (Truncated, ReadError):
+        prs = []
+    merged_list = [p for p in prs if p.get("merged_at")]
+    facts = []
+    for pr in prs:
+        f = rd.load("facts", str(pr["number"]))
+        if f is not None and f.get("v") != FACTS_VERSION:
+            f = None  # cached by an older reduction: read again once
+        if f is None:
+            try:
+                f = pr_facts(rd, pr, owner)
+                if f["state"] == "closed":  # a closed PR does not change; an open one is read again next run
+                    rd.save("facts", str(pr["number"]), f)
+            except (Truncated, ReadError):
+                res["unread"] += 1
+                continue
+        ok, why = eligible(f, managed_base)
+        facts.append((f, ok, why))
+    mrows = [f for f, ok, _ in facts if ok and f["merged_at"]]
+    need = [f for f in mrows if rd.load("compute", str(f["number"])) is None]
+    runs, runs_ok = [], False
+    if need:
+        try:
+            runs, runs_ok = runs_index(rd, min(iso(f["created_at"]) for f in need), max(iso(f["merged_at"]) for f in need) + dt.timedelta(hours=1))
+        except (Truncated, ReadError):
+            pass
+    base_commits, commits_ok, req = [], False, None
+    if mrows:
+        try:
+            base_commits, commits_ok = rd.pages(
+                f"commits?sha={mrows[0]['base']}&since={fmt(min(iso(f['merged_at']) for f in mrows))}"
+                f"&until={fmt(max(iso(f['merged_at']) for f in mrows) + WINDOW + dt.timedelta(hours=2))}", max_pages=5)
+        except (Truncated, ReadError):
+            pass
+        try:
+            req = required_contexts(rd, mrows[0]["base"], tick_ctx.get(repo))
+        except (Truncated, ReadError):
+            pass
+    out = []
+    for f, ok, why in facts:
+        merged = f["merged_at"]
+        row = {"pr": f["number"], "eligible": ok, "excluded_because": why, "merged": bool(merged),
+               "ready_at": f["first_ready"], "merged_at": merged}
+        if f["first_ready"]:
+            row["day"] = f["first_ready"][:10]
+        row.update({
+            "north": north_star(f) if f["first_ready"] else None, "north_gh": north_star(f, False) if f["first_ready"] else None,
+            "handoff_min": round((iso(merged) - iso(f["first_ready"])).total_seconds() / 60.0, 1) if merged and f["first_ready"] else None,
+            "holds": f["holds"], "re_holds": f["re_holds"], "size": f["size"], "pushes": f["pushes"],
+            "enqueues": f["enqueues"], "ejections": f["ejections"], "dirty": f["number"] in dirty,
+            "owner_actions": sum(1 for _, ts in f["owner_events"] if f["first_ready"] and iso(f["first_ready"]) <= iso(ts) <= iso(f["first_ready"]) + HORIZON),
+            "repair_cycles": f["repair_cycles"], "compute": None, "correct": None,
+        })
+        if ok and merged:
+            comp = rd.load("compute", str(f["number"]))
+            if comp is None and runs_ok:
+                try:
+                    comp = pr_compute(rd, f, runs, runs_ok)
+                    if comp["complete"]:
+                        rd.save("compute", str(f["number"]), comp)
+                except (Truncated, ReadError):
+                    comp = None
+            row["compute"] = comp
+            corr = rd.load("correct", str(f["number"]))
+            if corr is None:
+                try:
+                    corr = pr_correct(rd, f, base_commits, commits_ok, req, ticks, now, merged_list, res["listing_complete"])
+                    if now >= iso(merged) + ESCAPE_WINDOW and corr["bad"] is not None and corr["escaped"] is not None:
+                        rd.save("correct", str(f["number"]), corr)
+                except (Truncated, ReadError):
+                    corr = {"provisional": True, "reverted": None, "base_red": None, "bad": None, "escaped": None, "escaped_by": None}
+            if corr.get("escaped") is None and res["listing_complete"]:  # independent of the base reads
+                corr["escaped_by"] = escaped_by(merged_list, f)
+                corr["escaped"] = corr["escaped_by"] is not None
+            corr["provisional"] = now < iso(merged) + WINDOW
+            corr["escape_provisional"] = now < iso(merged) + ESCAPE_WINDOW
+            row["correct"] = corr
+        out.append(row)
+    res.update(rows=out, reads=rd.calls, truncated=rd.truncated, errors=rd.errors)
+    return res
+
+
+def day_closed(day, now):
+    """A cohort day is reported once its 48h horizon has closed: the end of the day plus 48 hours."""
+    d = dt.datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=UTC)
+    return now >= d + dt.timedelta(days=1) + HORIZON
+
+
+def check_controls(repo, rows, controls, refused):
+    """Positive controls: a known revert, a known escaped defect, and owner-touched PRs must be found.
+    A control whose PR is not among the report's rows is `not_in_window` (unchecked, not passed)."""
+    by = {r["pr"]: r for r in rows}
+    c = (controls or {}).get(repo, {})
+    out = {"revert": {"expected": 0, "found": 0, "not_in_window": 0}, "escape": {"expected": 0, "found": 0, "not_in_window": 0},
+           "owner_touched": {"in_report": 0, "non_autonomous": 0, "not_in_window": 0}}
+    for reverted, _ in c.get("revert", []):
+        r = by.get(reverted)
+        if not r or not r["correct"] or r["correct"]["reverted"] is None:
+            out["revert"]["not_in_window"] += 1
+            continue
+        out["revert"]["expected"] += 1
+        out["revert"]["found"] += bool(r["correct"]["reverted"])
+    for escaped, naming in c.get("escape", []):
+        r = by.get(escaped)
+        if not r or not r["correct"] or r["correct"].get("escaped") is None:
+            out["escape"]["not_in_window"] += 1
+            continue
+        out["escape"]["expected"] += 1
+        out["escape"]["found"] += r["correct"].get("escaped_by") == naming
+    for n in sorted(refused or ()):
+        r = by.get(n)
+        if not r or not r["north"]:
+            out["owner_touched"]["not_in_window"] += 1
+            continue
+        out["owner_touched"]["in_report"] += 1
+        out["owner_touched"]["non_autonomous"] += r["north"] == "owner_action"
+    o = out
+    failed = []
+    if o["revert"]["found"] < o["revert"]["expected"]:
+        failed.append("revert control not found")
+    if o["escape"]["found"] < o["escape"]["expected"]:
+        failed.append("escaped-defect control not found")
+    if o["owner_touched"]["in_report"] and not o["owner_touched"]["non_autonomous"]:
+        failed.append("owner-touched control read as autonomous")
+    checked = o["revert"]["expected"] + o["escape"]["expected"] + o["owner_touched"]["in_report"]
+    out["status"] = "failed" if failed else "ok" if checked else "unchecked"
+    out["failed"] = failed
+    return out
+
+
+def build(repos, cache_dir, cap, owner, start, now, ticks, tick_ctx, baseline=None, fetch=None, bases=None,
+          dirty=None, controls=None, refused=None):
+    """The `end_to_end` report section. `ticks`: repo -> [datetimes a base_poison red-everywhere episode began]."""
+    lo = start
+    if baseline:
+        lo = min(lo, baseline[0])
+    per_cap = max(1, cap // max(1, len(repos)))
+    controls = DEFAULT_CONTROLS if controls is None else controls
+    out = {"scorecard_version": SCORECARD_VERSION, "owner": owner, "read_cap_per_repo": per_cap, "repos": {}, "truncated": False,
+           "reads": 0, "coverage": {"status": "available", "reason": ""}, "baseline": None, "window": None, "controls_failed": False}
+    notes = []
+    for repo in repos:
+        r = collect_repo(repo, cache_dir, per_cap, owner, lo, now, now, ticks, tick_ctx, fetch,
+                         (bases or {}).get(repo, "main"), (dirty or {}).get(repo, ()))
+        excluded = collections.Counter(x["excluded_because"] for x in r["rows"] if not x["eligible"])
+        elig = [x for x in r["rows"] if x["eligible"]]
+        days = {}
+        for x in elig:
+            days.setdefault(x["day"], []).append(x)
+        ctl = check_controls(repo, r["rows"], controls, (refused or {}).get(repo))
+        out["repos"][repo] = {
+            "per_day": {d: {"closed": day_closed(d, now), **summarize(v)} for d, v in sorted(days.items())},
+            "prs": r["rows"], "excluded": dict(excluded), "controls": ctl,
+            "unread_prs": r["unread"], "listing_complete": r["listing_complete"],
+            "reads": r["reads"], "truncated": r["truncated"], "read_errors": r["errors"],
+        }
+        out["truncated"] = out["truncated"] or r["truncated"]
+        out["reads"] += r["reads"]
+        out["controls_failed"] = out["controls_failed"] or ctl["status"] == "failed"
+        if r["truncated"] or r["unread"] or not r["listing_complete"] or r["errors"]:
+            notes.append(f"{repo}: truncated={r['truncated']} unread={r['unread']} listing_complete={r['listing_complete']} read_errors={r['errors']}")
+    if notes:
+        out["coverage"] = {"status": "partial", "reason": "; ".join(notes)}
+    ds = start.strftime("%Y-%m-%d")
+
+    def pooled(v, a, b):
+        rows = [p for p in v["prs"] if p["eligible"] and a <= p["day"] <= b and day_closed(p["day"], now)]
+        s = summarize(rows)
+        open_days = sorted({p["day"] for p in v["prs"] if p["eligible"] and a <= p["day"] <= b and not day_closed(p["day"], now)})
+        s["open_days_not_reported"] = open_days
+        return s
+    out["window"] = {"from": ds, "to": now.strftime("%Y-%m-%d"), "per_repo": {repo: pooled(v, ds, "9999") for repo, v in out["repos"].items()}}
+    if baseline:
+        b0, b1 = (x.strftime("%Y-%m-%d") for x in baseline)
+        per = {repo: pooled(v, b0, b1) for repo, v in out["repos"].items()}
+        floor = {}
+        for repo, v in out["repos"].items():
+            rates = {d: s["north_star"]["rate_pct"] for d, s in v["per_day"].items() if b0 <= d <= b1 and s["closed"] and s["ready_prs"]}
+            vals = [x for x in rates.values() if x is not None]
+            floor[repo] = {"north_star_rate_pct_by_day": rates, "spread_pp": None if len(vals) < 2 else round(max(vals) - min(vals), 1)}
+        out["baseline"] = {"from": b0, "to": b1, "per_repo": per, "noise_floor": floor}
+    for repo, s in out["window"]["per_repo"].items():  # window vs baseline: overlapping intervals mean no difference is claimed
+        bs = (out["baseline"] or {}).get("per_repo", {}).get(repo)
+        a, b = s["north_star"]["rate_ci95"], (bs or {}).get("north_star", {}).get("rate_ci95")
+        s["north_star"]["overlaps_baseline"] = None if not (a and b) else not (a[0] > b[1] or b[0] > a[1])
+    return out
+
+
+def ci(x):
+    return "n/a" if not x else f"{x[0]}-{x[1]}"
+
+
+def sample_label(s, truncated):
+    ns = s["north_star"]
+    why = []
+    if ns["insufficient_sample"]:
+        why.append(f"n<{MIN_SAMPLE}")
+    if ns.get("overlaps_baseline"):
+        why.append("interval overlaps baseline")
+    if truncated:
+        why.append("truncated")
+    return "insufficient sample (" + ", ".join(why) + ")" if why else "ok"
+
+
+def markdown(e2e):
+    L = ["", f"## Scorecard {e2e['scorecard_version']}: end-to-end per eligible PR (cohort = UTC day the PR became ready)", "",
+         "Baseline cohort: PRs ready 2026-11-12 to 2026-11-14. A day closes 48h after it ends, so the first comparable later cohort day closes 48h after that day.", "",
+         f"Reads {e2e['reads']} (cap {e2e['read_cap_per_repo']} per repo), truncated={str(e2e['truncated']).lower()}"
+         + (" : a truncated window is insufficient sample" if e2e["truncated"] else "") + f". Coverage: {e2e['coverage']['status']} {e2e['coverage']['reason']}", "",
+         f"North Star: eligible PRs that became ready in the window and merged within 48h of ready with no owner action ({e2e['owner']}'s own account: "
+         "review, label, comment, UI merge or close), over ALL eligible PRs ready in the window. A cohort day is reported only after its 48h horizon closed. "
+         "An owner-identity commit with no agent trailer makes a PR unknown; above 20% unknown the rate is a range. `gh-only` ignores commits. "
+         "Rates carry a 95% Wilson interval; below 50 PRs, or when the interval overlaps the baseline's, the sample is insufficient and no difference is claimed. "
+         "Handoff-to-merge is load-dependent context, not the verdict. Verdict proxies: review rounds (HOLDs) and re-HOLD rate per PR, agent pushes by kind "
+         "(repair after a HOLD or `repaired:`, author before, merge-main), merge-queue attempts and ejections by cause, DIRTY per 100 PRs, gate runs per merged PR "
+         "(repeats counted; minutes are context). Correctness: revert or red required check on the base within 7 days; escaped defect (best effort, titles and bodies naming the PR only) within 14.", ""]
+    if e2e["controls_failed"]:
+        L += ["**CONTROL FAILED: nothing is reported.** A positive control read zero, so the instrument or the repo coverage is broken:", ""]
+        for repo, v in sorted(e2e["repos"].items()):
+            for f in v["controls"]["failed"]:
+                L.append(f"- {repo}: {f}")
+        return "\n".join(L) + "\n"
+    head = ("| {0} | ready PRs | autonomous a/o/unknown/not merged | rate (CI95) | range if unknown>20% | unknown | gh-only rate | sample | "
+            "holds/PR | re-HOLD rate (CI95) | pushes/PR repair/author/merge-main | queue attempts/PR | ejections | DIRTY/100 | owner actions/PR | repair cycles/PR | "
+            "runs per merged PR median/mean (repeats) | handoff median/p90 min (context) | correctness bad/good/unk | bad rate (CI95) | escaped (CI95) | context min sh/hosted |")
+    sep = "|" + "---|" * 22
+
+    def row(label, s, ctl="", trunc=False):
+        a, r, p, c, k, h = s["north_star"], s["rounds"], s["pushes_per_ready_pr"], s["compute_per_merged_pr"], s["correctness"], s["handoff_min"]
+        rng = f"{a['rate_range_pct'][0]}-{a['rate_range_pct'][1]}%" if a["unknown_over_20pct"] else "-"
+        ej = ", ".join(f"{k2} {n}" for k2, n in s["merge_queue"]["ejections_by_cause"].items()) or "0"
+        zero_bad = f" (control: reverts {ctl['revert']['found']}/{ctl['revert']['expected']})" if ctl and ctl["revert"]["expected"] and k["reverted"] == 0 and k["base_red"] == 0 else ""
+        zero_esc = f" (control: escapes {ctl['escape']['found']}/{ctl['escape']['expected']})" if ctl and ctl["escape"]["expected"] and k["escaped"] == 0 else ""
+        return (f"| {label} | {s['ready_prs']} | {a['autonomous']}/{a['owner_action']}/{a['unknown']}/{a['not_merged_in_48h']} | "
+                f"{a['rate_pct']}% ({ci(a['rate_ci95'])}) | {rng} | {a['unknown_share_pct']}% | {a['github_only']['rate_pct']}% ({ci(a['github_only']['rate_ci95'])}) | "
+                f"{sample_label(s, trunc)} | {r['holds_per_ready_pr']} | {r['re_hold_rate_pct']}% ({ci(r['re_hold_rate_ci95'])}), n={r['prs_with_hold']} | "
+                f"{p['repair']}/{p['author']}/{p['merge_main']} | {s['merge_queue']['attempts_per_ready_pr']} | {ej} | {s['dirty_per_100_prs']} | "
+                f"{s['interventions']['owner_actions_per_pr']} | {s['interventions']['repair_cycles_per_pr']} | {c['runs_median']}/{c['runs_mean']} ({c['repeat_runs_total']}/{c['runs_total']}) | "
+                f"{h['median']}/{h['p90']} (n={h['n']}) | {k['bad']}/{k['good']}/{k['unknown']} | {k['bad_rate_pct']}% ({ci(k['bad_rate_ci95'])}){zero_bad} | "
+                f"{k['escaped']}/{k['escaped_known']} ({ci(k['escaped_rate_ci95'])}){zero_esc} | {c['context_self_hosted_min_median']}/{c['context_hosted_min_median']} |")
+
+    def ctl_str(v):
+        c = v["controls"]
+        return f"reverts {c['revert']['found']}/{c['revert']['expected']}, escapes {c['escape']['found']}/{c['escape']['expected']}, owner-touched {c['owner_touched']['non_autonomous']}/{c['owner_touched']['in_report']}"
+    for repo, v in sorted(e2e["repos"].items()):
+        L += [f"### {repo}", ""]
+        if v.get("excluded"):
+            L += ["Excluded from the cohort: " + ", ".join(f"{k} {n}" for k, n in sorted(v["excluded"].items())), ""]
+        L += [f"Controls ({v['controls']['status']}): " + ctl_str(v) + f"; not in window: {sum(x['not_in_window'] for x in v['controls'].values() if isinstance(x, dict))}", ""]
+        L += [head.format("ready day"), sep]
+        for d, s in v["per_day"].items():
+            L.append(row(d, s, v["controls"], e2e["truncated"]) if s["closed"] else f"| {d} (48h horizon open: not reported) |" + " |" * 21)
+        L.append("")
+    for title, blk in (("Window", e2e.get("window")), ("Baseline", e2e.get("baseline"))):
+        if blk:
+            L += [f"## {title} {blk['from']} to {blk['to']} (pooled, closed days only)", "", head.format("repo"), sep]
+            L += [row(repo, s, e2e["repos"][repo]["controls"], e2e["truncated"]) for repo, s in sorted(blk["per_repo"].items())] + [""]
+    nf = (e2e.get("baseline") or {}).get("noise_floor")
+    if nf:
+        L += ["### Baseline noise floor (day against day, North Star rate)", ""]
+        for repo, v in sorted(nf.items()):
+            L.append(f"- {repo}: " + ", ".join(f"{d} {r}%" for d, r in v["north_star_rate_pct_by_day"].items()) + f"; spread {v['spread_pp']} points. A later change smaller than the spread is no change.")
+        L.append("")
+    return "\n".join(L) + "\n"

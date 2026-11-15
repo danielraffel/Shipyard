@@ -551,5 +551,59 @@ class TickIntegrationTests(unittest.TestCase):
         tmp.cleanup()
 
 
+class LauncherFallbackTests(Base):
+    def fallback(self, t, reason="grant_unknown", detail="rc=1_grant_unknown:_errno=4"):
+        with open(self.log / "summary.log", "a") as fh:
+            fh.write(f"{stamp(t)} launcher=direct reason=not_active rc=1: grant_unknown: errno=4\n")
+            fh.write(f"{stamp(t)} launcher-fallback reason={reason} FINDING detail={detail}\n")
+
+    def launcher_lines(self, lines):
+        return [l for l in lines if "kind=launcher_fallback" in l]
+
+    def test_a_fallback_is_announced_once(self):
+        self.fallback(NOW - dt.timedelta(minutes=1))
+        lines, _, findings = self.run_once()
+        [line] = self.launcher_lines(lines)
+        self.assertIn("kind=launcher_fallback repo=- lane=steward-tick", line)
+        self.assertIn("reason=grant_unknown", line)
+        self.assertEqual([f["key"] for f in findings], ["launcher_fallback:steward-tick"])
+        # The same line is not counted again, and the announcement is not re-read as a fallback.
+        lines, _, findings = self.run_once(NOW + dt.timedelta(minutes=6))
+        self.assertEqual(self.launcher_lines(lines), [])
+        self.assertEqual(findings, [])
+        self.assertEqual(self.store()["issues"], [])
+
+    def test_a_fallback_on_consecutive_ticks_files_an_issue_then_closes(self):
+        t = NOW
+        for _ in range(2):
+            self.fallback(t - dt.timedelta(minutes=1))
+            self.run_once(t)
+            t += dt.timedelta(minutes=6)
+        [issue] = self.store()["issues"]
+        self.assertIn("<!-- drain-watch:launcher_fallback:steward-tick -->", issue["body"])
+        self.assertIn("launcher-fallback reason=grant_unknown FINDING", issue["body"])
+        for _ in range(3):
+            self.run_once(t)
+            t += dt.timedelta(minutes=6)
+        self.assertEqual(self.store()["issues"][0]["state"], "closed")
+
+    def test_old_fallbacks_and_other_lines_are_not_findings(self):
+        self.fallback(NOW - dt.timedelta(hours=1))
+        with open(self.log / "summary.log", "a") as fh:
+            fh.write(f"{stamp(NOW)} drain-watch kind=launcher_fallback repo=- lane=steward-tick detail=x first_seen=y count=1\n")
+            fh.write(f"{stamp(NOW)} launcher=direct reason=not_active rc=1: grant_unknown: errno=4\n")
+            fh.write(f"{stamp(NOW)} acme/repo rc=0 launcher=direct\n")
+        _, _, findings = self.run_once()
+        self.assertEqual(findings, [])
+
+    def test_a_detail_with_a_tab_still_matches(self):
+        self.fallback(NOW - dt.timedelta(minutes=1), detail="rc=1_odd\toutput")
+        _, _, findings = self.run_once()
+        self.assertEqual(len(findings), 1)
+
+    def test_a_missing_summary_is_no_finding(self):
+        self.assertEqual(dw.check_launcher_fallback(str(self.log / "absent.log"), {}, NOW), [])
+
+
 if __name__ == "__main__":
     unittest.main()

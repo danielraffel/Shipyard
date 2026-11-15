@@ -430,6 +430,7 @@ close anything. See [superseded-close.md](superseded-close.md).
 | `admitted` | Enqueued or merged this pass (outranks any label) | nobody |
 | `ready` | Approved and green; a dry run would admit it | steward |
 | `draft`, `unmanaged`, `handoff_missing`, `invalid_head`, `direct_merge_refused`, `required_policy_unknown` | The steward does not own or cannot admit it yet | author or config |
+| `unmanaged:automation` | A release-automation PR (`release/version-bump` or `release/version-at-land`, labels `automation` and `shipyard:unmanaged`): the release automation lands it | nobody (actor `automation`; the loss report counts it `intentional`) |
 
 The approval tokens come from the same review and comment reads the gate made
 to refuse the head, so naming them costs nothing extra. Only an undated state

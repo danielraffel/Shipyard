@@ -369,13 +369,35 @@ class LauncherTests(LauncherBase):
 
     # -- read-only access check ---------------------------------------------
 
-    def check_access(self, database: pathlib.Path):
+    def check_access_report(self, database: pathlib.Path, **env):
         result_file = pathlib.Path(self.tmp.name) / f"access-{len(list(pathlib.Path(self.tmp.name).glob('access-*')))}.json"
         result = self.launch("--launcher-check-access", "--launcher-result", str(result_file),
-                             env={"SHIPYARD_LAUNCHER_TEST_TCC_DB": str(database)})
+                             env={"SHIPYARD_LAUNCHER_TEST_TCC_DB": str(database), **env})
         self.assertEqual(stat.S_IMODE(result_file.stat().st_mode), 0o600)
         self.assertEqual(json.loads(result_file.read_text()), json.loads(result.stdout))
-        return result.returncode, json.loads(result.stdout)["full_disk_access"]
+        return result.returncode, json.loads(result.stdout)
+
+    def check_access(self, database: pathlib.Path, **env):
+        code, report = self.check_access_report(database, **env)
+        return code, report["full_disk_access"]
+
+    def test_an_interrupted_open_is_retried(self):
+        # EINTR is never an answer about the grant: the open is tried again.
+        database = pathlib.Path(self.tmp.name) / "TCC.db"
+        database.write_bytes(b"")
+        code, report = self.check_access_report(database, SHIPYARD_LAUNCHER_TEST_EINTR_COUNT="2")
+        self.assertEqual((code, report["full_disk_access"], report["errno"], report["attempts"]), (0, "granted", 0, 3))
+        database.chmod(0o000)
+        code, report = self.check_access_report(database, SHIPYARD_LAUNCHER_TEST_EINTR_COUNT="4")
+        self.assertEqual((code, report["full_disk_access"], report["attempts"]), (1, "denied", 5))
+
+    def test_an_open_interrupted_every_time_is_unknown(self):
+        database = pathlib.Path(self.tmp.name) / "TCC.db"
+        database.write_bytes(b"")
+        started = time.monotonic()
+        code, report = self.check_access_report(database, SHIPYARD_LAUNCHER_TEST_EINTR_COUNT="99")
+        self.assertEqual((code, report["full_disk_access"], report["errno"], report["attempts"]), (2, "unknown", 4, 5))
+        self.assertLess(time.monotonic() - started, 10)  # bounded, well inside the probe's 20 s
 
     def test_check_access_reports_granted_denied_and_unknown(self):
         database = pathlib.Path(self.tmp.name) / "TCC.db"
@@ -415,6 +437,15 @@ class LauncherTests(LauncherBase):
         result = self.launch("--launcher-verify", launcher=self.prod_launcher)
         self.assertEqual(result.returncode, 77)
         self.assertIn("Developer ID", result.stderr)
+        # Nor fake an interrupted open or redirect the database it opens.
+        database = pathlib.Path(self.tmp.name) / "TCC.db"
+        database.write_bytes(b"")
+        result = self.launch("--launcher-check-access", launcher=self.prod_launcher,
+                             env={"SHIPYARD_LAUNCHER_TEST_TCC_DB": str(database),
+                                  "SHIPYARD_LAUNCHER_TEST_EINTR_COUNT": "99"})
+        report = json.loads(result.stdout)
+        self.assertNotEqual(report["errno"], 4)
+        self.assertLess(report["attempts"], 5)
 
 
 FAKE_OPEN = """#!/bin/bash
@@ -502,14 +533,57 @@ class ActivationTests(LauncherBase):
         self.assertEqual(len(list(self.record.parent.glob("activation.json.demoted-*"))), 1)
         self.assertEqual(self.active(), (1, "not_activated"))
 
-    def test_unknown_grant_is_not_active_and_keeps_the_record(self):
-        for env in ({"FAKE_FDA": "unknown"}, {"FAKE_PPID": "4242"}, {"FAKE_OPEN_FAILS": "1"}):
+    NO_ANSWER = ({"FAKE_FDA": "unknown"}, {"FAKE_OPEN_FAILS": "1"})
+
+    def test_unknown_grant_past_the_grace_window_is_not_active_and_keeps_the_record(self):
+        for env in self.NO_ANSWER:
+            with self.subTest(env=env):
+                self.write_record(age=2 * 86400)
+                code, reason = self.active(**env)
+                self.assertEqual(code, 1)
+                self.assertTrue(reason.startswith("grant_unknown: "), reason)
+                self.assertTrue(self.record.exists())
+
+    def test_unknown_grant_within_the_grace_window_stays_active_without_refreshing(self):
+        for env in self.NO_ANSWER:
+            with self.subTest(env=env):
+                self.write_record(age=7200)
+                before = json.loads(self.record.read_text())["fda_checked_at"]
+                code, reason = self.active(**env)
+                self.assertEqual(code, 0, reason)
+                self.assertTrue(reason.startswith("grant_unknown_grace: "), reason)
+                self.assertRegex(reason, r"last confirmed 7[12]\d\ds ago$")
+                # The grace never rolls the confirmation forward.
+                self.assertEqual(json.loads(self.record.read_text())["fda_checked_at"], before)
+
+    def test_grace_window_is_bounded(self):
+        self.write_record(age=7200)
+        code, reason = self.active(FAKE_FDA="unknown", SHIPYARD_LAUNCHER_TEST_GRANT_GRACE_SECS="3600")
+        self.assertEqual(code, 1)
+        self.assertTrue(reason.startswith("grant_unknown: "), reason)
+        self.write_record(age=-600)  # a clock that ran backwards earns no grace
+        code, reason = self.active(FAKE_FDA="unknown")
+        self.assertEqual(code, 1)
+        self.assertTrue(reason.startswith("grant_unknown: "), reason)
+
+    def test_an_untrusted_answer_never_gets_grace(self):
+        # An answer from a copy launchd did not start is not the launcher's own,
+        # even when the grant was confirmed minutes ago; a denial in it does
+        # not demote either.
+        for env in ({"FAKE_PPID": "4242"}, {"FAKE_PPID": "4242", "FAKE_FDA": "denied"}, {"FAKE_FDA": "maybe"}):
             with self.subTest(env=env):
                 self.write_record(age=7200)
                 code, reason = self.active(**env)
                 self.assertEqual(code, 1)
-                self.assertTrue(reason.startswith("grant_unknown"), reason)
+                self.assertTrue(reason.startswith("grant_unknown: "), reason)
                 self.assertTrue(self.record.exists())
+
+    def test_a_denied_grant_within_the_grace_window_still_demotes(self):
+        self.write_record(age=7200)
+        code, reason = self.active(FAKE_FDA="denied")
+        self.assertEqual(code, 1)
+        self.assertTrue(reason.startswith("grant_revoked: demoted"), reason)
+        self.assertFalse(self.record.exists())
 
     def test_cache_window_is_bounded(self):
         self.write_record(age=30)

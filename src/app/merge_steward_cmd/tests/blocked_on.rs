@@ -1779,3 +1779,104 @@ fn an_unbound_approval_rule_never_trusts_its_status() {
         );
     }
 }
+
+/// A release-automation bot pull request: unmanaged on purpose.
+fn unmanaged_pr(branch: &str, labels: &[&str]) -> ObservedPr {
+    let mut pr = pr_with(7, labels, "CLEAN", &green_rollup());
+    pr.fact.author = Some("danielraffel".to_owned());
+    pr.fact.head_branch = branch.to_owned();
+    pr
+}
+
+fn managed_policy() -> StewardPolicy {
+    let mut policy = queue_policy();
+    policy.managed_label = Some("shipyard:managed".to_owned());
+    policy
+}
+
+fn action_stall(pr: &ObservedPr) -> Stall {
+    let policy = managed_policy();
+    let decision = classify_pr(&pr.fact, &policy, &BTreeMap::new());
+    classify(
+        &RowFacts {
+            pr: &pr.fact,
+            decision: &decision,
+            mutation: None,
+            error: None,
+            approval: GateRead::Unread,
+            enqueued_at: None,
+            ejection: None,
+        },
+        &policy,
+    )
+    .0
+}
+
+fn action_for(pr: &ObservedPr) -> crate::app::merge_steward_cmd::next_action::NextAction {
+    let policy = managed_policy();
+    let decision = classify_pr(&pr.fact, &policy, &BTreeMap::new());
+    let (stall, _) = classify(
+        &RowFacts {
+            pr: &pr.fact,
+            decision: &decision,
+            mutation: None,
+            error: None,
+            approval: GateRead::Unread,
+            enqueued_at: None,
+            ejection: None,
+        },
+        &policy,
+    );
+    crate::app::merge_steward_cmd::next_action::for_row(
+        &crate::app::merge_steward_cmd::next_action::RowContext {
+            repo: "owner/repo",
+            base: "main",
+            pr: &pr.fact,
+            policy: &policy,
+            error: None,
+        },
+        &stall,
+    )
+}
+
+#[test]
+fn an_automation_release_pr_is_unmanaged_on_purpose_and_needs_nobody() {
+    for branch in ["release/version-bump", "release/version-at-land"] {
+        let pr = unmanaged_pr(branch, &["automation", "shipyard:unmanaged"]);
+        assert_eq!(action_stall(&pr).blocked_on, "unmanaged:automation");
+        let next = action_for(&pr);
+        assert_eq!(
+            serde_json::to_value(&next).expect("json")["actor"],
+            json!("automation")
+        );
+        assert_eq!(
+            next.action,
+            "Nothing to do: the release automation lands it."
+        );
+        assert!(!next.actionable());
+    }
+}
+
+#[test]
+fn a_human_unmanaged_pr_or_a_loose_lookalike_keeps_the_handoff_advice() {
+    for (branch, labels) in [
+        ("feature", &["automation", "shipyard:unmanaged"][..]),
+        ("release/version-bump", &["shipyard:unmanaged"][..]),
+        ("release/version-bump", &["automation"][..]),
+        (
+            "release/version-bump-x",
+            &["automation", "shipyard:unmanaged"][..],
+        ),
+        ("feature", &[][..]),
+    ] {
+        let pr = unmanaged_pr(branch, labels);
+        assert_eq!(
+            action_stall(&pr).blocked_on,
+            "unmanaged",
+            "{branch} {labels:?}"
+        );
+        let next = action_for(&pr);
+        assert!(next.actionable());
+        assert!(next.action.contains("steward-handoff"));
+    }
+}

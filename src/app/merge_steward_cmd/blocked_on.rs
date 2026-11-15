@@ -237,6 +237,36 @@ impl SameHeadRetry {
     }
 }
 
+/// Token for an unmanaged pull request that the release automation owns.
+pub(super) const UNMANAGED_AUTOMATION_TOKEN: &str = "unmanaged:automation";
+
+/// Head branches the release automation opens its bot pull requests from:
+/// the bump PR of the Pulp fleet and Shipyard's own version-at-land branch.
+const RELEASE_AUTOMATION_BRANCHES: [&str; 2] = ["release/version-bump", "release/version-at-land"];
+
+/// Label the release automation puts on its pull requests.
+const AUTOMATION_LABEL: &str = "automation";
+
+/// The token for a pull request the steward does not own.
+fn unmanaged(pr: &StewardPullRequest) -> (Stall, SinceHint) {
+    let token = if is_release_automation(pr) {
+        UNMANAGED_AUTOMATION_TOKEN
+    } else {
+        "unmanaged"
+    };
+    undated(token.to_owned(), None, SinceHint::HeadPushed)
+}
+
+/// Whether this pull request is a release-automation PR that is unmanaged on
+/// purpose: it carries both `shipyard:unmanaged` and `automation` and comes
+/// from one of the exact bot head branches. The automation lands it itself.
+fn is_release_automation(pr: &StewardPullRequest) -> bool {
+    let has = |wanted: &str| pr.labels.iter().any(|l| l.eq_ignore_ascii_case(wanted));
+    has(super::UNMANAGED_LABEL)
+        && has(AUTOMATION_LABEL)
+        && RELEASE_AUTOMATION_BRANCHES.contains(&pr.head_branch.as_str())
+}
+
 /// What the pass knows about one row.
 pub(super) struct RowFacts<'a> {
     /// The pull request as observed.
@@ -343,7 +373,7 @@ fn classify_token(facts: &RowFacts<'_>, policy: &StewardPolicy) -> (Stall, Since
                 SinceHint::Labeled(label.clone())
             }),
         ),
-        StewardDecision::Unmanaged => undated("unmanaged".to_owned(), None, SinceHint::HeadPushed),
+        StewardDecision::Unmanaged => unmanaged(pr),
         StewardDecision::HandoffMissing => {
             undated("handoff_missing".to_owned(), None, SinceHint::HeadPushed)
         }
