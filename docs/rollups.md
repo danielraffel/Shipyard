@@ -298,6 +298,34 @@ python3 -I tools/metrics/loss_report.py --log-dir DIR [--since 7d] [--github CAC
 | Agent-free resolution, strict | The same, and the next token is a normal wait (the system moved it along). |
 | Owner stops per 100 PRs | PRs with a `human_stop` episode over PRs seen, excluding closed-unmerged ones when known. Stops raised, not answered. |
 | Fix push | An episode of a token that ended with a new head. |
+
+### End-to-end metrics per merged PR
+
+The loss numbers count blocked episodes. These four measure Shipyard end to end,
+per repo, per UTC day of the merge. `tools/metrics/pr_metrics.py` computes them;
+they are on only when the tick passes `--e2e-cache DIR` (the daily run does, unless
+`SHIPYARD_PR_METRICS=off`).
+
+| Metric | Definition |
+| --- | --- |
+| Autonomous merge rate | Merged PRs with no owner action from opening to merge, over merged PRs where that is determinable. An owner action is a commit, review, label, comment, merge or close by the owner's personal account (`--owner`, default danielraffel) in a human session. App and bot identities, and comments posted through `ghapp` as `shipyard-local[bot]`, are not. Reported as autonomous / owner action / unknown. |
+| Unknown (autonomy) | An owner-account commit with no agent trailer (`Co-Authored-By: Claude`, `Codex` and similar), because agents commit under the owner's git identity and a human commit looks the same; or a timeline or commit list that was not read in full. A definite owner action (any timeline event by the owner) outranks an ambiguous commit. |
+| Handoff-to-merge time | Median and p90 minutes, per merged PR, from the first ready-for-review moment to `merged_at`. A PR opened as a draft is ready at its first `ready_for_review` event; any other PR was ready when opened. |
+| Compute per merged PR | Actions job minutes (`completed_at` minus `started_at`, skipped jobs excluded) over every run whose `head_sha` is one of the PR's heads (its commits and force-push SHAs) plus its `merge_group` runs (`gh-readonly-queue/<base>/pr-<n>-...`), split into self-hosted (job label `self-hosted`) and hosted. |
+| Correctness | Share of merged PRs where, within 7 days of the merge, a commit named `Revert ...` that names the merge sha or `#<n>` landed on the base, or a required check went red on the base at the merge commit or the next push. The red signal is a `base_poison` red-everywhere episode in the ticks if one began in that interval, else the check runs at those commits against the base's required contexts (the tick's `required_contexts`, else the ruleset). A PR under 7 days old is `provisional`: its window is still open, so its rate can only rise. |
+
+Cost is bounded. Merged PRs do not change, so the timeline and commits of a PR, the
+jobs of a run, the compute of a PR and the check runs of a settled commit are each
+read once and kept under `DIR/<owner>__<repo>/`. Generous-Corp repos read through
+`ghread api`, every other repo through `ghapp api`. `--read-cap` (default 100) is the
+most reads per run across all repos, split evenly per repo; when a repo hits its
+share the report says `truncated` and the next run continues from the cache. Each run
+still reads, per repo, the closed-PR listing, one run listing for the window and one
+base commit listing; a PR's correctness is re-evaluated from that listing until its
+7 days are over. A read that fails leaves a PR unread or a field null, never zero.
+
+`--baseline FROM:TO` (default `2026-11-12:2026-11-14`, `none` to drop it) adds a
+Baseline section that pools those merge days per repo, for comparing a later day.
 | `review_verdict_same_head_no_push` | Actionable `required_failed` episodes naming `review-verdict` that cleared on the same head with no push. |
 | `capacity_queued`, superseded | Episodes with that token; superseded counts the `excluded_label:superseded` label and, apart, rows carrying the steward's `superseded` detection. |
 | `red_everywhere` | Episodes whose token, detail or decision names it. `unavailable` when it never appears in the window, since silence cannot tell "none occurred" from "not emitted". |
