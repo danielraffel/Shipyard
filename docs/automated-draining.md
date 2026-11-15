@@ -444,15 +444,31 @@ and never fails the pass.
 same dry-run classification as a steward pass over that one pull request and
 returns the moment the answer is yours: exit 0 with `blocked_on` and
 `next_action` (`actor`, `action`, `stop`), or exit 1 on timeout, which means
-nothing is yours to do yet. A merged, closed, stacked (base is not the default
-branch) or empty-diff pull request is answered before any admission read.
+nothing is yours to do yet. A merged, closed, release-base, stacked or
+empty-diff pull request is answered before any admission read.
+
+A base other than the default is a release base, read
+`release_base:<base>`, when it matches `[merge_steward] release_bases`
+(default `["release/*"]`) or when a ruleset that names it (not a `~ALL`
+ruleset) protects it with a pull-request or required-checks rule. A release
+refresh is not a stack and is never told to retarget to the default branch.
+The steward admits only the default branch, so a release base has a review
+path only when its rules require `review-verdict` and `[merge_steward]
+reviewed_release_bases` (empty by default) says the standing reviewer covers
+it; then the reviewer acts. Otherwise the answer is `owner` with `stop: true`:
+the coordinator or owner runs the release-branch landing. A pattern costs no
+read; only a base no pattern names and no open pull request heads has its
+rules read, and an unreadable ruleset is an error, never the retarget advice.
+Anything else on a non-default base reads `stacked_on:<base>`.
+`shipyard pr` prints the same classification before it opens a pull request
+on a base `release_bases` names.
 Every steward pass row carries the same `next_action`.
 
 | `actor` | Meaning |
 |---|---|
 | `author` | Act now: the action names the failed required check, the conflict, or the dropped change. A `superseded` pull request also answers `author` with `stop: true`: confirm the successor, close this one with a comment naming it, and move on. No owner is needed. |
 | `repair` | Act now (the repair lane, or the author doing its job): a HOLD names this head; the action links it. Address the HOLD's named items, then push a new head. |
-| `owner` | `stop: true`: `owner-decision`, `PARKED/*`, or no automatic admission. Report and stop. |
+| `owner` | `stop: true`: `owner-decision`, `PARKED/*`, a release base with no standing review path, or no automatic admission. Report and stop. |
 | `nobody` | `stop: true`: merged or closed. A merged answer says to retarget stacked children to the base. |
 | `reviewer`, `ci`, `steward`, `operator` | Nothing to do; keep waiting. Includes green-with-no-verdict, checks running, queued, and BEHIND on a merge-queue base (never merge main for that). |
 

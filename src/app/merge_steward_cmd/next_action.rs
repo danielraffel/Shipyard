@@ -43,6 +43,24 @@ pub(crate) enum Actor {
     Automation,
 }
 
+impl Actor {
+    /// The actor as JSON spells it.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Author => "author",
+            Self::Reviewer => "reviewer",
+            Self::Ci => "ci",
+            Self::Steward => "steward",
+            Self::Owner => "owner",
+            Self::Operator => "operator",
+            Self::Repair => "repair",
+            Self::Nobody => "nobody",
+            Self::Automation => "automation",
+        }
+    }
+}
+
 /// What to do next, and who does it.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct NextAction {
@@ -121,6 +139,36 @@ impl NextAction {
                      `{default_branch}` into it (no rebase)."
                 ),
             ),
+        }
+    }
+
+    /// A pull request on a release base (see [`crate::release_base`]): not a
+    /// stack, and never retargeted to the default branch. `review_path` is
+    /// true when the base's rules require the approval context and the
+    /// standing reviewer covers the base.
+    #[must_use]
+    pub fn release_base(base: &str, default_branch: &str, review_path: bool) -> Self {
+        if review_path {
+            Self::new(
+                Actor::Reviewer,
+                format!(
+                    "Release base `{base}`: not a stack, so do not retarget it to \
+                     `{default_branch}`. Its rules require the approval context and the standing \
+                     reviewer covers this base: nothing for the author to do until it posts \
+                     APPROVE or HOLD. The steward admits only `{default_branch}`; the coordinator \
+                     or owner lands the release branch."
+                ),
+            )
+        } else {
+            Self::stop(
+                Actor::Owner,
+                format!(
+                    "stop: no standing review path for base `{base}`; the coordinator or owner \
+                     runs the release-branch landing. Don't retarget to `{default_branch}`, and \
+                     don't merge `{default_branch}` into it. Report the pull request and its \
+                     head, then work on something else."
+                ),
+            )
         }
     }
 
@@ -1067,6 +1115,22 @@ mod tests {
         assert_eq!(empty.actor, Actor::Author);
         assert!(empty.action.contains("0 changed files"), "{empty:?}");
         assert_eq!(next("empty_diff", None, true, "CLEAN"), empty);
+    }
+
+    #[test]
+    fn release_bases_stop_or_wait_and_never_say_retarget_this() {
+        let stop = NextAction::release_base("release/v1.0.10", "main", false);
+        assert_eq!((stop.actor, stop.stop), (Actor::Owner, true));
+        assert!(stop.action.starts_with(
+            "stop: no standing review path for base `release/v1.0.10`; the coordinator or \
+             owner runs the release-branch landing. Don't retarget to `main`"
+        ));
+        let review = NextAction::release_base("release/v1.0.10", "main", true);
+        assert_eq!((review.actor, review.stop), (Actor::Reviewer, false));
+        assert!(!review.actionable());
+        for action in [stop.action, review.action] {
+            assert!(!action.contains("retarget this pull request"), "{action}");
+        }
     }
 
     #[test]

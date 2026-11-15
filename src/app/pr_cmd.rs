@@ -121,6 +121,9 @@ fn stacked_base_guard<W: Write>(
         return Ok(());
     }
 
+    if args.stacked_on.is_none() && release_base_notice(args, config, &configured, stdout)? {
+        return Ok(());
+    }
     let contexts = shipyard_and_config_contexts(config, cwd, &args.base);
     let verdict = describe_stacked_base(config, cwd, &args.base, &configured, &contexts);
     writeln!(stdout, "{verdict}").map_err(|error| CliFailure::new(1, error.to_string()))?;
@@ -158,6 +161,48 @@ fn stacked_base_guard<W: Write>(
             args.base, args.base
         ),
     ))
+}
+
+/// Print the release-base classification `shipyard wait pr --state
+/// actionable` will give this pull request, when `--base` matches
+/// `[merge_steward] release_bases`; true when it did. Patterns only: the
+/// guard makes no API call, so a base only a ruleset marks as a release base
+/// is classified once the pull request exists.
+fn release_base_notice<W: Write>(
+    args: &PrCommandArgs,
+    config: &LoadedConfig,
+    configured: &str,
+    stdout: &mut W,
+) -> Result<bool, CliFailure> {
+    let policy = crate::release_base::ReleaseBasePolicy::from_config(config)
+        .map_err(|error| CliFailure::new(2, format!("{error}. No pull request was created.")))?;
+    let Some(pattern) = policy.matching_pattern(&args.base) else {
+        return Ok(false);
+    };
+    let review_path = policy.reviewer_covers(&args.base);
+    let next = super::merge_steward_cmd::next_action::NextAction::release_base(
+        &args.base,
+        configured,
+        review_path,
+    );
+    let condition = if review_path {
+        " (once its rules require `review-verdict`)"
+    } else {
+        ""
+    };
+    writeln!(
+        stdout,
+        "▸ release base: `{base}` matches {source}; it is not a stack. `shipyard wait pr \
+         <n> --state actionable` will read `blocked_on: release_base:{base}`{condition}, \
+         next_action ({actor}, stop={stop}): {action}",
+        base = args.base,
+        source = crate::release_base::ReleaseSource::Pattern(pattern.to_owned()).describe(),
+        actor = next.actor.as_str(),
+        stop = next.stop,
+        action = next.action,
+    )
+    .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    Ok(true)
 }
 
 /// The `[ship]` key listing long-lived integration bases (`develop/*`,
@@ -1526,8 +1571,8 @@ mod tests {
         assert!(failure.message.contains("No pull request was created"));
     }
 
-    /// Long-lived integration bases are not stacks: `develop/*` and
-    /// `release/*` pass by default, a configured list replaces the defaults,
+    /// Long-lived integration bases are not stacks: `develop/*` passes by
+    /// default (`release/*` is a release base, announced as one), a configured list replaces the defaults,
     /// and an ordinary branch still refuses.
     #[cfg(unix)]
     #[test]
@@ -1535,17 +1580,15 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = repo_with_main_only_gate(temp.path());
         let config = config_at(&repo);
-        for base in ["develop/next", "release/1.2"] {
-            let args = PrCommandArgs {
-                base: base.to_owned(),
-                ..pr_args()
-            };
-            let mut out = Vec::new();
-            stacked_base_guard(&args, &config, &repo, &mut out)
-                .unwrap_or_else(|failure| panic!("{base}: {}", failure.message));
-            let printed = String::from_utf8(out).expect("utf8");
-            assert!(printed.contains("is an integration base"), "{printed}");
-        }
+        let args = PrCommandArgs {
+            base: "develop/next".to_owned(),
+            ..pr_args()
+        };
+        let mut out = Vec::new();
+        stacked_base_guard(&args, &config, &repo, &mut out)
+            .unwrap_or_else(|failure| panic!("develop/next: {}", failure.message));
+        let printed = String::from_utf8(out).expect("utf8");
+        assert!(printed.contains("is an integration base"), "{printed}");
         // Control: an ordinary branch on the same instrument still refuses.
         let feature = PrCommandArgs {
             base: String::from("feature/parent"),
@@ -1571,6 +1614,65 @@ mod tests {
         assert!(
             stacked_base_guard(&develop, &config, &repo, &mut Vec::new()).is_err(),
             "a configured list replaces the defaults"
+        );
+    }
+
+    /// A release base is not a stack: `shipyard pr` says so before opening,
+    /// with the same next action `shipyard wait pr --state actionable` gives,
+    /// and never the stacked-base verdict or the retarget advice.
+    #[cfg(unix)]
+    #[test]
+    fn a_release_base_is_announced_at_open_time_and_is_not_a_stack() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = repo_with_main_only_gate(temp.path());
+        let config = config_at(&repo);
+        let args = PrCommandArgs {
+            base: "release/v1.0.10".to_owned(),
+            ..pr_args()
+        };
+        let mut out = Vec::new();
+        stacked_base_guard(&args, &config, &repo, &mut out)
+            .unwrap_or_else(|failure| panic!("release base: {}", failure.message));
+        let printed = String::from_utf8(out).expect("utf8");
+        assert!(
+            printed.contains("▸ release base: `release/v1.0.10`"),
+            "{printed}"
+        );
+        assert!(
+            printed.contains("blocked_on: release_base:release/v1.0.10"),
+            "{printed}"
+        );
+        assert!(
+            printed.contains("next_action (owner, stop=true)"),
+            "{printed}"
+        );
+        assert!(printed.contains("Don't retarget to `main`"), "{printed}");
+        assert!(!printed.contains("stacked base"), "{printed}");
+
+        // A reviewed release base is a review wait, not a stop.
+        fs::write(
+            repo.join(".shipyard/config.toml"),
+            "[ship]\nbase_branch = \"main\"\n[merge_steward]\nreviewed_release_bases = [\"release/*\"]\n",
+        )
+        .expect("config");
+        let mut out = Vec::new();
+        stacked_base_guard(&args, &config_at(&repo), &repo, &mut out).expect("reviewed");
+        let printed = String::from_utf8(out).expect("utf8");
+        assert!(
+            printed.contains("next_action (reviewer, stop=false)"),
+            "{printed}"
+        );
+
+        // Control: a configured list replaces the default, and an unmatched
+        // non-default base is still refused as a stack.
+        fs::write(
+            repo.join(".shipyard/config.toml"),
+            "[ship]\nbase_branch = \"main\"\nintegration_bases = []\n[merge_steward]\nrelease_bases = [\"rel-*\"]\n",
+        )
+        .expect("config");
+        assert!(
+            stacked_base_guard(&args, &config_at(&repo), &repo, &mut Vec::new()).is_err(),
+            "release/* is no longer a release base"
         );
     }
 

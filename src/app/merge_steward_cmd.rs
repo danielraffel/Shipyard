@@ -2328,7 +2328,7 @@ mod ledger;
 mod merge_group_stall;
 mod mutation_outcome;
 mod native_arm;
-mod next_action;
+pub(super) mod next_action;
 mod observation;
 mod orphan_groups;
 mod pass_budget;
@@ -2400,8 +2400,8 @@ pub(super) fn observe_next_steps(
 /// actionable`: the `blocked_on` row a dry-run admission pass gives that pull
 /// request alone, with its next action, as one JSON object. A merged or
 /// closed pull request, one based on a branch other than the repository
-/// default, and one whose diff against its base is empty are answered before
-/// any admission read. Read-only: the pass is a dry run and the steward
+/// default (a release base or a stack), and one whose diff against its base
+/// is empty are answered before any admission read. Read-only: the pass is a dry run and the steward
 /// ledger is only read.
 pub(super) fn pr_next_action_snapshot(
     actions: &GitHubActions,
@@ -2464,11 +2464,12 @@ pub(super) fn pr_next_action_snapshot(
         )),
         "CLOSED" => Some(("closed".to_owned(), next_action::NextAction::closed())),
         _ if !base.eq_ignore_ascii_case(&default_branch) => {
-            let parent = open_pull_request_for_head(actions, &repo, &base);
-            Some((
-                format!("stacked_on:{base}"),
-                next_action::NextAction::stacked(&base, &default_branch, parent),
-            ))
+            let (token, next, source) =
+                non_default_base(actions, global_dir, &repo, &base, &default_branch)?;
+            if let Some(source) = source {
+                snapshot["release_base_source"] = Value::from(source.describe());
+            }
+            Some((token, next))
         }
         _ if row.get("changedFiles").and_then(Value::as_u64) == Some(0) => Some((
             "empty_diff".to_owned(),
@@ -2574,6 +2575,87 @@ fn single_repo_args(repo: &str, base: &str, apply: bool) -> StewardCommandArgs {
 }
 
 /// The open pull request whose head is `branch`, when exactly one exists.
+/// A pull request on a base other than the default: a release base
+/// (`release_base:<base>`, see [`crate::release_base`]) or a stack
+/// (`stacked_on:<base>`). A configured pattern costs no read; otherwise the
+/// open-parent read decides a real stack, and only an orphan's base has its
+/// rulesets read. An unreadable ruleset is an error, never the retarget
+/// advice.
+fn non_default_base(
+    actions: &GitHubActions,
+    global_dir: &Path,
+    repo: &str,
+    base: &str,
+    default_branch: &str,
+) -> Result<
+    (
+        String,
+        next_action::NextAction,
+        Option<crate::release_base::ReleaseSource>,
+    ),
+    String,
+> {
+    use crate::release_base::{ReleaseBasePolicy, ReleaseSource};
+    let policy = ReleaseBasePolicy::from_machine_global(global_dir)?;
+    let release = |source: ReleaseSource, rules: Option<Value>| {
+        let review_path =
+            policy.reviewer_covers(base) && release_requires_approval(actions, repo, base, rules)?;
+        Ok::<_, String>((
+            format!("release_base:{base}"),
+            next_action::NextAction::release_base(base, default_branch, review_path),
+            Some(source),
+        ))
+    };
+    if let Some(pattern) = policy.matching_pattern(base) {
+        return release(ReleaseSource::Pattern(pattern.to_owned()), None);
+    }
+    let parent = open_pull_request_for_head(actions, repo, base);
+    if parent.is_none() {
+        let rules = observation::evaluated_branch_rules(actions, repo, base)
+            .map_err(|error| format!("could not classify base `{base}`: {error}"))?;
+        if ruleset_names_base(actions, repo, &rules)? {
+            return release(ReleaseSource::Ruleset, Some(rules));
+        }
+    }
+    Ok((
+        format!("stacked_on:{base}"),
+        next_action::NextAction::stacked(base, default_branch, parent),
+        None,
+    ))
+}
+
+/// Whether a ruleset behind `rules`' target rules names a branch rather
+/// than covering every branch.
+fn ruleset_names_base(actions: &GitHubActions, repo: &str, rules: &Value) -> Result<bool, String> {
+    for id in crate::release_base::target_ruleset_ids(rules) {
+        let ruleset = gh_json(
+            actions,
+            &["api".to_owned(), format!("repos/{repo}/rulesets/{id}")],
+            "ruleset",
+        )?;
+        if crate::release_base::ruleset_names_a_branch(&ruleset) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether `base`'s rules require the approval context.
+fn release_requires_approval(
+    actions: &GitHubActions,
+    repo: &str,
+    base: &str,
+    rules: Option<Value>,
+) -> Result<bool, String> {
+    let rules = match rules {
+        Some(rules) => rules,
+        None => observation::evaluated_branch_rules(actions, repo, base)?,
+    };
+    Ok(observation::evaluated_required_checks(&rules)?
+        .iter()
+        .any(|check| check.context == crate::merge_steward::DEFAULT_APPROVAL_CONTEXT))
+}
+
 fn open_pull_request_for_head(actions: &GitHubActions, repo: &str, branch: &str) -> Option<u64> {
     gh_json(
         actions,
