@@ -308,3 +308,5 @@ ticks, gaps, unreadable files), GitHub reads, agent work, CI compute and owner
 stops answered. CI compute per episode and owner stops answered are always
 `unavailable` today: tick JSON does not carry them. Elapsed time appears only as
 context in the JSON; no number in the summary is a duration.
+
+The four end-to-end per-merged-PR metrics (autonomous merge rate, handoff-to-merge time, compute, correctness) are defined in [metrics.md](metrics.md).
