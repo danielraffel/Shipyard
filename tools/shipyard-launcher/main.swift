@@ -33,7 +33,7 @@ import Darwin
 import Foundation
 import Security
 
-let launcherVersion = "1"
+let launcherVersion = "2"
 let bundleIdentifier = "com.danielraffel.shipyard.launcher"
 /// The codesign identifier of every Shipyard release binary.
 let targetIdentifier = "shipyard"
@@ -447,13 +447,12 @@ func run(_ executable: String, _ arguments: [String], script: Bool, requirement:
 /// raises a prompt, and nothing on /Volumes is touched.
 func checkAccess(result: String?) -> Never {
     let database = testOverride("SHIPYARD_LAUNCHER_TEST_TCC_DB") ?? "/Library/Application Support/com.apple.TCC/TCC.db"
-    let fd = open(database, O_RDONLY | O_CLOEXEC)
-    let error = fd >= 0 ? 0 : errno
+    let (fd, error, attempts) = openRetryingInterrupts(database)
     if fd >= 0 { close(fd) }
     let state = fd >= 0 ? "granted" : (error == EPERM || error == EACCES ? "denied" : "unknown")
     let report: [String: Any] = [
         "schema": 1, "launcher_version": launcherVersion, "full_disk_access": state,
-        "errno": error, "pid": Int(getpid()), "ppid": Int(getppid()),
+        "errno": error, "attempts": attempts, "pid": Int(getpid()), "ppid": Int(getppid()),
     ]
     guard var data = try? JSONSerialization.data(withJSONObject: report, options: [.sortedKeys]) else {
         fail("cannot encode the access report", code: 70)
@@ -470,12 +469,45 @@ func checkAccess(result: String?) -> Never {
     exit(state == "granted" ? 0 : (state == "denied" ? 1 : 2))
 }
 
+/// Open `path` read-only, trying again when the call is interrupted (EINTR).
+/// An interrupted open says nothing about the grant: under launchd the open
+/// can block in the system's privacy check and come back EINTR. At most
+/// accessOpenAttempts tries, about 1.5 s in all, well inside the 20 s the
+/// probe waits. Returns the descriptor (or -1), the last errno and the number
+/// of tries.
+let accessOpenAttempts = 5
+
+func openRetryingInterrupts(_ path: String) -> (Int32, Int32, Int) {
+    // Test builds can make the first N tries report EINTR.
+    var interrupts = Int(testOverride("SHIPYARD_LAUNCHER_TEST_EINTR_COUNT") ?? "") ?? 0
+    var error: Int32 = EINTR
+    for attempt in 1...accessOpenAttempts {
+        if attempt > 1 { usleep(useconds_t(100_000 << (attempt - 2))) }
+        if interrupts > 0 {
+            interrupts -= 1
+            error = EINTR
+            continue
+        }
+        let fd = open(path, O_RDONLY | O_CLOEXEC)
+        if fd >= 0 { return (fd, 0, attempt) }
+        error = errno
+        if error != EINTR { return (-1, error, attempt) }
+    }
+    return (-1, error, accessOpenAttempts)
+}
+
 // MARK: activation
 
 /// How long a confirmed Full Disk Access grant is trusted before
 /// --launcher-active asks macOS again. The recheck never prompts.
 let grantCacheSeconds = Double(testOverride("SHIPYARD_LAUNCHER_TEST_GRANT_CACHE_SECS") ?? "") ?? 3600
 let grantProbeSeconds = 20.0
+/// How long a grant confirmed earlier still counts when the recheck gets no
+/// answer at all ("unknown": the open was interrupted, `open` failed, or no
+/// report came back). Only an answer that says the grant is gone ("denied")
+/// demotes; an answer that cannot be trusted ("unverified") never gets grace.
+/// Past this window "unknown" is not active.
+let grantUnknownGraceSeconds = Double(testOverride("SHIPYARD_LAUNCHER_TEST_GRANT_GRACE_SECS") ?? "") ?? 86400
 
 /// This bundle's code directory hash, from its own signature.
 func ownCDHash() -> String? {
@@ -524,7 +556,8 @@ func replaceRecord(_ path: String, _ record: [String: Any]) -> Bool {
 /// Ask macOS, through LaunchServices, whether this bundle holds Full Disk
 /// Access: `open` starts a fresh copy of the bundle as its own responsible
 /// process (parent launchd), which answers --launcher-check-access. Only that
-/// answer counts; anything else is "unknown".
+/// answer counts. No answer is "unknown"; an answer that is malformed or did
+/// not come from a launchd-started copy is "unverified".
 func probeGrant() -> (String, String) {
     var template = Array((NSTemporaryDirectory() + "shipyard-launcher-grant.XXXXXX").utf8CString)
     guard let made = mkdtemp(&template) else { return ("unknown", "cannot create a private directory") }
@@ -547,9 +580,9 @@ func probeGrant() -> (String, String) {
         if let data = FileManager.default.contents(atPath: result),
            let report = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
             guard let state = report["full_disk_access"] as? String, ["granted", "denied", "unknown"].contains(state) else {
-                return ("unknown", "unexpected access report")
+                return ("unverified", "unexpected access report")
             }
-            guard (report["ppid"] as? Int) == 1 else { return ("unknown", "the access answer did not come from a launchd-started launcher") }
+            guard (report["ppid"] as? Int) == 1 else { return ("unverified", "the access answer did not come from a launchd-started launcher") }
             return (state, "errno=\(report["errno"] ?? "?")")
         }
         usleep(200_000)
@@ -560,7 +593,9 @@ func probeGrant() -> (String, String) {
 /// Whether Shipyard may route through this launcher now. Active only when the
 /// activation record is readable and trusted, names this exact bundle (path,
 /// identifier, team, code directory hash), and the Full Disk Access grant was
-/// confirmed within grantCacheSeconds or is confirmed again now. A revoked
+/// confirmed within grantCacheSeconds or is confirmed again now (or the
+/// recheck got no answer and the grant was confirmed within
+/// grantUnknownGraceSeconds). A revoked
 /// grant demotes the record (renamed to activation.json.demoted-<time>), so
 /// nothing routes until --activate runs again. Every other doubt is
 /// "not active" and leaves the record alone. Exit 0 active, 1 not.
@@ -626,6 +661,10 @@ func launcherActive(home: String, team: String) -> Never {
         let demoted = path + ".demoted-\(Int(Date().timeIntervalSince1970))"
         let moved = rename(path, demoted) == 0
         activeReport(false, "grant_revoked: \(moved ? "demoted to \(demoted)" : "could not demote the record") (\(detail))")
+    case "unknown" where age >= 0 && age < grantUnknownGraceSeconds:
+        // No answer, but a grant confirmed within the grace window. The record
+        // is not refreshed, so the window never rolls forward on its own.
+        activeReport(true, "grant_unknown_grace: \(detail); last confirmed \(Int(age))s ago")
     default:
         activeReport(false, "grant_unknown: \(detail)")
     }

@@ -17,6 +17,10 @@ Kinds:
                  context absent)
   stuck_claim    a repair claim 30 min or more old whose PR head has not moved
   pass_fault     new log lines matching a fault signature, per signature and lane
+  launcher_fallback
+                 the steward tick ran directly although ShipyardLauncher.app is
+                 activated on the host (new `launcher-fallback ... FINDING` lines
+                 in summary.log): the path that raises privacy prompts
 
   drain_watch.py --tick           # what the steward tick runs: always exits 0
   drain_watch.py --dry-run        # print what would be announced and filed, change nothing
@@ -138,6 +142,47 @@ def parse_iso(s):
 
 def home(*p):
     return os.path.join(os.path.expanduser("~"), *p)
+
+
+# ------------------------------------------------------------------ launcher
+LAUNCHER_LINE = re.compile(r"^(\d{8}T\d{6}Z) launcher-fallback reason=(\S+) FINDING(?: detail=(\S*))?$")
+LAUNCHER_LOOKBACK = dt.timedelta(minutes=15)
+SUMMARY_TAIL = 1024 * 1024
+
+
+def check_launcher_fallback(summary, state, now):
+    """One launcher_fallback finding when summary.log has `launcher-fallback` lines newer
+    than the last run's (15 minutes back on a first run). Each tick's line counts in one
+    run only, so a single fallback is announced once and an issue is filed only when the
+    next tick falls back too."""
+    last = state.get("launcher_fallback_seen")
+    since = parse_stamp(last) if last else now - LAUNCHER_LOOKBACK
+    try:
+        with open(summary, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, fh.tell() - SUMMARY_TAIL))
+            text = fh.read().decode("utf-8", "replace")
+    except OSError:
+        return []
+    hits = []
+    for line in text.splitlines():
+        m = LAUNCHER_LINE.match(line)
+        if not m:
+            continue
+        t = parse_stamp(m.group(1))
+        if since < t <= now:
+            hits.append((t, m.group(2), m.group(3) or "", line))
+    if not hits:
+        return []
+    state["launcher_fallback_seen"] = stamp_of(max(h[0] for h in hits))
+    t, reason, detail, _ = hits[-1]
+    return [dict(kind="launcher_fallback", repo="-", lane="steward-tick", key="launcher_fallback:steward-tick",
+                 detail=f"tick ran direct (reason={reason}) {len(hits)} time(s) since last run; latest {detail}"[:200],
+                 evidence=[h[3][:200] for h in hits[-5:]])]
+
+
+def stamp_of(t):
+    return t.strftime("%Y%m%dT%H%M%SZ")
 
 
 # ------------------------------------------------------------------ ticks
@@ -493,6 +538,7 @@ def collect(a, now, state):
     f += check_merge_group_stalled(per_repo, now, sup)
     f += check_stuck_claims(per_repo, a.runner_dir, now, sup)
     f += scan_logs(a.fleet_dir, state, a.from_start, now)
+    f += check_launcher_fallback(a.summary, state, now)
     return f
 
 

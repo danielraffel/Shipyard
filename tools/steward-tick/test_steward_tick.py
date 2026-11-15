@@ -274,6 +274,10 @@ if [ "$1" = --launcher-active ]; then
   [ -n "${FAKE_EXEC_FAILS:-}" ] && { chmod a-x "$0"; echo '{"active":true,"reason":"grant_cached"}'; exit 0; }
   [ "${FAKE_VERIFY_RC:-0}" = 0 ] || { echo '{"active":false,"reason":"grant_revoked: demoted"}'; exit "$FAKE_VERIFY_RC"; }
   [ -n "${FAKE_ACTIVE_NO_VERDICT:-}" ] && { echo '{"reason":"grant_cached"}'; exit 0; }
+  if [ -n "${FAKE_UNKNOWN_TIMES:-}" ]; then
+    n=$(grep -c -- --launcher-active "$HOME/launcher-calls")
+    [ "$n" -le "$FAKE_UNKNOWN_TIMES" ] && { echo '{"active":false,"reason":"grant_unknown: errno=4"}'; exit 1; }
+  fi
   echo '{"active":true,"reason":"grant_cached"}'; exit 0
 fi
 if [ "$1" = --launcher-script ] && [ "$2" = steward-tick ]; then
@@ -376,6 +380,67 @@ class StewardTickLauncherTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(self.calls.exists())
         self.assertIn("launcher=direct", self.summary())
+
+    def findings(self):
+        return [line for line in self.summary().splitlines() if " launcher-fallback " in line]
+
+    def test_an_unknown_grant_is_asked_again_before_falling_back(self):
+        self.activate()
+        result = self.run_installed(FAKE_UNKNOWN_TIMES="1", SHIPYARD_STEWARD_LAUNCHER_RETRY_S="0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.calls.read_text().splitlines(),
+                         ["--launcher-active", "--launcher-active", "--launcher-script steward-tick"])
+        self.assertIn("launcher=app", self.summary())
+        self.assertEqual(self.findings(), [])
+
+    def test_an_unknown_grant_twice_falls_back_loudly(self):
+        self.activate()
+        result = self.run_installed(FAKE_UNKNOWN_TIMES="2", SHIPYARD_STEWARD_LAUNCHER_RETRY_S="0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.calls.read_text().splitlines(), ["--launcher-active", "--launcher-active"])
+        self.assertIn("launcher=direct reason=not_active rc=1: grant_unknown: errno=4", self.summary())
+        [finding] = self.findings()
+        self.assertRegex(finding, r"^\d{8}T\d{6}Z launcher-fallback reason=grant_unknown FINDING detail=rc=1_grant_unknown:_errno=4$")
+        self.assertIn("acme/repo rc=0", self.summary())
+
+    def test_other_refusals_are_not_retried_but_are_loud(self):
+        self.activate()
+        self.run_installed(FAKE_VERIFY_RC="1")
+        self.assertEqual(self.calls.read_text().splitlines(), ["--launcher-active"])
+        [finding] = self.findings()
+        self.assertIn("launcher-fallback reason=grant_revoked FINDING", finding)
+
+    def test_every_fallback_with_an_activation_record_is_loud(self):
+        cases = {
+            "timed_out": dict(FAKE_ACTIVE_HANG="1", SHIPYARD_STEWARD_LAUNCHER_TIMEOUT_S="1"),
+            "exec_failed": dict(FAKE_EXEC_FAILS="1"),
+            "grant_cached": dict(FAKE_ACTIVE_NO_VERDICT="1"),
+            "launcher-script-mismatch": dict(SHIPYARD_LAUNCHER_FALLBACK="launcher-script-mismatch"),
+        }
+        for reason, env in cases.items():
+            with self.subTest(reason=reason):
+                self.tearDown()
+                self.setUp()
+                self.activate()
+                self.run_installed(**env)
+                [finding] = self.findings()
+                self.assertIn(f"launcher-fallback reason={reason} FINDING", finding)
+
+    def test_a_missing_launcher_with_a_record_is_loud(self):
+        self.activate()
+        (self.home / ".local" / "libexec" / "ShipyardLauncher.app" / "Contents" / "MacOS" / "shipyard-launcher").unlink()
+        result = self.run_installed()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("launcher=direct reason=launcher_missing", self.summary())
+        [finding] = self.findings()
+        self.assertIn("launcher-fallback reason=launcher_missing FINDING", finding)
+
+    def test_no_finding_without_an_activation_record_or_when_off(self):
+        self.run_installed()
+        self.activate()
+        self.run_installed(SHIPYARD_STEWARD_LAUNCHER="off")
+        self.run_tick()  # the repository copy never routes
+        self.assertEqual(self.findings(), [])
 
     def test_off_switch(self):
         self.activate()
