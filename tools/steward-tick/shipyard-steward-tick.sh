@@ -70,8 +70,10 @@ elif [ "${SHIPYARD_STEWARD_LAUNCHER:-on}" != off ] && [ -f "$launcher_record" ] 
   # A recheck that got no answer (grant_unknown...) is asked once more after
   # SHIPYARD_STEWARD_LAUNCHER_RETRY_S (default 5 s) before falling back: a
   # transient failure must not move the tick onto the prompt-raising path.
+  # Not when the probe hit its deadline ("no access report within"): its
+  # launcher copy may still be stuck, and a retry would leave a second one.
   if ! launcher_is_active \
-    && printf '%s' "$launcher_out" | jq -e '.reason // "" | startswith("grant_unknown")' >/dev/null 2>&1; then
+    && printf '%s' "$launcher_out" | jq -e '.reason // "" | startswith("grant_unknown") and (contains("no access report within") | not)' >/dev/null 2>&1; then
     sleep "${SHIPYARD_STEWARD_LAUNCHER_RETRY_S:-5}"
     launcher_check
   fi
@@ -100,6 +102,15 @@ elif [ "${SHIPYARD_STEWARD_LAUNCHER:-on}" != off ] && [ -f "$launcher_record" ] 
   # Activated, but the launcher's executable is gone.
   echo "$stamp launcher=direct reason=launcher_missing" >> "$log_dir/summary.log"
   launcher_fallback launcher_missing "$launcher_exe is not executable"
+elif [ "${SHIPYARD_STEWARD_LAUNCHER:-on}" != off ] && [ ! -e "$launcher_record" ] \
+  && compgen -G "$launcher_record.demoted-*" >/dev/null \
+  && [ "$(cd "$(dirname "$0")" 2>/dev/null && pwd -P)/$(basename "$0")" \
+     = "$(cd "$(dirname "$tick_installed")" 2>/dev/null && pwd -P)/$(basename "$tick_installed")" ]; then
+  # A recheck found the grant gone and demoted the record: every tick now runs
+  # directly until the owner grants Full Disk Access again and --activate runs.
+  launcher_demoted=$(ls -1t "$launcher_record".demoted-* 2>/dev/null | head -1)
+  echo "$stamp launcher=direct reason=grant_revoked_demoted" >> "$log_dir/summary.log"
+  launcher_fallback grant_revoked_demoted "record demoted to $launcher_demoted; grant Full Disk Access, then --activate"
 fi
 # Config-only sparse clones live on the internal disk: a launchd job that opens
 # a path on /Volumes blocks in the kernel waiting on an invisible privacy prompt.

@@ -274,6 +274,7 @@ if [ "$1" = --launcher-active ]; then
   [ -n "${FAKE_EXEC_FAILS:-}" ] && { chmod a-x "$0"; echo '{"active":true,"reason":"grant_cached"}'; exit 0; }
   [ "${FAKE_VERIFY_RC:-0}" = 0 ] || { echo '{"active":false,"reason":"grant_revoked: demoted"}'; exit "$FAKE_VERIFY_RC"; }
   [ -n "${FAKE_ACTIVE_NO_VERDICT:-}" ] && { echo '{"reason":"grant_cached"}'; exit 0; }
+  [ -n "${FAKE_PROBE_DEADLINE:-}" ] && { echo '{"active":false,"reason":"grant_unknown: no access report within 20s"}'; exit 1; }
   if [ -n "${FAKE_UNKNOWN_TIMES:-}" ]; then
     n=$(grep -c -- --launcher-active "$HOME/launcher-calls")
     [ "$n" -le "$FAKE_UNKNOWN_TIMES" ] && { echo '{"active":false,"reason":"grant_unknown: errno=4"}'; exit 1; }
@@ -434,6 +435,31 @@ class StewardTickLauncherTests(unittest.TestCase):
         self.assertIn("launcher=direct reason=launcher_missing", self.summary())
         [finding] = self.findings()
         self.assertIn("launcher-fallback reason=launcher_missing FINDING", finding)
+
+    def test_a_probe_that_hit_its_deadline_is_not_retried(self):
+        self.activate()
+        self.run_installed(FAKE_PROBE_DEADLINE="1", SHIPYARD_STEWARD_LAUNCHER_RETRY_S="0")
+        self.assertEqual(self.calls.read_text().splitlines(), ["--launcher-active"])
+        [finding] = self.findings()
+        self.assertIn("launcher-fallback reason=grant_unknown FINDING", finding)
+
+    def test_a_demoted_record_is_loud_on_every_tick(self):
+        self.record.parent.mkdir(parents=True, exist_ok=True)
+        demoted = self.record.with_name("activation.json.demoted-1763190000")
+        demoted.write_text('{"schema": 2}\n')
+        for _ in range(2):
+            result = self.run_installed()
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.calls.exists())
+        self.assertEqual(self.summary().count("launcher=direct reason=grant_revoked_demoted"), 2)
+        findings = self.findings()
+        self.assertEqual(len(findings), 2)
+        self.assertIn("launcher-fallback reason=grant_revoked_demoted FINDING", findings[0])
+        self.assertIn(demoted.name, findings[0])
+        # Reactivated: the old demoted file no longer pages.
+        self.activate()
+        self.run_installed()
+        self.assertEqual(len(self.findings()), 2)
 
     def test_no_finding_without_an_activation_record_or_when_off(self):
         self.run_installed()
