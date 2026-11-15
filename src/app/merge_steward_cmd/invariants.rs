@@ -269,8 +269,30 @@ fn workflow_names(text: &str, context: &str) -> bool {
         .filter(|line| !line.trim_start().starts_with('#'))
         .any(|line| {
             let line = line.to_ascii_lowercase();
-            names_token(&line, context) || stem.as_deref().is_some_and(|stem| line.contains(stem))
+            names_token(&line, context)
+                || stem.as_deref().is_some_and(|stem| line.contains(stem))
+                || template_matches(&line, context)
         })
+}
+
+/// Whether a templated job `name:` (`Test ${{ matrix.name }}`) can yield
+/// `context`: the text before the first expression must be a non-empty
+/// prefix of the context and the text after the last one a suffix of it.
+/// The expression's value is only known at run time, so a prefix-anchored
+/// template is the strongest static evidence available.
+fn template_matches(line: &str, context: &str) -> bool {
+    let Some(value) = line.trim_start().strip_prefix("name:") else {
+        return false;
+    };
+    let value = value.trim().trim_matches(['"', '\'']);
+    let (Some(open), Some(close)) = (value.find("${{"), value.rfind("}}")) else {
+        return false;
+    };
+    let (prefix, suffix) = (&value[..open], &value[close + 2..]);
+    !prefix.trim().is_empty()
+        && context.len() > prefix.len() + suffix.len()
+        && context.starts_with(prefix)
+        && context.ends_with(suffix)
 }
 
 fn names_token(line: &str, token: &str) -> bool {
