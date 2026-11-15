@@ -5,6 +5,8 @@
 #   tick         Shipyard tools/steward-tick/shipyard-steward-tick.sh -> FLEET_DEPLOY_TICK_DEST
 #   deploy       Shipyard tools/fleet-deploy/fleet-deploy.sh          -> FLEET_DEPLOY_SELF_DEST
 #   pass-runner  fleet-handbook scripts/pass-runner, through its own scripts/install-pass-runner.sh
+#   fleet-loop   fleet-handbook scripts/fleet-loop (+ pass-runner/pr_trust.py), through its own
+#                scripts/fleet-loop/install-fleet-loop.sh; only on a host that already runs it
 #   launcher     a staged, signed ShipyardLauncher.app      -> FLEET_DEPLOY_LAUNCHER_DEST,
 #                then activated once the owner's Full Disk Access grant is in place
 #
@@ -90,16 +92,41 @@ install_file() {
 # after SECONDS, so a hung launcher or check can never hold the deploy lock.
 bounded() {
   /usr/bin/python3 -c '
-import subprocess, sys
+import math, os, signal, subprocess, sys
+
+def reap_killed(proc):
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    proc.communicate()
+
 try:
-    run = subprocess.run(sys.argv[2:], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                         stdin=subprocess.DEVNULL, timeout=float(sys.argv[1]))
-except subprocess.TimeoutExpired:
-    sys.exit(124)
+    timeout = float(sys.argv[1])
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError
+except (TypeError, ValueError, OverflowError):
+    sys.exit(125)
+
+proc = None
+try:
+    proc = subprocess.Popen(sys.argv[2:], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            stdin=subprocess.DEVNULL, start_new_session=True)
+    try:
+        out, _ = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        reap_killed(proc)
+        sys.exit(124)
 except OSError:
+    if proc is not None:
+        reap_killed(proc)
     sys.exit(126)
-sys.stdout.buffer.write(run.stdout)
-sys.exit(run.returncode)
+except Exception:
+    if proc is not None:
+        reap_killed(proc)
+    sys.exit(125)
+sys.stdout.buffer.write(out)
+sys.exit(proc.returncode)
 ' "$@"
 }
 launcher_timeout="${FLEET_DEPLOY_LAUNCHER_TIMEOUT_S:-45}"
@@ -278,5 +305,57 @@ if rev=$(sync_clone fleet-handbook "$handbook_remote"); then
   fi
 else
   say "unit=pass-runner refused reason=fetch_failed"
+fi
+
+# fleet-loop: the loop's modules are installed by a separate owner-step script, so
+# a merged fix to them (2026-11-15: pair conflicts, m3 ran the 11-14 copy) never
+# reached the host. Run that script when its inputs change, on a host that
+# already has a fleet-loop config (the installer keeps it; its mode and webhook
+# choices are read back from the host, never defaulted). Last, because the
+# installer waits for a running pre-queue worker; the wait is bounded here.
+fleet_loop_cfg="${FLEET_DEPLOY_FLEET_LOOP_CONFIG:-$HOME/.config/fleet-loop/config.json}"
+fleet_loop_webhook="${FLEET_DEPLOY_FLEET_LOOP_WEBHOOK_PLIST:-$HOME/Library/LaunchAgents/com.danielraffel.fleet-loop.webhook.plist}"
+fleet_loop_timeout="${FLEET_DEPLOY_FLEET_LOOP_TIMEOUT_S:-2400}"
+if [ "${FLEET_DEPLOY_FLEET_LOOP:-on}" != off ] && [ -f "$root/fleet-handbook/scripts/fleet-loop/install-fleet-loop.sh" ] \
+   && [ -f "$fleet_loop_cfg" ]; then
+  hb="$root/fleet-handbook"
+  want=$(printf '%s:%s' "$(git -C "$hb" rev-parse HEAD:scripts/fleet-loop 2>/dev/null)" \
+         "$(git -C "$hb" rev-parse HEAD:scripts/pass-runner/pr_trust.py 2>/dev/null)")
+  have=$(cat "$root/fleet-loop.rev" 2>/dev/null || echo none)
+  if [ "$want" != "$have" ]; then
+    # Validate the role and return only a single safe hostname for a backup.
+    host=$(/usr/bin/python3 - "$fleet_loop_cfg" <<'PYCONFIG' 2>/dev/null
+import json, re, sys
+with open(sys.argv[1]) as f:
+    c = json.load(f)
+if not isinstance(c, dict) or c.get("mode") not in ("primary", "backup"):
+    sys.exit(1)
+if c["mode"] == "backup":
+    host = c.get("primary_host")
+    if not isinstance(host, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", host):
+        sys.exit(1)
+    print(host)
+PYCONFIG
+    ) || host="__unreadable__"
+    if [ "$host" = "__unreadable__" ]; then
+      say "unit=fleet-loop refused reason=config_unreadable"
+    else
+      args=()
+      [ -n "$host" ] && args+=(--backup-for "$host")
+      [ -f "$fleet_loop_webhook" ] && args+=(--webhook)
+      out="$root/fleet-loop-install-$stamp.log"
+      export OUT="$out"
+      bounded "$fleet_loop_timeout" /bin/bash -c 'cd "$1" && shift && bash scripts/fleet-loop/install-fleet-loop.sh "$@" >"$OUT" 2>&1' \
+        _ "$hb" ${args[@]+"${args[@]}"} >/dev/null 2>&1
+      rc=$?
+      if [ "$rc" = 0 ]; then
+        echo "$want" > "$root/fleet-loop.rev"
+        say "unit=fleet-loop installed rev=$(git -C "$hb" rev-parse --short=12 HEAD) args=[${args[*]-}]"
+      else
+        say "unit=fleet-loop refused rc=$rc log=$out"
+      fi
+      for f in $(ls -1t "$root"/fleet-loop-install-*.log 2>/dev/null | tail -n +21); do rm -f "$f"; done
+    fi
+  fi
 fi
 exit 0
