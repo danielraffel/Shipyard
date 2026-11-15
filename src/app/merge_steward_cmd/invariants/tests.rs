@@ -949,3 +949,23 @@ fn a_pass_in_a_checkout_of_the_base_reads_workflows_from_disk() {
     );
     assert!(find(&invariants, PRODUCER).incident(), "{invariants:?}");
 }
+
+#[test]
+fn a_templated_job_name_produces_a_context_with_its_prefix() {
+    let mut fixture = Fixture::clean();
+    fixture.required = vec![required("Test macOS ARM64")];
+    fixture.head_checks = BTreeSet::new();
+    fixture.workflows = Ok(vec![
+        "jobs:\n  test:\n    name: Test ${{ matrix.name }}\n".to_owned(),
+    ]);
+    assert!(find(&fixture.evaluate(), PRODUCER).ok);
+    // A different prefix, a bare expression, or a comment is no producer.
+    for text in [
+        "jobs:\n  t:\n    name: Build ${{ matrix.name }}\n",
+        "jobs:\n  t:\n    name: ${{ matrix.name }}\n",
+        "# name: Test ${{ matrix.name }}\n",
+    ] {
+        fixture.workflows = Ok(vec![text.to_owned()]);
+        assert!(find(&fixture.evaluate(), PRODUCER).incident(), "{text}");
+    }
+}
