@@ -382,9 +382,13 @@ fi
 # on it. SHIPYARD_LOSS_REPORT=off turns it off.
 loss_report="${SHIPYARD_LOSS_REPORT_SCRIPT:-$clones/deploy/Shipyard/tools/metrics/loss_report.py}"
 # SHIPYARD_PR_METRICS=off drops the end-to-end per-PR metrics (their GitHub reads, capped per run).
+# The cap is one shared total per run (about 3 reads per PR; closed PRs are cached across days, so
+# after warm-up a day reads only new or changed PRs). It runs once per UTC day.
+pr_metrics_repos="${SHIPYARD_PR_METRICS_REPOS:-Generous-Corp/pulp,Generous-Corp/vellum,danielraffel/Shipyard,danielraffel/tartci,danielraffel/fleet-handbook}"
+pr_metrics_cap="${SHIPYARD_PR_METRICS_READ_CAP:-1500}"
 pr_metrics_args=()
 if [ "${SHIPYARD_PR_METRICS:-on}" != "off" ]; then
-  pr_metrics_args=(--e2e-cache "$log_dir/pr-metrics-cache")
+  pr_metrics_args=(--e2e-cache "$log_dir/pr-metrics-cache" --repos "$pr_metrics_repos" --read-cap "$pr_metrics_cap")
 fi
 if [ "${SHIPYARD_LOSS_REPORT:-on}" != "off" ] && [ -f "$loss_report" ]; then
   /usr/bin/python3 -c '
@@ -395,8 +399,14 @@ os.setsid()
 if os.fork():
     os._exit(0)
 fd = os.open(os.devnull, os.O_RDWR)
-for n in (0, 1, 2):
-    os.dup2(fd, n)
+os.dup2(fd, 0)
+os.dup2(fd, 1)
+# stderr goes to loss-report.err so a failing report leaves a trace
+try:
+    efd = os.open(os.path.join(sys.argv[2], "loss-report.err"), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+except OSError:
+    efd = fd
+os.dup2(efd, 2)
 os.execv("/usr/bin/python3", ["python3", "-I", sys.argv[1], "--daily", "--log-dir", sys.argv[2]] + sys.argv[3:])
 ' "$loss_report" "$log_dir" ${pr_metrics_args[@]+"${pr_metrics_args[@]}"} || true
 fi

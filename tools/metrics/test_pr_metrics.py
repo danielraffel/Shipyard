@@ -484,7 +484,10 @@ class Caps(Base):
         self.assertTrue(out["truncated"] and v["truncated"])
         self.assertGreater(v["unread_prs"], 0)
         self.assertEqual(out["coverage"]["status"], "partial")
+        md = pm.markdown(out)
+        self.assertIn(f"**TRUNCATED: {v['unread_prs']} PRs unread**", md)
         again = self.build(world(prs), cap=200)
+        self.assertNotIn("TRUNCATED:", pm.markdown(again))
         self.assertFalse(again["truncated"])
         self.assertEqual(len(again["repos"][REPO]["prs"]), 4)
 

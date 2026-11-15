@@ -712,13 +712,17 @@ def build(repos, cache_dir, cap, owner, start, now, ticks, tick_ctx, baseline=No
     lo = start
     if baseline:
         lo = min(lo, baseline[0])
+    # `cap` is a shared total per run. Each repo gets an equal share of what is left, so reads a small
+    # repo does not use (a warm cache) flow to the repos read after it.
     per_cap = max(1, cap // max(1, len(repos)))
+    remaining = cap
     controls = DEFAULT_CONTROLS if controls is None else controls
-    out = {"scorecard_version": SCORECARD_VERSION, "owner": owner, "read_cap_per_repo": per_cap, "repos": {}, "truncated": False,
+    out = {"scorecard_version": SCORECARD_VERSION, "owner": owner, "read_cap_per_repo": per_cap, "read_cap_total": cap, "repos": {}, "truncated": False,
            "reads": 0, "coverage": {"status": "available", "reason": ""}, "baseline": None, "window": None, "controls_failed": False}
     notes = []
-    for repo in repos:
-        r = collect_repo(repo, cache_dir, per_cap, owner, lo, now, now, ticks, tick_ctx, fetch,
+    for i, repo in enumerate(repos):
+        repo_cap = max(1, remaining // (len(repos) - i))
+        r = collect_repo(repo, cache_dir, repo_cap, owner, lo, now, now, ticks, tick_ctx, fetch,
                          (bases or {}).get(repo, "main"), (dirty or {}).get(repo, ()))
         excluded = collections.Counter(x["excluded_because"] for x in r["rows"] if not x["eligible"])
         elig = [x for x in r["rows"] if x["eligible"]]
@@ -734,6 +738,7 @@ def build(repos, cache_dir, cap, owner, start, now, ticks, tick_ctx, baseline=No
         }
         out["truncated"] = out["truncated"] or r["truncated"]
         out["reads"] += r["reads"]
+        remaining = max(0, remaining - r["reads"])
         out["controls_failed"] = out["controls_failed"] or ctl["status"] == "failed"
         if r["truncated"] or r["unread"] or not r["listing_complete"] or r["errors"]:
             notes.append(f"{repo}: truncated={r['truncated']} unread={r['unread']} listing_complete={r['listing_complete']} read_errors={r['errors']}")
@@ -783,7 +788,7 @@ def sample_label(s, truncated):
 def markdown(e2e):
     L = ["", f"## Scorecard {e2e['scorecard_version']}: end-to-end per eligible PR (cohort = UTC day the PR became ready)", "",
          "Baseline cohort: PRs ready 2026-11-12 to 2026-11-14. A day closes 48h after it ends, so the first comparable later cohort day closes 48h after that day.", "",
-         f"Reads {e2e['reads']} (cap {e2e['read_cap_per_repo']} per repo), truncated={str(e2e['truncated']).lower()}"
+         f"Reads {e2e['reads']} (cap {e2e.get('read_cap_total', e2e['read_cap_per_repo'])} per run, shared: each repo gets an equal share of what is left), truncated={str(e2e['truncated']).lower()}"
          + (" : a truncated window is insufficient sample" if e2e["truncated"] else "") + f". Coverage: {e2e['coverage']['status']} {e2e['coverage']['reason']}", "",
          f"North Star: eligible PRs that became ready in the window and merged within 48h of ready with no owner action ({e2e['owner']}'s own account: "
          "review, label, comment, UI merge or close), over ALL eligible PRs ready in the window. A cohort day is reported only after its 48h horizon closed. "
@@ -822,6 +827,9 @@ def markdown(e2e):
         return f"reverts {c['revert']['found']}/{c['revert']['expected']}, escapes {c['escape']['found']}/{c['escape']['expected']}, owner-touched {c['owner_touched']['non_autonomous']}/{c['owner_touched']['in_report']}"
     for repo, v in sorted(e2e["repos"].items()):
         L += [f"### {repo}", ""]
+        if v["truncated"] or v["unread_prs"] or not v["listing_complete"]:
+            L += [f"**TRUNCATED: {v['unread_prs']} PRs unread** ({v['reads']} reads, read cap hit={str(v['truncated']).lower()}, "
+                  f"listing complete={str(v['listing_complete']).lower()}). Cached PRs are not re-read, so the next run resumes.", ""]
         if v.get("excluded"):
             L += ["Excluded from the cohort: " + ", ".join(f"{k} {n}" for k, n in sorted(v["excluded"].items())), ""]
         L += [f"Controls ({v['controls']['status']}): " + ctl_str(v) + f"; not in window: {sum(x['not_in_window'] for x in v['controls'].values() if isinstance(x, dict))}", ""]
