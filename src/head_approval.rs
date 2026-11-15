@@ -27,10 +27,19 @@
 //! * A final-line `verdict: APPROVE head:<sha>` or `reviewed:<sha>` comment
 //!   from a configured reviewer identity. The sha is always the full head.
 //!   `verdict: HOLD head:<sha>` and a matching `REQUEST_CHANGES` review block,
-//!   and a counting HOLD is final for its head: no APPROVE naming that head,
-//!   from any reviewer, posted before or after it, counts (reported as
-//!   `excluded_approval:head held by <signer> at <id>`). Only a new head (a
-//!   push) can be approved, and an approval does not carry from a held head.
+//!   and a counting HOLD wins for its head: no APPROVE naming that head, from
+//!   any reviewer, posted before or after it, counts (reported as
+//!   `excluded_approval:head held by <signer> at <id>`), and an approval does
+//!   not carry from a held head. One exception ([`hold_superseded_after`]): a
+//!   counted APPROVE of the head supersedes its HOLDs when a `dispute:`
+//!   comment from the pull request's author or a trusted identity (the fleet
+//!   App, or an `OWNER`, `MEMBER` or `COLLABORATOR`) was posted after the
+//!   newest counted HOLD and before the APPROVE (reported as
+//!   `hold_superseded:held by <signer> at <id>`). Every comparison is strict,
+//!   a HOLD's or dispute's time is its latest edit, and an unreadable time
+//!   leaves the HOLD in force. Any counted reviewer's APPROVE qualifies, not
+//!   only the HOLD's own reviewer. The exception applies only to the head
+//!   judged: a superseded head's approval never carries to a later head.
 //!
 //! Bot status alone is not a rejection: the dedicated review App is configured
 //! as a reviewer. The fleet author App and the PR author cannot approve their
@@ -1769,6 +1778,9 @@ pub fn verdict_audit_events(
             events.push(format!("excluded_approval:head {holder}"));
         }
         events.push(format!("head_held:{holder}"));
+    } else if let Some(hold) = first_hold(head, reviews, comments, policy, author) {
+        // An APPROVE after a trusted `dispute:` superseded it.
+        events.push(format!("hold_superseded:{}", describe_hold(hold)));
     }
     for comment in comments {
         if !reviewer_allowed(comment, policy, author) {
@@ -1948,7 +1960,8 @@ impl HeadGate {
                  fleet App (a `ghapp` verdict comment) or a human the base lists in \
                  `[auto_merge] human_reviewers`, never the PR author, and no HOLD naming \
                  it: a HOLD makes its head un-approvable, so a held head needs a new \
-                 push. This repository arms only approved heads; left disarmed until a \
+                 push, or a `dispute:` from the author after the HOLD and an APPROVE \
+                 after the dispute. This repository arms only approved heads; left disarmed until a \
                  reviewer posts that verdict",
                 short(head)
             ),
@@ -2026,11 +2039,14 @@ pub fn decide_excusing(
     )
 }
 
-/// The first counting HOLD naming `head`, review or comment, if any.
+/// The first counting HOLD naming `head` that still holds it, review or
+/// comment, if any: none once [`hold_superseded_after`] finds an APPROVE that
+/// supersedes it.
 ///
 /// A HOLD makes its head un-approvable: no APPROVE naming the same head, from
-/// any reviewer, earlier or later, counts against it. Only a new head (a
-/// push) can be approved. The queue-arm guard's `_latest_on` is the same.
+/// any reviewer, earlier or later, counts against it, unless a trusted
+/// `dispute:` followed the newest HOLD and a counted APPROVE followed the
+/// dispute. The queue-arm guard's `_latest_on` is the same.
 fn head_hold<'a>(
     head: &str,
     reviews: &'a [Value],
@@ -2038,7 +2054,33 @@ fn head_hold<'a>(
     policy: &ApprovalPolicy,
     author: Option<&str>,
 ) -> Option<&'a Value> {
-    let review = reviews.iter().find(|review| {
+    first_hold(head, reviews, comments, policy, author)
+        .filter(|_| hold_superseded_after(head, reviews, comments, policy, author).is_none())
+}
+
+/// The first counting HOLD naming `head`, review or comment, if any,
+/// superseded or not.
+fn first_hold<'a>(
+    head: &str,
+    reviews: &'a [Value],
+    comments: &'a [Value],
+    policy: &ApprovalPolicy,
+    author: Option<&str>,
+) -> Option<&'a Value> {
+    holds_on(head, reviews, comments, policy, author)
+        .into_iter()
+        .next()
+}
+
+/// Every counting HOLD naming `head`: reviews first, then comments.
+fn holds_on<'a>(
+    head: &str,
+    reviews: &'a [Value],
+    comments: &'a [Value],
+    policy: &ApprovalPolicy,
+    author: Option<&str>,
+) -> Vec<&'a Value> {
+    let review_holds = reviews.iter().filter(|review| {
         review
             .get("commit_id")
             .and_then(Value::as_str)
@@ -2049,18 +2091,129 @@ fn head_hold<'a>(
                 .is_some_and(|state| state.eq_ignore_ascii_case("CHANGES_REQUESTED"))
             && verdict_counts(review, Verdict::Hold, policy, author)
     });
-    review.or_else(|| {
-        comments.iter().find(|comment| {
+    let comment_holds = comments.iter().filter(|comment| {
+        comment
+            .get("body")
+            .and_then(Value::as_str)
+            .and_then(marker_verdict)
+            .is_some_and(|(verdict, marker_head)| {
+                verdict == Verdict::Hold && marker_head.eq_ignore_ascii_case(head)
+            })
+            && verdict_counts(comment, Verdict::Hold, policy, author)
+    });
+    review_holds.chain(comment_holds).collect()
+}
+
+/// A record's time at its latest edit: the later of `at` and `updated_at`
+/// when the record carries one. `None` when either is unreadable.
+fn edited_at(record: &Value) -> Option<DateTime<Utc>> {
+    let posted = at(record)?;
+    match record.get("updated_at") {
+        None | Some(Value::Null) => Some(posted),
+        Some(updated) => {
+            let updated = updated
+                .as_str()
+                .and_then(|text| DateTime::parse_from_rfc3339(text).ok())?
+                .with_timezone(&Utc);
+            Some(posted.max(updated))
+        }
+    }
+}
+
+/// Whether `record`'s author may dispute a HOLD: the fleet App itself (a
+/// Bot; a user account named like it is anyone), an `OWNER`, `MEMBER` or
+/// `COLLABORATOR`, or the pull request's author. Same as the queue-arm
+/// guard's `_dispute_trusted`.
+fn dispute_trusted(record: &Value, author: Option<&str>) -> bool {
+    let Some(login) = login(record) else {
+        return false;
+    };
+    if is_fleet_author(login) {
+        return record.get("type").and_then(Value::as_str) == Some("Bot");
+    }
+    record
+        .get("association")
+        .and_then(Value::as_str)
+        .is_some_and(|association| TRUSTED_ASSOCIATIONS.contains(&association))
+        || author.is_some_and(|author| normalized_login(author) == normalized_login(login))
+}
+
+/// A `dispute:` comment: its body starts `dispute:` (any case, after leading
+/// blank space), and its last non-blank line is neither a verdict nor an
+/// adversarial ruling, so no verdict and no ruling is ever a dispute. Same as
+/// the queue-arm guard's `is_dispute_body`.
+pub(crate) fn is_dispute_body(body: &str) -> bool {
+    let starts = body
+        .trim_start()
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("dispute:"));
+    let ruling = body
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .is_some_and(|line| {
+            line.trim()
+                .get(..19)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("adversarial-ruling:"))
+        });
+    starts && marker_verdict(body).is_none() && !ruling
+}
+
+/// When a counted APPROVE supersedes every counted HOLD of `head`: the time
+/// of the first trusted `dispute:` comment posted strictly after the newest
+/// counted HOLD, when a counted APPROVE of `head` was posted strictly after
+/// that dispute. Only approvals after that time may then decide the head.
+/// `None` (the HOLD stands) when no HOLD names the head, any HOLD's time is
+/// unreadable, no trusted dispute follows the newest one, or no counted
+/// APPROVE follows the dispute. Same as the queue-arm guard's
+/// `hold_superseded_after`.
+pub(crate) fn hold_superseded_after(
+    head: &str,
+    reviews: &[Value],
+    comments: &[Value],
+    policy: &ApprovalPolicy,
+    author: Option<&str>,
+) -> Option<DateTime<Utc>> {
+    let mut newest: Option<DateTime<Utc>> = None;
+    for hold in holds_on(head, reviews, comments, policy, author) {
+        // Any unreadable HOLD time leaves the HOLD in force.
+        let time = edited_at(hold)?;
+        newest = Some(newest.map_or(time, |seen| seen.max(time)));
+    }
+    let newest = newest?;
+    let dispute = comments
+        .iter()
+        .filter(|comment| {
             comment
                 .get("body")
                 .and_then(Value::as_str)
-                .and_then(marker_verdict)
-                .is_some_and(|(verdict, marker_head)| {
-                    verdict == Verdict::Hold && marker_head.eq_ignore_ascii_case(head)
-                })
-                && verdict_counts(comment, Verdict::Hold, policy, author)
+                .is_some_and(is_dispute_body)
+                && dispute_trusted(comment, author)
         })
-    })
+        .filter_map(edited_at)
+        .filter(|time| *time > newest)
+        .min()?;
+    let approves = |record: &&Value| {
+        at(record).is_some_and(|time| time > dispute)
+            && verdict_counts(record, Verdict::Approve, policy, author)
+    };
+    let reviewed = reviews.iter().filter(approves).any(|review| {
+        review
+            .get("state")
+            .and_then(Value::as_str)
+            .is_some_and(|state| state.eq_ignore_ascii_case("APPROVED"))
+            && review
+                .get("commit_id")
+                .and_then(Value::as_str)
+                .is_some_and(|commit| commit.eq_ignore_ascii_case(head))
+    });
+    let marked = comments.iter().filter(approves).any(|comment| {
+        comment
+            .get("body")
+            .and_then(Value::as_str)
+            .is_some_and(|body| marker_names_head(body, head))
+    });
+    (reviewed || marked).then_some(dispute)
 }
 
 /// `held by <signer> at <comment|review> <id>` for a HOLD record: the `reviewer:` signer line
@@ -2103,8 +2256,10 @@ fn latest_verdict(
     policy: &ApprovalPolicy,
     author: Option<&str>,
 ) -> Option<Verdict> {
-    // A HOLD is final for its head: no approval, earlier or later, outranks it.
-    if head_hold(head, reviews, comments, policy, author).is_some() {
+    // Strict: any HOLD wins here, superseded or not. This is the rule for a
+    // head whose approval would carry; the head judged goes through
+    // [`decide_for_author`], which applies [`hold_superseded_after`].
+    if first_hold(head, reviews, comments, policy, author).is_some() {
         return Some(Verdict::Hold);
     }
     let review_events = reviews.iter().filter_map(|review| {
@@ -2153,11 +2308,13 @@ pub(crate) fn decide_for_author(
     if !policy.required {
         return HeadGate::NotRequired;
     }
-    if latest_verdict(head, reviews, comments, policy, author) == Some(Verdict::Hold) {
+    if head_hold(head, reviews, comments, policy, author).is_some() {
         return HeadGate::NotApproved {
             head: head.to_owned(),
         };
     }
+    // A superseded HOLD: only an approval after the dispute decides the head.
+    let disputed = hold_superseded_after(head, reviews, comments, policy, author);
     let mut ejections = head_ejections(queue, head);
     if latest_was_interruption {
         ejections.pop();
@@ -2170,6 +2327,7 @@ pub(crate) fn decide_for_author(
             .and_then(|ejection| ejection.at.as_deref())
             .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
             .map_or(DateTime::<Utc>::MAX_UTC, |at| at.with_timezone(&Utc));
+        let floor = disputed.map_or(floor, |dispute| floor.max(dispute));
         return match find_approval_for_author(head, reviews, comments, policy, Some(floor), author)
         {
             Some(approval) => HeadGate::Approved { approval },
@@ -2179,7 +2337,7 @@ pub(crate) fn decide_for_author(
             },
         };
     }
-    let gate = match find_approval_for_author(head, reviews, comments, policy, None, author) {
+    let gate = match find_approval_for_author(head, reviews, comments, policy, disputed, author) {
         Some(approval) => HeadGate::Approved { approval },
         None => HeadGate::NotApproved {
             head: head.to_owned(),
@@ -2479,7 +2637,7 @@ pub fn read_policy_required(
 /// A review as the gate reads it.
 const REVIEW_RECORD_JQ: &str = ".[] | {id: .id, login: .user.login, type: .user.type, association: .author_association, at: .submitted_at, state: .state, commit_id: .commit_id, body: .body, performed_via_github_app_id: .performed_via_github_app.id}";
 /// A comment as the gate reads it.
-const COMMENT_RECORD_JQ: &str = ".[] | {id: .id, login: .user.login, type: .user.type, association: .author_association, at: .created_at, body: .body, performed_via_github_app_id: .performed_via_github_app.id}";
+const COMMENT_RECORD_JQ: &str = ".[] | {id: .id, login: .user.login, type: .user.type, association: .author_association, at: .created_at, updated_at: .updated_at, body: .body, performed_via_github_app_id: .performed_via_github_app.id}";
 
 fn read_records(run_gh: RunGh<'_>, path: &str, jq: &str) -> Result<Vec<Value>, String> {
     let raw = run_gh(&[

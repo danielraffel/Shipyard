@@ -179,6 +179,12 @@ VERDICT #8933 head fc399ea6: RED — macos failed cmake-forge-catalog-install (R
   last 24 hours (their `pull_request` runs and the merge groups named for them).
   The verdict stays `RED` — the head cannot land — but the line no longer
   implies the PR caused it.
+- **A held head** is `RED` on the required `review-verdict` check while a
+  counted HOLD names it. It turns green without a new push only when a
+  `dispute:` from the author or a trusted identity follows the newest HOLD and
+  a counted APPROVE of the same head follows the dispute (docs/ghapp-guards.md,
+  "A disputed HOLD"); the comment re-runs that check, and the verdict line
+  follows it.
 - **Queue suffix**: `queued pos N`, `armed`, `not armed`, `ejected <reason> at
   <time>, same head|new head since`, `merged`, `closed`.
 

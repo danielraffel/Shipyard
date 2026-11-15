@@ -36,7 +36,7 @@ use crate::output::write_json_envelope;
 /// Each GitHub read's own deadline.
 const GITHUB_READ_TIMEOUT: Duration = Duration::from_mins(1);
 /// A comment as the approval gate reads it (`head_approval`'s record).
-const COMMENT_RECORD_JQ: &str = ".[] | {id: .id, login: .user.login, type: .user.type, association: .author_association, at: .created_at, body: .body, performed_via_github_app_id: .performed_via_github_app.id}";
+const COMMENT_RECORD_JQ: &str = ".[] | {id: .id, login: .user.login, type: .user.type, association: .author_association, at: .created_at, updated_at: .updated_at, body: .body, performed_via_github_app_id: .performed_via_github_app.id}";
 /// A label event.
 const EVENT_RECORD_JQ: &str =
     ".[] | {event: .event, label: .label.name, login: .actor.login, at: .created_at}";

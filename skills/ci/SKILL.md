@@ -448,8 +448,10 @@ reviewed:<40-hex sha>
 ```
 
 `reviewed:` is an alias for APPROVE. The latest verdict on the current head
-decides, except that a HOLD is final: once a counting HOLD names a head, no
-APPROVE of that head (earlier or later, any signer) counts; push a new head. A HOLD on an older head, a quoted (`>`) line, a line above the last,
+decides, except that a HOLD wins: once a counting HOLD names a head, no
+APPROVE of that head (earlier or later, any signer) counts; push a new head,
+or, if the HOLD is wrong, comment `dispute: <reason>` after it, and a counted
+APPROVE of the same head posted after the dispute supersedes the HOLD. A HOLD on an older head, a quoted (`>`) line, a line above the last,
 and prose that mentions "hold" or "changes requested" never gate. A marker
 posted before the head commit existed does not count. Without an approval the line reads
 `▸ Auto-merge not armed on #N: head … carries no approval …`, and the same check
@@ -4756,7 +4758,16 @@ only makes the pull request look approved. The managed
 `verdict-contradiction-guard` refuses that APPROVE before it posts (same
 counting rule as the gate, from any signer) and names the HOLD's signer and
 URL; the author pushes a new head (merging the base) and the reviewer
-reviews that. It also refuses a verdict that contradicts the same session's
+reviews that. A disputed HOLD is the one exception: once a `dispute:` comment
+from the pull request's author, the fleet App or an OWNER, MEMBER or
+COLLABORATOR follows the newest counted HOLD of a head, the guard lets an
+APPROVE of that head post, and the gate counts it when it was posted after
+the dispute. That APPROVE must be a fully valid counted verdict (exact head,
+allowed signer, session stamp), any counted reviewer may post it, every time
+is strict and taken at its latest edit, and an unreadable time leaves the HOLD
+in force. It applies to that head only: a superseded head's approval never
+carries to a later head. An adversarial FIX-FIRST or BLOCK ruling is not a
+HOLD, and no dispute clears one. It also refuses a verdict that contradicts the same session's
 opposite verdict on the same head within ten minutes; a deliberate
 retraction of one's own APPROVE posts with `SHIPYARD_VERDICT_RETRACT=1`. The
 steward reports such a row as `held:review-verdict` with `blocked_detail` "held head: needs

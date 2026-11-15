@@ -135,7 +135,9 @@ fn verdict_for(
             return format!(
                 "head {head} is {holder}, and a HOLD makes its head un-approvable: the author \
                  pushes a new head to https://github.com/{repo}/pull/{pr} that addresses the \
-                 HOLD, and a reviewer reviews that new head"
+                 HOLD, and a reviewer reviews that new head; or, if the HOLD is wrong, the \
+                 author comments `dispute: <reason>` after it, and a counted APPROVE of this \
+                 head posted after the dispute supersedes the HOLD"
             );
         }
         format!(

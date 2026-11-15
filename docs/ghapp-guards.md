@@ -457,7 +457,9 @@ any counting reviewer or signer, posted before or after the HOLD, and an
 approval does not carry from a held head. Only a new head (a push) can be
 approved. Each APPROVE ignored this way is reported as
 `excluded_approval:head held by <signer> at <comment|review> <id>`. A HOLD
-from a login that does not count is ignored.
+from a login that does not count is ignored. The one exception is a disputed
+HOLD (below): an APPROVE posted after a trusted `dispute:` that follows the
+newest HOLD supersedes it at that head.
 
 **Whose verdict counts.**
 
@@ -757,7 +759,8 @@ disables auto-merge (`disablePullRequestAutoMerge`) if armed. Another pull
 request, another head, or one neither armed nor queued is left alone. Every
 action and every failure is a line in `holds.jsonl` in the guards directory.
 A held head never lands again: a HOLD makes its head un-approvable, so the
-pull request lands only after a new head is pushed and approved, which
+pull request lands only after a new head is pushed and approved, or after a
+disputed HOLD is superseded by an APPROVE of the same head (below), which
 `queue-arm-guard` requires on hosts with review before arm.
 
 The merge steward closes the same gap without a HOLD. On every `--apply` pass
@@ -823,6 +826,46 @@ check correctly stayed red ("ignored 1 APPROVE"), but the pull request read as
 approved, the reviewers' queue counted it as reviewed, and nobody acted.
 `verdict-contradiction-guard` stops that APPROVE before it posts.
 
+### A disputed HOLD
+
+A wrong HOLD used to cost a push: the author merged the base to make a new
+head, and every required check ran again (about 77 minutes a round; vellum#435
+lost about two hours). Now a counted APPROVE supersedes the counted HOLDs of
+the same head when all of these hold:
+
+1. a comment whose body starts `dispute:` (any case) was posted strictly after
+   the newest counted HOLD of that head, by the pull request's author, the
+   fleet App (a Bot; a user account named like it does not count), or an
+   OWNER, MEMBER or COLLABORATOR. A comment whose last line is a verdict or an
+   `adversarial-ruling:` is never a dispute;
+2. the APPROVE is a counted verdict by the usual rules: exact head, allowed
+   signer, session stamp where the base lists `reviewer_stamp_sessions`, from
+   an identity the gate counts;
+3. the APPROVE was posted strictly after that dispute;
+4. no counted HOLD of the head is newer than the dispute, so none is newer
+   than the APPROVE.
+
+The APPROVE may come from any counted reviewer, not only the one that posted
+the HOLD: the dispute exists for HOLDs that are wrong or whose reviewer is
+gone. A base that lists `reviewer_identities` still counts only those. A HOLD
+comment's and a dispute's times are read at their latest edit, so editing an
+old comment into a dispute, or a HOLD after its dispute, does not qualify; an
+unreadable time leaves the HOLD in force. Only an approval posted after the
+dispute can decide the head, so the self-approval and reviewer-claim checks
+judge that one. The exception is for the head judged only: a superseded head's
+approval never carries to a later head by a merge-only or rebase carry.
+
+The gate reports a superseded HOLD as `hold_superseded:held by <signer> at
+<comment|review> <id>` instead of `head_held:`, and `verdict-contradiction-guard`
+lets the re-review's APPROVE post once a qualifying dispute is on the pull
+request (a guard installed from an older binary still refuses it, so hosts
+need `shipyard guards install` after updating). Rule 2 of that guard (a
+session does not contradict itself within ten minutes) is unchanged.
+
+An adversarial reviewer's `adversarial-ruling: FIX-FIRST|BLOCK` is not a HOLD:
+the gate never reads rulings, so nothing here clears one, and the fleet's
+adversarial-open gating, which lives outside Shipyard, is unaffected.
+
 **What it recognises:** the verdicts the stamper and the reviewer-claim guard
 read: a body whose last non-blank line is `verdict: APPROVE|HOLD head:<sha>` or
 `reviewed: <sha>` in `pr`/`issue` `comment`/`review`/`close` options, `api`
@@ -844,8 +887,10 @@ before `verdict-hold-hook`, so a HOLD it refuses never disarms anything.
    HOLD), and never a drive-by comment the gate does not count. The refusal
    names the HOLD and the next action: "head <sha> is held by <signer> at
    <comment url>; a HOLD makes a head un-approvable. If the HOLD is wrong, the
-   author must push a new head (merge the base) and you review that; do not
-   approve this head."
+   author must push a new head (merge the base) and you review that, or
+   comment `dispute: <reason>` after the HOLD and you re-review this head; do
+   not approve this head before then." Once a trusted `dispute:` follows the
+   newest HOLD, the APPROVE posts (see "A disputed HOLD").
 2. **A session does not contradict itself.** A HOLD is refused when the same
    session (the same host, session id and agent id in the fleet App's stamp)
    posted an APPROVE of that head in the last ten minutes, and an APPROVE in
@@ -872,7 +917,7 @@ each verdict costs up to four App API reads.
 `blocked_detail` in the steward's report and in `shipyard wait pr --state
 actionable`; its `next_action` starts "Held head: needs a new head" and tells
 the repair lane to address the HOLD's named items and push a new head (or, when the HOLD
-is wrong, push a new head anyway and comment `dispute: <reason>`). `pr-watch`'s
+is wrong, comment `dispute: <reason>` so a reviewer re-reviews the same head). `pr-watch`'s
 `held_unrepaired` event says the same.
 
 ## Environment re-enqueue

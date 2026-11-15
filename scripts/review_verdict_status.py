@@ -8,8 +8,10 @@ never pass through it. A required ``review-verdict`` status stops those too.
 
 The decision is the guard's own: this script calls
 ``ghapp_queue_arm_guard.review_gate`` with the live head bound, so the two
-cannot drift. A trusted HOLD naming the head always wins (a HOLD makes its
-head un-approvable; only a new head can be approved), otherwise the newest
+cannot drift. A trusted HOLD naming the head wins (a HOLD makes its head
+un-approvable) unless a trusted ``dispute:`` follows the newest HOLD and a
+counted APPROVE follows the dispute (the guard's ``hold_superseded_after``);
+otherwise the newest
 trusted verdict naming the head decides, and only an APPROVE naming the head, or one the
 guard carries to it, is ``success``. Both carries apply here: the merge-only
 carry and the rebase carry (same patch-id, same files, the base touched none

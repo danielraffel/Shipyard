@@ -4506,3 +4506,411 @@ fn a_non_boolean_fleet_review_switch_on_the_base_is_unreadable() {
         assert!(policy.required, "{policy:?}");
     });
 }
+
+// ---------------------------------------------------------------------------
+// A trusted dispute, then a counted APPROVE, supersedes the HOLD (vellum#435)
+// ---------------------------------------------------------------------------
+
+const DISPUTE_AUTHOR: &str = "author-agent";
+
+fn hold_at(id: u64, at: &str, head: &str) -> Value {
+    signed_verdict(
+        id,
+        at,
+        "infra-review2",
+        "fleet-pass-reviewer-1",
+        "HOLD",
+        head,
+    )
+}
+
+fn approve_at(id: u64, at: &str, head: &str) -> Value {
+    signed_verdict(
+        id,
+        at,
+        "pulp-review",
+        "fleet-pass-reviewer-2",
+        "APPROVE",
+        head,
+    )
+}
+
+fn dispute_by(login: &str, kind: &str, association: &str, at: &str) -> Value {
+    json!({"id": 2, "login": login, "type": kind, "association": association, "at": at,
+           "body": "dispute: the HOLD names a test this PR does not touch"})
+}
+
+fn author_dispute(at: &str) -> Value {
+    dispute_by(DISPUTE_AUTHOR, "User", "NONE", at)
+}
+
+fn decided(policy: &ApprovalPolicy, reviews: &[Value], comments: &[Value]) -> HeadGate {
+    super::with_host_sessions(None, || {
+        decide_for_author(
+            policy,
+            HEAD,
+            reviews,
+            comments,
+            &empty_queue(HEAD),
+            false,
+            Some(DISPUTE_AUTHOR),
+        )
+    })
+}
+
+fn marker_id(gate: &HeadGate) -> Option<u64> {
+    match gate {
+        HeadGate::Approved {
+            approval: Approval::Marker { comment_id, .. },
+        } => *comment_id,
+        _ => None,
+    }
+}
+
+#[test]
+fn a_dispute_then_an_approve_supersedes_the_hold() {
+    let policy = pulp_signed();
+    let comments = [
+        hold_at(1, "2026-11-14T10:00:00Z", HEAD),
+        author_dispute("2026-11-14T11:00:00Z"),
+        approve_at(3, "2026-11-14T12:00:00Z", HEAD),
+    ];
+    let gate = decided(&policy, &[], &comments);
+    assert_eq!(marker_id(&gate), Some(3), "{gate:?}");
+    super::with_host_sessions(None, || {
+        assert_eq!(
+            super::verdict_audit_events(HEAD, &[], &comments, &policy, Some(DISPUTE_AUTHOR)),
+            vec!["hold_superseded:held by infra-review2 at comment 1".to_owned()]
+        );
+    });
+}
+
+#[test]
+fn an_approve_with_no_dispute_does_not_supersede() {
+    let policy = pulp_signed();
+    let comments = [
+        hold_at(1, "2026-11-14T10:00:00Z", HEAD),
+        approve_at(3, "2026-11-14T12:00:00Z", HEAD),
+    ];
+    assert!(!decided(&policy, &[], &comments).allows());
+}
+
+#[test]
+fn only_the_author_or_a_trusted_identity_disputes() {
+    let policy = pulp_signed();
+    let at = "2026-11-14T11:00:00Z";
+    for (name, dispute, counts) in [
+        ("the author", author_dispute(at), true),
+        (
+            "the fleet App",
+            dispute_by("shipyard-local[bot]", "Bot", "CONTRIBUTOR", at),
+            true,
+        ),
+        ("a member", dispute_by("helper", "User", "MEMBER", at), true),
+        (
+            "a drive-by account",
+            dispute_by("drive-by", "User", "NONE", at),
+            false,
+        ),
+        (
+            "a user named like the App",
+            dispute_by("shipyard-local", "User", "NONE", at),
+            false,
+        ),
+    ] {
+        let comments = [
+            hold_at(1, "2026-11-14T10:00:00Z", HEAD),
+            dispute,
+            approve_at(3, "2026-11-14T12:00:00Z", HEAD),
+        ];
+        assert_eq!(decided(&policy, &[], &comments).allows(), counts, "{name}");
+    }
+}
+
+#[test]
+fn a_dispute_out_of_order_does_not_supersede() {
+    let policy = pulp_signed();
+    let cases: [(&str, Vec<Value>); 4] = [
+        (
+            "dispute before the HOLD",
+            vec![
+                author_dispute("2026-11-14T09:00:00Z"),
+                hold_at(1, "2026-11-14T10:00:00Z", HEAD),
+                approve_at(3, "2026-11-14T12:00:00Z", HEAD),
+            ],
+        ),
+        (
+            "dispute after the APPROVE",
+            vec![
+                hold_at(1, "2026-11-14T10:00:00Z", HEAD),
+                approve_at(3, "2026-11-14T11:00:00Z", HEAD),
+                author_dispute("2026-11-14T12:00:00Z"),
+            ],
+        ),
+        (
+            "a second HOLD after the dispute",
+            vec![
+                hold_at(1, "2026-11-14T10:00:00Z", HEAD),
+                author_dispute("2026-11-14T11:00:00Z"),
+                hold_at(4, "2026-11-14T11:30:00Z", HEAD),
+                approve_at(3, "2026-11-14T12:00:00Z", HEAD),
+            ],
+        ),
+        (
+            "equal times",
+            vec![
+                hold_at(1, "2026-11-14T10:00:00Z", HEAD),
+                author_dispute("2026-11-14T10:00:00Z"),
+                approve_at(3, "2026-11-14T12:00:00Z", HEAD),
+            ],
+        ),
+    ];
+    for (name, comments) in cases {
+        assert!(!decided(&policy, &[], &comments).allows(), "{name}");
+    }
+}
+
+#[test]
+fn a_hold_newer_than_the_approve_wins() {
+    let policy = pulp_signed();
+    let comments = [
+        hold_at(1, "2026-11-14T10:00:00Z", HEAD),
+        author_dispute("2026-11-14T11:00:00Z"),
+        approve_at(3, "2026-11-14T12:00:00Z", HEAD),
+        hold_at(4, "2026-11-14T13:00:00Z", HEAD),
+    ];
+    assert!(!decided(&policy, &[], &comments).allows());
+}
+
+#[test]
+fn an_edit_cannot_move_a_dispute_or_a_hold_and_an_unreadable_time_holds() {
+    let policy = pulp_signed();
+    let mut edited_in = author_dispute("2026-11-14T11:00:00Z");
+    edited_in["updated_at"] = json!("2026-11-14T12:30:00Z");
+    let mut edited_hold = hold_at(1, "2026-11-14T10:00:00Z", HEAD);
+    edited_hold["updated_at"] = json!("2026-11-14T11:30:00Z");
+    let mut unreadable_edit = hold_at(1, "2026-11-14T10:00:00Z", HEAD);
+    unreadable_edit["updated_at"] = json!("yesterday");
+    let undated = hold_at(1, "not a time", HEAD);
+    for (name, hold, dispute) in [
+        (
+            "dispute edited in after the APPROVE",
+            hold_at(1, "2026-11-14T10:00:00Z", HEAD),
+            edited_in,
+        ),
+        (
+            "HOLD edited after the dispute",
+            edited_hold,
+            author_dispute("2026-11-14T11:00:00Z"),
+        ),
+        (
+            "HOLD edit time unreadable",
+            unreadable_edit,
+            author_dispute("2026-11-14T11:00:00Z"),
+        ),
+        (
+            "HOLD time unreadable",
+            undated,
+            author_dispute("2026-11-14T11:00:00Z"),
+        ),
+    ] {
+        let comments = [hold, dispute, approve_at(3, "2026-11-14T12:00:00Z", HEAD)];
+        assert!(!decided(&policy, &[], &comments).allows(), "{name}");
+    }
+    // Control: an edit that stays inside the window is fine.
+    let mut early_edit = author_dispute("2026-11-14T11:00:00Z");
+    early_edit["updated_at"] = json!("2026-11-14T11:10:00Z");
+    let comments = [
+        hold_at(1, "2026-11-14T10:00:00Z", HEAD),
+        early_edit,
+        approve_at(3, "2026-11-14T12:00:00Z", HEAD),
+    ];
+    assert!(decided(&policy, &[], &comments).allows());
+}
+
+#[test]
+fn an_approve_the_gate_does_not_count_does_not_supersede() {
+    let mut stamped = pulp_signed();
+    stamped.stamp_sessions = Some(vec!["fleet-pass-reviewer-*".to_owned()]);
+    let unsigned = signed_verdict(
+        3,
+        "2026-11-14T12:00:00Z",
+        "someone-unlisted",
+        "fleet-pass-reviewer-2",
+        "APPROVE",
+        HEAD,
+    );
+    let author_lane = signed_verdict(
+        3,
+        "2026-11-14T12:00:00Z",
+        "pulp-review",
+        "author-lane-3",
+        "APPROVE",
+        HEAD,
+    );
+    let mut unstamped = fleet(
+        "2026-11-14T12:00:00Z",
+        &format!("reviewer: pulp-review\nverdict: APPROVE head:{HEAD}"),
+    );
+    unstamped["id"] = json!(3);
+    let mut drive_by = person("drive-by", "NONE", &format!("verdict: APPROVE head:{HEAD}"));
+    drive_by["at"] = json!("2026-11-14T12:00:00Z");
+    for (name, approval, policy) in [
+        ("an unlisted signer", unsigned, pulp_signed()),
+        ("an unlisted stamped session", author_lane, stamped.clone()),
+        ("no session stamp", unstamped, stamped.clone()),
+        ("a drive-by account", drive_by, pulp_signed()),
+    ] {
+        // Control: alone it does not approve either.
+        assert!(
+            !decided(&policy, &[], std::slice::from_ref(&approval)).allows(),
+            "{name} alone"
+        );
+        let comments = [
+            hold_at(1, "2026-11-14T10:00:00Z", HEAD),
+            author_dispute("2026-11-14T11:00:00Z"),
+            approval,
+        ];
+        assert!(!decided(&policy, &[], &comments).allows(), "{name}");
+    }
+}
+
+#[test]
+fn an_approve_from_before_the_dispute_never_decides() {
+    let policy = pulp_signed();
+    let mut comments = vec![
+        approve_at(9, "2026-11-14T09:00:00Z", HEAD),
+        hold_at(1, "2026-11-14T10:00:00Z", HEAD),
+        author_dispute("2026-11-14T11:00:00Z"),
+    ];
+    assert!(!decided(&policy, &[], &comments).allows());
+    comments.push(approve_at(3, "2026-11-14T12:00:00Z", HEAD));
+    assert_eq!(marker_id(&decided(&policy, &[], &comments)), Some(3));
+}
+
+#[test]
+fn a_review_hold_and_an_approved_review_follow_the_same_rule() {
+    let policy = required(&["shipyard-review[bot]"]);
+    let mut hold = review(
+        "shipyard-review[bot]",
+        "Bot",
+        "CHANGES_REQUESTED",
+        HEAD,
+        "2026-11-14T10:00:00Z",
+    );
+    hold["id"] = json!(55);
+    let early = review(
+        "shipyard-review[bot]",
+        "Bot",
+        "APPROVED",
+        HEAD,
+        "2026-11-14T09:00:00Z",
+    );
+    let late = review(
+        "shipyard-review[bot]",
+        "Bot",
+        "APPROVED",
+        HEAD,
+        "2026-11-14T12:00:00Z",
+    );
+    let dispute = [author_dispute("2026-11-14T11:00:00Z")];
+    assert!(!decided(&policy, &[early.clone(), hold.clone()], &dispute).allows());
+    assert!(decided(&policy, &[early, hold.clone(), late.clone()], &dispute).allows());
+    assert!(!decided(&policy, &[hold, late], &[]).allows());
+}
+
+/// A FIX-FIRST or BLOCK ruling is never a HOLD, and no ruling is a dispute:
+/// adversarial gating lives outside this gate and nothing here clears it.
+#[test]
+fn an_adversarial_ruling_is_never_a_dispute() {
+    let ruling = format!(
+        "dispute: the finding is wrong\nreviewer: infra-review2\nadversarial-ruling: OK head:{HEAD}"
+    );
+    assert!(!super::is_dispute_body(&ruling));
+    assert!(!super::is_dispute_body(&format!(
+        "dispute: fine\nverdict: APPROVE head:{HEAD}"
+    )));
+    assert!(super::is_dispute_body("  Dispute: the HOLD is wrong"));
+    assert!(!super::is_dispute_body("disputed elsewhere"));
+    let policy = pulp_signed();
+    let mut as_ruling = author_dispute("2026-11-14T11:00:00Z");
+    as_ruling["body"] = json!(ruling);
+    let comments = [
+        hold_at(1, "2026-11-14T10:00:00Z", HEAD),
+        as_ruling,
+        approve_at(3, "2026-11-14T12:00:00Z", HEAD),
+    ];
+    assert!(!decided(&policy, &[], &comments).allows());
+    // A FIX-FIRST ruling followed by a dispute leaves no HOLD to supersede,
+    // so the dispute rule never reads it.
+    let fix_first = fleet(
+        "2026-11-14T10:00:00Z",
+        &format!("Adversarial review\nadversarial-ruling: FIX-FIRST head:{HEAD}"),
+    );
+    super::with_host_sessions(None, || {
+        assert_eq!(
+            super::hold_superseded_after(
+                HEAD,
+                &[],
+                &[fix_first, author_dispute("2026-11-14T11:00:00Z")],
+                &policy,
+                Some(DISPUTE_AUTHOR),
+            ),
+            None
+        );
+    });
+}
+
+#[test]
+fn a_different_head_is_unaffected_and_a_superseded_head_never_carries() {
+    let policy = pulp_signed();
+    let superseded_old = [
+        hold_at(1, "2026-11-14T10:00:00Z", OTHER),
+        author_dispute("2026-11-14T11:00:00Z"),
+        approve_at(3, "2026-11-14T12:00:00Z", OTHER),
+    ];
+    assert!(!decided(&policy, &[], &superseded_old).allows());
+    let input = super::CarryInput {
+        repo: "Generous-Corp/pulp",
+        pr: 435,
+        head: HEAD,
+        reviews: &[],
+        comments: &superseded_old,
+        policy: &policy,
+        author: Some(DISPUTE_AUTHOR),
+    };
+    let gh = |args: &[String]| -> Result<String, String> {
+        panic!("a superseded head must not reach a carry read: {args:?}")
+    };
+    let gate = HeadGate::NotApproved {
+        head: HEAD.to_owned(),
+    };
+    super::with_host_sessions(None, || {
+        assert_eq!(super::with_carry(&gh, &input, gate.clone()), gate);
+    });
+    // A dispute that predates this head's own HOLD does not lift it.
+    let comments = [
+        hold_at(1, "2026-11-14T10:00:00Z", OTHER),
+        author_dispute("2026-11-14T11:00:00Z"),
+        hold_at(4, "2026-11-14T11:30:00Z", HEAD),
+        approve_at(3, "2026-11-14T12:00:00Z", HEAD),
+    ];
+    assert!(!decided(&policy, &[], &comments).allows());
+}
+
+#[test]
+fn the_approving_agent_still_cannot_land_its_own_superseding_approval() {
+    let policy = pulp_signed();
+    let mut approval = approve_at(3, "2026-11-14T12:00:00Z", HEAD);
+    approval["body"] = json!(format!(
+        "Review.\nreviewer: pulp-review\n<!-- session: Daniels-Mac-Studio-m3/fleet-pass-reviewer-2 \
+         agent: lane-7 -->\nverdict: APPROVE head:{HEAD}"
+    ));
+    let comments = [
+        hold_at(1, "2026-11-14T10:00:00Z", HEAD),
+        author_dispute("2026-11-14T11:00:00Z"),
+        approval,
+    ];
+    let gate = super::with_arming_agent(Some("lane-7"), || decided(&policy, &[], &comments));
+    assert!(matches!(gate, HeadGate::SelfApproved { .. }), "{gate:?}");
+}

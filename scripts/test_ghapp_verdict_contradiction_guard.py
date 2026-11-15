@@ -392,6 +392,57 @@ class VerdictContradictionGuard(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("this session posted a HOLD", result.stderr)
 
+    # ------------------------------------------------ rule 1: a disputed HOLD
+
+    @staticmethod
+    def dispute(*, ident: int = 50, at: datetime = NOW - timedelta(seconds=2),
+                user: dict | None = None, association: str = "NONE",
+                body: str = "dispute: the HOLD names a file this PR does not touch") -> dict:
+        return {"id": ident, "user": user or {"login": "author-agent", "type": "User"},
+                "author_association": association,
+                "created_at": at.strftime("%Y-%m-%dT%H:%M:%SZ"), "body": body}
+
+    def test_an_approve_after_a_trusted_dispute_of_the_hold_posts(self) -> None:
+        hold = comment("HOLD", ident=4321, at=NOW - timedelta(minutes=30))
+        for name, dispute in (
+                ("the author", self.dispute()),
+                ("the fleet App", self.dispute(user=APP)),
+                ("a member", self.dispute(user={"login": "danielraffel", "type": "User"},
+                                          association="MEMBER"))):
+            with self.subTest(name):
+                result = self.run_guard(self.post("APPROVE"), [hold, dispute],
+                                        env={"SHIPYARD_AGENT_ID": "someone-else"})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("this APPROVE supersedes it", result.stderr)
+
+    def test_an_approve_of_a_held_head_without_a_qualifying_dispute_is_refused(self) -> None:
+        hold = comment("HOLD", ident=4321, at=NOW - timedelta(minutes=30))
+        for name, comments in (
+                ("no dispute", [hold]),
+                ("a drive-by dispute", [hold, self.dispute(
+                    user={"login": "stranger", "type": "User"})]),
+                ("a dispute before the HOLD", [self.dispute(at=NOW - timedelta(hours=1)),
+                                               hold]),
+                ("a user named like the App", [hold, self.dispute(
+                    user={"login": "shipyard-local", "type": "User"})])):
+            with self.subTest(name):
+                self.assert_held(self.run_guard(self.post("APPROVE"), comments,
+                                                env={"SHIPYARD_AGENT_ID": "someone-else"}))
+
+    def test_without_the_gate_helper_a_disputed_hold_still_refuses(self) -> None:
+        installed = self.guards / "queue-arm-guard"
+        installed.write_text(installed.read_text(encoding="utf-8").replace(
+            "def dispute_after_holds(", "def _removed_dispute_after_holds("), encoding="utf-8")
+        hold = comment("HOLD", ident=4321, at=NOW - timedelta(minutes=30))
+        self.assert_held(self.run_guard(self.post("APPROVE"), [hold, self.dispute()],
+                                        env={"SHIPYARD_AGENT_ID": "someone-else"}))
+
+    def test_a_dispute_does_not_lift_this_sessions_own_recent_hold(self) -> None:
+        hold = comment("HOLD", ident=4321, at=NOW - timedelta(minutes=3))
+        result = self.run_guard(self.post("APPROVE"), [hold, self.dispute()])
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("this session posted a HOLD", result.stderr)
+
     # ------------------------------------------------ parity and wiring
 
     def test_refuses_exactly_the_approves_the_gate_ignores(self) -> None:
@@ -412,10 +463,19 @@ class VerdictContradictionGuard(unittest.TestCase):
                      association="OWNER")],
             [comment("HOLD", user={"login": "shipyard-local", "type": "User"})],
             [comment("APPROVE", ident=1), comment("HOLD", ident=2)],
+            # A trusted dispute after the HOLD: the gate counts the APPROVE
+            # posted next, so the guard lets it post.
+            [comment("HOLD", ident=1, at=NOW - timedelta(minutes=30)), self.dispute()],
+            [comment("HOLD", ident=1, at=NOW - timedelta(minutes=30)),
+             self.dispute(user={"login": "stranger", "type": "User"})],
         ]
         for comments in cases:
             with self.subTest(comments=[c["body"][-60:] for c in comments]):
-                held, why = arm.review_verdict(HEAD, "author-agent", comments, [], policy)
+                # The APPROVE as the gate would see it once posted.
+                posted = comment("APPROVE", ident=99, at=NOW,
+                                 stamp=_stamp("someone", "someone-else"))
+                held, why = arm.review_verdict(HEAD, "author-agent", [*comments, posted], [],
+                                               policy)
                 gate_holds = (not held) and "un-approvable" in why
                 result = self.run_guard(self.post("APPROVE"), comments,
                                         env={"SHIPYARD_AGENT_ID": "someone-else"})

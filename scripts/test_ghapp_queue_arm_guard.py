@@ -5030,6 +5030,205 @@ class HoldMakesHeadUnapprovable(unittest.TestCase):
                                                       self.policy))
 
 
+class DisputedHoldIsSupersededByALaterApprove(unittest.TestCase):
+    """A counted APPROVE supersedes a counted HOLD of the same head only after
+    a trusted `dispute:` that follows the newest HOLD. Same rule as
+    src/head_approval.rs ``hold_superseded_after``."""
+
+    HEAD = HoldMakesHeadUnapprovable.HEAD
+    OLD = HoldMakesHeadUnapprovable.OLD
+    AUTHOR = "danielraffel"
+    setUp = HoldMakesHeadUnapprovable.setUp
+    verdict = HoldMakesHeadUnapprovable.verdict
+    judge = HoldMakesHeadUnapprovable.judge
+
+    def dispute(self, comment_id: int, at: str, login: str = "danielraffel",
+                association: str = "NONE", kind: str = "User",
+                body: str = "dispute: the HOLD names a test this PR does not touch",
+                updated: str | None = None) -> dict[str, Any]:
+        record = {"id": comment_id, "user": {"login": login, "type": kind},
+                  "created_at": at, "body": body, "author_association": association}
+        if updated is not None:
+            record["updated_at"] = updated
+        return record
+
+    def hold(self, at: str = "2026-11-14T10:00:00Z", head: str | None = None,
+             comment_id: int = 1) -> dict[str, Any]:
+        return self.verdict(comment_id, at, "infra-review2", "fleet-pass-reviewer-1", "HOLD",
+                            head or self.HEAD)
+
+    def approve(self, at: str = "2026-11-14T12:00:00Z", head: str | None = None,
+                comment_id: int = 3, signer: str = "pulp-review") -> dict[str, Any]:
+        return self.verdict(comment_id, at, signer, "fleet-pass-reviewer-2", "APPROVE",
+                            head or self.HEAD)
+
+    def test_a_dispute_then_an_approve_supersedes_the_hold(self) -> None:
+        comments = [self.hold(), self.dispute(2, "2026-11-14T11:00:00Z"), self.approve()]
+        allowed, why = self.judge(comments)
+        self.assertTrue(allowed, why)
+        self.assertIn("supersedes the HOLD", why)
+        self.assertEqual(guard.HELD_EXCLUSIONS, [])
+        self.assertEqual(guard.deciding_approval(self.HEAD, self.AUTHOR, comments, [],
+                                                 self.policy)["verdict_comment_id"], 3)
+
+    def test_an_approve_with_no_dispute_does_not(self) -> None:
+        allowed, why = self.judge([self.hold(), self.approve()])
+        self.assertFalse(allowed, why)
+        self.assertIn("un-approvable", why)
+        self.assertIn("dispute: <reason>", why)
+
+    def test_only_the_author_or_a_trusted_identity_disputes(self) -> None:
+        for name, dispute, counts in (
+                ("the author", self.dispute(2, "2026-11-14T11:00:00Z"), True),
+                ("the fleet App", self.dispute(2, "2026-11-14T11:00:00Z",
+                                               login="shipyard-local[bot]", kind="Bot"), True),
+                ("a collaborator", self.dispute(2, "2026-11-14T11:00:00Z", login="helper",
+                                                association="COLLABORATOR"), True),
+                ("a drive-by account", self.dispute(2, "2026-11-14T11:00:00Z",
+                                                    login="drive-by"), False),
+                ("a user named like the App", self.dispute(2, "2026-11-14T11:00:00Z",
+                                                           login="shipyard-local"), False)):
+            with self.subTest(name):
+                guard.HELD_EXCLUSIONS.clear()
+                allowed, why = self.judge([self.hold(), dispute, self.approve()])
+                self.assertEqual(allowed, counts, why)
+
+    def test_a_dispute_before_the_hold_does_not(self) -> None:
+        allowed, why = self.judge([self.dispute(2, "2026-11-14T09:00:00Z"), self.hold(),
+                                   self.approve()])
+        self.assertFalse(allowed, why)
+
+    def test_a_dispute_after_the_approve_does_not(self) -> None:
+        allowed, why = self.judge([self.hold(), self.approve(at="2026-11-14T11:00:00Z"),
+                                   self.dispute(2, "2026-11-14T12:00:00Z")])
+        self.assertFalse(allowed, why)
+
+    def test_a_dispute_must_follow_the_newest_hold(self) -> None:
+        allowed, why = self.judge([
+            self.hold(), self.dispute(2, "2026-11-14T11:00:00Z"),
+            self.hold(at="2026-11-14T11:30:00Z", comment_id=4), self.approve()])
+        self.assertFalse(allowed, why)
+
+    def test_a_hold_newer_than_the_approve_wins(self) -> None:
+        allowed, why = self.judge([
+            self.hold(), self.dispute(2, "2026-11-14T11:00:00Z"), self.approve(),
+            self.hold(at="2026-11-14T13:00:00Z", comment_id=4)])
+        self.assertFalse(allowed, why)
+
+    def test_equal_times_do_not_order(self) -> None:
+        for comments in ([self.hold(), self.dispute(2, "2026-11-14T10:00:00Z"), self.approve()],
+                         [self.hold(), self.dispute(2, "2026-11-14T12:00:00Z"),
+                          self.approve()]):
+            with self.subTest(comments[1]["created_at"]):
+                self.assertFalse(self.judge(comments)[0])
+
+    def test_an_edit_cannot_move_a_dispute_or_a_hold(self) -> None:
+        edited_in = self.dispute(2, "2026-11-14T11:00:00Z", updated="2026-11-14T12:30:00Z")
+        self.assertFalse(self.judge([self.hold(), edited_in, self.approve()])[0])
+        hold = dict(self.hold(), updated_at="2026-11-14T11:30:00Z")
+        self.assertFalse(self.judge([hold, self.dispute(2, "2026-11-14T11:00:00Z"),
+                                     self.approve()])[0])
+        unreadable = dict(self.hold(), updated_at="yesterday")
+        self.assertFalse(self.judge([unreadable, self.dispute(2, "2026-11-14T11:00:00Z"),
+                                     self.approve()])[0])
+
+    def test_a_hold_with_no_readable_time_stands(self) -> None:
+        hold = self.hold(at="not a time")
+        self.assertFalse(self.judge([hold, self.dispute(2, "2026-11-14T11:00:00Z"),
+                                     self.approve()])[0])
+
+    def test_an_approve_the_gate_does_not_count_does_not(self) -> None:
+        unsigned = self.approve(signer="someone-unlisted")
+        unstamped = dict(self.approve(), body=f"reviewer: pulp-review\nverdict: APPROVE "
+                                              f"head:{self.HEAD}")
+        author_lane = dict(self.approve(), body=(
+            "reviewer: pulp-review\n<!-- session: Daniels-Mac-Studio-m3/author-lane-3 -->\n"
+            f"verdict: APPROVE head:{self.HEAD}"))
+        human = {"id": 3, "user": {"login": "drive-by", "type": "User"},
+                 "created_at": "2026-11-14T12:00:00Z", "author_association": "NONE",
+                 "body": f"verdict: APPROVE head:{self.HEAD}"}
+        stamped = guard.review_policy(
+            '[auto_merge]\nreviewer_signers = ["pulp-review", "infra-review2"]\n'
+            'reviewer_stamp_sessions = ["fleet-pass-reviewer-*"]\n', "Generous-Corp/pulp", True)
+        for name, approval, policy in (
+                ("an unlisted signer", unsigned, self.policy),
+                ("no session stamp", unstamped, stamped),
+                ("an unlisted stamped session", author_lane, stamped),
+                ("a drive-by account", human, self.policy)):
+            with self.subTest(name):
+                self.policy = policy
+                # Control: alone, it does not count either.
+                self.assertFalse(self.judge([approval])[0])
+                self.assertFalse(self.judge(
+                    [self.hold(), self.dispute(2, "2026-11-14T11:00:00Z"), approval])[0])
+
+    def test_an_approve_from_before_the_dispute_never_decides(self) -> None:
+        early = self.approve(at="2026-11-14T09:00:00Z", comment_id=9)
+        comments = [early, self.hold(), self.dispute(2, "2026-11-14T11:00:00Z")]
+        self.assertFalse(self.judge(comments)[0])
+        approved = [*comments, self.approve()]
+        self.assertTrue(self.judge(approved)[0])
+        self.assertEqual(guard.deciding_approval(self.HEAD, self.AUTHOR, approved, [],
+                                                 self.policy)["verdict_comment_id"], 3)
+
+    def test_a_held_review_and_an_approved_review_follow_the_same_rule(self) -> None:
+        hold = {"id": 70, "user": {"login": "danielraffel", "type": "User"},
+                "author_association": "OWNER", "state": "CHANGES_REQUESTED",
+                "commit_id": self.HEAD, "submitted_at": "2026-11-14T10:00:00Z", "body": "no"}
+        early = {"id": 71, "user": {"login": "danielraffel", "type": "User"},
+                 "author_association": "OWNER", "state": "APPROVED", "commit_id": self.HEAD,
+                 "submitted_at": "2026-11-14T09:00:00Z", "body": ""}
+        comments = [self.dispute(2, "2026-11-14T11:00:00Z"), self.approve()]
+        self.assertTrue(self.judge(comments, [early, hold])[0])
+        self.assertFalse(self.judge(comments[:1], [early, hold])[0])
+
+    def test_an_adversarial_ruling_is_never_a_dispute_and_never_cleared(self) -> None:
+        ruling_body = (f"dispute: the finding is wrong\nreviewer: infra-review2\n"
+                       f"adversarial-ruling: OK head:{self.HEAD}")
+        self.assertFalse(guard.is_dispute_body(ruling_body))
+        self.assertFalse(guard.is_dispute_body(
+            f"dispute: fine\nverdict: APPROVE head:{self.HEAD}"))
+        self.assertTrue(guard.is_dispute_body("  Dispute: the HOLD is wrong"))
+        allowed, why = self.judge([self.hold(), self.dispute(2, "2026-11-14T11:00:00Z",
+                                                             body=ruling_body),
+                                   self.approve()])
+        self.assertFalse(allowed, why)
+        # A FIX-FIRST ruling is not a HOLD: no dispute machinery reads it.
+        fix_first = self.dispute(5, "2026-11-14T10:00:00Z", login="shipyard-local[bot]",
+                                 kind="Bot", body=f"Adversarial review\n"
+                                 f"adversarial-ruling: FIX-FIRST head:{self.HEAD}")
+        self.assertIsNone(guard.dispute_after_holds(
+            self.HEAD, self.AUTHOR, [fix_first, self.dispute(2, "2026-11-14T11:00:00Z")], [],
+            self.policy))
+
+    def test_a_different_head_is_unaffected(self) -> None:
+        superseded_old = [self.hold(head=self.OLD), self.dispute(2, "2026-11-14T11:00:00Z"),
+                          self.approve(head=self.OLD)]
+        self.assertTrue(guard.review_verdict(self.OLD, self.AUTHOR, superseded_old, [],
+                                             self.policy)[0])
+        # The new head has no verdict, and the superseded head never carries.
+        self.assertFalse(self.judge(superseded_old)[0])
+        self.assertIsNone(guard.approved_earlier_head(self.HEAD, self.AUTHOR, superseded_old,
+                                                      [], self.policy))
+        # A dispute posted before this head's HOLD (answering the old head's)
+        # does not lift it.
+        self.assertFalse(self.judge([self.hold(head=self.OLD),
+                                     self.dispute(2, "2026-11-14T11:00:00Z"),
+                                     self.hold(at="2026-11-14T11:30:00Z", comment_id=4),
+                                     self.approve()])[0])
+
+    def test_the_approving_agent_still_cannot_land_its_own_approval(self) -> None:
+        comments = [self.hold(), self.dispute(2, "2026-11-14T11:00:00Z"),
+                    dict(self.approve(), body=(
+                        "Review.\nreviewer: pulp-review\n<!-- session: "
+                        f"Daniels-Mac-Studio-m3/fleet-pass-reviewer-2 agent: lane-7 -->\n"
+                        f"verdict: APPROVE head:{self.HEAD}"))]
+        with mock.patch.dict(os.environ, {"SHIPYARD_AGENT_ID": "lane-7"}):
+            refusal = guard.self_approval(self.HEAD, self.AUTHOR, comments, [], self.policy)
+        self.assertIsNotNone(refusal)
+        self.assertIn("same agent", str(refusal))
+
+
 class ReviewerClaimReceipt(unittest.TestCase):
     head = "a" * 40
 

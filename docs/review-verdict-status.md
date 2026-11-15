@@ -17,8 +17,11 @@ required check: GitHub then cannot merge a head whose status is not
 `review_gate` with the live head bound, so the status and the guard cannot
 disagree:
 
-- a trusted HOLD naming the head always wins, before or after any APPROVE of
-  the same head (a held head needs a new push); otherwise the newest trusted
+- a trusted HOLD naming the head wins, before or after any APPROVE of the
+  same head (a held head needs a new push), unless a `dispute:` comment from
+  the pull request's author or a trusted identity follows the newest counted
+  HOLD and a counted APPROVE of the head follows the dispute (see
+  "A disputed HOLD" in docs/ghapp-guards.md); otherwise the newest trusted
   verdict naming the head decides;
 - `success` only for an APPROVE naming the head (a comment ending
   `verdict: APPROVE head:<sha>` or `reviewed: <sha>`, or an `APPROVED`

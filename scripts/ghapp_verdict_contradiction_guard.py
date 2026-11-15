@@ -29,7 +29,11 @@ as variables, or inside an ``input: $var`` object.
 1. **A held head is not approvable.** An APPROVE is refused when a HOLD that
    the gate counts already names that head, from any signer. "Counts" is the
    gate's own ``counting_verdicts`` with the base's review policy, so this
-   guard refuses exactly the APPROVEs the gate would ignore.
+   guard refuses exactly the APPROVEs the gate would ignore. The one
+   exception is the gate's own: when a trusted ``dispute:`` comment follows
+   the newest counted HOLD of that head (``dispute_after_holds``), an APPROVE
+   posted now would supersede the HOLD, so it posts. A queue-arm guard
+   without that helper refuses as before.
 2. **One session does not contradict itself.** A HOLD is refused when the same
    session (same host, session id and agent id in its stamp) posted an APPROVE
    of that head through the fleet App in the last ``WINDOW_SECONDS``; an
@@ -630,13 +634,22 @@ def judge(args: list[str]) -> int:
             if not isinstance(base, str) or not base:
                 return unreadable("the pull request carries no base branch")
             policy = ARM.review_policy(ARM.base_config_text(repo, base), repo, True)
-            hold = held_by(head, author if isinstance(author, str) else None,
-                           comments, reviews, policy)
-            if hold is not None:
+            login = author if isinstance(author, str) else None
+            hold = held_by(head, login, comments, reviews, policy)
+            disputed = (hold is not None and hasattr(ARM, "dispute_after_holds")
+                        and ARM.dispute_after_holds(head, login, comments, reviews,
+                                                    policy) is not None)
+            if hold is not None and disputed:
+                print(f"{PREFIX}: note: head {head} is held by {hold['signer']} at "
+                      f"{hold['url']}, and a trusted `dispute:` follows the newest HOLD, so "
+                      "this APPROVE supersedes it.", file=sys.stderr)
+            elif hold is not None:
                 return _refuse(
                     f"head {head} is held by {hold['signer']} at {hold['url']}; a HOLD makes a "
                     "head un-approvable. If the HOLD is wrong, the author must push a new head "
-                    f"(merge the base) and you review that; do not approve this head. "
+                    "(merge the base) and you review that, or comment `dispute: <reason>` "
+                    "after the HOLD and you re-review this head; do not approve this head "
+                    "before then. "
                     f"(https://github.com/{repo}/pull/{number})")
         contradiction = own_contradiction(kind, head, comments, reviews, _now())
     except Exception as error:  # noqa: BLE001 - see unreadable()

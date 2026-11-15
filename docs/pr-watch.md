@@ -385,7 +385,7 @@ The mapping is case-insensitive by repository slug. An explicit
 | `ready_unreviewed` | a comment whose first line starts with READY names the current head, and no verdict names it |
 | `head_unreviewed` | opt-in, `--head-unreviewed-after 45m`: the current head has been up that long with neither a READY nor a verdict naming it (drafts excepted). Off by default because it fires for every head an agent is still working on |
 | `verdict_posted` | a verdict was posted (a last line `verdict: APPROVE/HOLD head:<sha>` or `reviewed: <sha>`, or an APPROVED / CHANGES_REQUESTED review); route it to the author |
-| `armed_unapproved` | armed or queued, and the head carries no approval: no verdict names it, or a HOLD names it (a HOLD makes its head un-approvable, so a later APPROVE of the same head does not clear it) |
+| `armed_unapproved` | armed or queued, and the head carries no approval: no verdict names it, or a HOLD names it (a HOLD makes its head un-approvable, so a later APPROVE of the same head does not clear it). `pr-watch` does not read `dispute:` comments, so it keeps reporting a HOLD that a later APPROVE superseded; the `review-verdict` status is the authority |
 | `required_red` | the pull request is armed, queued or approved, and the latest attempt of a required check on its head failed or was cancelled; the line names the failing tests. A red head nobody armed or approved is its author's work in progress |
 | `group_red` | a merge group named for the pull request failed a required job; the line names the failing tests |
 | `queue_removed` | the merge queue removed it for any reason but a merge |

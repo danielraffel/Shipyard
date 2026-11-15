@@ -90,12 +90,19 @@ head. An adversary's ruling, ``adversarial-ruling: OK|FIX-FIRST|BLOCK
 head:<sha>`` on the last line (``marker_ruling``), is stamped like a verdict
 so the fleet's must-review can trust who ruled, and is never a verdict here:
 ``marker_verdict`` reads nothing from it, so no ruling approves or holds a
-head. A counting HOLD naming the head is final for it: no APPROVE naming the
-same head, from any reviewer, before or after the HOLD, counts, and an
-approval does not carry from a held head; only a new head (a push) can be
-approved; each APPROVE ignored this way is reported as
-``excluded_approval:head held by <signer> at <comment|review> <id>``.
-Otherwise the latest verdict naming the head decides. When the base config
+head. A counting HOLD naming the head wins over every APPROVE naming the
+same head, from any reviewer, before or after the HOLD, and an approval does
+not carry from a held head; each APPROVE ignored this way is reported as
+``excluded_approval:head held by <signer> at <comment|review> <id>``. One
+exception (``hold_superseded_after``): a counted APPROVE of the head supersedes
+its HOLDs when a ``dispute:`` comment from the pull request's author or a
+trusted identity (the fleet App, or an OWNER, MEMBER or COLLABORATOR) was
+posted after the newest counted HOLD of that head and before the APPROVE.
+Every time is strict and read at its latest edit for the HOLD and the dispute;
+an unreadable time leaves the HOLD in force. Any counted reviewer's APPROVE
+qualifies, not only the HOLD's own reviewer. The exception applies only to
+the head judged: a superseded head's approval still never carries to a later
+head. Otherwise the latest verdict naming the head decides. When the base config
 lists ``reviewer_identities``, only those count. Otherwise an approval counts
 only from the fleet App (every agent posts as it through ghapp), or from an account the base lists in ``[auto_merge]
 human_reviewers`` (empty by default) whose ``author_association`` is OWNER,
@@ -1826,16 +1833,140 @@ def _held_by(login: str, body: Any, kind: str, record_id: Any) -> str:
     return f"held by {signer} at {kind} {record_id if record_id is not None else '(no id)'}"
 
 
+def _dispute_trusted(comment: dict[str, Any], author: str | None) -> bool:
+    """Whether ``comment``'s author may dispute a HOLD: the fleet App itself
+    (a Bot; a user account named like it is anyone), an OWNER, MEMBER or
+    COLLABORATOR, or the pull request's author. Same as src/head_approval.rs
+    ``dispute_trusted``."""
+    user = comment.get("user") or {}
+    login = user.get("login")
+    if not isinstance(login, str) or not login:
+        return False
+    if _normalized_login(login) == FLEET_AUTHOR:
+        return user.get("type") == "Bot"
+    if comment.get("author_association") in TRUSTED_ASSOCIATIONS:
+        return True
+    return author is not None and _normalized_login(author) == _normalized_login(login)
+
+
+def is_dispute_body(body: Any) -> bool:
+    """A ``dispute:`` comment: its body starts ``dispute:`` (any case, after
+    leading blank space), and its last non-blank line is neither a verdict nor
+    an adversarial ruling, so no verdict and no ruling is ever a dispute."""
+    if not isinstance(body, str) or not body.lstrip().lower().startswith("dispute:"):
+        return False
+    lines = [line for line in body.splitlines() if line.strip()]
+    last = lines[-1].strip().lower() if lines else ""
+    return marker_verdict(body) is None and not last.startswith("adversarial-ruling:")
+
+
+def _effective_time(comment: dict[str, Any]) -> datetime | None:
+    """A comment's time at its latest edit, or None when unreadable."""
+    raw = _comment_effective_time(comment)
+    at = _timestamp(raw) if raw is not None else None
+    return at if at is not None and at.tzinfo is not None else None
+
+
+def dispute_after_holds(
+    head: str,
+    author: str | None,
+    comments: list[dict[str, Any]],
+    reviews: list[dict[str, Any]],
+    policy: dict[str, Any],
+) -> datetime | None:
+    """The first trusted ``dispute:`` posted after the newest counted HOLD of
+    ``head``, or None: no counted HOLD names it, any such HOLD's time is
+    unreadable, or no trusted dispute follows the newest one. A HOLD
+    comment's and a dispute's times are their latest edit, so neither can be
+    edited in after the fact. The verdict-contradiction guard asks this
+    before an APPROVE of a held head posts."""
+    head = head.lower()
+    candidates = [comment for comment in comments
+                  if is_dispute_body(comment.get("body")) and _dispute_trusted(comment, author)]
+    if not candidates:
+        return None
+    # Counting here is a second read of records the gate already counted:
+    # keep its exclusion report as the gate made it.
+    saved = list(EXCLUDED_APPROVALS)
+    try:
+        return _first_dispute_after(head, author, candidates, comments, reviews, policy)
+    finally:
+        EXCLUDED_APPROVALS[:] = saved
+
+
+def _first_dispute_after(
+    head: str,
+    author: str | None,
+    candidates: list[dict[str, Any]],
+    comments: list[dict[str, Any]],
+    reviews: list[dict[str, Any]],
+    policy: dict[str, Any],
+) -> datetime | None:
+    times: list[datetime | None] = []
+    for review in reviews:
+        if any(verdict == "HOLD" and named == head for _, verdict, named, _ in
+               counting_verdicts(author, [], [review], policy)):
+            at = _timestamp(review.get("submitted_at"))
+            times.append(at if at is not None and at.tzinfo is not None else None)
+    for comment in comments:
+        if any(verdict == "HOLD" and named == head for _, verdict, named, _ in
+               counting_verdicts(author, [comment], [], policy)):
+            times.append(_effective_time(comment))
+    if not times or any(at is None for at in times):
+        return None
+    newest = max(at for at in times if at is not None)
+    disputes = [at for comment in candidates
+                if (at := _effective_time(comment)) is not None and at > newest]
+    return min(disputes) if disputes else None
+
+
+def hold_superseded_after(
+    head: str,
+    author: str | None,
+    comments: list[dict[str, Any]],
+    reviews: list[dict[str, Any]],
+    policy: dict[str, Any],
+) -> datetime | None:
+    """When a counted APPROVE supersedes every counted HOLD of ``head``: the
+    time of the dispute it follows (see ``dispute_after_holds``), when a
+    counted APPROVE of ``head`` was posted strictly after it. Only approvals
+    after that time can then decide the head. None leaves the HOLD in force.
+    Same as src/head_approval.rs ``hold_superseded_after``."""
+    dispute = dispute_after_holds(head, author, comments, reviews, policy)
+    if dispute is None:
+        return None
+    head = head.lower()
+    saved = list(EXCLUDED_APPROVALS)
+    try:
+        approved = any(at is not None and at.tzinfo is not None and at > dispute
+                       and verdict == "APPROVE" and named == head
+                       for at, verdict, named, _ in
+                       counting_verdicts(author, comments, reviews, policy))
+    finally:
+        EXCLUDED_APPROVALS[:] = saved
+    return dispute if approved else None
+
+
 def _latest_on(
-    verdicts: list[tuple[datetime | None, str, str, str]], head: str
+    verdicts: list[tuple[datetime | None, str, str, str]], head: str,
+    superseded_after: datetime | None,
 ) -> tuple[datetime | None, str, str, str] | None:
     """The deciding verdict on ``head``: any HOLD, else the newest APPROVE.
 
-    A HOLD is final for its head, so no APPROVE naming the same head, earlier
-    or later, from any reviewer, outranks it. Same as src/head_approval.rs
-    ``latest_verdict``."""
+    A HOLD wins for its head, so no APPROVE naming the same head, earlier or
+    later, from any reviewer, outranks it, unless ``superseded_after`` (from
+    ``hold_superseded_after``, for the head being judged only) is set: then
+    the newest verdict after it decides. Pass None for any head whose approval
+    would carry, so a held head never carries. Same as src/head_approval.rs
+    ``latest_verdict`` and ``decide_for_author``."""
     on_head = [entry for entry in verdicts if entry[2] == head]
     holds = [entry for entry in on_head if entry[1] == "HOLD"]
+    if holds and superseded_after is not None:
+        after = [entry for entry in on_head
+                 if entry[0] is not None and entry[0].tzinfo is not None
+                 and entry[0] > superseded_after]
+        if after and all(entry[1] == "APPROVE" for entry in after):
+            return max(after, key=lambda entry: entry[0])
     if holds:
         return holds[0]
     dated = [entry for entry in on_head if entry[0] is not None]
@@ -1875,11 +2006,15 @@ def review_verdict(
     head = head.lower()
     verdicts = counting_verdicts(author, comments, reviews, policy)
     wanted = wanted_verdict(head, author, policy)
-    latest = _latest_on(verdicts, head)
+    superseded = hold_superseded_after(head, author, comments, reviews, policy)
+    latest = _latest_on(verdicts, head, superseded)
     if latest is not None:
         at, verdict, _, what = latest
         if verdict == "APPROVE":
-            return True, f"head {head[:12]} carries {what}"
+            note = ("" if superseded is None else
+                    "; it supersedes the HOLD of this head: a trusted `dispute:` followed "
+                    "the newest HOLD and the APPROVE followed the dispute")
+            return True, f"head {head[:12]} carries {what}{note}"
         posted = (at.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
                   if at is not None and at.tzinfo is not None else "with no readable time")
         excluded = [entry for entry in verdicts if entry[2] == head and entry[1] == "APPROVE"]
@@ -1888,7 +2023,8 @@ def review_verdict(
         return False, (
             f"a HOLD naming head {head[:12]} makes it un-approvable ({what}, posted {posted})"
             + (f"; ignored {len(excluded)} APPROVE(s) of the same head" if excluded else "")
-            + "; push a new head that addresses the HOLD and have it reviewed")
+            + "; push a new head that addresses the HOLD and have it reviewed, or, if the "
+            "HOLD is wrong, comment `dispute: <reason>` so a reviewer re-reviews this head")
     older = [entry for entry in verdicts if entry[0] is not None]
     stale = ""
     if older:
@@ -1906,7 +2042,8 @@ def _deciding_approval_comment(
 ) -> dict[str, Any] | None:
     """The APPROVE comment deciding ``head``, when one does."""
     head = head.lower()
-    latest = _latest_on(counting_verdicts(author, comments, reviews, policy), head)
+    latest = _latest_on(counting_verdicts(author, comments, reviews, policy), head,
+                        hold_superseded_after(head, author, comments, reviews, policy))
     if latest is None or latest[1] != "APPROVE" or latest[0] is None:
         return None
     for comment in comments:
@@ -1968,9 +2105,13 @@ def deciding_approval(
         return {"verdict_comment_id": comment.get("id"),
                 "signer": signed[-1].lower() if signed else None, "approved_head": head,
                 "approved_at": _comment_effective_time(comment)}
+    superseded = hold_superseded_after(head, author, comments, reviews, policy)
     for review in reviews:
+        submitted = _timestamp(review.get("submitted_at"))
         if (str(review.get("state") or "").upper() == "APPROVED"
-                and str(review.get("commit_id") or "").lower() == head):
+                and str(review.get("commit_id") or "").lower() == head
+                and (superseded is None or (submitted is not None and submitted.tzinfo
+                                            is not None and submitted > superseded))):
             return {"verdict_review_id": review.get("id"),
                     "signer": (review.get("user") or {}).get("login"), "approved_head": head,
                     "approved_at": review.get("submitted_at")}
@@ -2034,13 +2175,14 @@ def approved_earlier_head(
     """The newest other head whose deciding verdict is an approval, if no verdict names ``head``."""
     head = head.lower()
     verdicts = counting_verdicts(author, comments, reviews, policy)
-    if _latest_on(verdicts, head) is not None:
+    if _latest_on(verdicts, head, None) is not None:
         return None
     floor = datetime.min.replace(tzinfo=timezone.utc)
     for _, _, named, _ in sorted(verdicts, key=lambda entry: entry[0] or floor, reverse=True):
         if named == head:
             continue
-        latest = _latest_on(verdicts, named)
+        # Strict: a held head's approval never carries, superseded or not.
+        latest = _latest_on(verdicts, named, None)
         return named if latest is not None and latest[1] == "APPROVE" else None
     return None
 
@@ -2180,7 +2322,8 @@ def carry_limits(approved: str, author: str | None, comments: list[dict[str, Any
                  now: datetime | None = None) -> str | None:
     """Why the approval of ``approved`` may not carry at all, or None: its
     verdict has a ``carry: no`` line, or it is older than MAX_CARRY_AGE."""
-    latest = _latest_on(counting_verdicts(author, comments, reviews, policy), approved.lower())
+    latest = _latest_on(counting_verdicts(author, comments, reviews, policy), approved.lower(),
+                        None)
     at = latest[0] if latest is not None else None
     if at is None:
         return "the time of its verdict is unknown"
@@ -3576,7 +3719,7 @@ def _review_gate(classification: dict[str, Any], repo: str | None, dry_run: bool
     cause = "hold" if "is HOLD" in why or "HOLD naming" in why else "unreviewed"
     head_ref = str((pull.get("head") or {}).get("ref") or "")
     if cause == "unreviewed" and head_ref.startswith(ROLLUP_BRANCH_PREFIX) and _latest_on(
-            counting_verdicts(author, comments, reviews, policy), head.lower()) is None:
+            counting_verdicts(author, comments, reviews, policy), head.lower(), None) is None:
         try:
             config = train_config(config_text)
             refusal, members = (rollup_acceptance(repo, number, head, pull, config, policy)
@@ -3654,8 +3797,10 @@ def _review_gate(classification: dict[str, Any], repo: str | None, dry_run: bool
         return False, f"{label} ({repo}): {why}", review_fix(
             cause, what, repo, number, head,
             f"the author pushes a new head to https://github.com/{repo}/pull/{number} that "
-            "addresses the HOLD; a reviewer then reviews that new head. No APPROVE of the "
-            f"held head {head} counts", False)
+            "addresses the HOLD; a reviewer then reviews that new head. If the HOLD is wrong, "
+            "the author comments `dispute: <reason>` instead, and a counted APPROVE of "
+            f"{head} posted after that dispute supersedes the HOLD; no APPROVE posted before "
+            "the dispute counts", False)
     command = (f"a reviewer agent reviews head {head} and posts, through `ghapp` (the fleet "
                f"App), a comment ending `verdict: APPROVE head:{head}` on "
                f"https://github.com/{repo}/pull/{number}; a human approval counts only for a "
