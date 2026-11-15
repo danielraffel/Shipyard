@@ -979,7 +979,6 @@ class FleetRolloutStageTests(unittest.TestCase):
         code: int,
         events: list[dict],
         *,
-        capable: int = 0,
         plan_code: int = 0,
         plan_stderr: str = "",
     ) -> FakeRunner:
@@ -989,9 +988,6 @@ class FleetRolloutStageTests(unittest.TestCase):
         runner.probe_calls = []  # type: ignore[attr-defined]
 
         def run_status(args: list[str]) -> tuple[int, str, str]:
-            if args[1:] == ["runner", "fleet-reconcile", "--help"]:
-                runner.probe_calls.append(args)  # type: ignore[attr-defined]
-                return capable, "", ""
             if "--apply" not in args:
                 runner.probe_calls.append(args)  # type: ignore[attr-defined]
                 return plan_code, "{}", plan_stderr
@@ -1103,14 +1099,7 @@ class FleetRolloutStageTests(unittest.TestCase):
         self.assertEqual(runner.probe_calls, [])  # type: ignore[attr-defined]
         self.assertIn("WARNING: --ci-mode has no fleet", err)
 
-    def test_controller_without_verified_rollouts_falls_back_to_the_backstop(self) -> None:
-        runner = self.fleet_runner(0, [], capable=2)
-        code, _, err = self.run_main(runner, "--fleet-shipyard", "/opt/ctl/shipyard")
-        self.assertEqual(code, 0)
-        self.assertEqual(runner.fleet_calls, [])  # type: ignore[attr-defined]
-        self.assertIn("predates verified fleet rollouts", err)
-
-    def test_mac_without_host_classes_falls_back_to_the_backstop(self) -> None:
+    def test_mac_without_host_classes_hands_over_to_self_update(self) -> None:
         runner = self.fleet_runner(
             0,
             [],

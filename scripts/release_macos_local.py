@@ -921,7 +921,7 @@ def run_fleet_rollout(config: ReleaseConfig, runner: CommandRunner, shipyard: st
 
     The release is not reverted on failure: it is public, verified installable,
     and other consumers may already hold it. The failure is loud and names the
-    hosts that did not verify, and the fleet-reconcile backstop retries later.
+    hosts that did not verify; fix them and rerun `shipyard runner fleet-update`.
     """
     if not shipyard:
         print(
@@ -930,26 +930,15 @@ def run_fleet_rollout(config: ReleaseConfig, runner: CommandRunner, shipyard: st
             file=sys.stderr,
         )
         raise SystemExit(FLEET_ROLLOUT_FAILED_EXIT)
-    # The controller binary is the one already installed, i.e. the previous
-    # release. A controller that predates verified rollouts (no fleet-reconcile)
-    # or a Mac with no [host_class] cannot run this stage; neither makes the
-    # release incomplete, so hand over to the backstop with a warning.
-    code, _, _ = runner.run_status([shipyard, "runner", "fleet-reconcile", "--help"])
-    if code != 0:
-        print(
-            f"WARNING: {shipyard} predates verified fleet rollouts; the fleet was NOT "
-            f"updated to {config.tag} here. Once the controller runs a release with "
-            "`runner fleet-reconcile`, its agent rolls the fleet after the soak.",
-            file=sys.stderr,
-        )
-        return
+    # A Mac with no [host_class] cannot run this stage; that does not make the
+    # release incomplete, so hand over with a warning.
     plan = [shipyard, "--json", "runner", "fleet-update", "--to", config.tag, "--all-hosts"]
     code, _, stderr = runner.run_status(plan)
     if code != 0 and "No [host_class." in stderr:
         print(
             "WARNING: this Mac declares no [host_class.*], so it is not the fleet "
-            f"controller; the fleet was NOT updated to {config.tag} here. The "
-            "controller's fleet-reconcile agent rolls it out after the soak.",
+            f"controller; the fleet was NOT updated to {config.tag} here. "
+            "TartCI self-update rolls it out after the soak.",
             file=sys.stderr,
         )
         return
@@ -970,7 +959,7 @@ def run_fleet_rollout(config: ReleaseConfig, runner: CommandRunner, shipyard: st
     if code == FLEET_CONTROLLER_BUSY_EXIT:
         print(
             f"WARNING: another fleet rollout holds the controller lock; {config.tag} was "
-            "not rolled out here. The running rollout or the fleet-reconcile agent "
+            "not rolled out here. The running rollout or TartCI self-update "
             "finishes the fleet.",
             file=sys.stderr,
         )
@@ -1065,7 +1054,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help=(
             "Skip the final governed fleet rollout + verification. The release "
-            "is then not done until the fleet verifies; fleet-reconcile catches up."
+            "is then not done until the fleet verifies; TartCI self-update catches up."
         ),
     )
     parser.add_argument(
@@ -1131,13 +1120,13 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 "WARNING: --no-fleet-rollout: the fleet was NOT updated to "
                 f"{config.tag}; the release is not done until every host verifies "
-                "(shipyard runner fleet-reconcile will catch up after the soak).",
+                "(TartCI self-update will catch up after the soak).",
                 file=sys.stderr,
             )
         elif config.ci_mode:
             print(
                 "WARNING: --ci-mode has no fleet to roll out to; the controller's "
-                "shipyard runner fleet-reconcile will update the fleet after the soak.",
+                "TartCI self-update will update the fleet after the soak.",
                 file=sys.stderr,
             )
         else:

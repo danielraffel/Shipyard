@@ -27,7 +27,7 @@ fn activated_home() -> tempfile::TempDir {
 fn launchd_job(exe: &str) -> JobFacts {
     JobFacts {
         ppid: 1,
-        xpc_service_name: Some("com.danielraffel.shipyard.fleet-reconcile".to_owned()),
+        xpc_service_name: Some("com.danielraffel.shipyard.example-job".to_owned()),
         under_launcher: false,
         routing_off: false,
         current_exe: Some(PathBuf::from(exe)),
@@ -216,7 +216,7 @@ fn the_daemon_itself_is_never_routed() {
     assert!(!is_daemon_internal(args(&[
         "--json",
         "runner",
-        "fleet-reconcile",
+        "fleet-update",
         "--apply"
     ])));
     let mut daemon = launchd_job("/h/.local/share/shipyard/auth-generations/a/shipyard");
@@ -248,7 +248,7 @@ fn an_exec_failure_is_logged_and_shipyard_runs_directly() {
     assert_eq!(*execs.borrow(), [executable_path(temp.path())]);
     assert!(
         line.starts_with(
-            "job=com.danielraffel.shipyard.fleet-reconcile launcher=direct reason=exec_failed"
+            "job=com.danielraffel.shipyard.example-job launcher=direct reason=exec_failed"
         ),
         "{line}"
     );

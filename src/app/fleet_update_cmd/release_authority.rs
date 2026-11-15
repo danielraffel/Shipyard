@@ -1106,9 +1106,9 @@ mod alert_issue_tests {
 
     #[test]
     fn alert_lookup_requires_an_exact_title_among_search_hits() {
-        let title = "fleet-reconcile: v0.209.0 could not reach the fleet";
+        let title = "fleet-update: v0.209.0 could not reach the fleet";
         let found = serde_json::json!({"incomplete_results": false, "items": [
-            {"number": 1, "title": "fleet-reconcile: v0.209.0 could not reach the fleet (old)", "state": "open"},
+            {"number": 1, "title": "fleet-update: v0.209.0 could not reach the fleet (old)", "state": "open"},
             {"number": 2, "title": title, "state": "open", "pull_request": {}},
             {"number": 3, "title": title, "state": "open"},
         ]});
