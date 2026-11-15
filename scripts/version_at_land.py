@@ -122,7 +122,8 @@ def plan(repo: Path, config: Config, base: str, head: str) -> list[Assignment]:
             continue
         parent = git(repo, "rev-parse", f"{commit}^1").stdout.strip()
         changed = git_diff_names(parent, commit)
-        for verdict in assess_surfaces(config, changed, parent, commit, repo):
+        for verdict in assess_surfaces(config, changed, parent, commit, repo,
+                                       ignore_deferring_skip=True):
             name = verdict.surface.name
             levels[name] = max_level(levels.get(name, "none"), verdict.final_level)
     assignments: list[Assignment] = []

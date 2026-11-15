@@ -4107,6 +4107,8 @@ retry only through a later bounded invocation.
 | Auto-release  | `Release: skip reason="..."`                                 |
 | Lane policy   | `Lane-Policy: <target>=required\|advisory` (escalate/demote for this PR only) |
 
+**Do not write a `Version-Bump` trailer to defer to version-at-land.** A PR needs none: version-at-land assigns versions on main and the gate reports "assigned post-merge". A `skip` whose reason says "assigned at land" or names version-at-land is ignored there (Shipyard #1393 lost 11.5 h of release to one). A `skip` with a real reason, such as `comment-only refactor`, is honoured.
+
 **`Version-Bump` is authoritative when set.** The override wins against both the path-based heuristic and the conventional-commit subject ceiling. If you want a bug fix to ship as `cli=patch` even though it touches many public-API files, write `Version-Bump: cli=patch reason="bug fix"` — the trailer is the author's explicit accountability, and the reason string is reviewable. Two escape hatches stay in place: `skip` zeroes the level, and an override on a surface that wasn't actually touched is ignored (no rubber-stamping unrelated bumps).
 
 **Gotcha:** anything under `.github/workflows/**`, `.claude-plugin/**`, `commands/**`, `agents/**`, `hooks/**`, `scripts/release.sh`, `scripts/ci_matrix.py`, release packaging scripts, or `src/**` triggers the `ci` skill's path map (`scripts/skill_path_map.json`). Update this SKILL.md in the same PR — or use the `Skill-Update: skip` trailer with a real reason.

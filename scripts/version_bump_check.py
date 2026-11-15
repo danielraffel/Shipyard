@@ -517,13 +517,28 @@ def heuristic_for_surface(
     return "patch"
 
 
+# A skip whose reason says versions are assigned at land is not a decision about
+# the change: nothing in a pull request assigns a version, so the trailer says
+# nothing the gate asked for. Agents wrote it on src/ changes, and at land time
+# it suppressed the release (Shipyard #1393 waited 11.5 h for v0.435.0).
+DEFERS_TO_LAND = re.compile(r"assigned\s+at\s+land|version-at-land", re.IGNORECASE)
+
+
 def surface_trailer_override(
     trailers: dict[str, list[str]],
     trailer_key: str,
     surface_name: str,
+    ignore_deferring_skip: bool = False,
 ) -> str | None:
-    """Parse `Version-Bump: <surface>=<level> reason="..."` from trailers."""
+    """Parse `Version-Bump: <surface>=<level> reason="..."` from trailers.
+
+    With `ignore_deferring_skip`, a `skip` whose reason defers to version-at-land
+    is not an override; a skip with any other reason still is.
+    """
     for v in trailers.get(trailer_key.lower(), []):
+        if ignore_deferring_skip and DEFERS_TO_LAND.search(v) \
+                and re.search(rf"{re.escape(surface_name)}\s*=\s*skip\b", v, re.IGNORECASE):
+            continue
         m = re.search(rf"{re.escape(surface_name)}\s*=\s*([A-Za-z]+)", v)
         if not m:
             continue
@@ -606,13 +621,15 @@ def assess_surfaces(
     base: str,
     head: str,
     repo: Path,
+    ignore_deferring_skip: bool = False,
 ) -> list[Verdict]:
     trailers = git_range_trailers(base, head)
     verdicts: list[Verdict] = []
     for s in cfg.surfaces:
         heur = heuristic_for_surface(s, changed, base, head)
 
-        override = surface_trailer_override(trailers, cfg.trailer_version_bump, s.name)
+        override = surface_trailer_override(trailers, cfg.trailer_version_bump, s.name,
+                                           ignore_deferring_skip)
         final = heur
         skip_requested = (override == "skip")
         explicit_level = override in LEVELS
