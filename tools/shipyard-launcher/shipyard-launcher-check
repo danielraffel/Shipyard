@@ -22,9 +22,11 @@ this exact bundle: path, identifier, team and code directory hash, plus the
 time the grant was confirmed. Routing asks the launcher itself
 (`shipyard-launcher --launcher-active`), which accepts the record only for
 that exact bundle and rechecks the grant through LaunchServices once the
-confirmation is older than an hour. A revoked grant demotes the record, and a
-replaced bundle, a different team, or an unreadable record is "not active",
-so a launcher without a grant can never raise an unattended prompt.
+confirmation is older than an hour. A recheck that gets no answer keeps a
+grant confirmed within the last 24 hours active (grant_unknown_grace). A
+revoked grant demotes the record, and a replaced bundle, a different team, or
+an unreadable record is "not active". The one gap: a grant revoked while every
+recheck goes unanswered stays active until the 24-hour grace runs out.
 """
 
 from __future__ import annotations
@@ -195,7 +197,8 @@ def launcher_active() -> tuple[bool, str]:
     """The launcher's own verdict (--launcher-active): the record names this
     exact bundle (path, identifier, team, code directory hash) and a Full Disk
     Access grant confirmed within the launcher's cache window, or confirmed
-    again now. A revoked grant demotes the record. Anything unclear is "not
+    again now, or (when the recheck gets no answer) confirmed within its grace
+    window. A revoked grant demotes the record. Anything else unclear is "not
     active"."""
     if not EXECUTABLE.is_file():
         return False, "launcher_missing"

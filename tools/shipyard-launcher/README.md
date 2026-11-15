@@ -286,11 +286,17 @@ only when all of these hold:
 | Its identifier and team are this bundle's own | `record_identifier_mismatch`, `record_team_mismatch` | kept |
 | Its cdhash is this bundle's own (a rebuilt or replaced bundle needs `--activate` again; the grant itself carries over) | `bundle_replaced: ...` | kept |
 | The grant was confirmed less than an hour ago, or is confirmed again now | `grant_unknown: ...` | kept |
+| A recheck that got no answer (the open was interrupted every time, `open` failed, no report within 20 seconds) still counts as active while the grant was confirmed less than 24 hours ago; `fda_checked_at` is not refreshed, so the window does not roll forward. Past 24 hours, or with a clock that moved backwards, it is not active | active: `grant_unknown_grace: ...; last confirmed <n>s ago`; past the window: `grant_unknown: ...` | kept |
+| An answer that is malformed or did not come from a launchd-started copy never gets that grace, whatever it says | `grant_unknown: ...` | kept |
 | The recheck does not say the grant is gone | `grant_revoked: demoted to ...` | renamed to `activation.json.demoted-<time>` |
 
 The recheck is the same probe the check tool uses: a fresh copy of the bundle
 started through LaunchServices opens the system TCC database. It never
-prompts, never touches `/Volumes`, and takes at most 20 seconds. Its answer
+prompts, never touches `/Volumes`, and takes at most 20 seconds. An open
+interrupted by a signal (EINTR) is not an answer about the grant: under
+launchd the open can block in the system's privacy check and come back
+interrupted, so it is tried up to 5 times, about 1.5 seconds in all, and the
+report carries `attempts`. Its answer
 counts only when that copy's parent is launchd. A confirmed grant refreshes
 `fda_checked_at`, so the probe runs at most about once an hour per host. A
 clock that moved backwards counts as stale. Every verdict is one line in

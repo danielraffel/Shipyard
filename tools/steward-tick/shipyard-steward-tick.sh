@@ -22,22 +22,16 @@ launcher_exe="$HOME/.local/libexec/ShipyardLauncher.app/Contents/MacOS/shipyard-
 launcher_record="$HOME/.local/share/shipyard/launcher/activation.json"
 tick_installed="$HOME/.local/libexec/shipyard-steward-tick.sh"
 launcher_path=direct
-if [ -n "${SHIPYARD_LAUNCHER_APP:-}" ]; then
-  launcher_path=app
-elif [ -n "${SHIPYARD_LAUNCHER_FALLBACK:-}" ]; then
-  # The launcher refused to run this file under its identity (its bytes are
-  # not the ones fleet-deploy bound) and handed it to plain /bin/bash. Do not
-  # route again.
-  echo "$stamp launcher=direct reason=$SHIPYARD_LAUNCHER_FALLBACK" >> "$log_dir/summary.log"
-elif [ "${SHIPYARD_STEWARD_LAUNCHER:-on}" != off ] && [ -f "$launcher_record" ] && [ -x "$launcher_exe" ] \
-  && [ "$(cd "$(dirname "$0")" 2>/dev/null && pwd -P)/$(basename "$0")" \
-     = "$(cd "$(dirname "$tick_installed")" 2>/dev/null && pwd -P)/$(basename "$tick_installed")" ]; then
-  # The launcher's own verdict: the activation record names this exact bundle
-  # and a grant still in place (rechecked without a prompt). Only exit 0 with
-  # "active": true routes; anything else runs the tick directly.
-  # The check is bounded (SHIPYARD_STEWARD_LAUNCHER_TIMEOUT_S, default 45 s,
-  # like Shipyard's own): a hung launcher is killed and counts as not active,
-  # so it can never stall the steward.
+# launcher_fallback REASON DETAIL: the launcher is activated on this host but
+# the tick runs directly, the path that raises privacy prompts. Never silent:
+# besides the launcher=direct line, one `launcher-fallback ... FINDING` line,
+# which drain-watch turns into a launcher_fallback finding (and an issue when
+# it persists into a second run).
+launcher_fallback() {
+  echo "$stamp launcher-fallback reason=$(printf '%s' "${1:-unknown}" | head -c 60 | tr -c 'A-Za-z0-9_-' '_') FINDING detail=$(printf '%s' "$2" | head -c 160 | tr '\n ' '__')" >> "$log_dir/summary.log"
+}
+# launcher_check: one bounded --launcher-active; sets launcher_rc, launcher_out.
+launcher_check() {
   launcher_rc=0
   launcher_out=$(/usr/bin/python3 -c '
 import subprocess, sys
@@ -51,7 +45,39 @@ except OSError:
 sys.stdout.buffer.write(run.stdout)
 sys.exit(run.returncode)
 ' "${SHIPYARD_STEWARD_LAUNCHER_TIMEOUT_S:-45}" "$launcher_exe" --launcher-active 2>/dev/null) || launcher_rc=$?
-  if [ "$launcher_rc" = 0 ] && [ "$(printf '%s' "$launcher_out" | jq -r '.active' 2>/dev/null)" = true ]; then
+}
+launcher_is_active() {
+  [ "$launcher_rc" = 0 ] && [ "$(printf '%s' "$launcher_out" | jq -r '.active' 2>/dev/null)" = true ]
+}
+if [ -n "${SHIPYARD_LAUNCHER_APP:-}" ]; then
+  launcher_path=app
+elif [ -n "${SHIPYARD_LAUNCHER_FALLBACK:-}" ]; then
+  # The launcher refused to run this file under its identity (its bytes are
+  # not the ones fleet-deploy bound) and handed it to plain /bin/bash. Do not
+  # route again.
+  echo "$stamp launcher=direct reason=$SHIPYARD_LAUNCHER_FALLBACK" >> "$log_dir/summary.log"
+  launcher_fallback "${SHIPYARD_LAUNCHER_FALLBACK%%:*}" "$SHIPYARD_LAUNCHER_FALLBACK"
+elif [ "${SHIPYARD_STEWARD_LAUNCHER:-on}" != off ] && [ -f "$launcher_record" ] && [ -x "$launcher_exe" ] \
+  && [ "$(cd "$(dirname "$0")" 2>/dev/null && pwd -P)/$(basename "$0")" \
+     = "$(cd "$(dirname "$tick_installed")" 2>/dev/null && pwd -P)/$(basename "$tick_installed")" ]; then
+  # The launcher's own verdict: the activation record names this exact bundle
+  # and a grant still in place (rechecked without a prompt). Only exit 0 with
+  # "active": true routes; anything else runs the tick directly.
+  # The check is bounded (SHIPYARD_STEWARD_LAUNCHER_TIMEOUT_S, default 45 s,
+  # like Shipyard's own): a hung launcher is killed and counts as not active,
+  # so it can never stall the steward.
+  launcher_check
+  # A recheck that got no answer (grant_unknown...) is asked once more after
+  # SHIPYARD_STEWARD_LAUNCHER_RETRY_S (default 5 s) before falling back: a
+  # transient failure must not move the tick onto the prompt-raising path.
+  # Not when the probe hit its deadline ("no access report within"): its
+  # launcher copy may still be stuck, and a retry would leave a second one.
+  if ! launcher_is_active \
+    && printf '%s' "$launcher_out" | jq -e '.reason // "" | startswith("grant_unknown") and (contains("no access report within") | not)' >/dev/null 2>&1; then
+    sleep "${SHIPYARD_STEWARD_LAUNCHER_RETRY_S:-5}"
+    launcher_check
+  fi
+  if launcher_is_active; then
     # execfail: if the exec itself fails, keep going directly instead of exiting.
     shopt -s execfail
     exec "$launcher_exe" --launcher-script steward-tick "$@"
@@ -64,6 +90,27 @@ sys.exit(run.returncode)
     launcher_why=$(printf '%s' "$launcher_out" | jq -r '.reason // empty' 2>/dev/null)
   fi
   echo "$stamp launcher=direct reason=not_active rc=$launcher_rc: $(printf '%s' "${launcher_why:-$launcher_out}" | head -c 160 | tr '\n' ' ')" >> "$log_dir/summary.log"
+  case "$launcher_rc" in
+    exec_failed) launcher_class=exec_failed ;;
+    124) launcher_class=timed_out ;;
+    *) launcher_class=$(printf '%s' "${launcher_why:-rc_$launcher_rc}" | sed 's/[^A-Za-z0-9_-].*//'); launcher_class=${launcher_class:-rc_$launcher_rc} ;;
+  esac
+  launcher_fallback "$launcher_class" "rc=$launcher_rc ${launcher_why:-$launcher_out}"
+elif [ "${SHIPYARD_STEWARD_LAUNCHER:-on}" != off ] && [ -f "$launcher_record" ] && [ ! -x "$launcher_exe" ] \
+  && [ "$(cd "$(dirname "$0")" 2>/dev/null && pwd -P)/$(basename "$0")" \
+     = "$(cd "$(dirname "$tick_installed")" 2>/dev/null && pwd -P)/$(basename "$tick_installed")" ]; then
+  # Activated, but the launcher's executable is gone.
+  echo "$stamp launcher=direct reason=launcher_missing" >> "$log_dir/summary.log"
+  launcher_fallback launcher_missing "$launcher_exe is not executable"
+elif [ "${SHIPYARD_STEWARD_LAUNCHER:-on}" != off ] && [ ! -e "$launcher_record" ] \
+  && compgen -G "$launcher_record.demoted-*" >/dev/null \
+  && [ "$(cd "$(dirname "$0")" 2>/dev/null && pwd -P)/$(basename "$0")" \
+     = "$(cd "$(dirname "$tick_installed")" 2>/dev/null && pwd -P)/$(basename "$tick_installed")" ]; then
+  # A recheck found the grant gone and demoted the record: every tick now runs
+  # directly until the owner grants Full Disk Access again and --activate runs.
+  launcher_demoted=$(ls -1t "$launcher_record".demoted-* 2>/dev/null | head -1)
+  echo "$stamp launcher=direct reason=grant_revoked_demoted" >> "$log_dir/summary.log"
+  launcher_fallback grant_revoked_demoted "record demoted to $launcher_demoted; grant Full Disk Access, then --activate"
 fi
 # Config-only sparse clones live on the internal disk: a launchd job that opens
 # a path on /Volumes blocks in the kernel waiting on an invisible privacy prompt.
