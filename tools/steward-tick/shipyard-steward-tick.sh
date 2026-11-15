@@ -373,7 +373,7 @@ os.execv("/usr/bin/python3", ["python3", "-I", sys.argv[1], "--tick", "--log-dir
 ' "$drain_watch" "$log_dir" || true
 fi
 
-# Daily loss report (docs/rollups.md, "Daily loss report"): episodes, agent-free
+# Daily loss report (docs/metrics.md, "Daily loss report"): episodes, agent-free
 # resolution and per-day series from the live and archived tick JSON. The script
 # itself gates to one run per UTC day, takes its own lock, writes
 # loss-report-YYYYMMDD.{json,md} here plus one `loss-report` line in summary.log,
