@@ -37,6 +37,8 @@ UTC = dt.timezone.utc
 STAMP_RE = re.compile(r"-(\d{8}T\d{6}Z)\.json$")
 INTERV_RE = re.compile(r"^\s*(repaired|dispute)\s*:", re.I | re.M)
 INTENTIONAL = {"draft"}
+# An unmanaged release-automation PR: the bot lane lands it, nobody acts.
+INTENTIONAL_TOKENS = {"unmanaged:automation"}
 SYSTEM_WAIT = {
     "queued", "admitted", "ready", "deferred_pass_budget", "revalidating",
     "transient_rerun", "carried_commits_over_cap", "carried_commits_unreadable",
@@ -81,7 +83,7 @@ def family(token):
 
 def classify(token, actor, stop):
     fam = family(token)
-    if fam in INTENTIONAL:
+    if fam in INTENTIONAL or token in INTENTIONAL_TOKENS or actor == "automation":
         return "intentional"
     if stop or actor == "owner" or fam in OWNER_STOP:
         return "human_stop"

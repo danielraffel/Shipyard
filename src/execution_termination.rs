@@ -272,6 +272,15 @@ fn freeze_complete_tree_with_hook(
 ) -> io::Result<(String, Vec<FrozenProcessIdentity>)> {
     signal(receipt.pid, "-STOP")?;
     let mut known = BTreeSet::from([receipt.pid]);
+    if let Err(error) = await_exact_worker_stopped(
+        receipt,
+        process_snapshot,
+        ROOT_STOP_OBSERVATION_ATTEMPTS,
+        Duration::from_millis(10),
+    ) {
+        resume_pids(&known);
+        return Err(error);
+    }
     let mut stable_scans = 0_u8;
     for scan_index in 0..64 {
         let processes = process_snapshot()?;
@@ -473,6 +482,69 @@ fn process_snapshot() -> io::Result<BTreeMap<u32, ProcessSnapshot>> {
         .collect())
 }
 
+/// How many `ps` observations to allow for the root worker to reach the
+/// stopped state after `kill -STOP` returns. Signal delivery is asynchronous:
+/// on a loaded host `ps` can still report the exact worker as running for a
+/// short while, which is not the same thing as a different process holding
+/// the pid.
+#[cfg(unix)]
+const ROOT_STOP_OBSERVATION_ATTEMPTS: u32 = 200;
+
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+enum ExactWorkerState {
+    Stopped,
+    Running,
+    Absent,
+}
+
+#[cfg(unix)]
+fn exact_worker_state(
+    receipt: &WorkerReceipt,
+    processes: &BTreeMap<u32, ProcessSnapshot>,
+) -> ExactWorkerState {
+    match processes.get(&receipt.pid) {
+        Some(process)
+            if process.command.contains("execution-worker")
+                && process.command.contains(&receipt.job_id)
+                && process.command.contains(&receipt.generation) =>
+        {
+            if process.stopped {
+                ExactWorkerState::Stopped
+            } else {
+                ExactWorkerState::Running
+            }
+        }
+        _ => ExactWorkerState::Absent,
+    }
+}
+
+/// Wait, bounded, until the exact worker named by `receipt` is observed
+/// stopped. A pid that no longer names the exact worker fails at once; a
+/// worker still observed running after every attempt fails too.
+#[cfg(unix)]
+fn await_exact_worker_stopped(
+    receipt: &WorkerReceipt,
+    mut snapshot: impl FnMut() -> io::Result<BTreeMap<u32, ProcessSnapshot>>,
+    attempts: u32,
+    pause: Duration,
+) -> io::Result<()> {
+    for attempt in 0..attempts.max(1) {
+        match exact_worker_state(receipt, &snapshot()?) {
+            ExactWorkerState::Stopped => return Ok(()),
+            ExactWorkerState::Absent => break,
+            ExactWorkerState::Running => {
+                if attempt + 1 < attempts {
+                    thread::sleep(pause);
+                }
+            }
+        }
+    }
+    Err(io::Error::other(
+        "exact worker identity was not frozen before tree snapshot",
+    ))
+}
+
 #[cfg(unix)]
 fn exact_worker_is_stopped(
     receipt: &WorkerReceipt,
@@ -495,6 +567,85 @@ mod tests {
     use chrono::Utc;
 
     use super::*;
+
+    fn snapshot_of(receipt: &WorkerReceipt, stopped: bool) -> BTreeMap<u32, ProcessSnapshot> {
+        BTreeMap::from([(
+            receipt.pid,
+            ProcessSnapshot {
+                pid: receipt.pid,
+                parent: 1,
+                stopped,
+                zombie: false,
+                command: format!(
+                    "shipyard execution-worker {} {}",
+                    receipt.job_id, receipt.generation
+                ),
+            },
+        )])
+    }
+
+    fn await_receipt() -> WorkerReceipt {
+        WorkerReceipt {
+            job_id: "job-await".to_owned(),
+            generation: "generation-await".to_owned(),
+            pid: 4242,
+            started_at: Utc::now(),
+            boot_id: None,
+        }
+    }
+
+    #[test]
+    fn a_stop_signal_still_in_flight_is_waited_for_not_failed() {
+        let receipt = await_receipt();
+        let mut observations = 0;
+        let result = await_exact_worker_stopped(
+            &receipt,
+            || {
+                observations += 1;
+                Ok(snapshot_of(&receipt, observations > 3))
+            },
+            ROOT_STOP_OBSERVATION_ATTEMPTS,
+            Duration::ZERO,
+        );
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(observations, 4);
+    }
+
+    #[test]
+    fn a_worker_that_never_stops_fails_after_the_bounded_wait() {
+        let receipt = await_receipt();
+        let mut observations = 0;
+        let result = await_exact_worker_stopped(
+            &receipt,
+            || {
+                observations += 1;
+                Ok(snapshot_of(&receipt, false))
+            },
+            5,
+            Duration::ZERO,
+        );
+        assert!(result.is_err());
+        assert_eq!(observations, 5);
+    }
+
+    #[test]
+    fn a_pid_naming_another_process_fails_without_waiting() {
+        let receipt = await_receipt();
+        let mut observations = 0;
+        let result = await_exact_worker_stopped(
+            &receipt,
+            || {
+                observations += 1;
+                let mut processes = snapshot_of(&receipt, false);
+                processes.get_mut(&receipt.pid).unwrap().command = "unrelated".to_owned();
+                Ok(processes)
+            },
+            ROOT_STOP_OBSERVATION_ATTEMPTS,
+            Duration::ZERO,
+        );
+        assert!(result.is_err());
+        assert_eq!(observations, 1);
+    }
 
     #[test]
     fn durable_transaction_is_bound_to_exact_worker_generation() {

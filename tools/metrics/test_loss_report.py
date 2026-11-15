@@ -164,6 +164,12 @@ class EpisodeTests(Fixture):
         self.live(t + dt.timedelta(minutes=10), [(1, "a", "x_token", "ci", None)])
         self.assertEqual(self.report()["totals"]["by_class"], {"actionable": 1})
 
+    def test_unmanaged_automation_is_intentional_and_human_unmanaged_is_actionable(self):
+        self.live(dt.datetime(2026, 11, 12, 1, 0, tzinfo=UTC), [
+            (1, "a", "unmanaged:automation", "automation", None),
+            (2, "b", "unmanaged", "author", None)])
+        self.assertEqual(self.report()["totals"]["by_class"], {"intentional": 1, "actionable": 1})
+
     def test_required_pending_is_a_normal_wait_whatever_the_actor(self):
         self.live(dt.datetime(2026, 11, 12, 1, 0, tzinfo=UTC), [
             (1, "a", "required_pending", "author", None), (2, "b", "required_pending", "repair", None),
