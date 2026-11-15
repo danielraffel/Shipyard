@@ -563,9 +563,9 @@ def build_report(log_dir, since, now, github=None, gap_minutes=120, e2e=None):
     report["pages"] = {"coverage": pc_cov, "per_day_by_class": pc_pages, "suppressed_per_day_by_reason": pc_sup}
     if e2e:
         pr_metrics = _pr_metrics()
-        repos = e2e.get("repos") or sorted(per_repo)
+        repos = e2e.get("repos") or list(pr_metrics.DEFAULT_REPOS)
         report["end_to_end"] = pr_metrics.build(
-            repos, e2e["cache_dir"], e2e.get("cap", 100), e2e.get("owner", "danielraffel"), start, now,
+            repos, e2e["cache_dir"], e2e.get("cap", pr_metrics.DEFAULT_READ_CAP), e2e.get("owner", "danielraffel"), start, now,
             {k: sorted(v) for k, v in st["poison_began"].items()}, st["required"], e2e.get("baseline"), e2e.get("fetch"), st["bases"],
             st["dirty"], e2e.get("controls"), st["refused"])
     else:
@@ -705,9 +705,9 @@ def main(argv=None):
     ap.add_argument("--now", help="ISO time, for tests and replays")
     ap.add_argument("--github", help="directory of cached GitHub REST answers (never fetches)")
     ap.add_argument("--e2e-cache", help="directory for the per-PR metrics cache; setting it turns on the GitHub reads for the end-to-end metrics")
-    ap.add_argument("--read-cap", type=int, default=100, help="most GitHub reads per run, shared across repos (default 100)")
+    ap.add_argument("--read-cap", type=int, default=_pr_metrics().DEFAULT_READ_CAP, help="most GitHub reads per run, shared across repos (default 1500)")
     ap.add_argument("--owner", default="danielraffel", help="the owner's personal GitHub login")
-    ap.add_argument("--repos", help="comma-separated owner/repo list for the end-to-end metrics (default: repos in the ticks)")
+    ap.add_argument("--repos", help="comma-separated owner/repo list for the end-to-end metrics (default: the five fleet repos)")
     ap.add_argument("--baseline", default="2026-11-12:2026-11-14", help="FROM:TO UTC days for the Baseline section, or 'none'")
     ap.add_argument("--json-out")
     ap.add_argument("--md-out")

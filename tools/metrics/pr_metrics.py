@@ -57,6 +57,10 @@ HOLD_RE = re.compile(r"^\s*[*_#> ]*(HOLD\b|(?i:verdict)\s*:\s*HOLD\b)", re.M)
 ESCAPE_RE = r"(?i)\b(fix\w*|regress\w*|broke\w*|broken|caused|introduc\w*)\b[^\n]{0,60}?(?<![\w#])#%d(?!\d)"
 
 
+DEFAULT_READ_CAP = 1500  # shared total per run, ~3 reads per PR
+DEFAULT_REPOS = ("Generous-Corp/pulp", "Generous-Corp/vellum", "danielraffel/Shipyard", "danielraffel/tartci", "danielraffel/fleet-handbook")
+
+
 class Truncated(Exception):
     """The per-run read cap was reached."""
 

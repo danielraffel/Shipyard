@@ -509,7 +509,7 @@ class Integrated(unittest.TestCase):
             (Path(d) / f"acme_repo-{lr.dt.datetime.strftime(t, '%Y%m%dT%H%M%SZ')}.json").write_text(json.dumps(tick))
             p = pr(1, T(11, "08:00"), T(11, "09:00"))
             gh = world([p], base_commits=[commit(p["merge_commit_sha"], date=T(11, "09:00"))])
-            rep = lr.build_report(d, dt.timedelta(days=4), NOW, e2e={"cache_dir": c, "cap": 50, "owner": OWNER, "fetch": gh})
+            rep = lr.build_report(d, dt.timedelta(days=4), NOW, e2e={"cache_dir": c, "cap": 50, "owner": OWNER, "fetch": gh, "repos": [REPO]})
             e = rep["end_to_end"]["repos"][REPO]
             self.assertEqual(e["per_day"]["2026-11-11"]["ready_prs"], 1)
             self.assertEqual(e["prs"][0]["correct"]["base_red_source"], "ticks")
@@ -518,6 +518,23 @@ class Integrated(unittest.TestCase):
             plain = lr.build_report(d, dt.timedelta(days=4), NOW)
             self.assertIsNone(plain["end_to_end"])
             self.assertIn("no --e2e-cache", lr.markdown(plain))
+
+    def test_defaults_are_the_five_fleet_repos_and_a_1500_cap(self):
+        seen = {}
+
+        def fake_build(repos, cache, cap, *a, **k):
+            seen.update(repos=list(repos), cap=cap)
+            return {}
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as c:
+            orig = pm.build
+            pm.build = fake_build
+            try:
+                lr.build_report(d, dt.timedelta(days=1), NOW, e2e={"cache_dir": c})
+            finally:
+                pm.build = orig
+        self.assertEqual(seen["cap"], 1500)
+        self.assertEqual(seen["repos"], ["Generous-Corp/pulp", "Generous-Corp/vellum", "danielraffel/Shipyard",
+                                         "danielraffel/tartci", "danielraffel/fleet-handbook"])
 
 
 if __name__ == "__main__":
