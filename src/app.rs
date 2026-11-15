@@ -82,7 +82,6 @@ mod reuse_rederive;
 mod review_verdict_cmd;
 mod reviewer_claim_cmd;
 mod reviewer_dispatch_cmd;
-mod rollup_cmd;
 mod run_cmd;
 mod runner_cmd;
 mod runner_kill_cmd;
@@ -91,7 +90,6 @@ mod sandbox_audit_cmd;
 mod ship_cmd;
 mod ship_state_cmd;
 mod targets_cmd;
-mod train_cmd;
 mod update_cmd;
 mod verdicts_cmd;
 mod wait_cmd;
@@ -566,16 +564,6 @@ where
                 stdout,
             );
         }
-        Command::Rollup { command } => {
-            return rollup_cmd::rollup_command(
-                command,
-                cli.mode.into(),
-                &cwd,
-                &runtime_paths.state_dir,
-                cli.json,
-                stdout,
-            );
-        }
         Command::Advance {
             target,
             retrigger,
@@ -804,16 +792,6 @@ where
         }
         Command::QueueHold { command } => {
             return queue_hold_command(command, &runtime_paths.state_dir, cli.json, stdout);
-        }
-        Command::Train { command } => {
-            return train_cmd::train(
-                command,
-                cli.mode.into(),
-                &cwd,
-                &runtime_paths.state_dir,
-                cli.json,
-                stdout,
-            );
         }
         Command::QueueObserve {
             repo,
@@ -1091,14 +1069,12 @@ fn handle_operational_variant<W: Write>(
         | Command::ReviewVerdict { .. }
         | Command::ReviewerDispatch { .. }
         | Command::ReviewerClaim { .. }
-        | Command::Rollup { .. }
         | Command::Who { .. }
         | Command::Overdue { .. }
         | Command::Next { .. }
         | Command::Owner { .. }
         | Command::Relay { .. }
         | Command::BaseHealth { .. }
-        | Command::Train { .. }
         | Command::Diagnose { .. }
         | Command::Doctor { .. }
         | Command::Daemon { .. }

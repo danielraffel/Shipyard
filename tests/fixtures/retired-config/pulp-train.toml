@@ -1,0 +1,44 @@
+# Generous-Corp/pulp .shipyard/config.toml [train] at c5e74238a724fb3d01b37629219e87bf30ef97bb,
+# plus an [auto_merge.rollup] table: base-config tables Shipyard no longer reads.
+[train]
+# Shipyard's merge train, read-only (phase 1): `shipyard train status
+# [--record]` and `shipyard train metrics` report each open PR's stage and
+# the queue's throughput. With `mode` unset ("off") nothing forms, arms,
+# enqueues or merges; rollups need `mode = "rollup"` (PR #11159).
+enabled = true
+mode = "off"
+landing = "merge-queue"
+max_members = 4
+exclude_paths = [
+    ".github/workflows/**",
+    "tools/ci/**",
+    "tools/install-shipyard.sh",
+    "tools/scripts/queue_*",
+    "tools/scripts/test_queue_*",
+    "tools/scripts/fixtures/queue_*",
+    "tools/shipyard.toml",
+    "tools/toolchain/**",
+    "**/*codesign*",
+    "**/*signing*",
+    "**/*notariz*",
+    "**/*notary*",
+    "tools/scripts/sign-notarize-*",
+]
+# test/ctest_script_inputs/ is not listed: it holds one fragment per entry, so
+# two PRs that add different tests touch different files.
+hot_files = [
+    "**/SKILL.md",
+    ".claude-plugin/**",
+    "docs/status/*capabilit*.json",
+    "tools/agent-capabilities/**",
+    "tools/scripts/agent_capability_manifest.py",
+    ".shipyard/changed-surface-families.toml",
+    "tools/scripts/text_encoding_baseline.json",
+]
+require_counted_approval = true
+
+[auto_merge.rollup]
+mode = "shadow"
+min_ready = 3
+max_members = 4
+sensitive_paths = []

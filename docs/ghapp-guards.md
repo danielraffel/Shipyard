@@ -630,7 +630,7 @@ same three guardrails and logs its merge carries the same way. Only landings
 log: a read-only evaluation judges the carry without appending a row, rebase
 or merge. Such evaluations include the `review-verdict` status, through
 `review_gate(..., dry_run=True)` in Python and `ApprovalPolicy::dry_run` in
-Rust, and `shipyard train status`. So the log holds only carries that
+Rust. So the log holds only carries that
 actually armed or merged.
 
 **Rebases (separate switch, off by default).** A rebased head does not descend
@@ -722,8 +722,8 @@ files to its approved blobs and modes, the members change disjoint files,
 the base touched none of them since, and no member changes an excluded path.
 A HOLD naming the rollup head stops it. `SHIPYARD_TRAIN=off` or a
 `train.pause` file in the guards directory refuses every rollup on the host.
-The notice comment on the rollup pull request is never read. See
-[rollups.md](rollups.md).
+The notice comment on the rollup pull request is never read. Rollups are
+being removed: no base takes them, and nothing in Shipyard forms one.
 
 ### A HOLD takes its head out of the landing path
 

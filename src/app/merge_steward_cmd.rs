@@ -2221,7 +2221,6 @@ mod shadow_ledger;
 mod stale_merge_ref;
 mod superseded;
 mod terminal_handoff;
-pub(super) mod train;
 mod unapproved_admission;
 pub(super) use carried_commits::STACKED_LABEL_PREFIX;
 pub(super) use infra_rerun::Mode as InfraRerunMode;
