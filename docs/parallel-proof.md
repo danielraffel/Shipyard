@@ -126,46 +126,10 @@ observation, not worker JSON. They must come from the controller-comparable
 clock contract used by the eventual dispatcher; until that transport exists,
 these checks are shadow evidence only.
 
-`src/ctest_inventory.rs` is the first shadow-only inventory producer boundary.
-It purely translates bounded `ctest --show-only=json-v1` output into this
-canonical inventory. Runtime capabilities and every observed resource-lock
-scope come from explicit controller-owned classification: mutable test-side
-labels cannot grant worker eligibility, an unclassified lock fails closed, and
-unused test/lock declarations are rejected as probable typos. An independently
-controller-owned exhaustive test count and domain-separated sorted-ID digest
-must match, so output captured with `-R`, `-E`, `-L`, `-I`, or another filter
-cannot masquerade as the configured graph. Every emitted test must also match
-the controller-owned exact `CTest -C` configuration, including the intentional
-empty no-configuration case. Unsupported CTest JSON versions, duplicate
-relevant properties, ambiguous property types, disabled or non-executable
-tests, nonempty `REQUIRED_FILES` without controller filesystem attestation, and
-`RESOURCE_GROUPS` also fail closed. Input bytes and expanded capability
-relations are bounded before per-test cloning. The producer does not execute
-CTest, dispatch work, or satisfy merge readiness.
-
 A production executor must still compare the tests actually executed back to
-this canonical declared set. It must not rely on `ctest --tests-from-file` as
+the canonical declared inventory. It must not rely on `ctest --tests-from-file` as
 an existence check: CTest silently ignores unknown names there, and fixtures
 may add tests implicitly.
-
-`src/parallel_proof_one_host.rs` supplies the smallest executor-facing bridge
-before any cross-host dispatch. Its machine-global policy is default-off and
-admits only Pulp's exact numeric repository identity, `mac` target, Apple
-Silicon build contract, and M3 host. One controller-owned receipt records
-exactly one successful configure plus one successful build and binds their
-command/environment digests to the exact source, toolchain, canonical CTest
-inventory, proof manifest, and compact artifact content/layout/size identity.
-The matching consumption observation must come from the same authenticated M3
-session, verify that exact content address, observe zero configure or build
-invocations during test consumption, and report the sorted unique executed
-test IDs. Missing, extra, duplicate, reordered, or mutated IDs fail exact
-reconciliation against the canonical inventory.
-
-This v1 bridge is pure shadow evidence. It does not invoke a process, package
-or transfer bytes, dispatch a shard, publish a check, or alter validation. A
-matched result explicitly retains the existing full gate as authoritative and
-reports cross-host dispatch as false. It is not an operational canary or a
-speedup measurement.
 
 ### Executable canary boundary
 
@@ -346,16 +310,13 @@ Unit tests exercise:
 - single-level crash-durable store-root creation; and
 - the invariant that neither a manifest nor aggregate can satisfy merge
   readiness.
-- the default-off M3-only build-once bridge, exact configure/build receipt and
-  artifact bindings, no-rebuild consumption, exact executed-set reconciliation,
-  and source/build/artifact/session mutation controls.
 
 ## Required production follow-ups
 
 This slice is a prerequisite, not the performance feature. Queue time improves
 only after all of the following are implemented and measured:
 
-1. Wire the shadow CTest inventory producer to controller-owned, immutable
+1. Produce the canonical CTest inventory from controller-owned, immutable
    classification and compare the executed set back to the canonical declared
    inventory. This wiring remains non-authoritative until separately reviewed.
 2. Build-once production on an isolated trusted builder, content-addressed
