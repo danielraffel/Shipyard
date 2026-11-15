@@ -86,10 +86,14 @@ above it, a pull request joins only when:
 - it shares no file with an older member and no `[train] hot_files` glob.
 
 Members are taken oldest first, at most `max_members`. Fewer than two is no
-rollup. The plan appears in the steward's JSON as `repos[].rollup`, with an
-`action` of `below_threshold`, `skipped_too_many`, `no_batch`, `shadow`,
-`apply_unavailable`, `deadline` or `unreadable`, the members' exact heads and why each other ready pull request
-was left out.
+rollup. The plan appears in the steward's JSON as `repos[].rollup` on every
+repository the pass observed, with an `action` of `below_threshold`,
+`skipped_too_many`, `no_batch`, `shadow`, `apply_unavailable`, `deadline` or
+`unreadable`, the members' exact heads and why each other ready pull request
+was left out. Two more actions say the planner does not run on that base:
+`not_applicable` (it has a merge queue, or its merge path is not the
+exact-head merge) and `off` (`mode = "off"`). Fewer than two ready is
+`below_threshold` without reading the base config, so `mode` is absent.
 
 Its GitHub reads are bounded. A repository is planned at most once per
 `interval_minutes`: an applied pass stamps the plan in the steward's state
@@ -116,7 +120,11 @@ Consecutive passes repeat a plan, so each pull request at a head counts once,
 in the first plan that names it, and a plan counts as a rollup only when it
 brings at least two members no earlier plan took. It is an estimate: it
 assumes each rollup passes its one run. It is the evidence for moving a base
-from `shadow` to `apply`.
+from `shadow` to `apply`. Beside it, `rollup_counterfactual.per_repo_status`
+gives each repository's `state`: `off` (only `not_applicable` or `off`
+reports), `no_candidates` (the planner ran and never named a batch, with each
+action and each left-out reason counted), `planned`, or `not_reported` (ticks
+from a steward that wrote no report).
 
 ## The shape
 

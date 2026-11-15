@@ -221,7 +221,9 @@ struct RepoReport {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     rollup_reconciliation: Vec<String>,
     /// The rollup a backed-up base without a merge queue would form this
-    /// pass ([`rollup_pass`]). Absent when it does not apply.
+    /// pass ([`rollup_pass`]). Present on every observed repository, with
+    /// `not_applicable` or `off` when the planner does not run there; absent
+    /// only when the repository was not observed.
     #[serde(skip_serializing_if = "Option::is_none")]
     rollup: Option<rollup_pass::Report>,
     /// Uncertain merge-queue admissions this pass settled from GitHub, or
@@ -1608,7 +1610,7 @@ fn plan_rollup(
     ledger_path: &Path,
     merge_path: &str,
     prs: &[PrReport],
-) -> Option<rollup_pass::Report> {
+) -> rollup_pass::Report {
     let run_gh = |gh_args: &[String]| actions.run_gh(gh_args).map_err(|error| error.to_string());
     let cache = ledger_path
         .parent()
@@ -1656,14 +1658,14 @@ fn pre_mutation_rollup(
             blocked: blocked_on::Stall::default(),
         })
         .collect::<Vec<_>>();
-    plan_rollup(
+    Some(plan_rollup(
         actions,
         args,
         observation,
         ledger_path,
         policy.merge_path(),
         &prs,
-    )
+    ))
 }
 
 /// One repository of a steward pass: observe it, apply its plan, settle its
@@ -1844,18 +1846,20 @@ fn steward_repo_observed(
             if let Some(cancellations) = recovery_cancellations.remove(&observation.repo) {
                 report.cancellations.extend(cancellations);
             }
-            if !pass_budget::deadline_passed(args.pass_deadline) {
-                report.rollup = snapshot_rollup.or_else(|| {
-                    plan_rollup(
-                        actions,
-                        args,
-                        &observation,
-                        ledger_path,
-                        &report.merge_path,
-                        &report.prs,
-                    )
-                });
-            }
+            report.rollup = Some(match snapshot_rollup {
+                Some(snapshot) => snapshot,
+                None if pass_budget::deadline_passed(args.pass_deadline) => {
+                    rollup_pass::budget_spent(&observation, &report.prs)
+                }
+                None => plan_rollup(
+                    actions,
+                    args,
+                    &observation,
+                    ledger_path,
+                    &report.merge_path,
+                    &report.prs,
+                ),
+            });
             if args.apply && pass_budget::deadline_passed(args.pass_deadline) {
                 report
                     .rollup_reconciliation

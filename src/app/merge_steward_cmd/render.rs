@@ -64,7 +64,7 @@ pub(super) fn render_report<W: Write>(
             writeln!(
                 stdout,
                 "  rollup: mode={} action={} ready={} members={}{}",
-                label(&rollup.mode),
+                rollup.mode.as_ref().map_or_else(|| "-".to_owned(), label),
                 label(&rollup.action),
                 rollup.ready.len(),
                 if members.is_empty() { "-" } else { &members },
