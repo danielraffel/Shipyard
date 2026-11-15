@@ -2597,25 +2597,26 @@ fn non_default_base(
 > {
     use crate::release_base::{ReleaseBasePolicy, ReleaseSource};
     let policy = ReleaseBasePolicy::from_machine_global(global_dir)?;
-    // The same derivation the standing reviewer uses: a base whose rules
-    // require a review context is reviewed. Unreadable rules are the stop.
-    let release = |source: ReleaseSource, rules: Option<Value>| {
-        let review_path = release_requires_review(actions, repo, base, rules);
-        Ok::<_, String>((
+    // Always the owner's stop, whatever the base's rules require: the
+    // standing reviewer does not review release bases. Re-enable the review
+    // wait only once a non-main reviewer path exists (fleet-handbook #140,
+    // parked).
+    let release = |source: ReleaseSource| {
+        (
             format!("release_base:{base}"),
-            next_action::NextAction::release_base(base, default_branch, review_path),
+            next_action::NextAction::release_base(base, default_branch),
             Some(source),
-        ))
+        )
     };
     if let Some(pattern) = policy.matching_pattern(base) {
-        return release(ReleaseSource::Pattern(pattern.to_owned()), None);
+        return Ok(release(ReleaseSource::Pattern(pattern.to_owned())));
     }
     let parent = open_pull_request_for_head(actions, repo, base);
     if parent.is_none() {
         let rules = observation::evaluated_branch_rules(actions, repo, base)
             .map_err(|error| format!("could not classify base `{base}`: {error}"))?;
         if ruleset_names_base(actions, repo, &rules)? {
-            return release(ReleaseSource::Ruleset, Some(rules));
+            return Ok(release(ReleaseSource::Ruleset));
         }
     }
     Ok((
@@ -2639,28 +2640,6 @@ fn ruleset_names_base(actions: &GitHubActions, repo: &str, rules: &Value) -> Res
         }
     }
     Ok(false)
-}
-
-/// Whether `base`'s rules require a review context
-/// ([`crate::release_base::REVIEW_PATH_CONTEXTS`]); false when they cannot
-/// be read, so the answer fails closed to the stop.
-fn release_requires_review(
-    actions: &GitHubActions,
-    repo: &str,
-    base: &str,
-    rules: Option<Value>,
-) -> bool {
-    let rules = match rules {
-        Some(rules) => Ok(rules),
-        None => observation::evaluated_branch_rules(actions, repo, base),
-    };
-    rules
-        .and_then(|rules| observation::evaluated_required_checks(&rules))
-        .is_ok_and(|required| {
-            crate::release_base::requires_review(
-                required.iter().map(|check| check.context.as_str()),
-            )
-        })
 }
 
 fn open_pull_request_for_head(actions: &GitHubActions, repo: &str, branch: &str) -> Option<u64> {

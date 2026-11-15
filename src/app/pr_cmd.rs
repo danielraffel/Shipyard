@@ -179,28 +179,18 @@ fn release_base_notice<W: Write>(
     let Some(pattern) = policy.matching_pattern(&args.base) else {
         return Ok(false);
     };
-    let next = |review_path| {
-        super::merge_steward_cmd::next_action::NextAction::release_base(
-            &args.base,
-            configured,
-            review_path,
-        )
-    };
-    let (review, stop) = (next(true), next(false));
+    let next =
+        super::merge_steward_cmd::next_action::NextAction::release_base(&args.base, configured);
     writeln!(
         stdout,
         "▸ release base: `{base}` matches {source}; it is not a stack. `shipyard wait pr \
-         <n> --state actionable` will read `blocked_on: release_base:{base}`. If its rules \
-         require `review-verdict` or `release-path-review`, next_action ({}, stop={}): {}\n  \
-         Otherwise next_action ({}, stop={}): {}",
-        review.actor.as_str(),
-        review.stop,
-        review.action,
-        stop.actor.as_str(),
-        stop.stop,
-        stop.action,
+         <n> --state actionable` will read `blocked_on: release_base:{base}`, next_action \
+         ({actor}, stop={stop}): {action}",
         base = args.base,
         source = crate::release_base::ReleaseSource::Pattern(pattern.to_owned()).describe(),
+        actor = next.actor.as_str(),
+        stop = next.stop,
+        action = next.action,
     )
     .map_err(|error| CliFailure::new(1, error.to_string()))?;
     Ok(true)
@@ -1644,13 +1634,10 @@ mod tests {
             "{printed}"
         );
         assert!(
-            printed.contains("Otherwise next_action (owner, stop=true)"),
+            printed.contains("next_action (owner, stop=true)"),
             "{printed}"
         );
-        assert!(
-            printed.contains("`release-path-review`, next_action (reviewer, stop=false)"),
-            "{printed}"
-        );
+        assert!(!printed.contains("reviewer"), "{printed}");
         assert!(printed.contains("Don't retarget to `main`"), "{printed}");
         assert!(!printed.contains("stacked base"), "{printed}");
 

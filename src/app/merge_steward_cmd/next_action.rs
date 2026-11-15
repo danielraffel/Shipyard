@@ -143,33 +143,23 @@ impl NextAction {
     }
 
     /// A pull request on a release base (see [`crate::release_base`]): not a
-    /// stack, and never retargeted to the default branch. `review_path` is
-    /// true when the base's rules require a review context, which puts it on
-    /// the standing reviewer's path.
+    /// stack, never retargeted to the default branch, and always the owner's
+    /// stop. The steward admits only the default branch and the standing
+    /// reviewer does not review release bases: verdicts are bound to a head,
+    /// not a base, so an approval on a release base would survive a retarget.
+    /// Re-enable the review wait only once a non-main reviewer path exists
+    /// (fleet-handbook #140, parked).
     #[must_use]
-    pub fn release_base(base: &str, default_branch: &str, review_path: bool) -> Self {
-        if review_path {
-            Self::new(
-                Actor::Reviewer,
-                format!(
-                    "Release base `{base}`: not a stack, so do not retarget it to \
-                     `{default_branch}`. Its rules require a review context, so the standing \
-                     reviewer reviews it: nothing for the author to do until it posts APPROVE \
-                     or HOLD. The steward admits only `{default_branch}`; the coordinator \
-                     or owner lands the release branch."
-                ),
-            )
-        } else {
-            Self::stop(
-                Actor::Owner,
-                format!(
-                    "stop: no standing review path for base `{base}`; the coordinator or owner \
-                     runs the release-branch landing. Don't retarget to `{default_branch}`, and \
-                     don't merge `{default_branch}` into it. Report the pull request and its \
-                     head, then work on something else."
-                ),
-            )
-        }
+    pub fn release_base(base: &str, default_branch: &str) -> Self {
+        Self::stop(
+            Actor::Owner,
+            format!(
+                "stop: no standing review path for base `{base}`; the coordinator or owner runs \
+                 the release-branch landing. Don't retarget to `{default_branch}`, and don't \
+                 merge `{default_branch}` into it. Report the pull request and its head, then \
+                 work on something else."
+            ),
+        )
     }
 
     /// A pull request whose diff against its base is empty.
@@ -1118,19 +1108,15 @@ mod tests {
     }
 
     #[test]
-    fn release_bases_stop_or_wait_and_never_say_retarget_this() {
-        let stop = NextAction::release_base("release/v1.0.10", "main", false);
+    fn a_release_base_is_always_the_owners_stop_and_never_says_retarget_this() {
+        let stop = NextAction::release_base("release/v1.0.10", "main");
         assert_eq!((stop.actor, stop.stop), (Actor::Owner, true));
+        assert!(stop.actionable());
         assert!(stop.action.starts_with(
             "stop: no standing review path for base `release/v1.0.10`; the coordinator or \
              owner runs the release-branch landing. Don't retarget to `main`"
         ));
-        let review = NextAction::release_base("release/v1.0.10", "main", true);
-        assert_eq!((review.actor, review.stop), (Actor::Reviewer, false));
-        assert!(!review.actionable());
-        for action in [stop.action, review.action] {
-            assert!(!action.contains("retarget this pull request"), "{action}");
-        }
+        assert!(!stop.action.contains("retarget this pull request"));
     }
 
     #[test]

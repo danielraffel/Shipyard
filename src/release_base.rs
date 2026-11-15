@@ -9,13 +9,12 @@
 //! (default `["release/*"]`), or when a repository ruleset that names it
 //! (not one that covers every branch) protects it as a landing target.
 //!
-//! The steward admits only the default branch. A release base has a review
-//! path when its rules require a review context (`review-verdict` or
-//! `release-path-review`): the standing reviewer reviews any base whose rules
-//! require one (fleet-handbook PR 140), derived from the rulesets with no
-//! config, and this reads the same rules so the two cannot disagree.
-//! Otherwise, or when the rules cannot be read, the owner or coordinator
-//! lands it.
+//! The steward admits only the default branch, and the standing reviewer
+//! does not review release bases (verdicts are bound to a head, not a base,
+//! so an approval on a release base would survive a retarget). A release
+//! base is therefore always the owner's stop: the coordinator or owner lands
+//! it. Re-enable the review wait only once a non-main reviewer path exists
+//! (fleet-handbook #140, parked).
 
 use serde_json::Value;
 
@@ -23,8 +22,6 @@ use crate::config::LoadedConfig;
 
 /// `[merge_steward] release_bases`: the release-base patterns.
 pub const RELEASE_BASES_KEY: &str = "merge_steward.release_bases";
-/// Required contexts that put a base on the standing reviewer's path.
-pub const REVIEW_PATH_CONTEXTS: [&str; 2] = ["review-verdict", "release-path-review"];
 /// Release-base patterns when the key is absent.
 pub const DEFAULT_RELEASE_BASES: [&str; 1] = ["release/*"];
 
@@ -80,15 +77,6 @@ impl ReleaseBasePolicy {
             .find(|pattern| crate::head_approval::glob_match(pattern, base))
             .map(String::as_str)
     }
-}
-
-/// Whether `required` (the base's required contexts, from its rules) puts
-/// the base on the standing reviewer's path.
-#[must_use]
-pub fn requires_review<'a>(required: impl IntoIterator<Item = &'a str>) -> bool {
-    required
-        .into_iter()
-        .any(|context| REVIEW_PATH_CONTEXTS.contains(&context.trim()))
 }
 
 fn string_list(key: &str, value: &toml::Value) -> Result<Vec<String>, String> {
@@ -188,9 +176,6 @@ mod tests {
         );
         assert_eq!(policy.matching_pattern("feat/parent"), None);
         assert_eq!(policy.matching_pattern("release/v1/hotfix"), None);
-        assert!(requires_review(["macos", "release-path-review"]));
-        assert!(requires_review(["review-verdict"]));
-        assert!(!requires_review(["macos", "post-review-verdict"]));
     }
 
     #[test]
