@@ -218,6 +218,22 @@ class VersionAtLandTests(unittest.TestCase):
                    'fix: internal\n\nVersion-Bump: cli=skip reason="comment-only refactor"')
         self.assertEqual([item["assigned"] for item in self._plan()["plan"]], ["0.292.1"])
 
+    def test_version_bump_none_does_not_suppress_release_at_land(self) -> None:
+        self._land("src/steward.rs", "pub fn steward() {}\n",
+                   'fix: internal\n\nVersion-Bump: cli=none reason="not a release"')
+        self.assertEqual([item["assigned"] for item in self._plan()["plan"]], ["0.292.1"])
+
+    def test_malformed_release_skip_does_not_suppress_release(self) -> None:
+        for index, directive in enumerate(("skipping", "skip=false", "skip", 'skip reason=""',
+                                            'skip reason="   "', "skip reason=internal",
+                                            'skip reason="internal" extra')):
+            with self.subTest(directive=directive):
+                self._land(f"src/change{index}.rs", "pub fn change() {}\n",
+                           f"fix: change\n\nRelease: {directive}")
+                assignments = [item["assigned"] for item in self._plan()["plan"]]
+                self.base = run(self.repo, "git", "rev-parse", "HEAD").stdout.strip()
+                self.assertEqual(assignments, ["0.292.1"])
+
     def test_a_comment_only_change_is_still_no_release(self) -> None:
         self._land("src/steward.rs", "pub fn steward() {}\n", "fix: add")
         self.base = run(self.repo, "git", "rev-parse", "HEAD").stdout.strip()
@@ -227,6 +243,13 @@ class VersionAtLandTests(unittest.TestCase):
     def test_pr_gate_report_is_unchanged_by_a_skip(self) -> None:
         self._land("src/steward.rs", "pub fn steward() {}\n",
                    'fix: x\n\nVersion-Bump: cli=skip reason="assigned at land"')
+        result = self.gate()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Shipyard CLI: no bump needed", result.stdout)
+
+    def test_pr_gate_report_is_unchanged_by_none(self) -> None:
+        self._land("src/steward.rs", "pub fn steward() {}\n",
+                   'fix: x\n\nVersion-Bump: cli=none reason="assigned at land"')
         result = self.gate()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("Shipyard CLI: no bump needed", result.stdout)

@@ -525,7 +525,7 @@ def surface_trailer_override(
 ) -> str | None:
     """Parse `Version-Bump: <surface>=<level> reason="..."` from trailers.
 
-    With `honor_skip` False (version-at-land), a `skip` is not an override: no
+    With `honor_skip` False (version-at-land), `skip` and `none` are not overrides: no
     pull request gate asks for a bump, so the trailer decided nothing, and
     honouring it suppressed the release (Shipyard #1393 waited 11.5 h). At land
     only `Release: skip` opts a change out.
@@ -535,7 +535,7 @@ def surface_trailer_override(
         if not m:
             continue
         level = m.group(1).lower()
-        if level == "skip" and not honor_skip:
+        if level in ("skip", "none") and not honor_skip:
             continue
         if level in LEVELS or level == "skip":
             return level

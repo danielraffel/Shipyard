@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -112,8 +113,11 @@ def release_skipped(parent: str, commit: str) -> bool:
     `Version-Bump: <surface>=skip` no longer does at land: no pull request gate
     asks for a bump, so agents wrote it by habit and it suppressed releases.
     """
-    return any(value.lower().startswith("skip")
-               for value in git_range_trailers(parent, commit).get("release", []))
+    for value in git_range_trailers(parent, commit).get("release", []):
+        match = re.fullmatch(r'\s*skip\s+reason="([^"\n]*)"\s*', value, re.IGNORECASE)
+        if match and match.group(1).strip():
+            return True
+    return False
 
 
 def plan(repo: Path, config: Config, base: str, head: str) -> list[Assignment]:
