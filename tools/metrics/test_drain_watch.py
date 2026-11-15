@@ -596,6 +596,11 @@ class LauncherFallbackTests(Base):
         _, _, findings = self.run_once()
         self.assertEqual(findings, [])
 
+    def test_a_detail_with_a_tab_still_matches(self):
+        self.fallback(NOW - dt.timedelta(minutes=1), detail="rc=1_odd\toutput")
+        _, _, findings = self.run_once()
+        self.assertEqual(len(findings), 1)
+
     def test_a_missing_summary_is_no_finding(self):
         self.assertEqual(dw.check_launcher_fallback(str(self.log / "absent.log"), {}, NOW), [])
 

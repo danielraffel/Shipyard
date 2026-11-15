@@ -25,8 +25,8 @@ that exact bundle and rechecks the grant through LaunchServices once the
 confirmation is older than an hour. A recheck that gets no answer keeps a
 grant confirmed within the last 24 hours active (grant_unknown_grace). A
 revoked grant demotes the record, and a replaced bundle, a different team, or
-an unreadable record is "not active", so a launcher without a grant can never
-raise an unattended prompt.
+an unreadable record is "not active". The one gap: a grant revoked while every
+recheck goes unanswered stays active until the 24-hour grace runs out.
 """
 
 from __future__ import annotations

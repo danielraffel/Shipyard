@@ -145,7 +145,7 @@ def home(*p):
 
 
 # ------------------------------------------------------------------ launcher
-LAUNCHER_LINE = re.compile(r"^(\d{8}T\d{6}Z) launcher-fallback reason=(\S+) FINDING(?: detail=(\S*))?$")
+LAUNCHER_LINE = re.compile(r"^(\d{8}T\d{6}Z) launcher-fallback reason=(\S+) FINDING(?: detail=(.*))?$")
 LAUNCHER_LOOKBACK = dt.timedelta(minutes=15)
 SUMMARY_TAIL = 1024 * 1024
 
