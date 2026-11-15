@@ -36,3 +36,29 @@ ticks, gaps, unreadable files), GitHub reads, agent work, CI compute and owner
 stops answered. CI compute per episode and owner stops answered are always
 `unavailable` today: tick JSON does not carry them. Elapsed time appears only as
 context in the JSON; no number in the summary is a duration.
+
+## Cohort, interventions, escapes and comparison
+
+The four metrics are the Shipyard scorecard; the autonomous merge rate is the headline. They are
+measured over a cohort of PRs, not over blocked episodes.
+
+- **Eligible PR.** A merged PR that was non-draft at some point (every merged PR was), whose base
+  is the repo's managed base (the tick's `base`, else `main`) or an integration base
+  (`develop/*`, `release/*`), and which does not carry `automation` (bot release and
+  version-bump PRs), `shipyard:unmanaged` or `superseded`. Closed-unmerged PRs are not in this
+  report. The report lists how many PRs each exclusion removed.
+- **Cohort day.** The UTC day the PR first became ready for review, not the day it merged. A
+  cohort is therefore only complete once its PRs have merged; a recent day undercounts.
+- **Human interventions and repair churn are separate.** Per PR: owner actions (timeline events by
+  the owner account) versus repair cycles (`repaired:` comments, the repair lane's report that a
+  HOLD or red check was fixed and pushed) and HOLD verdicts (comments or reviews that start with
+  `HOLD`). Autonomy counts only the first; churn is the second, so a PR that needed three agent
+  repairs and no human is still autonomous.
+- **Escaped defect (best effort).** A later PR merged within 14 days whose title or body names this
+  PR as the cause on one line (`fix ... #N`, `regression from #N`, `broke`, `caused`,
+  `introduced`). Text matching can miss or over-match, so it is reported beside revert and
+  base-red correctness and never folded into them. Provisional until the PR is 14 days old.
+- **Comparison.** The report prints the pooled window cohort and the pooled Baseline cohort
+  (default 2026-11-12 to 2026-11-14) next to each other, with sample sizes and a 95% Wilson interval
+  on every rate. Medians and p90 carry only n. It makes no per-change attribution: a difference is
+  a difference, not evidence of which change caused it.

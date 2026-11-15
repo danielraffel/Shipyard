@@ -266,6 +266,81 @@ class Correctness(Base):
         self.assertEqual((k["unknown"], k["bad_rate_pct"]), (1, None))
 
 
+class Cohort(Base):
+    def test_excluded_labels_and_unmanaged_bases_leave_the_cohort_with_a_reason(self):
+        a, b, c = (pr(i, T(10, "10:00"), T(10, "11:00")) for i in (1, 2, 3))
+        a["labels"] = [{"name": "automation"}]
+        b["labels"] = [{"name": "shipyard:unmanaged"}]
+        c["base"] = {"ref": "feature-x"}
+        d = pr(4, T(10, "10:00"), T(10, "11:00"))
+        out = self.build(world([a, b, c, d]))
+        v = out["repos"][REPO]
+        self.assertEqual(v["excluded"], {"automation": 1, "unmanaged": 1, "unmanaged_base": 1})
+        self.assertEqual(v["per_day"]["2026-11-10"]["merged"], 1)
+
+    def test_a_pr_is_assigned_to_the_day_it_became_ready_not_the_day_it_merged(self):
+        out = self.build(world([pr(1, T(10, "22:00"), T(11, "02:00"))]))
+        r = self.rows(out)[1]
+        self.assertEqual((r["day"], r["merge_day"]), ("2026-11-10", "2026-11-11"))
+        self.assertIn("2026-11-10", out["repos"][REPO]["per_day"])
+
+    def test_owner_actions_are_counted_apart_from_repair_cycles_and_holds(self):
+        bot = {"login": "shipyard-local[bot]"}
+        tl = {1: [{"event": "commented", "actor": bot, "body": "HOLD: red", "created_at": T(10, "10:10")},
+                  {"event": "commented", "actor": bot, "body": "repaired: fix at abc", "created_at": T(10, "10:20")},
+                  {"event": "commented", "actor": bot, "body": "repaired: again", "created_at": T(10, "10:30")},
+                  {"event": "labeled", "actor": {"login": OWNER}, "created_at": T(10, "10:40")},
+                  {"event": "commented", "actor": {"login": OWNER}, "body": "ok", "created_at": T(10, "10:50")}]}
+        out = self.build(world([pr(1, T(10, "10:00"), T(10, "11:00"))], tl))
+        r = self.rows(out)[1]
+        self.assertEqual((r["owner_actions"], r["repair_cycles"], r["holds"]), (2, 2, 1))
+        iv = out["repos"][REPO]["per_day"]["2026-11-10"]["interventions"]
+        self.assertEqual((iv["owner_actions_per_pr"], iv["repair_cycles_per_pr"], iv["prs_with_repair_cycle"]), (2.0, 2.0, 1))
+
+
+class Escapes(Base):
+    def test_a_later_pr_naming_this_one_as_the_cause_within_14_days_is_an_escape(self):
+        p1 = pr(5, T(1, "09:00"), T(1, "10:00"))
+        fix = pr(9, T(3, "09:00"), T(3, "10:00"))
+        fix["title"], fix["body"] = "fix crash", "A regression from #5 broke the queue"
+        late = pr(10, T(20, "09:00"), T(20, "10:00"))
+        late["title"] = "fix typo from #5"  # 19 days later: outside the window
+        other = pr(11, T(3, "11:00"), T(3, "12:00"))
+        other["title"], other["body"] = "fix thing", "unrelated to #55"
+        out = self.build(world([p1, fix, late, other]), now=dt.datetime(2026, 11, 30, tzinfo=UTC))
+        c = self.rows(out)[5]["correct"]
+        self.assertEqual((c["escaped"], c["escaped_by"], c["escape_provisional"]), (True, 9, False))
+        self.assertFalse(self.rows(out)[11]["correct"]["escaped"])
+        k = out["repos"][REPO]["per_day"]["2026-11-01"]["correctness"]
+        self.assertEqual(k["escaped"], 1)
+
+    def test_escape_window_is_provisional_for_a_pr_under_14_days_old(self):
+        out = self.build(world([pr(5, T(10, "09:00"), T(10, "10:00"))]))
+        self.assertTrue(self.rows(out)[5]["correct"]["escape_provisional"])
+
+
+class Intervals(unittest.TestCase):
+    def test_wilson_interval(self):
+        self.assertIsNone(pm.wilson(0, 0))
+        lo, hi = pm.wilson(8, 10)
+        self.assertAlmostEqual(lo, 49.0, delta=0.2)
+        self.assertAlmostEqual(hi, 94.3, delta=0.2)
+        self.assertEqual(pm.wilson(0, 5)[0], 0.0)
+
+
+class WindowVsBaseline(Base):
+    def test_window_and_baseline_print_side_by_side_with_n_and_interval(self):
+        prs = [pr(1, T(12, "10:00"), T(12, "11:00")), pr(2, T(13, "10:00"), T(13, "11:00")), pr(3, T(14, "08:00"), T(14, "09:00"))]
+        b = (dt.datetime(2026, 11, 12, tzinfo=UTC), dt.datetime(2026, 11, 13, tzinfo=UTC))
+        out = pm.build([REPO], self.cache, 200, OWNER, dt.datetime(2026, 11, 14, tzinfo=UTC), NOW, {}, {}, b, world(prs))
+        self.assertEqual(out["baseline"]["per_repo"][REPO]["merged"], 2)
+        self.assertEqual(out["window"]["per_repo"][REPO]["merged"], 1)
+        md = pm.markdown(out)
+        self.assertIn("## Window 2026-11-14", md)
+        self.assertIn("## Baseline 2026-11-12 to 2026-11-13", md)
+        self.assertIn("CI95", md)
+
+
 class Caps(Base):
     def test_read_cap_truncates_and_flags_it_and_the_next_run_resumes_from_cache(self):
         prs = [pr(i, T(10, "10:00"), T(10, "11:00")) for i in (1, 2, 3, 4)]
@@ -300,7 +375,7 @@ class Integrated(unittest.TestCase):
             e = rep["end_to_end"]["repos"][REPO]
             self.assertEqual(e["per_day"]["2026-11-13"]["merged"], 1)
             self.assertEqual(e["prs"][0]["correct"]["base_red_source"], "ticks")
-            self.assertIn("End-to-end per merged PR", lr.markdown(rep))
+            self.assertIn("End-to-end per eligible PR", lr.markdown(rep))
             self.assertFalse([x for x in gh.calls if "rules/branches" in x])  # required contexts came from the tick
             plain = lr.build_report(d, dt.timedelta(days=3), NOW)
             self.assertIsNone(plain["end_to_end"])

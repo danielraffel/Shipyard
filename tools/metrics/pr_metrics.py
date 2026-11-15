@@ -39,6 +39,14 @@ AGENT_TRAILER_RE = re.compile(
     r"co-authored-by:[^\n]*(claude|codex|anthropic|openai|copilot)|generated with[^\n]*(claude|codex)"
     r"|^(version-bump|skill-update|release)\s*:", re.I | re.M)
 BAD_CONCLUSIONS = {"failure", "timed_out"}
+FACTS_VERSION = 2
+ESCAPE_WINDOW = dt.timedelta(days=14)
+# Labels that take a PR out of the eligible cohort, with the reason reported.
+EXCLUDE_LABELS = {"automation": "automation", "shipyard:unmanaged": "unmanaged", "superseded": "superseded"}
+INTEGRATION_BASES = ("develop/", "release/")
+REPAIRED_RE = re.compile(r"^\s*repaired\s*:", re.I)
+HOLD_RE = re.compile(r"^\s*[*_#> ]*HOLD\b")
+ESCAPE_RE = r"(?i)\b(fix\w*|regress\w*|broke\w*|broken|caused|introduc\w*)\b[^\n]{0,60}?(?<![\w#])#%d(?!\d)"
 
 
 class Truncated(Exception):
@@ -151,7 +159,12 @@ def pr_facts(rd, pr, owner):
     if life and life[0][1] == "ready_for_review":
         ready = life[0][0]
     definite, ambiguous = [], []
+    repairs = holds = 0
     for e in tl:
+        body = e.get("body") or ""
+        if e.get("event") in ("commented", "reviewed"):
+            repairs += bool(REPAIRED_RE.search(body))
+            holds += bool(HOLD_RE.search(body))
         if e.get("event") not in ACTION_EVENTS:
             continue
         who = ((e.get("actor") or e.get("user") or {}).get("login") or "")
@@ -170,9 +183,23 @@ def pr_facts(rd, pr, owner):
     return {
         "number": n, "base": pr["base"]["ref"], "created_at": fmt(created), "merged_at": fmt(merged),
         "merge_commit_sha": pr.get("merge_commit_sha"), "first_ready": fmt(ready),
-        "owner_definite": sorted(set(definite)), "owner_ambiguous": sorted(set(ambiguous)),
+        "v": FACTS_VERSION, "owner_definite": sorted(set(definite)), "owner_action_count": len(definite),
+        "repair_cycles": repairs, "holds": holds,
+        "labels": sorted(l["name"] for l in pr.get("labels") or []), "owner_ambiguous": sorted(set(ambiguous)),
         "heads": sorted(heads), "timeline_complete": tl_full, "commits_complete": c_full,
     }
+
+
+def eligible(f, managed_base):
+    """(True, None) or (False, reason). A merged PR was non-draft at merge, so the draft test always passes.
+    Out: a base that is not the managed base or an integration base, or a label from EXCLUDE_LABELS."""
+    for lab in f.get("labels") or []:
+        if lab in EXCLUDE_LABELS:
+            return False, EXCLUDE_LABELS[lab]
+    b = f["base"]
+    if b != managed_base and not b.startswith(INTEGRATION_BASES):
+        return False, "unmanaged_base"
+    return True, None
 
 
 def autonomy(f, commits=True):
@@ -297,10 +324,28 @@ def poison_hit(ticks, repo, merged, until):
     return False
 
 
-def pr_correct(rd, f, base_commits, commits_ok, required, ticks, now):
+def escaped_by(later, f):
+    """Best effort: the number of a later PR, merged within 14 days after this one, whose title or body
+    says it fixes or follows from this PR (`fix ... #N`, `regression from #N`). None when unreadable."""
+    rx = re.compile(ESCAPE_RE % f["number"])
+    merged = iso(f["merged_at"])
+    for p in later:
+        m = iso(p.get("merged_at"))
+        if p["number"] == f["number"] or not m or not (merged < m <= merged + ESCAPE_WINDOW):
+            continue
+        if rx.search(f"{p.get('title') or ''}\n{p.get('body') or ''}"):
+            return p["number"]
+    return None
+
+
+def pr_correct(rd, f, base_commits, commits_ok, required, ticks, now, later=None, later_ok=False):
     merged = iso(f["merged_at"])
     provisional = now < merged + WINDOW
-    out = {"provisional": provisional, "reverted": None, "base_red": None, "bad": None}
+    out = {"provisional": provisional, "reverted": None, "base_red": None, "bad": None,
+           "escape_provisional": now < merged + ESCAPE_WINDOW, "escaped": None, "escaped_by": None}
+    if later_ok:
+        out["escaped_by"] = escaped_by(later or [], f)
+        out["escaped"] = out["escaped_by"] is not None
     if commits_ok:
         out["reverted"] = revert_of(base_commits, f) is not None
     # base red: the merge commit and the next push to the base
@@ -338,6 +383,17 @@ def pctile(xs, p):
     return None if not xs else round(xs[max(0, math.ceil(p * len(xs)) - 1)], 1)
 
 
+def wilson(k, n, z=1.96):
+    """95% Wilson score interval for k of n, in percent, or None when n is 0."""
+    if not n:
+        return None
+    p = k / n
+    d = 1 + z * z / n
+    c = (p + z * z / (2 * n)) / d
+    h = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / d
+    return [round(100 * max(0.0, c - h), 1), round(100 * min(1.0, c + h), 1)]
+
+
 def pct_of(a, b):
     return None if not b else round(100.0 * a / b, 1)
 
@@ -359,8 +415,19 @@ def summarize(rows):
         "autonomous": {"autonomous": len(auto), "owner_action": len(owner), "unknown": len(unk),
                        "rate_pct": None if not (auto or owner) else round(100.0 * len(auto) / (len(auto) + len(owner)), 1),
                        "unknown_share_pct": pct_of(len(unk), n),
+                       "rate_ci95": wilson(len(auto), len(auto) + len(owner)), "n_determinable": len(auto) + len(owner),
                        "github_only": {"autonomous": g_auto, "owner_action": g_owner, "unknown": n - g_auto - g_owner,
-                                       "rate_pct": None if not (g_auto or g_owner) else round(100.0 * g_auto / (g_auto + g_owner), 1)}},
+                                       "rate_pct": None if not (g_auto or g_owner) else round(100.0 * g_auto / (g_auto + g_owner), 1),
+                                       "rate_ci95": wilson(g_auto, g_auto + g_owner)}},
+        "interventions": {
+            "owner_actions_total": sum(r["owner_actions"] for r in rows),
+            "repair_cycles_total": sum(r["repair_cycles"] for r in rows),
+            "holds_total": sum(r["holds"] for r in rows),
+            "prs_with_owner_action": sum(1 for r in rows if r["owner_actions"]),
+            "prs_with_repair_cycle": sum(1 for r in rows if r["repair_cycles"]),
+            "owner_actions_per_pr": None if not n else round(sum(r["owner_actions"] for r in rows) / n, 2),
+            "repair_cycles_per_pr": None if not n else round(sum(r["repair_cycles"] for r in rows) / n, 2),
+        },
         "handoff_min": {"n": len(hand), "median": None if not hand else round(statistics.median(hand), 1), "p90": pctile(hand, 0.9)},
         "compute_per_pr": {
             "prs_read": len(comp), "prs_unread_or_partial": n - len(comp),
@@ -375,6 +442,12 @@ def summarize(rows):
             "base_red": sum(1 for r in rows if r["correct"]["base_red"]),
             "provisional_prs": sum(1 for r in rows if r["correct"]["provisional"]),
             "bad_rate_pct": None if not (bad or good) else round(100.0 * len(bad) / (len(bad) + len(good)), 1),
+            "bad_rate_ci95": wilson(len(bad), len(bad) + len(good)),
+            "escaped": sum(1 for r in rows if r["correct"].get("escaped")),
+            "escaped_known": sum(1 for r in rows if r["correct"].get("escaped") is not None),
+            "escaped_rate_pct": pct_of(sum(1 for r in rows if r["correct"].get("escaped")), sum(1 for r in rows if r["correct"].get("escaped") is not None)),
+            "escaped_rate_ci95": wilson(sum(1 for r in rows if r["correct"].get("escaped")), sum(1 for r in rows if r["correct"].get("escaped") is not None)),
+            "escape_provisional_prs": sum(1 for r in rows if r["correct"].get("escape_provisional")),
             "provisional": any(r["correct"]["provisional"] for r in rows),
         },
     }
@@ -397,7 +470,7 @@ def merged_prs(rd, lo, hi):
     return out, False
 
 
-def collect_repo(repo, cache_dir, cap, owner, lo, hi, now, ticks, tick_ctx, fetch=None):
+def collect_repo(repo, cache_dir, cap, owner, lo, hi, now, ticks, tick_ctx, fetch=None, managed_base="main"):
     rd = Reader(repo, cache_dir, cap, fetch)
     res = {"repo": repo, "rows": [], "unread": 0, "listing_complete": False, "reads": 0, "truncated": False, "errors": 0}
     try:
@@ -407,6 +480,8 @@ def collect_repo(repo, cache_dir, cap, owner, lo, hi, now, ticks, tick_ctx, fetc
     rows, pending = [], []
     for pr in prs:
         f = rd.load("facts", str(pr["number"]))
+        if f is not None and f.get("v") != FACTS_VERSION:
+            f = None  # cached by an older reduction: read again once
         if f is None:
             try:
                 f = pr_facts(rd, pr, owner)
@@ -452,14 +527,22 @@ def collect_repo(repo, cache_dir, cap, owner, lo, hi, now, ticks, tick_ctx, fetc
         corr = rd.load("correct", str(f["number"]))
         if corr is None:
             try:
-                corr = pr_correct(rd, f, base_commits, commits_ok, req, ticks, now)
-                if not corr["provisional"] and corr["bad"] is not None:
+                corr = pr_correct(rd, f, base_commits, commits_ok, req, ticks, now, prs, res["listing_complete"])
+                if now >= iso(f["merged_at"]) + ESCAPE_WINDOW and corr["bad"] is not None and corr["escaped"] is not None:
                     rd.save("correct", str(f["number"]), corr)
             except (Truncated, ReadError):
-                corr = {"provisional": now < iso(f["merged_at"]) + WINDOW, "reverted": None, "base_red": None, "bad": None}
+                corr = {"provisional": True, "reverted": None, "base_red": None, "bad": None, "escaped": None, "escaped_by": None}
+        if corr.get("escaped") is None and res["listing_complete"]:  # independent of the base reads
+            corr["escaped_by"] = escaped_by(prs, f)
+            corr["escaped"] = corr["escaped_by"] is not None
         corr["provisional"] = now < iso(f["merged_at"]) + WINDOW  # age is relative to this run
+        corr["escape_provisional"] = now < iso(f["merged_at"]) + ESCAPE_WINDOW
+        ok, why = eligible(f, managed_base)
         out.append({
-            "pr": f["number"], "day": f["merged_at"][:10], "autonomy": autonomy(f), "autonomy_github_only": autonomy(f, False),
+            "pr": f["number"], "day": f["first_ready"][:10], "merge_day": f["merged_at"][:10],
+            "eligible": ok, "excluded_because": why,
+            "owner_actions": f.get("owner_action_count", len(f["owner_definite"])),
+            "repair_cycles": f.get("repair_cycles", 0), "holds": f.get("holds", 0), "autonomy": autonomy(f), "autonomy_github_only": autonomy(f, False),
             "handoff_min": round((iso(f["merged_at"]) - iso(f["first_ready"])).total_seconds() / 60.0, 1),
             "compute": comp, "correct": corr,
         })
@@ -467,7 +550,7 @@ def collect_repo(repo, cache_dir, cap, owner, lo, hi, now, ticks, tick_ctx, fetc
     return res
 
 
-def build(repos, cache_dir, cap, owner, start, now, ticks, tick_ctx, baseline=None, fetch=None):
+def build(repos, cache_dir, cap, owner, start, now, ticks, tick_ctx, baseline=None, fetch=None, bases=None):
     """The `end_to_end` report section. `ticks`: repo -> [datetimes a base_poison red-everywhere episode began]."""
     lo = start
     if baseline:
@@ -477,12 +560,16 @@ def build(repos, cache_dir, cap, owner, start, now, ticks, tick_ctx, baseline=No
            "coverage": {"status": "available", "reason": ""}, "baseline": None}
     notes = []
     for repo in repos:
-        r = collect_repo(repo, cache_dir, per_cap, owner, lo, now, now, ticks, tick_ctx, fetch)
+        r = collect_repo(repo, cache_dir, per_cap, owner, lo, now, now, ticks, tick_ctx, fetch, (bases or {}).get(repo, "main"))
         days = {}
+        excluded = {}
         for row in r["rows"]:
+            if not row["eligible"]:
+                excluded[row["excluded_because"]] = excluded.get(row["excluded_because"], 0) + 1
+                continue
             days.setdefault(row["day"], []).append(row)
         out["repos"][repo] = {
-            "per_day": {d: summarize(v) for d, v in sorted(days.items())}, "prs": r["rows"],
+            "per_day": {d: summarize(v) for d, v in sorted(days.items())}, "prs": r["rows"], "excluded": excluded,
             "unread_prs": r["unread"], "listing_complete": r["listing_complete"],
             "reads": r["reads"], "truncated": r["truncated"], "read_errors": r["errors"],
         }
@@ -491,37 +578,52 @@ def build(repos, cache_dir, cap, owner, start, now, ticks, tick_ctx, baseline=No
             notes.append(f"{repo}: truncated={r['truncated']} unread={r['unread']} listing_complete={r['listing_complete']} read_errors={r['errors']}")
     if notes:
         out["coverage"] = {"status": "partial", "reason": "; ".join(notes)}
+    ds = start.strftime("%Y-%m-%d")
+    cohort = lambda v, a, b: summarize([p for p in v["prs"] if p["eligible"] and a <= p["day"] <= b])  # noqa: E731
+    out["window"] = {"from": ds, "to": now.strftime("%Y-%m-%d"),
+                     "per_repo": {repo: cohort(v, ds, "9999") for repo, v in out["repos"].items()}}
     if baseline:
-        b0, b1 = baseline
-        out["baseline"] = {"from": b0.strftime("%Y-%m-%d"), "to": b1.strftime("%Y-%m-%d"), "per_repo": {
-            repo: summarize([p for p in v["prs"] if b0.strftime("%Y-%m-%d") <= p["day"] <= b1.strftime("%Y-%m-%d")])
-            for repo, v in out["repos"].items()}}
+        b0, b1 = (x.strftime("%Y-%m-%d") for x in baseline)
+        out["baseline"] = {"from": b0, "to": b1, "per_repo": {repo: cohort(v, b0, b1) for repo, v in out["repos"].items()}}
     return out
 
 
+def ci(x):
+    return "n/a" if not x else f"{x[0]}-{x[1]}"
+
+
 def markdown(e2e):
-    L = ["", "## End-to-end per merged PR (by merge day, UTC)", "",
-         "Autonomous merge rate: merged PRs with no owner action (a commit, review, label, comment, merge or close by "
-         f"{e2e['owner']}'s own account) from opening to merge, over PRs where that is determinable; the rest are unknown (a commit under the owner's identity with no agent trailer). "
-         "The `gh-only` figure ignores commits and counts only GitHub-side owner actions. "
-         "Handoff-to-merge: first ready-for-review moment to merged_at, median and p90 minutes. "
-         "Compute: Actions job minutes on the PR's heads plus its merge-group runs, self-hosted and hosted. "
-         "Correctness: share of merged PRs with a revert or a red required check on the base within 7 days; "
-         "provisional while the 7 days are open.", "",
+    L = ["", "## End-to-end per eligible PR (cohort = UTC day the PR became ready)", "",
+         "Eligible: a merged PR on the managed base or an integration base, without the `automation`, "
+         "`shipyard:unmanaged` or `superseded` label (docs/metrics.md). Rates carry a 95% Wilson interval and n; "
+         "no per-change attribution is made.",
+         f"Autonomous merge rate: eligible PRs with no owner action (review, label, comment, merge or close by {e2e['owner']}'s own account; "
+         "a commit under that identity with no agent trailer makes the PR unknown). `gh-only` ignores commits. "
+         "Handoff-to-merge: first ready moment to merge, median and p90 minutes. Compute: job minutes on the PR's heads and merge-group runs, "
+         "self-hosted/hosted. Correctness: revert or red required check on the base within 7 days (provisional while open); "
+         "escaped defect: a later PR within 14 days whose title or body names this one as the cause (best effort).", "",
          f"Coverage: {e2e['coverage']['status']} {e2e['coverage']['reason']}" + (" (TRUNCATED at the read cap)" if e2e["truncated"] else ""), ""]
-    head = "| day | merged | autonomous (a/o/unknown, rate) | handoff median/p90 | compute sh/hosted median min (PRs read) | correctness (bad/good/unknown, rate) |"
-    sep = "|---|---|---|---|---|---|"
+    head = ("| {0} | n | autonomous a/o/unknown | rate (CI95) | unknown share | gh-only rate (CI95) | handoff median/p90 min | "
+            "compute sh/hosted median min (PRs read) | owner actions/PR | repair cycles/PR | correctness bad/good/unknown | bad rate (CI95) | escaped rate (CI95) |")
+    sep = "|" + "---|" * 13
 
     def row(label, s):
-        a, h, c, k = s["autonomous"], s["handoff_min"], s["compute_per_pr"], s["correctness"]
+        a, h, c, k, iv = s["autonomous"], s["handoff_min"], s["compute_per_pr"], s["correctness"], s["interventions"]
+        g = a["github_only"]
         prov = " provisional" if k["provisional"] else ""
-        return (f"| {label} | {s['merged']} | {a['autonomous']}/{a['owner_action']}/{a['unknown']}, {a['rate_pct']}% | "
-                f"{h['median']}/{h['p90']} | {c['self_hosted_min_median']}/{c['hosted_min_median']} ({c['prs_read']}) | "
-                f"{k['bad']}/{k['good']}/{k['unknown']}, {k['bad_rate_pct']}%{prov} |")
+        esc = f"{k['escaped_rate_pct']}% ({ci(k['escaped_rate_ci95'])}), n={k['escaped_known']}" + (" provisional" if k["escape_provisional_prs"] else "")
+        return (f"| {label} | {s['merged']} | {a['autonomous']}/{a['owner_action']}/{a['unknown']} | {a['rate_pct']}% ({ci(a['rate_ci95'])}), n={a['n_determinable']} | "
+                f"{a['unknown_share_pct']}% | {g['rate_pct']}% ({ci(g['rate_ci95'])}) | {h['median']}/{h['p90']} (n={h['n']}) | "
+                f"{c['self_hosted_min_median']}/{c['hosted_min_median']} ({c['prs_read']}) | {iv['owner_actions_per_pr']} | {iv['repair_cycles_per_pr']} | "
+                f"{k['bad']}/{k['good']}/{k['unknown']} | {k['bad_rate_pct']}% ({ci(k['bad_rate_ci95'])}){prov} | {esc} |")
     for repo, v in sorted(e2e["repos"].items()):
-        L += [f"### {repo}", "", head, sep] + [row(d, s) for d, s in v["per_day"].items()] + [""]
-    b = e2e.get("baseline")
-    if b:
-        L += [f"## Baseline {b['from']} to {b['to']} (pooled)", "", head.replace("| day", "| repo"), sep]
-        L += [row(repo, s) for repo, s in sorted(b["per_repo"].items())] + [""]
+        L += [f"### {repo}", ""]
+        if v.get("excluded"):
+            L += ["Excluded from the cohort: " + ", ".join(f"{k} {n}" for k, n in sorted(v["excluded"].items())), ""]
+        L += [head.format("ready day"), sep] + [row(d, s) for d, s in v["per_day"].items()] + [""]
+    w, b = e2e.get("window"), e2e.get("baseline")
+    for title, blk in (("Window", w), ("Baseline", b)):
+        if blk:
+            L += [f"## {title} {blk['from']} to {blk['to']} (pooled cohort)", "", head.format("repo"), sep]
+            L += [row(repo, s) for repo, s in sorted(blk["per_repo"].items())] + [""]
     return "\n".join(L) + "\n"
