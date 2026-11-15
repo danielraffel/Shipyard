@@ -313,85 +313,21 @@ class DailyTests(Fixture):
         self.assertEqual(lr.daily(str(self.dir / "missing"), self.now), 0)
 
 
-class RollupCounterfactualTests(Fixture):
-    def tick(self, t, plan):
-        body = {"repos": [{"repo": REPO, "prs": [], "errors": [], "rollup": plan}]}
+class RetiredRollupPlanTests(Fixture):
+    def test_an_archived_tick_with_a_rollup_plan_still_reads(self):
+        # Ticks written before the rollup planner was removed carry a
+        # `rollup` key. The report reads the rest of the tick and no longer
+        # reports rollups.
+        t = dt.datetime(2026, 11, 12, 1, 0, tzinfo=UTC)
+        body = {"repos": [{"repo": REPO, "prs": [], "errors": [],
+                           "rollup": {"mode": "shadow", "action": "shadow", "ready": [],
+                                      "members": [{"pr": 1, "head": "a"}, {"pr": 2, "head": "b"}]}}]}
         (self.dir / f"acme_repo-{stamp(t)}.json").write_text(json.dumps(body))
-
-    @staticmethod
-    def plan(action, *members):
-        return {"mode": "shadow", "action": action, "ready": [], "min_ready": 3,
-                "members": [{"pr": pr, "head": head} for pr, head in members]}
-
-    def test_absent_plans_are_unavailable_not_zero(self):
-        self.live(dt.datetime(2026, 11, 12, 1, 0, tzinfo=UTC), [(1, "a", "ready", "steward", None)])
-        rc = self.report()["rollup_counterfactual"]
-        self.assertEqual(rc["coverage"]["status"], "unavailable")
-        self.assertIsNone(rc["per_repo_per_day"])
-
-    def test_a_repeated_plan_counts_once_and_saves_prs_minus_rollups(self):
-        d1 = dt.datetime(2026, 11, 11, 1, 0, tzinfo=UTC)
-        self.tick(d1, self.plan("shadow", (1, "a"), (2, "b"), (3, "c")))
-        self.tick(d1 + dt.timedelta(minutes=5), self.plan("shadow", (1, "a"), (2, "b"), (3, "c")))
-        # One newcomer alone would land on its own: no rollup.
-        self.tick(d1 + dt.timedelta(minutes=10), self.plan("shadow", (1, "a"), (4, "d")))
-        # A new head of #2 is a new member.
-        d2 = d1 + dt.timedelta(days=1)
-        self.tick(d2, self.plan("apply_unavailable", (2, "b2"), (5, "e"), (6, "f")))
-        self.tick(d2 + dt.timedelta(minutes=5), self.plan("below_threshold"))
-        self.tick(d2 + dt.timedelta(minutes=10), self.plan("no_batch", (7, "g"), (8, "h")))
         r = self.report()
-        days = r["rollup_counterfactual"]["per_repo_per_day"][REPO]
-        self.assertEqual(days, {
-            "2026-11-11": {"prs": 3, "rollups": 1, "ci_runs_saved": 2},
-            "2026-11-12": {"prs": 3, "rollups": 1, "ci_runs_saved": 2},
-        })
-        self.assertIn("would have batched 3 PRs into 1 rollups, saving ~2 CI runs", lr.markdown(r))
-        status = r["rollup_counterfactual"]["per_repo_status"][REPO]
-        self.assertEqual(status["state"], "planned")
-        self.assertIn(f"- {REPO}: planned: ", lr.markdown(r))
-
-    def test_a_planner_that_does_not_run_reads_planner_off(self):
-        t = dt.datetime(2026, 11, 12, 1, 0, tzinfo=UTC)
-        queue = {"action": "not_applicable", "ready": [1, 2], "min_ready": 3,
-                 "detail": "the base has a merge queue, which batches on its own"}
-        self.tick(t, queue)
-        self.tick(t + dt.timedelta(minutes=5), queue)
-        r = self.report()
-        rc = r["rollup_counterfactual"]
-        self.assertEqual(rc["coverage"]["status"], "partial")
-        status = rc["per_repo_status"][REPO]
-        self.assertEqual(status["state"], "off")
-        self.assertEqual(status["actions"], {"not_applicable": 2})
-        self.assertIn(f"- {REPO}: planner off (the base has a merge queue, which batches on its own 2)",
-                      lr.markdown(r))
-        self.tick(t + dt.timedelta(minutes=10), {"mode": "off", "action": "off", "ready": [1, 2],
-                                                 "min_ready": 3, "detail": "mode off"})
-        self.assertEqual(self.report()["rollup_counterfactual"]["per_repo_status"][REPO]["state"], "off")
-
-    def test_a_planner_that_ran_without_a_batch_counts_actions_and_reasons(self):
-        t = dt.datetime(2026, 11, 12, 1, 0, tzinfo=UTC)
-        self.tick(t, {"action": "below_threshold", "ready": [1], "min_ready": 3})
-        self.tick(t + dt.timedelta(minutes=5), {"action": "below_threshold", "ready": [], "min_ready": 3})
-        no_batch = dict(self.plan("no_batch"), skipped=[
-            {"pr": 4, "why": "member #4: no verdict names its head"},
-            {"pr": 5, "why": "member #5: no verdict names its head"},
-            {"pr": 6, "why": "#4 also changes src/a.rs"},
-        ])
-        self.tick(t + dt.timedelta(minutes=10), no_batch)
-        # A tick from a steward that wrote no rollup report.
-        (self.dir / f"acme_repo-{stamp(t + dt.timedelta(minutes=15))}.json").write_text(
-            json.dumps({"repos": [{"repo": REPO, "prs": [], "errors": []}]}))
-        r = self.report()
-        status = r["rollup_counterfactual"]["per_repo_status"][REPO]
-        self.assertEqual(status["state"], "no_candidates")
-        self.assertEqual(status["actions"], {"below_threshold": 2, "no_batch": 1, "not_reported": 1})
-        self.assertEqual(status["left_out_reasons"], {"no verdict names its head": 2, "#N also changes src/a.rs": 1})
-        self.assertEqual(r["rollup_counterfactual"]["per_repo_per_day"], {})
-        md = lr.markdown(r)
-        self.assertIn(f"- {REPO}: planner ran, no candidates: below_threshold 2, no_batch 1, not_reported 1; "
-                      "left out: no verdict names its head 2, #N also changes src/a.rs 1", md)
-        self.assertNotIn("would have batched", md)
+        self.assertEqual(r["sources"]["unreadable"], 0)
+        self.assertEqual(r["sources"]["live_files"], 1)
+        self.assertNotIn("rollup_counterfactual", r)
+        self.assertNotIn("Rollup", lr.markdown(r))
 
 
 class TickIntegrationTests(unittest.TestCase):

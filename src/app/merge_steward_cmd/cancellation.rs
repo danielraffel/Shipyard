@@ -577,8 +577,6 @@ pub(super) fn apply_repo_plan(
                 "entries": stall_pass.entries,
                 "reads": "three per queue entry whose group head has no active run",
             })),
-            rollup_reconciliation: Vec::new(),
-            rollup: None,
             uncertain_mutations,
             api_calls: None,
             rate_limit_deferred: None,
