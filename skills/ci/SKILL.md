@@ -507,10 +507,6 @@ Two things not to conclude from it:
   head: dispatch `build.yml` with `pr_number=<n>` as the
   fleet App and wait for the full lane. The steward's native-arm backstop arms
   it later. See the shipyard skill.
-- **`shipyard train status` shows why an approved PR is not in the queue.**
-  It is off unless the base sets `[train] enabled = true`; `SHIPYARD_TRAIN=off`
-  or `shipyard train pause --reason` kills it on a host. Read-only: it never
-  arms or enqueues.
 - **Armed is not merged.** GitHub still waits for the repository's required
   checks and refuses drafts itself. But note the converse: once armed, GitHub
   may merge as soon as the *required* set is green, which can be before
@@ -833,9 +829,8 @@ the scorecard reads from the log, so a forged line changes nothing. Keep records
 **A rollup lands on its members' approvals.** On a base with `[train]
 mode = "rollup"`, a `shipyard-train/rollup-*` head with no verdict of its own
 lands only when each merge on its first-parent chain merges a member's exact
-approved head and changes nothing else (docs/rollups.md); `shipyard rollup
-verify --pr N` says whether it would. Do not approve a rollup head instead:
-approve each member.
+approved head and changes nothing else (docs/ghapp-guards.md). Rollups are
+being removed and no base takes them; never form one.
 
 **"May this head land?" is `shipyard review-verdict --pr N --json`.** It is
 the repository-side review rule with no host switch in it: exit 0 when an

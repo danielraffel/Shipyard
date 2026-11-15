@@ -576,17 +576,6 @@ pub(super) enum Command {
         #[command(subcommand)]
         command: ReviewerClaimCommand,
     },
-    /// Land several approved pull requests as one tested merge: a rollup.
-    ///
-    /// Off unless the base's `.shipyard/config.toml` sets `[train]
-    /// enabled = true` and `mode = "rollup"`. Only `build --apply` and
-    /// `land --apply` write. Exits 0 when done, 1 when refused, 2 when the
-    /// answer cannot be read.
-    Rollup {
-        /// Rollup subcommand.
-        #[command(subcommand)]
-        command: RollupCommand,
-    },
     /// Pull requests that have sat in one blocked state past its dwell
     /// limit, with the next action, owner and any act taken. Read-only.
     ///
@@ -746,15 +735,6 @@ pub(super) enum Command {
     /// `base_health.auto_jump` (`off` by default; `dry-run` records "would jump
     /// PR #n" once per episode; `on` dequeues and re-enqueues the fix with
     /// `jump: true`). With `off`, `--act` returns before reading GitHub.
-    /// The merge train: whether it is on for a repository, every open pull
-    /// request's stage on the way into the merge queue, metrics, and the host
-    /// pause. Off unless the base config sets `[train] enabled = true`;
-    /// `SHIPYARD_TRAIN=off` or `train pause` kills it on this host. Read-only.
-    Train {
-        /// Train operation.
-        #[command(subcommand)]
-        command: TrainCommand,
-    },
     #[command(name = "base-health")]
     BaseHealth {
         /// Exact OWNER/REPO. Defaults to the `origin` remote.
@@ -1403,45 +1383,6 @@ pub(super) enum QueueCommand {
         /// Override the restore-ledger path. Test hook.
         #[arg(long = "ledger", hide = true)]
         ledger: Option<PathBuf>,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-pub(super) enum TrainCommand {
-    /// Print the switch and, when on, each open pull request's stage and why.
-    Status {
-        /// Exact OWNER/REPO. Defaults to the `origin` remote.
-        #[arg(long, value_name = "OWNER/REPO")]
-        repo: Option<String>,
-        /// Base branch.
-        #[arg(long, default_value = "main")]
-        base: String,
-        /// Append this pass to the repository's sample file (for `metrics`).
-        #[arg(long)]
-        record: bool,
-    },
-    /// Merges/hour, approved-to-merged p50/p95, queue-empty minutes while a
-    /// ready pull request waited, and batch sizes, from recorded samples.
-    Metrics {
-        /// Exact OWNER/REPO. Defaults to the `origin` remote.
-        #[arg(long, value_name = "OWNER/REPO")]
-        repo: Option<String>,
-        /// Window, in hours, ending now.
-        #[arg(long = "since-hours", default_value_t = 24)]
-        since_hours: u32,
-    },
-    /// Pause the train on this host: writes the guards-dir pause file.
-    Pause {
-        /// Why; recorded with who paused and when.
-        #[arg(long)]
-        reason: String,
-    },
-    /// Remove this host's pause file. Only the operator who paused may, with
-    /// a reason, and not while `SHIPYARD_TRAIN` still kills the train.
-    Resume {
-        /// Why; recorded with who resumed and when.
-        #[arg(long)]
-        reason: String,
     },
 }
 
@@ -3625,109 +3566,6 @@ pub(super) enum OwnerCommand {
         #[arg(long, value_name = "OWNER/REPO")]
         repo: Option<String>,
     },
-}
-
-#[derive(Debug, Subcommand)]
-pub(super) enum RollupCommand {
-    /// Which open pull requests would form the next rollup, and why each
-    /// other one would not. Read-only.
-    Plan {
-        /// Exact OWNER/REPO. Defaults to the `origin` remote.
-        #[arg(long, value_name = "OWNER/REPO")]
-        repo: Option<String>,
-        /// Base branch. Defaults to the repository's default branch.
-        #[arg(long, value_name = "BRANCH")]
-        base: Option<String>,
-    },
-    /// Form a rollup of these members on the base's tip, in this checkout,
-    /// without touching its work tree. `--apply` pushes
-    /// `shipyard-train/rollup-<first member>` and opens its pull request.
-    Build {
-        /// Exact OWNER/REPO. Defaults to the `origin` remote.
-        #[arg(long, value_name = "OWNER/REPO")]
-        repo: Option<String>,
-        /// Base branch. Defaults to the repository's default branch.
-        #[arg(long, value_name = "BRANCH")]
-        base: Option<String>,
-        /// Member pull requests, oldest first, comma-separated.
-        #[arg(long, value_delimiter = ',', required = true)]
-        members: Vec<u64>,
-        /// Push the branch and open the pull request.
-        #[arg(long)]
-        apply: bool,
-    },
-    /// Whether a rollup pull request's head lands, by the guard's rollup
-    /// rule. Read-only.
-    Verify {
-        /// Exact OWNER/REPO. Defaults to the `origin` remote.
-        #[arg(long, value_name = "OWNER/REPO")]
-        repo: Option<String>,
-        /// The rollup pull request.
-        #[arg(long)]
-        pr: u64,
-    },
-    /// Land a verified rollup. With `landing = "merge-queue"` it prints the
-    /// steward handoff that enqueues it; with `"direct"`, `--apply` merges it
-    /// with its head bound and the merge method MERGE once the base's
-    /// required checks pass on it, refusing if the base moved.
-    Land {
-        /// Exact OWNER/REPO. Defaults to the `origin` remote.
-        #[arg(long, value_name = "OWNER/REPO")]
-        repo: Option<String>,
-        /// The rollup pull request.
-        #[arg(long)]
-        pr: u64,
-        /// Merge it.
-        #[arg(long)]
-        apply: bool,
-    },
-    /// Close the members of rollups that landed lately (by the merge queue
-    /// or directly) that GitHub did not mark merged, each only once its
-    /// exact head is proven on the base. The merge steward runs this on
-    /// every `--apply` pass for a base that takes rollups.
-    Reconcile {
-        /// Exact OWNER/REPO. Defaults to the `origin` remote.
-        #[arg(long, value_name = "OWNER/REPO")]
-        repo: Option<String>,
-        /// Base branch. Defaults to the repository's default branch.
-        #[arg(long, value_name = "BRANCH")]
-        base: Option<String>,
-        /// Close them.
-        #[arg(long)]
-        apply: bool,
-    },
-    /// The next bisect step after a rollup's run: land, eject one member, or
-    /// test each half. Read-only.
-    Split {
-        /// Exact OWNER/REPO. Unused; accepted for symmetry.
-        #[arg(long, value_name = "OWNER/REPO")]
-        repo: Option<String>,
-        /// The rollup's members, oldest first, comma-separated.
-        #[arg(long, value_delimiter = ',', required = true)]
-        members: Vec<u64>,
-        /// The whole rollup passed.
-        #[arg(long)]
-        passed: bool,
-        /// After the halves ran: whether the older half passed.
-        #[arg(long = "first-passed", value_name = "BOOL")]
-        first_passed: Option<bool>,
-        /// After the halves ran: whether the newer half passed.
-        #[arg(long = "second-passed", value_name = "BOOL")]
-        second_passed: Option<bool>,
-    },
-}
-
-impl RollupCommand {
-    pub(super) fn repo(&self) -> Option<String> {
-        match self {
-            Self::Plan { repo, .. }
-            | Self::Build { repo, .. }
-            | Self::Verify { repo, .. }
-            | Self::Land { repo, .. }
-            | Self::Reconcile { repo, .. }
-            | Self::Split { repo, .. } => repo.clone(),
-        }
-    }
 }
 
 #[derive(Debug, Subcommand)]

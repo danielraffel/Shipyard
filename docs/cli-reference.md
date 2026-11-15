@@ -74,16 +74,6 @@ shipyard base-health --replay FILE [--json]  # replay recorded episodes (JSON ar
                                              #   plus a red base tip; names the approved head that passed the context after the tip went red;
                                              #   scores the pick against the PR that repaired the base. Offline: no GitHub read, no state
 
-# Is the merge queue fed? The merge train (off unless the base config sets `[train] enabled = true`)
-shipyard train status [--repo R] [--base main]  # switch + each open PR's stage and why (approval is head_approval's, carry included)
-shipyard train status --record                # also append this pass to <state>/train/<owner>__<repo>.jsonl (for metrics)
-shipyard train metrics [--since-hours 24]     # merges/h, approved->merged p50/p95, queue-empty minutes while a PR was ready, batch sizes, heads/merged PR
-shipyard train pause --reason "..."           # host kill switch: writes <guards dir>/train.pause; SHIPYARD_TRAIN=off|0|false (or off:owner/repo) also kills
-shipyard train resume --reason "..."          # removes the pause file: only the operator who paused, never while SHIPYARD_TRAIN kills
-                                              #   (both audited in <guards dir>/train-pauses.jsonl)
-# Off (absent, false, unreadable, or killed): status makes at most the one config read (none when killed) and records nothing.
-# status never writes the carry log: approvals are evaluated dry (a carried approval is reported, not logged).
-
 # Why is it red? Bounded diagnosis instead of reading a 10 MB job log (shipyard.diagnose/v1)
 shipyard diagnose 123                        # PR head: per failing REQUIRED check the step, tests, <=5 evidence groups,
                                              #   runner, class (infra | interrupted | stale_base | flake_candidate | real),
@@ -162,23 +152,6 @@ shipyard reviewer-dispatch observe --repo OWNER/REPO --pr 123 \
                                              # missing or stale evidence fails closed; launcher retry/escalation is a
                                              # separate caller-owned follow-up
 shipyard landability --repo OWNER/REPO       # can this PR's required contexts be scheduled at all
-shipyard rollup plan [--repo OWNER/REPO] [--base BRANCH]
-                                             # which open PRs form the next rollup (oldest ready, disjoint files,
-                                             #   no excluded or shared hot paths) and why each other one does not
-shipyard rollup build --members 11,12 [--base BRANCH] [--apply]
-                                             # merge each member's exact head onto the base tip (merge-tree +
-                                             #   commit-tree; the work tree is untouched); --apply pushes
-                                             #   shipyard-train/rollup-<n> and opens its PR with a notice comment
-shipyard rollup verify --pr N                # does this rollup head land, by the guard's rollup rule
-shipyard rollup land --pr N [--apply]        # merge method MERGE only; merge-queue: prints the steward handoff;
-                                             #   direct: required checks green, base re-read, PR merge API with
-                                             #   sha= bound; closes members GitHub did not mark merged
-shipyard rollup reconcile [--base BRANCH] --apply
-                                             # close members of landed rollups GitHub did not mark merged, each only
-                                             #   once its head is proven on the base (the steward runs this too)
-shipyard rollup split --members 11,12,13,14 [--passed] [--first-passed BOOL --second-passed BOOL]
-                                             # next bisect step: land, eject one member, or test each half
-                                             #   (docs/rollups.md); all rollup commands exit 0/1 refused/2 unreadable
 
 # Keep the fleet on the latest release (controller only)
 shipyard runner fleet-update --to vX.Y.Z --all-hosts          # plan

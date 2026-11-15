@@ -16,7 +16,6 @@ use crate::landing::queue::{
     EnqueueGuidance, MergeQueueConfig, Payload, QueueFinding, QueueInputs, StrictFinding,
     determine_queue, determine_strict, enqueue_guidance,
 };
-use crate::landing::strategy::{BatchingAction, BatchingGuidance};
 use crate::landing::{LandingReport, SurfaceOutcome, SurfaceRead, Verdict};
 
 /// A ruleset carrying an active merge queue on the default branch.
@@ -610,12 +609,6 @@ fn unknown_enqueue_guidance_is_a_headline_unknown() {
             action: "unknown".to_owned(),
             command: None,
             rationale: "merge method unavailable".to_owned(),
-        },
-        batching: BatchingGuidance {
-            action: BatchingAction::Disabled,
-            command: None,
-            max_members: None,
-            rationale: "no train".to_owned(),
         },
         required_checks: placement::PlacementFinding {
             contexts_source: "none".to_owned(),

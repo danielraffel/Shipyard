@@ -31,10 +31,6 @@ use crate::landing::{LandingReport, SCHEMA_VERSION, SurfaceRead, backlog};
 /// How many completed runs to consider when deriving placement.
 pub const DEFAULT_RUN_SAMPLE: usize = 30;
 
-fn default_batching(queue: &queue::QueueFinding) -> crate::landing::strategy::BatchingGuidance {
-    crate::landing::strategy::batching_guidance(queue, &crate::rollup::Config::default())
-}
-
 /// How many per-run job reads to spend at most.
 pub const DEFAULT_MAX_JOB_READS: usize = 20;
 
@@ -153,7 +149,6 @@ pub fn gather(actions: &GitHubActions, options: &GatherOptions<'_>) -> LandingRe
         finding
     };
     let base_jump = crate::base_health::jump_advice(repo, &base_health, chrono::Utc::now());
-    let batching = default_batching(&merge_queue);
 
     LandingReport {
         schema_version: SCHEMA_VERSION,
@@ -162,7 +157,6 @@ pub fn gather(actions: &GitHubActions, options: &GatherOptions<'_>) -> LandingRe
         merge_queue,
         strict,
         enqueue,
-        batching,
         required_checks: placement::PlacementFinding {
             contexts_source,
             checks,

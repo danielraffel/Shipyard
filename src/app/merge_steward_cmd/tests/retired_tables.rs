@@ -1,6 +1,8 @@
-//! The merge train's OFF contract on the steward's managed enqueue: with
-//! `[train]` absent or `enabled = false` in the base config, the steward
-//! issues byte-identical `gh` calls and reaches the same result.
+//! Retired base-config tables on the steward's managed enqueue: with Pulp's
+//! real `[train]` block and an `[auto_merge.rollup]` table in the base
+//! config, the steward issues byte-identical `gh` calls and reaches the same
+//! result as without them. Rollups and the merge train were removed; nothing
+//! reads these tables.
 
 use super::*;
 
@@ -54,15 +56,22 @@ fn enqueue_with_config(config: &str) -> (Option<String>, Option<String>, String)
     (mutation, error, calls)
 }
 
+/// Pulp's real `[train]` block and an `[auto_merge.rollup]` table.
+const RETIRED: &str = include_str!("../../../../tests/fixtures/retired-config/pulp-train.toml");
+
+/// `text` as the fake's `printf '%s\n'` arguments, one shell word per line.
+fn printf_lines(text: &str) -> String {
+    text.lines()
+        .map(|line| format!("'{}'", line.replace('\'', r"'\''")))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[test]
-fn the_managed_enqueue_is_byte_identical_with_the_train_off() {
+fn the_managed_enqueue_is_byte_identical_with_retired_tables() {
     let base = "'[auto_merge]' 'arm_requires_head_approval = false'";
     let baseline = enqueue_with_config(base);
     assert_eq!(baseline.0.as_deref(), Some("enqueued"), "{baseline:?}");
-    for off in [
-        format!("{base} '[train]'"),
-        format!("{base} '[train]' 'enabled = false'"),
-    ] {
-        assert_eq!(enqueue_with_config(&off), baseline, "{off}");
-    }
+    let retired = format!("{base} {}", printf_lines(RETIRED));
+    assert_eq!(enqueue_with_config(&retired), baseline, "{retired}");
 }

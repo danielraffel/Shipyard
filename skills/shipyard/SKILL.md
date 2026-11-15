@@ -812,8 +812,8 @@ commit gets no carrier action until a reviewer approves that head.
 Three guardrails bound every carry, in the guard and in `head_approval`:
 - **Excluded paths:** a PR touching `[auto_merge] carry_excluded_paths` never
   carries, and never joins a rollup. The default list is workflows,
-  `.agents/contract.toml`, `tools/ci/**`, `.shipyard/**` (the review, carry
-  and train policy itself), the guards and Shipyard's arm code, and signing
+  `.agents/contract.toml`, `tools/ci/**`, `.shipyard/**` (the review and
+  carry policy itself), the guards and Shipyard's arm code, and signing
   and release automation. `carry_excluded_paths` replaces that list;
   `carry_excluded_paths_extra` adds to it, and `carry_excluded_paths_allow`
   re-includes default paths, never workflows, `tools/ci/**`, the CI contract,
@@ -825,7 +825,7 @@ Three guardrails bound every carry, in the guard and in `head_approval`:
 
 Every merge carry a landing accepts is logged to `carries.jsonl` with its
 verdict id and both merge bases. Read-only evaluations (`dry_run`: the
-`review-verdict` status, `train status`) never append a row.
+`review-verdict` status) never append a row.
 
 ## A required check bound to Actions is not bound to a workflow
 
@@ -848,22 +848,12 @@ could never land. A refusal or an API error never admits
 retargeting after the run and `merge_group` forgery remain open until a
 dedicated judge App exists.
 
-## Rollups: several approved pull requests as one tested merge
+## Rollups and the merge train were removed
 
-Off unless the base's `.shipyard/config.toml` sets `[train] enabled = true`
-and `mode = "rollup"` (docs/rollups.md). `shipyard rollup plan` picks the
-oldest ready members with disjoint files; `build --members a,b --apply`
-pushes `shipyard-train/rollup-<a>`, one merge per member's exact approved
-head and nothing else; `verify --pr N` runs the guard's rule; `land --pr N`
-needs the merge method MERGE, then prints the steward handoff (merge-queue)
-or, with `--apply` (direct), merges with `sha=` bound once required checks
-pass and refuses if the base moved. Never edit a rollup branch by hand: any
-commit that is not a member merge makes the guard refuse it. A failed rollup
-is bisected with `rollup split`. A `rollup-of:` comment is a notice, never
-evidence.
+`shipyard rollup` and `shipyard train` no longer exist, and the steward no
+longer plans rollups. `[train]` and `[auto_merge.rollup]` in a base config are
+ignored; `shipyard landing` warns when a base still sets them.
 
-The steward no longer plans rollups: its JSON has no `repos[].rollup`, and
-`[auto_merge.rollup]` in a base config is ignored.
 ## A transient rerun needs the interruption signature, not a conclusion
 
 The steward's bounded rerun and the carrier's `redispatch` both rerun only a
@@ -901,32 +891,9 @@ full lane. No override lands it, neither
 the steward's native-arm backstop. Do not dispatch or label it yourself to
 get past it. See `docs/ghapp-guards.md`.
 
-## The merge train is off unless the base turns it on
+## A head that carries another PR's unapproved commits is refused
 
-`shipyard train status|metrics|pause|resume` is the merge train's read-only
-first phase (#935). It is off unless the base branch's `.shipyard/config.toml`
-sets `[train] enabled = true`, read through the API. `SHIPYARD_TRAIN=off`
-(`0` and `false` too, or `off:<owner/repo>`) and a guards-dir `train.pause`
-written by `shipyard train pause --reason` kill it on a host, whatever the config says,
-and a pause file that does not parse still pauses. Only the operator who
-paused can `train resume --reason`, and not while the env still kills; both
-are audited in `train-pauses.jsonl`. While off, `status` makes
-at most the one config read (none when killed) and records nothing, and no
-landing path consults it: the steward's managed enqueue is byte-identical
-with `[train]` absent or false (`tests/train_off.rs`). A PR's stage uses
-`head_approval`'s evaluation, carry included; never match verdict text
-yourself to decide a PR is approved. `status` evaluates approvals dry
-(`ApprovalPolicy::dry_run`), so a reported carry is never written to
-`carries.jsonl`. The goal is merges/hour and
-approved-to-merged latency, not batch size: under HEADGREEN every queue entry
-builds its own group. `train status --record` once per pass feeds
-`train metrics`, which also reports heads per merged PR (PR-head churn).
-The steward's handoff is a commit status on one head, so a clean base merge
-leaves a managed PR `HandoffMissing`; `train status` reports whether the
-newest handed-off earlier head carries to the current one under the same
-merge-only rule as an approval. The steward itself still requires the status
-on the head until the train admits PRs.
-Before it enqueues or merges a head, the steward also refuses one that carries
+Before it enqueues or merges a head, the steward refuses one that carries
 commits of another open PR whose head is not approved
 (`carries_unapproved_commits:#Q`; see `docs/automated-draining.md`). A PR stacked on P, directly or through other open PRs' branches, or one that only inherits P's commit (not in its own diff against its own base), never counts as carrying. Nor does a PR that merged P's branch: a shared commit counts only if it is on Q's first-parent chain or not on P's own first-parent chain, so P's own commits reaching Q through a merge's second parent do not hold P, while P merging held work in or building on commits on Q's own first-parent chain is still refused (residual: P built on commits Q itself merged in as a second parent is cleared; see `docs/automated-draining.md`). One stack is excused on both chains, the declared older parent: when Q declares the stack (labelled `stacked:<P>`, or reaching P through a chain of open PRs' `stacked:<n>` labels and base branches), P was opened before Q, and Q's own diff holds P's exact head, the shared commits on P's first-parent chain are P's own, so an approved parent is not held by a child that targets the base while held or unreviewed. The label never clears anything by itself, and `Supersedes #n` or the clean-replacement marker never admit P. Work P merged in is still refused, and so are the three misses, each named with its fix in the refusal detail: an undeclared Q (`not labelled stacked:P`: label it with `shipyard pr --stacked-on P` or retarget Q onto P's branch), a P opened after Q (`#P was opened after #Q`: retarget Q onto P's branch), and a Q on an older head of P's (`#Q is on an older head of #P`: merge P into Q). Residual: a Q labelled `stacked:P` whose author opened P first and reset it onto Q's held commits is cleared; the label event names who declared it. A shared commit whose change is already on the base tip under other shas does not hold P either: a non-merge commit whose `git patch-id --stable` equals a single-parent tip commit's (candidates: at most 20 tip commits touching its first changed file since its author date), or a merge whose every path differing from its first parent has an identical mode, type and blob on the tip (read tree to tree, not from a file list). The steward proves this against the tip itself and never from PR metadata; every shared commit must qualify, and any doubt, cap or read error keeps the refusal. A PR whose listing is over the 250-commit cap is judged by its own diff against its own base, and an unapproved one whose own diff is still over the cap blocks P only if probing P's commits (at most 50), or for a larger P the roots of P's commits (at most 50), cannot rule out that it carries them (`carried_commits_over_cap:#Q`). A P that is itself over the cap (a mirror-history import) is checked the other way: P's head is probed against the roots of each other open PR's own commits, so it is admitted unless it carries an unapproved PR's commit, or an unapproved PR is too large to settle.
 

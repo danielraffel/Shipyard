@@ -253,10 +253,10 @@ mod observation;
 mod poison_pause;
 #[cfg(unix)]
 mod recovery;
+#[cfg(unix)]
+mod retired_tables;
 mod scheduling_loop;
 mod superseded;
-#[cfg(unix)]
-mod train_off;
 #[cfg(unix)]
 mod transient_rerun;
 #[cfg(unix)]
