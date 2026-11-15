@@ -1360,7 +1360,6 @@ class GhappWrapperTests(unittest.TestCase):
         package.write_bytes(b"pkg fixture")
         cases = (
             ("release", "create", "v0.1.0", str(package)),
-            ("release", "delete", "v0.1.0"),
             ("release", "upload", "v0.1.0", str(package), "--tag", "v0.2.0"),
         )
         for arguments in cases:
@@ -1376,6 +1375,301 @@ class GhappWrapperTests(unittest.TestCase):
                 self.assertIn("outside privileged grammar", result.stderr)
                 self.assertFalse(self.helper_log.exists())
                 self.assertFalse(self.gh_log.exists())
+
+    # Draft-release deletion. The fake gh serves a release list from a JSON
+    # state file, answers per-id reads, and records every DELETE.
+    def install_release_api(
+        self, releases: list[dict[str, object]], *, list_fails: bool = False
+    ) -> tuple[Path, Path]:
+        state = self.root / "releases.json"
+        deletes = self.root / "release-deletes"
+        state.write_text(json.dumps(releases), encoding="utf-8")
+        self.gh.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, re, sys\n"
+            "if os.environ.get('GH_TOKEN') != 'ghs_private_fixture': sys.exit(92)\n"
+            "with open(os.environ['GH_LOG'], 'a', encoding='utf-8') as log:\n"
+            "    log.write(' '.join(sys.argv[1:]) + '\\n')\n"
+            "args = sys.argv[1:]\n"
+            "assert args[0] == 'api', args\n"
+            "state_path = os.environ['RELEASE_STATE']\n"
+            "releases = json.load(open(state_path))\n"
+            "if args[1:3] == ['-X', 'DELETE']:\n"
+            "    release_id = int(args[3].rsplit('/', 1)[1])\n"
+            "    with open(os.environ['RELEASE_DELETES'], 'a') as log:\n"
+            "        log.write(f'{release_id}\\n')\n"
+            "    json.dump([r for r in releases if r['id'] != release_id], open(state_path, 'w'))\n"
+            "    sys.exit(0)\n"
+            "if 'X' in args[1] or args[1].startswith('-'): sys.exit(64)\n"
+            "path = args[1]\n"
+            "listing = re.fullmatch(r'repos/[^/]+/[^/]+/releases\\?per_page=100&page=(\\d+)', path)\n"
+            "if listing:\n"
+            "    if os.environ.get('RELEASE_LIST_FAILS') == '1':\n"
+            "        print('gh: Not Found (HTTP 404)', file=sys.stderr)\n"
+            "        sys.exit(1)\n"
+            "    page = int(listing.group(1))\n"
+            "    print(json.dumps(releases[(page - 1) * 100:page * 100]))\n"
+            "    sys.exit(0)\n"
+            "single = re.fullmatch(r'repos/[^/]+/[^/]+/releases/(\\d+)', path)\n"
+            "if single:\n"
+            "    for release in releases:\n"
+            "        if release['id'] == int(single.group(1)):\n"
+            "            print(json.dumps(release))\n"
+            "            sys.exit(0)\n"
+            "    print('gh: Not Found (HTTP 404)', file=sys.stderr)\n"
+            "    sys.exit(1)\n"
+            "sys.exit(65)\n",
+            encoding="utf-8",
+        )
+        self.gh.chmod(0o755)
+        self.environment["RELEASE_STATE"] = str(state)
+        self.environment["RELEASE_DELETES"] = str(deletes)
+        if list_fails:
+            self.environment["RELEASE_LIST_FAILS"] = "1"
+        return state, deletes
+
+    @staticmethod
+    def release(
+        release_id: int, tag: str, *, draft: bool, prerelease: bool = False
+    ) -> dict[str, object]:
+        return {
+            "id": release_id,
+            "tag_name": tag,
+            "draft": draft,
+            "prerelease": prerelease,
+        }
+
+    def test_release_delete_removes_superseded_draft_and_keeps_tag(self) -> None:
+        _, deletes = self.install_release_api(
+            [
+                self.release(3, "v0.433.0", draft=False),
+                self.release(2, "v0.420.0", draft=True),
+                self.release(1, "v0.71.0", draft=True),
+            ]
+        )
+
+        result = self.run_wrapper(
+            "release", "delete", "v0.420.0", "--yes",
+            "--repo", "danielraffel/Shipyard",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(deletes.read_text().split(), ["2"])
+        self.assertIn("superseded by published v0.433.0", result.stdout)
+        self.assertIn("git tag v0.420.0 kept", result.stdout)
+        calls = self.gh_log.read_text().splitlines()
+        # Fresh reads of the draft and its superseder by id precede the DELETE.
+        self.assertEqual(
+            calls[-3:],
+            [
+                "api repos/danielraffel/Shipyard/releases/2",
+                "api repos/danielraffel/Shipyard/releases/3",
+                "api -X DELETE repos/danielraffel/Shipyard/releases/2",
+            ],
+        )
+        self.assertFalse(any("git/refs" in call for call in calls))
+        self.assertIn("--repo danielraffel/Shipyard", self.helper_log.read_text())
+
+    def test_release_delete_refuses_published_release(self) -> None:
+        _, deletes = self.install_release_api(
+            [
+                self.release(3, "v0.433.0", draft=False),
+                self.release(2, "v0.420.0", draft=False),
+            ]
+        )
+
+        result = self.run_wrapper(
+            "release", "delete", "v0.420.0", "--yes",
+            "--repo", "danielraffel/Shipyard",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("release v0.420.0 is published, not a draft", result.stderr)
+        self.assertFalse(deletes.exists())
+
+    def test_release_delete_refuses_prerelease_draft(self) -> None:
+        _, deletes = self.install_release_api(
+            [
+                self.release(3, "v0.433.0", draft=False),
+                self.release(2, "v0.420.0", draft=True, prerelease=True),
+            ]
+        )
+
+        result = self.run_wrapper(
+            "release", "delete", "v0.420.0", "--yes",
+            "--repo", "danielraffel/Shipyard",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("is a prerelease", result.stderr)
+        self.assertFalse(deletes.exists())
+
+    def test_release_delete_refuses_draft_without_newer_published_release(self) -> None:
+        _, deletes = self.install_release_api(
+            [
+                self.release(4, "v0.500.0", draft=True),
+                self.release(3, "v0.460.0", draft=False, prerelease=True),
+                self.release(2, "v0.440.0", draft=True),
+                self.release(1, "v0.433.0", draft=False),
+            ]
+        )
+
+        result = self.run_wrapper(
+            "release", "delete", "v0.440.0", "--yes",
+            "--repo", "danielraffel/Shipyard",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "no published, non-prerelease release with a tag newer than v0.440.0",
+            result.stderr,
+        )
+        self.assertFalse(deletes.exists())
+
+    def test_release_delete_refuses_cleanup_tag_before_token_mint(self) -> None:
+        for flag in ("--cleanup-tag", "--cleanup-tag=true"):
+            with self.subTest(flag=flag):
+                result = self.run_wrapper(
+                    "release", "delete", "v0.420.0", "--yes", flag,
+                    "--repo", "danielraffel/Shipyard",
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("never deletes the git tag", result.stderr)
+                self.assertFalse(self.helper_log.exists())
+                self.assertFalse(self.gh_log.exists())
+
+    def test_release_delete_refuses_unreadable_release_list(self) -> None:
+        _, deletes = self.install_release_api(
+            [self.release(3, "v0.433.0", draft=False)], list_fails=True
+        )
+
+        result = self.run_wrapper(
+            "release", "delete", "v0.420.0", "--yes",
+            "--repo", "danielraffel/Shipyard",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("release list for danielraffel/Shipyard is unreadable", result.stderr)
+        self.assertFalse(deletes.exists())
+
+    def test_release_delete_refuses_when_fresh_read_is_unreadable(self) -> None:
+        state, deletes = self.install_release_api(
+            [
+                self.release(3, "v0.433.0", draft=False),
+                self.release(2, "v0.420.0", draft=True),
+            ]
+        )
+        # The per-id read answers 404 (the release vanished or is hidden).
+        self.gh.write_text(
+            self.gh.read_text().replace(
+                "single = re.fullmatch", "single = None and re.fullmatch"
+            ),
+            encoding="utf-8",
+        )
+
+        result = self.run_wrapper(
+            "release", "delete", "v0.420.0", "--yes",
+            "--repo", "danielraffel/Shipyard",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("release id 2 is unreadable", result.stderr)
+        self.assertFalse(deletes.exists())
+
+    def test_release_delete_refuses_malformed_arguments_before_token_mint(self) -> None:
+        cases = (
+            (("release", "delete", "v0.420.0", "--repo", "danielraffel/Shipyard"),
+             "requires --yes"),
+            (("release", "delete", "nightly", "--yes", "--repo", "danielraffel/Shipyard"),
+             "is not a plain semver tag"),
+            (("release", "delete", "v1.2.3-rc.1", "--yes", "--repo", "danielraffel/Shipyard"),
+             "is not a plain semver tag"),
+            (("release", "delete", "v0.420.0", "--yes"),
+             "requires exactly one explicit --repo"),
+            (("release", "delete", "v0.420.0", "--yes", "--repo", "a/b", "--repo", "c/d"),
+             "requires exactly one explicit --repo"),
+            (("release", "delete", "v0.420.0", "--yes", "--repo", "github.com/a/b"),
+             "must be an exact OWNER/REPO slug"),
+            (("release", "delete", "v0.420.0", "v0.421.0", "--yes", "--repo", "a/b"),
+             "takes exactly one tag"),
+            (("release", "delete", "v0.420.0", "--yes", "--apply", "--repo", "a/b"),
+             "does not take --apply"),
+            (("release", "prune-drafts", "--yes", "--repo", "a/b"),
+             "takes --apply, not --yes"),
+            (("release", "prune-drafts", "--apply", "--dry-run", "--repo", "a/b"),
+             "contradict"),
+            (("release", "prune-drafts", "v1.0.0", "--repo", "a/b"),
+             "takes no positional arguments"),
+            (("release", "prune-drafts", "--cleanup-tag", "--repo", "a/b"),
+             "never deletes the git tag"),
+        )
+        for arguments, reason in cases:
+            with self.subTest(arguments=arguments):
+                self.helper_log.unlink(missing_ok=True)
+                self.gh_log.unlink(missing_ok=True)
+                result = self.run_wrapper(*arguments)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(reason, result.stderr)
+                self.assertFalse(self.helper_log.exists())
+                self.assertFalse(self.gh_log.exists())
+
+    def test_release_prune_drafts_dry_run_lists_decisions_without_writing(self) -> None:
+        releases = [
+            self.release(9, "v0.433.0", draft=False),
+            self.release(8, "v0.440.0", draft=True),
+            self.release(7, "v0.420.0", draft=True),
+            self.release(6, "v0.300.0", draft=True, prerelease=True),
+            self.release(5, "nightly", draft=True),
+            self.release(4, "v0.71.0", draft=True),
+        ]
+        state, deletes = self.install_release_api(releases)
+
+        result = self.run_wrapper(
+            "release", "prune-drafts", "--repo", "danielraffel/Shipyard"
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("dry run; pass --apply to delete", result.stdout)
+        self.assertIn(
+            "would-delete v0.71.0 (id 4): superseded by published v0.433.0",
+            result.stdout,
+        )
+        self.assertIn("would-delete v0.420.0 (id 7)", result.stdout)
+        self.assertIn("keep v0.440.0 (id 8): no published", result.stdout)
+        self.assertIn("keep v0.300.0 (id 6): release v0.300.0 is a prerelease", result.stdout)
+        self.assertIn("keep nightly (id 5): tag 'nightly' is not a plain semver", result.stdout)
+        self.assertIn("would delete 2 of 5 draft(s); kept 3", result.stdout)
+        self.assertFalse(deletes.exists())
+        self.assertFalse(
+            any("DELETE" in call for call in self.gh_log.read_text().splitlines())
+        )
+        self.assertEqual(json.loads(state.read_text()), releases)
+
+        explicit = self.run_wrapper(
+            "release", "prune-drafts", "--dry-run", "--repo", "danielraffel/Shipyard"
+        )
+        self.assertEqual(explicit.returncode, 0, explicit.stderr)
+        self.assertFalse(deletes.exists())
+
+    def test_release_prune_drafts_apply_deletes_only_superseded_drafts(self) -> None:
+        _, deletes = self.install_release_api(
+            [
+                self.release(9, "v0.433.0", draft=False),
+                self.release(8, "v0.440.0", draft=True),
+                self.release(7, "v0.420.0", draft=True),
+                self.release(4, "v0.71.0", draft=True),
+            ]
+        )
+
+        result = self.run_wrapper(
+            "release", "prune-drafts", "--apply", "--repo", "danielraffel/Shipyard"
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(sorted(deletes.read_text().split()), ["4", "7"])
+        self.assertIn("deleted v0.71.0 (id 4)", result.stdout)
+        self.assertIn("keep v0.440.0 (id 8)", result.stdout)
+        self.assertIn("deleted 2 of 3 draft(s); kept 1", result.stdout)
 
     def test_untrusted_repo_host_fails_before_token_mint(self) -> None:
         result = self.run_wrapper(

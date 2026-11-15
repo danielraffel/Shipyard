@@ -2501,8 +2501,14 @@ GitHub permission change from a mismatch line. See `docs/github-app-quota.md`.
 
 The one bounded asset-publication exception is `ghapp release upload`: require
 an explicit exact repository, tag, and existing non-symlink regular files. It
-does not admit native `--clobber`, release creation/deletion, or tag
-retargeting. Its explicit `--replace-existing` flag is translated to native
+does not admit native `--clobber`, release creation, or tag retargeting.
+Release deletion is limited to superseded drafts: `ghapp release delete <tag>
+--yes --repo OWNER/REPO` deletes a draft, non-prerelease release only when a
+published, non-prerelease release with a strictly higher semver tag exists in
+the same repository, re-reads both by id first, keeps the git tag and refuses
+`--cleanup-tag`. `ghapp release prune-drafts --repo OWNER/REPO` applies that
+rule to every draft and prints each decision; it is a dry run unless `--apply`.
+Each refusal names its reason (`docs/ghapp-guards.md`). Its explicit `--replace-existing` flag is translated to native
 `--clobber` only after those checks, for workflows that replace a staged
 checksum or signed asset in an existing draft release.
 `scripts/release_macos_local.py` must invoke the installed `ghapp` wrapper for

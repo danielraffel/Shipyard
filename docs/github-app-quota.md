@@ -355,8 +355,8 @@ for interactive operator commands outside it.
 
 `release upload` is a deliberately narrower publication surface than native
 `gh`: it requires exactly one explicit `--repo OWNER/REPO`, one exact tag, and
-one or more existing non-symlink regular-file operands. It cannot create or
-delete a release or retarget a tag. The explicit `--replace-existing` flag is
+one or more existing non-symlink regular-file operands. It cannot create a
+release or retarget a tag. The explicit `--replace-existing` flag is
 the only overwrite capability; it is translated to native `--clobber` only
 after the same exact-tag, repository, and stable-file checks, while native
 `--clobber` remains outside the privileged grammar.

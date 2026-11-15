@@ -820,13 +820,116 @@ if [[ "${1:-}" == "release" && "${2:-}" == "upload" ]]; then
     unset release_upload_filtered release_upload_argument
 fi
 
+# `release delete` and `release prune-drafts` are Shipyard-only capabilities,
+# not native gh grammar. They delete only a DRAFT release that a published,
+# non-prerelease release with a strictly higher semver tag supersedes, and
+# never the git tag. The arguments are parsed completely here, before token
+# mint, and rewritten to a flag-free form; the live checks and the REST calls
+# run after the token is minted (see release_draft_delete_run below).
+release_draft_mode=""
+release_draft_tag=""
+release_draft_apply=0
+if [[ "${1:-}" == "release" && ( "${2:-}" == "delete" || "${2:-}" == "prune-drafts" ) ]]; then
+    release_draft_mode="$2"
+    release_draft_repo=""
+    release_draft_repo_count=0
+    release_draft_repo_pending=0
+    release_draft_yes=0
+    release_draft_dry_run=0
+    release_draft_positionals=()
+    for release_draft_argument in "${@:3}"; do
+        if [[ "$release_draft_repo_pending" == 1 ]]; then
+            release_draft_repo="$release_draft_argument"
+            release_draft_repo_pending=0
+            continue
+        fi
+        case "$release_draft_argument" in
+            --repo|-R)
+                release_draft_repo_pending=1
+                release_draft_repo_count=$((release_draft_repo_count + 1))
+                ;;
+            --repo=*)
+                release_draft_repo="${release_draft_argument#--repo=}"
+                release_draft_repo_count=$((release_draft_repo_count + 1))
+                ;;
+            --cleanup-tag|--cleanup-tag=*)
+                echo "ghapp: refused: release $release_draft_mode never deletes the git tag; --cleanup-tag is not accepted" >&2
+                exit 1
+                ;;
+            -y|--yes)
+                if [[ "$release_draft_mode" != "delete" ]]; then
+                    echo "ghapp: refused: release prune-drafts takes --apply, not $release_draft_argument" >&2
+                    exit 1
+                fi
+                release_draft_yes=1
+                ;;
+            --apply|--dry-run)
+                if [[ "$release_draft_mode" != "prune-drafts" ]]; then
+                    echo "ghapp: refused: release delete does not take $release_draft_argument" >&2
+                    exit 1
+                fi
+                if [[ "$release_draft_argument" == "--apply" ]]; then
+                    release_draft_apply=1
+                else
+                    release_draft_dry_run=1
+                fi
+                ;;
+            -*)
+                echo "ghapp: refused: option $release_draft_argument is not accepted by release $release_draft_mode" >&2
+                exit 1
+                ;;
+            *)
+                release_draft_positionals+=("$release_draft_argument")
+                ;;
+        esac
+    done
+    if [[ "$release_draft_repo_pending" == 1 || "$release_draft_repo_count" != 1 ]]; then
+        echo "ghapp: refused: release $release_draft_mode requires exactly one explicit --repo OWNER/REPO selector" >&2
+        exit 1
+    fi
+    if [[ ! "$release_draft_repo" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_.-]{1,100}$ || \
+          "$release_draft_repo" == */. || "$release_draft_repo" == */.. ]]; then
+        echo "ghapp: refused: release $release_draft_mode --repo must be an exact OWNER/REPO slug" >&2
+        exit 1
+    fi
+    if [[ "$release_draft_mode" == "delete" ]]; then
+        if [[ "${#release_draft_positionals[@]}" != 1 ]]; then
+            echo "ghapp: refused: release delete takes exactly one tag" >&2
+            exit 1
+        fi
+        release_draft_tag="${release_draft_positionals[0]}"
+        if [[ ! "$release_draft_tag" =~ ^v?(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})$ ]]; then
+            echo "ghapp: refused: tag $(printf '%q' "$release_draft_tag") is not a plain semver tag (vMAJOR.MINOR.PATCH)" >&2
+            exit 1
+        fi
+        if [[ "$release_draft_yes" != 1 ]]; then
+            echo "ghapp: refused: release delete requires --yes" >&2
+            exit 1
+        fi
+        set -- release delete "$release_draft_tag" --repo "$release_draft_repo"
+    else
+        if [[ "${#release_draft_positionals[@]}" != 0 ]]; then
+            echo "ghapp: refused: release prune-drafts takes no positional arguments" >&2
+            exit 1
+        fi
+        if [[ "$release_draft_apply" == 1 && "$release_draft_dry_run" == 1 ]]; then
+            echo "ghapp: refused: --apply and --dry-run contradict each other" >&2
+            exit 1
+        fi
+        set -- release prune-drafts --repo "$release_draft_repo"
+    fi
+    unset release_draft_repo_count release_draft_repo_pending
+    unset release_draft_yes release_draft_dry_run release_draft_positionals
+    unset release_draft_argument
+fi
+
 command_name="${1:-}"
 subcommand_name="$(grammar_subcommand "$command_name" "${2:-}")"
 if [[ "$command_name" == "pr" && "${2:-}" == "edit" ]]; then
     pr_edit_equivalent "${@:3}"
     exit 1
 fi
-if ! grammar_has surface "$command_name" "$subcommand_name"; then
+if [[ -z "$release_draft_mode" ]] && ! grammar_has surface "$command_name" "$subcommand_name"; then
     echo "ghapp: command is outside privileged grammar $GHAPP_COMMAND_GRAMMAR_VERSION" >&2
     exit 1
 fi
@@ -2049,6 +2152,208 @@ fi
 # `hold-disarms` on). A HOLD on an already-armed head otherwise merged anyway.
 if [[ -x "$guards/verdict-hold-hook" ]]; then
     PATH="$trusted_path" "$guards/verdict-hold-hook" "$@" || true
+fi
+
+# Draft-only release deletion. Everything is decided from a fresh, complete
+# read of the repository's releases with the token minted above, and every
+# deletion re-reads both the draft and the release that supersedes it by id
+# immediately before the REST DELETE. Deleting a release object never deletes
+# its git tag. Any read that fails or returns something unexpected refuses.
+if [[ -n "$release_draft_mode" ]]; then
+    if [[ "$repo" != "$release_draft_repo" ]]; then
+        echo "ghapp: refused: release $release_draft_mode repository binding changed during routing" >&2
+        exit 1
+    fi
+    set +e
+    /usr/bin/env -u PYTHONHOME -u PYTHONPATH PATH="$trusted_path" \
+        "$python_binary" -I - "$gh_binary" "$repo" "$release_draft_mode" \
+        "$release_draft_tag" "$release_draft_apply" <<'PY'
+import json, re, subprocess, sys
+
+gh, repo, mode, wanted_tag, apply_flag = sys.argv[1:6]
+SEMVER = re.compile(r"v?(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})")
+PAGE_SIZE = 100
+MAX_PAGES = 50
+
+
+class Refusal(Exception):
+    pass
+
+
+def semver(tag):
+    match = SEMVER.fullmatch(tag) if isinstance(tag, str) else None
+    return tuple(int(part) for part in match.groups()) if match else None
+
+
+def api(*arguments):
+    try:
+        result = subprocess.run(
+            [gh, "api", *arguments],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise Refusal(f"GitHub API call failed: {error}")
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip().splitlines()
+        raise Refusal(
+            "GitHub API call failed"
+            + (f": {detail[-1][:200]}" if detail else f" (exit {result.returncode})")
+        )
+    return result.stdout
+
+
+def read_json(*arguments):
+    try:
+        return json.loads(api(*arguments))
+    except json.JSONDecodeError:
+        raise Refusal("GitHub API returned malformed JSON")
+
+
+def well_formed(release):
+    return (
+        isinstance(release, dict)
+        and type(release.get("id")) is int
+        and release["id"] > 0
+        and isinstance(release.get("tag_name"), str)
+        and type(release.get("draft")) is bool
+        and type(release.get("prerelease")) is bool
+    )
+
+
+def list_releases():
+    releases = []
+    for page in range(1, MAX_PAGES + 1):
+        try:
+            batch = read_json(
+                f"repos/{repo}/releases?per_page={PAGE_SIZE}&page={page}"
+            )
+        except Refusal as error:
+            raise Refusal(f"the release list for {repo} is unreadable ({error})")
+        if not isinstance(batch, list) or not all(well_formed(item) for item in batch):
+            raise Refusal(f"the release list for {repo} is malformed")
+        releases.extend(batch)
+        if len(batch) < PAGE_SIZE:
+            return releases
+    raise Refusal(f"{repo} has more than {PAGE_SIZE * MAX_PAGES} releases; the list is incomplete")
+
+
+def published_supersedes(release):
+    return not release["draft"] and not release["prerelease"]
+
+
+def decide(draft, releases):
+    """Return the superseding published release, or raise Refusal."""
+    tag = draft["tag_name"]
+    version = semver(tag)
+    if version is None:
+        raise Refusal(f"tag {tag!r} is not a plain semver tag (vMAJOR.MINOR.PATCH)")
+    if not draft["draft"]:
+        raise Refusal(f"release {tag} is published, not a draft")
+    if draft["prerelease"]:
+        raise Refusal(f"release {tag} is a prerelease")
+    same_tag = [item for item in releases if item["tag_name"] == tag]
+    if len(same_tag) != 1:
+        raise Refusal(f"{len(same_tag)} releases carry tag {tag}; refusing to guess which one")
+    newer = [
+        item
+        for item in releases
+        if published_supersedes(item)
+        and semver(item["tag_name"]) is not None
+        and semver(item["tag_name"]) > version
+    ]
+    if not newer:
+        raise Refusal(f"no published, non-prerelease release with a tag newer than {tag} exists")
+    return max(newer, key=lambda item: semver(item["tag_name"]))
+
+
+def fresh(release_id):
+    try:
+        value = read_json(f"repos/{repo}/releases/{release_id}")
+    except Refusal as error:
+        raise Refusal(f"release id {release_id} is unreadable ({error})")
+    if not well_formed(value) or value["id"] != release_id:
+        raise Refusal(f"release id {release_id} read back malformed")
+    return value
+
+
+def delete(draft, superseder):
+    tag = draft["tag_name"]
+    current = fresh(draft["id"])
+    if current["tag_name"] != tag or not current["draft"] or current["prerelease"]:
+        raise Refusal(f"release {tag} changed since it was listed; it is no longer a plain draft")
+    newer = fresh(superseder["id"])
+    if (
+        newer["tag_name"] != superseder["tag_name"]
+        or not published_supersedes(newer)
+    ):
+        raise Refusal(f"release {superseder['tag_name']} changed since it was listed; it no longer supersedes {tag}")
+    # DELETE /releases/{id} removes the release object only; the tag stays.
+    api("-X", "DELETE", f"repos/{repo}/releases/{draft['id']}")
+
+
+try:
+    releases = list_releases()
+except Refusal as error:
+    print(f"ghapp: refused: {error}", file=sys.stderr)
+    sys.exit(1)
+
+if mode == "delete":
+    try:
+        matches = [item for item in releases if item["tag_name"] == wanted_tag]
+        if not matches:
+            raise Refusal(f"no release with tag {wanted_tag} exists in {repo}")
+        if len(matches) != 1:
+            raise Refusal(f"{len(matches)} releases carry tag {wanted_tag}; refusing to guess which one")
+        draft = matches[0]
+        superseder = decide(draft, releases)
+        delete(draft, superseder)
+    except Refusal as error:
+        print(f"ghapp: refused: {error}", file=sys.stderr)
+        sys.exit(1)
+    print(
+        f"ghapp: deleted draft release {wanted_tag} (id {draft['id']}) in {repo}; "
+        f"superseded by published {superseder['tag_name']}; git tag {wanted_tag} kept"
+    )
+    sys.exit(0)
+
+applying = apply_flag == "1"
+drafts = sorted(
+    (item for item in releases if item["draft"]),
+    key=lambda item: (semver(item["tag_name"]) or (-1, -1, -1), item["tag_name"], item["id"]),
+)
+print(f"ghapp: release prune-drafts {repo}: {len(drafts)} draft(s), "
+      + ("applying" if applying else "dry run; pass --apply to delete"))
+failures = 0
+eligible = 0
+for draft in drafts:
+    label = f"{draft['tag_name'] or '<untagged>'} (id {draft['id']})"
+    try:
+        superseder = decide(draft, releases)
+    except Refusal as error:
+        print(f"keep {label}: {error}")
+        continue
+    eligible += 1
+    if not applying:
+        print(f"would-delete {label}: superseded by published {superseder['tag_name']}; tag kept")
+        continue
+    try:
+        delete(draft, superseder)
+    except Refusal as error:
+        failures += 1
+        print(f"failed {label}: {error}")
+        continue
+    print(f"deleted {label}: superseded by published {superseder['tag_name']}; tag kept")
+verb = "deleted" if applying else "would delete"
+print(f"ghapp: {verb} {eligible - failures} of {len(drafts)} draft(s); kept {len(drafts) - eligible}"
+      + (f"; {failures} failed" if failures else ""))
+sys.exit(1 if failures else 0)
+PY
+    release_draft_status=$?
+    set -e
+    exit "$release_draft_status"
 fi
 
 if [[ "${1:-}" == "release" && "${2:-}" == "upload" && \

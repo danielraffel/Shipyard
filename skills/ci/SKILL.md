@@ -1987,8 +1987,12 @@ The bounded App-authenticated publication exception is
 existing release, stable private snapshots of non-symlink regular files, and
 an explicit repository. `--replace-existing` is the sole bounded overwrite
 flag, translated to native `--clobber` only after those checks; native
-`--clobber`, lifecycle creation/deletion, and tag retargeting remain outside
-the privileged grammar.
+`--clobber`, release creation, and tag retargeting remain outside the
+privileged grammar. The only deletion is `ghapp release delete <tag> --yes
+--repo OWNER/REPO` (or `ghapp release prune-drafts --repo OWNER/REPO`, a dry
+run unless `--apply`): it removes a draft, non-prerelease release only when a
+published release with a strictly higher semver tag exists, never deletes the
+git tag, and refuses `--cleanup-tag`. See `docs/ghapp-guards.md`.
 The local macOS release script calls `ghapp` for both signed-asset and
 checksum uploads; native `gh` rejects the wrapper-only replacement flag.
 It resolves the absolute wrapper from the runner process account's home, not

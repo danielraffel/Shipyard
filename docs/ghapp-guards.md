@@ -1238,6 +1238,52 @@ refusal names the other's allowed path: the arm guard's same-head refusal points
 at `gh pr update-branch <n>`, and the refresh guard's refusal says a same-head
 queue removal is refreshable.
 
+## Deleting superseded draft releases
+
+Native `gh release delete` is outside the privileged grammar. `ghapp` instead
+has two Shipyard-only commands that remove a draft release only when a
+published release has superseded it:
+
+```
+ghapp release delete <tag> --yes --repo OWNER/REPO
+ghapp release prune-drafts --repo OWNER/REPO [--dry-run | --apply]
+```
+
+A draft is deletable when all of these hold, read with the minted App token
+just before the decision:
+
+- the complete release list for the repository reads cleanly (every page, every
+  entry with an integer `id`, a string `tag_name` and boolean `draft` and
+  `prerelease`);
+- exactly one release carries the tag, and it is `draft: true` and
+  `prerelease: false`;
+- the tag is plain semver, `vMAJOR.MINOR.PATCH` or `MAJOR.MINOR.PATCH`;
+- a release with `draft: false`, `prerelease: false` and a strictly higher
+  plain-semver tag exists in the same repository.
+
+Immediately before the `DELETE /repos/OWNER/REPO/releases/<id>` call, the wrapper
+reads both the draft and the superseding release again by id and refuses if
+either changed. That REST call removes only the release object, so the git tag
+always stays; `--cleanup-tag` is refused, and no `git/refs` endpoint is ever
+called.
+
+Everything about the arguments is checked before a token is minted: exactly one
+explicit `--repo OWNER/REPO` slug (no host, no environment or checkout
+binding), one plain-semver tag, and `--yes` for `release delete`. Any other
+option is refused. The repository must also be one a Shipyard App installation
+covers, since the token is minted for that exact slug; there is no separate
+list. Every refusal starts with `ghapp: refused:` and names the reason (a
+published release, a prerelease, no newer published release, several releases
+with one tag, an unreadable list or release, a non-semver tag, a missing
+`--yes`, `--cleanup-tag`).
+
+`release prune-drafts` applies the same rule to every draft and prints one
+line per draft: `would-delete`, `deleted`, `keep` (with the reason) or `failed`
+(with the reason), then a total. It is a dry run unless `--apply` is passed,
+matching `shipyard cloud retarget` and `add-lane`; `--dry-run` is accepted to
+say so explicitly. With `--apply` it exits 1 if any deletion failed, and each
+deletion repeats the fresh by-id reads.
+
 ## Overrides and bypasses
 
 | variable | who sets it | effect |
