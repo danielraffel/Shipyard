@@ -273,6 +273,7 @@ fn a_stacked_pull_request_waits_for_its_open_parent() {
     let temp = tempfile::tempdir().expect("temp");
     let log = temp.path().join("calls");
     let no_parent = r#"  *"pr list --repo owner/repo --head feat/parent"*) printf '%s' '[]' ;;
+  *"rules/branches/feat%2Fparent"*) printf '%s' '[[]]' ;;
 "#;
     let body = script(
         &log,
@@ -288,6 +289,135 @@ fn a_stacked_pull_request_waits_for_its_open_parent() {
             .as_str()
             .is_some_and(|action| action.contains("retarget this pull request to `main` now")),
         "{snapshot:#}"
+    );
+}
+
+fn release_snapshot(rules_case: &str) -> (Value, String) {
+    let temp = tempfile::tempdir().expect("temp");
+    let log = temp.path().join("calls");
+    let body = script(
+        &log,
+        &pr_row("OPEN", "release/v1.0.10", "CLEAN", 3, &green_rollup()),
+        "",
+        rules_case,
+    );
+    read_snapshot(&temp, &body)
+}
+
+fn release_rules(contexts: &str) -> String {
+    format!(
+        r#"  *"rules/branches/release%2Fv1.0.10"*) printf '%s' '[[{{"type":"required_status_checks","ruleset_id":5,"parameters":{{"required_status_checks":[{contexts}]}}}}]]' ;;
+"#
+    )
+}
+
+fn assert_release_stop(snapshot: &Value) {
+    assert_eq!(
+        snapshot["blocked_on"], "release_base:release/v1.0.10",
+        "{snapshot:#}"
+    );
+    assert_eq!(snapshot["actionable"], true);
+    assert_eq!(snapshot["next_action"]["actor"], "owner", "{snapshot:#}");
+    assert_eq!(snapshot["next_action"]["stop"], true);
+    let action = snapshot["next_action"]["action"].as_str().expect("action");
+    assert!(
+        action.starts_with("stop: no standing review path for base `release/v1.0.10`"),
+        "{action}"
+    );
+    assert!(action.contains("Don't retarget to `main`"), "{action}");
+    assert!(!action.contains("retarget this pull request"), "{action}");
+}
+
+/// A release refresh (spectr 348, 2026-11-15): a `release/*` base is a
+/// release base, not a stack, and always the owner's stop. Its pattern
+/// decides it, so neither the parent lookup nor its rules are read.
+#[cfg(unix)]
+#[test]
+fn a_release_base_stops_with_the_landing_path_and_is_never_a_stack() {
+    let (snapshot, calls) = release_snapshot("");
+    assert_release_stop(&snapshot);
+    assert!(!calls.contains("pr list"), "{calls}");
+    assert!(!calls.contains("rules/branches"), "{calls}");
+}
+
+/// The standing reviewer does not review release bases (fleet-handbook
+/// #140, parked), so rules that require a review context, or rules that
+/// cannot be read, still give the stop, never a reviewer wait.
+#[cfg(unix)]
+#[test]
+fn a_release_base_stops_whatever_its_rules_say() {
+    for rules in [
+        release_rules(r#"{"context":"review-verdict"}"#),
+        release_rules(r#"{"context":"release-path-review"}"#),
+        r#"  *"rules/branches/release%2Fv1.0.10"*) echo 'HTTP 502: Bad Gateway' >&2; exit 1 ;;
+"#
+        .to_owned(),
+    ] {
+        assert_release_stop(&release_snapshot(&rules).0);
+    }
+}
+
+/// A base no pattern names is a release base when a ruleset that names it
+/// protects it; a repo-wide (`~ALL`) ruleset does not make an orphan stack a
+/// release base, and an unreadable ruleset is an error, never the retarget
+/// advice.
+#[cfg(unix)]
+#[test]
+fn a_ruleset_that_names_the_base_makes_it_a_release_base_but_a_repo_wide_one_does_not() {
+    let cases = |include: &str| {
+        format!(
+            r#"  *"pr list --repo owner/repo --head stable"*) printf '%s' '[]' ;;
+  *"rules/branches/stable"*) printf '%s' '[[{{"type":"pull_request","ruleset_id":9}}]]' ;;
+  *"rulesets/9"*) printf '%s' '{{"id":9,"conditions":{{"ref_name":{{"include":[{include}],"exclude":[]}}}}}}' ;;
+"#
+        )
+    };
+    let read = |include: &str| {
+        let temp = tempfile::tempdir().expect("temp");
+        let log = temp.path().join("calls");
+        let body = script(
+            &log,
+            &pr_row("OPEN", "stable", "CLEAN", 3, &green_rollup()),
+            "",
+            &cases(include),
+        );
+        read_snapshot(&temp, &body).0
+    };
+    let named = read(r#""refs/heads/stable""#);
+    assert_eq!(named["blocked_on"], "release_base:stable", "{named:#}");
+    assert_eq!(named["next_action"]["stop"], true);
+    let repo_wide = read(r#""~ALL""#);
+    assert_eq!(
+        repo_wide["blocked_on"], "stacked_on:stable",
+        "{repo_wide:#}"
+    );
+    assert_eq!(repo_wide["next_action"]["actor"], "author");
+
+    let temp = tempfile::tempdir().expect("temp");
+    let log = temp.path().join("calls");
+    let unreadable = r#"  *"pr list --repo owner/repo --head stable"*) printf '%s' '[]' ;;
+  *"rules/branches/stable"*) echo 'HTTP 502: Bad Gateway' >&2; exit 1 ;;
+"#;
+    let body = script(
+        &log,
+        &pr_row("OPEN", "stable", "CLEAN", 3, &green_rollup()),
+        "",
+        unreadable,
+    );
+    let actions = fake_gh(&temp, &body);
+    let state_dir = temp.path().join("state");
+    fs::create_dir_all(&state_dir).expect("state dir");
+    let error = pr_next_action_snapshot(
+        &actions,
+        &state_dir,
+        &temp.path().join("global"),
+        "owner/repo",
+        42,
+    )
+    .expect_err("an unreadable ruleset fails closed");
+    assert!(
+        error.contains("could not classify base `stable`"),
+        "{error}"
     );
 }
 

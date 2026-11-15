@@ -32,9 +32,23 @@ no model call, starts a pass when a pull request becomes reviewable, or queues o
 Kick a pass by hand only once the checks are green, because the queue skips anything else.
 See `docs/automated-draining.md`.
 
+## Release bases are not stacks
+
+A pull request on a release base (`[merge_steward] release_bases`, default
+`["release/*"]`, or a base a ruleset that names it protects) reads
+`blocked_on: release_base:<base>`, never `stacked_on`, and is never told to
+retarget to the default branch. Whatever its rules require, the next action
+is `owner`, `stop: true`: the coordinator or owner lands the release branch.
+The standing reviewer does not review release bases (verdicts are head-bound,
+so an approval would survive a retarget); the review wait returns only once a
+non-main reviewer path exists (fleet-handbook PR 140, parked).
+`shipyard pr --base release/...` prints this before opening and proceeds
+without `--stacked-on`.
+
 ## PR stacking and admission
 
-`shipyard pr` requires `--stacked-on <n>` for a non-default base, and the
+`shipyard pr` requires `--stacked-on <n>` for a non-default base that is not
+a release base or an integration base, and the
 parent must be an open pull request in the same repository whose head is the
 requested base branch. The `stacked:<n>` label is a repair-lane marker only:
 the steward's carried-commit guard judges a labelled stack like any other open
