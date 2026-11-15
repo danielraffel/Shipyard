@@ -974,18 +974,26 @@ fn a_templated_job_name_produces_a_context_with_its_prefix() {
 #[test]
 fn an_older_host_gets_the_fix_release_and_an_eta() {
     let hint = fix_hint(PRODUCER, "0.432.0", now(), || Some("v0.434.0".to_owned()))
-        .expect("known invariant");
+        .expect("known invariant")
+        .0;
     assert!(hint.contains("ships in v0.433.0"), "{hint}");
     assert!(hint.contains("host on v0.432.0"), "{hint}");
     assert!(hint.contains("ETA 12:30Z"), "{hint}");
+    let token = fix_hint(PRODUCER, "0.432.0", now(), || Some("v0.434.0".to_owned()))
+        .expect("known invariant")
+        .1;
+    assert_eq!(token, "fix#1382@v0.433.0,host=v0.432.0,eta=12:30Z");
 }
 
 #[test]
 fn without_a_published_fix_the_eta_is_unknown() {
     let hint = fix_hint(PRODUCER, "0.432.0", now(), || Some("v0.432.1".to_owned()))
-        .expect("known invariant");
+        .expect("known invariant")
+        .0;
     assert!(hint.contains("ETA unknown"), "{hint}");
-    let hint = fix_hint(PRODUCER, "0.432.0", now(), || None).expect("known invariant");
+    let hint = fix_hint(PRODUCER, "0.432.0", now(), || None)
+        .expect("known invariant")
+        .0;
     assert!(hint.contains("ETA unknown"), "{hint}");
 }
 
@@ -993,7 +1001,8 @@ fn without_a_published_fix_the_eta_is_unknown() {
 fn a_host_at_or_past_the_fix_says_the_failure_is_real_without_a_read() {
     for running in ["0.433.0", "0.500.1"] {
         let hint = fix_hint(PRODUCER, running, now(), || panic!("no release read"))
-            .expect("known invariant");
+            .expect("known invariant")
+            .0;
         assert!(hint.contains("failure is real"), "{hint}");
     }
 }

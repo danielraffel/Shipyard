@@ -149,6 +149,9 @@ pub(crate) struct Invariant {
     /// it and when this host should have it. See [`fix_hint`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fix_hint: Option<String>,
+    /// [`fix_hint`] as one space-free token for the tick's summary line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fix_hint_token: Option<String>,
 }
 
 impl Invariant {
@@ -241,28 +244,43 @@ pub(crate) fn fix_hint(
     running: &str,
     now: DateTime<Utc>,
     latest: impl FnOnce() -> Option<String>,
-) -> Option<String> {
+) -> Option<(String, String)> {
     let &(_, reference, fixed) = KNOWN_FIXES.iter().find(|(known, _, _)| *known == id)?;
+    let number = reference.split_whitespace().next()?;
     let fixed_version = parse_version(fixed)?;
     let running_version = parse_version(running)?;
     if running_version >= fixed_version {
-        return Some(format!(
-            "fix {reference} is present (host on v{running}, fix in v{fixed}); failure is real"
+        return Some((
+            format!(
+                "fix {reference} is present (host on v{running}, fix in v{fixed}); failure is real"
+            ),
+            format!("fix{number}@v{fixed},host=v{running},real"),
         ));
     }
     let published = latest()
         .and_then(|tag| parse_version(&tag))
         .is_some_and(|tag| tag >= fixed_version);
+    let eta_time = (now + chrono::Duration::minutes(HOST_FRESHNESS_MINUTES))
+        .format("%H:%MZ")
+        .to_string();
+    let token = format!(
+        "fix{number}@v{fixed},host=v{running},eta={}",
+        if published {
+            eta_time.as_str()
+        } else {
+            "unknown"
+        }
+    );
     let eta = if published {
         format!(
-            "ETA {} (a release with the fix is published; assumes the host's {HOST_FRESHNESS_MINUTES} min tool-freshness interval)",
-            (now + chrono::Duration::minutes(HOST_FRESHNESS_MINUTES)).format("%H:%MZ")
+            "ETA {eta_time} (a release with the fix is published; assumes the host's {HOST_FRESHNESS_MINUTES} min tool-freshness interval)"
         )
     } else {
         "ETA unknown (no published release with the fix yet)".to_owned()
     };
-    Some(format!(
-        "fix {reference} ships in v{fixed}; host on v{running}; {eta}"
+    Some((
+        format!("fix {reference} ships in v{fixed}; host on v{running}; {eta}"),
+        token,
     ))
 }
 
@@ -277,7 +295,7 @@ fn attach_fix_hints(
 ) {
     let mut cached: Option<Option<String>> = None;
     for invariant in invariants.iter_mut().filter(|row| row.incident()) {
-        invariant.fix_hint = fix_hint(&invariant.id, running, now, || {
+        let hint = fix_hint(&invariant.id, running, now, || {
             cached
                 .get_or_insert_with(|| {
                     let raw = actions
@@ -291,6 +309,10 @@ fn attach_fix_hints(
                 })
                 .clone()
         });
+        if let Some((text, token)) = hint {
+            invariant.fix_hint = Some(text);
+            invariant.fix_hint_token = Some(token);
+        }
     }
 }
 
