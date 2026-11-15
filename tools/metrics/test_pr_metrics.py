@@ -97,6 +97,14 @@ class Autonomy(Base):
         a = out["repos"][REPO]["per_day"]["2026-11-10"]["autonomous"]
         self.assertEqual((a["unknown"], a["rate_pct"]), (1, 100.0))  # rate is over determinable PRs only
 
+    def test_version_bump_trailer_marks_agent_work_and_github_only_ignores_commits(self):
+        cm = {1: [commit("c1", OWNER, "chore\n\nVersion-Bump: cli=skip reason=x")], 2: [commit("c2", OWNER, "by hand")]}
+        out = self.build(world([pr(1, T(10, "10:00"), T(10, "11:00")), pr(2, T(10, "10:00"), T(10, "11:00"))], commits=cm))
+        r = self.rows(out)
+        self.assertEqual((r[1]["autonomy"], r[2]["autonomy"], r[2]["autonomy_github_only"]), ("autonomous", "unknown", "autonomous"))
+        a = out["repos"][REPO]["per_day"]["2026-11-10"]["autonomous"]
+        self.assertEqual((a["unknown_share_pct"], a["github_only"]["unknown"], a["github_only"]["rate_pct"]), (50.0, 0, 100.0))
+
     def test_a_definite_owner_action_beats_an_ambiguous_commit(self):
         tl = {1: [{"event": "commented", "user": {"login": OWNER}, "created_at": T(10, "10:30")}]}
         out = self.build(world([pr(1, T(10, "10:00"), T(10, "11:00"))], tl, {1: [commit("c1", OWNER)]}))

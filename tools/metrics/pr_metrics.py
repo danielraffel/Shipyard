@@ -36,7 +36,8 @@ ACTION_EVENTS = {
     "enqueued", "dequeued", "milestoned", "demilestoned", "renamed", "base_ref_changed",
 }
 AGENT_TRAILER_RE = re.compile(
-    r"co-authored-by:[^\n]*(claude|codex|anthropic|openai|copilot)|generated with[^\n]*(claude|codex)", re.I)
+    r"co-authored-by:[^\n]*(claude|codex|anthropic|openai|copilot)|generated with[^\n]*(claude|codex)"
+    r"|^(version-bump|skill-update|release)\s*:", re.I | re.M)
 BAD_CONCLUSIONS = {"failure", "timed_out"}
 
 
@@ -174,11 +175,15 @@ def pr_facts(rd, pr, owner):
     }
 
 
-def autonomy(f):
-    """owner_action, unknown or autonomous for one PR's facts."""
+def autonomy(f, commits=True):
+    """owner_action, unknown or autonomous for one PR's facts.
+
+    commits=True (strict): an owner-identity commit with no agent trailer is ambiguous, so unknown.
+    commits=False (GitHub-side only): commits are never an owner action, since agents commit under the
+    owner's git identity; only the owner account's actions on GitHub (review, label, UI merge, comment) count."""
     if f["owner_definite"]:
         return "owner_action"
-    if f["owner_ambiguous"] or not f["timeline_complete"] or not f["commits_complete"]:
+    if (commits and f["owner_ambiguous"]) or not f["timeline_complete"] or not f["commits_complete"]:
         return "unknown"
     return "autonomous"
 
@@ -333,12 +338,18 @@ def pctile(xs, p):
     return None if not xs else round(xs[max(0, math.ceil(p * len(xs)) - 1)], 1)
 
 
+def pct_of(a, b):
+    return None if not b else round(100.0 * a / b, 1)
+
+
 def summarize(rows):
     """The four metrics over a list of per-PR rows."""
     n = len(rows)
     auto = [r for r in rows if r["autonomy"] == "autonomous"]
     owner = [r for r in rows if r["autonomy"] == "owner_action"]
     unk = [r for r in rows if r["autonomy"] == "unknown"]
+    g_auto = sum(1 for r in rows if r["autonomy_github_only"] == "autonomous")
+    g_owner = sum(1 for r in rows if r["autonomy_github_only"] == "owner_action")
     hand = [r["handoff_min"] for r in rows if r["handoff_min"] is not None]
     comp = [r for r in rows if r["compute"] and r["compute"]["complete"]]
     good = [r for r in rows if r["correct"]["bad"] is False]
@@ -346,7 +357,10 @@ def summarize(rows):
     return {
         "merged": n,
         "autonomous": {"autonomous": len(auto), "owner_action": len(owner), "unknown": len(unk),
-                       "rate_pct": None if not (auto or owner) else round(100.0 * len(auto) / (len(auto) + len(owner)), 1)},
+                       "rate_pct": None if not (auto or owner) else round(100.0 * len(auto) / (len(auto) + len(owner)), 1),
+                       "unknown_share_pct": pct_of(len(unk), n),
+                       "github_only": {"autonomous": g_auto, "owner_action": g_owner, "unknown": n - g_auto - g_owner,
+                                       "rate_pct": None if not (g_auto or g_owner) else round(100.0 * g_auto / (g_auto + g_owner), 1)}},
         "handoff_min": {"n": len(hand), "median": None if not hand else round(statistics.median(hand), 1), "p90": pctile(hand, 0.9)},
         "compute_per_pr": {
             "prs_read": len(comp), "prs_unread_or_partial": n - len(comp),
@@ -445,7 +459,7 @@ def collect_repo(repo, cache_dir, cap, owner, lo, hi, now, ticks, tick_ctx, fetc
                 corr = {"provisional": now < iso(f["merged_at"]) + WINDOW, "reverted": None, "base_red": None, "bad": None}
         corr["provisional"] = now < iso(f["merged_at"]) + WINDOW  # age is relative to this run
         out.append({
-            "pr": f["number"], "day": f["merged_at"][:10], "autonomy": autonomy(f),
+            "pr": f["number"], "day": f["merged_at"][:10], "autonomy": autonomy(f), "autonomy_github_only": autonomy(f, False),
             "handoff_min": round((iso(f["merged_at"]) - iso(f["first_ready"])).total_seconds() / 60.0, 1),
             "compute": comp, "correct": corr,
         })
@@ -488,7 +502,8 @@ def build(repos, cache_dir, cap, owner, start, now, ticks, tick_ctx, baseline=No
 def markdown(e2e):
     L = ["", "## End-to-end per merged PR (by merge day, UTC)", "",
          "Autonomous merge rate: merged PRs with no owner action (a commit, review, label, comment, merge or close by "
-         f"{e2e['owner']}'s own account) from opening to merge, over PRs where that is determinable; the rest are unknown. "
+         f"{e2e['owner']}'s own account) from opening to merge, over PRs where that is determinable; the rest are unknown (a commit under the owner's identity with no agent trailer). "
+         "The `gh-only` figure ignores commits and counts only GitHub-side owner actions. "
          "Handoff-to-merge: first ready-for-review moment to merged_at, median and p90 minutes. "
          "Compute: Actions job minutes on the PR's heads plus its merge-group runs, self-hosted and hosted. "
          "Correctness: share of merged PRs with a revert or a red required check on the base within 7 days; "
