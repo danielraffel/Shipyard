@@ -38,6 +38,14 @@ FAKE_INSTALLER = """#!/bin/bash
 echo "$(git rev-parse --short=12 HEAD)" >> "$FLEET_PASS_LIVE/installs"
 """
 
+FAKE_LOOP_INSTALLER = """#!/bin/bash
+# Stand-in for fleet-handbook's install-fleet-loop.sh: records its arguments.
+here="$(cd "$(dirname "$0")" && pwd)"
+[ -f "$here/LOOP_FAIL" ] && { echo "tests fail" >&2; exit 1; }
+[ -f "$here/LOOP_HANG" ] && sleep 30
+echo "$*" >> "$FLEET_PASS_LIVE/loop-installs"
+"""
+
 
 def git(cwd, *args):
     subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
@@ -59,6 +67,9 @@ class FleetDeployTests(unittest.TestCase):
         })
         self.handbook = self.make_repo("fleet-handbook", {
             "scripts/install-pass-runner.sh": FAKE_INSTALLER,
+            "scripts/fleet-loop/install-fleet-loop.sh": FAKE_LOOP_INSTALLER,
+            "scripts/fleet-loop/fleet_loop.py": "print(1)\n",
+            "scripts/pass-runner/pr_trust.py": "TRUST = 1\n",
         })
         self.tick_dest = t / "libexec" / "shipyard-steward-tick.sh"
         self.self_dest = t / "libexec" / "shipyard-fleet-deploy.sh"
@@ -185,6 +196,82 @@ class FleetDeployTests(unittest.TestCase):
         git(self.t / "fleet-handbook-work", "push", "-q", "origin", "main")
         self.run_deploy()
         self.assertEqual(len(self.installs()), 1)
+
+    def loop_installs(self):
+        p = self.live / "loop-installs"
+        return p.read_text().splitlines() if p.exists() else []
+
+    def enable_loop(self, config='{"mode": "primary"}'):
+        cfg = self.t / ".config" / "fleet-loop" / "config.json"
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        cfg.write_text(config)
+
+    def test_fleet_loop_is_left_alone_on_a_host_that_does_not_run_it(self):
+        self.run_deploy()
+        self.assertEqual(self.loop_installs(), [])
+        self.assertNotIn("unit=fleet-loop", self.log.read_text())
+
+    def test_fleet_loop_is_installed_once_and_again_only_when_its_files_change(self):
+        self.enable_loop()
+        self.run_deploy()
+        self.assertEqual(self.loop_installs(), [""])
+        self.assertIn("unit=fleet-loop installed", self.log.read_text())
+        self.run_deploy()
+        self.assertEqual(len(self.loop_installs()), 1)
+        # a change elsewhere in the handbook is not a loop change
+        self.commit("fleet-handbook", "docs/x.md", "x\n")
+        self.run_deploy()
+        self.assertEqual(len(self.loop_installs()), 1)
+        # the merged pair_conflicts.py case
+        self.commit("fleet-handbook", "scripts/fleet-loop/pair_conflicts.py", "print(2)\n")
+        self.run_deploy()
+        self.assertEqual(len(self.loop_installs()), 2)
+        # the trusted-author predicate the loop installs beside its modules
+        self.commit("fleet-handbook", "scripts/pass-runner/pr_trust.py", "TRUST = 2\n")
+        self.run_deploy()
+        self.assertEqual(len(self.loop_installs()), 3)
+
+    def test_fleet_loop_keeps_a_backup_host_a_backup_and_a_webhook_host_a_webhook_host(self):
+        self.enable_loop('{"mode": "backup", "primary_host": "m3"}')
+        hook = self.t / "Library" / "LaunchAgents" / "com.danielraffel.fleet-loop.webhook.plist"
+        hook.parent.mkdir(parents=True)
+        hook.write_text("<plist/>")
+        self.run_deploy(FLEET_DEPLOY_FLEET_LOOP_WEBHOOK_PLIST=str(hook))
+        self.assertEqual(self.loop_installs(), ["--backup-for m3 --webhook"])
+
+    def test_fleet_loop_unreadable_config_is_refused_not_guessed(self):
+        self.enable_loop("{not json")
+        self.run_deploy()
+        self.assertEqual(self.loop_installs(), [])
+        self.assertIn("unit=fleet-loop refused reason=config_unreadable", self.log.read_text())
+
+    def test_a_failing_fleet_loop_installer_is_logged_and_retried(self):
+        self.enable_loop()
+        self.commit("fleet-handbook", "scripts/fleet-loop/LOOP_FAIL", "1\n")
+        self.run_deploy()
+        self.assertEqual(self.loop_installs(), [])
+        self.assertIn("unit=fleet-loop refused", self.log.read_text())
+        work = self.t / "fleet-handbook-work"
+        os.remove(work / "scripts" / "fleet-loop" / "LOOP_FAIL")
+        git(work, "add", "-A")
+        git(work, "commit", "-q", "-m", "fix")
+        git(work, "push", "-q", "origin", "main")
+        self.run_deploy()
+        self.assertEqual(len(self.loop_installs()), 1)
+
+    def test_a_hung_fleet_loop_installer_cannot_hold_the_deploy(self):
+        self.enable_loop()
+        self.commit("fleet-handbook", "scripts/fleet-loop/LOOP_HANG", "1\n")
+        started = time.time()
+        r = self.run_deploy(FLEET_DEPLOY_FLEET_LOOP_TIMEOUT_S="2")
+        self.assertEqual(r.returncode, 0)
+        self.assertLess(time.time() - started, 20)
+        self.assertIn("unit=fleet-loop refused rc=124", self.log.read_text())
+
+    def test_fleet_loop_off_switch(self):
+        self.enable_loop()
+        self.run_deploy(FLEET_DEPLOY_FLEET_LOOP="off")
+        self.assertEqual(self.loop_installs(), [])
 
     def test_unreachable_remote_logs_and_exits_zero(self):
         r = self.run_deploy(FLEET_DEPLOY_SHIPYARD_REMOTE=str(self.t / "missing.git"))
