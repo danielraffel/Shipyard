@@ -193,11 +193,13 @@ Full flow + env-var setup in `RELEASING.md` § "macOS release is a locally-signe
 
 ## Development
 
-Shipyard is a Rust crate with Python helper scripts. CI runs:
+Shipyard is a Rust crate with Python helper scripts. The authoritative list of checks is the `run:` steps in `.github/workflows/ci.yml`; if this list and that file disagree, the workflow wins. To run the main ones locally:
 
 - `cargo fmt --all --check`
 - `cargo clippy --all-targets --locked -- -D warnings`
 - `cargo test --all-targets --locked --features ci-test-home`
-- `python3 scripts/run_unittest_strict.py -s scripts -p 'test_*.py'` (also `-s tools/metrics`)
+- `python3 scripts/run_unittest_strict.py -s <dir> -p 'test_*.py'` for each Python test directory the workflow names (`scripts`, `tools/metrics` and others)
+
+CI wraps the cargo test and clippy steps in `scripts/ci-capped-run.sh`, which only caps their resource use.
 
 Never push directly to `main`; open a PR as described above.
