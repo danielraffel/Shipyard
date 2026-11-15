@@ -32,8 +32,9 @@ as variables, or inside an ``input: $var`` object.
    guard refuses exactly the APPROVEs the gate would ignore. The one
    exception is the gate's own: when a trusted ``dispute:`` comment follows
    the newest counted HOLD of that head (``dispute_after_holds``), an APPROVE
-   posted now would supersede the HOLD, so it posts. A queue-arm guard
-   without that helper refuses as before.
+   posted now would supersede the HOLD, so it posts. An edit of an existing
+   comment into that APPROVE is still refused (the gate dates it by its
+   creation), and a queue-arm guard without that helper refuses as before.
 2. **One session does not contradict itself.** A HOLD is refused when the same
    session (same host, session id and agent id in its stamp) posted an APPROVE
    of that head through the fleet App in the last ``WINDOW_SECONDS``; an
@@ -636,7 +637,11 @@ def judge(args: list[str]) -> int:
             policy = ARM.review_policy(ARM.base_config_text(repo, base), repo, True)
             login = author if isinstance(author, str) else None
             hold = held_by(head, login, comments, reviews, policy)
-            disputed = (hold is not None and hasattr(ARM, "dispute_after_holds")
+            # An edit keeps its comment's creation time, which the gate dates
+            # an APPROVE by: an edited-in APPROVE would read approved yet not
+            # count, so only a new comment or review is let through.
+            disputed = (hold is not None and not _edits_a_comment(args)
+                        and hasattr(ARM, "dispute_after_holds")
                         and ARM.dispute_after_holds(head, login, comments, reviews,
                                                     policy) is not None)
             if hold is not None and disputed:
@@ -669,6 +674,13 @@ def judge(args: list[str]) -> int:
         print(f"{PREFIX}: note: retracting this session's APPROVE of head {head} "
               f"({contradiction['url']}) with a HOLD ({RETRACT_ENV}=1).", file=sys.stderr)
     return 0
+
+
+def _edits_a_comment(args: list[str]) -> bool:
+    """Whether the request edits an existing comment (REST
+    ``issues/comments/N``, ``--edit-last``, GraphQL ``updateIssueComment``)."""
+    return bool(re.search(r"issues/comments/\d+|--edit-last|updateIssueComment",
+                          " ".join(args), re.I))
 
 
 def _may_carry_verdict(args: list[str]) -> bool:

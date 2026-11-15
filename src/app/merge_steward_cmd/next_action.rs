@@ -647,7 +647,8 @@ fn held(stall: &Stall, repo: &str, base: &str, number: u64) -> NextAction {
              (with a test), merge {base} if needed (no rebase), push once, then comment \
              `repaired: <what> at <sha>`. If the HOLD is wrong, comment `dispute: <reason>` \
              after it: a reviewer's counted APPROVE of this head posted after the dispute \
-             supersedes the HOLD. Never ask for this head to be approved."
+             supersedes the HOLD. If no re-review comes, push a new head (merge {base}). \
+             Never ask for this head to be approved."
         ),
     )
 }

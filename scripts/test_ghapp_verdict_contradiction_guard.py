@@ -429,6 +429,32 @@ class VerdictContradictionGuard(unittest.TestCase):
                 self.assert_held(self.run_guard(self.post("APPROVE"), comments,
                                                 env={"SHIPYARD_AGENT_ID": "someone-else"}))
 
+    def test_editing_a_comment_into_an_approve_after_a_dispute_is_still_refused(self) -> None:
+        hold = comment("HOLD", ident=4321, at=NOW - timedelta(minutes=30))
+        for argv in (["api", "-X", "PATCH", f"repos/{REPO}/issues/comments/55", "--raw-field",
+                      f"body=verdict: APPROVE head:{HEAD}"],
+                     ["pr", "comment", "7", "--edit-last", "--body",
+                      f"verdict: APPROVE head:{HEAD}"]):
+            with self.subTest(argv[:3]):
+                self.fake_gh([hold, self.dispute()])
+                fake = self.root / "gh"
+                fake.write_text(fake.read_text(encoding="utf-8").replace(
+                    "if state['fail']:",
+                    "if 'issues/comments/55' in argv:\n"
+                    f"    print('https://api.github.com/repos/{REPO}/issues/7'); sys.exit(0)\n"
+                    "if state['fail']:"), encoding="utf-8")
+                environment = {
+                    "PATH": "/usr/bin:/bin", "HOME": str(self.root), "GHAPP_REAL_GH": str(fake),
+                    "GH_REPO": REPO, "SHIPYARD_GHAPP_GUARDS_DIR": str(self.guards),
+                    "SHIPYARD_VERDICT_GUARD_NOW": NOW.isoformat(),
+                    "SHIPYARD_AGENT_ID": "someone-else",
+                }
+                result = subprocess.run(
+                    [sys.executable, str(self.guards / "verdict-contradiction-guard"), *argv],
+                    env=environment, capture_output=True, text=True, check=False,
+                    stdin=subprocess.DEVNULL)
+                self.assert_held(result)
+
     def test_without_the_gate_helper_a_disputed_hold_still_refuses(self) -> None:
         installed = self.guards / "queue-arm-guard"
         installed.write_text(installed.read_text(encoding="utf-8").replace(

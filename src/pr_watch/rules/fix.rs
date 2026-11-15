@@ -373,8 +373,8 @@ pub fn held_unrepaired(repo: &str, pr: &PrHistory, sha: &str, hold: &TrailEntry)
         command: format!(
             "held head: needs a new head. Read the HOLD and push a repair to {} (if the HOLD \
              is wrong, comment `dispute: <reason>` after it, and a reviewer's counted APPROVE \
-             of this head posted after the dispute supersedes the HOLD; never re-approve this \
-             head yourself), or label the pull request owner-decision, superseded \
+             of this head posted after the dispute supersedes the HOLD; if no re-review comes, \
+             push a new head, merging the base; never re-approve this head yourself), or label the pull request owner-decision, superseded \
              or PARKED/<why> if it is not the author's to repair",
             pr.head_ref
         ),

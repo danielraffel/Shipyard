@@ -3626,7 +3626,8 @@ def review_gate(classification: dict[str, Any], repo: str | None, dry_run: bool 
         classification["held_exclusions"] = sorted(set(HELD_EXCLUSIONS))
         print(f"queue-arm-guard: note: PR #{classification.get('pr')}: "
               f"{'; '.join(classification['held_exclusions'])}: a HOLD makes its head "
-              "un-approvable, so only a new head can be approved", file=sys.stderr)
+              "un-approvable, so only a new head, or an APPROVE posted after a trusted "
+              "`dispute:` that follows the HOLD, can approve it", file=sys.stderr)
     excluded = sorted(set(EXCLUDED_APPROVALS))
     if excluded:
         classification["excluded_approvals"] = excluded
