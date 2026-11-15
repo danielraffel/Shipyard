@@ -853,7 +853,10 @@ once `[auto_merge.rollup] min_ready` (default 3) pull requests are ready, and
 reports it as `repos[].rollup` (`mode = "shadow"` by default). It is
 read-only: `apply` reports `apply_unavailable` and every pull request still
 merges on its own, so act on a plan with the commands above, never by
-hand-merging members together.
+hand-merging members together. Every observed repository carries
+`repos[].rollup`: `not_applicable` (a merge-queue base) or `off` means the
+planner does not run there, and `below_threshold` means it ran with too few
+ready.
 ## A transient rerun needs the interruption signature, not a conclusion
 
 The steward's bounded rerun and the carrier's `redispatch` both rerun only a

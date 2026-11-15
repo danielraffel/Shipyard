@@ -416,7 +416,7 @@ fn only_ready_rows_at_the_observed_head_count() {
 }
 
 /// `run` through a recording `gh` that answers only the base config read.
-fn run_with(config: &str, merge_queue: bool, merge_path: &str) -> (Option<Report>, Vec<String>) {
+fn run_with(config: &str, merge_queue: bool, merge_path: &str) -> (Report, Vec<String>) {
     run_throttled(
         config,
         merge_queue,
@@ -434,7 +434,19 @@ fn run_throttled(
     dir: Option<&std::path::Path>,
     write: bool,
     now: chrono::DateTime<chrono::Utc>,
-) -> (Option<Report>, Vec<String>) {
+) -> (Report, Vec<String>) {
+    run_ready(config, merge_queue, merge_path, 3, dir, write, now)
+}
+
+fn run_ready(
+    config: &str,
+    merge_queue: bool,
+    merge_path: &str,
+    ready: u64,
+    dir: Option<&std::path::Path>,
+    write: bool,
+    now: chrono::DateTime<chrono::Utc>,
+) -> (Report, Vec<String>) {
     let calls = RefCell::new(Vec::new());
     let run_gh = |argv: &[String]| {
         calls.borrow_mut().push(argv.join(" "));
@@ -452,7 +464,16 @@ fn run_throttled(
         merge_queue,
     );
     let rows: Vec<PrReport> = (1..=3)
-        .map(|pr| row(pr, StewardDecision::ArmMergeQueue))
+        .map(|pr| {
+            row(
+                pr,
+                if pr <= ready {
+                    StewardDecision::ArmMergeQueue
+                } else {
+                    StewardDecision::Draft
+                },
+            )
+        })
         .collect();
     let report = run(
         &run_gh,
@@ -470,20 +491,72 @@ fn run_throttled(
 }
 
 #[test]
-fn a_merge_queue_base_or_off_mode_does_nothing() {
-    let (report, calls) = run_with("", true, "merge_queue");
-    assert!(report.is_none());
+fn a_merge_queue_base_is_reported_not_applicable_without_a_read() {
+    let (report, calls) = run_with("", true, "native_queue_exact_head");
+    assert_eq!(report.action, Action::NotApplicable);
+    assert_eq!(report.mode, None);
+    assert_eq!(report.ready, vec![1, 2, 3], "the ready count still shows");
+    assert!(
+        report
+            .detail
+            .as_deref()
+            .unwrap_or("")
+            .contains("merge queue")
+    );
     assert!(
         calls.is_empty(),
         "a merge-queue base reads nothing: {calls:?}"
     );
+    let (report, calls) = run_with("", false, "native_auto_merge");
+    assert_eq!(report.action, Action::NotApplicable);
+    assert!(calls.is_empty(), "{calls:?}");
+}
+
+#[test]
+fn off_mode_is_reported_as_off_and_reads_only_the_base_config() {
     let (report, calls) = run_with(
         "[auto_merge.rollup]\nmode = \"off\"\n",
         false,
         "server_enforced_exact_head_merge",
     );
-    assert!(report.is_none());
+    assert_eq!(report.action, Action::Off);
+    assert_eq!(report.mode, Some(Mode::Off));
+    assert!(report.members.is_empty());
     assert_eq!(calls.len(), 1, "off reads only the base config: {calls:?}");
+}
+
+#[test]
+fn fewer_than_two_ready_is_below_threshold_without_a_read() {
+    for ready in [0, 1] {
+        let (report, calls) = run_ready(
+            "",
+            false,
+            "server_enforced_exact_head_merge",
+            ready,
+            None,
+            false,
+            chrono::Utc::now(),
+        );
+        assert_eq!(report.action, Action::BelowThreshold, "{ready} ready");
+        assert_eq!(report.ready.len(), usize::try_from(ready).expect("small"));
+        assert_eq!(report.mode, None, "the config was not read");
+        assert!(calls.is_empty(), "{ready} ready reads nothing: {calls:?}");
+    }
+}
+
+#[test]
+fn the_report_serializes_every_state_for_the_loss_report() {
+    let (off, _) = run_with(
+        "[auto_merge.rollup]\nmode = \"off\"\n",
+        false,
+        "server_enforced_exact_head_merge",
+    );
+    let (queue, _) = run_with("", true, "native_queue_exact_head");
+    let json = |report: &Report| serde_json::to_value(report).expect("json");
+    assert_eq!(json(&off)["action"], "off");
+    assert_eq!(json(&off)["mode"], "off");
+    assert_eq!(json(&queue)["action"], "not_applicable");
+    assert!(json(&queue).get("mode").is_none());
 }
 
 #[test]
@@ -493,7 +566,6 @@ fn below_threshold_reads_only_the_base_config_and_writes_nothing() {
         false,
         "server_enforced_exact_head_merge",
     );
-    let report = report.expect("report");
     assert_eq!(report.action, Action::BelowThreshold);
     assert_eq!(report.ready, vec![1, 2, 3]);
     assert_eq!(calls.len(), 1, "{calls:?}");
@@ -509,7 +581,6 @@ fn below_threshold_reads_only_the_base_config_and_writes_nothing() {
 fn unreadable_approval_reads_form_nothing() {
     // The config reads, nothing else does: no batch, no write.
     let (report, calls) = run_with("", false, "server_enforced_exact_head_merge");
-    let report = report.expect("report");
     assert!(
         [Action::Unreadable, Action::NoBatch].contains(&report.action),
         "{report:?}"
@@ -530,18 +601,17 @@ fn a_stamped_plan_stands_for_its_interval_and_reads_nothing() {
     let path = "server_enforced_exact_head_merge";
     let t0 = chrono::Utc::now();
     let (first, calls) = run_throttled(config, false, path, Some(temp.path()), true, t0);
-    assert_eq!(first.expect("plan").action, Action::BelowThreshold);
+    assert_eq!(first.action, Action::BelowThreshold);
     assert_eq!(calls.len(), 1);
     let later = t0 + chrono::Duration::minutes(29);
     let (cached, calls) = run_throttled(config, false, path, Some(temp.path()), true, later);
-    let cached = cached.expect("cached plan");
     assert!(calls.is_empty(), "a fresh stamp reads nothing: {calls:?}");
     assert!(cached.cached_at.is_some());
     assert_eq!(cached.action, Action::BelowThreshold);
     let expired = t0 + chrono::Duration::minutes(31);
     let (fresh, calls) = run_throttled(config, false, path, Some(temp.path()), true, expired);
     assert_eq!(calls.len(), 1, "a stale stamp plans again");
-    assert!(fresh.expect("plan").cached_at.is_none());
+    assert!(fresh.cached_at.is_none());
 }
 
 #[test]

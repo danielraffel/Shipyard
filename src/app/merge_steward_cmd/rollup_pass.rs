@@ -248,6 +248,11 @@ pub(super) struct Skipped {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum Action {
+    /// The planner does not run on this base: it has a merge queue, or its
+    /// merge path is not the exact-head merge. Nothing was read.
+    NotApplicable,
+    /// The base sets `mode = "off"`: nothing past the base config was read.
+    Off,
     /// Fewer than `min_ready` ready: nothing more was read.
     BelowThreshold,
     /// More than `max_ready` ready: nothing more was read.
@@ -267,7 +272,10 @@ pub(super) enum Action {
 /// What the pass decided for one repository.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(super) struct Report {
-    pub mode: Mode,
+    /// The base's mode, when its config was read (absent below two ready,
+    /// on a base the planner does not run on, and when it is unreadable).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<Mode>,
     /// Ready pull requests this pass, oldest first.
     pub ready: Vec<u64>,
     pub min_ready: usize,
@@ -388,7 +396,7 @@ pub(super) fn plan(
     readers: &Readers<'_>,
 ) -> Report {
     let mut report = Report {
-        mode: policy.mode,
+        mode: Some(policy.mode),
         ready: ready.iter().map(|ready| ready.pr).collect(),
         min_ready: policy.min_ready,
         action: Action::BelowThreshold,
@@ -565,23 +573,64 @@ pub(super) struct Throttle<'a> {
     pub expired: &'a dyn Fn() -> bool,
 }
 
+/// A report made without reading anything: `action`, why, and the ready
+/// rows the steward's own pass saw.
+fn unread(action: Action, ready: &[Ready], detail: String) -> Report {
+    Report {
+        mode: None,
+        ready: ready.iter().map(|ready| ready.pr).collect(),
+        min_ready: DEFAULT_MIN_READY,
+        action,
+        members: Vec::new(),
+        skipped: Vec::new(),
+        detail: Some(detail),
+        cached_at: None,
+    }
+}
+
+/// The report of a pass whose time budget ran out before the planner
+/// started: `deadline`, nothing read.
+pub(super) fn budget_spent(observation: &RepoObservation, prs: &[PrReport]) -> Report {
+    unread(
+        Action::Deadline,
+        &ready_rows(observation, prs),
+        "the pass time budget was spent before the plan started".to_owned(),
+    )
+}
+
 /// Run the pass for one observed repository after its plan was applied.
-/// `None` when it does not apply (a merge-queue base, fewer than two ready
-/// rows, or `mode = "off"`). Reads GitHub only; its one local write is the
-/// plan stamp under `throttle.dir`, on an applied pass.
+/// Always a report, so a reader can tell a planner that does not run
+/// (`not_applicable`, `off`) from one that ran and found no batch
+/// (`below_threshold`, `no_batch`, ...) and from a plan. Reads GitHub only;
+/// its one local write is the plan stamp under `throttle.dir`, on an applied
+/// pass.
 pub(super) fn run(
     run_gh: &dyn Fn(&[String]) -> Result<String, String>,
     observation: &RepoObservation,
     merge_path: &str,
     prs: &[PrReport],
     throttle: &Throttle<'_>,
-) -> Option<Report> {
-    if observation.merge_queue || merge_path != "server_enforced_exact_head_merge" {
-        return None;
-    }
+) -> Report {
     let ready = ready_rows(observation, prs);
+    if observation.merge_queue || merge_path != "server_enforced_exact_head_merge" {
+        let why = if observation.merge_queue {
+            "the base has a merge queue, which batches on its own".to_owned()
+        } else {
+            format!("the merge path is {merge_path}, not server_enforced_exact_head_merge")
+        };
+        return unread(Action::NotApplicable, &ready, why);
+    }
     if ready.len() < 2 {
-        return None;
+        // Every min_ready is at least two: below it whatever the base says,
+        // so its config is not read.
+        return unread(
+            Action::BelowThreshold,
+            &ready,
+            format!(
+                "{} ready, fewer than two; the base config was not read",
+                ready.len()
+            ),
+        );
     }
     let (repo, base) = (observation.repo.as_str(), observation.base.as_str());
     let stamp = throttle.dir.map(|dir| stamp_path(dir, repo, base));
@@ -589,15 +638,15 @@ pub(super) fn run(
         .as_deref()
         .and_then(|path| fresh_stamp(path, throttle.now))
     {
-        return Some(cached);
+        return cached;
     }
-    let (report, interval) = plan_live(run_gh, repo, base, &ready, throttle.expired)?;
+    let (report, interval) = plan_live(run_gh, repo, base, &ready, throttle.expired);
     if let (Some(path), Some(interval), true) = (stamp.as_deref(), interval, throttle.write)
         && report.action != Action::Deadline
     {
         write_stamp(path, &report, interval, throttle.now);
     }
-    Some(report)
+    report
 }
 
 /// [`run`]'s live plan, and the interval to stamp it for (`None`: do not
@@ -608,22 +657,8 @@ fn plan_live(
     base: &str,
     ready: &[Ready],
     expired: &dyn Fn() -> bool,
-) -> Option<(Report, Option<usize>)> {
-    let unreadable = |detail: String| {
-        Some((
-            Report {
-                mode: Mode::Shadow,
-                ready: ready.iter().map(|ready| ready.pr).collect(),
-                min_ready: DEFAULT_MIN_READY,
-                action: Action::Unreadable,
-                members: Vec::new(),
-                skipped: Vec::new(),
-                detail: Some(detail),
-                cached_at: None,
-            },
-            None,
-        ))
-    };
+) -> (Report, Option<usize>) {
+    let unreadable = |detail: String| (unread(Action::Unreadable, ready, detail), None);
     let text = match rollup::base_config_text(run_gh, repo, base) {
         Ok(text) => text,
         Err(error) => return unreadable(error),
@@ -639,7 +674,17 @@ fn plan_live(
     };
     let policy = Policy::from_table(&table);
     if policy.mode == Mode::Off {
-        return None;
+        let report = Report {
+            mode: Some(Mode::Off),
+            action: Action::Off,
+            min_ready: policy.min_ready,
+            ..unread(
+                Action::Off,
+                ready,
+                "[auto_merge.rollup] mode = \"off\" on the base".to_owned(),
+            )
+        };
+        return (report, Some(policy.interval_minutes));
     }
     // A `[train]` table that does not parse adds no exclusions it might have
     // named: refuse the plan rather than guess.
@@ -654,7 +699,7 @@ fn plan_live(
             files: &|_| Err("not read".to_owned()),
             expired,
         };
-        return Some((plan(&policy, &train, &[], ready, &none), interval));
+        return (plan(&policy, &train, &[], ready, &none), interval);
     }
     let approval = match crate::head_approval::read_policy(run_gh, repo, base) {
         Ok(approval) => approval,
@@ -675,7 +720,7 @@ fn plan_live(
             expired,
         },
     );
-    Some((report, interval))
+    (report, interval)
 }
 
 #[cfg(test)]
