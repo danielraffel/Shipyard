@@ -99,7 +99,7 @@ pub(super) fn base_health_command<W: Write>(
     let decision = if args.act {
         advice
             .as_ref()
-            .map(|advice| act(&actions, state_dir, &repo, auto_jump, advice))
+            .map(|advice| act(&actions, state_dir, (&repo, &base), auto_jump, advice))
             .transpose()?
     } else {
         None
@@ -345,7 +345,7 @@ fn append_decision(path: &Path, decision: &JumpDecision) -> Result<(), CliFailur
 fn act(
     actions: &GitHubActions,
     state_dir: &Path,
-    repo: &str,
+    (repo, base): (&str, &str),
     auto_jump: AutoJump,
     advice: &JumpAdvice,
 ) -> Result<JumpDecision, CliFailure> {
@@ -369,6 +369,13 @@ fn act(
         return Ok(decision);
     }
     if auto_jump == AutoJump::On {
+        // Another pull request holds this queue alone: jump nothing, and
+        // record nothing, so the jump is decided again once it ends.
+        let solo = crate::merge_queue_solo::read(state_dir, repo, Utc::now());
+        if let Some(token) = solo.admission_hold(base, advice.pr) {
+            decision.outcome = format!("held: {token}");
+            return Ok(decision);
+        }
         decision.outcome = jump(actions, repo, advice.pr, None);
     }
     append_decision(&path, &decision)?;
@@ -576,7 +583,7 @@ mod tests {
         let first = act(
             &actions,
             state.path(),
-            "o/r",
+            ("o/r", "main"),
             AutoJump::DryRun,
             &advice("900"),
         )
@@ -586,7 +593,7 @@ mod tests {
         let repeat = act(
             &actions,
             state.path(),
-            "o/r",
+            ("o/r", "main"),
             AutoJump::DryRun,
             &advice("900"),
         )
@@ -595,7 +602,7 @@ mod tests {
         let next_episode = act(
             &actions,
             state.path(),
-            "o/r",
+            ("o/r", "main"),
             AutoJump::DryRun,
             &advice("901"),
         )
@@ -606,6 +613,37 @@ mod tests {
         assert_eq!(recorded.len(), 2, "one line per episode: {recorded:?}");
         assert_eq!(recorded[0].pr, 8933);
         assert_eq!(recorded[1].main_run_id.as_deref(), Some("901"));
+    }
+
+    /// A solo reservation for another pull request holds the jump before any
+    /// read, and leaves no decision behind, so it is decided again later.
+    #[test]
+    fn a_solo_reservation_for_another_pull_request_holds_the_jump() {
+        let state = tempfile::tempdir().expect("tempdir");
+        let actions = GitHubActions::offline_for_tests(state.path());
+        let reservation = crate::merge_queue_solo::Reservation::new(
+            "o/r",
+            "main",
+            451,
+            &"c".repeat(40),
+            crate::merge_queue_solo::SoloReason::Release,
+            "release coalesce lands alone",
+            "verdict comment 1",
+            crate::merge_queue_solo::DEFAULT_TTL_MINUTES,
+            Utc::now(),
+        )
+        .expect("reservation");
+        crate::merge_queue_solo::reserve(state.path(), &reservation).expect("reserve");
+        let decision = act(
+            &actions,
+            state.path(),
+            ("o/r", "main"),
+            AutoJump::On,
+            &advice("900"),
+        )
+        .expect("decision");
+        assert_eq!(decision.outcome, "held: held_solo_reservation:#451");
+        assert!(load_decisions(&decisions_path(state.path())).is_empty());
     }
 
     /// The replay reads the real Vellum episode and names #409, holding

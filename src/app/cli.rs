@@ -5254,6 +5254,58 @@ mod tests {
     }
 
     #[test]
+    fn merge_queue_solo_parses_target_reason_note_and_ttl() {
+        let solo = Cli::try_parse_from([
+            "shipyard",
+            "merge-queue",
+            "solo",
+            "Generous-Corp/vellum#451",
+            "--reason",
+            "release",
+            "--note",
+            "release coalesce lands alone",
+        ])
+        .expect("solo");
+        assert!(matches!(
+            solo.command,
+            Command::MergeQueue {
+                command: super::MergeQueueCommand::Solo {
+                    ref target,
+                    ttl_minutes: crate::merge_queue_solo::DEFAULT_TTL_MINUTES,
+                    ..
+                }
+            } if target == "Generous-Corp/vellum#451"
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "shipyard",
+                "merge-queue",
+                "solo",
+                "o/r#1",
+                "--reason",
+                "release"
+            ])
+            .is_err(),
+            "a note is required"
+        );
+        let release = Cli::try_parse_from([
+            "shipyard",
+            "merge-queue",
+            "solo-release",
+            "Generous-Corp/vellum",
+            "--reason",
+            "landed by hand",
+        ])
+        .expect("solo-release");
+        assert!(matches!(
+            release.command,
+            Command::MergeQueue {
+                command: super::MergeQueueCommand::SoloRelease { ref repo, .. }
+            } if repo == "Generous-Corp/vellum"
+        ));
+    }
+
+    #[test]
     fn queue_hold_revoke_parses_exact_identity_and_reason() {
         assert!(
             Cli::try_parse_from([

@@ -430,6 +430,22 @@ fn someone_elses_move(kind: &str, facts: &Facts<'_>) -> Option<NextAction> {
                  that. Do not push or merge {base} for this."
             ),
         ),
+        "held_solo_reservation" => NextAction::new(
+            Actor::Operator,
+            format!(
+                "Waits for {arg} to land alone: a solo reservation holds the {base} merge queue \
+                 for it, so nothing else is admitted until it lands, leaves the queue, or the \
+                 reservation expires. Nothing to do; do not push."
+            ),
+        ),
+        "held_solo_reservation_unreadable" => NextAction::new(
+            Actor::Operator,
+            format!(
+                "The {base} merge queue's solo reservation is unreadable, so every admission \
+                 waits. Nothing for the author to do; the operator ends it with `shipyard \
+                 merge-queue solo-release`."
+            ),
+        ),
         "revalidating" | "admission_pending" => NextAction::new(
             Actor::Steward,
             format!(

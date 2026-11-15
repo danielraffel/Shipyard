@@ -1313,7 +1313,9 @@ shipyard merge-queue solo Generous-Corp/vellum#451 --reason release \
   --note "v1.4 release coalesce must be its own merge group"
 GHAPP_ALLOW_QUEUE_REMOVAL=1 GHAPP_QUEUE_REMOVAL_REASON=solo \
   GHAPP_QUEUE_REMOVAL_NOTE="clear the queue for #451" \
-  ghapp pr merge 418 --repo Generous-Corp/vellum --disable-auto
+  ghapp api graphql \
+  -f query='mutation($id:ID!){dequeuePullRequest(input:{id:$id}){clientMutationId}}' \
+  -f id=<node id of #418>
 shipyard merge-queue status          # lists reservations
 shipyard merge-queue solo-release Generous-Corp/vellum --reason "landed by hand"
 ```
@@ -1338,6 +1340,14 @@ admissions as a backstop), and the guard accepts a `solo` removal only when:
 The audit record carries a `solo` object naming the reserved PR, its head and
 position, the reservation's reason and expiry, and each removed entry's
 position.
+
+A removed entry the steward manages is enqueued again once the reservation
+ends: a manual removal is not one of the reasons that bar the same head. The
+removal does count once toward the head's ejection cap (`EJECTION_CAP`, 2),
+like any manual dequeue, so a head removed twice needs an approval newer than
+the last removal. A PR only the native-arm backstop arms (no steward handoff)
+is not re-armed on the same head after a removal; it needs a new push or an
+arm by hand.
 
 The steward ends the reservation when the reserved PR merges, closes, gets a
 new head, or leaves the queue after a pass saw it there, and when the TTL runs

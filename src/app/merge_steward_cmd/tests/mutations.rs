@@ -2294,6 +2294,121 @@ esac
     assert!(!calls.contains("enablePullRequestAutoMerge"), "{calls}");
 }
 
+/// A whole applying pass over a reserved repository: the reservation is
+/// reconciled and reported, and a reservation whose pull request merged is
+/// ended; an unreadable one is a repository error and arms nothing.
+#[cfg(unix)]
+#[test]
+#[allow(clippy::too_many_lines)] // One fixture serves both cases.
+fn a_steward_pass_reconciles_and_reports_the_solo_reservation() {
+    for corrupt in [false, true] {
+        let temp = tempfile::tempdir().expect("temp");
+        let log = temp.path().join("calls");
+        let actions = fake_gh(
+            &temp,
+            &format!(
+                r#"
+printf '%s\\n' "$*" >> '{}'
+case "$*" in
+  *"number=451"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"number":451,"state":"MERGED","headRefOid":"cccccccccccccccccccccccccccccccccccccccc","isInMergeQueue":false,"mergeQueueEntry":null,"autoMergeRequest":null,"timelineItems":{{"pageInfo":{{"hasPreviousPage":false}},"nodes":[]}}}}}}}}}}' ;;
+  *"isInMergeQueue"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"number":42,"state":"OPEN","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","isInMergeQueue":false,"mergeQueueEntry":null,"autoMergeRequest":null,"timelineItems":{{"pageInfo":{{"hasPreviousPage":false}},"nodes":[]}}}}}}}}}}' ;;
+  *"mergeQueue"*) printf '%s' '{{"data":{{"repository":{{"mergeQueue":{{"entries":{{"nodes":[],"pageInfo":{{"hasNextPage":false}}}}}}}}}}}}' ;;
+  *) printf '%s' '{{}}' ;;
+esac
+"#,
+                log.display()
+            ),
+        );
+        let observation = observation_for(ready_pr(), true);
+        let args = StewardCommandArgs {
+            repos: vec!["owner/repo".to_owned()],
+            base: "main".to_owned(),
+            opt_out_label: "steward:skip".to_owned(),
+            provenance_blocking_labels: default_provenance_blocking_labels(),
+            managed_label: MANAGED_LABEL.to_owned(),
+            handoff_context: HANDOFF_CONTEXT.to_owned(),
+            max_transient_reruns: 1,
+            recover_hosted_setup_eviction_priority: false,
+            coalesce: false,
+            preempt_capacity: false,
+            max_preemptions_per_head: 1,
+            arm_unqueued: true,
+            approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
+            wake_owner: false,
+            unapproved_dequeue: crate::app::merge_steward_cmd::DequeueMode::Report,
+            infra_rerun: crate::app::merge_steward_cmd::InfraRerunMode::Off,
+            pass_budget: None,
+            pass_deadline: None,
+            invariants: None,
+            apply: true,
+            ledger: None,
+        };
+        let mut ledger = StewardLedger::default();
+        let control = mutation_control(&temp, "studio", "studio");
+        let path = crate::merge_queue_solo::reservation_path(&control.state_dir, "owner/repo")
+            .expect("path");
+        if corrupt {
+            fs::create_dir_all(path.parent().expect("dir")).expect("dir");
+            fs::write(&path, "{").expect("corrupt");
+        } else {
+            let reservation = crate::merge_queue_solo::Reservation::new(
+                "owner/repo",
+                "main",
+                451,
+                &"c".repeat(40),
+                crate::merge_queue_solo::SoloReason::Release,
+                "release coalesce lands alone",
+                "verdict comment 1",
+                crate::merge_queue_solo::DEFAULT_TTL_MINUTES,
+                chrono::Utc::now(),
+            )
+            .expect("reservation");
+            crate::merge_queue_solo::reserve(&control.state_dir, &reservation).expect("reserve");
+        }
+
+        let (report, failed, _) = apply_repo_plan(
+            &actions,
+            &args,
+            &observation,
+            &temp.path().join("ledger.json"),
+            &mut ledger,
+            0,
+            Some(&control),
+            None,
+        );
+
+        let solo = report.solo_reservation.clone().expect("reported");
+        if corrupt {
+            assert!(failed, "an unreadable reservation is a failure: {report:?}");
+            assert_eq!(solo["state"], "unreadable", "{solo}");
+            assert!(
+                report
+                    .errors
+                    .iter()
+                    .any(|error| error.contains("unreadable")),
+                "{report:?}"
+            );
+            assert!(path.exists(), "nothing ends an unreadable reservation");
+        } else {
+            assert_eq!(solo["action"], "ended:merged", "{solo}");
+            assert_eq!(solo["state"], "absent", "{solo}");
+            assert!(!path.exists());
+            assert!(
+                report.errors.iter().all(|error| !error.contains("solo")),
+                "{report:?}"
+            );
+        }
+        // An unreadable reservation arms nothing; once a merged one ends, the
+        // rest of the pass admits as usual.
+        let calls = fs::read_to_string(&log).unwrap_or_default();
+        assert_eq!(
+            calls.contains("enablePullRequestAutoMerge"),
+            !corrupt,
+            "{calls}"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn steward_ambiguous_failure_is_durable_shared_uncertainty() {

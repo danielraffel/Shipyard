@@ -43,13 +43,22 @@ fn parse_target(target: &str) -> Result<(String, u64), String> {
     Ok((repo.to_owned(), number))
 }
 
-/// The base, head and approval of a pull request whose current head carries
-/// a verified exact-head approval; anything else refuses.
+/// What the approval check found: the base, the approved head, the approval,
+/// and whether the pull request is already in the queue.
+pub(super) struct ApprovedHead {
+    base: String,
+    head: String,
+    approval: String,
+    in_queue: bool,
+}
+
+/// The pull request's base and head when its current head carries a
+/// verified exact-head approval; anything else refuses.
 pub(super) fn approved_head(
     run_gh: RunGh<'_>,
     repo: &str,
     pr: u64,
-) -> Result<(String, String, String), String> {
+) -> Result<ApprovedHead, String> {
     let pull: Value = serde_json::from_str(&run_gh(&[
         "api".to_owned(),
         format!("repos/{repo}/pulls/{pr}"),
@@ -103,7 +112,15 @@ pub(super) fn approved_head(
         author.as_deref(),
     )?;
     match gate {
-        HeadGate::Approved { approval } => Ok((base, head, approval.describe())),
+        HeadGate::Approved { approval } => Ok(ApprovedHead {
+            in_queue: queue
+                .pointer("/data/repository/pullRequest/isInMergeQueue")
+                .and_then(Value::as_bool)
+                == Some(true),
+            base,
+            head,
+            approval: approval.describe(),
+        }),
         // A base that requires no approval has no exact-head approval to
         // reserve on, and a reservation needs one.
         other => Err(format!(
@@ -125,20 +142,22 @@ pub(super) fn reserve(
     if request.note.trim().is_empty() {
         return Err(CliFailure::new(2, "--note must say what is landing alone"));
     }
-    let (base, head, approval) =
+    let approved =
         approved_head(run_gh, &repo, pr).map_err(|error| CliFailure::new(REFUSED, error))?;
-    let reservation = Reservation::new(
+    let mut reservation = Reservation::new(
         &repo,
-        &base,
+        &approved.base,
         pr,
-        &head,
+        &approved.head,
         reason,
         request.note,
-        &approval,
+        &approved.approval,
         request.ttl_minutes,
         now,
     )
     .map_err(|error| CliFailure::new(2, error))?;
+    // Already queued: leaving the queue ends it from the first pass on.
+    reservation.seen_in_queue = approved.in_queue;
     let path = merge_queue_solo::reserve(state_root, &reservation)
         .map_err(|error| CliFailure::new(REFUSED, error))?;
     Ok((reservation, path))
@@ -354,6 +373,8 @@ mod tests {
         assert_eq!(reservation.pr, 451);
         assert_eq!(reservation.head, HEAD);
         assert_eq!(reservation.base, "main");
+        // The fake shows it queued, so leaving the queue ends it at once.
+        assert!(reservation.seen_in_queue);
         assert!(matches!(
             merge_queue_solo::read(temp.path(), "Generous-Corp/pulp", Utc::now()),
             merge_queue_solo::SoloState::Active(_)
@@ -385,6 +406,43 @@ mod tests {
                 merge_queue_solo::SoloState::Absent
             );
         }
+    }
+
+    #[test]
+    fn a_reservation_is_refused_on_a_host_that_is_not_the_mutation_machine() {
+        let temp = tempfile::tempdir().expect("temp");
+        let global = temp.path().join("global");
+        let state = temp.path().join("state");
+        std::fs::create_dir_all(&global).expect("global");
+        std::fs::create_dir_all(&state).expect("state");
+        std::fs::write(
+            global.join("config.toml"),
+            "[merge_queue]\nmutation_machine = \"studio\"\n",
+        )
+        .expect("config");
+        std::fs::write(state.join("machine-tag"), "laptop\n").expect("tag");
+        let mut out = Vec::new();
+        let refusal = solo_command(
+            &state,
+            &global,
+            temp.path(),
+            RuntimeMode::Isolated,
+            &request("Generous-Corp/pulp#451"),
+            true,
+            &mut out,
+        )
+        .expect_err("refused");
+        assert_eq!(refusal.code, REFUSED, "{}", refusal.message);
+        assert!(
+            refusal.message.contains("mutation machine"),
+            "{}",
+            refusal.message
+        );
+        assert!(out.is_empty());
+        assert_eq!(
+            merge_queue_solo::read(&state, "Generous-Corp/pulp", Utc::now()),
+            merge_queue_solo::SoloState::Absent
+        );
     }
 
     #[test]

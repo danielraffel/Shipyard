@@ -551,13 +551,14 @@ pub fn reserve(state_root: &Path, reservation: &Reservation) -> Result<PathBuf, 
         _ => {}
     }
     let path = reservation_path(state_root, &repo)?;
-    write_record(&path, reservation)?;
+    // Audit first: a reservation nobody can account for later is not made.
     audit(
         state_root,
         "reserved",
         &repo,
         serde_json::to_value(reservation).unwrap_or(Value::Null),
     )?;
+    write_record(&path, reservation)?;
     Ok(path)
 }
 
@@ -567,10 +568,8 @@ pub fn release(state_root: &Path, repo: &str, why: &str) -> Result<bool, String>
     let _lock = lock_repo(state_root, repo)?;
     let path = reservation_path(state_root, repo)?;
     let prior = read(state_root, repo, Utc::now());
-    match fs::remove_file(&path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(format!("cannot remove {}: {error}", path.display())),
+    if prior == SoloState::Absent {
+        return Ok(false);
     }
     audit(
         state_root,
@@ -578,7 +577,11 @@ pub fn release(state_root: &Path, repo: &str, why: &str) -> Result<bool, String>
         repo,
         serde_json::json!({"why": why, "prior": prior.report()}),
     )?;
-    Ok(true)
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!("cannot remove {}: {error}", path.display())),
+    }
 }
 
 /// The reserved pull request as GitHub shows it now.
@@ -678,15 +681,21 @@ pub fn apply_decision(
         Reconcile::Latch => {
             let mut latched = current;
             latched.seen_in_queue = true;
-            write_record(&path, &latched)?;
             audit(
                 state_root,
                 "seen_in_queue",
                 &repo,
                 serde_json::json!({"pr": latched.pr, "head": latched.head}),
             )?;
+            write_record(&path, &latched)?;
         }
         Reconcile::Clear(why) => {
+            audit(
+                state_root,
+                "ended",
+                &repo,
+                serde_json::json!({"pr": current.pr, "head": current.head, "why": why}),
+            )?;
             fs::remove_file(&path)
                 .or_else(|error| {
                     if error.kind() == io::ErrorKind::NotFound {
@@ -696,12 +705,6 @@ pub fn apply_decision(
                     }
                 })
                 .map_err(|error| format!("cannot remove {}: {error}", path.display()))?;
-            audit(
-                state_root,
-                "ended",
-                &repo,
-                serde_json::json!({"pr": current.pr, "head": current.head, "why": why}),
-            )?;
         }
     }
     Ok(read(state_root, &repo, now))
@@ -911,6 +914,18 @@ mod tests {
         assert!(audit.contains("left_queue"), "{audit}");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_reservation_that_cannot_be_audited_is_not_made() {
+        let temp = tempfile::tempdir().expect("temp");
+        let audit_path = temp.path().join(SOLO_AUDIT_FILE);
+        ensure_private_dir(audit_path.parent().expect("dir")).expect("dir");
+        // A directory where the log should be: the append fails.
+        fs::create_dir(&audit_path).expect("block the audit log");
+        assert!(reserve(temp.path(), &reservation(451)).is_err());
+        assert_eq!(read(temp.path(), REPO, at(1)), SoloState::Absent);
+    }
+
     #[test]
     fn a_decision_never_ends_a_reservation_that_replaced_the_one_it_judged() {
         let temp = tempfile::tempdir().expect("temp");
@@ -982,6 +997,26 @@ mod tests {
         assert!(guard.contains(&format!(r#"SOLO_SUBDIR = ("{first}", "{second}")"#)));
         assert!(guard.contains(&format!(r#"SOLO_KIND = "{KIND}""#)));
         assert!(guard.contains(&format!("SOLO_SCHEMA = {SCHEMA}")));
+    }
+
+    /// The admission actions are matched by their audit strings: each must
+    /// still be what its caller passes, or a renamed one would escape.
+    #[test]
+    fn every_paused_action_is_still_spelled_by_its_caller() {
+        let callers = [
+            include_str!("app/merge_steward_cmd/pr_mutations.rs"),
+            include_str!("app/merge_steward_cmd/fix_reorder.rs"),
+            include_str!("app/merge_steward_cmd/exact_head_merge.rs"),
+            include_str!("app/merge_steward_cmd/carrier.rs"),
+            include_str!("merge_queue_control.rs"),
+        ]
+        .concat();
+        for action in ADMISSION_ACTIONS {
+            assert!(
+                callers.contains(&format!("\"{action}\"")),
+                "no caller passes `{action}`"
+            );
+        }
     }
 
     #[test]
