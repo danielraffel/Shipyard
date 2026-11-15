@@ -1297,68 +1297,7 @@ two more variables:
 | `reorder` | refuse: dequeuing other PRs discards their merge-group runs; enqueue the PR that must land first with the queue's jump option |
 | `defect-fix` | allow, with a `WARNING`, and append a record |
 | `reorder-main-red-fix` | allow only when every PR removed is the one `GHAPP_QUEUE_REMOVAL_FIX_PR` names (it leaves the queue to jump back in); never another PR |
-| `solo` | allow only under a live solo reservation (below), and only for entries ahead of the reserved PR in its queue; never the reserved PR, an entry behind it, or another base |
 | missing or anything else | refuse |
-
-#### Solo reservations
-
-GitHub's merge queue batches entries, so a PR that must land alone (a release
-coalesce, the fix for a red base) shares a merge group with whatever was queued
-ahead of it, and dequeuing those entries is a `reorder`. A solo reservation is
-the sanctioned way to clear the queue for one PR:
-
-```bash
-# on the merge_queue.mutation_machine host
-shipyard merge-queue solo Generous-Corp/vellum#451 --reason release \
-  --note "v1.4 release coalesce must be its own merge group"
-GHAPP_ALLOW_QUEUE_REMOVAL=1 GHAPP_QUEUE_REMOVAL_REASON=solo \
-  GHAPP_QUEUE_REMOVAL_NOTE="clear the queue for #451" \
-  ghapp api graphql \
-  -f query='mutation($id:ID!){dequeuePullRequest(input:{id:$id}){clientMutationId}}' \
-  -f id=<node id of #418>
-shipyard merge-queue status          # lists reservations
-shipyard merge-queue solo-release Generous-Corp/vellum --reason "landed by hand"
-```
-
-`--reason` is one of `release`, `main-red-fix` or `incident`. The reservation is
-refused unless the PR is open and its current head carries a verified
-exact-head approval (the same gate the steward admits on; a base that requires
-no approval cannot be reserved), and unless this host is the configured
-mutation machine. It lasts `--ttl-minutes` (default 120, at most 480).
-
-While it is live the steward admits nothing else into that repository's queue
-(`held_solo_reservation:#<n>`; the audited mutation guard refuses the same
-admissions as a backstop), and the guard accepts a `solo` removal only when:
-
-- the reservation file under
-  `<state root>/merge_queue/solo/<owner>__<name>.json` is a 0600 regular file
-  owned by this user, not a link, unexpired, and well formed
-  (`SHIPYARD_SOLO_RESERVATION_DIR` overrides the directory for tests);
-- the reserved PR is open and queued at the reserved head and base; and
-- every PR removed is in that same queue at a smaller position.
-
-The audit record carries a `solo` object naming the reserved PR, its head and
-position, the reservation's reason and expiry, and each removed entry's
-position.
-
-A removed entry the steward manages is enqueued again once the reservation
-ends: a manual removal is not one of the reasons that bar the same head. The
-removal does count once toward the head's ejection cap (`EJECTION_CAP`, 2),
-like any manual dequeue, so a head removed twice needs an approval newer than
-the last removal. A PR only the native-arm backstop arms (no steward handoff)
-is not re-armed on the same head after a removal; it needs a new push or an
-arm by hand.
-
-The steward ends the reservation when the reserved PR merges, closes, gets a
-new head, or leaves the queue after a pass saw it there, and when the TTL runs
-out. An unread PR never ends it. An unreadable reservation file fails closed:
-it pauses every admission into that repository's queue (including the named
-PR), grants no removal, and is reported as an error in each tick until
-`shipyard merge-queue solo-release` removes it.
-
-A reservation is a pause and a bound on removals, never evidence of approval:
-the reserved PR is still admitted only through its own exact-head gate. It is
-not a boundary against a process of the same user forging Shipyard's state.
 
 An allowed removal reads each target PR through the App token and appends one
 JSON line (time, reason, note, fix PR, each target's repository, number, head

@@ -1320,8 +1320,7 @@ pub(super) enum MergeQueueCommand {
     /// Reserve a repository's merge queue for one approved pull request.
     ///
     /// While the reservation is active the steward admits nothing else into
-    /// that queue, and the `ghapp` removal guard accepts a `solo` removal of
-    /// an entry ahead of the reserved pull request. It ends when the pull
+    /// that queue; it removes nothing already queued. It ends when the pull
     /// request merges, closes, changes head or leaves the queue, or after
     /// `--ttl-minutes`. Refused unless the pull request's current head
     /// carries a verified exact-head approval and this host is the

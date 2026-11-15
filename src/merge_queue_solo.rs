@@ -5,11 +5,11 @@
 //! with whatever was queued ahead of it. A reservation names that pull
 //! request. While it is active:
 //!
-//! * every Shipyard admission into the repository's queue for any other pull
-//!   request is refused before GitHub is contacted (the steward reports
-//!   `held_solo_reservation:#<n>`), and
-//! * the `ghapp` queue-removal guard accepts a `solo` removal of an entry
-//!   *ahead of* the reserved pull request, and nothing else.
+//! every Shipyard admission into the repository's queue for any other pull
+//! request is refused before GitHub is contacted (the steward reports
+//! `held_solo_reservation:#<n>`). It removes nothing from the queue and adds
+//! no queue-removal guard exception: entries already queued stay where they
+//! are.
 //!
 //! A reservation is a pause and a bound on removals, never evidence of
 //! approval. It is created only for a pull request whose current head carries
@@ -19,7 +19,7 @@
 //! being seen in it, or when its TTL runs out.
 //!
 //! It fails closed: a reservation file that cannot be read or checked pauses
-//! every admission into that repository's queue and grants no removal, until
+//! every admission into that repository's queue until
 //! `shipyard merge-queue solo-release` removes it.
 //!
 //! The record lives under the machine state root and is protected like the
@@ -239,7 +239,7 @@ pub enum SoloState {
     /// A reservation whose TTL ran out; it pauses nothing.
     Expired(Reservation),
     /// A file that is there but cannot be trusted. Pauses every admission
-    /// into the repository's queue and grants no removal.
+    /// into the repository's queue.
     Unreadable {
         /// The file.
         path: PathBuf,
@@ -974,29 +974,6 @@ mod tests {
         );
         assert!(reservation_path(Path::new("/s"), "../x").is_err());
         assert!(reservation_path(Path::new("/s"), "a/b/c").is_err());
-    }
-
-    /// The `ghapp` removal guard finds the reservation without asking
-    /// Shipyard, so its default directory must be this one.
-    #[test]
-    fn the_removal_guard_reads_reservations_where_shipyard_writes_them() {
-        use crate::identity::RuntimeMode;
-        use crate::paths::RuntimePaths;
-        use crate::platform::Platform;
-        let guard = include_str!("../scripts/ghapp_queue_removal_guard.py");
-        let home = Path::new("/h");
-        let mac = RuntimePaths::for_platform(Platform::MacOs, home, RuntimeMode::Shipyard);
-        let linux = RuntimePaths::for_platform(Platform::Linux, home, RuntimeMode::Shipyard);
-        assert_eq!(
-            mac.state_dir,
-            Path::new("/h/Library/Application Support/shipyard")
-        );
-        assert_eq!(linux.state_dir, Path::new("/h/.local/state/shipyard"));
-        assert!(guard.contains(r#"SOLO_STATE_STEM = "shipyard""#));
-        let (first, second) = SOLO_DIR.split_once('/').expect("two parts");
-        assert!(guard.contains(&format!(r#"SOLO_SUBDIR = ("{first}", "{second}")"#)));
-        assert!(guard.contains(&format!(r#"SOLO_KIND = "{KIND}""#)));
-        assert!(guard.contains(&format!("SOLO_SCHEMA = {SCHEMA}")));
     }
 
     /// The admission actions are matched by their audit strings: each must
