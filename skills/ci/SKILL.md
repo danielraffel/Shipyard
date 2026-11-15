@@ -1661,6 +1661,10 @@ selector-eligible runner sits outside its approved prefix or carries the
 opposite capability. Never reuse either lease for secret-bearing or
 `pull_request_target` jobs.
 
+### Survivability: will the lane still be there after an ordinary exit?
+
+A lane being served now does not mean it survives a cancel signal. A LaunchAgent with `RunAtLoad` and no `KeepAlive` is not supervised, and it takes the lane out for good after one exit. Check with `launchctl print gui/$(id -u)/<label>`, never `launchctl list` over SSH, and run it first against a job you know is loaded. An empty runner census is a scope error until proven otherwise. Detail: `docs/fleet-health-lessons.md`.
+
 ### A queued job that nobody will ever pick up
 
 The lane assertions ask *is a runner serving this lane*. None of them asks
@@ -2474,6 +2478,10 @@ What it does:
 
 See `docs/cloud-retarget.md` for full context; add-lane complements retarget.
 
+### A health verdict needs a control too
+
+A verdict you cannot contradict is an assertion. Before accepting that a host is dead, look for work on it: a runner that is `busy`, or a job that finished there after the claim, refutes the claim. Silence refutes nothing, since an idle host is healthy. `online` is not proof of life, and a stale vitals file is unknown rather than green. Detail: `docs/fleet-health-lessons.md`.
+
 ## Before blaming a lane: a runner census needs both scopes and a control
 
 A job stuck `queued` on self-hosted labels has three very different causes that
@@ -3052,6 +3060,10 @@ the same run IDs without re-dispatching. On SHA or merge-policy drift the
 resume is refused with a clear message — re-run with `--no-resume` to
 archive the stale state and start fresh. Full details in
 [`docs/ship-resume.md`](../../docs/ship-resume.md).
+
+### Being right does not discharge the duty
+
+A process that exits fail-closed because it cannot prove a resource is gone made the right call, and must never be "fixed" by making it proceed. But the refusal starts an obligation: bound the retry, give every held resource an owner or an explicit release, and raise the failure somewhere that outlives the host. A clean exit holding nothing owes nothing, and an exit you cannot observe is unknown, not discharged. Detail: `docs/fleet-health-lessons.md`.
 
 ## Queue management
 

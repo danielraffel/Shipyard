@@ -2586,6 +2586,10 @@ python3 scripts/finish_line_status.py \
   --json
 ```
 
+### Being right does not discharge the duty
+
+A process that exits fail-closed because it cannot prove a resource is gone made the right call, and must never be "fixed" by making it proceed. But the refusal starts an obligation: bound the retry, give every held resource an owner or an explicit release, and raise the failure somewhere that outlives the host. A clean exit holding nothing owes nothing, and an exit you cannot observe is unknown, not discharged. Detail: `docs/fleet-health-lessons.md`.
+
 ## Zero runners fleet-wide: suspect the admission gate's own observation cost
 
 `runner admission-clean` is the gate TartCI calls immediately before registering
@@ -2731,6 +2735,10 @@ auto_fix = false
 reap_in_progress_max_min = 300
 reap_queued_max_min = 480
 ```
+
+### A health verdict needs a control too
+
+A verdict you cannot contradict is an assertion. Before accepting that a host is dead, look for work on it: a runner that is `busy`, or a job that finished there after the claim, refutes the claim. Silence refutes nothing, since an idle host is healthy. `online` is not proof of life, and a stale vitals file is unknown rather than green. Detail: `docs/fleet-health-lessons.md`.
 
 ## Fleet Service Assertions (assert service, never liveness)
 
@@ -2968,6 +2976,10 @@ tables are internally coherent, so this is a difference to know rather than a
 bug to fix — but a caller that branches on a bare `$?` without tracking which
 command produced it will read one of them backwards. Branch per command, or read
 the `--json` envelope, which names the outcome instead of encoding it.
+
+### Survivability: will the lane still be there after an ordinary exit?
+
+A lane being served now does not mean it survives a cancel signal. A LaunchAgent with `RunAtLoad` and no `KeepAlive` is not supervised, and it takes the lane out for good after one exit. Check with `launchctl print gui/$(id -u)/<label>`, never `launchctl list` over SSH, and run it first against a job you know is loaded. An empty runner census is a scope error until proven otherwise. Detail: `docs/fleet-health-lessons.md`.
 
 ### A queued job that nobody will ever pick up
 

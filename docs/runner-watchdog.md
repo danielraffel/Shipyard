@@ -354,6 +354,8 @@ macos-15                                       bare string -> Hosted
 local-only                                     sentinel    -> names no runner
 ```
 
+Further incident lessons from this family (supervisor scan blindness, relay hop cost, guard arming, escalation hysteresis, leaks and handback) are in `docs/fleet-health-lessons.md`.
+
 ### A refusal must name its boundary
 
 `Unknown` always carries a `Boundary`, and no measured verdict carries one. The
