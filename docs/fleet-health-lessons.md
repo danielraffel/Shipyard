@@ -1,6 +1,8 @@
 # Fleet health lessons
 
-A design that implemented these checks as typed assertions (scan blindness, relay hop cost, guard arming, escalation with hysteresis, leak detection, handback, health reconciliation, runner survivability) was removed unused. The last commit that contained it is `5dd671185d776e46a93239e5922c3694a20bfcf1`. A future fleet watchdog can start from that history and from the lessons below, each of which was paid for by a real incident.
+A Rust design that implemented these checks as typed assertions (scan blindness, relay hop cost, guard arming, escalation with hysteresis, leak detection, handback, health reconciliation, runner survivability) was never wired to a command and was removed. Commit `cc1415c66e988aedbb760ca10105d66525c28a60` is the last main commit that contains it.
+
+The live fleet watchdog is separate: the `fleet-health` (daily) and `fleet-liveness` (every 10 minutes) scripts in the agent-skills repo check reachability, the Shipyard daemon, runner registration, TartCI pool and self-update state, and post failures to the fleet Discord channel. See the fleet-handbook's `docs/monitoring.md`. The lessons below, each paid for by a real incident, apply to that watchdog or any successor.
 
 ## Supervisor scan blindness is a ratio, never a sample
 
