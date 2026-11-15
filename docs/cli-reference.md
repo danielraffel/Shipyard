@@ -878,7 +878,7 @@ with a placement-correct share per job class), queue wait per job ahead,
 merge-queue attempts per merged PR with ejections by cause (`gate_failed`,
 `starved`, `cancelled_after_start`), push cancellations (PR-head gate runs
 cancelled after a newer commit on the same branch started a run), receipt
-reuse, and batch fullness. Each block carries `evidence.sample` and
+reuse, and batch fullness. `gate-cost` has no repeat-of-merge-group-sha counter; the scorecard's repeat runs come from `tools/metrics/pr_metrics.py`. Each block carries `evidence.sample` and
 `evidence.min_sample`; below the minimum, draw no verdict. Answers that can no
 longer change (jobs of a completed run attempt, annotations of a completed
 check run, commit parents) are cached under the state directory and reused by

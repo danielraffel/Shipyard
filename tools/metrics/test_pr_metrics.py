@@ -405,6 +405,12 @@ class Proxies(Base):
         self.assertEqual((c["runs"], c["repeat_runs"], c["group_runs"]), (2, 1, 1))
 
 
+class VellumControl(unittest.TestCase):
+    def test_the_vellum_push_runs_on_a_merge_group_sha_count_as_repeats(self):
+        runs = json.loads((HERE / "fixtures" / "vellum-gpu-runs-20261113-15.json").read_text())
+        self.assertEqual(pm.push_repeats_of_group_shas(runs), (44, 42))
+
+
 class Controls(Base):
     LATE = dt.datetime(2026, 11, 30, tzinfo=UTC)
 

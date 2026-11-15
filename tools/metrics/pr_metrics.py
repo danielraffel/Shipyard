@@ -295,6 +295,14 @@ def runs_index(rd, lo, hi):
     return runs, full
 
 
+def push_repeats_of_group_shas(runs):
+    """(push runs, push runs that repeat a merge_group run of the same workflow on the same sha).
+    The queue fast-forwards the base to the group sha, so such a push re-runs what the group already proved."""
+    group = {(r.get("name"), r.get("head_sha")) for r in runs if r.get("event") == "merge_group"}
+    push = [r for r in runs if r.get("event") == "push"]
+    return len(push), sum(1 for r in push if (r.get("name"), r.get("head_sha")) in group)
+
+
 def pr_compute(rd, f, runs, runs_complete):
     heads = set(f["heads"])
     mg = re.compile(rf"^gh-readonly-queue/{re.escape(f['base'])}/pr-{f['number']}-")
@@ -774,6 +782,7 @@ def sample_label(s, truncated):
 
 def markdown(e2e):
     L = ["", f"## Scorecard {e2e['scorecard_version']}: end-to-end per eligible PR (cohort = UTC day the PR became ready)", "",
+         "Baseline cohort: PRs ready 2026-11-12 to 2026-11-14. A day closes 48h after it ends, so the first comparable later cohort day closes 48h after that day.", "",
          f"Reads {e2e['reads']} (cap {e2e['read_cap_per_repo']} per repo), truncated={str(e2e['truncated']).lower()}"
          + (" : a truncated window is insufficient sample" if e2e["truncated"] else "") + f". Coverage: {e2e['coverage']['status']} {e2e['coverage']['reason']}", "",
          f"North Star: eligible PRs that became ready in the window and merged within 48h of ready with no owner action ({e2e['owner']}'s own account: "

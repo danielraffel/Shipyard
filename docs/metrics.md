@@ -30,7 +30,7 @@ it is on only when the tick passes `--e2e-cache DIR` (the daily run does, unless
 | North Star outcomes | `autonomous`, `owner_action`, `unknown`, `not_merged_in_48h`. **Unknown**: an owner-identity commit with no agent trailer (`Co-Authored-By: Claude`/`Codex`, `Version-Bump:`, `Skill-Update:`, `Release:`), because agents commit under the owner's git identity; or a timeline or commit list not read in full. The unknown share is always shown; above 20% the rate prints as a range (autonomous over all, to autonomous plus unknown over all). `gh-only` is the same rate ignoring commits. |
 | **Verdict proxies (mechanism, per ready PR)** | **Review rounds**: HOLD verdicts per ready PR (comments or reviews that start with `HOLD` or `verdict: HOLD`); **re-HOLD rate**: PRs with a HOLD after a repair push or `repaired:` comment over PRs with a HOLD, per PR and by size bucket (<200, 200-800, >800 changed lines). **Agent pushes**: commits after the first ready moment, one per distinct minute, split into `merge_main` (a `Merge branch 'main'` commit), `repair` (after the first HOLD or `repaired:`) and `author` (before). **Merge-queue attempts** per ready PR (`added_to_merge_queue` events) and **ejections by cause** (`removed_from_merge_queue` reasons other than `merged`). **DIRTY per 100 PRs**: PRs whose tick token held `merge_state:DIRTY`. |
 | Handoff-to-merge time | Median and p90 minutes from first ready to `merged_at`. **Load-dependent context, not the verdict.** |
-| **Compute per merged PR** | Verdict: gate **runs** per merged PR, and repeat runs (a run of a workflow on a sha that workflow already ran on, including a push to the base on a merge-group sha, since the queue fast-forwards the base). Runs counted: those whose `head_sha` is one of the PR's heads (its commits and force-push SHAs), its `merge_group` runs (`gh-readonly-queue/<base>/pr-<n>-...`), and pushes on its merge-group shas. Job minutes (`completed_at` minus `started_at`, split by the `self-hosted` label) are context. |
+| **Compute per merged PR** | Verdict: gate **runs** per merged PR, and repeat runs (a run of a workflow on a sha that workflow already ran on, including a push to the base on a merge-group sha, since the queue fast-forwards the base). Runs counted: those whose `head_sha` is one of the PR's heads (its commits and force-push SHAs), its `merge_group` runs (`gh-readonly-queue/<base>/pr-<n>-...`), and pushes on its merge-group shas. `gate-cost` has no repeat-of-merge-group-sha counter; the scorecard's repeat runs come from `tools/metrics/pr_metrics.py`. Job minutes (`completed_at` minus `started_at`, split by the `self-hosted` label) are context. |
 | **Correctness** | Of merged eligible PRs: a revert (a commit `Revert ...` naming the merge sha or `#<n>`) within 7 days, or a required check red on the base at the merge commit or the next push (a `base_poison` red-everywhere episode in the ticks if one began then, else check runs against the required contexts; `cancelled` is not red). Provisional while the PR is under 7 days old. **Escaped defect** (best effort): a later PR merged within 14 days whose title or body names this PR as the cause on one line (`fix ... #N`, `regression`, `broke`, `caused`, `introduced`); the detection floor is titles and bodies naming the PR only, so it is never complete. |
 
 ## Controls
@@ -59,3 +59,13 @@ api`, others through `ghapp api`. `--read-cap` (default 100) is the most reads p
 split evenly; a repo that hits its share is `truncated` and the next run resumes from the cache. Each
 report prints the read count and the `truncated` flag. A read that fails leaves a PR unread or a
 field null, never zero. `--baseline FROM:TO` (default `2026-11-12:2026-11-14`, `none` to drop it).
+
+## Baseline cohort
+
+The baseline cohort is the PRs ready 2026-11-12 to 2026-11-14. A day closes 48 hours after it ends
+(11-12 at 11-15 00:00 UTC, 11-14 at 11-17 00:00 UTC), so the first comparable later cohort day
+closes 48 hours after that day. The frozen baseline is recomputed after 2026-11-17 00:05 UTC from
+the cache.
+
+The Vellum positive control for repeat runs is `tools/metrics/fixtures/vellum-gpu-runs-20261113-15.json`:
+of 44 push runs of the GPU proof, 42 are on a sha a merge-group run already ran.
