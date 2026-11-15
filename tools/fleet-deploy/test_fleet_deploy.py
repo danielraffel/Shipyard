@@ -287,6 +287,17 @@ class FleetDeployTests(unittest.TestCase):
         self.assertFalse((self.live / "escaped").exists())
         self.assertIn("unit=fleet-loop refused rc=124", self.log.read_text())
 
+    def test_fleet_loop_rejects_malformed_timeout_without_starting_installer(self):
+        self.enable_loop()
+        self.commit("fleet-handbook", "scripts/fleet-loop/install-fleet-loop.sh",
+                    "#!/bin/bash\necho started > \"$FLEET_PASS_LIVE/started\"\n"
+                    "(sleep 1; echo escaped > \"$FLEET_PASS_LIVE/escaped\") &\nwait\n")
+        self.run_deploy(FLEET_DEPLOY_FLEET_LOOP_TIMEOUT_S="not-a-number")
+        time.sleep(2)
+        self.assertFalse((self.live / "started").exists())
+        self.assertFalse((self.live / "escaped").exists())
+        self.assertIn("unit=fleet-loop refused rc=125", self.log.read_text())
+
     def test_fleet_loop_off_switch(self):
         self.enable_loop()
         self.run_deploy(FLEET_DEPLOY_FLEET_LOOP="off")

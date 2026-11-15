@@ -92,21 +92,39 @@ install_file() {
 # after SECONDS, so a hung launcher or check can never hold the deploy lock.
 bounded() {
   /usr/bin/python3 -c '
-import os, signal, subprocess, sys
+import math, os, signal, subprocess, sys
+
+def reap_killed(proc):
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    proc.communicate()
+
+try:
+    timeout = float(sys.argv[1])
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError
+except (TypeError, ValueError, OverflowError):
+    sys.exit(125)
+
+proc = None
 try:
     proc = subprocess.Popen(sys.argv[2:], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                             stdin=subprocess.DEVNULL, start_new_session=True)
     try:
-        out, _ = proc.communicate(timeout=float(sys.argv[1]))
+        out, _ = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        proc.communicate()
+        reap_killed(proc)
         sys.exit(124)
 except OSError:
+    if proc is not None:
+        reap_killed(proc)
     sys.exit(126)
+except Exception:
+    if proc is not None:
+        reap_killed(proc)
+    sys.exit(125)
 sys.stdout.buffer.write(out)
 sys.exit(proc.returncode)
 ' "$@"
