@@ -148,7 +148,7 @@ rather than stacking them.
 
 ### Bypass trailers (tip commit, never PR body)
 
-A PR needs no `Version-Bump:` trailer: version-at-land assigns versions on main, and the PR gate reports "assigned post-merge". Do not write `cli=skip` to "defer to version-at-land" (it suppressed the release for #1393; version-at-land now ignores such a skip). Use `skip` only for a real decision, with its own reason (for example `comment-only refactor`).
+A PR needs no `Version-Bump:` trailer. At land, version-at-land takes versions from the change and ignores `Version-Bump: <surface>=skip` (it suppressed the release for #1393); only `Release: skip reason="..."` opts a change out.
 
 | Gate          | Trailer                                                      |
 |---------------|--------------------------------------------------------------|

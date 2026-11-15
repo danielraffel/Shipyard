@@ -193,7 +193,7 @@ class VersionAtLandTests(unittest.TestCase):
 
     def test_skip_trailer_covers_only_its_own_change(self) -> None:
         self._land("src/telemetry.rs", "pub fn shadow() {}\n",
-                   'feat: internal telemetry\n\nVersion-Bump: cli=skip reason="internal"')
+                   'feat: internal telemetry\n\nRelease: skip reason="internal"')
         self._land("src/cli.rs", "pub fn cli() {}\n", "fix: cli")
         payload = self._plan()
         self.assertEqual(payload["status"], "dry-run")
@@ -202,10 +202,10 @@ class VersionAtLandTests(unittest.TestCase):
 
     def test_skip_trailer_alone_still_assigns_nothing(self) -> None:
         self._land("src/telemetry.rs", "pub fn shadow() {}\n",
-                   'feat: internal telemetry\n\nVersion-Bump: cli=skip reason="internal"')
+                   'feat: internal telemetry\n\nRelease: skip reason="internal"')
         self.assertEqual(self._plan()["plan"], [])
 
-    def test_skip_that_defers_to_version_at_land_is_ignored(self) -> None:
+    def test_version_bump_skip_never_suppresses_a_release_at_land(self) -> None:
         # Shipyard #1393: a src/ fix carried this trailer and no release opened.
         self._land("src/steward.rs", "pub fn steward() {}\n",
                    "fix(steward): classify an unmanaged PR\n\n"
@@ -213,13 +213,18 @@ class VersionAtLandTests(unittest.TestCase):
         self.assertEqual([(item["surface"], item["assigned"]) for item in self._plan()["plan"]],
                          [("cli", "0.292.1")])
 
-    def test_deliberate_skip_with_its_own_reason_stays_honoured(self) -> None:
+    def test_version_bump_skip_with_its_own_reason_is_ignored_too(self) -> None:
         self._land("src/steward.rs", "pub fn steward() {}\n",
                    'fix: internal\n\nVersion-Bump: cli=skip reason="comment-only refactor"')
+        self.assertEqual([item["assigned"] for item in self._plan()["plan"]], ["0.292.1"])
+
+    def test_a_comment_only_change_is_still_no_release(self) -> None:
+        self._land("src/steward.rs", "pub fn steward() {}\n", "fix: add")
+        self.base = run(self.repo, "git", "rev-parse", "HEAD").stdout.strip()
+        self._land("src/steward.rs", "// a note\npub fn steward() {}\n", "docs: comment")
         self.assertEqual(self._plan()["plan"], [])
 
-    def test_pr_gate_still_honours_a_deferring_skip(self) -> None:
-        # Only version-at-land ignores it; the PR-time report is unchanged.
+    def test_pr_gate_report_is_unchanged_by_a_skip(self) -> None:
         self._land("src/steward.rs", "pub fn steward() {}\n",
                    'fix: x\n\nVersion-Bump: cli=skip reason="assigned at land"')
         result = self.gate()
@@ -229,7 +234,7 @@ class VersionAtLandTests(unittest.TestCase):
     def test_skipped_side_branch_merged_after_marker_does_not_block_later_landings(self) -> None:
         run(self.repo, "git", "checkout", "-qb", "side")
         self._land("src/telemetry.rs", "pub fn shadow() {}\n",
-                   'feat: internal telemetry\n\nVersion-Bump: cli=skip reason="internal"')
+                   'feat: internal telemetry\n\nRelease: skip reason="internal"')
         run(self.repo, "git", "checkout", "-q", "main")
         run(self.repo, "git", "merge", "-q", "--no-ff", "side", "-m", "Merge side")
         self._land("src/cli.rs", "pub fn cli() {}\n", "fix: cli")

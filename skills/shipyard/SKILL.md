@@ -1146,8 +1146,9 @@ repository.
 
 It judges each first-parent change since the last `Version-Bump-Applied` marker
 on its own, then takes the highest level per surface. A
-`Version-Bump: <surface>=skip` trailer therefore skips only the change that
-carries it. Before 2026-10-23 the whole range was judged at once, so one
+`Release: skip reason="..."` trailer skips only the change that carries it;
+a `Version-Bump: <surface>=skip` is ignored at land (it suppressed #1393's
+release for 11.5 h). Before 2026-10-23 the whole range was judged at once, so one
 skipped change merged after the marker silenced every later release. Shipyard
 sat at v0.344.1 for six days because of it. If `main` keeps landing src changes
 but no tag appears, run

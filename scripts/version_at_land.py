@@ -31,6 +31,7 @@ from version_bump_check import (
     assess_surfaces,
     bump_version,
     git_diff_names,
+    git_range_trailers,
     load_config,
     max_level,
     read_version,
@@ -105,6 +106,16 @@ def drain_base(repo: Path, head: str, fallback: str | None) -> str:
     return git(repo, "rev-parse", f"{head}^1").stdout.strip()
 
 
+def release_skipped(parent: str, commit: str) -> bool:
+    """Whether the change opts out of a release with `Release: skip`.
+
+    `Version-Bump: <surface>=skip` no longer does at land: no pull request gate
+    asks for a bump, so agents wrote it by habit and it suppressed releases.
+    """
+    return any(value.lower().startswith("skip")
+               for value in git_range_trailers(parent, commit).get("release", []))
+
+
 def plan(repo: Path, config: Config, base: str, head: str) -> list[Assignment]:
     """Assess every change that landed on main since `base` on its own, then
     take the highest level per surface.
@@ -121,9 +132,11 @@ def plan(repo: Path, config: Config, base: str, head: str) -> list[Assignment]:
         if is_bump_landing(repo, commit):
             continue
         parent = git(repo, "rev-parse", f"{commit}^1").stdout.strip()
+        if release_skipped(parent, commit):
+            continue
         changed = git_diff_names(parent, commit)
         for verdict in assess_surfaces(config, changed, parent, commit, repo,
-                                       ignore_deferring_skip=True):
+                                       honor_skip=False):
             name = verdict.surface.name
             levels[name] = max_level(levels.get(name, "none"), verdict.final_level)
     assignments: list[Assignment] = []
