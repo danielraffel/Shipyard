@@ -80,6 +80,23 @@ class Base(unittest.TestCase):
         return {r["pr"]: r for r in out["repos"][REPO]["prs"]}
 
 
+class SharedCap(Base):
+    def test_total_reads_never_exceed_cap_when_cap_below_repo_count(self):
+        repos = [f"o/r{i}" for i in range(5)]
+        gh = world([pr(1, T(10, "10:00"), T(10, "11:00"))])
+        out = pm.build(repos, self.cache, 1, OWNER, START, NOW, {}, {}, None, gh)
+        self.assertLessEqual(out["reads"], 1)
+        self.assertLessEqual(len(gh.calls), 1)
+        self.assertTrue(out["truncated"])
+        self.assertEqual(out["coverage"]["status"], "partial")
+
+    def test_zero_cap_issues_no_reads(self):
+        gh = world([pr(1, T(10, "10:00"), T(10, "11:00"))])
+        out = pm.build([REPO, "o/other"], self.cache, 0, OWNER, START, NOW, {}, {}, None, gh)
+        self.assertEqual(len(gh.calls), 0)
+        self.assertTrue(out["truncated"])
+
+
 class Autonomy(Base):
     def test_owner_label_is_an_owner_action_and_bot_events_are_not(self):
         tl = {1: [{"event": "labeled", "actor": {"login": "shipyard-local[bot]"}, "created_at": T(10, "10:30")}],
@@ -484,7 +501,10 @@ class Caps(Base):
         self.assertTrue(out["truncated"] and v["truncated"])
         self.assertGreater(v["unread_prs"], 0)
         self.assertEqual(out["coverage"]["status"], "partial")
+        md = pm.markdown(out)
+        self.assertIn(f"**TRUNCATED: {v['unread_prs']} PRs unread**", md)
         again = self.build(world(prs), cap=200)
+        self.assertNotIn("TRUNCATED:", pm.markdown(again))
         self.assertFalse(again["truncated"])
         self.assertEqual(len(again["repos"][REPO]["prs"]), 4)
 
@@ -506,7 +526,7 @@ class Integrated(unittest.TestCase):
             (Path(d) / f"acme_repo-{lr.dt.datetime.strftime(t, '%Y%m%dT%H%M%SZ')}.json").write_text(json.dumps(tick))
             p = pr(1, T(11, "08:00"), T(11, "09:00"))
             gh = world([p], base_commits=[commit(p["merge_commit_sha"], date=T(11, "09:00"))])
-            rep = lr.build_report(d, dt.timedelta(days=4), NOW, e2e={"cache_dir": c, "cap": 50, "owner": OWNER, "fetch": gh})
+            rep = lr.build_report(d, dt.timedelta(days=4), NOW, e2e={"cache_dir": c, "cap": 50, "owner": OWNER, "fetch": gh, "repos": [REPO]})
             e = rep["end_to_end"]["repos"][REPO]
             self.assertEqual(e["per_day"]["2026-11-11"]["ready_prs"], 1)
             self.assertEqual(e["prs"][0]["correct"]["base_red_source"], "ticks")
@@ -515,6 +535,23 @@ class Integrated(unittest.TestCase):
             plain = lr.build_report(d, dt.timedelta(days=4), NOW)
             self.assertIsNone(plain["end_to_end"])
             self.assertIn("no --e2e-cache", lr.markdown(plain))
+
+    def test_defaults_are_the_five_fleet_repos_and_a_1500_cap(self):
+        seen = {}
+
+        def fake_build(repos, cache, cap, *a, **k):
+            seen.update(repos=list(repos), cap=cap)
+            return {}
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as c:
+            orig = pm.build
+            pm.build = fake_build
+            try:
+                lr.build_report(d, dt.timedelta(days=1), NOW, e2e={"cache_dir": c})
+            finally:
+                pm.build = orig
+        self.assertEqual(seen["cap"], 1500)
+        self.assertEqual(seen["repos"], ["Generous-Corp/pulp", "Generous-Corp/vellum", "danielraffel/Shipyard",
+                                         "danielraffel/tartci", "danielraffel/fleet-handbook"])
 
 
 if __name__ == "__main__":

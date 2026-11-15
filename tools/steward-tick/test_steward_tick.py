@@ -90,6 +90,26 @@ class StewardTickArchiveTests(unittest.TestCase):
         self.assertIn("acme/repo release-canary status=fail tag=v1.0.1", summary.read_text())
         self.assertIn("--repo acme/repo --daily --apply", (self.home / "canary-args").read_text())
 
+    def test_loss_report_gets_the_five_repos_a_sized_cap_and_keeps_its_stderr(self):
+        fake = self.home / "fake_loss_report.py"
+        fake.write_text(
+            "import os, sys\n"
+            "open(os.path.join(os.environ['HOME'], 'lr-args'), 'w').write(' '.join(sys.argv[1:]))\n"
+            "sys.stderr.write('boom from loss report\\n')\n"
+        )
+        result = self.run_tick(SHIPYARD_LOSS_REPORT_SCRIPT=str(fake))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        err = self.log_dir / "loss-report.err"
+        for _ in range(100):
+            if err.exists() and "boom" in err.read_text():
+                break
+            time.sleep(0.1)
+        self.assertIn("boom from loss report", err.read_text())
+        args = (self.home / "lr-args").read_text()
+        self.assertIn("--read-cap 1500", args)
+        self.assertIn("--repos Generous-Corp/pulp,Generous-Corp/vellum,danielraffel/Shipyard,danielraffel/tartci,danielraffel/fleet-handbook", args)
+        self.assertIn("--e2e-cache", args)
+
     def test_release_canary_off_switch(self):
         result = self.run_tick(SHIPYARD_RELEASE_CANARY="off")
         self.assertEqual(result.returncode, 0, result.stderr)
