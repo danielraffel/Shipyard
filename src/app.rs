@@ -40,7 +40,6 @@ mod diagnose_cmd;
 mod doctor_cmd;
 mod dwell_cmd;
 mod execution_worker_cmd;
-pub mod fleet_escalation_cmd;
 mod fleet_status_cmd;
 mod fleet_update_cmd;
 mod git_credential_cmd;

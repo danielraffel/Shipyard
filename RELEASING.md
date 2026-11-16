@@ -149,7 +149,7 @@ The script runs the full pipeline on the local Mac:
 2. Builds `target/release/shipyard` and `target/release/shipyard-workstream-provider` unless both are supplied with `--skip-build --binary <path> --companion-binary <path>`.
 3. Signs both Mach-O binaries with `--options runtime --timestamp` (notarytool prerequisites).
 4. Packages both signed binaries into one `.dmg`, signs the DMG, submits it via `xcrun notarytool submit --wait --timeout 20m`, and staples the accepted ticket. `--timeout` bounds only the wait for Apple's verdict, not the upload or credential lookup, so every `notarytool` process also has a 25-minute wall-clock cap with stdin closed. A stalled or failed attempt is retried at most twice, after 60 s and 180 s. Once Apple has returned a submission id, a retry waits on that submission (`notarytool wait <id>`) instead of uploading a duplicate. The id is printed (and written to the step summary in CI) as soon as it arrives, so `xcrun notarytool info <id>` and `xcrun notarytool log <id>` can diagnose a run later. An `Invalid` or `Rejected` verdict fails at once and prints `notarytool log`. In CI the signing step has `timeout-minutes: 115` and the job `timeout-minutes: 210`, so a hang can no longer hold a release draft for the 6-hour default.
-5. **Runs both binaries' `--version` from the mounted DMG locally.** If either fails, the script exits and does NOT upload. This is the whole point — the Mac running the script is the same Mac that will need to launch the binaries tomorrow.
+5. **Runs both binaries' `--version` from the mounted DMG locally.** If either fails, the script exits and does NOT upload. This is the whole point — the Mac running the script is the same Mac that will need to launch the binaries tomorrow. Each binary must also report exactly the tag's version (`shipyard 0.438.0` for `v0.438.0`), checked here (exit 3), by the `install.sh` E2E for every installed tag (exit 4, release back to draft), and by the Linux release build on every `v*` tag before upload.
 6. On launch success: uploads via `gh release upload --clobber`, updates `checksums.sha256`, verifies public asset visibility, and runs the `install.sh` E2E. In CI the release workflow splits this: the upload step runs with `--defer-publish` (the release stays a draft), the DMG is attested, and only then does a `--publish-only` step publish it and run the install E2E. A host never sees a published release without an attestation, because `fleet-update` refuses one. Every `actions/attest` step (DMG and non-macOS assets) gets three attempts with 30 s and 90 s backoff, since Sigstore has transient TLS and 5xx failures; the action cannot report why it failed, so a deterministic failure also uses all three attempts before it fails the job.
 7. With `--rollback-tag`, verifies baseline install, pair upgrade, and rollback in an isolated temp install directory; rollback before v0.127.0 must remove the provider companion.
 8. **Rolls the published tag out to the fleet and verifies every host.** It runs the controller's `shipyard --json runner fleet-update --to vX.Y.Z --all-hosts --apply --lagging-only`, so hosts already on the tag are skipped rather than reinstalled. That governed rollout updates each configured host class one at a time, with the controller's own host last. It then re-reads each host in a fresh process:
@@ -157,9 +157,9 @@ The script runs the full pipeline on the local Mac:
    - the daemon must answer `daemon status` as that version from the refreshed pid;
    - when the release ships `shipyard guards`, its ghapp guards are installed (the install's own result is authoritative, and any replaced copy is named) and must be current.
 
-   A host whose update may have committed but did not verify (failed verification, rejected evidence, pair-hash drift, or a timeout) is rolled back automatically to the version it ran before, through the same governed path, and re-verified. If that rollback fails, the host is quarantined, an alert issue is opened, and the stage prints "FLEET ROLLBACK FAILED … needs an operator now". No rollout touches a quarantined host until `shipyard runner fleet-reconcile --clear-host <class>`. If another rollout holds the controller lock (exit 75), the stage warns and hands over instead of failing. The run stops at that host and ends with a `fleet_summary` naming verified, failed and not-attempted hosts. A failure exits `6` and names every lagging host. **The release is not reverted**: it is already public and install-verified. Fix the host, then rerun `shipyard runner fleet-update --to vX.Y.Z --host-class <class> --apply`, or let `shipyard runner fleet-reconcile` retry after its soak.
+   A host whose update may have committed but did not verify (failed verification, rejected evidence, pair-hash drift, or a timeout) is rolled back automatically to the version it ran before, through the same governed path, and re-verified. If that rollback fails, the host is quarantined, an alert issue is opened, and the stage prints "FLEET ROLLBACK FAILED … needs an operator now". No rollout touches a quarantined host until `shipyard runner fleet-update --clear-host <class>`. If another rollout holds the controller lock (exit 75), the stage warns and hands over instead of failing. The run stops at that host and ends with a `fleet_summary` naming verified, failed and not-attempted hosts. A failure exits `6` and names every lagging host. **The release is not reverted**: it is already public and install-verified. Fix the host, then rerun `shipyard runner fleet-update --to vX.Y.Z --host-class <class> --apply`. TartCI self-update also rolls a lagging host forward after its soak.
 
-   `--no-fleet-rollout` skips the stage with a warning. It is also skipped with a warning when `--ci-mode` is set (CI has no fleet), when the controller binary predates verified rollouts, or when the Mac declares no `[host_class.*]`. In all of those cases the controller's reconcile agent picks the release up.
+   `--no-fleet-rollout` skips the stage with a warning. It is also skipped with a warning when `--ci-mode` is set (CI has no fleet), when the controller binary predates verified fleet rollouts (its `runner fleet-update` has no `--lagging-only`), or when the Mac declares no `[host_class.*]`. In all of those cases TartCI self-update picks the release up (see below).
 
 Running without `--upload` is the diagnostic mode (used to confirm the local signing path actually works on a given Mac). Script-helper tests under `scripts/test_*.py` ensure missing creds / bad flags / bash syntax errors all surface before the expensive build step.
 
@@ -219,20 +219,18 @@ was still on v0.205.0 while v0.208.0 was published, because nothing ran the
 governed rollout after a release. **A release is done when the fleet
 verifies it, not when the DMG is public.** The local release script therefore
 ends with the verified fleet rollout above. For a release that reached GitHub
-any other way (CI signing, a manual upload, an opted-out run), the controller
-runs `shipyard runner fleet-reconcile` every 15 minutes. It compares the latest
-published release (after a 30-minute soak) with every host's installed version
-and runs the same verified rollout to the lagging host classes only. It never
-downgrades a host that is ahead; that raises an alert instead. It makes at most
-one attempt per tag every 6 hours. After three attempts, or at once for an
-ineligible release, it stops retrying and opens a GitHub issue. It fails closed
-when it cannot read a version.
+any other way (CI signing, a manual upload, an opted-out run), TartCI
+self-update rolls it out: each Shipyard release goes to the canary host (m5)
+first, then to the other hosts after a 2-hour healthy soak; they also wait for the steward host to verify the release (see tartci `fleet/tool-rollout.json`). `tartci fleet-macos
+tool-freshness` reports each host's installed version, and fleet-liveness
+alerts when self-update is halted, starved or failed. To roll a host by hand,
+use `shipyard runner fleet-update`.
 
 **Adding a machine** to the fleet means adding its `[host_class.<name>]` (and
 its tartci profile) to the controller's machine-global config. Exactly one Mac
 is the controller; `shipyard doctor --fleet` flags a remote host that also
 declares host classes. No host is
-named in code; the next release or reconcile tick rolls and verifies it like
+named in code; the next release or self-update rolls and verifies it like
 every other host.
 `shipyard doctor` reports each host's version against the latest release.
 
@@ -300,8 +298,16 @@ Plugin-version bumps (`.claude-plugin/plugin.json`) are intentionally **not** ta
 ## Version-at-land assignment
 
 The post-merge `version-at-land.yml` workflow assigns CLI and plugin versions
-from the merged change range. Pull requests do not edit version files, so
+from the merged change range. Pull requests do not change versions, so
 patch-only changes are assigned and released without a per-PR counter race.
+The PR gate (`scripts/version_bump_check.py`) refuses any edit to a version
+file, except in `Cargo.toml` and `Cargo.lock`. There, dependency, feature,
+profile and lint edits pass, while the `[package]` table, the build-target and
+workspace tables (`[lib]`, `[[bin]]`, `[[example]]`, `[[test]]`, `[[bench]]`,
+`[workspace]`, top-level `auto*` keys) and the crate's own `Cargo.lock` version
+must not change. A version file that is added, deleted, changes mode, is not a
+regular file, or cannot be parsed is refused too. Only
+`Release: allow-version-files reason="..."` admits these edits.
 The writer updates Cargo.lock with Cargo.toml and records a marker for replay
 safety.
 

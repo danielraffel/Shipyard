@@ -54,7 +54,7 @@ class Paths(unittest.TestCase):
                      "scripts/ghapp_queue_arm_guard.py", "scripts/ghapp_merge_guard.sh",
                      "src/head_approval.rs", "src/head_approval/carry.rs",
                      "src/queue_arm_gate.rs", "src/auto_arm/mod.rs", "src/ghapp_guards.rs",
-                     "src/fleet_guards.rs", "src/app/ship_cmd/auto_arm.rs",
+                     "src/app/ship_cmd/auto_arm.rs",
                      "src/app/merge_steward_cmd/native_arm.rs",
                      "scripts/ci_macos_signing_keychain.py", "tools/codesign-app.sh",
                      "scripts/notarize.py", "install.sh", "tools/install.sh",

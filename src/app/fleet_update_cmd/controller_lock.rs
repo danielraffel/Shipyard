@@ -1,7 +1,7 @@
 //! One fleet mutation at a time per controller.
 //!
-//! A release-stage rollout, an operator's `fleet-update --apply` and the
-//! reconcile agent can all start a rollout. Two at once would interleave
+//! A release-stage rollout and an operator's `fleet-update --apply` can both
+//! start a rollout. Two at once would interleave
 //! updates, verifications and rollbacks on the same hosts. The lock spans the
 //! whole apply + verify + rollback sequence; a contender does not wait.
 

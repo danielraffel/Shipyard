@@ -103,6 +103,38 @@ class PackageReleaseTests(unittest.TestCase):
             Path("/tmp/release-home/keys/AuthKey_TEST.p8").resolve(),
         )
 
+    def test_redact_args_hides_authorization_headers_and_bearer_values(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            shown = " ".join(
+                package_release.redact_args(
+                    [
+                        "curl",
+                        "-fsSL",
+                        "-H",
+                        "Authorization: Bearer ghs_FAKE_SECRET_123",
+                        "--header",
+                        "authorization: token gho_FAKE_SECRET_456",
+                        "--header=Authorization: Basic dXNlcjpwYXNz",
+                        "-H",
+                        "Accept: application/json",
+                        "x=Bearer ghs_FAKE_SECRET_789",
+                        "https://api.github.com/repos/o/r",
+                    ]
+                )
+            )
+        for secret in ("ghs_FAKE_SECRET_123", "gho_FAKE_SECRET_456", "dXNlcjpwYXNz", "ghs_FAKE_SECRET_789"):
+            self.assertNotIn(secret, shown)
+        self.assertIn("-H Authorization: <redacted>", shown)
+        self.assertIn("-H Accept: application/json", shown)
+        self.assertIn("https://api.github.com/repos/o/r", shown)
+
+    def test_redact_text_hides_github_token_env_values(self) -> None:
+        with mock.patch.dict(os.environ, {"GITHUB_TOKEN": "ghs_FAKE_SECRET_123"}):
+            self.assertEqual(
+                package_release.redact_text("echoed ghs_FAKE_SECRET_123"),
+                "echoed <redacted>",
+            )
+
     def test_run_redacts_secrets_from_command_failures(self) -> None:
         result = subprocess.CompletedProcess(
             args=["fake"],
@@ -314,7 +346,192 @@ class PackageReleaseTests(unittest.TestCase):
                 artifacts[0],
                 ("shipyard", "shipyard-workstream-provider"),
                 ci_mode=False,
+                expected_tag=None,
             )
+
+    def test_version_equals_tag_accepts_an_exact_match(self) -> None:
+        self.assertEqual(
+            package_release.require_version_equals_tag(
+                "shipyard 0.438.0\n", "shipyard", "v0.438.0", source="test"
+            ),
+            "0.438.0",
+        )
+
+    def test_version_equals_tag_names_binary_expected_and_actual(self) -> None:
+        with self.assertRaises(package_release.LaunchGateFailed) as ctx:
+            package_release.require_version_equals_tag(
+                "shipyard-workstream-provider 9.9.9",
+                "shipyard-workstream-provider",
+                "v0.438.0",
+                source="test",
+            )
+        message = str(ctx.exception.code)
+        self.assertIn("shipyard-workstream-provider --version reports 9.9.9", message)
+        self.assertIn("expected 0.438.0 from tag v0.438.0", message)
+
+    def test_version_equals_tag_rejects_suffixes_extra_text_and_empty_output(self) -> None:
+        for output in (
+            "shipyard 0.438.0-dirty",
+            "shipyard 0.438.0+build.1",
+            "shipyard 0.438.0 (abc123)",
+            "warning: x\nshipyard 0.438.0",
+            "shipyard",
+            "other 0.438.0",
+            "",
+        ):
+            with self.subTest(output=output):
+                with self.assertRaises(package_release.LaunchGateFailed):
+                    package_release.require_version_equals_tag(
+                        output, "shipyard", "v0.438.0", source="test"
+                    )
+
+    def test_version_equals_tag_requires_a_v_semver_tag(self) -> None:
+        for tag in ("0.438.0", "dev", "latest", "v0.438", ""):
+            with self.subTest(tag=tag):
+                with self.assertRaises(package_release.LaunchGateFailed):
+                    package_release.require_version_equals_tag(
+                        "shipyard 0.438.0", "shipyard", tag, source="test"
+                    )
+
+    def _write_pair(self, root: Path, primary: str, companion: str) -> tuple[Path, Path]:
+        binary = root / "shipyard"
+        binary.write_text(f"#!/bin/sh\necho '{primary}'\n", encoding="utf-8")
+        binary.chmod(0o755)
+        provider = root / "shipyard-workstream-provider"
+        provider.write_text(f"#!/bin/sh\necho '{companion}'\n", encoding="utf-8")
+        provider.chmod(0o755)
+        return binary, provider
+
+    def _plain_args(self, root: Path, binary: Path, provider: Path, *extra: str):
+        return package_release.parse_args(
+            [
+                "--skip-build",
+                "--binary",
+                str(binary),
+                "--companion-binary",
+                str(provider),
+                "--target",
+                "linux-x64",
+                "--tag",
+                "v0.438.0",
+                "--dist-dir",
+                str(root / "dist"),
+                *extra,
+            ]
+        )
+
+    def test_tag_packaging_passes_when_both_binaries_report_the_tag(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            binary, provider = self._write_pair(
+                root, "shipyard 0.438.0", "shipyard-workstream-provider 0.438.0"
+            )
+            with redirect_stdout(StringIO()):
+                artifacts = package_release.package(
+                    self._plain_args(root, binary, provider, "--version-must-match-tag")
+                )
+            self.assertEqual(len(artifacts), 2)
+
+    def test_tag_packaging_fails_when_the_pair_agrees_but_lies(self) -> None:
+        # A build.rs override moves both binaries together, so the pair check
+        # alone cannot see it.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            binary, provider = self._write_pair(
+                root, "shipyard 9.9.9", "shipyard-workstream-provider 9.9.9"
+            )
+            with self.assertRaisesRegex(
+                package_release.LaunchGateFailed, "reports 9.9.9, expected 0.438.0"
+            ):
+                package_release.package(
+                    self._plain_args(root, binary, provider, "--version-must-match-tag")
+                )
+            self.assertFalse((root / "dist").exists())
+
+    def test_tag_packaging_is_off_without_the_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            binary, provider = self._write_pair(
+                root, "shipyard 0.1.0", "shipyard-workstream-provider 0.1.0"
+            )
+            with redirect_stdout(StringIO()):
+                artifacts = package_release.package(self._plain_args(root, binary, provider))
+            self.assertEqual(len(artifacts), 2)
+
+    def test_tag_packaging_refuses_to_skip_the_smoke(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            binary, provider = self._write_pair(
+                root, "shipyard 0.438.0", "shipyard-workstream-provider 0.438.0"
+            )
+            with self.assertRaisesRegex(SystemExit, "--no-smoke"):
+                package_release.package(
+                    self._plain_args(
+                        root, binary, provider, "--version-must-match-tag", "--no-smoke"
+                    )
+                )
+
+    def test_dmg_smoke_checks_each_mounted_binary_against_the_tag(self) -> None:
+        def fake_run(args: list[str], **_kwargs: object) -> str:
+            if args[:2] == ["hdiutil", "attach"]:
+                return ""
+            if args[1:] == ["--version"]:
+                name = Path(args[0]).name
+                return f"{name} 0.438.0" if name == "shipyard" else f"{name} 0.437.0"
+            raise AssertionError(f"unexpected command: {args}")
+
+        with mock.patch.object(package_release, "require_commands"), \
+                mock.patch.object(package_release, "run", side_effect=fake_run), \
+                mock.patch.object(package_release, "detach_dmg"):
+            with self.assertRaisesRegex(
+                package_release.LaunchGateFailed,
+                "shipyard-workstream-provider --version reports 0.437.0",
+            ):
+                package_release.smoke_dmg(
+                    Path("fake.dmg"),
+                    ("shipyard", "shipyard-workstream-provider"),
+                    ci_mode=False,
+                    expected_tag="v0.438.0",
+                )
+
+    def test_dmg_smoke_failures_surface_as_the_launch_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            binary, provider = self._write_pair(
+                root, "shipyard 0.438.0", "shipyard-workstream-provider 0.438.0"
+            )
+            args = package_release.parse_args(
+                [
+                    "--skip-build",
+                    "--binary",
+                    str(binary),
+                    "--companion-binary",
+                    str(provider),
+                    "--target",
+                    "macos-arm64",
+                    "--tag",
+                    "v0.438.0",
+                    "--dist-dir",
+                    str(root / "dist"),
+                    "--dmg",
+                    "--version-must-match-tag",
+                ]
+            )
+
+            def fake_create_dmg(_stage: Path, output: Path, **_kwargs: object) -> None:
+                output.write_text("dmg", encoding="utf-8")
+
+            with mock.patch.object(package_release, "require_commands"), \
+                    mock.patch.object(
+                        package_release, "create_dmg", side_effect=fake_create_dmg
+                    ), mock.patch.object(
+                        package_release,
+                        "smoke_dmg",
+                        side_effect=package_release.CommandFailed("mount failed"),
+                    ) as smoke_dmg:
+                with self.assertRaisesRegex(package_release.LaunchGateFailed, "mount failed"):
+                    package_release.package(args)
+            self.assertEqual(smoke_dmg.call_args.kwargs["expected_tag"], "v0.438.0")
 
     def test_ci_mode_softens_dmg_mount_failure(self) -> None:
         def fake_run(args: list[str], **_kwargs: object) -> str:

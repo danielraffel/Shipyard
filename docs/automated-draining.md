@@ -736,7 +736,9 @@ While both hold:
   When more than one pull request qualifies, the one carrying a
   `main-red-fix` or `fixes-main` label is the fix; if no single label
   separates them, none is jumped or held, all are admitted plainly, and the
-  pass reports `fix ambiguous: ...`. A `shipyard:unblock` label or the
+  pass reports `fix ambiguous: ...`. Any of the three labels `shipyard:unblock`,
+  `main-red-fix` and `fixes-main` marks a fix for the base-poison pass and
+  the drain path alike. The
   repository's own detector still takes priority where it names one. There
   is never more than one fix.
 - **The fix goes first.** It is enqueued with `jump: true` and is never
@@ -1153,4 +1155,4 @@ These came from running it for real:
   pull requests, measured rather than read from config.
 - [TartCI](https://github.com/danielraffel/tartci) covers VM pools, images,
   leases and runner lifecycle.
-- The scheduled reviewer, repair and operator pass-runner used on m3 is versioned in [`tools/fleet-pass/`](../tools/fleet-pass/README.md).
+- The scheduled reviewer, repair and operator pass-runner lives in fleet-handbook `scripts/pass-runner/` and is installed on a host with fleet-handbook's `scripts/install-pass-runner.sh`.

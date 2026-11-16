@@ -29,6 +29,12 @@ DEFAULT_LOCAL_ENV_FILES = (
 )
 PUBLIC_ASSET_VISIBILITY_TIMEOUT_SECS = 90
 PUBLIC_ASSET_VISIBILITY_POLL_SECS = 3
+# The mounted DMG did not launch, or a binary in it reported a version other
+# than the tag. Nothing has been uploaded.
+LAUNCH_GATE_FAILED_EXIT = 3
+# The public install.sh path did not end in the tag's binaries; the release is
+# returned to draft.
+INSTALL_E2E_FAILED_EXIT = 4
 # Distinct from every earlier failure: the release is public and installable,
 # but at least one fleet host did not verify at it.
 FLEET_ROLLOUT_FAILED_EXIT = 6
@@ -81,9 +87,11 @@ class CommandRunner:
             capture_output=capture,
         )
         if result.returncode != 0:
-            detail = f"command failed ({result.returncode}): {' '.join(args)}"
+            # Never echo a credential: curl calls carry an Authorization header.
+            shown = " ".join(package_release.redact_args(args))
+            detail = f"command failed ({result.returncode}): {shown}"
             if result.stderr:
-                detail = f"{detail}\n{result.stderr.strip()}"
+                detail = f"{detail}\n{package_release.redact_text(result.stderr.strip())}"
             raise SystemExit(detail)
         return result.stdout.strip() if capture else ""
 
@@ -275,6 +283,7 @@ def package_signed_dmg(config: ReleaseConfig) -> Path:
         "--dmg",
         "--sign-macos",
         "--notarize",
+        "--version-must-match-tag",
     ]
     # Publication is never allowed to soften the mounted-DMG launch gate.
     if config.ci_mode and not config.upload:
@@ -288,7 +297,11 @@ def package_signed_dmg(config: ReleaseConfig) -> Path:
     if config.cargo_target:
         args.extend(["--cargo-target", config.cargo_target])
 
-    artifacts = package_release.package(package_release.parse_args(args))
+    try:
+        artifacts = package_release.package(package_release.parse_args(args))
+    except package_release.LaunchGateFailed as error:
+        print(f"mount and launch gate failed: {error.code}", file=sys.stderr)
+        raise SystemExit(LAUNCH_GATE_FAILED_EXIT) from error
     if len(artifacts) != 1 or artifacts[0].suffix != ".dmg":
         raise SystemExit(f"expected one DMG artifact, got: {artifacts}")
     return artifacts[0]
@@ -767,7 +780,8 @@ def publish_if_ready(config: ReleaseConfig, runner: CommandRunner) -> str:
     try:
         wait_for_public_release_assets(config, runner)
         run_install_e2e(config, runner)
-    except SystemExit:
+    except SystemExit as error:
+        print(f"install E2E failed for {config.tag}: {error.code}", file=sys.stderr)
         runner.run(
             [
                 "gh",
@@ -779,7 +793,7 @@ def publish_if_ready(config: ReleaseConfig, runner: CommandRunner) -> str:
                 "--draft=true",
             ]
         )
-        raise SystemExit(4)
+        raise SystemExit(INSTALL_E2E_FAILED_EXIT) from error
 
     return "published" if did_publish else "already-public"
 
@@ -862,17 +876,21 @@ def run_install_e2e(config: ReleaseConfig, runner: CommandRunner) -> str:
                 ["bash", str(config.install_sh)],
                 env=_install_env(config, install_dir, tag),
             )
+            # Each install must run the tag it asked for, including the
+            # baseline and rollback installs of --rollback-tag.
             output = runner.run([str(binary), "--version"], capture=True)
-            primary_version = package_release.parse_binary_version(
+            primary_version = package_release.require_version_equals_tag(
                 output,
                 package_release.BIN_NAME,
+                tag,
                 source=f"{phase} installed CLI",
             )
             if _provider_expected_for_tag(tag):
                 provider_output = runner.run([str(companion), "--version"], capture=True)
-                provider_version = package_release.parse_binary_version(
+                provider_version = package_release.require_version_equals_tag(
                     provider_output,
                     package_release.COMPANION_BIN_NAME,
+                    tag,
                     source=f"{phase} installed provider",
                 )
                 if provider_version != primary_version:
@@ -921,7 +939,7 @@ def run_fleet_rollout(config: ReleaseConfig, runner: CommandRunner, shipyard: st
 
     The release is not reverted on failure: it is public, verified installable,
     and other consumers may already hold it. The failure is loud and names the
-    hosts that did not verify, and the fleet-reconcile backstop retries later.
+    hosts that did not verify; fix them and rerun `shipyard runner fleet-update`.
     """
     if not shipyard:
         print(
@@ -931,15 +949,15 @@ def run_fleet_rollout(config: ReleaseConfig, runner: CommandRunner, shipyard: st
         )
         raise SystemExit(FLEET_ROLLOUT_FAILED_EXIT)
     # The controller binary is the one already installed, i.e. the previous
-    # release. A controller that predates verified rollouts (no fleet-reconcile)
-    # or a Mac with no [host_class] cannot run this stage; neither makes the
-    # release incomplete, so hand over to the backstop with a warning.
-    code, _, _ = runner.run_status([shipyard, "runner", "fleet-reconcile", "--help"])
-    if code != 0:
+    # release. A controller without `runner fleet-update --lagging-only` or a Mac with no
+    # [host_class] cannot run this stage; neither makes the release incomplete,
+    # so hand over with a warning.
+    code, help_text, _ = runner.run_status([shipyard, "runner", "fleet-update", "--help"])
+    if code != 0 or "--lagging-only" not in help_text:
         print(
             f"WARNING: {shipyard} predates verified fleet rollouts; the fleet was NOT "
-            f"updated to {config.tag} here. Once the controller runs a release with "
-            "`runner fleet-reconcile`, its agent rolls the fleet after the soak.",
+            f"updated to {config.tag} here. TartCI self-update rolls it out after the "
+            "soak (see `tartci fleet-macos tool-freshness`).",
             file=sys.stderr,
         )
         return
@@ -948,8 +966,8 @@ def run_fleet_rollout(config: ReleaseConfig, runner: CommandRunner, shipyard: st
     if code != 0 and "No [host_class." in stderr:
         print(
             "WARNING: this Mac declares no [host_class.*], so it is not the fleet "
-            f"controller; the fleet was NOT updated to {config.tag} here. The "
-            "controller's fleet-reconcile agent rolls it out after the soak.",
+            f"controller; the fleet was NOT updated to {config.tag} here. "
+            "TartCI self-update rolls it out after the soak.",
             file=sys.stderr,
         )
         return
@@ -965,12 +983,12 @@ def run_fleet_rollout(config: ReleaseConfig, runner: CommandRunner, shipyard: st
     # Only hosts behind the tag: reinstalling a current host restarts its daemon
     # and cannot be rolled back (there is no earlier version to restore).
     command = [*plan, "--apply", "--lagging-only"]
-    print(f"fleet rollout: {' '.join(command)}")
+    print(f"fleet rollout: {' '.join(package_release.redact_args(command))}")
     code, stdout, stderr = runner.run_status(command)
     if code == FLEET_CONTROLLER_BUSY_EXIT:
         print(
             f"WARNING: another fleet rollout holds the controller lock; {config.tag} was "
-            "not rolled out here. The running rollout or the fleet-reconcile agent "
+            "not rolled out here. The running rollout or TartCI self-update "
             "finishes the fleet.",
             file=sys.stderr,
         )
@@ -1065,7 +1083,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help=(
             "Skip the final governed fleet rollout + verification. The release "
-            "is then not done until the fleet verifies; fleet-reconcile catches up."
+            "is then not done until the fleet verifies; TartCI self-update catches up."
         ),
     )
     parser.add_argument(
@@ -1131,13 +1149,13 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 "WARNING: --no-fleet-rollout: the fleet was NOT updated to "
                 f"{config.tag}; the release is not done until every host verifies "
-                "(shipyard runner fleet-reconcile will catch up after the soak).",
+                "(TartCI self-update will catch up after the soak).",
                 file=sys.stderr,
             )
         elif config.ci_mode:
             print(
                 "WARNING: --ci-mode has no fleet to roll out to; the controller's "
-                "shipyard runner fleet-reconcile will update the fleet after the soak.",
+                "TartCI self-update will update the fleet after the soak.",
                 file=sys.stderr,
             )
         else:

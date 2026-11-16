@@ -695,15 +695,14 @@ rejected, and none after 2026-09-15 once arm-on-open took over. The test
 returns to `auto_merge_cmd`, `ship_cmd` or `pr_cmd`. New audit entries say
 `arm native auto-merge`; `merge-queue resolve` still accepts the old
 `enqueue pull request` entries.
-## fleet-reconcile ledger: every attempt says how it ended
+## Rollout ledger: a failed rollback is recorded once
 
-`fleet-reconcile/attempts.json` records `last_outcome` (`verified` or
-`failed: <reason>`) for each rollout. Reconcile only ever targets the latest
-release, so a failed older tag is never retried; when a newer tag rolls out,
-every older tag without a verified rollout gets `terminal: "superseded by
-<tag> without a verified rollout (last attempt: ...)"`. Entries written before
-this carry no `last_outcome` and close as "outcome not recorded". The close
-happens inside a rollout, never on an idle tick, which still writes nothing.
+`fleet-reconcile/attempts.json` in the controller's state dir (the directory
+keeps its original name so earlier ledgers stay readable) records a host
+quarantined after a failed rollback and the tag that failure made terminal.
+Fields written by earlier releases (attempt counts, `last_outcome`, alert
+bookkeeping) are ignored on read and dropped on the next write. A change that leaves the ledger as it was writes
+nothing.
 
 ## A missing key is not an empty list
 
@@ -1269,9 +1268,12 @@ successful rotation.
 
 ## Version-at-land
 
-A normal PR does not edit `Cargo.toml`, `Cargo.lock`, or plugin manifest
-versions. The read-only version gate rejects those edits unless the PR carries
-the explicit release recovery trailer. After merge, `version-at-land.yml` is the
+A normal PR does not edit the plugin manifests, and in `Cargo.toml` and
+`Cargo.lock` it edits only dependencies, features, profiles and lints: the
+`[package]` table, the build-target and workspace tables and the version line
+itself must not change. The read-only version gate refuses anything else,
+including an added, deleted, mode-changed or unparseable version file, unless
+the PR carries the explicit release recovery trailer. After merge, `version-at-land.yml` is the
 single writer and assigns the next versions. It never pushes to `main` (the
 ruleset requires PR-only checks): it rebuilds the bot-owned
 `release/version-at-land` branch with one cumulative bump commit, keeps a single
@@ -1383,8 +1385,6 @@ PRs are gone.
 | Read one exact shadow-comparison result | `shipyard --json changed-surface-trial-status --repo <owner/repo> --pr <n> --target <name> --head <sha>` (read-only; exit 3 collecting, 0 ready/safe terminal/`keyed_shadow_recorded`, 1 rejected/invalidated; an activation whose `schema_version` differs from its plan's reads `rejected: invalid_shadow_activation_contract` (Shipyard 0.274.0 and 0.275.0 wrote such activations for schema-3 plans; re-run on a fixed version); stale-base results are typed and permanently shadow-only, and carry the planner's cause in `stale_base_reason`; result receipts and the key manifest are read up to 16 MiB (a keyed full shadow of a large suite exceeds 1 MiB), and an unreadable receipt is reported by its own reason; validates exact receipt identity plus conservative timing/savings and never promotes policy or merge readiness) |
 | Measure what executable-keyed reuse would skip, without skipping | Declare `executable_reuse` (derivation_paths, build_dir, platform_probe, rederive, base_record pointers) in the protected base's `changed_surface_selection` and run the target on a `shadow_compare` host with `reuse_record = true`. A build-and-test plan becomes `keyed_full_shadow` / `keyed_bounded_shadow`: the configured build and full tests still run with their own verdict, and trial status reports `would_skip_count` and `false_skips`. No qualifying base record leaves the stages unchanged with an `executable_reuse_*` diagnostic. The host re-derives every keyed result before merge readiness (`shipyard reuse rederive` / `rederive-sweep` by hand); two refusals on a host trip the switch, and one sampled failure, false skip or rebuilt would-skip executable (`unreached_changed`) trips it at once; the receipt's `key_blind_candidates` names the executables for the project's key-blind list. Each keyed payload keeps its evidence in its own `payload-<sha256>/` directory, so re-shipping a head with a new candidate set runs keyed beside the earlier run and trial status names the deciding run in `verdict_source` (newest `recorded_at_unix_ns`) with every run in `keyed_runs`; past 8 payloads, or a changed activation for the same payload, runs unkeyed with an `activation_conflict` diagnostic (`keyed_payload_cap` for the cap), never a failed ship. The binding is written to `executable-reuse-binding.json` in the payload dir and the command carries only its digest (`executable_reuse_sha256`, payload schema 3), so the command no longer grows with the candidate count; Shipyard and the adapter share one 5,632-byte cap on the decoded payload, and a file the adapter cannot use (missing, unreadable, digest mismatch, invalid) makes it run unkeyed with `bound: null` and `derived.status` `error: binding ...`. A runner whose own derivation fails (`derived.status` `error: ...`) reads `not_derived: runner_error: <line>` in re-derivation, is never a refusal, and shows as `keyed.runner_error`. The host passes `derived.build_dir` as `{build_dir}`. A keyed plan binds the newest clean read-audit report (`read-audit.json`, staged beside the binding; `{audit_report}` in the base's commands) or records `audit: none` with a reason, in which case the run keys nothing and trial status says `reuse_observation: false` (a staged report counts only when the runner's `derived.audit.status` is `applied` and the key manifest's `producer.audit_status` is `clean`, otherwise `staged_unconfirmed: <why>`). `shipyard --json reuse records --target <t>` lists what a keyed plan would bind on this host now (0 with the refusal counts when nothing qualifies). Key code is read only from the base; a head edit to it forces the full suite. See `docs/changed-surface-selection.md#executable-keyed-shadow-runs`. |
 | Assess a macOS sharding canary | Default-off: `shipyard parallel-proof-canary --request <absolute-private-json>` is a no-execution/no-mutation plan unless `--apply` is explicit. Apply requires trusted machine-global policy pinning a native adapter digest, full invocation-authority digest, bounds, repository/target, and exact builder/worker identities. The controller completes the proof-bound same-host control before distributed work, rechecks session/storage fences, binds actual transfer and interrupted-resume counters, forces avoided-byte claims and model calls to zero, records distributed-started before mutation, and no-overwrite publishes evidence. Core has no Pulp commands or personal host defaults; installed adapter configuration and physical fleet proof remain required. Neither surface authorizes a merge. |
-| Produce a canonical shadow CTest inventory | Library-only: translate bounded CTest JSON-v1 with an independent exhaustive count/sorted-ID digest, exact configuration, bounded controller-owned capabilities, and explicit host/fleet scope for every resource lock. Filtered, ambiguous, disabled, non-executable, `REQUIRED_FILES`-dependent, or unsupported graphs fail closed. This does not invoke CTest, dispatch work, or authorize a merge. |
-| Assess one-host Pulp M3 build-once consumption | Library-only and default-off: bind exactly one successful configure/build receipt to the exact source, toolchain, canonical CTest inventory, proof manifest, and compact artifact content address; require same-session M3 consumption with zero configure/build invocations and exact sorted executed-set reconciliation. The existing full gate remains authoritative, and this cannot run commands, dispatch cross-host work, publish a check, or authorize a merge. |
 | Show run logs | `shipyard logs <job_id> --json` |
 | **Runner watchdog: health check** | `shipyard runner status --repo <r> --runner-id <id>` |
 | **Recover an exact Pulp zero-job Actions wedge** | `shipyard runner zero-job-recover --pr <n> --source-run-id <id>` is read-only by default; review the exact candidate, then add `--apply` once. This is independent of coalescing and stale cancellation. |
@@ -1401,7 +1401,7 @@ PRs are gone.
 | **Runner provisioning: VM-slot-aware free macOS capacity** | `shipyard runner capacity [--json]` (reads `tart list` + `tart get` per `[host_class.*]`, using configured `tart_home` as `TART_HOME`; counts only running macOS/darwin VMs; `free = Σ max(0, cap − running_macos)`; fail-closed, exit 1 if any host/VM OS unreadable) |
 | **Runner fleet visibility: exact-head queue/release liveness** | `shipyard runner fleet-status --repo <owner/repo> --target macos [--json]` (bounded pagination plus one shared 30-second GitHub deadline; deadline expiry renders a fail-closed partial assessment instead of hanging; stable auth/rate/truncation reasons; detects optional/superseded capacity owners and cleared enrollment). **Read `routing_confidence` next to `routable_free`.** A failed GitHub read is classified `transient` / `denied` / `unclassified`; only a transient one is retried, and one the controller's own repo-scope census can corroborate is demoted to a named `degraded_observations` entry instead of making healthy capacity unroutable. A denial, or a gap with nothing to corroborate it, still reports zero routable slots. A declared expected host that cannot serve `--target` prints under `other targets` and does not raise the verdict. |
 | **Roll one exact Shipyard release across the fleet** | Configure absolute `host_class.<name>.shipyard_bin` and remote `github_cli` paths, explicit `shipyard_mode`/`shipyard_global_dir`/`shipyard_state_dir`, plus self-contained machine-global command auth. Review `shipyard runner fleet-update --to vX.Y.Z --host-class <class> --json`, then add `--apply`; repeat the selector for an ordered subset or use explicit `--all-hosts`. Before any host, Shipyard binds the annotated tag's full tag-object/commit/tree OIDs, release ID, exact checksum-manifest and macOS DMG SHA-256, and `release.yml` build-provenance attestations, closes the mint window, and freezes that authority for every selected host. Release assets stream by immutable asset ID into owner-private hard-capped staging; exact declared size and SHA are verified before attestation, while partial files and escaped pipe holders are bounded by the same process-tree deadline. Missing attestations, manifest/source drift, implicit/duplicate hosts, authority/asset receipt mismatch, cross-host pair-hash mismatch, mixed CLI/provider pairs, or a companion retained by legacy rollback fail closed. Receipts preserve complete authority plus before/after paths, versions, double hashes, daemon identity, and configured repositories; rollout stops at the first failure. The release's own install.sh runs against the staged asset through a curl shim that also serves a `checksums.sha256` holding the controller-pinned SHA-256, so an install.sh that refuses a release with no checksums manifest still installs the verified staged bytes. Each applied host is then re-read in a fresh process (installed version, daemon version + refreshed pid, ghapp guards current when the release ships them) and the run ends with a `fleet_summary` naming verified/failed/not-attempted hosts. |
-| **Keep the fleet on the latest release** | The local release script's last stage is the verified rollout (exit 6 names lagging hosts; `--no-fleet-rollout` warns). The controller backstop is `shipyard runner fleet-reconcile [--apply]`: it rolls the newest release that has itself soaked for 30 minutes (a newer release never restarts an older one's soak), alerts once when a host lags a release for over 2 h (`--lag-alert-hours`), retries a tag at most once every 6 hours, and exits 9 on anything unreadable. Install its agent only with `scripts/install_fleet_reconcile.sh --install` on the controller. `shipyard doctor --fleet` shows each host's version against the latest release. Each tick's `daemon_problems` names hosts whose daemon is stopped, watches no repositories, or has no launcher, so it will not restart after a reboot; the launcher install needs the host's console. A daemon refuses a slug its credential answers HTTP 404 for (a renamed or transferred repository's old name) and logs `refusing to watch <slug>`; `shipyard daemon refresh --repo <current name>` fixes it. |
+| **Keep the fleet on the latest release** | The local release script's last stage is the verified rollout (exit 6 names lagging hosts; `--no-fleet-rollout` warns). TartCI self-update is the backstop: it rolls each release to the canary host (m5), then to the other hosts after a 2-hour healthy soak (they also wait for the steward host to verify the release; see tartci `fleet/tool-rollout.json`), and `tartci fleet-macos tool-freshness` reports each host (fleet-liveness alerts when self-update is halted, starved or failed). To roll by hand use `shipyard runner fleet-update`; a host quarantined after a failed rollback stays out of every rollout until `shipyard runner fleet-update --clear-host <class>`. `shipyard doctor --fleet` shows each host's version against the latest release. A host without the daemon launcher will not restart its daemon after a reboot; the launcher install needs the host's console. A daemon refuses a slug its credential answers HTTP 404 for (a renamed or transferred repository's old name) and logs `refusing to watch <slug>`; `shipyard daemon refresh --repo <current name>` fixes it. |
 
 The first governed replacement of a deployed pre-release-matched legacy auth
 wrapper may consume its repository-routed, single-line `ghs_` token response.
@@ -1480,7 +1480,7 @@ writer custody before mutation.
 | **Triage a steward exception without a resident agent** | `shipyard runner recovery-worker` inspects/revalidates one durable exact-head request without launching a model; add `--apply` for one bounded phase-1 classification attempt, or `--drain --apply` for the bounded current snapshot. Policy is machine-global only; Shipyard constructs a tool-disabled argv, clears the inherited environment, uses a global model lease and overall deadline, and accepts strict JSON that can classify/escalate but cannot authorize repairs, paths, or tests. Provider/quota failures terminalize with distinct authentication or transport classes; unsafe findings escalate; neither blocks unrelated PRs. A future alternate-provider attempt remains bounded and explicit; no implicit provider switch occurs. |
 | **Understand daemon shadow observation** | With an existing work ledger, the daemon observes policy-covered native nonterminal exact PR heads even with zero IPC subscribers; inert imported history is never scheduled. Relevant webhooks debounce for 2s with a 10s maximum burst age; overflow is requeued. An 8-target round-robin catch-up runs every 5m; exact-target cooldown, four-read concurrency, and a rolling-hour request ceiling with worst-case page reservation bound cost. Each exact target uses producer-provenanced pagination through exact-repository auth loaded only from trusted machine-global configuration, exhaustive through 1,000 contexts and fail-closed beyond; request evidence counts every page. Token-helper preparation is separately bounded and cached, and pre-command failures do not count as requests. Only changed snapshots and redacted fetch failure/recovery transitions emit `shadow_observation_transition` to IPC and the retained supervised daemon stderr log, including exact-head, API-cost, latency, policy-revision, and zero-model evidence. Repeated failures stay quiet. This phase cannot write GitHub, the ledger, or Linear; publish a wake; activate; or dispatch. |
 | **Recognize an assigned-capacity dispatch wedge** | The daemon can publish one durable `dispatch_wedge` actionable wake after two stable observations prove that the exact current merge-queue job remains queued with no assigned runner while a compatible runner is online and idle. Authority binds repository identity, PR/head, merge-group head, run/attempt/job, labels, queue position, policy, and the final authenticated PR/queue reread. Head movement, regenerated/dequeued groups, incomplete pagination, label mismatch, busy/offline capacity, or ambiguous evidence refuses publication. Restart preserves the observation deadline and exact pending publication; a failed or capacity-less observation gets a bounded durable follow-up. This is diagnosis and escalation only: it does not cancel, requeue, mutate selectors or runners, reorder GitHub's queue, or retry work. |
-| **Run sandbox E2E beside production Shipyard safely** | Each protected queue/supervisor/ship mutation holds the shared host-global writer-domain lease only for its critical section; streamed logs reacquire per append, while idle daemons and read-only commands own no lease. Sandbox E2E keeps the fair-entry turnstile and data-domain lease exclusive from snapshot through contamination assertion. A production mutation waits boundedly, then exits `75` with `sandbox_writer_domain_overlap` instead of racing evidence. If the guardian refuses before transition because production workers are active, classify the canary as safely deferred only through `scripts/sandbox_admission_deferral.py`; its exact receipt, installed hash, mutation-probe path, lease absence, daemon PID, and live process start identity must all agree at both workflow checkpoints. That admission deferral is INFRA/retryable and does not justify rerunning the production job. The macOS guardian observes only the exact no-holder/contended ambiguity through a bounded stable-idle window while continuously fencing production identity, binary, config, and active workers; any holder or drift still fails closed. If a corrected-path cleanup retains the host lease solely because workers appeared after its mutation proof, the launchd-owned guardian may reconcile it without a model: authenticate the unique prior ready/mutation/final receipts, preserve exact production identity and configuration while workers drain, prove stable idle again immediately before removing the exact device/inode/ctime plus cryptographically random lease generation, and publish a durable pending/terminal receipt. Removal first atomically detaches that generation under a unique tombstone name, then deletes only the revalidated detached identity; crash debris cannot authorize or block a later fixed-name lease and is retained for evidence rather than guessed away. A lease retained by a canary that never wrote its mutation fence is reconcilable the same way only when its receipts prove it never touched production (never quiesced or restored it, never armed or ran its mutation probe, no workers at admission, candidate dead) and the production it snapshotted was replaced out of band (daemon pid/start or installed binary changed, e.g. by a fleet update); the reconciliation then binds to the current production and its receipts say `reconciliation_basis: production-superseded` with `mutation_fence_proved: false`. With production unchanged, a fence-less lease stays fail-closed for an operator. A fenced lease whose production daemon was later replaced (restart or install) binds to the current production the same way (`production-superseded`), and a cleanup whose two writer-domain holder inspections both timed out (`lsof` on a loaded host) is reconcilable like the exhausted-deadline case; when the workflow's final receipt check fails it prints the guardian's `failure`, not a bare `false`. The guardian holds the host's fleet install guard (`fleet-auth-support.guard` in the production state dir) from before lease creation until its terminal receipt, so a fleet rollout defers (exit 75, no attempt spent) instead of replacing production mid-canary; fleet-reconcile's attempt ledger never rewrites itself on an idle tick, defers a tick before recording when the controller's own guard is held, and takes the shared writer-domain lease for every real write, so it can never land inside a contamination audit (the audit stays strict; nothing in `fleet-reconcile/` is exempted); a canary that finds an install in flight waits 60s, then fails `FleetUpdateInProgress` (INFRA/retryable). A process that exits while being inspected is reported as `ProcessGone`, not a raw KERN_PROCARGS2 errno. Pre-generation legacy leases require explicit operator reconciliation; ambiguous, unexpectedly populated, live-owner, quiesced, identity-drifted, or foreign-holder cases remain untouched. A pending/deferred retained-lease result is only INFRA/retryable evidence, never physical-canary or release acceptance. After its terminal receipt proves the exact lease generation was removed, rerun only the targeted macOS Sandbox job; do not rerun the whole workflow or rebuild unchanged binaries. After cleanup, confirm daemon IPC liveness through a bounded exact-PID-fenced window and require the receipt's configured repositories rather than treating one status miss as death. The guardian must fsync its terminal receipt before self-unloading its exact launchd label; later runs may recover only a bounded set of inert, receipt-authenticated registrations, and terminal workflow paths must fail closed if a successful full inventory does not prove the current label disappeared. Keep failure artifacts inside explicit canary/runner temp roots. Do not add filename/PID/job-ID exemptions or delete either lock file. Restart v0.108.1 daemons during rollout because they hold the obsolete lifetime lease. |
+| **Run sandbox E2E beside production Shipyard safely** | Each protected queue/supervisor/ship mutation holds the shared host-global writer-domain lease only for its critical section; streamed logs reacquire per append, while idle daemons and read-only commands own no lease. Sandbox E2E keeps the fair-entry turnstile and data-domain lease exclusive from snapshot through contamination assertion. A production mutation waits boundedly, then exits `75` with `sandbox_writer_domain_overlap` instead of racing evidence. If the guardian refuses before transition because production workers are active, classify the canary as safely deferred only through `scripts/sandbox_admission_deferral.py`; its exact receipt, installed hash, mutation-probe path, lease absence, daemon PID, and live process start identity must all agree at both workflow checkpoints. That admission deferral is INFRA/retryable and does not justify rerunning the production job. The macOS guardian observes only the exact no-holder/contended ambiguity through a bounded stable-idle window while continuously fencing production identity, binary, config, and active workers; any holder or drift still fails closed. If a corrected-path cleanup retains the host lease solely because workers appeared after its mutation proof, the launchd-owned guardian may reconcile it without a model: authenticate the unique prior ready/mutation/final receipts, preserve exact production identity and configuration while workers drain, prove stable idle again immediately before removing the exact device/inode/ctime plus cryptographically random lease generation, and publish a durable pending/terminal receipt. Removal first atomically detaches that generation under a unique tombstone name, then deletes only the revalidated detached identity; crash debris cannot authorize or block a later fixed-name lease and is retained for evidence rather than guessed away. A lease retained by a canary that never wrote its mutation fence is reconcilable the same way only when its receipts prove it never touched production (never quiesced or restored it, never armed or ran its mutation probe, no workers at admission, candidate dead) and the production it snapshotted was replaced out of band (daemon pid/start or installed binary changed, e.g. by a fleet update); the reconciliation then binds to the current production and its receipts say `reconciliation_basis: production-superseded` with `mutation_fence_proved: false`. With production unchanged, a fence-less lease stays fail-closed for an operator. A fenced lease whose production daemon was later replaced (restart or install) binds to the current production the same way (`production-superseded`), and a cleanup whose two writer-domain holder inspections both timed out (`lsof` on a loaded host) is reconcilable like the exhausted-deadline case; when the workflow's final receipt check fails it prints the guardian's `failure`, not a bare `false`. The guardian holds the host's fleet install guard (`fleet-auth-support.guard` in the production state dir) from before lease creation until its terminal receipt, so a fleet rollout defers (exit 75, no attempt spent) instead of replacing production mid-canary; the fleet rollout ledger never rewrites itself when nothing changed and takes the shared writer-domain lease for every real write, so it can never land inside a contamination audit (the audit stays strict; nothing in the ledger directory `fleet-reconcile/` is exempted); a canary that finds an install in flight waits 60s, then fails `FleetUpdateInProgress` (INFRA/retryable). A process that exits while being inspected is reported as `ProcessGone`, not a raw KERN_PROCARGS2 errno. Pre-generation legacy leases require explicit operator reconciliation; ambiguous, unexpectedly populated, live-owner, quiesced, identity-drifted, or foreign-holder cases remain untouched. A pending/deferred retained-lease result is only INFRA/retryable evidence, never physical-canary or release acceptance. After its terminal receipt proves the exact lease generation was removed, rerun only the targeted macOS Sandbox job; do not rerun the whole workflow or rebuild unchanged binaries. After cleanup, confirm daemon IPC liveness through a bounded exact-PID-fenced window and require the receipt's configured repositories rather than treating one status miss as death. The guardian must fsync its terminal receipt before self-unloading its exact launchd label; later runs may recover only a bounded set of inert, receipt-authenticated registrations, and terminal workflow paths must fail closed if a successful full inventory does not prove the current label disappeared. Keep failure artifacts inside explicit canary/runner temp roots. Do not add filename/PID/job-ID exemptions or delete either lock file. Restart v0.108.1 daemons during rollout because they hold the obsolete lifetime lease. |
 | **Sandbox E2E times out waiting for `ready.json` and the canary has no `guardian.log`** | launchd never started the guardian. `launchctl print gui/$(id -u)/com.danielraffel.shipyard.sandbox-canary.<run>.<attempt>` shows `runs = 0` and `pended nondemand spawn = speculative`: a RunAtLoad launch is speculative, and a busy host can defer it indefinitely. The workflow kickstarts the guardian right after `launchctl bootstrap` for this reason, so never drop the `launchctl kickstart` line. Its final `if: always()` step boots out the run's label, so a failed run no longer leaves its job loaded. The guardian's `launchd_recovery` reports another run's registration it cannot recover (no or foreign receipt, a guardian that may still be running) under `warnings`, which never fail the run; only this run's own label and a removal it attempted and failed land in `errors`. |
 | **Sandbox E2E fails at the host guard (`sandbox-e2e must run on M3`)** | The macOS Sandbox job pins itself to M3 by runner name, machine tag and the tartci fleet identity: `[host] id = "studio"` in `$TARTCI_FLEET_PROFILE` (default `~/.config/tartci/macos-fleet-profile.toml`). It never reads the live hostname, because macOS renames a host on a Bonjour name collision (`Daniels-Mac-Studio-m3` became `Daniels-Mac-Studio-m3-4.local`, which failed the old hostname `case`). The message names the profile, the identity it found and the hostname. If it fires, the job reached a host other than M3 (route it to `Shipyard-studio-02-sandbox`, or `Shipyard-studio-02` before that runner was split), or M3's profile lost its `host.id`; it is host identity, not the PR. |
 | **Sandbox E2E fails at "Refuse a host with a wedged filesystem mount", or `guardian.log` shows a step `start` with no `done`** | A mount point's `stat` blocks in the kernel: on m3 (2026-10-20) the CoreDevice DeviceFS mount at `~/Library/Developer/CoreDevice/DeviceFS` wedged, and every `lsof` (which stats every mount) hung for good in state U; `timeout` and SIGKILL cannot end such a process, and each adds to the load average. `scripts/wedged_mount_preflight.py` makes a `stat`, a `statvfs` and a one-entry directory read on each mount in a child, names the mount and call that does not answer in 20s, and lists processes in long uninterruptible wait as context. A stat of the mount root alone is not enough: on m3 it returned for all 18 mounts while the DeviceFS server was still stuck, because the kernel can answer a root's attributes itself. A pass means those three calls returned, not that the host is healthy. A long U wait alone is not a wedge: macOS keeps some system extensions in U for days. The fix is on the host (force-unmount the mount, restart CoreDeviceService, or reboot), and it needs the host owner's go; rerunning only repeats the refusal. Do not run `lsof` or a recursive walk over `$HOME` on such a host while diagnosing; each one adds another stuck process. If the guardian meets a child that survives SIGKILL anyway, it abandons it and its receipt's `failure` names the child ("did not exit ... after SIGKILL"). |
@@ -1664,37 +1664,7 @@ opposite capability. Never reuse either lease for secret-bearing or
 
 ### Survivability: will the lane still be there after an ordinary exit?
 
-`fleet_service` answers *is this lane being served*. It cannot answer *will it
-survive*, and the two come apart badly.
-
-On 2026-09-05 this repository's only macOS runner was `online` and `busy` —
-`Served`, correctly, by every existing assertion. A routine force-push tripped
-`cancel-in-progress`, the cancel arrived at the runner as a signal
-(`Runner will be shutdown for UserCancelled`), and it exited. It never came
-back: not ephemeral, `RunAtLoad` with **no `KeepAlive`**, and not loaded in
-launchd at all. The lane went from `Served` to permanently `Unserved` with no
-state in between, while the host stayed up and kept serving three other
-runners. The precondition was statically visible the whole time.
-
-`fleet_supervision` reads that precondition. `Restartability` per runner
-(`Supervised` / `SelfReplacing` / `Unsupervised` / `Unknown`), rolled up per
-lane into `Survivability` (`Survivable` / `Fragile` / `SinglePointOfFailure` /
-`Unknown`).
-
-Two traps it is built around, both of which produce a confident false fault:
-
-- **A LaunchAgent lives in the per-user GUI domain.** `launchctl list` over SSH
-  prints nothing for a job that is loaded and running, so "not loaded" from an
-  SSH session is not a fact. Query `launchctl print gui/$(id -u)/<label>`, and
-  **always run it against a job you know is loaded first** — without that
-  control an empty result is indistinguishable from a broken query. An
-  unreadable domain is `Unknown { boundary: Scope }`, never a fault.
-- **An empty runner census is a scope error until proven otherwise.** Zero
-  runners yields `Unknown`, not `SinglePointOfFailure`; the org-vs-repo scope
-  mistake already misled this fleet once.
-
-`RunAtLoad` is not supervision. It starts a job once and says nothing about
-what happens when it exits — which is exactly the plist that took the lane out.
+A lane being served now does not mean it survives a cancel signal. A LaunchAgent with `RunAtLoad` and no `KeepAlive` is not supervised, and it takes the lane out for good after one exit. Check with `launchctl print gui/$(id -u)/<label>`, never `launchctl list` over SSH, and run it first against a job you know is loaded. An empty runner census is a scope error until proven otherwise. Detail: `docs/fleet-health-lessons.md`.
 
 ### A queued job that nobody will ever pick up
 
@@ -2511,37 +2481,7 @@ See `docs/cloud-retarget.md` for full context; add-lane complements retarget.
 
 ### A health verdict needs a control too
 
-The same rule that governs a runner census governs a health signal: a verdict
-you cannot contradict is not a verdict, it is an assertion. tartci #188 is the
-case — a fleet health checker reported a host **dead while it was serving a
-busy runner**. That is the only shape in this family where the system was
-*confident and wrong* rather than silent, and it is the most corrosive: once an
-operator sees one confidently wrong "dead", they stop trusting every other
-verdict the same system emits.
-
-`fleet_health_reconciliation` checks a claim against independent evidence that
-the host is doing work, and the asymmetry is the whole design:
-
-- **Service evidence is positive and hard to fake.** A `busy` runner is
-  executing someone's job; a job completed after the claim finished on that
-  host. Neither happens on a dead machine, so both *refute* a `critical` claim
-  and downgrade it from `Block` to `Warn` — the host keeps taking work and the
-  operator learns the signal is wrong.
-- **Silence refutes nothing.** An idle host serves nothing and is healthy.
-  Reading quiet as dead would condemn every unused machine in the fleet.
-
-Two traps it deliberately encodes:
-
-- **`online` is not proof of life.** A registration outlives the machine behind
-  it — tartci #189, an offline runner still advertising its labels — so only
-  *work* counts as evidence. Census presence never refutes a health claim.
-- **Staleness is not health.** A vitals file whose producer died repeats its
-  last word forever with total confidence. Past a ceiling the claim is neither
-  green nor critical; it is `Unknown`, because nobody is answering.
-
-When triaging a host the fleet calls unusable, get the counter-evidence before
-the diagnosis: is anything on it *busy right now*? If so, the signal is the
-fault.
+A verdict you cannot contradict is an assertion. Before accepting that a host is dead, look for work on it: a runner that is `busy`, or a job that finished there after the claim, refutes the claim. Silence refutes nothing, since an idle host is healthy. `online` is not proof of life, and a stale vitals file is unknown rather than green. Detail: `docs/fleet-health-lessons.md`.
 
 ## Before blaming a lane: a runner census needs both scopes and a control
 
@@ -3124,41 +3064,7 @@ archive the stale state and start fresh. Full details in
 
 ### Being right does not discharge the duty
 
-A process that exits fail-closed because it cannot prove a resource is gone has
-made the *correct* decision, and it must never be "fixed" by making it proceed.
-But a correct refusal is not a completed obligation — it is the start of one.
-
-At the moment it stops, that process knows three things nobody else does: that
-it stopped, what it was holding, and why it could not finish. If it exits
-without saying them, that knowledge dies with it and the only remaining
-evidence is a resource nobody can account for. The real incident: a teardown
-refused correctly, **raised nothing**, and left a failed lease release
-unresolved, so a shared resource stayed held by a process that no longer
-existed.
-
-`fleet_handback::assess_exit` names the three obligations, most consequential
-first:
-
-1. **Bound the retry.** Repeating an unproven action is not recovery — an
-   unbounded restart into unproven state is the `NRestarts=36088` crash loop,
-   and it does damage on a timer rather than sitting inert.
-2. **Dispose.** Every held resource gets an owner or an explicit release. A
-   lease held by a dead process is a leak whatever the exit code was.
-3. **Raise.** Somewhere that outlives the host, because a journal line on a
-   machine nobody is looking at is not a signal. An empty reference does not
-   count.
-
-Two things it deliberately will *not* do, both of which would make it useless:
-
-- **A clean exit holding nothing owes nothing.** Faulting on every quiet
-  success buries the real findings under ordinary ones.
-- **An unobservable exit is `Unknown`, not `Discharged`.** It has a separate
-  constructor precisely so nobody can score one by passing defaults into the
-  normal path.
-
-`fleet_selfheal` already returns `Escalate` instead of acting when idleness
-cannot be proven. This is the other end of that contract — what the caller owes
-on receiving one.
+A process that exits fail-closed because it cannot prove a resource is gone made the right call, and must never be "fixed" by making it proceed. But the refusal starts an obligation: bound the retry, give every held resource an owner or an explicit release, and raise the failure somewhere that outlives the host. A clean exit holding nothing owes nothing, and an exit you cannot observe is unknown, not discharged. Detail: `docs/fleet-health-lessons.md`.
 
 ## Queue management
 
@@ -3215,7 +3121,7 @@ shipyard queue resume --repo OWNER/REPO --apply --json    # later: re-run what i
 - triage also reads the base head's checks. When a required context is red on
   the base, an open pull request that names that context next to a fix word
   (`fix`, `unblock`, `repair`, `restore`, `revert`) in its title or
-  description, or that carries the `shipyard:unblock` label, is an unblocking
+  description, or that carries the `shipyard:unblock`, `main-red-fix` or `fixes-main` label, is an unblocking
   candidate. With exactly one candidate, triage prioritizes it in the same
   pass. With several, it lists them and you choose with `queue prioritize`.
   `--no-prioritize-unblocking` reports without jumping.
@@ -3955,7 +3861,7 @@ When the user says "push a PR", "ship this", "ship it", "we're done", "merge thi
 The orchestration, in order:
 
 1. `skill_sync_check.py --mode=report` — hard-fails if a mapped path was touched without a `SKILL.md` update or a `Skill-Update:` trailer on the tip commit.
-2. `version_bump_check.py --mode=report` — rejects version-file edits; version-at-land assigns both surfaces after merge.
+2. `version_bump_check.py --mode=report` rejects version-file edits (dependency and feature edits in `Cargo.toml` and `Cargo.lock` pass), and version-at-land assigns both surfaces after merge.
 3. `git commit` + `gh pr create` + `shipyard ship`.
 4. If `[pr.provenance]` is configured, run its exact argv with the submitting session's environment. A required hook must succeed before any durable handoff or validation dispatch.
 5. With `[merge_steward].auto_handoff = true` on the protected base branch or explicit `--workstream-id`, write the exact-head server receipt and managed label immediately after provenance, before validation begins. The PR branch cannot enable the project default. The fallback workstream is `OWNER/REPO#PR` and the fallback context is the PR URL; `--no-steward-handoff` is an explicit override.
@@ -4416,7 +4322,7 @@ more consecutive groups carrying different pull requests, none common to all
 of them, is poisoned, and `runner steward --json` reports it under
 `repos[].base_poison` with the context and its first error line. With
 `merge_group_hold = "on"` the steward then enqueues only a named fix (label
-`shipyard:unblock`, a title or description naming the context next to a fix
+`shipyard:unblock`, `main-red-fix` or `fixes-main`, a title or description naming the context next to a fix
 word, or the detector's `candidate_fix_pr`) and reports every other approved
 green head `held_base_poisoned:<context>`; it puts the fix's review first
 (machine-global `base_health.fix_review_priority_file` and

@@ -620,7 +620,8 @@ pub struct UnblockCandidate {
 
 /// Find pull requests that say they fix a check that is red on the base.
 ///
-/// A pull request carrying [`UNBLOCK_LABEL`] always qualifies. Otherwise its
+/// A pull request carrying [`UNBLOCK_LABEL`], `main-red-fix` or `fixes-main`
+/// always qualifies. Otherwise its
 /// title or description must name a red required context *and* use a fix word
 /// (`fix`, `unblock`, `repair`, `restore`, `revert`). Drafts, doomed heads, and
 /// pull requests whose own run of the red context already failed are excluded.
@@ -661,8 +662,8 @@ pub fn unblocking_candidates_excusing(
 }
 
 /// Why a pull request reads as the fix for one of `red_contexts`: it carries
-/// [`UNBLOCK_LABEL`], or its title or description names a red context next
-/// to a fix word. Empty when it does not.
+/// [`UNBLOCK_LABEL`] or a `main-red-fix`/`fixes-main` label, or its title or
+/// description names a red context next to a fix word. Empty when it does not.
 #[must_use]
 pub fn fix_evidence(
     title: &str,
@@ -671,11 +672,8 @@ pub fn fix_evidence(
     red_contexts: &[String],
 ) -> Vec<String> {
     let mut evidence = Vec::new();
-    if labels
-        .iter()
-        .any(|label| label.eq_ignore_ascii_case(UNBLOCK_LABEL))
-    {
-        evidence.push(format!("label `{UNBLOCK_LABEL}`"));
+    if let Some(label) = labels.iter().find(|label| is_fix_label(label)) {
+        evidence.push(format!("label `{}`", label.to_ascii_lowercase()));
     }
     let text = format!("{title}\n{body}").to_ascii_lowercase();
     if has_fix_word(&text) {
@@ -686,6 +684,15 @@ pub fn fix_evidence(
         }
     }
     evidence
+}
+
+/// Whether `label` marks a fix: [`UNBLOCK_LABEL`] or any of
+/// [`crate::base_health::fix_first::FIX_LABELS`], ignoring case.
+fn is_fix_label(label: &str) -> bool {
+    label.eq_ignore_ascii_case(UNBLOCK_LABEL)
+        || crate::base_health::fix_first::FIX_LABELS
+            .iter()
+            .any(|fix| label.eq_ignore_ascii_case(fix))
 }
 
 fn has_fix_word(text: &str) -> bool {

@@ -34,7 +34,7 @@ scripts the edited file sat in.)
 
 Scripts:
 
-- `scripts/version_bump_check.py` — detects which surfaces need a post-merge assignment. Pull requests may not edit version files; the gate has no apply mode.
+- `scripts/version_bump_check.py` detects which surfaces need a post-merge assignment. Pull requests may not edit version files, except dependency and feature edits in `Cargo.toml` and `Cargo.lock`; the gate has no apply mode.
 - `scripts/skill_sync_check.py` — hard-fails when a mapped path is touched without the corresponding `SKILL.md` update. The map is `scripts/skill_path_map.json`; every dir under `skills/` must appear in it.
 
 Full design: borrowed from `pulp` (upstream) — the schema and scripts are shared. See the pulp repo's `docs/guides/versioning.md` for the source of truth on the design.
@@ -53,7 +53,7 @@ for patterns and exit-code reference.
 When the user says "push a PR", "ship this", "ship it", "we're done", "merge this", or similar, invoke `shipyard pr` (or `shipyard ship` if that name is reserved for release today — check `skills/ci/SKILL.md`). It orchestrates:
 
 1. `skill_sync_check.py --mode=report` — hard-fails on missing SKILL.md updates.
-2. `version_bump_check.py --mode=report` — validates the version-file prohibition.
+2. `version_bump_check.py --mode=report` refuses a PR that edits a version file (dependency and feature edits in `Cargo.toml` and `Cargo.lock` pass).
 3. `git commit` + PR create + CI validate. Agents pass `--no-arm` and stop there; the steward merges the approved head (see "How a PR lands here").
 4. `.github/workflows/auto-release.yml` tags the moved CLI version on merge; the existing tag-triggered `release.yml` publishes binaries.
 
@@ -176,7 +176,7 @@ The script is 9 steps: build, re-sign, package-to-dmg, sign-dmg, notarize+staple
 
 **Draft-until-complete (#252):** `release.yml` now creates the GitHub Release as **draft**. `install.sh`'s `releases/latest` resolution excludes drafts by default — so during the build/upload gap window, macOS users degrade to the previous published tag instead of hitting a 404 on the missing dmg. Step 8 of the local release script flips `draft=false` once the dmg is uploaded; step 9's E2E failure reverts to draft so broken releases disappear from `releases/latest` automatically. This is why shipping is a manual-on-Mac step today, not an auto-release: the maintainer's local script is the gate that flips the release public.
 
-**Load-bearing rule:** the success criterion is a working `--version` after fresh install.sh → mount → extract → launch. Not `codesign --verify`, not `spctl --assess`, not the on-runner launch gate in isolation. We shipped v0.42.0 and v0.43.0 with the same breakage because we declared victory on partial verification. Don't do that again.
+**Load-bearing rule:** the success criterion is a working `--version` after fresh install.sh → mount → extract → launch. That `--version` must equal the tag without its leading `v`, since a build script or a hardcoded string can make a binary report a version its tag does not name. Not `codesign --verify`, not `spctl --assess`, not the on-runner launch gate in isolation. We shipped v0.42.0 and v0.43.0 with the same breakage because we declared victory on partial verification. Don't do that again.
 
 Full flow + env-var setup in `RELEASING.md` § "macOS release is a locally-signed + stapled .dmg". Do not revert to CI signing or bare Mach-O without re-running the #219 diagnostic and proving the online-notarization-check issue is resolved (tracked in #226).
 
@@ -193,6 +193,13 @@ Full flow + env-var setup in `RELEASING.md` § "macOS release is a locally-signe
 
 ## Development
 
-- `uv sync` to install.
-- `pytest -x` for the test suite.
-- Never push directly to `main` — always PR → CI → merge.
+Shipyard is a Rust crate with Python helper scripts. The authoritative list of checks is the `run:` steps in `.github/workflows/ci.yml`; if this list and that file disagree, the workflow wins. To run the main ones locally:
+
+- `cargo fmt --all --check`
+- `cargo clippy --all-targets --locked -- -D warnings`
+- `cargo test --all-targets --locked --features ci-test-home`
+- `python3 scripts/run_unittest_strict.py -s <dir> -p 'test_*.py'` for each Python test directory the workflow names (`scripts`, `tools/metrics` and others)
+
+CI wraps the cargo test and clippy steps in `scripts/ci-capped-run.sh`, which only caps their resource use.
+
+Never push directly to `main`; open a PR as described above.
