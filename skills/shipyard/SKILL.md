@@ -750,7 +750,11 @@ with, or take the claim with `shipyard claim take --from <owner> --reason
 "..."`, which posts `repair-claim-taken: <you> from <owner> reason=...`.
 `repair-claim-released: <owner>` ends a claim; a garbled time counts as live.
 GitHub unreadable after one retry: it prints why and lets the push go.
-`SHIPYARD_CLAIM_FENCE=off` is the rollback. The claim grammar has one parser,
+`SHIPYARD_CLAIM_FENCE=off` is an owner and incident rollback only; agents
+never set it (same rule as `GHAPP_ALLOW_*`). With no hook, check first:
+`shipyard claim check-push origin "$(git remote get-url origin)" --branch
+"$BRANCH" && git push origin "$BRANCH"`. A hook runs in every worktree of a
+clone once the clone sets `git config core.hooksPath .githooks`. The claim grammar has one parser,
 `src/work_claim.rs`, used by the relay and `shipyard advance` too.
 `repaired:` and `repair-claim-taken:` comments get the `ghapp` session stamp
 above their last non-blank line. Full reference: `docs/claim-fence.md`.

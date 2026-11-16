@@ -14,7 +14,8 @@ claim is live, so two sessions do not repair the same pull request at once.
 | Path | Fenced | How |
 |---|---|---|
 | `shipyard pr` / `shipyard ship` push | yes | checked in process before the push |
-| `git push` in a repository whose pre-push hook calls `shipyard claim check-push "$1" "$2"` with the hook's stdin | yes | the hook exits 1 on a refusal |
+| `git push` in a repository whose pre-push hook calls `shipyard claim check-push "$1" "$2"` with the hook's stdin, and whose clone sets `core.hooksPath` | yes | the hook exits 1 on a refusal ([every worktree](#making-a-repositorys-hook-run-in-every-worktree)) |
+| `shipyard claim check-push origin <url> --branch <b> && git push ...` | yes | [without a hook](#checking-before-a-push-without-a-hook) |
 | Shipyard's own `.githooks/pre-push` | yes | it carries that line |
 | `git push` in a repository whose hook does not (Pulp and Vellum until their own PRs add it) | no | |
 | `git push --no-verify` | no | git skips the hook |
@@ -23,6 +24,55 @@ Agent git pushes over SSH with the owner's key, never through the fleet App, so
 no `ghapp` guard or server-side rule sees a push. The fence is a client-side
 coordination check, not a security boundary: every claim comment posts as the
 same App, so an owner is only a name.
+
+## Making a repository's hook run, in every worktree
+
+A pre-push hook fences a push only when git runs it. For a repository that
+opts in (Vellum and Pulp in their own pull requests):
+
+1. Its `.githooks/pre-push` calls the fence before its other gates, passing the
+   hook's stdin through:
+
+   ```sh
+   push_refs=""
+   [ -t 0 ] || push_refs="$(cat)"
+   if command -v shipyard >/dev/null 2>&1; then
+       printf '%s\n' "$push_refs" | shipyard claim check-push "${1:-}" "${2:-}"
+       case $? in 0) ;; 1) exit 1 ;; *) echo "claim-fence: could not run; pushing without the check" >&2 ;; esac
+   fi
+   ```
+
+   A hook that reads stdin for its own purposes must use `$push_refs`
+   afterwards, since stdin can be read once.
+2. The clone sets `core.hooksPath` to the relative path `.githooks`, once:
+   `git config core.hooksPath .githooks` (Shipyard's `scripts/install-githooks.sh`
+   does exactly this). It is stored in the clone's shared `.git/config`, so every
+   worktree of that clone, including a lane worktree added later with
+   `git worktree add`, runs the hook from its own checkout's `.githooks/`. Git
+   resolves a relative `core.hooksPath` against the worktree being pushed from.
+
+It does not cover:
+
+- a branch checked out from before the hook gained the fence line (the hook
+  runs from the worktree's own checkout);
+- a clone where `core.hooksPath` was never set (git's default `.git/hooks` has
+  no such hook), or where a worktree-specific config (`extensions.worktreeConfig`)
+  overrides it;
+- `git push --no-verify`.
+
+Check a worktree with `git config core.hooksPath` (expect `.githooks`) and
+`test -x .githooks/pre-push`.
+
+## Checking before a push, without a hook
+
+A lane that pushes with raw `git push` can call the fence itself first:
+
+```sh
+shipyard claim check-push origin "$(git remote get-url origin)" --branch "$BRANCH" && git push origin "$BRANCH"
+```
+
+`--branch` (repeatable) replaces the hook's stdin. Exit 1 is a refusal; exit 0
+covers allowed, kill-switched and GitHub-unreadable (the last two print why).
 
 ## How a claim is read
 
@@ -89,3 +139,8 @@ pushes, and a pre-push hook cannot add a trailer without changing the SHA.
 
 `SHIPYARD_CLAIM_FENCE=off` turns the fence off for that process (it prints that
 it did). Removing the hook line turns it off for a repository.
+
+Both are owner and incident rollbacks only. Agents never set
+`SHIPYARD_CLAIM_FENCE=off`, the same rule as `GHAPP_ALLOW_*`: a refused agent
+sets `SHIPYARD_CLAIM_OWNER` to its own claim's name or takes the claim with
+`shipyard claim take`. The refusal ends with that rule.

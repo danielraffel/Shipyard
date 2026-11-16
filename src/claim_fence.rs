@@ -124,7 +124,8 @@ fn refusal(repo: &str, branch: &str, pr: u64, claim: &LiveClaim, env: &FenceEnv)
         "claim-fence: refusing push to {repo} {branch}: pull request #{pr} has a live \
          repair claim by {owner} until {until} (comment {id}); {you}.\n\
          claim-fence: set {OWNER_ENV}={owner} if this is your claim, or take it over with \
-         `shipyard claim take --repo {repo} --pr {pr} --from {owner} --reason \"...\"`, then push again.",
+         `shipyard claim take --repo {repo} --pr {pr} --from {owner} --reason \"...\"`, then push again.\n\
+         claim-fence: {SWITCH_ENV}=off is an owner and incident rollback only; agents never set it.",
         owner = claim.owner,
         until = claim.until,
         id = claim.comment_id,

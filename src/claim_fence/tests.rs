@@ -118,6 +118,12 @@ fn an_unset_owner_is_refused_with_both_ways_forward() {
         ),
         "{text}"
     );
+    assert!(
+        text.ends_with(
+            "claim-fence: SHIPYARD_CLAIM_FENCE=off is an owner and incident rollback only; agents never set it."
+        ),
+        "{text}"
+    );
 }
 
 #[test]

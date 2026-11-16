@@ -24,17 +24,26 @@ pub(super) fn claim_command<W: Write>(
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
     match command {
-        ClaimCommand::CheckPush { remote: _, url } => {
-            let mut stdin = String::new();
-            std::io::stdin()
-                .read_to_string(&mut stdin)
-                .map_err(|error| {
-                    CliFailure::new(2, format!("cannot read the hook's stdin: {error}"))
-                })?;
+        ClaimCommand::CheckPush {
+            remote: _,
+            url,
+            branches,
+        } => {
+            let branches = if branches.is_empty() {
+                let mut stdin = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut stdin)
+                    .map_err(|error| {
+                        CliFailure::new(2, format!("cannot read the hook's stdin: {error}"))
+                    })?;
+                pushed_branches(&stdin)
+            } else {
+                branches
+            };
             let Some(repo) = super::wait_cmd::parse_github_repo_slug(&url) else {
                 return Ok(ExitCode::SUCCESS);
             };
-            let fence = run_fence(&repo, &pushed_branches(&stdin), None);
+            let fence = run_fence(&repo, &branches, None);
             Ok(report(&fence))
         }
         ClaimCommand::Take {

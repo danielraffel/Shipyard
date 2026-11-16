@@ -3554,14 +3554,18 @@ pub(super) enum OwnerCommand {
 
 #[derive(Debug, Subcommand)]
 pub(super) enum ClaimCommand {
-    /// Judge a push from a git pre-push hook: reads the hook's stdin and exits
-    /// 1 when a pushed branch's open pull request has another session's live
-    /// claim, 0 otherwise (including when GitHub cannot be read).
+    /// Judge a push: exits 1 when a pushed branch's open pull request has
+    /// another session's live claim, 0 otherwise (including when GitHub cannot
+    /// be read). From a git pre-push hook it reads the hook's stdin; before a
+    /// push with no hook, name the branch with `--branch`.
     CheckPush {
         /// The remote's name, as git passes it to the hook.
         remote: String,
         /// The remote's URL, as git passes it to the hook.
         url: String,
+        /// Judge this branch instead of reading a hook's stdin. Repeatable.
+        #[arg(long = "branch", value_name = "BRANCH")]
+        branches: Vec<String>,
     },
     /// Take another owner's live claim: post `repair-claim-taken: <you> from
     /// <owner> reason=...` as `$SHIPYARD_CLAIM_OWNER`.
