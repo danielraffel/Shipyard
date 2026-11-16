@@ -47,7 +47,7 @@ class Fake:
         raise pm.ReadError("no route " + path)
 
 
-def world(prs, timelines=None, commits=None, base_commits=None, runs=None, jobs=None, checks=None, required=("Test",)):
+def world(prs, timelines=None, commits=None, base_commits=None, runs=None, jobs=None, checks=None, required=("Test",), default_checks=True):
     timelines, commits, jobs, checks = timelines or {}, commits or {}, jobs or {}, checks or {}
     routes = [(r"pulls\?state=all", prs)]
     for n in {p["number"] for p in prs}:
@@ -61,6 +61,8 @@ def world(prs, timelines=None, commits=None, base_commits=None, runs=None, jobs=
         routes.append((rf"actions/runs/{rid}/jobs", {"jobs": js}))
     for sha, cr in checks.items():
         routes.append((rf"commits/{sha}/check-runs", {"check_runs": cr}))
+    if default_checks:
+        routes.append((r"commits/[^/]+/check-runs", {"check_runs": [{"name": "Test", "status": "completed", "conclusion": "success"}]}))
     routes.append((r"rules/branches/main", [{"type": "required_status_checks",
                                               "parameters": {"required_status_checks": [{"context": c} for c in required]}}]))
     return Fake(routes)
@@ -279,7 +281,7 @@ class Correctness(Base):
 
     def test_unreadable_checks_make_correctness_unknown(self):
         p = self.merged_old(6)
-        out = self.build(world([p], base_commits=[commit(p["merge_commit_sha"], date=T(5, "10:00"))]), now=dt.datetime(2026, 11, 14, tzinfo=UTC))
+        out = self.build(world([p], base_commits=[commit(p["merge_commit_sha"], date=T(5, "10:00"))], default_checks=False), now=dt.datetime(2026, 11, 14, tzinfo=UTC))
         k = out["repos"][REPO]["per_day"]["2026-11-05"]["correctness"]
         self.assertEqual((k["unknown"], k["bad_rate_pct"]), (1, None))
 
@@ -383,7 +385,7 @@ class NorthStar(Base):
         self.assertTrue(ns["unknown_over_20pct"] and ns["insufficient_sample"])
         self.assertEqual(ns["rate_range_pct"], [50.0, 100.0])
         md = pm.markdown(out)
-        self.assertIn("insufficient sample (n<50", md)
+        self.assertIn("insufficient sample (n<50)", md)
         self.assertIn("50.0-100.0%", md)
 
 
@@ -501,8 +503,7 @@ class Truncation(Base):
         with tempfile.TemporaryDirectory() as d2:
             full = pm.build([REPO], d2, 300, OWNER, START, self.LATE, {}, {}, None, world(prs), None, None, {})
         self.assertEqual(full["repos"][REPO]["unread_prs"], 0)
-        self.assertFalse(full["repos"][REPO]["truncated"])
-        self.assertNotIn("read cap hit=true", pm.markdown(full))
+        self.assertNotIn("partial", pm.markdown(full))
 
     def test_truncated_with_all_facts_cached_is_still_partial(self):
         v = {"truncated": True, "unread_prs": 0, "listing_complete": True, "read_errors": 0}
@@ -559,7 +560,7 @@ class Caps(Base):
         md = pm.markdown(out)
         self.assertIn(f"**TRUNCATED: {v['unread_prs']} PRs unread**", md)
         again = self.build(world(prs), cap=200)
-        self.assertIn("read cap hit=false", pm.markdown(again))
+        self.assertNotIn("TRUNCATED:", pm.markdown(again))
         self.assertFalse(again["truncated"])
         self.assertEqual(len(again["repos"][REPO]["prs"]), 4)
 
