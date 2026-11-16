@@ -1894,3 +1894,41 @@ fn the_digest_reads_a_claim_with_a_note_and_a_minute_time() {
         })
     );
 }
+
+#[test]
+fn the_digest_follows_a_take_and_a_release_as_the_push_fence_does() {
+    let mut pr = Pr::open(1);
+    pr.comments.push((
+        "repair-claim: team-lead (repair-462-allowlist) until 2026-11-16T22:00Z".to_owned(),
+        "2026-11-16T18:17:00Z".to_owned(),
+    ));
+    pr.comments.push((
+        "repair-claim-taken: vellum-lead from team-lead reason=idle".to_owned(),
+        "2026-11-16T18:30:00Z".to_owned(),
+    ));
+    assert_eq!(
+        digest(&pr).claim,
+        Some(Claim {
+            by: "vellum-lead".to_owned(),
+            until: "2026-11-16T22:00Z".to_owned()
+        }),
+        "a take moves the claim, with its time"
+    );
+    pr.comments.push((
+        "repair-claim-released: vellum-lead".to_owned(),
+        "2026-11-16T18:40:00Z".to_owned(),
+    ));
+    assert_eq!(digest(&pr).claim, None, "a release ends it");
+    pr.comments.push((
+        "repair-claim: m1-repair until 2026-11-16 23:00 UTC".to_owned(),
+        "2026-11-16T18:50:00Z".to_owned(),
+    ));
+    assert_eq!(
+        digest(&pr).claim,
+        Some(Claim {
+            by: "m1-repair".to_owned(),
+            until: "2026-11-16T23:00:00+00:00".to_owned()
+        }),
+        "a time written with spaces is relayed as one plain token"
+    );
+}

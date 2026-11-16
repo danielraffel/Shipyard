@@ -1198,9 +1198,11 @@ fn push_pr_branch(
     branch: &str,
     expected_remote_head: &str,
     mut prospective_push: Option<&mut prepush_changed_surface::ProspectivePush>,
+    fence_env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
 ) -> Result<(), CliFailure> {
     let mut environment = crate::pr::scoped_push_environment(&config.global_dir)
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    environment.extend(fence_env);
     environment.extend(
         prospective_push
             .as_deref_mut()
@@ -1292,13 +1294,15 @@ fn resolve_pr_context(
         });
     }
 
-    super::claim_cmd::fence_before_push(cwd, checkout.branch, args.gh_command.as_deref())?;
+    let fence_env =
+        super::claim_cmd::fence_before_push(cwd, checkout.branch, args.gh_command.as_deref())?;
     push_pr_branch(
         config,
         cwd,
         checkout.branch,
         expected_remote_head,
         prospective_push,
+        fence_env,
     )?;
     let info = find_pr_for_branch(config, cwd, args.gh_command.as_deref(), checkout.branch)
         .map_err(|error| CliFailure::new(1, error.to_string()))?

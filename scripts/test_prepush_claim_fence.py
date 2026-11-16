@@ -21,6 +21,7 @@ def run_with_fence(root: Path, status: int) -> tuple[subprocess.CompletedProcess
     env.update(provision(root))
     env["SHIPYARD_PREPUSH_BASE"] = "HEAD"
     env["SHIPYARD_ENFORCE_PREPUSH"] = "0"
+    env["SHIPYARD_CLAIM_FENCE"] = "on"
     seen = root / "fence-call.txt"
     fence = Path(env["PATH"].split(os.pathsep)[0]) / "shipyard"
     fence.write_text(
@@ -59,6 +60,26 @@ class PrePushClaimFenceTests(unittest.TestCase):
             proc, _ = run_with_fence(Path(td), 2)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("claim check-push could not run; pushing without the check", proc.stderr)
+
+
+    def test_a_missing_shipyard_is_named_only_when_the_fence_is_on(self) -> None:
+        for fence, named in (("on", True), ("", False)):
+            with self.subTest(fence=fence), tempfile.TemporaryDirectory() as td:
+                env = os.environ.copy()
+                env.pop("RUSTUP_AUTO_INSTALL", None)
+                env.update(provision(Path(td)))
+                env["SHIPYARD_PREPUSH_BASE"] = "HEAD"
+                env["SHIPYARD_ENFORCE_PREPUSH"] = "0"
+                env["SHIPYARD_CLAIM_FENCE"] = fence
+                proc = subprocess.run(
+                    ["bash", str(HOOK), "origin", URL],
+                    cwd=ROOT, env=env, text=True, capture_output=True, input=REFS, timeout=120,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(
+                    "shipyard is not on PATH; pushing without the check" in proc.stderr, named,
+                    proc.stderr,
+                )
 
 
 if __name__ == "__main__":

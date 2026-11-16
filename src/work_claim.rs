@@ -190,6 +190,7 @@ impl ClaimRegistry {
 /// advance` and the push fence all read claims through it. The optional
 /// parenthetical note is what people actually write
 /// (`repair-claim: team-lead (repair-462-allowlist) until 2026-11-16T22:00Z`).
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ClaimLine {
     pub(crate) owner: String,
@@ -197,6 +198,7 @@ pub(crate) struct ClaimLine {
 }
 
 /// Every claim line in `body`, in order.
+#[cfg(test)]
 pub(crate) fn claim_lines(body: &str) -> Vec<ClaimLine> {
     claim_acts(body)
         .into_iter()
@@ -207,26 +209,49 @@ pub(crate) fn claim_lines(body: &str) -> Vec<ClaimLine> {
         .collect()
 }
 
-/// A claim's expiry: RFC 3339, or the minute form `YYYY-MM-DDTHH:MMZ`.
-/// `None` when it parses as neither, which every caller treats as live.
+/// A claim's expiry, in every spelling fleet-handbook's `repair_preclaim.py`
+/// reads plus a few it does not: `2026-11-16T22:00Z`, a space for the `T`,
+/// optional seconds (and fraction), a `Z`, ` UTC` or `+HH:MM` suffix or none
+/// (read as UTC), and a trailing period. `None` when it is none of these.
 pub(crate) fn claim_expiry(until: &str) -> Option<DateTime<Utc>> {
-    let until = until.trim();
-    DateTime::parse_from_rfc3339(until)
-        .map(|time| time.with_timezone(&Utc))
-        .ok()
-        .or_else(|| {
-            chrono::NaiveDateTime::parse_from_str(until, "%Y-%m-%dT%H:%MZ")
-                .ok()
-                .map(|time| time.and_utc())
-        })
+    let text = until.trim().trim_end_matches('.').trim_end();
+    let (text, zoned) = if let Some(rest) = text.strip_suffix("UTC") {
+        (rest.trim_end(), false)
+    } else if let Some(rest) = text.strip_suffix('Z') {
+        (rest, false)
+    } else {
+        (text, true)
+    };
+    let text = text.replacen(' ', "T", 1);
+    if zoned {
+        for format in ["%Y-%m-%dT%H:%M%:z", "%Y-%m-%dT%H:%M:%S%.f%:z"] {
+            if let Ok(time) = DateTime::parse_from_str(&text, format) {
+                return Some(time.with_timezone(&Utc));
+            }
+        }
+    }
+    ["%Y-%m-%dT%H:%M", "%Y-%m-%dT%H:%M:%S%.f"]
+        .iter()
+        .find_map(|format| chrono::NaiveDateTime::parse_from_str(&text, format).ok())
+        .map(|time| time.and_utc())
 }
 
 /// What one comment line does to the claims on a pull request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ClaimAct {
-    Claim { owner: String, until: String },
-    Release { owner: String },
-    Take { owner: String, from: String },
+    Claim {
+        owner: String,
+        until: String,
+    },
+    /// `None`: a bare `repair-claim-released:`, which ends every earlier claim
+    /// (as `repair_preclaim.py` reads it).
+    Release {
+        owner: Option<String>,
+    },
+    Take {
+        owner: String,
+        from: String,
+    },
 }
 
 /// The claim acts in `body`, one per line at most, in line order.
@@ -235,8 +260,9 @@ fn claim_acts(body: &str) -> Vec<ClaimAct> {
     let re = RE.get_or_init(|| {
         regex::Regex::new(concat!(
             r"^[ \t]*(?:",
-            r"repair-claim:[ \t]*(\S+)(?:[ \t]+\([^)]*\))?[ \t]+until[ \t]+(\S+)",
-            r"|repair-claim-released:[ \t]*(\S+)",
+            r"repair-claim:[ \t]*(\S+)(?:[ \t]+\([^)]*\))?[ \t]+until[ \t]+",
+            r"(\d{4}-\d\d-\d\d[T ]\d\d:\d\d(?::\d\d(?:\.\d+)?)?(?:[ \t]*(?:Z|UTC|[+-]\d\d:\d\d))?\.?|\S+)",
+            r"|repair-claim-released:[ \t]*(\S+)?",
             r"|repair-claim-taken:[ \t]*(\S+)[ \t]+from[ \t]+(\S+)",
             r")",
         ))
@@ -248,25 +274,47 @@ fn claim_acts(body: &str) -> Vec<ClaimAct> {
             let group = |index: usize| found.get(index).map(|m| m.as_str().to_owned());
             if let (Some(owner), Some(until)) = (group(1), group(2)) {
                 Some(ClaimAct::Claim { owner, until })
-            } else if let Some(owner) = group(3) {
-                Some(ClaimAct::Release { owner })
-            } else {
+            } else if let Some(owner) = group(4) {
                 Some(ClaimAct::Take {
-                    owner: group(4)?,
+                    owner,
                     from: group(5)?,
                 })
+            } else {
+                Some(ClaimAct::Release { owner: group(3) })
             }
         })
         .collect()
 }
 
-/// A claim that is live at the time asked about.
+/// A claim someone holds: posted, and neither released nor taken since.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct LiveClaim {
+pub(crate) struct HeldClaim {
     pub(crate) owner: String,
     pub(crate) until: String,
     /// The comment that put the claim in this owner's hands.
     pub(crate) comment_id: u64,
+    /// When the claim itself was posted (a take keeps the original time).
+    pub(crate) claimed_at: String,
+    /// Order of the act that put it in these hands, oldest first.
+    pub(crate) seq: usize,
+}
+
+/// A held claim that is live at the time asked about.
+pub(crate) type LiveClaim = HeldClaim;
+
+impl HeldClaim {
+    /// When the claim ends. An unreadable time ends `unreadable` after the
+    /// claim was posted, or never (`None`).
+    pub(crate) fn expires(&self, unreadable: Option<Duration>) -> Option<DateTime<Utc>> {
+        claim_expiry(&self.until).or_else(|| {
+            let posted = DateTime::parse_from_rfc3339(&self.claimed_at).ok()?;
+            Some(posted.with_timezone(&Utc) + unreadable?)
+        })
+    }
+
+    pub(crate) fn live_at(&self, now: DateTime<Utc>, unreadable: Option<Duration>) -> bool {
+        self.expires(unreadable).is_none_or(|until| until > now)
+    }
 }
 
 /// One trusted comment, as the claim fold reads it.
@@ -278,42 +326,48 @@ pub(crate) struct ClaimComment<'a> {
     pub(crate) body: &'a str,
 }
 
-/// The claims live at `now`, from trusted comments in any order.
+/// The claims held after trusted comments in any order, expired or not.
 ///
 /// Comments are read oldest first (stable for equal times). A
-/// `repair-claim-released: <owner>` ends that owner's earlier claim; a
+/// `repair-claim-released: <owner>` ends that owner's earlier claim, and a
+/// bare `repair-claim-released:` every earlier claim; a
 /// `repair-claim-taken: <new> from <old>` moves the old owner's earlier claim,
-/// with its expiry, to the new owner. A claim posted after either is live
-/// again. A claim whose time parses as nothing is live: it cannot be shown
-/// expired.
-pub(crate) fn live_claims(comments: &[ClaimComment<'_>], now: DateTime<Utc>) -> Vec<LiveClaim> {
+/// with its expiry, to the new owner. A claim posted after either is held
+/// again.
+pub(crate) fn held_claims(comments: &[ClaimComment<'_>]) -> Vec<HeldClaim> {
     let mut ordered: Vec<&ClaimComment<'_>> = comments.iter().collect();
     ordered.sort_by(|left, right| left.at.cmp(right.at));
-    let mut held: BTreeMap<String, LiveClaim> = BTreeMap::new();
+    let mut held: BTreeMap<String, HeldClaim> = BTreeMap::new();
+    let mut seq = 0;
     for comment in ordered {
         for act in claim_acts(comment.body) {
+            seq += 1;
             match act {
                 ClaimAct::Claim { owner, until } => {
                     held.insert(
                         owner.clone(),
-                        LiveClaim {
+                        HeldClaim {
                             owner,
                             until,
                             comment_id: comment.id,
+                            claimed_at: comment.at.to_owned(),
+                            seq,
                         },
                     );
                 }
-                ClaimAct::Release { owner } => {
+                ClaimAct::Release { owner: Some(owner) } => {
                     held.remove(&owner);
                 }
+                ClaimAct::Release { owner: None } => held.clear(),
                 ClaimAct::Take { owner, from } => {
                     if let Some(taken) = held.remove(&from) {
                         held.insert(
                             owner.clone(),
-                            LiveClaim {
+                            HeldClaim {
                                 owner,
-                                until: taken.until,
                                 comment_id: comment.id,
+                                seq,
+                                ..taken
                             },
                         );
                     }
@@ -321,19 +375,16 @@ pub(crate) fn live_claims(comments: &[ClaimComment<'_>], now: DateTime<Utc>) -> 
             }
         }
     }
-    held.into_values()
-        .filter(|claim| claim_expiry(&claim.until).is_none_or(|until| until > now))
-        .collect()
+    let mut held: Vec<HeldClaim> = held.into_values().collect();
+    held.sort_by_key(|claim| claim.seq);
+    held
 }
 
-/// The claims live at `now` in comment records shaped as `shipyard advance`
-/// reads them (`id`, `type`, `association`, `at`, `body`). Only a trusted
-/// author's comment counts: a repository owner, member or collaborator, or a
-/// bot (the fleet's lanes post through its App).
-pub(crate) fn live_claims_in_records(
-    comments: &[serde_json::Value],
-    now: DateTime<Utc>,
-) -> Vec<LiveClaim> {
+/// The claims held in comment records shaped as `shipyard advance` reads
+/// them (`id`, `type`, `association`, `at`, `body`). Only a trusted author's
+/// comment counts: a repository owner, member or collaborator, or a bot (the
+/// fleet's lanes post through its App).
+pub(crate) fn held_claims_in_records(comments: &[serde_json::Value]) -> Vec<HeldClaim> {
     let trusted: Vec<ClaimComment<'_>> = comments
         .iter()
         .filter(|comment| trusted_record(comment))
@@ -352,7 +403,18 @@ pub(crate) fn live_claims_in_records(
                 .unwrap_or(""),
         })
         .collect();
-    live_claims(&trusted, now)
+    held_claims(&trusted)
+}
+
+/// [`held_claims_in_records`] live at `now`, an unreadable time live.
+pub(crate) fn live_claims_in_records(
+    comments: &[serde_json::Value],
+    now: DateTime<Utc>,
+) -> Vec<LiveClaim> {
+    held_claims_in_records(comments)
+        .into_iter()
+        .filter(|claim| claim.live_at(now, None))
+        .collect()
 }
 
 fn trusted_record(comment: &serde_json::Value) -> bool {
@@ -458,5 +520,79 @@ mod tests {
             claim_lines("see repair-claim: x until y").is_empty(),
             "line start only"
         );
+    }
+
+    /// Each real spelling, with the owner and expiry fleet-handbook's
+    /// `repair_preclaim.py` (origin/main) reads from it, computed by running
+    /// its `CLAIM` and `epoch`. `None` where preclaim does not match.
+    #[test]
+    fn every_spelling_reads_as_repair_preclaim_reads_it() {
+        let cases: [(&str, Option<&str>, &str, Option<&str>); 8] = [
+            // Generous-Corp/vellum#462 verbatim; preclaim misses the note.
+            (
+                "repair-claim: team-lead (repair-462-allowlist) until 2026-11-16T22:00Z",
+                None,
+                "team-lead",
+                Some("2026-11-16T22:00:00+00:00"),
+            ),
+            // fleet-pass.sh's own form, and preclaim's test FAR.
+            (
+                "repair-claim: repair-lane/repair-2 until 2099-01-01T00:00Z",
+                Some("2099-01-01T00:00:00+00:00"),
+                "repair-lane/repair-2",
+                Some("2099-01-01T00:00:00+00:00"),
+            ),
+            (
+                "repair-claim: repair-lane/repair-2 until 2026-11-16 22:00Z",
+                Some("2026-11-16T22:00:00+00:00"),
+                "repair-lane/repair-2",
+                Some("2026-11-16T22:00:00+00:00"),
+            ),
+            (
+                "repair-claim: repair-lane/repair-2 until 2026-11-16T22:00 UTC",
+                Some("2026-11-16T22:00:00+00:00"),
+                "repair-lane/repair-2",
+                Some("2026-11-16T22:00:00+00:00"),
+            ),
+            (
+                "repair-claim: repair-lane/repair-2 until 2026-11-16T22:00UTC",
+                Some("2026-11-16T22:00:00+00:00"),
+                "repair-lane/repair-2",
+                Some("2026-11-16T22:00:00+00:00"),
+            ),
+            (
+                "repair-claim: repair-lane/repair-2 until 2026-11-16T22:00:30Z",
+                Some("2026-11-16T22:00:30+00:00"),
+                "repair-lane/repair-2",
+                Some("2026-11-16T22:00:30+00:00"),
+            ),
+            (
+                "repair-claim: repair-lane/repair-2 until 2026-11-16T22:00Z.",
+                Some("2026-11-16T22:00:00+00:00"),
+                "repair-lane/repair-2",
+                Some("2026-11-16T22:00:00+00:00"),
+            ),
+            // No zone: read as UTC here; preclaim does not match it.
+            (
+                "repair-claim: repair-lane/repair-2 until 2026-11-16T22:00",
+                None,
+                "repair-lane/repair-2",
+                Some("2026-11-16T22:00:00+00:00"),
+            ),
+        ];
+        for (line, preclaim, owner, ours) in cases {
+            let found = claim_lines(line);
+            assert_eq!(found.len(), 1, "{line}");
+            assert_eq!(found[0].owner, owner, "{line}");
+            let expiry = claim_expiry(&found[0].until).map(|time| time.to_rfc3339());
+            assert_eq!(expiry.as_deref(), ours, "{line}");
+            if let Some(preclaim) = preclaim {
+                assert_eq!(
+                    expiry.as_deref(),
+                    Some(preclaim),
+                    "differs from preclaim: {line}"
+                );
+            }
+        }
     }
 }

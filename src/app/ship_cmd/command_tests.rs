@@ -1190,6 +1190,7 @@ fn ship_command_still_refuses_rewritten_history_without_the_flag() {
 #[test]
 #[cfg(unix)]
 fn ship_command_refuses_to_push_a_branch_another_session_has_claimed() {
+    crate::app::claim_cmd::TEST_FENCE_ON.with(|on| on.set(true));
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = temp.path().join("repo");
     seed_repo(&repo);
@@ -1255,6 +1256,7 @@ exit 2
         &mut stdout,
     )
     .expect_err("a foreign live claim refuses the push");
+    crate::app::claim_cmd::TEST_FENCE_ON.with(|on| on.set(false));
 
     assert!(
         failure

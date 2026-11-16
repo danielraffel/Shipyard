@@ -10,9 +10,9 @@ one more line just above that marker::
 
     <!-- session: <host>/<session>[ agent: <id>] -->
 
-A comment with a ``repaired:`` or ``repair-claim-taken:`` line gets the same
-stamp above its last non-blank line, so a push made under someone else's live repair
-claim names the session that made it (``docs/claim-fence.md``).
+A comment with a ``repair-claim-taken:`` line gets the same stamp above its
+last non-blank line, so a take of someone else's live repair claim names the
+session that took it (``docs/claim-fence.md``).
 
 ``<session>`` is ``SHIPYARD_STAMP_SESSION_ID``, else ``CLAUDE_CODE_SESSION_ID``,
 else ``CODEX_COMPANION_SESSION_ID``, else ``unattributed``; ``agent`` is ``SHIPYARD_AGENT_ID`` when set. The marker
@@ -101,8 +101,8 @@ _RULING = re.compile(
 # the arm guard checks the stamp's host against the `session:` line, so a
 # stamp written by hand (or copied with the rest of a verdict) must not stand.
 _STAMPED = re.compile(r"<!--\s*session\s*:.*?-->", re.DOTALL | re.IGNORECASE)
-# A push report or a claim take, which get the stamp as their last line.
-_ATTRIBUTED = re.compile(r"^[ \t]*(?:repaired|repair-claim-taken)[ \t]*:", re.MULTILINE | re.IGNORECASE)
+# A claim take, which gets the stamp above its last line.
+_ATTRIBUTED = re.compile(r"^[ \t]*repair-claim-taken[ \t]*:", re.MULTILINE | re.IGNORECASE)
 _COMMENT_ENDPOINT = re.compile(r"^repos/[^/]+/[^/]+/issues/(?:[0-9]+/comments|comments/[0-9]+)$")
 _API_HOST = re.compile(r"^[a-z][a-z0-9+.-]*://[^/]*(?:/api/v3)?", re.IGNORECASE)
 # The pull-request and issue commands that post a comment, with the options
@@ -226,17 +226,17 @@ def strip_stamps(body: str) -> str:
 
 
 def attributed(body: str) -> bool:
-    """Whether ``body`` reports a push (``repaired:``) or takes a repair
-    claim (``repair-claim-taken:``) on a line of its own. Neither is a
-    verdict; the stamp only names the session, so the next push made under
-    someone else's live claim names its pusher."""
+    """Whether ``body`` takes a repair claim (``repair-claim-taken:``) on a
+    line of its own. It is no verdict; the stamp only names the session that
+    took the claim. (``repaired:`` is deliberately not stamped here: it would
+    wake fleet-handbook readers of stamped repairs; see docs/claim-fence.md.)"""
     return _ATTRIBUTED.search(body) is not None
 
 
 def stamped(body: str) -> str | None:
     """``body`` without any stamp it carried and, when it is a verdict or an
     adversarial ruling, with this session's stamp above its marker line;
-    when it reports a push or takes a claim (``attributed``), the same way,
+    when it takes a claim (``attributed``), the same way,
     so its last line stays last for any reader; ``None`` when there is
     nothing to change (none of these, and no stamp)."""
     clean = strip_stamps(body)

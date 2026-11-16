@@ -8,6 +8,7 @@ use super::*;
 /// The claim from Generous-Corp/vellum#462, verbatim.
 const INCIDENT: &str = "repair-claim: team-lead (repair-462-allowlist) until 2026-11-16T22:00Z";
 const REPO: &str = "Generous-Corp/vellum";
+const HEAD: &str = "0123456789abcdef0123456789abcdef01234567";
 
 fn at(hour: u32, minute: u32) -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 11, 16, hour, minute, 0)
@@ -19,11 +20,15 @@ fn record(id: u64, at: &str, body: &str) -> String {
     json!({"id": id, "type": "Bot", "association": "NONE", "at": at, "body": body}).to_string()
 }
 
-/// A GitHub that has PR 462 open on `fix` with `comments`.
+/// A GitHub that has PR 462 open on `fix` with `comments`. Each read takes
+/// `read_cost` of the fence's clock.
 struct FakeGitHub {
     comments: Vec<String>,
     fail_reads: Cell<u32>,
     calls: Cell<u32>,
+    clock: Cell<Duration>,
+    read_cost: Duration,
+    timeouts: RefCell<Vec<Duration>>,
 }
 
 impl FakeGitHub {
@@ -35,11 +40,17 @@ impl FakeGitHub {
                 .collect(),
             fail_reads: Cell::new(0),
             calls: Cell::new(0),
+            clock: Cell::new(Duration::ZERO),
+            read_cost: Duration::from_millis(100),
+            timeouts: RefCell::new(Vec::new()),
         }
     }
 
-    fn read(&self, repo: &str, args: &[String]) -> Result<String, String> {
+    fn read(&self, repo: &str, args: &[String], timeout: Duration) -> Result<String, String> {
         self.calls.set(self.calls.get() + 1);
+        self.timeouts.borrow_mut().push(timeout);
+        self.clock
+            .set(self.clock.get() + self.read_cost.min(timeout));
         assert_eq!(repo, REPO);
         if self.fail_reads.get() > 0 {
             self.fail_reads.set(self.fail_reads.get() - 1);
@@ -61,29 +72,35 @@ impl FakeGitHub {
     }
 }
 
-fn check(github: &FakeGitHub, owner: Option<&str>, now: DateTime<Utc>) -> Fence {
-    check_counting(github, owner, now).0
+fn on(owner: Option<&str>) -> FenceEnv {
+    FenceEnv {
+        owner: owner.map(str::to_owned),
+        enabled: true,
+    }
 }
 
-/// [`check`], with how often the fence slept before a retry.
-fn check_counting(github: &FakeGitHub, owner: Option<&str>, now: DateTime<Utc>) -> (Fence, u32) {
-    let read = |repo: &str, args: &[String]| github.read(repo, args);
+/// Run the fence; the outcome and how often it slept before a retry.
+fn run(github: &FakeGitHub, env: &FenceEnv, now: DateTime<Utc>) -> (Outcome, u32) {
+    let read = |repo: &str, args: &[String], timeout: Duration| github.read(repo, args, timeout);
     let slept = Cell::new(0);
     let sleep = |delay: Duration| {
         assert_eq!(delay, RETRY_DELAY);
         slept.set(slept.get() + 1);
+        github.clock.set(github.clock.get() + delay);
     };
+    let elapsed = || github.clock.get();
     let io = FenceIo {
         read: &read,
         sleep: &sleep,
+        elapsed: &elapsed,
         now,
     };
-    let env = FenceEnv {
-        owner: owner.map(str::to_owned),
-        disabled: false,
-    };
-    let fence = check_push(&io, &env, REPO, &["fix".to_owned()]);
-    (fence, slept.get())
+    let outcome = check_push(&io, env, REPO, &["fix".to_owned()]);
+    (outcome, slept.get())
+}
+
+fn check(github: &FakeGitHub, owner: Option<&str>, now: DateTime<Utc>) -> Fence {
+    run(github, &on(owner), now).0.fence
 }
 
 fn refused(fence: &Fence) -> &str {
@@ -94,36 +111,50 @@ fn refused(fence: &Fence) -> &str {
 }
 
 #[test]
-fn a_foreign_live_claim_refuses_the_push() {
+fn the_fence_is_off_unless_switched_on() {
     let github = FakeGitHub::new(&[(1, "2026-11-16T18:17:00Z", INCIDENT)]);
-    let fence = check(&github, Some("vellum-lead"), at(18, 36));
+    for value in [None, Some("off"), Some("1"), Some("yes")] {
+        let env = FenceEnv::from_env(&|name| {
+            (name == SWITCH_ENV)
+                .then(|| value.map(str::to_owned))
+                .flatten()
+        });
+        assert!(!env.enabled, "{value:?}");
+        assert_eq!(run(&github, &env, at(18, 36)).0.fence, Fence::Disabled);
+    }
+    assert_eq!(github.calls.get(), 0, "no read when off");
+    assert!(FenceEnv::from_env(&|name| (name == SWITCH_ENV).then(|| "on".to_owned())).enabled);
+}
+
+#[test]
+fn switched_on_a_foreign_live_claim_refuses_the_push() {
+    let github = FakeGitHub::new(&[(1, "2026-11-16T18:17:00Z", INCIDENT)]);
+    let env = FenceEnv::from_env(&|name| match name {
+        SWITCH_ENV => Some("on".to_owned()),
+        OWNER_ENV => Some("vellum-lead".to_owned()),
+        _ => None,
+    });
+    let fence = run(&github, &env, at(18, 36)).0.fence;
     let text = refused(&fence);
     assert!(text.contains("team-lead until 2026-11-16T22:00Z"), "{text}");
     assert!(text.contains("pull request #462"), "{text}");
 }
 
 #[test]
-fn an_unset_owner_is_refused_with_both_ways_forward() {
+fn a_refusal_names_only_the_take_never_an_override() {
     let github = FakeGitHub::new(&[(1, "2026-11-16T18:17:00Z", INCIDENT)]);
     let fence = check(&github, None, at(18, 36));
     let text = refused(&fence);
-    assert!(text.contains("SHIPYARD_CLAIM_OWNER is unset"), "{text}");
-    assert!(
-        text.contains("set SHIPYARD_CLAIM_OWNER=team-lead if this is your claim"),
-        "{text}"
-    );
     assert!(
         text.contains(
             "shipyard claim take --repo Generous-Corp/vellum --pr 462 --from team-lead --reason"
         ),
         "{text}"
     );
-    assert!(
-        text.ends_with(
-            "claim-fence: SHIPYARD_CLAIM_FENCE=off is an owner and incident rollback only; agents never set it."
-        ),
-        "{text}"
-    );
+    assert!(text.contains("owner names can collide"), "{text}");
+    for named in [OWNER_ENV, SWITCH_ENV, DONE_ENV, "=off", "--no-verify"] {
+        assert!(!text.contains(named), "a refusal names {named}: {text}");
+    }
 }
 
 #[test]
@@ -171,55 +202,74 @@ fn a_release_by_someone_else_does_not_end_the_claim() {
 }
 
 #[test]
-fn a_garbled_time_counts_as_live() {
+fn a_bare_release_ends_every_earlier_claim_as_preclaim_reads_it() {
+    let github = FakeGitHub::new(&[
+        (1, "2026-11-16T18:17:00Z", INCIDENT),
+        (2, "2026-11-16T18:30:00Z", "repair-claim-released:"),
+    ]);
+    assert_eq!(check(&github, None, at(18, 36)), Fence::Allow);
+}
+
+#[test]
+fn an_unreadable_time_is_live_for_four_hours_after_its_comment_and_is_named() {
     let github = FakeGitHub::new(&[(
-        1,
+        7,
         "2026-11-16T18:17:00Z",
         "repair-claim: team-lead until tonight-ish",
     )]);
-    refused(&check(&github, None, at(23, 59)));
+    let (outcome, _) = run(&github, &on(None), at(22, 16));
+    refused(&outcome.fence);
+    assert_eq!(
+        outcome.notes,
+        vec![
+            "claim-fence: comment 7 claims for team-lead with an unreadable time `tonight-ish`; \
+             it counts until 2026-11-16T22:17:00+00:00 (4h after it was posted)"
+                .to_owned()
+        ]
+    );
+    let (outcome, _) = run(&github, &on(None), at(22, 17));
+    assert_eq!(outcome.fence, Fence::Allow, "four hours on, it has expired");
+    assert_eq!(
+        outcome.notes.len(),
+        1,
+        "still named when it no longer blocks"
+    );
 }
 
 #[test]
 fn an_outsider_s_claim_does_not_count() {
-    let github = FakeGitHub {
-        comments: vec![
-            json!({"id": 1, "type": "User", "association": "NONE",
-                   "at": "2026-11-16T18:17:00Z", "body": INCIDENT})
-            .to_string(),
-        ],
-        fail_reads: Cell::new(0),
-        calls: Cell::new(0),
-    };
+    let mut github = FakeGitHub::new(&[]);
+    github.comments = vec![
+        json!({"id": 1, "type": "User", "association": "NONE",
+               "at": "2026-11-16T18:17:00Z", "body": INCIDENT})
+        .to_string(),
+    ];
     assert_eq!(check(&github, None, at(18, 36)), Fence::Allow);
 }
 
 #[test]
 fn a_branch_without_an_open_pull_request_is_allowed() {
     let github = FakeGitHub::new(&[(1, "2026-11-16T18:17:00Z", INCIDENT)]);
-    let read = |repo: &str, args: &[String]| github.read(repo, args);
+    let read = |repo: &str, args: &[String], timeout: Duration| github.read(repo, args, timeout);
     let io = FenceIo {
         read: &read,
         sleep: &|_| {},
+        elapsed: &|| Duration::ZERO,
         now: at(18, 36),
     };
-    let fence = check_push(&io, &FenceEnv::default(), REPO, &["new-branch".to_owned()]);
-    assert_eq!(fence, Fence::Allow);
+    let outcome = check_push(&io, &on(None), REPO, &["new-branch".to_owned()]);
+    assert_eq!(outcome.fence, Fence::Allow);
 }
 
 #[test]
 fn an_unreadable_github_fails_open_loudly_after_one_retry() {
     let github = FakeGitHub::new(&[(1, "2026-11-16T18:17:00Z", INCIDENT)]);
     github.fail_reads.set(2);
-    let (fence, slept) = check_counting(&github, None, at(18, 36));
+    let (outcome, slept) = run(&github, &on(None), at(18, 36));
     assert_eq!(github.calls.get(), 2, "one read and one retry");
     assert_eq!(slept, 1, "one pause before the retry");
-    let Fence::FailOpen(reason) = &fence else {
-        panic!("expected fail-open, got {fence:?}");
-    };
-    assert!(reason.contains("after one retry"), "{reason}");
     assert_eq!(
-        fence.message().as_deref(),
+        outcome.fence.message().as_deref(),
         Some(
             "claim-fence: could not read claims (gh: HTTP 503 (after one retry)); pushing without the check"
         )
@@ -230,24 +280,67 @@ fn an_unreadable_github_fails_open_loudly_after_one_retry() {
 fn one_failed_read_is_retried_and_still_refuses() {
     let github = FakeGitHub::new(&[(1, "2026-11-16T18:17:00Z", INCIDENT)]);
     github.fail_reads.set(1);
-    let (fence, slept) = check_counting(&github, None, at(18, 36));
-    refused(&fence);
+    let (outcome, slept) = run(&github, &on(None), at(18, 36));
+    refused(&outcome.fence);
     assert_eq!(slept, 1);
 }
 
 #[test]
-fn the_kill_switch_turns_the_fence_off() {
-    let env = FenceEnv::from_env(&|name| (name == SWITCH_ENV).then(|| "off".to_owned()));
-    assert!(env.disabled);
-    let io = FenceIo {
-        read: &|_, _| panic!("no read when off"),
-        sleep: &|_| {},
-        now: at(18, 36),
-    };
+fn the_whole_check_fails_open_at_its_deadline() {
+    let mut github = FakeGitHub::new(&[(1, "2026-11-16T18:17:00Z", INCIDENT)]);
+    // The PR lookup alone takes 10 s; the comments read gets only the 5 s left.
+    github.read_cost = Duration::from_secs(10);
+    let (outcome, slept) = run(&github, &on(None), at(18, 36));
+    refused(&outcome.fence);
     assert_eq!(
-        check_push(&io, &env, REPO, &["fix".to_owned()]),
-        Fence::Disabled
+        *github.timeouts.borrow(),
+        vec![DEADLINE, Duration::from_secs(5)],
+        "each read gets what is left of the one deadline"
     );
+    assert_eq!(slept, 0);
+
+    // A first read that fails at 14 s leaves no time for the retry.
+    let github = FakeGitHub::new(&[(1, "2026-11-16T18:17:00Z", INCIDENT)]);
+    github.clock.set(Duration::from_secs(14));
+    github.fail_reads.set(1);
+    let (outcome, slept) = run(&github, &on(None), at(18, 36));
+    let Fence::FailOpen(reason) = &outcome.fence else {
+        panic!("expected fail-open, got {:?}", outcome.fence);
+    };
+    assert!(reason.contains("no time left to retry"), "{reason}");
+    assert_eq!((github.calls.get(), slept), (1, 0));
+
+    // Past the deadline, nothing more is read.
+    let github = FakeGitHub::new(&[(1, "2026-11-16T18:17:00Z", INCIDENT)]);
+    github.clock.set(DEADLINE);
+    let (outcome, _) = run(&github, &on(None), at(18, 36));
+    assert_eq!(
+        outcome.fence,
+        Fence::FailOpen("the check passed its 15s deadline".to_owned())
+    );
+    assert_eq!(github.calls.get(), 0);
+}
+
+#[test]
+fn the_hook_skips_a_push_shipyard_pr_already_checked() {
+    let pushed = format!("refs/heads/fix {HEAD} refs/heads/fix {}\n", "0".repeat(40));
+    assert!(already_checked(&pushed, Some(HEAD)));
+    let other = "f".repeat(40);
+    assert!(
+        !already_checked(&pushed, Some(&other)),
+        "another head is checked"
+    );
+    assert!(!already_checked(&pushed, None));
+    assert!(
+        !already_checked(&pushed, Some("0123456")),
+        "only a full SHA"
+    );
+    let two = format!("{pushed}refs/heads/x {other} refs/heads/x {other}\n");
+    assert!(
+        !already_checked(&two, Some(HEAD)),
+        "every pushed ref must match"
+    );
+    assert!(!already_checked("", Some(HEAD)));
 }
 
 fn take_with(
@@ -256,10 +349,11 @@ fn take_with(
     from: &str,
     posted: &RefCell<Vec<Vec<String>>>,
 ) -> Result<String, TakeError> {
-    let read = |repo: &str, args: &[String]| github.read(repo, args);
+    let read = |repo: &str, args: &[String], timeout: Duration| github.read(repo, args, timeout);
     let io = FenceIo {
         read: &read,
         sleep: &|_| {},
+        elapsed: &|| Duration::ZERO,
         now: at(18, 36),
     };
     let write = |repo: &str, args: &[String]| {
@@ -268,14 +362,10 @@ fn take_with(
         let body = args[3].strip_prefix("body=").expect("body field");
         Ok(json!({"body": body, "html_url": "https://github.com/x/1"}).to_string())
     };
-    let env = FenceEnv {
-        owner: owner.map(str::to_owned),
-        disabled: false,
-    };
     take(
         &io,
         &write,
-        &env,
+        &on(owner),
         REPO,
         462,
         from,

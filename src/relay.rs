@@ -455,7 +455,7 @@ fn scan_comments(pr: &Value, head: &str) -> (Option<String>, Option<Claim>, Opti
         .cloned()
         .unwrap_or_default();
     let mut verdict = None;
-    let mut claim = None;
+    let mut claim_comments = Vec::new();
     let mut last_comment_at = None;
     for comment in &comments {
         let body = comment.get("body").and_then(Value::as_str).unwrap_or("");
@@ -475,19 +475,34 @@ fn scan_comments(pr: &Value, head: &str) -> (Option<String>, Option<Claim>, Opti
                 verdict = Some(found[1].to_ascii_uppercase());
             }
         }
-        // Comment text reaches an agent's prompt: keep only plain tokens.
-        if let Some(found) = crate::work_claim::claim_lines(body).pop()
-            && crate::owner_registry::safe_value(&found.owner)
-            && crate::owner_registry::safe_value(&found.until)
-            && found.owner.len() <= 64
-            && found.until.len() <= 64
-        {
-            claim = Some(Claim {
-                by: found.owner,
-                until: found.until,
-            });
-        }
+        claim_comments.push(crate::work_claim::ClaimComment {
+            id: 0,
+            at: comment
+                .get("createdAt")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            body,
+        });
     }
+    // The newest claim still held after releases and takes, read the way the
+    // push fence reads it. Comment text reaches an agent's prompt: keep only
+    // plain tokens (a time written with a space is relayed in RFC 3339).
+    let claim = crate::work_claim::held_claims(&claim_comments)
+        .pop()
+        .and_then(|held| {
+            let until = if crate::owner_registry::safe_value(&held.until) {
+                held.until.clone()
+            } else {
+                crate::work_claim::claim_expiry(&held.until)?.to_rfc3339()
+            };
+            (crate::owner_registry::safe_value(&held.owner)
+                && held.owner.len() <= 64
+                && until.len() <= 64)
+                .then_some(Claim {
+                    by: held.owner,
+                    until,
+                })
+        });
     (verdict, claim, last_comment_at)
 }
 

@@ -2,6 +2,7 @@
 //! pre-push hook) and its explicit release-and-take path (`take`). The
 //! decision lives in [`crate::claim_fence`]; this module only does the I/O.
 
+use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, ExitCode, Stdio};
@@ -11,12 +12,14 @@ use chrono::Utc;
 
 use super::CliFailure;
 use super::cli::ClaimCommand;
-use crate::claim_fence::{Fence, FenceEnv, FenceIo, check_push, pushed_branches, take};
+use crate::claim_fence::{
+    DONE_ENV, Fence, FenceEnv, FenceIo, already_checked, check_push, pushed_branches, take,
+};
 
-/// One GitHub read may not hold a push longer than this.
-const READ_TIMEOUT: Duration = Duration::from_secs(20);
 /// `ghread`'s answer for a repository it does not serve (`danielraffel/*`).
 const GHREAD_NOT_SERVED: i32 = 75;
+/// A write (the take) may not hang longer than this.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub(super) fn claim_command<W: Write>(
     command: ClaimCommand,
@@ -29,6 +32,7 @@ pub(super) fn claim_command<W: Write>(
             url,
             branches,
         } => {
+            let env = FenceEnv::from_env(&|name| std::env::var(name).ok());
             let branches = if branches.is_empty() {
                 let mut stdin = String::new();
                 std::io::stdin()
@@ -36,15 +40,21 @@ pub(super) fn claim_command<W: Write>(
                     .map_err(|error| {
                         CliFailure::new(2, format!("cannot read the hook's stdin: {error}"))
                     })?;
+                if already_checked(&stdin, std::env::var(DONE_ENV).ok().as_deref()) {
+                    return Ok(ExitCode::SUCCESS);
+                }
                 pushed_branches(&stdin)
             } else {
                 branches
             };
+            if !env.enabled {
+                return Ok(ExitCode::SUCCESS);
+            }
             let Some(repo) = super::wait_cmd::parse_github_repo_slug(&url) else {
+                eprintln!("claim-fence: {url:?} is not a GitHub remote; pushing without the check");
                 return Ok(ExitCode::SUCCESS);
             };
-            let fence = run_fence(&repo, &branches, None);
-            Ok(report(&fence))
+            Ok(report(&run_fence(&repo, &branches, None)))
         }
         ClaimCommand::Take {
             from,
@@ -61,17 +71,24 @@ pub(super) fn claim_command<W: Write>(
                     )
                 })?,
             };
-            let read = |repo: &str, args: &[String]| fleet_gh(repo, args, None);
+            let read = |repo: &str, args: &[String], timeout: Duration| {
+                fleet_gh(repo, args, None, timeout)
+            };
+            let started = Instant::now();
+            let elapsed = || started.elapsed();
             let io = FenceIo {
                 read: &read,
                 sleep: &std::thread::sleep,
+                elapsed: &elapsed,
                 now: Utc::now(),
             };
             let pr = match pr {
                 Some(pr) => pr,
                 None => current_branch_pr(cwd, &io, &repo)?,
             };
-            let write = |repo: &str, args: &[String]| run_tool("ghapp", repo, args, true);
+            let write = |repo: &str, args: &[String]| {
+                run_tool("ghapp", repo, args, true, WRITE_TIMEOUT).map_err(|error| error.text)
+            };
             let env = FenceEnv::from_env(&|name| std::env::var(name).ok());
             let posted = take(&io, &write, &env, &repo, pr, &from, &reason)
                 .map_err(|error| CliFailure::new(1, format!("claim take refused: {}", error.0)))?;
@@ -83,14 +100,19 @@ pub(super) fn claim_command<W: Write>(
 
 /// The fence before `shipyard pr`/ship pushes `branch`: a refusal is a
 /// failure; anything else is reported on stderr and the push goes ahead.
-/// `gh_override` is the command's own `--gh-command`, when given.
+/// `gh_override` is the command's own `--gh-command`, when given. Returns the
+/// environment to hand the push, so the repository's pre-push hook skips the
+/// head this already checked.
 pub(super) fn fence_before_push(
     cwd: &Path,
     branch: &str,
     gh_override: Option<&Path>,
-) -> Result<(), CliFailure> {
+) -> Result<Vec<(OsString, OsString)>, CliFailure> {
+    if !fence_env().enabled {
+        return Ok(Vec::new());
+    }
     let Some(repo) = super::ship_cmd::git_repo_slug(cwd) else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     match run_fence(&repo, &[branch.to_owned()], gh_override) {
         Fence::Refuse(text) => Err(CliFailure::new(1, text)),
@@ -98,23 +120,59 @@ pub(super) fn fence_before_push(
             if let Some(message) = other.message() {
                 eprintln!("{message}");
             }
-            Ok(())
+            Ok(head_sha(cwd)
+                .map(|sha| vec![(OsString::from(DONE_ENV), OsString::from(sha))])
+                .unwrap_or_default())
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's `SHIPYARD_CLAIM_FENCE=on`, for this thread only.
+    pub(super) static TEST_FENCE_ON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// This process's fence settings (and, in a test, this thread's switch).
+fn fence_env() -> FenceEnv {
+    let env = FenceEnv::from_env(&|name| std::env::var(name).ok());
+    #[cfg(test)]
+    let env = FenceEnv {
+        enabled: env.enabled || TEST_FENCE_ON.with(std::cell::Cell::get),
+        ..env
+    };
+    env
+}
+
+fn head_sha(cwd: &Path) -> Option<String> {
+    let output = crate::supervised::git_supervised()
+        .args(["rev-parse", "HEAD"])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    let sha = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    (output.status.success() && sha.len() == 40).then_some(sha)
 }
 
 fn run_fence(repo: &str, branches: &[String], gh_override: Option<&Path>) -> Fence {
     if branches.is_empty() {
         return Fence::Allow;
     }
-    let read = |repo: &str, args: &[String]| fleet_gh(repo, args, gh_override);
+    let read =
+        |repo: &str, args: &[String], timeout: Duration| fleet_gh(repo, args, gh_override, timeout);
+    let started = Instant::now();
+    let elapsed = || started.elapsed();
     let io = FenceIo {
         read: &read,
         sleep: &std::thread::sleep,
+        elapsed: &elapsed,
         now: Utc::now(),
     };
-    let env = FenceEnv::from_env(&|name| std::env::var(name).ok());
-    check_push(&io, &env, repo, branches)
+    let outcome = check_push(&io, &fence_env(), repo, branches);
+    for note in &outcome.notes {
+        eprintln!("{note}");
+    }
+    outcome.fence
 }
 
 fn report(fence: &Fence) -> ExitCode {
@@ -154,37 +212,72 @@ fn current_branch_pr(cwd: &Path, io: &FenceIo<'_>, repo: &str) -> Result<u64, Cl
 }
 
 /// A read through the fleet's App clients: `ghapp` for `danielraffel/*`,
-/// `ghread` (its own budget) elsewhere, falling back to `ghapp` when `ghread`
-/// is missing or does not serve the repository.
-fn fleet_gh(repo: &str, args: &[String], gh_override: Option<&Path>) -> Result<String, String> {
+/// `ghread` (its own budget) elsewhere, falling back to `ghapp` only when
+/// `ghread` is missing or does not serve the repository (never after a
+/// timeout: that would spend the fence's deadline twice).
+fn fleet_gh(
+    repo: &str,
+    args: &[String],
+    gh_override: Option<&Path>,
+    timeout: Duration,
+) -> Result<String, String> {
     if let Some(program) = gh_override {
-        return run_tool(&program.to_string_lossy(), repo, args, false);
+        return run_tool(&program.to_string_lossy(), repo, args, false, timeout)
+            .map_err(|error| error.text);
     }
+    fleet_gh_with(repo, args, timeout, "ghread", "ghapp")
+}
+
+fn fleet_gh_with(
+    repo: &str,
+    args: &[String],
+    timeout: Duration,
+    ghread: &str,
+    ghapp: &str,
+) -> Result<String, String> {
+    let read = |program: &str| run_tool(program, repo, args, false, timeout);
     let owner = repo.split('/').next().unwrap_or_default();
     if owner.eq_ignore_ascii_case("danielraffel") {
-        return run_tool("ghapp", repo, args, false);
+        return read(ghapp).map_err(|error| error.text);
     }
-    match run_tool_coded("ghread", repo, args, false) {
+    match read(ghread) {
         Ok(out) => Ok(out),
-        // Missing, or not serving this repository: the App client reads it.
-        Err((None | Some(GHREAD_NOT_SERVED), _)) => run_tool("ghapp", repo, args, false),
-        Err((_, error)) => Err(error),
+        Err(ToolError {
+            kind: ToolFailure::NotRun | ToolFailure::Exit(GHREAD_NOT_SERVED),
+            ..
+        }) => read(ghapp).map_err(|error| error.text),
+        Err(error) => Err(error.text),
     }
 }
 
-/// Run one `gh`-shaped tool bound to `repo`, for at most [`READ_TIMEOUT`].
-fn run_tool(program: &str, repo: &str, args: &[String], write: bool) -> Result<String, String> {
-    run_tool_coded(program, repo, args, write).map_err(|(_, error)| error)
+/// How a tool call failed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ToolFailure {
+    /// It could not be started.
+    NotRun,
+    /// It ran past its timeout and was killed.
+    TimedOut,
+    /// It exited with this code.
+    Exit(i32),
+    /// Anything else (a signal, a wait error).
+    Other,
 }
 
-/// [`run_tool`], with the exit code of a tool that ran and exited nonzero
-/// (`None` when it could not run, timed out, or died on a signal).
-fn run_tool_coded(
+#[derive(Debug)]
+struct ToolError {
+    kind: ToolFailure,
+    text: String,
+}
+
+/// Run one `gh`-shaped tool bound to `repo`, for at most `timeout`.
+fn run_tool(
     program: &str,
     repo: &str,
     args: &[String],
     write: bool,
-) -> Result<String, (Option<i32>, String)> {
+    timeout: Duration,
+) -> Result<String, ToolError> {
+    let fail = |kind, text: String| ToolError { kind, text };
     let mut command = Command::new(program);
     command
         .args(args)
@@ -199,9 +292,12 @@ fn run_tool_coded(
         || program.to_owned(),
         |name| name.to_string_lossy().into_owned(),
     );
-    let mut child = command
-        .spawn()
-        .map_err(|error| (None, format!("{name} could not run: {error}")))?;
+    let mut child = command.spawn().map_err(|error| {
+        fail(
+            ToolFailure::NotRun,
+            format!("{name} could not run: {error}"),
+        )
+    })?;
     let mut out = child.stdout.take().expect("piped stdout");
     let mut err = child.stderr.take().expect("piped stderr");
     let out_reader = std::thread::spawn(move || {
@@ -214,33 +310,44 @@ fn run_tool_coded(
         let _ = err.read_to_end(&mut buffer);
         buffer
     });
-    let deadline = Instant::now() + READ_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(25)),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
             Ok(None) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err((
-                    None,
-                    format!("{name} timed out after {}s", READ_TIMEOUT.as_secs()),
+                return Err(fail(
+                    ToolFailure::TimedOut,
+                    format!("{name} timed out after {}s", timeout.as_secs()),
                 ));
             }
-            Err(error) => return Err((None, format!("{name} could not be waited on: {error}"))),
+            Err(error) => {
+                return Err(fail(
+                    ToolFailure::Other,
+                    format!("{name} could not be waited on: {error}"),
+                ));
+            }
         }
     };
     let stdout = out_reader.join().unwrap_or_default();
     let stderr = err_reader.join().unwrap_or_default();
     if status.success() {
-        Ok(String::from_utf8_lossy(&stdout).into_owned())
-    } else {
-        let detail = String::from_utf8_lossy(&stderr);
-        let detail = detail.trim();
-        let detail = detail.lines().last().unwrap_or("no detail");
-        Err((
-            status.code(),
-            format!("{name} exited with {status}: {detail}"),
-        ))
+        return Ok(String::from_utf8_lossy(&stdout).into_owned());
     }
+    let detail = String::from_utf8_lossy(&stderr);
+    let detail = detail
+        .trim()
+        .lines()
+        .last()
+        .unwrap_or("no detail")
+        .to_owned();
+    let kind = status.code().map_or(ToolFailure::Other, ToolFailure::Exit);
+    Err(fail(kind, format!("{name} exited with {status}: {detail}")))
 }
+
+#[cfg(test)]
+mod tests;
