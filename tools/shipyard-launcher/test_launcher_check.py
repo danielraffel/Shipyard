@@ -325,3 +325,32 @@ class RealSignatureTests(CheckHarness):
         result = self.verify(**weak)
         self.assertEqual(result.returncode, 1)
         self.assertIn("signature does not satisfy", result.stdout)
+
+
+class AccessWaitDefaultTests(unittest.TestCase):
+    """The access probe's default wait must outlast a slow LaunchServices start."""
+
+    def load(self):
+        import importlib.machinery
+        import importlib.util
+        loader = importlib.machinery.SourceFileLoader("launcher_check_under_test", str(CHECK))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        module = importlib.util.module_from_spec(spec)
+        saved = os.environ.pop("SHIPYARD_LAUNCHER_CHECK_WAIT_SECS", None)
+        try:
+            loader.exec_module(module)
+        finally:
+            if saved is not None:
+                os.environ["SHIPYARD_LAUNCHER_CHECK_WAIT_SECS"] = saved
+        return module
+
+    def test_default_wait_covers_a_loaded_host(self):
+        # m3 needed more than 20 s on 2026-11-16; activation worked at 120 s.
+        self.assertGreaterEqual(self.load().ACCESS_WAIT_SECS, 120)
+
+    def test_fleet_deploy_activation_bound_exceeds_the_wait(self):
+        deploy = CHECK.parent.parent / "fleet-deploy" / "fleet-deploy.sh"
+        text = deploy.read_text()
+        import re
+        bound = int(re.search(r'bounded (\d+) /usr/bin/python3 "\$check" --activate', text).group(1))
+        self.assertGreater(bound, self.load().ACCESS_WAIT_SECS + 60)
