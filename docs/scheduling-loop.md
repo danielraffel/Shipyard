@@ -187,8 +187,9 @@ The event is only a trigger; nothing in it is trusted. The admission:
 5. Leaves to the tick a base whose merge groups read anything but clear, a
    paused queue entry, and a pending run cancellation.
 6. A report (no `--apply`, or `admit_ready = "report"`) stops here after
-   reading the live exact-head approval gate: it says `would_admit` only for
-   an approved head, `waiting_head_approval` otherwise.
+   reading the live exact-head approval gate as a report, so a carried
+   approval writes no carry log line: it says `would_admit` only for an
+   approved head, `waiting_head_approval` otherwise.
 7. Takes the steward's ledger lock without waiting. If a tick or an
    `admission-clean` gate holds it, it does nothing: that pass sees the head.
 8. Admits through the tick's own path: the live exact-head approval gate, the

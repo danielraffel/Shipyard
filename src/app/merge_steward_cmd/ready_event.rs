@@ -262,9 +262,9 @@ pub(super) fn rest_remaining(actions: &GitHubActions) -> Result<u64, String> {
 
 /// Run the steward's admission for the one pull request `event` names.
 ///
-/// Without `apply`, nothing is locked, recorded or mutated, and the live
-/// exact-head approval gate is read so `would_admit` is never claimed for an
-/// unapproved head.
+/// Without `apply`, nothing is locked, recorded or mutated (not even a carry
+/// log line), and the live exact-head approval gate is read as a report so
+/// `would_admit` is never claimed for an unapproved head.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(super) fn admit_ready_event(
     actions: &GitHubActions,
@@ -400,8 +400,15 @@ pub(super) fn admit_ready_event(
     }
     if !apply {
         // A report never claims an unapproved head: the live exact-head gate,
-        // read as the admission reads it.
-        match super::pr_mutations::read_head_gate_for(actions, &observation, pr, &unlocked_ledger) {
+        // evaluated as the admission evaluates it, but as a report
+        // (`dry_run`), so a carried approval is judged and never appended to
+        // the carry log, which records only carries a landing accepted.
+        match super::pr_mutations::read_head_gate_for_report(
+            actions,
+            &observation,
+            pr,
+            &unlocked_ledger,
+        ) {
             Ok((gate, ..)) if gate.allows() => {}
             Ok((gate, ..)) => {
                 let mut outcome = ReadyEventOutcome::skipped(event, apply, "waiting_head_approval");
