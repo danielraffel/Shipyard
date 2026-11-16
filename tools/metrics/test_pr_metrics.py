@@ -493,6 +493,32 @@ class Attribution(Base):
         self.assertEqual(self.rows(out)[1]["north"], "unknown")
         self.assertEqual(self.rows(out)[1]["attribution"]["signals"], [])
 
+    def many_commits(self):
+        return [commit("c1", "x", "w")] + [commit(f"p{i}", "x", "w") for i in range(299)]  # 3 full pages: the read is incomplete
+
+    def test_an_incomplete_commit_read_never_trusts_steward_evidence(self):
+        enq = {"event": "added_to_merge_queue", "actor": {"login": "shipyard-local[bot]"}, "created_at": T(10, "10:40")}
+        r, _ = self.run_one(self.merged_pr(), [enq, self.MERGE], cm=self.many_commits())
+        self.assertFalse(r["attribution"]["steward_merge_recognised"])
+
+    def test_a_pr_read_from_incomplete_commits_is_not_cached_and_is_read_again(self):
+        p = self.merged_pr()
+        self.build(world([p], {1: [self.MERGE]}, {1: self.many_commits()}))
+        gh = world([p], {1: [self.MERGE]}, {1: self.many_commits()})
+        self.build(gh)
+        self.assertTrue([c for c in gh.calls if "pulls/1/commits" in c])  # not served from the cache
+
+    def test_a_cached_incomplete_entry_is_read_again(self):
+        p = self.merged_pr()
+        self.build(world([p], {1: [self.MERGE]}, {1: [commit("c1", "x", "w")]}))
+        path = os.path.join(self.cache, REPO.replace("/", "__"), "facts", "1.json")
+        d = json.load(open(path))
+        d["commits_complete"] = False
+        json.dump(d, open(path, "w"))
+        gh = world([p], {1: [self.MERGE]}, {1: [commit("c1", "x", "w")]})
+        self.build(gh)
+        self.assertTrue([c for c in gh.calls if "pulls/1/commits" in c])
+
     def review(self, body, hm="10:30", rid=11, state="commented"):
         return {"event": "reviewed", "id": rid, "state": state, "user": {"login": "shipyard-local[bot]"}, "submitted_at": T(10, hm), "body": body}
 

@@ -67,7 +67,11 @@ RECORD = HOME / ".local" / "share" / "shipyard" / "launcher" / "activation.json"
 CODESIGN = setting("SHIPYARD_LAUNCHER_CHECK_CODESIGN", "/usr/bin/codesign")
 SPCTL = setting("SHIPYARD_LAUNCHER_CHECK_SPCTL", "/usr/sbin/spctl")
 OPEN = setting("SHIPYARD_LAUNCHER_CHECK_OPEN", "/usr/bin/open")
-ACCESS_WAIT_SECS = float(setting("SHIPYARD_LAUNCHER_CHECK_WAIT_SECS", "20"))
+# The access probe starts the launcher through LaunchServices and waits for its
+# report. On a loaded host (m3, 2026-11-16) the first report came after more
+# than 20 s, so a 20 s wait turned a granted launcher into "did not report" and
+# activation never happened. The wait ends as soon as the report arrives.
+ACCESS_WAIT_SECS = float(setting("SHIPYARD_LAUNCHER_CHECK_WAIT_SECS", "120"))
 TOOL_TIMEOUT_SECS = float(setting("SHIPYARD_LAUNCHER_CHECK_TOOL_TIMEOUT_SECS", "60"))
 # Test mode only: a weaker requirement, so real codesign can judge ad-hoc
 # signed test bundles (a tampered resource must still fail).
