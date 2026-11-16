@@ -298,8 +298,16 @@ Plugin-version bumps (`.claude-plugin/plugin.json`) are intentionally **not** ta
 ## Version-at-land assignment
 
 The post-merge `version-at-land.yml` workflow assigns CLI and plugin versions
-from the merged change range. Pull requests do not edit version files, so
+from the merged change range. Pull requests do not change versions, so
 patch-only changes are assigned and released without a per-PR counter race.
+The PR gate (`scripts/version_bump_check.py`) refuses any edit to a version
+file, except in `Cargo.toml` and `Cargo.lock`. There, dependency, feature,
+profile and lint edits pass, while the `[package]` table, the build-target and
+workspace tables (`[lib]`, `[[bin]]`, `[[example]]`, `[[test]]`, `[[bench]]`,
+`[workspace]`, top-level `auto*` keys) and the crate's own `Cargo.lock` version
+must not change. A version file that is added, deleted, changes mode, is not a
+regular file, or cannot be parsed is refused too. Only
+`Release: allow-version-files reason="..."` admits these edits.
 The writer updates Cargo.lock with Cargo.toml and records a marker for replay
 safety.
 

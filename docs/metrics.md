@@ -36,15 +36,21 @@ it is on only when the tick passes `--e2e-cache DIR` (the daily run does, unless
 ## Controls
 
 A zero is printed with its positive control's count. Built-in controls: fleet-handbook #124 reverted
-#119 (the revert detector must find it), #126's title names #116 (the escape detector must find
-it), and PRs the ticks show as `direct_merge_refused` are owner-touched (they must not read as
-autonomous). A control whose PR is outside the window is "not in window" and unchecked. If a control
-that is in the window is missed, the report prints `CONTROL FAILED: nothing is reported`.
+#119 (the revert detector must find it) and #126's title names #116 (the escape detector must find
+it). `DEFAULT_CONTROLS` can also pin `"owner": [pr, ...]`, PRs with a hand-verified owner action that
+must read `owner_action`. PRs the ticks show as `direct_merge_refused` are counted for context only:
+that stop is a ruleset config gap, not an owner action, so they can legitimately read autonomous.
+A control whose PR is outside the window is "not in window" and unchecked. A control in the window
+that is missed withholds only its own metric (revert: correctness; escape: escaped; owner: North
+Star); every other number is still reported.
+
+A repo whose window has unread PRs (read cap hit, or a cut-short listing) is labelled `partial` and
+still reports what it read. A repo fully read is reported normally even when another repo was cut.
 
 ## Sample and comparison
 
 Every rate carries a 95% Wilson interval and n. A sample is **insufficient** below 50 PRs, when the
-window's interval overlaps the baseline's, or when the run was truncated. The report prints the
+window's interval overlaps the baseline's, or when that repo was not fully read (cap hit, read error, unread PRs or a cut-short listing; it is then labelled `partial`). Sufficiency is per repository: a fully read repo is unaffected by another repo's truncation. The report prints the
 pooled window cohort beside the pooled Baseline cohort (default 2026-11-12 to 2026-11-14, closed
 days only) and the baseline's day-against-day North Star rates and spread as the noise floor: a
 later change smaller than that spread is no change. It makes no per-change attribution. Medians and
