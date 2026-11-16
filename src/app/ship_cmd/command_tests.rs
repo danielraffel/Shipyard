@@ -1186,3 +1186,88 @@ fn ship_command_still_refuses_rewritten_history_without_the_flag() {
     assert!(error.contains("SHA drift"), "{error}");
     assert!(error.contains("--adopt-head"), "{error}");
 }
+
+#[test]
+#[cfg(unix)]
+fn ship_command_refuses_to_push_a_branch_another_session_has_claimed() {
+    crate::app::claim_cmd::TEST_FENCE_ON.with(|on| on.set(true));
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path().join("repo");
+    seed_repo(&repo);
+    let gh = temp.path().join("gh");
+    let gh_log = temp.path().join("gh.log");
+    fake_gh(
+        &gh,
+        &format!(
+            r#"
+echo "$@" >> "{}"
+case "$2" in
+  repos/danielraffel/pulp/pulls\?state=open\&head=danielraffel:feature/test) echo 88; exit 0 ;;
+esac
+if [ "$3" = "repos/danielraffel/pulp/issues/88/comments" ]; then
+  echo '{{"id":1,"type":"Bot","association":"NONE","at":"2026-11-16T18:17:00Z","body":"repair-claim: team-lead (repair-88) until 2999-01-01T00:00Z"}}'
+  exit 0
+fi
+echo "unexpected gh args: $@" >&2
+exit 2
+"#,
+            gh_log.display()
+        ),
+    );
+    let paths = RuntimePaths::current_with_overrides(
+        RuntimeMode::Isolated,
+        Some(temp.path().join("global")),
+        Some(temp.path().join("state")),
+    );
+    let mut stdout = Vec::new();
+
+    let failure = ship_command(
+        ShipCommandArgs {
+            allow_unserved_lanes: Vec::new(),
+            allow_unreachable_triggers: Vec::new(),
+            skip_landability: true,
+            pr: None,
+            base: "main".to_owned(),
+            auto_create_base: None,
+            no_warm: true,
+            resume_from: None,
+            merge_command: None,
+            merge_result: Some(MergeResult::Success),
+            gh_command: Some(gh),
+            pr_snapshot_file: None,
+            allow_unreachable_targets: false,
+            allow_fleet_epoch_drift: false,
+            skip_targets: Vec::new(),
+            targets: Vec::new(),
+            adopt_head: false,
+            steward_handoff: None,
+            invocation: ShipInvocation::Direct,
+            foreground: true,
+            arm_auto_merge: crate::app::cli::ArmRequest::Off,
+            leave_unarmed: false,
+            body_append: None,
+            stacked_on: None,
+            next_steps: None,
+        },
+        &loaded_config(temp.path()),
+        &repo,
+        &paths,
+        true,
+        &mut stdout,
+    )
+    .expect_err("a foreign live claim refuses the push");
+    crate::app::claim_cmd::TEST_FENCE_ON.with(|on| on.set(false));
+
+    assert!(
+        failure
+            .message
+            .contains("claim-fence: refusing push to danielraffel/pulp feature/test"),
+        "{}",
+        failure.message
+    );
+    assert!(
+        failure.message.contains("by team-lead"),
+        "{}",
+        failure.message
+    );
+}

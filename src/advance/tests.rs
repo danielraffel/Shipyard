@@ -680,3 +680,25 @@ fn release_hold_refuses_an_empty_required_set_even_with_green_checks() {
     facts.checks.required.clear();
     assert_eq!(refused(release(&facts)), "required_checks_unknown");
 }
+
+#[test]
+fn a_claim_with_a_note_and_a_minute_time_is_read_and_expires() {
+    // Generous-Corp/vellum#462, verbatim. The old grammar matched neither
+    // the note nor the minute time, so retrigger ignored the claim.
+    let comments = vec![comment(
+        9,
+        "shipyard-local[bot]",
+        "2026-11-16T18:17:00Z",
+        "repair-claim: team-lead (repair-462-allowlist) until 2026-11-16T22:00Z",
+    )];
+    let before = parse_time("2026-11-16T21:59:00Z").expect("time");
+    let after = parse_time("2026-11-16T22:00:00Z").expect("time");
+    assert_eq!(
+        live_repair_claims(&comments, before),
+        vec!["team-lead until 2026-11-16T22:00Z (comment 9)".to_owned()]
+    );
+    assert!(
+        live_repair_claims(&comments, after).is_empty(),
+        "a minute-form time expires like any other"
+    );
+}

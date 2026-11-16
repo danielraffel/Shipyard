@@ -395,11 +395,6 @@ fn verdict_regex() -> &'static Regex {
     })
 }
 
-fn claim_regex() -> &'static Regex {
-    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?m)^\s*repair-claim:\s*(\S+)\s+until\s+(\S+)").expect("regex"))
-}
-
 /// Whether `text` holds anything a merge or arm guard reads as a verdict: a
 /// `verdict:` or `reviewed:` marker line, a session stamp, or the inline
 /// spelling of either. The relay never sends such text.
@@ -460,7 +455,7 @@ fn scan_comments(pr: &Value, head: &str) -> (Option<String>, Option<Claim>, Opti
         .cloned()
         .unwrap_or_default();
     let mut verdict = None;
-    let mut claim = None;
+    let mut claim_comments = Vec::new();
     let mut last_comment_at = None;
     for comment in &comments {
         let body = comment.get("body").and_then(Value::as_str).unwrap_or("");
@@ -480,19 +475,34 @@ fn scan_comments(pr: &Value, head: &str) -> (Option<String>, Option<Claim>, Opti
                 verdict = Some(found[1].to_ascii_uppercase());
             }
         }
-        // Comment text reaches an agent's prompt: keep only plain tokens.
-        if let Some(found) = claim_regex().captures_iter(body).last()
-            && crate::owner_registry::safe_value(&found[1])
-            && crate::owner_registry::safe_value(&found[2])
-            && found[1].len() <= 64
-            && found[2].len() <= 64
-        {
-            claim = Some(Claim {
-                by: found[1].to_owned(),
-                until: found[2].to_owned(),
-            });
-        }
+        claim_comments.push(crate::work_claim::ClaimComment {
+            id: 0,
+            at: comment
+                .get("createdAt")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            body,
+        });
     }
+    // The newest claim still held after releases and takes, read the way the
+    // push fence reads it. Comment text reaches an agent's prompt: keep only
+    // plain tokens (a time written with a space is relayed in RFC 3339).
+    let claim = crate::work_claim::held_claims(&claim_comments)
+        .pop()
+        .and_then(|held| {
+            let until = if crate::owner_registry::safe_value(&held.until) {
+                held.until.clone()
+            } else {
+                crate::work_claim::claim_expiry(&held.until)?.to_rfc3339()
+            };
+            (crate::owner_registry::safe_value(&held.owner)
+                && held.owner.len() <= 64
+                && until.len() <= 64)
+                .then_some(Claim {
+                    by: held.owner,
+                    until,
+                })
+        });
     (verdict, claim, last_comment_at)
 }
 
