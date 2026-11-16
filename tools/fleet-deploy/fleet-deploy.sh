@@ -244,7 +244,8 @@ except (ValueError, AttributeError):
     say_once launcher-activation "unit=launcher-activation active"
     return 0
   fi
-  if out=$(bounded 180 /usr/bin/python3 "$check" --activate --json); then
+  # Room for the check tool's 120 s access wait plus its codesign and spctl calls.
+  if out=$(bounded 300 /usr/bin/python3 "$check" --activate --json); then
     say "unit=launcher-activation activated"
     printf '%s\n' "unit=launcher-activation active" > "$root/launcher-activation.state"
     return 0
