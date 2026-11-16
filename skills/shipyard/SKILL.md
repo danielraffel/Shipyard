@@ -5716,7 +5716,7 @@ not own.
 
 Which workflow files the gate reads: `[landability] workflows` if set, else `.github/workflows/build.yml`. When neither names a file that exists (a repo with no `build.yml`), the gate falls back to only the workflow files whose jobs produce a required context, warns once naming them, and suggests pinning them with `[landability] workflows`. If no file produces any required context the loud "measured nothing" warning stays.
 
-Required contexts are the union of classic branch protection and repository rulesets (`rules/branches/{base}`), deduped by context; an unreadable ruleset read warns loudly instead of passing silently.
+Required contexts are the union of classic branch protection and repository rulesets (`rules/branches/{base}`), deduped by context; an unreadable ruleset read warns loudly instead of passing silently. A job whose `name:` is templated (`Test ${{ matrix.name }}`) matches a context as a pattern and is reported `producer: templated (unverified)`; such a match is never a refusal.
 
 ### Things that will bite a future change
 

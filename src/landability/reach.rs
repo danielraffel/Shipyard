@@ -310,11 +310,22 @@ pub fn assess_reachability(input: &ReachInput<'_>) -> Vec<ContextReachability> {
 }
 
 fn assess_one(context: &RequiredContext, input: &ReachInput<'_>) -> ContextReachability {
-    let producers: Vec<&WorkflowUnderTest> = input
-        .workflows
-        .iter()
-        .filter(|workflow| workflow.jobs.iter().any(|job| job.produces(&context.name)))
-        .collect();
+    let exact =
+        |workflow: &&WorkflowUnderTest| workflow.jobs.iter().any(|job| job.produces(&context.name));
+    let mut producers: Vec<&WorkflowUnderTest> = input.workflows.iter().filter(exact).collect();
+    let templated_only = producers.is_empty();
+    if templated_only {
+        producers = input
+            .workflows
+            .iter()
+            .filter(|workflow| {
+                workflow
+                    .jobs
+                    .iter()
+                    .any(|job| job.produces_templated(&context.name))
+            })
+            .collect();
+    }
 
     let mut notes = Vec::new();
     if !context.protected
@@ -370,6 +381,20 @@ fn assess_one(context: &RequiredContext, input: &ReachInput<'_>) -> ContextReach
         ));
     }
     best.notes.splice(0..0, notes);
+    if templated_only {
+        best.notes.push(TEMPLATED_NOTE.to_owned());
+        // An unverified pattern match must never refuse a submission: report
+        // the finding but as an instrument limit, not a trigger fault.
+        if best.verdict.blocks() {
+            best.verdict = Reachability::Unknown {
+                boundary: "templated".to_owned(),
+                detail: format!(
+                    "the producer's name is templated, so this {} finding is unverified",
+                    best.verdict.as_str()
+                ),
+            };
+        }
+    }
 
     if !context.protected
         && input.protection_readable
@@ -399,6 +424,9 @@ fn not_required_remedies(base: &str) -> Vec<String> {
             .to_owned(),
     ]
 }
+
+/// Note attached when the only producer matched by name pattern.
+const TEMPLATED_NOTE: &str = "producer: templated (unverified)";
 
 /// Events that can put a check on a pull request's merge ref.
 fn is_pull_request_shaped(event: &str) -> bool {
@@ -803,7 +831,10 @@ pub fn warnings(assessments: &[ContextReachability]) -> Vec<String> {
             _ => {}
         }
         for note in &assessment.notes {
-            if note.contains("does not declare `edited`") || note.contains("does not require") {
+            if note.contains("does not declare `edited`")
+                || note.contains("does not require")
+                || note == TEMPLATED_NOTE
+            {
                 warnings.push(format!("landability: `{}` - {note}", assessment.context));
             }
         }

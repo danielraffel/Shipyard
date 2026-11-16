@@ -749,3 +749,59 @@ fn the_epoch_helper_is_not_used_for_anything_load_bearing() {
         Utc.with_ymd_and_hms(2026, 9, 14, 1, 0, 53).unwrap()
     );
 }
+
+// ---------------------------------------------------------------------------
+// Templated producer names (`Test ${{ matrix.name }}`).
+// ---------------------------------------------------------------------------
+
+fn templated_case(base: &str) -> Case {
+    let source = format!(
+        "{SPECTR_ON}\n\njobs:\n  test:\n    name: Test ${{{{ matrix.name }}}}\n    runs-on: \
+         ${{{{ matrix.os }}}}\n"
+    );
+    let mut case = Case::spectr(base);
+    case.contexts = vec![RequiredContext {
+        name: "Test macOS ARM64".to_owned(),
+        protected: true,
+        shipyard_source: None,
+    }];
+    case.workflows = vec![WorkflowUnderTest {
+        path: ".github/workflows/ci.yml".to_owned(),
+        jobs: parse_workflow_jobs(&source),
+        triggers: parse_workflow_triggers(&source),
+        base_triggers: None,
+    }];
+    case
+}
+
+#[test]
+fn a_templated_job_name_is_a_templated_producer_not_no_producer() {
+    let verdict = templated_case("main").one();
+    assert_ne!(verdict.verdict, Reachability::NoProducer);
+    assert_eq!(
+        verdict.workflow.as_deref(),
+        Some(".github/workflows/ci.yml")
+    );
+    assert!(
+        warnings(&[verdict])
+            .join("\n")
+            .contains("producer: templated (unverified)")
+    );
+}
+
+#[test]
+fn a_templated_producer_can_never_refuse() {
+    // A stacked base is BaseExcluded (blocking, exit 8) for an exact
+    // producer; for a pattern match it must degrade to a warning.
+    let exact = Case::spectr(STACKED_BASE).one();
+    assert!(exact.verdict.blocks(), "control: an exact producer refuses");
+    let verdict = templated_case(STACKED_BASE).one();
+    assert!(!verdict.verdict.blocks(), "{:?}", verdict.verdict);
+}
+
+#[test]
+fn a_context_matching_no_template_is_still_no_producer() {
+    let mut case = templated_case("main");
+    case.contexts[0].name = "Lint".to_owned();
+    assert_eq!(case.one().verdict, Reachability::NoProducer);
+}
