@@ -5714,6 +5714,8 @@ not own.
 | `gather.rs` | the four API calls and the 300 s cache |
 | `gate.rs` | the submission gate; the only thing that turns a verdict into a refusal |
 
+Which workflow files the gate reads: `[landability] workflows` if set, else `.github/workflows/build.yml`. When neither names a file that exists (a repo with no `build.yml`), the gate falls back to only the workflow files whose jobs produce a required context, warns once naming them, and suggests pinning them with `[landability] workflows`. If no file produces any required context the loud "measured nothing" warning stays.
+
 ### Things that will bite a future change
 
 - **`trigger.rs` and `workflow.rs` err in OPPOSITE directions, deliberately.**
