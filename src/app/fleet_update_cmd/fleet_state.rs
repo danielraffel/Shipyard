@@ -132,7 +132,7 @@ pub(super) fn record_rollback_failure(
 }
 
 pub(super) fn alert_title(tag: &str) -> String {
-    format!("fleet-update: {tag} could not reach the fleet")
+    format!("fleet-reconcile: {tag} could not reach the fleet")
 }
 
 pub(super) fn rollback_failure_body(tag: &str, host_class: &str, reason: &str) -> String {

@@ -92,12 +92,12 @@ pub(in crate::app) fn fleet_version_doctor_section(
     }
     for (tag, attempts) in terminal_tags(&runtime_paths.state_dir) {
         rows.insert(
-            format!("terminal:{tag}"),
+            format!("reconcile:{tag}"),
             entry(
                 false,
                 Some(tag.clone()),
                 attempts.terminal.clone(),
-                Some("a failed rollback made this release terminal".to_owned()),
+                Some("this release is terminal for fleet rollouts".to_owned()),
             ),
         );
     }

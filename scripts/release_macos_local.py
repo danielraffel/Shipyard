@@ -930,8 +930,19 @@ def run_fleet_rollout(config: ReleaseConfig, runner: CommandRunner, shipyard: st
             file=sys.stderr,
         )
         raise SystemExit(FLEET_ROLLOUT_FAILED_EXIT)
-    # A Mac with no [host_class] cannot run this stage; that does not make the
-    # release incomplete, so hand over with a warning.
+    # The controller binary is the one already installed, i.e. the previous
+    # release. A controller without `runner fleet-update` or a Mac with no
+    # [host_class] cannot run this stage; neither makes the release incomplete,
+    # so hand over with a warning.
+    code, _, _ = runner.run_status([shipyard, "runner", "fleet-update", "--help"])
+    if code != 0:
+        print(
+            f"WARNING: {shipyard} predates verified fleet rollouts; the fleet was NOT "
+            f"updated to {config.tag} here. TartCI self-update rolls it out after the "
+            "soak (see `tartci fleet-macos tool-freshness`).",
+            file=sys.stderr,
+        )
+        return
     plan = [shipyard, "--json", "runner", "fleet-update", "--to", config.tag, "--all-hosts"]
     code, _, stderr = runner.run_status(plan)
     if code != 0 and "No [host_class." in stderr:
