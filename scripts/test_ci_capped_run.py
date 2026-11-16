@@ -19,7 +19,10 @@ def run(env, cmd=SHOW):
 class CiCappedRunTests(unittest.TestCase):
     def test_test_workflow_step_uses_cap(self):
         workflow = (SCRIPT.parent.parent / ".github/workflows/ci.yml").read_text()
-        self.assertIn("run: scripts/ci-capped-run.sh cargo test --all-targets --locked --features ci-test-home", workflow)
+        marker = "run: scripts/ci-capped-run.sh cargo test --all-targets --locked --features ci-test-home"
+        step = next(chunk for chunk in workflow.split("      - name:") if marker in chunk)
+        self.assertEqual(workflow.count(marker), 1)
+        self.assertIn("shell: bash", step)
 
     def test_github_hosted_runs_unchanged(self):
         result = run({"RUNNER_ENVIRONMENT": "github-hosted"})

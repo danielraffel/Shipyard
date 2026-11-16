@@ -2255,7 +2255,9 @@ fn sweep_absent_older_than(
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
+    use std::fs;
     use std::path::{Path, PathBuf};
+    use std::process::Command;
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
@@ -2341,6 +2343,64 @@ mod tests {
 
     fn request_store_with_value(value: &Value) -> (tempfile::TempDir, QueueRequestStore) {
         request_store_with_contents(&serde_json::to_string(value).expect("serialize fixture"))
+    }
+
+    /// Official build, install, and release paths must never turn on every
+    /// feature or the test-only `ci-test-home` feature, which lets
+    /// `SHIPYARD_TEST_HOME` override the home directory of a shipped binary.
+    #[test]
+    fn official_surfaces_never_enable_all_features_or_ci_test_home() {
+        // The only places that legitimately build with ci-test-home.
+        const CI_TEST_HOME_ALLOWED: [&str; 2] =
+            [".github/workflows/ci.yml", ".shipyard/config.toml"];
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let output = Command::new("git")
+            .args(["-C", repository.to_str().expect("UTF-8 repository path")])
+            .args(["ls-files", "-z"])
+            .output()
+            .expect("git ls-files must be available for the repository guard");
+        assert!(output.status.success(), "git ls-files failed");
+        let mut scanned = 0;
+        for raw in output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|p| !p.is_empty())
+        {
+            let path = String::from_utf8(raw.to_vec()).expect("tracked paths must be UTF-8");
+            let file_name = path.rsplit('/').next().unwrap_or(&path);
+            let is_test_or_fixture = file_name.starts_with("test_")
+                || path.contains("/tests/")
+                || path.contains("/fixtures/");
+            let is_script = [".sh", ".py", ".ps1", ".bash"]
+                .iter()
+                .any(|extension| path.ends_with(extension));
+            let official = path == ".shipyard/config.toml"
+                || path == "install.sh"
+                || path == "RELEASING.md"
+                || path.starts_with(".github/workflows/")
+                || path.starts_with(".githooks/")
+                || path.starts_with("hooks/")
+                || (!is_test_or_fixture && is_script);
+            if !official {
+                continue;
+            }
+            let Ok(contents) = fs::read_to_string(repository.join(&path)) else {
+                continue;
+            };
+            scanned += 1;
+            let contents = contents.replace("\r\n", "\n").to_ascii_lowercase();
+            assert!(
+                !contents.contains("--all-features")
+                    && !contents.contains("--all_features")
+                    && !contents.contains("all_features = true"),
+                "official surface {path} enables all features"
+            );
+            assert!(
+                CI_TEST_HOME_ALLOWED.contains(&path.as_str()) || !contents.contains("ci-test-home"),
+                "official surface {path} enables the test-only ci-test-home feature"
+            );
+        }
+        assert!(scanned > 10, "the surface scan found only {scanned} files");
     }
 
     #[test]
