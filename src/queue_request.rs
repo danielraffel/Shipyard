@@ -2797,6 +2797,25 @@ mod tests {
     }
 
     #[test]
+    fn v4_record_with_an_experimental_authority_key_loads_and_ignores_it() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        let envelope =
+            QueuedExecutionEnvelope::from_run_request("job-run", "/work/repo", &run_request());
+        let mut value = serde_json::to_value(&envelope).expect("serialize");
+        value["experimental_authority"] = json!({"backend_policy": "trusted_native_advisory"});
+        std::fs::write(
+            store.path_for("job-run"),
+            serde_json::to_string(&value).expect("encode"),
+        )
+        .expect("write");
+
+        let loaded = store.load("job-run").expect("load").expect("present");
+
+        assert_eq!(loaded, envelope);
+    }
+
+    #[test]
     fn request_mutation_lock_excludes_concurrent_store_writer() {
         let temp = tempfile::tempdir().expect("tempdir");
         let store = QueueRequestStore::new(temp.path()).expect("store");

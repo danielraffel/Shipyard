@@ -4,7 +4,9 @@
 
 The queue request reader accepts schema versions 1 through 4 and refuses any
 other version. There is no `experimental_authority` request vocabulary: no
-writer produces one, and no reader projects one into a queue job. Content
+writer produces one, and the reader does not interpret one. A schema v4 record
+that carries an `experimental_authority` key still loads, and the key is
+ignored; a record whose schema version is above 4 is refused. Content
 identity and cache integrity never turn advisory-native evidence into
 Tart-required, merge, signing, or release authority.
 
