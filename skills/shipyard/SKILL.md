@@ -5926,9 +5926,15 @@ the steward host and its relay only: agents never run it, as they never arm or
 enqueue. Only fleet-list repos (`not_fleet_repo`); a ledger rate-limit cooldown
 or REST under 300 is `rate_limited` before any read; one attempt per head per
 60 s, at least 30 (`merge-steward.ready-events.json`); a report reads the live
-gate before `would_admit`. A moved head, a non-ready classification, a
+gate as a report (`read_head_gate_for_report`, `dry_run`) before `would_admit`,
+so it has no side effect: no lock, no attempt record, no `carries.jsonl` line.
+A moved head, a non-ready classification, a
 non-clear base poison, a paused entry or a pending cancellation is skipped; the ledger lock is tried, never waited on
-(`steward_busy`). The tick's own lock now waits up to 30 s
+(`steward_busy`). Under the lock the base's merge groups are read again (a
+non-clear reading is `base_poison_not_clear`), and while any flake re-enqueue
+receipt in the repository that the tick's breaker sweep has not judged is
+within the flake window, every head is skipped as `flake_requeue_unswept`: the
+tick sweeps first (`flake_requeue::unswept_requeue`). The tick's own lock now waits up to 30 s
 (`acquire_ledger_lock_within`).
 `src/app/merge_steward_cmd/merge_group_stall.rs`: for each queue entry
 whose `merge_group_heads` sha has no active run in the census, three reads
