@@ -1513,18 +1513,6 @@ not meet both 120 seconds and 10 percent, or transfer/dispatch overhead above
 recovery is proven. No v1 canary decision dispatches work or satisfies merge
 readiness.
 
-The shadow inventory producer accepts only bounded CTest JSON-v1 observations.
-It requires controller-owned target/per-test capability declarations and an
-explicit host/fleet scope for every observed `RESOURCE_LOCK`; unused
-declarations, a filtered set that differs from the independent expected count
-or sorted-ID digest, a test whose emitted configuration differs from the exact
-controller-owned `CTest -C` configuration, ambiguous property types, duplicate
-properties, unsupported versions, disabled or non-executable tests, and
-nonempty `REQUIRED_FILES` without controller filesystem attestation, and
-`RESOURCE_GROUPS` fail closed. Capability expansion is bounded before per-test
-cloning. It is a pure translation boundary: it does not invoke CTest, dispatch
-work, or satisfy merge readiness.
-
 Bounded execution remains machine-global default-off. For a controlled canary,
 use `changed_surface_execution.mode = "shadow_compare"` in trusted global
 config; the repository cannot enable it, the queued command is exact-bound,
@@ -1541,18 +1529,10 @@ both authorization boundaries. The legacy scalar remains compatible only by
 itself; replace it atomically when migrating because mixed scalar/scoped policy
 is ambiguous and fails closed.
 
-The one-host build-once bridge remains machine-global default-off. The
-`parallel-proof-canary` command exposes a one-shot plan/apply seam; apply also
-requires a trusted digest-pinned native adapter and complete reviewed
-invocation-authority digest. Core contains no Pulp commands or personal host
-defaults. Bind one successful configure and
-one successful build receipt to the exact source, toolchain, canonical CTest
-inventory, proof manifest, and compact artifact content/layout/size identity.
-Consumption must remain in the same authenticated M3 session, verify that
-exact content address, observe zero configure/build invocations, and reconcile
-the sorted unique executed IDs exactly to the canonical inventory. It cannot
-run commands, dispatch cross-host work, publish a check, or replace the full
-authoritative gate.
+The `parallel-proof-canary` command is machine-global default-off and exposes a
+one-shot plan/apply seam; apply also requires a trusted digest-pinned native
+adapter and complete reviewed invocation-authority digest. Core contains no Pulp
+commands or personal host defaults.
 
 Schema v3 also binds nonempty baseline and per-family `CMake` producer-target
 lists. It may replace only the exact protected `build` and `test` stages as one
@@ -2570,41 +2550,7 @@ python3 scripts/finish_line_status.py \
 
 ### Being right does not discharge the duty
 
-A process that exits fail-closed because it cannot prove a resource is gone has
-made the *correct* decision, and it must never be "fixed" by making it proceed.
-But a correct refusal is not a completed obligation — it is the start of one.
-
-At the moment it stops, that process knows three things nobody else does: that
-it stopped, what it was holding, and why it could not finish. If it exits
-without saying them, that knowledge dies with it and the only remaining
-evidence is a resource nobody can account for. The real incident: a teardown
-refused correctly, **raised nothing**, and left a failed lease release
-unresolved, so a shared resource stayed held by a process that no longer
-existed.
-
-`fleet_handback::assess_exit` names the three obligations, most consequential
-first:
-
-1. **Bound the retry.** Repeating an unproven action is not recovery — an
-   unbounded restart into unproven state is the `NRestarts=36088` crash loop,
-   and it does damage on a timer rather than sitting inert.
-2. **Dispose.** Every held resource gets an owner or an explicit release. A
-   lease held by a dead process is a leak whatever the exit code was.
-3. **Raise.** Somewhere that outlives the host, because a journal line on a
-   machine nobody is looking at is not a signal. An empty reference does not
-   count.
-
-Two things it deliberately will *not* do, both of which would make it useless:
-
-- **A clean exit holding nothing owes nothing.** Faulting on every quiet
-  success buries the real findings under ordinary ones.
-- **An unobservable exit is `Unknown`, not `Discharged`.** It has a separate
-  constructor precisely so nobody can score one by passing defaults into the
-  normal path.
-
-`fleet_selfheal` already returns `Escalate` instead of acting when idleness
-cannot be proven. This is the other end of that contract — what the caller owes
-on receiving one.
+A process that exits fail-closed because it cannot prove a resource is gone made the right call, and must never be "fixed" by making it proceed. But the refusal starts an obligation: bound the retry, give every held resource an owner or an explicit release, and raise the failure somewhere that outlives the host. A clean exit holding nothing owes nothing, and an exit you cannot observe is unknown, not discharged. Detail: `docs/fleet-health-lessons.md`.
 
 ## Zero runners fleet-wide: suspect the admission gate's own observation cost
 
@@ -2754,37 +2700,7 @@ reap_queued_max_min = 480
 
 ### A health verdict needs a control too
 
-The same rule that governs a runner census governs a health signal: a verdict
-you cannot contradict is not a verdict, it is an assertion. tartci #188 is the
-case — a fleet health checker reported a host **dead while it was serving a
-busy runner**. That is the only shape in this family where the system was
-*confident and wrong* rather than silent, and it is the most corrosive: once an
-operator sees one confidently wrong "dead", they stop trusting every other
-verdict the same system emits.
-
-`fleet_health_reconciliation` checks a claim against independent evidence that
-the host is doing work, and the asymmetry is the whole design:
-
-- **Service evidence is positive and hard to fake.** A `busy` runner is
-  executing someone's job; a job completed after the claim finished on that
-  host. Neither happens on a dead machine, so both *refute* a `critical` claim
-  and downgrade it from `Block` to `Warn` — the host keeps taking work and the
-  operator learns the signal is wrong.
-- **Silence refutes nothing.** An idle host serves nothing and is healthy.
-  Reading quiet as dead would condemn every unused machine in the fleet.
-
-Two traps it deliberately encodes:
-
-- **`online` is not proof of life.** A registration outlives the machine behind
-  it — tartci #189, an offline runner still advertising its labels — so only
-  *work* counts as evidence. Census presence never refutes a health claim.
-- **Staleness is not health.** A vitals file whose producer died repeats its
-  last word forever with total confidence. Past a ceiling the claim is neither
-  green nor critical; it is `Unknown`, because nobody is answering.
-
-When triaging a host the fleet calls unusable, get the counter-evidence before
-the diagnosis: is anything on it *busy right now*? If so, the signal is the
-fault.
+A verdict you cannot contradict is an assertion. Before accepting that a host is dead, look for work on it: a runner that is `busy`, or a job that finished there after the claim, refutes the claim. Silence refutes nothing, since an idle host is healthy. `online` is not proof of life, and a stale vitals file is unknown rather than green. Detail: `docs/fleet-health-lessons.md`.
 
 ## Fleet Service Assertions (assert service, never liveness)
 
@@ -2815,8 +2731,7 @@ name the `Boundary` (`grammar` / `scope` / `identity` / `permission` / `parse` /
 and `Boundary::next_action` names it. A `transport` failure is explicitly **not**
 an auth fault — do not re-authenticate in response to a timeout.
 
-Two more rules when the thing being judged is a **supervisor**
-(`src/fleet_supervisor.rs`):
+Two more rules when the thing being judged is a **supervisor**:
 
 3. **Never judge scan blindness from a sample.** `SCAN BLIND (gh queue scan
    failed) N/9` flickers. One supervisor measured here was blind on 1598 of its
@@ -2892,7 +2807,7 @@ second licenses a redeploy that destroys whatever the host was carrying.
 
 When a fleet fault needs to reach a human, do not leave it in a log on the
 broken host — nobody reads that host. Open a tracking issue and auto-close it on
-recovery (`src/fleet_escalation.rs` decides; the caller does the I/O), and give
+recovery, and give
 it hysteresis: raise only after a subject has been failing *continuously*, clear
 only after it has been healthy *continuously*, and clear more slowly than you
 raise. Everything here flickers, and a flapping alarm gets ignored along with
@@ -3026,37 +2941,7 @@ the `--json` envelope, which names the outcome instead of encoding it.
 
 ### Survivability: will the lane still be there after an ordinary exit?
 
-`fleet_service` answers *is this lane being served*. It cannot answer *will it
-survive*, and the two come apart badly.
-
-On 2026-09-05 this repository's only macOS runner was `online` and `busy` —
-`Served`, correctly, by every existing assertion. A routine force-push tripped
-`cancel-in-progress`, the cancel arrived at the runner as a signal
-(`Runner will be shutdown for UserCancelled`), and it exited. It never came
-back: not ephemeral, `RunAtLoad` with **no `KeepAlive`**, and not loaded in
-launchd at all. The lane went from `Served` to permanently `Unserved` with no
-state in between, while the host stayed up and kept serving three other
-runners. The precondition was statically visible the whole time.
-
-`fleet_supervision` reads that precondition. `Restartability` per runner
-(`Supervised` / `SelfReplacing` / `Unsupervised` / `Unknown`), rolled up per
-lane into `Survivability` (`Survivable` / `Fragile` / `SinglePointOfFailure` /
-`Unknown`).
-
-Two traps it is built around, both of which produce a confident false fault:
-
-- **A LaunchAgent lives in the per-user GUI domain.** `launchctl list` over SSH
-  prints nothing for a job that is loaded and running, so "not loaded" from an
-  SSH session is not a fact. Query `launchctl print gui/$(id -u)/<label>`, and
-  **always run it against a job you know is loaded first** — without that
-  control an empty result is indistinguishable from a broken query. An
-  unreadable domain is `Unknown { boundary: Scope }`, never a fault.
-- **An empty runner census is a scope error until proven otherwise.** Zero
-  runners yields `Unknown`, not `SinglePointOfFailure`; the org-vs-repo scope
-  mistake already misled this fleet once.
-
-`RunAtLoad` is not supervision. It starts a job once and says nothing about
-what happens when it exits — which is exactly the plist that took the lane out.
+A lane being served now does not mean it survives a cancel signal. A LaunchAgent with `RunAtLoad` and no `KeepAlive` is not supervised, and it takes the lane out for good after one exit. Check with `launchctl print gui/$(id -u)/<label>`, never `launchctl list` over SSH, and run it first against a job you know is loaded. An empty runner census is a scope error until proven otherwise. Detail: `docs/fleet-health-lessons.md`.
 
 ### A queued job that nobody will ever pick up
 

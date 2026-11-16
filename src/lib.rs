@@ -53,8 +53,6 @@ pub mod cloud_records;
 pub mod code_owners;
 /// Layered configuration loading and worktree fallback behavior.
 pub mod config;
-/// Pure, fail-closed translation from CTest JSON-v1 metadata into a canonical test inventory.
-pub mod ctest_inventory;
 /// Unix socket IPC primitives for daemon subscribers and status reads.
 pub mod daemon_ipc;
 /// Stable macOS privacy identity (launchd launcher) for the detached daemon.
@@ -95,32 +93,10 @@ pub mod executor;
 pub mod file_lock;
 /// Fail-closed check that a host has converged to the declared fleet epoch.
 pub mod fleet_epoch;
-/// Decide when a fleet verdict should leave the host and reach a human.
-pub mod fleet_escalation;
-/// Typed guard assertions: is a declared guard actually armed on the host, and
-/// is the installed copy still the one the repo believes it deployed?
-pub mod fleet_guards;
-/// What a process owes when it correctly refuses to act: raise it, dispose of
-/// what it held, and bound the retry.
-pub mod fleet_handback;
 /// Typed service assertions: is a declared lane actually being served?
-/// Reconcile a host-health claim against evidence that the host is serving,
-/// so a confidently wrong verdict cannot remove a working host from rotation.
-pub mod fleet_health_reconciliation;
-/// The leak assertion: a live object whose subject already ended is a defect.
-pub mod fleet_lifecycle;
-/// Typed relay assertions: does every declared hop connect inside its budget?
-pub mod fleet_relay;
-/// Bounded self-heal gate: is a corrective action provably safe to take?
-pub mod fleet_selfheal;
 pub mod fleet_service;
 /// Typed slot assertions: is a free macOS VM slot being withheld, and why?
 pub mod fleet_slot;
-/// Assert that a lane's service survives an ordinary exit, not merely that it
-/// is serving right now.
-pub mod fleet_supervision;
-/// Typed supervisor assertions: can the thing that boots VMs see the work?
-pub mod fleet_supervisor;
 /// Read-only gate-minutes-per-merged-PR, batch fullness and receipt reuse.
 pub mod gate_cost;
 /// Repo-local gate script resolution for `shipyard pr`.
@@ -229,8 +205,6 @@ pub mod parallel_proof_canary_job_adapter;
 pub mod parallel_proof_canary_receipt;
 /// Authenticated companion protocol for read-only remote M1 cache observation.
 pub mod parallel_proof_canary_remote_cache;
-/// Default-off one-host build-once consumption proof for the Pulp M3 shadow canary.
-pub mod parallel_proof_one_host;
 /// Filesystem path resolution for isolated and compatible modes.
 pub mod paths;
 /// Consumer repository Shipyard pin helpers.

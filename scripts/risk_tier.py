@@ -94,8 +94,6 @@ DEFAULT_HIGH_PATHS = (
     "src/auto_arm*",
     "src/auto_arm/**",
     "src/ghapp_guards*",
-    "src/fleet_guards*",
-    "src/fleet_guards/**",
     "src/app/guards_cmd*",
     "src/app/ship_cmd/auto_arm*",
     "src/app/merge_steward_cmd/native_arm*",

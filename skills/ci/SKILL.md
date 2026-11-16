@@ -1382,8 +1382,6 @@ PRs are gone.
 | Read one exact shadow-comparison result | `shipyard --json changed-surface-trial-status --repo <owner/repo> --pr <n> --target <name> --head <sha>` (read-only; exit 3 collecting, 0 ready/safe terminal/`keyed_shadow_recorded`, 1 rejected/invalidated; an activation whose `schema_version` differs from its plan's reads `rejected: invalid_shadow_activation_contract` (Shipyard 0.274.0 and 0.275.0 wrote such activations for schema-3 plans; re-run on a fixed version); stale-base results are typed and permanently shadow-only, and carry the planner's cause in `stale_base_reason`; result receipts and the key manifest are read up to 16 MiB (a keyed full shadow of a large suite exceeds 1 MiB), and an unreadable receipt is reported by its own reason; validates exact receipt identity plus conservative timing/savings and never promotes policy or merge readiness) |
 | Measure what executable-keyed reuse would skip, without skipping | Declare `executable_reuse` (derivation_paths, build_dir, platform_probe, rederive, base_record pointers) in the protected base's `changed_surface_selection` and run the target on a `shadow_compare` host with `reuse_record = true`. A build-and-test plan becomes `keyed_full_shadow` / `keyed_bounded_shadow`: the configured build and full tests still run with their own verdict, and trial status reports `would_skip_count` and `false_skips`. No qualifying base record leaves the stages unchanged with an `executable_reuse_*` diagnostic. The host re-derives every keyed result before merge readiness (`shipyard reuse rederive` / `rederive-sweep` by hand); two refusals on a host trip the switch, and one sampled failure, false skip or rebuilt would-skip executable (`unreached_changed`) trips it at once; the receipt's `key_blind_candidates` names the executables for the project's key-blind list. Each keyed payload keeps its evidence in its own `payload-<sha256>/` directory, so re-shipping a head with a new candidate set runs keyed beside the earlier run and trial status names the deciding run in `verdict_source` (newest `recorded_at_unix_ns`) with every run in `keyed_runs`; past 8 payloads, or a changed activation for the same payload, runs unkeyed with an `activation_conflict` diagnostic (`keyed_payload_cap` for the cap), never a failed ship. The binding is written to `executable-reuse-binding.json` in the payload dir and the command carries only its digest (`executable_reuse_sha256`, payload schema 3), so the command no longer grows with the candidate count; Shipyard and the adapter share one 5,632-byte cap on the decoded payload, and a file the adapter cannot use (missing, unreadable, digest mismatch, invalid) makes it run unkeyed with `bound: null` and `derived.status` `error: binding ...`. A runner whose own derivation fails (`derived.status` `error: ...`) reads `not_derived: runner_error: <line>` in re-derivation, is never a refusal, and shows as `keyed.runner_error`. The host passes `derived.build_dir` as `{build_dir}`. A keyed plan binds the newest clean read-audit report (`read-audit.json`, staged beside the binding; `{audit_report}` in the base's commands) or records `audit: none` with a reason, in which case the run keys nothing and trial status says `reuse_observation: false` (a staged report counts only when the runner's `derived.audit.status` is `applied` and the key manifest's `producer.audit_status` is `clean`, otherwise `staged_unconfirmed: <why>`). `shipyard --json reuse records --target <t>` lists what a keyed plan would bind on this host now (0 with the refusal counts when nothing qualifies). Key code is read only from the base; a head edit to it forces the full suite. See `docs/changed-surface-selection.md#executable-keyed-shadow-runs`. |
 | Assess a macOS sharding canary | Default-off: `shipyard parallel-proof-canary --request <absolute-private-json>` is a no-execution/no-mutation plan unless `--apply` is explicit. Apply requires trusted machine-global policy pinning a native adapter digest, full invocation-authority digest, bounds, repository/target, and exact builder/worker identities. The controller completes the proof-bound same-host control before distributed work, rechecks session/storage fences, binds actual transfer and interrupted-resume counters, forces avoided-byte claims and model calls to zero, records distributed-started before mutation, and no-overwrite publishes evidence. Core has no Pulp commands or personal host defaults; installed adapter configuration and physical fleet proof remain required. Neither surface authorizes a merge. |
-| Produce a canonical shadow CTest inventory | Library-only: translate bounded CTest JSON-v1 with an independent exhaustive count/sorted-ID digest, exact configuration, bounded controller-owned capabilities, and explicit host/fleet scope for every resource lock. Filtered, ambiguous, disabled, non-executable, `REQUIRED_FILES`-dependent, or unsupported graphs fail closed. This does not invoke CTest, dispatch work, or authorize a merge. |
-| Assess one-host Pulp M3 build-once consumption | Library-only and default-off: bind exactly one successful configure/build receipt to the exact source, toolchain, canonical CTest inventory, proof manifest, and compact artifact content address; require same-session M3 consumption with zero configure/build invocations and exact sorted executed-set reconciliation. The existing full gate remains authoritative, and this cannot run commands, dispatch cross-host work, publish a check, or authorize a merge. |
 | Show run logs | `shipyard logs <job_id> --json` |
 | **Runner watchdog: health check** | `shipyard runner status --repo <r> --runner-id <id>` |
 | **Recover an exact Pulp zero-job Actions wedge** | `shipyard runner zero-job-recover --pr <n> --source-run-id <id>` is read-only by default; review the exact candidate, then add `--apply` once. This is independent of coalescing and stale cancellation. |
@@ -1663,37 +1661,7 @@ opposite capability. Never reuse either lease for secret-bearing or
 
 ### Survivability: will the lane still be there after an ordinary exit?
 
-`fleet_service` answers *is this lane being served*. It cannot answer *will it
-survive*, and the two come apart badly.
-
-On 2026-09-05 this repository's only macOS runner was `online` and `busy` —
-`Served`, correctly, by every existing assertion. A routine force-push tripped
-`cancel-in-progress`, the cancel arrived at the runner as a signal
-(`Runner will be shutdown for UserCancelled`), and it exited. It never came
-back: not ephemeral, `RunAtLoad` with **no `KeepAlive`**, and not loaded in
-launchd at all. The lane went from `Served` to permanently `Unserved` with no
-state in between, while the host stayed up and kept serving three other
-runners. The precondition was statically visible the whole time.
-
-`fleet_supervision` reads that precondition. `Restartability` per runner
-(`Supervised` / `SelfReplacing` / `Unsupervised` / `Unknown`), rolled up per
-lane into `Survivability` (`Survivable` / `Fragile` / `SinglePointOfFailure` /
-`Unknown`).
-
-Two traps it is built around, both of which produce a confident false fault:
-
-- **A LaunchAgent lives in the per-user GUI domain.** `launchctl list` over SSH
-  prints nothing for a job that is loaded and running, so "not loaded" from an
-  SSH session is not a fact. Query `launchctl print gui/$(id -u)/<label>`, and
-  **always run it against a job you know is loaded first** — without that
-  control an empty result is indistinguishable from a broken query. An
-  unreadable domain is `Unknown { boundary: Scope }`, never a fault.
-- **An empty runner census is a scope error until proven otherwise.** Zero
-  runners yields `Unknown`, not `SinglePointOfFailure`; the org-vs-repo scope
-  mistake already misled this fleet once.
-
-`RunAtLoad` is not supervision. It starts a job once and says nothing about
-what happens when it exits — which is exactly the plist that took the lane out.
+A lane being served now does not mean it survives a cancel signal. A LaunchAgent with `RunAtLoad` and no `KeepAlive` is not supervised, and it takes the lane out for good after one exit. Check with `launchctl print gui/$(id -u)/<label>`, never `launchctl list` over SSH, and run it first against a job you know is loaded. An empty runner census is a scope error until proven otherwise. Detail: `docs/fleet-health-lessons.md`.
 
 ### A queued job that nobody will ever pick up
 
@@ -2510,37 +2478,7 @@ See `docs/cloud-retarget.md` for full context; add-lane complements retarget.
 
 ### A health verdict needs a control too
 
-The same rule that governs a runner census governs a health signal: a verdict
-you cannot contradict is not a verdict, it is an assertion. tartci #188 is the
-case — a fleet health checker reported a host **dead while it was serving a
-busy runner**. That is the only shape in this family where the system was
-*confident and wrong* rather than silent, and it is the most corrosive: once an
-operator sees one confidently wrong "dead", they stop trusting every other
-verdict the same system emits.
-
-`fleet_health_reconciliation` checks a claim against independent evidence that
-the host is doing work, and the asymmetry is the whole design:
-
-- **Service evidence is positive and hard to fake.** A `busy` runner is
-  executing someone's job; a job completed after the claim finished on that
-  host. Neither happens on a dead machine, so both *refute* a `critical` claim
-  and downgrade it from `Block` to `Warn` — the host keeps taking work and the
-  operator learns the signal is wrong.
-- **Silence refutes nothing.** An idle host serves nothing and is healthy.
-  Reading quiet as dead would condemn every unused machine in the fleet.
-
-Two traps it deliberately encodes:
-
-- **`online` is not proof of life.** A registration outlives the machine behind
-  it — tartci #189, an offline runner still advertising its labels — so only
-  *work* counts as evidence. Census presence never refutes a health claim.
-- **Staleness is not health.** A vitals file whose producer died repeats its
-  last word forever with total confidence. Past a ceiling the claim is neither
-  green nor critical; it is `Unknown`, because nobody is answering.
-
-When triaging a host the fleet calls unusable, get the counter-evidence before
-the diagnosis: is anything on it *busy right now*? If so, the signal is the
-fault.
+A verdict you cannot contradict is an assertion. Before accepting that a host is dead, look for work on it: a runner that is `busy`, or a job that finished there after the claim, refutes the claim. Silence refutes nothing, since an idle host is healthy. `online` is not proof of life, and a stale vitals file is unknown rather than green. Detail: `docs/fleet-health-lessons.md`.
 
 ## Before blaming a lane: a runner census needs both scopes and a control
 
@@ -3123,41 +3061,7 @@ archive the stale state and start fresh. Full details in
 
 ### Being right does not discharge the duty
 
-A process that exits fail-closed because it cannot prove a resource is gone has
-made the *correct* decision, and it must never be "fixed" by making it proceed.
-But a correct refusal is not a completed obligation — it is the start of one.
-
-At the moment it stops, that process knows three things nobody else does: that
-it stopped, what it was holding, and why it could not finish. If it exits
-without saying them, that knowledge dies with it and the only remaining
-evidence is a resource nobody can account for. The real incident: a teardown
-refused correctly, **raised nothing**, and left a failed lease release
-unresolved, so a shared resource stayed held by a process that no longer
-existed.
-
-`fleet_handback::assess_exit` names the three obligations, most consequential
-first:
-
-1. **Bound the retry.** Repeating an unproven action is not recovery — an
-   unbounded restart into unproven state is the `NRestarts=36088` crash loop,
-   and it does damage on a timer rather than sitting inert.
-2. **Dispose.** Every held resource gets an owner or an explicit release. A
-   lease held by a dead process is a leak whatever the exit code was.
-3. **Raise.** Somewhere that outlives the host, because a journal line on a
-   machine nobody is looking at is not a signal. An empty reference does not
-   count.
-
-Two things it deliberately will *not* do, both of which would make it useless:
-
-- **A clean exit holding nothing owes nothing.** Faulting on every quiet
-  success buries the real findings under ordinary ones.
-- **An unobservable exit is `Unknown`, not `Discharged`.** It has a separate
-  constructor precisely so nobody can score one by passing defaults into the
-  normal path.
-
-`fleet_selfheal` already returns `Escalate` instead of acting when idleness
-cannot be proven. This is the other end of that contract — what the caller owes
-on receiving one.
+A process that exits fail-closed because it cannot prove a resource is gone made the right call, and must never be "fixed" by making it proceed. But the refusal starts an obligation: bound the retry, give every held resource an owner or an explicit release, and raise the failure somewhere that outlives the host. A clean exit holding nothing owes nothing, and an exit you cannot observe is unknown, not discharged. Detail: `docs/fleet-health-lessons.md`.
 
 ## Queue management
 
