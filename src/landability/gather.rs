@@ -75,6 +75,11 @@ pub struct FleetFacts {
     /// failed" is a statement about the instrument. Folding them together
     /// would make every transport blip look like an unprotected branch.
     pub protection_absent: bool,
+    /// The repository-ruleset read failed, so `required_contexts` may be a
+    /// narrower set than GitHub enforces. Such facts are never cached: the
+    /// cache does not keep warnings, and a warm run would silently drop the
+    /// ruleset-only contexts.
+    pub ruleset_read_failed: bool,
     /// Instrument problems worth printing.
     pub warnings: Vec<String>,
     /// How many API calls this gather actually made. Reported rather than
@@ -158,6 +163,9 @@ pub fn gather(
     fetch_variables(actions, repo, &mut facts);
     fetch_census(actions, repo, &mut facts);
 
+    if facts.ruleset_read_failed {
+        return facts;
+    }
     write_cache(
         &path,
         &CachedFacts {
@@ -322,10 +330,13 @@ fn merge_ruleset_contexts(facts: &mut FleetFacts, raw: Result<String, String>, b
             })
             .clone_into(&mut facts.contexts_source);
         }
-        Err(error) => facts.warnings.push(format!(
+        Err(error) => {
+            facts.ruleset_read_failed = true;
+            facts.warnings.push(format!(
             "repository rulesets unreadable for `{base}` ({error}); required checks defined by a \
              ruleset were NOT included, so the contexts checked may be a narrower set"
-        )),
+        ));
+        }
     }
 }
 
@@ -424,6 +435,7 @@ fn from_cache(cached: CachedFacts) -> FleetFacts {
         required_contexts: cached.required_contexts,
         contexts_source: cached.contexts_source,
         protection_absent: cached.protection_absent,
+        ruleset_read_failed: false,
         warnings: Vec::new(),
         api_calls: 0,
     }
@@ -541,6 +553,7 @@ fn write_cache(path: &Path, cached: &CachedFacts) {
 #[cfg(test)]
 mod ruleset_tests {
     use super::*;
+    use crate::cloud::GitHubActions;
 
     fn rule(contexts: &[&str]) -> String {
         let checks: Vec<_> = contexts
@@ -600,6 +613,34 @@ mod ruleset_tests {
             ])
         );
         assert_eq!(facts.contexts_source, "branch_protection+ruleset");
+    }
+
+    #[test]
+    fn an_unreadable_ruleset_is_not_cached_so_warm_runs_cannot_drop_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let actions = GitHubActions::offline_for_tests(dir.path());
+        let now = Utc::now();
+        let cold = gather(&actions, dir.path(), "o/r", "main", now, false);
+        assert!(cold.ruleset_read_failed);
+        assert!(
+            cold.warnings
+                .iter()
+                .any(|w| w.contains("rulesets unreadable"))
+        );
+        let warm = gather(
+            &actions,
+            dir.path(),
+            "o/r",
+            "main",
+            now + Duration::seconds(1),
+            false,
+        );
+        assert!(warm.api_calls > 0, "a failed ruleset read must be re-read");
+        assert!(
+            warm.warnings
+                .iter()
+                .any(|w| w.contains("rulesets unreadable"))
+        );
     }
 
     #[test]
