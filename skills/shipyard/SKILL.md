@@ -6133,7 +6133,9 @@ evidence. `green_head_fix` names the fix from the census
 with no read: not draft, approval status successful at the head, every
 confirmed context's selected check green with `observed_at > red_since`, never a PR
 that rode a failing group. `fix_first::pick` names it only when it is the
-sole candidate or the sole one labelled `main-red-fix`/`fixes-main`;
+sole candidate or the sole one labelled `main-red-fix`/`fixes-main`; the
+base-poison and drain paths also name any PR carrying `shipyard:unblock`,
+`main-red-fix` or `fixes-main` as a fix (`queue_drain::fix_evidence`);
 otherwise `GreenHead::Ambiguous`: none jumped or held, all added to
 `candidates` (admitted plainly, never paused), `fix_ambiguity` reported.
 `RepoPoison::partial` reports an unread tip or fix listing and the shadow

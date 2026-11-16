@@ -14,7 +14,7 @@
 //!   enqueued (`held_base_poisoned:<context>`); under `dry-run` it is
 //!   enqueued as before and reported `would_hold_base_poisoned:<context>`.
 //! * **Fast-track the fix.** A pull request is a named fix when it carries
-//!   [`crate::queue_drain::UNBLOCK_LABEL`], when its title or description
+//!   [`crate::queue_drain::UNBLOCK_LABEL`], `main-red-fix` or `fixes-main`, when its title or description
 //!   names the poisoned context next to a fix word, when the base-poison
 //!   detector names it as `candidate_fix_pr`. A head that passes the context
 //!   after the newest failing group while at least two other open heads fail

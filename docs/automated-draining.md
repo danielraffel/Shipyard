@@ -736,7 +736,9 @@ While both hold:
   When more than one pull request qualifies, the one carrying a
   `main-red-fix` or `fixes-main` label is the fix; if no single label
   separates them, none is jumped or held, all are admitted plainly, and the
-  pass reports `fix ambiguous: ...`. A `shipyard:unblock` label or the
+  pass reports `fix ambiguous: ...`. Any of the three labels `shipyard:unblock`,
+  `main-red-fix` and `fixes-main` marks a fix for the base-poison pass and
+  the drain path alike. The
   repository's own detector still takes priority where it names one. There
   is never more than one fix.
 - **The fix goes first.** It is enqueued with `jump: true` and is never
