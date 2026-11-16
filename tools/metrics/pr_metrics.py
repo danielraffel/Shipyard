@@ -291,7 +291,7 @@ def finalize(rd, f, pr):
     f["provenance"] = bool(PROVENANCE_RE.search(body))
     f["stamp"] = bool(STAMP_RE.search(body)) or bool(f.get("stamp_commit")) or bool(f.get("agent_events"))
     try:
-        f["steward_path"] = bool(f.get("merged_at")) and any(e[0] == "merged" for e in f["owner_events"]) and steward_evidence(rd, f)
+        f["steward_path"] = bool(f.get("merged_at")) and bool(f.get("timeline_complete")) and bool(f.get("commits_complete")) and any(e[0] == "merged" for e in f["owner_events"]) and steward_evidence(rd, f)
     except Truncated:  # the policy could not be read within the cap: no approval is trusted this run
         f["steward_path"] = False
     return f
@@ -799,12 +799,12 @@ def collect_repo(repo, cache_dir, cap, owner, lo, hi, now, ticks, tick_ctx, fetc
     facts = []
     for pr in prs:
         f = rd.load("facts", str(pr["number"]))
-        if f is not None and f.get("v") != FACTS_VERSION:
-            f = None  # cached by an older reduction without the attribution facts (trailer, stamp, verdict path): read again once
+        if f is not None and (f.get("v") != FACTS_VERSION or not (f.get("timeline_complete") and f.get("commits_complete"))):
+            f = None  # also: an entry cached from a partial timeline or commit read is read again  # cached by an older reduction without the attribution facts (trailer, stamp, verdict path): read again once
         if f is None:
             try:
                 f = pr_facts(rd, pr, owner)
-                if f["state"] == "closed":  # a closed PR does not change; an open one is read again next run
+                if f["state"] == "closed" and f["timeline_complete"] and f["commits_complete"]:  # a closed PR does not change; an open one, or a partial read, is read again next run
                     rd.save("facts", str(pr["number"]), f)
             except (Truncated, ReadError):
                 res["unread"] += 1
