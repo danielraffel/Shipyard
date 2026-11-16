@@ -1,7 +1,7 @@
 {
   "$schema": "./versioning.schema.json",
   "schema_version": 1,
-  "_comment": "Shipyard versioning gate. Pull requests never edit version files; version-at-land assigns them after merge. A release PR may opt in with Release: allow-version-files reason=\"...\".",
+  "_comment": "Shipyard versioning gate. Pull requests never change a version value (other edits to version files pass); version-at-land assigns them after merge. A release PR may opt in with Release: allow-version-files reason=\"...\".",
 
   "surfaces": {
     "cli": {

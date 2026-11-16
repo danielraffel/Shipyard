@@ -1,9 +1,11 @@
 # Version-at-land migration
 
 Shipyard now assigns CLI and plugin versions after a change lands on `main`.
-A normal pull request must not edit `Cargo.toml`, `Cargo.lock`,
+A normal pull request must not change a version in `Cargo.toml`, `Cargo.lock`,
 `.claude-plugin/plugin.json`, or `.claude-plugin/marketplace.json`. The PR gate
-reports those edits as an error. Two branches can therefore merge back to back
+reports a moved version value, an added or deleted version file, or a version it
+cannot parse as an error. Other edits to those files, such as a dependency or a
+`[features]` entry, pass. Two branches can therefore merge back to back
 without racing on a shared version line.
 
 The post-merge `version-at-land.yml` workflow is the only writer. It computes
@@ -54,7 +56,7 @@ feature or fix pull requests.
 
 ## Replay acceptance
 
-A no-version-file PR passes the gate. A PR that edits a version file fails
-unless it carries the release exception. Two consecutive merged commits are
+A PR that leaves every version value alone passes the gate. A PR that changes
+one fails unless it carries the release exception. Two consecutive merged commits are
 processed by one writer transaction and receive one monotonically increasing
 assignment, so the second branch has no version-line conflict to replay.

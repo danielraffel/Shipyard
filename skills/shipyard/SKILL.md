@@ -1050,9 +1050,12 @@ everything unowned. The cleanup touches nothing but `shipyard-validation-*`.
 
 ## Version-at-land
 
-A normal PR does not edit `Cargo.toml`, `Cargo.lock`, or plugin manifest
-versions. The read-only version gate rejects those edits unless the PR carries
-the explicit release recovery trailer. After merge, `version-at-land.yml` is the
+A normal PR does not change a version: `[package].version` (or the crate name)
+in `Cargo.toml`, the crate's own entry in `Cargo.lock`, or any `version` key in
+the plugin manifests. Other edits to those files, such as a dependency or a
+`[features]` entry, pass. The read-only version gate refuses a PR when a version
+value moves, when one of those files is added or deleted, or when its version
+cannot be read, unless the PR carries the explicit release recovery trailer. After merge, `version-at-land.yml` is the
 single writer and assigns the next versions. It never pushes to `main` (the
 ruleset requires PR-only checks): it rebuilds the bot-owned
 `release/version-at-land` branch with one cumulative bump commit, keeps a single
