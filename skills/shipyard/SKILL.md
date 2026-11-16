@@ -30,7 +30,8 @@ A scheduled reviewer pass works through the **must-review queue** a script compu
 non-draft, green, and no verdict naming the head, with missed ones first. A 2-minute eligibility tick, which makes
 no model call, starts a pass when a pull request becomes reviewable, or queues one follow-up behind a running pass.
 Kick a pass by hand only once the checks are green, because the queue skips anything else.
-See `docs/automated-draining.md`.
+The pass runner lives in fleet-handbook `scripts/pass-runner/` and is installed with its
+`scripts/install-pass-runner.sh`. See `docs/automated-draining.md`.
 
 ## Release bases are not stacks
 
@@ -910,15 +911,14 @@ the merge-queue mutation guard, so `HOLD`, `mutation_machine` and the audit
 apply. Its starvation rule is `gate_cost::proxy::ejection_cause` plus the
 wait bound, shared with the gate-cost metric; do not add a third copy.
 
-## fleet-reconcile ledger: every attempt says how it ended
+## Rollout ledger: a failed rollback is recorded once
 
-`fleet-reconcile/attempts.json` records `last_outcome` (`verified` or
-`failed: <reason>`) for each rollout. Reconcile only ever targets the latest
-release, so a failed older tag is never retried; when a newer tag rolls out,
-every older tag without a verified rollout gets `terminal: "superseded by
-<tag> without a verified rollout (last attempt: ...)"`. Entries written before
-this carry no `last_outcome` and close as "outcome not recorded". The close
-happens inside a rollout, never on an idle tick, which still writes nothing.
+`fleet-reconcile/attempts.json` in the controller's state dir (the directory
+keeps its original name so earlier ledgers stay readable) records a host
+quarantined after a failed rollback and the tag that failure made terminal.
+Fields written by earlier releases (attempt counts, `last_outcome`, alert
+bookkeeping) are ignored on read and dropped on the next write. A change that leaves the ledger as it was writes
+nothing.
 
 ## A missing key is not an empty list
 
@@ -1845,7 +1845,7 @@ release being installed binds whether or not a daemon was running.
 
 `--lagging-only` reads each selected host first and skips
 hosts already at or ahead of the target. Reinstalling such a host cannot be
-rolled back and restarts its daemon. The release stage and reconcile always use
+rolled back and restarts its daemon. The release stage always uses
 it. The controller's own
 (`ssh`-less) host class is always updated last, and one controller lock spans
 apply, verify and rollback (a second rollout exits 75).
@@ -1853,88 +1853,62 @@ apply, verify and rollback (a second rollout exits 75).
 A release is done when the fleet verifies it. `scripts/release-macos-local.sh`
 ends with that verified rollout (exit 6 naming lagging hosts; the published
 release is never reverted; `--no-fleet-rollout` opts out with a warning). The
-stage falls back to the backstop with a warning when the controller binary
-predates this (no `runner fleet-reconcile`), or when the Mac declares no
+stage hands over with a warning when the Mac declares no
 `[host_class.*]`.
 
-For releases that reached GitHub another way, `shipyard runner fleet-reconcile`
-compares the recent published non-draft releases with every host class's
-installed version and targets the **newest release that has itself soaked**
-(`--soak-minutes`, default 30). Each release still soaks its full window
-before any host gets it, but a newer release no longer restarts an older one's
-soak. Without that, steady merges starved the rollout (Shipyard #722). With
-`--apply` it rolls out to **only the host classes behind that tag**. A host
-that lags a published release for longer than `--lag-alert-hours` (default 2)
-is listed in `lagging_too_long` and raises one alert until it catches up,
-because a `soaking` decision exits 0. It never downgrades: a host running
-a newer version than the latest release stops the whole tick with an alert
-(exit 4). Each attempt is recorded before it starts. A tag is retried at most
-once per `--retry-hours` (default 6, exit 3), and after `--max-attempts`
-(default 3) it becomes terminal (exit 5). An ineligible release is terminal
-immediately. A terminal tag opens or refreshes a GitHub issue titled
-`fleet-reconcile: <tag> could not reach the fleet` on the Shipyard repository
-and shows in `shipyard doctor --fleet`. Anything unreadable exits 9 and rolls
-nothing out. A tick that finds the controller lock held records nothing (exit
-75). A host whose install guard (`fleet-auth-support.guard` in its state dir)
-is held, by a running Sandbox canary or another install, refuses before any
-change with exit 75 and `SHIPYARD_FLEET_HOST_BUSY` on stderr; the rollout stops
-there as **deferred** (verdict `deferred`, exit 75), nothing is rolled back,
-and reconcile withdraws the attempt it recorded so the next tick retries
-without waiting out `--retry-hours`. When the controller's own install guard
-is held (a Sandbox canary on the controller), the tick defers before recording
-anything. The attempt ledger (`fleet-reconcile/attempts.json`) is production
-persistence in the protected state tree: a tick that changes nothing does not
-rewrite it, and every real write holds the shared sandbox writer-domain lease,
-so it waits for (and then defers to, exit 75) an exclusive Sandbox audit.
-Each tick also reads every host's daemon (`shipyard --json daemon status`) and
-launcher (`daemon launcher status`) and lists problems in `daemon_problems`. A
-host without the launcher has nothing to restart its daemon after a reboot.
-An active launcher counts as reboot-safe only when `daemon launcher status`
-reads `survives_kill_and_reboot: true` from the agent plist launchd loads
-(`RunAtLoad` true and `KeepAlive {SuccessfulExit = false}`); `false` gets
-`shipyard daemon refresh`, which rewrites the plist, and an unread value is a
-problem too, never a yes.
-The fix for a missing launcher is `shipyard daemon launcher install`, run at that host's console
-because it needs a one-time macOS approval, so never run it over SSH. A daemon
-that is not running gets `shipyard daemon refresh`. Each host raises one
-`fleet-reconcile: <class> daemon will not survive a reboot` issue until it
-reads healthy again. A daemon problem never changes the rollout decision or
-the exit code. Install its launchd agent on the controller only with
-`scripts/install_fleet_reconcile.sh`. That script is a dry run by default;
-`--install` first rehearses the reconcile under the agent's exact environment
-and refuses to load it on failure.
+For releases that reached GitHub another way, TartCI self-update rolls the
+release out: first to the canary host (m5), then to the other hosts after a
+2-hour healthy soak (they also wait for the steward host to verify the release;
+see tartci `fleet/tool-rollout.json`). `tartci fleet-macos tool-freshness` reports each host's
+installed version, and fleet-liveness alerts when self-update is halted,
+starved or failed. To roll hosts by hand, use `shipyard runner fleet-update`;
+`shipyard doctor --fleet` shows each host's version against the latest release.
 
-A failed rollback, whether it happened in reconcile, the release stage or an
+A host whose install guard (`fleet-auth-support.guard` in its state dir) is
+held, by a running Sandbox canary or another install, refuses before any
+change with exit 75 and `SHIPYARD_FLEET_HOST_BUSY` on stderr; the rollout stops
+there as **deferred** (verdict `deferred`, exit 75) and nothing is rolled back.
+The rollout ledger is production persistence in the protected state tree: a
+change that leaves it as it was does not rewrite it, and every real write holds
+the shared sandbox writer-domain lease, so it waits for (and then defers to,
+exit 75) an exclusive Sandbox audit.
+
+A host without the daemon launcher has nothing to restart its daemon after a
+reboot. The fix is `shipyard daemon launcher install`, run at that host's
+console because it needs a one-time macOS approval, so never run it over SSH.
+An active launcher counts as reboot-safe only when `daemon launcher status`
+reads `survives_kill_and_reboot: true`; `false` gets `shipyard daemon refresh`,
+which rewrites the plist. A daemon that is not running gets `shipyard daemon
+refresh`.
+
+A failed rollback, whether it happened in the release stage or an
 operator's `fleet-update --apply`, is terminal for that tag immediately and
 alerts at once. The host is **quarantined** in the controller's ledger. Every
-fleet-update and reconcile skips it until `shipyard runner fleet-reconcile
---clear-host <class>` is run after the host is fixed; that also makes its tag
+fleet-update skips it until `shipyard runner fleet-update --clear-host
+<class>` is run after the host is fixed; that also makes its tag
 eligible again. Rollback follows only failures that may have changed the host:
 - a timeout of the update command;
 - evidence that could not be collected after the command exited 0 (the host runs an unverified build, which is never treated as current);
 - rejected evidence, pair-hash drift, or a failed verification.
 
 A failure before the update command started (including a controller-local
-probe timing out) touched nothing and is never rolled back. The "hosts ahead" alert
-is raised once per tag. An unreadable host no longer blocks the others: the
-reachable lagging hosts are rolled, the tick exits 9, and the host alerts once
-after 4 consecutive unreadable ticks. Alerts find their issue by exact-title
-search, not by scanning one page of open issues.
+probe timing out) touched nothing and is never rolled back. Alerts find their
+issue by exact-title search, not by scanning one page of open issues.
 
 **Exactly one controller.** Only one Mac may declare `[host_class.*]` and run
-fleet-update or fleet-reconcile. Two controllers would race each other's
+fleet-update. Two controllers would race each other's
 rollouts and rollbacks on the same hosts, and each only holds its own lock.
 Shipyard can check this only from the controller: every probe reads each remote
 host's machine-global config, and a remote host that also declares host classes
-is reported by fleet-reconcile and flagged by `shipyard doctor --fleet` as a
+is flagged by `shipyard doctor --fleet` as a
 second controller. Remove the host classes from any Mac that is not the
 controller.
 
 **Adding a machine is adding its `[host_class.<name>]`** (plus its tartci
 profile) to the controller's machine-global config. Nothing in Shipyard names a
-host. `fleet-update --all-hosts`, `fleet-reconcile` and `doctor --fleet`
-enumerate the configured classes, so the new machine is probed, rolled,
-verified and rolled back like the others from the next tick.
+host. `fleet-update --all-hosts` and `doctor --fleet` enumerate the configured
+classes, so the new machine is probed, rolled, verified and rolled back like
+the others from the next rollout.
 
 For targets v0.134.0 and newer, the fleet transaction stages the exact
 release-matched CLI, helper, wrapper, and typed context in a private,
@@ -3302,8 +3276,7 @@ said (m1 watched the pre-transfer `danielraffel/pulp` for a day this way, with
 verdict "unknown"). A slug the credential could not answer for is kept.
 `shipyard doctor` reports `daemon-repos` not ok for a watched repo that was
 renamed or returns 404 to both probes; the fix is `shipyard daemon refresh
---repo <current name>`. `runner fleet-reconcile` lists a running daemon that
-watches no repositories under `daemon_problems`.
+--repo <current name>`.
 
 ## Legacy Queue Recovery: killed-worker stale-running reaping
 
@@ -3642,8 +3615,7 @@ destination it reaches, so a tracked layer may not set `host_class`: `runner
 capacity`, `runner reroute-watch`, `runner fleet-status`, `runner watch` and
 `ship`'s macOS VM-slot admission refuse one in `.shipyard/config.toml` or a
 committed `.shipyard.local/config.toml`, naming the file, before probing
-anything. (`who`, `fleet-update` and `fleet-reconcile` already read only the
-machine-global config.)
+anything. (`who` and `fleet-update` already read only the machine-global config.)
 
 ```toml
 [host_class.studio]
