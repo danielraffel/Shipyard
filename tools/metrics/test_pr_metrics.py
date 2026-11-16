@@ -448,33 +448,51 @@ class Attribution(Base):
 
     def test_an_app_enqueue_event_makes_an_owner_merge_a_steward_merge(self):
         enq = {"event": "added_to_merge_queue", "actor": {"login": "shipyard-local[bot]"}, "created_at": T(10, "10:40")}
-        r, _ = self.run_one(self.merged_pr(), [enq, self.MERGE], cm=[commit("c1", "x", "w")])
+        r, _ = self.run_one(self.merged_pr(), [self.CM, enq, self.MERGE], cm=[commit("c1", "x", "w")])
         self.assertEqual((r["north"], r["attribution"]["steward_merge_recognised"]), ("autonomous", True))
 
     def enq(self, hm, kind="added_to_merge_queue", login="shipyard-local[bot]"):
         return {"event": kind, "actor": {"login": login}, "created_at": T(10, hm)}
 
     def test_an_ejected_enqueue_followed_by_a_manual_merge_is_an_owner_action(self):
-        tl = [self.enq("10:40"), dict(self.enq("10:45", "removed_from_merge_queue"), reason="failed_checks"), self.MERGE]
+        tl = [self.CM, self.enq("10:40"), dict(self.enq("10:45", "removed_from_merge_queue"), reason="failed_checks"), self.MERGE]
         r, _ = self.run_one(self.merged_pr(), tl, cm=[commit("c1", "x", "w")])
         self.assertEqual((r["north"], r["attribution"]["steward_merge_recognised"]), ("owner_action", False))
 
     def test_an_enqueue_then_a_hold_then_a_manual_merge_is_an_owner_action(self):
         hold = dict(self.app_comment("verdict: HOLD head:" + HEAD), created_at=T(10, "10:50"))
-        r, _ = self.run_one(self.merged_pr(), [self.enq("10:40"), hold, self.MERGE], cm=[commit("c1", "x", "w")])
+        r, _ = self.run_one(self.merged_pr(), [self.CM, self.enq("10:40"), hold, self.MERGE], cm=[commit("c1", "x", "w")])
         self.assertEqual(r["north"], "owner_action")
 
     def test_a_new_enqueue_after_an_ejection_that_leads_to_the_merge_is_a_steward_merge(self):
-        tl = [self.enq("10:40"), dict(self.enq("10:45", "removed_from_merge_queue"), reason="failed_checks"), self.enq("10:50"), self.MERGE]
+        tl = [self.CM, self.enq("10:40"), dict(self.enq("10:45", "removed_from_merge_queue"), reason="failed_checks"), self.enq("10:50"), self.MERGE]
         r, _ = self.run_one(self.merged_pr(), tl, cm=[commit("c1", "x", "w")])
         self.assertEqual((r["north"], r["attribution"]["steward_merge_recognised"]), ("autonomous", True))
 
-    def test_an_enqueue_of_an_older_head_is_not_evidence_for_the_merged_head(self):
-        r, _ = self.run_one(self.merged_pr(), [self.enq("10:40"), self.MERGE], cm=[commit("c1", "x", "w", date=T(10, "10:50"))])
-        self.assertEqual(r["north"], "owner_action")
-        push = {"event": "head_ref_force_pushed", "actor": {"login": "x"}, "created_at": T(10, "10:50"), "after_sha": HEAD}
-        r, _ = self.run_one(self.merged_pr(), [self.enq("10:40"), push, self.MERGE], cm=[commit("c1", "x", "w")])
-        self.assertEqual(r["north"], "owner_action")
+    CM = {"event": "committed", "sha": HEAD}
+
+    def test_a_clock_skewed_commit_timestamp_does_not_change_the_classification(self):
+        for date in (T(1, "00:00"), T(10, "10:50"), T(30, "23:00")):
+            r, _ = self.run_one(self.merged_pr(), [self.CM, self.enq("10:40"), self.MERGE], cm=[commit("c1", "x", "w", date=date)])
+            self.assertEqual((r["north"], r["attribution"]["steward_merge_recognised"]), ("autonomous", True))
+
+    def test_a_later_push_of_an_older_commit_after_the_enqueue_is_never_steward(self):
+        older = {"event": "committed", "sha": "c" * 40}
+        r, _ = self.run_one(self.merged_pr(), [self.CM, self.enq("10:40"), older, self.MERGE], cm=[commit("c1", "x", "w", date=T(1, "00:00"))])
+        self.assertEqual((r["attribution"]["steward_merge_recognised"], r["north"]), (False, "owner_action"))
+        forced = {"event": "head_ref_force_pushed", "actor": {"login": "x"}, "created_at": T(1, "00:00"), "after_sha": HEAD}
+        r, _ = self.run_one(self.merged_pr(), [self.CM, self.enq("10:40"), forced, self.MERGE], cm=[commit("c1", "x", "w")])
+        self.assertEqual(r["attribution"]["steward_merge_recognised"], False)
+
+    def test_an_enqueue_the_timeline_cannot_bind_to_the_merged_sha_is_unknown_and_counted_apart(self):
+        # no commit event at all, or the head then was another SHA with no later push
+        for tl in ([self.enq("10:40"), self.MERGE], [{"event": "committed", "sha": "d" * 40}, self.enq("10:40"), self.MERGE]):
+            r, out = self.run_one(self.merged_pr(), tl, cm=[commit("c1", "x", "w")])
+            self.assertEqual((r["north"], r["attribution"]["steward_merge_recognised"], r["attribution"]["merge_unverified"]), ("unknown", False, True))
+            a = out["repos"][REPO]["per_day"]["2026-11-10"]["attribution"]
+            self.assertEqual((a["owner_merges_unverified"], a["steward_merges_recognised"]), (1, 0))
+            ns = out["repos"][REPO]["per_day"]["2026-11-10"]["north_star"]
+            self.assertEqual((ns["owner_action"], ns["autonomous"], ns["unknown"]), (0, 0, 1))
 
     def test_an_approval_followed_by_an_ejection_is_not_evidence(self):
         gone = dict(self.enq("10:45", "removed_from_merge_queue"), reason="failed_checks")
@@ -523,7 +541,7 @@ class Attribution(Base):
         return {"event": "reviewed", "id": rid, "state": state, "user": {"login": "shipyard-local[bot]"}, "submitted_at": T(10, hm), "body": body}
 
     def test_a_review_based_approve_then_an_enqueue_then_a_merge_is_a_steward_merge(self):
-        r, _ = self.run_one(self.merged_pr(), [self.review(self.APPROVE), self.enq("10:40"), self.MERGE], cm=[commit("c1", "x", "w")])
+        r, _ = self.run_one(self.merged_pr(), [self.review(self.APPROVE), self.CM, self.enq("10:40"), self.MERGE], cm=[commit("c1", "x", "w")])
         self.assertEqual((r["north"], r["attribution"]["steward_merge_recognised"]), ("autonomous", True))
         r, _ = self.run_one(self.merged_pr(), [self.review(self.APPROVE), self.MERGE], cm=[commit("c1", "x", "w")])
         self.assertEqual(r["attribution"]["steward_merge_recognised"], True)  # the approval alone counts too
@@ -565,7 +583,7 @@ class Attribution(Base):
 
     def test_an_incomplete_timeline_is_not_cached_and_is_read_again(self):
         p = self.merged_pr()
-        tl = {1: self.long_timeline([self.enq("10:40"), self.MERGE])}
+        tl = {1: self.long_timeline([self.CM, self.enq("10:40"), self.MERGE])}
         gh = world([p], tl, {1: [commit("c1", "x", "w")]})
         out = self.build(gh)
         self.assertFalse(os.path.exists(os.path.join(self.cache, REPO.replace("/", "__"), "facts", "1.json")))
@@ -588,21 +606,21 @@ class Attribution(Base):
         self.assertTrue([c for c in gh.calls if "timeline" in c])
 
     def test_an_incomplete_timeline_with_an_apparent_steward_path_is_not_a_steward_merge(self):
-        tl = {1: self.long_timeline([self.enq("10:40"), self.MERGE])}
+        tl = {1: self.long_timeline([self.CM, self.enq("10:40"), self.MERGE])}
         r = self.rows(self.build(world([self.merged_pr()], tl, {1: [commit("c1", "x", "w")]})))[1]
         self.assertEqual((r["attribution"]["steward_merge_recognised"], r["north"]), (False, "unknown"))
         # the same events read in full are a steward merge
-        r, _ = self.run_one(self.merged_pr(), [self.enq("10:40"), self.MERGE], cm=[commit("c1", "x", "w")])
+        r, _ = self.run_one(self.merged_pr(), [self.CM, self.enq("10:40"), self.MERGE], cm=[commit("c1", "x", "w")])
         self.assertEqual((r["attribution"]["steward_merge_recognised"], r["north"]), (True, "autonomous"))
 
     def test_incomplete_commits_with_an_apparent_steward_path_are_not_a_steward_merge(self):
-        gh = world([self.merged_pr()], {1: [self.enq("10:40"), self.MERGE]}, {1: self.long_commits()})
+        gh = world([self.merged_pr()], {1: [self.CM, self.enq("10:40"), self.MERGE]}, {1: self.long_commits()})
         r = self.rows(self.build(gh))[1]
         self.assertEqual((r["attribution"]["steward_merge_recognised"], r["north"]), (False, "unknown"))
 
     def test_a_partial_read_does_not_hide_a_definite_owner_action(self):
         label = {"event": "labeled", "actor": {"login": OWNER}, "created_at": T(10, "10:30")}
-        tl = {1: self.long_timeline([label, self.enq("10:40"), self.MERGE])}
+        tl = {1: self.long_timeline([label, self.CM, self.enq("10:40"), self.MERGE])}
         r = self.rows(self.build(world([self.merged_pr()], tl, {1: [commit("c1", "x", "w")]})))[1]
         self.assertEqual(r["north"], "owner_action")
 
