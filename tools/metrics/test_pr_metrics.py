@@ -2,6 +2,7 @@ import datetime as dt
 import json
 import os
 import re
+import base64
 import shutil
 import sys
 import tempfile
@@ -48,6 +49,10 @@ class Fake:
         raise pm.ReadError("no route " + path)
 
 
+CONFIG = ('[auto_merge]\nreviewer_signers = ["rev"]\nreviewer_stamp_sessions = ["fleet-pass-reviewer-*"]\n')
+HEAD = "a" * 40
+
+
 def world(prs, timelines=None, commits=None, base_commits=None, runs=None, jobs=None, checks=None, required=("Test",), default_checks=True):
     timelines, commits, jobs, checks = timelines or {}, commits or {}, jobs or {}, checks or {}
     routes = [(r"pulls\?state=all", prs)]
@@ -64,6 +69,7 @@ def world(prs, timelines=None, commits=None, base_commits=None, runs=None, jobs=
         routes.append((rf"commits/{sha}/check-runs", (lambda path, cr=cr: {"check_runs": cr(path)}) if callable(cr) else {"check_runs": cr}))
     if default_checks:
         routes.append((r"commits/[^/]+/check-runs", {"check_runs": [{"name": "Test", "status": "completed", "conclusion": "success"}]}))
+    routes.append((r"contents/\.shipyard/config\.toml", {"content": base64.b64encode(CONFIG.encode()).decode()}))
     routes.append((r"rules/branches/main", [{"type": "required_status_checks",
                                               "parameters": {"required_status_checks": [{"context": c} for c in required]}}]))
     return Fake(routes)
@@ -424,13 +430,59 @@ class Attribution(Base):
         self.assertEqual((r["north"], r["attribution"]["agent_owner_events"], r["attribution"]["primary"]), ("autonomous", 1, "session_stamp"))
         self.assertEqual(out["repos"][REPO]["per_day"]["2026-11-10"]["attribution"]["agent_stamped_owner_events"], 1)
 
-    def test_owner_merge_of_a_pr_in_the_steward_path_is_a_steward_merge(self):
-        merge = {"event": "merged", "actor": {"login": OWNER}, "created_at": T(10, "11:00")}
-        verdict = {"event": "commented", "user": {"login": "reviewer[bot]"}, "created_at": T(10, "10:30"), "body": "verdict: APPROVE head:abcdef1234567"}
-        r, _ = self.run_one(self.opened(), [verdict, merge], cm=[commit("c1", "x", "w")])
+    MERGE = {"event": "merged", "actor": {"login": OWNER}, "created_at": T(10, "11:00")}
+
+    def app_comment(self, body, login="shipyard-local[bot]"):
+        return {"event": "commented", "user": {"login": login}, "created_at": T(10, "10:30"), "body": body}
+
+    def merged_pr(self, login=OWNER):
+        p = self.opened(login)
+        p["head"] = {"sha": HEAD}
+        return p
+
+    APPROVE = ("reviewer: rev\n<!-- session: m3/fleet-pass-reviewer-7 -->\nverdict: APPROVE head:" + HEAD)
+
+    def test_a_trusted_app_approve_with_a_session_stamp_makes_an_owner_merge_a_steward_merge(self):
+        r, _ = self.run_one(self.merged_pr(), [self.app_comment(self.APPROVE), self.MERGE], cm=[commit("c1", "x", "w")])
         self.assertEqual((r["north"], r["attribution"]["steward_merge_recognised"], r["attribution"]["legacy_north"]), ("autonomous", True, "owner_action"))
-        r, _ = self.run_one(self.opened("shipyard-local[bot]"), [merge])  # opened through the App
-        self.assertEqual((r["north"], r["owner_actions"]), ("autonomous", 0))
+
+    def test_an_app_enqueue_event_makes_an_owner_merge_a_steward_merge(self):
+        enq = {"event": "added_to_merge_queue", "actor": {"login": "shipyard-local[bot]"}, "created_at": T(10, "10:40")}
+        r, _ = self.run_one(self.merged_pr(), [enq, self.MERGE], cm=[commit("c1", "x", "w")])
+        self.assertEqual((r["north"], r["attribution"]["steward_merge_recognised"]), ("autonomous", True))
+
+    def test_an_enqueue_by_anyone_but_the_app_is_not_evidence(self):
+        enq = {"event": "added_to_merge_queue", "actor": {"login": "someone"}, "created_at": T(10, "10:40")}
+        r, _ = self.run_one(self.merged_pr(), [enq, self.MERGE], cm=[commit("c1", "x", "w")])
+        self.assertEqual(r["north"], "owner_action")
+
+    def test_an_owner_merge_after_a_hold_stays_owner_action(self):
+        hold = self.app_comment("<!-- session: m3/fleet-pass-reviewer-7 -->\nverdict: HOLD head:" + HEAD)
+        r, _ = self.run_one(self.merged_pr(), [hold, self.MERGE], cm=[commit("c1", "x", "w")])
+        self.assertEqual((r["north"], r["attribution"]["steward_merge_recognised"]), ("owner_action", False))
+        # an approval does not outlive an App HOLD at the same head
+        r, _ = self.run_one(self.merged_pr(), [self.app_comment(self.APPROVE), hold, self.MERGE], cm=[commit("c1", "x", "w")])
+        self.assertEqual(r["north"], "owner_action")
+
+    def test_an_untrusted_user_posting_an_approve_does_not_make_a_steward_merge(self):
+        for body, login in ((self.APPROVE, "someone"), (self.APPROVE, OWNER),
+                            ("verdict: APPROVE head:" + HEAD, "shipyard-local[bot]"),  # unsigned, unstamped
+                            ("reviewer: nobody\n<!-- session: m3/fleet-pass-reviewer-7 -->\nverdict: APPROVE head:" + HEAD, "shipyard-local[bot]"),
+                            ("reviewer: rev\n<!-- session: m3/some-lane -->\nverdict: APPROVE head:" + HEAD, "shipyard-local[bot]"),
+                            (self.APPROVE.replace(HEAD, "b" * 40), "shipyard-local[bot]")):  # not the merged head
+            r, _ = self.run_one(self.merged_pr(), [self.app_comment(body, login), self.MERGE], cm=[commit("c1", "x", "w")])
+            self.assertEqual((r["north"], body[:30]), ("owner_action", body[:30]))
+
+    def test_a_pr_with_no_readable_policy_trusts_no_approval(self):
+        gh = world([self.merged_pr()], {1: [self.app_comment(self.APPROVE), self.MERGE]}, {1: [commit("c1", "x", "w")]})
+        gh.routes = [x for x in gh.routes if "contents" not in x[0]]
+        out = self.build(gh)
+        self.assertEqual(self.rows(out)[1]["north"], "owner_action")
+        self.assertEqual(out["repos"][REPO]["read_errors"], 0)
+
+    def test_app_opened_alone_is_not_evidence_for_an_owner_merge(self):
+        r, _ = self.run_one(self.opened("shipyard-local[bot]"), [self.MERGE])
+        self.assertEqual(r["north"], "owner_action")
 
     def test_owner_merge_with_no_steward_path_and_no_signal_is_a_human_merge(self):
         merge = {"event": "merged", "actor": {"login": OWNER}, "created_at": T(10, "11:00")}
@@ -462,9 +514,6 @@ class Attribution(Base):
         talk = {"event": "commented", "user": {"login": "someone"}, "created_at": T(10, "10:30"), "body": "No verdict: tests pending"}
         r, _ = self.run_one(self.opened(), [talk, merge], cm=[commit("c1", "x", "w")])
         self.assertEqual((r["north"], r["attribution"]["steward_merge_recognised"]), ("owner_action", False))
-        real = dict(talk, body="verdict: APPROVE head:abcdef1234567")
-        r, _ = self.run_one(self.opened(), [real, merge], cm=[commit("c1", "x", "w")])
-        self.assertEqual(r["north"], "autonomous")
 
     def test_the_legacy_rule_counts_stamped_owner_events_as_owner_actions(self):
         tl = [{"event": "commented", "user": {"login": OWNER}, "created_at": T(10, "10:30"), "body": "<!-- session: m5/abc -->"}]

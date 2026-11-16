@@ -25,6 +25,9 @@ import os
 import re
 import statistics
 import subprocess
+import sys
+import base64
+import importlib.util
 
 UTC = dt.timezone.utc
 WINDOW = dt.timedelta(days=7)
@@ -44,10 +47,12 @@ AGENT_TRAILER_RE = re.compile(
 APP_OPENERS = {"shipyard-local[bot]"}
 PROVENANCE_RE = re.compile(r"<!--\s*(shipyard-owner|whence)\b", re.I)
 STAMP_RE = re.compile(r"<!--\s*session:\s*\S+", re.I)
-VERDICT_RE = re.compile(r"^\s*[*_#> ]*verdict\s*:\s*(APPROVE|HOLD)\b[^\n]*\bhead\s*:\s*[0-9a-f]{7,40}\b", re.I | re.M)
+GUARD_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "scripts", "ghapp_queue_arm_guard.py")
+APP_LOGINS = {"shipyard-local[bot]", "shipyard-local"}
+_GUARD = []
 SIGNALS = ("app_opener", "provenance", "trailer", "session_stamp")
 BAD_CONCLUSIONS = {"failure", "timed_out"}
-FACTS_VERSION = 4
+FACTS_VERSION = 5
 CHECKS_VERSION = 2  # derived correctness caches: entries written before this (incomplete pagination read as clean) are read again
 ESCAPE_WINDOW = dt.timedelta(days=14)
 HORIZON = dt.timedelta(hours=48)
@@ -118,6 +123,7 @@ class Reader:
         self.root = os.path.join(cache_dir, repo.replace("/", "__"))
         self.truncated = False
         self.errors = 0
+        self.policies = {}
 
     def get(self, path):
         if self.calls >= self.cap:
@@ -168,6 +174,93 @@ def commit_date(c):
     return iso(((c.get("commit") or {}).get("committer") or {}).get("date"))
 
 
+def guard():
+    """The queue-arm guard module, loaded by path: its verdict and approval rules are the ones that count
+    approvals everywhere else, so the scorecard reuses them instead of copying them."""
+    if not _GUARD:
+        spec = importlib.util.spec_from_file_location("ghapp_queue_arm_guard", GUARD_PATH)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules.setdefault("ghapp_queue_arm_guard", mod)
+        spec.loader.exec_module(mod)
+        _GUARD.append(mod)
+    return _GUARD[0]
+
+
+def trust_policy(rd, base):
+    """The base's review policy, or None when it cannot be read or does not configure both `reviewer_signers`
+    and `reviewer_stamp_sessions`. None means no approval is trusted (fail closed). One read per repo and base."""
+    cached = rd.policies.get(base, 0)
+    if cached != 0:
+        return cached
+    pol = None
+    try:
+        before = rd.errors
+        try:
+            d = rd.get(f"contents/.shipyard/config.toml?ref={base}")
+        finally:
+            rd.errors = before  # a repo with no config is an answer, not a read error
+        text = base64.b64decode(d.get("content") or "").decode("utf-8")
+        g = guard()
+        saved = os.environ.get(g.SIGNERS_FROM_BASE_ENV)
+        os.environ[g.SIGNERS_FROM_BASE_ENV] = "1"  # the repository-side rule: no host file is read
+        try:
+            p = g.review_policy(text, rd.repo, False)
+        finally:
+            if saved is None:
+                os.environ.pop(g.SIGNERS_FROM_BASE_ENV, None)
+            else:
+                os.environ[g.SIGNERS_FROM_BASE_ENV] = saved
+        if p.get("signers") and p.get("stamp_sessions"):
+            pol = p
+    except Truncated:
+        raise
+    except Exception:  # unreadable or unparsable: no approval is trusted
+        pol = None
+    rd.policies[base] = pol
+    return pol
+
+
+def trusted_steward_evidence(rd, pr, tl):
+    """True only with trusted evidence the steward path ran: an enqueue performed by the fleet App, or an APPROVE at the
+    merged head that the guard's own rules count (posted by the App, a configured signer, a configured reviewer session
+    stamp) with no App HOLD at that head. Discussion text, a spoofed verdict and a HOLD never count."""
+    g = guard()
+    head = pr["head"]["sha"]
+    merged = iso(pr.get("merged_at"))
+    pol, approved, held = None, False, False
+    for e in tl:
+        login = ((e.get("actor") or e.get("user") or {}).get("login") or "").lower()
+        if login not in APP_LOGINS:
+            continue
+        if e.get("event") in ("added_to_merge_queue", "enqueued"):
+            return True
+        if e.get("event") != "commented":
+            continue
+        body = e.get("body") or ""
+        v = g.marker_verdict(body)
+        if not v or v[1] != head:
+            continue
+        ts = iso(e.get("created_at"))
+        if merged and ts and ts > merged:
+            continue
+        if v[0] == "HOLD":
+            held = True
+        elif v[0] == "APPROVE":
+            if pol is None:
+                pol = trust_policy(rd, pr["base"]["ref"]) or False
+            saved = os.environ.get(g.SIGNERS_FROM_BASE_ENV)
+            os.environ[g.SIGNERS_FROM_BASE_ENV] = "1"
+            try:
+                ok = bool(pol) and g.app_approval_refusal(body, pol) is None
+            finally:
+                if saved is None:
+                    os.environ.pop(g.SIGNERS_FROM_BASE_ENV, None)
+                else:
+                    os.environ[g.SIGNERS_FROM_BASE_ENV] = saved
+            approved = approved or ok
+    return approved and not held
+
+
 def pr_facts(rd, pr, owner):
     """Timeline and commits of one PR (merged or not), reduced to what the metrics need."""
     n = pr["number"]
@@ -185,7 +278,7 @@ def pr_facts(rd, pr, owner):
     else:
         ready = None if pr.get("draft") else created
     owner_events, agent_events, repairs, holds, ejections, enqueues = [], [], [], [], [], 0
-    steward_path, stamp = False, bool(STAMP_RE.search(pr.get("body") or ""))
+    steward_path, stamp = trusted_steward_evidence(rd, pr, tl), bool(STAMP_RE.search(pr.get("body") or ""))
     for e in tl:
         ev, ts = e.get("event"), e.get("created_at") or e.get("submitted_at")
         body = e.get("body") or ""
@@ -196,9 +289,6 @@ def pr_facts(rd, pr, owner):
                 holds.append(ts)
         if ev in ("added_to_merge_queue", "enqueued"):
             enqueues += 1
-            steward_path = True
-        if ev in ("commented", "reviewed") and VERDICT_RE.search(body):
-            steward_path = True  # a verdict was posted: the steward's review path
         if ev in ("removed_from_merge_queue", "dequeued") and (e.get("reason") or "unknown") != "merged":
             ejections.append(e.get("reason") or "unknown")
         if ev not in ACTION_EVENTS:
@@ -282,15 +372,15 @@ def attribution(f):
 
 def effective_owner_events(f, attributed=True):
     """The owner events that are a human's. Without attribution every owner-account event counts.
-    With it, a merge by the owner account on a PR that was in the steward's enqueue or verdict path, or
-    that carries a tier 1 or 2 signal (it came through `shipyard pr`), is a steward merge: in user-owned
-    repos the steward merges under the owner account, so the account alone cannot tell it from a human.
+    With it, a merge by the owner account is a steward merge only with trusted evidence (see
+    trusted_steward_evidence): in user-owned repos the steward merges under the owner account, so the
+    account alone cannot tell it from a human, and no PR-level signal stands in for the evidence.
     Returns (events, steward_merges_dropped)."""
     ev = f["owner_events"]
     if not attributed:  # the earlier rule: every owner-account event, stamped ones included
         return sorted(ev + list(f.get("agent_events") or []), key=lambda e: iso(e[1])), 0
     a = attribution(f)
-    steward = f.get("steward_path") or (a["primary"] in ("app_opener", "provenance"))
+    steward = bool(f.get("steward_path"))
     keep = [e for e in ev if not (e[0] == "merged" and steward)]
     return keep, len(ev) - len(keep)
 
