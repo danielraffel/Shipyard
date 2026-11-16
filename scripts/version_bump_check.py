@@ -387,7 +387,9 @@ def _cargo_package(manifest: dict) -> tuple[str, str]:
 def _cargo_manifest_locked(text: str, vfs: list[VersionFile]) -> dict:
     """The parts of a Cargo.toml a pull request may not change."""
     manifest = _toml(text)
-    _, version = _cargo_package(manifest)
+    crate, version = _cargo_package(manifest)
+    if cargo_crate_name(text) != crate:
+        raise _Unreadable("the lockfile updater disagrees with Cargo's package name")
     readers = [vf for vf in vfs if vf.kind == "regex" and vf.pattern]
     if not readers:
         raise _Unreadable("no configured version reader for Cargo.toml")
@@ -439,7 +441,12 @@ def _locked_parts(
         if manifest is None:
             raise _Unreadable("Cargo.lock without a Cargo.toml beside it")
         crate, _ = _cargo_package(_toml(manifest))
-        return _cargo_lock_own_version(text, crate)
+        version = _cargo_lock_own_version(text, crate)
+        probe = "0.0.0-version-gate-probe"
+        updated = _updated_cargo_lock_text(text, crate, probe)
+        if updated is None or _cargo_lock_own_version(updated, crate) != probe:
+            raise _Unreadable("the lockfile updater cannot update the own entry")
+        return version
     if name == "Cargo.toml":
         return _cargo_manifest_locked(text, vfs)
     raise _Unreadable("version files other than Cargo.toml and Cargo.lock are refused whole")
@@ -535,6 +542,27 @@ def cargo_crate_name(manifest_text: str) -> str | None:
     return m.group(1) if m else None
 
 
+def _updated_cargo_lock_text(text: str, crate: str, new: str) -> str | None:
+    """Apply the lock updater in memory, or refuse an ambiguous match."""
+    blocks = text.split("[[package]]")
+    rewritten: list[str] = []
+    changed = 0
+    for block in blocks:
+        if (
+            re.search(rf'(?m)^name\s*=\s*"{re.escape(crate)}"$', block)
+            and not re.search(r"(?m)^source\s*=", block)
+        ):
+            block, count = re.subn(
+                r'(?m)^(version\s*=\s*")([^"]+)(")',
+                lambda m: f"{m.group(1)}{new}{m.group(3)}",
+                block,
+                count=1,
+            )
+            changed += count
+        rewritten.append(block)
+    return "[[package]]".join(rewritten) if changed == 1 else None
+
+
 def refresh_cargo_lock(repo: Path, manifest_rel: str, new: str) -> str | None:
     """Point Cargo.lock's own entry for this crate at `new`.
 
@@ -561,29 +589,13 @@ def refresh_cargo_lock(repo: Path, manifest_rel: str, new: str) -> str | None:
         return None
 
     text = lock.read_text()
-    # Split on the block delimiter, keeping it, so each chunk is one package.
-    blocks = text.split("[[package]]")
-    rewritten: list[str] = []
-    changed = 0
-    for block in blocks:
-        if (
-            re.search(rf'(?m)^name\s*=\s*"{re.escape(crate)}"$', block)
-            and not re.search(r"(?m)^source\s*=", block)
-        ):
-            block, count = re.subn(
-                r'(?m)^(version\s*=\s*")([^"]+)(")',
-                lambda m: f"{m.group(1)}{new}{m.group(3)}",
-                block,
-                count=1,
-            )
-            changed += count
-        rewritten.append(block)
     # Exactly one workspace-member entry must match. Zero means the lock does not
     # describe this crate; more than one is ambiguous. Either way, leave the file
     # alone and let the build fail loudly rather than guess.
-    if changed != 1:
+    rewritten = _updated_cargo_lock_text(text, crate, new)
+    if rewritten is None:
         return None
-    lock.write_text("[[package]]".join(rewritten))
+    lock.write_text(rewritten)
     try:
         return str(lock.relative_to(repo))
     except ValueError:

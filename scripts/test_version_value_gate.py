@@ -116,6 +116,22 @@ class VersionValueGateTests(unittest.TestCase):
 
     # Cargo.toml and Cargo.lock
 
+    def test_updater_incompatible_cargo_quoting_is_refused(self) -> None:
+        for path, old, new in (
+            ("Cargo.toml", 'name = "shipyard"', "name = 'shipyard'"),
+            ("Cargo.lock", 'name = "shipyard"', "name = 'shipyard'"),
+            ("Cargo.lock", 'version = "0.292.0"', "version = '0.292.0'"),
+        ):
+            with self.subTest(path=path, new=new):
+                original = (self.repo / path).read_text()
+                self.edit(path, old, new)
+                self.commit()
+                try:
+                    self.assert_refused(path)
+                finally:
+                    run(self.repo, "git", "reset", "--hard", "-q", self.base)
+                self.assertEqual((self.repo / path).read_text(), original)
+
     def test_dependency_only_edit_passes(self) -> None:
         self.edit("Cargo.toml", 'serde = "1.0"\n', 'serde = "1.0"\nanyhow = "1"\n')
         self.edit("Cargo.lock", "[[package]]\nname = \"shipyard\"",
