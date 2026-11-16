@@ -39,13 +39,20 @@ ACTION_EVENTS = {
 AGENT_TRAILER_RE = re.compile(
     r"co-authored-by:[^\n]*(claude|codex|anthropic|openai|copilot)|generated with[^\n]*(claude|codex)"
     r"|^(version-bump|skill-update|release)\s*:", re.I | re.M)
+# Agent-authorship signals, strongest first. A PR carrying any of them is agent work even when its commits
+# carry the owner's git identity, which is how agents commit on this fleet.
+APP_OPENERS = {"shipyard-local[bot]"}
+PROVENANCE_RE = re.compile(r"<!--\s*(shipyard-owner|whence)\b", re.I)
+STAMP_RE = re.compile(r"<!--\s*session:\s*\S+", re.I)
+VERDICT_RE = re.compile(r"^\s*[*_#> ]*(APPROVE[D]?|HOLD)\b|verdict\s*:", re.I | re.M)
+SIGNALS = ("app_opener", "provenance", "trailer", "session_stamp")
 BAD_CONCLUSIONS = {"failure", "timed_out"}
-FACTS_VERSION = 3
+FACTS_VERSION = 4
 ESCAPE_WINDOW = dt.timedelta(days=14)
 HORIZON = dt.timedelta(hours=48)
 MIN_SAMPLE = 50
 UNKNOWN_RANGE_SHARE = 0.20
-SCORECARD_VERSION = "2026-11-15.1"
+SCORECARD_VERSION = "2026-11-16.1"
 MERGE_MAIN_RE = re.compile(r"^Merge (remote-tracking )?branch '?(origin/)?(main|master)'?|^Merge pull request .* from .*/main", re.I)
 # Positive controls: a real revert (#124 reverted #119), a real escaped defect (#126 names #116).
 DEFAULT_CONTROLS = {"danielraffel/fleet-handbook": {"revert": [(119, 124)], "escape": [(116, 126)]}}  # "owner": [pr, ...] pins PRs with a hand-verified owner action
@@ -176,7 +183,8 @@ def pr_facts(rd, pr, owner):
         ready = created
     else:
         ready = None if pr.get("draft") else created
-    owner_events, repairs, holds, ejections, enqueues = [], [], [], [], 0
+    owner_events, agent_events, repairs, holds, ejections, enqueues = [], [], [], [], [], 0
+    steward_path, stamp = False, bool(STAMP_RE.search(pr.get("body") or ""))
     for e in tl:
         ev, ts = e.get("event"), e.get("created_at") or e.get("submitted_at")
         body = e.get("body") or ""
@@ -187,22 +195,34 @@ def pr_facts(rd, pr, owner):
                 holds.append(ts)
         if ev in ("added_to_merge_queue", "enqueued"):
             enqueues += 1
+            steward_path = True
+        if ev in ("commented", "reviewed") and VERDICT_RE.search(body):
+            steward_path = True  # a verdict was posted: the steward's review path
         if ev in ("removed_from_merge_queue", "dequeued") and (e.get("reason") or "unknown") != "merged":
             ejections.append(e.get("reason") or "unknown")
         if ev not in ACTION_EVENTS:
             continue
         who = ((e.get("actor") or e.get("user") or {}).get("login") or "")
         if who.lower() == owner.lower() and ts:
-            owner_events.append([ev, ts])
+            if STAMP_RE.search(body) or PROVENANCE_RE.search(body):
+                # an agent speaking under the owner's account: not an owner action, and a signal of its own
+                agent_events.append([ev, ts])
+                stamp = True
+            else:
+                owner_events.append([ev, ts])
     heads = {pr["head"]["sha"]}
     for e in tl:
         if e.get("event") == "head_ref_force_pushed":
             heads.update(x for x in (e.get("before_sha"), e.get("after_sha")) if x)
-    ambiguous, pushes = [], {}
+    ambiguous, pushes, trailer = [], {}, False
     for c in commits:
         heads.add(c["sha"])
         d = commit_date(c)
         msg = (c.get("commit") or {}).get("message") or ""
+        if AGENT_TRAILER_RE.search(msg):
+            trailer = True
+        if STAMP_RE.search(msg):
+            stamp = True
         logins = {((c.get("author") or {}).get("login") or "").lower(), ((c.get("committer") or {}).get("login") or "").lower()}
         if owner.lower() in logins and not AGENT_TRAILER_RE.search(msg) and d:
             ambiguous.append(fmt(d))
@@ -225,7 +245,9 @@ def pr_facts(rd, pr, owner):
         "v": FACTS_VERSION, "number": n, "base": pr["base"]["ref"], "created_at": fmt(created),
         "merged_at": fmt(merged) if merged else None, "state": pr.get("state"),
         "merge_commit_sha": pr.get("merge_commit_sha"), "first_ready": fmt(ready) if ready else None,
-        "owner_events": owner_events, "ambiguous_commits": sorted(set(ambiguous)),
+        "owner_events": owner_events, "agent_events": agent_events, "steward_path": steward_path,
+        "opener": (pr.get("user") or {}).get("login"), "provenance": bool(PROVENANCE_RE.search(pr.get("body") or "")),
+        "agent_trailer": trailer, "stamp": stamp, "ambiguous_commits": sorted(set(ambiguous)),
         "repair_cycles": len(repairs), "holds": len(holds), "re_holds": re_holds, "size": size,
         "pushes": split, "enqueues": enqueues, "ejections": ejections,
         "labels": sorted(l["name"] for l in pr.get("labels") or []),
@@ -247,26 +269,66 @@ def eligible(f, managed_base):
     return True, None
 
 
-def north_star(f, commits=True):
+def attribution(f):
+    """The agent-authorship signals a PR carries, strongest first: opened by the fleet App, `shipyard pr`
+    provenance in the body, an agent Co-Authored-By (or Version-Bump style) trailer, an agent session stamp.
+    `primary` is the first that applies; every one that applies is listed so the attribution can be audited."""
+    have = {"app_opener": (f.get("opener") or "").lower() in APP_OPENERS, "provenance": bool(f.get("provenance")),
+            "trailer": bool(f.get("agent_trailer")), "session_stamp": bool(f.get("stamp"))}
+    sig = [k for k in SIGNALS if have[k]]
+    return {"signals": sig, "primary": sig[0] if sig else None}
+
+
+def effective_owner_events(f, attributed=True):
+    """The owner events that are a human's. Without attribution every owner-account event counts.
+    With it, a merge by the owner account on a PR that was in the steward's enqueue or verdict path, or
+    that carries a tier 1 or 2 signal (it came through `shipyard pr`), is a steward merge: in user-owned
+    repos the steward merges under the owner account, so the account alone cannot tell it from a human.
+    Returns (events, steward_merges_dropped)."""
+    ev = f["owner_events"]
+    if not attributed:
+        return ev, 0
+    a = attribution(f)
+    steward = f.get("steward_path") or (a["primary"] in ("app_opener", "provenance"))
+    keep = [e for e in ev if not (e[0] == "merged" and steward)]
+    return keep, len(ev) - len(keep)
+
+
+def north_star(f, commits=True, attributed=True):
     """autonomous, owner_action, unknown or not_merged for one ready PR, over the 48h horizon.
 
-    autonomous: merged within 48h of ready with no owner event between ready and merge.
-    owner_action: an owner-account timeline event in that interval.
-    unknown: merged in time with no such event, but an owner-identity commit with no agent trailer
-        (commits=True), or a timeline or commit list not read in full.
+    autonomous: merged within 48h of ready with no human owner event between ready and merge.
+    owner_action: a human owner-account timeline event in that interval (see effective_owner_events).
+    unknown: merged in time with no such event, but an owner-identity commit with no agent trailer and
+        no agent signal on the PR at all (commits=True), or a timeline or commit list not read in full.
     not_merged: not merged within 48h and no owner event.
-    commits=False ignores commits: only GitHub-side owner actions count."""
+    commits=False ignores commits: only GitHub-side owner actions count.
+    attributed=False is the earlier rule (every owner-account event is an owner action, owner-identity
+    commits make a PR unknown), kept so a change can be shown against it."""
     r = iso(f["first_ready"])
     h = r + HORIZON
     m = iso(f.get("merged_at"))
     end = min(m, h) if m else h
-    if any(r <= iso(ts) <= end for _, ts in f["owner_events"]):
+    events, _ = effective_owner_events(f, attributed)
+    if any(r <= iso(ts) <= end for _, ts in events):
         return "owner_action"
     if not m or m > h:
         return "not_merged"
-    if (commits and any(iso(d) <= end for d in f["ambiguous_commits"])) or not (f["timeline_complete"] and f["commits_complete"]):
+    ambiguous = any(iso(d) <= end for d in f["ambiguous_commits"])
+    if attributed and attribution(f)["primary"]:
+        ambiguous = False
+    if (commits and ambiguous) or not (f["timeline_complete"] and f["commits_complete"]):
         return "unknown"
     return "autonomous"
+
+
+def row_attribution(f):
+    a = attribution(f)
+    _, stew = effective_owner_events(f)
+    return {"signals": a["signals"], "primary": a["primary"], "steward_merge_recognised": bool(stew),
+            "agent_owner_events": len(f.get("agent_events") or []),
+            "owner_identity_commits": bool(f["ambiguous_commits"]),
+            "legacy_north": north_star(f, attributed=False)}
 
 
 # --------------------------------------------------------------- compute
@@ -481,6 +543,29 @@ def bucket(size):
     return "unknown" if size is None else "<200" if size < 200 else "200-800" if size <= 800 else ">800"
 
 
+def attribution_summary(rows):
+    """What each agent signal contributed, so the attribution can be audited. `by_primary` counts each PR once, under
+    its strongest signal; `with_signal` counts every PR a signal applies to. `ambiguous_cleared` counts PRs
+    with an owner-identity commit that the earlier rule called unknown and a signal now explains.
+    `legacy` is the earlier rule over the same PRs."""
+    at = [r["attribution"] for r in rows if r.get("attribution")]
+    n = len(rows)
+    legacy = collections.Counter(a["legacy_north"] for a in at)
+    prim = collections.Counter(a["primary"] or "none" for a in at)
+    cleared = collections.Counter(a["primary"] for a, r in ((r["attribution"], r) for r in rows if r.get("attribution"))
+                                  if a["primary"] and a["legacy_north"] == "unknown" and r["north"] != "unknown")
+    return {
+        "by_primary": {k: prim.get(k, 0) for k in SIGNALS + ("none",)},
+        "with_signal": {k: sum(1 for a in at if k in a["signals"]) for k in SIGNALS},
+        "ambiguous_cleared": {k: cleared.get(k, 0) for k in SIGNALS},
+        "steward_merges_recognised": sum(1 for a in at if a["steward_merge_recognised"]),
+        "agent_stamped_owner_events": sum(a["agent_owner_events"] for a in at),
+        "legacy": {"autonomous": legacy["autonomous"], "owner_action": legacy["owner_action"], "unknown": legacy["unknown"],
+                   "not_merged_in_48h": legacy["not_merged"], "rate_pct": pct_of(legacy["autonomous"], n),
+                   "unknown_share_pct": pct_of(legacy["unknown"], n)},
+    }
+
+
 def summarize(rows):
     """The scorecard over a list of eligible ready PRs (one row each)."""
     n = len(rows)
@@ -503,8 +588,10 @@ def summarize(rows):
     bad = [r for r in merged if r["correct"] and r["correct"]["bad"]]
     esc_known = [r for r in merged if r["correct"] and r["correct"].get("escaped") is not None]
     esc = [r for r in esc_known if r["correct"]["escaped"]]
+    attr = attribution_summary(rows)
     return {
         "ready_prs": n, "merged": len(merged),
+        "attribution": attr,
         "north_star": {
             "autonomous": auto, "owner_action": ns["owner_action"], "unknown": unk, "not_merged_in_48h": ns["not_merged"],
             "rate_pct": pct_of(auto, n), "rate_ci95": wilson(auto, n),
@@ -575,6 +662,14 @@ def all_prs(rd, lo, hi):
     return out, False
 
 
+def needs_reread(f, pr):
+    """A cached v3 reduction is re-read only when its classification could change: it has owner events (an
+    agent stamp on one reclassifies it, a merge may be the steward's) or owner-identity commits that no
+    list-level signal already explains."""
+    strong = (((pr.get("user") or {}).get("login") or "").lower() in APP_OPENERS) or bool(PROVENANCE_RE.search(pr.get("body") or ""))
+    return bool(f.get("owner_events")) or (bool(f.get("ambiguous_commits")) and not strong)
+
+
 def collect_repo(repo, cache_dir, cap, owner, lo, hi, now, ticks, tick_ctx, fetch=None, managed_base="main", dirty=()):
     rd = Reader(repo, cache_dir, cap, fetch)
     res = {"repo": repo, "rows": [], "unread": 0, "listing_complete": False, "reads": 0, "truncated": False, "errors": 0}
@@ -587,7 +682,17 @@ def collect_repo(repo, cache_dir, cap, owner, lo, hi, now, ticks, tick_ctx, fetc
     for pr in prs:
         f = rd.load("facts", str(pr["number"]))
         if f is not None and f.get("v") != FACTS_VERSION:
-            f = None  # cached by an older reduction: read again once
+            if f.get("v") == 3 and not needs_reread(f, pr):
+                # nothing in this PR depends on the signals only a re-read gives: keep the cached reduction
+                f.update(v=FACTS_VERSION, agent_events=[], steward_path=False, agent_trailer=None, stamp=None)
+                if f["state"] == "closed":
+                    rd.save("facts", str(pr["number"]), f)
+            else:
+                f = None  # cached by an older reduction: read again once
+        if f is not None:  # the opener and the body come with the PR list, so they are never stale
+            f["opener"] = (pr.get("user") or {}).get("login")
+            f["provenance"] = bool(PROVENANCE_RE.search(pr.get("body") or ""))
+            f["stamp"] = bool(f.get("stamp")) or bool(STAMP_RE.search(pr.get("body") or ""))
         if f is None:
             try:
                 f = pr_facts(rd, pr, owner)
@@ -626,11 +731,12 @@ def collect_repo(repo, cache_dir, cap, owner, lo, hi, now, ticks, tick_ctx, fetc
         if f["first_ready"]:
             row["day"] = f["first_ready"][:10]
         row.update({
-            "north": north_star(f) if f["first_ready"] else None, "north_gh": north_star(f, False) if f["first_ready"] else None,
+            "north": north_star(f) if f["first_ready"] else None,
+            "attribution": row_attribution(f) if f["first_ready"] else None, "north_gh": north_star(f, False) if f["first_ready"] else None,
             "handoff_min": round((iso(merged) - iso(f["first_ready"])).total_seconds() / 60.0, 1) if merged and f["first_ready"] else None,
             "holds": f["holds"], "re_holds": f["re_holds"], "size": f["size"], "pushes": f["pushes"],
             "enqueues": f["enqueues"], "ejections": f["ejections"], "dirty": f["number"] in dirty,
-            "owner_actions": sum(1 for _, ts in f["owner_events"] if f["first_ready"] and iso(f["first_ready"]) <= iso(ts) <= iso(f["first_ready"]) + HORIZON),
+            "owner_actions": sum(1 for _, ts in effective_owner_events(f)[0] if f["first_ready"] and iso(f["first_ready"]) <= iso(ts) <= iso(f["first_ready"]) + HORIZON),
             "repair_cycles": f["repair_cycles"], "compute": None, "correct": None,
         })
         if ok and merged:
@@ -816,7 +922,10 @@ def markdown(e2e):
          + (" : repos with unread PRs are labelled partial; fully read repos are reported normally" if e2e["truncated"] else "") + f". Coverage: {e2e['coverage']['status']} {e2e['coverage']['reason']}", "",
          f"North Star: eligible PRs that became ready in the window and merged within 48h of ready with no owner action ({e2e['owner']}'s own account: "
          "review, label, comment, UI merge or close), over ALL eligible PRs ready in the window. A cohort day is reported only after its 48h horizon closed. "
-         "An owner-identity commit with no agent trailer makes a PR unknown; above 20% unknown the rate is a range. `gh-only` ignores commits. "
+         "Agents commit under the owner's git identity, so a PR is agent work when it carries any signal: opened by the fleet App, `shipyard pr` provenance in the body, "
+         "an agent Co-Authored-By trailer, an agent session stamp. Only a PR with an owner-identity commit and no signal is unknown; above 20% unknown the rate is a range. "
+         "An owner-account event is an owner action only when it is a human's: one carrying a session stamp is an agent's, and a merge by the owner account of a PR in the "
+         "steward's enqueue or verdict path (or opened through `shipyard pr`) is a steward merge. `gh-only` ignores commits. "
          "Rates carry a 95% Wilson interval; below 50 PRs, or when the interval overlaps the baseline's, the sample is insufficient and no difference is claimed. "
          "Handoff-to-merge is load-dependent context, not the verdict. Verdict proxies: review rounds (HOLDs) and re-HOLD rate per PR, agent pushes by kind "
          "(repair after a HOLD or `repaired:`, author before, merge-main), merge-queue attempts and ejections by cause, DIRTY per 100 PRs, gate runs per merged PR "
@@ -870,6 +979,16 @@ def markdown(e2e):
         if blk:
             L += [f"## {title} {blk['from']} to {blk['to']} (pooled, closed days only)", "", head.format("repo"), sep]
             L += [row(repo, s, e2e["repos"][repo]["controls"], repo_partial(e2e["repos"][repo])) for repo, s in sorted(blk["per_repo"].items())] + [""]
+    if e2e.get("window"):
+        L += ["### Attribution by signal (window; each PR counted once under its strongest signal)", "",
+              "| repo | PRs | app opener | provenance | trailer | session stamp | no signal | unknown cleared by signals | steward merges | agent-stamped owner events | legacy rate / unknown |",
+              "|---|---|---|---|---|---|---|---|---|---|---|"]
+        for repo, s_ in sorted(e2e["window"]["per_repo"].items()):
+            at = s_["attribution"]
+            p, lg = at["by_primary"], at["legacy"]
+            L.append(f"| {repo} | {s_['ready_prs']} | {p['app_opener']} | {p['provenance']} | {p['trailer']} | {p['session_stamp']} | {p['none']} | "
+                     f"{sum(at['ambiguous_cleared'].values())} | {at['steward_merges_recognised']} | {at['agent_stamped_owner_events']} | {lg['rate_pct']}% / {lg['unknown_share_pct']}% |")
+        L.append("")
     nf = (e2e.get("baseline") or {}).get("noise_floor")
     if nf:
         L += ["### Baseline noise floor (day against day, North Star rate)", ""]

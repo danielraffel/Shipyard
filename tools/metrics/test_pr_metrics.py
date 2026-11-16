@@ -2,6 +2,7 @@ import datetime as dt
 import json
 import os
 import re
+import shutil
 import sys
 import tempfile
 import unittest
@@ -338,6 +339,97 @@ class Escapes(Base):
     def test_escape_window_is_provisional_for_a_pr_under_14_days_old(self):
         out = self.build(world([pr(5, T(10, "09:00"), T(10, "10:00"))]))
         self.assertTrue(self.rows(out)[5]["correct"]["escape_provisional"])
+
+
+class Attribution(Base):
+    """Agents commit under the owner's identity, so authorship comes from stronger signals."""
+
+    def run_one(self, p=None, tl=None, cm=None):
+        p = p or pr(1, T(10, "10:00"), T(10, "11:00"))
+        shutil.rmtree(os.path.join(self.cache, REPO.replace("/", "__")), ignore_errors=True)  # each call reads fresh
+        out = self.build(world([p], {1: tl or []}, {1: cm or [commit("c1", OWNER, "work")]}))
+        return self.rows(out)[1], out
+
+    def opened(self, login=None, body=None):
+        p = pr(1, T(10, "10:00"), T(10, "11:00"))
+        p["user"], p["body"] = {"login": login or OWNER}, body
+        return p
+
+    def test_a_human_only_pr_stays_unknown_and_a_human_action_stays_owner(self):
+        r, _ = self.run_one(self.opened())
+        self.assertEqual((r["north"], r["attribution"]["signals"], r["attribution"]["primary"]), ("unknown", [], None))
+        tl = [{"event": "labeled", "actor": {"login": OWNER}, "created_at": T(10, "10:30")}]
+        r, _ = self.run_one(self.opened(), tl)
+        self.assertEqual(r["north"], "owner_action")
+
+    def test_opened_by_the_fleet_app_clears_owner_identity_commits(self):
+        r, out = self.run_one(self.opened("shipyard-local[bot]"))
+        self.assertEqual((r["north"], r["attribution"]["primary"], r["attribution"]["legacy_north"]), ("autonomous", "app_opener", "unknown"))
+        a = out["repos"][REPO]["per_day"]["2026-11-10"]["attribution"]
+        self.assertEqual((a["by_primary"]["app_opener"], a["ambiguous_cleared"]["app_opener"], a["legacy"]["unknown"]), (1, 1, 1))
+
+    def test_shipyard_provenance_markers_in_the_body(self):
+        for body in ("x\n<!-- shipyard-owner: host=m5 client=codex -->", "<!-- whence {\"a\":1} -->"):
+            r, _ = self.run_one(self.opened(body=body))
+            self.assertEqual((r["north"], r["attribution"]["primary"]), ("autonomous", "provenance"))
+
+    def test_agent_trailer_on_any_commit(self):
+        cm = [commit("c1", OWNER, "work"), commit("c2", "someone", "x\n\nCo-Authored-By: Claude <noreply@anthropic.com>")]
+        r, _ = self.run_one(self.opened(), cm=cm)
+        self.assertEqual((r["north"], r["attribution"]["primary"]), ("autonomous", "trailer"))
+
+    def test_session_stamp_in_the_body_or_a_commit(self):
+        r, _ = self.run_one(self.opened(body="<!-- session: m5/abc -->"))
+        self.assertEqual((r["north"], r["attribution"]["primary"]), ("autonomous", "session_stamp"))
+        r, _ = self.run_one(self.opened(), cm=[commit("c1", OWNER, "work\n\n<!-- session: m5/abc -->")])
+        self.assertEqual((r["north"], r["attribution"]["primary"]), ("autonomous", "session_stamp"))
+
+    def test_signals_are_all_listed_and_the_strongest_is_primary(self):
+        p = self.opened("shipyard-local[bot]", "<!-- whence {} -->")
+        r, _ = self.run_one(p, cm=[commit("c1", OWNER, "w\n\nCo-Authored-By: Claude <a@anthropic.com>")])
+        self.assertEqual(r["attribution"]["signals"], ["app_opener", "provenance", "trailer"])
+        self.assertEqual(r["attribution"]["primary"], "app_opener")
+
+    def test_an_owner_comment_with_a_session_stamp_is_an_agent_not_an_owner_action(self):
+        tl = [{"event": "commented", "user": {"login": OWNER}, "created_at": T(10, "10:30"), "body": "repaired: x\n<!-- session: m5/abc -->"}]
+        r, out = self.run_one(self.opened(), tl)
+        self.assertEqual((r["north"], r["attribution"]["agent_owner_events"], r["attribution"]["primary"]), ("autonomous", 1, "session_stamp"))
+        self.assertEqual(out["repos"][REPO]["per_day"]["2026-11-10"]["attribution"]["agent_stamped_owner_events"], 1)
+
+    def test_owner_merge_of_a_pr_in_the_steward_path_is_a_steward_merge(self):
+        merge = {"event": "merged", "actor": {"login": OWNER}, "created_at": T(10, "11:00")}
+        verdict = {"event": "commented", "user": {"login": "reviewer[bot]"}, "created_at": T(10, "10:30"), "body": "APPROVE head abc"}
+        r, _ = self.run_one(self.opened(), [verdict, merge], cm=[commit("c1", "x", "w")])
+        self.assertEqual((r["north"], r["attribution"]["steward_merge_recognised"], r["attribution"]["legacy_north"]), ("autonomous", True, "owner_action"))
+        r, _ = self.run_one(self.opened("shipyard-local[bot]"), [merge])  # opened through the App
+        self.assertEqual((r["north"], r["owner_actions"]), ("autonomous", 0))
+
+    def test_owner_merge_with_no_steward_path_and_no_signal_is_a_human_merge(self):
+        merge = {"event": "merged", "actor": {"login": OWNER}, "created_at": T(10, "11:00")}
+        r, _ = self.run_one(self.opened(), [merge], cm=[commit("c1", "x", "w")])
+        self.assertEqual((r["north"], r["attribution"]["steward_merge_recognised"]), ("owner_action", False))
+
+    def test_an_owner_label_still_counts_on_an_app_opened_pr(self):
+        tl = [{"event": "labeled", "actor": {"login": OWNER}, "created_at": T(10, "10:30")}]
+        r, _ = self.run_one(self.opened("shipyard-local[bot]"), tl)
+        self.assertEqual(r["north"], "owner_action")
+
+    def test_a_cached_v3_entry_is_kept_unless_the_signals_could_change_it(self):
+        keep = {"v": 3, "number": 1, "base": "main", "created_at": T(10, "10:00"), "merged_at": T(10, "11:00"), "state": "closed",
+                "merge_commit_sha": "m", "first_ready": T(10, "10:00"), "owner_events": [], "ambiguous_commits": [T(10, "10:10")],
+                "repair_cycles": 0, "holds": 0, "re_holds": 0, "size": None, "pushes": {"repair": 0, "author": 0, "merge_main": 0},
+                "enqueues": 0, "ejections": [], "labels": [], "heads": ["h"], "timeline_complete": True, "commits_complete": True}
+        p = self.opened("shipyard-local[bot]")
+        self.assertFalse(pm.needs_reread(keep, p))
+        self.assertTrue(pm.needs_reread(keep, self.opened()))
+        self.assertTrue(pm.needs_reread(dict(keep, owner_events=[["labeled", T(10, "10:30")]]), p))
+        os.makedirs(os.path.join(self.cache, REPO.replace("/", "__"), "facts"))
+        with open(os.path.join(self.cache, REPO.replace("/", "__"), "facts", "1.json"), "w") as fh:
+            json.dump(keep, fh)
+        gh = world([p])
+        out = self.build(gh)
+        self.assertEqual(self.rows(out)[1]["north"], "autonomous")
+        self.assertFalse([c for c in gh.calls if "timeline" in c])
 
 
 def unmerged(n, created, state="open", draft=False):
