@@ -69,6 +69,60 @@ impl WorkflowJob {
     }
 }
 
+impl WorkflowJob {
+    /// Whether this job's name is a template (`Test ${{ matrix.name }}`) whose
+    /// literal parts match `context` as a pattern.
+    ///
+    /// Never true for a job [`Self::produces`] already accepts, and never true
+    /// for an expression with no literal text at all (`${{ x }}` alone would
+    /// match everything). The match is a hint: the expression is not
+    /// resolved, so callers must report it as unverified and never let it
+    /// alone refuse a submission.
+    #[must_use]
+    pub fn produces_templated(&self, context: &str) -> bool {
+        let Some(expr) = &self.name_expr else {
+            return false;
+        };
+        expr.contains("${{") && !self.produces(context) && template_matches(expr, context)
+    }
+}
+
+/// Match `context` against `template`, where each `${{ ... }}` is a wildcard.
+fn template_matches(template: &str, context: &str) -> bool {
+    let template = template.trim().trim_matches(['"', '\'']);
+    let mut literals: Vec<&str> = Vec::new();
+    let mut rest = template;
+    while let Some(open) = rest.find("${{") {
+        literals.push(&rest[..open]);
+        let Some(close) = rest[open..].find("}}") else {
+            return false;
+        };
+        rest = &rest[open + close + 2..];
+    }
+    literals.push(rest);
+    if literals.iter().all(|lit| lit.trim().is_empty()) {
+        return false;
+    }
+    let (first, last) = (literals[0], literals[literals.len() - 1]);
+    let Some(mut remaining) = context.strip_prefix(first) else {
+        return false;
+    };
+    if literals.len() == 1 {
+        return remaining.is_empty();
+    }
+    let Some(trimmed) = remaining.strip_suffix(last) else {
+        return false;
+    };
+    remaining = trimmed;
+    for lit in &literals[1..literals.len() - 1] {
+        match remaining.find(lit) {
+            Some(at) => remaining = &remaining[at + lit.len()..],
+            None => return false,
+        }
+    }
+    true
+}
+
 /// What a `runs-on:` expression resolves to, statically.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -466,4 +520,34 @@ pub fn transitive_needs(jobs: &[WorkflowJob], roots: &[String]) -> Vec<String> {
     }
     seen.sort();
     seen
+}
+
+#[cfg(test)]
+mod template_tests {
+    use super::*;
+
+    fn job(name: &str) -> WorkflowJob {
+        parse_workflow_jobs(&format!("jobs:\n  t:\n    name: {name}\n    runs-on: x\n")).remove(0)
+    }
+
+    #[test]
+    fn literal_parts_match_as_a_pattern() {
+        let j = job("Test ${{ matrix.name }}");
+        assert!(j.produces_templated("Test macOS ARM64"));
+        assert!(!j.produces_templated("Build macOS ARM64"));
+        let j = job("${{ matrix.os }} / lint (${{ matrix.v }})");
+        assert!(j.produces_templated("linux / lint (3.12)"));
+        assert!(!j.produces_templated("linux / lint"));
+    }
+
+    #[test]
+    fn a_name_with_no_literal_text_matches_nothing() {
+        assert!(!job("${{ matrix.name }}").produces_templated("anything"));
+    }
+
+    #[test]
+    fn an_exact_producer_is_not_reported_as_templated() {
+        assert!(!job("build").produces_templated("build"));
+        assert!(!job("${{ x && 'a' || 'b' }}").produces_templated("a"));
+    }
 }

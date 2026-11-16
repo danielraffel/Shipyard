@@ -185,9 +185,11 @@ fn effective_workflow_paths(
         .map(|name| format!(".github/workflows/{name}"))
         .filter(|path| {
             read(path).is_ok_and(|source| {
-                parse_workflow_jobs(&source)
-                    .iter()
-                    .any(|job| contexts.iter().any(|context| job.produces(context)))
+                parse_workflow_jobs(&source).iter().any(|job| {
+                    contexts
+                        .iter()
+                        .any(|context| job.produces(context) || job.produces_templated(context))
+                })
             })
         })
         .collect();
@@ -970,5 +972,57 @@ mod fallback_tests {
         assert!(jobs.is_empty());
         assert!(read_warnings.iter().any(|w| w.contains("build.yml")));
         drop(config);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod templated_fallback_tests {
+    use super::*;
+
+    #[test]
+    fn the_fallback_selects_a_file_with_a_templated_producer() {
+        let temp = tempfile::tempdir().expect("temp");
+        let repo = temp.path();
+        let dir = repo.join(".github/workflows");
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::create_dir_all(repo.join(".shipyard")).expect("cfg");
+        std::fs::write(
+            dir.join("ci.yml"),
+            "on: pull_request\njobs:\n  test:\n    name: Test ${{ matrix.name }}\n    runs-on: x\n",
+        )
+        .expect("ci");
+        std::fs::write(
+            dir.join("other.yml"),
+            "on: pull_request\njobs:\n  lint:\n    name: Lint\n    runs-on: x\n",
+        )
+        .expect("other");
+        std::fs::write(repo.join(".shipyard/config.toml"), "").expect("config");
+        for args in [
+            vec!["init", "--initial-branch=main"],
+            vec!["config", "user.name", "t"],
+            vec!["config", "user.email", "t@example.com"],
+            vec!["add", "."],
+            vec!["commit", "-q", "-m", "base"],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(&args)
+                    .current_dir(repo)
+                    .status()
+                    .expect("git")
+                    .success()
+            );
+        }
+        let config = LoadedConfig::load_from_cwd(crate::identity::RuntimeMode::Isolated, repo)
+            .expect("config");
+        let mut warnings = Vec::new();
+        let paths = effective_workflow_paths(
+            &config,
+            repo,
+            "main",
+            &[&["Test macOS ARM64".to_owned()]],
+            &mut warnings,
+        );
+        assert_eq!(paths, [".github/workflows/ci.yml"]);
     }
 }

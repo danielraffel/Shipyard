@@ -78,6 +78,17 @@ pub fn assess(input: &AssessInput<'_>, now: DateTime<Utc>) -> LandabilityReport 
             .filter(|job| job.produces(context))
             .map(|job| job.id.clone())
             .collect();
+        if producers.is_empty() && input.jobs.iter().any(|job| job.produces_templated(context)) {
+            // The name is a template (`Test ${{ matrix.name }}`) that cannot
+            // be resolved here. Not "no producer", and not assessed either:
+            // a pattern match must never be able to refuse a submission.
+            report.warnings.push(format!(
+                "required context `{context}`: producer: templated (unverified) - a job name \
+                 with an unresolved `${{{{ }}}}` matches it as a pattern, so its lanes were NOT \
+                 assessed"
+            ));
+            continue;
+        }
         if producers.is_empty() {
             // Not a fault by itself: a required context may come from a
             // workflow this preflight did not read (a separate file, or an
