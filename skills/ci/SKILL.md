@@ -1268,9 +1268,12 @@ successful rotation.
 
 ## Version-at-land
 
-A normal PR does not edit `Cargo.toml`, `Cargo.lock`, or plugin manifest
-versions. The read-only version gate rejects those edits unless the PR carries
-the explicit release recovery trailer. After merge, `version-at-land.yml` is the
+A normal PR does not edit the plugin manifests, and in `Cargo.toml` and
+`Cargo.lock` it edits only dependencies, features, profiles and lints: the
+`[package]` table, the build-target and workspace tables and the version line
+itself must not change. The read-only version gate refuses anything else,
+including an added, deleted, mode-changed or unparseable version file, unless
+the PR carries the explicit release recovery trailer. After merge, `version-at-land.yml` is the
 single writer and assigns the next versions. It never pushes to `main` (the
 ruleset requires PR-only checks): it rebuilds the bot-owned
 `release/version-at-land` branch with one cumulative bump commit, keeps a single
@@ -3858,7 +3861,7 @@ When the user says "push a PR", "ship this", "ship it", "we're done", "merge thi
 The orchestration, in order:
 
 1. `skill_sync_check.py --mode=report` — hard-fails if a mapped path was touched without a `SKILL.md` update or a `Skill-Update:` trailer on the tip commit.
-2. `version_bump_check.py --mode=report` — rejects version-file edits; version-at-land assigns both surfaces after merge.
+2. `version_bump_check.py --mode=report` rejects version-file edits (dependency and feature edits in `Cargo.toml` and `Cargo.lock` pass), and version-at-land assigns both surfaces after merge.
 3. `git commit` + `gh pr create` + `shipyard ship`.
 4. If `[pr.provenance]` is configured, run its exact argv with the submitting session's environment. A required hook must succeed before any durable handoff or validation dispatch.
 5. With `[merge_steward].auto_handoff = true` on the protected base branch or explicit `--workstream-id`, write the exact-head server receipt and managed label immediately after provenance, before validation begins. The PR branch cannot enable the project default. The fallback workstream is `OWNER/REPO#PR` and the fallback context is the PR URL; `--no-steward-handoff` is an explicit override.
