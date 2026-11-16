@@ -50,7 +50,7 @@ still reports what it read. A repo fully read is reported normally even when ano
 ## Sample and comparison
 
 Every rate carries a 95% Wilson interval and n. A sample is **insufficient** below 50 PRs, when the
-window's interval overlaps the baseline's, or when the run was truncated. The report prints the
+window's interval overlaps the baseline's, or when that repo was not fully read (cap hit, read error, unread PRs or a cut-short listing; it is then labelled `partial`). Sufficiency is per repository: a fully read repo is unaffected by another repo's truncation. The report prints the
 pooled window cohort beside the pooled Baseline cohort (default 2026-11-12 to 2026-11-14, closed
 days only) and the baseline's day-against-day North Star rates and spread as the noise floor: a
 later change smaller than that spread is no change. It makes no per-change attribution. Medians and

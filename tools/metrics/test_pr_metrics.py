@@ -48,7 +48,7 @@ class Fake:
         raise pm.ReadError("no route " + path)
 
 
-def world(prs, timelines=None, commits=None, base_commits=None, runs=None, jobs=None, checks=None, required=("Test",)):
+def world(prs, timelines=None, commits=None, base_commits=None, runs=None, jobs=None, checks=None, required=("Test",), default_checks=True):
     timelines, commits, jobs, checks = timelines or {}, commits or {}, jobs or {}, checks or {}
     routes = [(r"pulls\?state=all", prs)]
     for n in {p["number"] for p in prs}:
@@ -62,6 +62,8 @@ def world(prs, timelines=None, commits=None, base_commits=None, runs=None, jobs=
         routes.append((rf"actions/runs/{rid}/jobs", {"jobs": js}))
     for sha, cr in checks.items():
         routes.append((rf"commits/{sha}/check-runs", {"check_runs": cr}))
+    if default_checks:
+        routes.append((r"commits/[^/]+/check-runs", {"check_runs": [{"name": "Test", "status": "completed", "conclusion": "success"}]}))
     routes.append((r"rules/branches/main", [{"type": "required_status_checks",
                                               "parameters": {"required_status_checks": [{"context": c} for c in required]}}]))
     return Fake(routes)
@@ -280,7 +282,7 @@ class Correctness(Base):
 
     def test_unreadable_checks_make_correctness_unknown(self):
         p = self.merged_old(6)
-        out = self.build(world([p], base_commits=[commit(p["merge_commit_sha"], date=T(5, "10:00"))]), now=dt.datetime(2026, 11, 14, tzinfo=UTC))
+        out = self.build(world([p], base_commits=[commit(p["merge_commit_sha"], date=T(5, "10:00"))], default_checks=False), now=dt.datetime(2026, 11, 14, tzinfo=UTC))
         k = out["repos"][REPO]["per_day"]["2026-11-05"]["correctness"]
         self.assertEqual((k["unknown"], k["bad_rate_pct"]), (1, None))
 
@@ -593,7 +595,18 @@ class Truncation(Base):
         with tempfile.TemporaryDirectory() as d2:
             full = pm.build([REPO], d2, 300, OWNER, START, self.LATE, {}, {}, None, world(prs), None, None, {})
         self.assertEqual(full["repos"][REPO]["unread_prs"], 0)
-        self.assertNotIn("partial: unread", pm.markdown(full))
+        self.assertNotIn("partial", pm.markdown(full))
+
+    def test_truncated_with_all_facts_cached_is_still_partial(self):
+        v = {"truncated": True, "unread_prs": 0, "listing_complete": True, "read_errors": 0}
+        self.assertTrue(pm.repo_partial(v))
+        self.assertTrue(pm.repo_partial(dict(v, truncated=False, read_errors=1)))
+        self.assertFalse(pm.repo_partial(dict(v, truncated=False)))
+
+    def test_pinned_owner_control_is_rendered(self):
+        prs = [pr(1, T(10, "10:00"), T(10, "11:00"))]
+        out = pm.build([REPO], self.cache, 200, OWNER, START, self.LATE, {}, {}, None, world(prs), None, None, {REPO: {"owner": [1]}})
+        self.assertIn("owner-pinned 0/1 (failed)", pm.markdown(out))
 
     def test_settled_prs_are_cached_between_runs(self):
         prs = [pr(n, T(10, "10:00"), T(10, "11:00")) for n in range(1, 4)]

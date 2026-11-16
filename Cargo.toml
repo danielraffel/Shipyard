@@ -1,6 +1,6 @@
 [package]
 name = "shipyard"
-version = "0.438.1"
+version = "0.439.2"
 edition = "2024"
 description = "Cross-platform CI coordination for local, SSH, and cloud runners."
 repository = "https://github.com/danielraffel/Shipyard"
@@ -22,9 +22,6 @@ path = "src/bin/shipyard-workstream-provider.rs"
 # CI-only path isolation for production-shaped integration-test binaries.
 # Official release builds never enable this feature.
 ci-test-home = []
-# Source-only compatibility decoder for the future advisory-authority request
-# vocabulary. Official builds and releases deliberately omit this feature.
-experimental-authority-v5 = []
 
 [dependencies]
 atomicwrites = "0.4.4"
