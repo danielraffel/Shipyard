@@ -157,7 +157,7 @@ shipyard landability --repo OWNER/REPO       # can this PR's required contexts b
 shipyard runner fleet-update --to vX.Y.Z --all-hosts          # plan
 shipyard runner fleet-update --to vX.Y.Z --all-hosts --apply  # roll out + verify every host; the first host is a canary smoked with read-only admission-clean
 shipyard runner fleet-update --to vX.Y.Z --all-hosts --apply --skip-canary-smoke  # emergency rollback while GitHub itself cannot be observed
-shipyard runner fleet-reconcile                # recent releases vs every host; --apply rolls the newest soaked tag to hosts behind it
+shipyard runner fleet-update --clear-host <class>  # release a host quarantined after a failed rollback, once it is fixed
 shipyard doctor --fleet                        # each host's version vs the latest release
 
 # Monitor

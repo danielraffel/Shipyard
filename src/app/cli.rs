@@ -3002,8 +3002,8 @@ pub(super) enum RunnerCommand {
     #[command(name = "fleet-update")]
     FleetUpdate {
         /// Exact release tag to install, for example v0.127.2.
-        #[arg(long = "to")]
-        to: String,
+        #[arg(long = "to", required_unless_present = "clear_host")]
+        to: Option<String>,
         /// Governed host class to update. Repeat to define fail-stop order.
         #[arg(long = "host-class")]
         host_classes: Vec<String>,
@@ -3024,37 +3024,14 @@ pub(super) enum RunnerCommand {
         /// receipt records that the smoke was skipped.
         #[arg(long = "skip-canary-smoke")]
         skip_canary_smoke: bool,
-    },
-    /// Backstop for releases that did not roll themselves out: compare the
-    /// latest published release with every configured host's installed
-    /// version and, once the release has soaked, run the verified
-    /// `fleet-update` rollout. Reports only unless `--apply` is supplied.
-    /// Only lagging host classes are rolled; a host ahead of the release stops
-    /// the run with an alert (exit 4) and is never downgraded. Exit 9 when
-    /// anything is unreadable (nothing is rolled out), 3 while rate-limited,
-    /// 5 once the tag is terminal, 75 when another rollout holds the lock or a
-    /// host's install guard is held (a Sandbox canary); a deferral is not an attempt.
-    #[command(name = "fleet-reconcile")]
-    FleetReconcile {
-        /// Minutes a release must have been public before it is rolled out.
-        #[arg(long = "soak-minutes", default_value_t = 30)]
-        soak_minutes: u64,
-        /// Hours between attempts at the same tag.
-        #[arg(long = "retry-hours", default_value_t = 6)]
-        retry_hours: u64,
-        /// Attempts at one tag before it becomes terminal and raises an alert.
-        #[arg(long = "max-attempts", default_value_t = 3)]
-        max_attempts: u32,
-        /// Hours a host may lag a published release before it raises an alert.
-        #[arg(long = "lag-alert-hours", default_value_t = 2)]
-        lag_alert_hours: u64,
         /// Clear a host class quarantined after a failed rollback (fix the host
         /// first). A tag made terminal by that failure becomes eligible again.
-        #[arg(long = "clear-host", value_name = "HOST_CLASS")]
+        #[arg(
+            long = "clear-host",
+            value_name = "HOST_CLASS",
+            conflicts_with_all = ["to", "apply", "all_hosts", "host_classes", "lagging_only", "skip_canary_smoke"]
+        )]
         clear_host: Option<String>,
-        /// Run the rollout when one is due.
-        #[arg(long)]
-        apply: bool,
     },
     /// Maintain an expiring repository-variable lease for an approved local
     /// Linux CI lane. Dry-run unless `--apply` is supplied.

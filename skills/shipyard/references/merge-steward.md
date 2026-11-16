@@ -103,7 +103,7 @@ person notices. `--infra-rerun` (`off`, `shadow`, `enforce`; module
   step, the repository report's `infra_rerun.findings` carries one line,
   "infra outage suspected: <check> failing on N PRs at step '<step>'". It is
   one finding per episode (`first_reported_at`, `new`, remembered 40 minutes
-  past its last sighting) and `tools/fleet-pass/operator-findings.py` prints
+  past its last sighting) and fleet-handbook's `scripts/pass-runner/operator-findings.py` prints
   it as `INFRA-OUTAGE-SUSPECTED`.
 - Known blind spot: a head can break a "non-content" step itself (a bad
   submodule pin breaks checkout, a changed lockfile breaks `Install …

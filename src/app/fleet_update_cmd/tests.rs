@@ -2229,8 +2229,6 @@ fn a_busy_host_defers_the_rollout_without_rollback_or_later_hosts() {
         ops.rollbacks.is_empty(),
         "an untouched busy host is never rolled back"
     );
-    assert!(error.deferred);
-    assert!(!error.ineligible);
     assert!(error.rollback_failed_host.is_none());
     assert_eq!(error.failure.code, EXIT_CONTROLLER_BUSY);
     assert!(
@@ -2311,10 +2309,10 @@ fn quarantined_hosts_are_excluded_from_every_rollout() {
         .iter()
         .map(|name| host_update_plan(&named_host(name), "v0.137.0").expect("plan"))
         .collect::<Vec<_>>();
-    let mut ledger = reconcile::AttemptLedger::default();
+    let mut ledger = fleet_state::RolloutLedger::default();
     ledger.quarantined.insert(
         "m5".to_owned(),
-        reconcile::Quarantine {
+        fleet_state::Quarantine {
             tag: "v0.136.0".to_owned(),
             reason: "rollback failed".to_owned(),
             since: chrono::Utc::now(),
@@ -2332,13 +2330,11 @@ fn quarantined_hosts_are_excluded_from_every_rollout() {
 }
 
 #[test]
-fn a_fleet_update_rollback_failure_quarantines_and_alerts_like_reconcile() {
+fn a_fleet_update_rollback_failure_quarantines_and_alerts() {
     let temp = tempfile::tempdir().expect("temp");
     let mut alerts = Vec::new();
     let failure = RolloutFailure {
-        ineligible: false,
         rollback_failed_host: Some("m5".to_owned()),
-        deferred: false,
         failure: CliFailure::new(EXIT_ROLLBACK_FAILED, "ROLLBACK TO v0.208.0 FAILED"),
     };
     let error = record_cli_rollback_failure(temp.path(), "0.209.0", failure, |title, body| {
@@ -2352,11 +2348,24 @@ fn a_fleet_update_rollback_failure_quarantines_and_alerts_like_reconcile() {
             .contains("m5 is quarantined and an alert was raised")
     );
     assert_eq!(alerts.len(), 1);
-    assert_eq!(alerts[0].0, reconcile::alert_title("v0.209.0"));
+    assert_eq!(alerts[0].0, fleet_state::alert_title("v0.209.0"));
     assert!(alerts[0].1.contains("--clear-host m5"));
-    let ledger = reconcile::read_ledger(temp.path()).expect("ledger");
+    let ledger = fleet_state::read_ledger(temp.path()).expect("ledger");
     assert_eq!(ledger.quarantined["m5"].tag, "v0.209.0");
     assert!(ledger.tags["v0.209.0"].terminal.is_some());
+
+    // Clearing the host releases the quarantine and reopens its terminal tag.
+    let mut output = Vec::new();
+    let paths = RuntimePaths::current_with_overrides(
+        RuntimeMode::Shipyard,
+        Some(temp.path().join("global")),
+        Some(temp.path().to_path_buf()),
+    );
+    clear_quarantined_host(&paths, "m5", &mut output).expect("clear");
+    assert!(String::from_utf8_lossy(&output).contains("cleared m5"));
+    let ledger = fleet_state::read_ledger(temp.path()).expect("ledger");
+    assert!(ledger.quarantined.is_empty());
+    assert!(ledger.tags["v0.209.0"].terminal.is_none());
 
     // An ordinary failure records nothing.
     let temp = tempfile::tempdir().expect("temp");
@@ -2365,7 +2374,7 @@ fn a_fleet_update_rollback_failure_quarantines_and_alerts_like_reconcile() {
         panic!("no alert for an ordinary failure")
     });
     assert_eq!(error.code, 1);
-    assert!(!reconcile::ledger_path(temp.path()).exists());
+    assert!(!fleet_state::ledger_path(temp.path()).exists());
 }
 
 #[test]
@@ -2419,14 +2428,13 @@ fn lagging_only_skips_current_and_ahead_hosts_and_fails_closed_on_unknown() {
             .iter()
             .find(|(name, _)| *name == plan.class)
             .and_then(|(_, version)| *version);
-        reconcile::HostVersion {
+        fleet_state::HostVersion {
             host_class: plan.class.clone(),
             ssh: plan.ssh.clone(),
             version: version.map(ToOwned::to_owned),
             error: None,
             lagging: None,
             declares_host_classes: None,
-            daemon: None,
         }
     };
     let (lagging, current) =
@@ -2444,14 +2452,13 @@ fn lagging_only_skips_current_and_ahead_hosts_and_fails_closed_on_unknown() {
         "current and ahead hosts are never reinstalled"
     );
 
-    let unreadable = |plan: &HostUpdatePlan| reconcile::HostVersion {
+    let unreadable = |plan: &HostUpdatePlan| fleet_state::HostVersion {
         host_class: plan.class.clone(),
         ssh: plan.ssh.clone(),
         version: None,
         error: Some("ssh: timed out".to_owned()),
         lagging: None,
         declares_host_classes: None,
-        daemon: None,
     };
     let error = partition_lagging(plans, "v0.137.0", unreadable).expect_err("unknown");
     assert!(
@@ -2507,6 +2514,7 @@ fn fleet_update_apply_refuses_while_another_rollout_holds_the_lock() {
         apply: true,
         lagging_only: true,
         skip_canary_smoke: false,
+        clear_host: None,
     };
     let mut output = Vec::new();
     let error = fleet_update_command(
@@ -2646,21 +2654,20 @@ fn verification_script_installs_guards_and_reads_every_fact_on_the_host() {
 #[test]
 fn doctor_flags_a_host_only_once_it_lags_past_the_soak() {
     let now = chrono::Utc::now();
-    let latest = reconcile::PublishedRelease {
+    let latest = fleet_state::PublishedRelease {
         tag: "v0.208.0".to_owned(),
         published_at: now - chrono::Duration::minutes(45),
     };
-    let row = |version: Option<&str>, lagging: Option<bool>| reconcile::HostVersion {
+    let row = |version: Option<&str>, lagging: Option<bool>| fleet_state::HostVersion {
         host_class: "m5".to_owned(),
         ssh: Some("blackbook".to_owned()),
         version: version.map(ToOwned::to_owned),
         error: version.is_none().then(|| "ssh: timed out".to_owned()),
         lagging,
         declares_host_classes: None,
-        daemon: None,
     };
     let lagging =
-        reconcile_cmd::fleet_version_row(&row(Some("0.205.0"), Some(true)), Some(&latest), now, 30);
+        fleet_doctor::fleet_version_row(&row(Some("0.205.0"), Some(true)), Some(&latest), now, 30);
     assert!(!lagging.ok);
     assert!(
         lagging
@@ -2670,16 +2677,12 @@ fn doctor_flags_a_host_only_once_it_lags_past_the_soak() {
             .contains("lags v0.208.0 past the 30-minute soak")
     );
     let soaking =
-        reconcile_cmd::fleet_version_row(&row(Some("0.205.0"), Some(true)), Some(&latest), now, 60);
+        fleet_doctor::fleet_version_row(&row(Some("0.205.0"), Some(true)), Some(&latest), now, 60);
     assert!(soaking.ok, "{soaking:?}");
-    let current = reconcile_cmd::fleet_version_row(
-        &row(Some("0.208.0"), Some(false)),
-        Some(&latest),
-        now,
-        30,
-    );
+    let current =
+        fleet_doctor::fleet_version_row(&row(Some("0.208.0"), Some(false)), Some(&latest), now, 30);
     assert!(current.ok);
-    let unknown = reconcile_cmd::fleet_version_row(&row(None, None), Some(&latest), now, 30);
+    let unknown = fleet_doctor::fleet_version_row(&row(None, None), Some(&latest), now, 30);
     assert!(!unknown.ok);
     assert!(
         unknown
@@ -2688,7 +2691,7 @@ fn doctor_flags_a_host_only_once_it_lags_past_the_soak() {
             .unwrap_or_default()
             .starts_with("UNKNOWN: ssh: timed out")
     );
-    let no_release = reconcile_cmd::fleet_version_row(&row(Some("0.205.0"), None), None, now, 30);
+    let no_release = fleet_doctor::fleet_version_row(&row(Some("0.205.0"), None), None, now, 30);
     assert!(!no_release.ok);
 }
 
@@ -2712,7 +2715,7 @@ fn pr_watch_fleet_rows_fail_only_when_no_host_completes_passes() {
         stale_after_minutes: 45,
         repos: Vec::new(),
     };
-    let rows = reconcile_cmd::pr_watch_fleet_rows(&[
+    let rows = fleet_doctor::pr_watch_fleet_rows(&[
         ("m3".to_owned(), Ok(quiet.clone())),
         ("m5s".to_owned(), Ok(scanner(true))),
         ("m1".to_owned(), Err("old Shipyard".to_owned())),
@@ -2730,7 +2733,7 @@ fn pr_watch_fleet_rows_fail_only_when_no_host_completes_passes() {
     );
 
     // The only scanner went stale: both its row and the fleet row fail.
-    let rows = reconcile_cmd::pr_watch_fleet_rows(&[
+    let rows = fleet_doctor::pr_watch_fleet_rows(&[
         ("m3".to_owned(), Ok(quiet.clone())),
         ("m5s".to_owned(), Ok(scanner(false))),
     ]);
@@ -2745,7 +2748,7 @@ fn pr_watch_fleet_rows_fail_only_when_no_host_completes_passes() {
     );
 
     // Nobody scans at all.
-    let rows = reconcile_cmd::pr_watch_fleet_rows(&[("m3".to_owned(), Ok(quiet))]);
+    let rows = fleet_doctor::pr_watch_fleet_rows(&[("m3".to_owned(), Ok(quiet))]);
     assert!(!rows["pr-watch:fleet"].ok);
 }
 
@@ -2838,7 +2841,6 @@ fn a_failed_canary_smoke_rolls_the_canary_back_and_touches_no_other_host() {
         "the canary is restored to its pre-update version"
     );
     assert!(error.rollback_failed_host.is_none());
-    assert!(!error.deferred);
     assert_eq!(error.failure.code, 1);
     let message = &error.failure.message;
     assert!(

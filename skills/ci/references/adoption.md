@@ -432,8 +432,9 @@ shipyard --mode isolated runner capacity --json | jq .configured       # control
 `github_cli`, `github_token_helper`, `shipyard_mode`, `shipyard_global_dir`,
 `shipyard_state_dir` ([install.md](../../../docs/install.md)). Then
 `shipyard runner fleet-update --to vX.Y.Z --host-class <name>` prints the plan;
-`--apply` rolls it. `shipyard runner fleet-reconcile` is the backstop for
-releases that did not roll out on their own. Do not use `fleet-update` as a
+`--apply` rolls it. TartCI self-update is the backstop for releases that
+did not roll out on their own (`tartci fleet-macos tool-freshness` shows each
+host). Do not use `fleet-update` as a
 detection probe: it is a fleet operation even when it only plans, and
 `runner capacity` answers the detection question without touching the rollout
 path.
@@ -442,7 +443,7 @@ Known risk: the release soak keys on the newest tag, so several releases in
 an hour can hold every rollout until the cadence slows.
 
 **Verify (audit proxy):** rollouts and verified host installs from
-`fleet-reconcile` / `fleet-update` records (audit: 10 rollouts, 37 verified
+`fleet-update` records (audit: 10 rollouts, 37 verified
 installs, 1 failed). The audit script's PROVEN counts readable host classes,
 which proves the probe path, not a rollout.
 

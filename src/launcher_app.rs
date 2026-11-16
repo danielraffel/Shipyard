@@ -15,7 +15,7 @@
 //! would raise its own prompt, so in every other case nothing changes.
 //!
 //! [`route_launchd_job`] is the entry point here: a launchd job whose program
-//! is this binary (for example `com.danielraffel.shipyard.fleet-reconcile`)
+//! is this binary (for example `com.danielraffel.shipyard.example-job`)
 //! replaces itself with the launcher. `exec` keeps the pid, and the pid is the
 //! job's responsible process, so the launcher bundle becomes the job's
 //! identity. The daemon and its supervisor are never routed (they keep their
