@@ -13,8 +13,8 @@ mod canary;
 mod command;
 mod controller_lock;
 mod evidence;
-mod reconcile;
-mod reconcile_cmd;
+mod fleet_doctor;
+mod fleet_state;
 mod release_authority;
 mod rollback;
 mod verify;
@@ -24,9 +24,7 @@ use command::exact_asset_curl_shim;
 #[cfg(all(test, target_os = "macos"))]
 use command::remote_pair_probe;
 use command::{local_update_command, remote_update_command, render_host_result, render_plan};
-pub(super) use reconcile_cmd::{
-    FleetReconcileArgs, fleet_reconcile_command, fleet_version_doctor_section,
-};
+pub(super) use fleet_doctor::fleet_version_doctor_section;
 
 #[cfg(all(test, unix))]
 use evidence::execute_plan_with_timeout;
@@ -131,6 +129,8 @@ pub(super) struct FleetUpdateArgs {
     pub(super) lagging_only: bool,
     /// Skip the canary smoke; recorded in the receipt as skipped.
     pub(super) skip_canary_smoke: bool,
+    /// Clear a quarantined host class instead of rolling anything out.
+    pub(super) clear_host: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -165,6 +165,9 @@ pub(super) fn fleet_update_command<W: Write>(
             "fleet-update requires a Unix rollout controller",
         ));
     }
+    if let Some(host_class) = &args.clear_host {
+        return clear_quarantined_host(runtime_paths, host_class, stdout);
+    }
     if !args.apply {
         return run_fleet_update(args, mode, cwd, runtime_paths, json, stdout)
             .map_err(|failure| failure.failure);
@@ -193,9 +196,37 @@ pub(super) fn fleet_update_command<W: Write>(
     })
 }
 
+/// `fleet-update --clear-host`: release a quarantine once the host is fixed.
+/// A tag made terminal by that host's failed rollback becomes eligible again.
+fn clear_quarantined_host<W: Write>(
+    runtime_paths: &RuntimePaths,
+    host_class: &str,
+    stdout: &mut W,
+) -> Result<ExitCode, CliFailure> {
+    let Some(_lock) = controller_lock::try_acquire(&runtime_paths.state_dir)
+        .map_err(|error| CliFailure::new(1, error))?
+    else {
+        return Err(CliFailure::new(
+            EXIT_CONTROLLER_BUSY,
+            "another fleet rollout holds the controller lock; retry --clear-host later",
+        ));
+    };
+    let cleared = fleet_state::clear_host(&runtime_paths.state_dir, host_class)
+        .map_err(|error| CliFailure::new(1, error))?;
+    let message = match cleared {
+        Some(quarantine) => format!(
+            "cleared {host_class} (quarantined since {} after {}: {})",
+            quarantine.since, quarantine.tag, quarantine.reason
+        ),
+        None => format!("{host_class} was not quarantined"),
+    };
+    writeln!(stdout, "{message}").map_err(|error| CliFailure::new(1, error.to_string()))?;
+    Ok(ExitCode::SUCCESS)
+}
+
 /// A host that `fleet-update --apply` (the release stage, an operator) could
-/// not restore is recorded exactly like reconcile records it: quarantined, its
-/// tag terminal, and an alert issue opened, all under the held lock.
+/// not restore is recorded: quarantined, its tag terminal, and an alert issue
+/// opened, all under the held lock.
 fn record_cli_rollback_failure<A>(
     state_dir: &Path,
     to: &str,
@@ -211,7 +242,7 @@ where
     let tag = normalize_exact_tag(to).unwrap_or_else(|_| to.to_owned());
     let reason = failure.failure.message.clone();
     let mut notes = Vec::new();
-    let body = match reconcile::record_rollback_failure(
+    let body = match fleet_state::record_rollback_failure(
         state_dir,
         &tag,
         host_class,
@@ -221,10 +252,10 @@ where
         Ok((_, body)) => body,
         Err(error) => {
             notes.push(format!("QUARANTINE NOT RECORDED: {error}"));
-            reconcile::rollback_failure_body(&tag, host_class, &reason)
+            fleet_state::rollback_failure_body(&tag, host_class, &reason)
         }
     };
-    if let Err(error) = alert(&reconcile::alert_title(&tag), &body) {
+    if let Err(error) = alert(&fleet_state::alert_title(&tag), &body) {
         notes.push(format!("ALERT NOT DELIVERED: {error}"));
     }
     let mut message = format!("{reason}; {host_class} is quarantined and an alert was raised");
@@ -241,23 +272,15 @@ pub(super) const EXIT_CONTROLLER_BUSY: u8 = 75;
 /// Why a rollout did not complete.
 #[derive(Debug)]
 pub(super) struct RolloutFailure {
-    /// True when the release was refused before any host was touched.
-    pub(super) ineligible: bool,
     /// The host that was mutated and could not be restored.
     pub(super) rollback_failed_host: Option<String>,
-    /// True when a host refused at its install guard before any change (a
-    /// sandbox canary or another update owns it). Not a failed attempt: the
-    /// rollout simply resumes on a later tick.
-    pub(super) deferred: bool,
     pub(super) failure: CliFailure,
 }
 
 impl From<CliFailure> for RolloutFailure {
     fn from(failure: CliFailure) -> Self {
         Self {
-            ineligible: false,
             rollback_failed_host: None,
-            deferred: false,
             failure,
         }
     }
@@ -292,9 +315,7 @@ pub(super) fn run_fleet_update<W: Write>(
     let release_authority = GitHubReleaseAuthorityVerifier::new(&config, cwd)
         .verify(&target)
         .map_err(|error| RolloutFailure {
-            ineligible: true,
             rollback_failed_host: None,
-            deferred: false,
             failure: CliFailure::new(1, format!("fleet release is ineligible: {error}")),
         })?;
     let mut plans = selected_classes
@@ -305,8 +326,8 @@ pub(super) fn run_fleet_update<W: Write>(
     // A host that could not be restored after a failed rollout stays out of
     // every rollout, whichever path starts it, until an operator clears it.
     // An unreadable ledger fails closed before any host is touched.
-    let ledger = reconcile::read_ledger(&runtime_paths.state_dir)
-        .map_err(|error| CliFailure::new(reconcile::EXIT_RECONCILE_UNKNOWN, error))?;
+    let ledger = fleet_state::read_ledger(&runtime_paths.state_dir)
+        .map_err(|error| CliFailure::new(fleet_state::EXIT_FLEET_UNKNOWN, error))?;
     let quarantined = exclude_quarantined(&mut plans, &ledger);
 
     if !args.apply {
@@ -317,7 +338,7 @@ pub(super) fn run_fleet_update<W: Write>(
     let mut skipped_current = Vec::new();
     if args.lagging_only {
         let (lagging, current) = partition_lagging(plans, &target, |plan| {
-            reconcile::probe_version_at(
+            fleet_state::probe_version_at(
                 &plan.class,
                 plan.ssh.as_deref(),
                 Some(&plan.binary.display().to_string()),
@@ -338,7 +359,7 @@ pub(super) fn run_fleet_update<W: Write>(
     if !quarantined.is_empty() {
         let _ = writeln!(
             std::io::stderr(),
-            "fleet-update: skipped quarantined host(s) {}; clear with `shipyard runner fleet-reconcile --clear-host <class>` once fixed",
+            "fleet-update: skipped quarantined host(s) {}; clear with `shipyard runner fleet-update --clear-host <class>` once fixed",
             quarantined.join(", ")
         );
     }
@@ -348,7 +369,7 @@ pub(super) fn run_fleet_update<W: Write>(
 /// Drop quarantined host classes from `plans`, returning their names.
 fn exclude_quarantined(
     plans: &mut Vec<HostUpdatePlan>,
-    ledger: &reconcile::AttemptLedger,
+    ledger: &fleet_state::RolloutLedger,
 ) -> Vec<String> {
     let quarantined = plans
         .iter()
@@ -368,9 +389,9 @@ fn partition_lagging<P>(
     mut probe: P,
 ) -> Result<(Vec<HostUpdatePlan>, Vec<String>), CliFailure>
 where
-    P: FnMut(&HostUpdatePlan) -> reconcile::HostVersion,
+    P: FnMut(&HostUpdatePlan) -> fleet_state::HostVersion,
 {
-    let target_version = reconcile::parse_version(target)
+    let target_version = fleet_state::parse_version(target)
         .ok_or_else(|| CliFailure::new(2, format!("target {target} is not vMAJOR.MINOR.PATCH")))?;
     let mut lagging = Vec::new();
     let mut current = Vec::new();
@@ -379,10 +400,10 @@ where
         let installed = probed
             .version
             .as_deref()
-            .and_then(reconcile::parse_version)
+            .and_then(fleet_state::parse_version)
             .ok_or_else(|| {
                 CliFailure::new(
-                    reconcile::EXIT_RECONCILE_UNKNOWN,
+                    fleet_state::EXIT_FLEET_UNKNOWN,
                     format!(
                         "cannot read the installed version on {} ({}); refusing to decide which hosts lag",
                         plan.class,
@@ -408,7 +429,7 @@ struct LiveOps<'a> {
 
 impl HostOps for LiveOps<'_> {
     fn installed_version(&mut self, plan: &HostUpdatePlan) -> Option<String> {
-        reconcile::probe_version_at(
+        fleet_state::probe_version_at(
             &plan.class,
             plan.ssh.as_deref(),
             Some(&plan.binary.display().to_string()),
@@ -480,6 +501,7 @@ mod non_unix_tests {
             apply: true,
             lagging_only: false,
             skip_canary_smoke: false,
+            clear_host: None,
         };
         let mut output = Vec::new();
         let error = fleet_update_command(
@@ -638,9 +660,7 @@ fn apply_plans<W: Write, O: HostOps>(
                 .join(", ");
             if failure.deferred {
                 return Err(RolloutFailure {
-                    ineligible: false,
                     rollback_failed_host: None,
-                    deferred: true,
                     failure: CliFailure::new(
                         EXIT_CONTROLLER_BUSY,
                         format!(
@@ -651,9 +671,7 @@ fn apply_plans<W: Write, O: HostOps>(
                 });
             }
             return Err(RolloutFailure {
-                ineligible: false,
                 rollback_failed_host: failure.rollback_failed.then(|| plan.class.clone()),
-                deferred: false,
                 failure: CliFailure::new(
                     if failure.rollback_failed {
                         EXIT_ROLLBACK_FAILED

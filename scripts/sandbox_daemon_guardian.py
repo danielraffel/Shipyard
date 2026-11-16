@@ -1811,7 +1811,7 @@ class Guardian:
                             f"{self.fleet_install_guard_path} for "
                             f"{FLEET_INSTALL_GUARD_WAIT_SECONDS:.0f}s; the host is "
                             "being updated, so rerun only the targeted Sandbox job "
-                            "once `shipyard runner fleet-reconcile` reports it current"
+                            "once `tartci fleet-macos tool-freshness` reports it current"
                         ) from None
                     time.sleep(FLEET_INSTALL_GUARD_POLL_SECONDS)
             _validate_open_lock_path(
