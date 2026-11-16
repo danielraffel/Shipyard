@@ -3118,7 +3118,7 @@ shipyard queue resume --repo OWNER/REPO --apply --json    # later: re-run what i
 - triage also reads the base head's checks. When a required context is red on
   the base, an open pull request that names that context next to a fix word
   (`fix`, `unblock`, `repair`, `restore`, `revert`) in its title or
-  description, or that carries the `shipyard:unblock` label, is an unblocking
+  description, or that carries the `shipyard:unblock`, `main-red-fix` or `fixes-main` label, is an unblocking
   candidate. With exactly one candidate, triage prioritizes it in the same
   pass. With several, it lists them and you choose with `queue prioritize`.
   `--no-prioritize-unblocking` reports without jumping.
@@ -4319,7 +4319,7 @@ more consecutive groups carrying different pull requests, none common to all
 of them, is poisoned, and `runner steward --json` reports it under
 `repos[].base_poison` with the context and its first error line. With
 `merge_group_hold = "on"` the steward then enqueues only a named fix (label
-`shipyard:unblock`, a title or description naming the context next to a fix
+`shipyard:unblock`, `main-red-fix` or `fixes-main`, a title or description naming the context next to a fix
 word, or the detector's `candidate_fix_pr`) and reports every other approved
 green head `held_base_poisoned:<context>`; it puts the fix's review first
 (machine-global `base_health.fix_review_priority_file` and

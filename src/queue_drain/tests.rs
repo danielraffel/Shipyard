@@ -674,6 +674,14 @@ fn fix_evidence_reads_the_label_or_a_fix_word_next_to_the_context() {
         )
         .is_empty()
     );
+    for label in ["main-red-fix", "fixes-main", "Main-Red-Fix", UNBLOCK_LABEL] {
+        let evidence = fix_evidence("chore: recheck", "", &[label.to_owned()], &contexts);
+        assert_eq!(
+            evidence,
+            vec![format!("label `{}`", label.to_ascii_lowercase())]
+        );
+    }
+    assert!(fix_evidence("chore: recheck", "", &["bug".to_owned()], &contexts).is_empty());
     // Negative controls: naming the context without a fix word, or a fix
     // word without the context, is not a fix.
     assert!(fix_evidence("Versioning & Skill-Sync notes", "", &[], &contexts).is_empty());
