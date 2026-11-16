@@ -154,6 +154,7 @@ pub fn gather(
     };
 
     fetch_required_contexts(actions, repo, base, &mut facts);
+    fetch_ruleset_contexts(actions, repo, base, &mut facts);
     fetch_variables(actions, repo, &mut facts);
     fetch_census(actions, repo, &mut facts);
 
@@ -261,6 +262,70 @@ fn fetch_required_contexts(
                 ));
             }
         }
+    }
+}
+
+/// Required contexts from repository rulesets, merged into the classic
+/// branch-protection result. One call.
+///
+/// A repository can require checks through a ruleset with no classic
+/// protection at all (the classic endpoint then answers 404), so reading only
+/// protection made the gate check nothing there. The two sources are a union,
+/// deduped by context.
+fn fetch_ruleset_contexts(actions: &GitHubActions, repo: &str, base: &str, facts: &mut FleetFacts) {
+    facts.api_calls += 1;
+    let encoded = crate::required_check_policy::encode_path_segment(base);
+    let raw = actions
+        .run_gh(&[
+            "api".to_owned(),
+            format!("repos/{repo}/rules/branches/{encoded}"),
+            "--paginate".to_owned(),
+            "--slurp".to_owned(),
+        ])
+        .map_err(|error| error.to_string());
+    merge_ruleset_contexts(facts, raw, base);
+}
+
+/// Fold one ruleset read into `facts`. Split from the fetch so the merge is
+/// testable without a network.
+fn merge_ruleset_contexts(facts: &mut FleetFacts, raw: Result<String, String>, base: &str) {
+    let checks = raw.and_then(|raw| {
+        let value: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|error| format!("repository rulesets JSON malformed: {error}"))?;
+        crate::required_check_policy::evaluated_required_checks(&value)
+    });
+    match checks {
+        Ok(checks) => {
+            let mut contexts: Vec<String> = facts.required_contexts.clone().unwrap_or_default();
+            let had_protection = !contexts.is_empty();
+            let before = contexts.len();
+            for check in checks {
+                if !contexts.contains(&check.context) {
+                    contexts.push(check.context);
+                }
+            }
+            if contexts.len() == before {
+                return;
+            }
+            // A ruleset answered: the branch is not unprotected, whatever the
+            // classic endpoint said, so drop the finding it raised.
+            facts.protection_absent = false;
+            facts.warnings.retain(|warning| {
+                !(warning.contains("is NOT protected")
+                    || warning.contains("returned no required contexts"))
+            });
+            facts.required_contexts = Some(contexts);
+            (if had_protection {
+                "branch_protection+ruleset"
+            } else {
+                "ruleset"
+            })
+            .clone_into(&mut facts.contexts_source);
+        }
+        Err(error) => facts.warnings.push(format!(
+            "repository rulesets unreadable for `{base}` ({error}); required checks defined by a \
+             ruleset were NOT included, so the contexts checked may be a narrower set"
+        )),
     }
 }
 
@@ -470,5 +535,83 @@ fn write_cache(path: &Path, cached: &CachedFacts) {
     }
     if let Ok(raw) = serde_json::to_string_pretty(cached) {
         let _ = std::fs::write(path, raw);
+    }
+}
+
+#[cfg(test)]
+mod ruleset_tests {
+    use super::*;
+
+    fn rule(contexts: &[&str]) -> String {
+        let checks: Vec<_> = contexts
+            .iter()
+            .map(|context| serde_json::json!({"context": context}))
+            .collect();
+        serde_json::json!([[{
+            "type": "required_status_checks",
+            "parameters": {"required_status_checks": checks}
+        }]])
+        .to_string()
+    }
+
+    fn classic_404() -> FleetFacts {
+        FleetFacts {
+            contexts_source: "config".to_owned(),
+            protection_absent: true,
+            warnings: vec!["branch `main` is NOT protected (HTTP 404)".to_owned()],
+            ..FleetFacts::default()
+        }
+    }
+
+    #[test]
+    fn a_ruleset_only_repo_yields_its_contexts() {
+        let mut facts = classic_404();
+        merge_ruleset_contexts(
+            &mut facts,
+            Ok(rule(&["Test macOS ARM64", "review-verdict"])),
+            "main",
+        );
+        assert_eq!(
+            facts.required_contexts,
+            Some(vec![
+                "Test macOS ARM64".to_owned(),
+                "review-verdict".to_owned()
+            ])
+        );
+        assert_eq!(facts.contexts_source, "ruleset");
+        assert!(!facts.protection_absent);
+        assert!(facts.warnings.iter().all(|w| !w.contains("NOT protected")));
+    }
+
+    #[test]
+    fn both_sources_are_a_deduped_union() {
+        let mut facts = FleetFacts {
+            required_contexts: Some(vec!["macos".to_owned(), "lint".to_owned()]),
+            contexts_source: "branch_protection".to_owned(),
+            ..FleetFacts::default()
+        };
+        merge_ruleset_contexts(&mut facts, Ok(rule(&["lint", "review-verdict"])), "main");
+        assert_eq!(
+            facts.required_contexts,
+            Some(vec![
+                "macos".to_owned(),
+                "lint".to_owned(),
+                "review-verdict".to_owned()
+            ])
+        );
+        assert_eq!(facts.contexts_source, "branch_protection+ruleset");
+    }
+
+    #[test]
+    fn an_unreadable_ruleset_warns_and_changes_nothing() {
+        let mut facts = classic_404();
+        merge_ruleset_contexts(&mut facts, Err("HTTP 403".to_owned()), "main");
+        assert_eq!(facts.required_contexts, None);
+        assert!(
+            facts
+                .warnings
+                .iter()
+                .any(|w| w.contains("rulesets unreadable") && w.contains("HTTP 403"))
+        );
     }
 }
