@@ -29,6 +29,12 @@ DEFAULT_LOCAL_ENV_FILES = (
 )
 PUBLIC_ASSET_VISIBILITY_TIMEOUT_SECS = 90
 PUBLIC_ASSET_VISIBILITY_POLL_SECS = 3
+# The mounted DMG did not launch, or a binary in it reported a version other
+# than the tag. Nothing has been uploaded.
+LAUNCH_GATE_FAILED_EXIT = 3
+# The public install.sh path did not end in the tag's binaries; the release is
+# returned to draft.
+INSTALL_E2E_FAILED_EXIT = 4
 # Distinct from every earlier failure: the release is public and installable,
 # but at least one fleet host did not verify at it.
 FLEET_ROLLOUT_FAILED_EXIT = 6
@@ -81,9 +87,11 @@ class CommandRunner:
             capture_output=capture,
         )
         if result.returncode != 0:
-            detail = f"command failed ({result.returncode}): {' '.join(args)}"
+            # Never echo a credential: curl calls carry an Authorization header.
+            shown = " ".join(package_release.redact_args(args))
+            detail = f"command failed ({result.returncode}): {shown}"
             if result.stderr:
-                detail = f"{detail}\n{result.stderr.strip()}"
+                detail = f"{detail}\n{package_release.redact_text(result.stderr.strip())}"
             raise SystemExit(detail)
         return result.stdout.strip() if capture else ""
 
@@ -275,6 +283,7 @@ def package_signed_dmg(config: ReleaseConfig) -> Path:
         "--dmg",
         "--sign-macos",
         "--notarize",
+        "--version-must-match-tag",
     ]
     # Publication is never allowed to soften the mounted-DMG launch gate.
     if config.ci_mode and not config.upload:
@@ -288,7 +297,11 @@ def package_signed_dmg(config: ReleaseConfig) -> Path:
     if config.cargo_target:
         args.extend(["--cargo-target", config.cargo_target])
 
-    artifacts = package_release.package(package_release.parse_args(args))
+    try:
+        artifacts = package_release.package(package_release.parse_args(args))
+    except package_release.LaunchGateFailed as error:
+        print(f"mount and launch gate failed: {error.code}", file=sys.stderr)
+        raise SystemExit(LAUNCH_GATE_FAILED_EXIT) from error
     if len(artifacts) != 1 or artifacts[0].suffix != ".dmg":
         raise SystemExit(f"expected one DMG artifact, got: {artifacts}")
     return artifacts[0]
@@ -767,7 +780,8 @@ def publish_if_ready(config: ReleaseConfig, runner: CommandRunner) -> str:
     try:
         wait_for_public_release_assets(config, runner)
         run_install_e2e(config, runner)
-    except SystemExit:
+    except SystemExit as error:
+        print(f"install E2E failed for {config.tag}: {error.code}", file=sys.stderr)
         runner.run(
             [
                 "gh",
@@ -779,7 +793,7 @@ def publish_if_ready(config: ReleaseConfig, runner: CommandRunner) -> str:
                 "--draft=true",
             ]
         )
-        raise SystemExit(4)
+        raise SystemExit(INSTALL_E2E_FAILED_EXIT) from error
 
     return "published" if did_publish else "already-public"
 
@@ -862,17 +876,21 @@ def run_install_e2e(config: ReleaseConfig, runner: CommandRunner) -> str:
                 ["bash", str(config.install_sh)],
                 env=_install_env(config, install_dir, tag),
             )
+            # Each install must run the tag it asked for, including the
+            # baseline and rollback installs of --rollback-tag.
             output = runner.run([str(binary), "--version"], capture=True)
-            primary_version = package_release.parse_binary_version(
+            primary_version = package_release.require_version_equals_tag(
                 output,
                 package_release.BIN_NAME,
+                tag,
                 source=f"{phase} installed CLI",
             )
             if _provider_expected_for_tag(tag):
                 provider_output = runner.run([str(companion), "--version"], capture=True)
-                provider_version = package_release.parse_binary_version(
+                provider_version = package_release.require_version_equals_tag(
                     provider_output,
                     package_release.COMPANION_BIN_NAME,
+                    tag,
                     source=f"{phase} installed provider",
                 )
                 if provider_version != primary_version:
@@ -965,7 +983,7 @@ def run_fleet_rollout(config: ReleaseConfig, runner: CommandRunner, shipyard: st
     # Only hosts behind the tag: reinstalling a current host restarts its daemon
     # and cannot be rolled back (there is no earlier version to restore).
     command = [*plan, "--apply", "--lagging-only"]
-    print(f"fleet rollout: {' '.join(command)}")
+    print(f"fleet rollout: {' '.join(package_release.redact_args(command))}")
     code, stdout, stderr = runner.run_status(command)
     if code == FLEET_CONTROLLER_BUSY_EXIT:
         print(

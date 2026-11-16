@@ -139,6 +139,20 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn('--companion-binary "${{ matrix.companion_binary }}"', text)
         self.assertIn("target/release/shipyard-workstream-provider --version", text)
 
+    def test_tag_builds_require_binary_versions_to_equal_the_tag(self) -> None:
+        steps = self._steps("build")
+        step = next(s for s in steps if s.startswith("name: Package non-macOS artifact"))
+        # Same predicate the release job publishes on, read from the runner
+        # environment rather than a new expression interpolation.
+        self.assertIn('if [[ "$GITHUB_REF" == refs/tags/v* ]]; then', step)
+        self.assertIn("tag_args=(--version-must-match-tag)", step)
+        self.assertIn('--tag "${{ github.ref_name }}"', step)
+        self.assertIn('"${tag_args[@]}"', step)
+        self.assertIn(
+            "if: always() && startsWith(github.ref, 'refs/tags/v')",
+            RELEASE_WORKFLOW.read_text(encoding="utf-8"),
+        )
+
     def test_release_workflow_binds_and_verifies_artifact_identity(self) -> None:
         text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("scripts/release_artifact_manifest.py write", text)
