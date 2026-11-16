@@ -282,6 +282,11 @@ def steward_evidence(rd, f):
     return state == "enq" or (state == "approve" and not held)
 
 
+def reads_complete(f):
+    """Whether the timeline and the commit list were read in full: only then are they a settled fact about the PR."""
+    return bool(f.get("timeline_complete") and f.get("commits_complete"))
+
+
 def finalize(rd, f, pr):
     """Facts that depend on inputs that change independently of the cached reduction, recomputed on every run:
     the opener and body (from the PR list), the stamp (body, commits and timeline kept apart), and the steward
@@ -291,7 +296,9 @@ def finalize(rd, f, pr):
     f["provenance"] = bool(PROVENANCE_RE.search(body))
     f["stamp"] = bool(STAMP_RE.search(body)) or bool(f.get("stamp_commit")) or bool(f.get("agent_events"))
     try:
-        f["steward_path"] = bool(f.get("merged_at")) and any(e[0] == "merged" for e in f["owner_events"]) and steward_evidence(rd, f)
+            # a hidden later HOLD, removal or push could cancel the evidence, so a partial read proves nothing
+        f["steward_path"] = (bool(f.get("merged_at")) and reads_complete(f) and any(e[0] == "merged" for e in f["owner_events"])
+                             and steward_evidence(rd, f))
     except Truncated:  # the policy could not be read within the cap: no approval is trusted this run
         f["steward_path"] = False
     return f
@@ -436,7 +443,12 @@ def north_star(f, commits=True, attributed=True):
     m = iso(f.get("merged_at"))
     end = min(m, h) if m else h
     events, _ = effective_owner_events(f, attributed)
-    if any(r <= iso(ts) <= end for _, ts in events):
+    inside = [e for e in events if r <= iso(e[1]) <= end]
+    if inside:
+        if attributed and not reads_complete(f) and all(e[0] == "merged" for e in inside):
+            # an owner-account merge that could have been the steward's: with a partial read there is no
+            # telling, so it is unknown rather than a claimed human action
+            return "unknown"
         return "owner_action"
     if not m or m > h:
         return "not_merged"
@@ -515,7 +527,7 @@ def pr_compute(rd, f, runs, runs_complete):
         repeats += k in seen
         seen[k] = True
     sh = ho = 0.0
-    complete = runs_complete
+    complete = runs_complete and reads_complete(f)  # the heads come from the timeline and the commits
     for r in mine.values():
         a, b, ok = job_minutes(rd, r)
         sh += a
@@ -799,12 +811,12 @@ def collect_repo(repo, cache_dir, cap, owner, lo, hi, now, ticks, tick_ctx, fetc
     facts = []
     for pr in prs:
         f = rd.load("facts", str(pr["number"]))
-        if f is not None and f.get("v") != FACTS_VERSION:
-            f = None  # cached by an older reduction without the attribution facts (trailer, stamp, verdict path): read again once
+        if f is not None and (f.get("v") != FACTS_VERSION or not reads_complete(f)):
+            f = None  # an older reduction, or one cached from a partial read (an entry saved before partial reads were refused): read again
         if f is None:
             try:
                 f = pr_facts(rd, pr, owner)
-                if f["state"] == "closed":  # a closed PR does not change; an open one is read again next run
+                if f["state"] == "closed" and reads_complete(f):  # a closed PR does not change; an open one, or a partial read, is read again next run
                     rd.save("facts", str(pr["number"]), f)
             except (Truncated, ReadError):
                 res["unread"] += 1

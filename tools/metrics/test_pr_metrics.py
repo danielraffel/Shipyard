@@ -526,6 +526,65 @@ class Attribution(Base):
         r, _ = self.run_one(self.merged_pr(), [self.review(self.APPROVE), dis, self.MERGE], cm=[commit("c1", "x", "w")])
         self.assertEqual(r["north"], "owner_action")
 
+    NOISE = {"event": "subscribed", "actor": {"login": "x"}, "created_at": T(10, "10:00")}
+
+    def long_timeline(self, head_events, pages=5):
+        """`pages` full pages of 100: the read stops at its page cap and is incomplete."""
+        first = head_events + [self.NOISE] * (100 - len(head_events))
+        return lambda path: first if "page=1" in path else [self.NOISE] * 100
+
+    def long_commits(self, pages=3):
+        mk = lambda i: commit(f"k{i}", "x", "w", date=T(10, "09:00"))
+        return lambda path: [mk(i) for i in range(100)]
+
+    def test_an_incomplete_timeline_is_not_cached_and_is_read_again(self):
+        p = self.merged_pr()
+        tl = {1: self.long_timeline([self.enq("10:40"), self.MERGE])}
+        gh = world([p], tl, {1: [commit("c1", "x", "w")]})
+        out = self.build(gh)
+        self.assertFalse(os.path.exists(os.path.join(self.cache, REPO.replace("/", "__"), "facts", "1.json")))
+        gh2 = world([p], tl, {1: [commit("c1", "x", "w")]})
+        self.build(gh2)
+        self.assertTrue([c for c in gh2.calls if "timeline" in c])
+
+    def test_a_legacy_cache_entry_from_a_partial_read_is_read_again(self):
+        old = {"v": pm.FACTS_VERSION, "number": 1, "base": "main", "created_at": T(10, "10:00"), "merged_at": T(10, "11:00"), "state": "closed",
+               "merge_commit_sha": "m", "first_ready": T(10, "10:00"), "owner_events": [], "agent_events": [], "steward_seq": [],
+               "ambiguous_commits": [], "repair_cycles": 0, "holds": 0, "re_holds": 0, "size": None,
+               "pushes": {"repair": 0, "author": 0, "merge_main": 0}, "enqueues": 0, "ejections": [], "labels": [], "heads": ["h"],
+               "timeline_complete": False, "commits_complete": True, "agent_trailer": False, "stamp_commit": False}
+        d = os.path.join(self.cache, REPO.replace("/", "__"), "facts")
+        os.makedirs(d)
+        with open(os.path.join(d, "1.json"), "w") as fh:
+            json.dump(old, fh)
+        gh = world([self.merged_pr()], {1: []}, {1: [commit("c1", "x", "w")]})
+        self.build(gh)
+        self.assertTrue([c for c in gh.calls if "timeline" in c])
+
+    def test_an_incomplete_timeline_with_an_apparent_steward_path_is_not_a_steward_merge(self):
+        tl = {1: self.long_timeline([self.enq("10:40"), self.MERGE])}
+        r = self.rows(self.build(world([self.merged_pr()], tl, {1: [commit("c1", "x", "w")]})))[1]
+        self.assertEqual((r["attribution"]["steward_merge_recognised"], r["north"]), (False, "unknown"))
+        # the same events read in full are a steward merge
+        r, _ = self.run_one(self.merged_pr(), [self.enq("10:40"), self.MERGE], cm=[commit("c1", "x", "w")])
+        self.assertEqual((r["attribution"]["steward_merge_recognised"], r["north"]), (True, "autonomous"))
+
+    def test_incomplete_commits_with_an_apparent_steward_path_are_not_a_steward_merge(self):
+        gh = world([self.merged_pr()], {1: [self.enq("10:40"), self.MERGE]}, {1: self.long_commits()})
+        r = self.rows(self.build(gh))[1]
+        self.assertEqual((r["attribution"]["steward_merge_recognised"], r["north"]), (False, "unknown"))
+
+    def test_a_partial_read_does_not_hide_a_definite_owner_action(self):
+        label = {"event": "labeled", "actor": {"login": OWNER}, "created_at": T(10, "10:30")}
+        tl = {1: self.long_timeline([label, self.enq("10:40"), self.MERGE])}
+        r = self.rows(self.build(world([self.merged_pr()], tl, {1: [commit("c1", "x", "w")]})))[1]
+        self.assertEqual(r["north"], "owner_action")
+
+    def test_compute_from_partial_heads_is_not_complete(self):
+        f = {"heads": ["h"], "base": "main", "number": 1, "timeline_complete": True, "commits_complete": False}
+        c = pm.pr_compute(None, f, [], True)
+        self.assertFalse(c["complete"])
+
     def test_an_enqueue_by_anyone_but_the_app_is_not_evidence(self):
         enq = {"event": "added_to_merge_queue", "actor": {"login": "someone"}, "created_at": T(10, "10:40")}
         r, _ = self.run_one(self.merged_pr(), [enq, self.MERGE], cm=[commit("c1", "x", "w")])
