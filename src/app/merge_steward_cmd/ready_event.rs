@@ -21,7 +21,9 @@
 //!   as ready, is skipped;
 //! - a base with a poison reading other than clear, a paused queue entry, or
 //!   a pending run cancellation is skipped;
-//! - a ledger lock another pass holds is skipped, never waited on.
+//! - a ledger lock another pass holds is skipped, never waited on;
+//! - under the lock, the base's merge groups are read again, and a head with
+//!   a flake re-enqueue the tick's breaker sweep has not judged is skipped.
 //!
 //! See `docs/scheduling-loop.md`, "Ready on event".
 
@@ -450,6 +452,18 @@ pub(super) fn admit_ready_event(
     if !ledger.pending_cancellations.is_empty() {
         return ReadyEventOutcome::skipped(event, apply, "pending_cancellations");
     }
+    // The tick runs the flake breaker's sweep before any admission; this
+    // path does not. A head whose flake re-enqueue the sweep has not judged
+    // yet (the queue may have ejected it again on the same signature) is the
+    // tick's: it sweeps, then decides.
+    if super::flake_requeue::unswept_requeue(
+        &ledger,
+        &observation.repo,
+        pr.fact.number,
+        &pr.fact.head_sha,
+    ) {
+        return ReadyEventOutcome::skipped(event, apply, "flake_requeue_unswept");
+    }
     // The decision again, on the ledger the lock protects.
     let decision = classify_pr(
         &pr.fact,
@@ -472,6 +486,16 @@ pub(super) fn admit_ready_event(
     let mut removal_cache = ledger.removal_ledger.clone();
     let defect_fix =
         super::defect_fix_removals::read(&reads.defect_fix_ledger, &mut removal_cache, now);
+    // The base's merge groups again, under the lock: the reading above was
+    // taken before it, and a pass that held the lock may have seen the base
+    // turn poisoned since.
+    let base_poison =
+        super::base_poison::observe(actions, &observation, &policy, &BTreeMap::new(), now);
+    if let Some(poison) = base_poison.as_ref()
+        && !matches!(poison.health, MergeGroupHealth::Clear { .. })
+    {
+        return ReadyEventOutcome::skipped(event, apply, "base_poison_not_clear");
+    }
     let context = MutationApplyContext {
         actions,
         observation: &observation,

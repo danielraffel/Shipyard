@@ -532,6 +532,17 @@ fn short(sha: &str) -> &str {
     sha.get(..12).unwrap_or(sha)
 }
 
+/// Whether `head` of `pr` carries a flake re-enqueue that [`sweep`] has not
+/// judged yet. Only the tick sweeps, so a ready-on-event admission leaves
+/// such a head to it.
+pub(super) fn unswept_requeue(ledger: &StewardLedger, repo: &str, pr: u64, head: &str) -> bool {
+    ledger
+        .flake_requeue
+        .requeued
+        .get(&receipt_key(repo, pr, head))
+        .is_some_and(|receipt| !receipt.swept)
+}
+
 pub(super) fn receipt_key(repo: &str, pr: u64, head: &str) -> String {
     format!(
         "{}#{pr}@{}",

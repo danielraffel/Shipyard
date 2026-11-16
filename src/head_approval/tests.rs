@@ -2709,7 +2709,7 @@ impl History {
 
     /// Merge the base into the approved head, letting `edit` change the
     /// merge before it is committed.
-    fn merge(&self, edit: impl FnOnce(&Self)) -> String {
+    pub(crate) fn merge(&self, edit: impl FnOnce(&Self)) -> String {
         self.git(&["checkout", "-q", "-B", "head", &self.approved]);
         self.git(&["merge", "-q", "--no-commit", "main"]);
         edit(self);

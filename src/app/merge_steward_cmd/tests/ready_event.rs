@@ -582,6 +582,40 @@ fn pending_cancellations_leave_the_head_to_the_tick() {
     assert_eq!(harness.enqueues(), 0);
 }
 
+/// The tick sweeps the flake breaker before it admits; this path does not,
+/// so a head with a flake re-enqueue the sweep has not judged is the tick's.
+/// Control: once swept, the same head is admitted.
+#[test]
+fn an_unswept_flake_requeue_leaves_the_head_to_the_tick() {
+    let receipted = |swept: bool| {
+        let mut ledger = StewardLedger::default();
+        ledger.flake_requeue.requeued.insert(
+            crate::app::merge_steward_cmd::flake_requeue::receipt_key("owner/repo", 42, HEAD),
+            crate::app::merge_steward_cmd::flake_requeue::Receipt {
+                repo: "owner/repo".to_owned(),
+                signature: "macos: flaky".to_owned(),
+                ejection_at: "2026-11-13T00:10:00Z".to_owned(),
+                at: "2026-11-13T00:20:00Z".to_owned(),
+                state: crate::app::merge_steward_cmd::flake_requeue::ReceiptState::Done,
+                attempts: 1,
+                swept,
+            },
+        );
+        ledger
+    };
+    let harness = Harness::new(&Fixture::approved());
+    harness.save(&receipted(false));
+    let outcome = harness.admit(HEAD, &observed(HEAD));
+    assert_eq!(outcome.reason, "flake_requeue_unswept", "{outcome:?}");
+    assert_eq!(harness.enqueues(), 0);
+
+    let swept = Harness::new(&Fixture::approved());
+    swept.save(&receipted(true));
+    let outcome = swept.admit(HEAD, &observed(HEAD));
+    assert_eq!(outcome.outcome, "admitted", "{outcome:?}");
+    assert_eq!(swept.enqueues(), 1);
+}
+
 #[test]
 fn a_head_removed_for_a_defect_is_refused_by_the_admission() {
     let harness = Harness::new(&Fixture::approved());
@@ -646,4 +680,142 @@ fn a_base_with_no_queue_merges_the_exact_head() {
     assert!(calls.contains("mergePullRequest("), "{calls}");
     assert!(calls.contains("expectedHeadOid"), "{calls}");
     assert!(!calls.contains("enqueuePullRequest"), "{calls}");
+}
+
+/// A dry run's gate read on a head whose approval carries (a merge of the
+/// base into the approved head) leaves `carries.jsonl` byte-identical: the
+/// report reads the gate as a report. The gate's `gh` answers are recorded
+/// from the git-backed history the carry tests use and replayed by the fake
+/// `gh`, so the admission reaches the carry path; `would_admit` proves it
+/// did (an unrecorded read would make the gate unreadable instead).
+#[test]
+fn a_dry_run_on_a_carried_approval_writes_no_carry_log() {
+    use crate::head_approval::tests::{History, empty_queue};
+    use std::cell::RefCell;
+
+    let history = History::new(false);
+    let head = history.merge(|_| {});
+    let guards = tempfile::tempdir().expect("guards");
+    let log = guards.path().join("carries.jsonl");
+    fs::write(&log, "{\"kind\":\"rebase\",\"earlier\":true}\n").expect("seed");
+    let before = fs::read(&log).expect("log");
+
+    let mut observation = observed(&head);
+    observation.repo = "danielraffel/tartci".to_owned();
+    observation.prs[0].fact.number = 7;
+    let pr = observation.prs[0].clone();
+    let queue = empty_queue(&head);
+
+    // Record every read the report's gate makes, from the history.
+    let recorded: RefCell<Vec<(String, Result<String, String>)>> = RefCell::default();
+    let record = |args: &[String]| {
+        let answer = history.gh(args);
+        recorded.borrow_mut().push((args.join(" "), answer.clone()));
+        answer
+    };
+    let gate = crate::head_approval::with_guards_dir(guards.path(), || {
+        crate::head_approval::with_host_review_default(true, || {
+            let policy =
+                crate::head_approval::read_policy_required(&record, &observation.repo, "main")
+                    .expect("policy");
+            crate::app::merge_steward_cmd::pr_mutations::report_gate_with(
+                &record,
+                &observation,
+                &pr,
+                &policy,
+                &queue,
+                &StewardLedger::default(),
+            )
+        })
+    })
+    .expect("gate")
+    .0;
+    assert!(
+        matches!(
+            gate,
+            crate::head_approval::HeadGate::Approved {
+                approval: crate::head_approval::Approval::Carried { .. }
+            }
+        ),
+        "{gate:?}"
+    );
+    assert_eq!(fs::read(&log).expect("log"), before);
+
+    // Replay them from the fake `gh`, with the admission's other reads.
+    let temp = tempfile::tempdir().expect("temp");
+    let calls = temp.path().join("recorded");
+    fs::create_dir(&calls).expect("recorded");
+    for (index, (args, answer)) in recorded.borrow().iter().enumerate() {
+        let base = calls.join(format!("{index:03}"));
+        fs::write(base.with_extension("args"), args).expect("args");
+        let (out, rc) = match answer {
+            Ok(out) => (out.clone(), 0),
+            Err(error) => (error.clone(), 1),
+        };
+        fs::write(base.with_extension("out"), out).expect("out");
+        fs::write(base.with_extension("rc"), rc.to_string()).expect("rc");
+    }
+    let queue_json = queue.to_string();
+    let script = format!(
+        r#"
+# CONFIG_ERROR: the recorded history answers the policy read
+# CARRIED_COMMITS: and the compare reads the carry makes
+for f in '{calls}'/*.args; do
+  if [ "$*" = "$(cat "$f")" ]; then
+    b="${{f%.args}}"; rc=$(cat "$b.rc")
+    if [ "$rc" = 0 ]; then cat "$b.out"; else cat "$b.out" >&2; fi
+    exit "$rc"
+  fi
+done
+case "$*" in
+  *"isInMergeQueue"*) printf '%s' '{queue_json}' ;;
+  *"pulls/7 --jq [.head.ref, .base.ref]"*) printf 'head\nmain\n' ;;
+  *"actions/runs?event=merge_group"*) printf '%s' '{{"workflow_runs":[]}}' ;;
+  *) printf '%s\n' "$*" >> '{calls}/unmatched'; echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+        calls = calls.display(),
+    );
+    let actions = fake_gh(&temp, &script);
+    let control = mutation_control(&temp, "studio", "studio");
+    let ledger_path = control.state_dir.join("merge-steward.json");
+    let event = ReadyEvent {
+        repo: observation.repo.clone(),
+        base: "main".to_owned(),
+        number: 7,
+        head: head.clone(),
+    };
+    let observe = || Ok(observation.clone());
+    let fleet = || Ok(vec!["danielraffel/tartci".to_owned()]);
+    let rest = || Ok(5_000);
+    let outcome = crate::head_approval::with_guards_dir(guards.path(), || {
+        crate::head_approval::with_host_review_default(true, || {
+            admit_ready_event(
+                &actions,
+                &control,
+                &ledger_path,
+                &event,
+                false,
+                Duration::from_secs(60),
+                &ReadyReads {
+                    observe: &observe,
+                    fleet_repos: &fleet,
+                    rest_remaining: &rest,
+                    defect_fix_ledger: temp.path().join("queue-removals.jsonl"),
+                },
+                Utc::now(),
+            )
+        })
+    });
+    assert_eq!(
+        outcome.outcome,
+        "would_admit",
+        "{outcome:?}; unmatched: {}",
+        fs::read_to_string(calls.join("unmatched")).unwrap_or_default()
+    );
+    assert_eq!(
+        fs::read(&log).expect("log"),
+        before,
+        "a dry run wrote a carry"
+    );
 }
