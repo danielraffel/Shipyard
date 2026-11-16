@@ -7,7 +7,7 @@ branch, which App-opened pull requests need) checks out the bare branch
 head. Diffed two-dot against `origin/main`, that head reports every commit
 main gained since the branch was cut as the branch's own change: once
 version-at-land bumps `Cargo.toml` on main, every such run fails with
-"Versions are owned by version-at-land". The base for those runs is
+"Version files are owned by version-at-land". The base for those runs is
 where the branch left main.
 
 usage: resolve_diff_base.py --event EVENT [--base-ref REF] [--default-branch main]

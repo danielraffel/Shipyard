@@ -178,10 +178,46 @@ class VersionValueGateTests(unittest.TestCase):
         self.commit()
         self.assert_refused("Cargo.toml")
 
-    def test_multiline_description_without_a_version_line_passes(self) -> None:
+    def test_package_table_edit_fails(self) -> None:
         self.edit("Cargo.toml", 'name = "shipyard"\n',
                   'name = "shipyard"\ndescription = """\nCross-platform CI.\n"""\n')
         self.commit()
+        self.assert_refused("Cargo.toml")
+
+    def test_build_script_in_package_fails(self) -> None:
+        self.edit("Cargo.toml", 'edition = "2021"\n', 'edition = "2021"\nbuild = "build.rs"\n')
+        self.commit()
+        self.assert_refused("Cargo.toml")
+
+    def test_build_target_and_workspace_tables_fail(self) -> None:
+        for name, addition in (
+            ("workspace", '\n[workspace]\nmembers = ["x"]\n'),
+            ("lib", '\n[lib]\npath = "src/other.rs"\n'),
+            ("bin", '\n[[bin]]\nname = "planted"\npath = "src/planted.rs"\n'),
+            ("example", '\n[[example]]\nname = "planted"\npath = "src/planted.rs"\n'),
+            ("test", '\n[[test]]\nname = "planted"\npath = "src/planted.rs"\n'),
+            ("bench", '\n[[bench]]\nname = "planted"\npath = "src/planted.rs"\n'),
+        ):
+            with self.subTest(table=name):
+                run(self.repo, "git", "reset", "-q", "--hard", self.base)
+                with (self.repo / "Cargo.toml").open("a") as manifest:
+                    manifest.write(addition)
+                self.commit()
+                self.assert_refused("Cargo.toml")
+
+    def test_top_level_target_discovery_keys_fail(self) -> None:
+        for key in ("autobins", "autoexamples", "autotests", "autobenches"):
+            with self.subTest(key=key):
+                run(self.repo, "git", "reset", "-q", "--hard", self.base)
+                text = (self.repo / "Cargo.toml").read_text()
+                (self.repo / "Cargo.toml").write_text(f"{key} = false\n" + text)
+                self.commit()
+                self.assert_refused("Cargo.toml")
+
+    def test_profile_and_lint_edits_pass(self) -> None:
+        with (self.repo / "Cargo.toml").open("a") as manifest:
+            manifest.write('\n[profile.release]\nlto = true\n\n[lints.clippy]\npedantic = "warn"\n')
+        self.commit("chore: tune profile")
         self.assert_passes()
 
     def test_downstream_reader_matches_the_release_tagger(self) -> None:
@@ -190,17 +226,11 @@ class VersionValueGateTests(unittest.TestCase):
         self.assertEqual(version_bump_check._CARGO_DOWNSTREAM_VERSION_RES[0].pattern,
                          r'(?ms)^\[package\].*?^\s*version\s*=\s*"([^"]+)"')
 
-    def test_non_utf8_version_file_fails(self) -> None:
-        (self.repo / ".claude-plugin/plugin.json").write_bytes(
-            PLUGIN.replace('"CI"', '"C\\u00ff"').encode() + b"\xff\n")
+    def test_non_utf8_cargo_toml_fails(self) -> None:
+        (self.repo / "Cargo.toml").write_bytes(CARGO.encode() + b"# \xff\n")
         self.commit()
-        self.assertEqual(self.value_edits(), [".claude-plugin/plugin.json"])
-        self.assertNotEqual(self.gate().returncode, 0)
-
-    def test_json_top_level_array_fails(self) -> None:
-        (self.repo / ".claude-plugin/plugin.json").write_text('[{"version": "0.111.0"}]\n')
-        self.commit()
-        self.assertEqual(self.value_edits(), [".claude-plugin/plugin.json"])
+        self.assertEqual(self.value_edits(), ["Cargo.toml"])
+        # read_version in assess_surfaces exits on it before the report.
         self.assertNotEqual(self.gate().returncode, 0)
 
     def test_without_tomllib_a_cargo_edit_keeps_the_whole_file_rule(self) -> None:
@@ -266,58 +296,58 @@ class VersionValueGateTests(unittest.TestCase):
         self.edit("Cargo.toml", 'version = "0.292.1"', 'version = "0.292.0"')
         self.assert_refused("Cargo.toml")
 
-    # Plugin manifests
+    # Symlinks and non-file entries
 
-    def test_plugin_json_non_version_edit_passes(self) -> None:
+    def swap_for_symlink(self, path: str) -> None:
+        """Replace `path` with a symlink whose target string is the old
+        contents, so its blob id is unchanged and only the mode moves."""
+        oid = run(self.repo, "git", "rev-parse", f"HEAD:{path}").stdout.strip()
+        run(self.repo, "git", "update-index", "--cacheinfo", f"120000,{oid},{path}")
+        run(self.repo, "git", "commit", "-qm", "chore: swap")
+        self.assertEqual(run(self.repo, "git", "rev-parse", f"HEAD:{path}").stdout.strip(), oid)
+
+    def test_symlink_swap_fails_for_every_version_file(self) -> None:
+        for path in ("Cargo.toml", "Cargo.lock", ".claude-plugin/plugin.json",
+                     ".claude-plugin/marketplace.json"):
+            with self.subTest(path=path):
+                run(self.repo, "git", "reset", "-q", "--hard", self.base)
+                self.swap_for_symlink(path)
+                self.assertEqual(self.value_edits(), [path])
+                self.assert_refused(path)
+
+    def test_tree_at_version_file_path_fails(self) -> None:
+        run(self.repo, "git", "rm", "-q", "Cargo.lock")
+        (self.repo / "Cargo.lock").mkdir()
+        (self.repo / "Cargo.lock/planted").write_text(LOCK)
+        self.commit()
+        self.assert_refused("Cargo.lock")
+
+    def test_executable_bit_flip_fails(self) -> None:
+        run(self.repo, "git", "update-index", "--chmod=+x", "Cargo.toml")
+        run(self.repo, "git", "commit", "-qm", "chore: chmod")
+        self.assert_refused("Cargo.toml")
+
+    # Plugin manifests keep the whole-file rule
+
+    def test_plugin_json_non_version_edit_fails(self) -> None:
         self.edit(".claude-plugin/plugin.json", '"description": "CI"', '"description": "CI agent"')
         self.commit()
-        self.assert_passes()
+        self.assert_refused(".claude-plugin/plugin.json")
 
     def test_plugin_json_version_edit_fails(self) -> None:
         self.edit(".claude-plugin/plugin.json", '"0.111.0"', '"0.112.0"')
         self.commit()
         self.assert_refused(".claude-plugin/plugin.json")
 
-    def test_plugin_json_duplicate_version_key_fails(self) -> None:
+    def test_plugin_json_min_shipyard_version_edit_fails(self) -> None:
         self.edit(".claude-plugin/plugin.json", '"version": "0.111.0"',
-                  '"version": "0.111.0",\n  "version": "9.9.9"')
+                  '"version": "0.111.0",\n  "min_shipyard_version": "0.500.0"')
         self.commit()
         self.assert_refused(".claude-plugin/plugin.json")
 
-    def test_plugin_json_removed_version_fails(self) -> None:
-        self.edit(".claude-plugin/plugin.json", ',\n  "version": "0.111.0"', "")
-        self.commit()
-        self.assert_refused(".claude-plugin/plugin.json")
-
-    def test_plugin_json_unparseable_fails(self) -> None:
-        self.edit(".claude-plugin/plugin.json", '"name"', "name")
-        self.commit()
-        self.assert_refused(".claude-plugin/plugin.json")
-
-    def test_marketplace_non_version_edit_passes(self) -> None:
+    def test_marketplace_non_version_edit_fails(self) -> None:
         self.edit(".claude-plugin/marketplace.json", '"description": "CI"',
                   '"description": "CI agent"')
-        self.commit()
-        self.assert_passes()
-
-    def test_marketplace_plugin_version_edit_fails(self) -> None:
-        self.edit(".claude-plugin/marketplace.json", '"version": "0.111.0"',
-                  '"version": "0.112.0"')
-        self.commit()
-        self.assert_refused(".claude-plugin/marketplace.json")
-
-    def test_marketplace_metadata_version_edit_fails(self) -> None:
-        # A second version location in the same file counts too.
-        self.edit(".claude-plugin/marketplace.json", '"0.1.8"', '"0.1.9"')
-        self.commit()
-        self.assert_refused(".claude-plugin/marketplace.json")
-
-    def test_marketplace_decoy_before_the_real_version_fails(self) -> None:
-        # The configured regex reads the first "version" after "plugins": [.
-        self.edit(".claude-plugin/marketplace.json", '[{"name": "shipyard"',
-                  '[{"author": {"version": "0.111.0"}, "name": "shipyard"')
-        self.edit(".claude-plugin/marketplace.json", '"CI", "version": "0.111.0"',
-                  '"CI", "version": "9.9.9"')
         self.commit()
         self.assert_refused(".claude-plugin/marketplace.json")
 

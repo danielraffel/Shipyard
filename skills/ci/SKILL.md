@@ -1002,7 +1002,7 @@ pull requests need `ci.yml` and `version-skill-check.yml` dispatched) checks
 out the branch head itself, and the gate scripts diff two-dot. Against
 `origin/main`, every commit main gained since the branch was cut reads as the
 branch's own change. Once version-at-land bumped `Cargo.toml` on main, every
-such run failed with "Versions are owned by version-at-land" while the
+such run failed with "Version files are owned by version-at-land" while the
 pull request's own run passed (#795, #799). Diff a non-`pull_request` run from
 `git merge-base origin/main HEAD` (`scripts/resolve_diff_base.py`). Before
 calling such a failure the pull request's, diff the branch from its merge base.
@@ -1269,12 +1269,12 @@ successful rotation.
 
 ## Version-at-land
 
-A normal PR does not change a version: `[package].version` (or the crate name)
-in `Cargo.toml`, the crate's own entry in `Cargo.lock`, or any `version` key in
-the plugin manifests. Other edits to those files, such as a dependency or a
-`[features]` entry, pass. The read-only version gate refuses a PR when a version
-value moves, when one of those files is added or deleted, or when its version
-cannot be read, unless the PR carries the explicit release recovery trailer. After merge, `version-at-land.yml` is the
+A normal PR does not edit the plugin manifests, and in `Cargo.toml` and
+`Cargo.lock` it edits only dependencies, features, profiles and lints: the
+`[package]` table, the build-target and workspace tables and the version line
+itself must not change. The read-only version gate refuses anything else,
+including an added, deleted, mode-changed or unparseable version file, unless
+the PR carries the explicit release recovery trailer. After merge, `version-at-land.yml` is the
 single writer and assigns the next versions. It never pushes to `main` (the
 ruleset requires PR-only checks): it rebuilds the bot-owned
 `release/version-at-land` branch with one cumulative bump commit, keeps a single
@@ -3958,7 +3958,7 @@ When the user says "push a PR", "ship this", "ship it", "we're done", "merge thi
 The orchestration, in order:
 
 1. `skill_sync_check.py --mode=report` — hard-fails if a mapped path was touched without a `SKILL.md` update or a `Skill-Update:` trailer on the tip commit.
-2. `version_bump_check.py --mode=report` rejects version changes (other edits to version files pass), and version-at-land assigns both surfaces after merge.
+2. `version_bump_check.py --mode=report` rejects version-file edits (dependency and feature edits in `Cargo.toml` and `Cargo.lock` pass), and version-at-land assigns both surfaces after merge.
 3. `git commit` + `gh pr create` + `shipyard ship`.
 4. If `[pr.provenance]` is configured, run its exact argv with the submitting session's environment. A required hook must succeed before any durable handoff or validation dispatch.
 5. With `[merge_steward].auto_handoff = true` on the protected base branch or explicit `--workstream-id`, write the exact-head server receipt and managed label immediately after provenance, before validation begins. The PR branch cannot enable the project default. The fallback workstream is `OWNER/REPO#PR` and the fallback context is the PR URL; `--no-steward-handoff` is an explicit override.

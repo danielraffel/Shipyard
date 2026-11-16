@@ -285,22 +285,25 @@ def release_version_file_exception(base: str, head: str) -> bool:
 
 # ── Version-value prohibition ──────────────────────────────────────────
 #
-# A pull request may edit a version file (a dependency or a [features] entry
-# in Cargo.toml, a description in plugin.json) as long as no version VALUE
-# moves. A file counts as a forbidden edit when its blob differs between base
-# and head and any of these holds:
+# Version files are refused whole in a pull request, except Cargo.toml and
+# Cargo.lock: there a dependency, feature, profile or lint edit passes, while
+# the [package] table, the build-target tables and the crate's own lockfile
+# version must not change. A version file counts as a forbidden edit when:
 #
 #   * it exists on only one side (added or deleted);
-#   * a strict parser cannot read it, or the configured reader disagrees with
-#     the strict parser, on either side;
-#   * any version location in it differs between the two sides;
-#   * no strict parser exists for it (the whole-file rule applies).
+#   * it is not a regular file (100644 or 100755) on either side, or its mode
+#     changed: a symlink whose target string equals the old contents keeps the
+#     same blob id while readers follow it somewhere else;
+#   * its blob differs and it is not Cargo.toml or Cargo.lock;
+#   * a strict parser cannot read it, or a regex reader of the version
+#     disagrees with the parser, on either side;
+#   * any locked part of it differs between the two sides.
 #
-# The configured readers are regexes, and a regex can be pointed at a decoy
-# (a single-quoted TOML version, or a nested "version" key placed first), so a
-# real parser is the authority and the regex must agree with it.
+# The regex readers can be pointed at a decoy (a single-quoted TOML version,
+# or an indented `version =` line inside a multi-line string), so tomllib is
+# the authority and every regex reader must agree with it.
 
-try:  # Python 3.11+. Without it every TOML file falls back to the whole-file rule.
+try:  # Python 3.11+. Without it Cargo.toml and Cargo.lock keep the whole-file rule.
     import tomllib as _tomllib
 except ModuleNotFoundError:  # pragma: no cover - CI runs 3.12
     _tomllib = None  # type: ignore[assignment]
@@ -319,23 +322,33 @@ _CARGO_DOWNSTREAM_VERSION_RES = (
     re.compile(r'(?ms)^\[package\].*?^\s*version\s*=\s*"([^"]+)"'),
 )
 
+# Cargo.toml tables and top-level keys a pull request may not change. The
+# [package] table carries the version, name, build script and target
+# discovery; the rest decide what is built. Dependency, feature, profile and
+# lint tables stay editable.
+_CARGO_LOCKED_KEYS = (
+    "package", "workspace", "lib", "bin", "example", "test", "bench",
+    "autobins", "autoexamples", "autotests", "autobenches",
+)
 
-def _git_blob(ref: str, path: str) -> str | None:
-    """Object id of `path` at `ref`, or None when the path is absent there.
+_REGULAR_FILE_MODES = ("100644", "100755")
 
-    Raises when `ref` itself does not resolve, so a bad ref can never read as
+
+def _git_entry(ref: str, path: str) -> tuple[str, str, str] | None:
+    """(mode, type, object id) of `path` at `ref`, or None when absent.
+
+    Raises when `ref` does not resolve, so a bad ref can never read as
     "absent on both sides".
     """
     out = subprocess.run(
-        ["git", "rev-parse", "--verify", "--quiet", f"{ref}:{path}"],
-        capture_output=True, text=True,
-    )
-    if out.returncode == 0:
-        return out.stdout.strip()
-    subprocess.run(
-        ["git", "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
+        ["git", "ls-tree", "--full-tree", ref, "--", path],
         check=True, capture_output=True, text=True,
-    )
+    ).stdout
+    for line in out.splitlines():
+        meta, _, name = line.partition("\t")
+        if name == path:
+            mode, kind, oid = meta.split()
+            return mode, kind, oid
     return None
 
 
@@ -350,40 +363,6 @@ def _git_blob_text(oid: str) -> str:
         raise _Unreadable("not UTF-8") from exc
 
 
-def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
-    seen: dict[str, object] = {}
-    for key, value in pairs:
-        if key in seen:
-            raise _Unreadable(f"duplicate JSON key {key!r}")
-        seen[key] = value
-    return seen
-
-
-def _json_version_locations(text: str) -> dict[str, object]:
-    """Every `version` key in a JSON document, keyed by its JSON path."""
-    try:
-        data = json.loads(text, object_pairs_hook=_reject_duplicate_keys)
-    except json.JSONDecodeError as exc:
-        raise _Unreadable(str(exc)) from exc
-    if not isinstance(data, dict):
-        raise _Unreadable("top level is not a JSON object")
-    found: dict[str, object] = {}
-
-    def walk(node: object, where: str) -> None:
-        if isinstance(node, dict):
-            for key, value in node.items():
-                child = f"{where}.{key}"
-                if key == "version":
-                    found[child] = value
-                walk(value, child)
-        elif isinstance(node, list):
-            for index, value in enumerate(node):
-                walk(value, f"{where}[{index}]")
-
-    walk(data, "$")
-    return found
-
-
 def _toml(text: str) -> dict:
     if _tomllib is None:
         raise _Unreadable("tomllib unavailable")
@@ -393,9 +372,9 @@ def _toml(text: str) -> dict:
         raise _Unreadable(str(exc)) from exc
 
 
-def _cargo_package(text: str) -> tuple[str, str]:
+def _cargo_package(manifest: dict) -> tuple[str, str]:
     """(`[package].name`, `[package].version`) as Cargo reads them."""
-    package = _toml(text).get("package")
+    package = manifest.get("package")
     if not isinstance(package, dict):
         raise _Unreadable("no [package] table")
     name, version = package.get("name"), package.get("version")
@@ -403,6 +382,23 @@ def _cargo_package(text: str) -> tuple[str, str]:
     if not isinstance(name, str) or not isinstance(version, str):
         raise _Unreadable("[package] name or version is not a literal string")
     return name, version
+
+
+def _cargo_manifest_locked(text: str, vfs: list[VersionFile]) -> dict:
+    """The parts of a Cargo.toml a pull request may not change."""
+    manifest = _toml(text)
+    _, version = _cargo_package(manifest)
+    readers = [vf for vf in vfs if vf.kind == "regex" and vf.pattern]
+    if not readers:
+        raise _Unreadable("no configured version reader for Cargo.toml")
+    for vf in readers:
+        if _extract_version_from_text(text, vf) != version:
+            raise _Unreadable("the configured reader disagrees with Cargo's version")
+    for pattern in _CARGO_DOWNSTREAM_VERSION_RES:
+        m = pattern.search(text)
+        if not m or m.group(1) != version:
+            raise _Unreadable("a downstream reader disagrees with Cargo's version")
+    return {key: manifest.get(key) for key in _CARGO_LOCKED_KEYS}
 
 
 def _cargo_lock_own_version(lock_text: str, crate: str) -> str:
@@ -425,13 +421,13 @@ def _cargo_lock_own_version(lock_text: str, crate: str) -> str:
     return version
 
 
-def _version_locations(
+def _locked_parts(
     path: str,
     vfs: list[VersionFile],
     text: str,
     read_at: Callable[[str], str | None],
 ) -> object:
-    """Every version location in one side of a version file.
+    """What may not change in one side of Cargo.toml or Cargo.lock.
 
     `read_at(path)` returns the text of another file on the same side, or
     None; Cargo.lock needs the crate name from Cargo.toml. Raises
@@ -442,42 +438,15 @@ def _version_locations(
         manifest = read_at(path[: -len("Cargo.lock")] + "Cargo.toml")
         if manifest is None:
             raise _Unreadable("Cargo.lock without a Cargo.toml beside it")
-        crate, _ = _cargo_package(manifest)
+        crate, _ = _cargo_package(_toml(manifest))
         return _cargo_lock_own_version(text, crate)
-    if not vfs:
-        raise _Unreadable("no configured version location")
     if name == "Cargo.toml":
-        package = _cargo_package(text)
-        locations: object = package
-        authority: str | None = package[1]
-        for pattern in _CARGO_DOWNSTREAM_VERSION_RES:
-            m = pattern.search(text)
-            if not m or m.group(1) != authority:
-                raise _Unreadable("a downstream reader disagrees with Cargo's version")
-    elif name.endswith(".json"):
-        locations = _json_version_locations(text)
-        authority = None
-    else:
-        raise _Unreadable("no strict reader for this file type")
-    for vf in vfs:
-        configured = _extract_version_from_text(text, vf)
-        if not isinstance(configured, str):
-            raise _Unreadable(f"configured reader found no version in {vf.path}")
-        if authority is not None and configured != authority:
-            raise _Unreadable(
-                f"configured reader read {configured!r}, Cargo reads {authority!r}"
-            )
-        if authority is None and configured not in locations.values():
-            raise _Unreadable(f"configured reader read {configured!r}, not a version key")
-    return locations
+        return _cargo_manifest_locked(text, vfs)
+    raise _Unreadable("version files other than Cargo.toml and Cargo.lock are refused whole")
 
 
 def version_value_edits(cfg: Config, base: str, head: str) -> list[str]:
-    """Version files a PR may not carry: those whose version value moved.
-
-    Supersedes "any edit to a version file". Fails closed: see the section
-    comment above.
-    """
+    """Version files a PR may not carry. See the section comment above."""
     by_path: dict[str, list[VersionFile]] = {}
     for surface in cfg.surfaces:
         for vf in surface.version_files:
@@ -485,23 +454,30 @@ def version_value_edits(cfg: Config, base: str, head: str) -> list[str]:
 
     def reader(ref: str) -> Callable[[str], str | None]:
         def read_at(other: str) -> str | None:
-            oid = _git_blob(ref, other)
-            return None if oid is None else _git_blob_text(oid)
+            entry = _git_entry(ref, other)
+            if entry is None or entry[0] not in _REGULAR_FILE_MODES:
+                return None
+            return _git_blob_text(entry[2])
         return read_at
 
     edits: list[str] = []
     for path in sorted(version_file_paths(cfg)):
-        before, after = _git_blob(base, path), _git_blob(head, path)
-        if before == after:
-            # Unchanged, or absent on both sides.
+        before, after = _git_entry(base, path), _git_entry(head, path)
+        if before is None and after is None:
             continue
         if before is None or after is None:
             edits.append(path)
             continue
+        if (before[0] != after[0] or before[0] not in _REGULAR_FILE_MODES
+                or before[1] != "blob" or after[1] != "blob"):
+            edits.append(path)
+            continue
+        if before[2] == after[2]:
+            continue
         vfs = by_path.get(path, [])
         try:
-            old = _version_locations(path, vfs, _git_blob_text(before), reader(base))
-            new = _version_locations(path, vfs, _git_blob_text(after), reader(head))
+            old = _locked_parts(path, vfs, _git_blob_text(before[2]), reader(base))
+            new = _locked_parts(path, vfs, _git_blob_text(after[2]), reader(head))
         except _Unreadable:
             edits.append(path)
             continue
@@ -932,12 +908,13 @@ def render_report(
     failures = 0
     if forbidden_version_files:
         lines.append(
-            "Versions are owned by version-at-land and must not change in a PR: "
+            "Version files are owned by version-at-land and must not be edited in a PR: "
             + ", ".join(forbidden_version_files)
         )
         lines.append(
-            "Other edits to these files are allowed; a file is refused when a version "
-            "value moved, it was added or deleted, or its version cannot be read."
+            "Version files are refused whole, except Cargo.toml and Cargo.lock: there "
+            "dependency and feature edits pass, while [package], the build-target tables "
+            "and the crate's own version must not change."
         )
         lines.append(
             'Release PRs must carry `Release: allow-version-files reason="..."`.'
