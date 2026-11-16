@@ -44,7 +44,7 @@ AGENT_TRAILER_RE = re.compile(
 APP_OPENERS = {"shipyard-local[bot]"}
 PROVENANCE_RE = re.compile(r"<!--\s*(shipyard-owner|whence)\b", re.I)
 STAMP_RE = re.compile(r"<!--\s*session:\s*\S+", re.I)
-VERDICT_RE = re.compile(r"^\s*[*_#> ]*(APPROVE[D]?|HOLD)\b|verdict\s*:", re.I | re.M)
+VERDICT_RE = re.compile(r"^\s*[*_#> ]*verdict\s*:\s*(APPROVE|HOLD)\b[^\n]*\bhead\s*:\s*[0-9a-f]{7,40}\b", re.I | re.M)
 SIGNALS = ("app_opener", "provenance", "trailer", "session_stamp")
 BAD_CONCLUSIONS = {"failure", "timed_out"}
 FACTS_VERSION = 4
@@ -286,8 +286,8 @@ def effective_owner_events(f, attributed=True):
     repos the steward merges under the owner account, so the account alone cannot tell it from a human.
     Returns (events, steward_merges_dropped)."""
     ev = f["owner_events"]
-    if not attributed:
-        return ev, 0
+    if not attributed:  # the earlier rule: every owner-account event, stamped ones included
+        return sorted(ev + list(f.get("agent_events") or []), key=lambda e: iso(e[1])), 0
     a = attribution(f)
     steward = f.get("steward_path") or (a["primary"] in ("app_opener", "provenance"))
     keep = [e for e in ev if not (e[0] == "merged" and steward)]
@@ -419,17 +419,17 @@ def required_contexts(rd, base, tick_ctx):
 
 
 def commit_red(rd, sha, required):
-    """(red_contexts, settled). Cached once every check run has completed."""
+    """(red_contexts, settled). Settled and cached only when every page was read and every check run completed."""
     cached = rd.load("checks", sha)
     if cached is not None:
         return set(cached["red"]) & required, True
-    runs, _ = rd.pages(f"commits/{sha}/check-runs", key="check_runs", max_pages=2)
+    runs, complete = rd.pages(f"commits/{sha}/check-runs", key="check_runs", max_pages=2)
     latest = {}
     for c in runs:
         k = c["name"]
         if k not in latest or (c.get("started_at") or "") > (latest[k].get("started_at") or ""):
             latest[k] = c
-    settled = bool(latest) and all(c.get("status") == "completed" for c in latest.values())
+    settled = complete and bool(latest) and all(c.get("status") == "completed" for c in latest.values())
     red = {k for k, c in latest.items() if c.get("conclusion") in BAD_CONCLUSIONS}
     if settled:
         rd.save("checks", sha, {"red": sorted(red)})
@@ -662,14 +662,6 @@ def all_prs(rd, lo, hi):
     return out, False
 
 
-def needs_reread(f, pr):
-    """A cached v3 reduction is re-read only when its classification could change: it has owner events (an
-    agent stamp on one reclassifies it, a merge may be the steward's) or owner-identity commits that no
-    list-level signal already explains."""
-    strong = (((pr.get("user") or {}).get("login") or "").lower() in APP_OPENERS) or bool(PROVENANCE_RE.search(pr.get("body") or ""))
-    return bool(f.get("owner_events")) or (bool(f.get("ambiguous_commits")) and not strong)
-
-
 def collect_repo(repo, cache_dir, cap, owner, lo, hi, now, ticks, tick_ctx, fetch=None, managed_base="main", dirty=()):
     rd = Reader(repo, cache_dir, cap, fetch)
     res = {"repo": repo, "rows": [], "unread": 0, "listing_complete": False, "reads": 0, "truncated": False, "errors": 0}
@@ -682,13 +674,7 @@ def collect_repo(repo, cache_dir, cap, owner, lo, hi, now, ticks, tick_ctx, fetc
     for pr in prs:
         f = rd.load("facts", str(pr["number"]))
         if f is not None and f.get("v") != FACTS_VERSION:
-            if f.get("v") == 3 and not needs_reread(f, pr):
-                # nothing in this PR depends on the signals only a re-read gives: keep the cached reduction
-                f.update(v=FACTS_VERSION, agent_events=[], steward_path=False, agent_trailer=None, stamp=None)
-                if f["state"] == "closed":
-                    rd.save("facts", str(pr["number"]), f)
-            else:
-                f = None  # cached by an older reduction: read again once
+            f = None  # cached by an older reduction without the attribution facts (trailer, stamp, verdict path): read again once
         if f is not None:  # the opener and the body come with the PR list, so they are never stale
             f["opener"] = (pr.get("user") or {}).get("login")
             f["provenance"] = bool(PROVENANCE_RE.search(pr.get("body") or ""))

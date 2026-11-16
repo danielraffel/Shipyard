@@ -280,6 +280,16 @@ class Correctness(Base):
         k = out["repos"][REPO]["per_day"]["2026-11-12"]["correctness"]
         self.assertEqual(k["provisional_prs"], 1)
 
+    def test_an_incomplete_multi_page_check_read_is_not_settled_or_cached(self):
+        p = self.merged_old(6)
+        greens = [{"name": f"j{i}", "status": "completed", "conclusion": "success"} for i in range(200)]
+        ck = {p["merge_commit_sha"]: lambda path: {"check_runs": greens[:100] if "page=1" in path else greens[100:]}}
+        out = self.build(world([p], base_commits=[commit(p["merge_commit_sha"], date=T(5, "10:00"))], checks=ck),
+                         now=dt.datetime(2026, 11, 14, tzinfo=UTC))
+        c = self.rows(out)[6]["correct"]
+        self.assertEqual((c["base_red"], c["bad"]), (None, None))
+        self.assertFalse(os.path.exists(os.path.join(self.cache, REPO.replace("/", "__"), "checks", p["merge_commit_sha"] + ".json")))
+
     def test_unreadable_checks_make_correctness_unknown(self):
         p = self.merged_old(6)
         out = self.build(world([p], base_commits=[commit(p["merge_commit_sha"], date=T(5, "10:00"))], default_checks=False), now=dt.datetime(2026, 11, 14, tzinfo=UTC))
@@ -400,7 +410,7 @@ class Attribution(Base):
 
     def test_owner_merge_of_a_pr_in_the_steward_path_is_a_steward_merge(self):
         merge = {"event": "merged", "actor": {"login": OWNER}, "created_at": T(10, "11:00")}
-        verdict = {"event": "commented", "user": {"login": "reviewer[bot]"}, "created_at": T(10, "10:30"), "body": "APPROVE head abc"}
+        verdict = {"event": "commented", "user": {"login": "reviewer[bot]"}, "created_at": T(10, "10:30"), "body": "verdict: APPROVE head:abcdef1234567"}
         r, _ = self.run_one(self.opened(), [verdict, merge], cm=[commit("c1", "x", "w")])
         self.assertEqual((r["north"], r["attribution"]["steward_merge_recognised"], r["attribution"]["legacy_north"]), ("autonomous", True, "owner_action"))
         r, _ = self.run_one(self.opened("shipyard-local[bot]"), [merge])  # opened through the App
@@ -416,22 +426,36 @@ class Attribution(Base):
         r, _ = self.run_one(self.opened("shipyard-local[bot]"), tl)
         self.assertEqual(r["north"], "owner_action")
 
-    def test_a_cached_v3_entry_is_kept_unless_the_signals_could_change_it(self):
-        keep = {"v": 3, "number": 1, "base": "main", "created_at": T(10, "10:00"), "merged_at": T(10, "11:00"), "state": "closed",
-                "merge_commit_sha": "m", "first_ready": T(10, "10:00"), "owner_events": [], "ambiguous_commits": [T(10, "10:10")],
-                "repair_cycles": 0, "holds": 0, "re_holds": 0, "size": None, "pushes": {"repair": 0, "author": 0, "merge_main": 0},
-                "enqueues": 0, "ejections": [], "labels": [], "heads": ["h"], "timeline_complete": True, "commits_complete": True}
-        p = self.opened("shipyard-local[bot]")
-        self.assertFalse(pm.needs_reread(keep, p))
-        self.assertTrue(pm.needs_reread(keep, self.opened()))
-        self.assertTrue(pm.needs_reread(dict(keep, owner_events=[["labeled", T(10, "10:30")]]), p))
-        os.makedirs(os.path.join(self.cache, REPO.replace("/", "__"), "facts"))
-        with open(os.path.join(self.cache, REPO.replace("/", "__"), "facts", "1.json"), "w") as fh:
-            json.dump(keep, fh)
-        gh = world([p])
-        out = self.build(gh)
-        self.assertEqual(self.rows(out)[1]["north"], "autonomous")
-        self.assertFalse([c for c in gh.calls if "timeline" in c])
+    def test_a_cached_v3_entry_is_read_again_and_attributed_by_its_trailer(self):
+        old = {"v": 3, "number": 1, "base": "main", "created_at": T(10, "10:00"), "merged_at": T(10, "11:00"), "state": "closed",
+               "merge_commit_sha": "m", "first_ready": T(10, "10:00"), "owner_events": [], "ambiguous_commits": [T(10, "10:10")],
+               "repair_cycles": 0, "holds": 0, "re_holds": 0, "size": None, "pushes": {"repair": 0, "author": 0, "merge_main": 0},
+               "enqueues": 0, "ejections": [], "labels": [], "heads": ["h"], "timeline_complete": True, "commits_complete": True}
+        d = os.path.join(self.cache, REPO.replace("/", "__"), "facts")
+        os.makedirs(d)
+        with open(os.path.join(d, "1.json"), "w") as fh:
+            json.dump(old, fh)
+        cm = {1: [commit("c1", OWNER, "w\n\nCo-Authored-By: Claude <a@anthropic.com>")]}
+        gh = world([self.opened()], commits=cm)
+        r = self.rows(self.build(gh))[1]
+        self.assertTrue([c for c in gh.calls if "commits" in c])
+        self.assertEqual((r["north"], r["attribution"]["primary"]), ("autonomous", "trailer"))
+
+    def test_discussion_text_with_verdict_is_not_a_steward_path(self):
+        merge = {"event": "merged", "actor": {"login": OWNER}, "created_at": T(10, "11:00")}
+        talk = {"event": "commented", "user": {"login": "someone"}, "created_at": T(10, "10:30"), "body": "No verdict: tests pending"}
+        r, _ = self.run_one(self.opened(), [talk, merge], cm=[commit("c1", "x", "w")])
+        self.assertEqual((r["north"], r["attribution"]["steward_merge_recognised"]), ("owner_action", False))
+        real = dict(talk, body="verdict: APPROVE head:abcdef1234567")
+        r, _ = self.run_one(self.opened(), [real, merge], cm=[commit("c1", "x", "w")])
+        self.assertEqual(r["north"], "autonomous")
+
+    def test_the_legacy_rule_counts_stamped_owner_events_as_owner_actions(self):
+        tl = [{"event": "commented", "user": {"login": OWNER}, "created_at": T(10, "10:30"), "body": "<!-- session: m5/abc -->"}]
+        r, _ = self.run_one(self.opened(), tl)
+        self.assertEqual((r["north"], r["attribution"]["legacy_north"]), ("autonomous", "owner_action"))
+        r, _ = self.run_one(self.opened(), [], cm=[commit("c1", OWNER, "work")])
+        self.assertEqual(r["attribution"]["legacy_north"], "unknown")
 
 
 def unmerged(n, created, state="open", draft=False):
