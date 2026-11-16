@@ -516,10 +516,15 @@ def push_repeats_of_group_shas(runs):
     return len(push), sum(1 for r in push if (r.get("name"), r.get("head_sha")) in group)
 
 
-def load_compute(rd, number):
-    """A cached compute reduction, or None when absent or written before COMPUTE_VERSION (recomputed)."""
+def load_compute(rd, number, f=None):
+    """A cached compute reduction, or None when absent or written before COMPUTE_VERSION (recomputed). With `f`, an
+    entry is never complete while that PR's own timeline or commit read is incomplete (the heads came from them)."""
     c = rd.load("compute", str(number))
-    return c if c is not None and c.get("v") == COMPUTE_VERSION and c.get("complete") else None
+    if c is None or c.get("v") != COMPUTE_VERSION or not c.get("complete"):
+        return None
+    if f is not None and not reads_complete(f):
+        return None
+    return c
 
 
 def pr_compute(rd, f, runs, runs_complete):
@@ -841,7 +846,7 @@ def collect_repo(repo, cache_dir, cap, owner, lo, hi, now, ticks, tick_ctx, fetc
         ok, why = eligible(f, managed_base)
         facts.append((f, ok, why))
     mrows = [f for f, ok, _ in facts if ok and f["merged_at"]]
-    need = [f for f in mrows if load_compute(rd, f["number"]) is None]
+    need = [f for f in mrows if load_compute(rd, f["number"], f) is None]
     runs, runs_ok = [], False
     if need:
         try:
@@ -878,7 +883,7 @@ def collect_repo(repo, cache_dir, cap, owner, lo, hi, now, ticks, tick_ctx, fetc
             "repair_cycles": f["repair_cycles"], "compute": None, "correct": None,
         })
         if ok and merged:
-            comp = load_compute(rd, f["number"])
+            comp = load_compute(rd, f["number"], f)
             if comp is None and runs_ok:
                 try:
                     comp = pr_compute(rd, f, runs, runs_ok)
@@ -1065,9 +1070,10 @@ def markdown(e2e):
          "Agents commit under the owner's git identity, so a PR is agent work when it carries any signal: opened by the fleet App, `shipyard pr` provenance in the body, "
          "an agent Co-Authored-By trailer, an agent session stamp. Only a PR with an owner-identity commit and no signal is unknown; above 20% unknown the rate is a range. "
          "An owner-account event is an owner action only when it is a human's: one carrying a session stamp is an agent's, and a merge by the owner account is a "
-         "steward merge only with trusted evidence bound to the merged SHA (an App enqueue, or a counted App APPROVE at the merged head with no later removal, HOLD or push); a HOLD, "
-         "a verdict path or `shipyard pr` provenance alone does not qualify. A merge the timeline cannot tie to the merged SHA, or read from an incomplete timeline or commit list, is unknown: "
-         "credited to neither side, counted as an unverified owner merge and not as an owner action. `gh-only` ignores commits. "
+         "steward merge only with trusted evidence bound to the merged SHA and read in timeline order, never by date: an App enqueue made while the timeline's head was the merged SHA, "
+         "or an exact-head APPROVE counted by the guard's rules (the App, a configured `reviewer_signers` signer, a configured `reviewer_stamp_sessions` stamp), with no later push, queue removal or HOLD; "
+         "a HOLD, a verdict path or `shipyard pr` provenance alone does not qualify. A merge the timeline cannot tie to the merged SHA, or read from an incomplete timeline or commit list, is unknown: "
+         "credited to neither side, counted as an unverified owner merge and left out of the owner-action counts. `gh-only` ignores commits. "
          "Rates carry a 95% Wilson interval; below 50 PRs, or when the interval overlaps the baseline's, the sample is insufficient and no difference is claimed. "
          "Handoff-to-merge is load-dependent context, not the verdict. Verdict proxies: review rounds (HOLDs) and re-HOLD rate per PR, agent pushes by kind "
          "(repair after a HOLD or `repaired:`, author before, merge-main), merge-queue attempts and ejections by cause, DIRTY per 100 PRs, gate runs per merged PR "
