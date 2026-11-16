@@ -101,7 +101,9 @@ covers allowed, off, and GitHub unreadable (the last prints why).
 ## What passes without a check
 
 With the fence on, each of these lets the push through and prints why:
-GitHub unreadable within the deadline, a remote URL that is not GitHub, a
+GitHub unreadable within the deadline, a remote URL that is not GitHub
+(`claim-fence: <url> is not a GitHub remote; not checked`; an SSH host alias
+or a typo lands here), a
 `shipyard` that predates `claim check-push`, and no `shipyard` on PATH (the
 hook prints that one). With the fence off, all of them are silent.
 

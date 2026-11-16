@@ -50,11 +50,13 @@ pub(super) fn claim_command<W: Write>(
             if !env.enabled {
                 return Ok(ExitCode::SUCCESS);
             }
-            let Some(repo) = super::wait_cmd::parse_github_repo_slug(&url) else {
-                eprintln!("claim-fence: {url:?} is not a GitHub remote; pushing without the check");
-                return Ok(ExitCode::SUCCESS);
-            };
-            Ok(report(&run_fence(&repo, &branches, None)))
+            match github_target(&url) {
+                Ok(repo) => Ok(report(&run_fence(&repo, &branches, None))),
+                Err(note) => {
+                    eprintln!("{note}");
+                    Ok(ExitCode::SUCCESS)
+                }
+            }
         }
         ClaimCommand::Take {
             from,
@@ -173,6 +175,13 @@ fn run_fence(repo: &str, branches: &[String], gh_override: Option<&Path>) -> Fen
         eprintln!("{note}");
     }
     outcome.fence
+}
+
+/// The `OWNER/REPO` a remote URL names, or the note to print when it names
+/// none (an SSH host alias, a typo, a local path): that push is not checked.
+fn github_target(url: &str) -> Result<String, String> {
+    super::wait_cmd::parse_github_repo_slug(url)
+        .ok_or_else(|| format!("claim-fence: {url} is not a GitHub remote; not checked"))
 }
 
 fn report(fence: &Fence) -> ExitCode {

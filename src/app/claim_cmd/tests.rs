@@ -96,3 +96,23 @@ fn shipyard_pr_hands_its_push_the_head_it_checked() {
         "nothing handed on when the fence is off"
     );
 }
+
+#[test]
+fn a_remote_that_is_not_github_is_named_as_not_checked() {
+    for url in [
+        "m3-git:Generous-Corp/vellum.git",
+        "git@gihtub.com:o/r.git",
+        "/srv/git/r.git",
+    ] {
+        assert_eq!(
+            github_target(url),
+            Err(format!(
+                "claim-fence: {url} is not a GitHub remote; not checked"
+            ))
+        );
+    }
+    assert_eq!(
+        github_target("git@github.com:Generous-Corp/vellum.git").as_deref(),
+        Ok("Generous-Corp/vellum")
+    );
+}
