@@ -793,8 +793,8 @@ def ci(x):
 
 
 def repo_partial(v):
-    """A repo is partial when PRs in its window were not read or its listing was cut short."""
-    return bool(v["unread_prs"] or not v["listing_complete"])
+    """A repo is partial when its read cap ran out, a read failed, PRs were left unread or its listing was cut short."""
+    return bool(v["truncated"] or v.get("read_errors") or v["unread_prs"] or not v["listing_complete"])
 
 
 def sample_label(s, truncated):
@@ -805,7 +805,7 @@ def sample_label(s, truncated):
     if ns.get("overlaps_baseline"):
         why.append("interval overlaps baseline")
     if truncated:
-        why.append("partial: unread PRs")
+        why.append("partial: not fully read")
     return "insufficient sample (" + ", ".join(why) + ")" if why else "ok"
 
 
@@ -853,10 +853,11 @@ def markdown(e2e):
 
     def ctl_str(v):
         c = v["controls"]
-        return f"reverts {c['revert']['found']}/{c['revert']['expected']}, escapes {c['escape']['found']}/{c['escape']['expected']}, owner-touched {c['owner_touched']['non_autonomous']}/{c['owner_touched']['in_report']}"
+        return (f"reverts {c['revert']['found']}/{c['revert']['expected']}, escapes {c['escape']['found']}/{c['escape']['expected']}, owner-touched (context) {c['owner_touched']['non_autonomous']}/{c['owner_touched']['in_report']}, "
+               f"owner-pinned {c['owner_pinned']['found']}/{c['owner_pinned']['expected']} ({c['status']})")
     for repo, v in sorted(e2e["repos"].items()):
         L += [f"### {repo}", ""]
-        if v["truncated"] or v["unread_prs"] or not v["listing_complete"]:
+        if repo_partial(v):
             L += [f"**TRUNCATED: {v['unread_prs']} PRs unread** ({v['reads']} reads, read cap hit={str(v['truncated']).lower()}, "
                   f"listing complete={str(v['listing_complete']).lower()}). Cached PRs are not re-read, so the next run resumes.", ""]
         if v.get("excluded"):

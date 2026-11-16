@@ -383,7 +383,7 @@ class NorthStar(Base):
         self.assertTrue(ns["unknown_over_20pct"] and ns["insufficient_sample"])
         self.assertEqual(ns["rate_range_pct"], [50.0, 100.0])
         md = pm.markdown(out)
-        self.assertIn("insufficient sample (n<50)", md)
+        self.assertIn("insufficient sample (n<50", md)
         self.assertIn("50.0-100.0%", md)
 
 
@@ -501,7 +501,19 @@ class Truncation(Base):
         with tempfile.TemporaryDirectory() as d2:
             full = pm.build([REPO], d2, 300, OWNER, START, self.LATE, {}, {}, None, world(prs), None, None, {})
         self.assertEqual(full["repos"][REPO]["unread_prs"], 0)
-        self.assertNotIn("partial: unread", pm.markdown(full))
+        self.assertFalse(full["repos"][REPO]["truncated"])
+        self.assertNotIn("read cap hit=true", pm.markdown(full))
+
+    def test_truncated_with_all_facts_cached_is_still_partial(self):
+        v = {"truncated": True, "unread_prs": 0, "listing_complete": True, "read_errors": 0}
+        self.assertTrue(pm.repo_partial(v))
+        self.assertTrue(pm.repo_partial(dict(v, truncated=False, read_errors=1)))
+        self.assertFalse(pm.repo_partial(dict(v, truncated=False)))
+
+    def test_pinned_owner_control_is_rendered(self):
+        prs = [pr(1, T(10, "10:00"), T(10, "11:00"))]
+        out = pm.build([REPO], self.cache, 200, OWNER, START, self.LATE, {}, {}, None, world(prs), None, None, {REPO: {"owner": [1]}})
+        self.assertIn("owner-pinned 0/1 (failed)", pm.markdown(out))
 
     def test_settled_prs_are_cached_between_runs(self):
         prs = [pr(n, T(10, "10:00"), T(10, "11:00")) for n in range(1, 4)]
@@ -547,7 +559,7 @@ class Caps(Base):
         md = pm.markdown(out)
         self.assertIn(f"**TRUNCATED: {v['unread_prs']} PRs unread**", md)
         again = self.build(world(prs), cap=200)
-        self.assertNotIn("TRUNCATED:", pm.markdown(again))
+        self.assertIn("read cap hit=false", pm.markdown(again))
         self.assertFalse(again["truncated"])
         self.assertEqual(len(again["repos"][REPO]["prs"]), 4)
 
