@@ -451,6 +451,48 @@ class Attribution(Base):
         r, _ = self.run_one(self.merged_pr(), [enq, self.MERGE], cm=[commit("c1", "x", "w")])
         self.assertEqual((r["north"], r["attribution"]["steward_merge_recognised"]), ("autonomous", True))
 
+    def enq(self, hm, kind="added_to_merge_queue", login="shipyard-local[bot]"):
+        return {"event": kind, "actor": {"login": login}, "created_at": T(10, hm)}
+
+    def test_an_ejected_enqueue_followed_by_a_manual_merge_is_an_owner_action(self):
+        tl = [self.enq("10:40"), dict(self.enq("10:45", "removed_from_merge_queue"), reason="failed_checks"), self.MERGE]
+        r, _ = self.run_one(self.merged_pr(), tl, cm=[commit("c1", "x", "w")])
+        self.assertEqual((r["north"], r["attribution"]["steward_merge_recognised"]), ("owner_action", False))
+
+    def test_an_enqueue_then_a_hold_then_a_manual_merge_is_an_owner_action(self):
+        hold = dict(self.app_comment("verdict: HOLD head:" + HEAD), created_at=T(10, "10:50"))
+        r, _ = self.run_one(self.merged_pr(), [self.enq("10:40"), hold, self.MERGE], cm=[commit("c1", "x", "w")])
+        self.assertEqual(r["north"], "owner_action")
+
+    def test_a_new_enqueue_after_an_ejection_that_leads_to_the_merge_is_a_steward_merge(self):
+        tl = [self.enq("10:40"), dict(self.enq("10:45", "removed_from_merge_queue"), reason="failed_checks"), self.enq("10:50"), self.MERGE]
+        r, _ = self.run_one(self.merged_pr(), tl, cm=[commit("c1", "x", "w")])
+        self.assertEqual((r["north"], r["attribution"]["steward_merge_recognised"]), ("autonomous", True))
+
+    def test_an_enqueue_of_an_older_head_is_not_evidence_for_the_merged_head(self):
+        r, _ = self.run_one(self.merged_pr(), [self.enq("10:40"), self.MERGE], cm=[commit("c1", "x", "w", date=T(10, "10:50"))])
+        self.assertEqual(r["north"], "owner_action")
+        push = {"event": "head_ref_force_pushed", "actor": {"login": "x"}, "created_at": T(10, "10:50"), "after_sha": HEAD}
+        r, _ = self.run_one(self.merged_pr(), [self.enq("10:40"), push, self.MERGE], cm=[commit("c1", "x", "w")])
+        self.assertEqual(r["north"], "owner_action")
+
+    def test_an_approval_followed_by_an_ejection_is_not_evidence(self):
+        gone = dict(self.enq("10:45", "removed_from_merge_queue"), reason="failed_checks")
+        r, _ = self.run_one(self.merged_pr(), [self.app_comment(self.APPROVE), gone, self.MERGE], cm=[commit("c1", "x", "w")])
+        self.assertEqual(r["north"], "owner_action")
+
+    def test_a_stamp_removed_from_the_body_does_not_persist_in_a_warm_cache(self):
+        cm = {1: [commit("c1", OWNER, "work")]}
+        p = self.opened(body="<!-- session: m5/abc -->")
+        warm = self.build(world([p], {1: []}, cm))
+        self.assertEqual(self.rows(warm)[1]["north"], "autonomous")
+        q = self.opened(body="plain")
+        gh = world([q], {1: []}, cm)
+        out = self.build(gh)  # same cache dir: the entry is warm
+        self.assertFalse([c for c in gh.calls if "timeline" in c])  # served from the cache
+        self.assertEqual(self.rows(out)[1]["north"], "unknown")
+        self.assertEqual(self.rows(out)[1]["attribution"]["signals"], [])
+
     def test_an_enqueue_by_anyone_but_the_app_is_not_evidence(self):
         enq = {"event": "added_to_merge_queue", "actor": {"login": "someone"}, "created_at": T(10, "10:40")}
         r, _ = self.run_one(self.merged_pr(), [enq, self.MERGE], cm=[commit("c1", "x", "w")])

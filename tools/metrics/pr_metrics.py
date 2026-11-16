@@ -52,7 +52,7 @@ APP_LOGINS = {"shipyard-local[bot]", "shipyard-local"}
 _GUARD = []
 SIGNALS = ("app_opener", "provenance", "trailer", "session_stamp")
 BAD_CONCLUSIONS = {"failure", "timed_out"}
-FACTS_VERSION = 5
+FACTS_VERSION = 6
 CHECKS_VERSION = 2  # derived correctness caches: entries written before this (incomplete pagination read as clean) are read again
 ESCAPE_WINDOW = dt.timedelta(days=14)
 HORIZON = dt.timedelta(hours=48)
@@ -220,34 +220,49 @@ def trust_policy(rd, base):
     return pol
 
 
-def trusted_steward_evidence(rd, pr, tl):
-    """True only with trusted evidence the steward path ran: an enqueue performed by the fleet App, or an APPROVE at the
-    merged head that the guard's own rules count (posted by the App, a configured signer, a configured reviewer session
-    stamp) with no App HOLD at that head. Discussion text, a spoofed verdict and a HOLD never count."""
+def steward_seq(pr, tl, commits):
+    """The queue and verdict events that bear on how a PR reached its merge, in time order and before the merge, as
+    [kind, ts, body]: `enq` (an enqueue by the fleet App while the merged head was the head), `enq_stale` (an App
+    enqueue before a later push or force-push, so of an older head), `remove` (a queue removal other than the merge itself),
+    `hold` and `approve` (an App verdict comment for the merged head; `approve` keeps the body so the approval is judged
+    against the base's policy when it is classified, never when it is cached)."""
     g = guard()
     head = pr["head"]["sha"]
     merged = iso(pr.get("merged_at"))
-    pol, approved, held = None, False, False
+    changed = [commit_date(c) for c in commits] + [iso(e.get("created_at")) for e in tl if e.get("event") == "head_ref_force_pushed"]
+    head_changed = max([d for d in changed if d], default=None)
+    seq = []
     for e in tl:
-        login = ((e.get("actor") or e.get("user") or {}).get("login") or "").lower()
-        if login not in APP_LOGINS:
-            continue
-        if e.get("event") in ("added_to_merge_queue", "enqueued"):
-            return True
-        if e.get("event") != "commented":
-            continue
-        body = e.get("body") or ""
-        v = g.marker_verdict(body)
-        if not v or v[1] != head:
-            continue
         ts = iso(e.get("created_at"))
-        if merged and ts and ts > merged:
+        if not ts or (merged and ts > merged):
             continue
-        if v[0] == "HOLD":
-            held = True
-        elif v[0] == "APPROVE":
+        ev = e.get("event")
+        login = ((e.get("actor") or e.get("user") or {}).get("login") or "").lower()
+        if ev in ("removed_from_merge_queue", "dequeued") and (e.get("reason") or "unknown") != "merged":
+            seq.append(["remove", fmt(ts), None])
+        elif ev in ("added_to_merge_queue", "enqueued") and login in APP_LOGINS:
+            seq.append(["enq_stale" if head_changed and head_changed > ts else "enq", fmt(ts), None])
+        elif ev == "commented" and login in APP_LOGINS:
+            body = e.get("body") or ""
+            v = g.marker_verdict(body)
+            if v and v[1] == head and v[0] in ("HOLD", "APPROVE"):
+                seq.append(["hold" if v[0] == "HOLD" else "approve", fmt(ts), body if v[0] == "APPROVE" else None])
+    return sorted(seq, key=lambda x: iso(x[1]))
+
+
+def steward_evidence(rd, f):
+    """True only when the last thing that happened before the merge was trusted steward evidence: an App enqueue of the
+    merged head with no removal after it and no HOLD after it, or an APPROVE the guard's own rules count (App, configured
+    signer, configured reviewer session stamp, read from the base's config) with no App HOLD at the merged head at all.
+    Evidence followed by an ejection, a HOLD or a newer push does not count. A spoofed verdict never does."""
+    g = guard()
+    state, held, pol = None, any(k == "hold" for k, _, _ in f.get("steward_seq") or []), None
+    for kind, _, body in f.get("steward_seq") or []:
+        if kind == "enq":
+            state = "enq"
+        elif kind == "approve":
             if pol is None:
-                pol = trust_policy(rd, pr["base"]["ref"]) or False
+                pol = trust_policy(rd, f["base"]) or False
             saved = os.environ.get(g.SIGNERS_FROM_BASE_ENV)
             os.environ[g.SIGNERS_FROM_BASE_ENV] = "1"
             try:
@@ -257,8 +272,26 @@ def trusted_steward_evidence(rd, pr, tl):
                     os.environ.pop(g.SIGNERS_FROM_BASE_ENV, None)
                 else:
                     os.environ[g.SIGNERS_FROM_BASE_ENV] = saved
-            approved = approved or ok
-    return approved and not held
+            if ok:
+                state = "approve"
+        else:  # remove, hold, enq_stale
+            state = None
+    return state == "enq" or (state == "approve" and not held)
+
+
+def finalize(rd, f, pr):
+    """Facts that depend on inputs that change independently of the cached reduction, recomputed on every run:
+    the opener and body (from the PR list), the stamp (body, commits and timeline kept apart), and the steward
+    evidence (judged against the base's current policy)."""
+    body = pr.get("body") or ""
+    f["opener"] = (pr.get("user") or {}).get("login")
+    f["provenance"] = bool(PROVENANCE_RE.search(body))
+    f["stamp"] = bool(STAMP_RE.search(body)) or bool(f.get("stamp_commit")) or bool(f.get("agent_events"))
+    try:
+        f["steward_path"] = bool(f.get("merged_at")) and any(e[0] == "merged" for e in f["owner_events"]) and steward_evidence(rd, f)
+    except Truncated:  # the policy could not be read within the cap: no approval is trusted this run
+        f["steward_path"] = False
+    return f
 
 
 def pr_facts(rd, pr, owner):
@@ -278,7 +311,7 @@ def pr_facts(rd, pr, owner):
     else:
         ready = None if pr.get("draft") else created
     owner_events, agent_events, repairs, holds, ejections, enqueues = [], [], [], [], [], 0
-    steward_path, stamp = trusted_steward_evidence(rd, pr, tl), bool(STAMP_RE.search(pr.get("body") or ""))
+    stamp_commit = False
     for e in tl:
         ev, ts = e.get("event"), e.get("created_at") or e.get("submitted_at")
         body = e.get("body") or ""
@@ -298,7 +331,6 @@ def pr_facts(rd, pr, owner):
             if STAMP_RE.search(body) or PROVENANCE_RE.search(body):
                 # an agent speaking under the owner's account: not an owner action, and a signal of its own
                 agent_events.append([ev, ts])
-                stamp = True
             else:
                 owner_events.append([ev, ts])
     heads = {pr["head"]["sha"]}
@@ -313,7 +345,7 @@ def pr_facts(rd, pr, owner):
         if AGENT_TRAILER_RE.search(msg):
             trailer = True
         if STAMP_RE.search(msg):
-            stamp = True
+            stamp_commit = True
         logins = {((c.get("author") or {}).get("login") or "").lower(), ((c.get("committer") or {}).get("login") or "").lower()}
         if owner.lower() in logins and not AGENT_TRAILER_RE.search(msg) and d:
             ambiguous.append(fmt(d))
@@ -336,9 +368,9 @@ def pr_facts(rd, pr, owner):
         "v": FACTS_VERSION, "number": n, "base": pr["base"]["ref"], "created_at": fmt(created),
         "merged_at": fmt(merged) if merged else None, "state": pr.get("state"),
         "merge_commit_sha": pr.get("merge_commit_sha"), "first_ready": fmt(ready) if ready else None,
-        "owner_events": owner_events, "agent_events": agent_events, "steward_path": steward_path,
+        "owner_events": owner_events, "agent_events": agent_events, "steward_seq": steward_seq(pr, tl, commits),
         "opener": (pr.get("user") or {}).get("login"), "provenance": bool(PROVENANCE_RE.search(pr.get("body") or "")),
-        "agent_trailer": trailer, "stamp": stamp, "ambiguous_commits": sorted(set(ambiguous)),
+        "agent_trailer": trailer, "stamp_commit": stamp_commit, "ambiguous_commits": sorted(set(ambiguous)),
         "repair_cycles": len(repairs), "holds": len(holds), "re_holds": re_holds, "size": size,
         "pushes": split, "enqueues": enqueues, "ejections": ejections,
         "labels": sorted(l["name"] for l in pr.get("labels") or []),
@@ -766,10 +798,6 @@ def collect_repo(repo, cache_dir, cap, owner, lo, hi, now, ticks, tick_ctx, fetc
         f = rd.load("facts", str(pr["number"]))
         if f is not None and f.get("v") != FACTS_VERSION:
             f = None  # cached by an older reduction without the attribution facts (trailer, stamp, verdict path): read again once
-        if f is not None:  # the opener and the body come with the PR list, so they are never stale
-            f["opener"] = (pr.get("user") or {}).get("login")
-            f["provenance"] = bool(PROVENANCE_RE.search(pr.get("body") or ""))
-            f["stamp"] = bool(f.get("stamp")) or bool(STAMP_RE.search(pr.get("body") or ""))
         if f is None:
             try:
                 f = pr_facts(rd, pr, owner)
@@ -778,6 +806,7 @@ def collect_repo(repo, cache_dir, cap, owner, lo, hi, now, ticks, tick_ctx, fetc
             except (Truncated, ReadError):
                 res["unread"] += 1
                 continue
+        finalize(rd, f, pr)
         ok, why = eligible(f, managed_base)
         facts.append((f, ok, why))
     mrows = [f for f, ok, _ in facts if ok and f["merged_at"]]
