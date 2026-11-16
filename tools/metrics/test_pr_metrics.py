@@ -493,6 +493,39 @@ class Attribution(Base):
         self.assertEqual(self.rows(out)[1]["north"], "unknown")
         self.assertEqual(self.rows(out)[1]["attribution"]["signals"], [])
 
+    def review(self, body, hm="10:30", rid=11, state="commented"):
+        return {"event": "reviewed", "id": rid, "state": state, "user": {"login": "shipyard-local[bot]"}, "submitted_at": T(10, hm), "body": body}
+
+    def test_a_review_based_approve_then_an_enqueue_then_a_merge_is_a_steward_merge(self):
+        r, _ = self.run_one(self.merged_pr(), [self.review(self.APPROVE), self.enq("10:40"), self.MERGE], cm=[commit("c1", "x", "w")])
+        self.assertEqual((r["north"], r["attribution"]["steward_merge_recognised"]), ("autonomous", True))
+        r, _ = self.run_one(self.merged_pr(), [self.review(self.APPROVE), self.MERGE], cm=[commit("c1", "x", "w")])
+        self.assertEqual(r["attribution"]["steward_merge_recognised"], True)  # the approval alone counts too
+
+    def test_a_review_based_hold_after_an_approval_then_a_manual_merge_is_an_owner_action(self):
+        hold = self.review("<!-- session: m3/fleet-pass-reviewer-7 -->\nverdict: HOLD head:" + HEAD, "10:50", 12, "changes_requested")
+        r, _ = self.run_one(self.merged_pr(), [self.review(self.APPROVE), hold, self.MERGE], cm=[commit("c1", "x", "w")])
+        self.assertEqual((r["north"], r["attribution"]["steward_merge_recognised"]), ("owner_action", False))
+        # a comment approval cancelled by a later review HOLD
+        r, _ = self.run_one(self.merged_pr(), [self.app_comment(self.APPROVE), hold, self.MERGE], cm=[commit("c1", "x", "w")])
+        self.assertEqual(r["north"], "owner_action")
+
+    def test_a_review_verdict_naming_the_wrong_head_is_not_counted(self):
+        r, _ = self.run_one(self.merged_pr(), [self.review(self.APPROVE.replace(HEAD, "b" * 40)), self.MERGE], cm=[commit("c1", "x", "w")])
+        self.assertEqual(r["north"], "owner_action")
+
+    def test_a_review_verdict_from_an_untrusted_user_or_without_a_stamp_is_not_counted(self):
+        bad = dict(self.review(self.APPROVE), user={"login": "someone"})
+        r, _ = self.run_one(self.merged_pr(), [bad, self.MERGE], cm=[commit("c1", "x", "w")])
+        self.assertEqual(r["north"], "owner_action")
+        r, _ = self.run_one(self.merged_pr(), [self.review("verdict: APPROVE head:" + HEAD), self.MERGE], cm=[commit("c1", "x", "w")])
+        self.assertEqual(r["north"], "owner_action")
+
+    def test_a_dismissed_review_approval_does_not_count(self):
+        dis = {"event": "review_dismissed", "actor": {"login": "x"}, "created_at": T(10, "10:45"), "dismissed_review": {"review_id": 11}}
+        r, _ = self.run_one(self.merged_pr(), [self.review(self.APPROVE), dis, self.MERGE], cm=[commit("c1", "x", "w")])
+        self.assertEqual(r["north"], "owner_action")
+
     def test_an_enqueue_by_anyone_but_the_app_is_not_evidence(self):
         enq = {"event": "added_to_merge_queue", "actor": {"login": "someone"}, "created_at": T(10, "10:40")}
         r, _ = self.run_one(self.merged_pr(), [enq, self.MERGE], cm=[commit("c1", "x", "w")])

@@ -52,7 +52,7 @@ APP_LOGINS = {"shipyard-local[bot]", "shipyard-local"}
 _GUARD = []
 SIGNALS = ("app_opener", "provenance", "trailer", "session_stamp")
 BAD_CONCLUSIONS = {"failure", "timed_out"}
-FACTS_VERSION = 6
+FACTS_VERSION = 7
 CHECKS_VERSION = 2  # derived correctness caches: entries written before this (incomplete pagination read as clean) are read again
 ESCAPE_WINDOW = dt.timedelta(days=14)
 HORIZON = dt.timedelta(hours=48)
@@ -224,7 +224,7 @@ def steward_seq(pr, tl, commits):
     """The queue and verdict events that bear on how a PR reached its merge, in time order and before the merge, as
     [kind, ts, body]: `enq` (an enqueue by the fleet App while the merged head was the head), `enq_stale` (an App
     enqueue before a later push or force-push, so of an older head), `remove` (a queue removal other than the merge itself),
-    `hold` and `approve` (an App verdict comment for the merged head; `approve` keeps the body so the approval is judged
+    `hold` and `approve` (an App verdict, as a comment or a review that was not dismissed, for the merged head; `approve` keeps the body so the approval is judged
     against the base's policy when it is classified, never when it is cached)."""
     g = guard()
     head = pr["head"]["sha"]
@@ -232,17 +232,20 @@ def steward_seq(pr, tl, commits):
     changed = [commit_date(c) for c in commits] + [iso(e.get("created_at")) for e in tl if e.get("event") == "head_ref_force_pushed"]
     head_changed = max([d for d in changed if d], default=None)
     seq = []
+    dismissed = {(e.get("dismissed_review") or {}).get("review_id") for e in tl
+                 if e.get("event") == "review_dismissed" and (not merged or (iso(e.get("created_at")) or merged) <= merged)}
+    dismissed.discard(None)
     for e in tl:
-        ts = iso(e.get("created_at"))
+        ev = e.get("event")
+        ts = iso(e.get("submitted_at") if ev == "reviewed" else e.get("created_at")) or iso(e.get("created_at"))
         if not ts or (merged and ts > merged):
             continue
-        ev = e.get("event")
         login = ((e.get("actor") or e.get("user") or {}).get("login") or "").lower()
         if ev in ("removed_from_merge_queue", "dequeued") and (e.get("reason") or "unknown") != "merged":
             seq.append(["remove", fmt(ts), None])
         elif ev in ("added_to_merge_queue", "enqueued") and login in APP_LOGINS:
             seq.append(["enq_stale" if head_changed and head_changed > ts else "enq", fmt(ts), None])
-        elif ev == "commented" and login in APP_LOGINS:
+        elif ev in ("commented", "reviewed") and login in APP_LOGINS and not (ev == "reviewed" and e.get("id") in dismissed):
             body = e.get("body") or ""
             v = g.marker_verdict(body)
             if v and v[1] == head and v[0] in ("HOLD", "APPROVE"):
