@@ -916,7 +916,7 @@ wait bound, shared with the gate-cost metric; do not add a third copy.
 keeps its original name so earlier ledgers stay readable) records a host
 quarantined after a failed rollback and the tag that failure made terminal.
 Fields written by earlier releases (attempt counts, `last_outcome`, alert
-bookkeeping) are ignored. A change that leaves the ledger as it was writes
+bookkeeping) are ignored on read and dropped on the next write. A change that leaves the ledger as it was writes
 nothing.
 
 ## A missing key is not an empty list
@@ -1864,8 +1864,9 @@ stage hands over with a warning when the Mac declares no
 `[host_class.*]`.
 
 For releases that reached GitHub another way, TartCI self-update rolls the
-release out: first to the canary host (m5), then to m1, m3 and m5s after a
-2-hour healthy soak. `tartci fleet-macos tool-freshness` reports each host's
+release out: first to the canary host (m5), then to the other hosts after a
+2-hour healthy soak (they also wait for the steward host to verify the release;
+see tartci `fleet/tool-rollout.json`). `tartci fleet-macos tool-freshness` reports each host's
 installed version, and fleet-liveness alerts when self-update is halted,
 starved or failed. To roll hosts by hand, use `shipyard runner fleet-update`;
 `shipyard doctor --fleet` shows each host's version against the latest release.

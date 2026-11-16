@@ -159,7 +159,7 @@ The script runs the full pipeline on the local Mac:
 
    A host whose update may have committed but did not verify (failed verification, rejected evidence, pair-hash drift, or a timeout) is rolled back automatically to the version it ran before, through the same governed path, and re-verified. If that rollback fails, the host is quarantined, an alert issue is opened, and the stage prints "FLEET ROLLBACK FAILED … needs an operator now". No rollout touches a quarantined host until `shipyard runner fleet-update --clear-host <class>`. If another rollout holds the controller lock (exit 75), the stage warns and hands over instead of failing. The run stops at that host and ends with a `fleet_summary` naming verified, failed and not-attempted hosts. A failure exits `6` and names every lagging host. **The release is not reverted**: it is already public and install-verified. Fix the host, then rerun `shipyard runner fleet-update --to vX.Y.Z --host-class <class> --apply`. TartCI self-update also rolls a lagging host forward after its soak.
 
-   `--no-fleet-rollout` skips the stage with a warning. It is also skipped with a warning when `--ci-mode` is set (CI has no fleet), or when the Mac declares no `[host_class.*]`. In all of those cases TartCI self-update picks the release up (see below).
+   `--no-fleet-rollout` skips the stage with a warning. It is also skipped with a warning when `--ci-mode` is set (CI has no fleet), when the controller binary predates verified fleet rollouts (its `runner fleet-update` has no `--lagging-only`), or when the Mac declares no `[host_class.*]`. In all of those cases TartCI self-update picks the release up (see below).
 
 Running without `--upload` is the diagnostic mode (used to confirm the local signing path actually works on a given Mac). Script-helper tests under `scripts/test_*.py` ensure missing creds / bad flags / bash syntax errors all surface before the expensive build step.
 
@@ -221,7 +221,7 @@ verifies it, not when the DMG is public.** The local release script therefore
 ends with the verified fleet rollout above. For a release that reached GitHub
 any other way (CI signing, a manual upload, an opted-out run), TartCI
 self-update rolls it out: each Shipyard release goes to the canary host (m5)
-first, then to m1, m3 and m5s after a 2-hour healthy soak. `tartci fleet-macos
+first, then to the other hosts after a 2-hour healthy soak; they also wait for the steward host to verify the release (see tartci `fleet/tool-rollout.json`). `tartci fleet-macos
 tool-freshness` reports each host's installed version, and fleet-liveness
 alerts when self-update is halted, starved or failed. To roll a host by hand,
 use `shipyard runner fleet-update`.

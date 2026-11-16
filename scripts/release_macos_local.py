@@ -931,11 +931,11 @@ def run_fleet_rollout(config: ReleaseConfig, runner: CommandRunner, shipyard: st
         )
         raise SystemExit(FLEET_ROLLOUT_FAILED_EXIT)
     # The controller binary is the one already installed, i.e. the previous
-    # release. A controller without `runner fleet-update` or a Mac with no
+    # release. A controller without `runner fleet-update --lagging-only` or a Mac with no
     # [host_class] cannot run this stage; neither makes the release incomplete,
     # so hand over with a warning.
-    code, _, _ = runner.run_status([shipyard, "runner", "fleet-update", "--help"])
-    if code != 0:
+    code, help_text, _ = runner.run_status([shipyard, "runner", "fleet-update", "--help"])
+    if code != 0 or "--lagging-only" not in help_text:
         print(
             f"WARNING: {shipyard} predates verified fleet rollouts; the fleet was NOT "
             f"updated to {config.tag} here. TartCI self-update rolls it out after the "

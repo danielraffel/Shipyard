@@ -980,6 +980,7 @@ class FleetRolloutStageTests(unittest.TestCase):
         events: list[dict],
         *,
         capable: int = 0,
+        help_without_flag: bool = False,
         plan_code: int = 0,
         plan_stderr: str = "",
     ) -> FakeRunner:
@@ -991,7 +992,7 @@ class FleetRolloutStageTests(unittest.TestCase):
         def run_status(args: list[str]) -> tuple[int, str, str]:
             if args[1:] == ["runner", "fleet-update", "--help"]:
                 runner.probe_calls.append(args)  # type: ignore[attr-defined]
-                return capable, "", ""
+                return capable, "" if help_without_flag else "--lagging-only", ""
             if "--apply" not in args:
                 runner.probe_calls.append(args)  # type: ignore[attr-defined]
                 return plan_code, "{}", plan_stderr
@@ -1105,6 +1106,13 @@ class FleetRolloutStageTests(unittest.TestCase):
 
     def test_controller_without_fleet_update_hands_over_to_self_update(self) -> None:
         runner = self.fleet_runner(0, [], capable=2)
+        code, _, err = self.run_main(runner, "--fleet-shipyard", "/opt/ctl/shipyard")
+        self.assertEqual(code, 0)
+        self.assertEqual(runner.fleet_calls, [])  # type: ignore[attr-defined]
+        self.assertIn("predates verified fleet rollouts", err)
+
+    def test_controller_whose_fleet_update_lacks_lagging_only_hands_over(self) -> None:
+        runner = self.fleet_runner(0, [], help_without_flag=True)
         code, _, err = self.run_main(runner, "--fleet-shipyard", "/opt/ctl/shipyard")
         self.assertEqual(code, 0)
         self.assertEqual(runner.fleet_calls, [])  # type: ignore[attr-defined]

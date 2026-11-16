@@ -3029,7 +3029,7 @@ pub(super) enum RunnerCommand {
         #[arg(
             long = "clear-host",
             value_name = "HOST_CLASS",
-            conflicts_with_all = ["apply", "all_hosts", "host_classes", "lagging_only", "skip_canary_smoke"]
+            conflicts_with_all = ["to", "apply", "all_hosts", "host_classes", "lagging_only", "skip_canary_smoke"]
         )]
         clear_host: Option<String>,
     },

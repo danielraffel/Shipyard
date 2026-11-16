@@ -86,8 +86,7 @@ pub(super) fn update_ledger<F: FnOnce(&mut RolloutLedger)>(
     write_ledger(state_dir, &ledger)
 }
 
-/// Why the host's own install guard is held right now, if it is: a Sandbox
-/// canary (or an install) owns this host, so a rollout tick must defer before
+/// Clear an operator-resolved quarantine. When the host's failed rollback is
 /// what made its tag terminal, that tag becomes eligible again too.
 pub(super) fn clear_host(state_dir: &Path, host_class: &str) -> Result<Option<Quarantine>, String> {
     let mut cleared = None;
@@ -144,7 +143,7 @@ pub(super) fn rollback_failure_body(tag: &str, host_class: &str, reason: &str) -
     )
 }
 
-fn rollback_failed_prefix(host_class: &str) -> String {
+pub(super) fn rollback_failed_prefix(host_class: &str) -> String {
     format!("rollback failed on {host_class}: ")
 }
 
@@ -210,7 +209,6 @@ pub(super) fn classify_hosts(latest: &PublishedRelease, hosts: &mut [HostVersion
     }
 }
 
-/// Tuning for [`decide`].
 /// Read one configured host's installed version. See [`probe_version_at`].
 pub(super) fn probe_host_version(class: &HostClassConfig) -> HostVersion {
     probe_version_at(

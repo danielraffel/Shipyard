@@ -97,7 +97,9 @@ pub(in crate::app) fn fleet_version_doctor_section(
                 false,
                 Some(tag.clone()),
                 attempts.terminal.clone(),
-                Some("this release is terminal for fleet rollouts".to_owned()),
+                Some(
+                    "a failed rollback closed this release; fix the host, then clear it".to_owned(),
+                ),
             ),
         );
     }
@@ -268,7 +270,14 @@ fn terminal_tags(state_dir: &Path) -> Vec<(String, fleet_state::TagRecord)> {
             ledger
                 .tags
                 .into_iter()
-                .filter(|(_, attempts)| attempts.terminal.is_some())
+                .filter(|(_, record)| {
+                    // Only a tag `clear_host` can reopen is a finding; older
+                    // terminal reasons are history that no rollout reads.
+                    record
+                        .terminal
+                        .as_deref()
+                        .is_some_and(|reason| reason.starts_with("rollback failed on "))
+                })
                 .collect()
         })
         .unwrap_or_default()
@@ -346,6 +355,11 @@ mod tests {
                 .entry("v0.208.0".to_owned())
                 .or_default()
                 .terminal = Some("rollback failed on m3: gone".to_owned());
+            ledger
+                .tags
+                .entry("v0.207.0".to_owned())
+                .or_default()
+                .terminal = Some("superseded by v0.208.0 without a verified rollout".to_owned());
             ledger.tags.entry("v0.209.0".to_owned()).or_default();
         })
         .expect("ledger");
