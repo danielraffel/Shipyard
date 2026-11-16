@@ -5933,8 +5933,8 @@ non-clear base poison, a paused entry or a pending cancellation is skipped; the 
 (`steward_busy`). Under the lock the base's merge groups are read again (a
 non-clear reading is `base_poison_not_clear`), and while any flake re-enqueue
 receipt in the repository that the tick's breaker sweep has not judged is
-within the receipts' 30-day retention (`RECEIPT_DAYS`, not the flake window:
-the breaker trips on any receipt it keeps), every head is skipped as
+stored, whatever its age (the sweep judges every stored receipt; only a prune
+removes one), every head is skipped as
 `flake_requeue_unswept`: the tick sweeps first
 (`flake_requeue::unswept_requeue`). The sweep marks a receipt swept when its
 pull request is closed or no longer at the receipted head, so a closed pull

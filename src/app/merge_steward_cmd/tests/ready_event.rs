@@ -585,10 +585,10 @@ fn pending_cancellations_leave_the_head_to_the_tick() {
 /// The tick sweeps the flake breaker before it admits; this path does not.
 /// Pull request 41 was flake re-enqueued and may have been ejected again on
 /// its signature, unswept: an event for pull request 42, which has no receipt
-/// of its own and may share that signature, is left to the tick, even 25
-/// hours later (past the flake window, inside the receipts' retention, which
-/// is what the breaker reads). Once 41 is swept, or once its receipt is past
-/// the retention, 42 is admitted.
+/// of its own and may share that signature, is left to the tick, at any age:
+/// 25 hours (past the flake window) or 31 days (past the retention, but
+/// still stored until a prune removes it, and the sweep judges every stored
+/// receipt). Once 41 is swept, or its receipt is pruned, 42 is admitted.
 #[test]
 fn an_unswept_flake_requeue_on_another_head_leaves_the_repository_to_the_tick() {
     let other = "dddddddddddddddddddddddddddddddddddddddd";
@@ -611,6 +611,7 @@ fn an_unswept_flake_requeue_on_another_head_leaves_the_repository_to_the_tick() 
     for at in [
         Utc::now() - chrono::Duration::minutes(20),
         Utc::now() - chrono::Duration::hours(25),
+        Utc::now() - chrono::Duration::days(31),
     ] {
         let harness = Harness::new(&Fixture::approved());
         harness.save(&receipted(false, at));
@@ -618,14 +619,15 @@ fn an_unswept_flake_requeue_on_another_head_leaves_the_repository_to_the_tick() 
         assert_eq!(outcome.reason, "flake_requeue_unswept", "{at} {outcome:?}");
         assert_eq!(harness.enqueues(), 0);
     }
-    for (swept, at) in [
-        (true, Utc::now() - chrono::Duration::minutes(20)),
-        (false, Utc::now() - chrono::Duration::days(31)),
+    let pruned = StewardLedger::default();
+    for ledger in [
+        receipted(true, Utc::now() - chrono::Duration::minutes(20)),
+        pruned,
     ] {
         let harness = Harness::new(&Fixture::approved());
-        harness.save(&receipted(swept, at));
+        harness.save(&ledger);
         let outcome = harness.admit(HEAD, &observed(HEAD));
-        assert_eq!(outcome.outcome, "admitted", "swept={swept} {outcome:?}");
+        assert_eq!(outcome.outcome, "admitted", "{outcome:?}");
         assert_eq!(harness.enqueues(), 1);
     }
 }

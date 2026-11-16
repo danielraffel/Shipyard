@@ -537,23 +537,18 @@ fn short(sha: &str) -> &str {
 /// hide a tripped signature that another pull request, ejected on the same
 /// signature, would otherwise be re-enqueued on; so a ready-event admission
 /// leaves the whole repository to the tick until it sweeps. Keys match the
-/// sweep's `repo#` prefix. The bound is the receipts' own retention,
-/// [`RECEIPT_DAYS`], not the flake window: the breaker trips on any receipt
-/// it keeps. A receipt whose time cannot be read blocks. The sweep marks a
-/// receipt swept once its pull request is closed or has moved on, so a
-/// closed pull request does not hold the repository for the retention.
-pub(super) fn unswept_requeue(ledger: &StewardLedger, repo: &str, now: DateTime<Utc>) -> bool {
+/// sweep's `repo#` prefix. There is no age bound: the sweep judges every
+/// stored unswept receipt whatever its age, so every one blocks until the
+/// sweep judges it or pruning removes it. The sweep marks a receipt swept
+/// once its pull request is closed or has moved on, so a closed pull request
+/// does not hold the repository.
+pub(super) fn unswept_requeue(ledger: &StewardLedger, repo: &str) -> bool {
     let prefix = format!("{}#", repo.to_ascii_lowercase());
-    let retention = Duration::days(RECEIPT_DAYS);
     ledger
         .flake_requeue
         .requeued
         .iter()
-        .filter(|(key, receipt)| key.starts_with(&prefix) && !receipt.swept)
-        .any(|(_, receipt)| {
-            DateTime::parse_from_rfc3339(&receipt.at)
-                .map_or(true, |at| now - at.with_timezone(&Utc) < retention)
-        })
+        .any(|(key, receipt)| key.starts_with(&prefix) && !receipt.swept)
 }
 
 pub(super) fn receipt_key(repo: &str, pr: u64, head: &str) -> String {

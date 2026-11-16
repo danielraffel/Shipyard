@@ -24,7 +24,7 @@
 //! - a ledger lock another pass holds is skipped, never waited on;
 //! - under the lock, the base's merge groups are read again, and while any
 //!   flake re-enqueue in the repository is one the tick's breaker sweep has
-//!   not judged (within the receipts' retention), every head is skipped.
+//!   not judged (any stored receipt, whatever its age), every head is skipped.
 //!
 //! See `docs/scheduling-loop.md`, "Ready on event".
 
@@ -458,7 +458,7 @@ pub(super) fn admit_ready_event(
     // the sweep has not judged (the queue may have ejected it again on a
     // signature this head shares), every head is the tick's: it sweeps,
     // then decides.
-    if super::flake_requeue::unswept_requeue(&ledger, &observation.repo, now) {
+    if super::flake_requeue::unswept_requeue(&ledger, &observation.repo) {
         return ReadyEventOutcome::skipped(event, apply, "flake_requeue_unswept");
     }
     // The decision again, on the ledger the lock protects.
