@@ -533,21 +533,18 @@ fn short(sha: &str) -> &str {
 }
 
 /// Whether any flake re-enqueue in `repo` is one [`sweep`] has not judged
-/// yet, within the flake window. Only the tick sweeps, and an unswept
-/// receipt on one pull request can hide a tripped signature that another
-/// pull request, ejected on the same signature, would otherwise be
-/// re-enqueued on; so a ready-on-event admission leaves the whole repository
-/// to the tick until it sweeps. Keys match the sweep's `repo#` prefix. A
-/// receipt older than the window (a long-closed pull request the sweep never
-/// sees) does not block; one whose time cannot be read does.
-pub(super) fn unswept_requeue(
-    ledger: &StewardLedger,
-    repo: &str,
-    window_hours: u32,
-    now: DateTime<Utc>,
-) -> bool {
+/// yet. Only the tick sweeps, and an unswept receipt on one pull request can
+/// hide a tripped signature that another pull request, ejected on the same
+/// signature, would otherwise be re-enqueued on; so a ready-event admission
+/// leaves the whole repository to the tick until it sweeps. Keys match the
+/// sweep's `repo#` prefix. The bound is the receipts' own retention,
+/// [`RECEIPT_DAYS`], not the flake window: the breaker trips on any receipt
+/// it keeps. A receipt whose time cannot be read blocks. The sweep marks a
+/// receipt swept once its pull request is closed or has moved on, so a
+/// closed pull request does not hold the repository for the retention.
+pub(super) fn unswept_requeue(ledger: &StewardLedger, repo: &str, now: DateTime<Utc>) -> bool {
     let prefix = format!("{}#", repo.to_ascii_lowercase());
-    let window = Duration::hours(i64::from(window_hours));
+    let retention = Duration::days(RECEIPT_DAYS);
     ledger
         .flake_requeue
         .requeued
@@ -555,7 +552,7 @@ pub(super) fn unswept_requeue(
         .filter(|(key, receipt)| key.starts_with(&prefix) && !receipt.swept)
         .any(|(_, receipt)| {
             DateTime::parse_from_rfc3339(&receipt.at)
-                .map_or(true, |at| now - at.with_timezone(&Utc) < window)
+                .map_or(true, |at| now - at.with_timezone(&Utc) < retention)
         })
 }
 
@@ -871,12 +868,20 @@ pub(super) fn sweep(
         else {
             continue;
         };
+        // The observation lists every open pull request on the base (a
+        // partial list is refused before the pass). A receipt whose pull
+        // request is closed, or no longer at the receipted head, can never
+        // be re-enqueued again: it is marked swept, so it stops holding the
+        // repository for ready-event admissions (`unswept_requeue`).
         let Some(open) = observation
             .prs
             .iter()
             .find(|open| open.fact.number == pr)
             .filter(|open| open.fact.head_sha.eq_ignore_ascii_case(&head))
         else {
+            if let Some(receipt) = state.requeued.get_mut(&key) {
+                receipt.swept = true;
+            }
             continue;
         };
         if open.fact.queue_position.is_some() {

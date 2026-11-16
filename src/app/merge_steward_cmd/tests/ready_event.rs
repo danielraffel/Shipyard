@@ -585,8 +585,10 @@ fn pending_cancellations_leave_the_head_to_the_tick() {
 /// The tick sweeps the flake breaker before it admits; this path does not.
 /// Pull request 41 was flake re-enqueued and may have been ejected again on
 /// its signature, unswept: an event for pull request 42, which has no receipt
-/// of its own and may share that signature, is left to the tick. Once 41 is
-/// swept, or once its receipt is older than the flake window, 42 is admitted.
+/// of its own and may share that signature, is left to the tick, even 25
+/// hours later (past the flake window, inside the receipts' retention, which
+/// is what the breaker reads). Once 41 is swept, or once its receipt is past
+/// the retention, 42 is admitted.
 #[test]
 fn an_unswept_flake_requeue_on_another_head_leaves_the_repository_to_the_tick() {
     let other = "dddddddddddddddddddddddddddddddddddddddd";
@@ -606,16 +608,19 @@ fn an_unswept_flake_requeue_on_another_head_leaves_the_repository_to_the_tick() 
         );
         ledger
     };
-    let recent = Utc::now() - chrono::Duration::minutes(20);
-    let harness = Harness::new(&Fixture::approved());
-    harness.save(&receipted(false, recent));
-    let outcome = harness.admit(HEAD, &observed(HEAD));
-    assert_eq!(outcome.reason, "flake_requeue_unswept", "{outcome:?}");
-    assert_eq!(harness.enqueues(), 0);
-
+    for at in [
+        Utc::now() - chrono::Duration::minutes(20),
+        Utc::now() - chrono::Duration::hours(25),
+    ] {
+        let harness = Harness::new(&Fixture::approved());
+        harness.save(&receipted(false, at));
+        let outcome = harness.admit(HEAD, &observed(HEAD));
+        assert_eq!(outcome.reason, "flake_requeue_unswept", "{at} {outcome:?}");
+        assert_eq!(harness.enqueues(), 0);
+    }
     for (swept, at) in [
-        (true, recent),
-        (false, Utc::now() - chrono::Duration::days(30)),
+        (true, Utc::now() - chrono::Duration::minutes(20)),
+        (false, Utc::now() - chrono::Duration::days(31)),
     ] {
         let harness = Harness::new(&Fixture::approved());
         harness.save(&receipted(swept, at));
@@ -623,6 +628,57 @@ fn an_unswept_flake_requeue_on_another_head_leaves_the_repository_to_the_tick() 
         assert_eq!(outcome.outcome, "admitted", "swept={swept} {outcome:?}");
         assert_eq!(harness.enqueues(), 1);
     }
+}
+
+/// A closed pull request's unswept receipt stops holding the repository once
+/// the tick's sweep runs: the sweep marks it swept (its pull request is not
+/// in the open list), and the next event for pull request 42 is admitted.
+#[test]
+fn a_closed_pull_requests_receipt_is_swept_and_stops_blocking() {
+    let other = "dddddddddddddddddddddddddddddddddddddddd";
+    let mut ledger = StewardLedger::default();
+    let key = crate::app::merge_steward_cmd::flake_requeue::receipt_key("owner/repo", 41, other);
+    ledger.flake_requeue.requeued.insert(
+        key.clone(),
+        crate::app::merge_steward_cmd::flake_requeue::Receipt {
+            repo: "owner/repo".to_owned(),
+            signature: "macos: flaky".to_owned(),
+            ejection_at: "2026-11-13T00:10:00Z".to_owned(),
+            at: Utc::now().to_rfc3339(),
+            state: crate::app::merge_steward_cmd::flake_requeue::ReceiptState::Done,
+            attempts: 1,
+            swept: false,
+        },
+    );
+    let harness = Harness::new(&Fixture::approved());
+    harness.save(&ledger);
+    assert_eq!(
+        harness.admit(HEAD, &observed(HEAD)).reason,
+        "flake_requeue_unswept"
+    );
+    // The tick's sweep over the open list (only 42): 41 is closed. It reads
+    // nothing for 41.
+    let mut ledger = load_ledger(&harness.ledger_path).expect("ledger");
+    crate::app::merge_steward_cmd::flake_requeue::sweep(
+        &crate::merge_steward::flake_requeue::FlakePolicy {
+            mode: crate::merge_steward::flake_requeue::FlakeMode::Apply,
+            window_hours: 24,
+            max_requeues: 3,
+        },
+        &observed(HEAD),
+        &mut ledger,
+        &crate::app::merge_steward_cmd::flake_requeue::SweepReads {
+            queue: &|pr| panic!("the sweep read the timeline of closed #{pr}"),
+            assess: &|_| panic!("the sweep assessed a closed pull request"),
+        },
+    );
+    assert!(ledger.flake_requeue.requeued[&key].swept);
+    harness.save(&ledger);
+    // A later event: past the per-head attempt window of the first.
+    let later = Utc::now() + chrono::Duration::seconds(90);
+    let outcome = harness.admit_at(HEAD, &observed(HEAD), true, later);
+    assert_eq!(outcome.outcome, "admitted", "{outcome:?}");
+    assert_eq!(harness.enqueues(), 1);
 }
 
 #[test]
