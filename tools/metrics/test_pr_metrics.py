@@ -1,5 +1,6 @@
 import datetime as dt
 import json
+import os
 import re
 import sys
 import tempfile
@@ -451,21 +452,63 @@ class Controls(Base):
         self.assertFalse(out["controls_failed"])
         self.assertIn("reverts 1/1, escapes 1/1", pm.markdown(out))
 
-    def test_a_missed_control_means_nothing_is_reported(self):
+    def test_a_missed_control_withholds_only_its_metric(self):
         out = self.run_controls(False)
-        self.assertEqual(out["repos"][REPO]["controls"]["status"], "failed")
+        c = out["repos"][REPO]["controls"]
+        self.assertEqual((c["status"], c["disabled"]), ("failed", ["correctness"]))
         md = pm.markdown(out)
-        self.assertIn("CONTROL FAILED", md)
-        self.assertNotIn("| ready day |", md)
+        self.assertIn("CONTROL FAILED for some metrics", md)
+        self.assertIn("| ready day |", md)  # the report is still printed
+        self.assertIn("withheld", md)
 
-    def test_owner_touched_prs_from_the_ticks_must_read_non_autonomous(self):
+    def test_refused_prs_are_context_and_never_fail_the_control(self):
+        prs = [pr(1, T(10, "10:00"), T(10, "11:00"))]
+        out = pm.build([REPO], self.cache, 200, OWNER, START, self.LATE, {}, {}, None, world(prs), None, None, {}, {REPO: {1}})
+        c = out["repos"][REPO]["controls"]
+        self.assertEqual(c["owner_touched"], {"in_report": 1, "non_autonomous": 0, "not_in_window": 0})
+        self.assertNotEqual(c["status"], "failed")
+        self.assertFalse(out["controls_failed"])
+
+    def test_a_pinned_owner_touched_pr_read_as_autonomous_withholds_the_north_star_only(self):
+        prs = [pr(1, T(10, "10:00"), T(10, "11:00"))]
+        out = pm.build([REPO], self.cache, 200, OWNER, START, self.LATE, {}, {}, None, world(prs), None, None, {REPO: {"owner": [1]}})
+        c = out["repos"][REPO]["controls"]
+        self.assertEqual((c["status"], c["disabled"]), ("failed", ["north_star"]))
+        md = pm.markdown(out)
+        self.assertIn("| ready day |", md)
+        self.assertIn("withheld", md)
+
+    def test_a_pinned_owner_touched_pr_found_passes(self):
         owner_pr = {1: [{"event": "merged", "actor": {"login": OWNER}, "created_at": T(10, "10:50")}]}
         prs = [pr(1, T(10, "10:00"), T(10, "11:00"))]
-        ok = pm.build([REPO], self.cache, 200, OWNER, START, self.LATE, {}, {}, None, world(prs, owner_pr), None, None, {}, {REPO: {1}})
-        self.assertEqual(ok["repos"][REPO]["controls"]["owner_touched"], {"in_report": 1, "non_autonomous": 1, "not_in_window": 0})
+        out = pm.build([REPO], self.cache, 200, OWNER, START, self.LATE, {}, {}, None, world(prs, owner_pr), None, None, {REPO: {"owner": [1]}})
+        self.assertEqual(out["repos"][REPO]["controls"]["status"], "ok")
+        self.assertNotIn("withheld", pm.markdown(out))
+
+
+class Truncation(Base):
+    LATE = dt.datetime(2026, 11, 30, tzinfo=UTC)
+
+    def test_a_truncated_repo_is_partial_and_a_fully_read_repo_is_not(self):
+        prs = [pr(n, T(10, "10:00"), T(10, "11:00")) for n in range(1, 4)]
+        out = pm.build([REPO], self.cache, 4, OWNER, START, self.LATE, {}, {}, None, world(prs), None, None, {})
+        v = out["repos"][REPO]
+        self.assertGreater(v["unread_prs"], 0)
+        self.assertTrue(out["truncated"])
+        md = pm.markdown(out)
+        self.assertIn("partial", md)
+        self.assertIn("| ready day |", md)  # numbers are still printed
         with tempfile.TemporaryDirectory() as d2:
-            bad = pm.build([REPO], d2, 200, OWNER, START, self.LATE, {}, {}, None, world(prs), None, None, {}, {REPO: {1}})
-        self.assertEqual(bad["repos"][REPO]["controls"]["status"], "failed")
+            full = pm.build([REPO], d2, 300, OWNER, START, self.LATE, {}, {}, None, world(prs), None, None, {})
+        self.assertEqual(full["repos"][REPO]["unread_prs"], 0)
+        self.assertNotIn("partial: unread", pm.markdown(full))
+
+    def test_settled_prs_are_cached_between_runs(self):
+        prs = [pr(n, T(10, "10:00"), T(10, "11:00")) for n in range(1, 4)]
+        pm.build([REPO], self.cache, 300, OWNER, START, self.LATE, {}, {}, None, world(prs), None, None, {})
+        again = pm.build([REPO], self.cache, 300, OWNER, START, self.LATE, {}, {}, None, world(prs), None, None, {})
+        self.assertTrue(os.path.isdir(os.path.join(self.cache, REPO.replace("/", "__"), "facts")))
+        self.assertLess(again["repos"][REPO]["reads"], 10)
 
 
 class Intervals(unittest.TestCase):
