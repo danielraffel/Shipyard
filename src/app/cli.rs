@@ -138,6 +138,13 @@ pub(super) enum Command {
         #[command(subcommand)]
         command: GuardsCommand,
     },
+    /// The push claim fence: refuse a push to a pull-request branch another
+    /// session holds a live `repair-claim:` on, or take that claim over.
+    Claim {
+        /// Claim subcommand.
+        #[command(subcommand)]
+        command: ClaimCommand,
+    },
     /// Qualify and pin immutable upstream dependencies.
     Dependency {
         /// Dependency family.
@@ -3539,6 +3546,35 @@ pub(super) enum OwnerCommand {
         /// Pull request number.
         #[arg(long)]
         pr: u64,
+        /// Exact OWNER/REPO. Defaults to the `origin` remote.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum ClaimCommand {
+    /// Judge a push from a git pre-push hook: reads the hook's stdin and exits
+    /// 1 when a pushed branch's open pull request has another session's live
+    /// claim, 0 otherwise (including when GitHub cannot be read).
+    CheckPush {
+        /// The remote's name, as git passes it to the hook.
+        remote: String,
+        /// The remote's URL, as git passes it to the hook.
+        url: String,
+    },
+    /// Take another owner's live claim: post `repair-claim-taken: <you> from
+    /// <owner> reason=...` as `$SHIPYARD_CLAIM_OWNER`.
+    Take {
+        /// The owner whose claim is taken.
+        #[arg(long)]
+        from: String,
+        /// Why the claim is taken.
+        #[arg(long)]
+        reason: String,
+        /// The pull request. Defaults to the open one for the current branch.
+        #[arg(long)]
+        pr: Option<u64>,
         /// Exact OWNER/REPO. Defaults to the `origin` remote.
         #[arg(long, value_name = "OWNER/REPO")]
         repo: Option<String>,

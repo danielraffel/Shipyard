@@ -848,37 +848,20 @@ fn approved_by(actor: &Actor, comments: &[Value]) -> Option<u64> {
     })
 }
 
-/// Every live `repair-claim: <lane> until <time>` from a trusted author. A
-/// claim whose time does not parse is live: it cannot be shown expired.
+/// Every live `repair-claim: <lane> until <time>` from a trusted author, read
+/// with the one claim grammar in [`crate::work_claim`]. A claim whose time
+/// does not parse is live: it cannot be shown expired.
 #[must_use]
 pub fn live_repair_claims(comments: &[Value], now: DateTime<Utc>) -> Vec<String> {
-    let pattern = Regex::new(r"(?m)^\s*repair-claim:\s*(\S+)\s+until\s+(\S+)").expect("regex");
-    comments
-        .iter()
-        .filter(|comment| trusted(comment))
-        .flat_map(|comment| {
-            let id = comment
-                .get("id")
-                .and_then(Value::as_u64)
-                .unwrap_or_default();
-            let body = comment.get("body").and_then(Value::as_str).unwrap_or("");
-            pattern
-                .captures_iter(body)
-                .filter(|claim| parse_time(&claim[2]).is_none_or(|until| until > now))
-                .map(|claim| format!("{} until {} (comment {id})", &claim[1], &claim[2]))
-                .collect::<Vec<_>>()
+    crate::work_claim::live_claims_in_records(comments, now)
+        .into_iter()
+        .map(|claim| {
+            format!(
+                "{} until {} (comment {})",
+                claim.owner, claim.until, claim.comment_id
+            )
         })
         .collect()
-}
-
-fn trusted(comment: &Value) -> bool {
-    comment
-        .get("association")
-        .and_then(Value::as_str)
-        .is_some_and(|association| {
-            crate::head_approval::TRUSTED_ASSOCIATIONS.contains(&association)
-        })
-        || comment.get("type").and_then(Value::as_str) == Some("Bot")
 }
 
 /// The head is unchanged since the last required run: required runs are

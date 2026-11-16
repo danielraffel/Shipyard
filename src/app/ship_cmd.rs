@@ -1292,6 +1292,7 @@ fn resolve_pr_context(
         });
     }
 
+    super::claim_cmd::fence_before_push(cwd, checkout.branch, args.gh_command.as_deref())?;
     push_pr_branch(
         config,
         cwd,

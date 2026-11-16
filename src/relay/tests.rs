@@ -1876,3 +1876,21 @@ fn checks_going_green_after_the_approval_run_the_admission() {
     h.pass(1, Mode::Shadow);
     assert_eq!(calls.borrow().len(), 1);
 }
+
+#[test]
+fn the_digest_reads_a_claim_with_a_note_and_a_minute_time() {
+    // Generous-Corp/vellum#462, verbatim: the note and the minute time are
+    // how people write claims, and the relay ignored this one.
+    let mut pr = Pr::open(1);
+    pr.comments.push((
+        "repair-claim: team-lead (repair-462-allowlist) until 2026-11-16T22:00Z".to_owned(),
+        "2026-11-16T18:17:00Z".to_owned(),
+    ));
+    assert_eq!(
+        digest(&pr).claim,
+        Some(Claim {
+            by: "team-lead".to_owned(),
+            until: "2026-11-16T22:00Z".to_owned()
+        })
+    );
+}

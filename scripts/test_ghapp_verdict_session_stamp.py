@@ -60,6 +60,43 @@ class Stamp(unittest.TestCase):
         assert once is not None
         self.assertEqual(stamp.stamped(once), once, "a re-stamp replaces, never adds")
 
+    def test_a_repaired_comment_names_its_session_and_keeps_its_last_line(self) -> None:
+        # Generous-Corp/vellum#462: an unmarked `repaired:` came from a push
+        # made under someone else's live claim, and nothing named the pusher.
+        body = "repaired: merged origin/main at 444ed8dc52\n"
+        out = stamp.stamped(body)
+        assert out is not None
+        lines = out.split("\n")
+        self.assertRegex(lines[0], r"^<!-- session: [^/\s]+/sess-A -->$")
+        self.assertEqual(lines[1], "repaired: merged origin/main at 444ed8dc52")
+        self.assertTrue(out.endswith("\n"))
+        self.assertIsNone(guard.marker_verdict(out), "a stamped repair is no verdict")
+        self.assertEqual(stamp.stamped(out), out, "a re-stamp replaces, never adds")
+
+    def test_a_claim_take_is_stamped_and_a_forged_stamp_replaced(self) -> None:
+        forged = "<!-- session: someone-else/sess-Z -->"
+        body = f"repair-claim-taken: lane-b from lane-a reason=idle\n{forged}"
+        out = stamp.stamped(body)
+        assert out is not None
+        self.assertNotIn("sess-Z", out)
+        lines = out.split("\n")
+        self.assertRegex(lines[0], r"^<!-- session: [^/\s]+/sess-A -->$")
+        self.assertEqual(lines[-1], "repair-claim-taken: lane-b from lane-a reason=idle")
+
+    def test_a_repaired_mention_inside_a_line_is_not_stamped(self) -> None:
+        self.assertIsNone(stamp.stamped("I will comment repaired: later"))
+
+    def test_main_reports_the_repaired_stamp_as_its_own(self) -> None:
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), "pr", "comment", "5", "--body", "repaired: x at abc"],
+            capture_output=True, check=True,
+            env={"PATH": "/usr/bin:/bin", "CLAUDE_CODE_SESSION_ID": "sess-A"},
+        )
+        items = result.stdout.split(b"\0")[:-1]
+        self.assertEqual(items[-3], b"SHIPYARD-STAMP-OWN")
+        self.assertRegex(items[-2].decode(), r"^<!-- session: [^/\s]+/sess-A -->$")
+        self.assertIn(items[-2], items[5])
+
     def test_a_stamp_already_in_the_body_is_replaced(self) -> None:
         # tartci#623: a copied verdict could carry a hand-written stamp naming
         # the reviewer's machine, and a stamper that kept it vouched for it.

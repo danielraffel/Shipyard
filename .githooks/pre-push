@@ -8,6 +8,19 @@ if [ "${SHIPYARD_SKIP_PREPUSH:-0}" = "1" ]; then
     echo "[pre-push] run the repository gates, or use the sanctioned shipyard pr path." >&2
     exit 1
 fi
+# Claim fence (docs/claim-fence.md): refuse a push to a pull-request branch
+# another session holds a live `repair-claim:` on. It fails open, loudly, when
+# GitHub cannot be read or this host's shipyard predates `claim check-push`.
+push_refs=""
+[ -t 0 ] || push_refs="$(cat)"
+if command -v shipyard >/dev/null 2>&1; then
+    printf '%s\n' "$push_refs" | shipyard claim check-push "${1:-}" "${2:-}"
+    case $? in
+        0) ;;
+        1) exit 1 ;;
+        *) echo "[pre-push] claim-fence: shipyard claim check-push could not run; pushing without the check" >&2 ;;
+    esac
+fi
 # Never let a rustup proxy invoked by this hook download a toolchain: a
 # missing pin is refused immediately below instead of stalling the push.
 export RUSTUP_AUTO_INSTALL=0

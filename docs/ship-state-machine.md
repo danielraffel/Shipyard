@@ -470,6 +470,10 @@ authoritative even when an unrelated hosted check has a similar target name.
   an existing `ServerAliveInterval` is preserved. A concurrent writer is
   refused at the push boundary, so a duplicate repair does not overwrite the
   first writer.
+- **Claim fence:** before that push (not on `--pr`), Shipyard refuses when an
+  open pull request for the branch carries another owner's live
+  `repair-claim:`, and fails open with a note when GitHub cannot be read
+  (`docs/claim-fence.md`). It writes no `ShipState`.
 - **Failure modes**
   - Explicit `shipyard ship --pr <n>` runs from a checkout whose canonical
     GitHub repository, local branch, or full `HEAD` differs from the

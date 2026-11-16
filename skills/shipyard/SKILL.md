@@ -740,6 +740,21 @@ cooldown, limit 1); the lockfile mode is `[governance.lockfile].mode`
 (`advisory` until promoted). The audit's workflow checks are textual: a
 version comment after a SHA must look like `# v1.2.3`.
 
+## A push to a claimed pull request is refused
+
+`shipyard pr`/`ship` and any pre-push hook that runs `shipyard claim
+check-push "$1" "$2"` (Shipyard's own does) refuse a push when an open pull
+request for the branch has another owner's live `repair-claim: <owner>
+[(<note>)] until <time>`. Set `SHIPYARD_CLAIM_OWNER` to the name you claimed
+with, or take the claim with `shipyard claim take --from <owner> --reason
+"..."`, which posts `repair-claim-taken: <you> from <owner> reason=...`.
+`repair-claim-released: <owner>` ends a claim; a garbled time counts as live.
+GitHub unreadable after one retry: it prints why and lets the push go.
+`SHIPYARD_CLAIM_FENCE=off` is the rollback. The claim grammar has one parser,
+`src/work_claim.rs`, used by the relay and `shipyard advance` too.
+`repaired:` and `repair-claim-taken:` comments get the `ghapp` session stamp
+above their last non-blank line. Full reference: `docs/claim-fence.md`.
+
 ## An adversarial ruling is stamped like a verdict and counted by nothing
 
 A comment whose last line is exactly `adversarial-ruling: OK|FIX-FIRST|BLOCK

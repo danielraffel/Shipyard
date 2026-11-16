@@ -395,11 +395,6 @@ fn verdict_regex() -> &'static Regex {
     })
 }
 
-fn claim_regex() -> &'static Regex {
-    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?m)^\s*repair-claim:\s*(\S+)\s+until\s+(\S+)").expect("regex"))
-}
-
 /// Whether `text` holds anything a merge or arm guard reads as a verdict: a
 /// `verdict:` or `reviewed:` marker line, a session stamp, or the inline
 /// spelling of either. The relay never sends such text.
@@ -481,15 +476,15 @@ fn scan_comments(pr: &Value, head: &str) -> (Option<String>, Option<Claim>, Opti
             }
         }
         // Comment text reaches an agent's prompt: keep only plain tokens.
-        if let Some(found) = claim_regex().captures_iter(body).last()
-            && crate::owner_registry::safe_value(&found[1])
-            && crate::owner_registry::safe_value(&found[2])
-            && found[1].len() <= 64
-            && found[2].len() <= 64
+        if let Some(found) = crate::work_claim::claim_lines(body).pop()
+            && crate::owner_registry::safe_value(&found.owner)
+            && crate::owner_registry::safe_value(&found.until)
+            && found.owner.len() <= 64
+            && found.until.len() <= 64
         {
             claim = Some(Claim {
-                by: found[1].to_owned(),
-                until: found[2].to_owned(),
+                by: found.owner,
+                until: found.until,
             });
         }
     }
