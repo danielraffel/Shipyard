@@ -493,6 +493,30 @@ class Attribution(Base):
             self.assertEqual((a["owner_merges_unverified"], a["steward_merges_recognised"]), (1, 0))
             ns = out["repos"][REPO]["per_day"]["2026-11-10"]["north_star"]
             self.assertEqual((ns["owner_action"], ns["autonomous"], ns["unknown"]), (0, 0, 1))
+            self.assertEqual(r["owner_actions"], 0)
+            iv = out["repos"][REPO]["per_day"]["2026-11-10"]["interventions"]
+            self.assertEqual((iv["owner_actions_per_pr"], iv["prs_with_owner_action"]), (0.0, 0))
+
+    def test_an_unverified_merge_from_a_partial_read_is_not_an_owner_action(self):
+        gh = world([self.merged_pr()], {1: [self.CM, self.enq("10:40"), self.MERGE]}, {1: self.long_commits()})
+        r = self.rows(self.build(gh))[1]
+        self.assertEqual((r["north"], r["owner_actions"]), ("unknown", 0))
+
+    def test_an_old_compute_cache_entry_is_recomputed(self):
+        d = os.path.join(self.cache, REPO.replace("/", "__"), "compute")
+        os.makedirs(d)
+        with open(os.path.join(d, "1.json"), "w") as fh:  # written before COMPUTE_VERSION: complete=true from a partial read
+            json.dump({"self_hosted_min": 99.0, "hosted_min": 0.0, "runs": 1, "repeat_runs": 0, "group_runs": 0, "complete": True}, fh)
+        gh = world([self.merged_pr()], {1: [self.CM, self.enq("10:40"), self.MERGE]}, {1: [commit("c1", "x", "w")]})
+        c = self.rows(self.build(gh))[1]["compute"]
+        self.assertNotEqual((c or {}).get("self_hosted_min"), 99.0)
+        self.assertTrue([x for x in gh.calls if "runs" in x])
+
+    def test_the_report_states_the_actual_steward_evidence_rule(self):
+        md = pm.markdown(self.build(world([self.merged_pr()])))
+        self.assertIn("trusted evidence bound to the merged SHA", md)
+        self.assertIn("unverified owner merge", md)
+        self.assertNotIn("(or opened through `shipyard pr`) is a steward merge", md)
 
     def test_an_approval_followed_by_an_ejection_is_not_evidence(self):
         gone = dict(self.enq("10:45", "removed_from_merge_queue"), reason="failed_checks")
