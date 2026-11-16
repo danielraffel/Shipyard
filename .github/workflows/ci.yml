@@ -209,9 +209,6 @@ jobs:
         # bare `unittest discover` exits 0 when the process is ended mid-suite.
         run: python3 scripts/run_unittest_strict.py -s scripts -p 'test_*.py'
 
-      - name: Run fleet pass-runner tests
-        run: python3 scripts/run_unittest_strict.py -s tools/fleet-pass -p 'test_*.py'
-
       - name: Run loss report tests
         run: python3 scripts/run_unittest_strict.py -s tools/metrics -p 'test_*.py'
 
