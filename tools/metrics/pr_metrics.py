@@ -48,7 +48,7 @@ UNKNOWN_RANGE_SHARE = 0.20
 SCORECARD_VERSION = "2026-11-15.1"
 MERGE_MAIN_RE = re.compile(r"^Merge (remote-tracking )?branch '?(origin/)?(main|master)'?|^Merge pull request .* from .*/main", re.I)
 # Positive controls: a real revert (#124 reverted #119), a real escaped defect (#126 names #116).
-DEFAULT_CONTROLS = {"danielraffel/fleet-handbook": {"revert": [(119, 124)], "escape": [(116, 126)]}}
+DEFAULT_CONTROLS = {"danielraffel/fleet-handbook": {"revert": [(119, 124)], "escape": [(116, 126)]}}  # "owner": [pr, ...] pins PRs with a hand-verified owner action
 # Labels that take a PR out of the eligible cohort, with the reason reported.
 EXCLUDE_LABELS = {"automation": "automation", "shipyard:unmanaged": "unmanaged", "superseded": "superseded"}
 INTEGRATION_BASES = ("develop/", "release/")
@@ -689,6 +689,8 @@ def check_controls(repo, rows, controls, refused):
             continue
         out["escape"]["expected"] += 1
         out["escape"]["found"] += r["correct"].get("escaped_by") == naming
+    # `refused` PRs were stopped by direct_merge_refused (a ruleset config gap), which says nothing about
+    # whether the owner touched them, so they are only counted for context and never fail the control.
     for n in sorted(refused or ()):
         r = by.get(n)
         if not r or not r["north"]:
@@ -696,17 +698,30 @@ def check_controls(repo, rows, controls, refused):
             continue
         out["owner_touched"]["in_report"] += 1
         out["owner_touched"]["non_autonomous"] += r["north"] == "owner_action"
+    # Pinned owner-touched PRs (verified by hand to carry a genuine owner action) must read owner_action.
+    out["owner_pinned"] = {"expected": 0, "found": 0, "not_in_window": 0}
+    for n in c.get("owner", []):
+        r = by.get(n)
+        if not r or not r["north"]:
+            out["owner_pinned"]["not_in_window"] += 1
+            continue
+        out["owner_pinned"]["expected"] += 1
+        out["owner_pinned"]["found"] += r["north"] == "owner_action"
     o = out
-    failed = []
+    failed, disabled = [], []
     if o["revert"]["found"] < o["revert"]["expected"]:
         failed.append("revert control not found")
+        disabled.append("correctness")
     if o["escape"]["found"] < o["escape"]["expected"]:
         failed.append("escaped-defect control not found")
-    if o["owner_touched"]["in_report"] and not o["owner_touched"]["non_autonomous"]:
+        disabled.append("escaped")
+    if o["owner_pinned"]["found"] < o["owner_pinned"]["expected"]:
         failed.append("owner-touched control read as autonomous")
-    checked = o["revert"]["expected"] + o["escape"]["expected"] + o["owner_touched"]["in_report"]
+        disabled.append("north_star")
+    checked = o["revert"]["expected"] + o["escape"]["expected"] + o["owner_pinned"]["expected"]
     out["status"] = "failed" if failed else "ok" if checked else "unchecked"
     out["failed"] = failed
+    out["disabled"] = disabled  # parallel to `failed`; only these metrics are withheld; the rest of the report stands
     return out
 
 
@@ -777,6 +792,11 @@ def ci(x):
     return "n/a" if not x else f"{x[0]}-{x[1]}"
 
 
+def repo_partial(v):
+    """A repo is partial when its read cap ran out, a read failed, PRs were left unread or its listing was cut short."""
+    return bool(v["truncated"] or v.get("read_errors") or v["unread_prs"] or not v["listing_complete"])
+
+
 def sample_label(s, truncated):
     ns = s["north_star"]
     why = []
@@ -785,7 +805,7 @@ def sample_label(s, truncated):
     if ns.get("overlaps_baseline"):
         why.append("interval overlaps baseline")
     if truncated:
-        why.append("truncated")
+        why.append("partial: not fully read")
     return "insufficient sample (" + ", ".join(why) + ")" if why else "ok"
 
 
@@ -793,7 +813,7 @@ def markdown(e2e):
     L = ["", f"## Scorecard {e2e['scorecard_version']}: end-to-end per eligible PR (cohort = UTC day the PR became ready)", "",
          "Baseline cohort: PRs ready 2026-11-12 to 2026-11-14. A day closes 48h after it ends, so the first comparable later cohort day closes 48h after that day.", "",
          f"Reads {e2e['reads']} (cap {e2e.get('read_cap_total', e2e['read_cap_per_repo'])} per run, shared: each repo gets an equal share of what is left), truncated={str(e2e['truncated']).lower()}"
-         + (" : a truncated window is insufficient sample" if e2e["truncated"] else "") + f". Coverage: {e2e['coverage']['status']} {e2e['coverage']['reason']}", "",
+         + (" : repos with unread PRs are labelled partial; fully read repos are reported normally" if e2e["truncated"] else "") + f". Coverage: {e2e['coverage']['status']} {e2e['coverage']['reason']}", "",
          f"North Star: eligible PRs that became ready in the window and merged within 48h of ready with no owner action ({e2e['owner']}'s own account: "
          "review, label, comment, UI merge or close), over ALL eligible PRs ready in the window. A cohort day is reported only after its 48h horizon closed. "
          "An owner-identity commit with no agent trailer makes a PR unknown; above 20% unknown the rate is a range. `gh-only` ignores commits. "
@@ -802,11 +822,11 @@ def markdown(e2e):
          "(repair after a HOLD or `repaired:`, author before, merge-main), merge-queue attempts and ejections by cause, DIRTY per 100 PRs, gate runs per merged PR "
          "(repeats counted; minutes are context). Correctness: revert or red required check on the base within 7 days; escaped defect (best effort, titles and bodies naming the PR only) within 14.", ""]
     if e2e["controls_failed"]:
-        L += ["**CONTROL FAILED: nothing is reported.** A positive control read zero, so the instrument or the repo coverage is broken:", ""]
+        L += ["**CONTROL FAILED for some metrics (those cells read `withheld`; everything else is reported).** A positive control read zero, so that instrument is broken:", ""]
         for repo, v in sorted(e2e["repos"].items()):
-            for f in v["controls"]["failed"]:
-                L.append(f"- {repo}: {f}")
-        return "\n".join(L) + "\n"
+            for f, m in zip(v["controls"]["failed"], v["controls"]["disabled"]):
+                L.append(f"- {repo}: {f} (withheld: {m})")
+        L.append("")
     head = ("| {0} | ready PRs | autonomous a/o/unknown/not merged | rate (CI95) | range if unknown>20% | unknown | gh-only rate | sample | "
             "holds/PR | re-HOLD rate (CI95) | pushes/PR repair/author/merge-main | queue attempts/PR | ejections | DIRTY/100 | owner actions/PR | repair cycles/PR | "
             "runs per merged PR median/mean (repeats) | handoff median/p90 min (context) | correctness bad/good/unk | bad rate (CI95) | escaped (CI95) | context min sh/hosted |")
@@ -814,24 +834,30 @@ def markdown(e2e):
 
     def row(label, s, ctl="", trunc=False):
         a, r, p, c, k, h = s["north_star"], s["rounds"], s["pushes_per_ready_pr"], s["compute_per_merged_pr"], s["correctness"], s["handoff_min"]
+        off = set((ctl or {}).get("disabled", ()))
+        W = "withheld"
         rng = f"{a['rate_range_pct'][0]}-{a['rate_range_pct'][1]}%" if a["unknown_over_20pct"] else "-"
         ej = ", ".join(f"{k2} {n}" for k2, n in s["merge_queue"]["ejections_by_cause"].items()) or "0"
         zero_bad = f" (control: reverts {ctl['revert']['found']}/{ctl['revert']['expected']})" if ctl and ctl["revert"]["expected"] and k["reverted"] == 0 and k["base_red"] == 0 else ""
         zero_esc = f" (control: escapes {ctl['escape']['found']}/{ctl['escape']['expected']})" if ctl and ctl["escape"]["expected"] and k["escaped"] == 0 else ""
-        return (f"| {label} | {s['ready_prs']} | {a['autonomous']}/{a['owner_action']}/{a['unknown']}/{a['not_merged_in_48h']} | "
-                f"{a['rate_pct']}% ({ci(a['rate_ci95'])}) | {rng} | {a['unknown_share_pct']}% | {a['github_only']['rate_pct']}% ({ci(a['github_only']['rate_ci95'])}) | "
+        ns_off = "north_star" in off
+        return (f"| {label} | {s['ready_prs']} | {W if ns_off else str(a['autonomous']) + '/' + str(a['owner_action']) + '/' + str(a['unknown']) + '/' + str(a['not_merged_in_48h'])} | "
+                f"{W if ns_off else str(a['rate_pct']) + '% (' + ci(a['rate_ci95']) + ')'} | {W if ns_off else rng} | {W if ns_off else str(a['unknown_share_pct']) + '%'} | "
+                f"{W if ns_off else str(a['github_only']['rate_pct']) + '% (' + ci(a['github_only']['rate_ci95']) + ')'} | "
                 f"{sample_label(s, trunc)} | {r['holds_per_ready_pr']} | {r['re_hold_rate_pct']}% ({ci(r['re_hold_rate_ci95'])}), n={r['prs_with_hold']} | "
                 f"{p['repair']}/{p['author']}/{p['merge_main']} | {s['merge_queue']['attempts_per_ready_pr']} | {ej} | {s['dirty_per_100_prs']} | "
                 f"{s['interventions']['owner_actions_per_pr']} | {s['interventions']['repair_cycles_per_pr']} | {c['runs_median']}/{c['runs_mean']} ({c['repeat_runs_total']}/{c['runs_total']}) | "
-                f"{h['median']}/{h['p90']} (n={h['n']}) | {k['bad']}/{k['good']}/{k['unknown']} | {k['bad_rate_pct']}% ({ci(k['bad_rate_ci95'])}){zero_bad} | "
-                f"{k['escaped']}/{k['escaped_known']} ({ci(k['escaped_rate_ci95'])}){zero_esc} | {c['context_self_hosted_min_median']}/{c['context_hosted_min_median']} |")
+                f"{h['median']}/{h['p90']} (n={h['n']}) | {W if 'correctness' in off else str(k['bad']) + '/' + str(k['good']) + '/' + str(k['unknown'])} | "
+                f"{W if 'correctness' in off else str(k['bad_rate_pct']) + '% (' + ci(k['bad_rate_ci95']) + ')' + zero_bad} | "
+                f"{W if 'escaped' in off else str(k['escaped']) + '/' + str(k['escaped_known']) + ' (' + ci(k['escaped_rate_ci95']) + ')' + zero_esc} | {c['context_self_hosted_min_median']}/{c['context_hosted_min_median']} |")
 
     def ctl_str(v):
         c = v["controls"]
-        return f"reverts {c['revert']['found']}/{c['revert']['expected']}, escapes {c['escape']['found']}/{c['escape']['expected']}, owner-touched {c['owner_touched']['non_autonomous']}/{c['owner_touched']['in_report']}"
+        return (f"reverts {c['revert']['found']}/{c['revert']['expected']}, escapes {c['escape']['found']}/{c['escape']['expected']}, owner-touched (context) {c['owner_touched']['non_autonomous']}/{c['owner_touched']['in_report']}, "
+               f"owner-pinned {c['owner_pinned']['found']}/{c['owner_pinned']['expected']} ({c['status']})")
     for repo, v in sorted(e2e["repos"].items()):
         L += [f"### {repo}", ""]
-        if v["truncated"] or v["unread_prs"] or not v["listing_complete"]:
+        if repo_partial(v):
             L += [f"**TRUNCATED: {v['unread_prs']} PRs unread** ({v['reads']} reads, read cap hit={str(v['truncated']).lower()}, "
                   f"listing complete={str(v['listing_complete']).lower()}). Cached PRs are not re-read, so the next run resumes.", ""]
         if v.get("excluded"):
@@ -839,12 +865,12 @@ def markdown(e2e):
         L += [f"Controls ({v['controls']['status']}): " + ctl_str(v) + f"; not in window: {sum(x['not_in_window'] for x in v['controls'].values() if isinstance(x, dict))}", ""]
         L += [head.format("ready day"), sep]
         for d, s in v["per_day"].items():
-            L.append(row(d, s, v["controls"], e2e["truncated"]) if s["closed"] else f"| {d} (48h horizon open: not reported) |" + " |" * 21)
+            L.append(row(d, s, v["controls"], repo_partial(v)) if s["closed"] else f"| {d} (48h horizon open: not reported) |" + " |" * 21)
         L.append("")
     for title, blk in (("Window", e2e.get("window")), ("Baseline", e2e.get("baseline"))):
         if blk:
             L += [f"## {title} {blk['from']} to {blk['to']} (pooled, closed days only)", "", head.format("repo"), sep]
-            L += [row(repo, s, e2e["repos"][repo]["controls"], e2e["truncated"]) for repo, s in sorted(blk["per_repo"].items())] + [""]
+            L += [row(repo, s, e2e["repos"][repo]["controls"], repo_partial(e2e["repos"][repo])) for repo, s in sorted(blk["per_repo"].items())] + [""]
     nf = (e2e.get("baseline") or {}).get("noise_floor")
     if nf:
         L += ["### Baseline noise floor (day against day, North Star rate)", ""]

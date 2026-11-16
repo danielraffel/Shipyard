@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Callable, Iterable
 
 # ── Types ───────────────────────────────────────────────────────────────
 
@@ -283,6 +283,222 @@ def release_version_file_exception(base: str, head: str) -> bool:
     return False
 
 
+# ── Version-value prohibition ──────────────────────────────────────────
+#
+# Version files are refused whole in a pull request, except Cargo.toml and
+# Cargo.lock: there a dependency, feature, profile or lint edit passes, while
+# the [package] table, the build-target tables and the crate's own lockfile
+# version must not change. A version file counts as a forbidden edit when:
+#
+#   * it exists on only one side (added or deleted);
+#   * it is not a regular file (100644 or 100755) on either side, or its mode
+#     changed: a symlink whose target string equals the old contents keeps the
+#     same blob id while readers follow it somewhere else;
+#   * its blob differs and it is not Cargo.toml or Cargo.lock;
+#   * a strict parser cannot read it, or a regex reader of the version
+#     disagrees with the parser, on either side;
+#   * any locked part of it differs between the two sides.
+#
+# The regex readers can be pointed at a decoy (a single-quoted TOML version,
+# or an indented `version =` line inside a multi-line string), so tomllib is
+# the authority and every regex reader must agree with it.
+
+try:  # Python 3.11+. Without it Cargo.toml and Cargo.lock keep the whole-file rule.
+    import tomllib as _tomllib
+except ModuleNotFoundError:  # pragma: no cover - CI runs 3.12
+    _tomllib = None  # type: ignore[assignment]
+
+
+class _Unreadable(Exception):
+    """A version file the strict reader cannot vouch for. Fail closed."""
+
+
+# Other readers of Cargo.toml's version that must agree with Cargo. The first
+# is the one `.github/workflows/auto-release.yml` tags from (it allows leading
+# whitespace, unlike the configured reader), so a line the configured reader
+# skips, such as an indented one inside a multi-line string, cannot move the
+# tag while Cargo and the gate read the old version.
+_CARGO_DOWNSTREAM_VERSION_RES = (
+    re.compile(r'(?ms)^\[package\].*?^\s*version\s*=\s*"([^"]+)"'),
+)
+
+# Cargo.toml tables and top-level keys a pull request may not change. The
+# [package] table carries the version, name, build script and target
+# discovery; the rest decide what is built. Dependency, feature, profile and
+# lint tables stay editable.
+_CARGO_LOCKED_KEYS = (
+    "package", "workspace", "lib", "bin", "example", "test", "bench",
+    "autobins", "autoexamples", "autotests", "autobenches",
+)
+
+_REGULAR_FILE_MODES = ("100644", "100755")
+
+
+def _git_entry(ref: str, path: str) -> tuple[str, str, str] | None:
+    """(mode, type, object id) of `path` at `ref`, or None when absent.
+
+    Raises when `ref` does not resolve, so a bad ref can never read as
+    "absent on both sides".
+    """
+    out = subprocess.run(
+        ["git", "ls-tree", "--full-tree", ref, "--", path],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    for line in out.splitlines():
+        meta, _, name = line.partition("\t")
+        if name == path:
+            mode, kind, oid = meta.split()
+            return mode, kind, oid
+    return None
+
+
+def _git_blob_text(oid: str) -> str:
+    data = subprocess.run(
+        ["git", "cat-file", "blob", oid],
+        check=True, capture_output=True,
+    ).stdout
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _Unreadable("not UTF-8") from exc
+
+
+def _toml(text: str) -> dict:
+    if _tomllib is None:
+        raise _Unreadable("tomllib unavailable")
+    try:
+        return _tomllib.loads(text)
+    except _tomllib.TOMLDecodeError as exc:
+        raise _Unreadable(str(exc)) from exc
+
+
+def _cargo_package(manifest: dict) -> tuple[str, str]:
+    """(`[package].name`, `[package].version`) as Cargo reads them."""
+    package = manifest.get("package")
+    if not isinstance(package, dict):
+        raise _Unreadable("no [package] table")
+    name, version = package.get("name"), package.get("version")
+    # `version.workspace = true` and a missing key both land here.
+    if not isinstance(name, str) or not isinstance(version, str):
+        raise _Unreadable("[package] name or version is not a literal string")
+    return name, version
+
+
+def _cargo_manifest_locked(text: str, vfs: list[VersionFile]) -> dict:
+    """The parts of a Cargo.toml a pull request may not change."""
+    manifest = _toml(text)
+    crate, version = _cargo_package(manifest)
+    if cargo_crate_name(text) != crate:
+        raise _Unreadable("the lockfile updater disagrees with Cargo's package name")
+    readers = [vf for vf in vfs if vf.kind == "regex" and vf.pattern]
+    if not readers:
+        raise _Unreadable("no configured version reader for Cargo.toml")
+    for vf in readers:
+        if _extract_version_from_text(text, vf) != version:
+            raise _Unreadable("the configured reader disagrees with Cargo's version")
+        probe = "0.0.0" if version != "0.0.0" else "0.0.1"
+        updated = _updated_regex_version_text(text, vf, probe)
+        expected = _toml(text)
+        expected["package"]["version"] = probe
+        if _toml(updated) != expected:
+            raise _Unreadable("the manifest writer cannot update Cargo's package version")
+    for pattern in _CARGO_DOWNSTREAM_VERSION_RES:
+        m = pattern.search(text)
+        if not m or m.group(1) != version:
+            raise _Unreadable("a downstream reader disagrees with Cargo's version")
+    return {key: manifest.get(key) for key in _CARGO_LOCKED_KEYS}
+
+
+def _cargo_lock_own_version(lock_text: str, crate: str) -> str:
+    """The version of the lockfile's own entry for `crate`.
+
+    Exactly one source-less `[[package]]` with that name must exist; a
+    registry crate of the same name carries a `source` key.
+    """
+    entries = _toml(lock_text).get("package")
+    if not isinstance(entries, list):
+        raise _Unreadable("Cargo.lock has no [[package]] entries")
+    own = [entry for entry in entries
+           if isinstance(entry, dict) and entry.get("name") == crate
+           and "source" not in entry]
+    if len(own) != 1:
+        raise _Unreadable(f"Cargo.lock has {len(own)} own entries for {crate!r}")
+    version = own[0].get("version")
+    if not isinstance(version, str):
+        raise _Unreadable("Cargo.lock own entry has no version")
+    return version
+
+
+def _locked_parts(
+    path: str,
+    vfs: list[VersionFile],
+    text: str,
+    read_at: Callable[[str], str | None],
+) -> object:
+    """What may not change in one side of Cargo.toml or Cargo.lock.
+
+    `read_at(path)` returns the text of another file on the same side, or
+    None; Cargo.lock needs the crate name from Cargo.toml. Raises
+    `_Unreadable` when the file cannot be vouched for.
+    """
+    name = path.rsplit("/", 1)[-1]
+    if name == "Cargo.lock":
+        manifest = read_at(path[: -len("Cargo.lock")] + "Cargo.toml")
+        if manifest is None:
+            raise _Unreadable("Cargo.lock without a Cargo.toml beside it")
+        crate, _ = _cargo_package(_toml(manifest))
+        version = _cargo_lock_own_version(text, crate)
+        probe = "0.0.0-version-gate-probe"
+        updated = _updated_cargo_lock_text(text, crate, probe)
+        if updated is None or _cargo_lock_own_version(updated, crate) != probe:
+            raise _Unreadable("the lockfile updater cannot update the own entry")
+        return version
+    if name == "Cargo.toml":
+        return _cargo_manifest_locked(text, vfs)
+    raise _Unreadable("version files other than Cargo.toml and Cargo.lock are refused whole")
+
+
+def version_value_edits(cfg: Config, base: str, head: str) -> list[str]:
+    """Version files a PR may not carry. See the section comment above."""
+    by_path: dict[str, list[VersionFile]] = {}
+    for surface in cfg.surfaces:
+        for vf in surface.version_files:
+            by_path.setdefault(vf.path, []).append(vf)
+
+    def reader(ref: str) -> Callable[[str], str | None]:
+        def read_at(other: str) -> str | None:
+            entry = _git_entry(ref, other)
+            if entry is None or entry[0] not in _REGULAR_FILE_MODES:
+                return None
+            return _git_blob_text(entry[2])
+        return read_at
+
+    edits: list[str] = []
+    for path in sorted(version_file_paths(cfg)):
+        before, after = _git_entry(base, path), _git_entry(head, path)
+        if before is None and after is None:
+            continue
+        if before is None or after is None:
+            edits.append(path)
+            continue
+        if (before[0] != after[0] or before[0] not in _REGULAR_FILE_MODES
+                or before[1] != "blob" or after[1] != "blob"):
+            edits.append(path)
+            continue
+        if before[2] == after[2]:
+            continue
+        vfs = by_path.get(path, [])
+        try:
+            old = _locked_parts(path, vfs, _git_blob_text(before[2]), reader(base))
+            new = _locked_parts(path, vfs, _git_blob_text(after[2]), reader(head))
+        except _Unreadable:
+            edits.append(path)
+            continue
+        if old != new:
+            edits.append(path)
+    return edits
+
+
 # ── Version-file I/O ────────────────────────────────────────────────────
 
 _CMAKE_PROJECT_VERSION_RE = re.compile(
@@ -332,6 +548,27 @@ def cargo_crate_name(manifest_text: str) -> str | None:
     return m.group(1) if m else None
 
 
+def _updated_cargo_lock_text(text: str, crate: str, new: str) -> str | None:
+    """Apply the lock updater in memory, or refuse an ambiguous match."""
+    blocks = text.split("[[package]]")
+    rewritten: list[str] = []
+    changed = 0
+    for block in blocks:
+        if (
+            re.search(rf'(?m)^name\s*=\s*"{re.escape(crate)}"$', block)
+            and not re.search(r"(?m)^source\s*=", block)
+        ):
+            block, count = re.subn(
+                r'(?m)^(version\s*=\s*")([^"]+)(")',
+                lambda m: f"{m.group(1)}{new}{m.group(3)}",
+                block,
+                count=1,
+            )
+            changed += count
+        rewritten.append(block)
+    return "[[package]]".join(rewritten) if changed == 1 else None
+
+
 def refresh_cargo_lock(repo: Path, manifest_rel: str, new: str) -> str | None:
     """Point Cargo.lock's own entry for this crate at `new`.
 
@@ -358,33 +595,21 @@ def refresh_cargo_lock(repo: Path, manifest_rel: str, new: str) -> str | None:
         return None
 
     text = lock.read_text()
-    # Split on the block delimiter, keeping it, so each chunk is one package.
-    blocks = text.split("[[package]]")
-    rewritten: list[str] = []
-    changed = 0
-    for block in blocks:
-        if (
-            re.search(rf'(?m)^name\s*=\s*"{re.escape(crate)}"$', block)
-            and not re.search(r"(?m)^source\s*=", block)
-        ):
-            block, count = re.subn(
-                r'(?m)^(version\s*=\s*")([^"]+)(")',
-                lambda m: f"{m.group(1)}{new}{m.group(3)}",
-                block,
-                count=1,
-            )
-            changed += count
-        rewritten.append(block)
     # Exactly one workspace-member entry must match. Zero means the lock does not
     # describe this crate; more than one is ambiguous. Either way, leave the file
     # alone and let the build fail loudly rather than guess.
-    if changed != 1:
+    rewritten = _updated_cargo_lock_text(text, crate, new)
+    if rewritten is None:
         return None
-    lock.write_text("[[package]]".join(rewritten))
+    lock.write_text(rewritten)
     try:
         return str(lock.relative_to(repo))
     except ValueError:
         return str(lock)
+
+
+def _updated_regex_version_text(text: str, vf: VersionFile, new: str) -> str:
+    return re.sub(vf.pattern, lambda m: m.group(0).replace(m.group(1), new), text, count=1)
 
 
 def write_version(repo: Path, vf: VersionFile, new: str) -> bool:
@@ -420,7 +645,7 @@ def write_version(repo: Path, vf: VersionFile, new: str) -> bool:
         )
     elif vf.kind == "regex" and vf.pattern:
         # A capture-group-1 version string is required.
-        new_text = re.sub(vf.pattern, lambda m: m.group(0).replace(m.group(1), new), text, count=1)
+        new_text = _updated_regex_version_text(text, vf, new)
     else:
         return False
     if new_text == text:
@@ -709,6 +934,11 @@ def render_report(
             + ", ".join(forbidden_version_files)
         )
         lines.append(
+            "Version files are refused whole, except Cargo.toml and Cargo.lock: there "
+            "dependency and feature edits pass, while [package], the build-target tables "
+            "and the crate's own version must not change."
+        )
+        lines.append(
             'Release PRs must carry `Release: allow-version-files reason="..."`.'
         )
         failures += 1
@@ -791,7 +1021,7 @@ def main(argv: list[str]) -> int:
 
     forbidden: list[str] = []
     if not release_version_file_exception(args.base, args.head):
-        forbidden = sorted(set(changed) & version_file_paths(cfg))
+        forbidden = version_value_edits(cfg, args.base, args.head)
 
     text, code = render_report(
         verdicts, args.mode, args.base, root,

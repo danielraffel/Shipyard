@@ -1050,9 +1050,12 @@ everything unowned. The cleanup touches nothing but `shipyard-validation-*`.
 
 ## Version-at-land
 
-A normal PR does not edit `Cargo.toml`, `Cargo.lock`, or plugin manifest
-versions. The read-only version gate rejects those edits unless the PR carries
-the explicit release recovery trailer. After merge, `version-at-land.yml` is the
+A normal PR does not edit the plugin manifests, and in `Cargo.toml` and
+`Cargo.lock` it edits only dependencies, features, profiles and lints: the
+`[package]` table, the build-target and workspace tables and the version line
+itself must not change. The read-only version gate refuses anything else,
+including an added, deleted, mode-changed or unparseable version file, unless
+the PR carries the explicit release recovery trailer. After merge, `version-at-land.yml` is the
 single writer and assigns the next versions. It never pushes to `main` (the
 ruleset requires PR-only checks): it rebuilds the bot-owned
 `release/version-at-land` branch with one cumulative bump commit, keeps a single
@@ -1134,13 +1137,9 @@ PRs are gone.
 
 ## First Steps
 
-Schema v5 experimental-authority support is not an operational feature. Every
-official Shipyard build remains v4-only. The default-off
-`experimental-authority-v5` source-test feature can only validate the reserved
-request bytes and return `ExperimentalAuthorityRefused` before projection; it
-has no request or outcome writer, queue mutation, backend, executor, promotion,
-merge, signing, or release authority. Never tell an operator or agent to seed,
-submit, repair, or execute a v5 record.
+The queue request reader accepts schema versions 1 through 4 and refuses
+anything else. Never tell an operator or agent to seed, submit, repair, or
+execute a record with a schema version above 4.
 
 1. Confirm the active repo and dirty state with `git status --short`.
 2. Use RepoPrompt for code analysis across Shipyard, historical shipyard-rust,
