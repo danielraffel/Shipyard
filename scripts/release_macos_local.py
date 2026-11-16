@@ -87,9 +87,11 @@ class CommandRunner:
             capture_output=capture,
         )
         if result.returncode != 0:
-            detail = f"command failed ({result.returncode}): {' '.join(args)}"
+            # Never echo a credential: curl calls carry an Authorization header.
+            shown = " ".join(package_release.redact_args(args))
+            detail = f"command failed ({result.returncode}): {shown}"
             if result.stderr:
-                detail = f"{detail}\n{result.stderr.strip()}"
+                detail = f"{detail}\n{package_release.redact_text(result.stderr.strip())}"
             raise SystemExit(detail)
         return result.stdout.strip() if capture else ""
 
@@ -981,7 +983,7 @@ def run_fleet_rollout(config: ReleaseConfig, runner: CommandRunner, shipyard: st
     # Only hosts behind the tag: reinstalling a current host restarts its daemon
     # and cannot be rolled back (there is no earlier version to restore).
     command = [*plan, "--apply", "--lagging-only"]
-    print(f"fleet rollout: {' '.join(command)}")
+    print(f"fleet rollout: {' '.join(package_release.redact_args(command))}")
     code, stdout, stderr = runner.run_status(command)
     if code == FLEET_CONTROLLER_BUSY_EXIT:
         print(

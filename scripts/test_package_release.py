@@ -103,6 +103,38 @@ class PackageReleaseTests(unittest.TestCase):
             Path("/tmp/release-home/keys/AuthKey_TEST.p8").resolve(),
         )
 
+    def test_redact_args_hides_authorization_headers_and_bearer_values(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            shown = " ".join(
+                package_release.redact_args(
+                    [
+                        "curl",
+                        "-fsSL",
+                        "-H",
+                        "Authorization: Bearer ghs_FAKE_SECRET_123",
+                        "--header",
+                        "authorization: token gho_FAKE_SECRET_456",
+                        "--header=Authorization: Basic dXNlcjpwYXNz",
+                        "-H",
+                        "Accept: application/json",
+                        "x=Bearer ghs_FAKE_SECRET_789",
+                        "https://api.github.com/repos/o/r",
+                    ]
+                )
+            )
+        for secret in ("ghs_FAKE_SECRET_123", "gho_FAKE_SECRET_456", "dXNlcjpwYXNz", "ghs_FAKE_SECRET_789"):
+            self.assertNotIn(secret, shown)
+        self.assertIn("-H Authorization: <redacted>", shown)
+        self.assertIn("-H Accept: application/json", shown)
+        self.assertIn("https://api.github.com/repos/o/r", shown)
+
+    def test_redact_text_hides_github_token_env_values(self) -> None:
+        with mock.patch.dict(os.environ, {"GITHUB_TOKEN": "ghs_FAKE_SECRET_123"}):
+            self.assertEqual(
+                package_release.redact_text("echoed ghs_FAKE_SECRET_123"),
+                "echoed <redacted>",
+            )
+
     def test_run_redacts_secrets_from_command_failures(self) -> None:
         result = subprocess.CompletedProcess(
             args=["fake"],

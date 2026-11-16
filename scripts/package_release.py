@@ -65,11 +65,17 @@ NOTARY_CREDENTIAL_ATTEMPTS = 2
 NOTARY_CREDENTIAL_BACKOFF_SECS = 30.0
 NOTARY_CREDENTIAL_TIMEOUT_SECS = 3 * 60
 SENSITIVE_FLAGS = {"--password", "-p", "-P", "-k"}
+HEADER_FLAGS = {"-H", "--header"}
 SENSITIVE_ENV_NAMES = (
     "SHIPYARD_NOTARIZE_APP_PASSWORD",
     "SHIPYARD_SIGNING_IDENTITY",
     "SHIPYARD_SIGNING_P12_PASSWORD",
+    "SHIPYARD_GITHUB_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
 )
+# A credential carried in an argument, e.g. curl's `Authorization: Bearer <x>`.
+AUTH_VALUE_RE = re.compile(r"\b(Bearer|token|Basic)\s+\S+", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -124,17 +130,33 @@ def redact_text(text: str, extra_values: tuple[str, ...] = ()) -> str:
     return redacted
 
 
+def _redact_header(value: str) -> str:
+    name, sep, _ = value.partition(":")
+    if sep and name.strip().lower() == "authorization":
+        return f"{name}: <redacted>"
+    return value
+
+
 def redact_args(args: list[str], extra_values: tuple[str, ...] = ()) -> list[str]:
     redacted: list[str] = []
     redact_next = False
+    header_next = False
     for arg in args:
         if redact_next:
             redacted.append("<redacted>")
             redact_next = False
             continue
+        if header_next:
+            arg = _redact_header(arg)
+            header_next = False
+        elif arg.startswith("--header="):
+            arg = "--header=" + _redact_header(arg.removeprefix("--header="))
+        arg = AUTH_VALUE_RE.sub(lambda match: f"{match.group(1)} <redacted>", arg)
         redacted.append(redact_text(arg, extra_values))
         if arg in SENSITIVE_FLAGS:
             redact_next = True
+        elif arg in HEADER_FLAGS:
+            header_next = True
     return redacted
 
 

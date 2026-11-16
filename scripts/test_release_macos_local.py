@@ -691,6 +691,76 @@ class ReleaseMacosLocalTests(unittest.TestCase):
 
         self.assertEqual(runner.calls, 2)
 
+    def _failing_curl_path(self, root: Path) -> str:
+        curl = root / "curl"
+        curl.write_text(
+            "#!/bin/sh\necho 'curl: (6) Could not resolve host' >&2\nexit 6\n",
+            encoding="utf-8",
+        )
+        curl.chmod(0o755)
+        return f"{root}{os.pathsep}{os.environ.get('PATH', '')}"
+
+    def test_command_failure_never_echoes_the_authorization_token(self) -> None:
+        secret = "ghs_FAKE_SECRET_123"
+        with tempfile.TemporaryDirectory() as temp:
+            path = self._failing_curl_path(Path(temp))
+            with mock.patch.dict(
+                os.environ, {"GITHUB_TOKEN": secret, "PATH": path}
+            ):
+                args = release_macos_local.release_api_curl_args("https://unreachable.invalid")
+                self.assertIn(f"Authorization: Bearer {secret}", args)
+                stderr = StringIO()
+                with redirect_stderr(stderr):
+                    with self.assertRaises(SystemExit) as ctx:
+                        release_macos_local.CommandRunner().run(args, capture=True)
+        message = str(ctx.exception.code)
+        self.assertIn("command failed (6): curl -fsSL -H Authorization: <redacted>", message)
+        self.assertIn("Could not resolve host", message)
+        self.assertNotIn(secret, message)
+        self.assertNotIn(secret, stderr.getvalue())
+
+    def test_publish_failure_report_never_echoes_the_authorization_token(self) -> None:
+        secret = "ghs_FAKE_SECRET_123"
+
+        class RealCurlRunner(FakeRunner):
+            def run(self, args: list[str], **kwargs: object) -> str:
+                if args and args[0] == "curl":
+                    self.commands.append(args)
+                    return release_macos_local.CommandRunner.run(self, args, **kwargs)
+                return super().run(args, **kwargs)
+
+        runner = RealCurlRunner(assets=complete_release_assets(), draft=True)
+        runner.ci_gh = None
+        config = release_macos_local.ReleaseConfig(
+            tag="v0.438.0",
+            repo="danielraffel/Shipyard",
+            artifact_prefix="shipyard",
+            dist_dir=Path("dist"),
+            upload=True,
+            ci_mode=False,
+            skip_build=True,
+            binary=None,
+            cargo_target=None,
+        )
+        stdout, stderr = StringIO(), StringIO()
+        with tempfile.TemporaryDirectory() as temp:
+            path = self._failing_curl_path(Path(temp))
+            # The first poll fails, then the visibility deadline has passed.
+            clock = iter(range(0, 10_000, 1_000))
+            with mock.patch.dict(os.environ, {"GITHUB_TOKEN": secret, "PATH": path}), \
+                    mock.patch.object(release_macos_local.time, "sleep"), \
+                    mock.patch.object(
+                        release_macos_local.time, "monotonic", side_effect=lambda: next(clock)
+                    ), \
+                    redirect_stdout(stdout), redirect_stderr(stderr):
+                with self.assertRaises(SystemExit) as ctx:
+                    release_macos_local.publish_if_ready(config, runner)
+        self.assertEqual(ctx.exception.code, 4)
+        self.assertIn("Authorization: <redacted>", stderr.getvalue())
+        self.assertNotIn(secret, stderr.getvalue())
+        self.assertNotIn(secret, stdout.getvalue())
+        self.assertTrue(runner.draft)
+
     def test_release_api_curl_args_use_private_repo_token_when_present(self) -> None:
         with mock.patch.dict(os.environ, {"SHIPYARD_GITHUB_TOKEN": "token"}, clear=True):
             args = release_macos_local.release_api_curl_args("https://example.test")
