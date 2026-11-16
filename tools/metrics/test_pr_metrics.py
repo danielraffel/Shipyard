@@ -203,6 +203,17 @@ class Compute(Base):
         self.assertEqual(again, [])
         self.assertEqual(self.rows(out)[1]["compute"]["self_hosted_min"], 30.0)
 
+    def test_a_current_compute_entry_is_not_trusted_while_the_head_reads_are_incomplete(self):
+        d = os.path.join(self.cache, REPO.replace("/", "__"), "compute")
+        os.makedirs(d)
+        with open(os.path.join(d, "1.json"), "w") as fh:
+            json.dump({"v": pm.COMPUTE_VERSION, "self_hosted_min": 1.0, "hosted_min": 1.0, "runs": 1, "repeat_runs": 0, "group_runs": 0, "complete": True}, fh)
+        gh = world([pr(1, T(10, "09:00"), T(10, "11:00"))], runs=self.runs, jobs=self.jobs)
+        gh.routes.insert(0, (r"pulls/1/commits", lambda path: [commit(f"p{i}", "x", "w") for i in range(100)]))  # 3 full pages: incomplete
+        c = self.rows(self.build(gh))[1]["compute"]
+        self.assertFalse((c or {}).get("complete"))
+        self.assertNotEqual((c or {}).get("self_hosted_min"), 1.0)
+
     def test_an_unreadable_jobs_list_is_unread_not_zero(self):
         gh = world([pr(1, T(10, "09:00"), T(10, "11:00"))], runs=self.runs, jobs={})
         out = self.build(gh)
@@ -289,7 +300,7 @@ class Correctness(Base):
     def test_an_incomplete_multi_page_check_read_is_not_settled_or_cached(self):
         p = self.merged_old(6)
         greens = [{"name": f"j{i}", "status": "completed", "conclusion": "success"} for i in range(200)]
-        ck = {p["merge_commit_sha"]: lambda path: greens[:100] if "page=1" in path else greens[100:]}
+        ck = {p["merge_commit_sha"]: lambda path: greens[:100] if path.endswith("&page=1") else greens[100:]}
         out = self.build(world([p], base_commits=[commit(p["merge_commit_sha"], date=T(5, "10:00"))], checks=ck),
                          now=dt.datetime(2026, 11, 14, tzinfo=UTC))
         c = self.rows(out)[6]["correct"]
@@ -516,6 +527,9 @@ class Attribution(Base):
         md = pm.markdown(self.build(world([self.merged_pr()])))
         self.assertIn("trusted evidence bound to the merged SHA", md)
         self.assertIn("unverified owner merge", md)
+        for phrase in ("timeline order, never by date", "exact-head APPROVE", "reviewer_signers", "reviewer_stamp_sessions",
+                       "left out of the owner-action counts"):
+            self.assertIn(phrase, md)
         self.assertNotIn("(or opened through `shipyard pr`) is a steward merge", md)
 
     def test_an_approval_followed_by_an_ejection_is_not_evidence(self):
@@ -599,7 +613,7 @@ class Attribution(Base):
     def long_timeline(self, head_events, pages=5):
         """`pages` full pages of 100: the read stops at its page cap and is incomplete."""
         first = head_events + [self.NOISE] * (100 - len(head_events))
-        return lambda path: first if "page=1" in path else [self.NOISE] * 100
+        return lambda path: first if path.endswith("&page=1") else [self.NOISE] * 100
 
     def long_commits(self, pages=3):
         mk = lambda i: commit(f"k{i}", "x", "w", date=T(10, "09:00"))
@@ -632,7 +646,7 @@ class Attribution(Base):
     def test_an_incomplete_timeline_with_an_apparent_steward_path_is_not_a_steward_merge(self):
         tl = {1: self.long_timeline([self.CM, self.enq("10:40"), self.MERGE])}
         r = self.rows(self.build(world([self.merged_pr()], tl, {1: [commit("c1", "x", "w")]})))[1]
-        self.assertEqual((r["attribution"]["steward_merge_recognised"], r["north"]), (False, "unknown"))
+        self.assertEqual((r["attribution"]["steward_merge_recognised"], r["north"], r["owner_actions"]), (False, "unknown", 0))
         # the same events read in full are a steward merge
         r, _ = self.run_one(self.merged_pr(), [self.CM, self.enq("10:40"), self.MERGE], cm=[commit("c1", "x", "w")])
         self.assertEqual((r["attribution"]["steward_merge_recognised"], r["north"]), (True, "autonomous"))
@@ -646,7 +660,7 @@ class Attribution(Base):
         label = {"event": "labeled", "actor": {"login": OWNER}, "created_at": T(10, "10:30")}
         tl = {1: self.long_timeline([label, self.CM, self.enq("10:40"), self.MERGE])}
         r = self.rows(self.build(world([self.merged_pr()], tl, {1: [commit("c1", "x", "w")]})))[1]
-        self.assertEqual(r["north"], "owner_action")
+        self.assertEqual((r["north"], r["owner_actions"]), ("owner_action", 1))  # the label counts, the unplaced merge does not
 
     def test_compute_from_partial_heads_is_not_complete(self):
         f = {"heads": ["h"], "base": "main", "number": 1, "timeline_complete": True, "commits_complete": False}
