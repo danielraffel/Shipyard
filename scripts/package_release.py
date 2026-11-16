@@ -332,9 +332,20 @@ def build_release(cargo_target: str | None) -> None:
     run(args)
 
 
-def smoke_binary(binary: Path, expected_name: str = BIN_NAME) -> str:
+class LaunchGateFailed(SystemExit):
+    """A packaged binary failed to launch, or reported a version other than the tag."""
+
+
+def smoke_binary(
+    binary: Path, expected_name: str = BIN_NAME, *, expected_tag: str | None = None
+) -> str:
     output = run([str(binary), "--version"], capture=True)
-    parse_binary_version(output, expected_name, source=str(binary))
+    if expected_tag is None:
+        parse_binary_version(output, expected_name, source=str(binary))
+    else:
+        require_version_equals_tag(
+            output, expected_name, expected_tag, source=str(binary)
+        )
     return output
 
 
@@ -346,6 +357,35 @@ def parse_binary_version(output: str, expected_name: str, *, source: str) -> str
     if not SEMVER_RE.fullmatch(version):
         raise SystemExit(f"Invalid semantic version from {source}: {output!r}")
     return version
+
+
+def tag_version(tag: str) -> str:
+    """Return the version a release tag names: `v<semver>` without the `v`."""
+    version = tag.removeprefix("v")
+    if version == tag or not SEMVER_RE.fullmatch(version):
+        raise LaunchGateFailed(f"Release tag is not v<semver>: {tag!r}")
+    return version
+
+
+def require_version_equals_tag(
+    output: str, expected_name: str, tag: str, *, source: str
+) -> str:
+    """Fail unless `<expected_name> <semver>` reports exactly the tag's version.
+
+    The tag comes from Cargo.toml, but a build script or a hardcoded string can
+    make the binary report something else, so the release checks what it runs.
+    """
+    expected = tag_version(tag)
+    try:
+        actual = parse_binary_version(output, expected_name, source=source)
+    except SystemExit as error:
+        raise LaunchGateFailed(error.code) from error
+    if actual != expected:
+        raise LaunchGateFailed(
+            f"Release version mismatch: {expected_name} --version reports {actual}, "
+            f"expected {expected} from tag {tag} ({source})"
+        )
+    return actual
 
 
 def require_matching_pair_versions(
@@ -370,9 +410,13 @@ def smoke_binary_pair(
     companion: Path,
     primary_name: str = BIN_NAME,
     companion_name: str = COMPANION_BIN_NAME,
+    *,
+    expected_tag: str | None = None,
 ) -> str:
-    primary_output = smoke_binary(primary, primary_name)
-    companion_output = smoke_binary(companion, companion_name)
+    primary_output = smoke_binary(primary, primary_name, expected_tag=expected_tag)
+    companion_output = smoke_binary(
+        companion, companion_name, expected_tag=expected_tag
+    )
     require_matching_pair_versions(primary_output, companion_output)
     return f"{primary_output}\n{companion_output}"
 
@@ -834,7 +878,13 @@ def notarize_and_staple(path: Path) -> None:
     staple(path)
 
 
-def smoke_dmg(path: Path, binary_names: tuple[str, ...], *, ci_mode: bool) -> str:
+def smoke_dmg(
+    path: Path,
+    binary_names: tuple[str, ...],
+    *,
+    ci_mode: bool,
+    expected_tag: str | None = None,
+) -> str:
     require_commands(["hdiutil"])
     temp = Path(tempfile.mkdtemp(prefix="shipyard-dmg-"))
     mount = temp / "mnt"
@@ -862,6 +912,7 @@ def smoke_dmg(path: Path, binary_names: tuple[str, ...], *, ci_mode: bool) -> st
             return smoke_binary_pair(
                 mount / binary_names[0],
                 mount / binary_names[1],
+                expected_tag=expected_tag,
             )
         finally:
             detach_dmg(mount)
@@ -950,7 +1001,13 @@ def package(args: argparse.Namespace) -> list[Path]:
         raise SystemExit(f"Built binary not found: {binary}")
     if not companion_binary.exists():
         raise SystemExit(f"Built companion binary not found: {companion_binary}")
-    smoke = smoke_binary_pair(binary, companion_binary)
+    expected_tag = None
+    if args.version_must_match_tag:
+        if args.no_smoke:
+            raise SystemExit("--version-must-match-tag cannot be combined with --no-smoke")
+        expected_tag = args.tag or ""
+        tag_version(expected_tag)
+    smoke = smoke_binary_pair(binary, companion_binary, expected_tag=expected_tag)
 
     tag = args.tag or "dev"
     output_dir = args.dist_dir / tag
@@ -980,11 +1037,17 @@ def package(args: argparse.Namespace) -> list[Path]:
             if args.notarize:
                 notarize_and_staple(dmg)
             if not args.no_smoke:
-                smoke = smoke_dmg(
-                    dmg,
-                    (args.artifact_prefix, args.companion_artifact_prefix),
-                    ci_mode=args.ci_mode,
-                )
+                try:
+                    smoke = smoke_dmg(
+                        dmg,
+                        (args.artifact_prefix, args.companion_artifact_prefix),
+                        ci_mode=args.ci_mode,
+                        expected_tag=expected_tag,
+                    )
+                except LaunchGateFailed:
+                    raise
+                except SystemExit as error:
+                    raise LaunchGateFailed(error.code) from error
             artifacts.append(dmg)
     else:
         artifact = output_dir / artifact_base
@@ -994,7 +1057,7 @@ def package(args: argparse.Namespace) -> list[Path]:
                 verify_signing_probe()
                 sign_binary(artifact)
         if not args.no_smoke:
-            primary_smoke = smoke_binary(artifact)
+            primary_smoke = smoke_binary(artifact, expected_tag=expected_tag)
         artifacts.append(artifact)
         companion_artifact = output_dir / artifact_filename(
             args.companion_artifact_prefix, target
@@ -1005,7 +1068,7 @@ def package(args: argparse.Namespace) -> list[Path]:
                 sign_binary(companion_artifact)
         if not args.no_smoke:
             companion_smoke = smoke_binary(
-                companion_artifact, COMPANION_BIN_NAME
+                companion_artifact, COMPANION_BIN_NAME, expected_tag=expected_tag
             )
             require_matching_pair_versions(primary_smoke, companion_smoke)
             smoke = f"{primary_smoke}\n{companion_smoke}"
@@ -1040,6 +1103,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--notarize", action="store_true", help="Notarize and staple the macOS DMG")
     parser.add_argument("--ci-mode", action="store_true", help="Treat DMG mount failure as non-fatal")
     parser.add_argument("--no-smoke", action="store_true", help="Skip packaged artifact launch smoke")
+    parser.add_argument(
+        "--version-must-match-tag",
+        action="store_true",
+        help="Fail unless every binary's --version equals --tag without its leading v",
+    )
     return parser.parse_args(argv)
 
 

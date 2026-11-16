@@ -130,13 +130,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # The release job publishes only refs/tags/v*, so every publishable
+          # build must report exactly the tag's version.
+          tag_args=()
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            tag_args=(--version-must-match-tag)
+          fi
           ${{ matrix.python }} scripts/package_release.py \
             --skip-build \
             --binary "${{ matrix.binary }}" \
             --companion-binary "${{ matrix.companion_binary }}" \
             --target "${{ matrix.package_target }}" \
             --tag "${{ github.ref_name }}" \
-            --dist-dir artifacts/release
+            --dist-dir artifacts/release \
+            "${tag_args[@]}"
 
       - name: Upload non-macOS artifact
         id: upload_artifact

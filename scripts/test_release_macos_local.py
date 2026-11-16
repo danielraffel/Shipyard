@@ -38,6 +38,8 @@ class FakeRunner(release_macos_local.CommandRunner):
         }
         self.commands: list[list[str]] = []
         self.envs: list[dict[str, str] | None] = []
+        # install.sh installs SHIPYARD_VERSION; the fake binaries then report it.
+        self.installed_version = "0.1.0"
 
     def run(
         self,
@@ -127,6 +129,8 @@ class FakeRunner(release_macos_local.CommandRunner):
         if args[:2] == ["curl", "-fsSL"]:
             return json.dumps({"assets": [{"name": name} for name in self.assets]})
         if args and args[0] == "bash":
+            if env and env.get("SHIPYARD_VERSION"):
+                self.installed_version = env["SHIPYARD_VERSION"].removeprefix("v")
             return ""
         if (
             args
@@ -137,7 +141,7 @@ class FakeRunner(release_macos_local.CommandRunner):
             and args[1:] == ["--version"]
         ):
             name = Path(args[0]).name
-            return f"{name} 0.1.0"
+            return f"{name} {self.installed_version}"
         return ""
 
 
@@ -277,6 +281,85 @@ class ReleaseMacosLocalTests(unittest.TestCase):
             Path("/tmp/shipyard-workstream-provider"),
         )
         self.assertEqual(result, artifact)
+
+    def _dmg_config(self) -> release_macos_local.ReleaseConfig:
+        return release_macos_local.ReleaseConfig(
+            tag="v0.438.0",
+            repo="danielraffel/Shipyard",
+            artifact_prefix="shipyard",
+            dist_dir=Path("dist"),
+            upload=True,
+            ci_mode=False,
+            skip_build=True,
+            binary=Path("/tmp/shipyard"),
+            companion_binary=Path("/tmp/shipyard-workstream-provider"),
+            cargo_target=None,
+        )
+
+    def test_dmg_packaging_requires_versions_to_equal_the_tag(self) -> None:
+        artifact = Path("dist/v0.438.0/shipyard-macos-arm64.dmg")
+        with mock.patch.object(
+            release_macos_local.package_release, "package", return_value=[artifact]
+        ) as package:
+            self.assertEqual(release_macos_local.package_signed_dmg(self._dmg_config()), artifact)
+        parsed = package.call_args.args[0]
+        self.assertTrue(parsed.version_must_match_tag)
+        self.assertEqual(parsed.tag, "v0.438.0")
+
+    def test_mount_and_launch_version_mismatch_exits_3(self) -> None:
+        mismatch = release_macos_local.package_release.LaunchGateFailed(
+            "Release version mismatch: shipyard --version reports 9.9.9, "
+            "expected 0.438.0 from tag v0.438.0 (mnt/shipyard)"
+        )
+        stderr = StringIO()
+        with mock.patch.object(
+            release_macos_local.package_release, "package", side_effect=mismatch
+        ), redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as ctx:
+                release_macos_local.package_signed_dmg(self._dmg_config())
+        self.assertEqual(ctx.exception.code, release_macos_local.LAUNCH_GATE_FAILED_EXIT)
+        self.assertEqual(ctx.exception.code, 3)
+        self.assertIn("reports 9.9.9, expected 0.438.0", stderr.getvalue())
+
+    def test_lying_built_binary_exits_3_before_signing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for name in ("shipyard", "shipyard-workstream-provider"):
+                path = root / name
+                path.write_text(f"#!/bin/sh\necho '{name} 9.9.9'\n", encoding="utf-8")
+                path.chmod(0o755)
+            config = release_macos_local.ReleaseConfig(
+                tag="v0.438.0",
+                repo="danielraffel/Shipyard",
+                artifact_prefix="shipyard",
+                dist_dir=root / "dist",
+                upload=True,
+                ci_mode=False,
+                skip_build=True,
+                binary=root / "shipyard",
+                companion_binary=root / "shipyard-workstream-provider",
+                cargo_target=None,
+            )
+            pkg = release_macos_local.package_release
+            with mock.patch.object(pkg, "require_commands"), \
+                    mock.patch.object(pkg, "require_signing_env"), \
+                    mock.patch.object(pkg, "notarize_and_staple") as notarize, \
+                    redirect_stderr(StringIO()):
+                with self.assertRaises(SystemExit) as ctx:
+                    release_macos_local.package_signed_dmg(config)
+            self.assertEqual(ctx.exception.code, 3)
+            notarize.assert_not_called()
+            self.assertFalse((root / "dist").exists())
+
+    def test_other_packaging_failures_keep_their_own_exit(self) -> None:
+        with mock.patch.object(
+            release_macos_local.package_release,
+            "package",
+            side_effect=SystemExit("Built binary not found: /tmp/shipyard"),
+        ):
+            with self.assertRaises(SystemExit) as ctx:
+                release_macos_local.package_signed_dmg(self._dmg_config())
+        self.assertEqual(ctx.exception.code, "Built binary not found: /tmp/shipyard")
 
     def test_publication_never_enables_soft_dmg_mount_smoke(self) -> None:
         config = release_macos_local.ReleaseConfig(
@@ -639,8 +722,8 @@ class ReleaseMacosLocalTests(unittest.TestCase):
 
         result = release_macos_local.run_install_e2e(config, runner)
 
-        self.assertIn("install:v0.127.0:shipyard 0.1.0", result)
-        self.assertIn("shipyard-workstream-provider 0.1.0", result)
+        self.assertIn("install:v0.127.0:shipyard 0.127.0", result)
+        self.assertIn("shipyard-workstream-provider 0.127.0", result)
         bash_envs = [
             env
                 for command, env in zip(runner.commands, runner.envs)
@@ -677,6 +760,80 @@ class ReleaseMacosLocalTests(unittest.TestCase):
                 config, MismatchedRunner(assets=[])
             )
 
+    def _install_config(self, **overrides: object) -> release_macos_local.ReleaseConfig:
+        values: dict[str, object] = dict(
+            tag="v0.438.0",
+            repo="danielraffel/Shipyard",
+            artifact_prefix="shipyard",
+            dist_dir=Path("dist"),
+            upload=True,
+            ci_mode=False,
+            skip_build=True,
+            binary=None,
+            cargo_target=None,
+        )
+        values.update(overrides)
+        return release_macos_local.ReleaseConfig(**values)
+
+    def _lying_runner(self, output_for: dict[str, str]) -> FakeRunner:
+        class LyingRunner(FakeRunner):
+            def run(self, args: list[str], **kwargs: object) -> str:
+                if args and args[1:] == ["--version"]:
+                    name = Path(args[0]).name
+                    if name in output_for:
+                        self.commands.append(args)
+                        return output_for[name]
+                return super().run(args, **kwargs)
+
+        return LyingRunner(assets=complete_release_assets(), draft=True)
+
+    def test_run_install_e2e_rejects_a_pair_that_agrees_but_lies(self) -> None:
+        runner = self._lying_runner(
+            {
+                "shipyard": "shipyard 9.9.9",
+                "shipyard-workstream-provider": "shipyard-workstream-provider 9.9.9",
+            }
+        )
+        with self.assertRaisesRegex(
+            SystemExit, "shipyard --version reports 9.9.9, expected 0.438.0 from tag v0.438.0"
+        ):
+            release_macos_local.run_install_e2e(self._install_config(), runner)
+
+    def test_run_install_e2e_rejects_dirty_extra_and_empty_versions(self) -> None:
+        for output in ("shipyard 0.438.0-dirty", "shipyard 0.438.0 extra", ""):
+            with self.subTest(output=output):
+                runner = self._lying_runner({"shipyard": output})
+                with self.assertRaises(SystemExit):
+                    release_macos_local.run_install_e2e(self._install_config(), runner)
+
+    def test_run_install_e2e_checks_rollback_installs_against_their_own_tag(self) -> None:
+        class StaleRollbackRunner(FakeRunner):
+            def run(self, args: list[str], **kwargs: object) -> str:
+                output = super().run(args, **kwargs)
+                if output == "shipyard 0.126.2":
+                    return "shipyard 0.127.0"
+                return output
+
+        with self.assertRaisesRegex(SystemExit, "reports 0.127.0, expected 0.126.2"):
+            release_macos_local.run_install_e2e(
+                self._install_config(tag="v0.127.0", rollback_tag="v0.126.2"),
+                StaleRollbackRunner(assets=[]),
+            )
+
+    def test_install_e2e_version_mismatch_exits_4_and_redrafts(self) -> None:
+        runner = self._lying_runner({"shipyard": "shipyard 9.9.9"})
+        stderr = StringIO()
+        with redirect_stdout(StringIO()), redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as ctx:
+                release_macos_local.publish_if_ready(self._install_config(), runner)
+        self.assertEqual(ctx.exception.code, release_macos_local.INSTALL_E2E_FAILED_EXIT)
+        self.assertEqual(ctx.exception.code, 4)
+        self.assertIn("reports 9.9.9, expected 0.438.0", stderr.getvalue())
+        edits = [" ".join(command) for command in runner.commands if "edit" in command]
+        self.assertIn("--draft=false", edits[0])
+        self.assertIn("--draft=true", edits[-1])
+        self.assertTrue(runner.draft)
+
     def test_run_install_e2e_can_upgrade_and_rollback_between_tags(self) -> None:
         config = release_macos_local.ReleaseConfig(
             tag="v0.127.0",
@@ -694,9 +851,9 @@ class ReleaseMacosLocalTests(unittest.TestCase):
 
         result = release_macos_local.run_install_e2e(config, runner)
 
-        self.assertIn("baseline:v0.126.2:shipyard 0.1.0:provider-absent", result)
-        self.assertIn("upgrade:v0.127.0:shipyard 0.1.0", result)
-        self.assertIn("rollback:v0.126.2:shipyard 0.1.0:provider-absent", result)
+        self.assertIn("baseline:v0.126.2:shipyard 0.126.2:provider-absent", result)
+        self.assertIn("upgrade:v0.127.0:shipyard 0.127.0", result)
+        self.assertIn("rollback:v0.126.2:shipyard 0.126.2:provider-absent", result)
         bash_envs = [
             env
                 for command, env in zip(runner.commands, runner.envs)
