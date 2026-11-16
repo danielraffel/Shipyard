@@ -48,6 +48,7 @@ VERDICT_RE = re.compile(r"^\s*[*_#> ]*verdict\s*:\s*(APPROVE|HOLD)\b[^\n]*\bhead
 SIGNALS = ("app_opener", "provenance", "trailer", "session_stamp")
 BAD_CONCLUSIONS = {"failure", "timed_out"}
 FACTS_VERSION = 4
+CHECKS_VERSION = 2  # derived correctness caches: entries written before this (incomplete pagination read as clean) are read again
 ESCAPE_WINDOW = dt.timedelta(days=14)
 HORIZON = dt.timedelta(hours=48)
 MIN_SAMPLE = 50
@@ -421,7 +422,7 @@ def required_contexts(rd, base, tick_ctx):
 def commit_red(rd, sha, required):
     """(red_contexts, settled). Settled and cached only when every page was read and every check run completed."""
     cached = rd.load("checks", sha)
-    if cached is not None:
+    if cached is not None and cached.get("v") == CHECKS_VERSION:
         return set(cached["red"]) & required, True
     runs, complete = rd.pages(f"commits/{sha}/check-runs", key="check_runs", max_pages=2)
     latest = {}
@@ -432,7 +433,7 @@ def commit_red(rd, sha, required):
     settled = complete and bool(latest) and all(c.get("status") == "completed" for c in latest.values())
     red = {k for k, c in latest.items() if c.get("conclusion") in BAD_CONCLUSIONS}
     if settled:
-        rd.save("checks", sha, {"red": sorted(red)})
+        rd.save("checks", sha, {"v": CHECKS_VERSION, "red": sorted(red)})
     return red & required, settled
 
 
@@ -736,11 +737,13 @@ def collect_repo(repo, cache_dir, cap, owner, lo, hi, now, ticks, tick_ctx, fetc
                     comp = None
             row["compute"] = comp
             corr = rd.load("correct", str(f["number"]))
+            if corr is not None and corr.get("v") != CHECKS_VERSION:
+                corr = None
             if corr is None:
                 try:
                     corr = pr_correct(rd, f, base_commits, commits_ok, req, ticks, now, merged_list, res["listing_complete"])
                     if now >= iso(merged) + ESCAPE_WINDOW and corr["bad"] is not None and corr["escaped"] is not None:
-                        rd.save("correct", str(f["number"]), corr)
+                        rd.save("correct", str(f["number"]), dict(corr, v=CHECKS_VERSION))
                 except (Truncated, ReadError):
                     corr = {"provisional": True, "reverted": None, "base_red": None, "bad": None, "escaped": None, "escaped_by": None}
             if corr.get("escaped") is None and res["listing_complete"]:  # independent of the base reads

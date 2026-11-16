@@ -61,7 +61,7 @@ def world(prs, timelines=None, commits=None, base_commits=None, runs=None, jobs=
     for rid, js in jobs.items():
         routes.append((rf"actions/runs/{rid}/jobs", {"jobs": js}))
     for sha, cr in checks.items():
-        routes.append((rf"commits/{sha}/check-runs", {"check_runs": cr}))
+        routes.append((rf"commits/{sha}/check-runs", (lambda path, cr=cr: {"check_runs": cr(path)}) if callable(cr) else {"check_runs": cr}))
     if default_checks:
         routes.append((r"commits/[^/]+/check-runs", {"check_runs": [{"name": "Test", "status": "completed", "conclusion": "success"}]}))
     routes.append((r"rules/branches/main", [{"type": "required_status_checks",
@@ -283,12 +283,28 @@ class Correctness(Base):
     def test_an_incomplete_multi_page_check_read_is_not_settled_or_cached(self):
         p = self.merged_old(6)
         greens = [{"name": f"j{i}", "status": "completed", "conclusion": "success"} for i in range(200)]
-        ck = {p["merge_commit_sha"]: lambda path: {"check_runs": greens[:100] if "page=1" in path else greens[100:]}}
+        ck = {p["merge_commit_sha"]: lambda path: greens[:100] if "page=1" in path else greens[100:]}
         out = self.build(world([p], base_commits=[commit(p["merge_commit_sha"], date=T(5, "10:00"))], checks=ck),
                          now=dt.datetime(2026, 11, 14, tzinfo=UTC))
         c = self.rows(out)[6]["correct"]
         self.assertEqual((c["base_red"], c["bad"]), (None, None))
         self.assertFalse(os.path.exists(os.path.join(self.cache, REPO.replace("/", "__"), "checks", p["merge_commit_sha"] + ".json")))
+
+    def test_old_unversioned_clean_caches_are_read_again(self):
+        p = self.merged_old(6)
+        root = os.path.join(self.cache, REPO.replace("/", "__"))
+        sha = p["merge_commit_sha"]
+        for kind, name, body in (("checks", sha, {"red": []}),
+                                 ("correct", "6", {"provisional": False, "reverted": False, "base_red": False, "bad": False,
+                                                   "escape_provisional": False, "escaped": False, "escaped_by": None})):
+            os.makedirs(os.path.join(root, kind), exist_ok=True)
+            with open(os.path.join(root, kind, name + ".json"), "w") as fh:
+                json.dump(body, fh)
+        red = [{"name": "Test", "status": "completed", "conclusion": "failure"}]
+        gh = world([p], base_commits=[commit(sha, date=T(5, "10:00"))], checks={sha: red})
+        c = self.rows(self.build(gh, now=dt.datetime(2026, 11, 14, tzinfo=UTC)))[6]["correct"]
+        self.assertTrue([x for x in gh.calls if "check-runs" in x])
+        self.assertEqual((c["base_red"], c["bad"]), (True, True))
 
     def test_unreadable_checks_make_correctness_unknown(self):
         p = self.merged_old(6)
