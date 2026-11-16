@@ -193,9 +193,11 @@ The event is only a trigger; nothing in it is trusted. The admission:
 7. Takes the steward's ledger lock without waiting. If a tick or an
    `admission-clean` gate holds it, it does nothing: that pass sees the head.
    Under the lock it reads the base's merge groups again (anything but clear
-   is the tick's), and it leaves to the tick a head with a flake re-enqueue
-   the tick's breaker sweep has not judged yet (`flake_requeue_unswept`):
-   only the tick sweeps.
+   is the tick's), and while any flake re-enqueue in the repository, within
+   the flake window, is one the tick's breaker sweep has not judged yet, it
+   leaves every head to the tick (`flake_requeue_unswept`): only the tick
+   sweeps, and an unswept receipt can hide a tripped signature another pull
+   request shares.
 8. Admits through the tick's own path: the live exact-head approval gate, the
    carried-commit, code-owner and defect-fix guards, the final revalidation,
    and the enqueue (or exact-head merge) pinned to the head with

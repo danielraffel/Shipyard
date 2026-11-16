@@ -22,8 +22,9 @@
 //! - a base with a poison reading other than clear, a paused queue entry, or
 //!   a pending run cancellation is skipped;
 //! - a ledger lock another pass holds is skipped, never waited on;
-//! - under the lock, the base's merge groups are read again, and a head with
-//!   a flake re-enqueue the tick's breaker sweep has not judged is skipped.
+//! - under the lock, the base's merge groups are read again, and while any
+//!   flake re-enqueue in the repository is one the tick's breaker sweep has
+//!   not judged (within the flake window), every head is skipped.
 //!
 //! See `docs/scheduling-loop.md`, "Ready on event".
 
@@ -453,14 +454,15 @@ pub(super) fn admit_ready_event(
         return ReadyEventOutcome::skipped(event, apply, "pending_cancellations");
     }
     // The tick runs the flake breaker's sweep before any admission; this
-    // path does not. A head whose flake re-enqueue the sweep has not judged
-    // yet (the queue may have ejected it again on the same signature) is the
-    // tick's: it sweeps, then decides.
+    // path does not. While any flake re-enqueue in this repository is one
+    // the sweep has not judged (the queue may have ejected it again on a
+    // signature this head shares), every head is the tick's: it sweeps,
+    // then decides.
     if super::flake_requeue::unswept_requeue(
         &ledger,
         &observation.repo,
-        pr.fact.number,
-        &pr.fact.head_sha,
+        policy.ejection_guards.flake_requeue.window_hours,
+        now,
     ) {
         return ReadyEventOutcome::skipped(event, apply, "flake_requeue_unswept");
     }

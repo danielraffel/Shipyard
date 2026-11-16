@@ -582,20 +582,23 @@ fn pending_cancellations_leave_the_head_to_the_tick() {
     assert_eq!(harness.enqueues(), 0);
 }
 
-/// The tick sweeps the flake breaker before it admits; this path does not,
-/// so a head with a flake re-enqueue the sweep has not judged is the tick's.
-/// Control: once swept, the same head is admitted.
+/// The tick sweeps the flake breaker before it admits; this path does not.
+/// Pull request 41 was flake re-enqueued and may have been ejected again on
+/// its signature, unswept: an event for pull request 42, which has no receipt
+/// of its own and may share that signature, is left to the tick. Once 41 is
+/// swept, or once its receipt is older than the flake window, 42 is admitted.
 #[test]
-fn an_unswept_flake_requeue_leaves_the_head_to_the_tick() {
-    let receipted = |swept: bool| {
+fn an_unswept_flake_requeue_on_another_head_leaves_the_repository_to_the_tick() {
+    let other = "dddddddddddddddddddddddddddddddddddddddd";
+    let receipted = |swept: bool, at: DateTime<Utc>| {
         let mut ledger = StewardLedger::default();
         ledger.flake_requeue.requeued.insert(
-            crate::app::merge_steward_cmd::flake_requeue::receipt_key("owner/repo", 42, HEAD),
+            crate::app::merge_steward_cmd::flake_requeue::receipt_key("owner/repo", 41, other),
             crate::app::merge_steward_cmd::flake_requeue::Receipt {
                 repo: "owner/repo".to_owned(),
                 signature: "macos: flaky".to_owned(),
-                ejection_at: "2026-11-13T00:10:00Z".to_owned(),
-                at: "2026-11-13T00:20:00Z".to_owned(),
+                ejection_at: (at - chrono::Duration::minutes(10)).to_rfc3339(),
+                at: at.to_rfc3339(),
                 state: crate::app::merge_steward_cmd::flake_requeue::ReceiptState::Done,
                 attempts: 1,
                 swept,
@@ -603,17 +606,23 @@ fn an_unswept_flake_requeue_leaves_the_head_to_the_tick() {
         );
         ledger
     };
+    let recent = Utc::now() - chrono::Duration::minutes(20);
     let harness = Harness::new(&Fixture::approved());
-    harness.save(&receipted(false));
+    harness.save(&receipted(false, recent));
     let outcome = harness.admit(HEAD, &observed(HEAD));
     assert_eq!(outcome.reason, "flake_requeue_unswept", "{outcome:?}");
     assert_eq!(harness.enqueues(), 0);
 
-    let swept = Harness::new(&Fixture::approved());
-    swept.save(&receipted(true));
-    let outcome = swept.admit(HEAD, &observed(HEAD));
-    assert_eq!(outcome.outcome, "admitted", "{outcome:?}");
-    assert_eq!(swept.enqueues(), 1);
+    for (swept, at) in [
+        (true, recent),
+        (false, Utc::now() - chrono::Duration::days(30)),
+    ] {
+        let harness = Harness::new(&Fixture::approved());
+        harness.save(&receipted(swept, at));
+        let outcome = harness.admit(HEAD, &observed(HEAD));
+        assert_eq!(outcome.outcome, "admitted", "swept={swept} {outcome:?}");
+        assert_eq!(harness.enqueues(), 1);
+    }
 }
 
 #[test]

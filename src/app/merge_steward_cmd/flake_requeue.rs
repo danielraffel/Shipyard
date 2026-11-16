@@ -532,15 +532,31 @@ fn short(sha: &str) -> &str {
     sha.get(..12).unwrap_or(sha)
 }
 
-/// Whether `head` of `pr` carries a flake re-enqueue that [`sweep`] has not
-/// judged yet. Only the tick sweeps, so a ready-on-event admission leaves
-/// such a head to it.
-pub(super) fn unswept_requeue(ledger: &StewardLedger, repo: &str, pr: u64, head: &str) -> bool {
+/// Whether any flake re-enqueue in `repo` is one [`sweep`] has not judged
+/// yet, within the flake window. Only the tick sweeps, and an unswept
+/// receipt on one pull request can hide a tripped signature that another
+/// pull request, ejected on the same signature, would otherwise be
+/// re-enqueued on; so a ready-on-event admission leaves the whole repository
+/// to the tick until it sweeps. Keys match the sweep's `repo#` prefix. A
+/// receipt older than the window (a long-closed pull request the sweep never
+/// sees) does not block; one whose time cannot be read does.
+pub(super) fn unswept_requeue(
+    ledger: &StewardLedger,
+    repo: &str,
+    window_hours: u32,
+    now: DateTime<Utc>,
+) -> bool {
+    let prefix = format!("{}#", repo.to_ascii_lowercase());
+    let window = Duration::hours(i64::from(window_hours));
     ledger
         .flake_requeue
         .requeued
-        .get(&receipt_key(repo, pr, head))
-        .is_some_and(|receipt| !receipt.swept)
+        .iter()
+        .filter(|(key, receipt)| key.starts_with(&prefix) && !receipt.swept)
+        .any(|(_, receipt)| {
+            DateTime::parse_from_rfc3339(&receipt.at)
+                .map_or(true, |at| now - at.with_timezone(&Utc) < window)
+        })
 }
 
 pub(super) fn receipt_key(repo: &str, pr: u64, head: &str) -> String {
