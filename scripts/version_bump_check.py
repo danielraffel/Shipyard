@@ -396,6 +396,12 @@ def _cargo_manifest_locked(text: str, vfs: list[VersionFile]) -> dict:
     for vf in readers:
         if _extract_version_from_text(text, vf) != version:
             raise _Unreadable("the configured reader disagrees with Cargo's version")
+        probe = "0.0.0" if version != "0.0.0" else "0.0.1"
+        updated = _updated_regex_version_text(text, vf, probe)
+        expected = _toml(text)
+        expected["package"]["version"] = probe
+        if _toml(updated) != expected:
+            raise _Unreadable("the manifest writer cannot update Cargo's package version")
     for pattern in _CARGO_DOWNSTREAM_VERSION_RES:
         m = pattern.search(text)
         if not m or m.group(1) != version:
@@ -602,6 +608,10 @@ def refresh_cargo_lock(repo: Path, manifest_rel: str, new: str) -> str | None:
         return str(lock)
 
 
+def _updated_regex_version_text(text: str, vf: VersionFile, new: str) -> str:
+    return re.sub(vf.pattern, lambda m: m.group(0).replace(m.group(1), new), text, count=1)
+
+
 def write_version(repo: Path, vf: VersionFile, new: str) -> bool:
     p = repo / vf.path
     if not p.exists():
@@ -635,7 +645,7 @@ def write_version(repo: Path, vf: VersionFile, new: str) -> bool:
         )
     elif vf.kind == "regex" and vf.pattern:
         # A capture-group-1 version string is required.
-        new_text = re.sub(vf.pattern, lambda m: m.group(0).replace(m.group(1), new), text, count=1)
+        new_text = _updated_regex_version_text(text, vf, new)
     else:
         return False
     if new_text == text:

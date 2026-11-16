@@ -116,6 +116,13 @@ class VersionValueGateTests(unittest.TestCase):
 
     # Cargo.toml and Cargo.lock
 
+    def test_matching_multiline_package_decoy_is_refused(self) -> None:
+        path = self.repo / "Cargo.toml"
+        path.write_text('decoy = \'\'\'\n[package]\nname = "shipyard"\n'
+                        'version = "0.292.0"\n\'\'\'\n' + path.read_text())
+        self.commit()
+        self.assert_refused("Cargo.toml")
+
     def test_updater_incompatible_cargo_quoting_is_refused(self) -> None:
         for path, old, new in (
             ("Cargo.toml", 'name = "shipyard"', "name = 'shipyard'"),
