@@ -25,6 +25,9 @@ import os
 import re
 import statistics
 import subprocess
+import sys
+import base64
+import importlib.util
 
 UTC = dt.timezone.utc
 WINDOW = dt.timedelta(days=7)
@@ -39,13 +42,24 @@ ACTION_EVENTS = {
 AGENT_TRAILER_RE = re.compile(
     r"co-authored-by:[^\n]*(claude|codex|anthropic|openai|copilot)|generated with[^\n]*(claude|codex)"
     r"|^(version-bump|skill-update|release)\s*:", re.I | re.M)
+# Agent-authorship signals, strongest first. A PR carrying any of them is agent work even when its commits
+# carry the owner's git identity, which is how agents commit on this fleet.
+APP_OPENERS = {"shipyard-local[bot]"}
+PROVENANCE_RE = re.compile(r"<!--\s*(shipyard-owner|whence)\b", re.I)
+STAMP_RE = re.compile(r"<!--\s*session:\s*\S+", re.I)
+GUARD_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "scripts", "ghapp_queue_arm_guard.py")
+APP_LOGINS = {"shipyard-local[bot]", "shipyard-local"}
+_GUARD = []
+SIGNALS = ("app_opener", "provenance", "trailer", "session_stamp")
 BAD_CONCLUSIONS = {"failure", "timed_out"}
-FACTS_VERSION = 3
+FACTS_VERSION = 8
+COMPUTE_VERSION = 2  # compute caches: entries written before this could be marked complete from a partial timeline or commit read
+CHECKS_VERSION = 2  # derived correctness caches: entries written before this (incomplete pagination read as clean) are read again
 ESCAPE_WINDOW = dt.timedelta(days=14)
 HORIZON = dt.timedelta(hours=48)
 MIN_SAMPLE = 50
 UNKNOWN_RANGE_SHARE = 0.20
-SCORECARD_VERSION = "2026-11-15.1"
+SCORECARD_VERSION = "2026-11-16.1"
 MERGE_MAIN_RE = re.compile(r"^Merge (remote-tracking )?branch '?(origin/)?(main|master)'?|^Merge pull request .* from .*/main", re.I)
 # Positive controls: a real revert (#124 reverted #119), a real escaped defect (#126 names #116).
 DEFAULT_CONTROLS = {"danielraffel/fleet-handbook": {"revert": [(119, 124)], "escape": [(116, 126)]}}  # "owner": [pr, ...] pins PRs with a hand-verified owner action
@@ -110,6 +124,7 @@ class Reader:
         self.root = os.path.join(cache_dir, repo.replace("/", "__"))
         self.truncated = False
         self.errors = 0
+        self.policies = {}
 
     def get(self, path):
         if self.calls >= self.cap:
@@ -160,6 +175,144 @@ def commit_date(c):
     return iso(((c.get("commit") or {}).get("committer") or {}).get("date"))
 
 
+def guard():
+    """The queue-arm guard module, loaded by path: its verdict and approval rules are the ones that count
+    approvals everywhere else, so the scorecard reuses them instead of copying them."""
+    if not _GUARD:
+        spec = importlib.util.spec_from_file_location("ghapp_queue_arm_guard", GUARD_PATH)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules.setdefault("ghapp_queue_arm_guard", mod)
+        spec.loader.exec_module(mod)
+        _GUARD.append(mod)
+    return _GUARD[0]
+
+
+def trust_policy(rd, base):
+    """The base's review policy, or None when it cannot be read or does not configure both `reviewer_signers`
+    and `reviewer_stamp_sessions`. None means no approval is trusted (fail closed). One read per repo and base."""
+    cached = rd.policies.get(base, 0)
+    if cached != 0:
+        return cached
+    pol = None
+    try:
+        before = rd.errors
+        try:
+            d = rd.get(f"contents/.shipyard/config.toml?ref={base}")
+        finally:
+            rd.errors = before  # a repo with no config is an answer, not a read error
+        text = base64.b64decode(d.get("content") or "").decode("utf-8")
+        g = guard()
+        saved = os.environ.get(g.SIGNERS_FROM_BASE_ENV)
+        os.environ[g.SIGNERS_FROM_BASE_ENV] = "1"  # the repository-side rule: no host file is read
+        try:
+            p = g.review_policy(text, rd.repo, False)
+        finally:
+            if saved is None:
+                os.environ.pop(g.SIGNERS_FROM_BASE_ENV, None)
+            else:
+                os.environ[g.SIGNERS_FROM_BASE_ENV] = saved
+        if p.get("signers") and p.get("stamp_sessions"):
+            pol = p
+    except Truncated:
+        raise
+    except Exception:  # unreadable or unparsable: no approval is trusted
+        pol = None
+    rd.policies[base] = pol
+    return pol
+
+
+def steward_seq(pr, tl):
+    """The events that bear on how a PR reached its merge, in the timeline's own order and up to the merge, with no
+    dates involved: ["push", sha] (a commit or force-push that moved the head), ["enq", head-then] (an enqueue by the fleet
+    App, with the head as the timeline had it at that point, or None), ["remove"] (a queue removal other than the merge),
+    ["hold"] and ["approve", body] (an App verdict, as a comment or a review that was not dismissed, for the merged head;
+    `approve` keeps its body so it is judged against the base's policy when classified, never when cached)."""
+    g = guard()
+    head = pr["head"]["sha"]
+    cut = next((i for i, e in enumerate(tl) if e.get("event") == "merged"), len(tl))
+    tl = tl[:cut]
+    dismissed = {(e.get("dismissed_review") or {}).get("review_id") for e in tl if e.get("event") == "review_dismissed"}
+    dismissed.discard(None)
+    seq, cur = [], None
+    for e in tl:
+        ev = e.get("event")
+        login = ((e.get("actor") or e.get("user") or e.get("author") or {}).get("login") or "").lower()
+        if ev in ("committed", "head_ref_force_pushed"):
+            cur = e.get("sha") if ev == "committed" else e.get("after_sha")
+            seq.append(["push", cur])
+        elif ev in ("removed_from_merge_queue", "dequeued") and (e.get("reason") or "unknown") != "merged":
+            seq.append(["remove"])
+        elif ev in ("added_to_merge_queue", "enqueued") and login in APP_LOGINS:
+            seq.append(["enq", cur])
+        elif ev in ("commented", "reviewed") and login in APP_LOGINS and not (ev == "reviewed" and e.get("id") in dismissed):
+            body = e.get("body") or ""
+            v = g.marker_verdict(body)
+            if v and v[1] == head and v[0] in ("HOLD", "APPROVE"):
+                seq.append(["hold"] if v[0] == "HOLD" else ["approve", body])
+    return seq
+
+
+def steward_evidence(rd, f):
+    """True, False or None (cannot be bound to the merged SHA). True only when the last thing before the merge was trusted
+    steward evidence: an App enqueue made while the timeline's head was the merged SHA, with nothing after it that moves the
+    head, removes it from the queue or holds it; or an APPROVE the guard's own rules count (App, configured signer,
+    configured reviewer session stamp, read from the base's config) for the merged SHA, with no App HOLD at that SHA at all.
+    None: the last event is an enqueue the timeline cannot tie to the merged SHA (no commit event names it), so the merge is
+    neither the steward's nor a human's. Evidence followed by a push, a removal or a HOLD is False."""
+    g = guard()
+    seq = f.get("steward_seq") or []
+    state, held, pol = None, any(e[0] == "hold" for e in seq), None
+    for e in seq:
+        kind = e[0]
+        if kind == "enq":
+            state = "enq" if e[1] and e[1] == f["head_sha"] else "unbound"
+        elif kind == "approve":
+            if pol is None:
+                pol = trust_policy(rd, f["base"]) or False
+            saved = os.environ.get(g.SIGNERS_FROM_BASE_ENV)
+            os.environ[g.SIGNERS_FROM_BASE_ENV] = "1"
+            try:
+                ok = bool(pol) and g.app_approval_refusal(e[1], pol) is None
+            finally:
+                if saved is None:
+                    os.environ.pop(g.SIGNERS_FROM_BASE_ENV, None)
+                else:
+                    os.environ[g.SIGNERS_FROM_BASE_ENV] = saved
+            if ok:
+                state = "approve"
+        else:  # push, remove, hold
+            state = None
+    if state == "unbound":
+        return None
+    return state == "enq" or (state == "approve" and not held)
+
+
+def reads_complete(f):
+    """Whether the timeline and the commit list were read in full: only then are they a settled fact about the PR."""
+    return bool(f.get("timeline_complete") and f.get("commits_complete"))
+
+
+def finalize(rd, f, pr):
+    """Facts that depend on inputs that change independently of the cached reduction, recomputed on every run:
+    the opener and body (from the PR list), the stamp (body, commits and timeline kept apart), and the steward
+    evidence (judged against the base's current policy)."""
+    body = pr.get("body") or ""
+    f["opener"] = (pr.get("user") or {}).get("login")
+    f["provenance"] = bool(PROVENANCE_RE.search(body))
+    f["stamp"] = bool(STAMP_RE.search(body)) or bool(f.get("stamp_commit")) or bool(f.get("agent_events"))
+    owner_merge = bool(f.get("merged_at")) and any(e[0] == "merged" for e in f["owner_events"])
+    verdict = False
+    if owner_merge and reads_complete(f):  # a hidden later HOLD, removal or push could cancel the evidence
+        try:
+            verdict = steward_evidence(rd, f)
+        except Truncated:  # the policy could not be read within the cap: no approval is trusted this run
+            verdict = False
+    f["steward_path"] = verdict is True
+    # an owner-account merge the data cannot place as the steward's or a human's: unknown, credited to neither
+    f["merge_unverified"] = owner_merge and (not reads_complete(f) or verdict is None)
+    return f
+
+
 def pr_facts(rd, pr, owner):
     """Timeline and commits of one PR (merged or not), reduced to what the metrics need."""
     n = pr["number"]
@@ -176,7 +329,8 @@ def pr_facts(rd, pr, owner):
         ready = created
     else:
         ready = None if pr.get("draft") else created
-    owner_events, repairs, holds, ejections, enqueues = [], [], [], [], 0
+    owner_events, agent_events, repairs, holds, ejections, enqueues = [], [], [], [], [], 0
+    stamp_commit = False
     for e in tl:
         ev, ts = e.get("event"), e.get("created_at") or e.get("submitted_at")
         body = e.get("body") or ""
@@ -193,19 +347,27 @@ def pr_facts(rd, pr, owner):
             continue
         who = ((e.get("actor") or e.get("user") or {}).get("login") or "")
         if who.lower() == owner.lower() and ts:
-            owner_events.append([ev, ts])
+            if STAMP_RE.search(body) or PROVENANCE_RE.search(body):
+                # an agent speaking under the owner's account: not an owner action, and a signal of its own
+                agent_events.append([ev, ts])
+            else:
+                owner_events.append([ev, ts])
     heads = {pr["head"]["sha"]}
     for e in tl:
         if e.get("event") == "head_ref_force_pushed":
             heads.update(x for x in (e.get("before_sha"), e.get("after_sha")) if x)
-    ambiguous, pushes = [], {}
+    ambiguous, pushes, trailer = [], {}, False
     for c in commits:
         heads.add(c["sha"])
         d = commit_date(c)
         msg = (c.get("commit") or {}).get("message") or ""
+        if AGENT_TRAILER_RE.search(msg):
+            trailer = True
+        if STAMP_RE.search(msg):
+            stamp_commit = True
         logins = {((c.get("author") or {}).get("login") or "").lower(), ((c.get("committer") or {}).get("login") or "").lower()}
-        if owner.lower() in logins and not AGENT_TRAILER_RE.search(msg) and d:
-            ambiguous.append(fmt(d))
+        if owner.lower() in logins and not AGENT_TRAILER_RE.search(msg):
+            ambiguous.append(c["sha"])  # by identity, never by date
         if ready and d and d > ready:  # a push after the first ready moment, one per distinct commit minute
             pushes[fmt(d)[:16]] = (MERGE_MAIN_RE.search(msg.splitlines()[0] if msg else "") is not None, d)
     split = {"repair": 0, "author": 0, "merge_main": 0}
@@ -225,7 +387,9 @@ def pr_facts(rd, pr, owner):
         "v": FACTS_VERSION, "number": n, "base": pr["base"]["ref"], "created_at": fmt(created),
         "merged_at": fmt(merged) if merged else None, "state": pr.get("state"),
         "merge_commit_sha": pr.get("merge_commit_sha"), "first_ready": fmt(ready) if ready else None,
-        "owner_events": owner_events, "ambiguous_commits": sorted(set(ambiguous)),
+        "owner_events": owner_events, "agent_events": agent_events, "steward_seq": steward_seq(pr, tl), "head_sha": pr["head"]["sha"],
+        "opener": (pr.get("user") or {}).get("login"), "provenance": bool(PROVENANCE_RE.search(pr.get("body") or "")),
+        "agent_trailer": trailer, "stamp_commit": stamp_commit, "ambiguous_commits": sorted(set(ambiguous)),
         "repair_cycles": len(repairs), "holds": len(holds), "re_holds": re_holds, "size": size,
         "pushes": split, "enqueues": enqueues, "ejections": ejections,
         "labels": sorted(l["name"] for l in pr.get("labels") or []),
@@ -247,26 +411,71 @@ def eligible(f, managed_base):
     return True, None
 
 
-def north_star(f, commits=True):
+def attribution(f):
+    """The agent-authorship signals a PR carries, strongest first: opened by the fleet App, `shipyard pr`
+    provenance in the body, an agent Co-Authored-By (or Version-Bump style) trailer, an agent session stamp.
+    `primary` is the first that applies; every one that applies is listed so the attribution can be audited."""
+    have = {"app_opener": (f.get("opener") or "").lower() in APP_OPENERS, "provenance": bool(f.get("provenance")),
+            "trailer": bool(f.get("agent_trailer")), "session_stamp": bool(f.get("stamp"))}
+    sig = [k for k in SIGNALS if have[k]]
+    return {"signals": sig, "primary": sig[0] if sig else None}
+
+
+def effective_owner_events(f, attributed=True):
+    """The owner events that are a human's. Without attribution every owner-account event counts.
+    With it, a merge by the owner account is a steward merge only with trusted evidence (see
+    trusted_steward_evidence): in user-owned repos the steward merges under the owner account, so the
+    account alone cannot tell it from a human, and no PR-level signal stands in for the evidence.
+    Returns (events, steward_merges_dropped)."""
+    ev = f["owner_events"]
+    if not attributed:  # the earlier rule: every owner-account event, stamped ones included
+        return sorted(ev + list(f.get("agent_events") or []), key=lambda e: iso(e[1])), 0
+    a = attribution(f)
+    steward = bool(f.get("steward_path"))
+    keep = [e for e in ev if not (e[0] == "merged" and steward)]
+    return keep, len(ev) - len(keep)
+
+
+def north_star(f, commits=True, attributed=True):
     """autonomous, owner_action, unknown or not_merged for one ready PR, over the 48h horizon.
 
-    autonomous: merged within 48h of ready with no owner event between ready and merge.
-    owner_action: an owner-account timeline event in that interval.
-    unknown: merged in time with no such event, but an owner-identity commit with no agent trailer
-        (commits=True), or a timeline or commit list not read in full.
+    autonomous: merged within 48h of ready with no human owner event between ready and merge.
+    owner_action: a human owner-account timeline event in that interval (see effective_owner_events).
+    unknown: merged in time with no such event, but an owner-identity commit with no agent trailer and
+        no agent signal on the PR at all (commits=True), or a timeline or commit list not read in full.
     not_merged: not merged within 48h and no owner event.
-    commits=False ignores commits: only GitHub-side owner actions count."""
+    commits=False ignores commits: only GitHub-side owner actions count.
+    attributed=False is the earlier rule (every owner-account event is an owner action, owner-identity
+    commits make a PR unknown), kept so a change can be shown against it."""
     r = iso(f["first_ready"])
     h = r + HORIZON
     m = iso(f.get("merged_at"))
     end = min(m, h) if m else h
-    if any(r <= iso(ts) <= end for _, ts in f["owner_events"]):
+    events, _ = effective_owner_events(f, attributed)
+    inside = [e for e in events if r <= iso(e[1]) <= end]
+    if inside:
+        if attributed and f.get("merge_unverified") and all(e[0] == "merged" for e in inside):
+            # an owner-account merge that could have been the steward's: with a partial read, or an enqueue the
+            # timeline cannot tie to the merged SHA, there is no telling, so it is unknown rather than a claimed human action
+            return "unknown"
         return "owner_action"
     if not m or m > h:
         return "not_merged"
-    if (commits and any(iso(d) <= end for d in f["ambiguous_commits"])) or not (f["timeline_complete"] and f["commits_complete"]):
+    ambiguous = bool(f["ambiguous_commits"])  # every commit of a merged PR precedes its merge: no date decides this
+    if attributed and attribution(f)["primary"]:
+        ambiguous = False
+    if (commits and ambiguous) or not (f["timeline_complete"] and f["commits_complete"]):
         return "unknown"
     return "autonomous"
+
+
+def row_attribution(f):
+    a = attribution(f)
+    _, stew = effective_owner_events(f)
+    return {"signals": a["signals"], "primary": a["primary"], "steward_merge_recognised": bool(stew),
+            "agent_owner_events": len(f.get("agent_events") or []),
+            "owner_identity_commits": bool(f["ambiguous_commits"]), "merge_unverified": bool(f.get("merge_unverified")),
+            "legacy_north": north_star(f, attributed=False)}
 
 
 # --------------------------------------------------------------- compute
@@ -307,6 +516,12 @@ def push_repeats_of_group_shas(runs):
     return len(push), sum(1 for r in push if (r.get("name"), r.get("head_sha")) in group)
 
 
+def load_compute(rd, number):
+    """A cached compute reduction, or None when absent or written before COMPUTE_VERSION (recomputed)."""
+    c = rd.load("compute", str(number))
+    return c if c is not None and c.get("v") == COMPUTE_VERSION and c.get("complete") else None
+
+
 def pr_compute(rd, f, runs, runs_complete):
     heads = set(f["heads"])
     mg = re.compile(rf"^gh-readonly-queue/{re.escape(f['base'])}/pr-{f['number']}-")
@@ -327,7 +542,7 @@ def pr_compute(rd, f, runs, runs_complete):
         repeats += k in seen
         seen[k] = True
     sh = ho = 0.0
-    complete = runs_complete
+    complete = runs_complete and reads_complete(f)  # the heads come from the timeline and the commits
     for r in mine.values():
         a, b, ok = job_minutes(rd, r)
         sh += a
@@ -357,20 +572,20 @@ def required_contexts(rd, base, tick_ctx):
 
 
 def commit_red(rd, sha, required):
-    """(red_contexts, settled). Cached once every check run has completed."""
+    """(red_contexts, settled). Settled and cached only when every page was read and every check run completed."""
     cached = rd.load("checks", sha)
-    if cached is not None:
+    if cached is not None and cached.get("v") == CHECKS_VERSION:
         return set(cached["red"]) & required, True
-    runs, _ = rd.pages(f"commits/{sha}/check-runs", key="check_runs", max_pages=2)
+    runs, complete = rd.pages(f"commits/{sha}/check-runs", key="check_runs", max_pages=2)
     latest = {}
     for c in runs:
         k = c["name"]
         if k not in latest or (c.get("started_at") or "") > (latest[k].get("started_at") or ""):
             latest[k] = c
-    settled = bool(latest) and all(c.get("status") == "completed" for c in latest.values())
+    settled = complete and bool(latest) and all(c.get("status") == "completed" for c in latest.values())
     red = {k for k, c in latest.items() if c.get("conclusion") in BAD_CONCLUSIONS}
     if settled:
-        rd.save("checks", sha, {"red": sorted(red)})
+        rd.save("checks", sha, {"v": CHECKS_VERSION, "red": sorted(red)})
     return red & required, settled
 
 
@@ -481,6 +696,30 @@ def bucket(size):
     return "unknown" if size is None else "<200" if size < 200 else "200-800" if size <= 800 else ">800"
 
 
+def attribution_summary(rows):
+    """What each agent signal contributed, so the attribution can be audited. `by_primary` counts each PR once, under
+    its strongest signal; `with_signal` counts every PR a signal applies to. `ambiguous_cleared` counts PRs
+    with an owner-identity commit that the earlier rule called unknown and a signal now explains.
+    `legacy` is the earlier rule over the same PRs."""
+    at = [r["attribution"] for r in rows if r.get("attribution")]
+    n = len(rows)
+    legacy = collections.Counter(a["legacy_north"] for a in at)
+    prim = collections.Counter(a["primary"] or "none" for a in at)
+    cleared = collections.Counter(a["primary"] for a, r in ((r["attribution"], r) for r in rows if r.get("attribution"))
+                                  if a["primary"] and a["legacy_north"] == "unknown" and r["north"] != "unknown")
+    return {
+        "by_primary": {k: prim.get(k, 0) for k in SIGNALS + ("none",)},
+        "with_signal": {k: sum(1 for a in at if k in a["signals"]) for k in SIGNALS},
+        "ambiguous_cleared": {k: cleared.get(k, 0) for k in SIGNALS},
+        "steward_merges_recognised": sum(1 for a in at if a["steward_merge_recognised"]),
+        "owner_merges_unverified": sum(1 for a in at if a.get("merge_unverified")),
+        "agent_stamped_owner_events": sum(a["agent_owner_events"] for a in at),
+        "legacy": {"autonomous": legacy["autonomous"], "owner_action": legacy["owner_action"], "unknown": legacy["unknown"],
+                   "not_merged_in_48h": legacy["not_merged"], "rate_pct": pct_of(legacy["autonomous"], n),
+                   "unknown_share_pct": pct_of(legacy["unknown"], n)},
+    }
+
+
 def summarize(rows):
     """The scorecard over a list of eligible ready PRs (one row each)."""
     n = len(rows)
@@ -503,8 +742,10 @@ def summarize(rows):
     bad = [r for r in merged if r["correct"] and r["correct"]["bad"]]
     esc_known = [r for r in merged if r["correct"] and r["correct"].get("escaped") is not None]
     esc = [r for r in esc_known if r["correct"]["escaped"]]
+    attr = attribution_summary(rows)
     return {
         "ready_prs": n, "merged": len(merged),
+        "attribution": attr,
         "north_star": {
             "autonomous": auto, "owner_action": ns["owner_action"], "unknown": unk, "not_merged_in_48h": ns["not_merged"],
             "rate_pct": pct_of(auto, n), "rate_ci95": wilson(auto, n),
@@ -586,20 +827,21 @@ def collect_repo(repo, cache_dir, cap, owner, lo, hi, now, ticks, tick_ctx, fetc
     facts = []
     for pr in prs:
         f = rd.load("facts", str(pr["number"]))
-        if f is not None and f.get("v") != FACTS_VERSION:
-            f = None  # cached by an older reduction: read again once
+        if f is not None and (f.get("v") != FACTS_VERSION or not reads_complete(f)):
+            f = None  # an older reduction, or one cached from a partial read (an entry saved before partial reads were refused): read again
         if f is None:
             try:
                 f = pr_facts(rd, pr, owner)
-                if f["state"] == "closed":  # a closed PR does not change; an open one is read again next run
+                if f["state"] == "closed" and reads_complete(f):  # a closed PR does not change; an open one, or a partial read, is read again next run
                     rd.save("facts", str(pr["number"]), f)
             except (Truncated, ReadError):
                 res["unread"] += 1
                 continue
+        finalize(rd, f, pr)
         ok, why = eligible(f, managed_base)
         facts.append((f, ok, why))
     mrows = [f for f, ok, _ in facts if ok and f["merged_at"]]
-    need = [f for f in mrows if rd.load("compute", str(f["number"])) is None]
+    need = [f for f in mrows if load_compute(rd, f["number"]) is None]
     runs, runs_ok = [], False
     if need:
         try:
@@ -626,29 +868,33 @@ def collect_repo(repo, cache_dir, cap, owner, lo, hi, now, ticks, tick_ctx, fetc
         if f["first_ready"]:
             row["day"] = f["first_ready"][:10]
         row.update({
-            "north": north_star(f) if f["first_ready"] else None, "north_gh": north_star(f, False) if f["first_ready"] else None,
+            "north": north_star(f) if f["first_ready"] else None,
+            "attribution": row_attribution(f) if f["first_ready"] else None, "north_gh": north_star(f, False) if f["first_ready"] else None,
             "handoff_min": round((iso(merged) - iso(f["first_ready"])).total_seconds() / 60.0, 1) if merged and f["first_ready"] else None,
             "holds": f["holds"], "re_holds": f["re_holds"], "size": f["size"], "pushes": f["pushes"],
             "enqueues": f["enqueues"], "ejections": f["ejections"], "dirty": f["number"] in dirty,
-            "owner_actions": sum(1 for _, ts in f["owner_events"] if f["first_ready"] and iso(f["first_ready"]) <= iso(ts) <= iso(f["first_ready"]) + HORIZON),
+            "owner_actions": sum(1 for ev, ts in effective_owner_events(f)[0]
+                                 if not (ev == "merged" and f.get("merge_unverified")) and f["first_ready"] and iso(f["first_ready"]) <= iso(ts) <= iso(f["first_ready"]) + HORIZON),
             "repair_cycles": f["repair_cycles"], "compute": None, "correct": None,
         })
         if ok and merged:
-            comp = rd.load("compute", str(f["number"]))
+            comp = load_compute(rd, f["number"])
             if comp is None and runs_ok:
                 try:
                     comp = pr_compute(rd, f, runs, runs_ok)
                     if comp["complete"]:
-                        rd.save("compute", str(f["number"]), comp)
+                        rd.save("compute", str(f["number"]), dict(comp, v=COMPUTE_VERSION))
                 except (Truncated, ReadError):
                     comp = None
             row["compute"] = comp
             corr = rd.load("correct", str(f["number"]))
+            if corr is not None and corr.get("v") != CHECKS_VERSION:
+                corr = None
             if corr is None:
                 try:
                     corr = pr_correct(rd, f, base_commits, commits_ok, req, ticks, now, merged_list, res["listing_complete"])
                     if now >= iso(merged) + ESCAPE_WINDOW and corr["bad"] is not None and corr["escaped"] is not None:
-                        rd.save("correct", str(f["number"]), corr)
+                        rd.save("correct", str(f["number"]), dict(corr, v=CHECKS_VERSION))
                 except (Truncated, ReadError):
                     corr = {"provisional": True, "reverted": None, "base_red": None, "bad": None, "escaped": None, "escaped_by": None}
             if corr.get("escaped") is None and res["listing_complete"]:  # independent of the base reads
@@ -816,7 +1062,12 @@ def markdown(e2e):
          + (" : repos with unread PRs are labelled partial; fully read repos are reported normally" if e2e["truncated"] else "") + f". Coverage: {e2e['coverage']['status']} {e2e['coverage']['reason']}", "",
          f"North Star: eligible PRs that became ready in the window and merged within 48h of ready with no owner action ({e2e['owner']}'s own account: "
          "review, label, comment, UI merge or close), over ALL eligible PRs ready in the window. A cohort day is reported only after its 48h horizon closed. "
-         "An owner-identity commit with no agent trailer makes a PR unknown; above 20% unknown the rate is a range. `gh-only` ignores commits. "
+         "Agents commit under the owner's git identity, so a PR is agent work when it carries any signal: opened by the fleet App, `shipyard pr` provenance in the body, "
+         "an agent Co-Authored-By trailer, an agent session stamp. Only a PR with an owner-identity commit and no signal is unknown; above 20% unknown the rate is a range. "
+         "An owner-account event is an owner action only when it is a human's: one carrying a session stamp is an agent's, and a merge by the owner account is a "
+         "steward merge only with trusted evidence bound to the merged SHA (an App enqueue, or a counted App APPROVE at the merged head with no later removal, HOLD or push); a HOLD, "
+         "a verdict path or `shipyard pr` provenance alone does not qualify. A merge the timeline cannot tie to the merged SHA, or read from an incomplete timeline or commit list, is unknown: "
+         "credited to neither side, counted as an unverified owner merge and not as an owner action. `gh-only` ignores commits. "
          "Rates carry a 95% Wilson interval; below 50 PRs, or when the interval overlaps the baseline's, the sample is insufficient and no difference is claimed. "
          "Handoff-to-merge is load-dependent context, not the verdict. Verdict proxies: review rounds (HOLDs) and re-HOLD rate per PR, agent pushes by kind "
          "(repair after a HOLD or `repaired:`, author before, merge-main), merge-queue attempts and ejections by cause, DIRTY per 100 PRs, gate runs per merged PR "
@@ -871,6 +1122,16 @@ def markdown(e2e):
         if blk:
             L += [f"## {title} {blk['from']} to {blk['to']} (pooled, closed days only)", "", head.format("repo"), sep]
             L += [row(repo, s, e2e["repos"][repo]["controls"], repo_partial(e2e["repos"][repo])) for repo, s in sorted(blk["per_repo"].items())] + [""]
+    if e2e.get("window"):
+        L += ["### Attribution by signal (window; each PR counted once under its strongest signal)", "",
+              "| repo | PRs | app opener | provenance | trailer | session stamp | no signal | unknown cleared by signals | steward merges | unverified owner merges | agent-stamped owner events | legacy rate / unknown |",
+              "|---|---|---|---|---|---|---|---|---|---|---|---|"]
+        for repo, s_ in sorted(e2e["window"]["per_repo"].items()):
+            at = s_["attribution"]
+            p, lg = at["by_primary"], at["legacy"]
+            L.append(f"| {repo} | {s_['ready_prs']} | {p['app_opener']} | {p['provenance']} | {p['trailer']} | {p['session_stamp']} | {p['none']} | "
+                     f"{sum(at['ambiguous_cleared'].values())} | {at['steward_merges_recognised']} | {at['owner_merges_unverified']} | {at['agent_stamped_owner_events']} | {lg['rate_pct']}% / {lg['unknown_share_pct']}% |")
+        L.append("")
     nf = (e2e.get("baseline") or {}).get("noise_floor")
     if nf:
         L += ["### Baseline noise floor (day against day, North Star rate)", ""]
