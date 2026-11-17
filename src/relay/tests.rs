@@ -1556,6 +1556,26 @@ fn a_malformed_owner_marker_leaves_the_pull_request_unowned() {
 }
 
 #[test]
+fn an_unowned_conflict_after_a_push_is_told_once_and_a_cleared_one_is_dropped() {
+    let pr = Pr::open(543);
+    let mut h = unowned_harness(&pr, true);
+    h.pass(0, Mode::Send);
+    // A push that leaves it conflicting: the head moved, so a history-based
+    // event would stay silent.
+    let mut dirty = pr.clone();
+    dirty.head = HEAD_B;
+    dirty.merge = "DIRTY";
+    h.gh.set(dirty);
+    for minute in [1, 15, 40, 90] {
+        h.pass(minute, Mode::Send);
+    }
+    let deliveries = h.deliveries();
+    assert_eq!(deliveries.len(), 1, "told once: {deliveries:?}");
+    assert_eq!(deliveries[0]["tier"], "lead");
+    assert_eq!(deliveries[0]["events"][0]["event"], "dirty_after_base_move");
+}
+
+#[test]
 fn without_a_lead_an_unowned_pull_request_is_not_tracked() {
     let mut pr = Pr::open(543);
     pr.comments.push(verdict("HOLD", HEAD_A));

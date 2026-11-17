@@ -356,32 +356,44 @@ fn run_repo(
             log.push(record);
         }
         let unowned = tracked.owner.is_none();
-        let first_actionable = if unowned && tracked.digest.is_none() {
+        // With no owner the lead hears only what needs an author, judged by
+        // the state now, every pass: a history to compare with would miss a
+        // HOLD that landed before the first look or a conflict that came with
+        // a push. What is no longer true is dropped from the queue; a fact
+        // already delivered is not delivered again (its key is stable, since
+        // an unowned event carries no sequence number).
+        if unowned {
+            tracked
+                .pending
+                .retain(|event| matches!(event, RelayEvent::Overdue { .. }));
+        }
+        let mut events: Vec<RelayEvent> = if unowned {
             super::actionable_now(&digest)
+                .into_iter()
+                .chain(overdue_now)
+                .filter(|event| super::needs_an_owner(event, &digest))
+                .filter(|event| input.config.events.contains(event.name()))
+                .collect()
         } else {
-            Vec::new()
+            derived
+                .into_iter()
+                .chain(overdue_now)
+                .filter(|event| input.config.events.contains(event.name()))
+                // Green, pending (a re-run), green again at one head is one fact.
+                .filter(|event| match event {
+                    RelayEvent::RequiredCheck { result, head, .. } if result == "green" => {
+                        tracked.green_head.as_deref() != Some(head.as_str())
+                    }
+                    _ => true,
+                })
+                .collect()
         };
-        let mut events: Vec<RelayEvent> = derived
-            .into_iter()
-            .chain(first_actionable)
-            .chain(overdue_now)
-            // With no owner, the lead hears only what needs an author.
-            .filter(|event| !unowned || super::needs_an_owner(event, &digest))
-            .filter(|event| input.config.events.contains(event.name()))
-            // Green, pending (a re-run), green again at one head is one fact.
-            .filter(|event| match event {
-                RelayEvent::RequiredCheck { result, head, .. } if result == "green" => {
-                    tracked.green_head.as_deref() != Some(head.as_str())
-                }
-                _ => true,
-            })
-            .collect();
         if digest.checks == super::Checks::Success {
             tracked.green_head = Some(digest.head.clone());
         } else if digest.checks == super::Checks::Failure {
             tracked.green_head = None;
         }
-        for event in &mut events {
+        for event in events.iter_mut().filter(|_| !unowned) {
             if let Some(seq) = event.seq_mut() {
                 tracked.event_seq += 1;
                 *seq = tracked.event_seq;
@@ -399,12 +411,6 @@ fn run_repo(
                 continue;
             }
             tracked.pending.push(event);
-        }
-        // Events queued while it had an owner are not the lead's to hear.
-        if unowned {
-            tracked
-                .pending
-                .retain(|event| super::needs_an_owner(event, &digest));
         }
         // An overdue notice for a head that has since moved is stale.
         tracked.pending.retain(|event| match event {
