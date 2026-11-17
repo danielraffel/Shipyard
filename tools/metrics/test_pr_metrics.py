@@ -13,6 +13,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import pr_metrics as pm  # noqa: E402
 import synthetic_control as sc  # noqa: E402
+import acceptance as acc  # noqa: E402
 import loss_report as lr  # noqa: E402
 
 UTC = dt.timezone.utc
@@ -220,6 +221,65 @@ class Compute(Base):
         out = self.build(gh)
         self.assertIsNone(self.rows(out)[1]["compute"])
         self.assertEqual(out["repos"][REPO]["per_day"]["2026-11-10"]["compute_per_merged_pr"]["prs_read"], 0)
+
+
+class ProofsAndQueue(Base):
+    def test_a_busy_run_range_is_split_until_each_part_fits_and_is_complete(self):
+        seen = []
+        full = dt.datetime(2026, 11, 14, tzinfo=UTC), dt.datetime(2026, 11, 14, 23, 59, 59, tzinfo=UTC)
+        span = (full[1] - full[0]).total_seconds()
+
+        def fetch(path):
+            m = re.search(r"created=([^.]+)\.\.([^&]+)&per_page=100&page=(\d+)", path)
+            a, b = (dt.datetime.strptime(x, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC) for x in m.groups()[:2])
+            total = int(2500 * ((b - a).total_seconds() + 1) / (span + 1))
+            seen.append((a, b, int(m.group(3)), total))
+            start = (int(m.group(3)) - 1) * 100
+            n = max(0, min(100, total - start))
+            return {"total_count": total, "workflow_runs": [{"id": int(a.timestamp()) * 1000 + start + i} for i in range(n)]}
+        rd = pm.Reader(REPO, self.cache, 10_000, fetch)
+        runs, complete = pm.runs_index(rd, *full)
+        self.assertTrue(complete)
+        self.assertTrue(all(x[3] <= pm.RUNS_SLICE_LIMIT for x in seen if x[2] == 1 and x[3] <= pm.RUNS_SLICE_LIMIT) and max(x[2] for x in seen) <= 10)
+        self.assertGreater(len(runs), 2000)  # not cut at 1000
+        self.assertEqual(len({r["id"] for r in runs}), len(runs))
+
+    def test_a_range_that_cannot_be_split_further_and_overflows_is_incomplete(self):
+        fetch = lambda path: {"total_count": 5000, "workflow_runs": [{"id": 1}] * 100}
+        rd = pm.Reader(REPO, self.cache, 10_000, fetch)
+        t0 = dt.datetime(2026, 11, 14, tzinfo=UTC)
+        _, complete = pm.runs_index(rd, t0, t0 + dt.timedelta(seconds=1))
+        self.assertFalse(complete)
+
+    def test_an_old_job_cache_without_macos_minutes_is_read_again(self):
+        rd = pm.Reader(REPO, self.cache, 100, lambda path: {"jobs": [{"labels": ["macOS-14", "self-hosted"], "started_at": T(10, "10:00"),
+                                                                       "completed_at": T(10, "10:30"), "conclusion": "success"}]})
+        rd.save("jobs", "7", {"self_hosted": 99.0, "hosted": 0.0})
+        sh, ho, mac, ok = pm.job_minutes(rd, {"id": 7, "status": "completed"})
+        self.assertEqual((sh, ho, mac, ok), (30.0, 0.0, 30.0, True))
+
+    def test_enqueue_to_merge_counts_from_the_last_enqueue_and_runs_by_workflow_and_level_are_kept(self):
+        p = pr(1, T(10, "10:00"), T(10, "11:25"))
+        tl = {1: [{"event": "added_to_merge_queue", "actor": {"login": "x"}, "created_at": T(10, "10:20")},
+                  {"event": "removed_from_merge_queue", "actor": {"login": "x"}, "created_at": T(10, "10:30"), "reason": "failed_checks"},
+                  {"event": "added_to_merge_queue", "actor": {"login": "x"}, "created_at": T(10, "10:40")}]}
+        sha = f"h{1:040d}"[:40]
+        runs = [{"id": 1, "name": "Proof", "head_sha": sha, "event": "pull_request", "status": "completed"},
+                {"id": 2, "name": "Proof", "head_sha": "g", "event": "merge_group", "status": "completed", "head_branch": "gh-readonly-queue/main/pr-1-x"}]
+        job = [{"labels": ["macOS"], "started_at": T(10, "10:00"), "completed_at": T(10, "10:12"), "conclusion": "success"}]
+        other = pr(2, T(10, "10:00"), T(10, "11:00"))
+        other["head"]["sha"] = "z" * 40
+        out = self.build(world([p, other], tl, commits={2: [commit("c2")]}, runs=runs, jobs={1: job, 2: job}))
+        r = self.rows(out)
+        self.assertEqual((r[1]["enqueue_to_merge_min"], r[2]["enqueue_to_merge_min"]), (45.0, None))
+        c = r[1]["compute"]
+        self.assertEqual((c["macos_min"], c["by_workflow"]["Proof"]), (24.0, {"pull_request": 1, "merge_group": 1, "push": 0, "other": 0}))
+        s = out["repos"][REPO]["per_day"]["2026-11-10"]
+        self.assertEqual((s["merge_queue"]["enqueue_to_merge_min"]["n"], s["merge_queue"]["enqueue_to_merge_min"]["median"]), (1, 45.0))
+        self.assertEqual(s["compute_per_merged_pr"]["by_workflow"]["Proof"], {"pull_request": 0.5, "merge_group": 0.5, "push": 0.0, "prs": 2})
+        md = pm.markdown(out)
+        self.assertIn("Proofs, macOS minutes and queue wait per merged PR", md)
+        self.assertIn("| Proof | 0.5 / 0.5 / 0.0 |", md)
 
 
 class Correctness(Base):
@@ -909,19 +969,42 @@ class Controls(Base):
 class Truncation(Base):
     LATE = dt.datetime(2026, 11, 30, tzinfo=UTC)
 
-    def test_a_truncated_repo_is_partial_and_a_fully_read_repo_is_not(self):
+    def test_a_repo_with_unread_prs_is_withheld_and_a_fully_read_repo_is_not(self):
         prs = [pr(n, T(10, "10:00"), T(10, "11:00")) for n in range(1, 4)]
         out = pm.build([REPO], self.cache, 4, OWNER, START, self.LATE, {}, {}, None, world(prs), None, None, {})
         v = out["repos"][REPO]
         self.assertGreater(v["unread_prs"], 0)
         self.assertTrue(out["truncated"])
+        self.assertEqual((v["per_day"], v["prs"], out["window"]["per_repo"]), ({}, [], {}))  # no number for a repo with unread PRs
+        self.assertEqual(v["withheld"]["total_prs"], 3)
         md = pm.markdown(out)
-        self.assertIn("partial", md)
-        self.assertIn("| ready day |", md)  # numbers are still printed
+        self.assertIn(f"**WITHHELD: {v['unread_prs']} of 3 PRs unread", md)
+        self.assertNotIn("| ready day |", md)
         with tempfile.TemporaryDirectory() as d2:
             full = pm.build([REPO], d2, 300, OWNER, START, self.LATE, {}, {}, None, world(prs), None, None, {})
         self.assertEqual(full["repos"][REPO]["unread_prs"], 0)
-        self.assertNotIn("partial", pm.markdown(full))
+        self.assertNotIn("withheld", full["repos"][REPO])
+        self.assertNotIn("WITHHELD", pm.markdown(full))
+
+    def test_a_cut_short_listing_withholds_the_repo_too(self):
+        gh = world([pr(1, T(10, "10:00"), T(10, "11:00"))])
+        full_page = [pr(n, T(10, "10:00"), T(10, "11:00")) for n in range(1, 101)]
+        gh.routes[0] = (r"pulls\?state=all", full_page)  # eight full pages that never reach the window's start
+        for n in range(2, 101):
+            gh.routes.append((rf"issues/{n}/timeline", []))
+            gh.routes.append((rf"pulls/{n}/commits", [commit(f"c{n}")]))
+        out = pm.build([REPO], self.cache, 5000, OWNER, dt.datetime(2026, 11, 1, tzinfo=UTC), self.LATE, {}, {}, None, gh, None, None, {})
+        self.assertFalse(out["repos"][REPO]["listing_complete"])
+        self.assertIn("withheld", out["repos"][REPO])
+        self.assertEqual(out["repos"][REPO]["prs"], [])
+
+    def test_the_oldest_cohort_day_is_read_first_so_a_cap_leaves_the_newest_unread(self):
+        old, mid, new = (pr(1, T(8, "10:00"), T(8, "11:00")), pr(2, T(9, "10:00"), T(9, "11:00")), pr(3, T(10, "10:00"), T(10, "11:00")))
+        gh = world([new, mid, old])  # the API lists newest first
+        pm.build([REPO], self.cache, 5, OWNER, START, self.LATE, {}, {}, None, gh, None, None, {})  # the listing plus two PRs
+        facts = sorted(os.listdir(os.path.join(self.cache, REPO.replace("/", "__"), "facts")))
+        self.assertEqual(facts, ["1.json", "2.json"])
+        self.assertEqual([c for c in gh.calls if "timeline" in c][:1], [c for c in gh.calls if "issues/1/timeline" in c][:1])
 
     def test_truncated_with_all_facts_cached_is_still_partial(self):
         v = {"truncated": True, "unread_prs": 0, "listing_complete": True, "read_errors": 0}
@@ -976,9 +1059,9 @@ class Caps(Base):
         self.assertGreater(v["unread_prs"], 0)
         self.assertEqual(out["coverage"]["status"], "partial")
         md = pm.markdown(out)
-        self.assertIn(f"**TRUNCATED: {v['unread_prs']} PRs unread**", md)
+        self.assertIn(f"**WITHHELD: {v['unread_prs']} of 4 PRs unread", md)
         again = self.build(world(prs), cap=200)
-        self.assertNotIn("TRUNCATED:", pm.markdown(again))
+        self.assertNotIn("WITHHELD", pm.markdown(again))
         self.assertFalse(again["truncated"])
         self.assertEqual(len(again["repos"][REPO]["prs"]), 4)
 
@@ -1091,7 +1174,7 @@ class SyntheticControl(unittest.TestCase):
         out = pm.build([REPO], tempfile.mkdtemp(), 50, OWNER, START, NOW, {}, {}, None, world([pr(1, T(10, "10:00"), T(10, "11:00"))]))
         self.assertEqual(out["synthetic_control"]["status"], "pass")
         md = pm.markdown(out)
-        self.assertIn("**CONTROL PASS: 31 of 31", md)
+        self.assertIn("**CONTROL PASS: 38 of 38", md)
         self.assertIn("| ready day |", md)
 
     def test_a_repo_with_no_live_control_reads_synthetic_not_unchecked(self):
@@ -1113,6 +1196,38 @@ class SyntheticControl(unittest.TestCase):
         self.assertIn("withheld", md)
         for number_cells in ("| ready day |", "rate (CI95)", "autonomous a/o/unknown", "handoff median"):
             self.assertNotIn(number_cells, md)
+
+
+class Acceptance(unittest.TestCase):
+    def summaries(self, **over):
+        def s(med, pr_lvl=0.0, mg=0.0, mac=0.0, q2m=0.0):
+            return {"handoff_min": {"median": med}, "merge_queue": {"enqueue_to_merge_min": {"median": q2m}},
+                    "compute_per_merged_pr": {"macos_min_mean": mac, "by_workflow": {acc.PROOF: {"pull_request": pr_lvl, "merge_group": mg}}}}
+        base = {"Generous-Corp/vellum": s(365.0, 2.9, 0.87, 0.0, 54.0), "Generous-Corp/pulp": s(92.0, mac=69.0)}
+        base.update(over)
+        return base
+
+    def test_the_hand_measured_values_reproduce_exactly_and_all_six_are_within(self):
+        rows = acc.compare(self.summaries())
+        self.assertEqual(len(rows), 6)
+        self.assertTrue(all(r["within"] and r["delta_pct"] == 0.0 for r in rows))
+
+    def test_a_number_outside_the_tolerance_or_missing_is_not_within(self):
+        v = self.summaries()["Generous-Corp/vellum"]
+        v["handoff_min"]["median"] = 365.0 * 1.2
+        del v["compute_per_merged_pr"]["by_workflow"][acc.PROOF]
+        rows = {r["name"]: r for r in acc.compare(self.summaries(**{"Generous-Corp/vellum": v}))}
+        self.assertEqual((rows["Vellum ready-to-merge median"]["within"], rows["Vellum ready-to-merge median"]["delta_pct"]), (False, 20.0))
+        self.assertEqual((rows["Vellum PR GPU proofs per merged PR"]["report"], rows["Vellum PR GPU proofs per merged PR"]["within"]), (None, False))
+        self.assertTrue(rows["Pulp ready-to-merge median"]["within"])
+        self.assertIn("| Vellum ready-to-merge median | 365.0 min | 438.0 | 20.0% | NO |", acc.table(list(rows.values()), 0.15))
+
+    def test_the_tolerance_edge(self):
+        v = self.summaries()["Generous-Corp/vellum"]
+        v["handoff_min"]["median"] = 365.0 * 1.15
+        self.assertTrue({r["name"]: r for r in acc.compare(self.summaries(**{"Generous-Corp/vellum": v}))}["Vellum ready-to-merge median"]["within"])
+        v["handoff_min"]["median"] = 365.0 * 1.16
+        self.assertFalse({r["name"]: r for r in acc.compare(self.summaries(**{"Generous-Corp/vellum": v}))}["Vellum ready-to-merge median"]["within"])
 
 
 if __name__ == "__main__":
