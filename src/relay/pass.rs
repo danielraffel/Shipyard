@@ -361,22 +361,21 @@ fn run_repo(
             log.push(record);
         }
         let unowned = tracked.owner.is_none();
+        let mut seeded: Vec<RelayEvent> = Vec::new();
         if tracked.unowned_scope != unowned {
             tracked.unowned_scope = unowned;
             tracked.sent.clear();
-            tracked.pending.clear();
             tracked.last_sent_at = None;
             // A pull request that just gained an owner has no history for it:
-            // seed what needs an author now, so the new owner is told.
+            // what needs an author now is told to the new owner (below, and
+            // only if this pass derives no event for it), and an ejection
+            // still waiting moves to the new audience with it.
             if !unowned {
-                tracked.pending = super::actionable_now(&digest);
-                for event in &mut tracked.pending {
-                    if let Some(seq) = event.seq_mut() {
-                        tracked.event_seq += 1;
-                        *seq = tracked.event_seq;
-                    }
-                }
+                seeded = super::actionable_now(&digest);
             }
+            tracked
+                .pending
+                .retain(|event| !unowned && matches!(event, RelayEvent::Ejected { .. }));
         }
         // With no owner the lead hears only what needs an author, judged by
         // the state now, every pass: a history to compare with would miss a
@@ -406,8 +405,20 @@ fn run_repo(
                 .filter(|event| input.config.events.contains(event.name()))
                 .collect()
         } else {
-            derived
+            let derived_now: Vec<RelayEvent> = derived;
+            // A seeded event is dropped when this pass derived the same kind
+            // for the same head, so the owner never hears one failure twice.
+            let seeded_new: Vec<RelayEvent> = seeded
                 .into_iter()
+                .filter(|s| {
+                    !derived_now
+                        .iter()
+                        .any(|d| d.name() == s.name() && d.head() == s.head())
+                })
+                .collect();
+            derived_now
+                .into_iter()
+                .chain(seeded_new)
                 .chain(overdue_now)
                 .filter(|event| input.config.events.contains(event.name()))
                 // Green, pending (a re-run), green again at one head is one fact.

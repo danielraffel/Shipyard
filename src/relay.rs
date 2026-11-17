@@ -202,6 +202,22 @@ impl RelayEvent {
         }
     }
 
+    /// The head this event names, when it names one.
+    pub(crate) fn head(&self) -> Option<&str> {
+        match self {
+            Self::Merged { head }
+            | Self::Closed { head }
+            | Self::Enqueued { head, .. }
+            | Self::Ejected { head, .. }
+            | Self::Verdict { head, .. }
+            | Self::RequiredCheck { head, .. }
+            | Self::DirtyAfterBaseMove { head, .. }
+            | Self::ClaimTaken { head, .. }
+            | Self::StackedBaseMerged { head, .. }
+            | Self::Overdue { head, .. } => Some(head),
+        }
+    }
+
     /// Merged or closed: delivered without waiting out the rate limit.
     pub(crate) fn terminal(&self) -> bool {
         matches!(self, Self::Merged { .. } | Self::Closed { .. })
