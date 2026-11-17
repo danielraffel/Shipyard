@@ -295,6 +295,7 @@ pub(crate) fn state_for(
         }
         "no_verdict"
         | "awaiting_review"
+        | "review_quarantined"
         | "waiting_head_approval"
         | "approval_excluded"
         | "waiting_code_owner"
