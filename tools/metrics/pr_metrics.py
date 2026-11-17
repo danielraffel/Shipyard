@@ -822,6 +822,11 @@ def main_red_episodes(chron, states, pr_by_sha):
         if not st or not st.get("settled"):
             skipped += 1
             prev_settled = False
+            # the base's state across an unread push is unknown: an open episode ends there, with no fixer and no
+            # duration, and a red seen after it is a new episode with no PR
+            for ep in {id(e): e for e in open_ctx.values()}.values():
+                ep["open"], ep["end_unknown"] = set(), True
+            open_ctx = {}
             continue
         red, green = set(st["red"]) - skip, set(st["green"]) - skip
         new = sorted(c for c in red if c not in open_ctx)
@@ -1069,7 +1074,8 @@ def change_failure_summary(merged):
             "prs_that_started_red": sum(1 for r in known if r["main_red"]), "episodes": len(eps),
             "change_failures": len(cf), "other_post_merge_red": sum(1 for e in eps if e["head_red_same_context"] is False),
             "minutes_to_green": sorted(e["minutes_to_green"] for e in cf if e["minutes_to_green"] is not None),
-            "unresolved": sum(1 for e in cf if e["minutes_to_green"] is None),
+            "unresolved": sum(1 for e in cf if e["minutes_to_green"] is None and not e.get("end_unknown")),
+            "end_unknown": sum(1 for e in eps if e.get("end_unknown")),
             "head_red_same_context": len(cf), "head_red_unknown": sum(1 for e in eps if e["head_red_same_context"] is None)}
 
 
@@ -1329,7 +1335,7 @@ def collect_repo(repo, cache_dir, cap, owner, lo, hi, now, ticks, tick_ctx, fetc
             row["path"], row["path_why"] = path_of(dict(f, dirty=row["dirty"]), comp)
             row["cause_min"] = cause_minutes(f, comp)
             # the episodes this PR's merge started (empty list: none), or None when the base's checks were not read in full
-            row["main_red"] = [{k: ep[k] for k in ("contexts", "minutes_to_green", "fixer_pr", "head_red_same_context")}
+            row["main_red"] = [{k: ep.get(k) for k in ("contexts", "minutes_to_green", "fixer_pr", "head_red_same_context", "end_unknown")}
                                for ep in episodes if ep["pr"] == f["number"]] if ep_ok and f.get("merge_commit_sha") in attributable else None
             corr = rd.load("correct", str(f["number"]))
             if corr is not None and corr.get("v") != CHECKS_VERSION:

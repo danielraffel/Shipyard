@@ -376,10 +376,18 @@ class MainRed(unittest.TestCase):
                               {"a": 1, "b": 2, "c": 3})
         self.assertEqual((len(eps), eps[0]["contexts"], eps[0]["fixer_pr"], eps[0]["minutes_to_green"]), (1, ["X", "Y"], 3, 2.0))
 
-    def test_a_cancelled_or_absent_context_does_not_close_an_episode_and_unsettled_pushes_are_skipped(self):
-        eps, skipped = self.run_eps([("base", self.st(green=["T"])), ("a", self.st(red=["T"])), ("b", self.st()), ("c", self.st(red=["T"], settled=False)),
-                                     ("d", self.st(green=["T"]))], {"a": 1, "b": 2, "c": 3, "d": 4})
-        self.assertEqual((eps[0]["fixer_pr"], eps[0]["minutes_to_green"], skipped), (4, 3.0, 1))
+    def test_a_cancelled_or_absent_context_does_not_close_an_episode(self):
+        eps, skipped = self.run_eps([("base", self.st(green=["T"])), ("a", self.st(red=["T"])), ("b", self.st()), ("d", self.st(green=["T"]))],
+                                    {"a": 1, "b": 2, "d": 4})
+        self.assertEqual((eps[0]["fixer_pr"], eps[0]["minutes_to_green"], skipped), (4, 2.0, 0))
+
+    def test_an_unsettled_push_ends_an_open_episode_unknown_and_a_later_red_is_a_new_one(self):
+        eps, skipped = self.run_eps([("base", self.st(green=["T"])), ("a", self.st(red=["T"])), ("c", self.st(red=["T"], settled=False)),
+                                     ("d", self.st(red=["T"])), ("e", self.st(green=["T"]))], {"a": 1, "c": 3, "d": 4, "e": 5})
+        self.assertEqual([(e["pr"], e.get("end_unknown"), e["fixer_pr"], e["minutes_to_green"]) for e in eps], [(1, True, None, None), (None, None, 5, 1.0)])
+        self.assertEqual(skipped, 1)
+        s = pm.change_failure_summary([{"main_red": [dict(eps[0], head_red_same_context=True)]}])
+        self.assertEqual((s["unresolved"], s["end_unknown"]), (0, 1))
 
     def test_a_direct_push_that_turns_main_red_has_no_pr(self):
         eps, _ = self.run_eps([("base", self.st(green=["T"])), ("push", self.st(red=["T"]))], {"a": 1})
