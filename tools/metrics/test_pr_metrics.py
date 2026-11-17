@@ -283,7 +283,14 @@ class ProofsAndQueue(Base):
 
 
 class Paths(unittest.TestCase):
-    F = {"holds": 0, "ejections": [], "merged_at": T(10, "12:00"), "hold_times": [], "push_times": [], "enqueue_times": [], "dequeue_times": []}
+    F = {"holds": 0, "ejections": [], "merged_at": T(10, "12:00"), "hold_times": [], "push_times": [], "enqueue_times": [], "dequeue_times": [],
+         "timeline_complete": True, "commits_complete": True}
+
+    def test_cause_minutes_are_none_when_the_timeline_or_the_commits_were_not_read_in_full(self):
+        f = self.f(hold_times=[T(10, "10:00")], push_times=[T(10, "10:20")])
+        self.assertEqual(pm.cause_minutes(f, self.comp())["hold"], 20.0)
+        self.assertIsNone(pm.cause_minutes(dict(f, timeline_complete=False), self.comp()))
+        self.assertIsNone(pm.cause_minutes(dict(f, commits_complete=False), self.comp()))
 
     def f(self, **kw):
         return dict(self.F, **kw)
@@ -341,6 +348,46 @@ class Paths(unittest.TestCase):
         self.assertIn("| slow share | clean median (n) | slow median / p90 (n) | top cause |", md)
 
 
+class JobsSkippedHold(Base):
+    """Findings of the review of the job-read switch."""
+    def run_skipped(self, runs, seed=None, jobs=None):
+        p = pr(1, T(10, "09:00"), T(10, "11:00"))
+        gh = world([p], runs=runs, jobs=jobs or {})
+        if seed is not None:
+            d = os.path.join(self.cache, REPO.replace("/", "__"), "compute")
+            os.makedirs(d)
+            with open(os.path.join(d, "1.json"), "w") as fh:
+                json.dump(seed, fh)
+        pm.READ_JOB_MINUTES = False
+        try:
+            return pm.build([REPO], self.cache, 200, OWNER, START, NOW, {}, {}, None, gh, control=False)
+        finally:
+            pm.READ_JOB_MINUTES = True
+
+    RUN = {"id": 11, "head_sha": f"h{1:040d}"[:40], "event": "pull_request", "head_branch": "feat"}
+
+    def test_an_unfinished_run_keeps_the_pr_unknown_when_job_reads_are_skipped(self):
+        out = self.run_skipped([dict(self.RUN, status="in_progress")])
+        r = out["repos"][REPO]["prs"][0]
+        self.assertEqual((r["compute"]["complete"], r["path"]), (False, None))
+        done = self.run_skipped([dict(self.RUN, status="completed", conclusion="success")])
+        self.assertEqual(done["repos"][REPO]["prs"][0]["path"], "clean")
+
+    def test_skipped_job_reads_report_no_minutes_not_zeros_and_the_summary_copes(self):
+        out = self.run_skipped([dict(self.RUN, status="completed", conclusion="success")])
+        c = out["repos"][REPO]["prs"][0]["compute"]
+        self.assertEqual((c["self_hosted_min"], c["hosted_min"], c["macos_min"], c["runner_wait_min"], c["jobs_read"]), (None, None, None, None, False))
+        s = pm.summarize([r for r in out["repos"][REPO]["prs"] if r["eligible"]])["compute_per_merged_pr"]
+        self.assertEqual((s["context_self_hosted_min_median"], s["macos_min_mean"], s["macos_min_median"], s["runs_total"]), (None, None, None, 1))
+
+    def test_a_cached_compute_entry_with_minutes_is_not_reused_when_job_reads_are_skipped(self):
+        seed = {"v": pm.COMPUTE_VERSION, "complete": True, "jobs_read": True, "self_hosted_min": 99.0, "hosted_min": 1.0, "macos_min": 5.0,
+                "runner_wait_min": 2.0, "red_events": [], "by_workflow": {}, "runs": 7, "repeat_runs": 0, "group_runs": 0}
+        out = self.run_skipped([dict(self.RUN, status="completed", conclusion="success")], seed)
+        c = out["repos"][REPO]["prs"][0]["compute"]
+        self.assertEqual((c["self_hosted_min"], c["runs"]), (None, 1))
+
+
 class JobsSkipped(Base):
     runs = [{"id": 11, "head_sha": f"h{1:040d}"[:40], "event": "pull_request", "status": "completed", "head_branch": "feat"},
             {"id": 12, "head_sha": "zzz", "event": "merge_group", "status": "completed", "head_branch": "gh-readonly-queue/main/pr-1-abc"}]
@@ -361,6 +408,11 @@ class JobsSkipped(Base):
 
 
 class MergeRemoval(Base):
+    def test_a_removal_after_the_merge_is_not_an_ejection(self):
+        p = pr(1, T(10, "10:00"), T(10, "11:00"))
+        out = self.build(world([p], {1: [self.removal("11:05")]}))
+        self.assertEqual(self.rows(out)[1]["ejections"], [])
+
     def removal(self, hm):
         return {"event": "removed_from_merge_queue", "actor": {"login": "x"}, "created_at": T(10, hm)}
 

@@ -236,11 +236,12 @@ MERGE_REMOVAL_WINDOW = dt.timedelta(minutes=2)
 def ejection(e, merged):
     """Whether a timeline event is a removal from the merge queue that is an ejection. The REST event names no reason, and GitHub
     records a removal when a PR merges, so a removal within two minutes before the merge is the merge, not an ejection (the
-    rule the m3 fleet-metrics parser uses); one that says `merged` is the merge too."""
+    rule the m3 fleet-metrics parser uses); one that says `merged` is the merge too, and a removal after the merge cannot be an
+    ejection of the merged PR."""
     if e.get("event") not in ("removed_from_merge_queue", "dequeued") or (e.get("reason") or "unknown") in ("merged", "already_merged"):
         return False
     t, m = iso(e.get("created_at")), iso(merged)
-    return not (t and m and dt.timedelta(0) <= m - t <= MERGE_REMOVAL_WINDOW)
+    return not (t and m and m - t <= MERGE_REMOVAL_WINDOW)
 
 
 def steward_seq(pr, tl):
@@ -617,7 +618,7 @@ def cause_minutes(f, comp):
     can wait at once), so they are not additive. hold: from each HOLD to the next push; red: from a failed head run to the
     next push; queue: from each enqueue to its removal or the merge; runner: queued job time; dirty: not measured."""
     m = iso(f.get("merged_at"))
-    if not m:
+    if not m or not reads_complete(f):  # a partial timeline or commit list omits holds, pushes and queue events: no number, not an undercount
         return None
     done = comp and comp.get("complete")
     return {"hold": _wait_until_next(f.get("hold_times") or [], f.get("push_times") or [], m),
@@ -637,6 +638,8 @@ def enqueue_to_merge(f):
 def load_compute(rd, number, f=None):
     """A cached compute reduction, or None when absent or written before COMPUTE_VERSION (recomputed). With `f`, an
     entry is never complete while that PR's own timeline or commit read is incomplete (the heads came from them)."""
+    if not READ_JOB_MINUTES:  # a cached entry carries job minutes this run is meant to leave empty
+        return None
     c = rd.load("compute", str(number))
     if c is None or c.get("v") != COMPUTE_VERSION or not c.get("complete"):
         return None
@@ -672,7 +675,8 @@ def pr_compute(rd, f, runs, runs_complete):
     mac = wait = 0.0
     by_wf, red_events = {}, []
     for r in mine.values():
-        a, b, m, w, ok = job_minutes(rd, r) if READ_JOB_MINUTES else (0.0, 0.0, 0.0, 0.0, True)
+        # skipping the jobs reads must not hide an unfinished run: its outcome is still unknown, so the PR is not clean
+        a, b, m, w, ok = job_minutes(rd, r) if READ_JOB_MINUTES else (0.0, 0.0, 0.0, 0.0, r.get("status") == "completed")
         sh += a
         ho += b
         mac += m
@@ -683,7 +687,9 @@ def pr_compute(rd, f, runs, runs_complete):
         level = by_wf.setdefault(r.get("name") or "?", {"pull_request": 0, "merge_group": 0, "push": 0, "other": 0})
         ev = r.get("event")
         level[ev if ev in ("merge_group", "push") else "pull_request" if ev in ("pull_request", "pull_request_target") else "other"] += 1
-    return {"self_hosted_min": round(sh, 1), "hosted_min": round(ho, 1), "macos_min": round(mac, 1), "runner_wait_min": round(wait, 1) if READ_JOB_MINUTES else None, "jobs_read": READ_JOB_MINUTES, "red_events": sorted(red_events), "by_workflow": by_wf,
+    j = READ_JOB_MINUTES  # job-derived numbers are None, never a measured zero, when the jobs were not read
+    return {"self_hosted_min": round(sh, 1) if j else None, "hosted_min": round(ho, 1) if j else None, "macos_min": round(mac, 1) if j else None,
+            "runner_wait_min": round(wait, 1) if j else None, "jobs_read": j, "red_events": sorted(red_events), "by_workflow": by_wf,
             "runs": len(mine), "repeat_runs": repeats,
             "group_runs": sum(1 for r in mine.values() if r.get("event") == "merge_group"), "complete": complete}
 
@@ -899,6 +905,7 @@ def summarize(rows):
     merged = [r for r in rows if r["merged"]]
     hand = [r["handoff_min"] for r in merged]
     comp = [r for r in merged if r["compute"] and r["compute"]["complete"]]
+    jobs_comp = [r for r in comp if r["compute"].get("jobs_read", True)]  # minutes come only from PRs whose jobs were read
     held = [r for r in rows if r["holds"]]
     rehold = [r for r in held if r["re_holds"]]
     by_size = {}
@@ -955,10 +962,10 @@ def summarize(rows):
             "runs_mean": None if not comp else round(sum(r["compute"]["runs"] for r in comp) / len(comp), 2),
             "repeat_runs_total": sum(r["compute"]["repeat_runs"] for r in comp),
             "runs_total": sum(r["compute"]["runs"] for r in comp),
-            "context_self_hosted_min_median": med([r["compute"]["self_hosted_min"] for r in comp]),
-            "context_hosted_min_median": med([r["compute"]["hosted_min"] for r in comp]),
-            "macos_min_mean": None if not comp else round(sum(r["compute"]["macos_min"] for r in comp) / len(comp), 1),
-            "macos_min_median": med([r["compute"]["macos_min"] for r in comp]),
+            "context_self_hosted_min_median": med([r["compute"]["self_hosted_min"] for r in jobs_comp]),
+            "context_hosted_min_median": med([r["compute"]["hosted_min"] for r in jobs_comp]),
+            "macos_min_mean": None if not jobs_comp else round(sum(r["compute"]["macos_min"] for r in jobs_comp) / len(jobs_comp), 1),
+            "macos_min_median": med([r["compute"]["macos_min"] for r in jobs_comp]),
             "by_workflow": workflow_means(comp),
         },
         "correctness": {
