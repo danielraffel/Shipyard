@@ -1455,6 +1455,34 @@ fn a_marker_cannot_outrank_by_a_future_time_or_name_an_unknown_socket() {
 }
 
 #[test]
+fn a_marker_owner_still_hears_that_its_pull_request_merged() {
+    // A merged pull request leaves GitHub's open list, so the body marker is
+    // no longer listed. That must not forget the owner before `merged` is
+    // delivered: only a pull request that is still open and lost its marker
+    // forgets it.
+    let pr = Pr::open(11796);
+    let mut h = Harness::new(
+        std::slice::from_ref(&pr),
+        FakeCmux::with(&[("m5", "/tmp/cmux-nightly.sock", "S-AUDIO")]),
+    );
+    let marker = owner_registry::render_marker(&owner(11796, "m5", "S-AUDIO"));
+    h.gh.open_bodies
+        .borrow_mut()
+        .insert(11796, format!("Summary\n\n{marker}"));
+    h.pass(0, Mode::Send);
+    let mut merged = pr.clone();
+    merged.state = "MERGED";
+    merged.merged = true;
+    h.gh.set(merged);
+    h.gh.open_bodies.borrow_mut().clear();
+    h.pass(1, Mode::Send);
+    let sends = h.cmux.sends();
+    assert_eq!(sends.len(), 1, "the merge reached the owner: {sends:?}");
+    assert_eq!(sends[0].0, "m5");
+    assert_eq!(h.deliveries()[0]["tier"], "owner");
+}
+
+#[test]
 fn each_delivery_is_persisted_before_the_next_one_is_sent() {
     let prs = [Pr::open(1), Pr::open(2)];
     let mut h = Harness::new(
