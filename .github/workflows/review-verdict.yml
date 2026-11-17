@@ -12,8 +12,11 @@
 name: Review verdict
 
 on:
+  # `edited` re-judges the head after a retarget. It is not filtered to base
+  # changes: this job is itself the required `review-verdict` check, and a
+  # skipped run under that name would count as passing.
   pull_request_target:
-    types: [opened, reopened, synchronize, ready_for_review]
+    types: [opened, reopened, synchronize, ready_for_review, edited]
   issue_comment:
     types: [created, edited, deleted]
   workflow_run:
