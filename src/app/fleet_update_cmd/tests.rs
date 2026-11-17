@@ -1369,6 +1369,7 @@ fn real_auth_transaction_publishes_the_atomic_generation_contract() {
         &shlex_quote(&wrapper_source.display().to_string()),
         &shlex_quote(&close_guard_source.display().to_string()),
         &install_binary,
+        "/usr/bin/true",
         "shipyard",
         &state,
         &state,

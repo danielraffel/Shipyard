@@ -306,6 +306,7 @@ impl ReaderFixture {
             &shlex_quote(&self.wrapper_source.display().to_string()),
             &shlex_quote(&self.close_guard_source.display().to_string()),
             &install_binary,
+            super::ACCEPTING_CODESIGN,
             "shipyard",
             &self.state(),
             &self.state(),
