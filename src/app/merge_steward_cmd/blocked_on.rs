@@ -14,7 +14,7 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 
 use super::{
@@ -1014,6 +1014,24 @@ const fn approval_since_source(blocker: &ApprovalBlocker) -> &'static str {
     }
 }
 
+/// How old a head must be before a required context with no run at all reads
+/// `required_never_ran` even though a review status is pending: CI normally
+/// starts within minutes of a push.
+const NEVER_RAN_AFTER: Duration = Duration::minutes(10);
+
+/// Whether the head has existed longer than `age`, judged by its oldest dated
+/// check (every check at the head was created after the push). A head with no
+/// dated check is not known to be old.
+fn head_older_than(pr: &StewardPullRequest, now: DateTime<Utc>, age: Duration) -> bool {
+    pr.checks
+        .iter()
+        .filter_map(|check| check.observed_at.as_deref())
+        .filter_map(|at| DateTime::parse_from_rfc3339(at).ok())
+        .map(|at| at.with_timezone(&Utc))
+        .min()
+        .is_some_and(|oldest| now - oldest > age)
+}
+
 /// Split missing contexts (never ran on this head) from pending ones.
 fn waiting_required(
     pr: &StewardPullRequest,
@@ -1042,9 +1060,19 @@ fn waiting_required(
     // A context that has not appeared yet while runs from the same source are
     // still queued or running is pending (a job that `needs:` another has not
     // started); only an absent context with nothing in flight never ran.
+    //
+    // On a head older than `NEVER_RAN_AFTER`, a review status (`review-verdict`
+    // is `pending` while the head awaits its reviewer) is produced by another
+    // workflow and says nothing about whether this context's workflow started:
+    // counting it kept a head whose CI never
+    // started at all (a base retarget with no `edited` trigger) reading "checks
+    // running, do not push".
+    let head_is_old = head_older_than(pr, Utc::now(), NEVER_RAN_AFTER);
     let in_flight = |required: &crate::merge_steward::RequiredCheck| {
         pr.checks.iter().any(|check| {
             !check.status.eq_ignore_ascii_case("COMPLETED")
+                && (!head_is_old
+                    || !crate::merge_steward::is_review_gate(&check.name, &policy.approval_context))
                 && required
                     .app_id
                     .is_none_or(|app_id| check.app_id == Some(app_id))

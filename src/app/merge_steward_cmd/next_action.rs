@@ -331,8 +331,9 @@ fn callers_move(kind: &str, facts: &Facts<'_>, stall: &Stall) -> Option<NextActi
         "required_never_ran" => NextAction::new(
             Actor::Author,
             format!(
-                "Required check(s) {arg} never ran on this head: merge {base} once (no rebase) \
-                 and push once so CI starts, or dispatch the workflow on this branch."
+                "CI never started at this head (likely a base retarget): required check(s) {arg} \
+                 have no run: merge {base} once (no rebase) and push once so CI starts, or \
+                 dispatch the workflow on this branch."
             ),
         ),
         "required_failed" => NextAction::new(

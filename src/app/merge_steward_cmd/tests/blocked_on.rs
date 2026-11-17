@@ -2009,3 +2009,92 @@ esac
         assert_eq!(reports[0].blocked.blocked_on, token);
     }
 }
+
+/// Shipyard #1457 at 577d982b: a base retarget started no `Test macOS ARM64`
+/// run, and the only thing in flight was the `review-verdict` status, pending
+/// while the head awaits its reviewer. That is another workflow's wait, so the
+/// row is `required_never_ran`, not `required_pending` ("checks running, do
+/// not push"). A required job that really is still running keeps it pending.
+#[test]
+fn a_pending_review_status_does_not_hide_a_required_check_that_never_ran() {
+    let policy = app_bound_policy(&["macos", "review-verdict"]);
+    let mut pr = pr_with(1457, &[], "BLOCKED", &json!([]));
+    pr.fact.checks.push(StewardCheck {
+        status: "PENDING".to_owned(),
+        conclusion: None,
+        observed_at: Some("2026-11-17T08:25:29Z".to_owned()),
+        ..review_status(Some("no reviewer verdict names head aaaaaaaaaaaa"))
+    });
+    let decision = classify_pr(&pr.fact, &policy, &BTreeMap::new());
+    let classify_row = |pr: &ObservedPr| {
+        classify(
+            &RowFacts {
+                pr: &pr.fact,
+                decision: &decision,
+                mutation: None,
+                error: None,
+                approval: GateRead::Unread,
+                enqueued_at: None,
+                ejection: None,
+            },
+            &policy,
+        )
+        .0
+    };
+    let stall = classify_row(&pr);
+    assert_eq!(stall.blocked_on, "required_never_ran:macos", "{stall:?}");
+    let next = crate::app::merge_steward_cmd::next_action::for_row(
+        &crate::app::merge_steward_cmd::next_action::RowContext {
+            repo: "danielraffel/Shipyard",
+            base: "main",
+            pr: &pr.fact,
+            policy: &policy,
+            error: None,
+        },
+        &stall,
+    );
+    assert!(next.action.contains("CI never started"), "{}", next.action);
+    // A head pushed moments ago has not been given time: the pending review
+    // status keeps it pending, so a fresh push is not told its CI never ran.
+    let mut fresh = pr.clone();
+    fresh.fact.checks[0].observed_at = Some(Utc::now().to_rfc3339());
+    let decision_fresh = classify_pr(&fresh.fact, &policy, &BTreeMap::new());
+    let young = classify(
+        &RowFacts {
+            pr: &fresh.fact,
+            decision: &decision_fresh,
+            mutation: None,
+            error: None,
+            approval: GateRead::Unread,
+            enqueued_at: None,
+            ejection: None,
+        },
+        &policy,
+    )
+    .0;
+    assert_eq!(young.blocked_on, "required_pending", "{young:?}");
+    // Control: a non-review job still running keeps it pending.
+    let mut running = pr.clone();
+    running.fact.checks.push(StewardCheck {
+        name: "some-upstream-job".to_owned(),
+        source: StewardCheckSource::CheckRun,
+        status: "IN_PROGRESS".to_owned(),
+        conclusion: None,
+        ..review_status(None)
+    });
+    let decision_running = classify_pr(&running.fact, &policy, &BTreeMap::new());
+    let pending = classify(
+        &RowFacts {
+            pr: &running.fact,
+            decision: &decision_running,
+            mutation: None,
+            error: None,
+            approval: GateRead::Unread,
+            enqueued_at: None,
+            ejection: None,
+        },
+        &policy,
+    )
+    .0;
+    assert_eq!(pending.blocked_on, "required_pending", "{pending:?}");
+}
