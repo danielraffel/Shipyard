@@ -1847,6 +1847,16 @@ fullness against the ruleset's `max_entries_to_merge` and the share of
 merge-group runs whose `shipyard-receipt-decision/v1` said `reuse`. Run it from
 inside a checkout of the repo (credentials resolve by cwd); a 48h window of a
 busy repo is several hundred API reads, and a cold 66h Pulp window took 810 s.
+Reads are bounded: `--max-reads N` (default 300; each `--paginate` call counts
+once) stops cleanly at N and marks the report `partial` (a `PARTIAL:` line, a
+`partial` JSON field and a `read_budget` telemetry gap); the figures then
+understate the window. Before reading, it prints an estimate (listing pages,
+one jobs read per run, three per merge-group run, ten fixed; the cache is
+ignored) and refuses with exit 2 when the estimate exceeds the default cap,
+unless `--max-reads` is given. `--cached-only` sends no GitHub reads: it reports
+the window of the newest live run of the same length from the local cache
+(runs whose jobs are not cached are missing; always partial) and fails if none
+exists. Neither flag is a substitute for a narrower `--since`.
 Settled answers (jobs of a completed run attempt, annotations of a completed
 check run, commit parents) are cached under the state dir, so a repeat run
 reads only what is still in flight; the last line (`reads:`, JSON `reads`)
