@@ -2521,7 +2521,7 @@ class GhappWrapperTests(unittest.TestCase):
     def test_pr_create_that_fails_or_prints_no_pull_request_registers_nothing(
         self,
     ) -> None:
-        self.write_create_gh("https://github.com/owner/repo/pull/77", status=1)
+        self.write_create_gh("no url here", status=1)
         result = self.run_wrapper(
             "pr", "create", "--title", "x", "--body", "y", "--repo", "owner/repo"
         )
@@ -2650,6 +2650,16 @@ class GhappWrapperTests(unittest.TestCase):
             "pr", "create", "--title", "x", "--body", "y", "--repo", "owner/repo"
         )
         self.assertNotIn("ALLOW", result.stderr)
+
+    def test_a_pr_created_before_gh_failed_a_later_step_is_still_registered(
+        self,
+    ) -> None:
+        self.write_create_gh("https://github.com/owner/repo/pull/77", status=1)
+        result = self.run_wrapper(
+            "pr", "create", "--title", "x", "--body", "y", "--repo", "owner/repo"
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(len(self.owner_register_calls()), 1)
 
     def test_a_pr_create_dry_run_registers_nothing(self) -> None:
         self.write_create_gh("https://github.com/owner/repo/pull/77")

@@ -2148,6 +2148,10 @@ if [[ "${1:-} ${2:-}" == "pr create" && "${SHIPYARD_GHAPP_ALLOW_DUPLICATE_PR:-}"
             ghapp_dup_head="$(PATH="$trusted_path" "$git_binary" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
         fi
         ghapp_dup_tree=""
+        if [[ -z "$ghapp_dup_base" && -n "$ghapp_dup_head" ]]; then
+            # Like gh: a branch's configured merge base is the default base.
+            ghapp_dup_base="$(PATH="$trusted_path" "$git_binary" config --get "branch.${ghapp_dup_head}.gh-merge-base" 2>/dev/null || true)"
+        fi
         if [[ -n "$ghapp_dup_head" && "$ghapp_dup_head" != HEAD && "$ghapp_dup_head" != *:* ]]; then
             ghapp_dup_tree="$(PATH="$trusted_path" "$git_binary" rev-parse --verify --quiet "refs/heads/${ghapp_dup_head}^{tree}" 2>/dev/null || \
                 PATH="$trusted_path" "$git_binary" rev-parse --verify --quiet "refs/remotes/origin/${ghapp_dup_head}^{tree}" 2>/dev/null || true)"
@@ -2227,16 +2231,16 @@ if [[ "$ghapp_register_owner" == 1 && ( "${1:-}" != "api" || "$ghapp_stderr_open
     set -e
     trap - INT TERM HUP
     /bin/cat -- "$ghapp_create_out" 2>/dev/null || true
-    if [[ "$ghapp_status" == 0 ]]; then
-        ghapp_created_url="$(/usr/bin/grep -E '^https://github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/pull/[0-9]+$' "$ghapp_create_out" 2>/dev/null | /usr/bin/tail -n 1 || true)"
-        if [[ -n "$ghapp_created_url" ]]; then
-            ghapp_created_path="${ghapp_created_url#https://github.com/}"
-            ghapp_created_number="${ghapp_created_path##*/}"
-            ghapp_created_repo="${ghapp_created_path%/pull/*}"
-            PATH="$trusted_path" "$shipyard_binary" "${resolver_context_argv[@]}" owner register \
-                --pr "$ghapp_created_number" --repo "$ghapp_created_repo" \
-                --after-create </dev/null >&2 2>&1 || true
-        fi
+    # A URL on stdout means the pull request exists, even when gh then failed
+    # a later step (an attachment upload): register it regardless of status.
+    ghapp_created_url="$(/usr/bin/grep -E '^https://github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/pull/[0-9]+$' "$ghapp_create_out" 2>/dev/null | /usr/bin/tail -n 1 || true)"
+    if [[ -n "$ghapp_created_url" ]]; then
+        ghapp_created_path="${ghapp_created_url#https://github.com/}"
+        ghapp_created_number="${ghapp_created_path##*/}"
+        ghapp_created_repo="${ghapp_created_path%/pull/*}"
+        PATH="$trusted_path" "$shipyard_binary" "${resolver_context_argv[@]}" owner register \
+            --pr "$ghapp_created_number" --repo "$ghapp_created_repo" \
+            --after-create </dev/null >&2 2>&1 || true
     fi
     exit "$ghapp_status"
 fi
