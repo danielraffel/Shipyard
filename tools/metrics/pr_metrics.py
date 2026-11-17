@@ -54,7 +54,7 @@ SIGNALS = ("app_opener", "provenance", "trailer", "session_stamp")
 BAD_CONCLUSIONS = {"failure", "timed_out"}
 FACTS_VERSION = 11
 COMPUTE_VERSION = 4  # compute caches: entries written before this could be marked complete from a partial timeline or commit read
-CHECKS_VERSION = 2  # derived correctness caches: entries written before this (incomplete pagination read as clean) are read again
+CHECKS_VERSION = 3  # derived check caches: v2 entries (incomplete pagination read as clean, latest run by start) are read again
 ESCAPE_WINDOW = dt.timedelta(days=14)
 HORIZON = dt.timedelta(hours=48)
 MIN_SAMPLE = 50
@@ -745,8 +745,9 @@ STUCK_AFTER = dt.timedelta(hours=3)  # a run still queued or running this long a
 def commit_state(rd, sha, age=None):
     """The check state of one commit: {"red": contexts failing, "green": contexts succeeding, "settled": every page read and
     every run finished}. A context's latest run (by start) decides it. A run that has not finished `STUCK_AFTER` after the
-    push (`age`) is stuck (GitHub keeps phantom queued runs for days) and says nothing: it is neither red nor green and does
-    not hold the commit open. Cached only when every run finished: a stuck run can still finish later.""" 
+    push (`age`) and `STUCK_AFTER` after its own start is stuck (GitHub keeps phantom queued runs for days) and says
+    nothing: it is neither red nor green and does not hold the commit open; a rerun queued minutes ago on an old push is
+    pending. Cached only when every run finished: a stuck run can still finish later.""" 
     cached = rd.load("cstate", sha)
     if cached is not None and cached.get("v") == CHECKS_VERSION:
         return cached
@@ -756,8 +757,16 @@ def commit_state(rd, sha, age=None):
         k = c["name"]
         if k not in latest or run_order(c) > run_order(latest[k]):
             latest[k] = c
-    stuck = age is not None and age >= STUCK_AFTER
-    st = {"v": CHECKS_VERSION, "settled": bool(complete and latest and (stuck or all(c.get("status") == "completed" for c in latest.values()))),
+    now = dt.datetime.now(UTC)
+
+    def done_or_stuck(c):
+        if c.get("status") == "completed":
+            return True
+        if age is None or age < STUCK_AFTER:
+            return False
+        return not c.get("started_at") or now - iso(c["started_at"]) >= STUCK_AFTER
+
+    st = {"v": CHECKS_VERSION, "settled": bool(complete and latest and all(done_or_stuck(c) for c in latest.values())),
           "red": sorted(k for k, c in latest.items() if c.get("status") == "completed" and c.get("conclusion") in BAD_CONCLUSIONS),
           "green": sorted(k for k, c in latest.items() if c.get("status") == "completed" and c.get("conclusion") == "success")}
     if st["settled"] and all(c.get("status") == "completed" for c in latest.values()):
@@ -829,6 +838,27 @@ def main_red_episodes(chron, states, pr_by_sha):
     return episodes, skipped
 
 
+def head_red_at(rd, sha, at):
+    """The contexts red on a PR head when it merged: each context's newest run that had finished by `at`. A rerun after
+    the merge does not rewrite history. None when the runs could not be read in full or none had finished by then."""
+    key = f"{sha}@{at}"
+    cached = rd.load("headred", key)
+    if cached is not None and cached.get("v") == CHECKS_VERSION:
+        return set(cached["red"])
+    runs, complete = rd.pages(f"commits/{sha}/check-runs", key="check_runs", max_pages=5)
+    latest = {}
+    for c in runs:
+        done_at = c.get("completed_at") or c.get("started_at")  # the API always sets completed_at on a completed run
+        if c.get("status") == "completed" and (done_at is None or done_at <= at):
+            if c["name"] not in latest or run_order(c) > run_order(latest[c["name"]]):
+                latest[c["name"]] = c
+    if not complete or not latest:
+        return None
+    red = {k for k, c in latest.items() if c.get("conclusion") in BAD_CONCLUSIONS}
+    rd.save("headred", key, {"v": CHECKS_VERSION, "red": sorted(red)})
+    return red
+
+
 def attributable_pushes(chron, states):
     """The pushes whose effect on the base is known: settled, with a settled push right before them. A PR whose merge
     commit is not one of these (absent from the listing, unsettled, first in the window, or after a skipped push) has
@@ -886,8 +916,8 @@ def detect_main_red(rd, base_commits, merged_list, now=None):
         p = by_sha.get(ep["start_sha"])
         ep["head_red_same_context"] = None
         if p and ep["pr"]:
-            hs = commit_state(rd, p["head"]["sha"])
-            ep["head_red_same_context"] = bool(set(hs["red"]) & set(ep["contexts"])) if hs["settled"] else None
+            red = head_red_at(rd, p["head"]["sha"], p["merged_at"])
+            ep["head_red_same_context"] = bool(red & set(ep["contexts"])) if red is not None else None
     return episodes, skipped, untracked_contexts(chron, states), attributable_pushes(chron, states)
 
 
@@ -1006,7 +1036,7 @@ def change_failure_summary(merged):
     cf = [e for e in eps if e["head_red_same_context"]]  # merged red on its own final head, and main went red after: a change failure
     return {"merged": len(merged), "unknown": len(merged) - len(known),
             "prs_that_started_red": sum(1 for r in known if r["main_red"]), "episodes": len(eps),
-            "change_failures": len(cf), "other_post_merge_red": len(eps) - len(cf),
+            "change_failures": len(cf), "other_post_merge_red": sum(1 for e in eps if e["head_red_same_context"] is False),
             "minutes_to_green": sorted(e["minutes_to_green"] for e in cf if e["minutes_to_green"] is not None),
             "unresolved": sum(1 for e in cf if e["minutes_to_green"] is None),
             "head_red_same_context": len(cf), "head_red_unknown": sum(1 for e in eps if e["head_red_same_context"] is None)}
@@ -1601,14 +1631,14 @@ def markdown(e2e):
               "(the push's PR is the fixer). Counts and raw minutes to green are printed, with no rate and no median. `Other post-merge red` are episodes the PR's merge started "
               "whose head was green in that context: base red that a merge may not have caused (a flake, an interaction, a post-merge job); they are listed apart and not counted as change failures. "
               "Recall is known incidents found over known incidents expected. Pushes are ordered by parents, pushes with unsettled checks are skipped, and contexts that flap or appear once are not tracked.", "",
-              "| repo | merged | change failures | minutes to green (each) | unresolved | other post-merge red | recall k/n | unknown attribution |", "|---|---|---|---|---|---|---|---|"]
+              "| repo | merged | change failures | minutes to green (each) | unresolved | other post-merge red | head unknown | recall k/n | unknown attribution |", "|---|---|---|---|---|---|---|---|---|"]
         for repo, s_ in sorted(e2e["window"]["per_repo"].items()):
             cf, ctl = s_["change_failure"], e2e["repos"][repo]["controls"]
             inc = ctl.get("incident", {"found": 0, "expected": 0})
             off = "change_failure" in ctl["disabled"]
             W = "withheld"
             L.append(f"| {repo} | {cf['merged']} | {W if off else cf['change_failures']} | {W if off else ', '.join(str(x) for x in cf['minutes_to_green']) or '-'} | "
-                     f"{W if off else cf['unresolved']} | {W if off else cf['other_post_merge_red']} | {inc['found']}/{inc['expected']} | {cf['unknown']} |")
+                     f"{W if off else cf['unresolved']} | {W if off else cf['other_post_merge_red']} | {W if off else cf['head_red_unknown']} | {inc['found']}/{inc['expected']} | {cf['unknown']} |")
         for repo, v in sorted(e2e["repos"].items()):
             u = (v.get("main_red") or {}).get("untracked_contexts")
             if u and (u["noisy"] or u["one_off"]):

@@ -440,6 +440,17 @@ class CommitState(Base):
         red, settled = pm.commit_red(self.rd(runs), "s7", {"T"})
         self.assertEqual((red, settled), (set(), False))
 
+    def test_a_rerun_queued_minutes_ago_on_an_old_push_is_pending_not_stuck(self):
+        fresh = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        runs = [{"id": 1, "name": "T", "status": "completed", "conclusion": "success", "started_at": T(10, "10:00")},
+                {"id": 2, "name": "T", "status": "queued", "conclusion": None, "started_at": fresh}]
+        self.assertFalse(pm.commit_state(self.rd(runs), "s8", dt.timedelta(hours=30))["settled"])
+
+    def test_a_check_cache_from_before_the_rerun_ordering_is_read_again(self):
+        rd = self.rd(self.RUNS)
+        rd.save("cstate", "s9", {"v": 2, "settled": True, "red": ["Old"], "green": []})
+        self.assertEqual(pm.commit_state(rd, "s9", dt.timedelta(hours=5))["red"], ["Bad"])
+
     def test_a_context_seen_on_one_push_only_is_not_tracked_but_a_recurring_one_is(self):
         st = lambda red=(), green=(): {"settled": True, "red": sorted(red), "green": sorted(green)}
         chron = [("a", T(10, "10:00")), ("b", T(10, "10:10")), ("c", T(10, "10:20"))]
@@ -565,6 +576,20 @@ class MainRedReads(Base):
             s = out["repos"][REPO]["per_day"]["2026-11-10"]["change_failure"]
             self.assertEqual((s["change_failures"], s["other_post_merge_red"], s["episodes"], s["minutes_to_green"] if cf else []), (cf, other, 1, [60.0] if cf else []))
 
+    def test_the_head_verdict_is_the_one_in_force_at_the_merge(self):
+        a, b = self.merged()
+        gh = self.world(a, b, self.base(a, b), False)
+        later_red = [{"id": 1, "name": "Test", "status": "completed", "conclusion": "success", "started_at": T(10, "09:30"), "completed_at": T(10, "09:40")},
+                     {"id": 2, "name": "Test", "status": "completed", "conclusion": "failure", "started_at": T(10, "12:00"), "completed_at": T(10, "12:10")}]
+        gh.routes = [(rf"commits/{a['head']['sha']}/check-runs", {"check_runs": later_red})] + gh.routes
+        with tempfile.TemporaryDirectory() as d:
+            out = pm.build([REPO], d, 500, OWNER, START, NOW, {}, {}, None, gh, controls={}, control=False)
+        self.assertIs(out["repos"][REPO]["main_red"]["episodes"][0]["head_red_same_context"], False)  # the 12:10 rerun came after the 10:00 merge
+
+    def test_an_unknown_head_is_neither_a_change_failure_nor_other_post_merge_red(self):
+        s = pm.change_failure_summary([{"main_red": [{"contexts": ["T"], "minutes_to_green": 5.0, "fixer_pr": 2, "head_red_same_context": None}]}])
+        self.assertEqual((s["change_failures"], s["other_post_merge_red"], s["head_red_unknown"]), (0, 0, 1))
+
     def test_a_missed_known_incident_fails_the_control_and_withholds_change_failure_only(self):
         a, b = self.merged()
         with tempfile.TemporaryDirectory() as d:
@@ -609,7 +634,7 @@ class MainRedReads(Base):
             out = pm.build([REPO], d, 500, OWNER, START, NOW, {}, {}, None, self.world(a, b, self.base(a, b), True), controls={REPO: {"incident": [(1, 2)]}}, control=False)
         md = pm.markdown(out)
         self.assertIn("### Change failures: merges that went to main red (window)", md)
-        self.assertIn(f"| {REPO} | 2 | 1 | 60.0 | 0 | 0 | 1/1 | 0 |", md)
+        self.assertIn(f"| {REPO} | 2 | 1 | 60.0 | 0 | 0 | 0 | 1/1 | 0 |", md)
         self.assertNotIn("not tracked:", md)  # nothing untracked in this small world
         out["repos"][REPO]["main_red"]["untracked_contexts"] = {"noisy": ["review-verdict"], "one_off": ["x", "y"]}
         self.assertIn(f"- {REPO}: not tracked: noisy gates review-verdict; 2 one-off contexts", pm.markdown(out))
