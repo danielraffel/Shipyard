@@ -361,6 +361,16 @@ an already-open wrapper may still require its release-matched helper, binary,
 or context. Generation garbage collection is a separate reader-aware operation,
 not part of rollout or rollback.
 
+On macOS the transaction refuses to activate a staged Shipyard binary that is
+not the Developer ID release (identifier `shipyard`, team `95CX6P84C4`),
+checked with `/usr/bin/codesign --verify --strict -R=...` before anything
+public moves. Privacy grants follow that identity, so another binary would
+raise prompts on an unattended host. The refusal exits 78, the receipt says
+`refused to activate: ...`, and the previous generation stays selected.
+`shipyard doctor` (`release-identity`) and `shipyard fleet status` (the
+per-host `shipyard:` line) report the active binary against the same
+requirement.
+
 Older fleet-update releases v0.100.0 through v0.130.x used the legacy
 four-target transaction and nine-line recovery journal, with no resolver
 context or unsupported probe; the current client does not target them.
@@ -555,6 +565,24 @@ SHIPYARD_INSTALL_DIR="${HOME}/mytools/bin" bash install.sh
 | Linux | x64 | `shipyard-linux-x64`, `shipyard-workstream-provider-linux-x64` |
 | Linux | ARM64 | `shipyard-linux-arm64`, `shipyard-workstream-provider-linux-arm64` |
 
+On macOS, `install.sh` and `shipyard update` install only the Developer ID
+release. Each binary must pass `/usr/bin/codesign --verify --strict` against
+the release's designated requirement: its identifier (`shipyard` or
+`shipyard-workstream-provider`), an Apple-anchored Developer ID Application
+certificate, and team `95CX6P84C4`. macOS privacy (TCC) grants follow that
+identity, so any other binary, such as an ad-hoc signed or local build, is a
+new identity and raises privacy prompts again; on an unattended host nobody
+answers them and the work behind them stalls. A binary that fails is not
+installed, and the previous install stays in place:
+- `install.sh` checks the staged binaries before the swap and the installed
+  ones after it, and its rollback restores the previous pair;
+- `shipyard update` runs the target tag's own installer, which may predate
+  that check, so it snapshots the installed pair first, checks what the
+  installer left, and restores the snapshot on a failure.
+
+The installer no longer re-signs anything ad hoc, neither a binary without a
+Developer ID team nor a notarized binary that would not launch.
+
 Intel Macs (x86_64) are not supported from v0.50.0 onward. Apple Silicon only. Older releases (v0.44.0–v0.49.0) that shipped Intel dmgs remain installable by pinning `SHIPYARD_VERSION`; `install.sh` on an Intel Mac surfaces a clear "unsupported" message instead of a 404 on v0.50.0+.
 
 ## Build from source
@@ -595,7 +623,16 @@ ln -sf ~/.local/bin/shipyard ~/.local/bin/sy
 ```
 
 Only do this intentionally: Claude Code, Codex, the macOS GUI, and
-project pinners all treat `~/.local/bin/shipyard` as canonical.
+project pinners all treat `~/.local/bin/shipyard` as canonical. A local
+build is not the Developer ID release, so macOS treats it as a new privacy
+identity and asks again for every protected location it touches.
+
+**Owner-only developer mode.** `SHIPYARD_INSTALL_ALLOW_UNSIGNED_DEV=1` lets
+`install.sh` (for example with `SHIPYARD_SKIP_DOWNLOAD=1` over a copied
+local build) and `shipyard update` install a binary that is not the
+Developer ID release. In that mode `install.sh` also re-signs ad hoc as it
+used to. It is for the repository owner at an interactive terminal only.
+Agents, scripts, LaunchAgents and fleet hosts never set it.
 
 ## Requirements and optional tools
 

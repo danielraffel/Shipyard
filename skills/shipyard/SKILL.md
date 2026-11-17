@@ -1782,6 +1782,16 @@ matching: `gh … --help | grep -q` under `pipefail` fails whenever grep exits
 first and gh dies of SIGPIPE (exit 141), which silently skipped the flag and
 left `api …/logs` refused after release.
 
+On macOS, `install.sh` and `shipyard update` install only the Developer ID
+release (identifier `shipyard` / `shipyard-workstream-provider`, team
+`95CX6P84C4`, checked with `/usr/bin/codesign --verify --strict -R=...`). A
+binary that fails is not installed and the previous pair stays. `shipyard
+update` snapshots the installed pair before running the target tag's
+installer, which may predate the check, and restores it on a failure
+(`src/app/update_cmd/install_identity.rs`). install.sh no longer re-signs ad
+hoc. The owner-only developer mode is documented in docs/install.md; agents
+never use it.
+
 `shipyard update` never installs the ghapp wrapper: `~/.local/bin/ghapp` runs
 the generation named by `~/.local/bin/ghapp.shipyard-generation`, and only
 `shipyard runner fleet-update` publishes a generation and moves that selector.
@@ -1799,6 +1809,26 @@ first failure. The release's install.sh installs the controller-staged asset
 through a curl shim that also serves a `checksums.sha256` with the SHA-256 the
 controller pinned, so an install.sh that refuses releases without a checksums
 manifest still installs over fleet-update.
+
+On macOS the transaction **activates only the Developer ID release**. Right
+after the release binary is staged, and before anything public moves, it runs
+`/usr/bin/codesign --verify --strict -R=<requirement>` on it. The requirement
+is identifier `shipyard`, an Apple-anchored Developer ID Application
+certificate, team `95CX6P84C4` (`src/release_identity.rs`). macOS privacy
+(TCC) grants follow that identity, so any other binary, such as an
+installer's ad-hoc re-sign or a local build, would be a new identity that
+raises prompts nobody answers on an unattended host. A binary that fails the
+check, or a missing codesign, exits 78 with
+`SHIPYARD_FLEET_ACTIVATION_REFUSED=not-developer-id-release`. The receipt says
+`refused to activate: ...`, the stage and lock are released, and the active
+generation stays selected. There is no override. The install runs with
+`SHIPYARD_NO_ADHOC_FALLBACK=1`, so install.sh never strips the release
+signature to get a binary to launch. `shipyard doctor` reports the active
+`~/.local/bin/shipyard` against the same requirement (`release-identity`,
+advisory). `shipyard fleet status` prints one `shipyard:` line per host: the
+version, whether it is the Developer ID release, and that host's TartCI
+tool-freshness verdict (`current`/`behind` and the latest release). The line
+is informational and never makes a host unroutable.
 
 Every applied host is then **independently verified** in a fresh process:
 - the installed `shipyard --version` must equal the target;
@@ -5927,6 +5957,19 @@ description, from a status bound to its rule's app (an unbound rule never
 qualifies), passes `merge_steward::review_waiting` ("needs N counted
 APPROVEs of head <head>", "awaiting reviewer verdict for head <head>",
 bound to this head; no `hold`/`held by` in any case), else `required_failed`.
+A non-approval review status (`release-path-review`) whose bound status says
+`a HOLD names head <head>` (`merge_steward::review_hold`; `(comment <id>)`
+gives `held_by`) is `held:<context>` (repair lane), and `waiting_review_status`
+drops it from the red-everywhere count too: a HOLD is that PR's own review
+outcome. `review_quarantine::annotate` (run in `apply_repo_plan` before the
+dwell pass) turns a reviewer-waiting row (`no_verdict`, `awaiting_review`,
+`waiting_head_approval`, or `required_pending` on the approval context alone)
+whose exact head the pass-runner quarantine file lists
+(`scheduling_loop::read_quarantine`; path from `SHIPYARD_REVIEW_QUARANTINE`, then `[loop] review_quarantine_file`, then `~/.local/share/shipyard-steward/pass-runner/review-quarantine.txt`; a missing file is no quarantine) into `review_quarantined`, actor author,
+with the first line of the newest `Review quarantine diagnosis:` comment since
+the quarantine as its detail (one comments read per quarantined head only;
+the comment is untrusted text and only fills the detail). The loop state is
+still `quarantined`.
 `src/app/merge_steward_cmd/scheduling_loop.rs`: the loop contract
 (docs/scheduling-loop.md). `state_for` maps a row to one `LoopState` (precedence
 `merge_group_stalled` > `Queued` decision or `queued`/`admitted` > quarantined at

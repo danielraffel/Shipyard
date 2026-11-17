@@ -2216,6 +2216,7 @@ mod red_base_ejections;
 mod red_everywhere;
 mod render;
 mod resume_record;
+mod review_quarantine;
 mod scheduling_loop;
 mod shadow_ledger;
 mod stale_merge_ref;
