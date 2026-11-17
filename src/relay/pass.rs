@@ -245,6 +245,19 @@ fn run_repo(
         .map(|t| t.pr)
         .collect();
     let mut read = super::fetch(input.gh, repo, &live, true)?;
+    // A tracked pull request outside the discovery page (the newest 100) is
+    // read by number: its own body carries any marker.
+    let own_markers: Vec<(u64, String)> = read
+        .prs
+        .iter()
+        .filter_map(|(number, node)| {
+            let body = node.as_ref()?.get("body")?.as_str()?;
+            (!read.markers.contains_key(number)
+                && owner_registry::parse_marker(repo, *number, body).is_some())
+            .then(|| (*number, body.to_owned()))
+        })
+        .collect();
+    read.markers.extend(own_markers);
     // A marker-sourced owner whose marker is gone from the body is forgotten.
     for tracked in state.prs.values_mut().filter(|t| t.repo == repo) {
         if tracked
