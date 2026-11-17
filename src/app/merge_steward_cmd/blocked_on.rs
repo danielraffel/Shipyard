@@ -1042,9 +1042,16 @@ fn waiting_required(
     // A context that has not appeared yet while runs from the same source are
     // still queued or running is pending (a job that `needs:` another has not
     // started); only an absent context with nothing in flight never ran.
+    //
+    // A review status (`review-verdict` is `pending` while the head awaits its
+    // reviewer) is produced by another workflow and says nothing about whether
+    // this context's workflow started: counting it kept a head whose CI never
+    // started at all (a base retarget with no `edited` trigger) reading "checks
+    // running, do not push".
     let in_flight = |required: &crate::merge_steward::RequiredCheck| {
         pr.checks.iter().any(|check| {
             !check.status.eq_ignore_ascii_case("COMPLETED")
+                && !crate::merge_steward::is_review_gate(&check.name, &policy.approval_context)
                 && required
                     .app_id
                     .is_none_or(|app_id| check.app_id == Some(app_id))

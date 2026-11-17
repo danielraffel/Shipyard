@@ -2009,3 +2009,72 @@ esac
         assert_eq!(reports[0].blocked.blocked_on, token);
     }
 }
+
+/// Shipyard #1457 at 577d982b: a base retarget started no `Test macOS ARM64`
+/// run, and the only thing in flight was the `review-verdict` status, pending
+/// while the head awaits its reviewer. That is another workflow's wait, so the
+/// row is `required_never_ran`, not `required_pending` ("checks running, do
+/// not push"). A required job that really is still running keeps it pending.
+#[test]
+fn a_pending_review_status_does_not_hide_a_required_check_that_never_ran() {
+    let policy = app_bound_policy(&["macos", "review-verdict"]);
+    let mut pr = pr_with(1457, &[], "BLOCKED", &json!([]));
+    pr.fact.checks.push(StewardCheck {
+        status: "PENDING".to_owned(),
+        conclusion: None,
+        ..review_status(Some("no reviewer verdict names head aaaaaaaaaaaa"))
+    });
+    let decision = classify_pr(&pr.fact, &policy, &BTreeMap::new());
+    let classify_row = |pr: &ObservedPr| {
+        classify(
+            &RowFacts {
+                pr: &pr.fact,
+                decision: &decision,
+                mutation: None,
+                error: None,
+                approval: GateRead::Unread,
+                enqueued_at: None,
+                ejection: None,
+            },
+            &policy,
+        )
+        .0
+    };
+    let stall = classify_row(&pr);
+    assert_eq!(stall.blocked_on, "required_never_ran:macos", "{stall:?}");
+    let next = crate::app::merge_steward_cmd::next_action::for_row(
+        &crate::app::merge_steward_cmd::next_action::RowContext {
+            repo: "danielraffel/Shipyard",
+            base: "main",
+            pr: &pr.fact,
+            policy: &policy,
+            error: None,
+        },
+        &stall,
+    );
+    assert!(next.action.contains("CI never started"), "{}", next.action);
+    // Control: a non-review job still running keeps it pending.
+    let mut running = pr.clone();
+    running.fact.checks.push(StewardCheck {
+        name: "some-upstream-job".to_owned(),
+        source: StewardCheckSource::CheckRun,
+        status: "IN_PROGRESS".to_owned(),
+        conclusion: None,
+        ..review_status(None)
+    });
+    let decision_running = classify_pr(&running.fact, &policy, &BTreeMap::new());
+    let pending = classify(
+        &RowFacts {
+            pr: &running.fact,
+            decision: &decision_running,
+            mutation: None,
+            error: None,
+            approval: GateRead::Unread,
+            enqueued_at: None,
+            ejection: None,
+        },
+        &policy,
+    )
+    .0;
+    assert_eq!(pending.blocked_on, "required_pending", "{pending:?}");
+}
