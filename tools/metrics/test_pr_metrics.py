@@ -444,6 +444,14 @@ class BaseOrder(unittest.TestCase):
         commits = [self.c("c", "b", T(10, "10:00")), self.c("a", "base", T(10, "12:00")), self.c("b", "a", T(10, "09:00")), self.c("base", None, T(10, "08:00"))]
         self.assertEqual([x["sha"] for x in pm.base_order(commits)], ["base", "a", "b", "c"])
 
+    def test_a_merged_branchs_own_commits_are_not_base_pushes(self):
+        # main: base -> m1 (merge of PR branch b1 <- b2, where b2 merged main) -> m2. The listing returns b1 and b2 too.
+        def mc(sha, parents, date):
+            return {"sha": sha, "parents": [{"sha": p} for p in parents], "commit": {"committer": {"date": date}}}
+        commits = [mc("m2", ["m1"], T(10, "12:00")), mc("m1", ["base", "b2"], T(10, "11:00")), mc("b2", ["b1", "base"], T(10, "10:30")),
+                   mc("b1", ["base"], T(10, "10:00")), mc("base", [], T(10, "08:00"))]
+        self.assertEqual([x["sha"] for x in pm.base_order(commits)], ["base", "m1", "m2"])
+
     def test_without_parents_or_with_a_forked_history_it_falls_back_to_commit_date(self):
         plain = [commit("y", date=T(10, "11:00")), commit("x", date=T(10, "10:00"))]
         self.assertEqual([x["sha"] for x in pm.base_order(plain)], ["x", "y"])

@@ -818,23 +818,23 @@ def commit_date_str(c):
 
 def base_order(commits):
     """The base's pushes, oldest first. A merge queue fast-forwards the base, so each commit keeps its own (older) date
-    and dates mis-order pushes: follow first-parent links when every commit carries them and they form one chain, else
-    fall back to commit date (test fixtures and API answers without parents)."""
+    and dates mis-order pushes: follow first-parent links when every commit carries them, else fall back to commit date
+    (test fixtures and API answers without parents). Listing a base that takes merge commits also returns the commits
+    of every merged branch (a PR's own commits and its merges of main), which never were base pushes and carry the PR's
+    own check runs: only the first-parent chain from the one tip is the base. More than one tip (a forked history)
+    falls back to commit date."""
     by = {c["sha"]: c for c in commits}
     if commits and all(c.get("parents") is not None for c in commits):
-        child, roots = {}, []
-        for c in commits:
-            ps = [p["sha"] for p in c["parents"]]
-            if ps and ps[0] in by:
-                child.setdefault(ps[0], []).append(c["sha"])
-            else:
-                roots.append(c["sha"])
-        if len(roots) == 1 and all(len(v) == 1 for v in child.values()):
-            order = [roots[0]]
-            while order[-1] in child:
-                order.append(child[order[-1]][0])
-            if len(order) == len(commits):
-                return [by[x] for x in order]
+        referenced = {p["sha"] for c in commits for p in c["parents"]}
+        tips = [c["sha"] for c in commits if c["sha"] not in referenced]
+        if len(tips) == 1:
+            order = [tips[0]]
+            while True:
+                ps = by[order[-1]]["parents"]
+                if not ps or ps[0]["sha"] not in by:
+                    break
+                order.append(ps[0]["sha"])
+            return [by[x] for x in reversed(order)]
     return sorted(commits, key=commit_date_str)
 
 
