@@ -120,7 +120,7 @@ prints ejections, ejections per merged PR, the top cause and the unknown-cause c
 ## HOLDs and repair rounds
 
 A repair round is a push after a HOLD and before the next HOLD or the merge. The report prints, over the HOLDs of
-merged PRs, the mean repair pushes per HOLD and the HOLDs with no push at all, next to the re-HOLD rate. When no
+merged PRs posted before their merge, the mean repair pushes per HOLD and the HOLDs with no push at all, next to the re-HOLD rate over the same merged PRs. A push's time is its commit's committer date, as for the agent-push counts (the timeline records no time for a plain push), so a fix committed before a HOLD and pushed after it counts as a push before the HOLD. When no
 PR's compute was read, runs per merged PR prints `withheld (compute not read)` instead of an empty cell.
 
 ## Sample and comparison

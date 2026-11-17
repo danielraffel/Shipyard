@@ -807,12 +807,22 @@ class HoldRounds(Base):
         self.assertEqual(pm.hold_rounds(self.f([], [T(10, "10:10")])), [])
         self.assertIsNone(pm.hold_rounds(self.f([T(10, "10:00")], [], merged=None)))
 
+    def test_a_hold_posted_after_the_merge_is_not_counted(self):
+        self.assertEqual(pm.hold_rounds(self.f([T(10, "10:00"), T(10, "12:30")], [T(10, "10:10")])), [1])
+
+    def test_the_re_hold_rate_in_the_hold_table_is_over_the_same_merged_prs(self):
+        rows = [{"hold_rounds": [1, 1], "re_holds": 1}, {"hold_rounds": [0], "re_holds": 0}]
+        got = pm.hold_round_summary(rows)
+        self.assertEqual((got["prs_with_hold"], got["re_hold_rate_pct"]), (2, 50.0))
+
     def test_a_push_at_the_merge_minute_counts_and_one_after_it_does_not(self):
         self.assertEqual(pm.hold_rounds(self.f([T(10, "10:00")], [T(10, "12:00"), T(10, "12:01")])), [1])
 
     def test_the_summary_pools_holds_across_prs(self):
         rows = [{"hold_rounds": [2, 0]}, {"hold_rounds": []}, {"hold_rounds": None}, {"hold_rounds": [1]}]
-        self.assertEqual(pm.hold_round_summary(rows), {"holds": 3, "pushes_after_holds": 3, "mean": 1.0, "holds_without_push": 1})
+        got = pm.hold_round_summary(rows)
+        self.assertEqual({k: got[k] for k in ("holds", "pushes_after_holds", "mean", "holds_without_push", "prs_with_hold")},
+                         {"holds": 3, "pushes_after_holds": 3, "mean": 1.0, "holds_without_push": 1, "prs_with_hold": 2})
         self.assertEqual(pm.hold_round_summary([])["mean"], None)
 
     def test_the_report_prints_the_hold_table_and_withholds_runs_when_compute_was_not_read(self):

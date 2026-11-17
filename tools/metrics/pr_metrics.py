@@ -681,7 +681,7 @@ def hold_rounds(f):
     m = iso(f.get("merged_at"))
     if not m:
         return None
-    holds = sorted(iso(x) for x in f.get("hold_times") or [] if iso(x))
+    holds = sorted(iso(x) for x in f.get("hold_times") or [] if iso(x) and iso(x) < m)  # a HOLD posted after the merge held nothing
     pushes = sorted(iso(x) for x in f.get("push_times") or [] if iso(x))
     return [sum(1 for p in pushes if h < p <= (holds[i + 1] if i + 1 < len(holds) else m)) for i, h in enumerate(holds)]
 
@@ -1127,8 +1127,12 @@ def hold_round_summary(merged):
     """Over the HOLDs of merged PRs: how many there were, the mean repair pushes after each, and the HOLDs the PR merged
     past (or was followed by another HOLD) without a single push."""
     per = [n for r in merged for n in (r.get("hold_rounds") or [])]
+    held = [r for r in merged if r.get("hold_rounds")]
+    rehold = [r for r in held if r.get("re_holds")]
     return {"holds": len(per), "pushes_after_holds": sum(per), "mean": None if not per else round(sum(per) / len(per), 2),
-            "holds_without_push": sum(1 for n in per if n == 0)}
+            "holds_without_push": sum(1 for n in per if n == 0),
+            # the same merged cohort as the HOLD counts, so the table's columns describe one population
+            "prs_with_hold": len(held), "re_hold_rate_pct": pct_of(len(rehold), len(held)), "re_hold_rate_ci95": wilson(len(rehold), len(held))}
 
 
 def change_failure_summary(merged):
@@ -1774,8 +1778,8 @@ def markdown(e2e):
               "A repair round is a push after a HOLD and before the next HOLD or the merge. The re-HOLD rate is the share of PRs with a HOLD that got another HOLD after a repair.", "",
               "| repo | PRs with a HOLD | HOLDs | repair pushes per HOLD | HOLDs with no push | re-HOLD rate (CI95) |", "|---|---|---|---|---|---|"]
         for repo, s_ in sorted(e2e["window"]["per_repo"].items()):
-            r, h = s_["rounds"], s_["rounds"]["repair_rounds_per_hold"]
-            L.append(f"| {repo} | {r['prs_with_hold']} | {h['holds']} | {h['mean']} | {h['holds_without_push']} | {r['re_hold_rate_pct']}% ({ci(r['re_hold_rate_ci95'])}) |")
+            h = s_["rounds"]["repair_rounds_per_hold"]
+            L.append(f"| {repo} | {h['prs_with_hold']} | {h['holds']} | {h['mean']} | {h['holds_without_push']} | {h['re_hold_rate_pct']}% ({ci(h['re_hold_rate_ci95'])}) |")
         L.append("")
     nf = (e2e.get("baseline") or {}).get("noise_floor")
     if nf:
