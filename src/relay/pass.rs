@@ -398,9 +398,11 @@ fn run_repo(
             if !unowned {
                 seeded = super::actionable_now(&digest);
             }
-            tracked
-                .pending
-                .retain(|event| !unowned && matches!(event, RelayEvent::Ejected { .. }));
+            tracked.pending.retain(|event| {
+                !unowned
+                    && matches!(event, RelayEvent::Ejected { .. })
+                    && super::needs_an_owner(event, &digest)
+            });
         }
         // With no owner the lead hears only what needs an author, judged by
         // the state now, every pass: a history to compare with would miss a
@@ -410,10 +412,10 @@ fn run_repo(
         // an unowned event carries no sequence number).
         if unowned {
             tracked.pending.retain(|event| {
-                matches!(
-                    event,
-                    RelayEvent::Overdue { .. } | RelayEvent::Ejected { .. }
-                ) && super::needs_an_owner(event, &digest)
+                // Overdue rows are re-read from the steward each pass, so a
+                // queued one is stale by definition; an ejection is an edge
+                // that is kept while it still describes the pull request.
+                matches!(event, RelayEvent::Ejected { .. }) && super::needs_an_owner(event, &digest)
             });
         }
         let mut events: Vec<RelayEvent> = if unowned {
