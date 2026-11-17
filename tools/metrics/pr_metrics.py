@@ -70,8 +70,9 @@ DEFAULT_CONTROLS = {  # "owner": [pr, ...] pins PRs with a hand-verified owner a
     "danielraffel/fleet-handbook": {"revert": [(119, 124)], "escape": [(116, 126)]},
     "Generous-Corp/pulp": {"escape": [(12219, 12375), (12338, 12384)]},
     # hand-verified main-red incident: #1459's merge 71c87fcd turned `Python helper tests [github-hosted]` red on main,
-    # #1462's merge 22f19c07 turned it green (check runs read 2026-11-17)
-    "danielraffel/Shipyard": {"incident": [(1459, 1462)]},
+    # #1462's merge 22f19c07 turned it green, and #1459's own head f9bf6b3c was green there at merge (check runs read
+    # 2026-11-17): other post-merge red, not a change failure. (escaped, fixer[, head red at merge])
+    "danielraffel/Shipyard": {"incident": [(1459, 1462, False)]},
 }
 # Labels that take a PR out of the eligible cohort, with the reason reported.
 # The gate-proof workflows whose runs per merged PR are reported by name, per repo; any other repo shows its busiest workflows.
@@ -785,21 +786,23 @@ NOISY_MIN_PUSHES = 20  # ... judged only over at least this many pushes, so a sh
 
 
 def untracked_contexts(chron, states):
-    """Contexts the detector does not follow: `one_off` (seen on a single push, a per-version or per-event name that can
-    never turn green again) and `noisy` (turns red, from green or absent, on NOISY_RED_STARTS or more of the pushes it
+    """Contexts the detector does not follow: `one_off` (seen on a single push that is not the newest settled one, a
+    per-version or per-event name that can never turn green again; a context new on the newest push is kept until a
+    later push shows whether it recurs) and `noisy` (turns red, from green or absent, on NOISY_RED_STARTS or more of the pushes it
     appears on: review-verdict and the reviewer judge are PR gates that flap on a merge-queue base). It counts turns,
     not red pushes, so one sustained break that stays red for many pushes is still followed."""
-    seen, starts, was_red = collections.Counter(), collections.Counter(), set()
+    seen, starts, was_red, last = collections.Counter(), collections.Counter(), set(), set()
     for sha, _ in chron:
         st = states.get(sha)
         if st and st.get("settled"):
-            for c in set(st["red"]) | set(st["green"]):
+            last = set(st["red"]) | set(st["green"])
+            for c in last:
                 seen[c] += 1
             red = set(st["red"])
             for c in red - was_red:
                 starts[c] += 1
             was_red = red
-    return {"one_off": sorted(c for c, n in seen.items() if n <= 1),
+    return {"one_off": sorted(c for c, n in seen.items() if n <= 1 and c not in last),
             "noisy": sorted(c for c, n in seen.items() if n >= NOISY_MIN_PUSHES and starts[c] / n >= NOISY_RED_STARTS)}
 
 
@@ -848,7 +851,8 @@ def head_states_at(rd, sha, at):
     cached = rd.load("headstate", key)
     if cached is not None and cached.get("v") == CHECKS_VERSION:
         return cached["states"]
-    runs, complete = rd.pages(f"commits/{sha}/check-runs", key="check_runs", max_pages=5)
+    # filter=all: the default (latest) drops a run superseded by a rerun after the merge
+    runs, complete = rd.pages(f"commits/{sha}/check-runs?filter=all", key="check_runs", max_pages=5)
     if not complete:
         return None
     latest = {}
@@ -1364,12 +1368,15 @@ def check_controls(repo, rows, controls, refused, main_red=None):
     # Known incidents: a PR whose merge turned a main context red and the PR that turned it green (the change-failure detector).
     out["incident"] = {"expected": 0, "found": 0, "not_in_window": 0}
     eps = (main_red or {}).get("episodes", [])
-    for escaped, fixer in c.get("incident", []):
+    for pin in c.get("incident", []):
+        escaped, fixer = pin[0], pin[1]
+        head = pin[2] if len(pin) > 2 else None
         if escaped not in by or not (main_red or {}).get("complete"):
             out["incident"]["not_in_window"] += 1
             continue
         out["incident"]["expected"] += 1
-        out["incident"]["found"] += any(e["pr"] == escaped and e["fixer_pr"] == fixer for e in eps)
+        out["incident"]["found"] += any(e["pr"] == escaped and e["fixer_pr"] == fixer and (head is None or e.get("head_red_same_context") is head)
+                                        for e in eps)
     # `refused` PRs were stopped by direct_merge_refused (a ruleset config gap), which says nothing about
     # whether the owner touched them, so they are only counted for context and never fail the control.
     for n in sorted(refused or ()):

@@ -495,7 +495,23 @@ class SustainedRed(unittest.TestCase):
 
 class IncidentControls(unittest.TestCase):
     def test_shipyard_carries_its_hand_verified_main_red_incident(self):
-        self.assertIn((1459, 1462), pm.DEFAULT_CONTROLS["danielraffel/Shipyard"]["incident"])
+        self.assertIn((1459, 1462, False), pm.DEFAULT_CONTROLS["danielraffel/Shipyard"]["incident"])
+
+    def test_an_incident_pinned_with_its_head_verdict_fails_when_the_head_is_classified_otherwise(self):
+        row = {"pr": 1, "north": None, "merged": True}
+        mr = {"complete": True, "episodes": [{"pr": 1, "fixer_pr": 2, "head_red_same_context": None}]}
+        found = lambda pin: pm.check_controls(REPO, [row], {REPO: {"incident": [pin]}}, None, mr)["incident"]["found"]
+        self.assertEqual((found((1, 2)), found((1, 2, False)), found((1, 2, None))), (1, 0, 1))
+
+
+class OneOff(unittest.TestCase):
+    def test_a_context_new_and_red_on_the_newest_push_is_followed(self):
+        st = lambda red=(), green=(): {"settled": True, "red": sorted(red), "green": sorted(green)}
+        chron = [("a", T(10, "10:00")), ("b", T(10, "10:10"))]
+        states = {"a": st(green=["T"]), "b": st(red=["New"], green=["T"])}
+        self.assertEqual(pm.untracked_contexts(chron, states)["one_off"], [])
+        eps, _ = pm.main_red_episodes(chron, states, {"a": 1, "b": 2})
+        self.assertEqual([(e["pr"], e["contexts"]) for e in eps], [(2, ["New"])])
 
 
 class BaseOrder(unittest.TestCase):
@@ -602,6 +618,13 @@ class MainRedReads(Base):
         with tempfile.TemporaryDirectory() as d:
             rd = pm.Reader(REPO, d, 50, lambda path: {"check_runs": runs})
             self.assertEqual(pm.head_states_at(rd, "h1", T(10, "10:00")), {"Test": "pending"})  # the rerun was running at the merge
+
+    def test_the_head_read_asks_for_every_run_not_only_the_latest(self):
+        paths = []
+        with tempfile.TemporaryDirectory() as d:
+            rd = pm.Reader(REPO, d, 50, lambda path: paths.append(path) or {"check_runs": []})
+            pm.head_states_at(rd, "h2", T(10, "10:00"))
+        self.assertTrue(paths and all("filter=all" in p for p in paths))
 
     def test_an_unknown_head_is_neither_a_change_failure_nor_other_post_merge_red(self):
         s = pm.change_failure_summary([{"main_red": [{"contexts": ["T"], "minutes_to_green": 5.0, "fixer_pr": 2, "head_red_same_context": None}]}])
