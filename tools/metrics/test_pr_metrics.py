@@ -836,6 +836,7 @@ class HoldRounds(Base):
         out = pm.build([REPO], tempfile.mkdtemp(), 50, OWNER, START, NOW, {}, {}, None, gh, control=False)
         md = pm.markdown(out)
         self.assertIn("### HOLDs and repair rounds (window, merged PRs)", md)
+        self.assertIn("| merged PRs not read in full |", md)
         self.assertIn("withheld (compute not read)", md)
 
 

@@ -1778,10 +1778,10 @@ def markdown(e2e):
     if e2e.get("window"):
         L += ["### HOLDs and repair rounds (window, merged PRs)", "",
               "A repair round is a push after a HOLD and before the next HOLD or the merge. The re-HOLD rate is the share of PRs with a HOLD that got another HOLD after a repair.", "",
-              "| repo | PRs with a HOLD | HOLDs | repair pushes per HOLD | HOLDs with no push | re-HOLD rate (CI95) |", "|---|---|---|---|---|---|"]
+              "| repo | PRs with a HOLD | HOLDs | repair pushes per HOLD | HOLDs with no push | re-HOLD rate (CI95) | merged PRs not read in full |", "|---|---|---|---|---|---|---|"]
         for repo, s_ in sorted(e2e["window"]["per_repo"].items()):
             h = s_["rounds"]["repair_rounds_per_hold"]
-            L.append(f"| {repo} | {h['prs_with_hold']} | {h['holds']} | {h['mean']} | {h['holds_without_push']} | {h['re_hold_rate_pct']}% ({ci(h['re_hold_rate_ci95'])}) |")
+            L.append(f"| {repo} | {h['prs_with_hold']} | {h['holds']} | {h['mean']} | {h['holds_without_push']} | {h['re_hold_rate_pct']}% ({ci(h['re_hold_rate_ci95'])}) | {h['prs_unread']} |")
         L.append("")
     nf = (e2e.get("baseline") or {}).get("noise_floor")
     if nf:
