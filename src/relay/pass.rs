@@ -321,6 +321,14 @@ fn run_repo(
             continue;
         }
         tracked.missing_passes = 0;
+        // A stored unowned pull request stays eligible only while the lead is
+        // configured and it is still an open, non-draft, unmarked one.
+        if tracked.owner.is_none()
+            && digest.state == "OPEN"
+            && (input.config.fallbacks(repo).lead.is_none() || !read.unmarked.contains(number))
+        {
+            continue;
+        }
         infer_actions(tracked, &digest, input.now, log);
         // Overdue rows are the steward's, at this exact head; the rest are
         // derived from the change since the last pass.
@@ -387,6 +395,10 @@ fn run_repo(
                 continue;
             }
             tracked.pending.push(event);
+        }
+        // Events queued while it had an owner are not the lead's to hear.
+        if unowned {
+            tracked.pending.retain(super::needs_an_owner);
         }
         // An overdue notice for a head that has since moved is stale.
         tracked.pending.retain(|event| match event {

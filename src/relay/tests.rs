@@ -1528,6 +1528,20 @@ fn an_unowned_pull_request_tells_the_lead_only_what_needs_an_author() {
 }
 
 #[test]
+fn an_unowned_pull_request_that_leaves_the_lead_scope_goes_quiet() {
+    let pr = Pr::open(543);
+    let mut h = unowned_harness(&pr, true);
+    h.pass(0, Mode::Send);
+    // The lead is removed: a later HOLD is nobody's to deliver through it.
+    h.config.repo.clear();
+    let mut held = pr.clone();
+    held.comments.push(verdict("HOLD", HEAD_A));
+    h.gh.set(held);
+    h.pass(1, Mode::Send);
+    assert!(h.deliveries().is_empty(), "{:?}", h.deliveries());
+}
+
+#[test]
 fn without_a_lead_an_unowned_pull_request_is_not_tracked() {
     let mut pr = Pr::open(543);
     pr.comments.push(verdict("HOLD", HEAD_A));
