@@ -371,7 +371,7 @@ fn run_repo(
                 .collect();
             tracked.pending.retain(|event| {
                 super::needs_an_owner(event, &digest)
-                    && (matches!(event, RelayEvent::Ejected { .. })
+                    && (matches!(event, RelayEvent::Ejected { .. }) && !digest.in_queue
                         || current.contains(&event.key(repo, *number)))
             });
         }

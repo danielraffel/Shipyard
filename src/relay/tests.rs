@@ -1651,6 +1651,26 @@ fn an_unowned_pull_request_with_no_body_still_reaches_the_lead() {
 }
 
 #[test]
+fn a_queued_ejection_is_dropped_when_the_pull_request_re_enters_the_queue() {
+    let mut pr = Pr::open(543);
+    pr.comments.push(verdict("HOLD", HEAD_A));
+    let mut queued = pr.clone();
+    queued.in_queue = true;
+    let mut h = unowned_harness(&pr, true);
+    h.gh.set(queued.clone());
+    h.pass(0, Mode::Send);
+    // The HOLD opens the rate window; an ejection inside it is queued.
+    let mut out = queued.clone();
+    out.in_queue = false;
+    h.gh.set(out);
+    h.pass(1, Mode::Send);
+    let first = h.deliveries().len();
+    h.gh.set(queued);
+    h.pass(15, Mode::Send);
+    assert_eq!(h.deliveries().len(), first, "{:?}", h.deliveries());
+}
+
+#[test]
 fn an_unowned_draft_pull_request_is_not_tracked() {
     let mut pr = Pr::open(543);
     pr.comments.push(verdict("HOLD", HEAD_A));
