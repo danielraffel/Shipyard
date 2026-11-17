@@ -619,6 +619,13 @@ class MainRedReads(Base):
             rd = pm.Reader(REPO, d, 50, lambda path: {"check_runs": runs})
             self.assertEqual(pm.head_states_at(rd, "h1", T(10, "10:00")), {"Test": "pending"})  # the rerun was running at the merge
 
+    def test_a_rerun_queued_after_the_merge_does_not_replace_the_verdict_at_merge(self):
+        runs = [{"id": 1, "name": "Test", "status": "completed", "conclusion": "failure", "started_at": T(10, "09:00"), "completed_at": T(10, "09:10")},
+                {"id": 2, "name": "Test", "status": "queued", "conclusion": None, "started_at": None}]
+        with tempfile.TemporaryDirectory() as d:
+            rd = pm.Reader(REPO, d, 50, lambda path: {"check_runs": runs})
+            self.assertEqual(pm.head_states_at(rd, "h3", T(10, "10:00")), {"Test": "red"})
+
     def test_the_head_read_asks_for_every_run_not_only_the_latest(self):
         paths = []
         with tempfile.TemporaryDirectory() as d:

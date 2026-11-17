@@ -857,7 +857,8 @@ def head_states_at(rd, sha, at):
         return None
     latest = {}
     for c in runs:
-        if (c.get("started_at") or "") <= at and (c["name"] not in latest or run_order(c) > run_order(latest[c["name"]])):
+        # a run with no start time cannot be shown to have existed at the merge (a rerun queued later), so it is ignored
+        if c.get("started_at") and c["started_at"] <= at and (c["name"] not in latest or run_order(c) > run_order(latest[c["name"]])):
             latest[c["name"]] = c
     states = {}
     for k, c in latest.items():
