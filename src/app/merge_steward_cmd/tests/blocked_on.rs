@@ -1880,3 +1880,221 @@ fn a_human_unmanaged_pr_or_a_loose_lookalike_keeps_the_handoff_advice() {
         assert!(next.action.contains("steward-handoff"));
     }
 }
+
+/// Vellum #462, #506, #508: `release-path-review` red with "a HOLD names head
+/// <sha> (comment <id>)" is the PR's own HOLD (`held:release-path-review`,
+/// the repair lane's move), never `required_failed` (which a base-level
+/// episode rewords as "do not repair this PR").
+#[test]
+fn a_hold_on_release_path_review_is_held_not_required_failed() {
+    let policy = app_bound_policy(&["macos", "release-path-review", "review-verdict"]);
+    let mut pr = pr_with(
+        462,
+        &[],
+        "BLOCKED",
+        &json!([app_check(
+            "macos",
+            "COMPLETED",
+            Some("SUCCESS"),
+            "2026-11-13T20:00:00Z"
+        )]),
+    );
+    pr.fact.checks.push(status(
+        "release-path-review",
+        ".github/workflows/release-path-review-trigger.yml and 6 more: a HOLD names head aaaaaaaaaaaa (comment 6926025881)",
+    ));
+    let stall = classify_failed(&pr, &policy, &["release-path-review (app_id=15368)"]);
+    assert_eq!(stall.blocked_on, "held:release-path-review");
+    let held_by = stall.held_by.clone().expect("held_by");
+    assert_eq!(
+        (held_by.record, held_by.id),
+        ("comment", Some(6_926_025_881))
+    );
+    let next = crate::app::merge_steward_cmd::next_action::for_row(
+        &crate::app::merge_steward_cmd::next_action::RowContext {
+            repo: "Generous-Corp/vellum",
+            base: "main",
+            pr: &pr.fact,
+            policy: &policy,
+            error: None,
+        },
+        &stall,
+    );
+    assert_eq!(
+        next.actor,
+        crate::app::merge_steward_cmd::next_action::Actor::Repair
+    );
+    assert!(next.action.contains("fix what it names"), "{}", next.action);
+    // A HOLD naming another head is not this head's HOLD (fail closed).
+    let mut other = pr.clone();
+    other.fact.checks.pop();
+    other.fact.checks.push(status(
+        "release-path-review",
+        "x: a HOLD names head bbbbbbbbbbbb (comment 1)",
+    ));
+    assert_eq!(
+        classify_failed(&other, &policy, &["release-path-review (app_id=15368)"]).blocked_on,
+        "required_failed:release-path-review"
+    );
+}
+
+/// Shipyard #1434: the reviewer quarantined the head and said why. A row
+/// waiting on a reviewer whose head the quarantine file lists reads
+/// `review_quarantined`, the author's move, with the diagnosis's first line;
+/// a row at another head, or not waiting on a reviewer, is left alone.
+#[test]
+fn a_quarantined_head_waiting_on_a_reviewer_names_the_diagnosis() {
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = fake_gh(
+        &temp,
+        r#"
+case "$*" in
+  *"issues/1434/comments"*) printf '%s\n' '{"created_at":"2026-11-17T03:06:22Z","body":"Review quarantine diagnosis: this head bundles unrelated removals. Please split.\nmore"}' ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+    );
+    let policy = app_bound_policy(&["macos", "review-verdict"]);
+    let pr = pr_with(1434, &[], "BLOCKED", &green_rollup());
+    let mut observation = observation_for(pr.clone(), true);
+    observation.repo = "danielraffel/Shipyard".to_owned();
+    let mk = |token: &str, head: &str| PrReport {
+        number: 1434,
+        head_sha: head.to_owned(),
+        decision: StewardDecision::Draft,
+        mutation: None,
+        error: None,
+        blocked: Stall {
+            blocked_on: token.to_owned(),
+            ..Stall::default()
+        },
+    };
+    let quarantine = crate::app::merge_steward_cmd::scheduling_loop::parse_quarantine(&format!(
+        "danielraffel/Shipyard#1434 {HEAD} reviewer_unverified_exhausted since=1794020000\n"
+    ));
+    let mut reports = vec![mk("no_verdict", HEAD)];
+    crate::app::merge_steward_cmd::review_quarantine::annotate(
+        &actions,
+        &observation,
+        &policy,
+        &quarantine,
+        &mut reports,
+    );
+    let blocked = &reports[0].blocked;
+    assert_eq!(blocked.blocked_on, "review_quarantined");
+    assert_eq!(
+        blocked.blocked_detail.as_deref(),
+        Some("this head bundles unrelated removals. Please split.")
+    );
+    let next = blocked.next_action.as_ref().expect("next action");
+    assert_eq!(
+        next.actor,
+        crate::app::merge_steward_cmd::next_action::Actor::Author
+    );
+    assert!(next.action.contains("Please split"), "{}", next.action);
+    // Another head, or an approved and green row, keeps its own token.
+    for (token, head) in [
+        ("no_verdict", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        ("ready", HEAD),
+        ("held", HEAD),
+    ] {
+        let mut reports = vec![mk(token, head)];
+        crate::app::merge_steward_cmd::review_quarantine::annotate(
+            &actions,
+            &observation,
+            &policy,
+            &quarantine,
+            &mut reports,
+        );
+        assert_eq!(reports[0].blocked.blocked_on, token);
+    }
+}
+
+/// Shipyard #1457 at 577d982b: a base retarget started no `Test macOS ARM64`
+/// run, and the only thing in flight was the `review-verdict` status, pending
+/// while the head awaits its reviewer. That is another workflow's wait, so the
+/// row is `required_never_ran`, not `required_pending` ("checks running, do
+/// not push"). A required job that really is still running keeps it pending.
+#[test]
+fn a_pending_review_status_does_not_hide_a_required_check_that_never_ran() {
+    let policy = app_bound_policy(&["macos", "review-verdict"]);
+    let mut pr = pr_with(1457, &[], "BLOCKED", &json!([]));
+    pr.fact.checks.push(StewardCheck {
+        status: "PENDING".to_owned(),
+        conclusion: None,
+        observed_at: Some("2026-11-17T08:25:29Z".to_owned()),
+        ..review_status(Some("no reviewer verdict names head aaaaaaaaaaaa"))
+    });
+    let decision = classify_pr(&pr.fact, &policy, &BTreeMap::new());
+    let classify_row = |pr: &ObservedPr| {
+        classify(
+            &RowFacts {
+                pr: &pr.fact,
+                decision: &decision,
+                mutation: None,
+                error: None,
+                approval: GateRead::Unread,
+                enqueued_at: None,
+                ejection: None,
+            },
+            &policy,
+        )
+        .0
+    };
+    let stall = classify_row(&pr);
+    assert_eq!(stall.blocked_on, "required_never_ran:macos", "{stall:?}");
+    let next = crate::app::merge_steward_cmd::next_action::for_row(
+        &crate::app::merge_steward_cmd::next_action::RowContext {
+            repo: "danielraffel/Shipyard",
+            base: "main",
+            pr: &pr.fact,
+            policy: &policy,
+            error: None,
+        },
+        &stall,
+    );
+    assert!(next.action.contains("CI never started"), "{}", next.action);
+    // A head pushed moments ago has not been given time: the pending review
+    // status keeps it pending, so a fresh push is not told its CI never ran.
+    let mut fresh = pr.clone();
+    fresh.fact.checks[0].observed_at = Some(Utc::now().to_rfc3339());
+    let decision_fresh = classify_pr(&fresh.fact, &policy, &BTreeMap::new());
+    let young = classify(
+        &RowFacts {
+            pr: &fresh.fact,
+            decision: &decision_fresh,
+            mutation: None,
+            error: None,
+            approval: GateRead::Unread,
+            enqueued_at: None,
+            ejection: None,
+        },
+        &policy,
+    )
+    .0;
+    assert_eq!(young.blocked_on, "required_pending", "{young:?}");
+    // Control: a non-review job still running keeps it pending.
+    let mut running = pr.clone();
+    running.fact.checks.push(StewardCheck {
+        name: "some-upstream-job".to_owned(),
+        source: StewardCheckSource::CheckRun,
+        status: "IN_PROGRESS".to_owned(),
+        conclusion: None,
+        ..review_status(None)
+    });
+    let decision_running = classify_pr(&running.fact, &policy, &BTreeMap::new());
+    let pending = classify(
+        &RowFacts {
+            pr: &running.fact,
+            decision: &decision_running,
+            mutation: None,
+            error: None,
+            approval: GateRead::Unread,
+            enqueued_at: None,
+            ejection: None,
+        },
+        &policy,
+    )
+    .0;
+    assert_eq!(pending.blocked_on, "required_pending", "{pending:?}");
+}

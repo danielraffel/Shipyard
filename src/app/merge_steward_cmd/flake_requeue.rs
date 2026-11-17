@@ -532,6 +532,25 @@ fn short(sha: &str) -> &str {
     sha.get(..12).unwrap_or(sha)
 }
 
+/// Whether any flake re-enqueue in `repo` is one [`sweep`] has not judged
+/// yet. Only the tick sweeps, and an unswept receipt on one pull request can
+/// hide a tripped signature that another pull request, ejected on the same
+/// signature, would otherwise be re-enqueued on; so a ready-event admission
+/// leaves the whole repository to the tick until it sweeps. Keys match the
+/// sweep's `repo#` prefix. There is no age bound: the sweep judges every
+/// stored unswept receipt whatever its age, so every one blocks until the
+/// sweep judges it or pruning removes it. The sweep marks a receipt swept
+/// once its pull request is closed or has moved on, so a closed pull request
+/// does not hold the repository.
+pub(super) fn unswept_requeue(ledger: &StewardLedger, repo: &str) -> bool {
+    let prefix = format!("{}#", repo.to_ascii_lowercase());
+    ledger
+        .flake_requeue
+        .requeued
+        .iter()
+        .any(|(key, receipt)| key.starts_with(&prefix) && !receipt.swept)
+}
+
 pub(super) fn receipt_key(repo: &str, pr: u64, head: &str) -> String {
     format!(
         "{}#{pr}@{}",
@@ -844,12 +863,20 @@ pub(super) fn sweep(
         else {
             continue;
         };
+        // The observation lists every open pull request on the base (a
+        // partial list is refused before the pass). A receipt whose pull
+        // request is closed, or no longer at the receipted head, can never
+        // be re-enqueued again: it is marked swept, so it stops holding the
+        // repository for ready-event admissions (`unswept_requeue`).
         let Some(open) = observation
             .prs
             .iter()
             .find(|open| open.fact.number == pr)
             .filter(|open| open.fact.head_sha.eq_ignore_ascii_case(&head))
         else {
+            if let Some(receipt) = state.requeued.get_mut(&key) {
+                receipt.swept = true;
+            }
             continue;
         };
         if open.fact.queue_position.is_some() {

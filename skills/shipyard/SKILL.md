@@ -1782,6 +1782,17 @@ matching: `gh … --help | grep -q` under `pipefail` fails whenever grep exits
 first and gh dies of SIGPIPE (exit 141), which silently skipped the flag and
 left `api …/logs` refused after release.
 
+On macOS, `install.sh` and `shipyard update` install only the Developer ID
+release (identifier `shipyard` / `shipyard-workstream-provider`, team
+`95CX6P84C4`, checked with `/usr/bin/codesign --verify --strict -R=...`). A
+binary that fails is never executed or installed, and the previous pair
+stays. On macOS `shipyard update` refuses a target tag whose installer
+predates the check (older installers write in place, so nothing could undo
+them), before running it (`src/app/update_cmd/install_identity.rs`).
+install.sh always runs `/usr/bin/codesign` (its tests rewrite a copy, never
+the environment) and no longer re-signs ad hoc. The owner-only developer mode is documented in docs/install.md; agents
+never use it.
+
 `shipyard update` never installs the ghapp wrapper: `~/.local/bin/ghapp` runs
 the generation named by `~/.local/bin/ghapp.shipyard-generation`, and only
 `shipyard runner fleet-update` publishes a generation and moves that selector.
@@ -1799,6 +1810,26 @@ first failure. The release's install.sh installs the controller-staged asset
 through a curl shim that also serves a `checksums.sha256` with the SHA-256 the
 controller pinned, so an install.sh that refuses releases without a checksums
 manifest still installs over fleet-update.
+
+On macOS the transaction **activates only the Developer ID release**. Right
+after the release binary is staged, and before anything public moves, it runs
+`/usr/bin/codesign --verify --strict -R=<requirement>` on it. The requirement
+is identifier `shipyard`, an Apple-anchored Developer ID Application
+certificate, team `95CX6P84C4` (`src/release_identity.rs`). macOS privacy
+(TCC) grants follow that identity, so any other binary, such as an
+installer's ad-hoc re-sign or a local build, would be a new identity that
+raises prompts nobody answers on an unattended host. A binary that fails the
+check, or a missing codesign, exits 78 with
+`SHIPYARD_FLEET_ACTIVATION_REFUSED=not-developer-id-release`. The receipt says
+`refused to activate: ...`, the stage and lock are released, and the active
+generation stays selected. There is no override. The install runs with
+`SHIPYARD_NO_ADHOC_FALLBACK=1`, so install.sh never strips the release
+signature to get a binary to launch. `shipyard doctor` reports the active
+`~/.local/bin/shipyard` against the same requirement (`release-identity`,
+advisory). `shipyard fleet status` prints one `shipyard:` line per host: the
+version, whether it is the Developer ID release, and that host's TartCI
+tool-freshness verdict (`current`/`behind` and the latest release). The line
+is informational and never makes a host unroutable.
 
 Every applied host is then **independently verified** in a fresh process:
 - the installed `shipyard --version` must equal the target;
@@ -5927,6 +5958,21 @@ description, from a status bound to its rule's app (an unbound rule never
 qualifies), passes `merge_steward::review_waiting` ("needs N counted
 APPROVEs of head <head>", "awaiting reviewer verdict for head <head>",
 bound to this head; no `hold`/`held by` in any case), else `required_failed`.
+A non-approval review status (`release-path-review`) whose bound status says
+`a HOLD names head <head>` (`merge_steward::review_hold`; `(comment <id>)`
+gives `held_by`) is `held:<context>` (repair lane), and `waiting_review_status`
+drops it from the red-everywhere count too: a HOLD is that PR's own review
+outcome. `review_quarantine::annotate` (run in `apply_repo_plan` before the
+dwell pass) turns a reviewer-waiting row (`no_verdict`, `awaiting_review`,
+`waiting_head_approval`, or `required_pending` on the approval context alone)
+whose exact head the pass-runner quarantine file lists
+(`scheduling_loop::read_quarantine`; path from `SHIPYARD_REVIEW_QUARANTINE`, then `[loop] review_quarantine_file`, then `~/.local/share/shipyard-steward/pass-runner/review-quarantine.txt`; a missing file is no quarantine) into `review_quarantined`, actor author,
+with the first line of the newest `Review quarantine diagnosis:` comment since
+the quarantine as its detail (one comments read per quarantined head only;
+the comment is untrusted text and only fills the detail). The loop state is
+still `quarantined`.
+`blocked_on::waiting_required` reads an absent required context as `required_never_ran` unless a non-review check of its app is still in flight. Review statuses (`is_review_gate`, e.g. a `pending` `review-verdict`) do not count as in flight once the head is more than 10 minutes old (`NEVER_RAN_AFTER`, dated by the oldest check `observed_at` on the head, since the PR fact carries no push time); a younger head keeps them as pending so a fresh push is not told its CI never started. Shipyard #1457 read "checks running, do not push" for 4 h with no CI run at all. Its next_action opens "CI never started at this head (likely a base retarget)".
+
 `src/app/merge_steward_cmd/scheduling_loop.rs`: the loop contract
 (docs/scheduling-loop.md). `state_for` maps a row to one `LoopState` (precedence
 `merge_group_stalled` > `Queued` decision or `queued`/`admitted` > quarantined at
@@ -5938,7 +5984,7 @@ first actor, first deadline, then two more; L1 repair or adversary, L2
 with the same token kind, the row's `since` (or `merge_group_enqueued_at`,
 or the quarantine line's `since=`), else now. Quarantine file: env
 `SHIPYARD_REVIEW_QUARANTINE` or machine-global `loop.review_quarantine_file`.
-No GitHub reads; `loop_seen` is kept only by applying passes.
+No GitHub reads; `loop_seen` is kept only by applying passes. A head change restarts escalation: `for_row` filters first-sight evidence to times at or after the prior record's `observed_at`, so a stale head-commit date cannot carry level 3 onto a new head.
 `src/app/merge_steward_cmd/ready_event.rs`: ready on event
 (docs/scheduling-loop.md, "Ready on event"). `runner steward-admit-ready
 --repo R --pr N --head SHA [--apply]`, or `shipyard relay` with
@@ -5950,9 +5996,19 @@ the steward host and its relay only: agents never run it, as they never arm or
 enqueue. Only fleet-list repos (`not_fleet_repo`); a ledger rate-limit cooldown
 or REST under 300 is `rate_limited` before any read; one attempt per head per
 60 s, at least 30 (`merge-steward.ready-events.json`); a report reads the live
-gate before `would_admit`. A moved head, a non-ready classification, a
+gate as a report (`read_head_gate_for_report`, `dry_run`) before `would_admit`,
+so it has no side effect: no lock, no attempt record, no `carries.jsonl` line.
+A moved head, a non-ready classification, a
 non-clear base poison, a paused entry or a pending cancellation is skipped; the ledger lock is tried, never waited on
-(`steward_busy`). The tick's own lock now waits up to 30 s
+(`steward_busy`). Under the lock the base's merge groups are read again (a
+non-clear reading is `base_poison_not_clear`), and while any flake re-enqueue
+receipt in the repository that the tick's breaker sweep has not judged is
+stored, whatever its age (the sweep judges every stored receipt; only a prune
+removes one), every head is skipped as
+`flake_requeue_unswept`: the tick sweeps first
+(`flake_requeue::unswept_requeue`). The sweep marks a receipt swept when its
+pull request is closed or no longer at the receipted head, so a closed pull
+request does not hold the repository for the retention. The tick's own lock now waits up to 30 s
 (`acquire_ledger_lock_within`).
 `src/app/merge_steward_cmd/merge_group_stall.rs`: for each queue entry
 whose `merge_group_heads` sha has no active run in the census, three reads

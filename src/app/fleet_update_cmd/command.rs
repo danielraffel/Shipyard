@@ -73,7 +73,7 @@ pub(super) fn remote_update_command(
     );
     let auth_contract = auth_support::wrapper_helper_contract_probe(auth_helper);
     let binary_install_command = format!(
-        "SHIPYARD_FLEET_ASSET_PATH=\"$release_asset\" SHIPYARD_GITHUB_TOKEN=\"$token\" SHIPYARD_VERSION={} SHIPYARD_INSTALL_DIR=\"$auth_generation_stage\" SHIPYARD_CURL_BIN=\"$curl_shim\" /bin/bash \"$installer\" >/dev/null",
+        "SHIPYARD_NO_ADHOC_FALLBACK=1 SHIPYARD_FLEET_ASSET_PATH=\"$release_asset\" SHIPYARD_GITHUB_TOKEN=\"$token\" SHIPYARD_VERSION={} SHIPYARD_INSTALL_DIR=\"$auth_generation_stage\" SHIPYARD_CURL_BIN=\"$curl_shim\" /bin/bash \"$installer\" >/dev/null",
         shlex_quote(version),
     );
     let auth_transaction = auth_support::install_transaction(
@@ -87,6 +87,7 @@ pub(super) fn remote_update_command(
         "\"$auth_wrapper_source\"",
         "\"$auth_close_guard_source\"",
         &binary_install_command,
+        auth_support::TRANSACTION_CODESIGN,
         mode,
         global_dir,
         state_dir,
@@ -140,7 +141,7 @@ pub(super) fn remote_update_command(
          test \"$(/usr/bin/shasum -a 256 \"$auth_wrapper_source\" | /usr/bin/awk '{{print $1}}')\" = {}\n\
          test \"$(/usr/bin/shasum -a 256 \"$auth_close_guard_source\" | /usr/bin/awk '{{print $1}}')\" = {}\n\
          curl_shim=\"$staging_dir/curl-exact-asset\"; /usr/bin/printf '%s\\n' {} > \"$curl_shim\"; /bin/chmod 700 \"$curl_shim\"\n\
-         SHIPYARD_FLEET_ASSET_PATH=\"$release_asset\" SHIPYARD_GITHUB_TOKEN=\"$token\" SHIPYARD_VERSION={} SHIPYARD_INSTALL_DIR=\"$staging_dir\" SHIPYARD_CURL_BIN=\"$curl_shim\" /bin/bash \"$installer\" >/dev/null\n\
+         SHIPYARD_NO_ADHOC_FALLBACK=1 SHIPYARD_FLEET_ASSET_PATH=\"$release_asset\" SHIPYARD_GITHUB_TOKEN=\"$token\" SHIPYARD_VERSION={} SHIPYARD_INSTALL_DIR=\"$staging_dir\" SHIPYARD_CURL_BIN=\"$curl_shim\" /bin/bash \"$installer\" >/dev/null\n\
          staged_binary=\"$staging_dir/shipyard\"; test \"$(\"$staged_binary\" --version)\" = {}\n\
          \"$staged_binary\" --mode {} --global-dir {} --state-dir {} update --to {} --check --unattended-fleet >/dev/null\n\
          {}\nunset token\n{}\n{}\n{}\n\
@@ -681,7 +682,7 @@ pub(super) fn local_update_command(plan: &HostUpdatePlan) -> String {
     let auth_header_setup = github_api_auth_header_setup();
     let version = plan.target.strip_prefix('v').unwrap_or(&plan.target);
     let binary_install_command = format!(
-        "SHIPYARD_FLEET_ASSET_PATH=\"$release_asset\" SHIPYARD_VERSION={} SHIPYARD_INSTALL_DIR=\"$auth_generation_stage\" SHIPYARD_CURL_BIN=\"$curl_shim\" /bin/bash \"$installer\" >/dev/null",
+        "SHIPYARD_NO_ADHOC_FALLBACK=1 SHIPYARD_FLEET_ASSET_PATH=\"$release_asset\" SHIPYARD_VERSION={} SHIPYARD_INSTALL_DIR=\"$auth_generation_stage\" SHIPYARD_CURL_BIN=\"$curl_shim\" /bin/bash \"$installer\" >/dev/null",
         shlex_quote(version),
     );
     let auth_transaction = auth_support::install_transaction(
@@ -695,6 +696,7 @@ pub(super) fn local_update_command(plan: &HostUpdatePlan) -> String {
         "\"$auth_wrapper_source\"",
         "\"$auth_close_guard_source\"",
         &binary_install_command,
+        auth_support::TRANSACTION_CODESIGN,
         plan.runtime_mode.as_str(),
         &plan.global_dir,
         &plan.state_dir,
