@@ -203,6 +203,8 @@ def expected():
         "change_failure.merged": len(merged), "change_failure.unknown": 0,
         "change_failure.prs_that_started_red": sum(1 for c in merged if c.get("base_red")),
         "change_failure.episodes": sum(1 for c in merged if c.get("base_red")), "change_failure.unresolved": 0,
+        "change_failure.change_failures": sum(1 for c in merged if c.get("base_red")), "change_failure.other_post_merge_red": 0,
+        "change_failure.head_red_unknown": 0,
         "change_failure.head_red_same_context": sum(1 for c in merged if c.get("base_red")),
         "change_failure.minutes_to_green.sum": sum(delay[c["red_until"]] - delay[c["n"]] for c in merged if c.get("base_red")),
         "controls.incident.expected": sum(1 for c in merged if c.get("base_red")), "controls.incident.found": sum(1 for c in merged if c.get("base_red")),
