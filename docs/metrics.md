@@ -38,7 +38,7 @@ it is on only when the tick passes `--e2e-cache DIR` (the daily run does, unless
 **Synthetic control (every report).** `tools/metrics/synthetic_control.py` holds fifteen invented PRs, each
 built to have one known outcome (autonomous, owner label, steward merge, unbound owner merge, unsigned owner
 PR, never merged, reverted, red base, escaped, twice held with repair and merge-main pushes, ejected from the
-queue, a gate-run fixture with repeats). `expected()` derives 60 numbers from that table with plain arithmetic
+queue, a gate-run fixture with repeats). `expected()` derives 64 numbers from that table with plain arithmetic
 and never calls the scorecard; the real `pr_metrics.build` then runs over the same PRs, served from memory (no
 GitHub read, a throwaway cache), and every number must match. The report prints one line, `CONTROL PASS` with the
 count and the largest delta, or `CONTROL FAIL` with each missed number, its expected value, its value and the delta.
@@ -108,6 +108,12 @@ time; ported from the m3 fleet-metrics parser). A reason of `merged` or `already
 ejection. A PR whose cause could not be read keeps `unknown`, is not cached and is read again next run. The report
 prints ejections, ejections per merged PR, the top cause and the unknown-cause count. GraphQL goes through `ghapp`
 (the read-only reader has no GraphQL route) and counts against the read cap like any read.
+
+## HOLDs and repair rounds
+
+A repair round is a push after a HOLD and before the next HOLD or the merge. The report prints, over the HOLDs of
+merged PRs, the mean repair pushes per HOLD and the HOLDs with no push at all, next to the re-HOLD rate. When no
+PR's compute was read, runs per merged PR prints `withheld (compute not read)` instead of an empty cell.
 
 ## Sample and comparison
 

@@ -519,6 +519,39 @@ class EjectionCause(Base):
         self.assertIn(f"| {REPO} | 1 | 1 | 1.0 | ci_failure | ci_failure 1 | 0 |", md)
 
 
+class HoldRounds(Base):
+    def f(self, holds, pushes, merged=T(10, "12:00")):
+        return {"merged_at": merged, "hold_times": holds, "push_times": pushes}
+
+    def test_pushes_between_a_hold_and_the_next_hold_or_the_merge_are_its_repair_rounds(self):
+        f = self.f([T(10, "10:00"), T(10, "11:00")], [T(10, "09:50"), T(10, "10:10"), T(10, "10:20"), T(10, "11:30")])
+        self.assertEqual(pm.hold_rounds(f), [2, 1])  # the 09:50 push came before any HOLD
+
+    def test_a_hold_with_no_push_before_the_merge_or_the_next_hold_has_zero_rounds(self):
+        self.assertEqual(pm.hold_rounds(self.f([T(10, "10:00"), T(10, "10:30")], [T(10, "10:45")])), [0, 1])
+        self.assertEqual(pm.hold_rounds(self.f([T(10, "10:00")], [])), [0])
+
+    def test_no_hold_is_an_empty_list_and_an_unmerged_pr_is_none(self):
+        self.assertEqual(pm.hold_rounds(self.f([], [T(10, "10:10")])), [])
+        self.assertIsNone(pm.hold_rounds(self.f([T(10, "10:00")], [], merged=None)))
+
+    def test_a_push_at_the_merge_minute_counts_and_one_after_it_does_not(self):
+        self.assertEqual(pm.hold_rounds(self.f([T(10, "10:00")], [T(10, "12:00"), T(10, "12:01")])), [1])
+
+    def test_the_summary_pools_holds_across_prs(self):
+        rows = [{"hold_rounds": [2, 0]}, {"hold_rounds": []}, {"hold_rounds": None}, {"hold_rounds": [1]}]
+        self.assertEqual(pm.hold_round_summary(rows), {"holds": 3, "pushes_after_holds": 3, "mean": 1.0, "holds_without_push": 1})
+        self.assertEqual(pm.hold_round_summary([])["mean"], None)
+
+    def test_the_report_prints_the_hold_table_and_withholds_runs_when_compute_was_not_read(self):
+        gh = world([pr(1, T(10, "10:00"), T(10, "11:00"))], default_checks=True)
+        gh.routes = [x for x in gh.routes if "actions/runs" not in x[0]]
+        out = pm.build([REPO], tempfile.mkdtemp(), 50, OWNER, START, NOW, {}, {}, None, gh, control=False)
+        md = pm.markdown(out)
+        self.assertIn("### HOLDs and repair rounds (window, merged PRs)", md)
+        self.assertIn("withheld (compute not read)", md)
+
+
 class Correctness(Base):
     def merged_old(self, n, day=5):
         return pr(n, T(day, "09:00"), T(day, "10:00"), sha=f"s{n}" + "0" * 38)
@@ -1395,7 +1428,7 @@ class SyntheticControl(unittest.TestCase):
         out = pm.build([REPO], tempfile.mkdtemp(), 50, OWNER, START, NOW, {}, {}, None, world([pr(1, T(10, "10:00"), T(10, "11:00"))]))
         self.assertEqual(out["synthetic_control"]["status"], "pass")
         md = pm.markdown(out)
-        self.assertIn("**CONTROL PASS: 60 of 60", md)
+        self.assertIn("**CONTROL PASS: 64 of 64", md)
         self.assertIn("| ready day |", md)
 
     def test_a_repo_with_no_live_control_reads_synthetic_not_unchecked(self):

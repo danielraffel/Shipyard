@@ -650,6 +650,17 @@ def cause_minutes(f, comp):
             "runner": comp.get("runner_wait_min") if done else None, "dirty": None}
 
 
+def hold_rounds(f):
+    """For a merged PR, one entry per HOLD: how many pushes (repair rounds) landed after it and before the next HOLD or the
+    merge. [] when it had no HOLD, None when it did not merge."""
+    m = iso(f.get("merged_at"))
+    if not m:
+        return None
+    holds = sorted(iso(x) for x in f.get("hold_times") or [] if iso(x))
+    pushes = sorted(iso(x) for x in f.get("push_times") or [] if iso(x))
+    return [sum(1 for p in pushes if h < p <= (holds[i + 1] if i + 1 < len(holds) else m)) for i, h in enumerate(holds)]
+
+
 def enqueue_to_merge(f):
     """Minutes from the last merge-queue enqueue before the merge to `merged_at`, or None (no enqueue, not merged)."""
     m = iso(f.get("merged_at"))
@@ -949,6 +960,14 @@ def bucket(size):
     return "unknown" if size is None else "<200" if size < 200 else "200-800" if size <= 800 else ">800"
 
 
+def hold_round_summary(merged):
+    """Over the HOLDs of merged PRs: how many there were, the mean repair pushes after each, and the HOLDs the PR merged
+    past (or was followed by another HOLD) without a single push."""
+    per = [n for r in merged for n in (r.get("hold_rounds") or [])]
+    return {"holds": len(per), "pushes_after_holds": sum(per), "mean": None if not per else round(sum(per) / len(per), 2),
+            "holds_without_push": sum(1 for n in per if n == 0)}
+
+
 def change_failure_summary(merged):
     """Merged PRs whose merge started a main-red episode: counts, the raw minutes to green (no median: n is small and the
     distribution is long), the unresolved ones, and the PRs whose base checks were not read in full (`unknown`)."""
@@ -1062,6 +1081,7 @@ def summarize(rows):
             "prs_with_hold": len(held), "prs_with_re_hold": len(rehold),
             "re_hold_rate_pct": pct_of(len(rehold), len(held)), "re_hold_rate_ci95": wilson(len(rehold), len(held)),
             "by_size": dict(sorted(by_size.items())),
+            "repair_rounds_per_hold": hold_round_summary(merged),
         },
         "pushes_per_ready_pr": {k: None if not n else round(v / n, 2) for k, v in push.items()},
         "pushes_total": push,
@@ -1197,7 +1217,7 @@ def collect_repo(repo, cache_dir, cap, owner, lo, hi, now, ticks, tick_ctx, fetc
             "handoff_min": round((iso(merged) - iso(f["first_ready"])).total_seconds() / 60.0, 1) if merged and f["first_ready"] else None,
             "holds": f["holds"], "re_holds": f["re_holds"], "size": f["size"], "pushes": f["pushes"],
             "enqueues": f["enqueues"], "ejections": f["ejections"], "dirty": f["number"] in dirty,
-            "enqueue_to_merge_min": enqueue_to_merge(f),
+            "enqueue_to_merge_min": enqueue_to_merge(f), "hold_rounds": hold_rounds(f),
             "owner_actions": sum(1 for ev, ts in effective_owner_events(f)[0]
                                  if not (ev == "merged" and f.get("merge_unverified")) and f["first_ready"] and iso(f["first_ready"]) <= iso(ts) <= iso(f["first_ready"]) + HORIZON),
             "repair_cycles": f["repair_cycles"], "compute": None, "correct": None, "path": None, "path_why": [], "cause_min": None, "main_red": None,
@@ -1478,7 +1498,7 @@ def markdown(e2e):
                 f"{W if ns_off else str(a['github_only']['rate_pct']) + '% (' + ci(a['github_only']['rate_ci95']) + ')'} | "
                 f"{sample_label(s, trunc)} | {r['holds_per_ready_pr']} | {r['re_hold_rate_pct']}% ({ci(r['re_hold_rate_ci95'])}), n={r['prs_with_hold']} | "
                 f"{p['repair']}/{p['author']}/{p['merge_main']} | {s['merge_queue']['attempts_per_ready_pr']} | {ej} | {s['dirty_per_100_prs']} | "
-                f"{s['interventions']['owner_actions_per_pr']} | {s['interventions']['repair_cycles_per_pr']} | {c['runs_median']}/{c['runs_mean']} ({c['repeat_runs_total']}/{c['runs_total']}) | "
+                f"{s['interventions']['owner_actions_per_pr']} | {s['interventions']['repair_cycles_per_pr']} | {W + ' (compute not read)' if not c['prs_read'] else str(c['runs_median']) + '/' + str(c['runs_mean']) + ' (' + str(c['repeat_runs_total']) + '/' + str(c['runs_total']) + ')'} | "
                 f"{h['median']}/{h['p90']} (n={h['n']}) | {W if 'correctness' in off else str(k['bad']) + '/' + str(k['good']) + '/' + str(k['unknown'])} | "
                 f"{W if 'correctness' in off else str(k['bad_rate_pct']) + '% (' + ci(k['bad_rate_ci95']) + ')' + zero_bad} | "
                 f"{W if 'escaped' in off else str(k['escaped']) + '/' + str(k['escaped_known']) + ' (' + ci(k['escaped_rate_ci95']) + ')' + zero_esc} | {c['context_self_hosted_min_median']}/{c['context_hosted_min_median']} |")
@@ -1571,6 +1591,14 @@ def markdown(e2e):
             q = s_["merge_queue"]
             by = ", ".join(f"{k2} {n}" for k2, n in q["ejections_by_cause"].items()) or "0"
             L.append(f"| {repo} | {s_['ready_prs']} | {sum(q['ejections_by_cause'].values())} | {q['ejections_per_merge']} | {q['top_ejection_cause']} | {by} | {q['ejections_cause_unknown']} |")
+        L.append("")
+    if e2e.get("window"):
+        L += ["### HOLDs and repair rounds (window, merged PRs)", "",
+              "A repair round is a push after a HOLD and before the next HOLD or the merge. The re-HOLD rate is the share of PRs with a HOLD that got another HOLD after a repair.", "",
+              "| repo | PRs with a HOLD | HOLDs | repair pushes per HOLD | HOLDs with no push | re-HOLD rate (CI95) |", "|---|---|---|---|---|---|"]
+        for repo, s_ in sorted(e2e["window"]["per_repo"].items()):
+            r, h = s_["rounds"], s_["rounds"]["repair_rounds_per_hold"]
+            L.append(f"| {repo} | {r['prs_with_hold']} | {h['holds']} | {h['mean']} | {h['holds_without_push']} | {r['re_hold_rate_pct']}% ({ci(r['re_hold_rate_ci95'])}) |")
         L.append("")
     nf = (e2e.get("baseline") or {}).get("noise_floor")
     if nf:
