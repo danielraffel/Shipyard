@@ -2136,11 +2136,26 @@ fi
 unset ghapp_create_arg
 if [[ "$ghapp_register_owner" == 1 && ( "${1:-}" != "api" || "$ghapp_stderr_open" == 0 ) ]]; then
     ghapp_create_out="$(/usr/bin/mktemp /tmp/shipyard-ghapp-create.XXXXXX)"
+    ghapp_create_child=""
     trap '/bin/rm -f -- "$ghapp_create_out"' EXIT
+    # gh runs as a child here rather than replacing this shell, so a caller's
+    # timeout (INT/TERM/HUP) must still reach it: a cancelled create must not
+    # go on to open the pull request.
+    for ghapp_create_signal in INT TERM HUP; do
+        trap 'if [[ -n "$ghapp_create_child" ]]; then kill -'"$ghapp_create_signal"' "$ghapp_create_child" 2>/dev/null || true; fi' "$ghapp_create_signal"
+    done
     set +e
-    "$gh_binary" "$@" >"$ghapp_create_out"
+    "$gh_binary" "$@" >"$ghapp_create_out" &
+    ghapp_create_child=$!
+    wait "$ghapp_create_child"
     ghapp_status=$?
+    # A signal interrupts the first wait; collect the child's real status.
+    while kill -0 "$ghapp_create_child" 2>/dev/null; do
+        wait "$ghapp_create_child"
+        ghapp_status=$?
+    done
     set -e
+    trap - INT TERM HUP
     /bin/cat -- "$ghapp_create_out" 2>/dev/null || true
     if [[ "$ghapp_status" == 0 ]]; then
         ghapp_created_url="$(/usr/bin/grep -E '^https://github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/pull/[0-9]+$' "$ghapp_create_out" 2>/dev/null | /usr/bin/tail -n 1 || true)"

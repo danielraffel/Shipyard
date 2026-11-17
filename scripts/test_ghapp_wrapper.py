@@ -2530,6 +2530,34 @@ class GhappWrapperTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.owner_register_calls(), [])
 
+    def test_a_cancelled_pr_create_stops_the_native_create(self) -> None:
+        started = self.root / "create-started"
+        finished = self.root / "create-finished"
+        self.gh.write_text(
+            "#!/bin/sh\n"
+            f"touch '{started}'\n"
+            "sleep 5\n"
+            f"touch '{finished}'\n",
+            encoding="utf-8",
+        )
+        self.gh.chmod(0o755)
+        process = subprocess.Popen(
+            [str(self.wrapper), "pr", "create", "--title", "x", "--body", "y",
+             "--repo", "owner/repo"],
+            cwd=self.root,
+            env=self.environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        deadline = time.monotonic() + 20
+        while not started.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertTrue(started.exists())
+        process.terminate()
+        process.communicate(timeout=20)
+        time.sleep(0.5)
+        self.assertFalse(finished.exists(), "gh outlived the cancelled wrapper")
+
     def test_a_pr_create_dry_run_registers_nothing(self) -> None:
         self.write_create_gh("https://github.com/owner/repo/pull/77")
         result = self.run_wrapper(
