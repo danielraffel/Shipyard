@@ -200,7 +200,7 @@ class Compute(Base):
         first = [c for c in gh.calls if "/jobs" in c or "/timeline" in c or "pulls/1/commits" in c]
         gh2 = world([pr(1, T(10, "09:00"), T(10, "11:00"))], runs=self.runs, jobs=self.jobs)
         out = self.build(gh2)
-        again = [c for c in gh2.calls if "/jobs" in c or "/timeline" in c or "pulls/1/commits" in c or "actions/runs?created" in c]
+        again = [c for c in gh2.calls if "/jobs" in c or "/timeline" in c or "pulls/1/commits" in c]  # the run list is re-read to validate the cache
         self.assertEqual(len(first), 4)
         self.assertEqual(again, [])
         self.assertEqual(self.rows(out)[1]["compute"]["self_hosted_min"], 30.0)
@@ -353,6 +353,52 @@ class Paths(unittest.TestCase):
         md = pm.markdown(out)
         self.assertIn("### Clean and slow paths (window, merged PRs)", md)
         self.assertIn("| slow share | clean median (n) | slow median / p90 (n) | top cause |", md)
+
+
+class RerunCache(Base):
+    HEAD = f"h{1:040d}"[:40]
+    JOB = [{"labels": ["self-hosted", "macOS"], "created_at": T(10, "10:00"), "started_at": T(10, "10:01"), "completed_at": T(10, "10:21"), "conclusion": "success"}]
+
+    def mk(self, attempt, conclusion, updated):
+        return {"id": 11, "name": "ci", "head_sha": self.HEAD, "event": "pull_request", "status": "completed", "conclusion": conclusion,
+                "head_branch": "feat", "run_attempt": attempt, "updated_at": updated}
+
+    def build_one(self, runs, jobs=None, attempts=None):
+        push = {"event": "head_ref_force_pushed", "actor": {"login": "x"}, "created_at": T(10, "10:50"), "after_sha": "o" * 40}  # the observed push that ends a red wait
+        gh = world([pr(1, T(10, "09:00"), T(10, "11:00"))], {1: [push]}, runs=runs, jobs={11: jobs or self.JOB})
+        for k, v in (attempts or {}).items():
+            gh.routes.insert(0, (rf"actions/runs/11/attempts/{k}", v))
+        out = pm.build([REPO], self.cache, 300, OWNER, START, NOW, {}, {}, None, gh, control=False)
+        return out["repos"][REPO]["prs"][0], gh
+
+    def test_a_cached_success_is_not_reused_after_a_rerun_of_the_same_run_fails(self):
+        r, _ = self.build_one([self.mk(1, "success", T(10, "10:30"))])
+        self.assertEqual((r["path"], r["compute"]["red_events"]), ("clean", []))
+        r2, gh = self.build_one([self.mk(2, "failure", T(10, "10:50"))])  # same run id, now attempt 2 and failed
+        self.assertEqual((r2["path"], r2["path_why"]), ("slow", ["red"]))
+
+    def test_an_unchanged_run_keeps_its_cache_and_costs_no_jobs_read(self):
+        self.build_one([self.mk(1, "success", T(10, "10:30"))])
+        calls, orig = [], pm.pr_compute
+        pm.pr_compute = lambda *a, **k: (calls.append(1), orig(*a, **k))[1]
+        try:
+            r, gh = self.build_one([self.mk(1, "success", T(10, "10:30"))])
+        finally:
+            pm.pr_compute = orig
+        self.assertEqual((calls, r["path"]), ([], "clean"))  # served from the cache
+
+    def test_cached_job_minutes_are_for_one_attempt_a_rerun_reads_its_jobs_again(self):
+        rd = pm.Reader(REPO, self.cache, 50, lambda path: {"jobs": [dict(self.JOB[0], completed_at=T(10, "10:41"))]})
+        rd.save("jobs", "11", {"self_hosted": 20.0, "hosted": 0.0, "macos": 20.0, "wait": 1.0, "attempt": 1})
+        sh, _, _, _, ok = pm.job_minutes(rd, {"id": 11, "status": "completed", "run_attempt": 2})
+        self.assertEqual((sh, ok), (40.0, True))
+        self.assertEqual(pm.job_minutes(rd, {"id": 11, "status": "completed", "run_attempt": 2})[0], 40.0)
+
+    def test_a_failed_rerun_classifies_slow_but_leaves_the_red_duration_unknown(self):
+        r, _ = self.build_one([self.mk(2, "failure", T(10, "10:40"))])
+        self.assertEqual((r["path"], r["compute"]["red_partial"], r["cause_min"]["red"]), ("slow", True, None))
+        first, _ = self.build_one([self.mk(1, "failure", T(10, "10:40"))])
+        self.assertEqual((first["compute"]["red_partial"], first["cause_min"]["red"]), (False, 10.0))  # a first attempt: 10:40 to the 10:50 force-push
 
 
 class JobsSkippedHold(Base):

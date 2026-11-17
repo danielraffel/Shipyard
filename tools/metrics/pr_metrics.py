@@ -53,7 +53,7 @@ _GUARD = []
 SIGNALS = ("app_opener", "provenance", "trailer", "session_stamp")
 BAD_CONCLUSIONS = {"failure", "timed_out"}
 FACTS_VERSION = 12  # push_times are observed head updates, never commit timestamps
-COMPUTE_VERSION = 5  # compute caches: entries written before this could be marked complete from a partial timeline or commit read or rerun history
+COMPUTE_VERSION = 6  # compute caches: entries written before this could be marked complete from a partial timeline or commit read or rerun history
 CHECKS_VERSION = 2  # derived correctness caches: entries written before this (incomplete pagination read as clean) are read again
 ESCAPE_WINDOW = dt.timedelta(days=14)
 HORIZON = dt.timedelta(hours=48)
@@ -517,8 +517,10 @@ def job_minutes(rd, run):
     macos_min is the part of the minutes on jobs whose labels name macOS, whoever hosts them. runner_wait_min is the
     time its jobs sat queued for a runner (`started_at` minus `created_at`)."""
     rid = run["id"]
+    attempt = int(run.get("run_attempt") or 1)
     cached = rd.load("jobs", str(rid))
-    if cached and "macos" in cached and "wait" in cached:  # an entry from before these were kept is read again
+    # an entry is for one attempt of one run: a rerun keeps the run id, so a different attempt is read again
+    if cached and "macos" in cached and "wait" in cached and cached.get("attempt") == attempt:
         return cached["self_hosted"], cached["hosted"], cached["macos"], cached["wait"], True
     jobs, full = rd.pages(f"actions/runs/{rid}/jobs?filter=all", key="jobs", max_pages=3)
     sh = ho = mac = wait = 0.0
@@ -538,7 +540,7 @@ def job_minutes(rd, run):
             mac += m
     done = run.get("status") == "completed" and full
     if done:
-        rd.save("jobs", str(rid), {"self_hosted": round(sh, 2), "hosted": round(ho, 2), "macos": round(mac, 2), "wait": round(wait, 2)})
+        rd.save("jobs", str(rid), {"self_hosted": round(sh, 2), "hosted": round(ho, 2), "macos": round(mac, 2), "wait": round(wait, 2), "attempt": attempt})
     return round(sh, 2), round(ho, 2), round(mac, 2), round(wait, 2), done
 
 
@@ -632,7 +634,7 @@ def cause_minutes(f, comp):
     hold = None if hold_times and not push_times else _wait_until_next(hold_times, push_times, m)
     red = None if red_events and not push_times else _wait_until_next(red_events, push_times, m)
     return {"hold": hold,
-            "red": red if done else None,
+            "red": None if comp and comp.get("red_partial") else red if done else None,  # None: an earlier failed attempt is not in the list
             "queue": _wait_until_next(f.get("enqueue_times") or [], f.get("dequeue_times") or [], m),
             "runner": comp.get("runner_wait_min") if done else None, "dirty": None}  # None when the jobs were not read
 
@@ -645,16 +647,27 @@ def enqueue_to_merge(f):
     return round((m - max(ts)).total_seconds() / 60.0, 1) if ts and m else None
 
 
-def load_compute(rd, number, f=None):
+def run_fingerprint(r):
+    return [int(r.get("run_attempt") or 1), r.get("updated_at")]
+
+
+def load_compute(rd, number, f=None, runs_by_id=None):
     """A cached compute reduction, or None when absent or written before COMPUTE_VERSION (recomputed). With `f`, an
-    entry is never complete while that PR's own timeline or commit read is incomplete (the heads came from them)."""
-    if not READ_JOB_MINUTES:  # a cached entry carries job minutes this run is meant to leave empty
+    entry is never complete while that PR's own timeline or commit read is incomplete (the heads came from them). With
+    `runs_by_id` (the current run list) every run the entry was built from must still have the attempt and update time
+    it had: a rerun keeps its run id and can turn a cached success into a failure. Without the run list a cached entry
+    cannot be validated and is not used."""
+    if not READ_JOB_MINUTES or runs_by_id is None:  # a cached entry carries job minutes this run is meant to leave empty
         return None
     c = rd.load("compute", str(number))
     if c is None or c.get("v") != COMPUTE_VERSION or not c.get("complete"):
         return None
     if f is not None and not reads_complete(f):
         return None
+    for rid, fp in (c.get("run_fp") or {}).items():
+        cur = runs_by_id.get(int(rid))
+        if cur is None or run_fingerprint(cur) != fp:
+            return None
     return c
 
 
@@ -683,7 +696,7 @@ def pr_compute(rd, f, runs, runs_complete):
     sh = ho = 0.0
     complete = runs_complete and reads_complete(f)  # the heads come from the timeline and the commits
     mac = wait = 0.0
-    by_wf, red_events = {}, []
+    by_wf, red_events, red_partial = {}, [], False
     for r in mine.values():
         # skipping the jobs reads must not hide an unfinished run: its outcome is still unknown, so the PR is not clean
         a, b, m, w, ok = job_minutes(rd, r) if READ_JOB_MINUTES else (0.0, 0.0, 0.0, 0.0, r.get("status") == "completed")
@@ -703,13 +716,14 @@ def pr_compute(rd, f, runs, runs_complete):
         if (r.get("head_sha") in heads and r.get("event") != "merge_group"
                 and r.get("conclusion") in BAD_CONCLUSIONS and r.get("updated_at")):
             red_events.append(r["updated_at"])  # any failed non-merge-group run on one of the PR's heads
+            red_partial = red_partial or attempt > 1  # the list shows only its latest attempt: earlier failed attempts are not in red_events
         level = by_wf.setdefault(r.get("name") or "?", {"pull_request": 0, "merge_group": 0, "push": 0, "other": 0})
         ev = r.get("event")
         level[ev if ev in ("merge_group", "push") else "pull_request" if ev in ("pull_request", "pull_request_target") else "other"] += 1
     j = READ_JOB_MINUTES  # job-derived numbers are None, never a measured zero, when the jobs were not read
     return {"self_hosted_min": round(sh, 1) if j else None, "hosted_min": round(ho, 1) if j else None, "macos_min": round(mac, 1) if j else None,
             "runner_wait_min": round(wait, 1) if j else None, "jobs_read": j, "red_events": sorted(red_events), "by_workflow": by_wf,
-            "runs": len(mine), "repeat_runs": repeats,
+            "runs": len(mine), "repeat_runs": repeats, "red_partial": red_partial, "run_fp": {str(i): run_fingerprint(r) for i, r in mine.items()},
             "group_runs": sum(1 for r in mine.values() if r.get("event") == "merge_group"), "complete": complete}
 
 
@@ -1059,13 +1073,13 @@ def collect_repo(repo, cache_dir, cap, owner, lo, hi, now, ticks, tick_ctx, fetc
         ok, why = eligible(f, managed_base)
         facts.append((f, ok, why))
     mrows = [f for f, ok, _ in facts if ok and f["merged_at"]]
-    need = [f for f in mrows if load_compute(rd, f["number"], f) is None]
     runs, runs_ok = [], False
-    if need:
+    if mrows:  # always read: a cached compute entry is validated against the current runs (a rerun changes a run in place)
         try:
-            runs, runs_ok = runs_index(rd, min(iso(f["created_at"]) for f in need), max(iso(f["merged_at"]) for f in need) + dt.timedelta(hours=1))
+            runs, runs_ok = runs_index(rd, min(iso(f["created_at"]) for f in mrows), max(iso(f["merged_at"]) for f in mrows) + dt.timedelta(hours=1))
         except (Truncated, ReadError):
             pass
+    runs_by_id = {r["id"]: r for r in runs} if runs_ok else None
     base_commits, commits_ok, req = [], False, None
     if mrows:
         try:
@@ -1097,7 +1111,7 @@ def collect_repo(repo, cache_dir, cap, owner, lo, hi, now, ticks, tick_ctx, fetc
             "repair_cycles": f["repair_cycles"], "compute": None, "correct": None, "path": None, "path_why": [], "cause_min": None,
         })
         if ok and merged:
-            comp = load_compute(rd, f["number"], f)
+            comp = load_compute(rd, f["number"], f, runs_by_id)
             if comp is None and runs_ok:
                 try:
                     comp = pr_compute(rd, f, runs, runs_ok)
