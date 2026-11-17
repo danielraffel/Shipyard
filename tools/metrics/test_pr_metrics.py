@@ -338,89 +338,21 @@ class Paths(unittest.TestCase):
         self.assertEqual((p["clean"]["n"], p["clean"]["median_min"], p["slow"]["n"], p["slow"]["median_min"], p["slow"]["p90_min"], p["unknown"]),
                          (3, 50.0, 2, 250.0, 400.0, 1))
         self.assertEqual(p["slow_share_pct"], 40.0)  # unknown is in neither path
-        cm = p["cause_min"]
-        self.assertEqual((p["top_cause"], cm["red"]["mean_min"], cm["hold"]["mean_min"], cm["dirty"]["mean_min"], cm["dirty"]["n"]), ("red", 60.0, 15.0, None, 0))
+        self.assertEqual((p["top_cause"], p["cause_min_per_merge"]["red"], p["cause_min_per_merge"]["hold"], p["cause_min_per_merge"]["dirty"]), ("red", 20.0, 5.0, None))
         self.assertEqual(pm.path_summary([])["top_cause"], None)
 
-    def test_a_cause_is_averaged_over_the_slow_prs_it_was_measured_for_never_over_all_merged_prs(self):
-        row = lambda red: {"handoff_min": 100.0, "path": "slow", "path_why": ["hold"], "cause_min": {"hold": 0.0, "red": red, "queue": 0.0, "runner": None, "dirty": None}}
-        rows = [row(60.0), row(None), {"handoff_min": 50.0, "path": "clean", "path_why": [], "cause_min": None}]
-        cm = pm.path_summary(rows)["cause_min"]
-        self.assertEqual((cm["red"]["mean_min"], cm["red"]["n"], cm["red"]["of_slow"]), (60.0, 1, 2))  # not 60 / 3 merged or 60 / 2 slow
-        self.assertEqual((cm["runner"]["mean_min"], cm["runner"]["n"]), (None, 0))
-
-    def test_a_commit_date_and_a_force_push_both_after_the_start_make_the_wait_unknown_not_a_guess(self):
-        f = self.f(hold_times=[T(10, "10:20")], push_times=[T(10, "10:30"), T(10, "10:50")], push_times_observed=[T(10, "10:50")])
-        self.assertIsNone(pm.cause_minutes(f, self.comp())["hold"])  # the repair commit is dated 10:30, its force-push 10:50
-        only_forced = self.f(hold_times=[T(10, "10:20")], push_times=[T(10, "10:50")], push_times_observed=[T(10, "10:50")])
-        self.assertEqual(pm.cause_minutes(only_forced, self.comp())["hold"], 30.0)
-
-    def test_a_wait_that_ends_at_a_force_push_is_exact_and_one_that_ends_at_a_commit_date_is_flagged(self):
-        f = self.f(hold_times=[T(10, "10:00")], push_times=[T(10, "10:20")], push_times_observed=[T(10, "10:20")])
-        c = pm.cause_minutes(f, self.comp())
-        self.assertEqual((c["hold"], c["estimated_endpoints"]), (20.0, False))
-        est = pm.cause_minutes(dict(f, push_times_observed=[]), self.comp())
-        self.assertEqual((est["hold"], est["estimated_endpoints"]), (20.0, True))
+    def test_the_summary_withholds_a_cause_when_one_slow_pr_is_unmeasured(self):
+        row = lambda lead, path, red: {"handoff_min": lead, "path": path, "path_why": ["red"] if path == "slow" else [],
+                                       "cause_min": {"hold": 0.0, "red": red, "queue": 0.0, "runner": 0.0, "dirty": None}}
+        p = pm.path_summary([row(40.0, "slow", 60.0), row(50.0, "slow", None), row(20.0, "clean", 0.0)])
+        self.assertIsNone(p["cause_min_per_merge"]["red"])
+        self.assertEqual(p["top_cause"], "hold")
 
     def test_the_report_prints_the_clean_and_slow_table(self):
         out = pm.build([REPO], tempfile.mkdtemp(), 50, OWNER, START, NOW, {}, {}, None, world([pr(1, T(10, "10:00"), T(10, "11:00"))]))
         md = pm.markdown(out)
         self.assertIn("### Clean and slow paths (window, merged PRs)", md)
         self.assertIn("| slow share | clean median (n) | slow median / p90 (n) | top cause |", md)
-
-
-class RerunAttempts(Base):
-    HEAD = f"h{1:040d}"[:40]
-
-    def world(self, attempt, prev_conclusion, readable=True):
-        p = pr(1, T(10, "09:00"), T(10, "11:00"))
-        run = {"id": 11, "name": "ci", "head_sha": self.HEAD, "event": "pull_request", "status": "completed", "conclusion": "success",
-               "head_branch": "feat", "run_attempt": attempt, "updated_at": T(10, "10:40")}
-        job = [{"labels": ["x"], "created_at": T(10, "10:00"), "started_at": T(10, "10:01"), "completed_at": T(10, "10:05"), "conclusion": "success"}]
-        gh = world([p], runs=[run], jobs={11: job})
-        if readable:
-            gh.routes.insert(0, (r"actions/runs/11/attempts/1", {"conclusion": prev_conclusion, "updated_at": T(10, "10:20")}))
-        return gh
-
-    def build_one(self, gh):
-        return pm.build([REPO], self.cache, 300, OWNER, START, NOW, {}, {}, None, gh, control=False)["repos"][REPO]["prs"][0]
-
-    def test_a_force_push_to_an_older_commit_ends_the_wait_at_the_force_push_not_at_the_merge(self):
-        p = pr(1, T(10, "10:00"), T(10, "12:00"))
-        tl = {1: [{"event": "commented", "user": {"login": "r"}, "created_at": T(10, "10:30"), "body": "HOLD: fix"},
-                  {"event": "head_ref_force_pushed", "actor": {"login": "x"}, "created_at": T(10, "10:50"), "after_sha": "o" * 40}]}
-        cm = {1: [commit("old", "x", "w", date=T(10, "09:00"))]}  # the commit is older than ready: it gives no push time by itself
-        out = self.build(world([p], tl, cm))
-        r = self.rows(out)[1]
-        self.assertEqual(r["cause_min"]["hold"], 20.0)  # 10:30 to the 10:50 force-push, not to the 12:00 merge
-        self.assertFalse(r["cause_min"]["estimated_endpoints"])
-
-    def test_every_earlier_attempt_is_read_even_when_the_latest_attempt_failed_too(self):
-        p = pr(1, T(10, "09:00"), T(10, "11:00"))
-        run = {"id": 11, "name": "ci", "head_sha": self.HEAD, "event": "pull_request", "status": "completed", "conclusion": "failure",
-               "head_branch": "feat", "run_attempt": 3, "updated_at": T(10, "10:40")}
-        gh = world([p], runs=[run], jobs={11: [{"labels": ["x"], "created_at": T(10, "10:00"), "started_at": T(10, "10:01"), "completed_at": T(10, "10:05"), "conclusion": "failure"}]})
-        gh.routes.insert(0, (r"actions/runs/11/attempts/1", {"conclusion": "failure", "updated_at": T(10, "10:10")}))
-        gh.routes.insert(0, (r"actions/runs/11/attempts/2", {"conclusion": "failure", "updated_at": T(10, "10:25")}))
-        r = self.build_one(gh)
-        self.assertEqual(r["compute"]["red_events"], [T(10, "10:10"), T(10, "10:25"), T(10, "10:40")])
-        shutil.rmtree(os.path.join(self.cache, REPO.replace("/", "__")))  # the first read was cached
-        gh2 = world([p], runs=[run], jobs={11: [{"labels": ["x"], "created_at": T(10, "10:00"), "started_at": T(10, "10:01"), "completed_at": T(10, "10:05"), "conclusion": "failure"}]})
-        self.assertFalse(self.build_one(gh2)["compute"]["complete"])  # earlier attempts unreadable: not complete even though the latest failed
-
-    def test_a_failed_first_attempt_followed_by_a_passing_rerun_still_makes_the_pr_red(self):
-        r = self.build_one(self.world(2, "failure"))
-        self.assertEqual((r["path"], r["path_why"], r["compute"]["red_events"]), ("slow", ["red"], [T(10, "10:20")]))
-
-    def test_a_rerun_whose_first_attempt_passed_is_clean_and_a_first_run_reads_no_attempts(self):
-        self.assertEqual(self.build_one(self.world(2, "success"))["path"], "clean")
-        gh = self.world(1, "failure")
-        self.assertEqual(self.build_one(gh)["path"], "clean")
-        self.assertFalse([c for c in gh.calls if "/attempts/" in c])
-
-    def test_unreadable_earlier_attempts_leave_the_pr_unknown_not_clean(self):
-        r = self.build_one(self.world(2, "failure", readable=False))
-        self.assertEqual((r["compute"]["complete"], r["path"]), (False, None))
 
 
 class JobsSkippedHold(Base):
@@ -492,6 +424,17 @@ class JobsSkipped(Base):
         r = self.rows(out)[1]
         self.assertEqual((r["path"], r["path_why"]), ("slow", ["red"]))
 
+    def test_a_successful_rerun_without_attempt_history_stays_unknown(self):
+        run = dict(self.runs[0], status="completed", conclusion="success", run_attempt=2)
+        gh = world([pr(1, T(10, "09:00"), T(10, "11:00"))], runs=[run], jobs={})
+        pm.READ_JOB_MINUTES = False
+        try:
+            out = pm.build([REPO], self.cache, 200, OWNER, START, NOW, {}, {}, None, gh, control=False)
+        finally:
+            pm.READ_JOB_MINUTES = True
+        r = self.rows(out)[1]
+        self.assertEqual((r["compute"]["complete"], r["path"]), (False, None))
+
 
 class MergeRemoval(Base):
     def test_a_removal_after_the_merge_is_not_an_ejection(self):
@@ -515,6 +458,20 @@ class MergeRemoval(Base):
         out = self.build(world([p], {1: [self.removal("11:00")]}))
         r = self.rows(out)[1]
         self.assertEqual((r["ejections"], "ejection" in r["path_why"]), ([], False))
+
+
+class ObservedPushTimes(Base):
+    def test_cause_minutes_use_observed_force_push_time_not_commit_date(self):
+        p = pr(1, T(10, "09:00"), T(10, "11:00"))
+        tl = {1: [{"event": "commented", "actor": {"login": "x"}, "body": "HOLD", "created_at": T(10, "10:00")},
+                  {"event": "head_ref_force_pushed", "before_sha": "old", "after_sha": "new", "created_at": T(10, "10:30")}]}
+        cm = {1: [commit("new", date=T(10, "09:05"))]}
+        gh = world([p], tl, commits=cm)
+        rd = pm.Reader(REPO, self.cache, 200, gh)
+        f = pm.pr_facts(rd, p, OWNER)
+        self.assertEqual(f["push_times"], [T(10, "10:30")])
+        c = pm.cause_minutes(f, {"complete": True, "red_events": [], "runner_wait_min": 0.0})
+        self.assertEqual(c["hold"], 30.0)
 
 
 class Correctness(Base):
@@ -1391,7 +1348,7 @@ class SyntheticControl(unittest.TestCase):
             "push_repeats_of_group_shas": (lambda runs: (0, 0), None),
             "steward_evidence": (lambda rd, f: False, "attribution.steward_merges_recognised"),
             "path_of": (lambda f, comp: ("clean", []), "paths.slow.n"),
-            "cause_minutes": (lambda f, comp: {"hold": 0.0, "red": 0.0, "queue": 0.0, "runner": 0.0, "dirty": None}, "paths.cause_min.red.mean_min"),
+            "cause_minutes": (lambda f, comp: {"hold": 0.0, "red": 0.0, "queue": 0.0, "runner": 0.0, "dirty": None}, "paths.cause_min_per_merge.red"),
         }
         for name, (fn, expect) in cases.items():
             if expect is None:
@@ -1411,7 +1368,7 @@ class SyntheticControl(unittest.TestCase):
         out = pm.build([REPO], tempfile.mkdtemp(), 50, OWNER, START, NOW, {}, {}, None, world([pr(1, T(10, "10:00"), T(10, "11:00"))]))
         self.assertEqual(out["synthetic_control"]["status"], "pass")
         md = pm.markdown(out)
-        self.assertIn("**CONTROL PASS: 54 of 54", md)
+        self.assertIn("**CONTROL PASS: 49 of 49", md)
         self.assertIn("| ready day |", md)
 
     def test_a_repo_with_no_live_control_reads_synthetic_not_unchecked(self):

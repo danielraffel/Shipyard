@@ -38,7 +38,7 @@ it is on only when the tick passes `--e2e-cache DIR` (the daily run does, unless
 **Synthetic control (every report).** `tools/metrics/synthetic_control.py` holds fifteen invented PRs, each
 built to have one known outcome (autonomous, owner label, steward merge, unbound owner merge, unsigned owner
 PR, never merged, reverted, red base, escaped, twice held with repair and merge-main pushes, ejected from the
-queue, a gate-run fixture with repeats). `expected()` derives 54 numbers from that table with plain arithmetic
+queue, a gate-run fixture with repeats). `expected()` derives 49 numbers from that table with plain arithmetic
 and never calls the scorecard; the real `pr_metrics.build` then runs over the same PRs, served from memory (no
 GitHub read, a throwaway cache), and every number must match. The report prints one line, `CONTROL PASS` with the
 count and the largest delta, or `CONTROL FAIL` with each missed number, its expected value, its value and the delta.
@@ -87,12 +87,12 @@ read as ejected and as slow.
 
 Each merged PR is `slow` when it had any HOLD, a failed run on one of its heads, an ejection from the merge queue
 or a DIRTY tick; `clean` when none of these and its compute was read in full; otherwise `unknown` (a failed run
-cannot be ruled out without the run list), and unknown PRs are in neither path. The report gives the slow share
+cannot be ruled out without the run list, and a successful rerun does not settle an earlier attempt), and unknown PRs are in neither path. The report gives the slow share
 (slow over slow plus clean), the clean median and the slow median and p90 lead time (first ready to merge), each
 with its n, and the minutes per merged PR that each cause held the slow PRs up: HOLD (each HOLD to the next push
-or the merge), red (each failed head run to the next push or the merge), queue (each enqueue to its removal or the
+or the merge), red (each failed head run to the next observed head update or the merge), queue (each enqueue to its removal or the
 merge), runner (queued job time from the jobs' `created_at` to `started_at`) and DIRTY (not measured: the ticks
-record a state, not a duration, so its cell is empty and never zero). Each cause is a mean over the slow PRs it was measured for, printed with that n out of all slow PRs, never divided by PRs it was not measured for. A hold or red wait ends at the next push: GitHub's timeline names a push time only for a force-push, so any other end is the commit's own date (never later than the push) and the PR is counted under `estimated endpoints`. When a commit date and an observed force-push both lie after a wait's start, which one ended it is unknown and the wait is None. A failed run is read from every attempt: a rerun keeps its run id and shows only its latest attempt, so earlier attempts are read, and a PR whose earlier attempts cannot be read stays unknown. The causes overlap and are not additive. The per-run jobs reads are most of a compute read; a measurement run can set `pr_metrics.READ_JOB_MINUTES = False` to classify paths from the run list alone (the runner cause is then empty and nothing is cached).
+record a state, not a duration, so its cell is empty and never zero). Push endpoints come from GitHub timeline head-update events, not commit timestamps; when an endpoint is unavailable, that cause is unknown. The causes overlap and are not additive. A cause aggregate is withheld when any slow PR lacks a measured value, so an unread value is never treated as zero. The per-run jobs reads are most of a compute read; a measurement run can set `pr_metrics.READ_JOB_MINUTES = False` to classify paths from the run list alone (the runner cause is then empty and nothing is cached).
 The top cause is the largest of the measured ones.
 
 ## Sample and comparison
