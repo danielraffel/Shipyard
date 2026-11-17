@@ -349,6 +349,12 @@ class Paths(unittest.TestCase):
         self.assertEqual((cm["red"]["mean_min"], cm["red"]["n"], cm["red"]["of_slow"]), (60.0, 1, 2))  # not 60 / 3 merged or 60 / 2 slow
         self.assertEqual((cm["runner"]["mean_min"], cm["runner"]["n"]), (None, 0))
 
+    def test_a_commit_date_and_a_force_push_both_after_the_start_make_the_wait_unknown_not_a_guess(self):
+        f = self.f(hold_times=[T(10, "10:20")], push_times=[T(10, "10:30"), T(10, "10:50")], push_times_observed=[T(10, "10:50")])
+        self.assertIsNone(pm.cause_minutes(f, self.comp())["hold"])  # the repair commit is dated 10:30, its force-push 10:50
+        only_forced = self.f(hold_times=[T(10, "10:20")], push_times=[T(10, "10:50")], push_times_observed=[T(10, "10:50")])
+        self.assertEqual(pm.cause_minutes(only_forced, self.comp())["hold"], 30.0)
+
     def test_a_wait_that_ends_at_a_force_push_is_exact_and_one_that_ends_at_a_commit_date_is_flagged(self):
         f = self.f(hold_times=[T(10, "10:00")], push_times=[T(10, "10:20")], push_times_observed=[T(10, "10:20")])
         c = pm.cause_minutes(f, self.comp())
@@ -388,6 +394,19 @@ class RerunAttempts(Base):
         r = self.rows(out)[1]
         self.assertEqual(r["cause_min"]["hold"], 20.0)  # 10:30 to the 10:50 force-push, not to the 12:00 merge
         self.assertFalse(r["cause_min"]["estimated_endpoints"])
+
+    def test_every_earlier_attempt_is_read_even_when_the_latest_attempt_failed_too(self):
+        p = pr(1, T(10, "09:00"), T(10, "11:00"))
+        run = {"id": 11, "name": "ci", "head_sha": self.HEAD, "event": "pull_request", "status": "completed", "conclusion": "failure",
+               "head_branch": "feat", "run_attempt": 3, "updated_at": T(10, "10:40")}
+        gh = world([p], runs=[run], jobs={11: [{"labels": ["x"], "created_at": T(10, "10:00"), "started_at": T(10, "10:01"), "completed_at": T(10, "10:05"), "conclusion": "failure"}]})
+        gh.routes.insert(0, (r"actions/runs/11/attempts/1", {"conclusion": "failure", "updated_at": T(10, "10:10")}))
+        gh.routes.insert(0, (r"actions/runs/11/attempts/2", {"conclusion": "failure", "updated_at": T(10, "10:25")}))
+        r = self.build_one(gh)
+        self.assertEqual(r["compute"]["red_events"], [T(10, "10:10"), T(10, "10:25"), T(10, "10:40")])
+        shutil.rmtree(os.path.join(self.cache, REPO.replace("/", "__")))  # the first read was cached
+        gh2 = world([p], runs=[run], jobs={11: [{"labels": ["x"], "created_at": T(10, "10:00"), "started_at": T(10, "10:01"), "completed_at": T(10, "10:05"), "conclusion": "failure"}]})
+        self.assertFalse(self.build_one(gh2)["compute"]["complete"])  # earlier attempts unreadable: not complete even though the latest failed
 
     def test_a_failed_first_attempt_followed_by_a_passing_rerun_still_makes_the_pr_red(self):
         r = self.build_one(self.world(2, "failure"))

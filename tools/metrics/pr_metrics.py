@@ -586,7 +586,7 @@ CAUSES = ("hold", "red", "queue", "runner", "dirty")
 
 
 def _wait_until_next(starts, nexts, merged, observed=None):
-    """(minutes, estimated): from each start to the next `nexts` event after it, or to the merge when none follows. With
+    """(minutes or None, estimated): from each start to the next `nexts` event after it, or to the merge when none follows. With
     `observed` (the head-update times seen on the timeline), a wait that ends at any other time ends at an estimate."""
     nexts = sorted(iso(x) for x in nexts if iso(x))
     seen = {iso(x) for x in observed or ()}
@@ -595,7 +595,11 @@ def _wait_until_next(starts, nexts, merged, observed=None):
         if st > merged:
             continue
         end = next((n for n in nexts if n > st), None)
-        estimated = estimated or (end is not None and end <= merged and observed is not None and end not in seen)
+        is_estimate = end is not None and end <= merged and observed is not None and end not in seen
+        if is_estimate and any(st < o <= merged for o in seen):
+            # a commit date and an observed force-push both lie after this start: which one ended the wait is not known
+            return None, True
+        estimated = estimated or is_estimate
         total += ((min(end, merged) if end else merged) - st).total_seconds() / 60.0
     return round(total, 1), estimated
 
@@ -630,6 +634,7 @@ def cause_minutes(f, comp):
     hold, est_h = _wait_until_next(f.get("hold_times") or [], pushes, m, observed)
     red, est_r = _wait_until_next(comp.get("red_events") or [], pushes, m, observed) if done else (None, False)
     queue, _ = _wait_until_next(f.get("enqueue_times") or [], f.get("dequeue_times") or [], m)
+    # a wait is None when a commit date and an observed force-push both follow its start (the push that ended it is unknown);
     # hold and red end at the next push; GitHub's timeline names a push time only for a force-push, so any other end is the
     # commit's own date (never later than the push): flagged, so the report can say the endpoint is an estimate
     return {"hold": hold, "red": red, "queue": queue, "runner": comp.get("runner_wait_min") if done else None, "dirty": None,
@@ -694,7 +699,7 @@ def pr_compute(rd, f, runs, runs_complete):
         on_head = r.get("head_sha") in heads and r.get("event") != "merge_group"
         if on_head and r.get("conclusion") in BAD_CONCLUSIONS and r.get("updated_at"):
             red_events.append(r["updated_at"])  # any failed non-merge-group run on one of the PR's heads
-        elif on_head and (r.get("run_attempt") or 1) > 1:
+        if on_head and (r.get("run_attempt") or 1) > 1:
             # a rerun keeps the run id and shows only its latest attempt: an earlier attempt that failed is a red the list hides
             try:
                 for k in range(1, r["run_attempt"]):
