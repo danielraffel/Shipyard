@@ -197,6 +197,9 @@ fn collect_report_with_github_auth(
     if let Some(entry) = check_ghapp_generation() {
         core.insert("ghapp-generation".to_owned(), entry);
     }
+    if let Some(entry) = check_release_identity() {
+        core.insert("release-identity".to_owned(), entry);
+    }
     if let Some(entry) = check_daemon_watched_repos(mode, state_dir) {
         core.insert("daemon-repos".to_owned(), entry);
     }
@@ -1330,6 +1333,51 @@ fn check_daemon_version_drift_with(
     Some(daemon_version_entry(
         crate::daemon_version::compare_daemon_version(status, cli_version)?,
     ))
+}
+
+/// Whether the active `~/.local/bin/shipyard` is the Developer ID release.
+/// macOS privacy grants follow that identity, so any other binary there (a
+/// local build, an ad-hoc re-sign) raises prompts that stall unattended work.
+/// Advisory for readiness: the binary itself still runs.
+fn check_release_identity() -> Option<DoctorEntry> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let active = crate::paths::home_dir().join(".local/bin/shipyard");
+    release_identity_entry(&active, crate::release_identity::check)
+}
+
+fn release_identity_entry(
+    active: &Path,
+    check: impl FnOnce(&Path) -> crate::release_identity::ReleaseIdentity,
+) -> Option<DoctorEntry> {
+    use crate::release_identity::{RELEASE_IDENTIFIER, RELEASE_TEAM, ReleaseIdentity};
+    if !active.exists() {
+        return None;
+    }
+    let resolved = std::fs::canonicalize(active).unwrap_or_else(|_| active.to_path_buf());
+    let expected = format!("Developer ID, identifier {RELEASE_IDENTIFIER}, team {RELEASE_TEAM}");
+    Some(match check(&resolved) {
+        ReleaseIdentity::Release => DoctorEntry::ok(format!("release identity ({expected})")),
+        ReleaseIdentity::NotRelease(detail) => DoctorEntry {
+            ok: false,
+            version: Some("not the Developer ID release".to_owned()),
+            detail: Some(format!(
+                "{} is not signed as the release ({expected}): {detail}. macOS treats it as a new \
+                 privacy identity, so unattended work that touches a protected location waits on a \
+                 prompt. Install the release with `shipyard runner fleet-update --to <tag> \
+                 --host-class <this host> --apply`.",
+                resolved.display()
+            )),
+            error: None,
+        },
+        ReleaseIdentity::Unchecked(detail) => DoctorEntry {
+            ok: false,
+            version: Some("release identity unchecked".to_owned()),
+            detail: Some(format!("could not check {}: {detail}", resolved.display())),
+            error: None,
+        },
+    })
 }
 
 fn check_ghapp_generation() -> Option<DoctorEntry> {
@@ -2508,6 +2556,52 @@ mod tests {
 
         assert!(entry.ok);
         assert_eq!(entry.version.as_deref(), Some("codesign + xattr healthy"));
+    }
+
+    #[test]
+    fn release_identity_reports_the_resolved_active_binary() {
+        use super::release_identity_entry;
+        use crate::release_identity::ReleaseIdentity;
+        let dir = tempfile::tempdir().expect("dir");
+        let generation = dir.path().join("generation-shipyard");
+        std::fs::write(&generation, b"x").expect("binary");
+        let active = dir.path().join("shipyard");
+        std::os::unix::fs::symlink(&generation, &active).expect("link");
+        let resolved = std::fs::canonicalize(&generation).expect("resolved");
+
+        let mut checked = None;
+        let entry = release_identity_entry(&active, |path| {
+            checked = Some(path.to_path_buf());
+            ReleaseIdentity::Release
+        })
+        .expect("entry");
+        assert!(entry.ok);
+        assert_eq!(checked.as_deref(), Some(resolved.as_path()));
+
+        let entry = release_identity_entry(&active, |_| {
+            ReleaseIdentity::NotRelease(
+                "code failed to satisfy specified code requirement(s)".to_owned(),
+            )
+        })
+        .expect("entry");
+        assert!(!entry.ok);
+        assert_eq!(
+            entry.version.as_deref(),
+            Some("not the Developer ID release")
+        );
+        let detail = entry.detail.expect("detail");
+        assert!(detail.contains("team 95CX6P84C4"), "{detail}");
+        assert!(detail.contains("shipyard runner fleet-update"), "{detail}");
+
+        let entry =
+            release_identity_entry(&active, |_| ReleaseIdentity::Unchecked("gone".to_owned()))
+                .expect("entry");
+        assert!(!entry.ok);
+
+        assert!(
+            release_identity_entry(&dir.path().join("absent"), |_| ReleaseIdentity::Release)
+                .is_none()
+        );
     }
 
     #[test]

@@ -361,6 +361,16 @@ an already-open wrapper may still require its release-matched helper, binary,
 or context. Generation garbage collection is a separate reader-aware operation,
 not part of rollout or rollback.
 
+On macOS the transaction refuses to activate a staged Shipyard binary that is
+not the Developer ID release (identifier `shipyard`, team `95CX6P84C4`),
+checked with `/usr/bin/codesign --verify --strict -R=...` before anything
+public moves. Privacy grants follow that identity, so another binary would
+raise prompts on an unattended host. The refusal exits 78, the receipt says
+`refused to activate: ...`, and the previous generation stays selected.
+`shipyard doctor` (`release-identity`) and `shipyard fleet status` (the
+per-host `shipyard:` line) report the active binary against the same
+requirement.
+
 Older fleet-update releases v0.100.0 through v0.130.x used the legacy
 four-target transaction and nine-line recovery journal, with no resolver
 context or unsupported probe; the current client does not target them.

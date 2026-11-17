@@ -10,6 +10,10 @@ use crate::app::fleet_update_cmd::test_release_authority;
 const NEW_WRAPPER: &[u8] = b"#!/bin/bash\n# Shipyard-Auth-Generation-Contract: auth-selector-v2\n# Shipyard-Sibling-Close-Guard-Contract: sibling-close-guard-v1\n# Shipyard-Stable-Public-Trampoline-Contract: stable-selector-v1\n# Shipyard-Stable-Public-Trampoline-BEGIN\n# Shipyard-Stable-Public-Trampoline-END\nexit 0\n";
 const PUBLIC_TRAMPOLINE: &[u8] = b"#!/bin/bash\n# Shipyard-Auth-Generation-Contract: auth-selector-v2\n# Shipyard-Sibling-Close-Guard-Contract: sibling-close-guard-v1\n# Shipyard-Stable-Public-Trampoline-Contract: stable-selector-v1\n# Shipyard-Stable-Public-Trampoline-BEGIN\n# Shipyard-Stable-Public-Trampoline-END\necho \"ghapp: stable public trampoline fell through\" >&2\nexit 1\n";
 
+/// Every fixture binary is an unsigned script; tests that are not about the
+/// release identity accept it.
+const ACCEPTING_CODESIGN: &str = "/usr/bin/true";
+
 fn digest(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
@@ -70,6 +74,9 @@ struct RunOptions {
     refresh_prefix: &'static str,
     refresh: RefreshBehavior,
     lock_publish: LockPublishBehavior,
+    codesign: String,
+    /// Replaces the staged release binary after the fixture writes it.
+    staged_binary: Option<PathBuf>,
 }
 
 impl Default for RunOptions {
@@ -81,6 +88,8 @@ impl Default for RunOptions {
             refresh_prefix: "",
             refresh: RefreshBehavior::Success,
             lock_publish: LockPublishBehavior::Success,
+            codesign: ACCEPTING_CODESIGN.to_owned(),
+            staged_binary: None,
         }
     }
 }
@@ -240,23 +249,38 @@ impl Fixture {
         )
     }
 
+    /// The installed pair every run starts from when a test did not set one.
+    fn seed_installed_pair(&self) {
+        for path in [self.binary(), self.companion()] {
+            if !path.exists() {
+                crate::test_support::write_executable_script_with_mode(
+                    &path,
+                    "#!/bin/sh\nexit 0\n",
+                    0o700,
+                );
+            }
+        }
+    }
+
     fn run_output(&self, options: RunOptions) -> Output {
         let resolver_required =
             crate::app::fleet_update_cmd::tag_supports_auth_resolver(options.target);
         let state = self.state();
         let binary = self.binary();
         let companion = self.companion();
-        for path in [&binary, &companion] {
-            if !path.exists() {
-                crate::test_support::write_executable_script_with_mode(
-                    path,
-                    "#!/bin/sh\nexit 0\n",
-                    0o700,
-                );
-            }
-        }
+        self.seed_installed_pair();
 
-        let installed_binary = self.installed_binary_command(&options, &state, &binary);
+        let mut installed_binary = self.installed_binary_command(&options, &state, &binary);
+        if let Some(staged) = &options.staged_binary {
+            use std::fmt::Write as _;
+            write!(
+                installed_binary,
+                "; /bin/cp {} \"$auth_generation_stage/shipyard\"",
+                shlex_quote(&staged.display().to_string())
+            )
+            .expect("write to String");
+        }
+        let codesign = options.codesign.clone();
         let script = install_transaction(
             &self.helper,
             &self.wrapper,
@@ -268,6 +292,7 @@ impl Fixture {
             &shlex_quote(&self.wrapper_source.display().to_string()),
             &shlex_quote(&self.close_guard_source.display().to_string()),
             &installed_binary,
+            &codesign,
             "shipyard",
             &state,
             &state,
@@ -900,6 +925,7 @@ fn guardless_generation_is_anchored_and_restored_after_the_public_guard() {
         &shlex_quote(&fixture.wrapper_source.display().to_string()),
         &shlex_quote(&fixture.close_guard_source.display().to_string()),
         "/bin/true",
+        ACCEPTING_CODESIGN,
         "shipyard",
         &state,
         &state,
@@ -927,4 +953,194 @@ fn guardless_generation_is_anchored_and_restored_after_the_public_guard() {
     assert!(guard_restore < legacy_selector_restore);
     assert!(restore.contains("auth_restore_wrapper_first=0"));
     assert!(restore.contains("Shipyard-Sibling-Close-Guard-Contract: sibling-close-guard-v1"));
+}
+
+/// Whatever was public before the run: the binary, helper and wrapper paths,
+/// the generation directories, and the transaction's lock and journal.
+fn public_state(fixture: &Fixture) -> Vec<String> {
+    fixture.seed_installed_pair();
+    let mut seen = Vec::new();
+    for path in [
+        fixture.binary(),
+        fixture.companion(),
+        fixture.helper.clone(),
+        fixture.wrapper.clone(),
+        fixture.wrapper.with_extension("shipyard-generation"),
+        fixture.state().join("fleet-auth-support.lock"),
+        fixture.state().join("fleet-auth-support.transaction"),
+    ] {
+        seen.push(format!(
+            "{} exists={} link={:?}",
+            path.display(),
+            path.exists() || path.is_symlink(),
+            std::fs::read_link(&path).ok()
+        ));
+    }
+    let generations = fixture
+        .root
+        .path()
+        .join(".local/share/shipyard/auth-generations");
+    let mut entries = std::fs::read_dir(&generations)
+        .map(|dir| {
+            dir.map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    entries.sort();
+    seen.push(format!("generations={entries:?}"));
+    seen
+}
+
+fn assert_refused(output: &Output) {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(ACTIVATION_REFUSED_EXIT_CODE),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.lines().any(|line| line == ACTIVATION_REFUSED_MARKER),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("refused to activate this release"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("team 95CX6P84C4"), "{stderr}");
+    assert!(
+        stderr.contains("The active generation is unchanged."),
+        "{stderr}"
+    );
+    // The refusal names no way around it.
+    for word in ["override", "ALLOW", "SKIP", "bypass", "--force"] {
+        assert!(!stderr.contains(word), "refusal names {word}: {stderr}");
+    }
+}
+
+#[test]
+fn a_binary_codesign_refuses_is_never_activated() {
+    let fixture = Fixture::new();
+    let refuse = fixture.root.path().join("codesign-refuses");
+    crate::test_support::write_executable_script_with_mode(
+        &refuse,
+        "#!/bin/sh\necho 'test-requirement: code failed to satisfy specified code requirement(s)' >&2\nexit 3\n",
+        0o700,
+    );
+    let before = public_state(&fixture);
+    let output = fixture.run_output(RunOptions {
+        codesign: refuse.display().to_string(),
+        ..RunOptions::default()
+    });
+    assert_refused(&output);
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("codesign: test-requirement: code failed to satisfy"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // Nothing public moved, no generation or stage is left, and the lock is free.
+    assert_eq!(public_state(&fixture), before);
+    // The lock really is free: the same release installs once codesign accepts it.
+    assert!(fixture.run(RunOptions::default()).success());
+}
+
+#[test]
+fn a_missing_codesign_refuses_rather_than_skipping_the_check() {
+    let fixture = Fixture::new();
+    let before = public_state(&fixture);
+    let output = fixture.run_output(RunOptions {
+        codesign: "/nonexistent/codesign".to_owned(),
+        ..RunOptions::default()
+    });
+    assert_refused(&output);
+    assert_eq!(public_state(&fixture), before);
+}
+
+#[test]
+fn the_staged_binary_is_checked_against_the_exact_release_requirement() {
+    let fixture = Fixture::new();
+    let accept = fixture.root.path().join("codesign-checks-argv");
+    let calls = fixture.root.path().join("codesign-calls");
+    crate::test_support::write_executable_script_with_mode(
+        &accept,
+        &format!(
+            "#!/bin/sh\n/usr/bin/printf '%s\\n' \"$@\" >> {calls}\ntest \"$#\" = 4 || exit 9\ntest \"$1\" = --verify || exit 9\ntest \"$2\" = --strict || exit 9\ntest \"$3\" = {requirement} || exit 9\ncase \"$4\" in */.stage.*/shipyard) ;; *) exit 9 ;; esac\ntest -x \"$4\" || exit 9\n",
+            calls = shlex_quote(&calls.display().to_string()),
+            requirement = shlex_quote(&format!(
+                "-R={}",
+                crate::release_identity::RELEASE_REQUIREMENT
+            )),
+        ),
+        0o700,
+    );
+    let output = fixture.run_output(RunOptions {
+        codesign: accept.display().to_string(),
+        ..RunOptions::default()
+    });
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let calls = std::fs::read_to_string(calls).expect("codesign ran");
+    assert_eq!(
+        calls.lines().count(),
+        4,
+        "exactly one codesign call: {calls}"
+    );
+    assert!(
+        std::fs::read_link(fixture.binary())
+            .expect("binary selected")
+            .ends_with("shipyard")
+    );
+}
+
+/// The real codesign, through the generated quoting: the fixture's unsigned
+/// script is refused, so the requirement reaches codesign intact.
+#[cfg(target_os = "macos")]
+#[test]
+fn real_codesign_refuses_an_unsigned_release_binary() {
+    let fixture = Fixture::new();
+    let before = public_state(&fixture);
+    let output = fixture.run_output(RunOptions {
+        codesign: crate::release_identity::CODESIGN.to_owned(),
+        ..RunOptions::default()
+    });
+    assert_refused(&output);
+    assert_eq!(public_state(&fixture), before);
+}
+
+/// The real codesign on an ad-hoc signed binary, the shape install.sh's
+/// re-sign or a local build produces: refused, nothing moves.
+#[cfg(target_os = "macos")]
+#[test]
+fn real_codesign_refuses_an_ad_hoc_signed_release_binary() {
+    let fixture = Fixture::new();
+    let adhoc = fixture.root.path().join("adhoc-shipyard");
+    std::fs::copy("/usr/bin/true", &adhoc).expect("copy");
+    let signed = Command::new(crate::release_identity::CODESIGN)
+        .args(["--force", "--sign", "-"])
+        .arg(&adhoc)
+        .output()
+        .expect("codesign");
+    assert!(signed.status.success(), "ad-hoc sign: {signed:?}");
+    let before = public_state(&fixture);
+    let output = fixture.run_output(RunOptions {
+        codesign: crate::release_identity::CODESIGN.to_owned(),
+        staged_binary: Some(adhoc),
+        ..RunOptions::default()
+    });
+    assert_refused(&output);
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("codesign: "),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(public_state(&fixture), before);
 }

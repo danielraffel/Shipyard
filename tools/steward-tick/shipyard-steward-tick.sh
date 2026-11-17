@@ -419,6 +419,61 @@ fi
 # that did something (pass, fail, error) reach summary.log as a `release-canary`
 # line. Detached like the others since a rehearsal can take many minutes; the
 # command takes its own per-repo lock. SHIPYARD_RELEASE_CANARY=off turns it off.
+#
+# A rehearsal outlives the tick, and once the tick's launcher exits macOS
+# attributes a detached process to itself: the Shipyard release under its
+# auth-generations path, a new privacy identity after every install. So when
+# this tick runs under the launcher, each rehearsal runs through the launcher,
+# spawned with the responsibility disclaim: the launcher bundle is then its
+# own responsible process and the Shipyard it runs inherits it. The deadline
+# is kept by that spawner, not by `timeout` (which would become the identity).
+# When the disclaim is unavailable the rehearsal runs directly, as before, with
+# one `launcher-fallback ... FINDING` line.
+canary_launcher=
+if [ "$launcher_path" = app ] && [ -x "$launcher_exe" ] && [ "$steward_bin" = "$HOME/.local/bin/shipyard" ]; then
+  canary_launcher=$launcher_exe
+fi
+# disclaim_run SECONDS ARGV...: posix_spawn ARGV as its own responsible
+# process, wait at most SECONDS (TERM, then KILL), exit with its status. Exits
+# 125 and prints SHIPYARD_DISCLAIM_UNAVAILABLE, having run nothing, when the
+# disclaim cannot be set.
+disclaim_run_py='
+import ctypes, os, signal, sys, time
+seconds, argv = float(sys.argv[1]), sys.argv[2:]
+def unavailable(why):
+    print(f"SHIPYARD_DISCLAIM_UNAVAILABLE {why}", flush=True)
+    sys.exit(125)
+try:
+    libc = ctypes.CDLL(None)
+    attr = ctypes.c_void_p()
+    if libc.posix_spawnattr_init(ctypes.byref(attr)) != 0:
+        unavailable("posix_spawnattr_init")
+    if libc.responsibility_spawnattrs_setdisclaim(ctypes.byref(attr), 1) != 0:
+        unavailable("responsibility_spawnattrs_setdisclaim")
+except (OSError, AttributeError) as error:
+    unavailable(type(error).__name__)
+args = (ctypes.c_char_p * (len(argv) + 1))(*[os.fsencode(a) for a in argv], None)
+env = [os.fsencode(f"{k}={v}") for k, v in os.environ.items()]
+envp = (ctypes.c_char_p * (len(env) + 1))(*env, None)
+pid = ctypes.c_int()
+if libc.posix_spawn(ctypes.byref(pid), os.fsencode(argv[0]), None, ctypes.byref(attr), args, envp) != 0:
+    unavailable("posix_spawn")
+end = time.monotonic() + seconds
+while True:
+    done, status = os.waitpid(pid.value, os.WNOHANG)
+    if done:
+        sys.exit(os.WEXITSTATUS(status) if os.WIFEXITED(status) else 128 + os.WTERMSIG(status))
+    if time.monotonic() >= end:
+        os.kill(pid.value, signal.SIGTERM)
+        time.sleep(5)
+        try:
+            os.kill(pid.value, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        os.waitpid(pid.value, 0)
+        sys.exit(124)
+    time.sleep(1)
+'
 if [ "${SHIPYARD_RELEASE_CANARY:-on}" != "off" ] && "$steward_bin" release-canary run --help >/dev/null 2>&1; then
   /usr/bin/python3 -c '
 import os, sys
@@ -432,14 +487,27 @@ for n in (0, 1, 2):
     os.dup2(fd, n)
 os.execv("/bin/bash", ["bash", "-c", sys.argv[1], "release-canary"] + sys.argv[2:])
 ' '
-  bin=$1 clones=$2 log=$3 stamp=$4; shift 4
+  bin=$1 clones=$2 log=$3 stamp=$4 launcher=$5 run_py=$6; shift 6
   for repo in "$@"; do
     [ -d "$clones/${repo#*/}/.git" ] || continue
-    line=$(cd "$clones/${repo#*/}" && timeout 3600 "$bin" release-canary run --repo "$repo" --daily --apply 2>&1 | tail -n 1)
+    via=direct out=
+    if [ -n "$launcher" ]; then
+      out=$(cd "$clones/${repo#*/}" && /usr/bin/python3 -c "$run_py" 3600 "$launcher" release-canary run --repo "$repo" --daily --apply 2>&1)
+      case "$out" in
+        SHIPYARD_DISCLAIM_UNAVAILABLE*)
+          echo "$stamp launcher-fallback reason=disclaim_unavailable FINDING detail=release-canary_$(printf "%s" "${out#SHIPYARD_DISCLAIM_UNAVAILABLE }" | head -c 80 | tr -c "A-Za-z0-9_-" "_")" >> "$log/summary.log"
+          out= ;;
+        *) via=app ;;
+      esac
+    fi
+    if [ "$via" = direct ]; then
+      out=$(cd "$clones/${repo#*/}" && timeout 3600 "$bin" release-canary run --repo "$repo" --daily --apply 2>&1)
+    fi
+    line=$(printf "%s\n" "$out" | tail -n 1)
     case "$line" in
       "release-canary status=skipped"*|"") ;;
-      *) echo "$stamp $repo $line" >> "$log/summary.log" ;;
+      *) echo "$stamp $repo $line launcher=$via" >> "$log/summary.log" ;;
     esac
   done
-' "$steward_bin" "$clones" "$log_dir" "$stamp" "${repos[@]}" || true
+' "$steward_bin" "$clones" "$log_dir" "$stamp" "$canary_launcher" "$disclaim_run_py" "${repos[@]}" || true
 fi

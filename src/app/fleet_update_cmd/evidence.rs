@@ -289,6 +289,17 @@ pub(super) fn classify_update_failure(output: &Output) -> PlanExecutionError {
                 .to_owned(),
         );
     }
+    let refused_marker = String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .any(|line| line.trim() == auth_support::ACTIVATION_REFUSED_MARKER);
+    if code == Some(auth_support::ACTIVATION_REFUSED_EXIT_CODE) && refused_marker {
+        return PlanExecutionError::Failed(format!(
+            "refused to activate: the staged shipyard binary is not signed with Developer ID \
+             as identifier {} by team {}; the active generation is unchanged",
+            crate::release_identity::RELEASE_IDENTIFIER,
+            crate::release_identity::RELEASE_TEAM,
+        ));
+    }
     PlanExecutionError::Failed(format!("update command exited {}", code.unwrap_or(-1)))
 }
 

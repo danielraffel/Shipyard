@@ -1800,6 +1800,26 @@ through a curl shim that also serves a `checksums.sha256` with the SHA-256 the
 controller pinned, so an install.sh that refuses releases without a checksums
 manifest still installs over fleet-update.
 
+On macOS the transaction **activates only the Developer ID release**. Right
+after the release binary is staged, and before anything public moves, it runs
+`/usr/bin/codesign --verify --strict -R=<requirement>` on it. The requirement
+is identifier `shipyard`, an Apple-anchored Developer ID Application
+certificate, team `95CX6P84C4` (`src/release_identity.rs`). macOS privacy
+(TCC) grants follow that identity, so any other binary, such as an
+installer's ad-hoc re-sign or a local build, would be a new identity that
+raises prompts nobody answers on an unattended host. A binary that fails the
+check, or a missing codesign, exits 78 with
+`SHIPYARD_FLEET_ACTIVATION_REFUSED=not-developer-id-release`. The receipt says
+`refused to activate: ...`, the stage and lock are released, and the active
+generation stays selected. There is no override. The install runs with
+`SHIPYARD_NO_ADHOC_FALLBACK=1`, so install.sh never strips the release
+signature to get a binary to launch. `shipyard doctor` reports the active
+`~/.local/bin/shipyard` against the same requirement (`release-identity`,
+advisory). `shipyard fleet status` prints one `shipyard:` line per host: the
+version, whether it is the Developer ID release, and that host's TartCI
+tool-freshness verdict (`current`/`behind` and the latest release). The line
+is informational and never makes a host unroutable.
+
 Every applied host is then **independently verified** in a fresh process:
 - the installed `shipyard --version` must equal the target;
 - `daemon status` must answer as that version from the refreshed pid (the daemon's pid file, alive);

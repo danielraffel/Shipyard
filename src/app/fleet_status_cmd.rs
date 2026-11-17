@@ -1336,8 +1336,34 @@ fn storage_probe_script(disk_path: &str) -> String {
          if command -v ccache >/dev/null 2>&1; then \
            ccache --print-stats 2>/dev/null | \
              awk -F '\\t' '$1 == \"cache_size_kibibyte\" || $1 == \"max_cache_size_kibibyte\" {{print}}'; \
+         fi; {}",
+        shlex_quote(disk_path),
+        shipyard_install_probe_script()
+    )
+}
+
+/// The active Shipyard's version and signing identity, and the host's own
+/// `TartCI` freshness verdict for it. `$HOME` expands on the far side.
+fn shipyard_install_probe_script() -> String {
+    format!(
+        "b=\"$HOME/.local/bin/shipyard\"; if [ -x \"$b\" ]; then \
+           printf 'shipyard_version\\t%s\\n' \"$(\"$b\" --version 2>/dev/null | awk 'NR == 1 {{print $2}}')\"; \
+           if [ \"$(uname -s)\" = Darwin ]; then \
+             if {codesign} --verify --strict {requirement} \"$b\" >/dev/null 2>&1; then \
+               printf 'shipyard_identity\\trelease\\n'; \
+             else printf 'shipyard_identity\\tnot_release\\n'; fi; \
+           fi; \
+         fi; \
+         f=\"$HOME/.tartci/state/tool-freshness/state.json\"; \
+         if [ -r \"$f\" ] && [ -x /usr/bin/plutil ]; then \
+           printf 'shipyard_latest\\t%s\\n' \"$(/usr/bin/plutil -extract tools.shipyard.latest raw -o - \"$f\" 2>/dev/null)\"; \
+           printf 'shipyard_freshness\\t%s\\n' \"$(/usr/bin/plutil -extract tools.shipyard.state raw -o - \"$f\" 2>/dev/null)\"; \
          fi",
-        shlex_quote(disk_path)
+        codesign = crate::release_identity::CODESIGN,
+        requirement = shlex_quote(&format!(
+            "-R={}",
+            crate::release_identity::RELEASE_REQUIREMENT
+        )),
     )
 }
 
@@ -1365,11 +1391,20 @@ fn storage_probe_from_output(output: &Output, fallback_path: &str) -> StoragePro
             "max_cache_size_kibibyte" => {
                 probe.ccache_max_kibibyte = value.trim().parse().ok();
             }
+            "shipyard_version" => probe.shipyard.version = non_empty(value),
+            "shipyard_identity" => probe.shipyard.identity = non_empty(value),
+            "shipyard_latest" => probe.shipyard.latest = non_empty(value),
+            "shipyard_freshness" => probe.shipyard.freshness = non_empty(value),
             _ => {}
         }
     }
     probe.readable = output.status.success() && probe.disk_available_kibibyte.is_some();
     probe
+}
+
+fn non_empty(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_owned())
 }
 
 /// Backoff before each retry of the repo-scope runner census.
