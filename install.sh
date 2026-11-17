@@ -252,12 +252,12 @@ fi
 
 mkdir -p "${INSTALL_DIR}"
 
-# The release identity check. SHIPYARD_INSTALL_TEST_CODESIGN exists only for
-# install.sh's own tests (a fixture codesign); SHIPYARD_INSTALL_ALLOW_UNSIGNED_DEV=1
-# is the repository owner's developer mode for installing a local build, never
+# The release identity check, always with the system codesign: nothing in the
+# environment can point it elsewhere. SHIPYARD_INSTALL_ALLOW_UNSIGNED_DEV=1 is
+# the repository owner's developer mode for installing a local build, never
 # set by agents or automation (docs/install.md).
 RELEASE_TEAM="95CX6P84C4"
-RELEASE_CODESIGN="${SHIPYARD_INSTALL_TEST_CODESIGN:-/usr/bin/codesign}"
+RELEASE_CODESIGN="/usr/bin/codesign"
 UNSIGNED_DEV="${SHIPYARD_INSTALL_ALLOW_UNSIGNED_DEV:-0}"
 
 release_requirement() {
@@ -266,9 +266,10 @@ release_requirement() {
 }
 
 # require_release_identity BINARY IDENTIFIER: exit 1 unless BINARY is the
-# Developer ID release signed as IDENTIFIER. Runs before anything replaces the
-# installed binaries, and again on them after the swap (the EXIT trap then
-# restores the previous install).
+# Developer ID release signed as IDENTIFIER. Runs before the binary is ever
+# executed (the smoke test runs it) and before anything replaces the installed
+# binaries, and again on them after the swap (the EXIT trap then restores the
+# previous install).
 require_release_identity() {
     binary="$1"
     identifier="$2"
@@ -322,21 +323,6 @@ smoke_binary_or_repair() {
         printf '%s\n' "${version}"
         return 0
     fi
-    # Stripping the release signature yields an ad-hoc identity, which the
-    # release identity check refuses; only a local build may take this path.
-    if [ "${OS}" = "macos" ] \
-        && [ "${UNSIGNED_DEV}" = "1" ] \
-        && [ "${SHIPYARD_NO_ADHOC_FALLBACK:-0}" != "1" ] \
-        && command -v codesign >/dev/null 2>&1; then
-        team_line=$(codesign -dv "${binary}" 2>&1 | grep "^TeamIdentifier=") || team_line=""
-        if [ -n "${team_line}" ] && [ "${team_line}" != "TeamIdentifier=not set" ]; then
-            echo "WARN: notarized binary would not launch; trying local ad-hoc fallback." >&2
-            xattr -cr "${binary}" 2>/dev/null || true
-            codesign --remove-signature "${binary}" 2>/dev/null || true
-            codesign --force --sign - "${binary}" 2>/dev/null || true
-        fi
-    fi
-    version="$(binary_semver "${binary}" "${binary_label}")" || version=""
     if [ -z "${version}" ]; then
         echo "ERROR: ${binary_label} installed but failed post-install smoke." >&2
         echo "Expected '${binary_label} <semantic-version>' from '${binary} --version'." >&2
@@ -590,13 +576,13 @@ if [ "${REQUIRE_PROVIDER}" = "1" ]; then
 fi
 
 prepare_macos_binary "${STAGED_DEST}"
-STAGED_VERSION="$(smoke_binary_or_repair "${STAGED_DEST}" "${BINARY_VERSION_NAME}")"
 require_release_identity "${STAGED_DEST}" "${BINARY_VERSION_NAME}"
+STAGED_VERSION="$(smoke_binary_or_repair "${STAGED_DEST}" "${BINARY_VERSION_NAME}")"
 if [ "${REQUIRE_PROVIDER}" = "1" ]; then
     prepare_macos_binary "${STAGED_PROVIDER_DEST}"
+    require_release_identity "${STAGED_PROVIDER_DEST}" "${PROVIDER_VERSION_NAME}"
     STAGED_PROVIDER_VERSION="$(smoke_binary_or_repair \
         "${STAGED_PROVIDER_DEST}" "${PROVIDER_VERSION_NAME}")"
-    require_release_identity "${STAGED_PROVIDER_DEST}" "${PROVIDER_VERSION_NAME}"
     if [ "${STAGED_VERSION}" != "${STAGED_PROVIDER_VERSION}" ]; then
         echo "ERROR: release binary version mismatch: ${BINARY_NAME}=${STAGED_VERSION} ${PROVIDER_BINARY_NAME}=${STAGED_PROVIDER_VERSION}." >&2
         exit 1
@@ -629,12 +615,12 @@ else
     rm -f "${PROVIDER_DEST}"
 fi
 ln -sf "${DEST}" "${INSTALL_DIR}/${ALIAS_NAME}"
-INSTALLED_VERSION="$(smoke_binary_or_repair "${DEST}" "${BINARY_VERSION_NAME}")"
 require_release_identity "${DEST}" "${BINARY_VERSION_NAME}"
+INSTALLED_VERSION="$(smoke_binary_or_repair "${DEST}" "${BINARY_VERSION_NAME}")"
 if [ "${REQUIRE_PROVIDER}" = "1" ]; then
+    require_release_identity "${PROVIDER_DEST}" "${PROVIDER_VERSION_NAME}"
     INSTALLED_PROVIDER_VERSION="$(smoke_binary_or_repair \
         "${PROVIDER_DEST}" "${PROVIDER_VERSION_NAME}")"
-    require_release_identity "${PROVIDER_DEST}" "${PROVIDER_VERSION_NAME}"
     if [ "${INSTALLED_VERSION}" != "${INSTALLED_PROVIDER_VERSION}" ]; then
         echo "ERROR: installed binary version mismatch: ${BINARY_NAME}=${INSTALLED_VERSION} ${PROVIDER_BINARY_NAME}=${INSTALLED_PROVIDER_VERSION}." >&2
         exit 1

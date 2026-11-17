@@ -1785,11 +1785,12 @@ left `api …/logs` refused after release.
 On macOS, `install.sh` and `shipyard update` install only the Developer ID
 release (identifier `shipyard` / `shipyard-workstream-provider`, team
 `95CX6P84C4`, checked with `/usr/bin/codesign --verify --strict -R=...`). A
-binary that fails is not installed and the previous pair stays. `shipyard
-update` snapshots the installed pair before running the target tag's
-installer, which may predate the check, and restores it on a failure
-(`src/app/update_cmd/install_identity.rs`). install.sh no longer re-signs ad
-hoc. The owner-only developer mode is documented in docs/install.md; agents
+binary that fails is never executed or installed, and the previous pair
+stays. On macOS `shipyard update` refuses a target tag whose installer
+predates the check (older installers write in place, so nothing could undo
+them), before running it (`src/app/update_cmd/install_identity.rs`).
+install.sh always runs `/usr/bin/codesign` (its tests rewrite a copy, never
+the environment) and no longer re-signs ad hoc. The owner-only developer mode is documented in docs/install.md; agents
 never use it.
 
 `shipyard update` never installs the ghapp wrapper: `~/.local/bin/ghapp` runs
