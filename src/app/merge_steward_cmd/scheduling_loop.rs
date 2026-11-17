@@ -519,13 +519,20 @@ pub(crate) fn for_row(
         Some(seen) => specific_evidence(state, facts, quarantined_at)
             .filter(|at| seen.observed_at.is_none_or(|floor| *at >= floor))
             .unwrap_or(now),
-        // First sight of this head (a push, or the first pass after a
-        // deploy): the earliest of every applicable timestamp the pass has,
-        // so an older dwell or row time is never discarded. `queued` and
-        // `quarantined` are decided by the queue and the file, not the row's
-        // token, so the row's and dwell's times date another state there.
+        // First sight of this head: the earliest of every applicable
+        // timestamp the pass has, so an older dwell or row time is never
+        // discarded. `queued` and `quarantined` are decided by the queue and
+        // the file, not the row's token, so the row's and dwell's times date
+        // another state there.
+        //
+        // When an earlier head of this pull request was on record, the new
+        // head is a push: escalation restarts with it. No evidence older than
+        // the last pass that saw the old head can date it (a head commit's
+        // own date is the author's clock and can predate the push by a day),
+        // so such a time would start the new head at the old head's level.
         None => {
             let token_dated = !matches!(state, LoopState::Queued | LoopState::Quarantined);
+            let floor = seen.and_then(|prior| prior.observed_at);
             [
                 specific_evidence(state, facts, quarantined_at),
                 facts.dwell_since.filter(|_| token_dated),
@@ -533,6 +540,7 @@ pub(crate) fn for_row(
             ]
             .into_iter()
             .flatten()
+            .filter(|at| floor.is_none_or(|floor| *at >= floor))
             .min()
             .unwrap_or(now)
         }

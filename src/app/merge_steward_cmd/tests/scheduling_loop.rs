@@ -236,15 +236,16 @@ fn since_is_the_earliest_evidence_at_this_head_and_a_new_head_starts_over() {
     );
     let other = "b".repeat(40);
     let other: &'static str = Box::leak(other.into_boxed_str());
+    // Evidence after the last pass that saw the old head can date the push.
     let (fresh, record) = for_row(
         REPO,
-        &facts(other, Some(ago(10))),
+        &facts(other, Some(ago(3))),
         Some(&seen),
         &quarantine,
         now(),
     )
     .expect("covered");
-    assert_eq!(fresh.since, ago(10).to_rfc3339(), "a push starts it over");
+    assert_eq!(fresh.since, ago(3).to_rfc3339(), "a push starts it over");
     assert_eq!(record.head, other);
     let (undated, _) =
         for_row(REPO, &facts(HEAD, None), None, &quarantine, now()).expect("covered");
@@ -570,4 +571,59 @@ fn first_sight_uses_the_earliest_applicable_timestamp() {
     let (state, _) =
         for_row(REPO, &base, Some(&running), &BTreeMap::new(), now()).expect("covered");
     assert_eq!(state.since, now().to_rfc3339());
+}
+
+/// tartci #879: the entry sat at level 3 in a state for a day; the head then
+/// changed and its checks restarted (`required_pending`), but the head commit's
+/// own date (the author's clock, a day older than the push) dated the new
+/// state and the PR went on at level 3, coordinator, while CI was running.
+/// A head change or a state change restarts escalation at level 0.
+#[test]
+fn a_new_head_or_state_restarts_escalation_even_when_its_commit_date_is_old() {
+    let quarantine = BTreeMap::new();
+    let old_head = Seen {
+        state: LoopState::RequiredRed,
+        head: HEAD.to_owned(),
+        since: ago(36 * 60),
+        observed_at: Some(ago(5)),
+    };
+    let escalated = classify(LoopState::RequiredRed, old_head.since, now());
+    assert_eq!(escalated.level, 3, "control: the old state was at level 3");
+    let new_head: &'static str = Box::leak("c".repeat(40).into_boxed_str());
+    let facts = |head: &'static str, since: DateTime<Utc>| RowFacts {
+        number: 879,
+        head,
+        token: "required_pending",
+        decision: &ARM,
+        since: Some(since),
+        // `HeadPushed`: the commit date, a day before the push.
+        since_source: Some("head_commit"),
+        dwell_since: Some(ago(36 * 60)),
+        enqueued_at: None,
+    };
+    let (row, record) = for_row(
+        REPO,
+        &facts(new_head, ago(36 * 60)),
+        Some(&old_head),
+        &quarantine,
+        now(),
+    )
+    .expect("covered");
+    assert_eq!(row.state, LoopState::CheckRunning);
+    assert_eq!(row.level, 0, "{row:?}");
+    assert_eq!(row.since, now().to_rfc3339(), "a new since");
+    assert_eq!(record.head, new_head);
+    // The same head changing state restarts it too, with no stale evidence.
+    let (state_change, _) = for_row(
+        REPO,
+        &facts(HEAD, ago(36 * 60)),
+        Some(&old_head),
+        &quarantine,
+        now(),
+    )
+    .expect("covered");
+    assert_eq!(
+        (state_change.level, state_change.since),
+        (0, now().to_rfc3339())
+    );
 }
