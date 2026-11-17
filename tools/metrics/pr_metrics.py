@@ -52,7 +52,7 @@ APP_LOGINS = {"shipyard-local[bot]", "shipyard-local"}
 _GUARD = []
 SIGNALS = ("app_opener", "provenance", "trailer", "session_stamp")
 BAD_CONCLUSIONS = {"failure", "timed_out"}
-FACTS_VERSION = 10
+FACTS_VERSION = 11
 COMPUTE_VERSION = 4  # compute caches: entries written before this could be marked complete from a partial timeline or commit read
 CHECKS_VERSION = 2  # derived correctness caches: entries written before this (incomplete pagination read as clean) are read again
 ESCAPE_WINDOW = dt.timedelta(days=14)
@@ -223,6 +223,19 @@ def trust_policy(rd, base):
     return pol
 
 
+MERGE_REMOVAL_WINDOW = dt.timedelta(minutes=2)
+
+
+def ejection(e, merged):
+    """Whether a timeline event is a removal from the merge queue that is an ejection. The REST event names no reason, and GitHub
+    records a removal when a PR merges, so a removal within two minutes before the merge is the merge, not an ejection (the
+    rule the m3 fleet-metrics parser uses); one that says `merged` is the merge too."""
+    if e.get("event") not in ("removed_from_merge_queue", "dequeued") or (e.get("reason") or "unknown") in ("merged", "already_merged"):
+        return False
+    t, m = iso(e.get("created_at")), iso(merged)
+    return not (t and m and dt.timedelta(0) <= m - t <= MERGE_REMOVAL_WINDOW)
+
+
 def steward_seq(pr, tl):
     """The events that bear on how a PR reached its merge, in the timeline's own order and up to the merge, with no
     dates involved: ["push", sha] (a commit or force-push that moved the head), ["enq", head-then] (an enqueue by the fleet
@@ -242,7 +255,7 @@ def steward_seq(pr, tl):
         if ev in ("committed", "head_ref_force_pushed"):
             cur = e.get("sha") if ev == "committed" else e.get("after_sha")
             seq.append(["push", cur])
-        elif ev in ("removed_from_merge_queue", "dequeued") and (e.get("reason") or "unknown") != "merged":
+        elif ejection(e, pr.get("merged_at")):
             seq.append(["remove"])
         elif ev in ("added_to_merge_queue", "enqueued") and login in APP_LOGINS:
             seq.append(["enq", cur])
@@ -346,7 +359,7 @@ def pr_facts(rd, pr, owner):
             enqueues += 1
             if ts:
                 enqueue_times.append(ts)
-        if ev in ("removed_from_merge_queue", "dequeued") and (e.get("reason") or "unknown") != "merged":
+        if ejection(e, pr.get("merged_at")):
             ejections.append(e.get("reason") or "unknown")
         if ev not in ACTION_EVENTS:
             continue
@@ -357,8 +370,7 @@ def pr_facts(rd, pr, owner):
                 agent_events.append([ev, ts])
             else:
                 owner_events.append([ev, ts])
-    dequeue_times = [e.get("created_at") for e in tl
-                     if e.get("event") in ("removed_from_merge_queue", "dequeued") and (e.get("reason") or "unknown") != "merged" and e.get("created_at")]
+    dequeue_times = [e.get("created_at") for e in tl if ejection(e, pr.get("merged_at")) and e.get("created_at")]
     heads = {pr["head"]["sha"]}
     for e in tl:
         if e.get("event") == "head_ref_force_pushed":

@@ -93,6 +93,8 @@ def raw_world():
             tl.append({"event": "merged", "actor": {"login": OWNER}, "created_at": merged})
         elif merged:
             tl.append({"event": "merged", "actor": {"login": APP}, "created_at": merged})
+        if merged:  # GitHub records a removal from the queue when a PR merges; it is not an ejection
+            tl.append({"event": "removed_from_merge_queue", "actor": {"login": APP}, "created_at": merged})
         if c.get("owner_actions"):
             tl.append({"event": "labeled", "actor": {"login": OWNER}, "created_at": _t("10:05")})
         if c.get("holds"):

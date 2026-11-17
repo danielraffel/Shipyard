@@ -77,6 +77,11 @@ scorecard's own values, within 15%. The synthetic control covers these fields to
 
 ## Clean and slow paths
 
+An ejection is a removal from the merge queue other than the merge itself. GitHub records a removal when a PR merges
+and the REST timeline names no reason, so a removal within two minutes before `merged_at` (or one that says
+`merged`) is the merge, not an ejection (the rule the m3 fleet-metrics parser uses). Without it every merged PR
+read as ejected and as slow.
+
 Each merged PR is `slow` when it had any HOLD, a failed run on one of its heads, an ejection from the merge queue
 or a DIRTY tick; `clean` when none of these and its compute was read in full; otherwise `unknown` (a failed run
 cannot be ruled out without the run list), and unknown PRs are in neither path. The report gives the slow share

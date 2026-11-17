@@ -360,6 +360,25 @@ class JobsSkipped(Base):
         self.assertFalse(os.path.exists(os.path.join(self.cache, REPO.replace("/", "__"), "compute", "1.json")))
 
 
+class MergeRemoval(Base):
+    def removal(self, hm):
+        return {"event": "removed_from_merge_queue", "actor": {"login": "x"}, "created_at": T(10, hm)}
+
+    def test_the_removal_github_records_at_the_merge_is_not_an_ejection_but_an_earlier_one_is(self):
+        p = pr(1, T(10, "10:00"), T(10, "11:00"))
+        tl = {1: [self.removal("10:30"), self.removal("10:59"), self.removal("11:00")]}
+        out = self.build(world([p], tl))
+        r = self.rows(out)[1]
+        self.assertEqual(r["ejections"], ["unknown"])  # the 10:30 one only
+        self.assertEqual((r["path"], r["path_why"]), ("slow", ["ejection"]))
+
+    def test_a_pr_with_only_the_merge_removal_is_not_slow_for_an_ejection(self):
+        p = pr(1, T(10, "10:00"), T(10, "11:00"))
+        out = self.build(world([p], {1: [self.removal("11:00")]}))
+        r = self.rows(out)[1]
+        self.assertEqual((r["ejections"], "ejection" in r["path_why"]), ([], False))
+
+
 class Correctness(Base):
     def merged_old(self, n, day=5):
         return pr(n, T(day, "09:00"), T(day, "10:00"), sha=f"s{n}" + "0" * 38)
