@@ -1542,6 +1542,20 @@ fn an_unowned_pull_request_that_leaves_the_lead_scope_goes_quiet() {
 }
 
 #[test]
+fn a_malformed_owner_marker_leaves_the_pull_request_unowned() {
+    let mut pr = Pr::open(543);
+    pr.comments.push(verdict("HOLD", HEAD_A));
+    let mut h = unowned_harness(&pr, true);
+    h.gh.open_bodies.borrow_mut().insert(
+        543,
+        format!("body\n{}", "<!-- shipyard-owner: nonsense -->"),
+    );
+    h.pass(0, Mode::Send);
+    assert_eq!(h.deliveries().len(), 1, "{:?}", h.deliveries());
+    assert_eq!(h.deliveries()[0]["tier"], "lead");
+}
+
+#[test]
 fn without_a_lead_an_unowned_pull_request_is_not_tracked() {
     let mut pr = Pr::open(543);
     pr.comments.push(verdict("HOLD", HEAD_A));

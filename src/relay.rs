@@ -424,15 +424,16 @@ pub(crate) fn actionable_now(digest: &PrDigest) -> Vec<RelayEvent> {
 }
 
 /// Whether `event` is one the lead hears about for a pull request with no
-/// owner: what needs an author's action, never a merge, a green check or a
-/// claim.
-pub(crate) fn needs_an_owner(event: &RelayEvent) -> bool {
+/// owner: what needs an author's action at the head it is on now, never a
+/// merge, a green check, a claim, or a fact about a head that has moved.
+pub(crate) fn needs_an_owner(event: &RelayEvent, digest: &PrDigest) -> bool {
+    let at_head = |head: &String| digest.state == "OPEN" && *head == digest.head;
     match event {
-        RelayEvent::Verdict { verdict, .. } => verdict == "HOLD",
-        RelayEvent::RequiredCheck { result, .. } => result == "red",
-        RelayEvent::DirtyAfterBaseMove { .. }
-        | RelayEvent::Ejected { .. }
-        | RelayEvent::Overdue { .. } => true,
+        RelayEvent::Verdict { verdict, head } => verdict == "HOLD" && at_head(head),
+        RelayEvent::RequiredCheck { result, head, .. } => result == "red" && at_head(head),
+        RelayEvent::DirtyAfterBaseMove { head, .. }
+        | RelayEvent::Ejected { head, .. }
+        | RelayEvent::Overdue { head, .. } => at_head(head),
         _ => false,
     }
 }
@@ -841,7 +842,11 @@ pub(crate) fn fetch(
                     node.get("number").and_then(Value::as_u64),
                     node.get("body").and_then(Value::as_str),
                 ) {
-                    if body.contains(crate::owner_registry::MARKER_PREFIX) {
+                    // Marked only when the marker parses: a malformed one
+                    // names no owner, so the pull request is unowned.
+                    if body.contains(crate::owner_registry::MARKER_PREFIX)
+                        && crate::owner_registry::parse_marker(repo, number, body).is_some()
+                    {
                         read.markers.insert(number, body.to_owned());
                     } else if node.get("isDraft").and_then(Value::as_bool) != Some(true) {
                         read.unmarked.push(number);

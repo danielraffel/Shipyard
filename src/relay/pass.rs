@@ -366,7 +366,7 @@ fn run_repo(
             .chain(first_actionable)
             .chain(overdue_now)
             // With no owner, the lead hears only what needs an author.
-            .filter(|event| !unowned || super::needs_an_owner(event))
+            .filter(|event| !unowned || super::needs_an_owner(event, &digest))
             .filter(|event| input.config.events.contains(event.name()))
             // Green, pending (a re-run), green again at one head is one fact.
             .filter(|event| match event {
@@ -402,7 +402,9 @@ fn run_repo(
         }
         // Events queued while it had an owner are not the lead's to hear.
         if unowned {
-            tracked.pending.retain(super::needs_an_owner);
+            tracked
+                .pending
+                .retain(|event| super::needs_an_owner(event, &digest));
         }
         // An overdue notice for a head that has since moved is stale.
         tracked.pending.retain(|event| match event {
