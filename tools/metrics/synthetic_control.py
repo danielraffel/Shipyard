@@ -48,12 +48,13 @@ CASES = [
     {"n": 6, "name": "later_fix", "delay": 120, "north": "autonomous", "title": "fix regression from #5"},
     {"n": 7, "name": "held_twice", "delay": 150, "north": "autonomous", "holds": 2, "re_holds": 1,
      "pushes": {"author": 1, "repair": 1, "merge_main": 1}},
-    {"n": 8, "name": "queued_twice", "delay": 85, "north": "autonomous", "enqueues": 2, "ejections": ["failed_checks"]},
-    {"n": 9, "name": "compute", "delay": 95, "north": "autonomous", "runs": 4, "repeat_runs": 2},
+    {"n": 8, "name": "queued_twice", "delay": 85, "north": "autonomous", "enqueues": 2, "ejections": ["failed_checks"], "enq_to_merge": 45},
+    {"n": 9, "name": "compute", "delay": 95, "north": "autonomous", "runs": 4, "repeat_runs": 2, "macos_min": 10,
+     "workflows": {"ci": {"pull_request": 2, "merge_group": 1, "push": 1}}},
     {"n": 10, "name": "owner_label_a", "delay": 100, "north": "owner_action", "owner_actions": 1},
     {"n": 11, "name": "owner_label_b", "delay": 110, "north": "owner_action", "owner_actions": 1},
-    {"n": 12, "name": "steward_merge", "delay": 45, "north": "autonomous", "enqueues": 1, "steward": True},
-    {"n": 13, "name": "unbound_owner_merge", "delay": 55, "north": "unknown", "enqueues": 1, "unverified": True},
+    {"n": 12, "name": "steward_merge", "delay": 45, "north": "autonomous", "enqueues": 1, "steward": True, "enq_to_merge": 25},
+    {"n": 13, "name": "unbound_owner_merge", "delay": 55, "north": "unknown", "enqueues": 1, "unverified": True, "enq_to_merge": 35},
     {"n": 14, "name": "owner_opened_unsigned", "delay": 65, "north": "unknown", "opener": OWNER, "signal": None},
     {"n": 15, "name": "never_merged", "delay": None, "north": "not_merged"},
 ]
@@ -107,7 +108,7 @@ def raw_world():
             checks[merge_sha] = [{"name": "Test", "status": "completed", "conclusion": "failure", "started_at": merged}]
         if c.get("runs"):
             g = "9" * 40
-            for rid, ev, sha, br, lab, mins in ((101, "pull_request", head, "feat", ["self-hosted"], 10), (102, "pull_request", head, "feat", ["ubuntu"], 5),
+            for rid, ev, sha, br, lab, mins in ((101, "pull_request", head, "feat", ["self-hosted", "macOS"], 10), (102, "pull_request", head, "feat", ["ubuntu"], 5),
                                                 (103, "merge_group", g, f"gh-readonly-queue/main/pr-{n}-x", ["self-hosted"], 20), (104, "push", g, "main", ["ubuntu"], 1)):
                 runs.append({"id": rid, "name": "ci", "head_sha": sha, "event": ev, "status": "completed", "head_branch": br})
                 jobs[rid] = [{"labels": lab, "started_at": _t("10:00"), "completed_at": _plus(mins), "conclusion": "success"}]
@@ -152,6 +153,7 @@ def expected():
     merged = [c for c in CASES if c["delay"] is not None]
     count = lambda k: sum(1 for c in CASES if c["north"] == k)
     hand = sorted(c["delay"] for c in merged)
+    q2m = [c["enq_to_merge"] for c in CASES if "enq_to_merge" in c]
     owner_actions = sum(c.get("owner_actions", 0) for c in CASES)
     ejections = sum(len(c.get("ejections", [])) for c in CASES)
     bad = sum(1 for c in merged if c.get("reverted") or c.get("base_red"))
@@ -175,6 +177,12 @@ def expected():
         "compute_per_merged_pr.runs_total": sum(c.get("runs", 0) for c in CASES),
         "compute_per_merged_pr.repeat_runs_total": sum(c.get("repeat_runs", 0) for c in CASES),
         "compute_per_merged_pr.prs_read": len(merged),
+        "compute_per_merged_pr.macos_min_mean": round(sum(c.get("macos_min", 0) for c in merged) / len(merged), 1),
+        "compute_per_merged_pr.macos_min_median": round(statistics.median(c.get("macos_min", 0) for c in merged), 1),
+        "merge_queue.enqueue_to_merge_min.n": len(q2m),
+        "merge_queue.enqueue_to_merge_min.median": round(statistics.median(q2m), 1),
+        **{f"compute_per_merged_pr.by_workflow.{wf}.{lv}": round(sum(c.get("workflows", {}).get(wf, {}).get(lv, 0) for c in merged) / len(merged), 2)
+           for wf in {w for c in merged for w in c.get("workflows", {})} for lv in ("pull_request", "merge_group", "push")},
         "correctness.bad": bad, "correctness.good": len(merged) - bad,
         "correctness.reverted": sum(1 for c in merged if c.get("reverted")),
         "correctness.base_red": sum(1 for c in merged if c.get("base_red")),

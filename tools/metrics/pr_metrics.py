@@ -52,8 +52,8 @@ APP_LOGINS = {"shipyard-local[bot]", "shipyard-local"}
 _GUARD = []
 SIGNALS = ("app_opener", "provenance", "trailer", "session_stamp")
 BAD_CONCLUSIONS = {"failure", "timed_out"}
-FACTS_VERSION = 8
-COMPUTE_VERSION = 2  # compute caches: entries written before this could be marked complete from a partial timeline or commit read
+FACTS_VERSION = 9
+COMPUTE_VERSION = 3  # compute caches: entries written before this could be marked complete from a partial timeline or commit read
 CHECKS_VERSION = 2  # derived correctness caches: entries written before this (incomplete pagination read as clean) are read again
 ESCAPE_WINDOW = dt.timedelta(days=14)
 HORIZON = dt.timedelta(hours=48)
@@ -64,6 +64,8 @@ MERGE_MAIN_RE = re.compile(r"^Merge (remote-tracking )?branch '?(origin/)?(main|
 # Positive controls: a real revert (#124 reverted #119), a real escaped defect (#126 names #116).
 DEFAULT_CONTROLS = {"danielraffel/fleet-handbook": {"revert": [(119, 124)], "escape": [(116, 126)]}}  # "owner": [pr, ...] pins PRs with a hand-verified owner action
 # Labels that take a PR out of the eligible cohort, with the reason reported.
+# The gate-proof workflows whose runs per merged PR are reported by name, per repo; any other repo shows its busiest workflows.
+PROOF_WORKFLOWS = {"Generous-Corp/vellum": ("Locked macOS GPU proof",)}
 EXCLUDE_LABELS = {"automation": "automation", "shipyard:unmanaged": "unmanaged", "superseded": "superseded"}
 INTEGRATION_BASES = ("develop/", "release/")
 REPAIRED_RE = re.compile(r"^\s*repaired\s*:", re.I)
@@ -330,6 +332,7 @@ def pr_facts(rd, pr, owner):
     else:
         ready = None if pr.get("draft") else created
     owner_events, agent_events, repairs, holds, ejections, enqueues = [], [], [], [], [], 0
+    enqueue_times = []
     stamp_commit = False
     for e in tl:
         ev, ts = e.get("event"), e.get("created_at") or e.get("submitted_at")
@@ -341,6 +344,8 @@ def pr_facts(rd, pr, owner):
                 holds.append(ts)
         if ev in ("added_to_merge_queue", "enqueued"):
             enqueues += 1
+            if ts:
+                enqueue_times.append(ts)
         if ev in ("removed_from_merge_queue", "dequeued") and (e.get("reason") or "unknown") != "merged":
             ejections.append(e.get("reason") or "unknown")
         if ev not in ACTION_EVENTS:
@@ -391,7 +396,7 @@ def pr_facts(rd, pr, owner):
         "opener": (pr.get("user") or {}).get("login"), "provenance": bool(PROVENANCE_RE.search(pr.get("body") or "")),
         "agent_trailer": trailer, "stamp_commit": stamp_commit, "ambiguous_commits": sorted(set(ambiguous)),
         "repair_cycles": len(repairs), "holds": len(holds), "re_holds": re_holds, "size": size,
-        "pushes": split, "enqueues": enqueues, "ejections": ejections,
+        "pushes": split, "enqueues": enqueues, "enqueue_times": enqueue_times, "ejections": ejections,
         "labels": sorted(l["name"] for l in pr.get("labels") or []),
         "heads": sorted(heads), "timeline_complete": tl_full, "commits_complete": c_full,
     }
@@ -480,13 +485,14 @@ def row_attribution(f):
 
 # --------------------------------------------------------------- compute
 def job_minutes(rd, run):
-    """(self_hosted_min, hosted_min, complete) for one run, read once ever when it has completed."""
+    """(self_hosted_min, hosted_min, macos_min, complete) for one run, read once ever when it has completed.
+    macos_min is the part of the minutes on jobs whose labels name macOS, whoever hosts them."""
     rid = run["id"]
     cached = rd.load("jobs", str(rid))
-    if cached:
-        return cached["self_hosted"], cached["hosted"], True
+    if cached and "macos" in cached:  # an entry from before macOS minutes were kept is read again
+        return cached["self_hosted"], cached["hosted"], cached["macos"], True
     jobs, full = rd.pages(f"actions/runs/{rid}/jobs?filter=all", key="jobs", max_pages=3)
-    sh = ho = 0.0
+    sh = ho = mac = 0.0
     for j in jobs:
         a, b = iso(j.get("started_at")), iso(j.get("completed_at"))
         if not a or not b or j.get("conclusion") == "skipped":
@@ -496,16 +502,47 @@ def job_minutes(rd, run):
             sh += m
         else:
             ho += m
+        if any("macos" in str(l).lower() for l in j.get("labels") or []):
+            mac += m
     done = run.get("status") == "completed" and full
     if done:
-        rd.save("jobs", str(rid), {"self_hosted": round(sh, 2), "hosted": round(ho, 2)})
-    return round(sh, 2), round(ho, 2), done
+        rd.save("jobs", str(rid), {"self_hosted": round(sh, 2), "hosted": round(ho, 2), "macos": round(mac, 2)})
+    return round(sh, 2), round(ho, 2), round(mac, 2), done
+
+
+RUNS_SLICE_LIMIT = 900  # the Actions API serves at most 1000 runs for one `created` range: a busier range is split in halves
 
 
 def runs_index(rd, lo, hi):
-    """Runs created in [lo, hi]: (list, complete). One read per page, shared by every PR in the window."""
-    runs, full = rd.pages(f"actions/runs?created={fmt(lo)}..{fmt(hi)}", key="workflow_runs", max_pages=10)
-    return runs, full
+    """Runs created in [lo, hi]: (list, complete). A range with more than RUNS_SLICE_LIMIT runs is split in
+    halves until each part fits, so a busy repo is read in full instead of cut at 1000. One page read per 100 runs,
+    shared by every PR in the window. A part that cannot be split further (one second) and still overflows is incomplete."""
+    runs, complete = {}, [True]
+
+    def part(a, b):
+        d = rd.get(f"actions/runs?created={fmt(a)}..{fmt(b)}&per_page=100&page=1")
+        items = d.get("workflow_runs", []) if isinstance(d, dict) else None
+        if not isinstance(items, list):
+            raise ReadError("unexpected shape")
+        total = d.get("total_count", len(items))
+        if total > RUNS_SLICE_LIMIT and (b - a).total_seconds() > 1:
+            mid = a + (b - a) / 2
+            mid = mid.replace(microsecond=0)
+            part(a, mid)
+            part(mid + dt.timedelta(seconds=1), b)
+            return
+        pages = [items]
+        for n in range(2, min(10, math.ceil(total / 100)) + 1):
+            more = rd.get(f"actions/runs?created={fmt(a)}..{fmt(b)}&per_page=100&page={n}").get("workflow_runs", [])
+            pages.append(more)
+        for page in pages:
+            for r in page:
+                runs[r["id"]] = r
+        if total > RUNS_SLICE_LIMIT:
+            complete[0] = False  # one second holds more runs than the API serves
+
+    part(lo.replace(microsecond=0), hi.replace(microsecond=0))
+    return list(runs.values()), complete[0]
 
 
 def push_repeats_of_group_shas(runs):
@@ -514,6 +551,14 @@ def push_repeats_of_group_shas(runs):
     group = {(r.get("name"), r.get("head_sha")) for r in runs if r.get("event") == "merge_group"}
     push = [r for r in runs if r.get("event") == "push"]
     return len(push), sum(1 for r in push if (r.get("name"), r.get("head_sha")) in group)
+
+
+def enqueue_to_merge(f):
+    """Minutes from the last merge-queue enqueue before the merge to `merged_at`, or None (no enqueue, not merged)."""
+    m = iso(f.get("merged_at"))
+    ts = [iso(x) for x in f.get("enqueue_times") or []]
+    ts = [x for x in ts if x and m and x <= m]
+    return round((m - max(ts)).total_seconds() / 60.0, 1) if ts and m else None
 
 
 def load_compute(rd, number, f=None):
@@ -548,12 +593,19 @@ def pr_compute(rd, f, runs, runs_complete):
         seen[k] = True
     sh = ho = 0.0
     complete = runs_complete and reads_complete(f)  # the heads come from the timeline and the commits
+    mac = 0.0
+    by_wf = {}
     for r in mine.values():
-        a, b, ok = job_minutes(rd, r)
+        a, b, m, ok = job_minutes(rd, r)
         sh += a
         ho += b
+        mac += m
         complete = complete and ok
-    return {"self_hosted_min": round(sh, 1), "hosted_min": round(ho, 1), "runs": len(mine), "repeat_runs": repeats,
+        level = by_wf.setdefault(r.get("name") or "?", {"pull_request": 0, "merge_group": 0, "push": 0, "other": 0})
+        ev = r.get("event")
+        level[ev if ev in ("merge_group", "push") else "pull_request" if ev in ("pull_request", "pull_request_target") else "other"] += 1
+    return {"self_hosted_min": round(sh, 1), "hosted_min": round(ho, 1), "macos_min": round(mac, 1), "by_workflow": by_wf,
+            "runs": len(mine), "repeat_runs": repeats,
             "group_runs": sum(1 for r in mine.values() if r.get("event") == "merge_group"), "complete": complete}
 
 
@@ -701,6 +753,18 @@ def bucket(size):
     return "unknown" if size is None else "<200" if size < 200 else "200-800" if size <= 800 else ">800"
 
 
+def workflow_means(comp):
+    """Per merged PR with a complete compute read: mean runs of each workflow at each level (the PR's own heads,
+    its merge group, pushes to the base). `prs` is the denominator."""
+    names = sorted({n for r in comp for n in r["compute"].get("by_workflow", {})})
+    out = {}
+    for n in names:
+        out[n] = {lv: round(sum(r["compute"]["by_workflow"].get(n, {}).get(lv, 0) for r in comp) / len(comp), 2)
+                  for lv in ("pull_request", "merge_group", "push")}
+        out[n]["prs"] = len(comp)
+    return out
+
+
 def attribution_summary(rows):
     """What each agent signal contributed, so the attribution can be audited. `by_primary` counts each PR once, under
     its strongest signal; `with_signal` counts every PR a signal applies to. `ambiguous_cleared` counts PRs
@@ -742,6 +806,7 @@ def summarize(rows):
         b["prs_with_hold"] += 1
         b["prs_with_re_hold"] += bool(r["re_holds"])
     push = {k: sum(r["pushes"].get(k, 0) for r in rows) for k in ("repair", "author", "merge_main")}
+    q2m = [r["enqueue_to_merge_min"] for r in merged if r.get("enqueue_to_merge_min") is not None]
     ej = collections.Counter(c for r in rows for c in r["ejections"])
     good = [r for r in merged if r["correct"] and r["correct"]["bad"] is False]
     bad = [r for r in merged if r["correct"] and r["correct"]["bad"]]
@@ -771,6 +836,7 @@ def summarize(rows):
         "merge_queue": {
             "attempts_per_ready_pr": None if not n else round(sum(r["enqueues"] for r in rows) / n, 2),
             "ejections_by_cause": dict(ej.most_common()),
+            "enqueue_to_merge_min": {"n": len(q2m), "median": med(q2m), "p90": pctile(q2m, 0.9)},
         },
         "dirty_per_100_prs": None if not n else round(100.0 * sum(1 for r in rows if r["dirty"]) / n, 1),
         "interventions": {
@@ -789,6 +855,9 @@ def summarize(rows):
             "runs_total": sum(r["compute"]["runs"] for r in comp),
             "context_self_hosted_min_median": med([r["compute"]["self_hosted_min"] for r in comp]),
             "context_hosted_min_median": med([r["compute"]["hosted_min"] for r in comp]),
+            "macos_min_mean": None if not comp else round(sum(r["compute"]["macos_min"] for r in comp) / len(comp), 1),
+            "macos_min_median": med([r["compute"]["macos_min"] for r in comp]),
+            "by_workflow": workflow_means(comp),
         },
         "correctness": {
             "bad": len(bad), "good": len(good), "unknown": len(merged) - len(bad) - len(good),
@@ -821,7 +890,7 @@ def all_prs(rd, lo, hi):
     return out, False
 
 
-def collect_repo(repo, cache_dir, cap, owner, lo, hi, now, ticks, tick_ctx, fetch=None, managed_base="main", dirty=()):
+def collect_repo(repo, cache_dir, cap, owner, lo, hi, now, ticks, tick_ctx, fetch=None, managed_base="main", dirty=(), merged_between=None):
     rd = Reader(repo, cache_dir, cap, fetch)
     res = {"repo": repo, "rows": [], "unread": 0, "listing_complete": False, "reads": 0, "truncated": False, "errors": 0}
     try:
@@ -829,6 +898,9 @@ def collect_repo(repo, cache_dir, cap, owner, lo, hi, now, ticks, tick_ctx, fetc
     except (Truncated, ReadError):
         prs = []
     merged_list = [p for p in prs if p.get("merged_at")]
+    if merged_between:  # a measurement window: only the PRs that merged in it are read; the rest created since `lo` are skipped
+        a, b = merged_between
+        prs = [p for p in prs if p.get("merged_at") and a <= iso(p["merged_at"]) <= b]
     facts = []
     for pr in prs:
         f = rd.load("facts", str(pr["number"]))
@@ -878,6 +950,7 @@ def collect_repo(repo, cache_dir, cap, owner, lo, hi, now, ticks, tick_ctx, fetc
             "handoff_min": round((iso(merged) - iso(f["first_ready"])).total_seconds() / 60.0, 1) if merged and f["first_ready"] else None,
             "holds": f["holds"], "re_holds": f["re_holds"], "size": f["size"], "pushes": f["pushes"],
             "enqueues": f["enqueues"], "ejections": f["ejections"], "dirty": f["number"] in dirty,
+            "enqueue_to_merge_min": enqueue_to_merge(f),
             "owner_actions": sum(1 for ev, ts in effective_owner_events(f)[0]
                                  if not (ev == "merged" and f.get("merge_unverified")) and f["first_ready"] and iso(f["first_ready"]) <= iso(ts) <= iso(f["first_ready"]) + HORIZON),
             "repair_cycles": f["repair_cycles"], "compute": None, "correct": None,
@@ -977,7 +1050,7 @@ def check_controls(repo, rows, controls, refused):
 
 
 def build(repos, cache_dir, cap, owner, start, now, ticks, tick_ctx, baseline=None, fetch=None, bases=None,
-          dirty=None, controls=None, refused=None, control=None):
+          dirty=None, controls=None, refused=None, control=None, merged_between=None):
     """The `end_to_end` report section. `ticks`: repo -> [datetimes a base_poison red-everywhere episode began].
     `control`: None runs the synthetic control (tools/metrics/synthetic_control.py) on every call; False skips it
     (the control itself runs with False); a callable returns a control result. A failed control withholds every
@@ -996,7 +1069,7 @@ def build(repos, cache_dir, cap, owner, start, now, ticks, tick_ctx, baseline=No
     for i, repo in enumerate(repos):
         repo_cap = remaining // (len(repos) - i)  # may be 0: the shared total is never exceeded
         r = collect_repo(repo, cache_dir, repo_cap, owner, lo, now, now, ticks, tick_ctx, fetch,
-                         (bases or {}).get(repo, "main"), (dirty or {}).get(repo, ()))
+                         (bases or {}).get(repo, "main"), (dirty or {}).get(repo, ()), merged_between)
         excluded = collections.Counter(x["excluded_because"] for x in r["rows"] if not x["eligible"])
         elig = [x for x in r["rows"] if x["eligible"]]
         days = {}
@@ -1169,6 +1242,21 @@ def markdown(e2e):
             p, lg = at["by_primary"], at["legacy"]
             L.append(f"| {repo} | {s_['ready_prs']} | {p['app_opener']} | {p['provenance']} | {p['trailer']} | {p['session_stamp']} | {p['none']} | "
                      f"{sum(at['ambiguous_cleared'].values())} | {at['steward_merges_recognised']} | {at['owner_merges_unverified']} | {at['agent_stamped_owner_events']} | {lg['rate_pct']}% / {lg['unknown_share_pct']}% |")
+        L.append("")
+    if e2e.get("window"):
+        L += ["### Proofs, macOS minutes and queue wait per merged PR (window)", "",
+              "Runs per merged PR with a complete compute read, by level: `PR` is the PR's own heads, `group` its merge group (batches share one run), `push` pushes to the base. "
+              "macOS minutes are job minutes on jobs labelled macOS. Enqueue to merge is the last enqueue before the merge.", "",
+              "| repo | merged PRs read | workflow | runs/PR PR / group / push | macOS min mean / median | enqueue to merge median / p90 min (n) |", "|---|---|---|---|---|---|"]
+        for repo, s_ in sorted(e2e["window"]["per_repo"].items()):
+            c, q = s_["compute_per_merged_pr"], s_["merge_queue"]["enqueue_to_merge_min"]
+            wf = c.get("by_workflow", {})
+            names = [n for n in PROOF_WORKFLOWS.get(repo, ()) if n in wf] or sorted(wf, key=lambda n: -wf[n]["pull_request"])[:3]
+            tail = f"{c['macos_min_mean']} / {c['macos_min_median']} | {q['median']} / {q['p90']} ({q['n']})"
+            for i, n in enumerate(names or [None]):
+                lv = wf.get(n, {})
+                L.append(f"| {repo if i == 0 else ''} | {c['prs_read'] if i == 0 else ''} | {n or '-'} | "
+                         f"{lv.get('pull_request', '-')} / {lv.get('merge_group', '-')} / {lv.get('push', '-')} | {tail if i == 0 else ''} |")
         L.append("")
     nf = (e2e.get("baseline") or {}).get("noise_floor")
     if nf:
