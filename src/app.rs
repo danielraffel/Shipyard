@@ -27,6 +27,7 @@ pub(crate) mod changed_surface_cmd;
 mod changed_surface_trial_cmd;
 mod changelog_cmd;
 mod ci_cmd;
+mod claim_cmd;
 mod cleanup_cmd;
 mod cli;
 mod cloud_cmd;
@@ -372,6 +373,9 @@ where
         }
         Command::Guards { command } => {
             return guards_cmd::guards_command(command, cli.json, stdout);
+        }
+        Command::Claim { command } => {
+            return claim_cmd::claim_command(command, &cwd, stdout);
         }
         Command::Dependency { command } => {
             return dependency_command(command, &cwd, &runtime_paths, cli.json, stdout);
@@ -1030,6 +1034,7 @@ fn handle_operational_variant<W: Write>(
         | Command::ParallelProofCanaryWorker { .. }
         | Command::Pin { .. }
         | Command::Guards { .. }
+        | Command::Claim { .. }
         | Command::Dependency { .. }
         | Command::Config { .. }
         | Command::Ci { .. }

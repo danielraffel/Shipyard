@@ -132,6 +132,80 @@ pub fn workflow_paths(config: &LoadedConfig) -> Vec<String> {
         })
 }
 
+/// The workflow paths this run reads.
+///
+/// [`workflow_paths`] unless the config names no workflows AND the default
+/// file is absent (a repository such as one whose required checks come from
+/// `gpu-macos.yml` and friends). Then reading only the missing default would
+/// measure nothing and still look clean, so fall back to the files in
+/// `.github/workflows/` that have a job producing at least one required
+/// context. Only producing files, never the whole directory: see
+/// [`DEFAULT_WORKFLOWS`]. One warning names the files chosen. When no file
+/// produces any required context the default is kept, so the caller's
+/// "measured nothing" warning still fires.
+fn effective_workflow_paths(
+    config: &LoadedConfig,
+    cwd: &Path,
+    base: &str,
+    context_sets: &[&[String]],
+    warnings: &mut Vec<String>,
+) -> Vec<String> {
+    let contexts: Vec<&String> = context_sets.iter().flat_map(|set| set.iter()).collect();
+    let paths = workflow_paths(config);
+    let configured = config
+        .get("landability.workflows")
+        .and_then(toml::Value::as_array)
+        .is_some_and(|values| values.iter().any(|value| value.as_str().is_some()));
+    if configured {
+        return paths;
+    }
+    let read = |path: &str| {
+        read_workflow_at_ref(cwd, &format!("origin/{base}"), path)
+            .or_else(|_| read_workflow_at_ref(cwd, "HEAD", path))
+    };
+    if DEFAULT_WORKFLOWS.iter().any(|path| read(path).is_ok()) {
+        return paths;
+    }
+    let Ok(entries) = std::fs::read_dir(cwd.join(".github/workflows")) else {
+        return paths;
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter(|entry| entry.path().is_file())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| {
+            Path::new(name)
+                .extension()
+                .is_some_and(|ext| ext == "yml" || ext == "yaml")
+        })
+        .collect();
+    names.sort();
+    let chosen: Vec<String> = names
+        .into_iter()
+        .map(|name| format!(".github/workflows/{name}"))
+        .filter(|path| {
+            read(path).is_ok_and(|source| {
+                parse_workflow_jobs(&source).iter().any(|job| {
+                    contexts
+                        .iter()
+                        .any(|context| job.produces(context) || job.produces_templated(context))
+                })
+            })
+        })
+        .collect();
+    if chosen.is_empty() {
+        return paths;
+    }
+    warnings.push(format!(
+        "landability: no [landability] workflows configured and {} is absent; reading the \
+         workflow file(s) whose jobs produce a required context: {}. Pin them with \
+         `[landability] workflows = [...]` in .shipyard/config.toml",
+        DEFAULT_WORKFLOWS.join(", "),
+        chosen.join(", ")
+    ));
+    chosen
+}
+
 /// Required contexts from `[governance] required_status_checks`, the fallback
 /// when branch protection is unreadable.
 #[must_use]
@@ -196,6 +270,9 @@ pub fn run(
         None => configured.clone(),
     };
 
+    let paths =
+        effective_workflow_paths(config, cwd, base, &[&contexts, &configured], &mut warnings);
+
     // Link (1)-(3): will these contexts ever be REQUESTED? This runs before
     // the lane assessment because a refusal here makes the lane question
     // pointless — an unschedulable lane for a run that is never created is
@@ -203,6 +280,7 @@ pub fn run(
     // Zero additional API calls: the protection read is the one `gather`
     // already made, and workflows, base and diff are all local.
     let (reachability, reach_warnings) = assess_triggers(
+        &paths,
         config,
         cwd,
         base,
@@ -242,7 +320,7 @@ pub fn run(
         };
     }
 
-    let jobs = read_jobs(config, cwd, base, &mut warnings);
+    let jobs = read_jobs(&paths, cwd, base, &mut warnings);
     if jobs.is_empty() {
         warnings.push(
             "landability: no workflow jobs were parsed - the gate measured nothing, which reads \
@@ -332,6 +410,7 @@ fn assess_lanes(
 /// for, which is the only source spectr has).
 #[allow(clippy::too_many_arguments)]
 fn assess_triggers(
+    paths: &[String],
     config: &LoadedConfig,
     cwd: &Path,
     base: &str,
@@ -382,7 +461,7 @@ fn assess_triggers(
         .iter()
         .map(|(_, path)| path.clone())
         .collect();
-    let workflows = read_workflows_under_test(config, cwd, base, &extra_workflows, warnings);
+    let workflows = read_workflows_under_test(paths, cwd, base, &extra_workflows, warnings);
 
     let changed = match changed_paths(cwd, base) {
         Ok(changed) => changed,
@@ -432,15 +511,15 @@ fn assess_triggers(
 /// Zero API calls, and the local checkout is the correct source anyway: the
 /// workflow that runs on `pull_request` is the one on the base ref.
 fn read_jobs(
-    config: &LoadedConfig,
+    paths: &[String],
     cwd: &Path,
     base: &str,
     warnings: &mut Vec<String>,
 ) -> Vec<WorkflowJob> {
     let mut jobs: Vec<WorkflowJob> = Vec::new();
-    for path in workflow_paths(config) {
-        match read_workflow_at_ref(cwd, &format!("origin/{base}"), &path)
-            .or_else(|_| read_workflow_at_ref(cwd, "HEAD", &path))
+    for path in paths {
+        match read_workflow_at_ref(cwd, &format!("origin/{base}"), path)
+            .or_else(|_| read_workflow_at_ref(cwd, "HEAD", path))
         {
             Ok(source) => jobs.extend(parse_workflow_jobs(&source)),
             Err(error) => warnings.push(format!(
@@ -655,17 +734,17 @@ pub fn read_workflows_under_test_public(
     extra: &[String],
     warnings: &mut Vec<String>,
 ) -> Vec<WorkflowUnderTest> {
-    read_workflows_under_test(config, cwd, base, extra, warnings)
+    read_workflows_under_test(&workflow_paths(config), cwd, base, extra, warnings)
 }
 
 fn read_workflows_under_test(
-    config: &LoadedConfig,
+    base_paths: &[String],
     cwd: &Path,
     base: &str,
     extra: &[String],
     warnings: &mut Vec<String>,
 ) -> Vec<WorkflowUnderTest> {
-    let mut paths = workflow_paths(config);
+    let mut paths = base_paths.to_vec();
     for path in extra {
         if !paths.contains(path) {
             paths.push(path.clone());
@@ -781,4 +860,169 @@ pub fn resolve_base(config: &LoadedConfig) -> String {
         }
     }
     "main".to_owned()
+}
+
+#[cfg(all(test, unix))]
+mod fallback_tests {
+    use std::fs;
+    use std::path::Path;
+
+    use super::*;
+    use crate::identity::RuntimeMode;
+
+    fn git(cwd: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("git runs");
+        assert!(status.success(), "git {args:?}");
+    }
+
+    fn workflow(job: &str) -> String {
+        format!("on: pull_request\njobs:\n  {job}:\n    name: {job}\n    runs-on: ubuntu-latest\n")
+    }
+
+    /// A checkout with the given workflow files and optional config body.
+    fn repo(temp: &Path, files: &[(&str, &str)], config: &str) -> std::path::PathBuf {
+        let repo = temp.join("repo");
+        fs::create_dir_all(repo.join(".github/workflows")).expect("workflows");
+        fs::create_dir_all(repo.join(".shipyard")).expect("config");
+        git(&repo, &["init", "--initial-branch=main"]);
+        git(&repo, &["config", "user.name", "t"]);
+        git(&repo, &["config", "user.email", "t@example.com"]);
+        for (name, job) in files {
+            fs::write(repo.join(".github/workflows").join(name), workflow(job)).expect("workflow");
+        }
+        fs::write(repo.join(".shipyard/config.toml"), config).expect("config");
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "base"]);
+        repo
+    }
+
+    fn resolve(repo: &Path, contexts: &[&str]) -> (Vec<String>, Vec<String>) {
+        let config = LoadedConfig::load_from_cwd(RuntimeMode::Isolated, repo).expect("config");
+        let contexts: Vec<String> = contexts.iter().map(|c| (*c).to_owned()).collect();
+        let mut warnings = Vec::new();
+        let paths = effective_workflow_paths(&config, repo, "main", &[&contexts], &mut warnings);
+        (paths, warnings)
+    }
+
+    #[test]
+    fn no_default_file_falls_back_to_only_the_producing_workflows() {
+        let temp = tempfile::tempdir().expect("temp");
+        let repo = repo(
+            temp.path(),
+            &[
+                ("gpu.yml", "gpu-check"),
+                ("prov.yml", "provenance"),
+                ("other.yml", "unrelated"),
+            ],
+            "[ship]\nbase_branch = \"main\"\n",
+        );
+        let (paths, warnings) = resolve(&repo, &["gpu-check", "provenance"]);
+        assert_eq!(
+            paths,
+            [".github/workflows/gpu.yml", ".github/workflows/prov.yml"]
+        );
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("gpu.yml") && warnings[0].contains("prov.yml"));
+        assert!(!warnings[0].contains("other.yml"));
+        assert!(warnings[0].contains("[landability] workflows"));
+    }
+
+    #[test]
+    fn an_existing_default_file_is_unchanged() {
+        let temp = tempfile::tempdir().expect("temp");
+        let repo = repo(
+            temp.path(),
+            &[("build.yml", "build"), ("gpu.yml", "gpu-check")],
+            "",
+        );
+        let (paths, warnings) = resolve(&repo, &["gpu-check"]);
+        assert_eq!(paths, DEFAULT_WORKFLOWS);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn configured_workflows_are_unchanged() {
+        let temp = tempfile::tempdir().expect("temp");
+        let repo = repo(
+            temp.path(),
+            &[("gpu.yml", "gpu-check"), ("prov.yml", "provenance")],
+            "[landability]\nworkflows = [\".github/workflows/prov.yml\"]\n",
+        );
+        let (paths, warnings) = resolve(&repo, &["gpu-check"]);
+        assert_eq!(paths, [".github/workflows/prov.yml"]);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn no_producer_keeps_the_default_so_measured_nothing_still_fires() {
+        let temp = tempfile::tempdir().expect("temp");
+        let repo = repo(temp.path(), &[("other.yml", "unrelated")], "");
+        let (paths, warnings) = resolve(&repo, &["gpu-check"]);
+        assert_eq!(paths, DEFAULT_WORKFLOWS);
+        assert!(warnings.is_empty());
+        let config = LoadedConfig::load_from_cwd(RuntimeMode::Isolated, &repo).expect("config");
+        let mut read_warnings = Vec::new();
+        let jobs = read_jobs(&paths, &repo, "main", &mut read_warnings);
+        assert!(jobs.is_empty());
+        assert!(read_warnings.iter().any(|w| w.contains("build.yml")));
+        drop(config);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod templated_fallback_tests {
+    use super::*;
+
+    #[test]
+    fn the_fallback_selects_a_file_with_a_templated_producer() {
+        let temp = tempfile::tempdir().expect("temp");
+        let repo = temp.path();
+        let dir = repo.join(".github/workflows");
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::create_dir_all(repo.join(".shipyard")).expect("cfg");
+        std::fs::write(
+            dir.join("ci.yml"),
+            "on: pull_request\njobs:\n  test:\n    name: Test ${{ matrix.name }}\n    runs-on: x\n",
+        )
+        .expect("ci");
+        std::fs::write(
+            dir.join("other.yml"),
+            "on: pull_request\njobs:\n  lint:\n    name: Lint\n    runs-on: x\n",
+        )
+        .expect("other");
+        std::fs::write(repo.join(".shipyard/config.toml"), "").expect("config");
+        for args in [
+            vec!["init", "--initial-branch=main"],
+            vec!["config", "user.name", "t"],
+            vec!["config", "user.email", "t@example.com"],
+            vec!["add", "."],
+            vec!["commit", "-q", "-m", "base"],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(&args)
+                    .current_dir(repo)
+                    .status()
+                    .expect("git")
+                    .success()
+            );
+        }
+        let config = LoadedConfig::load_from_cwd(crate::identity::RuntimeMode::Isolated, repo)
+            .expect("config");
+        let mut warnings = Vec::new();
+        let paths = effective_workflow_paths(
+            &config,
+            repo,
+            "main",
+            &[&["Test macOS ARM64".to_owned()]],
+            &mut warnings,
+        );
+        assert_eq!(paths, [".github/workflows/ci.yml"]);
+    }
 }

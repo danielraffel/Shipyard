@@ -43,6 +43,8 @@ pub mod changed_surface;
 pub mod changelog;
 /// Typed CI routing profile schema.
 pub mod ci_profile;
+/// The push fence: refuse a push to a branch another session has claimed.
+pub(crate) mod claim_fence;
 /// Coarse failure classification shared by executors.
 pub mod classify;
 /// GitHub Actions workflow discovery, dispatch planning, and shell helpers.

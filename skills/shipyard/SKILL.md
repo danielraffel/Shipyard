@@ -740,6 +740,26 @@ cooldown, limit 1); the lockfile mode is `[governance.lockfile].mode`
 (`advisory` until promoted). The audit's workflow checks are textual: a
 version comment after a SHA must look like `# v1.2.3`.
 
+## A push to a claimed pull request is refused (once switched on)
+
+With `SHIPYARD_CLAIM_FENCE=on` (off by default; owner and incident switch
+only, agents never set it, same rule as `GHAPP_ALLOW_*`), `shipyard pr`/`ship`
+and any pre-push hook that runs `shipyard claim check-push "$1" "$2"`
+(Shipyard's own does) refuse a push when an open pull request for the branch
+has another owner's live `repair-claim: <owner> [(<note>)] until <time>`.
+`SHIPYARD_CLAIM_OWNER` names your own claims. On a refusal, take the claim:
+`shipyard claim take --from <owner> --reason "..."`, with the owner exactly as
+written; it posts `repair-claim-taken: <you> from <owner> reason=...`.
+`repair-claim-released: <owner>` ends a claim (a bare one ends all). An
+unreadable time ends 4h after its comment, with a warning. The whole check has
+a 15s deadline, then lets the push go and says why. With no hook, check first:
+`shipyard claim check-push origin "$(git remote get-url origin)" --branch
+"$BRANCH" && git push origin "$BRANCH"`. A hook runs in every worktree of a
+clone once the clone sets `git config core.hooksPath .githooks`. The claim
+grammar has one parser, `src/work_claim.rs`, used by the relay and `shipyard
+advance` too. `repair-claim-taken:` comments get the `ghapp` session stamp.
+Full reference: `docs/claim-fence.md`.
+
 ## An adversarial ruling is stamped like a verdict and counted by nothing
 
 A comment whose last line is exactly `adversarial-ruling: OK|FIX-FIRST|BLOCK
@@ -5713,6 +5733,10 @@ not own.
 | `attestation.rs` | reads the tartci-written host attestation; decides whether a record is evidence |
 | `gather.rs` | the four API calls and the 300 s cache |
 | `gate.rs` | the submission gate; the only thing that turns a verdict into a refusal |
+
+Which workflow files the gate reads: `[landability] workflows` if set, else `.github/workflows/build.yml`. When neither names a file that exists (a repo with no `build.yml`), the gate falls back to only the workflow files whose jobs produce a required context, warns once naming them, and suggests pinning them with `[landability] workflows`. If no file produces any required context the loud "measured nothing" warning stays.
+
+Required contexts are the union of classic branch protection and repository rulesets (`rules/branches/{base}`), deduped by context; an unreadable ruleset read warns loudly instead of passing silently. A job whose `name:` contains an unresolved expression (for example `Test` followed by a matrix name) matches a context as a pattern and is reported `producer: templated (unverified)`; such a match is never a refusal.
 
 ### Things that will bite a future change
 

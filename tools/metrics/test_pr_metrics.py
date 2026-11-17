@@ -2,6 +2,8 @@ import datetime as dt
 import json
 import os
 import re
+import base64
+import shutil
 import sys
 import tempfile
 import unittest
@@ -47,6 +49,10 @@ class Fake:
         raise pm.ReadError("no route " + path)
 
 
+CONFIG = ('[auto_merge]\nreviewer_signers = ["rev"]\nreviewer_stamp_sessions = ["fleet-pass-reviewer-*"]\n')
+HEAD = "a" * 40
+
+
 def world(prs, timelines=None, commits=None, base_commits=None, runs=None, jobs=None, checks=None, required=("Test",), default_checks=True):
     timelines, commits, jobs, checks = timelines or {}, commits or {}, jobs or {}, checks or {}
     routes = [(r"pulls\?state=all", prs)]
@@ -60,9 +66,10 @@ def world(prs, timelines=None, commits=None, base_commits=None, runs=None, jobs=
     for rid, js in jobs.items():
         routes.append((rf"actions/runs/{rid}/jobs", {"jobs": js}))
     for sha, cr in checks.items():
-        routes.append((rf"commits/{sha}/check-runs", {"check_runs": cr}))
+        routes.append((rf"commits/{sha}/check-runs", (lambda path, cr=cr: {"check_runs": cr(path)}) if callable(cr) else {"check_runs": cr}))
     if default_checks:
         routes.append((r"commits/[^/]+/check-runs", {"check_runs": [{"name": "Test", "status": "completed", "conclusion": "success"}]}))
+    routes.append((r"contents/\.shipyard/config\.toml", {"content": base64.b64encode(CONFIG.encode()).decode()}))
     routes.append((r"rules/branches/main", [{"type": "required_status_checks",
                                               "parameters": {"required_status_checks": [{"context": c} for c in required]}}]))
     return Fake(routes)
@@ -196,6 +203,17 @@ class Compute(Base):
         self.assertEqual(again, [])
         self.assertEqual(self.rows(out)[1]["compute"]["self_hosted_min"], 30.0)
 
+    def test_a_current_compute_entry_is_not_trusted_while_the_head_reads_are_incomplete(self):
+        d = os.path.join(self.cache, REPO.replace("/", "__"), "compute")
+        os.makedirs(d)
+        with open(os.path.join(d, "1.json"), "w") as fh:
+            json.dump({"v": pm.COMPUTE_VERSION, "self_hosted_min": 1.0, "hosted_min": 1.0, "runs": 1, "repeat_runs": 0, "group_runs": 0, "complete": True}, fh)
+        gh = world([pr(1, T(10, "09:00"), T(10, "11:00"))], runs=self.runs, jobs=self.jobs)
+        gh.routes.insert(0, (r"pulls/1/commits", lambda path: [commit(f"p{i}", "x", "w") for i in range(100)]))  # 3 full pages: incomplete
+        c = self.rows(self.build(gh))[1]["compute"]
+        self.assertFalse((c or {}).get("complete"))
+        self.assertNotEqual((c or {}).get("self_hosted_min"), 1.0)
+
     def test_an_unreadable_jobs_list_is_unread_not_zero(self):
         gh = world([pr(1, T(10, "09:00"), T(10, "11:00"))], runs=self.runs, jobs={})
         out = self.build(gh)
@@ -279,6 +297,32 @@ class Correctness(Base):
         k = out["repos"][REPO]["per_day"]["2026-11-12"]["correctness"]
         self.assertEqual(k["provisional_prs"], 1)
 
+    def test_an_incomplete_multi_page_check_read_is_not_settled_or_cached(self):
+        p = self.merged_old(6)
+        greens = [{"name": f"j{i}", "status": "completed", "conclusion": "success"} for i in range(200)]
+        ck = {p["merge_commit_sha"]: lambda path: greens[:100] if path.endswith("&page=1") else greens[100:]}
+        out = self.build(world([p], base_commits=[commit(p["merge_commit_sha"], date=T(5, "10:00"))], checks=ck),
+                         now=dt.datetime(2026, 11, 14, tzinfo=UTC))
+        c = self.rows(out)[6]["correct"]
+        self.assertEqual((c["base_red"], c["bad"]), (None, None))
+        self.assertFalse(os.path.exists(os.path.join(self.cache, REPO.replace("/", "__"), "checks", p["merge_commit_sha"] + ".json")))
+
+    def test_old_unversioned_clean_caches_are_read_again(self):
+        p = self.merged_old(6)
+        root = os.path.join(self.cache, REPO.replace("/", "__"))
+        sha = p["merge_commit_sha"]
+        for kind, name, body in (("checks", sha, {"red": []}),
+                                 ("correct", "6", {"provisional": False, "reverted": False, "base_red": False, "bad": False,
+                                                   "escape_provisional": False, "escaped": False, "escaped_by": None})):
+            os.makedirs(os.path.join(root, kind), exist_ok=True)
+            with open(os.path.join(root, kind, name + ".json"), "w") as fh:
+                json.dump(body, fh)
+        red = [{"name": "Test", "status": "completed", "conclusion": "failure"}]
+        gh = world([p], base_commits=[commit(sha, date=T(5, "10:00"))], checks={sha: red})
+        c = self.rows(self.build(gh, now=dt.datetime(2026, 11, 14, tzinfo=UTC)))[6]["correct"]
+        self.assertTrue([x for x in gh.calls if "check-runs" in x])
+        self.assertEqual((c["base_red"], c["bad"]), (True, True))
+
     def test_unreadable_checks_make_correctness_unknown(self):
         p = self.merged_old(6)
         out = self.build(world([p], base_commits=[commit(p["merge_commit_sha"], date=T(5, "10:00"))], default_checks=False), now=dt.datetime(2026, 11, 14, tzinfo=UTC))
@@ -340,6 +384,359 @@ class Escapes(Base):
     def test_escape_window_is_provisional_for_a_pr_under_14_days_old(self):
         out = self.build(world([pr(5, T(10, "09:00"), T(10, "10:00"))]))
         self.assertTrue(self.rows(out)[5]["correct"]["escape_provisional"])
+
+
+class Attribution(Base):
+    """Agents commit under the owner's identity, so authorship comes from stronger signals."""
+
+    def run_one(self, p=None, tl=None, cm=None):
+        p = p or pr(1, T(10, "10:00"), T(10, "11:00"))
+        shutil.rmtree(os.path.join(self.cache, REPO.replace("/", "__")), ignore_errors=True)  # each call reads fresh
+        out = self.build(world([p], {1: tl or []}, {1: cm or [commit("c1", OWNER, "work")]}))
+        return self.rows(out)[1], out
+
+    def opened(self, login=None, body=None):
+        p = pr(1, T(10, "10:00"), T(10, "11:00"))
+        p["user"], p["body"] = {"login": login or OWNER}, body
+        return p
+
+    def test_a_human_only_pr_stays_unknown_and_a_human_action_stays_owner(self):
+        r, _ = self.run_one(self.opened())
+        self.assertEqual((r["north"], r["attribution"]["signals"], r["attribution"]["primary"]), ("unknown", [], None))
+        tl = [{"event": "labeled", "actor": {"login": OWNER}, "created_at": T(10, "10:30")}]
+        r, _ = self.run_one(self.opened(), tl)
+        self.assertEqual(r["north"], "owner_action")
+
+    def test_opened_by_the_fleet_app_clears_owner_identity_commits(self):
+        r, out = self.run_one(self.opened("shipyard-local[bot]"))
+        self.assertEqual((r["north"], r["attribution"]["primary"], r["attribution"]["legacy_north"]), ("autonomous", "app_opener", "unknown"))
+        a = out["repos"][REPO]["per_day"]["2026-11-10"]["attribution"]
+        self.assertEqual((a["by_primary"]["app_opener"], a["ambiguous_cleared"]["app_opener"], a["legacy"]["unknown"]), (1, 1, 1))
+
+    def test_shipyard_provenance_markers_in_the_body(self):
+        for body in ("x\n<!-- shipyard-owner: host=m5 client=codex -->", "<!-- whence {\"a\":1} -->"):
+            r, _ = self.run_one(self.opened(body=body))
+            self.assertEqual((r["north"], r["attribution"]["primary"]), ("autonomous", "provenance"))
+
+    def test_agent_trailer_on_any_commit(self):
+        cm = [commit("c1", OWNER, "work"), commit("c2", "someone", "x\n\nCo-Authored-By: Claude <noreply@anthropic.com>")]
+        r, _ = self.run_one(self.opened(), cm=cm)
+        self.assertEqual((r["north"], r["attribution"]["primary"]), ("autonomous", "trailer"))
+
+    def test_session_stamp_in_the_body_or_a_commit(self):
+        r, _ = self.run_one(self.opened(body="<!-- session: m5/abc -->"))
+        self.assertEqual((r["north"], r["attribution"]["primary"]), ("autonomous", "session_stamp"))
+        r, _ = self.run_one(self.opened(), cm=[commit("c1", OWNER, "work\n\n<!-- session: m5/abc -->")])
+        self.assertEqual((r["north"], r["attribution"]["primary"]), ("autonomous", "session_stamp"))
+
+    def test_signals_are_all_listed_and_the_strongest_is_primary(self):
+        p = self.opened("shipyard-local[bot]", "<!-- whence {} -->")
+        r, _ = self.run_one(p, cm=[commit("c1", OWNER, "w\n\nCo-Authored-By: Claude <a@anthropic.com>")])
+        self.assertEqual(r["attribution"]["signals"], ["app_opener", "provenance", "trailer"])
+        self.assertEqual(r["attribution"]["primary"], "app_opener")
+
+    def test_an_owner_comment_with_a_session_stamp_is_an_agent_not_an_owner_action(self):
+        tl = [{"event": "commented", "user": {"login": OWNER}, "created_at": T(10, "10:30"), "body": "repaired: x\n<!-- session: m5/abc -->"}]
+        r, out = self.run_one(self.opened(), tl)
+        self.assertEqual((r["north"], r["attribution"]["agent_owner_events"], r["attribution"]["primary"]), ("autonomous", 1, "session_stamp"))
+        self.assertEqual(out["repos"][REPO]["per_day"]["2026-11-10"]["attribution"]["agent_stamped_owner_events"], 1)
+
+    MERGE = {"event": "merged", "actor": {"login": OWNER}, "created_at": T(10, "11:00")}
+
+    def app_comment(self, body, login="shipyard-local[bot]"):
+        return {"event": "commented", "user": {"login": login}, "created_at": T(10, "10:30"), "body": body}
+
+    def merged_pr(self, login=OWNER):
+        p = self.opened(login)
+        p["head"] = {"sha": HEAD}
+        return p
+
+    APPROVE = ("reviewer: rev\n<!-- session: m3/fleet-pass-reviewer-7 -->\nverdict: APPROVE head:" + HEAD)
+
+    def test_a_trusted_app_approve_with_a_session_stamp_makes_an_owner_merge_a_steward_merge(self):
+        r, _ = self.run_one(self.merged_pr(), [self.app_comment(self.APPROVE), self.MERGE], cm=[commit("c1", "x", "w")])
+        self.assertEqual((r["north"], r["attribution"]["steward_merge_recognised"], r["attribution"]["legacy_north"]), ("autonomous", True, "owner_action"))
+
+    def test_an_app_enqueue_event_makes_an_owner_merge_a_steward_merge(self):
+        enq = {"event": "added_to_merge_queue", "actor": {"login": "shipyard-local[bot]"}, "created_at": T(10, "10:40")}
+        r, _ = self.run_one(self.merged_pr(), [self.CM, enq, self.MERGE], cm=[commit("c1", "x", "w")])
+        self.assertEqual((r["north"], r["attribution"]["steward_merge_recognised"]), ("autonomous", True))
+
+    def enq(self, hm, kind="added_to_merge_queue", login="shipyard-local[bot]"):
+        return {"event": kind, "actor": {"login": login}, "created_at": T(10, hm)}
+
+    def test_an_ejected_enqueue_followed_by_a_manual_merge_is_an_owner_action(self):
+        tl = [self.CM, self.enq("10:40"), dict(self.enq("10:45", "removed_from_merge_queue"), reason="failed_checks"), self.MERGE]
+        r, _ = self.run_one(self.merged_pr(), tl, cm=[commit("c1", "x", "w")])
+        self.assertEqual((r["north"], r["attribution"]["steward_merge_recognised"]), ("owner_action", False))
+
+    def test_an_enqueue_then_a_hold_then_a_manual_merge_is_an_owner_action(self):
+        hold = dict(self.app_comment("verdict: HOLD head:" + HEAD), created_at=T(10, "10:50"))
+        r, _ = self.run_one(self.merged_pr(), [self.CM, self.enq("10:40"), hold, self.MERGE], cm=[commit("c1", "x", "w")])
+        self.assertEqual(r["north"], "owner_action")
+
+    def test_a_new_enqueue_after_an_ejection_that_leads_to_the_merge_is_a_steward_merge(self):
+        tl = [self.CM, self.enq("10:40"), dict(self.enq("10:45", "removed_from_merge_queue"), reason="failed_checks"), self.enq("10:50"), self.MERGE]
+        r, _ = self.run_one(self.merged_pr(), tl, cm=[commit("c1", "x", "w")])
+        self.assertEqual((r["north"], r["attribution"]["steward_merge_recognised"]), ("autonomous", True))
+
+    CM = {"event": "committed", "sha": HEAD}
+
+    def test_a_clock_skewed_commit_timestamp_does_not_change_the_classification(self):
+        for date in (T(1, "00:00"), T(10, "10:50"), T(30, "23:00")):
+            r, _ = self.run_one(self.merged_pr(), [self.CM, self.enq("10:40"), self.MERGE], cm=[commit("c1", "x", "w", date=date)])
+            self.assertEqual((r["north"], r["attribution"]["steward_merge_recognised"]), ("autonomous", True))
+
+    def test_a_later_push_of_an_older_commit_after_the_enqueue_is_never_steward(self):
+        older = {"event": "committed", "sha": "c" * 40}
+        r, _ = self.run_one(self.merged_pr(), [self.CM, self.enq("10:40"), older, self.MERGE], cm=[commit("c1", "x", "w", date=T(1, "00:00"))])
+        self.assertEqual((r["attribution"]["steward_merge_recognised"], r["north"]), (False, "owner_action"))
+        forced = {"event": "head_ref_force_pushed", "actor": {"login": "x"}, "created_at": T(1, "00:00"), "after_sha": HEAD}
+        r, _ = self.run_one(self.merged_pr(), [self.CM, self.enq("10:40"), forced, self.MERGE], cm=[commit("c1", "x", "w")])
+        self.assertEqual(r["attribution"]["steward_merge_recognised"], False)
+
+    def test_an_enqueue_the_timeline_cannot_bind_to_the_merged_sha_is_unknown_and_counted_apart(self):
+        # no commit event at all, or the head then was another SHA with no later push
+        for tl in ([self.enq("10:40"), self.MERGE], [{"event": "committed", "sha": "d" * 40}, self.enq("10:40"), self.MERGE]):
+            r, out = self.run_one(self.merged_pr(), tl, cm=[commit("c1", "x", "w")])
+            self.assertEqual((r["north"], r["attribution"]["steward_merge_recognised"], r["attribution"]["merge_unverified"]), ("unknown", False, True))
+            a = out["repos"][REPO]["per_day"]["2026-11-10"]["attribution"]
+            self.assertEqual((a["owner_merges_unverified"], a["steward_merges_recognised"]), (1, 0))
+            ns = out["repos"][REPO]["per_day"]["2026-11-10"]["north_star"]
+            self.assertEqual((ns["owner_action"], ns["autonomous"], ns["unknown"]), (0, 0, 1))
+            self.assertEqual(r["owner_actions"], 0)
+            iv = out["repos"][REPO]["per_day"]["2026-11-10"]["interventions"]
+            self.assertEqual((iv["owner_actions_per_pr"], iv["prs_with_owner_action"]), (0.0, 0))
+
+    def test_an_unverified_merge_from_a_partial_read_is_not_an_owner_action(self):
+        gh = world([self.merged_pr()], {1: [self.CM, self.enq("10:40"), self.MERGE]}, {1: self.long_commits()})
+        r = self.rows(self.build(gh))[1]
+        self.assertEqual((r["north"], r["owner_actions"]), ("unknown", 0))
+
+    def test_an_old_compute_cache_entry_is_recomputed(self):
+        d = os.path.join(self.cache, REPO.replace("/", "__"), "compute")
+        os.makedirs(d)
+        with open(os.path.join(d, "1.json"), "w") as fh:  # written before COMPUTE_VERSION: complete=true from a partial read
+            json.dump({"self_hosted_min": 99.0, "hosted_min": 0.0, "runs": 1, "repeat_runs": 0, "group_runs": 0, "complete": True}, fh)
+        gh = world([self.merged_pr()], {1: [self.CM, self.enq("10:40"), self.MERGE]}, {1: [commit("c1", "x", "w")]})
+        c = self.rows(self.build(gh))[1]["compute"]
+        self.assertNotEqual((c or {}).get("self_hosted_min"), 99.0)
+        self.assertTrue([x for x in gh.calls if "runs" in x])
+
+    def test_the_report_states_the_actual_steward_evidence_rule(self):
+        md = pm.markdown(self.build(world([self.merged_pr()])))
+        self.assertIn("trusted evidence bound to the merged SHA", md)
+        self.assertIn("unverified owner merge", md)
+        for phrase in ("timeline order, never by date", "exact-head APPROVE", "reviewer_signers", "reviewer_stamp_sessions",
+                       "left out of the owner-action counts"):
+            self.assertIn(phrase, md)
+        self.assertNotIn("(or opened through `shipyard pr`) is a steward merge", md)
+
+    def test_an_approval_followed_by_an_ejection_is_not_evidence(self):
+        gone = dict(self.enq("10:45", "removed_from_merge_queue"), reason="failed_checks")
+        r, _ = self.run_one(self.merged_pr(), [self.app_comment(self.APPROVE), gone, self.MERGE], cm=[commit("c1", "x", "w")])
+        self.assertEqual(r["north"], "owner_action")
+
+    def test_a_stamp_removed_from_the_body_does_not_persist_in_a_warm_cache(self):
+        cm = {1: [commit("c1", OWNER, "work")]}
+        p = self.opened(body="<!-- session: m5/abc -->")
+        warm = self.build(world([p], {1: []}, cm))
+        self.assertEqual(self.rows(warm)[1]["north"], "autonomous")
+        q = self.opened(body="plain")
+        gh = world([q], {1: []}, cm)
+        out = self.build(gh)  # same cache dir: the entry is warm
+        self.assertFalse([c for c in gh.calls if "timeline" in c])  # served from the cache
+        self.assertEqual(self.rows(out)[1]["north"], "unknown")
+        self.assertEqual(self.rows(out)[1]["attribution"]["signals"], [])
+
+    def many_commits(self):
+        return [commit("c1", "x", "w")] + [commit(f"p{i}", "x", "w") for i in range(299)]  # 3 full pages: the read is incomplete
+
+    def test_an_incomplete_commit_read_never_trusts_steward_evidence(self):
+        enq = {"event": "added_to_merge_queue", "actor": {"login": "shipyard-local[bot]"}, "created_at": T(10, "10:40")}
+        r, _ = self.run_one(self.merged_pr(), [enq, self.MERGE], cm=self.many_commits())
+        self.assertFalse(r["attribution"]["steward_merge_recognised"])
+
+    def test_a_pr_read_from_incomplete_commits_is_not_cached_and_is_read_again(self):
+        p = self.merged_pr()
+        self.build(world([p], {1: [self.MERGE]}, {1: self.many_commits()}))
+        gh = world([p], {1: [self.MERGE]}, {1: self.many_commits()})
+        self.build(gh)
+        self.assertTrue([c for c in gh.calls if "pulls/1/commits" in c])  # not served from the cache
+
+    def test_a_cached_incomplete_entry_is_read_again(self):
+        p = self.merged_pr()
+        self.build(world([p], {1: [self.MERGE]}, {1: [commit("c1", "x", "w")]}))
+        path = os.path.join(self.cache, REPO.replace("/", "__"), "facts", "1.json")
+        d = json.load(open(path))
+        d["commits_complete"] = False
+        json.dump(d, open(path, "w"))
+        gh = world([p], {1: [self.MERGE]}, {1: [commit("c1", "x", "w")]})
+        self.build(gh)
+        self.assertTrue([c for c in gh.calls if "pulls/1/commits" in c])
+
+    def review(self, body, hm="10:30", rid=11, state="commented"):
+        return {"event": "reviewed", "id": rid, "state": state, "user": {"login": "shipyard-local[bot]"}, "submitted_at": T(10, hm), "body": body}
+
+    def test_a_review_based_approve_then_an_enqueue_then_a_merge_is_a_steward_merge(self):
+        r, _ = self.run_one(self.merged_pr(), [self.review(self.APPROVE), self.CM, self.enq("10:40"), self.MERGE], cm=[commit("c1", "x", "w")])
+        self.assertEqual((r["north"], r["attribution"]["steward_merge_recognised"]), ("autonomous", True))
+        r, _ = self.run_one(self.merged_pr(), [self.review(self.APPROVE), self.MERGE], cm=[commit("c1", "x", "w")])
+        self.assertEqual(r["attribution"]["steward_merge_recognised"], True)  # the approval alone counts too
+
+    def test_a_review_based_hold_after_an_approval_then_a_manual_merge_is_an_owner_action(self):
+        hold = self.review("<!-- session: m3/fleet-pass-reviewer-7 -->\nverdict: HOLD head:" + HEAD, "10:50", 12, "changes_requested")
+        r, _ = self.run_one(self.merged_pr(), [self.review(self.APPROVE), hold, self.MERGE], cm=[commit("c1", "x", "w")])
+        self.assertEqual((r["north"], r["attribution"]["steward_merge_recognised"]), ("owner_action", False))
+        # a comment approval cancelled by a later review HOLD
+        r, _ = self.run_one(self.merged_pr(), [self.app_comment(self.APPROVE), hold, self.MERGE], cm=[commit("c1", "x", "w")])
+        self.assertEqual(r["north"], "owner_action")
+
+    def test_a_review_verdict_naming_the_wrong_head_is_not_counted(self):
+        r, _ = self.run_one(self.merged_pr(), [self.review(self.APPROVE.replace(HEAD, "b" * 40)), self.MERGE], cm=[commit("c1", "x", "w")])
+        self.assertEqual(r["north"], "owner_action")
+
+    def test_a_review_verdict_from_an_untrusted_user_or_without_a_stamp_is_not_counted(self):
+        bad = dict(self.review(self.APPROVE), user={"login": "someone"})
+        r, _ = self.run_one(self.merged_pr(), [bad, self.MERGE], cm=[commit("c1", "x", "w")])
+        self.assertEqual(r["north"], "owner_action")
+        r, _ = self.run_one(self.merged_pr(), [self.review("verdict: APPROVE head:" + HEAD), self.MERGE], cm=[commit("c1", "x", "w")])
+        self.assertEqual(r["north"], "owner_action")
+
+    def test_a_dismissed_review_approval_does_not_count(self):
+        dis = {"event": "review_dismissed", "actor": {"login": "x"}, "created_at": T(10, "10:45"), "dismissed_review": {"review_id": 11}}
+        r, _ = self.run_one(self.merged_pr(), [self.review(self.APPROVE), dis, self.MERGE], cm=[commit("c1", "x", "w")])
+        self.assertEqual(r["north"], "owner_action")
+
+    NOISE = {"event": "subscribed", "actor": {"login": "x"}, "created_at": T(10, "10:00")}
+
+    def long_timeline(self, head_events, pages=5):
+        """`pages` full pages of 100: the read stops at its page cap and is incomplete."""
+        first = head_events + [self.NOISE] * (100 - len(head_events))
+        return lambda path: first if path.endswith("&page=1") else [self.NOISE] * 100
+
+    def long_commits(self, pages=3):
+        mk = lambda i: commit(f"k{i}", "x", "w", date=T(10, "09:00"))
+        return lambda path: [mk(i) for i in range(100)]
+
+    def test_an_incomplete_timeline_is_not_cached_and_is_read_again(self):
+        p = self.merged_pr()
+        tl = {1: self.long_timeline([self.CM, self.enq("10:40"), self.MERGE])}
+        gh = world([p], tl, {1: [commit("c1", "x", "w")]})
+        out = self.build(gh)
+        self.assertFalse(os.path.exists(os.path.join(self.cache, REPO.replace("/", "__"), "facts", "1.json")))
+        gh2 = world([p], tl, {1: [commit("c1", "x", "w")]})
+        self.build(gh2)
+        self.assertTrue([c for c in gh2.calls if "timeline" in c])
+
+    def test_a_legacy_cache_entry_from_a_partial_read_is_read_again(self):
+        old = {"v": pm.FACTS_VERSION, "number": 1, "base": "main", "created_at": T(10, "10:00"), "merged_at": T(10, "11:00"), "state": "closed",
+               "merge_commit_sha": "m", "first_ready": T(10, "10:00"), "owner_events": [], "agent_events": [], "steward_seq": [],
+               "ambiguous_commits": [], "repair_cycles": 0, "holds": 0, "re_holds": 0, "size": None,
+               "pushes": {"repair": 0, "author": 0, "merge_main": 0}, "enqueues": 0, "ejections": [], "labels": [], "heads": ["h"],
+               "timeline_complete": False, "commits_complete": True, "agent_trailer": False, "stamp_commit": False}
+        d = os.path.join(self.cache, REPO.replace("/", "__"), "facts")
+        os.makedirs(d)
+        with open(os.path.join(d, "1.json"), "w") as fh:
+            json.dump(old, fh)
+        gh = world([self.merged_pr()], {1: []}, {1: [commit("c1", "x", "w")]})
+        self.build(gh)
+        self.assertTrue([c for c in gh.calls if "timeline" in c])
+
+    def test_an_incomplete_timeline_with_an_apparent_steward_path_is_not_a_steward_merge(self):
+        tl = {1: self.long_timeline([self.CM, self.enq("10:40"), self.MERGE])}
+        r = self.rows(self.build(world([self.merged_pr()], tl, {1: [commit("c1", "x", "w")]})))[1]
+        self.assertEqual((r["attribution"]["steward_merge_recognised"], r["north"], r["owner_actions"]), (False, "unknown", 0))
+        # the same events read in full are a steward merge
+        r, _ = self.run_one(self.merged_pr(), [self.CM, self.enq("10:40"), self.MERGE], cm=[commit("c1", "x", "w")])
+        self.assertEqual((r["attribution"]["steward_merge_recognised"], r["north"]), (True, "autonomous"))
+
+    def test_incomplete_commits_with_an_apparent_steward_path_are_not_a_steward_merge(self):
+        gh = world([self.merged_pr()], {1: [self.CM, self.enq("10:40"), self.MERGE]}, {1: self.long_commits()})
+        r = self.rows(self.build(gh))[1]
+        self.assertEqual((r["attribution"]["steward_merge_recognised"], r["north"]), (False, "unknown"))
+
+    def test_a_partial_read_does_not_hide_a_definite_owner_action(self):
+        label = {"event": "labeled", "actor": {"login": OWNER}, "created_at": T(10, "10:30")}
+        tl = {1: self.long_timeline([label, self.CM, self.enq("10:40"), self.MERGE])}
+        r = self.rows(self.build(world([self.merged_pr()], tl, {1: [commit("c1", "x", "w")]})))[1]
+        self.assertEqual((r["north"], r["owner_actions"]), ("owner_action", 1))  # the label counts, the unplaced merge does not
+
+    def test_compute_from_partial_heads_is_not_complete(self):
+        f = {"heads": ["h"], "base": "main", "number": 1, "timeline_complete": True, "commits_complete": False}
+        c = pm.pr_compute(None, f, [], True)
+        self.assertFalse(c["complete"])
+
+    def test_an_enqueue_by_anyone_but_the_app_is_not_evidence(self):
+        enq = {"event": "added_to_merge_queue", "actor": {"login": "someone"}, "created_at": T(10, "10:40")}
+        r, _ = self.run_one(self.merged_pr(), [enq, self.MERGE], cm=[commit("c1", "x", "w")])
+        self.assertEqual(r["north"], "owner_action")
+
+    def test_an_owner_merge_after_a_hold_stays_owner_action(self):
+        hold = self.app_comment("<!-- session: m3/fleet-pass-reviewer-7 -->\nverdict: HOLD head:" + HEAD)
+        r, _ = self.run_one(self.merged_pr(), [hold, self.MERGE], cm=[commit("c1", "x", "w")])
+        self.assertEqual((r["north"], r["attribution"]["steward_merge_recognised"]), ("owner_action", False))
+        # an approval does not outlive an App HOLD at the same head
+        r, _ = self.run_one(self.merged_pr(), [self.app_comment(self.APPROVE), hold, self.MERGE], cm=[commit("c1", "x", "w")])
+        self.assertEqual(r["north"], "owner_action")
+
+    def test_an_untrusted_user_posting_an_approve_does_not_make_a_steward_merge(self):
+        for body, login in ((self.APPROVE, "someone"), (self.APPROVE, OWNER),
+                            ("verdict: APPROVE head:" + HEAD, "shipyard-local[bot]"),  # unsigned, unstamped
+                            ("reviewer: nobody\n<!-- session: m3/fleet-pass-reviewer-7 -->\nverdict: APPROVE head:" + HEAD, "shipyard-local[bot]"),
+                            ("reviewer: rev\n<!-- session: m3/some-lane -->\nverdict: APPROVE head:" + HEAD, "shipyard-local[bot]"),
+                            (self.APPROVE.replace(HEAD, "b" * 40), "shipyard-local[bot]")):  # not the merged head
+            r, _ = self.run_one(self.merged_pr(), [self.app_comment(body, login), self.MERGE], cm=[commit("c1", "x", "w")])
+            self.assertEqual((r["north"], body[:30]), ("owner_action", body[:30]))
+
+    def test_a_pr_with_no_readable_policy_trusts_no_approval(self):
+        gh = world([self.merged_pr()], {1: [self.app_comment(self.APPROVE), self.MERGE]}, {1: [commit("c1", "x", "w")]})
+        gh.routes = [x for x in gh.routes if "contents" not in x[0]]
+        out = self.build(gh)
+        self.assertEqual(self.rows(out)[1]["north"], "owner_action")
+        self.assertEqual(out["repos"][REPO]["read_errors"], 0)
+
+    def test_app_opened_alone_is_not_evidence_for_an_owner_merge(self):
+        r, _ = self.run_one(self.opened("shipyard-local[bot]"), [self.MERGE])
+        self.assertEqual(r["north"], "owner_action")
+
+    def test_owner_merge_with_no_steward_path_and_no_signal_is_a_human_merge(self):
+        merge = {"event": "merged", "actor": {"login": OWNER}, "created_at": T(10, "11:00")}
+        r, _ = self.run_one(self.opened(), [merge], cm=[commit("c1", "x", "w")])
+        self.assertEqual((r["north"], r["attribution"]["steward_merge_recognised"]), ("owner_action", False))
+
+    def test_an_owner_label_still_counts_on_an_app_opened_pr(self):
+        tl = [{"event": "labeled", "actor": {"login": OWNER}, "created_at": T(10, "10:30")}]
+        r, _ = self.run_one(self.opened("shipyard-local[bot]"), tl)
+        self.assertEqual(r["north"], "owner_action")
+
+    def test_a_cached_v3_entry_is_read_again_and_attributed_by_its_trailer(self):
+        old = {"v": 3, "number": 1, "base": "main", "created_at": T(10, "10:00"), "merged_at": T(10, "11:00"), "state": "closed",
+               "merge_commit_sha": "m", "first_ready": T(10, "10:00"), "owner_events": [], "ambiguous_commits": [T(10, "10:10")],
+               "repair_cycles": 0, "holds": 0, "re_holds": 0, "size": None, "pushes": {"repair": 0, "author": 0, "merge_main": 0},
+               "enqueues": 0, "ejections": [], "labels": [], "heads": ["h"], "timeline_complete": True, "commits_complete": True}
+        d = os.path.join(self.cache, REPO.replace("/", "__"), "facts")
+        os.makedirs(d)
+        with open(os.path.join(d, "1.json"), "w") as fh:
+            json.dump(old, fh)
+        cm = {1: [commit("c1", OWNER, "w\n\nCo-Authored-By: Claude <a@anthropic.com>")]}
+        gh = world([self.opened()], commits=cm)
+        r = self.rows(self.build(gh))[1]
+        self.assertTrue([c for c in gh.calls if "commits" in c])
+        self.assertEqual((r["north"], r["attribution"]["primary"]), ("autonomous", "trailer"))
+
+    def test_discussion_text_with_verdict_is_not_a_steward_path(self):
+        merge = {"event": "merged", "actor": {"login": OWNER}, "created_at": T(10, "11:00")}
+        talk = {"event": "commented", "user": {"login": "someone"}, "created_at": T(10, "10:30"), "body": "No verdict: tests pending"}
+        r, _ = self.run_one(self.opened(), [talk, merge], cm=[commit("c1", "x", "w")])
+        self.assertEqual((r["north"], r["attribution"]["steward_merge_recognised"]), ("owner_action", False))
+
+    def test_the_legacy_rule_counts_stamped_owner_events_as_owner_actions(self):
+        tl = [{"event": "commented", "user": {"login": OWNER}, "created_at": T(10, "10:30"), "body": "<!-- session: m5/abc -->"}]
+        r, _ = self.run_one(self.opened(), tl)
+        self.assertEqual((r["north"], r["attribution"]["legacy_north"]), ("autonomous", "owner_action"))
+        r, _ = self.run_one(self.opened(), [], cm=[commit("c1", OWNER, "work")])
+        self.assertEqual(r["attribution"]["legacy_north"], "unknown")
 
 
 def unmerged(n, created, state="open", draft=False):

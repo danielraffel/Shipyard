@@ -791,3 +791,43 @@ fn readable_variables_still_produce_real_verdicts() {
         report.lanes
     );
 }
+
+#[test]
+fn a_context_with_no_producer_or_a_templated_one_never_refuses() {
+    // exit 7 comes from `report.blocking()`; neither case may populate it.
+    let jobs = parse_workflow_jobs(
+        "jobs:\n  test:\n    name: Test ${{ matrix.name }}\n    runs-on: ${{ matrix.os }}\n",
+    );
+    for context in ["Some External App", "Test macOS ARM64"] {
+        let contexts = vec![context.to_owned()];
+        let attestations = AttestationSet {
+            hosts: Vec::new(),
+            unreadable: Vec::new(),
+        };
+        let report = assess(
+            &AssessInput {
+                contexts: &contexts,
+                contexts_source: "ruleset",
+                jobs: &jobs,
+                variables: &[],
+                census: &[],
+                census_boundary: None,
+                variables_boundary: None,
+                attestations: &attestations,
+                thresholds: crate::fleet_service::LaneServiceThresholds::default(),
+                allow_unserved: &[],
+            },
+            now(),
+        );
+        assert!(report.blocking().is_empty(), "{context}");
+        let templated = report
+            .warnings
+            .iter()
+            .any(|w| w.contains("producer: templated (unverified)"));
+        assert_eq!(templated, context == "Test macOS ARM64");
+        assert_eq!(
+            report.contexts_without_producer.is_empty(),
+            context == "Test macOS ARM64"
+        );
+    }
+}
