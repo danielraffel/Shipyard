@@ -900,35 +900,39 @@ def commit_date_str(c):
     return ((c.get("commit") or {}).get("committer") or {}).get("date") or ""
 
 
-def base_order(commits):
+def base_order(commits, anchors=None):
     """The base's pushes, oldest first. A merge queue fast-forwards the base, so each commit keeps its own (older) date
     and dates mis-order pushes: follow first-parent links when every commit carries them, else fall back to commit date
     (test fixtures and API answers without parents). Listing a base that takes merge commits also returns the commits
     of every merged branch (a PR's own commits and its merges of main), which never were base pushes and carry the PR's
-    own check runs: only the first-parent chain from the one tip is the base. More than one tip (a forked history)
-    falls back to commit date."""
+    own check runs: only a first-parent chain is the base. With `anchors=None` the listing reaches the base's tip, so
+    its one tip is followed (more than one tip falls back to commit date). A listing cut off by `until` can hold a
+    feature commit whose merge fell outside it, so its tip is not trusted: `anchors` (merged PRs' merge commits, known
+    base pushes, oldest first) give the chain, walked back from the newest one listed."""
     by = {c["sha"]: c for c in commits}
     if commits and all(c.get("parents") is not None for c in commits):
-        referenced = {p["sha"] for c in commits for p in c["parents"]}
-        tips = [c["sha"] for c in commits if c["sha"] not in referenced]
-        if len(tips) == 1:
-            order = [tips[0]]
-            while True:
-                ps = by[order[-1]]["parents"]
-                if not ps or ps[0]["sha"] not in by:
-                    break
-                order.append(ps[0]["sha"])
+        if anchors is None:
+            referenced = {p["sha"] for c in commits for p in c["parents"]}
+            tips = [c["sha"] for c in commits if c["sha"] not in referenced]
+            start = tips[0] if len(tips) == 1 else None
+        else:
+            start = next((a for a in reversed(list(anchors)) if a in by), None)
+        if start is not None:
+            order = [start]
+            while by[order[-1]]["parents"] and by[order[-1]]["parents"][0]["sha"] in by:
+                order.append(by[order[-1]]["parents"][0]["sha"])
             return [by[x] for x in reversed(order)]
     return sorted(commits, key=commit_date_str)
 
 
-def detect_main_red(rd, base_commits, merged_list, now=None):
+def detect_main_red(rd, base_commits, merged_list, now=None, listing_cut=False):
     """Read every base push's checks (the cap raises Truncated, an unreadable page ReadError), find the episodes and,
     for each one a PR started, whether that PR's final head was red in the same context when it merged."""
     by_sha = {p["merge_commit_sha"]: p for p in merged_list if p.get("merge_commit_sha")}
     # a PR's push time is its merged_at; a commit's own date is when it was written, not when it reached the base
     chron, floor = [], ""
-    for c in base_order(base_commits):
+    anchors = [p["merge_commit_sha"] for p in sorted(by_sha.values(), key=lambda p: p["merged_at"])] if listing_cut else None
+    for c in base_order(base_commits, anchors):
         t = by_sha[c["sha"]]["merged_at"] if c["sha"] in by_sha else commit_date_str(c)
         floor = max(floor, t)  # a push cannot precede its parent's: a commit written earlier than the one before it still arrived after it
         chron.append((c["sha"], floor))
@@ -1265,12 +1269,14 @@ def collect_repo(repo, cache_dir, cap, owner, lo, hi, now, ticks, tick_ctx, fetc
             runs, runs_ok = runs_index(rd, min(iso(f["created_at"]) for f in need), max(iso(f["merged_at"]) for f in need) + dt.timedelta(hours=1))
         except (Truncated, ReadError):
             pass
-    base_commits, commits_ok, req = [], False, None
+    base_commits, commits_ok, req, listing_cut = [], False, None, False
     if mrows:
         try:
+            until = max(iso(f['merged_at']) for f in mrows) + WINDOW + dt.timedelta(hours=2)
+            listing_cut = until < (now or dt.datetime.now(UTC))  # the listing stops short of the base's tip
             base_commits, commits_ok = rd.pages(
                 f"commits?sha={mrows[0]['base']}&since={fmt(min(iso(f['merged_at']) for f in mrows) - BASE_LOOKBACK)}"
-                f"&until={fmt(max(iso(f['merged_at']) for f in mrows) + WINDOW + dt.timedelta(hours=2))}", max_pages=5)
+                f"&until={fmt(until)}", max_pages=5)
         except (Truncated, ReadError):
             pass
         try:
@@ -1280,7 +1286,7 @@ def collect_repo(repo, cache_dir, cap, owner, lo, hi, now, ticks, tick_ctx, fetc
     episodes, ep_ok, ep_skipped, untracked, attributable = [], False, 0, {"one_off": [], "noisy": []}, set()
     if mrows and commits_ok:
         try:
-            episodes, ep_skipped, untracked, attributable = detect_main_red(rd, base_commits, merged_list, now)
+            episodes, ep_skipped, untracked, attributable = detect_main_red(rd, base_commits, merged_list, now, listing_cut)
             ep_ok = True
         except (Truncated, ReadError):
             pass

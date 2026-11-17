@@ -531,6 +531,14 @@ class BaseOrder(unittest.TestCase):
                    mc("b1", ["base"], T(10, "10:00")), mc("base", [], T(10, "08:00"))]
         self.assertEqual([x["sha"] for x in pm.base_order(commits)], ["base", "m1", "m2"])
 
+    def test_a_feature_commit_whose_merge_fell_outside_a_cut_listing_is_not_the_base_tip(self):
+        def mc(sha, parents, date):
+            return {"sha": sha, "parents": [{"sha": p} for p in parents], "commit": {"committer": {"date": date}}}
+        # main: base -> m1 -> m2; feature f (branched from m2) is listed, its merge commit is past `until`
+        commits = [mc("f", ["m2"], T(10, "12:30")), mc("m2", ["m1", "x"], T(10, "12:00")), mc("m1", ["base", "y"], T(10, "11:00")), mc("base", [], T(10, "08:00"))]
+        self.assertEqual([x["sha"] for x in pm.base_order(commits, ["m1", "m2"])], ["base", "m1", "m2"])
+        self.assertEqual([x["sha"] for x in pm.base_order(commits)], ["base", "m1", "m2", "f"])  # a listing that reaches the tip trusts it
+
     def test_without_parents_or_with_a_forked_history_it_falls_back_to_commit_date(self):
         plain = [commit("y", date=T(10, "11:00")), commit("x", date=T(10, "10:00"))]
         self.assertEqual([x["sha"] for x in pm.base_order(plain)], ["x", "y"])
@@ -549,6 +557,18 @@ class BaseOrder(unittest.TestCase):
             eps, *_ = pm.detect_main_red(pm.Reader(REPO, d, 100, gh), base, [a, b])
         self.assertEqual((eps[0]["pr"], eps[0]["fixer_pr"], eps[0]["minutes_to_green"]), (1, 2, 30.0))  # 10:00 to 10:30, not 01:00 to 02:00
 
+
+    def test_a_cut_listing_does_not_read_a_feature_commit_as_a_base_push(self):
+        a = pr(1, T(10, "09:00"), T(10, "10:00"))
+        a["merge_commit_sha"], a["head"]["sha"] = "ma" * 20, "ha" * 20
+        red = [{"name": "T", "status": "completed", "conclusion": "failure", "started_at": T(10, "10:00")}]
+        ok = [{"name": "T", "status": "completed", "conclusion": "success", "started_at": T(10, "10:00")}]
+        base = [{"sha": "feat", "parents": [{"sha": a["merge_commit_sha"]}], "commit": {"committer": {"date": T(10, "10:30")}}},
+                self.c(a["merge_commit_sha"], "base0", T(10, "10:00")), self.c("base0", None, T(10, "08:00"))]
+        gh = world([a], base_commits=base, checks={"base0": ok, a["merge_commit_sha"]: ok, "feat": red, a["head"]["sha"]: ok})
+        with tempfile.TemporaryDirectory() as d:
+            cut, *_ = pm.detect_main_red(pm.Reader(REPO, d, 100, gh), base, [a], listing_cut=True)
+        self.assertEqual(cut, [])  # the feature commit's red is the PR's own check, not main
 
     def test_a_push_written_before_the_one_ahead_of_it_never_gives_a_negative_time_to_green(self):
         a = pr(1, T(10, "09:00"), T(10, "10:00"))
