@@ -5971,6 +5971,8 @@ with the first line of the newest `Review quarantine diagnosis:` comment since
 the quarantine as its detail (one comments read per quarantined head only;
 the comment is untrusted text and only fills the detail). The loop state is
 still `quarantined`.
+`ci.yml` and `review-verdict.yml` subscribe to `pull_request`/`pull_request_target` type `edited` so a retargeted stacked PR re-fires its gates; `ci.yml` skips everything unless `github.event.changes.base.ref.from` is set (see skills/ci/SKILL.md).
+
 `src/app/merge_steward_cmd/scheduling_loop.rs`: the loop contract
 (docs/scheduling-loop.md). `state_for` maps a row to one `LoopState` (precedence
 `merge_group_stalled` > `Queued` decision or `queued`/`admitted` > quarantined at
