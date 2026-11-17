@@ -877,6 +877,40 @@ fn only_the_exact_busy_status_and_marker_classify_as_a_deferral() {
     ));
 }
 
+#[cfg(unix)]
+#[test]
+fn an_activation_refusal_names_the_identity_in_the_receipt() {
+    use std::os::unix::process::ExitStatusExt;
+    let output = |code: i32, stderr: &str| Output {
+        status: std::process::ExitStatus::from_raw(code << 8),
+        stdout: Vec::new(),
+        stderr: stderr.as_bytes().to_vec(),
+    };
+    let marker = format!(
+        "{}\nshipyard fleet: ...\n",
+        auth_support::ACTIVATION_REFUSED_MARKER
+    );
+    let PlanExecutionError::Failed(detail) =
+        classify_update_failure(&output(auth_support::ACTIVATION_REFUSED_EXIT_CODE, &marker))
+    else {
+        panic!("a refusal is a failure, never a deferral");
+    };
+    assert!(detail.starts_with("refused to activate: "), "{detail}");
+    assert!(detail.contains("team 95CX6P84C4"), "{detail}");
+    assert!(
+        detail.contains("the active generation is unchanged"),
+        "{detail}"
+    );
+    // Neither part alone is a refusal.
+    let PlanExecutionError::Failed(detail) = classify_update_failure(&output(
+        auth_support::ACTIVATION_REFUSED_EXIT_CODE,
+        "boom\n",
+    )) else {
+        panic!("failure");
+    };
+    assert_eq!(detail, "update command exited 78");
+}
+
 /// The launch binding renders the daemon argv from the repositories the
 /// daemon reports. It holds only when a spawned daemon's argv is exactly the
 /// spawn contract over those same repositories, so the two renderers must

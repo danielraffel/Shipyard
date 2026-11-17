@@ -1018,6 +1018,26 @@ class Controls(Base):
         self.assertIn("| ready day |", md)  # the report is still printed
         self.assertIn("withheld", md)
 
+    def test_the_pulp_escape_controls_withhold_escapes_the_detector_cannot_find(self):
+        # The real fixes do not name the PR they fix, so the built-in controls must fail
+        # rather than let Pulp report zero escaped defects.
+        pulp = "Generous-Corp/pulp"
+        p12219 = pr(12219, T(13, "09:00"), T(14, "06:30"))
+        p12338 = pr(12338, T(15, "09:00"), T(15, "16:42"))
+        p12375 = pr(12375, T(15, "20:00"), T(16, "01:14"))
+        p12375["title"] = "fix(ci): review the cheap-first jobs in the pr_number dispatch allowlist"
+        p12384 = pr(12384, T(15, "22:00"), T(16, "04:16"))
+        p12384["title"] = "fix(web): link spectral_graph_persistence into the sample-region WASM closure"
+        prs = [p12219, p12338, p12375, p12384]
+        bc = [commit(p["merge_commit_sha"], date=p["merged_at"]) for p in prs]
+        ok = [{"name": "Test", "status": "completed", "conclusion": "success"}]
+        gh = world(prs, base_commits=bc, checks={p["merge_commit_sha"]: ok for p in prs})
+        out = pm.build([pulp], self.cache, 300, OWNER, START, self.LATE, {}, {}, None, gh)
+        c = out["repos"][pulp]["controls"]
+        self.assertEqual((c["status"], c["escape"]["expected"], c["escape"]["found"], c["disabled"]),
+                         ("failed", 2, 0, ["escaped"]))
+        self.assertTrue(out["controls_failed"])
+
     def test_refused_prs_are_context_and_never_fail_the_control(self):
         prs = [pr(1, T(10, "10:00"), T(10, "11:00"))]
         out = pm.build([REPO], self.cache, 200, OWNER, START, self.LATE, {}, {}, None, world(prs), None, None, {}, {REPO: {1}})

@@ -14,7 +14,7 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 
 use super::{
@@ -686,6 +686,23 @@ fn review_gates_waiting(
     {
         return Some(stall);
     }
+    // A HOLD naming this head on a path-scoped review status
+    // (`release-path-review`) is the same repair-lane move as a HOLD on the
+    // approval context: `held:<context>`, never `required_failed`.
+    if let Some(held) = contexts
+        .iter()
+        .find_map(|label| review_status_hold(facts.pr, policy, label))
+    {
+        let since = latest_check_time(facts.pr, policy, contexts);
+        let (mut stall, hint) = dated(
+            format!("held:{}", held.context),
+            since,
+            "check_completed",
+            Some(held.description),
+        );
+        stall.held_by = held.held_by;
+        return Some((stall, hint));
+    }
     let detail = review_statuses_waiting(facts.pr, policy, contexts)?;
     let since = latest_check_time(facts.pr, policy, contexts);
     Some(dated(
@@ -694,6 +711,71 @@ fn review_gates_waiting(
         "check_completed",
         Some(detail),
     ))
+}
+
+/// A HOLD a non-approval review status names at the current head.
+struct StatusHold {
+    context: String,
+    description: String,
+    held_by: Option<HeldBy>,
+}
+
+/// The HOLD that review status `label` names at this head, when its newest
+/// status (from the app its rule binds, with no same-named check run beside
+/// it) says `a HOLD names head <head>`. Same trust rules as
+/// [`review_statuses_waiting`]: an unbound rule or a foreign status never
+/// reads, so the row stays `required_failed` (fail closed).
+fn review_status_hold(
+    pr: &StewardPullRequest,
+    policy: &StewardPolicy,
+    label: &str,
+) -> Option<StatusHold> {
+    let context = context_name(policy, label);
+    if !crate::merge_steward::is_review_gate(context, &policy.approval_context)
+        || super::infra_rerun::is_approval_context(context, &policy.approval_context)
+    {
+        return None;
+    }
+    let app_id = policy
+        .required_checks
+        .iter()
+        .find(|required| required.context.eq_ignore_ascii_case(context))
+        .and_then(|required| required.app_id)?;
+    if pr.checks.iter().any(|check| {
+        check.source == crate::merge_steward::StewardCheckSource::CheckRun
+            && check.name.eq_ignore_ascii_case(context)
+    }) {
+        return None;
+    }
+    let description =
+        crate::merge_steward::approval_status_description(&pr.checks, context, Some(app_id))?
+            .trim();
+    let rest = crate::merge_steward::review_hold(description, &pr.head_sha)?;
+    let held_by = held_by_from_status(rest).or_else(|| {
+        // `(comment <id>)` / `(review <id>)`: the record without a signer.
+        let clause = rest.split_once('(')?.1;
+        let (record, id) = clause.split_once(' ')?;
+        let record = match record {
+            "comment" => "comment",
+            "review" => "review",
+            _ => return None,
+        };
+        let id = id
+            .split(|c: char| !c.is_ascii_digit())
+            .next()?
+            .parse()
+            .ok()?;
+        Some(HeldBy {
+            holder: "a reviewer".to_owned(),
+            record,
+            id: Some(id),
+        })
+    });
+    Some(StatusHold {
+        context: context.to_owned(),
+        description: description.to_owned(),
+        held_by,
+    })
 }
 
 /// The detail when every one of `contexts` is a review status whose newest
@@ -932,6 +1014,24 @@ const fn approval_since_source(blocker: &ApprovalBlocker) -> &'static str {
     }
 }
 
+/// How old a head must be before a required context with no run at all reads
+/// `required_never_ran` even though a review status is pending: CI normally
+/// starts within minutes of a push.
+const NEVER_RAN_AFTER: Duration = Duration::minutes(10);
+
+/// Whether the head has existed longer than `age`, judged by its oldest dated
+/// check (every check at the head was created after the push). A head with no
+/// dated check is not known to be old.
+fn head_older_than(pr: &StewardPullRequest, now: DateTime<Utc>, age: Duration) -> bool {
+    pr.checks
+        .iter()
+        .filter_map(|check| check.observed_at.as_deref())
+        .filter_map(|at| DateTime::parse_from_rfc3339(at).ok())
+        .map(|at| at.with_timezone(&Utc))
+        .min()
+        .is_some_and(|oldest| now - oldest > age)
+}
+
 /// Split missing contexts (never ran on this head) from pending ones.
 fn waiting_required(
     pr: &StewardPullRequest,
@@ -960,9 +1060,19 @@ fn waiting_required(
     // A context that has not appeared yet while runs from the same source are
     // still queued or running is pending (a job that `needs:` another has not
     // started); only an absent context with nothing in flight never ran.
+    //
+    // On a head older than `NEVER_RAN_AFTER`, a review status (`review-verdict`
+    // is `pending` while the head awaits its reviewer) is produced by another
+    // workflow and says nothing about whether this context's workflow started:
+    // counting it kept a head whose CI never
+    // started at all (a base retarget with no `edited` trigger) reading "checks
+    // running, do not push".
+    let head_is_old = head_older_than(pr, Utc::now(), NEVER_RAN_AFTER);
     let in_flight = |required: &crate::merge_steward::RequiredCheck| {
         pr.checks.iter().any(|check| {
             !check.status.eq_ignore_ascii_case("COMPLETED")
+                && (!head_is_old
+                    || !crate::merge_steward::is_review_gate(&check.name, &policy.approval_context))
                 && required
                     .app_id
                     .is_none_or(|app_id| check.app_id == Some(app_id))

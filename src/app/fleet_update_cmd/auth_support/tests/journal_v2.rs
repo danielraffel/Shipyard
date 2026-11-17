@@ -157,6 +157,10 @@ impl Fixture {
     }
 
     fn script(&self) -> String {
+        self.script_with_codesign(super::ACCEPTING_CODESIGN)
+    }
+
+    fn script_with_codesign(&self, codesign: &str) -> String {
         let install_binary = format!(
             "/bin/cp {} \"$auth_generation_stage/shipyard\"; /bin/cp {} \"$auth_generation_stage/shipyard-workstream-provider\"",
             shlex_quote(&self.binary_source.display().to_string()),
@@ -173,6 +177,7 @@ impl Fixture {
             &shlex_quote(&self.wrapper_source.display().to_string()),
             &shlex_quote(&self.close_guard_source.display().to_string()),
             &install_binary,
+            codesign,
             "shipyard",
             &self.state(),
             &self.state(),
@@ -201,6 +206,16 @@ impl Fixture {
             .env("HOME", self.root.path())
             .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
             .status()
+            .expect("run transaction")
+    }
+
+    fn run_output(&self, script: &str) -> std::process::Output {
+        Command::new("/bin/bash")
+            .args(["-c", &format!("set -Eeuo pipefail\n{script}")])
+            .env_clear()
+            .env("HOME", self.root.path())
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .output()
             .expect("run transaction")
     }
 
@@ -531,4 +546,73 @@ impl SelfContained {
     fn write_unknown_wrapper(path: &Path) {
         Fixture::write_executable(path, b"#!/bin/bash\nexit 0\n");
     }
+}
+
+/// A release whose binary is not the Developer ID release is refused before
+/// anything public moves: the previous generation stays the active one, and
+/// the refusal leaves nothing behind that would block the next good release.
+#[test]
+fn a_refused_release_leaves_the_previous_generation_active() {
+    let mut fixture = Fixture::new();
+    assert!(fixture.run(&fixture.script()).success(), "first release");
+    let selector = fixture.wrapper.with_extension("shipyard-generation");
+    let generations = fixture
+        .root
+        .path()
+        .join(".local/share/shipyard/auth-generations");
+    let snapshot = |fixture: &Fixture| {
+        let mut names = std::fs::read_dir(&generations)
+            .expect("generations")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        names.sort();
+        (
+            std::fs::read_link(&selector).expect("selector"),
+            std::fs::read_link(&fixture.binary).expect("binary link"),
+            std::fs::read_link(&fixture.companion).expect("companion link"),
+            names,
+        )
+    };
+    let active = snapshot(&fixture);
+    assert!(active.1.starts_with(&generations), "{active:?}");
+
+    fixture.update_release("next");
+    let refuse = fixture.root.path().join("codesign-refuses");
+    Fixture::write_executable(
+        &refuse,
+        b"#!/bin/sh\necho 'test-requirement: code failed to satisfy specified code requirement(s)' >&2\nexit 3\n",
+    );
+    let output = fixture.run_output(&fixture.script_with_codesign(&refuse.display().to_string()));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(ACTIVATION_REFUSED_EXIT_CODE),
+        "{stderr}"
+    );
+    assert!(
+        stderr.lines().any(|line| line == ACTIVATION_REFUSED_MARKER),
+        "{stderr}"
+    );
+    assert_eq!(
+        snapshot(&fixture),
+        active,
+        "the previous generation stays active"
+    );
+    for name in ["fleet-auth-support.lock", "fleet-auth-support.transaction"] {
+        assert!(!fixture.state().join(name).exists(), "{name} left behind");
+    }
+
+    assert!(
+        fixture.run(&fixture.script()).success(),
+        "the next good release installs"
+    );
+    let next = snapshot(&fixture);
+    assert_ne!(next.0, active.0, "the good release is selected");
+    assert_eq!(next.3.len(), active.3.len() + 1);
 }
