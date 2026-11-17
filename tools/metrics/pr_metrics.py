@@ -53,7 +53,7 @@ _GUARD = []
 SIGNALS = ("app_opener", "provenance", "trailer", "session_stamp")
 BAD_CONCLUSIONS = {"failure", "timed_out"}
 FACTS_VERSION = 12
-COMPUTE_VERSION = 5  # compute caches: entries written before this could be marked complete from a partial timeline or commit read
+COMPUTE_VERSION = 6  # compute caches: entries written before this could be marked complete from a partial timeline or commit read
 CHECKS_VERSION = 2  # derived correctness caches: entries written before this (incomplete pagination read as clean) are read again
 ESCAPE_WINDOW = dt.timedelta(days=14)
 HORIZON = dt.timedelta(hours=48)
