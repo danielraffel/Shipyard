@@ -872,3 +872,93 @@ fn a_gh_without_the_escape_flag_falls_back_to_the_bare_read() {
         "gh: Not Found (HTTP 404)"
     );
 }
+
+/// A reader that sends through `budget` and counts what reached `inner`.
+fn budgeted<'a>(
+    budget: &'a budget::ReadBudget,
+    sent: &'a std::sync::atomic::AtomicU64,
+    inner: &'a (impl Fn(&[String]) -> Result<String, String> + Sync),
+) -> impl Fn(&[String]) -> Result<String, String> + Sync + 'a {
+    move |args: &[String]| {
+        budget.admit()?;
+        sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        inner(args)
+    }
+}
+
+#[test]
+fn the_read_cap_stops_at_n_and_the_result_is_partial() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let now = at("2026-09-26T01:00:00Z");
+    let inner = reader(settled_fixture());
+    // Control: uncapped, the window reads more than the cap allows and finds
+    // every gate job.
+    let open = budget::ReadBudget::new(10_000, false);
+    let open_sent = AtomicU64::new(0);
+    let full = gather_cached(
+        &budgeted(&open, &open_sent, &inner),
+        &query(),
+        now,
+        &ReadCache::disabled(),
+    )
+    .expect("uncapped gathers");
+    assert!(!open.stopped());
+    let total = open_sent.load(Ordering::Relaxed);
+    assert!(total > 6, "control: the window costs {total} reads");
+
+    let cap = 6;
+    let capped_budget = budget::ReadBudget::new(cap, false);
+    let capped_sent = AtomicU64::new(0);
+    let capped = gather_cached(
+        &budgeted(&capped_budget, &capped_sent, &inner),
+        &query(),
+        now,
+        &ReadCache::disabled(),
+    )
+    .expect("a capped window still reports what it read");
+    assert_eq!(capped_sent.load(Ordering::Relaxed), cap, "stops at N");
+    assert_eq!(capped_budget.sent(), cap);
+    assert!(capped_budget.stopped());
+    assert!(
+        capped_budget
+            .partial_reason()
+            .is_some_and(|why| why.contains("cap of 6")),
+    );
+    assert!(
+        capped.gate_jobs.len() < full.gate_jobs.len(),
+        "unread runs are missing, not invented: {} of {}",
+        capped.gate_jobs.len(),
+        full.gate_jobs.len()
+    );
+}
+
+#[test]
+fn cached_only_sends_no_github_reads_and_serves_the_cached_window() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let dir = tempfile::tempdir().expect("tempdir");
+    let now_system = std::time::SystemTime::now();
+    let now = at("2026-09-26T01:00:00Z");
+    let inner = reader(settled_fixture());
+    // Warm the cache with one live run.
+    let live = budget::ReadBudget::new(10_000, false);
+    let live_sent = AtomicU64::new(0);
+    let warm = ReadCache::open(dir.path(), now_system);
+    let live_obs = gather_cached(&budgeted(&live, &live_sent, &inner), &query(), now, &warm)
+        .expect("live gathers");
+    assert!(live_sent.load(Ordering::Relaxed) > 0, "control: live read");
+
+    let cache = ReadCache::open(dir.path(), now_system);
+    let window = cached_window(&cache, &query()).expect("a cached window");
+    assert_eq!(window, (query().from, query().to));
+    let zero = budget::ReadBudget::new(300, true);
+    let sent = AtomicU64::new(0);
+    let observation = gather_cached(&budgeted(&zero, &sent, &inner), &query(), now, &cache)
+        .expect("cached-only gathers from the cache");
+    assert_eq!(sent.load(Ordering::Relaxed), 0, "zero GitHub reads");
+    assert_eq!(zero.sent(), 0);
+    assert!(zero.stopped(), "the refused reads mark it partial");
+    assert_eq!(observation.gate_jobs.len(), live_obs.gate_jobs.len());
+    // An empty cache has nothing to serve.
+    let empty = ReadCache::open(tempfile::tempdir().expect("t").path(), now_system);
+    assert_eq!(cached_window(&empty, &query()), None);
+}

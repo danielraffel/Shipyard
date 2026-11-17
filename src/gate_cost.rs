@@ -43,6 +43,7 @@ use serde_json::Value;
 use crate::metrics::job_name;
 use crate::validation_signals::{self, GhReader, ReceiptDecision};
 
+pub mod budget;
 pub mod cache;
 pub mod ctest_log;
 pub mod proxy;
@@ -388,6 +389,10 @@ pub struct GateCostReport {
     pub proxies: GateProxies,
     /// Requests this report cost: sent to GitHub, and served from the cache.
     pub reads: ReadStats,
+    /// Why the figures cover only part of the window (the read cap, or
+    /// `--cached-only`). Absent when every read was made.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub partial: Option<String>,
 }
 
 fn round2(value: f64) -> f64 {
@@ -726,6 +731,7 @@ pub fn compute(observation: &GateCostObservation) -> GateCostReport {
         telemetry_gaps: gaps,
         proxies,
         reads: observation.reads,
+        partial: None,
     }
 }
 
@@ -1117,7 +1123,7 @@ pub fn gather_cached(
     let mut listing_gaps = Vec::new();
     let mut gate_absent: BTreeMap<String, GateAbsence> = BTreeMap::new();
     for event in &query.events {
-        let pages = read_pages(
+        let listing = read_pages(
             gh,
             &format!(
                 "repos/{}/actions/workflows/{}/runs",
@@ -1128,7 +1134,30 @@ pub fn gather_cached(
                 created.clone(),
                 "per_page=100".to_owned(),
             ],
-        )?;
+        );
+        let snapshot_key = listing_snapshot_key(query, event);
+        let pages = match listing {
+            Ok(pages) => {
+                // The newest listing of this window length, kept so a
+                // `--cached-only` run can report it without a request.
+                cache.put(
+                    &snapshot_key,
+                    &serde_json::json!({
+                        "from": query.from.to_rfc3339(),
+                        "to": query.to.to_rfc3339(),
+                        "pages": pages,
+                    }),
+                );
+                pages
+            }
+            Err(error) if budget::is_stopped(&error) => {
+                match cached_listing(cache, &snapshot_key, query) {
+                    Some(pages) => pages,
+                    None => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        };
         if let Some(total) = pages
             .first()
             .and_then(|page| page.get("total_count"))
@@ -1173,7 +1202,12 @@ pub fn gather_cached(
             Ok::<_, String>((run.id, jobs, outcome))
         });
         for result in per_run {
-            let (run_id, jobs, outcome) = result?;
+            // A read the budget refused leaves this run unread; the caller
+            // marks the report partial. Any other failure still fails.
+            let (run_id, jobs, outcome) = match result {
+                Err(error) if budget::is_stopped(&error) => continue,
+                other => other?,
+            };
             let exact = jobs
                 .iter()
                 .any(|job| text(job, "name").as_deref() == Some(query.gate_job.as_str()));
@@ -1263,6 +1297,49 @@ pub fn gather_cached(
         listing_gaps,
         gate_absent,
     })
+}
+
+/// The cache key of the newest run listing for `event`, per window length.
+fn listing_snapshot_key(query: &GateCostQuery, event: &str) -> String {
+    format!(
+        "runs-listing/v1:{}:{}:{event}:{}",
+        query.repo,
+        query.workflow,
+        (query.to - query.from).num_seconds()
+    )
+}
+
+/// The window the newest cached listing of the query's first event covers,
+/// for `--cached-only`: the query's window length, ending when that listing
+/// was read.
+#[must_use]
+pub fn cached_window(
+    cache: &ReadCache,
+    query: &GateCostQuery,
+) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+    let value = cache.get(&listing_snapshot_key(query, query.events.first()?))?;
+    let at = |key: &str| {
+        DateTime::parse_from_rfc3339(value.get(key)?.as_str()?)
+            .ok()
+            .map(|at| at.with_timezone(&Utc))
+    };
+    Some((at("from")?, at("to")?))
+}
+
+/// The cached listing pages, only when they cover exactly the query's window.
+fn cached_listing(cache: &ReadCache, key: &str, query: &GateCostQuery) -> Option<Vec<Value>> {
+    let value = cache.get(key)?;
+    let same = |name: &str, want: DateTime<Utc>| {
+        value
+            .get(name)
+            .and_then(Value::as_str)
+            .and_then(|text| DateTime::parse_from_rfc3339(text).ok())
+            .is_some_and(|at| at.with_timezone(&Utc) == want)
+    };
+    if !same("from", query.from) || !same("to", query.to) {
+        return None;
+    }
+    value.get("pages")?.as_array().cloned()
 }
 
 /// Per run attempt, the id of the one job that stands for `gate_job` when no
