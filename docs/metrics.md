@@ -38,7 +38,7 @@ it is on only when the tick passes `--e2e-cache DIR` (the daily run does, unless
 **Synthetic control (every report).** `tools/metrics/synthetic_control.py` holds fifteen invented PRs, each
 built to have one known outcome (autonomous, owner label, steward merge, unbound owner merge, unsigned owner
 PR, never merged, reverted, red base, escaped, twice held with repair and merge-main pushes, ejected from the
-queue, a gate-run fixture with repeats). `expected()` derives 31 numbers from that table with plain arithmetic
+queue, a gate-run fixture with repeats). `expected()` derives 38 numbers from that table with plain arithmetic
 and never calls the scorecard; the real `pr_metrics.build` then runs over the same PRs, served from memory (no
 GitHub read, a throwaway cache), and every number must match. The report prints one line, `CONTROL PASS` with the
 count and the largest delta, or `CONTROL FAIL` with each missed number, its expected value, its value and the delta.
@@ -60,6 +60,20 @@ with any unread PR in its window, or a listing cut short, prints no row at all (
 window and baseline rows, and the per-PR rows in the JSON are empty) and says how many PRs were unread; the next
 run resumes from the oldest unread day. A repo fully read is reported normally even when another repo was cut.
 A repo whose read cap ran out only on later reads (compute, checks) is still labelled `partial`.
+
+## Proofs, macOS minutes, queue wait and the acceptance check
+
+The compute block keeps, per merged PR, runs by workflow and level (the PR's own heads, its merge group,
+pushes to the base), and the minutes on jobs labelled macOS. `PROOF_WORKFLOWS` names the gate-proof workflow per
+repo (Vellum: `Locked macOS GPU proof`); a repo without one shows its busiest workflows. Enqueue to merge is the
+minutes from the last `added_to_merge_queue` before the merge to `merged_at`. The run list is read in slices:
+the Actions API serves at most 1000 runs for one `created` range, so a busy range is halved until each part fits
+(before this, Pulp and Vellum compute reads were never complete and the block was always empty).
+
+`tools/metrics/acceptance.py --from 2026-11-14 --to 2026-11-16 --cache DIR` reads the PRs merged in a window and
+compares six numbers measured by hand on 2026-11-15 (Vellum and Pulp ready-to-merge medians, Vellum PR-level and
+merge-group GPU proofs per merged PR, Pulp macOS minutes per merged PR, Vellum enqueue-to-merge median) with the
+scorecard's own values, within 15%. The synthetic control covers these fields too.
 
 ## Sample and comparison
 
