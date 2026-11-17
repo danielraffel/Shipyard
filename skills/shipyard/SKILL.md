@@ -1782,6 +1782,16 @@ matching: `gh … --help | grep -q` under `pipefail` fails whenever grep exits
 first and gh dies of SIGPIPE (exit 141), which silently skipped the flag and
 left `api …/logs` refused after release.
 
+On macOS, `install.sh` and `shipyard update` install only the Developer ID
+release (identifier `shipyard` / `shipyard-workstream-provider`, team
+`95CX6P84C4`, checked with `/usr/bin/codesign --verify --strict -R=...`). A
+binary that fails is not installed and the previous pair stays. `shipyard
+update` snapshots the installed pair before running the target tag's
+installer, which may predate the check, and restores it on a failure
+(`src/app/update_cmd/install_identity.rs`). install.sh no longer re-signs ad
+hoc. The owner-only developer mode is documented in docs/install.md; agents
+never use it.
+
 `shipyard update` never installs the ghapp wrapper: `~/.local/bin/ghapp` runs
 the generation named by `~/.local/bin/ghapp.shipyard-generation`, and only
 `shipyard runner fleet-update` publishes a generation and moves that selector.
