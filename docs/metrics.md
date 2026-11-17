@@ -55,8 +55,11 @@ A control whose PR is outside the window is "not in window" and unchecked. A con
 that is missed withholds only its own metric (revert: correctness; escape: escaped; owner: North
 Star); every other number is still reported.
 
-A repo whose window has unread PRs (read cap hit, or a cut-short listing) is labelled `partial` and
-still reports what it read. A repo fully read is reported normally even when another repo was cut.
+**Read everything or withhold.** PRs are read oldest cohort day first, whole days at a time, and cached. A repo
+with any unread PR in its window, or a listing cut short, prints no row at all (the per-day tables, the pooled
+window and baseline rows, and the per-PR rows in the JSON are empty) and says how many PRs were unread; the next
+run resumes from the oldest unread day. A repo fully read is reported normally even when another repo was cut.
+A repo whose read cap ran out only on later reads (compute, checks) is still labelled `partial`.
 
 ## Sample and comparison
 

@@ -889,19 +889,42 @@ class Controls(Base):
 class Truncation(Base):
     LATE = dt.datetime(2026, 11, 30, tzinfo=UTC)
 
-    def test_a_truncated_repo_is_partial_and_a_fully_read_repo_is_not(self):
+    def test_a_repo_with_unread_prs_is_withheld_and_a_fully_read_repo_is_not(self):
         prs = [pr(n, T(10, "10:00"), T(10, "11:00")) for n in range(1, 4)]
         out = pm.build([REPO], self.cache, 4, OWNER, START, self.LATE, {}, {}, None, world(prs), None, None, {})
         v = out["repos"][REPO]
         self.assertGreater(v["unread_prs"], 0)
         self.assertTrue(out["truncated"])
+        self.assertEqual((v["per_day"], v["prs"], out["window"]["per_repo"]), ({}, [], {}))  # no number for a repo with unread PRs
+        self.assertEqual(v["withheld"]["total_prs"], 3)
         md = pm.markdown(out)
-        self.assertIn("partial", md)
-        self.assertIn("| ready day |", md)  # numbers are still printed
+        self.assertIn(f"**WITHHELD: {v['unread_prs']} of 3 PRs unread", md)
+        self.assertNotIn("| ready day |", md)
         with tempfile.TemporaryDirectory() as d2:
             full = pm.build([REPO], d2, 300, OWNER, START, self.LATE, {}, {}, None, world(prs), None, None, {})
         self.assertEqual(full["repos"][REPO]["unread_prs"], 0)
-        self.assertNotIn("partial", pm.markdown(full))
+        self.assertNotIn("withheld", full["repos"][REPO])
+        self.assertNotIn("WITHHELD", pm.markdown(full))
+
+    def test_a_cut_short_listing_withholds_the_repo_too(self):
+        gh = world([pr(1, T(10, "10:00"), T(10, "11:00"))])
+        full_page = [pr(n, T(10, "10:00"), T(10, "11:00")) for n in range(1, 101)]
+        gh.routes[0] = (r"pulls\?state=all", full_page)  # eight full pages that never reach the window's start
+        for n in range(2, 101):
+            gh.routes.append((rf"issues/{n}/timeline", []))
+            gh.routes.append((rf"pulls/{n}/commits", [commit(f"c{n}")]))
+        out = pm.build([REPO], self.cache, 5000, OWNER, dt.datetime(2026, 11, 1, tzinfo=UTC), self.LATE, {}, {}, None, gh, None, None, {})
+        self.assertFalse(out["repos"][REPO]["listing_complete"])
+        self.assertIn("withheld", out["repos"][REPO])
+        self.assertEqual(out["repos"][REPO]["prs"], [])
+
+    def test_the_oldest_cohort_day_is_read_first_so_a_cap_leaves_the_newest_unread(self):
+        old, mid, new = (pr(1, T(8, "10:00"), T(8, "11:00")), pr(2, T(9, "10:00"), T(9, "11:00")), pr(3, T(10, "10:00"), T(10, "11:00")))
+        gh = world([new, mid, old])  # the API lists newest first
+        pm.build([REPO], self.cache, 5, OWNER, START, self.LATE, {}, {}, None, gh, None, None, {})  # the listing plus two PRs
+        facts = sorted(os.listdir(os.path.join(self.cache, REPO.replace("/", "__"), "facts")))
+        self.assertEqual(facts, ["1.json", "2.json"])
+        self.assertEqual([c for c in gh.calls if "timeline" in c][:1], [c for c in gh.calls if "issues/1/timeline" in c][:1])
 
     def test_truncated_with_all_facts_cached_is_still_partial(self):
         v = {"truncated": True, "unread_prs": 0, "listing_complete": True, "read_errors": 0}
@@ -956,9 +979,9 @@ class Caps(Base):
         self.assertGreater(v["unread_prs"], 0)
         self.assertEqual(out["coverage"]["status"], "partial")
         md = pm.markdown(out)
-        self.assertIn(f"**TRUNCATED: {v['unread_prs']} PRs unread**", md)
+        self.assertIn(f"**WITHHELD: {v['unread_prs']} of 4 PRs unread", md)
         again = self.build(world(prs), cap=200)
-        self.assertNotIn("TRUNCATED:", pm.markdown(again))
+        self.assertNotIn("WITHHELD", pm.markdown(again))
         self.assertFalse(again["truncated"])
         self.assertEqual(len(again["repos"][REPO]["prs"]), 4)
 

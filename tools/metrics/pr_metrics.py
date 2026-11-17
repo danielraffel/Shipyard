@@ -823,12 +823,16 @@ def all_prs(rd, lo, hi):
 
 def collect_repo(repo, cache_dir, cap, owner, lo, hi, now, ticks, tick_ctx, fetch=None, managed_base="main", dirty=()):
     rd = Reader(repo, cache_dir, cap, fetch)
-    res = {"repo": repo, "rows": [], "unread": 0, "listing_complete": False, "reads": 0, "truncated": False, "errors": 0}
+    res = {"repo": repo, "rows": [], "unread": 0, "total_prs": 0, "listing_complete": False, "reads": 0, "truncated": False, "errors": 0}
     try:
         prs, res["listing_complete"] = all_prs(rd, lo, hi)
     except (Truncated, ReadError):
         prs = []
     merged_list = [p for p in prs if p.get("merged_at")]
+    # Read the oldest cohort day first, whole days at a time: when the read cap runs out, the unread PRs are the newest
+    # ones, the cache keeps what was read, and the next run resumes where this one stopped.
+    prs = sorted(prs, key=lambda p: (iso(p["created_at"]), p["number"]))
+    res["total_prs"] = len(prs)
     facts = []
     for pr in prs:
         f = rd.load("facts", str(pr["number"]))
@@ -1006,9 +1010,14 @@ def build(repos, cache_dir, cap, owner, start, now, ticks, tick_ctx, baseline=No
         out["repos"][repo] = {
             "per_day": {d: {"closed": day_closed(d, now), **summarize(v)} for d, v in sorted(days.items())},
             "prs": r["rows"], "excluded": dict(excluded), "controls": ctl,
-            "unread_prs": r["unread"], "listing_complete": r["listing_complete"],
+            "unread_prs": r["unread"], "listing_complete": r["listing_complete"], "total_prs": r["total_prs"],
             "reads": r["reads"], "truncated": r["truncated"], "read_errors": r["errors"],
         }
+        if r["unread"] or not r["listing_complete"]:
+            # read everything or withhold: a number over some of a repo's PRs says nothing about the repo
+            v = out["repos"][repo]
+            v["withheld"] = {"unread_prs": r["unread"], "total_prs": r["total_prs"], "listing_complete": r["listing_complete"]}
+            v["per_day"], v["prs"] = {}, []
         out["truncated"] = out["truncated"] or r["truncated"]
         out["reads"] += r["reads"]
         remaining = max(0, remaining - r["reads"])
@@ -1025,12 +1034,13 @@ def build(repos, cache_dir, cap, owner, start, now, ticks, tick_ctx, baseline=No
         open_days = sorted({p["day"] for p in v["prs"] if p["eligible"] and a <= p["day"] <= b and not day_closed(p["day"], now)})
         s["open_days_not_reported"] = open_days
         return s
-    out["window"] = {"from": ds, "to": now.strftime("%Y-%m-%d"), "per_repo": {repo: pooled(v, ds, "9999") for repo, v in out["repos"].items()}}
+    live = {repo: v for repo, v in out["repos"].items() if not v.get("withheld")}
+    out["window"] = {"from": ds, "to": now.strftime("%Y-%m-%d"), "per_repo": {repo: pooled(v, ds, "9999") for repo, v in live.items()}}
     if baseline:
         b0, b1 = (x.strftime("%Y-%m-%d") for x in baseline)
-        per = {repo: pooled(v, b0, b1) for repo, v in out["repos"].items()}
+        per = {repo: pooled(v, b0, b1) for repo, v in live.items()}
         floor = {}
-        for repo, v in out["repos"].items():
+        for repo, v in live.items():
             rates = {d: s["north_star"]["rate_pct"] for d, s in v["per_day"].items() if b0 <= d <= b1 and s["closed"] and s["ready_prs"]}
             vals = [x for x in rates.values() if x is not None]
             floor[repo] = {"north_star_rate_pct_by_day": rates, "spread_pp": None if len(vals) < 2 else round(max(vals) - min(vals), 1)}
@@ -1090,7 +1100,7 @@ def markdown(e2e):
     L = ["", f"## Scorecard {e2e['scorecard_version']}: end-to-end per eligible PR (cohort = UTC day the PR became ready)", "",
          "Baseline cohort: PRs ready 2026-11-12 to 2026-11-14. A day closes 48h after it ends, so the first comparable later cohort day closes 48h after that day.", "",
          f"Reads {e2e['reads']} (cap {e2e.get('read_cap_total', e2e['read_cap_per_repo'])} per run, shared: each repo gets an equal share of what is left), truncated={str(e2e['truncated']).lower()}"
-         + (" : repos with unread PRs are labelled partial; fully read repos are reported normally" if e2e["truncated"] else "") + f". Coverage: {e2e['coverage']['status']} {e2e['coverage']['reason']}", "",
+         + (" : a repo with any unread PR is withheld entirely; fully read repos are reported normally" if e2e["truncated"] else "") + f". Coverage: {e2e['coverage']['status']} {e2e['coverage']['reason']}", "",
          f"North Star: eligible PRs that became ready in the window and merged within 48h of ready with no owner action ({e2e['owner']}'s own account: "
          "review, label, comment, UI merge or close), over ALL eligible PRs ready in the window. A cohort day is reported only after its 48h horizon closed. "
          "Agents commit under the owner's git identity, so a PR is agent work when it carries any signal: opened by the fleet App, `shipyard pr` provenance in the body, "
@@ -1146,6 +1156,12 @@ def markdown(e2e):
                f"owner-pinned {c['owner_pinned']['found']}/{c['owner_pinned']['expected']} ({c['status']})")
     for repo, v in sorted(e2e["repos"].items()):
         L += [f"### {repo}", ""]
+        if v.get("withheld"):
+            w = v["withheld"]
+            L += [f"**WITHHELD: {w['unread_prs']} of {w['total_prs']} PRs unread, listing complete={str(w['listing_complete']).lower()}.** "
+                  "No row is printed for a repo until every PR in its window is read. PRs are read oldest cohort day first and cached, so the next run resumes where this one stopped.", "",
+                  f"Controls ({v['controls']['status']}): " + ctl_str(v), ""]
+            continue
         if repo_partial(v):
             L += [f"**TRUNCATED: {v['unread_prs']} PRs unread** ({v['reads']} reads, read cap hit={str(v['truncated']).lower()}, "
                   f"listing complete={str(v['listing_complete']).lower()}). Cached PRs are not re-read, so the next run resumes.", ""]
