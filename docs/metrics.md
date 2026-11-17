@@ -38,7 +38,7 @@ it is on only when the tick passes `--e2e-cache DIR` (the daily run does, unless
 **Synthetic control (every report).** `tools/metrics/synthetic_control.py` holds fifteen invented PRs, each
 built to have one known outcome (autonomous, owner label, steward merge, unbound owner merge, unsigned owner
 PR, never merged, reverted, red base, escaped, twice held with repair and merge-main pushes, ejected from the
-queue, a gate-run fixture with repeats). `expected()` derives 49 numbers from that table with plain arithmetic
+queue, a gate-run fixture with repeats). `expected()` derives 58 numbers from that table with plain arithmetic
 and never calls the scorecard; the real `pr_metrics.build` then runs over the same PRs, served from memory (no
 GitHub read, a throwaway cache), and every number must match. The report prints one line, `CONTROL PASS` with the
 count and the largest delta, or `CONTROL FAIL` with each missed number, its expected value, its value and the delta.
@@ -86,6 +86,18 @@ or the merge), red (each failed head run to the next push or the merge), queue (
 merge), runner (queued job time from the jobs' `created_at` to `started_at`) and DIRTY (not measured: the ticks
 record a state, not a duration, so its cell is empty and never zero). The causes overlap and are not additive.
 The top cause is the largest of the measured ones.
+
+## Main-red episodes (change failure)
+
+The detector reads the checks of every push to the base in the window (each context's latest run decides it; a push
+with unfinished runs or an unread page says nothing and is skipped). An episode starts at the first push where a
+context is red that was not red before and is attributed to the PR whose merge commit that push is (a direct push,
+or a first usable push that is already red, has no PR). It ends at the push where its last context turns green; that
+push's PR is the fixer. The report prints counts and the raw minutes to green, with no rate and no median, plus
+`head red`: episodes whose PR's own final head was red in the same context when it merged. A known-incident control
+(`DEFAULT_CONTROLS[repo]["incident"] = [(escaped PR, fixer PR)]`) must be found: the report prints recall k/n, and a
+miss fails the control and withholds the change-failure cells only. `base_red` and the text-matched escape stay as
+they were and will be retired once the episodes are audited by hand.
 
 ## Sample and comparison
 

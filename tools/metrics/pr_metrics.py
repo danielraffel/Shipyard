@@ -703,6 +703,75 @@ def commit_red(rd, sha, required):
     return red & required, settled
 
 
+def commit_state(rd, sha):
+    """The check state of one commit: {"red": contexts failing, "green": contexts succeeding, "settled": every run finished and
+    every page read}. A context's latest run (by start) decides it. Cached once settled."""
+    cached = rd.load("cstate", sha)
+    if cached is not None and cached.get("v") == CHECKS_VERSION:
+        return cached
+    runs, complete = rd.pages(f"commits/{sha}/check-runs", key="check_runs", max_pages=5)
+    latest = {}
+    for c in runs:
+        k = c["name"]
+        if k not in latest or (c.get("started_at") or "") > (latest[k].get("started_at") or ""):
+            latest[k] = c
+    st = {"v": CHECKS_VERSION, "settled": bool(complete and latest and all(c.get("status") == "completed" for c in latest.values())),
+          "red": sorted(k for k, c in latest.items() if c.get("conclusion") in BAD_CONCLUSIONS),
+          "green": sorted(k for k, c in latest.items() if c.get("conclusion") == "success")}
+    if st["settled"]:
+        rd.save("cstate", sha, st)
+    return st
+
+
+def main_red_episodes(chron, states, pr_by_sha):
+    """Main-red episodes from the base's pushes, oldest first. `chron`: [(sha, ts)]; `states`: sha -> commit_state (or None
+    when unread); `pr_by_sha`: merge commit sha -> PR number. An episode starts at the first commit where a context is
+    red that was not red before, is attributed to the PR whose merge commit that is (None for a direct push or when the
+    first usable commit is already red: it began before the window), and ends at the commit where its last context
+    turns green; that commit's PR is the fixer. A commit with unsettled checks says nothing and is skipped. Returns
+    (episodes, skipped)."""
+    open_ctx, episodes, skipped, first = {}, [], 0, True
+    for sha, ts in chron:
+        st = states.get(sha)
+        if not st or not st.get("settled"):
+            skipped += 1
+            continue
+        red, green = set(st["red"]), set(st["green"])
+        new = sorted(c for c in red if c not in open_ctx)
+        if new:
+            ep = {"start_sha": sha, "start": ts, "pr": None if first else pr_by_sha.get(sha), "began_before_window": first,
+                  "contexts": new, "open": set(new), "end": None, "fixer_pr": None, "minutes_to_green": None}
+            episodes.append(ep)
+            for c in new:
+                open_ctx[c] = ep
+        for c in sorted(set(open_ctx) & green):
+            ep = open_ctx.pop(c)
+            ep["open"].discard(c)
+            if not ep["open"]:
+                ep["end"], ep["fixer_pr"], ep["fixer_sha"] = ts, pr_by_sha.get(sha), sha
+                ep["minutes_to_green"] = round((iso(ts) - iso(ep["start"])).total_seconds() / 60.0, 1)
+        first = False
+    for ep in episodes:
+        ep["open"] = sorted(ep["open"])
+    return episodes, skipped
+
+
+def detect_main_red(rd, base_commits, merged_list):
+    """Read every base push's checks (the cap raises Truncated, an unreadable page ReadError), find the episodes and,
+    for each one a PR started, whether that PR's final head was red in the same context when it merged."""
+    chron = sorted(((c["sha"], ((c.get("commit") or {}).get("committer") or {}).get("date") or "") for c in base_commits), key=lambda x: x[1])
+    states = {sha: commit_state(rd, sha) for sha, _ in chron}
+    by_sha = {p["merge_commit_sha"]: p for p in merged_list if p.get("merge_commit_sha")}
+    episodes, skipped = main_red_episodes(chron, states, {k: p["number"] for k, p in by_sha.items()})
+    for ep in episodes:
+        p = by_sha.get(ep["start_sha"])
+        ep["head_red_same_context"] = None
+        if p and ep["pr"]:
+            hs = commit_state(rd, p["head"]["sha"])
+            ep["head_red_same_context"] = bool(set(hs["red"]) & set(ep["contexts"])) if hs["settled"] else None
+    return episodes, skipped
+
+
 def revert_of(commits, f):
     """A commit in the 7 days after the merge whose message starts `Revert` and names the merge sha or PR."""
     merged = iso(f["merged_at"])
@@ -810,6 +879,18 @@ def bucket(size):
     return "unknown" if size is None else "<200" if size < 200 else "200-800" if size <= 800 else ">800"
 
 
+def change_failure_summary(merged):
+    """Merged PRs whose merge started a main-red episode: counts, the raw minutes to green (no median: n is small and the
+    distribution is long), the unresolved ones, and the PRs whose base checks were not read in full (`unknown`)."""
+    known = [r for r in merged if r.get("main_red") is not None]
+    eps = [e for r in known for e in r["main_red"]]
+    return {"merged": len(merged), "unknown": len(merged) - len(known),
+            "prs_that_started_red": sum(1 for r in known if r["main_red"]), "episodes": len(eps),
+            "minutes_to_green": sorted(e["minutes_to_green"] for e in eps if e["minutes_to_green"] is not None),
+            "unresolved": sum(1 for e in eps if e["minutes_to_green"] is None),
+            "head_red_same_context": sum(1 for e in eps if e["head_red_same_context"])}
+
+
 def path_summary(merged):
     """Clean and slow paths over merged PRs: counts, lead-time medians and p90, the slow share, and the minutes per merged
     PR each cause held the slow ones up. `unknown` PRs (no slow cause seen, compute not read in full) are in neither path."""
@@ -895,6 +976,7 @@ def summarize(rows):
     return {
         "ready_prs": n, "merged": len(merged),
         "paths": path_summary(merged),
+        "change_failure": change_failure_summary(merged),
         "attribution": attr,
         "north_star": {
             "autonomous": auto, "owner_action": ns["owner_action"], "unknown": unk, "not_merged_in_48h": ns["not_merged"],
@@ -1021,6 +1103,14 @@ def collect_repo(repo, cache_dir, cap, owner, lo, hi, now, ticks, tick_ctx, fetc
             req = required_contexts(rd, mrows[0]["base"], tick_ctx.get(repo))
         except (Truncated, ReadError):
             pass
+    episodes, ep_ok, ep_skipped = [], False, 0
+    if mrows and commits_ok:
+        try:
+            episodes, ep_skipped = detect_main_red(rd, base_commits, merged_list)
+            ep_ok = True
+        except (Truncated, ReadError):
+            pass
+    res["main_red"] = {"episodes": episodes, "complete": ep_ok, "skipped_unsettled_commits": ep_skipped}
     out = []
     for f, ok, why in facts:
         merged = f["merged_at"]
@@ -1037,7 +1127,7 @@ def collect_repo(repo, cache_dir, cap, owner, lo, hi, now, ticks, tick_ctx, fetc
             "enqueue_to_merge_min": enqueue_to_merge(f),
             "owner_actions": sum(1 for ev, ts in effective_owner_events(f)[0]
                                  if not (ev == "merged" and f.get("merge_unverified")) and f["first_ready"] and iso(f["first_ready"]) <= iso(ts) <= iso(f["first_ready"]) + HORIZON),
-            "repair_cycles": f["repair_cycles"], "compute": None, "correct": None, "path": None, "path_why": [], "cause_min": None,
+            "repair_cycles": f["repair_cycles"], "compute": None, "correct": None, "path": None, "path_why": [], "cause_min": None, "main_red": None,
         })
         if ok and merged:
             comp = load_compute(rd, f["number"], f)
@@ -1051,6 +1141,9 @@ def collect_repo(repo, cache_dir, cap, owner, lo, hi, now, ticks, tick_ctx, fetc
             row["compute"] = comp
             row["path"], row["path_why"] = path_of(dict(f, dirty=row["dirty"]), comp)
             row["cause_min"] = cause_minutes(f, comp)
+            # the episodes this PR's merge started (empty list: none), or None when the base's checks were not read in full
+            row["main_red"] = [{k: ep[k] for k in ("contexts", "minutes_to_green", "fixer_pr", "head_red_same_context")}
+                               for ep in episodes if ep["pr"] == f["number"]] if ep_ok else None
             corr = rd.load("correct", str(f["number"]))
             if corr is not None and corr.get("v") != CHECKS_VERSION:
                 corr = None
@@ -1078,7 +1171,7 @@ def day_closed(day, now):
     return now >= d + dt.timedelta(days=1) + HORIZON
 
 
-def check_controls(repo, rows, controls, refused):
+def check_controls(repo, rows, controls, refused, main_red=None):
     """Positive controls: a known revert, a known escaped defect, and owner-touched PRs must be found.
     A control whose PR is not among the report's rows is `not_in_window` (unchecked, not passed)."""
     by = {r["pr"]: r for r in rows}
@@ -1099,6 +1192,15 @@ def check_controls(repo, rows, controls, refused):
             continue
         out["escape"]["expected"] += 1
         out["escape"]["found"] += r["correct"].get("escaped_by") == naming
+    # Known incidents: a PR whose merge turned a main context red and the PR that turned it green (the change-failure detector).
+    out["incident"] = {"expected": 0, "found": 0, "not_in_window": 0}
+    eps = (main_red or {}).get("episodes", [])
+    for escaped, fixer in c.get("incident", []):
+        if escaped not in by or not (main_red or {}).get("complete"):
+            out["incident"]["not_in_window"] += 1
+            continue
+        out["incident"]["expected"] += 1
+        out["incident"]["found"] += any(e["pr"] == escaped and e["fixer_pr"] == fixer for e in eps)
     # `refused` PRs were stopped by direct_merge_refused (a ruleset config gap), which says nothing about
     # whether the owner touched them, so they are only counted for context and never fail the control.
     for n in sorted(refused or ()):
@@ -1128,7 +1230,10 @@ def check_controls(repo, rows, controls, refused):
     if o["owner_pinned"]["found"] < o["owner_pinned"]["expected"]:
         failed.append("owner-touched control read as autonomous")
         disabled.append("north_star")
-    checked = o["revert"]["expected"] + o["escape"]["expected"] + o["owner_pinned"]["expected"]
+    if o["incident"]["found"] < o["incident"]["expected"]:
+        failed.append("known main-red incident not found")
+        disabled.append("change_failure")
+    checked = o["revert"]["expected"] + o["escape"]["expected"] + o["owner_pinned"]["expected"] + o["incident"]["expected"]
     out["status"] = "failed" if failed else "ok" if checked else "unchecked"
     out["failed"] = failed
     out["disabled"] = disabled  # parallel to `failed`; only these metrics are withheld; the rest of the report stands
@@ -1161,11 +1266,11 @@ def build(repos, cache_dir, cap, owner, start, now, ticks, tick_ctx, baseline=No
         days = {}
         for x in elig:
             days.setdefault(x["day"], []).append(x)
-        ctl = check_controls(repo, r["rows"], controls, (refused or {}).get(repo))
+        ctl = check_controls(repo, r["rows"], controls, (refused or {}).get(repo), r["main_red"])
         out["repos"][repo] = {
             "per_day": {d: {"closed": day_closed(d, now), **summarize(v)} for d, v in sorted(days.items())},
             "prs": r["rows"], "excluded": dict(excluded), "controls": ctl,
-            "unread_prs": r["unread"], "listing_complete": r["listing_complete"], "total_prs": r["total_prs"],
+            "unread_prs": r["unread"], "listing_complete": r["listing_complete"], "total_prs": r["total_prs"], "main_red": r["main_red"],
             "reads": r["reads"], "truncated": r["truncated"], "read_errors": r["errors"],
         }
         if r["unread"] or not r["listing_complete"]:
@@ -1367,6 +1472,22 @@ def markdown(e2e):
             cm = p["cause_min_per_merge"]
             L.append(f"| {repo} | {p['merged']} | {p['slow_share_pct']}% | {p['clean']['median_min']} ({p['clean']['n']}) | {p['slow']['median_min']} / {p['slow']['p90_min']} ({p['slow']['n']}) | "
                      f"{p['top_cause']} | {cm['hold']} / {cm['red']} / {cm['queue']} / {cm['runner']} | {p['unknown']} |")
+        L.append("")
+    if e2e.get("window"):
+        L += ["### Main-red episodes caused by merges (change failure, window)", "",
+              "An episode starts at the first base push where a check context is red that was not red before, is attributed to the PR whose merge commit that is, and ends at the push "
+              "where its last context turns green (that push's PR is the fixer). Counts and raw minutes to green are printed, with no rate and no median. "
+              "`head red` counts episodes whose PR's own final head was red in the same context when it merged. Recall is known incidents found over known incidents expected. "
+              "Pushes with unsettled checks are skipped.", "",
+              "| repo | merged | PRs that started red | episodes | minutes to green (each) | unresolved | head red | recall k/n | unknown attribution |", "|---|---|---|---|---|---|---|---|---|"]
+        for repo, s_ in sorted(e2e["window"]["per_repo"].items()):
+            cf, ctl = s_["change_failure"], e2e["repos"][repo]["controls"]
+            inc = ctl.get("incident", {"found": 0, "expected": 0})
+            off = "change_failure" in ctl["disabled"]
+            W = "withheld"
+            L.append(f"| {repo} | {cf['merged']} | {W if off else cf['prs_that_started_red']} | {W if off else cf['episodes']} | "
+                     f"{W if off else ', '.join(str(x) for x in cf['minutes_to_green']) or '-'} | {W if off else cf['unresolved']} | {W if off else cf['head_red_same_context']} | "
+                     f"{inc['found']}/{inc['expected']} | {cf['unknown']} |")
         L.append("")
     nf = (e2e.get("baseline") or {}).get("noise_floor")
     if nf:
