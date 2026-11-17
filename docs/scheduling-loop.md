@@ -187,10 +187,18 @@ The event is only a trigger; nothing in it is trusted. The admission:
 5. Leaves to the tick a base whose merge groups read anything but clear, a
    paused queue entry, and a pending run cancellation.
 6. A report (no `--apply`, or `admit_ready = "report"`) stops here after
-   reading the live exact-head approval gate: it says `would_admit` only for
-   an approved head, `waiting_head_approval` otherwise.
+   reading the live exact-head approval gate as a report, so a carried
+   approval writes no carry log line: it says `would_admit` only for an
+   approved head, `waiting_head_approval` otherwise.
 7. Takes the steward's ledger lock without waiting. If a tick or an
    `admission-clean` gate holds it, it does nothing: that pass sees the head.
+   Under the lock it reads the base's merge groups again (anything but clear
+   is the tick's), and while any stored flake re-enqueue in the repository,
+   whatever its age, is one the tick's breaker sweep has not judged yet, it leaves
+   every head to the tick (`flake_requeue_unswept`): only the tick sweeps,
+   and an unswept receipt can hide a tripped signature another pull request
+   shares. The sweep marks a receipt judged once its pull request is closed
+   or has moved to another head.
 8. Admits through the tick's own path: the live exact-head approval gate, the
    carried-commit, code-owner and defect-fix guards, the final revalidation,
    and the enqueue (or exact-head merge) pinned to the head with
