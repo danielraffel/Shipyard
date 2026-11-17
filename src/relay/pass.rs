@@ -366,6 +366,17 @@ fn run_repo(
             tracked.sent.clear();
             tracked.pending.clear();
             tracked.last_sent_at = None;
+            // A pull request that just gained an owner has no history for it:
+            // seed what needs an author now, so the new owner is told.
+            if !unowned {
+                tracked.pending = super::actionable_now(&digest);
+                for event in &mut tracked.pending {
+                    if let Some(seq) = event.seq_mut() {
+                        tracked.event_seq += 1;
+                        *seq = tracked.event_seq;
+                    }
+                }
+            }
         }
         // With no owner the lead hears only what needs an author, judged by
         // the state now, every pass: a history to compare with would miss a
@@ -413,7 +424,12 @@ fn run_repo(
         } else if digest.checks == super::Checks::Failure {
             tracked.green_head = None;
         }
-        for event in events.iter_mut().filter(|_| !unowned) {
+        // An unowned event is a state, deduplicated by its stable key; only
+        // an ejection is an edge that can recur, so it keeps a sequence.
+        for event in events
+            .iter_mut()
+            .filter(|e| !unowned || matches!(e, RelayEvent::Ejected { .. }))
+        {
             if let Some(seq) = event.seq_mut() {
                 tracked.event_seq += 1;
                 *seq = tracked.event_seq;

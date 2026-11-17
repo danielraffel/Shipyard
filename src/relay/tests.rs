@@ -1617,6 +1617,24 @@ fn a_pull_request_that_loses_its_owner_tells_the_lead_what_the_owner_was_told() 
 }
 
 #[test]
+fn a_newly_registered_owner_is_told_the_hold_the_lead_already_heard() {
+    let mut pr = Pr::open(543);
+    pr.comments.push(verdict("HOLD", HEAD_A));
+    let mut h = unowned_harness(&pr, true);
+    h.cmux = FakeCmux::with(&[("m5", "/tmp/cmux-nightly.sock", "S"), ("m1", "", "LEAD")]);
+    h.pass(0, Mode::Send);
+    assert_eq!(h.deliveries()[0]["tier"], "lead");
+    let marker = owner_registry::render_marker(&owner(543, "m5", "S"));
+    h.gh.open_bodies
+        .borrow_mut()
+        .insert(543, format!("body\n{marker}"));
+    h.pass(30, Mode::Send);
+    let deliveries = h.deliveries();
+    assert_eq!(deliveries.len(), 2, "{deliveries:?}");
+    assert_eq!(deliveries[1]["tier"], "owner");
+}
+
+#[test]
 fn without_a_lead_an_unowned_pull_request_is_not_tracked() {
     let mut pr = Pr::open(543);
     pr.comments.push(verdict("HOLD", HEAD_A));

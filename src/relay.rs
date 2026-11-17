@@ -431,9 +431,10 @@ pub(crate) fn needs_an_owner(event: &RelayEvent, digest: &PrDigest) -> bool {
     match event {
         RelayEvent::Verdict { verdict, head } => verdict == "HOLD" && at_head(head),
         RelayEvent::RequiredCheck { result, head, .. } => result == "red" && at_head(head),
-        RelayEvent::DirtyAfterBaseMove { head, .. }
-        | RelayEvent::Ejected { head, .. }
-        | RelayEvent::Overdue { head, .. } => at_head(head),
+        RelayEvent::Ejected { head, .. } => at_head(head) && !digest.in_queue,
+        RelayEvent::DirtyAfterBaseMove { head, .. } | RelayEvent::Overdue { head, .. } => {
+            at_head(head)
+        }
         _ => false,
     }
 }
