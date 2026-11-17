@@ -4251,6 +4251,19 @@ shipyard landability --repo OWNER/REPO --base main   # the on-demand surface
 
 ### Before bulk backlog work: `shipyard landing`
 
+A stacked PR retargeted to `main` after its parent merges re-fires a gate only
+if the producing workflow subscribes to `pull_request` type `edited`
+(landability warns "does not declare `edited`"). `ci.yml` does, and its
+`resolve-runners` job runs only when `github.event.changes.base.ref.from` is
+set, so title and body edits start nothing; the concurrency group gets a
+`-edit-noop` suffix on those edits so a skipped run cannot cancel a running
+one. The skipped `test` matrix job reports under its unexpanded template name,
+not `Test macOS ARM64`, so it cannot stand in for the required check.
+`review-verdict.yml` also subscribes to `edited`, unfiltered, because the job
+is itself the required check and a skipped run under that name would count as
+passing. Landability reads `origin/<base>` first, so its warning clears only
+once this is merged.
+
 `landability` says whether a gate can be scheduled. It does not say how work
 **merges** here, and that is the question to settle before touching a backlog.
 
