@@ -489,11 +489,13 @@ fn someone_elses_move(kind: &str, facts: &Facts<'_>) -> Option<NextAction> {
 fn reviewers_move(kind: &str, facts: &Facts<'_>) -> Option<NextAction> {
     let Facts {
         arg,
+        detail,
         detail_suffix,
         base,
         required,
         ..
     } = facts;
+    let detail = detail.unwrap_or("see the reviewer's comment");
     Some(match kind {
         "no_verdict" => NextAction::new(
             Actor::Reviewer,
@@ -509,6 +511,15 @@ fn reviewers_move(kind: &str, facts: &Facts<'_>) -> Option<NextAction> {
                 "Awaiting reviewers; nothing for the author to do. The review status(es) {arg} \
                  only wait on approvals or a verdict for this head{detail_suffix}. Do not push, \
                  do not merge {base}; this is review throughput, not a base fault."
+            ),
+        ),
+        "review_quarantined" => NextAction::new(
+            Actor::Author,
+            format!(
+                "The reviewer quarantined this head and will not review it as it stands: \
+                 {detail}. Fix what that names, merge {base} if needed (no rebase), push once \
+                 and comment `repaired: <what> at <sha>`. If the diagnosis is wrong, push a new \
+                 head and comment `dispute: <reason>`. Waiting does not help."
             ),
         ),
         "approval_excluded" => NextAction::new(

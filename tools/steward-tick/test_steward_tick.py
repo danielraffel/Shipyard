@@ -1,5 +1,7 @@
+import json
 import os
 import subprocess
+import sys
 import tarfile
 import tempfile
 import time
@@ -287,6 +289,11 @@ class StewardTickArchiveTests(unittest.TestCase):
 
 FAKE_LAUNCHER = """#!/bin/bash
 # Stand-in for ShipyardLauncher.app's executable.
+# Shipyard arguments (a detached release rehearsal): exec keeps this pid, so
+# the recorder reads this process's own responsibility.
+if [ "$1" = release-canary ]; then
+  exec /usr/bin/python3 "$HOME/canary-recorder.py" "$@"
+fi
 echo "$*" >> "$HOME/launcher-calls"
 if [ "$1" = --launcher-active ]; then
   [ -n "${FAKE_ACTIVE_HANG:-}" ] && sleep 30
@@ -497,3 +504,85 @@ class StewardTickLauncherTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+CANARY_RECORDER = """
+import ctypes, json, os, sys
+libc = ctypes.CDLL(None)
+responsible = libc.responsibility_get_pid_responsible_for_pid
+responsible.restype, responsible.argtypes = ctypes.c_int, [ctypes.c_int]
+with open(os.path.join(os.environ["HOME"], "canary-launcher.json"), "w") as out:
+    json.dump({"own_responsible": responsible(os.getpid()) == os.getpid(),
+               "cwd": os.getcwd(), "argv": sys.argv[1:]}, out)
+print("release-canary status=pass tag=v1.0.1 issue=closed #5")
+"""
+
+
+@unittest.skipUnless(sys.platform == "darwin", "macOS responsibility")
+class StewardTickReleaseCanaryLauncherTests(unittest.TestCase):
+    """A detached rehearsal keeps the launcher's privacy identity after the tick."""
+
+    run_tick = StewardTickArchiveTests.run_tick
+    tearDown = StewardTickArchiveTests.tearDown
+    activate = StewardTickLauncherTests.activate
+    run_installed = StewardTickLauncherTests.run_installed
+    summary = StewardTickLauncherTests.summary
+
+    def setUp(self):
+        StewardTickLauncherTests.setUp(self)
+        (self.home / "canary-recorder.py").write_text(CANARY_RECORDER)
+        shipyard = self.home / ".local" / "bin" / "shipyard"
+        shipyard.write_text(
+            "#!/bin/bash\n"
+            "if [ \"$1\" = --version ]; then echo 'shipyard 1.0'; exit 0; fi\n"
+            "if [ \"$1\" = release-canary ]; then\n"
+            "  [ \"$3\" = --help ] && exit 0\n"
+            "  echo \"$*\" > \"$HOME/canary-direct\"\n"
+            "  echo 'release-canary status=pass tag=v1.0.1'; exit 0\n"
+            "fi\n"
+            "printf '%s\\n' '{\"repos\":[]}'\n"
+        )
+        self.record_file = self.home / "canary-launcher.json"
+
+    def wait_for(self, text):
+        for _ in range(150):
+            if text in self.summary():
+                return
+            time.sleep(0.1)
+        self.fail(f"{text!r} never reached summary.log:\n{self.summary()}")
+
+    def test_an_activated_tick_runs_the_rehearsal_through_the_launcher_disclaimed(self):
+        self.activate()
+        result = self.run_installed()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.wait_for("acme/repo release-canary status=pass")
+        record = json.loads(self.record_file.read_text())
+        self.assertTrue(record["own_responsible"], record)
+        self.assertEqual(record["argv"], ["release-canary", "run", "--repo", "acme/repo", "--daily", "--apply"])
+        self.assertEqual(os.path.realpath(record["cwd"]),
+                         os.path.realpath(self.home / ".local" / "share" / "shipyard-steward" / "repo"))
+        self.assertIn("release-canary status=pass tag=v1.0.1 issue=closed #5 launcher=app", self.summary())
+        self.assertFalse((self.home / "canary-direct").exists())
+
+    def test_a_tick_not_under_the_launcher_runs_the_rehearsal_directly(self):
+        result = self.run_installed()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.wait_for("acme/repo release-canary status=pass")
+        self.assertIn("release-canary status=pass tag=v1.0.1 launcher=direct", self.summary())
+        self.assertFalse(self.record_file.exists())
+
+    def test_without_the_disclaim_it_runs_directly_and_says_so(self):
+        # A python3 whose ctypes cannot set the disclaim: the spawner names it
+        # and runs nothing, so the rehearsal runs directly, once.
+        self.activate()
+        installed = self.installed.read_text()
+        self.assertEqual(installed.count("responsibility_spawnattrs_setdisclaim(ctypes.byref(attr), 1)"), 1)
+        self.installed.write_text(installed.replace(
+            "responsibility_spawnattrs_setdisclaim(ctypes.byref(attr), 1)",
+            "no_such_symbol_for_test(ctypes.byref(attr), 1)"))
+        result = self.run_installed()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.wait_for("acme/repo release-canary status=pass")
+        self.assertIn("launcher-fallback reason=disclaim_unavailable FINDING", self.summary())
+        self.assertIn("release-canary status=pass tag=v1.0.1 launcher=direct", self.summary())
+        self.assertFalse(self.record_file.exists())
