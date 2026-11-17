@@ -399,9 +399,7 @@ fn run_repo(
                 seeded = super::actionable_now(&digest);
             }
             tracked.pending.retain(|event| {
-                !unowned
-                    && matches!(event, RelayEvent::Ejected { .. })
-                    && super::needs_an_owner(event, &digest)
+                matches!(event, RelayEvent::Ejected { .. }) && super::needs_an_owner(event, &digest)
             });
         }
         // With no owner the lead hears only what needs an author, judged by
