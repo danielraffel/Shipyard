@@ -612,8 +612,8 @@ fn the_process_runner_drives_a_fake_cmux_executable() {
 struct FakeGitHub {
     prs: RefCell<BTreeMap<u64, Pr>>,
     open_bodies: RefCell<BTreeMap<u64, String>>,
-    /// Each pull request's own body, as its individual fetch returns it.
-    bodies: RefCell<BTreeMap<u64, String>>,
+    /// Pull requests the open list reports as drafts.
+    drafts: RefCell<std::collections::BTreeSet<u64>>,
     comments: RefCell<Vec<String>>,
     queries: RefCell<u32>,
     fail_comment: bool,
@@ -624,7 +624,7 @@ impl FakeGitHub {
         Self {
             prs: RefCell::new(prs.iter().map(|p| (p.number, p.clone())).collect()),
             open_bodies: RefCell::new(BTreeMap::new()),
-            bodies: RefCell::new(BTreeMap::new()),
+            drafts: RefCell::new(std::collections::BTreeSet::new()),
             comments: RefCell::new(Vec::new()),
             queries: RefCell::new(0),
             fail_comment: false,
@@ -658,12 +658,7 @@ impl FakeGitHub {
         let alias = regex::Regex::new(r"pr(\d+): pullRequest").unwrap();
         for found in alias.captures_iter(query) {
             let number: u64 = found[1].parse().unwrap();
-            let mut node = self.prs.borrow().get(&number).map_or(Value::Null, Pr::node);
-            if let (Some(object), Some(body)) =
-                (node.as_object_mut(), self.bodies.borrow().get(&number))
-            {
-                object.insert("body".to_owned(), Value::from(body.clone()));
-            }
+            let node = self.prs.borrow().get(&number).map_or(Value::Null, Pr::node);
             repository.insert(format!("pr{number}"), node);
         }
         if query.contains("open: pullRequests") {
@@ -671,7 +666,9 @@ impl FakeGitHub {
                 .open_bodies
                 .borrow()
                 .iter()
-                .map(|(n, body)| json!({"number": n, "body": body}))
+                .map(|(n, body)| {
+                    json!({"number": n, "body": body, "isDraft": self.drafts.borrow().contains(n)})
+                })
                 .collect();
             repository.insert("open".to_owned(), json!({"nodes": nodes}));
         }
@@ -1599,91 +1596,49 @@ fn an_unowned_pull_request_ejected_from_the_queue_reaches_the_lead() {
 }
 
 #[test]
-fn a_pull_request_that_loses_its_owner_tells_the_lead_what_the_owner_was_told() {
-    let pr = Pr::open(543);
+fn an_unowned_fact_that_clears_inside_the_rate_limit_window_is_not_sent() {
+    let mut pr = Pr::open(543);
+    pr.comments.push(verdict("HOLD", HEAD_A));
     let mut h = unowned_harness(&pr, true);
-    h.cmux = FakeCmux::with(&[("m5", "/tmp/cmux-nightly.sock", "S"), ("m1", "", "LEAD")]);
-    let marker = owner_registry::render_marker(&owner(543, "m5", "S"));
-    h.gh.open_bodies
-        .borrow_mut()
-        .insert(543, format!("body\n{marker}"));
     h.pass(0, Mode::Send);
-    let mut held = pr.clone();
-    held.comments.push(verdict("HOLD", HEAD_A));
-    h.gh.set(held);
-    h.pass(1, Mode::Send);
     assert_eq!(h.deliveries().len(), 1);
-    assert_eq!(h.deliveries()[0]["tier"], "owner");
-    // The marker is removed: the HOLD is still there, and the lead hears it.
-    h.gh.open_bodies
-        .borrow_mut()
-        .insert(543, "no marker".to_owned());
-    h.pass(30, Mode::Send);
-    let deliveries = h.deliveries();
-    assert_eq!(deliveries.len(), 2, "{deliveries:?}");
-    assert_eq!(deliveries[1]["tier"], "lead");
-}
-
-#[test]
-fn a_newly_registered_owner_is_told_the_hold_the_lead_already_heard() {
-    let mut pr = Pr::open(543);
-    pr.comments.push(verdict("HOLD", HEAD_A));
-    let mut h = unowned_harness(&pr, true);
-    h.cmux = FakeCmux::with(&[("m5", "/tmp/cmux-nightly.sock", "S"), ("m1", "", "LEAD")]);
-    h.pass(0, Mode::Send);
-    assert_eq!(h.deliveries()[0]["tier"], "lead");
-    let marker = owner_registry::render_marker(&owner(543, "m5", "S"));
-    h.gh.open_bodies
-        .borrow_mut()
-        .insert(543, format!("body\n{marker}"));
-    h.pass(30, Mode::Send);
-    let deliveries = h.deliveries();
-    assert_eq!(deliveries.len(), 2, "{deliveries:?}");
-    assert_eq!(deliveries[1]["tier"], "owner");
-}
-
-#[test]
-fn an_owned_pull_request_outside_the_discovery_page_keeps_its_owner() {
-    // The discovery page lists the newest 100 open pull requests; this one is
-    // not on it, but its own fetch carries the marker.
-    let pr = Pr::open(543);
-    let mut h = unowned_harness(&pr, true);
-    h.cmux = FakeCmux::with(&[("m5", "/tmp/cmux-nightly.sock", "S"), ("m1", "", "LEAD")]);
-    let marker = owner_registry::render_marker(&owner(543, "m5", "S"));
-    h.gh.open_bodies
-        .borrow_mut()
-        .insert(543, format!("body\n{marker}"));
-    h.pass(0, Mode::Send);
-    h.gh.open_bodies.borrow_mut().clear();
-    h.gh.bodies
-        .borrow_mut()
-        .insert(543, format!("body\n{marker}"));
-    let mut held = pr.clone();
-    held.comments.push(verdict("HOLD", HEAD_A));
-    h.gh.set(held);
+    // Red inside the window is queued; it clears before the window ends.
+    let mut red_pr = pr.clone();
+    red_pr.checks = red();
+    h.gh.set(red_pr);
     h.pass(1, Mode::Send);
-    let deliveries = h.deliveries();
-    assert_eq!(deliveries.len(), 1, "{deliveries:?}");
-    assert_eq!(deliveries[0]["tier"], "owner");
+    h.gh.set(pr.clone());
+    h.pass(2, Mode::Send);
+    h.pass(15, Mode::Send);
+    assert_eq!(h.deliveries().len(), 1, "{:?}", h.deliveries());
 }
 
 #[test]
-fn a_tracked_pull_request_registered_outside_the_discovery_page_gets_its_owner() {
+fn a_second_ejection_of_an_unowned_pull_request_is_a_new_fact() {
+    let mut queued = Pr::open(543);
+    queued.in_queue = true;
+    let mut h = unowned_harness(&queued, true);
+    h.pass(0, Mode::Send);
+    let mut out = queued.clone();
+    out.in_queue = false;
+    h.gh.set(out.clone());
+    h.pass(1, Mode::Send);
+    h.gh.set(queued.clone());
+    h.pass(15, Mode::Send);
+    h.gh.set(out);
+    h.pass(30, Mode::Send);
+    assert_eq!(h.deliveries().len(), 2, "{:?}", h.deliveries());
+}
+
+#[test]
+fn an_unowned_draft_pull_request_is_not_tracked() {
     let mut pr = Pr::open(543);
     pr.comments.push(verdict("HOLD", HEAD_A));
     let mut h = unowned_harness(&pr, true);
-    h.cmux = FakeCmux::with(&[("m5", "/tmp/cmux-nightly.sock", "S"), ("m1", "", "LEAD")]);
+    h.gh.drafts.borrow_mut().insert(543);
     h.pass(0, Mode::Send);
-    assert_eq!(h.deliveries()[0]["tier"], "lead");
-    let marker = owner_registry::render_marker(&owner(543, "m5", "S"));
-    h.gh.open_bodies.borrow_mut().clear();
-    h.gh.bodies
-        .borrow_mut()
-        .insert(543, format!("body\n{marker}"));
-    h.pass(30, Mode::Send);
-    let deliveries = h.deliveries();
-    assert_eq!(deliveries.len(), 2, "{deliveries:?}");
-    assert_eq!(deliveries[1]["tier"], "owner");
+    assert!(h.state.prs.is_empty());
+    assert!(h.deliveries().is_empty());
 }
 
 #[test]

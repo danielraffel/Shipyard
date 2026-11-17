@@ -202,22 +202,6 @@ impl RelayEvent {
         }
     }
 
-    /// The head this event names, when it names one.
-    pub(crate) fn head(&self) -> Option<&str> {
-        match self {
-            Self::Merged { head }
-            | Self::Closed { head }
-            | Self::Enqueued { head, .. }
-            | Self::Ejected { head, .. }
-            | Self::Verdict { head, .. }
-            | Self::RequiredCheck { head, .. }
-            | Self::DirtyAfterBaseMove { head, .. }
-            | Self::ClaimTaken { head, .. }
-            | Self::StackedBaseMerged { head, .. }
-            | Self::Overdue { head, .. } => Some(head),
-        }
-    }
-
     /// Merged or closed: delivered without waiting out the rate limit.
     pub(crate) fn terminal(&self) -> bool {
         matches!(self, Self::Merged { .. } | Self::Closed { .. })
@@ -447,7 +431,7 @@ pub(crate) fn needs_an_owner(event: &RelayEvent, digest: &PrDigest) -> bool {
     match event {
         RelayEvent::Verdict { verdict, head } => verdict == "HOLD" && at_head(head),
         RelayEvent::RequiredCheck { result, head, .. } => result == "red" && at_head(head),
-        RelayEvent::Ejected { head, .. } => at_head(head) && !digest.in_queue,
+        RelayEvent::Ejected { head, .. } => at_head(head),
         RelayEvent::DirtyAfterBaseMove { head, .. } | RelayEvent::Overdue { head, .. } => {
             at_head(head)
         }
@@ -745,7 +729,7 @@ pub(crate) fn render_message(
 /// The GraphQL fields read for one owned pull request, as alias `pr<N>`.
 pub(crate) fn pr_fields(number: u64) -> String {
     format!(
-        "pr{number}: pullRequest(number:{number}){{id number body state merged isDraft isInMergeQueue \
+        "pr{number}: pullRequest(number:{number}){{id number state merged isDraft isInMergeQueue \
          mergeStateStatus headRefOid baseRefName baseRefOid \
          baseRef{{associatedPullRequests(states:[MERGED],last:1){{nodes{{number}}}}}} \
          comments(last:30){{nodes{{body createdAt authorAssociation author{{__typename login}}}}}} \

@@ -64,11 +64,6 @@ pub(crate) struct Tracked {
     /// Consecutive passes whose batch nothing could take.
     #[serde(default)]
     pub(crate) failed_deliveries: u32,
-    /// Whether the last pass judged this pull request as unowned (told to the
-    /// lead). A change of scope is a new audience: what the other audience
-    /// was told says nothing about this one.
-    #[serde(default)]
-    pub(crate) unowned_scope: bool,
     /// The head whose required checks were last seen green.
     #[serde(default)]
     pub(crate) green_head: Option<String>,
@@ -245,19 +240,6 @@ fn run_repo(
         .map(|t| t.pr)
         .collect();
     let mut read = super::fetch(input.gh, repo, &live, true)?;
-    // A tracked pull request outside the discovery page (the newest 100) is
-    // read by number: its own body carries any marker.
-    let own_markers: Vec<(u64, String)> = read
-        .prs
-        .iter()
-        .filter_map(|(number, node)| {
-            let body = node.as_ref()?.get("body")?.as_str()?;
-            (!read.markers.contains_key(number)
-                && owner_registry::parse_marker(repo, *number, body).is_some())
-            .then(|| (*number, body.to_owned()))
-        })
-        .collect();
-    read.markers.extend(own_markers);
     // A marker-sourced owner whose marker is gone from the body is forgotten.
     for tracked in state.prs.values_mut().filter(|t| t.repo == repo) {
         if tracked
@@ -265,18 +247,6 @@ fn run_repo(
             .as_ref()
             .is_some_and(|o| o.source == owner_registry::Source::BodyMarker)
             && !read.markers.contains_key(&tracked.pr)
-            // A pull request outside the discovery page (the newest 100) is
-            // judged by its own body, so a marker that is still there keeps
-            // its owner.
-            && !read
-                .prs
-                .get(&tracked.pr)
-                .and_then(Option::as_ref)
-                .and_then(|node| node.get("body"))
-                .and_then(Value::as_str)
-                .is_some_and(|body| {
-                    owner_registry::parse_marker(repo, tracked.pr, body).is_some()
-                })
         {
             tracked.owner = None;
         }
@@ -386,22 +356,6 @@ fn run_repo(
             log.push(record);
         }
         let unowned = tracked.owner.is_none();
-        let mut seeded: Vec<RelayEvent> = Vec::new();
-        if tracked.unowned_scope != unowned {
-            tracked.unowned_scope = unowned;
-            tracked.sent.clear();
-            tracked.last_sent_at = None;
-            // A pull request that just gained an owner has no history for it:
-            // what needs an author now is told to the new owner (below, and
-            // only if this pass derives no event for it), and an ejection
-            // still waiting moves to the new audience with it.
-            if !unowned {
-                seeded = super::actionable_now(&digest);
-            }
-            tracked.pending.retain(|event| {
-                matches!(event, RelayEvent::Ejected { .. }) && super::needs_an_owner(event, &digest)
-            });
-        }
         // With no owner the lead hears only what needs an author, judged by
         // the state now, every pass: a history to compare with would miss a
         // HOLD that landed before the first look or a conflict that came with
@@ -409,11 +363,16 @@ fn run_repo(
         // already delivered is not delivered again (its key is stable, since
         // an unowned event carries no sequence number).
         if unowned {
+            // A queued fact that no longer holds is dropped (overdue rows are
+            // re-read from the steward every pass).
+            let current: Vec<String> = super::actionable_now(&digest)
+                .iter()
+                .map(|event| event.key(repo, *number))
+                .collect();
             tracked.pending.retain(|event| {
-                // Overdue rows are re-read from the steward each pass, so a
-                // queued one is stale by definition; an ejection is an edge
-                // that is kept while it still describes the pull request.
-                matches!(event, RelayEvent::Ejected { .. }) && super::needs_an_owner(event, &digest)
+                super::needs_an_owner(event, &digest)
+                    && (matches!(event, RelayEvent::Ejected { .. })
+                        || current.contains(&event.key(repo, *number)))
             });
         }
         let mut events: Vec<RelayEvent> = if unowned {
@@ -430,20 +389,8 @@ fn run_repo(
                 .filter(|event| input.config.events.contains(event.name()))
                 .collect()
         } else {
-            let derived_now: Vec<RelayEvent> = derived;
-            // A seeded event is dropped when this pass derived the same kind
-            // for the same head, so the owner never hears one failure twice.
-            let seeded_new: Vec<RelayEvent> = seeded
+            derived
                 .into_iter()
-                .filter(|s| {
-                    !derived_now
-                        .iter()
-                        .any(|d| d.name() == s.name() && d.head() == s.head())
-                })
-                .collect();
-            derived_now
-                .into_iter()
-                .chain(seeded_new)
                 .chain(overdue_now)
                 .filter(|event| input.config.events.contains(event.name()))
                 // Green, pending (a re-run), green again at one head is one fact.
