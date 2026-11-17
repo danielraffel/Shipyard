@@ -738,7 +738,7 @@ def commit_state(rd, sha, age=None):
     """The check state of one commit: {"red": contexts failing, "green": contexts succeeding, "settled": every page read and
     every run finished}. A context's latest run (by start) decides it. A run that has not finished `STUCK_AFTER` after the
     push (`age`) is stuck (GitHub keeps phantom queued runs for days) and says nothing: it is neither red nor green and does
-    not hold the commit open. Cached once settled.""" 
+    not hold the commit open. Cached only when every run finished: a stuck run can still finish later.""" 
     cached = rd.load("cstate", sha)
     if cached is not None and cached.get("v") == CHECKS_VERSION:
         return cached
@@ -752,11 +752,15 @@ def commit_state(rd, sha, age=None):
     st = {"v": CHECKS_VERSION, "settled": bool(complete and latest and (stuck or all(c.get("status") == "completed" for c in latest.values()))),
           "red": sorted(k for k, c in latest.items() if c.get("status") == "completed" and c.get("conclusion") in BAD_CONCLUSIONS),
           "green": sorted(k for k, c in latest.items() if c.get("status") == "completed" and c.get("conclusion") == "success")}
-    if st["settled"]:
+    if st["settled"] and all(c.get("status") == "completed" for c in latest.values()):
         rd.save("cstate", sha, st)
     return st
 
 
+# `since` filters the base listing by commit date, and a merge queue pushes merge commits written while the group ran
+# (up to its check timeout, 6 h on Vellum), so the listing starts a day early: that also gives the first PR in the
+# window a settled push before it to compare against.
+BASE_LOOKBACK = dt.timedelta(days=1)
 NOISY_RED_FRACTION = 0.2  # a context red on this share of pushes or more is a gate that flaps, not a check a merge breaks
 NOISY_MIN_PUSHES = 20  # ... judged only over at least this many pushes, so a short window cannot call a real break noise
 
@@ -782,21 +786,23 @@ def main_red_episodes(chron, states, pr_by_sha):
     when unread); `pr_by_sha`: merge commit sha -> PR number. An episode starts at the first commit where a context is
     red that was not red before, is attributed to the PR whose merge commit that is (None for a direct push or when the
     first usable commit is already red: it began before the window), and ends at the commit where its last context
-    turns green; that commit's PR is the fixer. A commit with unsettled checks says nothing and is skipped. Returns
-    (episodes, skipped)."""
-    open_ctx, episodes, skipped, first = {}, [], 0, True
+    turns green; that commit's PR is the fixer. A commit with unsettled checks says nothing and is skipped, and the
+    next settled commit after it has no baseline: an episode that starts there has no PR (`after_gap`), since the
+    skipped push may have turned the context red. Returns (episodes, skipped)."""
+    open_ctx, episodes, skipped, first, prev_settled = {}, [], 0, True, False
     untracked = untracked_contexts(chron, states)
     skip = set(untracked["one_off"]) | set(untracked["noisy"])
     for sha, ts in chron:
         st = states.get(sha)
         if not st or not st.get("settled"):
             skipped += 1
+            prev_settled = False
             continue
         red, green = set(st["red"]) - skip, set(st["green"]) - skip
         new = sorted(c for c in red if c not in open_ctx)
         if new:
-            ep = {"start_sha": sha, "start": ts, "pr": None if first else pr_by_sha.get(sha), "began_before_window": first,
-                  "contexts": new, "open": set(new), "end": None, "fixer_pr": None, "minutes_to_green": None}
+            ep = {"start_sha": sha, "start": ts, "pr": pr_by_sha.get(sha) if prev_settled else None, "began_before_window": first,
+                  "after_gap": not first and not prev_settled, "contexts": new, "open": set(new), "end": None, "fixer_pr": None, "minutes_to_green": None}
             episodes.append(ep)
             for c in new:
                 open_ctx[c] = ep
@@ -806,10 +812,24 @@ def main_red_episodes(chron, states, pr_by_sha):
             if not ep["open"]:
                 ep["end"], ep["fixer_pr"], ep["fixer_sha"] = ts, pr_by_sha.get(sha), sha
                 ep["minutes_to_green"] = round((iso(ts) - iso(ep["start"])).total_seconds() / 60.0, 1)
-        first = False
+        first, prev_settled = False, True
     for ep in episodes:
         ep["open"] = sorted(ep["open"])
     return episodes, skipped
+
+
+def attributable_pushes(chron, states):
+    """The pushes whose effect on the base is known: settled, with a settled push right before them. A PR whose merge
+    commit is not one of these (absent from the listing, unsettled, first in the window, or after a skipped push) has
+    an unknown main-red attribution, never a known zero."""
+    out, prev = set(), False
+    for sha, _ in chron:
+        st = states.get(sha)
+        ok = bool(st and st.get("settled"))
+        if ok and prev:
+            out.add(sha)
+        prev = ok
+    return out
 
 
 def commit_date_str(c):
@@ -857,7 +877,7 @@ def detect_main_red(rd, base_commits, merged_list, now=None):
         if p and ep["pr"]:
             hs = commit_state(rd, p["head"]["sha"])
             ep["head_red_same_context"] = bool(set(hs["red"]) & set(ep["contexts"])) if hs["settled"] else None
-    return episodes, skipped, untracked_contexts(chron, states)
+    return episodes, skipped, untracked_contexts(chron, states), attributable_pushes(chron, states)
 
 
 def revert_of(commits, f):
@@ -1186,7 +1206,7 @@ def collect_repo(repo, cache_dir, cap, owner, lo, hi, now, ticks, tick_ctx, fetc
     if mrows:
         try:
             base_commits, commits_ok = rd.pages(
-                f"commits?sha={mrows[0]['base']}&since={fmt(min(iso(f['merged_at']) for f in mrows))}"
+                f"commits?sha={mrows[0]['base']}&since={fmt(min(iso(f['merged_at']) for f in mrows) - BASE_LOOKBACK)}"
                 f"&until={fmt(max(iso(f['merged_at']) for f in mrows) + WINDOW + dt.timedelta(hours=2))}", max_pages=5)
         except (Truncated, ReadError):
             pass
@@ -1194,10 +1214,10 @@ def collect_repo(repo, cache_dir, cap, owner, lo, hi, now, ticks, tick_ctx, fetc
             req = required_contexts(rd, mrows[0]["base"], tick_ctx.get(repo))
         except (Truncated, ReadError):
             pass
-    episodes, ep_ok, ep_skipped, untracked = [], False, 0, {"one_off": [], "noisy": []}
+    episodes, ep_ok, ep_skipped, untracked, attributable = [], False, 0, {"one_off": [], "noisy": []}, set()
     if mrows and commits_ok:
         try:
-            episodes, ep_skipped, untracked = detect_main_red(rd, base_commits, merged_list, now)
+            episodes, ep_skipped, untracked, attributable = detect_main_red(rd, base_commits, merged_list, now)
             ep_ok = True
         except (Truncated, ReadError):
             pass
@@ -1234,7 +1254,7 @@ def collect_repo(repo, cache_dir, cap, owner, lo, hi, now, ticks, tick_ctx, fetc
             row["cause_min"] = cause_minutes(f, comp)
             # the episodes this PR's merge started (empty list: none), or None when the base's checks were not read in full
             row["main_red"] = [{k: ep[k] for k in ("contexts", "minutes_to_green", "fixer_pr", "head_red_same_context")}
-                               for ep in episodes if ep["pr"] == f["number"]] if ep_ok else None
+                               for ep in episodes if ep["pr"] == f["number"]] if ep_ok and f.get("merge_commit_sha") in attributable else None
             corr = rd.load("correct", str(f["number"]))
             if corr is not None and corr.get("v") != CHECKS_VERSION:
                 corr = None

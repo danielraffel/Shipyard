@@ -391,6 +391,17 @@ class MainRed(unittest.TestCase):
         self.assertEqual([(e["pr"], e["fixer_pr"]) for e in eps], [(1, 2), (3, 4)])
 
 
+    def test_a_red_push_right_after_an_unsettled_one_has_no_pr(self):
+        eps, skipped = self.run_eps([("base", self.st(green=["T"])), ("a", self.st(red=["T"], settled=False)), ("b", self.st(red=["T"])), ("c", self.st(green=["T"]))],
+                                    {"a": 1, "b": 2, "c": 3})
+        self.assertEqual((eps[0]["pr"], eps[0]["after_gap"], eps[0]["fixer_pr"], skipped), (None, True, 3, 1))  # a may have turned it red, not b
+
+    def test_only_a_settled_push_after_a_settled_push_is_attributable(self):
+        chron = [(x, T(10, f"10:0{i}")) for i, x in enumerate("abcde")]
+        states = {"a": self.st(green=["T"]), "b": self.st(green=["T"]), "c": self.st(settled=False), "d": self.st(green=["T"]), "e": self.st(green=["T"])}
+        self.assertEqual(pm.attributable_pushes(chron, states), {"b", "e"})
+
+
 class CommitState(Base):
     def rd(self, runs):
         return pm.Reader(REPO, self.cache, 50, lambda path: {"check_runs": runs})
@@ -409,6 +420,15 @@ class CommitState(Base):
         self.assertFalse(st["settled"])
         self.assertIsNone(rd.load("cstate", "s2"))
         self.assertFalse(pm.commit_state(self.rd(self.RUNS), "s3")["settled"])  # no age given: never stuck
+
+    def test_a_push_settled_only_because_a_run_is_stuck_is_not_cached(self):
+        rd = self.rd(self.RUNS)
+        self.assertTrue(pm.commit_state(rd, "s4", dt.timedelta(hours=5))["settled"])
+        self.assertIsNone(rd.load("cstate", "s4"))  # the stuck run can still finish
+        done = [r for r in self.RUNS if r["status"] == "completed"]
+        rd2 = self.rd(done)
+        pm.commit_state(rd2, "s5", dt.timedelta(hours=5))
+        self.assertIsNotNone(rd2.load("cstate", "s5"))
 
     def test_a_context_seen_on_one_push_only_is_not_tracked_but_a_recurring_one_is(self):
         st = lambda red=(), green=(): {"settled": True, "red": sorted(red), "green": sorted(green)}
@@ -467,7 +487,7 @@ class BaseOrder(unittest.TestCase):
         base = [self.c("base0", None, T(10, "08:00")), self.c(a["merge_commit_sha"], "base0", T(10, "01:00")), self.c(b["merge_commit_sha"], a["merge_commit_sha"], T(10, "02:00"))]
         gh = world([a, b], base_commits=base, checks={"base0": ok, a["merge_commit_sha"]: red, b["merge_commit_sha"]: ok, a["head"]["sha"]: ok})
         with tempfile.TemporaryDirectory() as d:
-            eps, _, _ = pm.detect_main_red(pm.Reader(REPO, d, 100, gh), base, [a, b])
+            eps, *_ = pm.detect_main_red(pm.Reader(REPO, d, 100, gh), base, [a, b])
         self.assertEqual((eps[0]["pr"], eps[0]["fixer_pr"], eps[0]["minutes_to_green"]), (1, 2, 30.0))  # 10:00 to 10:30, not 01:00 to 02:00
 
 
@@ -480,7 +500,7 @@ class BaseOrder(unittest.TestCase):
         base = [self.c("base0", None, T(10, "08:00")), self.c(a["merge_commit_sha"], "base0", T(10, "09:30")), self.c("direct", a["merge_commit_sha"], T(10, "09:00"))]
         gh = world([a], base_commits=base, checks={"base0": ok, a["merge_commit_sha"]: red, "direct": ok, a["head"]["sha"]: red})
         with tempfile.TemporaryDirectory() as d:
-            eps, _, _ = pm.detect_main_red(pm.Reader(REPO, d, 100, gh), base, [a])
+            eps, *_ = pm.detect_main_red(pm.Reader(REPO, d, 100, gh), base, [a])
         self.assertEqual((eps[0]["pr"], eps[0]["minutes_to_green"]), (1, 0.0))
 
 
@@ -538,6 +558,25 @@ class MainRedReads(Base):
         self.assertFalse(v["main_red"]["complete"])
         self.assertTrue(all(r["main_red"] is None for r in v["prs"]))
         self.assertEqual(v["controls"]["incident"]["not_in_window"], 1)
+
+    def test_a_merge_the_base_listing_misses_has_unknown_attribution_not_a_known_zero(self):
+        a, b = self.merged()
+        listing = [commit("base0", date=T(10, "08:00")), commit(a["merge_commit_sha"], date=T(10, "10:00"))]  # b's merge is absent
+        with tempfile.TemporaryDirectory() as d:
+            out = pm.build([REPO], d, 500, OWNER, START, NOW, {}, {}, None, self.world(a, b, listing, False), controls={}, control=False)
+        rows = {r["pr"]: r for r in out["repos"][REPO]["prs"]}
+        self.assertEqual((len(rows[1]["main_red"]), rows[2]["main_red"]), (1, None))
+        with tempfile.TemporaryDirectory() as d:
+            out = pm.build([REPO], d, 500, OWNER, START, NOW, {}, {}, None, self.world(a, b, [], False), controls={}, control=False)
+        self.assertTrue(all(r["main_red"] is None for r in out["repos"][REPO]["prs"]))  # an empty listing is not zero failures
+
+    def test_the_base_listing_starts_a_day_before_the_first_merge(self):
+        a, b = self.merged()
+        gh = self.world(a, b, self.base(a, b), False)
+        with tempfile.TemporaryDirectory() as d:
+            pm.build([REPO], d, 500, OWNER, START, NOW, {}, {}, None, gh, controls={}, control=False)
+        since = [c for c in gh.calls if "commits?sha=" in c][0].split("since=")[1].split("&")[0]
+        self.assertEqual(since, pm.fmt(pm.iso(T(10, "10:00")) - dt.timedelta(days=1)))
 
     def test_the_report_prints_the_episode_table(self):
         a, b = self.merged()

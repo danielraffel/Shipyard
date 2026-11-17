@@ -116,13 +116,22 @@ def raw_world():
                 runs.append({"id": rid, "name": "ci", "head_sha": sha, "event": ev, "status": "completed", "head_branch": br,
                              "conclusion": "failure" if rid == 101 else "success", "updated_at": _t("10:12")})  # run 101 failed, at 10:12
                 jobs[rid] = [{"labels": lab, "created_at": _t("09:58"), "started_at": _t("10:00"), "completed_at": _plus(mins), "conclusion": "success"}]
-    # main is read sparsely: a green push before the window, the PR that turned Test red, and the PR that turned it green
+    # main: a green push before the window, then every merged PR's merge commit (a merge the listing misses has an
+    # unknown main-red attribution, never a known zero). A merge between the PR that turned Test red and the PR that
+    # turned it green ran no Test (a docs-only change), so it neither ends the episode nor reads as a red base.
     base_commits += [{"sha": "1" * 40, "commit": {"message": "baseline", "committer": {"date": _t("09:00")}}}]
+    red_spans = [(_plus(c["delay"]), _plus(next(x["delay"] for x in CASES if x["n"] == c["red_until"]))) for c in CASES if c.get("base_red")]
+    # a direct push lands just before each PR that turns Test red, so the merge before it is not judged against that red
+    for i, (lo, _) in enumerate(red_spans):
+        before = (dt.datetime.fromisoformat(lo.replace("Z", "+00:00")) - dt.timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        base_commits.append({"sha": f"d{i:039x}", "commit": {"message": "docs: direct push", "committer": {"date": before}}})
     for c in CASES:
-        if c.get("base_red"):
-            for n in (c["n"], c["red_until"]):
-                at = _plus(next(x["delay"] for x in CASES if x["n"] == n))
-                base_commits.append({"sha": _sha(n, "c"), "commit": {"message": f"merge #{n}", "committer": {"date": at}}})
+        if c["delay"] is None:
+            continue
+        at = _plus(c["delay"])
+        base_commits.append({"sha": _sha(c["n"], "c"), "commit": {"message": f"merge #{c['n']}", "committer": {"date": at}}})
+        if not c.get("base_red") and any(lo < at < hi for lo, hi in red_spans):
+            checks[_sha(c["n"], "c")] = [{"name": "Docs", "status": "completed", "conclusion": "success", "started_at": at}]
     ok = [{"name": "Test", "status": "completed", "conclusion": "success"}]
 
     def get(path):
