@@ -377,6 +377,25 @@ class RerunCache(Base):
         r2, gh = self.build_one([self.mk(2, "failure", T(10, "10:50"))])  # same run id, now attempt 2 and failed
         self.assertEqual((r2["path"], r2["path_why"]), ("slow", ["red"]))
 
+    def test_a_run_that_appears_after_the_entry_was_cached_invalidates_it(self):
+        self.build_one([self.mk(1, "success", T(10, "10:30"))])
+        extra = dict(self.mk(1, "failure", T(10, "10:45")), id=12, name="late")
+        calls, orig = [], pm.pr_compute
+        pm.pr_compute = lambda *a, **k: (calls.append(1), orig(*a, **k))[1]
+        try:
+            r, _ = self.build_one([self.mk(1, "success", T(10, "10:30")), extra], jobs=self.JOB)
+        finally:
+            pm.pr_compute = orig
+        self.assertEqual(calls, [1])
+
+    def test_a_cached_entry_is_used_when_the_run_list_cannot_be_read_rather_than_lost(self):
+        self.build_one([self.mk(1, "success", T(10, "10:30"))])
+        gh = world([pr(1, T(10, "09:00"), T(10, "11:00"))], {1: []}, runs=[], jobs={})
+        gh.routes = [x for x in gh.routes if "actions/runs" not in x[0]]
+        out = pm.build([REPO], self.cache, 300, OWNER, START, NOW, {}, {}, None, gh, control=False)
+        r = out["repos"][REPO]["prs"][0]
+        self.assertEqual((r["compute"]["runs"], r["path"]), (1, "clean"))
+
     def test_an_unchanged_run_keeps_its_cache_and_costs_no_jobs_read(self):
         self.build_one([self.mk(1, "success", T(10, "10:30"))])
         calls, orig = [], pm.pr_compute

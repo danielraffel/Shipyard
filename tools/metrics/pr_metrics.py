@@ -656,25 +656,31 @@ def load_compute(rd, number, f=None, runs_by_id=None):
     entry is never complete while that PR's own timeline or commit read is incomplete (the heads came from them). With
     `runs_by_id` (the current run list) every run the entry was built from must still have the attempt and update time
     it had: a rerun keeps its run id and can turn a cached success into a failure. Without the run list a cached entry
-    cannot be validated and is not used."""
-    if not READ_JOB_MINUTES or runs_by_id is None:  # a cached entry carries job minutes this run is meant to leave empty
+    cannot be validated (the run list was not read, for example under the read cap): it is used as it stands, since the
+    alternative is to lose a settled result.  A run that appeared since the entry was written is a change too."""
+    if not READ_JOB_MINUTES:  # a cached entry carries job minutes this run is meant to leave empty
         return None
     c = rd.load("compute", str(number))
     if c is None or c.get("v") != COMPUTE_VERSION or not c.get("complete"):
         return None
     if f is not None and not reads_complete(f):
         return None
-    for rid, fp in (c.get("run_fp") or {}).items():
-        cur = runs_by_id.get(int(rid))
-        if cur is None or run_fingerprint(cur) != fp:
-            return None
+    if runs_by_id is not None and f is not None:
+        stored = c.get("run_fp") or {}
+        if {str(i) for i in pr_runs(f, list(runs_by_id.values()))} != set(stored):
+            return None  # a run appeared (or left the list) since the entry was written
+        for rid, fp in stored.items():
+            if run_fingerprint(runs_by_id[int(rid)]) != fp:
+                return None
     return c
 
 
 READ_JOB_MINUTES = True  # False skips the per-run jobs reads (the bulk of the reads): runs, failed head runs and paths still work
 
 
-def pr_compute(rd, f, runs, runs_complete):
+def pr_runs(f, runs):
+    """The runs that belong to a merged PR: those on one of its heads, its merge-group runs, and pushes to the base on a
+    merge-group sha (the queue fast-forwards the base to the group)."""
     heads = set(f["heads"])
     mg = re.compile(rf"^gh-readonly-queue/{re.escape(f['base'])}/pr-{f['number']}-")
     mine, group_shas = {}, set()
@@ -683,10 +689,15 @@ def pr_compute(rd, f, runs, runs_complete):
             mine[r["id"]] = r
             if r.get("event") == "merge_group":
                 group_shas.add(r.get("head_sha"))
-    # a push to the base on a sha a merge group already ran: the merge queue fast-forwards the base to the group
     for r in runs:
         if r["id"] not in mine and r.get("event") == "push" and r.get("head_sha") in group_shas:
             mine[r["id"]] = r
+    return mine
+
+
+def pr_compute(rd, f, runs, runs_complete):
+    heads = set(f["heads"])
+    mine = pr_runs(f, runs)
     # a repeat is a run of a workflow on a sha that workflow already ran on (reruns, a push on a merge-group sha)
     seen, repeats = {}, 0
     for r in sorted(mine.values(), key=lambda x: (x.get("event") != "merge_group", x["id"])):
