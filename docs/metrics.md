@@ -37,7 +37,10 @@ it is on only when the tick passes `--e2e-cache DIR` (the daily run does, unless
 
 A zero is printed with its positive control's count. Built-in controls: fleet-handbook #124 reverted
 #119 (the revert detector must find it) and #126's title names #116 (the escape detector must find
-it). `DEFAULT_CONTROLS` can also pin `"owner": [pr, ...]`, PRs with a hand-verified owner action that
+it). Pulp has two escape controls, both checked by hand against main-red traces: #12375 fixed
+#12219 (Workflow lint) and #12384 fixed #12338 (the WAM link). Neither fix names the PR it fixes, so
+the escape detector misses them and Pulp's escaped metric reads `withheld` until it can find them.
+`DEFAULT_CONTROLS` can also pin `"owner": [pr, ...]`, PRs with a hand-verified owner action that
 must read `owner_action`. PRs the ticks show as `direct_merge_refused` are counted for context only:
 that stop is a ruleset config gap, not an owner action, so they can legitimately read autonomous.
 A control whose PR is outside the window is "not in window" and unchecked. A control in the window
