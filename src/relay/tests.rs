@@ -1591,6 +1591,32 @@ fn an_unowned_pull_request_ejected_from_the_queue_reaches_the_lead() {
 }
 
 #[test]
+fn a_pull_request_that_loses_its_owner_tells_the_lead_what_the_owner_was_told() {
+    let pr = Pr::open(543);
+    let mut h = unowned_harness(&pr, true);
+    h.cmux = FakeCmux::with(&[("m5", "/tmp/cmux-nightly.sock", "S"), ("m1", "", "LEAD")]);
+    let marker = owner_registry::render_marker(&owner(543, "m5", "S"));
+    h.gh.open_bodies
+        .borrow_mut()
+        .insert(543, format!("body\n{marker}"));
+    h.pass(0, Mode::Send);
+    let mut held = pr.clone();
+    held.comments.push(verdict("HOLD", HEAD_A));
+    h.gh.set(held);
+    h.pass(1, Mode::Send);
+    assert_eq!(h.deliveries().len(), 1);
+    assert_eq!(h.deliveries()[0]["tier"], "owner");
+    // The marker is removed: the HOLD is still there, and the lead hears it.
+    h.gh.open_bodies
+        .borrow_mut()
+        .insert(543, "no marker".to_owned());
+    h.pass(30, Mode::Send);
+    let deliveries = h.deliveries();
+    assert_eq!(deliveries.len(), 2, "{deliveries:?}");
+    assert_eq!(deliveries[1]["tier"], "lead");
+}
+
+#[test]
 fn without_a_lead_an_unowned_pull_request_is_not_tracked() {
     let mut pr = Pr::open(543);
     pr.comments.push(verdict("HOLD", HEAD_A));

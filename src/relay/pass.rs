@@ -64,6 +64,11 @@ pub(crate) struct Tracked {
     /// Consecutive passes whose batch nothing could take.
     #[serde(default)]
     pub(crate) failed_deliveries: u32,
+    /// Whether the last pass judged this pull request as unowned (told to the
+    /// lead). A change of scope is a new audience: what the other audience
+    /// was told says nothing about this one.
+    #[serde(default)]
+    pub(crate) unowned_scope: bool,
     /// The head whose required checks were last seen green.
     #[serde(default)]
     pub(crate) green_head: Option<String>,
@@ -356,6 +361,12 @@ fn run_repo(
             log.push(record);
         }
         let unowned = tracked.owner.is_none();
+        if tracked.unowned_scope != unowned {
+            tracked.unowned_scope = unowned;
+            tracked.sent.clear();
+            tracked.pending.clear();
+            tracked.last_sent_at = None;
+        }
         // With no owner the lead hears only what needs an author, judged by
         // the state now, every pass: a history to compare with would miss a
         // HOLD that landed before the first look or a conflict that came with
