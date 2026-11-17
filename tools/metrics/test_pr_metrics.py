@@ -255,7 +255,7 @@ class ProofsAndQueue(Base):
         rd = pm.Reader(REPO, self.cache, 100, lambda path: {"jobs": [{"labels": ["macOS-14", "self-hosted"], "started_at": T(10, "10:00"),
                                                                        "completed_at": T(10, "10:30"), "conclusion": "success"}]})
         rd.save("jobs", "7", {"self_hosted": 99.0, "hosted": 0.0})
-        sh, ho, mac, ok = pm.job_minutes(rd, {"id": 7, "status": "completed"})
+        sh, ho, mac, wait, ok = pm.job_minutes(rd, {"id": 7, "status": "completed"})
         self.assertEqual((sh, ho, mac, ok), (30.0, 0.0, 30.0, True))
 
     def test_enqueue_to_merge_counts_from_the_last_enqueue_and_runs_by_workflow_and_level_are_kept(self):
@@ -280,6 +280,65 @@ class ProofsAndQueue(Base):
         md = pm.markdown(out)
         self.assertIn("Proofs, macOS minutes and queue wait per merged PR", md)
         self.assertIn("| Proof | 0.5 / 0.5 / 0.0 |", md)
+
+
+class Paths(unittest.TestCase):
+    F = {"holds": 0, "ejections": [], "merged_at": T(10, "12:00"), "hold_times": [], "push_times": [], "enqueue_times": [], "dequeue_times": []}
+
+    def f(self, **kw):
+        return dict(self.F, **kw)
+
+    def comp(self, **kw):
+        return dict({"complete": True, "red_events": [], "runner_wait_min": 0.0}, **kw)
+
+    def test_a_pr_with_no_slow_cause_and_a_complete_compute_is_clean(self):
+        self.assertEqual(pm.path_of(self.f(), self.comp()), ("clean", []))
+
+    def test_each_slow_cause_makes_the_pr_slow_with_its_reason(self):
+        self.assertEqual(pm.path_of(self.f(holds=1), self.comp()), ("slow", ["hold"]))
+        self.assertEqual(pm.path_of(self.f(), self.comp(red_events=[T(10, "10:30")])), ("slow", ["red"]))
+        self.assertEqual(pm.path_of(self.f(ejections=["failed_checks"]), self.comp()), ("slow", ["ejection"]))
+        self.assertEqual(pm.path_of(self.f(dirty=True), self.comp()), ("slow", ["dirty"]))
+        self.assertEqual(pm.path_of(self.f(holds=1, dirty=True), self.comp(red_events=[T(10, "10:30")])), ("slow", ["hold", "red", "dirty"]))
+
+    def test_an_unread_compute_leaves_a_pr_with_no_other_cause_unknown_not_clean(self):
+        self.assertEqual(pm.path_of(self.f(), None), (None, []))
+        self.assertEqual(pm.path_of(self.f(), self.comp(complete=False)), (None, []))
+        self.assertEqual(pm.path_of(self.f(holds=1), None), ("slow", ["hold"]))  # a known cause needs no compute
+        self.assertEqual(pm.path_of(self.f(), self.comp(complete=False, red_events=[T(10, "10:30")])), (None, []))  # an incomplete read is not trusted
+
+    def test_hold_and_red_wait_until_the_next_push_or_the_merge(self):
+        f = self.f(hold_times=[T(10, "10:00"), T(10, "11:00")], push_times=[T(10, "10:20")])
+        self.assertEqual(pm.cause_minutes(f, self.comp())["hold"], 20.0 + 60.0)  # 10:00 to the push, 11:00 to the 12:00 merge
+        red = pm.cause_minutes(self.f(push_times=[T(10, "11:30")]), self.comp(red_events=[T(10, "11:00")]))
+        self.assertEqual(red["red"], 30.0)
+
+    def test_queue_time_runs_from_each_enqueue_to_its_removal_or_the_merge(self):
+        f = self.f(enqueue_times=[T(10, "10:00"), T(10, "10:40")], dequeue_times=[T(10, "10:10")])
+        self.assertEqual(pm.cause_minutes(f, self.comp())["queue"], 10.0 + 80.0)
+
+    def test_unmeasured_causes_are_none_not_zero_and_an_unmerged_pr_has_no_causes(self):
+        c = pm.cause_minutes(self.f(), None)
+        self.assertEqual((c["red"], c["runner"], c["dirty"]), (None, None, None))
+        self.assertIsNone(pm.cause_minutes(self.f(merged_at=None), self.comp()))
+
+    def test_the_summary_reports_share_medians_and_the_top_cause(self):
+        row = lambda lead, path, why=(), **cm: {"handoff_min": lead, "path": path, "path_why": list(why),
+                                                "cause_min": {"hold": 0.0, "red": 0.0, "queue": 0.0, "runner": 0.0, "dirty": None, **cm}}
+        rows = [row(30.0, "clean"), row(50.0, "clean"), row(70.0, "clean"), row(400.0, "slow", ["red"], red=120.0), row(100.0, "slow", ["hold"], hold=30.0),
+                row(60.0, None, ())]
+        p = pm.path_summary(rows)
+        self.assertEqual((p["clean"]["n"], p["clean"]["median_min"], p["slow"]["n"], p["slow"]["median_min"], p["slow"]["p90_min"], p["unknown"]),
+                         (3, 50.0, 2, 250.0, 400.0, 1))
+        self.assertEqual(p["slow_share_pct"], 40.0)  # unknown is in neither path
+        self.assertEqual((p["top_cause"], p["cause_min_per_merge"]["red"], p["cause_min_per_merge"]["hold"], p["cause_min_per_merge"]["dirty"]), ("red", 20.0, 5.0, None))
+        self.assertEqual(pm.path_summary([])["top_cause"], None)
+
+    def test_the_report_prints_the_clean_and_slow_table(self):
+        out = pm.build([REPO], tempfile.mkdtemp(), 50, OWNER, START, NOW, {}, {}, None, world([pr(1, T(10, "10:00"), T(10, "11:00"))]))
+        md = pm.markdown(out)
+        self.assertIn("### Clean and slow paths (window, merged PRs)", md)
+        self.assertIn("| slow share | clean median (n) | slow median / p90 (n) | top cause |", md)
 
 
 class Correctness(Base):
@@ -1135,6 +1194,8 @@ class SyntheticControl(unittest.TestCase):
             "commit_red": (lambda rd, sha, required: (set(), True), "correctness.base_red"),
             "push_repeats_of_group_shas": (lambda runs: (0, 0), None),
             "steward_evidence": (lambda rd, f: False, "attribution.steward_merges_recognised"),
+            "path_of": (lambda f, comp: ("clean", []), "paths.slow.n"),
+            "cause_minutes": (lambda f, comp: {"hold": 0.0, "red": 0.0, "queue": 0.0, "runner": 0.0, "dirty": None}, "paths.cause_min_per_merge.red"),
         }
         for name, (fn, expect) in cases.items():
             if expect is None:
@@ -1154,7 +1215,7 @@ class SyntheticControl(unittest.TestCase):
         out = pm.build([REPO], tempfile.mkdtemp(), 50, OWNER, START, NOW, {}, {}, None, world([pr(1, T(10, "10:00"), T(10, "11:00"))]))
         self.assertEqual(out["synthetic_control"]["status"], "pass")
         md = pm.markdown(out)
-        self.assertIn("**CONTROL PASS: 38 of 38", md)
+        self.assertIn("**CONTROL PASS: 49 of 49", md)
         self.assertIn("| ready day |", md)
 
     def test_a_repo_with_no_live_control_reads_synthetic_not_unchecked(self):

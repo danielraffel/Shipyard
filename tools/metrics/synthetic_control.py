@@ -47,9 +47,9 @@ CASES = [
     {"n": 5, "name": "escaped", "delay": 75, "north": "autonomous", "escaped_by": 6},
     {"n": 6, "name": "later_fix", "delay": 120, "north": "autonomous", "title": "fix regression from #5"},
     {"n": 7, "name": "held_twice", "delay": 150, "north": "autonomous", "holds": 2, "re_holds": 1,
-     "pushes": {"author": 1, "repair": 1, "merge_main": 1}},
-    {"n": 8, "name": "queued_twice", "delay": 85, "north": "autonomous", "enqueues": 2, "ejections": ["failed_checks"], "enq_to_merge": 45},
-    {"n": 9, "name": "compute", "delay": 95, "north": "autonomous", "runs": 4, "repeat_runs": 2, "macos_min": 10,
+     "pushes": {"author": 1, "repair": 1, "merge_main": 1}, "slow": True, "cause_min": {"hold": 20}},
+    {"n": 8, "name": "queued_twice", "delay": 85, "north": "autonomous", "enqueues": 2, "ejections": ["failed_checks"], "enq_to_merge": 45, "slow": True, "cause_min": {"queue": 55}},
+    {"n": 9, "name": "compute", "delay": 95, "north": "autonomous", "runs": 4, "repeat_runs": 2, "macos_min": 10, "slow": True, "cause_min": {"red": 83, "runner": 8},
      "workflows": {"ci": {"pull_request": 2, "merge_group": 1, "push": 1}}},
     {"n": 10, "name": "owner_label_a", "delay": 100, "north": "owner_action", "owner_actions": 1},
     {"n": 11, "name": "owner_label_b", "delay": 110, "north": "owner_action", "owner_actions": 1},
@@ -110,8 +110,9 @@ def raw_world():
             g = "9" * 40
             for rid, ev, sha, br, lab, mins in ((101, "pull_request", head, "feat", ["self-hosted", "macOS"], 10), (102, "pull_request", head, "feat", ["ubuntu"], 5),
                                                 (103, "merge_group", g, f"gh-readonly-queue/main/pr-{n}-x", ["self-hosted"], 20), (104, "push", g, "main", ["ubuntu"], 1)):
-                runs.append({"id": rid, "name": "ci", "head_sha": sha, "event": ev, "status": "completed", "head_branch": br})
-                jobs[rid] = [{"labels": lab, "started_at": _t("10:00"), "completed_at": _plus(mins), "conclusion": "success"}]
+                runs.append({"id": rid, "name": "ci", "head_sha": sha, "event": ev, "status": "completed", "head_branch": br,
+                             "conclusion": "failure" if rid == 101 else "success", "updated_at": _t("10:12")})  # run 101 failed, at 10:12
+                jobs[rid] = [{"labels": lab, "created_at": _t("09:58"), "started_at": _t("10:00"), "completed_at": _plus(mins), "conclusion": "success"}]
     ok = [{"name": "Test", "status": "completed", "conclusion": "success"}]
 
     def get(path):
@@ -154,6 +155,7 @@ def expected():
     count = lambda k: sum(1 for c in CASES if c["north"] == k)
     hand = sorted(c["delay"] for c in merged)
     q2m = [c["enq_to_merge"] for c in CASES if "enq_to_merge" in c]
+    slow = [c for c in merged if c.get("slow")]
     owner_actions = sum(c.get("owner_actions", 0) for c in CASES)
     ejections = sum(len(c.get("ejections", [])) for c in CASES)
     bad = sum(1 for c in merged if c.get("reverted") or c.get("base_red"))
@@ -183,6 +185,12 @@ def expected():
         "merge_queue.enqueue_to_merge_min.median": round(statistics.median(q2m), 1),
         **{f"compute_per_merged_pr.by_workflow.{wf}.{lv}": round(sum(c.get("workflows", {}).get(wf, {}).get(lv, 0) for c in merged) / len(merged), 2)
            for wf in {w for c in merged for w in c.get("workflows", {})} for lv in ("pull_request", "merge_group", "push")},
+        "paths.slow.n": len(slow), "paths.clean.n": len(merged) - len(slow), "paths.unknown": 0,
+        "paths.slow_share_pct": round(100.0 * len(slow) / len(merged), 1),
+        "paths.clean.median_min": round(statistics.median(c["delay"] for c in merged if not c.get("slow")), 1),
+        "paths.slow.median_min": round(statistics.median(c["delay"] for c in slow), 1),
+        "paths.slow.p90_min": sorted(c["delay"] for c in slow)[max(0, math.ceil(0.9 * len(slow)) - 1)],
+        **{f"paths.cause_min_per_merge.{k}": round(sum(c.get("cause_min", {}).get(k, 0) for c in slow) / len(merged), 2) for k in ("hold", "red", "queue", "runner")},
         "correctness.bad": bad, "correctness.good": len(merged) - bad,
         "correctness.reverted": sum(1 for c in merged if c.get("reverted")),
         "correctness.base_red": sum(1 for c in merged if c.get("base_red")),

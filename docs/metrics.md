@@ -38,7 +38,7 @@ it is on only when the tick passes `--e2e-cache DIR` (the daily run does, unless
 **Synthetic control (every report).** `tools/metrics/synthetic_control.py` holds fifteen invented PRs, each
 built to have one known outcome (autonomous, owner label, steward merge, unbound owner merge, unsigned owner
 PR, never merged, reverted, red base, escaped, twice held with repair and merge-main pushes, ejected from the
-queue, a gate-run fixture with repeats). `expected()` derives 38 numbers from that table with plain arithmetic
+queue, a gate-run fixture with repeats). `expected()` derives 49 numbers from that table with plain arithmetic
 and never calls the scorecard; the real `pr_metrics.build` then runs over the same PRs, served from memory (no
 GitHub read, a throwaway cache), and every number must match. The report prints one line, `CONTROL PASS` with the
 count and the largest delta, or `CONTROL FAIL` with each missed number, its expected value, its value and the delta.
@@ -74,6 +74,18 @@ the Actions API serves at most 1000 runs for one `created` range, so a busy rang
 compares six numbers measured by hand on 2026-11-15 (Vellum and Pulp ready-to-merge medians, Vellum PR-level and
 merge-group GPU proofs per merged PR, Pulp macOS minutes per merged PR, Vellum enqueue-to-merge median) with the
 scorecard's own values, within 15%. The synthetic control covers these fields too.
+
+## Clean and slow paths
+
+Each merged PR is `slow` when it had any HOLD, a failed run on one of its heads, an ejection from the merge queue
+or a DIRTY tick; `clean` when none of these and its compute was read in full; otherwise `unknown` (a failed run
+cannot be ruled out without the run list), and unknown PRs are in neither path. The report gives the slow share
+(slow over slow plus clean), the clean median and the slow median and p90 lead time (first ready to merge), each
+with its n, and the minutes per merged PR that each cause held the slow PRs up: HOLD (each HOLD to the next push
+or the merge), red (each failed head run to the next push or the merge), queue (each enqueue to its removal or the
+merge), runner (queued job time from the jobs' `created_at` to `started_at`) and DIRTY (not measured: the ticks
+record a state, not a duration, so its cell is empty and never zero). The causes overlap and are not additive.
+The top cause is the largest of the measured ones.
 
 ## Sample and comparison
 
