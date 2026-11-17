@@ -388,13 +388,13 @@ class RerunCache(Base):
             pm.pr_compute = orig
         self.assertEqual(calls, [1])
 
-    def test_a_cached_entry_is_used_when_the_run_list_cannot_be_read_rather_than_lost(self):
+    def test_a_cached_entry_is_kept_when_the_run_list_cannot_be_read_but_its_clean_verdict_is_unknown(self):
         self.build_one([self.mk(1, "success", T(10, "10:30"))])
         gh = world([pr(1, T(10, "09:00"), T(10, "11:00"))], {1: []}, runs=[], jobs={})
         gh.routes = [x for x in gh.routes if "actions/runs" not in x[0]]
         out = pm.build([REPO], self.cache, 300, OWNER, START, NOW, {}, {}, None, gh, control=False)
         r = out["repos"][REPO]["prs"][0]
-        self.assertEqual((r["compute"]["runs"], r["path"]), (1, "clean"))
+        self.assertEqual((r["compute"]["runs"], r["path"]), (1, None))  # its numbers are kept, but a clean verdict that cannot be checked is unknown
 
     def test_an_unchanged_run_keeps_its_cache_and_costs_no_jobs_read(self):
         self.build_one([self.mk(1, "success", T(10, "10:30"))])

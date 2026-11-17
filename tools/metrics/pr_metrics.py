@@ -1132,6 +1132,8 @@ def collect_repo(repo, cache_dir, cap, owner, lo, hi, now, ticks, tick_ctx, fetc
                     comp = None
             row["compute"] = comp
             row["path"], row["path_why"] = path_of(dict(f, dirty=row["dirty"]), comp)
+            if runs_by_id is None and row["path"] == "clean":
+                row["path"] = None  # a cached success that could not be checked against the current runs (a rerun may have failed): unknown, not clean
             row["cause_min"] = cause_minutes(f, comp)
             corr = rd.load("correct", str(f["number"]))
             if corr is not None and corr.get("v") != CHECKS_VERSION:
