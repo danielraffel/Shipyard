@@ -2499,7 +2499,7 @@ class GhappWrapperTests(unittest.TestCase):
         return [
             line
             for line in self.resolver_log.read_text().splitlines()
-            if line.startswith("owner register")
+            if " owner register " in f" {line} "
         ]
 
     def test_pr_create_registers_the_owner_without_changing_its_output(self) -> None:
@@ -2512,7 +2512,10 @@ class GhappWrapperTests(unittest.TestCase):
         self.assertEqual(result.stdout, url + "\n")
         self.assertEqual(
             self.owner_register_calls(),
-            ["owner register --pr 77 --repo owner/repo --after-create"],
+            [
+                f"--mode shipyard --global-dir {self.root / 'governed global'} "
+                "owner register --pr 77 --repo owner/repo --after-create"
+            ],
         )
 
     def test_pr_create_that_fails_or_prints_no_pull_request_registers_nothing(

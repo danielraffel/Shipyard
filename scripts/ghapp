@@ -2163,7 +2163,7 @@ if [[ "$ghapp_register_owner" == 1 && ( "${1:-}" != "api" || "$ghapp_stderr_open
             ghapp_created_path="${ghapp_created_url#https://github.com/}"
             ghapp_created_number="${ghapp_created_path##*/}"
             ghapp_created_repo="${ghapp_created_path%/pull/*}"
-            PATH="$trusted_path" "$shipyard_binary" owner register \
+            PATH="$trusted_path" "$shipyard_binary" "${resolver_context_argv[@]}" owner register \
                 --pr "$ghapp_created_number" --repo "$ghapp_created_repo" \
                 --after-create </dev/null >&2 2>&1 || true
         fi
