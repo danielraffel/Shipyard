@@ -21,7 +21,10 @@
 //!   as ready, is skipped;
 //! - a base with a poison reading other than clear, a paused queue entry, or
 //!   a pending run cancellation is skipped;
-//! - a ledger lock another pass holds is skipped, never waited on.
+//! - a ledger lock another pass holds is skipped, never waited on;
+//! - under the lock, the base's merge groups are read again, and while any
+//!   flake re-enqueue in the repository is one the tick's breaker sweep has
+//!   not judged (any stored receipt, whatever its age), every head is skipped.
 //!
 //! See `docs/scheduling-loop.md`, "Ready on event".
 
@@ -262,9 +265,9 @@ pub(super) fn rest_remaining(actions: &GitHubActions) -> Result<u64, String> {
 
 /// Run the steward's admission for the one pull request `event` names.
 ///
-/// Without `apply`, nothing is locked, recorded or mutated, and the live
-/// exact-head approval gate is read so `would_admit` is never claimed for an
-/// unapproved head.
+/// Without `apply`, nothing is locked, recorded or mutated (not even a carry
+/// log line), and the live exact-head approval gate is read as a report so
+/// `would_admit` is never claimed for an unapproved head.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(super) fn admit_ready_event(
     actions: &GitHubActions,
@@ -400,8 +403,15 @@ pub(super) fn admit_ready_event(
     }
     if !apply {
         // A report never claims an unapproved head: the live exact-head gate,
-        // read as the admission reads it.
-        match super::pr_mutations::read_head_gate_for(actions, &observation, pr, &unlocked_ledger) {
+        // evaluated as the admission evaluates it, but as a report
+        // (`dry_run`), so a carried approval is judged and never appended to
+        // the carry log, which records only carries a landing accepted.
+        match super::pr_mutations::read_head_gate_for_report(
+            actions,
+            &observation,
+            pr,
+            &unlocked_ledger,
+        ) {
             Ok((gate, ..)) if gate.allows() => {}
             Ok((gate, ..)) => {
                 let mut outcome = ReadyEventOutcome::skipped(event, apply, "waiting_head_approval");
@@ -443,6 +453,14 @@ pub(super) fn admit_ready_event(
     if !ledger.pending_cancellations.is_empty() {
         return ReadyEventOutcome::skipped(event, apply, "pending_cancellations");
     }
+    // The tick runs the flake breaker's sweep before any admission; this
+    // path does not. While any flake re-enqueue in this repository is one
+    // the sweep has not judged (the queue may have ejected it again on a
+    // signature this head shares), every head is the tick's: it sweeps,
+    // then decides.
+    if super::flake_requeue::unswept_requeue(&ledger, &observation.repo) {
+        return ReadyEventOutcome::skipped(event, apply, "flake_requeue_unswept");
+    }
     // The decision again, on the ledger the lock protects.
     let decision = classify_pr(
         &pr.fact,
@@ -465,6 +483,16 @@ pub(super) fn admit_ready_event(
     let mut removal_cache = ledger.removal_ledger.clone();
     let defect_fix =
         super::defect_fix_removals::read(&reads.defect_fix_ledger, &mut removal_cache, now);
+    // The base's merge groups again, under the lock: the reading above was
+    // taken before it, and a pass that held the lock may have seen the base
+    // turn poisoned since.
+    let base_poison =
+        super::base_poison::observe(actions, &observation, &policy, &BTreeMap::new(), now);
+    if let Some(poison) = base_poison.as_ref()
+        && !matches!(poison.health, MergeGroupHealth::Clear { .. })
+    {
+        return ReadyEventOutcome::skipped(event, apply, "base_poison_not_clear");
+    }
     let context = MutationApplyContext {
         actions,
         observation: &observation,
