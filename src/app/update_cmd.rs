@@ -28,6 +28,8 @@ const DEFAULT_RELEASES_API_BASE: &str =
     "https://api.github.com/repos/danielraffel/Shipyard/releases";
 const UPDATE_AUTH_TIMEOUT: Duration = Duration::from_secs(15);
 
+mod install_identity;
+
 /// CLI dispatch entry.
 #[allow(clippy::too_many_lines)] // one linear install transaction; each step is a named helper
 pub(super) fn update_command<W: Write>(
@@ -746,6 +748,13 @@ fn apply_update<W: Write>(
         format!("Updating from {installed} to {target_tag} via {install_script_url} …")
     })?;
 
+    // The target tag's installer may predate its own identity check, so the
+    // update checks what it installed and puts the previous pair back.
+    let codesign = install_identity::update_codesign();
+    let snapshot = match codesign {
+        Some(_) => Some(install_identity::Snapshot::take(tools.install_dir)?),
+        None => None,
+    };
     invoke_install_script(
         tools.curl_bin,
         tools.shell_bin,
@@ -755,6 +764,9 @@ fn apply_update<W: Write>(
         tools.install_dir,
         json,
     )?;
+    if let (Some(snapshot), Some(codesign)) = (snapshot, codesign) {
+        snapshot.enforce(codesign)?;
+    }
 
     let mut data = BTreeMap::new();
     data.insert("event".to_owned(), Value::from("applied"));
