@@ -62,7 +62,14 @@ UNKNOWN_RANGE_SHARE = 0.20
 SCORECARD_VERSION = "2026-11-16.1"
 MERGE_MAIN_RE = re.compile(r"^Merge (remote-tracking )?branch '?(origin/)?(main|master)'?|^Merge pull request .* from .*/main", re.I)
 # Positive controls: a real revert (#124 reverted #119), a real escaped defect (#126 names #116).
-DEFAULT_CONTROLS = {"danielraffel/fleet-handbook": {"revert": [(119, 124)], "escape": [(116, 126)]}}  # "owner": [pr, ...] pins PRs with a hand-verified owner action
+# Pulp: two escapes verified by hand from main-red traces. #12219 landed red on Workflow lint and
+# #12375 fixed it; #12338 broke the WAM link and #12384 fixed it. Neither fix names the PR it fixes,
+# so the text-based escape detector misses both, and the Pulp escaped metric is withheld until it can
+# find them.
+DEFAULT_CONTROLS = {  # "owner": [pr, ...] pins PRs with a hand-verified owner action
+    "danielraffel/fleet-handbook": {"revert": [(119, 124)], "escape": [(116, 126)]},
+    "Generous-Corp/pulp": {"escape": [(12219, 12375), (12338, 12384)]},
+}
 # Labels that take a PR out of the eligible cohort, with the reason reported.
 EXCLUDE_LABELS = {"automation": "automation", "shipyard:unmanaged": "unmanaged", "superseded": "superseded"}
 INTEGRATION_BASES = ("develop/", "release/")
