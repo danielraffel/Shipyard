@@ -125,7 +125,11 @@ first sighting is judged by its state, so a HOLD that landed before the relay
 looked still alerts once; after that it is the usual per-event key, so the same
 fact is delivered once. The message says no owner is registered and names
 `shipyard owner register`. A `shipyard:needs-agent` label alone does not
-trigger it.
+trigger it. Known limits: a fact already told to an owner is not repeated to the
+lead if the owner's marker is later removed (same key); a new owner is not told
+what the lead heard; and a marker-owned pull request that falls off the newest
+100 open ones loses its marker owner, as it did before, and is then treated as
+unowned.
 
 A batch nothing could take is retried one rate-limit window later, up to six
 times, then dropped (logged as `refused`). At most one fallback comment is
