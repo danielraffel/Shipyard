@@ -799,12 +799,39 @@ def main_red_episodes(chron, states, pr_by_sha):
     return episodes, skipped
 
 
+def commit_date_str(c):
+    return ((c.get("commit") or {}).get("committer") or {}).get("date") or ""
+
+
+def base_order(commits):
+    """The base's pushes, oldest first. A merge queue fast-forwards the base, so each commit keeps its own (older) date
+    and dates mis-order pushes: follow first-parent links when every commit carries them and they form one chain, else
+    fall back to commit date (test fixtures and API answers without parents)."""
+    by = {c["sha"]: c for c in commits}
+    if commits and all(c.get("parents") is not None for c in commits):
+        child, roots = {}, []
+        for c in commits:
+            ps = [p["sha"] for p in c["parents"]]
+            if ps and ps[0] in by:
+                child.setdefault(ps[0], []).append(c["sha"])
+            else:
+                roots.append(c["sha"])
+        if len(roots) == 1 and all(len(v) == 1 for v in child.values()):
+            order = [roots[0]]
+            while order[-1] in child:
+                order.append(child[order[-1]][0])
+            if len(order) == len(commits):
+                return [by[x] for x in order]
+    return sorted(commits, key=commit_date_str)
+
+
 def detect_main_red(rd, base_commits, merged_list):
     """Read every base push's checks (the cap raises Truncated, an unreadable page ReadError), find the episodes and,
     for each one a PR started, whether that PR's final head was red in the same context when it merged."""
-    chron = sorted(((c["sha"], ((c.get("commit") or {}).get("committer") or {}).get("date") or "") for c in base_commits), key=lambda x: x[1])
-    states = {sha: commit_state(rd, sha) for sha, _ in chron}
     by_sha = {p["merge_commit_sha"]: p for p in merged_list if p.get("merge_commit_sha")}
+    # a PR's push time is its merged_at; a commit's own date is when it was written, not when it reached the base
+    chron = [(c["sha"], by_sha[c["sha"]]["merged_at"] if c["sha"] in by_sha else commit_date_str(c)) for c in base_order(base_commits)]
+    states = {sha: commit_state(rd, sha) for sha, _ in chron}
     episodes, skipped = main_red_episodes(chron, states, {k: p["number"] for k, p in by_sha.items()})
     for ep in episodes:
         p = by_sha.get(ep["start_sha"])
@@ -867,7 +894,7 @@ def pr_correct(rd, f, base_commits, commits_ok, required, ticks, now, later=None
     # base red: the merge commit and the next push to the base
     nxt = None
     if commits_ok and f.get("merge_commit_sha"):
-        chron = sorted(base_commits, key=lambda c: ((c.get("commit") or {}).get("committer") or {}).get("date") or "")
+        chron = base_order(base_commits)
         shas = [c["sha"] for c in chron]
         if f["merge_commit_sha"] in shas and shas.index(f["merge_commit_sha"]) + 1 < len(shas):
             nxt = chron[shas.index(f["merge_commit_sha"]) + 1]

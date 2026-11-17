@@ -384,6 +384,34 @@ class MainRed(unittest.TestCase):
         self.assertEqual([(e["pr"], e["fixer_pr"]) for e in eps], [(1, 2), (3, 4)])
 
 
+class BaseOrder(unittest.TestCase):
+    def c(self, sha, parent, date):
+        return {"sha": sha, "parents": [{"sha": parent}] if parent else [], "commit": {"committer": {"date": date}}}
+
+    def test_a_fast_forwarded_base_is_ordered_by_parents_not_by_commit_date(self):
+        # the queue fast-forwards: b was written before a but pushed after it
+        commits = [self.c("c", "b", T(10, "10:00")), self.c("a", "base", T(10, "12:00")), self.c("b", "a", T(10, "09:00")), self.c("base", None, T(10, "08:00"))]
+        self.assertEqual([x["sha"] for x in pm.base_order(commits)], ["base", "a", "b", "c"])
+
+    def test_without_parents_or_with_a_forked_history_it_falls_back_to_commit_date(self):
+        plain = [commit("y", date=T(10, "11:00")), commit("x", date=T(10, "10:00"))]
+        self.assertEqual([x["sha"] for x in pm.base_order(plain)], ["x", "y"])
+        forked = [self.c("a", "r", T(10, "10:00")), self.c("b", "r", T(10, "09:00")), self.c("r", None, T(10, "08:00"))]
+        self.assertEqual([x["sha"] for x in pm.base_order(forked)], ["r", "b", "a"])
+
+    def test_the_episode_uses_the_prs_merge_time_not_its_commit_date(self):
+        a, b = pr(1, T(10, "09:00"), T(10, "10:00")), pr(2, T(10, "09:00"), T(10, "10:30"))
+        a["merge_commit_sha"], b["merge_commit_sha"] = "ma" * 20, "mb" * 20
+        a["head"]["sha"], b["head"]["sha"] = "ha" * 20, "hb" * 20
+        red = [{"name": "T", "status": "completed", "conclusion": "failure", "started_at": T(10, "10:00")}]
+        ok = [{"name": "T", "status": "completed", "conclusion": "success", "started_at": T(10, "10:00")}]
+        base = [self.c("base0", None, T(10, "08:00")), self.c(a["merge_commit_sha"], "base0", T(10, "01:00")), self.c(b["merge_commit_sha"], a["merge_commit_sha"], T(10, "02:00"))]
+        gh = world([a, b], base_commits=base, checks={"base0": ok, a["merge_commit_sha"]: red, b["merge_commit_sha"]: ok, a["head"]["sha"]: ok})
+        with tempfile.TemporaryDirectory() as d:
+            eps, _ = pm.detect_main_red(pm.Reader(REPO, d, 100, gh), base, [a, b])
+        self.assertEqual((eps[0]["pr"], eps[0]["fixer_pr"], eps[0]["minutes_to_green"]), (1, 2, 30.0))  # 10:00 to 10:30, not 01:00 to 02:00
+
+
 class MainRedReads(Base):
     def merged(self):
         a, b = pr(1, T(10, "09:00"), T(10, "10:00")), pr(2, T(10, "09:00"), T(10, "11:00"))

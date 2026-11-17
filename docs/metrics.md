@@ -93,7 +93,7 @@ The detector reads the checks of every push to the base in the window (each cont
 with unfinished runs or an unread page says nothing and is skipped). An episode starts at the first push where a
 context is red that was not red before and is attributed to the PR whose merge commit that push is (a direct push,
 or a first usable push that is already red, has no PR). It ends at the push where its last context turns green; that
-push's PR is the fixer. The report prints counts and the raw minutes to green, with no rate and no median, plus
+push's PR is the fixer. Pushes are ordered by first-parent links, not commit dates (a merge queue fast-forwards the base, so each commit keeps its own older date), and a PR's push time is its `merged_at`. The report prints counts and the raw minutes to green, with no rate and no median, plus
 `head red`: episodes whose PR's own final head was red in the same context when it merged. A known-incident control
 (`DEFAULT_CONTROLS[repo]["incident"] = [(escaped PR, fixer PR)]`) must be found: the report prints recall k/n, and a
 miss fails the control and withholds the change-failure cells only. `base_red` and the text-matched escape stay as
