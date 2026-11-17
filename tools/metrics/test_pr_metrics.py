@@ -793,7 +793,7 @@ class EjectionCause(Base):
 
 class HoldRounds(Base):
     def f(self, holds, pushes, merged=T(10, "12:00")):
-        return {"merged_at": merged, "hold_times": holds, "push_times": pushes}
+        return {"merged_at": merged, "hold_times": holds, "push_times": pushes, "timeline_complete": True, "commits_complete": True}
 
     def test_pushes_between_a_hold_and_the_next_hold_or_the_merge_are_its_repair_rounds(self):
         f = self.f([T(10, "10:00"), T(10, "11:00")], [T(10, "09:50"), T(10, "10:10"), T(10, "10:20"), T(10, "11:30")])
@@ -807,11 +807,16 @@ class HoldRounds(Base):
         self.assertEqual(pm.hold_rounds(self.f([], [T(10, "10:10")])), [])
         self.assertIsNone(pm.hold_rounds(self.f([T(10, "10:00")], [], merged=None)))
 
+    def test_an_incomplete_timeline_or_commit_read_gives_no_rounds(self):
+        f = self.f([T(10, "10:00")], [T(10, "10:10")])
+        for k in ("timeline_complete", "commits_complete"):
+            self.assertIsNone(pm.hold_rounds(dict(f, **{k: False})))
+
     def test_a_hold_posted_after_the_merge_is_not_counted(self):
         self.assertEqual(pm.hold_rounds(self.f([T(10, "10:00"), T(10, "12:30")], [T(10, "10:10")])), [1])
 
     def test_the_re_hold_rate_in_the_hold_table_is_over_the_same_merged_prs(self):
-        rows = [{"hold_rounds": [1, 1], "re_holds": 1}, {"hold_rounds": [0], "re_holds": 0}]
+        rows = [{"hold_rounds": [1, 1], "re_holds": 1}, {"hold_rounds": [0], "re_holds": 3}]  # the second's re-HOLDs came after its merge
         got = pm.hold_round_summary(rows)
         self.assertEqual((got["prs_with_hold"], got["re_hold_rate_pct"]), (2, 50.0))
 

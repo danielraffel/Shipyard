@@ -677,9 +677,10 @@ def cause_minutes(f, comp):
 
 def hold_rounds(f):
     """For a merged PR, one entry per HOLD: how many pushes (repair rounds) landed after it and before the next HOLD or the
-    merge. [] when it had no HOLD, None when it did not merge."""
+    merge. [] when it had no HOLD, None when it did not merge or its timeline or commits were not read in full (a missing
+    page could hide a HOLD or a push)."""
     m = iso(f.get("merged_at"))
-    if not m:
+    if not m or not reads_complete(f):
         return None
     holds = sorted(iso(x) for x in f.get("hold_times") or [] if iso(x) and iso(x) < m)  # a HOLD posted after the merge held nothing
     pushes = sorted(iso(x) for x in f.get("push_times") or [] if iso(x))
@@ -1128,9 +1129,10 @@ def hold_round_summary(merged):
     past (or was followed by another HOLD) without a single push."""
     per = [n for r in merged for n in (r.get("hold_rounds") or [])]
     held = [r for r in merged if r.get("hold_rounds")]
-    rehold = [r for r in held if r.get("re_holds")]
+    # re-HOLD on the same pre-merge sequence: a HOLD after a HOLD that got a repair push
+    rehold = [r for r in held if any(n > 0 for n in r["hold_rounds"][:-1])]
     return {"holds": len(per), "pushes_after_holds": sum(per), "mean": None if not per else round(sum(per) / len(per), 2),
-            "holds_without_push": sum(1 for n in per if n == 0),
+            "holds_without_push": sum(1 for n in per if n == 0), "prs_unread": sum(1 for r in merged if r.get("hold_rounds") is None),
             # the same merged cohort as the HOLD counts, so the table's columns describe one population
             "prs_with_hold": len(held), "re_hold_rate_pct": pct_of(len(rehold), len(held)), "re_hold_rate_ci95": wilson(len(rehold), len(held))}
 
