@@ -2118,6 +2118,72 @@ sys.stdout.buffer.write(data)
 ' "$1"
 }
 
+# `pr create` refuses to open a duplicate: an open pull request in the same
+# repository with the same base and the same head tree has an identical diff,
+# so a second one only splits review and CI. One GraphQL read lists the open
+# pull requests with their head trees. Best effort: any failure to read, or a
+# head it cannot resolve locally (a fork's `owner:branch`), lets the create
+# proceed. Operators can allow a deliberate re-open (docs/ghapp-guards.md).
+if [[ "${1:-} ${2:-}" == "pr create" && "${SHIPYARD_GHAPP_ALLOW_DUPLICATE_PR:-}" != 1 ]]; then
+    ghapp_dup_head=""
+    ghapp_dup_base=""
+    ghapp_dup_dry=0
+    ghapp_dup_args=("${@:3}")
+    ghapp_dup_i=0
+    while [[ "$ghapp_dup_i" -lt "${#ghapp_dup_args[@]}" ]]; do
+        ghapp_dup_arg="${ghapp_dup_args[$ghapp_dup_i]}"
+        case "$ghapp_dup_arg" in
+            --head=*) ghapp_dup_head="${ghapp_dup_arg#--head=}" ;;
+            -H=*) ghapp_dup_head="${ghapp_dup_arg#-H=}" ;;
+            --head|-H) ghapp_dup_i=$((ghapp_dup_i + 1)); ghapp_dup_head="${ghapp_dup_args[$ghapp_dup_i]:-}" ;;
+            --base=*) ghapp_dup_base="${ghapp_dup_arg#--base=}" ;;
+            -B=*) ghapp_dup_base="${ghapp_dup_arg#-B=}" ;;
+            --base|-B) ghapp_dup_i=$((ghapp_dup_i + 1)); ghapp_dup_base="${ghapp_dup_args[$ghapp_dup_i]:-}" ;;
+            --dry-run|-w|--web) ghapp_dup_dry=1 ;;
+        esac
+        ghapp_dup_i=$((ghapp_dup_i + 1))
+    done
+    if [[ "$ghapp_dup_dry" == 0 && "$repo" == */* && "$repo" != *://* ]]; then
+        if [[ -z "$ghapp_dup_head" ]]; then
+            ghapp_dup_head="$(PATH="$trusted_path" "$git_binary" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+        fi
+        ghapp_dup_tree=""
+        if [[ -n "$ghapp_dup_head" && "$ghapp_dup_head" != HEAD && "$ghapp_dup_head" != *:* ]]; then
+            ghapp_dup_tree="$(PATH="$trusted_path" "$git_binary" rev-parse --verify --quiet "refs/heads/${ghapp_dup_head}^{tree}" 2>/dev/null || \
+                PATH="$trusted_path" "$git_binary" rev-parse --verify --quiet "refs/remotes/origin/${ghapp_dup_head}^{tree}" 2>/dev/null || true)"
+        fi
+        if [[ -n "$ghapp_dup_tree" ]]; then
+            ghapp_dup_list="$(PATH="$trusted_path" "$gh_binary" api graphql \
+                -f query='query($owner:String!,$name:String!){repository(owner:$owner,name:$name){defaultBranchRef{name} pullRequests(states:OPEN,first:100,orderBy:{field:UPDATED_AT,direction:DESC}){nodes{number url baseRefName headRefName isCrossRepository headRef{target{... on Commit{tree{oid}}}}}}}}' \
+                -f owner="${repo%%/*}" -f name="${repo#*/}" 2>/dev/null || true)"
+            if [[ -n "$ghapp_dup_list" ]]; then
+                ghapp_dup_found="$(printf '%s' "$ghapp_dup_list" | "$python_binary" -I -c '
+import json, sys
+tree, base, head = sys.argv[1:4]
+try:
+    repository = json.load(sys.stdin)["data"]["repository"]
+    base = base or repository["defaultBranchRef"]["name"]
+    for node in repository["pullRequests"]["nodes"]:
+        if node.get("isCrossRepository") or node.get("headRefName") == head:
+            continue
+        oid = (((node.get("headRef") or {}).get("target") or {}).get("tree") or {}).get("oid")
+        if oid == tree and node.get("baseRefName") == base:
+            print("{} {}".format(node["number"], node["url"]))
+            break
+except Exception:
+    pass
+' "$ghapp_dup_tree" "$ghapp_dup_base" "$ghapp_dup_head" 2>/dev/null || true)"
+                if [[ -n "$ghapp_dup_found" ]]; then
+                    echo "ghapp: refusing to open a duplicate pull request: ${ghapp_dup_found#* } (#${ghapp_dup_found%% *}) is open against the same base with an identical diff. Update that pull request instead." >&2
+                    exit 1
+                fi
+            fi
+        fi
+    fi
+    unset ghapp_dup_head ghapp_dup_base ghapp_dup_dry ghapp_dup_args ghapp_dup_i ghapp_dup_arg \
+        ghapp_dup_tree ghapp_dup_list ghapp_dup_found
+fi
+
 # `pr create` registers its session as the pull request's owner, as `shipyard
 # pr` does, so the relay can reach the session when the PR needs it. Best
 # effort: it never changes gh's stdout or exit code, and `shipyard owner

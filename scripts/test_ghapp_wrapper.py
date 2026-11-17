@@ -2582,6 +2582,75 @@ class GhappWrapperTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.gh_log.read_text(), "the body\n")
 
+    def make_duplicate_fixture(self, other_base: str = "main") -> None:
+        """A checkout on branch `feature`, and a gh whose open-PR list holds
+        one pull request with the same head tree (and `other_base`)."""
+        env = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
+        def git(*args: str) -> str:
+            return subprocess.run(
+                ["git", *args], cwd=self.root, env=env, text=True, check=True,
+                capture_output=True,
+            ).stdout.strip()
+        git("init", "-q", "-b", "feature")
+        (self.root / "f.txt").write_text("x\n")
+        git("add", "f.txt")
+        git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "c")
+        tree = git("rev-parse", "HEAD^{tree}")
+        listing = json.dumps({"data": {"repository": {
+            "defaultBranchRef": {"name": "main"},
+            "pullRequests": {"nodes": [{
+                "number": 555, "url": "https://github.com/owner/repo/pull/555",
+                "baseRefName": other_base, "headRefName": "other",
+                "isCrossRepository": False,
+                "headRef": {"target": {"tree": {"oid": tree}}},
+            }]},
+        }}})
+        (self.root / "graphql.json").write_text(listing)
+        self.gh.write_text(
+            "#!/bin/sh\n"
+            "if [ \"$1 $2\" = 'api graphql' ]; then cat \"$GRAPHQL_FIXTURE\"; exit 0; fi\n"
+            "printf '%s\\n' \"$*\" > \"$GH_LOG\"\n"
+            "printf '%s\\n' https://github.com/owner/repo/pull/556\n",
+            encoding="utf-8",
+        )
+        self.gh.chmod(0o755)
+        self.environment["GRAPHQL_FIXTURE"] = str(self.root / "graphql.json")
+
+    def test_pr_create_refuses_a_duplicate_of_an_open_pull_request(self) -> None:
+        self.make_duplicate_fixture()
+        result = self.run_wrapper(
+            "pr", "create", "--title", "x", "--body", "y", "--repo", "owner/repo"
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("#555", result.stderr)
+        self.assertIn("/pull/555", result.stderr)
+        self.assertFalse(self.gh_log.exists(), "gh pr create must not run")
+        self.assertEqual(self.owner_register_calls(), [])
+
+    def test_pr_create_allows_the_same_tree_on_a_different_base(self) -> None:
+        self.make_duplicate_fixture(other_base="release")
+        result = self.run_wrapper(
+            "pr", "create", "--title", "x", "--body", "y", "--repo", "owner/repo"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.gh_log.exists())
+
+    def test_pr_create_duplicate_guard_honours_the_operator_override(self) -> None:
+        self.make_duplicate_fixture()
+        self.environment["SHIPYARD_GHAPP_ALLOW_DUPLICATE_PR"] = "1"
+        result = self.run_wrapper(
+            "pr", "create", "--title", "x", "--body", "y", "--repo", "owner/repo"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("SHIPYARD_GHAPP_ALLOW_DUPLICATE_PR", result.stderr)
+
+    def test_the_duplicate_refusal_does_not_name_its_override(self) -> None:
+        self.make_duplicate_fixture()
+        result = self.run_wrapper(
+            "pr", "create", "--title", "x", "--body", "y", "--repo", "owner/repo"
+        )
+        self.assertNotIn("ALLOW", result.stderr)
+
     def test_a_pr_create_dry_run_registers_nothing(self) -> None:
         self.write_create_gh("https://github.com/owner/repo/pull/77")
         result = self.run_wrapper(
