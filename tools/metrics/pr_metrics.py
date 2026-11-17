@@ -52,8 +52,8 @@ APP_LOGINS = {"shipyard-local[bot]", "shipyard-local"}
 _GUARD = []
 SIGNALS = ("app_opener", "provenance", "trailer", "session_stamp")
 BAD_CONCLUSIONS = {"failure", "timed_out"}
-FACTS_VERSION = 11
-COMPUTE_VERSION = 4  # compute caches: entries written before this could be marked complete from a partial timeline or commit read
+FACTS_VERSION = 12
+COMPUTE_VERSION = 5  # compute caches: entries written before this could be marked complete from a partial timeline or commit read
 CHECKS_VERSION = 2  # derived correctness caches: entries written before this (incomplete pagination read as clean) are read again
 ESCAPE_WINDOW = dt.timedelta(days=14)
 HORIZON = dt.timedelta(hours=48)
@@ -379,6 +379,7 @@ def pr_facts(rd, pr, owner):
             else:
                 owner_events.append([ev, ts])
     dequeue_times = [e.get("created_at") for e in tl if ejection(e, pr.get("merged_at")) and e.get("created_at")]
+    forced = [e["created_at"] for e in tl if e.get("event") == "head_ref_force_pushed" and e.get("created_at")]  # observed head updates
     heads = {pr["head"]["sha"]}
     for e in tl:
         if e.get("event") == "head_ref_force_pushed":
@@ -419,7 +420,8 @@ def pr_facts(rd, pr, owner):
         "agent_trailer": trailer, "stamp_commit": stamp_commit, "ambiguous_commits": sorted(set(ambiguous)),
         "repair_cycles": len(repairs), "holds": len(holds), "re_holds": re_holds, "size": size,
         "pushes": split, "enqueues": enqueues, "enqueue_times": enqueue_times, "dequeue_times": dequeue_times,
-        "hold_times": sorted(holds), "push_times": sorted(fmt(d) for _, d in pushes.values()), "ejections": ejections,
+        "hold_times": sorted(holds), "push_times": sorted({fmt(d) for _, d in pushes.values()} | set(forced)), "push_times_observed": sorted(forced),
+        "ejections": ejections,
         "labels": sorted(l["name"] for l in pr.get("labels") or []),
         "heads": sorted(heads), "timeline_complete": tl_full, "commits_complete": c_full,
     }
@@ -583,16 +585,19 @@ def push_repeats_of_group_shas(runs):
 CAUSES = ("hold", "red", "queue", "runner", "dirty")
 
 
-def _wait_until_next(starts, nexts, merged):
-    """Minutes from each start to the next `nexts` event after it, or to the merge when none follows."""
+def _wait_until_next(starts, nexts, merged, observed=None):
+    """(minutes, estimated): from each start to the next `nexts` event after it, or to the merge when none follows. With
+    `observed` (the head-update times seen on the timeline), a wait that ends at any other time ends at an estimate."""
     nexts = sorted(iso(x) for x in nexts if iso(x))
-    total = 0.0
+    seen = {iso(x) for x in observed or ()}
+    total, estimated = 0.0, False
     for st in sorted(iso(x) for x in starts if iso(x)):
         if st > merged:
             continue
         end = next((n for n in nexts if n > st), None)
+        estimated = estimated or (end is not None and end <= merged and observed is not None and end not in seen)
         total += ((min(end, merged) if end else merged) - st).total_seconds() / 60.0
-    return round(total, 1)
+    return round(total, 1), estimated
 
 
 def path_of(f, comp):
@@ -621,10 +626,14 @@ def cause_minutes(f, comp):
     if not m or not reads_complete(f):  # a partial timeline or commit list omits holds, pushes and queue events: no number, not an undercount
         return None
     done = comp and comp.get("complete")
-    return {"hold": _wait_until_next(f.get("hold_times") or [], f.get("push_times") or [], m),
-            "red": _wait_until_next(comp.get("red_events") or [], f.get("push_times") or [], m) if done else None,
-            "queue": _wait_until_next(f.get("enqueue_times") or [], f.get("dequeue_times") or [], m),
-            "runner": comp.get("runner_wait_min") if done else None, "dirty": None}  # None when the jobs were not read
+    pushes, observed = f.get("push_times") or [], f.get("push_times_observed") or []
+    hold, est_h = _wait_until_next(f.get("hold_times") or [], pushes, m, observed)
+    red, est_r = _wait_until_next(comp.get("red_events") or [], pushes, m, observed) if done else (None, False)
+    queue, _ = _wait_until_next(f.get("enqueue_times") or [], f.get("dequeue_times") or [], m)
+    # hold and red end at the next push; GitHub's timeline names a push time only for a force-push, so any other end is the
+    # commit's own date (never later than the push): flagged, so the report can say the endpoint is an estimate
+    return {"hold": hold, "red": red, "queue": queue, "runner": comp.get("runner_wait_min") if done else None, "dirty": None,
+            "estimated_endpoints": est_h or est_r}  # runner None when the jobs were not read
 
 
 def enqueue_to_merge(f):
@@ -682,9 +691,18 @@ def pr_compute(rd, f, runs, runs_complete):
         mac += m
         wait += w
         complete = complete and ok
-        if (r.get("head_sha") in heads and r.get("event") != "merge_group"
-                and r.get("conclusion") in BAD_CONCLUSIONS and r.get("updated_at")):
+        on_head = r.get("head_sha") in heads and r.get("event") != "merge_group"
+        if on_head and r.get("conclusion") in BAD_CONCLUSIONS and r.get("updated_at"):
             red_events.append(r["updated_at"])  # any failed non-merge-group run on one of the PR's heads
+        elif on_head and (r.get("run_attempt") or 1) > 1:
+            # a rerun keeps the run id and shows only its latest attempt: an earlier attempt that failed is a red the list hides
+            try:
+                for k in range(1, r["run_attempt"]):
+                    prev = rd.get(f"actions/runs/{r['id']}/attempts/{k}")
+                    if prev.get("conclusion") in BAD_CONCLUSIONS and prev.get("updated_at"):
+                        red_events.append(prev["updated_at"])
+            except ReadError:
+                complete = False  # the earlier attempts could not be read: whether this PR went red is unknown
         level = by_wf.setdefault(r.get("name") or "?", {"pull_request": 0, "merge_group": 0, "push": 0, "other": 0})
         ev = r.get("event")
         level[ev if ev in ("merge_group", "push") else "pull_request" if ev in ("pull_request", "pull_request_target") else "other"] += 1
@@ -848,16 +866,18 @@ def path_summary(merged):
     causes = {}
     for c in CAUSES:
         vals = [r["cause_min"][c] for r in slow if r.get("cause_min") and r["cause_min"].get(c) is not None]
-        causes[c] = round(sum(vals) / len(merged), 2) if vals and merged else None
-    known = {c: v for c, v in causes.items() if v is not None}
+        # the mean of the slow PRs the cause was measured for, with that n out of all slow PRs: never divided by PRs it was not measured for
+        causes[c] = {"n": len(vals), "of_slow": len(slow), "mean_min": round(sum(vals) / len(vals), 1) if vals else None}
+    known = {c: v["mean_min"] for c, v in causes.items() if v["mean_min"] is not None}
     return {
         "merged": len(merged), "unknown": len(merged) - len(clean) - len(slow),
         "clean": {"n": len(clean), "median_min": med(lead(clean)), "p90_min": pctile(lead(clean), 0.9)},
         "slow": {"n": len(slow), "median_min": med(lead(slow)), "p90_min": pctile(lead(slow), 0.9)},
         "slow_share_pct": pct_of(len(slow), len(slow) + len(clean)),
         "slow_reasons": dict(collections.Counter(w for r in slow for w in r["path_why"]).most_common()),
-        "cause_min_per_merge": causes, "top_cause": max(known, key=known.get) if known else None,
-        "note": "causes overlap and are not additive; dirty is not measured",
+        "cause_min": causes, "top_cause": max(known, key=known.get) if known else None,
+        "estimated_endpoints": sum(1 for r in slow if (r.get("cause_min") or {}).get("estimated_endpoints")),
+        "note": "causes overlap and are not additive; dirty is not measured; each cause is a mean over the slow PRs it was measured for",
     }
 
 
@@ -1389,14 +1409,14 @@ def markdown(e2e):
     if e2e.get("window"):
         L += ["### Clean and slow paths (window, merged PRs)", "",
               "A merged PR is slow when it had any HOLD, a failed run on a head, an ejection from the queue or a DIRTY tick; clean when none, with compute read in full; "
-              "otherwise unknown (a failed run cannot be ruled out). Lead time is first ready to merge. Cause minutes are per merged PR over the slow PRs, overlap, "
+              "otherwise unknown (a failed run cannot be ruled out). Lead time is first ready to merge. Cause minutes are a mean over the slow PRs each cause was measured for (n out of all slow PRs, never divided by PRs it was not measured for), overlap, "
               "and are not additive; dirty is not measured.", "",
-              "| repo | merged | slow share | clean median (n) | slow median / p90 (n) | top cause | min per merge: hold / red / queue / runner | unknown path |", "|---|---|---|---|---|---|---|---|"]
+              "| repo | merged | slow share | clean median (n) | slow median / p90 (n) | top cause | mean min over the slow PRs measured (n/slow): hold / red / queue / runner | estimated endpoints | unknown path |", "|---|---|---|---|---|---|---|---|---|"]
         for repo, s_ in sorted(e2e["window"]["per_repo"].items()):
             p = s_["paths"]
-            cm = p["cause_min_per_merge"]
+            cm = {k: (f"{v['mean_min']} ({v['n']}/{v['of_slow']})" if v["n"] else "-") for k, v in p["cause_min"].items()}
             L.append(f"| {repo} | {p['merged']} | {p['slow_share_pct']}% | {p['clean']['median_min']} ({p['clean']['n']}) | {p['slow']['median_min']} / {p['slow']['p90_min']} ({p['slow']['n']}) | "
-                     f"{p['top_cause']} | {cm['hold']} / {cm['red']} / {cm['queue']} / {cm['runner']} | {p['unknown']} |")
+                     f"{p['top_cause']} | {cm['hold']} / {cm['red']} / {cm['queue']} / {cm['runner']} | {p['estimated_endpoints']} | {p['unknown']} |")
         L.append("")
     nf = (e2e.get("baseline") or {}).get("noise_floor")
     if nf:

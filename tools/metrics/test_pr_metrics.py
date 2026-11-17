@@ -338,14 +338,70 @@ class Paths(unittest.TestCase):
         self.assertEqual((p["clean"]["n"], p["clean"]["median_min"], p["slow"]["n"], p["slow"]["median_min"], p["slow"]["p90_min"], p["unknown"]),
                          (3, 50.0, 2, 250.0, 400.0, 1))
         self.assertEqual(p["slow_share_pct"], 40.0)  # unknown is in neither path
-        self.assertEqual((p["top_cause"], p["cause_min_per_merge"]["red"], p["cause_min_per_merge"]["hold"], p["cause_min_per_merge"]["dirty"]), ("red", 20.0, 5.0, None))
+        cm = p["cause_min"]
+        self.assertEqual((p["top_cause"], cm["red"]["mean_min"], cm["hold"]["mean_min"], cm["dirty"]["mean_min"], cm["dirty"]["n"]), ("red", 60.0, 15.0, None, 0))
         self.assertEqual(pm.path_summary([])["top_cause"], None)
+
+    def test_a_cause_is_averaged_over_the_slow_prs_it_was_measured_for_never_over_all_merged_prs(self):
+        row = lambda red: {"handoff_min": 100.0, "path": "slow", "path_why": ["hold"], "cause_min": {"hold": 0.0, "red": red, "queue": 0.0, "runner": None, "dirty": None}}
+        rows = [row(60.0), row(None), {"handoff_min": 50.0, "path": "clean", "path_why": [], "cause_min": None}]
+        cm = pm.path_summary(rows)["cause_min"]
+        self.assertEqual((cm["red"]["mean_min"], cm["red"]["n"], cm["red"]["of_slow"]), (60.0, 1, 2))  # not 60 / 3 merged or 60 / 2 slow
+        self.assertEqual((cm["runner"]["mean_min"], cm["runner"]["n"]), (None, 0))
+
+    def test_a_wait_that_ends_at_a_force_push_is_exact_and_one_that_ends_at_a_commit_date_is_flagged(self):
+        f = self.f(hold_times=[T(10, "10:00")], push_times=[T(10, "10:20")], push_times_observed=[T(10, "10:20")])
+        c = pm.cause_minutes(f, self.comp())
+        self.assertEqual((c["hold"], c["estimated_endpoints"]), (20.0, False))
+        est = pm.cause_minutes(dict(f, push_times_observed=[]), self.comp())
+        self.assertEqual((est["hold"], est["estimated_endpoints"]), (20.0, True))
 
     def test_the_report_prints_the_clean_and_slow_table(self):
         out = pm.build([REPO], tempfile.mkdtemp(), 50, OWNER, START, NOW, {}, {}, None, world([pr(1, T(10, "10:00"), T(10, "11:00"))]))
         md = pm.markdown(out)
         self.assertIn("### Clean and slow paths (window, merged PRs)", md)
         self.assertIn("| slow share | clean median (n) | slow median / p90 (n) | top cause |", md)
+
+
+class RerunAttempts(Base):
+    HEAD = f"h{1:040d}"[:40]
+
+    def world(self, attempt, prev_conclusion, readable=True):
+        p = pr(1, T(10, "09:00"), T(10, "11:00"))
+        run = {"id": 11, "name": "ci", "head_sha": self.HEAD, "event": "pull_request", "status": "completed", "conclusion": "success",
+               "head_branch": "feat", "run_attempt": attempt, "updated_at": T(10, "10:40")}
+        job = [{"labels": ["x"], "created_at": T(10, "10:00"), "started_at": T(10, "10:01"), "completed_at": T(10, "10:05"), "conclusion": "success"}]
+        gh = world([p], runs=[run], jobs={11: job})
+        if readable:
+            gh.routes.insert(0, (r"actions/runs/11/attempts/1", {"conclusion": prev_conclusion, "updated_at": T(10, "10:20")}))
+        return gh
+
+    def build_one(self, gh):
+        return pm.build([REPO], self.cache, 300, OWNER, START, NOW, {}, {}, None, gh, control=False)["repos"][REPO]["prs"][0]
+
+    def test_a_force_push_to_an_older_commit_ends_the_wait_at_the_force_push_not_at_the_merge(self):
+        p = pr(1, T(10, "10:00"), T(10, "12:00"))
+        tl = {1: [{"event": "commented", "user": {"login": "r"}, "created_at": T(10, "10:30"), "body": "HOLD: fix"},
+                  {"event": "head_ref_force_pushed", "actor": {"login": "x"}, "created_at": T(10, "10:50"), "after_sha": "o" * 40}]}
+        cm = {1: [commit("old", "x", "w", date=T(10, "09:00"))]}  # the commit is older than ready: it gives no push time by itself
+        out = self.build(world([p], tl, cm))
+        r = self.rows(out)[1]
+        self.assertEqual(r["cause_min"]["hold"], 20.0)  # 10:30 to the 10:50 force-push, not to the 12:00 merge
+        self.assertFalse(r["cause_min"]["estimated_endpoints"])
+
+    def test_a_failed_first_attempt_followed_by_a_passing_rerun_still_makes_the_pr_red(self):
+        r = self.build_one(self.world(2, "failure"))
+        self.assertEqual((r["path"], r["path_why"], r["compute"]["red_events"]), ("slow", ["red"], [T(10, "10:20")]))
+
+    def test_a_rerun_whose_first_attempt_passed_is_clean_and_a_first_run_reads_no_attempts(self):
+        self.assertEqual(self.build_one(self.world(2, "success"))["path"], "clean")
+        gh = self.world(1, "failure")
+        self.assertEqual(self.build_one(gh)["path"], "clean")
+        self.assertFalse([c for c in gh.calls if "/attempts/" in c])
+
+    def test_unreadable_earlier_attempts_leave_the_pr_unknown_not_clean(self):
+        r = self.build_one(self.world(2, "failure", readable=False))
+        self.assertEqual((r["compute"]["complete"], r["path"]), (False, None))
 
 
 class JobsSkippedHold(Base):
@@ -1316,7 +1372,7 @@ class SyntheticControl(unittest.TestCase):
             "push_repeats_of_group_shas": (lambda runs: (0, 0), None),
             "steward_evidence": (lambda rd, f: False, "attribution.steward_merges_recognised"),
             "path_of": (lambda f, comp: ("clean", []), "paths.slow.n"),
-            "cause_minutes": (lambda f, comp: {"hold": 0.0, "red": 0.0, "queue": 0.0, "runner": 0.0, "dirty": None}, "paths.cause_min_per_merge.red"),
+            "cause_minutes": (lambda f, comp: {"hold": 0.0, "red": 0.0, "queue": 0.0, "runner": 0.0, "dirty": None}, "paths.cause_min.red.mean_min"),
         }
         for name, (fn, expect) in cases.items():
             if expect is None:
@@ -1336,7 +1392,7 @@ class SyntheticControl(unittest.TestCase):
         out = pm.build([REPO], tempfile.mkdtemp(), 50, OWNER, START, NOW, {}, {}, None, world([pr(1, T(10, "10:00"), T(10, "11:00"))]))
         self.assertEqual(out["synthetic_control"]["status"], "pass")
         md = pm.markdown(out)
-        self.assertIn("**CONTROL PASS: 49 of 49", md)
+        self.assertIn("**CONTROL PASS: 54 of 54", md)
         self.assertIn("| ready day |", md)
 
     def test_a_repo_with_no_live_control_reads_synthetic_not_unchecked(self):

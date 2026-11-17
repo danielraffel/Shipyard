@@ -192,7 +192,9 @@ def expected():
         "paths.clean.median_min": round(statistics.median(c["delay"] for c in merged if not c.get("slow")), 1),
         "paths.slow.median_min": round(statistics.median(c["delay"] for c in slow), 1),
         "paths.slow.p90_min": sorted(c["delay"] for c in slow)[max(0, math.ceil(0.9 * len(slow)) - 1)],
-        **{f"paths.cause_min_per_merge.{k}": round(sum(c.get("cause_min", {}).get(k, 0) for c in slow) / len(merged), 2) for k in ("hold", "red", "queue", "runner")},
+        **{f"paths.cause_min.{k}.mean_min": round(sum(c.get("cause_min", {}).get(k, 0) for c in slow) / len(slow), 1) for k in ("hold", "red", "queue", "runner")},
+        **{f"paths.cause_min.{k}.n": len(slow) for k in ("hold", "red", "queue", "runner")},
+        "paths.estimated_endpoints": sum(1 for c in slow if "hold" in c.get("cause_min", {})),  # the held PR's waits end at commit-date pushes
         "correctness.bad": bad, "correctness.good": len(merged) - bad,
         "correctness.reverted": sum(1 for c in merged if c.get("reverted")),
         "correctness.base_red": sum(1 for c in merged if c.get("base_red")),
