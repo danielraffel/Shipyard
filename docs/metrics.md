@@ -38,7 +38,7 @@ it is on only when the tick passes `--e2e-cache DIR` (the daily run does, unless
 **Synthetic control (every report).** `tools/metrics/synthetic_control.py` holds fifteen invented PRs, each
 built to have one known outcome (autonomous, owner label, steward merge, unbound owner merge, unsigned owner
 PR, never merged, reverted, red base, escaped, twice held with repair and merge-main pushes, ejected from the
-queue, a gate-run fixture with repeats). `expected()` derives 58 numbers from that table with plain arithmetic
+queue, a gate-run fixture with repeats). `expected()` derives 60 numbers from that table with plain arithmetic
 and never calls the scorecard; the real `pr_metrics.build` then runs over the same PRs, served from memory (no
 GitHub read, a throwaway cache), and every number must match. The report prints one line, `CONTROL PASS` with the
 count and the largest delta, or `CONTROL FAIL` with each missed number, its expected value, its value and the delta.
@@ -98,6 +98,16 @@ push's PR is the fixer. The report prints counts and the raw minutes to green, w
 (`DEFAULT_CONTROLS[repo]["incident"] = [(escaped PR, fixer PR)]`) must be found: the report prints recall k/n, and a
 miss fails the control and withholds the change-failure cells only. `base_red` and the text-matched escape stay as
 they were and will be retired once the episodes are audited by hand.
+
+## Merge-queue ejections and their cause
+
+The REST timeline's `removed_from_merge_queue` event names no reason, so every removal read as `unknown`, including
+the removal that happens when a PR merges (781 of 781 in the 2026-11-09 to 11-15 cache). For a PR with such a removal
+the scorecard now asks GraphQL once (`RemovedFromMergeQueueEvent.reason`, lowercased, matched to the REST event by
+time; ported from the m3 fleet-metrics parser). A reason of `merged` or `already_merged` is the merge, not an
+ejection. A PR whose cause could not be read keeps `unknown`, is not cached and is read again next run. The report
+prints ejections, ejections per merged PR, the top cause and the unknown-cause count. GraphQL goes through `ghapp`
+(the read-only reader has no GraphQL route) and counts against the read cap like any read.
 
 ## Sample and comparison
 
