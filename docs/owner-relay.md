@@ -117,7 +117,7 @@ The fallback chain, first success wins:
 
 **Unowned pull requests.** An open, non-draft pull request with no owner marker
 and no stored record is tracked when the repository has a
-`relay.repo."<repo>".lead` (up to 30 per repository per pass; without a lead
+`relay.repo."<repo>".lead` (among the newest 100 open ones; without a lead
 nothing is tracked). The lead hears only what needs an author: a HOLD at the
 current head, red required checks, a conflict (`DIRTY`), an ejection or an
 `overdue` notice, never a merge, a green check, a claim or an approval. Its

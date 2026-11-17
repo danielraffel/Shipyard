@@ -21,8 +21,6 @@ const ACT_WINDOW_HOURS: i64 = 24;
 /// How long a finished pull request stays in the state, so a stored owner
 /// record does not bring it back as new.
 const DONE_RETENTION_DAYS: i64 = 30;
-/// Unowned pull requests tracked per repository per pass: bounds the query.
-const MAX_UNOWNED_TRACKED: usize = 30;
 
 /// GraphQL: post one comment on a pull request (the last fallback).
 pub(crate) const ADD_COMMENT_MUTATION: &str = "mutation($id:ID!,$body:String!){addComment(input:{subjectId:$id,body:$body}){commentEdge{node{id}}}}";
@@ -277,9 +275,9 @@ fn run_repo(
     }
     // Open pull requests nobody registered: with a lead configured they are
     // tracked too, so an event that needs an author's action reaches the lead
-    // instead of nobody. Bounded per pass; a registered owner always wins.
+    // instead of nobody. Bounded by the discovery page (100); a registered owner always wins.
     if input.config.fallbacks(repo).lead.is_some() {
-        for number in read.unmarked.iter().take(MAX_UNOWNED_TRACKED) {
+        for number in read.unmarked.iter() {
             let entry = state
                 .prs
                 .entry(key(repo, *number))
@@ -322,10 +320,16 @@ fn run_repo(
         }
         tracked.missing_passes = 0;
         // A stored unowned pull request stays eligible only while the lead is
-        // configured and it is still an open, non-draft, unmarked one.
+        // configured and it is not a draft (read from its own fetch, not from
+        // the discovery page, which holds only the newest 100 open ones).
+        let is_draft = node
+            .as_ref()
+            .and_then(|n| n.get("isDraft"))
+            .and_then(Value::as_bool)
+            == Some(true);
         if tracked.owner.is_none()
             && digest.state == "OPEN"
-            && (input.config.fallbacks(repo).lead.is_none() || !read.unmarked.contains(number))
+            && (input.config.fallbacks(repo).lead.is_none() || is_draft)
         {
             continue;
         }
