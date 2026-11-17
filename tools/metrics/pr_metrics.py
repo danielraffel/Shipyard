@@ -52,7 +52,7 @@ APP_LOGINS = {"shipyard-local[bot]", "shipyard-local"}
 _GUARD = []
 SIGNALS = ("app_opener", "provenance", "trailer", "session_stamp")
 BAD_CONCLUSIONS = {"failure", "timed_out"}
-FACTS_VERSION = 10
+FACTS_VERSION = 11
 COMPUTE_VERSION = 4  # compute caches: entries written before this could be marked complete from a partial timeline or commit read
 CHECKS_VERSION = 2  # derived correctness caches: entries written before this (incomplete pagination read as clean) are read again
 ESCAPE_WINDOW = dt.timedelta(days=14)
@@ -62,7 +62,14 @@ UNKNOWN_RANGE_SHARE = 0.20
 SCORECARD_VERSION = "2026-11-17.1"
 MERGE_MAIN_RE = re.compile(r"^Merge (remote-tracking )?branch '?(origin/)?(main|master)'?|^Merge pull request .* from .*/main", re.I)
 # Positive controls: a real revert (#124 reverted #119), a real escaped defect (#126 names #116).
-DEFAULT_CONTROLS = {"danielraffel/fleet-handbook": {"revert": [(119, 124)], "escape": [(116, 126)]}}  # "owner": [pr, ...] pins PRs with a hand-verified owner action
+# Pulp: two escapes verified by hand from main-red traces. #12219 landed red on Workflow lint and
+# #12375 fixed it; #12338 broke the WAM link and #12384 fixed it. Neither fix names the PR it fixes,
+# so the text-based escape detector misses both, and the Pulp escaped metric is withheld until it can
+# find them.
+DEFAULT_CONTROLS = {  # "owner": [pr, ...] pins PRs with a hand-verified owner action
+    "danielraffel/fleet-handbook": {"revert": [(119, 124)], "escape": [(116, 126)]},
+    "Generous-Corp/pulp": {"escape": [(12219, 12375), (12338, 12384)]},
+}
 # Labels that take a PR out of the eligible cohort, with the reason reported.
 # The gate-proof workflows whose runs per merged PR are reported by name, per repo; any other repo shows its busiest workflows.
 PROOF_WORKFLOWS = {"Generous-Corp/vellum": ("Locked macOS GPU proof",)}
@@ -223,6 +230,20 @@ def trust_policy(rd, base):
     return pol
 
 
+MERGE_REMOVAL_WINDOW = dt.timedelta(minutes=2)
+
+
+def ejection(e, merged):
+    """Whether a timeline event is a removal from the merge queue that is an ejection. The REST event names no reason, and GitHub
+    records a removal when a PR merges, so a removal within two minutes before the merge is the merge, not an ejection (the
+    rule the m3 fleet-metrics parser uses); one that says `merged` is the merge too, and a removal after the merge cannot be an
+    ejection of the merged PR."""
+    if e.get("event") not in ("removed_from_merge_queue", "dequeued") or (e.get("reason") or "unknown") in ("merged", "already_merged"):
+        return False
+    t, m = iso(e.get("created_at")), iso(merged)
+    return not (t and m and m - t <= MERGE_REMOVAL_WINDOW)
+
+
 def steward_seq(pr, tl):
     """The events that bear on how a PR reached its merge, in the timeline's own order and up to the merge, with no
     dates involved: ["push", sha] (a commit or force-push that moved the head), ["enq", head-then] (an enqueue by the fleet
@@ -242,7 +263,7 @@ def steward_seq(pr, tl):
         if ev in ("committed", "head_ref_force_pushed"):
             cur = e.get("sha") if ev == "committed" else e.get("after_sha")
             seq.append(["push", cur])
-        elif ev in ("removed_from_merge_queue", "dequeued") and (e.get("reason") or "unknown") != "merged":
+        elif ejection(e, pr.get("merged_at")):
             seq.append(["remove"])
         elif ev in ("added_to_merge_queue", "enqueued") and login in APP_LOGINS:
             seq.append(["enq", cur])
@@ -346,7 +367,7 @@ def pr_facts(rd, pr, owner):
             enqueues += 1
             if ts:
                 enqueue_times.append(ts)
-        if ev in ("removed_from_merge_queue", "dequeued") and (e.get("reason") or "unknown") != "merged":
+        if ejection(e, pr.get("merged_at")):
             ejections.append(e.get("reason") or "unknown")
         if ev not in ACTION_EVENTS:
             continue
@@ -357,8 +378,7 @@ def pr_facts(rd, pr, owner):
                 agent_events.append([ev, ts])
             else:
                 owner_events.append([ev, ts])
-    dequeue_times = [e.get("created_at") for e in tl
-                     if e.get("event") in ("removed_from_merge_queue", "dequeued") and (e.get("reason") or "unknown") != "merged" and e.get("created_at")]
+    dequeue_times = [e.get("created_at") for e in tl if ejection(e, pr.get("merged_at")) and e.get("created_at")]
     heads = {pr["head"]["sha"]}
     for e in tl:
         if e.get("event") == "head_ref_force_pushed":
@@ -598,13 +618,13 @@ def cause_minutes(f, comp):
     can wait at once), so they are not additive. hold: from each HOLD to the next push; red: from a failed head run to the
     next push; queue: from each enqueue to its removal or the merge; runner: queued job time; dirty: not measured."""
     m = iso(f.get("merged_at"))
-    if not m:
+    if not m or not reads_complete(f):  # a partial timeline or commit list omits holds, pushes and queue events: no number, not an undercount
         return None
     done = comp and comp.get("complete")
     return {"hold": _wait_until_next(f.get("hold_times") or [], f.get("push_times") or [], m),
             "red": _wait_until_next(comp.get("red_events") or [], f.get("push_times") or [], m) if done else None,
             "queue": _wait_until_next(f.get("enqueue_times") or [], f.get("dequeue_times") or [], m),
-            "runner": comp.get("runner_wait_min") if done else None, "dirty": None}
+            "runner": comp.get("runner_wait_min") if done else None, "dirty": None}  # None when the jobs were not read
 
 
 def enqueue_to_merge(f):
@@ -618,12 +638,17 @@ def enqueue_to_merge(f):
 def load_compute(rd, number, f=None):
     """A cached compute reduction, or None when absent or written before COMPUTE_VERSION (recomputed). With `f`, an
     entry is never complete while that PR's own timeline or commit read is incomplete (the heads came from them)."""
+    if not READ_JOB_MINUTES:  # a cached entry carries job minutes this run is meant to leave empty
+        return None
     c = rd.load("compute", str(number))
     if c is None or c.get("v") != COMPUTE_VERSION or not c.get("complete"):
         return None
     if f is not None and not reads_complete(f):
         return None
     return c
+
+
+READ_JOB_MINUTES = True  # False skips the per-run jobs reads (the bulk of the reads): runs, failed head runs and paths still work
 
 
 def pr_compute(rd, f, runs, runs_complete):
@@ -650,7 +675,8 @@ def pr_compute(rd, f, runs, runs_complete):
     mac = wait = 0.0
     by_wf, red_events = {}, []
     for r in mine.values():
-        a, b, m, w, ok = job_minutes(rd, r)
+        # skipping the jobs reads must not hide an unfinished run: its outcome is still unknown, so the PR is not clean
+        a, b, m, w, ok = job_minutes(rd, r) if READ_JOB_MINUTES else (0.0, 0.0, 0.0, 0.0, r.get("status") == "completed")
         sh += a
         ho += b
         mac += m
@@ -661,7 +687,9 @@ def pr_compute(rd, f, runs, runs_complete):
         level = by_wf.setdefault(r.get("name") or "?", {"pull_request": 0, "merge_group": 0, "push": 0, "other": 0})
         ev = r.get("event")
         level[ev if ev in ("merge_group", "push") else "pull_request" if ev in ("pull_request", "pull_request_target") else "other"] += 1
-    return {"self_hosted_min": round(sh, 1), "hosted_min": round(ho, 1), "macos_min": round(mac, 1), "runner_wait_min": round(wait, 1), "red_events": sorted(red_events), "by_workflow": by_wf,
+    j = READ_JOB_MINUTES  # job-derived numbers are None, never a measured zero, when the jobs were not read
+    return {"self_hosted_min": round(sh, 1) if j else None, "hosted_min": round(ho, 1) if j else None, "macos_min": round(mac, 1) if j else None,
+            "runner_wait_min": round(wait, 1) if j else None, "jobs_read": j, "red_events": sorted(red_events), "by_workflow": by_wf,
             "runs": len(mine), "repeat_runs": repeats,
             "group_runs": sum(1 for r in mine.values() if r.get("event") == "merge_group"), "complete": complete}
 
@@ -1020,6 +1048,7 @@ def summarize(rows):
     merged = [r for r in rows if r["merged"]]
     hand = [r["handoff_min"] for r in merged]
     comp = [r for r in merged if r["compute"] and r["compute"]["complete"]]
+    jobs_comp = [r for r in comp if r["compute"].get("jobs_read", True)]  # minutes come only from PRs whose jobs were read
     held = [r for r in rows if r["holds"]]
     rehold = [r for r in held if r["re_holds"]]
     by_size = {}
@@ -1077,10 +1106,10 @@ def summarize(rows):
             "runs_mean": None if not comp else round(sum(r["compute"]["runs"] for r in comp) / len(comp), 2),
             "repeat_runs_total": sum(r["compute"]["repeat_runs"] for r in comp),
             "runs_total": sum(r["compute"]["runs"] for r in comp),
-            "context_self_hosted_min_median": med([r["compute"]["self_hosted_min"] for r in comp]),
-            "context_hosted_min_median": med([r["compute"]["hosted_min"] for r in comp]),
-            "macos_min_mean": None if not comp else round(sum(r["compute"]["macos_min"] for r in comp) / len(comp), 1),
-            "macos_min_median": med([r["compute"]["macos_min"] for r in comp]),
+            "context_self_hosted_min_median": med([r["compute"]["self_hosted_min"] for r in jobs_comp]),
+            "context_hosted_min_median": med([r["compute"]["hosted_min"] for r in jobs_comp]),
+            "macos_min_mean": None if not jobs_comp else round(sum(r["compute"]["macos_min"] for r in jobs_comp) / len(jobs_comp), 1),
+            "macos_min_median": med([r["compute"]["macos_min"] for r in jobs_comp]),
             "by_workflow": workflow_means(comp),
         },
         "correctness": {
@@ -1196,7 +1225,7 @@ def collect_repo(repo, cache_dir, cap, owner, lo, hi, now, ticks, tick_ctx, fetc
             if comp is None and runs_ok:
                 try:
                     comp = pr_compute(rd, f, runs, runs_ok)
-                    if comp["complete"]:
+                    if comp["complete"] and comp["jobs_read"]:  # minutes not read: do not cache, a full read recomputes
                         rd.save("compute", str(f["number"]), dict(comp, v=COMPUTE_VERSION))
                 except (Truncated, ReadError):
                     comp = None

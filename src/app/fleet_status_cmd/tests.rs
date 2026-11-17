@@ -1,3 +1,4 @@
+use super::assessment::ShipyardInstall;
 use super::*;
 use crate::fleet_slot::QueuedJobState;
 
@@ -755,6 +756,7 @@ fn analyze_host_scopes_health_to_requested_target() {
             disk_floor_kibibyte: DEFAULT_DISK_FLOOR_KIBIBYTE,
             ccache_size_kibibyte: Some(1),
             ccache_max_kibibyte: Some(2),
+            shipyard: ShipyardInstall::default(),
         },
         healthy_attestation(),
         FLEET_LANE_TARGET,
@@ -798,6 +800,7 @@ fn central_runner_inventory_supersedes_host_github_rate_limit_problem() {
         disk_floor_kibibyte: DEFAULT_DISK_FLOOR_KIBIBYTE,
         ccache_size_kibibyte: Some(1),
         ccache_max_kibibyte: Some(2),
+        shipyard: ShipyardInstall::default(),
     };
 
     let centrally_observed = analyze_host(
@@ -1982,6 +1985,7 @@ fn healthy_storage() -> StorageProbe {
         disk_floor_kibibyte: DEFAULT_DISK_FLOOR_KIBIBYTE,
         ccache_size_kibibyte: Some(1),
         ccache_max_kibibyte: Some(2),
+        shipyard: ShipyardInstall::default(),
     }
 }
 
@@ -2932,4 +2936,78 @@ fn a_degraded_routing_verdict_names_its_gap_on_both_surfaces() {
             .is_some_and(|reason| reason.contains("organization")),
         "the JSON surface must name the gap: {document}"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn storage_probe_reads_the_active_shipyard_and_the_hosts_freshness_verdict() {
+    let home = tempfile::tempdir().expect("home");
+    let bin = home.path().join(".local/bin");
+    std::fs::create_dir_all(&bin).expect("bin");
+    executable_script(&bin.join("shipyard"), "echo 'shipyard 0.439.2'");
+    let state = home.path().join(".tartci/state/tool-freshness");
+    std::fs::create_dir_all(&state).expect("state");
+    std::fs::write(
+        state.join("state.json"),
+        r#"{"measured_at":"2026-11-17T06:53:24Z","tools":{"shipyard":{"installed":"0.439.2","latest":"0.440.0","state":"behind"}}}"#,
+    )
+    .expect("state.json");
+
+    let output = Command::new("sh")
+        .args(["-c", &storage_probe_script(".")])
+        .env("HOME", home.path())
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .expect("sh");
+    let probe = storage_probe_from_output(&output, ".");
+
+    assert!(probe.readable, "{output:?}");
+    assert_eq!(probe.shipyard.version.as_deref(), Some("0.439.2"));
+    if cfg!(target_os = "macos") {
+        // An unsigned script is not the Developer ID release.
+        assert_eq!(probe.shipyard.identity.as_deref(), Some("not_release"));
+        assert_eq!(probe.shipyard.latest.as_deref(), Some("0.440.0"));
+        assert_eq!(probe.shipyard.freshness.as_deref(), Some("behind"));
+    }
+    // Informational only: never a storage problem.
+    assert!(storage_problems(&probe).is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn storage_probe_without_shipyard_stays_readable_and_reports_nothing() {
+    let home = tempfile::tempdir().expect("home");
+    let output = Command::new("sh")
+        .args(["-c", &storage_probe_script(".")])
+        .env("HOME", home.path())
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .expect("sh");
+    let probe = storage_probe_from_output(&output, ".");
+    assert!(probe.readable, "{output:?}");
+    assert_eq!(probe.shipyard, ShipyardInstall::default());
+    assert_eq!(probe.shipyard.summary(), None);
+}
+
+#[test]
+fn shipyard_install_summary_names_identity_and_drift() {
+    let release = ShipyardInstall {
+        version: Some("0.440.0".to_owned()),
+        identity: Some("release".to_owned()),
+        latest: Some("0.440.0".to_owned()),
+        freshness: Some("current".to_owned()),
+    };
+    assert_eq!(
+        release.summary().as_deref(),
+        Some("0.440.0, Developer ID release, current (latest 0.440.0)")
+    );
+    let local_build = ShipyardInstall {
+        version: Some("0.439.2".to_owned()),
+        identity: Some("not_release".to_owned()),
+        latest: Some("0.440.0".to_owned()),
+        freshness: Some("behind".to_owned()),
+    };
+    let line = local_build.summary().expect("line");
+    assert!(line.contains("NOT the Developer ID release"), "{line}");
+    assert!(line.ends_with("behind (latest 0.440.0)"), "{line}");
 }

@@ -168,6 +168,20 @@ fn write_fleet_headline<W: Write>(
     Ok(())
 }
 
+/// The host's Shipyard line (informational) and its storage problems.
+fn write_host_storage_lines<W: Write>(
+    stdout: &mut W,
+    host: &HostFleetStatus,
+) -> Result<(), CliFailure> {
+    if let Some(shipyard) = host.storage.shipyard.summary() {
+        writeln!(stdout, "    shipyard: {shipyard}").map_err(text_write_failure)?;
+    }
+    for problem in &host.storage_problems {
+        writeln!(stdout, "    storage: {problem}").map_err(text_write_failure)?;
+    }
+    Ok(())
+}
+
 fn write_fleet_text<W: Write>(stdout: &mut W, view: &FleetAssessment) -> Result<(), CliFailure> {
     write_fleet_headline(stdout, view)?;
     for host in &view.hosts {
@@ -190,11 +204,7 @@ fn write_fleet_text<W: Write>(stdout: &mut W, view: &FleetAssessment) -> Result<
             host.doctor.source
         )
         .map_err(text_write_failure)?;
-        if !host.storage_problems.is_empty() {
-            for problem in &host.storage_problems {
-                writeln!(stdout, "    storage: {problem}").map_err(text_write_failure)?;
-            }
-        }
+        write_host_storage_lines(stdout, host)?;
         for problem in &host.attestation_problems {
             writeln!(stdout, "    attestation: {problem}").map_err(text_write_failure)?;
         }

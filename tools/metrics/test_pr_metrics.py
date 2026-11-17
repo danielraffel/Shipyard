@@ -283,7 +283,14 @@ class ProofsAndQueue(Base):
 
 
 class Paths(unittest.TestCase):
-    F = {"holds": 0, "ejections": [], "merged_at": T(10, "12:00"), "hold_times": [], "push_times": [], "enqueue_times": [], "dequeue_times": []}
+    F = {"holds": 0, "ejections": [], "merged_at": T(10, "12:00"), "hold_times": [], "push_times": [], "enqueue_times": [], "dequeue_times": [],
+         "timeline_complete": True, "commits_complete": True}
+
+    def test_cause_minutes_are_none_when_the_timeline_or_the_commits_were_not_read_in_full(self):
+        f = self.f(hold_times=[T(10, "10:00")], push_times=[T(10, "10:20")])
+        self.assertEqual(pm.cause_minutes(f, self.comp())["hold"], 20.0)
+        self.assertIsNone(pm.cause_minutes(dict(f, timeline_complete=False), self.comp()))
+        self.assertIsNone(pm.cause_minutes(dict(f, commits_complete=False), self.comp()))
 
     def f(self, **kw):
         return dict(self.F, **kw)
@@ -534,6 +541,89 @@ class MainRedReads(Base):
         self.assertNotIn("not tracked:", md)  # nothing untracked in this small world
         out["repos"][REPO]["main_red"]["untracked_contexts"] = {"noisy": ["review-verdict"], "one_off": ["x", "y"]}
         self.assertIn(f"- {REPO}: not tracked: noisy gates review-verdict; 2 one-off contexts", pm.markdown(out))
+
+
+class JobsSkippedHold(Base):
+    """Findings of the review of the job-read switch."""
+    def run_skipped(self, runs, seed=None, jobs=None):
+        p = pr(1, T(10, "09:00"), T(10, "11:00"))
+        gh = world([p], runs=runs, jobs=jobs or {})
+        if seed is not None:
+            d = os.path.join(self.cache, REPO.replace("/", "__"), "compute")
+            os.makedirs(d)
+            with open(os.path.join(d, "1.json"), "w") as fh:
+                json.dump(seed, fh)
+        pm.READ_JOB_MINUTES = False
+        try:
+            return pm.build([REPO], self.cache, 200, OWNER, START, NOW, {}, {}, None, gh, control=False)
+        finally:
+            pm.READ_JOB_MINUTES = True
+
+    RUN = {"id": 11, "head_sha": f"h{1:040d}"[:40], "event": "pull_request", "head_branch": "feat"}
+
+    def test_an_unfinished_run_keeps_the_pr_unknown_when_job_reads_are_skipped(self):
+        out = self.run_skipped([dict(self.RUN, status="in_progress")])
+        r = out["repos"][REPO]["prs"][0]
+        self.assertEqual((r["compute"]["complete"], r["path"]), (False, None))
+        done = self.run_skipped([dict(self.RUN, status="completed", conclusion="success")])
+        self.assertEqual(done["repos"][REPO]["prs"][0]["path"], "clean")
+
+    def test_skipped_job_reads_report_no_minutes_not_zeros_and_the_summary_copes(self):
+        out = self.run_skipped([dict(self.RUN, status="completed", conclusion="success")])
+        c = out["repos"][REPO]["prs"][0]["compute"]
+        self.assertEqual((c["self_hosted_min"], c["hosted_min"], c["macos_min"], c["runner_wait_min"], c["jobs_read"]), (None, None, None, None, False))
+        s = pm.summarize([r for r in out["repos"][REPO]["prs"] if r["eligible"]])["compute_per_merged_pr"]
+        self.assertEqual((s["context_self_hosted_min_median"], s["macos_min_mean"], s["macos_min_median"], s["runs_total"]), (None, None, None, 1))
+
+    def test_a_cached_compute_entry_with_minutes_is_not_reused_when_job_reads_are_skipped(self):
+        seed = {"v": pm.COMPUTE_VERSION, "complete": True, "jobs_read": True, "self_hosted_min": 99.0, "hosted_min": 1.0, "macos_min": 5.0,
+                "runner_wait_min": 2.0, "red_events": [], "by_workflow": {}, "runs": 7, "repeat_runs": 0, "group_runs": 0}
+        out = self.run_skipped([dict(self.RUN, status="completed", conclusion="success")], seed)
+        c = out["repos"][REPO]["prs"][0]["compute"]
+        self.assertEqual((c["self_hosted_min"], c["runs"]), (None, 1))
+
+
+class JobsSkipped(Base):
+    runs = [{"id": 11, "head_sha": f"h{1:040d}"[:40], "event": "pull_request", "status": "completed", "head_branch": "feat"},
+            {"id": 12, "head_sha": "zzz", "event": "merge_group", "status": "completed", "head_branch": "gh-readonly-queue/main/pr-1-abc"}]
+
+    def test_without_job_reads_runs_and_failed_head_runs_still_count_and_nothing_is_cached(self):
+        runs = [dict(r, conclusion="failure", updated_at=T(10, "10:12")) for r in self.runs]
+        gh = world([pr(1, T(10, "09:00"), T(10, "11:00"))], runs=runs, jobs={})  # no jobs route: any jobs read would fail
+        pm.READ_JOB_MINUTES = False
+        try:
+            out = pm.build([REPO], self.cache, 200, OWNER, START, NOW, {}, {}, None, gh, control=False)  # the control reads jobs
+        finally:
+            pm.READ_JOB_MINUTES = True
+        r = self.rows(out)[1]
+        self.assertEqual((r["compute"]["runs"], r["compute"]["complete"], r["compute"]["runner_wait_min"], r["path"]), (2, True, None, "slow"))
+        self.assertIsNone(r["cause_min"]["runner"])
+        self.assertFalse([c for c in gh.calls if "/jobs" in c])
+        self.assertFalse(os.path.exists(os.path.join(self.cache, REPO.replace("/", "__"), "compute", "1.json")))
+
+
+class MergeRemoval(Base):
+    def test_a_removal_after_the_merge_is_not_an_ejection(self):
+        p = pr(1, T(10, "10:00"), T(10, "11:00"))
+        out = self.build(world([p], {1: [self.removal("11:05")]}))
+        self.assertEqual(self.rows(out)[1]["ejections"], [])
+
+    def removal(self, hm):
+        return {"event": "removed_from_merge_queue", "actor": {"login": "x"}, "created_at": T(10, hm)}
+
+    def test_the_removal_github_records_at_the_merge_is_not_an_ejection_but_an_earlier_one_is(self):
+        p = pr(1, T(10, "10:00"), T(10, "11:00"))
+        tl = {1: [self.removal("10:30"), self.removal("10:59"), self.removal("11:00")]}
+        out = self.build(world([p], tl))
+        r = self.rows(out)[1]
+        self.assertEqual(r["ejections"], ["unknown"])  # the 10:30 one only
+        self.assertEqual((r["path"], r["path_why"]), ("slow", ["ejection"]))
+
+    def test_a_pr_with_only_the_merge_removal_is_not_slow_for_an_ejection(self):
+        p = pr(1, T(10, "10:00"), T(10, "11:00"))
+        out = self.build(world([p], {1: [self.removal("11:00")]}))
+        r = self.rows(out)[1]
+        self.assertEqual((r["ejections"], "ejection" in r["path_why"]), ([], False))
 
 
 class Correctness(Base):
@@ -1175,6 +1265,26 @@ class Controls(Base):
         self.assertIn("CONTROL FAILED for some metrics", md)
         self.assertIn("| ready day |", md)  # the report is still printed
         self.assertIn("withheld", md)
+
+    def test_the_pulp_escape_controls_withhold_escapes_the_detector_cannot_find(self):
+        # The real fixes do not name the PR they fix, so the built-in controls must fail
+        # rather than let Pulp report zero escaped defects.
+        pulp = "Generous-Corp/pulp"
+        p12219 = pr(12219, T(13, "09:00"), T(14, "06:30"))
+        p12338 = pr(12338, T(15, "09:00"), T(15, "16:42"))
+        p12375 = pr(12375, T(15, "20:00"), T(16, "01:14"))
+        p12375["title"] = "fix(ci): review the cheap-first jobs in the pr_number dispatch allowlist"
+        p12384 = pr(12384, T(15, "22:00"), T(16, "04:16"))
+        p12384["title"] = "fix(web): link spectral_graph_persistence into the sample-region WASM closure"
+        prs = [p12219, p12338, p12375, p12384]
+        bc = [commit(p["merge_commit_sha"], date=p["merged_at"]) for p in prs]
+        ok = [{"name": "Test", "status": "completed", "conclusion": "success"}]
+        gh = world(prs, base_commits=bc, checks={p["merge_commit_sha"]: ok for p in prs})
+        out = pm.build([pulp], self.cache, 300, OWNER, START, self.LATE, {}, {}, None, gh)
+        c = out["repos"][pulp]["controls"]
+        self.assertEqual((c["status"], c["escape"]["expected"], c["escape"]["found"], c["disabled"]),
+                         ("failed", 2, 0, ["escaped"]))
+        self.assertTrue(out["controls_failed"])
 
     def test_refused_prs_are_context_and_never_fail_the_control(self):
         prs = [pr(1, T(10, "10:00"), T(10, "11:00"))]

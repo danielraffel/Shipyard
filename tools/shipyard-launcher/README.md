@@ -144,7 +144,16 @@ Still their own identities: the `com.danielraffel.fleet-pass.*` agents
 (installed from fleet-handbook; they need a `fleet-pass` allowlist entry),
 processes the tick detaches with `setsid` (once their responsible process
 exits, macOS attributes them to themselves), and tartci's agents
-(TartCILauncher.app).
+(TartCILauncher.app). The one detached process that runs Shipyard, the daily
+release rehearsal, is not among them when the tick runs under the launcher: the
+tick spawns `shipyard-launcher release-canary ...` with
+`responsibility_spawnattrs_setdisclaim`, so the launcher is its own responsible
+process and the Shipyard it runs inherits it. If the disclaim cannot be set the
+rehearsal runs directly and summary.log gets a
+`launcher-fallback reason=disclaim_unavailable FINDING` line; every rehearsal
+result line ends `launcher=app` or `launcher=direct`. drain watch and loss
+report run `/usr/bin/python3` and may call ghapp, which runs Shipyard; they
+stay their own identities.
 
 ## What the steward tick needs
 
@@ -165,7 +174,7 @@ inherits its Full Disk Access:
 | Child | How it is bound | What it can still reach |
 | --- | --- | --- |
 | The Shipyard release (`~/.local/bin/shipyard` resolved) | Developer ID, team `95CX6P84C4`, identifier `shipyard`, under `auth-generations/<id>/`, checked on the file and again on the suspended process; never older than the newest version run here (the floor) | Every tool Shipyard runs: `gh` (through the ghapp wrapper), `git`, `ssh`, `python3`, from its fixed tool path, which includes the user-writable `~/.local/bin` and `/opt/homebrew/bin` |
-| The steward tick (`~/.local/libexec/shipyard-steward-tick.sh`) | SHA-256 bound at deploy time; a verified private copy runs | `~/.local/bin/ghapp`, `~/.local/bin/shipyard`, `jq`, `timeout`, `git`, `/usr/bin/python3`, and the scripts the tick starts (fleet-deploy, drain watch, loss report; detached, so they keep the grant only while the tick runs) |
+| The steward tick (`~/.local/libexec/shipyard-steward-tick.sh`) | SHA-256 bound at deploy time; a verified private copy runs | `~/.local/bin/ghapp`, `~/.local/bin/shipyard`, `jq`, `timeout`, `git`, `/usr/bin/python3`, and the scripts the tick starts (fleet-deploy, drain watch, loss report; detached, so they keep the grant only while the tick runs). The release rehearsal (`release-canary`) is the exception: it runs through the launcher spawned with the responsibility disclaim, so it keeps the grant after the tick exits |
 
 The bindings hold against changes made by anything that does not also rewrite
 `~/.local/share/shipyard/launcher/activation.json`. That record, the tick's

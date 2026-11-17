@@ -829,6 +829,30 @@ pub fn is_review_gate(name: &str, approval_context: &str) -> bool {
             && name.eq_ignore_ascii_case(approval_context.trim()))
 }
 
+/// The text after a HOLD naming `head` in a review status description, when
+/// the status says a HOLD names this head: the approval status posts
+/// `a HOLD naming head <sha> ...`, and a path-scoped review status such as
+/// `release-path-review` posts `<paths>: a HOLD names head <sha> (comment
+/// <id>)`. `None` when no HOLD is named or it names another head.
+#[must_use]
+pub fn review_hold<'a>(description: &'a str, head: &str) -> Option<&'a str> {
+    let text = description.trim();
+    ["a HOLD names head ", "a HOLD naming head "]
+        .into_iter()
+        .find_map(|marker| text.split_once(marker))
+        .map(|(_, rest)| rest)
+        .filter(|rest| {
+            let short = rest
+                .split(|ch: char| !ch.is_ascii_hexdigit())
+                .next()
+                .unwrap_or("");
+            short.len() >= 7
+                && head
+                    .to_ascii_lowercase()
+                    .starts_with(&short.to_ascii_lowercase())
+        })
+}
+
 /// Why a red review status only waits on reviewers, read from its own
 /// description and bound to `head`: `approvals_missing` for "needs N counted
 /// APPROVEs of head <head> ...", `no_verdict` for "no reviewer verdict

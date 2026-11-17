@@ -48,7 +48,10 @@ nothing about live data. The live positive controls below stay as a second check
 
 A zero is printed with its positive control's count. Built-in controls: fleet-handbook #124 reverted
 #119 (the revert detector must find it) and #126's title names #116 (the escape detector must find
-it). `DEFAULT_CONTROLS` can also pin `"owner": [pr, ...]`, PRs with a hand-verified owner action that
+it). Pulp has two escape controls, both checked by hand against main-red traces: #12375 fixed
+#12219 (Workflow lint) and #12384 fixed #12338 (the WAM link). Neither fix names the PR it fixes, so
+the escape detector misses them and Pulp's escaped metric reads `withheld` until it can find them.
+`DEFAULT_CONTROLS` can also pin `"owner": [pr, ...]`, PRs with a hand-verified owner action that
 must read `owner_action`. PRs the ticks show as `direct_merge_refused` are counted for context only:
 that stop is a ruleset config gap, not an owner action, so they can legitimately read autonomous.
 A control whose PR is outside the window is "not in window" and unchecked. A control in the window
@@ -77,6 +80,11 @@ scorecard's own values, within 15%. The synthetic control covers these fields to
 
 ## Clean and slow paths
 
+An ejection is a removal from the merge queue other than the merge itself. GitHub records a removal when a PR merges
+and the REST timeline names no reason, so a removal within two minutes before `merged_at` (or one that says
+`merged`) is the merge, not an ejection (the rule the m3 fleet-metrics parser uses). Without it every merged PR
+read as ejected and as slow.
+
 Each merged PR is `slow` when it had any HOLD, a failed run on one of its heads, an ejection from the merge queue
 or a DIRTY tick; `clean` when none of these and its compute was read in full; otherwise `unknown` (a failed run
 cannot be ruled out without the run list), and unknown PRs are in neither path. The report gives the slow share
@@ -84,7 +92,7 @@ cannot be ruled out without the run list), and unknown PRs are in neither path. 
 with its n, and the minutes per merged PR that each cause held the slow PRs up: HOLD (each HOLD to the next push
 or the merge), red (each failed head run to the next push or the merge), queue (each enqueue to its removal or the
 merge), runner (queued job time from the jobs' `created_at` to `started_at`) and DIRTY (not measured: the ticks
-record a state, not a duration, so its cell is empty and never zero). The causes overlap and are not additive.
+record a state, not a duration, so its cell is empty and never zero). The causes overlap and are not additive. The per-run jobs reads are most of a compute read; a measurement run can set `pr_metrics.READ_JOB_MINUTES = False` to classify paths from the run list alone (the runner cause is then empty and nothing is cached).
 The top cause is the largest of the measured ones.
 
 ## Main-red episodes (change failure)
