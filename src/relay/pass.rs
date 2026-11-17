@@ -363,9 +363,12 @@ fn run_repo(
         // already delivered is not delivered again (its key is stable, since
         // an unowned event carries no sequence number).
         if unowned {
-            tracked
-                .pending
-                .retain(|event| matches!(event, RelayEvent::Overdue { .. }));
+            tracked.pending.retain(|event| {
+                matches!(
+                    event,
+                    RelayEvent::Overdue { .. } | RelayEvent::Ejected { .. }
+                ) && super::needs_an_owner(event, &digest)
+            });
         }
         let mut events: Vec<RelayEvent> = if unowned {
             super::actionable_now(&digest)
