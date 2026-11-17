@@ -5935,7 +5935,7 @@ outcome. `review_quarantine::annotate` (run in `apply_repo_plan` before the
 dwell pass) turns a reviewer-waiting row (`no_verdict`, `awaiting_review`,
 `waiting_head_approval`, or `required_pending` on the approval context alone)
 whose exact head the pass-runner quarantine file lists
-(`scheduling_loop::read_quarantine`) into `review_quarantined`, actor author,
+(`scheduling_loop::read_quarantine`; path from `SHIPYARD_REVIEW_QUARANTINE`, then `[loop] review_quarantine_file`, then `~/.local/share/shipyard-steward/pass-runner/review-quarantine.txt`; a missing file is no quarantine) into `review_quarantined`, actor author,
 with the first line of the newest `Review quarantine diagnosis:` comment since
 the quarantine as its detail (one comments read per quarantined head only;
 the comment is untrusted text and only fills the detail). The loop state is
