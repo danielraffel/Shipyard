@@ -686,8 +686,9 @@ def pr_compute(rd, f, runs, runs_complete):
         mac += m
         wait += w
         complete = complete and ok
-        if r.get("event") in ("pull_request", "pull_request_target") and r.get("conclusion") in BAD_CONCLUSIONS and r.get("updated_at"):
-            red_events.append(r["updated_at"])  # a run on one of the PR's heads that failed, when it finished
+        if (r.get("head_sha") in heads and r.get("event") != "merge_group"
+                and r.get("conclusion") in BAD_CONCLUSIONS and r.get("updated_at")):
+            red_events.append(r["updated_at"])  # any failed non-merge-group run on one of the PR's heads
         level = by_wf.setdefault(r.get("name") or "?", {"pull_request": 0, "merge_group": 0, "push": 0, "other": 0})
         ev = r.get("event")
         level[ev if ev in ("merge_group", "push") else "pull_request" if ev in ("pull_request", "pull_request_target") else "other"] += 1

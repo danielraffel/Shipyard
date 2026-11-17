@@ -780,6 +780,17 @@ class JobsSkipped(Base):
         self.assertFalse([c for c in gh.calls if "/jobs" in c])
         self.assertFalse(os.path.exists(os.path.join(self.cache, REPO.replace("/", "__"), "compute", "1.json")))
 
+    def test_a_failed_push_run_on_a_pr_head_counts_as_red(self):
+        run = dict(self.runs[0], event="push", conclusion="failure", updated_at=T(10, "10:12"))
+        gh = world([pr(1, T(10, "09:00"), T(10, "11:00"))], runs=[run], jobs={})
+        pm.READ_JOB_MINUTES = False
+        try:
+            out = pm.build([REPO], self.cache, 200, OWNER, START, NOW, {}, {}, None, gh, control=False)
+        finally:
+            pm.READ_JOB_MINUTES = True
+        r = self.rows(out)[1]
+        self.assertEqual((r["path"], r["path_why"]), ("slow", ["red"]))
+
 
 class MergeRemoval(Base):
     def test_a_removal_after_the_merge_is_not_an_ejection(self):
