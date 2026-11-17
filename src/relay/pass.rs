@@ -370,6 +370,12 @@ fn run_repo(
         let mut events: Vec<RelayEvent> = if unowned {
             super::actionable_now(&digest)
                 .into_iter()
+                // An ejection from the queue is an edge, not a state.
+                .chain(
+                    derived
+                        .into_iter()
+                        .filter(|event| matches!(event, RelayEvent::Ejected { .. })),
+                )
                 .chain(overdue_now)
                 .filter(|event| super::needs_an_owner(event, &digest))
                 .filter(|event| input.config.events.contains(event.name()))

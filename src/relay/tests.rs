@@ -1556,7 +1556,7 @@ fn a_malformed_owner_marker_leaves_the_pull_request_unowned() {
 }
 
 #[test]
-fn an_unowned_conflict_after_a_push_is_told_once_and_a_cleared_one_is_dropped() {
+fn an_unowned_conflict_after_a_push_is_told_once() {
     let pr = Pr::open(543);
     let mut h = unowned_harness(&pr, true);
     h.pass(0, Mode::Send);
@@ -1573,6 +1573,21 @@ fn an_unowned_conflict_after_a_push_is_told_once_and_a_cleared_one_is_dropped() 
     assert_eq!(deliveries.len(), 1, "told once: {deliveries:?}");
     assert_eq!(deliveries[0]["tier"], "lead");
     assert_eq!(deliveries[0]["events"][0]["event"], "dirty_after_base_move");
+}
+
+#[test]
+fn an_unowned_pull_request_ejected_from_the_queue_reaches_the_lead() {
+    let mut queued = Pr::open(543);
+    queued.in_queue = true;
+    let mut h = unowned_harness(&queued, true);
+    h.pass(0, Mode::Send);
+    let mut ejected = queued.clone();
+    ejected.in_queue = false;
+    h.gh.set(ejected);
+    h.pass(1, Mode::Send);
+    let deliveries = h.deliveries();
+    assert_eq!(deliveries.len(), 1, "{deliveries:?}");
+    assert_eq!(deliveries[0]["events"][0]["event"], "ejected");
 }
 
 #[test]
