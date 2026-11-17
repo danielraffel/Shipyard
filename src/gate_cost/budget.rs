@@ -102,23 +102,26 @@ impl ReadBudget {
     }
 }
 
-/// Reads a window costs at most (the cache is ignored): the run listing pages
-/// and one jobs read per run for every event, two annotation reads per
-/// merge-group run, and a fixed handful for the ruleset, merged pull
-/// requests, batches, queue depth and runner census.
+/// Reads a window costs at most (the cache is ignored): per event the run
+/// listing pages, the cross-check walk (up to `WALK_MAX_PAGES` pages) and one
+/// jobs read per run; two annotation reads per merge-group run; the batch
+/// first-parent walk, up to `MAX_BATCH_WALK` commit reads for each merge-queue
+/// push (bounded by the merge-group runs, one push per batch at most); and a
+/// fixed handful for the ruleset, merged pull requests, activity feed, queue
+/// depth and runner census.
 #[must_use]
 pub fn estimate(runs_per_event: &[(String, u64)]) -> u64 {
     const FIXED: u64 = 10;
     const LISTING_PAGE: u64 = 100;
+    let walk_pages = u64::from(super::WALK_MAX_PAGES);
+    let batch_walk = u64::from(super::MAX_BATCH_WALK);
     runs_per_event
         .iter()
         .map(|(event, runs)| {
-            let per_run = if event == super::MERGE_GROUP_EVENT {
-                3
-            } else {
-                1
-            };
-            runs.div_ceil(LISTING_PAGE) + runs * per_run
+            let merge_group = event == super::MERGE_GROUP_EVENT;
+            let per_run = if merge_group { 3 } else { 1 };
+            let batches = if merge_group { runs * batch_walk } else { 0 };
+            runs.div_ceil(LISTING_PAGE) + walk_pages + runs * per_run + batches
         })
         .sum::<u64>()
         + FIXED
@@ -164,7 +167,15 @@ mod tests {
             ("pull_request".to_owned(), 250),
             (super::super::MERGE_GROUP_EVENT.to_owned(), 100),
         ];
-        // 3 + 250, 1 + 300, 10 fixed.
-        assert_eq!(estimate(&runs), 564);
+        // pull_request: 3 pages + 10 walk + 250 jobs.
+        // merge_group: 1 page + 10 walk + 300 jobs/annotations + 100 * 50 walk.
+        // 10 fixed.
+        assert_eq!(estimate(&runs), 263 + 5_311 + 10);
+    }
+
+    #[test]
+    fn a_window_of_no_runs_still_prices_the_cross_check_walk() {
+        let runs = [("pull_request".to_owned(), 0)];
+        assert_eq!(estimate(&runs), 10 + 10);
     }
 }

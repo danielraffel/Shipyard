@@ -962,3 +962,21 @@ fn cached_only_sends_no_github_reads_and_serves_the_cached_window() {
     let empty = ReadCache::open(tempfile::tempdir().expect("t").path(), now_system);
     assert_eq!(cached_window(&empty, &query()), None);
 }
+
+#[test]
+fn a_cap_spent_before_the_run_listing_yields_a_partial_report_not_a_failure() {
+    use std::sync::atomic::AtomicU64;
+    let now = at("2026-09-26T01:00:00Z");
+    let inner = reader(settled_fixture());
+    let spent = budget::ReadBudget::new(0, false);
+    let reads = AtomicU64::new(0);
+    let observation = gather_cached(
+        &budgeted(&spent, &reads, &inner),
+        &query(),
+        now,
+        &ReadCache::disabled(),
+    )
+    .expect("a refused listing with no snapshot degrades, it does not fail");
+    assert!(spent.stopped(), "the refusal marks the result partial");
+    assert!(observation.gate_jobs.is_empty(), "no runs were read");
+}

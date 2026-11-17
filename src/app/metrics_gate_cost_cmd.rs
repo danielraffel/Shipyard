@@ -220,14 +220,16 @@ fn bounded_report(
         };
         query.from = from;
         query.to = to;
-    } else {
+    } else if args_max_reads.is_none() {
+        // An explicit `--max-reads` is never refused, so it needs no estimate;
+        // the estimate's own reads would spend that cap before the real ones.
         let estimate = estimate_reads(reader, query)?;
         eprintln!(
             "gate-cost: estimated up to {estimate} GitHub reads for {} .. {} (ignores the cache); \
              cap {}",
             query.from.format("%Y-%m-%dT%H:%M:%SZ"),
             query.to.format("%Y-%m-%dT%H:%M:%SZ"),
-            args_max_reads.unwrap_or(budget::DEFAULT_MAX_READS),
+            budget::DEFAULT_MAX_READS,
         );
         if let Some(refusal) = refuse_over_cap(estimate, args_max_reads) {
             return Err(CliFailure::new(WAIT_EXIT_INVALID, refusal));
@@ -656,6 +658,84 @@ mod tests {
             refuse_over_cap(1_100, Some(50)),
             None,
             "explicit caps stop, not refuse"
+        );
+    }
+
+    #[test]
+    fn an_explicit_max_reads_skips_the_estimate_reads() {
+        let calls = std::sync::Mutex::new(Vec::<String>::new());
+        let reader = |args: &[String]| -> Result<String, String> {
+            calls.lock().expect("calls").push(args.join(" "));
+            Err("gh: fixture".to_owned())
+        };
+        let now = Utc::now();
+        let mut query = GateCostQuery {
+            repo: "o/r".to_owned(),
+            workflow: "build.yml".to_owned(),
+            gate_job: "test".to_owned(),
+            base_branch: "main".to_owned(),
+            events: vec!["pull_request".to_owned()],
+            receipt_job: None,
+            receipt_target: String::new(),
+            from: now - chrono::Duration::days(7),
+            to: now,
+        };
+        let spend = budget::ReadBudget::new(1, false);
+        let _ = bounded_report(
+            &reader,
+            &mut query,
+            &ReadCache::disabled(),
+            &spend,
+            Some(1),
+            false,
+            now,
+        );
+        let calls = calls.lock().expect("calls");
+        assert!(
+            calls.iter().all(|call| !call.contains("per_page=1 ")
+                && !call.ends_with("per_page=1")
+                && !call.contains(".total_count")),
+            "an explicit cap must not send the estimate reads: {calls:?}"
+        );
+        // Control: without an explicit cap the estimate is sent first.
+        calls_control();
+    }
+
+    fn calls_control() {
+        let calls = std::sync::Mutex::new(Vec::<String>::new());
+        let reader = |args: &[String]| -> Result<String, String> {
+            calls.lock().expect("calls").push(args.join(" "));
+            Err("gh: fixture".to_owned())
+        };
+        let now = Utc::now();
+        let mut query = GateCostQuery {
+            repo: "o/r".to_owned(),
+            workflow: "build.yml".to_owned(),
+            gate_job: "test".to_owned(),
+            base_branch: "main".to_owned(),
+            events: vec!["pull_request".to_owned()],
+            receipt_job: None,
+            receipt_target: String::new(),
+            from: now - chrono::Duration::days(7),
+            to: now,
+        };
+        let spend = budget::ReadBudget::new(300, false);
+        let _ = bounded_report(
+            &reader,
+            &mut query,
+            &ReadCache::disabled(),
+            &spend,
+            None,
+            false,
+            now,
+        );
+        assert!(
+            calls
+                .lock()
+                .expect("calls")
+                .iter()
+                .any(|call| call.contains(".total_count")),
+            "control: the default cap sends the estimate"
         );
     }
 

@@ -1151,9 +1151,11 @@ pub fn gather_cached(
                 pages
             }
             Err(error) if budget::is_stopped(&error) => {
+                // No usable snapshot: this event contributes no runs and
+                // the report is marked partial by the budget.
                 match cached_listing(cache, &snapshot_key, query) {
                     Some(pages) => pages,
-                    None => return Err(error),
+                    None => continue,
                 }
             }
             Err(error) => return Err(error),
