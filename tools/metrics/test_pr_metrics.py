@@ -766,6 +766,24 @@ class EjectionCause(Base):
         self.assertEqual(self.rows(out)[1]["ejections"], ["failed_checks"])
         self.assertFalse([c for c in gh.calls if c.startswith("graphql:")])
 
+    def test_a_removal_graphql_gives_no_reason_stays_unknown_and_is_read_again(self):
+        out = self.build(self.world_with([{"createdAt": T(10, "10:30"), "reason": None}]))
+        self.assertEqual(self.rows(out)[1]["ejections"], ["unknown"])
+        self.assertFalse(os.path.exists(os.path.join(self.cache, REPO.replace("/", "__"), "facts", "1.json")))
+
+    def test_facts_cached_before_causes_were_read_are_read_again(self):
+        d = os.path.join(self.cache, REPO.replace("/", "__"), "facts")
+        os.makedirs(d)
+        gh = self.world_with([{"createdAt": T(10, "10:30"), "reason": "CI_FAILURE"}])
+        self.build(gh)
+        path = os.path.join(d, "1.json")
+        old = json.load(open(path))
+        old.update(v=11, ejections=["unknown"])
+        old.pop("ejection_causes_known", None)
+        json.dump(old, open(path, "w"))
+        out = self.build(self.world_with([{"createdAt": T(10, "10:30"), "reason": "CI_FAILURE"}]))
+        self.assertEqual(self.rows(out)[1]["ejections"], ["ci_failure"])
+
     def test_the_report_prints_the_ejection_table(self):
         out = self.build(self.world_with([{"createdAt": T(10, "10:30"), "reason": "CI_FAILURE"}]))
         md = pm.markdown(out)

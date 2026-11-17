@@ -1,6 +1,6 @@
 # Shipyard scorecard: end-to-end metrics per eligible PR
 
-Scorecard definition version: `2026-11-17.2` (`SCORECARD_VERSION` in `tools/metrics/pr_metrics.py`,
+Scorecard definition version: `2026-11-17.3` (`SCORECARD_VERSION` in `tools/metrics/pr_metrics.py`,
 printed in every report header). A change to any definition below bumps it, so a definition change
 cannot pose as an improvement. The daily loss report ([below](#daily-loss-report))
 counts blocked episodes; this scorecard measures outcomes per PR. `pr_metrics.py` computes it, and
@@ -113,7 +113,7 @@ The REST timeline's `removed_from_merge_queue` event names no reason, so every r
 the removal that happens when a PR merges (781 of 781 in the 2026-11-09 to 11-15 cache). For a PR with such a removal
 the scorecard now asks GraphQL once (`RemovedFromMergeQueueEvent.reason`, lowercased, matched to the REST event by
 time; ported from the m3 fleet-metrics parser). A reason of `merged` or `already_merged` is the merge, not an
-ejection. A PR whose cause could not be read keeps `unknown`, is not cached and is read again next run. The report
+ejection. A PR whose cause could not be read, or whose GraphQL removal names no reason, keeps `unknown`, is not cached and is read again next run. Facts cached before causes were read (version 11) are read again. The report
 prints ejections, ejections per merged PR, the top cause and the unknown-cause count. GraphQL goes through `ghapp`
 (the read-only reader has no GraphQL route) and counts against the read cap like any read.
 

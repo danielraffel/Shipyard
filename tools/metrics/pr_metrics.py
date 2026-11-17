@@ -52,14 +52,14 @@ APP_LOGINS = {"shipyard-local[bot]", "shipyard-local"}
 _GUARD = []
 SIGNALS = ("app_opener", "provenance", "trailer", "session_stamp")
 BAD_CONCLUSIONS = {"failure", "timed_out"}
-FACTS_VERSION = 11
+FACTS_VERSION = 12  # 12: merge-queue ejection causes read from GraphQL
 COMPUTE_VERSION = 4  # compute caches: entries written before this could be marked complete from a partial timeline or commit read
 CHECKS_VERSION = 3  # derived check caches: v2 entries (incomplete pagination read as clean, latest run by start) are read again
 ESCAPE_WINDOW = dt.timedelta(days=14)
 HORIZON = dt.timedelta(hours=48)
 MIN_SAMPLE = 50
 UNKNOWN_RANGE_SHARE = 0.20
-SCORECARD_VERSION = "2026-11-17.2"  # .2: correctness reads the first-parent next push and the newest run by id; main-red episodes
+SCORECARD_VERSION = "2026-11-17.3"  # .2: correctness reads the first-parent next push and the newest run by id; main-red episodes. .3: ejection causes from GraphQL
 MERGE_MAIN_RE = re.compile(r"^Merge (remote-tracking )?branch '?(origin/)?(main|master)'?|^Merge pull request .* from .*/main", re.I)
 # Positive controls: a real revert (#124 reverted #119), a real escaped defect (#126 names #116).
 # Pulp: two escapes verified by hand from main-red traces. #12219 landed red on Workflow lint and
@@ -369,7 +369,7 @@ def ejection_reasons(rd, n):
         nodes = d["data"]["repository"]["pullRequest"]["timelineItems"]["nodes"]
     except (KeyError, TypeError):
         raise ReadError("graphql shape")
-    return {x["createdAt"]: (x.get("reason") or "").lower() or "unspecified" for x in nodes if x}
+    return {x["createdAt"]: (x.get("reason") or "unknown").lower() for x in nodes if x}  # no reason: still unknown, read again
 
 
 def pr_facts(rd, pr, owner):
