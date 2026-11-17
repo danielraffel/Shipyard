@@ -388,6 +388,55 @@ pub(crate) fn derive_events(old: Option<&PrDigest>, new: &PrDigest) -> Vec<Relay
     events
 }
 
+/// The events an unowned pull request needs someone to act on, from its
+/// state now: a HOLD at the current head, red required checks, a conflict.
+/// An owned pull request's owner is told these as they change; an unowned one
+/// has no history to compare with, so its first sighting is judged by its
+/// state, or a HOLD that landed before the relay looked would reach nobody.
+pub(crate) fn actionable_now(digest: &PrDigest) -> Vec<RelayEvent> {
+    if digest.state != "OPEN" {
+        return Vec::new();
+    }
+    let head = digest.head.clone();
+    let mut events = Vec::new();
+    if digest.verdict.as_deref() == Some("HOLD") {
+        events.push(RelayEvent::Verdict {
+            verdict: "HOLD".to_owned(),
+            head: head.clone(),
+        });
+    }
+    if digest.checks == Checks::Failure && !digest.in_queue {
+        events.push(RelayEvent::RequiredCheck {
+            result: "red".to_owned(),
+            names: digest.red.clone(),
+            head: head.clone(),
+            seq: 0,
+        });
+    }
+    if digest.merge == "DIRTY" {
+        events.push(RelayEvent::DirtyAfterBaseMove {
+            head,
+            base: digest.base.clone(),
+            base_oid: digest.base_oid.clone(),
+        });
+    }
+    events
+}
+
+/// Whether `event` is one the lead hears about for a pull request with no
+/// owner: what needs an author's action, never a merge, a green check or a
+/// claim.
+pub(crate) fn needs_an_owner(event: &RelayEvent) -> bool {
+    match event {
+        RelayEvent::Verdict { verdict, .. } => verdict == "HOLD",
+        RelayEvent::RequiredCheck { result, .. } => result == "red",
+        RelayEvent::DirtyAfterBaseMove { .. }
+        | RelayEvent::Ejected { .. }
+        | RelayEvent::Overdue { .. } => true,
+        _ => false,
+    }
+}
+
 fn verdict_regex() -> &'static Regex {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     RE.get_or_init(|| {
@@ -701,7 +750,7 @@ pub(crate) fn repo_query(numbers: &[u64], discover: bool) -> String {
         .collect::<Vec<_>>()
         .join(" ");
     let open = if discover {
-        "open: pullRequests(states:OPEN,first:100,orderBy:{field:UPDATED_AT,direction:DESC}){nodes{number body}}"
+        "open: pullRequests(states:OPEN,first:100,orderBy:{field:UPDATED_AT,direction:DESC}){nodes{number body isDraft}}"
     } else {
         ""
     };
@@ -718,6 +767,9 @@ pub(crate) struct RepoRead {
     pub(crate) prs: BTreeMap<u64, Option<Value>>,
     /// Open pull-request bodies that carry an owner marker, by number.
     pub(crate) markers: BTreeMap<u64, String>,
+    /// Open, non-draft pull requests with no owner marker (newest first):
+    /// the lead is told about the ones that need an owner's action.
+    pub(crate) unmarked: Vec<u64>,
 }
 
 /// Read `numbers` (and, with `discover`, the marked open pull requests) of
@@ -788,9 +840,12 @@ pub(crate) fn fetch(
                 if let (Some(number), Some(body)) = (
                     node.get("number").and_then(Value::as_u64),
                     node.get("body").and_then(Value::as_str),
-                ) && body.contains(crate::owner_registry::MARKER_PREFIX)
-                {
-                    read.markers.insert(number, body.to_owned());
+                ) {
+                    if body.contains(crate::owner_registry::MARKER_PREFIX) {
+                        read.markers.insert(number, body.to_owned());
+                    } else if node.get("isDraft").and_then(Value::as_bool) != Some(true) {
+                        read.unmarked.push(number);
+                    }
                 }
             }
         }

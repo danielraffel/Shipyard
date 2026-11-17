@@ -21,6 +21,8 @@ const ACT_WINDOW_HOURS: i64 = 24;
 /// How long a finished pull request stays in the state, so a stored owner
 /// record does not bring it back as new.
 const DONE_RETENTION_DAYS: i64 = 30;
+/// Unowned pull requests tracked per repository per pass: bounds the query.
+const MAX_UNOWNED_TRACKED: usize = 30;
 
 /// GraphQL: post one comment on a pull request (the last fallback).
 pub(crate) const ADD_COMMENT_MUTATION: &str = "mutation($id:ID!,$body:String!){addComment(input:{subjectId:$id,body:$body}){commentEdge{node{id}}}}";
@@ -273,6 +275,24 @@ fn run_repo(
             discovered.push(*number);
         }
     }
+    // Open pull requests nobody registered: with a lead configured they are
+    // tracked too, so an event that needs an author's action reaches the lead
+    // instead of nobody. Bounded per pass; a registered owner always wins.
+    if input.config.fallbacks(repo).lead.is_some() {
+        for number in read.unmarked.iter().take(MAX_UNOWNED_TRACKED) {
+            let entry = state
+                .prs
+                .entry(key(repo, *number))
+                .or_insert_with(|| Tracked {
+                    repo: repo.to_owned(),
+                    pr: *number,
+                    ..Tracked::default()
+                });
+            if entry.done_at.is_none() && entry.owner.is_none() && !read.prs.contains_key(number) {
+                discovered.push(*number);
+            }
+        }
+    }
     if !discovered.is_empty() {
         let extra = super::fetch(input.gh, repo, &discovered, false)?;
         read.prs.extend(extra.prs);
@@ -323,9 +343,18 @@ fn run_repo(
             }
             log.push(record);
         }
+        let unowned = tracked.owner.is_none();
+        let first_actionable = if unowned && tracked.digest.is_none() {
+            super::actionable_now(&digest)
+        } else {
+            Vec::new()
+        };
         let mut events: Vec<RelayEvent> = derived
             .into_iter()
+            .chain(first_actionable)
             .chain(overdue_now)
+            // With no owner, the lead hears only what needs an author.
+            .filter(|event| !unowned || super::needs_an_owner(event))
             .filter(|event| input.config.events.contains(event.name()))
             // Green, pending (a re-run), green again at one head is one fact.
             .filter(|event| match event {
@@ -536,7 +565,13 @@ fn deliver(
     let pr = tracked.pr;
     let events = tracked.pending.clone();
     let keys: Vec<String> = events.iter().map(|e| e.key(repo, pr)).collect();
-    let message = render_message(repo, pr, digest, &events, steward_next);
+    let mut message = render_message(repo, pr, digest, &events, steward_next);
+    if tracked.owner.is_none() {
+        message.push_str(&format!(
+            " (No owner is registered for this pull request, so the lead hears it; the owning \
+             session runs `shipyard owner register --pr {pr} --repo {repo}`.)"
+        ));
+    }
     let mut record = DeliveryRecord {
         kind: "delivery".to_owned(),
         at: input.now,

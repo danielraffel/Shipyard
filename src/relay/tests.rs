@@ -1454,6 +1454,89 @@ fn a_marker_cannot_outrank_by_a_future_time_or_name_an_unknown_socket() {
     assert!(h2.state.prs.values().next().unwrap().owner.is_none());
 }
 
+/// A harness whose repository has a lead on m1 and one open pull request
+/// that nobody registered (no marker, no stored record).
+fn unowned_harness(pr: &Pr, with_lead: bool) -> Harness {
+    let mut h = Harness::new(
+        std::slice::from_ref(pr),
+        FakeCmux::with(&[("m1", "", "LEAD")]),
+    );
+    if with_lead {
+        h.config.repo.insert(
+            REPO.to_owned(),
+            config::RepoFallbacks {
+                lead: Some(address("m1", "LEAD")),
+                repair_lane: None,
+            },
+        );
+    }
+    h.gh.open_bodies
+        .borrow_mut()
+        .insert(pr.number, "no marker".to_owned());
+    h
+}
+
+#[test]
+fn a_hold_on_an_unowned_pull_request_reaches_the_lead_at_first_sight() {
+    // vellum#543: no marker, no record, a HOLD that landed before the relay
+    // looked. It used to reach nobody.
+    let mut pr = Pr::open(543);
+    pr.comments.push(verdict("HOLD", HEAD_A));
+    let mut h = unowned_harness(&pr, true);
+    h.pass(0, Mode::Send);
+    let deliveries = h.deliveries();
+    assert_eq!(deliveries.len(), 1, "{deliveries:?}");
+    assert_eq!(deliveries[0]["tier"], "lead");
+    let message = deliveries[0]["message"].as_str().unwrap();
+    assert!(message.contains("No owner is registered"), "{message}");
+    // The same fact is not delivered twice.
+    h.pass(1, Mode::Send);
+    h.pass(2, Mode::Send);
+    assert_eq!(h.deliveries().len(), 1);
+}
+
+#[test]
+fn an_unowned_pull_request_tells_the_lead_only_what_needs_an_author() {
+    let pr = Pr::open(543);
+    let mut h = unowned_harness(&pr, true);
+    h.pass(0, Mode::Send);
+    assert!(h.deliveries().is_empty(), "a quiet pull request is silent");
+    // A green check, an approval and a merge are not the lead's to hear.
+    let mut approved = pr.clone();
+    approved.comments.push(verdict("APPROVE", HEAD_A));
+    h.gh.set(approved.clone());
+    h.pass(1, Mode::Send);
+    let mut merged = approved;
+    merged.state = "MERGED";
+    merged.merged = true;
+    h.gh.set(merged);
+    h.gh.open_bodies.borrow_mut().clear();
+    h.pass(2, Mode::Send);
+    assert!(h.deliveries().is_empty(), "{:?}", h.deliveries());
+    // A red check is.
+    let mut red_pr = Pr::open(544);
+    red_pr.checks = red();
+    h.gh.set(red_pr);
+    h.gh.open_bodies
+        .borrow_mut()
+        .insert(544, "no marker".to_owned());
+    h.pass(3, Mode::Send);
+    h.pass(4, Mode::Send);
+    let deliveries = h.deliveries();
+    assert_eq!(deliveries.len(), 1, "{deliveries:?}");
+    assert_eq!(deliveries[0]["pr"], 544);
+}
+
+#[test]
+fn without_a_lead_an_unowned_pull_request_is_not_tracked() {
+    let mut pr = Pr::open(543);
+    pr.comments.push(verdict("HOLD", HEAD_A));
+    let mut h = unowned_harness(&pr, false);
+    h.pass(0, Mode::Send);
+    assert!(h.state.prs.is_empty());
+    assert!(h.deliveries().is_empty());
+}
+
 #[test]
 fn each_delivery_is_persisted_before_the_next_one_is_sent() {
     let prs = [Pr::open(1), Pr::open(2)];
