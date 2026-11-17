@@ -67,6 +67,52 @@ pub(super) struct StorageProbe {
     pub(super) disk_floor_kibibyte: u64,
     pub(super) ccache_size_kibibyte: Option<u64>,
     pub(super) ccache_max_kibibyte: Option<u64>,
+    /// The Shipyard this host runs, read by the same probe. Informational: it
+    /// never counts as a problem or makes a host unroutable.
+    pub(super) shipyard: ShipyardInstall,
+}
+
+/// The active `~/.local/bin/shipyard` on a host.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub(super) struct ShipyardInstall {
+    pub(super) version: Option<String>,
+    /// `release` when it is the Developer ID release (identifier shipyard,
+    /// team 95CX6P84C4), `not_release` otherwise; absent off macOS.
+    pub(super) identity: Option<String>,
+    /// The newest release and the verdict (`current`, `behind`) from the
+    /// host's own `TartCI` tool-freshness measurement, which is what applies
+    /// updates there. Absent when the host has no measurement.
+    pub(super) latest: Option<String>,
+    pub(super) freshness: Option<String>,
+}
+
+impl ShipyardInstall {
+    /// One line for the text report, or `None` when nothing was read.
+    pub(super) fn summary(&self) -> Option<String> {
+        if self.version.is_none() && self.identity.is_none() && self.latest.is_none() {
+            return None;
+        }
+        let mut parts = vec![
+            self.version
+                .clone()
+                .unwrap_or_else(|| "version unknown".to_owned()),
+        ];
+        match self.identity.as_deref() {
+            Some("release") => parts.push("Developer ID release".to_owned()),
+            Some(_) => parts.push(
+                "NOT the Developer ID release (a new macOS privacy identity: expect prompts)"
+                    .to_owned(),
+            ),
+            None => {}
+        }
+        match (self.freshness.as_deref(), self.latest.as_deref()) {
+            (Some(state), Some(latest)) => parts.push(format!("{state} (latest {latest})")),
+            (Some(state), None) => parts.push(state.to_owned()),
+            (None, Some(latest)) => parts.push(format!("latest {latest}")),
+            (None, None) => {}
+        }
+        Some(parts.join(", "))
+    }
 }
 
 /// One persistent runner the host attester reported as broken.

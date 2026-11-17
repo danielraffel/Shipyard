@@ -163,8 +163,29 @@ class InstallChecksumTests(unittest.TestCase):
         hdiutil.chmod(0o755)
 
     def run_install(
-        self, uname_s: str, uname_m: str, extra_env: dict[str, str] | None = None
+        self,
+        uname_s: str,
+        uname_m: str,
+        extra_env: dict[str, str] | None = None,
+        *,
+        real_codesign: bool = False,
+        codesign: Path | None = None,
     ) -> subprocess.CompletedProcess:
+        # The release identity check runs /usr/bin/codesign, and nothing in
+        # the environment can change that. Fixture binaries are unsigned
+        # scripts, so unless a test is about the real check it runs a copy of
+        # install.sh whose one codesign path names a fixture instead.
+        script = INSTALL_SH
+        codesign = codesign or (self.bin / "codesign")
+        if not real_codesign and codesign.exists():
+            text = INSTALL_SH.read_text(encoding="utf-8")
+            self.assertEqual(text.count('RELEASE_CODESIGN="/usr/bin/codesign"'), 1)
+            script = self.root / "install-under-test.sh"
+            script.write_text(
+                text.replace('RELEASE_CODESIGN="/usr/bin/codesign"',
+                             f'RELEASE_CODESIGN="{codesign}"'),
+                encoding="utf-8",
+            )
         env = {
             "HOME": str(self.root / "home"),
             "PATH": f"{self.bin}:/usr/bin:/bin:/usr/sbin:/sbin",
@@ -180,7 +201,7 @@ class InstallChecksumTests(unittest.TestCase):
             **(extra_env or {}),
         }
         return subprocess.run(
-            ["bash", str(INSTALL_SH)],
+            ["bash", str(script)],
             env=env,
             capture_output=True,
             text=True,
@@ -307,6 +328,136 @@ class InstallChecksumTests(unittest.TestCase):
         self.assertIn("sha256 mismatch for shipyard-macos-arm64.dmg", result.stderr)
         self.assertEqual(self.tool_calls(), "", "no hdiutil/codesign/xattr may run")
         self.assert_nothing_installed()
+
+
+# A codesign whose verify answers 3, as for an ad-hoc or unsigned binary.
+REFUSING_CODESIGN = """#!/bin/sh
+printf 'codesign %s\\n' "$*" >> "$FIXTURE_TOOL_LOG"
+case "$1" in --verify) echo 'test-requirement: code failed to satisfy specified code requirement(s)' >&2; exit 3 ;; esac
+exit 0
+"""
+
+REQUIREMENT = (
+    'identifier "{}" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6]'
+    ' and certificate leaf[field.1.2.840.113635.100.6.1.13] and certificate leaf[subject.OU] = "95CX6P84C4"'
+)
+
+
+class InstallReleaseIdentityTests(InstallChecksumTests):
+    """On macOS only the Developer ID release replaces the installed Shipyard."""
+
+    # The checksum tests run once, in the parent class.
+    for _name in [n for n in dir(InstallChecksumTests) if n.startswith("test_")]:
+        locals()[_name] = None
+    del _name
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.install_macos_shims()
+        self.publish(self.macos_dmg())
+        self.install_dir.mkdir(parents=True)
+        for name in ("shipyard", "shipyard-workstream-provider"):
+            previous = self.install_dir / name
+            previous.write_text(f"#!/bin/sh\necho '{name} 0.100.0'\n", encoding="utf-8")
+            previous.chmod(0o755)
+
+    def previous_kept(self) -> None:
+        for name in ("shipyard", "shipyard-workstream-provider"):
+            self.assertIn(
+                "0.100.0", (self.install_dir / name).read_text(encoding="utf-8"), name
+            )
+        leftovers = sorted(p.name for p in self.install_dir.iterdir())
+        self.assertEqual(leftovers, ["shipyard", "shipyard-workstream-provider"])
+
+    def assert_refused(self, result: subprocess.CompletedProcess) -> None:
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("refused to install shipyard", result.stderr)
+        self.assertIn("team 95CX6P84C4", result.stderr)
+        self.assertIn("The installed Shipyard is unchanged.", result.stderr)
+        # The refusal never names a way around it.
+        self.assertNotIn("ALLOW_UNSIGNED", result.stderr)
+        self.assertNotIn("developer mode", result.stderr)
+        self.previous_kept()
+        self.assertNotIn("--force --sign -", self.tool_calls(), "no ad-hoc re-sign")
+
+    def test_a_binary_codesign_refuses_is_not_installed(self) -> None:
+        refusing = self.root / "codesign-refuses"
+        refusing.write_text(REFUSING_CODESIGN, encoding="utf-8")
+        refusing.chmod(0o755)
+        result = self.run_install("Darwin", "arm64", codesign=refusing)
+        self.assert_refused(result)
+        self.assertFalse(self.ran_marker.exists(), "a refused binary is never executed")
+
+    @unittest.skipUnless(sys.platform == "darwin", "the real codesign")
+    def test_real_codesign_refuses_an_ad_hoc_signed_binary(self) -> None:
+        payload = self.root / "dmg-payload"
+        for name in ("shipyard", "shipyard-workstream-provider"):
+            signed = subprocess.run(
+                ["/usr/bin/codesign", "--force", "--sign", "-", str(payload / name)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(signed.returncode, 0, signed.stderr)
+        result = self.run_install("Darwin", "arm64", real_codesign=True)
+        self.assert_refused(result)
+
+    def test_the_release_is_checked_against_its_exact_requirement(self) -> None:
+        checking = self.root / "codesign-checks"
+        checking.write_text(
+            "#!/bin/sh\n"
+            "printf 'verify %s|%s|%s\\n' \"$2\" \"$3\" \"$(basename \"$4\")\" >> \"$FIXTURE_TOOL_LOG\"\n"
+            "[ \"$1\" = --verify ] && [ \"$2\" = --strict ] || exit 9\n"
+            "case \"$3\" in\n"
+            f"  '-R={REQUIREMENT.format('shipyard')}'|'-R={REQUIREMENT.format('shipyard-workstream-provider')}') exit 0 ;;\n"
+            "esac\n"
+            "exit 9\n",
+            encoding="utf-8",
+        )
+        checking.chmod(0o755)
+        result = self.run_install("Darwin", "arm64", codesign=checking)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("0.200.0", (self.install_dir / "shipyard").read_text(encoding="utf-8"))
+        verifies = [line for line in self.tool_calls().splitlines() if line.startswith("verify ")]
+        # Staged CLI and provider, then each again once installed.
+        self.assertEqual(len(verifies), 4, verifies)
+        self.assertIn(f"-R={REQUIREMENT.format('shipyard-workstream-provider')}", "".join(verifies))
+
+    def test_a_binary_refused_after_the_swap_is_rolled_back(self) -> None:
+        # The staged copies pass; the installed CLI does not (its bytes
+        # changed between the checks). The EXIT trap restores the previous pair.
+        after_swap = self.root / "codesign-refuses-installed"
+        after_swap.write_text(
+            "#!/bin/sh\n"
+            "printf 'verify %s\\n' \"$(basename \"$4\")\" >> \"$FIXTURE_TOOL_LOG\"\n"
+            "case \"$(basename \"$4\")\" in .*.install.*) exit 0 ;; esac\n"
+            "echo 'test-requirement: code failed to satisfy specified code requirement(s)' >&2\n"
+            "exit 3\n",
+            encoding="utf-8",
+        )
+        after_swap.chmod(0o755)
+        result = self.run_install("Darwin", "arm64", codesign=after_swap)
+        self.assert_refused(result)
+        verifies = [line for line in self.tool_calls().splitlines() if line.startswith("verify ")]
+        self.assertEqual(verifies[-1], "verify shipyard", verifies)
+
+    def test_linux_is_not_checked(self) -> None:
+        self.publish(self.linux_assets())
+        refusing = self.root / "codesign-refuses"
+        refusing.write_text(REFUSING_CODESIGN, encoding="utf-8")
+        refusing.chmod(0o755)
+        result = self.run_install("Linux", "x86_64", codesign=refusing)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_owner_developer_mode_installs_a_local_build_loudly(self) -> None:
+        refusing = self.root / "codesign-refuses"
+        refusing.write_text(REFUSING_CODESIGN, encoding="utf-8")
+        refusing.chmod(0o755)
+        result = self.run_install(
+            "Darwin", "arm64", {"SHIPYARD_INSTALL_ALLOW_UNSIGNED_DEV": "1"}, codesign=refusing
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("developer mode", result.stderr)
+        self.assertIn("0.200.0", (self.install_dir / "shipyard").read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

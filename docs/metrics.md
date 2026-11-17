@@ -1,6 +1,6 @@
 # Shipyard scorecard: end-to-end metrics per eligible PR
 
-Scorecard definition version: `2026-11-15.1` (`SCORECARD_VERSION` in `tools/metrics/pr_metrics.py`,
+Scorecard definition version: `2026-11-17.3` (`SCORECARD_VERSION` in `tools/metrics/pr_metrics.py`,
 printed in every report header). A change to any definition below bumps it, so a definition change
 cannot pose as an improvement. The daily loss report ([below](#daily-loss-report))
 counts blocked episodes; this scorecard measures outcomes per PR. `pr_metrics.py` computes it, and
@@ -48,7 +48,10 @@ nothing about live data. The live positive controls below stay as a second check
 
 A zero is printed with its positive control's count. Built-in controls: fleet-handbook #124 reverted
 #119 (the revert detector must find it) and #126's title names #116 (the escape detector must find
-it). `DEFAULT_CONTROLS` can also pin `"owner": [pr, ...]`, PRs with a hand-verified owner action that
+it). Pulp has two escape controls, both checked by hand against main-red traces: #12375 fixed
+#12219 (Workflow lint) and #12384 fixed #12338 (the WAM link). Neither fix names the PR it fixes, so
+the escape detector misses them and Pulp's escaped metric reads `withheld` until it can find them.
+`DEFAULT_CONTROLS` can also pin `"owner": [pr, ...]`, PRs with a hand-verified owner action that
 must read `owner_action`. PRs the ticks show as `direct_merge_refused` are counted for context only:
 that stop is a ruleset config gap, not an owner action, so they can legitimately read autonomous.
 A control whose PR is outside the window is "not in window" and unchecked. A control in the window
@@ -77,6 +80,11 @@ scorecard's own values, within 15%. The synthetic control covers these fields to
 
 ## Clean and slow paths
 
+An ejection is a removal from the merge queue other than the merge itself. GitHub records a removal when a PR merges
+and the REST timeline names no reason, so a removal within two minutes before `merged_at` (or one that says
+`merged`) is the merge, not an ejection (the rule the m3 fleet-metrics parser uses). Without it every merged PR
+read as ejected and as slow.
+
 Each merged PR is `slow` when it had any HOLD, a failed run on one of its heads, an ejection from the merge queue
 or a DIRTY tick; `clean` when none of these and its compute was read in full; otherwise `unknown` (a failed run
 cannot be ruled out without the run list), and unknown PRs are in neither path. The report gives the slow share
@@ -84,18 +92,18 @@ cannot be ruled out without the run list), and unknown PRs are in neither path. 
 with its n, and the minutes per merged PR that each cause held the slow PRs up: HOLD (each HOLD to the next push
 or the merge), red (each failed head run to the next push or the merge), queue (each enqueue to its removal or the
 merge), runner (queued job time from the jobs' `created_at` to `started_at`) and DIRTY (not measured: the ticks
-record a state, not a duration, so its cell is empty and never zero). The causes overlap and are not additive.
+record a state, not a duration, so its cell is empty and never zero). The causes overlap and are not additive. The per-run jobs reads are most of a compute read; a measurement run can set `pr_metrics.READ_JOB_MINUTES = False` to classify paths from the run list alone (the runner cause is then empty and nothing is cached).
 The top cause is the largest of the measured ones.
 
 ## Main-red episodes (change failure)
 
 The detector reads the checks of every push to the base in the window (each context's latest run decides it; a push
-with unfinished runs or an unread page says nothing and is skipped). An episode starts at the first push where a
+with unfinished runs or an unread page says nothing and is skipped; an episode still open there ends `end unknown`, with no fixer and no duration, since the base may have gone green and red again unseen). Each context's latest run decides a push, so a red that a rerun on the same commit turned green is a flake, not an episode. A direct push's time is its commit date (no push time is recorded), floored at the push before it, so a fix by direct push can read as a shorter time to green. An episode starts at the first push where a
 context is red that was not red before and is attributed to the PR whose merge commit that push is (a direct push,
 or a first usable push that is already red, has no PR). It ends at the push where its last context turns green; that
-push's PR is the fixer. A run still queued or running three hours after its push is stuck (GitHub keeps phantom queued runs for days): it is neither red nor green and does not hold the push open. A context seen on one push only (a per-version or per-event name) can never turn green again and is not tracked. A context red on a fifth or more of the pushes it appears on (judged over at least 20 pushes) is a PR gate that flaps on a merge-queue base (`review-verdict`, the reviewer `judge`), not a check a merge breaks, and is not tracked either; the report lists both kinds. Pushes are ordered by first-parent links, not commit dates (a merge queue fast-forwards the base, so each commit keeps its own older date), and a PR's push time is its `merged_at`. The report prints counts and the raw minutes to green, with no rate and no median, plus
+push's PR is the fixer. A run still queued or running three hours after its push is stuck (GitHub keeps phantom queued runs for days): it is neither red nor green and does not hold the push open. A context seen on one push only (a per-version or per-event name) can never turn green again and is not tracked, unless that push is the newest one: a check new on the latest push is followed until a later push shows whether it recurs. The head's runs are read with `filter=all`, so a rerun after the merge cannot hide the run that decided it. A context that turns red (from green or absent) on a tenth or more of the pushes it appears on (judged over at least 20 pushes) is a PR gate that flaps on a merge-queue base (`review-verdict`, the reviewer `judge`), not a check a merge breaks, and is not tracked either; one sustained break that stays red for many pushes turns red once and is still followed. The report lists both kinds. A context's newest run is the one with the highest id, so a queued rerun holds its push open. Pushes are the base's first-parent chain from its tip (when the listing stops short of the tip, from the newest merged PR's merge commit in it, since a cut listing can hold a feature commit whose merge fell outside it), ordered by those links, not commit dates (a merge queue fast-forwards the base, so each commit keeps its own older date; listing a base that takes merge commits also returns every merged branch's own commits, which were never base pushes), and a PR's push time is its `merged_at`. The listing is read up to 40 pages (Pulp's main lists about 2,900 commits over 8 days, its merged branches' commits included) and starts a day before the first merge in the window, so a queue's merge commit written before its `merged_at` is still read and the first PR has a push before it. A PR is attributed only when its merge commit is a settled push right after another settled push: a merge the listing misses, an unsettled one, or one right after a skipped push has `unknown` attribution (an episode that starts right after a skipped push has no PR), never a known zero. Limits: in a cut listing (a historical window), pushes after the newest listed PR merge are not read, so an episode open there reads unresolved; a rerun on a base push more than a day old is not seen once that push's state is cached. A push's state is cached only when all its runs finished and the push is a day old, and a run counts as stuck only when both the push and the run itself are three hours old (a run with no start time yet is pending), so a rerun queued minutes ago on an old push is pending. `head red` takes each context's newest run started by `merged_at` (pending if it had not finished by then, or if a run of that context has not started at all: it may have been queued before the merge), so a rerun after the merge does not change it; an episode whose head was not red in any of its contexts and not green in all of them (pending, absent or unread) is `head unknown`, neither a change failure nor other post-merge red. The report prints counts and the raw minutes to green, with no rate and no median, plus
 `head red`: episodes whose PR's own final head was red in the same context when it merged. A known-incident control
-(`DEFAULT_CONTROLS[repo]["incident"] = [(escaped PR, fixer PR)]`) must be found: the report prints recall k/n, and a
+(`DEFAULT_CONTROLS[repo]["incident"] = [(escaped PR, fixer PR[, head red at merge])]`; Shipyard pins #1459, #1462 and a green head, verified against their check runs) must be found, with the head verdict when one is pinned: the report prints recall k/n, and a
 miss fails the control and withholds the change-failure cells only. `base_red` and the text-matched escape stay as
 they were and will be retired once the episodes are audited by hand.
 
@@ -105,7 +113,7 @@ The REST timeline's `removed_from_merge_queue` event names no reason, so every r
 the removal that happens when a PR merges (781 of 781 in the 2026-11-09 to 11-15 cache). For a PR with such a removal
 the scorecard now asks GraphQL once (`RemovedFromMergeQueueEvent.reason`, lowercased, matched to the REST event by
 time; ported from the m3 fleet-metrics parser). A reason of `merged` or `already_merged` is the merge, not an
-ejection. A PR whose cause could not be read keeps `unknown`, is not cached and is read again next run. The report
+ejection. A PR whose cause could not be read, or whose GraphQL removal names no reason, keeps `unknown`, is not cached and is read again next run. Facts cached before causes were read (version 11) are read again. The report
 prints ejections, ejections per merged PR, the top cause and the unknown-cause count. GraphQL goes through `ghapp`
 (the read-only reader has no GraphQL route) and counts against the read cap like any read.
 

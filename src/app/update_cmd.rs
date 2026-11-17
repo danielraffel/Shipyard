@@ -28,6 +28,8 @@ const DEFAULT_RELEASES_API_BASE: &str =
     "https://api.github.com/repos/danielraffel/Shipyard/releases";
 const UPDATE_AUTH_TIMEOUT: Duration = Duration::from_secs(15);
 
+mod install_identity;
+
 /// CLI dispatch entry.
 #[allow(clippy::too_many_lines)] // one linear install transaction; each step is a named helper
 pub(super) fn update_command<W: Write>(
@@ -782,6 +784,7 @@ fn invoke_install_script(
             curl_bin,
             curl: Command::new(curl_bin),
             shell: Command::new(shell_bin),
+            require_identity_check: install_identity::installer_must_check_identity(),
         },
         install_script_url,
         target_tag,
@@ -795,6 +798,8 @@ struct InstallerCommands<'a> {
     curl_bin: &'a Path,
     curl: Command,
     shell: Command,
+    /// Refuse a target installer without the Developer ID check (macOS).
+    require_identity_check: bool,
 }
 
 fn invoke_install_script_with_commands(
@@ -809,6 +814,7 @@ fn invoke_install_script_with_commands(
         curl_bin,
         mut curl,
         mut shell,
+        require_identity_check,
     } = commands;
     // Fetch the entire tagged installer before executing any of it. Streaming
     // curl into a shell allowed a truncated response to run far enough to
@@ -840,6 +846,12 @@ fn invoke_install_script_with_commands(
             1,
             "downloaded installer was empty; installer was not executed",
         ));
+    }
+    if require_identity_check {
+        let text = std::fs::read(installer.path()).map_err(|error| {
+            CliFailure::new(1, format!("failed to read the staged installer: {error}"))
+        })?;
+        install_identity::require_identity_checking_installer(&text, target_tag)?;
     }
 
     // Under `--json`, route installer progress to stderr so the stdout
@@ -1124,6 +1136,7 @@ mod tests {
                 curl_bin: Path::new("/bin/sh"),
                 curl: curl_command,
                 shell: shell_command,
+                require_identity_check: false,
             },
             "https://example.invalid/install.sh",
             "v0.98.1",
@@ -1152,6 +1165,51 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn an_installer_without_the_identity_check_is_never_executed() {
+        // Tags before the check wrote in place; nothing could undo them.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let curl_fixture = temp.path().join("curl-fixture.sh");
+        let shell_fixture = temp.path().join("shell-fixture.sh");
+        let marker = temp.path().join("shell-ran");
+        std::fs::write(
+            &curl_fixture,
+            "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"--output\" ]; then shift; printf '#!/bin/sh\\nprepare_macos_binary() {\\n  :\\n}\\n' > \"$1\"; fi\n  shift\ndone\nexit 0\n",
+        )
+        .expect("write curl fixture");
+        std::fs::write(
+            &shell_fixture,
+            format!("#!/bin/sh\n/usr/bin/touch {}\n", shlex_quote_path(&marker)),
+        )
+        .expect("write shell fixture");
+        let mut curl_command = Command::new("/bin/sh");
+        curl_command.arg(&curl_fixture);
+        let mut shell_command = Command::new("/bin/sh");
+        shell_command.arg(&shell_fixture);
+
+        let error = invoke_install_script_with_commands(
+            InstallerCommands {
+                curl_bin: Path::new("/bin/sh"),
+                curl: curl_command,
+                shell: shell_command,
+                require_identity_check: true,
+            },
+            "https://example.invalid/install.sh",
+            "v0.440.0",
+            None,
+            temp.path(),
+            false,
+        )
+        .expect_err("refused");
+        assert!(
+            error.message.starts_with("refused to update to v0.440.0"),
+            "{}",
+            error.message
+        );
+        assert!(!marker.exists(), "an installer without the check ran");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn installer_receives_exact_binary_directory_and_curl_identity() {
         let temp = tempfile::tempdir().expect("tempdir");
         let curl = temp.path().join("custom-curl");
@@ -1161,7 +1219,8 @@ mod tests {
         std::fs::create_dir(&install_dir).expect("install dir");
         write_executable(
             &curl,
-            "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"--output\" ]; then shift; printf '#!/bin/sh\\n' > \"$1\"; fi\n  shift\ndone\n",
+            // An installer with the identity check, which macOS requires.
+            "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"--output\" ]; then shift; printf '#!/bin/sh\\nrequire_release_identity() {\\n  :\\n}\\n' > \"$1\"; fi\n  shift\ndone\n",
         );
         write_executable(
             &shell,

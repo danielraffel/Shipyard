@@ -12,6 +12,12 @@ set -euo pipefail
 #   SHIPYARD_SKIP_DOWNLOAD    Reuse an existing binary in install dir
 #   SHIPYARD_REPO             Override release repo
 #   SHIPYARD_GITHUB_TOKEN     Optional token for private release repos
+#
+# On macOS only the Developer ID release is installed: each binary must pass
+# `codesign --verify --strict` against the release's designated requirement
+# (its identifier, an Apple-anchored Developer ID Application certificate,
+# team 95CX6P84C4) before it replaces anything. macOS privacy grants follow
+# that identity, so any other binary is a new identity that raises prompts.
 
 REPO="${SHIPYARD_REPO:-danielraffel/Shipyard}"
 INSTALL_DIR="${SHIPYARD_INSTALL_DIR:-${HOME}/.local/bin}"
@@ -246,6 +252,42 @@ fi
 
 mkdir -p "${INSTALL_DIR}"
 
+# The release identity check, always with the system codesign: nothing in the
+# environment can point it elsewhere. SHIPYARD_INSTALL_ALLOW_UNSIGNED_DEV=1 is
+# the repository owner's developer mode for installing a local build, never
+# set by agents or automation (docs/install.md).
+RELEASE_TEAM="95CX6P84C4"
+RELEASE_CODESIGN="/usr/bin/codesign"
+UNSIGNED_DEV="${SHIPYARD_INSTALL_ALLOW_UNSIGNED_DEV:-0}"
+
+release_requirement() {
+    printf 'identifier "%s" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] and certificate leaf[field.1.2.840.113635.100.6.1.13] and certificate leaf[subject.OU] = "%s"' \
+        "$1" "${RELEASE_TEAM}"
+}
+
+# require_release_identity BINARY IDENTIFIER: exit 1 unless BINARY is the
+# Developer ID release signed as IDENTIFIER. Runs before the binary is ever
+# executed (the smoke test runs it) and before anything replaces the installed
+# binaries, and again on them after the swap (the EXIT trap then restores the
+# previous install).
+require_release_identity() {
+    binary="$1"
+    identifier="$2"
+    if [ "${OS}" != "macos" ]; then
+        return 0
+    fi
+    if [ "${UNSIGNED_DEV}" = "1" ]; then
+        echo "WARNING: developer mode: ${binary} is installed without the Developer ID check." >&2
+        return 0
+    fi
+    if "${RELEASE_CODESIGN}" --verify --strict "-R=$(release_requirement "${identifier}")" \
+            "${binary}" >/dev/null 2>&1; then
+        return 0
+    fi
+    echo "ERROR: refused to install ${identifier}: the binary is not signed with Developer ID as identifier ${identifier} by team ${RELEASE_TEAM}, so macOS would treat it as a new privacy identity. The installed Shipyard is unchanged." >&2
+    exit 1
+}
+
 prepare_macos_binary() {
     binary="$1"
     if [ "${OS}" != "macos" ]; then
@@ -256,7 +298,8 @@ prepare_macos_binary() {
         team_line=$(codesign -dv "${binary}" 2>&1 | grep "^TeamIdentifier=") || team_line=""
         if [ -n "${team_line}" ] && [ "${team_line}" != "TeamIdentifier=not set" ]; then
             echo "Detected Developer-ID-signed binary (${team_line#TeamIdentifier=}); preserving notarization."
-        else
+        elif [ "${UNSIGNED_DEV}" = "1" ]; then
+            # An ad-hoc identity is only ever wanted for a local build.
             codesign --force --sign - "${binary}" 2>/dev/null || true
             echo "Detected ad-hoc-signed binary; re-signed locally for Gatekeeper."
         fi
@@ -280,18 +323,6 @@ smoke_binary_or_repair() {
         printf '%s\n' "${version}"
         return 0
     fi
-    if [ "${OS}" = "macos" ] \
-        && [ "${SHIPYARD_NO_ADHOC_FALLBACK:-0}" != "1" ] \
-        && command -v codesign >/dev/null 2>&1; then
-        team_line=$(codesign -dv "${binary}" 2>&1 | grep "^TeamIdentifier=") || team_line=""
-        if [ -n "${team_line}" ] && [ "${team_line}" != "TeamIdentifier=not set" ]; then
-            echo "WARN: notarized binary would not launch; trying local ad-hoc fallback." >&2
-            xattr -cr "${binary}" 2>/dev/null || true
-            codesign --remove-signature "${binary}" 2>/dev/null || true
-            codesign --force --sign - "${binary}" 2>/dev/null || true
-        fi
-    fi
-    version="$(binary_semver "${binary}" "${binary_label}")" || version=""
     if [ -z "${version}" ]; then
         echo "ERROR: ${binary_label} installed but failed post-install smoke." >&2
         echo "Expected '${binary_label} <semantic-version>' from '${binary} --version'." >&2
@@ -545,9 +576,11 @@ if [ "${REQUIRE_PROVIDER}" = "1" ]; then
 fi
 
 prepare_macos_binary "${STAGED_DEST}"
+require_release_identity "${STAGED_DEST}" "${BINARY_VERSION_NAME}"
 STAGED_VERSION="$(smoke_binary_or_repair "${STAGED_DEST}" "${BINARY_VERSION_NAME}")"
 if [ "${REQUIRE_PROVIDER}" = "1" ]; then
     prepare_macos_binary "${STAGED_PROVIDER_DEST}"
+    require_release_identity "${STAGED_PROVIDER_DEST}" "${PROVIDER_VERSION_NAME}"
     STAGED_PROVIDER_VERSION="$(smoke_binary_or_repair \
         "${STAGED_PROVIDER_DEST}" "${PROVIDER_VERSION_NAME}")"
     if [ "${STAGED_VERSION}" != "${STAGED_PROVIDER_VERSION}" ]; then
@@ -582,8 +615,10 @@ else
     rm -f "${PROVIDER_DEST}"
 fi
 ln -sf "${DEST}" "${INSTALL_DIR}/${ALIAS_NAME}"
+require_release_identity "${DEST}" "${BINARY_VERSION_NAME}"
 INSTALLED_VERSION="$(smoke_binary_or_repair "${DEST}" "${BINARY_VERSION_NAME}")"
 if [ "${REQUIRE_PROVIDER}" = "1" ]; then
+    require_release_identity "${PROVIDER_DEST}" "${PROVIDER_VERSION_NAME}"
     INSTALLED_PROVIDER_VERSION="$(smoke_binary_or_repair \
         "${PROVIDER_DEST}" "${PROVIDER_VERSION_NAME}")"
     if [ "${INSTALLED_VERSION}" != "${INSTALLED_PROVIDER_VERSION}" ]; then

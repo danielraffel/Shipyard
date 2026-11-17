@@ -24,6 +24,15 @@ pub(super) const HOST_BUSY_EXIT_CODE: i32 = 75;
 /// Stderr line that accompanies [`HOST_BUSY_EXIT_CODE`]; both must agree
 /// before a non-zero exit is read as a deferral rather than a failure.
 pub(super) const HOST_BUSY_MARKER: &str = "SHIPYARD_FLEET_HOST_BUSY=fleet-auth-support.guard";
+/// Exit status of a host transaction that refused to activate a staged
+/// Shipyard binary that is not the Developer ID release. Distinct from
+/// [`HOST_BUSY_EXIT_CODE`] (75, a deferral that callers retry at once).
+pub(super) const ACTIVATION_REFUSED_EXIT_CODE: i32 = 78;
+/// Stderr line that accompanies [`ACTIVATION_REFUSED_EXIT_CODE`].
+pub(super) const ACTIVATION_REFUSED_MARKER: &str =
+    "SHIPYARD_FLEET_ACTIVATION_REFUSED=not-developer-id-release";
+/// The codesign the host transaction checks the staged binary with.
+pub(super) const TRANSACTION_CODESIGN: &str = crate::release_identity::CODESIGN;
 const WRAPPER_DEFAULT_HELPER: &str = ".config/shipyard/bin/shipyard-github-app-token";
 const LOCK_ACQUISITION_SCRIPT: &str = r#"
 if [ ! -e "$auth_guard" ] && [ ! -L "$auth_guard" ]; then
@@ -153,6 +162,7 @@ pub(super) fn install_transaction(
     wrapper_source: &str,
     close_guard_source: &str,
     binary_install_command: &str,
+    codesign: &str,
     mode: &str,
     global_dir: &Path,
     state_dir: &Path,
@@ -161,6 +171,14 @@ pub(super) fn install_transaction(
     refresh_prefix: &str,
     fail_after_helper_for_test: bool,
 ) -> String {
+    let codesign = shlex_quote(codesign);
+    let release_requirement = shlex_quote(&format!(
+        "-R={}",
+        crate::release_identity::RELEASE_REQUIREMENT
+    ));
+    let activation_refused_marker = shlex_quote(ACTIVATION_REFUSED_MARKER);
+    let activation_refused_exit = ACTIVATION_REFUSED_EXIT_CODE;
+    let release_team = crate::release_identity::RELEASE_TEAM;
     let helper = shlex_quote(&helper.display().to_string());
     let wrapper = shlex_quote(&wrapper.display().to_string());
     let binary = shlex_quote(&binary.display().to_string());
@@ -1081,6 +1099,21 @@ test "$(/usr/bin/grep -c '^# Shipyard-Stable-Public-Trampoline-Contract: stable-
 {binary_install_command}
 /bin/chmod 700 "$auth_generation_stage/shipyard"
 if [ "$auth_companion_required" = 1 ]; then /bin/chmod 700 "$auth_generation_stage/shipyard-workstream-provider"; fi
+# Only the Developer ID release may become the active shipyard. macOS privacy
+# grants follow its designated requirement, so any other binary (an installer's
+# ad-hoc re-sign, a local build) is a new identity that raises prompts nobody
+# can answer on an unattended host. Checked before anything public moves; the
+# failure is kept inside the substitution so the inherited ERR trap never runs
+# in the subshell.
+auth_identity_out="$({codesign} --verify --strict {release_requirement} "$auth_generation_stage/shipyard" 2>&1 >/dev/null || /usr/bin/printf '\n%s' {activation_refused_marker})"
+case "$auth_identity_out" in
+  *{activation_refused_marker})
+    /usr/bin/printf '%s\n' {activation_refused_marker} >&2
+    /usr/bin/printf '%s\n' "shipyard fleet: refused to activate this release: its shipyard binary is not signed with Developer ID as identifier shipyard by team {release_team}, so macOS would treat it as a new privacy identity. The active generation is unchanged." >&2
+    /usr/bin/printf 'codesign: %s\n' "$(/usr/bin/printf '%s\n' "$auth_identity_out" | /usr/bin/head -n 1)" >&2
+    auth_release_after_failure {activation_refused_exit}
+    ;;
+esac
 auth_stage_helper_digest="$(/usr/bin/shasum -a 256 "$auth_generation_stage/shipyard-github-app-token" | /usr/bin/awk '{{print $1}}')"
 auth_stage_wrapper_digest="$(/usr/bin/shasum -a 256 "$auth_generation_stage/ghapp" | /usr/bin/awk '{{print $1}}')"
 auth_stage_trampoline_digest="$(/usr/bin/shasum -a 256 "$auth_generation_stage/ghapp.public-trampoline" | /usr/bin/awk '{{print $1}}')"

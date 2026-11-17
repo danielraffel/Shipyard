@@ -9,6 +9,7 @@ use crate::app::cli::MetricsGateCostArgs;
 use crate::app::{CliFailure, WAIT_EXIT_INVALID};
 use crate::cloud::GitHubActions;
 use crate::config::LoadedConfig;
+use crate::gate_cost::budget::{self, ReadBudget};
 use crate::gate_cost::{self, GateCostQuery, GateCostReport, GateProxies, ReadCache, scorecard};
 use crate::identity::RuntimeMode;
 use crate::output::write_pretty_json;
@@ -17,6 +18,7 @@ use crate::output::write_pretty_json;
 const GITHUB_READ_TIMEOUT: Duration = Duration::from_mins(1);
 const CONFIG_SECTION: &str = "metrics.gate_cost";
 
+#[allow(clippy::too_many_lines)] // One command: scorecard and report paths.
 pub(super) fn gate_cost_command<W: Write>(
     args: MetricsGateCostArgs,
     mode: RuntimeMode,
@@ -29,6 +31,8 @@ pub(super) fn gate_cost_command<W: Write>(
         .map_err(|error| CliFailure::new(2, format!("config error: {error}")))?;
     let now = Utc::now();
     let no_cache = args.no_cache;
+    let args_max_reads = args.max_reads;
+    let cached_only = args.cached_only;
     let scorecard = args.scorecard;
     let flakes = args.flakes;
     let causes = args.causes;
@@ -37,7 +41,7 @@ pub(super) fn gate_cost_command<W: Write>(
     let required_contexts = args.required_contexts.clone();
     let selection_steps = args.selection_steps.clone();
     let export_cases = args.export_cases.clone();
-    let query = resolve_query(args, &config, now)?;
+    let mut query = resolve_query(args, &config, now)?;
     let archive_causes = causes_archive
         .as_deref()
         .map(|dir| scorecard::causes::archive(dir, &query.repo))
@@ -51,7 +55,13 @@ pub(super) fn gate_cost_command<W: Write>(
     let actions = GitHubActions::from_loaded_config(cwd, &config)
         // Route the App token to the repository asked about, not the checkout's.
         .with_repo_override(&query.repo);
+    let budget = ReadBudget::new(
+        args_max_reads.unwrap_or(budget::DEFAULT_MAX_READS),
+        cached_only,
+    );
+    // Every GitHub read goes through the budget; cache hits never reach it.
     let reader = |gh_args: &[String]| {
+        budget.admit()?;
         actions
             .run_gh_with_timeout(gh_args, GITHUB_READ_TIMEOUT)
             .map_err(|error| error.to_string())
@@ -109,9 +119,15 @@ pub(super) fn gate_cost_command<W: Write>(
         write_scorecard(stdout, &report, json_output)?;
         return Ok(std::process::ExitCode::SUCCESS);
     }
-    let observation = gate_cost::gather_cached(&reader, &query, now, &cache)
-        .map_err(|error| CliFailure::new(1, format!("gate-cost read failed: {error}")))?;
-    let report = gate_cost::compute(&observation);
+    let report = bounded_report(
+        &reader,
+        &mut query,
+        &cache,
+        &budget,
+        args_max_reads,
+        cached_only,
+        now,
+    )?;
     if json_output {
         write_pretty_json(stdout, &report)
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
@@ -120,6 +136,119 @@ pub(super) fn gate_cost_command<W: Write>(
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
     }
     Ok(std::process::ExitCode::SUCCESS)
+}
+
+/// The run counts that price the window: one listing read per event,
+/// `per_page=1`, for its `total_count`. The refusal below needs them before
+/// the real reads start.
+fn estimate_reads(
+    reader: &gate_cost::SyncGhReader<'_>,
+    query: &GateCostQuery,
+) -> Result<u64, CliFailure> {
+    let created = format!(
+        "created={}..{}",
+        query.from.format("%Y-%m-%dT%H:%M:%SZ"),
+        query.to.format("%Y-%m-%dT%H:%M:%SZ")
+    );
+    let mut runs = Vec::new();
+    for event in &query.events {
+        let args = [
+            "api".to_owned(),
+            "-X".to_owned(),
+            "GET".to_owned(),
+            format!(
+                "repos/{}/actions/workflows/{}/runs",
+                query.repo, query.workflow
+            ),
+            "-f".to_owned(),
+            format!("event={event}"),
+            "-f".to_owned(),
+            created.clone(),
+            "-f".to_owned(),
+            "per_page=1".to_owned(),
+            "--jq".to_owned(),
+            ".total_count".to_owned(),
+        ];
+        let total = reader(&args)
+            .map_err(|error| CliFailure::new(1, format!("gate-cost estimate failed: {error}")))?
+            .trim()
+            .parse::<u64>()
+            .map_err(|error| {
+                CliFailure::new(
+                    1,
+                    format!("gate-cost estimate: unreadable run count: {error}"),
+                )
+            })?;
+        runs.push((event.clone(), total));
+    }
+    Ok(budget::estimate(&runs))
+}
+
+/// The refusal text when the estimate exceeds the default cap and the caller
+/// did not raise `--max-reads` themselves.
+fn refuse_over_cap(estimate: u64, max_reads: Option<u64>) -> Option<String> {
+    (max_reads.is_none() && estimate > budget::DEFAULT_MAX_READS).then(|| {
+        format!(
+            "gate-cost would send up to {estimate} GitHub reads, over the default cap of {}. \
+             Narrow the window (--since), use --cached-only, or raise the cap explicitly with \
+             --max-reads {estimate}; the reads share the fleet's App budget.",
+            budget::DEFAULT_MAX_READS
+        )
+    })
+}
+
+/// The gate-cost report for `query` within the read budget: the estimate and
+/// its refusal (or, `--cached-only`, the cached window), then the reads, with
+/// a result the budget cut short marked partial.
+fn bounded_report(
+    reader: &gate_cost::SyncGhReader<'_>,
+    query: &mut GateCostQuery,
+    cache: &ReadCache,
+    budget: &ReadBudget,
+    args_max_reads: Option<u64>,
+    cached_only: bool,
+    now: DateTime<Utc>,
+) -> Result<GateCostReport, CliFailure> {
+    if cached_only {
+        let Some((from, to)) = gate_cost::cached_window(cache, query) else {
+            return Err(CliFailure::new(
+                1,
+                "gate-cost --cached-only: no cached run listing for this repository, workflow \
+                 and window length; run it once without --cached-only"
+                    .to_owned(),
+            ));
+        };
+        query.from = from;
+        query.to = to;
+    } else if args_max_reads.is_none() {
+        // An explicit `--max-reads` is never refused, so it needs no estimate;
+        // the estimate's own reads would spend that cap before the real ones.
+        let estimate = estimate_reads(reader, query)?;
+        eprintln!(
+            "gate-cost: estimated up to {estimate} GitHub reads for {} .. {} (ignores the cache); \
+             cap {}",
+            query.from.format("%Y-%m-%dT%H:%M:%SZ"),
+            query.to.format("%Y-%m-%dT%H:%M:%SZ"),
+            budget::DEFAULT_MAX_READS,
+        );
+        if let Some(refusal) = refuse_over_cap(estimate, args_max_reads) {
+            return Err(CliFailure::new(WAIT_EXIT_INVALID, refusal));
+        }
+    }
+    let observation = gate_cost::gather_cached(reader, query, now, cache)
+        .map_err(|error| CliFailure::new(1, format!("gate-cost read failed: {error}")))?;
+    let mut report = gate_cost::compute(&observation);
+    // Refused reads were counted by the cache; the budget counts only sent ones.
+    report.reads.github = budget.sent();
+    report.partial = budget.partial_reason();
+    if let Some(why) = &report.partial {
+        report.telemetry_gaps.push(gate_cost::TelemetryGap {
+            signal: "read_budget".to_owned(),
+            reason: why.clone(),
+        });
+        eprintln!("gate-cost: PARTIAL result: {why}");
+    }
+    Ok(report)
 }
 
 fn write_scorecard<W: Write>(
@@ -425,6 +554,9 @@ fn render(report: &GateCostReport) -> String {
         "{} {} job `{}` into {}, {} .. {}\n",
         report.repo, report.workflow, report.gate_job, report.base_branch, report.from, report.to
     );
+    if let Some(why) = &report.partial {
+        let _ = writeln!(out, "PARTIAL: {why}");
+    }
     render_proxies(&mut out, &report.proxies);
     let _ = writeln!(
         out,
@@ -508,6 +640,104 @@ mod tests {
 
     use super::*;
     use crate::gate_cost::{GateCostObservation, compute};
+
+    #[test]
+    fn an_estimate_over_the_cap_refuses_unless_the_cap_is_raised_explicitly() {
+        let refusal = refuse_over_cap(1_100, None).expect("refused");
+        assert!(
+            refusal.contains("1100") && refusal.contains("--max-reads"),
+            "{refusal}"
+        );
+        assert_eq!(refuse_over_cap(300, None), None, "at the cap is allowed");
+        assert_eq!(
+            refuse_over_cap(1_100, Some(1_100)),
+            None,
+            "raised explicitly"
+        );
+        assert_eq!(
+            refuse_over_cap(1_100, Some(50)),
+            None,
+            "explicit caps stop, not refuse"
+        );
+    }
+
+    #[test]
+    fn an_explicit_max_reads_skips_the_estimate_reads() {
+        let calls = std::sync::Mutex::new(Vec::<String>::new());
+        let reader = |args: &[String]| -> Result<String, String> {
+            calls.lock().expect("calls").push(args.join(" "));
+            Err("gh: fixture".to_owned())
+        };
+        let now = Utc::now();
+        let mut query = GateCostQuery {
+            repo: "o/r".to_owned(),
+            workflow: "build.yml".to_owned(),
+            gate_job: "test".to_owned(),
+            base_branch: "main".to_owned(),
+            events: vec!["pull_request".to_owned()],
+            receipt_job: None,
+            receipt_target: String::new(),
+            from: now - chrono::Duration::days(7),
+            to: now,
+        };
+        let spend = budget::ReadBudget::new(1, false);
+        let _ = bounded_report(
+            &reader,
+            &mut query,
+            &ReadCache::disabled(),
+            &spend,
+            Some(1),
+            false,
+            now,
+        );
+        let calls = calls.lock().expect("calls");
+        assert!(
+            calls.iter().all(|call| !call.contains("per_page=1 ")
+                && !call.ends_with("per_page=1")
+                && !call.contains(".total_count")),
+            "an explicit cap must not send the estimate reads: {calls:?}"
+        );
+        // Control: without an explicit cap the estimate is sent first.
+        calls_control();
+    }
+
+    fn calls_control() {
+        let calls = std::sync::Mutex::new(Vec::<String>::new());
+        let reader = |args: &[String]| -> Result<String, String> {
+            calls.lock().expect("calls").push(args.join(" "));
+            Err("gh: fixture".to_owned())
+        };
+        let now = Utc::now();
+        let mut query = GateCostQuery {
+            repo: "o/r".to_owned(),
+            workflow: "build.yml".to_owned(),
+            gate_job: "test".to_owned(),
+            base_branch: "main".to_owned(),
+            events: vec!["pull_request".to_owned()],
+            receipt_job: None,
+            receipt_target: String::new(),
+            from: now - chrono::Duration::days(7),
+            to: now,
+        };
+        let spend = budget::ReadBudget::new(300, false);
+        let _ = bounded_report(
+            &reader,
+            &mut query,
+            &ReadCache::disabled(),
+            &spend,
+            None,
+            false,
+            now,
+        );
+        assert!(
+            calls
+                .lock()
+                .expect("calls")
+                .iter()
+                .any(|call| call.contains(".total_count")),
+            "control: the default cap sends the estimate"
+        );
+    }
 
     #[test]
     fn unavailable_archive_fails_without_output_or_exports() {

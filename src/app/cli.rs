@@ -1773,6 +1773,16 @@ pub(crate) struct MetricsGateCostArgs {
     /// runs.
     #[arg(long)]
     pub(crate) no_cache: bool,
+    /// Most GitHub reads this run may send (default 300; each `--paginate`
+    /// call counts once). At the cap it stops and marks the result partial.
+    /// Before reading, the run prints an estimate and refuses when it exceeds
+    /// the cap, unless this flag is given explicitly.
+    #[arg(long = "max-reads", value_name = "N")]
+    pub(crate) max_reads: Option<u64>,
+    /// Send no GitHub reads: report only what the local cache holds, over the
+    /// window of the last live run with the same length. Marked partial.
+    #[arg(long = "cached-only", conflicts_with_all = ["no_cache", "scorecard", "max_reads"])]
+    pub(crate) cached_only: bool,
     /// Report the success-rate scorecard instead: per ISO week, open-to-merge
     /// median and p90, merge-queue ejection rate, red-after-push rate on
     /// required checks, and check names red across pull requests.
