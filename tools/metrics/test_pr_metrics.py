@@ -428,6 +428,8 @@ class CommitState(Base):
         done = [r for r in self.RUNS if r["status"] == "completed"]
         rd2 = self.rd(done)
         pm.commit_state(rd2, "s5", dt.timedelta(hours=5))
+        self.assertIsNone(rd2.load("cstate", "s5"))  # finished, but a rerun can still come within the day
+        pm.commit_state(rd2, "s5", dt.timedelta(hours=30))
         self.assertIsNotNone(rd2.load("cstate", "s5"))
 
     def test_a_queued_rerun_with_no_start_time_is_the_newest_run_and_holds_the_push_open(self):
@@ -445,6 +447,11 @@ class CommitState(Base):
         runs = [{"id": 1, "name": "T", "status": "completed", "conclusion": "success", "started_at": T(10, "10:00")},
                 {"id": 2, "name": "T", "status": "queued", "conclusion": None, "started_at": fresh}]
         self.assertFalse(pm.commit_state(self.rd(runs), "s8", dt.timedelta(hours=30))["settled"])
+
+    def test_a_queued_rerun_with_no_start_time_on_an_old_push_is_pending(self):
+        runs = [{"id": 1, "name": "T", "status": "completed", "conclusion": "success", "started_at": T(10, "10:00")},
+                {"id": 2, "name": "T", "status": "queued", "conclusion": None, "started_at": None}]
+        self.assertFalse(pm.commit_state(self.rd(runs), "s10", dt.timedelta(hours=30))["settled"])
 
     def test_a_check_cache_from_before_the_rerun_ordering_is_read_again(self):
         rd = self.rd(self.RUNS)
@@ -585,6 +592,16 @@ class MainRedReads(Base):
         with tempfile.TemporaryDirectory() as d:
             out = pm.build([REPO], d, 500, OWNER, START, NOW, {}, {}, None, gh, controls={}, control=False)
         self.assertIs(out["repos"][REPO]["main_red"]["episodes"][0]["head_red_same_context"], False)  # the 12:10 rerun came after the 10:00 merge
+
+    def test_a_head_context_absent_or_pending_at_the_merge_is_unknown(self):
+        f = pm.head_red_same_context
+        self.assertEqual((f({"Docs": "green"}, ["Test"]), f({"Test": "pending"}, ["Test"]), f({"Test": "green", "X": "red"}, ["Test"]),
+                          f({"Test": "red"}, ["Test", "Y"]), f(None, ["Test"])), (None, None, False, True, None))
+        runs = [{"id": 1, "name": "Test", "status": "completed", "conclusion": "success", "started_at": T(10, "09:00"), "completed_at": T(10, "09:10")},
+                {"id": 2, "name": "Test", "status": "completed", "conclusion": "failure", "started_at": T(10, "09:50"), "completed_at": T(10, "10:20")}]
+        with tempfile.TemporaryDirectory() as d:
+            rd = pm.Reader(REPO, d, 50, lambda path: {"check_runs": runs})
+            self.assertEqual(pm.head_states_at(rd, "h1", T(10, "10:00")), {"Test": "pending"})  # the rerun was running at the merge
 
     def test_an_unknown_head_is_neither_a_change_failure_nor_other_post_merge_red(self):
         s = pm.change_failure_summary([{"main_red": [{"contexts": ["T"], "minutes_to_green": 5.0, "fixer_pr": 2, "head_red_same_context": None}]}])

@@ -739,6 +739,7 @@ def commit_red(rd, sha, required):
     return red & required, settled
 
 
+CACHE_AFTER = dt.timedelta(days=1)  # a push's state is cached once it is a day old: a rerun or late workflow comes sooner
 STUCK_AFTER = dt.timedelta(hours=3)  # a run still queued or running this long after its push is stuck, not pending
 
 
@@ -747,7 +748,8 @@ def commit_state(rd, sha, age=None):
     every run finished}. A context's latest run (by start) decides it. A run that has not finished `STUCK_AFTER` after the
     push (`age`) and `STUCK_AFTER` after its own start is stuck (GitHub keeps phantom queued runs for days) and says
     nothing: it is neither red nor green and does not hold the commit open; a rerun queued minutes ago on an old push is
-    pending. Cached only when every run finished: a stuck run can still finish later.""" 
+    pending. Cached only when every run finished and the push is a day old: a stuck run can still finish, and a rerun or
+    a late workflow can still appear.""" 
     cached = rd.load("cstate", sha)
     if cached is not None and cached.get("v") == CHECKS_VERSION:
         return cached
@@ -764,12 +766,12 @@ def commit_state(rd, sha, age=None):
             return True
         if age is None or age < STUCK_AFTER:
             return False
-        return not c.get("started_at") or now - iso(c["started_at"]) >= STUCK_AFTER
+        return bool(c.get("started_at")) and now - iso(c["started_at"]) >= STUCK_AFTER  # no start time yet: pending
 
     st = {"v": CHECKS_VERSION, "settled": bool(complete and latest and all(done_or_stuck(c) for c in latest.values())),
           "red": sorted(k for k, c in latest.items() if c.get("status") == "completed" and c.get("conclusion") in BAD_CONCLUSIONS),
           "green": sorted(k for k, c in latest.items() if c.get("status") == "completed" and c.get("conclusion") == "success")}
-    if st["settled"] and all(c.get("status") == "completed" for c in latest.values()):
+    if st["settled"] and all(c.get("status") == "completed" for c in latest.values()) and age is not None and age >= CACHE_AFTER:
         rd.save("cstate", sha, st)
     return st
 
@@ -838,25 +840,41 @@ def main_red_episodes(chron, states, pr_by_sha):
     return episodes, skipped
 
 
-def head_red_at(rd, sha, at):
-    """The contexts red on a PR head when it merged: each context's newest run that had finished by `at`. A rerun after
-    the merge does not rewrite history. None when the runs could not be read in full or none had finished by then."""
+def head_states_at(rd, sha, at):
+    """Each context's verdict on a PR head when it merged: the newest run started by `at` decides it, "red" or "green" if
+    it had finished by then, "pending" if not. A rerun after the merge does not rewrite history. None when the runs could
+    not be read in full."""
     key = f"{sha}@{at}"
-    cached = rd.load("headred", key)
+    cached = rd.load("headstate", key)
     if cached is not None and cached.get("v") == CHECKS_VERSION:
-        return set(cached["red"])
+        return cached["states"]
     runs, complete = rd.pages(f"commits/{sha}/check-runs", key="check_runs", max_pages=5)
+    if not complete:
+        return None
     latest = {}
     for c in runs:
+        if (c.get("started_at") or "") <= at and (c["name"] not in latest or run_order(c) > run_order(latest[c["name"]])):
+            latest[c["name"]] = c
+    states = {}
+    for k, c in latest.items():
         done_at = c.get("completed_at") or c.get("started_at")  # the API always sets completed_at on a completed run
-        if c.get("status") == "completed" and (done_at is None or done_at <= at):
-            if c["name"] not in latest or run_order(c) > run_order(latest[c["name"]]):
-                latest[c["name"]] = c
-    if not complete or not latest:
+        if c.get("status") != "completed" or (done_at or "") > at:
+            states[k] = "pending"
+        else:
+            states[k] = "red" if c.get("conclusion") in BAD_CONCLUSIONS else "green" if c.get("conclusion") == "success" else "pending"
+    rd.save("headstate", key, {"v": CHECKS_VERSION, "states": states})
+    return states
+
+
+def head_red_same_context(states, contexts):
+    """True when the head was red in any of the episode's contexts at merge, False only when it was green in all of
+    them, None when any is pending, absent or unread."""
+    if states is None:
         return None
-    red = {k for k, c in latest.items() if c.get("conclusion") in BAD_CONCLUSIONS}
-    rd.save("headred", key, {"v": CHECKS_VERSION, "red": sorted(red)})
-    return red
+    vals = [states.get(c) for c in contexts]
+    if "red" in vals:
+        return True
+    return False if all(v == "green" for v in vals) else None
 
 
 def attributable_pushes(chron, states):
@@ -916,8 +934,7 @@ def detect_main_red(rd, base_commits, merged_list, now=None):
         p = by_sha.get(ep["start_sha"])
         ep["head_red_same_context"] = None
         if p and ep["pr"]:
-            red = head_red_at(rd, p["head"]["sha"], p["merged_at"])
-            ep["head_red_same_context"] = bool(red & set(ep["contexts"])) if red is not None else None
+            ep["head_red_same_context"] = head_red_same_context(head_states_at(rd, p["head"]["sha"], p["merged_at"]), ep["contexts"])
     return episodes, skipped, untracked_contexts(chron, states), attributable_pushes(chron, states)
 
 
