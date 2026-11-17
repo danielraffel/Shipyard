@@ -341,6 +341,25 @@ class Paths(unittest.TestCase):
         self.assertIn("| slow share | clean median (n) | slow median / p90 (n) | top cause |", md)
 
 
+class JobsSkipped(Base):
+    runs = [{"id": 11, "head_sha": f"h{1:040d}"[:40], "event": "pull_request", "status": "completed", "head_branch": "feat"},
+            {"id": 12, "head_sha": "zzz", "event": "merge_group", "status": "completed", "head_branch": "gh-readonly-queue/main/pr-1-abc"}]
+
+    def test_without_job_reads_runs_and_failed_head_runs_still_count_and_nothing_is_cached(self):
+        runs = [dict(r, conclusion="failure", updated_at=T(10, "10:12")) for r in self.runs]
+        gh = world([pr(1, T(10, "09:00"), T(10, "11:00"))], runs=runs, jobs={})  # no jobs route: any jobs read would fail
+        pm.READ_JOB_MINUTES = False
+        try:
+            out = pm.build([REPO], self.cache, 200, OWNER, START, NOW, {}, {}, None, gh, control=False)  # the control reads jobs
+        finally:
+            pm.READ_JOB_MINUTES = True
+        r = self.rows(out)[1]
+        self.assertEqual((r["compute"]["runs"], r["compute"]["complete"], r["compute"]["runner_wait_min"], r["path"]), (2, True, None, "slow"))
+        self.assertIsNone(r["cause_min"]["runner"])
+        self.assertFalse([c for c in gh.calls if "/jobs" in c])
+        self.assertFalse(os.path.exists(os.path.join(self.cache, REPO.replace("/", "__"), "compute", "1.json")))
+
+
 class Correctness(Base):
     def merged_old(self, n, day=5):
         return pr(n, T(day, "09:00"), T(day, "10:00"), sha=f"s{n}" + "0" * 38)

@@ -84,7 +84,7 @@ cannot be ruled out without the run list), and unknown PRs are in neither path. 
 with its n, and the minutes per merged PR that each cause held the slow PRs up: HOLD (each HOLD to the next push
 or the merge), red (each failed head run to the next push or the merge), queue (each enqueue to its removal or the
 merge), runner (queued job time from the jobs' `created_at` to `started_at`) and DIRTY (not measured: the ticks
-record a state, not a duration, so its cell is empty and never zero). The causes overlap and are not additive.
+record a state, not a duration, so its cell is empty and never zero). The causes overlap and are not additive. The per-run jobs reads are most of a compute read; a measurement run can set `pr_metrics.READ_JOB_MINUTES = False` to classify paths from the run list alone (the runner cause is then empty and nothing is cached).
 The top cause is the largest of the measured ones.
 
 ## Sample and comparison

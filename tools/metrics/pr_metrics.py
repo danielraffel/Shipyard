@@ -604,7 +604,7 @@ def cause_minutes(f, comp):
     return {"hold": _wait_until_next(f.get("hold_times") or [], f.get("push_times") or [], m),
             "red": _wait_until_next(comp.get("red_events") or [], f.get("push_times") or [], m) if done else None,
             "queue": _wait_until_next(f.get("enqueue_times") or [], f.get("dequeue_times") or [], m),
-            "runner": comp.get("runner_wait_min") if done else None, "dirty": None}
+            "runner": comp.get("runner_wait_min") if done else None, "dirty": None}  # None when the jobs were not read
 
 
 def enqueue_to_merge(f):
@@ -624,6 +624,9 @@ def load_compute(rd, number, f=None):
     if f is not None and not reads_complete(f):
         return None
     return c
+
+
+READ_JOB_MINUTES = True  # False skips the per-run jobs reads (the bulk of the reads): runs, failed head runs and paths still work
 
 
 def pr_compute(rd, f, runs, runs_complete):
@@ -650,7 +653,7 @@ def pr_compute(rd, f, runs, runs_complete):
     mac = wait = 0.0
     by_wf, red_events = {}, []
     for r in mine.values():
-        a, b, m, w, ok = job_minutes(rd, r)
+        a, b, m, w, ok = job_minutes(rd, r) if READ_JOB_MINUTES else (0.0, 0.0, 0.0, 0.0, True)
         sh += a
         ho += b
         mac += m
@@ -661,7 +664,7 @@ def pr_compute(rd, f, runs, runs_complete):
         level = by_wf.setdefault(r.get("name") or "?", {"pull_request": 0, "merge_group": 0, "push": 0, "other": 0})
         ev = r.get("event")
         level[ev if ev in ("merge_group", "push") else "pull_request" if ev in ("pull_request", "pull_request_target") else "other"] += 1
-    return {"self_hosted_min": round(sh, 1), "hosted_min": round(ho, 1), "macos_min": round(mac, 1), "runner_wait_min": round(wait, 1), "red_events": sorted(red_events), "by_workflow": by_wf,
+    return {"self_hosted_min": round(sh, 1), "hosted_min": round(ho, 1), "macos_min": round(mac, 1), "runner_wait_min": round(wait, 1) if READ_JOB_MINUTES else None, "jobs_read": READ_JOB_MINUTES, "red_events": sorted(red_events), "by_workflow": by_wf,
             "runs": len(mine), "repeat_runs": repeats,
             "group_runs": sum(1 for r in mine.values() if r.get("event") == "merge_group"), "complete": complete}
 
@@ -1044,7 +1047,7 @@ def collect_repo(repo, cache_dir, cap, owner, lo, hi, now, ticks, tick_ctx, fetc
             if comp is None and runs_ok:
                 try:
                     comp = pr_compute(rd, f, runs, runs_ok)
-                    if comp["complete"]:
+                    if comp["complete"] and comp["jobs_read"]:  # minutes not read: do not cache, a full read recomputes
                         rd.save("compute", str(f["number"]), dict(comp, v=COMPUTE_VERSION))
                 except (Truncated, ReadError):
                     comp = None
