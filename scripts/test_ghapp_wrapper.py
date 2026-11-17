@@ -2483,6 +2483,62 @@ class GhappWrapperTests(unittest.TestCase):
                 repos.append(words[words.index("--repo") + 1])
         return repos
 
+    def write_create_gh(self, output: str, status: int = 0) -> None:
+        self.gh.write_text(
+            "#!/bin/sh\n"
+            "printf '%s\\n' \"$*\" > \"$GH_LOG\"\n"
+            f"printf '%s\\n' '{output}'\n"
+            f"exit {status}\n",
+            encoding="utf-8",
+        )
+        self.gh.chmod(0o755)
+
+    def owner_register_calls(self) -> list[str]:
+        if not self.resolver_log.exists():
+            return []
+        return [
+            line
+            for line in self.resolver_log.read_text().splitlines()
+            if line.startswith("owner register")
+        ]
+
+    def test_pr_create_registers_the_owner_without_changing_its_output(self) -> None:
+        url = "https://github.com/owner/repo/pull/77"
+        self.write_create_gh(url)
+        result = self.run_wrapper(
+            "pr", "create", "--title", "x", "--body", "y", "--repo", "owner/repo"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, url + "\n")
+        self.assertEqual(
+            self.owner_register_calls(),
+            ["owner register --pr 77 --repo owner/repo --after-create"],
+        )
+
+    def test_pr_create_that_fails_or_prints_no_pull_request_registers_nothing(
+        self,
+    ) -> None:
+        self.write_create_gh("https://github.com/owner/repo/pull/77", status=1)
+        result = self.run_wrapper(
+            "pr", "create", "--title", "x", "--body", "y", "--repo", "owner/repo"
+        )
+        self.assertEqual(result.returncode, 1)
+        self.write_create_gh("a pull request already exists")
+        result = self.run_wrapper(
+            "pr", "create", "--title", "x", "--body", "y", "--repo", "owner/repo"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.owner_register_calls(), [])
+
+    def test_a_pr_create_dry_run_registers_nothing(self) -> None:
+        self.write_create_gh("https://github.com/owner/repo/pull/77")
+        result = self.run_wrapper(
+            "pr", "create", "--dry-run", "--title", "x", "--body", "y",
+            "--repo", "owner/repo",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.owner_register_calls(), [])
+
     def make_checkout(self, remote: str) -> None:
         subprocess.run(["git", "init", "-q"], cwd=self.root, check=True)
         subprocess.run(

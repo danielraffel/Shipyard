@@ -60,7 +60,12 @@ shipyard owner release --pr N [--repo OWNER/REPO]      # hand it to the repo's r
 branch. `--all` re-registers every record on this host whose session id or
 cmux surface matches this session. `SHIPYARD_OWNER_REGISTER=0` stops
 `shipyard pr`/`ship` from registering (automation pushing for someone else).
-A plain `git push` does not register; run `shipyard owner register` from the
+`ghapp pr create` registers too: after a successful create (stdout captured, no
+`--dry-run`/`--web`) the wrapper runs `shipyard owner register --pr N --repo R
+--after-create`, which follows the same `[relay]` opt-in and
+`SHIPYARD_OWNER_REGISTER=0` rule as `shipyard pr`, never fails the create, and
+prints nothing to stdout. A host's `ghapp` picks this up with the next auth
+generation (`shipyard update`). A plain `git push` does not register; run `shipyard owner register` from the
 pushing session (or a pre-push hook) when ownership moves that way.
 
 ## The relay

@@ -2118,6 +2118,44 @@ sys.stdout.buffer.write(data)
 ' "$1"
 }
 
+# `pr create` registers its session as the pull request's owner, as `shipyard
+# pr` does, so the relay can reach the session when the PR needs it. Best
+# effort: it never changes gh's stdout or exit code, and `shipyard owner
+# register --after-create` itself honours the host's `[relay]` opt-in and
+# SHIPYARD_OWNER_REGISTER=0. Only when stdout is captured (an agent, not a
+# terminal), so an interactive prompt keeps its terminal.
+ghapp_register_owner=0
+if [[ "${1:-} ${2:-}" == "pr create" && "$ghapp_sanitize" != 1 && ! -t 1 ]]; then
+    ghapp_register_owner=1
+    for ghapp_create_arg in "$@"; do
+        case "$ghapp_create_arg" in
+            --dry-run|-w|--web) ghapp_register_owner=0 ;;
+        esac
+    done
+fi
+unset ghapp_create_arg
+if [[ "$ghapp_register_owner" == 1 && ( "${1:-}" != "api" || "$ghapp_stderr_open" == 0 ) ]]; then
+    ghapp_create_out="$(/usr/bin/mktemp /tmp/shipyard-ghapp-create.XXXXXX)"
+    trap '/bin/rm -f -- "$ghapp_create_out"' EXIT
+    set +e
+    "$gh_binary" "$@" >"$ghapp_create_out"
+    ghapp_status=$?
+    set -e
+    /bin/cat -- "$ghapp_create_out" 2>/dev/null || true
+    if [[ "$ghapp_status" == 0 ]]; then
+        ghapp_created_url="$(/usr/bin/grep -E '^https://github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/pull/[0-9]+$' "$ghapp_create_out" 2>/dev/null | /usr/bin/tail -n 1 || true)"
+        if [[ -n "$ghapp_created_url" ]]; then
+            ghapp_created_path="${ghapp_created_url#https://github.com/}"
+            ghapp_created_number="${ghapp_created_path##*/}"
+            ghapp_created_repo="${ghapp_created_path%/pull/*}"
+            PATH="$trusted_path" "$shipyard_binary" owner register \
+                --pr "$ghapp_created_number" --repo "$ghapp_created_repo" \
+                --after-create </dev/null >&2 2>&1 || true
+        fi
+    fi
+    exit "$ghapp_status"
+fi
+
 if [[ "${1:-}" != "api" || "$ghapp_stderr_open" == 0 ]]; then
     if [[ "$ghapp_sanitize" != 1 ]]; then
         exec "$gh_binary" "$@"
