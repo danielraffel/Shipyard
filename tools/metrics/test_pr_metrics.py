@@ -812,6 +812,10 @@ class HoldRounds(Base):
         for k in ("timeline_complete", "commits_complete"):
             self.assertIsNone(pm.hold_rounds(dict(f, **{k: False})))
 
+    def test_a_push_later_in_the_same_minute_as_the_hold_is_its_repair(self):
+        self.assertEqual(pm.hold_rounds(self.f(["2026-11-10T10:05:10Z"], ["2026-11-10T10:05:40Z"])), [1])
+        self.assertEqual(pm.fmt(pm.iso("2026-11-10T10:05:40Z")), "2026-11-10T10:05:40Z")  # push_times keep seconds
+
     def test_a_hold_posted_after_the_merge_is_not_counted(self):
         self.assertEqual(pm.hold_rounds(self.f([T(10, "10:00"), T(10, "12:30")], [T(10, "10:10")])), [1])
 
