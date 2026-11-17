@@ -52,8 +52,8 @@ APP_LOGINS = {"shipyard-local[bot]", "shipyard-local"}
 _GUARD = []
 SIGNALS = ("app_opener", "provenance", "trailer", "session_stamp")
 BAD_CONCLUSIONS = {"failure", "timed_out"}
-FACTS_VERSION = 11
-COMPUTE_VERSION = 4  # compute caches: entries written before this could be marked complete from a partial timeline or commit read
+FACTS_VERSION = 12  # push_times are observed head updates, never commit timestamps
+COMPUTE_VERSION = 5  # compute caches: entries written before this could be marked complete from a partial timeline or commit read or rerun history
 CHECKS_VERSION = 2  # derived correctness caches: entries written before this (incomplete pagination read as clean) are read again
 ESCAPE_WINDOW = dt.timedelta(days=14)
 HORIZON = dt.timedelta(hours=48)
@@ -354,10 +354,15 @@ def pr_facts(rd, pr, owner):
         ready = None if pr.get("draft") else created
     owner_events, agent_events, repairs, holds, ejections, enqueues = [], [], [], [], [], 0
     enqueue_times = []
+    observed_push_times = []
     stamp_commit = False
     for e in tl:
         ev, ts = e.get("event"), e.get("created_at") or e.get("submitted_at")
         body = e.get("body") or ""
+        if ev in ("committed", "head_ref_force_pushed") and ts and ready:
+            observed = iso(ts)
+            if observed and observed > ready:
+                observed_push_times.append(fmt(observed))
         if ev in ("commented", "reviewed") and ts:
             if REPAIRED_RE.search(body):
                 repairs.append(ts)
@@ -419,7 +424,7 @@ def pr_facts(rd, pr, owner):
         "agent_trailer": trailer, "stamp_commit": stamp_commit, "ambiguous_commits": sorted(set(ambiguous)),
         "repair_cycles": len(repairs), "holds": len(holds), "re_holds": re_holds, "size": size,
         "pushes": split, "enqueues": enqueues, "enqueue_times": enqueue_times, "dequeue_times": dequeue_times,
-        "hold_times": sorted(holds), "push_times": sorted(fmt(d) for _, d in pushes.values()), "ejections": ejections,
+        "hold_times": sorted(holds), "push_times": sorted(set(observed_push_times)), "ejections": ejections,
         "labels": sorted(l["name"] for l in pr.get("labels") or []),
         "heads": sorted(heads), "timeline_complete": tl_full, "commits_complete": c_full,
     }
@@ -621,8 +626,13 @@ def cause_minutes(f, comp):
     if not m or not reads_complete(f):  # a partial timeline or commit list omits holds, pushes and queue events: no number, not an undercount
         return None
     done = comp and comp.get("complete")
-    return {"hold": _wait_until_next(f.get("hold_times") or [], f.get("push_times") or [], m),
-            "red": _wait_until_next(comp.get("red_events") or [], f.get("push_times") or [], m) if done else None,
+    push_times = f.get("push_times") or []
+    hold_times = f.get("hold_times") or []
+    red_events = comp.get("red_events") or [] if comp else []
+    hold = None if hold_times and not push_times else _wait_until_next(hold_times, push_times, m)
+    red = None if red_events and not push_times else _wait_until_next(red_events, push_times, m)
+    return {"hold": hold,
+            "red": red if done else None,
             "queue": _wait_until_next(f.get("enqueue_times") or [], f.get("dequeue_times") or [], m),
             "runner": comp.get("runner_wait_min") if done else None, "dirty": None}  # None when the jobs were not read
 
@@ -681,7 +691,15 @@ def pr_compute(rd, f, runs, runs_complete):
         ho += b
         mac += m
         wait += w
-        complete = complete and ok
+        # The Actions run list exposes only the latest conclusion for a rerun. A successful latest attempt
+        # does not establish that an earlier attempt was also successful, so leave the path unknown unless
+        # the latest attempt itself is red (which is independently sufficient to classify the PR as slow).
+        try:
+            attempt = int(r.get("run_attempt") or 1)
+        except (TypeError, ValueError):
+            attempt = 1
+        attempts_known = attempt <= 1 or r.get("conclusion") in BAD_CONCLUSIONS
+        complete = complete and ok and attempts_known
         if (r.get("head_sha") in heads and r.get("event") != "merge_group"
                 and r.get("conclusion") in BAD_CONCLUSIONS and r.get("updated_at")):
             red_events.append(r["updated_at"])  # any failed non-merge-group run on one of the PR's heads
@@ -847,8 +865,17 @@ def path_summary(merged):
     lead = lambda rs: [r["handoff_min"] for r in rs if r["handoff_min"] is not None]
     causes = {}
     for c in CAUSES:
-        vals = [r["cause_min"][c] for r in slow if r.get("cause_min") and r["cause_min"].get(c) is not None]
-        causes[c] = round(sum(vals) / len(merged), 2) if vals and merged else None
+        vals = []
+        measured = True
+        for r in slow:
+            cm = r.get("cause_min")
+            if not cm or cm.get(c) is None:
+                measured = False
+                break
+            vals.append(cm[c])
+        # An unknown slow PR must not be treated as a zero-minute contribution. Withhold the
+        # aggregate until every slow PR has a measured value for this cause.
+        causes[c] = round(sum(vals) / len(merged), 2) if measured and vals and merged else None
     known = {c: v for c, v in causes.items() if v is not None}
     return {
         "merged": len(merged), "unknown": len(merged) - len(clean) - len(slow),

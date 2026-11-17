@@ -87,12 +87,12 @@ read as ejected and as slow.
 
 Each merged PR is `slow` when it had any HOLD, a failed run on one of its heads, an ejection from the merge queue
 or a DIRTY tick; `clean` when none of these and its compute was read in full; otherwise `unknown` (a failed run
-cannot be ruled out without the run list), and unknown PRs are in neither path. The report gives the slow share
+cannot be ruled out without the run list, and a successful rerun does not settle an earlier attempt), and unknown PRs are in neither path. The report gives the slow share
 (slow over slow plus clean), the clean median and the slow median and p90 lead time (first ready to merge), each
 with its n, and the minutes per merged PR that each cause held the slow PRs up: HOLD (each HOLD to the next push
-or the merge), red (each failed head run to the next push or the merge), queue (each enqueue to its removal or the
+or the merge), red (each failed head run to the next observed head update or the merge), queue (each enqueue to its removal or the
 merge), runner (queued job time from the jobs' `created_at` to `started_at`) and DIRTY (not measured: the ticks
-record a state, not a duration, so its cell is empty and never zero). The causes overlap and are not additive. The per-run jobs reads are most of a compute read; a measurement run can set `pr_metrics.READ_JOB_MINUTES = False` to classify paths from the run list alone (the runner cause is then empty and nothing is cached).
+record a state, not a duration, so its cell is empty and never zero). Push endpoints come from GitHub timeline head-update events, not commit timestamps; when an endpoint is unavailable, that cause is unknown. The causes overlap and are not additive. A cause aggregate is withheld when any slow PR lacks a measured value, so an unread value is never treated as zero. The per-run jobs reads are most of a compute read; a measurement run can set `pr_metrics.READ_JOB_MINUTES = False` to classify paths from the run list alone (the runner cause is then empty and nothing is cached).
 The top cause is the largest of the measured ones.
 
 ## Sample and comparison

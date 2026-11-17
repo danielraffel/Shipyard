@@ -341,6 +341,13 @@ class Paths(unittest.TestCase):
         self.assertEqual((p["top_cause"], p["cause_min_per_merge"]["red"], p["cause_min_per_merge"]["hold"], p["cause_min_per_merge"]["dirty"]), ("red", 20.0, 5.0, None))
         self.assertEqual(pm.path_summary([])["top_cause"], None)
 
+    def test_the_summary_withholds_a_cause_when_one_slow_pr_is_unmeasured(self):
+        row = lambda lead, path, red: {"handoff_min": lead, "path": path, "path_why": ["red"] if path == "slow" else [],
+                                       "cause_min": {"hold": 0.0, "red": red, "queue": 0.0, "runner": 0.0, "dirty": None}}
+        p = pm.path_summary([row(40.0, "slow", 60.0), row(50.0, "slow", None), row(20.0, "clean", 0.0)])
+        self.assertIsNone(p["cause_min_per_merge"]["red"])
+        self.assertEqual(p["top_cause"], "hold")
+
     def test_the_report_prints_the_clean_and_slow_table(self):
         out = pm.build([REPO], tempfile.mkdtemp(), 50, OWNER, START, NOW, {}, {}, None, world([pr(1, T(10, "10:00"), T(10, "11:00"))]))
         md = pm.markdown(out)
@@ -417,6 +424,17 @@ class JobsSkipped(Base):
         r = self.rows(out)[1]
         self.assertEqual((r["path"], r["path_why"]), ("slow", ["red"]))
 
+    def test_a_successful_rerun_without_attempt_history_stays_unknown(self):
+        run = dict(self.runs[0], status="completed", conclusion="success", run_attempt=2)
+        gh = world([pr(1, T(10, "09:00"), T(10, "11:00"))], runs=[run], jobs={})
+        pm.READ_JOB_MINUTES = False
+        try:
+            out = pm.build([REPO], self.cache, 200, OWNER, START, NOW, {}, {}, None, gh, control=False)
+        finally:
+            pm.READ_JOB_MINUTES = True
+        r = self.rows(out)[1]
+        self.assertEqual((r["compute"]["complete"], r["path"]), (False, None))
+
 
 class MergeRemoval(Base):
     def test_a_removal_after_the_merge_is_not_an_ejection(self):
@@ -440,6 +458,20 @@ class MergeRemoval(Base):
         out = self.build(world([p], {1: [self.removal("11:00")]}))
         r = self.rows(out)[1]
         self.assertEqual((r["ejections"], "ejection" in r["path_why"]), ([], False))
+
+
+class ObservedPushTimes(Base):
+    def test_cause_minutes_use_observed_force_push_time_not_commit_date(self):
+        p = pr(1, T(10, "09:00"), T(10, "11:00"))
+        tl = {1: [{"event": "commented", "actor": {"login": "x"}, "body": "HOLD", "created_at": T(10, "10:00")},
+                  {"event": "head_ref_force_pushed", "before_sha": "old", "after_sha": "new", "created_at": T(10, "10:30")}]}
+        cm = {1: [commit("new", date=T(10, "09:05"))]}
+        gh = world([p], tl, commits=cm)
+        rd = pm.Reader(REPO, self.cache, 200, gh)
+        f = pm.pr_facts(rd, p, OWNER)
+        self.assertEqual(f["push_times"], [T(10, "10:30")])
+        c = pm.cause_minutes(f, {"complete": True, "red_events": [], "runner_wait_min": 0.0})
+        self.assertEqual(c["hold"], 30.0)
 
 
 class Correctness(Base):
