@@ -5971,7 +5971,7 @@ first actor, first deadline, then two more; L1 repair or adversary, L2
 with the same token kind, the row's `since` (or `merge_group_enqueued_at`,
 or the quarantine line's `since=`), else now. Quarantine file: env
 `SHIPYARD_REVIEW_QUARANTINE` or machine-global `loop.review_quarantine_file`.
-No GitHub reads; `loop_seen` is kept only by applying passes. A head change restarts escalation: `for_row` filters first-sight evidence to times at or after the prior record's `observed_at`, so a stale head-commit date cannot carry level 3 onto a new head. `.shipyard/config.toml` sets `[pr.body] attribution` so `shipyard pr` bodies end with the Claude Code line (the body builder adds it only when configured).
+No GitHub reads; `loop_seen` is kept only by applying passes. A head change restarts escalation: `for_row` filters first-sight evidence to times at or after the prior record's `observed_at`, so a stale head-commit date cannot carry level 3 onto a new head.
 `src/app/merge_steward_cmd/ready_event.rs`: ready on event
 (docs/scheduling-loop.md, "Ready on event"). `runner steward-admit-ready
 --repo R --pr N --head SHA [--apply]`, or `shipyard relay` with
