@@ -2561,6 +2561,27 @@ class GhappWrapperTests(unittest.TestCase):
         time.sleep(0.5)
         self.assertFalse(finished.exists(), "gh outlived the cancelled wrapper")
 
+    def test_pr_create_still_passes_its_stdin_to_gh(self) -> None:
+        self.gh.write_text(
+            "#!/bin/sh\n"
+            "cat > \"$GH_LOG\"\n"
+            "printf '%s\\n' https://github.com/owner/repo/pull/78\n",
+            encoding="utf-8",
+        )
+        self.gh.chmod(0o755)
+        result = subprocess.run(
+            [str(self.wrapper), "pr", "create", "--title", "x", "--body-file", "-",
+             "--repo", "owner/repo"],
+            cwd=self.root,
+            env=self.environment,
+            input="the body\n",
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.gh_log.read_text(), "the body\n")
+
     def test_a_pr_create_dry_run_registers_nothing(self) -> None:
         self.write_create_gh("https://github.com/owner/repo/pull/77")
         result = self.run_wrapper(

@@ -2145,7 +2145,11 @@ if [[ "$ghapp_register_owner" == 1 && ( "${1:-}" != "api" || "$ghapp_stderr_open
         trap 'if [[ -n "$ghapp_create_child" ]]; then kill -'"$ghapp_create_signal"' "$ghapp_create_child" 2>/dev/null || true; fi' "$ghapp_create_signal"
     done
     set +e
-    "$gh_binary" "$@" >"$ghapp_create_out" &
+    # A background command gets /dev/null for stdin unless told otherwise;
+    # `--body-file -` needs the caller's stdin.
+    exec 3<&0
+    "$gh_binary" "$@" <&3 >"$ghapp_create_out" &
+    exec 3<&-
     ghapp_create_child=$!
     wait "$ghapp_create_child"
     ghapp_status=$?
