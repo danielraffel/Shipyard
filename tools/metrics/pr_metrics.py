@@ -69,6 +69,9 @@ MERGE_MAIN_RE = re.compile(r"^Merge (remote-tracking )?branch '?(origin/)?(main|
 DEFAULT_CONTROLS = {  # "owner": [pr, ...] pins PRs with a hand-verified owner action
     "danielraffel/fleet-handbook": {"revert": [(119, 124)], "escape": [(116, 126)]},
     "Generous-Corp/pulp": {"escape": [(12219, 12375), (12338, 12384)]},
+    # hand-verified main-red incident: #1459's merge 71c87fcd turned `Python helper tests [github-hosted]` red on main,
+    # #1462's merge 22f19c07 turned it green (check runs read 2026-11-17)
+    "danielraffel/Shipyard": {"incident": [(1459, 1462)]},
 }
 # Labels that take a PR out of the eligible cohort, with the reason reported.
 # The gate-proof workflows whose runs per merged PR are reported by name, per repo; any other repo shows its busiest workflows.
@@ -713,6 +716,11 @@ def required_contexts(rd, base, tick_ctx):
     return out or None
 
 
+def run_order(c):
+    """Newest run of a context: the highest id (a queued rerun has no start time yet but a newer id), then the start."""
+    return (c.get("id") or 0, c.get("started_at") or "")
+
+
 def commit_red(rd, sha, required):
     """(red_contexts, settled). Settled and cached only when every page was read and every check run completed."""
     cached = rd.load("checks", sha)
@@ -722,7 +730,7 @@ def commit_red(rd, sha, required):
     latest = {}
     for c in runs:
         k = c["name"]
-        if k not in latest or (c.get("started_at") or "") > (latest[k].get("started_at") or ""):
+        if k not in latest or run_order(c) > run_order(latest[k]):
             latest[k] = c
     settled = complete and bool(latest) and all(c.get("status") == "completed" for c in latest.values())
     red = {k for k, c in latest.items() if c.get("conclusion") in BAD_CONCLUSIONS}
@@ -746,7 +754,7 @@ def commit_state(rd, sha, age=None):
     latest = {}
     for c in runs:
         k = c["name"]
-        if k not in latest or (c.get("started_at") or "") > (latest[k].get("started_at") or ""):
+        if k not in latest or run_order(c) > run_order(latest[k]):
             latest[k] = c
     stuck = age is not None and age >= STUCK_AFTER
     st = {"v": CHECKS_VERSION, "settled": bool(complete and latest and (stuck or all(c.get("status") == "completed" for c in latest.values()))),
@@ -761,24 +769,27 @@ def commit_state(rd, sha, age=None):
 # (up to its check timeout, 6 h on Vellum), so the listing starts a day early: that also gives the first PR in the
 # window a settled push before it to compare against.
 BASE_LOOKBACK = dt.timedelta(days=1)
-NOISY_RED_FRACTION = 0.2  # a context red on this share of pushes or more is a gate that flaps, not a check a merge breaks
+NOISY_RED_STARTS = 0.1  # a context that turns red on this share of its pushes or more is a gate that flaps, not a check a merge breaks
 NOISY_MIN_PUSHES = 20  # ... judged only over at least this many pushes, so a short window cannot call a real break noise
 
 
 def untracked_contexts(chron, states):
     """Contexts the detector does not follow: `one_off` (seen on a single push, a per-version or per-event name that can
-    never turn green again) and `noisy` (red on NOISY_RED_FRACTION or more of the pushes it appears on: review-verdict
-    and the reviewer judge are PR gates that read red on most pushes of a merge-queue base)."""
-    seen, red = collections.Counter(), collections.Counter()
+    never turn green again) and `noisy` (turns red, from green or absent, on NOISY_RED_STARTS or more of the pushes it
+    appears on: review-verdict and the reviewer judge are PR gates that flap on a merge-queue base). It counts turns,
+    not red pushes, so one sustained break that stays red for many pushes is still followed."""
+    seen, starts, was_red = collections.Counter(), collections.Counter(), set()
     for sha, _ in chron:
         st = states.get(sha)
         if st and st.get("settled"):
             for c in set(st["red"]) | set(st["green"]):
                 seen[c] += 1
-            for c in st["red"]:
-                red[c] += 1
+            red = set(st["red"])
+            for c in red - was_red:
+                starts[c] += 1
+            was_red = red
     return {"one_off": sorted(c for c, n in seen.items() if n <= 1),
-            "noisy": sorted(c for c, n in seen.items() if n >= NOISY_MIN_PUSHES and red[c] / n >= NOISY_RED_FRACTION)}
+            "noisy": sorted(c for c, n in seen.items() if n >= NOISY_MIN_PUSHES and starts[c] / n >= NOISY_RED_STARTS)}
 
 
 def main_red_episodes(chron, states, pr_by_sha):

@@ -430,6 +430,16 @@ class CommitState(Base):
         pm.commit_state(rd2, "s5", dt.timedelta(hours=5))
         self.assertIsNotNone(rd2.load("cstate", "s5"))
 
+    def test_a_queued_rerun_with_no_start_time_is_the_newest_run_and_holds_the_push_open(self):
+        runs = [{"id": 1, "name": "T", "status": "completed", "conclusion": "failure", "started_at": T(10, "10:00")},
+                {"id": 2, "name": "T", "status": "queued", "conclusion": None, "started_at": None}]
+        rd = self.rd(runs)
+        st = pm.commit_state(rd, "s6", dt.timedelta(minutes=30))
+        self.assertEqual((st["settled"], st["red"]), (False, []))
+        self.assertIsNone(rd.load("cstate", "s6"))
+        red, settled = pm.commit_red(self.rd(runs), "s7", {"T"})
+        self.assertEqual((red, settled), (set(), False))
+
     def test_a_context_seen_on_one_push_only_is_not_tracked_but_a_recurring_one_is(self):
         st = lambda red=(), green=(): {"settled": True, "red": sorted(red), "green": sorted(green)}
         chron = [("a", T(10, "10:00")), ("b", T(10, "10:10")), ("c", T(10, "10:20"))]
@@ -453,6 +463,21 @@ class NoisyContexts(unittest.TestCase):
         self.assertEqual([e["contexts"] for e in eps], [["Test"]])
         short = pm.untracked_contexts(chron[:3], states)
         self.assertEqual(short["noisy"], [])  # three pushes are too few to call anything noise
+
+
+class SustainedRed(unittest.TestCase):
+    def test_a_check_that_breaks_and_stays_red_is_followed_not_called_noise(self):
+        st = lambda red=(), green=(): {"settled": True, "red": sorted(red), "green": sorted(green)}
+        chron = [(f"p{i}", T(10, f"10:{i:02d}")) for i in range(24)]
+        states = {sha: (st(green=["T"]) if i < 16 else st(red=["T"])) for i, (sha, _) in enumerate(chron)}  # red on the last 8 of 24
+        self.assertEqual(pm.untracked_contexts(chron, states)["noisy"], [])
+        eps, _ = pm.main_red_episodes(chron, states, {sha: i for i, (sha, _) in enumerate(chron)})
+        self.assertEqual([(e["pr"], e["contexts"], e["minutes_to_green"]) for e in eps], [(16, ["T"], None)])
+
+
+class IncidentControls(unittest.TestCase):
+    def test_shipyard_carries_its_hand_verified_main_red_incident(self):
+        self.assertIn((1459, 1462), pm.DEFAULT_CONTROLS["danielraffel/Shipyard"]["incident"])
 
 
 class BaseOrder(unittest.TestCase):
