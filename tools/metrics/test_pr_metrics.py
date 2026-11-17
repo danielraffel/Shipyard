@@ -384,6 +384,50 @@ class MainRed(unittest.TestCase):
         self.assertEqual([(e["pr"], e["fixer_pr"]) for e in eps], [(1, 2), (3, 4)])
 
 
+class CommitState(Base):
+    def rd(self, runs):
+        return pm.Reader(REPO, self.cache, 50, lambda path: {"check_runs": runs})
+
+    RUNS = [{"name": "T", "status": "completed", "conclusion": "success", "started_at": T(10, "10:00")},
+            {"name": "Phantom", "status": "queued", "conclusion": None, "started_at": T(10, "10:00")},
+            {"name": "Bad", "status": "completed", "conclusion": "failure", "started_at": T(10, "10:00")}]
+
+    def test_a_run_still_queued_long_after_the_push_is_stuck_and_does_not_hold_the_commit_open(self):
+        st = pm.commit_state(self.rd(self.RUNS), "s1", dt.timedelta(hours=5))
+        self.assertEqual((st["settled"], st["red"], st["green"]), (True, ["Bad"], ["T"]))  # the phantom is neither red nor green
+
+    def test_a_run_still_running_soon_after_the_push_is_pending_and_the_commit_is_unsettled_and_not_cached(self):
+        rd = self.rd(self.RUNS)
+        st = pm.commit_state(rd, "s2", dt.timedelta(minutes=30))
+        self.assertFalse(st["settled"])
+        self.assertIsNone(rd.load("cstate", "s2"))
+        self.assertFalse(pm.commit_state(self.rd(self.RUNS), "s3")["settled"])  # no age given: never stuck
+
+    def test_a_context_seen_on_one_push_only_is_not_tracked_but_a_recurring_one_is(self):
+        st = lambda red=(), green=(): {"settled": True, "red": sorted(red), "green": sorted(green)}
+        chron = [("a", T(10, "10:00")), ("b", T(10, "10:10")), ("c", T(10, "10:20"))]
+        states = {"a": st(green=["T"]), "b": st(red=["T", "Regenerate docs for v1.2"]), "c": st(green=["T"])}
+        eps, _ = pm.main_red_episodes(chron, states, {"a": 1, "b": 2, "c": 3})
+        self.assertEqual([(e["pr"], e["contexts"], e["fixer_pr"]) for e in eps], [(2, ["T"], 3)])  # the per-version context never recurs
+
+
+class NoisyContexts(unittest.TestCase):
+    def test_a_gate_that_is_red_on_a_fifth_of_many_pushes_is_not_tracked_but_a_real_break_in_a_short_window_is(self):
+        st = lambda red=(), green=(): {"settled": True, "red": sorted(red), "green": sorted(green)}
+        chron = [(f"p{i}", T(10, f"10:{i:02d}")) for i in range(30)]
+        states = {sha: st(red=["gate"] if i % 3 == 0 else [], green=[] if i % 3 == 0 else ["gate"]) for i, (sha, _) in enumerate(chron)}  # red on 10 of 30
+        states["p5"]["red"], states["p5"]["green"] = ["Test"], ["gate"]
+        for sha in states:
+            if sha != "p5":
+                states[sha]["green"] = sorted(set(states[sha]["green"]) | {"Test"})
+        u = pm.untracked_contexts(chron, states)
+        self.assertEqual(u["noisy"], ["gate"])  # Test is red on 1 of 30 pushes: tracked
+        eps, _ = pm.main_red_episodes(chron, states, {sha: i for i, (sha, _) in enumerate(chron)})
+        self.assertEqual([e["contexts"] for e in eps], [["Test"]])
+        short = pm.untracked_contexts(chron[:3], states)
+        self.assertEqual(short["noisy"], [])  # three pushes are too few to call anything noise
+
+
 class BaseOrder(unittest.TestCase):
     def c(self, sha, parent, date):
         return {"sha": sha, "parents": [{"sha": parent}] if parent else [], "commit": {"committer": {"date": date}}}
@@ -408,8 +452,21 @@ class BaseOrder(unittest.TestCase):
         base = [self.c("base0", None, T(10, "08:00")), self.c(a["merge_commit_sha"], "base0", T(10, "01:00")), self.c(b["merge_commit_sha"], a["merge_commit_sha"], T(10, "02:00"))]
         gh = world([a, b], base_commits=base, checks={"base0": ok, a["merge_commit_sha"]: red, b["merge_commit_sha"]: ok, a["head"]["sha"]: ok})
         with tempfile.TemporaryDirectory() as d:
-            eps, _ = pm.detect_main_red(pm.Reader(REPO, d, 100, gh), base, [a, b])
+            eps, _, _ = pm.detect_main_red(pm.Reader(REPO, d, 100, gh), base, [a, b])
         self.assertEqual((eps[0]["pr"], eps[0]["fixer_pr"], eps[0]["minutes_to_green"]), (1, 2, 30.0))  # 10:00 to 10:30, not 01:00 to 02:00
+
+
+    def test_a_push_written_before_the_one_ahead_of_it_never_gives_a_negative_time_to_green(self):
+        a = pr(1, T(10, "09:00"), T(10, "10:00"))
+        a["merge_commit_sha"], a["head"]["sha"] = "ma" * 20, "ha" * 20
+        red = [{"name": "T", "status": "completed", "conclusion": "failure", "started_at": T(10, "10:00")}]
+        ok = [{"name": "T", "status": "completed", "conclusion": "success", "started_at": T(10, "10:00")}]
+        # the fixer is a direct push whose commit was written (09:00) before PR 1 merged (10:00)
+        base = [self.c("base0", None, T(10, "08:00")), self.c(a["merge_commit_sha"], "base0", T(10, "09:30")), self.c("direct", a["merge_commit_sha"], T(10, "09:00"))]
+        gh = world([a], base_commits=base, checks={"base0": ok, a["merge_commit_sha"]: red, "direct": ok, a["head"]["sha"]: red})
+        with tempfile.TemporaryDirectory() as d:
+            eps, _, _ = pm.detect_main_red(pm.Reader(REPO, d, 100, gh), base, [a])
+        self.assertEqual((eps[0]["pr"], eps[0]["minutes_to_green"]), (1, 0.0))
 
 
 class MainRedReads(Base):
@@ -440,6 +497,14 @@ class MainRedReads(Base):
             rows = {r["pr"]: r for r in v["prs"]}
             self.assertEqual((len(rows[1]["main_red"]), rows[2]["main_red"]), (1, []))
 
+    def test_an_episode_whose_head_was_green_is_other_post_merge_red_not_a_change_failure(self):
+        a, b = self.merged()
+        for head_red, cf, other in ((True, 1, 0), (False, 0, 1)):
+            with tempfile.TemporaryDirectory() as d:
+                out = pm.build([REPO], d, 500, OWNER, START, NOW, {}, {}, None, self.world(a, b, self.base(a, b), head_red), controls={}, control=False)
+            s = out["repos"][REPO]["per_day"]["2026-11-10"]["change_failure"]
+            self.assertEqual((s["change_failures"], s["other_post_merge_red"], s["episodes"], s["minutes_to_green"] if cf else []), (cf, other, 1, [60.0] if cf else []))
+
     def test_a_missed_known_incident_fails_the_control_and_withholds_change_failure_only(self):
         a, b = self.merged()
         with tempfile.TemporaryDirectory() as d:
@@ -464,8 +529,11 @@ class MainRedReads(Base):
         with tempfile.TemporaryDirectory() as d:
             out = pm.build([REPO], d, 500, OWNER, START, NOW, {}, {}, None, self.world(a, b, self.base(a, b), True), controls={REPO: {"incident": [(1, 2)]}}, control=False)
         md = pm.markdown(out)
-        self.assertIn("### Main-red episodes caused by merges (change failure, window)", md)
-        self.assertIn(f"| {REPO} | 2 | 1 | 1 | 60.0 | 0 | 1 | 1/1 | 0 |", md)
+        self.assertIn("### Change failures: merges that went to main red (window)", md)
+        self.assertIn(f"| {REPO} | 2 | 1 | 60.0 | 0 | 0 | 1/1 | 0 |", md)
+        self.assertNotIn("not tracked:", md)  # nothing untracked in this small world
+        out["repos"][REPO]["main_red"]["untracked_contexts"] = {"noisy": ["review-verdict"], "one_off": ["x", "y"]}
+        self.assertIn(f"- {REPO}: not tracked: noisy gates review-verdict; 2 one-off contexts", pm.markdown(out))
 
 
 class EjectionCause(Base):
@@ -1395,7 +1463,7 @@ class SyntheticControl(unittest.TestCase):
         out = pm.build([REPO], tempfile.mkdtemp(), 50, OWNER, START, NOW, {}, {}, None, world([pr(1, T(10, "10:00"), T(10, "11:00"))]))
         self.assertEqual(out["synthetic_control"]["status"], "pass")
         md = pm.markdown(out)
-        self.assertIn("**CONTROL PASS: 60 of 60", md)
+        self.assertIn("**CONTROL PASS: 63 of 63", md)
         self.assertIn("| ready day |", md)
 
     def test_a_repo_with_no_live_control_reads_synthetic_not_unchecked(self):

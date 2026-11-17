@@ -38,7 +38,7 @@ it is on only when the tick passes `--e2e-cache DIR` (the daily run does, unless
 **Synthetic control (every report).** `tools/metrics/synthetic_control.py` holds fifteen invented PRs, each
 built to have one known outcome (autonomous, owner label, steward merge, unbound owner merge, unsigned owner
 PR, never merged, reverted, red base, escaped, twice held with repair and merge-main pushes, ejected from the
-queue, a gate-run fixture with repeats). `expected()` derives 60 numbers from that table with plain arithmetic
+queue, a gate-run fixture with repeats). `expected()` derives 63 numbers from that table with plain arithmetic
 and never calls the scorecard; the real `pr_metrics.build` then runs over the same PRs, served from memory (no
 GitHub read, a throwaway cache), and every number must match. The report prints one line, `CONTROL PASS` with the
 count and the largest delta, or `CONTROL FAIL` with each missed number, its expected value, its value and the delta.
@@ -93,7 +93,7 @@ The detector reads the checks of every push to the base in the window (each cont
 with unfinished runs or an unread page says nothing and is skipped). An episode starts at the first push where a
 context is red that was not red before and is attributed to the PR whose merge commit that push is (a direct push,
 or a first usable push that is already red, has no PR). It ends at the push where its last context turns green; that
-push's PR is the fixer. Pushes are ordered by first-parent links, not commit dates (a merge queue fast-forwards the base, so each commit keeps its own older date), and a PR's push time is its `merged_at`. The report prints counts and the raw minutes to green, with no rate and no median, plus
+push's PR is the fixer. A run still queued or running three hours after its push is stuck (GitHub keeps phantom queued runs for days): it is neither red nor green and does not hold the push open. A context seen on one push only (a per-version or per-event name) can never turn green again and is not tracked. A context red on a fifth or more of the pushes it appears on (judged over at least 20 pushes) is a PR gate that flaps on a merge-queue base (`review-verdict`, the reviewer `judge`), not a check a merge breaks, and is not tracked either; the report lists both kinds. Pushes are ordered by first-parent links, not commit dates (a merge queue fast-forwards the base, so each commit keeps its own older date), and a PR's push time is its `merged_at`. The report prints counts and the raw minutes to green, with no rate and no median, plus
 `head red`: episodes whose PR's own final head was red in the same context when it merged. A known-incident control
 (`DEFAULT_CONTROLS[repo]["incident"] = [(escaped PR, fixer PR)]`) must be found: the report prints recall k/n, and a
 miss fails the control and withholds the change-failure cells only. `base_red` and the text-matched escape stay as
