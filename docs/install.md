@@ -574,11 +574,14 @@ identity, so any other binary, such as an ad-hoc signed or local build, is a
 new identity and raises privacy prompts again; on an unattended host nobody
 answers them and the work behind them stalls. A binary that fails is not
 installed, and the previous install stays in place:
-- `install.sh` checks the staged binaries before the swap and the installed
-  ones after it, and its rollback restores the previous pair;
-- `shipyard update` runs the target tag's own installer, which may predate
-  that check, so it snapshots the installed pair first, checks what the
-  installer left, and restores the snapshot on a failure.
+- `install.sh` checks each staged binary before running it (the smoke test
+  executes it) and before the swap, and each installed one after the swap,
+  where its rollback restores the previous pair. The check always runs the
+  system `/usr/bin/codesign`; nothing in the environment changes that.
+- `shipyard update` runs the target tag's own installer. An installer from
+  before the check writes in place and nothing can undo it, so on macOS the
+  update refuses a target whose installer lacks the check, before running any
+  of it. Update to a release whose installer has it.
 
 The installer no longer re-signs anything ad hoc, neither a binary without a
 Developer ID team nor a notarized binary that would not launch.
@@ -630,8 +633,9 @@ identity and asks again for every protected location it touches.
 **Owner-only developer mode.** `SHIPYARD_INSTALL_ALLOW_UNSIGNED_DEV=1` lets
 `install.sh` (for example with `SHIPYARD_SKIP_DOWNLOAD=1` over a copied
 local build) and `shipyard update` install a binary that is not the
-Developer ID release. In that mode `install.sh` also re-signs ad hoc as it
-used to. It is for the repository owner at an interactive terminal only.
+Developer ID release (and lets `shipyard update` run an older installer). In
+that mode `install.sh` also re-signs a binary without a Developer ID team ad
+hoc as it used to; it never strips a release signature. It is for the repository owner at an interactive terminal only.
 Agents, scripts, LaunchAgents and fleet hosts never set it.
 
 ## Requirements and optional tools
