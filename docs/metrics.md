@@ -35,6 +35,17 @@ it is on only when the tick passes `--e2e-cache DIR` (the daily run does, unless
 
 ## Controls
 
+**Synthetic control (every report).** `tools/metrics/synthetic_control.py` holds fifteen invented PRs, each
+built to have one known outcome (autonomous, owner label, steward merge, unbound owner merge, unsigned owner
+PR, never merged, reverted, red base, escaped, twice held with repair and merge-main pushes, ejected from the
+queue, a gate-run fixture with repeats). `expected()` derives 31 numbers from that table with plain arithmetic
+and never calls the scorecard; the real `pr_metrics.build` then runs over the same PRs, served from memory (no
+GitHub read, a throwaway cache), and every number must match. The report prints one line, `CONTROL PASS` with the
+count and the largest delta, or `CONTROL FAIL` with each missed number, its expected value, its value and the delta.
+On a failure the report withholds every outcome number (the per-day tables, the window and baseline pooled rows,
+and the per-PR rows in the JSON) and says so: an instrument that cannot reproduce numbers built into it says
+nothing about live data. The live positive controls below stay as a second check on real PRs.
+
 A zero is printed with its positive control's count. Built-in controls: fleet-handbook #124 reverted
 #119 (the revert detector must find it) and #126's title names #116 (the escape detector must find
 it). `DEFAULT_CONTROLS` can also pin `"owner": [pr, ...]`, PRs with a hand-verified owner action that

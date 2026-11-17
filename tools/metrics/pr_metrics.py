@@ -59,7 +59,7 @@ ESCAPE_WINDOW = dt.timedelta(days=14)
 HORIZON = dt.timedelta(hours=48)
 MIN_SAMPLE = 50
 UNKNOWN_RANGE_SHARE = 0.20
-SCORECARD_VERSION = "2026-11-16.1"
+SCORECARD_VERSION = "2026-11-17.1"
 MERGE_MAIN_RE = re.compile(r"^Merge (remote-tracking )?branch '?(origin/)?(main|master)'?|^Merge pull request .* from .*/main", re.I)
 # Positive controls: a real revert (#124 reverted #119), a real escaped defect (#126 names #116).
 DEFAULT_CONTROLS = {"danielraffel/fleet-handbook": {"revert": [(119, 124)], "escape": [(116, 126)]}}  # "owner": [pr, ...] pins PRs with a hand-verified owner action
@@ -977,8 +977,11 @@ def check_controls(repo, rows, controls, refused):
 
 
 def build(repos, cache_dir, cap, owner, start, now, ticks, tick_ctx, baseline=None, fetch=None, bases=None,
-          dirty=None, controls=None, refused=None):
-    """The `end_to_end` report section. `ticks`: repo -> [datetimes a base_poison red-everywhere episode began]."""
+          dirty=None, controls=None, refused=None, control=None):
+    """The `end_to_end` report section. `ticks`: repo -> [datetimes a base_poison red-everywhere episode began].
+    `control`: None runs the synthetic control (tools/metrics/synthetic_control.py) on every call; False skips it
+    (the control itself runs with False); a callable returns a control result. A failed control withholds every
+    outcome number: the report then carries only the failure and its deltas."""
     lo = start
     if baseline:
         lo = min(lo, baseline[0])
@@ -1036,7 +1039,30 @@ def build(repos, cache_dir, cap, owner, start, now, ticks, tick_ctx, baseline=No
         bs = (out["baseline"] or {}).get("per_repo", {}).get(repo)
         a, b = s["north_star"]["rate_ci95"], (bs or {}).get("north_star", {}).get("rate_ci95")
         s["north_star"]["overlaps_baseline"] = None if not (a and b) else not (a[0] > b[1] or b[0] > a[1])
+    out["synthetic_control"] = run_synthetic_control(control)
+    if out["synthetic_control"] and out["synthetic_control"]["status"] == "pass":
+        for v in out["repos"].values():  # no live PR may pin a control for this repo; the injected case covers every repo
+            if v["controls"]["status"] == "unchecked":
+                v["controls"]["status"] = "synthetic"
+    if out["synthetic_control"] and out["synthetic_control"]["status"] != "pass":
+        out["withheld"] = "the synthetic control failed, so no outcome number is reported"
+        for v in out["repos"].values():
+            v["per_day"], v["prs"] = {}, []
+        out["window"]["per_repo"], out["baseline"] = {}, None
     return out
+
+
+def run_synthetic_control(control):
+    """The synthetic control's result for this report, or None when it is switched off."""
+    if control is False:
+        return None
+    if callable(control):
+        return control()
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    import synthetic_control
+    return synthetic_control.run(sys.modules[__name__])
 
 
 def ci(x):
@@ -1078,6 +1104,12 @@ def markdown(e2e):
          "Handoff-to-merge is load-dependent context, not the verdict. Verdict proxies: review rounds (HOLDs) and re-HOLD rate per PR, agent pushes by kind "
          "(repair after a HOLD or `repaired:`, author before, merge-main), merge-queue attempts and ejections by cause, DIRTY per 100 PRs, gate runs per merged PR "
          "(repeats counted; minutes are context). Correctness: revert or red required check on the base within 7 days; escaped defect (best effort, titles and bodies naming the PR only) within 14.", ""]
+    sc = e2e.get("synthetic_control")
+    if sc:
+        import synthetic_control
+        L += [f"**{synthetic_control.line(sc)}**", ""]
+        if sc["status"] != "pass":
+            return "\n".join(L + ["**Outcome numbers are withheld: the instrument did not reproduce its own injected case. Nothing below this line is reported.**", ""]) + "\n"
     if e2e["controls_failed"]:
         L += ["**CONTROL FAILED for some metrics (those cells read `withheld`; everything else is reported).** A positive control read zero, so that instrument is broken:", ""]
         for repo, v in sorted(e2e["repos"].items()):
