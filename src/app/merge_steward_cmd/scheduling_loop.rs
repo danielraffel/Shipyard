@@ -424,7 +424,7 @@ pub(crate) const DEFAULT_QUARANTINE_RELATIVE: &str =
 /// not exist; [`read_quarantine`] treats a missing file as no quarantine.
 #[must_use]
 pub(crate) fn quarantine_path(global_dir: Option<&Path>) -> Option<PathBuf> {
-    quarantine_path_in(global_dir, std::env::var_os("HOME").map(PathBuf::from))
+    quarantine_path_in(global_dir, Some(crate::paths::home_dir()))
 }
 
 fn quarantine_path_in(global_dir: Option<&Path>, home: Option<PathBuf>) -> Option<PathBuf> {
@@ -658,6 +658,21 @@ pub(super) fn annotate(
 #[cfg(test)]
 mod default_path_tests {
     use super::*;
+
+    /// Under test the home is the per-process empty one, never the host's:
+    /// no steward test reads a real quarantine file.
+    #[test]
+    fn the_default_path_is_under_the_test_home_not_the_real_one() {
+        if std::env::var_os(QUARANTINE_ENV).is_some() {
+            return;
+        }
+        let path = quarantine_path(None).expect("default");
+        assert_eq!(
+            path,
+            crate::paths::home_dir().join(DEFAULT_QUARANTINE_RELATIVE)
+        );
+        assert!(read_quarantine(Some(&path)).is_empty());
+    }
 
     #[test]
     fn an_unconfigured_host_defaults_to_the_fleet_pass_runner_file() {
