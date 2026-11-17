@@ -295,6 +295,7 @@ pub(crate) fn state_for(
         }
         "no_verdict"
         | "awaiting_review"
+        | "review_quarantined"
         | "waiting_head_approval"
         | "approval_excluded"
         | "waiting_code_owner"
@@ -413,26 +414,41 @@ pub(crate) fn parse_quarantine(text: &str) -> Quarantine {
     out
 }
 
-/// The quarantine file this host names, if any: the environment variable,
-/// then the machine-global key.
+/// Where the fleet's pass-runner writes its quarantine file, under `$HOME`,
+/// used when neither the environment nor the machine-global config names one.
+pub(crate) const DEFAULT_QUARANTINE_RELATIVE: &str =
+    ".local/share/shipyard-steward/pass-runner/review-quarantine.txt";
+
+/// The quarantine file this host names: the environment variable, then the
+/// machine-global key, then the fleet default under `$HOME`. The default may
+/// not exist; [`read_quarantine`] treats a missing file as no quarantine.
 #[must_use]
 pub(crate) fn quarantine_path(global_dir: Option<&Path>) -> Option<PathBuf> {
+    quarantine_path_in(global_dir, Some(crate::paths::home_dir()))
+}
+
+fn quarantine_path_in(global_dir: Option<&Path>, home: Option<PathBuf>) -> Option<PathBuf> {
     if let Some(path) = std::env::var_os(QUARANTINE_ENV).filter(|value| !value.is_empty()) {
         return Some(PathBuf::from(path));
     }
-    let config =
-        crate::config::LoadedConfig::load_machine_global_from_dir(global_dir?.to_path_buf())
-            .ok()?;
-    config
-        .get_str(QUARANTINE_KEY)
-        .map(str::trim)
-        .filter(|path| !path.is_empty())
-        .map(
-            |path| match (path.strip_prefix("~/"), std::env::var_os("HOME")) {
-                (Some(rest), Some(home)) => PathBuf::from(home).join(rest),
-                _ => PathBuf::from(path),
-            },
-        )
+    let configured = global_dir
+        .and_then(|dir| {
+            crate::config::LoadedConfig::load_machine_global_from_dir(dir.to_path_buf()).ok()
+        })
+        .and_then(|config| {
+            config
+                .get_str(QUARANTINE_KEY)
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+                .map(str::to_owned)
+        });
+    match configured {
+        Some(path) => Some(match (path.strip_prefix("~/"), home.as_ref()) {
+            (Some(rest), Some(home)) => home.join(rest),
+            _ => PathBuf::from(path),
+        }),
+        None => home.map(|home| home.join(DEFAULT_QUARANTINE_RELATIVE)),
+    }
 }
 
 /// Read the quarantine file. Absent, unnamed or unreadable: no quarantine,
@@ -636,5 +652,57 @@ pub(super) fn annotate(
             .collect::<std::collections::BTreeSet<_>>();
         seen.retain(|key, _| !key.starts_with(&prefix) || open.contains(key));
         seen.extend(next);
+    }
+}
+
+#[cfg(test)]
+mod default_path_tests {
+    use super::*;
+
+    /// Under test the home is the per-process empty one, never the host's:
+    /// no steward test reads a real quarantine file.
+    #[test]
+    fn the_default_path_is_under_the_test_home_not_the_real_one() {
+        if std::env::var_os(QUARANTINE_ENV).is_some() {
+            return;
+        }
+        let path = quarantine_path(None).expect("default");
+        assert_eq!(
+            path,
+            crate::paths::home_dir().join(DEFAULT_QUARANTINE_RELATIVE)
+        );
+        assert!(read_quarantine(Some(&path)).is_empty());
+    }
+
+    #[test]
+    fn an_unconfigured_host_defaults_to_the_fleet_pass_runner_file() {
+        if std::env::var_os(QUARANTINE_ENV).is_some() {
+            return;
+        }
+        let home = tempfile::tempdir().expect("home");
+        let path = quarantine_path_in(None, Some(home.path().to_path_buf())).expect("default");
+        assert_eq!(path, home.path().join(DEFAULT_QUARANTINE_RELATIVE));
+        // The default file is absent: no quarantine, no error.
+        assert!(read_quarantine(Some(&path)).is_empty());
+        // Present: read like any configured file.
+        std::fs::create_dir_all(path.parent().expect("dir")).expect("mkdir");
+        let head = "a".repeat(40);
+        std::fs::write(
+            &path,
+            format!("o/r#7 {head} reviewer_unverified_exhausted\n"),
+        )
+        .expect("w");
+        assert_eq!(read_quarantine(Some(&path)).len(), 1);
+        // A configured key still wins over the default.
+        let global = tempfile::tempdir().expect("global");
+        std::fs::write(
+            global.path().join("config.toml"),
+            "[loop]\nreview_quarantine_file = \"~/custom.txt\"\n",
+        )
+        .expect("cfg");
+        assert_eq!(
+            quarantine_path_in(Some(global.path()), Some(home.path().to_path_buf())),
+            Some(home.path().join("custom.txt"))
+        );
     }
 }
