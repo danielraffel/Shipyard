@@ -133,6 +133,10 @@ names is quarantined; a new head is classified normally.
   head, the row's own `since`), else this pass. For `queued` and
   `quarantined` only the enqueue and the quarantine line count, since the
   row's token and its times describe another state.
+  When an earlier head of the pull request is on record, the new head is a
+  push and escalation restarts: only evidence no older than the last pass that
+  saw the old head counts (a head commit's date is the author's clock and can
+  predate the push by a day), else this pass, so the level is 0.
 
 ## Records
 
