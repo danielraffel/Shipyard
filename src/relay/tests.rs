@@ -12,6 +12,7 @@ use crate::owner_registry::{self, OwnerRecord, SessionIdentity, Source};
 
 const REPO: &str = "Generous-Corp/pulp";
 const HEAD_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const NULL_BODY: &str = "\u{0}null";
 const HEAD_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const BASE_1: &str = "1111111111111111111111111111111111111111";
 const BASE_2: &str = "2222222222222222222222222222222222222222";
@@ -667,6 +668,12 @@ impl FakeGitHub {
                 .borrow()
                 .iter()
                 .map(|(n, body)| {
+                    // `NULL_BODY` stands for GitHub's null body (none written).
+                    let body = if body == NULL_BODY {
+                        Value::Null
+                    } else {
+                        json!(body)
+                    };
                     json!({"number": n, "body": body, "isDraft": self.drafts.borrow().contains(n)})
                 })
                 .collect();
@@ -1628,6 +1635,19 @@ fn a_second_ejection_of_an_unowned_pull_request_is_a_new_fact() {
     h.gh.set(out);
     h.pass(30, Mode::Send);
     assert_eq!(h.deliveries().len(), 2, "{:?}", h.deliveries());
+}
+
+#[test]
+fn an_unowned_pull_request_with_no_body_still_reaches_the_lead() {
+    let mut pr = Pr::open(543);
+    pr.comments.push(verdict("HOLD", HEAD_A));
+    let mut h = unowned_harness(&pr, true);
+    h.gh.open_bodies
+        .borrow_mut()
+        .insert(543, NULL_BODY.to_owned());
+    h.pass(0, Mode::Send);
+    assert_eq!(h.deliveries().len(), 1, "{:?}", h.deliveries());
+    assert_eq!(h.deliveries()[0]["tier"], "lead");
 }
 
 #[test]

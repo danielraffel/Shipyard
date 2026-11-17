@@ -839,10 +839,10 @@ pub(crate) fn fetch(
                 .into_iter()
                 .flatten()
             {
-                if let (Some(number), Some(body)) = (
-                    node.get("number").and_then(Value::as_u64),
-                    node.get("body").and_then(Value::as_str),
-                ) {
+                // GitHub returns a null body for a pull request with none:
+                // that is an unmarked, unowned pull request, not a skipped one.
+                if let Some(number) = node.get("number").and_then(Value::as_u64) {
+                    let body = node.get("body").and_then(Value::as_str).unwrap_or("");
                     // Marked only when the marker parses: a malformed one
                     // names no owner, so the pull request is unowned.
                     if body.contains(crate::owner_registry::MARKER_PREFIX)
