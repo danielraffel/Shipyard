@@ -5,10 +5,6 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-    # `edited` fires when a stacked PR is retargeted to main after its parent
-    # merges, which a new push would otherwise be needed to re-run. A title or
-    # body edit is not a base change and starts nothing (see `if` below).
-    types: [opened, synchronize, reopened, edited]
   # Native merge queue. A merge_group run has no inputs and must not read
   # vars.DEFAULT_RUNNER_PROVIDER, so it resolves to GitHub-hosted runners.
   merge_group:
@@ -46,9 +42,7 @@ on:
         type: string
 
 concurrency:
-  # A title or body edit runs no job, but a run in the same group would still
-  # cancel the in-progress one; it gets its own group.
-  group: ci-${{ github.ref }}${{ github.event_name == 'pull_request' && github.event.action == 'edited' && github.event.changes.base.ref.from == null && '-edit-noop' || '' }}
+  group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -57,9 +51,6 @@ env:
 jobs:
   resolve-runners:
     name: Resolve runners
-    # Every other job needs this one, so skipping it skips the workflow for an
-    # `edited` event that did not change the base.
-    if: github.event_name != 'pull_request' || github.event.action != 'edited' || github.event.changes.base.ref.from != null
     runs-on: ubuntu-latest
     outputs:
       matrix_json: ${{ steps.resolve.outputs.matrix_json }}

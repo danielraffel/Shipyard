@@ -2022,6 +2022,7 @@ fn a_pending_review_status_does_not_hide_a_required_check_that_never_ran() {
     pr.fact.checks.push(StewardCheck {
         status: "PENDING".to_owned(),
         conclusion: None,
+        observed_at: Some("2026-11-17T08:25:29Z".to_owned()),
         ..review_status(Some("no reviewer verdict names head aaaaaaaaaaaa"))
     });
     let decision = classify_pr(&pr.fact, &policy, &BTreeMap::new());
@@ -2053,6 +2054,25 @@ fn a_pending_review_status_does_not_hide_a_required_check_that_never_ran() {
         &stall,
     );
     assert!(next.action.contains("CI never started"), "{}", next.action);
+    // A head pushed moments ago has not been given time: the pending review
+    // status keeps it pending, so a fresh push is not told its CI never ran.
+    let mut fresh = pr.clone();
+    fresh.fact.checks[0].observed_at = Some(Utc::now().to_rfc3339());
+    let decision_fresh = classify_pr(&fresh.fact, &policy, &BTreeMap::new());
+    let young = classify(
+        &RowFacts {
+            pr: &fresh.fact,
+            decision: &decision_fresh,
+            mutation: None,
+            error: None,
+            approval: GateRead::Unread,
+            enqueued_at: None,
+            ejection: None,
+        },
+        &policy,
+    )
+    .0;
+    assert_eq!(young.blocked_on, "required_pending", "{young:?}");
     // Control: a non-review job still running keeps it pending.
     let mut running = pr.clone();
     running.fact.checks.push(StewardCheck {

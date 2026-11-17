@@ -5971,9 +5971,7 @@ with the first line of the newest `Review quarantine diagnosis:` comment since
 the quarantine as its detail (one comments read per quarantined head only;
 the comment is untrusted text and only fills the detail). The loop state is
 still `quarantined`.
-`blocked_on::waiting_required` reads an absent required context as `required_never_ran` unless a non-review check of its app is still in flight: review statuses (`is_review_gate`, e.g. a `pending` `review-verdict`) never count as in flight, since they come from another workflow (Shipyard #1457 read "checks running, do not push" with no CI run at all). Its next_action opens "CI never started at this head (likely a base retarget)". There is no head-age rule: the PR fact carries no push time.
-
-`ci.yml` and `review-verdict.yml` subscribe to `pull_request`/`pull_request_target` type `edited` so a retargeted stacked PR re-fires its gates; `ci.yml` skips everything unless `github.event.changes.base.ref.from` is set (see skills/ci/SKILL.md).
+`blocked_on::waiting_required` reads an absent required context as `required_never_ran` unless a non-review check of its app is still in flight. Review statuses (`is_review_gate`, e.g. a `pending` `review-verdict`) do not count as in flight once the head is more than 10 minutes old (`NEVER_RAN_AFTER`, dated by the oldest check `observed_at` on the head, since the PR fact carries no push time); a younger head keeps them as pending so a fresh push is not told its CI never started. Shipyard #1457 read "checks running, do not push" for 4 h with no CI run at all. Its next_action opens "CI never started at this head (likely a base retarget)".
 
 `src/app/merge_steward_cmd/scheduling_loop.rs`: the loop contract
 (docs/scheduling-loop.md). `state_for` maps a row to one `LoopState` (precedence
