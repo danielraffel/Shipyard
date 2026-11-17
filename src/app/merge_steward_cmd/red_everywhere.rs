@@ -146,7 +146,8 @@ pub(super) fn reds(
     infra_rerun::failed_required(observation, approval_context, excluded_labels)
         .into_iter()
         // A review status that only waits on reviewers (approvals missing, no
-        // verdict yet, at this head) is reviewer throughput, never a
+        // verdict yet, at this head) or names a HOLD on this head is
+        // reviewer throughput or the PR's own review outcome, never a
         // base-level cause. A failing review CHECK RUN (a crashing review
         // workflow) or a review status with any other description still
         // counts.
@@ -186,7 +187,7 @@ pub(super) fn reds(
 
 /// Whether `check` is a review status (a commit status, not a check run),
 /// posted by the app its required rule binds, whose own description says it
-/// only waits on reviewers at `head`. A status under an unbound rule, or from
+/// only waits on reviewers, or names a HOLD, at `head`. A status under an unbound rule, or from
 /// another creator, is never trusted to leave the count.
 pub(super) fn waiting_review_status(
     check: &crate::merge_steward::StewardCheck,
@@ -202,11 +203,12 @@ pub(super) fn waiting_review_status(
     bound
         && check.source == crate::merge_steward::StewardCheckSource::StatusContext
         && crate::merge_steward::is_review_gate(&check.name, approval_context)
-        && check
-            .description
-            .as_deref()
-            .and_then(|description| crate::merge_steward::review_waiting(description, head))
-            .is_some()
+        && check.description.as_deref().is_some_and(|description| {
+            crate::merge_steward::review_waiting(description, head).is_some()
+                    // A HOLD naming this head is this pull request's own
+                    // review outcome, never a failing test shared with others.
+                    || crate::merge_steward::review_hold(description, head).is_some()
+        })
 }
 
 /// One pass's episodes: the report section, and the marks still to put on

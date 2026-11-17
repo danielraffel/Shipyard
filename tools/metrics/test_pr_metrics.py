@@ -12,6 +12,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import pr_metrics as pm  # noqa: E402
+import synthetic_control as sc  # noqa: E402
 import loss_report as lr  # noqa: E402
 
 UTC = dt.timezone.utc
@@ -860,6 +861,26 @@ class Controls(Base):
         self.assertIn("| ready day |", md)  # the report is still printed
         self.assertIn("withheld", md)
 
+    def test_the_pulp_escape_controls_withhold_escapes_the_detector_cannot_find(self):
+        # The real fixes do not name the PR they fix, so the built-in controls must fail
+        # rather than let Pulp report zero escaped defects.
+        pulp = "Generous-Corp/pulp"
+        p12219 = pr(12219, T(13, "09:00"), T(14, "06:30"))
+        p12338 = pr(12338, T(15, "09:00"), T(15, "16:42"))
+        p12375 = pr(12375, T(15, "20:00"), T(16, "01:14"))
+        p12375["title"] = "fix(ci): review the cheap-first jobs in the pr_number dispatch allowlist"
+        p12384 = pr(12384, T(15, "22:00"), T(16, "04:16"))
+        p12384["title"] = "fix(web): link spectral_graph_persistence into the sample-region WASM closure"
+        prs = [p12219, p12338, p12375, p12384]
+        bc = [commit(p["merge_commit_sha"], date=p["merged_at"]) for p in prs]
+        ok = [{"name": "Test", "status": "completed", "conclusion": "success"}]
+        gh = world(prs, base_commits=bc, checks={p["merge_commit_sha"]: ok for p in prs})
+        out = pm.build([pulp], self.cache, 300, OWNER, START, self.LATE, {}, {}, None, gh)
+        c = out["repos"][pulp]["controls"]
+        self.assertEqual((c["status"], c["escape"]["expected"], c["escape"]["found"], c["disabled"]),
+                         ("failed", 2, 0, ["escaped"]))
+        self.assertTrue(out["controls_failed"])
+
     def test_refused_prs_are_context_and_never_fail_the_control(self):
         prs = [pr(1, T(10, "10:00"), T(10, "11:00"))]
         out = pm.build([REPO], self.cache, 200, OWNER, START, self.LATE, {}, {}, None, world(prs), None, None, {}, {REPO: {1}})
@@ -1005,6 +1026,93 @@ class Integrated(unittest.TestCase):
         self.assertEqual(seen["cap"], 1500)
         self.assertEqual(seen["repos"], ["Generous-Corp/pulp", "Generous-Corp/vellum", "danielraffel/Shipyard",
                                          "danielraffel/tartci", "danielraffel/fleet-handbook"])
+
+
+class SyntheticControl(unittest.TestCase):
+    def broken(self, name, fn):
+        """Run the control with one scorecard function replaced by a broken one."""
+        orig = getattr(pm, name)
+        setattr(pm, name, fn)
+        try:
+            return sc.run(pm)
+        finally:
+            setattr(pm, name, orig)
+
+    def test_the_control_passes_on_the_real_scorecard_and_covers_every_metric_family(self):
+        r = sc.run(pm)
+        self.assertEqual((r["status"], r["failed"], r["max_abs_delta"]), ("pass", [], 0.0))
+        families = {c["name"].split(".")[0] for c in r["checks"]}
+        self.assertTrue({"north_star", "handoff_min", "rounds", "pushes_total", "merge_queue", "interventions",
+                         "compute_per_merged_pr", "correctness", "attribution"} <= families)
+        self.assertEqual(sc.line(r).split(":")[0], "CONTROL PASS")
+
+    def test_expected_values_are_computed_without_the_scorecard(self):
+        import inspect
+        for fn in (sc.expected, sc.raw_world):
+            self.assertNotIn("pr_metrics", inspect.getsource(fn))
+        e = sc.expected()
+        self.assertEqual((e["north_star.autonomous"], e["north_star.owner_action"], e["north_star.unknown"], e["north_star.not_merged_in_48h"]), (10, 2, 2, 1))
+        self.assertEqual((e["handoff_min.median"], e["handoff_min.p90"], e["compute_per_merged_pr.repeat_runs_total"]), (70.0, 120, 2))  # sorted delays 20 25 30 35 45 55 65 75 85 95 100 110 120 150: median (65+75)/2, 13th of 14
+
+    def test_the_control_reads_nothing_from_github_and_unknown_paths_fail_loudly(self):
+        with self.assertRaises(KeyError):
+            sc.raw_world()("repos/other/repo/pulls?state=all")
+
+    def test_a_broken_north_star_fails_the_control_with_deltas(self):
+        r = self.broken("north_star", lambda f, commits=True, attributed=True: "autonomous")
+        self.assertEqual(r["status"], "fail")
+        self.assertIn("north_star.owner_action", r["failed"])
+        self.assertIn("expected 2 got 0 (delta -2.0)", sc.line(r))
+
+    def test_each_family_of_numbers_is_guarded(self):
+        cases = {
+            "pctile": (lambda xs, p: 0.0, "handoff_min.p90"),
+            "revert_of": (lambda commits, f: None, "correctness.reverted"),
+            "escaped_by": (lambda later, f: None, "correctness.escaped"),
+            "commit_red": (lambda rd, sha, required: (set(), True), "correctness.base_red"),
+            "push_repeats_of_group_shas": (lambda runs: (0, 0), None),
+            "steward_evidence": (lambda rd, f: False, "attribution.steward_merges_recognised"),
+        }
+        for name, (fn, expect) in cases.items():
+            if expect is None:
+                continue
+            r = self.broken(name, fn)
+            self.assertEqual(r["status"], "fail", name)
+            self.assertIn(expect, r["failed"], name)
+
+    def test_a_crash_in_the_scorecard_fails_the_control(self):
+        def boom(*a, **k):
+            raise RuntimeError("instrument broke")
+        r = self.broken("pr_facts", boom)
+        self.assertEqual(r["status"], "fail")
+        self.assertIn("RuntimeError", sc.line(r))
+
+    def test_the_report_prints_control_pass_with_the_numbers(self):
+        out = pm.build([REPO], tempfile.mkdtemp(), 50, OWNER, START, NOW, {}, {}, None, world([pr(1, T(10, "10:00"), T(10, "11:00"))]))
+        self.assertEqual(out["synthetic_control"]["status"], "pass")
+        md = pm.markdown(out)
+        self.assertIn("**CONTROL PASS: 31 of 31", md)
+        self.assertIn("| ready day |", md)
+
+    def test_a_repo_with_no_live_control_reads_synthetic_not_unchecked(self):
+        gh = world([pr(1, T(10, "10:00"), T(10, "11:00"))])
+        out = pm.build([REPO], tempfile.mkdtemp(), 50, OWNER, START, NOW, {}, {}, None, gh)
+        self.assertEqual(out["repos"][REPO]["controls"]["status"], "synthetic")
+        self.assertIn("Controls (synthetic)", pm.markdown(out))
+        off = pm.build([REPO], tempfile.mkdtemp(), 50, OWNER, START, NOW, {}, {}, None, world([pr(1, T(10, "10:00"), T(10, "11:00"))]), control=False)
+        self.assertEqual(off["repos"][REPO]["controls"]["status"], "unchecked")
+
+    def test_a_failed_control_withholds_every_outcome_number(self):
+        failing = lambda: sc.run(pm) | {"status": "fail", "failed": ["north_star.autonomous"]}
+        out = pm.build([REPO], tempfile.mkdtemp(), 50, OWNER, START, NOW, {}, {}, None, world([pr(1, T(10, "10:00"), T(10, "11:00"))]),
+                       control=failing)
+        self.assertIn("synthetic control failed", out["withheld"])
+        self.assertEqual((out["repos"][REPO]["per_day"], out["repos"][REPO]["prs"], out["window"]["per_repo"], out["baseline"]), ({}, [], {}, None))
+        md = pm.markdown(out)
+        self.assertIn("CONTROL FAIL", md)
+        self.assertIn("withheld", md)
+        for number_cells in ("| ready day |", "rate (CI95)", "autonomous a/o/unknown", "handoff median"):
+            self.assertNotIn(number_cells, md)
 
 
 if __name__ == "__main__":

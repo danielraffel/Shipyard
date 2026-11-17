@@ -323,6 +323,13 @@ pub(super) fn apply_repo_plan(
         })),
         None => None,
     };
+    let quarantine = super::scheduling_loop::read_quarantine(
+        super::scheduling_loop::quarantine_path(
+            global_dir.or_else(|| mutation_control.map(|control| control.global_dir.as_path())),
+        )
+        .as_deref(),
+    );
+    super::review_quarantine::annotate(actions, observation, &policy, &quarantine, &mut reports);
     let dwell_policy =
         super::dwell_pass::read_policy(actions, &observation.repo, &observation.base);
     let dwell_report = super::dwell_pass::run(
@@ -352,12 +359,6 @@ pub(super) fn apply_repo_plan(
     );
     // The scheduling loop: one state, act, deadline and level per covered
     // row, from what this pass already read. See `scheduling_loop`.
-    let quarantine = super::scheduling_loop::read_quarantine(
-        super::scheduling_loop::quarantine_path(
-            global_dir.or_else(|| mutation_control.map(|control| control.global_dir.as_path())),
-        )
-        .as_deref(),
-    );
     {
         let dwell = ledger
             .dwell

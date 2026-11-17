@@ -118,7 +118,10 @@ fn a_dry_run_reads_the_machine_global_quarantine_file() {
         pr_next_action_snapshot(&actions, &state_dir, &global, "owner/repo", 42)
     })
     .expect("snapshot");
-    assert_eq!(snapshot["blocked_on"], "no_verdict");
+    // The quarantined head is named for the author, not left as a wait on
+    // the reviewer.
+    assert_eq!(snapshot["blocked_on"], "review_quarantined", "{snapshot:#}");
+    assert_eq!(snapshot["next_action"]["actor"], "author", "{snapshot:#}");
     assert_eq!(snapshot["loop"]["state"], "quarantined", "{snapshot:#}");
 }
 

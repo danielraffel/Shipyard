@@ -690,3 +690,40 @@ fn an_unbound_or_foreign_waiting_review_status_still_groups() {
         &foreign.required_checks,
     ));
 }
+
+/// Vellum #462, #506, #508: `release-path-review` red on three PRs, each with
+/// its own "a HOLD names head <sha>", is three separate review outcomes, not
+/// one failing test shared by three PRs. A real failing check still groups.
+#[test]
+fn hold_statuses_on_many_prs_are_never_a_base_level_episode() {
+    let hold = |number: u64| {
+        let mut check = failed("release-path-review", number);
+        check.source = StewardCheckSource::StatusContext;
+        check.description = Some(format!(
+            ".github/workflows/x.yml and 6 more: a HOLD names head {} (comment {number})",
+            &head(number)[..12]
+        ));
+        check
+    };
+    let mut obs = observation(
+        [462_u64, 506, 508]
+            .into_iter()
+            .map(|n| observed(n, head(n), vec![hold(n)]))
+            .collect(),
+    );
+    obs.required_checks.push(RequiredCheck {
+        context: "release-path-review".to_owned(),
+        app_id: Some(15_368),
+    });
+    let ledger = StewardLedger::default();
+    assert!(
+        reds(&obs, &ledger, "review-verdict", &[]).is_empty(),
+        "a HOLD status is never counted"
+    );
+    let real = three_red_prs();
+    assert_eq!(
+        super::group(&reds(&real, &ledger, "review-verdict", &[])).len(),
+        1,
+        "a genuine failing check on three PRs still groups"
+    );
+}
