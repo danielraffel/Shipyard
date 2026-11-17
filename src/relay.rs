@@ -745,7 +745,7 @@ pub(crate) fn render_message(
 /// The GraphQL fields read for one owned pull request, as alias `pr<N>`.
 pub(crate) fn pr_fields(number: u64) -> String {
     format!(
-        "pr{number}: pullRequest(number:{number}){{id number state merged isDraft isInMergeQueue \
+        "pr{number}: pullRequest(number:{number}){{id number body state merged isDraft isInMergeQueue \
          mergeStateStatus headRefOid baseRefName baseRefOid \
          baseRef{{associatedPullRequests(states:[MERGED],last:1){{nodes{{number}}}}}} \
          comments(last:30){{nodes{{body createdAt authorAssociation author{{__typename login}}}}}} \

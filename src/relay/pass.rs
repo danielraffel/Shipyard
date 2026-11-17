@@ -252,6 +252,18 @@ fn run_repo(
             .as_ref()
             .is_some_and(|o| o.source == owner_registry::Source::BodyMarker)
             && !read.markers.contains_key(&tracked.pr)
+            // A pull request outside the discovery page (the newest 100) is
+            // judged by its own body, so a marker that is still there keeps
+            // its owner.
+            && !read
+                .prs
+                .get(&tracked.pr)
+                .and_then(Option::as_ref)
+                .and_then(|node| node.get("body"))
+                .and_then(Value::as_str)
+                .is_some_and(|body| {
+                    owner_registry::parse_marker(repo, tracked.pr, body).is_some()
+                })
         {
             tracked.owner = None;
         }
