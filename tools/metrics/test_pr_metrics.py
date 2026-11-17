@@ -695,6 +695,13 @@ class MainRedReads(Base):
             out = pm.build([REPO], d, 500, OWNER, START, NOW, {}, {}, None, self.world(a, b, [], False), controls={}, control=False)
         self.assertTrue(all(r["main_red"] is None for r in out["repos"][REPO]["prs"]))  # an empty listing is not zero failures
 
+    def test_the_base_listing_reads_enough_pages_for_a_busy_merge_commit_base(self):
+        a, b = self.merged()
+        gh = self.world(a, b, [commit(f"x{i}", date=T(10, "09:00")) for i in range(100)], False)  # every page full
+        with tempfile.TemporaryDirectory() as d:
+            pm.build([REPO], d, 500, OWNER, START, NOW, {}, {}, None, gh, controls={}, control=False)
+        self.assertEqual(len([c for c in gh.calls if "commits?sha=" in c]), 40)
+
     def test_the_base_listing_starts_a_day_before_the_first_merge(self):
         a, b = self.merged()
         gh = self.world(a, b, self.base(a, b), False)

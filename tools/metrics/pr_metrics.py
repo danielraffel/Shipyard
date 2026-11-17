@@ -59,7 +59,7 @@ ESCAPE_WINDOW = dt.timedelta(days=14)
 HORIZON = dt.timedelta(hours=48)
 MIN_SAMPLE = 50
 UNKNOWN_RANGE_SHARE = 0.20
-SCORECARD_VERSION = "2026-11-17.1"
+SCORECARD_VERSION = "2026-11-17.2"  # .2: correctness reads the first-parent next push and the newest run by id; main-red episodes
 MERGE_MAIN_RE = re.compile(r"^Merge (remote-tracking )?branch '?(origin/)?(main|master)'?|^Merge pull request .* from .*/main", re.I)
 # Positive controls: a real revert (#124 reverted #119), a real escaped defect (#126 names #116).
 # Pulp: two escapes verified by hand from main-red traces. #12219 landed red on Workflow lint and
@@ -781,6 +781,9 @@ def commit_state(rd, sha, age=None):
 # (up to its check timeout, 6 h on Vellum), so the listing starts a day early: that also gives the first PR in the
 # window a settled push before it to compare against.
 BASE_LOOKBACK = dt.timedelta(days=1)
+# The listing of a merge-commit base also returns every merged branch's own commits: Pulp's main lists about 2,900
+# commits over 8 days (153 of Shipyard's 651 are base pushes). A listing cut short reads every PR as unknown.
+BASE_LISTING_PAGES = 40
 NOISY_RED_STARTS = 0.1  # a context that turns red on this share of its pushes or more is a gate that flaps, not a check a merge breaks
 NOISY_MIN_PUSHES = 20  # ... judged only over at least this many pushes, so a short window cannot call a real break noise
 
@@ -1289,7 +1292,7 @@ def collect_repo(repo, cache_dir, cap, owner, lo, hi, now, ticks, tick_ctx, fetc
                 base_anchors = [p["merge_commit_sha"] for p in sorted(merged_list, key=lambda p: p["merged_at"]) if p.get("merge_commit_sha")]
             base_commits, commits_ok = rd.pages(
                 f"commits?sha={mrows[0]['base']}&since={fmt(min(iso(f['merged_at']) for f in mrows) - BASE_LOOKBACK)}"
-                f"&until={fmt(until)}", max_pages=5)
+                f"&until={fmt(until)}", max_pages=BASE_LISTING_PAGES)
         except (Truncated, ReadError):
             pass
         try:
