@@ -639,12 +639,12 @@ class MainRedReads(Base):
             rd = pm.Reader(REPO, d, 50, lambda path: {"check_runs": runs})
             self.assertEqual(pm.head_states_at(rd, "h1", T(10, "10:00")), {"Test": "pending"})  # the rerun was running at the merge
 
-    def test_a_rerun_queued_after_the_merge_does_not_replace_the_verdict_at_merge(self):
+    def test_an_unstarted_rerun_leaves_the_head_verdict_at_merge_unknown(self):
         runs = [{"id": 1, "name": "Test", "status": "completed", "conclusion": "failure", "started_at": T(10, "09:00"), "completed_at": T(10, "09:10")},
                 {"id": 2, "name": "Test", "status": "queued", "conclusion": None, "started_at": None}]
         with tempfile.TemporaryDirectory() as d:
             rd = pm.Reader(REPO, d, 50, lambda path: {"check_runs": runs})
-            self.assertEqual(pm.head_states_at(rd, "h3", T(10, "10:00")), {"Test": "red"})
+            self.assertEqual(pm.head_states_at(rd, "h3", T(10, "10:00")), {"Test": "pending"})  # queued before or after the merge: unknown
 
     def test_the_head_read_asks_for_every_run_not_only_the_latest(self):
         paths = []
@@ -824,6 +824,17 @@ class Correctness(Base):
         ck = {p["merge_commit_sha"]: [{"name": "Test", "status": "completed", "conclusion": "success"}], "r1": [{"name": "Test", "status": "completed", "conclusion": "success"}]}
         out = self.build(world([p], base_commits=bc, checks=ck), now=dt.datetime(2026, 11, 14, tzinfo=UTC))
         self.assertFalse(self.rows(out)[5]["correct"]["reverted"])
+
+    def test_a_feature_commit_in_a_cut_listing_is_not_the_next_push(self):
+        q = self.merged_old(7, day=4)
+        ok = [{"name": "Test", "status": "completed", "conclusion": "success"}]
+        red = [{"name": "Test", "status": "completed", "conclusion": "failure"}]
+        mc = lambda sha, parents, date: dict(commit(sha, date=date), parents=[{"sha": x} for x in parents])
+        # q merged on day 4; the listing (cut: day 4 + 7 d + 2 h is before now) also holds a feature commit branched
+        # from q's merge whose own merge is not listed
+        bc = [mc("feat", [q["merge_commit_sha"]], T(4, "12:00")), mc(q["merge_commit_sha"], ["base0"], T(4, "10:00")), mc("base0", [], T(4, "08:00"))]
+        out = self.build(world([q], base_commits=bc, checks={q["merge_commit_sha"]: ok, "feat": red, "base0": ok}), now=dt.datetime(2026, 11, 14, tzinfo=UTC))
+        self.assertFalse(self.rows(out)[7]["correct"]["base_red"])
 
     def test_red_required_check_at_the_merge_commit_or_next_push(self):
         p, q = self.merged_old(6), self.merged_old(7, day=4)

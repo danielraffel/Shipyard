@@ -855,10 +855,12 @@ def head_states_at(rd, sha, at):
     runs, complete = rd.pages(f"commits/{sha}/check-runs?filter=all", key="check_runs", max_pages=5)
     if not complete:
         return None
-    latest = {}
+    latest, unstarted = {}, set()
     for c in runs:
-        # a run with no start time cannot be shown to have existed at the merge (a rerun queued later), so it is ignored
-        if c.get("started_at") and c["started_at"] <= at and (c["name"] not in latest or run_order(c) > run_order(latest[c["name"]])):
+        # a run with no start time yet may have been queued before the merge or after it: its context is unknown
+        if not c.get("started_at") and c.get("status") != "completed":
+            unstarted.add(c["name"])
+        elif c.get("started_at") and c["started_at"] <= at and (c["name"] not in latest or run_order(c) > run_order(latest[c["name"]])):
             latest[c["name"]] = c
     states = {}
     for k, c in latest.items():
@@ -867,7 +869,10 @@ def head_states_at(rd, sha, at):
             states[k] = "pending"
         else:
             states[k] = "red" if c.get("conclusion") in BAD_CONCLUSIONS else "green" if c.get("conclusion") == "success" else "pending"
-    rd.save("headstate", key, {"v": CHECKS_VERSION, "states": states})
+    for k in unstarted:
+        states[k] = "pending"
+    if not unstarted:  # an unstarted run gets its start time later, which can settle the question
+        rd.save("headstate", key, {"v": CHECKS_VERSION, "states": states})
     return states
 
 
@@ -986,7 +991,7 @@ def escaped_by(later, f):
     return None
 
 
-def pr_correct(rd, f, base_commits, commits_ok, required, ticks, now, later=None, later_ok=False):
+def pr_correct(rd, f, base_commits, commits_ok, required, ticks, now, later=None, later_ok=False, anchors=None):
     merged = iso(f["merged_at"])
     provisional = now < merged + WINDOW
     out = {"provisional": provisional, "reverted": None, "base_red": None, "bad": None,
@@ -999,7 +1004,7 @@ def pr_correct(rd, f, base_commits, commits_ok, required, ticks, now, later=None
     # base red: the merge commit and the next push to the base
     nxt = None
     if commits_ok and f.get("merge_commit_sha"):
-        chron = base_order(base_commits)
+        chron = base_order(base_commits, anchors)
         shas = [c["sha"] for c in chron]
         if f["merge_commit_sha"] in shas and shas.index(f["merge_commit_sha"]) + 1 < len(shas):
             nxt = chron[shas.index(f["merge_commit_sha"]) + 1]
@@ -1269,11 +1274,13 @@ def collect_repo(repo, cache_dir, cap, owner, lo, hi, now, ticks, tick_ctx, fetc
             runs, runs_ok = runs_index(rd, min(iso(f["created_at"]) for f in need), max(iso(f["merged_at"]) for f in need) + dt.timedelta(hours=1))
         except (Truncated, ReadError):
             pass
-    base_commits, commits_ok, req, listing_cut = [], False, None, False
+    base_commits, commits_ok, req, listing_cut, base_anchors = [], False, None, False, None
     if mrows:
         try:
             until = max(iso(f['merged_at']) for f in mrows) + WINDOW + dt.timedelta(hours=2)
             listing_cut = until < (now or dt.datetime.now(UTC))  # the listing stops short of the base's tip
+            if listing_cut:
+                base_anchors = [p["merge_commit_sha"] for p in sorted(merged_list, key=lambda p: p["merged_at"]) if p.get("merge_commit_sha")]
             base_commits, commits_ok = rd.pages(
                 f"commits?sha={mrows[0]['base']}&since={fmt(min(iso(f['merged_at']) for f in mrows) - BASE_LOOKBACK)}"
                 f"&until={fmt(until)}", max_pages=5)
@@ -1329,7 +1336,7 @@ def collect_repo(repo, cache_dir, cap, owner, lo, hi, now, ticks, tick_ctx, fetc
                 corr = None
             if corr is None:
                 try:
-                    corr = pr_correct(rd, f, base_commits, commits_ok, req, ticks, now, merged_list, res["listing_complete"])
+                    corr = pr_correct(rd, f, base_commits, commits_ok, req, ticks, now, merged_list, res["listing_complete"], base_anchors)
                     if now >= iso(merged) + ESCAPE_WINDOW and corr["bad"] is not None and corr["escaped"] is not None:
                         rd.save("correct", str(f["number"]), dict(corr, v=CHECKS_VERSION))
                 except (Truncated, ReadError):
