@@ -52,14 +52,14 @@ APP_LOGINS = {"shipyard-local[bot]", "shipyard-local"}
 _GUARD = []
 SIGNALS = ("app_opener", "provenance", "trailer", "session_stamp")
 BAD_CONCLUSIONS = {"failure", "timed_out"}
-FACTS_VERSION = 14  # 14: merge-queue ejection causes read from GraphQL; push_times are observed head updates; main-red facts
+FACTS_VERSION = 15  # 14: merge-queue ejection causes read from GraphQL; push_times are observed head updates; main-red facts
 COMPUTE_VERSION = 8  # compute caches: entries written before this could be marked complete from a partial timeline or commit read or rerun history
 CHECKS_VERSION = 3  # derived check caches: v2 entries (incomplete pagination read as clean, latest run by start) are read again
 ESCAPE_WINDOW = dt.timedelta(days=14)
 HORIZON = dt.timedelta(hours=48)
 MIN_SAMPLE = 50
 UNKNOWN_RANGE_SHARE = 0.20
-SCORECARD_VERSION = "2026-11-18.3"  # .2: correctness reads the first-parent next push and the newest run by id; main-red episodes. .3: ejection causes from GraphQL
+SCORECARD_VERSION = "2026-11-18.4"  # .2: correctness reads the first-parent next push and the newest run by id; main-red episodes. .3: ejection causes from GraphQL
 MERGE_MAIN_RE = re.compile(r"^Merge (remote-tracking )?branch '?(origin/)?(main|master)'?|^Merge pull request .* from .*/main", re.I)
 # Positive controls: a real revert (#124 reverted #119), a real escaped defect (#126 names #116).
 # Pulp: two escapes verified by hand from main-red traces. #12219 landed red on Workflow lint and
@@ -263,9 +263,9 @@ def ejection(e, merged):
     ejection of the merged PR."""
     if e.get("event") not in ("removed_from_merge_queue", "dequeued") or (e.get("reason") or "unknown") in ("merged", "already_merged"):
         return False
-    if (e.get("reason") or "unknown") != "unknown":  # an explicit non-merge reason (failed_checks, ...) is an ejection wherever it falls
-        return True
     t, m = iso(e.get("created_at")), iso(merged)
+    if (e.get("reason") or "unknown") != "unknown":  # an explicit non-merge reason (failed_checks, ...) is an ejection wherever it falls before the merge
+        return not (t and m and t > m)
     return not (t and m and m - t <= MERGE_REMOVAL_WINDOW)
 
 
@@ -394,9 +394,14 @@ def pr_facts(rd, pr, owner):
     enqueue_times, removal_ts = [], []
     observed_push_times = []
     stamp_commit = False
+    hold_untimed_push, untimed_commit_dates = False, []  # `committed` events carry no observation time: their git dates stand in only to place them
     for e in tl:
         ev, ts = e.get("event"), e.get("created_at") or e.get("submitted_at")
         body = e.get("body") or ""
+        if ev == "committed" and not ts:
+            hold_untimed_push = hold_untimed_push or bool(holds)  # a commit listed after a HOLD: when the head moved is unknown
+            cd = ((e.get("committer") or {}).get("date")) or ((e.get("author") or {}).get("date"))
+            untimed_commit_dates.append(fmt(iso(cd)) if iso(cd) else None)
         if ev in ("committed", "head_ref_force_pushed") and ts and ready:
             observed = iso(ts)
             if observed and observed > ready:
@@ -474,7 +479,7 @@ def pr_facts(rd, pr, owner):
         "agent_trailer": trailer, "stamp_commit": stamp_commit, "ambiguous_commits": sorted(set(ambiguous)),
         "repair_cycles": len(repairs), "holds": len(holds), "re_holds": re_holds, "size": size,
         "pushes": split, "enqueues": enqueues, "enqueue_times": enqueue_times, "dequeue_times": dequeue_times,
-        "ejection_causes_known": causes_known, "hold_times": sorted(holds), "push_times": sorted(set(observed_push_times)), "ejections": ejections,
+        "ejection_causes_known": causes_known, "hold_times": sorted(holds), "hold_untimed_push": hold_untimed_push, "untimed_commit_dates": untimed_commit_dates, "push_times": sorted(set(observed_push_times)), "ejections": ejections,
         "labels": sorted(l["name"] for l in pr.get("labels") or []),
         "heads": sorted(heads), "timeline_complete": tl_full, "commits_complete": c_full,
     }
@@ -701,8 +706,13 @@ def cause_minutes(f, comp):
     push_times = f.get("push_times") or []
     hold_times = f.get("hold_times") or []
     red_events = comp.get("red_events") or [] if comp else []
-    hold = None if hold_times and not push_times else _wait_until_next(hold_times, push_times, m)
-    red = None if red_events and not push_times else _wait_until_next(red_events, push_times, m)
+    # With the timeline and commits read in full, no commit or push event after a HOLD or failure means the PR was not
+    # pushed again: the interval runs to the merge. A commit event with no time that follows it moved the head at an
+    # unknown time, so the duration is unknown.
+    first_red = min((iso(x) for x in red_events if iso(x)), default=None)
+    red_untimed = bool(first_red) and any(d is None or iso(d) > first_red for d in f.get("untimed_commit_dates") or [])
+    hold = None if f.get("hold_untimed_push") else _wait_until_next(hold_times, push_times, m)
+    red = None if red_untimed else _wait_until_next(red_events, push_times, m)
     return {"hold": hold,
             "red": None if comp and comp.get("red_partial") else red if outcomes else None,  # None: an earlier failed attempt is not in the list
             "queue": _wait_until_next(f.get("enqueue_times") or [], f.get("dequeue_times") or [], m),
@@ -792,7 +802,9 @@ def pr_compute(rd, f, runs, runs_complete):
             sh += a
             ho += b
             mac += m
-            if r.get("event") != "push" or r.get("head_sha") in heads:  # a push to the base on the merge-group sha runs after the merge and cannot have delayed it
+            started = iso(r.get("run_started_at") or r.get("created_at"))
+            post_merge = (r.get("event") == "push" and r.get("head_sha") not in heads) or bool(merged and started and started > merged)
+            if not post_merge:  # a push to the base on the merge-group sha, or a run begun after the merge, cannot have delayed it
                 wait += w
         else:
             timing_complete = False
