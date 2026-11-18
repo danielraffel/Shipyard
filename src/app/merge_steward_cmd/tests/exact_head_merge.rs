@@ -826,17 +826,35 @@ fn unstable_pr_json(macos: &str, extra: &[(&str, &str)]) -> String {
 /// One steward pass (classify the census row, then mutate) over a head the
 /// census and the final live read both report as `census` and `live`.
 fn run_unstable(policy: &StewardPolicy, census: &str, live: &str) -> Outcome {
+    run_unstable_reads(policy, census, live, live)
+}
+
+/// [`run_unstable`], with the last live read (the final revalidation under
+/// the merge guard) reporting `final_live` while every earlier one reports
+/// `live`.
+fn run_unstable_reads(
+    policy: &StewardPolicy,
+    census: &str,
+    live: &str,
+    final_live: &str,
+) -> Outcome {
     let temp = tempfile::tempdir().expect("temp");
     let log = temp.path().join("calls");
+    let reads = temp.path().join("pr-view-reads");
     let base = Fixture::approved_clean().script(&log);
     let live_line = format!(
         r#"  "pr view "*) printf '%s' '{}' ;;"#,
         pr_json_with_status(HEAD, true, false, None)
     );
     assert!(base.contains(&live_line), "fixture shape changed");
+    // The final revalidation is the pass's second live `pr view`; the first is
+    // the pre-guard live re-read.
     let script = base.replace(
         &live_line,
-        &format!(r#"  "pr view "*) printf '%s' '{live}' ;;"#),
+        &format!(
+            r#"  "pr view "*) printf x >> '{reads}'; if [ "$(wc -c < '{reads}' | tr -d ' ')" -ge 2 ]; then printf '%s' '{final_live}'; else printf '%s' '{live}'; fi ;;"#,
+            reads = reads.display()
+        ),
     );
     let actions = fake_gh(&temp, &script);
     let mut pr = parse_pr(
@@ -1132,4 +1150,115 @@ fn a_hostile_check_name_cannot_split_the_mutation_or_summary_line() {
         "{mutation:?}"
     );
     assert_eq!(mutation.matches(',').count(), 1, "{mutation:?}");
+}
+
+/// The final revalidation under the merge guard holds on its own: the census
+/// and the pre-guard read are mergeable, and only the final read sees a
+/// listed check red (or a required check red), so nothing merges. Its
+/// re-classification refuses first; the explicit merge-state term after it is
+/// a second check of the same read.
+#[cfg(unix)]
+#[test]
+fn the_final_live_read_alone_refuses_a_red_listed_or_required_check() {
+    let policy = unstable_policy(Some(&["risk-tier"]));
+    let green = unstable_pr_json(
+        "SUCCESS",
+        &[
+            ("risk-tier", "SUCCESS"),
+            ("zizmor (report only)", "FAILURE"),
+        ],
+    );
+    // Control: green on every read merges, after two live reads.
+    let merged = run_unstable_reads(&policy, &green, &green, &green);
+    assert_merged(&merged);
+    let reads = merged
+        .calls
+        .lines()
+        .filter(|line| line.starts_with("pr view "))
+        .count();
+    assert_eq!(reads, 2, "{}", merged.calls);
+
+    let listed_red = unstable_pr_json(
+        "SUCCESS",
+        &[
+            ("risk-tier", "FAILURE"),
+            ("zizmor (report only)", "FAILURE"),
+        ],
+    );
+    let held = run_unstable_reads(&policy, &green, &green, &listed_red);
+    assert_eq!(held.decision, StewardDecision::ArmMergeQueue);
+    assert!(
+        held.mutation
+            .as_deref()
+            .is_some_and(|m| m.contains("skipped_after_final_live_revalidation")),
+        "{:?}\n{}",
+        held.mutation,
+        held.calls
+    );
+    assert_no_write(&held);
+
+    let required_red = unstable_pr_json(
+        "FAILURE",
+        &[
+            ("risk-tier", "SUCCESS"),
+            ("zizmor (report only)", "FAILURE"),
+        ],
+    );
+    let held = run_unstable_reads(&policy, &green, &green, &required_red);
+    assert_no_write(&held);
+}
+
+/// A required check still running, or a listed check still pending, holds an
+/// UNSTABLE head; GitHub would report the first BLOCKED, but a stale UNSTABLE
+/// read must not matter.
+#[test]
+fn a_running_required_or_pending_listed_check_holds_an_unstable_head() {
+    let classify = |json: &str| {
+        let mut pr = parse_pr(
+            &serde_json::from_str(json).expect("PR json"),
+            &BTreeMap::new(),
+        )
+        .expect("PR")
+        .fact;
+        pr.checks.push(
+            crate::app::merge_steward_cmd::observation::parse_rest_check(
+                &serde_json::from_str(&rest_check_run(true)).expect("check run"),
+            )
+            .expect("check run"),
+        );
+        classify_pr(
+            &pr,
+            &unstable_policy(Some(&["risk-tier"])),
+            &BTreeMap::new(),
+        )
+    };
+    // Control.
+    let green = unstable_pr_json("SUCCESS", &[("risk-tier", "SUCCESS")]);
+    assert_eq!(classify(&green), StewardDecision::ArmMergeQueue);
+
+    let running = green.replacen(
+        r#""status":"COMPLETED","conclusion":"SUCCESS""#,
+        r#""status":"IN_PROGRESS","conclusion":null"#,
+        1,
+    );
+    assert!(running.contains("IN_PROGRESS"), "{running}");
+    assert!(
+        matches!(classify(&running), StewardDecision::WaitingRequired { contexts } if contexts == vec!["macos".to_owned()]),
+        "{running}"
+    );
+
+    let listed_pending = green.replace(
+        r#""name":"risk-tier","status":"COMPLETED","conclusion":"SUCCESS""#,
+        r#""name":"risk-tier","status":"QUEUED","conclusion":null"#,
+    );
+    assert!(listed_pending.contains("QUEUED"), "{listed_pending}");
+    assert_eq!(
+        classify(&listed_pending),
+        StewardDecision::WaitingRequired {
+            contexts: vec![
+                UNSTABLE_WAIT.to_owned(),
+                "risk-tier (unstable_blocking_checks)".to_owned(),
+            ]
+        }
+    );
 }
