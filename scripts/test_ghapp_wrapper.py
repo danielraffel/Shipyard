@@ -2483,6 +2483,336 @@ class GhappWrapperTests(unittest.TestCase):
                 repos.append(words[words.index("--repo") + 1])
         return repos
 
+    def write_create_gh(self, output: str, status: int = 0) -> None:
+        self.gh.write_text(
+            "#!/bin/sh\n"
+            "printf '%s\\n' \"$*\" > \"$GH_LOG\"\n"
+            f"printf '%s\\n' '{output}'\n"
+            f"exit {status}\n",
+            encoding="utf-8",
+        )
+        self.gh.chmod(0o755)
+
+    def owner_register_calls(self) -> list[str]:
+        if not self.resolver_log.exists():
+            return []
+        return [
+            line
+            for line in self.resolver_log.read_text().splitlines()
+            if " owner register " in f" {line} "
+        ]
+
+    def test_pr_create_registers_the_owner_without_changing_its_output(self) -> None:
+        url = "https://github.com/owner/repo/pull/77"
+        self.write_create_gh(url)
+        result = self.run_wrapper(
+            "pr", "create", "--title", "x", "--body", "y", "--repo", "owner/repo"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, url + "\n")
+        self.assertEqual(
+            self.owner_register_calls(),
+            [
+                f"--mode shipyard --global-dir {self.root / 'governed global'} "
+                "owner register --pr 77 --repo owner/repo --after-create"
+            ],
+        )
+
+    def test_pr_create_value_that_looks_like_web_does_not_disable_registration(
+        self,
+    ) -> None:
+        self.write_create_gh("https://github.com/owner/repo/pull/77")
+        result = self.run_wrapper(
+            "pr", "create", "--title", "--web", "--body", "x",
+            "--repo", "owner/repo",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.owner_register_calls()), 1)
+
+    def test_pr_create_rejects_a_boolean_token_as_the_repo_value(self) -> None:
+        self.write_create_gh("https://github.com/owner/repo/pull/77")
+        result = self.run_wrapper(
+            "pr", "create", "--title", "x", "--repo", "--web",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--repo requires a value before --web", result.stderr)
+        self.assertFalse(self.helper_log.exists())
+        self.assertFalse(self.gh_log.exists())
+
+    def test_pr_create_boolean_assignments_honor_true_for_dry_guards(self) -> None:
+        self.make_duplicate_fixture()
+        for option in ("--dry-run=true", "--web=true"):
+            with self.subTest(option=option):
+                result = self.run_wrapper(
+                    "pr", "create", option, "--title", "x", "--body", "y",
+                    "--repo", "owner/repo",
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.owner_register_calls(), [])
+
+    def test_pr_create_boolean_assignments_honor_false_for_dry_guards(self) -> None:
+        self.make_duplicate_fixture()
+        for option in ("--dry-run=false", "--web=false"):
+            with self.subTest(option=option):
+                result = self.run_wrapper(
+                    "pr", "create", option, "--title", "x", "--body", "y",
+                    "--repo", "owner/repo",
+                )
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("#555", result.stderr)
+
+    def test_pr_create_that_fails_or_prints_no_pull_request_registers_nothing(
+        self,
+    ) -> None:
+        self.write_create_gh("no url here", status=1)
+        result = self.run_wrapper(
+            "pr", "create", "--title", "x", "--body", "y", "--repo", "owner/repo"
+        )
+        self.assertEqual(result.returncode, 1)
+        self.write_create_gh("a pull request already exists")
+        result = self.run_wrapper(
+            "pr", "create", "--title", "x", "--body", "y", "--repo", "owner/repo"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.owner_register_calls(), [])
+
+    def test_a_cancelled_pr_create_stops_the_native_create(self) -> None:
+        started = self.root / "create-started"
+        finished = self.root / "create-finished"
+        self.gh.write_text(
+            "#!/bin/sh\n"
+            f"touch '{started}'\n"
+            "sleep 5\n"
+            f"touch '{finished}'\n",
+            encoding="utf-8",
+        )
+        self.gh.chmod(0o755)
+        process = subprocess.Popen(
+            [str(self.wrapper), "pr", "create", "--title", "x", "--body", "y",
+             "--repo", "owner/repo"],
+            cwd=self.root,
+            env=self.environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        deadline = time.monotonic() + 20
+        while not started.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertTrue(started.exists())
+        process.terminate()
+        process.communicate(timeout=20)
+        time.sleep(0.5)
+        self.assertFalse(finished.exists(), "gh outlived the cancelled wrapper")
+
+    def test_pr_create_still_passes_its_stdin_to_gh(self) -> None:
+        self.gh.write_text(
+            "#!/bin/sh\n"
+            "cat > \"$GH_LOG\"\n"
+            "printf '%s\\n' https://github.com/owner/repo/pull/78\n",
+            encoding="utf-8",
+        )
+        self.gh.chmod(0o755)
+        result = subprocess.run(
+            [str(self.wrapper), "pr", "create", "--title", "x", "--body-file", "-",
+             "--repo", "owner/repo"],
+            cwd=self.root,
+            env=self.environment,
+            input="the body\n",
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.gh_log.read_text(), "the body\n")
+
+    def make_duplicate_fixture(
+        self, other_base: str = "main", head: str = "other"
+    ) -> None:
+        """A checkout on branch `feature`, and a gh whose open-PR list holds
+        one pull request with the same head tree (and `other_base`)."""
+        env = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
+        def git(*args: str) -> str:
+            return subprocess.run(
+                ["git", *args], cwd=self.root, env=env, text=True, check=True,
+                capture_output=True,
+            ).stdout.strip()
+        git("init", "-q", "-b", "feature")
+        (self.root / "f.txt").write_text("x\n")
+        git("add", "f.txt")
+        git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "c")
+        tree = git("rev-parse", "HEAD^{tree}")
+        listing = json.dumps({"data": {"repository": {
+            "defaultBranchRef": {"name": "main"},
+            "pullRequests": {"nodes": [{
+                "number": 555, "url": "https://github.com/owner/repo/pull/555",
+                "baseRefName": other_base, "headRefName": head,
+                "isCrossRepository": False,
+                "headRef": {"target": {"tree": {"oid": tree}}},
+            }]},
+        }}})
+        (self.root / "graphql.json").write_text(listing)
+        self.gh.write_text(
+            "#!/bin/sh\n"
+            "if [ \"$1 $2\" = 'api graphql' ]; then cat \"$GRAPHQL_FIXTURE\"; exit 0; fi\n"
+            "printf '%s\\n' \"$*\" > \"$GH_LOG\"\n"
+            "printf '%s\\n' https://github.com/owner/repo/pull/556\n",
+            encoding="utf-8",
+        )
+        self.gh.chmod(0o755)
+        self.environment["GRAPHQL_FIXTURE"] = str(self.root / "graphql.json")
+
+    def test_pr_create_refuses_a_duplicate_of_an_open_pull_request(self) -> None:
+        self.make_duplicate_fixture()
+        result = self.run_wrapper(
+            "pr", "create", "--title", "x", "--body", "y", "--repo", "owner/repo"
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("#555", result.stderr)
+        self.assertIn("/pull/555", result.stderr)
+        self.assertFalse(self.gh_log.exists(), "gh pr create must not run")
+        self.assertEqual(self.owner_register_calls(), [])
+
+    def test_pr_create_duplicate_guard_parses_attached_short_head_and_base(self) -> None:
+        self.make_duplicate_fixture()
+        result = self.run_wrapper(
+            "pr", "create", "-Hfeature", "-Bmain", "--title", "x",
+            "--body", "y", "--repo", "owner/repo",
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("#555", result.stderr)
+        self.assertFalse(self.gh_log.exists(), "gh pr create must not run")
+
+    def test_pr_create_refuses_a_duplicate_on_the_same_head_branch(self) -> None:
+        self.make_duplicate_fixture(head="feature")
+        result = self.run_wrapper(
+            "pr", "create", "--title", "x", "--body", "y", "--repo", "owner/repo"
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("#555", result.stderr)
+        self.assertFalse(self.gh_log.exists(), "gh pr create must not run")
+
+    def test_pr_create_duplicate_guard_paginates_open_pull_requests(self) -> None:
+        self.make_duplicate_fixture()
+        duplicate = json.loads((self.root / "graphql.json").read_text())
+        pages = self.root / "graphql-pages"
+        pages.mkdir()
+        for index in range(101):
+            page = {
+                "data": {
+                    "repository": {
+                        "defaultBranchRef": {"name": "main"},
+                        "pullRequests": {
+                            "nodes": [],
+                            "pageInfo": {
+                                "hasNextPage": index < 100,
+                                "endCursor": (
+                                    f"cursor-{index}" if index < 100 else None
+                                ),
+                            },
+                        },
+                    }
+                }
+            }
+            if index == 100:
+                page = duplicate
+                page["data"]["repository"]["pullRequests"]["pageInfo"] = {
+                    "hasNextPage": False,
+                    "endCursor": None,
+                }
+            (pages / f"page-{index}.json").write_text(
+                json.dumps(page), encoding="utf-8"
+            )
+        count_path = self.root / "graphql-count"
+        self.environment.update(
+            GRAPHQL_PAGES=str(pages),
+            GRAPHQL_COUNT=str(count_path),
+        )
+        self.gh.write_text(
+            "#!/bin/sh\n"
+            "if [ \"$1 $2\" = 'api graphql' ]; then\n"
+            "  count=0\n"
+            "  if [ -f \"$GRAPHQL_COUNT\" ]; then count=$(cat \"$GRAPHQL_COUNT\"); fi\n"
+            "  cat \"$GRAPHQL_PAGES/page-$count.json\"\n"
+            "  printf '%s' $((count + 1)) > \"$GRAPHQL_COUNT\"\n"
+            "  exit 0\n"
+            "fi\n"
+            "printf '%s\\n' \"$*\" > \"$GH_LOG\"\n"
+            "printf '%s\\n' https://github.com/owner/repo/pull/556\n",
+            encoding="utf-8",
+        )
+        self.gh.chmod(0o755)
+        result = self.run_wrapper(
+            "pr", "create", "--title", "x", "--body", "y", "--repo", "owner/repo"
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("#555", result.stderr)
+        self.assertFalse(self.gh_log.exists(), "gh pr create must not run")
+
+    def test_pr_create_proceeds_when_the_open_pull_request_list_is_malformed(self) -> None:
+        self.make_duplicate_fixture()
+        (self.root / "graphql.json").write_text('{"errors":[{"message":"boom"}]}')
+        result = self.run_wrapper(
+            "pr", "create", "--title", "x", "--body", "y", "--repo", "owner/repo"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.gh_log.exists(), "gh pr create must run")
+        self.assertIn("creating anyway", result.stderr)
+
+    def test_pr_create_proceeds_when_the_page_cursor_repeats(self) -> None:
+        self.make_duplicate_fixture()
+        page = json.loads((self.root / "graphql.json").read_text())
+        page["data"]["repository"]["pullRequests"]["nodes"] = []
+        page["data"]["repository"]["pullRequests"]["pageInfo"] = {"hasNextPage": True, "endCursor": "same"}
+        (self.root / "graphql.json").write_text(json.dumps(page))
+        result = self.run_wrapper(
+            "pr", "create", "--title", "x", "--body", "y", "--repo", "owner/repo"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.gh_log.exists(), "gh pr create must run")
+
+    def test_pr_create_allows_the_same_tree_on_a_different_base(self) -> None:
+        self.make_duplicate_fixture(other_base="release")
+        result = self.run_wrapper(
+            "pr", "create", "--title", "x", "--body", "y", "--repo", "owner/repo"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.gh_log.exists())
+
+    def test_pr_create_duplicate_guard_honours_the_operator_override(self) -> None:
+        self.make_duplicate_fixture()
+        self.environment["SHIPYARD_GHAPP_ALLOW_DUPLICATE_PR"] = "1"
+        result = self.run_wrapper(
+            "pr", "create", "--title", "x", "--body", "y", "--repo", "owner/repo"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("SHIPYARD_GHAPP_ALLOW_DUPLICATE_PR", result.stderr)
+
+    def test_the_duplicate_refusal_does_not_name_its_override(self) -> None:
+        self.make_duplicate_fixture()
+        result = self.run_wrapper(
+            "pr", "create", "--title", "x", "--body", "y", "--repo", "owner/repo"
+        )
+        self.assertNotIn("ALLOW", result.stderr)
+
+    def test_a_pr_created_before_gh_failed_a_later_step_is_still_registered(
+        self,
+    ) -> None:
+        self.write_create_gh("https://github.com/owner/repo/pull/77", status=1)
+        result = self.run_wrapper(
+            "pr", "create", "--title", "x", "--body", "y", "--repo", "owner/repo"
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(len(self.owner_register_calls()), 1)
+
+    def test_a_pr_create_dry_run_registers_nothing(self) -> None:
+        self.write_create_gh("https://github.com/owner/repo/pull/77")
+        result = self.run_wrapper(
+            "pr", "create", "--dry-run", "--title", "x", "--body", "y",
+            "--repo", "owner/repo",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.owner_register_calls(), [])
+
     def make_checkout(self, remote: str) -> None:
         subprocess.run(["git", "init", "-q"], cwd=self.root, check=True)
         subprocess.run(

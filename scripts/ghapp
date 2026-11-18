@@ -847,8 +847,14 @@ while [[ "$grammar_argument_index" -lt "$grammar_argument_count" ]]; do
     argument="${grammar_arguments[$grammar_argument_index]}"
     grammar_argument_index=$((grammar_argument_index + 1))
     if [[ -n "$grammar_pending_option" ]]; then
+        if [[ ( "$grammar_pending_option" == "--repo" || "$grammar_pending_option" == "-R" ) && \
+            "$argument" == -* ]]; then
+            echo "ghapp: $grammar_pending_option requires a value before $argument" >&2
+            exit 1
+        fi
         if [[ "$argument" == --repo || "$argument" == -R ]] || \
-            cli_boolean_option "$command_name" "${2:-}" "$argument" || \
+            { cli_boolean_option "$command_name" "${2:-}" "$argument" && \
+                ! [[ "$command_name" == pr && "${2:-}" == create ]]; } || \
             cli_option_takes_value "$command_name" "${2:-}" "$argument"; then
             echo "ghapp: $grammar_pending_option requires a value before $argument" >&2
             exit 1
@@ -2117,6 +2123,209 @@ data = re.sub(rb"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", b"", data)
 sys.stdout.buffer.write(data)
 ' "$1"
 }
+
+# Parse `pr create` options once for the guards below. Values are consumed
+# before boolean flags are inspected, so a value that happens to look like a
+# flag remains a value (as native gh accepts it).
+ghapp_pr_create_parse_options() {
+    ghapp_create_head=""
+    ghapp_create_base=""
+    ghapp_create_dry=0
+    local argument pending_kind="" options_ended=0
+    for argument in "$@"; do
+        if [[ -n "$pending_kind" ]]; then
+            case "$pending_kind" in
+                head) ghapp_create_head="$argument" ;;
+                base) ghapp_create_base="$argument" ;;
+            esac
+            pending_kind=""
+            continue
+        fi
+        if [[ "$options_ended" == 1 ]]; then
+            continue
+        fi
+        case "$argument" in
+            --)
+                options_ended=1
+                continue
+                ;;
+            --head|-H)
+                pending_kind=head
+                continue
+                ;;
+            --base|-B)
+                pending_kind=base
+                continue
+                ;;
+            --head=*) ghapp_create_head="${argument#--head=}"; continue ;;
+            --base=*) ghapp_create_base="${argument#--base=}"; continue ;;
+            -H=*) ghapp_create_head="${argument#-H=}"; continue ;;
+            -B=*) ghapp_create_base="${argument#-B=}"; continue ;;
+            -H?*) ghapp_create_head="${argument#-H}"; continue ;;
+            -B?*) ghapp_create_base="${argument#-B}"; continue ;;
+            --dry-run=true|--web=true) ghapp_create_dry=1; continue ;;
+            --dry-run=false|--web=false) continue ;;
+        esac
+        if cli_option_takes_value pr create "$argument"; then
+            pending_kind=value
+            continue
+        fi
+        if cli_boolean_option pr create "$argument"; then
+            case "$argument" in
+                --dry-run|-w|--web) ghapp_create_dry=1 ;;
+            esac
+        fi
+    done
+}
+
+# `pr create` refuses to open a duplicate: an open pull request in the same
+# repository with the same base and the same head tree has an identical diff,
+# so a second one only splits review and CI. One GraphQL read lists the open
+# pull requests with their head trees, a page at a time until the list is
+# exhausted. Best effort: any failure to read a page (an error, a malformed
+# response, a missing cursor), or a head it cannot resolve locally (a fork's
+# `owner:branch`), lets the create proceed; only a duplicate found refuses.
+# Operators can allow
+# a deliberate re-open (docs/ghapp-guards.md).
+if [[ "${1:-} ${2:-}" == "pr create" && "${SHIPYARD_GHAPP_ALLOW_DUPLICATE_PR:-}" != 1 ]]; then
+    ghapp_pr_create_parse_options "${@:3}"
+    ghapp_dup_head="$ghapp_create_head"
+    ghapp_dup_base="$ghapp_create_base"
+    ghapp_dup_dry="$ghapp_create_dry"
+    if [[ "$ghapp_dup_dry" == 0 && "$repo" == */* && "$repo" != *://* ]]; then
+        if [[ -z "$ghapp_dup_head" ]]; then
+            ghapp_dup_head="$(PATH="$trusted_path" "$git_binary" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+        fi
+        ghapp_dup_tree=""
+        if [[ -z "$ghapp_dup_base" && -n "$ghapp_dup_head" ]]; then
+            # Like gh: a branch's configured merge base is the default base.
+            ghapp_dup_base="$(PATH="$trusted_path" "$git_binary" config --get "branch.${ghapp_dup_head}.gh-merge-base" 2>/dev/null || true)"
+        fi
+        if [[ -n "$ghapp_dup_head" && "$ghapp_dup_head" != HEAD && "$ghapp_dup_head" != *:* ]]; then
+            ghapp_dup_tree="$(PATH="$trusted_path" "$git_binary" rev-parse --verify --quiet "refs/heads/${ghapp_dup_head}^{tree}" 2>/dev/null || \
+                PATH="$trusted_path" "$git_binary" rev-parse --verify --quiet "refs/remotes/origin/${ghapp_dup_head}^{tree}" 2>/dev/null || true)"
+        fi
+        if [[ -n "$ghapp_dup_tree" ]]; then
+            ghapp_dup_query='query($owner:String!,$name:String!){repository(owner:$owner,name:$name){defaultBranchRef{name} pullRequests(states:OPEN,first:100,orderBy:{field:UPDATED_AT,direction:DESC}){nodes{number url baseRefName headRefName isCrossRepository headRef{target{... on Commit{tree{oid}}}}} pageInfo{hasNextPage endCursor}}}}'
+            ghapp_dup_query_after='query($owner:String!,$name:String!,$after:String!){repository(owner:$owner,name:$name){defaultBranchRef{name} pullRequests(states:OPEN,first:100,after:$after,orderBy:{field:UPDATED_AT,direction:DESC}){nodes{number url baseRefName headRefName isCrossRepository headRef{target{... on Commit{tree{oid}}}}} pageInfo{hasNextPage endCursor}}}}'
+            ghapp_dup_cursor=""
+            while :; do
+                if [[ -n "$ghapp_dup_cursor" ]]; then
+                    ghapp_dup_list="$(PATH="$trusted_path" "$gh_binary" api graphql \
+                        -f query="$ghapp_dup_query_after" \
+                        -f owner="${repo%%/*}" -f name="${repo#*/}" \
+                        -f after="$ghapp_dup_cursor" 2>/dev/null || true)"
+                else
+                    ghapp_dup_list="$(PATH="$trusted_path" "$gh_binary" api graphql \
+                        -f query="$ghapp_dup_query" \
+                        -f owner="${repo%%/*}" -f name="${repo#*/}" 2>/dev/null || true)"
+                fi
+                [[ -n "$ghapp_dup_list" ]] || break
+                ghapp_dup_page="$(printf '%s' "$ghapp_dup_list" | "$python_binary" -I -c '
+import json, sys
+tree, base, head = sys.argv[1:4]
+found = ""
+has_next = "0"
+cursor = ""
+try:
+    repository = json.load(sys.stdin)["data"]["repository"]
+    base = base or repository["defaultBranchRef"]["name"]
+    pull_requests = repository["pullRequests"]
+    for node in pull_requests["nodes"]:
+        if node.get("isCrossRepository"):
+            continue
+        oid = (((node.get("headRef") or {}).get("target") or {}).get("tree") or {}).get("oid")
+        if oid == tree and node.get("baseRefName") == base:
+            found = "{} {}".format(node["number"], node["url"])
+            break
+    page_info = pull_requests.get("pageInfo") or {}
+    if page_info.get("hasNextPage") and page_info.get("endCursor"):
+        has_next = "1"
+        cursor = page_info["endCursor"]
+except Exception:
+    print("||error")
+else:
+    print("{}|{}|ok|{}".format(found, has_next, cursor))
+' "$ghapp_dup_tree" "$ghapp_dup_base" "$ghapp_dup_head" 2>/dev/null || true)"
+                IFS='|' read -r ghapp_dup_found ghapp_dup_has_next ghapp_dup_status ghapp_dup_next_cursor <<< "$ghapp_dup_page"
+                if [[ "$ghapp_dup_status" != ok ]]; then
+                    echo "ghapp: duplicate pull-request scan could not read the open pull requests; creating anyway" >&2
+                    break
+                fi
+                if [[ -n "$ghapp_dup_found" ]]; then
+                    echo "ghapp: refusing to open a duplicate pull request: ${ghapp_dup_found#* } (#${ghapp_dup_found%% *}) is open against the same base with an identical diff. Update that pull request instead." >&2
+                    exit 1
+                fi
+                if [[ "$ghapp_dup_has_next" != 1 ]]; then
+                    break
+                fi
+                if [[ -z "$ghapp_dup_next_cursor" || "$ghapp_dup_next_cursor" == "$ghapp_dup_cursor" ]]; then
+                    echo "ghapp: duplicate pull-request scan lost its page cursor; creating anyway" >&2
+                    break
+                fi
+                ghapp_dup_cursor="$ghapp_dup_next_cursor"
+            done
+        fi
+    fi
+    unset ghapp_create_head ghapp_create_base ghapp_create_dry ghapp_dup_head ghapp_dup_base \
+        ghapp_dup_dry ghapp_dup_tree ghapp_dup_list ghapp_dup_found ghapp_dup_query \
+        ghapp_dup_query_after ghapp_dup_cursor ghapp_dup_next_cursor ghapp_dup_page \
+        ghapp_dup_has_next ghapp_dup_status
+fi
+
+# `pr create` registers its session as the pull request's owner, as `shipyard
+# pr` does, so the relay can reach the session when the PR needs it. Best
+# effort: it never changes gh's stdout or exit code, and `shipyard owner
+# register --after-create` itself honours the host's `[relay]` opt-in and
+# SHIPYARD_OWNER_REGISTER=0. Only when stdout is captured (an agent, not a
+# terminal), so an interactive prompt keeps its terminal.
+ghapp_register_owner=0
+if [[ "${1:-} ${2:-}" == "pr create" && "$ghapp_sanitize" != 1 && ! -t 1 ]]; then
+    ghapp_pr_create_parse_options "${@:3}"
+    ghapp_register_owner=1
+    [[ "$ghapp_create_dry" == 1 ]] && ghapp_register_owner=0
+fi
+unset ghapp_create_head ghapp_create_base ghapp_create_dry
+if [[ "$ghapp_register_owner" == 1 && ( "${1:-}" != "api" || "$ghapp_stderr_open" == 0 ) ]]; then
+    ghapp_create_out="$(/usr/bin/mktemp /tmp/shipyard-ghapp-create.XXXXXX)"
+    ghapp_create_child=""
+    trap '/bin/rm -f -- "$ghapp_create_out"' EXIT
+    # gh runs as a child here rather than replacing this shell, so a caller's
+    # timeout (INT/TERM/HUP) must still reach it: a cancelled create must not
+    # go on to open the pull request.
+    for ghapp_create_signal in INT TERM HUP; do
+        trap 'if [[ -n "$ghapp_create_child" ]]; then kill -'"$ghapp_create_signal"' "$ghapp_create_child" 2>/dev/null || true; fi' "$ghapp_create_signal"
+    done
+    set +e
+    # A background command gets /dev/null for stdin unless told otherwise;
+    # `--body-file -` needs the caller's stdin.
+    exec 3<&0
+    "$gh_binary" "$@" <&3 >"$ghapp_create_out" &
+    exec 3<&-
+    ghapp_create_child=$!
+    wait "$ghapp_create_child"
+    ghapp_status=$?
+    # A signal interrupts the first wait; collect the child's real status.
+    while kill -0 "$ghapp_create_child" 2>/dev/null; do
+        wait "$ghapp_create_child"
+        ghapp_status=$?
+    done
+    set -e
+    trap - INT TERM HUP
+    /bin/cat -- "$ghapp_create_out" 2>/dev/null || true
+    # A URL on stdout means the pull request exists, even when gh then failed
+    # a later step (an attachment upload): register it regardless of status.
+    ghapp_created_url="$(/usr/bin/grep -E '^https://github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/pull/[0-9]+$' "$ghapp_create_out" 2>/dev/null | /usr/bin/tail -n 1 || true)"
+    if [[ -n "$ghapp_created_url" ]]; then
+        ghapp_created_path="${ghapp_created_url#https://github.com/}"
+        ghapp_created_number="${ghapp_created_path##*/}"
+        ghapp_created_repo="${ghapp_created_path%/pull/*}"
+        PATH="$trusted_path" "$shipyard_binary" "${resolver_context_argv[@]}" owner register \
+            --pr "$ghapp_created_number" --repo "$ghapp_created_repo" \
+            --after-create </dev/null >&2 2>&1 || true
+    fi
+    exit "$ghapp_status"
+fi
 
 if [[ "${1:-}" != "api" || "$ghapp_stderr_open" == 0 ]]; then
     if [[ "$ghapp_sanitize" != 1 ]]; then
