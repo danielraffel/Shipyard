@@ -230,6 +230,15 @@ class Collect(unittest.TestCase):
         r = self.go(Fake(listing, jobs), events=("merge_group",))
         self.assertEqual(r["never_landed"][0]["runs_not_landed"], 0)
 
+    def test_never_landed_is_provisional_until_the_landing_horizon_has_passed(self):
+        mg = "gh-readonly-queue/main/pr-1-x"
+        listing = [run(2, "merge_group", "x", branch=mg)]
+        jobs = {2: [job("macos", FLEET, 0, 10)]}
+        early = self.go(Fake(listing, jobs), events=("merge_group",), now=dt.datetime(2026, 11, 14, tzinfo=dt.timezone.utc))
+        self.assertTrue(any("provisional" in x for x in early["partial_reasons"]))
+        late = self.go(Fake(listing, jobs), events=("merge_group",), now=dt.datetime(2026, 11, 20, tzinfo=dt.timezone.utc))
+        self.assertFalse(late["partial"])
+
     def test_an_open_day_is_not_cached(self):
         f = Fake(self.listing, self.jobs)
         self.go(f, now=dt.datetime(2026, 11, 12, 18, tzinfo=dt.timezone.utc))

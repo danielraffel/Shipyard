@@ -233,6 +233,9 @@ def collect(rd, since, until, events, workflows, branch, today, workers=4):
         partial.append(f"{unread} of {len(todo)} runs' jobs not read in full")
     if rd.truncated:
         partial.append(f"read cap of {rd.cap} reached")
+    if "merge_group" in events and until + dt.timedelta(days=LAND_HORIZON_DAYS) > today:
+        partial.append(f"landing horizon open until {until + dt.timedelta(days=LAND_HORIZON_DAYS)}: "
+                       "never-landed figures are provisional")
     return {"runs": {ev: [r for r in runs[ev] if r["id"] in seen] for ev in events}, "ctx": ctx, "jobs": jobs,
             "partial": partial, "reads": rd.calls, "errors": rd.errors}
 

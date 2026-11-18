@@ -168,8 +168,9 @@ and a hard cap on calls (`--read-cap`, default 8000). Runs are listed one UTC da
 total is over the 1,000-result cap is split by time until each part fits. The jobs of a completed run are fetched
 with `filter=all` (every attempt) and cached; a cache entry that has not seen a run's latest attempt is read
 again. Day listings of days two or more days old are cached for 24 hours, then read again so a later re-run
-shows up. A second run over the same window reads almost nothing. `--workflow` limits which runs have their
-jobs read; it does not change the duplicate or never-landed lookups.
+shows up. A second run over the same window reads almost nothing. `--workflow` limits the report to those
+workflows; the same-SHA and landing lookups still read every workflow's runs, so a filtered figure is the same
+number the unfiltered report gives that workflow.
 
 | Figure | Definition |
 | --- | --- |
@@ -177,7 +178,7 @@ jobs read; it does not change the duplicate or never-landed lookups.
 | Queue minutes | `created_at` to `started_at` of jobs that got a runner: median, p90 (linear interpolation) and sum, per workflow and event. |
 | Duplicate | A push run on `--branch` (default `main`) whose `head_sha` has a successful `merge_group` run of the same workflow path. The merge group is listed from one day before the window. |
 | Short-job wait | Per fleet label: jobs that ran under 3 minutes, their count and their queue hours, next to all fleet jobs and queue hours for that label. |
-| Never landed | Fleet minutes of completed `merge_group` runs whose `head_sha` is not the `head_sha` of any push to the branch. Pushes are listed for 7 days after the window (or until today), so "never" means not landed within that horizon; a run still in flight is counted separately and left out. |
+| Never landed | Fleet minutes of completed `merge_group` runs whose `head_sha` is not the `head_sha` of any push to the branch. Pushes are listed for 7 days after the window (or until today), so "never" means not landed within that horizon; a run still in flight is counted separately and left out. Until the horizon has passed the figure is provisional and the report says `partial`. |
 
 `partial` is printed, with the reason, when a listing could not be read in full, a run's jobs were not read (read
 cap or error), the cap was reached or a run had not finished (its unfinished jobs count zero minutes). A partial row is never zero: it shows how many runs went unread. Re-run with
