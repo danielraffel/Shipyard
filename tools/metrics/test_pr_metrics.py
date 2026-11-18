@@ -944,6 +944,34 @@ class RerunCache(Base):
         self.assertIsNotNone(m)
         self.assertEqual(m.group(1), pm.SCORECARD_VERSION)
 
+    def cause_of(self, timeline, runs=()):
+        gh = world([pr(1, T(10, "09:00"), T(10, "11:00"))], {1: timeline}, runs=list(runs), jobs={11: self.JOB})
+        with tempfile.TemporaryDirectory() as fresh:  # a settled PR is cached: each call starts empty
+            out = pm.build([REPO], fresh, 300, OWNER, START, NOW, {}, {}, None, gh, control=False)
+        return out["repos"][REPO]["prs"][0]["cause_min"]
+
+    HOLD = {"event": "commented", "actor": {"login": "x"}, "body": "HOLD", "created_at": T(10, "10:00")}
+
+    def test_a_hold_with_no_commit_or_push_after_it_is_measured_to_the_merge(self):
+        self.assertEqual(self.cause_of([self.HOLD])["hold"], 60.0)
+
+    def test_a_failed_run_with_no_commit_or_push_after_it_is_measured_to_the_merge(self):
+        self.assertEqual(self.cause_of([], [self.mk(1, "failure", T(10, "10:12"))])["red"], 48.0)
+
+    def test_an_untimed_commit_after_a_hold_leaves_the_hold_unknown(self):
+        commit_after = {"event": "committed", "sha": "c" * 40, "committer": {"date": T(10, "10:30")}}
+        self.assertIsNone(self.cause_of([self.HOLD, commit_after])["hold"])
+        commit_before = {"event": "committed", "sha": "c" * 40, "committer": {"date": T(9, "09:30")}}
+        self.assertEqual(self.cause_of([commit_before, self.HOLD])["hold"], 60.0)  # listed before the HOLD: not a push after it
+
+    def test_an_untimed_commit_after_a_failed_run_leaves_the_red_duration_unknown(self):
+        run = [self.mk(1, "failure", T(10, "10:12"))]
+        after = {"event": "committed", "sha": "c" * 40, "committer": {"date": T(10, "10:30")}}
+        self.assertIsNone(self.cause_of([after], run)["red"])
+        self.assertIsNone(self.cause_of([{"event": "committed", "sha": "c" * 40}], run)["red"])  # no date at all
+        before = {"event": "committed", "sha": "c" * 40, "committer": {"date": T(10, "10:05")}}
+        self.assertEqual(self.cause_of([before], run)["red"], 48.0)
+
 
 class JobsSkippedHold(Base):
     """Findings of the review of the job-read switch."""
@@ -1180,6 +1208,12 @@ class MergeRemoval(Base):
         e = dict(self.removal("10:59"), reason="failed_checks")
         r = self.rows(self.build(world([p], {1: [e]})))[1]
         self.assertEqual((r["ejections"], r["path"]), (["failed_checks"], "slow"))
+
+    def test_a_removal_with_an_explicit_reason_after_the_merge_is_not_an_ejection(self):
+        p = pr(1, T(10, "09:00"), T(10, "11:00"))
+        e = dict(self.removal("11:30"), reason="failed_checks")
+        r = self.rows(self.build(world([p], {1: [e]})))[1]
+        self.assertEqual(r["ejections"], [])
 
     def test_a_pr_with_only_the_merge_removal_is_not_slow_for_an_ejection(self):
         p = pr(1, T(10, "10:00"), T(10, "11:00"))
@@ -1829,6 +1863,14 @@ class Proxies(Base):
         job = [{"labels": ["self-hosted"], "created_at": T(10, "10:00"), "started_at": T(10, "10:05"), "completed_at": T(10, "10:10"), "conclusion": "success"}]
         out = self.build(world([p], runs=runs, jobs={21: job}), now=self.LATE)
         self.assertEqual(self.rows(out)[1]["compute"]["runner_wait_min"], 5.0)
+
+    def test_a_run_begun_after_the_merge_adds_no_runner_wait(self):
+        p = pr(1, T(10, "09:00"), T(10, "11:00"))
+        h = p["head"]["sha"]
+        runs = [{"id": 21, "head_sha": h, "event": "pull_request", "status": "completed", "name": "GPU", "head_branch": "feat", "created_at": T(10, "11:20")}]
+        job = [{"labels": ["self-hosted"], "created_at": T(10, "11:20"), "started_at": T(10, "11:25"), "completed_at": T(10, "11:30"), "conclusion": "success"}]
+        out = self.build(world([p], runs=runs, jobs={21: job}), now=self.LATE)
+        self.assertEqual(self.rows(out)[1]["compute"]["runner_wait_min"], 0.0)
 
 
 class VellumControl(unittest.TestCase):
