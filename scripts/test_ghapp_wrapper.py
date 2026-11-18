@@ -2529,6 +2529,38 @@ class GhappWrapperTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(self.owner_register_calls()), 1)
 
+    def test_pr_create_rejects_a_boolean_token_as_the_repo_value(self) -> None:
+        self.write_create_gh("https://github.com/owner/repo/pull/77")
+        result = self.run_wrapper(
+            "pr", "create", "--title", "x", "--repo", "--web",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--repo requires a value before --web", result.stderr)
+        self.assertFalse(self.helper_log.exists())
+        self.assertFalse(self.gh_log.exists())
+
+    def test_pr_create_boolean_assignments_honor_true_for_dry_guards(self) -> None:
+        self.make_duplicate_fixture()
+        for option in ("--dry-run=true", "--web=true"):
+            with self.subTest(option=option):
+                result = self.run_wrapper(
+                    "pr", "create", option, "--title", "x", "--body", "y",
+                    "--repo", "owner/repo",
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.owner_register_calls(), [])
+
+    def test_pr_create_boolean_assignments_honor_false_for_dry_guards(self) -> None:
+        self.make_duplicate_fixture()
+        for option in ("--dry-run=false", "--web=false"):
+            with self.subTest(option=option):
+                result = self.run_wrapper(
+                    "pr", "create", option, "--title", "x", "--body", "y",
+                    "--repo", "owner/repo",
+                )
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("#555", result.stderr)
+
     def test_pr_create_that_fails_or_prints_no_pull_request_registers_nothing(
         self,
     ) -> None:
@@ -2593,7 +2625,9 @@ class GhappWrapperTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.gh_log.read_text(), "the body\n")
 
-    def make_duplicate_fixture(self, other_base: str = "main") -> None:
+    def make_duplicate_fixture(
+        self, other_base: str = "main", head: str = "other"
+    ) -> None:
         """A checkout on branch `feature`, and a gh whose open-PR list holds
         one pull request with the same head tree (and `other_base`)."""
         env = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
@@ -2611,7 +2645,7 @@ class GhappWrapperTests(unittest.TestCase):
             "defaultBranchRef": {"name": "main"},
             "pullRequests": {"nodes": [{
                 "number": 555, "url": "https://github.com/owner/repo/pull/555",
-                "baseRefName": other_base, "headRefName": "other",
+                "baseRefName": other_base, "headRefName": head,
                 "isCrossRepository": False,
                 "headRef": {"target": {"tree": {"oid": tree}}},
             }]},
@@ -2648,39 +2682,58 @@ class GhappWrapperTests(unittest.TestCase):
         self.assertIn("#555", result.stderr)
         self.assertFalse(self.gh_log.exists(), "gh pr create must not run")
 
+    def test_pr_create_refuses_a_duplicate_on_the_same_head_branch(self) -> None:
+        self.make_duplicate_fixture(head="feature")
+        result = self.run_wrapper(
+            "pr", "create", "--title", "x", "--body", "y", "--repo", "owner/repo"
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("#555", result.stderr)
+        self.assertFalse(self.gh_log.exists(), "gh pr create must not run")
+
     def test_pr_create_duplicate_guard_paginates_open_pull_requests(self) -> None:
         self.make_duplicate_fixture()
-        first = {
-            "data": {
-                "repository": {
-                    "defaultBranchRef": {"name": "main"},
-                    "pullRequests": {
-                        "nodes": [],
-                        "pageInfo": {"hasNextPage": True, "endCursor": "cursor-1"},
-                    },
+        duplicate = json.loads((self.root / "graphql.json").read_text())
+        pages = self.root / "graphql-pages"
+        pages.mkdir()
+        for index in range(101):
+            page = {
+                "data": {
+                    "repository": {
+                        "defaultBranchRef": {"name": "main"},
+                        "pullRequests": {
+                            "nodes": [],
+                            "pageInfo": {
+                                "hasNextPage": index < 100,
+                                "endCursor": (
+                                    f"cursor-{index}" if index < 100 else None
+                                ),
+                            },
+                        },
+                    }
                 }
             }
-        }
-        second = json.loads((self.root / "graphql.json").read_text())
-        second["data"]["repository"]["pullRequests"]["pageInfo"] = {
-            "hasNextPage": False,
-            "endCursor": None,
-        }
-        first_path = self.root / "graphql-first.json"
-        second_path = self.root / "graphql-second.json"
+            if index == 100:
+                page = duplicate
+                page["data"]["repository"]["pullRequests"]["pageInfo"] = {
+                    "hasNextPage": False,
+                    "endCursor": None,
+                }
+            (pages / f"page-{index}.json").write_text(
+                json.dumps(page), encoding="utf-8"
+            )
         count_path = self.root / "graphql-count"
-        first_path.write_text(json.dumps(first), encoding="utf-8")
-        second_path.write_text(json.dumps(second), encoding="utf-8")
         self.environment.update(
-            GRAPHQL_FIRST=str(first_path),
-            GRAPHQL_SECOND=str(second_path),
+            GRAPHQL_PAGES=str(pages),
             GRAPHQL_COUNT=str(count_path),
         )
         self.gh.write_text(
             "#!/bin/sh\n"
             "if [ \"$1 $2\" = 'api graphql' ]; then\n"
-            "  if [ -f \"$GRAPHQL_COUNT\" ]; then cat \"$GRAPHQL_SECOND\";\n"
-            "  else : > \"$GRAPHQL_COUNT\"; cat \"$GRAPHQL_FIRST\"; fi\n"
+            "  count=0\n"
+            "  if [ -f \"$GRAPHQL_COUNT\" ]; then count=$(cat \"$GRAPHQL_COUNT\"); fi\n"
+            "  cat \"$GRAPHQL_PAGES/page-$count.json\"\n"
+            "  printf '%s' $((count + 1)) > \"$GRAPHQL_COUNT\"\n"
             "  exit 0\n"
             "fi\n"
             "printf '%s\\n' \"$*\" > \"$GH_LOG\"\n"
