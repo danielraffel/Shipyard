@@ -1558,3 +1558,42 @@ fn a_stuck_alert_is_within_the_per_pass_escalation_cap() {
         "the deferred alert was not used up"
     );
 }
+
+/// A pass that does not apply reports the stuck row but as not emitted
+/// (`escalated_level` 0), writes no feed, and leaves the alert for the next
+/// apply pass.
+#[test]
+fn a_dry_run_pass_reports_the_stuck_row_as_not_emitted() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut pass = pass(
+        &temp,
+        vec![pr(1, Some("SUCCESS"), Some("SUCCESS"), &[])],
+        vec![report(1, "merge_state:UNSTABLE", None)],
+    );
+    let mut ledger = established();
+    pass.run(&mut ledger, &FakeActs::default());
+    pass.apply = false;
+    pass.now = now() + chrono::Duration::minutes(61);
+    let dry = pass.run(&mut ledger, &FakeActs::default());
+    let row = dry
+        .overdue
+        .iter()
+        .find(|row| row.state == crate::merge_steward::dwell::DwellState::ApprovedStuck)
+        .expect("stuck row");
+    assert_eq!(row.escalated_level, 0);
+    assert!(
+        !temp
+            .path()
+            .join("state")
+            .join(dwell_pass::DIR)
+            .join(dwell_pass::FEED)
+            .exists(),
+        "a dry run writes no feed"
+    );
+    pass.apply = true;
+    pass.now = now() + chrono::Duration::minutes(62);
+    assert_eq!(
+        pass.run(&mut ledger, &FakeActs::default()).escalations_new,
+        1
+    );
+}

@@ -410,10 +410,18 @@ pub(super) fn run(
         .iter()
         .map(|report| (report.number, report.head_sha.clone()))
         .collect();
+    let deferred: BTreeSet<u64> = reports
+        .iter()
+        .filter(|report| {
+            super::pass_budget::is_deferred(report) || report.blocked.blocked_on.is_empty()
+        })
+        .map(|report| report.number)
+        .collect();
     let mut stuck = dwell::track_stuck(
         &mut state,
         &stuck_candidates(input, reports),
         &open,
+        &deferred,
         input.dwell_policy,
         input.now,
     );
@@ -434,7 +442,7 @@ pub(super) fn run(
     report.overdue.extend(stuck.iter().map(|row| {
         // The relay delivers only an emitted level: one this pass escalated
         // or an earlier pass marked, never one the cap deferred.
-        let emitted = row.escalate
+        let emitted = (row.escalate && input.apply)
             || state
                 .stuck_approved
                 .get(&row.overdue.number)

@@ -939,6 +939,18 @@ fn stuck_pass(
     minutes: i64,
     apply: bool,
 ) -> Vec<Planned> {
+    stuck_pass_with(state, candidates, others, &[], minutes, apply)
+}
+
+/// [`stuck_pass`], with `deferred` pull requests seen but not judged.
+fn stuck_pass_with(
+    state: &mut DwellRepoState,
+    candidates: &[StuckCandidate],
+    others: &[(u64, &str)],
+    deferred: &[u64],
+    minutes: i64,
+    apply: bool,
+) -> Vec<Planned> {
     let open = candidates
         .iter()
         .map(|candidate| (candidate.number, candidate.head.clone()))
@@ -952,6 +964,7 @@ fn stuck_pass(
         state,
         candidates,
         &open,
+        &deferred.iter().copied().collect(),
         &DwellPolicy::default(),
         now() + Duration::minutes(minutes),
     );
@@ -1100,6 +1113,44 @@ fn the_stuck_bound_is_configurable_and_zero_disables_it() {
     let mut state = established();
     let pr = [stuck(9, HEAD, "merge_state:UNSTABLE")];
     let open: BTreeMap<u64, String> = [(9, HEAD.to_owned())].into_iter().collect();
-    track_stuck(&mut state, &pr, &open, &off, now());
-    assert!(track_stuck(&mut state, &pr, &open, &off, now() + Duration::minutes(600)).is_empty());
+    track_stuck(&mut state, &pr, &open, &BTreeSet::new(), &off, now());
+    assert!(
+        track_stuck(
+            &mut state,
+            &pr,
+            &open,
+            &BTreeSet::new(),
+            &off,
+            now() + Duration::minutes(600)
+        )
+        .is_empty()
+    );
+}
+
+/// Passes that did not judge the pull request (its row deferred by the pass
+/// budget or a rate limit) and passes that did not happen at all are no
+/// evidence it stopped being stuck: neither restarts the clock, so the alert
+/// still fires 60 minutes after it was first seen.
+#[test]
+fn deferred_rows_and_missing_passes_do_not_restart_the_clock() {
+    let pr = [stuck(11, HEAD, "merge_state:UNSTABLE")];
+    // Deferred for 30 minutes.
+    let mut state = established();
+    stuck_pass(&mut state, &pr, &[], 0, true);
+    for minute in (5..=30).step_by(5) {
+        assert!(stuck_pass_with(&mut state, &[], &[(11, HEAD)], &[11], minute, true).is_empty());
+    }
+    assert!(stuck_pass(&mut state, &pr, &[], 35, true).is_empty());
+    assert!(
+        stuck_pass(&mut state, &pr, &[], 60, true)[0].escalate,
+        "deferred rows kept the clock"
+    );
+    // No pass at all for 30 minutes.
+    let mut state = established();
+    stuck_pass(&mut state, &pr, &[], 0, true);
+    assert!(stuck_pass(&mut state, &pr, &[], 30, true).is_empty());
+    assert!(
+        stuck_pass(&mut state, &pr, &[], 60, true)[0].escalate,
+        "a missing pass kept the clock"
+    );
 }

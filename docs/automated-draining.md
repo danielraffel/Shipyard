@@ -1016,12 +1016,13 @@ with every
 required check green, and that the pass neither merged nor queued, whatever its
 `blocked_on` (`merge_state:UNSTABLE`, an excluded label, an unknown merge
 state, ...). Drafts and queued pull requests are not tracked: the queue owns
-them. The clock starts the first pass that sees it so at its head. A short
-stretch as a non-candidate at that head (up to 15 minutes between candidate
-passes: a `review-verdict` re-run after a comment, a deferred row) keeps it; a
-longer one (queued, held, a red required check) restarts it when the pull
-request is a candidate again, so only time actually spent approved, green and
-unmerged counts. It restarts at a new head and is dropped once the pull
+them. The clock starts the first pass that sees it so at its head. A stretch
+in which passes judged it not a candidate at that head (queued, held, a red
+required check, its verdict re-running after a comment) restarts the clock
+when it is a candidate again if the stretch lasted more than 15 minutes; a
+shorter one keeps it. A row the pass budget or a rate limit deferred, and a
+tick that did not run, are no evidence either way and change nothing, so a
+degraded steward cannot keep the alarm silent. It restarts at a new head and is dropped once the pull
 request is no longer seen. The alert is one per head either way, and a row the
 per-pass escalation cap defers is neither marked nor relayed. Past the limit (60
 minutes; `0` turns it off) the pass reports one `approved_stuck` overdue row

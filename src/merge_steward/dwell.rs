@@ -522,17 +522,19 @@ pub struct StuckApproved {
     pub since: DateTime<Utc>,
     /// Whether its alert was emitted, by an apply pass. One per head.
     pub alerted: bool,
-    /// The last pass that saw it a candidate. A gap longer than
-    /// [`STUCK_GAP_MINUTES`] restarts the clock.
+    /// The first pass, since it was last a candidate, that judged it and
+    /// found it not a candidate (queued, held, red, re-running its verdict).
+    /// A stretch longer than [`STUCK_GAP_MINUTES`] restarts the clock.
     #[serde(default)]
-    pub last_candidate_at: Option<DateTime<Utc>>,
+    pub ineligible_since: Option<DateTime<Utc>>,
 }
 
-/// Longest gap between two passes that see a pull request as a candidate
-/// before its stuck clock restarts. A `review-verdict` re-run after a
-/// comment, or a deferred row, is a pass or two at the five-minute tick;
-/// a stretch in the queue, under a HOLD or with a red required check is not
-/// time spent stuck, so the clock starts again when it comes back.
+/// Longest stretch a pull request may be judged not a candidate at its head
+/// before its stuck clock restarts. A `review-verdict` re-run after a comment
+/// is a pass or two at the five-minute tick; a stretch in the queue, under a
+/// HOLD or with a red required check is not time spent stuck. Only passes
+/// that judged the pull request count: a deferred row or a missing pass is
+/// no evidence either way and neither advances nor breaks the clock.
 pub const STUCK_GAP_MINUTES: i64 = 15;
 
 /// One pull request this pass saw approved at its exact head with every
@@ -552,12 +554,12 @@ pub struct StuckCandidate {
 /// [`DwellState::ApprovedStuck`] limit (60 minutes by default; 0 disables).
 ///
 /// The clock starts the first pass that sees a pull request as a candidate
-/// at its head. A short stretch as a non-candidate at the same head (a
-/// `review-verdict` re-run after a comment, a deferred row: up to
-/// [`STUCK_GAP_MINUTES`] between candidate passes) keeps the clock; a longer
-/// one (queued, held, a red required check) restarts it when the pull request
-/// is a candidate again, so only time actually spent approved, green and
-/// unmerged counts. The alert stays one per head either way. A new head
+/// at its head. A stretch in which passes judged it not a candidate at the
+/// same head (queued, held, red, its verdict re-running) restarts the clock
+/// when it is a candidate again if the stretch lasted longer than
+/// [`STUCK_GAP_MINUTES`]; a shorter one keeps it. Rows in `deferred` (seen,
+/// not judged this pass) and passes that did not happen are no evidence and
+/// change nothing. The alert stays one per head either way. A new head
 /// starts over; a pull request this pass did not see at all (merged or
 /// closed) is dropped. `open` is every pull request this pass saw, with its
 /// head.
@@ -572,9 +574,14 @@ pub fn track_stuck(
     state: &mut DwellRepoState,
     candidates: &[StuckCandidate],
     open: &BTreeMap<u64, String>,
+    deferred: &BTreeSet<u64>,
     policy: &DwellPolicy,
     now: DateTime<Utc>,
 ) -> Vec<Planned> {
+    let candidate_numbers: BTreeSet<u64> = candidates
+        .iter()
+        .map(|candidate| candidate.number)
+        .collect();
     let mut next: BTreeMap<u64, StuckApproved> = state
         .stuck_approved
         .iter()
@@ -582,17 +589,28 @@ pub fn track_stuck(
             open.get(number)
                 .is_some_and(|head| head.eq_ignore_ascii_case(&entry.head))
         })
-        .map(|(number, entry)| (*number, entry.clone()))
+        .map(|(number, entry)| {
+            let mut entry = entry.clone();
+            // Judged this pass and not a candidate: evidence of a stretch.
+            if !candidate_numbers.contains(number)
+                && !deferred.contains(number)
+                && entry.ineligible_since.is_none()
+            {
+                entry.ineligible_since = Some(now);
+            }
+            (*number, entry)
+        })
         .collect();
     for candidate in candidates {
         let entry = match state.stuck_approved.get(&candidate.number) {
             Some(entry) if entry.head.eq_ignore_ascii_case(&candidate.head) => {
-                let last = entry.last_candidate_at.unwrap_or(entry.since);
-                let resumed = now - last > Duration::minutes(STUCK_GAP_MINUTES);
+                let resumed = entry
+                    .ineligible_since
+                    .is_some_and(|start| now - start > Duration::minutes(STUCK_GAP_MINUTES));
                 StuckApproved {
                     token: candidate.token.clone(),
                     since: if resumed { now } else { entry.since },
-                    last_candidate_at: Some(now),
+                    ineligible_since: None,
                     ..entry.clone()
                 }
             }
@@ -601,7 +619,7 @@ pub fn track_stuck(
                 token: candidate.token.clone(),
                 since: now,
                 alerted: false,
-                last_candidate_at: Some(now),
+                ineligible_since: None,
             },
         };
         next.insert(candidate.number, entry);
