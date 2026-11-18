@@ -240,9 +240,9 @@ def ejection(e, merged):
     ejection of the merged PR."""
     if e.get("event") not in ("removed_from_merge_queue", "dequeued") or (e.get("reason") or "unknown") in ("merged", "already_merged"):
         return False
-    if (e.get("reason") or "unknown") != "unknown":  # an explicit non-merge reason (failed_checks, ...) is an ejection wherever it falls
-        return True
     t, m = iso(e.get("created_at")), iso(merged)
+    if (e.get("reason") or "unknown") != "unknown":  # an explicit non-merge reason (failed_checks, ...) is an ejection wherever it falls before the merge
+        return not (t and m and t > m)
     return not (t and m and m - t <= MERGE_REMOVAL_WINDOW)
 
 
@@ -754,7 +754,9 @@ def pr_compute(rd, f, runs, runs_complete):
             sh += a
             ho += b
             mac += m
-            if r.get("event") != "push" or r.get("head_sha") in heads:  # a push to the base on the merge-group sha runs after the merge and cannot have delayed it
+            started = iso(r.get("run_started_at") or r.get("created_at"))
+            post_merge = (r.get("event") == "push" and r.get("head_sha") not in heads) or bool(merged and started and started > merged)
+            if not post_merge:  # a push to the base on the merge-group sha, or a run begun after the merge, cannot have delayed it
                 wait += w
         else:
             timing_complete = False

@@ -713,6 +713,12 @@ class MergeRemoval(Base):
         r = self.rows(self.build(world([p], {1: [e]})))[1]
         self.assertEqual((r["ejections"], r["path"]), (["failed_checks"], "slow"))
 
+    def test_a_removal_with_an_explicit_reason_after_the_merge_is_not_an_ejection(self):
+        p = pr(1, T(10, "09:00"), T(10, "11:00"))
+        e = dict(self.removal("11:30"), reason="failed_checks")
+        r = self.rows(self.build(world([p], {1: [e]})))[1]
+        self.assertEqual(r["ejections"], [])
+
     def test_a_pr_with_only_the_merge_removal_is_not_slow_for_an_ejection(self):
         p = pr(1, T(10, "10:00"), T(10, "11:00"))
         out = self.build(world([p], {1: [self.removal("11:00")]}))
@@ -1349,6 +1355,14 @@ class Proxies(Base):
         job = [{"labels": ["self-hosted"], "created_at": T(10, "10:00"), "started_at": T(10, "10:05"), "completed_at": T(10, "10:10"), "conclusion": "success"}]
         out = self.build(world([p], runs=runs, jobs={21: job}), now=self.LATE)
         self.assertEqual(self.rows(out)[1]["compute"]["runner_wait_min"], 5.0)
+
+    def test_a_run_begun_after_the_merge_adds_no_runner_wait(self):
+        p = pr(1, T(10, "09:00"), T(10, "11:00"))
+        h = p["head"]["sha"]
+        runs = [{"id": 21, "head_sha": h, "event": "pull_request", "status": "completed", "name": "GPU", "head_branch": "feat", "created_at": T(10, "11:20")}]
+        job = [{"labels": ["self-hosted"], "created_at": T(10, "11:20"), "started_at": T(10, "11:25"), "completed_at": T(10, "11:30"), "conclusion": "success"}]
+        out = self.build(world([p], runs=runs, jobs={21: job}), now=self.LATE)
+        self.assertEqual(self.rows(out)[1]["compute"]["runner_wait_min"], 0.0)
 
 
 class VellumControl(unittest.TestCase):
