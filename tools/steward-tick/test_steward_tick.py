@@ -112,6 +112,31 @@ class StewardTickArchiveTests(unittest.TestCase):
         self.assertIn("--repos Generous-Corp/pulp,Generous-Corp/vellum,danielraffel/Shipyard,danielraffel/tartci,danielraffel/fleet-handbook", args)
         self.assertIn("--e2e-cache", args)
 
+    def test_release_notify_runs_detached_in_tick_mode_and_keeps_its_stderr(self):
+        fake = self.home / "fake_release_notify.py"
+        fake.write_text(
+            "import os, sys\n"
+            "open(os.path.join(os.environ['HOME'], 'rn-args'), 'w').write(' '.join(sys.argv[1:]))\n"
+            "sys.stderr.write('boom from release notify\\n')\n"
+        )
+        result = self.run_tick(SHIPYARD_RELEASE_NOTIFY_SCRIPT=str(fake))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        err = self.log_dir / "release-notify.err"
+        for _ in range(100):
+            if err.exists() and "boom" in err.read_text():
+                break
+            time.sleep(0.1)
+        self.assertIn("boom from release notify", err.read_text())
+        self.assertEqual((self.home / "rn-args").read_text(), f"--tick --log-dir {self.log_dir}")
+
+    def test_release_notify_off_switch(self):
+        fake = self.home / "fake_release_notify.py"
+        fake.write_text("import os\nopen(os.path.join(os.environ['HOME'], 'rn-args'), 'w').write('ran')\n")
+        result = self.run_tick(SHIPYARD_RELEASE_NOTIFY_SCRIPT=str(fake), SHIPYARD_RELEASE_NOTIFY="off")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        time.sleep(1)
+        self.assertFalse((self.home / "rn-args").exists())
+
     def test_release_canary_off_switch(self):
         result = self.run_tick(SHIPYARD_RELEASE_CANARY="off")
         self.assertEqual(result.returncode, 0, result.stderr)
