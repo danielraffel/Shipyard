@@ -160,25 +160,22 @@ A PR needs no `Version-Bump:` trailer. At land, version-at-land takes versions f
 
 `./scripts/release.sh` remains as a break-glass manual path. The default is the automatic path above (auto-release workflow on merge). Do not call `release.sh` directly unless the automatic path is genuinely blocked.
 
-## macOS release is a stapled .dmg, built LOCALLY (arm64 only)
+## macOS release: a stapled .dmg (arm64 only), built and published by release.yml on m5studio
 
-As of #219 (2026-04-24 evening), macOS binaries ship as stapled **.dmg** artifacts built on the maintainer's Mac. CI builds the Linux binaries (x64 and ARM64) and, only when `CI_PLATFORM_FOCUS=all`, Windows. The `.dmg` wrapper puts the notarization ticket **inside** the artifact so Gatekeeper verifies offline — no online notarization check, no per-Mac taskgated flakiness. Bare Mach-O binaries depend on an online check that proved unreliable (v0.42.0 and v0.43.0 both shipped bare Mach-O and both SIGKILL'd on the maintainer's Mac).
+macOS binaries ship as stapled **.dmg** artifacts. The `.dmg` wrapper puts the notarization ticket **inside** the artifact so Gatekeeper verifies offline. Bare Mach-O binaries depend on an online notarization check that proved unreliable: v0.42.0 and v0.43.0 shipped bare Mach-O and both SIGKILL'd on the maintainer's Mac (#219). Apple Silicon (arm64) is the only supported macOS architecture (#256); install.sh prints a clean "unsupported" message on Intel.
 
-As of #256 (v0.50.0+), **Apple Silicon (arm64) is the only supported macOS architecture.** Intel Macs (x86_64) were dropped — install.sh now prints a clean "unsupported" message on Intel rather than hitting a 404. This halved the release surface and retired the Rosetta/Intel-host branch of the local flow.
+**How a release is published, with no human step** (repository variable `CI_MACOS_SIGNING_ENABLED=true`):
 
-After any new tag lands and the release workflow publishes non-macOS assets, run:
+1. A merged change opens the `release/version-at-land` pull request (`version-at-land.yml`); the steward merges it once `review-verdict` is green.
+2. `auto-release.yml` tags `vX.Y.Z`.
+3. `release.yml` builds Linux x64 and ARM64 (and Windows only under `CI_PLATFORM_FOCUS=all`), runs the live smoke, and creates the GitHub release as a **draft**. `install.sh`'s `releases/latest` excludes drafts, so users keep the previous release until this one is complete.
+4. Its `sign-and-upload-macos` job runs on the self-hosted `local-mac` runner on m5studio (Shipyard-studio-*), in the `release` environment. It builds with a pinned toolchain, imports the Developer ID identity into an ephemeral keychain, signs, notarizes, staples and attests the DMG, and mounts it and launches both binaries. Then `scripts/release-macos-local.sh --publish-only --ci-mode` checks every asset and checksum, flips the release public, and runs install.sh for the tag. If the installed binary's `--version` is not the tag, it puts the release back to draft and fails the run.
+5. `release-heal.yml` re-runs a failed draft release run, up to 3 times.
+6. `release-cadence-check.yml`'s `chain` step opens one `release-blocked` issue when a version is not public, complete and latest 90 minutes after it lands, or a bump pull request is open over 120 minutes. The m3 steward tick then messages the lead sessions over cmux (`docs/release-watchdog.md`).
 
-```bash
-./scripts/release-macos-local.sh --tag vX.Y.Z --upload
-```
+**Load-bearing rule:** the success criterion is a working `--version` after a fresh install.sh, mount, extract and launch. That `--version` must equal the tag without its leading `v`, since a build script or a hardcoded string can make a binary report a version its tag does not name. Not `codesign --verify`, not `spctl --assess`, not the on-runner launch gate in isolation. We shipped v0.42.0 and v0.43.0 with the same breakage because we declared victory on partial verification. Don't do that again.
 
-The script is 9 steps: build, re-sign, package-to-dmg, sign-dmg, notarize+staple, **mount + launch test** (exit 3 if it fails), upload, **flip release from draft to public** (#252), **end-to-end install.sh → launch test** (exit 4 if it fails — reverts release to draft). Refuses to upload a dmg that doesn't mount-and-launch cleanly; refuses to declare success after upload if the download+install chain doesn't end in a working `--version`.
-
-**Draft-until-complete (#252):** `release.yml` now creates the GitHub Release as **draft**. `install.sh`'s `releases/latest` resolution excludes drafts by default — so during the build/upload gap window, macOS users degrade to the previous published tag instead of hitting a 404 on the missing dmg. Step 8 of the local release script flips `draft=false` once the dmg is uploaded; step 9's E2E failure reverts to draft so broken releases disappear from `releases/latest` automatically. This is why shipping is a manual-on-Mac step today, not an auto-release: the maintainer's local script is the gate that flips the release public.
-
-**Load-bearing rule:** the success criterion is a working `--version` after fresh install.sh → mount → extract → launch. That `--version` must equal the tag without its leading `v`, since a build script or a hardcoded string can make a binary report a version its tag does not name. Not `codesign --verify`, not `spctl --assess`, not the on-runner launch gate in isolation. We shipped v0.42.0 and v0.43.0 with the same breakage because we declared victory on partial verification. Don't do that again.
-
-Full flow + env-var setup in `RELEASING.md` § "macOS release is a locally-signed + stapled .dmg". Do not revert to CI signing or bare Mach-O without re-running the #219 diagnostic and proving the online-notarization-check issue is resolved (tracked in #226).
+**Break-glass fallback:** if the CI job cannot run (signing disabled, the m5studio runner down), run `./scripts/release-macos-local.sh --tag vX.Y.Z --upload` on an Apple Silicon Mac with the signing credentials. It runs the same steps and the same install.sh `--version` check (exit 3 on a failed mount and launch, exit 4 on a failed install, which reverts the release to draft). Full flow and environment setup: `RELEASING.md`. Do not move to bare Mach-O without re-running the #219 diagnostic (#226).
 
 ## How a PR lands here
 
