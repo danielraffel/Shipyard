@@ -36,7 +36,7 @@ The pass runner lives in fleet-handbook `scripts/pass-runner/` and is installed 
 ## A blocked release messages the lead
 
 A release that is not public, complete and installable 90 minutes after its
-version lands, or a bump pull request open longer than 60 minutes, opens one
+version lands, or a bump pull request open longer than 120 minutes, opens one
 `release-blocked` issue (`scripts/release_watchdog.py chain`). The steward
 tick on m3 runs `tools/metrics/release_notify.py`, which messages the targets
 in `tools/metrics/release-notify-targets.txt` over cmux. A host's

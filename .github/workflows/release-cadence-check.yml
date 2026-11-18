@@ -12,16 +12,16 @@ name: Release cadence check
 # The `chain` step follows the current Cargo.toml version to an installable
 # release: tag, a green release.yml run (whose publish step runs install.sh on
 # the fleet Mac), a public release with every asset, releases/latest, and no
-# bump pull request open past 60 minutes. It judges after 90 minutes and keeps
+# bump pull request open past 120 minutes. It judges after 90 minutes and keeps
 # one `release-blocked` issue; tools/metrics/release_notify.py on m3 messages
 # the lead sessions when its failing step changes. It also runs when a release
-# or heal run finishes, so a recovery closes the issue promptly.
+# run finishes, so a recovery closes the issue promptly.
 
 on:
   schedule:
     - cron: "*/30 * * * *"
   workflow_run:
-    workflows: ["Release", "Release Heal"]
+    workflows: ["Release"]
     types: [completed]
   workflow_dispatch:
     inputs:
@@ -76,4 +76,4 @@ jobs:
         run: |
           args=()
           if [ "$DRY_RUN" = "true" ]; then args+=(--dry-run); fi
-          python3 scripts/release_watchdog.py "${args[@]}" chain --bound-minutes 90 --bump-stale-minutes 60
+          python3 scripts/release_watchdog.py "${args[@]}" chain --bound-minutes 90 --bump-stale-minutes 120

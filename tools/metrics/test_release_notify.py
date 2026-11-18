@@ -15,7 +15,10 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import release_notify as rn  # noqa: E402
 
-LEAD = {"host": "m5s", "target": "surface:1000090005", "socket": "/tmp/cmux-nightly.sock"}
+LEAD = {"host": "m5s", "target": "A90D2C0A-A0E4-4045-9242-42F522E78E95",
+        "socket": "/tmp/cmux-nightly.sock"}
+ORCH_M3 = {"host": "local", "target": "654D7FD3-5762-47E1-9E06-3E6ED569FB76",
+           "socket": "/tmp/cmux-nightly.sock"}
 ORCH = {"host": "local", "target": "workspace:3", "socket": ""}
 
 
@@ -31,7 +34,8 @@ def issue(number: int = 1500, key: str | None = "v1.2.0:release_run_failed") -> 
 class TargetTests(unittest.TestCase):
     def test_parses_hosts_sockets_and_comments(self) -> None:
         targets, refused = rn.parse_targets(
-            "# lead\nm5s surface:1000090005 /tmp/cmux-nightly.sock\nlocal workspace:3  # m3\n\n")
+            "# lead\nm5s A90D2C0A-A0E4-4045-9242-42F522E78E95 /tmp/cmux-nightly.sock\n"
+            "local workspace:3  # m3\n\n")
         self.assertEqual(targets, [LEAD, ORCH])
         self.assertEqual(refused, [])
 
@@ -45,15 +49,17 @@ class TargetTests(unittest.TestCase):
     def test_remote_command_is_batch_ssh_and_reads_the_text_from_stdin(self) -> None:
         self.assertEqual(rn.command(LEAD), [
             "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", "m5s", "cmux", "--socket",
-            "/tmp/cmux-nightly.sock", "agent", "message", "surface:1000090005", "--from",
+            "/tmp/cmux-nightly.sock", "agent", "message", "A90D2C0A-A0E4-4045-9242-42F522E78E95", "--from",
             "shipyard-release-watch", "--", "-"])
         self.assertEqual(rn.command(ORCH)[:4], ["cmux", "agent", "message", "workspace:3"])
 
-    def test_shipped_default_names_the_lead(self) -> None:
+    def test_shipped_default_names_both_leads_by_stable_id(self) -> None:
         text = (Path(rn.HERE) / "release-notify-targets.txt").read_text()
         targets, refused = rn.parse_targets(text)
-        self.assertIn(LEAD, targets)
+        self.assertEqual(targets, [ORCH_M3, LEAD])
         self.assertEqual(refused, [])
+        for t in targets:  # surface:N refs change after a reboot
+            self.assertNotRegex(t["target"], r"^(surface|workspace):\d+$")
 
 
 class PlanTests(unittest.TestCase):
@@ -89,7 +95,7 @@ class PlanTests(unittest.TestCase):
         self.deliver_all(state, [issue()], [LEAD])
         owed = self.deliver_all(state, [], [LEAD])
         self.assertEqual(len(owed), 1)
-        self.assertIn("Release unblocked", owed[0]["text"])
+        self.assertIn("fixed or superseded", owed[0]["text"])
         self.assertEqual(state.get("reported"), {})
         self.assertEqual(self.deliver_all(state, [], [LEAD]), [])
 
@@ -105,7 +111,7 @@ class RunTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.dir = Path(self.tmp.name)
         self.targets = self.dir / "targets"
-        self.targets.write_text("m5s surface:1000090005 /tmp/cmux-nightly.sock\n")
+        self.targets.write_text("m5s A90D2C0A-A0E4-4045-9242-42F522E78E95 /tmp/cmux-nightly.sock\n")
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
@@ -119,11 +125,14 @@ class RunTests(unittest.TestCase):
             setattr(a, k, v)
         return a
 
-    def fake(self, issues: list[dict], send_rc: int = 0):
+    def fake(self, issues: list[dict], send_rc: int = 0, comment_rc: int = 0):
         calls: list[list[str]] = []
 
         def run(cmd, **kw):
             calls.append(cmd)
+            if cmd[0] == "ghapp" and "-X" in cmd:
+                return subprocess.CompletedProcess(cmd, comment_rc, stdout="{}",
+                                                   stderr="" if comment_rc == 0 else "HTTP 502")
             if cmd[0] == "ghapp":
                 return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(issues), stderr="")
             return subprocess.CompletedProcess(cmd, send_rc, stdout="",
@@ -141,15 +150,41 @@ class RunTests(unittest.TestCase):
         self.assertEqual(len(sends), 1)
         self.assertIn("sent=1", (self.dir / "summary.log").read_text())
 
-    def test_a_failed_send_is_logged_and_retried(self) -> None:
+    def test_an_unresolvable_target_falls_back_to_one_issue_comment(self) -> None:
         calls, run = self.fake([issue()], send_rc=1)
         with mock.patch.object(rn.subprocess, "run", run):
-            lines = rn.run(self.args(), now=1000.0)
+            first = rn.run(self.args(), now=1000.0)
             rn.run(self.args(), now=2000.0)
-        self.assertTrue(any("ERROR send #1500" in ln and "no such surface" in ln for ln in lines))
-        self.assertEqual(len([c for c in calls if c[0] == "ssh"]), 2)
-        log = (self.dir / "summary.log").read_text()
-        self.assertEqual(log.count("ERROR send #1500"), 1)  # logged once, retried silently
+            third = rn.run(self.args(), now=3000.0)
+            rn.run(self.args(), now=4000.0)  # delivered by comment: nothing more
+        self.assertFalse(any("ERROR" in ln for ln in first))  # one failure is not news
+        self.assertEqual(len([c for c in calls if c[0] == "ssh"]), 3)
+        comments = [c for c in calls if c[0] == "ghapp" and "-X" in c]
+        self.assertEqual(len(comments), 1)
+        self.assertIn("repos/o/r/issues/1500/comments", comments[0])
+        self.assertIn("could not reach", " ".join(comments[0]))
+        self.assertIn("Release blocked", " ".join(comments[0]))
+        self.assertTrue(any("unreachable after 3 tries" in ln and "commented on #1500" in ln
+                            for ln in third))
+        self.assertEqual((self.dir / "summary.log").read_text().count("unreachable"), 1)
+
+    def test_a_target_that_never_resolves_and_no_comment_gives_up_after_a_day(self) -> None:
+        calls, run = self.fake([issue()], send_rc=1, comment_rc=1)
+        with mock.patch.object(rn.subprocess, "run", run):
+            for n in range(5):
+                rn.run(self.args(), now=1000.0 + n * 3600)
+            lines = rn.run(self.args(), now=1000.0 + 25 * 3600)
+            rn.run(self.args(), now=1000.0 + 26 * 3600)
+        self.assertTrue(any("gave up" in ln for ln in lines))
+        self.assertEqual(len([c for c in calls if c[0] == "ssh"]), 6)
+
+    def test_failures_are_counted_per_message_and_target(self) -> None:
+        state: dict = {}
+        a = self.args()
+        msg = rn.plan([issue()], state, [LEAD])[0]
+        rn.on_failure(state, msg, [issue()], "x", 1.0, "s", a)
+        rn.on_failure(state, msg, [issue()], "x", 2.0, "s", a)
+        self.assertEqual(state["failures"][f"{msg['key']}@{rn.dest(LEAD)}"]["count"], 2)
 
     def test_a_github_read_error_is_logged_not_raised(self) -> None:
         def run(cmd, **kw):

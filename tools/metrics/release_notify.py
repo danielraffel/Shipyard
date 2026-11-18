@@ -12,18 +12,20 @@ call and sends a cmux agent message to every target in the targets file:
 
 - when an issue opens, or its `release-blocked-key` marker (the version and
   the failing steps) changes;
-- once more when an issue it reported is no longer open.
+- once more when an issue it reported is no longer open (fixed or superseded).
 
-A delivery that fails is retried on the next pass; nothing is marked sent
-until cmux accepted it. The tick never waits on this and it exits 0.
+A delivery that fails is retried on the next pass. After three consecutive
+failures to one target it comments on the issue instead, logs one line, and
+stops; if even the comment cannot be posted it stops after 24 hours. The tick
+never waits on this and it exits 0.
 
 Targets file (`--targets`, else ~/.config/shipyard/release-notify-targets,
 else release-notify-targets.txt next to this script), one per line:
 
     <host> <cmux target> [<cmux socket>]
 
-`<host>` is `local` or an ssh host; `<cmux target>` is a surface or workspace
-id, or a workspace title without spaces. Values may only use [A-Za-z0-9._:/@+-]
+`<host>` is `local` or an ssh host; `<cmux target>` is a stable id (a
+surface or agent UUID), never a `surface:N` ref, which changes after a reboot. Values may only use [A-Za-z0-9._:/@+-]
 and may not start with "-", so nothing reaches a remote shell unquoted or is
 read as an option.
 """
@@ -46,6 +48,8 @@ SENDER = "shipyard-release-watch"
 SAFE = re.compile(r"^[A-Za-z0-9._:/@+][A-Za-z0-9._:/@+-]*$")
 KEY = re.compile(r"<!--\s*release-blocked-key:\s*(.*?)\s*-->")
 HERE = os.path.dirname(os.path.abspath(__file__))
+FALLBACK_AFTER = 3  # consecutive failed sends before the issue comment
+GIVE_UP_AFTER = 24 * 3600  # stop retrying a message nobody can receive
 
 
 def home(*p: str) -> str:
@@ -104,8 +108,8 @@ def plan(issues: list[dict], state: dict, targets: list[dict]) -> list[dict]:
         if number in open_numbers:
             continue
         key = f"#{number}:resolved"
-        text = (f"Release unblocked: {last.get('title', '')} (#{number}) is closed. "
-                "No action needed.")
+        text = (f"Release issue closed (fixed or superseded): {last.get('title', '')} "
+                f"(#{number}). The watchdog judges the next version on its own.")
         out += [{"key": key, "number": number, "text": text, "to": t, "resolved": True}
                 for t in targets]
     delivered = state.get("delivered", {})
@@ -192,6 +196,46 @@ def send(msg: dict, cmux: str) -> tuple[bool, str]:
     return out.returncode == 0, (out.stderr or out.stdout).strip()[:160]
 
 
+def comment(ghapp: str, repo: str, number: str, body: str) -> tuple[bool, str]:
+    try:
+        out = subprocess.run([ghapp, "api", "-X", "POST",
+                              f"repos/{repo}/issues/{number}/comments", "-f", f"body={body}"],
+                             capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, str(exc)[:160]
+    return out.returncode == 0, (out.stderr or out.stdout).strip()[:160]
+
+
+def on_failure(state: dict, msg: dict, issues: list[dict], detail: str, now: float,
+               stamp: str, a: argparse.Namespace) -> list[str]:
+    """Count consecutive failures for this message and target. After
+    FALLBACK_AFTER, say it on the issue instead (one comment) and stop; if even
+    that fails for GIVE_UP_AFTER seconds, stop anyway. One log line each."""
+    fails = state.setdefault("failures", {})
+    k = f"{msg['key']}@{dest(msg['to'])}"
+    f = fails.setdefault(k, {"count": 0, "first": now})
+    f["count"] += 1
+    if f["count"] < FALLBACK_AFTER:
+        return []
+    who = dest(msg["to"])
+    ok, why = comment(a.ghapp, a.repo, msg["number"],
+                      f"release-notify could not reach `{who}` over cmux after {f['count']} "
+                      f"tries ({detail}). The message it carried:\n\n{msg['text']}\n\n"
+                      "Fix the target in tools/metrics/release-notify-targets.txt or the "
+                      "host's ~/.config/shipyard/release-notify-targets.")
+    if ok:
+        record(state, msg, issues)
+        del fails[k]
+        return [f"{stamp} release-notify ERROR {who} unreachable after {FALLBACK_AFTER} tries "
+                f"({detail}); commented on #{msg['number']} instead"]
+    if now - f["first"] >= GIVE_UP_AFTER:
+        record(state, msg, issues)
+        del fails[k]
+        return [f"{stamp} release-notify ERROR gave up on {msg['key']} to {who} after 24 h: "
+                f"send {detail}; comment {why}"]
+    return []
+
+
 def run(a: argparse.Namespace, now: float | None = None) -> list[str]:
     """One pass. Returns the summary lines it wrote (or would write)."""
     now = time.time() if now is None else now
@@ -222,17 +266,11 @@ def run(a: argparse.Namespace, now: float | None = None) -> list[str]:
             ok, detail = send(msg, a.cmux)
             if ok:
                 record(state, msg, issues)
+                state.get("failures", {}).pop(f"{msg['key']}@{dest(msg['to'])}", None)
                 sent += 1
             else:
                 failed += 1
-                # One error line per message and target, not one per pass.
-                logged = state.setdefault("failed_logged", [])
-                once = f"{msg['key']}@{dest(msg['to'])}"
-                if once not in logged:
-                    logged.append(once)
-                    del logged[:-200]
-                    lines.append(f"{stamp} release-notify ERROR send {msg['key']} to "
-                                 f"{dest(msg['to'])}: {detail} (retried every pass)")
+                lines += on_failure(state, msg, issues, detail, now, stamp, a)
         if not a.dry_run:
             prune(state, issues, targets)
         if sent or failed:

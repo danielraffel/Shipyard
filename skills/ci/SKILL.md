@@ -1314,17 +1314,19 @@ A stalled release chain opens a `release-stall` issue on its own:
 that are in no tag while no bump pull request is open. Both close their issue
 on recovery; see `docs/release-watchdog.md`.
 
-The same workflow's `chain` step follows the current version to an
-installable release. 90 minutes after the version lands it needs the tag, a
-green `release.yml` run (its publish step runs install.sh on the fleet Mac
-and checks `--version`), a public release with every asset, and
-`releases/latest` on that tag. A bump pull request open longer than 60 minutes
-fails it at any time. It keeps one `release-blocked` issue. Every
-release-chain issue carries that label, and the steward tick on m3 messages
-the lead sessions in `tools/metrics/release-notify-targets.txt` over cmux
-when one opens, changes its failing step or closes. Preview it with
-`python3 scripts/release_watchdog.py --dry-run chain`, adding `--ref <newest published tag> --bound-minutes 0`
-for a control (an older tag reports `latest_mismatch`).
+The same workflow's `chain` step follows each version to an installable
+release. A version is ok once it, or a newer one, is the public
+`releases/latest` with every asset (publication follows `release.yml`'s
+install.sh `--version` check); 90 minutes after landing it fails and names the
+missing link (tag, run, publication, assets, latest). While the current version
+is inside its 90 minutes it judges the newest version past them, so
+back-to-back bumps cannot hide a broken release. A bump pull request open
+longer than 120 minutes fails it at any time. It keeps one `release-blocked`
+issue. Every release-chain issue carries that label, and the steward tick on
+m3 messages the lead sessions in `tools/metrics/release-notify-targets.txt`
+over cmux (by stable id, never `surface:N`) when one opens, changes its failing
+step or closes; an unreachable target gets an issue comment instead. Preview it
+with `python3 scripts/release_watchdog.py --dry-run chain`.
 
 ## Stale ship-state records: `discard --repo` and `prune`
 
