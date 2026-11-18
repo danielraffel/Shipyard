@@ -531,5 +531,79 @@ class Workflow(unittest.TestCase):
                           "statuses: write"])
 
 
+class FlakyTransport(rt.GitHub):
+    """A real ``GitHub.post`` over a fake ``gh api``: scripted failures, one store."""
+
+    def __init__(self, failures: list[tuple[str, bool]]) -> None:
+        super().__init__("gh", "o/r")
+        self.failures, self.check_runs, self.posts = failures, [], 0
+
+    def _run(self, args: list[str], stdin: str | None = None):
+        import subprocess
+        if "-X" not in args:
+            return subprocess.CompletedProcess(
+                args, 0, json.dumps({"total_count": len(self.check_runs)}), "")
+        if not any(a.endswith("/check-runs") for a in args):
+            return subprocess.CompletedProcess(args, 0, "{}", "")
+        self.posts += 1
+        if self.failures:
+            error, landed = self.failures.pop(0)
+            if landed:
+                self.check_runs.append(json.loads(stdin))
+            return subprocess.CompletedProcess(args, 1, "", error)
+        self.check_runs.append(json.loads(stdin))
+        return subprocess.CompletedProcess(args, 0, "{}", "")
+
+
+class PostRetry(unittest.TestCase):
+    BODY = {"name": "risk-tier", "head_sha": "h" * 40}
+
+    def post(self, github: FlakyTransport) -> None:
+        with mock.patch.object(rt.time, "sleep") as sleep:
+            github.post("repos/o/r/check-runs", self.BODY)
+        self.sleeps = [c.args[0] for c in sleep.call_args_list]
+
+    def test_empty_json_then_success_posts_one_check_run(self) -> None:
+        github = FlakyTransport([("unexpected end of JSON input", False)])
+        self.post(github)
+        self.assertEqual(len(github.check_runs), 1)
+        self.assertEqual(self.sleeps, [2])
+
+    def test_failed_attempt_that_landed_is_not_duplicated(self) -> None:
+        github = FlakyTransport([("HTTP 502 Bad Gateway", True)])
+        self.post(github)
+        self.assertEqual(len(github.check_runs), 1)
+        self.assertEqual(github.posts, 1)
+
+    def test_persistent_failure_raises_after_bounded_attempts(self) -> None:
+        github = FlakyTransport([("unexpected end of JSON input", False)] * 9)
+        with self.assertRaises(rt.TierError):
+            self.post(github)
+        self.assertEqual(github.posts, 4)
+        self.assertEqual(github.check_runs, [])
+
+    def test_permanent_error_is_not_retried(self) -> None:
+        github = FlakyTransport([("HTTP 403 Resource not accessible", False)])
+        with self.assertRaises(rt.TierError):
+            self.post(github)
+        self.assertEqual(github.posts, 1)
+
+    def test_main_exit_codes(self) -> None:
+        for failures, code, runs in ([("unexpected end of JSON input", False)], 0, 1), \
+                                    ([("unexpected end of JSON input", False)] * 9, 1, 0):
+            github = FlakyTransport(list(failures))
+            fake = FakeGitHub({"repos/o/r/pulls/7": pull(changed_files=0),
+                               "repos/o/r/pulls/7/files": [],
+                               "repos/o/r/pulls/7/commits": []}, {})
+            fake.post = github.post
+            with mock.patch.object(rt, "GitHub", lambda *_: fake), \
+                    mock.patch.object(rt.time, "sleep"), \
+                    contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(rt.main(["--repo", "o/r", "--pr", "7", "--post",
+                                          "--check-run"]), code)
+            self.assertEqual(len(github.check_runs), runs)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -51,6 +51,7 @@ import re
 import secrets
 import subprocess
 import sys
+import time
 import tomllib
 from dataclasses import dataclass, field
 from typing import Any
@@ -746,10 +747,42 @@ class GitHub:
             return None
         raise TierError(f"reading {path} at {ref[:12]} failed: {done.stderr.strip()[:300]}")
 
+    RETRY_DELAYS = (2, 5, 10)
+
+    @staticmethod
+    def _transient(text: str) -> bool:
+        low = text.lower()
+        return (not low.strip() or "unexpected end of json" in low or "timed out" in low
+                or "timeout" in low or "invalid json" in low
+                or re.search(r"\b(50[0-9]|429)\b", low) is not None
+                or "connection" in low or "eof" in low)
+
+    def _already_posted(self, path: str, body: dict[str, Any]) -> bool:
+        """True when a check run with this name and head already exists."""
+        if not path.endswith("/check-runs") or not body.get("head_sha"):
+            return False
+        try:
+            found = self.json(f"repos/{self.repo}/commits/{body['head_sha']}/check-runs"
+                              f"?check_name={quote(str(body.get('name')), safe='')}")
+        except (TierError, ValueError):
+            return False
+        return bool(isinstance(found, dict) and found.get("total_count"))
+
     def post(self, path: str, body: dict[str, Any]) -> None:
-        done = self._run(["-X", "POST", path, "--input", "-"], stdin=json.dumps(body))
-        if done.returncode != 0:
-            raise TierError(f"POST {path} failed: {(done.stderr or done.stdout).strip()[:300]}")
+        delays = list(self.RETRY_DELAYS)
+        attempt = 0
+        while True:
+            done = self._run(["-X", "POST", path, "--input", "-"], stdin=json.dumps(body))
+            if done.returncode == 0:
+                return
+            detail = (done.stderr or done.stdout).strip()
+            if not self._transient(detail) or not delays:
+                raise TierError(f"POST {path} failed: {detail[:300]}")
+            time.sleep(delays.pop(0))
+            attempt += 1
+            # The failed attempt may have landed; never create a duplicate.
+            if self._already_posted(path, body):
+                return
 
 
 def evaluate(github: GitHub, number: int) -> tuple[dict[str, Any], Assessment]:
