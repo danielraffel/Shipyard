@@ -1045,9 +1045,16 @@ fn waiting_required(
         .iter()
         .find_map(|context| context.strip_prefix("github-merge-state:CLEAN (current="))
     {
+        // An UNSTABLE hold names the checks that are not advisory, and any
+        // advisory-list entry that matches nothing, after the state.
+        let detail = contexts
+            .iter()
+            .filter(|context| !context.starts_with("github-merge-state:"))
+            .cloned()
+            .collect::<Vec<_>>();
         return undated(
             format!("merge_state:{}", state.trim_end_matches(')')),
-            None,
+            (!detail.is_empty()).then(|| detail.join("; ")),
             SinceHint::HeadPushed,
         );
     }

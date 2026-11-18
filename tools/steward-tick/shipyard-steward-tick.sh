@@ -218,10 +218,10 @@ steward_one() {
     oldest=$(jq -r '[.repos[]?.blocked_summary?.oldest[]?|"#\(.number):\(.blocked_on):\(.age_minutes)m"]|join(",")' "$out" 2>/dev/null || true)
     # Base-level episodes: one required check failing the same test on 3+ open PRs.
     red_everywhere=$(jq -r '[.repos[]?.red_everywhere?.groups[]?]|length' "$out" 2>/dev/null || echo ERROR)
-    # Heads merged over red checks that are not required (GitHub UNSTABLE):
-    # logged, never a gate.
-    non_required_red=$(jq -r '[.repos[]?.prs[]? | . as $pr | (.mutation // "" | tostring | split(",")[] | select(startswith("non_required_red:")) | "#\($pr.number):" + (ltrimstr("non_required_red:") | gsub("[[:space:][:cntrl:];=]+";"_")))] | join(",")' "$out" 2>/dev/null || true)
-    echo "$stamp $repo rc=$rc $counts took=${took}s ver=$steward_ver launcher=$launcher_path invariants=$invariants red_everywhere=$red_everywhere${oldest:+ oldest=$oldest}${non_required_red:+ non_required_red=$non_required_red}" >> "$log_dir/summary.log"
+    # Heads merged over advisory checks that were red or pending (GitHub
+    # UNSTABLE, [auto_merge] unstable_advisory_checks): logged, never a gate.
+    advisory_not_green=$(jq -r '[.repos[]?.prs[]? | . as $pr | (.mutation // "" | tostring | split(",")[] | select(startswith("advisory_not_green:")) | "#\($pr.number):" + (ltrimstr("advisory_not_green:") | gsub("[[:space:][:cntrl:];=]+";"_")))] | join(",")' "$out" 2>/dev/null || true)
+    echo "$stamp $repo rc=$rc $counts took=${took}s ver=$steward_ver launcher=$launcher_path invariants=$invariants red_everywhere=$red_everywhere${oldest:+ oldest=$oldest}${advisory_not_green:+ advisory_not_green=$advisory_not_green}" >> "$log_dir/summary.log"
   elif grep -q "another steward apply pass is already running" "$out.err" 2>/dev/null; then
     echo "$stamp $repo skipped=lock_busy" >> "$log_dir/summary.log"
   else

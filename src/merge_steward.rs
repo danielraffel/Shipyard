@@ -173,8 +173,8 @@ impl StewardPolicy {
     /// actor that can post a status of that name. The steward then merges
     /// with `mergePullRequest` bound by `expectedHeadOid`, only an approved
     /// head whose required checks are all green and whose merge state
-    /// [`merge_state_wait`] admits (`CLEAN`, or `UNSTABLE` red only outside
-    /// the required set), and GitHub refuses the merge of any head whose
+    /// [`merge_state_wait`] admits (`CLEAN`, or `UNSTABLE` with every other
+    /// non-green check listed advisory by the base), and GitHub refuses the merge of any head whose
     /// approval context or CI has not passed. It never arms auto-merge here:
     /// an armed request survives a later push by anyone with write access.
     /// Anything less stays refused, with no merge at all.
@@ -467,67 +467,113 @@ pub fn classify_pr(
 /// agent: `failure` while the head needs an agent, `success` once cleared.
 pub const STEWARD_RECOVERY_CONTEXT: &str = "shipyard/steward-recovery";
 
+/// The wait every non-`CLEAN` merge state reports first; `blocked_on` reads it
+/// as `merge_state:<STATE>`.
+fn merge_state_context(state: &str) -> String {
+    format!("github-merge-state:CLEAN (current={state})")
+}
+
+/// Suffix of a wait context naming a check that is not required, not green,
+/// and not in the base's `[auto_merge] unstable_advisory_checks`.
+pub const NOT_ADVISORY_SUFFIX: &str = " (not in unstable_advisory_checks)";
+/// Wait context when GitHub says `UNSTABLE` but every check the steward sees
+/// that is not required is green, so nothing it can name explains the state.
+pub const UNEXPLAINED_UNSTABLE: &str = "unstable-without-a-visible-non-green-check";
+/// Prefix of a note naming an `unstable_advisory_checks` entry that matches no
+/// check on the head (likely a typo or a renamed job). Informational: it never
+/// admits anything.
+pub const ADVISORY_UNMATCHED_PREFIX: &str = "unstable_advisory_checks entry matches no check: ";
+
 /// Whether GitHub's merge state lets a base with no merge queue merge `pr`:
 /// `None` when it does, else the contexts the head waits on.
 ///
-/// `CLEAN` admits. `UNSTABLE` means GitHub has every required rule satisfied
-/// (an unmet one is `BLOCKED`) and only checks that are not required are red
-/// or pending; it admits too, unless the steward's own recovery status
-/// ([`STEWARD_RECOVERY_CONTEXT`]) or a check the base lists in `[auto_merge]
-/// unstable_blocking_checks` is red or pending at the head, or that list is
-/// unknown (`None`: the config was unreadable or malformed). Every other
-/// state waits. This decides nothing about required checks or approval: the
-/// caller has already checked those against the live ruleset, and does so
-/// again on the final live read before the merge.
+/// `CLEAN` admits. `UNSTABLE` (GitHub's word for "every required rule is met,
+/// some other check is red or pending"; an unmet required rule is `BLOCKED`)
+/// admits only when the base's `[auto_merge] unstable_advisory_checks` is
+/// known and names every check on the head that no required rule selects and
+/// that is not green, judged per producer (surface and app) on its newest
+/// observation, and at least one such check exists to explain the state. The
+/// steward's own recovery status ([`STEWARD_RECOVERY_CONTEXT`]) can never be
+/// advisory. Every other state, and an unknown list, waits: unknown, renamed
+/// or new checks hold the head. This decides nothing about required checks
+/// or approval: the caller checks those against the live ruleset, before
+/// this and again on the final live read.
 ///
-/// The first context is always `github-merge-state:CLEAN (current=<STATE>)`,
-/// which `blocked_on` reports as `merge_state:<STATE>`; a listed check that
-/// holds the head follows it.
+/// The first context is always `github-merge-state:CLEAN (current=<STATE>)`.
+/// Checks that hold an `UNSTABLE` head follow it (each ending in
+/// [`NOT_ADVISORY_SUFFIX`], or [`UNEXPLAINED_UNSTABLE`]), then a note for each
+/// list entry that matches no check ([`ADVISORY_UNMATCHED_PREFIX`]).
 #[must_use]
 pub fn merge_state_wait(pr: &StewardPullRequest, policy: &StewardPolicy) -> Option<Vec<String>> {
     let merge_state = pr.merge_state.to_ascii_uppercase();
     if merge_state == "CLEAN" {
         return None;
     }
-    let wait = vec![format!("github-merge-state:CLEAN (current={merge_state})")];
+    let mut wait = vec![merge_state_context(&merge_state)];
     if merge_state != "UNSTABLE" {
         return Some(wait);
     }
-    let Some(listed) = policy.ejection_guards.unstable_blocking_checks.as_ref() else {
+    let Some(advisory) = policy.ejection_guards.unstable_advisory_checks.as_ref() else {
         return Some(wait);
     };
-    if !newest_named_is_green(&pr.checks, STEWARD_RECOVERY_CONTEXT) {
-        return Some(wait);
-    }
-    let mut holding = listed
+    let is_advisory = |name: &str| {
+        !name.eq_ignore_ascii_case(STEWARD_RECOVERY_CONTEXT)
+            && advisory
+                .iter()
+                .any(|entry| entry.trim().eq_ignore_ascii_case(name.trim()))
+    };
+    let not_green = non_required_not_green(pr, policy);
+    let mut holding = not_green
         .iter()
-        .filter(|name| !newest_named_is_green(&pr.checks, name))
-        .map(|name| format!("{name} (unstable_blocking_checks)"))
+        .filter(|name| !is_advisory(name))
+        .map(|name| format!("{name}{NOT_ADVISORY_SUFFIX}"))
         .collect::<Vec<_>>();
+    if not_green.is_empty() {
+        holding.push(UNEXPLAINED_UNSTABLE.to_owned());
+    }
     if holding.is_empty() {
         return None;
     }
-    holding.sort();
-    holding.dedup();
-    Some(wait.into_iter().chain(holding).collect())
+    wait.extend(holding);
+    wait.extend(
+        advisory_unmatched(pr, policy)
+            .into_iter()
+            .map(|entry| format!("{ADVISORY_UNMATCHED_PREFIX}{entry}")),
+    );
+    Some(wait)
 }
 
-/// Whether every producer's newest observation named `name` on this head is
-/// green, or there is none. Producers (surface and app) are judged apart, so
-/// a green check from one cannot mask a red one of the same name from
-/// another; a rerun by the same producer supersedes its earlier attempt.
-fn newest_named_is_green(checks: &[StewardCheck], name: &str) -> bool {
-    let named = checks
-        .iter()
-        .filter(|check| check.name.eq_ignore_ascii_case(name.trim()))
-        .collect::<Vec<_>>();
-    named.iter().all(|check| {
-        named
+/// Whether `contexts` (a `WaitingRequired` decision) waits on an `UNSTABLE`
+/// merge state that only the steward's own recovery status, or an unknown
+/// advisory list, holds: the state its recovery clear can resolve.
+#[must_use]
+pub fn waits_only_on_recovery_status(contexts: &[String]) -> bool {
+    let recovery = format!("{STEWARD_RECOVERY_CONTEXT}{NOT_ADVISORY_SUFFIX}");
+    contexts.first().map(String::as_str) == Some(merge_state_context("UNSTABLE").as_str())
+        && contexts[1..]
             .iter()
-            .filter(|other| other.source == check.source && other.app_id == check.app_id)
-            .max_by(|left, right| cmp_recency(left, right))
-            .is_none_or(|newest| check_is_green(newest))
-    })
+            .all(|context| *context == recovery || context.starts_with(ADVISORY_UNMATCHED_PREFIX))
+}
+
+/// `unstable_advisory_checks` entries that match no check on this head,
+/// sorted. A typo or a renamed job shows here; it never admits anything.
+#[must_use]
+pub fn advisory_unmatched(pr: &StewardPullRequest, policy: &StewardPolicy) -> Vec<String> {
+    let Some(advisory) = policy.ejection_guards.unstable_advisory_checks.as_ref() else {
+        return Vec::new();
+    };
+    let mut unmatched = advisory
+        .iter()
+        .filter(|entry| {
+            !pr.checks
+                .iter()
+                .any(|check| check.name.trim().eq_ignore_ascii_case(entry.trim()))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    unmatched.sort();
+    unmatched.dedup();
+    unmatched
 }
 
 fn check_is_green(check: &StewardCheck) -> bool {
@@ -543,35 +589,49 @@ fn check_is_green(check: &StewardCheck) -> bool {
         )
 }
 
-/// Names of checks no required rule selects whose newest observation on this
-/// head is a terminal failure, sorted. Reported on an `UNSTABLE` merge, never
-/// a gate.
+/// Whether two observations come from the same producer of the same check:
+/// same name (any case), surface and app.
+fn same_producer(left: &StewardCheck, right: &StewardCheck) -> bool {
+    left.name.eq_ignore_ascii_case(&right.name)
+        && left.source == right.source
+        && left.app_id == right.app_id
+}
+
+/// Names of checks on this head that are not green (red or pending) and that
+/// no required rule selects, sorted. Each producer (name, surface, app) is
+/// judged on its newest observation, so a green check from one producer
+/// cannot hide a red one of the same name from another; a rerun by the same
+/// producer supersedes its earlier attempt. A producer is required only when
+/// a required rule selects its newest observation; any other producer of a
+/// required name is judged here like any other check.
 #[must_use]
-pub fn non_required_red(pr: &StewardPullRequest, policy: &StewardPolicy) -> Vec<String> {
+pub fn non_required_not_green(pr: &StewardPullRequest, policy: &StewardPolicy) -> Vec<String> {
     let selected = policy
         .required_checks
         .iter()
         .filter_map(|rule| selected_required_check(&pr.checks, rule))
-        .map(|check| check.name.to_ascii_lowercase())
-        .collect::<BTreeSet<_>>();
-    let names = pr
+        .collect::<Vec<_>>();
+    let mut names = pr
         .checks
         .iter()
-        .map(|check| check.name.clone())
-        .filter(|name| !selected.contains(&name.to_ascii_lowercase()))
-        .collect::<BTreeSet<_>>();
-    names
-        .into_iter()
-        .filter(|name| {
-            pr.checks
+        .filter(|check| {
+            let newest = pr
+                .checks
                 .iter()
-                .filter(|check| check.name.eq_ignore_ascii_case(name))
+                .filter(|other| same_producer(other, check))
                 .max_by(|left, right| cmp_recency(left, right))
-                .is_some_and(|check| {
-                    check.status.eq_ignore_ascii_case("COMPLETED") && !check_is_green(check)
-                })
+                .is_some_and(|newest| std::ptr::eq(newest, *check));
+            newest
+                && !check_is_green(check)
+                && !selected
+                    .iter()
+                    .any(|required| same_producer(required, check))
         })
-        .collect()
+        .map(|check| check.name.clone())
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// Required contexts whose newest observation on this head is a terminal

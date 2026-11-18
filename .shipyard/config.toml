@@ -89,11 +89,6 @@ required_checks = [
 
 [auto_merge]
 human_reviewers = ["danielraffel"]
-# Checks that are not required by the ruleset but still hold a head GitHub
-# reports UNSTABLE while they are red or pending (the steward otherwise merges
-# an UNSTABLE head whose required checks are green). The version and skill
-# sync gate blocks merge by policy (CLAUDE.md), so it is listed here.
-unstable_blocking_checks = ["Enforce version & skill sync"]
 # Who may sign the fleet App's `verdict: APPROVE`: an approval posted through
 # ghapp counts only with a `reviewer: <name>` line naming one of these. This
 # list beats any host's reviewer-signers.json. `shipyard review-verdict` and

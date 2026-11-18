@@ -673,10 +673,10 @@ fn merge_state(state: &str, base: &str, number: u64) -> NextAction {
             Actor::Author,
             format!(
                 "GitHub reports {other}; this base admits CLEAN, or UNSTABLE when every required \
-                 check is green. UNSTABLE waits only on the steward's own recovery status, a \
-                 check the base lists in [auto_merge] unstable_blocking_checks, or an unreadable \
-                 base config: fix or rerun that check. BLOCKED: a branch rule is unmet; read \
-                 `shipyard landing --pr {number}`."
+                 check is green and every other red or pending check is named in the base's \
+                 [auto_merge] unstable_advisory_checks. UNSTABLE: fix or rerun the check \
+                 `blocked_detail` names. BLOCKED: a branch rule is unmet; read `shipyard landing \
+                 --pr {number}`."
             ),
         ),
     }

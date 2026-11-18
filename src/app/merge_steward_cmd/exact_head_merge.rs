@@ -5,8 +5,9 @@
 //! path. When such a base still has a GitHub-enforced required-check set that
 //! includes an app-bound exact-head approval context (`review-verdict` by
 //! default), the steward merges an approved head itself: only when GitHub
-//! reports it `CLEAN` (or `UNSTABLE`, red only in checks that are not required;
-//! see [`crate::merge_steward::merge_state_wait`]), every required check is
+//! reports it `CLEAN` (or `UNSTABLE` with every other non-green check listed
+//! advisory by the base; see [`crate::merge_steward::merge_state_wait`]),
+//! every required check is
 //! green, and the steward's own exact-head approval gate returns `Approved`
 //! (never `NotRequired`). The
 //! mutation is `mergePullRequest` bound by `expectedHeadOid`, through the
@@ -326,9 +327,9 @@ pub(super) fn merge_exact_head(
                 &format!("pr:{}:{head}", pr.fact.number),
                 "merge_exact_head_server_enforced",
             );
-            // A merge over red checks that are not required says which, so
+            // A merge over advisory checks that were not green says which, so
             // the tick summary shows what was not a gate.
-            let red = crate::merge_steward::non_required_red(&live.fact, policy);
+            let red = crate::merge_steward::non_required_not_green(&live.fact, policy);
             let merged = if red.is_empty() {
                 format!("merged_exact_head:{head}")
             } else {
@@ -350,7 +351,7 @@ pub(super) fn merge_exact_head(
                     })
                     .collect::<Vec<_>>();
                 format!(
-                    "merged_exact_head:{head},non_required_red:{}",
+                    "merged_exact_head:{head},advisory_not_green:{}",
                     names.join("|")
                 )
             };

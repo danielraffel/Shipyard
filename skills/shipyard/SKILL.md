@@ -1108,8 +1108,8 @@ On a base without a merge queue the steward's own failed
 GitHub reports the head UNSTABLE and the steward waits on
 `github-merge-state:CLEAN (current=UNSTABLE)` even after every required check
 is green. A pass that clears that signal re-reads the exact head and admits it
-in the same pass when it is now ready (CLEAN, or UNSTABLE under the rule
-below). Do not post a success
+in the same pass when it is now ready (CLEAN, or UNSTABLE under the
+advisory-list rule below). Do not post a success
 `shipyard/steward-recovery` status by hand to hurry it: the steward clears it
 under its recovery-clear fence.
 
@@ -3794,18 +3794,25 @@ There the steward merges an owned head with `mergePullRequest`
 (`expectedHeadOid` = that head, `MERGE`) through the ordinary `gh`/`ghapp` path,
 only when every required check (from the live ruleset) is green at that head,
 the exact-head approval gate returns `Approved` (`NotRequired` is refused), and
-GitHub reports it `CLEAN` or `UNSTABLE`. `UNSTABLE` means only checks that are
-not required are red or pending (an unmet required rule is `BLOCKED`), so such
-a head merges like a `CLEAN` one unless the steward's own
-`shipyard/steward-recovery` status is red, or a check the base lists in
-`.shipyard/config.toml` `[auto_merge] unstable_blocking_checks = ["risk-tier"]`
-(default empty; exact names, any case) is red or pending at the head. A listed
-check that never ran does not hold it. A base config that cannot be read, or a
-list that is not an array of check names, admits only `CLEAN`. A head held
-this way reports `merge_state:UNSTABLE`. Per-PR mutations are
-`merged_exact_head:<sha>` (followed by `,non_required_red:<a>|<b>` when it
-merged over red checks that are not required; the tick summary line shows
-them as `non_required_red=#<n>:<a>|<b>`), `waiting_head_approval`, and
+GitHub reports it `CLEAN`, or `UNSTABLE` under an advisory list. `UNSTABLE`
+means every required rule is met and some other check is red or pending (an
+unmet required rule is `BLOCKED`). The steward merges such a head only when
+the base's `.shipyard/config.toml` sets `[auto_merge] unstable_advisory_checks
+= ["zizmor (report only)"]` and that list names (exact name, any case) every
+check on the head that no required rule selects and that is red or pending,
+each producer judged on its newest run. An unlisted, renamed or new check
+holds the head, and so do the steward's own `shipyard/steward-recovery` status
+(never advisory) and an `UNSTABLE` state with no visible non-green check.
+With the key unset, a list that is not an array of check names, an
+`auto_merge` that is not a table, or a base config that cannot be read, only
+`CLEAN` is admitted (the default). A held head reports `merge_state:UNSTABLE`;
+the decision's contexts name each check that holds it (`<name> (not in
+unstable_advisory_checks)`) and each list entry that matches no check on the
+head (`unstable_advisory_checks entry matches no check: <entry>`), so a typo
+shows. Per-PR mutations are `merged_exact_head:<sha>` (followed by
+`,advisory_not_green:<a>|<b>` when advisory checks were red or pending; the
+tick summary line shows them as `advisory_not_green=#<n>:<a>|<b>`),
+`waiting_head_approval`, and
 `waiting_required`. It never arms native auto-merge on such a base, because an
 armed request survives a later push by anyone with write access; any armed
 request on an owned PR is disarmed (`auto_merge_disabled:<sha>`) on every
