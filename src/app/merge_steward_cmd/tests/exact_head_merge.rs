@@ -1364,3 +1364,80 @@ fn the_final_live_read_alone_refuses_an_unlisted_red_check() {
     );
     assert_no_write(&held);
 }
+
+/// danielraffel/v8-builder#69 as GitHub reported it while it sat UNSTABLE
+/// for ten hours: both required checks (`review-verdict`, `unit-tests`,
+/// app-bound) green, `review-verdict` also present as a commit status, and
+/// only the report-only zizmor job red. Listed advisory, it is admitted;
+/// unlisted (or with no list) it holds. The duplicate `review-verdict`
+/// copies from other producers never hold it.
+#[test]
+fn v8_builder_69_is_admitted_once_zizmor_is_advisory() {
+    const V8_HEAD: &str = "3573681990d2eede3af8e5835f9532bcaa77f279";
+    let rollup = r#"[
+        {"__typename":"CheckRun","name":"zizmor (report only)","status":"COMPLETED","conclusion":"FAILURE","completedAt":"2026-11-18T01:03:16Z","detailsUrl":"https://github.com/danielraffel/v8-builder/actions/runs/44212755939/job/134494964357"},
+        {"__typename":"CheckRun","name":"review-verdict","status":"COMPLETED","conclusion":"SUCCESS","completedAt":"2026-11-18T10:44:44Z","detailsUrl":"https://github.com/danielraffel/v8-builder/actions/runs/44212752922/job/134746210269"},
+        {"__typename":"CheckRun","name":"unit-tests","status":"COMPLETED","conclusion":"SUCCESS","completedAt":"2026-11-18T01:03:13Z","detailsUrl":"https://github.com/danielraffel/v8-builder/actions/runs/44212755975/job/134494964776"},
+        {"__typename":"StatusContext","context":"review-verdict","state":"SUCCESS","createdAt":"2026-11-18T10:44:40Z"}
+    ]"#;
+    let json = format!(
+        r#"{{"id":"PR_kw69","number":69,"state":"OPEN","isDraft":false,"baseRefName":"main","headRefOid":"{V8_HEAD}","headRefName":"ci/two-reviews","mergeStateStatus":"UNSTABLE","autoMergeRequest":null,"labels":[],"statusCheckRollup":{rollup}}}"#
+    );
+    let mut pr = parse_pr(
+        &serde_json::from_str(&json).expect("PR json"),
+        &BTreeMap::new(),
+    )
+    .expect("PR")
+    .fact;
+    // The census hydrates the app-bound rules' check runs over REST.
+    for (id, name, completed) in [
+        (
+            134_746_210_269_u64,
+            "review-verdict",
+            "2026-11-18T10:44:44Z",
+        ),
+        (134_494_964_776_u64, "unit-tests", "2026-11-18T01:03:13Z"),
+    ] {
+        pr.checks.push(
+            crate::app::merge_steward_cmd::observation::parse_rest_check(
+                &serde_json::from_str(&format!(
+                    r#"{{"id":{id},"name":"{name}","head_sha":"{V8_HEAD}","status":"completed","conclusion":"success","started_at":"2026-11-18T01:03:05Z","completed_at":"{completed}","details_url":"https://github.com/danielraffel/v8-builder/actions/runs/1/job/{id}","app":{{"id":{ACTIONS_APP},"slug":"github-actions"}}}}"#
+                ))
+                .expect("check run"),
+            )
+            .expect("check run"),
+        );
+    }
+    let policy = |listed: Option<&[&str]>| {
+        let mut policy = no_queue_policy(vec![
+            RequiredCheck {
+                context: "review-verdict".to_owned(),
+                app_id: Some(ACTIONS_APP),
+            },
+            RequiredCheck {
+                context: "unit-tests".to_owned(),
+                app_id: Some(ACTIONS_APP),
+            },
+        ]);
+        policy.ejection_guards.unstable_advisory_checks =
+            listed.map(|names| names.iter().map(|name| (*name).to_owned()).collect());
+        policy
+    };
+    assert_eq!(
+        classify_pr(
+            &pr,
+            &policy(Some(&["zizmor (report only)"])),
+            &BTreeMap::new()
+        ),
+        StewardDecision::ArmMergeQueue
+    );
+    for listed in [None, Some(&[][..]), Some(&["unit-tests"][..])] {
+        assert!(
+            matches!(
+                classify_pr(&pr, &policy(listed), &BTreeMap::new()),
+                StewardDecision::WaitingRequired { contexts } if contexts[0] == UNSTABLE_WAIT
+            ),
+            "{listed:?}"
+        );
+    }
+}
