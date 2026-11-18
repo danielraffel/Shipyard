@@ -219,7 +219,8 @@ class Compute(Base):
     def test_an_unreadable_jobs_list_is_unread_not_zero(self):
         gh = world([pr(1, T(10, "09:00"), T(10, "11:00"))], runs=self.runs, jobs={})
         out = self.build(gh)
-        self.assertIsNone(self.rows(out)[1]["compute"])
+        comp = self.rows(out)[1]["compute"]  # the runs were read, the jobs were not: no minutes and not complete
+        self.assertEqual((comp["complete"], comp["self_hosted_min"], comp["runner_wait_min"]), (False, None, None))
         self.assertEqual(out["repos"][REPO]["per_day"]["2026-11-10"]["compute_per_merged_pr"]["prs_read"], 0)
 
 
@@ -532,6 +533,57 @@ class MalformedJobTiming(Base):
                           row["compute"]["hosted_min"], row["compute"]["macos_min"],
                           row["compute"]["runner_wait_min"], row["path"]),
                          (False, None, None, None, None, None))
+
+    def test_a_failed_run_stays_slow_when_job_timing_is_malformed(self):
+        p = pr(1, T(10, "09:00"), T(10, "11:00"))
+        run = dict(self.RUN, conclusion="failure", updated_at=T(10, "10:12"))
+        job = {"labels": ["self-hosted"], "created_at": T(10, "10:00"), "started_at": T(10, "10:01"), "conclusion": "failure"}
+        out = self.build(world([p], runs=[run], jobs={11: [job]}))
+        row = out["repos"][REPO]["prs"][0]
+        self.assertEqual((row["path"], row["path_why"], row["compute"]["complete"], row["compute"]["self_hosted_min"]),
+                         ("slow", ["red"], False, None))
+
+    def test_a_failed_run_stays_slow_when_the_jobs_request_errors(self):
+        p = pr(1, T(10, "09:00"), T(10, "11:00"))
+        run = dict(self.RUN, conclusion="failure", updated_at=T(10, "10:12"))
+        gh = world([p], runs=[run], jobs={})
+
+        def fetch(path):
+            if "/jobs" in path:
+                raise pm.ReadError("boom")
+            return gh(path)
+        out = pm.build([REPO], self.cache, 200, OWNER, START, NOW, {}, {}, None, fetch, control=False)
+        row = out["repos"][REPO]["prs"][0]
+        self.assertEqual((row["path"], row["path_why"], row["compute"]["complete"]), ("slow", ["red"], False))
+
+    def test_a_failed_run_stays_slow_beside_a_successful_rerun_of_another_workflow(self):
+        p = pr(1, T(10, "09:00"), T(10, "11:00"))
+        bad = dict(self.RUN, conclusion="failure", updated_at=T(10, "10:12"))
+        rerun = dict(self.RUN, id=12, name="other", run_attempt=2, conclusion="success", updated_at=T(10, "10:30"))
+        job = {"labels": ["self-hosted"], "created_at": T(10, "10:00"), "started_at": T(10, "10:01"),
+               "completed_at": T(10, "10:21"), "conclusion": "success"}
+        out = self.build(world([p], runs=[bad, rerun], jobs={11: [job], 12: [job]}))
+        row = out["repos"][REPO]["prs"][0]
+        self.assertEqual((row["path"], row["path_why"], row["compute"]["complete"]), ("slow", ["red"], False))
+
+    def test_a_failed_run_stays_slow_when_the_jobs_read_is_cut_short(self):
+        p = pr(1, T(10, "09:00"), T(10, "11:00"))
+        run = dict(self.RUN, conclusion="failure", updated_at=T(10, "10:12"))
+        job = {"labels": ["self-hosted"], "created_at": T(10, "10:00"), "started_at": T(10, "10:01"),
+               "completed_at": T(10, "10:21"), "conclusion": "failure"}
+        gh = world([p], runs=[run], jobs={11: [job]})
+        orig = pm.Reader.pages
+
+        def cut(rd, path, key=None, max_pages=3):
+            items, full = orig(rd, path, key=key, max_pages=max_pages) if key else orig(rd, path, max_pages=max_pages)
+            return items, (False if "/jobs" in path else full)
+        pm.Reader.pages = cut
+        try:
+            out = pm.build([REPO], self.cache, 200, OWNER, START, NOW, {}, {}, None, gh, control=False)
+        finally:
+            pm.Reader.pages = orig
+        row = out["repos"][REPO]["prs"][0]
+        self.assertEqual((row["path"], row["path_why"], row["compute"]["complete"]), ("slow", ["red"], False))
 
 
 class MergeRemoval(Base):

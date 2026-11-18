@@ -609,14 +609,20 @@ def _wait_until_next(starts, nexts, merged):
     return round(total, 1)
 
 
+def outcomes_known(comp):
+    """True when every run's outcome and the head list were read, whether or not the job timings were. Entries cached
+    before `outcomes_complete` existed were only saved complete, so they fall back to `complete`."""
+    return bool(comp.get("outcomes_complete", comp.get("complete")))
+
+
 def path_of(f, comp):
     """clean, slow or None (unknown) for a merged PR, and why. Slow: any HOLD, red run on a head, ejection from the
-    queue, or DIRTY. A red run is only known from a complete compute read, so a PR with no other cause and an unread
-    compute is unknown, not clean."""
+    queue, or DIRTY. A red run is only known from a read of the run list and heads in full, so a PR with no other cause
+    and an unread compute is unknown, not clean."""
     why = []
     if f["holds"]:
         why.append("hold")
-    if comp and comp.get("complete") and comp.get("red_events"):
+    if comp and outcomes_known(comp) and comp.get("red_events"):  # a red run is an outcome: job timing, a jobs read or another run's rerun history cannot hide it
         why.append("red")
     if f["ejections"]:
         why.append("ejection")
@@ -635,13 +641,14 @@ def cause_minutes(f, comp):
     if not m or not reads_complete(f):  # a partial timeline or commit list omits holds, pushes and queue events: no number, not an undercount
         return None
     done = comp and comp.get("complete")
+    outcomes = comp and outcomes_known(comp)
     push_times = f.get("push_times") or []
     hold_times = f.get("hold_times") or []
     red_events = comp.get("red_events") or [] if comp else []
     hold = None if hold_times and not push_times else _wait_until_next(hold_times, push_times, m)
     red = None if red_events and not push_times else _wait_until_next(red_events, push_times, m)
     return {"hold": hold,
-            "red": None if comp and comp.get("red_partial") else red if done else None,  # None: an earlier failed attempt is not in the list
+            "red": None if comp and comp.get("red_partial") else red if outcomes else None,  # None: an earlier failed attempt is not in the list
             "queue": _wait_until_next(f.get("enqueue_times") or [], f.get("dequeue_times") or [], m),
             "runner": comp.get("runner_wait_min") if done else None, "dirty": None}  # None when the jobs were not read
 
@@ -713,12 +720,17 @@ def pr_compute(rd, f, runs, runs_complete):
         seen[k] = True
     sh = ho = 0.0
     complete = runs_complete and reads_complete(f)  # the heads come from the timeline and the commits
+    outcomes_complete = complete  # as `complete`, but job timing and job reads do not count: run outcomes are in the run list
     mac = wait = 0.0
     timing_complete = True
     by_wf, red_events, red_partial = {}, [], False
     for r in mine.values():
         # skipping the jobs reads must not hide an unfinished run: its outcome is still unknown, so the PR is not clean
-        a, b, m, w, ok = job_minutes(rd, r) if READ_JOB_MINUTES else (0.0, 0.0, 0.0, 0.0, r.get("status") == "completed")
+        try:
+            a, b, m, w, ok = job_minutes(rd, r) if READ_JOB_MINUTES else (0.0, 0.0, 0.0, 0.0, r.get("status") == "completed")
+        except ReadError:  # a failed jobs read withholds this run's minutes; its outcome is in the run list
+            a = b = m = w = 0.0
+            ok = False
         if ok:
             sh += a
             ho += b
@@ -735,6 +747,7 @@ def pr_compute(rd, f, runs, runs_complete):
             attempt = 1
         attempts_known = attempt <= 1 or r.get("conclusion") in BAD_CONCLUSIONS
         complete = complete and ok and attempts_known
+        outcomes_complete = outcomes_complete and r.get("status") == "completed"  # a rerun's history only blocks a clean verdict (`complete`)
         if (r.get("head_sha") in heads and r.get("event") != "merge_group"
                 and r.get("conclusion") in BAD_CONCLUSIONS and r.get("updated_at")):
             red_events.append(r["updated_at"])  # any failed non-merge-group run on one of the PR's heads
@@ -747,7 +760,8 @@ def pr_compute(rd, f, runs, runs_complete):
     return {"self_hosted_min": round(sh, 1) if measured else None, "hosted_min": round(ho, 1) if measured else None, "macos_min": round(mac, 1) if measured else None,
             "runner_wait_min": round(wait, 1) if measured else None, "jobs_read": j, "red_events": sorted(red_events), "by_workflow": by_wf,
             "runs": len(mine), "repeat_runs": repeats, "red_partial": red_partial, "run_fp": {str(i): run_fingerprint(r) for i, r in mine.items()},
-            "group_runs": sum(1 for r in mine.values() if r.get("event") == "merge_group"), "complete": complete}
+            "group_runs": sum(1 for r in mine.values() if r.get("event") == "merge_group"), "complete": complete,
+            "outcomes_complete": outcomes_complete}
 
 
 # ----------------------------------------------------------- correctness
