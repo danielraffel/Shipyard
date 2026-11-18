@@ -186,6 +186,17 @@ class RunTests(unittest.TestCase):
         rn.on_failure(state, msg, [issue()], "x", 2.0, "s", a)
         self.assertEqual(state["failures"][f"{msg['key']}@{rn.dest(LEAD)}"]["count"], 2)
 
+    def test_failures_of_a_superseded_key_are_forgotten(self) -> None:
+        calls, run = self.fake([issue()], send_rc=1)
+        with mock.patch.object(rn.subprocess, "run", run):
+            rn.run(self.args(), now=1000.0)
+            rn.run(self.args(), now=2000.0)
+        calls, run = self.fake([issue(key="v1.2.0:latest_mismatch")], send_rc=1)
+        with mock.patch.object(rn.subprocess, "run", run):
+            rn.run(self.args(), now=3000.0)
+        state = json.loads((self.dir / "state.json").read_text())
+        self.assertEqual([v["count"] for v in state["failures"].values()], [1])
+
     def test_a_github_read_error_is_logged_not_raised(self) -> None:
         def run(cmd, **kw):
             return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="HTTP 502")

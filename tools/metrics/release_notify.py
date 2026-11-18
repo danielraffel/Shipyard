@@ -273,6 +273,11 @@ def run(a: argparse.Namespace, now: float | None = None) -> list[str]:
                 lines += on_failure(state, msg, issues, detail, now, stamp, a)
         if not a.dry_run:
             prune(state, issues, targets)
+            # A count belongs to a message still owed; a superseded key or a
+            # closed issue must not carry old failures into a later message.
+            owed_now = {f"{m['key']}@{dest(m['to'])}" for m in plan(issues, state, targets)}
+            state["failures"] = {k: v for k, v in state.get("failures", {}).items()
+                                 if k in owed_now}
         if sent or failed:
             lines.append(f"{stamp} release-notify sent={sent} failed={failed} "
                          f"open={len(issues)} targets={source or 'none'}")
