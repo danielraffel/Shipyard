@@ -565,6 +565,15 @@ class MalformedJobTiming(Base):
         row = self.build_row(world([p], runs=[run], jobs={11: [job]}))
         self.assertEqual((row["path"], row["path_why"]), ("slow", ["red"]))
 
+    def test_a_known_failure_stands_beside_another_run_rerun_after_the_merge(self):
+        p = pr(1, T(10, "09:00"), T(10, "11:00"))
+        bad = dict(self.RUN, conclusion="failure", updated_at=T(10, "10:12"))
+        late = dict(self.RUN, id=12, name="other", run_attempt=2, conclusion="success", updated_at=T(10, "12:30"))
+        job = {"labels": ["self-hosted"], "created_at": T(10, "10:00"), "started_at": T(10, "10:01"),
+               "completed_at": T(10, "10:21"), "conclusion": "success"}
+        row = self.build_row(world([p], runs=[bad, late], jobs={11: [job], 12: [job]}))
+        self.assertEqual((row["path"], row["path_why"], row["compute"]["complete"]), ("slow", ["red"], False))
+
     def test_a_rerun_counts_only_its_latest_attempts_jobs(self):
         run = dict(self.RUN, run_attempt=2)
         old = {"labels": ["self-hosted"], "run_attempt": 1, "created_at": T(10, "10:00"),

@@ -757,7 +757,7 @@ def pr_compute(rd, f, runs, runs_complete):
         outcomes_complete = outcomes_complete and r.get("status") == "completed"  # a rerun's history only blocks a clean verdict (`complete`)
         after_merge = bool(merged and iso(r.get("updated_at")) and iso(r.get("updated_at")) > merged)  # a rerun after the merge cannot have delayed it
         if after_merge and attempt > 1:
-            complete = outcomes_complete = False  # the rerun replaced what the run showed at the merge: unknown
+            complete = False  # the rerun replaced what the run showed at the merge: no clean verdict (a red found elsewhere still stands)
         if (r.get("head_sha") in heads and r.get("event") != "merge_group" and not after_merge
                 and r.get("conclusion") in BAD_CONCLUSIONS and r.get("updated_at")):
             red_events.append(r["updated_at"])  # any failed non-merge-group run on one of the PR's heads
