@@ -42,7 +42,8 @@ tick on m3 runs `tools/metrics/release_notify.py`, which messages the targets
 in `tools/metrics/release-notify-targets.txt` over cmux. A host's
 `~/.config/shipyard/release-notify-targets` replaces that list. Answer the
 message by fixing the step the issue names. The issue closes itself. See
-`docs/release-watchdog.md`.
+`docs/release-watchdog.md`. A change covered by a merged plugin-only bump
+pull request is released; the cadence check expects no tag for it.
 
 ## Release bases are not stacks
 
