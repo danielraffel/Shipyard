@@ -244,23 +244,21 @@ def chain_decide(*, version: str, landed_at: str | None, now: datetime, tag_exis
         if missing:
             published.append(("release_assets_missing",
                               f"release {tag} lacks {', '.join(missing)}"))
-    # release.yml publishes only after its install.sh check passes, and a failed
-    # check puts the release back to draft, so a public, complete release is the
-    # proof; the run is judged only to say why one is not (a run recovered by
-    # hand or by a dispatch therefore clears this).
-    if published:
-        if run is None:
-            failures.append(("release_run_missing", f"no release.yml run for {tag} {since}"))
-        elif run.get("status") != "completed":
-            failures.append(("release_run_incomplete",
-                             f"release.yml run {run.get('html_url', run.get('id'))} is still "
-                             f"{run.get('status')} {since}"))
-        elif run.get("conclusion") != "success":
-            failures.append(("release_run_failed",
-                             f"release.yml run {run.get('html_url', run.get('id'))} concluded "
-                             f"{run.get('conclusion')}; failed: {failed_jobs or 'see the run'}"))
-        failures += published
-    elif latest_tag != tag:
+    # The run is the install proof: its publish step runs install.sh and checks
+    # --version. A run recovered by `gh run rerun --failed` or by a dispatched
+    # release.yml run on the tag (the latest run for the tag, any event) clears it.
+    if run is None:
+        failures.append(("release_run_missing", f"no release.yml run for {tag} {since}"))
+    elif run.get("status") != "completed":
+        failures.append(("release_run_incomplete",
+                         f"release.yml run {run.get('html_url', run.get('id'))} is still "
+                         f"{run.get('status')} {since}"))
+    elif run.get("conclusion") != "success":
+        failures.append(("release_run_failed",
+                         f"release.yml run {run.get('html_url', run.get('id'))} concluded "
+                         f"{run.get('conclusion')}; failed: {failed_jobs or 'see the run'}"))
+    failures += published
+    if not published and latest_tag != tag:
         failures.append(("latest_mismatch",
                          f"releases/latest is {latest_tag or 'unreadable'}, not {tag}, "
                          "so install.sh without SHIPYARD_VERSION installs another tag"))
@@ -308,7 +306,8 @@ CHAIN_FIX = {
     "release_run_incomplete": "A release job is queued or hung, usually on the self-hosted "
                               "macOS runner (`local-mac`, Shipyard-studio-*); check that runner.",
     "release_run_failed": "release-heal.yml re-runs failed jobs up to 3 times while the release "
-                          "is a draft. Once that is spent, fix the failing step and "
+                          "is a draft. Once that is spent, or when the release is already "
+                          "public, fix the failing step and "
                           "`gh run rerun <id> --failed --repo {repo}`.",
     "release_unpublished": "The release stays a draft until sign-and-upload-macos publishes it "
                            "after the install.sh check; read that job's log.",

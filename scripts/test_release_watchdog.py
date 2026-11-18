@@ -175,8 +175,7 @@ class ChainTests(unittest.TestCase):
         self.assertEqual(steps(verdict), ["tag_missing"])
 
     def test_no_release_run(self) -> None:
-        self.assertEqual(steps(chain(run=None, release=None)),
-                         ["release_run_missing", "release_unpublished"])
+        self.assertEqual(steps(chain(run=None)), ["release_run_missing"])
 
     def test_a_hung_release_run(self) -> None:
         verdict = chain(run={"id": 7, "status": "queued", "conclusion": None}, release=None)
@@ -190,11 +189,10 @@ class ChainTests(unittest.TestCase):
         self.assertEqual(steps(verdict), ["release_run_failed", "release_unpublished"])
         self.assertIn("Publish the attested release", verdict["failures"][0][1])
 
-    def test_a_public_complete_release_is_the_proof_whatever_the_run_says(self) -> None:
-        # Publication follows the install check, so a release recovered by hand
-        # or by a dispatched run clears the tracker.
+    def test_a_failed_run_fails_even_when_the_release_is_public(self) -> None:
+        # The run carries the install proof; a public release alone does not.
         verdict = chain(run={"id": 7, "status": "completed", "conclusion": "failure"})
-        self.assertEqual(verdict["state"], "ok")
+        self.assertEqual(steps(verdict), ["release_run_failed"])
 
     def test_a_missing_tag_stops_there(self) -> None:
         verdict = chain(tag_exists=False)
