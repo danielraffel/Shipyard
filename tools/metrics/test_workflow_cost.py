@@ -118,6 +118,14 @@ class Cost(unittest.TestCase):
         self.assertIn("PARTIAL", wc.render_md(r))
 
 
+class Honest(unittest.TestCase):
+    def test_an_unfinished_run_makes_the_report_partial(self):
+        r = rep(data([run(1, "push", "s1", status="in_progress", conclusion=None)], {1: [job("a", FLEET, 0, 5)]}))
+        self.assertTrue(row(r, "push")["partial"])
+        self.assertTrue(r["partial"])
+        self.assertTrue(any("not finished" in x for x in r["partial_reasons"]))
+
+
 class Fake:
     """A GitHub that serves runs and jobs from fixtures and counts reads."""
 
@@ -162,7 +170,8 @@ class Collect(unittest.TestCase):
         self.assertEqual(r["duplicates"][0]["same_sha_merge_group_success"], 1)
         f2 = Fake(self.listing, self.jobs)
         r2 = self.go(f2)
-        self.assertEqual(f2.paths, [])
+        self.assertFalse(any("/jobs" in p for p in f2.paths))
+        self.assertEqual(len(f2.paths), 1)  # only the newest, still open, day is listed again
         self.assertEqual(r2["workflows"], r["workflows"])
 
     def test_a_day_over_the_search_cap_is_split_by_time_and_read_in_full(self):
@@ -188,6 +197,38 @@ class Collect(unittest.TestCase):
         self.assertLessEqual(r["reads"], 5)
         r2 = self.go(Fake(self.listing, self.jobs), cap=1000)
         self.assertFalse(r2["partial"])
+
+    def test_a_rerun_of_a_cached_run_is_read_again(self):
+        self.go(Fake(self.listing, self.jobs))
+        rerun = [dict(r, run_attempt=2) if r["id"] == 1 else r for r in self.listing]
+        jobs = dict(self.jobs)
+        jobs[1] = self.jobs[1] + [dict(job("a", HOSTED, 0, 9), run_attempt=2)]
+        f = Fake(rerun, jobs)
+        old = 60 * 60 * 30
+        for p in Path(self.tmp).rglob("list/*.json"):
+            import os
+            os.utime(p, (p.stat().st_atime - old, p.stat().st_mtime - old))
+        r = self.go(f)
+        self.assertEqual(row(r, "push")["hosted_minutes"], 12.0)
+
+    def test_a_listing_cached_for_more_than_a_day_is_read_again(self):
+        self.go(Fake(self.listing, self.jobs))
+        old = 60 * 60 * 30
+        import os
+        for p in Path(self.tmp).rglob("list/*.json"):
+            os.utime(p, (p.stat().st_atime - old, p.stat().st_mtime - old))
+        f = Fake(self.listing, self.jobs)
+        self.go(f)
+        self.assertTrue(any("/actions/runs?" in p for p in f.paths))
+        self.assertFalse(any("/jobs" in p for p in f.paths))
+
+    def test_a_merge_group_sha_that_lands_days_later_is_looked_up_through_the_horizon(self):
+        mg = "gh-readonly-queue/main/pr-1-x"
+        listing = [run(2, "merge_group", "late", branch=mg),
+                   run(3, "push", "late", created="2026-11-17T10:00:00Z")]
+        jobs = {2: [job("macos", FLEET, 0, 10)], 3: []}
+        r = self.go(Fake(listing, jobs), events=("merge_group",))
+        self.assertEqual(r["never_landed"][0]["runs_not_landed"], 0)
 
     def test_an_open_day_is_not_cached(self):
         f = Fake(self.listing, self.jobs)

@@ -22,11 +22,14 @@ import math
 import os
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 SCHEMA = "shipyard-workflow-cost/v1"
 UTC = dt.timezone.utc
 SHORT_JOB_MINUTES = 3.0
+LAND_HORIZON_DAYS = 7  # how long after the window a merge-group SHA may still land and count as landed
+LIST_TTL_SECONDS = 24 * 3600  # a cached day listing is read again after this, so a later re-run shows up
 LIST_PAGES = 10  # the search cap is 1,000 results per query, 100 a page
 JOB_PAGES = 5
 DEFAULT_EVENTS = ("push", "merge_group", "pull_request")
@@ -141,12 +144,20 @@ def list_range(rd, event, lo, hi, branch):
     return a + b, ca and cb
 
 
+def fresh(rd, kind, name):
+    try:
+        age = time.time() - os.path.getmtime(os.path.join(rd.root, kind, f"{name}.json"))
+    except OSError:
+        return False
+    return age < LIST_TTL_SECONDS
+
+
 def list_day(rd, event, day, branch, today):
     """Every run of `event` created on UTC `day`. Returns (runs, complete). A day is cached for good once it is two
     or more days old and every run in it has completed."""
     key = f"{event}-{branch or 'all'}-{day.isoformat()}"
     cached = rd.load("list", key)
-    if cached is not None:
+    if cached is not None and fresh(rd, "list", key):
         return cached, True
     lo = dt.datetime(day.year, day.month, day.day, tzinfo=UTC)
     runs, complete = list_range(rd, event, lo, lo + dt.timedelta(hours=24, seconds=-1), branch)
@@ -158,7 +169,8 @@ def list_day(rd, event, day, branch, today):
 def run_jobs(rd, run):
     """(jobs, complete) for one run, every attempt. A completed run's jobs are cached for good."""
     cached = rd.load("jobs", str(run["id"]))
-    if cached is not None:
+    # A re-run keeps the run id and adds attempts: a cache that has not seen the latest attempt is stale.
+    if cached is not None and max([j.get("run_attempt") or 1 for j in cached] or [1]) >= (run.get("run_attempt") or 1):
         return cached, True
     items, complete = rd.pages(f"actions/runs/{run['id']}/jobs?filter=all", key="jobs", max_pages=JOB_PAGES)
     jobs = [{k: x.get(k) for k in JOB_FIELDS} for x in items]
@@ -180,9 +192,9 @@ def collect(rd, since, until, events, workflows, branch, today, workers=4):
     plan = {(ev, d): True for ev in events for d in days(since, until)}
     if "push" in events or "merge_group" in events:
         # Context for duplicates and never-landed: a merge group is built before its push, so look one day back
-        # for merge groups and one day ahead (up to today) for pushes. Listed only; their jobs are not read.
+        # for merge groups and LAND_HORIZON_DAYS ahead (up to today) for pushes. Listed only; their jobs are not read.
         ctx_days = [("merge_group", d) for d in days(since - dt.timedelta(days=1), until)]
-        ctx_days += [("push", d) for d in days(since, min(until + dt.timedelta(days=1), today))]
+        ctx_days += [("push", d) for d in days(since, min(until + dt.timedelta(days=LAND_HORIZON_DAYS), today))]
         for key in ctx_days:
             plan.setdefault(key, False)
     plan = [(ev, d, w) for (ev, d), w in plan.items()]
@@ -247,10 +259,12 @@ def compute(data, repo, since, until, events, branch="main"):
             jobs = data["jobs"].get(run["id"])
             wk = (run["name"], run["path"], ev)
             w = rows.setdefault(wk, {"workflow": run["name"], "path": run["path"], "event": ev, "runs": 0,
-                                     "conclusions": collections.Counter(), "runs_unread": 0,
+                                     "conclusions": collections.Counter(), "runs_unread": 0, "runs_unfinished": 0,
                                      "fleet_minutes": 0.0, "hosted_minutes": 0.0,
                                      "fleet_by_label": collections.Counter(), "queue": []})
             w["runs"] += 1
+            if run["status"] != "completed":
+                w["runs_unfinished"] += 1
             w["conclusions"][run["conclusion"] or run["status"] or "unknown"] += 1
             if ev == "push" and (run["head_branch"] == branch or not branch):
                 d = dup[(run["name"], run["path"])]
@@ -307,10 +321,15 @@ def compute(data, repo, since, until, events, branch="main"):
     for w in sorted(rows.values(), key=lambda r: -(r["fleet_minutes"] + r["hosted_minutes"])):
         workflows.append({
             "workflow": w["workflow"], "path": w["path"], "event": w["event"], "runs": w["runs"],
-            "conclusions": dict(w["conclusions"]), "runs_unread": w["runs_unread"], "partial": bool(w["runs_unread"]),
+            "conclusions": dict(w["conclusions"]), "runs_unread": w["runs_unread"], "runs_unfinished": w["runs_unfinished"],
+            "partial": bool(w["runs_unread"] or w["runs_unfinished"]),
             "fleet_minutes": round(w["fleet_minutes"], 1), "hosted_minutes": round(w["hosted_minutes"], 1),
             "fleet_by_label": {k: round(v, 1) for k, v in w["fleet_by_label"].items()},
             "queue_minutes": stats(w["queue"])})
+    unfinished = sum(w["runs_unfinished"] for w in rows.values())
+    reasons = list(data["partial"])
+    if unfinished:
+        reasons.append(f"{unfinished} runs had not finished; their unfinished jobs count as zero minutes")
     jobs_out = sorted(by_job.values(), key=lambda r: -r["minutes"])
     for j in jobs_out:
         for k in ("minutes", "queue_minutes", "minutes_not_landed"):
@@ -318,7 +337,8 @@ def compute(data, repo, since, until, events, branch="main"):
     report = {
         "schema": SCHEMA, "repo": repo, "since": since.isoformat(), "until": until.isoformat(),
         "events": list(events), "branch": branch,
-        "partial": bool(data["partial"]), "partial_reasons": list(data["partial"]),
+        "partial": bool(reasons), "partial_reasons": reasons,
+        "landing_horizon_days": LAND_HORIZON_DAYS,
         "reads": data["reads"], "read_errors": data["errors"],
         "workflows": workflows, "jobs": jobs_out,
         "duplicates": [{"workflow": k[0], "path": k[1], **v,
@@ -361,7 +381,7 @@ def render_md(rep):
             "| Label | Fleet jobs | Short jobs | Short-job queue hours | All fleet queue hours |", "|---|---|---|---|---|"]
     for s in rep["short_job_wait"]:
         out.append(f"| {s['label']} | {s['fleet_jobs']} | {s['short_jobs']} | {s['short_queue_hours']} | {s['all_queue_hours']} |")
-    out += ["", "## Merge-group runs whose SHA never reached the branch", "",
+    out += ["", f"## Merge-group runs whose SHA did not reach the branch within {rep['landing_horizon_days']} days of the window", "",
             "| Workflow | Runs | In flight | Not landed | Fleet min | Fleet min not landed |", "|---|---|---|---|---|---|"]
     for n in rep["never_landed"]:
         out.append(f"| {n['workflow']} | {n['runs']} | {n['in_flight']} | {n['runs_not_landed']} | "
