@@ -127,6 +127,63 @@ class Calc(unittest.TestCase):
         r = report([(gate(1), [sel(), bad]), (gate(2), [sel()])])
         self.assertEqual((r["jobs_read"], r["jobs_unread"]), (1, 1))
 
+    def test_every_schema_field_is_required_and_exactly_typed(self):
+        good = {
+            "affected-tests-shadow": (sr.SELECTION_SCHEMA, {"total": 100, "selected": 5, "select_all": False,
+                                      "reason": "graph", "failed": 1, "failed_outside_selection": 1,
+                                      "failed_outside_names": ["t"]}),
+            "test-receipts-shadow": (sr.RECEIPTS_SCHEMA, {"selected": 100, "would_skip": 10, "would_skip_failed": 1,
+                                     "would_skip_failed_names": ["x"]}),
+            "flake-exoneration": (sr.EXONERATION_SCHEMA, {"tests": {"t": {"excused": True}}}),
+        }
+        wrong = [None, "false", "1", 1.5, -1, True, [], {}, [1], 7, {"t": 1}]
+
+        def run(title, msg):
+            anns = [{"title": "affected-tests-shadow", "message": json.dumps(good["affected-tests-shadow"][1])}]
+            if title != "affected-tests-shadow":
+                anns.append({"title": title, "message": json.dumps(msg)})
+            else:
+                anns = [{"title": title, "message": json.dumps(msg)}]
+            return sr.read_job(gate(1), anns)
+
+        self.assertEqual([f for f, _ in sr.SELECTION_SCHEMA], [
+            "total", "selected", "select_all", "reason", "failed", "failed_outside_selection", "failed_outside_names"])
+        self.assertEqual([f for f, _ in sr.RECEIPTS_SCHEMA], [
+            "selected", "would_skip", "would_skip_failed", "would_skip_failed_names"])
+        self.assertEqual([f for f, _ in sr.EXONERATION_SCHEMA], ["tests"])
+        for title, (schema, notice) in good.items():
+            self.assertIsNotNone(run(title, notice)[0], title)
+            for field, ok in schema:
+                dropped = {k: v for k, v in notice.items() if k != field}
+                self.assertIsNone(run(title, dropped)[0], f"{title} without {field}")
+                for w in wrong:
+                    if ok(w):
+                        continue
+                    self.assertIsNone(run(title, dict(notice, **{field: w}))[0], f"{title}.{field}={w!r}")
+
+    def test_exoneration_tests_must_map_names_to_objects(self):
+        for bad in ({"t": 1}, {"t": None}, ["t"]):
+            anns = [sel(), {"title": "flake-exoneration", "message": json.dumps({"tests": bad})}]
+            self.assertIsNone(sr.read_job(gate(1), anns)[0])
+
+    def test_cross_field_rules_are_enforced(self):
+        base = {"total": 100, "selected": 5, "select_all": False, "reason": "graph", "failed": 2,
+                "failed_outside_selection": 1, "failed_outside_names": ["t"]}
+        rc = {"selected": 100, "would_skip": 10, "would_skip_failed": 1, "would_skip_failed_names": ["x"]}
+
+        def ok(sel_m, rc_m=None):
+            anns = [{"title": "affected-tests-shadow", "message": json.dumps(sel_m)}]
+            if rc_m is not None:
+                anns.append({"title": "test-receipts-shadow", "message": json.dumps(rc_m)})
+            return sr.read_job(gate(1), anns)[0] is not None
+        self.assertTrue(ok(base, rc))
+        for bad in (dict(base, selected=101), dict(base, failed_outside_selection=3),
+                    dict(base, failed_outside_names=["a", "b"])):
+            self.assertFalse(ok(bad))
+        for bad in (dict(rc, would_skip=101), dict(rc, would_skip_failed=11),
+                    dict(rc, would_skip_failed_names=["a", "b"])):
+            self.assertFalse(ok(base, bad))
+
     def test_under_95_percent_coverage_prints_partial_with_the_share(self):
         rows = [(gate(i), [sel()]) for i in range(1, 19)] + [(gate(30), []), (gate(31), [])]
         r = report(rows)

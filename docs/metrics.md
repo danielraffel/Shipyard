@@ -206,7 +206,12 @@ Notices parsed (JSON in `message`): `affected-tests-shadow` or `shipyard-selecti
 | Unexplained misses | Misses minus those whose verdict is `exonerated`, and the same per 100 narrowed jobs. This is the figure the promotion rule reads. |
 | Receipts | Jobs with the notice, median `would_skip / selected`, and `would_skip_failed` (with names). |
 
-A gate job whose selection notice is missing or unparseable, whose annotations could not be read, or whose run's
+Each notice is checked against a schema table (`SELECTION_SCHEMA`, `RECEIPTS_SCHEMA`, `EXONERATION_SCHEMA`): every
+field is required with its exact JSON type (`select_all` a boolean, counts non-negative integers, names lists of
+strings, no defaults), with `selected <= total`, `failed_outside_selection <= failed`,
+`0 <= would_skip_failed <= would_skip <= selected` and no more names than their count. A failing notice is unread.
+
+A gate job whose selection notice is missing, unparseable or invalid, whose annotations could not be read, or whose run's
 jobs could not be read is unread: it is listed, and the result prints `PARTIAL`, as it does when under 95% of gate
 jobs carried a selection notice, a listing was truncated or the read cap was reached.
 

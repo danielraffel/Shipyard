@@ -213,12 +213,53 @@ def normalize_reason(reason):
 
 
 def _count(v):
-    """A non-negative integer as JSON wrote it, or None. A bool, a string or a float is not a count."""
-    return v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else None
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+
+
+def _names(v):
+    return isinstance(v, list) and all(isinstance(n, str) for n in v)
+
+
+def _text(v):
+    return isinstance(v, str)
+
+
+def _bool(v):
+    return isinstance(v, bool)
+
+
+# One table per notice type: (field, type check). Every field is required and exactly typed; there are no defaults.
+SELECTION_SCHEMA = (("total", _count), ("selected", _count), ("select_all", _bool), ("reason", _text),
+                    ("failed", _count), ("failed_outside_selection", _count), ("failed_outside_names", _names))
+RECEIPTS_SCHEMA = (("selected", _count), ("would_skip", _count), ("would_skip_failed", _count),
+                   ("would_skip_failed_names", _names))
+EXONERATION_SCHEMA = (("tests", lambda v: isinstance(v, dict) and all(isinstance(t, dict) for t in v.values())),)
+# Cross-field constraints, each a (description, predicate over the notice).
+SELECTION_RULES = (("selected <= total", lambda m: m["selected"] <= m["total"]),
+                   ("failed_outside_selection <= failed", lambda m: m["failed_outside_selection"] <= m["failed"]),
+                   ("names <= failed_outside_selection", lambda m: len(m["failed_outside_names"]) <= m["failed_outside_selection"]))
+RECEIPTS_RULES = (("0 <= would_skip_failed <= would_skip <= selected",
+                   lambda m: m["would_skip_failed"] <= m["would_skip"] <= m["selected"]),
+                  ("names <= would_skip_failed", lambda m: len(m["would_skip_failed_names"]) <= m["would_skip_failed"]))
+
+
+def validate(notice, schema, rules=()):
+    """None when `notice` has every field of `schema` with its exact type and satisfies `rules`, else why not."""
+    if not isinstance(notice, dict):
+        return "not an object"
+    for field, ok in schema:
+        if field not in notice:
+            return f"missing {field}"
+        if not ok(notice[field]):
+            return f"bad {field}"
+    for why, pred in rules:
+        if not pred(notice):
+            return f"violates {why}"
+    return None
 
 
 def read_job(g, annotations):
-    """One gate job's facts, or (None, why) when its selection notice is missing or unusable."""
+    """One gate job's facts, or (None, why) when a notice is missing or fails its schema."""
     if annotations is None:
         return None, "annotations not read"
     sel = [a for a in annotations if a["title"] in SELECTION_TITLES]
@@ -227,31 +268,24 @@ def read_job(g, annotations):
     s = parse_notice(sel[0])
     if s is None:
         return None, "selection annotation unparseable"
-    total, selected = _count(s.get("total")), _count(s.get("selected"))
-    failed, outside = _count(s.get("failed", 0)), _count(s.get("failed_outside_selection", 0))
-    names = s.get("failed_outside_names") or []
-    select_all = s.get("select_all")
-    if (None in (total, selected, failed, outside) or not isinstance(select_all, bool) or selected > total
-            or outside > failed or not isinstance(names, list) or not all(isinstance(n, str) for n in names)):
+    if validate(s, SELECTION_SCHEMA, SELECTION_RULES):
         return None, "selection annotation invalid"
-    f = {"job_id": g["job_id"], "run_id": g["run_id"], "conclusion": g["conclusion"], "select_all": select_all,
-         "reason": s.get("reason"), "total": total, "selected": selected, "failed": failed, "outside": outside,
-         "outside_names": names, "fraction": (selected / total) if total else None,
-         "receipts": None, "exoneration": {}}
+    f = {"job_id": g["job_id"], "run_id": g["run_id"], "conclusion": g["conclusion"], "select_all": s["select_all"],
+         "reason": s["reason"], "total": s["total"], "selected": s["selected"], "failed": s["failed"],
+         "outside": s["failed_outside_selection"], "outside_names": s["failed_outside_names"],
+         "fraction": (s["selected"] / s["total"]) if s["total"] else None, "receipts": None, "exoneration": {}}
     for a in annotations:
         if a["title"] == RECEIPTS_TITLE:
             r = parse_notice(a)
-            skip, sel_n, bad = _count(r.get("would_skip") if r else None), _count(r.get("selected") if r else None), \
-                _count(r.get("would_skip_failed", 0) if r else None)
-            names = (r or {}).get("would_skip_failed_names") or []
-            if None in (skip, sel_n, bad) or skip > sel_n or not isinstance(names, list):
+            if validate(r, RECEIPTS_SCHEMA, RECEIPTS_RULES):
                 return None, "receipts annotation invalid"
-            f["receipts"] = {"would_skip": skip, "selected": sel_n, "would_skip_failed": bad,
-                             "failed_names": [str(n) for n in names]}
+            f["receipts"] = {"would_skip": r["would_skip"], "selected": r["selected"],
+                             "would_skip_failed": r["would_skip_failed"], "failed_names": r["would_skip_failed_names"]}
         elif a["title"] in EXONERATION_TITLES:
             e = parse_notice(a)
-            if e and isinstance(e.get("tests"), dict):
-                f["exoneration"].update(e["tests"])
+            if validate(e, EXONERATION_SCHEMA):
+                return None, "exoneration annotation invalid"
+            f["exoneration"].update(e["tests"])
     return f, None
 
 
