@@ -59,7 +59,7 @@ ESCAPE_WINDOW = dt.timedelta(days=14)
 HORIZON = dt.timedelta(hours=48)
 MIN_SAMPLE = 50
 UNKNOWN_RANGE_SHARE = 0.20
-SCORECARD_VERSION = "2026-11-18.3"  # .2: correctness reads the first-parent next push and the newest run by id; main-red episodes
+SCORECARD_VERSION = "2026-11-18.6"  # .2: correctness reads the first-parent next push and the newest run by id; main-red episodes
 MERGE_MAIN_RE = re.compile(r"^Merge (remote-tracking )?branch '?(origin/)?(main|master)'?|^Merge pull request .* from .*/main", re.I)
 # Positive controls: a real revert (#124 reverted #119), a real escaped defect (#126 names #116).
 # Pulp: two escapes verified by hand from main-red traces. #12219 landed red on Workflow lint and
@@ -851,12 +851,13 @@ CACHE_AFTER = dt.timedelta(days=1)  # a push's state is cached once it is a day 
 STUCK_AFTER = dt.timedelta(hours=3)  # a run still queued or running this long after its push is stuck, not pending
 
 
-def commit_state(rd, sha, age=None):
+def commit_state(rd, sha, age=None, now=None):
     """The check state of one commit: {"red": contexts failing, "green": contexts succeeding, "settled": every page read and
     every run finished}. A context's latest run (by start) decides it. A run that has not finished `STUCK_AFTER` after the
     push (`age`) and `STUCK_AFTER` after its own start is stuck (GitHub keeps phantom queued runs for days) and says
     nothing: it is neither red nor green and does not hold the commit open; a rerun queued minutes ago on an old push is
-    pending. Cached only when every run finished and the push is a day old: a stuck run can still finish, and a rerun or
+    pending. `now` is the report's clock (never the wall clock, so a replay is deterministic); the contexts treated as stuck
+    are listed in "stuck". Cached only when every run finished and the push is a day old: a stuck run can still finish, and a rerun or
     a late workflow can still appear.""" 
     runs, complete = rd.pages(f"commits/{sha}/check-runs", key="check_runs", max_pages=5)
     fp = runs_fingerprint(runs, complete)
@@ -868,7 +869,7 @@ def commit_state(rd, sha, age=None):
         k = c["name"]
         if k not in latest or run_order(c) > run_order(latest[k]):
             latest[k] = c
-    now = dt.datetime.now(UTC)
+    now = now or dt.datetime.now(UTC)
 
     def done_or_stuck(c):
         if c.get("status") == "completed":
@@ -879,7 +880,8 @@ def commit_state(rd, sha, age=None):
 
     st = {"v": CHECKS_VERSION, "settled": bool(complete and latest and all(done_or_stuck(c) for c in latest.values())),
           "red": sorted(k for k, c in latest.items() if c.get("status") == "completed" and c.get("conclusion") in BAD_CONCLUSIONS),
-          "green": sorted(k for k, c in latest.items() if c.get("status") == "completed" and c.get("conclusion") == "success")}
+          "green": sorted(k for k, c in latest.items() if c.get("status") == "completed" and c.get("conclusion") == "success"),
+          "stuck": sorted(k for k, c in latest.items() if c.get("status") != "completed" and done_or_stuck(c))}
     if st["settled"] and all(c.get("status") == "completed" for c in latest.values()) and age is not None and age >= CACHE_AFTER:
         rd.save("cstate", sha, dict(st, fp=fp))
     return st
@@ -940,6 +942,14 @@ def main_red_episodes(chron, states, pr_by_sha):
             open_ctx = {}
             continue
         red, green = set(st["red"]) - skip, set(st["green"]) - skip
+        # a stuck run says nothing about its context: an open episode in it is not known to continue, so it ends here
+        # with no fixer and no duration, and the next push has no baseline
+        stuck = set(st.get("stuck") or []) - skip
+        if stuck:
+            for c in sorted(stuck & set(open_ctx)):
+                ep = open_ctx.pop(c)
+                ep["open"].discard(c)
+                ep["end_unknown"] = True
         new = sorted(c for c in red if c not in open_ctx)
         if new:
             ep = {"start_sha": sha, "start": ts, "pr": pr_by_sha.get(sha) if prev_settled else None, "began_before_window": first,
@@ -953,7 +963,7 @@ def main_red_episodes(chron, states, pr_by_sha):
             if not ep["open"]:
                 ep["end"], ep["fixer_pr"], ep["fixer_sha"] = ts, pr_by_sha.get(sha), sha
                 ep["minutes_to_green"] = round((iso(ts) - iso(ep["start"])).total_seconds() / 60.0, 1)
-        first, prev_settled = False, True
+        first, prev_settled = False, not stuck
     for ep in episodes:
         ep["open"] = sorted(ep["open"])
     return episodes, skipped
@@ -1059,7 +1069,7 @@ def detect_main_red(rd, base_commits, merged_list, now=None, listing_cut=False):
         floor = max(floor, t)  # a push cannot precede its parent's: a commit written earlier than the one before it still arrived after it
         chron.append((c["sha"], floor))
     now = now or dt.datetime.now(UTC)
-    states = {sha: commit_state(rd, sha, now - iso(ts)) for sha, ts in chron}
+    states = {sha: commit_state(rd, sha, now - iso(ts), now) for sha, ts in chron}
     episodes, skipped = main_red_episodes(chron, states, {k: p["number"] for k, p in by_sha.items()})
     for ep in episodes:
         p = by_sha.get(ep["start_sha"])
