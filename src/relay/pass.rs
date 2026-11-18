@@ -4,6 +4,7 @@
 //! the returned state and appends the returned log records.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::path::Path;
 
 use chrono::{DateTime, Duration, Utc};
@@ -240,12 +241,23 @@ fn run_repo(
         .map(|t| t.pr)
         .collect();
     let mut read = super::fetch(input.gh, repo, &live, true)?;
-    // A marker-sourced owner whose marker is gone from the body is forgotten.
+    // A marker-sourced owner whose marker is gone from an open pull request's
+    // body is forgotten. A pull request that merged or closed is no longer in
+    // the open list, so its missing marker says nothing: its owner still gets
+    // the `merged` or `closed` message.
     for tracked in state.prs.values_mut().filter(|t| t.repo == repo) {
-        if tracked
-            .owner
-            .as_ref()
-            .is_some_and(|o| o.source == owner_registry::Source::BodyMarker)
+        let still_open = read
+            .prs
+            .get(&tracked.pr)
+            .and_then(Option::as_ref)
+            .and_then(|node| node.get("state"))
+            .and_then(Value::as_str)
+            == Some("OPEN");
+        if still_open
+            && tracked
+                .owner
+                .as_ref()
+                .is_some_and(|o| o.source == owner_registry::Source::BodyMarker)
             && !read.markers.contains_key(&tracked.pr)
         {
             tracked.owner = None;
@@ -271,6 +283,24 @@ fn run_repo(
         adopt_marker(entry, record, input.config, input.now);
         if !read.prs.contains_key(number) {
             discovered.push(*number);
+        }
+    }
+    // Open pull requests nobody registered: with a lead configured they are
+    // tracked too, so an event that needs an author's action reaches the lead
+    // instead of nobody. Bounded by the discovery page (100); a registered owner always wins.
+    if input.config.fallbacks(repo).lead.is_some() {
+        for number in &read.unmarked {
+            let entry = state
+                .prs
+                .entry(key(repo, *number))
+                .or_insert_with(|| Tracked {
+                    repo: repo.to_owned(),
+                    pr: *number,
+                    ..Tracked::default()
+                });
+            if entry.done_at.is_none() && entry.owner.is_none() && !read.prs.contains_key(number) {
+                discovered.push(*number);
+            }
         }
     }
     if !discovered.is_empty() {
@@ -301,6 +331,20 @@ fn run_repo(
             continue;
         }
         tracked.missing_passes = 0;
+        // A stored unowned pull request stays eligible only while the lead is
+        // configured and it is not a draft (read from its own fetch, not from
+        // the discovery page, which holds only the newest 100 open ones).
+        let is_draft = node
+            .as_ref()
+            .and_then(|n| n.get("isDraft"))
+            .and_then(Value::as_bool)
+            == Some(true);
+        if tracked.owner.is_none()
+            && digest.state == "OPEN"
+            && (input.config.fallbacks(repo).lead.is_none() || is_draft)
+        {
+            continue;
+        }
         infer_actions(tracked, &digest, input.now, log);
         // Overdue rows are the steward's, at this exact head; the rest are
         // derived from the change since the last pass.
@@ -323,24 +367,65 @@ fn run_repo(
             }
             log.push(record);
         }
-        let mut events: Vec<RelayEvent> = derived
-            .into_iter()
-            .chain(overdue_now)
-            .filter(|event| input.config.events.contains(event.name()))
-            // Green, pending (a re-run), green again at one head is one fact.
-            .filter(|event| match event {
-                RelayEvent::RequiredCheck { result, head, .. } if result == "green" => {
-                    tracked.green_head.as_deref() != Some(head.as_str())
-                }
-                _ => true,
-            })
-            .collect();
+        let unowned = tracked.owner.is_none();
+        // With no owner the lead hears only what needs an author, judged by
+        // the state now, every pass: a history to compare with would miss a
+        // HOLD that landed before the first look or a conflict that came with
+        // a push. What is no longer true is dropped from the queue; a fact
+        // already delivered is not delivered again (its key is stable, since
+        // an unowned event carries no sequence number).
+        if unowned {
+            // A queued fact that no longer holds is dropped (overdue rows are
+            // re-read from the steward every pass).
+            let current: Vec<String> = super::actionable_now(&digest)
+                .iter()
+                .map(|event| event.key(repo, *number))
+                .collect();
+            tracked.pending.retain(|event| {
+                super::needs_an_owner(event, &digest)
+                    && (matches!(event, RelayEvent::Ejected { .. }) && !digest.in_queue
+                        || matches!(event, RelayEvent::Overdue { head, .. } if *head == digest.head)
+                        || current.contains(&event.key(repo, *number)))
+            });
+        }
+        let mut events: Vec<RelayEvent> = if unowned {
+            super::actionable_now(&digest)
+                .into_iter()
+                // An ejection from the queue is an edge, not a state.
+                .chain(
+                    derived
+                        .into_iter()
+                        .filter(|event| matches!(event, RelayEvent::Ejected { .. })),
+                )
+                .chain(overdue_now)
+                .filter(|event| super::needs_an_owner(event, &digest))
+                .filter(|event| input.config.events.contains(event.name()))
+                .collect()
+        } else {
+            derived
+                .into_iter()
+                .chain(overdue_now)
+                .filter(|event| input.config.events.contains(event.name()))
+                // Green, pending (a re-run), green again at one head is one fact.
+                .filter(|event| match event {
+                    RelayEvent::RequiredCheck { result, head, .. } if result == "green" => {
+                        tracked.green_head.as_deref() != Some(head.as_str())
+                    }
+                    _ => true,
+                })
+                .collect()
+        };
         if digest.checks == super::Checks::Success {
             tracked.green_head = Some(digest.head.clone());
         } else if digest.checks == super::Checks::Failure {
             tracked.green_head = None;
         }
-        for event in &mut events {
+        // An unowned event is a state, deduplicated by its stable key; only
+        // an ejection is an edge that can recur, so it keeps a sequence.
+        for event in events
+            .iter_mut()
+            .filter(|e| !unowned || matches!(e, RelayEvent::Ejected { .. }))
+        {
             if let Some(seq) = event.seq_mut() {
                 tracked.event_seq += 1;
                 *seq = tracked.event_seq;
@@ -349,7 +434,17 @@ fn run_repo(
         repo_pass.events += events.len();
         for event in events {
             let event_key = event.key(repo, *number);
-            if tracked.sent.contains(&event_key)
+            // A check event delivered while the PR had an owner carries a
+            // sequence number; the same fact must not reach the lead again
+            // once the owner marker is gone.
+            let sent_while_owned = unowned
+                && matches!(event, RelayEvent::RequiredCheck { .. })
+                && tracked
+                    .sent
+                    .iter()
+                    .any(|key| same_fact_ignoring_seq(key, &event_key));
+            if sent_while_owned
+                || tracked.sent.contains(&event_key)
                 || tracked
                     .pending
                     .iter()
@@ -536,7 +631,14 @@ fn deliver(
     let pr = tracked.pr;
     let events = tracked.pending.clone();
     let keys: Vec<String> = events.iter().map(|e| e.key(repo, pr)).collect();
-    let message = render_message(repo, pr, digest, &events, steward_next);
+    let mut message = render_message(repo, pr, digest, &events, steward_next);
+    if tracked.owner.is_none() {
+        let _ = write!(
+            message,
+            " (No owner is registered for this pull request, so the lead hears it; the owning \
+             session runs `shipyard owner register --pr {pr} --repo {repo}`.)"
+        );
+    }
     let mut record = DeliveryRecord {
         kind: "delivery".to_owned(),
         at: input.now,
@@ -625,4 +727,12 @@ fn deliver(
         }
     }
     record
+}
+
+/// Whether two event keys differ only in their trailing sequence number.
+fn same_fact_ignoring_seq(sent: &str, candidate: &str) -> bool {
+    match (sent.rsplit_once(':'), candidate.rsplit_once(':')) {
+        (Some((a, _)), Some((b, _))) => a == b,
+        _ => false,
+    }
 }
