@@ -862,12 +862,23 @@ def run_order(c):
     return (c.get("id") or 0, c.get("started_at") or "")
 
 
+def runs_fingerprint(runs, complete):
+    """What a cached check state was derived from: each check run's id, state, conclusion and times (a rerun is a new id, a
+    late workflow a new entry, a finished run changes status and completed_at). None when the list was not read in full:
+    such a read matches no cache."""
+    if not complete:
+        return None
+    return sorted([c.get("id"), c.get("name"), c.get("status"), c.get("conclusion"), c.get("started_at"), c.get("completed_at")] for c in runs)
+
+
 def commit_red(rd, sha, required):
     """(red_contexts, settled). Settled and cached only when every page was read and every check run completed."""
-    cached = rd.load("checks", sha)
-    if cached is not None and cached.get("v") == CHECKS_VERSION:
-        return set(cached["red"]) & required, True
     runs, complete = rd.pages(f"commits/{sha}/check-runs", key="check_runs", max_pages=2)
+    fp = runs_fingerprint(runs, complete)
+    cached = rd.load("checks", sha)
+    # the cache only skips recomputation: the run list is read every time and the entry is used only while it still matches
+    if cached is not None and cached.get("v") == CHECKS_VERSION and fp is not None and cached.get("fp") == fp:
+        return set(cached["red"]) & required, True
     latest = {}
     for c in runs:
         k = c["name"]
@@ -876,7 +887,7 @@ def commit_red(rd, sha, required):
     settled = complete and bool(latest) and all(c.get("status") == "completed" for c in latest.values())
     red = {k for k, c in latest.items() if c.get("conclusion") in BAD_CONCLUSIONS}
     if settled:
-        rd.save("checks", sha, {"v": CHECKS_VERSION, "red": sorted(red)})
+        rd.save("checks", sha, {"v": CHECKS_VERSION, "red": sorted(red), "fp": fp})
     return red & required, settled
 
 
@@ -891,10 +902,11 @@ def commit_state(rd, sha, age=None):
     nothing: it is neither red nor green and does not hold the commit open; a rerun queued minutes ago on an old push is
     pending. Cached only when every run finished and the push is a day old: a stuck run can still finish, and a rerun or
     a late workflow can still appear.""" 
-    cached = rd.load("cstate", sha)
-    if cached is not None and cached.get("v") == CHECKS_VERSION:
-        return cached
     runs, complete = rd.pages(f"commits/{sha}/check-runs", key="check_runs", max_pages=5)
+    fp = runs_fingerprint(runs, complete)
+    cached = rd.load("cstate", sha)
+    if cached is not None and cached.get("v") == CHECKS_VERSION and fp is not None and cached.get("fp") == fp:
+        return {k: v for k, v in cached.items() if k != "fp"}
     latest = {}
     for c in runs:
         k = c["name"]
@@ -913,7 +925,7 @@ def commit_state(rd, sha, age=None):
           "red": sorted(k for k, c in latest.items() if c.get("status") == "completed" and c.get("conclusion") in BAD_CONCLUSIONS),
           "green": sorted(k for k, c in latest.items() if c.get("status") == "completed" and c.get("conclusion") == "success")}
     if st["settled"] and all(c.get("status") == "completed" for c in latest.values()) and age is not None and age >= CACHE_AFTER:
-        rd.save("cstate", sha, st)
+        rd.save("cstate", sha, dict(st, fp=fp))
     return st
 
 
@@ -996,13 +1008,14 @@ def head_states_at(rd, sha, at):
     it had finished by then, "pending" if not. A rerun after the merge does not rewrite history. None when the runs could
     not be read in full."""
     key = f"{sha}@{at}"
-    cached = rd.load("headstate", key)
-    if cached is not None and cached.get("v") == CHECKS_VERSION:
-        return cached["states"]
     # filter=all: the default (latest) drops a run superseded by a rerun after the merge
     runs, complete = rd.pages(f"commits/{sha}/check-runs?filter=all", key="check_runs", max_pages=5)
     if not complete:
         return None
+    fp = runs_fingerprint(runs, complete)
+    cached = rd.load("headstate", key)
+    if cached is not None and cached.get("v") == CHECKS_VERSION and cached.get("fp") == fp:
+        return cached["states"]
     latest, unstarted = {}, set()
     for c in runs:
         # a run with no start time yet may have been queued before the merge or after it: its context is unknown
@@ -1020,7 +1033,7 @@ def head_states_at(rd, sha, at):
     for k in unstarted:
         states[k] = "pending"
     if not unstarted:  # an unstarted run gets its start time later, which can settle the question
-        rd.save("headstate", key, {"v": CHECKS_VERSION, "states": states})
+        rd.save("headstate", key, {"v": CHECKS_VERSION, "states": states, "fp": fp})
     return states
 
 

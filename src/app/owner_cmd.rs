@@ -175,7 +175,25 @@ pub(super) fn owner_command<W: Write>(
     let now = Utc::now();
     let mut registrations = Vec::new();
     match command {
-        OwnerCommand::Register { pr, repo, all } => {
+        OwnerCommand::Register {
+            pr,
+            repo,
+            all,
+            after_create,
+        } => {
+            if after_create {
+                // The caller (`ghapp pr create`) just opened the pull request.
+                // Same rules as a push through `shipyard pr`; never a failure.
+                if let (Some(number), Some(repo)) = (pr, repo) {
+                    let line = if registration_enabled(&|name| std::env::var(name).ok()) {
+                        register_after_push(cwd, &config, runtime_paths, &repo, number)
+                    } else {
+                        format!("▸ Owner of {repo}#{number} not registered ({REGISTER_ENV}=0)")
+                    };
+                    writeln!(stdout, "{line}").map_err(io_failure)?;
+                }
+                return Ok(ExitCode::SUCCESS);
+            }
             if all {
                 for record in owner_registry::load_all(&runtime_paths.state_dir) {
                     if !same_session(&record, &identity) {
