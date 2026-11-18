@@ -27,6 +27,8 @@ fn token(state: DwellState) -> &'static str {
         DwellState::CarriesUnapproved => "carries_unapproved_commits:#7",
         DwellState::StackedBaseMerged => STACKED_BASE_MERGED,
         DwellState::StaleMergeRef => "stale_merge_ref:macos",
+        // Not a `blocked_on` state: `track_stuck` keeps its clock.
+        DwellState::ApprovedStuck => "",
     }
 }
 
@@ -112,6 +114,9 @@ fn retrigger_marks_are_retained_when_history_grows() {
 fn every_state_is_overdue_exactly_at_its_limit() {
     let policy = DwellPolicy::default();
     for state in DwellState::ALL {
+        if state == DwellState::ApprovedStuck {
+            continue;
+        }
         let limit = i64::from(policy.limit(state).unwrap());
         assert_eq!(
             state_for_token(token(state), APPROVAL),
@@ -915,4 +920,129 @@ fn a_stale_merge_ref_token_has_the_retrigger_act() {
         Some(ActKind::RetriggerStaleRef)
     );
     assert!(ActKind::RetriggerStaleRef.writes_github());
+}
+
+fn stuck(number: u64, head: &str, token: &str) -> StuckCandidate {
+    StuckCandidate {
+        number,
+        head: head.to_owned(),
+        token: token.to_owned(),
+    }
+}
+
+/// One pass of `track_stuck` `minutes` after `now()`.
+fn stuck_pass(
+    state: &mut DwellRepoState,
+    candidates: &[StuckCandidate],
+    skipped: &[u64],
+    minutes: i64,
+    apply: bool,
+) -> Vec<Planned> {
+    track_stuck(
+        state,
+        candidates,
+        &skipped.iter().copied().collect(),
+        &DwellPolicy::default(),
+        now() + Duration::minutes(minutes),
+        apply,
+    )
+}
+
+/// An approved, required-green pull request the steward has not merged is
+/// silent under 60 minutes, escalates exactly once when it passes 60, and is
+/// still reported (not escalating) on later passes while it stays stuck. The
+/// row names why the steward has not merged it.
+#[test]
+fn an_approved_green_pull_request_stuck_past_the_bound_alerts_once() {
+    let mut state = established();
+    let pr = [stuck(69, HEAD, "merge_state:UNSTABLE")];
+    assert!(stuck_pass(&mut state, &pr, &[], 0, true).is_empty());
+    assert!(
+        stuck_pass(&mut state, &pr, &[], 59, true).is_empty(),
+        "under the bound"
+    );
+    let first = stuck_pass(&mut state, &pr, &[], 60, true);
+    assert_eq!(first.len(), 1);
+    assert!(first[0].escalate);
+    assert_eq!(first[0].overdue.state, DwellState::ApprovedStuck);
+    assert_eq!(first[0].overdue.token, "merge_state:UNSTABLE");
+    assert_eq!(first[0].overdue.age_minutes, 60);
+    assert_eq!(first[0].overdue.level, 1);
+    assert_eq!(first[0].act, Disposition::NoAct);
+    for minutes in [65, 120, 600] {
+        let later = stuck_pass(&mut state, &pr, &[], minutes, true);
+        assert_eq!(later.len(), 1, "{minutes}");
+        assert!(!later[0].escalate, "alerted once, not again at {minutes}");
+    }
+}
+
+/// A new head starts a new clock and a new alert; a pull request that is
+/// no longer a candidate (merged, red, unapproved) loses its entry, while
+/// one the pass budget skipped keeps its clock.
+#[test]
+fn a_new_head_restarts_the_clock_and_a_skipped_row_keeps_it() {
+    let mut state = established();
+    let at_a = [stuck(7, HEAD, "excluded_label:owner-decision")];
+    stuck_pass(&mut state, &at_a, &[], 0, true);
+    assert!(stuck_pass(&mut state, &at_a, &[], 61, true)[0].escalate);
+    let at_b = [stuck(7, HEAD2, "excluded_label:owner-decision")];
+    assert!(
+        stuck_pass(&mut state, &at_b, &[], 70, true).is_empty(),
+        "new head, new clock"
+    );
+    assert!(stuck_pass(&mut state, &at_b, &[], 130, true)[0].escalate);
+
+    let mut state = established();
+    let pr = [stuck(8, HEAD, "held")];
+    stuck_pass(&mut state, &pr, &[], 0, true);
+    // Skipped for a pass: the entry and its clock survive.
+    assert!(stuck_pass(&mut state, &[], &[8], 30, true).is_empty());
+    assert!(stuck_pass(&mut state, &pr, &[], 60, true)[0].escalate);
+    // Gone (merged, or no longer approved and green): the entry is dropped.
+    stuck_pass(&mut state, &[], &[], 61, true);
+    assert!(state.stuck_approved.is_empty());
+}
+
+/// A pass that does not apply (a dry run, `shipyard wait`) reports the
+/// alert but never consumes it: the next apply pass still escalates.
+#[test]
+fn a_dry_run_does_not_use_up_the_alert() {
+    let mut state = established();
+    let pr = [stuck(9, HEAD, "merge_state:UNSTABLE")];
+    stuck_pass(&mut state, &pr, &[], 0, true);
+    let dry = stuck_pass(&mut state, &pr, &[], 61, false);
+    assert!(dry[0].escalate);
+    let applied = stuck_pass(&mut state, &pr, &[], 62, true);
+    assert!(applied[0].escalate, "the dry run did not consume it");
+    assert!(!stuck_pass(&mut state, &pr, &[], 63, true)[0].escalate);
+}
+
+/// `[auto_merge.dwell] approved_stuck = 0` turns the alarm off; another
+/// value moves the bound.
+#[test]
+fn the_stuck_bound_is_configurable_and_zero_disables_it() {
+    let policy = |raw: &str| DwellPolicy::from_table(&raw.parse::<toml::Table>().expect("toml"));
+    assert_eq!(
+        DwellPolicy::default().limit(DwellState::ApprovedStuck),
+        Some(60)
+    );
+    assert_eq!(
+        policy("[auto_merge.dwell]\napproved_stuck = 30\n").limit(DwellState::ApprovedStuck),
+        Some(30)
+    );
+    let off = policy("[auto_merge.dwell]\napproved_stuck = 0\n");
+    let mut state = established();
+    let pr = [stuck(9, HEAD, "merge_state:UNSTABLE")];
+    track_stuck(&mut state, &pr, &BTreeSet::new(), &off, now(), true);
+    assert!(
+        track_stuck(
+            &mut state,
+            &pr,
+            &BTreeSet::new(),
+            &off,
+            now() + Duration::minutes(600),
+            true
+        )
+        .is_empty()
+    );
 }

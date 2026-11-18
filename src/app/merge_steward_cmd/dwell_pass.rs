@@ -404,6 +404,26 @@ pub(super) fn run(
             )
         })
         .collect();
+    // Approved, required-green, still unmerged: alerted once per head past
+    // its limit, whatever holds it.
+    let stuck = dwell::track_stuck(
+        &mut state,
+        &stuck_candidates(input, reports),
+        &skipped,
+        input.dwell_policy,
+        input.now,
+        input.apply,
+    );
+    report.escalations_new += stuck.iter().filter(|row| row.escalate).count();
+    report.overdue.extend(stuck.iter().map(|row| {
+        overdue_record(
+            input,
+            by_number.get(&row.overdue.number).copied(),
+            row,
+            row.overdue.level,
+            None,
+        )
+    }));
     ledger.dwell.insert(repo_key, state);
     if input.apply
         && let Some(state_dir) = input.state_dir
@@ -469,6 +489,58 @@ fn sightings(reports: &[PrReport], stacked: &[OpenPr]) -> (Vec<Sighting>, BTreeS
         since: None,
     }));
     (out, skipped)
+}
+
+/// Pull requests this pass saw approved at their exact head with every
+/// required check green, and that it neither merged nor queued.
+///
+/// Approved means a green observation of the approval context
+/// (`review-verdict`, check run or commit status) at the head and no newer
+/// approval status refusing it; the canonical workflow turns it green only
+/// for an exact-head APPROVE. A draft, a queued pull request (the queue owns
+/// it), a row the pass budget deferred, and one this pass merged or enqueued
+/// are not candidates.
+fn stuck_candidates(input: &DwellInput<'_>, reports: &[PrReport]) -> Vec<dwell::StuckCandidate> {
+    let policy = input.policy;
+    let approval = policy.approval_context.trim();
+    reports
+        .iter()
+        .filter(|report| {
+            !super::pass_budget::is_deferred(report) && !report.blocked.blocked_on.is_empty()
+        })
+        .filter(|report| {
+            !report.mutation.as_deref().is_some_and(|mutation| {
+                mutation.split([',', ';']).any(|part| {
+                    part.starts_with("enqueued") || part.starts_with("merged_exact_head")
+                })
+            })
+        })
+        .filter_map(|report| {
+            let pr = &input
+                .observation
+                .prs
+                .iter()
+                .find(|pr| pr.fact.number == report.number)?
+                .fact;
+            let approved = !approval.is_empty()
+                && crate::merge_steward::approval_status_agrees(pr, policy)
+                && pr.checks.iter().any(|check| {
+                    check.name.eq_ignore_ascii_case(approval)
+                        && check.status.eq_ignore_ascii_case("COMPLETED")
+                        && green(check.conclusion.as_deref())
+                });
+            (approved
+                && !pr.draft
+                && pr.queue_position.is_none()
+                && pr.head_sha.eq_ignore_ascii_case(&report.head_sha)
+                && crate::merge_steward::required_checks_all_succeeded(pr, policy))
+            .then(|| dwell::StuckCandidate {
+                number: report.number,
+                head: report.head_sha.clone(),
+                token: report.blocked.blocked_on.clone(),
+            })
+        })
+        .collect()
 }
 
 /// Required contexts a `required_never_ran:<a,b>` token names that have a

@@ -952,6 +952,7 @@ approved_green_not_queued = 5   # ready / admission_pending: evaluated first nex
 carries_unapproved = 60         # escalate only
 stacked_base_merged = 10        # stacked on a merged base: retarget once
 stale_merge_ref = 10            # approved, red on a stale merge ref: retrigger once
+approved_stuck = 60             # approved and required-green but not merged or queued: alert once per head
 act = "shadow"                  # "apply" runs the GitHub-writing acts; "off" runs none
 max_acts_per_pass = 3           # GitHub-writing acts per repository per pass
 max_escalations_per_pass = 25
@@ -1007,6 +1008,25 @@ dropped). Review, CI and steward states go only to the feed, where the party
 that can act reads them, and rows the steward is acting on this pass are not
 relayed. The GitHub-writing acts ship in `shadow`: they are reported as
 `would_act` and escalate until the base sets `act = "apply"`.
+
+**Approved but stuck** (`approved_stuck`). Beside the token states, every pass
+tracks each pull request that is approved at its exact head (a green
+`review-verdict` check run or status, with no newer refusing status) with every
+required check green, and that the pass neither merged nor queued, whatever its
+`blocked_on` (`merge_state:UNSTABLE`, an excluded label, an unknown merge
+state, ...). Drafts and queued pull requests are not tracked: the queue owns
+them. The clock starts the first pass that sees it so at its head and restarts
+at a new head; a row the pass budget deferred keeps it. Past the limit (60
+minutes; `0` turns it off) the pass reports one `approved_stuck` overdue row
+naming the `blocked_on`, routed to the author. It escalates exactly once per
+head, and only an `--apply` pass marks it, so a dry run (`shipyard wait`)
+never uses up the alert. Later passes keep reporting the row, not escalating,
+until the pull request merges, moves or stops being approved and green. It
+reaches people three ways: the overdue feed (once), `shipyard relay` to the
+owning session, or to the repository's lead for an unowned pull request (event
+`overdue`, naming the reason; the reason is not part of the dedup key), and
+drain watch (`stuck_approved`, see `docs/drain-watch.md`), which writes one
+`summary.log` line and then files one deduplicated issue.
 
 No act arms, enqueues, merges, updates a branch or approves; the act interface
 has no method that could.

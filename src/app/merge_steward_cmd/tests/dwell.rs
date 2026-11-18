@@ -1361,3 +1361,110 @@ mod stale_annotate {
         ));
     }
 }
+
+/// Through a real dwell pass: only an approved, required-green pull request
+/// the steward neither merged nor queued is tracked; past 60 minutes it
+/// raises one author-routed `approved_stuck` row naming the steward's
+/// `blocked_on`, written once to the overdue feed, then reported without
+/// escalating. A red, an unapproved (no green verdict, or a refusing verdict
+/// status), and an enqueued pull request never are.
+#[test]
+fn an_approved_green_pull_request_the_steward_did_not_merge_is_alerted_once() {
+    let temp = tempfile::tempdir().unwrap();
+    // #5: every required check green, but its newest `review-verdict` commit
+    // status refuses the head, so it is not approved.
+    let mut refused = pr(5, Some("SUCCESS"), Some("SUCCESS"), &[]);
+    refused
+        .fact
+        .checks
+        .push(crate::merge_steward::StewardCheck {
+            name: "review-verdict".to_owned(),
+            source: crate::merge_steward::StewardCheckSource::StatusContext,
+            app_id: None,
+            status: "COMPLETED".to_owned(),
+            conclusion: Some("FAILURE".to_owned()),
+            run_id: None,
+            observed_at: Some("2026-11-09T10:00:00Z".to_owned()),
+            check_id: None,
+            description: None,
+        });
+    let prs = vec![
+        pr(1, Some("SUCCESS"), Some("SUCCESS"), &[]),
+        pr(2, Some("FAILURE"), Some("SUCCESS"), &[]),
+        pr(3, Some("SUCCESS"), Some("FAILURE"), &[]),
+        pr(4, Some("SUCCESS"), Some("SUCCESS"), &[]),
+        refused,
+    ];
+    let mut enqueued = report(4, "admitted", None);
+    enqueued.mutation = Some("enqueued".to_owned());
+    let mut pass = pass(
+        &temp,
+        prs,
+        vec![
+            report(1, "merge_state:UNSTABLE", None),
+            report(2, "required_failed:macos", None),
+            report(3, "no_verdict", None),
+            enqueued,
+            report(5, "required_failed:review-verdict", None),
+        ],
+    );
+    let mut ledger = established();
+    let stuck_rows = |report: &dwell_pass::DwellRepoReport| {
+        report
+            .overdue
+            .iter()
+            .filter(|row| row.state == crate::merge_steward::dwell::DwellState::ApprovedStuck)
+            .map(|row| {
+                (
+                    row.pr,
+                    row.blocked_on.clone(),
+                    row.escalated,
+                    row.owner.role,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert!(stuck_rows(&pass.run(&mut ledger, &FakeActs::default())).is_empty());
+    pass.now = now() + chrono::Duration::minutes(59);
+    assert!(stuck_rows(&pass.run(&mut ledger, &FakeActs::default())).is_empty());
+    pass.now = now() + chrono::Duration::minutes(61);
+    let first = pass.run(&mut ledger, &FakeActs::default());
+    assert_eq!(
+        stuck_rows(&first),
+        vec![(1, "merge_state:UNSTABLE".to_owned(), true, "author")]
+    );
+    let feed = fs::read_to_string(
+        temp.path()
+            .join("state")
+            .join(dwell_pass::DIR)
+            .join(dwell_pass::FEED),
+    )
+    .expect("feed");
+    assert_eq!(feed.matches("\"approved_stuck\"").count(), 1, "{feed}");
+    pass.now = now() + chrono::Duration::minutes(75);
+    let later = pass.run(&mut ledger, &FakeActs::default());
+    assert_eq!(
+        stuck_rows(&later),
+        vec![(1, "merge_state:UNSTABLE".to_owned(), false, "author")]
+    );
+    let feed = fs::read_to_string(
+        temp.path()
+            .join("state")
+            .join(dwell_pass::DIR)
+            .join(dwell_pass::FEED),
+    )
+    .expect("feed");
+    assert_eq!(
+        feed.matches("\"approved_stuck\"").count(),
+        1,
+        "alerted once"
+    );
+    // The row the relay reads delivers, with the reason.
+    let tick =
+        serde_json::json!({"repos": [{"dwell": serde_json::to_value(&later).expect("json")}]});
+    let events = crate::relay::steward_overdue(&tick);
+    assert_eq!(
+        events[&1][0].describe(),
+        "overdue: approved_stuck for 75 min (limit 60 min); blocked on merge_state:UNSTABLE"
+    );
+}

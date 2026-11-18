@@ -72,11 +72,16 @@ pub enum DwellState {
     /// Approved, with required checks that went red on a test merge commit
     /// that no longer exists ([`super::stale_merge_ref`]).
     StaleMergeRef,
+    /// Approved at its exact head with every required check green, yet not
+    /// merged or queued, whatever the reason (any `blocked_on`). Not a
+    /// `blocked_on` state: [`track_stuck`] tracks it beside the others, so the
+    /// per-token dwell of the same pull request keeps its own clock and act.
+    ApprovedStuck,
 }
 
 impl DwellState {
     /// Every state, in report order.
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::NeedsReview,
         Self::RequiredPending,
         Self::RequiredFailedInfra,
@@ -89,6 +94,7 @@ impl DwellState {
         Self::CarriesUnapproved,
         Self::StackedBaseMerged,
         Self::StaleMergeRef,
+        Self::ApprovedStuck,
     ];
 
     /// The config key and report name.
@@ -107,6 +113,7 @@ impl DwellState {
             Self::CarriesUnapproved => "carries_unapproved",
             Self::StackedBaseMerged => "stacked_base_merged",
             Self::StaleMergeRef => "stale_merge_ref",
+            Self::ApprovedStuck => "approved_stuck",
         }
     }
 
@@ -119,7 +126,7 @@ impl DwellState {
             | Self::RequiredFailedInfra
             | Self::StaleVerdictCheck
             | Self::StaleMergeRef => 10,
-            Self::RequiredPending | Self::CarriesUnapproved => 60,
+            Self::RequiredPending | Self::CarriesUnapproved | Self::ApprovedStuck => 60,
             Self::RequiredFailed => 45,
             Self::Dirty | Self::Held | Self::RequiredNeverRan => 30,
             Self::ApprovedGreenNotQueued => 5,
@@ -144,7 +151,8 @@ impl DwellState {
             | Self::RequiredFailed
             | Self::Dirty
             | Self::Held
-            | Self::CarriesUnapproved => None,
+            | Self::CarriesUnapproved
+            | Self::ApprovedStuck => None,
         }
     }
 
@@ -158,7 +166,11 @@ impl DwellState {
             | Self::RequiredNeverRan
             | Self::StaleMergeRef => "operator",
             Self::ApprovedGreenNotQueued => "steward",
-            Self::RequiredFailed | Self::Dirty | Self::Held | Self::StackedBaseMerged => "author",
+            Self::RequiredFailed
+            | Self::Dirty
+            | Self::Held
+            | Self::StackedBaseMerged
+            | Self::ApprovedStuck => "author",
         }
     }
 
@@ -492,6 +504,115 @@ pub struct DwellRepoState {
     /// an active head can never lose its lifetime retrigger mark.
     #[serde(default)]
     pub retriggers: Vec<RetriggerMark>,
+    /// Approved, required-green pull requests not merged or queued, and when
+    /// each was first seen so at its head ([`track_stuck`]).
+    #[serde(default)]
+    pub stuck_approved: BTreeMap<u64, StuckApproved>,
+}
+
+/// One approved, required-green pull request the steward has not merged or
+/// queued.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct StuckApproved {
+    /// The head it was first seen approved and green at.
+    pub head: String,
+    /// The `blocked_on` token last seen: why the steward has not merged it.
+    pub token: String,
+    /// The first pass that saw it approved and green at this head.
+    pub since: DateTime<Utc>,
+    /// Whether its alert was emitted, by an apply pass. One per head.
+    pub alerted: bool,
+}
+
+/// One pull request this pass saw approved at its exact head with every
+/// required check green, and neither merged nor queued.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StuckCandidate {
+    /// Pull request number.
+    pub number: u64,
+    /// Current head.
+    pub head: String,
+    /// Its `blocked_on` token.
+    pub token: String,
+}
+
+/// Track approved, required-green pull requests the steward has not merged,
+/// and plan the alert of each one stuck past the
+/// [`DwellState::ApprovedStuck`] limit (60 minutes by default; 0 disables).
+///
+/// A candidate keeps its clock while its head is unchanged and starts a new
+/// one at a new head. A pull request in `skipped` (seen, but not classified
+/// this pass) keeps its entry unchanged; any other non-candidate loses it.
+/// A row past the limit escalates exactly once per head: `escalate` is true
+/// on the first pass past the limit and, when `apply`, the entry is marked so
+/// no later pass escalates it again. A pass that does not apply (a dry run,
+/// `shipyard wait`) never marks it, so it cannot use up the alert. Later
+/// passes still report the row (not escalating) while it stays stuck, so the
+/// relay can deliver an alert it missed; it deduplicates by state, head and
+/// level.
+pub fn track_stuck(
+    state: &mut DwellRepoState,
+    candidates: &[StuckCandidate],
+    skipped: &BTreeSet<u64>,
+    policy: &DwellPolicy,
+    now: DateTime<Utc>,
+    apply: bool,
+) -> Vec<Planned> {
+    let mut next: BTreeMap<u64, StuckApproved> = state
+        .stuck_approved
+        .iter()
+        .filter(|(number, _)| skipped.contains(number))
+        .map(|(number, entry)| (*number, entry.clone()))
+        .collect();
+    for candidate in candidates {
+        let entry = match state.stuck_approved.get(&candidate.number) {
+            Some(entry) if entry.head.eq_ignore_ascii_case(&candidate.head) => StuckApproved {
+                token: candidate.token.clone(),
+                ..entry.clone()
+            },
+            _ => StuckApproved {
+                head: candidate.head.clone(),
+                token: candidate.token.clone(),
+                since: now,
+                alerted: false,
+            },
+        };
+        next.insert(candidate.number, entry);
+    }
+    let mut rows = Vec::new();
+    if let Some(limit) = policy.limit(DwellState::ApprovedStuck) {
+        for candidate in candidates {
+            let Some(entry) = next.get_mut(&candidate.number) else {
+                continue;
+            };
+            let age = (now - entry.since).num_minutes().max(0);
+            if age < i64::from(limit) {
+                continue;
+            }
+            let escalate = !entry.alerted;
+            if escalate && apply {
+                entry.alerted = true;
+            }
+            rows.push(Planned {
+                overdue: Overdue {
+                    number: candidate.number,
+                    state: DwellState::ApprovedStuck,
+                    token: entry.token.clone(),
+                    head: entry.head.clone(),
+                    entered_at: entry.since,
+                    age_minutes: age,
+                    limit_minutes: limit,
+                    over_minutes: age - i64::from(limit),
+                    level: 1,
+                },
+                act: Disposition::NoAct,
+                escalate,
+                escalation_deferred: false,
+            });
+        }
+    }
+    state.stuck_approved = next;
+    rows
 }
 
 /// The retrigger history of one pull request head.

@@ -15,6 +15,9 @@ Kinds:
                  a queued PR row whose merge group can never finish (the steward's
                  `merge_group_stalled:<context>` token: every run done, a required
                  context absent)
+  stuck_approved a PR approved at its exact head with every required check green that the
+                 steward has not merged or queued for 60 min or more, whatever holds it
+                 (the steward's `approved_stuck` dwell row, which names its blocked_on)
   stuck_claim    a repair claim 30 min or more old whose PR head has not moved
   pass_fault     new log lines matching a fault signature, per signature and lane
   launcher_fallback
@@ -211,6 +214,12 @@ def recent_ticks(log_dir, now, span):
             if "prs" not in r or r.get("errors"):
                 per_repo.setdefault(r["repo"], []).append((t, None))
                 continue
+            stuck = {}
+            dwell = r.get("dwell") if isinstance(r.get("dwell"), dict) else {}
+            for o in dwell.get("overdue") or []:
+                if isinstance(o, dict) and o.get("state") == "approved_stuck" and isinstance(o.get("pr"), int):
+                    stuck[o["pr"]] = {"head": str(o.get("head") or ""), "blocked_on": str(o.get("blocked_on") or "unknown"),
+                                      "age": o.get("age_minutes"), "entered": o.get("entered_at")}
             rows = {}
             for p in r["prs"]:
                 na = p.get("next_action") or {}
@@ -218,7 +227,8 @@ def recent_ticks(log_dir, now, span):
                                      "actor": na.get("actor"), "stop": bool(na.get("stop")),
                                      "since": parse_iso(p.get("since")), "deferred": read_deferred(p),
                                      "loop": (p.get("loop") or {}).get("state") if isinstance(p.get("loop"), dict) else None,
-                                     "required": [c for c in (r.get("required_contexts") or []) if isinstance(c, str)]}
+                                     "required": [c for c in (r.get("required_contexts") or []) if isinstance(c, str)],
+                                     "stuck": stuck.get(p["number"])}
             per_repo.setdefault(r["repo"], []).append((t, rows))
     for v in per_repo.values():
         v.sort(key=lambda x: x[0])
@@ -319,6 +329,28 @@ def check_merge_group_stalled(per_repo, now, sup=None):
                             detail=f"{len(stalled)} merge group(s) can never finish: " + ",".join(f"#{n}" for n in stalled[:5]),
                             evidence=[f"{repo}#{n} {rows[n]['token']} since {rows[n]['since'].isoformat() if rows[n]['since'] else 'unknown'}"
                                       for n in stalled[:5]]))
+    return out
+
+
+def check_stuck_approved(per_repo, now):
+    """PRs the steward's latest tick reports `approved_stuck`: approved at their exact head,
+    every required check green, and not merged or queued past its bound. One finding per PR
+    and head, naming why the steward has not merged it. Never suppressed: an approved green
+    PR that does not merge is always worth a page."""
+    out = []
+    for repo, ticks in per_repo.items():
+        t_last, rows = latest_valid(ticks)
+        if rows is None or now - t_last > dt.timedelta(minutes=30):
+            continue
+        for pr in sorted(rows):
+            st = rows[pr].get("stuck")
+            if not st or (st["head"] and rows[pr]["head"] and st["head"] != rows[pr]["head"]):
+                continue
+            head = st["head"] or rows[pr]["head"] or "?"
+            reason = re.sub(r"[\s;]+", "_", st["blocked_on"])
+            out.append(dict(kind="stuck_approved", repo=repo, lane="-", key=f"stuck_approved:{repo}#{pr}@{head[:12]}",
+                            detail=f"#{pr} approved and required-green, unmerged {st['age']}m, blocked_on={reason}",
+                            evidence=[f"{repo}#{pr} head {head} blocked_on {st['blocked_on']} since {st['entered']}"]))
     return out
 
 
@@ -536,6 +568,7 @@ def collect(a, now, state):
     f += check_drain_stall(per_repo, now, sup)
     f += check_stale_hold(per_repo, now, sup)
     f += check_merge_group_stalled(per_repo, now, sup)
+    f += check_stuck_approved(per_repo, now)
     f += check_stuck_claims(per_repo, a.runner_dir, now, sup)
     f += scan_logs(a.fleet_dir, state, a.from_start, now)
     f += check_launcher_fallback(a.summary, state, now)

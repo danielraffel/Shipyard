@@ -210,6 +210,49 @@ class DetectionTests(Base):
         self.assertIn(("reviewer", "Traceback x1"), got)
 
 
+class StuckApprovedTests(Base):
+    def stuck_tick(self, t, stuck_pr, head="h69", tick_head="h69", token="merge_state:UNSTABLE", age=75):
+        prs = [{"number": 69, "head_sha": tick_head, "blocked_on": token, "since": None,
+                "next_action": {"actor": "author", "action": "x", "stop": False}},
+               {"number": 70, "head_sha": "h70", "blocked_on": "merge_state:UNSTABLE", "since": None,
+                "next_action": {"actor": "author", "action": "x", "stop": False}}]
+        overdue = [{"pr": 70, "state": "held", "head": "h70", "blocked_on": "held", "age_minutes": 99}]
+        if stuck_pr:
+            overdue.append({"pr": 69, "state": "approved_stuck", "head": head, "blocked_on": token,
+                            "age_minutes": age, "entered_at": "2026-11-13T10:45:00Z"})
+        body = {"repos": [{"repo": REPO, "prs": prs, "errors": [], "dwell": {"overdue": overdue}}]}
+        (self.log / f"{REPO.replace('/', '_')}-{stamp(t)}.json").write_text(json.dumps(body))
+
+    def test_an_approved_stuck_row_is_one_finding_naming_the_reason(self):
+        self.stuck_tick(NOW, True)
+        _, _, f = self.run_once()
+        stuck = [x for x in f if x["kind"] == "stuck_approved"]
+        self.assertEqual([x["key"] for x in stuck], ["stuck_approved:acme/repo#69@h69"])
+        self.assertIn("#69 approved and required-green, unmerged 75m, blocked_on=merge_state:UNSTABLE", stuck[0]["detail"])
+
+    def test_no_row_no_finding_and_a_moved_head_is_not_paged(self):
+        self.stuck_tick(NOW, False)
+        _, _, f = self.run_once()
+        self.assertEqual([x for x in f if x["kind"] == "stuck_approved"], [])
+        self.stuck_tick(NOW + dt.timedelta(minutes=5), True, head="old", tick_head="new")
+        _, _, f = self.run_once(NOW + dt.timedelta(minutes=5))
+        self.assertEqual([x for x in f if x["kind"] == "stuck_approved"], [])
+
+    def test_announced_once_then_one_issue_on_the_second_run(self):
+        self.stuck_tick(NOW, True, token="excluded_label:owner decision; x")
+        self.run_once()
+        lines = [l for l in self.summary() if "kind=stuck_approved" in l]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("blocked_on=excluded_label:owner_decision_x", lines[0])
+        self.assertEqual(self.store()["issues"], [])
+        self.stuck_tick(NOW + dt.timedelta(minutes=5), True, token="excluded_label:owner decision; x")
+        self.run_once(NOW + dt.timedelta(minutes=5))
+        self.assertEqual(len([l for l in self.summary() if "kind=stuck_approved" in l]), 1, "announced once")
+        issues = self.store()["issues"]
+        self.assertEqual(len(issues), 1)
+        self.assertIn("<!-- drain-watch:stuck_approved:acme/repo#69@h69 -->", issues[0]["body"])
+
+
 class TranscriptAndTimeTests(Base):
     def test_transcripts_are_not_scanned_but_runner_lines_are(self):
         (self.fleet / "repair.last-output.txt").write_text(
