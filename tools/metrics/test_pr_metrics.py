@@ -2058,7 +2058,7 @@ class Integrated(unittest.TestCase):
             self.assertIsNone(plain["end_to_end"])
             self.assertIn("no --e2e-cache", lr.markdown(plain))
 
-    def test_defaults_are_the_five_fleet_repos_and_a_1500_cap(self):
+    def test_defaults_are_the_five_fleet_repos_and_a_3000_cap(self):
         seen = {}
 
         def fake_build(repos, cache, cap, *a, **k):
@@ -2071,9 +2071,54 @@ class Integrated(unittest.TestCase):
                 lr.build_report(d, dt.timedelta(days=1), NOW, e2e={"cache_dir": c})
             finally:
                 pm.build = orig
-        self.assertEqual(seen["cap"], 1500)
+        self.assertEqual(seen["cap"], 3000)
         self.assertEqual(seen["repos"], ["Generous-Corp/pulp", "Generous-Corp/vellum", "danielraffel/Shipyard",
                                          "danielraffel/tartci", "danielraffel/fleet-handbook"])
+
+
+class ReadShares(unittest.TestCase):
+    """The shared read cap is split by each repo's listed PR count, with a floor, not equally."""
+    LO, HI = dt.datetime(2026, 11, 10, tzinfo=UTC), dt.datetime(2026, 11, 18, tzinfo=UTC)
+
+    def fetch_for(self, counts):
+        def fetch(path):
+            repo = path.split("/pulls")[0][len("repos/"):]
+            page = int(re.search(r"&page=(\d+)", path).group(1))
+            n = counts[repo]
+            lo, hi = (page - 1) * 100, min(n, page * 100)
+            return [{"number": i, "created_at": T(12, "10:00")} for i in range(lo, hi)]
+        return fetch
+
+    def test_a_pulp_sized_repo_gets_a_warm_run_and_no_small_repo_starves(self):
+        counts = {"o/pulp": 316, "o/a": 20, "o/b": 20, "o/c": 20, "o/d": 5}
+        with tempfile.TemporaryDirectory() as d:
+            shares, spent = pm.read_shares(list(counts), d, 3000, self.LO, self.HI, self.fetch_for(counts))
+        self.assertGreaterEqual(shares["o/pulp"], 1200)  # ~900 warm, ~1,200 cold; an equal split gave 300
+        self.assertTrue(all(shares[r] >= pm.READ_FLOOR for r in counts))
+        self.assertLessEqual(sum(shares.values()) + spent, 3000)
+
+    def test_an_incomplete_planning_listing_is_unknown_and_takes_the_median_of_the_others(self):
+        counts = {"o/huge": 1000, "o/a": 20, "o/b": 40, "o/c": 60}  # o/huge: eight pages of 100 and still more
+        with tempfile.TemporaryDirectory() as d:
+            shares, spent = pm.read_shares(list(counts), d, 3000, self.LO, self.HI, self.fetch_for(counts))
+        extra = 3000 - spent - pm.READ_FLOOR * len(counts)
+        total = 40 + 20 + 40 + 60  # unknown repo weighs the median (40) of the complete listings, not its capped 800
+        self.assertEqual(shares["o/huge"], pm.READ_FLOOR + extra * 40 // total)
+        self.assertEqual(shares["o/c"], pm.READ_FLOOR + extra * 60 // total)
+
+    def test_a_cap_that_cannot_fund_the_floors_after_planning_is_split_equally(self):
+        counts = {f"o/r{i}": 50 for i in range(5)}
+        calls = []
+        with tempfile.TemporaryDirectory() as d:
+            shares, spent = pm.read_shares(list(counts), d, 500, self.LO, self.HI, lambda p: calls.append(p) or [])  # 500 = 5 floors, no room for 5 listings
+        self.assertEqual((set(shares.values()), spent, calls), ({100}, 0, []))
+
+    def test_a_cap_below_the_floors_is_split_equally_with_no_planning_reads(self):
+        counts = {"o/pulp": 316, "o/a": 20}
+        calls = []
+        with tempfile.TemporaryDirectory() as d:
+            shares, spent = pm.read_shares(list(counts), d, 50, self.LO, self.HI, lambda p: calls.append(p) or [])
+        self.assertEqual((shares, spent, calls), ({"o/pulp": 25, "o/a": 25}, 0, []))
 
 
 class SyntheticControl(unittest.TestCase):
