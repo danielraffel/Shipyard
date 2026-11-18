@@ -236,10 +236,12 @@ MERGE_REMOVAL_WINDOW = dt.timedelta(minutes=2)
 def ejection(e, merged):
     """Whether a timeline event is a removal from the merge queue that is an ejection. The REST event names no reason, and GitHub
     records a removal when a PR merges, so a removal within two minutes before the merge is the merge, not an ejection (the
-    rule the m3 fleet-metrics parser uses); one that says `merged` is the merge too, and a removal after the merge cannot be an
+    rule the m3 fleet-metrics parser uses, applied only when no reason is given); one that says `merged` is the merge too, and a removal after the merge cannot be an
     ejection of the merged PR."""
     if e.get("event") not in ("removed_from_merge_queue", "dequeued") or (e.get("reason") or "unknown") in ("merged", "already_merged"):
         return False
+    if (e.get("reason") or "unknown") != "unknown":  # an explicit non-merge reason (failed_checks, ...) is an ejection wherever it falls
+        return True
     t, m = iso(e.get("created_at")), iso(merged)
     return not (t and m and m - t <= MERGE_REMOVAL_WINDOW)
 
@@ -742,7 +744,7 @@ def pr_compute(rd, f, runs, runs_complete):
             sh += a
             ho += b
             mac += m
-            if r.get("event") != "push":  # a push to the base on the merge-group sha runs after the merge and cannot have delayed it
+            if r.get("event") != "push" or r.get("head_sha") in heads:  # a push to the base on the merge-group sha runs after the merge and cannot have delayed it
                 wait += w
         else:
             timing_complete = False
