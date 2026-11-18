@@ -863,6 +863,28 @@ class RerunCache(Base):
         first, _ = self.build_one([self.mk(1, "failure", T(10, "10:40"))])
         self.assertEqual((first["compute"]["red_partial"], first["cause_min"]["red"]), (False, 10.0))  # a first attempt: 10:40 to the 10:50 force-push
 
+    def test_a_successful_rerun_leaves_red_and_runner_unknown_beside_another_cause(self):
+        r, _ = self.build_one([self.mk(2, "success", T(10, "10:40"))])
+        self.assertEqual((r["compute"]["red_partial"], r["compute"]["runner_wait_min"]), (True, None))
+        self.assertEqual((r["cause_min"]["red"], r["cause_min"]["runner"]), (None, None))
+
+    def test_a_successful_rerun_beside_a_hold_gives_no_numeric_red_duration(self):
+        tl = {1: [{"event": "commented", "actor": {"login": "x"}, "body": "HOLD", "created_at": T(10, "10:00")},
+                  {"event": "head_ref_force_pushed", "actor": {"login": "x"}, "created_at": T(10, "10:50"), "after_sha": "o" * 40}]}
+        gh = world([pr(1, T(10, "09:00"), T(10, "11:00"))], tl, runs=[self.mk(2, "success", T(10, "10:40"))], jobs={11: self.JOB})
+        out = pm.build([REPO], self.cache, 300, OWNER, START, NOW, {}, {}, None, gh, control=False)
+        r = out["repos"][REPO]["prs"][0]
+        self.assertEqual((r["path"], r["cause_min"]["red"]), ("slow", None))
+        self.assertEqual(r["cause_min"]["hold"], 50.0)
+
+    def test_a_known_failure_stands_beside_an_unfinished_run(self):
+        bad = self.mk(1, "failure", T(10, "10:40"))
+        busy = dict(self.mk(1, None, T(10, "10:45")), id=12, name="other", status="in_progress")
+        gh = world([pr(1, T(10, "09:00"), T(10, "11:00"))], {}, runs=[bad, busy], jobs={11: self.JOB, 12: self.JOB})
+        out = pm.build([REPO], self.cache, 300, OWNER, START, NOW, {}, {}, None, gh, control=False)
+        r = out["repos"][REPO]["prs"][0]
+        self.assertEqual((r["path"], r["compute"]["complete"]), ("slow", False))
+
 
 class JobsSkippedHold(Base):
     """Findings of the review of the job-read switch."""
