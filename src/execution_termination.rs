@@ -552,7 +552,7 @@ fn stopped_snapshot(
                 }
             }
             ExactWorkerState::Running => {
-                last = "running".to_owned();
+                "running".clone_into(&mut last);
                 absent_in_a_row = 0;
             }
         }
