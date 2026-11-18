@@ -511,48 +511,22 @@ pub struct DwellRepoState {
 }
 
 /// One approved, required-green pull request the steward has not merged or
-/// queued.
+/// queued, keyed by pull request and head.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct StuckApproved {
-    /// The head it was first seen approved and green at.
+    /// The head it was first judged eligible at.
     pub head: String,
     /// The `blocked_on` token last seen: why the steward has not merged it.
     pub token: String,
-    /// The first pass that saw it approved and green at this head.
-    pub since: DateTime<Utc>,
+    /// The first pass that judged it approved, required-green, unmerged and
+    /// unqueued at this head. Never reset while it stays open at this head.
+    #[serde(alias = "since")]
+    pub first_eligible_at: DateTime<Utc>,
     /// Whether its alert was emitted, by an apply pass. One per head.
     pub alerted: bool,
-    /// The first pass, since it was last a candidate, that judged it and
-    /// found it not a candidate (queued, held, red, re-running its verdict).
-    #[serde(default)]
-    pub ineligible_since: Option<DateTime<Utc>>,
-    /// The latest such pass. The stretch is measured between the two judged
-    /// passes only; when it spans more than [`STUCK_GAP_MINUTES`] the clock
-    /// restarts.
-    #[serde(default)]
-    pub ineligible_last: Option<DateTime<Utc>>,
 }
 
-impl StuckApproved {
-    /// Minutes between the first and the last pass that judged it not a
-    /// candidate since it was last one; 0 when none did.
-    fn judged_stretch_minutes(&self) -> i64 {
-        match (self.ineligible_since, self.ineligible_last) {
-            (Some(first), Some(last)) => (last - first).num_minutes(),
-            _ => 0,
-        }
-    }
-}
-
-/// Longest stretch a pull request may be judged not a candidate at its head
-/// before its stuck clock restarts. A `review-verdict` re-run after a comment
-/// is a pass or two at the five-minute tick; a stretch in the queue, under a
-/// HOLD or with a red required check is not time spent stuck. Only passes
-/// that judged the pull request count: a deferred row or a missing pass is
-/// no evidence either way and neither advances nor breaks the clock.
-pub const STUCK_GAP_MINUTES: i64 = 15;
-
-/// One pull request this pass saw approved at its exact head with every
+/// One pull request this pass judged approved at its exact head with every
 /// required check green, and neither merged nor queued.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StuckCandidate {
@@ -571,35 +545,26 @@ pub struct StuckCandidate {
 /// and plan the alert of each one stuck past the
 /// [`DwellState::ApprovedStuck`] limit (60 minutes by default; 0 disables).
 ///
-/// The clock starts the first pass that sees a pull request as a candidate
-/// at its head. A stretch in which passes judged it not a candidate at the
-/// same head (queued, held, red, its verdict re-running) restarts the clock
-/// when it is a candidate again if the stretch lasted longer than
-/// [`STUCK_GAP_MINUTES`]; a shorter one keeps it. Rows in `deferred` (seen,
-/// not judged this pass) and passes that did not happen are no evidence and
-/// change nothing. The alert stays one per head either way. A new head
-/// starts over; a pull request this pass did not see at all (merged or
-/// closed) is dropped. `open` is every pull request this pass saw, with its
-/// head.
-/// A row past the limit escalates exactly once per head: `escalate` is true
-/// until [`mark_stuck_alerted`] records it, which only an apply pass does and
-/// only for rows that escalated within the per-pass cap. A pass that does not
-/// apply (a dry run, `shipyard wait`) never marks it, so it cannot use up the
-/// alert. Later passes still report the row (not escalating) while it stays
-/// stuck, so the relay can deliver an alert it missed; it deduplicates by
-/// state, head and level.
+/// Keyed on (pull request, head). `first_eligible_at` is set the first time a
+/// pass judges the pull request eligible at a head and is never reset while
+/// it stays open at that head, whatever later passes see (a verdict re-run,
+/// a deferred row, a missing tick, a stretch queued or held). It is dropped
+/// only on a new head, or when the pull request is no longer open (`open` is
+/// every pull request this pass saw, with its head).
+///
+/// A row is reported only on a pass that judges it eligible and whose age
+/// from `first_eligible_at` has reached the limit; it escalates exactly once
+/// per (pull request, head), marked by [`mark_stuck_alerted`] on an apply
+/// pass within the per-pass cap. Later eligible passes report it without
+/// escalating; a pass that does not judge it eligible reports nothing and
+/// changes nothing.
 pub fn track_stuck(
     state: &mut DwellRepoState,
     candidates: &[StuckCandidate],
     open: &BTreeMap<u64, String>,
-    deferred: &BTreeSet<u64>,
     policy: &DwellPolicy,
     now: DateTime<Utc>,
 ) -> Vec<Planned> {
-    let candidate_numbers: BTreeSet<u64> = candidates
-        .iter()
-        .map(|candidate| candidate.number)
-        .collect();
     let mut next: BTreeMap<u64, StuckApproved> = state
         .stuck_approved
         .iter()
@@ -607,72 +572,52 @@ pub fn track_stuck(
             open.get(number)
                 .is_some_and(|head| head.eq_ignore_ascii_case(&entry.head))
         })
-        .map(|(number, entry)| {
-            let mut entry = entry.clone();
-            // Judged this pass and not a candidate: evidence of a stretch.
-            if !candidate_numbers.contains(number) && !deferred.contains(number) {
-                entry.ineligible_since.get_or_insert(now);
-                entry.ineligible_last = Some(now);
-            }
-            (*number, entry)
-        })
+        .map(|(number, entry)| (*number, entry.clone()))
         .collect();
     for candidate in candidates {
-        let entry = match state.stuck_approved.get(&candidate.number) {
+        match next.get_mut(&candidate.number) {
             Some(entry) if entry.head.eq_ignore_ascii_case(&candidate.head) => {
-                let resumed = entry.judged_stretch_minutes() > STUCK_GAP_MINUTES;
-                StuckApproved {
-                    token: if candidate.placeholder_token {
-                        entry.token.clone()
-                    } else {
-                        candidate.token.clone()
-                    },
-                    since: if resumed { now } else { entry.since },
-                    ineligible_since: None,
-                    ineligible_last: None,
-                    ..entry.clone()
+                if !candidate.placeholder_token {
+                    entry.token.clone_from(&candidate.token);
                 }
             }
-            _ => StuckApproved {
-                head: candidate.head.clone(),
-                token: candidate.token.clone(),
-                since: now,
-                alerted: false,
-                ineligible_since: None,
-                ineligible_last: None,
-            },
-        };
-        next.insert(candidate.number, entry);
+            _ => {
+                next.insert(
+                    candidate.number,
+                    StuckApproved {
+                        head: candidate.head.clone(),
+                        token: candidate.token.clone(),
+                        first_eligible_at: now,
+                        alerted: false,
+                    },
+                );
+            }
+        }
     }
     let mut rows = Vec::new();
     if let Some(limit) = policy.limit(DwellState::ApprovedStuck) {
-        for (number, entry) in &next {
-            let candidate = candidate_numbers.contains(number);
-            // An alerted head stays reported (never escalating) through a
-            // deferred row or a short judged blip, so a reader of the tick
-            // does not see it clear and come back; a candidate is reported
-            // and escalates once.
-            let holds =
-                candidate || (entry.alerted && entry.judged_stretch_minutes() <= STUCK_GAP_MINUTES);
-            let age = (now - entry.since).num_minutes().max(0);
-            if !holds || age < i64::from(limit) {
+        for candidate in candidates {
+            let Some(entry) = next.get(&candidate.number) else {
+                continue;
+            };
+            let age = (now - entry.first_eligible_at).num_minutes().max(0);
+            if age < i64::from(limit) {
                 continue;
             }
-            let escalate = candidate && !entry.alerted;
             rows.push(Planned {
                 overdue: Overdue {
-                    number: *number,
+                    number: candidate.number,
                     state: DwellState::ApprovedStuck,
                     token: entry.token.clone(),
                     head: entry.head.clone(),
-                    entered_at: entry.since,
+                    entered_at: entry.first_eligible_at,
                     age_minutes: age,
                     limit_minutes: limit,
                     over_minutes: age - i64::from(limit),
                     level: 1,
                 },
                 act: Disposition::NoAct,
-                escalate,
+                escalate: !entry.alerted,
                 escalation_deferred: false,
             });
         }

@@ -253,6 +253,52 @@ class StuckApprovedTests(Base):
         self.assertIn("<!-- drain-watch:stuck_approved:acme/repo#69@h69 -->", issues[0]["body"])
 
 
+class StuckApprovedClearTests(StuckApprovedTests):
+    def filed(self, minutes=5):
+        self.stuck_tick(NOW, True)
+        self.run_once()
+        self.stuck_tick(NOW + dt.timedelta(minutes=minutes), True)
+        self.run_once(NOW + dt.timedelta(minutes=minutes))
+        self.assertEqual(len(self.store()["issues"]), 1)
+
+    def gone_tick(self, t):
+        body = {"repos": [{"repo": REPO, "prs": [{"number": 70, "head_sha": "h70", "blocked_on": "held", "since": None,
+                                                    "next_action": {"actor": "author", "action": "x", "stop": False}}],
+                           "errors": [], "dwell": {"overdue": []}}]}
+        (self.log / f"{REPO.replace('/', '_')}-{stamp(t)}.json").write_text(json.dumps(body))
+
+    def test_row_absence_with_the_pr_open_at_its_head_keeps_the_issue(self):
+        self.filed()
+        for m in range(10, 70, 5):
+            self.stuck_tick(NOW + dt.timedelta(minutes=m), False)
+            self.run_once(NOW + dt.timedelta(minutes=m))
+        self.assertEqual(self.store()["issues"][0]["state"], "open")
+        self.assertIn("stuck_approved:acme/repo#69@h69", self.state()["findings"])
+        # It comes back: no second announcement.
+        self.stuck_tick(NOW + dt.timedelta(minutes=70), True)
+        self.run_once(NOW + dt.timedelta(minutes=70))
+        self.assertEqual(len([l for l in self.summary() if "kind=stuck_approved" in l]), 1)
+
+    def test_a_stale_tick_keeps_the_issue(self):
+        self.filed()
+        for m in (40, 60, 90):
+            self.run_once(NOW + dt.timedelta(minutes=m))
+        self.assertEqual(self.store()["issues"][0]["state"], "open")
+
+    def test_merged_or_closed_clears_at_once(self):
+        self.filed()
+        self.gone_tick(NOW + dt.timedelta(minutes=10))
+        self.run_once(NOW + dt.timedelta(minutes=10))
+        self.assertEqual(self.store()["issues"][0]["state"], "closed")
+        self.assertNotIn("stuck_approved:acme/repo#69@h69", self.state()["findings"])
+
+    def test_a_new_head_clears_the_old_one_at_once(self):
+        self.filed()
+        self.stuck_tick(NOW + dt.timedelta(minutes=10), False, tick_head="h69new")
+        self.run_once(NOW + dt.timedelta(minutes=10))
+        self.assertEqual(self.store()["issues"][0]["state"], "closed")
+
+
 class TranscriptAndTimeTests(Base):
     def test_transcripts_are_not_scanned_but_runner_lines_are(self):
         (self.fleet / "repair.last-output.txt").write_text(

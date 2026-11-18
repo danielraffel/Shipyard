@@ -1678,3 +1678,49 @@ fn an_unmanaged_pull_request_never_alerts() {
     }
     assert_eq!(alerted, vec![3]);
 }
+
+/// Approved, required-green, managed pull requests that are deliberately
+/// parked (`owner-decision`, `superseded`, `PARKED/<platform>`), drafts, and
+/// queued ones never alert; the same pull request without any of those does.
+#[test]
+fn parked_draft_and_queued_pull_requests_never_alert() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut draft = pr(4, Some("SUCCESS"), Some("SUCCESS"), &[]);
+    draft.fact.draft = true;
+    let mut queued = pr(5, Some("SUCCESS"), Some("SUCCESS"), &[]);
+    queued.fact.queue_position = Some(0);
+    let prs = vec![
+        pr(1, Some("SUCCESS"), Some("SUCCESS"), &["owner-decision"]),
+        pr(2, Some("SUCCESS"), Some("SUCCESS"), &["superseded"]),
+        pr(3, Some("SUCCESS"), Some("SUCCESS"), &["PARKED/windows"]),
+        draft,
+        queued,
+        pr(6, Some("SUCCESS"), Some("SUCCESS"), &[]),
+    ];
+    let reports = vec![
+        report(1, "excluded_label:owner-decision", None),
+        report(2, "excluded_label:superseded", None),
+        report(3, "excluded_label:PARKED/windows", None),
+        report(4, "draft", None),
+        report(5, "queued", None),
+        report(6, "merge_state:UNSTABLE", None),
+    ];
+    let mut pass = pass(&temp, prs, reports);
+    let mut ledger = established();
+    let mut alerted = Vec::new();
+    for minute in (0..=65).step_by(5) {
+        pass.now = now() + chrono::Duration::minutes(minute);
+        let report = pass.run(&mut ledger, &FakeActs::default());
+        alerted.extend(
+            report
+                .overdue
+                .iter()
+                .filter(|row| {
+                    row.state == crate::merge_steward::dwell::DwellState::ApprovedStuck
+                        && row.escalated
+                })
+                .map(|row| row.pr),
+        );
+    }
+    assert_eq!(alerted, vec![6]);
+}

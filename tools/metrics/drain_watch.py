@@ -332,6 +332,24 @@ def check_merge_group_stalled(per_repo, now, sup=None):
     return out
 
 
+def stuck_key(repo, pr, head):
+    return f"stuck_approved:{repo}#{pr}@{(head or '?')[:12]}"
+
+
+def stuck_open(per_repo, now):
+    """(repos with a fresh valid tick, stuck keys of PRs open at that head in it). A
+    stuck_approved finding clears only on evidence: its PR gone from a fresh tick (merged
+    or closed) or at another head. Row absence alone, or a stale or failed tick, keeps it."""
+    repos, keys = set(), set()
+    for repo, ticks in per_repo.items():
+        t_last, rows = latest_valid(ticks)
+        if rows is None or now - t_last > dt.timedelta(minutes=30):
+            continue
+        repos.add(repo)
+        keys.update(stuck_key(repo, pr, o["head"]) for pr, o in rows.items())
+    return repos, keys
+
+
 def check_stuck_approved(per_repo, now):
     """PRs the steward's latest tick reports `approved_stuck`: approved at their exact head,
     every required check green, and not merged or queued past its bound. One finding per PR
@@ -348,7 +366,7 @@ def check_stuck_approved(per_repo, now):
                 continue
             head = st["head"] or rows[pr]["head"] or "?"
             reason = re.sub(r"[\s;]+", "_", st["blocked_on"])
-            out.append(dict(kind="stuck_approved", repo=repo, lane="-", key=f"stuck_approved:{repo}#{pr}@{head[:12]}",
+            out.append(dict(kind="stuck_approved", repo=repo, lane="-", key=stuck_key(repo, pr, head),
                             detail=f"#{pr} approved and required-green, unmerged {st['age']}m, blocked_on={reason}",
                             evidence=[f"{repo}#{pr} head {head} blocked_on {st['blocked_on']} since {st['entered']}"]))
     return out
@@ -569,6 +587,7 @@ def collect(a, now, state):
     f += check_stale_hold(per_repo, now, sup)
     f += check_merge_group_stalled(per_repo, now, sup)
     f += check_stuck_approved(per_repo, now)
+    state["_stuck_open"] = stuck_open(per_repo, now)
     f += check_stuck_claims(per_repo, a.runner_dir, now, sup)
     f += scan_logs(a.fleet_dir, state, a.from_start, now)
     f += check_launcher_fallback(a.summary, state, now)
@@ -636,14 +655,23 @@ def run(a, now=None, issues=None):
         except Exception as exc:
             st["pending"] = {k: f[k] for k in ("kind", "repo", "lane", "key", "detail", "evidence")}
             lines.append(f"{stamp} drain-watch ERROR issue {key}: {str(exc)[:100]}")
+    stuck_repos, stuck_keys = state.pop("_stuck_open", (set(), set()))
     for key in list(findings_state):
         if key in seen:
             continue
         st = findings_state[key]
+        stuck = key.startswith("stuck_approved:")
+        if stuck:
+            # Cleared only on evidence the PR merged, closed or moved: absent from a
+            # fresh tick of its repository, or there at another head. A missing row
+            # (the steward not judging it eligible this pass) or a stale tick keeps it.
+            repo = key[len("stuck_approved:"):].rsplit("#", 1)[0]
+            if repo not in stuck_repos or key in stuck_keys:
+                continue
         st["absent"] = st.get("absent", 0) + 1
         if st.get("pending") and not st.get("issue"):
             continue  # no issue could be filed yet: keep it until one is
-        if st["absent"] >= CLEAR_RUNS:
+        if stuck or st["absent"] >= CLEAR_RUNS:
             if st.get("issue"):
                 if a.dry_run:
                     actions.append(f"would close issue #{st['issue']} for {key}")

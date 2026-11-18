@@ -1010,39 +1010,36 @@ relayed. The GitHub-writing acts ship in `shadow`: they are reported as
 `would_act` and escalate until the base sets `act = "apply"`.
 
 **Approved but stuck** (`approved_stuck`). Beside the token states, every pass
-tracks each pull request the steward manages (the managed label or the
-`shipyard-local` App's own pull requests; an unmanaged one is not the
-steward's to merge, and the census does not read its checks; nor does it read
-the checks of a conflicting pull request without the managed label, which the
-`dirty` state already escalates to its author) that is approved at its exact
-head (its newest
-`review-verdict` check run or status is green, with no newer refusing status)
-with every
-required check green, and that the pass neither merged nor queued, whatever its
-`blocked_on` (`merge_state:UNSTABLE`, an excluded label, an unknown merge
-state, ...). Drafts and queued pull requests are not tracked: the queue owns
-them. The clock starts the first pass that sees it so at its head. A stretch
-in which passes judged it not a candidate at that head (queued, held, a red
-required check, its verdict re-running after a comment) restarts the clock
-when it is a candidate again if the first and last judged passes of the
-stretch are more than 15 minutes apart; a shorter one keeps it. Once alerted,
-the row stays reported (not escalating) through a deferred pass or a short
-blip, so drain watch does not see it clear and come back. A row the pass budget or a rate limit deferred is judged from the census
-facts it carries (the alert keeps the last real `blocked_on`, not
-`deferred_pass_budget`), and a tick that did not run changes nothing, so a
-degraded steward cannot keep the alarm silent. It restarts at a new head and is dropped once the pull
-request is no longer seen. The alert is one per head either way, and a row the
-per-pass escalation cap defers is neither marked nor relayed. Past the limit (60
-minutes; `0` turns it off) the pass reports one `approved_stuck` overdue row
-naming the `blocked_on`, routed to the author. It escalates exactly once per
-head, and only an `--apply` pass marks it, so a dry run (`shipyard wait`)
-never uses up the alert. Later passes keep reporting the row, not escalating,
-until the pull request merges, moves or stops being approved and green. It
-reaches people three ways: the overdue feed (once), `shipyard relay` to the
+judges each pull request the steward manages (the managed label or the
+`shipyard-local` App's own pull requests): it is *eligible* when it is approved
+at its exact head (its newest `review-verdict` check run or status is
+`SUCCESS`, with no newer refusing status), every required check is green, and
+it is neither merged nor queued by that pass, whatever its `blocked_on`
+(`merge_state:UNSTABLE`, an unknown merge state, ...). Out of scope: an
+unmanaged pull request (not the steward's to merge; the census does not read
+its checks), a conflicting one without the managed label (the `dirty` state
+escalates it), drafts, queued pull requests (the queue owns them), and ones
+deliberately parked with a hold label the pipeline skips (`owner-decision`,
+`superseded`, `PARKED/<platform>`). A row the pass budget deferred is judged
+from the census facts it carries.
+
+Everything is keyed on (pull request, head). The first pass that judges it
+eligible at a head records `first_eligible_at`, which is never reset while it
+stays open at that head: a verdict re-run, a deferred row, a missing tick or a
+stretch queued or held changes nothing. It is dropped only on a new head or
+once the pull request is no longer open. A pass that judges it eligible
+`approved_stuck` minutes (60; `0` turns it off) or more after
+`first_eligible_at` reports one overdue row naming the `blocked_on`, routed to
+the author; it escalates exactly **once per (pull request, head)**, so a second
+stuck episode at the same head does not alert again. Only an `--apply` pass
+marks it, within the per-pass escalation cap, so a dry run (`shipyard wait`)
+never uses it up. Later eligible passes keep reporting it without escalating.
+It reaches people three ways: the overdue feed (once); `shipyard relay` to the
 owning session, or to the repository's lead for an unowned pull request (event
-`overdue`, naming the reason; the reason is not part of the dedup key), and
-drain watch (`stuck_approved`, see `docs/drain-watch.md`), which writes one
-`summary.log` line and then files one deduplicated issue.
+`overdue`, naming the reason, which is not part of the dedup key); and drain
+watch (`stuck_approved`, see `docs/drain-watch.md`), which writes one
+`summary.log` line, files one issue, and closes it only when the pull request
+merges, closes or moves to a new head.
 
 No act arms, enqueues, merges, updates a branch or approves; the act interface
 has no method that could.

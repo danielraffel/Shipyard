@@ -410,19 +410,10 @@ pub(super) fn run(
         .iter()
         .map(|report| (report.number, report.head_sha.clone()))
         .collect();
-    // A row the pass budget deferred is still judged: candidacy reads the
-    // census facts, which a deferred row has. Only a row with no token at
-    // all was not seen well enough to judge.
-    let deferred: BTreeSet<u64> = reports
-        .iter()
-        .filter(|report| report.blocked.blocked_on.is_empty())
-        .map(|report| report.number)
-        .collect();
     let mut stuck = dwell::track_stuck(
         &mut state,
         &stuck_candidates(input, reports),
         &open,
-        &deferred,
         input.dwell_policy,
         input.now,
     );
@@ -528,8 +519,10 @@ fn sightings(reports: &[PrReport], stacked: &[OpenPr]) -> (Vec<Sighting>, BTreeS
 ///
 /// Approved is [`approved_at_head`]. Only pull requests the steward manages
 /// are candidates: an unmanaged one (no managed label, no handoff) is not the
-/// steward's to merge. A draft, a queued pull request (the queue owns it),
-/// and one this pass merged or enqueued are not candidates either. A row the
+/// steward's to merge. Nor are a draft, a queued pull request (the queue owns
+/// it), one carrying a hold label the pipeline skips (`owner-decision`,
+/// `superseded`, `PARKED/<platform>`: deliberately parked), or one this pass
+/// merged or enqueued. A row the
 /// pass budget deferred is judged like any other, from the census facts it
 /// carries, so a degraded steward that defers it every pass cannot keep the
 /// alarm silent; its `deferred_pass_budget` token is a placeholder, so the
@@ -566,6 +559,7 @@ fn stuck_candidates(input: &DwellInput<'_>, reports: &[PrReport]) -> Vec<dwell::
             (approved_at_head(pr, policy)
                 && !pr.draft
                 && pr.queue_position.is_none()
+                && crate::merge_steward::excluded_admission_label(&pr.labels).is_none()
                 && pr.head_sha.eq_ignore_ascii_case(&report.head_sha)
                 && crate::merge_steward::required_checks_all_succeeded(pr, policy))
             .then(|| dwell::StuckCandidate {
