@@ -659,6 +659,13 @@ fn recovery_cleared_pr_json() -> String {
 /// written its success recovery status, and reports `cleared_merge_state`
 /// as the merge state from then on.
 fn run_recovery_clear_pass(cleared_merge_state: &str) -> (PrReport, String) {
+    run_recovery_clear_pass_under(cleared_merge_state, &no_queue_policy(required(true)))
+}
+
+fn run_recovery_clear_pass_under(
+    cleared_merge_state: &str,
+    policy: &StewardPolicy,
+) -> (PrReport, String) {
     let temp = tempfile::tempdir().expect("temp");
     let log = temp.path().join("calls");
     let marker = temp.path().join("recovery-cleared");
@@ -723,7 +730,7 @@ fn run_recovery_clear_pass(cleared_merge_state: &str) -> (PrReport, String) {
         &actions,
         &args,
         &observation,
-        &no_queue_policy(required(true)),
+        policy,
         &temp.path().join("ledger.json"),
         &mut ledger,
         Some(&control),
@@ -754,9 +761,9 @@ fn clearing_a_stale_recovery_signal_merges_the_ready_head_in_the_same_pass() {
     assert_eq!(calls.matches("mergePullRequest(").count(), 1, "{calls}");
 }
 
-/// When GitHub still reports UNSTABLE after the clear, the pass merges
-/// nothing: the re-read is a live classification, not a waiver of the
-/// CLEAN requirement.
+/// When GitHub still reports UNSTABLE after the clear and the base's
+/// `unstable_blocking_checks` list is unknown, the pass merges nothing: the
+/// re-read is a live classification, not a waiver of the CLEAN requirement.
 #[cfg(unix)]
 #[test]
 fn a_head_still_unstable_after_the_clear_waits_for_the_next_pass() {
@@ -777,4 +784,279 @@ fn a_head_still_unstable_after_the_clear_waits_for_the_next_pass() {
         ledger: StewardLedger::default(),
         temp: tempfile::tempdir().expect("temp"),
     });
+}
+
+/// A no-queue policy as the steward reads it from a base config: `listed` is
+/// `[auto_merge] unstable_blocking_checks`, `None` when unknown.
+fn unstable_policy(listed: Option<&[&str]>) -> StewardPolicy {
+    let mut policy = no_queue_policy(required(true));
+    policy.ejection_guards.unstable_blocking_checks =
+        listed.map(|names| names.iter().map(|name| (*name).to_owned()).collect());
+    policy
+}
+
+/// The approved head as GitHub reports it `UNSTABLE`: `extra` rollup rows
+/// (checks no rule requires) appended, and the required `macos` check
+/// concluding `macos`.
+fn unstable_pr_json(macos: &str, extra: &[(&str, &str)]) -> String {
+    use std::fmt::Write as _;
+    let rows = extra
+        .iter()
+        .enumerate()
+        .fold(String::new(), |mut rows, (index, (name, conclusion))| {
+            let _ = write!(
+                rows,
+                r#",{{"__typename":"CheckRun","name":"{name}","status":"COMPLETED","conclusion":"{conclusion}","completedAt":"2026-10-30T00:00:30Z","detailsUrl":"https://github.com/owner/repo/actions/runs/{}"}}"#,
+                300 + index
+            );
+            rows
+        });
+    pr_json_with_status(HEAD, true, false, None)
+        .replace(
+            r#""mergeStateStatus":"CLEAN""#,
+            r#""mergeStateStatus":"UNSTABLE""#,
+        )
+        .replace(
+            r#""conclusion":"SUCCESS","completedAt":"2026-10-30T00:00:00Z""#,
+            &format!(r#""conclusion":"{macos}","completedAt":"2026-10-30T00:00:00Z""#),
+        )
+        .replace("]}", &format!("{rows}]}}"))
+}
+
+/// One steward pass (classify the census row, then mutate) over a head the
+/// census and the final live read both report as `census` and `live`.
+fn run_unstable(policy: &StewardPolicy, census: &str, live: &str) -> Outcome {
+    let temp = tempfile::tempdir().expect("temp");
+    let log = temp.path().join("calls");
+    let base = Fixture::approved_clean().script(&log);
+    let live_line = format!(
+        r#"  "pr view "*) printf '%s' '{}' ;;"#,
+        pr_json_with_status(HEAD, true, false, None)
+    );
+    assert!(base.contains(&live_line), "fixture shape changed");
+    let script = base.replace(
+        &live_line,
+        &format!(r#"  "pr view "*) printf '%s' '{live}' ;;"#),
+    );
+    let actions = fake_gh(&temp, &script);
+    let mut pr = parse_pr(
+        &serde_json::from_str(census).expect("PR json"),
+        &BTreeMap::new(),
+    )
+    .expect("PR");
+    pr.fact.checks.push(
+        crate::app::merge_steward_cmd::observation::parse_rest_check(
+            &serde_json::from_str(&rest_check_run(true)).expect("check run"),
+        )
+        .expect("check run"),
+    );
+    let observation = observation(pr.clone());
+    let mut ledger = StewardLedger::default();
+    let control = mutation_control(&temp, "studio", "studio");
+    let ledger_path = temp.path().join("ledger.json");
+    let context = mutation_apply_context(&actions, &observation, &ledger_path, &control);
+    let decision = classify_pr(&pr.fact, policy, &BTreeMap::new());
+    let (mutation, error) = mutate_pr(&context, &pr, policy, &decision, &mut ledger);
+    let calls = fs::read_to_string(log).unwrap_or_default();
+    Outcome {
+        decision,
+        mutation,
+        error,
+        calls,
+        ledger,
+        temp,
+    }
+}
+
+fn assert_merged(outcome: &Outcome) {
+    assert_eq!(
+        outcome.decision,
+        StewardDecision::ArmMergeQueue,
+        "{}",
+        outcome.calls
+    );
+    assert!(
+        outcome.error.is_none(),
+        "{:?}\n{}",
+        outcome.error,
+        outcome.calls
+    );
+    assert_eq!(outcome.calls.matches("mergePullRequest(").count(), 1);
+    assert!(
+        outcome.calls.contains(&format!("head={HEAD}")),
+        "{}",
+        outcome.calls
+    );
+}
+
+/// GitHub reports UNSTABLE because only a report-only check is red; every
+/// required check is green and the head is approved, so the steward merges
+/// it by exact head and names the red check it did not gate on.
+#[cfg(unix)]
+#[test]
+fn unstable_head_red_only_in_a_report_only_check_is_merged() {
+    let json = unstable_pr_json("SUCCESS", &[("zizmor (report only)", "FAILURE")]);
+    let outcome = run_unstable(&unstable_policy(Some(&[])), &json, &json);
+    assert_merged(&outcome);
+    assert_eq!(
+        outcome.mutation,
+        Some(format!(
+            "merged_exact_head:{HEAD},non_required_red:zizmor (report only)"
+        ))
+    );
+}
+
+/// A check the base lists in `unstable_blocking_checks` holds an UNSTABLE
+/// head while it is red; the same head merges when the list does not name it.
+#[cfg(unix)]
+#[test]
+fn unstable_head_with_a_red_listed_check_is_not_merged() {
+    let json = unstable_pr_json(
+        "SUCCESS",
+        &[
+            ("risk-tier", "FAILURE"),
+            ("zizmor (report only)", "FAILURE"),
+        ],
+    );
+    // Control: unlisted, it is not a gate.
+    assert_merged(&run_unstable(
+        &unstable_policy(Some(&["other-check"])),
+        &json,
+        &json,
+    ));
+
+    let held = run_unstable(&unstable_policy(Some(&["Risk-Tier"])), &json, &json);
+    assert_eq!(
+        held.decision,
+        StewardDecision::WaitingRequired {
+            contexts: vec![
+                "github-merge-state:CLEAN (current=UNSTABLE)".to_owned(),
+                "Risk-Tier (unstable_blocking_checks)".to_owned(),
+            ]
+        }
+    );
+    assert_no_write(&held);
+
+    // Listed, but green at the head while another check is red: merges.
+    let green = unstable_pr_json(
+        "SUCCESS",
+        &[
+            ("risk-tier", "SUCCESS"),
+            ("zizmor (report only)", "FAILURE"),
+        ],
+    );
+    assert_merged(&run_unstable(
+        &unstable_policy(Some(&["risk-tier"])),
+        &green,
+        &green,
+    ));
+
+    // The census was green, but the final live read finds the listed check
+    // red: the merge is refused under the guard.
+    let raced = run_unstable(&unstable_policy(Some(&["risk-tier"])), &green, &json);
+    assert_eq!(raced.decision, StewardDecision::ArmMergeQueue);
+    assert_no_write(&raced);
+}
+
+/// A red required check never lands, UNSTABLE or not, whether the census or
+/// only the final live read sees it; the same UNSTABLE head with that check
+/// green merges.
+#[cfg(unix)]
+#[test]
+fn unstable_head_with_a_red_required_check_is_never_merged() {
+    let policy = unstable_policy(Some(&[]));
+    let green = unstable_pr_json("SUCCESS", &[("zizmor (report only)", "FAILURE")]);
+    let red = unstable_pr_json("FAILURE", &[("zizmor (report only)", "FAILURE")]);
+    // Control.
+    assert_merged(&run_unstable(&policy, &green, &green));
+
+    let census_red = run_unstable(&policy, &red, &red);
+    assert!(
+        matches!(&census_red.decision, StewardDecision::RequiredFailed { contexts }
+            if contexts == &vec!["macos".to_owned()]),
+        "{:?}",
+        census_red.decision
+    );
+    assert_no_write(&census_red);
+
+    let live_red = run_unstable(&policy, &green, &red);
+    assert_eq!(live_red.decision, StewardDecision::ArmMergeQueue);
+    assert_no_write(&live_red);
+
+    // A required check still running is BLOCKED on GitHub, and waits here.
+    let pending = pr_json_with_status(HEAD, true, false, None).replace(
+        r#""mergeStateStatus":"CLEAN""#,
+        r#""mergeStateStatus":"BLOCKED""#,
+    );
+    let blocked = run_unstable(&policy, &pending, &pending);
+    assert!(
+        matches!(&blocked.decision, StewardDecision::WaitingRequired { contexts }
+            if contexts == &vec!["github-merge-state:CLEAN (current=BLOCKED)".to_owned()]),
+        "{:?}",
+        blocked.decision
+    );
+    assert_no_write(&blocked);
+}
+
+/// When the base config could not be read (or its list is malformed), the
+/// list is unknown and only CLEAN is admitted; the same head merges once the
+/// list is known.
+#[cfg(unix)]
+#[test]
+fn unstable_head_is_held_when_the_blocking_list_is_unknown() {
+    let json = unstable_pr_json("SUCCESS", &[("zizmor (report only)", "FAILURE")]);
+    let held = run_unstable(&unstable_policy(None), &json, &json);
+    assert_eq!(
+        held.decision,
+        StewardDecision::WaitingRequired {
+            contexts: vec!["github-merge-state:CLEAN (current=UNSTABLE)".to_owned()]
+        }
+    );
+    assert_no_write(&held);
+    assert_merged(&run_unstable(&unstable_policy(Some(&[])), &json, &json));
+}
+
+/// The steward's own failed recovery status always holds an UNSTABLE head
+/// with the bare merge-state wait, so the clear-then-reclassify path still
+/// owns it.
+#[test]
+fn the_stewards_own_red_recovery_status_holds_an_unstable_head() {
+    let pr = parse_pr(
+        &serde_json::from_str(&recovery_flagged_pr_json()).expect("PR json"),
+        &BTreeMap::new(),
+    )
+    .expect("PR");
+    let mut fact = pr.fact;
+    fact.checks.push(
+        crate::app::merge_steward_cmd::observation::parse_rest_check(
+            &serde_json::from_str(&rest_check_run(true)).expect("check run"),
+        )
+        .expect("check run"),
+    );
+    assert_eq!(
+        classify_pr(&fact, &unstable_policy(Some(&[])), &BTreeMap::new()),
+        StewardDecision::WaitingRequired {
+            contexts: vec![UNSTABLE_WAIT.to_owned()]
+        }
+    );
+}
+
+const UNSTABLE_WAIT: &str = "github-merge-state:CLEAN (current=UNSTABLE)";
+
+/// With the list known, a head GitHub still reports UNSTABLE after the clear
+/// (nothing it requires is red) merges in the same pass.
+#[cfg(unix)]
+#[test]
+fn a_head_still_unstable_after_the_clear_merges_when_the_list_is_known() {
+    let (report, calls) = run_recovery_clear_pass_under("UNSTABLE", &unstable_policy(Some(&[])));
+    assert!(report.error.is_none(), "{report:?}\n{calls}");
+    assert_eq!(report.decision, StewardDecision::ArmMergeQueue, "{calls}");
+    assert_eq!(
+        report.mutation,
+        Some(format!("needs_agent_cleared,merged_exact_head:{HEAD}")),
+        "{calls}"
+    );
+    let clear = calls.find("state=success").expect("recovery clear");
+    let merge = calls.find("mergePullRequest(").expect("merge");
+    assert!(clear < merge, "{calls}");
 }

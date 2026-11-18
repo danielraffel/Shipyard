@@ -5,8 +5,10 @@
 //! path. When such a base still has a GitHub-enforced required-check set that
 //! includes an app-bound exact-head approval context (`review-verdict` by
 //! default), the steward merges an approved head itself: only when GitHub
-//! reports it `CLEAN`, every required check is green, and the steward's own
-//! exact-head approval gate returns `Approved` (never `NotRequired`). The
+//! reports it `CLEAN` (or `UNSTABLE`, red only in checks that are not required;
+//! see [`crate::merge_steward::merge_state_wait`]), every required check is
+//! green, and the steward's own exact-head approval gate returns `Approved`
+//! (never `NotRequired`). The
 //! mutation is `mergePullRequest` bound by `expectedHeadOid`, through the
 //! ordinary `gh` path so the `ghapp` merge guard judges it, and GitHub still
 //! refuses the merge of any head whose approval context or CI has not passed.
@@ -285,7 +287,7 @@ pub(super) fn merge_exact_head(
             );
         }
     };
-    if !(live.fact.merge_state.eq_ignore_ascii_case("CLEAN")
+    if !(crate::merge_steward::merge_state_wait(&live.fact, policy).is_none()
         && crate::merge_steward::required_checks_all_succeeded(&live.fact, policy)
         && crate::merge_steward::approval_status_agrees(&live.fact, policy))
     {
@@ -324,10 +326,25 @@ pub(super) fn merge_exact_head(
                 &format!("pr:{}:{head}", pr.fact.number),
                 "merge_exact_head_server_enforced",
             );
+            // A merge over red checks that are not required says which, so
+            // the tick summary shows what was not a gate.
+            let red = crate::merge_steward::non_required_red(&live.fact, policy);
+            let merged = if red.is_empty() {
+                format!("merged_exact_head:{head}")
+            } else {
+                let names = red
+                    .iter()
+                    .map(|name| name.replace([',', ';', '|'], "_"))
+                    .collect::<Vec<_>>();
+                format!(
+                    "merged_exact_head:{head},non_required_red:{}",
+                    names.join("|")
+                )
+            };
             finish(
                 guard,
                 "merged_exact_head",
-                Some(join(mutation, &format!("merged_exact_head:{head}"))),
+                Some(join(mutation, &merged)),
                 None,
             )
         }

@@ -171,8 +171,10 @@ impl StewardPolicy {
     /// required-check set that includes the approval context, with that rule
     /// bound to an app (`integration_id`): an unbound rule is satisfied by any
     /// actor that can post a status of that name. The steward then merges
-    /// with `mergePullRequest` bound by `expectedHeadOid`, only an approved,
-    /// `CLEAN`, all-green head, and GitHub refuses the merge of any head whose
+    /// with `mergePullRequest` bound by `expectedHeadOid`, only an approved
+    /// head whose required checks are all green and whose merge state
+    /// [`merge_state_wait`] admits (`CLEAN`, or `UNSTABLE` red only outside
+    /// the required set), and GitHub refuses the merge of any head whose
     /// approval context or CI has not passed. It never arms auto-merge here:
     /// an armed request survives a later push by anyone with write access.
     /// Anything less stays refused, with no merge at all.
@@ -443,10 +445,10 @@ pub fn classify_pr(
             run_ids: transient_runs.into_iter().collect(),
         };
     }
-    if !policy.merge_queue && merge_state != "CLEAN" {
-        return StewardDecision::WaitingRequired {
-            contexts: vec![format!("github-merge-state:CLEAN (current={merge_state})")],
-        };
+    if !policy.merge_queue
+        && let Some(contexts) = merge_state_wait(pr, policy)
+    {
+        return StewardDecision::WaitingRequired { contexts };
     }
     if policy.merge_queue || policy.server_enforced_exact_head_merge() {
         // The exact-head enqueue mutation is idempotent from the steward's
@@ -459,6 +461,109 @@ pub fn classify_pr(
             reasons: vec![DirectMergeRefusal::ValidatedBaseRevisionNotAtomic],
         }
     }
+}
+
+/// The status context the steward posts on a head it hands to a recovery
+/// agent: `failure` while the head needs an agent, `success` once cleared.
+pub const STEWARD_RECOVERY_CONTEXT: &str = "shipyard/steward-recovery";
+
+/// Whether GitHub's merge state lets a base with no merge queue merge `pr`:
+/// `None` when it does, else the contexts the head waits on.
+///
+/// `CLEAN` admits. `UNSTABLE` means GitHub has every required rule satisfied
+/// (an unmet one is `BLOCKED`) and only checks that are not required are red
+/// or pending; it admits too, unless the steward's own recovery status
+/// ([`STEWARD_RECOVERY_CONTEXT`]) or a check the base lists in `[auto_merge]
+/// unstable_blocking_checks` is red or pending at the head, or that list is
+/// unknown (`None`: the config was unreadable or malformed). Every other
+/// state waits. This decides nothing about required checks or approval: the
+/// caller has already checked those against the live ruleset, and does so
+/// again on the final live read before the merge.
+///
+/// The first context is always `github-merge-state:CLEAN (current=<STATE>)`,
+/// which `blocked_on` reports as `merge_state:<STATE>`; a listed check that
+/// holds the head follows it.
+#[must_use]
+pub fn merge_state_wait(pr: &StewardPullRequest, policy: &StewardPolicy) -> Option<Vec<String>> {
+    let merge_state = pr.merge_state.to_ascii_uppercase();
+    if merge_state == "CLEAN" {
+        return None;
+    }
+    let wait = vec![format!("github-merge-state:CLEAN (current={merge_state})")];
+    if merge_state != "UNSTABLE" {
+        return Some(wait);
+    }
+    let Some(listed) = policy.ejection_guards.unstable_blocking_checks.as_ref() else {
+        return Some(wait);
+    };
+    if !newest_named_is_green(&pr.checks, STEWARD_RECOVERY_CONTEXT) {
+        return Some(wait);
+    }
+    let mut holding = listed
+        .iter()
+        .filter(|name| !newest_named_is_green(&pr.checks, name))
+        .map(|name| format!("{name} (unstable_blocking_checks)"))
+        .collect::<Vec<_>>();
+    if holding.is_empty() {
+        return None;
+    }
+    holding.sort();
+    holding.dedup();
+    Some(wait.into_iter().chain(holding).collect())
+}
+
+/// Whether the newest observation named `name` on this head is green, or
+/// there is none.
+fn newest_named_is_green(checks: &[StewardCheck], name: &str) -> bool {
+    checks
+        .iter()
+        .filter(|check| check.name.eq_ignore_ascii_case(name.trim()))
+        .max_by(|left, right| cmp_recency(left, right))
+        .is_none_or(check_is_green)
+}
+
+fn check_is_green(check: &StewardCheck) -> bool {
+    check.status.eq_ignore_ascii_case("COMPLETED")
+        && matches!(
+            check
+                .conclusion
+                .as_deref()
+                .unwrap_or_default()
+                .to_ascii_uppercase()
+                .as_str(),
+            "SUCCESS" | "NEUTRAL" | "SKIPPED"
+        )
+}
+
+/// Names of checks no required rule selects whose newest observation on this
+/// head is a terminal failure, sorted. Reported on an `UNSTABLE` merge, never
+/// a gate.
+#[must_use]
+pub fn non_required_red(pr: &StewardPullRequest, policy: &StewardPolicy) -> Vec<String> {
+    let selected = policy
+        .required_checks
+        .iter()
+        .filter_map(|rule| selected_required_check(&pr.checks, rule))
+        .map(|check| check.name.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    let names = pr
+        .checks
+        .iter()
+        .map(|check| check.name.clone())
+        .filter(|name| !selected.contains(&name.to_ascii_lowercase()))
+        .collect::<BTreeSet<_>>();
+    names
+        .into_iter()
+        .filter(|name| {
+            pr.checks
+                .iter()
+                .filter(|check| check.name.eq_ignore_ascii_case(name))
+                .max_by(|left, right| cmp_recency(left, right))
+                .is_some_and(|check| {
+                    check.status.eq_ignore_ascii_case("COMPLETED") && !check_is_green(check)
+                })
+        })
+        .collect()
 }
 
 /// Required contexts whose newest observation on this head is a terminal

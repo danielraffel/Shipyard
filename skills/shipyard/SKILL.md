@@ -1086,8 +1086,8 @@ checks and a reviewer's exact-head APPROVE; the run on its merge is a no-op.
 The bump commit also carries `Skill-Update: skip` (and `Doc-Update: skip`)
 trailers, computed from `skill_path_map.json` / `doc_sync_map.json` for the
 files it edited, because the skill map claims `Cargo.toml` and
-`.claude-plugin/**` and the sync gate otherwise leaves the bump pull request
-non-CLEAN (the steward admits only CLEAN). A kept bump head that lacks a
+`.claude-plugin/**` and the sync gate otherwise fails on the bump pull
+request. A kept bump head that lacks a
 currently required trailer is treated as stale and rebuilt on the next run;
 dispatch `version-at-land.yml` by hand to force that without waiting for a
 landing.
@@ -1097,8 +1097,8 @@ On a base without a merge queue the steward's own failed
 GitHub reports the head UNSTABLE and the steward waits on
 `github-merge-state:CLEAN (current=UNSTABLE)` even after every required check
 is green. A pass that clears that signal re-reads the exact head and admits it
-in the same pass when it is now CLEAN and ready; a head GitHub still reports
-UNSTABLE waits for the next pass. Do not post a success
+in the same pass when it is now ready (CLEAN, or UNSTABLE under the rule
+below). Do not post a success
 `shipyard/steward-recovery` status by hand to hurry it: the steward clears it
 under its recovery-clear fence.
 
@@ -3781,9 +3781,20 @@ that includes the approval context (`--approval-context`, default
 unbound rule leaves the base `direct_merge_refused_server_enforcement_required`.
 There the steward merges an owned head with `mergePullRequest`
 (`expectedHeadOid` = that head, `MERGE`) through the ordinary `gh`/`ghapp` path,
-only when GitHub reports it `CLEAN`, every required check is green, and the
-exact-head approval gate returns `Approved` (`NotRequired` is refused). Per-PR
-mutations are `merged_exact_head:<sha>`, `waiting_head_approval`, and
+only when every required check (from the live ruleset) is green at that head,
+the exact-head approval gate returns `Approved` (`NotRequired` is refused), and
+GitHub reports it `CLEAN` or `UNSTABLE`. `UNSTABLE` means only checks that are
+not required are red or pending (an unmet required rule is `BLOCKED`), so such
+a head merges like a `CLEAN` one unless the steward's own
+`shipyard/steward-recovery` status is red, or a check the base lists in
+`.shipyard/config.toml` `[auto_merge] unstable_blocking_checks = ["risk-tier"]`
+(default empty; exact names, any case) is red or pending at the head. A listed
+check that never ran does not hold it. A base config that cannot be read, or a
+list that is not an array of check names, admits only `CLEAN`. A head held
+this way reports `merge_state:UNSTABLE`. Per-PR mutations are
+`merged_exact_head:<sha>` (followed by `,non_required_red:<a>|<b>` when it
+merged over red checks that are not required; the tick summary line shows
+them as `non_required_red=#<n>:<a>|<b>`), `waiting_head_approval`, and
 `waiting_required`. It never arms native auto-merge on such a base, because an
 armed request survives a later push by anyone with write access; any armed
 request on an owned PR is disarmed (`auto_merge_disabled:<sha>`) on every
