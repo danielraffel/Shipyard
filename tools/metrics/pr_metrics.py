@@ -59,7 +59,7 @@ ESCAPE_WINDOW = dt.timedelta(days=14)
 HORIZON = dt.timedelta(hours=48)
 MIN_SAMPLE = 50
 UNKNOWN_RANGE_SHARE = 0.20
-SCORECARD_VERSION = "2026-11-17.2"  # .2: correctness reads the first-parent next push and the newest run by id; main-red episodes
+SCORECARD_VERSION = "2026-11-18.2"  # .2: correctness reads the first-parent next push and the newest run by id; main-red episodes
 MERGE_MAIN_RE = re.compile(r"^Merge (remote-tracking )?branch '?(origin/)?(main|master)'?|^Merge pull request .* from .*/main", re.I)
 # Positive controls: a real revert (#124 reverted #119), a real escaped defect (#126 names #116).
 # Pulp: two escapes verified by hand from main-red traces. #12219 landed red on Workflow lint and
@@ -240,10 +240,12 @@ MERGE_REMOVAL_WINDOW = dt.timedelta(minutes=2)
 def ejection(e, merged):
     """Whether a timeline event is a removal from the merge queue that is an ejection. The REST event names no reason, and GitHub
     records a removal when a PR merges, so a removal within two minutes before the merge is the merge, not an ejection (the
-    rule the m3 fleet-metrics parser uses); one that says `merged` is the merge too, and a removal after the merge cannot be an
+    rule the m3 fleet-metrics parser uses, applied only when no reason is given); one that says `merged` is the merge too, and a removal after the merge cannot be an
     ejection of the merged PR."""
     if e.get("event") not in ("removed_from_merge_queue", "dequeued") or (e.get("reason") or "unknown") in ("merged", "already_merged"):
         return False
+    if (e.get("reason") or "unknown") != "unknown":  # an explicit non-merge reason (failed_checks, ...) is an ejection wherever it falls
+        return True
     t, m = iso(e.get("created_at")), iso(merged)
     return not (t and m and m - t <= MERGE_REMOVAL_WINDOW)
 
@@ -746,7 +748,8 @@ def pr_compute(rd, f, runs, runs_complete):
             sh += a
             ho += b
             mac += m
-            wait += w
+            if r.get("event") != "push" or r.get("head_sha") in heads:  # a push to the base on the merge-group sha runs after the merge and cannot have delayed it
+                wait += w
         else:
             timing_complete = False
         # The Actions run list exposes only the latest conclusion for a rerun. A successful latest attempt
