@@ -47,7 +47,7 @@ CASES = [
     {"n": 5, "name": "escaped", "delay": 75, "north": "autonomous", "escaped_by": 6},
     {"n": 6, "name": "later_fix", "delay": 120, "north": "autonomous", "title": "fix regression from #5"},
     {"n": 7, "name": "held_twice", "delay": 150, "north": "autonomous", "holds": 2, "re_holds": 1,
-     "pushes": {"author": 1, "repair": 1, "merge_main": 1}, "slow": True, "cause_min": {"hold": None}},
+     "pushes": {"author": 1, "repair": 1, "merge_main": 1}, "slow": True, "cause_min": {"hold": 20}, "rounds_after_hold": [1, 1]},
     {"n": 8, "name": "queued_twice", "delay": 85, "north": "autonomous", "enqueues": 2, "ejections": ["ci_failure"], "enq_to_merge": 45, "slow": True, "cause_min": {"queue": 55}},
     {"n": 9, "name": "compute", "delay": 95, "north": "autonomous", "runs": 4, "repeat_runs": 2, "macos_min": 10, "slow": True, "cause_min": {"red": 83, "runner": 6},  # red: run 101 failed at 10:12 and no push followed, so 83 min to the 11:35 merge; three runs that can precede the merge wait 2 min each; the push on the merge-group sha runs after it
      "workflows": {"ci": {"pull_request": 2, "merge_group": 1, "push": 1}}},
@@ -100,7 +100,8 @@ def raw_world():
         if c.get("holds"):
             tl += [{"event": "commented", "user": {"login": "reviewer[bot]"}, "created_at": _t("10:20"), "body": "HOLD: fix this"},
                    {"event": "commented", "user": {"login": "reviewer[bot]"}, "created_at": _t("10:40"), "body": "HOLD: still broken"},
-                   {"event": "committed", "sha": _sha(n, "e"), "committer": {"date": _t("10:30")}}]  # GitHub's `committed` event has no observation time: the repair push time is unknown
+                   {"event": "head_ref_force_pushed", "actor": {"login": APP}, "created_at": _t("10:30"), "after_sha": _sha(n, "e")},  # the observed pushes that answer each HOLD
+                   {"event": "head_ref_force_pushed", "actor": {"login": APP}, "created_at": _t("10:50"), "after_sha": _sha(n, "f")}]
             cm = [{"sha": sha, "author": {"login": APP}, "committer": {"login": APP}, "commit": {"message": m, "committer": {"date": d}}}
                   for sha, m, d in ((head, "work", _t("10:10")), (_sha(n, "e"), "fix", _t("10:30")),
                                     (_sha(n, "f"), "Merge branch 'main' into x", _t("10:50")))]
@@ -230,6 +231,10 @@ def expected():
         "change_failure.head_red_same_context": sum(1 for c in merged if c.get("base_red")),
         "change_failure.minutes_to_green.sum": sum(delay[c["red_until"]] - delay[c["n"]] for c in merged if c.get("base_red")),
         "controls.incident.expected": sum(1 for c in merged if c.get("base_red")), "controls.incident.found": sum(1 for c in merged if c.get("base_red")),
+        "rounds.repair_rounds_per_hold.holds": sum(c.get("holds", 0) for c in CASES),
+        "rounds.repair_rounds_per_hold.pushes_after_holds": sum(sum(c.get("rounds_after_hold", [])) for c in CASES),
+        "rounds.repair_rounds_per_hold.mean": round(sum(sum(c.get("rounds_after_hold", [])) for c in CASES) / sum(c.get("holds", 0) for c in CASES), 2),
+        "rounds.repair_rounds_per_hold.holds_without_push": sum(1 for c in CASES for n in c.get("rounds_after_hold", []) if n == 0),
         "correctness.bad": bad, "correctness.good": len(merged) - bad,
         "correctness.reverted": sum(1 for c in merged if c.get("reverted")),
         "correctness.base_red": sum(1 for c in merged if c.get("base_red")),

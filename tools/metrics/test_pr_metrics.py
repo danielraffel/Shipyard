@@ -877,6 +877,78 @@ class EjectionCause(Base):
         self.assertIn(f"| {REPO} | 1 | 1 | 1.0 | ci_failure | ci_failure 1 | 0 |", md)
 
 
+class HoldRounds(Base):
+    def f(self, holds, pushes, merged=T(10, "12:00")):
+        return {"merged_at": merged, "hold_times": holds, "push_times": pushes, "timeline_complete": True, "commits_complete": True}
+
+    def test_pushes_between_a_hold_and_the_next_hold_or_the_merge_are_its_repair_rounds(self):
+        f = self.f([T(10, "10:00"), T(10, "11:00")], [T(10, "09:50"), T(10, "10:10"), T(10, "10:20"), T(10, "11:30")])
+        self.assertEqual(pm.hold_rounds(f), [2, 1])  # the 09:50 push came before any HOLD
+
+    def test_a_hold_with_no_push_before_the_merge_or_the_next_hold_has_zero_rounds(self):
+        self.assertEqual(pm.hold_rounds(self.f([T(10, "10:00"), T(10, "10:30")], [T(10, "10:45")])), [0, 1])
+        self.assertEqual(pm.hold_rounds(self.f([T(10, "10:00")], [])), [0])
+
+    def test_no_hold_is_an_empty_list_and_an_unmerged_pr_is_none(self):
+        self.assertEqual(pm.hold_rounds(self.f([], [T(10, "10:10")])), [])
+        self.assertIsNone(pm.hold_rounds(self.f([T(10, "10:00")], [], merged=None)))
+
+    def test_an_incomplete_timeline_or_commit_read_gives_no_rounds(self):
+        f = self.f([T(10, "10:00")], [T(10, "10:10")])
+        for k in ("timeline_complete", "commits_complete"):
+            self.assertIsNone(pm.hold_rounds(dict(f, **{k: False})))
+
+    def test_a_push_later_in_the_same_minute_as_the_hold_is_its_repair(self):
+        self.assertEqual(pm.hold_rounds(self.f(["2026-11-10T10:05:10Z"], ["2026-11-10T10:05:40Z"])), [1])
+        self.assertEqual(pm.fmt(pm.iso("2026-11-10T10:05:40Z")), "2026-11-10T10:05:40Z")  # push_times keep seconds
+
+    def test_a_hold_posted_after_the_merge_is_not_counted(self):
+        self.assertEqual(pm.hold_rounds(self.f([T(10, "10:00"), T(10, "12:30")], [T(10, "10:10")])), [1])
+
+    def test_the_re_hold_rate_in_the_hold_table_is_over_the_same_merged_prs(self):
+        rows = [{"hold_rounds": [1, 1], "re_holds": 1}, {"hold_rounds": [0], "re_holds": 3}]  # the second's re-HOLDs came after its merge
+        got = pm.hold_round_summary(rows)
+        self.assertEqual((got["prs_with_hold"], got["re_hold_rate_pct"]), (2, 50.0))
+
+    def test_only_a_push_strictly_before_the_merge_or_the_next_hold_counts(self):
+        self.assertEqual(pm.hold_rounds(self.f([T(10, "10:00")], [T(10, "11:59"), T(10, "12:00"), T(10, "12:01")])), [1])  # the merge is at 12:00
+        self.assertEqual(pm.hold_rounds(self.f([T(10, "10:00"), T(10, "10:30")], [T(10, "10:30")])), [0, 0])  # a push at the next HOLD's time belongs to neither
+
+    def test_an_untimestamped_commit_after_a_hold_is_a_repair_round(self):
+        p = pr(1, T(10, "09:00"), T(10, "12:00"))
+        tl = {1: [{"event": "commented", "actor": {"login": "x"}, "body": "HOLD", "created_at": T(10, "10:00")},
+                  {"event": "committed", "sha": "c" * 40, "committer": {"date": T(10, "10:30")}}]}  # GitHub's committed event has no created_at
+        with tempfile.TemporaryDirectory() as d:
+            out = pm.build([REPO], d, 300, OWNER, START, NOW, {}, {}, None, world([p], tl), control=False)
+        self.assertEqual(out["repos"][REPO]["prs"][0]["hold_rounds"], [1])
+
+    def test_a_commit_and_the_force_push_that_moved_the_head_to_it_are_one_round(self):
+        p = pr(1, T(10, "09:00"), T(10, "12:00"))
+        sha = "c" * 40
+        tl = {1: [{"event": "commented", "actor": {"login": "x"}, "body": "HOLD", "created_at": T(10, "10:00")},
+                  {"event": "committed", "sha": sha, "committer": {"date": T(10, "10:20")}},
+                  {"event": "head_ref_force_pushed", "actor": {"login": "x"}, "created_at": T(10, "10:40"), "after_sha": sha}]}
+        with tempfile.TemporaryDirectory() as d:
+            out = pm.build([REPO], d, 300, OWNER, START, NOW, {}, {}, None, world([p], tl), control=False)
+        self.assertEqual(out["repos"][REPO]["prs"][0]["hold_rounds"], [1])
+
+    def test_the_summary_pools_holds_across_prs(self):
+        rows = [{"hold_rounds": [2, 0]}, {"hold_rounds": []}, {"hold_rounds": None}, {"hold_rounds": [1]}]
+        got = pm.hold_round_summary(rows)
+        self.assertEqual({k: got[k] for k in ("holds", "pushes_after_holds", "mean", "holds_without_push", "prs_with_hold")},
+                         {"holds": 3, "pushes_after_holds": 3, "mean": 1.0, "holds_without_push": 1, "prs_with_hold": 2})
+        self.assertEqual(pm.hold_round_summary([])["mean"], None)
+
+    def test_the_report_prints_the_hold_table_and_withholds_runs_when_compute_was_not_read(self):
+        gh = world([pr(1, T(10, "10:00"), T(10, "11:00"))], default_checks=True)
+        gh.routes = [x for x in gh.routes if "actions/runs" not in x[0]]
+        out = pm.build([REPO], tempfile.mkdtemp(), 50, OWNER, START, NOW, {}, {}, None, gh, control=False)
+        md = pm.markdown(out)
+        self.assertIn("### HOLDs and repair rounds (window, merged PRs)", md)
+        self.assertIn("| merged PRs not read in full |", md)
+        self.assertIn("withheld (compute not read)", md)
+
+
 class RerunCache(Base):
     HEAD = f"h{1:040d}"[:40]
     JOB = [{"labels": ["self-hosted", "macOS"], "created_at": T(10, "10:00"), "started_at": T(10, "10:01"), "completed_at": T(10, "10:21"), "conclusion": "success"}]
@@ -2269,7 +2341,7 @@ class SyntheticControl(unittest.TestCase):
         out = pm.build([REPO], tempfile.mkdtemp(), 50, OWNER, START, NOW, {}, {}, None, world([pr(1, T(10, "10:00"), T(10, "11:00"))]))
         self.assertEqual(out["synthetic_control"]["status"], "pass")
         md = pm.markdown(out)
-        self.assertIn("**CONTROL PASS: 63 of 63", md)
+        self.assertIn("**CONTROL PASS: 67 of 67", md)
         self.assertIn("| ready day |", md)
 
     def test_a_repo_with_no_live_control_reads_synthetic_not_unchecked(self):
