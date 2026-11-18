@@ -42,6 +42,9 @@ fn pr(number: u64, head: &str, merge_state: &str, checks: Vec<StewardCheck>) -> 
     DrainPullRequest {
         pr: StewardPullRequest {
             number,
+            changed_files: None,
+            commit_count: None,
+
             head_sha: head.to_owned(),
             head_branch: format!("branch-{number}"),
             author: None,

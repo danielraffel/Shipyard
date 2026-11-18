@@ -10,6 +10,8 @@ use crate::pr_queue_state::PrQueueState;
 fn open_pr() -> StewardPullRequest {
     StewardPullRequest {
         number: 7,
+        changed_files: None,
+        commit_count: None,
         head_sha: "a".repeat(40),
         author: None,
         head_branch: "feature/x".to_owned(),

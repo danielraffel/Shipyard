@@ -1448,6 +1448,8 @@ impl DwellActs for GitHubDwellActs<'_> {
             node_id: String::new(),
             fact: StewardPullRequest {
                 number: stacked.number,
+                changed_files: None,
+                commit_count: None,
                 head_sha: stacked.head_sha.clone(),
                 head_branch: stacked.head_ref.clone(),
                 author: stacked.author.clone(),

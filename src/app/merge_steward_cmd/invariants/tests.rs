@@ -765,6 +765,9 @@ fn watchdog_observation() -> crate::app::merge_steward_cmd::RepoObservation {
         node_id: format!("PR_{number}"),
         fact: StewardPullRequest {
             number,
+            changed_files: None,
+            commit_count: None,
+
             head_sha: format!("{number:040}"),
             head_branch: format!("b{number}"),
             author: None,
