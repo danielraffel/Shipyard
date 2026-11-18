@@ -607,6 +607,16 @@ pub(super) enum Command {
         #[arg(long, value_name = "OWNER/REPO")]
         repo: Option<String>,
     },
+    /// One read-only page from the steward's local snapshots and optional local sources.
+    #[command(name = "fleet-report")]
+    FleetReport {
+        /// Output format: md or json.
+        #[arg(long, default_value = "md", value_parser = ["md", "json"])]
+        format: String,
+        /// JSON array of objects with host and status strings.
+        #[arg(long, value_name = "PATH")]
+        hosts_file: Option<PathBuf>,
+    },
     /// Which host and agent session armed, enqueued, merged or removed a
     /// pull request. Read-only.
     ///

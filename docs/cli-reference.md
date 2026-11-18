@@ -121,6 +121,7 @@ shipyard guards install --opt-in-review-before-arm               # remove the op
 #   rebase-carry (an approval carries across a pure rebase), hold-disarms (a HOLD dequeues its head)
 shipyard overdue [--repo OWNER/REPO] [--json] # pull requests past their [auto_merge.dwell] limit: state, age, level, act, owner route; reads the steward snapshot, never GitHub
 shipyard next [--repo OWNER/REPO] [--json]    # the top five to admit, closest to mergeable first, with the one thing each needs; reads the steward snapshot
+shipyard fleet-report [--format md|json] [--hosts-file PATH] # one local page of per-repo PR status, owner actions, pool and optional host lines; no GitHub reads
 shipyard who --pr 123 [--repo OWNER/REPO]    # which host/session (and agent, if set) armed, enqueued, merged or removed it; joins every
                                              #   host's queue-arms.jsonl + queue-removals.jsonl to the PR timeline
                                              #   (repo+PR+verb+head; time breaks ties); unexplained = unattributed

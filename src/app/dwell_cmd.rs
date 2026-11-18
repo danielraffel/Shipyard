@@ -32,7 +32,7 @@ pub(super) enum View {
 /// Every snapshot to show: `repo`'s (any base), or every repository's. A
 /// snapshot that cannot be read is skipped with a warning on stderr rather
 /// than hiding the others.
-fn snapshots(state_dir: &Path, repo: Option<&str>) -> Vec<Value> {
+pub(super) fn snapshots(state_dir: &Path, repo: Option<&str>) -> Vec<Value> {
     let mut paths: Vec<PathBuf> = std::fs::read_dir(state_dir.join(DIR))
         .map(|entries| {
             entries

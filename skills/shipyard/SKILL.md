@@ -71,6 +71,14 @@ retargeted automatically.
 
 ## Overdue pull requests and what lands next: `shipyard overdue`, `shipyard next`
 
+`shipyard fleet-report [--format md|json] [--hosts-file PATH]` combines the
+steward's per-repository snapshots into one read-only page. It lists all PRs
+from current snapshots, owner-only actions, and per-repository counts. The
+optional hosts file is a JSON array of `{ "host": "...", "status": "..." }`;
+host collection stays outside Shipyard. Missing local pool, tick and host
+sources are shown as unavailable, without failing the report. Older snapshots
+without full fleet rows are marked incomplete.
+
 Before guessing what to work on, read the steward's own answer:
 `shipyard next [--repo R] [--json]` lists the five pull requests closest to
 mergeable (stack bases first, then approved green, approved pending, green

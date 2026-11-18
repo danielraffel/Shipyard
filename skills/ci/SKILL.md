@@ -5,6 +5,13 @@ description: "Cross-platform CI coordination with Shipyard: validates, ships, ma
 
 # CI Operations with Shipyard
 
+## One page of fleet status: `shipyard fleet-report`
+
+`shipyard fleet-report [--format md|json] [--hosts-file <path>]` renders every open PR the merge steward saw
+(blocker, owner, age, next action, who acts), per-repo counts, an Owner actions section, and the Claude pool
+state from `sr status --json`. It reads only the steward's own snapshots, so it costs no GitHub reads. Sources it
+cannot read print as "(unavailable: reason)" and never fail it. Read it before polling `gh` for a PR's state.
+
 ## Durable external work
 
 Agents may register CI preparation, repair, review, or release work through

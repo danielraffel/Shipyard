@@ -41,6 +41,7 @@ mod diagnose_cmd;
 mod doctor_cmd;
 mod dwell_cmd;
 mod execution_worker_cmd;
+mod fleet_report_cmd;
 mod fleet_status_cmd;
 mod fleet_update_cmd;
 mod git_credential_cmd;
@@ -652,6 +653,14 @@ where
                 stdout,
             );
         }
+        Command::FleetReport { format, hosts_file } => {
+            return fleet_report_cmd::run(
+                &runtime_paths.state_dir,
+                &format,
+                hosts_file.as_deref(),
+                stdout,
+            );
+        }
         Command::Who { pr, repo, contact } => {
             if let Some(contact) = contact {
                 let pr = contact.or(pr).ok_or_else(|| {
@@ -1076,6 +1085,7 @@ fn handle_operational_variant<W: Write>(
         | Command::Who { .. }
         | Command::Overdue { .. }
         | Command::Next { .. }
+        | Command::FleetReport { .. }
         | Command::Owner { .. }
         | Command::Relay { .. }
         | Command::BaseHealth { .. }
