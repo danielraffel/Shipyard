@@ -376,6 +376,34 @@ os.execv("/usr/bin/python3", ["python3", "-I", sys.argv[1], "--tick", "--log-dir
 ' "$drain_watch" "$log_dir" || true
 fi
 
+# Release notify (docs/release-watchdog.md): the release watchdog keeps every
+# blocked release in an open `release-blocked` issue; this messages the lead
+# sessions in tools/metrics/release-notify-targets.txt (or the host's
+# ~/.config/shipyard/release-notify-targets) over cmux when one opens, changes
+# its failing step or closes. At most one GitHub read per 10 minutes, its own
+# lock, exits 0 whatever happens; stderr goes to release-notify.err. Detached
+# like the others. SHIPYARD_RELEASE_NOTIFY=off turns it off.
+release_notify="${SHIPYARD_RELEASE_NOTIFY_SCRIPT:-$clones/deploy/Shipyard/tools/metrics/release_notify.py}"
+if [ "${SHIPYARD_RELEASE_NOTIFY:-on}" != "off" ] && [ -f "$release_notify" ]; then
+  /usr/bin/python3 -c '
+import os, sys
+if os.fork():
+    sys.exit(0)
+os.setsid()
+if os.fork():
+    os._exit(0)
+fd = os.open(os.devnull, os.O_RDWR)
+os.dup2(fd, 0)
+os.dup2(fd, 1)
+try:
+    efd = os.open(os.path.join(sys.argv[2], "release-notify.err"), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+except OSError:
+    efd = fd
+os.dup2(efd, 2)
+os.execv("/usr/bin/python3", ["python3", "-I", sys.argv[1], "--tick", "--log-dir", sys.argv[2]])
+' "$release_notify" "$log_dir" || true
+fi
+
 # Daily loss report (docs/metrics.md, "Daily loss report"): episodes, agent-free
 # resolution and per-day series from the live and archived tick JSON. The script
 # itself gates to one run per UTC day, takes its own lock, writes
