@@ -1698,6 +1698,39 @@ fn an_unowned_overdue_notice_waits_inside_the_rate_limit_window() {
 }
 
 #[test]
+fn a_red_check_delivered_to_the_owner_is_not_resent_to_the_lead_when_the_marker_goes() {
+    let pr = Pr::open(543);
+    let mut h = Harness::new(
+        std::slice::from_ref(&pr),
+        FakeCmux::with(&[("m1", "", "LEAD"), ("m5", "/tmp/cmux-nightly.sock", "S")]),
+    );
+    h.config.repo.insert(
+        REPO.to_owned(),
+        config::RepoFallbacks {
+            lead: Some(address("m1", "LEAD")),
+            repair_lane: None,
+        },
+    );
+    let marker = owner_registry::render_marker(&owner(543, "m5", "S"));
+    h.gh.open_bodies.borrow_mut().insert(543, marker);
+    h.pass(0, Mode::Send);
+    let mut red_pr = pr.clone();
+    red_pr.checks = red();
+    h.gh.set(red_pr);
+    h.pass(1, Mode::Send);
+    let owner_sends = h.cmux.sends().len();
+    assert_eq!(owner_sends, 1, "the owner heard the red check once");
+
+    // The marker is removed: the same red check at the same head is not new.
+    h.gh.open_bodies
+        .borrow_mut()
+        .insert(543, "no marker".to_owned());
+    h.pass(20, Mode::Send);
+    h.pass(40, Mode::Send);
+    assert_eq!(h.cmux.sends().len(), owner_sends, "{:?}", h.cmux.sends());
+}
+
+#[test]
 fn an_unowned_draft_pull_request_is_not_tracked() {
     let mut pr = Pr::open(543);
     pr.comments.push(verdict("HOLD", HEAD_A));

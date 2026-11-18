@@ -423,7 +423,17 @@ fn run_repo(
         repo_pass.events += events.len();
         for event in events {
             let event_key = event.key(repo, *number);
-            if tracked.sent.contains(&event_key)
+            // A check event delivered while the PR had an owner carries a
+            // sequence number; the same fact must not reach the lead again
+            // once the owner marker is gone.
+            let sent_while_owned = unowned
+                && matches!(event, RelayEvent::RequiredCheck { .. })
+                && tracked
+                    .sent
+                    .iter()
+                    .any(|key| same_fact_ignoring_seq(key, &event_key));
+            if sent_while_owned
+                || tracked.sent.contains(&event_key)
                 || tracked
                     .pending
                     .iter()
@@ -706,4 +716,12 @@ fn deliver(
         }
     }
     record
+}
+
+/// Whether two event keys differ only in their trailing sequence number.
+fn same_fact_ignoring_seq(sent: &str, candidate: &str) -> bool {
+    match (sent.rsplit_once(':'), candidate.rsplit_once(':')) {
+        (Some((a, _)), Some((b, _))) => a == b,
+        _ => false,
+    }
 }
