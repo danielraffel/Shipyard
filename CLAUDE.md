@@ -160,7 +160,9 @@ A PR needs no `Version-Bump:` trailer. At land, version-at-land takes versions f
 
 `./scripts/release.sh` remains as a break-glass manual path. The default is the automatic path above (auto-release workflow on merge). Do not call `release.sh` directly unless the automatic path is genuinely blocked.
 
-## macOS release is a stapled .dmg, built LOCALLY (arm64 only)
+## macOS release is a stapled .dmg (arm64 only), built by release.yml on the fleet Mac
+
+**Current path:** with the repository variable `CI_MACOS_SIGNING_ENABLED=true` (set today), `release.yml`'s `sign-and-upload-macos` job builds, signs, notarizes, staples and attests the DMG on the self-hosted `local-mac` runner (Shipyard-studio-*). It publishes the release only after the mounted-DMG and install.sh `--version` checks pass. No human step remains. `release-heal.yml` re-runs a failed draft, and `release-cadence-check.yml`'s `chain` step opens a `release-blocked` issue (and the m3 steward tick messages the lead sessions) when a version is not public and installable 90 minutes after it lands; see `docs/release-watchdog.md`. The local script below is the break-glass fallback, and its rules (stapled DMG, a working `--version` after a fresh install) are the ones the CI job enforces.
 
 As of #219 (2026-04-24 evening), macOS binaries ship as stapled **.dmg** artifacts built on the maintainer's Mac. CI builds the Linux binaries (x64 and ARM64) and, only when `CI_PLATFORM_FOCUS=all`, Windows. The `.dmg` wrapper puts the notarization ticket **inside** the artifact so Gatekeeper verifies offline — no online notarization check, no per-Mac taskgated flakiness. Bare Mach-O binaries depend on an online check that proved unreliable (v0.42.0 and v0.43.0 both shipped bare Mach-O and both SIGKILL'd on the maintainer's Mac).
 

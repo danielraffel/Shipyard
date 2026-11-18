@@ -1314,6 +1314,18 @@ A stalled release chain opens a `release-stall` issue on its own:
 that are in no tag while no bump pull request is open. Both close their issue
 on recovery; see `docs/release-watchdog.md`.
 
+The same workflow's `chain` step follows the current version to an
+installable release. 90 minutes after the version lands it needs the tag, a
+green `release.yml` run (its publish step runs install.sh on the fleet Mac
+and checks `--version`), a public release with every asset, and
+`releases/latest` on that tag. A bump pull request open longer than 60 minutes
+fails it at any time. It keeps one `release-blocked` issue. Every
+release-chain issue carries that label, and the steward tick on m3 messages
+the lead sessions in `tools/metrics/release-notify-targets.txt` over cmux
+when one opens, changes its failing step or closes. Preview it with
+`python3 scripts/release_watchdog.py --dry-run chain`, adding `--ref v<known-good>`
+for a control.
+
 ## Stale ship-state records: `discard --repo` and `prune`
 
 The daemon archives a record when its PR's `pull_request.closed` webhook

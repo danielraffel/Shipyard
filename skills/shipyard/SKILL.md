@@ -33,6 +33,17 @@ Kick a pass by hand only once the checks are green, because the queue skips anyt
 The pass runner lives in fleet-handbook `scripts/pass-runner/` and is installed with its
 `scripts/install-pass-runner.sh`. See `docs/automated-draining.md`.
 
+## A blocked release messages the lead
+
+A release that is not public, complete and installable 90 minutes after its
+version lands, or a bump pull request open longer than 60 minutes, opens one
+`release-blocked` issue (`scripts/release_watchdog.py chain`). The steward
+tick on m3 runs `tools/metrics/release_notify.py`, which messages the targets
+in `tools/metrics/release-notify-targets.txt` over cmux. A host's
+`~/.config/shipyard/release-notify-targets` replaces that list. Answer the
+message by fixing the step the issue names. The issue closes itself. See
+`docs/release-watchdog.md`.
+
 ## Release bases are not stacks
 
 A pull request on a release base (`[merge_steward] release_bases`, default

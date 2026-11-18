@@ -143,6 +143,97 @@ class CadenceTests(unittest.TestCase):
         self.assertIn("gh workflow run version-at-land.yml --repo o/r", body)
 
 
+ASSETS = ("shipyard-linux-x64", "shipyard-macos-arm64.dmg", "checksums.sha256")
+
+
+def chain(**over: object) -> dict:
+    """A v1.2.0 that landed two hours ago and released cleanly, with overrides."""
+    args: dict = dict(
+        version="1.2.0", landed_at=ago(hours=2), now=NOW, tag_exists=True,
+        run={"id": 7, "html_url": "https://run/7", "status": "completed", "conclusion": "success"},
+        failed_jobs="", release={"draft": False, "assets": [{"name": n} for n in ASSETS]},
+        latest_tag="v1.2.0", expected_assets=ASSETS, bump_pr=None)
+    args.update(over)
+    return rw.chain_decide(**args)
+
+
+def steps(verdict: dict) -> list[str]:
+    return [step for step, _ in verdict["failures"]]
+
+
+class ChainTests(unittest.TestCase):
+    def test_a_clean_release_is_ok(self) -> None:
+        self.assertEqual(chain()["state"], "ok")
+
+    def test_inside_the_bound_nothing_is_judged(self) -> None:
+        verdict = chain(landed_at=ago(minutes=30), tag_exists=False, run=None, release=None)
+        self.assertEqual(verdict["state"], "pending")
+        self.assertEqual(verdict["failures"], [])
+
+    def test_past_the_bound_a_missing_tag_fails(self) -> None:
+        verdict = chain(landed_at=ago(minutes=91), tag_exists=False, run=None, release=None)
+        self.assertEqual(steps(verdict), ["tag_missing"])
+
+    def test_no_release_run(self) -> None:
+        self.assertEqual(steps(chain(run=None)), ["release_run_missing"])
+
+    def test_a_hung_release_run(self) -> None:
+        verdict = chain(run={"id": 7, "status": "queued", "conclusion": None}, release=None)
+        self.assertEqual(steps(verdict), ["release_run_incomplete", "release_unpublished"])
+
+    def test_a_failed_install_check_names_the_job(self) -> None:
+        verdict = chain(run={"id": 7, "html_url": "https://run/7", "status": "completed",
+                             "conclusion": "failure"},
+                        failed_jobs="sign-and-upload-macos -> Publish the attested release",
+                        release=None)
+        self.assertEqual(steps(verdict), ["release_run_failed", "release_unpublished"])
+        self.assertIn("Publish the attested release", verdict["failures"][0][1])
+
+    def test_a_failed_run_fails_even_when_the_release_is_public(self) -> None:
+        verdict = chain(run={"id": 7, "status": "completed", "conclusion": "failure"})
+        self.assertEqual(steps(verdict), ["release_run_failed"])
+
+    def test_a_missing_asset(self) -> None:
+        verdict = chain(release={"draft": False, "assets": [{"name": "shipyard-linux-x64"}]})
+        self.assertEqual(steps(verdict), ["release_assets_missing"])
+        self.assertIn("shipyard-macos-arm64.dmg", verdict["failures"][0][1])
+
+    def test_latest_must_be_this_tag(self) -> None:
+        self.assertEqual(steps(chain(latest_tag="v1.1.0")), ["latest_mismatch"])
+
+    def test_an_old_version_with_no_landing_time_is_judged(self) -> None:
+        self.assertEqual(steps(chain(landed_at=None, tag_exists=False, run=None, release=None)),
+                         ["tag_missing"])
+
+    def test_a_bump_pr_open_past_an_hour_fails_even_inside_the_bound(self) -> None:
+        pr = {"number": 1481, "created_at": ago(minutes=61), "verdict": "absent"}
+        verdict = chain(bump_pr=pr, landed_at=ago(minutes=5), release=None, run=None)
+        self.assertEqual(verdict["state"], "failing")
+        self.assertEqual(steps(verdict), ["bump_pr_stale"])
+        self.assertIn("#1481", verdict["failures"][0][1])
+        self.assertIn("review-verdict at its head: absent", verdict["failures"][0][1])
+
+    def test_a_young_bump_pr_is_fine(self) -> None:
+        pr = {"number": 1481, "created_at": ago(minutes=59), "verdict": "success"}
+        self.assertEqual(chain(bump_pr=pr)["state"], "ok")
+
+    def test_body_carries_the_key_the_notifier_compares(self) -> None:
+        verdict = chain(latest_tag="v1.1.0")
+        body = rw.chain_body("1.2.0", verdict, ["tag v1.2.0: present"], NOW, "o/r")
+        self.assertTrue(body.startswith("<!-- release-blocked-key: v1.2.0:latest_mismatch -->"))
+        self.assertIn("gh release edit v1.2.0 --latest --repo o/r", body)
+        self.assertIn("- tag v1.2.0: present", body)
+
+    def test_every_step_has_a_fix(self) -> None:
+        self.assertTrue(set(rw.CHAIN_FIX) >= {
+            "bump_pr_stale", "tag_missing", "release_run_missing", "release_run_incomplete",
+            "release_run_failed", "release_unpublished", "release_assets_missing",
+            "latest_mismatch"})
+
+    def test_every_tracker_is_labelled_for_the_notifier(self) -> None:
+        self.assertIn("release-blocked", rw.LABEL_SPECS)
+
+
 class TrackerTests(unittest.TestCase):
     def test_lifecycle(self) -> None:
         self.assertEqual(rw.issue_action(False, True), "create")
@@ -275,6 +366,15 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('cron: "*/30 * * * *"', text)
         self.assertIn("fetch-depth: 0", text)
         self.assertNotIn("RELEASE_BOT_TOKEN", text)
+
+    def test_chain_runs_on_schedule_and_after_release_runs(self) -> None:
+        text = self.workflow("release-cadence-check.yml")
+        self.assertIn('workflows: ["Release", "Release Heal"]', text)
+        self.assertIn("release_watchdog.py \"${args[@]}\" chain --bound-minutes 90", text)
+        self.assertIn("if: ${{ !cancelled() }}", text)
+        for name in ("Release", "Release Heal"):
+            self.assertTrue(any(p.read_text().startswith(f"name: {name}\n")
+                                for p in (ROOT / ".github/workflows").glob("*.yml")))
 
     def test_least_privilege_and_concurrency(self) -> None:
         for name in ("auto-release-watchdog.yml", "release-cadence-check.yml"):

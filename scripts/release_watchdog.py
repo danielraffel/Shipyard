@@ -10,6 +10,18 @@ or ``auto-release.yml`` completes. A failed run opens or updates that
 workflow's tracker with the run, the error lines from its log and the fix for
 errors it recognises; the next successful run closes it.
 
+``chain`` (``release-cadence-check.yml``, every 30 minutes and whenever a
+``release.yml`` or ``release-heal.yml`` run completes) follows the current
+``Cargo.toml`` version on main to an installable release. Within
+``--bound-minutes`` (90) of the version landing on main: the ``v*`` tag exists,
+the tag's ``release.yml`` run succeeded (its publish step installs the tag with
+install.sh on the fleet Mac and checks ``--version``), the release is public
+with every expected asset, and ``releases/latest`` is that tag. Separately, a
+``release/version-at-land`` pull request may not stay open past
+``--bump-stale-minutes`` (60). It keeps one ``release-blocked`` issue whose
+body carries a ``release-blocked-key`` marker; ``tools/metrics/release_notify.py``
+on m3 messages the fleet's lead sessions when that key changes.
+
 ``cadence`` (``release-cadence-check.yml``) runs every 30 minutes and looks
 only at outcomes, so it fires whatever broke. Two invariants:
 
@@ -38,10 +50,17 @@ LABEL_SPECS = {
     "ci": ("0E8A16", "Continuous integration and release automation"),
     "blocks-release": ("B60205", "Blocks the next release until resolved"),
     "release-stall": ("D93F0B", "Opened and closed by the release watchdog"),
+    # tools/metrics/release_notify.py messages the lead sessions about every
+    # open issue with this label, so every tracker carries it.
+    "release-blocked": ("B60205", "A release is not reaching users; lead sessions are told"),
 }
 LABELS = tuple(LABEL_SPECS)
 TRACKER_LABEL = "release-stall"
 CADENCE_TITLE = "Release cadence: merged changes but no release"
+CHAIN_TITLE = "Release blocked: the current version is not released and installable"
+CHAIN_BOUND_MINUTES = 90.0
+BUMP_STALE_MINUTES = 60.0
+KEY_MARKER = "release-blocked-key"
 # Which tracker a watched workflow owns, keyed by its `name:`.
 WATCHED = {
     "Assign versions at land": "version-at-land",
@@ -174,6 +193,109 @@ def cadence_body(stuck: list[dict], bumps: list[dict], now: datetime, repo: str)
                 "cause is fixed.", ""]
     out.append("_This tracker closes automatically on the next sweep that finds every "
                "change released._")
+    return "\n".join(out)
+
+
+def chain_decide(*, version: str, landed_at: str | None, now: datetime, tag_exists: bool,
+                 run: dict | None, failed_jobs: str, release: dict | None,
+                 latest_tag: str | None, expected_assets: tuple[str, ...],
+                 bump_pr: dict | None, bound_minutes: float = CHAIN_BOUND_MINUTES,
+                 bump_stale_minutes: float = BUMP_STALE_MINUTES) -> dict:
+    """Judge the current version's path from main to an installable release.
+
+    Returns ``{"state": "ok"|"pending"|"failing", "failures": [(step, detail)],
+    "note": str}``. ``landed_at`` is when the version reached main (None: long
+    ago). ``run`` is the latest ``release.yml`` push run for the tag; its
+    publish step already ran install.sh on the fleet Mac and compared
+    ``--version`` with the tag, so its success covers the install. ``release``
+    is the public release (None when missing or still a draft, which the
+    default token cannot see). ``bump_pr`` is the open bump pull request, with
+    ``number``, ``created_at`` and ``verdict`` (the review-verdict check).
+    """
+    tag = f"v{version}"
+    failures: list[tuple[str, str]] = []
+    if bump_pr:
+        age = (now - _parse(bump_pr["created_at"])).total_seconds() / 60
+        if age > bump_stale_minutes:
+            failures.append(("bump_pr_stale",
+                             f"bump pull request #{bump_pr['number']} has been open "
+                             f"{age:.0f} min (limit {bump_stale_minutes:.0f}); "
+                             f"review-verdict at its head: {bump_pr.get('verdict') or 'absent'}"))
+    waited = (now - _parse(landed_at)).total_seconds() / 60 if landed_at else None
+    if waited is not None and waited < bound_minutes:
+        note = f"{tag} landed {waited:.0f} min ago; judged after {bound_minutes:.0f} min"
+        return {"state": "failing" if failures else "pending", "failures": failures,
+                "note": note}
+    since = f"{waited:.0f} min after it landed" if waited is not None else "long after it landed"
+    if not tag_exists:
+        failures.append(("tag_missing", f"tag {tag} does not exist {since}"))
+    elif run is None:
+        failures.append(("release_run_missing", f"no release.yml push run for {tag} {since}"))
+    elif run.get("status") != "completed":
+        failures.append(("release_run_incomplete",
+                         f"release.yml run {run.get('html_url', run.get('id'))} is still "
+                         f"{run.get('status')} {since}"))
+    elif run.get("conclusion") != "success":
+        failures.append(("release_run_failed",
+                         f"release.yml run {run.get('html_url', run.get('id'))} concluded "
+                         f"{run.get('conclusion')}; failed: {failed_jobs or 'see the run'}"))
+    if tag_exists:
+        if release is None or release.get("draft"):
+            failures.append(("release_unpublished", f"release {tag} is missing or still a draft"))
+        else:
+            have = {a.get("name") for a in release.get("assets", [])}
+            missing = [name for name in expected_assets if name not in have]
+            if missing:
+                failures.append(("release_assets_missing",
+                                 f"release {tag} lacks {', '.join(missing)}"))
+            elif latest_tag != tag:
+                failures.append(("latest_mismatch",
+                                 f"releases/latest is {latest_tag or 'unreadable'}, not {tag}, "
+                                 "so install.sh without SHIPYARD_VERSION installs another tag"))
+    return {"state": "failing" if failures else "ok", "failures": failures,
+            "note": f"{tag} judged {since}"}
+
+
+def chain_key(version: str, failures: list[tuple[str, str]]) -> str:
+    """What the notifier compares: a new version or a new failing step is news."""
+    return f"v{version}:" + ",".join(step for step, _ in failures)
+
+
+CHAIN_FIX = {
+    "bump_pr_stale": "Read the bump pull request's checks and verdict; re-run a transient red "
+                     "check. The steward merges it once review-verdict is green.",
+    "tag_missing": "Read the latest *Auto-Release on CLI Version Bump* run (its tracker names "
+                   "the error) and re-run it once fixed.",
+    "release_run_missing": "The tag push started no release.yml run: "
+                           "`gh workflow run release.yml --repo {repo} --ref {tag}`.",
+    "release_run_incomplete": "A release job is queued or hung, usually on the self-hosted "
+                              "macOS runner (`local-mac`, Shipyard-studio-*); check that runner.",
+    "release_run_failed": "release-heal.yml re-runs failed jobs up to 3 times while the release "
+                          "is a draft. Once that is spent, or if the release is already public, "
+                          "fix the failing step and `gh run rerun <id> --failed --repo {repo}`.",
+    "release_unpublished": "The release stays a draft until sign-and-upload-macos publishes it "
+                           "after the install.sh check; read that job's log.",
+    "release_assets_missing": "Re-run the job that uploads the missing asset.",
+    "latest_mismatch": "Make {tag} the latest release (not a prerelease): "
+                       "`gh release edit {tag} --latest --repo {repo}`.",
+}
+
+
+def chain_body(version: str, verdict: dict, evidence: list[str], now: datetime,
+               repo: str) -> str:
+    tag = f"v{version}"
+    stamp = now.strftime("%Y-%m-%d %H:%M UTC")
+    out = [f"<!-- {KEY_MARKER}: {chain_key(version, verdict['failures'])} -->",
+           f"_Auto-generated by `release_watchdog.py chain` "
+           f"(`.github/workflows/release-cadence-check.yml`) on {stamp}._", "",
+           f"**{tag} is not released and installable.** ({verdict['note']})", ""]
+    for step, detail in verdict["failures"]:
+        out += [f"- **{step}**: {detail}",
+                f"  - Fix: {CHAIN_FIX[step].format(repo=repo, tag=tag)}"]
+    out += ["", "**Evidence:**", *[f"- {line}" for line in evidence], "",
+            "_The lead sessions are messaged when the failing step changes. This issue "
+            "closes on the next pass that finds the release public, complete and latest, "
+            "with no stale bump pull request._"]
     return "\n".join(out)
 
 
@@ -353,6 +475,92 @@ def run_cadence(args: argparse.Namespace, now: datetime) -> int:
     return 0
 
 
+def latest_bump_landing(version: str, lookback_days: float, now: datetime) -> str | None:
+    """When ``version`` reached main, or None when that was before the lookback."""
+    for bump in reversed(collect_bumps(now - timedelta(days=lookback_days))):
+        if bump["version"] == version:
+            return bump["landed_at"]
+    return None
+
+
+def verdict_at(repo: str, sha: str) -> str:
+    runs = json.loads(gh("api", f"repos/{repo}/commits/{sha}/check-runs?check_name=review-verdict",
+                         check=False) or "{}").get("check_runs", [])
+    if not runs:
+        return "absent"
+    run = runs[0]
+    return run.get("conclusion") or run.get("status") or "unknown"
+
+
+def optional_json(*args: str) -> dict | None:
+    """A GET that may 404 (a draft or missing release reads as None)."""
+    result = run_gh(*args)
+    if result.returncode != 0:
+        if "404" in result.stderr + result.stdout:
+            return None
+        raise SystemExit(f"gh {' '.join(args[:4])} failed (exit {result.returncode}): "
+                         f"{result.stderr.strip()} {result.stdout.strip()}")
+    return json.loads(result.stdout)
+
+
+def run_chain(args: argparse.Namespace, now: datetime) -> int:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from release_draft_heal import expected_assets  # noqa: PLC0415 (script sibling)
+
+    version = cargo_version_at(args.ref)
+    if not version:
+        raise SystemExit(f"cannot read the Cargo.toml version at {args.ref}")
+    tag = f"v{version}"
+    landed = latest_bump_landing(version, args.lookback_days, now)
+    tag_exists = git("rev-parse", "-q", "--verify", f"refs/tags/{tag}").returncode == 0
+    runs = json.loads(gh("api", f"repos/{args.repo}/actions/workflows/release.yml/runs"
+                                f"?branch={tag}&event=push&per_page=1")).get("workflow_runs", [])
+    run = runs[0] if runs else None
+    failed_jobs = ""
+    if run and run.get("status") == "completed" and run.get("conclusion") != "success":
+        jobs = json.loads(gh("api", f"repos/{args.repo}/actions/runs/{run['id']}/jobs"
+                                    "?per_page=100")).get("jobs", [])
+        failed_jobs = "; ".join(
+            f"{j['name']} -> " + (", ".join(s["name"] for s in j.get("steps", [])
+                                            if s.get("conclusion") in FAILED) or j["conclusion"])
+            for j in jobs if j.get("conclusion") in FAILED | {"cancelled"})
+    release = optional_json("api", f"repos/{args.repo}/releases/tags/{tag}")
+    latest = (optional_json("api", f"repos/{args.repo}/releases/latest") or {}).get("tag_name")
+    owner = args.repo.split("/", 1)[0]
+    bump_prs = json.loads(gh("api", f"repos/{args.repo}/pulls?state=open&base=main"
+                                    f"&head={owner}:{BUMP_BRANCH}"))
+    bump_pr = None
+    if bump_prs:
+        pr = bump_prs[0]
+        bump_pr = {"number": pr["number"], "created_at": pr["created_at"],
+                   "verdict": verdict_at(args.repo, pr["head"]["sha"])}
+    verdict = chain_decide(version=version, landed_at=landed, now=now, tag_exists=tag_exists,
+                           run=run, failed_jobs=failed_jobs, release=release, latest_tag=latest,
+                           expected_assets=expected_assets(), bump_pr=bump_pr,
+                           bound_minutes=args.bound_minutes,
+                           bump_stale_minutes=args.bump_stale_minutes)
+    evidence = [f"version on main: {tag}, landed {landed or 'before the lookback window'}",
+                f"tag {tag}: {'present' if tag_exists else 'absent'}",
+                f"release.yml run: {run['html_url'] + ' ' + str(run.get('status')) + '/' + str(run.get('conclusion')) if run else 'none'}",
+                f"release: {release['html_url'] + (' draft' if release.get('draft') else ' public') if release else 'not public'}",
+                f"releases/latest: {latest or 'unreadable'}",
+                f"bump pull request: {'#' + str(bump_pr['number']) + ' opened ' + bump_pr['created_at'] + ', review-verdict ' + bump_pr['verdict'] if bump_pr else 'none open'}"]
+    print(json.dumps({"state": verdict["state"], "version": tag,
+                      "failures": verdict["failures"], "note": verdict["note"]}))
+    if verdict["state"] == "pending":
+        print("chain: pending, tracker untouched")
+        return 0
+    body = chain_body(version, verdict, evidence, now, args.repo)
+    if args.dry_run:
+        print(body)
+        return 0
+    action = apply_tracker(args.repo, CHAIN_TITLE, verdict["state"] == "failing", body,
+                           f"Pass on {now:%Y-%m-%d %H:%M} UTC found {tag} public, complete and "
+                           "latest, with no stale bump pull request. Closing.")
+    print(f"tracker: {action}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -369,9 +577,16 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument("--grace-hours", type=float, default=2.0)
     c.add_argument("--bump-grace-minutes", type=float, default=30.0)
     c.add_argument("--lookback-days", type=float, default=7.0)
+    ch = sub.add_parser("chain")
+    ch.add_argument("--bound-minutes", type=float, default=CHAIN_BOUND_MINUTES)
+    ch.add_argument("--bump-stale-minutes", type=float, default=BUMP_STALE_MINUTES)
+    ch.add_argument("--lookback-days", type=float, default=14.0)
+    ch.add_argument("--ref", default="origin/main",
+                    help="judge the version at this ref (a known-good tag is a control)")
     args = ap.parse_args(argv)
     now = datetime.now(timezone.utc)
-    return run_watchdog(args, now) if args.check == "watchdog" else run_cadence(args, now)
+    runner = {"watchdog": run_watchdog, "cadence": run_cadence, "chain": run_chain}[args.check]
+    return runner(args, now)
 
 
 if __name__ == "__main__":
