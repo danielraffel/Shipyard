@@ -897,8 +897,17 @@ class HoldRounds(Base):
         got = pm.hold_round_summary(rows)
         self.assertEqual((got["prs_with_hold"], got["re_hold_rate_pct"]), (2, 50.0))
 
-    def test_a_push_at_the_merge_minute_counts_and_one_after_it_does_not(self):
-        self.assertEqual(pm.hold_rounds(self.f([T(10, "10:00")], [T(10, "12:00"), T(10, "12:01")])), [1])
+    def test_only_a_push_strictly_before_the_merge_or_the_next_hold_counts(self):
+        self.assertEqual(pm.hold_rounds(self.f([T(10, "10:00")], [T(10, "11:59"), T(10, "12:00"), T(10, "12:01")])), [1])  # the merge is at 12:00
+        self.assertEqual(pm.hold_rounds(self.f([T(10, "10:00"), T(10, "10:30")], [T(10, "10:30")])), [0, 0])  # a push at the next HOLD's time belongs to neither
+
+    def test_an_untimestamped_commit_after_a_hold_is_a_repair_round(self):
+        p = pr(1, T(10, "09:00"), T(10, "12:00"))
+        tl = {1: [{"event": "commented", "actor": {"login": "x"}, "body": "HOLD", "created_at": T(10, "10:00")},
+                  {"event": "committed", "sha": "c" * 40, "committer": {"date": T(10, "10:30")}}]}  # GitHub's committed event has no created_at
+        with tempfile.TemporaryDirectory() as d:
+            out = pm.build([REPO], d, 300, OWNER, START, NOW, {}, {}, None, world([p], tl), control=False)
+        self.assertEqual(out["repos"][REPO]["prs"][0]["hold_rounds"], [1])
 
     def test_the_summary_pools_holds_across_prs(self):
         rows = [{"hold_rounds": [2, 0]}, {"hold_rounds": []}, {"hold_rounds": None}, {"hold_rounds": [1]}]

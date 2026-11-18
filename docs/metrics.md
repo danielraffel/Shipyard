@@ -1,6 +1,6 @@
 # Shipyard scorecard: end-to-end metrics per eligible PR
 
-Scorecard definition version: `2026-11-18.11` (`SCORECARD_VERSION` in `tools/metrics/pr_metrics.py`,
+Scorecard definition version: `2026-11-18.12` (`SCORECARD_VERSION` in `tools/metrics/pr_metrics.py`,
 printed in every report header). A change to any definition below bumps it, so a definition change
 cannot pose as an improvement. The daily loss report ([below](#daily-loss-report))
 counts blocked episodes; this scorecard measures outcomes per PR. `pr_metrics.py` computes it, and
@@ -119,7 +119,7 @@ prints ejections, ejections per merged PR, the top cause and the unknown-cause c
 
 ## HOLDs and repair rounds
 
-A repair round is a push after a HOLD and before the next HOLD or the merge. The report prints, over the HOLDs of
+A repair round is a push strictly after a HOLD and strictly before the next HOLD or the merge. The report prints, over the HOLDs of
 merged PRs posted before their merge, the mean repair pushes per HOLD and the HOLDs with no push at all, next to the re-HOLD rate over the same merged PRs and HOLDs (a HOLD after a HOLD that got a repair push). A PR whose timeline or commits were not read in full has no rounds and is left out (`prs_unread`). A push's time is its commit's committer date, as for the agent-push counts (the timeline records no time for a plain push), so a fix committed before a HOLD and pushed after it counts as a push before the HOLD. When no
 PR's compute was read, runs per merged PR prints `withheld (compute not read)` instead of an empty cell.
 

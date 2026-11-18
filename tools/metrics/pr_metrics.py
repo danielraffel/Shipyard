@@ -59,7 +59,7 @@ ESCAPE_WINDOW = dt.timedelta(days=14)
 HORIZON = dt.timedelta(hours=48)
 MIN_SAMPLE = 50
 UNKNOWN_RANGE_SHARE = 0.20
-SCORECARD_VERSION = "2026-11-18.11"  # .2: correctness reads the first-parent next push and the newest run by id; main-red episodes. .3: ejection causes from GraphQL
+SCORECARD_VERSION = "2026-11-18.12"  # .2: correctness reads the first-parent next push and the newest run by id; main-red episodes. .3: ejection causes from GraphQL
 MERGE_MAIN_RE = re.compile(r"^Merge (remote-tracking )?branch '?(origin/)?(main|master)'?|^Merge pull request .* from .*/main", re.I)
 # Positive controls: a real revert (#124 reverted #119), a real escaped defect (#126 names #116).
 # Pulp: two escapes verified by hand from main-red traces. #12219 landed red on Workflow lint and
@@ -727,8 +727,10 @@ def hold_rounds(f):
     if not m or not reads_complete(f):
         return None
     holds = sorted(iso(x) for x in f.get("hold_times") or [] if iso(x) and iso(x) < m)  # a HOLD posted after the merge held nothing
-    pushes = sorted(iso(x) for x in f.get("push_times") or [] if iso(x))
-    return [sum(1 for p in pushes if h < p <= (holds[i + 1] if i + 1 < len(holds) else m)) for i, h in enumerate(holds)]
+    # a timed push (a force-push) is observed; a `committed` event carries no time, so its commit's committer date stands in
+    # (as for the agent-push counts) and an ordinary repair commit is still a round
+    pushes = sorted({iso(x) for x in list(f.get("push_times") or []) + list(f.get("untimed_commit_dates") or []) if iso(x)})
+    return [sum(1 for p in pushes if h < p < (holds[i + 1] if i + 1 < len(holds) else m)) for i, h in enumerate(holds)]
 
 
 def enqueue_to_merge(f):
