@@ -760,14 +760,19 @@ class GitHub:
     def _landed(self, path: str, body: dict[str, Any]) -> bool:
         """True when a check run carrying this invocation's external_id exists."""
         try:
-            found = self.json(f"repos/{self.repo}/commits/{body['head_sha']}/check-runs"
-                              f"?check_name={quote(str(body.get('name')), safe='')}"
-                              "&per_page=100")
+            for page in range(1, 11):
+                found = self.json(f"repos/{self.repo}/commits/{body['head_sha']}/check-runs"
+                                  f"?check_name={quote(str(body.get('name')), safe='')}"
+                                  f"&filter=all&per_page=100&page={page}")
+                runs = found.get("check_runs") if isinstance(found, dict) else None
+                if any(isinstance(run, dict) and run.get("external_id") == body["external_id"]
+                       for run in runs or []):
+                    return True
+                if len(runs or []) < 100:
+                    break
         except (TierError, ValueError):
-            return False
-        runs = found.get("check_runs") if isinstance(found, dict) else None
-        return any(isinstance(run, dict) and run.get("external_id") == body["external_id"]
-                   for run in runs or [])
+            pass
+        return False
 
     def post(self, path: str, body: dict[str, Any]) -> None:
         check = path.endswith("/check-runs") and bool(body.get("head_sha"))
