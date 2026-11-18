@@ -1239,6 +1239,38 @@ class Correctness(Base):
         s = out["repos"][REPO]["per_day"]
         self.assertEqual(s["2026-11-05"]["correctness"]["bad_rate_pct"], 100.0)
 
+    def base_red_of(self, checks_for_merge, checks_for_next=None):
+        p = self.merged_old(6)
+        bc = [commit(p["merge_commit_sha"], date=T(5, "10:00")), commit("nx", date=T(5, "12:00"))]
+        ck = {p["merge_commit_sha"]: checks_for_merge, "nx": checks_for_next if checks_for_next is not None else [{"name": "Test", "status": "completed", "conclusion": "success"}]}
+        out = self.build(world([p], base_commits=bc, checks=ck), now=dt.datetime(2026, 11, 14, tzinfo=UTC))
+        return self.rows(out)[6]["correct"]
+
+    def test_a_red_check_beside_a_pending_one_is_unknown_not_base_red(self):
+        c = self.base_red_of([{"name": "Test", "status": "completed", "conclusion": "failure"}, {"name": "Slow", "status": "in_progress", "conclusion": None}])
+        self.assertEqual((c["base_red"], c["bad"]), (None, None))
+
+    def test_a_red_check_on_an_incomplete_page_read_is_unknown_not_base_red(self):
+        p = self.merged_old(6)
+        bc = [commit(p["merge_commit_sha"], date=T(5, "10:00"))]
+        page = [{"id": i, "name": f"C{i}", "status": "completed", "conclusion": "success"} for i in range(1, 100)]
+        page.append({"id": 100, "name": "Test", "status": "completed", "conclusion": "failure"})  # a full page, forever: the list is never read to its end
+        out = self.build(world([p], base_commits=bc, checks={p["merge_commit_sha"]: lambda path: page}), now=dt.datetime(2026, 11, 14, tzinfo=UTC))
+        c = self.rows(out)[6]["correct"]
+        self.assertEqual((c["base_red"], c["bad"]), (None, None))
+
+    def test_a_settled_red_next_push_is_base_red_even_when_the_merge_commit_is_pending(self):
+        c = self.base_red_of([{"name": "Test", "status": "queued", "conclusion": None}], [{"name": "Test", "status": "completed", "conclusion": "failure"}])
+        self.assertTrue(c["base_red"])
+
+    def test_a_reverted_pr_is_bad_even_when_its_base_checks_are_unsettled(self):
+        p = self.merged_old(6)
+        bc = [commit(p["merge_commit_sha"], date=T(5, "10:00")), commit("rv", msg=f'Revert "x" (#{p["number"]})', date=T(6, "10:00"))]
+        ck = {p["merge_commit_sha"]: [{"name": "Test", "status": "queued", "conclusion": None}]}
+        out = self.build(world([p], base_commits=bc, checks=ck), now=dt.datetime(2026, 11, 14, tzinfo=UTC))
+        c = self.rows(out)[6]["correct"]
+        self.assertEqual((c["reverted"], c["base_red"], c["bad"]), (True, None, True))
+
     def test_a_non_required_red_check_is_ignored(self):
         p = self.merged_old(6)
         bc = [commit(p["merge_commit_sha"], date=T(5, "10:00"))]
