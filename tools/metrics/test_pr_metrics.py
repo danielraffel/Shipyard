@@ -814,6 +814,19 @@ class EjectionCause(Base):
         q = out["repos"][REPO]["per_day"]["2026-11-10"]["merge_queue"]
         self.assertEqual((q["ejections_by_cause"], q["top_ejection_cause"], q["ejections_cause_unknown"], q["ejections_per_merge"]), ({"ci_failure": 1}, "ci_failure", 0, 1.0))
 
+    def test_ejections_per_merge_excludes_unmerged_ready_prs(self):
+        merged = pr(1, T(10, "10:00"), T(10, "11:00"))
+        open_pr = pr(2, T(10, "10:00"), None)
+        open_pr["state"] = "open"
+        open_pr["updated_at"] = T(10, "12:00")
+        timelines = {
+            1: [dict(self.REMOVE, reason="failed_checks")],
+            2: [dict(self.REMOVE, reason="failed_checks")],
+        }
+        out = self.build(world([merged, open_pr], timelines))
+        q = out["repos"][REPO]["per_day"]["2026-11-10"]["merge_queue"]
+        self.assertEqual((q["ejections_by_cause"], q["ejections_per_merge"]), ({"failed_checks": 2}, 1.0))
+
     def test_a_removal_that_graphql_says_was_the_merge_is_not_an_ejection(self):
         out = self.build(self.world_with([{"createdAt": T(10, "10:30"), "reason": "MERGED"}]))
         self.assertEqual(self.rows(out)[1]["ejections"], [])

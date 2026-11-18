@@ -1336,6 +1336,7 @@ def summarize(rows):
     push = {k: sum(r["pushes"].get(k, 0) for r in rows) for k in ("repair", "author", "merge_main")}
     q2m = [r["enqueue_to_merge_min"] for r in merged if r.get("enqueue_to_merge_min") is not None]
     ej = collections.Counter(c for r in rows for c in r["ejections"])
+    merged_ej = collections.Counter(c for r in merged for c in r["ejections"])
     good = [r for r in merged if r["correct"] and r["correct"]["bad"] is False]
     bad = [r for r in merged if r["correct"] and r["correct"]["bad"]]
     esc_known = [r for r in merged if r["correct"] and r["correct"].get("escaped") is not None]
@@ -1366,7 +1367,7 @@ def summarize(rows):
         "merge_queue": {
             "attempts_per_ready_pr": None if not n else round(sum(r["enqueues"] for r in rows) / n, 2),
             "ejections_by_cause": dict(ej.most_common()),
-            "ejections_per_merge": None if not merged else round(sum(ej.values()) / len(merged), 3),
+            "ejections_per_merge": None if not merged else round(sum(merged_ej.values()) / len(merged), 3),
             "top_ejection_cause": next((c for c, _ in ej.most_common() if c != "unknown"), None),
             "ejections_cause_unknown": ej.get("unknown", 0),
             "enqueue_to_merge_min": {"n": len(q2m), "median": med(q2m), "p90": pctile(q2m, 0.9)},
