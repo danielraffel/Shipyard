@@ -184,7 +184,7 @@ class Compute(Base):
              "head_branch": "gh-readonly-queue/main/pr-10-abc"},  # another PR: pr-10 is not pr-1
             {"id": 14, "head_sha": "other", "event": "push", "status": "completed", "head_branch": "main"},
         ]
-        job = lambda lab, a, b, concl="success": {"labels": lab, "started_at": T(10, a), "completed_at": T(10, b), "conclusion": concl}
+        job = lambda lab, a, b, concl="success": {"labels": lab, "created_at": T(10, a), "started_at": T(10, a), "completed_at": T(10, b), "conclusion": concl}
         self.jobs = {11: [job(["self-hosted", "macOS"], "10:00", "10:20"), job(["ubuntu-latest"], "10:00", "10:05")],
                      12: [job(["self-hosted"], "10:40", "10:50"), job(["x"], "10:40", "10:45", "skipped")],
                      13: [job(["ubuntu-latest"], "10:00", "11:00")], 14: [job(["ubuntu-latest"], "10:00", "11:00")]}
@@ -252,7 +252,7 @@ class ProofsAndQueue(Base):
         self.assertFalse(complete)
 
     def test_an_old_job_cache_without_macos_minutes_is_read_again(self):
-        rd = pm.Reader(REPO, self.cache, 100, lambda path: {"jobs": [{"labels": ["macOS-14", "self-hosted"], "started_at": T(10, "10:00"),
+        rd = pm.Reader(REPO, self.cache, 100, lambda path: {"jobs": [{"labels": ["macOS-14", "self-hosted"], "created_at": T(10, "10:00"), "started_at": T(10, "10:00"),
                                                                        "completed_at": T(10, "10:30"), "conclusion": "success"}]})
         rd.save("jobs", "7", {"self_hosted": 99.0, "hosted": 0.0})
         sh, ho, mac, wait, ok = pm.job_minutes(rd, {"id": 7, "status": "completed"})
@@ -266,7 +266,7 @@ class ProofsAndQueue(Base):
         sha = f"h{1:040d}"[:40]
         runs = [{"id": 1, "name": "Proof", "head_sha": sha, "event": "pull_request", "status": "completed"},
                 {"id": 2, "name": "Proof", "head_sha": "g", "event": "merge_group", "status": "completed", "head_branch": "gh-readonly-queue/main/pr-1-x"}]
-        job = [{"labels": ["macOS"], "started_at": T(10, "10:00"), "completed_at": T(10, "10:12"), "conclusion": "success"}]
+        job = [{"labels": ["macOS"], "created_at": T(10, "10:00"), "started_at": T(10, "10:00"), "completed_at": T(10, "10:12"), "conclusion": "success"}]
         other = pr(2, T(10, "10:00"), T(10, "11:00"))
         other["head"]["sha"] = "z" * 40
         out = self.build(world([p, other], tl, commits={2: [commit("c2")]}, runs=runs, jobs={1: job, 2: job}))
@@ -499,6 +499,39 @@ class JobsSkipped(Base):
             pm.READ_JOB_MINUTES = True
         r = self.rows(out)[1]
         self.assertEqual((r["compute"]["complete"], r["path"]), (False, None))
+
+
+class MalformedJobTiming(Base):
+    RUN = {"id": 11, "head_sha": f"h{1:040d}"[:40], "event": "pull_request", "status": "completed",
+           "conclusion": "success", "head_branch": "feat"}
+
+    def run_one(self, job):
+        p = pr(1, T(10, "09:00"), T(10, "11:00"))
+        out = self.build(world([p], runs=[self.RUN], jobs={11: [job]}))
+        return out["repos"][REPO]["prs"][0]
+
+    def test_pre_fix_job_cache_is_read_again_before_reusing_minutes(self):
+        job = {"labels": ["self-hosted", "macOS"], "created_at": T(10, "10:00"),
+               "started_at": T(10, "10:01"), "completed_at": T(10, "10:21"), "conclusion": "success"}
+        rd = pm.Reader(REPO, self.cache, 50, lambda path: {"jobs": [job]})
+        rd.save("jobs", "11", {"self_hosted": 99.0, "hosted": 1.0, "macos": 5.0, "wait": 2.0, "attempt": 1})
+        self.assertEqual(pm.job_minutes(rd, self.RUN), (20.0, 0.0, 20.0, 1.0, True))
+
+    def test_missing_job_duration_keeps_compute_incomplete_and_withholds_minutes(self):
+        row = self.run_one({"labels": ["self-hosted", "macOS"], "created_at": T(10, "10:00"),
+                            "started_at": T(10, "10:01"), "conclusion": "success"})
+        self.assertEqual((row["compute"]["complete"], row["compute"]["self_hosted_min"],
+                          row["compute"]["hosted_min"], row["compute"]["macos_min"],
+                          row["compute"]["runner_wait_min"], row["path"]),
+                         (False, None, None, None, None, None))
+
+    def test_missing_job_creation_time_keeps_compute_incomplete_and_withholds_runner_wait(self):
+        row = self.run_one({"labels": ["self-hosted", "macOS"], "started_at": T(10, "10:01"),
+                            "completed_at": T(10, "10:21"), "conclusion": "success"})
+        self.assertEqual((row["compute"]["complete"], row["compute"]["self_hosted_min"],
+                          row["compute"]["hosted_min"], row["compute"]["macos_min"],
+                          row["compute"]["runner_wait_min"], row["path"]),
+                         (False, None, None, None, None, None))
 
 
 class MergeRemoval(Base):
@@ -1134,7 +1167,7 @@ class Proxies(Base):
         runs = [{"id": 21, "head_sha": "grp", "event": "merge_group", "status": "completed", "name": "GPU", "head_branch": "gh-readonly-queue/main/pr-1-x"},
                 {"id": 22, "head_sha": "grp", "event": "push", "status": "completed", "name": "GPU", "head_branch": "main"},
                 {"id": 23, "head_sha": "zzz", "event": "push", "status": "completed", "name": "GPU", "head_branch": "main"}]
-        job = [{"labels": ["self-hosted"], "started_at": T(10, "10:00"), "completed_at": T(10, "10:10"), "conclusion": "success"}]
+        job = [{"labels": ["self-hosted"], "created_at": T(10, "10:00"), "started_at": T(10, "10:00"), "completed_at": T(10, "10:10"), "conclusion": "success"}]
         out = self.build(world([p], runs=runs, jobs={21: job, 22: job}), now=self.LATE)
         c = self.rows(out)[1]["compute"]
         self.assertEqual((c["runs"], c["repeat_runs"], c["group_runs"]), (2, 1, 1))
