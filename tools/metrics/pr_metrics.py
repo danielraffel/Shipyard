@@ -53,7 +53,7 @@ _GUARD = []
 SIGNALS = ("app_opener", "provenance", "trailer", "session_stamp")
 BAD_CONCLUSIONS = {"failure", "timed_out"}
 FACTS_VERSION = 14  # 14: merge-queue ejection causes read from GraphQL; push_times are observed head updates; main-red facts
-COMPUTE_VERSION = 7  # compute caches: entries written before this could be marked complete from a partial timeline or commit read or rerun history
+COMPUTE_VERSION = 8  # compute caches: entries written before this could be marked complete from a partial timeline or commit read or rerun history
 CHECKS_VERSION = 3  # derived check caches: v2 entries (incomplete pagination read as clean, latest run by start) are read again
 ESCAPE_WINDOW = dt.timedelta(days=14)
 HORIZON = dt.timedelta(hours=48)
@@ -570,12 +570,18 @@ def job_minutes(rd, run):
     cached = rd.load("jobs", str(rid))
     # an entry is for one attempt of one run: a rerun keeps the run id, so a different attempt is read again
     if (cached and "macos" in cached and "wait" in cached and cached.get("attempt") == attempt
-            and cached.get("timing_complete") is True):
+            and cached.get("timing_complete") is True and cached.get("latest_attempt_only") is True):
         return cached["self_hosted"], cached["hosted"], cached["macos"], cached["wait"], True
     jobs, full = rd.pages(f"actions/runs/{rid}/jobs?filter=all", key="jobs", max_pages=3)
     sh = ho = mac = wait = 0.0
     timing_complete = True
     for j in jobs:
+        try:
+            job_attempt = int(j.get("run_attempt") or attempt)
+        except (TypeError, ValueError):
+            job_attempt = attempt
+        if job_attempt != attempt:  # `filter=all` also lists the jobs of earlier attempts: this entry is for the latest one
+            continue
         a, b = iso(j.get("started_at")), iso(j.get("completed_at"))
         if j.get("conclusion") == "skipped":
             continue
@@ -595,7 +601,7 @@ def job_minutes(rd, run):
     if not done:
         return None, None, None, None, False
     rd.save("jobs", str(rid), {"self_hosted": round(sh, 2), "hosted": round(ho, 2), "macos": round(mac, 2), "wait": round(wait, 2), "attempt": attempt,
-                                "timing_complete": True})
+                                "timing_complete": True, "latest_attempt_only": True})
     return round(sh, 2), round(ho, 2), round(mac, 2), round(wait, 2), True
 
 
@@ -771,6 +777,7 @@ def pr_runs(f, runs):
 
 def pr_compute(rd, f, runs, runs_complete):
     heads = set(f["heads"])
+    merged = iso(f.get("merged_at"))
     mine = pr_runs(f, runs)
     # a repeat is a run of a workflow on a sha that workflow already ran on (reruns, a push on a merge-group sha)
     seen, repeats = {}, 0
@@ -808,7 +815,10 @@ def pr_compute(rd, f, runs, runs_complete):
         attempts_known = attempt <= 1 or r.get("conclusion") in BAD_CONCLUSIONS
         complete = complete and ok and attempts_known
         outcomes_complete = outcomes_complete and r.get("status") == "completed"  # a rerun's history only blocks a clean verdict (`complete`)
-        if (r.get("head_sha") in heads and r.get("event") != "merge_group"
+        after_merge = bool(merged and iso(r.get("updated_at")) and iso(r.get("updated_at")) > merged)  # a rerun after the merge cannot have delayed it
+        if after_merge and attempt > 1:
+            complete = False  # the rerun replaced what the run showed at the merge: no clean verdict (a red found elsewhere still stands)
+        if (r.get("head_sha") in heads and r.get("event") != "merge_group" and not after_merge
                 and r.get("conclusion") in BAD_CONCLUSIONS and r.get("updated_at")):
             red_events.append(r["updated_at"])  # any failed non-merge-group run on one of the PR's heads
             red_partial = red_partial or attempt > 1  # the list shows only its latest attempt: earlier failed attempts are not in red_events
