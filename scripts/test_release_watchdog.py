@@ -143,6 +143,236 @@ class CadenceTests(unittest.TestCase):
         self.assertIn("gh workflow run version-at-land.yml --repo o/r", body)
 
 
+ASSETS = ("shipyard-linux-x64", "shipyard-macos-arm64.dmg", "checksums.sha256")
+
+
+def chain(**over: object) -> dict:
+    """A v1.2.0 that landed two hours ago and released cleanly, with overrides."""
+    args: dict = dict(
+        version="1.2.0", landed_at=ago(hours=2), now=NOW, tag_exists=True,
+        run={"id": 7, "html_url": "https://run/7", "status": "completed", "conclusion": "success"},
+        failed_jobs="", release={"draft": False, "assets": [{"name": n} for n in ASSETS]},
+        latest_tag="v1.2.0", expected_assets=ASSETS, bump_pr=None)
+    args.update(over)
+    return rw.chain_decide(**args)
+
+
+def steps(verdict: dict) -> list[str]:
+    return [step for step, _ in verdict["failures"]]
+
+
+class ChainTests(unittest.TestCase):
+    def test_a_clean_release_is_ok(self) -> None:
+        self.assertEqual(chain()["state"], "ok")
+
+    def test_inside_the_bound_nothing_is_judged(self) -> None:
+        verdict = chain(landed_at=ago(minutes=30), tag_exists=False, run=None, release=None)
+        self.assertEqual(verdict["state"], "pending")
+        self.assertEqual(verdict["failures"], [])
+
+    def test_past_the_bound_a_missing_tag_fails(self) -> None:
+        verdict = chain(landed_at=ago(minutes=91), tag_exists=False, run=None, release=None)
+        self.assertEqual(steps(verdict), ["tag_missing"])
+
+    def test_no_release_run(self) -> None:
+        self.assertEqual(steps(chain(run=None, release=None)),
+                         ["release_run_missing", "release_unpublished"])
+
+    def test_a_hung_release_run(self) -> None:
+        verdict = chain(run={"id": 7, "status": "queued", "conclusion": None}, release=None)
+        self.assertEqual(steps(verdict), ["release_run_incomplete", "release_unpublished"])
+
+    def test_a_failed_install_check_names_the_job(self) -> None:
+        verdict = chain(run={"id": 7, "html_url": "https://run/7", "status": "completed",
+                             "conclusion": "failure"},
+                        failed_jobs="sign-and-upload-macos -> Publish the attested release",
+                        release=None)
+        self.assertEqual(steps(verdict), ["release_run_failed", "release_unpublished"])
+        self.assertIn("Publish the attested release", verdict["failures"][0][1])
+
+    def test_a_failed_run_is_evidence_when_the_release_is_public_complete_and_latest(self) -> None:
+        # Publication follows the install check; a later failed step (keychain
+        # restore) or a hand recovery leaves an installable release.
+        verdict = chain(run={"id": 7, "status": "completed", "conclusion": "failure"})
+        self.assertEqual(verdict["state"], "ok")
+
+    def test_a_fully_green_release_is_ok_inside_the_bound(self) -> None:
+        self.assertEqual(chain(landed_at=ago(minutes=13))["state"], "ok")
+
+    def test_inside_the_bound_an_unreleased_version_is_pending(self) -> None:
+        verdict = chain(landed_at=ago(minutes=13), release=None,
+                        run={"id": 7, "status": "in_progress", "conclusion": None})
+        self.assertEqual(verdict["state"], "pending")
+
+    def test_one_key_for_both_run_states(self) -> None:
+        self.assertEqual(rw.chain_key("1.2.0", [("release_run_incomplete", ""),
+                                                ("release_unpublished", "")]),
+                         rw.chain_key("1.2.0", [("release_run_failed", ""),
+                                                ("release_unpublished", "")]))
+
+    def test_a_missing_tag_stops_there(self) -> None:
+        verdict = chain(tag_exists=False)
+        self.assertEqual(steps(verdict), ["tag_missing"])
+
+    def test_a_missing_asset(self) -> None:
+        verdict = chain(release={"draft": False, "assets": [{"name": "shipyard-linux-x64"}]})
+        self.assertEqual(steps(verdict), ["release_assets_missing"])
+        self.assertIn("shipyard-macos-arm64.dmg", verdict["failures"][0][1])
+
+    def test_latest_must_be_this_tag(self) -> None:
+        self.assertEqual(steps(chain(latest_tag="v1.1.0")), ["latest_mismatch"])
+
+    def test_an_old_version_with_no_landing_time_is_judged(self) -> None:
+        self.assertEqual(steps(chain(landed_at=None, tag_exists=False, run=None, release=None)),
+                         ["tag_missing"])
+
+    def test_a_bump_pr_open_past_two_hours_fails_even_inside_the_bound(self) -> None:
+        pr = {"number": 1481, "created_at": ago(minutes=121), "verdict": "absent"}
+        verdict = chain(bump_pr=pr, landed_at=ago(minutes=5), release=None, run=None)
+        self.assertEqual(verdict["state"], "failing")
+        self.assertEqual(steps(verdict), ["bump_pr_stale"])
+        self.assertIn("#1481", verdict["failures"][0][1])
+        self.assertIn("review-verdict at its head: absent", verdict["failures"][0][1])
+
+    def test_a_bump_pr_under_two_hours_is_fine(self) -> None:
+        # 8 of 82 healthy bumps took over 60 minutes; the limit is 120.
+        pr = {"number": 1481, "created_at": ago(minutes=110), "verdict": "success"}
+        self.assertEqual(chain(bump_pr=pr)["state"], "ok")
+
+    def test_body_carries_the_key_the_notifier_compares(self) -> None:
+        verdict = chain(latest_tag="v1.1.0")
+        body = rw.chain_body("1.2.0", verdict, ["tag v1.2.0: present"], NOW, "o/r")
+        self.assertTrue(body.startswith("<!-- release-blocked-key: v1.2.0:latest_mismatch -->"))
+        self.assertIn("gh release edit v1.2.0 --latest --repo o/r", body)
+        self.assertIn("- tag v1.2.0: present", body)
+
+    def test_every_step_has_a_fix(self) -> None:
+        self.assertTrue(set(rw.CHAIN_FIX) >= {
+            "bump_pr_stale", "tag_missing", "release_run_missing", "release_run_incomplete",
+            "release_run_failed", "release_unpublished", "release_assets_missing",
+            "latest_mismatch"})
+
+    def test_every_tracker_is_labelled_for_the_notifier(self) -> None:
+        self.assertIn("release-blocked", rw.LABEL_SPECS)
+
+
+class PickVersionTests(unittest.TestCase):
+    BUMPS = [{"version": "1.4.0", "landed_at": ago(minutes=20)},
+             {"version": "1.3.0", "landed_at": ago(minutes=70)},
+             {"version": "1.2.0", "landed_at": ago(minutes=120)}]
+
+    def test_a_current_version_past_its_bound_is_judged(self) -> None:
+        self.assertEqual(rw.pick_version("1.2.0", self.BUMPS[2:], NOW), ("1.2.0", ago(minutes=120)))
+
+    def test_rapid_landings_judge_the_newest_version_past_its_bound(self) -> None:
+        # 2026-11-13: six bumps landed 30 to 80 minutes apart; judging only the
+        # current one left a broken release.yml unreported for hours.
+        self.assertEqual(rw.pick_version("1.4.0", self.BUMPS, NOW), ("1.2.0", ago(minutes=120)))
+
+    def test_pending_only_when_nothing_has_passed_its_bound(self) -> None:
+        self.assertEqual(rw.pick_version("1.4.0", self.BUMPS[:2], NOW), ("1.4.0", ago(minutes=20)))
+
+    def test_a_version_older_than_the_lookback(self) -> None:
+        self.assertEqual(rw.pick_version("1.1.0", self.BUMPS, NOW), ("1.1.0", None))
+
+    def test_a_superseded_version_is_ok_once_a_newer_release_is_latest(self) -> None:
+        verdict = chain(tag_exists=False, release=None, run=None, latest_tag="v1.3.0")
+        self.assertEqual(verdict["state"], "ok")
+        self.assertIn("superseded by v1.3.0", verdict["note"])
+
+    def test_an_older_latest_does_not_count(self) -> None:
+        self.assertEqual(steps(chain(latest_tag="v1.1.9")), ["latest_mismatch"])
+
+
+class ChainIoDecisionTests(unittest.TestCase):
+    def test_a_successful_run_outranks_a_later_failed_one(self) -> None:
+        runs = [{"id": 9, "conclusion": "failure"}, {"id": 7, "conclusion": "success"}]
+        self.assertEqual(rw.pick_run(runs)["id"], 7)
+        self.assertEqual(rw.pick_run([{"id": 9, "conclusion": None}])["id"], 9)
+        self.assertIsNone(rw.pick_run([]))
+
+    def test_only_a_stale_bump_tracker_closes_while_pending(self) -> None:
+        self.assertTrue(rw.stale_bump_only("<!-- release-blocked-key: v1.2.0:bump_pr_stale -->"))
+        self.assertFalse(rw.stale_bump_only(
+            "<!-- release-blocked-key: v1.2.0:bump_pr_stale,release_run_failed -->"))
+        self.assertFalse(rw.stale_bump_only("<!-- release-blocked-key: v1.2.0:tag_missing -->"))
+        self.assertFalse(rw.stale_bump_only("no marker"))
+
+
+class RunChainTests(unittest.TestCase):
+    """run_chain end to end with GitHub and git faked."""
+
+    def run_chain(self, *, current: str, bumps: list[dict], releases: dict, latest: str,
+                  tags: set[str], tracker: dict | None = None) -> tuple[dict, list[tuple]]:
+        applied: list[tuple] = []
+
+        def git(*args: str) -> subprocess.CompletedProcess[str]:
+            rc = 0 if args[-1].removeprefix("refs/tags/") in tags else 1
+            return subprocess.CompletedProcess(args, rc, stdout="", stderr="")
+
+        def gh(*args: str, **kw: object) -> str:
+            path = args[1]
+            if "/pulls?" in path:
+                return "[]"
+            tag = re.search(r"branch=(v[\d.]+)", path)
+            if tag and tag.group(1) in releases:
+                return json.dumps({"workflow_runs": [{"id": 1, "html_url": "https://run/1",
+                                                      "status": "completed",
+                                                      "conclusion": "success"}]})
+            return json.dumps({"workflow_runs": []})
+
+        def optional(*args: str) -> dict | None:
+            path = args[1]
+            if path.endswith("/releases/latest"):
+                return {"tag_name": latest}
+            return releases.get(path.rsplit("/", 1)[-1])
+
+        args = rw.argparse.Namespace(repo="o/r", ref="origin/main", lookback_days=14.0,
+                                     bound_minutes=90.0, bump_stale_minutes=120.0,
+                                     dry_run=False)
+        out = io.StringIO()
+        with mock.patch.object(rw, "cargo_version_at", return_value=current), \
+                mock.patch.object(rw, "collect_bumps", return_value=bumps), \
+                mock.patch.object(rw, "git", side_effect=git), \
+                mock.patch.object(rw, "gh", side_effect=gh), \
+                mock.patch.object(rw, "optional_json", side_effect=optional), \
+                mock.patch("release_draft_heal.expected_assets", return_value=ASSETS), \
+                mock.patch.object(rw, "find_tracker", return_value=tracker), \
+                mock.patch.object(rw, "apply_tracker",
+                                  side_effect=lambda *a: applied.append(a) or "x"), \
+                contextlib.redirect_stdout(out):
+            rw.run_chain(args, NOW)
+        return json.loads(out.getvalue().splitlines()[0]), applied
+
+    PUBLIC = {"draft": False, "html_url": "https://rel", "assets": [{"name": n} for n in ASSETS]}
+
+    def test_back_to_back_bumps_cannot_hide_a_broken_release(self) -> None:
+        # v1.3.0 landed 20 min ago; v1.2.0 landed 2 h ago and never published.
+        bumps = [{"version": "1.3.0", "landed_at": ago(minutes=20)},
+                 {"version": "1.2.0", "landed_at": ago(minutes=120)}]
+        verdict, applied = self.run_chain(current="1.3.0", bumps=bumps, releases={},
+                                          latest="v1.1.0", tags={"v1.2.0", "v1.3.0"})
+        self.assertEqual(verdict["state"], "failing")
+        self.assertEqual(verdict["version"], "v1.2.0")
+        self.assertEqual(applied[0][1:3], (rw.CHAIN_TITLE, True))
+
+    def test_a_green_current_release_closes_the_tracker_at_once(self) -> None:
+        bumps = [{"version": "1.3.0", "landed_at": ago(minutes=20)}]
+        verdict, applied = self.run_chain(current="1.3.0", bumps=bumps,
+                                          releases={"v1.3.0": self.PUBLIC}, latest="v1.3.0",
+                                          tags={"v1.3.0"}, tracker={"number": 4})
+        self.assertEqual(verdict["state"], "ok")
+        self.assertEqual(applied[0][1:3], (rw.CHAIN_TITLE, False))
+
+    def test_pending_with_nothing_older_leaves_the_tracker(self) -> None:
+        bumps = [{"version": "1.3.0", "landed_at": ago(minutes=20)}]
+        verdict, applied = self.run_chain(current="1.3.0", bumps=bumps, releases={},
+                                          latest="v1.2.0", tags={"v1.3.0"},
+                                          tracker={"number": 4, "body": "x"})
+        self.assertEqual(verdict["state"], "pending")
+        self.assertEqual(applied, [])
+
+
 class TrackerTests(unittest.TestCase):
     def test_lifecycle(self) -> None:
         self.assertEqual(rw.issue_action(False, True), "create")
@@ -257,6 +487,28 @@ class TrackerCreationTests(unittest.TestCase):
         self.assertEqual(found["number"], 1)
 
 
+class TrackerLabelTests(unittest.TestCase):
+    def update(self, labels: list[dict]) -> list[tuple[str, ...]]:
+        calls: list[tuple[str, ...]] = []
+
+        def fake(*args: str) -> subprocess.CompletedProcess[str]:
+            calls.append(args)
+            out = json.dumps([{"number": 3, "title": "t", "labels": labels}]) \
+                if args[1].startswith("repos/o/r/issues?") else "{}"
+            return subprocess.CompletedProcess(args, 0, stdout=out, stderr="")
+        with mock.patch.object(rw, "run_gh", fake):
+            self.assertEqual(rw.apply_tracker("o/r", "t", True, "body", "closed"), "update")
+        return [c for c in calls if c[3:4] == ("repos/o/r/issues/3/labels",)]
+
+    def test_an_unlabelled_tracker_gains_the_notify_label_on_update(self) -> None:
+        added = self.update([{"name": "release-stall"}])
+        self.assertEqual(len(added), 1)
+        self.assertIn("labels[]=release-blocked", added[0])
+
+    def test_a_labelled_tracker_is_left_alone(self) -> None:
+        self.assertEqual(self.update([{"name": "release-blocked"}]), [])
+
+
 class WorkflowTests(unittest.TestCase):
     def workflow(self, name: str) -> str:
         return (ROOT / ".github/workflows" / name).read_text()
@@ -275,6 +527,18 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('cron: "*/30 * * * *"', text)
         self.assertIn("fetch-depth: 0", text)
         self.assertNotIn("RELEASE_BOT_TOKEN", text)
+
+    def test_chain_runs_on_schedule_and_after_release_runs(self) -> None:
+        text = self.workflow("release-cadence-check.yml")
+        # Heal completing means a re-run was requested, not finished; the
+        # re-run's own Release completion triggers the check.
+        self.assertIn('workflows: ["Release"]', text)
+        self.assertIn("--bump-stale-minutes 120", text)
+        self.assertIn("release_watchdog.py \"${args[@]}\" chain --bound-minutes 90", text)
+        self.assertIn("if: ${{ !cancelled() }}", text)
+        for name in ("Release",):
+            self.assertTrue(any(p.read_text().startswith(f"name: {name}\n")
+                                for p in (ROOT / ".github/workflows").glob("*.yml")))
 
     def test_least_privilege_and_concurrency(self) -> None:
         for name in ("auto-release-watchdog.yml", "release-cadence-check.yml"):

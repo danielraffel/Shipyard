@@ -80,9 +80,9 @@ gh workflow run release.yml --ref v<x.y.z>
 
 Run that after the auto-tag appears. The release workflow will pick up the existing tag and publish the binaries. (Pulp's first auto-released tag, `v0.4.0`, used this fallback before its `RELEASE_BOT_TOKEN` was provisioned.)
 
-## macOS release is a locally-signed + stapled .dmg
+## macOS release is a signed + stapled .dmg
 
-**As of 2026-04-24 evening, macOS binaries ship as stapled `.dmg` artifacts built on the maintainer's Mac.** This supersedes the "bare Mach-O, notarized at release" path used through v0.43.0.
+**macOS binaries ship as stapled `.dmg` artifacts.** This supersedes the "bare Mach-O, notarized at release" path used through v0.43.0. With `CI_MACOS_SIGNING_ENABLED=true` (the setting today), `release.yml`'s `sign-and-upload-macos` job builds, signs, notarizes, staples, attests and publishes the DMG on the self-hosted `local-mac` runner on m5studio (see "CI macOS signing (enabled)" below); nobody runs anything by hand. `scripts/release-macos-local.sh`, described next, is what that job runs in `--ci-mode`, and the break-glass path on a maintainer Mac when the CI job cannot run.
 
 **What we learned** (issue [#219](https://github.com/danielraffel/Shipyard/issues/219)):
 
@@ -163,10 +163,11 @@ The script runs the full pipeline on the local Mac:
 
 Running without `--upload` is the diagnostic mode (used to confirm the local signing path actually works on a given Mac). Script-helper tests under `scripts/test_*.py` ensure missing creds / bad flags / bash syntax errors all surface before the expensive build step.
 
-### Optional CI macOS signing
+### CI macOS signing (enabled)
 
-CI signing is dormant unless the repository variable
-`CI_MACOS_SIGNING_ENABLED=true` is set. When enabled, the macOS release
+CI signing runs when the repository variable `CI_MACOS_SIGNING_ENABLED=true`
+is set, as it is today; without it, publishing falls back to the local script
+above. When enabled, the macOS release
 job imports a Developer ID identity into an ephemeral keychain, resolves
 the identity by Team ID, and runs `scripts/release-macos-local.sh
 --ci-mode --upload`.

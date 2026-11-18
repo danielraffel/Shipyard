@@ -51,6 +51,7 @@ import re
 import secrets
 import subprocess
 import sys
+import time
 import tomllib
 from dataclasses import dataclass, field
 from typing import Any
@@ -746,10 +747,51 @@ class GitHub:
             return None
         raise TierError(f"reading {path} at {ref[:12]} failed: {done.stderr.strip()[:300]}")
 
+    RETRY_DELAYS = (2, 5, 10)
+
+    @staticmethod
+    def _transient(text: str) -> bool:
+        low = text.lower()
+        return (not low.strip() or "unexpected end of json" in low or "timed out" in low
+                or "timeout" in low or "invalid json" in low
+                or re.search(r"\b(50[0-9]|429)\b", low) is not None
+                or "connection" in low or "eof" in low)
+
+    def _landed(self, path: str, body: dict[str, Any]) -> bool:
+        """True when a check run carrying this invocation's external_id exists."""
+        try:
+            for page in range(1, 11):
+                found = self.json(f"repos/{self.repo}/commits/{body['head_sha']}/check-runs"
+                                  f"?check_name={quote(str(body.get('name')), safe='')}"
+                                  f"&filter=all&per_page=100&page={page}")
+                runs = found.get("check_runs") if isinstance(found, dict) else None
+                if any(isinstance(run, dict) and run.get("external_id") == body["external_id"]
+                       for run in runs or []):
+                    return True
+                if len(runs or []) < 100:
+                    break
+        except (TierError, ValueError):
+            pass
+        return False
+
     def post(self, path: str, body: dict[str, Any]) -> None:
-        done = self._run(["-X", "POST", path, "--input", "-"], stdin=json.dumps(body))
-        if done.returncode != 0:
-            raise TierError(f"POST {path} failed: {(done.stderr or done.stdout).strip()[:300]}")
+        check = path.endswith("/check-runs") and bool(body.get("head_sha"))
+        if check:
+            # Names this publication, so a readback never mistakes a rerun's or
+            # another writer's run of the same name for ours.
+            body = {**body, "external_id": secrets.token_hex(16)}
+        delays = list(self.RETRY_DELAYS)
+        while True:
+            done = self._run(["-X", "POST", path, "--input", "-"], stdin=json.dumps(body))
+            if done.returncode == 0:
+                return
+            detail = (done.stderr or done.stdout).strip()
+            # The failed attempt may have landed; never create a duplicate.
+            if check and self._transient(detail) and self._landed(path, body):
+                return
+            if not self._transient(detail) or not delays:
+                raise TierError(f"POST {path} failed: {detail[:300]}")
+            time.sleep(delays.pop(0))
 
 
 def evaluate(github: GitHub, number: int) -> tuple[dict[str, Any], Assessment]:
