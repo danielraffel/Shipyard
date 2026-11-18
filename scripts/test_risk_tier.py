@@ -582,6 +582,12 @@ class PostRetry(unittest.TestCase):
         self.assertEqual(github.posts, 4)
         self.assertEqual(github.check_runs, [])
 
+    def test_preexisting_check_run_does_not_mask_a_lost_post(self) -> None:
+        github = FlakyTransport([("unexpected end of JSON input", False)])
+        github.check_runs.append({"name": "risk-tier", "old": True})
+        self.post(github)
+        self.assertEqual(len(github.check_runs), 2)
+
     def test_permanent_error_is_not_retried(self) -> None:
         github = FlakyTransport([("HTTP 403 Resource not accessible", False)])
         with self.assertRaises(rt.TierError):

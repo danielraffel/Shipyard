@@ -757,20 +757,22 @@ class GitHub:
                 or re.search(r"\b(50[0-9]|429)\b", low) is not None
                 or "connection" in low or "eof" in low)
 
-    def _already_posted(self, path: str, body: dict[str, Any]) -> bool:
-        """True when a check run with this name and head already exists."""
+    def _count_check_runs(self, path: str, body: dict[str, Any]) -> int | None:
+        """Check runs with this name on this head, or None when not countable."""
         if not path.endswith("/check-runs") or not body.get("head_sha"):
-            return False
+            return None
         try:
             found = self.json(f"repos/{self.repo}/commits/{body['head_sha']}/check-runs"
                               f"?check_name={quote(str(body.get('name')), safe='')}")
         except (TierError, ValueError):
-            return False
-        return bool(isinstance(found, dict) and found.get("total_count"))
+            return None
+        total = found.get("total_count") if isinstance(found, dict) else None
+        return total if isinstance(total, int) else None
 
     def post(self, path: str, body: dict[str, Any]) -> None:
         delays = list(self.RETRY_DELAYS)
-        attempt = 0
+        # A rerun may already have a run of this name; only growth proves a landing.
+        baseline = self._count_check_runs(path, body)
         while True:
             done = self._run(["-X", "POST", path, "--input", "-"], stdin=json.dumps(body))
             if done.returncode == 0:
@@ -779,9 +781,9 @@ class GitHub:
             if not self._transient(detail) or not delays:
                 raise TierError(f"POST {path} failed: {detail[:300]}")
             time.sleep(delays.pop(0))
-            attempt += 1
             # The failed attempt may have landed; never create a duplicate.
-            if self._already_posted(path, body):
+            now = self._count_check_runs(path, body)
+            if baseline is not None and now is not None and now > baseline:
                 return
 
 
