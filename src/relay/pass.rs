@@ -240,12 +240,23 @@ fn run_repo(
         .map(|t| t.pr)
         .collect();
     let mut read = super::fetch(input.gh, repo, &live, true)?;
-    // A marker-sourced owner whose marker is gone from the body is forgotten.
+    // A marker-sourced owner whose marker is gone from an open pull request's
+    // body is forgotten. A pull request that merged or closed is no longer in
+    // the open list, so its missing marker says nothing: its owner still gets
+    // the `merged` or `closed` message.
     for tracked in state.prs.values_mut().filter(|t| t.repo == repo) {
-        if tracked
-            .owner
-            .as_ref()
-            .is_some_and(|o| o.source == owner_registry::Source::BodyMarker)
+        let still_open = read
+            .prs
+            .get(&tracked.pr)
+            .and_then(Option::as_ref)
+            .and_then(|node| node.get("state"))
+            .and_then(Value::as_str)
+            == Some("OPEN");
+        if still_open
+            && tracked
+                .owner
+                .as_ref()
+                .is_some_and(|o| o.source == owner_registry::Source::BodyMarker)
             && !read.markers.contains_key(&tracked.pr)
         {
             tracked.owner = None;
