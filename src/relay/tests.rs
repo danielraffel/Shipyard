@@ -1971,6 +1971,7 @@ fn overdue_event(head: &str, level: u32) -> RelayEvent {
         level,
         age_minutes: 45,
         limit_minutes: 30,
+        blocked_on: None,
     }
 }
 
@@ -2255,5 +2256,33 @@ fn the_digest_follows_a_take_and_a_release_as_the_push_fence_does() {
             until: "2026-11-16T23:00:00+00:00".to_owned()
         }),
         "a time written with spaces is relayed as one plain token"
+    );
+}
+
+/// The steward's approved-but-stuck alert reaches the relay like any author
+/// overdue row, naming why the steward has not merged it; the reason is told,
+/// not keyed, so a changed reason is not a second alert.
+#[test]
+fn an_approved_stuck_row_is_relayed_with_its_blocking_reason() {
+    let row = |token: &str| {
+        json!({"pr": 69, "state": "approved_stuck", "head": HEAD_A, "level": 1,
+               "escalated_level": 1, "age_minutes": 75, "limit_minutes": 60,
+               "blocked_on": token, "owner": {"role": "author"},
+               "act": {"disposition": "no_act"}})
+    };
+    let rows =
+        steward_overdue(&json!({"repos": [{"dwell": {"overdue": [row("merge_state:UNSTABLE")]}}]}));
+    let event = &rows[&69][0];
+    assert_eq!(
+        event.describe(),
+        "overdue: approved_stuck for 75 min (limit 60 min); blocked on merge_state:UNSTABLE"
+    );
+    let other = &steward_overdue(
+        &json!({"repos": [{"dwell": {"overdue": [row("excluded_label:owner-decision")]}}]}),
+    )[&69][0];
+    assert_eq!(event.key(REPO, 69), other.key(REPO, 69));
+    assert_eq!(
+        event.key(REPO, 69),
+        format!("{REPO}#69:overdue:{HEAD_A}:approved_stuck:1")
     );
 }

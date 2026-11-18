@@ -171,6 +171,11 @@ pub(crate) enum RelayEvent {
         age_minutes: i64,
         #[serde(default)]
         limit_minutes: u32,
+        /// Why the steward has not merged it (its `blocked_on`), when the
+        /// row names it. Told, never part of the key: the same alert is not
+        /// repeated because the reason changed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        blocked_on: Option<String>,
     },
 }
 
@@ -277,8 +282,16 @@ impl RelayEvent {
                 state,
                 age_minutes,
                 limit_minutes,
+                blocked_on,
                 ..
-            } => format!("overdue: {state} for {age_minutes} min (limit {limit_minutes} min)"),
+            } => {
+                let reason = blocked_on
+                    .as_deref()
+                    .map_or_else(String::new, |token| format!("; blocked on {token}"));
+                format!(
+                    "overdue: {state} for {age_minutes} min (limit {limit_minutes} min){reason}"
+                )
+            }
         }
     }
 }
@@ -934,6 +947,11 @@ pub(crate) fn steward_overdue(report: &Value) -> BTreeMap<u64, Vec<RelayEvent>> 
                 .and_then(Value::as_u64)
                 .and_then(|minutes| u32::try_from(minutes).ok())
                 .unwrap_or(0),
+            blocked_on: row
+                .get("blocked_on")
+                .and_then(Value::as_str)
+                .filter(|token| !token.is_empty())
+                .map(str::to_owned),
         });
     }
     out
