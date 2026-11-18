@@ -1361,3 +1361,366 @@ mod stale_annotate {
         ));
     }
 }
+
+/// Through a real dwell pass: only an approved, required-green pull request
+/// the steward neither merged nor queued is tracked; past 60 minutes it
+/// raises one author-routed `approved_stuck` row naming the steward's
+/// `blocked_on`, written once to the overdue feed, then reported without
+/// escalating. A red, an unapproved (no green verdict, or a refusing verdict
+/// status), and an enqueued pull request never are.
+#[test]
+fn an_approved_green_pull_request_the_steward_did_not_merge_is_alerted_once() {
+    let temp = tempfile::tempdir().unwrap();
+    // #5: every required check green, but its newest `review-verdict` commit
+    // status refuses the head, so it is not approved.
+    let mut refused = pr(5, Some("SUCCESS"), Some("SUCCESS"), &[]);
+    refused
+        .fact
+        .checks
+        .push(crate::merge_steward::StewardCheck {
+            name: "review-verdict".to_owned(),
+            source: crate::merge_steward::StewardCheckSource::StatusContext,
+            app_id: None,
+            status: "COMPLETED".to_owned(),
+            conclusion: Some("FAILURE".to_owned()),
+            run_id: None,
+            observed_at: Some("2026-11-09T10:00:00Z".to_owned()),
+            check_id: None,
+            description: None,
+        });
+    let prs = vec![
+        pr(1, Some("SUCCESS"), Some("SUCCESS"), &[]),
+        pr(2, Some("FAILURE"), Some("SUCCESS"), &[]),
+        pr(3, Some("SUCCESS"), Some("FAILURE"), &[]),
+        pr(4, Some("SUCCESS"), Some("SUCCESS"), &[]),
+        refused,
+    ];
+    let mut enqueued = report(4, "admitted", None);
+    enqueued.mutation = Some("enqueued".to_owned());
+    let mut pass = pass(
+        &temp,
+        prs,
+        vec![
+            report(1, "merge_state:UNSTABLE", None),
+            report(2, "required_failed:macos", None),
+            report(3, "no_verdict", None),
+            enqueued,
+            report(5, "required_failed:review-verdict", None),
+        ],
+    );
+    let mut ledger = established();
+    let stuck_rows = |report: &dwell_pass::DwellRepoReport| {
+        report
+            .overdue
+            .iter()
+            .filter(|row| row.state == crate::merge_steward::dwell::DwellState::ApprovedStuck)
+            .map(|row| {
+                (
+                    row.pr,
+                    row.blocked_on.clone(),
+                    row.escalated,
+                    row.owner.role,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    for minute in [0, 15, 30, 45, 59] {
+        pass.now = now() + chrono::Duration::minutes(minute);
+        assert!(stuck_rows(&pass.run(&mut ledger, &FakeActs::default())).is_empty());
+    }
+    pass.now = now() + chrono::Duration::minutes(61);
+    let first = pass.run(&mut ledger, &FakeActs::default());
+    assert_eq!(
+        stuck_rows(&first),
+        vec![(1, "merge_state:UNSTABLE".to_owned(), true, "author")]
+    );
+    let feed = fs::read_to_string(
+        temp.path()
+            .join("state")
+            .join(dwell_pass::DIR)
+            .join(dwell_pass::FEED),
+    )
+    .expect("feed");
+    assert_eq!(feed.matches("\"approved_stuck\"").count(), 1, "{feed}");
+    pass.now = now() + chrono::Duration::minutes(75);
+    let later = pass.run(&mut ledger, &FakeActs::default());
+    assert_eq!(
+        stuck_rows(&later),
+        vec![(1, "merge_state:UNSTABLE".to_owned(), false, "author")]
+    );
+    let feed = fs::read_to_string(
+        temp.path()
+            .join("state")
+            .join(dwell_pass::DIR)
+            .join(dwell_pass::FEED),
+    )
+    .expect("feed");
+    assert_eq!(
+        feed.matches("\"approved_stuck\"").count(),
+        1,
+        "alerted once"
+    );
+    // The row the relay reads delivers, with the reason.
+    let tick =
+        serde_json::json!({"repos": [{"dwell": serde_json::to_value(&later).expect("json")}]});
+    let events = crate::relay::steward_overdue(&tick);
+    assert_eq!(
+        events[&1][0].describe(),
+        "overdue: approved_stuck for 75 min (limit 60 min); blocked on merge_state:UNSTABLE"
+    );
+}
+
+/// Approval for the alarm is the newest `review-verdict` observation, green,
+/// with no newer refusing status, whether or not `review-verdict` is a
+/// required check: an older green attempt never stands in for a newer red
+/// one, and a head with no verdict at all is not approved.
+#[test]
+fn the_alarm_reads_approval_from_the_newest_verdict_observation() {
+    let not_required = StewardPolicy {
+        required_checks: vec![RequiredCheck {
+            context: "macos".to_owned(),
+            app_id: None,
+        }],
+        ..queue_policy()
+    };
+    let verdict = |conclusion: &str, id: u64, at: &str| crate::merge_steward::StewardCheck {
+        name: "review-verdict".to_owned(),
+        source: crate::merge_steward::StewardCheckSource::CheckRun,
+        app_id: None,
+        status: "COMPLETED".to_owned(),
+        conclusion: Some(conclusion.to_owned()),
+        run_id: Some(id),
+        observed_at: Some(at.to_owned()),
+        check_id: Some(id),
+        description: None,
+    };
+    for policy in [policy(), not_required] {
+        let approved = pr(1, Some("SUCCESS"), Some("SUCCESS"), &[]);
+        assert!(dwell_pass::approved_at_head(&approved.fact, &policy));
+        let mut regressed = pr(2, Some("SUCCESS"), None, &[]);
+        regressed
+            .fact
+            .checks
+            .push(verdict("SUCCESS", 10, "2026-11-09T10:00:00Z"));
+        regressed
+            .fact
+            .checks
+            .push(verdict("FAILURE", 11, "2026-11-09T11:00:00Z"));
+        assert!(!dwell_pass::approved_at_head(&regressed.fact, &policy));
+        let none = pr(3, Some("SUCCESS"), None, &[]);
+        assert!(!dwell_pass::approved_at_head(&none.fact, &policy));
+        for no_verdict in ["NEUTRAL", "SKIPPED"] {
+            let mut skipped = pr(4, Some("SUCCESS"), None, &[]);
+            skipped
+                .fact
+                .checks
+                .push(verdict(no_verdict, 12, "2026-11-09T11:00:00Z"));
+            assert!(
+                !dwell_pass::approved_at_head(&skipped.fact, &policy),
+                "{no_verdict}"
+            );
+        }
+    }
+}
+
+/// A stuck alert counts against `max_escalations_per_pass`; one the cap
+/// defers is reported as deferred, not marked, and escalates on a later pass
+/// with budget.
+#[test]
+fn a_stuck_alert_is_within_the_per_pass_escalation_cap() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut pass = pass(
+        &temp,
+        vec![pr(1, Some("SUCCESS"), Some("SUCCESS"), &[])],
+        vec![report(1, "merge_state:UNSTABLE", None)],
+    );
+    pass.dwell_policy.max_escalations_per_pass = 0;
+    let mut ledger = established();
+    for minute in [0, 15, 30, 45, 55] {
+        pass.now = now() + chrono::Duration::minutes(minute);
+        pass.run(&mut ledger, &FakeActs::default());
+    }
+    pass.now = now() + chrono::Duration::minutes(61);
+    let capped = pass.run(&mut ledger, &FakeActs::default());
+    let row = capped
+        .overdue
+        .iter()
+        .find(|row| row.state == crate::merge_steward::dwell::DwellState::ApprovedStuck)
+        .expect("stuck row");
+    assert!(!row.escalated && row.escalation_deferred);
+    assert_eq!(row.escalated_level, 0, "a deferred alert is not relayed");
+    assert_eq!(capped.escalations_new, 0);
+    pass.dwell_policy.max_escalations_per_pass = 1;
+    pass.now = now() + chrono::Duration::minutes(66);
+    let released = pass.run(&mut ledger, &FakeActs::default());
+    assert_eq!(
+        released.escalations_new, 1,
+        "the deferred alert was not used up"
+    );
+}
+
+/// A pass that does not apply reports the stuck row but as not emitted
+/// (`escalated_level` 0), writes no feed, and leaves the alert for the next
+/// apply pass.
+#[test]
+fn a_dry_run_pass_reports_the_stuck_row_as_not_emitted() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut pass = pass(
+        &temp,
+        vec![pr(1, Some("SUCCESS"), Some("SUCCESS"), &[])],
+        vec![report(1, "merge_state:UNSTABLE", None)],
+    );
+    let mut ledger = established();
+    pass.run(&mut ledger, &FakeActs::default());
+    pass.apply = false;
+    pass.now = now() + chrono::Duration::minutes(61);
+    let dry = pass.run(&mut ledger, &FakeActs::default());
+    let row = dry
+        .overdue
+        .iter()
+        .find(|row| row.state == crate::merge_steward::dwell::DwellState::ApprovedStuck)
+        .expect("stuck row");
+    assert_eq!(row.escalated_level, 0);
+    assert!(
+        !temp
+            .path()
+            .join("state")
+            .join(dwell_pass::DIR)
+            .join(dwell_pass::FEED)
+            .exists(),
+        "a dry run writes no feed"
+    );
+    pass.apply = true;
+    pass.now = now() + chrono::Duration::minutes(62);
+    assert_eq!(
+        pass.run(&mut ledger, &FakeActs::default()).escalations_new,
+        1
+    );
+}
+
+/// Through a real pass: a row the pass budget defers on every pass is still
+/// judged from its census facts, so the alert fires at 60 minutes while it
+/// is deferred, naming the last real reason rather than the deferral.
+#[test]
+fn a_row_deferred_every_pass_still_alerts() {
+    let temp = tempfile::tempdir().unwrap();
+    let prs = vec![pr(1, Some("SUCCESS"), Some("SUCCESS"), &[])];
+    let mut pass = pass(
+        &temp,
+        prs.clone(),
+        vec![report(1, "merge_state:UNSTABLE", None)],
+    );
+    let mut ledger = established();
+    pass.run(&mut ledger, &FakeActs::default());
+    pass.reports = vec![pass_budget::deferred_report(
+        &prs[0],
+        StewardDecision::ArmMergeQueue,
+        "budget",
+    )];
+    let mut alerts = Vec::new();
+    for minute in (5..=90).step_by(5) {
+        pass.now = now() + chrono::Duration::minutes(minute);
+        let report = pass.run(&mut ledger, &FakeActs::default());
+        alerts.extend(
+            report
+                .overdue
+                .iter()
+                .filter(|row| {
+                    row.state == crate::merge_steward::dwell::DwellState::ApprovedStuck
+                        && row.escalated
+                })
+                .map(|row| (minute, row.blocked_on.clone())),
+        );
+    }
+    assert_eq!(alerts, vec![(60, "merge_state:UNSTABLE".to_owned())]);
+}
+
+/// The alarm covers pull requests the steward manages. An approved,
+/// required-green pull request it does not manage (no managed label, or no
+/// handoff receipt at its head) is not one it left unmerged, so it never
+/// alerts; the same pull request managed does.
+#[test]
+fn an_unmanaged_pull_request_never_alerts() {
+    let temp = tempfile::tempdir().unwrap();
+    let prs = vec![
+        pr(1, Some("SUCCESS"), Some("SUCCESS"), &[]),
+        pr(2, Some("SUCCESS"), Some("SUCCESS"), &[]),
+        pr(3, Some("SUCCESS"), Some("SUCCESS"), &[]),
+    ];
+    let mut unmanaged = report(1, "unmanaged", None);
+    unmanaged.decision = StewardDecision::Unmanaged;
+    let mut no_handoff = report(2, "handoff_missing", None);
+    no_handoff.decision = StewardDecision::HandoffMissing;
+    let mut pass = pass(
+        &temp,
+        prs,
+        vec![
+            unmanaged,
+            no_handoff,
+            report(3, "merge_state:UNSTABLE", None),
+        ],
+    );
+    let mut ledger = established();
+    let mut alerted = Vec::new();
+    for minute in (0..=65).step_by(5) {
+        pass.now = now() + chrono::Duration::minutes(minute);
+        let report = pass.run(&mut ledger, &FakeActs::default());
+        alerted.extend(
+            report
+                .overdue
+                .iter()
+                .filter(|row| {
+                    row.state == crate::merge_steward::dwell::DwellState::ApprovedStuck
+                        && row.escalated
+                })
+                .map(|row| row.pr),
+        );
+    }
+    assert_eq!(alerted, vec![3]);
+}
+
+/// Approved, required-green, managed pull requests that are deliberately
+/// parked (`owner-decision`, `superseded`, `PARKED/<platform>`), drafts, and
+/// queued ones never alert; the same pull request without any of those does.
+#[test]
+fn parked_draft_and_queued_pull_requests_never_alert() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut draft = pr(4, Some("SUCCESS"), Some("SUCCESS"), &[]);
+    draft.fact.draft = true;
+    let mut queued = pr(5, Some("SUCCESS"), Some("SUCCESS"), &[]);
+    queued.fact.queue_position = Some(0);
+    let prs = vec![
+        pr(1, Some("SUCCESS"), Some("SUCCESS"), &["owner-decision"]),
+        pr(2, Some("SUCCESS"), Some("SUCCESS"), &["superseded"]),
+        pr(3, Some("SUCCESS"), Some("SUCCESS"), &["PARKED/windows"]),
+        draft,
+        queued,
+        pr(6, Some("SUCCESS"), Some("SUCCESS"), &[]),
+    ];
+    let reports = vec![
+        report(1, "excluded_label:owner-decision", None),
+        report(2, "excluded_label:superseded", None),
+        report(3, "excluded_label:PARKED/windows", None),
+        report(4, "draft", None),
+        report(5, "queued", None),
+        report(6, "merge_state:UNSTABLE", None),
+    ];
+    let mut pass = pass(&temp, prs, reports);
+    let mut ledger = established();
+    let mut alerted = Vec::new();
+    for minute in (0..=65).step_by(5) {
+        pass.now = now() + chrono::Duration::minutes(minute);
+        let report = pass.run(&mut ledger, &FakeActs::default());
+        alerted.extend(
+            report
+                .overdue
+                .iter()
+                .filter(|row| {
+                    row.state == crate::merge_steward::dwell::DwellState::ApprovedStuck
+                        && row.escalated
+                })
+                .map(|row| row.pr),
+        );
+    }
+    assert_eq!(alerted, vec![6]);
+}
