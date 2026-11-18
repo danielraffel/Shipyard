@@ -291,6 +291,18 @@ def pick_version(current: str, bumps: list[dict], now: datetime,
     return current, landed
 
 
+def pick_run(runs: list[dict]) -> dict | None:
+    """The run that speaks for a tag: any successful one (the install proof
+    stands even if a later manual run failed), else the newest."""
+    return next((r for r in runs if r.get("conclusion") == "success"), runs[0] if runs else None)
+
+
+def stale_bump_only(body: str) -> bool:
+    """Whether a chain tracker's sole failure was a stale bump pull request."""
+    m = re.search(rf"<!--\s*{KEY_MARKER}:\s*\S+?:(\S*)\s*-->", body or "")
+    return bool(m) and m.group(1) == "bump_pr_stale"
+
+
 def chain_key(version: str, failures: list[tuple[str, str]]) -> str:
     """What the notifier compares: a new version or a new failing step is news."""
     return f"v{version}:" + ",".join(step for step, _ in failures)
@@ -549,8 +561,8 @@ def run_chain(args: argparse.Namespace, now: datetime) -> int:
     tag = f"v{version}"
     tag_exists = git("rev-parse", "-q", "--verify", f"refs/tags/{tag}").returncode == 0
     runs = json.loads(gh("api", f"repos/{args.repo}/actions/workflows/release.yml/runs"
-                                f"?branch={tag}&per_page=1")).get("workflow_runs", [])
-    run = runs[0] if runs else None
+                                f"?branch={tag}&per_page=10")).get("workflow_runs", [])
+    run = pick_run(runs)
     failed_jobs = ""
     if run and run.get("status") == "completed" and run.get("conclusion") != "success":
         jobs = json.loads(gh("api", f"repos/{args.repo}/actions/runs/{run['id']}/jobs"
@@ -584,9 +596,17 @@ def run_chain(args: argparse.Namespace, now: datetime) -> int:
     print(json.dumps({"state": verdict["state"], "version": tag,
                       "failures": verdict["failures"], "note": verdict["note"]}))
     if verdict["state"] == "pending":
-        # Only when no version has passed its bound yet; the tracker closes on
-        # an ok verdict, never on a pending one.
-        print("chain: pending, tracker untouched")
+        # Only when no version has passed its bound yet. The tracker closes on
+        # an ok verdict, except one that only reported a bump pull request that
+        # has since merged or closed (nothing is failing now).
+        tracker = None if args.dry_run else find_tracker(args.repo, CHAIN_TITLE)
+        if tracker and stale_bump_only(tracker.get("body", "")):
+            apply_tracker(args.repo, CHAIN_TITLE, False, "",
+                          f"The bump pull request is no longer open; {tag} is inside its "
+                          f"{args.bound_minutes:.0f}-minute bound. Closing.")
+            print("tracker: close (stale bump resolved)")
+        else:
+            print("chain: pending, tracker untouched")
         return 0
     body = chain_body(version, verdict, evidence, now, args.repo)
     if args.dry_run:

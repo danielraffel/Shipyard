@@ -267,6 +267,21 @@ class PickVersionTests(unittest.TestCase):
         self.assertEqual(steps(chain(latest_tag="v1.1.9")), ["latest_mismatch"])
 
 
+class ChainIoDecisionTests(unittest.TestCase):
+    def test_a_successful_run_outranks_a_later_failed_one(self) -> None:
+        runs = [{"id": 9, "conclusion": "failure"}, {"id": 7, "conclusion": "success"}]
+        self.assertEqual(rw.pick_run(runs)["id"], 7)
+        self.assertEqual(rw.pick_run([{"id": 9, "conclusion": None}])["id"], 9)
+        self.assertIsNone(rw.pick_run([]))
+
+    def test_only_a_stale_bump_tracker_closes_while_pending(self) -> None:
+        self.assertTrue(rw.stale_bump_only("<!-- release-blocked-key: v1.2.0:bump_pr_stale -->"))
+        self.assertFalse(rw.stale_bump_only(
+            "<!-- release-blocked-key: v1.2.0:bump_pr_stale,release_run_failed -->"))
+        self.assertFalse(rw.stale_bump_only("<!-- release-blocked-key: v1.2.0:tag_missing -->"))
+        self.assertFalse(rw.stale_bump_only("no marker"))
+
+
 class TrackerTests(unittest.TestCase):
     def test_lifecycle(self) -> None:
         self.assertEqual(rw.issue_action(False, True), "create")
