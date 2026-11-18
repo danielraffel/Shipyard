@@ -590,15 +590,22 @@ fn check_is_green(check: &StewardCheck) -> bool {
 }
 
 /// Whether two observations come from the same producer of the same check:
-/// same name (any case), surface and app.
+/// same name (any case), surface and app, and for a check run the same
+/// workflow run. A job rerun keeps its workflow run, so the newer attempt
+/// supersedes the older; the same job name in another workflow, or in the
+/// same workflow run by another event, is a separate GitHub context and is
+/// judged on its own. A commit status is one context per name, as GitHub
+/// keeps it. A check run whose workflow run is unknown (another app's) is
+/// keyed by name and app alone.
 fn same_producer(left: &StewardCheck, right: &StewardCheck) -> bool {
     left.name.eq_ignore_ascii_case(&right.name)
         && left.source == right.source
         && left.app_id == right.app_id
+        && (left.source == StewardCheckSource::StatusContext || left.run_id == right.run_id)
 }
 
 /// Names of checks on this head that are not green (red or pending) and that
-/// no required rule selects, sorted. Each producer (name, surface, app) is
+/// no required rule selects, sorted. Each producer ([`same_producer`]) is
 /// judged on its newest observation, so a green check from one producer
 /// cannot hide a red one of the same name from another; a rerun by the same
 /// producer supersedes its earlier attempt. A producer is required only when

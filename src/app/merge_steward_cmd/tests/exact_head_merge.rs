@@ -1244,13 +1244,17 @@ fn a_head_still_unstable_after_the_clear_merges_when_only_advisory_checks_are_re
     assert!(clear < merge, "{calls}");
 }
 
-/// Two producers report an advisory-named check: each is judged on its own
-/// newest observation, and a rerun by the same producer supersedes its own
-/// earlier attempt.
+/// Each producer of a check is judged on its own newest observation: a job
+/// rerun in the same workflow run supersedes the red attempt, while a green
+/// run from another app, or from another workflow run (another workflow, or
+/// another event) with the same job name, does not hide the red one.
 #[test]
 fn each_producer_of_a_check_is_judged_on_its_own_newest_observation() {
     let policy = unstable_policy(Some(&["zizmor (report only)"]));
-    let classify = |second_app: Option<u64>, second: &str, extra_unlisted_app: Option<u64>| {
+    let classify = |second_app: Option<u64>,
+                    second_run: u64,
+                    second: &str,
+                    extra_unlisted_app: Option<u64>| {
         let mut pr = parse_pr(
             &serde_json::from_str(&unstable_pr_json("SUCCESS", &[])).expect("PR json"),
             &BTreeMap::new(),
@@ -1278,7 +1282,7 @@ fn each_producer_of_a_check_is_judged_on_its_own_newest_observation() {
         pr.checks.push(StewardCheck {
             app_id: second_app,
             conclusion: Some(second.to_owned()),
-            run_id: Some(501),
+            run_id: Some(second_run),
             observed_at: Some("2026-10-30T00:00:20Z".to_owned()),
             check_id: Some(5001),
             ..base.clone()
@@ -1300,14 +1304,20 @@ fn each_producer_of_a_check_is_judged_on_its_own_newest_observation() {
             "risk-tier (not in unstable_advisory_checks)".to_owned(),
         ],
     };
-    // Same producer, green rerun: risk-tier is green; only the advisory
+    // Same workflow run, green rerun: risk-tier is green; only the advisory
     // zizmor is red, so it merges.
     assert_eq!(
-        classify(Some(ACTIONS_APP), "SUCCESS", Some(ACTIONS_APP)),
+        classify(Some(ACTIONS_APP), 500, "SUCCESS", Some(ACTIONS_APP)),
         StewardDecision::ArmMergeQueue
     );
-    // Another producer's green does not hide the red attempt.
-    assert_eq!(classify(Some(99), "SUCCESS", Some(ACTIONS_APP)), held);
+    // Another app's green does not hide the red attempt.
+    assert_eq!(classify(Some(99), 500, "SUCCESS", Some(ACTIONS_APP)), held);
+    // Nor does the same job name green in another workflow run (another
+    // workflow, or the same workflow on another event).
+    assert_eq!(
+        classify(Some(ACTIONS_APP), 501, "SUCCESS", Some(ACTIONS_APP)),
+        held
+    );
 }
 
 /// A check name with a newline or spaces stays one token in the mutation.
