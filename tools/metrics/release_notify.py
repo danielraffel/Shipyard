@@ -23,8 +23,9 @@ else release-notify-targets.txt next to this script), one per line:
     <host> <cmux target> [<cmux socket>]
 
 `<host>` is `local` or an ssh host; `<cmux target>` is a surface or workspace
-id, or a workspace title without spaces. Values may only use [A-Za-z0-9._:/@+-],
-so nothing reaches a remote shell unquoted.
+id, or a workspace title without spaces. Values may only use [A-Za-z0-9._:/@+-]
+and may not start with "-", so nothing reaches a remote shell unquoted or is
+read as an option.
 """
 from __future__ import annotations
 
@@ -41,7 +42,8 @@ import time
 REPO = "danielraffel/Shipyard"
 LABEL = "release-blocked"
 SENDER = "shipyard-release-watch"
-SAFE = re.compile(r"^[A-Za-z0-9._:/@+-]+$")
+# No leading "-": a field must never be read as an ssh or cmux option.
+SAFE = re.compile(r"^[A-Za-z0-9._:/@+][A-Za-z0-9._:/@+-]*$")
 KEY = re.compile(r"<!--\s*release-blocked-key:\s*(.*?)\s*-->")
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -121,7 +123,7 @@ def command(t: dict, cmux: str = "cmux") -> list[str]:
     cmd += ["agent", "message", t["target"], "--from", SENDER, "--", "-"]
     if t["host"] == "local":
         return cmd
-    return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", t["host"], *cmd]
+    return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", t["host"], *cmd]
 
 
 def record(state: dict, msg: dict, issues: list[dict]) -> None:
@@ -223,8 +225,14 @@ def run(a: argparse.Namespace, now: float | None = None) -> list[str]:
                 sent += 1
             else:
                 failed += 1
-                lines.append(f"{stamp} release-notify ERROR send {msg['key']} to "
-                             f"{dest(msg['to'])}: {detail}")
+                # One error line per message and target, not one per pass.
+                logged = state.setdefault("failed_logged", [])
+                once = f"{msg['key']}@{dest(msg['to'])}"
+                if once not in logged:
+                    logged.append(once)
+                    del logged[:-200]
+                    lines.append(f"{stamp} release-notify ERROR send {msg['key']} to "
+                                 f"{dest(msg['to'])}: {detail} (retried every pass)")
         if not a.dry_run:
             prune(state, issues, targets)
         if sent or failed:

@@ -38,9 +38,12 @@ credentials. It still runs when the release workflows or their token are broken:
   request is open. An open bump pull request is waiting on review, not stalled.
 - A `Cargo.toml` version move on `main` is in a `v*` tag within 30 minutes.
 
-Layer 4 follows the current `Cargo.toml` version on `main` to a release a user
-can install. Before 90 minutes have passed since the version landed it only
-reports `pending`. After that, every one of these must hold:
+Layer 4 follows the `Cargo.toml` version on `main` to a release a user can
+install. It judges the current version once 90 minutes have passed since it
+landed. Versions often land less than 90 minutes apart, so while the current
+one is inside its bound it judges the newest version already past it. A version
+counts as done once it, or a newer version, is the public `releases/latest`.
+Otherwise every one of these must hold:
 
 - the `v*` tag exists;
 - the tag's `release.yml` push run completed with success. Its
@@ -85,7 +88,7 @@ To preview without touching an issue:
 
 ```bash
 python3 scripts/release_watchdog.py --dry-run cadence
-python3 scripts/release_watchdog.py --dry-run chain --ref v<known-good tag>   # a control: ok
+python3 scripts/release_watchdog.py --dry-run chain --ref <newest published tag> --bound-minutes 0   # a control: ok
 python3 scripts/release_watchdog.py --dry-run watchdog --workflow "Assign versions at land" \
   --run-id <id> --run-url <url> --conclusion failure
 ```

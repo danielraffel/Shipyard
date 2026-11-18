@@ -1323,8 +1323,8 @@ fails it at any time. It keeps one `release-blocked` issue. Every
 release-chain issue carries that label, and the steward tick on m3 messages
 the lead sessions in `tools/metrics/release-notify-targets.txt` over cmux
 when one opens, changes its failing step or closes. Preview it with
-`python3 scripts/release_watchdog.py --dry-run chain`, adding `--ref v<known-good>`
-for a control.
+`python3 scripts/release_watchdog.py --dry-run chain`, adding `--ref <newest published tag> --bound-minutes 0`
+for a control (an older tag reports `latest_mismatch`).
 
 ## Stale ship-state records: `discard --repo` and `prune`
 

@@ -36,13 +36,15 @@ class TargetTests(unittest.TestCase):
         self.assertEqual(refused, [])
 
     def test_refuses_shell_syntax_and_bad_shapes(self) -> None:
-        targets, refused = rn.parse_targets("m5s surface:1;rm\nm5s\nm5s a b c\n")
+        targets, refused = rn.parse_targets(
+            "m5s surface:1;rm\nm5s\nm5s a b c\n-F/tmp/evil surface:1\nm5s --socket\n"
+            "m5s surface:1 -oProxyCommand=x\n")
         self.assertEqual(targets, [])
-        self.assertEqual(len(refused), 3)
+        self.assertEqual(len(refused), 6)
 
     def test_remote_command_is_batch_ssh_and_reads_the_text_from_stdin(self) -> None:
         self.assertEqual(rn.command(LEAD), [
-            "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "m5s", "cmux", "--socket",
+            "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", "m5s", "cmux", "--socket",
             "/tmp/cmux-nightly.sock", "agent", "message", "surface:1000090005", "--from",
             "shipyard-release-watch", "--", "-"])
         self.assertEqual(rn.command(ORCH)[:4], ["cmux", "agent", "message", "workspace:3"])
@@ -146,6 +148,8 @@ class RunTests(unittest.TestCase):
             rn.run(self.args(), now=2000.0)
         self.assertTrue(any("ERROR send #1500" in ln and "no such surface" in ln for ln in lines))
         self.assertEqual(len([c for c in calls if c[0] == "ssh"]), 2)
+        log = (self.dir / "summary.log").read_text()
+        self.assertEqual(log.count("ERROR send #1500"), 1)  # logged once, retried silently
 
     def test_a_github_read_error_is_logged_not_raised(self) -> None:
         def run(cmd, **kw):

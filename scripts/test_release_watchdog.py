@@ -241,33 +241,32 @@ class ChainTests(unittest.TestCase):
         self.assertIn("release-blocked", rw.LABEL_SPECS)
 
 
-class ChainRunTests(unittest.TestCase):
-    def run_pending(self, open_tracker: dict | None) -> list[tuple]:
-        closed: list[tuple] = []
-        args = rw.argparse.Namespace(repo="o/r", ref="origin/main", lookback_days=14.0,
-                                     bound_minutes=90.0, bump_stale_minutes=60.0, dry_run=False)
-        ok = subprocess.CompletedProcess([], 0, stdout="", stderr="")
-        with mock.patch.object(rw, "cargo_version_at", return_value="1.3.0"), \
-                mock.patch.object(rw, "latest_bump_landing", return_value=ago(minutes=5)), \
-                mock.patch.object(rw, "git", return_value=ok), \
-                mock.patch.object(rw, "gh", side_effect=lambda *a, **k: "[]" if "pulls" in a[1]
-                                  else '{"workflow_runs": []}'), \
-                mock.patch.object(rw, "optional_json", return_value=None), \
-                mock.patch.object(rw, "find_tracker", return_value=open_tracker), \
-                mock.patch.object(rw, "apply_tracker",
-                                  side_effect=lambda *a: closed.append(a) or "close"), \
-                contextlib.redirect_stdout(io.StringIO()):
-            rw.run_chain(args, NOW)
-        return closed
+class PickVersionTests(unittest.TestCase):
+    BUMPS = [{"version": "1.4.0", "landed_at": ago(minutes=20)},
+             {"version": "1.3.0", "landed_at": ago(minutes=70)},
+             {"version": "1.2.0", "landed_at": ago(minutes=120)}]
 
-    def test_a_pending_newer_version_closes_the_old_versions_tracker(self) -> None:
-        closed = self.run_pending({"number": 9})
-        self.assertEqual(len(closed), 1)
-        self.assertEqual(closed[0][1:3], (rw.CHAIN_TITLE, False))
-        self.assertIn("v1.3.0", closed[0][4])
+    def test_a_current_version_past_its_bound_is_judged(self) -> None:
+        self.assertEqual(rw.pick_version("1.2.0", self.BUMPS[2:], NOW), ("1.2.0", ago(minutes=120)))
 
-    def test_pending_with_no_tracker_touches_nothing(self) -> None:
-        self.assertEqual(self.run_pending(None), [])
+    def test_rapid_landings_judge_the_newest_version_past_its_bound(self) -> None:
+        # 2026-11-13: six bumps landed 30 to 80 minutes apart; judging only the
+        # current one left a broken release.yml unreported for hours.
+        self.assertEqual(rw.pick_version("1.4.0", self.BUMPS, NOW), ("1.2.0", ago(minutes=120)))
+
+    def test_pending_only_when_nothing_has_passed_its_bound(self) -> None:
+        self.assertEqual(rw.pick_version("1.4.0", self.BUMPS[:2], NOW), ("1.4.0", ago(minutes=20)))
+
+    def test_a_version_older_than_the_lookback(self) -> None:
+        self.assertEqual(rw.pick_version("1.1.0", self.BUMPS, NOW), ("1.1.0", None))
+
+    def test_a_superseded_version_is_ok_once_a_newer_release_is_latest(self) -> None:
+        verdict = chain(tag_exists=False, release=None, run=None, latest_tag="v1.3.0")
+        self.assertEqual(verdict["state"], "ok")
+        self.assertIn("superseded by v1.3.0", verdict["note"])
+
+    def test_an_older_latest_does_not_count(self) -> None:
+        self.assertEqual(steps(chain(latest_tag="v1.1.9")), ["latest_mismatch"])
 
 
 class TrackerTests(unittest.TestCase):
@@ -382,6 +381,28 @@ class TrackerCreationTests(unittest.TestCase):
         with mock.patch.object(rw, "run_gh", fake):
             found = rw.find_tracker("o/r", "t")
         self.assertEqual(found["number"], 1)
+
+
+class TrackerLabelTests(unittest.TestCase):
+    def update(self, labels: list[dict]) -> list[tuple[str, ...]]:
+        calls: list[tuple[str, ...]] = []
+
+        def fake(*args: str) -> subprocess.CompletedProcess[str]:
+            calls.append(args)
+            out = json.dumps([{"number": 3, "title": "t", "labels": labels}]) \
+                if args[1].startswith("repos/o/r/issues?") else "{}"
+            return subprocess.CompletedProcess(args, 0, stdout=out, stderr="")
+        with mock.patch.object(rw, "run_gh", fake):
+            self.assertEqual(rw.apply_tracker("o/r", "t", True, "body", "closed"), "update")
+        return [c for c in calls if c[3:4] == ("repos/o/r/issues/3/labels",)]
+
+    def test_an_unlabelled_tracker_gains_the_notify_label_on_update(self) -> None:
+        added = self.update([{"name": "release-stall"}])
+        self.assertEqual(len(added), 1)
+        self.assertIn("labels[]=release-blocked", added[0])
+
+    def test_a_labelled_tracker_is_left_alone(self) -> None:
+        self.assertEqual(self.update([{"name": "release-blocked"}]), [])
 
 
 class WorkflowTests(unittest.TestCase):

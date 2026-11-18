@@ -56,6 +56,7 @@ LABEL_SPECS = {
 }
 LABELS = tuple(LABEL_SPECS)
 TRACKER_LABEL = "release-stall"
+NOTIFY_LABEL = "release-blocked"
 CADENCE_TITLE = "Release cadence: merged changes but no release"
 CHAIN_TITLE = "Release blocked: the current version is not released and installable"
 CHAIN_BOUND_MINUTES = 90.0
@@ -227,6 +228,10 @@ def chain_decide(*, version: str, landed_at: str | None, now: datetime, tag_exis
         return {"state": "failing" if failures else "pending", "failures": failures,
                 "note": note}
     since = f"{waited:.0f} min after it landed" if waited is not None else "long after it landed"
+    if _semver(latest_tag) and _semver(tag) and _semver(latest_tag) > _semver(tag):
+        # A newer release is public and latest: users install newer code.
+        return {"state": "failing" if failures else "ok", "failures": failures,
+                "note": f"{tag} is superseded by {latest_tag}"}
     if not tag_exists:
         failures.append(("tag_missing", f"tag {tag} does not exist {since}"))
         return {"state": "failing", "failures": failures, "note": f"{tag} judged {since}"}
@@ -261,6 +266,31 @@ def chain_decide(*, version: str, landed_at: str | None, now: datetime, tag_exis
                          "so install.sh without SHIPYARD_VERSION installs another tag"))
     return {"state": "failing" if failures else "ok", "failures": failures,
             "note": f"{tag} judged {since}"}
+
+
+def _semver(tag: str | None) -> tuple[int, ...] | None:
+    m = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", tag or "")
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def pick_version(current: str, bumps: list[dict], now: datetime,
+                 bound_minutes: float = CHAIN_BOUND_MINUTES) -> tuple[str, str | None]:
+    """The version to judge and when it landed.
+
+    ``bumps`` are version moves on main, newest first. Judging only the current
+    version would go blind whenever versions land less than the bound apart
+    (each landing restarts the clock), so while the current one is inside its
+    bound the newest version already past it is judged instead.
+    """
+    cutoff = now - timedelta(minutes=bound_minutes)
+    landed = next((b["landed_at"] for b in bumps if b["version"] == current), None)
+    if landed is None or _parse(landed) <= cutoff:
+        return current, landed
+    older = next((b for b in bumps
+                  if b["version"] != current and _parse(b["landed_at"]) <= cutoff), None)
+    if older:
+        return older["version"], older["landed_at"]
+    return current, landed
 
 
 def chain_key(version: str, failures: list[tuple[str, str]]) -> str:
@@ -401,6 +431,12 @@ def apply_tracker(repo: str, title: str, failing: bool, body: str, close_note: s
         create_tracker(repo, title, body)
     elif action == "update":
         gh("api", "-X", "PATCH", f"repos/{repo}/issues/{issue['number']}", "-f", f"body={body}")
+        if not any(lbl.get("name") == NOTIFY_LABEL for lbl in issue.get("labels") or []
+                   if isinstance(lbl, dict)):
+            # A tracker opened before the label existed, or without labels.
+            ensure_labels(repo)
+            run_gh("api", "-X", "POST", f"repos/{repo}/issues/{issue['number']}/labels",
+                   "-f", f"labels[]={NOTIFY_LABEL}")
     elif action == "close":
         gh("api", "-X", "POST", f"repos/{repo}/issues/{issue['number']}/comments",
            "-f", f"body={close_note}")
@@ -482,14 +518,6 @@ def run_cadence(args: argparse.Namespace, now: datetime) -> int:
     return 0
 
 
-def latest_bump_landing(version: str, lookback_days: float, now: datetime) -> str | None:
-    """When ``version`` reached main, or None when that was before the lookback."""
-    for bump in reversed(collect_bumps(now - timedelta(days=lookback_days))):
-        if bump["version"] == version:
-            return bump["landed_at"]
-    return None
-
-
 def verdict_at(repo: str, sha: str) -> str:
     runs = json.loads(gh("api", f"repos/{repo}/commits/{sha}/check-runs?check_name=review-verdict",
                          check=False) or "{}").get("check_runs", [])
@@ -514,11 +542,12 @@ def run_chain(args: argparse.Namespace, now: datetime) -> int:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from release_draft_heal import expected_assets  # noqa: PLC0415 (script sibling)
 
-    version = cargo_version_at(args.ref)
-    if not version:
+    current = cargo_version_at(args.ref)
+    if not current:
         raise SystemExit(f"cannot read the Cargo.toml version at {args.ref}")
+    version, landed = pick_version(current, collect_bumps(now - timedelta(days=args.lookback_days)),
+                                   now, args.bound_minutes)
     tag = f"v{version}"
-    landed = latest_bump_landing(version, args.lookback_days, now)
     tag_exists = git("rev-parse", "-q", "--verify", f"refs/tags/{tag}").returncode == 0
     runs = json.loads(gh("api", f"repos/{args.repo}/actions/workflows/release.yml/runs"
                                 f"?branch={tag}&per_page=1")).get("workflow_runs", [])
@@ -546,7 +575,8 @@ def run_chain(args: argparse.Namespace, now: datetime) -> int:
                            expected_assets=expected_assets(), bump_pr=bump_pr,
                            bound_minutes=args.bound_minutes,
                            bump_stale_minutes=args.bump_stale_minutes)
-    evidence = [f"version on main: {tag}, landed {landed or 'before the lookback window'}",
+    evidence = [f"version on main: v{current}; judged: {tag}, landed "
+                f"{landed or 'before the lookback window'}",
                 f"tag {tag}: {'present' if tag_exists else 'absent'}",
                 f"release.yml run: {run['html_url'] + ' ' + str(run.get('status')) + '/' + str(run.get('conclusion')) if run else 'none'}",
                 f"release: {release['html_url'] + (' draft' if release.get('draft') else ' public') if release else 'not public'}",
@@ -555,16 +585,9 @@ def run_chain(args: argparse.Namespace, now: datetime) -> int:
     print(json.dumps({"state": verdict["state"], "version": tag,
                       "failures": verdict["failures"], "note": verdict["note"]}))
     if verdict["state"] == "pending":
-        # A newer version is inside its bound: an open tracker describes an
-        # older version (or a bump that has since merged), so close it.
-        if not args.dry_run and find_tracker(args.repo, CHAIN_TITLE):
-            apply_tracker(args.repo, CHAIN_TITLE, False, "",
-                          f"{tag} landed and is inside its {args.bound_minutes:.0f}-minute "
-                          "bound; the blocked state this issue described is superseded. "
-                          "Closing; the next pass reopens one if the new version stalls.")
-            print("tracker: close (superseded by a pending version)")
-        else:
-            print("chain: pending")
+        # Only when no version has passed its bound yet; the tracker closes on
+        # an ok verdict, never on a pending one.
+        print("chain: pending, tracker untouched")
         return 0
     body = chain_body(version, verdict, evidence, now, args.repo)
     if args.dry_run:
