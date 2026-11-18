@@ -184,7 +184,7 @@ class Compute(Base):
              "head_branch": "gh-readonly-queue/main/pr-10-abc"},  # another PR: pr-10 is not pr-1
             {"id": 14, "head_sha": "other", "event": "push", "status": "completed", "head_branch": "main"},
         ]
-        job = lambda lab, a, b, concl="success": {"labels": lab, "started_at": T(10, a), "completed_at": T(10, b), "conclusion": concl}
+        job = lambda lab, a, b, concl="success": {"labels": lab, "created_at": T(10, a), "started_at": T(10, a), "completed_at": T(10, b), "conclusion": concl}
         self.jobs = {11: [job(["self-hosted", "macOS"], "10:00", "10:20"), job(["ubuntu-latest"], "10:00", "10:05")],
                      12: [job(["self-hosted"], "10:40", "10:50"), job(["x"], "10:40", "10:45", "skipped")],
                      13: [job(["ubuntu-latest"], "10:00", "11:00")], 14: [job(["ubuntu-latest"], "10:00", "11:00")]}
@@ -200,7 +200,7 @@ class Compute(Base):
         first = [c for c in gh.calls if "/jobs" in c or "/timeline" in c or "pulls/1/commits" in c]
         gh2 = world([pr(1, T(10, "09:00"), T(10, "11:00"))], runs=self.runs, jobs=self.jobs)
         out = self.build(gh2)
-        again = [c for c in gh2.calls if "/jobs" in c or "/timeline" in c or "pulls/1/commits" in c or "actions/runs?created" in c]
+        again = [c for c in gh2.calls if "/jobs" in c or "/timeline" in c or "pulls/1/commits" in c]  # the run list is re-read to validate the cache
         self.assertEqual(len(first), 4)
         self.assertEqual(again, [])
         self.assertEqual(self.rows(out)[1]["compute"]["self_hosted_min"], 30.0)
@@ -219,7 +219,8 @@ class Compute(Base):
     def test_an_unreadable_jobs_list_is_unread_not_zero(self):
         gh = world([pr(1, T(10, "09:00"), T(10, "11:00"))], runs=self.runs, jobs={})
         out = self.build(gh)
-        self.assertIsNone(self.rows(out)[1]["compute"])
+        comp = self.rows(out)[1]["compute"]  # the runs were read, the jobs were not: no minutes and not complete
+        self.assertEqual((comp["complete"], comp["self_hosted_min"], comp["runner_wait_min"]), (False, None, None))
         self.assertEqual(out["repos"][REPO]["per_day"]["2026-11-10"]["compute_per_merged_pr"]["prs_read"], 0)
 
 
@@ -252,10 +253,10 @@ class ProofsAndQueue(Base):
         self.assertFalse(complete)
 
     def test_an_old_job_cache_without_macos_minutes_is_read_again(self):
-        rd = pm.Reader(REPO, self.cache, 100, lambda path: {"jobs": [{"labels": ["macOS-14", "self-hosted"], "started_at": T(10, "10:00"),
+        rd = pm.Reader(REPO, self.cache, 100, lambda path: {"jobs": [{"labels": ["macOS-14", "self-hosted"], "created_at": T(10, "10:00"), "started_at": T(10, "10:00"),
                                                                        "completed_at": T(10, "10:30"), "conclusion": "success"}]})
         rd.save("jobs", "7", {"self_hosted": 99.0, "hosted": 0.0})
-        sh, ho, mac, ok = pm.job_minutes(rd, {"id": 7, "status": "completed"})
+        sh, ho, mac, wait, ok = pm.job_minutes(rd, {"id": 7, "status": "completed"})
         self.assertEqual((sh, ho, mac, ok), (30.0, 0.0, 30.0, True))
 
     def test_enqueue_to_merge_counts_from_the_last_enqueue_and_runs_by_workflow_and_level_are_kept(self):
@@ -266,7 +267,7 @@ class ProofsAndQueue(Base):
         sha = f"h{1:040d}"[:40]
         runs = [{"id": 1, "name": "Proof", "head_sha": sha, "event": "pull_request", "status": "completed"},
                 {"id": 2, "name": "Proof", "head_sha": "g", "event": "merge_group", "status": "completed", "head_branch": "gh-readonly-queue/main/pr-1-x"}]
-        job = [{"labels": ["macOS"], "started_at": T(10, "10:00"), "completed_at": T(10, "10:12"), "conclusion": "success"}]
+        job = [{"labels": ["macOS"], "created_at": T(10, "10:00"), "started_at": T(10, "10:00"), "completed_at": T(10, "10:12"), "conclusion": "success"}]
         other = pr(2, T(10, "10:00"), T(10, "11:00"))
         other["head"]["sha"] = "z" * 40
         out = self.build(world([p, other], tl, commits={2: [commit("c2")]}, runs=runs, jobs={1: job, 2: job}))
@@ -280,6 +281,463 @@ class ProofsAndQueue(Base):
         md = pm.markdown(out)
         self.assertIn("Proofs, macOS minutes and queue wait per merged PR", md)
         self.assertIn("| Proof | 0.5 / 0.5 / 0.0 |", md)
+
+
+class Paths(unittest.TestCase):
+    F = {"holds": 0, "ejections": [], "merged_at": T(10, "12:00"), "hold_times": [], "push_times": [], "enqueue_times": [], "dequeue_times": [],
+         "timeline_complete": True, "commits_complete": True}
+
+    def test_cause_minutes_are_none_when_the_timeline_or_the_commits_were_not_read_in_full(self):
+        f = self.f(hold_times=[T(10, "10:00")], push_times=[T(10, "10:20")])
+        self.assertEqual(pm.cause_minutes(f, self.comp())["hold"], 20.0)
+        self.assertIsNone(pm.cause_minutes(dict(f, timeline_complete=False), self.comp()))
+        self.assertIsNone(pm.cause_minutes(dict(f, commits_complete=False), self.comp()))
+
+    def f(self, **kw):
+        return dict(self.F, **kw)
+
+    def comp(self, **kw):
+        return dict({"complete": True, "red_events": [], "runner_wait_min": 0.0}, **kw)
+
+    def test_a_pr_with_no_slow_cause_and_a_complete_compute_is_clean(self):
+        self.assertEqual(pm.path_of(self.f(), self.comp()), ("clean", []))
+
+    def test_each_slow_cause_makes_the_pr_slow_with_its_reason(self):
+        self.assertEqual(pm.path_of(self.f(holds=1), self.comp()), ("slow", ["hold"]))
+        self.assertEqual(pm.path_of(self.f(), self.comp(red_events=[T(10, "10:30")])), ("slow", ["red"]))
+        self.assertEqual(pm.path_of(self.f(ejections=["failed_checks"]), self.comp()), ("slow", ["ejection"]))
+        self.assertEqual(pm.path_of(self.f(dirty=True), self.comp()), ("slow", ["dirty"]))
+        self.assertEqual(pm.path_of(self.f(holds=1, dirty=True), self.comp(red_events=[T(10, "10:30")])), ("slow", ["hold", "red", "dirty"]))
+
+    def test_an_unread_compute_leaves_a_pr_with_no_other_cause_unknown_not_clean(self):
+        self.assertEqual(pm.path_of(self.f(), None), (None, []))
+        self.assertEqual(pm.path_of(self.f(), self.comp(complete=False)), (None, []))
+        self.assertEqual(pm.path_of(self.f(holds=1), None), ("slow", ["hold"]))  # a known cause needs no compute
+        self.assertEqual(pm.path_of(self.f(), self.comp(complete=False, red_events=[T(10, "10:30")])), (None, []))  # an incomplete read is not trusted
+
+    def test_hold_and_red_wait_until_the_next_push_or_the_merge(self):
+        f = self.f(hold_times=[T(10, "10:00"), T(10, "11:00")], push_times=[T(10, "10:20")])
+        self.assertEqual(pm.cause_minutes(f, self.comp())["hold"], 20.0 + 60.0)  # 10:00 to the push, 11:00 to the 12:00 merge
+        red = pm.cause_minutes(self.f(push_times=[T(10, "11:30")]), self.comp(red_events=[T(10, "11:00")]))
+        self.assertEqual(red["red"], 30.0)
+
+    def test_queue_time_runs_from_each_enqueue_to_its_removal_or_the_merge(self):
+        f = self.f(enqueue_times=[T(10, "10:00"), T(10, "10:40")], dequeue_times=[T(10, "10:10")])
+        self.assertEqual(pm.cause_minutes(f, self.comp())["queue"], 10.0 + 80.0)
+
+    def test_unmeasured_causes_are_none_not_zero_and_an_unmerged_pr_has_no_causes(self):
+        c = pm.cause_minutes(self.f(), None)
+        self.assertEqual((c["red"], c["runner"], c["dirty"]), (None, None, None))
+        self.assertIsNone(pm.cause_minutes(self.f(merged_at=None), self.comp()))
+
+    def test_the_summary_reports_share_medians_and_the_top_cause(self):
+        row = lambda lead, path, why=(), **cm: {"handoff_min": lead, "path": path, "path_why": list(why),
+                                                "cause_min": {"hold": 0.0, "red": 0.0, "queue": 0.0, "runner": 0.0, "dirty": None, **cm}}
+        rows = [row(30.0, "clean"), row(50.0, "clean"), row(70.0, "clean"), row(400.0, "slow", ["red"], red=120.0), row(100.0, "slow", ["hold"], hold=30.0),
+                row(60.0, None, ())]
+        p = pm.path_summary(rows)
+        self.assertEqual((p["clean"]["n"], p["clean"]["median_min"], p["slow"]["n"], p["slow"]["median_min"], p["slow"]["p90_min"], p["unknown"]),
+                         (3, 50.0, 2, 250.0, 400.0, 1))
+        self.assertEqual(p["slow_share_pct"], 40.0)  # unknown is in neither path
+        self.assertEqual((p["top_cause"], p["cause_min_per_merge"]["red"], p["cause_min_per_merge"]["hold"], p["cause_min_per_merge"]["dirty"]), ("red", 20.0, 5.0, None))
+        self.assertEqual(pm.path_summary([])["top_cause"], None)
+
+    def test_the_summary_withholds_a_cause_when_one_slow_pr_is_unmeasured(self):
+        row = lambda lead, path, red: {"handoff_min": lead, "path": path, "path_why": ["red"] if path == "slow" else [],
+                                       "cause_min": {"hold": 0.0, "red": red, "queue": 0.0, "runner": 0.0, "dirty": None}}
+        p = pm.path_summary([row(40.0, "slow", 60.0), row(50.0, "slow", None), row(20.0, "clean", 0.0)])
+        self.assertIsNone(p["cause_min_per_merge"]["red"])
+        self.assertEqual(p["top_cause"], "hold")
+
+    def test_the_report_prints_the_clean_and_slow_table(self):
+        out = pm.build([REPO], tempfile.mkdtemp(), 50, OWNER, START, NOW, {}, {}, None, world([pr(1, T(10, "10:00"), T(10, "11:00"))]))
+        md = pm.markdown(out)
+        self.assertIn("### Clean and slow paths (window, merged PRs)", md)
+        self.assertIn("| slow share | clean median (n) | slow median / p90 (n) | top cause |", md)
+
+
+class RerunCache(Base):
+    HEAD = f"h{1:040d}"[:40]
+    JOB = [{"labels": ["self-hosted", "macOS"], "created_at": T(10, "10:00"), "started_at": T(10, "10:01"), "completed_at": T(10, "10:21"), "conclusion": "success"}]
+
+    def mk(self, attempt, conclusion, updated):
+        return {"id": 11, "name": "ci", "head_sha": self.HEAD, "event": "pull_request", "status": "completed", "conclusion": conclusion,
+                "head_branch": "feat", "run_attempt": attempt, "updated_at": updated}
+
+    def build_one(self, runs, jobs=None, attempts=None):
+        push = {"event": "head_ref_force_pushed", "actor": {"login": "x"}, "created_at": T(10, "10:50"), "after_sha": "o" * 40}  # the observed push that ends a red wait
+        gh = world([pr(1, T(10, "09:00"), T(10, "11:00"))], {1: [push]}, runs=runs, jobs={11: jobs or self.JOB})
+        for k, v in (attempts or {}).items():
+            gh.routes.insert(0, (rf"actions/runs/11/attempts/{k}", v))
+        out = pm.build([REPO], self.cache, 300, OWNER, START, NOW, {}, {}, None, gh, control=False)
+        return out["repos"][REPO]["prs"][0], gh
+
+    def test_a_cached_success_is_not_reused_after_a_rerun_of_the_same_run_fails(self):
+        r, _ = self.build_one([self.mk(1, "success", T(10, "10:30"))])
+        self.assertEqual((r["path"], r["compute"]["red_events"]), ("clean", []))
+        r2, gh = self.build_one([self.mk(2, "failure", T(10, "10:50"))])  # same run id, now attempt 2 and failed
+        self.assertEqual((r2["path"], r2["path_why"]), ("slow", ["red"]))
+
+    def test_a_run_that_appears_after_the_entry_was_cached_invalidates_it(self):
+        self.build_one([self.mk(1, "success", T(10, "10:30"))])
+        extra = dict(self.mk(1, "failure", T(10, "10:45")), id=12, name="late")
+        calls, orig = [], pm.pr_compute
+        pm.pr_compute = lambda *a, **k: (calls.append(1), orig(*a, **k))[1]
+        try:
+            r, _ = self.build_one([self.mk(1, "success", T(10, "10:30")), extra], jobs=self.JOB)
+        finally:
+            pm.pr_compute = orig
+        self.assertEqual(calls, [1])
+
+    def test_a_cached_entry_is_kept_when_the_run_list_cannot_be_read_but_its_clean_verdict_is_unknown(self):
+        self.build_one([self.mk(1, "success", T(10, "10:30"))])
+        gh = world([pr(1, T(10, "09:00"), T(10, "11:00"))], {1: []}, runs=[], jobs={})
+        gh.routes = [x for x in gh.routes if "actions/runs" not in x[0]]
+        out = pm.build([REPO], self.cache, 300, OWNER, START, NOW, {}, {}, None, gh, control=False)
+        r = out["repos"][REPO]["prs"][0]
+        self.assertEqual((r["compute"]["runs"], r["path"]), (1, None))  # its numbers are kept, but a clean verdict that cannot be checked is unknown
+
+    def test_an_unchanged_run_keeps_its_cache_and_costs_no_jobs_read(self):
+        self.build_one([self.mk(1, "success", T(10, "10:30"))])
+        calls, orig = [], pm.pr_compute
+        pm.pr_compute = lambda *a, **k: (calls.append(1), orig(*a, **k))[1]
+        try:
+            r, gh = self.build_one([self.mk(1, "success", T(10, "10:30"))])
+        finally:
+            pm.pr_compute = orig
+        self.assertEqual((calls, r["path"]), ([], "clean"))  # served from the cache
+
+    def test_cached_job_minutes_are_for_one_attempt_a_rerun_reads_its_jobs_again(self):
+        rd = pm.Reader(REPO, self.cache, 50, lambda path: {"jobs": [dict(self.JOB[0], completed_at=T(10, "10:41"))]})
+        rd.save("jobs", "11", {"self_hosted": 20.0, "hosted": 0.0, "macos": 20.0, "wait": 1.0, "attempt": 1})
+        sh, _, _, _, ok = pm.job_minutes(rd, {"id": 11, "status": "completed", "run_attempt": 2})
+        self.assertEqual((sh, ok), (40.0, True))
+        self.assertEqual(pm.job_minutes(rd, {"id": 11, "status": "completed", "run_attempt": 2})[0], 40.0)
+
+    def test_a_failed_rerun_classifies_slow_but_leaves_the_red_duration_unknown(self):
+        r, _ = self.build_one([self.mk(2, "failure", T(10, "10:40"))])
+        self.assertEqual((r["path"], r["compute"]["red_partial"], r["cause_min"]["red"]), ("slow", True, None))
+        first, _ = self.build_one([self.mk(1, "failure", T(10, "10:40"))])
+        self.assertEqual((first["compute"]["red_partial"], first["cause_min"]["red"]), (False, 10.0))  # a first attempt: 10:40 to the 10:50 force-push
+
+    def test_a_successful_rerun_leaves_red_and_runner_unknown_beside_another_cause(self):
+        r, _ = self.build_one([self.mk(2, "success", T(10, "10:40"))])
+        self.assertEqual((r["compute"]["red_partial"], r["compute"]["runner_wait_min"]), (True, None))
+        self.assertEqual((r["cause_min"]["red"], r["cause_min"]["runner"]), (None, None))
+
+    def test_a_successful_rerun_beside_a_hold_gives_no_numeric_red_duration(self):
+        tl = {1: [{"event": "commented", "actor": {"login": "x"}, "body": "HOLD", "created_at": T(10, "10:00")},
+                  {"event": "head_ref_force_pushed", "actor": {"login": "x"}, "created_at": T(10, "10:50"), "after_sha": "o" * 40}]}
+        gh = world([pr(1, T(10, "09:00"), T(10, "11:00"))], tl, runs=[self.mk(2, "success", T(10, "10:40"))], jobs={11: self.JOB})
+        out = pm.build([REPO], self.cache, 300, OWNER, START, NOW, {}, {}, None, gh, control=False)
+        r = out["repos"][REPO]["prs"][0]
+        self.assertEqual((r["path"], r["cause_min"]["red"]), ("slow", None))
+        self.assertEqual(r["cause_min"]["hold"], 50.0)
+
+    def test_a_known_failure_stands_beside_an_unfinished_run(self):
+        bad = self.mk(1, "failure", T(10, "10:40"))
+        busy = dict(self.mk(1, None, T(10, "10:45")), id=12, name="other", status="in_progress")
+        gh = world([pr(1, T(10, "09:00"), T(10, "11:00"))], {}, runs=[bad, busy], jobs={11: self.JOB, 12: self.JOB})
+        out = pm.build([REPO], self.cache, 300, OWNER, START, NOW, {}, {}, None, gh, control=False)
+        r = out["repos"][REPO]["prs"][0]
+        self.assertEqual((r["path"], r["compute"]["complete"]), ("slow", False))
+
+    def test_the_documented_scorecard_version_is_the_one_the_report_prints(self):
+        doc = open(os.path.join(os.path.dirname(os.path.abspath(pm.__file__)), "..", "..", "docs", "metrics.md"), encoding="utf-8").read()
+        m = re.search(r"Scorecard definition version: `([^`]+)`", doc)
+        self.assertIsNotNone(m)
+        self.assertEqual(m.group(1), pm.SCORECARD_VERSION)
+
+    def cause_of(self, timeline, runs=()):
+        gh = world([pr(1, T(10, "09:00"), T(10, "11:00"))], {1: timeline}, runs=list(runs), jobs={11: self.JOB})
+        with tempfile.TemporaryDirectory() as fresh:  # a settled PR is cached: each call starts empty
+            out = pm.build([REPO], fresh, 300, OWNER, START, NOW, {}, {}, None, gh, control=False)
+        return out["repos"][REPO]["prs"][0]["cause_min"]
+
+    HOLD = {"event": "commented", "actor": {"login": "x"}, "body": "HOLD", "created_at": T(10, "10:00")}
+
+    def test_a_hold_with_no_commit_or_push_after_it_is_measured_to_the_merge(self):
+        self.assertEqual(self.cause_of([self.HOLD])["hold"], 60.0)
+
+    def test_a_failed_run_with_no_commit_or_push_after_it_is_measured_to_the_merge(self):
+        self.assertEqual(self.cause_of([], [self.mk(1, "failure", T(10, "10:12"))])["red"], 48.0)
+
+    def test_an_untimed_commit_after_a_hold_leaves_the_hold_unknown(self):
+        commit_after = {"event": "committed", "sha": "c" * 40, "committer": {"date": T(10, "10:30")}}
+        self.assertIsNone(self.cause_of([self.HOLD, commit_after])["hold"])
+        commit_before = {"event": "committed", "sha": "c" * 40, "committer": {"date": T(9, "09:30")}}
+        self.assertEqual(self.cause_of([commit_before, self.HOLD])["hold"], 60.0)  # listed before the HOLD: not a push after it
+
+    def test_an_untimed_commit_after_a_failed_run_leaves_the_red_duration_unknown(self):
+        run = [self.mk(1, "failure", T(10, "10:12"))]
+        after = {"event": "committed", "sha": "c" * 40, "committer": {"date": T(10, "10:30")}}
+        self.assertIsNone(self.cause_of([after], run)["red"])
+        self.assertIsNone(self.cause_of([{"event": "committed", "sha": "c" * 40}], run)["red"])  # no date at all
+        before = {"event": "committed", "sha": "c" * 40, "committer": {"date": T(10, "10:05")}}
+        self.assertEqual(self.cause_of([before], run)["red"], 48.0)
+
+
+class JobsSkippedHold(Base):
+    """Findings of the review of the job-read switch."""
+    def run_skipped(self, runs, seed=None, jobs=None):
+        p = pr(1, T(10, "09:00"), T(10, "11:00"))
+        gh = world([p], runs=runs, jobs=jobs or {})
+        if seed is not None:
+            d = os.path.join(self.cache, REPO.replace("/", "__"), "compute")
+            os.makedirs(d)
+            with open(os.path.join(d, "1.json"), "w") as fh:
+                json.dump(seed, fh)
+        pm.READ_JOB_MINUTES = False
+        try:
+            return pm.build([REPO], self.cache, 200, OWNER, START, NOW, {}, {}, None, gh, control=False)
+        finally:
+            pm.READ_JOB_MINUTES = True
+
+    RUN = {"id": 11, "head_sha": f"h{1:040d}"[:40], "event": "pull_request", "head_branch": "feat"}
+
+    def test_an_unfinished_run_keeps_the_pr_unknown_when_job_reads_are_skipped(self):
+        out = self.run_skipped([dict(self.RUN, status="in_progress")])
+        r = out["repos"][REPO]["prs"][0]
+        self.assertEqual((r["compute"]["complete"], r["path"]), (False, None))
+        done = self.run_skipped([dict(self.RUN, status="completed", conclusion="success")])
+        self.assertEqual(done["repos"][REPO]["prs"][0]["path"], "clean")
+
+    def test_skipped_job_reads_report_no_minutes_not_zeros_and_the_summary_copes(self):
+        out = self.run_skipped([dict(self.RUN, status="completed", conclusion="success")])
+        c = out["repos"][REPO]["prs"][0]["compute"]
+        self.assertEqual((c["self_hosted_min"], c["hosted_min"], c["macos_min"], c["runner_wait_min"], c["jobs_read"]), (None, None, None, None, False))
+        s = pm.summarize([r for r in out["repos"][REPO]["prs"] if r["eligible"]])["compute_per_merged_pr"]
+        self.assertEqual((s["context_self_hosted_min_median"], s["macos_min_mean"], s["macos_min_median"], s["runs_total"]), (None, None, None, 1))
+
+    def test_a_cached_compute_entry_with_minutes_is_not_reused_when_job_reads_are_skipped(self):
+        seed = {"v": pm.COMPUTE_VERSION, "complete": True, "jobs_read": True, "self_hosted_min": 99.0, "hosted_min": 1.0, "macos_min": 5.0,
+                "runner_wait_min": 2.0, "red_events": [], "by_workflow": {}, "runs": 7, "repeat_runs": 0, "group_runs": 0}
+        out = self.run_skipped([dict(self.RUN, status="completed", conclusion="success")], seed)
+        c = out["repos"][REPO]["prs"][0]["compute"]
+        self.assertEqual((c["self_hosted_min"], c["runs"]), (None, 1))
+
+
+class JobsSkipped(Base):
+    runs = [{"id": 11, "head_sha": f"h{1:040d}"[:40], "event": "pull_request", "status": "completed", "head_branch": "feat"},
+            {"id": 12, "head_sha": "zzz", "event": "merge_group", "status": "completed", "head_branch": "gh-readonly-queue/main/pr-1-abc"}]
+
+    def test_without_job_reads_runs_and_failed_head_runs_still_count_and_nothing_is_cached(self):
+        runs = [dict(r, conclusion="failure", updated_at=T(10, "10:12")) for r in self.runs]
+        gh = world([pr(1, T(10, "09:00"), T(10, "11:00"))], runs=runs, jobs={})  # no jobs route: any jobs read would fail
+        pm.READ_JOB_MINUTES = False
+        try:
+            out = pm.build([REPO], self.cache, 200, OWNER, START, NOW, {}, {}, None, gh, control=False)  # the control reads jobs
+        finally:
+            pm.READ_JOB_MINUTES = True
+        r = self.rows(out)[1]
+        self.assertEqual((r["compute"]["runs"], r["compute"]["complete"], r["compute"]["runner_wait_min"], r["path"]), (2, True, None, "slow"))
+        self.assertIsNone(r["cause_min"]["runner"])
+        self.assertFalse([c for c in gh.calls if "/jobs" in c])
+        self.assertFalse(os.path.exists(os.path.join(self.cache, REPO.replace("/", "__"), "compute", "1.json")))
+
+    def test_a_failed_push_run_on_a_pr_head_counts_as_red(self):
+        run = dict(self.runs[0], event="push", conclusion="failure", updated_at=T(10, "10:12"))
+        gh = world([pr(1, T(10, "09:00"), T(10, "11:00"))], runs=[run], jobs={})
+        pm.READ_JOB_MINUTES = False
+        try:
+            out = pm.build([REPO], self.cache, 200, OWNER, START, NOW, {}, {}, None, gh, control=False)
+        finally:
+            pm.READ_JOB_MINUTES = True
+        r = self.rows(out)[1]
+        self.assertEqual((r["path"], r["path_why"]), ("slow", ["red"]))
+
+    def test_a_successful_rerun_without_attempt_history_stays_unknown(self):
+        run = dict(self.runs[0], status="completed", conclusion="success", run_attempt=2)
+        gh = world([pr(1, T(10, "09:00"), T(10, "11:00"))], runs=[run], jobs={})
+        pm.READ_JOB_MINUTES = False
+        try:
+            out = pm.build([REPO], self.cache, 200, OWNER, START, NOW, {}, {}, None, gh, control=False)
+        finally:
+            pm.READ_JOB_MINUTES = True
+        r = self.rows(out)[1]
+        self.assertEqual((r["compute"]["complete"], r["path"]), (False, None))
+
+
+class MalformedJobTiming(Base):
+    RUN = {"id": 11, "head_sha": f"h{1:040d}"[:40], "event": "pull_request", "status": "completed",
+           "conclusion": "success", "head_branch": "feat"}
+
+    def build_row(self, gh):
+        return self.build(gh)["repos"][REPO]["prs"][0]
+
+    def run_one(self, job):
+        p = pr(1, T(10, "09:00"), T(10, "11:00"))
+        out = self.build(world([p], runs=[self.RUN], jobs={11: [job]}))
+        return out["repos"][REPO]["prs"][0]
+
+    def test_pre_fix_job_cache_is_read_again_before_reusing_minutes(self):
+        job = {"labels": ["self-hosted", "macOS"], "created_at": T(10, "10:00"),
+               "started_at": T(10, "10:01"), "completed_at": T(10, "10:21"), "conclusion": "success"}
+        rd = pm.Reader(REPO, self.cache, 50, lambda path: {"jobs": [job]})
+        rd.save("jobs", "11", {"self_hosted": 99.0, "hosted": 1.0, "macos": 5.0, "wait": 2.0, "attempt": 1})
+        self.assertEqual(pm.job_minutes(rd, self.RUN), (20.0, 0.0, 20.0, 1.0, True))
+
+    def test_missing_job_duration_keeps_compute_incomplete_and_withholds_minutes(self):
+        row = self.run_one({"labels": ["self-hosted", "macOS"], "created_at": T(10, "10:00"),
+                            "started_at": T(10, "10:01"), "conclusion": "success"})
+        self.assertEqual((row["compute"]["complete"], row["compute"]["self_hosted_min"],
+                          row["compute"]["hosted_min"], row["compute"]["macos_min"],
+                          row["compute"]["runner_wait_min"], row["path"]),
+                         (False, None, None, None, None, None))
+
+    def test_missing_job_creation_time_keeps_compute_incomplete_and_withholds_runner_wait(self):
+        row = self.run_one({"labels": ["self-hosted", "macOS"], "started_at": T(10, "10:01"),
+                            "completed_at": T(10, "10:21"), "conclusion": "success"})
+        self.assertEqual((row["compute"]["complete"], row["compute"]["self_hosted_min"],
+                          row["compute"]["hosted_min"], row["compute"]["macos_min"],
+                          row["compute"]["runner_wait_min"], row["path"]),
+                         (False, None, None, None, None, None))
+
+    def test_a_failed_run_stays_slow_when_job_timing_is_malformed(self):
+        p = pr(1, T(10, "09:00"), T(10, "11:00"))
+        run = dict(self.RUN, conclusion="failure", updated_at=T(10, "10:12"))
+        job = {"labels": ["self-hosted"], "created_at": T(10, "10:00"), "started_at": T(10, "10:01"), "conclusion": "failure"}
+        out = self.build(world([p], runs=[run], jobs={11: [job]}))
+        row = out["repos"][REPO]["prs"][0]
+        self.assertEqual((row["path"], row["path_why"], row["compute"]["complete"], row["compute"]["self_hosted_min"]),
+                         ("slow", ["red"], False, None))
+
+    def test_a_rerun_after_the_merge_does_not_make_a_pr_red(self):
+        p = pr(1, T(10, "09:00"), T(10, "11:00"))
+        run = dict(self.RUN, conclusion="failure", updated_at=T(10, "12:30"))
+        job = {"labels": ["self-hosted"], "created_at": T(10, "10:00"), "started_at": T(10, "10:01"),
+               "completed_at": T(10, "10:21"), "conclusion": "failure"}
+        row = self.build_row(world([p], runs=[run], jobs={11: [job]}))
+        self.assertEqual((row["path"], row["compute"]["red_events"]), ("clean", []))
+        late = dict(run, run_attempt=2)
+        row = self.build_row(world([p], runs=[late], jobs={11: [job]}))
+        self.assertEqual((row["path"], row["compute"]["complete"]), (None, False))
+
+    def test_a_failure_before_the_merge_still_counts_beside_a_later_rerun(self):
+        p = pr(1, T(10, "09:00"), T(10, "11:00"))
+        run = dict(self.RUN, conclusion="failure", updated_at=T(10, "10:12"))
+        job = {"labels": ["self-hosted"], "created_at": T(10, "10:00"), "started_at": T(10, "10:01"),
+               "completed_at": T(10, "10:21"), "conclusion": "failure"}
+        row = self.build_row(world([p], runs=[run], jobs={11: [job]}))
+        self.assertEqual((row["path"], row["path_why"]), ("slow", ["red"]))
+
+    def test_a_known_failure_stands_beside_another_run_rerun_after_the_merge(self):
+        p = pr(1, T(10, "09:00"), T(10, "11:00"))
+        bad = dict(self.RUN, conclusion="failure", updated_at=T(10, "10:12"))
+        late = dict(self.RUN, id=12, name="other", run_attempt=2, conclusion="success", updated_at=T(10, "12:30"))
+        job = {"labels": ["self-hosted"], "created_at": T(10, "10:00"), "started_at": T(10, "10:01"),
+               "completed_at": T(10, "10:21"), "conclusion": "success"}
+        row = self.build_row(world([p], runs=[bad, late], jobs={11: [job], 12: [job]}))
+        self.assertEqual((row["path"], row["path_why"], row["compute"]["complete"]), ("slow", ["red"], False))
+
+    def test_a_rerun_counts_only_its_latest_attempts_jobs(self):
+        run = dict(self.RUN, run_attempt=2)
+        old = {"labels": ["self-hosted"], "run_attempt": 1, "created_at": T(10, "10:00"),
+               "started_at": T(10, "10:10"), "completed_at": T(10, "10:50"), "conclusion": "failure"}
+        new = {"labels": ["self-hosted"], "run_attempt": 2, "created_at": T(10, "10:55"),
+               "started_at": T(10, "10:56"), "completed_at": T(10, "11:06"), "conclusion": "success"}
+        rd = pm.Reader(REPO, self.cache, 50, lambda path: {"jobs": [old, new]})
+        self.assertEqual(pm.job_minutes(rd, run), (10.0, 0.0, 0.0, 1.0, True))
+
+    def test_a_job_cache_entry_that_summed_every_attempt_is_read_again(self):
+        run = dict(self.RUN, run_attempt=2)
+        new = {"labels": ["self-hosted"], "run_attempt": 2, "created_at": T(10, "10:55"),
+               "started_at": T(10, "10:56"), "completed_at": T(10, "11:06"), "conclusion": "success"}
+        rd = pm.Reader(REPO, self.cache, 50, lambda path: {"jobs": [new]})
+        rd.save("jobs", "11", {"self_hosted": 99.0, "hosted": 0.0, "macos": 0.0, "wait": 9.0, "attempt": 2, "timing_complete": True})
+        self.assertEqual(pm.job_minutes(rd, run)[0], 10.0)
+
+    def test_a_failed_run_stays_slow_when_the_jobs_request_errors(self):
+        p = pr(1, T(10, "09:00"), T(10, "11:00"))
+        run = dict(self.RUN, conclusion="failure", updated_at=T(10, "10:12"))
+        gh = world([p], runs=[run], jobs={})
+
+        def fetch(path):
+            if "/jobs" in path:
+                raise pm.ReadError("boom")
+            return gh(path)
+        out = pm.build([REPO], self.cache, 200, OWNER, START, NOW, {}, {}, None, fetch, control=False)
+        row = out["repos"][REPO]["prs"][0]
+        self.assertEqual((row["path"], row["path_why"], row["compute"]["complete"]), ("slow", ["red"], False))
+
+    def test_a_failed_run_stays_slow_beside_a_successful_rerun_of_another_workflow(self):
+        p = pr(1, T(10, "09:00"), T(10, "11:00"))
+        bad = dict(self.RUN, conclusion="failure", updated_at=T(10, "10:12"))
+        rerun = dict(self.RUN, id=12, name="other", run_attempt=2, conclusion="success", updated_at=T(10, "10:30"))
+        job = {"labels": ["self-hosted"], "created_at": T(10, "10:00"), "started_at": T(10, "10:01"),
+               "completed_at": T(10, "10:21"), "conclusion": "success"}
+        out = self.build(world([p], runs=[bad, rerun], jobs={11: [job], 12: [job]}))
+        row = out["repos"][REPO]["prs"][0]
+        self.assertEqual((row["path"], row["path_why"], row["compute"]["complete"]), ("slow", ["red"], False))
+
+    def test_a_failed_run_stays_slow_when_the_jobs_read_is_cut_short(self):
+        p = pr(1, T(10, "09:00"), T(10, "11:00"))
+        run = dict(self.RUN, conclusion="failure", updated_at=T(10, "10:12"))
+        job = {"labels": ["self-hosted"], "created_at": T(10, "10:00"), "started_at": T(10, "10:01"),
+               "completed_at": T(10, "10:21"), "conclusion": "failure"}
+        gh = world([p], runs=[run], jobs={11: [job]})
+        orig = pm.Reader.pages
+
+        def cut(rd, path, key=None, max_pages=3):
+            items, full = orig(rd, path, key=key, max_pages=max_pages) if key else orig(rd, path, max_pages=max_pages)
+            return items, (False if "/jobs" in path else full)
+        pm.Reader.pages = cut
+        try:
+            out = pm.build([REPO], self.cache, 200, OWNER, START, NOW, {}, {}, None, gh, control=False)
+        finally:
+            pm.Reader.pages = orig
+        row = out["repos"][REPO]["prs"][0]
+        self.assertEqual((row["path"], row["path_why"], row["compute"]["complete"]), ("slow", ["red"], False))
+
+
+class MergeRemoval(Base):
+    def test_a_removal_after_the_merge_is_not_an_ejection(self):
+        p = pr(1, T(10, "10:00"), T(10, "11:00"))
+        out = self.build(world([p], {1: [self.removal("11:05")]}))
+        self.assertEqual(self.rows(out)[1]["ejections"], [])
+
+    def removal(self, hm):
+        return {"event": "removed_from_merge_queue", "actor": {"login": "x"}, "created_at": T(10, hm)}
+
+    def test_the_removal_github_records_at_the_merge_is_not_an_ejection_but_an_earlier_one_is(self):
+        p = pr(1, T(10, "10:00"), T(10, "11:00"))
+        tl = {1: [self.removal("10:30"), self.removal("10:59"), self.removal("11:00")]}
+        out = self.build(world([p], tl))
+        r = self.rows(out)[1]
+        self.assertEqual(r["ejections"], ["unknown"])  # the 10:30 one only
+        self.assertEqual((r["path"], r["path_why"]), ("slow", ["ejection"]))
+
+    def test_a_removal_with_an_explicit_reason_near_the_merge_is_still_an_ejection(self):
+        p = pr(1, T(10, "09:00"), T(10, "11:00"))
+        e = dict(self.removal("10:59"), reason="failed_checks")
+        r = self.rows(self.build(world([p], {1: [e]})))[1]
+        self.assertEqual((r["ejections"], r["path"]), (["failed_checks"], "slow"))
+
+    def test_a_removal_with_an_explicit_reason_after_the_merge_is_not_an_ejection(self):
+        p = pr(1, T(10, "09:00"), T(10, "11:00"))
+        e = dict(self.removal("11:30"), reason="failed_checks")
+        r = self.rows(self.build(world([p], {1: [e]})))[1]
+        self.assertEqual(r["ejections"], [])
+
+    def test_a_pr_with_only_the_merge_removal_is_not_slow_for_an_ejection(self):
+        p = pr(1, T(10, "10:00"), T(10, "11:00"))
+        out = self.build(world([p], {1: [self.removal("11:00")]}))
+        r = self.rows(out)[1]
+        self.assertEqual((r["ejections"], "ejection" in r["path_why"]), ([], False))
+
+
+class ObservedPushTimes(Base):
+    def test_cause_minutes_use_observed_force_push_time_not_commit_date(self):
+        p = pr(1, T(10, "09:00"), T(10, "11:00"))
+        tl = {1: [{"event": "commented", "actor": {"login": "x"}, "body": "HOLD", "created_at": T(10, "10:00")},
+                  {"event": "head_ref_force_pushed", "before_sha": "old", "after_sha": "new", "created_at": T(10, "10:30")}]}
+        cm = {1: [commit("new", date=T(10, "09:05"))]}
+        gh = world([p], tl, commits=cm)
+        rd = pm.Reader(REPO, self.cache, 200, gh)
+        f = pm.pr_facts(rd, p, OWNER)
+        self.assertEqual(f["push_times"], [T(10, "10:30")])
+        c = pm.cause_minutes(f, {"complete": True, "red_events": [], "runner_wait_min": 0.0})
+        self.assertEqual(c["hold"], 30.0)
 
 
 class Correctness(Base):
@@ -877,10 +1335,34 @@ class Proxies(Base):
         runs = [{"id": 21, "head_sha": "grp", "event": "merge_group", "status": "completed", "name": "GPU", "head_branch": "gh-readonly-queue/main/pr-1-x"},
                 {"id": 22, "head_sha": "grp", "event": "push", "status": "completed", "name": "GPU", "head_branch": "main"},
                 {"id": 23, "head_sha": "zzz", "event": "push", "status": "completed", "name": "GPU", "head_branch": "main"}]
-        job = [{"labels": ["self-hosted"], "started_at": T(10, "10:00"), "completed_at": T(10, "10:10"), "conclusion": "success"}]
+        job = [{"labels": ["self-hosted"], "created_at": T(10, "10:00"), "started_at": T(10, "10:00"), "completed_at": T(10, "10:10"), "conclusion": "success"}]
         out = self.build(world([p], runs=runs, jobs={21: job, 22: job}), now=self.LATE)
         c = self.rows(out)[1]["compute"]
         self.assertEqual((c["runs"], c["repeat_runs"], c["group_runs"]), (2, 1, 1))
+
+    def test_a_post_merge_push_run_adds_no_runner_wait(self):
+        p = pr(1, T(10, "09:00"), T(10, "11:00"))
+        runs = [{"id": 21, "head_sha": "grp", "event": "merge_group", "status": "completed", "name": "GPU", "head_branch": "gh-readonly-queue/main/pr-1-x"},
+                {"id": 22, "head_sha": "grp", "event": "push", "status": "completed", "name": "GPU", "head_branch": "main"}]
+        job = [{"labels": ["self-hosted"], "created_at": T(10, "10:00"), "started_at": T(10, "10:05"), "completed_at": T(10, "10:10"), "conclusion": "success"}]
+        out = self.build(world([p], runs=runs, jobs={21: job, 22: job}), now=self.LATE)
+        self.assertEqual(self.rows(out)[1]["compute"]["runner_wait_min"], 5.0)
+
+    def test_a_push_run_on_a_pr_head_keeps_its_runner_wait(self):
+        p = pr(1, T(10, "09:00"), T(10, "11:00"))
+        h = pr(1, T(10, "09:00"), T(10, "11:00"))["head"]["sha"]
+        runs = [{"id": 21, "head_sha": h, "event": "push", "status": "completed", "name": "GPU", "head_branch": "feat"}]
+        job = [{"labels": ["self-hosted"], "created_at": T(10, "10:00"), "started_at": T(10, "10:05"), "completed_at": T(10, "10:10"), "conclusion": "success"}]
+        out = self.build(world([p], runs=runs, jobs={21: job}), now=self.LATE)
+        self.assertEqual(self.rows(out)[1]["compute"]["runner_wait_min"], 5.0)
+
+    def test_a_run_begun_after_the_merge_adds_no_runner_wait(self):
+        p = pr(1, T(10, "09:00"), T(10, "11:00"))
+        h = p["head"]["sha"]
+        runs = [{"id": 21, "head_sha": h, "event": "pull_request", "status": "completed", "name": "GPU", "head_branch": "feat", "created_at": T(10, "11:20")}]
+        job = [{"labels": ["self-hosted"], "created_at": T(10, "11:20"), "started_at": T(10, "11:25"), "completed_at": T(10, "11:30"), "conclusion": "success"}]
+        out = self.build(world([p], runs=runs, jobs={21: job}), now=self.LATE)
+        self.assertEqual(self.rows(out)[1]["compute"]["runner_wait_min"], 0.0)
 
 
 class VellumControl(unittest.TestCase):
@@ -1155,6 +1637,8 @@ class SyntheticControl(unittest.TestCase):
             "commit_red": (lambda rd, sha, required: (set(), True), "correctness.base_red"),
             "push_repeats_of_group_shas": (lambda runs: (0, 0), None),
             "steward_evidence": (lambda rd, f: False, "attribution.steward_merges_recognised"),
+            "path_of": (lambda f, comp: ("clean", []), "paths.slow.n"),
+            "cause_minutes": (lambda f, comp: {"hold": 0.0, "red": 0.0, "queue": 0.0, "runner": 0.0, "dirty": None}, "paths.cause_min_per_merge.red"),
         }
         for name, (fn, expect) in cases.items():
             if expect is None:
@@ -1174,7 +1658,7 @@ class SyntheticControl(unittest.TestCase):
         out = pm.build([REPO], tempfile.mkdtemp(), 50, OWNER, START, NOW, {}, {}, None, world([pr(1, T(10, "10:00"), T(10, "11:00"))]))
         self.assertEqual(out["synthetic_control"]["status"], "pass")
         md = pm.markdown(out)
-        self.assertIn("**CONTROL PASS: 38 of 38", md)
+        self.assertIn("**CONTROL PASS: 49 of 49", md)
         self.assertIn("| ready day |", md)
 
     def test_a_repo_with_no_live_control_reads_synthetic_not_unchecked(self):
