@@ -448,6 +448,34 @@ class RerunCache(Base):
         self.assertIsNotNone(m)
         self.assertEqual(m.group(1), pm.SCORECARD_VERSION)
 
+    def cause_of(self, timeline, runs=()):
+        gh = world([pr(1, T(10, "09:00"), T(10, "11:00"))], {1: timeline}, runs=list(runs), jobs={11: self.JOB})
+        with tempfile.TemporaryDirectory() as fresh:  # a settled PR is cached: each call starts empty
+            out = pm.build([REPO], fresh, 300, OWNER, START, NOW, {}, {}, None, gh, control=False)
+        return out["repos"][REPO]["prs"][0]["cause_min"]
+
+    HOLD = {"event": "commented", "actor": {"login": "x"}, "body": "HOLD", "created_at": T(10, "10:00")}
+
+    def test_a_hold_with_no_commit_or_push_after_it_is_measured_to_the_merge(self):
+        self.assertEqual(self.cause_of([self.HOLD])["hold"], 60.0)
+
+    def test_a_failed_run_with_no_commit_or_push_after_it_is_measured_to_the_merge(self):
+        self.assertEqual(self.cause_of([], [self.mk(1, "failure", T(10, "10:12"))])["red"], 48.0)
+
+    def test_an_untimed_commit_after_a_hold_leaves_the_hold_unknown(self):
+        commit_after = {"event": "committed", "sha": "c" * 40, "committer": {"date": T(10, "10:30")}}
+        self.assertIsNone(self.cause_of([self.HOLD, commit_after])["hold"])
+        commit_before = {"event": "committed", "sha": "c" * 40, "committer": {"date": T(9, "09:30")}}
+        self.assertEqual(self.cause_of([commit_before, self.HOLD])["hold"], 60.0)  # listed before the HOLD: not a push after it
+
+    def test_an_untimed_commit_after_a_failed_run_leaves_the_red_duration_unknown(self):
+        run = [self.mk(1, "failure", T(10, "10:12"))]
+        after = {"event": "committed", "sha": "c" * 40, "committer": {"date": T(10, "10:30")}}
+        self.assertIsNone(self.cause_of([after], run)["red"])
+        self.assertIsNone(self.cause_of([{"event": "committed", "sha": "c" * 40}], run)["red"])  # no date at all
+        before = {"event": "committed", "sha": "c" * 40, "committer": {"date": T(10, "10:05")}}
+        self.assertEqual(self.cause_of([before], run)["red"], 48.0)
+
 
 class JobsSkippedHold(Base):
     """Findings of the review of the job-read switch."""
