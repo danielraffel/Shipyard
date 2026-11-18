@@ -7,6 +7,8 @@ fn sha(byte: char) -> String {
 fn green_pr() -> StewardPullRequest {
     StewardPullRequest {
         number: 7,
+        changed_files: None,
+        commit_count: None,
         head_sha: sha('a'),
         author: None,
         head_branch: "feature".to_owned(),
@@ -44,6 +46,44 @@ fn queue_policy() -> StewardPolicy {
         handoff_context: "shipyard/steward-handoff".to_owned(),
         max_transient_reruns: 1,
         ejection_guards: crate::merge_steward::EjectionGuards::default(),
+    }
+}
+
+#[test]
+fn empty_diff_with_commits_blocks_admission() {
+    let mut pr = green_pr();
+    pr.changed_files = Some(0);
+    pr.commit_count = Some(2);
+    for position in [None, Some(0)] {
+        pr.queue_position = position;
+        assert_eq!(
+            classify_pr(&pr, &queue_policy(), &BTreeMap::new()),
+            StewardDecision::EmptyDiff
+        );
+    }
+}
+
+#[test]
+fn changed_files_with_commits_are_admitted() {
+    let mut pr = green_pr();
+    pr.changed_files = Some(1);
+    pr.commit_count = Some(2);
+    assert_eq!(
+        classify_pr(&pr, &queue_policy(), &BTreeMap::new()),
+        StewardDecision::ArmMergeQueue
+    );
+}
+
+#[test]
+fn unknown_diff_or_commit_count_does_not_block_admission() {
+    for (files, commits) in [(None, Some(2)), (Some(0), None), (None, None)] {
+        let mut pr = green_pr();
+        pr.changed_files = files;
+        pr.commit_count = commits;
+        assert_eq!(
+            classify_pr(&pr, &queue_policy(), &BTreeMap::new()),
+            StewardDecision::ArmMergeQueue
+        );
     }
 }
 

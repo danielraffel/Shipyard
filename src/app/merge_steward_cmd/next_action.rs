@@ -168,9 +168,9 @@ impl NextAction {
         Self::new(
             Actor::Author,
             format!(
-                "The diff against `{base}` is empty (0 changed files): the change was dropped \
-                 by a merge or rebase. Restore it on this branch and push once; a green run on \
-                 nothing proves nothing."
+                "The PR's diff against `{base}` is empty (0 changed files): a repair merge \
+                 probably dropped its changes. Restore them from an earlier head and push once, \
+                 or close the PR as superseded."
             ),
         )
     }
@@ -742,6 +742,8 @@ mod tests {
     fn pr(merge_state: &str) -> StewardPullRequest {
         StewardPullRequest {
             number: 11364,
+            changed_files: None,
+            commit_count: None,
             head_sha: "a".repeat(40),
             head_branch: "feature".to_owned(),
             author: None,

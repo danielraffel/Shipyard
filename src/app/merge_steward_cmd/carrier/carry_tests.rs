@@ -248,6 +248,8 @@ fn observation(merge_state: &str, head: &str) -> RepoObservation {
             owner: Some("team-lead".to_owned()),
             fact: StewardPullRequest {
                 number: 42,
+                changed_files: None,
+                commit_count: None,
                 head_sha: head.to_owned(),
                 author: Some("app/shipyard-local".to_owned()),
                 head_branch: "feature".to_owned(),

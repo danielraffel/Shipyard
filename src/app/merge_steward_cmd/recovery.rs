@@ -1301,6 +1301,8 @@ mod tests {
             owner: Some("team-lead".to_owned()),
             fact: StewardPullRequest {
                 number: 7,
+                changed_files: None,
+                commit_count: None,
                 head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
                 author: None,
                 head_branch: "feature".to_owned(),

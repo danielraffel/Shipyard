@@ -119,6 +119,14 @@ as `hold-condition:` lines so it can be released this way. Gotcha:
 `docs/advance.md` lands; the refusal changes nothing. Defect dequeues keep
 their own path. Full reference: `docs/advance.md`.
 
+## An empty diff is never admitted: `empty_diff`
+
+The steward refuses a pull request that has commits but changes no files against its base (GitHub
+changed_files == 0 and commits > 0). It reports `blocked_on: empty_diff` with the next action: a repair merge
+probably dropped the PR's changes, so restore them from an earlier head or close the PR as superseded. On
+2026-11-18 repair merges emptied four PRs (Pulp #12547 and #12549, skia-builder #63, v8-builder #71) that
+would otherwise have merged as no-ops. Unknown counts never block; only an observed 0 with commits does.
+
 ## Stale merge refs: `stale_merge_ref`
 
 An approved pull request whose required checks went red on a test merge

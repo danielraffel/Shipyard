@@ -433,7 +433,10 @@ fn an_empty_diff_is_the_authors_move_whatever_the_checks_say() {
         &log,
         &pr_row("OPEN", "main", "CLEAN", 0, &green_rollup()),
         "",
-        "",
+        &format!(
+            r#"  *"api repos/owner/repo/pulls/42") printf '%s' '{{"head":{{"sha":"{HEAD}"}},"base":{{"ref":"main"}},"changed_files":0,"commits":2}}' ;;
+"#
+        ),
     );
     let (snapshot, calls) = read_snapshot(&temp, &body);
     assert_eq!(snapshot["blocked_on"], "empty_diff", "{snapshot:#}");
@@ -445,10 +448,7 @@ fn an_empty_diff_is_the_authors_move_whatever_the_checks_say() {
             .is_some_and(|action| action.contains("0 changed files")),
         "{snapshot:#}"
     );
-    assert!(
-        !calls.contains("isInMergeQueue"),
-        "an empty diff is answered before the admission read:\n{calls}"
-    );
+    assert!(calls.contains("api repos/owner/repo/pulls/42"), "{calls}");
 }
 
 #[cfg(unix)]
