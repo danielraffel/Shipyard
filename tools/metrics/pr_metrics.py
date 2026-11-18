@@ -52,14 +52,14 @@ APP_LOGINS = {"shipyard-local[bot]", "shipyard-local"}
 _GUARD = []
 SIGNALS = ("app_opener", "provenance", "trailer", "session_stamp")
 BAD_CONCLUSIONS = {"failure", "timed_out"}
-FACTS_VERSION = 14  # push_times are observed head updates, never commit timestamps; main-red facts
+FACTS_VERSION = 15  # 14: merge-queue ejection causes read from GraphQL; push_times are observed head updates; main-red facts
 COMPUTE_VERSION = 8  # compute caches: entries written before this could be marked complete from a partial timeline or commit read or rerun history
 CHECKS_VERSION = 3  # derived check caches: v2 entries (incomplete pagination read as clean, latest run by start) are read again
 ESCAPE_WINDOW = dt.timedelta(days=14)
 HORIZON = dt.timedelta(hours=48)
 MIN_SAMPLE = 50
 UNKNOWN_RANGE_SHARE = 0.20
-SCORECARD_VERSION = "2026-11-18.9"  # .2: correctness reads the first-parent next push and the newest run by id; main-red episodes
+SCORECARD_VERSION = "2026-11-18.10"  # .2: correctness reads the first-parent next push and the newest run by id; main-red episodes. .3: ejection causes from GraphQL
 MERGE_MAIN_RE = re.compile(r"^Merge (remote-tracking )?branch '?(origin/)?(main|master)'?|^Merge pull request .* from .*/main", re.I)
 # Positive controls: a real revert (#124 reverted #119), a real escaped defect (#126 names #116).
 # Pulp: two escapes verified by hand from main-red traces. #12219 landed red on Workflow lint and
@@ -116,8 +116,11 @@ def gh_runner(repo):
     tool = "ghread" if repo.startswith("Generous-Corp/") else "ghapp"
 
     def run(path):
+        argv, env = [tool, "api", path], None
+        if path.startswith("graphql:"):  # ghread has no GraphQL route: the App reads it, with the repo named for provenance
+            argv, env = ["ghapp", "api", "graphql", "-f", "query=" + path[len("graphql:"):]], dict(os.environ, GH_REPO=repo)
         try:
-            p = subprocess.run([tool, "api", path], capture_output=True, text=True, timeout=30)
+            p = subprocess.run(argv, capture_output=True, text=True, timeout=30, env=env)
         except (OSError, subprocess.TimeoutExpired) as e:
             raise ReadError(f"{tool}: {type(e).__name__}") from e
         if p.returncode != 0:
@@ -150,6 +153,22 @@ class Reader:
         except ReadError:
             self.errors += 1
             raise
+
+    def gql(self, query):
+        """One GraphQL read, counted against the same cap as a REST read."""
+        if self.calls >= self.cap:
+            self.truncated = True
+            raise Truncated()
+        self.calls += 1
+        try:
+            d = self.fetch("graphql:" + query)
+        except ReadError:
+            self.errors += 1
+            raise
+        if not isinstance(d, dict) or d.get("errors") and not d.get("data"):
+            self.errors += 1
+            raise ReadError("graphql error")
+        return d
 
     def pages(self, path, key=None, max_pages=3):
         """All items of a paginated list (up to max_pages of 100). Returns (items, complete)."""
@@ -343,6 +362,19 @@ def finalize(rd, f, pr):
     return f
 
 
+def ejection_reasons(rd, n):
+    """The reason of each removal from the merge queue of PR `n`, as {created_at: reason}, lowercased (ci_failure,
+    merge_conflict, branch_protections, manual, ...). The REST timeline does not carry it; GraphQL does."""
+    owner, name = rd.repo.split("/")
+    d = rd.gql('query { repository(owner: "%s", name: "%s") { pullRequest(number: %d) { timelineItems(first: 100, '
+               'itemTypes: [REMOVED_FROM_MERGE_QUEUE_EVENT]) { nodes { ... on RemovedFromMergeQueueEvent { createdAt reason } } } } } }' % (owner, name, n))
+    try:
+        nodes = d["data"]["repository"]["pullRequest"]["timelineItems"]["nodes"]
+    except (KeyError, TypeError):
+        raise ReadError("graphql shape")
+    return {x["createdAt"]: (x.get("reason") or "unknown").lower() for x in nodes if x}  # no reason: still unknown, read again
+
+
 def pr_facts(rd, pr, owner):
     """Timeline and commits of one PR (merged or not), reduced to what the metrics need."""
     n = pr["number"]
@@ -360,7 +392,7 @@ def pr_facts(rd, pr, owner):
     else:
         ready = None if pr.get("draft") else created
     owner_events, agent_events, repairs, holds, ejections, enqueues = [], [], [], [], [], 0
-    enqueue_times = []
+    enqueue_times, removal_ts = [], []
     observed_push_times = []
     stamp_commit = False
     hold_untimed_push, untimed_commit_dates = False, []  # `committed` events carry no observation time: their git dates stand in only to place them
@@ -386,6 +418,7 @@ def pr_facts(rd, pr, owner):
                 enqueue_times.append(ts)
         if ejection(e, pr.get("merged_at")):
             ejections.append(e.get("reason") or "unknown")
+            removal_ts.append(ts)
         if ev not in ACTION_EVENTS:
             continue
         who = ((e.get("actor") or e.get("user") or {}).get("login") or "")
@@ -395,7 +428,18 @@ def pr_facts(rd, pr, owner):
                 agent_events.append([ev, ts])
             else:
                 owner_events.append([ev, ts])
-    dequeue_times = [e.get("created_at") for e in tl if ejection(e, pr.get("merged_at")) and e.get("created_at")]
+    causes_known, pairs = True, list(zip(removal_ts, ejections))
+    if any(r == "unknown" for r in ejections):
+        # the REST timeline names no cause; ask GraphQL once for this PR, and keep "unknown" (and read again next run) if it fails
+        try:
+            by_ts = ejection_reasons(rd, n)
+            pairs = [(t, by_ts.get(t, r) if r == "unknown" else r) for t, r in pairs]
+            pairs = [(t, r) for t, r in pairs if r not in ("merged", "already_merged")]  # GraphQL can name a merge REST could not
+            causes_known = all(r != "unknown" for _, r in pairs)
+        except ReadError:
+            causes_known = False
+    ejections = [r for _, r in pairs]
+    dequeue_times = [t for t, _ in pairs if t]
     heads = {pr["head"]["sha"]}
     for e in tl:
         if e.get("event") == "head_ref_force_pushed":
@@ -436,7 +480,7 @@ def pr_facts(rd, pr, owner):
         "agent_trailer": trailer, "stamp_commit": stamp_commit, "ambiguous_commits": sorted(set(ambiguous)),
         "repair_cycles": len(repairs), "holds": len(holds), "re_holds": re_holds, "size": size,
         "pushes": split, "enqueues": enqueues, "enqueue_times": enqueue_times, "dequeue_times": dequeue_times,
-        "hold_times": sorted(holds), "hold_untimed_push": hold_untimed_push, "untimed_commit_dates": untimed_commit_dates, "push_times": sorted(set(observed_push_times)), "ejections": ejections,
+        "ejection_causes_known": causes_known, "hold_times": sorted(holds), "hold_untimed_push": hold_untimed_push, "untimed_commit_dates": untimed_commit_dates, "push_times": sorted(set(observed_push_times)), "ejections": ejections,
         "labels": sorted(l["name"] for l in pr.get("labels") or []),
         "heads": sorted(heads), "timeline_complete": tl_full, "commits_complete": c_full,
     }
@@ -1292,6 +1336,7 @@ def summarize(rows):
     push = {k: sum(r["pushes"].get(k, 0) for r in rows) for k in ("repair", "author", "merge_main")}
     q2m = [r["enqueue_to_merge_min"] for r in merged if r.get("enqueue_to_merge_min") is not None]
     ej = collections.Counter(c for r in rows for c in r["ejections"])
+    merged_ej = collections.Counter(c for r in merged for c in r["ejections"])
     good = [r for r in merged if r["correct"] and r["correct"]["bad"] is False]
     bad = [r for r in merged if r["correct"] and r["correct"]["bad"]]
     esc_known = [r for r in merged if r["correct"] and r["correct"].get("escaped") is not None]
@@ -1322,6 +1367,9 @@ def summarize(rows):
         "merge_queue": {
             "attempts_per_ready_pr": None if not n else round(sum(r["enqueues"] for r in rows) / n, 2),
             "ejections_by_cause": dict(ej.most_common()),
+            "ejections_per_merge": None if not merged else round(sum(merged_ej.values()) / len(merged), 3),
+            "top_ejection_cause": next((c for c, _ in ej.most_common() if c != "unknown"), None),
+            "ejections_cause_unknown": ej.get("unknown", 0),
             "enqueue_to_merge_min": {"n": len(q2m), "median": med(q2m), "p90": pctile(q2m, 0.9)},
         },
         "dirty_per_100_prs": None if not n else round(100.0 * sum(1 for r in rows if r["dirty"]) / n, 1),
@@ -1423,7 +1471,7 @@ def collect_repo(repo, cache_dir, cap, owner, lo, hi, now, ticks, tick_ctx, fetc
         if f is None:
             try:
                 f = pr_facts(rd, pr, owner)
-                if f["state"] == "closed" and reads_complete(f):  # a closed PR does not change; an open one, or a partial read, is read again next run
+                if f["state"] == "closed" and reads_complete(f) and f.get("ejection_causes_known", True):  # a closed PR does not change; an open one, or a partial read, is read again next run
                     rd.save("facts", str(pr["number"]), f)
             except (Truncated, ReadError):
                 res["unread"] += 1
@@ -1850,6 +1898,16 @@ def markdown(e2e):
             u = (v.get("main_red") or {}).get("untracked_contexts")
             if u and (u["noisy"] or u["one_off"]):
                 L.append(f"- {repo}: not tracked: noisy gates {', '.join(u['noisy']) or 'none'}; {len(u['one_off'])} one-off contexts")
+        L.append("")
+    if e2e.get("window"):
+        L += ["### Merge-queue ejections (window, ready PRs)", "",
+              "A removal from the queue other than the merge itself. The cause is GraphQL's `RemovedFromMergeQueueEvent.reason`, lowercased (the REST timeline names none); "
+              "a PR whose cause could not be read stays `unknown` and is read again next run.", "",
+              "| repo | ready PRs | ejections | per merged PR | top cause | by cause | cause unknown |", "|---|---|---|---|---|---|---|"]
+        for repo, s_ in sorted(e2e["window"]["per_repo"].items()):
+            q = s_["merge_queue"]
+            by = ", ".join(f"{k2} {n}" for k2, n in q["ejections_by_cause"].items()) or "0"
+            L.append(f"| {repo} | {s_['ready_prs']} | {sum(q['ejections_by_cause'].values())} | {q['ejections_per_merge']} | {q['top_ejection_cause']} | {by} | {q['ejections_cause_unknown']} |")
         L.append("")
     nf = (e2e.get("baseline") or {}).get("noise_floor")
     if nf:
