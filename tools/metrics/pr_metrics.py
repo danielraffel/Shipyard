@@ -52,7 +52,7 @@ APP_LOGINS = {"shipyard-local[bot]", "shipyard-local"}
 _GUARD = []
 SIGNALS = ("app_opener", "provenance", "trailer", "session_stamp")
 BAD_CONCLUSIONS = {"failure", "timed_out"}
-FACTS_VERSION = 16  # 14: merge-queue ejection causes read from GraphQL; push_times are observed head updates; main-red facts
+FACTS_VERSION = 17  # 14: merge-queue ejection causes read from GraphQL; push_times are observed head updates; main-red facts
 COMPUTE_VERSION = 8  # compute caches: entries written before this could be marked complete from a partial timeline or commit read or rerun history
 CHECKS_VERSION = 3  # derived check caches: v2 entries (incomplete pagination read as clean, latest run by start) are read again
 ESCAPE_WINDOW = dt.timedelta(days=14)
@@ -394,6 +394,7 @@ def pr_facts(rd, pr, owner):
     enqueue_times, removal_ts = [], []
     observed_push_times = []
     stamp_commit = False
+    untimed_commits, force_pushed_shas = [], set()  # (sha, date) of timeline commits with no time; heads a timed force-push moved to
     hold_untimed_push, untimed_commit_dates = False, []  # `committed` events carry no observation time: their git dates stand in only to place them
     for e in tl:
         ev, ts = e.get("event"), e.get("created_at") or e.get("submitted_at")
@@ -402,6 +403,9 @@ def pr_facts(rd, pr, owner):
             hold_untimed_push = hold_untimed_push or bool(holds)  # a commit listed after a HOLD: when the head moved is unknown
             cd = ((e.get("committer") or {}).get("date")) or ((e.get("author") or {}).get("date"))
             untimed_commit_dates.append(fmt(iso(cd)) if iso(cd) else None)
+            untimed_commits.append((e.get("sha"), fmt(iso(cd)) if iso(cd) else None))
+        if ev == "head_ref_force_pushed" and e.get("after_sha"):
+            force_pushed_shas.add(e["after_sha"])
         if ev in ("committed", "head_ref_force_pushed") and ts and ready:
             observed = iso(ts)
             if observed and observed > ready:
@@ -479,7 +483,7 @@ def pr_facts(rd, pr, owner):
         "agent_trailer": trailer, "stamp_commit": stamp_commit, "ambiguous_commits": sorted(set(ambiguous)),
         "repair_cycles": len(repairs), "holds": len(holds), "re_holds": re_holds, "size": size,
         "pushes": split, "enqueues": enqueues, "enqueue_times": enqueue_times, "dequeue_times": dequeue_times,
-        "ejection_causes_known": causes_known, "hold_times": sorted(holds), "hold_untimed_push": hold_untimed_push, "untimed_commit_dates": untimed_commit_dates, "push_times": sorted(set(observed_push_times)), "ejections": ejections,
+        "ejection_causes_known": causes_known, "hold_times": sorted(holds), "hold_untimed_push": hold_untimed_push, "untimed_commit_dates": untimed_commit_dates, "untimed_repair_dates": sorted({d for sha, d in untimed_commits if d and sha not in force_pushed_shas}), "push_times": sorted(set(observed_push_times)), "ejections": ejections,
         "labels": sorted(l["name"] for l in pr.get("labels") or []),
         "heads": sorted(heads), "timeline_complete": tl_full, "commits_complete": c_full,
     }
@@ -728,8 +732,9 @@ def hold_rounds(f):
         return None
     holds = sorted(iso(x) for x in f.get("hold_times") or [] if iso(x) and iso(x) < m)  # a HOLD posted after the merge held nothing
     # a timed push (a force-push) is observed; a `committed` event carries no time, so its commit's committer date stands in
-    # (as for the agent-push counts) and an ordinary repair commit is still a round
-    pushes = sorted({iso(x) for x in list(f.get("push_times") or []) + list(f.get("untimed_commit_dates") or []) if iso(x)})
+    # (as for the agent-push counts) and an ordinary repair commit is still a round; a commit a timed force-push moved the head to
+    # is that push, not a second one
+    pushes = sorted({iso(x) for x in list(f.get("push_times") or []) + list(f.get("untimed_repair_dates") or []) if iso(x)})
     return [sum(1 for p in pushes if h < p < (holds[i + 1] if i + 1 < len(holds) else m)) for i, h in enumerate(holds)]
 
 

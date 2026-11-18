@@ -909,6 +909,16 @@ class HoldRounds(Base):
             out = pm.build([REPO], d, 300, OWNER, START, NOW, {}, {}, None, world([p], tl), control=False)
         self.assertEqual(out["repos"][REPO]["prs"][0]["hold_rounds"], [1])
 
+    def test_a_commit_and_the_force_push_that_moved_the_head_to_it_are_one_round(self):
+        p = pr(1, T(10, "09:00"), T(10, "12:00"))
+        sha = "c" * 40
+        tl = {1: [{"event": "commented", "actor": {"login": "x"}, "body": "HOLD", "created_at": T(10, "10:00")},
+                  {"event": "committed", "sha": sha, "committer": {"date": T(10, "10:20")}},
+                  {"event": "head_ref_force_pushed", "actor": {"login": "x"}, "created_at": T(10, "10:40"), "after_sha": sha}]}
+        with tempfile.TemporaryDirectory() as d:
+            out = pm.build([REPO], d, 300, OWNER, START, NOW, {}, {}, None, world([p], tl), control=False)
+        self.assertEqual(out["repos"][REPO]["prs"][0]["hold_rounds"], [1])
+
     def test_the_summary_pools_holds_across_prs(self):
         rows = [{"hold_rounds": [2, 0]}, {"hold_rounds": []}, {"hold_rounds": None}, {"hold_rounds": [1]}]
         got = pm.hold_round_summary(rows)
