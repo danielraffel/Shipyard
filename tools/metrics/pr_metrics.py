@@ -1380,8 +1380,8 @@ def read_shares(repos, cache_dir, cap, lo, hi, fetch=None):
     """repo -> its share of the shared read cap: READ_FLOOR each, the rest in proportion to the PRs each repo lists in the
     window (a PR costs about the same to read wherever it is, so a busy repo gets more). A repo whose listing cannot be read
     counts as the median of the others. Returns (shares, reads spent planning). A cap too small to give every repo its
-    floor is split equally with no planning reads, so the total is never exceeded."""
-    if cap < READ_FLOOR * len(repos):
+    floor after its planning listing is split equally with no planning reads, so the total is never exceeded."""
+    if cap < (READ_FLOOR + 8) * len(repos):  # 8 = most a repo's planning listing can cost
         return {r: cap // len(repos) for r in repos}, 0
     n, spent = {}, 0
     for repo in repos:

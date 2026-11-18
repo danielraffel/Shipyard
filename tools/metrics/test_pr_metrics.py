@@ -2097,6 +2097,13 @@ class ReadShares(unittest.TestCase):
         self.assertTrue(all(shares[r] >= pm.READ_FLOOR for r in counts))
         self.assertLessEqual(sum(shares.values()) + spent, 3000)
 
+    def test_a_cap_that_cannot_fund_the_floors_after_planning_is_split_equally(self):
+        counts = {f"o/r{i}": 50 for i in range(5)}
+        calls = []
+        with tempfile.TemporaryDirectory() as d:
+            shares, spent = pm.read_shares(list(counts), d, 500, self.LO, self.HI, lambda p: calls.append(p) or [])  # 500 = 5 floors, no room for 5 listings
+        self.assertEqual((set(shares.values()), spent, calls), ({100}, 0, []))
+
     def test_a_cap_below_the_floors_is_split_equally_with_no_planning_reads(self):
         counts = {"o/pulp": 316, "o/a": 20}
         calls = []
