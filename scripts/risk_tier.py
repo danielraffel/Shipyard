@@ -757,34 +757,36 @@ class GitHub:
                 or re.search(r"\b(50[0-9]|429)\b", low) is not None
                 or "connection" in low or "eof" in low)
 
-    def _count_check_runs(self, path: str, body: dict[str, Any]) -> int | None:
-        """Check runs with this name on this head, or None when not countable."""
-        if not path.endswith("/check-runs") or not body.get("head_sha"):
-            return None
+    def _landed(self, path: str, body: dict[str, Any]) -> bool:
+        """True when a check run carrying this invocation's external_id exists."""
         try:
             found = self.json(f"repos/{self.repo}/commits/{body['head_sha']}/check-runs"
-                              f"?check_name={quote(str(body.get('name')), safe='')}")
+                              f"?check_name={quote(str(body.get('name')), safe='')}"
+                              "&per_page=100")
         except (TierError, ValueError):
-            return None
-        total = found.get("total_count") if isinstance(found, dict) else None
-        return total if isinstance(total, int) else None
+            return False
+        runs = found.get("check_runs") if isinstance(found, dict) else None
+        return any(isinstance(run, dict) and run.get("external_id") == body["external_id"]
+                   for run in runs or [])
 
     def post(self, path: str, body: dict[str, Any]) -> None:
+        check = path.endswith("/check-runs") and bool(body.get("head_sha"))
+        if check:
+            # Names this publication, so a readback never mistakes a rerun's or
+            # another writer's run of the same name for ours.
+            body = {**body, "external_id": secrets.token_hex(16)}
         delays = list(self.RETRY_DELAYS)
-        # A rerun may already have a run of this name; only growth proves a landing.
-        baseline = self._count_check_runs(path, body)
         while True:
             done = self._run(["-X", "POST", path, "--input", "-"], stdin=json.dumps(body))
             if done.returncode == 0:
                 return
             detail = (done.stderr or done.stdout).strip()
+            # The failed attempt may have landed; never create a duplicate.
+            if check and self._transient(detail) and self._landed(path, body):
+                return
             if not self._transient(detail) or not delays:
                 raise TierError(f"POST {path} failed: {detail[:300]}")
             time.sleep(delays.pop(0))
-            # The failed attempt may have landed; never create a duplicate.
-            now = self._count_check_runs(path, body)
-            if baseline is not None and now is not None and now > baseline:
-                return
 
 
 def evaluate(github: GitHub, number: int) -> tuple[dict[str, Any], Assessment]:

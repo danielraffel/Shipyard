@@ -542,7 +542,7 @@ class FlakyTransport(rt.GitHub):
         import subprocess
         if "-X" not in args:
             return subprocess.CompletedProcess(
-                args, 0, json.dumps({"total_count": len(self.check_runs)}), "")
+                args, 0, json.dumps({"check_runs": self.check_runs}), "")
         if not any(a.endswith("/check-runs") for a in args):
             return subprocess.CompletedProcess(args, 0, "{}", "")
         self.posts += 1
@@ -584,9 +584,16 @@ class PostRetry(unittest.TestCase):
 
     def test_preexisting_check_run_does_not_mask_a_lost_post(self) -> None:
         github = FlakyTransport([("unexpected end of JSON input", False)])
-        github.check_runs.append({"name": "risk-tier", "old": True})
+        github.check_runs.append({"name": "risk-tier", "external_id": "other"})
         self.post(github)
         self.assertEqual(len(github.check_runs), 2)
+
+    def test_last_attempt_that_landed_succeeds(self) -> None:
+        github = FlakyTransport([("unexpected end of JSON input", False)] * 3
+                                + [("HTTP 502 Bad Gateway", True)])
+        self.post(github)
+        self.assertEqual(len(github.check_runs), 1)
+        self.assertEqual(github.posts, 4)
 
     def test_permanent_error_is_not_retried(self) -> None:
         github = FlakyTransport([("HTTP 403 Resource not accessible", False)])
