@@ -1311,7 +1311,8 @@ A stalled release chain opens a `release-stall` issue on its own:
 `auto-release-watchdog.yml` tracks a failing `version-at-land.yml` or
 `auto-release.yml` run (error lines and fix copied in), and
 `release-cadence-check.yml` flags `feat:`/`fix:` merges older than two hours
-that are in no tag while no bump pull request is open. Both close their issue
+that are in no tag and no merged bump pull request's history, while no bump
+pull request is open (a plugin-only bump is a release without a tag). Both close their issue
 on recovery; see `docs/release-watchdog.md`.
 
 The same workflow's `chain` step follows each version to an installable

@@ -1,6 +1,6 @@
 # Shipyard scorecard: end-to-end metrics per eligible PR
 
-Scorecard definition version: `2026-11-18.2` (`SCORECARD_VERSION` in `tools/metrics/pr_metrics.py`,
+Scorecard definition version: `2026-11-18.9` (`SCORECARD_VERSION` in `tools/metrics/pr_metrics.py`,
 printed in every report header). A change to any definition below bumps it, so a definition change
 cannot pose as an improvement. The daily loss report ([below](#daily-loss-report))
 counts blocked episodes; this scorecard measures outcomes per PR. `pr_metrics.py` computes it, and
@@ -38,7 +38,7 @@ it is on only when the tick passes `--e2e-cache DIR` (the daily run does, unless
 **Synthetic control (every report).** `tools/metrics/synthetic_control.py` holds fifteen invented PRs, each
 built to have one known outcome (autonomous, owner label, steward merge, unbound owner merge, unsigned owner
 PR, never merged, reverted, red base, escaped, twice held with repair and merge-main pushes, ejected from the
-queue, a gate-run fixture with repeats). `expected()` derives 49 numbers from that table with plain arithmetic
+queue, a gate-run fixture with repeats). `expected()` derives 61 numbers from that table with plain arithmetic
 and never calls the scorecard; the real `pr_metrics.build` then runs over the same PRs, served from memory (no
 GitHub read, a throwaway cache), and every number must match. The report prints one line, `CONTROL PASS` with the
 count and the largest delta, or `CONTROL FAIL` with each missed number, its expected value, its value and the delta.
@@ -95,6 +95,18 @@ merge), runner (queued job time from the jobs' `created_at` to `started_at`) and
 record a state, not a duration, so its cell is empty and never zero). Push endpoints come from GitHub timeline head-update events, not commit timestamps. With the timeline and commits read in full, a HOLD or failed run that no commit or push event follows ran to the merge, so its interval ends at `merged_at`. A commit event has no observation time: one listed after a HOLD, or dated after a failed run (or with no date), means the head moved at an unknown time, so that cause is unknown. A cached compute entry records each run's attempt and update time and is used only when the current run list still matches (same runs, same attempts and update times; if the run list cannot be read the entry's numbers are kept but a clean verdict is reported unknown) (a rerun keeps its run id and can turn a success into a failure), and cached job minutes are per attempt. A run whose latest update is after the merge never counts as red (a rerun after the merge cannot have delayed it), and a rerun after the merge leaves the PR's earlier outcome unknown. Job minutes of a rerun are those of its latest attempt only. Runner wait counts only runs that can precede the merge (not pushes to the base on a merge-group sha). A failed run on a PR head classifies it slow even when job timing is missing or a jobs read fails (those withhold only the job minutes). Any run with an attempt above one, failed or successful, makes the red duration and the runner wait unknown, because the list and the jobs read show only the latest attempt and earlier failures and waits are missing; a failed one still classifies the PR slow. The causes overlap and are not additive. A cause aggregate is withheld when any slow PR lacks a measured value, so an unread value is never treated as zero. The per-run jobs reads are most of a compute read; a measurement run can set `pr_metrics.READ_JOB_MINUTES = False` to classify paths from the run list alone (the runner cause is then empty and nothing is cached).
 The top cause is the largest of the measured ones.
 
+## Main-red episodes (change failure)
+
+The detector reads the checks of every push to the base in the window (each context's latest run decides it; a push
+with unfinished runs or an unread page says nothing and is skipped; an episode still open there ends `end unknown`, with no fixer and no duration, since the base may have gone green and red again unseen). Each context's latest run decides a push, so a red that a rerun on the same commit turned green is a flake, not an episode. A direct push's time is its commit date (no push time is recorded), floored at the push before it, so a fix by direct push can read as a shorter time to green. An episode starts at the first push where a
+context is red that was not red before and is attributed to the PR whose merge commit that push is (a direct push,
+or a first usable push that is already red, has no PR). It ends at the push where its last context turns green; that
+push's PR is the fixer. `base_red` is true only when a complete, settled read of the merge commit or the next push shows a required context red; a partial read or an unfinished run leaves it unknown (excluded from the correctness rate), never red and never green. The check-run list of a push or head is read every time; its cached state is reused only while a fingerprint of that list (each run's id, state, conclusion and times) is unchanged, so a rerun or a late workflow after the first read is seen. A run still queued or running three hours after its push is stuck (GitHub keeps phantom queued runs for days): it is neither red nor green and does not hold the push open. It also says nothing about its context: an open episode in that context ends there with no fixer and no minutes to green, and the next push has no baseline. The stuck check uses the report's clock, so a replay gives the same result. A context seen on one push only (a per-version or per-event name) can never turn green again and is not tracked, unless that push is the newest one: a check new on the latest push is followed until a later push shows whether it recurs. The head's runs are read with `filter=all`, so a rerun after the merge cannot hide the run that decided it. A context that turns red (from green or absent) on a tenth or more of the pushes it appears on (judged over at least 20 pushes) is a PR gate that flaps on a merge-queue base (`review-verdict`, the reviewer `judge`), not a check a merge breaks, and is not tracked either; one sustained break that stays red for many pushes turns red once and is still followed. The report lists both kinds. A context's newest run is the one with the highest id, so a queued rerun holds its push open. Pushes are the base's first-parent chain from its tip (when the listing stops short of the tip, from the newest merged PR's merge commit in it, since a cut listing can hold a feature commit whose merge fell outside it), ordered by those links, not commit dates (a merge queue fast-forwards the base, so each commit keeps its own older date; listing a base that takes merge commits also returns every merged branch's own commits, which were never base pushes), and a PR's push time is its `merged_at`. The listing is read up to 40 pages (Pulp's main lists about 2,900 commits over 8 days, its merged branches' commits included) and starts a day before the first merge in the window, so a queue's merge commit written before its `merged_at` is still read and the first PR has a push before it. A PR is attributed only when its merge commit is a settled push right after another settled push: a merge the listing misses, an unsettled one, or one right after a skipped push has `unknown` attribution (an episode that starts right after a skipped push has no PR), never a known zero. Limits: in a cut listing (a historical window), pushes after the newest listed PR merge are not read, so an episode open there reads unresolved; a rerun on a base push more than a day old is not seen once that push's state is cached. A push's state is cached only when all its runs finished and the push is a day old, and a run counts as stuck only when both the push and the run itself are three hours old (a run with no start time yet is pending), so a rerun queued minutes ago on an old push is pending. `head red` takes each context's newest run started by `merged_at` (pending if it had not finished by then, or if a run of that context has not started at all: it may have been queued before the merge), so a rerun after the merge does not change it; an episode whose head was not red in any of its contexts and not green in all of them (pending, absent or unread) is `head unknown`, neither a change failure nor other post-merge red. The report prints counts and the raw minutes to green, with no rate and no median, plus
+`head red`: episodes whose PR's own final head was red in the same context when it merged. A known-incident control
+(`DEFAULT_CONTROLS[repo]["incident"] = [(escaped PR, fixer PR[, head red at merge])]`; Shipyard pins #1459, #1462 and a green head, verified against their check runs) must be found, with the head verdict when one is pinned: the report prints recall k/n, and a
+miss fails the control and withholds the change-failure cells only. `base_red` and the text-matched escape stay as
+they were and will be retired once the episodes are audited by hand.
+
 ## Sample and comparison
 
 Every rate carries a 95% Wilson interval and n. A sample is **insufficient** below 50 PRs, when the
@@ -109,8 +121,12 @@ p90 carry only n.
 Merged PRs do not change, so a closed PR's timeline and commits, a completed run's jobs, a PR's
 compute and a settled commit's check runs are each read once and kept under
 `DIR/<owner>__<repo>/`; open PRs are read again each run. Generous-Corp repos read through `ghread
-api`, others through `ghapp api`. `--read-cap` (default 100) is the most reads per run across repos,
-split evenly; a repo that hits its share is `truncated` and the next run resumes from the cache. Each
+api`, others through `ghapp api`. `--read-cap` (default 3000) is the most reads per run across repos. Each repo is promised 100 reads and the rest
+is split by how many PRs each lists in the window (the listings are read first and counted; a listing that cannot be read in full, or that hits the eight-page planning cap, counts as the median of the other repos), so a busy repo is not
+starved by an equal split; a share a repo does not use flows to the repos after it. A repo that hits its share is
+`truncated` and the next run resumes from the cache. Cost: Pulp's 7-day window is about 316 PRs and needs about 900 reads
+on a warm cache (about 1,200 cold), and a warm Pulp read takes about 25 minutes of wall time through `ghread`, so the
+daily run is slow by design. The default of 1500 split equally gave Pulp 300 reads and withheld its numbers every run. Each
 report prints the read count and the `truncated` flag. A read that fails leaves a PR unread or a
 field null, never zero. `--baseline FROM:TO` (default `2026-11-12:2026-11-14`, `none` to drop it).
 
@@ -168,6 +184,60 @@ stops answered. CI compute per episode and owner stops answered are always
 context in the JSON; no number in the summary is a duration.
 
 The four end-to-end per-merged-PR metrics (autonomous merge rate, handoff-to-merge time, compute, correctness) are the scorecard above.
+
+## Selection recall report
+
+`tools/metrics/selection_recall.py` aggregates what a repo's merge-group gate already says about test selection, so
+the window number that decides whether narrowing may go live, or must be rolled back, is read rather than assembled
+by hand. It is read-only and nothing calls it.
+
+```
+python3 -I tools/metrics/selection_recall.py --repo Generous-Corp/pulp --since 2026-11-11 --until 2026-11-17 \
+  --workflow .github/workflows/build.yml --job macos --cache ~/.cache/shipyard-selection-recall \
+  --json-out recall.json --md-out recall.md
+```
+
+Reads use the scorecard's `Reader` (cache, per-repo read cap `--read-cap`, `ghread` for Generous-Corp). It lists the
+workflow's `merge_group` runs one UTC day at a time, reads each completed run's jobs (latest attempt), and for every
+completed gate job reads `check-runs/{job_id}/annotations`. Annotations of a finished job are cached for good; a run's
+cached jobs are read again when the run's attempt number moved.
+
+A gate job is a completed (success or failure) job named `--job` on `--runner-class` runners (default `fleet`). The
+same job name can also run on a hosted runner as the bootstrap and reuse stub, which runs no suite and emits no
+notice; those, cancelled jobs and runs not yet completed are counted under `excluded`, never as unread.
+
+Notices parsed (JSON in `message`): `affected-tests-shadow` or `shipyard-selection-shadow` (same fields:
+`total`, `selected`, `select_all`, `reason`, `failed`, `failed_outside_selection`, `failed_outside_names`),
+`test-receipts-shadow` (`would_skip`, `selected`, `would_skip_failed`, `would_skip_failed_names`) and
+`flake-exoneration` (`tests.<name>.excused` and `reason`; the `flake-exoneration-shadow` title with
+`would_exonerate` is read as well).
+
+| Figure | Definition |
+| --- | --- |
+| Select-all share | Read jobs with `select_all`, over read jobs. Reasons are ranked; a leading count is folded so "1 changed file(s) no edge reads" and "2 changed file(s) ..." are one row. |
+| Narrowed share, selected fraction | Read jobs without `select_all`. Selected fraction is `selected / total` per narrowed job: median and p90 (linear interpolation). |
+| Failing tests in narrowed jobs | Sum of `failed` over narrowed jobs. Failures in select-all jobs are reported apart and are never misses. |
+| Miss | A failing test outside the selection (`failed_outside_selection`) in a narrowed job. Listed with job id, test name and the exoneration verdict: `exonerated`, `not excused: <reason>`, or `no verdict` when the job has no exoneration notice. |
+| Misses per 100 narrowed jobs | Misses over narrowed jobs, times 100. The promotion rule is 0 unexplained misses over at least 300 narrowed jobs. |
+| Unexplained misses | Misses minus those whose verdict is `exonerated`, and the same per 100 narrowed jobs. This is the figure the promotion rule reads. |
+| Receipts | Jobs with the notice, median `would_skip / selected`, and `would_skip_failed` (with names). |
+
+Each notice is checked against a schema table (`SELECTION_SCHEMA`, `RECEIPTS_SCHEMA`, `EXONERATION_SCHEMAS`, which nests
+`TEST_SCHEMAS` for the per-test objects: a boolean `excused` or `would_exonerate`, a string `reason`, a list of counts
+`other_prs`; verdicts compare with `is True`, never truthiness): every
+field is required with its exact JSON type (`select_all` a boolean, counts non-negative integers, names lists of
+strings, no defaults), with `selected <= total`, `failed_outside_selection <= failed`,
+`0 <= would_skip_failed <= would_skip <= selected` and no more names than their count. A failing notice is unread.
+
+A gate job whose selection notice is missing, unparseable or invalid, whose annotations could not be read, or whose run's
+jobs could not be read is unread: it is listed, and the result prints `PARTIAL`, as it does when under 95% of gate
+jobs carried a selection notice, a listing was truncated or the read cap was reached.
+
+Reproduced for Pulp, 2026-11-11 to 2026-11-17: 310 gate jobs, 309 read (one failed in `Fetch pulp-rs crates` before
+the shadow ran); 195 select-all (157 "cmake changed"), 114 narrowed, selected fraction median 3.2% and p90 36.3%;
+28 gate jobs with a failing test and 30 failing tests; 12 failing tests in narrowed jobs, 6 misses, 5.3 per 100
+narrowed jobs, all 6 unexplained (every verdict "not excused: main evidence unread"); receipts would skip a median 0.87% of tests and one
+skipped test failed.
 
 ## Workflow cost report
 

@@ -37,6 +37,10 @@ def commit(sha, login="shipyard-local[bot]", msg="x", date=T(1, "00:00")):
             "commit": {"message": msg, "committer": {"date": date}}}
 
 
+def iso_dt(t):
+    return pm.iso(t)
+
+
 class Fake:
     """GitHub stand-in: routes are (regex, value); a missing route is a read error."""
 
@@ -354,6 +358,441 @@ class Paths(unittest.TestCase):
         md = pm.markdown(out)
         self.assertIn("### Clean and slow paths (window, merged PRs)", md)
         self.assertIn("| slow share | clean median (n) | slow median / p90 (n) | top cause |", md)
+
+
+class MainRed(unittest.TestCase):
+    def st(self, red=(), green=(), settled=True, stuck=()):
+        return {"settled": settled, "red": sorted(red), "green": sorted(green), "stuck": sorted(stuck)}
+
+    def run_eps(self, seq, prs=None):
+        """seq: [(sha, state)] oldest first; one minute apart from 10:00."""
+        chron = [(sha, T(10, f"10:{i:02d}")) for i, (sha, _) in enumerate(seq)]
+        return pm.main_red_episodes(chron, dict(seq), prs or {})
+
+    def test_the_pr_whose_merge_turned_a_context_red_is_the_cause_and_the_next_green_pr_the_fixer(self):
+        eps, skipped = self.run_eps([("base", self.st(green=["T"])), ("a", self.st(red=["T"])), ("b", self.st(green=["T"]))], {"a": 1, "b": 2})
+        self.assertEqual(len(eps), 1)
+        e = eps[0]
+        self.assertEqual((e["pr"], e["fixer_pr"], e["contexts"], e["minutes_to_green"], e["began_before_window"], skipped), (1, 2, ["T"], 1.0, False, 0))
+
+    def test_a_red_that_never_clears_is_an_open_episode(self):
+        eps, _ = self.run_eps([("base", self.st(green=["T"])), ("a", self.st(red=["T"])), ("b", self.st(red=["T"]))], {"a": 1, "b": 2})
+        self.assertEqual((len(eps), eps[0]["pr"], eps[0]["minutes_to_green"], eps[0]["open"]), (1, 1, None, ["T"]))  # b did not start it
+
+    def test_a_context_already_red_on_the_first_push_began_before_the_window_and_has_no_pr(self):
+        eps, _ = self.run_eps([("a", self.st(red=["T"])), ("b", self.st(green=["T"]))], {"a": 1, "b": 2})
+        self.assertEqual((eps[0]["pr"], eps[0]["began_before_window"], eps[0]["fixer_pr"]), (None, True, 2))
+
+    def test_two_contexts_red_at_once_are_one_episode_that_ends_when_both_are_green(self):
+        eps, _ = self.run_eps([("base", self.st(green=["X", "Y"])), ("a", self.st(red=["X", "Y"])), ("b", self.st(red=["Y"], green=["X"])), ("c", self.st(green=["X", "Y"]))],
+                              {"a": 1, "b": 2, "c": 3})
+        self.assertEqual((len(eps), eps[0]["contexts"], eps[0]["fixer_pr"], eps[0]["minutes_to_green"]), (1, ["X", "Y"], 3, 2.0))
+
+    def test_a_cancelled_or_absent_context_does_not_close_an_episode(self):
+        eps, skipped = self.run_eps([("base", self.st(green=["T"])), ("a", self.st(red=["T"])), ("b", self.st()), ("d", self.st(green=["T"]))],
+                                    {"a": 1, "b": 2, "d": 4})
+        self.assertEqual((eps[0]["fixer_pr"], eps[0]["minutes_to_green"], skipped), (4, 2.0, 0))
+
+    def test_an_unsettled_push_ends_an_open_episode_unknown_and_a_later_red_is_a_new_one(self):
+        eps, skipped = self.run_eps([("base", self.st(green=["T"])), ("a", self.st(red=["T"])), ("c", self.st(red=["T"], settled=False)),
+                                     ("d", self.st(red=["T"])), ("e", self.st(green=["T"]))], {"a": 1, "c": 3, "d": 4, "e": 5})
+        self.assertEqual([(e["pr"], e.get("end_unknown"), e["fixer_pr"], e["minutes_to_green"]) for e in eps], [(1, True, None, None), (None, None, 5, 1.0)])
+        self.assertEqual(skipped, 1)
+        s = pm.change_failure_summary([{"main_red": [dict(eps[0], head_red_same_context=True)]}])
+        self.assertEqual((s["unresolved"], s["end_unknown"]), (0, 1))
+
+    def test_a_direct_push_that_turns_main_red_has_no_pr(self):
+        eps, _ = self.run_eps([("base", self.st(green=["T"])), ("push", self.st(red=["T"]))], {"a": 1})
+        self.assertEqual(eps[0]["pr"], None)
+
+    def test_a_context_that_goes_red_again_after_clearing_is_a_second_episode(self):
+        eps, _ = self.run_eps([("base", self.st(green=["T"])), ("a", self.st(red=["T"])), ("b", self.st(green=["T"])), ("c", self.st(red=["T"])), ("d", self.st(green=["T"]))],
+                              {"a": 1, "b": 2, "c": 3, "d": 4})
+        self.assertEqual([(e["pr"], e["fixer_pr"]) for e in eps], [(1, 2), (3, 4)])
+
+
+    def test_a_stuck_context_gaps_the_episode_instead_of_being_spanned(self):
+        eps, _ = self.run_eps([("base", self.st(green=["T"])), ("a", self.st(red=["T"])), ("b", self.st(stuck=["T"])), ("c", self.st(green=["T"]))],
+                              {"a": 1, "b": 2, "c": 3})
+        e = eps[0]
+        self.assertEqual((e["fixer_pr"], e["minutes_to_green"], e["end_unknown"]), (None, None, True))  # c did not fix it: b says nothing about T
+
+    def test_an_episode_with_one_stuck_context_gets_no_fixer_when_the_others_turn_green(self):
+        eps, _ = self.run_eps([("base", self.st(green=["T", "U"])), ("a", self.st(red=["T", "U"])), ("b", self.st(red=["U"], stuck=["T"])), ("c", self.st(green=["T", "U"]))],
+                              {"a": 1, "b": 2, "c": 3})
+        e = eps[0]
+        self.assertEqual((e["fixer_pr"], e["minutes_to_green"], e["end_unknown"]), (None, None, True))
+
+    def test_the_push_after_a_stuck_context_is_not_attributable(self):
+        chron = [(x, T(10, f"10:0{i}")) for i, x in enumerate("abc")]
+        states = {"a": self.st(green=["T"]), "b": self.st(stuck=["T"]), "c": self.st(green=["T"])}
+        self.assertEqual(pm.attributable_pushes(chron, states), {"b"})
+
+    def test_a_red_push_right_after_an_unsettled_one_has_no_pr(self):
+        eps, skipped = self.run_eps([("base", self.st(green=["T"])), ("a", self.st(red=["T"], settled=False)), ("b", self.st(red=["T"])), ("c", self.st(green=["T"]))],
+                                    {"a": 1, "b": 2, "c": 3})
+        self.assertEqual((eps[0]["pr"], eps[0]["after_gap"], eps[0]["fixer_pr"], skipped), (None, True, 3, 1))  # a may have turned it red, not b
+
+    def test_only_a_settled_push_after_a_settled_push_is_attributable(self):
+        chron = [(x, T(10, f"10:0{i}")) for i, x in enumerate("abcde")]
+        states = {"a": self.st(green=["T"]), "b": self.st(green=["T"]), "c": self.st(settled=False), "d": self.st(green=["T"]), "e": self.st(green=["T"])}
+        self.assertEqual(pm.attributable_pushes(chron, states), {"b", "e"})
+
+
+class CommitState(Base):
+    def rd(self, runs):
+        return pm.Reader(REPO, self.cache, 50, lambda path: {"check_runs": runs})
+
+    RUNS = [{"name": "T", "status": "completed", "conclusion": "success", "started_at": T(10, "10:00")},
+            {"name": "Phantom", "status": "queued", "conclusion": None, "started_at": T(10, "10:00")},
+            {"name": "Bad", "status": "completed", "conclusion": "failure", "started_at": T(10, "10:00")}]
+
+    def test_a_run_still_queued_long_after_the_push_is_stuck_and_does_not_hold_the_commit_open(self):
+        st = pm.commit_state(self.rd(self.RUNS), "s1", dt.timedelta(hours=5))
+        self.assertEqual((st["settled"], st["red"], st["green"]), (True, ["Bad"], ["T"]))  # the phantom is neither red nor green
+
+    def test_a_run_still_running_soon_after_the_push_is_pending_and_the_commit_is_unsettled_and_not_cached(self):
+        rd = self.rd(self.RUNS)
+        st = pm.commit_state(rd, "s2", dt.timedelta(minutes=30))
+        self.assertFalse(st["settled"])
+        self.assertIsNone(rd.load("cstate", "s2"))
+        self.assertFalse(pm.commit_state(self.rd(self.RUNS), "s3")["settled"])  # no age given: never stuck
+
+    def test_a_push_settled_only_because_a_run_is_stuck_is_not_cached(self):
+        rd = self.rd(self.RUNS)
+        self.assertTrue(pm.commit_state(rd, "s4", dt.timedelta(hours=5))["settled"])
+        self.assertIsNone(rd.load("cstate", "s4"))  # the stuck run can still finish
+        done = [r for r in self.RUNS if r["status"] == "completed"]
+        rd2 = self.rd(done)
+        pm.commit_state(rd2, "s5", dt.timedelta(hours=5))
+        self.assertIsNone(rd2.load("cstate", "s5"))  # finished, but a rerun can still come within the day
+        pm.commit_state(rd2, "s5", dt.timedelta(hours=30))
+        self.assertIsNotNone(rd2.load("cstate", "s5"))
+
+    def reread(self):
+        """A reader whose check-run list the test can change between reads."""
+        runs = [{"id": 1, "name": "T", "status": "completed", "conclusion": "success", "started_at": T(10, "09:00"), "completed_at": T(10, "09:10")}]
+        return runs, pm.Reader(REPO, self.cache, 50, lambda path: {"check_runs": list(runs)})
+
+    RERUN = {"id": 2, "name": "T", "status": "completed", "conclusion": "failure", "started_at": T(10, "09:50"), "completed_at": T(10, "09:55")}
+
+    def test_commit_state_uses_the_reports_clock_for_the_stuck_check(self):
+        runs = [{"id": 1, "name": "T", "status": "queued", "conclusion": None, "started_at": T(10, "10:00")}]
+        rd = self.rd(runs)
+        age = dt.timedelta(hours=5)
+        replay = pm.commit_state(rd, "k1", age, now=iso_dt(T(10, "10:30")))  # 30 minutes after the run's start: pending, not stuck
+        self.assertEqual((replay["settled"], replay["stuck"]), (False, []))
+        later = pm.commit_state(rd, "k1", age, now=iso_dt(T(10, "14:00")))
+        self.assertEqual((later["settled"], later["stuck"]), (True, ["T"]))
+
+    def test_commit_red_sees_a_rerun_that_failed_after_the_first_read(self):
+        runs, rd = self.reread()
+        self.assertEqual(pm.commit_red(rd, "r1", {"T"}), (set(), True))
+        self.assertIsNotNone(rd.load("checks", "r1"))
+        runs.append(self.RERUN)
+        self.assertEqual(pm.commit_red(rd, "r1", {"T"}), ({"T"}, True))
+
+    def test_commit_state_sees_a_rerun_that_failed_after_the_first_read(self):
+        runs, rd = self.reread()
+        old = dt.timedelta(hours=30)
+        self.assertEqual(pm.commit_state(rd, "r2", old)["red"], [])
+        self.assertIsNotNone(rd.load("cstate", "r2"))
+        runs.append(self.RERUN)
+        st = pm.commit_state(rd, "r2", old)
+        self.assertEqual((st["red"], st["green"]), (["T"], []))
+
+    def test_head_states_at_sees_a_rerun_before_the_merge_that_appeared_after_the_first_read(self):
+        runs, rd = self.reread()
+        self.assertEqual(pm.head_states_at(rd, "r3", T(10, "10:00")), {"T": "green"})
+        self.assertIsNotNone(rd.load("headstate", "r3@" + T(10, "10:00")))
+        runs.append(self.RERUN)
+        self.assertEqual(pm.head_states_at(rd, "r3", T(10, "10:00")), {"T": "red"})
+
+    def test_a_cached_entry_without_a_run_list_fingerprint_is_recomputed(self):
+        runs, rd = self.reread()
+        rd.save("checks", "r4", {"v": pm.CHECKS_VERSION, "red": ["T"]})
+        self.assertEqual(pm.commit_red(rd, "r4", {"T"}), (set(), True))
+
+    def test_a_queued_rerun_with_no_start_time_is_the_newest_run_and_holds_the_push_open(self):
+        runs = [{"id": 1, "name": "T", "status": "completed", "conclusion": "failure", "started_at": T(10, "10:00")},
+                {"id": 2, "name": "T", "status": "queued", "conclusion": None, "started_at": None}]
+        rd = self.rd(runs)
+        st = pm.commit_state(rd, "s6", dt.timedelta(minutes=30))
+        self.assertEqual((st["settled"], st["red"]), (False, []))
+        self.assertIsNone(rd.load("cstate", "s6"))
+        red, settled = pm.commit_red(self.rd(runs), "s7", {"T"})
+        self.assertEqual((red, settled), (set(), False))
+
+    def test_a_rerun_queued_minutes_ago_on_an_old_push_is_pending_not_stuck(self):
+        fresh = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        runs = [{"id": 1, "name": "T", "status": "completed", "conclusion": "success", "started_at": T(10, "10:00")},
+                {"id": 2, "name": "T", "status": "queued", "conclusion": None, "started_at": fresh}]
+        self.assertFalse(pm.commit_state(self.rd(runs), "s8", dt.timedelta(hours=30))["settled"])
+
+    def test_a_queued_rerun_with_no_start_time_on_an_old_push_is_pending(self):
+        runs = [{"id": 1, "name": "T", "status": "completed", "conclusion": "success", "started_at": T(10, "10:00")},
+                {"id": 2, "name": "T", "status": "queued", "conclusion": None, "started_at": None}]
+        self.assertFalse(pm.commit_state(self.rd(runs), "s10", dt.timedelta(hours=30))["settled"])
+
+    def test_a_check_cache_from_before_the_rerun_ordering_is_read_again(self):
+        rd = self.rd(self.RUNS)
+        rd.save("cstate", "s9", {"v": 2, "settled": True, "red": ["Old"], "green": []})
+        self.assertEqual(pm.commit_state(rd, "s9", dt.timedelta(hours=5))["red"], ["Bad"])
+
+    def test_a_context_seen_on_one_push_only_is_not_tracked_but_a_recurring_one_is(self):
+        st = lambda red=(), green=(): {"settled": True, "red": sorted(red), "green": sorted(green)}
+        chron = [("a", T(10, "10:00")), ("b", T(10, "10:10")), ("c", T(10, "10:20"))]
+        states = {"a": st(green=["T"]), "b": st(red=["T", "Regenerate docs for v1.2"]), "c": st(green=["T"])}
+        eps, _ = pm.main_red_episodes(chron, states, {"a": 1, "b": 2, "c": 3})
+        self.assertEqual([(e["pr"], e["contexts"], e["fixer_pr"]) for e in eps], [(2, ["T"], 3)])  # the per-version context never recurs
+
+
+class NoisyContexts(unittest.TestCase):
+    def test_a_gate_that_is_red_on_a_fifth_of_many_pushes_is_not_tracked_but_a_real_break_in_a_short_window_is(self):
+        st = lambda red=(), green=(): {"settled": True, "red": sorted(red), "green": sorted(green)}
+        chron = [(f"p{i}", T(10, f"10:{i:02d}")) for i in range(30)]
+        states = {sha: st(red=["gate"] if i % 3 == 0 else [], green=[] if i % 3 == 0 else ["gate"]) for i, (sha, _) in enumerate(chron)}  # red on 10 of 30
+        states["p5"]["red"], states["p5"]["green"] = ["Test"], ["gate"]
+        for sha in states:
+            if sha != "p5":
+                states[sha]["green"] = sorted(set(states[sha]["green"]) | {"Test"})
+        u = pm.untracked_contexts(chron, states)
+        self.assertEqual(u["noisy"], ["gate"])  # Test is red on 1 of 30 pushes: tracked
+        eps, _ = pm.main_red_episodes(chron, states, {sha: i for i, (sha, _) in enumerate(chron)})
+        self.assertEqual([e["contexts"] for e in eps], [["Test"]])
+        short = pm.untracked_contexts(chron[:3], states)
+        self.assertEqual(short["noisy"], [])  # three pushes are too few to call anything noise
+
+
+class SustainedRed(unittest.TestCase):
+    def test_a_check_that_breaks_and_stays_red_is_followed_not_called_noise(self):
+        st = lambda red=(), green=(): {"settled": True, "red": sorted(red), "green": sorted(green)}
+        chron = [(f"p{i}", T(10, f"10:{i:02d}")) for i in range(24)]
+        states = {sha: (st(green=["T"]) if i < 16 else st(red=["T"])) for i, (sha, _) in enumerate(chron)}  # red on the last 8 of 24
+        self.assertEqual(pm.untracked_contexts(chron, states)["noisy"], [])
+        eps, _ = pm.main_red_episodes(chron, states, {sha: i for i, (sha, _) in enumerate(chron)})
+        self.assertEqual([(e["pr"], e["contexts"], e["minutes_to_green"]) for e in eps], [(16, ["T"], None)])
+
+
+class IncidentControls(unittest.TestCase):
+    def test_shipyard_carries_its_hand_verified_main_red_incident(self):
+        self.assertIn((1459, 1462, False), pm.DEFAULT_CONTROLS["danielraffel/Shipyard"]["incident"])
+
+    def test_an_incident_pinned_with_its_head_verdict_fails_when_the_head_is_classified_otherwise(self):
+        row = {"pr": 1, "north": None, "merged": True}
+        mr = {"complete": True, "episodes": [{"pr": 1, "fixer_pr": 2, "head_red_same_context": None}]}
+        found = lambda pin: pm.check_controls(REPO, [row], {REPO: {"incident": [pin]}}, None, mr)["incident"]["found"]
+        self.assertEqual((found((1, 2)), found((1, 2, False)), found((1, 2, None))), (1, 0, 1))
+
+
+class OneOff(unittest.TestCase):
+    def test_a_context_new_and_red_on_the_newest_push_is_followed(self):
+        st = lambda red=(), green=(): {"settled": True, "red": sorted(red), "green": sorted(green)}
+        chron = [("a", T(10, "10:00")), ("b", T(10, "10:10"))]
+        states = {"a": st(green=["T"]), "b": st(red=["New"], green=["T"])}
+        self.assertEqual(pm.untracked_contexts(chron, states)["one_off"], [])
+        eps, _ = pm.main_red_episodes(chron, states, {"a": 1, "b": 2})
+        self.assertEqual([(e["pr"], e["contexts"]) for e in eps], [(2, ["New"])])
+
+
+class BaseOrder(unittest.TestCase):
+    def c(self, sha, parent, date):
+        return {"sha": sha, "parents": [{"sha": parent}] if parent else [], "commit": {"committer": {"date": date}}}
+
+    def test_a_fast_forwarded_base_is_ordered_by_parents_not_by_commit_date(self):
+        # the queue fast-forwards: b was written before a but pushed after it
+        commits = [self.c("c", "b", T(10, "10:00")), self.c("a", "base", T(10, "12:00")), self.c("b", "a", T(10, "09:00")), self.c("base", None, T(10, "08:00"))]
+        self.assertEqual([x["sha"] for x in pm.base_order(commits)], ["base", "a", "b", "c"])
+
+    def test_a_merged_branchs_own_commits_are_not_base_pushes(self):
+        # main: base -> m1 (merge of PR branch b1 <- b2, where b2 merged main) -> m2. The listing returns b1 and b2 too.
+        def mc(sha, parents, date):
+            return {"sha": sha, "parents": [{"sha": p} for p in parents], "commit": {"committer": {"date": date}}}
+        commits = [mc("m2", ["m1"], T(10, "12:00")), mc("m1", ["base", "b2"], T(10, "11:00")), mc("b2", ["b1", "base"], T(10, "10:30")),
+                   mc("b1", ["base"], T(10, "10:00")), mc("base", [], T(10, "08:00"))]
+        self.assertEqual([x["sha"] for x in pm.base_order(commits)], ["base", "m1", "m2"])
+
+    def test_a_feature_commit_whose_merge_fell_outside_a_cut_listing_is_not_the_base_tip(self):
+        def mc(sha, parents, date):
+            return {"sha": sha, "parents": [{"sha": p} for p in parents], "commit": {"committer": {"date": date}}}
+        # main: base -> m1 -> m2; feature f (branched from m2) is listed, its merge commit is past `until`
+        commits = [mc("f", ["m2"], T(10, "12:30")), mc("m2", ["m1", "x"], T(10, "12:00")), mc("m1", ["base", "y"], T(10, "11:00")), mc("base", [], T(10, "08:00"))]
+        self.assertEqual([x["sha"] for x in pm.base_order(commits, ["m1", "m2"])], ["base", "m1", "m2"])
+        self.assertEqual([x["sha"] for x in pm.base_order(commits)], ["base", "m1", "m2", "f"])  # a listing that reaches the tip trusts it
+
+    def test_without_parents_or_with_a_forked_history_it_falls_back_to_commit_date(self):
+        plain = [commit("y", date=T(10, "11:00")), commit("x", date=T(10, "10:00"))]
+        self.assertEqual([x["sha"] for x in pm.base_order(plain)], ["x", "y"])
+        forked = [self.c("a", "r", T(10, "10:00")), self.c("b", "r", T(10, "09:00")), self.c("r", None, T(10, "08:00"))]
+        self.assertEqual([x["sha"] for x in pm.base_order(forked)], ["r", "b", "a"])
+
+    def test_the_episode_uses_the_prs_merge_time_not_its_commit_date(self):
+        a, b = pr(1, T(10, "09:00"), T(10, "10:00")), pr(2, T(10, "09:00"), T(10, "10:30"))
+        a["merge_commit_sha"], b["merge_commit_sha"] = "ma" * 20, "mb" * 20
+        a["head"]["sha"], b["head"]["sha"] = "ha" * 20, "hb" * 20
+        red = [{"name": "T", "status": "completed", "conclusion": "failure", "started_at": T(10, "10:00")}]
+        ok = [{"name": "T", "status": "completed", "conclusion": "success", "started_at": T(10, "10:00")}]
+        base = [self.c("base0", None, T(10, "08:00")), self.c(a["merge_commit_sha"], "base0", T(10, "01:00")), self.c(b["merge_commit_sha"], a["merge_commit_sha"], T(10, "02:00"))]
+        gh = world([a, b], base_commits=base, checks={"base0": ok, a["merge_commit_sha"]: red, b["merge_commit_sha"]: ok, a["head"]["sha"]: ok})
+        with tempfile.TemporaryDirectory() as d:
+            eps, *_ = pm.detect_main_red(pm.Reader(REPO, d, 100, gh), base, [a, b])
+        self.assertEqual((eps[0]["pr"], eps[0]["fixer_pr"], eps[0]["minutes_to_green"]), (1, 2, 30.0))  # 10:00 to 10:30, not 01:00 to 02:00
+
+
+    def test_a_cut_listing_does_not_read_a_feature_commit_as_a_base_push(self):
+        a = pr(1, T(10, "09:00"), T(10, "10:00"))
+        a["merge_commit_sha"], a["head"]["sha"] = "ma" * 20, "ha" * 20
+        red = [{"name": "T", "status": "completed", "conclusion": "failure", "started_at": T(10, "10:00")}]
+        ok = [{"name": "T", "status": "completed", "conclusion": "success", "started_at": T(10, "10:00")}]
+        base = [{"sha": "feat", "parents": [{"sha": a["merge_commit_sha"]}], "commit": {"committer": {"date": T(10, "10:30")}}},
+                self.c(a["merge_commit_sha"], "base0", T(10, "10:00")), self.c("base0", None, T(10, "08:00"))]
+        gh = world([a], base_commits=base, checks={"base0": ok, a["merge_commit_sha"]: ok, "feat": red, a["head"]["sha"]: ok})
+        with tempfile.TemporaryDirectory() as d:
+            cut, *_ = pm.detect_main_red(pm.Reader(REPO, d, 100, gh), base, [a], listing_cut=True)
+        self.assertEqual(cut, [])  # the feature commit's red is the PR's own check, not main
+
+    def test_a_push_written_before_the_one_ahead_of_it_never_gives_a_negative_time_to_green(self):
+        a = pr(1, T(10, "09:00"), T(10, "10:00"))
+        a["merge_commit_sha"], a["head"]["sha"] = "ma" * 20, "ha" * 20
+        red = [{"name": "T", "status": "completed", "conclusion": "failure", "started_at": T(10, "10:00")}]
+        ok = [{"name": "T", "status": "completed", "conclusion": "success", "started_at": T(10, "10:00")}]
+        # the fixer is a direct push whose commit was written (09:00) before PR 1 merged (10:00)
+        base = [self.c("base0", None, T(10, "08:00")), self.c(a["merge_commit_sha"], "base0", T(10, "09:30")), self.c("direct", a["merge_commit_sha"], T(10, "09:00"))]
+        gh = world([a], base_commits=base, checks={"base0": ok, a["merge_commit_sha"]: red, "direct": ok, a["head"]["sha"]: red})
+        with tempfile.TemporaryDirectory() as d:
+            eps, *_ = pm.detect_main_red(pm.Reader(REPO, d, 100, gh), base, [a])
+        self.assertEqual((eps[0]["pr"], eps[0]["minutes_to_green"]), (1, 0.0))
+
+
+class MainRedReads(Base):
+    def merged(self):
+        a, b = pr(1, T(10, "09:00"), T(10, "10:00")), pr(2, T(10, "09:00"), T(10, "11:00"))
+        a["head"]["sha"], b["head"]["sha"] = "ha" * 20, "hb" * 20
+        a["merge_commit_sha"], b["merge_commit_sha"] = "ma" * 20, "mb" * 20  # pr() truncates its default shas to the same value
+        return a, b
+
+    def world(self, a, b, base, head_a_red):
+        red = [{"name": "Test", "status": "completed", "conclusion": "failure", "started_at": T(10, "10:00")}]
+        ok = [{"name": "Test", "status": "completed", "conclusion": "success", "started_at": T(10, "10:00")}]
+        ck = {a["merge_commit_sha"]: red, b["merge_commit_sha"]: ok, "base0": ok, a["head"]["sha"]: red if head_a_red else ok}
+        return world([a, b], base_commits=base, checks=ck)
+
+    def base(self, a, b):
+        return [commit("base0", date=T(10, "08:00")), commit(a["merge_commit_sha"], date=T(10, "10:00")), commit(b["merge_commit_sha"], date=T(10, "11:00"))]
+
+    def test_the_detector_attributes_the_episode_to_its_pr_and_notes_whether_the_head_was_red_too(self):
+        a, b = self.merged()
+        for head_red in (True, False):
+            with tempfile.TemporaryDirectory() as d:
+                out = pm.build([REPO], d, 500, OWNER, START, NOW, {}, {}, None, self.world(a, b, self.base(a, b), head_red), controls={REPO: {"incident": [(1, 2)]}}, control=False)
+            v = out["repos"][REPO]
+            e = v["main_red"]["episodes"][0]
+            self.assertEqual((e["pr"], e["fixer_pr"], e["minutes_to_green"], e["head_red_same_context"]), (1, 2, 60.0, head_red))
+            self.assertEqual(v["controls"]["incident"], {"expected": 1, "found": 1, "not_in_window": 0})
+            rows = {r["pr"]: r for r in v["prs"]}
+            self.assertEqual((len(rows[1]["main_red"]), rows[2]["main_red"]), (1, []))
+
+    def test_an_episode_whose_head_was_green_is_other_post_merge_red_not_a_change_failure(self):
+        a, b = self.merged()
+        for head_red, cf, other in ((True, 1, 0), (False, 0, 1)):
+            with tempfile.TemporaryDirectory() as d:
+                out = pm.build([REPO], d, 500, OWNER, START, NOW, {}, {}, None, self.world(a, b, self.base(a, b), head_red), controls={}, control=False)
+            s = out["repos"][REPO]["per_day"]["2026-11-10"]["change_failure"]
+            self.assertEqual((s["change_failures"], s["other_post_merge_red"], s["episodes"], s["minutes_to_green"] if cf else []), (cf, other, 1, [60.0] if cf else []))
+
+    def test_the_head_verdict_is_the_one_in_force_at_the_merge(self):
+        a, b = self.merged()
+        gh = self.world(a, b, self.base(a, b), False)
+        later_red = [{"id": 1, "name": "Test", "status": "completed", "conclusion": "success", "started_at": T(10, "09:30"), "completed_at": T(10, "09:40")},
+                     {"id": 2, "name": "Test", "status": "completed", "conclusion": "failure", "started_at": T(10, "12:00"), "completed_at": T(10, "12:10")}]
+        gh.routes = [(rf"commits/{a['head']['sha']}/check-runs", {"check_runs": later_red})] + gh.routes
+        with tempfile.TemporaryDirectory() as d:
+            out = pm.build([REPO], d, 500, OWNER, START, NOW, {}, {}, None, gh, controls={}, control=False)
+        self.assertIs(out["repos"][REPO]["main_red"]["episodes"][0]["head_red_same_context"], False)  # the 12:10 rerun came after the 10:00 merge
+
+    def test_a_head_context_absent_or_pending_at_the_merge_is_unknown(self):
+        f = pm.head_red_same_context
+        self.assertEqual((f({"Docs": "green"}, ["Test"]), f({"Test": "pending"}, ["Test"]), f({"Test": "green", "X": "red"}, ["Test"]),
+                          f({"Test": "red"}, ["Test", "Y"]), f(None, ["Test"])), (None, None, False, True, None))
+        runs = [{"id": 1, "name": "Test", "status": "completed", "conclusion": "success", "started_at": T(10, "09:00"), "completed_at": T(10, "09:10")},
+                {"id": 2, "name": "Test", "status": "completed", "conclusion": "failure", "started_at": T(10, "09:50"), "completed_at": T(10, "10:20")}]
+        with tempfile.TemporaryDirectory() as d:
+            rd = pm.Reader(REPO, d, 50, lambda path: {"check_runs": runs})
+            self.assertEqual(pm.head_states_at(rd, "h1", T(10, "10:00")), {"Test": "pending"})  # the rerun was running at the merge
+
+    def test_an_unstarted_rerun_leaves_the_head_verdict_at_merge_unknown(self):
+        runs = [{"id": 1, "name": "Test", "status": "completed", "conclusion": "failure", "started_at": T(10, "09:00"), "completed_at": T(10, "09:10")},
+                {"id": 2, "name": "Test", "status": "queued", "conclusion": None, "started_at": None}]
+        with tempfile.TemporaryDirectory() as d:
+            rd = pm.Reader(REPO, d, 50, lambda path: {"check_runs": runs})
+            self.assertEqual(pm.head_states_at(rd, "h3", T(10, "10:00")), {"Test": "pending"})  # queued before or after the merge: unknown
+
+    def test_the_head_read_asks_for_every_run_not_only_the_latest(self):
+        paths = []
+        with tempfile.TemporaryDirectory() as d:
+            rd = pm.Reader(REPO, d, 50, lambda path: paths.append(path) or {"check_runs": []})
+            pm.head_states_at(rd, "h2", T(10, "10:00"))
+        self.assertTrue(paths and all("filter=all" in p for p in paths))
+
+    def test_an_unknown_head_is_neither_a_change_failure_nor_other_post_merge_red(self):
+        s = pm.change_failure_summary([{"main_red": [{"contexts": ["T"], "minutes_to_green": 5.0, "fixer_pr": 2, "head_red_same_context": None}]}])
+        self.assertEqual((s["change_failures"], s["other_post_merge_red"], s["head_red_unknown"]), (0, 0, 1))
+
+    def test_a_missed_known_incident_fails_the_control_and_withholds_change_failure_only(self):
+        a, b = self.merged()
+        with tempfile.TemporaryDirectory() as d:
+            out = pm.build([REPO], d, 500, OWNER, START, NOW, {}, {}, None, self.world(a, b, self.base(a, b), False), controls={REPO: {"incident": [(2, 1)]}}, control=False)
+        c = out["repos"][REPO]["controls"]
+        self.assertEqual((c["status"], c["disabled"], c["incident"]["found"], c["incident"]["expected"]), ("failed", ["change_failure"], 0, 1))
+        self.assertIn("known main-red incident not found", pm.markdown(out))
+
+    def test_unread_base_checks_leave_attribution_unknown_and_the_incident_unchecked(self):
+        a, b = self.merged()
+        gh = self.world(a, b, self.base(a, b), False)
+        gh.routes = [x for x in gh.routes if "check-runs" not in x[0]]
+        with tempfile.TemporaryDirectory() as d:
+            out = pm.build([REPO], d, 500, OWNER, START, NOW, {}, {}, None, gh, controls={REPO: {"incident": [(1, 2)]}}, control=False)
+        v = out["repos"][REPO]
+        self.assertFalse(v["main_red"]["complete"])
+        self.assertTrue(all(r["main_red"] is None for r in v["prs"]))
+        self.assertEqual(v["controls"]["incident"]["not_in_window"], 1)
+
+    def test_a_merge_the_base_listing_misses_has_unknown_attribution_not_a_known_zero(self):
+        a, b = self.merged()
+        listing = [commit("base0", date=T(10, "08:00")), commit(a["merge_commit_sha"], date=T(10, "10:00"))]  # b's merge is absent
+        with tempfile.TemporaryDirectory() as d:
+            out = pm.build([REPO], d, 500, OWNER, START, NOW, {}, {}, None, self.world(a, b, listing, False), controls={}, control=False)
+        rows = {r["pr"]: r for r in out["repos"][REPO]["prs"]}
+        self.assertEqual((len(rows[1]["main_red"]), rows[2]["main_red"]), (1, None))
+        with tempfile.TemporaryDirectory() as d:
+            out = pm.build([REPO], d, 500, OWNER, START, NOW, {}, {}, None, self.world(a, b, [], False), controls={}, control=False)
+        self.assertTrue(all(r["main_red"] is None for r in out["repos"][REPO]["prs"]))  # an empty listing is not zero failures
+
+    def test_the_base_listing_reads_enough_pages_for_a_busy_merge_commit_base(self):
+        a, b = self.merged()
+        gh = self.world(a, b, [commit(f"x{i}", date=T(10, "09:00")) for i in range(100)], False)  # every page full
+        with tempfile.TemporaryDirectory() as d:
+            pm.build([REPO], d, 500, OWNER, START, NOW, {}, {}, None, gh, controls={}, control=False)
+        self.assertEqual(len([c for c in gh.calls if "commits?sha=" in c]), 40)
+
+    def test_the_base_listing_starts_a_day_before_the_first_merge(self):
+        a, b = self.merged()
+        gh = self.world(a, b, self.base(a, b), False)
+        with tempfile.TemporaryDirectory() as d:
+            pm.build([REPO], d, 500, OWNER, START, NOW, {}, {}, None, gh, controls={}, control=False)
+        since = [c for c in gh.calls if "commits?sha=" in c][0].split("since=")[1].split("&")[0]
+        self.assertEqual(since, pm.fmt(pm.iso(T(10, "10:00")) - dt.timedelta(days=1)))
+
+    def test_the_report_prints_the_episode_table(self):
+        a, b = self.merged()
+        with tempfile.TemporaryDirectory() as d:
+            out = pm.build([REPO], d, 500, OWNER, START, NOW, {}, {}, None, self.world(a, b, self.base(a, b), True), controls={REPO: {"incident": [(1, 2)]}}, control=False)
+        md = pm.markdown(out)
+        self.assertIn("### Change failures: merges that went to main red (window)", md)
+        self.assertIn(f"| {REPO} | 2 | 1 | 60.0 | 0 | 0 | 0 | 1/1 | 0 |", md)
+        self.assertNotIn("not tracked:", md)  # nothing untracked in this small world
+        out["repos"][REPO]["main_red"]["untracked_contexts"] = {"noisy": ["review-verdict"], "one_off": ["x", "y"]}
+        self.assertIn(f"- {REPO}: not tracked: noisy gates review-verdict; 2 one-off contexts", pm.markdown(out))
 
 
 class RerunCache(Base):
@@ -775,6 +1214,17 @@ class Correctness(Base):
         out = self.build(world([p], base_commits=bc, checks=ck), now=dt.datetime(2026, 11, 14, tzinfo=UTC))
         self.assertFalse(self.rows(out)[5]["correct"]["reverted"])
 
+    def test_a_feature_commit_in_a_cut_listing_is_not_the_next_push(self):
+        q = self.merged_old(7, day=4)
+        ok = [{"name": "Test", "status": "completed", "conclusion": "success"}]
+        red = [{"name": "Test", "status": "completed", "conclusion": "failure"}]
+        mc = lambda sha, parents, date: dict(commit(sha, date=date), parents=[{"sha": x} for x in parents])
+        # q merged on day 4; the listing (cut: day 4 + 7 d + 2 h is before now) also holds a feature commit branched
+        # from q's merge whose own merge is not listed
+        bc = [mc("feat", [q["merge_commit_sha"]], T(4, "12:00")), mc(q["merge_commit_sha"], ["base0"], T(4, "10:00")), mc("base0", [], T(4, "08:00"))]
+        out = self.build(world([q], base_commits=bc, checks={q["merge_commit_sha"]: ok, "feat": red, "base0": ok}), now=dt.datetime(2026, 11, 14, tzinfo=UTC))
+        self.assertFalse(self.rows(out)[7]["correct"]["base_red"])
+
     def test_red_required_check_at_the_merge_commit_or_next_push(self):
         p, q = self.merged_old(6), self.merged_old(7, day=4)
         ok = [{"name": "Test", "status": "completed", "conclusion": "success"}]
@@ -788,6 +1238,38 @@ class Correctness(Base):
         self.assertTrue(r[7]["correct"]["base_red"])  # clean merge commit, red at the next push
         s = out["repos"][REPO]["per_day"]
         self.assertEqual(s["2026-11-05"]["correctness"]["bad_rate_pct"], 100.0)
+
+    def base_red_of(self, checks_for_merge, checks_for_next=None):
+        p = self.merged_old(6)
+        bc = [commit(p["merge_commit_sha"], date=T(5, "10:00")), commit("nx", date=T(5, "12:00"))]
+        ck = {p["merge_commit_sha"]: checks_for_merge, "nx": checks_for_next if checks_for_next is not None else [{"name": "Test", "status": "completed", "conclusion": "success"}]}
+        out = self.build(world([p], base_commits=bc, checks=ck), now=dt.datetime(2026, 11, 14, tzinfo=UTC))
+        return self.rows(out)[6]["correct"]
+
+    def test_a_red_check_beside_a_pending_one_is_unknown_not_base_red(self):
+        c = self.base_red_of([{"name": "Test", "status": "completed", "conclusion": "failure"}, {"name": "Slow", "status": "in_progress", "conclusion": None}])
+        self.assertEqual((c["base_red"], c["bad"]), (None, None))
+
+    def test_a_red_check_on_an_incomplete_page_read_is_unknown_not_base_red(self):
+        p = self.merged_old(6)
+        bc = [commit(p["merge_commit_sha"], date=T(5, "10:00"))]
+        page = [{"id": i, "name": f"C{i}", "status": "completed", "conclusion": "success"} for i in range(1, 100)]
+        page.append({"id": 100, "name": "Test", "status": "completed", "conclusion": "failure"})  # a full page, forever: the list is never read to its end
+        out = self.build(world([p], base_commits=bc, checks={p["merge_commit_sha"]: lambda path: page}), now=dt.datetime(2026, 11, 14, tzinfo=UTC))
+        c = self.rows(out)[6]["correct"]
+        self.assertEqual((c["base_red"], c["bad"]), (None, None))
+
+    def test_a_settled_red_next_push_is_base_red_even_when_the_merge_commit_is_pending(self):
+        c = self.base_red_of([{"name": "Test", "status": "queued", "conclusion": None}], [{"name": "Test", "status": "completed", "conclusion": "failure"}])
+        self.assertTrue(c["base_red"])
+
+    def test_a_reverted_pr_is_bad_even_when_its_base_checks_are_unsettled(self):
+        p = self.merged_old(6)
+        bc = [commit(p["merge_commit_sha"], date=T(5, "10:00")), commit("rv", msg=f'Revert "x" (#{p["number"]})', date=T(6, "10:00"))]
+        ck = {p["merge_commit_sha"]: [{"name": "Test", "status": "queued", "conclusion": None}]}
+        out = self.build(world([p], base_commits=bc, checks=ck), now=dt.datetime(2026, 11, 14, tzinfo=UTC))
+        c = self.rows(out)[6]["correct"]
+        self.assertEqual((c["reverted"], c["base_red"], c["bad"]), (True, None, True))
 
     def test_a_non_required_red_check_is_ignored(self):
         p = self.merged_old(6)
@@ -804,7 +1286,8 @@ class Correctness(Base):
         out = self.build(gh, ticks=ticks, now=dt.datetime(2026, 11, 14, tzinfo=UTC))
         c = self.rows(out)[6]["correct"]
         self.assertEqual((c["bad"], c["base_red_source"]), (True, "ticks"))
-        self.assertFalse([x for x in gh.calls if "check-runs" in x])
+        # pr_correct reads no check runs here; the one read is the main-red detector's, once per base push
+        self.assertEqual(len([x for x in gh.calls if "check-runs" in x]), 1)
 
     def test_a_pr_under_seven_days_old_is_provisional_and_flagged(self):
         p = pr(8, T(12, "09:00"), T(12, "10:00"), sha="s8" + "0" * 38)
@@ -1575,7 +2058,7 @@ class Integrated(unittest.TestCase):
             self.assertIsNone(plain["end_to_end"])
             self.assertIn("no --e2e-cache", lr.markdown(plain))
 
-    def test_defaults_are_the_five_fleet_repos_and_a_1500_cap(self):
+    def test_defaults_are_the_five_fleet_repos_and_a_3000_cap(self):
         seen = {}
 
         def fake_build(repos, cache, cap, *a, **k):
@@ -1588,9 +2071,54 @@ class Integrated(unittest.TestCase):
                 lr.build_report(d, dt.timedelta(days=1), NOW, e2e={"cache_dir": c})
             finally:
                 pm.build = orig
-        self.assertEqual(seen["cap"], 1500)
+        self.assertEqual(seen["cap"], 3000)
         self.assertEqual(seen["repos"], ["Generous-Corp/pulp", "Generous-Corp/vellum", "danielraffel/Shipyard",
                                          "danielraffel/tartci", "danielraffel/fleet-handbook"])
+
+
+class ReadShares(unittest.TestCase):
+    """The shared read cap is split by each repo's listed PR count, with a floor, not equally."""
+    LO, HI = dt.datetime(2026, 11, 10, tzinfo=UTC), dt.datetime(2026, 11, 18, tzinfo=UTC)
+
+    def fetch_for(self, counts):
+        def fetch(path):
+            repo = path.split("/pulls")[0][len("repos/"):]
+            page = int(re.search(r"&page=(\d+)", path).group(1))
+            n = counts[repo]
+            lo, hi = (page - 1) * 100, min(n, page * 100)
+            return [{"number": i, "created_at": T(12, "10:00")} for i in range(lo, hi)]
+        return fetch
+
+    def test_a_pulp_sized_repo_gets_a_warm_run_and_no_small_repo_starves(self):
+        counts = {"o/pulp": 316, "o/a": 20, "o/b": 20, "o/c": 20, "o/d": 5}
+        with tempfile.TemporaryDirectory() as d:
+            shares, spent = pm.read_shares(list(counts), d, 3000, self.LO, self.HI, self.fetch_for(counts))
+        self.assertGreaterEqual(shares["o/pulp"], 1200)  # ~900 warm, ~1,200 cold; an equal split gave 300
+        self.assertTrue(all(shares[r] >= pm.READ_FLOOR for r in counts))
+        self.assertLessEqual(sum(shares.values()) + spent, 3000)
+
+    def test_an_incomplete_planning_listing_is_unknown_and_takes_the_median_of_the_others(self):
+        counts = {"o/huge": 1000, "o/a": 20, "o/b": 40, "o/c": 60}  # o/huge: eight pages of 100 and still more
+        with tempfile.TemporaryDirectory() as d:
+            shares, spent = pm.read_shares(list(counts), d, 3000, self.LO, self.HI, self.fetch_for(counts))
+        extra = 3000 - spent - pm.READ_FLOOR * len(counts)
+        total = 40 + 20 + 40 + 60  # unknown repo weighs the median (40) of the complete listings, not its capped 800
+        self.assertEqual(shares["o/huge"], pm.READ_FLOOR + extra * 40 // total)
+        self.assertEqual(shares["o/c"], pm.READ_FLOOR + extra * 60 // total)
+
+    def test_a_cap_that_cannot_fund_the_floors_after_planning_is_split_equally(self):
+        counts = {f"o/r{i}": 50 for i in range(5)}
+        calls = []
+        with tempfile.TemporaryDirectory() as d:
+            shares, spent = pm.read_shares(list(counts), d, 500, self.LO, self.HI, lambda p: calls.append(p) or [])  # 500 = 5 floors, no room for 5 listings
+        self.assertEqual((set(shares.values()), spent, calls), ({100}, 0, []))
+
+    def test_a_cap_below_the_floors_is_split_equally_with_no_planning_reads(self):
+        counts = {"o/pulp": 316, "o/a": 20}
+        calls = []
+        with tempfile.TemporaryDirectory() as d:
+            shares, spent = pm.read_shares(list(counts), d, 50, self.LO, self.HI, lambda p: calls.append(p) or [])
+        self.assertEqual((shares, spent, calls), ({"o/pulp": 25, "o/a": 25}, 0, []))
 
 
 class SyntheticControl(unittest.TestCase):
@@ -1638,6 +2166,7 @@ class SyntheticControl(unittest.TestCase):
             "push_repeats_of_group_shas": (lambda runs: (0, 0), None),
             "steward_evidence": (lambda rd, f: False, "attribution.steward_merges_recognised"),
             "path_of": (lambda f, comp: ("clean", []), "paths.slow.n"),
+            "main_red_episodes": (lambda chron, states, pr_by_sha: ([], 0), "change_failure.episodes"),
             "cause_minutes": (lambda f, comp: {"hold": 0.0, "red": 0.0, "queue": 0.0, "runner": 0.0, "dirty": None}, "paths.cause_min_per_merge.red"),
         }
         for name, (fn, expect) in cases.items():
@@ -1658,7 +2187,7 @@ class SyntheticControl(unittest.TestCase):
         out = pm.build([REPO], tempfile.mkdtemp(), 50, OWNER, START, NOW, {}, {}, None, world([pr(1, T(10, "10:00"), T(10, "11:00"))]))
         self.assertEqual(out["synthetic_control"]["status"], "pass")
         md = pm.markdown(out)
-        self.assertIn("**CONTROL PASS: 49 of 49", md)
+        self.assertIn("**CONTROL PASS: 61 of 61", md)
         self.assertIn("| ready day |", md)
 
     def test_a_repo_with_no_live_control_reads_synthetic_not_unchecked(self):

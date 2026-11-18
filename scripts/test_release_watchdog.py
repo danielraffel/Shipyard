@@ -373,6 +373,52 @@ class RunChainTests(unittest.TestCase):
         self.assertEqual(applied, [])
 
 
+class CadenceBumpCoverTests(unittest.TestCase):
+    """2026-11-18, issue 1493: #1487 (fix:) merged at 11:46:20Z and moved only the
+    plugin. version-at-land's #1488 bumped plugin 0.184.8 -> 0.184.9 and merged at
+    12:49:58Z, so no CLI tag was due. The sweep at 14:02Z still said "merged but
+    in no release tag"."""
+
+    FIX = {"number": 1487, "title": "fix(release): page the lead when a version is not "
+           "released and installable", "merged_at": "2026-11-18T11:46:20Z",
+           "merge_commit_sha": "ee7266ab", "head": {"ref": "fix/release-chain-watch"}}
+    BUMP = {"number": 1488, "title": "chore: assign versions at land (plugin 0.184.9)",
+            "merged_at": "2026-11-18T12:49:58Z", "merge_commit_sha": "2dcadb01",
+            "head": {"ref": "release/version-at-land"}}
+
+    def sweep(self, pulls: list[dict]) -> dict:
+        history = {"2dcadb01": {"ee7266ab", "2dcadb01"}, "origin/main": {"ee7266ab", "2dcadb01"}}
+
+        def git(*args: str) -> subprocess.CompletedProcess[str]:
+            if args[:2] == ("merge-base", "--is-ancestor"):
+                rc = 0 if args[2] in history.get(args[3], set()) else 1
+                return subprocess.CompletedProcess(args, rc, stdout="", stderr="")
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")  # no v* tag
+
+        def gh(*args: str, **kw: object) -> str:
+            return json.dumps(pulls) if "state=closed" in args[1] else "[]"
+        out = io.StringIO()
+        args = rw.argparse.Namespace(repo="danielraffel/Shipyard", lookback_days=7.0,
+                                     grace_hours=2.0, bump_grace_minutes=30.0, dry_run=True)
+        with mock.patch.object(rw, "git", side_effect=git), \
+                mock.patch.object(rw, "gh", side_effect=gh), \
+                mock.patch.object(rw, "collect_bumps", return_value=[]), \
+                contextlib.redirect_stdout(out):
+            rw.run_cadence(args, datetime(2026, 11, 18, 14, 2, tzinfo=timezone.utc))
+        return json.loads(out.getvalue().splitlines()[0])
+
+    def test_a_change_a_merged_plugin_only_bump_covers_is_released(self) -> None:
+        self.assertEqual(self.sweep([self.BUMP, self.FIX])["untagged_merges"], [])
+
+    def test_without_a_covering_bump_it_is_still_flagged(self) -> None:
+        self.assertEqual(self.sweep([self.FIX])["untagged_merges"], [1487])
+
+    def test_only_merged_bump_pull_requests_count(self) -> None:
+        unmerged = dict(self.BUMP, merged_at=None)
+        self.assertEqual(rw.landed_bumps([unmerged, self.FIX]), [])
+        self.assertEqual(rw.landed_bumps([self.BUMP, self.FIX]), ["2dcadb01"])
+
+
 class TrackerTests(unittest.TestCase):
     def test_lifecycle(self) -> None:
         self.assertEqual(rw.issue_action(False, True), "create")

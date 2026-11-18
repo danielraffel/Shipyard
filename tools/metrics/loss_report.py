@@ -590,7 +590,7 @@ def main(argv=None):
     ap.add_argument("--now", help="ISO time, for tests and replays")
     ap.add_argument("--github", help="directory of cached GitHub REST answers (never fetches)")
     ap.add_argument("--e2e-cache", help="directory for the per-PR metrics cache; setting it turns on the GitHub reads for the end-to-end metrics")
-    ap.add_argument("--read-cap", type=int, default=_pr_metrics().DEFAULT_READ_CAP, help="most GitHub reads per run, shared across repos (default 1500)")
+    ap.add_argument("--read-cap", type=int, default=_pr_metrics().DEFAULT_READ_CAP, help="most GitHub reads per run, shared across repos by listed PR count (default 3000)")
     ap.add_argument("--owner", default="danielraffel", help="the owner's personal GitHub login")
     ap.add_argument("--repos", help="comma-separated owner/repo list for the end-to-end metrics (default: the five fleet repos)")
     ap.add_argument("--baseline", default="2026-11-12:2026-11-14", help="FROM:TO UTC days for the Baseline section, or 'none'")

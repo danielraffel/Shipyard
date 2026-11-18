@@ -404,6 +404,49 @@ pub(super) fn run(
             )
         })
         .collect();
+    // Approved, required-green, still unmerged: alerted once per head past
+    // its limit, whatever holds it.
+    let open: BTreeMap<u64, String> = reports
+        .iter()
+        .map(|report| (report.number, report.head_sha.clone()))
+        .collect();
+    let mut stuck = dwell::track_stuck(
+        &mut state,
+        &stuck_candidates(input, reports),
+        &open,
+        input.dwell_policy,
+        input.now,
+    );
+    // Within the same per-pass escalation cap as every other row.
+    for row in stuck.iter_mut().filter(|row| row.escalate) {
+        if escalations_left > 0 {
+            escalations_left -= 1;
+        } else {
+            row.escalate = false;
+            row.escalation_deferred = true;
+        }
+    }
+    if input.apply {
+        dwell::mark_stuck_alerted(&mut state, &stuck);
+    }
+    report.escalations_new += stuck.iter().filter(|row| row.escalate).count();
+    report.escalations_deferred += stuck.iter().filter(|row| row.escalation_deferred).count();
+    report.overdue.extend(stuck.iter().map(|row| {
+        // The relay delivers only an emitted level: one this pass escalated
+        // or an earlier pass marked, never one the cap deferred.
+        let emitted = (row.escalate && input.apply)
+            || state
+                .stuck_approved
+                .get(&row.overdue.number)
+                .is_some_and(|entry| entry.alerted);
+        overdue_record(
+            input,
+            by_number.get(&row.overdue.number).copied(),
+            row,
+            u32::from(emitted) * row.overdue.level,
+            None,
+        )
+    }));
     ledger.dwell.insert(repo_key, state);
     if input.apply
         && let Some(state_dir) = input.state_dir
@@ -469,6 +512,89 @@ fn sightings(reports: &[PrReport], stacked: &[OpenPr]) -> (Vec<Sighting>, BTreeS
         since: None,
     }));
     (out, skipped)
+}
+
+/// Pull requests this pass saw approved at their exact head with every
+/// required check green, and that it neither merged nor queued.
+///
+/// Approved is [`approved_at_head`]. Only pull requests the steward manages
+/// are candidates: an unmanaged one (no managed label, no handoff) is not the
+/// steward's to merge. Nor are a draft, a queued pull request (the queue owns
+/// it), one carrying a hold label the pipeline skips (`owner-decision`,
+/// `superseded`, `PARKED/<platform>`: deliberately parked), or one this pass
+/// merged or enqueued. A row the
+/// pass budget deferred is judged like any other, from the census facts it
+/// carries, so a degraded steward that defers it every pass cannot keep the
+/// alarm silent; its `deferred_pass_budget` token is a placeholder, so the
+/// alert keeps the last real reason.
+fn stuck_candidates(input: &DwellInput<'_>, reports: &[PrReport]) -> Vec<dwell::StuckCandidate> {
+    let policy = input.policy;
+    reports
+        .iter()
+        .filter(|report| !report.blocked.blocked_on.is_empty())
+        // The steward merges only what it manages; an unmanaged pull request
+        // is not one it left unmerged, and the census does not read its
+        // checks.
+        .filter(|report| {
+            !matches!(
+                report.decision,
+                crate::merge_steward::StewardDecision::Unmanaged
+                    | crate::merge_steward::StewardDecision::HandoffMissing
+            )
+        })
+        .filter(|report| {
+            !report.mutation.as_deref().is_some_and(|mutation| {
+                mutation.split([',', ';']).any(|part| {
+                    part.starts_with("enqueued") || part.starts_with("merged_exact_head")
+                })
+            })
+        })
+        .filter_map(|report| {
+            let pr = &input
+                .observation
+                .prs
+                .iter()
+                .find(|pr| pr.fact.number == report.number)?
+                .fact;
+            (approved_at_head(pr, policy)
+                && !pr.draft
+                && pr.queue_position.is_none()
+                && crate::merge_steward::excluded_admission_label(&pr.labels).is_none()
+                && pr.head_sha.eq_ignore_ascii_case(&report.head_sha)
+                && crate::merge_steward::required_checks_all_succeeded(pr, policy))
+            .then(|| dwell::StuckCandidate {
+                number: report.number,
+                head: report.head_sha.clone(),
+                token: report.blocked.blocked_on.clone(),
+                placeholder_token: super::pass_budget::is_deferred(report),
+            })
+        })
+        .collect()
+}
+
+/// Whether the head is approved: the newest observation of the approval
+/// context (`review-verdict`, check run or commit status) is `SUCCESS`
+/// (`NEUTRAL` or `SKIPPED` is no verdict) and no
+/// newer approval status refuses it. The canonical workflow turns it green
+/// only for an exact-head APPROVE. Judged on the newest observation, so an
+/// older green attempt never stands in for a newer red one, whether or not
+/// the approval context is a required check.
+pub(super) fn approved_at_head(pr: &StewardPullRequest, policy: &StewardPolicy) -> bool {
+    let approval = policy.approval_context.trim();
+    !approval.is_empty()
+        && crate::merge_steward::approval_status_agrees(pr, policy)
+        && pr
+            .checks
+            .iter()
+            .filter(|check| check.name.eq_ignore_ascii_case(approval))
+            .max_by(|left, right| crate::merge_steward::cmp_recency(left, right))
+            .is_some_and(|newest| {
+                newest.status.eq_ignore_ascii_case("COMPLETED")
+                    && newest
+                        .conclusion
+                        .as_deref()
+                        .is_some_and(|conclusion| conclusion.eq_ignore_ascii_case("SUCCESS"))
+            })
 }
 
 /// Required contexts a `required_never_ran:<a,b>` token names that have a

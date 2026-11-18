@@ -43,7 +43,7 @@ CASES = [
     {"n": 1, "name": "auto_a", "delay": 20, "north": "autonomous"},
     {"n": 2, "name": "auto_b", "delay": 30, "north": "autonomous"},
     {"n": 3, "name": "reverted", "delay": 25, "north": "autonomous", "reverted": True},
-    {"n": 4, "name": "base_red", "delay": 35, "north": "autonomous", "base_red": True},
+    {"n": 4, "name": "base_red", "delay": 35, "north": "autonomous", "base_red": True, "red_until": 5},
     {"n": 5, "name": "escaped", "delay": 75, "north": "autonomous", "escaped_by": 6},
     {"n": 6, "name": "later_fix", "delay": 120, "north": "autonomous", "title": "fix regression from #5"},
     {"n": 7, "name": "held_twice", "delay": 150, "north": "autonomous", "holds": 2, "re_holds": 1,
@@ -109,6 +109,7 @@ def raw_world():
             base_commits.append({"sha": _sha(n, "9"), "commit": {"message": f'Revert "case {n}" (#{n})', "committer": {"date": _t("20:00")}}})
         if c.get("base_red"):
             checks[merge_sha] = [{"name": "Test", "status": "completed", "conclusion": "failure", "started_at": merged}]
+            checks[head] = [{"name": "Test", "status": "completed", "conclusion": "failure", "started_at": _t("09:30")}]  # red on its own head too
         if c.get("runs"):
             g = "9" * 40
             for rid, ev, sha, br, lab, mins in ((101, "pull_request", head, "feat", ["self-hosted", "macOS"], 10), (102, "pull_request", head, "feat", ["ubuntu"], 5),
@@ -116,6 +117,22 @@ def raw_world():
                 runs.append({"id": rid, "name": "ci", "head_sha": sha, "event": ev, "status": "completed", "head_branch": br,
                              "conclusion": "failure" if rid == 101 else "success", "updated_at": _t("10:12")})  # run 101 failed, at 10:12
                 jobs[rid] = [{"labels": lab, "created_at": _t("09:58"), "started_at": _t("10:00"), "completed_at": _plus(mins), "conclusion": "success"}]
+    # main: a green push before the window, then every merged PR's merge commit (a merge the listing misses has an
+    # unknown main-red attribution, never a known zero). A merge between the PR that turned Test red and the PR that
+    # turned it green ran no Test (a docs-only change), so it neither ends the episode nor reads as a red base.
+    base_commits += [{"sha": "1" * 40, "commit": {"message": "baseline", "committer": {"date": _t("09:00")}}}]
+    red_spans = [(_plus(c["delay"]), _plus(next(x["delay"] for x in CASES if x["n"] == c["red_until"]))) for c in CASES if c.get("base_red")]
+    # a direct push lands just before each PR that turns Test red, so the merge before it is not judged against that red
+    for i, (lo, _) in enumerate(red_spans):
+        before = (dt.datetime.fromisoformat(lo.replace("Z", "+00:00")) - dt.timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        base_commits.append({"sha": f"d{i:039x}", "commit": {"message": "docs: direct push", "committer": {"date": before}}})
+    for c in CASES:
+        if c["delay"] is None:
+            continue
+        at = _plus(c["delay"])
+        base_commits.append({"sha": _sha(c["n"], "c"), "commit": {"message": f"merge #{c['n']}", "committer": {"date": at}}})
+        if not c.get("base_red") and any(lo < at < hi for lo, hi in red_spans):
+            checks[_sha(c["n"], "c")] = [{"name": "Docs", "status": "completed", "conclusion": "success", "started_at": at}]
     ok = [{"name": "Test", "status": "completed", "conclusion": "success"}]
 
     def get(path):
@@ -159,6 +176,7 @@ def expected():
     hand = sorted(c["delay"] for c in merged)
     q2m = [c["enq_to_merge"] for c in CASES if "enq_to_merge" in c]
     slow = [c for c in merged if c.get("slow")]
+    delay = {c["n"]: c["delay"] for c in CASES if c["delay"] is not None}
     owner_actions = sum(c.get("owner_actions", 0) for c in CASES)
     ejections = sum(len(c.get("ejections", [])) for c in CASES)
     bad = sum(1 for c in merged if c.get("reverted") or c.get("base_red"))
@@ -198,6 +216,14 @@ def expected():
         **{f"paths.cause_min_per_merge.{k}": (round(sum(c.get("cause_min", {}).get(k, 0) for c in slow) / len(merged), 2)
                                               if slow and all(c.get("cause_min", {}).get(k, 0) is not None for c in slow) else None)
            for k in ("hold", "red", "queue", "runner")},
+        "change_failure.merged": len(merged), "change_failure.unknown": 0,
+        "change_failure.prs_that_started_red": sum(1 for c in merged if c.get("base_red")),
+        "change_failure.episodes": sum(1 for c in merged if c.get("base_red")), "change_failure.unresolved": 0,
+        "change_failure.change_failures": sum(1 for c in merged if c.get("base_red")), "change_failure.other_post_merge_red": 0,
+        "change_failure.head_red_unknown": 0,
+        "change_failure.head_red_same_context": sum(1 for c in merged if c.get("base_red")),
+        "change_failure.minutes_to_green.sum": sum(delay[c["red_until"]] - delay[c["n"]] for c in merged if c.get("base_red")),
+        "controls.incident.expected": sum(1 for c in merged if c.get("base_red")), "controls.incident.found": sum(1 for c in merged if c.get("base_red")),
         "correctness.bad": bad, "correctness.good": len(merged) - bad,
         "correctness.reverted": sum(1 for c in merged if c.get("reverted")),
         "correctness.base_red": sum(1 for c in merged if c.get("base_red")),
@@ -211,6 +237,8 @@ def expected():
 
 def _dig(d, dotted):
     for k in dotted.split("."):
+        if isinstance(d, list) and k == "sum":
+            return sum(d)
         if not isinstance(d, dict) or k not in d:
             return None
         d = d[k]
@@ -225,8 +253,9 @@ def run(pr_metrics, tolerance=0.005):
     error = None
     try:
         with tempfile.TemporaryDirectory() as cache:
-            out = pr_metrics.build([REPO], cache, 10_000, OWNER, START, NOW, {}, {}, None, raw_world(), controls={}, control=False)
-        got_summary = out["repos"][REPO]["per_day"][DAY]
+            out = pr_metrics.build([REPO], cache, 10_000, OWNER, START, NOW, {}, {}, None, raw_world(),
+                                   controls={REPO: {"incident": [(c["n"], c["red_until"]) for c in CASES if c.get("base_red")]}}, control=False)
+        got_summary = dict(out["repos"][REPO]["per_day"][DAY], controls=out["repos"][REPO]["controls"])
     except Exception as e:  # an instrument that crashes has failed its control
         error = f"{type(e).__name__}: {e}"
     checks, failed = [], []

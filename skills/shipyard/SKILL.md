@@ -42,7 +42,8 @@ tick on m3 runs `tools/metrics/release_notify.py`, which messages the targets
 in `tools/metrics/release-notify-targets.txt` over cmux. A host's
 `~/.config/shipyard/release-notify-targets` replaces that list. Answer the
 message by fixing the step the issue names. The issue closes itself. See
-`docs/release-watchdog.md`.
+`docs/release-watchdog.md`. A change covered by a merged plugin-only bump
+pull request is released; the cadence check expects no tag for it.
 
 ## Release bases are not stacks
 
@@ -81,6 +82,11 @@ pass wrote and print its age; neither costs GitHub API budget. The steward
 takes only contract-allowed acts (re-run a stale `review-verdict` after a live
 gate read, dispatch a never-ran required check from the base's
 `[auto_merge.dwell.dispatch]` map, evaluate an overstayed approved head first,
+alert once per (pull request, head) on an approved, required-green pull
+request it manages, not parked with a hold label, that it has not merged or
+queued 60 minutes after it was first eligible at that head (`approved_stuck`, naming the
+`blocked_on`; to the owner or repo lead through the relay, and as a drain-watch
+page and issue),
 retarget a stack whose parent merged from its exact base branch), each after a
 live re-read of the pull request, at most three per pass, once per pull
 request, state and head, and ships them in `shadow` until the base sets
