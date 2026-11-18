@@ -1,6 +1,6 @@
 # Shipyard scorecard: end-to-end metrics per eligible PR
 
-Scorecard definition version: `2026-11-15.1` (`SCORECARD_VERSION` in `tools/metrics/pr_metrics.py`,
+Scorecard definition version: `2026-11-18.2` (`SCORECARD_VERSION` in `tools/metrics/pr_metrics.py`,
 printed in every report header). A change to any definition below bumps it, so a definition change
 cannot pose as an improvement. The daily loss report ([below](#daily-loss-report))
 counts blocked episodes; this scorecard measures outcomes per PR. `pr_metrics.py` computes it, and
@@ -38,7 +38,7 @@ it is on only when the tick passes `--e2e-cache DIR` (the daily run does, unless
 **Synthetic control (every report).** `tools/metrics/synthetic_control.py` holds fifteen invented PRs, each
 built to have one known outcome (autonomous, owner label, steward merge, unbound owner merge, unsigned owner
 PR, never merged, reverted, red base, escaped, twice held with repair and merge-main pushes, ejected from the
-queue, a gate-run fixture with repeats). `expected()` derives 38 numbers from that table with plain arithmetic
+queue, a gate-run fixture with repeats). `expected()` derives 49 numbers from that table with plain arithmetic
 and never calls the scorecard; the real `pr_metrics.build` then runs over the same PRs, served from memory (no
 GitHub read, a throwaway cache), and every number must match. The report prints one line, `CONTROL PASS` with the
 count and the largest delta, or `CONTROL FAIL` with each missed number, its expected value, its value and the delta.
@@ -77,6 +77,23 @@ the Actions API serves at most 1000 runs for one `created` range, so a busy rang
 compares six numbers measured by hand on 2026-11-15 (Vellum and Pulp ready-to-merge medians, Vellum PR-level and
 merge-group GPU proofs per merged PR, Pulp macOS minutes per merged PR, Vellum enqueue-to-merge median) with the
 scorecard's own values, within 15%. The synthetic control covers these fields too.
+
+## Clean and slow paths
+
+An ejection is a removal from the merge queue other than the merge itself. GitHub records a removal when a PR merges
+and the REST timeline names no reason, so a removal within two minutes before `merged_at` (or one that says
+`merged`) is the merge, not an ejection (the rule the m3 fleet-metrics parser uses). Without it every merged PR
+read as ejected and as slow.
+
+Each merged PR is `slow` when it had any HOLD, a failed run on one of its heads, an ejection from the merge queue
+or a DIRTY tick; `clean` when none of these and its compute was read in full; otherwise `unknown` (a failed run
+cannot be ruled out without the run list, and a successful rerun does not settle an earlier attempt), and unknown PRs are in neither path. The report gives the slow share
+(slow over slow plus clean), the clean median and the slow median and p90 lead time (first ready to merge), each
+with its n, and the minutes per merged PR that each cause held the slow PRs up: HOLD (each HOLD to the next push
+or the merge), red (each failed head run to the next observed head update or the merge), queue (each enqueue to its removal or the
+merge), runner (queued job time from the jobs' `created_at` to `started_at`) and DIRTY (not measured: the ticks
+record a state, not a duration, so its cell is empty and never zero). Push endpoints come from GitHub timeline head-update events, not commit timestamps. With the timeline and commits read in full, a HOLD or failed run that no commit or push event follows ran to the merge, so its interval ends at `merged_at`. A commit event has no observation time: one listed after a HOLD, or dated after a failed run (or with no date), means the head moved at an unknown time, so that cause is unknown. A cached compute entry records each run's attempt and update time and is used only when the current run list still matches (same runs, same attempts and update times; if the run list cannot be read the entry's numbers are kept but a clean verdict is reported unknown) (a rerun keeps its run id and can turn a success into a failure), and cached job minutes are per attempt. A run whose latest update is after the merge never counts as red (a rerun after the merge cannot have delayed it), and a rerun after the merge leaves the PR's earlier outcome unknown. Job minutes of a rerun are those of its latest attempt only. Runner wait counts only runs that can precede the merge (not pushes to the base on a merge-group sha). A failed run on a PR head classifies it slow even when job timing is missing or a jobs read fails (those withhold only the job minutes). Any run with an attempt above one, failed or successful, makes the red duration and the runner wait unknown, because the list and the jobs read show only the latest attempt and earlier failures and waits are missing; a failed one still classifies the PR slow. The causes overlap and are not additive. A cause aggregate is withheld when any slow PR lacks a measured value, so an unread value is never treated as zero. The per-run jobs reads are most of a compute read; a measurement run can set `pr_metrics.READ_JOB_MINUTES = False` to classify paths from the run list alone (the runner cause is then empty and nothing is cached).
+The top cause is the largest of the measured ones.
 
 ## Sample and comparison
 
