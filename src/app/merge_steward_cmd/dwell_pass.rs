@@ -406,15 +406,31 @@ pub(super) fn run(
         .collect();
     // Approved, required-green, still unmerged: alerted once per head past
     // its limit, whatever holds it.
-    let stuck = dwell::track_stuck(
+    let open: BTreeMap<u64, String> = reports
+        .iter()
+        .map(|report| (report.number, report.head_sha.clone()))
+        .collect();
+    let mut stuck = dwell::track_stuck(
         &mut state,
         &stuck_candidates(input, reports),
-        &skipped,
+        &open,
         input.dwell_policy,
         input.now,
-        input.apply,
     );
+    // Within the same per-pass escalation cap as every other row.
+    for row in stuck.iter_mut().filter(|row| row.escalate) {
+        if escalations_left > 0 {
+            escalations_left -= 1;
+        } else {
+            row.escalate = false;
+            row.escalation_deferred = true;
+        }
+    }
+    if input.apply {
+        dwell::mark_stuck_alerted(&mut state, &stuck);
+    }
     report.escalations_new += stuck.iter().filter(|row| row.escalate).count();
+    report.escalations_deferred += stuck.iter().filter(|row| row.escalation_deferred).count();
     report.overdue.extend(stuck.iter().map(|row| {
         overdue_record(
             input,
@@ -494,15 +510,11 @@ fn sightings(reports: &[PrReport], stacked: &[OpenPr]) -> (Vec<Sighting>, BTreeS
 /// Pull requests this pass saw approved at their exact head with every
 /// required check green, and that it neither merged nor queued.
 ///
-/// Approved means a green observation of the approval context
-/// (`review-verdict`, check run or commit status) at the head and no newer
-/// approval status refusing it; the canonical workflow turns it green only
-/// for an exact-head APPROVE. A draft, a queued pull request (the queue owns
+/// Approved is [`approved_at_head`]. A draft, a queued pull request (the queue owns
 /// it), a row the pass budget deferred, and one this pass merged or enqueued
 /// are not candidates.
 fn stuck_candidates(input: &DwellInput<'_>, reports: &[PrReport]) -> Vec<dwell::StuckCandidate> {
     let policy = input.policy;
-    let approval = policy.approval_context.trim();
     reports
         .iter()
         .filter(|report| {
@@ -522,14 +534,7 @@ fn stuck_candidates(input: &DwellInput<'_>, reports: &[PrReport]) -> Vec<dwell::
                 .iter()
                 .find(|pr| pr.fact.number == report.number)?
                 .fact;
-            let approved = !approval.is_empty()
-                && crate::merge_steward::approval_status_agrees(pr, policy)
-                && pr.checks.iter().any(|check| {
-                    check.name.eq_ignore_ascii_case(approval)
-                        && check.status.eq_ignore_ascii_case("COMPLETED")
-                        && green(check.conclusion.as_deref())
-                });
-            (approved
+            (approved_at_head(pr, policy)
                 && !pr.draft
                 && pr.queue_position.is_none()
                 && pr.head_sha.eq_ignore_ascii_case(&report.head_sha)
@@ -541,6 +546,31 @@ fn stuck_candidates(input: &DwellInput<'_>, reports: &[PrReport]) -> Vec<dwell::
             })
         })
         .collect()
+}
+
+/// Whether the head is approved: the newest observation of the approval
+/// context (`review-verdict`, check run or commit status) is `SUCCESS`
+/// (`NEUTRAL` or `SKIPPED` is no verdict) and no
+/// newer approval status refuses it. The canonical workflow turns it green
+/// only for an exact-head APPROVE. Judged on the newest observation, so an
+/// older green attempt never stands in for a newer red one, whether or not
+/// the approval context is a required check.
+pub(super) fn approved_at_head(pr: &StewardPullRequest, policy: &StewardPolicy) -> bool {
+    let approval = policy.approval_context.trim();
+    !approval.is_empty()
+        && crate::merge_steward::approval_status_agrees(pr, policy)
+        && pr
+            .checks
+            .iter()
+            .filter(|check| check.name.eq_ignore_ascii_case(approval))
+            .max_by(|left, right| crate::merge_steward::cmp_recency(left, right))
+            .is_some_and(|newest| {
+                newest.status.eq_ignore_ascii_case("COMPLETED")
+                    && newest
+                        .conclusion
+                        .as_deref()
+                        .is_some_and(|conclusion| conclusion.eq_ignore_ascii_case("SUCCESS"))
+            })
 }
 
 /// Required contexts a `required_never_ran:<a,b>` token names that have a

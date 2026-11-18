@@ -1010,13 +1010,16 @@ relayed. The GitHub-writing acts ship in `shadow`: they are reported as
 `would_act` and escalate until the base sets `act = "apply"`.
 
 **Approved but stuck** (`approved_stuck`). Beside the token states, every pass
-tracks each pull request that is approved at its exact head (a green
-`review-verdict` check run or status, with no newer refusing status) with every
+tracks each pull request that is approved at its exact head (its newest
+`review-verdict` check run or status is green, with no newer refusing status)
+with every
 required check green, and that the pass neither merged nor queued, whatever its
 `blocked_on` (`merge_state:UNSTABLE`, an excluded label, an unknown merge
 state, ...). Drafts and queued pull requests are not tracked: the queue owns
-them. The clock starts the first pass that sees it so at its head and restarts
-at a new head; a row the pass budget deferred keeps it. Past the limit (60
+them. The clock starts the first pass that sees it so at its head, survives
+every pass that still sees it open at that head (a `review-verdict` re-run
+after a comment, or a deferred row, does not reset it or its alert), restarts
+at a new head, and is dropped once the pull request is no longer seen. Past the limit (60
 minutes; `0` turns it off) the pass reports one `approved_stuck` overdue row
 naming the `blocked_on`, routed to the author. It escalates exactly once per
 head, and only an `--apply` pass marks it, so a dry run (`shipyard wait`)

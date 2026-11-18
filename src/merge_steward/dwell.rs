@@ -540,28 +540,34 @@ pub struct StuckCandidate {
 /// and plan the alert of each one stuck past the
 /// [`DwellState::ApprovedStuck`] limit (60 minutes by default; 0 disables).
 ///
-/// A candidate keeps its clock while its head is unchanged and starts a new
-/// one at a new head. A pull request in `skipped` (seen, but not classified
-/// this pass) keeps its entry unchanged; any other non-candidate loses it.
+/// The clock starts the first pass that sees a pull request as a candidate
+/// at its head, and survives every later pass that sees it open at that same
+/// head, candidate or not: a `review-verdict` re-run (every comment triggers
+/// one) or a deferred row makes a pull request a non-candidate for a pass,
+/// and that must not reset the clock or the alert. A new head starts over;
+/// a pull request this pass did not see at all (merged or closed) is
+/// dropped. `open` is every pull request this pass saw, with its head.
 /// A row past the limit escalates exactly once per head: `escalate` is true
-/// on the first pass past the limit and, when `apply`, the entry is marked so
-/// no later pass escalates it again. A pass that does not apply (a dry run,
-/// `shipyard wait`) never marks it, so it cannot use up the alert. Later
-/// passes still report the row (not escalating) while it stays stuck, so the
-/// relay can deliver an alert it missed; it deduplicates by state, head and
-/// level.
+/// until [`mark_stuck_alerted`] records it, which only an apply pass does and
+/// only for rows that escalated within the per-pass cap. A pass that does not
+/// apply (a dry run, `shipyard wait`) never marks it, so it cannot use up the
+/// alert. Later passes still report the row (not escalating) while it stays
+/// stuck, so the relay can deliver an alert it missed; it deduplicates by
+/// state, head and level.
 pub fn track_stuck(
     state: &mut DwellRepoState,
     candidates: &[StuckCandidate],
-    skipped: &BTreeSet<u64>,
+    open: &BTreeMap<u64, String>,
     policy: &DwellPolicy,
     now: DateTime<Utc>,
-    apply: bool,
 ) -> Vec<Planned> {
     let mut next: BTreeMap<u64, StuckApproved> = state
         .stuck_approved
         .iter()
-        .filter(|(number, _)| skipped.contains(number))
+        .filter(|(number, entry)| {
+            open.get(number)
+                .is_some_and(|head| head.eq_ignore_ascii_case(&entry.head))
+        })
         .map(|(number, entry)| (*number, entry.clone()))
         .collect();
     for candidate in candidates {
@@ -590,9 +596,6 @@ pub fn track_stuck(
                 continue;
             }
             let escalate = !entry.alerted;
-            if escalate && apply {
-                entry.alerted = true;
-            }
             rows.push(Planned {
                 overdue: Overdue {
                     number: candidate.number,
@@ -613,6 +616,17 @@ pub fn track_stuck(
     }
     state.stuck_approved = next;
     rows
+}
+
+/// Record the stuck alerts a pass emitted, so each head alerts once.
+pub fn mark_stuck_alerted(state: &mut DwellRepoState, planned: &[Planned]) {
+    for row in planned.iter().filter(|row| row.escalate) {
+        if let Some(entry) = state.stuck_approved.get_mut(&row.overdue.number)
+            && entry.head.eq_ignore_ascii_case(&row.overdue.head)
+        {
+            entry.alerted = true;
+        }
+    }
 }
 
 /// The retrigger history of one pull request head.

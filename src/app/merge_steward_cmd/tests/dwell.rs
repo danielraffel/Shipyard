@@ -1468,3 +1468,88 @@ fn an_approved_green_pull_request_the_steward_did_not_merge_is_alerted_once() {
         "overdue: approved_stuck for 75 min (limit 60 min); blocked on merge_state:UNSTABLE"
     );
 }
+
+/// Approval for the alarm is the newest `review-verdict` observation, green,
+/// with no newer refusing status, whether or not `review-verdict` is a
+/// required check: an older green attempt never stands in for a newer red
+/// one, and a head with no verdict at all is not approved.
+#[test]
+fn the_alarm_reads_approval_from_the_newest_verdict_observation() {
+    let not_required = StewardPolicy {
+        required_checks: vec![RequiredCheck {
+            context: "macos".to_owned(),
+            app_id: None,
+        }],
+        ..queue_policy()
+    };
+    let verdict = |conclusion: &str, id: u64, at: &str| crate::merge_steward::StewardCheck {
+        name: "review-verdict".to_owned(),
+        source: crate::merge_steward::StewardCheckSource::CheckRun,
+        app_id: None,
+        status: "COMPLETED".to_owned(),
+        conclusion: Some(conclusion.to_owned()),
+        run_id: Some(id),
+        observed_at: Some(at.to_owned()),
+        check_id: Some(id),
+        description: None,
+    };
+    for policy in [policy(), not_required] {
+        let approved = pr(1, Some("SUCCESS"), Some("SUCCESS"), &[]);
+        assert!(dwell_pass::approved_at_head(&approved.fact, &policy));
+        let mut regressed = pr(2, Some("SUCCESS"), None, &[]);
+        regressed
+            .fact
+            .checks
+            .push(verdict("SUCCESS", 10, "2026-11-09T10:00:00Z"));
+        regressed
+            .fact
+            .checks
+            .push(verdict("FAILURE", 11, "2026-11-09T11:00:00Z"));
+        assert!(!dwell_pass::approved_at_head(&regressed.fact, &policy));
+        let none = pr(3, Some("SUCCESS"), None, &[]);
+        assert!(!dwell_pass::approved_at_head(&none.fact, &policy));
+        for no_verdict in ["NEUTRAL", "SKIPPED"] {
+            let mut skipped = pr(4, Some("SUCCESS"), None, &[]);
+            skipped
+                .fact
+                .checks
+                .push(verdict(no_verdict, 12, "2026-11-09T11:00:00Z"));
+            assert!(
+                !dwell_pass::approved_at_head(&skipped.fact, &policy),
+                "{no_verdict}"
+            );
+        }
+    }
+}
+
+/// A stuck alert counts against `max_escalations_per_pass`; one the cap
+/// defers is reported as deferred, not marked, and escalates on a later pass
+/// with budget.
+#[test]
+fn a_stuck_alert_is_within_the_per_pass_escalation_cap() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut pass = pass(
+        &temp,
+        vec![pr(1, Some("SUCCESS"), Some("SUCCESS"), &[])],
+        vec![report(1, "merge_state:UNSTABLE", None)],
+    );
+    pass.dwell_policy.max_escalations_per_pass = 0;
+    let mut ledger = established();
+    pass.run(&mut ledger, &FakeActs::default());
+    pass.now = now() + chrono::Duration::minutes(61);
+    let capped = pass.run(&mut ledger, &FakeActs::default());
+    let row = capped
+        .overdue
+        .iter()
+        .find(|row| row.state == crate::merge_steward::dwell::DwellState::ApprovedStuck)
+        .expect("stuck row");
+    assert!(!row.escalated && row.escalation_deferred);
+    assert_eq!(capped.escalations_new, 0);
+    pass.dwell_policy.max_escalations_per_pass = 1;
+    pass.now = now() + chrono::Duration::minutes(66);
+    let released = pass.run(&mut ledger, &FakeActs::default());
+    assert_eq!(
+        released.escalations_new, 1,
+        "the deferred alert was not used up"
+    );
+}
