@@ -442,6 +442,12 @@ class RerunCache(Base):
         r = out["repos"][REPO]["prs"][0]
         self.assertEqual((r["path"], r["compute"]["complete"]), ("slow", False))
 
+    def test_the_documented_scorecard_version_is_the_one_the_report_prints(self):
+        doc = open(os.path.join(os.path.dirname(os.path.abspath(pm.__file__)), "..", "..", "docs", "metrics.md"), encoding="utf-8").read()
+        m = re.search(r"Scorecard definition version: `([^`]+)`", doc)
+        self.assertIsNotNone(m)
+        self.assertEqual(m.group(1), pm.SCORECARD_VERSION)
+
 
 class JobsSkippedHold(Base):
     """Findings of the review of the job-read switch."""

@@ -1,6 +1,6 @@
 # Shipyard scorecard: end-to-end metrics per eligible PR
 
-Scorecard definition version: `2026-11-15.1` (`SCORECARD_VERSION` in `tools/metrics/pr_metrics.py`,
+Scorecard definition version: `2026-11-18.1` (`SCORECARD_VERSION` in `tools/metrics/pr_metrics.py`,
 printed in every report header). A change to any definition below bumps it, so a definition change
 cannot pose as an improvement. The daily loss report ([below](#daily-loss-report))
 counts blocked episodes; this scorecard measures outcomes per PR. `pr_metrics.py` computes it, and
