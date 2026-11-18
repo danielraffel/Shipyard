@@ -39,6 +39,7 @@
 //! known_flaky_tests = ["ui-script-plugin-editor-au"]  # names or `*` globs
 //! red_everywhere = "shadow"           # off | shadow (default) | enforce
 //! flake_requeue = "shadow"            # off | shadow | apply (see `flake_requeue`)
+//! unstable_advisory_checks = ["zizmor (report only)"]  # default: unset
 //! ```
 //!
 //! `red_everywhere` is not an ejection guard but lives in the same table: it
@@ -46,6 +47,16 @@
 //! check the same way as two or more others, a base-level cause.
 //!
 //! The batch guard needs `generated_paths`; with none listed it never defers.
+//!
+//! `unstable_advisory_checks` is not an ejection guard either. It matters only
+//! on a base with no merge queue, where the steward merges an approved head
+//! itself. GitHub's `UNSTABLE` merge state means only checks that are not
+//! required are red or pending; the steward admits such a head only when
+//! every one of those is named here (exact, case-sensitive name), so an unknown,
+//! renamed or new check holds it. Unset, a value that is not an array of
+//! non-empty strings, an `auto_merge` that is not a table, or a config that
+//! cannot be read all leave the list unknown, and then only `CLEAN` is
+//! admitted (see [`super::merge_state_wait`]).
 
 use serde::Serialize;
 
@@ -64,6 +75,9 @@ pub const INFRA_ONLY_RETRY_KEY: &str = "infra_only_same_head_retry";
 pub const KNOWN_FLAKY_TESTS_KEY: &str = "known_flaky_tests";
 /// The red-everywhere mode: `off`, `shadow` (default) or `enforce`.
 pub const RED_EVERYWHERE_KEY: &str = "red_everywhere";
+/// Checks that are not required and may be red or pending on an `UNSTABLE`
+/// head the steward still merges ([`EjectionGuards::unstable_advisory_checks`]).
+pub const UNSTABLE_ADVISORY_CHECKS_KEY: &str = "unstable_advisory_checks";
 
 /// What the steward does when the same required check fails the same way on
 /// many open pull requests (`[auto_merge] red_everywhere`).
@@ -143,6 +157,15 @@ pub struct EjectionGuards {
     /// ejected along with another pull request's
     /// ([`super::flake_requeue::FlakePolicy`]).
     pub flake_requeue: super::flake_requeue::FlakePolicy,
+    /// On a base with no merge queue, the checks that are not required and
+    /// may be red or pending on a head GitHub reports `UNSTABLE` that the
+    /// steward still merges (`[auto_merge] unstable_advisory_checks`). `None`
+    /// (unset, malformed, or the config unreadable) admits only `CLEAN`. See
+    /// [`super::merge_state_wait`].
+    pub unstable_advisory_checks: Option<Vec<String>>,
+    /// Why `unstable_advisory_checks` did not parse, when it did not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unstable_advisory_checks_error: Option<String>,
     /// Why the base config could not be read, when it could not. The guards
     /// then keep their merge-queue defaults (on) with no generated paths.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -172,6 +195,8 @@ impl EjectionGuards {
             },
             dequeue_doomed_groups_error: None,
             flake_requeue: super::flake_requeue::FlakePolicy::for_base(merge_queue),
+            unstable_advisory_checks: None,
+            unstable_advisory_checks_error: None,
             read_error: None,
         }
     }
@@ -209,6 +234,15 @@ impl EjectionGuards {
                 .and_then(toml::Value::as_bool)
                 .unwrap_or(default)
         };
+        if let Some(value) = section.get(UNSTABLE_ADVISORY_CHECKS_KEY) {
+            guards.unstable_advisory_checks = parse_check_names(value);
+            if guards.unstable_advisory_checks.is_none() {
+                guards.unstable_advisory_checks_error = Some(format!(
+                    "{CONFIG_TABLE}.{UNSTABLE_ADVISORY_CHECKS_KEY} must be an array of check \
+                     names; only CLEAN heads are admitted"
+                ));
+            }
+        }
         guards.batch_guard = flag(BATCH_GUARD_KEY, guards.batch_guard);
         guards.red_outranks_pending = flag(RED_OUTRANKS_PENDING_KEY, guards.red_outranks_pending);
         guards.infra_only_retry = flag(INFRA_ONLY_RETRY_KEY, guards.infra_only_retry);
@@ -316,6 +350,21 @@ impl EjectionGuards {
     }
 }
 
+/// A TOML array of non-empty check names, trimmed; `None` for any other
+/// shape, so a malformed safety list is never read as an empty one.
+fn parse_check_names(value: &toml::Value) -> Option<Vec<String>> {
+    value
+        .as_array()?
+        .iter()
+        .map(|name| {
+            name.as_str()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,6 +397,90 @@ generated_paths = [
         let direct = EjectionGuards::from_table(&toml::Table::new(), false);
         assert!(!direct.batch_guard && !direct.red_outranks_pending && !direct.infra_only_retry);
         assert_eq!(EjectionGuards::default(), EjectionGuards::for_base(false));
+    }
+
+    #[test]
+    fn unstable_advisory_checks_are_unknown_unless_a_valid_list_is_set() {
+        for merge_queue in [false, true] {
+            for raw in [
+                "",
+                "[auto_merge]\n",
+                "auto_merge = \"x\"\n",
+                "[[auto_merge]]\nunstable_advisory_checks = [\"a\"]\n",
+            ] {
+                assert_eq!(
+                    EjectionGuards::from_table(&table(raw), merge_queue).unstable_advisory_checks,
+                    None,
+                    "{raw:?}"
+                );
+            }
+        }
+        let listed = EjectionGuards::from_table(
+            &table(
+                "[auto_merge]\nunstable_advisory_checks = [\" zizmor (report only) \", \"lint\"]\n",
+            ),
+            false,
+        );
+        assert_eq!(
+            listed.unstable_advisory_checks,
+            Some(vec!["zizmor (report only)".to_owned(), "lint".to_owned()])
+        );
+        assert!(listed.unstable_advisory_checks_error.is_none());
+        assert_eq!(
+            EjectionGuards::from_table(
+                &table("[auto_merge]\nunstable_advisory_checks = []\n"),
+                false
+            )
+            .unstable_advisory_checks,
+            Some(Vec::new())
+        );
+        for malformed in [
+            "unstable_advisory_checks = \"zizmor\"",
+            "unstable_advisory_checks = [\"zizmor\", 3]",
+            "unstable_advisory_checks = [\"\"]",
+            "unstable_advisory_checks = true",
+        ] {
+            let guards =
+                EjectionGuards::from_table(&table(&format!("[auto_merge]\n{malformed}\n")), false);
+            assert_eq!(guards.unstable_advisory_checks, None, "{malformed}");
+            assert!(
+                guards.unstable_advisory_checks_error.is_some(),
+                "{malformed}"
+            );
+        }
+    }
+
+    /// The rule-only Shipyard base config does not opt into advisory checks.
+    #[test]
+    fn shipyards_config_does_not_enable_advisory_checks() {
+        let raw = include_str!("../../.shipyard/config.toml");
+        let guards = EjectionGuards::from_table(&table(raw), false);
+        assert_eq!(guards.unstable_advisory_checks, None);
+        assert!(guards.unstable_advisory_checks_error.is_none());
+    }
+
+    #[test]
+    fn no_config_read_outcome_but_a_valid_list_makes_the_list_known() {
+        let listed = "[auto_merge]\nunstable_advisory_checks = [\"zizmor\"]\n";
+        let ok = |_: &[String]| Ok(listed.to_owned());
+        assert_eq!(
+            EjectionGuards::from_config(&ok, "o/r", "main", false).unstable_advisory_checks,
+            Some(vec!["zizmor".to_owned()])
+        );
+        let outcomes: [Result<String, String>; 4] = [
+            Err("HTTP 502: <html>404 Not Found upstream</html>".to_owned()),
+            Err("HTTP 404: Not Found".to_owned()),
+            Err("timed out".to_owned()),
+            Ok("not = [toml".to_owned()),
+        ];
+        for outcome in outcomes {
+            let read = |_: &[String]| outcome.clone();
+            assert_eq!(
+                EjectionGuards::from_config(&read, "o/r", "main", false).unstable_advisory_checks,
+                None,
+                "{outcome:?}"
+            );
+        }
     }
 
     #[test]

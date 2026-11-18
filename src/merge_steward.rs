@@ -171,8 +171,10 @@ impl StewardPolicy {
     /// required-check set that includes the approval context, with that rule
     /// bound to an app (`integration_id`): an unbound rule is satisfied by any
     /// actor that can post a status of that name. The steward then merges
-    /// with `mergePullRequest` bound by `expectedHeadOid`, only an approved,
-    /// `CLEAN`, all-green head, and GitHub refuses the merge of any head whose
+    /// with `mergePullRequest` bound by `expectedHeadOid`, only an approved
+    /// head whose required checks are all green and whose merge state
+    /// [`merge_state_wait`] admits (`CLEAN`, or `UNSTABLE` with every other
+    /// non-green check listed advisory by the base), and GitHub refuses the merge of any head whose
     /// approval context or CI has not passed. It never arms auto-merge here:
     /// an armed request survives a later push by anyone with write access.
     /// Anything less stays refused, with no merge at all.
@@ -443,10 +445,10 @@ pub fn classify_pr(
             run_ids: transient_runs.into_iter().collect(),
         };
     }
-    if !policy.merge_queue && merge_state != "CLEAN" {
-        return StewardDecision::WaitingRequired {
-            contexts: vec![format!("github-merge-state:CLEAN (current={merge_state})")],
-        };
+    if !policy.merge_queue
+        && let Some(contexts) = merge_state_wait(pr, policy)
+    {
+        return StewardDecision::WaitingRequired { contexts };
     }
     if policy.merge_queue || policy.server_enforced_exact_head_merge() {
         // The exact-head enqueue mutation is idempotent from the steward's
@@ -459,6 +461,183 @@ pub fn classify_pr(
             reasons: vec![DirectMergeRefusal::ValidatedBaseRevisionNotAtomic],
         }
     }
+}
+
+/// The status context the steward posts on a head it hands to a recovery
+/// agent: `failure` while the head needs an agent, `success` once cleared.
+pub const STEWARD_RECOVERY_CONTEXT: &str = "shipyard/steward-recovery";
+
+/// The wait every non-`CLEAN` merge state reports first; `blocked_on` reads it
+/// as `merge_state:<STATE>`.
+fn merge_state_context(state: &str) -> String {
+    format!("github-merge-state:CLEAN (current={state})")
+}
+
+/// Suffix of a wait context naming a check that is not required, not green,
+/// and not in the base's `[auto_merge] unstable_advisory_checks`.
+pub const NOT_ADVISORY_SUFFIX: &str = " (not in unstable_advisory_checks)";
+/// Wait context when GitHub says `UNSTABLE` but every check the steward sees
+/// that is not required is green, so nothing it can name explains the state.
+pub const UNEXPLAINED_UNSTABLE: &str = "unstable-without-a-visible-non-green-check";
+/// Prefix of a note naming an `unstable_advisory_checks` entry that matches no
+/// check on the head (likely a typo or a renamed job). Informational: it never
+/// admits anything.
+pub const ADVISORY_UNMATCHED_PREFIX: &str = "unstable_advisory_checks entry matches no check: ";
+
+/// Whether GitHub's merge state lets a base with no merge queue merge `pr`:
+/// `None` when it does, else the contexts the head waits on.
+///
+/// `CLEAN` admits. `UNSTABLE` (GitHub's word for "every required rule is met,
+/// some other check is red or pending"; an unmet required rule is `BLOCKED`)
+/// admits only when the base's `[auto_merge] unstable_advisory_checks` is
+/// known and names (exactly) every check on the head that no required rule
+/// selects and that is not green ([`non_required_not_green`]), and at least
+/// one such check exists to explain the state. The
+/// steward's own recovery status ([`STEWARD_RECOVERY_CONTEXT`]) can never be
+/// advisory. Every other state, and an unknown list, waits: unknown, renamed
+/// or new checks hold the head. This decides nothing about required checks
+/// or approval: the caller checks those against the live ruleset, before
+/// this and again on the final live read.
+///
+/// The first context is always `github-merge-state:CLEAN (current=<STATE>)`.
+/// Checks that hold an `UNSTABLE` head follow it (each ending in
+/// [`NOT_ADVISORY_SUFFIX`], or [`UNEXPLAINED_UNSTABLE`]), then a note for each
+/// list entry that matches no check ([`ADVISORY_UNMATCHED_PREFIX`]).
+#[must_use]
+pub fn merge_state_wait(pr: &StewardPullRequest, policy: &StewardPolicy) -> Option<Vec<String>> {
+    let merge_state = pr.merge_state.to_ascii_uppercase();
+    if merge_state == "CLEAN" {
+        return None;
+    }
+    let mut wait = vec![merge_state_context(&merge_state)];
+    if merge_state != "UNSTABLE" {
+        return Some(wait);
+    }
+    let Some(advisory) = policy.ejection_guards.unstable_advisory_checks.as_ref() else {
+        return Some(wait);
+    };
+    let is_advisory = |name: &str| {
+        !name.trim().eq_ignore_ascii_case(STEWARD_RECOVERY_CONTEXT)
+            && advisory.iter().any(|entry| entry.trim() == name.trim())
+    };
+    let not_green = non_required_not_green(pr, policy);
+    let unmatched = advisory_unmatched(pr, policy);
+    let mut holding = not_green
+        .iter()
+        .filter(|name| !is_advisory(name))
+        .map(|name| format!("{name}{NOT_ADVISORY_SUFFIX}"))
+        .collect::<Vec<_>>();
+    if not_green.is_empty() {
+        holding.push(UNEXPLAINED_UNSTABLE.to_owned());
+    }
+    if holding.is_empty() && unmatched.is_empty() {
+        return None;
+    }
+    wait.extend(holding);
+    wait.extend(
+        unmatched
+            .into_iter()
+            .map(|entry| format!("{ADVISORY_UNMATCHED_PREFIX}{entry}")),
+    );
+    Some(wait)
+}
+
+/// Whether `contexts` (a `WaitingRequired` decision) waits on an `UNSTABLE`
+/// merge state that only the steward's own recovery status, or an unknown
+/// advisory list, holds: the state its recovery clear can resolve.
+#[must_use]
+pub fn waits_only_on_recovery_status(contexts: &[String]) -> bool {
+    let recovery = format!("{STEWARD_RECOVERY_CONTEXT}{NOT_ADVISORY_SUFFIX}");
+    contexts.first().map(String::as_str) == Some(merge_state_context("UNSTABLE").as_str())
+        && contexts[1..]
+            .iter()
+            .all(|context| *context == recovery || context.starts_with(ADVISORY_UNMATCHED_PREFIX))
+}
+
+/// `unstable_advisory_checks` entries that match no check on this head,
+/// sorted. A typo or a renamed job shows here; it never admits anything.
+#[must_use]
+pub fn advisory_unmatched(pr: &StewardPullRequest, policy: &StewardPolicy) -> Vec<String> {
+    let Some(advisory) = policy.ejection_guards.unstable_advisory_checks.as_ref() else {
+        return Vec::new();
+    };
+    let mut unmatched = advisory
+        .iter()
+        .filter(|entry| {
+            if entry.trim().eq_ignore_ascii_case(STEWARD_RECOVERY_CONTEXT) {
+                return false;
+            }
+            !pr.checks
+                .iter()
+                .any(|check| check.name.trim() == entry.trim())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    unmatched.sort();
+    unmatched.dedup();
+    unmatched
+}
+
+fn check_is_green(check: &StewardCheck) -> bool {
+    check.status.eq_ignore_ascii_case("COMPLETED")
+        && matches!(
+            check
+                .conclusion
+                .as_deref()
+                .unwrap_or_default()
+                .to_ascii_uppercase()
+                .as_str(),
+            "SUCCESS" | "NEUTRAL" | "SKIPPED"
+        )
+}
+
+/// Names of checks on this head that are not green (red or pending) and that
+/// no required rule selects, sorted. Names compare exactly, as GitHub's
+/// contexts do. Both reads the steward makes of check runs (the rollup and
+/// the REST `check-runs` list) return only the latest run per check, so every
+/// check-run observation is judged on its own: no green row can stand in for
+/// a red one, whether it is a matrix sibling, another workflow's job of the
+/// same name, or a copy read moments apart (that last case holds the head for
+/// a pass, which is the safe direction). Commit statuses are read with their
+/// history, so each context is judged on its newest status, as GitHub's
+/// combined status is. The observation a required rule selects is judged by
+/// the required path instead.
+#[must_use]
+pub fn non_required_not_green(pr: &StewardPullRequest, policy: &StewardPolicy) -> Vec<String> {
+    let selected = policy
+        .required_checks
+        .iter()
+        .filter_map(|rule| selected_required_check(&pr.checks, rule))
+        .collect::<Vec<_>>();
+    let is_selected = |check: &StewardCheck| {
+        selected.iter().any(|required| {
+            std::ptr::eq(*required, check)
+                || (required.source == check.source
+                    && required.check_id.is_some()
+                    && required.check_id == check.check_id)
+        })
+    };
+    let mut names = pr
+        .checks
+        .iter()
+        .filter(|check| {
+            let judged = check.source != StewardCheckSource::StatusContext
+                || pr
+                    .checks
+                    .iter()
+                    .filter(|other| {
+                        other.source == StewardCheckSource::StatusContext
+                            && other.name.trim() == check.name.trim()
+                    })
+                    .max_by(|left, right| cmp_recency(left, right))
+                    .is_some_and(|newest| std::ptr::eq(newest, *check));
+            judged && !check_is_green(check) && !is_selected(check)
+        })
+        .map(|check| check.name.trim().to_owned())
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// Required contexts whose newest observation on this head is a terminal
@@ -988,12 +1167,19 @@ pub(crate) fn selected_required_check<'a>(
 /// (mixed surfaces, or a missing id) falls back to the timestamp.
 pub(crate) fn cmp_recency(left: &StewardCheck, right: &StewardCheck) -> std::cmp::Ordering {
     let same_surface = left.source == right.source;
-    cmp_id_then_time(
+    let recency = cmp_id_then_time(
         left.check_id.filter(|_| same_surface),
         right.check_id.filter(|_| same_surface),
         &check_recency(left),
         &check_recency(right),
-    )
+    );
+    if recency != std::cmp::Ordering::Equal {
+        return recency;
+    }
+    // A status without an id can tie another status at timestamp precision.
+    // Keep any tied non-green observation as the selected one so a green row
+    // can never hide evidence that the context still holds the head.
+    check_is_green(right).cmp(&check_is_green(left))
 }
 
 /// The one recency rule: ids decide only when BOTH sides have one; a missing

@@ -186,7 +186,8 @@ def sync_trailers(repo: Path, edited: list[str]) -> list[str]:
 
     The bump commit edits only version files, which the skill map and doc map
     also claim (Cargo.toml, .claude-plugin/**). The gates would otherwise fail
-    the bump pull request, and the steward admits only a CLEAN one. The
+    the bump pull request, and the steward holds a head with a red check that
+    is not listed advisory. The
     trailers are derived from the gates' own maps and matchers, so they track
     the maps instead of a hard-coded skill name. A repo without the gate
     scripts or maps has nothing to satisfy.

@@ -628,7 +628,7 @@ pub(super) const HANDOFF_CONTEXT: &str = "shipyard/steward-handoff";
 pub(super) const MANAGED_LABEL: &str = "shipyard:managed";
 pub(super) const DEFAULT_PROVENANCE_BLOCKING_LABEL: &str = "5·unresolved";
 pub(super) const UNMANAGED_LABEL: &str = "shipyard:unmanaged";
-pub(super) const RECOVERY_CONTEXT: &str = "shipyard/steward-recovery";
+pub(super) const RECOVERY_CONTEXT: &str = crate::merge_steward::STEWARD_RECOVERY_CONTEXT;
 pub(super) const NEEDS_AGENT_LABEL: &str = "shipyard:needs-agent";
 
 mod handoff;

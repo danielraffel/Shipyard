@@ -689,11 +689,6 @@ fn combine_mutations(left: Option<String>, right: Option<String>) -> Option<Stri
     }
 }
 
-/// The wait a direct-merge base reports while the steward's own failed
-/// recovery status is on the head: that status is a red non-required context,
-/// so GitHub holds the merge state at UNSTABLE until the steward clears it.
-const UNSTABLE_MERGE_STATE_WAIT: &str = "github-merge-state:CLEAN (current=UNSTABLE)";
-
 /// Pauses before each live read after a clear. GitHub recomputes the merge
 /// state asynchronously after a status write, so a read that still says
 /// UNSTABLE gets one more look before the PR waits for the next pass.
@@ -734,10 +729,13 @@ pub(super) fn reclassify_after_recovery_clear(
             .split([',', ';'])
             .any(|action| action == "needs_agent_cleared")
     });
+    // The steward's own failed recovery status is a red non-required
+    // context, so GitHub holds the merge state at UNSTABLE until the steward
+    // clears it.
     let waits_on_own_status = matches!(
         decision,
         StewardDecision::WaitingRequired { contexts }
-            if contexts.len() == 1 && contexts[0] == UNSTABLE_MERGE_STATE_WAIT
+            if crate::merge_steward::waits_only_on_recovery_status(contexts)
     );
     if policy.merge_queue || !cleared || !waits_on_own_status {
         return RecoveryClearReclassification::Unchanged;

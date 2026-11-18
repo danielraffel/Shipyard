@@ -294,6 +294,24 @@ class StewardTickArchiveTests(unittest.TestCase):
         self.run_tick()
         self.assertIn(" invariants=FAIL:required_context_producer(a_b_c) ", self.summary_line())
 
+    def test_advisory_checks_merged_over_are_one_token_per_pr(self):
+        self.steward_prints([
+            {"number": 69, "mutation": "merged_exact_head:abc,advisory_not_green:zizmor_(report_only)|lint"},
+            {"number": 70, "mutation": "merged_exact_head:def"},
+            {"number": 71, "mutation": "merged_exact_head:fed,advisory_not_green:a b\nc=d;e"},
+        ], rc=0)
+        self.run_tick()
+        line = self.summary_line()
+        self.assertTrue(line.endswith(
+            " advisory_not_green=#69:zizmor_(report_only)|lint,#71:a_b_c_d_e"), line)
+        self.assertNotIn("#70:", line)
+        self.assertIn("enqueued=3 ", line)
+
+    def test_no_advisory_field_without_an_advisory_merge(self):
+        self.steward_prints([{"number": 1, "mutation": "merged_exact_head:abc"}], rc=0)
+        self.run_tick()
+        self.assertNotIn("advisory_not_green", self.summary_line())
+
     def test_clean_pass_reports_zero_for_both(self):
         self.steward_prints([{"number": 1, "mutation": "enqueued"}], rc=0)
         self.run_tick()

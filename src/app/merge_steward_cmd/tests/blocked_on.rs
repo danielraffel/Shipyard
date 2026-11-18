@@ -2098,3 +2098,43 @@ fn a_pending_review_status_does_not_hide_a_required_check_that_never_ran() {
     .0;
     assert_eq!(pending.blocked_on, "required_pending", "{pending:?}");
 }
+
+/// An UNSTABLE head held on a base with no merge queue reads
+/// `merge_state:UNSTABLE`, and its detail names the check that is not
+/// advisory and any advisory entry that matches no check.
+#[test]
+fn an_unstable_hold_names_the_check_that_holds_it() {
+    let rollup = json!([
+        {"__typename": "CheckRun", "name": "macos", "status": "COMPLETED",
+         "conclusion": "SUCCESS", "completedAt": CHECKS_GREEN_AT,
+         "detailsUrl": "https://github.com/owner/repo/actions/runs/100"},
+        {"__typename": "CheckRun", "name": "risk-tier", "status": "COMPLETED",
+         "conclusion": "FAILURE", "completedAt": CHECKS_GREEN_AT,
+         "detailsUrl": "https://github.com/owner/repo/actions/runs/101"}
+    ]);
+    let pr = pr_with(12, &[], "UNSTABLE", &rollup);
+    let mut policy = queue_policy();
+    policy.merge_queue = false;
+    policy.ejection_guards.unstable_advisory_checks = Some(vec!["zizmor".to_owned()]);
+    let decision = classify_pr(&pr.fact, &policy, &BTreeMap::new());
+    let (blocked, _) = classify(
+        &RowFacts {
+            pr: &pr.fact,
+            decision: &decision,
+            mutation: None,
+            error: None,
+            approval: GateRead::Unread,
+            enqueued_at: None,
+            ejection: None,
+        },
+        &policy,
+    );
+    assert_eq!(blocked.blocked_on, "merge_state:UNSTABLE");
+    assert_eq!(
+        blocked.blocked_detail.as_deref(),
+        Some(
+            "risk-tier (not in unstable_advisory_checks); \
+             unstable_advisory_checks entry matches no check: zizmor"
+        )
+    );
+}
