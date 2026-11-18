@@ -754,7 +754,6 @@ def pr_compute(rd, f, runs, runs_complete):
             attempt = 1
         attempts_known = attempt <= 1 or r.get("conclusion") in BAD_CONCLUSIONS
         complete = complete and ok and attempts_known
-        outcomes_complete = outcomes_complete and r.get("status") == "completed"  # a rerun's history only blocks a clean verdict (`complete`)
         if attempt > 1:
             red_partial = True  # the list shows only a rerun's latest attempt: an earlier failed attempt is not in red_events, and its waits are not in runner_wait
         after_merge = bool(merged and iso(r.get("updated_at")) and iso(r.get("updated_at")) > merged)  # a rerun after the merge cannot have delayed it

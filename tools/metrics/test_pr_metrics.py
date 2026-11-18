@@ -434,6 +434,14 @@ class RerunCache(Base):
         self.assertEqual((r["path"], r["cause_min"]["red"]), ("slow", None))
         self.assertEqual(r["cause_min"]["hold"], 50.0)
 
+    def test_a_known_failure_stands_beside_an_unfinished_run(self):
+        bad = self.mk(1, "failure", T(10, "10:40"))
+        busy = dict(self.mk(1, None, T(10, "10:45")), id=12, name="other", status="in_progress")
+        gh = world([pr(1, T(10, "09:00"), T(10, "11:00"))], {}, runs=[bad, busy], jobs={11: self.JOB, 12: self.JOB})
+        out = pm.build([REPO], self.cache, 300, OWNER, START, NOW, {}, {}, None, gh, control=False)
+        r = out["repos"][REPO]["prs"][0]
+        self.assertEqual((r["path"], r["compute"]["complete"]), ("slow", False))
+
 
 class JobsSkippedHold(Base):
     """Findings of the review of the job-read switch."""
