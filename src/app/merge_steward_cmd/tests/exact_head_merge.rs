@@ -1244,151 +1244,146 @@ fn a_head_still_unstable_after_the_clear_merges_when_only_advisory_checks_are_re
     assert!(clear < merge, "{calls}");
 }
 
-/// No green observation can stand in for a red one: every check-run
-/// observation is judged on its own (both reads return only the latest run
-/// per check), so a newer green of the same name, from the same workflow run
-/// (a matrix sibling), another run or another app, never hides a red one.
-/// Names compare exactly: a green `lint` does not hide a red `Lint`, and
-/// listing `lint` does not waive `Lint`. A commit status is judged on its
-/// newest status per exact context, as GitHub's combined status is.
-#[test]
-fn no_green_observation_hides_a_red_one_and_names_compare_exactly() {
-    let advisory = |names: &[&str]| unstable_policy(Some(names));
-    let base_pr = || {
-        let mut pr = parse_pr(
-            &serde_json::from_str(&unstable_pr_json(
-                "SUCCESS",
-                &[("zizmor (report only)", "FAILURE")],
-            ))
-            .expect("PR json"),
-            &BTreeMap::new(),
+/// An approved UNSTABLE head, red only in the advisory zizmor, as the census
+/// holds it.
+fn identity_base_pr() -> StewardPullRequest {
+    let json = unstable_pr_json("SUCCESS", &[("zizmor (report only)", "FAILURE")]);
+    let mut pr = parse_pr(
+        &serde_json::from_str(&json).expect("PR json"),
+        &BTreeMap::new(),
+    )
+    .expect("PR")
+    .fact;
+    pr.checks.push(
+        crate::app::merge_steward_cmd::observation::parse_rest_check(
+            &serde_json::from_str(&rest_check_run(true)).expect("check run"),
         )
-        .expect("PR")
-        .fact;
-        pr.checks.push(
-            crate::app::merge_steward_cmd::observation::parse_rest_check(
-                &serde_json::from_str(&rest_check_run(true)).expect("check run"),
-            )
-            .expect("check run"),
-        );
-        pr
-    };
-    let check =
-        |name: &str, source, app: Option<u64>, run: Option<u64>, conclusion: &str, id: u64| {
-            StewardCheck {
-                name: name.to_owned(),
-                source,
-                app_id: app,
-                status: "COMPLETED".to_owned(),
-                conclusion: Some(conclusion.to_owned()),
-                run_id: run,
-                observed_at: Some(format!("2026-10-30T00:00:{:02}Z", id % 60)),
-                check_id: Some(id),
-                description: None,
-            }
-        };
-    let run_source = crate::merge_steward::StewardCheckSource::CheckRun;
-    let status_source = crate::merge_steward::StewardCheckSource::StatusContext;
-    let holds = |name: &str| StewardDecision::WaitingRequired {
+        .expect("check run"),
+    );
+    pr
+}
+
+/// One completed observation.
+fn observed(
+    name: &str,
+    source: crate::merge_steward::StewardCheckSource,
+    app: Option<u64>,
+    run: Option<u64>,
+    conclusion: &str,
+    id: u64,
+) -> StewardCheck {
+    StewardCheck {
+        name: name.to_owned(),
+        source,
+        app_id: app,
+        status: "COMPLETED".to_owned(),
+        conclusion: Some(conclusion.to_owned()),
+        run_id: run,
+        observed_at: Some(format!("2026-10-30T00:00:{:02}Z", id % 60)),
+        check_id: Some(id),
+        description: None,
+    }
+}
+
+fn identity_classify(pr: &StewardPullRequest, advisory: &[&str]) -> StewardDecision {
+    classify_pr(pr, &unstable_policy(Some(advisory)), &BTreeMap::new())
+}
+
+fn held_by(name: &str) -> StewardDecision {
+    StewardDecision::WaitingRequired {
         contexts: vec![
             UNSTABLE_WAIT.to_owned(),
             format!("{name} (not in unstable_advisory_checks)"),
         ],
-    };
+    }
+}
+
+/// No green check run can stand in for a red one: every check-run
+/// observation is judged on its own (both reads return only the latest run
+/// per check), so a newer green of the same name, from the same workflow run
+/// (a matrix sibling), another run or another app, never hides a red one.
+/// Names compare exactly: a green `lint` does not hide a red `Lint`, and
+/// listing `lint` does not waive `Lint`.
+#[test]
+fn no_green_check_run_hides_a_red_one_and_names_compare_exactly() {
+    use crate::merge_steward::StewardCheckSource::CheckRun;
+    let zizmor = ["zizmor (report only)"];
     // Control: only the advisory zizmor is red.
     assert_eq!(
-        classify_pr(
-            &base_pr(),
-            &advisory(&["zizmor (report only)"]),
-            &BTreeMap::new()
-        ),
+        identity_classify(&identity_base_pr(), &zizmor),
         StewardDecision::ArmMergeQueue
     );
-    // A red `build` with a newer green `build`: same run (matrix sibling),
-    // another run, another app. Each holds.
     for (run, app) in [
         (500, Some(ACTIONS_APP)),
         (501, Some(ACTIONS_APP)),
         (500, Some(99)),
     ] {
-        let mut pr = base_pr();
-        pr.checks.push(check(
+        let mut pr = identity_base_pr();
+        pr.checks.push(observed(
             "build",
-            run_source,
+            CheckRun,
             Some(ACTIONS_APP),
             Some(500),
             "FAILURE",
             10,
         ));
         pr.checks
-            .push(check("build", run_source, app, Some(run), "SUCCESS", 11));
+            .push(observed("build", CheckRun, app, Some(run), "SUCCESS", 11));
         assert_eq!(
-            classify_pr(&pr, &advisory(&["zizmor (report only)"]), &BTreeMap::new()),
-            holds("build"),
+            identity_classify(&pr, &zizmor),
+            held_by("build"),
             "run {run} app {app:?}"
         );
     }
-    // `Lint` red, `lint` green: distinct checks; listing `lint` waives
-    // nothing about `Lint`.
-    let mut pr = base_pr();
-    pr.checks.push(check(
+    let mut pr = identity_base_pr();
+    pr.checks.push(observed(
         "Lint",
-        run_source,
+        CheckRun,
         Some(ACTIONS_APP),
         Some(500),
         "FAILURE",
         10,
     ));
-    pr.checks.push(check(
+    pr.checks.push(observed(
         "lint",
-        run_source,
+        CheckRun,
         Some(ACTIONS_APP),
         Some(500),
         "SUCCESS",
         11,
     ));
     assert_eq!(
-        classify_pr(
-            &pr,
-            &advisory(&["zizmor (report only)", "lint"]),
-            &BTreeMap::new()
-        ),
-        StewardDecision::WaitingRequired {
-            contexts: vec![
-                UNSTABLE_WAIT.to_owned(),
-                "Lint (not in unstable_advisory_checks)".to_owned(),
-            ]
-        }
+        identity_classify(&pr, &["zizmor (report only)", "lint"]),
+        held_by("Lint")
     );
-    // Listed exactly, it is waived.
     assert_eq!(
-        classify_pr(
-            &pr,
-            &advisory(&["zizmor (report only)", "Lint"]),
-            &BTreeMap::new()
-        ),
+        identity_classify(&pr, &["zizmor (report only)", "Lint"]),
         StewardDecision::ArmMergeQueue
     );
-    // A commit status superseded by a newer status of the same context is
-    // judged on the newer one; `Scan` and `scan` are different contexts.
-    let mut pr = base_pr();
+}
+
+/// A commit status superseded by a newer status of the same context is
+/// judged on the newer one, as GitHub's combined status is; `Scan` and
+/// `scan` are different contexts.
+#[test]
+fn a_commit_status_is_judged_on_its_newest_status_per_exact_context() {
+    use crate::merge_steward::StewardCheckSource::StatusContext;
+    let zizmor = ["zizmor (report only)"];
+    let mut pr = identity_base_pr();
     pr.checks
-        .push(check("scan", status_source, None, None, "FAILURE", 10));
+        .push(observed("scan", StatusContext, None, None, "FAILURE", 10));
     pr.checks
-        .push(check("scan", status_source, None, None, "SUCCESS", 11));
+        .push(observed("scan", StatusContext, None, None, "SUCCESS", 11));
     assert_eq!(
-        classify_pr(&pr, &advisory(&["zizmor (report only)"]), &BTreeMap::new()),
+        identity_classify(&pr, &zizmor),
         StewardDecision::ArmMergeQueue
     );
-    let mut pr = base_pr();
+    let mut pr = identity_base_pr();
     pr.checks
-        .push(check("Scan", status_source, None, None, "FAILURE", 10));
+        .push(observed("Scan", StatusContext, None, None, "FAILURE", 10));
     pr.checks
-        .push(check("scan", status_source, None, None, "SUCCESS", 11));
-    assert_eq!(
-        classify_pr(&pr, &advisory(&["zizmor (report only)"]), &BTreeMap::new()),
-        holds("Scan")
-    );
+        .push(observed("scan", StatusContext, None, None, "SUCCESS", 11));
+    assert_eq!(identity_classify(&pr, &zizmor), held_by("Scan"));
 }
 
 /// A check name with a newline or spaces stays one token in the mutation.
