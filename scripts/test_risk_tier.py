@@ -10,6 +10,7 @@ import io
 import os
 import pathlib
 import sys
+import tomllib
 import unittest
 from unittest import mock
 from typing import Any
@@ -159,6 +160,14 @@ class BaseConfig(unittest.TestCase):
                      "[review\n"):
             with self.subTest(text=text), self.assertRaises(rt.TierError):
                 rt.load_rules(text)
+
+
+class RuleOnlyRepositoryConfig(unittest.TestCase):
+    def test_rule_pr_does_not_enable_advisory_check_data(self) -> None:
+        config = tomllib.loads(
+            (HERE.parent / ".shipyard" / "config.toml").read_text(encoding="utf-8")
+        )
+        self.assertNotIn("unstable_advisory_checks", config.get("auto_merge", {}))
 
 
 CARGO_BASE = """

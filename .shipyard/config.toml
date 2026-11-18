@@ -89,13 +89,6 @@ required_checks = [
 
 [auto_merge]
 human_reviewers = ["danielraffel"]
-# Checks that are not required and only report: a red or pending one does
-# not hold an approved, required-green head GitHub reports UNSTABLE. Any other
-# non-green check that is not required still holds it. risk-tier is
-# report-only (its status is always success; a red run is an infrastructure
-# failure, docs/risk-tier.md). The version and skill sync gate is NOT listed:
-# it blocks merge by policy.
-unstable_advisory_checks = ["risk-tier", "risk-tier report"]
 # Who may sign the fleet App's `verdict: APPROVE`: an approval posted through
 # ghapp counts only with a `reviewer: <name>` line naming one of these. This
 # list beats any host's reviewer-signers.json. `shipyard review-verdict` and
