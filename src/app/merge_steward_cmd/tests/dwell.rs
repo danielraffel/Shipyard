@@ -1424,9 +1424,10 @@ fn an_approved_green_pull_request_the_steward_did_not_merge_is_alerted_once() {
             })
             .collect::<Vec<_>>()
     };
-    assert!(stuck_rows(&pass.run(&mut ledger, &FakeActs::default())).is_empty());
-    pass.now = now() + chrono::Duration::minutes(59);
-    assert!(stuck_rows(&pass.run(&mut ledger, &FakeActs::default())).is_empty());
+    for minute in [0, 15, 30, 45, 59] {
+        pass.now = now() + chrono::Duration::minutes(minute);
+        assert!(stuck_rows(&pass.run(&mut ledger, &FakeActs::default())).is_empty());
+    }
     pass.now = now() + chrono::Duration::minutes(61);
     let first = pass.run(&mut ledger, &FakeActs::default());
     assert_eq!(
@@ -1535,7 +1536,10 @@ fn a_stuck_alert_is_within_the_per_pass_escalation_cap() {
     );
     pass.dwell_policy.max_escalations_per_pass = 0;
     let mut ledger = established();
-    pass.run(&mut ledger, &FakeActs::default());
+    for minute in [0, 15, 30, 45, 55] {
+        pass.now = now() + chrono::Duration::minutes(minute);
+        pass.run(&mut ledger, &FakeActs::default());
+    }
     pass.now = now() + chrono::Duration::minutes(61);
     let capped = pass.run(&mut ledger, &FakeActs::default());
     let row = capped
@@ -1544,6 +1548,7 @@ fn a_stuck_alert_is_within_the_per_pass_escalation_cap() {
         .find(|row| row.state == crate::merge_steward::dwell::DwellState::ApprovedStuck)
         .expect("stuck row");
     assert!(!row.escalated && row.escalation_deferred);
+    assert_eq!(row.escalated_level, 0, "a deferred alert is not relayed");
     assert_eq!(capped.escalations_new, 0);
     pass.dwell_policy.max_escalations_per_pass = 1;
     pass.now = now() + chrono::Duration::minutes(66);

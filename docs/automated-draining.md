@@ -1016,10 +1016,14 @@ with every
 required check green, and that the pass neither merged nor queued, whatever its
 `blocked_on` (`merge_state:UNSTABLE`, an excluded label, an unknown merge
 state, ...). Drafts and queued pull requests are not tracked: the queue owns
-them. The clock starts the first pass that sees it so at its head, survives
-every pass that still sees it open at that head (a `review-verdict` re-run
-after a comment, or a deferred row, does not reset it or its alert), restarts
-at a new head, and is dropped once the pull request is no longer seen. Past the limit (60
+them. The clock starts the first pass that sees it so at its head. A short
+stretch as a non-candidate at that head (up to 15 minutes between candidate
+passes: a `review-verdict` re-run after a comment, a deferred row) keeps it; a
+longer one (queued, held, a red required check) restarts it when the pull
+request is a candidate again, so only time actually spent approved, green and
+unmerged counts. It restarts at a new head and is dropped once the pull
+request is no longer seen. The alert is one per head either way, and a row the
+per-pass escalation cap defers is neither marked nor relayed. Past the limit (60
 minutes; `0` turns it off) the pass reports one `approved_stuck` overdue row
 naming the `blocked_on`, routed to the author. It escalates exactly once per
 head, and only an `--apply` pass marks it, so a dry run (`shipyard wait`)

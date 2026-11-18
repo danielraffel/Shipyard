@@ -969,7 +969,8 @@ fn stuck_pass(
 fn an_approved_green_pull_request_stuck_past_the_bound_alerts_once() {
     let mut state = established();
     let pr = [stuck(69, HEAD, "merge_state:UNSTABLE")];
-    assert!(stuck_pass(&mut state, &pr, &[], 0, true).is_empty());
+    let warm = stuck_passes(&mut state, &pr, HEAD, 0, 55, &[]);
+    assert!(warm.iter().all(|(_, rows)| rows.is_empty()));
     assert!(
         stuck_pass(&mut state, &pr, &[], 59, true).is_empty(),
         "under the bound"
@@ -982,42 +983,90 @@ fn an_approved_green_pull_request_stuck_past_the_bound_alerts_once() {
     assert_eq!(first[0].overdue.age_minutes, 60);
     assert_eq!(first[0].overdue.level, 1);
     assert_eq!(first[0].act, Disposition::NoAct);
-    for minutes in [65, 120, 600] {
-        let later = stuck_pass(&mut state, &pr, &[], minutes, true);
-        assert_eq!(later.len(), 1, "{minutes}");
-        assert!(!later[0].escalate, "alerted once, not again at {minutes}");
+    for (minute, rows) in stuck_passes(&mut state, &pr, HEAD, 65, 600, &[]) {
+        assert_eq!(rows.len(), 1, "{minute}");
+        assert!(!rows[0].escalate, "alerted once, not again at {minute}");
     }
 }
 
-/// A pass where the pull request is open at the same head but not a
-/// candidate (its `review-verdict` re-running after a comment, a deferred
-/// row) neither resets the clock nor the alert, and reports nothing; a new
-/// head starts over; a pull request no longer seen (merged, closed) is
-/// dropped.
+/// Passes every five minutes from `from` to `to` (inclusive): a candidate
+/// unless the minute is in `gaps`, where it is only seen open at `head`.
+fn stuck_passes(
+    state: &mut DwellRepoState,
+    pr: &[StuckCandidate],
+    head: &str,
+    from: i64,
+    to: i64,
+    gaps: &[i64],
+) -> Vec<(i64, Vec<Planned>)> {
+    (from..=to)
+        .step_by(5)
+        .map(|minute| {
+            let rows = if gaps.contains(&minute) {
+                stuck_pass(state, &[], &[(pr[0].number, head)], minute, true)
+            } else {
+                stuck_pass(state, pr, &[], minute, true)
+            };
+            (minute, rows)
+        })
+        .collect()
+}
+
+/// A short stretch as a non-candidate at the same head (a `review-verdict`
+/// re-run after a comment, two passes) keeps the clock, and a blip after the
+/// alert does not alert again; a new head starts over; a pull request no
+/// longer seen (merged, closed) is dropped.
 #[test]
-fn a_one_pass_blip_keeps_the_clock_and_the_alert_and_a_new_head_restarts() {
+fn a_short_blip_keeps_the_clock_and_the_alert_and_a_new_head_restarts() {
     let mut state = established();
     let pr = [stuck(7, HEAD, "excluded_label:owner-decision")];
-    stuck_pass(&mut state, &pr, &[], 0, true);
-    // Mid re-run at minute 50: not a candidate, same head.
-    assert!(stuck_pass(&mut state, &[], &[(7, HEAD)], 50, true).is_empty());
-    let first = stuck_pass(&mut state, &pr, &[], 60, true);
-    assert!(first[0].escalate, "the blip did not restart the clock");
-    // A blip after the alert: no second escalation at the same head.
-    stuck_pass(&mut state, &[], &[(7, HEAD)], 70, true);
-    for minutes in [75, 140] {
-        assert!(
-            !stuck_pass(&mut state, &pr, &[], minutes, true)[0].escalate,
-            "{minutes}"
-        );
-    }
-    // A new head: a new clock and a new alert.
+    let passes = stuck_passes(&mut state, &pr, HEAD, 0, 60, &[45, 50]);
+    let escalated: Vec<i64> = passes
+        .iter()
+        .filter(|(_, rows)| rows.iter().any(|row| row.escalate))
+        .map(|(minute, _)| *minute)
+        .collect();
+    assert_eq!(escalated, vec![60], "the blip did not restart the clock");
+    let later = stuck_passes(&mut state, &pr, HEAD, 65, 140, &[70, 75]);
+    assert!(
+        later
+            .iter()
+            .all(|(_, rows)| rows.iter().all(|row| !row.escalate)),
+        "one alert per head"
+    );
     let moved = [stuck(7, HEAD2, "excluded_label:owner-decision")];
-    assert!(stuck_pass(&mut state, &moved, &[], 150, true).is_empty());
-    assert!(stuck_pass(&mut state, &moved, &[], 210, true)[0].escalate);
-    // Not seen at all: dropped.
-    stuck_pass(&mut state, &[], &[], 211, true);
+    let at_b = stuck_passes(&mut state, &moved, HEAD2, 145, 205, &[]);
+    let escalated: Vec<i64> = at_b
+        .iter()
+        .filter(|(_, rows)| rows.iter().any(|row| row.escalate))
+        .map(|(minute, _)| *minute)
+        .collect();
+    assert_eq!(escalated, vec![205], "a new head, a new clock and alert");
+    stuck_pass(&mut state, &[], &[], 206, true);
     assert!(state.stuck_approved.is_empty());
+}
+
+/// A long stretch as a non-candidate at the same head (queued, held, a red
+/// required check) is not time spent stuck: the clock restarts when the
+/// pull request is a candidate again, so it does not alert at once.
+#[test]
+fn a_long_non_candidate_stretch_restarts_the_clock() {
+    let mut state = established();
+    let pr = [stuck(8, HEAD, "merge_state:UNKNOWN")];
+    // A candidate once, then 70 minutes queued (or held, or red).
+    let queued: Vec<i64> = (5..=70).step_by(5).collect();
+    let passes = stuck_passes(&mut state, &pr, HEAD, 0, 75, &queued);
+    assert!(
+        passes.iter().all(|(_, rows)| rows.is_empty()),
+        "back at minute 75 is not 75 minutes stuck"
+    );
+    let rest = stuck_passes(&mut state, &pr, HEAD, 80, 135, &[]);
+    let escalated: Vec<i64> = rest
+        .iter()
+        .filter(|(_, rows)| rows.iter().any(|row| row.escalate))
+        .map(|(minute, _)| *minute)
+        .collect();
+    assert_eq!(escalated, vec![135], "60 minutes after it came back");
 }
 
 /// A pass that does not apply (a dry run, `shipyard wait`) reports the
@@ -1026,7 +1075,7 @@ fn a_one_pass_blip_keeps_the_clock_and_the_alert_and_a_new_head_restarts() {
 fn a_dry_run_does_not_use_up_the_alert() {
     let mut state = established();
     let pr = [stuck(9, HEAD, "merge_state:UNSTABLE")];
-    stuck_pass(&mut state, &pr, &[], 0, true);
+    stuck_passes(&mut state, &pr, HEAD, 0, 55, &[]);
     let dry = stuck_pass(&mut state, &pr, &[], 61, false);
     assert!(dry[0].escalate);
     let applied = stuck_pass(&mut state, &pr, &[], 62, true);

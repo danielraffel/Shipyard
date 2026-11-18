@@ -432,11 +432,18 @@ pub(super) fn run(
     report.escalations_new += stuck.iter().filter(|row| row.escalate).count();
     report.escalations_deferred += stuck.iter().filter(|row| row.escalation_deferred).count();
     report.overdue.extend(stuck.iter().map(|row| {
+        // The relay delivers only an emitted level: one this pass escalated
+        // or an earlier pass marked, never one the cap deferred.
+        let emitted = row.escalate
+            || state
+                .stuck_approved
+                .get(&row.overdue.number)
+                .is_some_and(|entry| entry.alerted);
         overdue_record(
             input,
             by_number.get(&row.overdue.number).copied(),
             row,
-            row.overdue.level,
+            u32::from(emitted) * row.overdue.level,
             None,
         )
     }));

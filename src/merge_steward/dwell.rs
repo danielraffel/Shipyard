@@ -522,7 +522,18 @@ pub struct StuckApproved {
     pub since: DateTime<Utc>,
     /// Whether its alert was emitted, by an apply pass. One per head.
     pub alerted: bool,
+    /// The last pass that saw it a candidate. A gap longer than
+    /// [`STUCK_GAP_MINUTES`] restarts the clock.
+    #[serde(default)]
+    pub last_candidate_at: Option<DateTime<Utc>>,
 }
+
+/// Longest gap between two passes that see a pull request as a candidate
+/// before its stuck clock restarts. A `review-verdict` re-run after a
+/// comment, or a deferred row, is a pass or two at the five-minute tick;
+/// a stretch in the queue, under a HOLD or with a red required check is not
+/// time spent stuck, so the clock starts again when it comes back.
+pub const STUCK_GAP_MINUTES: i64 = 15;
 
 /// One pull request this pass saw approved at its exact head with every
 /// required check green, and neither merged nor queued.
@@ -541,12 +552,15 @@ pub struct StuckCandidate {
 /// [`DwellState::ApprovedStuck`] limit (60 minutes by default; 0 disables).
 ///
 /// The clock starts the first pass that sees a pull request as a candidate
-/// at its head, and survives every later pass that sees it open at that same
-/// head, candidate or not: a `review-verdict` re-run (every comment triggers
-/// one) or a deferred row makes a pull request a non-candidate for a pass,
-/// and that must not reset the clock or the alert. A new head starts over;
-/// a pull request this pass did not see at all (merged or closed) is
-/// dropped. `open` is every pull request this pass saw, with its head.
+/// at its head. A short stretch as a non-candidate at the same head (a
+/// `review-verdict` re-run after a comment, a deferred row: up to
+/// [`STUCK_GAP_MINUTES`] between candidate passes) keeps the clock; a longer
+/// one (queued, held, a red required check) restarts it when the pull request
+/// is a candidate again, so only time actually spent approved, green and
+/// unmerged counts. The alert stays one per head either way. A new head
+/// starts over; a pull request this pass did not see at all (merged or
+/// closed) is dropped. `open` is every pull request this pass saw, with its
+/// head.
 /// A row past the limit escalates exactly once per head: `escalate` is true
 /// until [`mark_stuck_alerted`] records it, which only an apply pass does and
 /// only for rows that escalated within the per-pass cap. A pass that does not
@@ -572,15 +586,22 @@ pub fn track_stuck(
         .collect();
     for candidate in candidates {
         let entry = match state.stuck_approved.get(&candidate.number) {
-            Some(entry) if entry.head.eq_ignore_ascii_case(&candidate.head) => StuckApproved {
-                token: candidate.token.clone(),
-                ..entry.clone()
-            },
+            Some(entry) if entry.head.eq_ignore_ascii_case(&candidate.head) => {
+                let last = entry.last_candidate_at.unwrap_or(entry.since);
+                let resumed = now - last > Duration::minutes(STUCK_GAP_MINUTES);
+                StuckApproved {
+                    token: candidate.token.clone(),
+                    since: if resumed { now } else { entry.since },
+                    last_candidate_at: Some(now),
+                    ..entry.clone()
+                }
+            }
             _ => StuckApproved {
                 head: candidate.head.clone(),
                 token: candidate.token.clone(),
                 since: now,
                 alerted: false,
+                last_candidate_at: Some(now),
             },
         };
         next.insert(candidate.number, entry);
