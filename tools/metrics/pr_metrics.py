@@ -742,7 +742,8 @@ def pr_compute(rd, f, runs, runs_complete):
             sh += a
             ho += b
             mac += m
-            wait += w
+            if r.get("event") != "push":  # a push to the base on the merge-group sha runs after the merge and cannot have delayed it
+                wait += w
         else:
             timing_complete = False
         # The Actions run list exposes only the latest conclusion for a rerun. A successful latest attempt

@@ -1300,6 +1300,14 @@ class Proxies(Base):
         c = self.rows(out)[1]["compute"]
         self.assertEqual((c["runs"], c["repeat_runs"], c["group_runs"]), (2, 1, 1))
 
+    def test_a_post_merge_push_run_adds_no_runner_wait(self):
+        p = pr(1, T(10, "09:00"), T(10, "11:00"))
+        runs = [{"id": 21, "head_sha": "grp", "event": "merge_group", "status": "completed", "name": "GPU", "head_branch": "gh-readonly-queue/main/pr-1-x"},
+                {"id": 22, "head_sha": "grp", "event": "push", "status": "completed", "name": "GPU", "head_branch": "main"}]
+        job = [{"labels": ["self-hosted"], "created_at": T(10, "10:00"), "started_at": T(10, "10:05"), "completed_at": T(10, "10:10"), "conclusion": "success"}]
+        out = self.build(world([p], runs=runs, jobs={21: job, 22: job}), now=self.LATE)
+        self.assertEqual(self.rows(out)[1]["compute"]["runner_wait_min"], 5.0)
+
 
 class VellumControl(unittest.TestCase):
     def test_the_vellum_push_runs_on_a_merge_group_sha_count_as_repeats(self):
