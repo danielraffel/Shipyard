@@ -4,6 +4,7 @@
 //! the returned state and appends the returned log records.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::path::Path;
 
 use chrono::{DateTime, Duration, Utc};
@@ -277,7 +278,7 @@ fn run_repo(
     // tracked too, so an event that needs an author's action reaches the lead
     // instead of nobody. Bounded by the discovery page (100); a registered owner always wins.
     if input.config.fallbacks(repo).lead.is_some() {
-        for number in read.unmarked.iter() {
+        for number in &read.unmarked {
             let entry = state
                 .prs
                 .entry(key(repo, *number))
@@ -372,6 +373,7 @@ fn run_repo(
             tracked.pending.retain(|event| {
                 super::needs_an_owner(event, &digest)
                     && (matches!(event, RelayEvent::Ejected { .. }) && !digest.in_queue
+                        || matches!(event, RelayEvent::Overdue { head, .. } if *head == digest.head)
                         || current.contains(&event.key(repo, *number)))
             });
         }
@@ -610,10 +612,11 @@ fn deliver(
     let keys: Vec<String> = events.iter().map(|e| e.key(repo, pr)).collect();
     let mut message = render_message(repo, pr, digest, &events, steward_next);
     if tracked.owner.is_none() {
-        message.push_str(&format!(
+        let _ = write!(
+            message,
             " (No owner is registered for this pull request, so the lead hears it; the owning \
              session runs `shipyard owner register --pr {pr} --repo {repo}`.)"
-        ));
+        );
     }
     let mut record = DeliveryRecord {
         kind: "delivery".to_owned(),

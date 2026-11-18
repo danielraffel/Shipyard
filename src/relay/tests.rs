@@ -1671,6 +1671,33 @@ fn a_queued_ejection_is_dropped_when_the_pull_request_re_enters_the_queue() {
 }
 
 #[test]
+fn an_unowned_overdue_notice_waits_inside_the_rate_limit_window() {
+    let mut pr = Pr::open(543);
+    pr.comments.push(verdict("HOLD", HEAD_A));
+    let mut h = unowned_harness(&pr, true);
+    h.pass(0, Mode::Send);
+    assert_eq!(h.deliveries().len(), 1);
+
+    // The overdue notice arrives while the HOLD's rate-limit window is open.
+    h.overdue.insert(543, vec![overdue_event(HEAD_A, 1)]);
+    h.pass(1, Mode::Send);
+    assert_eq!(h.deliveries().len(), 1);
+
+    // It is still current at the next window and must reach the lead.
+    h.overdue.clear();
+    h.pass(10, Mode::Send);
+    let deliveries = h.deliveries();
+    assert_eq!(deliveries.len(), 2, "{deliveries:?}");
+    assert!(
+        deliveries[1]["message"]
+            .as_str()
+            .unwrap()
+            .contains("overdue: dirty for 45 min (limit 30 min)"),
+        "{deliveries:?}"
+    );
+}
+
+#[test]
 fn an_unowned_draft_pull_request_is_not_tracked() {
     let mut pr = Pr::open(543);
     pr.comments.push(verdict("HOLD", HEAD_A));
