@@ -512,14 +512,22 @@ pub fn merge_state_wait(pr: &StewardPullRequest, policy: &StewardPolicy) -> Opti
     Some(wait.into_iter().chain(holding).collect())
 }
 
-/// Whether the newest observation named `name` on this head is green, or
-/// there is none.
+/// Whether every producer's newest observation named `name` on this head is
+/// green, or there is none. Producers (surface and app) are judged apart, so
+/// a green check from one cannot mask a red one of the same name from
+/// another; a rerun by the same producer supersedes its earlier attempt.
 fn newest_named_is_green(checks: &[StewardCheck], name: &str) -> bool {
-    checks
+    let named = checks
         .iter()
         .filter(|check| check.name.eq_ignore_ascii_case(name.trim()))
-        .max_by(|left, right| cmp_recency(left, right))
-        .is_none_or(check_is_green)
+        .collect::<Vec<_>>();
+    named.iter().all(|check| {
+        named
+            .iter()
+            .filter(|other| other.source == check.source && other.app_id == check.app_id)
+            .max_by(|left, right| cmp_recency(left, right))
+            .is_none_or(|newest| check_is_green(newest))
+    })
 }
 
 fn check_is_green(check: &StewardCheck) -> bool {

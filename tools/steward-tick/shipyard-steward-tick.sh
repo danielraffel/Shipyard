@@ -220,7 +220,7 @@ steward_one() {
     red_everywhere=$(jq -r '[.repos[]?.red_everywhere?.groups[]?]|length' "$out" 2>/dev/null || echo ERROR)
     # Heads merged over red checks that are not required (GitHub UNSTABLE):
     # logged, never a gate.
-    non_required_red=$(jq -r '[.repos[]?.prs[]? | . as $pr | (.mutation // "" | tostring | split(",")[] | select(startswith("non_required_red:")) | "#\($pr.number):" + (ltrimstr("non_required_red:") | gsub("[ ;]+";"_")))] | join(",")' "$out" 2>/dev/null || true)
+    non_required_red=$(jq -r '[.repos[]?.prs[]? | . as $pr | (.mutation // "" | tostring | split(",")[] | select(startswith("non_required_red:")) | "#\($pr.number):" + (ltrimstr("non_required_red:") | gsub("[[:space:][:cntrl:];=]+";"_")))] | join(",")' "$out" 2>/dev/null || true)
     echo "$stamp $repo rc=$rc $counts took=${took}s ver=$steward_ver launcher=$launcher_path invariants=$invariants red_everywhere=$red_everywhere${oldest:+ oldest=$oldest}${non_required_red:+ non_required_red=$non_required_red}" >> "$log_dir/summary.log"
   elif grep -q "another steward apply pass is already running" "$out.err" 2>/dev/null; then
     echo "$stamp $repo skipped=lock_busy" >> "$log_dir/summary.log"

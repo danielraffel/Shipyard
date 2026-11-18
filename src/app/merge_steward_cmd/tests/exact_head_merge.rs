@@ -901,7 +901,7 @@ fn unstable_head_red_only_in_a_report_only_check_is_merged() {
     assert_eq!(
         outcome.mutation,
         Some(format!(
-            "merged_exact_head:{HEAD},non_required_red:zizmor (report only)"
+            "merged_exact_head:{HEAD},non_required_red:zizmor_(report_only)"
         ))
     );
 }
@@ -1059,4 +1059,77 @@ fn a_head_still_unstable_after_the_clear_merges_when_the_list_is_known() {
     let clear = calls.find("state=success").expect("recovery clear");
     let merge = calls.find("mergePullRequest(").expect("merge");
     assert!(clear < merge, "{calls}");
+}
+
+/// Two producers report a listed check: a newer green one cannot mask an
+/// older red one from the other producer, while a rerun by the same producer
+/// does supersede its own red attempt.
+#[test]
+fn a_green_check_from_another_producer_does_not_mask_a_red_listed_check() {
+    let policy = unstable_policy(Some(&["risk-tier"]));
+    let red_then_other_green = |other_app: Option<u64>| {
+        let mut pr = parse_pr(
+            &serde_json::from_str(&unstable_pr_json("SUCCESS", &[])).expect("PR json"),
+            &BTreeMap::new(),
+        )
+        .expect("PR")
+        .fact;
+        pr.checks.push(
+            crate::app::merge_steward_cmd::observation::parse_rest_check(
+                &serde_json::from_str(&rest_check_run(true)).expect("check run"),
+            )
+            .expect("check run"),
+        );
+        let base = StewardCheck {
+            name: "risk-tier".to_owned(),
+            source: crate::merge_steward::StewardCheckSource::CheckRun,
+            app_id: Some(ACTIONS_APP),
+            status: "COMPLETED".to_owned(),
+            conclusion: Some("FAILURE".to_owned()),
+            run_id: Some(500),
+            observed_at: Some("2026-10-30T00:00:10Z".to_owned()),
+            check_id: Some(5000),
+            description: None,
+        };
+        pr.checks.push(base.clone());
+        pr.checks.push(StewardCheck {
+            app_id: other_app,
+            conclusion: Some("SUCCESS".to_owned()),
+            run_id: Some(501),
+            observed_at: Some("2026-10-30T00:00:20Z".to_owned()),
+            check_id: Some(5001),
+            ..base
+        });
+        classify_pr(&pr, &policy, &BTreeMap::new())
+    };
+    // Same producer: the green rerun supersedes the red attempt.
+    assert_eq!(
+        red_then_other_green(Some(ACTIONS_APP)),
+        StewardDecision::ArmMergeQueue
+    );
+    // Another producer's green does not.
+    assert_eq!(
+        red_then_other_green(Some(99)),
+        StewardDecision::WaitingRequired {
+            contexts: vec![
+                UNSTABLE_WAIT.to_owned(),
+                "risk-tier (unstable_blocking_checks)".to_owned(),
+            ]
+        }
+    );
+}
+
+/// A check name with a newline or spaces stays one token in the mutation.
+#[cfg(unix)]
+#[test]
+fn a_hostile_check_name_cannot_split_the_mutation_or_summary_line() {
+    let json = unstable_pr_json("SUCCESS", &[("evil\\nok=1, x;y|z", "FAILURE")]);
+    let outcome = run_unstable(&unstable_policy(Some(&[])), &json, &json);
+    assert_merged(&outcome);
+    let mutation = outcome.mutation.expect("mutation");
+    assert!(
+        !mutation.contains('\n') && !mutation.contains(' '),
+        "{mutation:?}"
+    );
+    assert_eq!(mutation.matches(',').count(), 1, "{mutation:?}");
 }

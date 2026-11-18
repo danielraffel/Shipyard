@@ -334,7 +334,20 @@ pub(super) fn merge_exact_head(
             } else {
                 let names = red
                     .iter()
-                    .map(|name| name.replace([',', ';', '|'], "_"))
+                    // Check names come from workflows a pull request can
+                    // edit: keep them to one token of the mutation and one
+                    // field of the tick summary line.
+                    .map(|name| {
+                        name.chars()
+                            .map(|c| {
+                                if c.is_control() || c.is_whitespace() || ",;|=".contains(c) {
+                                    '_'
+                                } else {
+                                    c
+                                }
+                            })
+                            .collect::<String>()
+                    })
                     .collect::<Vec<_>>();
                 format!(
                     "merged_exact_head:{head},non_required_red:{}",
