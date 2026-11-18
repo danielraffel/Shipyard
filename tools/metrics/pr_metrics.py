@@ -814,21 +814,22 @@ def pr_compute(rd, f, runs, runs_complete):
             attempt = 1
         attempts_known = attempt <= 1 or r.get("conclusion") in BAD_CONCLUSIONS
         complete = complete and ok and attempts_known
-        outcomes_complete = outcomes_complete and r.get("status") == "completed"  # a rerun's history only blocks a clean verdict (`complete`)
+        if attempt > 1:
+            red_partial = True  # the list shows only a rerun's latest attempt: an earlier failed attempt is not in red_events, and its waits are not in runner_wait
         after_merge = bool(merged and iso(r.get("updated_at")) and iso(r.get("updated_at")) > merged)  # a rerun after the merge cannot have delayed it
         if after_merge and attempt > 1:
             complete = False  # the rerun replaced what the run showed at the merge: no clean verdict (a red found elsewhere still stands)
         if (r.get("head_sha") in heads and r.get("event") != "merge_group" and not after_merge
                 and r.get("conclusion") in BAD_CONCLUSIONS and r.get("updated_at")):
             red_events.append(r["updated_at"])  # any failed non-merge-group run on one of the PR's heads
-            red_partial = red_partial or attempt > 1  # the list shows only its latest attempt: earlier failed attempts are not in red_events
         level = by_wf.setdefault(r.get("name") or "?", {"pull_request": 0, "merge_group": 0, "push": 0, "other": 0})
         ev = r.get("event")
         level[ev if ev in ("merge_group", "push") else "pull_request" if ev in ("pull_request", "pull_request_target") else "other"] += 1
+    # runner_wait_min is None after a rerun: earlier attempts' waits are not in the jobs read
     j = READ_JOB_MINUTES  # job-derived numbers are None, never a measured zero, when jobs were not read or timing was incomplete
     measured = j and timing_complete
     return {"self_hosted_min": round(sh, 1) if measured else None, "hosted_min": round(ho, 1) if measured else None, "macos_min": round(mac, 1) if measured else None,
-            "runner_wait_min": round(wait, 1) if measured else None, "jobs_read": j, "red_events": sorted(red_events), "by_workflow": by_wf,
+            "runner_wait_min": round(wait, 1) if measured and not red_partial else None, "jobs_read": j, "red_events": sorted(red_events), "by_workflow": by_wf,
             "runs": len(mine), "repeat_runs": repeats, "red_partial": red_partial, "run_fp": {str(i): run_fingerprint(r) for i, r in mine.items()},
             "group_runs": sum(1 for r in mine.values() if r.get("event") == "merge_group"), "complete": complete,
             "outcomes_complete": outcomes_complete}
