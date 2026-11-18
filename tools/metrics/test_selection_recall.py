@@ -69,9 +69,15 @@ class Calc(unittest.TestCase):
                 (gate(3), [sel()]), (gate(4), [sel()])]
         n = report(rows)["narrowed"]
         self.assertEqual((n["failing_tests"], n["misses"], n["misses_per_100_narrowed"]), (4, 3, 75.0))
+        self.assertEqual((n["exonerated_misses"], n["unexplained_misses"], n["unexplained_per_100_narrowed"]), (1, 2, 50.0))
         self.assertEqual([(m["job_id"], m["test"], m["verdict"]) for m in n["miss_list"]],
                          [(1, "gpu a", "exonerated"), (1, "timing b", "not excused: main evidence unread"),
                           (2, "c", "no verdict")])
+
+    def test_the_shadow_exoneration_title_with_would_exonerate_is_read_too(self):
+        shadow = {"title": "flake-exoneration-shadow", "message": json.dumps({"tests": {"t": {"would_exonerate": True}}})}
+        n = report([(gate(1, "failure"), [sel(failed=1, outside=1, names=["t"]), shadow]), (gate(2), [sel()])])["narrowed"]
+        self.assertEqual((n["miss_list"][0]["verdict"], n["unexplained_misses"]), ("exonerated", 0))
 
     def test_failures_in_select_all_jobs_are_counted_overall_but_never_as_misses(self):
         rows = [(gate(1, "failure"), [sel(select_all=True, selected=1000, reason="cmake changed", failed=2)]),

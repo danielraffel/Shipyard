@@ -32,7 +32,7 @@ SCHEMA = "shipyard-selection-recall/v1"
 UTC = dt.timezone.utc
 SELECTION_TITLES = ("affected-tests-shadow", "shipyard-selection-shadow")
 RECEIPTS_TITLE = "test-receipts-shadow"
-EXONERATION_TITLE = "flake-exoneration"
+EXONERATION_TITLES = ("flake-exoneration", "flake-exoneration-shadow")  # the first says `excused`, the second `would_exonerate`
 GATE_CONCLUSIONS = ("success", "failure")
 COVERAGE_FLOOR = 0.95
 DEFAULT_READ_CAP = 3000
@@ -241,10 +241,10 @@ def read_job(g, annotations):
                                      "failed_names": list(r.get("would_skip_failed_names") or [])}
                 except (TypeError, ValueError):
                     pass
-        elif a["title"] == EXONERATION_TITLE:
+        elif a["title"] in EXONERATION_TITLES:
             e = parse_notice(a)
             if e and isinstance(e.get("tests"), dict):
-                f["exoneration"] = e["tests"]
+                f["exoneration"].update(e["tests"])
     return f, None
 
 
@@ -252,7 +252,9 @@ def verdict(f, name):
     t = f["exoneration"].get(name)
     if not isinstance(t, dict):
         return "no verdict"
-    return "exonerated" if t.get("excused") else f"not excused: {t.get('reason') or 'unknown'}"
+    if t.get("excused") or t.get("would_exonerate"):
+        return "exonerated"
+    return f"not excused: {t.get('reason') or 'unknown'}"
 
 
 def compute(data, repo, since, until, workflow, job_name, runner="fleet"):
@@ -273,6 +275,9 @@ def compute(data, repo, since, until, workflow, job_name, runner="fleet"):
     misses = [{"job_id": f["job_id"], "run_id": f["run_id"], "test": n, "verdict": verdict(f, n)}
               for f in narrowed for n in f["outside_names"]]
     miss_count = sum(f["outside"] for f in narrowed)
+    # `outside` counts tests; the list names them. A miss the job did not name cannot be judged, so it is unexplained.
+    exonerated = sum(1 for m in misses if m["verdict"] == "exonerated")
+    unexplained = max(0, miss_count - exonerated)
     rcpt = [f["receipts"] for f in jobs if f["receipts"]]
     coverage = (len(jobs) / n_gate) if n_gate else None
     reasons_partial = list(data["partial"])
@@ -295,6 +300,8 @@ def compute(data, repo, since, until, workflow, job_name, runner="fleet"):
                      "selected_fraction_p90_pct": round(pct(fr, 90), 2) if fr else None,
                      "failing_tests": sum(f["failed"] for f in narrowed), "misses": miss_count,
                      "misses_per_100_narrowed": round(miss_count / len(narrowed) * 100, 1) if narrowed else None,
+                     "exonerated_misses": exonerated, "unexplained_misses": unexplained,
+                     "unexplained_per_100_narrowed": round(unexplained / len(narrowed) * 100, 1) if narrowed else None,
                      "miss_list": misses},
         "failures": {"jobs_with_failing_test": sum(1 for f in jobs if f["failed"]),
                      "failing_tests": sum(f["failed"] for f in jobs)},
@@ -331,6 +338,8 @@ def render_md(r):
             f"| Failing tests in narrowed jobs | {n['failing_tests']} |",
             f"| Misses (failed outside the selection) | {n['misses']} |",
             f"| **Misses per 100 narrowed jobs** | **{n['misses_per_100_narrowed']}** |",
+            f"| Exonerated misses / unexplained misses | {n['exonerated_misses']} / {n['unexplained_misses']} |",
+            f"| **Unexplained misses per 100 narrowed jobs** | **{n['unexplained_per_100_narrowed']}** |",
             f"| Receipts: jobs with the notice, median share it would skip | {r['receipts']['jobs']}, {r['receipts']['would_skip_median_pct']}% |",
             f"| Receipts: skipped tests that failed | {r['receipts']['would_skip_failed']} {r['receipts']['would_skip_failed_names']} |",
             "", "## Select-all reasons", "", "| Reason | Jobs | Share of read jobs |", "|---|---|---|"]

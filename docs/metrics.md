@@ -176,7 +176,8 @@ notice; those, cancelled jobs and runs not yet completed are counted under `excl
 Notices parsed (JSON in `message`): `affected-tests-shadow` or `shipyard-selection-shadow` (same fields:
 `total`, `selected`, `select_all`, `reason`, `failed`, `failed_outside_selection`, `failed_outside_names`),
 `test-receipts-shadow` (`would_skip`, `selected`, `would_skip_failed`, `would_skip_failed_names`) and
-`flake-exoneration` (`tests.<name>.excused` and `reason`).
+`flake-exoneration` (`tests.<name>.excused` and `reason`; the `flake-exoneration-shadow` title with
+`would_exonerate` is read as well).
 
 | Figure | Definition |
 | --- | --- |
@@ -185,6 +186,7 @@ Notices parsed (JSON in `message`): `affected-tests-shadow` or `shipyard-selecti
 | Failing tests in narrowed jobs | Sum of `failed` over narrowed jobs. Failures in select-all jobs are reported apart and are never misses. |
 | Miss | A failing test outside the selection (`failed_outside_selection`) in a narrowed job. Listed with job id, test name and the exoneration verdict: `exonerated`, `not excused: <reason>`, or `no verdict` when the job has no exoneration notice. |
 | Misses per 100 narrowed jobs | Misses over narrowed jobs, times 100. The promotion rule is 0 unexplained misses over at least 300 narrowed jobs. |
+| Unexplained misses | Misses minus those whose verdict is `exonerated`, and the same per 100 narrowed jobs. This is the figure the promotion rule reads. |
 | Receipts | Jobs with the notice, median `would_skip / selected`, and `would_skip_failed` (with names). |
 
 A gate job whose selection notice is missing or unparseable, whose annotations could not be read, or whose run's
@@ -194,5 +196,5 @@ jobs carried a selection notice, a listing was truncated or the read cap was rea
 Reproduced for Pulp, 2026-11-11 to 2026-11-17: 310 gate jobs, 309 read (one failed in `Fetch pulp-rs crates` before
 the shadow ran); 195 select-all (157 "cmake changed"), 114 narrowed, selected fraction median 3.2% and p90 36.3%;
 28 gate jobs with a failing test and 30 failing tests; 12 failing tests in narrowed jobs, 6 misses, 5.3 per 100
-narrowed jobs, every miss "not excused" (main evidence unread); receipts would skip a median 0.87% of tests and one
+narrowed jobs, all 6 unexplained (every verdict "not excused: main evidence unread"); receipts would skip a median 0.87% of tests and one
 skipped test failed.
