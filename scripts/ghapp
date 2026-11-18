@@ -2181,9 +2181,11 @@ ghapp_pr_create_parse_options() {
 # `pr create` refuses to open a duplicate: an open pull request in the same
 # repository with the same base and the same head tree has an identical diff,
 # so a second one only splits review and CI. One GraphQL read lists the open
-# pull requests with their head trees. Best effort: any failure to read, or a
-# head it cannot resolve locally (a fork's `owner:branch`), lets the create
-# proceed. An incomplete paginated response fails closed. Operators can allow
+# pull requests with their head trees, a page at a time until the list is
+# exhausted. Best effort: any failure to read a page (an error, a malformed
+# response, a missing cursor), or a head it cannot resolve locally (a fork's
+# `owner:branch`), lets the create proceed; only a duplicate found refuses.
+# Operators can allow
 # a deliberate re-open (docs/ghapp-guards.md).
 if [[ "${1:-} ${2:-}" == "pr create" && "${SHIPYARD_GHAPP_ALLOW_DUPLICATE_PR:-}" != 1 ]]; then
     ghapp_pr_create_parse_options "${@:3}"
@@ -2247,8 +2249,8 @@ else:
 ' "$ghapp_dup_tree" "$ghapp_dup_base" "$ghapp_dup_head" 2>/dev/null || true)"
                 IFS='|' read -r ghapp_dup_found ghapp_dup_has_next ghapp_dup_status ghapp_dup_next_cursor <<< "$ghapp_dup_page"
                 if [[ "$ghapp_dup_status" != ok ]]; then
-                    echo "ghapp: duplicate pull-request scan was incomplete; refusing to open a pull request" >&2
-                    exit 1
+                    echo "ghapp: duplicate pull-request scan could not read the open pull requests; creating anyway" >&2
+                    break
                 fi
                 if [[ -n "$ghapp_dup_found" ]]; then
                     echo "ghapp: refusing to open a duplicate pull request: ${ghapp_dup_found#* } (#${ghapp_dup_found%% *}) is open against the same base with an identical diff. Update that pull request instead." >&2
@@ -2258,8 +2260,8 @@ else:
                     break
                 fi
                 if [[ -z "$ghapp_dup_next_cursor" || "$ghapp_dup_next_cursor" == "$ghapp_dup_cursor" ]]; then
-                    echo "ghapp: duplicate pull-request scan was incomplete; refusing to open a pull request" >&2
-                    exit 1
+                    echo "ghapp: duplicate pull-request scan lost its page cursor; creating anyway" >&2
+                    break
                 fi
                 ghapp_dup_cursor="$ghapp_dup_next_cursor"
             done

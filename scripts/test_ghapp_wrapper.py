@@ -2748,6 +2748,28 @@ class GhappWrapperTests(unittest.TestCase):
         self.assertIn("#555", result.stderr)
         self.assertFalse(self.gh_log.exists(), "gh pr create must not run")
 
+    def test_pr_create_proceeds_when_the_open_pull_request_list_is_malformed(self) -> None:
+        self.make_duplicate_fixture()
+        (self.root / "graphql.json").write_text('{"errors":[{"message":"boom"}]}')
+        result = self.run_wrapper(
+            "pr", "create", "--title", "x", "--body", "y", "--repo", "owner/repo"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.gh_log.exists(), "gh pr create must run")
+        self.assertIn("creating anyway", result.stderr)
+
+    def test_pr_create_proceeds_when_the_page_cursor_repeats(self) -> None:
+        self.make_duplicate_fixture()
+        page = json.loads((self.root / "graphql.json").read_text())
+        page["data"]["repository"]["pullRequests"]["nodes"] = []
+        page["data"]["repository"]["pullRequests"]["pageInfo"] = {"hasNextPage": True, "endCursor": "same"}
+        (self.root / "graphql.json").write_text(json.dumps(page))
+        result = self.run_wrapper(
+            "pr", "create", "--title", "x", "--body", "y", "--repo", "owner/repo"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.gh_log.exists(), "gh pr create must run")
+
     def test_pr_create_allows_the_same_tree_on_a_different_base(self) -> None:
         self.make_duplicate_fixture(other_base="release")
         result = self.run_wrapper(
