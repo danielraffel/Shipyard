@@ -229,29 +229,36 @@ def chain_decide(*, version: str, landed_at: str | None, now: datetime, tag_exis
     since = f"{waited:.0f} min after it landed" if waited is not None else "long after it landed"
     if not tag_exists:
         failures.append(("tag_missing", f"tag {tag} does not exist {since}"))
-    elif run is None:
-        failures.append(("release_run_missing", f"no release.yml push run for {tag} {since}"))
-    elif run.get("status") != "completed":
-        failures.append(("release_run_incomplete",
-                         f"release.yml run {run.get('html_url', run.get('id'))} is still "
-                         f"{run.get('status')} {since}"))
-    elif run.get("conclusion") != "success":
-        failures.append(("release_run_failed",
-                         f"release.yml run {run.get('html_url', run.get('id'))} concluded "
-                         f"{run.get('conclusion')}; failed: {failed_jobs or 'see the run'}"))
-    if tag_exists:
-        if release is None or release.get("draft"):
-            failures.append(("release_unpublished", f"release {tag} is missing or still a draft"))
-        else:
-            have = {a.get("name") for a in release.get("assets", [])}
-            missing = [name for name in expected_assets if name not in have]
-            if missing:
-                failures.append(("release_assets_missing",
-                                 f"release {tag} lacks {', '.join(missing)}"))
-            elif latest_tag != tag:
-                failures.append(("latest_mismatch",
-                                 f"releases/latest is {latest_tag or 'unreadable'}, not {tag}, "
-                                 "so install.sh without SHIPYARD_VERSION installs another tag"))
+        return {"state": "failing", "failures": failures, "note": f"{tag} judged {since}"}
+    published: list[tuple[str, str]] = []
+    if release is None or release.get("draft"):
+        published.append(("release_unpublished", f"release {tag} is missing or still a draft"))
+    else:
+        have = {a.get("name") for a in release.get("assets", [])}
+        missing = [name for name in expected_assets if name not in have]
+        if missing:
+            published.append(("release_assets_missing",
+                              f"release {tag} lacks {', '.join(missing)}"))
+    # release.yml publishes only after its install.sh check passes, and a failed
+    # check puts the release back to draft, so a public, complete release is the
+    # proof; the run is judged only to say why one is not (a run recovered by
+    # hand or by a dispatch therefore clears this).
+    if published:
+        if run is None:
+            failures.append(("release_run_missing", f"no release.yml run for {tag} {since}"))
+        elif run.get("status") != "completed":
+            failures.append(("release_run_incomplete",
+                             f"release.yml run {run.get('html_url', run.get('id'))} is still "
+                             f"{run.get('status')} {since}"))
+        elif run.get("conclusion") != "success":
+            failures.append(("release_run_failed",
+                             f"release.yml run {run.get('html_url', run.get('id'))} concluded "
+                             f"{run.get('conclusion')}; failed: {failed_jobs or 'see the run'}"))
+        failures += published
+    elif latest_tag != tag:
+        failures.append(("latest_mismatch",
+                         f"releases/latest is {latest_tag or 'unreadable'}, not {tag}, "
+                         "so install.sh without SHIPYARD_VERSION installs another tag"))
     return {"state": "failing" if failures else "ok", "failures": failures,
             "note": f"{tag} judged {since}"}
 
@@ -266,13 +273,13 @@ CHAIN_FIX = {
                      "check. The steward merges it once review-verdict is green.",
     "tag_missing": "Read the latest *Auto-Release on CLI Version Bump* run (its tracker names "
                    "the error) and re-run it once fixed.",
-    "release_run_missing": "The tag push started no release.yml run: "
+    "release_run_missing": "The tag started no release.yml run: "
                            "`gh workflow run release.yml --repo {repo} --ref {tag}`.",
     "release_run_incomplete": "A release job is queued or hung, usually on the self-hosted "
                               "macOS runner (`local-mac`, Shipyard-studio-*); check that runner.",
     "release_run_failed": "release-heal.yml re-runs failed jobs up to 3 times while the release "
-                          "is a draft. Once that is spent, or if the release is already public, "
-                          "fix the failing step and `gh run rerun <id> --failed --repo {repo}`.",
+                          "is a draft. Once that is spent, fix the failing step and "
+                          "`gh run rerun <id> --failed --repo {repo}`.",
     "release_unpublished": "The release stays a draft until sign-and-upload-macos publishes it "
                            "after the install.sh check; read that job's log.",
     "release_assets_missing": "Re-run the job that uploads the missing asset.",
@@ -514,7 +521,7 @@ def run_chain(args: argparse.Namespace, now: datetime) -> int:
     landed = latest_bump_landing(version, args.lookback_days, now)
     tag_exists = git("rev-parse", "-q", "--verify", f"refs/tags/{tag}").returncode == 0
     runs = json.loads(gh("api", f"repos/{args.repo}/actions/workflows/release.yml/runs"
-                                f"?branch={tag}&event=push&per_page=1")).get("workflow_runs", [])
+                                f"?branch={tag}&per_page=1")).get("workflow_runs", [])
     run = runs[0] if runs else None
     failed_jobs = ""
     if run and run.get("status") == "completed" and run.get("conclusion") != "success":
@@ -548,7 +555,16 @@ def run_chain(args: argparse.Namespace, now: datetime) -> int:
     print(json.dumps({"state": verdict["state"], "version": tag,
                       "failures": verdict["failures"], "note": verdict["note"]}))
     if verdict["state"] == "pending":
-        print("chain: pending, tracker untouched")
+        # A newer version is inside its bound: an open tracker describes an
+        # older version (or a bump that has since merged), so close it.
+        if not args.dry_run and find_tracker(args.repo, CHAIN_TITLE):
+            apply_tracker(args.repo, CHAIN_TITLE, False, "",
+                          f"{tag} landed and is inside its {args.bound_minutes:.0f}-minute "
+                          "bound; the blocked state this issue described is superseded. "
+                          "Closing; the next pass reopens one if the new version stalls.")
+            print("tracker: close (superseded by a pending version)")
+        else:
+            print("chain: pending")
         return 0
     body = chain_body(version, verdict, evidence, now, args.repo)
     if args.dry_run:

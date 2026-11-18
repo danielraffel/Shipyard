@@ -175,7 +175,8 @@ class ChainTests(unittest.TestCase):
         self.assertEqual(steps(verdict), ["tag_missing"])
 
     def test_no_release_run(self) -> None:
-        self.assertEqual(steps(chain(run=None)), ["release_run_missing"])
+        self.assertEqual(steps(chain(run=None, release=None)),
+                         ["release_run_missing", "release_unpublished"])
 
     def test_a_hung_release_run(self) -> None:
         verdict = chain(run={"id": 7, "status": "queued", "conclusion": None}, release=None)
@@ -189,9 +190,15 @@ class ChainTests(unittest.TestCase):
         self.assertEqual(steps(verdict), ["release_run_failed", "release_unpublished"])
         self.assertIn("Publish the attested release", verdict["failures"][0][1])
 
-    def test_a_failed_run_fails_even_when_the_release_is_public(self) -> None:
+    def test_a_public_complete_release_is_the_proof_whatever_the_run_says(self) -> None:
+        # Publication follows the install check, so a release recovered by hand
+        # or by a dispatched run clears the tracker.
         verdict = chain(run={"id": 7, "status": "completed", "conclusion": "failure"})
-        self.assertEqual(steps(verdict), ["release_run_failed"])
+        self.assertEqual(verdict["state"], "ok")
+
+    def test_a_missing_tag_stops_there(self) -> None:
+        verdict = chain(tag_exists=False)
+        self.assertEqual(steps(verdict), ["tag_missing"])
 
     def test_a_missing_asset(self) -> None:
         verdict = chain(release={"draft": False, "assets": [{"name": "shipyard-linux-x64"}]})
@@ -232,6 +239,35 @@ class ChainTests(unittest.TestCase):
 
     def test_every_tracker_is_labelled_for_the_notifier(self) -> None:
         self.assertIn("release-blocked", rw.LABEL_SPECS)
+
+
+class ChainRunTests(unittest.TestCase):
+    def run_pending(self, open_tracker: dict | None) -> list[tuple]:
+        closed: list[tuple] = []
+        args = rw.argparse.Namespace(repo="o/r", ref="origin/main", lookback_days=14.0,
+                                     bound_minutes=90.0, bump_stale_minutes=60.0, dry_run=False)
+        ok = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        with mock.patch.object(rw, "cargo_version_at", return_value="1.3.0"), \
+                mock.patch.object(rw, "latest_bump_landing", return_value=ago(minutes=5)), \
+                mock.patch.object(rw, "git", return_value=ok), \
+                mock.patch.object(rw, "gh", side_effect=lambda *a, **k: "[]" if "pulls" in a[1]
+                                  else '{"workflow_runs": []}'), \
+                mock.patch.object(rw, "optional_json", return_value=None), \
+                mock.patch.object(rw, "find_tracker", return_value=open_tracker), \
+                mock.patch.object(rw, "apply_tracker",
+                                  side_effect=lambda *a: closed.append(a) or "close"), \
+                contextlib.redirect_stdout(io.StringIO()):
+            rw.run_chain(args, NOW)
+        return closed
+
+    def test_a_pending_newer_version_closes_the_old_versions_tracker(self) -> None:
+        closed = self.run_pending({"number": 9})
+        self.assertEqual(len(closed), 1)
+        self.assertEqual(closed[0][1:3], (rw.CHAIN_TITLE, False))
+        self.assertIn("v1.3.0", closed[0][4])
+
+    def test_pending_with_no_tracker_touches_nothing(self) -> None:
+        self.assertEqual(self.run_pending(None), [])
 
 
 class TrackerTests(unittest.TestCase):
