@@ -450,16 +450,12 @@ generated_paths = [
         }
     }
 
-    /// Shipyard's own base config lists exactly its report-only checks as
-    /// advisory, and never the version and skill sync gate.
+    /// The rule-only Shipyard base config does not opt into advisory checks.
     #[test]
-    fn shipyards_config_lists_only_report_only_checks_as_advisory() {
+    fn shipyards_config_does_not_enable_advisory_checks() {
         let raw = include_str!("../../.shipyard/config.toml");
         let guards = EjectionGuards::from_table(&table(raw), false);
-        assert_eq!(
-            guards.unstable_advisory_checks,
-            Some(vec!["risk-tier".to_owned(), "risk-tier report".to_owned()])
-        );
+        assert_eq!(guards.unstable_advisory_checks, None);
         assert!(guards.unstable_advisory_checks_error.is_none());
     }
 
