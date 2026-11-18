@@ -26,7 +26,9 @@ on m3 messages the fleet's lead sessions when that key changes.
 only at outcomes, so it fires whatever broke. Two invariants:
 
 - a ``feat:``/``fix:`` pull request merged to main more than ``--grace-hours``
-  ago is in a ``v*`` tag, or a ``release/version-at-land`` pull request is open;
+  ago is in a ``v*`` tag or in the history of a merged ``release/version-at-land``
+  pull request (a plugin-only bump is released without a tag), or a bump pull
+  request is open;
 - a commit on main that moved the ``Cargo.toml`` package version is in a
   ``v*`` tag within ``--bump-grace-minutes``.
 
@@ -161,6 +163,20 @@ def untagged_releases(merged: list[dict], untagged: set[str], bump_pr_open: bool
                    and pr.get("merge_commit_sha") in untagged
                    and _parse(pr["merged_at"]) <= cutoff),
                   key=lambda pr: pr["merged_at"])
+
+
+def landed_bumps(pulls: list[dict]) -> list[str]:
+    """Merge commits of merged version-at-land bump pull requests.
+
+    A bump covers every change on main up to its own merge (its body says so):
+    version-at-land decided which surfaces move. A change it covers is
+    released; when that bump moved the CLI version, ``untagged_bumps`` still
+    requires the tag, and a plugin-only bump needs none (the plugin ships
+    from git). So a merge in a bump's history is not "merged but unreleased".
+    """
+    return [p["merge_commit_sha"] for p in pulls
+            if p.get("merged_at") and p.get("merge_commit_sha")
+            and (p.get("head") or {}).get("ref") == BUMP_BRANCH]
 
 
 def untagged_bumps(bumps: list[dict], now: datetime, grace_minutes: float) -> list[dict]:
@@ -518,11 +534,14 @@ def run_cadence(args: argparse.Namespace, now: datetime) -> int:
     pulls = json.loads(gh("api", f"repos/{args.repo}/pulls?state=closed&base=main"
                                  "&sort=updated&direction=desc&per_page=100"))
     merged = [p for p in pulls if p.get("merged_at") and _parse(p["merged_at"]) >= since]
+    bump_merges = landed_bumps(pulls)
     untagged = set()
     for pr in merged:
         sha = pr.get("merge_commit_sha") or ""
         if (sha and git("merge-base", "--is-ancestor", sha, "origin/main").returncode == 0
-                and not git("tag", "--contains", sha, "--list", "v*").stdout.strip()):
+                and not git("tag", "--contains", sha, "--list", "v*").stdout.strip()
+                and not any(git("merge-base", "--is-ancestor", sha, bump).returncode == 0
+                            for bump in bump_merges)):
             untagged.add(sha)
     owner = args.repo.split("/", 1)[0]
     bump_prs = json.loads(gh("api", f"repos/{args.repo}/pulls?state=open&base=main"

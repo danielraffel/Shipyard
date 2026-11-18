@@ -34,8 +34,12 @@ Layer 3 checks two invariants with the default token and no release
 credentials. It still runs when the release workflows or their token are broken:
 
 - A `feat:` or `fix:` pull request merged to `main` more than two hours ago
-  has its merge commit in a `v*` tag, unless a `release/version-at-land` pull
-  request is open. An open bump pull request is waiting on review, not stalled.
+  has its merge commit in a `v*` tag or in the history of a merged
+  `release/version-at-land` pull request, unless a bump pull request is open.
+  The bump is version-at-land's decision: a plugin-only bump is the release
+  (the plugin ships from git) and needs no tag, and a bump that moved the CLI
+  must still be tagged (the next invariant). An open bump pull request is
+  waiting on review, not stalled.
 - A `Cargo.toml` version move on `main` is in a `v*` tag within 30 minutes.
 
 Layer 4 follows the `Cargo.toml` version on `main` to a release a user can
