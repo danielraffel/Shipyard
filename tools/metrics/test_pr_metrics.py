@@ -506,6 +506,9 @@ class MalformedJobTiming(Base):
     RUN = {"id": 11, "head_sha": f"h{1:040d}"[:40], "event": "pull_request", "status": "completed",
            "conclusion": "success", "head_branch": "feat"}
 
+    def build_row(self, gh):
+        return self.build(gh)["repos"][REPO]["prs"][0]
+
     def run_one(self, job):
         p = pr(1, T(10, "09:00"), T(10, "11:00"))
         out = self.build(world([p], runs=[self.RUN], jobs={11: [job]}))
@@ -542,6 +545,42 @@ class MalformedJobTiming(Base):
         row = out["repos"][REPO]["prs"][0]
         self.assertEqual((row["path"], row["path_why"], row["compute"]["complete"], row["compute"]["self_hosted_min"]),
                          ("slow", ["red"], False, None))
+
+    def test_a_rerun_after_the_merge_does_not_make_a_pr_red(self):
+        p = pr(1, T(10, "09:00"), T(10, "11:00"))
+        run = dict(self.RUN, conclusion="failure", updated_at=T(10, "12:30"))
+        job = {"labels": ["self-hosted"], "created_at": T(10, "10:00"), "started_at": T(10, "10:01"),
+               "completed_at": T(10, "10:21"), "conclusion": "failure"}
+        row = self.build_row(world([p], runs=[run], jobs={11: [job]}))
+        self.assertEqual((row["path"], row["compute"]["red_events"]), ("clean", []))
+        late = dict(run, run_attempt=2)
+        row = self.build_row(world([p], runs=[late], jobs={11: [job]}))
+        self.assertEqual((row["path"], row["compute"]["complete"]), (None, False))
+
+    def test_a_failure_before_the_merge_still_counts_beside_a_later_rerun(self):
+        p = pr(1, T(10, "09:00"), T(10, "11:00"))
+        run = dict(self.RUN, conclusion="failure", updated_at=T(10, "10:12"))
+        job = {"labels": ["self-hosted"], "created_at": T(10, "10:00"), "started_at": T(10, "10:01"),
+               "completed_at": T(10, "10:21"), "conclusion": "failure"}
+        row = self.build_row(world([p], runs=[run], jobs={11: [job]}))
+        self.assertEqual((row["path"], row["path_why"]), ("slow", ["red"]))
+
+    def test_a_rerun_counts_only_its_latest_attempts_jobs(self):
+        run = dict(self.RUN, run_attempt=2)
+        old = {"labels": ["self-hosted"], "run_attempt": 1, "created_at": T(10, "10:00"),
+               "started_at": T(10, "10:10"), "completed_at": T(10, "10:50"), "conclusion": "failure"}
+        new = {"labels": ["self-hosted"], "run_attempt": 2, "created_at": T(10, "10:55"),
+               "started_at": T(10, "10:56"), "completed_at": T(10, "11:06"), "conclusion": "success"}
+        rd = pm.Reader(REPO, self.cache, 50, lambda path: {"jobs": [old, new]})
+        self.assertEqual(pm.job_minutes(rd, run), (10.0, 0.0, 0.0, 1.0, True))
+
+    def test_a_job_cache_entry_that_summed_every_attempt_is_read_again(self):
+        run = dict(self.RUN, run_attempt=2)
+        new = {"labels": ["self-hosted"], "run_attempt": 2, "created_at": T(10, "10:55"),
+               "started_at": T(10, "10:56"), "completed_at": T(10, "11:06"), "conclusion": "success"}
+        rd = pm.Reader(REPO, self.cache, 50, lambda path: {"jobs": [new]})
+        rd.save("jobs", "11", {"self_hosted": 99.0, "hosted": 0.0, "macos": 0.0, "wait": 9.0, "attempt": 2, "timing_complete": True})
+        self.assertEqual(pm.job_minutes(rd, run)[0], 10.0)
 
     def test_a_failed_run_stays_slow_when_the_jobs_request_errors(self):
         p = pr(1, T(10, "09:00"), T(10, "11:00"))
