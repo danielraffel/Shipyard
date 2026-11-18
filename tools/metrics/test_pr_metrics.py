@@ -417,6 +417,17 @@ class MainRed(unittest.TestCase):
         e = eps[0]
         self.assertEqual((e["fixer_pr"], e["minutes_to_green"], e["end_unknown"]), (None, None, True))  # c did not fix it: b says nothing about T
 
+    def test_an_episode_with_one_stuck_context_gets_no_fixer_when_the_others_turn_green(self):
+        eps, _ = self.run_eps([("base", self.st(green=["T", "U"])), ("a", self.st(red=["T", "U"])), ("b", self.st(red=["U"], stuck=["T"])), ("c", self.st(green=["T", "U"]))],
+                              {"a": 1, "b": 2, "c": 3})
+        e = eps[0]
+        self.assertEqual((e["fixer_pr"], e["minutes_to_green"], e["end_unknown"]), (None, None, True))
+
+    def test_the_push_after_a_stuck_context_is_not_attributable(self):
+        chron = [(x, T(10, f"10:0{i}")) for i, x in enumerate("abc")]
+        states = {"a": self.st(green=["T"]), "b": self.st(stuck=["T"]), "c": self.st(green=["T"])}
+        self.assertEqual(pm.attributable_pushes(chron, states), {"b"})
+
     def test_a_red_push_right_after_an_unsettled_one_has_no_pr(self):
         eps, skipped = self.run_eps([("base", self.st(green=["T"])), ("a", self.st(red=["T"], settled=False)), ("b", self.st(red=["T"])), ("c", self.st(green=["T"]))],
                                     {"a": 1, "b": 2, "c": 3})

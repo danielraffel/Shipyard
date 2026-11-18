@@ -960,7 +960,7 @@ def main_red_episodes(chron, states, pr_by_sha):
         for c in sorted(set(open_ctx) & green):
             ep = open_ctx.pop(c)
             ep["open"].discard(c)
-            if not ep["open"]:
+            if not ep["open"] and not ep.get("end_unknown"):  # a context that went unobservable keeps the end and the duration unknown
                 ep["end"], ep["fixer_pr"], ep["fixer_sha"] = ts, pr_by_sha.get(sha), sha
                 ep["minutes_to_green"] = round((iso(ts) - iso(ep["start"])).total_seconds() / 60.0, 1)
         first, prev_settled = False, not stuck
@@ -1024,7 +1024,7 @@ def attributable_pushes(chron, states):
         ok = bool(st and st.get("settled"))
         if ok and prev:
             out.add(sha)
-        prev = ok
+        prev = ok and not (st.get("stuck") or [])  # a stuck context leaves the next push without a baseline, as in main_red_episodes
     return out
 
 
