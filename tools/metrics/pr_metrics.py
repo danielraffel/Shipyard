@@ -562,23 +562,28 @@ def row_attribution(f):
 # --------------------------------------------------------------- compute
 def job_minutes(rd, run):
     """(self_hosted_min, hosted_min, macos_min, runner_wait_min, complete) for one run, read once ever when it has completed.
-    macos_min is the part of the minutes on jobs whose labels name macOS, whoever hosts them. runner_wait_min is the
-    time its jobs sat queued for a runner (`started_at` minus `created_at`)."""
+    Every non-skipped job must have created, started and completed timestamps; malformed timing leaves the run incomplete
+    and is not cached. macos_min is the part of the minutes on jobs whose labels name macOS, whoever hosts them.
+    runner_wait_min is the time its jobs sat queued for a runner (`started_at` minus `created_at`)."""
     rid = run["id"]
     attempt = int(run.get("run_attempt") or 1)
     cached = rd.load("jobs", str(rid))
     # an entry is for one attempt of one run: a rerun keeps the run id, so a different attempt is read again
-    if cached and "macos" in cached and "wait" in cached and cached.get("attempt") == attempt:
+    if (cached and "macos" in cached and "wait" in cached and cached.get("attempt") == attempt
+            and cached.get("timing_complete") is True):
         return cached["self_hosted"], cached["hosted"], cached["macos"], cached["wait"], True
     jobs, full = rd.pages(f"actions/runs/{rid}/jobs?filter=all", key="jobs", max_pages=3)
     sh = ho = mac = wait = 0.0
+    timing_complete = True
     for j in jobs:
         a, b = iso(j.get("started_at")), iso(j.get("completed_at"))
-        if not a or not b or j.get("conclusion") == "skipped":
+        if j.get("conclusion") == "skipped":
             continue
         q = iso(j.get("created_at"))
-        if q:
-            wait += max(0.0, (a - q).total_seconds() / 60.0)
+        if not a or not b or not q:
+            timing_complete = False
+            continue
+        wait += max(0.0, (a - q).total_seconds() / 60.0)
         m = max(0.0, (b - a).total_seconds() / 60.0)
         if "self-hosted" in (j.get("labels") or []):
             sh += m
@@ -586,10 +591,12 @@ def job_minutes(rd, run):
             ho += m
         if any("macos" in str(l).lower() for l in j.get("labels") or []):
             mac += m
-    done = run.get("status") == "completed" and full
-    if done:
-        rd.save("jobs", str(rid), {"self_hosted": round(sh, 2), "hosted": round(ho, 2), "macos": round(mac, 2), "wait": round(wait, 2), "attempt": attempt})
-    return round(sh, 2), round(ho, 2), round(mac, 2), round(wait, 2), done
+    done = run.get("status") == "completed" and full and timing_complete
+    if not done:
+        return None, None, None, None, False
+    rd.save("jobs", str(rid), {"self_hosted": round(sh, 2), "hosted": round(ho, 2), "macos": round(mac, 2), "wait": round(wait, 2), "attempt": attempt,
+                                "timing_complete": True})
+    return round(sh, 2), round(ho, 2), round(mac, 2), round(wait, 2), True
 
 
 RUNS_SLICE_LIMIT = 900  # the Actions API serves at most 1000 runs for one `created` range: a busier range is split in halves
@@ -650,14 +657,20 @@ def _wait_until_next(starts, nexts, merged):
     return round(total, 1)
 
 
+def outcomes_known(comp):
+    """True when every run's outcome and the head list were read, whether or not the job timings were. Entries cached
+    before `outcomes_complete` existed were only saved complete, so they fall back to `complete`."""
+    return bool(comp.get("outcomes_complete", comp.get("complete")))
+
+
 def path_of(f, comp):
     """clean, slow or None (unknown) for a merged PR, and why. Slow: any HOLD, red run on a head, ejection from the
-    queue, or DIRTY. A red run is only known from a complete compute read, so a PR with no other cause and an unread
-    compute is unknown, not clean."""
+    queue, or DIRTY. A red run is only known from a read of the run list and heads in full, so a PR with no other cause
+    and an unread compute is unknown, not clean."""
     why = []
     if f["holds"]:
         why.append("hold")
-    if comp and comp.get("complete") and comp.get("red_events"):
+    if comp and outcomes_known(comp) and comp.get("red_events"):  # a red run is an outcome: job timing, a jobs read or another run's rerun history cannot hide it
         why.append("red")
     if f["ejections"]:
         why.append("ejection")
@@ -676,13 +689,14 @@ def cause_minutes(f, comp):
     if not m or not reads_complete(f):  # a partial timeline or commit list omits holds, pushes and queue events: no number, not an undercount
         return None
     done = comp and comp.get("complete")
+    outcomes = comp and outcomes_known(comp)
     push_times = f.get("push_times") or []
     hold_times = f.get("hold_times") or []
     red_events = comp.get("red_events") or [] if comp else []
     hold = None if hold_times and not push_times else _wait_until_next(hold_times, push_times, m)
     red = None if red_events and not push_times else _wait_until_next(red_events, push_times, m)
     return {"hold": hold,
-            "red": None if comp and comp.get("red_partial") else red if done else None,  # None: an earlier failed attempt is not in the list
+            "red": None if comp and comp.get("red_partial") else red if outcomes else None,  # None: an earlier failed attempt is not in the list
             "queue": _wait_until_next(f.get("enqueue_times") or [], f.get("dequeue_times") or [], m),
             "runner": comp.get("runner_wait_min") if done else None, "dirty": None}  # None when the jobs were not read
 
@@ -766,15 +780,24 @@ def pr_compute(rd, f, runs, runs_complete):
         seen[k] = True
     sh = ho = 0.0
     complete = runs_complete and reads_complete(f)  # the heads come from the timeline and the commits
+    outcomes_complete = complete  # as `complete`, but job timing and job reads do not count: run outcomes are in the run list
     mac = wait = 0.0
+    timing_complete = True
     by_wf, red_events, red_partial = {}, [], False
     for r in mine.values():
         # skipping the jobs reads must not hide an unfinished run: its outcome is still unknown, so the PR is not clean
-        a, b, m, w, ok = job_minutes(rd, r) if READ_JOB_MINUTES else (0.0, 0.0, 0.0, 0.0, r.get("status") == "completed")
-        sh += a
-        ho += b
-        mac += m
-        wait += w
+        try:
+            a, b, m, w, ok = job_minutes(rd, r) if READ_JOB_MINUTES else (0.0, 0.0, 0.0, 0.0, r.get("status") == "completed")
+        except ReadError:  # a failed jobs read withholds this run's minutes; its outcome is in the run list
+            a = b = m = w = 0.0
+            ok = False
+        if ok:
+            sh += a
+            ho += b
+            mac += m
+            wait += w
+        else:
+            timing_complete = False
         # The Actions run list exposes only the latest conclusion for a rerun. A successful latest attempt
         # does not establish that an earlier attempt was also successful, so leave the path unknown unless
         # the latest attempt itself is red (which is independently sufficient to classify the PR as slow).
@@ -784,6 +807,7 @@ def pr_compute(rd, f, runs, runs_complete):
             attempt = 1
         attempts_known = attempt <= 1 or r.get("conclusion") in BAD_CONCLUSIONS
         complete = complete and ok and attempts_known
+        outcomes_complete = outcomes_complete and r.get("status") == "completed"  # a rerun's history only blocks a clean verdict (`complete`)
         if (r.get("head_sha") in heads and r.get("event") != "merge_group"
                 and r.get("conclusion") in BAD_CONCLUSIONS and r.get("updated_at")):
             red_events.append(r["updated_at"])  # any failed non-merge-group run on one of the PR's heads
@@ -791,11 +815,13 @@ def pr_compute(rd, f, runs, runs_complete):
         level = by_wf.setdefault(r.get("name") or "?", {"pull_request": 0, "merge_group": 0, "push": 0, "other": 0})
         ev = r.get("event")
         level[ev if ev in ("merge_group", "push") else "pull_request" if ev in ("pull_request", "pull_request_target") else "other"] += 1
-    j = READ_JOB_MINUTES  # job-derived numbers are None, never a measured zero, when the jobs were not read
-    return {"self_hosted_min": round(sh, 1) if j else None, "hosted_min": round(ho, 1) if j else None, "macos_min": round(mac, 1) if j else None,
-            "runner_wait_min": round(wait, 1) if j else None, "jobs_read": j, "red_events": sorted(red_events), "by_workflow": by_wf,
+    j = READ_JOB_MINUTES  # job-derived numbers are None, never a measured zero, when jobs were not read or timing was incomplete
+    measured = j and timing_complete
+    return {"self_hosted_min": round(sh, 1) if measured else None, "hosted_min": round(ho, 1) if measured else None, "macos_min": round(mac, 1) if measured else None,
+            "runner_wait_min": round(wait, 1) if measured else None, "jobs_read": j, "red_events": sorted(red_events), "by_workflow": by_wf,
             "runs": len(mine), "repeat_runs": repeats, "red_partial": red_partial, "run_fp": {str(i): run_fingerprint(r) for i, r in mine.items()},
-            "group_runs": sum(1 for r in mine.values() if r.get("event") == "merge_group"), "complete": complete}
+            "group_runs": sum(1 for r in mine.values() if r.get("event") == "merge_group"), "complete": complete,
+            "outcomes_complete": outcomes_complete}
 
 
 # ----------------------------------------------------------- correctness
