@@ -795,6 +795,75 @@ class MainRedReads(Base):
         self.assertIn(f"- {REPO}: not tracked: noisy gates review-verdict; 2 one-off contexts", pm.markdown(out))
 
 
+class EjectionCause(Base):
+    REMOVE = {"event": "removed_from_merge_queue", "actor": {"login": "x"}, "created_at": T(10, "10:30")}
+
+    def gql(self, nodes):
+        return (r"graphql:", {"data": {"repository": {"pullRequest": {"timelineItems": {"nodes": nodes}}}}})
+
+    def world_with(self, nodes, route=True):
+        gh = world([pr(1, T(10, "10:00"), T(10, "11:00"))], {1: [dict(self.REMOVE)]})
+        if route:
+            gh.routes.append(self.gql(nodes))
+        return gh
+
+    def test_the_cause_comes_from_graphql_when_the_rest_timeline_names_none(self):
+        out = self.build(self.world_with([{"createdAt": T(10, "10:30"), "reason": "CI_FAILURE"}]))
+        r = self.rows(out)[1]
+        self.assertEqual(r["ejections"], ["ci_failure"])
+        q = out["repos"][REPO]["per_day"]["2026-11-10"]["merge_queue"]
+        self.assertEqual((q["ejections_by_cause"], q["top_ejection_cause"], q["ejections_cause_unknown"], q["ejections_per_merge"]), ({"ci_failure": 1}, "ci_failure", 0, 1.0))
+
+    def test_a_removal_that_graphql_says_was_the_merge_is_not_an_ejection(self):
+        out = self.build(self.world_with([{"createdAt": T(10, "10:30"), "reason": "MERGED"}]))
+        self.assertEqual(self.rows(out)[1]["ejections"], [])
+
+    def test_an_unreadable_cause_stays_unknown_and_the_pr_is_read_again(self):
+        gh = self.world_with([], route=False)
+        out = self.build(gh)
+        self.assertEqual(self.rows(out)[1]["ejections"], ["unknown"])
+        self.assertEqual(out["repos"][REPO]["per_day"]["2026-11-10"]["merge_queue"]["ejections_cause_unknown"], 1)
+        self.assertFalse(os.path.exists(os.path.join(self.cache, REPO.replace("/", "__"), "facts", "1.json")))  # not cached with an unknown cause
+
+    def test_a_cause_that_is_read_is_cached_and_one_cause_is_matched_to_its_own_removal(self):
+        tl = {1: [dict(self.REMOVE), dict(self.REMOVE, created_at=T(10, "10:45"))]}
+        gh = world([pr(1, T(10, "10:00"), T(10, "11:00"))], tl)
+        gh.routes.append(self.gql([{"createdAt": T(10, "10:30"), "reason": "MERGE_CONFLICT"}, {"createdAt": T(10, "10:45"), "reason": "MANUAL"}]))
+        out = self.build(gh)
+        self.assertEqual(self.rows(out)[1]["ejections"], ["merge_conflict", "manual"])
+        self.assertTrue(os.path.exists(os.path.join(self.cache, REPO.replace("/", "__"), "facts", "1.json")))
+
+    def test_a_rest_reason_is_kept_and_costs_no_graphql_read(self):
+        gh = world([pr(1, T(10, "10:00"), T(10, "11:00"))], {1: [dict(self.REMOVE, reason="failed_checks")]})
+        out = self.build(gh)
+        self.assertEqual(self.rows(out)[1]["ejections"], ["failed_checks"])
+        self.assertFalse([c for c in gh.calls if c.startswith("graphql:")])
+
+    def test_a_removal_graphql_gives_no_reason_stays_unknown_and_is_read_again(self):
+        out = self.build(self.world_with([{"createdAt": T(10, "10:30"), "reason": None}]))
+        self.assertEqual(self.rows(out)[1]["ejections"], ["unknown"])
+        self.assertFalse(os.path.exists(os.path.join(self.cache, REPO.replace("/", "__"), "facts", "1.json")))
+
+    def test_facts_cached_before_causes_were_read_are_read_again(self):
+        d = os.path.join(self.cache, REPO.replace("/", "__"), "facts")
+        os.makedirs(d)
+        gh = self.world_with([{"createdAt": T(10, "10:30"), "reason": "CI_FAILURE"}])
+        self.build(gh)
+        path = os.path.join(d, "1.json")
+        old = json.load(open(path))
+        old.update(v=11, ejections=["unknown"])
+        old.pop("ejection_causes_known", None)
+        json.dump(old, open(path, "w"))
+        out = self.build(self.world_with([{"createdAt": T(10, "10:30"), "reason": "CI_FAILURE"}]))
+        self.assertEqual(self.rows(out)[1]["ejections"], ["ci_failure"])
+
+    def test_the_report_prints_the_ejection_table(self):
+        out = self.build(self.world_with([{"createdAt": T(10, "10:30"), "reason": "CI_FAILURE"}]))
+        md = pm.markdown(out)
+        self.assertIn("### Merge-queue ejections (window, ready PRs)", md)
+        self.assertIn(f"| {REPO} | 1 | 1 | 1.0 | ci_failure | ci_failure 1 | 0 |", md)
+
+
 class RerunCache(Base):
     HEAD = f"h{1:040d}"[:40]
     JOB = [{"labels": ["self-hosted", "macOS"], "created_at": T(10, "10:00"), "started_at": T(10, "10:01"), "completed_at": T(10, "10:21"), "conclusion": "success"}]
@@ -2142,7 +2211,7 @@ class SyntheticControl(unittest.TestCase):
         out = pm.build([REPO], tempfile.mkdtemp(), 50, OWNER, START, NOW, {}, {}, None, world([pr(1, T(10, "10:00"), T(10, "11:00"))]))
         self.assertEqual(out["synthetic_control"]["status"], "pass")
         md = pm.markdown(out)
-        self.assertIn("**CONTROL PASS: 61 of 61", md)
+        self.assertIn("**CONTROL PASS: 63 of 63", md)
         self.assertIn("| ready day |", md)
 
     def test_a_repo_with_no_live_control_reads_synthetic_not_unchecked(self):
