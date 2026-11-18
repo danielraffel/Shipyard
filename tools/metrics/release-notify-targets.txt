@@ -1,0 +1,11 @@
+# Who tools/metrics/release_notify.py messages about an open release-blocked
+# issue. A host file at ~/.config/shipyard/release-notify-targets replaces this
+# one. Format: <host> <cmux target> [<cmux socket>]; host `local` is the host
+# running the steward tick (m3), any other host is reached over ssh.
+# Use a stable id (the session's surface or agent UUID), never `surface:N`:
+# those refs change after a reboot.
+#
+# The m3 orchestrator.
+local 654D7FD3-5762-47E1-9E06-3E6ED569FB76 /tmp/cmux-nightly.sock
+# The Shipyard lead on m5s.
+m5s A90D2C0A-A0E4-4045-9242-42F522E78E95 /tmp/cmux-nightly.sock

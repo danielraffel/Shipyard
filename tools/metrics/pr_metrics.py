@@ -59,7 +59,7 @@ ESCAPE_WINDOW = dt.timedelta(days=14)
 HORIZON = dt.timedelta(hours=48)
 MIN_SAMPLE = 50
 UNKNOWN_RANGE_SHARE = 0.20
-SCORECARD_VERSION = "2026-11-18.7"  # .2: correctness reads the first-parent next push and the newest run by id; main-red episodes. .3: ejection causes from GraphQL
+SCORECARD_VERSION = "2026-11-18.10"  # .2: correctness reads the first-parent next push and the newest run by id; main-red episodes. .3: ejection causes from GraphQL
 MERGE_MAIN_RE = re.compile(r"^Merge (remote-tracking )?branch '?(origin/)?(main|master)'?|^Merge pull request .* from .*/main", re.I)
 # Positive controls: a real revert (#124 reverted #119), a real escaped defect (#126 names #116).
 # Pulp: two escapes verified by hand from main-red traces. #12219 landed red on Workflow lint and
@@ -1186,13 +1186,16 @@ def pr_correct(rd, f, base_commits, commits_ok, required, ticks, now, later=None
         out["base_red"] = True
         out["base_red_source"] = "ticks"
     elif required and f.get("merge_commit_sha"):
+        # Red is established only by a complete, settled read of a commit (every page read, every run finished): a partial or
+        # pending read can miss a rerun that turned the context green, or show a run that is still going to change. Anything
+        # else is unknown, which the correctness rate leaves out.
         red, settled = commit_red(rd, f["merge_commit_sha"], required)
-        if nxt and not red:
-            red2, settled2 = commit_red(rd, nxt["sha"], required)
-            red, settled = red | red2, settled and settled2
-        if red:
+        reads = [(red, settled)]
+        if nxt and not (red and settled):
+            reads.append(commit_red(rd, nxt["sha"], required))
+        if any(r and ok for r, ok in reads):
             out["base_red"], out["base_red_source"] = True, "check_runs"
-        elif settled:
+        elif all(ok for _, ok in reads):
             out["base_red"], out["base_red_source"] = False, "check_runs"
     if out["reverted"] or out["base_red"]:
         out["bad"] = True
