@@ -47,9 +47,9 @@ CASES = [
     {"n": 5, "name": "escaped", "delay": 75, "north": "autonomous", "escaped_by": 6},
     {"n": 6, "name": "later_fix", "delay": 120, "north": "autonomous", "title": "fix regression from #5"},
     {"n": 7, "name": "held_twice", "delay": 150, "north": "autonomous", "holds": 2, "re_holds": 1,
-     "pushes": {"author": 1, "repair": 1, "merge_main": 1}, "slow": True, "cause_min": {"hold": 20}},
+     "pushes": {"author": 1, "repair": 1, "merge_main": 1}, "slow": True, "cause_min": {"hold": None}},
     {"n": 8, "name": "queued_twice", "delay": 85, "north": "autonomous", "enqueues": 2, "ejections": ["ci_failure"], "enq_to_merge": 45, "slow": True, "cause_min": {"queue": 55}},
-    {"n": 9, "name": "compute", "delay": 95, "north": "autonomous", "runs": 4, "repeat_runs": 2, "macos_min": 10, "slow": True, "cause_min": {"red": 83, "runner": 8},
+    {"n": 9, "name": "compute", "delay": 95, "north": "autonomous", "runs": 4, "repeat_runs": 2, "macos_min": 10, "slow": True, "cause_min": {"red": None, "runner": 8},
      "workflows": {"ci": {"pull_request": 2, "merge_group": 1, "push": 1}}},
     {"n": 10, "name": "owner_label_a", "delay": 100, "north": "owner_action", "owner_actions": 1},
     {"n": 11, "name": "owner_label_b", "delay": 110, "north": "owner_action", "owner_actions": 1},
@@ -216,7 +216,11 @@ def expected():
         "paths.clean.median_min": round(statistics.median(c["delay"] for c in merged if not c.get("slow")), 1),
         "paths.slow.median_min": round(statistics.median(c["delay"] for c in slow), 1),
         "paths.slow.p90_min": sorted(c["delay"] for c in slow)[max(0, math.ceil(0.9 * len(slow)) - 1)],
-        **{f"paths.cause_min_per_merge.{k}": round(sum(c.get("cause_min", {}).get(k, 0) for c in slow) / len(merged), 2) for k in ("hold", "red", "queue", "runner")},
+        # A cause aggregate is valid only when every slow PR has a measured value. Missing
+        # values stay unknown instead of being treated as zero-minute contributions.
+        **{f"paths.cause_min_per_merge.{k}": (round(sum(c.get("cause_min", {}).get(k, 0) for c in slow) / len(merged), 2)
+                                              if slow and all(c.get("cause_min", {}).get(k, 0) is not None for c in slow) else None)
+           for k in ("hold", "red", "queue", "runner")},
         "change_failure.merged": len(merged), "change_failure.unknown": 0,
         "change_failure.prs_that_started_red": sum(1 for c in merged if c.get("base_red")),
         "change_failure.episodes": sum(1 for c in merged if c.get("base_red")), "change_failure.unresolved": 0,
@@ -262,8 +266,12 @@ def run(pr_metrics, tolerance=0.005):
     checks, failed = [], []
     for name, exp in want.items():
         got = None if got_summary is None else _dig(got_summary, name)
-        delta = None if got is None else round(float(got) - float(exp), 4)
-        ok = delta is not None and abs(delta) <= tolerance
+        if exp is None:
+            delta = 0.0 if got is None else None
+            ok = got is None
+        else:
+            delta = None if got is None else round(float(got) - float(exp), 4)
+            ok = delta is not None and abs(delta) <= tolerance
         checks.append({"name": name, "expected": exp, "got": got, "delta": delta})
         if not ok:
             failed.append(name)
