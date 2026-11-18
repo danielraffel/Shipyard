@@ -52,14 +52,14 @@ APP_LOGINS = {"shipyard-local[bot]", "shipyard-local"}
 _GUARD = []
 SIGNALS = ("app_opener", "provenance", "trailer", "session_stamp")
 BAD_CONCLUSIONS = {"failure", "timed_out"}
-FACTS_VERSION = 9
-COMPUTE_VERSION = 3  # compute caches: entries written before this could be marked complete from a partial timeline or commit read
+FACTS_VERSION = 13  # 13: untimed commit events after a HOLD are kept; push_times are observed head updates, never commit timestamps
+COMPUTE_VERSION = 7  # compute caches: entries written before this could be marked complete from a partial timeline or commit read or rerun history
 CHECKS_VERSION = 2  # derived correctness caches: entries written before this (incomplete pagination read as clean) are read again
 ESCAPE_WINDOW = dt.timedelta(days=14)
 HORIZON = dt.timedelta(hours=48)
 MIN_SAMPLE = 50
 UNKNOWN_RANGE_SHARE = 0.20
-SCORECARD_VERSION = "2026-11-17.1"
+SCORECARD_VERSION = "2026-11-18.2"
 MERGE_MAIN_RE = re.compile(r"^Merge (remote-tracking )?branch '?(origin/)?(main|master)'?|^Merge pull request .* from .*/main", re.I)
 # Positive controls: a real revert (#124 reverted #119), a real escaped defect (#126 names #116).
 # Pulp: two escapes verified by hand from main-red traces. #12219 landed red on Workflow lint and
@@ -230,6 +230,22 @@ def trust_policy(rd, base):
     return pol
 
 
+MERGE_REMOVAL_WINDOW = dt.timedelta(minutes=2)
+
+
+def ejection(e, merged):
+    """Whether a timeline event is a removal from the merge queue that is an ejection. The REST event names no reason, and GitHub
+    records a removal when a PR merges, so a removal within two minutes before the merge is the merge, not an ejection (the
+    rule the m3 fleet-metrics parser uses, applied only when no reason is given); one that says `merged` is the merge too, and a removal after the merge cannot be an
+    ejection of the merged PR."""
+    if e.get("event") not in ("removed_from_merge_queue", "dequeued") or (e.get("reason") or "unknown") in ("merged", "already_merged"):
+        return False
+    t, m = iso(e.get("created_at")), iso(merged)
+    if (e.get("reason") or "unknown") != "unknown":  # an explicit non-merge reason (failed_checks, ...) is an ejection wherever it falls before the merge
+        return not (t and m and t > m)
+    return not (t and m and m - t <= MERGE_REMOVAL_WINDOW)
+
+
 def steward_seq(pr, tl):
     """The events that bear on how a PR reached its merge, in the timeline's own order and up to the merge, with no
     dates involved: ["push", sha] (a commit or force-push that moved the head), ["enq", head-then] (an enqueue by the fleet
@@ -249,7 +265,7 @@ def steward_seq(pr, tl):
         if ev in ("committed", "head_ref_force_pushed"):
             cur = e.get("sha") if ev == "committed" else e.get("after_sha")
             seq.append(["push", cur])
-        elif ev in ("removed_from_merge_queue", "dequeued") and (e.get("reason") or "unknown") != "merged":
+        elif ejection(e, pr.get("merged_at")):
             seq.append(["remove"])
         elif ev in ("added_to_merge_queue", "enqueued") and login in APP_LOGINS:
             seq.append(["enq", cur])
@@ -340,10 +356,20 @@ def pr_facts(rd, pr, owner):
         ready = None if pr.get("draft") else created
     owner_events, agent_events, repairs, holds, ejections, enqueues = [], [], [], [], [], 0
     enqueue_times = []
+    observed_push_times = []
     stamp_commit = False
+    hold_untimed_push, untimed_commit_dates = False, []  # `committed` events carry no observation time: their git dates stand in only to place them
     for e in tl:
         ev, ts = e.get("event"), e.get("created_at") or e.get("submitted_at")
         body = e.get("body") or ""
+        if ev == "committed" and not ts:
+            hold_untimed_push = hold_untimed_push or bool(holds)  # a commit listed after a HOLD: when the head moved is unknown
+            cd = ((e.get("committer") or {}).get("date")) or ((e.get("author") or {}).get("date"))
+            untimed_commit_dates.append(fmt(iso(cd)) if iso(cd) else None)
+        if ev in ("committed", "head_ref_force_pushed") and ts and ready:
+            observed = iso(ts)
+            if observed and observed > ready:
+                observed_push_times.append(fmt(observed))
         if ev in ("commented", "reviewed") and ts:
             if REPAIRED_RE.search(body):
                 repairs.append(ts)
@@ -353,7 +379,7 @@ def pr_facts(rd, pr, owner):
             enqueues += 1
             if ts:
                 enqueue_times.append(ts)
-        if ev in ("removed_from_merge_queue", "dequeued") and (e.get("reason") or "unknown") != "merged":
+        if ejection(e, pr.get("merged_at")):
             ejections.append(e.get("reason") or "unknown")
         if ev not in ACTION_EVENTS:
             continue
@@ -364,6 +390,7 @@ def pr_facts(rd, pr, owner):
                 agent_events.append([ev, ts])
             else:
                 owner_events.append([ev, ts])
+    dequeue_times = [e.get("created_at") for e in tl if ejection(e, pr.get("merged_at")) and e.get("created_at")]
     heads = {pr["head"]["sha"]}
     for e in tl:
         if e.get("event") == "head_ref_force_pushed":
@@ -403,7 +430,8 @@ def pr_facts(rd, pr, owner):
         "opener": (pr.get("user") or {}).get("login"), "provenance": bool(PROVENANCE_RE.search(pr.get("body") or "")),
         "agent_trailer": trailer, "stamp_commit": stamp_commit, "ambiguous_commits": sorted(set(ambiguous)),
         "repair_cycles": len(repairs), "holds": len(holds), "re_holds": re_holds, "size": size,
-        "pushes": split, "enqueues": enqueues, "enqueue_times": enqueue_times, "ejections": ejections,
+        "pushes": split, "enqueues": enqueues, "enqueue_times": enqueue_times, "dequeue_times": dequeue_times,
+        "hold_times": sorted(holds), "hold_untimed_push": hold_untimed_push, "untimed_commit_dates": untimed_commit_dates, "push_times": sorted(set(observed_push_times)), "ejections": ejections,
         "labels": sorted(l["name"] for l in pr.get("labels") or []),
         "heads": sorted(heads), "timeline_complete": tl_full, "commits_complete": c_full,
     }
@@ -492,18 +520,35 @@ def row_attribution(f):
 
 # --------------------------------------------------------------- compute
 def job_minutes(rd, run):
-    """(self_hosted_min, hosted_min, macos_min, complete) for one run, read once ever when it has completed.
-    macos_min is the part of the minutes on jobs whose labels name macOS, whoever hosts them."""
+    """(self_hosted_min, hosted_min, macos_min, runner_wait_min, complete) for one run, read once ever when it has completed.
+    Every non-skipped job must have created, started and completed timestamps; malformed timing leaves the run incomplete
+    and is not cached. macos_min is the part of the minutes on jobs whose labels name macOS, whoever hosts them.
+    runner_wait_min is the time its jobs sat queued for a runner (`started_at` minus `created_at`)."""
     rid = run["id"]
+    attempt = int(run.get("run_attempt") or 1)
     cached = rd.load("jobs", str(rid))
-    if cached and "macos" in cached:  # an entry from before macOS minutes were kept is read again
-        return cached["self_hosted"], cached["hosted"], cached["macos"], True
+    # an entry is for one attempt of one run: a rerun keeps the run id, so a different attempt is read again
+    if (cached and "macos" in cached and "wait" in cached and cached.get("attempt") == attempt
+            and cached.get("timing_complete") is True and cached.get("latest_attempt_only") is True):
+        return cached["self_hosted"], cached["hosted"], cached["macos"], cached["wait"], True
     jobs, full = rd.pages(f"actions/runs/{rid}/jobs?filter=all", key="jobs", max_pages=3)
-    sh = ho = mac = 0.0
+    sh = ho = mac = wait = 0.0
+    timing_complete = True
     for j in jobs:
-        a, b = iso(j.get("started_at")), iso(j.get("completed_at"))
-        if not a or not b or j.get("conclusion") == "skipped":
+        try:
+            job_attempt = int(j.get("run_attempt") or attempt)
+        except (TypeError, ValueError):
+            job_attempt = attempt
+        if job_attempt != attempt:  # `filter=all` also lists the jobs of earlier attempts: this entry is for the latest one
             continue
+        a, b = iso(j.get("started_at")), iso(j.get("completed_at"))
+        if j.get("conclusion") == "skipped":
+            continue
+        q = iso(j.get("created_at"))
+        if not a or not b or not q:
+            timing_complete = False
+            continue
+        wait += max(0.0, (a - q).total_seconds() / 60.0)
         m = max(0.0, (b - a).total_seconds() / 60.0)
         if "self-hosted" in (j.get("labels") or []):
             sh += m
@@ -511,10 +556,12 @@ def job_minutes(rd, run):
             ho += m
         if any("macos" in str(l).lower() for l in j.get("labels") or []):
             mac += m
-    done = run.get("status") == "completed" and full
-    if done:
-        rd.save("jobs", str(rid), {"self_hosted": round(sh, 2), "hosted": round(ho, 2), "macos": round(mac, 2)})
-    return round(sh, 2), round(ho, 2), round(mac, 2), done
+    done = run.get("status") == "completed" and full and timing_complete
+    if not done:
+        return None, None, None, None, False
+    rd.save("jobs", str(rid), {"self_hosted": round(sh, 2), "hosted": round(ho, 2), "macos": round(mac, 2), "wait": round(wait, 2), "attempt": attempt,
+                                "timing_complete": True, "latest_attempt_only": True})
+    return round(sh, 2), round(ho, 2), round(mac, 2), round(wait, 2), True
 
 
 RUNS_SLICE_LIMIT = 900  # the Actions API serves at most 1000 runs for one `created` range: a busier range is split in halves
@@ -560,6 +607,70 @@ def push_repeats_of_group_shas(runs):
     return len(push), sum(1 for r in push if (r.get("name"), r.get("head_sha")) in group)
 
 
+CAUSES = ("hold", "red", "queue", "runner", "dirty")
+
+
+def _wait_until_next(starts, nexts, merged):
+    """Minutes from each start to the next `nexts` event after it, or to the merge when none follows."""
+    nexts = sorted(iso(x) for x in nexts if iso(x))
+    total = 0.0
+    for st in sorted(iso(x) for x in starts if iso(x)):
+        if st > merged:
+            continue
+        end = next((n for n in nexts if n > st), None)
+        total += ((min(end, merged) if end else merged) - st).total_seconds() / 60.0
+    return round(total, 1)
+
+
+def outcomes_known(comp):
+    """True when every run's outcome and the head list were read, whether or not the job timings were. Entries cached
+    before `outcomes_complete` existed were only saved complete, so they fall back to `complete`."""
+    return bool(comp.get("outcomes_complete", comp.get("complete")))
+
+
+def path_of(f, comp):
+    """clean, slow or None (unknown) for a merged PR, and why. Slow: any HOLD, red run on a head, ejection from the
+    queue, or DIRTY. A red run is only known from a read of the run list and heads in full, so a PR with no other cause
+    and an unread compute is unknown, not clean."""
+    why = []
+    if f["holds"]:
+        why.append("hold")
+    if comp and outcomes_known(comp) and comp.get("red_events"):  # a red run is an outcome: job timing, a jobs read or another run's rerun history cannot hide it
+        why.append("red")
+    if f["ejections"]:
+        why.append("ejection")
+    if f.get("dirty"):
+        why.append("dirty")
+    if why:
+        return "slow", why
+    return ("clean", []) if comp and comp.get("complete") else (None, [])
+
+
+def cause_minutes(f, comp):
+    """Minutes each cause held a merged PR up, or None where it is not measured. The causes overlap (a HOLD and a red run
+    can wait at once), so they are not additive. hold: from each HOLD to the next push; red: from a failed head run to the
+    next push; queue: from each enqueue to its removal or the merge; runner: queued job time; dirty: not measured."""
+    m = iso(f.get("merged_at"))
+    if not m or not reads_complete(f):  # a partial timeline or commit list omits holds, pushes and queue events: no number, not an undercount
+        return None
+    done = comp and comp.get("complete")
+    outcomes = comp and outcomes_known(comp)
+    push_times = f.get("push_times") or []
+    hold_times = f.get("hold_times") or []
+    red_events = comp.get("red_events") or [] if comp else []
+    # With the timeline and commits read in full, no commit or push event after a HOLD or failure means the PR was not
+    # pushed again: the interval runs to the merge. A commit event with no time that follows it moved the head at an
+    # unknown time, so the duration is unknown.
+    first_red = min((iso(x) for x in red_events if iso(x)), default=None)
+    red_untimed = bool(first_red) and any(d is None or iso(d) > first_red for d in f.get("untimed_commit_dates") or [])
+    hold = None if f.get("hold_untimed_push") else _wait_until_next(hold_times, push_times, m)
+    red = None if red_untimed else _wait_until_next(red_events, push_times, m)
+    return {"hold": hold,
+            "red": None if comp and comp.get("red_partial") else red if outcomes else None,  # None: an earlier failed attempt is not in the list
+            "queue": _wait_until_next(f.get("enqueue_times") or [], f.get("dequeue_times") or [], m),
+            "runner": comp.get("runner_wait_min") if done else None, "dirty": None}  # None when the jobs were not read
+
+
 def enqueue_to_merge(f):
     """Minutes from the last merge-queue enqueue before the merge to `merged_at`, or None (no enqueue, not merged)."""
     m = iso(f.get("merged_at"))
@@ -568,18 +679,40 @@ def enqueue_to_merge(f):
     return round((m - max(ts)).total_seconds() / 60.0, 1) if ts and m else None
 
 
-def load_compute(rd, number, f=None):
+def run_fingerprint(r):
+    return [int(r.get("run_attempt") or 1), r.get("updated_at")]
+
+
+def load_compute(rd, number, f=None, runs_by_id=None):
     """A cached compute reduction, or None when absent or written before COMPUTE_VERSION (recomputed). With `f`, an
-    entry is never complete while that PR's own timeline or commit read is incomplete (the heads came from them)."""
+    entry is never complete while that PR's own timeline or commit read is incomplete (the heads came from them). With
+    `runs_by_id` (the current run list) every run the entry was built from must still have the attempt and update time
+    it had: a rerun keeps its run id and can turn a cached success into a failure. Without the run list a cached entry
+    cannot be validated (the run list was not read, for example under the read cap): it is used as it stands, since the
+    alternative is to lose a settled result.  A run that appeared since the entry was written is a change too."""
+    if not READ_JOB_MINUTES:  # a cached entry carries job minutes this run is meant to leave empty
+        return None
     c = rd.load("compute", str(number))
     if c is None or c.get("v") != COMPUTE_VERSION or not c.get("complete"):
         return None
     if f is not None and not reads_complete(f):
         return None
+    if runs_by_id is not None and f is not None:
+        stored = c.get("run_fp") or {}
+        if {str(i) for i in pr_runs(f, list(runs_by_id.values()))} != set(stored):
+            return None  # a run appeared (or left the list) since the entry was written
+        for rid, fp in stored.items():
+            if run_fingerprint(runs_by_id[int(rid)]) != fp:
+                return None
     return c
 
 
-def pr_compute(rd, f, runs, runs_complete):
+READ_JOB_MINUTES = True  # False skips the per-run jobs reads (the bulk of the reads): runs, failed head runs and paths still work
+
+
+def pr_runs(f, runs):
+    """The runs that belong to a merged PR: those on one of its heads, its merge-group runs, and pushes to the base on a
+    merge-group sha (the queue fast-forwards the base to the group)."""
     heads = set(f["heads"])
     mg = re.compile(rf"^gh-readonly-queue/{re.escape(f['base'])}/pr-{f['number']}-")
     mine, group_shas = {}, set()
@@ -588,10 +721,16 @@ def pr_compute(rd, f, runs, runs_complete):
             mine[r["id"]] = r
             if r.get("event") == "merge_group":
                 group_shas.add(r.get("head_sha"))
-    # a push to the base on a sha a merge group already ran: the merge queue fast-forwards the base to the group
     for r in runs:
         if r["id"] not in mine and r.get("event") == "push" and r.get("head_sha") in group_shas:
             mine[r["id"]] = r
+    return mine
+
+
+def pr_compute(rd, f, runs, runs_complete):
+    heads = set(f["heads"])
+    merged = iso(f.get("merged_at"))
+    mine = pr_runs(f, runs)
     # a repeat is a run of a workflow on a sha that workflow already ran on (reruns, a push on a merge-group sha)
     seen, repeats = {}, 0
     for r in sorted(mine.values(), key=lambda x: (x.get("event") != "merge_group", x["id"])):
@@ -600,20 +739,55 @@ def pr_compute(rd, f, runs, runs_complete):
         seen[k] = True
     sh = ho = 0.0
     complete = runs_complete and reads_complete(f)  # the heads come from the timeline and the commits
-    mac = 0.0
-    by_wf = {}
+    outcomes_complete = complete  # as `complete`, but job timing and job reads do not count: run outcomes are in the run list
+    mac = wait = 0.0
+    timing_complete = True
+    by_wf, red_events, red_partial = {}, [], False
     for r in mine.values():
-        a, b, m, ok = job_minutes(rd, r)
-        sh += a
-        ho += b
-        mac += m
-        complete = complete and ok
+        # skipping the jobs reads must not hide an unfinished run: its outcome is still unknown, so the PR is not clean
+        try:
+            a, b, m, w, ok = job_minutes(rd, r) if READ_JOB_MINUTES else (0.0, 0.0, 0.0, 0.0, r.get("status") == "completed")
+        except ReadError:  # a failed jobs read withholds this run's minutes; its outcome is in the run list
+            a = b = m = w = 0.0
+            ok = False
+        if ok:
+            sh += a
+            ho += b
+            mac += m
+            started = iso(r.get("run_started_at") or r.get("created_at"))
+            post_merge = (r.get("event") == "push" and r.get("head_sha") not in heads) or bool(merged and started and started > merged)
+            if not post_merge:  # a push to the base on the merge-group sha, or a run begun after the merge, cannot have delayed it
+                wait += w
+        else:
+            timing_complete = False
+        # The Actions run list exposes only the latest conclusion for a rerun. A successful latest attempt
+        # does not establish that an earlier attempt was also successful, so leave the path unknown unless
+        # the latest attempt itself is red (which is independently sufficient to classify the PR as slow).
+        try:
+            attempt = int(r.get("run_attempt") or 1)
+        except (TypeError, ValueError):
+            attempt = 1
+        attempts_known = attempt <= 1 or r.get("conclusion") in BAD_CONCLUSIONS
+        complete = complete and ok and attempts_known
+        if attempt > 1:
+            red_partial = True  # the list shows only a rerun's latest attempt: an earlier failed attempt is not in red_events, and its waits are not in runner_wait
+        after_merge = bool(merged and iso(r.get("updated_at")) and iso(r.get("updated_at")) > merged)  # a rerun after the merge cannot have delayed it
+        if after_merge and attempt > 1:
+            complete = False  # the rerun replaced what the run showed at the merge: no clean verdict (a red found elsewhere still stands)
+        if (r.get("head_sha") in heads and r.get("event") != "merge_group" and not after_merge
+                and r.get("conclusion") in BAD_CONCLUSIONS and r.get("updated_at")):
+            red_events.append(r["updated_at"])  # any failed non-merge-group run on one of the PR's heads
         level = by_wf.setdefault(r.get("name") or "?", {"pull_request": 0, "merge_group": 0, "push": 0, "other": 0})
         ev = r.get("event")
         level[ev if ev in ("merge_group", "push") else "pull_request" if ev in ("pull_request", "pull_request_target") else "other"] += 1
-    return {"self_hosted_min": round(sh, 1), "hosted_min": round(ho, 1), "macos_min": round(mac, 1), "by_workflow": by_wf,
-            "runs": len(mine), "repeat_runs": repeats,
-            "group_runs": sum(1 for r in mine.values() if r.get("event") == "merge_group"), "complete": complete}
+    # runner_wait_min is None after a rerun: earlier attempts' waits are not in the jobs read
+    j = READ_JOB_MINUTES  # job-derived numbers are None, never a measured zero, when jobs were not read or timing was incomplete
+    measured = j and timing_complete
+    return {"self_hosted_min": round(sh, 1) if measured else None, "hosted_min": round(ho, 1) if measured else None, "macos_min": round(mac, 1) if measured else None,
+            "runner_wait_min": round(wait, 1) if measured and not red_partial else None, "jobs_read": j, "red_events": sorted(red_events), "by_workflow": by_wf,
+            "runs": len(mine), "repeat_runs": repeats, "red_partial": red_partial, "run_fp": {str(i): run_fingerprint(r) for i, r in mine.items()},
+            "group_runs": sum(1 for r in mine.values() if r.get("event") == "merge_group"), "complete": complete,
+            "outcomes_complete": outcomes_complete}
 
 
 # ----------------------------------------------------------- correctness
@@ -760,6 +934,37 @@ def bucket(size):
     return "unknown" if size is None else "<200" if size < 200 else "200-800" if size <= 800 else ">800"
 
 
+def path_summary(merged):
+    """Clean and slow paths over merged PRs: counts, lead-time medians and p90, the slow share, and the minutes per merged
+    PR each cause held the slow ones up. `unknown` PRs (no slow cause seen, compute not read in full) are in neither path."""
+    clean = [r for r in merged if r.get("path") == "clean"]
+    slow = [r for r in merged if r.get("path") == "slow"]
+    lead = lambda rs: [r["handoff_min"] for r in rs if r["handoff_min"] is not None]
+    causes = {}
+    for c in CAUSES:
+        vals = []
+        measured = True
+        for r in slow:
+            cm = r.get("cause_min")
+            if not cm or cm.get(c) is None:
+                measured = False
+                break
+            vals.append(cm[c])
+        # An unknown slow PR must not be treated as a zero-minute contribution. Withhold the
+        # aggregate until every slow PR has a measured value for this cause.
+        causes[c] = round(sum(vals) / len(merged), 2) if measured and vals and merged else None
+    known = {c: v for c, v in causes.items() if v is not None}
+    return {
+        "merged": len(merged), "unknown": len(merged) - len(clean) - len(slow),
+        "clean": {"n": len(clean), "median_min": med(lead(clean)), "p90_min": pctile(lead(clean), 0.9)},
+        "slow": {"n": len(slow), "median_min": med(lead(slow)), "p90_min": pctile(lead(slow), 0.9)},
+        "slow_share_pct": pct_of(len(slow), len(slow) + len(clean)),
+        "slow_reasons": dict(collections.Counter(w for r in slow for w in r["path_why"]).most_common()),
+        "cause_min_per_merge": causes, "top_cause": max(known, key=known.get) if known else None,
+        "note": "causes overlap and are not additive; dirty is not measured",
+    }
+
+
 def workflow_means(comp):
     """Per merged PR with a complete compute read: mean runs of each workflow at each level (the PR's own heads,
     its merge group, pushes to the base). `prs` is the denominator."""
@@ -805,6 +1010,7 @@ def summarize(rows):
     merged = [r for r in rows if r["merged"]]
     hand = [r["handoff_min"] for r in merged]
     comp = [r for r in merged if r["compute"] and r["compute"]["complete"]]
+    jobs_comp = [r for r in comp if r["compute"].get("jobs_read", True)]  # minutes come only from PRs whose jobs were read
     held = [r for r in rows if r["holds"]]
     rehold = [r for r in held if r["re_holds"]]
     by_size = {}
@@ -822,6 +1028,7 @@ def summarize(rows):
     attr = attribution_summary(rows)
     return {
         "ready_prs": n, "merged": len(merged),
+        "paths": path_summary(merged),
         "attribution": attr,
         "north_star": {
             "autonomous": auto, "owner_action": ns["owner_action"], "unknown": unk, "not_merged_in_48h": ns["not_merged"],
@@ -860,10 +1067,10 @@ def summarize(rows):
             "runs_mean": None if not comp else round(sum(r["compute"]["runs"] for r in comp) / len(comp), 2),
             "repeat_runs_total": sum(r["compute"]["repeat_runs"] for r in comp),
             "runs_total": sum(r["compute"]["runs"] for r in comp),
-            "context_self_hosted_min_median": med([r["compute"]["self_hosted_min"] for r in comp]),
-            "context_hosted_min_median": med([r["compute"]["hosted_min"] for r in comp]),
-            "macos_min_mean": None if not comp else round(sum(r["compute"]["macos_min"] for r in comp) / len(comp), 1),
-            "macos_min_median": med([r["compute"]["macos_min"] for r in comp]),
+            "context_self_hosted_min_median": med([r["compute"]["self_hosted_min"] for r in jobs_comp]),
+            "context_hosted_min_median": med([r["compute"]["hosted_min"] for r in jobs_comp]),
+            "macos_min_mean": None if not jobs_comp else round(sum(r["compute"]["macos_min"] for r in jobs_comp) / len(jobs_comp), 1),
+            "macos_min_median": med([r["compute"]["macos_min"] for r in jobs_comp]),
             "by_workflow": workflow_means(comp),
         },
         "correctness": {
@@ -929,13 +1136,13 @@ def collect_repo(repo, cache_dir, cap, owner, lo, hi, now, ticks, tick_ctx, fetc
         ok, why = eligible(f, managed_base)
         facts.append((f, ok, why))
     mrows = [f for f, ok, _ in facts if ok and f["merged_at"]]
-    need = [f for f in mrows if load_compute(rd, f["number"], f) is None]
     runs, runs_ok = [], False
-    if need:
+    if mrows:  # always read: a cached compute entry is validated against the current runs (a rerun changes a run in place)
         try:
-            runs, runs_ok = runs_index(rd, min(iso(f["created_at"]) for f in need), max(iso(f["merged_at"]) for f in need) + dt.timedelta(hours=1))
+            runs, runs_ok = runs_index(rd, min(iso(f["created_at"]) for f in mrows), max(iso(f["merged_at"]) for f in mrows) + dt.timedelta(hours=1))
         except (Truncated, ReadError):
             pass
+    runs_by_id = {r["id"]: r for r in runs} if runs_ok else None
     base_commits, commits_ok, req = [], False, None
     if mrows:
         try:
@@ -964,18 +1171,22 @@ def collect_repo(repo, cache_dir, cap, owner, lo, hi, now, ticks, tick_ctx, fetc
             "enqueue_to_merge_min": enqueue_to_merge(f),
             "owner_actions": sum(1 for ev, ts in effective_owner_events(f)[0]
                                  if not (ev == "merged" and f.get("merge_unverified")) and f["first_ready"] and iso(f["first_ready"]) <= iso(ts) <= iso(f["first_ready"]) + HORIZON),
-            "repair_cycles": f["repair_cycles"], "compute": None, "correct": None,
+            "repair_cycles": f["repair_cycles"], "compute": None, "correct": None, "path": None, "path_why": [], "cause_min": None,
         })
         if ok and merged:
-            comp = load_compute(rd, f["number"], f)
+            comp = load_compute(rd, f["number"], f, runs_by_id)
             if comp is None and runs_ok:
                 try:
                     comp = pr_compute(rd, f, runs, runs_ok)
-                    if comp["complete"]:
+                    if comp["complete"] and comp["jobs_read"]:  # minutes not read: do not cache, a full read recomputes
                         rd.save("compute", str(f["number"]), dict(comp, v=COMPUTE_VERSION))
                 except (Truncated, ReadError):
                     comp = None
             row["compute"] = comp
+            row["path"], row["path_why"] = path_of(dict(f, dirty=row["dirty"]), comp)
+            if runs_by_id is None and row["path"] == "clean":
+                row["path"] = None  # a cached success that could not be checked against the current runs (a rerun may have failed): unknown, not clean
+            row["cause_min"] = cause_minutes(f, comp)
             corr = rd.load("correct", str(f["number"]))
             if corr is not None and corr.get("v") != CHECKS_VERSION:
                 corr = None
@@ -1280,6 +1491,18 @@ def markdown(e2e):
                 lv = wf.get(n, {})
                 L.append(f"| {repo if i == 0 else ''} | {c['prs_read'] if i == 0 else ''} | {n or '-'} | "
                          f"{lv.get('pull_request', '-')} / {lv.get('merge_group', '-')} / {lv.get('push', '-')} | {tail if i == 0 else ''} |")
+        L.append("")
+    if e2e.get("window"):
+        L += ["### Clean and slow paths (window, merged PRs)", "",
+              "A merged PR is slow when it had any HOLD, a failed run on a head, an ejection from the queue or a DIRTY tick; clean when none, with compute read in full; "
+              "otherwise unknown (a failed run cannot be ruled out). Lead time is first ready to merge. Cause minutes are per merged PR over the slow PRs, overlap, "
+              "and are not additive; dirty is not measured.", "",
+              "| repo | merged | slow share | clean median (n) | slow median / p90 (n) | top cause | min per merge: hold / red / queue / runner | unknown path |", "|---|---|---|---|---|---|---|---|"]
+        for repo, s_ in sorted(e2e["window"]["per_repo"].items()):
+            p = s_["paths"]
+            cm = p["cause_min_per_merge"]
+            L.append(f"| {repo} | {p['merged']} | {p['slow_share_pct']}% | {p['clean']['median_min']} ({p['clean']['n']}) | {p['slow']['median_min']} / {p['slow']['p90_min']} ({p['slow']['n']}) | "
+                     f"{p['top_cause']} | {cm['hold']} / {cm['red']} / {cm['queue']} / {cm['runner']} | {p['unknown']} |")
         L.append("")
     nf = (e2e.get("baseline") or {}).get("noise_floor")
     if nf:

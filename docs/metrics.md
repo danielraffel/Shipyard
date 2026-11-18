@@ -1,6 +1,6 @@
 # Shipyard scorecard: end-to-end metrics per eligible PR
 
-Scorecard definition version: `2026-11-15.1` (`SCORECARD_VERSION` in `tools/metrics/pr_metrics.py`,
+Scorecard definition version: `2026-11-18.2` (`SCORECARD_VERSION` in `tools/metrics/pr_metrics.py`,
 printed in every report header). A change to any definition below bumps it, so a definition change
 cannot pose as an improvement. The daily loss report ([below](#daily-loss-report))
 counts blocked episodes; this scorecard measures outcomes per PR. `pr_metrics.py` computes it, and
@@ -38,7 +38,7 @@ it is on only when the tick passes `--e2e-cache DIR` (the daily run does, unless
 **Synthetic control (every report).** `tools/metrics/synthetic_control.py` holds fifteen invented PRs, each
 built to have one known outcome (autonomous, owner label, steward merge, unbound owner merge, unsigned owner
 PR, never merged, reverted, red base, escaped, twice held with repair and merge-main pushes, ejected from the
-queue, a gate-run fixture with repeats). `expected()` derives 38 numbers from that table with plain arithmetic
+queue, a gate-run fixture with repeats). `expected()` derives 49 numbers from that table with plain arithmetic
 and never calls the scorecard; the real `pr_metrics.build` then runs over the same PRs, served from memory (no
 GitHub read, a throwaway cache), and every number must match. The report prints one line, `CONTROL PASS` with the
 count and the largest delta, or `CONTROL FAIL` with each missed number, its expected value, its value and the delta.
@@ -77,6 +77,23 @@ the Actions API serves at most 1000 runs for one `created` range, so a busy rang
 compares six numbers measured by hand on 2026-11-15 (Vellum and Pulp ready-to-merge medians, Vellum PR-level and
 merge-group GPU proofs per merged PR, Pulp macOS minutes per merged PR, Vellum enqueue-to-merge median) with the
 scorecard's own values, within 15%. The synthetic control covers these fields too.
+
+## Clean and slow paths
+
+An ejection is a removal from the merge queue other than the merge itself. GitHub records a removal when a PR merges
+and the REST timeline names no reason, so a removal within two minutes before `merged_at` (or one that says
+`merged`) is the merge, not an ejection (the rule the m3 fleet-metrics parser uses). Without it every merged PR
+read as ejected and as slow.
+
+Each merged PR is `slow` when it had any HOLD, a failed run on one of its heads, an ejection from the merge queue
+or a DIRTY tick; `clean` when none of these and its compute was read in full; otherwise `unknown` (a failed run
+cannot be ruled out without the run list, and a successful rerun does not settle an earlier attempt), and unknown PRs are in neither path. The report gives the slow share
+(slow over slow plus clean), the clean median and the slow median and p90 lead time (first ready to merge), each
+with its n, and the minutes per merged PR that each cause held the slow PRs up: HOLD (each HOLD to the next push
+or the merge), red (each failed head run to the next observed head update or the merge), queue (each enqueue to its removal or the
+merge), runner (queued job time from the jobs' `created_at` to `started_at`) and DIRTY (not measured: the ticks
+record a state, not a duration, so its cell is empty and never zero). Push endpoints come from GitHub timeline head-update events, not commit timestamps. With the timeline and commits read in full, a HOLD or failed run that no commit or push event follows ran to the merge, so its interval ends at `merged_at`. A commit event has no observation time: one listed after a HOLD, or dated after a failed run (or with no date), means the head moved at an unknown time, so that cause is unknown. A cached compute entry records each run's attempt and update time and is used only when the current run list still matches (same runs, same attempts and update times; if the run list cannot be read the entry's numbers are kept but a clean verdict is reported unknown) (a rerun keeps its run id and can turn a success into a failure), and cached job minutes are per attempt. A run whose latest update is after the merge never counts as red (a rerun after the merge cannot have delayed it), and a rerun after the merge leaves the PR's earlier outcome unknown. Job minutes of a rerun are those of its latest attempt only. Runner wait counts only runs that can precede the merge (not pushes to the base on a merge-group sha). A failed run on a PR head classifies it slow even when job timing is missing or a jobs read fails (those withhold only the job minutes). Any run with an attempt above one, failed or successful, makes the red duration and the runner wait unknown, because the list and the jobs read show only the latest attempt and earlier failures and waits are missing; a failed one still classifies the PR slow. The causes overlap and are not additive. A cause aggregate is withheld when any slow PR lacks a measured value, so an unread value is never treated as zero. The per-run jobs reads are most of a compute read; a measurement run can set `pr_metrics.READ_JOB_MINUTES = False` to classify paths from the run list alone (the runner cause is then empty and nothing is cached).
+The top cause is the largest of the measured ones.
 
 ## Sample and comparison
 
@@ -151,3 +168,41 @@ stops answered. CI compute per episode and owner stops answered are always
 context in the JSON; no number in the summary is a duration.
 
 The four end-to-end per-merged-PR metrics (autonomous merge rate, handoff-to-merge time, compute, correctness) are the scorecard above.
+
+## Workflow cost report
+
+`tools/metrics/workflow_cost.py` answers, for one repository and window, where the runner time goes and how long
+jobs wait for it. It is read-only and nothing calls it; run it by hand or from a loop that wants a baseline.
+
+```
+python3 -I tools/metrics/workflow_cost.py --repo Generous-Corp/vellum --since 2026-11-11 --until 2026-11-17 \
+  --events push,merge_group,pull_request --workflow "Locked macOS GPU proof" \
+  --cache ~/.cache/shipyard-workflow-cost --json-out cost.json --md-out cost.md
+```
+
+Reads use the scorecard's `Reader` (`ghread` for Generous-Corp, `ghapp` otherwise), so they share its cache format
+and a hard cap on calls (`--read-cap`, default 8000). Runs are listed one UTC day at a time; a day whose search
+total is over the 1,000-result cap is split by time until each part fits. The jobs of a completed run are fetched
+with `filter=all` (every attempt) and cached; a cache entry that has not seen a run's latest attempt is read
+again. Day listings of days two or more days old are cached for 24 hours, then read again so a later re-run
+shows up. A second run over the same window reads almost nothing. `--workflow` limits the report to those
+workflows; the same-SHA and landing lookups still read every workflow's runs, so a filtered figure is the same
+number the unfiltered report gives that workflow.
+
+| Figure | Definition |
+| --- | --- |
+| Job minutes | `started_at` to `completed_at`. A skipped job, or one that never got a runner, is zero. A job is fleet when `self-hosted` is among its labels, grouped by the first label that is not generic (`macOS`, `ARM64`, `linux`, ...); otherwise hosted. |
+| Queue minutes | `created_at` to `started_at` of jobs that got a runner: median, p90 (linear interpolation) and sum, per workflow and event. |
+| Duplicate | A push run on `--branch` (default `main`) whose `head_sha` has a successful `merge_group` run of the same workflow path. The merge group is listed from one day before the window. |
+| Short-job wait | Per fleet label: jobs that ran under 3 minutes, their count and their queue hours, next to all fleet jobs and queue hours for that label. |
+| Never landed | Fleet minutes of completed `merge_group` runs whose `head_sha` is not the `head_sha` of any push to the branch. Pushes are listed for 7 days after the window (or until today), so "never" means not landed within that horizon; a run still in flight is counted separately and left out. Until the horizon has passed the figure is provisional and the report says `partial`. |
+
+`partial` is printed, with the reason, when a listing could not be read in full, a run's jobs were not read (read
+cap or error), the cap was reached or a run had not finished (its unfinished jobs count zero minutes). A partial row is never zero: it shows how many runs went unread. Re-run with
+the same `--cache` to finish the missing reads.
+
+Reproduced for 2026-11-11 to 2026-11-17 (full counts, no sampling): Pulp push is 4,518 runs, 70,515 hosted minutes
+and 0 fleet minutes; Vellum push is 1,096 runs, 2,952 fleet and 4,803 hosted minutes; Pulp merge-group `macos`
+is 7,881 fleet minutes, 2,080 of them in groups that never landed; Vellum pull-request `sterile-consumer` is 86.9
+queue hours over 2026-11-15 to 2026-11-17. The Vellum `Locked macOS GPU proof` read was partial for two runs that
+were still queued.
