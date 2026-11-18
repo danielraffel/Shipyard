@@ -1012,8 +1012,10 @@ relayed. The GitHub-writing acts ship in `shadow`: they are reported as
 **Approved but stuck** (`approved_stuck`). Beside the token states, every pass
 tracks each pull request the steward manages (the managed label or the
 `shipyard-local` App's own pull requests; an unmanaged one is not the
-steward's to merge, and the census does not read its checks) that is
-approved at its exact head (its newest
+steward's to merge, and the census does not read its checks; nor does it read
+the checks of a conflicting pull request without the managed label, which the
+`dirty` state already escalates to its author) that is approved at its exact
+head (its newest
 `review-verdict` check run or status is green, with no newer refusing status)
 with every
 required check green, and that the pass neither merged nor queued, whatever its
