@@ -1218,6 +1218,37 @@ fn an_advisory_entry_matching_no_check_is_reported_on_a_held_head() {
     );
 }
 
+/// A valid advisory entry does not let an unmatched entry bypass the hold.
+#[test]
+fn an_unmatched_advisory_entry_holds_even_when_another_advisory_is_red() {
+    let json = unstable_pr_json("SUCCESS", &[("zizmor (report only)", "FAILURE")]);
+    let mut pr = parse_pr(
+        &serde_json::from_str(&json).expect("PR json"),
+        &BTreeMap::new(),
+    )
+    .expect("PR")
+    .fact;
+    pr.checks.push(
+        crate::app::merge_steward_cmd::observation::parse_rest_check(
+            &serde_json::from_str(&rest_check_run(true)).expect("check run"),
+        )
+        .expect("check run"),
+    );
+    assert_eq!(
+        classify_pr(
+            &pr,
+            &unstable_policy(Some(&["zizmor (report only)", "renamed-check"])),
+            &BTreeMap::new()
+        ),
+        StewardDecision::WaitingRequired {
+            contexts: vec![
+                UNSTABLE_WAIT.to_owned(),
+                "unstable_advisory_checks entry matches no check: renamed-check".to_owned(),
+            ]
+        }
+    );
+}
+
 const UNSTABLE_WAIT: &str = "github-merge-state:CLEAN (current=UNSTABLE)";
 
 /// With the list known, a head GitHub still reports UNSTABLE after the clear,
@@ -1384,6 +1415,24 @@ fn a_commit_status_is_judged_on_its_newest_status_per_exact_context() {
     pr.checks
         .push(observed("scan", StatusContext, None, None, "SUCCESS", 11));
     assert_eq!(identity_classify(&pr, &zizmor), held_by("Scan"));
+}
+
+/// Equal-timestamp status observations are ambiguous; a tied non-green one
+/// must keep an UNSTABLE head held instead of letting a green row win.
+#[test]
+fn a_tied_commit_status_observation_holds_on_the_non_green_row() {
+    use crate::merge_steward::StewardCheckSource::StatusContext;
+    let mut pr = identity_base_pr();
+    let mut red = observed("scan", StatusContext, None, None, "FAILURE", 10);
+    red.check_id = None;
+    let mut green = observed("scan", StatusContext, None, None, "SUCCESS", 10);
+    green.check_id = None;
+    pr.checks.push(red);
+    pr.checks.push(green);
+    assert_eq!(
+        identity_classify(&pr, &["zizmor (report only)"]),
+        held_by("scan")
+    );
 }
 
 /// A check name with a newline or spaces stays one token in the mutation.

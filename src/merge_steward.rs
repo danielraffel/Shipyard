@@ -521,6 +521,7 @@ pub fn merge_state_wait(pr: &StewardPullRequest, policy: &StewardPolicy) -> Opti
             && advisory.iter().any(|entry| entry.trim() == name.trim())
     };
     let not_green = non_required_not_green(pr, policy);
+    let unmatched = advisory_unmatched(pr, policy);
     let mut holding = not_green
         .iter()
         .filter(|name| !is_advisory(name))
@@ -529,12 +530,12 @@ pub fn merge_state_wait(pr: &StewardPullRequest, policy: &StewardPolicy) -> Opti
     if not_green.is_empty() {
         holding.push(UNEXPLAINED_UNSTABLE.to_owned());
     }
-    if holding.is_empty() {
+    if holding.is_empty() && unmatched.is_empty() {
         return None;
     }
     wait.extend(holding);
     wait.extend(
-        advisory_unmatched(pr, policy)
+        unmatched
             .into_iter()
             .map(|entry| format!("{ADVISORY_UNMATCHED_PREFIX}{entry}")),
     );
@@ -563,6 +564,9 @@ pub fn advisory_unmatched(pr: &StewardPullRequest, policy: &StewardPolicy) -> Ve
     let mut unmatched = advisory
         .iter()
         .filter(|entry| {
+            if entry.trim().eq_ignore_ascii_case(STEWARD_RECOVERY_CONTEXT) {
+                return false;
+            }
             !pr.checks
                 .iter()
                 .any(|check| check.name.trim() == entry.trim())
@@ -1163,12 +1167,19 @@ pub(crate) fn selected_required_check<'a>(
 /// (mixed surfaces, or a missing id) falls back to the timestamp.
 pub(crate) fn cmp_recency(left: &StewardCheck, right: &StewardCheck) -> std::cmp::Ordering {
     let same_surface = left.source == right.source;
-    cmp_id_then_time(
+    let recency = cmp_id_then_time(
         left.check_id.filter(|_| same_surface),
         right.check_id.filter(|_| same_surface),
         &check_recency(left),
         &check_recency(right),
-    )
+    );
+    if recency != std::cmp::Ordering::Equal {
+        return recency;
+    }
+    // A status without an id can tie another status at timestamp precision.
+    // Keep any tied non-green observation as the selected one so a green row
+    // can never hide evidence that the context still holds the head.
+    check_is_green(right).cmp(&check_is_green(left))
 }
 
 /// The one recency rule: ids decide only when BOTH sides have one; a missing
