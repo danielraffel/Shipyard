@@ -37,6 +37,10 @@ def commit(sha, login="shipyard-local[bot]", msg="x", date=T(1, "00:00")):
             "commit": {"message": msg, "committer": {"date": date}}}
 
 
+def iso_dt(t):
+    return pm.iso(t)
+
+
 class Fake:
     """GitHub stand-in: routes are (regex, value); a missing route is a read error."""
 
@@ -357,8 +361,8 @@ class Paths(unittest.TestCase):
 
 
 class MainRed(unittest.TestCase):
-    def st(self, red=(), green=(), settled=True):
-        return {"settled": settled, "red": sorted(red), "green": sorted(green)}
+    def st(self, red=(), green=(), settled=True, stuck=()):
+        return {"settled": settled, "red": sorted(red), "green": sorted(green), "stuck": sorted(stuck)}
 
     def run_eps(self, seq, prs=None):
         """seq: [(sha, state)] oldest first; one minute apart from 10:00."""
@@ -407,6 +411,23 @@ class MainRed(unittest.TestCase):
         self.assertEqual([(e["pr"], e["fixer_pr"]) for e in eps], [(1, 2), (3, 4)])
 
 
+    def test_a_stuck_context_gaps_the_episode_instead_of_being_spanned(self):
+        eps, _ = self.run_eps([("base", self.st(green=["T"])), ("a", self.st(red=["T"])), ("b", self.st(stuck=["T"])), ("c", self.st(green=["T"]))],
+                              {"a": 1, "b": 2, "c": 3})
+        e = eps[0]
+        self.assertEqual((e["fixer_pr"], e["minutes_to_green"], e["end_unknown"]), (None, None, True))  # c did not fix it: b says nothing about T
+
+    def test_an_episode_with_one_stuck_context_gets_no_fixer_when_the_others_turn_green(self):
+        eps, _ = self.run_eps([("base", self.st(green=["T", "U"])), ("a", self.st(red=["T", "U"])), ("b", self.st(red=["U"], stuck=["T"])), ("c", self.st(green=["T", "U"]))],
+                              {"a": 1, "b": 2, "c": 3})
+        e = eps[0]
+        self.assertEqual((e["fixer_pr"], e["minutes_to_green"], e["end_unknown"]), (None, None, True))
+
+    def test_the_push_after_a_stuck_context_is_not_attributable(self):
+        chron = [(x, T(10, f"10:0{i}")) for i, x in enumerate("abc")]
+        states = {"a": self.st(green=["T"]), "b": self.st(stuck=["T"]), "c": self.st(green=["T"])}
+        self.assertEqual(pm.attributable_pushes(chron, states), {"b"})
+
     def test_a_red_push_right_after_an_unsettled_one_has_no_pr(self):
         eps, skipped = self.run_eps([("base", self.st(green=["T"])), ("a", self.st(red=["T"], settled=False)), ("b", self.st(red=["T"])), ("c", self.st(green=["T"]))],
                                     {"a": 1, "b": 2, "c": 3})
@@ -454,6 +475,15 @@ class CommitState(Base):
         return runs, pm.Reader(REPO, self.cache, 50, lambda path: {"check_runs": list(runs)})
 
     RERUN = {"id": 2, "name": "T", "status": "completed", "conclusion": "failure", "started_at": T(10, "09:50"), "completed_at": T(10, "09:55")}
+
+    def test_commit_state_uses_the_reports_clock_for_the_stuck_check(self):
+        runs = [{"id": 1, "name": "T", "status": "queued", "conclusion": None, "started_at": T(10, "10:00")}]
+        rd = self.rd(runs)
+        age = dt.timedelta(hours=5)
+        replay = pm.commit_state(rd, "k1", age, now=iso_dt(T(10, "10:30")))  # 30 minutes after the run's start: pending, not stuck
+        self.assertEqual((replay["settled"], replay["stuck"]), (False, []))
+        later = pm.commit_state(rd, "k1", age, now=iso_dt(T(10, "14:00")))
+        self.assertEqual((later["settled"], later["stuck"]), (True, ["T"]))
 
     def test_commit_red_sees_a_rerun_that_failed_after_the_first_read(self):
         runs, rd = self.reread()
