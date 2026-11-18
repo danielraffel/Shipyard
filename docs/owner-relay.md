@@ -115,6 +115,22 @@ The fallback chain, first success wins:
 4. one pull-request comment (GraphQL `addComment`) starting `shipyard-relay:`,
    when `relay.comment_fallback` is on.
 
+**Unowned pull requests.** An open, non-draft pull request with no owner marker
+and no stored record is tracked when the repository has a
+`relay.repo."<repo>".lead` (among the newest 100 open ones; without a lead
+nothing is tracked). The lead hears only what needs an author: a HOLD at the
+current head, red required checks, a conflict (`DIRTY`), an ejection or an
+`overdue` notice, never a merge, a green check, a claim or an approval. Its
+first sighting is judged by its state, so a HOLD that landed before the relay
+looked still alerts once; after that it is the usual per-event key, so the same
+fact is delivered once. The message says no owner is registered and names
+`shipyard owner register`. A `shipyard:needs-agent` label alone does not
+trigger it. Known limits: a fact already told to an owner is not repeated to the
+lead if the owner's marker is later removed (same key); a new owner is not told
+what the lead heard; and a marker-owned pull request that falls off the newest
+100 open ones loses its marker owner, as it did before, and is then treated as
+unowned.
+
 A batch nothing could take is retried one rate-limit window later, up to six
 times, then dropped (logged as `refused`). At most one fallback comment is
 posted per head. A pull request GitHub does not know is dropped after three

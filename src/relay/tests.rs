@@ -12,6 +12,7 @@ use crate::owner_registry::{self, OwnerRecord, SessionIdentity, Source};
 
 const REPO: &str = "Generous-Corp/pulp";
 const HEAD_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const NULL_BODY: &str = "\u{0}null";
 const HEAD_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const BASE_1: &str = "1111111111111111111111111111111111111111";
 const BASE_2: &str = "2222222222222222222222222222222222222222";
@@ -612,6 +613,8 @@ fn the_process_runner_drives_a_fake_cmux_executable() {
 struct FakeGitHub {
     prs: RefCell<BTreeMap<u64, Pr>>,
     open_bodies: RefCell<BTreeMap<u64, String>>,
+    /// Pull requests the open list reports as drafts.
+    drafts: RefCell<std::collections::BTreeSet<u64>>,
     comments: RefCell<Vec<String>>,
     queries: RefCell<u32>,
     fail_comment: bool,
@@ -622,6 +625,7 @@ impl FakeGitHub {
         Self {
             prs: RefCell::new(prs.iter().map(|p| (p.number, p.clone())).collect()),
             open_bodies: RefCell::new(BTreeMap::new()),
+            drafts: RefCell::new(std::collections::BTreeSet::new()),
             comments: RefCell::new(Vec::new()),
             queries: RefCell::new(0),
             fail_comment: false,
@@ -663,7 +667,15 @@ impl FakeGitHub {
                 .open_bodies
                 .borrow()
                 .iter()
-                .map(|(n, body)| json!({"number": n, "body": body}))
+                .map(|(n, body)| {
+                    // `NULL_BODY` stands for GitHub's null body (none written).
+                    let body = if body == NULL_BODY {
+                        Value::Null
+                    } else {
+                        json!(body)
+                    };
+                    json!({"number": n, "body": body, "isDraft": self.drafts.borrow().contains(n)})
+                })
                 .collect();
             repository.insert("open".to_owned(), json!({"nodes": nodes}));
         }
@@ -1452,6 +1464,291 @@ fn a_marker_cannot_outrank_by_a_future_time_or_name_an_unknown_socket() {
     h2.gh.open_bodies.borrow_mut().clear();
     h2.pass(1, Mode::Send);
     assert!(h2.state.prs.values().next().unwrap().owner.is_none());
+}
+
+/// A harness whose repository has a lead on m1 and one open pull request
+/// that nobody registered (no marker, no stored record).
+fn unowned_harness(pr: &Pr, with_lead: bool) -> Harness {
+    let mut h = Harness::new(
+        std::slice::from_ref(pr),
+        FakeCmux::with(&[("m1", "", "LEAD")]),
+    );
+    if with_lead {
+        h.config.repo.insert(
+            REPO.to_owned(),
+            config::RepoFallbacks {
+                lead: Some(address("m1", "LEAD")),
+                repair_lane: None,
+            },
+        );
+    }
+    h.gh.open_bodies
+        .borrow_mut()
+        .insert(pr.number, "no marker".to_owned());
+    h
+}
+
+#[test]
+fn a_hold_on_an_unowned_pull_request_reaches_the_lead_at_first_sight() {
+    // vellum#543: no marker, no record, a HOLD that landed before the relay
+    // looked. It used to reach nobody.
+    let mut pr = Pr::open(543);
+    pr.comments.push(verdict("HOLD", HEAD_A));
+    let mut h = unowned_harness(&pr, true);
+    h.pass(0, Mode::Send);
+    let deliveries = h.deliveries();
+    assert_eq!(deliveries.len(), 1, "{deliveries:?}");
+    assert_eq!(deliveries[0]["tier"], "lead");
+    let message = deliveries[0]["message"].as_str().unwrap();
+    assert!(message.contains("No owner is registered"), "{message}");
+    // The same fact is not delivered twice.
+    h.pass(1, Mode::Send);
+    h.pass(2, Mode::Send);
+    assert_eq!(h.deliveries().len(), 1);
+}
+
+#[test]
+fn an_unowned_pull_request_tells_the_lead_only_what_needs_an_author() {
+    let pr = Pr::open(543);
+    let mut h = unowned_harness(&pr, true);
+    h.pass(0, Mode::Send);
+    assert!(h.deliveries().is_empty(), "a quiet pull request is silent");
+    // A green check, an approval and a merge are not the lead's to hear.
+    let mut approved = pr.clone();
+    approved.comments.push(verdict("APPROVE", HEAD_A));
+    h.gh.set(approved.clone());
+    h.pass(1, Mode::Send);
+    let mut merged = approved;
+    merged.state = "MERGED";
+    merged.merged = true;
+    h.gh.set(merged);
+    h.gh.open_bodies.borrow_mut().clear();
+    h.pass(2, Mode::Send);
+    assert!(h.deliveries().is_empty(), "{:?}", h.deliveries());
+    // A red check is.
+    let mut red_pr = Pr::open(544);
+    red_pr.checks = red();
+    h.gh.set(red_pr);
+    h.gh.open_bodies
+        .borrow_mut()
+        .insert(544, "no marker".to_owned());
+    h.pass(3, Mode::Send);
+    h.pass(4, Mode::Send);
+    let deliveries = h.deliveries();
+    assert_eq!(deliveries.len(), 1, "{deliveries:?}");
+    assert_eq!(deliveries[0]["pr"], 544);
+}
+
+#[test]
+fn an_unowned_pull_request_that_leaves_the_lead_scope_goes_quiet() {
+    let pr = Pr::open(543);
+    let mut h = unowned_harness(&pr, true);
+    h.pass(0, Mode::Send);
+    // The lead is removed: a later HOLD is nobody's to deliver through it.
+    h.config.repo.clear();
+    let mut held = pr.clone();
+    held.comments.push(verdict("HOLD", HEAD_A));
+    h.gh.set(held);
+    h.pass(1, Mode::Send);
+    assert!(h.deliveries().is_empty(), "{:?}", h.deliveries());
+}
+
+#[test]
+fn a_malformed_owner_marker_leaves_the_pull_request_unowned() {
+    let mut pr = Pr::open(543);
+    pr.comments.push(verdict("HOLD", HEAD_A));
+    let mut h = unowned_harness(&pr, true);
+    h.gh.open_bodies.borrow_mut().insert(
+        543,
+        format!("body\n{}", "<!-- shipyard-owner: nonsense -->"),
+    );
+    h.pass(0, Mode::Send);
+    assert_eq!(h.deliveries().len(), 1, "{:?}", h.deliveries());
+    assert_eq!(h.deliveries()[0]["tier"], "lead");
+}
+
+#[test]
+fn an_unowned_conflict_after_a_push_is_told_once() {
+    let pr = Pr::open(543);
+    let mut h = unowned_harness(&pr, true);
+    h.pass(0, Mode::Send);
+    // A push that leaves it conflicting: the head moved, so a history-based
+    // event would stay silent.
+    let mut dirty = pr.clone();
+    dirty.head = HEAD_B;
+    dirty.merge = "DIRTY";
+    h.gh.set(dirty);
+    for minute in [1, 15, 40, 90] {
+        h.pass(minute, Mode::Send);
+    }
+    let deliveries = h.deliveries();
+    assert_eq!(deliveries.len(), 1, "told once: {deliveries:?}");
+    assert_eq!(deliveries[0]["tier"], "lead");
+    assert_eq!(deliveries[0]["events"][0]["event"], "dirty_after_base_move");
+}
+
+#[test]
+fn an_unowned_pull_request_ejected_from_the_queue_reaches_the_lead() {
+    let mut queued = Pr::open(543);
+    queued.in_queue = true;
+    let mut h = unowned_harness(&queued, true);
+    h.pass(0, Mode::Send);
+    let mut ejected = queued.clone();
+    ejected.in_queue = false;
+    h.gh.set(ejected);
+    h.pass(1, Mode::Send);
+    let deliveries = h.deliveries();
+    assert_eq!(deliveries.len(), 1, "{deliveries:?}");
+    assert_eq!(deliveries[0]["events"][0]["event"], "ejected");
+}
+
+#[test]
+fn an_unowned_fact_that_clears_inside_the_rate_limit_window_is_not_sent() {
+    let mut pr = Pr::open(543);
+    pr.comments.push(verdict("HOLD", HEAD_A));
+    let mut h = unowned_harness(&pr, true);
+    h.pass(0, Mode::Send);
+    assert_eq!(h.deliveries().len(), 1);
+    // Red inside the window is queued; it clears before the window ends.
+    let mut red_pr = pr.clone();
+    red_pr.checks = red();
+    h.gh.set(red_pr);
+    h.pass(1, Mode::Send);
+    h.gh.set(pr.clone());
+    h.pass(2, Mode::Send);
+    h.pass(15, Mode::Send);
+    assert_eq!(h.deliveries().len(), 1, "{:?}", h.deliveries());
+}
+
+#[test]
+fn a_second_ejection_of_an_unowned_pull_request_is_a_new_fact() {
+    let mut queued = Pr::open(543);
+    queued.in_queue = true;
+    let mut h = unowned_harness(&queued, true);
+    h.pass(0, Mode::Send);
+    let mut out = queued.clone();
+    out.in_queue = false;
+    h.gh.set(out.clone());
+    h.pass(1, Mode::Send);
+    h.gh.set(queued.clone());
+    h.pass(15, Mode::Send);
+    h.gh.set(out);
+    h.pass(30, Mode::Send);
+    assert_eq!(h.deliveries().len(), 2, "{:?}", h.deliveries());
+}
+
+#[test]
+fn an_unowned_pull_request_with_no_body_still_reaches_the_lead() {
+    let mut pr = Pr::open(543);
+    pr.comments.push(verdict("HOLD", HEAD_A));
+    let mut h = unowned_harness(&pr, true);
+    h.gh.open_bodies
+        .borrow_mut()
+        .insert(543, NULL_BODY.to_owned());
+    h.pass(0, Mode::Send);
+    assert_eq!(h.deliveries().len(), 1, "{:?}", h.deliveries());
+    assert_eq!(h.deliveries()[0]["tier"], "lead");
+}
+
+#[test]
+fn a_queued_ejection_is_dropped_when_the_pull_request_re_enters_the_queue() {
+    let mut pr = Pr::open(543);
+    pr.comments.push(verdict("HOLD", HEAD_A));
+    let mut queued = pr.clone();
+    queued.in_queue = true;
+    let mut h = unowned_harness(&pr, true);
+    h.gh.set(queued.clone());
+    h.pass(0, Mode::Send);
+    // The HOLD opens the rate window; an ejection inside it is queued.
+    let mut out = queued.clone();
+    out.in_queue = false;
+    h.gh.set(out);
+    h.pass(1, Mode::Send);
+    let first = h.deliveries().len();
+    h.gh.set(queued);
+    h.pass(15, Mode::Send);
+    assert_eq!(h.deliveries().len(), first, "{:?}", h.deliveries());
+}
+
+#[test]
+fn an_unowned_overdue_notice_waits_inside_the_rate_limit_window() {
+    let mut pr = Pr::open(543);
+    pr.comments.push(verdict("HOLD", HEAD_A));
+    let mut h = unowned_harness(&pr, true);
+    h.pass(0, Mode::Send);
+    assert_eq!(h.deliveries().len(), 1);
+
+    // The overdue notice arrives while the HOLD's rate-limit window is open.
+    h.overdue.insert(543, vec![overdue_event(HEAD_A, 1)]);
+    h.pass(1, Mode::Send);
+    assert_eq!(h.deliveries().len(), 1);
+
+    // It is still current at the next window and must reach the lead.
+    h.overdue.clear();
+    h.pass(10, Mode::Send);
+    let deliveries = h.deliveries();
+    assert_eq!(deliveries.len(), 2, "{deliveries:?}");
+    assert!(
+        deliveries[1]["message"]
+            .as_str()
+            .unwrap()
+            .contains("overdue: dirty for 45 min (limit 30 min)"),
+        "{deliveries:?}"
+    );
+}
+
+#[test]
+fn a_red_check_delivered_to_the_owner_is_not_resent_to_the_lead_when_the_marker_goes() {
+    let pr = Pr::open(543);
+    let mut h = Harness::new(
+        std::slice::from_ref(&pr),
+        FakeCmux::with(&[("m1", "", "LEAD"), ("m5", "/tmp/cmux-nightly.sock", "S")]),
+    );
+    h.config.repo.insert(
+        REPO.to_owned(),
+        config::RepoFallbacks {
+            lead: Some(address("m1", "LEAD")),
+            repair_lane: None,
+        },
+    );
+    let marker = owner_registry::render_marker(&owner(543, "m5", "S"));
+    h.gh.open_bodies.borrow_mut().insert(543, marker);
+    h.pass(0, Mode::Send);
+    let mut red_pr = pr.clone();
+    red_pr.checks = red();
+    h.gh.set(red_pr);
+    h.pass(1, Mode::Send);
+    let owner_sends = h.cmux.sends().len();
+    assert_eq!(owner_sends, 1, "the owner heard the red check once");
+
+    // The marker is removed: the same red check at the same head is not new.
+    h.gh.open_bodies
+        .borrow_mut()
+        .insert(543, "no marker".to_owned());
+    h.pass(20, Mode::Send);
+    h.pass(40, Mode::Send);
+    assert_eq!(h.cmux.sends().len(), owner_sends, "{:?}", h.cmux.sends());
+}
+
+#[test]
+fn an_unowned_draft_pull_request_is_not_tracked() {
+    let mut pr = Pr::open(543);
+    pr.comments.push(verdict("HOLD", HEAD_A));
+    let mut h = unowned_harness(&pr, true);
+    h.gh.drafts.borrow_mut().insert(543);
+    h.pass(0, Mode::Send);
+    assert!(h.state.prs.is_empty());
+    assert!(h.deliveries().is_empty());
+}
+
+#[test]
+fn without_a_lead_an_unowned_pull_request_is_not_tracked() {
+    let mut pr = Pr::open(543);
+    pr.comments.push(verdict("HOLD", HEAD_A));
+    let mut h = unowned_harness(&pr, false);
+    h.pass(0, Mode::Send);
+    assert!(h.state.prs.is_empty());
+    assert!(h.deliveries().is_empty());
 }
 
 #[test]
