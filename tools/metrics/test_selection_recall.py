@@ -108,6 +108,25 @@ class Calc(unittest.TestCase):
         self.assertEqual(sorted(u["job_id"] for u in r["unread_jobs"]), [2, 3, 4, 5])
         self.assertIn("Unread gate jobs", sr.render_md(r))
 
+    def test_malformed_selection_values_are_unread_not_computed(self):
+        def raw(**kw):
+            m = {"total": 100, "selected": 5, "select_all": False, "reason": "graph", "failed": 1,
+                 "failed_outside_selection": 1, "failed_outside_names": ["t"]}
+            m.update(kw)
+            return [{"title": "affected-tests-shadow", "message": json.dumps(m)}]
+        bad = [raw(select_all="false"), raw(select_all=0), raw(total="100"), raw(selected=True), raw(selected=-1),
+               raw(selected=500), raw(failed=0, failed_outside_selection=1), raw(total=1.5),
+               raw(failed_outside_names="t"), raw(failed_outside_names=[1])]
+        r = report([(gate(1), raw())] + [(gate(i + 2), a) for i, a in enumerate(bad)])
+        self.assertEqual((r["jobs_read"], r["jobs_unread"], r["narrowed"]["jobs"]), (1, len(bad), 1))
+        self.assertTrue(r["partial"])
+        self.assertTrue(all(u["why"] == "selection annotation invalid" for u in r["unread_jobs"]))
+
+    def test_a_malformed_receipts_notice_leaves_the_job_unread(self):
+        bad = {"title": "test-receipts-shadow", "message": json.dumps({"selected": 10, "would_skip": 50})}
+        r = report([(gate(1), [sel(), bad]), (gate(2), [sel()])])
+        self.assertEqual((r["jobs_read"], r["jobs_unread"]), (1, 1))
+
     def test_under_95_percent_coverage_prints_partial_with_the_share(self):
         rows = [(gate(i), [sel()]) for i in range(1, 19)] + [(gate(30), []), (gate(31), [])]
         r = report(rows)

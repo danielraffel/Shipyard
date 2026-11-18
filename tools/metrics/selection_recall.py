@@ -212,6 +212,11 @@ def normalize_reason(reason):
     return re.sub(r"^\d+ ", "N ", reason or "unknown")
 
 
+def _count(v):
+    """A non-negative integer as JSON wrote it, or None. A bool, a string or a float is not a count."""
+    return v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else None
+
+
 def read_job(g, annotations):
     """One gate job's facts, or (None, why) when its selection notice is missing or unusable."""
     if annotations is None:
@@ -220,13 +225,15 @@ def read_job(g, annotations):
     if not sel:
         return None, "no selection annotation"
     s = parse_notice(sel[0])
-    try:
-        total, selected = int(s["total"]), int(s["selected"])
-        failed, outside = int(s.get("failed", 0)), int(s.get("failed_outside_selection", 0))
-        select_all = bool(s["select_all"])
-        names = list(s.get("failed_outside_names") or [])
-    except (TypeError, KeyError, ValueError):
+    if s is None:
         return None, "selection annotation unparseable"
+    total, selected = _count(s.get("total")), _count(s.get("selected"))
+    failed, outside = _count(s.get("failed", 0)), _count(s.get("failed_outside_selection", 0))
+    names = s.get("failed_outside_names") or []
+    select_all = s.get("select_all")
+    if (None in (total, selected, failed, outside) or not isinstance(select_all, bool) or selected > total
+            or outside > failed or not isinstance(names, list) or not all(isinstance(n, str) for n in names)):
+        return None, "selection annotation invalid"
     f = {"job_id": g["job_id"], "run_id": g["run_id"], "conclusion": g["conclusion"], "select_all": select_all,
          "reason": s.get("reason"), "total": total, "selected": selected, "failed": failed, "outside": outside,
          "outside_names": names, "fraction": (selected / total) if total else None,
@@ -234,13 +241,13 @@ def read_job(g, annotations):
     for a in annotations:
         if a["title"] == RECEIPTS_TITLE:
             r = parse_notice(a)
-            if r:
-                try:
-                    f["receipts"] = {"would_skip": int(r.get("would_skip") or 0), "selected": int(r.get("selected") or 0),
-                                     "would_skip_failed": int(r.get("would_skip_failed") or 0),
-                                     "failed_names": list(r.get("would_skip_failed_names") or [])}
-                except (TypeError, ValueError):
-                    pass
+            skip, sel_n, bad = _count(r.get("would_skip") if r else None), _count(r.get("selected") if r else None), \
+                _count(r.get("would_skip_failed", 0) if r else None)
+            names = (r or {}).get("would_skip_failed_names") or []
+            if None in (skip, sel_n, bad) or skip > sel_n or not isinstance(names, list):
+                return None, "receipts annotation invalid"
+            f["receipts"] = {"would_skip": skip, "selected": sel_n, "would_skip_failed": bad,
+                             "failed_names": [str(n) for n in names]}
         elif a["title"] in EXONERATION_TITLES:
             e = parse_notice(a)
             if e and isinstance(e.get("tests"), dict):
