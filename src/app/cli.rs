@@ -3549,6 +3549,11 @@ pub(super) enum OwnerCommand {
         /// session (same session id or cmux surface), e.g. after a restart.
         #[arg(long)]
         all: bool,
+        /// Register as `shipyard pr` does right after a push: only on a host
+        /// with `[relay]`, never with `SHIPYARD_OWNER_REGISTER=0`, and never an
+        /// error. Needs `--pr` and `--repo`. `ghapp pr create` runs this.
+        #[arg(long = "after-create", requires = "pr", requires_if("true", "repo"))]
+        after_create: bool,
     },
     /// Hand a pull request to the repository's repair lane: the relay stops
     /// addressing this session and uses the configured fallbacks.
@@ -5484,6 +5489,35 @@ mod tests {
     fn a_command_that_owns_no_pull_request_resolves_no_arm_opinion() {
         let cli = Cli::try_parse_from(["shipyard", "status"]).expect("parses");
         assert_eq!(cli.command.arm_auto_merge(), None);
+    }
+
+    #[test]
+    fn owner_register_after_create_needs_the_pull_request_and_repo() {
+        assert!(Cli::try_parse_from(["shipyard", "owner", "register", "--after-create"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "shipyard",
+                "owner",
+                "register",
+                "--pr",
+                "7",
+                "--after-create"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "shipyard",
+                "owner",
+                "register",
+                "--pr",
+                "7",
+                "--repo",
+                "o/r",
+                "--after-create",
+            ])
+            .is_ok()
+        );
     }
 
     /// The steward backstop is opt-in: its absence is the default and

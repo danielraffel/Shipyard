@@ -448,6 +448,41 @@ class CommitState(Base):
         pm.commit_state(rd2, "s5", dt.timedelta(hours=30))
         self.assertIsNotNone(rd2.load("cstate", "s5"))
 
+    def reread(self):
+        """A reader whose check-run list the test can change between reads."""
+        runs = [{"id": 1, "name": "T", "status": "completed", "conclusion": "success", "started_at": T(10, "09:00"), "completed_at": T(10, "09:10")}]
+        return runs, pm.Reader(REPO, self.cache, 50, lambda path: {"check_runs": list(runs)})
+
+    RERUN = {"id": 2, "name": "T", "status": "completed", "conclusion": "failure", "started_at": T(10, "09:50"), "completed_at": T(10, "09:55")}
+
+    def test_commit_red_sees_a_rerun_that_failed_after_the_first_read(self):
+        runs, rd = self.reread()
+        self.assertEqual(pm.commit_red(rd, "r1", {"T"}), (set(), True))
+        self.assertIsNotNone(rd.load("checks", "r1"))
+        runs.append(self.RERUN)
+        self.assertEqual(pm.commit_red(rd, "r1", {"T"}), ({"T"}, True))
+
+    def test_commit_state_sees_a_rerun_that_failed_after_the_first_read(self):
+        runs, rd = self.reread()
+        old = dt.timedelta(hours=30)
+        self.assertEqual(pm.commit_state(rd, "r2", old)["red"], [])
+        self.assertIsNotNone(rd.load("cstate", "r2"))
+        runs.append(self.RERUN)
+        st = pm.commit_state(rd, "r2", old)
+        self.assertEqual((st["red"], st["green"]), (["T"], []))
+
+    def test_head_states_at_sees_a_rerun_before_the_merge_that_appeared_after_the_first_read(self):
+        runs, rd = self.reread()
+        self.assertEqual(pm.head_states_at(rd, "r3", T(10, "10:00")), {"T": "green"})
+        self.assertIsNotNone(rd.load("headstate", "r3@" + T(10, "10:00")))
+        runs.append(self.RERUN)
+        self.assertEqual(pm.head_states_at(rd, "r3", T(10, "10:00")), {"T": "red"})
+
+    def test_a_cached_entry_without_a_run_list_fingerprint_is_recomputed(self):
+        runs, rd = self.reread()
+        rd.save("checks", "r4", {"v": pm.CHECKS_VERSION, "red": ["T"]})
+        self.assertEqual(pm.commit_red(rd, "r4", {"T"}), (set(), True))
+
     def test_a_queued_rerun_with_no_start_time_is_the_newest_run_and_holds_the_push_open(self):
         runs = [{"id": 1, "name": "T", "status": "completed", "conclusion": "failure", "started_at": T(10, "10:00")},
                 {"id": 2, "name": "T", "status": "queued", "conclusion": None, "started_at": None}]
