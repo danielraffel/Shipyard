@@ -1154,3 +1154,45 @@ fn deferred_rows_and_missing_passes_do_not_restart_the_clock() {
         "a missing pass kept the clock"
     );
 }
+
+/// One judged blip followed by deferred rows or missing ticks is measured
+/// between judged passes only, so it does not restart the clock: the alert
+/// fires on the first candidate pass past 60 minutes.
+#[test]
+fn a_blip_then_deferral_does_not_restart_the_clock() {
+    let pr = [stuck(12, HEAD, "merge_state:UNSTABLE")];
+    let mut state = established();
+    stuck_passes(&mut state, &pr, HEAD, 0, 45, &[]);
+    // Judged not a candidate once (a verdict re-run)...
+    assert!(stuck_pass(&mut state, &[], &[(12, HEAD)], 50, true).is_empty());
+    // ...then deferred for 15 minutes, with one tick missing.
+    stuck_pass_with(&mut state, &[], &[(12, HEAD)], &[12], 55, true);
+    stuck_pass_with(&mut state, &[], &[(12, HEAD)], &[12], 65, true);
+    let back = stuck_pass(&mut state, &pr, &[], 70, true);
+    assert!(back[0].escalate, "alerted at 70, not restarted to 130");
+    assert_eq!(back[0].overdue.age_minutes, 70);
+}
+
+/// Once alerted, a head stays reported (never escalating again) through a
+/// deferred row or a short judged blip, so a reader of the tick such as
+/// drain watch does not see it clear and come back; a long judged stretch
+/// (queued, held, red) stops it.
+#[test]
+fn an_alerted_row_stays_reported_through_a_blip_and_a_deferral() {
+    let pr = [stuck(13, HEAD, "merge_state:UNSTABLE")];
+    let mut state = established();
+    stuck_passes(&mut state, &pr, HEAD, 0, 55, &[]);
+    assert!(stuck_pass(&mut state, &pr, &[], 60, true)[0].escalate);
+    let blip = stuck_pass(&mut state, &[], &[(13, HEAD)], 65, true);
+    let deferred = stuck_pass_with(&mut state, &[], &[(13, HEAD)], &[13], 70, true);
+    let again = stuck_pass(&mut state, &pr, &[], 75, true);
+    for (minute, rows) in [(65, blip), (70, deferred), (75, again)] {
+        assert_eq!(rows.len(), 1, "{minute}");
+        assert!(!rows[0].escalate, "{minute}");
+    }
+    // Queued (judged not a candidate) for 20 minutes: no longer reported.
+    for minute in (80..=100).step_by(5) {
+        stuck_pass(&mut state, &[], &[(13, HEAD)], minute, true);
+    }
+    assert!(stuck_pass(&mut state, &[], &[(13, HEAD)], 105, true).is_empty());
+}

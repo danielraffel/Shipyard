@@ -524,9 +524,24 @@ pub struct StuckApproved {
     pub alerted: bool,
     /// The first pass, since it was last a candidate, that judged it and
     /// found it not a candidate (queued, held, red, re-running its verdict).
-    /// A stretch longer than [`STUCK_GAP_MINUTES`] restarts the clock.
     #[serde(default)]
     pub ineligible_since: Option<DateTime<Utc>>,
+    /// The latest such pass. The stretch is measured between the two judged
+    /// passes only; when it spans more than [`STUCK_GAP_MINUTES`] the clock
+    /// restarts.
+    #[serde(default)]
+    pub ineligible_last: Option<DateTime<Utc>>,
+}
+
+impl StuckApproved {
+    /// Minutes between the first and the last pass that judged it not a
+    /// candidate since it was last one; 0 when none did.
+    fn judged_stretch_minutes(&self) -> i64 {
+        match (self.ineligible_since, self.ineligible_last) {
+            (Some(first), Some(last)) => (last - first).num_minutes(),
+            _ => 0,
+        }
+    }
 }
 
 /// Longest stretch a pull request may be judged not a candidate at its head
@@ -592,11 +607,9 @@ pub fn track_stuck(
         .map(|(number, entry)| {
             let mut entry = entry.clone();
             // Judged this pass and not a candidate: evidence of a stretch.
-            if !candidate_numbers.contains(number)
-                && !deferred.contains(number)
-                && entry.ineligible_since.is_none()
-            {
-                entry.ineligible_since = Some(now);
+            if !candidate_numbers.contains(number) && !deferred.contains(number) {
+                entry.ineligible_since.get_or_insert(now);
+                entry.ineligible_last = Some(now);
             }
             (*number, entry)
         })
@@ -604,13 +617,12 @@ pub fn track_stuck(
     for candidate in candidates {
         let entry = match state.stuck_approved.get(&candidate.number) {
             Some(entry) if entry.head.eq_ignore_ascii_case(&candidate.head) => {
-                let resumed = entry
-                    .ineligible_since
-                    .is_some_and(|start| now - start > Duration::minutes(STUCK_GAP_MINUTES));
+                let resumed = entry.judged_stretch_minutes() > STUCK_GAP_MINUTES;
                 StuckApproved {
                     token: candidate.token.clone(),
                     since: if resumed { now } else { entry.since },
                     ineligible_since: None,
+                    ineligible_last: None,
                     ..entry.clone()
                 }
             }
@@ -620,24 +632,29 @@ pub fn track_stuck(
                 since: now,
                 alerted: false,
                 ineligible_since: None,
+                ineligible_last: None,
             },
         };
         next.insert(candidate.number, entry);
     }
     let mut rows = Vec::new();
     if let Some(limit) = policy.limit(DwellState::ApprovedStuck) {
-        for candidate in candidates {
-            let Some(entry) = next.get_mut(&candidate.number) else {
-                continue;
-            };
+        for (number, entry) in &next {
+            let candidate = candidate_numbers.contains(number);
+            // An alerted head stays reported (never escalating) through a
+            // deferred row or a short judged blip, so a reader of the tick
+            // does not see it clear and come back; a candidate is reported
+            // and escalates once.
+            let holds =
+                candidate || (entry.alerted && entry.judged_stretch_minutes() <= STUCK_GAP_MINUTES);
             let age = (now - entry.since).num_minutes().max(0);
-            if age < i64::from(limit) {
+            if !holds || age < i64::from(limit) {
                 continue;
             }
-            let escalate = !entry.alerted;
+            let escalate = candidate && !entry.alerted;
             rows.push(Planned {
                 overdue: Overdue {
-                    number: candidate.number,
+                    number: *number,
                     state: DwellState::ApprovedStuck,
                     token: entry.token.clone(),
                     head: entry.head.clone(),

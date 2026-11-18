@@ -1597,3 +1597,40 @@ fn a_dry_run_pass_reports_the_stuck_row_as_not_emitted() {
         1
     );
 }
+
+/// Through a real pass: rows the pass budget deferred for 20 minutes are not
+/// judged, so they do not restart the stuck clock and the alert still fires
+/// on the next candidate pass past 60 minutes.
+#[test]
+fn deferred_rows_through_a_real_pass_keep_the_stuck_clock() {
+    let temp = tempfile::tempdir().unwrap();
+    let prs = vec![pr(1, Some("SUCCESS"), Some("SUCCESS"), &[])];
+    let mut pass = pass(
+        &temp,
+        prs.clone(),
+        vec![report(1, "merge_state:UNSTABLE", None)],
+    );
+    let mut ledger = established();
+    for minute in [0, 15, 30, 45] {
+        pass.now = now() + chrono::Duration::minutes(minute);
+        pass.run(&mut ledger, &FakeActs::default());
+    }
+    pass.reports = vec![pass_budget::deferred_report(
+        &prs[0],
+        StewardDecision::ArmMergeQueue,
+        "budget",
+    )];
+    for minute in [50, 55, 60, 65, 70] {
+        pass.now = now() + chrono::Duration::minutes(minute);
+        pass.run(&mut ledger, &FakeActs::default());
+    }
+    pass.reports = vec![report(1, "merge_state:UNSTABLE", None)];
+    pass.now = now() + chrono::Duration::minutes(75);
+    let back = pass.run(&mut ledger, &FakeActs::default());
+    assert!(
+        back.overdue.iter().any(|row| {
+            row.state == crate::merge_steward::dwell::DwellState::ApprovedStuck && row.escalated
+        }),
+        "deferred passes did not restart the clock"
+    );
+}
