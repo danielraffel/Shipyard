@@ -1634,3 +1634,47 @@ fn a_row_deferred_every_pass_still_alerts() {
     }
     assert_eq!(alerts, vec![(60, "merge_state:UNSTABLE".to_owned())]);
 }
+
+/// The alarm covers pull requests the steward manages. An approved,
+/// required-green pull request it does not manage (no managed label, or no
+/// handoff receipt at its head) is not one it left unmerged, so it never
+/// alerts; the same pull request managed does.
+#[test]
+fn an_unmanaged_pull_request_never_alerts() {
+    let temp = tempfile::tempdir().unwrap();
+    let prs = vec![
+        pr(1, Some("SUCCESS"), Some("SUCCESS"), &[]),
+        pr(2, Some("SUCCESS"), Some("SUCCESS"), &[]),
+        pr(3, Some("SUCCESS"), Some("SUCCESS"), &[]),
+    ];
+    let mut unmanaged = report(1, "unmanaged", None);
+    unmanaged.decision = StewardDecision::Unmanaged;
+    let mut no_handoff = report(2, "handoff_missing", None);
+    no_handoff.decision = StewardDecision::HandoffMissing;
+    let mut pass = pass(
+        &temp,
+        prs,
+        vec![
+            unmanaged,
+            no_handoff,
+            report(3, "merge_state:UNSTABLE", None),
+        ],
+    );
+    let mut ledger = established();
+    let mut alerted = Vec::new();
+    for minute in (0..=65).step_by(5) {
+        pass.now = now() + chrono::Duration::minutes(minute);
+        let report = pass.run(&mut ledger, &FakeActs::default());
+        alerted.extend(
+            report
+                .overdue
+                .iter()
+                .filter(|row| {
+                    row.state == crate::merge_steward::dwell::DwellState::ApprovedStuck
+                        && row.escalated
+                })
+                .map(|row| row.pr),
+        );
+    }
+    assert_eq!(alerted, vec![3]);
+}

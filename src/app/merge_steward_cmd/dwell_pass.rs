@@ -526,8 +526,10 @@ fn sightings(reports: &[PrReport], stacked: &[OpenPr]) -> (Vec<Sighting>, BTreeS
 /// Pull requests this pass saw approved at their exact head with every
 /// required check green, and that it neither merged nor queued.
 ///
-/// Approved is [`approved_at_head`]. A draft, a queued pull request (the queue owns
-/// it), and one this pass merged or enqueued are not candidates. A row the
+/// Approved is [`approved_at_head`]. Only pull requests the steward manages
+/// are candidates: an unmanaged one (no managed label, no handoff) is not the
+/// steward's to merge. A draft, a queued pull request (the queue owns it),
+/// and one this pass merged or enqueued are not candidates either. A row the
 /// pass budget deferred is judged like any other, from the census facts it
 /// carries, so a degraded steward that defers it every pass cannot keep the
 /// alarm silent; its `deferred_pass_budget` token is a placeholder, so the
@@ -537,6 +539,16 @@ fn stuck_candidates(input: &DwellInput<'_>, reports: &[PrReport]) -> Vec<dwell::
     reports
         .iter()
         .filter(|report| !report.blocked.blocked_on.is_empty())
+        // The steward merges only what it manages; an unmanaged pull request
+        // is not one it left unmerged, and the census does not read its
+        // checks.
+        .filter(|report| {
+            !matches!(
+                report.decision,
+                crate::merge_steward::StewardDecision::Unmanaged
+                    | crate::merge_steward::StewardDecision::HandoffMissing
+            )
+        })
         .filter(|report| {
             !report.mutation.as_deref().is_some_and(|mutation| {
                 mutation.split([',', ';']).any(|part| {
