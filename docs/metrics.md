@@ -137,8 +137,12 @@ p90 carry only n.
 Merged PRs do not change, so a closed PR's timeline and commits, a completed run's jobs, a PR's
 compute and a settled commit's check runs are each read once and kept under
 `DIR/<owner>__<repo>/`; open PRs are read again each run. Generous-Corp repos read through `ghread
-api`, others through `ghapp api`. `--read-cap` (default 100) is the most reads per run across repos,
-split evenly; a repo that hits its share is `truncated` and the next run resumes from the cache. Each
+api`, others through `ghapp api`. `--read-cap` (default 3000) is the most reads per run across repos. Each repo is promised 100 reads and the rest
+is split by how many PRs each lists in the window (the listings are read first and counted; a listing that cannot be read in full, or that hits the eight-page planning cap, counts as the median of the other repos), so a busy repo is not
+starved by an equal split; a share a repo does not use flows to the repos after it. A repo that hits its share is
+`truncated` and the next run resumes from the cache. Cost: Pulp's 7-day window is about 316 PRs and needs about 900 reads
+on a warm cache (about 1,200 cold), and a warm Pulp read takes about 25 minutes of wall time through `ghread`, so the
+daily run is slow by design. The default of 1500 split equally gave Pulp 300 reads and withheld its numbers every run. Each
 report prints the read count and the `truncated` flag. A read that fails leaves a PR unread or a
 field null, never zero. `--baseline FROM:TO` (default `2026-11-12:2026-11-14`, `none` to drop it).
 

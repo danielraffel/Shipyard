@@ -27,6 +27,8 @@ fn token(state: DwellState) -> &'static str {
         DwellState::CarriesUnapproved => "carries_unapproved_commits:#7",
         DwellState::StackedBaseMerged => STACKED_BASE_MERGED,
         DwellState::StaleMergeRef => "stale_merge_ref:macos",
+        // Not a `blocked_on` state: `track_stuck` keeps its clock.
+        DwellState::ApprovedStuck => "",
     }
 }
 
@@ -112,6 +114,9 @@ fn retrigger_marks_are_retained_when_history_grows() {
 fn every_state_is_overdue_exactly_at_its_limit() {
     let policy = DwellPolicy::default();
     for state in DwellState::ALL {
+        if state == DwellState::ApprovedStuck {
+            continue;
+        }
         let limit = i64::from(policy.limit(state).unwrap());
         assert_eq!(
             state_for_token(token(state), APPROVAL),
@@ -915,4 +920,259 @@ fn a_stale_merge_ref_token_has_the_retrigger_act() {
         Some(ActKind::RetriggerStaleRef)
     );
     assert!(ActKind::RetriggerStaleRef.writes_github());
+}
+
+fn stuck(number: u64, head: &str, token: &str) -> StuckCandidate {
+    StuckCandidate {
+        number,
+        head: head.to_owned(),
+        token: token.to_owned(),
+        placeholder_token: false,
+    }
+}
+
+/// One pass of `track_stuck` `minutes` after `now()`: `candidates`, plus
+/// `others` seen open (number, head) but not judged eligible.
+fn stuck_pass(
+    state: &mut DwellRepoState,
+    candidates: &[StuckCandidate],
+    others: &[(u64, &str)],
+    minutes: i64,
+    apply: bool,
+) -> Vec<Planned> {
+    let open = candidates
+        .iter()
+        .map(|candidate| (candidate.number, candidate.head.clone()))
+        .chain(
+            others
+                .iter()
+                .map(|(number, head)| (*number, (*head).to_owned())),
+        )
+        .collect();
+    let rows = track_stuck(
+        state,
+        candidates,
+        &open,
+        &DwellPolicy::default(),
+        now() + Duration::minutes(minutes),
+    );
+    if apply {
+        mark_stuck_alerted(state, &rows);
+    }
+    rows
+}
+
+/// What each minute's pass is for one pull request at `head`.
+#[derive(Clone, Copy)]
+enum Seen {
+    /// Judged eligible.
+    Eligible,
+    /// Seen open at the head, not judged eligible (a verdict re-run, queued,
+    /// held, red, a deferred row).
+    Open,
+    /// No pass ran.
+    Missing,
+}
+
+/// Run `schedule` (minute, what the pass sees) for `pr`; the minutes at which
+/// it escalated.
+fn escalations(
+    state: &mut DwellRepoState,
+    pr: &StuckCandidate,
+    schedule: &[(i64, Seen)],
+) -> Vec<i64> {
+    let mut out = Vec::new();
+    for (minute, seen) in schedule {
+        let rows = match seen {
+            Seen::Eligible => stuck_pass(state, std::slice::from_ref(pr), &[], *minute, true),
+            Seen::Open => stuck_pass(state, &[], &[(pr.number, pr.head.as_str())], *minute, true),
+            Seen::Missing => continue,
+        };
+        if rows.iter().any(|row| row.escalate) {
+            out.push(*minute);
+        }
+    }
+    out
+}
+
+/// A named pass schedule and the minutes it must escalate at.
+type Schedule<'a> = (&'a str, Vec<(i64, Seen)>, Vec<i64>);
+
+/// Five-minute passes from `from` to `to`, each `seen`.
+fn every_five(from: i64, to: i64, seen: Seen) -> Vec<(i64, Seen)> {
+    (from..=to)
+        .step_by(5)
+        .map(|minute| (minute, seen))
+        .collect()
+}
+
+/// An eligible pull request is silent under 60 minutes, escalates exactly
+/// once at 60, and is still reported (not escalating) on later eligible
+/// passes. The row names why the steward has not merged it.
+#[test]
+fn an_approved_green_pull_request_stuck_past_the_bound_alerts_once() {
+    let mut state = established();
+    let pr = stuck(69, HEAD, "merge_state:UNSTABLE");
+    assert!(escalations(&mut state, &pr, &every_five(0, 55, Seen::Eligible)).is_empty());
+    let first = stuck_pass(&mut state, std::slice::from_ref(&pr), &[], 60, true);
+    assert_eq!(first.len(), 1);
+    assert!(first[0].escalate);
+    assert_eq!(first[0].overdue.state, DwellState::ApprovedStuck);
+    assert_eq!(first[0].overdue.token, "merge_state:UNSTABLE");
+    assert_eq!(first[0].overdue.age_minutes, 60);
+    assert_eq!(first[0].act, Disposition::NoAct);
+    for minute in (65..=600).step_by(5) {
+        let rows = stuck_pass(&mut state, std::slice::from_ref(&pr), &[], minute, true);
+        assert_eq!(rows.len(), 1, "{minute}");
+        assert!(!rows[0].escalate, "alerted once, not again at {minute}");
+    }
+}
+
+/// Nothing a pass sees at the same head resets `first_eligible_at`: a blip
+/// (one pass not eligible), a deferral, missing ticks, and a blip followed by
+/// deferral and a missing tick (the timings from review) all alert on the
+/// first eligible pass at or past 60 minutes from first eligibility. A pass
+/// that is not eligible never alerts.
+#[test]
+fn blips_deferrals_and_missing_ticks_never_reset_the_clock() {
+    let pr = stuck(12, HEAD, "merge_state:UNSTABLE");
+    let schedules: Vec<Schedule<'_>> = vec![
+        (
+            "blip",
+            [
+                every_five(0, 45, Seen::Eligible),
+                vec![(50, Seen::Open)],
+                every_five(55, 70, Seen::Eligible),
+            ]
+            .concat(),
+            vec![60],
+        ),
+        (
+            "deferral across the bound",
+            [
+                every_five(0, 50, Seen::Eligible),
+                every_five(55, 75, Seen::Open),
+                vec![(80, Seen::Eligible)],
+            ]
+            .concat(),
+            vec![80],
+        ),
+        (
+            "missing ticks",
+            vec![
+                (0, Seen::Eligible),
+                (30, Seen::Missing),
+                (61, Seen::Eligible),
+            ],
+            vec![61],
+        ),
+        (
+            "blip then deferral and a missing tick",
+            [
+                every_five(0, 45, Seen::Eligible),
+                vec![
+                    (50, Seen::Open),
+                    (55, Seen::Open),
+                    (60, Seen::Missing),
+                    (65, Seen::Open),
+                    (70, Seen::Eligible),
+                ],
+            ]
+            .concat(),
+            vec![70],
+        ),
+    ];
+    for (name, schedule, expected) in schedules {
+        let mut state = established();
+        assert_eq!(escalations(&mut state, &pr, &schedule), expected, "{name}");
+        let entry = &state.stuck_approved[&12];
+        assert_eq!(entry.first_eligible_at, now(), "{name}: never reset");
+    }
+}
+
+/// A second stuck episode at the same head (eligible, then a long stretch
+/// queued or held, then eligible again) does not alert again: one alert per
+/// (pull request, head). A new head is a new key with its own clock and
+/// alert; a pull request no longer seen is dropped.
+#[test]
+fn one_alert_per_pull_request_and_head() {
+    let mut state = established();
+    let pr = stuck(7, HEAD, "excluded_label:x");
+    let first = [
+        every_five(0, 60, Seen::Eligible),
+        every_five(65, 180, Seen::Open),
+        every_five(185, 300, Seen::Eligible),
+    ]
+    .concat();
+    assert_eq!(escalations(&mut state, &pr, &first), vec![60]);
+    let moved = stuck(7, HEAD2, "excluded_label:x");
+    assert_eq!(
+        escalations(&mut state, &moved, &every_five(305, 365, Seen::Eligible)),
+        vec![365]
+    );
+    stuck_pass(&mut state, &[], &[], 370, true);
+    assert!(state.stuck_approved.is_empty());
+}
+
+/// A deferred row's placeholder token never replaces the last real reason.
+#[test]
+fn a_placeholder_token_keeps_the_last_real_reason() {
+    let mut state = established();
+    let pr = stuck(9, HEAD, "merge_state:UNSTABLE");
+    stuck_pass(&mut state, std::slice::from_ref(&pr), &[], 0, true);
+    let deferred = StuckCandidate {
+        token: "deferred_pass_budget".to_owned(),
+        placeholder_token: true,
+        ..pr
+    };
+    let rows = stuck_pass(&mut state, &[deferred], &[], 60, true);
+    assert_eq!(rows[0].overdue.token, "merge_state:UNSTABLE");
+}
+
+/// A pass that does not apply (a dry run, `shipyard wait`) reports the
+/// alert but never consumes it: the next apply pass still escalates.
+#[test]
+fn a_dry_run_does_not_use_up_the_alert() {
+    let mut state = established();
+    let pr = [stuck(9, HEAD, "merge_state:UNSTABLE")];
+    stuck_pass(&mut state, &pr, &[], 0, true);
+    assert!(stuck_pass(&mut state, &pr, &[], 61, false)[0].escalate);
+    assert!(
+        stuck_pass(&mut state, &pr, &[], 62, true)[0].escalate,
+        "the dry run did not consume it"
+    );
+    assert!(!stuck_pass(&mut state, &pr, &[], 63, true)[0].escalate);
+}
+
+/// `[auto_merge.dwell] approved_stuck = 0` turns the alarm off; another
+/// value moves the bound.
+#[test]
+fn the_stuck_bound_is_configurable_and_zero_disables_it() {
+    let policy = |raw: &str| DwellPolicy::from_table(&raw.parse::<toml::Table>().expect("toml"));
+    assert_eq!(
+        DwellPolicy::default().limit(DwellState::ApprovedStuck),
+        Some(60)
+    );
+    assert_eq!(
+        policy("[auto_merge.dwell]\napproved_stuck = 30\n").limit(DwellState::ApprovedStuck),
+        Some(30)
+    );
+    let off = policy("[auto_merge.dwell]\napproved_stuck = 0\n");
+    let mut state = established();
+    let pr = [stuck(9, HEAD, "merge_state:UNSTABLE")];
+    let open: BTreeMap<u64, String> = [(9, HEAD.to_owned())].into_iter().collect();
+    track_stuck(&mut state, &pr, &open, &off, now());
+    assert!(track_stuck(&mut state, &pr, &open, &off, now() + Duration::minutes(600)).is_empty());
+}
+
+/// A ledger written by the previous version (`since`, no other new field)
+/// still reads.
+#[test]
+fn an_older_stuck_entry_still_reads() {
+    let entry: StuckApproved = serde_json::from_str(
+        r#"{"head":"aaaa","token":"held","since":"2026-11-09T12:00:00Z","alerted":true,"ineligible_since":null}"#,
+    )
+    .expect("entry");
+    assert_eq!(entry.first_eligible_at, now());
+    assert!(entry.alerted);
 }

@@ -411,7 +411,7 @@ close anything. See [superseded-close.md](superseded-close.md).
 | `capacity_queued` | Every pending required check is a check run still queued for a runner, and none has started. The pull request is not blocked: `next_action` is `ci` with `stop: false` and says to take other work. Dwell limits treat it like `required_pending`. |
 | `required_failed:<contexts>` | A required check failed. On a merge-queue base (`red_check_outranks_pending`, see [Ejection guards](#ejection-guards)) this outranks `required_pending`: a red head reads failed while its other checks still run. No red required check is ever admitted, whichever token it reads. When the only red context is the approval context (`review-verdict`), the row names the approval token instead; an apply pass that did not read the gate for that head reads the approval status's own description instead: a HOLD naming this head reads `held:<context>` (repair lane), "no reviewer verdict names head" reads `no_verdict` (reviewer), and only an absent or unrecognised description keeps this token and says so in `blocked_detail` | author or repair lane |
 | `transient_rerun` | The steward is rerunning an interrupted check | steward |
-| `merge_state:<STATE>` | GitHub says `DIRTY`, `BEHIND`, `UNSTABLE`, ... | repair lane: merge the base |
+| `merge_state:<STATE>` | GitHub says `DIRTY`, `BEHIND`, `BLOCKED`, `UNSTABLE`, ... On a base with no merge queue, `UNSTABLE` with every required check green is admitted only when each other red or pending check is named in the base's `[auto_merge] unstable_advisory_checks`; `blocked_detail` names the check that holds it | repair lane: merge the base; for `UNSTABLE`, fix or rerun the named check, or list it advisory in the base config if it is report-only |
 | `ejected_same_head:<cause>` | The queue ejected this exact head and the steward will not re-enqueue it: the failure is the head's, could not be placed, or the head's one retry is spent. `blocked_detail` carries the classifier's reason (the failing job and whether the retry was spent). Read from the same queue state in a dry run and an apply pass; `since` is the removal | repair lane |
 | `ejected_same_head:<cause>:needs_new_head` | The same, under the retry discipline ([Ejection guards](#ejection-guards)): `<cause>` is `failed_checks` with no infrastructure signature, `merge_conflict`, or `invalid_merge_commit`. Only a new head moves it; for `invalid_merge_commit` or `merge_conflict`, merge the base once and push once | author or repair lane |
 | `generated_path_batch:#<n>` | Approved and green, but this head changes a generated path (`[auto_merge] generated_paths`) that queued entry `#<n>` also changes; `blocked_detail` names the shared paths. Not an error: the steward admits it on the first pass after `#<n>` leaves the queue | steward (nothing to do) |
@@ -952,6 +952,7 @@ approved_green_not_queued = 5   # ready / admission_pending: evaluated first nex
 carries_unapproved = 60         # escalate only
 stacked_base_merged = 10        # stacked on a merged base: retarget once
 stale_merge_ref = 10            # approved, red on a stale merge ref: retrigger once
+approved_stuck = 60             # approved and required-green but not merged or queued: alert once per head
 act = "shadow"                  # "apply" runs the GitHub-writing acts; "off" runs none
 max_acts_per_pass = 3           # GitHub-writing acts per repository per pass
 max_escalations_per_pass = 25
@@ -1007,6 +1008,38 @@ dropped). Review, CI and steward states go only to the feed, where the party
 that can act reads them, and rows the steward is acting on this pass are not
 relayed. The GitHub-writing acts ship in `shadow`: they are reported as
 `would_act` and escalate until the base sets `act = "apply"`.
+
+**Approved but stuck** (`approved_stuck`). Beside the token states, every pass
+judges each pull request the steward manages (the managed label or the
+`shipyard-local` App's own pull requests): it is *eligible* when it is approved
+at its exact head (its newest `review-verdict` check run or status is
+`SUCCESS`, with no newer refusing status), every required check is green, and
+it is neither merged nor queued by that pass, whatever its `blocked_on`
+(`merge_state:UNSTABLE`, an unknown merge state, ...). Out of scope: an
+unmanaged pull request (not the steward's to merge; the census does not read
+its checks), a conflicting one without the managed label (the `dirty` state
+escalates it), drafts, queued pull requests (the queue owns them), and ones
+deliberately parked with a hold label the pipeline skips (`owner-decision`,
+`superseded`, `PARKED/<platform>`). A row the pass budget deferred is judged
+from the census facts it carries.
+
+Everything is keyed on (pull request, head). The first pass that judges it
+eligible at a head records `first_eligible_at`, which is never reset while it
+stays open at that head: a verdict re-run, a deferred row, a missing tick or a
+stretch queued or held changes nothing. It is dropped only on a new head or
+once the pull request is no longer open. A pass that judges it eligible
+`approved_stuck` minutes (60; `0` turns it off) or more after
+`first_eligible_at` reports one overdue row naming the `blocked_on`, routed to
+the author; it escalates exactly **once per (pull request, head)**, so a second
+stuck episode at the same head does not alert again. Only an `--apply` pass
+marks it, within the per-pass escalation cap, so a dry run (`shipyard wait`)
+never uses it up. Later eligible passes keep reporting it without escalating.
+It reaches people three ways: the overdue feed (once); `shipyard relay` to the
+owning session, or to the repository's lead for an unowned pull request (event
+`overdue`, naming the reason, which is not part of the dedup key); and drain
+watch (`stuck_approved`, see `docs/drain-watch.md`), which writes one
+`summary.log` line, files one issue, and closes it only when the pull request
+merges, closes or moves to a new head.
 
 No act arms, enqueues, merges, updates a branch or approves; the act interface
 has no method that could.

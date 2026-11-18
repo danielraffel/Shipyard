@@ -84,7 +84,8 @@ HOLD_RE = re.compile(r"^\s*[*_#> ]*(HOLD\b|(?i:verdict)\s*:\s*HOLD\b)", re.M)
 ESCAPE_RE = r"(?i)\b(fix\w*|regress\w*|broke\w*|broken|caused|introduc\w*)\b[^\n]{0,60}?(?<![\w#])#%d(?!\d)"
 
 
-DEFAULT_READ_CAP = 1500  # shared total per run, ~3 reads per PR
+DEFAULT_READ_CAP = 3000  # shared total per run, split across repos by listed PR count (Pulp alone needs ~900 warm, ~1,200 cold)
+READ_FLOOR = 100  # least reads any repo is promised, whatever its size
 DEFAULT_REPOS = ("Generous-Corp/pulp", "Generous-Corp/vellum", "danielraffel/Shipyard", "danielraffel/tartci", "danielraffel/fleet-handbook")
 
 
@@ -1367,6 +1368,7 @@ def summarize(rows):
     push = {k: sum(r["pushes"].get(k, 0) for r in rows) for k in ("repair", "author", "merge_main")}
     q2m = [r["enqueue_to_merge_min"] for r in merged if r.get("enqueue_to_merge_min") is not None]
     ej = collections.Counter(c for r in rows for c in r["ejections"])
+    merged_ej = collections.Counter(c for r in merged for c in r["ejections"])
     good = [r for r in merged if r["correct"] and r["correct"]["bad"] is False]
     bad = [r for r in merged if r["correct"] and r["correct"]["bad"]]
     esc_known = [r for r in merged if r["correct"] and r["correct"].get("escaped") is not None]
@@ -1398,7 +1400,7 @@ def summarize(rows):
         "merge_queue": {
             "attempts_per_ready_pr": None if not n else round(sum(r["enqueues"] for r in rows) / n, 2),
             "ejections_by_cause": dict(ej.most_common()),
-            "ejections_per_merge": None if not merged else round(sum(ej.values()) / len(merged), 3),
+            "ejections_per_merge": None if not merged else round(sum(merged_ej.values()) / len(merged), 3),
             "top_ejection_cause": next((c for c, _ in ej.most_common() if c != "unknown"), None),
             "ejections_cause_unknown": ej.get("unknown", 0),
             "enqueue_to_merge_min": {"n": len(q2m), "median": med(q2m), "p90": pctile(q2m, 0.9)},
@@ -1453,6 +1455,30 @@ def all_prs(rd, lo, hi):
         if len(items) < 100 or (items and (iso(items[-1].get("created_at")) or hi) < lo):
             return out, True
     return out, False
+
+
+def read_shares(repos, cache_dir, cap, lo, hi, fetch=None):
+    """repo -> its share of the shared read cap: READ_FLOOR each, the rest in proportion to the PRs each repo lists in the
+    window (a PR costs about the same to read wherever it is, so a busy repo gets more). A repo whose listing cannot be read
+    (or stops at the planning page cap with PRs still to list) counts as the median of the others. Returns (shares, reads spent planning). A cap too small to give every repo its
+    floor after its planning listing is split equally with no planning reads, so the total is never exceeded."""
+    if cap < (READ_FLOOR + 8) * len(repos):  # 8 = most a repo's planning listing can cost
+        return {r: cap // len(repos) for r in repos}, 0
+    n, spent = {}, 0
+    for repo in repos:
+        rd = Reader(repo, cache_dir, 8, fetch)
+        try:
+            prs, complete = all_prs(rd, lo, hi)
+            n[repo] = len(prs) if complete else None  # a capped listing undercounts: unknown, not its length
+        except (Truncated, ReadError):
+            n[repo] = None
+        spent += rd.calls
+    known = sorted(v for v in n.values() if v is not None)
+    fill = known[len(known) // 2] if known else 1
+    w = {r: (v if v is not None else fill) for r, v in n.items()}
+    budget = cap - spent
+    extra, total = budget - READ_FLOOR * len(repos), sum(w.values()) or 1
+    return {r: READ_FLOOR + max(0, extra) * w[r] // total for r in repos}, spent
 
 
 def collect_repo(repo, cache_dir, cap, owner, lo, hi, now, ticks, tick_ctx, fetch=None, managed_base="main", dirty=(), merged_between=None):
@@ -1663,14 +1689,15 @@ def build(repos, cache_dir, cap, owner, start, now, ticks, tick_ctx, baseline=No
         lo = min(lo, baseline[0])
     # `cap` is a shared total per run. Each repo gets an equal share of what is left, so reads a small
     # repo does not use (a warm cache) flow to the repos read after it.
-    per_cap = max(1, cap // max(1, len(repos)))
-    remaining = cap
+    shares, planning_reads = read_shares(repos, cache_dir, cap, lo, now, fetch)
+    per_cap = max(shares.values()) if shares else 0
+    remaining = cap - planning_reads
     controls = DEFAULT_CONTROLS if controls is None else controls
     out = {"scorecard_version": SCORECARD_VERSION, "owner": owner, "read_cap_per_repo": per_cap, "read_cap_total": cap, "repos": {}, "truncated": False,
-           "reads": 0, "coverage": {"status": "available", "reason": ""}, "baseline": None, "window": None, "controls_failed": False}
-    notes = []
+           "reads": planning_reads, "coverage": {"status": "available", "reason": ""}, "baseline": None, "window": None, "controls_failed": False}
+    notes, carry = [], 0
     for i, repo in enumerate(repos):
-        repo_cap = remaining // (len(repos) - i)  # may be 0: the shared total is never exceeded
+        repo_cap = min(remaining, shares[repo] + carry)  # reads an earlier repo left unused flow on; the shared total is never exceeded
         r = collect_repo(repo, cache_dir, repo_cap, owner, lo, now, now, ticks, tick_ctx, fetch,
                          (bases or {}).get(repo, "main"), (dirty or {}).get(repo, ()), merged_between)
         excluded = collections.Counter(x["excluded_because"] for x in r["rows"] if not x["eligible"])
@@ -1693,6 +1720,7 @@ def build(repos, cache_dir, cap, owner, start, now, ticks, tick_ctx, baseline=No
         out["truncated"] = out["truncated"] or r["truncated"]
         out["reads"] += r["reads"]
         remaining = max(0, remaining - r["reads"])
+        carry = max(0, repo_cap - r["reads"])
         out["controls_failed"] = out["controls_failed"] or ctl["status"] == "failed"
         if r["truncated"] or r["unread"] or not r["listing_complete"] or r["errors"]:
             notes.append(f"{repo}: truncated={r['truncated']} unread={r['unread']} listing_complete={r['listing_complete']} read_errors={r['errors']}")
@@ -1771,7 +1799,7 @@ def sample_label(s, truncated):
 def markdown(e2e):
     L = ["", f"## Scorecard {e2e['scorecard_version']}: end-to-end per eligible PR (cohort = UTC day the PR became ready)", "",
          "Baseline cohort: PRs ready 2026-11-12 to 2026-11-14. A day closes 48h after it ends, so the first comparable later cohort day closes 48h after that day.", "",
-         f"Reads {e2e['reads']} (cap {e2e.get('read_cap_total', e2e['read_cap_per_repo'])} per run, shared: each repo gets an equal share of what is left), truncated={str(e2e['truncated']).lower()}"
+         f"Reads {e2e['reads']} (cap {e2e.get('read_cap_total', e2e['read_cap_per_repo'])} per run, shared: 100 reads per repo, the rest by listed PR count; an unused share flows to the repos after it), truncated={str(e2e['truncated']).lower()}"
          + (" : a repo with any unread PR is withheld entirely; fully read repos are reported normally" if e2e["truncated"] else "") + f". Coverage: {e2e['coverage']['status']} {e2e['coverage']['reason']}", "",
          f"North Star: eligible PRs that became ready in the window and merged within 48h of ready with no owner action ({e2e['owner']}'s own account: "
          "review, label, comment, UI merge or close), over ALL eligible PRs ready in the window. A cohort day is reported only after its 48h horizon closed. "
