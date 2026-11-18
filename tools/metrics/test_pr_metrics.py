@@ -885,6 +885,12 @@ class RerunCache(Base):
         r = out["repos"][REPO]["prs"][0]
         self.assertEqual((r["path"], r["compute"]["complete"]), ("slow", False))
 
+    def test_the_documented_scorecard_version_is_the_one_the_report_prints(self):
+        doc = open(os.path.join(os.path.dirname(os.path.abspath(pm.__file__)), "..", "..", "docs", "metrics.md"), encoding="utf-8").read()
+        m = re.search(r"Scorecard definition version: `([^`]+)`", doc)
+        self.assertIsNotNone(m)
+        self.assertEqual(m.group(1), pm.SCORECARD_VERSION)
+
 
 class JobsSkippedHold(Base):
     """Findings of the review of the job-read switch."""
@@ -1115,6 +1121,12 @@ class MergeRemoval(Base):
         r = self.rows(out)[1]
         self.assertEqual(r["ejections"], ["unknown"])  # the 10:30 one only
         self.assertEqual((r["path"], r["path_why"]), ("slow", ["ejection"]))
+
+    def test_a_removal_with_an_explicit_reason_near_the_merge_is_still_an_ejection(self):
+        p = pr(1, T(10, "09:00"), T(10, "11:00"))
+        e = dict(self.removal("10:59"), reason="failed_checks")
+        r = self.rows(self.build(world([p], {1: [e]})))[1]
+        self.assertEqual((r["ejections"], r["path"]), (["failed_checks"], "slow"))
 
     def test_a_pr_with_only_the_merge_removal_is_not_slow_for_an_ejection(self):
         p = pr(1, T(10, "10:00"), T(10, "11:00"))
@@ -1748,6 +1760,22 @@ class Proxies(Base):
         out = self.build(world([p], runs=runs, jobs={21: job, 22: job}), now=self.LATE)
         c = self.rows(out)[1]["compute"]
         self.assertEqual((c["runs"], c["repeat_runs"], c["group_runs"]), (2, 1, 1))
+
+    def test_a_post_merge_push_run_adds_no_runner_wait(self):
+        p = pr(1, T(10, "09:00"), T(10, "11:00"))
+        runs = [{"id": 21, "head_sha": "grp", "event": "merge_group", "status": "completed", "name": "GPU", "head_branch": "gh-readonly-queue/main/pr-1-x"},
+                {"id": 22, "head_sha": "grp", "event": "push", "status": "completed", "name": "GPU", "head_branch": "main"}]
+        job = [{"labels": ["self-hosted"], "created_at": T(10, "10:00"), "started_at": T(10, "10:05"), "completed_at": T(10, "10:10"), "conclusion": "success"}]
+        out = self.build(world([p], runs=runs, jobs={21: job, 22: job}), now=self.LATE)
+        self.assertEqual(self.rows(out)[1]["compute"]["runner_wait_min"], 5.0)
+
+    def test_a_push_run_on_a_pr_head_keeps_its_runner_wait(self):
+        p = pr(1, T(10, "09:00"), T(10, "11:00"))
+        h = pr(1, T(10, "09:00"), T(10, "11:00"))["head"]["sha"]
+        runs = [{"id": 21, "head_sha": h, "event": "push", "status": "completed", "name": "GPU", "head_branch": "feat"}]
+        job = [{"labels": ["self-hosted"], "created_at": T(10, "10:00"), "started_at": T(10, "10:05"), "completed_at": T(10, "10:10"), "conclusion": "success"}]
+        out = self.build(world([p], runs=runs, jobs={21: job}), now=self.LATE)
+        self.assertEqual(self.rows(out)[1]["compute"]["runner_wait_min"], 5.0)
 
 
 class VellumControl(unittest.TestCase):

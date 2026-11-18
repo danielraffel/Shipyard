@@ -49,7 +49,7 @@ CASES = [
     {"n": 7, "name": "held_twice", "delay": 150, "north": "autonomous", "holds": 2, "re_holds": 1,
      "pushes": {"author": 1, "repair": 1, "merge_main": 1}, "slow": True, "cause_min": {"hold": None}},
     {"n": 8, "name": "queued_twice", "delay": 85, "north": "autonomous", "enqueues": 2, "ejections": ["ci_failure"], "enq_to_merge": 45, "slow": True, "cause_min": {"queue": 55}},
-    {"n": 9, "name": "compute", "delay": 95, "north": "autonomous", "runs": 4, "repeat_runs": 2, "macos_min": 10, "slow": True, "cause_min": {"red": None, "runner": 8},
+    {"n": 9, "name": "compute", "delay": 95, "north": "autonomous", "runs": 4, "repeat_runs": 2, "macos_min": 10, "slow": True, "cause_min": {"red": None, "runner": 6},  # three runs that can precede the merge wait 2 min each; the push on the merge-group sha runs after it
      "workflows": {"ci": {"pull_request": 2, "merge_group": 1, "push": 1}}},
     {"n": 10, "name": "owner_label_a", "delay": 100, "north": "owner_action", "owner_actions": 1},
     {"n": 11, "name": "owner_label_b", "delay": 110, "north": "owner_action", "owner_actions": 1},
