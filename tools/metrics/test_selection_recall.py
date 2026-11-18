@@ -63,8 +63,8 @@ class Calc(unittest.TestCase):
 
     def test_misses_count_failed_outside_selection_in_narrowed_jobs_and_name_the_verdict(self):
         rows = [(gate(1, "failure"), [sel(failed=3, outside=2, names=["gpu a", "timing b"]),
-                                      exo({"gpu a": {"excused": True, "reason": "fails on other heads"},
-                                           "timing b": {"excused": False, "reason": "main evidence unread"}})]),
+                                      exo({"gpu a": {"excused": True, "other_prs": [], "reason": "fails on other heads"},
+                                           "timing b": {"excused": False, "other_prs": [], "reason": "main evidence unread"}})]),
                 (gate(2, "failure"), [sel(failed=1, outside=1, names=["c"])]),
                 (gate(3), [sel()]), (gate(4), [sel()])]
         n = report(rows)["narrowed"]
@@ -75,7 +75,7 @@ class Calc(unittest.TestCase):
                           (2, "c", "no verdict")])
 
     def test_the_shadow_exoneration_title_with_would_exonerate_is_read_too(self):
-        shadow = {"title": "flake-exoneration-shadow", "message": json.dumps({"tests": {"t": {"would_exonerate": True}}})}
+        shadow = {"title": "flake-exoneration-shadow", "message": json.dumps({"tests": {"t": {"would_exonerate": True, "reason": "r"}}})}
         n = report([(gate(1, "failure"), [sel(failed=1, outside=1, names=["t"]), shadow]), (gate(2), [sel()])])["narrowed"]
         self.assertEqual((n["miss_list"][0]["verdict"], n["unexplained_misses"]), ("exonerated", 0))
 
@@ -127,42 +127,63 @@ class Calc(unittest.TestCase):
         r = report([(gate(1), [sel(), bad]), (gate(2), [sel()])])
         self.assertEqual((r["jobs_read"], r["jobs_unread"]), (1, 1))
 
-    def test_every_schema_field_is_required_and_exactly_typed(self):
-        good = {
-            "affected-tests-shadow": (sr.SELECTION_SCHEMA, {"total": 100, "selected": 5, "select_all": False,
-                                      "reason": "graph", "failed": 1, "failed_outside_selection": 1,
-                                      "failed_outside_names": ["t"]}),
-            "test-receipts-shadow": (sr.RECEIPTS_SCHEMA, {"selected": 100, "would_skip": 10, "would_skip_failed": 1,
-                                     "would_skip_failed_names": ["x"]}),
-            "flake-exoneration": (sr.EXONERATION_SCHEMA, {"tests": {"t": {"excused": True}}}),
-        }
-        wrong = [None, "false", "1", 1.5, -1, True, [], {}, [1], 7, {"t": 1}]
+    def test_every_schema_field_is_required_and_exactly_typed_at_every_nesting_level(self):
+        sel_n = {"total": 100, "selected": 5, "select_all": False, "reason": "graph", "failed": 1,
+                 "failed_outside_selection": 1, "failed_outside_names": ["t"]}
+        wrong = [None, "false", "true", "1", 1.5, -1, True, False, 0, 7, [], {}, [1], ["a"], {"t": 1}]
+        cases = [("affected-tests-shadow", sr.SELECTION_SCHEMA, sel_n, lambda n: n),
+                 ("test-receipts-shadow", sr.RECEIPTS_SCHEMA, {"selected": 100, "would_skip": 10, "would_skip_failed": 1,
+                                                               "would_skip_failed_names": ["x"]}, lambda n: n)]
+        entries = {"flake-exoneration": {"excused": True, "other_prs": [12], "reason": "r"},
+                   "flake-exoneration-shadow": {"would_exonerate": True, "reason": "r"}}
+        for title, entry in entries.items():
+            cases.append((title, sr.EXONERATION_SCHEMAS[title], {"tests": {"t": entry}}, lambda n: n))
 
         def run(title, msg):
-            anns = [{"title": "affected-tests-shadow", "message": json.dumps(good["affected-tests-shadow"][1])}]
-            if title != "affected-tests-shadow":
-                anns.append({"title": title, "message": json.dumps(msg)})
-            else:
-                anns = [{"title": title, "message": json.dumps(msg)}]
-            return sr.read_job(gate(1), anns)
+            anns = [{"title": "affected-tests-shadow", "message": json.dumps(sel_n)}]
+            anns = [{"title": title, "message": json.dumps(msg)}] if title == "affected-tests-shadow" else \
+                anns + [{"title": title, "message": json.dumps(msg)}]
+            return sr.read_job(gate(1), anns)[0]
 
+        def walk(title, schema, notice, path, rebuild):
+            """Every field of `schema` dropped and mistyped inside `notice`; recurse into nested tables."""
+            for field, ok in schema:
+                self.assertIsNone(run(title, rebuild({k: v for k, v in notice.items() if k != field})), f"{path}: no {field}")
+                for w in wrong:
+                    if not ok(w):
+                        self.assertIsNone(run(title, rebuild(dict(notice, **{field: w}))), f"{path}.{field}={w!r}")
+                nested = getattr(ok, "schema", None)
+                if nested:
+                    entry = next(iter(notice[field].values()))
+                    walk(title, nested, entry, f"{path}.{field}[]",
+                         lambda e, f=field, n=notice, rb=rebuild: rb(dict(n, **{f: {"t": e}})))
+
+        for title, schema, notice, rebuild in cases:
+            self.assertIsNotNone(run(title, notice), title)
+            walk(title, schema, notice, title, rebuild)
         self.assertEqual([f for f, _ in sr.SELECTION_SCHEMA], [
             "total", "selected", "select_all", "reason", "failed", "failed_outside_selection", "failed_outside_names"])
         self.assertEqual([f for f, _ in sr.RECEIPTS_SCHEMA], [
             "selected", "would_skip", "would_skip_failed", "would_skip_failed_names"])
-        self.assertEqual([f for f, _ in sr.EXONERATION_SCHEMA], ["tests"])
-        for title, (schema, notice) in good.items():
-            self.assertIsNotNone(run(title, notice)[0], title)
-            for field, ok in schema:
-                dropped = {k: v for k, v in notice.items() if k != field}
-                self.assertIsNone(run(title, dropped)[0], f"{title} without {field}")
-                for w in wrong:
-                    if ok(w):
-                        continue
-                    self.assertIsNone(run(title, dict(notice, **{field: w}))[0], f"{title}.{field}={w!r}")
+        self.assertEqual({k: [f for f, _ in v] for k, v in sr.TEST_SCHEMAS.items()},
+                         {"flake-exoneration": ["excused", "other_prs", "reason"],
+                          "flake-exoneration-shadow": ["would_exonerate", "reason"]})
+
+    def test_other_prs_must_be_a_list_of_counts(self):
+        for bad in (["12"], [-1], [True], [1.5], "12"):
+            e = {"title": "flake-exoneration", "message": json.dumps(
+                {"tests": {"t": {"excused": True, "other_prs": bad, "reason": "r"}}})}
+            self.assertIsNone(sr.read_job(gate(1), [sel(), e])[0], bad)
+
+    def test_a_string_false_is_not_an_exoneration(self):
+        for title, field in (("flake-exoneration", "excused"), ("flake-exoneration-shadow", "would_exonerate")):
+            e = {"title": title, "message": json.dumps({"tests": {"t": {field: "false", "other_prs": [], "reason": "r"}}})}
+            self.assertIsNone(sr.read_job(gate(1), [sel(failed=1, outside=1, names=["t"]), e])[0])
+        f = {"exoneration": {"t": {"excused": "false", "reason": "r"}}}
+        self.assertEqual(sr.verdict(f, "t"), "not excused: r")
 
     def test_exoneration_tests_must_map_names_to_objects(self):
-        for bad in ({"t": 1}, {"t": None}, ["t"]):
+        for bad in ({"t": 1}, {"t": None}, ["t"], {"t": {}}):
             anns = [sel(), {"title": "flake-exoneration", "message": json.dumps({"tests": bad})}]
             self.assertIsNone(sr.read_job(gate(1), anns)[0])
 
@@ -239,7 +260,7 @@ class Collect(unittest.TestCase):
             2: [mjob(21, labels=("ubuntu-latest",))],          # the hosted bootstrap stub of the same name
             3: [mjob(31, conclusion="cancelled"), mjob(32, conclusion="failure")],
             4: [mjob(41, status="in_progress", conclusion=None)]}
-        self.ann = {11: [sel(), rcpt()], 32: [sel(failed=1, outside=1, names=["t"]), exo({"t": {"excused": False, "reason": "r"}})]}
+        self.ann = {11: [sel(), rcpt()], 32: [sel(failed=1, outside=1, names=["t"]), exo({"t": {"excused": False, "other_prs": [], "reason": "r"}})]}
 
     def go(self, fake, cap=1000, **kw):
         out = Path(self.tmp) / "o.json"

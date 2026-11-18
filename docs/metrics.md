@@ -206,7 +206,9 @@ Notices parsed (JSON in `message`): `affected-tests-shadow` or `shipyard-selecti
 | Unexplained misses | Misses minus those whose verdict is `exonerated`, and the same per 100 narrowed jobs. This is the figure the promotion rule reads. |
 | Receipts | Jobs with the notice, median `would_skip / selected`, and `would_skip_failed` (with names). |
 
-Each notice is checked against a schema table (`SELECTION_SCHEMA`, `RECEIPTS_SCHEMA`, `EXONERATION_SCHEMA`): every
+Each notice is checked against a schema table (`SELECTION_SCHEMA`, `RECEIPTS_SCHEMA`, `EXONERATION_SCHEMAS`, which nests
+`TEST_SCHEMAS` for the per-test objects: a boolean `excused` or `would_exonerate`, a string `reason`, a list of counts
+`other_prs`; verdicts compare with `is True`, never truthiness): every
 field is required with its exact JSON type (`select_all` a boolean, counts non-negative integers, names lists of
 strings, no defaults), with `selected <= total`, `failed_outside_selection <= failed`,
 `0 <= would_skip_failed <= would_skip <= selected` and no more names than their count. A failing notice is unread.

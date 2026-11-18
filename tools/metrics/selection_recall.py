@@ -233,7 +233,22 @@ SELECTION_SCHEMA = (("total", _count), ("selected", _count), ("select_all", _boo
                     ("failed", _count), ("failed_outside_selection", _count), ("failed_outside_names", _names))
 RECEIPTS_SCHEMA = (("selected", _count), ("would_skip", _count), ("would_skip_failed", _count),
                    ("would_skip_failed_names", _names))
-EXONERATION_SCHEMA = (("tests", lambda v: isinstance(v, dict) and all(isinstance(t, dict) for t in v.values())),)
+def _each(schema):
+    """A check for an object whose every value is itself an object validated against `schema` (a nested table)."""
+    def check(v):
+        return isinstance(v, dict) and all(validate(t, schema) is None for t in v.values())
+    check.schema = schema
+    return check
+
+
+def _counts(v):
+    return isinstance(v, list) and all(_count(n) for n in v)
+
+
+# The per-test object differs by title: `excused` in the notice proper, `would_exonerate` in the shadow notice.
+TEST_SCHEMAS = {"flake-exoneration": (("excused", _bool), ("other_prs", _counts), ("reason", _text)),
+                "flake-exoneration-shadow": (("would_exonerate", _bool), ("reason", _text))}
+EXONERATION_SCHEMAS = {title: (("tests", _each(ts)),) for title, ts in TEST_SCHEMAS.items()}
 # Cross-field constraints, each a (description, predicate over the notice).
 SELECTION_RULES = (("selected <= total", lambda m: m["selected"] <= m["total"]),
                    ("failed_outside_selection <= failed", lambda m: m["failed_outside_selection"] <= m["failed"]),
@@ -283,7 +298,7 @@ def read_job(g, annotations):
                              "would_skip_failed": r["would_skip_failed"], "failed_names": r["would_skip_failed_names"]}
         elif a["title"] in EXONERATION_TITLES:
             e = parse_notice(a)
-            if validate(e, EXONERATION_SCHEMA):
+            if validate(e, EXONERATION_SCHEMAS[a["title"]]):
                 return None, "exoneration annotation invalid"
             f["exoneration"].update(e["tests"])
     return f, None
@@ -293,7 +308,7 @@ def verdict(f, name):
     t = f["exoneration"].get(name)
     if not isinstance(t, dict):
         return "no verdict"
-    if t.get("excused") or t.get("would_exonerate"):
+    if t.get("excused") is True or t.get("would_exonerate") is True:
         return "exonerated"
     return f"not excused: {t.get('reason') or 'unknown'}"
 
