@@ -1379,7 +1379,7 @@ def all_prs(rd, lo, hi):
 def read_shares(repos, cache_dir, cap, lo, hi, fetch=None):
     """repo -> its share of the shared read cap: READ_FLOOR each, the rest in proportion to the PRs each repo lists in the
     window (a PR costs about the same to read wherever it is, so a busy repo gets more). A repo whose listing cannot be read
-    counts as the median of the others. Returns (shares, reads spent planning). A cap too small to give every repo its
+    (or stops at the planning page cap with PRs still to list) counts as the median of the others. Returns (shares, reads spent planning). A cap too small to give every repo its
     floor after its planning listing is split equally with no planning reads, so the total is never exceeded."""
     if cap < (READ_FLOOR + 8) * len(repos):  # 8 = most a repo's planning listing can cost
         return {r: cap // len(repos) for r in repos}, 0
@@ -1387,7 +1387,8 @@ def read_shares(repos, cache_dir, cap, lo, hi, fetch=None):
     for repo in repos:
         rd = Reader(repo, cache_dir, 8, fetch)
         try:
-            n[repo] = len(all_prs(rd, lo, hi)[0])
+            prs, complete = all_prs(rd, lo, hi)
+            n[repo] = len(prs) if complete else None  # a capped listing undercounts: unknown, not its length
         except (Truncated, ReadError):
             n[repo] = None
         spent += rd.calls

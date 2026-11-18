@@ -2097,6 +2097,15 @@ class ReadShares(unittest.TestCase):
         self.assertTrue(all(shares[r] >= pm.READ_FLOOR for r in counts))
         self.assertLessEqual(sum(shares.values()) + spent, 3000)
 
+    def test_an_incomplete_planning_listing_is_unknown_and_takes_the_median_of_the_others(self):
+        counts = {"o/huge": 1000, "o/a": 20, "o/b": 40, "o/c": 60}  # o/huge: eight pages of 100 and still more
+        with tempfile.TemporaryDirectory() as d:
+            shares, spent = pm.read_shares(list(counts), d, 3000, self.LO, self.HI, self.fetch_for(counts))
+        extra = 3000 - spent - pm.READ_FLOOR * len(counts)
+        total = 40 + 20 + 40 + 60  # unknown repo weighs the median (40) of the complete listings, not its capped 800
+        self.assertEqual(shares["o/huge"], pm.READ_FLOOR + extra * 40 // total)
+        self.assertEqual(shares["o/c"], pm.READ_FLOOR + extra * 60 // total)
+
     def test_a_cap_that_cannot_fund_the_floors_after_planning_is_split_equally(self):
         counts = {f"o/r{i}": 50 for i in range(5)}
         calls = []
