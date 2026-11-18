@@ -151,3 +151,38 @@ stops answered. CI compute per episode and owner stops answered are always
 context in the JSON; no number in the summary is a duration.
 
 The four end-to-end per-merged-PR metrics (autonomous merge rate, handoff-to-merge time, compute, correctness) are the scorecard above.
+
+## Workflow cost report
+
+`tools/metrics/workflow_cost.py` answers, for one repository and window, where the runner time goes and how long
+jobs wait for it. It is read-only and nothing calls it; run it by hand or from a loop that wants a baseline.
+
+```
+python3 -I tools/metrics/workflow_cost.py --repo Generous-Corp/vellum --since 2026-11-11 --until 2026-11-17 \
+  --events push,merge_group,pull_request --workflow "Locked macOS GPU proof" \
+  --cache ~/.cache/shipyard-workflow-cost --json-out cost.json --md-out cost.md
+```
+
+Reads use the scorecard's `Reader` (`ghread` for Generous-Corp, `ghapp` otherwise), so they share its cache format
+and a hard cap on calls (`--read-cap`, default 8000). Runs are listed one UTC day at a time; a day whose search
+total is over the 1,000-result cap is split by time until each part fits. The jobs of a completed run are fetched
+with `filter=all` (every attempt) and cached for good, as are listings of days that are two or more days old and
+fully complete, so a second run over the same window reads almost nothing. `--workflow` limits which runs have their
+jobs read; it does not change the duplicate or never-landed lookups.
+
+| Figure | Definition |
+| --- | --- |
+| Job minutes | `started_at` to `completed_at`. A skipped job, or one that never got a runner, is zero. A job is fleet when `self-hosted` is among its labels, grouped by the first label that is not generic (`macOS`, `ARM64`, `linux`, ...); otherwise hosted. |
+| Queue minutes | `created_at` to `started_at` of jobs that got a runner: median, p90 (linear interpolation) and sum, per workflow and event. |
+| Duplicate | A push run on `--branch` (default `main`) whose `head_sha` has a successful `merge_group` run of the same workflow path. The merge group is listed from one day before the window. |
+| Short-job wait | Per fleet label: jobs that ran under 3 minutes, their count and their queue hours, next to all fleet jobs and queue hours for that label. |
+| Never landed | Fleet minutes of completed `merge_group` runs whose `head_sha` is not the `head_sha` of any push to the branch. Pushes are listed through the day after the window; a run still in flight is counted separately and left out. |
+
+`partial` is printed, with the reason, when a listing could not be read in full, a run's jobs were not read (read
+cap or error) or the cap was reached. A partial row is never zero: it shows how many runs went unread. Re-run with
+the same `--cache` to finish the missing reads.
+
+Reproduced for 2026-11-11 to 2026-11-17 (full counts, no sampling): Pulp push is 4,518 runs, 70,515 hosted minutes
+and 0 fleet minutes; Vellum push is 1,096 runs, 2,952 fleet and 4,803 hosted minutes; Pulp merge-group `macos`
+is 7,881 fleet minutes, 2,080 of them in groups that never landed; Vellum pull-request `sterile-consumer` is 86.9
+queue hours over 2026-11-15 to 2026-11-17.
