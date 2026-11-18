@@ -169,6 +169,60 @@ context in the JSON; no number in the summary is a duration.
 
 The four end-to-end per-merged-PR metrics (autonomous merge rate, handoff-to-merge time, compute, correctness) are the scorecard above.
 
+## Selection recall report
+
+`tools/metrics/selection_recall.py` aggregates what a repo's merge-group gate already says about test selection, so
+the window number that decides whether narrowing may go live, or must be rolled back, is read rather than assembled
+by hand. It is read-only and nothing calls it.
+
+```
+python3 -I tools/metrics/selection_recall.py --repo Generous-Corp/pulp --since 2026-11-11 --until 2026-11-17 \
+  --workflow .github/workflows/build.yml --job macos --cache ~/.cache/shipyard-selection-recall \
+  --json-out recall.json --md-out recall.md
+```
+
+Reads use the scorecard's `Reader` (cache, per-repo read cap `--read-cap`, `ghread` for Generous-Corp). It lists the
+workflow's `merge_group` runs one UTC day at a time, reads each completed run's jobs (latest attempt), and for every
+completed gate job reads `check-runs/{job_id}/annotations`. Annotations of a finished job are cached for good; a run's
+cached jobs are read again when the run's attempt number moved.
+
+A gate job is a completed (success or failure) job named `--job` on `--runner-class` runners (default `fleet`). The
+same job name can also run on a hosted runner as the bootstrap and reuse stub, which runs no suite and emits no
+notice; those, cancelled jobs and runs not yet completed are counted under `excluded`, never as unread.
+
+Notices parsed (JSON in `message`): `affected-tests-shadow` or `shipyard-selection-shadow` (same fields:
+`total`, `selected`, `select_all`, `reason`, `failed`, `failed_outside_selection`, `failed_outside_names`),
+`test-receipts-shadow` (`would_skip`, `selected`, `would_skip_failed`, `would_skip_failed_names`) and
+`flake-exoneration` (`tests.<name>.excused` and `reason`; the `flake-exoneration-shadow` title with
+`would_exonerate` is read as well).
+
+| Figure | Definition |
+| --- | --- |
+| Select-all share | Read jobs with `select_all`, over read jobs. Reasons are ranked; a leading count is folded so "1 changed file(s) no edge reads" and "2 changed file(s) ..." are one row. |
+| Narrowed share, selected fraction | Read jobs without `select_all`. Selected fraction is `selected / total` per narrowed job: median and p90 (linear interpolation). |
+| Failing tests in narrowed jobs | Sum of `failed` over narrowed jobs. Failures in select-all jobs are reported apart and are never misses. |
+| Miss | A failing test outside the selection (`failed_outside_selection`) in a narrowed job. Listed with job id, test name and the exoneration verdict: `exonerated`, `not excused: <reason>`, or `no verdict` when the job has no exoneration notice. |
+| Misses per 100 narrowed jobs | Misses over narrowed jobs, times 100. The promotion rule is 0 unexplained misses over at least 300 narrowed jobs. |
+| Unexplained misses | Misses minus those whose verdict is `exonerated`, and the same per 100 narrowed jobs. This is the figure the promotion rule reads. |
+| Receipts | Jobs with the notice, median `would_skip / selected`, and `would_skip_failed` (with names). |
+
+Each notice is checked against a schema table (`SELECTION_SCHEMA`, `RECEIPTS_SCHEMA`, `EXONERATION_SCHEMAS`, which nests
+`TEST_SCHEMAS` for the per-test objects: a boolean `excused` or `would_exonerate`, a string `reason`, a list of counts
+`other_prs`; verdicts compare with `is True`, never truthiness): every
+field is required with its exact JSON type (`select_all` a boolean, counts non-negative integers, names lists of
+strings, no defaults), with `selected <= total`, `failed_outside_selection <= failed`,
+`0 <= would_skip_failed <= would_skip <= selected` and no more names than their count. A failing notice is unread.
+
+A gate job whose selection notice is missing, unparseable or invalid, whose annotations could not be read, or whose run's
+jobs could not be read is unread: it is listed, and the result prints `PARTIAL`, as it does when under 95% of gate
+jobs carried a selection notice, a listing was truncated or the read cap was reached.
+
+Reproduced for Pulp, 2026-11-11 to 2026-11-17: 310 gate jobs, 309 read (one failed in `Fetch pulp-rs crates` before
+the shadow ran); 195 select-all (157 "cmake changed"), 114 narrowed, selected fraction median 3.2% and p90 36.3%;
+28 gate jobs with a failing test and 30 failing tests; 12 failing tests in narrowed jobs, 6 misses, 5.3 per 100
+narrowed jobs, all 6 unexplained (every verdict "not excused: main evidence unread"); receipts would skip a median 0.87% of tests and one
+skipped test failed.
+
 ## Workflow cost report
 
 `tools/metrics/workflow_cost.py` answers, for one repository and window, where the runner time goes and how long
