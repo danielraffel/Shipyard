@@ -3798,9 +3798,11 @@ GitHub reports it `CLEAN`, or `UNSTABLE` under an advisory list. `UNSTABLE`
 means every required rule is met and some other check is red or pending (an
 unmet required rule is `BLOCKED`). The steward merges such a head only when
 the base's `.shipyard/config.toml` sets `[auto_merge] unstable_advisory_checks
-= ["zizmor (report only)"]` and that list names (exact name, any case) every
-check on the head that no required rule selects and that is red or pending,
-each producer judged on its newest run. An unlisted, renamed or new check
+= ["zizmor (report only)"]` and that list names (exact, case-sensitive
+name) every check on the head that no required rule selects and that is red
+or pending. Every check-run observation counts on its own (a green run of the
+same name never hides a red one); a commit status counts by its newest status
+per context. An unlisted, renamed or new check
 holds the head, and so do the steward's own `shipyard/steward-recovery` status
 (never advisory) and an `UNSTABLE` state with no visible non-green check.
 With the key unset, a list that is not an array of check names, an

@@ -52,7 +52,7 @@
 //! on a base with no merge queue, where the steward merges an approved head
 //! itself. GitHub's `UNSTABLE` merge state means only checks that are not
 //! required are red or pending; the steward admits such a head only when
-//! every one of those is named here (exact name, any case), so an unknown,
+//! every one of those is named here (exact, case-sensitive name), so an unknown,
 //! renamed or new check holds it. Unset, a value that is not an array of
 //! non-empty strings, an `auto_merge` that is not a table, or a config that
 //! cannot be read all leave the list unknown, and then only `CLEAN` is

@@ -968,7 +968,7 @@ fn assert_merged(outcome: &Outcome) {
 fn unstable_head_red_only_in_an_advisory_check_is_merged() {
     let json = unstable_pr_json("SUCCESS", &[("zizmor (report only)", "FAILURE")]);
     let outcome = run_unstable(
-        &unstable_policy(Some(&["Zizmor (report only)"])),
+        &unstable_policy(Some(&["zizmor (report only)"])),
         &json,
         &json,
     );
@@ -1244,19 +1244,23 @@ fn a_head_still_unstable_after_the_clear_merges_when_only_advisory_checks_are_re
     assert!(clear < merge, "{calls}");
 }
 
-/// Each producer of a check is judged on its own newest observation: a job
-/// rerun in the same workflow run supersedes the red attempt, while a green
-/// run from another app, or from another workflow run (another workflow, or
-/// another event) with the same job name, does not hide the red one.
+/// No green observation can stand in for a red one: every check-run
+/// observation is judged on its own (both reads return only the latest run
+/// per check), so a newer green of the same name, from the same workflow run
+/// (a matrix sibling), another run or another app, never hides a red one.
+/// Names compare exactly: a green `lint` does not hide a red `Lint`, and
+/// listing `lint` does not waive `Lint`. A commit status is judged on its
+/// newest status per exact context, as GitHub's combined status is.
 #[test]
-fn each_producer_of_a_check_is_judged_on_its_own_newest_observation() {
-    let policy = unstable_policy(Some(&["zizmor (report only)"]));
-    let classify = |second_app: Option<u64>,
-                    second_run: u64,
-                    second: &str,
-                    extra_unlisted_app: Option<u64>| {
+fn no_green_observation_hides_a_red_one_and_names_compare_exactly() {
+    let advisory = |names: &[&str]| unstable_policy(Some(names));
+    let base_pr = || {
         let mut pr = parse_pr(
-            &serde_json::from_str(&unstable_pr_json("SUCCESS", &[])).expect("PR json"),
+            &serde_json::from_str(&unstable_pr_json(
+                "SUCCESS",
+                &[("zizmor (report only)", "FAILURE")],
+            ))
+            .expect("PR json"),
             &BTreeMap::new(),
         )
         .expect("PR")
@@ -1267,56 +1271,123 @@ fn each_producer_of_a_check_is_judged_on_its_own_newest_observation() {
             )
             .expect("check run"),
         );
-        let base = StewardCheck {
-            name: "risk-tier".to_owned(),
-            source: crate::merge_steward::StewardCheckSource::CheckRun,
-            app_id: Some(ACTIONS_APP),
-            status: "COMPLETED".to_owned(),
-            conclusion: Some("FAILURE".to_owned()),
-            run_id: Some(500),
-            observed_at: Some("2026-10-30T00:00:10Z".to_owned()),
-            check_id: Some(5000),
-            description: None,
-        };
-        pr.checks.push(base.clone());
-        pr.checks.push(StewardCheck {
-            app_id: second_app,
-            conclusion: Some(second.to_owned()),
-            run_id: Some(second_run),
-            observed_at: Some("2026-10-30T00:00:20Z".to_owned()),
-            check_id: Some(5001),
-            ..base.clone()
-        });
-        if let Some(app) = extra_unlisted_app {
-            pr.checks.push(StewardCheck {
-                name: "zizmor (report only)".to_owned(),
-                app_id: Some(app),
-                run_id: Some(502),
-                check_id: Some(5002),
-                ..base
-            });
-        }
-        classify_pr(&pr, &policy, &BTreeMap::new())
+        pr
     };
-    let held = StewardDecision::WaitingRequired {
+    let check =
+        |name: &str, source, app: Option<u64>, run: Option<u64>, conclusion: &str, id: u64| {
+            StewardCheck {
+                name: name.to_owned(),
+                source,
+                app_id: app,
+                status: "COMPLETED".to_owned(),
+                conclusion: Some(conclusion.to_owned()),
+                run_id: run,
+                observed_at: Some(format!("2026-10-30T00:00:{:02}Z", id % 60)),
+                check_id: Some(id),
+                description: None,
+            }
+        };
+    let run_source = crate::merge_steward::StewardCheckSource::CheckRun;
+    let status_source = crate::merge_steward::StewardCheckSource::StatusContext;
+    let holds = |name: &str| StewardDecision::WaitingRequired {
         contexts: vec![
             UNSTABLE_WAIT.to_owned(),
-            "risk-tier (not in unstable_advisory_checks)".to_owned(),
+            format!("{name} (not in unstable_advisory_checks)"),
         ],
     };
-    // Same workflow run, green rerun: risk-tier is green; only the advisory
-    // zizmor is red, so it merges.
+    // Control: only the advisory zizmor is red.
     assert_eq!(
-        classify(Some(ACTIONS_APP), 500, "SUCCESS", Some(ACTIONS_APP)),
+        classify_pr(
+            &base_pr(),
+            &advisory(&["zizmor (report only)"]),
+            &BTreeMap::new()
+        ),
         StewardDecision::ArmMergeQueue
     );
-    // Another app's green does not hide the red attempt.
-    assert_eq!(classify(Some(99), 500, "SUCCESS", Some(ACTIONS_APP)), held);
-    // Nor does the same job name green in another workflow run (another
-    // workflow, or the same workflow on another event).
+    // A red `build` with a newer green `build`: same run (matrix sibling),
+    // another run, another app. Each holds.
+    for (run, app) in [
+        (500, Some(ACTIONS_APP)),
+        (501, Some(ACTIONS_APP)),
+        (500, Some(99)),
+    ] {
+        let mut pr = base_pr();
+        pr.checks.push(check(
+            "build",
+            run_source,
+            Some(ACTIONS_APP),
+            Some(500),
+            "FAILURE",
+            10,
+        ));
+        pr.checks
+            .push(check("build", run_source, app, Some(run), "SUCCESS", 11));
+        assert_eq!(
+            classify_pr(&pr, &advisory(&["zizmor (report only)"]), &BTreeMap::new()),
+            holds("build"),
+            "run {run} app {app:?}"
+        );
+    }
+    // `Lint` red, `lint` green: distinct checks; listing `lint` waives
+    // nothing about `Lint`.
+    let mut pr = base_pr();
+    pr.checks.push(check(
+        "Lint",
+        run_source,
+        Some(ACTIONS_APP),
+        Some(500),
+        "FAILURE",
+        10,
+    ));
+    pr.checks.push(check(
+        "lint",
+        run_source,
+        Some(ACTIONS_APP),
+        Some(500),
+        "SUCCESS",
+        11,
+    ));
     assert_eq!(
-        classify(Some(ACTIONS_APP), 501, "SUCCESS", Some(ACTIONS_APP)),
-        held
+        classify_pr(
+            &pr,
+            &advisory(&["zizmor (report only)", "lint"]),
+            &BTreeMap::new()
+        ),
+        StewardDecision::WaitingRequired {
+            contexts: vec![
+                UNSTABLE_WAIT.to_owned(),
+                "Lint (not in unstable_advisory_checks)".to_owned(),
+            ]
+        }
+    );
+    // Listed exactly, it is waived.
+    assert_eq!(
+        classify_pr(
+            &pr,
+            &advisory(&["zizmor (report only)", "Lint"]),
+            &BTreeMap::new()
+        ),
+        StewardDecision::ArmMergeQueue
+    );
+    // A commit status superseded by a newer status of the same context is
+    // judged on the newer one; `Scan` and `scan` are different contexts.
+    let mut pr = base_pr();
+    pr.checks
+        .push(check("scan", status_source, None, None, "FAILURE", 10));
+    pr.checks
+        .push(check("scan", status_source, None, None, "SUCCESS", 11));
+    assert_eq!(
+        classify_pr(&pr, &advisory(&["zizmor (report only)"]), &BTreeMap::new()),
+        StewardDecision::ArmMergeQueue
+    );
+    let mut pr = base_pr();
+    pr.checks
+        .push(check("Scan", status_source, None, None, "FAILURE", 10));
+    pr.checks
+        .push(check("scan", status_source, None, None, "SUCCESS", 11));
+    assert_eq!(
+        classify_pr(&pr, &advisory(&["zizmor (report only)"]), &BTreeMap::new()),
+        holds("Scan")
     );
 }
 
@@ -1399,19 +1470,34 @@ fn v8_builder_69_is_admitted_once_zizmor_is_advisory() {
     )
     .expect("PR")
     .fact;
-    // The census hydrates the app-bound rules' check runs over REST.
-    for (id, name, completed) in [
+    // The census hydrates the head's check runs over REST (latest per check).
+    for (id, run, name, conclusion, completed) in [
         (
             134_746_210_269_u64,
+            44_212_752_922_u64,
             "review-verdict",
+            "success",
             "2026-11-18T10:44:44Z",
         ),
-        (134_494_964_776_u64, "unit-tests", "2026-11-18T01:03:13Z"),
+        (
+            134_494_964_776,
+            44_212_755_975,
+            "unit-tests",
+            "success",
+            "2026-11-18T01:03:13Z",
+        ),
+        (
+            134_494_964_357,
+            44_212_755_939,
+            "zizmor (report only)",
+            "failure",
+            "2026-11-18T01:03:16Z",
+        ),
     ] {
         pr.checks.push(
             crate::app::merge_steward_cmd::observation::parse_rest_check(
                 &serde_json::from_str(&format!(
-                    r#"{{"id":{id},"name":"{name}","head_sha":"{V8_HEAD}","status":"completed","conclusion":"success","started_at":"2026-11-18T01:03:05Z","completed_at":"{completed}","details_url":"https://github.com/danielraffel/v8-builder/actions/runs/1/job/{id}","app":{{"id":{ACTIONS_APP},"slug":"github-actions"}}}}"#
+                    r#"{{"id":{id},"name":"{name}","head_sha":"{V8_HEAD}","status":"completed","conclusion":"{conclusion}","started_at":"2026-11-18T01:03:05Z","completed_at":"{completed}","details_url":"https://github.com/danielraffel/v8-builder/actions/runs/{run}/job/{id}","app":{{"id":{ACTIONS_APP},"slug":"github-actions"}}}}"#
                 ))
                 .expect("check run"),
             )

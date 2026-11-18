@@ -490,9 +490,9 @@ pub const ADVISORY_UNMATCHED_PREFIX: &str = "unstable_advisory_checks entry matc
 /// `CLEAN` admits. `UNSTABLE` (GitHub's word for "every required rule is met,
 /// some other check is red or pending"; an unmet required rule is `BLOCKED`)
 /// admits only when the base's `[auto_merge] unstable_advisory_checks` is
-/// known and names every check on the head that no required rule selects and
-/// that is not green, judged per producer (surface and app) on its newest
-/// observation, and at least one such check exists to explain the state. The
+/// known and names (exactly) every check on the head that no required rule
+/// selects and that is not green ([`non_required_not_green`]), and at least
+/// one such check exists to explain the state. The
 /// steward's own recovery status ([`STEWARD_RECOVERY_CONTEXT`]) can never be
 /// advisory. Every other state, and an unknown list, waits: unknown, renamed
 /// or new checks hold the head. This decides nothing about required checks
@@ -517,10 +517,8 @@ pub fn merge_state_wait(pr: &StewardPullRequest, policy: &StewardPolicy) -> Opti
         return Some(wait);
     };
     let is_advisory = |name: &str| {
-        !name.eq_ignore_ascii_case(STEWARD_RECOVERY_CONTEXT)
-            && advisory
-                .iter()
-                .any(|entry| entry.trim().eq_ignore_ascii_case(name.trim()))
+        !name.trim().eq_ignore_ascii_case(STEWARD_RECOVERY_CONTEXT)
+            && advisory.iter().any(|entry| entry.trim() == name.trim())
     };
     let not_green = non_required_not_green(pr, policy);
     let mut holding = not_green
@@ -567,7 +565,7 @@ pub fn advisory_unmatched(pr: &StewardPullRequest, policy: &StewardPolicy) -> Ve
         .filter(|entry| {
             !pr.checks
                 .iter()
-                .any(|check| check.name.trim().eq_ignore_ascii_case(entry.trim()))
+                .any(|check| check.name.trim() == entry.trim())
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -589,28 +587,17 @@ fn check_is_green(check: &StewardCheck) -> bool {
         )
 }
 
-/// Whether two observations come from the same producer of the same check:
-/// same name (any case), surface and app, and for a check run the same
-/// workflow run. A job rerun keeps its workflow run, so the newer attempt
-/// supersedes the older; the same job name in another workflow, or in the
-/// same workflow run by another event, is a separate GitHub context and is
-/// judged on its own. A commit status is one context per name, as GitHub
-/// keeps it. A check run whose workflow run is unknown (another app's) is
-/// keyed by name and app alone.
-fn same_producer(left: &StewardCheck, right: &StewardCheck) -> bool {
-    left.name.eq_ignore_ascii_case(&right.name)
-        && left.source == right.source
-        && left.app_id == right.app_id
-        && (left.source == StewardCheckSource::StatusContext || left.run_id == right.run_id)
-}
-
 /// Names of checks on this head that are not green (red or pending) and that
-/// no required rule selects, sorted. Each producer ([`same_producer`]) is
-/// judged on its newest observation, so a green check from one producer
-/// cannot hide a red one of the same name from another; a rerun by the same
-/// producer supersedes its earlier attempt. A producer is required only when
-/// a required rule selects its newest observation; any other producer of a
-/// required name is judged here like any other check.
+/// no required rule selects, sorted. Names compare exactly, as GitHub's
+/// contexts do. Both reads the steward makes of check runs (the rollup and
+/// the REST `check-runs` list) return only the latest run per check, so every
+/// check-run observation is judged on its own: no green row can stand in for
+/// a red one, whether it is a matrix sibling, another workflow's job of the
+/// same name, or a copy read moments apart (that last case holds the head for
+/// a pass, which is the safe direction). Commit statuses are read with their
+/// history, so each context is judged on its newest status, as GitHub's
+/// combined status is. The observation a required rule selects is judged by
+/// the required path instead.
 #[must_use]
 pub fn non_required_not_green(pr: &StewardPullRequest, policy: &StewardPolicy) -> Vec<String> {
     let selected = policy
@@ -618,23 +605,31 @@ pub fn non_required_not_green(pr: &StewardPullRequest, policy: &StewardPolicy) -
         .iter()
         .filter_map(|rule| selected_required_check(&pr.checks, rule))
         .collect::<Vec<_>>();
+    let is_selected = |check: &StewardCheck| {
+        selected.iter().any(|required| {
+            std::ptr::eq(*required, check)
+                || (required.source == check.source
+                    && required.check_id.is_some()
+                    && required.check_id == check.check_id)
+        })
+    };
     let mut names = pr
         .checks
         .iter()
         .filter(|check| {
-            let newest = pr
-                .checks
-                .iter()
-                .filter(|other| same_producer(other, check))
-                .max_by(|left, right| cmp_recency(left, right))
-                .is_some_and(|newest| std::ptr::eq(newest, *check));
-            newest
-                && !check_is_green(check)
-                && !selected
+            let judged = check.source != StewardCheckSource::StatusContext
+                || pr
+                    .checks
                     .iter()
-                    .any(|required| same_producer(required, check))
+                    .filter(|other| {
+                        other.source == StewardCheckSource::StatusContext
+                            && other.name.trim() == check.name.trim()
+                    })
+                    .max_by(|left, right| cmp_recency(left, right))
+                    .is_some_and(|newest| std::ptr::eq(newest, *check));
+            judged && !check_is_green(check) && !is_selected(check)
         })
-        .map(|check| check.name.clone())
+        .map(|check| check.name.trim().to_owned())
         .collect::<Vec<_>>();
     names.sort();
     names.dedup();
