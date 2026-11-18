@@ -927,6 +927,7 @@ fn stuck(number: u64, head: &str, token: &str) -> StuckCandidate {
         number,
         head: head.to_owned(),
         token: token.to_owned(),
+        placeholder_token: false,
     }
 }
 

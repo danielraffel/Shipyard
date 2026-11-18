@@ -410,11 +410,12 @@ pub(super) fn run(
         .iter()
         .map(|report| (report.number, report.head_sha.clone()))
         .collect();
+    // A row the pass budget deferred is still judged: candidacy reads the
+    // census facts, which a deferred row has. Only a row with no token at
+    // all was not seen well enough to judge.
     let deferred: BTreeSet<u64> = reports
         .iter()
-        .filter(|report| {
-            super::pass_budget::is_deferred(report) || report.blocked.blocked_on.is_empty()
-        })
+        .filter(|report| report.blocked.blocked_on.is_empty())
         .map(|report| report.number)
         .collect();
     let mut stuck = dwell::track_stuck(
@@ -526,15 +527,16 @@ fn sightings(reports: &[PrReport], stacked: &[OpenPr]) -> (Vec<Sighting>, BTreeS
 /// required check green, and that it neither merged nor queued.
 ///
 /// Approved is [`approved_at_head`]. A draft, a queued pull request (the queue owns
-/// it), a row the pass budget deferred, and one this pass merged or enqueued
-/// are not candidates.
+/// it), and one this pass merged or enqueued are not candidates. A row the
+/// pass budget deferred is judged like any other, from the census facts it
+/// carries, so a degraded steward that defers it every pass cannot keep the
+/// alarm silent; its `deferred_pass_budget` token is a placeholder, so the
+/// alert keeps the last real reason.
 fn stuck_candidates(input: &DwellInput<'_>, reports: &[PrReport]) -> Vec<dwell::StuckCandidate> {
     let policy = input.policy;
     reports
         .iter()
-        .filter(|report| {
-            !super::pass_budget::is_deferred(report) && !report.blocked.blocked_on.is_empty()
-        })
+        .filter(|report| !report.blocked.blocked_on.is_empty())
         .filter(|report| {
             !report.mutation.as_deref().is_some_and(|mutation| {
                 mutation.split([',', ';']).any(|part| {
@@ -558,6 +560,7 @@ fn stuck_candidates(input: &DwellInput<'_>, reports: &[PrReport]) -> Vec<dwell::
                 number: report.number,
                 head: report.head_sha.clone(),
                 token: report.blocked.blocked_on.clone(),
+                placeholder_token: super::pass_budget::is_deferred(report),
             })
         })
         .collect()

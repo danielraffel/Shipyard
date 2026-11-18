@@ -1022,8 +1022,9 @@ required check, its verdict re-running after a comment) restarts the clock
 when it is a candidate again if the first and last judged passes of the
 stretch are more than 15 minutes apart; a shorter one keeps it. Once alerted,
 the row stays reported (not escalating) through a deferred pass or a short
-blip, so drain watch does not see it clear and come back. A row the pass budget or a rate limit deferred, and a
-tick that did not run, are no evidence either way and change nothing, so a
+blip, so drain watch does not see it clear and come back. A row the pass budget or a rate limit deferred is judged from the census
+facts it carries (the alert keeps the last real `blocked_on`, not
+`deferred_pass_budget`), and a tick that did not run changes nothing, so a
 degraded steward cannot keep the alarm silent. It restarts at a new head and is dropped once the pull
 request is no longer seen. The alert is one per head either way, and a row the
 per-pass escalation cap defers is neither marked nor relayed. Past the limit (60

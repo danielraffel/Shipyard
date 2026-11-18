@@ -562,6 +562,9 @@ pub struct StuckCandidate {
     pub head: String,
     /// Its `blocked_on` token.
     pub token: String,
+    /// The token is a placeholder (a row the pass budget deferred), not why
+    /// the steward has not merged it: the entry keeps its last real reason.
+    pub placeholder_token: bool,
 }
 
 /// Track approved, required-green pull requests the steward has not merged,
@@ -619,7 +622,11 @@ pub fn track_stuck(
             Some(entry) if entry.head.eq_ignore_ascii_case(&candidate.head) => {
                 let resumed = entry.judged_stretch_minutes() > STUCK_GAP_MINUTES;
                 StuckApproved {
-                    token: candidate.token.clone(),
+                    token: if candidate.placeholder_token {
+                        entry.token.clone()
+                    } else {
+                        candidate.token.clone()
+                    },
                     since: if resumed { now } else { entry.since },
                     ineligible_since: None,
                     ineligible_last: None,

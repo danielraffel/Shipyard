@@ -1598,11 +1598,11 @@ fn a_dry_run_pass_reports_the_stuck_row_as_not_emitted() {
     );
 }
 
-/// Through a real pass: rows the pass budget deferred for 20 minutes are not
-/// judged, so they do not restart the stuck clock and the alert still fires
-/// on the next candidate pass past 60 minutes.
+/// Through a real pass: a row the pass budget defers on every pass is still
+/// judged from its census facts, so the alert fires at 60 minutes while it
+/// is deferred, naming the last real reason rather than the deferral.
 #[test]
-fn deferred_rows_through_a_real_pass_keep_the_stuck_clock() {
+fn a_row_deferred_every_pass_still_alerts() {
     let temp = tempfile::tempdir().unwrap();
     let prs = vec![pr(1, Some("SUCCESS"), Some("SUCCESS"), &[])];
     let mut pass = pass(
@@ -1611,26 +1611,26 @@ fn deferred_rows_through_a_real_pass_keep_the_stuck_clock() {
         vec![report(1, "merge_state:UNSTABLE", None)],
     );
     let mut ledger = established();
-    for minute in [0, 15, 30, 45] {
-        pass.now = now() + chrono::Duration::minutes(minute);
-        pass.run(&mut ledger, &FakeActs::default());
-    }
+    pass.run(&mut ledger, &FakeActs::default());
     pass.reports = vec![pass_budget::deferred_report(
         &prs[0],
         StewardDecision::ArmMergeQueue,
         "budget",
     )];
-    for minute in [50, 55, 60, 65, 70] {
+    let mut alerts = Vec::new();
+    for minute in (5..=90).step_by(5) {
         pass.now = now() + chrono::Duration::minutes(minute);
-        pass.run(&mut ledger, &FakeActs::default());
+        let report = pass.run(&mut ledger, &FakeActs::default());
+        alerts.extend(
+            report
+                .overdue
+                .iter()
+                .filter(|row| {
+                    row.state == crate::merge_steward::dwell::DwellState::ApprovedStuck
+                        && row.escalated
+                })
+                .map(|row| (minute, row.blocked_on.clone())),
+        );
     }
-    pass.reports = vec![report(1, "merge_state:UNSTABLE", None)];
-    pass.now = now() + chrono::Duration::minutes(75);
-    let back = pass.run(&mut ledger, &FakeActs::default());
-    assert!(
-        back.overdue.iter().any(|row| {
-            row.state == crate::merge_steward::dwell::DwellState::ApprovedStuck && row.escalated
-        }),
-        "deferred passes did not restart the clock"
-    );
+    assert_eq!(alerts, vec![(60, "merge_state:UNSTABLE".to_owned())]);
 }
