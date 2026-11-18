@@ -2518,6 +2518,17 @@ class GhappWrapperTests(unittest.TestCase):
             ],
         )
 
+    def test_pr_create_value_that_looks_like_web_does_not_disable_registration(
+        self,
+    ) -> None:
+        self.write_create_gh("https://github.com/owner/repo/pull/77")
+        result = self.run_wrapper(
+            "pr", "create", "--title", "--web", "--body", "x",
+            "--repo", "owner/repo",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.owner_register_calls()), 1)
+
     def test_pr_create_that_fails_or_prints_no_pull_request_registers_nothing(
         self,
     ) -> None:
@@ -2626,6 +2637,63 @@ class GhappWrapperTests(unittest.TestCase):
         self.assertIn("/pull/555", result.stderr)
         self.assertFalse(self.gh_log.exists(), "gh pr create must not run")
         self.assertEqual(self.owner_register_calls(), [])
+
+    def test_pr_create_duplicate_guard_parses_attached_short_head_and_base(self) -> None:
+        self.make_duplicate_fixture()
+        result = self.run_wrapper(
+            "pr", "create", "-Hfeature", "-Bmain", "--title", "x",
+            "--body", "y", "--repo", "owner/repo",
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("#555", result.stderr)
+        self.assertFalse(self.gh_log.exists(), "gh pr create must not run")
+
+    def test_pr_create_duplicate_guard_paginates_open_pull_requests(self) -> None:
+        self.make_duplicate_fixture()
+        first = {
+            "data": {
+                "repository": {
+                    "defaultBranchRef": {"name": "main"},
+                    "pullRequests": {
+                        "nodes": [],
+                        "pageInfo": {"hasNextPage": True, "endCursor": "cursor-1"},
+                    },
+                }
+            }
+        }
+        second = json.loads((self.root / "graphql.json").read_text())
+        second["data"]["repository"]["pullRequests"]["pageInfo"] = {
+            "hasNextPage": False,
+            "endCursor": None,
+        }
+        first_path = self.root / "graphql-first.json"
+        second_path = self.root / "graphql-second.json"
+        count_path = self.root / "graphql-count"
+        first_path.write_text(json.dumps(first), encoding="utf-8")
+        second_path.write_text(json.dumps(second), encoding="utf-8")
+        self.environment.update(
+            GRAPHQL_FIRST=str(first_path),
+            GRAPHQL_SECOND=str(second_path),
+            GRAPHQL_COUNT=str(count_path),
+        )
+        self.gh.write_text(
+            "#!/bin/sh\n"
+            "if [ \"$1 $2\" = 'api graphql' ]; then\n"
+            "  if [ -f \"$GRAPHQL_COUNT\" ]; then cat \"$GRAPHQL_SECOND\";\n"
+            "  else : > \"$GRAPHQL_COUNT\"; cat \"$GRAPHQL_FIRST\"; fi\n"
+            "  exit 0\n"
+            "fi\n"
+            "printf '%s\\n' \"$*\" > \"$GH_LOG\"\n"
+            "printf '%s\\n' https://github.com/owner/repo/pull/556\n",
+            encoding="utf-8",
+        )
+        self.gh.chmod(0o755)
+        result = self.run_wrapper(
+            "pr", "create", "--title", "x", "--body", "y", "--repo", "owner/repo"
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("#555", result.stderr)
+        self.assertFalse(self.gh_log.exists(), "gh pr create must not run")
 
     def test_pr_create_allows_the_same_tree_on_a_different_base(self) -> None:
         self.make_duplicate_fixture(other_base="release")
