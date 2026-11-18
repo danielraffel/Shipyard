@@ -48,7 +48,7 @@ CASES = [
     {"n": 6, "name": "later_fix", "delay": 120, "north": "autonomous", "title": "fix regression from #5"},
     {"n": 7, "name": "held_twice", "delay": 150, "north": "autonomous", "holds": 2, "re_holds": 1,
      "pushes": {"author": 1, "repair": 1, "merge_main": 1}, "slow": True, "cause_min": {"hold": None}},
-    {"n": 8, "name": "queued_twice", "delay": 85, "north": "autonomous", "enqueues": 2, "ejections": ["ci_failure"], "enq_to_merge": 45, "slow": True, "cause_min": {"queue": 55}},
+    {"n": 8, "name": "queued_twice", "delay": 85, "north": "autonomous", "enqueues": 2, "ejections": ["failed_checks"], "enq_to_merge": 45, "slow": True, "cause_min": {"queue": 55}},
     {"n": 9, "name": "compute", "delay": 95, "north": "autonomous", "runs": 4, "repeat_runs": 2, "macos_min": 10, "slow": True, "cause_min": {"red": 83, "runner": 6},  # red: run 101 failed at 10:12 and no push followed, so 83 min to the 11:35 merge; three runs that can precede the merge wait 2 min each; the push on the merge-group sha runs after it
      "workflows": {"ci": {"pull_request": 2, "merge_group": 1, "push": 1}}},
     {"n": 10, "name": "owner_label_a", "delay": 100, "north": "owner_action", "owner_actions": 1},
@@ -85,7 +85,7 @@ def raw_world():
                 tl.append({"event": "committed", "sha": head})  # the timeline binds the enqueue to the merged SHA
             if c.get("name") == "queued_twice":
                 tl += [{"event": "added_to_merge_queue", "actor": {"login": APP}, "created_at": _t("10:20")},
-                       {"event": "removed_from_merge_queue", "actor": {"login": APP}, "created_at": _t("10:30")},  # the REST timeline names no reason
+                       {"event": "removed_from_merge_queue", "actor": {"login": APP}, "created_at": _t("10:30"), "reason": "failed_checks"},
                        {"event": "added_to_merge_queue", "actor": {"login": APP}, "created_at": _t("10:40")}]
             else:
                 tl.append({"event": "added_to_merge_queue", "actor": {"login": APP}, "created_at": _t("10:20")})
@@ -136,10 +136,6 @@ def raw_world():
     ok = [{"name": "Test", "status": "completed", "conclusion": "success"}]
 
     def get(path):
-        if path.startswith("graphql:"):  # the GraphQL timeline names the ejection reason
-            n = int(re.search(r"pullRequest\(number: (\d+)\)", path).group(1))
-            return {"data": {"repository": {"pullRequest": {"timelineItems": {"nodes": [
-                {"createdAt": _t("10:30"), "reason": "CI_FAILURE"}] if n == 8 else []}}}}}
         base = f"repos/{REPO}/"
         if not path.startswith(base):
             raise KeyError(path)
@@ -198,9 +194,7 @@ def expected():
         "pushes_total.repair": sum(c.get("pushes", {}).get("repair", 0) for c in CASES),
         "pushes_total.merge_main": sum(c.get("pushes", {}).get("merge_main", 0) for c in CASES),
         "merge_queue.attempts_per_ready_pr": round(sum(c.get("enqueues", 0) for c in CASES) / n, 2),
-        "merge_queue.ejections_by_cause.ci_failure": ejections,
-        "merge_queue.ejections_per_merge": round(ejections / len(merged), 3),
-        "merge_queue.ejections_cause_unknown": 0,
+        "merge_queue.ejections_failed_checks": ejections,
         "interventions.owner_actions_per_pr": round(owner_actions / n, 2),
         "interventions.prs_with_owner_action": sum(1 for c in CASES if c.get("owner_actions")),
         "compute_per_merged_pr.runs_total": sum(c.get("runs", 0) for c in CASES),
@@ -267,6 +261,8 @@ def run(pr_metrics, tolerance=0.005):
     checks, failed = [], []
     for name, exp in want.items():
         got = None if got_summary is None else _dig(got_summary, name)
+        if name == "merge_queue.ejections_failed_checks" and got_summary is not None:  # a cause missing from the map is zero ejections
+            got = (got_summary["merge_queue"].get("ejections_by_cause") or {}).get("failed_checks", 0)
         if exp is None:
             delta = 0.0 if got is None else None
             ok = got is None
