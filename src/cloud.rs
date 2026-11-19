@@ -913,6 +913,21 @@ impl GitHubActions {
         self.runners_raw_paginated(&format!("repos/{repository}/actions/runners"))
     }
 
+    /// Return the GitHub account type that owns a repository (`User` or
+    /// `Organization`). This is used when an organization-scoped runner read
+    /// returns 404: only a confirmed personal repository may safely fall back
+    /// to repository-only inventory.
+    pub(crate) fn repository_owner_type(&self, repository: &str) -> Result<String, GitHubError> {
+        let stdout = self.run_gh(&["api".to_owned(), format!("repos/{repository}")])?;
+        let value: Value = serde_json::from_str(&stdout)
+            .map_err(|error| GitHubError::new(format!("repository JSON malformed: {error}")))?;
+        value
+            .pointer("/owner/type")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| GitHubError::new("repository JSON missing owner type"))
+    }
+
     /// Read an organization's visible self-hosted runner inventory.
     pub(crate) fn organization_runners_raw(
         &self,

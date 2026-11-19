@@ -173,7 +173,23 @@ fn online_labels_or_unknown(
                     raw = serde_json::json!({"runners": runners});
                 }
                 Err(error)
-                    if crate::head_approval::gh_error_http_status(error.message()) == Some(404) => {
+                    if crate::head_approval::gh_error_http_status(error.message()) == Some(404) =>
+                {
+                    match actions.repository_owner_type(repo) {
+                        Ok(owner_type) if owner_type.eq_ignore_ascii_case("User") => {}
+                        Ok(owner_type) => {
+                            diagnostics.push(format!(
+                                "ci_queued_forever runners unknown: organization inventory returned 404 for owner type {owner_type}"
+                            ));
+                            return None;
+                        }
+                        Err(owner_error) => {
+                            diagnostics.push(format!(
+                                "ci_queued_forever runners unknown: owner type unavailable: {owner_error:?}"
+                            ));
+                            return None;
+                        }
+                    }
                 }
                 Err(error) => {
                     diagnostics.push(format!("ci_queued_forever runners unknown: {error:?}"));
@@ -388,9 +404,112 @@ mod tests {
             "acme/repo:ci_billing_blocked".to_owned(),
             "acme/repo:ci_queued_forever".to_owned(),
         ]);
+        let rows = vec![CiHealthOverdue {
+            kind: "overdue",
+            condition: "ci_billing_blocked",
+            repo: "acme/repo".to_owned(),
+            detail: "recent account payments have failed or spending limit".to_owned(),
+            at: Utc::now(),
+        }];
         let successful = BTreeSet::from(["ci_billing_blocked"]);
-        commit_seen_after_feed(&mut seen, "acme/repo", &[], &successful, |_| Ok(())).unwrap();
-        assert!(!seen.contains("acme/repo:ci_billing_blocked"));
+        // The queued inventory read failed, so its prior state remains while
+        // the independently successful billing probe is still recorded.
+        commit_seen_after_feed(&mut seen, "acme/repo", &rows, &successful, |_| Ok(())).unwrap();
+        assert!(seen.contains("acme/repo:ci_billing_blocked"));
         assert!(seen.contains("acme/repo:ci_queued_forever"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn organization_inventory_paginates_and_prevents_false_unserved_alert() {
+        let temp = tempfile::tempdir().unwrap();
+        let gh = temp.path().join("gh");
+        let page_one = serde_json::to_string(&serde_json::json!({
+            "runners": (0..100)
+                .map(|index| serde_json::json!({
+                    "status": "online",
+                    "labels": [{"name": format!("org-page-one-{index}")}]
+                }))
+                .collect::<Vec<_>>()
+        }))
+        .unwrap();
+        let page_two = serde_json::to_string(&serde_json::json!({
+            "runners": [{
+                "status": "online",
+                "labels": [{"name": "org-only"}]
+            }]
+        }))
+        .unwrap();
+        let repository = serde_json::to_string(&serde_json::json!({"runners": []})).unwrap();
+        let script = format!(
+            "#!/bin/sh\nset -eu\ncase \"$*\" in\n  *\"repos/acme/repo/actions/runners?per_page=100\") printf '%s' '{repository}';;\n  *\"orgs/acme/actions/runners?per_page=100&page=2\") printf '%s' '{page_two}';;\n  *\"orgs/acme/actions/runners?per_page=100\") printf '%s' '{page_one}';;\n  *) echo \"unexpected args: $*\" >&2; exit 1;;\nesac\n"
+        );
+        crate::test_support::write_executable_script(&gh, &script);
+        let actions = GitHubActions::hermetic_for_tests(temp.path(), &gh);
+        let mut diagnostics = Vec::new();
+        let online = online_labels_or_unknown(&actions, "acme/repo", &mut diagnostics)
+            .expect("organization inventory should be complete");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert!(online.contains("org-only"));
+
+        let now = DateTime::parse_from_rfc3339("2026-11-18T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert!(!queued_job_is_forever_queued(
+            "2026-11-18T00:00:00Z",
+            &["self-hosted".into(), "org-only".into()],
+            &online,
+            now
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn organization_inventory_404_is_unknown_unless_owner_is_personal() {
+        let temp = tempfile::tempdir().unwrap();
+        let gh = temp.path().join("gh");
+        let repository_runners = serde_json::to_string(&serde_json::json!({
+            "runners": [{
+                "status": "online",
+                "labels": [{"name": "repo-only"}]
+            }]
+        }))
+        .unwrap();
+        let script = format!(
+            "#!/bin/sh\nset -eu\ncase \"$*\" in\n  *\"repos/acme/repo/actions/runners?per_page=100\") printf '%s' '{repository_runners}';;\n  *\"orgs/acme/actions/runners?per_page=100\") echo 'gh: Not Found (HTTP 404)' >&2; exit 1;;\n  *\"repos/acme/repo\") printf '%s' '{{\"owner\":{{\"type\":\"Organization\"}}}}';;\n  *) echo \"unexpected args: $*\" >&2; exit 1;;\nesac\n"
+        );
+        crate::test_support::write_executable_script(&gh, &script);
+        let actions = GitHubActions::hermetic_for_tests(temp.path(), &gh);
+        let mut diagnostics = Vec::new();
+        assert!(online_labels_or_unknown(&actions, "acme/repo", &mut diagnostics).is_none());
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("owner type Organization"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn personal_repository_inventory_404_falls_back_to_repository_runners() {
+        let temp = tempfile::tempdir().unwrap();
+        let gh = temp.path().join("gh");
+        let repository_runners = serde_json::to_string(&serde_json::json!({
+            "runners": [{
+                "status": "online",
+                "labels": [{"name": "personal-only"}]
+            }]
+        }))
+        .unwrap();
+        let script = format!(
+            "#!/bin/sh\nset -eu\ncase \"$*\" in\n  *\"repos/acme/repo/actions/runners?per_page=100\") printf '%s' '{repository_runners}';;\n  *\"orgs/acme/actions/runners?per_page=100\") echo 'gh: Not Found (HTTP 404)' >&2; exit 1;;\n  *\"repos/acme/repo\") printf '%s' '{{\"owner\":{{\"type\":\"User\"}}}}';;\n  *) echo \"unexpected args: $*\" >&2; exit 1;;\nesac\n"
+        );
+        crate::test_support::write_executable_script(&gh, &script);
+        let actions = GitHubActions::hermetic_for_tests(temp.path(), &gh);
+        let mut diagnostics = Vec::new();
+        let online = online_labels_or_unknown(&actions, "acme/repo", &mut diagnostics)
+            .expect("personal repository should use repository inventory");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert!(online.contains("personal-only"));
     }
 }
