@@ -566,6 +566,9 @@ pub fn track_base_stalled(
         .retain(|known_head, _| known_head.eq_ignore_ascii_case(head));
     let oldest = eligible.iter().map(|c| c.number).min();
     let Some(oldest_pr) = oldest else {
+        // Nothing waiting on this base: the incident ended, so a later
+        // candidate at the same head starts a fresh clock.
+        state.base_stalled.clear();
         return Vec::new();
     };
     let entry = state

@@ -1269,3 +1269,34 @@ fn base_stalled_disabled_keeps_no_clock_and_reenabling_starts_fresh() {
         .is_empty()
     );
 }
+
+#[test]
+fn base_stalled_clock_restarts_after_an_empty_eligible_observation() {
+    let mut state = established();
+    let candidate = [BaseStalledCandidate { number: 7 }];
+    let policy = DwellPolicy::default();
+    track_base_stalled(&mut state, Some(HEAD), &candidate, None, &policy, now());
+    assert!(
+        track_base_stalled(
+            &mut state,
+            Some(HEAD),
+            &[],
+            None,
+            &policy,
+            now() + Duration::minutes(30)
+        )
+        .is_empty()
+    );
+    assert!(state.base_stalled.is_empty());
+    assert!(
+        track_base_stalled(
+            &mut state,
+            Some(HEAD),
+            &candidate,
+            None,
+            &policy,
+            now() + Duration::minutes(90)
+        )
+        .is_empty()
+    );
+}
