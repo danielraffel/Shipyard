@@ -853,6 +853,45 @@ impl GitHubActions {
         parse_active_jobs(&stdout)
     }
 
+    /// Read the jobs for one workflow run, retaining the fields used by the
+    /// steward's bounded CI-health probes.
+    pub(crate) fn workflow_run_jobs_raw(
+        &self,
+        repository: &str,
+        run_id: u64,
+    ) -> Result<Value, GitHubError> {
+        let stdout = self.run_gh(&[
+            "api".to_owned(),
+            format!("repos/{repository}/actions/runs/{run_id}/jobs?per_page=100"),
+        ])?;
+        serde_json::from_str(&stdout)
+            .map_err(|error| GitHubError::new(format!("workflow jobs JSON malformed: {error}")))
+    }
+
+    /// Read annotations for one failed check run.
+    pub(crate) fn check_run_annotations_raw(
+        &self,
+        repository: &str,
+        check_run_id: u64,
+    ) -> Result<Value, GitHubError> {
+        let stdout = self.run_gh(&[
+            "api".to_owned(),
+            format!("repos/{repository}/check-runs/{check_run_id}/annotations"),
+        ])?;
+        serde_json::from_str(&stdout)
+            .map_err(|error| GitHubError::new(format!("annotations JSON malformed: {error}")))
+    }
+
+    /// Read the repository's visible self-hosted runner inventory.
+    pub(crate) fn repository_runners_raw(&self, repository: &str) -> Result<Value, GitHubError> {
+        let stdout = self.run_gh(&[
+            "api".to_owned(),
+            format!("repos/{repository}/actions/runners?per_page=100"),
+        ])?;
+        serde_json::from_str(&stdout)
+            .map_err(|error| GitHubError::new(format!("runners JSON malformed: {error}")))
+    }
+
     /// Cancel a single workflow job.
     pub fn cancel_workflow_job(&self, repository: &str, job_id: u64) -> Result<(), GitHubError> {
         let args = vec![
