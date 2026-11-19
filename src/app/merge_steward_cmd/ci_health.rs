@@ -162,6 +162,26 @@ fn online_labels_or_unknown(
             let owner = repo.split_once('/').map_or(repo, |(owner, _)| owner);
             match actions.organization_runners_raw(owner) {
                 Ok(org_raw) => {
+                    if org_raw
+                        .get("runners")
+                        .and_then(Value::as_array)
+                        .is_some_and(|runners| {
+                            runners.iter().any(|runner| {
+                                runner
+                                    .get("runner_group_id")
+                                    .is_some_and(|group| !group.is_null())
+                                    || runner
+                                        .get("runner_group_name")
+                                        .is_some_and(|group| !group.is_null())
+                            })
+                        })
+                    {
+                        diagnostics.push(
+                            "ci_queued_forever runners unknown: organization runner-group repository eligibility unavailable"
+                                .to_owned(),
+                        );
+                        return None;
+                    }
                     let mut runners = raw
                         .get_mut("runners")
                         .and_then(Value::as_array_mut)
@@ -254,58 +274,62 @@ pub(super) fn probe(
 
     let online = online_labels_or_unknown(actions, repo, &mut errors);
     if let Some(online_labels) = online {
+        let mut runs = Vec::new();
         match actions.list_queued_runs(repo, MAX_QUEUED_RUNS) {
-            Ok(runs) => {
-                'runs: for run in runs {
-                    let jobs = match actions.workflow_run_jobs_raw(repo, run.database_id) {
-                        Ok(jobs) => jobs,
-                        Err(error) => {
-                            errors.push(format!("ci_queued_forever jobs: {error:?}"));
-                            continue;
-                        }
-                    };
-                    for job in jobs
-                        .get("jobs")
-                        .and_then(Value::as_array)
-                        .into_iter()
-                        .flatten()
-                    {
-                        if job.get("status").and_then(Value::as_str) != Some("queued") {
-                            continue;
-                        }
-                        let labels = job
-                            .get("labels")
-                            .and_then(Value::as_array)
-                            .map(|items| {
-                                items
-                                    .iter()
-                                    .filter_map(Value::as_str)
-                                    .map(str::to_owned)
-                                    .collect::<Vec<_>>()
-                            })
-                            .unwrap_or_default();
-                        let queued_at = job
-                            .get("queued_at")
-                            .and_then(Value::as_str)
-                            .unwrap_or(&run.created_at);
-                        if queued_job_is_forever_queued(queued_at, &labels, &online_labels, now) {
-                            rows.push(CiHealthOverdue {
-                                kind: "overdue",
-                                condition: "ci_queued_forever",
-                                repo: repo.to_owned(),
-                                detail: format!(
-                                    "job {} labels={}",
-                                    job.get("name").and_then(Value::as_str).unwrap_or("unknown"),
-                                    labels.join(",")
-                                ),
-                                at: now,
-                            });
-                            break 'runs;
-                        }
-                    }
+            Ok(queued) => runs.extend(queued),
+            Err(error) => errors.push(format!("ci_queued_forever runs: {error:?}")),
+        }
+        match actions.list_runs_with_status(repo, "in_progress", None, MAX_QUEUED_RUNS) {
+            Ok(in_progress) => runs.extend(in_progress),
+            Err(error) => errors.push(format!("ci_queued_forever in-progress runs: {error:?}")),
+        }
+        'runs: for run in runs {
+            let jobs = match actions.workflow_run_jobs_raw(repo, run.database_id) {
+                Ok(jobs) => jobs,
+                Err(error) => {
+                    errors.push(format!("ci_queued_forever jobs: {error:?}"));
+                    continue;
+                }
+            };
+            for job in jobs
+                .get("jobs")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if job.get("status").and_then(Value::as_str) != Some("queued") {
+                    continue;
+                }
+                let labels = job
+                    .get("labels")
+                    .and_then(Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let queued_at = job
+                    .get("queued_at")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&run.created_at);
+                if queued_job_is_forever_queued(queued_at, &labels, &online_labels, now) {
+                    rows.push(CiHealthOverdue {
+                        kind: "overdue",
+                        condition: "ci_queued_forever",
+                        repo: repo.to_owned(),
+                        detail: format!(
+                            "job {} labels={}",
+                            job.get("name").and_then(Value::as_str).unwrap_or("unknown"),
+                            labels.join(",")
+                        ),
+                        at: now,
+                    });
+                    break 'runs;
                 }
             }
-            Err(error) => errors.push(format!("ci_queued_forever runs: {error:?}")),
         }
     }
     (rows, errors)
@@ -511,5 +535,58 @@ mod tests {
             .expect("personal repository should use repository inventory");
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         assert!(online.contains("personal-only"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn in_progress_run_with_queued_job_is_checked_for_unserved_labels() {
+        let temp = tempfile::tempdir().unwrap();
+        let gh = temp.path().join("gh");
+        let script = r##"#!/bin/sh
+set -eu
+case "$*" in
+  *"actions/runs?status=completed&per_page=1&branch=main") printf '%s' '{"workflow_runs":[]}';;
+  *"actions/runners?per_page=100") printf '%s' '{"runners":[{"status":"online","labels":[{"name":"linux"}]}]}';;
+  *"orgs/acme/actions/runners?per_page=100") echo 'gh: Not Found (HTTP 404)' >&2; exit 1;;
+  *"repos/acme/repo" ) printf '%s' '{"owner":{"type":"User"}}';;
+  *"actions/runs?status=queued&per_page=5") printf '%s' '{"workflow_runs":[]}';;
+  *"actions/runs?status=in_progress&per_page=5") printf '%s' '{"workflow_runs":[{"id":42,"name":"CI","head_branch":"main","event":"push","created_at":"2026-11-18T00:00:00Z"}]}';;
+  *"actions/runs/42/jobs?per_page=100") printf '%s' '{"jobs":[{"status":"queued","name":"build","queued_at":"2026-11-18T00:00:00Z","labels":["self-hosted","retired"]}]}';;
+  *) echo "unexpected args: $*" >&2; exit 1;;
+esac
+"##;
+        crate::test_support::write_executable_script(&gh, script);
+        let actions = GitHubActions::hermetic_for_tests(temp.path(), &gh);
+        let now = DateTime::parse_from_rfc3339("2026-11-18T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let (rows, errors) = probe(&actions, "acme/repo", "main", now);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].condition, "ci_queued_forever");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn organization_runner_group_scope_keeps_availability_unknown() {
+        let temp = tempfile::tempdir().unwrap();
+        let gh = temp.path().join("gh");
+        let script = r##"#!/bin/sh
+set -eu
+case "$*" in
+  *"repos/acme/repo/actions/runners?per_page=100") printf '%s' '{"runners":[]}';;
+  *"orgs/acme/actions/runners?per_page=100") printf '%s' '{"runners":[{"status":"online","runner_group_id":7,"labels":[{"name":"restricted"}]}]}';;
+  *) echo "unexpected args: $*" >&2; exit 1;;
+esac
+"##;
+        crate::test_support::write_executable_script(&gh, script);
+        let actions = GitHubActions::hermetic_for_tests(temp.path(), &gh);
+        let mut diagnostics = Vec::new();
+        assert!(online_labels_or_unknown(&actions, "acme/repo", &mut diagnostics).is_none());
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("repository eligibility unavailable"))
+        );
     }
 }
