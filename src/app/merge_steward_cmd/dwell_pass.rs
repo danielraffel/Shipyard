@@ -245,7 +245,7 @@ pub(super) struct DwellInput<'a> {
     /// Reads completed merge-group runs for the queue heads. Called only on
     /// the tick a base-stalled alarm first escalates with no failing job
     /// visible in the active runs.
-    pub completed_merge_group_runs: Option<&'a dyn Fn() -> Vec<StewardRun>>,
+    pub completed_merge_group_runs: Option<&'a dyn Fn(DateTime<Utc>) -> Vec<StewardRun>>,
 }
 
 /// Read `[auto_merge.dwell]` from the base's `.shipyard/config.toml`, through
@@ -529,21 +529,25 @@ pub(super) fn run(
         input.dwell_policy,
         input.now,
     );
-    if let Some(census) = input.completed_merge_group_runs.filter(|_| {
+    let census_since = base_rows
+        .iter()
+        .find(|row| row.overdue.state == DwellState::BaseStalled && row.escalate)
+        .map(|row| row.overdue.entered_at - chrono::Duration::minutes(15));
+    if let (Some(census), Some(since)) = (input.completed_merge_group_runs, census_since) {
         // Only an applying pass records the alert, which is what keeps the read
         // to once per incident; a shadow pass would repeat it every tick.
-        input.apply && failed_job.is_none() && base_rows.iter().any(|row| row.escalate)
-    }) {
-        let census_job = failed_merge_group_job(census().iter());
-        if census_job.is_some() {
-            base_rows = dwell::track_base_stalled(
-                &mut state,
-                input.observation.base_sha.as_deref(),
-                &eligible,
-                census_job,
-                input.dwell_policy,
-                input.now,
-            );
+        if input.apply && failed_job.is_none() {
+            let census_job = failed_merge_group_job(census(since).iter());
+            if census_job.is_some() {
+                base_rows = dwell::track_base_stalled(
+                    &mut state,
+                    input.observation.base_sha.as_deref(),
+                    &eligible,
+                    census_job,
+                    input.dwell_policy,
+                    input.now,
+                );
+            }
         }
     }
     for row in &mut base_rows {

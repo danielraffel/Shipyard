@@ -155,7 +155,7 @@ struct Pass<'a> {
     apply: bool,
     temp: &'a tempfile::TempDir,
     now: DateTime<Utc>,
-    census: Option<&'a dyn Fn() -> Vec<StewardRun>>,
+    census: Option<&'a dyn Fn(DateTime<Utc>) -> Vec<StewardRun>>,
 }
 
 impl Pass<'_> {
@@ -720,7 +720,7 @@ fn a_base_stalled_alarm_reads_the_completed_run_census_once_and_names_the_job() 
     );
     let temp = tempfile::tempdir().unwrap();
     let reads = std::cell::Cell::new(0);
-    let census = || {
+    let census = |_| {
         reads.set(reads.get() + 1);
         vec![failed_merge_group_run()]
     };

@@ -1,7 +1,7 @@
 use super::{
-    BTreeMap, CapacityPreemptionPolicy, CliFailure, Duration, GitHubActions, Instant,
+    BTreeMap, CapacityPreemptionPolicy, CliFailure, DateTime, Duration, GitHubActions, Instant,
     MergeQueueSnapshot, ObservedPr, Path, RepoObservation, RequiredCheck, StewardCheck, StewardJob,
-    StewardPullRequest, StewardRun, Value, is_admin_protection_denied,
+    StewardPullRequest, StewardRun, Utc, Value, is_admin_protection_denied,
     is_capacity_preemption_workflow, is_full_sha, is_implicitly_managed,
     is_private_free_entitlement,
 };
@@ -17,6 +17,7 @@ const MAX_MERGE_QUEUE_PAGES: usize = 10;
 // release smoke gate uses the same read with the Actions token, where a 1,000
 // row request has repeatedly produced 502/EOF responses despite a 48-PR repo.
 const MAX_OPEN_PR_ROWS: usize = 200;
+const MAX_COMPLETED_MERGE_GROUP_RUNS: usize = 20;
 type MergeQueueSnapshotWithBase = (
     bool,
     BTreeMap<u64, u64>,
@@ -1663,15 +1664,25 @@ pub(super) fn completed_merge_group_runs(
     actions: &GitHubActions,
     repo: &str,
     base: &str,
+    since: DateTime<Utc>,
+    deadline: Option<Instant>,
 ) -> Result<Vec<StewardRun>, String> {
-    let value = gh_json(
-        actions,
-        &[
-            "api".to_owned(),
-            format!("repos/{repo}/actions/runs?event=merge_group&status=completed&per_page=100"),
-        ],
-        "completed merge-group runs",
-    )?;
+    let argv = vec![
+        "api".to_owned(),
+        format!(
+            "repos/{repo}/actions/runs?event=merge_group&status=completed&created=>{}&per_page=100",
+            since.to_rfc3339()
+        ),
+    ];
+    let value = if let Some(deadline) = deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(Vec::new());
+        }
+        gh_json_timeout(actions, &argv, "completed merge-group runs", remaining)?
+    } else {
+        gh_json(actions, &argv, "completed merge-group runs")?
+    };
     let rows = value
         .get("workflow_runs")
         .and_then(Value::as_array)
@@ -1679,21 +1690,42 @@ pub(super) fn completed_merge_group_runs(
     // The newest page is enough for this bounded diagnostic census. Match the
     // merge-group branch's base component rather than live queue heads: an
     // ejected group no longer has a queue entry but its completed run remains.
+    let mut candidates: Vec<&Value> = rows
+        .iter()
+        .filter(|row| {
+            row.get("event").and_then(Value::as_str) == Some("merge_group")
+                && row.get("status").and_then(Value::as_str) == Some("completed")
+                && row
+                    .get("head_branch")
+                    .and_then(Value::as_str)
+                    .is_some_and(|branch| merge_group_branch_matches_base(branch, base))
+        })
+        .collect();
+    // GitHub normally returns newest first, but make the bounded scan explicit
+    // so the first failed run is the newest one even if that ordering changes.
+    candidates.sort_by(|left, right| {
+        right
+            .get("created_at")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .cmp(left.get("created_at").and_then(Value::as_str).unwrap_or(""))
+    });
     let mut runs = Vec::new();
-    for row in rows {
-        if row.get("event").and_then(Value::as_str) != Some("merge_group")
-            || row.get("status").and_then(Value::as_str) != Some("completed")
-            || !row
-                .get("head_branch")
-                .and_then(Value::as_str)
-                .is_some_and(|branch| merge_group_branch_matches_base(branch, base))
-        {
-            continue;
-        }
+    for row in candidates.into_iter().take(MAX_COMPLETED_MERGE_GROUP_RUNS) {
         let mut run = parse_run(row)
             .ok_or_else(|| "completed merge-group response contained malformed run".to_owned())?;
-        run.jobs = fetch_run_jobs(actions, repo, run.id)?;
-        runs.push(run);
+        run.jobs = match deadline {
+            Some(deadline) => fetch_run_jobs_before(actions, repo, run.id, deadline)?,
+            None => fetch_run_jobs(actions, repo, run.id)?,
+        };
+        if run.jobs.iter().any(|job| {
+            job.conclusion
+                .as_deref()
+                .is_some_and(|conclusion| !conclusion.eq_ignore_ascii_case("success"))
+        }) {
+            runs.push(run);
+            break;
+        }
     }
     Ok(runs)
 }
