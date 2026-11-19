@@ -1,6 +1,6 @@
 //! One local, read-only fleet page. No GitHub reads.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -11,6 +11,8 @@ use serde_json::{Value, json};
 use wait_timeout::ChildExt;
 
 use super::{CliFailure, dwell_cmd};
+use crate::cloud::GitHubActions;
+use crate::identity::RuntimeMode;
 
 fn unavailable(reason: impl std::fmt::Display) -> Value {
     json!({"unavailable": reason.to_string()})
@@ -136,11 +138,47 @@ fn count_rows(rows: &[Value], overdue: &BTreeSet<u64>) -> Value {
     })
 }
 
+#[allow(clippy::too_many_lines)] // Keep the bounded report assembly in one auditable order.
 fn report_with_snapshot_source(
     snapshots: Vec<Value>,
     hosts_file: Option<&Path>,
     snapshot_source: &Value,
 ) -> Value {
+    let missing_fleet_rows: Vec<String> = snapshots
+        .iter()
+        .enumerate()
+        .filter(|(_, snapshot)| {
+            snapshot
+                .get("fleet_rows")
+                .and_then(Value::as_array)
+                .is_none()
+        })
+        .map(|(index, snapshot)| {
+            snapshot
+                .get("repo")
+                .and_then(Value::as_str)
+                .map_or_else(|| format!("snapshot {}", index + 1), str::to_owned)
+        })
+        .collect();
+    let invariants_available = snapshot_source.as_str() == Some("available")
+        && !snapshots.is_empty()
+        && missing_fleet_rows.is_empty();
+    let invariants_unavailable = if invariants_available {
+        Value::Null
+    } else if snapshot_source.as_str() == Some("available") && !missing_fleet_rows.is_empty() {
+        json!(format!(
+            "snapshots missing fleet_rows: {}",
+            missing_fleet_rows.join(", ")
+        ))
+    } else {
+        snapshot_source
+            .get("unavailable")
+            .and_then(Value::as_str)
+            .map_or_else(
+                || json!("no steward snapshot was read"),
+                |reason| json!(reason),
+            )
+    };
     let repos: Vec<Value> = snapshots
         .into_iter()
         .map(|snapshot| {
@@ -191,7 +229,8 @@ fn report_with_snapshot_source(
             let counts = count_rows(&rows, &overdue);
             json!({"repo": snapshot.get("repo"), "base": snapshot.get("base"),
             "at": snapshot.get("at"), "counts": counts, "rows": rows,
-            "complete": snapshot.get("fleet_rows").is_some()})
+            "overdue_rows": snapshot.get("overdue").cloned().unwrap_or_else(|| json!([])),
+            "complete": snapshot.get("fleet_rows").and_then(Value::as_array).is_some()})
         })
         .collect();
     let owner_actions: Vec<Value> = repos
@@ -216,7 +255,60 @@ fn report_with_snapshot_source(
             .map(|repo| repo["counts"][key].as_u64().unwrap_or(0))
             .sum::<u64>()
     };
-    json!({"source": "steward-snapshot", "steward_snapshots": snapshot_source, "summary": {
+    let mut invariant_rows: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let add = |kind: &str, repo: &Value, row: &Value, map: &mut BTreeMap<String, Vec<String>>| {
+        let repo = repo.as_str().unwrap_or("?");
+        let number = row
+            .get("number")
+            .and_then(Value::as_u64)
+            .or_else(|| row.get("pr").and_then(Value::as_u64))
+            .map_or_else(|| "?".to_owned(), |n| n.to_string());
+        let entries = map.entry(kind.to_owned()).or_default();
+        let entry = format!("{repo}#{number}");
+        if !entries.contains(&entry) {
+            entries.push(entry);
+        }
+    };
+    for repo in &repos {
+        for row in repo["rows"].as_array().into_iter().flatten() {
+            let owner = row
+                .get("owner")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            if owner.is_empty() || owner.eq_ignore_ascii_case("unknown") {
+                add(
+                    "open_pr_without_owner",
+                    &repo["repo"],
+                    row,
+                    &mut invariant_rows,
+                );
+            }
+            if row.get("blocked_on").and_then(Value::as_str) == Some("empty_diff") {
+                add("empty_diff", &repo["repo"], row, &mut invariant_rows);
+            }
+            if ["kind", "state", "blocked_on"].iter().any(|field| {
+                row.get(*field)
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| value.eq_ignore_ascii_case("approved_stuck"))
+            }) {
+                add("approved_stuck", &repo["repo"], row, &mut invariant_rows);
+            }
+        }
+        if let Some(overdue) = repo["overdue_rows"].as_array() {
+            for row in overdue {
+                let kind = row.get("kind").and_then(Value::as_str).unwrap_or("overdue");
+                add(kind, &repo["repo"], row, &mut invariant_rows);
+            }
+        }
+    }
+    let invariants: Vec<Value> = invariant_rows
+        .into_iter()
+        .map(|(kind, prs)| json!({"kind": kind, "count": prs.len(), "prs": prs}))
+        .collect();
+    json!({"source": "steward-snapshot", "steward_snapshots": snapshot_source,
+        "invariants": invariants, "invariants_available": invariants_available,
+        "invariants_unavailable": invariants_unavailable, "summary": {
         "repos": repos.len(), "open": sum("open"), "approved_green": sum("approved_green"),
         "waiting_review": sum("waiting_review"), "red": sum("red"), "overdue": sum("overdue")},
         "owner_actions": owner_actions, "repos": repos,
@@ -279,8 +371,36 @@ fn source_line(value: &Value) -> String {
 
 fn markdown(data: &Value) -> String {
     let summary = &data["summary"];
-    let mut out = format!(
-        "# Fleet report\n\n## Summary\n\n{} repos; {} open; {} approved and green; {} waiting review; {} red; {} overdue.\n\nSnapshot source: {}\n\nSteward tick: {}\n\n",
+    let mut out = "# Fleet report\n\n## Invariants\n\n".to_owned();
+    let invariants = data["invariants"].as_array().expect("invariants array");
+    if data["invariants_available"] != true {
+        let reason = data["invariants_unavailable"]
+            .as_str()
+            .unwrap_or("no steward snapshot was read");
+        let _ = writeln!(out, "(unavailable: {reason})\n");
+    } else if invariants.is_empty() {
+        out.push_str("All invariants hold\n\n");
+    } else {
+        for invariant in invariants {
+            let _ = writeln!(
+                out,
+                "- **{}** ({}): {}",
+                cell(invariant.get("kind")),
+                invariant["count"],
+                invariant["prs"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        out.push('\n');
+    }
+    let _ = writeln!(
+        out,
+        "## Summary\n\n{} repos; {} open; {} approved and green; {} waiting review; {} red; {} overdue.\n\nSnapshot source: {}\n\nSteward tick: {}\n",
         summary["repos"],
         summary["open"],
         summary["approved_green"],
@@ -349,17 +469,93 @@ fn markdown(data: &Value) -> String {
     out
 }
 
+fn parse_issue_target(target: &str) -> Result<(&str, u64), String> {
+    let (repo, number) = target
+        .rsplit_once('#')
+        .ok_or_else(|| "issue must be OWNER/REPO#NUMBER".to_owned())?;
+    if repo.split('/').count() != 2 || repo.split('/').any(str::is_empty) {
+        return Err("issue must be OWNER/REPO#NUMBER".to_owned());
+    }
+    let number = number
+        .parse()
+        .map_err(|_| "issue number must be an integer".to_owned())?;
+    Ok((repo, number))
+}
+
+fn publish_issue(
+    actions: &GitHubActions,
+    target: &str,
+    body: &str,
+    dry_run: bool,
+) -> Result<bool, String> {
+    if dry_run {
+        return Ok(false);
+    }
+    let (repo, number) = parse_issue_target(target)?;
+    let path = format!("repos/{repo}/issues/{number}");
+    let current = actions
+        .run_gh(&["api".to_owned(), path.clone()])
+        .map_err(|e| e.to_string())?;
+    let current: Value =
+        serde_json::from_str(&current).map_err(|e| format!("issue response was not JSON: {e}"))?;
+    if current.get("body").and_then(Value::as_str) == Some(body) {
+        return Ok(false);
+    }
+    actions
+        .run_gh(&[
+            "api".to_owned(),
+            "--method".to_owned(),
+            "PATCH".to_owned(),
+            path,
+            "-f".to_owned(),
+            format!("body={body}"),
+        ])
+        .map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+#[cfg(test)]
 pub(super) fn run<W: Write>(
     state_dir: &Path,
     format: &str,
     hosts_file: Option<&Path>,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
+    run_with_options(
+        state_dir,
+        format,
+        hosts_file,
+        stdout,
+        None,
+        RuntimeMode::Shipyard,
+        None,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // CLI boundary keeps publication options explicit.
+pub(super) fn run_with_options<W: Write>(
+    state_dir: &Path,
+    format: &str,
+    hosts_file: Option<&Path>,
+    stdout: &mut W,
+    cwd: Option<&Path>,
+    mode: RuntimeMode,
+    publish: Option<&str>,
+    dry_run: bool,
+) -> Result<ExitCode, CliFailure> {
     let (snapshots, snapshot_source) = match dwell_cmd::snapshots_for_report(state_dir, None) {
         Ok(snapshots) => (snapshots, json!("available")),
         Err(error) => (Vec::new(), unavailable(error)),
     };
     let data = report_with_snapshot_source(snapshots, hosts_file, &snapshot_source);
+    let markdown_body = markdown(&data);
+    if let Some(target) = publish {
+        let cwd = cwd.ok_or_else(|| CliFailure::new(2, "publishing requires a checkout"))?;
+        let actions = GitHubActions::from_cwd(mode, cwd);
+        publish_issue(&actions, target, &markdown_body, dry_run)
+            .map_err(|error| CliFailure::new(1, format!("publishing fleet report: {error}")))?;
+    }
     let rendered = if format == "json" {
         serde_json::to_string_pretty(&data).expect("JSON value")
     } else {
@@ -372,6 +568,9 @@ pub(super) fn run<W: Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn fixture_snapshots_group_rows_and_owner_actions() {
@@ -397,6 +596,143 @@ mod tests {
         assert!(md.contains("### o/a"));
         assert!(md.contains("### o/b"));
         assert!(md.contains("(unavailable:"));
+    }
+
+    #[test]
+    fn invariants_list_required_and_unknown_kinds_and_empty_state() {
+        let data = report_with_snapshot_source(
+            vec![json!({"repo":"o/a","at":"now","fleet_rows":[
+                {"number":1,"owner":"unknown","blocked_on":"empty_diff"},
+                {"number":2,"owner":"daniel","blocked_on":"approved_stuck"}],
+                "overdue":[{"pr":3,"kind":"base_stalled"},{"pr":4,"kind":"future_kind"},
+                    {"pr":5,"kind":"ci_billing_blocked"},{"pr":6,"kind":"ci_queued_forever"},
+                    {"pr":7,"kind":"orphan"}]})],
+            None,
+            &json!("available"),
+        );
+        let kinds: Vec<&str> = data["invariants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["kind"].as_str().unwrap())
+            .collect();
+        for kind in [
+            "open_pr_without_owner",
+            "empty_diff",
+            "approved_stuck",
+            "base_stalled",
+            "future_kind",
+            "ci_billing_blocked",
+            "ci_queued_forever",
+            "orphan",
+        ] {
+            assert!(kinds.contains(&kind), "missing {kind}: {kinds:?}");
+        }
+        assert!(markdown(&data).starts_with("# Fleet report\n\n## Invariants\n"));
+        let clean = report_with_snapshot_source(
+            vec![json!({"repo":"o/a","fleet_rows":[
+            {"number":1,"owner":"daniel","blocked_on":"ready"}],"overdue":[]})],
+            None,
+            &json!("available"),
+        );
+        assert!(markdown(&clean).contains("All invariants hold"));
+    }
+
+    #[test]
+    fn invariants_are_unavailable_when_a_snapshot_lacks_fleet_rows() {
+        let data = report_with_snapshot_source(
+            vec![
+                json!({"repo":"o/complete","fleet_rows":[],"overdue":[]}),
+                json!({"repo":"o/legacy","next_to_admit":[],"overdue":[]}),
+            ],
+            None,
+            &json!("available"),
+        );
+
+        assert_eq!(data["invariants_available"], false);
+        assert!(
+            data["invariants_unavailable"]
+                .as_str()
+                .unwrap()
+                .contains("o/legacy")
+        );
+        assert!(!markdown(&data).contains("All invariants hold"));
+    }
+
+    #[test]
+    fn invariants_are_available_when_all_snapshots_have_fleet_rows() {
+        let data = report_with_snapshot_source(
+            vec![
+                json!({"repo":"o/a","fleet_rows":[],"overdue":[]}),
+                json!({"repo":"o/b","fleet_rows":[],"overdue":[]}),
+            ],
+            None,
+            &json!("available"),
+        );
+
+        assert_eq!(data["invariants_available"], true);
+        assert!(markdown(&data).contains("All invariants hold"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publish_skips_unchanged_body_and_dry_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = temp.path().join("gh.log");
+        let gh = temp.path().join("gh");
+        std::fs::write(
+            &gh,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nprintf '{{\"body\":\"same\"}}'\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let actions = GitHubActions::hermetic_for_tests(temp.path(), &gh);
+        assert!(!publish_issue(&actions, "o/r#7", "same", false).unwrap());
+        assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 1);
+        assert!(!publish_issue(&actions, "o/r#7", "changed", true).unwrap());
+        assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publish_changed_body_patches_issue_and_reports_patch_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = temp.path().join("gh.log");
+        let mode = temp.path().join("mode");
+        let gh = temp.path().join("gh");
+        std::fs::write(&mode, "ok").unwrap();
+        std::fs::write(
+            &gh,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in\n  *'--method PATCH'*)\n    if [ \"$(cat '{}')\" = fail ]; then echo 'patch failed' >&2; exit 9; fi\n    printf '{{\"updated\":true}}'\n    ;;\n  *) printf '{{\"body\":\"old\"}}' ;;\nesac\n",
+                log.display(),
+                mode.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let actions = GitHubActions::hermetic_for_tests(temp.path(), &gh);
+
+        assert!(publish_issue(&actions, "o/r#7", "new", false).unwrap());
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            calls
+                .lines()
+                .any(|line| { line == "api repos/o/r/issues/7" })
+        );
+        assert!(
+            calls
+                .lines()
+                .any(|line| { line == "api --method PATCH repos/o/r/issues/7 -f body=new" })
+        );
+
+        std::fs::write(&mode, "fail").unwrap();
+        let error = publish_issue(&actions, "o/r#7", "newer", false).unwrap_err();
+        assert!(error.contains("PATCH repos/o/r/issues/7"));
+        assert!(error.contains("patch failed"));
     }
 
     #[test]
@@ -445,6 +781,21 @@ mod tests {
             markdown(&data)
                 .contains("Snapshot source: (unavailable: steward-dwell: directory is unreadable)")
         );
+        assert!(markdown(&data).contains("(unavailable: steward-dwell: directory is unreadable)"));
+        assert!(!markdown(&data).contains("All invariants hold"));
+    }
+
+    #[test]
+    fn empty_snapshot_set_does_not_claim_all_invariants_hold() {
+        let data = report_with_snapshot_source(Vec::new(), None, &json!("available"));
+        assert_eq!(data["invariants_available"], false);
+        assert_eq!(
+            data["invariants_unavailable"],
+            "no steward snapshot was read"
+        );
+        let md = markdown(&data);
+        assert!(md.contains("(unavailable: no steward snapshot was read)"));
+        assert!(!md.contains("All invariants hold"));
     }
 
     #[test]
