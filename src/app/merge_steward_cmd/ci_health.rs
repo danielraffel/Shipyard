@@ -259,10 +259,29 @@ fn probe_billing(
     now: DateTime<Utc>,
 ) -> (Option<CiHealthOverdue>, Vec<String>) {
     let mut errors = Vec::new();
+    let mut successful_workflows = BTreeSet::new();
 
     match actions.list_runs_with_status(repo, "completed", Some(default_branch), MAX_BILLING_RUNS) {
         Ok(runs) => {
             for run in runs {
+                // GitHub returns completed runs newest first. A successful
+                // execution clears an older billing failure for the same
+                // workflow, while failures in another workflow remain
+                // independently observable.
+                let workflow_key = if !run.path.is_empty() {
+                    run.path.as_str()
+                } else if !run.workflow_name.is_empty() {
+                    run.workflow_name.as_str()
+                } else {
+                    run.name.as_str()
+                };
+                if successful_workflows.contains(workflow_key) {
+                    continue;
+                }
+                if run.conclusion.as_deref() == Some("success") {
+                    successful_workflows.insert(workflow_key.to_owned());
+                    continue;
+                }
                 let jobs = match actions.workflow_run_jobs_raw(repo, run.database_id) {
                     Ok(jobs) => jobs,
                     Err(error) => {
@@ -777,6 +796,35 @@ esac
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].condition, "ci_billing_blocked");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn billing_failure_is_cleared_by_a_newer_successful_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let gh = temp.path().join("gh");
+        let script = r#"#!/bin/sh
+set -eu
+case "$*" in
+  *"actions/runs?status=completed&per_page=5&branch=main") printf '%s' '{"workflow_runs":[{"id":8,"name":"CI","path":".github/workflows/ci.yml","conclusion":"success","created_at":"2026-11-18T11:00:00Z"},{"id":7,"name":"CI","path":".github/workflows/ci.yml","conclusion":"failure","created_at":"2026-11-18T00:00:00Z"}]}';;
+  *"actions/runs/7/jobs?per_page=100") printf '%s' '{"jobs":[{"check_run_url":"https://api.github.com/repos/acme/repo/check-runs/101","conclusion":"failure"}]}';;
+  *"check-runs/101/annotations?per_page=30") printf '%s' '[{"message":"spending limit reached"}]';;
+  *"orgs/acme/actions/runners?per_page=100") echo 'gh: Not Found (HTTP 404)' >&2; exit 1;;
+  *"repos/acme/repo/actions/runners?per_page=100") printf '%s' '{"runners":[{"status":"online","labels":[{"name":"linux"}]}]}';;
+  *"repos/acme/repo") printf '%s' '{"owner":{"type":"User"}}';;
+  *"actions/runs?status=queued&per_page=5") printf '%s' '{"workflow_runs":[]}';;
+  *"actions/runs?status=in_progress&per_page=5") printf '%s' '{"workflow_runs":[]}';;
+  *) echo "unexpected args: $*" >&2; exit 1;;
+esac
+"#;
+        crate::test_support::write_executable_script(&gh, script);
+        let actions = GitHubActions::hermetic_for_tests(temp.path(), &gh);
+        let now = DateTime::parse_from_rfc3339("2026-11-18T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let (rows, errors) = probe(&actions, "acme/repo", "main", now);
+        assert!(rows.is_empty(), "{rows:?}");
+        assert!(errors.is_empty(), "{errors:?}");
     }
 
     #[cfg(unix)]
