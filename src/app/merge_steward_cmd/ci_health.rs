@@ -542,7 +542,7 @@ mod tests {
     fn in_progress_run_with_queued_job_is_checked_for_unserved_labels() {
         let temp = tempfile::tempdir().unwrap();
         let gh = temp.path().join("gh");
-        let script = r##"#!/bin/sh
+        let script = r#"#!/bin/sh
 set -eu
 case "$*" in
   *"actions/runs?status=completed&per_page=1&branch=main") printf '%s' '{"workflow_runs":[]}';;
@@ -554,7 +554,7 @@ case "$*" in
   *"actions/runs/42/jobs?per_page=100") printf '%s' '{"jobs":[{"status":"queued","name":"build","queued_at":"2026-11-18T00:00:00Z","labels":["self-hosted","retired"]}]}';;
   *) echo "unexpected args: $*" >&2; exit 1;;
 esac
-"##;
+"#;
         crate::test_support::write_executable_script(&gh, script);
         let actions = GitHubActions::hermetic_for_tests(temp.path(), &gh);
         let now = DateTime::parse_from_rfc3339("2026-11-18T12:00:00Z")
@@ -571,14 +571,14 @@ esac
     fn organization_runner_group_scope_keeps_availability_unknown() {
         let temp = tempfile::tempdir().unwrap();
         let gh = temp.path().join("gh");
-        let script = r##"#!/bin/sh
+        let script = r#"#!/bin/sh
 set -eu
 case "$*" in
   *"repos/acme/repo/actions/runners?per_page=100") printf '%s' '{"runners":[]}';;
   *"orgs/acme/actions/runners?per_page=100") printf '%s' '{"runners":[{"status":"online","runner_group_id":7,"labels":[{"name":"restricted"}]}]}';;
   *) echo "unexpected args: $*" >&2; exit 1;;
 esac
-"##;
+"#;
         crate::test_support::write_executable_script(&gh, script);
         let actions = GitHubActions::hermetic_for_tests(temp.path(), &gh);
         let mut diagnostics = Vec::new();
