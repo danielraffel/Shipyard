@@ -178,8 +178,8 @@ impl DwellState {
             | Self::Dirty
             | Self::Held
             | Self::StackedBaseMerged
-            | Self::ApprovedStuck => "author",
-            Self::BaseStalled => "author",
+            | Self::ApprovedStuck
+            | Self::BaseStalled => "author",
         }
     }
 
@@ -574,7 +574,11 @@ pub fn track_base_stalled(
             alerted: false,
         });
     entry.oldest_pr = oldest_pr;
-    entry.failed_job = failed_job;
+    // Keep the last failing job seen for this base head: the completed-run
+    // census is read once per incident, so later passes must not reset it.
+    if failed_job.is_some() {
+        entry.failed_job = failed_job;
+    }
     let Some(limit) = policy.limit(DwellState::BaseStalled) else {
         return Vec::new();
     };

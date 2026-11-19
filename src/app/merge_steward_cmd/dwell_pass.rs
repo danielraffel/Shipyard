@@ -32,7 +32,7 @@ use super::carried_commits::OpenPr;
 use super::next_action::NextAction;
 use super::{
     GitHubActions, MutationControl, ObservedPr, PrReport, RepoObservation, StewardLedger,
-    StewardPolicy, StewardPullRequest,
+    StewardPolicy, StewardPullRequest, StewardRun,
 };
 use crate::merge_steward::dwell::{
     self, ActKind, ActMode, ActRecord, Actable, Disposition, DwellPolicy, DwellRepoState,
@@ -229,6 +229,10 @@ pub(super) struct DwellInput<'a> {
     pub now: DateTime<Utc>,
     /// Past this instant no GitHub-writing act is taken (`--pass-budget-secs`).
     pub deadline: Option<std::time::Instant>,
+    /// Reads completed merge-group runs for the queue heads. Called only on
+    /// the tick a base-stalled alarm first escalates with no failing job
+    /// visible in the active runs.
+    pub completed_merge_group_runs: Option<&'a dyn Fn() -> Vec<StewardRun>>,
 }
 
 /// Read `[auto_merge.dwell]` from the base's `.shipyard/config.toml`, through
@@ -494,43 +498,37 @@ pub(super) fn run(
         )
     }));
     let eligible = stuck_candidates(input, reports);
-    let failed_job = input
-        .observation
-        .runs
+    let eligible: Vec<dwell::BaseStalledCandidate> = eligible
         .iter()
-        .filter(|run| {
-            run.event.eq_ignore_ascii_case("merge_group")
-                && run.status.eq_ignore_ascii_case("completed")
-                && run.jobs.iter().any(|job| {
-                    job.conclusion
-                        .as_deref()
-                        .is_some_and(|c| !c.eq_ignore_ascii_case("success"))
-                })
+        .map(|candidate| dwell::BaseStalledCandidate {
+            number: candidate.number,
         })
-        .max_by_key(|run| run.created_at.clone())
-        .and_then(|run| {
-            run.jobs
-                .iter()
-                .find(|job| {
-                    job.conclusion
-                        .as_deref()
-                        .is_some_and(|c| !c.eq_ignore_ascii_case("success"))
-                })
-                .map(|job| job.name.clone())
-        });
+        .collect();
+    let failed_job = failed_merge_group_job(input.observation.runs.iter());
     let mut base_rows = dwell::track_base_stalled(
         &mut state,
         input.observation.base_sha.as_deref(),
-        &eligible
-            .iter()
-            .map(|candidate| dwell::BaseStalledCandidate {
-                number: candidate.number,
-            })
-            .collect::<Vec<_>>(),
-        failed_job,
+        &eligible,
+        failed_job.clone(),
         input.dwell_policy,
         input.now,
     );
+    if let Some(census) = input
+        .completed_merge_group_runs
+        .filter(|_| failed_job.is_none() && base_rows.iter().any(|row| row.escalate))
+    {
+        let census_job = failed_merge_group_job(census().iter());
+        if census_job.is_some() {
+            base_rows = dwell::track_base_stalled(
+                &mut state,
+                input.observation.base_sha.as_deref(),
+                &eligible,
+                census_job,
+                input.dwell_policy,
+                input.now,
+            );
+        }
+    }
     for row in &mut base_rows {
         if row.escalate {
             if escalations_left > 0 {
@@ -643,6 +641,31 @@ fn sightings(reports: &[PrReport], stacked: &[OpenPr]) -> (Vec<Sighting>, BTreeS
 /// carries, so a degraded steward that defers it every pass cannot keep the
 /// alarm silent; its `deferred_pass_budget` token is a placeholder, so the
 /// alert keeps the last real reason.
+pub(super) fn failed_merge_group_job<'a>(
+    runs: impl Iterator<Item = &'a StewardRun>,
+) -> Option<String> {
+    runs.filter(|run| {
+        run.event.eq_ignore_ascii_case("merge_group")
+            && run.status.eq_ignore_ascii_case("completed")
+            && run.jobs.iter().any(|job| {
+                job.conclusion
+                    .as_deref()
+                    .is_some_and(|c| !c.eq_ignore_ascii_case("success"))
+            })
+    })
+    .max_by_key(|run| run.created_at.clone())
+    .and_then(|run| {
+        run.jobs
+            .iter()
+            .find(|job| {
+                job.conclusion
+                    .as_deref()
+                    .is_some_and(|c| !c.eq_ignore_ascii_case("success"))
+            })
+            .map(|job| job.name.clone())
+    })
+}
+
 fn stuck_candidates(input: &DwellInput<'_>, reports: &[PrReport]) -> Vec<dwell::StuckCandidate> {
     let policy = input.policy;
     reports

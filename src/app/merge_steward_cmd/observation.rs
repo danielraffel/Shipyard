@@ -17,6 +17,13 @@ const MAX_MERGE_QUEUE_PAGES: usize = 10;
 // release smoke gate uses the same read with the Actions token, where a 1,000
 // row request has repeatedly produced 502/EOF responses despite a 48-PR repo.
 const MAX_OPEN_PR_ROWS: usize = 200;
+type MergeQueueSnapshotWithBase = (
+    bool,
+    BTreeMap<u64, u64>,
+    BTreeMap<u64, String>,
+    BTreeMap<u64, String>,
+    Option<String>,
+);
 
 pub(super) fn resolve_repos(mut repos: Vec<String>, cwd: &Path) -> Result<Vec<String>, CliFailure> {
     if repos.is_empty() {
@@ -416,16 +423,7 @@ fn merge_queue_snapshot_with_base(
     actions: &GitHubActions,
     repo: &str,
     base: &str,
-) -> Result<
-    (
-        bool,
-        BTreeMap<u64, u64>,
-        BTreeMap<u64, String>,
-        BTreeMap<u64, String>,
-        Option<String>,
-    ),
-    String,
-> {
+) -> Result<MergeQueueSnapshotWithBase, String> {
     let (snapshot, pages, base_sha) =
         load_merge_queue_snapshot_once_with_base(actions, repo, base, None)?;
     if !snapshot.0 || pages == 1 {
@@ -1654,6 +1652,46 @@ pub(super) fn active_runs(actions: &GitHubActions, repo: &str) -> Result<Vec<Ste
     all.sort_unstable_by_key(|run| run.id);
     all.dedup_by_key(|run| run.id);
     Ok(all)
+}
+
+/// Completed merge-group runs for the observed queue heads. This is a bounded
+/// diagnostic census used only when a base-stalled candidate exists.
+pub(super) fn completed_merge_group_runs<'a>(
+    actions: &GitHubActions,
+    repo: &str,
+    heads: impl IntoIterator<Item = &'a String>,
+) -> Result<Vec<StewardRun>, String> {
+    let value = gh_json(
+        actions,
+        &[
+            "api".to_owned(),
+            format!("repos/{repo}/actions/runs?event=merge_group&status=completed&per_page=100"),
+        ],
+        "completed merge-group runs",
+    )?;
+    let rows = value
+        .get("workflow_runs")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "completed merge-group response missing workflow_runs".to_owned())?;
+    // The newest page is enough: only runs for the current queue heads count.
+    let heads: Vec<String> = heads.into_iter().cloned().collect();
+    let mut runs = Vec::new();
+    for row in rows {
+        if row.get("event").and_then(Value::as_str) != Some("merge_group")
+            || row.get("status").and_then(Value::as_str) != Some("completed")
+            || !row
+                .get("head_sha")
+                .and_then(Value::as_str)
+                .is_some_and(|head| heads.iter().any(|wanted| wanted.eq_ignore_ascii_case(head)))
+        {
+            continue;
+        }
+        let mut run = parse_run(row)
+            .ok_or_else(|| "completed merge-group response contained malformed run".to_owned())?;
+        run.jobs = fetch_run_jobs(actions, repo, run.id)?;
+        runs.push(run);
+    }
+    Ok(runs)
 }
 
 pub(super) fn parse_run(value: &Value) -> Option<StewardRun> {

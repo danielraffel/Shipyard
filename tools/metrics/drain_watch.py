@@ -382,12 +382,15 @@ def check_stuck_approved(per_repo, now):
     return out
 
 
+BASE_TICK_FRESH = dt.timedelta(minutes=30)
+
+
 def check_base_stalled(per_repo, now):
     """One finding per repository and unchanged base head."""
     out = []
     for repo, ticks in per_repo.items():
         t_last, rows = latest_valid(ticks)
-        if rows is None or now - t_last > dt.timedelta(minutes=30):
+        if rows is None or now - t_last > BASE_TICK_FRESH:
             continue
         for item in rows.get("_base_stalled", []):
             head = item.get("head") or "?"
@@ -616,7 +619,18 @@ def collect(a, now, state):
     f += check_stuck_approved(per_repo, now)
     f += check_base_stalled(per_repo, now)
     state["_stuck_open"] = stuck_open(per_repo, now)
-    state["_base_open"] = {f["key"] for f in f if f.get("kind") == "base_stalled"}
+    current_base = {finding["key"] for finding in f if finding.get("kind") == "base_stalled"}
+    # An absent base finding is authoritative only for a fresh, readable tick.
+    # Preserve the prior alarm for repositories whose newest observation is
+    # stale or unavailable; otherwise cleanup would close an active incident.
+    for key in state.get("findings", {}):
+        if not key.startswith("base_stalled:") or key in current_base:
+            continue
+        repo = key[len("base_stalled:"):].split("@", 1)[0]
+        t_last, rows = latest_valid(per_repo.get(repo, []))
+        if rows is None or now - t_last > BASE_TICK_FRESH:
+            current_base.add(key)
+    state["_base_open"] = current_base
     f += check_stuck_claims(per_repo, a.runner_dir, now, sup)
     f += scan_logs(a.fleet_dir, state, a.from_start, now)
     f += check_launcher_fallback(a.summary, state, now)
