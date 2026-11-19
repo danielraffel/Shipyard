@@ -505,7 +505,7 @@ pub(super) fn run(
             None,
         )
     }));
-    report.base_observed = input.observation.base_sha.clone();
+    report.base_observed.clone_from(&input.observation.base_sha);
     let eligible = stuck_candidates(input, reports);
     let eligible: Vec<dwell::BaseStalledCandidate> = eligible
         .iter()
