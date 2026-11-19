@@ -155,6 +155,7 @@ fn observation_for(pr: ObservedPr, merge_queue: bool) -> RepoObservation {
         runs: Vec::new(),
         merge_group_heads: BTreeMap::new(),
         merge_group_enqueued_at: BTreeMap::new(),
+        base_sha: None,
         capacity_preemption_policy: CapacityPreemptionPolicy::pulp(),
         preemption_error: None,
     }

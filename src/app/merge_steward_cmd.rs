@@ -104,6 +104,7 @@ struct RepoObservation {
     runs: Vec<StewardRun>,
     merge_group_heads: BTreeMap<u64, String>,
     merge_group_enqueued_at: BTreeMap<u64, String>,
+    base_sha: Option<String>,
     capacity_preemption_policy: CapacityPreemptionPolicy,
     preemption_error: Option<String>,
 }

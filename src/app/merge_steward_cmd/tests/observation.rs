@@ -1,7 +1,8 @@
 use super::*;
 use crate::app::merge_steward_cmd::observation::{
-    canonical_repo_name, encode_path_segment, evaluated_required_checks,
-    hydrate_required_check_identities, parse_check, parse_rest_check,
+    canonical_repo_name, completed_merge_group_runs_query, encode_path_segment,
+    evaluated_required_checks, hydrate_required_check_identities, merge_group_branch_matches_base,
+    parse_check, parse_rest_check,
 };
 #[cfg(unix)]
 use crate::app::merge_steward_cmd::observation::{
@@ -29,6 +30,65 @@ fn parses_both_check_rollup_shapes() {
     .expect("context");
     assert_eq!(context.status, "IN_PROGRESS");
     assert_eq!(context.run_id, Some(789));
+}
+
+#[test]
+fn merge_group_branch_matching_keeps_ejected_runs_for_the_observed_base() {
+    assert!(merge_group_branch_matches_base(
+        "gh-readonly-queue/main/pr-1520-abc123",
+        "main"
+    ));
+    assert!(!merge_group_branch_matches_base(
+        "gh-readonly-queue/release/pr-1520-abc123",
+        "main"
+    ));
+    assert!(!merge_group_branch_matches_base(
+        "feat/base-dead-man",
+        "main"
+    ));
+}
+
+#[test]
+fn completed_merge_group_query_uses_a_safe_utc_created_qualifier() {
+    let since = DateTime::parse_from_rfc3339("2026-11-19T10:45:00.123456789Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let query = completed_merge_group_runs_query("owner/repo", since);
+    assert_eq!(
+        query,
+        "repos/owner/repo/actions/runs?event=merge_group&status=completed&created=%3E2026-11-19T10:45:00Z&per_page=100"
+    );
+    assert!(!query.contains('+'));
+}
+
+#[cfg(unix)]
+#[test]
+fn completed_census_skips_newer_nonfailed_run_and_finds_older_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let actions = fake_gh(
+        &temp,
+        r#"
+case "$*" in
+  *"actions/runs?event=merge_group"*) printf '%s' '{"workflow_runs":[{"id":2,"workflow_id":77,"run_attempt":1,"name":"Build","head_sha":"bbbb","head_branch":"gh-readonly-queue/main/pr-1-b","status":"completed","event":"merge_group","created_at":"2026-11-19T12:00:00Z"},{"id":1,"workflow_id":77,"run_attempt":1,"name":"Build","head_sha":"aaaa","head_branch":"gh-readonly-queue/main/pr-1-a","status":"completed","event":"merge_group","created_at":"2026-11-19T11:00:00Z"}]}' ;;
+  *"actions/runs/2/jobs"*) printf '%s' '{"jobs":[{"name":"optional","status":"completed","conclusion":"skipped"}]}' ;;
+  *"actions/runs/1/jobs"*) printf '%s' '{"jobs":[{"name":"macOS","status":"completed","conclusion":"failure"}]}' ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+    );
+    let since = DateTime::parse_from_rfc3339("2026-11-19T10:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let runs = crate::app::merge_steward_cmd::observation::completed_merge_group_runs(
+        &actions,
+        "owner/repo",
+        "main",
+        since,
+        None,
+    )
+    .unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].id, 1);
 }
 
 #[test]

@@ -188,6 +188,7 @@ fn ejected_observation() -> RepoObservation {
         runs: Vec::new(),
         merge_group_heads: BTreeMap::new(),
         merge_group_enqueued_at: BTreeMap::new(),
+        base_sha: None,
         capacity_preemption_policy: crate::merge_steward::CapacityPreemptionPolicy::for_repository(
             "owner/repo",
         ),

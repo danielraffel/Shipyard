@@ -155,6 +155,7 @@ struct Pass<'a> {
     apply: bool,
     temp: &'a tempfile::TempDir,
     now: DateTime<Utc>,
+    census: Option<&'a dyn Fn(DateTime<Utc>) -> Vec<StewardRun>>,
 }
 
 impl Pass<'_> {
@@ -172,6 +173,7 @@ impl Pass<'_> {
                 state_dir: Some(&state_dir),
                 now: self.now,
                 deadline: None,
+                completed_merge_group_runs: self.census,
             },
             &self.reports,
             ledger,
@@ -206,6 +208,7 @@ fn pass(temp: &tempfile::TempDir, prs: Vec<ObservedPr>, reports: Vec<PrReport>) 
         apply: true,
         temp,
         now: now(),
+        census: None,
     }
 }
 
@@ -680,6 +683,179 @@ fn live_revalidation_refuses_a_moved_closed_or_fork_head() {
     );
     assert!(
         dwell_pass::live_pr_matches(&live("open", HEAD, "fork/repo"), "owner/repo", HEAD).is_err()
+    );
+}
+
+fn failed_merge_group_run() -> StewardRun {
+    StewardRun {
+        id: 7,
+        workflow_id: 8,
+        run_attempt: 1,
+        workflow: "Build".to_owned(),
+        head_sha: "b".repeat(40),
+        head_branch: "gh-readonly-queue/main/pr-1-x".to_owned(),
+        status: "completed".to_owned(),
+        event: "merge_group".to_owned(),
+        pull_request_number: Some(1),
+        created_at: "2026-11-09T11:00:00Z".to_owned(),
+        jobs: vec![StewardJob {
+            id: 9,
+            name: "macOS merge gate".to_owned(),
+            status: "completed".to_owned(),
+            conclusion: Some("failure".to_owned()),
+            labels: Vec::new(),
+            runner_name: None,
+        }],
+    }
+}
+
+#[test]
+fn failed_job_ignores_skipped_jobs_and_newer_nonfailed_runs() {
+    let mut older = failed_merge_group_run();
+    let mut skipped = older.jobs[0].clone();
+    skipped.name = "skipped advisory".into();
+    skipped.conclusion = Some("skipped".into());
+    older.jobs.insert(0, skipped.clone());
+    let mut newer = older.clone();
+    newer.created_at = "2026-11-09T12:00:00Z".into();
+    newer.jobs = vec![skipped];
+    assert_eq!(
+        dwell_pass::failed_merge_group_job([&newer, &older].into_iter()).as_deref(),
+        Some("macOS merge gate")
+    );
+}
+
+#[test]
+fn quota_deferred_base_alarm_does_not_read_census_until_capacity() {
+    let temp = tempfile::tempdir().unwrap();
+    let reads = std::cell::Cell::new(0);
+    let census = |_| {
+        reads.set(reads.get() + 1);
+        vec![failed_merge_group_run()]
+    };
+    let mut queued = pr(1, Some("SUCCESS"), Some("SUCCESS"), &[]);
+    queued.fact.queue_position = Some(0);
+    let mut pass = pass(&temp, vec![queued], vec![report(1, "queued", None)]);
+    pass.observation.base_sha = Some("a".repeat(40));
+    pass.census = Some(&census);
+    pass.dwell_policy.max_escalations_per_pass = 0;
+    let mut ledger = established();
+    pass.run(&mut ledger, &FakeActs::default());
+    for minute in [61, 62] {
+        pass.now = now() + chrono::Duration::minutes(minute);
+        let report = pass.run(&mut ledger, &FakeActs::default());
+        assert!(
+            report
+                .overdue
+                .iter()
+                .any(|row| row.state == DwellState::BaseStalled && row.escalation_deferred)
+        );
+    }
+    assert_eq!(reads.get(), 0);
+    pass.dwell_policy.max_escalations_per_pass = 1;
+    pass.now = now() + chrono::Duration::minutes(63);
+    let report = pass.run(&mut ledger, &FakeActs::default());
+    assert!(
+        report
+            .overdue
+            .iter()
+            .any(|row| row.state == DwellState::BaseStalled
+                && row.escalated
+                && row.blocked_on == "base_stalled:macOS merge gate")
+    );
+    assert_eq!(reads.get(), 1);
+}
+
+#[test]
+fn queued_approved_green_pr_starts_and_escalates_base_stall() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut queued = pr(1, Some("SUCCESS"), Some("SUCCESS"), &[]);
+    queued.fact.queue_position = Some(0);
+    let mut pass = pass(&temp, vec![queued], vec![report(1, "queued", None)]);
+    pass.observation.base_sha = Some("a".repeat(40));
+    let mut ledger = established();
+    let first = pass.run(&mut ledger, &FakeActs::default());
+    assert_eq!(first.base_eligible, Some(1));
+    pass.now = now() + chrono::Duration::minutes(61);
+    let later = pass.run(&mut ledger, &FakeActs::default());
+    assert!(later.overdue.iter().any(|row| row.state
+        == crate::merge_steward::dwell::DwellState::BaseStalled
+        && row.escalated));
+    assert!(
+        !later
+            .overdue
+            .iter()
+            .any(|row| row.state == crate::merge_steward::dwell::DwellState::ApprovedStuck)
+    );
+}
+
+/// The completed merge-group census is read once, on the pass the
+/// base-stalled alarm first escalates, and its failing job names the alarm;
+/// later passes neither read it again nor lose the job.
+#[test]
+fn a_base_stalled_alarm_reads_the_completed_run_census_once_and_names_the_job() {
+    assert_eq!(
+        dwell_pass::failed_merge_group_job(std::iter::once(&failed_merge_group_run())).as_deref(),
+        Some("macOS merge gate")
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let reads = std::cell::Cell::new(0);
+    let census = |_| {
+        reads.set(reads.get() + 1);
+        vec![failed_merge_group_run()]
+    };
+    let mut pass = pass(
+        &temp,
+        vec![pr(1, Some("SUCCESS"), Some("SUCCESS"), &[])],
+        vec![report(1, "merge_state:UNSTABLE", None)],
+    );
+    pass.observation.base_sha = Some("a".repeat(40));
+    pass.census = Some(&census);
+    let mut ledger = established();
+    let base_rows = |report: &dwell_pass::DwellRepoReport| {
+        report
+            .overdue
+            .iter()
+            .filter(|row| row.state == crate::merge_steward::dwell::DwellState::BaseStalled)
+            .map(|row| (row.blocked_on.clone(), row.escalated))
+            .collect::<Vec<_>>()
+    };
+    for minute in [0, 30, 59] {
+        pass.now = now() + chrono::Duration::minutes(minute);
+        assert!(base_rows(&pass.run(&mut ledger, &FakeActs::default())).is_empty());
+    }
+    assert_eq!(reads.get(), 0, "no census before the alarm");
+    pass.now = now() + chrono::Duration::minutes(61);
+    assert_eq!(
+        base_rows(&pass.run(&mut ledger, &FakeActs::default())),
+        vec![("base_stalled:macOS merge gate".to_owned(), true)]
+    );
+    pass.now = now() + chrono::Duration::minutes(75);
+    assert_eq!(
+        base_rows(&pass.run(&mut ledger, &FakeActs::default())),
+        vec![("base_stalled:macOS merge gate".to_owned(), false)]
+    );
+    assert_eq!(reads.get(), 1, "census read once per incident");
+}
+
+#[test]
+fn base_stalled_report_records_when_the_detector_is_disabled() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut pass = pass(
+        &temp,
+        vec![pr(1, Some("SUCCESS"), Some("SUCCESS"), &[])],
+        vec![report(1, "merge_state:UNSTABLE", None)],
+    );
+    pass.dwell_policy.limits.insert(DwellState::BaseStalled, 0);
+    pass.observation.base_sha = Some("a".repeat(40));
+    let mut ledger = established();
+    let report = pass.run(&mut ledger, &FakeActs::default());
+    assert_eq!(report.base_stalled_enabled, Some(false));
+    assert!(
+        report
+            .overdue
+            .iter()
+            .all(|row| { row.state != crate::merge_steward::dwell::DwellState::BaseStalled })
     );
 }
 

@@ -1,7 +1,7 @@
 use super::{
-    BTreeMap, CapacityPreemptionPolicy, CliFailure, Duration, GitHubActions, Instant,
+    BTreeMap, CapacityPreemptionPolicy, CliFailure, DateTime, Duration, GitHubActions, Instant,
     MergeQueueSnapshot, ObservedPr, Path, RepoObservation, RequiredCheck, StewardCheck, StewardJob,
-    StewardPullRequest, StewardRun, Value, is_admin_protection_denied,
+    StewardPullRequest, StewardRun, Utc, Value, is_admin_protection_denied,
     is_capacity_preemption_workflow, is_full_sha, is_implicitly_managed,
     is_private_free_entitlement,
 };
@@ -9,6 +9,7 @@ use crate::required_check_policy::{
     classic_required_checks, encode_path_segment as encode_policy_path_segment,
     evaluated_required_checks as parse_evaluated_required_checks, normalize_required_checks,
 };
+use chrono::SecondsFormat;
 
 const BOUNDED_GH_STDOUT_BYTES: usize = 4 * 1024 * 1024;
 const BOUNDED_GH_STDERR_BYTES: usize = 64 * 1024;
@@ -17,6 +18,14 @@ const MAX_MERGE_QUEUE_PAGES: usize = 10;
 // release smoke gate uses the same read with the Actions token, where a 1,000
 // row request has repeatedly produced 502/EOF responses despite a 48-PR repo.
 const MAX_OPEN_PR_ROWS: usize = 200;
+const MAX_COMPLETED_MERGE_GROUP_RUNS: usize = 20;
+type MergeQueueSnapshotWithBase = (
+    bool,
+    BTreeMap<u64, u64>,
+    BTreeMap<u64, String>,
+    BTreeMap<u64, String>,
+    Option<String>,
+);
 
 pub(super) fn resolve_repos(mut repos: Vec<String>, cwd: &Path) -> Result<Vec<String>, CliFailure> {
     if repos.is_empty() {
@@ -73,8 +82,8 @@ pub(super) fn observe_repo_with_status_history(
     let evaluated_rules = evaluated_branch_rules(actions, &repo, base)?;
     let required_checks =
         required_checks_with_evaluated_rules(actions, &repo, base, &evaluated_rules)?;
-    let (merge_queue, queue_positions, merge_group_heads, merge_group_enqueued_at) =
-        merge_queue_snapshot(actions, &repo, base)?;
+    let (merge_queue, queue_positions, merge_group_heads, merge_group_enqueued_at, base_sha) =
+        merge_queue_snapshot_with_base(actions, &repo, base)?;
     let mut prs = pull_requests(actions, &repo, base, &queue_positions)?;
     let mut history =
         status_history.map(|path| super::head_rollup::StatusHistory::load(path, &repo));
@@ -114,6 +123,7 @@ pub(super) fn observe_repo_with_status_history(
         runs,
         merge_group_heads,
         merge_group_enqueued_at,
+        base_sha,
         capacity_preemption_policy,
         preemption_error,
     })
@@ -142,8 +152,8 @@ pub(super) fn observe_pull_request(
     let evaluated_rules = evaluated_branch_rules(actions, &repo, base)?;
     let required_checks =
         required_checks_with_evaluated_rules(actions, &repo, base, &evaluated_rules)?;
-    let (merge_queue, queue_positions, merge_group_heads, merge_group_enqueued_at) =
-        merge_queue_snapshot(actions, &repo, base)?;
+    let (merge_queue, queue_positions, merge_group_heads, merge_group_enqueued_at, base_sha) =
+        merge_queue_snapshot_with_base(actions, &repo, base)?;
     let mut prs = vec![parse_pr(row, &queue_positions)?];
     hydrate_empty_diff_facts(actions, &repo, base, &mut prs);
     hydrate_census_check_identities(actions, &repo, &required_checks, &mut prs)?;
@@ -158,6 +168,7 @@ pub(super) fn observe_pull_request(
         runs: Vec::new(),
         merge_group_heads,
         merge_group_enqueued_at,
+        base_sha,
         capacity_preemption_policy,
         preemption_error: None,
     })
@@ -410,6 +421,26 @@ pub(super) fn merge_queue_snapshot(
     merge_queue_snapshot_with_deadline(actions, repo, base, None)
 }
 
+fn merge_queue_snapshot_with_base(
+    actions: &GitHubActions,
+    repo: &str,
+    base: &str,
+) -> Result<MergeQueueSnapshotWithBase, String> {
+    let (snapshot, pages, base_sha) =
+        load_merge_queue_snapshot_once_with_base(actions, repo, base, None)?;
+    if !snapshot.0 || pages == 1 {
+        return Ok((snapshot.0, snapshot.1, snapshot.2, snapshot.3, base_sha));
+    }
+    let (confirmation, confirmation_pages, confirmation_sha) =
+        load_merge_queue_snapshot_once_with_base(actions, repo, base, None)?;
+    if confirmation_pages != pages || confirmation != snapshot || confirmation_sha != base_sha {
+        return Err(
+            "merge queue changed during pagination; refusing an inconsistent snapshot".to_owned(),
+        );
+    }
+    Ok((snapshot.0, snapshot.1, snapshot.2, snapshot.3, base_sha))
+}
+
 pub(super) fn merge_queue_snapshot_before(
     actions: &GitHubActions,
     repo: &str,
@@ -425,11 +456,11 @@ fn merge_queue_snapshot_with_deadline(
     base: &str,
     deadline: Option<Instant>,
 ) -> Result<MergeQueueSnapshot, String> {
-    let (snapshot, pages) = load_merge_queue_snapshot_once(actions, repo, base, deadline)?;
+    let (snapshot, pages, _) = load_merge_queue_snapshot_once(actions, repo, base, deadline)?;
     if !snapshot.0 || pages == 1 {
         return Ok(snapshot);
     }
-    let (confirmation, confirmation_pages) =
+    let (confirmation, confirmation_pages, _) =
         load_merge_queue_snapshot_once(actions, repo, base, deadline)?;
     if confirmation_pages != pages || confirmation != snapshot {
         return Err(
@@ -441,13 +472,24 @@ fn merge_queue_snapshot_with_deadline(
 
 /// One page of a base branch's merge queue.
 pub(super) const MERGE_QUEUE_QUERY: &str = "query($owner:String!,$name:String!,$branch:String!,$cursor:String){repository(owner:$owner,name:$name){mergeQueue(branch:$branch){entries(first:100,after:$cursor){nodes{position enqueuedAt headCommit{oid} pullRequest{number}} pageInfo{hasNextPage endCursor}}}}}";
+const MERGE_QUEUE_QUERY_WITH_BASE: &str = "query($owner:String!,$name:String!,$branch:String!,$qualifiedBase:String!,$cursor:String){repository(owner:$owner,name:$name){ref(qualifiedName:$qualifiedBase){target{oid}} mergeQueue(branch:$branch){entries(first:100,after:$cursor){nodes{position enqueuedAt headCommit{oid} pullRequest{number}} pageInfo{hasNextPage endCursor}}}}}";
 
 fn load_merge_queue_snapshot_once(
     actions: &GitHubActions,
     repo: &str,
     base: &str,
     deadline: Option<Instant>,
-) -> Result<(MergeQueueSnapshot, usize), String> {
+) -> Result<(MergeQueueSnapshot, usize, Option<String>), String> {
+    load_merge_queue_snapshot_once_inner(actions, repo, base, deadline, MERGE_QUEUE_QUERY)
+}
+
+fn load_merge_queue_snapshot_once_inner(
+    actions: &GitHubActions,
+    repo: &str,
+    base: &str,
+    deadline: Option<Instant>,
+    query: &str,
+) -> Result<(MergeQueueSnapshot, usize, Option<String>), String> {
     // `gh api graphql` has no `--repo` flag. Scope the authenticated client
     // instead so repository-specific token helpers still receive provenance
     // while the argv remains valid for the native GitHub CLI.
@@ -455,10 +497,10 @@ fn load_merge_queue_snapshot_once(
     let (owner, name) = repo
         .split_once('/')
         .ok_or_else(|| format!("invalid repository slug `{repo}`"))?;
-    let query = MERGE_QUEUE_QUERY;
     let mut positions = BTreeMap::new();
     let mut heads = BTreeMap::new();
     let mut enqueued = BTreeMap::new();
+    let mut base_sha = None;
     let mut cursor: Option<String> = None;
     let mut seen_cursors = std::collections::BTreeSet::new();
     for page in 1..=MAX_MERGE_QUEUE_PAGES {
@@ -474,6 +516,9 @@ fn load_merge_queue_snapshot_once(
             "-F".to_owned(),
             format!("branch={base}"),
         ];
+        if query.contains("qualifiedBase") {
+            args.extend(["-F".to_owned(), format!("qualifiedBase=refs/heads/{base}")]);
+        }
         if let Some(cursor) = cursor.as_deref() {
             args.extend(["-F".to_owned(), format!("cursor={cursor}")]);
         }
@@ -483,6 +528,7 @@ fn load_merge_queue_snapshot_once(
                 return Ok((
                     (false, BTreeMap::new(), BTreeMap::new(), BTreeMap::new()),
                     page,
+                    base_sha,
                 ));
             }
             Err(error) => return Err(error),
@@ -497,6 +543,7 @@ fn load_merge_queue_snapshot_once(
                 return Ok((
                     (false, BTreeMap::new(), BTreeMap::new(), BTreeMap::new()),
                     page,
+                    None,
                 ));
             }
             return Err(format!("merge-queue GraphQL errors: {text}"));
@@ -504,18 +551,26 @@ fn load_merge_queue_snapshot_once(
         let Some(queue) = value.pointer("/data/repository/mergeQueue") else {
             return Err("merge-queue response missing repository.mergeQueue".to_owned());
         };
+        if base_sha.is_none() {
+            base_sha = value
+                .pointer("/data/repository/ref/target/oid")
+                .and_then(Value::as_str)
+                .filter(|sha| is_full_sha(sha))
+                .map(str::to_owned);
+        }
         if queue.is_null() {
             if page == 1 {
                 return Ok((
                     (false, BTreeMap::new(), BTreeMap::new(), BTreeMap::new()),
                     page,
+                    base_sha,
                 ));
             }
             return Err("merge-queue response became unavailable during pagination".to_owned());
         }
         append_merge_queue_nodes(queue, &mut positions, &mut heads, &mut enqueued)?;
         let Some(next_cursor) = merge_queue_next_cursor(queue)? else {
-            return Ok(((true, positions, heads, enqueued), page));
+            return Ok(((true, positions, heads, enqueued), page, base_sha));
         };
         if page == MAX_MERGE_QUEUE_PAGES {
             return Err(format!(
@@ -529,6 +584,15 @@ fn load_merge_queue_snapshot_once(
         cursor = Some(next_cursor.to_owned());
     }
     unreachable!("bounded merge-queue pagination returns from every page")
+}
+
+fn load_merge_queue_snapshot_once_with_base(
+    actions: &GitHubActions,
+    repo: &str,
+    base: &str,
+    deadline: Option<Instant>,
+) -> Result<(MergeQueueSnapshot, usize, Option<String>), String> {
+    load_merge_queue_snapshot_once_inner(actions, repo, base, deadline, MERGE_QUEUE_QUERY_WITH_BASE)
 }
 
 fn append_merge_queue_nodes(
@@ -1590,6 +1654,89 @@ pub(super) fn active_runs(actions: &GitHubActions, repo: &str) -> Result<Vec<Ste
     all.sort_unstable_by_key(|run| run.id);
     all.dedup_by_key(|run| run.id);
     Ok(all)
+}
+
+/// Completed merge-group runs for the observed base. This is a bounded
+/// diagnostic census used only when a base-stalled candidate exists. A failed
+/// merge group is commonly ejected from the live queue before this read, so
+/// filtering by current queue heads would lose the very run whose job should
+/// be named. The merge-group branch retains the base identity instead.
+pub(super) fn completed_merge_group_runs(
+    actions: &GitHubActions,
+    repo: &str,
+    base: &str,
+    since: DateTime<Utc>,
+    deadline: Option<Instant>,
+) -> Result<Vec<StewardRun>, String> {
+    let argv = vec![
+        "api".to_owned(),
+        completed_merge_group_runs_query(repo, since),
+    ];
+    let value = if let Some(deadline) = deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(Vec::new());
+        }
+        gh_json_timeout(actions, &argv, "completed merge-group runs", remaining)?
+    } else {
+        gh_json(actions, &argv, "completed merge-group runs")?
+    };
+    let rows = value
+        .get("workflow_runs")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "completed merge-group response missing workflow_runs".to_owned())?;
+    // The newest page is enough for this bounded diagnostic census. Match the
+    // merge-group branch's base component rather than live queue heads: an
+    // ejected group no longer has a queue entry but its completed run remains.
+    let mut candidates: Vec<&Value> = rows
+        .iter()
+        .filter(|row| {
+            row.get("event").and_then(Value::as_str) == Some("merge_group")
+                && row.get("status").and_then(Value::as_str) == Some("completed")
+                && row
+                    .get("head_branch")
+                    .and_then(Value::as_str)
+                    .is_some_and(|branch| merge_group_branch_matches_base(branch, base))
+        })
+        .collect();
+    // GitHub normally returns newest first, but make the bounded scan explicit
+    // so the first failed run is the newest one even if that ordering changes.
+    candidates.sort_by(|left, right| {
+        right
+            .get("created_at")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .cmp(left.get("created_at").and_then(Value::as_str).unwrap_or(""))
+    });
+    let mut runs = Vec::new();
+    for row in candidates.into_iter().take(MAX_COMPLETED_MERGE_GROUP_RUNS) {
+        let mut run = parse_run(row)
+            .ok_or_else(|| "completed merge-group response contained malformed run".to_owned())?;
+        run.jobs = match deadline {
+            Some(deadline) => fetch_run_jobs_before(actions, repo, run.id, deadline)?,
+            None => fetch_run_jobs(actions, repo, run.id)?,
+        };
+        if run
+            .jobs
+            .iter()
+            .any(super::dwell_pass::is_failed_merge_group_job)
+        {
+            runs.push(run);
+            break;
+        }
+    }
+    Ok(runs)
+}
+
+pub(super) fn completed_merge_group_runs_query(repo: &str, since: DateTime<Utc>) -> String {
+    format!(
+        "repos/{repo}/actions/runs?event=merge_group&status=completed&created=%3E{}&per_page=100",
+        since.to_rfc3339_opts(SecondsFormat::Secs, true)
+    )
+}
+
+pub(super) fn merge_group_branch_matches_base(branch: &str, base: &str) -> bool {
+    branch.starts_with(&format!("gh-readonly-queue/{base}/"))
 }
 
 pub(super) fn parse_run(value: &Value) -> Option<StewardRun> {

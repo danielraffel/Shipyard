@@ -299,6 +299,83 @@ class StuckApprovedClearTests(StuckApprovedTests):
         self.assertEqual(self.store()["issues"][0]["state"], "closed")
 
 
+class BaseStalledTests(Base):
+    def base_tick(self, t, head="base-old", overdue=True, observed=True, enabled=True):
+        dwell = {**({"base_observed": head, "base_eligible": 0 if not overdue else 1} if observed else {}), "overdue": ([{"pr": 69, "state": "base_stalled", "base_head": head,
+                                "age_minutes": 75, "failed_job": "macos"}] if overdue else [])}
+        if observed:
+            dwell["base_stalled_enabled"] = enabled
+        body = {"repos": [{"repo": REPO, "prs": [{"number": 69, "head_sha": "pr-head",
+                    "blocked_on": "base_stalled", "since": None,
+                    "next_action": {"actor": "author", "action": "x", "stop": False}}],
+                    "errors": [], "dwell": dwell}]}
+        (self.log / f"{REPO.replace('/', '_')}-{stamp(t)}.json").write_text(json.dumps(body))
+
+    def file_alarm(self):
+        self.base_tick(NOW)
+        self.run_once(NOW)
+        self.base_tick(NOW + dt.timedelta(minutes=5))
+        self.run_once(NOW + dt.timedelta(minutes=5))
+        self.assertEqual(len(self.store()["issues"]), 1)
+
+    def test_stale_tick_keeps_active_base_alarm_open(self):
+        self.file_alarm()
+        self.run_once(NOW + dt.timedelta(minutes=45))
+        self.assertEqual(self.store()["issues"][0]["state"], "open")
+        self.assertIn("base_stalled:acme/repo@base-old", self.state()["findings"])
+
+    def test_repeated_stale_ticks_never_clear_active_base_alarm(self):
+        self.file_alarm()
+        for m in (45, 50, 55, 60, 65, 70):  # well past CLEAR_RUNS stale/unavailable runs
+            self.run_once(NOW + dt.timedelta(minutes=m))
+        self.assertEqual(self.store()["issues"][0]["state"], "open")
+        st = self.state()["findings"]["base_stalled:acme/repo@base-old"]
+        self.assertEqual(st.get("absent", 0), 0)
+
+    def test_fresh_tick_without_a_base_observation_keeps_the_alarm(self):
+        self.file_alarm()
+        for m in (10, 15, 20, 25):
+            self.base_tick(NOW + dt.timedelta(minutes=m), head="base-new", overdue=False, observed=False)
+            self.run_once(NOW + dt.timedelta(minutes=m))
+        self.assertEqual(self.store()["issues"][0]["state"], "open")
+        self.assertIn("base_stalled:acme/repo@base-old", self.state()["findings"])
+
+    def test_fresh_same_base_with_no_eligible_pr_clears_the_alarm(self):
+        self.file_alarm()
+        self.base_tick(NOW + dt.timedelta(minutes=10), head="base-old", overdue=False)
+        self.run_once(NOW + dt.timedelta(minutes=10))
+        self.assertEqual(self.store()["issues"][0]["state"], "closed")
+
+    def test_unavailable_newest_tick_does_not_fall_back_to_an_older_valid_one(self):
+        self.file_alarm()
+        self.base_tick(NOW + dt.timedelta(minutes=10), head="base-new", overdue=False)
+        (self.log / f"{REPO.replace('/', '_')}-{stamp(NOW + dt.timedelta(minutes=12))}.json").write_text(
+            json.dumps({"repos": [{"repo": REPO, "errors": ["boom"]}]}))
+        self.run_once(NOW + dt.timedelta(minutes=12))
+        self.assertEqual(self.store()["issues"][0]["state"], "open")
+
+    def test_same_base_with_an_eligible_pr_missing_from_overdue_keeps_the_alarm(self):
+        self.file_alarm()
+        self.base_tick(NOW + dt.timedelta(minutes=10), head="base-old", overdue=False)
+        p = self.log / f"{REPO.replace('/', '_')}-{stamp(NOW + dt.timedelta(minutes=10))}.json"
+        d = json.loads(p.read_text()); d["repos"][0]["dwell"]["base_eligible"] = 2; p.write_text(json.dumps(d))
+        self.run_once(NOW + dt.timedelta(minutes=10))
+        self.assertEqual(self.store()["issues"][0]["state"], "open")
+
+    def test_fresh_changed_base_clears_active_alarm(self):
+        self.file_alarm()
+        self.base_tick(NOW + dt.timedelta(minutes=10), head="base-new", overdue=False)
+        self.run_once(NOW + dt.timedelta(minutes=10))
+        self.assertEqual(self.store()["issues"][0]["state"], "closed")
+        self.assertNotIn("base_stalled:acme/repo@base-old", self.state()["findings"])
+
+    def test_fresh_disabled_detector_clears_active_alarm_with_eligible_prs(self):
+        self.file_alarm()
+        self.base_tick(NOW + dt.timedelta(minutes=10), overdue=False, enabled=False)
+        self.run_once(NOW + dt.timedelta(minutes=10))
+        self.assertEqual(self.store()["issues"][0]["state"], "closed")
+        self.assertNotIn("base_stalled:acme/repo@base-old", self.state()["findings"])
+
 class TranscriptAndTimeTests(Base):
     def test_transcripts_are_not_scanned_but_runner_lines_are(self):
         (self.fleet / "repair.last-output.txt").write_text(

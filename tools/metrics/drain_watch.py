@@ -215,11 +215,16 @@ def recent_ticks(log_dir, now, span):
                 per_repo.setdefault(r["repo"], []).append((t, None))
                 continue
             stuck = {}
+            base_stalled = []
             dwell = r.get("dwell") if isinstance(r.get("dwell"), dict) else {}
             for o in dwell.get("overdue") or []:
                 if isinstance(o, dict) and o.get("state") == "approved_stuck" and isinstance(o.get("pr"), int):
                     stuck[o["pr"]] = {"head": str(o.get("head") or ""), "blocked_on": str(o.get("blocked_on") or "unknown"),
                                       "age": o.get("age_minutes"), "entered": o.get("entered_at")}
+                if isinstance(o, dict) and o.get("state") == "base_stalled":
+                    base_stalled.append({"head": str(o.get("base_head") or o.get("head") or "?"),
+                                         "pr": o.get("pr"), "age": o.get("age_minutes"),
+                                         "failed_job": o.get("failed_job") or "unknown"})
             rows = {}
             for p in r["prs"]:
                 na = p.get("next_action") or {}
@@ -229,6 +234,13 @@ def recent_ticks(log_dir, now, span):
                                      "loop": (p.get("loop") or {}).get("state") if isinstance(p.get("loop"), dict) else None,
                                      "required": [c for c in (r.get("required_contexts") or []) if isinstance(c, str)],
                                      "stuck": stuck.get(p["number"])}
+            rows["_base_stalled"] = base_stalled
+            bo = dwell.get("base_observed")
+            rows["_base_observed"] = bo if isinstance(bo, str) and bo else None
+            be = dwell.get("base_eligible")
+            rows["_base_eligible"] = be if isinstance(be, int) and not isinstance(be, bool) else None
+            enabled = dwell.get("base_stalled_enabled")
+            rows["_base_enabled"] = enabled if isinstance(enabled, bool) else None
             per_repo.setdefault(r["repo"], []).append((t, rows))
     for v in per_repo.values():
         v.sort(key=lambda x: x[0])
@@ -269,6 +281,8 @@ def check_drain_stall(per_repo, now, sup=None):
             continue  # not enough history to say nothing merged in 2 h
         waiting = []
         for pr, o in rows.items():
+            if not isinstance(pr, int):
+                continue
             if (o["deferred"] or classify(o["token"], o["actor"], o["stop"]) != "actionable"
                     or (o["since"] or t_last) > t_last - STALL_WINDOW):
                 continue
@@ -300,6 +314,8 @@ def check_stale_hold(per_repo, now, sup=None):
             continue
         old = []
         for pr, o in rows.items():
+            if not isinstance(pr, int):
+                continue
             if (o["deferred"] or not (o["token"] == "held" or o["token"].startswith("held:")) or not o["since"]
                     or t_last - o["since"] < STALE_HOLD):
                 continue
@@ -323,7 +339,7 @@ def check_merge_group_stalled(per_repo, now, sup=None):
         if rows is None or now - t_last > dt.timedelta(minutes=30):
             continue
         # Never suppressed: the steward says this merge group can never finish.
-        stalled = sorted(pr for pr, o in rows.items() if o["token"].startswith("merge_group_stalled:"))
+        stalled = sorted(pr for pr, o in rows.items() if isinstance(pr, int) and o["token"].startswith("merge_group_stalled:"))
         if stalled:
             out.append(dict(kind="merge_group_stalled", repo=repo, lane="-", key=f"merge_group_stalled:{repo}",
                             detail=f"{len(stalled)} merge group(s) can never finish: " + ",".join(f"#{n}" for n in stalled[:5]),
@@ -346,7 +362,7 @@ def stuck_open(per_repo, now):
         if rows is None or now - t_last > dt.timedelta(minutes=30):
             continue
         repos.add(repo)
-        keys.update(stuck_key(repo, pr, o["head"]) for pr, o in rows.items())
+        keys.update(stuck_key(repo, pr, o["head"]) for pr, o in rows.items() if isinstance(pr, int))
     return repos, keys
 
 
@@ -360,7 +376,7 @@ def check_stuck_approved(per_repo, now):
         t_last, rows = latest_valid(ticks)
         if rows is None or now - t_last > dt.timedelta(minutes=30):
             continue
-        for pr in sorted(rows):
+        for pr in sorted(k for k in rows if isinstance(k, int)):
             st = rows[pr].get("stuck")
             if not st or (st["head"] and rows[pr]["head"] and st["head"] != rows[pr]["head"]):
                 continue
@@ -369,6 +385,26 @@ def check_stuck_approved(per_repo, now):
             out.append(dict(kind="stuck_approved", repo=repo, lane="-", key=stuck_key(repo, pr, head),
                             detail=f"#{pr} approved and required-green, unmerged {st['age']}m, blocked_on={reason}",
                             evidence=[f"{repo}#{pr} head {head} blocked_on {st['blocked_on']} since {st['entered']}"]))
+    return out
+
+
+BASE_TICK_FRESH = dt.timedelta(minutes=30)
+
+
+def check_base_stalled(per_repo, now):
+    """One finding per repository and unchanged base head."""
+    out = []
+    for repo, ticks in per_repo.items():
+        t_last, rows = latest_valid(ticks)
+        if rows is None or now - t_last > BASE_TICK_FRESH:
+            continue
+        for item in rows.get("_base_stalled", []):
+            head = item.get("head") or "?"
+            job = item.get("failed_job") or "unknown"
+            out.append(dict(kind="base_stalled", repo=repo, lane="-",
+                            key=f"base_stalled:{repo}@{head}",
+                            detail=f"base {head[:12]} unchanged {item.get('age')}m; oldest eligible PR #{item.get('pr')}; failed_job={job}",
+                            evidence=[f"{repo} base {head} oldest eligible PR #{item.get('pr')} age={item.get('age')}m failed_job={job}"]))
     return out
 
 
@@ -587,7 +623,38 @@ def collect(a, now, state):
     f += check_stale_hold(per_repo, now, sup)
     f += check_merge_group_stalled(per_repo, now, sup)
     f += check_stuck_approved(per_repo, now)
+    f += check_base_stalled(per_repo, now)
     state["_stuck_open"] = stuck_open(per_repo, now)
+    current_base = {finding["key"] for finding in f if finding.get("kind") == "base_stalled"}
+    # An absent base finding is authoritative only for a fresh, readable tick.
+    # Preserve the prior alarm for repositories whose newest observation is
+    # stale or unavailable; otherwise cleanup would close an active incident.
+    for key in state.get("findings", {}):
+        if not key.startswith("base_stalled:") or key in current_base:
+            continue
+        repo = key[len("base_stalled:"):].split("@", 1)[0]
+        # The NEWEST tick decides: an unreadable or errored newest tick must not
+        # fall back to an older valid row.
+        ticks = per_repo.get(repo, [])
+        t_last, rows = ticks[-1] if ticks else (None, None)
+        if rows is None or now - t_last > BASE_TICK_FRESH:
+            current_base.add(key)
+            continue
+        # A fresh tick clears the alarm only on affirmative evidence: it observed
+        # a base head different from the alarm's (the base moved), or the same
+        # head with an explicit empty eligible set. Anything less keeps it.
+        observed = rows.get("_base_observed")
+        head = key.split("@", 1)[1]
+        # A fresh report explicitly records that the detector is disabled. This
+        # is affirmative clear evidence even when eligible PRs remain present;
+        # without it, the old issue would stay open forever after config=0.
+        if rows.get("_base_enabled") is False:
+            continue
+        moved = observed is not None and observed != head
+        none_waiting = observed == head and rows.get("_base_eligible") == 0
+        if not (moved or none_waiting):
+            current_base.add(key)
+    state["_base_open"] = current_base
     f += check_stuck_claims(per_repo, a.runner_dir, now, sup)
     f += scan_logs(a.fleet_dir, state, a.from_start, now)
     f += check_launcher_fallback(a.summary, state, now)
@@ -656,11 +723,13 @@ def run(a, now=None, issues=None):
             st["pending"] = {k: f[k] for k in ("kind", "repo", "lane", "key", "detail", "evidence")}
             lines.append(f"{stamp} drain-watch ERROR issue {key}: {str(exc)[:100]}")
     stuck_repos, stuck_keys = state.pop("_stuck_open", (set(), set()))
+    base_open = state.pop("_base_open", set())
     for key in list(findings_state):
         if key in seen:
             continue
         st = findings_state[key]
         stuck = key.startswith("stuck_approved:")
+        base = key.startswith("base_stalled:")
         if stuck:
             # Cleared only on evidence the PR merged, closed or moved: absent from a
             # fresh tick of its repository, or there at another head. A missing row
@@ -668,6 +737,25 @@ def run(a, now=None, issues=None):
             repo = key[len("stuck_approved:"):].rsplit("#", 1)[0]
             if repo not in stuck_repos or key in stuck_keys:
                 continue
+        if base and key not in base_open:
+            # Base-head keyed findings clear as soon as a later fresh tick
+            # reports a different head or no eligible PR.
+            if st.get("issue"):
+                if a.dry_run:
+                    actions.append(f"would close issue #{st['issue']} for {key}")
+                else:
+                    try:
+                        issues.close(st["issue"], key)
+                    except Exception as exc:
+                        lines.append(f"{stamp} drain-watch ERROR close {key}: {str(exc)[:100]}")
+                        continue
+            del findings_state[key]
+            continue
+        if base:
+            # Still in base_open: a stale or unavailable tick, not evidence the
+            # base moved. Keep the alarm without counting it absent, so the
+            # generic CLEAR_RUNS path never closes it.
+            continue
         st["absent"] = st.get("absent", 0) + 1
         if st.get("pending") and not st.get("issue"):
             continue  # no issue could be filed yet: keep it until one is

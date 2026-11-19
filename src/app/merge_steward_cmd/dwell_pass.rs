@@ -31,8 +31,8 @@ use serde_json::Value;
 use super::carried_commits::OpenPr;
 use super::next_action::NextAction;
 use super::{
-    GitHubActions, MutationControl, ObservedPr, PrReport, RepoObservation, StewardLedger,
-    StewardPolicy, StewardPullRequest,
+    GitHubActions, MutationControl, ObservedPr, PrReport, RepoObservation, StewardJob,
+    StewardLedger, StewardPolicy, StewardPullRequest, StewardRun,
 };
 use crate::merge_steward::dwell::{
     self, ActKind, ActMode, ActRecord, Actable, Disposition, DwellPolicy, DwellRepoState,
@@ -77,6 +77,19 @@ pub(super) struct DwellRepoReport {
     pub escalations_new: usize,
     /// Escalations owed but deferred by the per-pass cap.
     pub escalations_deferred: usize,
+    /// The base head this pass observed, when it read one. Absent means the
+    /// base was not observed, which is no evidence a base alarm cleared.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_observed: Option<String>,
+    /// Pull requests eligible for the base-stall clock this pass; with
+    /// `base_observed`, the proof that none is waiting on the base.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_eligible: Option<usize>,
+    /// Whether the base-stalled detector was enabled for this fresh policy
+    /// observation. `Some(false)` is affirmative evidence that a prior alarm
+    /// should be cleared; `None` means an older report did not record it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_stalled_enabled: Option<bool>,
     /// Why the base config could not be read (the defaults applied).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy_read_error: Option<String>,
@@ -130,6 +143,10 @@ pub(crate) struct OverdueRecord {
     pub escalation_deferred: bool,
     /// When this record was written.
     pub at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed_job: Option<String>,
 }
 
 /// Who an overdue record addresses.
@@ -225,6 +242,10 @@ pub(super) struct DwellInput<'a> {
     pub now: DateTime<Utc>,
     /// Past this instant no GitHub-writing act is taken (`--pass-budget-secs`).
     pub deadline: Option<std::time::Instant>,
+    /// Reads completed merge-group runs for the queue heads. Called only on
+    /// the tick a base-stalled alarm first escalates with no failing job
+    /// visible in the active runs.
+    pub completed_merge_group_runs: Option<&'a dyn Fn(DateTime<Utc>) -> Vec<StewardRun>>,
 }
 
 /// Read `[auto_merge.dwell]` from the base's `.shipyard/config.toml`, through
@@ -280,6 +301,7 @@ pub(super) fn run(
         policy_read_error: input.dwell_policy.read_error.clone(),
         ..DwellRepoReport::default()
     };
+    report.base_stalled_enabled = Some(input.dwell_policy.limit(DwellState::BaseStalled).is_some());
     let stacked = input
         .listing
         .map(|listing| stacked_on_merged_base(listing, observation))
@@ -489,6 +511,78 @@ pub(super) fn run(
             None,
         )
     }));
+    report.base_observed.clone_from(&input.observation.base_sha);
+    let eligible = eligible_candidates(input, reports, true);
+    let eligible: Vec<dwell::BaseStalledCandidate> = eligible
+        .iter()
+        .map(|candidate| dwell::BaseStalledCandidate {
+            number: candidate.number,
+            head: candidate.head.clone(),
+        })
+        .collect();
+    report.base_eligible = Some(eligible.len());
+    let failed_job = failed_merge_group_job(input.observation.runs.iter());
+    let mut base_rows = dwell::track_base_stalled(
+        &mut state,
+        input.observation.base_sha.as_deref(),
+        &eligible,
+        failed_job.clone(),
+        input.dwell_policy,
+        input.now,
+    );
+    let census_since = base_rows
+        .iter()
+        .find(|row| row.overdue.state == DwellState::BaseStalled && row.escalate)
+        .map(|row| row.overdue.entered_at - chrono::Duration::minutes(15));
+    if let (Some(census), Some(since)) = (input.completed_merge_group_runs, census_since) {
+        // Only an applying pass records the alert, which is what keeps the read
+        // to once per incident; a shadow pass would repeat it every tick.
+        if input.apply && escalations_left > 0 && failed_job.is_none() {
+            let census_job = failed_merge_group_job(census(since).iter());
+            if census_job.is_some() {
+                base_rows = dwell::track_base_stalled(
+                    &mut state,
+                    input.observation.base_sha.as_deref(),
+                    &eligible,
+                    census_job,
+                    input.dwell_policy,
+                    input.now,
+                );
+            }
+        }
+    }
+    for row in &mut base_rows {
+        if row.escalate {
+            if escalations_left > 0 {
+                escalations_left -= 1;
+            } else {
+                row.escalate = false;
+                row.escalation_deferred = true;
+            }
+        }
+    }
+    if input.apply {
+        dwell::mark_base_stalled_alerted(&mut state, &base_rows);
+    }
+    report.escalations_new += base_rows.iter().filter(|row| row.escalate).count();
+    report.escalations_deferred += base_rows
+        .iter()
+        .filter(|row| row.escalation_deferred)
+        .count();
+    report.overdue.extend(base_rows.iter().map(|row| {
+        let emitted = (row.escalate && input.apply)
+            || state
+                .base_stalled
+                .get(&row.overdue.head)
+                .is_some_and(|entry| entry.alerted);
+        overdue_record(
+            input,
+            by_number.get(&row.overdue.number).copied(),
+            row,
+            u32::from(emitted) * row.overdue.level,
+            None,
+        )
+    }));
     ledger.dwell.insert(repo_key, state);
     if input.apply
         && let Some(state_dir) = input.state_dir
@@ -556,6 +650,31 @@ fn sightings(reports: &[PrReport], stacked: &[OpenPr]) -> (Vec<Sighting>, BTreeS
     (out, skipped)
 }
 
+pub(super) fn is_failed_merge_group_job(job: &StewardJob) -> bool {
+    job.conclusion.as_deref().is_some_and(|conclusion| {
+        ["failure", "timed_out", "startup_failure", "action_required"]
+            .iter()
+            .any(|failed| conclusion.eq_ignore_ascii_case(failed))
+    })
+}
+
+pub(super) fn failed_merge_group_job<'a>(
+    runs: impl Iterator<Item = &'a StewardRun>,
+) -> Option<String> {
+    runs.filter(|run| {
+        run.event.eq_ignore_ascii_case("merge_group")
+            && run.status.eq_ignore_ascii_case("completed")
+            && run.jobs.iter().any(is_failed_merge_group_job)
+    })
+    .max_by_key(|run| run.created_at.clone())
+    .and_then(|run| {
+        run.jobs
+            .iter()
+            .find(|job| is_failed_merge_group_job(job))
+            .map(|job| job.name.clone())
+    })
+}
+
 /// Pull requests this pass saw approved at their exact head with every
 /// required check green, and that it neither merged nor queued.
 ///
@@ -570,10 +689,19 @@ fn sightings(reports: &[PrReport], stacked: &[OpenPr]) -> (Vec<Sighting>, BTreeS
 /// alarm silent; its `deferred_pass_budget` token is a placeholder, so the
 /// alert keeps the last real reason.
 fn stuck_candidates(input: &DwellInput<'_>, reports: &[PrReport]) -> Vec<dwell::StuckCandidate> {
+    eligible_candidates(input, reports, false)
+}
+
+// Base stalls include queued PRs, even when their report has no blocker.
+fn eligible_candidates(
+    input: &DwellInput<'_>,
+    reports: &[PrReport],
+    include_queued: bool,
+) -> Vec<dwell::StuckCandidate> {
     let policy = input.policy;
     reports
         .iter()
-        .filter(|report| !report.blocked.blocked_on.is_empty())
+        .filter(|report| include_queued || !report.blocked.blocked_on.is_empty())
         // The steward merges only what it manages; an unmanaged pull request
         // is not one it left unmerged, and the census does not read its
         // checks.
@@ -587,7 +715,8 @@ fn stuck_candidates(input: &DwellInput<'_>, reports: &[PrReport]) -> Vec<dwell::
         .filter(|report| {
             !report.mutation.as_deref().is_some_and(|mutation| {
                 mutation.split([',', ';']).any(|part| {
-                    part.starts_with("enqueued") || part.starts_with("merged_exact_head")
+                    (!include_queued && part.starts_with("enqueued"))
+                        || part.starts_with("merged_exact_head")
                 })
             })
         })
@@ -600,7 +729,7 @@ fn stuck_candidates(input: &DwellInput<'_>, reports: &[PrReport]) -> Vec<dwell::
                 .fact;
             (approved_at_head(pr, policy)
                 && !pr.draft
-                && pr.queue_position.is_none()
+                && (include_queued || pr.queue_position.is_none())
                 && crate::merge_steward::excluded_admission_label(&pr.labels).is_none()
                 && pr.head_sha.eq_ignore_ascii_case(&report.head_sha)
                 && crate::merge_steward::required_checks_all_succeeded(pr, policy))
@@ -808,7 +937,11 @@ fn overdue_record(
         author,
     };
     OverdueRecord {
-        kind: "overdue",
+        kind: if row.overdue.state == DwellState::BaseStalled {
+            "base_stalled"
+        } else {
+            "overdue"
+        },
         repo: input.observation.repo.clone(),
         pr: number,
         state: row.overdue.state,
@@ -827,6 +960,14 @@ fn overdue_record(
         escalated: row.escalate,
         escalation_deferred: row.escalation_deferred,
         at: input.now,
+        base_head: (row.overdue.state == DwellState::BaseStalled).then(|| row.overdue.head.clone()),
+        failed_job: (row.overdue.state == DwellState::BaseStalled).then(|| {
+            row.overdue
+                .token
+                .strip_prefix("base_stalled:")
+                .unwrap_or("unknown")
+                .to_owned()
+        }),
     }
 }
 

@@ -332,6 +332,18 @@ pub(super) fn apply_repo_plan(
     super::review_quarantine::annotate(actions, observation, &policy, &quarantine, &mut reports);
     let dwell_policy =
         super::dwell_pass::read_policy(actions, &observation.repo, &observation.base);
+    // Read only on the tick a base-stalled alarm first escalates (once per
+    // incident), never on every pass with a waiting PR.
+    let completed_merge_group_runs = |since| {
+        super::observation::completed_merge_group_runs(
+            actions,
+            &observation.repo,
+            &observation.base,
+            since,
+            args.pass_deadline,
+        )
+        .unwrap_or_default()
+    };
     let dwell_report = super::dwell_pass::run(
         &super::dwell_pass::DwellInput {
             observation,
@@ -343,6 +355,7 @@ pub(super) fn apply_repo_plan(
             state_dir: mutation_control.map(|control| control.state_dir.as_path()),
             now: Utc::now(),
             deadline: args.pass_deadline,
+            completed_merge_group_runs: Some(&completed_merge_group_runs),
         },
         &reports,
         ledger,

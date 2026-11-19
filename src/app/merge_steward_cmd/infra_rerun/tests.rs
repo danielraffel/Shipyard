@@ -71,6 +71,7 @@ fn observation(prs: Vec<ObservedPr>) -> RepoObservation {
         runs: Vec::new(),
         merge_group_heads: BTreeMap::new(),
         merge_group_enqueued_at: BTreeMap::new(),
+        base_sha: None,
         capacity_preemption_policy: CapacityPreemptionPolicy::for_repository("owner/repo"),
         preemption_error: None,
     }

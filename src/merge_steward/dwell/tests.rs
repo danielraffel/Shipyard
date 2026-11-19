@@ -29,6 +29,7 @@ fn token(state: DwellState) -> &'static str {
         DwellState::StaleMergeRef => "stale_merge_ref:macos",
         // Not a `blocked_on` state: `track_stuck` keeps its clock.
         DwellState::ApprovedStuck => "",
+        DwellState::BaseStalled => "base_stalled",
     }
 }
 
@@ -114,7 +115,7 @@ fn retrigger_marks_are_retained_when_history_grows() {
 fn every_state_is_overdue_exactly_at_its_limit() {
     let policy = DwellPolicy::default();
     for state in DwellState::ALL {
-        if state == DwellState::ApprovedStuck {
+        if matches!(state, DwellState::ApprovedStuck | DwellState::BaseStalled) {
             continue;
         }
         let limit = i64::from(policy.limit(state).unwrap());
@@ -1175,4 +1176,209 @@ fn an_older_stuck_entry_still_reads() {
     .expect("entry");
     assert_eq!(entry.first_eligible_at, now());
     assert!(entry.alerted);
+}
+
+#[test]
+fn base_stalled_names_longest_continuously_eligible_pr() {
+    let mut state = DwellRepoState::default();
+    let policy = DwellPolicy::default();
+    let first = [BaseStalledCandidate {
+        number: 100,
+        head: HEAD.to_owned(),
+    }];
+    track_base_stalled(&mut state, Some(HEAD), &first, None, &policy, now());
+    let both = [
+        BaseStalledCandidate {
+            number: 50,
+            head: HEAD.to_owned(),
+        },
+        BaseStalledCandidate {
+            number: 100,
+            head: HEAD.to_owned(),
+        },
+    ];
+    let rows = track_base_stalled(
+        &mut state,
+        Some(HEAD),
+        &both,
+        None,
+        &policy,
+        now() + chrono::Duration::minutes(61),
+    );
+    assert_eq!(rows[0].overdue.number, 100);
+    // State survives a restart; a new head starts a fresh eligibility interval.
+    let encoded = serde_json::to_string(&state).unwrap();
+    let mut restored: DwellRepoState = serde_json::from_str(&encoded).unwrap();
+    let changed = [
+        BaseStalledCandidate {
+            number: 50,
+            head: HEAD.to_owned(),
+        },
+        BaseStalledCandidate {
+            number: 100,
+            head: "new-head".to_owned(),
+        },
+    ];
+    let rows = track_base_stalled(
+        &mut restored,
+        Some(HEAD),
+        &changed,
+        None,
+        &policy,
+        now() + chrono::Duration::minutes(62),
+    );
+    assert_eq!(rows[0].overdue.number, 50);
+    // Leaving and rejoining resets eligibility too.
+    track_base_stalled(
+        &mut restored,
+        Some(HEAD),
+        &changed[1..],
+        None,
+        &policy,
+        now() + chrono::Duration::minutes(63),
+    );
+    let rows = track_base_stalled(
+        &mut restored,
+        Some(HEAD),
+        &changed,
+        None,
+        &policy,
+        now() + chrono::Duration::minutes(64),
+    );
+    assert_eq!(rows[0].overdue.number, 100);
+}
+
+#[test]
+fn base_stalled_is_quiet_under_bound_then_alerts_once() {
+    let mut state = established();
+    let candidate = [BaseStalledCandidate {
+        number: 7,
+        head: HEAD.to_owned(),
+    }];
+    let policy = DwellPolicy::default();
+    assert!(
+        track_base_stalled(&mut state, Some(HEAD), &candidate, None, &policy, now()).is_empty()
+    );
+    let rows = track_base_stalled(
+        &mut state,
+        Some(HEAD),
+        &candidate,
+        Some("build".into()),
+        &policy,
+        now() + Duration::minutes(60),
+    );
+    assert!(rows[0].escalate);
+    mark_base_stalled_alerted(&mut state, &rows);
+    assert!(
+        !track_base_stalled(
+            &mut state,
+            Some(HEAD),
+            &candidate,
+            None,
+            &policy,
+            now() + Duration::minutes(61)
+        )[0]
+        .escalate
+    );
+}
+
+#[test]
+fn base_stalled_rearms_only_after_head_change_and_zero_disables() {
+    let mut state = established();
+    let candidate = [BaseStalledCandidate {
+        number: 7,
+        head: HEAD.to_owned(),
+    }];
+    let policy = DwellPolicy::default();
+    track_base_stalled(&mut state, Some(HEAD), &candidate, None, &policy, now());
+    track_base_stalled(
+        &mut state,
+        Some(HEAD2),
+        &candidate,
+        None,
+        &policy,
+        now() + Duration::minutes(60),
+    );
+    assert!(
+        track_base_stalled(
+            &mut state,
+            Some(HEAD2),
+            &candidate,
+            None,
+            &policy,
+            now() + Duration::minutes(120)
+        )[0]
+        .escalate
+    );
+    let off = DwellPolicy::from_table(&"[auto_merge.dwell]\nbase_stalled = 0".parse().unwrap());
+    assert!(
+        track_base_stalled(
+            &mut state,
+            Some(HEAD2),
+            &candidate,
+            None,
+            &off,
+            now() + Duration::minutes(600)
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn base_stalled_disabled_keeps_no_clock_and_reenabling_starts_fresh() {
+    let mut state = established();
+    let candidate = [BaseStalledCandidate {
+        number: 7,
+        head: HEAD.to_owned(),
+    }];
+    let off = DwellPolicy::from_table(&"[auto_merge.dwell]\nbase_stalled = 0".parse().unwrap());
+    assert!(track_base_stalled(&mut state, Some(HEAD), &candidate, None, &off, now()).is_empty());
+    assert!(state.base_stalled.is_empty());
+    let on = DwellPolicy::default();
+    // Re-enabled 10 hours later: the clock starts now, so nothing is overdue.
+    assert!(
+        track_base_stalled(
+            &mut state,
+            Some(HEAD),
+            &candidate,
+            None,
+            &on,
+            now() + Duration::minutes(600)
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn base_stalled_clock_restarts_after_an_empty_eligible_observation() {
+    let mut state = established();
+    let candidate = [BaseStalledCandidate {
+        number: 7,
+        head: HEAD.to_owned(),
+    }];
+    let policy = DwellPolicy::default();
+    track_base_stalled(&mut state, Some(HEAD), &candidate, None, &policy, now());
+    assert!(
+        track_base_stalled(
+            &mut state,
+            Some(HEAD),
+            &[],
+            None,
+            &policy,
+            now() + Duration::minutes(30)
+        )
+        .is_empty()
+    );
+    assert!(state.base_stalled.is_empty());
+    assert!(
+        track_base_stalled(
+            &mut state,
+            Some(HEAD),
+            &candidate,
+            None,
+            &policy,
+            now() + Duration::minutes(90)
+        )
+        .is_empty()
+    );
 }
