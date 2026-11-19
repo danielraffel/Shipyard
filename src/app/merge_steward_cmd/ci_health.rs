@@ -133,8 +133,7 @@ fn online_runner_label_sets(raw: &Value) -> Option<Vec<BTreeSet<String>>> {
                 .map(|label| label.get("name")?.as_str().map(str::to_ascii_lowercase))
                 .collect::<Option<BTreeSet<_>>>()
         })
-        .collect::<Option<Vec<_>>>()
-        .filter(|labels| !labels.is_empty())
+        .collect()
 }
 
 /// Commit condition state only after the overdue feed has been written.
@@ -499,8 +498,14 @@ mod tests {
             online_runner_label_sets(&serde_json::json!({
                 "runners": [{"status": "offline", "labels": [{"name": "Retired"}]}]
             })),
-            None
+            Some(Vec::new())
         );
+        assert!(queued_job_is_forever_queued_on_runners(
+            old,
+            &["self-hosted".to_owned(), "retired".to_owned()],
+            &[],
+            now
+        ));
         assert_eq!(
             online_runner_label_sets(&serde_json::json!({
                 "runners": [{"status": "online", "labels": [{"name": "Retired"}]}]
