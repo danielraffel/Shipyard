@@ -860,12 +860,32 @@ impl GitHubActions {
         repository: &str,
         run_id: u64,
     ) -> Result<Value, GitHubError> {
-        let stdout = self.run_gh(&[
-            "api".to_owned(),
-            format!("repos/{repository}/actions/runs/{run_id}/jobs?per_page=100"),
-        ])?;
-        serde_json::from_str(&stdout)
-            .map_err(|error| GitHubError::new(format!("workflow jobs JSON malformed: {error}")))
+        const PAGE_SIZE: usize = 100;
+        const MAX_PAGES: usize = 10;
+        let mut jobs = Vec::new();
+        for page in 1..=MAX_PAGES {
+            let query = if page == 1 {
+                format!("repos/{repository}/actions/runs/{run_id}/jobs?per_page={PAGE_SIZE}")
+            } else {
+                format!(
+                    "repos/{repository}/actions/runs/{run_id}/jobs?per_page={PAGE_SIZE}&page={page}"
+                )
+            };
+            let stdout = self.run_gh(&["api".to_owned(), query])?;
+            let value: Value = serde_json::from_str(&stdout).map_err(|error| {
+                GitHubError::new(format!("workflow jobs JSON malformed: {error}"))
+            })?;
+            let page_jobs = value
+                .get("jobs")
+                .and_then(Value::as_array)
+                .ok_or_else(|| GitHubError::new("workflow jobs JSON missing jobs array"))?;
+            let count = page_jobs.len();
+            jobs.extend(page_jobs.iter().cloned());
+            if count < PAGE_SIZE {
+                return Ok(serde_json::json!({"jobs": jobs}));
+            }
+        }
+        Err(GitHubError::new("workflow jobs exceeded 10 pages"))
     }
 
     /// Read annotations for one failed check run.
@@ -2194,14 +2214,21 @@ pub fn parse_active_jobs(stdout: &str) -> Result<Vec<WorkflowJob>, GitHubError> 
 pub fn parse_queued_runs(stdout: &str) -> Result<Vec<QueuedRun>, GitHubError> {
     let value = serde_json::from_str::<Value>(stdout)
         .map_err(|error| GitHubError::new(format!("failed to parse gh runs JSON: {error}")))?;
-    let Some(runs) = value.get("workflow_runs").and_then(Value::as_array) else {
-        return Ok(Vec::new());
-    };
+    let runs = value
+        .get("workflow_runs")
+        .and_then(Value::as_array)
+        .ok_or_else(|| GitHubError::new("gh runs JSON missing workflow_runs array"))?;
     let mut out = Vec::new();
     for run in runs {
-        let Some(database_id) = run.get("id").and_then(Value::as_u64) else {
-            continue;
-        };
+        let database_id = run
+            .get("id")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| GitHubError::new("gh runs JSON has run without id"))?;
+        let created_at = run
+            .get("created_at")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| GitHubError::new("gh runs JSON has run without created_at"))?;
         let name = run
             .get("name")
             .and_then(Value::as_str)
@@ -2217,11 +2244,7 @@ pub fn parse_queued_runs(stdout: &str) -> Result<Vec<QueuedRun>, GitHubError> {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned();
-        let created_at = run
-            .get("created_at")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
+        let created_at = created_at.to_owned();
         let run_started_at = run
             .get("run_started_at")
             .and_then(Value::as_str)
@@ -2597,9 +2620,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        CloudDispatchOverrides, default_workflow_key, discover_workflows, parse_active_jobs,
-        parse_first_workflow_run, parse_matching_jobs, resolve_cloud_dispatch_plan,
-        resolve_cloud_dispatch_plan_with_overrides,
+        CloudDispatchOverrides, GitHubActions, default_workflow_key, discover_workflows,
+        parse_active_jobs, parse_first_workflow_run, parse_matching_jobs,
+        resolve_cloud_dispatch_plan, resolve_cloud_dispatch_plan_with_overrides,
     };
     use crate::config::{LoadedConfig, LocalOverlaySource};
 
@@ -2899,6 +2922,32 @@ exit 2
             .expect("fake gh");
         let log = std::fs::read_to_string(log).expect("log");
         assert_eq!(log, "ARGS=api repos/owner/repo\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workflow_run_jobs_paginates_beyond_one_hundred_jobs() {
+        let temp = TempDir::new().expect("tempdir");
+        let gh = temp.path().join("gh");
+        let page_one = serde_json::json!({
+            "jobs": (0..100)
+                .map(|id| serde_json::json!({"id": id, "conclusion": "success"}))
+                .collect::<Vec<_>>()
+        })
+        .to_string();
+        let page_two = serde_json::json!({
+            "jobs": [{"id": 100, "conclusion": "failure"}]
+        })
+        .to_string();
+        let script = format!(
+            "#!/bin/sh\nset -eu\ncase \"$*\" in\n  *\"runs/42/jobs?per_page=100&page=2\") printf '%s' '{page_two}';;\n  *\"runs/42/jobs?per_page=100\") printf '%s' '{page_one}';;\n  *) echo \"unexpected args: $*\" >&2; exit 1;;\nesac\n"
+        );
+        write_executable(&gh, &script);
+        let client = GitHubActions::hermetic_for_tests(temp.path(), &gh);
+        let jobs = client
+            .workflow_run_jobs_raw("acme/repo", 42)
+            .expect("paginated jobs");
+        assert_eq!(jobs["jobs"].as_array().expect("jobs array").len(), 101);
     }
 
     #[cfg(unix)]

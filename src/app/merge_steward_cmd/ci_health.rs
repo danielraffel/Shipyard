@@ -64,12 +64,6 @@ pub(super) fn annotation_is_billing_blocked(annotation: &Value) -> bool {
         })
 }
 
-pub(super) fn annotations_show_billing_block(annotations: &Value) -> bool {
-    annotations
-        .as_array()
-        .is_some_and(|items| items.iter().any(annotation_is_billing_blocked))
-}
-
 pub(super) fn queued_job_is_forever_queued(
     queued_at: &str,
     labels: &[String],
@@ -152,7 +146,7 @@ fn online_labels_or_unknown(
     diagnostics: &mut Vec<String>,
 ) -> Option<BTreeSet<String>> {
     match actions.repository_runners_raw(repo) {
-        Ok(mut raw) => {
+        Ok(raw) => {
             let owner = repo.split_once('/').map_or(repo, |(owner, _)| owner);
             match actions.organization_runners_raw(owner) {
                 Ok(org_raw) => {
@@ -168,13 +162,12 @@ fn online_labels_or_unknown(
                             "ci_queued_forever runners unknown: organization runner-group repository eligibility unavailable"
                                 .to_owned(),
                         );
-                        let mut runners = raw
-                            .get_mut("runners")
-                            .and_then(Value::as_array_mut)
-                            .cloned()
-                            .unwrap_or_default();
-                        runners.extend(org_runners.iter().cloned());
-                        raw = serde_json::json!({"runners": runners});
+                        // Organization-level runners may be restricted to
+                        // selected repositories. Without runner-group
+                        // eligibility, their labels cannot safely prove that
+                        // a queued job is unserved. Preserve unknown state so
+                        // the condition cannot emit a false overdue alert.
+                        return None;
                     }
                 }
                 Err(error)
@@ -241,31 +234,44 @@ fn probe_billing(
                         continue;
                     }
                 };
+                let Some(jobs) = jobs.get("jobs").and_then(Value::as_array) else {
+                    errors.push("ci_billing_blocked jobs: response missing jobs array".to_owned());
+                    continue;
+                };
                 for job in jobs
-                    .get("jobs")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
+                    .iter()
                     .filter(|job| job.get("conclusion").and_then(Value::as_str) == Some("failure"))
                 {
                     let Some(check_run_id) = job_check_run_id(job) else {
+                        errors.push(
+                            "ci_billing_blocked jobs: failed job missing check_run_url".to_owned(),
+                        );
                         continue;
                     };
                     match actions.check_run_annotations_raw(repo, check_run_id) {
-                        Ok(annotations) if annotations_show_billing_block(&annotations) => {
-                            return (
-                                Some(CiHealthOverdue {
-                                    kind: "overdue",
-                                    condition: "ci_billing_blocked",
-                                    repo: repo.to_owned(),
-                                    detail: "recent account payments have failed or spending limit"
+                        Ok(annotations) => {
+                            let Some(annotations) = annotations.as_array() else {
+                                errors.push(
+                                    "ci_billing_blocked annotations: response is not an array"
                                         .to_owned(),
-                                    at: now,
-                                }),
-                                errors,
-                            );
+                                );
+                                continue;
+                            };
+                            if annotations.iter().any(annotation_is_billing_blocked) {
+                                return (
+                                    Some(CiHealthOverdue {
+                                        kind: "overdue",
+                                        condition: "ci_billing_blocked",
+                                        repo: repo.to_owned(),
+                                        detail:
+                                            "recent account payments have failed or spending limit"
+                                                .to_owned(),
+                                        at: now,
+                                    }),
+                                    errors,
+                                );
+                            }
                         }
-                        Ok(_) => {}
                         Err(error) => {
                             errors.push(format!("ci_billing_blocked: {error:?}"));
                         }
@@ -302,30 +308,41 @@ fn probe_queued(
                 continue;
             }
         };
-        for job in jobs
-            .get("jobs")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
+        let Some(jobs) = jobs.get("jobs").and_then(Value::as_array) else {
+            errors.push("ci_queued_forever jobs: response missing jobs array".to_owned());
+            continue;
+        };
+        for job in jobs {
             if job.get("status").and_then(Value::as_str) != Some("queued") {
                 continue;
             }
-            let labels = job
-                .get("labels")
-                .and_then(Value::as_array)
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_owned)
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
+            let Some(label_values) = job.get("labels").and_then(Value::as_array) else {
+                errors.push("ci_queued_forever jobs: queued job missing labels array".to_owned());
+                continue;
+            };
+            let mut labels = Vec::with_capacity(label_values.len());
+            let mut malformed_labels = false;
+            for value in label_values {
+                if let Some(label) = value.as_str() {
+                    labels.push(label.to_owned());
+                } else {
+                    malformed_labels = true;
+                    break;
+                }
+            }
+            if malformed_labels {
+                errors.push("ci_queued_forever jobs: queued job has non-string label".to_owned());
+                continue;
+            }
             let queued_at = job
                 .get("created_at")
                 .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
                 .unwrap_or(&run.created_at);
+            if DateTime::parse_from_rfc3339(queued_at).is_err() {
+                errors.push("ci_queued_forever jobs: queued job has invalid created_at".to_owned());
+                continue;
+            }
             if queued_job_is_forever_queued(queued_at, &labels, &online_labels, now) {
                 return Some(CiHealthOverdue {
                     kind: "overdue",
@@ -523,9 +540,7 @@ mod tests {
         crate::test_support::write_executable_script(&gh, &script);
         let actions = GitHubActions::hermetic_for_tests(temp.path(), &gh);
         let mut diagnostics = Vec::new();
-        let online = online_labels_or_unknown(&actions, "acme/repo", &mut diagnostics)
-            .expect("labels remain usable for negative evidence");
-        assert!(online.contains("org-only"));
+        assert!(online_labels_or_unknown(&actions, "acme/repo", &mut diagnostics).is_none());
         assert!(
             diagnostics
                 .iter()
@@ -698,9 +713,7 @@ esac
         crate::test_support::write_executable_script(&gh, script);
         let actions = GitHubActions::hermetic_for_tests(temp.path(), &gh);
         let mut diagnostics = Vec::new();
-        let online = online_labels_or_unknown(&actions, "acme/repo", &mut diagnostics)
-            .expect("labels remain usable for negative evidence");
-        assert!(online.contains("restricted"));
+        assert!(online_labels_or_unknown(&actions, "acme/repo", &mut diagnostics).is_none());
         assert!(
             diagnostics
                 .iter()
