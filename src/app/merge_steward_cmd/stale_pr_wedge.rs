@@ -772,6 +772,7 @@ mod tests {
             runs: Vec::new(),
             merge_group_heads: BTreeMap::new(),
             merge_group_enqueued_at: BTreeMap::new(),
+            base_sha: None,
             capacity_preemption_policy: super::super::CapacityPreemptionPolicy::pulp(),
             preemption_error: None,
         };
@@ -872,6 +873,7 @@ esac
             runs: vec![old.clone(), new],
             merge_group_heads: BTreeMap::new(),
             merge_group_enqueued_at: BTreeMap::new(),
+            base_sha: None,
             capacity_preemption_policy: CapacityPreemptionPolicy::pulp(),
             preemption_error: None,
         };
@@ -1018,6 +1020,7 @@ esac
             runs,
             merge_group_heads: BTreeMap::new(),
             merge_group_enqueued_at: BTreeMap::new(),
+            base_sha: None,
             capacity_preemption_policy: CapacityPreemptionPolicy::pulp(),
             preemption_error: None,
         };

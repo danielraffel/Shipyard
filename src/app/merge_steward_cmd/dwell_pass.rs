@@ -130,6 +130,10 @@ pub(crate) struct OverdueRecord {
     pub escalation_deferred: bool,
     /// When this record was written.
     pub at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed_job: Option<String>,
 }
 
 /// Who an overdue record addresses.
@@ -489,6 +493,76 @@ pub(super) fn run(
             None,
         )
     }));
+    let eligible = stuck_candidates(input, reports);
+    let failed_job = input
+        .observation
+        .runs
+        .iter()
+        .filter(|run| {
+            run.event.eq_ignore_ascii_case("merge_group")
+                && run.status.eq_ignore_ascii_case("completed")
+                && run.jobs.iter().any(|job| {
+                    job.conclusion
+                        .as_deref()
+                        .is_some_and(|c| !c.eq_ignore_ascii_case("success"))
+                })
+        })
+        .max_by_key(|run| run.created_at.clone())
+        .and_then(|run| {
+            run.jobs
+                .iter()
+                .find(|job| {
+                    job.conclusion
+                        .as_deref()
+                        .is_some_and(|c| !c.eq_ignore_ascii_case("success"))
+                })
+                .map(|job| job.name.clone())
+        });
+    let mut base_rows = dwell::track_base_stalled(
+        &mut state,
+        input.observation.base_sha.as_deref(),
+        &eligible
+            .iter()
+            .map(|candidate| dwell::BaseStalledCandidate {
+                number: candidate.number,
+            })
+            .collect::<Vec<_>>(),
+        failed_job,
+        input.dwell_policy,
+        input.now,
+    );
+    for row in &mut base_rows {
+        if row.escalate {
+            if escalations_left > 0 {
+                escalations_left -= 1;
+            } else {
+                row.escalate = false;
+                row.escalation_deferred = true;
+            }
+        }
+    }
+    if input.apply {
+        dwell::mark_base_stalled_alerted(&mut state, &base_rows);
+    }
+    report.escalations_new += base_rows.iter().filter(|row| row.escalate).count();
+    report.escalations_deferred += base_rows
+        .iter()
+        .filter(|row| row.escalation_deferred)
+        .count();
+    report.overdue.extend(base_rows.iter().map(|row| {
+        let emitted = (row.escalate && input.apply)
+            || state
+                .base_stalled
+                .get(&row.overdue.head)
+                .is_some_and(|entry| entry.alerted);
+        overdue_record(
+            input,
+            by_number.get(&row.overdue.number).copied(),
+            row,
+            u32::from(emitted) * row.overdue.level,
+            None,
+        )
+    }));
     ledger.dwell.insert(repo_key, state);
     if input.apply
         && let Some(state_dir) = input.state_dir
@@ -808,7 +882,11 @@ fn overdue_record(
         author,
     };
     OverdueRecord {
-        kind: "overdue",
+        kind: if row.overdue.state == DwellState::BaseStalled {
+            "base_stalled"
+        } else {
+            "overdue"
+        },
         repo: input.observation.repo.clone(),
         pr: number,
         state: row.overdue.state,
@@ -827,6 +905,14 @@ fn overdue_record(
         escalated: row.escalate,
         escalation_deferred: row.escalation_deferred,
         at: input.now,
+        base_head: (row.overdue.state == DwellState::BaseStalled).then(|| row.overdue.head.clone()),
+        failed_job: (row.overdue.state == DwellState::BaseStalled).then(|| {
+            row.overdue
+                .token
+                .strip_prefix("base_stalled:")
+                .unwrap_or("unknown")
+                .to_owned()
+        }),
     }
 }
 

@@ -804,6 +804,7 @@ fn watchdog_observation() -> crate::app::merge_steward_cmd::RepoObservation {
         runs: Vec::new(),
         merge_group_heads: std::collections::BTreeMap::new(),
         merge_group_enqueued_at: std::collections::BTreeMap::new(),
+        base_sha: None,
         capacity_preemption_policy: crate::merge_steward::CapacityPreemptionPolicy::disabled(),
         preemption_error: None,
     }

@@ -77,11 +77,13 @@ pub enum DwellState {
     /// `blocked_on` state: [`track_stuck`] tracks it beside the others, so the
     /// per-token dwell of the same pull request keeps its own clock and act.
     ApprovedStuck,
+    /// An approved, required-green PR is waiting while its base has not moved.
+    BaseStalled,
 }
 
 impl DwellState {
     /// Every state, in report order.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::NeedsReview,
         Self::RequiredPending,
         Self::RequiredFailedInfra,
@@ -95,6 +97,7 @@ impl DwellState {
         Self::StackedBaseMerged,
         Self::StaleMergeRef,
         Self::ApprovedStuck,
+        Self::BaseStalled,
     ];
 
     /// The config key and report name.
@@ -114,6 +117,7 @@ impl DwellState {
             Self::StackedBaseMerged => "stacked_base_merged",
             Self::StaleMergeRef => "stale_merge_ref",
             Self::ApprovedStuck => "approved_stuck",
+            Self::BaseStalled => "base_stalled",
         }
     }
 
@@ -126,7 +130,10 @@ impl DwellState {
             | Self::RequiredFailedInfra
             | Self::StaleVerdictCheck
             | Self::StaleMergeRef => 10,
-            Self::RequiredPending | Self::CarriesUnapproved | Self::ApprovedStuck => 60,
+            Self::RequiredPending
+            | Self::CarriesUnapproved
+            | Self::ApprovedStuck
+            | Self::BaseStalled => 60,
             Self::RequiredFailed => 45,
             Self::Dirty | Self::Held | Self::RequiredNeverRan => 30,
             Self::ApprovedGreenNotQueued => 5,
@@ -152,7 +159,8 @@ impl DwellState {
             | Self::Dirty
             | Self::Held
             | Self::CarriesUnapproved
-            | Self::ApprovedStuck => None,
+            | Self::ApprovedStuck
+            | Self::BaseStalled => None,
         }
     }
 
@@ -171,6 +179,7 @@ impl DwellState {
             | Self::Held
             | Self::StackedBaseMerged
             | Self::ApprovedStuck => "author",
+            Self::BaseStalled => "author",
         }
     }
 
@@ -508,6 +517,100 @@ pub struct DwellRepoState {
     /// each was first seen so at its head ([`track_stuck`]).
     #[serde(default)]
     pub stuck_approved: BTreeMap<u64, StuckApproved>,
+    /// Base heads for which an eligible PR has been observed.
+    #[serde(default)]
+    pub base_stalled: BTreeMap<String, BaseStalled>,
+}
+
+/// Durable state for one unchanged base head.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BaseStalled {
+    /// The unchanged base head.
+    pub head: String,
+    /// First observation at this head.
+    pub first_seen: DateTime<Utc>,
+    /// Oldest eligible pull request.
+    pub oldest_pr: u64,
+    /// Failed merge-group job, when already present in the census.
+    pub failed_job: Option<String>,
+    /// Whether the first escalation was emitted.
+    pub alerted: bool,
+}
+
+/// An eligible pull request supporting a base alarm.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BaseStalledCandidate {
+    /// Pull request number.
+    pub number: u64,
+}
+
+/// Track one base head's unchanged interval and return its overdue row.
+pub fn track_base_stalled(
+    state: &mut DwellRepoState,
+    base_head: Option<&str>,
+    eligible: &[BaseStalledCandidate],
+    failed_job: Option<String>,
+    policy: &DwellPolicy,
+    now: DateTime<Utc>,
+) -> Vec<Planned> {
+    let Some(head) = base_head.filter(|head| !head.is_empty()) else {
+        return Vec::new();
+    };
+    state
+        .base_stalled
+        .retain(|known_head, _| known_head.eq_ignore_ascii_case(head));
+    let oldest = eligible.iter().map(|c| c.number).min();
+    let Some(oldest_pr) = oldest else {
+        return Vec::new();
+    };
+    let entry = state
+        .base_stalled
+        .entry(head.to_owned())
+        .or_insert_with(|| BaseStalled {
+            head: head.to_owned(),
+            first_seen: now,
+            oldest_pr,
+            failed_job: failed_job.clone(),
+            alerted: false,
+        });
+    entry.oldest_pr = oldest_pr;
+    entry.failed_job = failed_job;
+    let Some(limit) = policy.limit(DwellState::BaseStalled) else {
+        return Vec::new();
+    };
+    let age = (now - entry.first_seen).num_minutes().max(0);
+    if age < i64::from(limit) {
+        return Vec::new();
+    }
+    let token = entry.failed_job.as_deref().map_or_else(
+        || "base_stalled".to_owned(),
+        |job| format!("base_stalled:{job}"),
+    );
+    vec![Planned {
+        overdue: Overdue {
+            number: oldest_pr,
+            state: DwellState::BaseStalled,
+            token,
+            head: head.to_owned(),
+            entered_at: entry.first_seen,
+            age_minutes: age,
+            limit_minutes: limit,
+            over_minutes: age - i64::from(limit),
+            level: 1,
+        },
+        act: Disposition::NoAct,
+        escalate: !entry.alerted,
+        escalation_deferred: false,
+    }]
+}
+
+/// Mark base alarms emitted by an apply pass.
+pub fn mark_base_stalled_alerted(state: &mut DwellRepoState, planned: &[Planned]) {
+    for row in planned.iter().filter(|row| row.escalate) {
+        if let Some(entry) = state.base_stalled.get_mut(&row.overdue.head) {
+            entry.alerted = true;
+        }
+    }
 }
 
 /// One approved, required-green pull request the steward has not merged or

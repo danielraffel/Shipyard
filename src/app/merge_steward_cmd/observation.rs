@@ -73,8 +73,8 @@ pub(super) fn observe_repo_with_status_history(
     let evaluated_rules = evaluated_branch_rules(actions, &repo, base)?;
     let required_checks =
         required_checks_with_evaluated_rules(actions, &repo, base, &evaluated_rules)?;
-    let (merge_queue, queue_positions, merge_group_heads, merge_group_enqueued_at) =
-        merge_queue_snapshot(actions, &repo, base)?;
+    let (merge_queue, queue_positions, merge_group_heads, merge_group_enqueued_at, base_sha) =
+        merge_queue_snapshot_with_base(actions, &repo, base)?;
     let mut prs = pull_requests(actions, &repo, base, &queue_positions)?;
     let mut history =
         status_history.map(|path| super::head_rollup::StatusHistory::load(path, &repo));
@@ -114,6 +114,7 @@ pub(super) fn observe_repo_with_status_history(
         runs,
         merge_group_heads,
         merge_group_enqueued_at,
+        base_sha,
         capacity_preemption_policy,
         preemption_error,
     })
@@ -142,8 +143,8 @@ pub(super) fn observe_pull_request(
     let evaluated_rules = evaluated_branch_rules(actions, &repo, base)?;
     let required_checks =
         required_checks_with_evaluated_rules(actions, &repo, base, &evaluated_rules)?;
-    let (merge_queue, queue_positions, merge_group_heads, merge_group_enqueued_at) =
-        merge_queue_snapshot(actions, &repo, base)?;
+    let (merge_queue, queue_positions, merge_group_heads, merge_group_enqueued_at, base_sha) =
+        merge_queue_snapshot_with_base(actions, &repo, base)?;
     let mut prs = vec![parse_pr(row, &queue_positions)?];
     hydrate_empty_diff_facts(actions, &repo, base, &mut prs);
     hydrate_census_check_identities(actions, &repo, &required_checks, &mut prs)?;
@@ -158,6 +159,7 @@ pub(super) fn observe_pull_request(
         runs: Vec::new(),
         merge_group_heads,
         merge_group_enqueued_at,
+        base_sha,
         capacity_preemption_policy,
         preemption_error: None,
     })
@@ -410,6 +412,35 @@ pub(super) fn merge_queue_snapshot(
     merge_queue_snapshot_with_deadline(actions, repo, base, None)
 }
 
+fn merge_queue_snapshot_with_base(
+    actions: &GitHubActions,
+    repo: &str,
+    base: &str,
+) -> Result<
+    (
+        bool,
+        BTreeMap<u64, u64>,
+        BTreeMap<u64, String>,
+        BTreeMap<u64, String>,
+        Option<String>,
+    ),
+    String,
+> {
+    let (snapshot, pages, base_sha) =
+        load_merge_queue_snapshot_once_with_base(actions, repo, base, None)?;
+    if !snapshot.0 || pages == 1 {
+        return Ok((snapshot.0, snapshot.1, snapshot.2, snapshot.3, base_sha));
+    }
+    let (confirmation, confirmation_pages, confirmation_sha) =
+        load_merge_queue_snapshot_once_with_base(actions, repo, base, None)?;
+    if confirmation_pages != pages || confirmation != snapshot || confirmation_sha != base_sha {
+        return Err(
+            "merge queue changed during pagination; refusing an inconsistent snapshot".to_owned(),
+        );
+    }
+    Ok((snapshot.0, snapshot.1, snapshot.2, snapshot.3, base_sha))
+}
+
 pub(super) fn merge_queue_snapshot_before(
     actions: &GitHubActions,
     repo: &str,
@@ -425,11 +456,11 @@ fn merge_queue_snapshot_with_deadline(
     base: &str,
     deadline: Option<Instant>,
 ) -> Result<MergeQueueSnapshot, String> {
-    let (snapshot, pages) = load_merge_queue_snapshot_once(actions, repo, base, deadline)?;
+    let (snapshot, pages, _) = load_merge_queue_snapshot_once(actions, repo, base, deadline)?;
     if !snapshot.0 || pages == 1 {
         return Ok(snapshot);
     }
-    let (confirmation, confirmation_pages) =
+    let (confirmation, confirmation_pages, _) =
         load_merge_queue_snapshot_once(actions, repo, base, deadline)?;
     if confirmation_pages != pages || confirmation != snapshot {
         return Err(
@@ -441,13 +472,24 @@ fn merge_queue_snapshot_with_deadline(
 
 /// One page of a base branch's merge queue.
 pub(super) const MERGE_QUEUE_QUERY: &str = "query($owner:String!,$name:String!,$branch:String!,$cursor:String){repository(owner:$owner,name:$name){mergeQueue(branch:$branch){entries(first:100,after:$cursor){nodes{position enqueuedAt headCommit{oid} pullRequest{number}} pageInfo{hasNextPage endCursor}}}}}";
+const MERGE_QUEUE_QUERY_WITH_BASE: &str = "query($owner:String!,$name:String!,$branch:String!,$qualifiedBase:String!,$cursor:String){repository(owner:$owner,name:$name){ref(qualifiedName:$qualifiedBase){target{oid}} mergeQueue(branch:$branch){entries(first:100,after:$cursor){nodes{position enqueuedAt headCommit{oid} pullRequest{number}} pageInfo{hasNextPage endCursor}}}}}";
 
 fn load_merge_queue_snapshot_once(
     actions: &GitHubActions,
     repo: &str,
     base: &str,
     deadline: Option<Instant>,
-) -> Result<(MergeQueueSnapshot, usize), String> {
+) -> Result<(MergeQueueSnapshot, usize, Option<String>), String> {
+    load_merge_queue_snapshot_once_inner(actions, repo, base, deadline, MERGE_QUEUE_QUERY)
+}
+
+fn load_merge_queue_snapshot_once_inner(
+    actions: &GitHubActions,
+    repo: &str,
+    base: &str,
+    deadline: Option<Instant>,
+    query: &str,
+) -> Result<(MergeQueueSnapshot, usize, Option<String>), String> {
     // `gh api graphql` has no `--repo` flag. Scope the authenticated client
     // instead so repository-specific token helpers still receive provenance
     // while the argv remains valid for the native GitHub CLI.
@@ -455,10 +497,10 @@ fn load_merge_queue_snapshot_once(
     let (owner, name) = repo
         .split_once('/')
         .ok_or_else(|| format!("invalid repository slug `{repo}`"))?;
-    let query = MERGE_QUEUE_QUERY;
     let mut positions = BTreeMap::new();
     let mut heads = BTreeMap::new();
     let mut enqueued = BTreeMap::new();
+    let mut base_sha = None;
     let mut cursor: Option<String> = None;
     let mut seen_cursors = std::collections::BTreeSet::new();
     for page in 1..=MAX_MERGE_QUEUE_PAGES {
@@ -474,6 +516,9 @@ fn load_merge_queue_snapshot_once(
             "-F".to_owned(),
             format!("branch={base}"),
         ];
+        if query.contains("qualifiedBase") {
+            args.extend(["-F".to_owned(), format!("qualifiedBase=refs/heads/{base}")]);
+        }
         if let Some(cursor) = cursor.as_deref() {
             args.extend(["-F".to_owned(), format!("cursor={cursor}")]);
         }
@@ -483,6 +528,7 @@ fn load_merge_queue_snapshot_once(
                 return Ok((
                     (false, BTreeMap::new(), BTreeMap::new(), BTreeMap::new()),
                     page,
+                    base_sha,
                 ));
             }
             Err(error) => return Err(error),
@@ -497,6 +543,7 @@ fn load_merge_queue_snapshot_once(
                 return Ok((
                     (false, BTreeMap::new(), BTreeMap::new(), BTreeMap::new()),
                     page,
+                    None,
                 ));
             }
             return Err(format!("merge-queue GraphQL errors: {text}"));
@@ -504,18 +551,26 @@ fn load_merge_queue_snapshot_once(
         let Some(queue) = value.pointer("/data/repository/mergeQueue") else {
             return Err("merge-queue response missing repository.mergeQueue".to_owned());
         };
+        if base_sha.is_none() {
+            base_sha = value
+                .pointer("/data/repository/ref/target/oid")
+                .and_then(Value::as_str)
+                .filter(|sha| is_full_sha(sha))
+                .map(str::to_owned);
+        }
         if queue.is_null() {
             if page == 1 {
                 return Ok((
                     (false, BTreeMap::new(), BTreeMap::new(), BTreeMap::new()),
                     page,
+                    base_sha,
                 ));
             }
             return Err("merge-queue response became unavailable during pagination".to_owned());
         }
         append_merge_queue_nodes(queue, &mut positions, &mut heads, &mut enqueued)?;
         let Some(next_cursor) = merge_queue_next_cursor(queue)? else {
-            return Ok(((true, positions, heads, enqueued), page));
+            return Ok(((true, positions, heads, enqueued), page, base_sha));
         };
         if page == MAX_MERGE_QUEUE_PAGES {
             return Err(format!(
@@ -529,6 +584,15 @@ fn load_merge_queue_snapshot_once(
         cursor = Some(next_cursor.to_owned());
     }
     unreachable!("bounded merge-queue pagination returns from every page")
+}
+
+fn load_merge_queue_snapshot_once_with_base(
+    actions: &GitHubActions,
+    repo: &str,
+    base: &str,
+    deadline: Option<Instant>,
+) -> Result<(MergeQueueSnapshot, usize, Option<String>), String> {
+    load_merge_queue_snapshot_once_inner(actions, repo, base, deadline, MERGE_QUEUE_QUERY_WITH_BASE)
 }
 
 fn append_merge_queue_nodes(
