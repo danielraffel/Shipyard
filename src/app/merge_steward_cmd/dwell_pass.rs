@@ -81,6 +81,10 @@ pub(super) struct DwellRepoReport {
     /// base was not observed, which is no evidence a base alarm cleared.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_observed: Option<String>,
+    /// Pull requests eligible for the base-stall clock this pass; with
+    /// `base_observed`, the proof that none is waiting on the base.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_eligible: Option<usize>,
     /// Why the base config could not be read (the defaults applied).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy_read_error: Option<String>,
@@ -509,6 +513,7 @@ pub(super) fn run(
             number: candidate.number,
         })
         .collect();
+    report.base_eligible = Some(eligible.len());
     let failed_job = failed_merge_group_job(input.observation.runs.iter());
     let mut base_rows = dwell::track_base_stalled(
         &mut state,

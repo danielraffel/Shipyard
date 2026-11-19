@@ -237,6 +237,8 @@ def recent_ticks(log_dir, now, span):
             rows["_base_stalled"] = base_stalled
             bo = dwell.get("base_observed")
             rows["_base_observed"] = bo if isinstance(bo, str) and bo else None
+            be = dwell.get("base_eligible")
+            rows["_base_eligible"] = be if isinstance(be, int) and not isinstance(be, bool) else None
             per_repo.setdefault(r["repo"], []).append((t, rows))
     for v in per_repo.values():
         v.sort(key=lambda x: x[0])
@@ -629,15 +631,21 @@ def collect(a, now, state):
         if not key.startswith("base_stalled:") or key in current_base:
             continue
         repo = key[len("base_stalled:"):].split("@", 1)[0]
-        t_last, rows = latest_valid(per_repo.get(repo, []))
+        # The NEWEST tick decides: an unreadable or errored newest tick must not
+        # fall back to an older valid row.
+        ticks = per_repo.get(repo, [])
+        t_last, rows = ticks[-1] if ticks else (None, None)
         if rows is None or now - t_last > BASE_TICK_FRESH:
             current_base.add(key)
             continue
-        # A fresh tick clears the alarm only on an affirmative base observation:
-        # the head it saw differs from the alarm's (the base moved), or it saw
-        # the same head with no eligible PR. No observation is no evidence.
+        # A fresh tick clears the alarm only on affirmative evidence: it observed
+        # a base head different from the alarm's (the base moved), or the same
+        # head with an explicit empty eligible set. Anything less keeps it.
         observed = rows.get("_base_observed")
-        if observed is None:
+        head = key.split("@", 1)[1]
+        moved = observed is not None and observed != head
+        none_waiting = observed == head and rows.get("_base_eligible") == 0
+        if not (moved or none_waiting):
             current_base.add(key)
     state["_base_open"] = current_base
     f += check_stuck_claims(per_repo, a.runner_dir, now, sup)

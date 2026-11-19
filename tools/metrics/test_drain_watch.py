@@ -301,7 +301,7 @@ class StuckApprovedClearTests(StuckApprovedTests):
 
 class BaseStalledTests(Base):
     def base_tick(self, t, head="base-old", overdue=True, observed=True):
-        dwell = {**({"base_observed": head} if observed else {}), "overdue": ([{"pr": 69, "state": "base_stalled", "base_head": head,
+        dwell = {**({"base_observed": head, "base_eligible": 0 if not overdue else 1} if observed else {}), "overdue": ([{"pr": 69, "state": "base_stalled", "base_head": head,
                                 "age_minutes": 75, "failed_job": "macos"}] if overdue else [])}
         body = {"repos": [{"repo": REPO, "prs": [{"number": 69, "head_sha": "pr-head",
                     "blocked_on": "base_stalled", "since": None,
@@ -343,6 +343,22 @@ class BaseStalledTests(Base):
         self.base_tick(NOW + dt.timedelta(minutes=10), head="base-old", overdue=False)
         self.run_once(NOW + dt.timedelta(minutes=10))
         self.assertEqual(self.store()["issues"][0]["state"], "closed")
+
+    def test_unavailable_newest_tick_does_not_fall_back_to_an_older_valid_one(self):
+        self.file_alarm()
+        self.base_tick(NOW + dt.timedelta(minutes=10), head="base-new", overdue=False)
+        (self.log / f"{REPO.replace('/', '_')}-{stamp(NOW + dt.timedelta(minutes=12))}.json").write_text(
+            json.dumps({"repos": [{"repo": REPO, "errors": ["boom"]}]}))
+        self.run_once(NOW + dt.timedelta(minutes=12))
+        self.assertEqual(self.store()["issues"][0]["state"], "open")
+
+    def test_same_base_with_an_eligible_pr_missing_from_overdue_keeps_the_alarm(self):
+        self.file_alarm()
+        self.base_tick(NOW + dt.timedelta(minutes=10), head="base-old", overdue=False)
+        p = self.log / f"{REPO.replace('/', '_')}-{stamp(NOW + dt.timedelta(minutes=10))}.json"
+        d = json.loads(p.read_text()); d["repos"][0]["dwell"]["base_eligible"] = 2; p.write_text(json.dumps(d))
+        self.run_once(NOW + dt.timedelta(minutes=10))
+        self.assertEqual(self.store()["issues"][0]["state"], "open")
 
     def test_fresh_changed_base_clears_active_alarm(self):
         self.file_alarm()
