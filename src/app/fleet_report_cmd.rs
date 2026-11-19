@@ -1,6 +1,6 @@
 //! One local, read-only fleet page. No GitHub reads.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -11,6 +11,8 @@ use serde_json::{Value, json};
 use wait_timeout::ChildExt;
 
 use super::{CliFailure, dwell_cmd};
+use crate::cloud::GitHubActions;
+use crate::identity::RuntimeMode;
 
 fn unavailable(reason: impl std::fmt::Display) -> Value {
     json!({"unavailable": reason.to_string()})
@@ -191,6 +193,7 @@ fn report_with_snapshot_source(
             let counts = count_rows(&rows, &overdue);
             json!({"repo": snapshot.get("repo"), "base": snapshot.get("base"),
             "at": snapshot.get("at"), "counts": counts, "rows": rows,
+            "overdue_rows": snapshot.get("overdue").cloned().unwrap_or_else(|| json!([])),
             "complete": snapshot.get("fleet_rows").is_some()})
         })
         .collect();
@@ -216,7 +219,58 @@ fn report_with_snapshot_source(
             .map(|repo| repo["counts"][key].as_u64().unwrap_or(0))
             .sum::<u64>()
     };
-    json!({"source": "steward-snapshot", "steward_snapshots": snapshot_source, "summary": {
+    let mut invariant_rows: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let add = |kind: &str, repo: &Value, row: &Value, map: &mut BTreeMap<String, Vec<String>>| {
+        let repo = repo.as_str().unwrap_or("?");
+        let number = row
+            .get("number")
+            .and_then(Value::as_u64)
+            .or_else(|| row.get("pr").and_then(Value::as_u64))
+            .map_or_else(|| "?".to_owned(), |n| n.to_string());
+        let entries = map.entry(kind.to_owned()).or_default();
+        let entry = format!("{repo}#{number}");
+        if !entries.contains(&entry) {
+            entries.push(entry);
+        }
+    };
+    for repo in &repos {
+        for row in repo["rows"].as_array().into_iter().flatten() {
+            let owner = row
+                .get("owner")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            if owner.is_empty() || owner.eq_ignore_ascii_case("unknown") {
+                add(
+                    "open_pr_without_owner",
+                    &repo["repo"],
+                    row,
+                    &mut invariant_rows,
+                );
+            }
+            if row.get("blocked_on").and_then(Value::as_str) == Some("empty_diff") {
+                add("empty_diff", &repo["repo"], row, &mut invariant_rows);
+            }
+            if ["kind", "state", "blocked_on"].iter().any(|field| {
+                row.get(*field)
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| value.eq_ignore_ascii_case("approved_stuck"))
+            }) {
+                add("approved_stuck", &repo["repo"], row, &mut invariant_rows);
+            }
+        }
+        if let Some(overdue) = repo["overdue_rows"].as_array() {
+            for row in overdue {
+                let kind = row.get("kind").and_then(Value::as_str).unwrap_or("overdue");
+                add(kind, &repo["repo"], row, &mut invariant_rows);
+            }
+        }
+    }
+    let invariants: Vec<Value> = invariant_rows
+        .into_iter()
+        .map(|(kind, prs)| json!({"kind": kind, "count": prs.len(), "prs": prs}))
+        .collect();
+    json!({"source": "steward-snapshot", "steward_snapshots": snapshot_source, "invariants": invariants, "summary": {
         "repos": repos.len(), "open": sum("open"), "approved_green": sum("approved_green"),
         "waiting_review": sum("waiting_review"), "red": sum("red"), "overdue": sum("overdue")},
         "owner_actions": owner_actions, "repos": repos,
@@ -279,8 +333,30 @@ fn source_line(value: &Value) -> String {
 
 fn markdown(data: &Value) -> String {
     let summary = &data["summary"];
-    let mut out = format!(
-        "# Fleet report\n\n## Summary\n\n{} repos; {} open; {} approved and green; {} waiting review; {} red; {} overdue.\n\nSnapshot source: {}\n\nSteward tick: {}\n\n",
+    let mut out = "# Fleet report\n\n## Invariants\n\n".to_owned();
+    let invariants = data["invariants"].as_array().expect("invariants array");
+    if invariants.is_empty() {
+        out.push_str("All invariants hold\n\n");
+    } else {
+        for invariant in invariants {
+            let _ = writeln!(
+                out,
+                "- **{}** ({}): {}",
+                cell(invariant.get("kind")),
+                invariant["count"],
+                invariant["prs"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        out.push('\n');
+    }
+    out.push_str(&format!(
+        "## Summary\n\n{} repos; {} open; {} approved and green; {} waiting review; {} red; {} overdue.\n\nSnapshot source: {}\n\nSteward tick: {}\n\n",
         summary["repos"],
         summary["open"],
         summary["approved_green"],
@@ -289,7 +365,7 @@ fn markdown(data: &Value) -> String {
         summary["overdue"],
         source_line(&data["steward_snapshots"]),
         source_line(&data["steward_tick"])
-    );
+    ));
     out.push_str("## Owner actions\n\n");
     let owner = data["owner_actions"]
         .as_array()
@@ -349,17 +425,91 @@ fn markdown(data: &Value) -> String {
     out
 }
 
+fn parse_issue_target(target: &str) -> Result<(&str, u64), String> {
+    let (repo, number) = target
+        .rsplit_once('#')
+        .ok_or_else(|| "issue must be OWNER/REPO#NUMBER".to_owned())?;
+    if repo.split('/').count() != 2 || repo.split('/').any(|part| part.is_empty()) {
+        return Err("issue must be OWNER/REPO#NUMBER".to_owned());
+    }
+    let number = number
+        .parse()
+        .map_err(|_| "issue number must be an integer".to_owned())?;
+    Ok((repo, number))
+}
+
+fn publish_issue(
+    actions: &GitHubActions,
+    target: &str,
+    body: &str,
+    dry_run: bool,
+) -> Result<bool, String> {
+    if dry_run {
+        return Ok(false);
+    }
+    let (repo, number) = parse_issue_target(target)?;
+    let path = format!("repos/{repo}/issues/{number}");
+    let current = actions
+        .run_gh(&["api".to_owned(), path.clone()])
+        .map_err(|e| e.to_string())?;
+    let current: Value =
+        serde_json::from_str(&current).map_err(|e| format!("issue response was not JSON: {e}"))?;
+    if current.get("body").and_then(Value::as_str) == Some(body) {
+        return Ok(false);
+    }
+    actions
+        .run_gh(&[
+            "api".to_owned(),
+            "--method".to_owned(),
+            "PATCH".to_owned(),
+            path,
+            "-f".to_owned(),
+            format!("body={body}"),
+        ])
+        .map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
 pub(super) fn run<W: Write>(
     state_dir: &Path,
     format: &str,
     hosts_file: Option<&Path>,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
+    run_with_options(
+        state_dir,
+        format,
+        hosts_file,
+        stdout,
+        None,
+        RuntimeMode::Shipyard,
+        None,
+        false,
+    )
+}
+
+pub(super) fn run_with_options<W: Write>(
+    state_dir: &Path,
+    format: &str,
+    hosts_file: Option<&Path>,
+    stdout: &mut W,
+    cwd: Option<&Path>,
+    mode: RuntimeMode,
+    publish: Option<&str>,
+    dry_run: bool,
+) -> Result<ExitCode, CliFailure> {
     let (snapshots, snapshot_source) = match dwell_cmd::snapshots_for_report(state_dir, None) {
         Ok(snapshots) => (snapshots, json!("available")),
         Err(error) => (Vec::new(), unavailable(error)),
     };
     let data = report_with_snapshot_source(snapshots, hosts_file, &snapshot_source);
+    let markdown_body = markdown(&data);
+    if let Some(target) = publish {
+        let cwd = cwd.ok_or_else(|| CliFailure::new(2, "publishing requires a checkout"))?;
+        let actions = GitHubActions::from_cwd(mode, cwd);
+        publish_issue(&actions, target, &markdown_body, dry_run)
+            .map_err(|error| CliFailure::new(1, format!("publishing fleet report: {error}")))?;
+    }
     let rendered = if format == "json" {
         serde_json::to_string_pretty(&data).expect("JSON value")
     } else {
@@ -397,6 +547,69 @@ mod tests {
         assert!(md.contains("### o/a"));
         assert!(md.contains("### o/b"));
         assert!(md.contains("(unavailable:"));
+    }
+
+    #[test]
+    fn invariants_list_required_and_unknown_kinds_and_empty_state() {
+        let data = report_with_snapshot_source(
+            vec![json!({"repo":"o/a","at":"now","fleet_rows":[
+                {"number":1,"owner":"unknown","blocked_on":"empty_diff"},
+                {"number":2,"owner":"daniel","blocked_on":"approved_stuck"}],
+                "overdue":[{"pr":3,"kind":"base_stalled"},{"pr":4,"kind":"future_kind"},
+                    {"pr":5,"kind":"ci_billing_blocked"},{"pr":6,"kind":"ci_queued_forever"},
+                    {"pr":7,"kind":"orphan"}]})],
+            None,
+            &json!("available"),
+        );
+        let kinds: Vec<&str> = data["invariants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["kind"].as_str().unwrap())
+            .collect();
+        for kind in [
+            "open_pr_without_owner",
+            "empty_diff",
+            "approved_stuck",
+            "base_stalled",
+            "future_kind",
+            "ci_billing_blocked",
+            "ci_queued_forever",
+            "orphan",
+        ] {
+            assert!(kinds.contains(&kind), "missing {kind}: {kinds:?}");
+        }
+        assert!(markdown(&data).starts_with("# Fleet report\n\n## Invariants\n"));
+        let clean = report_with_snapshot_source(
+            vec![json!({"repo":"o/a","fleet_rows":[
+            {"number":1,"owner":"daniel","blocked_on":"ready"}],"overdue":[]})],
+            None,
+            &json!("available"),
+        );
+        assert!(markdown(&clean).contains("All invariants hold"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publish_skips_unchanged_body_and_dry_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = temp.path().join("gh.log");
+        let gh = temp.path().join("gh");
+        std::fs::write(
+            &gh,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nprintf '{{\"body\":\"same\"}}'\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let actions = GitHubActions::hermetic_for_tests(temp.path(), &gh);
+        assert!(!publish_issue(&actions, "o/r#7", "same", false).unwrap());
+        assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 1);
+        assert!(!publish_issue(&actions, "o/r#7", "changed", true).unwrap());
+        assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 1);
     }
 
     #[test]

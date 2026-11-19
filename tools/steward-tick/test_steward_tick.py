@@ -49,6 +49,11 @@ class StewardTickArchiveTests(unittest.TestCase):
         current.update(env)
         return subprocess.run(["bash", str(SCRIPT)], env=current, text=True, capture_output=True)
 
+    def test_fleet_report_publish_is_disabled_without_issue_variable(self):
+        result = self.run_tick()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("fleet-report", (self.log_dir / "summary.log").read_text())
+
     def add_old_tick(self, name="old.json", days=5):
         path = self.log_dir / name
         path.write_text('{"blocked_on":"test"}\n')
