@@ -235,6 +235,8 @@ def recent_ticks(log_dir, now, span):
                                      "required": [c for c in (r.get("required_contexts") or []) if isinstance(c, str)],
                                      "stuck": stuck.get(p["number"])}
             rows["_base_stalled"] = base_stalled
+            bo = dwell.get("base_observed")
+            rows["_base_observed"] = bo if isinstance(bo, str) and bo else None
             per_repo.setdefault(r["repo"], []).append((t, rows))
     for v in per_repo.values():
         v.sort(key=lambda x: x[0])
@@ -629,6 +631,13 @@ def collect(a, now, state):
         repo = key[len("base_stalled:"):].split("@", 1)[0]
         t_last, rows = latest_valid(per_repo.get(repo, []))
         if rows is None or now - t_last > BASE_TICK_FRESH:
+            current_base.add(key)
+            continue
+        # A fresh tick clears the alarm only on an affirmative base observation:
+        # the head it saw differs from the alarm's (the base moved), or it saw
+        # the same head with no eligible PR. No observation is no evidence.
+        observed = rows.get("_base_observed")
+        if observed is None:
             current_base.add(key)
     state["_base_open"] = current_base
     f += check_stuck_claims(per_repo, a.runner_dir, now, sup)

@@ -300,8 +300,8 @@ class StuckApprovedClearTests(StuckApprovedTests):
 
 
 class BaseStalledTests(Base):
-    def base_tick(self, t, head="base-old", overdue=True):
-        dwell = {"overdue": ([{"pr": 69, "state": "base_stalled", "base_head": head,
+    def base_tick(self, t, head="base-old", overdue=True, observed=True):
+        dwell = {**({"base_observed": head} if observed else {}), "overdue": ([{"pr": 69, "state": "base_stalled", "base_head": head,
                                 "age_minutes": 75, "failed_job": "macos"}] if overdue else [])}
         body = {"repos": [{"repo": REPO, "prs": [{"number": 69, "head_sha": "pr-head",
                     "blocked_on": "base_stalled", "since": None,
@@ -329,6 +329,20 @@ class BaseStalledTests(Base):
         self.assertEqual(self.store()["issues"][0]["state"], "open")
         st = self.state()["findings"]["base_stalled:acme/repo@base-old"]
         self.assertEqual(st.get("absent", 0), 0)
+
+    def test_fresh_tick_without_a_base_observation_keeps_the_alarm(self):
+        self.file_alarm()
+        for m in (10, 15, 20, 25):
+            self.base_tick(NOW + dt.timedelta(minutes=m), head="base-new", overdue=False, observed=False)
+            self.run_once(NOW + dt.timedelta(minutes=m))
+        self.assertEqual(self.store()["issues"][0]["state"], "open")
+        self.assertIn("base_stalled:acme/repo@base-old", self.state()["findings"])
+
+    def test_fresh_same_base_with_no_eligible_pr_clears_the_alarm(self):
+        self.file_alarm()
+        self.base_tick(NOW + dt.timedelta(minutes=10), head="base-old", overdue=False)
+        self.run_once(NOW + dt.timedelta(minutes=10))
+        self.assertEqual(self.store()["issues"][0]["state"], "closed")
 
     def test_fresh_changed_base_clears_active_alarm(self):
         self.file_alarm()

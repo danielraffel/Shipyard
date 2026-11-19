@@ -77,6 +77,10 @@ pub(super) struct DwellRepoReport {
     pub escalations_new: usize,
     /// Escalations owed but deferred by the per-pass cap.
     pub escalations_deferred: usize,
+    /// The base head this pass observed, when it read one. Absent means the
+    /// base was not observed, which is no evidence a base alarm cleared.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_observed: Option<String>,
     /// Why the base config could not be read (the defaults applied).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy_read_error: Option<String>,
@@ -497,6 +501,7 @@ pub(super) fn run(
             None,
         )
     }));
+    report.base_observed = input.observation.base_sha.clone();
     let eligible = stuck_candidates(input, reports);
     let eligible: Vec<dwell::BaseStalledCandidate> = eligible
         .iter()
