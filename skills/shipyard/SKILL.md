@@ -2316,7 +2316,9 @@ as evidence. On a `pull_request` run the record's head comes from
 `GITHUB_EVENT_PATH` (`GITHUB_SHA` is the test merge commit); pass `--job` with
 the display name when it differs from the job key. A workflow that wants every red named without editing its jobs adds a job
 that needs them and runs `scripts/ci_cause_notices.sh` (a job cannot read its
-own log while it runs, so the records come from the finished logs). `shipyard diagnose
+own log while it runs, so the records come from the finished logs). `shipyard diagnose`
+takes the pull request as `shipyard diagnose <n>` or `shipyard diagnose --pr <n>` (the form
+the steward's next_action and the relay print). `shipyard diagnose
 --annotate plan|post` puts every failing required job's record in the check
 run's `output.text`, and `shipyard cause archive --dir <labels
 checkout>/data/ci-cause --input <cases.jsonl>` appends records to
