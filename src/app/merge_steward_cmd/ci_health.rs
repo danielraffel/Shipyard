@@ -534,6 +534,44 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn paginated_organization_label_reaches_queue_probe() {
+        let temp = tempfile::tempdir().unwrap();
+        let gh = temp.path().join("gh");
+        let page_one = serde_json::to_string(&serde_json::json!({
+            "runners": (0..100)
+                .map(|index| serde_json::json!({
+                    "status": "online",
+                    "labels": [{"name": format!("org-page-one-{index}")}]
+                }))
+                .collect::<Vec<_>>()
+        }))
+        .unwrap();
+        let page_two = serde_json::to_string(&serde_json::json!({
+            "runners": [{
+                "status": "online",
+                "labels": [{"name": "org-only"}]
+            }]
+        }))
+        .unwrap();
+        let script = format!(
+            "#!/bin/sh\nset -eu\ncase \"$*\" in\n  *\"actions/runs?status=completed&per_page=1&branch=main\") printf '%s' '{{\"workflow_runs\":[]}}';;\n  *\"repos/acme/repo/actions/runners?per_page=100\") printf '%s' '{{\"runners\":[]}}';;\n  *\"orgs/acme/actions/runners?per_page=100&page=2\") printf '%s' '{page_two}';;\n  *\"orgs/acme/actions/runners?per_page=100\") printf '%s' '{page_one}';;\n  *\"actions/runs?status=queued&per_page=5\") printf '%s' '{{\"workflow_runs\":[{{\"id\":42,\"name\":\"CI\",\"head_branch\":\"main\",\"event\":\"push\",\"created_at\":\"2026-11-18T00:00:00Z\"}}]}}';;\n  *\"actions/runs?status=in_progress&per_page=5\") printf '%s' '{{\"workflow_runs\":[]}}';;\n  *\"actions/runs/42/jobs?per_page=100\") printf '%s' '{{\"jobs\":[{{\"status\":\"queued\",\"name\":\"build\",\"created_at\":\"2026-11-18T00:00:00Z\",\"labels\":[\"self-hosted\",\"org-only\"]}}]}}';;\n  *) echo \"unexpected args: $*\" >&2; exit 1;;\nesac\n"
+        );
+        crate::test_support::write_executable_script(&gh, &script);
+        let actions = GitHubActions::hermetic_for_tests(temp.path(), &gh);
+        let now = DateTime::parse_from_rfc3339("2026-11-18T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let (rows, errors) = probe(&actions, "acme/repo", "main", now);
+        assert!(rows.is_empty(), "{rows:?}");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("repository eligibility unavailable"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn organization_inventory_404_is_unknown_unless_owner_is_personal() {
         let temp = tempfile::tempdir().unwrap();
         let gh = temp.path().join("gh");
