@@ -725,8 +725,12 @@ pub(super) enum Command {
     /// larger than `--max-bytes`. Read-only unless `--annotate post`.
     Diagnose {
         /// Pull request whose head to diagnose.
-        #[arg(value_name = "PR", conflicts_with = "run")]
+        #[arg(value_name = "PR", conflicts_with_all = ["run", "pr_flag"])]
         pr: Option<u64>,
+        /// The same pull request as `--pr N`, the form steward and relay
+        /// hints print.
+        #[arg(long = "pr", value_name = "PR", conflicts_with = "run")]
+        pr_flag: Option<u64>,
         /// Workflow run to diagnose instead of a pull request head.
         #[arg(long, value_name = "ID")]
         run: Option<u64>,
@@ -4576,6 +4580,22 @@ mod tests {
             .join()
             .expect("Cli::parse_from on a 2 MiB thread");
         assert!(matches!(cli.command, Command::Daemon { .. }));
+    }
+
+    #[test]
+    fn diagnose_accepts_the_pr_as_positional_or_flag() {
+        for args in [
+            &["shipyard", "diagnose", "1520", "--repo", "o/r"][..],
+            &["shipyard", "diagnose", "--pr", "1520", "--repo", "o/r"][..],
+        ] {
+            let cli = Cli::try_parse_from(args.iter().copied()).expect("diagnose parses");
+            let Command::Diagnose { pr, pr_flag, .. } = cli.command else {
+                panic!("not diagnose");
+            };
+            assert_eq!(pr.or(pr_flag), Some(1520), "{args:?}");
+        }
+        assert!(Cli::try_parse_from(["shipyard", "diagnose", "1", "--pr", "2"]).is_err());
+        assert!(Cli::try_parse_from(["shipyard", "diagnose", "--pr", "2", "--run", "3"]).is_err());
     }
 
     #[test]
