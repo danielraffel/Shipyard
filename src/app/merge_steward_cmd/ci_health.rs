@@ -142,16 +142,6 @@ where
     Ok(())
 }
 
-fn first_failed_job(raw: &Value) -> Option<(u64, Value)> {
-    raw.get("jobs")?.as_array()?.iter().find_map(|job| {
-        let conclusion = job.get("conclusion").and_then(Value::as_str)?;
-        if conclusion != "failure" {
-            return None;
-        }
-        Some((job.get("id")?.as_u64()?, job.clone()))
-    })
-}
-
 fn online_labels_or_unknown(
     actions: &GitHubActions,
     repo: &str,
@@ -231,15 +221,12 @@ fn online_labels_or_unknown(
     }
 }
 
-/// Run both probes. Each failed read is returned as a loggable error and
-/// produces no alert; a runners 403 is deliberately treated as unknown.
-pub(super) fn probe(
+fn probe_billing(
     actions: &GitHubActions,
     repo: &str,
     default_branch: &str,
     now: DateTime<Utc>,
-) -> (Vec<CiHealthOverdue>, Vec<String>) {
-    let mut rows = Vec::new();
+) -> (Option<CiHealthOverdue>, Vec<String>) {
     let mut errors = Vec::new();
 
     match actions.list_runs_with_status(repo, "completed", Some(default_branch), 1) {
@@ -247,21 +234,36 @@ pub(super) fn probe(
             if let Some(run) = runs.first() {
                 match actions.workflow_run_jobs_raw(repo, run.database_id) {
                     Ok(jobs) => {
-                        if let Some((job_id, _)) = first_failed_job(&jobs) {
+                        for job in jobs
+                            .get("jobs")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter(|job| {
+                                job.get("conclusion").and_then(Value::as_str) == Some("failure")
+                            })
+                        {
+                            let Some(job_id) = job.get("id").and_then(Value::as_u64) else {
+                                continue;
+                            };
                             match actions.check_run_annotations_raw(repo, job_id) {
                                 Ok(annotations) if annotations_show_billing_block(&annotations) => {
-                                    rows.push(CiHealthOverdue {
-                                        kind: "overdue",
-                                        condition: "ci_billing_blocked",
-                                        repo: repo.to_owned(),
-                                        detail:
-                                            "recent account payments have failed or spending limit"
+                                    return (
+                                        Some(CiHealthOverdue {
+                                            kind: "overdue",
+                                            condition: "ci_billing_blocked",
+                                            repo: repo.to_owned(),
+                                            detail: "recent account payments have failed or spending limit"
                                                 .to_owned(),
-                                        at: now,
-                                    });
+                                            at: now,
+                                        }),
+                                        errors,
+                                    );
                                 }
                                 Ok(_) => {}
-                                Err(error) => errors.push(format!("ci_billing_blocked: {error:?}")),
+                                Err(error) => {
+                                    errors.push(format!("ci_billing_blocked: {error:?}"));
+                                }
                             }
                         }
                     }
@@ -271,68 +273,86 @@ pub(super) fn probe(
         }
         Err(error) => errors.push(format!("ci_billing_blocked runs: {error:?}")),
     }
+    (None, errors)
+}
 
-    let online = online_labels_or_unknown(actions, repo, &mut errors);
-    if let Some(online_labels) = online {
-        let mut runs = Vec::new();
-        match actions.list_queued_runs(repo, MAX_QUEUED_RUNS) {
-            Ok(queued) => runs.extend(queued),
-            Err(error) => errors.push(format!("ci_queued_forever runs: {error:?}")),
-        }
-        match actions.list_runs_with_status(repo, "in_progress", None, MAX_QUEUED_RUNS) {
-            Ok(in_progress) => runs.extend(in_progress),
-            Err(error) => errors.push(format!("ci_queued_forever in-progress runs: {error:?}")),
-        }
-        'runs: for run in runs {
-            let jobs = match actions.workflow_run_jobs_raw(repo, run.database_id) {
-                Ok(jobs) => jobs,
-                Err(error) => {
-                    errors.push(format!("ci_queued_forever jobs: {error:?}"));
-                    continue;
-                }
-            };
-            for job in jobs
-                .get("jobs")
+fn probe_queued(
+    actions: &GitHubActions,
+    repo: &str,
+    now: DateTime<Utc>,
+    errors: &mut Vec<String>,
+) -> Option<CiHealthOverdue> {
+    let online_labels = online_labels_or_unknown(actions, repo, errors)?;
+    let mut runs = Vec::new();
+    match actions.list_queued_runs(repo, MAX_QUEUED_RUNS) {
+        Ok(queued) => runs.extend(queued),
+        Err(error) => errors.push(format!("ci_queued_forever runs: {error:?}")),
+    }
+    match actions.list_runs_with_status(repo, "in_progress", None, MAX_QUEUED_RUNS) {
+        Ok(in_progress) => runs.extend(in_progress),
+        Err(error) => errors.push(format!("ci_queued_forever in-progress runs: {error:?}")),
+    }
+    for run in runs {
+        let jobs = match actions.workflow_run_jobs_raw(repo, run.database_id) {
+            Ok(jobs) => jobs,
+            Err(error) => {
+                errors.push(format!("ci_queued_forever jobs: {error:?}"));
+                continue;
+            }
+        };
+        for job in jobs
+            .get("jobs")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if job.get("status").and_then(Value::as_str) != Some("queued") {
+                continue;
+            }
+            let labels = job
+                .get("labels")
                 .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-            {
-                if job.get("status").and_then(Value::as_str) != Some("queued") {
-                    continue;
-                }
-                let labels = job
-                    .get("labels")
-                    .and_then(Value::as_array)
-                    .map(|items| {
-                        items
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .map(str::to_owned)
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                let queued_at = job
-                    .get("queued_at")
-                    .and_then(Value::as_str)
-                    .unwrap_or(&run.created_at);
-                if queued_job_is_forever_queued(queued_at, &labels, &online_labels, now) {
-                    rows.push(CiHealthOverdue {
-                        kind: "overdue",
-                        condition: "ci_queued_forever",
-                        repo: repo.to_owned(),
-                        detail: format!(
-                            "job {} labels={}",
-                            job.get("name").and_then(Value::as_str).unwrap_or("unknown"),
-                            labels.join(",")
-                        ),
-                        at: now,
-                    });
-                    break 'runs;
-                }
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let queued_at = job
+                .get("queued_at")
+                .and_then(Value::as_str)
+                .unwrap_or(&run.created_at);
+            if queued_job_is_forever_queued(queued_at, &labels, &online_labels, now) {
+                return Some(CiHealthOverdue {
+                    kind: "overdue",
+                    condition: "ci_queued_forever",
+                    repo: repo.to_owned(),
+                    detail: format!(
+                        "job {} labels={}",
+                        job.get("name").and_then(Value::as_str).unwrap_or("unknown"),
+                        labels.join(",")
+                    ),
+                    at: now,
+                });
             }
         }
     }
-    (rows, errors)
+    None
+}
+
+/// Run both probes. Each failed read is returned as a loggable error and
+/// produces no alert; a runners 403 is deliberately treated as unknown.
+pub(super) fn probe(
+    actions: &GitHubActions,
+    repo: &str,
+    default_branch: &str,
+    now: DateTime<Utc>,
+) -> (Vec<CiHealthOverdue>, Vec<String>) {
+    let (billing, mut errors) = probe_billing(actions, repo, default_branch, now);
+    let queued = probe_queued(actions, repo, now, &mut errors);
+    (billing.into_iter().chain(queued).collect(), errors)
 }
 
 #[cfg(test)]
@@ -564,6 +584,37 @@ esac
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].condition, "ci_queued_forever");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn billing_probe_checks_every_failed_job_for_annotations() {
+        let temp = tempfile::tempdir().unwrap();
+        let gh = temp.path().join("gh");
+        let script = r#"#!/bin/sh
+set -eu
+case "$*" in
+  *"actions/runs?status=completed&per_page=1&branch=main") printf '%s' '{"workflow_runs":[{"id":7,"name":"CI","head_branch":"main","event":"push","created_at":"2026-11-18T00:00:00Z"}]}';;
+  *"actions/runs/7/jobs?per_page=100") printf '%s' '{"jobs":[{"id":1,"conclusion":"failure"},{"id":2,"conclusion":"failure"}]}';;
+  *"check-runs/1/annotations") printf '%s' '[]';;
+  *"check-runs/2/annotations") printf '%s' '[{"message":"spending limit reached"}]';;
+  *"actions/runners?per_page=100") printf '%s' '{"runners":[{"status":"online","labels":[{"name":"linux"}]}]}';;
+  *"orgs/acme/actions/runners?per_page=100") echo 'gh: Not Found (HTTP 404)' >&2; exit 1;;
+  *"repos/acme/repo") printf '%s' '{"owner":{"type":"User"}}';;
+  *"actions/runs?status=queued&per_page=5") printf '%s' '{"workflow_runs":[]}';;
+  *"actions/runs?status=in_progress&per_page=5") printf '%s' '{"workflow_runs":[]}';;
+  *) echo "unexpected args: $*" >&2; exit 1;;
+esac
+"#;
+        crate::test_support::write_executable_script(&gh, script);
+        let actions = GitHubActions::hermetic_for_tests(temp.path(), &gh);
+        let now = DateTime::parse_from_rfc3339("2026-11-18T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let (rows, errors) = probe(&actions, "acme/repo", "main", now);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].condition, "ci_billing_blocked");
     }
 
     #[cfg(unix)]
