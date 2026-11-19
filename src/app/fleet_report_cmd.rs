@@ -144,10 +144,32 @@ fn report_with_snapshot_source(
     hosts_file: Option<&Path>,
     snapshot_source: &Value,
 ) -> Value {
-    let invariants_available =
-        snapshot_source.as_str() == Some("available") && !snapshots.is_empty();
+    let missing_fleet_rows: Vec<String> = snapshots
+        .iter()
+        .enumerate()
+        .filter(|(_, snapshot)| {
+            snapshot
+                .get("fleet_rows")
+                .and_then(Value::as_array)
+                .is_none()
+        })
+        .map(|(index, snapshot)| {
+            snapshot
+                .get("repo")
+                .and_then(Value::as_str)
+                .map_or_else(|| format!("snapshot {}", index + 1), str::to_owned)
+        })
+        .collect();
+    let invariants_available = snapshot_source.as_str() == Some("available")
+        && !snapshots.is_empty()
+        && missing_fleet_rows.is_empty();
     let invariants_unavailable = if invariants_available {
         Value::Null
+    } else if snapshot_source.as_str() == Some("available") && !missing_fleet_rows.is_empty() {
+        json!(format!(
+            "snapshots missing fleet_rows: {}",
+            missing_fleet_rows.join(", ")
+        ))
     } else {
         snapshot_source
             .get("unavailable")
@@ -208,7 +230,7 @@ fn report_with_snapshot_source(
             json!({"repo": snapshot.get("repo"), "base": snapshot.get("base"),
             "at": snapshot.get("at"), "counts": counts, "rows": rows,
             "overdue_rows": snapshot.get("overdue").cloned().unwrap_or_else(|| json!([])),
-            "complete": snapshot.get("fleet_rows").is_some()})
+            "complete": snapshot.get("fleet_rows").and_then(Value::as_array).is_some()})
         })
         .collect();
     let owner_actions: Vec<Value> = repos
@@ -614,6 +636,42 @@ mod tests {
             &json!("available"),
         );
         assert!(markdown(&clean).contains("All invariants hold"));
+    }
+
+    #[test]
+    fn invariants_are_unavailable_when_a_snapshot_lacks_fleet_rows() {
+        let data = report_with_snapshot_source(
+            vec![
+                json!({"repo":"o/complete","fleet_rows":[],"overdue":[]}),
+                json!({"repo":"o/legacy","next_to_admit":[],"overdue":[]}),
+            ],
+            None,
+            &json!("available"),
+        );
+
+        assert_eq!(data["invariants_available"], false);
+        assert!(
+            data["invariants_unavailable"]
+                .as_str()
+                .unwrap()
+                .contains("o/legacy")
+        );
+        assert!(!markdown(&data).contains("All invariants hold"));
+    }
+
+    #[test]
+    fn invariants_are_available_when_all_snapshots_have_fleet_rows() {
+        let data = report_with_snapshot_source(
+            vec![
+                json!({"repo":"o/a","fleet_rows":[],"overdue":[]}),
+                json!({"repo":"o/b","fleet_rows":[],"overdue":[]}),
+            ],
+            None,
+            &json!("available"),
+        );
+
+        assert_eq!(data["invariants_available"], true);
+        assert!(markdown(&data).contains("All invariants hold"));
     }
 
     #[cfg(unix)]
