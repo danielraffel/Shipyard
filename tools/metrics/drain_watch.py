@@ -727,6 +727,11 @@ def run(a, now=None, issues=None):
                         continue
             del findings_state[key]
             continue
+        if base:
+            # Still in base_open: a stale or unavailable tick, not evidence the
+            # base moved. Keep the alarm without counting it absent, so the
+            # generic CLEAR_RUNS path never closes it.
+            continue
         st["absent"] = st.get("absent", 0) + 1
         if st.get("pending") and not st.get("issue"):
             continue  # no issue could be filed yet: keep it until one is

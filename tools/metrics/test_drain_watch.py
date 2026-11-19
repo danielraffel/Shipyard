@@ -322,6 +322,14 @@ class BaseStalledTests(Base):
         self.assertEqual(self.store()["issues"][0]["state"], "open")
         self.assertIn("base_stalled:acme/repo@base-old", self.state()["findings"])
 
+    def test_repeated_stale_ticks_never_clear_active_base_alarm(self):
+        self.file_alarm()
+        for m in (45, 50, 55, 60, 65, 70):  # well past CLEAR_RUNS stale/unavailable runs
+            self.run_once(NOW + dt.timedelta(minutes=m))
+        self.assertEqual(self.store()["issues"][0]["state"], "open")
+        st = self.state()["findings"]["base_stalled:acme/repo@base-old"]
+        self.assertEqual(st.get("absent", 0), 0)
+
     def test_fresh_changed_base_clears_active_alarm(self):
         self.file_alarm()
         self.base_tick(NOW + dt.timedelta(minutes=10), head="base-new", overdue=False)
