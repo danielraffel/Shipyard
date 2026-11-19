@@ -221,6 +221,13 @@ fn online_labels_or_unknown(
     }
 }
 
+fn job_check_run_id(job: &Value) -> Option<u64> {
+    job.get("check_run_url")
+        .and_then(Value::as_str)
+        .and_then(|url| url.rsplit('/').next())
+        .and_then(|id| id.parse().ok())
+}
+
 fn probe_billing(
     actions: &GitHubActions,
     repo: &str,
@@ -243,10 +250,10 @@ fn probe_billing(
                                 job.get("conclusion").and_then(Value::as_str) == Some("failure")
                             })
                         {
-                            let Some(job_id) = job.get("id").and_then(Value::as_u64) else {
+                            let Some(check_run_id) = job_check_run_id(job) else {
                                 continue;
                             };
-                            match actions.check_run_annotations_raw(repo, job_id) {
+                            match actions.check_run_annotations_raw(repo, check_run_id) {
                                 Ok(annotations) if annotations_show_billing_block(&annotations) => {
                                     return (
                                         Some(CiHealthOverdue {
@@ -321,7 +328,7 @@ fn probe_queued(
                 })
                 .unwrap_or_default();
             let queued_at = job
-                .get("queued_at")
+                .get("created_at")
                 .and_then(Value::as_str)
                 .unwrap_or(&run.created_at);
             if queued_job_is_forever_queued(queued_at, &labels, &online_labels, now) {
@@ -571,7 +578,7 @@ case "$*" in
   *"repos/acme/repo" ) printf '%s' '{"owner":{"type":"User"}}';;
   *"actions/runs?status=queued&per_page=5") printf '%s' '{"workflow_runs":[]}';;
   *"actions/runs?status=in_progress&per_page=5") printf '%s' '{"workflow_runs":[{"id":42,"name":"CI","head_branch":"main","event":"push","created_at":"2026-11-18T00:00:00Z"}]}';;
-  *"actions/runs/42/jobs?per_page=100") printf '%s' '{"jobs":[{"status":"queued","name":"build","queued_at":"2026-11-18T00:00:00Z","labels":["self-hosted","retired"]}]}';;
+  *"actions/runs/42/jobs?per_page=100") printf '%s' '{"jobs":[{"status":"queued","name":"build","created_at":"2026-11-18T00:00:00Z","labels":["self-hosted","retired"]}]}';;
   *) echo "unexpected args: $*" >&2; exit 1;;
 esac
 "#;
@@ -595,9 +602,9 @@ esac
 set -eu
 case "$*" in
   *"actions/runs?status=completed&per_page=1&branch=main") printf '%s' '{"workflow_runs":[{"id":7,"name":"CI","head_branch":"main","event":"push","created_at":"2026-11-18T00:00:00Z"}]}';;
-  *"actions/runs/7/jobs?per_page=100") printf '%s' '{"jobs":[{"id":1,"conclusion":"failure"},{"id":2,"conclusion":"failure"}]}';;
-  *"check-runs/1/annotations") printf '%s' '[]';;
-  *"check-runs/2/annotations") printf '%s' '[{"message":"spending limit reached"}]';;
+  *"actions/runs/7/jobs?per_page=100") printf '%s' '{"jobs":[{"id":1,"check_run_url":"https://api.github.com/repos/acme/repo/check-runs/101","conclusion":"failure"},{"id":2,"check_run_url":"https://api.github.com/repos/acme/repo/check-runs/202","conclusion":"failure"}]}';;
+  *"check-runs/101/annotations") printf '%s' '[]';;
+  *"check-runs/202/annotations") printf '%s' '[{"message":"spending limit reached"}]';;
   *"actions/runners?per_page=100") printf '%s' '{"runners":[{"status":"online","labels":[{"name":"linux"}]}]}';;
   *"orgs/acme/actions/runners?per_page=100") echo 'gh: Not Found (HTTP 404)' >&2; exit 1;;
   *"repos/acme/repo") printf '%s' '{"owner":{"type":"User"}}';;
