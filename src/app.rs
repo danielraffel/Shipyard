@@ -498,6 +498,7 @@ where
         }
         Command::Diagnose {
             pr,
+            pr_flag,
             run,
             repo,
             base,
@@ -509,7 +510,7 @@ where
                 .map_err(|error| CliFailure::new(2, error))?;
             return diagnose_cmd::diagnose_command(
                 diagnose_cmd::DiagnoseArgs {
-                    pr,
+                    pr: pr.or(pr_flag),
                     run,
                     repo,
                     base,
