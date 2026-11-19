@@ -139,6 +139,13 @@ probably dropped the PR's changes, so restore them from an earlier head or close
 2026-11-18 repair merges emptied four PRs (Pulp #12547 and #12549, skia-builder #63, v8-builder #71) that
 would otherwise have merged as no-ops. Unknown counts never block; only an observed 0 with commits does.
 
+## The fleet status page publishes itself
+
+The m3 steward tick runs `shipyard fleet-report --publish-issue "$SHIPYARD_FLEET_REPORT_ISSUE"` after each pass
+when that variable is set. The issue body opens with an Invariants section: every violated invariant fleet-wide
+(no owner, over SLO, empty diff, approved_stuck, base_stalled, ci_* and any other overdue kind), or "All
+invariants hold". Read that issue before polling GitHub for fleet state; it is rewritten only when it changes.
+
 ## Stale merge refs: `stale_merge_ref`
 
 An approved pull request whose required checks went red on a test merge

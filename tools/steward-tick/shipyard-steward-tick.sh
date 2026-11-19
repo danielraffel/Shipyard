@@ -235,6 +235,22 @@ for repo in "${repos[@]}"; do
   steward_one "$repo"
 done
 
+# Optional fleet report publication. It is bounded and never fails the tick.
+if [ -n "${SHIPYARD_FLEET_REPORT_ISSUE:-}" ]; then
+  fleet_report_timeout="${SHIPYARD_FLEET_REPORT_TIMEOUT_S:-120}"
+  fleet_report_repo="${SHIPYARD_FLEET_REPORT_ISSUE%%#*}"
+  fleet_report_dir="$clones/${fleet_report_repo#*/}"
+  if [ -d "$fleet_report_dir" ]; then
+    (cd "$fleet_report_dir" && timeout "$fleet_report_timeout" "$steward_bin" fleet-report \
+      --publish-issue "$SHIPYARD_FLEET_REPORT_ISSUE" >/dev/null 2>>"$log_dir/fleet-report.err") \
+      || echo "$stamp fleet-report publish failed issue=$SHIPYARD_FLEET_REPORT_ISSUE" >> "$log_dir/summary.log"
+  else
+    timeout "$fleet_report_timeout" "$steward_bin" fleet-report \
+      --publish-issue "$SHIPYARD_FLEET_REPORT_ISSUE" >/dev/null 2>>"$log_dir/fleet-report.err" \
+      || echo "$stamp fleet-report publish failed issue=$SHIPYARD_FLEET_REPORT_ISSUE" >> "$log_dir/summary.log"
+  fi
+fi
+
 archive_old_tick_files() {
   local live_days="${SHIPYARD_STEWARD_LIVE_DAYS:-3}"
   local archive_days="${SHIPYARD_STEWARD_ARCHIVE_RETENTION_DAYS:-180}"

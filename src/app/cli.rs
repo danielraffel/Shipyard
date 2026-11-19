@@ -616,6 +616,12 @@ pub(super) enum Command {
         /// JSON array of objects with host and status strings.
         #[arg(long, value_name = "PATH")]
         hosts_file: Option<PathBuf>,
+        /// Replace an issue body with the Markdown report.
+        #[arg(long, value_name = "OWNER/REPO#NUMBER")]
+        publish_issue: Option<String>,
+        /// Render and read the report without publishing it.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Which host and agent session armed, enqueued, merged or removed a
     /// pull request. Read-only.

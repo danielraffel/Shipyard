@@ -9,8 +9,16 @@ description: "Cross-platform CI coordination with Shipyard: validates, ships, ma
 
 `shipyard fleet-report [--format md|json] [--hosts-file <path>]` renders every open PR the merge steward saw
 (blocker, owner, age, next action, who acts), per-repo counts, an Owner actions section, and the Claude pool
-state from `sr status --json`. It reads only the steward's own snapshots, so it costs no GitHub reads. Sources it
-cannot read print as "(unavailable: reason)" and never fail it. Read it before polling `gh` for a PR's state.
+state from `sr status --json`. The report starts with an Invariants section grouping ownerless PRs, overdue rows,
+empty diffs, approved-stuck rows, and any snapshot-provided overdue kinds (including base and CI stalls or orphans).
+It prints `All invariants hold` when that list is empty, and includes the same structured list in JSON. It reads only
+the steward's own snapshots, so it costs no GitHub reads. Sources it cannot read print as "(unavailable: reason)" and
+never fail it. Read it before polling `gh` for a PR's state.
+
+To replace an issue body with the Markdown report, add `--publish-issue OWNER/REPO#NUMBER`; the command reads the
+current body first and skips an unchanged body. `--dry-run` skips the write. The m3 tick leaves publishing disabled
+unless `SHIPYARD_FLEET_REPORT_ISSUE` is set, then runs it after the steward pass with a bounded timeout; publication
+errors are logged and never fail the tick.
 
 ## Durable external work
 
