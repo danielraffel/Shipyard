@@ -553,6 +553,11 @@ pub fn track_base_stalled(
     policy: &DwellPolicy,
     now: DateTime<Utc>,
 ) -> Vec<Planned> {
+    let Some(limit) = policy.limit(DwellState::BaseStalled) else {
+        // Disabled: keep no clock, so re-enabling never counts disabled time.
+        state.base_stalled.clear();
+        return Vec::new();
+    };
     let Some(head) = base_head.filter(|head| !head.is_empty()) else {
         return Vec::new();
     };
@@ -579,9 +584,6 @@ pub fn track_base_stalled(
     if failed_job.is_some() {
         entry.failed_job = failed_job;
     }
-    let Some(limit) = policy.limit(DwellState::BaseStalled) else {
-        return Vec::new();
-    };
     let age = (now - entry.first_seen).num_minutes().max(0);
     if age < i64::from(limit) {
         return Vec::new();

@@ -1247,3 +1247,25 @@ fn base_stalled_rearms_only_after_head_change_and_zero_disables() {
         .is_empty()
     );
 }
+
+#[test]
+fn base_stalled_disabled_keeps_no_clock_and_reenabling_starts_fresh() {
+    let mut state = established();
+    let candidate = [BaseStalledCandidate { number: 7 }];
+    let off = DwellPolicy::from_table(&"[auto_merge.dwell]\nbase_stalled = 0".parse().unwrap());
+    assert!(track_base_stalled(&mut state, Some(HEAD), &candidate, None, &off, now()).is_empty());
+    assert!(state.base_stalled.is_empty());
+    let on = DwellPolicy::default();
+    // Re-enabled 10 hours later: the clock starts now, so nothing is overdue.
+    assert!(
+        track_base_stalled(
+            &mut state,
+            Some(HEAD),
+            &candidate,
+            None,
+            &on,
+            now() + Duration::minutes(600)
+        )
+        .is_empty()
+    );
+}
