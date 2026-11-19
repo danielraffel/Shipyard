@@ -279,7 +279,39 @@ fn an_unknown_ci_health_probe_is_a_diagnostic_not_a_repo_error() {
         &["ci_queued_forever runners unknown: HTTP 403".to_owned()],
         true,
         true,
+        "o/r",
     );
     assert!(report.errors.is_empty(), "{:?}", report.errors);
     assert_eq!(report.ci_health_diagnostics.len(), 1);
+}
+
+#[test]
+fn ci_health_probe_timestamp_waits_for_feed_commit() {
+    let temp = tempfile::tempdir().unwrap();
+    let state_file = temp.path().join("state-file");
+    fs::write(&state_file, "not a directory").unwrap();
+    let ledger_path = state_file.join("ledger.json");
+    let mut ledger = StewardLedger::default();
+    let mut report = super::unreadable_repo_report("o/r", "main", &ledger, "seed".to_owned());
+    report.errors.clear();
+    report.ci_health.push(ci_health::CiHealthOverdue {
+        kind: "overdue",
+        condition: "ci_billing_blocked",
+        repo: "o/r".to_owned(),
+        detail: "recent account payments have failed or spending limit".to_owned(),
+        at: chrono::Utc::now(),
+    });
+
+    assert!(!super::record_ci_health(
+        &ledger_path,
+        &mut ledger,
+        "o/r",
+        &mut report,
+        &[],
+        true,
+        true,
+        "o/r",
+    ));
+    assert!(ledger.ci_health_probed.is_empty());
+    assert!(ledger.ci_health_seen.is_empty());
 }

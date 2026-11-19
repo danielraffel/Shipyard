@@ -1721,7 +1721,8 @@ fn record_ci_health(
     ci_errors: &[String],
     apply: bool,
     probe_due: bool,
-) {
+    probe_key: &str,
+) -> bool {
     let successful_conditions: BTreeSet<&'static str> = ["ci_billing_blocked", "ci_queued_forever"]
         .into_iter()
         .filter(|condition| !ci_errors.iter().any(|error| error.starts_with(condition)))
@@ -1747,8 +1748,13 @@ fn record_ci_health(
             append_result,
         ) {
             report.ci_health_diagnostics.push(error);
+            return false;
         }
+        ledger
+            .ci_health_probed
+            .insert(probe_key.to_owned(), Utc::now());
     }
+    true
 }
 
 /// [`steward_repo`] once `actions` is scoped to `repo` and counting its
@@ -1800,9 +1806,6 @@ fn steward_repo_observed(
                     >= ci_health::PROBE_INTERVAL_MINUTES
             });
             let (ci_health, ci_errors) = if probe_due {
-                if args.apply {
-                    ledger.ci_health_probed.insert(probe_key, Utc::now());
-                }
                 ci_health::probe(actions, repo, &args.base, Utc::now())
             } else {
                 (Vec::new(), Vec::new())
@@ -1816,6 +1819,7 @@ fn steward_repo_observed(
                 &ci_errors,
                 args.apply,
                 probe_due,
+                &probe_key,
             );
             if let Some(errors) = recovery_errors.remove(&observation.repo) {
                 report.errors.extend(errors);
