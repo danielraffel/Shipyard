@@ -32,7 +32,7 @@ pub(super) enum View {
 /// Every snapshot to show: `repo`'s (any base), or every repository's. A
 /// snapshot that cannot be read is skipped with a warning on stderr rather
 /// than hiding the others.
-fn snapshots(state_dir: &Path, repo: Option<&str>) -> Vec<Value> {
+pub(super) fn snapshots(state_dir: &Path, repo: Option<&str>) -> Vec<Value> {
     let mut paths: Vec<PathBuf> = std::fs::read_dir(state_dir.join(DIR))
         .map(|entries| {
             entries
@@ -66,6 +66,44 @@ fn snapshots(state_dir: &Path, repo: Option<&str>) -> Vec<Value> {
                     .and_then(Value::as_str)
                     .is_some_and(|name| name.eq_ignore_ascii_case(repo))
             })
+        })
+        .collect()
+}
+
+/// Read every steward snapshot while preserving source failures for callers
+/// whose contract requires an unavailable entry instead of an empty result.
+pub(super) fn snapshots_for_report(
+    state_dir: &Path,
+    repo: Option<&str>,
+) -> Result<Vec<Value>, String> {
+    let dir = state_dir.join(DIR);
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .map_err(|error| format!("{}: {error}", dir.display()))?
+        .map(|entry| {
+            entry
+                .map(|entry| entry.path())
+                .map_err(|error| format!("{}: {error}", dir.display()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    paths.retain(|path| path.extension().is_some_and(|ext| ext == "json"));
+    paths.sort();
+    paths
+        .into_iter()
+        .map(|path| {
+            let text = std::fs::read_to_string(&path)
+                .map_err(|error| format!("{}: {error}", path.display()))?;
+            let value = serde_json::from_str::<Value>(&text)
+                .map_err(|error| format!("{}: {error}", path.display()))?;
+            Ok(value)
+        })
+        .filter(|result| match result {
+            Ok(value) => repo.is_none_or(|repo| {
+                value
+                    .get("repo")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| name.eq_ignore_ascii_case(repo))
+            }),
+            Err(_) => true,
         })
         .collect()
 }
@@ -292,5 +330,22 @@ mod tests {
                 .unwrap()
                 .contains("no steward dwell snapshot for owner/repo")
         );
+    }
+
+    #[test]
+    fn report_snapshot_reader_preserves_missing_directory_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let error = snapshots_for_report(temp.path(), None).unwrap_err();
+        assert!(error.contains("steward-dwell"), "{error}");
+    }
+
+    #[test]
+    fn report_snapshot_reader_preserves_malformed_file_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join(DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("broken.json"), "{").unwrap();
+        let error = snapshots_for_report(temp.path(), None).unwrap_err();
+        assert!(error.contains("broken.json"), "{error}");
     }
 }

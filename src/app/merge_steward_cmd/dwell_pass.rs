@@ -65,6 +65,8 @@ pub(super) struct DwellRepoReport {
     pub overdue: Vec<OverdueRecord>,
     /// The closest to mergeable, with the single thing each needs.
     pub next_to_admit: Vec<Ranked>,
+    /// Compact census for read-only fleet reporting, including rows outside the top five.
+    pub fleet_rows: Vec<Value>,
     /// Every ranked pull request, closest first: the order the next pass
     /// evaluates admission candidates in.
     pub ranking: Vec<u64>,
@@ -300,12 +302,52 @@ pub(super) fn run(
     );
     report.tracked = state.entries.len();
 
-    let ranked = next_admit::rank(&rank_inputs(input, reports, &state));
+    let rank_inputs = rank_inputs(input, reports, &state);
+    let ranked = next_admit::rank(&rank_inputs);
     report.ranking = ranked.iter().map(|row| row.number).collect();
     report.next_to_admit = ranked
         .iter()
         .take(next_admit::NEXT_LISTED)
         .cloned()
+        .collect();
+    let ranked_by_number: BTreeMap<u64, &Ranked> =
+        ranked.iter().map(|row| (row.number, row)).collect();
+    let inputs_by_number: BTreeMap<u64, &RankInput> =
+        rank_inputs.iter().map(|row| (row.number, row)).collect();
+    let reports_by_number: BTreeMap<u64, &PrReport> =
+        reports.iter().map(|row| (row.number, row)).collect();
+    report.fleet_rows = observation
+        .prs
+        .iter()
+        .map(|pr| {
+            let number = pr.fact.number;
+            let report_row = reports_by_number.get(&number);
+            let ranked_row = ranked_by_number.get(&number);
+            let rank_input = inputs_by_number.get(&number);
+            let blocked_on = report_row.map_or("unknown", |row| row.blocked.blocked_on.as_str());
+            let next = report_row.and_then(|row| row.blocked.next_action.as_ref());
+            let age_minutes = state
+                .entries
+                .get(&number)
+                .map(|entry| entry.entered_at)
+                .or_else(|| report_row.and_then(|row| row.blocked.since.as_deref())
+                    .and_then(|since| DateTime::parse_from_rfc3339(since).ok())
+                    .map(|since| since.with_timezone(&Utc)))
+                .map(|since| (input.now - since).num_minutes().max(0));
+            serde_json::json!({
+                "number": number,
+                "blocked_on": blocked_on,
+                "owner": pr.owner.as_deref().or(pr.fact.author.as_deref()),
+                "age_minutes": age_minutes,
+                "state": state.entries.get(&number).map(|entry| entry.state),
+                "next_action": next,
+                "tier": ranked_row.map(|row| row.tier),
+                "approved_green": rank_input.is_some_and(|row| row.approved && row.others == OthersState::Green && !row.blocked_hard),
+                "red": rank_input.is_some_and(|row| row.others == OthersState::Red),
+                "actor": next.map(|action| action.actor.as_str())
+                    .or_else(|| ranked_row.map(|row| row.actor.as_str())),
+            })
+        })
         .collect();
     state.admission_rank.clone_from(&report.ranking);
 
@@ -1036,6 +1078,7 @@ pub(super) fn write_snapshot(
         "tracked": report.tracked,
         "overdue": report.overdue,
         "next_to_admit": report.next_to_admit,
+        "fleet_rows": report.fleet_rows,
         "ranking": report.ranking,
         "stack_listing": report.stack_listing,
         "api_calls": api_calls.map_or(Value::Null, |api| serde_json::json!({
