@@ -128,12 +128,15 @@ where
     let mut next_seen = seen.clone();
     let mut new_rows = Vec::new();
     let prefix = format!("{}:", repo.to_ascii_lowercase());
+    for row in rows {
+        if !seen.contains(&row.key()) {
+            new_rows.push(row.clone());
+        }
+        next_seen.insert(row.key());
+    }
     for condition in successful_conditions {
         next_seen.retain(|key| !key.ends_with(condition) || !key.starts_with(&prefix));
         for row in rows.iter().filter(|row| row.condition == *condition) {
-            if !seen.contains(&row.key()) {
-                new_rows.push(row.clone());
-            }
             next_seen.insert(row.key());
         }
     }
@@ -148,23 +151,14 @@ fn online_labels_or_unknown(
     diagnostics: &mut Vec<String>,
 ) -> Option<BTreeSet<String>> {
     match actions.repository_runners_raw(repo) {
-        Ok(mut raw) => {
+        Ok(raw) => {
             let owner = repo.split_once('/').map_or(repo, |(owner, _)| owner);
             match actions.organization_runners_raw(owner) {
                 Ok(org_raw) => {
                     if org_raw
                         .get("runners")
                         .and_then(Value::as_array)
-                        .is_some_and(|runners| {
-                            runners.iter().any(|runner| {
-                                runner
-                                    .get("runner_group_id")
-                                    .is_some_and(|group| !group.is_null())
-                                    || runner
-                                        .get("runner_group_name")
-                                        .is_some_and(|group| !group.is_null())
-                            })
-                        })
+                        .is_some_and(|runners| !runners.is_empty())
                     {
                         diagnostics.push(
                             "ci_queued_forever runners unknown: organization runner-group repository eligibility unavailable"
@@ -172,15 +166,6 @@ fn online_labels_or_unknown(
                         );
                         return None;
                     }
-                    let mut runners = raw
-                        .get_mut("runners")
-                        .and_then(Value::as_array_mut)
-                        .cloned()
-                        .unwrap_or_default();
-                    if let Some(org_runners) = org_raw.get("runners").and_then(Value::as_array) {
-                        runners.extend(org_runners.iter().cloned());
-                    }
-                    raw = serde_json::json!({"runners": runners});
                 }
                 Err(error)
                     if crate::head_approval::gh_error_http_status(error.message()) == Some(404) =>
@@ -470,9 +455,36 @@ mod tests {
         assert!(seen.contains("acme/repo:ci_queued_forever"));
     }
 
+    #[test]
+    fn positive_condition_is_recorded_despite_partial_probe_error() {
+        let mut seen = BTreeSet::from(["acme/repo:ci_queued_forever".to_owned()]);
+        let rows = vec![CiHealthOverdue {
+            kind: "overdue",
+            condition: "ci_billing_blocked",
+            repo: "acme/repo".to_owned(),
+            detail: "recent account payments have failed or spending limit".to_owned(),
+            at: Utc::now(),
+        }];
+        let appended = std::cell::Cell::new(0);
+        commit_seen_after_feed(
+            &mut seen,
+            "acme/repo",
+            &rows,
+            &BTreeSet::new(),
+            |new_rows| {
+                appended.set(new_rows.len());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(appended.get(), 1);
+        assert!(seen.contains("acme/repo:ci_billing_blocked"));
+        assert!(seen.contains("acme/repo:ci_queued_forever"));
+    }
+
     #[cfg(unix)]
     #[test]
-    fn organization_inventory_paginates_and_prevents_false_unserved_alert() {
+    fn organization_inventory_paginates_and_preserves_unknown_eligibility() {
         let temp = tempfile::tempdir().unwrap();
         let gh = temp.path().join("gh");
         let page_one = serde_json::to_string(&serde_json::json!({
@@ -498,20 +510,12 @@ mod tests {
         crate::test_support::write_executable_script(&gh, &script);
         let actions = GitHubActions::hermetic_for_tests(temp.path(), &gh);
         let mut diagnostics = Vec::new();
-        let online = online_labels_or_unknown(&actions, "acme/repo", &mut diagnostics)
-            .expect("organization inventory should be complete");
-        assert!(diagnostics.is_empty(), "{diagnostics:?}");
-        assert!(online.contains("org-only"));
-
-        let now = DateTime::parse_from_rfc3339("2026-11-18T12:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        assert!(!queued_job_is_forever_queued(
-            "2026-11-18T00:00:00Z",
-            &["self-hosted".into(), "org-only".into()],
-            &online,
-            now
-        ));
+        assert!(online_labels_or_unknown(&actions, "acme/repo", &mut diagnostics).is_none());
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("repository eligibility unavailable"))
+        );
     }
 
     #[cfg(unix)]
@@ -573,8 +577,8 @@ mod tests {
 set -eu
 case "$*" in
   *"actions/runs?status=completed&per_page=1&branch=main") printf '%s' '{"workflow_runs":[]}';;
-  *"actions/runners?per_page=100") printf '%s' '{"runners":[{"status":"online","labels":[{"name":"linux"}]}]}';;
   *"orgs/acme/actions/runners?per_page=100") echo 'gh: Not Found (HTTP 404)' >&2; exit 1;;
+  *"repos/acme/repo/actions/runners?per_page=100") printf '%s' '{"runners":[{"status":"online","labels":[{"name":"linux"}]}]}';;
   *"repos/acme/repo" ) printf '%s' '{"owner":{"type":"User"}}';;
   *"actions/runs?status=queued&per_page=5") printf '%s' '{"workflow_runs":[]}';;
   *"actions/runs?status=in_progress&per_page=5") printf '%s' '{"workflow_runs":[{"id":42,"name":"CI","head_branch":"main","event":"push","created_at":"2026-11-18T00:00:00Z"}]}';;
@@ -605,8 +609,8 @@ case "$*" in
   *"actions/runs/7/jobs?per_page=100") printf '%s' '{"jobs":[{"id":1,"check_run_url":"https://api.github.com/repos/acme/repo/check-runs/101","conclusion":"failure"},{"id":2,"check_run_url":"https://api.github.com/repos/acme/repo/check-runs/202","conclusion":"failure"}]}';;
   *"check-runs/101/annotations") printf '%s' '[]';;
   *"check-runs/202/annotations") printf '%s' '[{"message":"spending limit reached"}]';;
-  *"actions/runners?per_page=100") printf '%s' '{"runners":[{"status":"online","labels":[{"name":"linux"}]}]}';;
   *"orgs/acme/actions/runners?per_page=100") echo 'gh: Not Found (HTTP 404)' >&2; exit 1;;
+  *"repos/acme/repo/actions/runners?per_page=100") printf '%s' '{"runners":[{"status":"online","labels":[{"name":"linux"}]}]}';;
   *"repos/acme/repo") printf '%s' '{"owner":{"type":"User"}}';;
   *"actions/runs?status=queued&per_page=5") printf '%s' '{"workflow_runs":[]}';;
   *"actions/runs?status=in_progress&per_page=5") printf '%s' '{"workflow_runs":[]}';;
