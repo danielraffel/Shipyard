@@ -1721,7 +1721,6 @@ fn record_ci_health(
     ci_errors: &[String],
     apply: bool,
     probe_due: bool,
-    probe_key: &str,
 ) -> bool {
     let successful_conditions: BTreeSet<&'static str> = ["ci_billing_blocked", "ci_queued_forever"]
         .into_iter()
@@ -1750,9 +1749,8 @@ fn record_ci_health(
             report.ci_health_diagnostics.push(error);
             return false;
         }
-        ledger
-            .ci_health_probed
-            .insert(probe_key.to_owned(), Utc::now());
+        let probe_key = repo.to_ascii_lowercase();
+        ledger.ci_health_probed.insert(probe_key, Utc::now());
     }
     true
 }
@@ -1819,7 +1817,6 @@ fn steward_repo_observed(
                 &ci_errors,
                 args.apply,
                 probe_due,
-                &probe_key,
             );
             if let Some(errors) = recovery_errors.remove(&observation.repo) {
                 report.errors.extend(errors);

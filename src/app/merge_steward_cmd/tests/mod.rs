@@ -279,7 +279,6 @@ fn an_unknown_ci_health_probe_is_a_diagnostic_not_a_repo_error() {
         &["ci_queued_forever runners unknown: HTTP 403".to_owned()],
         true,
         true,
-        "o/r",
     );
     assert!(report.errors.is_empty(), "{:?}", report.errors);
     assert_eq!(report.ci_health_diagnostics.len(), 1);
@@ -310,7 +309,6 @@ fn ci_health_probe_timestamp_waits_for_feed_commit() {
         &[],
         true,
         true,
-        "o/r",
     ));
     assert!(ledger.ci_health_probed.is_empty());
     assert!(ledger.ci_health_seen.is_empty());
