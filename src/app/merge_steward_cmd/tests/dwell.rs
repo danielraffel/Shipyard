@@ -759,6 +759,27 @@ fn a_base_stalled_alarm_reads_the_completed_run_census_once_and_names_the_job() 
 }
 
 #[test]
+fn base_stalled_report_records_when_the_detector_is_disabled() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut pass = pass(
+        &temp,
+        vec![pr(1, Some("SUCCESS"), Some("SUCCESS"), &[])],
+        vec![report(1, "merge_state:UNSTABLE", None)],
+    );
+    pass.dwell_policy.limits.insert(DwellState::BaseStalled, 0);
+    pass.observation.base_sha = Some("a".repeat(40));
+    let mut ledger = established();
+    let report = pass.run(&mut ledger, &FakeActs::default());
+    assert_eq!(report.base_stalled_enabled, Some(false));
+    assert!(
+        report
+            .overdue
+            .iter()
+            .all(|row| { row.state != crate::merge_steward::dwell::DwellState::BaseStalled })
+    );
+}
+
+#[test]
 fn retarget_requires_the_parent_to_have_merged_the_exact_branch_into_the_base() {
     let stacked = stacked(20, "branch-7", 7);
     let live = json!({"state": "open", "base": {"ref": "branch-7"},

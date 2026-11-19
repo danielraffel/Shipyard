@@ -85,6 +85,11 @@ pub(super) struct DwellRepoReport {
     /// `base_observed`, the proof that none is waiting on the base.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_eligible: Option<usize>,
+    /// Whether the base-stalled detector was enabled for this fresh policy
+    /// observation. `Some(false)` is affirmative evidence that a prior alarm
+    /// should be cleared; `None` means an older report did not record it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_stalled_enabled: Option<bool>,
     /// Why the base config could not be read (the defaults applied).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy_read_error: Option<String>,
@@ -296,6 +301,7 @@ pub(super) fn run(
         policy_read_error: input.dwell_policy.read_error.clone(),
         ..DwellRepoReport::default()
     };
+    report.base_stalled_enabled = Some(input.dwell_policy.limit(DwellState::BaseStalled).is_some());
     let stacked = input
         .listing
         .map(|listing| stacked_on_merged_base(listing, observation))

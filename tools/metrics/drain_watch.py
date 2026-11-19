@@ -239,6 +239,8 @@ def recent_ticks(log_dir, now, span):
             rows["_base_observed"] = bo if isinstance(bo, str) and bo else None
             be = dwell.get("base_eligible")
             rows["_base_eligible"] = be if isinstance(be, int) and not isinstance(be, bool) else None
+            enabled = dwell.get("base_stalled_enabled")
+            rows["_base_enabled"] = enabled if isinstance(enabled, bool) else None
             per_repo.setdefault(r["repo"], []).append((t, rows))
     for v in per_repo.values():
         v.sort(key=lambda x: x[0])
@@ -643,6 +645,11 @@ def collect(a, now, state):
         # head with an explicit empty eligible set. Anything less keeps it.
         observed = rows.get("_base_observed")
         head = key.split("@", 1)[1]
+        # A fresh report explicitly records that the detector is disabled. This
+        # is affirmative clear evidence even when eligible PRs remain present;
+        # without it, the old issue would stay open forever after config=0.
+        if rows.get("_base_enabled") is False:
+            continue
         moved = observed is not None and observed != head
         none_waiting = observed == head and rows.get("_base_eligible") == 0
         if not (moved or none_waiting):
