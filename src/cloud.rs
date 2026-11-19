@@ -894,12 +894,33 @@ impl GitHubActions {
         repository: &str,
         check_run_id: u64,
     ) -> Result<Value, GitHubError> {
-        let stdout = self.run_gh(&[
-            "api".to_owned(),
-            format!("repos/{repository}/check-runs/{check_run_id}/annotations"),
-        ])?;
-        serde_json::from_str(&stdout)
-            .map_err(|error| GitHubError::new(format!("annotations JSON malformed: {error}")))
+        const PAGE_SIZE: usize = 30;
+        const MAX_PAGES: usize = 10;
+        let mut annotations = Vec::new();
+        for page in 1..=MAX_PAGES {
+            let query = if page == 1 {
+                format!(
+                    "repos/{repository}/check-runs/{check_run_id}/annotations?per_page={PAGE_SIZE}"
+                )
+            } else {
+                format!(
+                    "repos/{repository}/check-runs/{check_run_id}/annotations?per_page={PAGE_SIZE}&page={page}"
+                )
+            };
+            let stdout = self.run_gh(&["api".to_owned(), query])?;
+            let value: Value = serde_json::from_str(&stdout).map_err(|error| {
+                GitHubError::new(format!("annotations JSON malformed: {error}"))
+            })?;
+            let page_annotations = value
+                .as_array()
+                .ok_or_else(|| GitHubError::new("annotations JSON is not an array"))?;
+            let count = page_annotations.len();
+            annotations.extend(page_annotations.iter().cloned());
+            if count < PAGE_SIZE {
+                return Ok(Value::Array(annotations));
+            }
+        }
+        Err(GitHubError::new("annotations exceeded 10 pages"))
     }
 
     fn runners_raw_paginated(&self, path: &str) -> Result<Value, GitHubError> {
@@ -2948,6 +2969,30 @@ exit 2
             .workflow_run_jobs_raw("acme/repo", 42)
             .expect("paginated jobs");
         assert_eq!(jobs["jobs"].as_array().expect("jobs array").len(), 101);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_run_annotations_paginates_beyond_thirty_annotations() {
+        let temp = TempDir::new().expect("temp");
+        let gh = temp.path().join("gh");
+        let page_one = serde_json::json!(
+            (0..30)
+                .map(|index| serde_json::json!({"message": format!("annotation-{index}")}))
+                .collect::<Vec<_>>()
+        )
+        .to_string();
+        let page_two = serde_json::json!([{"message": "spending limit reached"}]).to_string();
+        let script = format!(
+            "#!/bin/sh\nset -eu\ncase \"$*\" in\n  *\"check-runs/9/annotations?per_page=30&page=2\") printf '%s' '{page_two}';;\n  *\"check-runs/9/annotations?per_page=30\") printf '%s' '{page_one}';;\n  *) echo \"unexpected args: $*\" >&2; exit 1;;\nesac\n"
+        );
+        write_executable(&gh, &script);
+        let client = GitHubActions::hermetic_for_tests(temp.path(), &gh);
+        let annotations = client
+            .check_run_annotations_raw("acme/repo", 9)
+            .expect("paginated annotations");
+        assert_eq!(annotations.as_array().expect("annotation array").len(), 31);
+        assert_eq!(annotations[30]["message"], "spending limit reached");
     }
 
     #[cfg(unix)]

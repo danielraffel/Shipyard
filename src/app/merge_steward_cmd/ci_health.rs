@@ -64,10 +64,25 @@ pub(super) fn annotation_is_billing_blocked(annotation: &Value) -> bool {
         })
 }
 
+#[cfg(test)]
 pub(super) fn queued_job_is_forever_queued(
     queued_at: &str,
     labels: &[String],
     online_labels: &std::collections::BTreeSet<String>,
+    now: DateTime<Utc>,
+) -> bool {
+    let runner_sets = if online_labels.is_empty() {
+        &[][..]
+    } else {
+        std::slice::from_ref(online_labels)
+    };
+    queued_job_is_forever_queued_on_runners(queued_at, labels, runner_sets, now)
+}
+
+fn queued_job_is_forever_queued_on_runners(
+    queued_at: &str,
+    labels: &[String],
+    online_runners: &[BTreeSet<String>],
     now: DateTime<Utc>,
 ) -> bool {
     let Ok(queued_at) = DateTime::parse_from_rfc3339(queued_at) else {
@@ -83,7 +98,7 @@ pub(super) fn queued_job_is_forever_queued(
     {
         return false;
     }
-    let mut constrained_labels = labels
+    let constrained_labels = labels
         .iter()
         .filter(|label| !label.eq_ignore_ascii_case("self-hosted"));
     if labels
@@ -93,27 +108,29 @@ pub(super) fn queued_job_is_forever_queued(
         // A bare `runs-on: self-hosted` job can use any online runner. It is
         // overdue only when the successfully read inventory has no eligible
         // runner at all.
-        return online_labels.is_empty();
+        return online_runners.is_empty();
     }
-    constrained_labels.any(|label| !online_labels.contains(&label.to_ascii_lowercase()))
+    online_runners.iter().all(|runner| {
+        !constrained_labels
+            .clone()
+            .all(|label| runner.contains(&label.to_ascii_lowercase()))
+    })
 }
 
-fn online_runner_labels(raw: &Value) -> Option<BTreeSet<String>> {
+fn online_runner_label_sets(raw: &Value) -> Option<Vec<BTreeSet<String>>> {
     let runners = raw.get("runners")?.as_array()?;
-    let labels = runners
+    runners
         .iter()
         .filter(|runner| runner.get("status").and_then(Value::as_str) == Some("online"))
-        .flat_map(|runner| {
+        .map(|runner| {
             runner
-                .get("labels")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
+                .get("labels")?
+                .as_array()?
+                .iter()
+                .map(|label| label.get("name")?.as_str().map(str::to_ascii_lowercase))
+                .collect::<Option<BTreeSet<_>>>()
         })
-        .filter_map(|label| label.get("name")?.as_str())
-        .map(str::to_ascii_lowercase)
-        .collect::<BTreeSet<_>>();
-    Some(labels)
+        .collect()
 }
 
 /// Commit condition state only after the overdue feed has been written.
@@ -153,7 +170,7 @@ fn online_labels_or_unknown(
     actions: &GitHubActions,
     repo: &str,
     diagnostics: &mut Vec<String>,
-) -> Option<BTreeSet<String>> {
+) -> Option<Vec<BTreeSet<String>>> {
     match actions.repository_runners_raw(repo) {
         Ok(raw) => {
             let owner = repo.split_once('/').map_or(repo, |(owner, _)| owner);
@@ -203,7 +220,7 @@ fn online_labels_or_unknown(
                     return None;
                 }
             }
-            if let Some(labels) = online_runner_labels(&raw) {
+            if let Some(labels) = online_runner_label_sets(&raw) {
                 Some(labels)
             } else {
                 diagnostics
@@ -352,7 +369,7 @@ fn probe_queued(
                 errors.push("ci_queued_forever jobs: queued job has invalid created_at".to_owned());
                 continue;
             }
-            if queued_job_is_forever_queued(queued_at, &labels, &online_labels, now) {
+            if queued_job_is_forever_queued_on_runners(queued_at, &labels, &online_labels, now) {
                 return Some(CiHealthOverdue {
                     kind: "overdue",
                     condition: "ci_queued_forever",
@@ -427,6 +444,22 @@ mod tests {
             &served,
             now
         ));
+        let split_runner_labels = vec![
+            BTreeSet::from(["linux".to_owned(), "arm64".to_owned()]),
+            BTreeSet::from(["macos".to_owned(), "x64".to_owned()]),
+        ];
+        assert!(queued_job_is_forever_queued_on_runners(
+            "2026-11-18T05:00:00Z",
+            &["self-hosted".into(), "macos".into(), "arm64".into()],
+            &split_runner_labels,
+            now
+        ));
+        assert!(!queued_job_is_forever_queued_on_runners(
+            "2026-11-18T05:00:00Z",
+            &["self-hosted".into(), "macos".into(), "x64".into()],
+            &split_runner_labels,
+            now
+        ));
         assert!(!queued_job_is_forever_queued(
             "2026-11-18T05:00:00Z",
             &["self-hosted".into(), "linux".into()],
@@ -455,14 +488,14 @@ mod tests {
             now
         ));
         assert_eq!(
-            online_runner_labels(&serde_json::json!({"runners": []})),
-            Some(BTreeSet::new())
+            online_runner_label_sets(&serde_json::json!({"runners": []})),
+            Some(Vec::new())
         );
         assert_eq!(
-            online_runner_labels(&serde_json::json!({
+            online_runner_label_sets(&serde_json::json!({
                 "runners": [{"status": "online", "labels": [{"name": "Retired"}]}]
             })),
-            Some(BTreeSet::from(["retired".to_owned()]))
+            Some(vec![BTreeSet::from(["retired".to_owned()])])
         );
     }
 
@@ -654,7 +687,7 @@ mod tests {
         let online = online_labels_or_unknown(&actions, "acme/repo", &mut diagnostics)
             .expect("personal repository should use repository inventory");
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
-        assert!(online.contains("personal-only"));
+        assert!(online[0].contains("personal-only"));
     }
 
     #[cfg(unix)]
@@ -697,8 +730,8 @@ case "$*" in
   *"actions/runs?status=completed&per_page=5&branch=main") printf '%s' '{"workflow_runs":[{"id":8,"name":"Hosted","head_branch":"main","event":"push","created_at":"2026-11-18T11:00:00Z"},{"id":7,"name":"Self-hosted","head_branch":"main","event":"push","created_at":"2026-11-18T00:00:00Z"}]}';;
   *"actions/runs/8/jobs?per_page=100") printf '%s' '{"jobs":[]}';;
   *"actions/runs/7/jobs?per_page=100") printf '%s' '{"jobs":[{"id":1,"check_run_url":"https://api.github.com/repos/acme/repo/check-runs/101","conclusion":"failure"},{"id":2,"check_run_url":"https://api.github.com/repos/acme/repo/check-runs/202","conclusion":"failure"}]}';;
-  *"check-runs/101/annotations") printf '%s' '[]';;
-  *"check-runs/202/annotations") printf '%s' '[{"message":"spending limit reached"}]';;
+  *"check-runs/101/annotations?per_page=30") printf '%s' '[]';;
+  *"check-runs/202/annotations?per_page=30") printf '%s' '[{"message":"spending limit reached"}]';;
   *"orgs/acme/actions/runners?per_page=100") echo 'gh: Not Found (HTTP 404)' >&2; exit 1;;
   *"repos/acme/repo/actions/runners?per_page=100") printf '%s' '{"runners":[{"status":"online","labels":[{"name":"linux"}]}]}';;
   *"repos/acme/repo") printf '%s' '{"owner":{"type":"User"}}';;
