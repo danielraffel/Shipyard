@@ -122,18 +122,25 @@ fn online_runner_label_sets(raw: &Value) -> Option<Vec<BTreeSet<String>>> {
     if runners.is_empty() {
         return None;
     }
-    runners
-        .iter()
-        .filter(|runner| runner.get("status").and_then(Value::as_str) == Some("online"))
-        .map(|runner| {
-            runner
-                .get("labels")?
-                .as_array()?
-                .iter()
-                .map(|label| label.get("name")?.as_str().map(str::to_ascii_lowercase))
-                .collect::<Option<BTreeSet<_>>>()
-        })
-        .collect()
+    let mut online = Vec::new();
+    for runner in runners {
+        let status = runner.get("status").and_then(Value::as_str)?;
+        let is_online = match status {
+            "online" => true,
+            "offline" => false,
+            _ => return None,
+        };
+        let labels = runner
+            .get("labels")?
+            .as_array()?
+            .iter()
+            .map(|label| label.get("name")?.as_str().map(str::to_ascii_lowercase))
+            .collect::<Option<BTreeSet<_>>>()?;
+        if is_online {
+            online.push(labels);
+        }
+    }
+    Some(online)
 }
 
 /// Commit condition state only after the overdue feed has been written.
@@ -499,6 +506,12 @@ mod tests {
                 "runners": [{"status": "offline", "labels": [{"name": "Retired"}]}]
             })),
             Some(Vec::new())
+        );
+        assert_eq!(
+            online_runner_label_sets(&serde_json::json!({
+                "runners": [{"status": "unknown", "labels": []}]
+            })),
+            None
         );
         assert!(queued_job_is_forever_queued_on_runners(
             old,
