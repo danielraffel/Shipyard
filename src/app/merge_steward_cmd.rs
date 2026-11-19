@@ -231,6 +231,12 @@ struct RepoReport {
     /// was healthy, so a non-zero exit with empty `errors` is explained here.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     exit_reasons: Vec<String>,
+    /// Per-repository CI-health overdue rows (one row per condition).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    ci_health: Vec<ci_health::CiHealthOverdue>,
+    /// Advisory diagnostics from CI-health probes; these never make a repo unhealthy.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    ci_health_diagnostics: Vec<String>,
     /// Dwell-time limits, overdue pull requests and the next-to-admit
     /// ranking ([`dwell_pass`]). Absent when the repository was not observed.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -370,6 +376,12 @@ struct StewardLedger {
     /// root-cause issues. See `flake_requeue`.
     #[serde(default, skip_serializing_if = "flake_requeue::State::is_empty")]
     flake_requeue: flake_requeue::State,
+    /// CI-health conditions currently active, keyed by repository and condition.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    ci_health_seen: BTreeSet<String>,
+    /// When each repository was last probed (the probe runs every 30 min).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    ci_health_probed: BTreeMap<String, DateTime<Utc>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -639,6 +651,7 @@ pub(crate) use handoff::{
 };
 mod recovery;
 use recovery::{reconcile_management_label, reconcile_recovery_signal};
+mod ci_health;
 mod stale_pr_wedge;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1700,6 +1713,48 @@ fn exit_reasons(report: &RepoReport) -> Vec<String> {
     reasons
 }
 
+fn record_ci_health(
+    ledger_path: &Path,
+    ledger: &mut StewardLedger,
+    repo: &str,
+    report: &mut RepoReport,
+    ci_errors: &[String],
+    apply: bool,
+    probe_due: bool,
+) -> bool {
+    let successful_conditions: BTreeSet<&'static str> = ["ci_billing_blocked", "ci_queued_forever"]
+        .into_iter()
+        .filter(|condition| !ci_errors.iter().any(|error| error.starts_with(condition)))
+        .collect();
+    report
+        .ci_health_diagnostics
+        .extend(ci_errors.iter().cloned());
+    // Probe results are independent. A runner-inventory failure must not
+    // suppress a valid billing alert, and an overdue-feed write must succeed
+    // before the seen set records the condition.
+    if apply && probe_due {
+        let append_result = |rows: &[ci_health::CiHealthOverdue]| {
+            let state_dir = ledger_path
+                .parent()
+                .ok_or_else(|| "ci health overdue feed has no state directory".to_owned())?;
+            ci_health::append_feed(state_dir, rows)
+        };
+        if let Err(error) = ci_health::commit_seen_after_feed(
+            &mut ledger.ci_health_seen,
+            repo,
+            &report.ci_health,
+            &successful_conditions,
+            append_result,
+        ) {
+            report.ci_health_diagnostics.push(error);
+            return false;
+        }
+        let probe_key = repo.to_ascii_lowercase();
+        ledger.ci_health_probed.insert(probe_key, Utc::now());
+    }
+    true
+}
+
 /// [`steward_repo`] once `actions` is scoped to `repo` and counting its
 /// GitHub reads.
 #[allow(clippy::too_many_arguments)]
@@ -1742,6 +1797,26 @@ fn steward_repo_observed(
                 *remaining_preemptions,
                 mutation_control,
                 Some(global_dir),
+            );
+            let probe_key = repo.to_ascii_lowercase();
+            let probe_due = ledger.ci_health_probed.get(&probe_key).is_none_or(|at| {
+                Utc::now().signed_duration_since(*at).num_minutes()
+                    >= ci_health::PROBE_INTERVAL_MINUTES
+            });
+            let (ci_health, ci_errors) = if probe_due {
+                ci_health::probe(actions, repo, &args.base, Utc::now())
+            } else {
+                (Vec::new(), Vec::new())
+            };
+            report.ci_health = ci_health;
+            record_ci_health(
+                ledger_path,
+                ledger,
+                repo,
+                &mut report,
+                &ci_errors,
+                args.apply,
+                probe_due,
             );
             if let Some(errors) = recovery_errors.remove(&observation.repo) {
                 report.errors.extend(errors);
@@ -1865,6 +1940,8 @@ fn deferred_rate_limit_repo_report(
         api_calls: None,
         rate_limit_deferred: Some(cooldown),
         exit_reasons: Vec::new(),
+        ci_health: Vec::new(),
+        ci_health_diagnostics: Vec::new(),
         dwell: None,
         infra_rerun: None,
         red_everywhere: None,
@@ -1898,6 +1975,8 @@ fn unreadable_repo_report(
         errors: vec![error],
         rate_limit_deferred: None,
         exit_reasons: Vec::new(),
+        ci_health: Vec::new(),
+        ci_health_diagnostics: Vec::new(),
         dwell: None,
         infra_rerun: None,
         red_everywhere: None,
@@ -1981,6 +2060,8 @@ fn append_unmatched_recovery_errors(
             errors,
             rate_limit_deferred: None,
             exit_reasons: Vec::new(),
+            ci_health: Vec::new(),
+            ci_health_diagnostics: Vec::new(),
             dwell: None,
             infra_rerun: None,
             red_everywhere: None,
@@ -2024,6 +2105,8 @@ fn persist_final_ledger(
             errors: vec![message],
             rate_limit_deferred: None,
             exit_reasons: Vec::new(),
+            ci_health: Vec::new(),
+            ci_health_diagnostics: Vec::new(),
             dwell: None,
             infra_rerun: None,
             red_everywhere: None,

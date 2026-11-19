@@ -853,6 +853,130 @@ impl GitHubActions {
         parse_active_jobs(&stdout)
     }
 
+    /// Read the jobs for one workflow run, retaining the fields used by the
+    /// steward's bounded CI-health probes.
+    pub(crate) fn workflow_run_jobs_raw(
+        &self,
+        repository: &str,
+        run_id: u64,
+    ) -> Result<Value, GitHubError> {
+        const PAGE_SIZE: usize = 100;
+        const MAX_PAGES: usize = 10;
+        let mut jobs = Vec::new();
+        for page in 1..=MAX_PAGES {
+            let query = if page == 1 {
+                format!("repos/{repository}/actions/runs/{run_id}/jobs?per_page={PAGE_SIZE}")
+            } else {
+                format!(
+                    "repos/{repository}/actions/runs/{run_id}/jobs?per_page={PAGE_SIZE}&page={page}"
+                )
+            };
+            let stdout = self.run_gh(&["api".to_owned(), query])?;
+            let value: Value = serde_json::from_str(&stdout).map_err(|error| {
+                GitHubError::new(format!("workflow jobs JSON malformed: {error}"))
+            })?;
+            let page_jobs = value
+                .get("jobs")
+                .and_then(Value::as_array)
+                .ok_or_else(|| GitHubError::new("workflow jobs JSON missing jobs array"))?;
+            let count = page_jobs.len();
+            jobs.extend(page_jobs.iter().cloned());
+            if count < PAGE_SIZE {
+                return Ok(serde_json::json!({"jobs": jobs}));
+            }
+        }
+        Err(GitHubError::new("workflow jobs exceeded 10 pages"))
+    }
+
+    /// Read annotations for one failed check run.
+    pub(crate) fn check_run_annotations_raw(
+        &self,
+        repository: &str,
+        check_run_id: u64,
+    ) -> Result<Value, GitHubError> {
+        const PAGE_SIZE: usize = 30;
+        const MAX_PAGES: usize = 10;
+        let mut annotations = Vec::new();
+        for page in 1..=MAX_PAGES {
+            let query = if page == 1 {
+                format!(
+                    "repos/{repository}/check-runs/{check_run_id}/annotations?per_page={PAGE_SIZE}"
+                )
+            } else {
+                format!(
+                    "repos/{repository}/check-runs/{check_run_id}/annotations?per_page={PAGE_SIZE}&page={page}"
+                )
+            };
+            let stdout = self.run_gh(&["api".to_owned(), query])?;
+            let value: Value = serde_json::from_str(&stdout).map_err(|error| {
+                GitHubError::new(format!("annotations JSON malformed: {error}"))
+            })?;
+            let page_annotations = value
+                .as_array()
+                .ok_or_else(|| GitHubError::new("annotations JSON is not an array"))?;
+            let count = page_annotations.len();
+            annotations.extend(page_annotations.iter().cloned());
+            if count < PAGE_SIZE {
+                return Ok(Value::Array(annotations));
+            }
+        }
+        Err(GitHubError::new("annotations exceeded 10 pages"))
+    }
+
+    fn runners_raw_paginated(&self, path: &str) -> Result<Value, GitHubError> {
+        const PAGE_SIZE: usize = 100;
+        const MAX_PAGES: usize = 10;
+        let mut runners = Vec::new();
+        for page in 1..=MAX_PAGES {
+            let query = if page == 1 {
+                format!("{path}?per_page={PAGE_SIZE}")
+            } else {
+                format!("{path}?per_page={PAGE_SIZE}&page={page}")
+            };
+            let stdout = self.run_gh(&["api".to_owned(), query])?;
+            let value: Value = serde_json::from_str(&stdout)
+                .map_err(|error| GitHubError::new(format!("runners JSON malformed: {error}")))?;
+            let page_runners = value
+                .get("runners")
+                .and_then(Value::as_array)
+                .ok_or_else(|| GitHubError::new("runners JSON missing runners array"))?;
+            let count = page_runners.len();
+            runners.extend(page_runners.iter().cloned());
+            if count < PAGE_SIZE {
+                return Ok(serde_json::json!({"runners": runners}));
+            }
+        }
+        Err(GitHubError::new("runners inventory exceeded 10 pages"))
+    }
+
+    /// Read the repository's visible self-hosted runner inventory.
+    pub(crate) fn repository_runners_raw(&self, repository: &str) -> Result<Value, GitHubError> {
+        self.runners_raw_paginated(&format!("repos/{repository}/actions/runners"))
+    }
+
+    /// Return the GitHub account type that owns a repository (`User` or
+    /// `Organization`). This is used when an organization-scoped runner read
+    /// returns 404: only a confirmed personal repository may safely fall back
+    /// to repository-only inventory.
+    pub(crate) fn repository_owner_type(&self, repository: &str) -> Result<String, GitHubError> {
+        let stdout = self.run_gh(&["api".to_owned(), format!("repos/{repository}")])?;
+        let value: Value = serde_json::from_str(&stdout)
+            .map_err(|error| GitHubError::new(format!("repository JSON malformed: {error}")))?;
+        value
+            .pointer("/owner/type")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| GitHubError::new("repository JSON missing owner type"))
+    }
+
+    /// Read an organization's visible self-hosted runner inventory.
+    pub(crate) fn organization_runners_raw(
+        &self,
+        organization: &str,
+    ) -> Result<Value, GitHubError> {
+        self.runners_raw_paginated(&format!("orgs/{organization}/actions/runners"))
+    }
+
     /// Cancel a single workflow job.
     pub fn cancel_workflow_job(&self, repository: &str, job_id: u64) -> Result<(), GitHubError> {
         let args = vec![
@@ -2111,14 +2235,21 @@ pub fn parse_active_jobs(stdout: &str) -> Result<Vec<WorkflowJob>, GitHubError> 
 pub fn parse_queued_runs(stdout: &str) -> Result<Vec<QueuedRun>, GitHubError> {
     let value = serde_json::from_str::<Value>(stdout)
         .map_err(|error| GitHubError::new(format!("failed to parse gh runs JSON: {error}")))?;
-    let Some(runs) = value.get("workflow_runs").and_then(Value::as_array) else {
-        return Ok(Vec::new());
-    };
+    let runs = value
+        .get("workflow_runs")
+        .and_then(Value::as_array)
+        .ok_or_else(|| GitHubError::new("gh runs JSON missing workflow_runs array"))?;
     let mut out = Vec::new();
     for run in runs {
-        let Some(database_id) = run.get("id").and_then(Value::as_u64) else {
-            continue;
-        };
+        let database_id = run
+            .get("id")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| GitHubError::new("gh runs JSON has run without id"))?;
+        let created_at = run
+            .get("created_at")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| GitHubError::new("gh runs JSON has run without created_at"))?;
         let name = run
             .get("name")
             .and_then(Value::as_str)
@@ -2134,11 +2265,7 @@ pub fn parse_queued_runs(stdout: &str) -> Result<Vec<QueuedRun>, GitHubError> {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned();
-        let created_at = run
-            .get("created_at")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
+        let created_at = created_at.to_owned();
         let run_started_at = run
             .get("run_started_at")
             .and_then(Value::as_str)
@@ -2514,9 +2641,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        CloudDispatchOverrides, default_workflow_key, discover_workflows, parse_active_jobs,
-        parse_first_workflow_run, parse_matching_jobs, resolve_cloud_dispatch_plan,
-        resolve_cloud_dispatch_plan_with_overrides,
+        CloudDispatchOverrides, GitHubActions, default_workflow_key, discover_workflows,
+        parse_active_jobs, parse_first_workflow_run, parse_matching_jobs,
+        resolve_cloud_dispatch_plan, resolve_cloud_dispatch_plan_with_overrides,
     };
     use crate::config::{LoadedConfig, LocalOverlaySource};
 
@@ -2816,6 +2943,56 @@ exit 2
             .expect("fake gh");
         let log = std::fs::read_to_string(log).expect("log");
         assert_eq!(log, "ARGS=api repos/owner/repo\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workflow_run_jobs_paginates_beyond_one_hundred_jobs() {
+        let temp = TempDir::new().expect("tempdir");
+        let gh = temp.path().join("gh");
+        let page_one = serde_json::json!({
+            "jobs": (0..100)
+                .map(|id| serde_json::json!({"id": id, "conclusion": "success"}))
+                .collect::<Vec<_>>()
+        })
+        .to_string();
+        let page_two = serde_json::json!({
+            "jobs": [{"id": 100, "conclusion": "failure"}]
+        })
+        .to_string();
+        let script = format!(
+            "#!/bin/sh\nset -eu\ncase \"$*\" in\n  *\"runs/42/jobs?per_page=100&page=2\") printf '%s' '{page_two}';;\n  *\"runs/42/jobs?per_page=100\") printf '%s' '{page_one}';;\n  *) echo \"unexpected args: $*\" >&2; exit 1;;\nesac\n"
+        );
+        write_executable(&gh, &script);
+        let client = GitHubActions::hermetic_for_tests(temp.path(), &gh);
+        let jobs = client
+            .workflow_run_jobs_raw("acme/repo", 42)
+            .expect("paginated jobs");
+        assert_eq!(jobs["jobs"].as_array().expect("jobs array").len(), 101);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_run_annotations_paginates_beyond_thirty_annotations() {
+        let temp = TempDir::new().expect("temp");
+        let gh = temp.path().join("gh");
+        let page_one = serde_json::json!(
+            (0..30)
+                .map(|index| serde_json::json!({"message": format!("annotation-{index}")}))
+                .collect::<Vec<_>>()
+        )
+        .to_string();
+        let page_two = serde_json::json!([{"message": "spending limit reached"}]).to_string();
+        let script = format!(
+            "#!/bin/sh\nset -eu\ncase \"$*\" in\n  *\"check-runs/9/annotations?per_page=30&page=2\") printf '%s' '{page_two}';;\n  *\"check-runs/9/annotations?per_page=30\") printf '%s' '{page_one}';;\n  *) echo \"unexpected args: $*\" >&2; exit 1;;\nesac\n"
+        );
+        write_executable(&gh, &script);
+        let client = GitHubActions::hermetic_for_tests(temp.path(), &gh);
+        let annotations = client
+            .check_run_annotations_raw("acme/repo", 9)
+            .expect("paginated annotations");
+        assert_eq!(annotations.as_array().expect("annotation array").len(), 31);
+        assert_eq!(annotations[30]["message"], "spending limit reached");
     }
 
     #[cfg(unix)]

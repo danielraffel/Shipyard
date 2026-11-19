@@ -105,6 +105,17 @@ in the same pass, so a pass with no admission candidate holds stacked entries
 (`stack_listing: not_read_this_pass`) rather than reading GitHub again. Full
 reference: `docs/automated-draining.md`, "Dwell-time limits".
 
+### Per-repository CI-health overdue rows
+
+Each steward tick also probes the default branch for a billing-block annotation
+(`ci_billing_blocked`) and for queued jobs older than six hours targeting a
+self-hosted label with no visible online runner (`ci_queued_forever`). The
+probe is bounded and fail-soft: unreadable annotations, jobs, or runner
+inventory are logged and produce no alert; a runner inventory 403 is recorded
+as unknown. Active conditions are deduplicated by repository and condition,
+cleared when the next tick no longer sees them, and newly seen rows are added
+to the same steward overdue feed.
+
 ## Routine release-movement acts: `shipyard advance`
 
 Do not ask the owner, and do not hand-type `ghapp` writes, to release a hold

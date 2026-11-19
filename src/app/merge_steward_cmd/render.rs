@@ -95,6 +95,14 @@ pub(super) fn render_report<W: Write>(
             )
             .map_err(|error| io_failure(&error))?;
         }
+        for row in &repo.ci_health {
+            writeln!(stdout, "  overdue: {} {}", row.condition, row.detail)
+                .map_err(|error| io_failure(&error))?;
+        }
+        for diagnostic in &repo.ci_health_diagnostics {
+            writeln!(stdout, "  ci-health diagnostic: {diagnostic}")
+                .map_err(|error| io_failure(&error))?;
+        }
         writeln!(
             stdout,
             "  stale-pr-run-wedge policy={} candidates={} receipts={}",

@@ -582,6 +582,8 @@ pub(super) fn apply_repo_plan(
             api_calls: None,
             rate_limit_deferred: None,
             exit_reasons: Vec::new(),
+            ci_health: Vec::new(),
+            ci_health_diagnostics: Vec::new(),
             dwell: Some(dwell_report),
             infra_rerun: Some(infra_rerun_status),
             red_everywhere: Some(red_everywhere_status),
