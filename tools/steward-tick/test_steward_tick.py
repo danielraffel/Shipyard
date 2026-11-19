@@ -54,6 +54,34 @@ class StewardTickArchiveTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("fleet-report", (self.log_dir / "summary.log").read_text())
 
+    def test_fleet_report_publish_runs_after_steward_and_failure_is_non_fatal(self):
+        events = self.home / "fleet-report-events"
+        shipyard = self.home / ".local" / "bin" / "shipyard"
+        shipyard.write_text(
+            "#!/bin/bash\n"
+            "if [ \"$1\" = --version ]; then echo 'shipyard 1.0'; exit 0; fi\n"
+            "if [ \"$1\" = fleet-report ]; then\n"
+            f"  echo fleet-report >> '{events}'\n"
+            "  echo 'publish failed' >&2\n"
+            "  exit 7\n"
+            "fi\n"
+            f"echo steward >> '{events}'\n"
+            "printf '%s\\n' '{\"repos\":[]}'\n"
+        )
+        shipyard.chmod(0o755)
+
+        result = self.run_tick(
+            SHIPYARD_FLEET_REPORT_ISSUE="acme/repo#9",
+            SHIPYARD_FLEET_REPORT_TIMEOUT_S="5",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(events.read_text().splitlines()[:2], ["steward", "fleet-report"])
+        self.assertIn(
+            "fleet-report publish failed issue=acme/repo#9",
+            (self.log_dir / "summary.log").read_text(),
+        )
+        self.assertIn("publish failed", (self.log_dir / "fleet-report.err").read_text())
+
     def add_old_tick(self, name="old.json", days=5):
         path = self.log_dir / name
         path.write_text('{"blocked_on":"test"}\n')

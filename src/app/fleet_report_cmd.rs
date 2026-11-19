@@ -138,6 +138,7 @@ fn count_rows(rows: &[Value], overdue: &BTreeSet<u64>) -> Value {
     })
 }
 
+#[allow(clippy::too_many_lines)] // Keep the bounded report assembly in one auditable order.
 fn report_with_snapshot_source(
     snapshots: Vec<Value>,
     hosts_file: Option<&Path>,
@@ -355,8 +356,9 @@ fn markdown(data: &Value) -> String {
         }
         out.push('\n');
     }
-    out.push_str(&format!(
-        "## Summary\n\n{} repos; {} open; {} approved and green; {} waiting review; {} red; {} overdue.\n\nSnapshot source: {}\n\nSteward tick: {}\n\n",
+    let _ = writeln!(
+        out,
+        "## Summary\n\n{} repos; {} open; {} approved and green; {} waiting review; {} red; {} overdue.\n\nSnapshot source: {}\n\nSteward tick: {}\n",
         summary["repos"],
         summary["open"],
         summary["approved_green"],
@@ -365,7 +367,7 @@ fn markdown(data: &Value) -> String {
         summary["overdue"],
         source_line(&data["steward_snapshots"]),
         source_line(&data["steward_tick"])
-    ));
+    );
     out.push_str("## Owner actions\n\n");
     let owner = data["owner_actions"]
         .as_array()
@@ -429,7 +431,7 @@ fn parse_issue_target(target: &str) -> Result<(&str, u64), String> {
     let (repo, number) = target
         .rsplit_once('#')
         .ok_or_else(|| "issue must be OWNER/REPO#NUMBER".to_owned())?;
-    if repo.split('/').count() != 2 || repo.split('/').any(|part| part.is_empty()) {
+    if repo.split('/').count() != 2 || repo.split('/').any(str::is_empty) {
         return Err("issue must be OWNER/REPO#NUMBER".to_owned());
     }
     let number = number
@@ -470,6 +472,7 @@ fn publish_issue(
     Ok(true)
 }
 
+#[cfg(test)]
 pub(super) fn run<W: Write>(
     state_dir: &Path,
     format: &str,
@@ -488,6 +491,7 @@ pub(super) fn run<W: Write>(
     )
 }
 
+#[allow(clippy::too_many_arguments)] // CLI boundary keeps publication options explicit.
 pub(super) fn run_with_options<W: Write>(
     state_dir: &Path,
     format: &str,
@@ -522,6 +526,9 @@ pub(super) fn run_with_options<W: Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn fixture_snapshots_group_rows_and_owner_actions() {
@@ -603,13 +610,51 @@ mod tests {
             ),
         )
         .unwrap();
-        use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
         let actions = GitHubActions::hermetic_for_tests(temp.path(), &gh);
         assert!(!publish_issue(&actions, "o/r#7", "same", false).unwrap());
         assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 1);
         assert!(!publish_issue(&actions, "o/r#7", "changed", true).unwrap());
         assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publish_changed_body_patches_issue_and_reports_patch_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = temp.path().join("gh.log");
+        let mode = temp.path().join("mode");
+        let gh = temp.path().join("gh");
+        std::fs::write(&mode, "ok").unwrap();
+        std::fs::write(
+            &gh,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in\n  *'--method PATCH'*)\n    if [ \"$(cat '{}')\" = fail ]; then echo 'patch failed' >&2; exit 9; fi\n    printf '{{\"updated\":true}}'\n    ;;\n  *) printf '{{\"body\":\"old\"}}' ;;\nesac\n",
+                log.display(),
+                mode.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let actions = GitHubActions::hermetic_for_tests(temp.path(), &gh);
+
+        assert!(publish_issue(&actions, "o/r#7", "new", false).unwrap());
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            calls
+                .lines()
+                .any(|line| { line == "api repos/o/r/issues/7" })
+        );
+        assert!(
+            calls
+                .lines()
+                .any(|line| { line == "api --method PATCH repos/o/r/issues/7 -f body=new" })
+        );
+
+        std::fs::write(&mode, "fail").unwrap();
+        let error = publish_issue(&actions, "o/r#7", "newer", false).unwrap_err();
+        assert!(error.contains("PATCH repos/o/r/issues/7"));
+        assert!(error.contains("patch failed"));
     }
 
     #[test]
