@@ -1716,11 +1716,11 @@ pub(super) fn completed_merge_group_runs(
             Some(deadline) => fetch_run_jobs_before(actions, repo, run.id, deadline)?,
             None => fetch_run_jobs(actions, repo, run.id)?,
         };
-        if run.jobs.iter().any(|job| {
-            job.conclusion
-                .as_deref()
-                .is_some_and(|conclusion| !conclusion.eq_ignore_ascii_case("success"))
-        }) {
+        if run
+            .jobs
+            .iter()
+            .any(super::dwell_pass::is_failed_merge_group_job)
+        {
             runs.push(run);
             break;
         }

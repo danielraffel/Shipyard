@@ -31,8 +31,8 @@ use serde_json::Value;
 use super::carried_commits::OpenPr;
 use super::next_action::NextAction;
 use super::{
-    GitHubActions, MutationControl, ObservedPr, PrReport, RepoObservation, StewardLedger,
-    StewardPolicy, StewardPullRequest, StewardRun,
+    GitHubActions, MutationControl, ObservedPr, PrReport, RepoObservation, StewardJob,
+    StewardLedger, StewardPolicy, StewardPullRequest, StewardRun,
 };
 use crate::merge_steward::dwell::{
     self, ActKind, ActMode, ActRecord, Actable, Disposition, DwellPolicy, DwellRepoState,
@@ -537,7 +537,7 @@ pub(super) fn run(
     if let (Some(census), Some(since)) = (input.completed_merge_group_runs, census_since) {
         // Only an applying pass records the alert, which is what keeps the read
         // to once per incident; a shadow pass would repeat it every tick.
-        if input.apply && failed_job.is_none() {
+        if input.apply && escalations_left > 0 && failed_job.is_none() {
             let census_job = failed_merge_group_job(census(since).iter());
             if census_job.is_some() {
                 base_rows = dwell::track_base_stalled(
@@ -650,6 +650,31 @@ fn sightings(reports: &[PrReport], stacked: &[OpenPr]) -> (Vec<Sighting>, BTreeS
     (out, skipped)
 }
 
+pub(super) fn is_failed_merge_group_job(job: &StewardJob) -> bool {
+    job.conclusion.as_deref().is_some_and(|conclusion| {
+        ["failure", "timed_out", "startup_failure", "action_required"]
+            .iter()
+            .any(|failed| conclusion.eq_ignore_ascii_case(failed))
+    })
+}
+
+pub(super) fn failed_merge_group_job<'a>(
+    runs: impl Iterator<Item = &'a StewardRun>,
+) -> Option<String> {
+    runs.filter(|run| {
+        run.event.eq_ignore_ascii_case("merge_group")
+            && run.status.eq_ignore_ascii_case("completed")
+            && run.jobs.iter().any(is_failed_merge_group_job)
+    })
+    .max_by_key(|run| run.created_at.clone())
+    .and_then(|run| {
+        run.jobs
+            .iter()
+            .find(|job| is_failed_merge_group_job(job))
+            .map(|job| job.name.clone())
+    })
+}
+
 /// Pull requests this pass saw approved at their exact head with every
 /// required check green, and that it neither merged nor queued.
 ///
@@ -663,31 +688,6 @@ fn sightings(reports: &[PrReport], stacked: &[OpenPr]) -> (Vec<Sighting>, BTreeS
 /// carries, so a degraded steward that defers it every pass cannot keep the
 /// alarm silent; its `deferred_pass_budget` token is a placeholder, so the
 /// alert keeps the last real reason.
-pub(super) fn failed_merge_group_job<'a>(
-    runs: impl Iterator<Item = &'a StewardRun>,
-) -> Option<String> {
-    runs.filter(|run| {
-        run.event.eq_ignore_ascii_case("merge_group")
-            && run.status.eq_ignore_ascii_case("completed")
-            && run.jobs.iter().any(|job| {
-                job.conclusion
-                    .as_deref()
-                    .is_some_and(|c| !c.eq_ignore_ascii_case("success"))
-            })
-    })
-    .max_by_key(|run| run.created_at.clone())
-    .and_then(|run| {
-        run.jobs
-            .iter()
-            .find(|job| {
-                job.conclusion
-                    .as_deref()
-                    .is_some_and(|c| !c.eq_ignore_ascii_case("success"))
-            })
-            .map(|job| job.name.clone())
-    })
-}
-
 fn stuck_candidates(input: &DwellInput<'_>, reports: &[PrReport]) -> Vec<dwell::StuckCandidate> {
     eligible_candidates(input, reports, false)
 }

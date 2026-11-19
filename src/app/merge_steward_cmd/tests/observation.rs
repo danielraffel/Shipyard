@@ -61,6 +61,36 @@ fn completed_merge_group_query_uses_a_safe_utc_created_qualifier() {
     assert!(!query.contains('+'));
 }
 
+#[cfg(unix)]
+#[test]
+fn completed_census_skips_newer_nonfailed_run_and_finds_older_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let actions = fake_gh(
+        &temp,
+        r#"
+case "$*" in
+  *"actions/runs?event=merge_group"*) printf '%s' '{"workflow_runs":[{"id":2,"workflow_id":77,"run_attempt":1,"name":"Build","head_sha":"bbbb","head_branch":"gh-readonly-queue/main/pr-1-b","status":"completed","event":"merge_group","created_at":"2026-11-19T12:00:00Z"},{"id":1,"workflow_id":77,"run_attempt":1,"name":"Build","head_sha":"aaaa","head_branch":"gh-readonly-queue/main/pr-1-a","status":"completed","event":"merge_group","created_at":"2026-11-19T11:00:00Z"}]}' ;;
+  *"actions/runs/2/jobs"*) printf '%s' '{"jobs":[{"name":"optional","status":"completed","conclusion":"skipped"}]}' ;;
+  *"actions/runs/1/jobs"*) printf '%s' '{"jobs":[{"name":"macOS","status":"completed","conclusion":"failure"}]}' ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+    );
+    let since = DateTime::parse_from_rfc3339("2026-11-19T10:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let runs = crate::app::merge_steward_cmd::observation::completed_merge_group_runs(
+        &actions,
+        "owner/repo",
+        "main",
+        since,
+        None,
+    )
+    .unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].id, 1);
+}
+
 #[test]
 fn run_parser_requires_explicit_positive_attempt_identity() {
     let base = serde_json::json!({

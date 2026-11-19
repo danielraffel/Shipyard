@@ -710,6 +710,63 @@ fn failed_merge_group_run() -> StewardRun {
 }
 
 #[test]
+fn failed_job_ignores_skipped_jobs_and_newer_nonfailed_runs() {
+    let mut older = failed_merge_group_run();
+    let mut skipped = older.jobs[0].clone();
+    skipped.name = "skipped advisory".into();
+    skipped.conclusion = Some("skipped".into());
+    older.jobs.insert(0, skipped.clone());
+    let mut newer = older.clone();
+    newer.created_at = "2026-11-09T12:00:00Z".into();
+    newer.jobs = vec![skipped];
+    assert_eq!(
+        dwell_pass::failed_merge_group_job([&newer, &older].into_iter()).as_deref(),
+        Some("macOS merge gate")
+    );
+}
+
+#[test]
+fn quota_deferred_base_alarm_does_not_read_census_until_capacity() {
+    let temp = tempfile::tempdir().unwrap();
+    let reads = std::cell::Cell::new(0);
+    let census = |_| {
+        reads.set(reads.get() + 1);
+        vec![failed_merge_group_run()]
+    };
+    let mut queued = pr(1, Some("SUCCESS"), Some("SUCCESS"), &[]);
+    queued.fact.queue_position = Some(0);
+    let mut pass = pass(&temp, vec![queued], vec![report(1, "queued", None)]);
+    pass.observation.base_sha = Some("a".repeat(40));
+    pass.census = Some(&census);
+    pass.dwell_policy.max_escalations_per_pass = 0;
+    let mut ledger = established();
+    pass.run(&mut ledger, &FakeActs::default());
+    for minute in [61, 62] {
+        pass.now = now() + chrono::Duration::minutes(minute);
+        let report = pass.run(&mut ledger, &FakeActs::default());
+        assert!(
+            report
+                .overdue
+                .iter()
+                .any(|row| row.state == DwellState::BaseStalled && row.escalation_deferred)
+        );
+    }
+    assert_eq!(reads.get(), 0);
+    pass.dwell_policy.max_escalations_per_pass = 1;
+    pass.now = now() + chrono::Duration::minutes(63);
+    let report = pass.run(&mut ledger, &FakeActs::default());
+    assert!(
+        report
+            .overdue
+            .iter()
+            .any(|row| row.state == DwellState::BaseStalled
+                && row.escalated
+                && row.blocked_on == "base_stalled:macOS merge gate")
+    );
+    assert_eq!(reads.get(), 1);
+}
+
+#[test]
 fn queued_approved_green_pr_starts_and_escalates_base_stall() {
     let temp = tempfile::tempdir().unwrap();
     let mut queued = pr(1, Some("SUCCESS"), Some("SUCCESS"), &[]);
