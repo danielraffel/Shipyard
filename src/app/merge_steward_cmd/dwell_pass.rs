@@ -517,6 +517,7 @@ pub(super) fn run(
         .iter()
         .map(|candidate| dwell::BaseStalledCandidate {
             number: candidate.number,
+            head: candidate.head.clone(),
         })
         .collect();
     report.base_eligible = Some(eligible.len());

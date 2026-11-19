@@ -531,10 +531,22 @@ pub struct BaseStalled {
     pub first_seen: DateTime<Utc>,
     /// Oldest eligible pull request.
     pub oldest_pr: u64,
+    /// Continuously eligible PR heads and their first observed eligibility.
+    #[serde(default)]
+    pub eligible_since: BTreeMap<u64, BaseStalledEligibility>,
     /// Failed merge-group job, when already present in the census.
     pub failed_job: Option<String>,
     /// Whether the first escalation was emitted.
     pub alerted: bool,
+}
+
+/// A PR head and the first tick on which it was continuously eligible.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BaseStalledEligibility {
+    /// The exact eligible PR head.
+    pub head: String,
+    /// First observation of continuous eligibility at this head.
+    pub first_seen: DateTime<Utc>,
 }
 
 /// An eligible pull request supporting a base alarm.
@@ -542,6 +554,8 @@ pub struct BaseStalled {
 pub struct BaseStalledCandidate {
     /// Pull request number.
     pub number: u64,
+    /// Exact eligible head.
+    pub head: String,
 }
 
 /// Track one base head's unchanged interval and return its overdue row.
@@ -564,23 +578,47 @@ pub fn track_base_stalled(
     state
         .base_stalled
         .retain(|known_head, _| known_head.eq_ignore_ascii_case(head));
-    let oldest = eligible.iter().map(|c| c.number).min();
-    let Some(oldest_pr) = oldest else {
+    if eligible.is_empty() {
         // Nothing waiting on this base: the incident ended, so a later
         // candidate at the same head starts a fresh clock.
         state.base_stalled.clear();
         return Vec::new();
-    };
+    }
     let entry = state
         .base_stalled
         .entry(head.to_owned())
         .or_insert_with(|| BaseStalled {
             head: head.to_owned(),
             first_seen: now,
-            oldest_pr,
+            oldest_pr: 0,
+            eligible_since: BTreeMap::new(),
             failed_job: failed_job.clone(),
             alerted: false,
         });
+    entry
+        .eligible_since
+        .retain(|number, _| eligible.iter().any(|candidate| candidate.number == *number));
+    for candidate in eligible {
+        let observed = entry
+            .eligible_since
+            .entry(candidate.number)
+            .or_insert_with(|| BaseStalledEligibility {
+                head: candidate.head.clone(),
+                first_seen: now,
+            });
+        if !observed.head.eq_ignore_ascii_case(&candidate.head) {
+            *observed = BaseStalledEligibility {
+                head: candidate.head.clone(),
+                first_seen: now,
+            };
+        }
+    }
+    let oldest_pr = *entry
+        .eligible_since
+        .iter()
+        .min_by_key(|(number, observed)| (observed.first_seen, **number))
+        .expect("eligible is nonempty")
+        .0;
     entry.oldest_pr = oldest_pr;
     // Keep the last failing job seen for this base head: the completed-run
     // census is read once per incident, so later passes must not reset it.

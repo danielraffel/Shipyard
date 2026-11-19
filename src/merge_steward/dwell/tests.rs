@@ -1179,9 +1179,82 @@ fn an_older_stuck_entry_still_reads() {
 }
 
 #[test]
+fn base_stalled_names_longest_continuously_eligible_pr() {
+    let mut state = DwellRepoState::default();
+    let policy = DwellPolicy::default();
+    let first = [BaseStalledCandidate {
+        number: 100,
+        head: HEAD.to_owned(),
+    }];
+    track_base_stalled(&mut state, Some(HEAD), &first, None, &policy, now());
+    let both = [
+        BaseStalledCandidate {
+            number: 50,
+            head: HEAD.to_owned(),
+        },
+        BaseStalledCandidate {
+            number: 100,
+            head: HEAD.to_owned(),
+        },
+    ];
+    let rows = track_base_stalled(
+        &mut state,
+        Some(HEAD),
+        &both,
+        None,
+        &policy,
+        now() + chrono::Duration::minutes(61),
+    );
+    assert_eq!(rows[0].overdue.number, 100);
+    // State survives a restart; a new head starts a fresh eligibility interval.
+    let encoded = serde_json::to_string(&state).unwrap();
+    let mut restored: DwellRepoState = serde_json::from_str(&encoded).unwrap();
+    let changed = [
+        BaseStalledCandidate {
+            number: 50,
+            head: HEAD.to_owned(),
+        },
+        BaseStalledCandidate {
+            number: 100,
+            head: "new-head".to_owned(),
+        },
+    ];
+    let rows = track_base_stalled(
+        &mut restored,
+        Some(HEAD),
+        &changed,
+        None,
+        &policy,
+        now() + chrono::Duration::minutes(62),
+    );
+    assert_eq!(rows[0].overdue.number, 50);
+    // Leaving and rejoining resets eligibility too.
+    track_base_stalled(
+        &mut restored,
+        Some(HEAD),
+        &changed[1..],
+        None,
+        &policy,
+        now() + chrono::Duration::minutes(63),
+    );
+    let rows = track_base_stalled(
+        &mut restored,
+        Some(HEAD),
+        &changed,
+        None,
+        &policy,
+        now() + chrono::Duration::minutes(64),
+    );
+    assert_eq!(rows[0].overdue.number, 100);
+}
+
+#[test]
 fn base_stalled_is_quiet_under_bound_then_alerts_once() {
     let mut state = established();
-    let candidate = [BaseStalledCandidate { number: 7 }];
+    let candidate = [BaseStalledCandidate {
+        number: 7,
+        head: HEAD.to_owned(),
+    }];
     let policy = DwellPolicy::default();
     assert!(
         track_base_stalled(&mut state, Some(HEAD), &candidate, None, &policy, now()).is_empty()
@@ -1212,7 +1285,10 @@ fn base_stalled_is_quiet_under_bound_then_alerts_once() {
 #[test]
 fn base_stalled_rearms_only_after_head_change_and_zero_disables() {
     let mut state = established();
-    let candidate = [BaseStalledCandidate { number: 7 }];
+    let candidate = [BaseStalledCandidate {
+        number: 7,
+        head: HEAD.to_owned(),
+    }];
     let policy = DwellPolicy::default();
     track_base_stalled(&mut state, Some(HEAD), &candidate, None, &policy, now());
     track_base_stalled(
@@ -1251,7 +1327,10 @@ fn base_stalled_rearms_only_after_head_change_and_zero_disables() {
 #[test]
 fn base_stalled_disabled_keeps_no_clock_and_reenabling_starts_fresh() {
     let mut state = established();
-    let candidate = [BaseStalledCandidate { number: 7 }];
+    let candidate = [BaseStalledCandidate {
+        number: 7,
+        head: HEAD.to_owned(),
+    }];
     let off = DwellPolicy::from_table(&"[auto_merge.dwell]\nbase_stalled = 0".parse().unwrap());
     assert!(track_base_stalled(&mut state, Some(HEAD), &candidate, None, &off, now()).is_empty());
     assert!(state.base_stalled.is_empty());
@@ -1273,7 +1352,10 @@ fn base_stalled_disabled_keeps_no_clock_and_reenabling_starts_fresh() {
 #[test]
 fn base_stalled_clock_restarts_after_an_empty_eligible_observation() {
     let mut state = established();
-    let candidate = [BaseStalledCandidate { number: 7 }];
+    let candidate = [BaseStalledCandidate {
+        number: 7,
+        head: HEAD.to_owned(),
+    }];
     let policy = DwellPolicy::default();
     track_base_stalled(&mut state, Some(HEAD), &candidate, None, &policy, now());
     assert!(
