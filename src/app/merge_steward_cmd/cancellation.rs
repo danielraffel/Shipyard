@@ -338,7 +338,7 @@ pub(super) fn apply_repo_plan(
         super::observation::completed_merge_group_runs(
             actions,
             &observation.repo,
-            observation.merge_group_heads.values(),
+            &observation.base,
         )
         .unwrap_or_default()
     };

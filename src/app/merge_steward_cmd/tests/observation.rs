@@ -1,7 +1,8 @@
 use super::*;
 use crate::app::merge_steward_cmd::observation::{
     canonical_repo_name, encode_path_segment, evaluated_required_checks,
-    hydrate_required_check_identities, parse_check, parse_rest_check,
+    hydrate_required_check_identities, merge_group_branch_matches_base, parse_check,
+    parse_rest_check,
 };
 #[cfg(unix)]
 use crate::app::merge_steward_cmd::observation::{
@@ -29,6 +30,22 @@ fn parses_both_check_rollup_shapes() {
     .expect("context");
     assert_eq!(context.status, "IN_PROGRESS");
     assert_eq!(context.run_id, Some(789));
+}
+
+#[test]
+fn merge_group_branch_matching_keeps_ejected_runs_for_the_observed_base() {
+    assert!(merge_group_branch_matches_base(
+        "gh-readonly-queue/main/pr-1520-abc123",
+        "main"
+    ));
+    assert!(!merge_group_branch_matches_base(
+        "gh-readonly-queue/release/pr-1520-abc123",
+        "main"
+    ));
+    assert!(!merge_group_branch_matches_base(
+        "feat/base-dead-man",
+        "main"
+    ));
 }
 
 #[test]

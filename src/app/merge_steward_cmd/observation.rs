@@ -1654,12 +1654,15 @@ pub(super) fn active_runs(actions: &GitHubActions, repo: &str) -> Result<Vec<Ste
     Ok(all)
 }
 
-/// Completed merge-group runs for the observed queue heads. This is a bounded
-/// diagnostic census used only when a base-stalled candidate exists.
-pub(super) fn completed_merge_group_runs<'a>(
+/// Completed merge-group runs for the observed base. This is a bounded
+/// diagnostic census used only when a base-stalled candidate exists. A failed
+/// merge group is commonly ejected from the live queue before this read, so
+/// filtering by current queue heads would lose the very run whose job should
+/// be named. The merge-group branch retains the base identity instead.
+pub(super) fn completed_merge_group_runs(
     actions: &GitHubActions,
     repo: &str,
-    heads: impl IntoIterator<Item = &'a String>,
+    base: &str,
 ) -> Result<Vec<StewardRun>, String> {
     let value = gh_json(
         actions,
@@ -1673,16 +1676,17 @@ pub(super) fn completed_merge_group_runs<'a>(
         .get("workflow_runs")
         .and_then(Value::as_array)
         .ok_or_else(|| "completed merge-group response missing workflow_runs".to_owned())?;
-    // The newest page is enough: only runs for the current queue heads count.
-    let heads: Vec<String> = heads.into_iter().cloned().collect();
+    // The newest page is enough for this bounded diagnostic census. Match the
+    // merge-group branch's base component rather than live queue heads: an
+    // ejected group no longer has a queue entry but its completed run remains.
     let mut runs = Vec::new();
     for row in rows {
         if row.get("event").and_then(Value::as_str) != Some("merge_group")
             || row.get("status").and_then(Value::as_str) != Some("completed")
             || !row
-                .get("head_sha")
+                .get("head_branch")
                 .and_then(Value::as_str)
-                .is_some_and(|head| heads.iter().any(|wanted| wanted.eq_ignore_ascii_case(head)))
+                .is_some_and(|branch| merge_group_branch_matches_base(branch, base))
         {
             continue;
         }
@@ -1692,6 +1696,10 @@ pub(super) fn completed_merge_group_runs<'a>(
         runs.push(run);
     }
     Ok(runs)
+}
+
+pub(super) fn merge_group_branch_matches_base(branch: &str, base: &str) -> bool {
+    branch.starts_with(&format!("gh-readonly-queue/{base}/"))
 }
 
 pub(super) fn parse_run(value: &Value) -> Option<StewardRun> {
