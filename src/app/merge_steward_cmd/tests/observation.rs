@@ -1,8 +1,8 @@
 use super::*;
 use crate::app::merge_steward_cmd::observation::{
-    canonical_repo_name, encode_path_segment, evaluated_required_checks,
-    hydrate_required_check_identities, merge_group_branch_matches_base, parse_check,
-    parse_rest_check,
+    canonical_repo_name, completed_merge_group_runs_query, encode_path_segment,
+    evaluated_required_checks, hydrate_required_check_identities, merge_group_branch_matches_base,
+    parse_check, parse_rest_check,
 };
 #[cfg(unix)]
 use crate::app::merge_steward_cmd::observation::{
@@ -46,6 +46,19 @@ fn merge_group_branch_matching_keeps_ejected_runs_for_the_observed_base() {
         "feat/base-dead-man",
         "main"
     ));
+}
+
+#[test]
+fn completed_merge_group_query_uses_a_safe_utc_created_qualifier() {
+    let since = DateTime::parse_from_rfc3339("2026-11-19T10:45:00.123456789Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let query = completed_merge_group_runs_query("owner/repo", since);
+    assert_eq!(
+        query,
+        "repos/owner/repo/actions/runs?event=merge_group&status=completed&created=%3E2026-11-19T10:45:00Z&per_page=100"
+    );
+    assert!(!query.contains('+'));
 }
 
 #[test]

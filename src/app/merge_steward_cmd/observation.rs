@@ -9,6 +9,7 @@ use crate::required_check_policy::{
     classic_required_checks, encode_path_segment as encode_policy_path_segment,
     evaluated_required_checks as parse_evaluated_required_checks, normalize_required_checks,
 };
+use chrono::SecondsFormat;
 
 const BOUNDED_GH_STDOUT_BYTES: usize = 4 * 1024 * 1024;
 const BOUNDED_GH_STDERR_BYTES: usize = 64 * 1024;
@@ -1669,10 +1670,7 @@ pub(super) fn completed_merge_group_runs(
 ) -> Result<Vec<StewardRun>, String> {
     let argv = vec![
         "api".to_owned(),
-        format!(
-            "repos/{repo}/actions/runs?event=merge_group&status=completed&created=>{}&per_page=100",
-            since.to_rfc3339()
-        ),
+        completed_merge_group_runs_query(repo, since),
     ];
     let value = if let Some(deadline) = deadline {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1728,6 +1726,13 @@ pub(super) fn completed_merge_group_runs(
         }
     }
     Ok(runs)
+}
+
+pub(super) fn completed_merge_group_runs_query(repo: &str, since: DateTime<Utc>) -> String {
+    format!(
+        "repos/{repo}/actions/runs?event=merge_group&status=completed&created=%3E{}&per_page=100",
+        since.to_rfc3339_opts(SecondsFormat::Secs, true)
+    )
 }
 
 pub(super) fn merge_group_branch_matches_base(branch: &str, base: &str) -> bool {
