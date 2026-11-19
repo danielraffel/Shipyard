@@ -261,3 +261,25 @@ mod superseded;
 mod transient_rerun;
 #[cfg(unix)]
 mod unapproved_admission;
+
+/// A CI-health probe that cannot read (an unknown runner inventory, a failed
+/// billing read) is advisory: it lands in `ci_health_diagnostics`, never in
+/// `errors`, so it cannot mark the repository unhealthy or fail the tick.
+#[test]
+fn an_unknown_ci_health_probe_is_a_diagnostic_not_a_repo_error() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut ledger = StewardLedger::default();
+    let mut report = super::unreadable_repo_report("o/r", "main", &ledger, "seed".to_owned());
+    report.errors.clear();
+    super::record_ci_health(
+        &temp.path().join("ledger.json"),
+        &mut ledger,
+        "o/r",
+        &mut report,
+        &["ci_queued_forever runners unknown: HTTP 403".to_owned()],
+        true,
+        true,
+    );
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(report.ci_health_diagnostics.len(), 1);
+}

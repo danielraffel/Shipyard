@@ -882,14 +882,43 @@ impl GitHubActions {
             .map_err(|error| GitHubError::new(format!("annotations JSON malformed: {error}")))
     }
 
+    fn runners_raw_paginated(&self, path: &str) -> Result<Value, GitHubError> {
+        const PAGE_SIZE: usize = 100;
+        const MAX_PAGES: usize = 10;
+        let mut runners = Vec::new();
+        for page in 1..=MAX_PAGES {
+            let query = if page == 1 {
+                format!("{path}?per_page={PAGE_SIZE}")
+            } else {
+                format!("{path}?per_page={PAGE_SIZE}&page={page}")
+            };
+            let stdout = self.run_gh(&["api".to_owned(), query])?;
+            let value: Value = serde_json::from_str(&stdout)
+                .map_err(|error| GitHubError::new(format!("runners JSON malformed: {error}")))?;
+            let page_runners = value
+                .get("runners")
+                .and_then(Value::as_array)
+                .ok_or_else(|| GitHubError::new("runners JSON missing runners array"))?;
+            let count = page_runners.len();
+            runners.extend(page_runners.iter().cloned());
+            if count < PAGE_SIZE {
+                return Ok(serde_json::json!({"runners": runners}));
+            }
+        }
+        Err(GitHubError::new("runners inventory exceeded 10 pages"))
+    }
+
     /// Read the repository's visible self-hosted runner inventory.
     pub(crate) fn repository_runners_raw(&self, repository: &str) -> Result<Value, GitHubError> {
-        let stdout = self.run_gh(&[
-            "api".to_owned(),
-            format!("repos/{repository}/actions/runners?per_page=100"),
-        ])?;
-        serde_json::from_str(&stdout)
-            .map_err(|error| GitHubError::new(format!("runners JSON malformed: {error}")))
+        self.runners_raw_paginated(&format!("repos/{repository}/actions/runners"))
+    }
+
+    /// Read an organization's visible self-hosted runner inventory.
+    pub(crate) fn organization_runners_raw(
+        &self,
+        organization: &str,
+    ) -> Result<Value, GitHubError> {
+        self.runners_raw_paginated(&format!("orgs/{organization}/actions/runners"))
     }
 
     /// Cancel a single workflow job.

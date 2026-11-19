@@ -234,6 +234,9 @@ struct RepoReport {
     /// Per-repository CI-health overdue rows (one row per condition).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     ci_health: Vec<ci_health::CiHealthOverdue>,
+    /// Advisory diagnostics from CI-health probes; these never make a repo unhealthy.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    ci_health_diagnostics: Vec<String>,
     /// Dwell-time limits, overdue pull requests and the next-to-admit
     /// ranking ([`dwell_pass`]). Absent when the repository was not observed.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1723,7 +1726,9 @@ fn record_ci_health(
         .into_iter()
         .filter(|condition| !ci_errors.iter().any(|error| error.starts_with(condition)))
         .collect();
-    report.errors.extend(ci_errors.iter().cloned());
+    report
+        .ci_health_diagnostics
+        .extend(ci_errors.iter().cloned());
     // Probe results are independent. A runner-inventory failure must not
     // suppress a valid billing alert, and an overdue-feed write must succeed
     // before the seen set records the condition.
@@ -1741,7 +1746,7 @@ fn record_ci_health(
             &successful_conditions,
             append_result,
         ) {
-            report.errors.push(error);
+            report.ci_health_diagnostics.push(error);
         }
     }
 }
@@ -1935,6 +1940,7 @@ fn deferred_rate_limit_repo_report(
         rate_limit_deferred: Some(cooldown),
         exit_reasons: Vec::new(),
         ci_health: Vec::new(),
+        ci_health_diagnostics: Vec::new(),
         dwell: None,
         infra_rerun: None,
         red_everywhere: None,
@@ -1969,6 +1975,7 @@ fn unreadable_repo_report(
         rate_limit_deferred: None,
         exit_reasons: Vec::new(),
         ci_health: Vec::new(),
+        ci_health_diagnostics: Vec::new(),
         dwell: None,
         infra_rerun: None,
         red_everywhere: None,
@@ -2053,6 +2060,7 @@ fn append_unmatched_recovery_errors(
             rate_limit_deferred: None,
             exit_reasons: Vec::new(),
             ci_health: Vec::new(),
+            ci_health_diagnostics: Vec::new(),
             dwell: None,
             infra_rerun: None,
             red_everywhere: None,
@@ -2097,6 +2105,7 @@ fn persist_final_ledger(
             rate_limit_deferred: None,
             exit_reasons: Vec::new(),
             ci_health: Vec::new(),
+            ci_health_diagnostics: Vec::new(),
             dwell: None,
             infra_rerun: None,
             red_everywhere: None,

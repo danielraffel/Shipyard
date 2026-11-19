@@ -94,13 +94,22 @@ pub(super) fn queued_job_is_forever_queued(
     })
 }
 
-fn online_runner_labels(_raw: &Value) -> Option<BTreeSet<String>> {
-    // The repository runners endpoint is only a partial view. It omits
-    // organization and enterprise runners, and an apparently complete page
-    // can therefore claim that a label is unserved while an org runner is
-    // available. Until the caller has a complete, paginated org/enterprise
-    // inventory, fail closed and treat the inventory as unknown.
-    None
+fn online_runner_labels(raw: &Value) -> Option<BTreeSet<String>> {
+    let runners = raw.get("runners")?.as_array()?;
+    let labels = runners
+        .iter()
+        .filter(|runner| runner.get("status").and_then(Value::as_str) == Some("online"))
+        .flat_map(|runner| {
+            runner
+                .get("labels")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .filter_map(|label| label.get("name")?.as_str())
+        .map(str::to_ascii_lowercase)
+        .collect::<BTreeSet<_>>();
+    (!labels.is_empty()).then_some(labels)
 }
 
 /// Commit condition state only after the overdue feed has been written.
@@ -146,19 +155,41 @@ fn first_failed_job(raw: &Value) -> Option<(u64, Value)> {
 fn online_labels_or_unknown(
     actions: &GitHubActions,
     repo: &str,
-    errors: &mut Vec<String>,
+    diagnostics: &mut Vec<String>,
 ) -> Option<BTreeSet<String>> {
     match actions.repository_runners_raw(repo) {
-        Ok(raw) => {
+        Ok(mut raw) => {
+            let owner = repo.split_once('/').map_or(repo, |(owner, _)| owner);
+            match actions.organization_runners_raw(owner) {
+                Ok(org_raw) => {
+                    let mut runners = raw
+                        .get_mut("runners")
+                        .and_then(Value::as_array_mut)
+                        .cloned()
+                        .unwrap_or_default();
+                    if let Some(org_runners) = org_raw.get("runners").and_then(Value::as_array) {
+                        runners.extend(org_runners.iter().cloned());
+                    }
+                    raw = serde_json::json!({"runners": runners});
+                }
+                Err(error)
+                    if crate::head_approval::gh_error_http_status(error.message()) == Some(404) => {
+                }
+                Err(error) => {
+                    diagnostics.push(format!("ci_queued_forever runners unknown: {error:?}"));
+                    return None;
+                }
+            }
             if let Some(labels) = online_runner_labels(&raw) {
                 Some(labels)
             } else {
-                errors.push("ci_queued_forever runners unknown: incomplete inventory".to_owned());
+                diagnostics
+                    .push("ci_queued_forever runners unknown: incomplete inventory".to_owned());
                 None
             }
         }
         Err(error) => {
-            errors.push(format!("ci_queued_forever runners unknown: {error:?}"));
+            diagnostics.push(format!("ci_queued_forever runners unknown: {error:?}"));
             None
         }
     }
@@ -324,11 +355,11 @@ mod tests {
             now
         ));
         assert!(online_runner_labels(&serde_json::json!({"runners": []})).is_none());
-        assert!(
+        assert_eq!(
             online_runner_labels(&serde_json::json!({
-                "runners": [{"status": "online", "labels": [{"name": "retired"}]}]
-            }))
-            .is_none()
+                "runners": [{"status": "online", "labels": [{"name": "Retired"}]}]
+            })),
+            Some(BTreeSet::from(["retired".to_owned()]))
         );
     }
 
