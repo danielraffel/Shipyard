@@ -83,10 +83,19 @@ pub(super) fn queued_job_is_forever_queued(
     {
         return false;
     }
-    labels.iter().any(|label| {
-        !label.eq_ignore_ascii_case("self-hosted")
-            && !online_labels.contains(&label.to_ascii_lowercase())
-    })
+    let mut constrained_labels = labels
+        .iter()
+        .filter(|label| !label.eq_ignore_ascii_case("self-hosted"));
+    if labels
+        .iter()
+        .all(|label| label.eq_ignore_ascii_case("self-hosted"))
+    {
+        // A bare `runs-on: self-hosted` job can use any online runner. It is
+        // overdue only when the successfully read inventory has no eligible
+        // runner at all.
+        return online_labels.is_empty();
+    }
+    constrained_labels.any(|label| !online_labels.contains(&label.to_ascii_lowercase()))
 }
 
 fn online_runner_labels(raw: &Value) -> Option<BTreeSet<String>> {
@@ -403,6 +412,18 @@ mod tests {
         assert!(!queued_job_is_forever_queued(
             "2026-11-18T07:00:00Z",
             &["self-hosted".into(), "retired".into()],
+            &served,
+            now
+        ));
+        assert!(queued_job_is_forever_queued(
+            "2026-11-18T05:00:00Z",
+            &["self-hosted".into()],
+            &BTreeSet::new(),
+            now
+        ));
+        assert!(!queued_job_is_forever_queued(
+            "2026-11-18T05:00:00Z",
+            &["self-hosted".into()],
             &served,
             now
         ));
