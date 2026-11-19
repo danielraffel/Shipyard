@@ -144,6 +144,19 @@ fn report_with_snapshot_source(
     hosts_file: Option<&Path>,
     snapshot_source: &Value,
 ) -> Value {
+    let invariants_available =
+        snapshot_source.as_str() == Some("available") && !snapshots.is_empty();
+    let invariants_unavailable = if invariants_available {
+        Value::Null
+    } else {
+        snapshot_source
+            .get("unavailable")
+            .and_then(Value::as_str)
+            .map_or_else(
+                || json!("no steward snapshot was read"),
+                |reason| json!(reason),
+            )
+    };
     let repos: Vec<Value> = snapshots
         .into_iter()
         .map(|snapshot| {
@@ -271,7 +284,9 @@ fn report_with_snapshot_source(
         .into_iter()
         .map(|(kind, prs)| json!({"kind": kind, "count": prs.len(), "prs": prs}))
         .collect();
-    json!({"source": "steward-snapshot", "steward_snapshots": snapshot_source, "invariants": invariants, "summary": {
+    json!({"source": "steward-snapshot", "steward_snapshots": snapshot_source,
+        "invariants": invariants, "invariants_available": invariants_available,
+        "invariants_unavailable": invariants_unavailable, "summary": {
         "repos": repos.len(), "open": sum("open"), "approved_green": sum("approved_green"),
         "waiting_review": sum("waiting_review"), "red": sum("red"), "overdue": sum("overdue")},
         "owner_actions": owner_actions, "repos": repos,
@@ -336,7 +351,12 @@ fn markdown(data: &Value) -> String {
     let summary = &data["summary"];
     let mut out = "# Fleet report\n\n## Invariants\n\n".to_owned();
     let invariants = data["invariants"].as_array().expect("invariants array");
-    if invariants.is_empty() {
+    if data["invariants_available"] != true {
+        let reason = data["invariants_unavailable"]
+            .as_str()
+            .unwrap_or("no steward snapshot was read");
+        let _ = writeln!(out, "(unavailable: {reason})\n");
+    } else if invariants.is_empty() {
         out.push_str("All invariants hold\n\n");
     } else {
         for invariant in invariants {
@@ -703,6 +723,21 @@ mod tests {
             markdown(&data)
                 .contains("Snapshot source: (unavailable: steward-dwell: directory is unreadable)")
         );
+        assert!(markdown(&data).contains("(unavailable: steward-dwell: directory is unreadable)"));
+        assert!(!markdown(&data).contains("All invariants hold"));
+    }
+
+    #[test]
+    fn empty_snapshot_set_does_not_claim_all_invariants_hold() {
+        let data = report_with_snapshot_source(Vec::new(), None, &json!("available"));
+        assert_eq!(data["invariants_available"], false);
+        assert_eq!(
+            data["invariants_unavailable"],
+            "no steward snapshot was read"
+        );
+        let md = markdown(&data);
+        assert!(md.contains("(unavailable: no steward snapshot was read)"));
+        assert!(!md.contains("All invariants hold"));
     }
 
     #[test]
