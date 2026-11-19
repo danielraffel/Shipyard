@@ -3,6 +3,8 @@
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::BTreeSet;
+use std::io::Write;
 
 use super::GitHubActions;
 
@@ -42,7 +44,6 @@ pub(super) fn append_feed(
         .append(true)
         .open(&path)
         .map_err(|error| format!("ci health overdue feed {}: {error}", path.display()))?;
-    use std::io::Write as _;
     for row in rows {
         let line = serde_json::to_string(row).map_err(|error| error.to_string())?;
         writeln!(file, "{line}").map_err(|error| error.to_string())?;
@@ -93,29 +94,43 @@ pub(super) fn queued_job_is_forever_queued(
     })
 }
 
-fn online_runner_labels(raw: &Value) -> Option<std::collections::BTreeSet<String>> {
-    let runners = raw.get("runners")?.as_array()?;
-    let mut labels = std::collections::BTreeSet::new();
-    for runner in runners {
-        if runner.get("status").and_then(Value::as_str) != Some("online") {
-            continue;
-        }
-        if let Some(items) = runner.pointer("/labels").and_then(Value::as_array) {
-            labels.extend(items.iter().filter_map(|label| {
-                label
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .map(|name| name.to_ascii_lowercase())
-            }));
+fn online_runner_labels(_raw: &Value) -> Option<BTreeSet<String>> {
+    // The repository runners endpoint is only a partial view. It omits
+    // organization and enterprise runners, and an apparently complete page
+    // can therefore claim that a label is unserved while an org runner is
+    // available. Until the caller has a complete, paginated org/enterprise
+    // inventory, fail closed and treat the inventory as unknown.
+    None
+}
+
+/// Commit condition state only after the overdue feed has been written.
+/// Probe errors simply omit that condition from `successful_conditions`, so a
+/// transient read failure cannot clear or suppress its prior state.
+pub(super) fn commit_seen_after_feed<F>(
+    seen: &mut BTreeSet<String>,
+    repo: &str,
+    rows: &[CiHealthOverdue],
+    successful_conditions: &BTreeSet<&'static str>,
+    append: F,
+) -> Result<(), String>
+where
+    F: FnOnce(&[CiHealthOverdue]) -> Result<(), String>,
+{
+    let mut next_seen = seen.clone();
+    let mut new_rows = Vec::new();
+    let prefix = format!("{}:", repo.to_ascii_lowercase());
+    for condition in successful_conditions {
+        next_seen.retain(|key| !key.ends_with(condition) || !key.starts_with(&prefix));
+        for row in rows.iter().filter(|row| row.condition == *condition) {
+            if !seen.contains(&row.key()) {
+                new_rows.push(row.clone());
+            }
+            next_seen.insert(row.key());
         }
     }
-    // An empty set is "unknown", never "nothing is served": org-level runners
-    // (Generous-Corp) are not listed by the repository runners endpoint, and
-    // ephemeral lanes have no runner online between jobs.
-    if labels.is_empty() {
-        return None;
-    }
-    Some(labels)
+    append(&new_rows)?;
+    *seen = next_seen;
+    Ok(())
 }
 
 fn first_failed_job(raw: &Value) -> Option<(u64, Value)> {
@@ -126,6 +141,27 @@ fn first_failed_job(raw: &Value) -> Option<(u64, Value)> {
         }
         Some((job.get("id")?.as_u64()?, job.clone()))
     })
+}
+
+fn online_labels_or_unknown(
+    actions: &GitHubActions,
+    repo: &str,
+    errors: &mut Vec<String>,
+) -> Option<BTreeSet<String>> {
+    match actions.repository_runners_raw(repo) {
+        Ok(raw) => {
+            if let Some(labels) = online_runner_labels(&raw) {
+                Some(labels)
+            } else {
+                errors.push("ci_queued_forever runners unknown: incomplete inventory".to_owned());
+                None
+            }
+        }
+        Err(error) => {
+            errors.push(format!("ci_queued_forever runners unknown: {error:?}"));
+            None
+        }
+    }
 }
 
 /// Run both probes. Each failed read is returned as a loggable error and
@@ -169,13 +205,7 @@ pub(super) fn probe(
         Err(error) => errors.push(format!("ci_billing_blocked runs: {error:?}")),
     }
 
-    let online = match actions.repository_runners_raw(repo) {
-        Ok(raw) => online_runner_labels(&raw),
-        Err(error) => {
-            errors.push(format!("ci_queued_forever runners unknown: {error:?}"));
-            None
-        }
-    };
+    let online = online_labels_or_unknown(actions, repo, &mut errors);
     if let Some(online_labels) = online {
         match actions.list_queued_runs(repo, MAX_QUEUED_RUNS) {
             Ok(runs) => {
@@ -294,5 +324,42 @@ mod tests {
             now
         ));
         assert!(online_runner_labels(&serde_json::json!({"runners": []})).is_none());
+        assert!(
+            online_runner_labels(&serde_json::json!({
+                "runners": [{"status": "online", "labels": [{"name": "retired"}]}]
+            }))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn feed_failure_does_not_commit_seen_state() {
+        let mut seen = BTreeSet::from(["acme/repo:ci_billing_blocked".to_owned()]);
+        let before = seen.clone();
+        let rows = vec![CiHealthOverdue {
+            kind: "overdue",
+            condition: "ci_queued_forever",
+            repo: "acme/repo".to_owned(),
+            detail: "job build labels=self-hosted,retired".to_owned(),
+            at: Utc::now(),
+        }];
+        let successful = BTreeSet::from(["ci_queued_forever"]);
+        let result = commit_seen_after_feed(&mut seen, "acme/repo", &rows, &successful, |_| {
+            Err("feed unavailable".to_owned())
+        });
+        assert_eq!(result, Err("feed unavailable".to_owned()));
+        assert_eq!(seen, before);
+    }
+
+    #[test]
+    fn successful_condition_updates_even_when_another_probe_failed() {
+        let mut seen = BTreeSet::from([
+            "acme/repo:ci_billing_blocked".to_owned(),
+            "acme/repo:ci_queued_forever".to_owned(),
+        ]);
+        let successful = BTreeSet::from(["ci_billing_blocked"]);
+        commit_seen_after_feed(&mut seen, "acme/repo", &[], &successful, |_| Ok(())).unwrap();
+        assert!(!seen.contains("acme/repo:ci_billing_blocked"));
+        assert!(seen.contains("acme/repo:ci_queued_forever"));
     }
 }

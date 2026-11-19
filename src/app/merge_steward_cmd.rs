@@ -1710,6 +1710,42 @@ fn exit_reasons(report: &RepoReport) -> Vec<String> {
     reasons
 }
 
+fn record_ci_health(
+    ledger_path: &Path,
+    ledger: &mut StewardLedger,
+    repo: &str,
+    report: &mut RepoReport,
+    ci_errors: &[String],
+    apply: bool,
+    probe_due: bool,
+) {
+    let successful_conditions: BTreeSet<&'static str> = ["ci_billing_blocked", "ci_queued_forever"]
+        .into_iter()
+        .filter(|condition| !ci_errors.iter().any(|error| error.starts_with(condition)))
+        .collect();
+    report.errors.extend(ci_errors.iter().cloned());
+    // Probe results are independent. A runner-inventory failure must not
+    // suppress a valid billing alert, and an overdue-feed write must succeed
+    // before the seen set records the condition.
+    if apply && probe_due {
+        let append_result = |rows: &[ci_health::CiHealthOverdue]| {
+            let state_dir = ledger_path
+                .parent()
+                .ok_or_else(|| "ci health overdue feed has no state directory".to_owned())?;
+            ci_health::append_feed(state_dir, rows)
+        };
+        if let Err(error) = ci_health::commit_seen_after_feed(
+            &mut ledger.ci_health_seen,
+            repo,
+            &report.ci_health,
+            &successful_conditions,
+            append_result,
+        ) {
+            report.errors.push(error);
+        }
+    }
+}
+
 /// [`steward_repo`] once `actions` is scoped to `repo` and counting its
 /// GitHub reads.
 #[allow(clippy::too_many_arguments)]
@@ -1767,32 +1803,15 @@ fn steward_repo_observed(
                 (Vec::new(), Vec::new())
             };
             report.ci_health = ci_health;
-            report.errors.extend(ci_errors);
-            let active_keys: BTreeSet<String> = report
-                .ci_health
-                .iter()
-                .map(ci_health::CiHealthOverdue::key)
-                .collect();
-            let new_rows: Vec<_> = report
-                .ci_health
-                .iter()
-                .filter(|row| !ledger.ci_health_seen.contains(&row.key()))
-                .cloned()
-                .collect();
-            // A tick that did not probe (or whose probe failed to read) keeps the
-            // seen set as it was, so a condition is not cleared and re-alerted.
-            if args.apply && probe_due && report.errors.iter().all(|e| !e.starts_with("ci_")) {
-                let repo_prefix = format!("{}:", repo.to_ascii_lowercase());
-                ledger
-                    .ci_health_seen
-                    .retain(|key| !key.starts_with(&repo_prefix) || active_keys.contains(key));
-                ledger.ci_health_seen.extend(active_keys);
-                if let Some(state_dir) = ledger_path.parent()
-                    && let Err(error) = ci_health::append_feed(state_dir, &new_rows)
-                {
-                    report.errors.push(error);
-                }
-            }
+            record_ci_health(
+                ledger_path,
+                ledger,
+                repo,
+                &mut report,
+                &ci_errors,
+                args.apply,
+                probe_due,
+            );
             if let Some(errors) = recovery_errors.remove(&observation.repo) {
                 report.errors.extend(errors);
             }
