@@ -109,7 +109,7 @@ fn online_runner_labels(raw: &Value) -> Option<BTreeSet<String>> {
         .filter_map(|label| label.get("name")?.as_str())
         .map(str::to_ascii_lowercase)
         .collect::<BTreeSet<_>>();
-    (!labels.is_empty()).then_some(labels)
+    Some(labels)
 }
 
 /// Commit condition state only after the overdue feed has been written.
@@ -151,20 +151,29 @@ fn online_labels_or_unknown(
     diagnostics: &mut Vec<String>,
 ) -> Option<BTreeSet<String>> {
     match actions.repository_runners_raw(repo) {
-        Ok(raw) => {
+        Ok(mut raw) => {
             let owner = repo.split_once('/').map_or(repo, |(owner, _)| owner);
             match actions.organization_runners_raw(owner) {
                 Ok(org_raw) => {
-                    if org_raw
-                        .get("runners")
-                        .and_then(Value::as_array)
-                        .is_some_and(|runners| !runners.is_empty())
-                    {
+                    let Some(org_runners) = org_raw.get("runners").and_then(Value::as_array) else {
                         diagnostics.push(
                             "ci_queued_forever runners unknown: organization runner-group repository eligibility unavailable"
                                 .to_owned(),
                         );
                         return None;
+                    };
+                    if !org_runners.is_empty() {
+                        diagnostics.push(
+                            "ci_queued_forever runners unknown: organization runner-group repository eligibility unavailable"
+                                .to_owned(),
+                        );
+                        let mut runners = raw
+                            .get_mut("runners")
+                            .and_then(Value::as_array_mut)
+                            .cloned()
+                            .unwrap_or_default();
+                        runners.extend(org_runners.iter().cloned());
+                        raw = serde_json::json!({"runners": runners});
                     }
                 }
                 Err(error)
@@ -406,7 +415,10 @@ mod tests {
             &online,
             now
         ));
-        assert!(online_runner_labels(&serde_json::json!({"runners": []})).is_none());
+        assert_eq!(
+            online_runner_labels(&serde_json::json!({"runners": []})),
+            Some(BTreeSet::new())
+        );
         assert_eq!(
             online_runner_labels(&serde_json::json!({
                 "runners": [{"status": "online", "labels": [{"name": "Retired"}]}]
@@ -510,7 +522,9 @@ mod tests {
         crate::test_support::write_executable_script(&gh, &script);
         let actions = GitHubActions::hermetic_for_tests(temp.path(), &gh);
         let mut diagnostics = Vec::new();
-        assert!(online_labels_or_unknown(&actions, "acme/repo", &mut diagnostics).is_none());
+        let online = online_labels_or_unknown(&actions, "acme/repo", &mut diagnostics)
+            .expect("labels remain usable for negative evidence");
+        assert!(online.contains("org-only"));
         assert!(
             diagnostics
                 .iter()
@@ -644,7 +658,9 @@ esac
         crate::test_support::write_executable_script(&gh, script);
         let actions = GitHubActions::hermetic_for_tests(temp.path(), &gh);
         let mut diagnostics = Vec::new();
-        assert!(online_labels_or_unknown(&actions, "acme/repo", &mut diagnostics).is_none());
+        let online = online_labels_or_unknown(&actions, "acme/repo", &mut diagnostics)
+            .expect("labels remain usable for negative evidence");
+        assert!(online.contains("restricted"));
         assert!(
             diagnostics
                 .iter()
