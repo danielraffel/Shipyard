@@ -654,12 +654,21 @@ where
                 stdout,
             );
         }
-        Command::FleetReport { format, hosts_file } => {
-            return fleet_report_cmd::run(
+        Command::FleetReport {
+            format,
+            hosts_file,
+            publish_issue,
+            dry_run,
+        } => {
+            return fleet_report_cmd::run_with_options(
                 &runtime_paths.state_dir,
                 &format,
                 hosts_file.as_deref(),
                 stdout,
+                Some(&cwd),
+                cli.mode.into(),
+                publish_issue.as_deref(),
+                dry_run,
             );
         }
         Command::Who { pr, repo, contact } => {
