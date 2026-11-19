@@ -523,10 +523,11 @@ pub(super) fn run(
         input.dwell_policy,
         input.now,
     );
-    if let Some(census) = input
-        .completed_merge_group_runs
-        .filter(|_| failed_job.is_none() && base_rows.iter().any(|row| row.escalate))
-    {
+    if let Some(census) = input.completed_merge_group_runs.filter(|_| {
+        // Only an applying pass records the alert, which is what keeps the read
+        // to once per incident; a shadow pass would repeat it every tick.
+        input.apply && failed_job.is_none() && base_rows.iter().any(|row| row.escalate)
+    }) {
         let census_job = failed_merge_group_job(census().iter());
         if census_job.is_some() {
             base_rows = dwell::track_base_stalled(
