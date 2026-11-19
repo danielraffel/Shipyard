@@ -2344,10 +2344,6 @@ pub(super) fn pr_next_action_snapshot(
             }
             Some((token, next))
         }
-        _ if row.get("changedFiles").and_then(Value::as_u64) == Some(0) => Some((
-            "empty_diff".to_owned(),
-            next_action::NextAction::empty_diff(&base),
-        )),
         _ => None,
     };
     if let Some((blocked_on, next)) = pre_admission {

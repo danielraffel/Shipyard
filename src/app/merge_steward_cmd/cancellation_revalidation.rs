@@ -132,7 +132,7 @@ pub(super) fn live_current_pull_request_state(
 /// classification consults: `author` decides implicit fleet management, so a
 /// read without it re-classifies every unlabelled fleet-authored pull request
 /// as `Unmanaged` and the mutation is skipped after live revalidation.
-pub(super) const LIVE_PR_VIEW_FIELDS: &str = "id,number,state,isDraft,baseRefName,headRefOid,headRefName,mergeStateStatus,autoMergeRequest,labels,author,statusCheckRollup";
+pub(super) const LIVE_PR_VIEW_FIELDS: &str = "id,number,state,isDraft,baseRefName,headRefOid,headRefName,mergeStateStatus,autoMergeRequest,labels,author,changedFiles,statusCheckRollup";
 
 pub(super) fn pull_request(
     actions: &GitHubActions,

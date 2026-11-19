@@ -52,14 +52,14 @@ APP_LOGINS = {"shipyard-local[bot]", "shipyard-local"}
 _GUARD = []
 SIGNALS = ("app_opener", "provenance", "trailer", "session_stamp")
 BAD_CONCLUSIONS = {"failure", "timed_out"}
-FACTS_VERSION = 15  # 14: merge-queue ejection causes read from GraphQL; push_times are observed head updates; main-red facts
+FACTS_VERSION = 17  # 14: merge-queue ejection causes read from GraphQL; push_times are observed head updates; main-red facts
 COMPUTE_VERSION = 8  # compute caches: entries written before this could be marked complete from a partial timeline or commit read or rerun history
 CHECKS_VERSION = 3  # derived check caches: v2 entries (incomplete pagination read as clean, latest run by start) are read again
 ESCAPE_WINDOW = dt.timedelta(days=14)
 HORIZON = dt.timedelta(hours=48)
 MIN_SAMPLE = 50
 UNKNOWN_RANGE_SHARE = 0.20
-SCORECARD_VERSION = "2026-11-18.10"  # .2: correctness reads the first-parent next push and the newest run by id; main-red episodes. .3: ejection causes from GraphQL
+SCORECARD_VERSION = "2026-11-18.12"  # .2: correctness reads the first-parent next push and the newest run by id; main-red episodes. .3: ejection causes from GraphQL
 MERGE_MAIN_RE = re.compile(r"^Merge (remote-tracking )?branch '?(origin/)?(main|master)'?|^Merge pull request .* from .*/main", re.I)
 # Positive controls: a real revert (#124 reverted #119), a real escaped defect (#126 names #116).
 # Pulp: two escapes verified by hand from main-red traces. #12219 landed red on Workflow lint and
@@ -395,6 +395,7 @@ def pr_facts(rd, pr, owner):
     enqueue_times, removal_ts = [], []
     observed_push_times = []
     stamp_commit = False
+    untimed_commits, force_pushed_shas = [], set()  # (sha, date) of timeline commits with no time; heads a timed force-push moved to
     hold_untimed_push, untimed_commit_dates = False, []  # `committed` events carry no observation time: their git dates stand in only to place them
     for e in tl:
         ev, ts = e.get("event"), e.get("created_at") or e.get("submitted_at")
@@ -403,6 +404,9 @@ def pr_facts(rd, pr, owner):
             hold_untimed_push = hold_untimed_push or bool(holds)  # a commit listed after a HOLD: when the head moved is unknown
             cd = ((e.get("committer") or {}).get("date")) or ((e.get("author") or {}).get("date"))
             untimed_commit_dates.append(fmt(iso(cd)) if iso(cd) else None)
+            untimed_commits.append((e.get("sha"), fmt(iso(cd)) if iso(cd) else None))
+        if ev == "head_ref_force_pushed" and e.get("after_sha"):
+            force_pushed_shas.add(e["after_sha"])
         if ev in ("committed", "head_ref_force_pushed") and ts and ready:
             observed = iso(ts)
             if observed and observed > ready:
@@ -480,7 +484,7 @@ def pr_facts(rd, pr, owner):
         "agent_trailer": trailer, "stamp_commit": stamp_commit, "ambiguous_commits": sorted(set(ambiguous)),
         "repair_cycles": len(repairs), "holds": len(holds), "re_holds": re_holds, "size": size,
         "pushes": split, "enqueues": enqueues, "enqueue_times": enqueue_times, "dequeue_times": dequeue_times,
-        "ejection_causes_known": causes_known, "hold_times": sorted(holds), "hold_untimed_push": hold_untimed_push, "untimed_commit_dates": untimed_commit_dates, "push_times": sorted(set(observed_push_times)), "ejections": ejections,
+        "ejection_causes_known": causes_known, "hold_times": sorted(holds), "hold_untimed_push": hold_untimed_push, "untimed_commit_dates": untimed_commit_dates, "untimed_repair_dates": sorted({d for sha, d in untimed_commits if d and sha not in force_pushed_shas}), "push_times": sorted(set(observed_push_times)), "ejections": ejections,
         "labels": sorted(l["name"] for l in pr.get("labels") or []),
         "heads": sorted(heads), "timeline_complete": tl_full, "commits_complete": c_full,
     }
@@ -718,6 +722,21 @@ def cause_minutes(f, comp):
             "red": None if comp and comp.get("red_partial") else red if outcomes else None,  # None: an earlier failed attempt is not in the list
             "queue": _wait_until_next(f.get("enqueue_times") or [], f.get("dequeue_times") or [], m),
             "runner": comp.get("runner_wait_min") if done else None, "dirty": None}  # None when the jobs were not read
+
+
+def hold_rounds(f):
+    """For a merged PR, one entry per HOLD: how many pushes (repair rounds) landed after it and before the next HOLD or the
+    merge. [] when it had no HOLD, None when it did not merge or its timeline or commits were not read in full (a missing
+    page could hide a HOLD or a push)."""
+    m = iso(f.get("merged_at"))
+    if not m or not reads_complete(f):
+        return None
+    holds = sorted(iso(x) for x in f.get("hold_times") or [] if iso(x) and iso(x) < m)  # a HOLD posted after the merge held nothing
+    # a timed push (a force-push) is observed; a `committed` event carries no time, so its commit's committer date stands in
+    # (as for the agent-push counts) and an ordinary repair commit is still a round; a commit a timed force-push moved the head to
+    # is that push, not a second one
+    pushes = sorted({iso(x) for x in list(f.get("push_times") or []) + list(f.get("untimed_repair_dates") or []) if iso(x)})
+    return [sum(1 for p in pushes if h < p < (holds[i + 1] if i + 1 < len(holds) else m)) for i, h in enumerate(holds)]
 
 
 def enqueue_to_merge(f):
@@ -1234,6 +1253,19 @@ def bucket(size):
     return "unknown" if size is None else "<200" if size < 200 else "200-800" if size <= 800 else ">800"
 
 
+def hold_round_summary(merged):
+    """Over the HOLDs of merged PRs: how many there were, the mean repair pushes after each, and the HOLDs the PR merged
+    past (or was followed by another HOLD) without a single push."""
+    per = [n for r in merged for n in (r.get("hold_rounds") or [])]
+    held = [r for r in merged if r.get("hold_rounds")]
+    # re-HOLD on the same pre-merge sequence: a HOLD after a HOLD that got a repair push
+    rehold = [r for r in held if any(n > 0 for n in r["hold_rounds"][:-1])]
+    return {"holds": len(per), "pushes_after_holds": sum(per), "mean": None if not per else round(sum(per) / len(per), 2),
+            "holds_without_push": sum(1 for n in per if n == 0), "prs_unread": sum(1 for r in merged if r.get("hold_rounds") is None),
+            # the same merged cohort as the HOLD counts, so the table's columns describe one population
+            "prs_with_hold": len(held), "re_hold_rate_pct": pct_of(len(rehold), len(held)), "re_hold_rate_ci95": wilson(len(rehold), len(held))}
+
+
 def change_failure_summary(merged):
     """Merged PRs whose merge started a main-red episode: counts, the raw minutes to green (no median: n is small and the
     distribution is long), the unresolved ones, and the PRs whose base checks were not read in full (`unknown`)."""
@@ -1361,6 +1393,7 @@ def summarize(rows):
             "prs_with_hold": len(held), "prs_with_re_hold": len(rehold),
             "re_hold_rate_pct": pct_of(len(rehold), len(held)), "re_hold_rate_ci95": wilson(len(rehold), len(held)),
             "by_size": dict(sorted(by_size.items())),
+            "repair_rounds_per_hold": hold_round_summary(merged),
         },
         "pushes_per_ready_pr": {k: None if not n else round(v / n, 2) for k, v in push.items()},
         "pushes_total": push,
@@ -1524,7 +1557,7 @@ def collect_repo(repo, cache_dir, cap, owner, lo, hi, now, ticks, tick_ctx, fetc
             "handoff_min": round((iso(merged) - iso(f["first_ready"])).total_seconds() / 60.0, 1) if merged and f["first_ready"] else None,
             "holds": f["holds"], "re_holds": f["re_holds"], "size": f["size"], "pushes": f["pushes"],
             "enqueues": f["enqueues"], "ejections": f["ejections"], "dirty": f["number"] in dirty,
-            "enqueue_to_merge_min": enqueue_to_merge(f),
+            "enqueue_to_merge_min": enqueue_to_merge(f), "hold_rounds": hold_rounds(f),
             "owner_actions": sum(1 for ev, ts in effective_owner_events(f)[0]
                                  if not (ev == "merged" and f.get("merge_unverified")) and f["first_ready"] and iso(f["first_ready"]) <= iso(ts) <= iso(f["first_ready"]) + HORIZON),
             "repair_cycles": f["repair_cycles"], "compute": None, "correct": None, "path": None, "path_why": [], "cause_min": None, "main_red": None,
@@ -1812,7 +1845,7 @@ def markdown(e2e):
                 f"{W if ns_off else str(a['github_only']['rate_pct']) + '% (' + ci(a['github_only']['rate_ci95']) + ')'} | "
                 f"{sample_label(s, trunc)} | {r['holds_per_ready_pr']} | {r['re_hold_rate_pct']}% ({ci(r['re_hold_rate_ci95'])}), n={r['prs_with_hold']} | "
                 f"{p['repair']}/{p['author']}/{p['merge_main']} | {s['merge_queue']['attempts_per_ready_pr']} | {ej} | {s['dirty_per_100_prs']} | "
-                f"{s['interventions']['owner_actions_per_pr']} | {s['interventions']['repair_cycles_per_pr']} | {c['runs_median']}/{c['runs_mean']} ({c['repeat_runs_total']}/{c['runs_total']}) | "
+                f"{s['interventions']['owner_actions_per_pr']} | {s['interventions']['repair_cycles_per_pr']} | {W + ' (compute not read)' if not c['prs_read'] else str(c['runs_median']) + '/' + str(c['runs_mean']) + ' (' + str(c['repeat_runs_total']) + '/' + str(c['runs_total']) + ')'} | "
                 f"{h['median']}/{h['p90']} (n={h['n']}) | {W if 'correctness' in off else str(k['bad']) + '/' + str(k['good']) + '/' + str(k['unknown'])} | "
                 f"{W if 'correctness' in off else str(k['bad_rate_pct']) + '% (' + ci(k['bad_rate_ci95']) + ')' + zero_bad} | "
                 f"{W if 'escaped' in off else str(k['escaped']) + '/' + str(k['escaped_known']) + ' (' + ci(k['escaped_rate_ci95']) + ')' + zero_esc} | {c['context_self_hosted_min_median']}/{c['context_hosted_min_median']} |")
@@ -1908,6 +1941,14 @@ def markdown(e2e):
             q = s_["merge_queue"]
             by = ", ".join(f"{k2} {n}" for k2, n in q["ejections_by_cause"].items()) or "0"
             L.append(f"| {repo} | {s_['ready_prs']} | {sum(q['ejections_by_cause'].values())} | {q['ejections_per_merge']} | {q['top_ejection_cause']} | {by} | {q['ejections_cause_unknown']} |")
+        L.append("")
+    if e2e.get("window"):
+        L += ["### HOLDs and repair rounds (window, merged PRs)", "",
+              "A repair round is a push after a HOLD and before the next HOLD or the merge. The re-HOLD rate is the share of PRs with a HOLD that got another HOLD after a repair.", "",
+              "| repo | PRs with a HOLD | HOLDs | repair pushes per HOLD | HOLDs with no push | re-HOLD rate (CI95) | merged PRs not read in full |", "|---|---|---|---|---|---|---|"]
+        for repo, s_ in sorted(e2e["window"]["per_repo"].items()):
+            h = s_["rounds"]["repair_rounds_per_hold"]
+            L.append(f"| {repo} | {h['prs_with_hold']} | {h['holds']} | {h['mean']} | {h['holds_without_push']} | {h['re_hold_rate_pct']}% ({ci(h['re_hold_rate_ci95'])}) | {h['prs_unread']} |")
         L.append("")
     nf = (e2e.get("baseline") or {}).get("noise_floor")
     if nf:

@@ -46,6 +46,9 @@ fn observed(number: u64, head_sha: String, checks: Vec<StewardCheck>) -> Observe
         owner: None,
         fact: StewardPullRequest {
             number,
+            changed_files: None,
+            commit_count: None,
+
             head_sha,
             head_branch: format!("feature-{number}"),
             author: Some("someone".to_owned()),

@@ -356,6 +356,7 @@ fn classify_token(facts: &RowFacts<'_>, policy: &StewardPolicy) -> (Stall, Since
         // Both answered above; kept total without a panic.
         StewardDecision::Queued { .. } => undated("queued".to_owned(), None, SinceHint::Known),
         StewardDecision::Draft => undated("draft".to_owned(), None, SinceHint::HeadPushed),
+        StewardDecision::EmptyDiff => undated("empty_diff".to_owned(), None, SinceHint::HeadPushed),
         StewardDecision::OptedOut => undated(
             format!("excluded_label:{}", policy.opt_out_label),
             None,

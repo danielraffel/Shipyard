@@ -33,6 +33,9 @@ fn pr(number: u64, checks: Vec<StewardCheck>, labels: &[&str]) -> ObservedPr {
         owner: None,
         fact: StewardPullRequest {
             number,
+            changed_files: None,
+            commit_count: None,
+
             head_sha: head(number),
             head_branch: format!("feature-{number}"),
             author: Some("someone".to_owned()),

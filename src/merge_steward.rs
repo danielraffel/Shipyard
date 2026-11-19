@@ -103,6 +103,10 @@ pub fn status_creator_app_id(login: Option<&str>, user_id: Option<u64>) -> Optio
 pub struct StewardPullRequest {
     /// Pull-request number.
     pub number: u64,
+    /// Files changed against the current base, when observed.
+    pub changed_files: Option<u64>,
+    /// Number of commits on the PR, when observed.
+    pub commit_count: Option<u64>,
     /// Full current head SHA.
     pub head_sha: String,
     /// Current head branch.
@@ -338,6 +342,8 @@ pub enum StewardDecision {
     },
     /// Draft PRs are never armed.
     Draft,
+    /// Commits exist, but the diff against the base has no changed files.
+    EmptyDiff,
     /// Head SHA was malformed; mutation is forbidden.
     InvalidHead,
     /// Conflict or unsafe behind state blocks admission.
@@ -396,11 +402,14 @@ pub fn classify_pr(
     if let Some(decision) = classify_management(pr, policy) {
         return decision;
     }
-    if let Some(position) = pr.queue_position {
-        return StewardDecision::Queued { position };
-    }
     if pr.draft {
         return StewardDecision::Draft;
+    }
+    if pr.changed_files == Some(0) && pr.commit_count.is_some_and(|count| count > 0) {
+        return StewardDecision::EmptyDiff;
+    }
+    if let Some(position) = pr.queue_position {
+        return StewardDecision::Queued { position };
     }
     if !is_full_sha(&pr.head_sha) {
         return StewardDecision::InvalidHead;

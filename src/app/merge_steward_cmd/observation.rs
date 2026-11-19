@@ -145,6 +145,7 @@ pub(super) fn observe_pull_request(
     let (merge_queue, queue_positions, merge_group_heads, merge_group_enqueued_at) =
         merge_queue_snapshot(actions, &repo, base)?;
     let mut prs = vec![parse_pr(row, &queue_positions)?];
+    hydrate_empty_diff_facts(actions, &repo, base, &mut prs);
     hydrate_census_check_identities(actions, &repo, &required_checks, &mut prs)?;
     let capacity_preemption_policy = CapacityPreemptionPolicy::for_repository(&repo);
     Ok(RepoObservation {
@@ -611,7 +612,7 @@ fn merge_queue_next_cursor(queue: &Value) -> Result<Option<&str>, String> {
 ///   page of pull requests requests over 500,000 possible nodes and GitHub
 ///   refuses the query outright. The only consumer is the owner fallback for an
 ///   owner wake, which [`hydrate_owner`] reads per pull request on demand.
-pub(super) const OPEN_PR_LIST_FIELDS: &str = "id,number,isDraft,baseRefName,headRefOid,headRefName,mergeStateStatus,autoMergeRequest,labels,author";
+pub(super) const OPEN_PR_LIST_FIELDS: &str = "id,number,isDraft,baseRefName,headRefOid,headRefName,mergeStateStatus,autoMergeRequest,labels,author,changedFiles";
 
 /// Fields read per pull request to resolve the owner a wake is addressed to.
 pub(super) const OWNER_VIEW_FIELDS: &str = "body,commits";
@@ -711,7 +712,38 @@ pub(super) fn pull_requests(
             "open PR list reached {MAX_OPEN_PR_ROWS}; refusing a possibly partial snapshot"
         ));
     }
-    rows.iter().map(|row| parse_pr(row, positions)).collect()
+    let mut prs = rows
+        .iter()
+        .map(|row| parse_pr(row, positions))
+        .collect::<Result<Vec<_>, _>>()?;
+    hydrate_empty_diff_facts(actions, repo, base, &mut prs);
+    Ok(prs)
+}
+
+/// REST exposes both counts without loading every commit in the bulk GraphQL
+/// census. A failed or stale read leaves the commit count unknown.
+fn hydrate_empty_diff_facts(
+    actions: &GitHubActions,
+    repo: &str,
+    base: &str,
+    prs: &mut [ObservedPr],
+) {
+    for pr in prs.iter_mut().filter(|pr| pr.fact.changed_files == Some(0)) {
+        let args = [
+            "api".to_owned(),
+            format!("repos/{repo}/pulls/{}", pr.fact.number),
+        ];
+        let Ok(live) = gh_json(actions, &args, "empty-diff PR counts") else {
+            continue;
+        };
+        if live.pointer("/head/sha").and_then(Value::as_str) != Some(pr.fact.head_sha.as_str())
+            || live.pointer("/base/ref").and_then(Value::as_str) != Some(base)
+        {
+            continue;
+        }
+        pr.fact.changed_files = live.get("changed_files").and_then(Value::as_u64);
+        pr.fact.commit_count = live.get("commits").and_then(Value::as_u64);
+    }
 }
 
 fn transient_open_pr_error(error: &str) -> bool {
@@ -900,6 +932,8 @@ pub(super) fn parse_pr(row: &Value, positions: &BTreeMap<u64, u64>) -> Result<Ob
     });
     let fact = StewardPullRequest {
         number,
+        changed_files: row.get("changedFiles").and_then(Value::as_u64),
+        commit_count: None,
         head_sha: row
             .get("headRefOid")
             .and_then(Value::as_str)

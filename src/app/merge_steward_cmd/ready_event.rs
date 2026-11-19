@@ -209,9 +209,6 @@ pub(super) fn observe_event_pr(
             "based on {base:?}, not the default branch {default_branch:?}"
         ));
     }
-    if row.get("changedFiles").and_then(Value::as_u64) == Some(0) {
-        return Err("empty diff".to_owned());
-    }
     observation::observe_pull_request(actions, &settings, base, &row)
 }
 

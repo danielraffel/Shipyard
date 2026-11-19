@@ -272,24 +272,24 @@ fn freeze_complete_tree_with_hook(
 ) -> io::Result<(String, Vec<FrozenProcessIdentity>)> {
     signal(receipt.pid, "-STOP")?;
     let mut known = BTreeSet::from([receipt.pid]);
-    if let Err(error) = await_exact_worker_stopped(
-        receipt,
-        process_snapshot,
-        ROOT_STOP_OBSERVATION_ATTEMPTS,
-        Duration::from_millis(10),
-    ) {
-        resume_pids(&known);
-        return Err(error);
-    }
     let mut stable_scans = 0_u8;
     for scan_index in 0..64 {
-        let processes = process_snapshot()?;
-        if !exact_worker_is_stopped(receipt, &processes) {
-            resume_pids(&known);
-            return Err(io::Error::other(
-                "exact worker identity was not frozen before tree snapshot",
-            ));
-        }
+        // The stop is observed on every scan, not just the first: a stopped
+        // process can be reported as running for a moment by a single `ps`
+        // read on a loaded host, so each scan waits (bounded) for the exact
+        // worker to read as stopped rather than failing on one sample.
+        let processes = match stopped_snapshot(
+            receipt,
+            process_snapshot,
+            ROOT_STOP_OBSERVATION_ATTEMPTS,
+            Duration::from_millis(10),
+        ) {
+            Ok(processes) => processes,
+            Err(error) => {
+                resume_pids(&known);
+                return Err(error);
+            }
+        };
         during_scan(scan_index);
         let mut closure_changed = true;
         while closure_changed {
@@ -490,6 +490,11 @@ fn process_snapshot() -> io::Result<BTreeMap<u32, ProcessSnapshot>> {
 #[cfg(unix)]
 const ROOT_STOP_OBSERVATION_ATTEMPTS: u32 = 200;
 
+/// Consecutive reads that must all fail to find the exact worker before the
+/// pid is declared to name some other process.
+#[cfg(unix)]
+const ABSENT_OBSERVATIONS_BEFORE_FAILING: u32 = 5;
+
 #[cfg(unix)]
 #[derive(Debug, PartialEq, Eq)]
 enum ExactWorkerState {
@@ -519,43 +524,45 @@ fn exact_worker_state(
     }
 }
 
-/// Wait, bounded, until the exact worker named by `receipt` is observed
-/// stopped. A pid that no longer names the exact worker fails at once; a
-/// worker still observed running after every attempt fails too.
+/// Observe the process table until the exact worker named by `receipt` reads
+/// as stopped, and return that observation. A pid that no longer names the
+/// exact worker fails at once; a worker still observed running after every
+/// attempt fails too.
 #[cfg(unix)]
-fn await_exact_worker_stopped(
+fn stopped_snapshot(
     receipt: &WorkerReceipt,
     mut snapshot: impl FnMut() -> io::Result<BTreeMap<u32, ProcessSnapshot>>,
     attempts: u32,
     pause: Duration,
-) -> io::Result<()> {
+) -> io::Result<BTreeMap<u32, ProcessSnapshot>> {
+    let mut last = "never observed".to_owned();
+    let mut absent_in_a_row = 0_u32;
     for attempt in 0..attempts.max(1) {
-        match exact_worker_state(receipt, &snapshot()?) {
-            ExactWorkerState::Stopped => return Ok(()),
-            ExactWorkerState::Absent => break,
-            ExactWorkerState::Running => {
-                if attempt + 1 < attempts {
-                    thread::sleep(pause);
+        let processes = snapshot()?;
+        match exact_worker_state(receipt, &processes) {
+            ExactWorkerState::Stopped => return Ok(processes),
+            ExactWorkerState::Absent => {
+                // One `ps` read can miss a live process while the process
+                // table changes under load, so a single miss is not proof the
+                // pid names another process. Consecutive misses are.
+                last = format!("pid entry {:?}", processes.get(&receipt.pid));
+                absent_in_a_row += 1;
+                if absent_in_a_row >= ABSENT_OBSERVATIONS_BEFORE_FAILING {
+                    break;
                 }
             }
+            ExactWorkerState::Running => {
+                "running".clone_into(&mut last);
+                absent_in_a_row = 0;
+            }
+        }
+        if attempt + 1 < attempts {
+            thread::sleep(pause);
         }
     }
-    Err(io::Error::other(
-        "exact worker identity was not frozen before tree snapshot",
-    ))
-}
-
-#[cfg(unix)]
-fn exact_worker_is_stopped(
-    receipt: &WorkerReceipt,
-    processes: &BTreeMap<u32, ProcessSnapshot>,
-) -> bool {
-    processes.get(&receipt.pid).is_some_and(|process| {
-        process.stopped
-            && process.command.contains("execution-worker")
-            && process.command.contains(&receipt.job_id)
-            && process.command.contains(&receipt.generation)
-    })
+    Err(io::Error::other(format!(
+        "exact worker identity was not frozen before tree snapshot (last observation: {last})"
+    )))
 }
 
 #[cfg(all(test, unix))]
@@ -598,7 +605,7 @@ mod tests {
     fn a_stop_signal_still_in_flight_is_waited_for_not_failed() {
         let receipt = await_receipt();
         let mut observations = 0;
-        let result = await_exact_worker_stopped(
+        let result = stopped_snapshot(
             &receipt,
             || {
                 observations += 1;
@@ -612,10 +619,34 @@ mod tests {
     }
 
     #[test]
+    fn a_stopped_worker_briefly_read_as_running_on_a_later_scan_is_waited_for() {
+        let receipt = await_receipt();
+        // Stopped, then one transient "running" sample, then stopped again.
+        let mut observations = 0;
+        let scan = |observations: &mut u32| {
+            stopped_snapshot(
+                &receipt,
+                || {
+                    *observations += 1;
+                    Ok(snapshot_of(&receipt, *observations != 2))
+                },
+                ROOT_STOP_OBSERVATION_ATTEMPTS,
+                Duration::ZERO,
+            )
+        };
+        assert!(scan(&mut observations).is_ok());
+        assert!(
+            scan(&mut observations).is_ok(),
+            "transient sample failed the scan"
+        );
+        assert_eq!(observations, 3);
+    }
+
+    #[test]
     fn a_worker_that_never_stops_fails_after_the_bounded_wait() {
         let receipt = await_receipt();
         let mut observations = 0;
-        let result = await_exact_worker_stopped(
+        let result = stopped_snapshot(
             &receipt,
             || {
                 observations += 1;
@@ -629,10 +660,10 @@ mod tests {
     }
 
     #[test]
-    fn a_pid_naming_another_process_fails_without_waiting() {
+    fn a_pid_naming_another_process_fails_after_a_few_confirming_reads() {
         let receipt = await_receipt();
         let mut observations = 0;
-        let result = await_exact_worker_stopped(
+        let result = stopped_snapshot(
             &receipt,
             || {
                 observations += 1;
@@ -644,7 +675,28 @@ mod tests {
             Duration::ZERO,
         );
         assert!(result.is_err());
-        assert_eq!(observations, 1);
+        assert_eq!(observations, ABSENT_OBSERVATIONS_BEFORE_FAILING);
+    }
+
+    #[test]
+    fn one_process_table_read_that_misses_the_worker_is_retried() {
+        let receipt = await_receipt();
+        let mut observations = 0;
+        let result = stopped_snapshot(
+            &receipt,
+            || {
+                observations += 1;
+                if observations == 1 {
+                    Ok(BTreeMap::new())
+                } else {
+                    Ok(snapshot_of(&receipt, true))
+                }
+            },
+            ROOT_STOP_OBSERVATION_ATTEMPTS,
+            Duration::ZERO,
+        );
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(observations, 2);
     }
 
     #[test]

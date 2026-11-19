@@ -127,6 +127,14 @@ as `hold-condition:` lines so it can be released this way. Gotcha:
 `docs/advance.md` lands; the refusal changes nothing. Defect dequeues keep
 their own path. Full reference: `docs/advance.md`.
 
+## An empty diff is never admitted: `empty_diff`
+
+The steward refuses a pull request that has commits but changes no files against its base (GitHub
+changed_files == 0 and commits > 0). It reports `blocked_on: empty_diff` with the next action: a repair merge
+probably dropped the PR's changes, so restore them from an earlier head or close the PR as superseded. On
+2026-11-18 repair merges emptied four PRs (Pulp #12547 and #12549, skia-builder #63, v8-builder #71) that
+would otherwise have merged as no-ops. Unknown counts never block; only an observed 0 with commits does.
+
 ## Stale merge refs: `stale_merge_ref`
 
 An approved pull request whose required checks went red on a test merge
@@ -659,6 +667,15 @@ save can read back an empty or old file and drop a PR's episode. Take the
 writer-domain lease before calling it; the helper only makes the write
 crash-safe. Off Unix only the file is synced, because std has no directory
 handle to sync there.
+
+## Stopping a worker's process tree waits on every scan
+
+When the supervisor stops a worker, `freeze_complete_tree` (src/execution_termination.rs) freezes the worker and
+then snapshots its process tree. Every scan waits, bounded, for the worker to read as stopped, and a pid counts
+as gone only after it is missing from five `ps` reads in a row. A single `ps` sample under load can misread a
+stopped process as running or miss its row, and that used to fail the stop with "exact worker identity was not
+frozen before tree snapshot" (the old `scheduler_defer_deadline_prevents_immediate_worker_relaunch` flake, #1347).
+If that error appears now, it names the last observation it saw; treat a repeat as a real stuck worker.
 
 ## A lane job running at reboot is requeued once, not lost
 
