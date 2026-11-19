@@ -2,9 +2,9 @@
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
-use std::process::{Command, ExitCode, Stdio};
+use std::process::{Command, ExitCode, ExitStatus, Stdio};
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -40,27 +40,35 @@ fn pool() -> Value {
     let Ok(mut child) = child else {
         return unavailable(child.unwrap_err());
     };
-    match child.wait_timeout(Duration::from_secs(3)) {
-        Ok(Some(_)) => {}
+    let status = match child.wait_timeout(Duration::from_secs(3)) {
+        Ok(Some(status)) => status,
         Ok(None) => {
             let _ = child.kill();
             let _ = child.wait();
             return unavailable("sr status timed out");
         }
         Err(error) => return unavailable(error),
+    };
+    let mut stdout = Vec::new();
+    let Some(mut pipe) = child.stdout.take() else {
+        return unavailable("sr stdout unavailable");
+    };
+    if let Err(error) = pipe.read_to_end(&mut stdout) {
+        return unavailable(error);
     }
-    match child.wait_with_output() {
-        Ok(output) if output.status.success() => {
-            match serde_json::from_slice::<Value>(&output.stdout) {
-                Ok(status) => status
-                    .get("claude_pool")
-                    .cloned()
-                    .unwrap_or_else(|| unavailable("claude_pool field missing")),
-                Err(error) => unavailable(format!("invalid sr JSON: {error}")),
-            }
-        }
-        Ok(output) => unavailable(format!("sr exited {}", output.status)),
-        Err(error) => unavailable(error),
+    pool_result(status, &stdout)
+}
+
+fn pool_result(status: ExitStatus, stdout: &[u8]) -> Value {
+    if !status.success() {
+        return unavailable(format!("sr exited {status}"));
+    }
+    match serde_json::from_slice::<Value>(stdout) {
+        Ok(status) => status
+            .get("claude_pool")
+            .cloned()
+            .unwrap_or_else(|| unavailable("claude_pool field missing")),
+        Err(error) => unavailable(format!("invalid sr JSON: {error}")),
     }
 }
 
@@ -129,6 +137,14 @@ fn count_rows(rows: &[Value], overdue: &BTreeSet<u64>) -> Value {
 }
 
 fn report(snapshots: Vec<Value>, hosts_file: Option<&Path>) -> Value {
+    report_with_snapshot_source(snapshots, hosts_file, json!("available"))
+}
+
+fn report_with_snapshot_source(
+    snapshots: Vec<Value>,
+    hosts_file: Option<&Path>,
+    snapshot_source: Value,
+) -> Value {
     let repos: Vec<Value> = snapshots
         .into_iter()
         .map(|snapshot| {
@@ -204,7 +220,7 @@ fn report(snapshots: Vec<Value>, hosts_file: Option<&Path>) -> Value {
             .map(|repo| repo["counts"][key].as_u64().unwrap_or(0))
             .sum::<u64>()
     };
-    json!({"source": "steward-snapshot", "summary": {
+    json!({"source": "steward-snapshot", "steward_snapshots": snapshot_source, "summary": {
         "repos": repos.len(), "open": sum("open"), "approved_green": sum("approved_green"),
         "waiting_review": sum("waiting_review"), "red": sum("red"), "overdue": sum("overdue")},
         "owner_actions": owner_actions, "repos": repos,
@@ -268,13 +284,14 @@ fn source_line(value: &Value) -> String {
 fn markdown(data: &Value) -> String {
     let summary = &data["summary"];
     let mut out = format!(
-        "# Fleet report\n\n## Summary\n\n{} repos; {} open; {} approved and green; {} waiting review; {} red; {} overdue.\n\nSteward tick: {}\n\n",
+        "# Fleet report\n\n## Summary\n\n{} repos; {} open; {} approved and green; {} waiting review; {} red; {} overdue.\n\nSnapshot source: {}\n\nSteward tick: {}\n\n",
         summary["repos"],
         summary["open"],
         summary["approved_green"],
         summary["waiting_review"],
         summary["red"],
         summary["overdue"],
+        source_line(&data["steward_snapshots"]),
         source_line(&data["steward_tick"])
     );
     out.push_str("## Owner actions\n\n");
@@ -342,7 +359,11 @@ pub(super) fn run<W: Write>(
     hosts_file: Option<&Path>,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
-    let data = report(dwell_cmd::snapshots(state_dir, None), hosts_file);
+    let (snapshots, snapshot_source) = match dwell_cmd::snapshots_for_report(state_dir, None) {
+        Ok(snapshots) => (snapshots, json!("available")),
+        Err(error) => (Vec::new(), unavailable(error)),
+    };
+    let data = report_with_snapshot_source(snapshots, hosts_file, snapshot_source);
     let rendered = if format == "json" {
         serde_json::to_string_pretty(&data).expect("JSON value")
     } else {
@@ -412,5 +433,44 @@ mod tests {
         run(temp.path(), "json", None, &mut output).unwrap();
         let report: Value = serde_json::from_slice(&output).unwrap();
         assert_eq!(report["repos"][0]["rows"][0]["number"], 1);
+    }
+
+    #[test]
+    fn unavailable_snapshots_are_rendered_without_claiming_zero_is_current() {
+        let data = report_with_snapshot_source(
+            Vec::new(),
+            None,
+            unavailable("steward-dwell: directory is unreadable"),
+        );
+        assert_eq!(
+            data["steward_snapshots"]["unavailable"],
+            "steward-dwell: directory is unreadable"
+        );
+        assert_eq!(data["summary"]["repos"], 0);
+        assert!(
+            markdown(&data)
+                .contains("Snapshot source: (unavailable: steward-dwell: directory is unreadable)")
+        );
+    }
+
+    #[test]
+    fn completed_pool_child_output_is_read_after_timeout_wait() {
+        let mut child = Command::new("sh")
+            .args(["-c", "printf '%s' '{\"claude_pool\":{\"ready\":1}}'"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let status = child
+            .wait_timeout(Duration::from_secs(3))
+            .unwrap()
+            .expect("child should complete");
+        let mut stdout = Vec::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_end(&mut stdout)
+            .unwrap();
+        assert_eq!(pool_result(status, &stdout)["ready"], 1);
     }
 }
