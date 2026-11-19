@@ -136,14 +136,10 @@ fn count_rows(rows: &[Value], overdue: &BTreeSet<u64>) -> Value {
     })
 }
 
-fn report(snapshots: Vec<Value>, hosts_file: Option<&Path>) -> Value {
-    report_with_snapshot_source(snapshots, hosts_file, json!("available"))
-}
-
 fn report_with_snapshot_source(
     snapshots: Vec<Value>,
     hosts_file: Option<&Path>,
-    snapshot_source: Value,
+    snapshot_source: &Value,
 ) -> Value {
     let repos: Vec<Value> = snapshots
         .into_iter()
@@ -363,7 +359,7 @@ pub(super) fn run<W: Write>(
         Ok(snapshots) => (snapshots, json!("available")),
         Err(error) => (Vec::new(), unavailable(error)),
     };
-    let data = report_with_snapshot_source(snapshots, hosts_file, snapshot_source);
+    let data = report_with_snapshot_source(snapshots, hosts_file, &snapshot_source);
     let rendered = if format == "json" {
         serde_json::to_string_pretty(&data).expect("JSON value")
     } else {
@@ -379,7 +375,7 @@ mod tests {
 
     #[test]
     fn fixture_snapshots_group_rows_and_owner_actions() {
-        let data = report(
+        let data = report_with_snapshot_source(
             vec![
                 json!({"repo":"o/a","at":"now","fleet_rows":[
             {"number":1,"title":"Owner choice","blocked_on":"owner_decision","owner":"daniel","age_minutes":42,
@@ -390,6 +386,7 @@ mod tests {
             {"number":3,"title":"Review","blocked_on":"no_verdict","tier":"green_needs_review"}],"overdue":[]}),
             ],
             None,
+            &json!("available"),
         );
         assert_eq!(data["summary"]["open"], 3);
         assert_eq!(data["summary"]["approved_green"], 1);
@@ -437,11 +434,8 @@ mod tests {
 
     #[test]
     fn unavailable_snapshots_are_rendered_without_claiming_zero_is_current() {
-        let data = report_with_snapshot_source(
-            Vec::new(),
-            None,
-            unavailable("steward-dwell: directory is unreadable"),
-        );
+        let snapshot_source = unavailable("steward-dwell: directory is unreadable");
+        let data = report_with_snapshot_source(Vec::new(), None, &snapshot_source);
         assert_eq!(
             data["steward_snapshots"]["unavailable"],
             "steward-dwell: directory is unreadable"
