@@ -11,6 +11,7 @@ use super::GitHubActions;
 const BILLING_MARKERS: [&str; 2] = ["recent account payments have failed", "spending limit"];
 const QUEUED_LIMIT: Duration = Duration::hours(6);
 const MAX_QUEUED_RUNS: u32 = 5;
+const MAX_BILLING_RUNS: u32 = 5;
 /// The probe reads at most once per repository per this many minutes.
 pub(super) const PROBE_INTERVAL_MINUTES: i64 = 30;
 
@@ -230,45 +231,45 @@ fn probe_billing(
 ) -> (Option<CiHealthOverdue>, Vec<String>) {
     let mut errors = Vec::new();
 
-    match actions.list_runs_with_status(repo, "completed", Some(default_branch), 1) {
+    match actions.list_runs_with_status(repo, "completed", Some(default_branch), MAX_BILLING_RUNS) {
         Ok(runs) => {
-            if let Some(run) = runs.first() {
-                match actions.workflow_run_jobs_raw(repo, run.database_id) {
-                    Ok(jobs) => {
-                        for job in jobs
-                            .get("jobs")
-                            .and_then(Value::as_array)
-                            .into_iter()
-                            .flatten()
-                            .filter(|job| {
-                                job.get("conclusion").and_then(Value::as_str) == Some("failure")
-                            })
-                        {
-                            let Some(check_run_id) = job_check_run_id(job) else {
-                                continue;
-                            };
-                            match actions.check_run_annotations_raw(repo, check_run_id) {
-                                Ok(annotations) if annotations_show_billing_block(&annotations) => {
-                                    return (
-                                        Some(CiHealthOverdue {
-                                            kind: "overdue",
-                                            condition: "ci_billing_blocked",
-                                            repo: repo.to_owned(),
-                                            detail: "recent account payments have failed or spending limit"
-                                                .to_owned(),
-                                            at: now,
-                                        }),
-                                        errors,
-                                    );
-                                }
-                                Ok(_) => {}
-                                Err(error) => {
-                                    errors.push(format!("ci_billing_blocked: {error:?}"));
-                                }
-                            }
+            for run in runs {
+                let jobs = match actions.workflow_run_jobs_raw(repo, run.database_id) {
+                    Ok(jobs) => jobs,
+                    Err(error) => {
+                        errors.push(format!("ci_billing_blocked jobs: {error:?}"));
+                        continue;
+                    }
+                };
+                for job in jobs
+                    .get("jobs")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter(|job| job.get("conclusion").and_then(Value::as_str) == Some("failure"))
+                {
+                    let Some(check_run_id) = job_check_run_id(job) else {
+                        continue;
+                    };
+                    match actions.check_run_annotations_raw(repo, check_run_id) {
+                        Ok(annotations) if annotations_show_billing_block(&annotations) => {
+                            return (
+                                Some(CiHealthOverdue {
+                                    kind: "overdue",
+                                    condition: "ci_billing_blocked",
+                                    repo: repo.to_owned(),
+                                    detail: "recent account payments have failed or spending limit"
+                                        .to_owned(),
+                                    at: now,
+                                }),
+                                errors,
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            errors.push(format!("ci_billing_blocked: {error:?}"));
                         }
                     }
-                    Err(error) => errors.push(format!("ci_billing_blocked jobs: {error:?}")),
                 }
             }
         }
@@ -554,7 +555,7 @@ mod tests {
         }))
         .unwrap();
         let script = format!(
-            "#!/bin/sh\nset -eu\ncase \"$*\" in\n  *\"actions/runs?status=completed&per_page=1&branch=main\") printf '%s' '{{\"workflow_runs\":[]}}';;\n  *\"repos/acme/repo/actions/runners?per_page=100\") printf '%s' '{{\"runners\":[]}}';;\n  *\"orgs/acme/actions/runners?per_page=100&page=2\") printf '%s' '{page_two}';;\n  *\"orgs/acme/actions/runners?per_page=100\") printf '%s' '{page_one}';;\n  *\"actions/runs?status=queued&per_page=5\") printf '%s' '{{\"workflow_runs\":[{{\"id\":42,\"name\":\"CI\",\"head_branch\":\"main\",\"event\":\"push\",\"created_at\":\"2026-11-18T00:00:00Z\"}}]}}';;\n  *\"actions/runs?status=in_progress&per_page=5\") printf '%s' '{{\"workflow_runs\":[]}}';;\n  *\"actions/runs/42/jobs?per_page=100\") printf '%s' '{{\"jobs\":[{{\"status\":\"queued\",\"name\":\"build\",\"created_at\":\"2026-11-18T00:00:00Z\",\"labels\":[\"self-hosted\",\"org-only\"]}}]}}';;\n  *) echo \"unexpected args: $*\" >&2; exit 1;;\nesac\n"
+            "#!/bin/sh\nset -eu\ncase \"$*\" in\n  *\"actions/runs?status=completed&per_page=5&branch=main\") printf '%s' '{{\"workflow_runs\":[]}}';;\n  *\"repos/acme/repo/actions/runners?per_page=100\") printf '%s' '{{\"runners\":[]}}';;\n  *\"orgs/acme/actions/runners?per_page=100&page=2\") printf '%s' '{page_two}';;\n  *\"orgs/acme/actions/runners?per_page=100\") printf '%s' '{page_one}';;\n  *\"actions/runs?status=queued&per_page=5\") printf '%s' '{{\"workflow_runs\":[{{\"id\":42,\"name\":\"CI\",\"head_branch\":\"main\",\"event\":\"push\",\"created_at\":\"2026-11-18T00:00:00Z\"}}]}}';;\n  *\"actions/runs?status=in_progress&per_page=5\") printf '%s' '{{\"workflow_runs\":[]}}';;\n  *\"actions/runs/42/jobs?per_page=100\") printf '%s' '{{\"jobs\":[{{\"status\":\"queued\",\"name\":\"build\",\"created_at\":\"2026-11-18T00:00:00Z\",\"labels\":[\"self-hosted\",\"org-only\"]}}]}}';;\n  *) echo \"unexpected args: $*\" >&2; exit 1;;\nesac\n"
         );
         crate::test_support::write_executable_script(&gh, &script);
         let actions = GitHubActions::hermetic_for_tests(temp.path(), &gh);
@@ -628,7 +629,7 @@ mod tests {
         let script = r#"#!/bin/sh
 set -eu
 case "$*" in
-  *"actions/runs?status=completed&per_page=1&branch=main") printf '%s' '{"workflow_runs":[]}';;
+  *"actions/runs?status=completed&per_page=5&branch=main") printf '%s' '{"workflow_runs":[]}';;
   *"orgs/acme/actions/runners?per_page=100") echo 'gh: Not Found (HTTP 404)' >&2; exit 1;;
   *"repos/acme/repo/actions/runners?per_page=100") printf '%s' '{"runners":[{"status":"online","labels":[{"name":"linux"}]}]}';;
   *"repos/acme/repo" ) printf '%s' '{"owner":{"type":"User"}}';;
@@ -657,7 +658,8 @@ esac
         let script = r#"#!/bin/sh
 set -eu
 case "$*" in
-  *"actions/runs?status=completed&per_page=1&branch=main") printf '%s' '{"workflow_runs":[{"id":7,"name":"CI","head_branch":"main","event":"push","created_at":"2026-11-18T00:00:00Z"}]}';;
+  *"actions/runs?status=completed&per_page=5&branch=main") printf '%s' '{"workflow_runs":[{"id":8,"name":"Hosted","head_branch":"main","event":"push","created_at":"2026-11-18T11:00:00Z"},{"id":7,"name":"Self-hosted","head_branch":"main","event":"push","created_at":"2026-11-18T00:00:00Z"}]}';;
+  *"actions/runs/8/jobs?per_page=100") printf '%s' '{"jobs":[]}';;
   *"actions/runs/7/jobs?per_page=100") printf '%s' '{"jobs":[{"id":1,"check_run_url":"https://api.github.com/repos/acme/repo/check-runs/101","conclusion":"failure"},{"id":2,"check_run_url":"https://api.github.com/repos/acme/repo/check-runs/202","conclusion":"failure"}]}';;
   *"check-runs/101/annotations") printf '%s' '[]';;
   *"check-runs/202/annotations") printf '%s' '[{"message":"spending limit reached"}]';;
