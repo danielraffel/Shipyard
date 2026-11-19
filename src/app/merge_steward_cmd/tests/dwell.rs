@@ -709,6 +709,29 @@ fn failed_merge_group_run() -> StewardRun {
     }
 }
 
+#[test]
+fn queued_approved_green_pr_starts_and_escalates_base_stall() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut queued = pr(1, Some("SUCCESS"), Some("SUCCESS"), &[]);
+    queued.fact.queue_position = Some(0);
+    let mut pass = pass(&temp, vec![queued], vec![report(1, "queued", None)]);
+    pass.observation.base_sha = Some("a".repeat(40));
+    let mut ledger = established();
+    let first = pass.run(&mut ledger, &FakeActs::default());
+    assert_eq!(first.base_eligible, Some(1));
+    pass.now = now() + chrono::Duration::minutes(61);
+    let later = pass.run(&mut ledger, &FakeActs::default());
+    assert!(later.overdue.iter().any(|row| row.state
+        == crate::merge_steward::dwell::DwellState::BaseStalled
+        && row.escalated));
+    assert!(
+        !later
+            .overdue
+            .iter()
+            .any(|row| row.state == crate::merge_steward::dwell::DwellState::ApprovedStuck)
+    );
+}
+
 /// The completed merge-group census is read once, on the pass the
 /// base-stalled alarm first escalates, and its failing job names the alarm;
 /// later passes neither read it again nor lose the job.

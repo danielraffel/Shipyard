@@ -512,7 +512,7 @@ pub(super) fn run(
         )
     }));
     report.base_observed.clone_from(&input.observation.base_sha);
-    let eligible = stuck_candidates(input, reports);
+    let eligible = eligible_candidates(input, reports, true);
     let eligible: Vec<dwell::BaseStalledCandidate> = eligible
         .iter()
         .map(|candidate| dwell::BaseStalledCandidate {
@@ -688,10 +688,19 @@ pub(super) fn failed_merge_group_job<'a>(
 }
 
 fn stuck_candidates(input: &DwellInput<'_>, reports: &[PrReport]) -> Vec<dwell::StuckCandidate> {
+    eligible_candidates(input, reports, false)
+}
+
+// Base stalls include queued PRs, even when their report has no blocker.
+fn eligible_candidates(
+    input: &DwellInput<'_>,
+    reports: &[PrReport],
+    include_queued: bool,
+) -> Vec<dwell::StuckCandidate> {
     let policy = input.policy;
     reports
         .iter()
-        .filter(|report| !report.blocked.blocked_on.is_empty())
+        .filter(|report| include_queued || !report.blocked.blocked_on.is_empty())
         // The steward merges only what it manages; an unmanaged pull request
         // is not one it left unmerged, and the census does not read its
         // checks.
@@ -705,7 +714,8 @@ fn stuck_candidates(input: &DwellInput<'_>, reports: &[PrReport]) -> Vec<dwell::
         .filter(|report| {
             !report.mutation.as_deref().is_some_and(|mutation| {
                 mutation.split([',', ';']).any(|part| {
-                    part.starts_with("enqueued") || part.starts_with("merged_exact_head")
+                    (!include_queued && part.starts_with("enqueued"))
+                        || part.starts_with("merged_exact_head")
                 })
             })
         })
@@ -718,7 +728,7 @@ fn stuck_candidates(input: &DwellInput<'_>, reports: &[PrReport]) -> Vec<dwell::
                 .fact;
             (approved_at_head(pr, policy)
                 && !pr.draft
-                && pr.queue_position.is_none()
+                && (include_queued || pr.queue_position.is_none())
                 && crate::merge_steward::excluded_admission_label(&pr.labels).is_none()
                 && pr.head_sha.eq_ignore_ascii_case(&report.head_sha)
                 && crate::merge_steward::required_checks_all_succeeded(pr, policy))
