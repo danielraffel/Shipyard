@@ -87,9 +87,9 @@ fn excluded_size_path(path: &str) -> bool {
         || std::path::Path::new(&lower)
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("lock"))
-        || lower
-            .split('/')
-            .any(|part| part == "generated" || part.ends_with(".generated"))
+        || lower.split('/').any(|part| {
+            part == "generated" || part.ends_with(".generated") || part.contains(".generated.")
+        })
         || matches!(
             lower.rsplit('/').next().unwrap_or(""),
             "version" | "version.txt" | "version.json"
@@ -1325,6 +1325,7 @@ mod tests {
         ] {
             assert!(excluded_size_path(path), "{path}");
         }
+        assert!(excluded_size_path("src/schema.generated.rs"));
         assert!(!excluded_size_path("src/ship.rs"));
     }
 
