@@ -78,6 +78,8 @@ pub const RED_EVERYWHERE_KEY: &str = "red_everywhere";
 /// Checks that are not required and may be red or pending on an `UNSTABLE`
 /// head the steward still merges ([`EjectionGuards::unstable_advisory_checks`]).
 pub const UNSTABLE_ADVISORY_CHECKS_KEY: &str = "unstable_advisory_checks";
+/// `[auto_merge]` key selecting [`EjectionGuards::repair_unstable_reds`].
+pub const REPAIR_UNSTABLE_REDS_KEY: &str = "repair_unstable_reds";
 
 /// What the steward does when the same required check fails the same way on
 /// many open pull requests (`[auto_merge] red_everywhere`).
@@ -122,6 +124,10 @@ impl RedEverywhereMode {
 /// not ask for them gets. The steward builds its value with
 /// [`Self::from_config`], whose defaults follow the merge queue.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each bool is one independent [auto_merge] switch read from the base config"
+)]
 pub struct EjectionGuards {
     /// Generated-path globs from the base config.
     pub generated_paths: Vec<String>,
@@ -166,6 +172,12 @@ pub struct EjectionGuards {
     /// Why `unstable_advisory_checks` did not parse, when it did not.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unstable_advisory_checks_error: Option<String>,
+    /// On a base with no merge queue, whether an approved head GitHub holds
+    /// `UNSTABLE` on a red check that is neither required nor advisory reads
+    /// `unstable_failed:<checks>` for the repair lane instead of waiting on
+    /// the coordinator (`[auto_merge] repair_unstable_reds`, default off).
+    /// It routes; it never admits anything.
+    pub repair_unstable_reds: bool,
     /// Why the base config could not be read, when it could not. The guards
     /// then keep their merge-queue defaults (on) with no generated paths.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -197,6 +209,7 @@ impl EjectionGuards {
             flake_requeue: super::flake_requeue::FlakePolicy::for_base(merge_queue),
             unstable_advisory_checks: None,
             unstable_advisory_checks_error: None,
+            repair_unstable_reds: false,
             read_error: None,
         }
     }
@@ -244,6 +257,7 @@ impl EjectionGuards {
             }
         }
         guards.batch_guard = flag(BATCH_GUARD_KEY, guards.batch_guard);
+        guards.repair_unstable_reds = !merge_queue && flag(REPAIR_UNSTABLE_REDS_KEY, false);
         guards.red_outranks_pending = flag(RED_OUTRANKS_PENDING_KEY, guards.red_outranks_pending);
         guards.infra_only_retry = flag(INFRA_ONLY_RETRY_KEY, guards.infra_only_retry);
         if let Some(mode) = section

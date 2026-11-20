@@ -344,6 +344,7 @@ fn callers_move(kind: &str, facts: &Facts<'_>, stall: &Stall) -> Option<NextActi
                  required do not gate."
             ),
         ),
+        "unstable_failed" | "unstable_red_exhausted" => unstable_red(kind, arg, repo, *number),
         "held" => held(stall, repo, base, *number),
         "ejection_cap" => NextAction::new(
             Actor::Author,
@@ -680,6 +681,29 @@ fn merge_state(state: &str, base: &str, number: u64) -> NextAction {
             ),
         ),
     }
+}
+
+/// An approved head held `UNSTABLE` on a red check that is not required and
+/// not advisory: the repair lane, or the coordinator once the route limit is
+/// spent at this head (see `unstable_repair`).
+fn unstable_red(kind: &str, arg: &str, repo: &str, number: u64) -> NextAction {
+    if kind == "unstable_red_exhausted" {
+        return NextAction::new(
+            Actor::Operator,
+            format!(
+                "Check(s) {arg} stayed red at this head after two repair routes: the coordinator \
+                 decides (fix, rerun, or list the check in [auto_merge] unstable_advisory_checks)."
+            ),
+        );
+    }
+    NextAction::new(
+        Actor::Repair,
+        format!(
+            "Check(s) {arg} are red on this approved head and hold it UNSTABLE (not required, \
+             not in [auto_merge] unstable_advisory_checks): the repair lane fixes them; \
+             `shipyard diagnose --pr {number} --repo {repo}` names the failure."
+        ),
+    )
 }
 
 fn held(stall: &Stall, repo: &str, base: &str, number: u64) -> NextAction {

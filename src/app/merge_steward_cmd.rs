@@ -352,6 +352,10 @@ struct StewardLedger {
     /// keyed `repo#pr`. See `scheduling_loop`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     loop_seen: BTreeMap<String, scheduling_loop::Seen>,
+    /// Red runs routed to repair on `UNSTABLE` heads, keyed `repo#pr`
+    /// (lowercase repository). See `unstable_repair`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    unstable_routes: BTreeMap<String, unstable_repair::Routes>,
     /// Doomed merge groups the steward decided on, keyed
     /// `repo#pr@group-sha`: once per (pull request, group head). See
     /// `merge_group_stall`.
@@ -2307,6 +2311,7 @@ mod stale_merge_ref;
 mod superseded;
 mod terminal_handoff;
 mod unapproved_admission;
+mod unstable_repair;
 pub(super) use carried_commits::STACKED_LABEL_PREFIX;
 pub(super) use infra_rerun::Mode as InfraRerunMode;
 pub(super) use unapproved_admission::DequeueMode;

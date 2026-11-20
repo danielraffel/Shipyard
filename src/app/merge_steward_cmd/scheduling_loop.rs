@@ -305,7 +305,9 @@ pub(crate) fn state_for(
             LoopState::CheckRunning
         }
         "capacity_queued" => LoopState::CapacityQueued,
-        "required_failed" => LoopState::RequiredRed,
+        // A red check that is not required holds an approved UNSTABLE head:
+        // the repair lane fixes it like a required red (see `unstable_repair`).
+        "required_failed" | "unstable_failed" | "unstable_red_exhausted" => LoopState::RequiredRed,
         "held" => LoopState::Hold,
         // Removed from the queue and not put back at this head: a new head
         // is the way forward (a defect-fix removal included).
@@ -546,8 +548,14 @@ pub(crate) fn for_row(
         }
     }
     .min(now);
+    let mut classified = classify(state, since, now);
+    if facts.token.starts_with("unstable_red_exhausted:") {
+        // The route limit is spent at this head: the coordinator, never a
+        // third repair route.
+        classified.actor = LoopActor::Coordinator;
+    }
     Some((
-        classify(state, since, now),
+        classified,
         Seen {
             state,
             head: facts.head.to_ascii_lowercase(),

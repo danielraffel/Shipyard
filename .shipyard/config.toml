@@ -89,6 +89,10 @@ required_checks = [
 
 [auto_merge]
 human_reviewers = ["danielraffel"]
+# An approved head held UNSTABLE on a red check that is neither required nor
+# listed advisory reads `unstable_failed:<checks>` for the repair lane, up to
+# two red runs of one check per head, then the coordinator. Routing only.
+repair_unstable_reds = true
 # Who may sign the fleet App's `verdict: APPROVE`: an approval posted through
 # ghapp counts only with a `reviewer: <name>` line naming one of these. This
 # list beats any host's reviewer-signers.json. `shipyard review-verdict` and
