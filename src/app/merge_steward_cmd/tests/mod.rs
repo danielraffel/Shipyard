@@ -262,6 +262,7 @@ mod superseded;
 mod transient_rerun;
 #[cfg(unix)]
 mod unapproved_admission;
+mod unstable_repair;
 
 /// A CI-health probe that cannot read (an unknown runner inventory, a failed
 /// billing read) is advisory: it lands in `ci_health_diagnostics`, never in

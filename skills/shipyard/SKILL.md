@@ -3866,7 +3866,11 @@ With the key unset, a list that is not an array of check names, an
 the decision's contexts name each check that holds it (`<name> (not in
 unstable_advisory_checks)`) and each list entry that matches no check on the
 head (`unstable_advisory_checks entry matches no check: <entry>`), so a typo
-shows. Per-PR mutations are `merged_exact_head:<sha>` (followed by
+shows. With `[auto_merge] repair_unstable_reds = true` (default off), an
+approved held head whose holding check is red (not only pending) reads
+`unstable_failed:<checks>` instead, for the repair lane, and
+`unstable_red_exhausted:<checks>` (the coordinator) once one check has gone
+red on more than two runs at that head. It routes; it never admits. Per-PR mutations are `merged_exact_head:<sha>` (followed by
 `,advisory_not_green:<a>|<b>` when advisory checks were red or pending; the
 tick summary line shows them as `advisory_not_green=#<n>:<a>|<b>`),
 `waiting_head_approval`, and

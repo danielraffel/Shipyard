@@ -58,11 +58,19 @@ The first match wins:
 | `no_verdict`, `awaiting_review:*`, `waiting_head_approval`, `approval_excluded:*`, `waiting_code_owner:*`, `code_owner_review`, `carries_unapproved_commits:*` | `awaiting_review` |
 | `required_pending`, `waiting_full_test_tier`, `waiting_enqueue_requirements`, `merge_state:` other than `DIRTY`/`BEHIND` | `check_running` |
 | `capacity_queued` | `capacity_queued` |
-| `required_failed:*` | `required_red` |
+| `required_failed:*`, `unstable_failed:*`, `unstable_red_exhausted:*` (actor `coordinator`, see below) | `required_red` |
 | `held:*` | `hold` |
 | `merge_state:DIRTY` | `dirty` |
 | `ejected_same_head:*`, `ejection_cap`, `defect_fix_removed:*` (removed for a defect; this head is never put back) | `ejected` |
 | anything else: `transient_rerun`, `required_never_ran:*`, `approval_unread`, `steward_error`, `uncertain_mutation`, `revalidating`, `required_policy_unknown`, `carried_commits_*`, and any token added later | `tooling` |
+
+`unstable_failed:<checks>` is an approved head, on a base with no merge queue,
+that GitHub holds `UNSTABLE` on a red check that is neither required nor in
+`[auto_merge] unstable_advisory_checks`, read only with `[auto_merge]
+repair_unstable_reds = true` (default off). The repair lane fixes it like a
+required red. A check that has gone red on more than two distinct runs at one
+head reads `unstable_red_exhausted:<checks>` instead, and its actor is the
+coordinator, never a third repair route. A new head starts the count over.
 
 `revalidating` and `uncertain_mutation` normally clear on the next pass, so
 they reach the 10-minute `tooling` deadline only when they persist. A row the

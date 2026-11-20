@@ -1033,6 +1033,9 @@ pub(super) fn apply_pr_plans_with_poison(
     // A red row whose checks ran on a long-stale merge ref, on an approved
     // head, reads `stale_merge_ref`; the dwell pass retriggers it.
     super::stale_merge_ref::annotate(actions, observation, policy, ledger, &mut reports);
+    // An approved head held UNSTABLE on a red non-advisory check goes to the
+    // repair lane, within its route limit. See `unstable_repair`.
+    super::unstable_repair::annotate(observation, policy, ledger, &mut reports, args.apply);
     if let Some(stall) = merge_group_stall {
         super::merge_group_stall::annotate(stall, &mut reports);
         super::merge_group_stall::annotate_defect_fix(

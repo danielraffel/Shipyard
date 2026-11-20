@@ -649,6 +649,65 @@ pub fn non_required_not_green(pr: &StewardPullRequest, policy: &StewardPolicy) -
     names
 }
 
+/// One red check that holds an `UNSTABLE` head: its name and the GitHub id
+/// of the failing observation (a rerun is a new id).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnstableRed {
+    /// The check or status context name.
+    pub name: String,
+    /// The failing observation's [`StewardCheck::check_id`], when known.
+    pub check_id: Option<u64>,
+}
+
+/// The checks that hold an `UNSTABLE` head red for the repair lane
+/// (`[auto_merge] repair_unstable_reds`): checks no required rule selects
+/// whose newest observation on the head is a terminal failure, minus the
+/// advisory list and the steward's own recovery status. Sorted by name; empty
+/// when the flag is off, the base has a merge queue, or GitHub does not say
+/// `UNSTABLE`. A check that is only pending is not red: the head may still
+/// turn `CLEAN` on its own.
+#[must_use]
+pub fn unstable_reds(pr: &StewardPullRequest, policy: &StewardPolicy) -> Vec<UnstableRed> {
+    if !policy.ejection_guards.repair_unstable_reds
+        || !pr.merge_state.eq_ignore_ascii_case("UNSTABLE")
+    {
+        return Vec::new();
+    }
+    let advisory = policy
+        .ejection_guards
+        .unstable_advisory_checks
+        .as_deref()
+        .unwrap_or_default();
+    let mut reds = non_required_not_green(pr, policy)
+        .into_iter()
+        .filter(|name| !name.eq_ignore_ascii_case(STEWARD_RECOVERY_CONTEXT))
+        .filter(|name| !advisory.iter().any(|entry| entry.trim() == name))
+        .filter_map(|name| {
+            let newest = pr
+                .checks
+                .iter()
+                .filter(|check| check.name.trim() == name)
+                .max_by(|left, right| cmp_recency(left, right))?;
+            let red = newest.status.eq_ignore_ascii_case("COMPLETED")
+                && matches!(
+                    newest
+                        .conclusion
+                        .as_deref()
+                        .unwrap_or_default()
+                        .to_ascii_uppercase()
+                        .as_str(),
+                    "FAILURE" | "TIMED_OUT" | "ERROR" | "ACTION_REQUIRED" | "STARTUP_FAILURE"
+                );
+            red.then_some(UnstableRed {
+                check_id: newest.check_id,
+                name,
+            })
+        })
+        .collect::<Vec<_>>();
+    reds.sort_by(|left, right| left.name.cmp(&right.name));
+    reds
+}
+
 /// Required contexts whose newest observation on this head is a terminal
 /// failure, sorted, whatever else is still running. A cancelled check the
 /// rerun budget still covers is not counted. [`classify_pr`] reports

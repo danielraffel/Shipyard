@@ -386,6 +386,7 @@ fn classify_token(facts: &RowFacts<'_>, policy: &StewardPolicy) -> (Stall, Since
         ),
         StewardDecision::WaitingRequired { contexts } => red_while_pending(pr, policy, contexts)
             .or_else(|| approval_context_only(facts, policy, contexts, false))
+            .or_else(|| unstable_red_for_repair(facts, policy, contexts))
             .unwrap_or_else(|| waiting_required(pr, policy, contexts)),
         StewardDecision::RequiredFailed { contexts } => {
             approval_context_only(facts, policy, contexts, true)
@@ -448,6 +449,51 @@ fn red_while_pending(
             context_names(policy, pending)
         )),
     ))
+}
+
+/// An approved head GitHub holds `UNSTABLE` on a red check that is neither
+/// required nor advisory, with `[auto_merge] repair_unstable_reds` on: the
+/// repair lane's `unstable_failed:<checks>` instead of `merge_state:UNSTABLE`.
+/// Approved means the exact-head gate admits it, or, unread, that the base
+/// requires its approval context (an `UNSTABLE` head has every required check
+/// green). The route limit is applied later, against the ledger
+/// ([`super::unstable_repair`]).
+fn unstable_red_for_repair(
+    facts: &RowFacts<'_>,
+    policy: &StewardPolicy,
+    contexts: &[String],
+) -> Option<(Stall, SinceHint)> {
+    if contexts.first().map(String::as_str) != Some("github-merge-state:CLEAN (current=UNSTABLE)") {
+        return None;
+    }
+    let approval = policy.approval_context.trim();
+    let approved = match facts.approval {
+        GateRead::Admits => true,
+        GateRead::Refused(_) => false,
+        GateRead::Unread => {
+            !approval.is_empty()
+                && policy
+                    .required_checks
+                    .iter()
+                    .any(|required| required.context.trim().eq_ignore_ascii_case(approval))
+        }
+    };
+    if !approved {
+        return None;
+    }
+    let reds = crate::merge_steward::unstable_reds(facts.pr, policy);
+    if reds.is_empty() {
+        return None;
+    }
+    let (token, detail) = super::unstable_repair::token(&reds, None, &facts.pr.head_sha);
+    let since = facts
+        .pr
+        .checks
+        .iter()
+        .filter(|check| reds.iter().any(|red| red.name == check.name.trim()))
+        .filter_map(|check| check.observed_at.clone())
+        .max();
+    Some(dated(token, since, "check_completed", Some(detail)))
 }
 
 /// A head every required check passed: what the admission attempt found.
