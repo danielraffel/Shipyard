@@ -368,7 +368,7 @@ fn accumulate(report: &mut ReviewQualityReport, verdicts: &[Verdict], lines: u64
     }
     let size = size_bucket(lines).to_owned();
     let mut seen = BTreeSet::new();
-    let mut previous_hold: std::collections::BTreeMap<String, bool> = Default::default();
+    let mut previous_hold = std::collections::BTreeMap::<String, bool>::new();
     let held = verdicts.iter().filter(|v| v.hold).count() as u64;
     let mut first_seen = BTreeSet::new();
     for verdict in verdicts {
