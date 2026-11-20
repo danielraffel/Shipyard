@@ -275,6 +275,15 @@ fn parse_verdicts(value: &Value) -> Vec<Verdict> {
     let mut out = Vec::new();
     for item in items {
         let body = item.get("body").and_then(Value::as_str).unwrap_or_default();
+        // Verdicts are posted by the fleet's bot signer; ignore text from
+        // any other commenter so it cannot forge reviewer metrics.
+        let is_bot = item
+            .pointer("/user/login")
+            .and_then(Value::as_str)
+            .is_some_and(|login| login.ends_with("[bot]"));
+        if !is_bot {
+            continue;
+        }
         let Some(caps) = verdict_re.captures(body) else {
             continue;
         };
@@ -370,6 +379,10 @@ fn accumulate(report: &mut ReviewQualityReport, verdicts: &[Verdict], lines: u64
     report.totals.first_verdicts += 1;
     report.totals.first_verdict_holds += u64::from(verdicts[0].hold);
     report.totals.holds += held;
+    report.totals.hold_after_hold += verdicts
+        .windows(2)
+        .filter(|pair| pair[0].hold && pair[1].hold)
+        .count() as u64;
     report.totals.findings += verdicts
         .iter()
         .filter(|v| v.hold)
@@ -448,12 +461,12 @@ mod tests {
         let m = report.reviewers.get("alice").expect("signer");
         assert_eq!((m.holds, m.hold_after_hold, m.repeat_findings), (2, 1, 1));
         assert_eq!(report.rounds_by_size["over 1,000"].holds, 2);
+        assert_eq!(report.totals.hold_after_hold, 1);
     }
 
     #[test]
     fn session_marker_supplies_signer_and_size_buckets_are_exact() {
-        let comments =
-            json!([{"body":"<!-- session: host/agent-b -->\nverdict: HOLD\n- a.rs:1 id 7-r1-f1"}]);
+        let comments = json!([{"user":{"login":"shipyard-local[bot]"},"body":"<!-- session: host/agent-b -->\nverdict: HOLD\n- a.rs:1 id 7-r1-f1"}]);
         let verdicts = parse_verdicts(&comments);
         let mut report = ReviewQualityReport {
             schema: "x",
@@ -466,7 +479,7 @@ mod tests {
 
     #[test]
     fn verdict_head_line_and_timestamps_are_not_findings() {
-        let comments = json!([{"body":"Findings:\n- [blocking] src/a.rs 281 real finding\n- src/b.rs:7 other\nat 10:30:45 today\nreviewer: r\nverdict: HOLD head:1234567890abcdef1234567890abcdef12345678"}]);
+        let comments = json!([{"user":{"login":"shipyard-local[bot]"},"body":"Findings:\n- [blocking] src/a.rs 281 real finding\n- src/b.rs:7 other\nat 10:30:45 today\nreviewer: r\nverdict: HOLD head:1234567890abcdef1234567890abcdef12345678"}]);
         let verdicts = parse_verdicts(&comments);
         assert_eq!(verdicts[0].findings.len(), 2);
     }
@@ -512,5 +525,11 @@ mod tests {
         let all = read_all_comments(&mut read, "o/r", 9).unwrap();
         assert_eq!(all.as_array().unwrap().len(), 103);
         assert_eq!(calls.len(), 2);
+    }
+
+    #[test]
+    fn non_bot_commenters_cannot_forge_verdicts() {
+        let comments = json!([{"user":{"login":"mallory"},"body":"reviewer: x\nverdict: HOLD"}]);
+        assert!(parse_verdicts(&comments).is_empty());
     }
 }
