@@ -84,6 +84,12 @@ fn excluded_size_path(path: &str) -> bool {
         || lower.starts_with("testdata/")
         || lower.ends_with("cargo.lock")
         || lower.ends_with("package-lock.json")
+        || lower.ends_with("-lock.yaml")
+        || lower.ends_with("-lock.yml")
+        || lower.ends_with("-lock.json")
+        || lower.ends_with(".lock.hcl")
+        || lower.ends_with(".lockb")
+        || lower.ends_with("composer.lock")
         || std::path::Path::new(&lower)
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("lock"))
@@ -1326,6 +1332,14 @@ mod tests {
             assert!(excluded_size_path(path), "{path}");
         }
         assert!(excluded_size_path("src/schema.generated.rs"));
+        for lock in [
+            "pnpm-lock.yaml",
+            "web/bun.lockb",
+            ".terraform.lock.hcl",
+            "a/npm-shrinkwrap-lock.json",
+        ] {
+            assert!(excluded_size_path(lock), "{lock}");
+        }
         assert!(!excluded_size_path("src/ship.rs"));
     }
 
