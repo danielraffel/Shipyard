@@ -88,7 +88,7 @@ fn excluded_size_path(path: &str) -> bool {
         || lower.ends_with("-lock.yml")
         || lower.ends_with("-lock.json")
         || lower.ends_with(".lock.hcl")
-        || lower.ends_with(".lockb")
+        || lower.ends_with("bun.lockb")
         || lower.ends_with("composer.lock")
         || std::path::Path::new(&lower)
             .extension()
@@ -429,16 +429,15 @@ pub fn create_pr(
     body: &str,
 ) -> Result<PrInfo, PrError> {
     let count = changed_line_count(cwd, base).ok();
+    let justified = body
+        .lines()
+        .any(|line| line.trim_start().starts_with("Why not split:"));
     let body = format!("{body}{}", size_guidance(body, count));
     match count {
         Some(count) => eprintln!("▸ PR size: {count} changed lines"),
         None => eprintln!("▸ PR size: unavailable (diff against origin/{base} failed)"),
     }
-    if count.is_some_and(|n| n > 1_000)
-        && !body
-            .lines()
-            .any(|line| line.trim_start().starts_with("Why not split:"))
-    {
+    if count.is_some_and(|n| n > 1_000) && !justified {
         eprintln!(
             "WARNING: PR is over 1,000 changed lines without a `Why not split:` line in the body"
         );
