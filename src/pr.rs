@@ -84,7 +84,9 @@ fn excluded_size_path(path: &str) -> bool {
         || lower.starts_with("testdata/")
         || lower.ends_with("cargo.lock")
         || lower.ends_with("package-lock.json")
-        || lower.ends_with(".lock")
+        || std::path::Path::new(&lower)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("lock"))
         || lower
             .split('/')
             .any(|part| part == "generated" || part.ends_with(".generated"))
