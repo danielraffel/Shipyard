@@ -47,7 +47,7 @@ const SIZE_RULE: &str = "One concern per PR. Target 400 changed lines. Over 1,00
 pub fn changed_line_count(cwd: &Path, base: &str) -> Result<usize, PrError> {
     let spec = format!("origin/{base}...HEAD");
     let output = crate::supervised::git_supervised()
-        .args(["diff", "--numstat", &spec])
+        .args(["diff", "--numstat", "--no-renames", &spec])
         .current_dir(cwd)
         .output()
         .map_err(|error| PrError::new(format!("git diff --numstat failed: {error}")))?;
@@ -1339,5 +1339,35 @@ mod tests {
         let unknown = size_guidance("Body", None);
         assert!(unknown.contains("unavailable"));
         assert!(!unknown.contains("**0**"));
+    }
+
+    #[test]
+    fn renames_into_excluded_paths_are_not_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "t@example.com"]);
+        run(&["config", "user.name", "t"]);
+        run(&["config", "commit.gpgsign", "false"]);
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        let body = "line\n".repeat(50);
+        std::fs::write(dir.path().join("deps.lock"), &body).unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "base"]);
+        run(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        std::fs::create_dir_all(dir.path().join("fixtures")).unwrap();
+        std::fs::write(dir.path().join("fixtures/x"), format!("{body}edit\n")).unwrap();
+        run(&["rm", "-q", "deps.lock"]);
+        run(&["add", "."]);
+        run(&["commit", "-qm", "rename"]);
+        assert_eq!(super::changed_line_count(dir.path(), "main").unwrap(), 0);
     }
 }
