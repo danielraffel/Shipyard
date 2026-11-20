@@ -96,11 +96,15 @@ fn excluded_size_path(path: &str) -> bool {
         )
 }
 
-fn size_guidance(body: &str, count: usize) -> String {
-    let mut note = format!(
-        "\n\n## PR size\n\nChanged lines (excluding generated files, lockfiles, fixtures, and version files): **{count}**.\n\n{SIZE_RULE}"
+fn size_guidance(body: &str, count: Option<usize>) -> String {
+    let shown = count.map_or_else(
+        || "unavailable (diff against base failed)".to_string(),
+        |n| n.to_string(),
     );
-    if count > 1_000
+    let mut note = format!(
+        "\n\n## PR size\n\nChanged lines (excluding generated files, lockfiles, fixtures, and version files): **{shown}**.\n\n{SIZE_RULE}"
+    );
+    if count.is_some_and(|n| n > 1_000)
         && !body
             .lines()
             .any(|line| line.trim_start().starts_with("Why not split:"))
@@ -418,10 +422,13 @@ pub fn create_pr(
     title: &str,
     body: &str,
 ) -> Result<PrInfo, PrError> {
-    let count = changed_line_count(cwd, base).unwrap_or(0);
+    let count = changed_line_count(cwd, base).ok();
     let body = format!("{body}{}", size_guidance(body, count));
-    eprintln!("▸ PR size: {count} changed lines");
-    if count > 1_000
+    match count {
+        Some(count) => eprintln!("▸ PR size: {count} changed lines"),
+        None => eprintln!("▸ PR size: unavailable (diff against origin/{base} failed)"),
+    }
+    if count.is_some_and(|n| n > 1_000)
         && !body
             .lines()
             .any(|line| line.trim_start().starts_with("Why not split:"))
@@ -1323,9 +1330,14 @@ mod tests {
 
     #[test]
     fn size_guidance_warns_only_for_large_unjustified_prs() {
-        let warning = size_guidance("Body", 1_001);
+        let warning = size_guidance("Body", Some(1_001));
         assert!(warning.contains("WARNING"));
-        assert!(!size_guidance("Why not split: generated together", 1_001).contains("WARNING"));
-        assert!(!size_guidance("Body", 1_000).contains("WARNING"));
+        assert!(
+            !size_guidance("Why not split: generated together", Some(1_001)).contains("WARNING")
+        );
+        assert!(!size_guidance("Body", Some(1_000)).contains("WARNING"));
+        let unknown = size_guidance("Body", None);
+        assert!(unknown.contains("unavailable"));
+        assert!(!unknown.contains("**0**"));
     }
 }
