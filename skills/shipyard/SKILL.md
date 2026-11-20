@@ -6365,6 +6365,10 @@ Omitting `--collect` skips this collector's provider imports, not all built-in
 Shipyard telemetry.
 # Local Rust gate placement
 
+## Pull request size norm
+
+`shipyard pr` reports substantive changed lines against the base, excluding generated files, lockfiles, fixtures, and version files. Keep one concern per pull request and target 400 changed lines. Pull requests over 1,000 changed lines should include a `Why not split:` explanation in the body. The warning is advisory and never blocks opening the pull request.
+
 The pre-push hook selects the repository-pinned Rust channel on the current
 host. Any fleet host with that channel plus rustfmt and clippy may run local
 formatting and lint gates; m1 is a fallback, not a universal gate. Local gates

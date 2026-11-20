@@ -41,6 +41,73 @@ pub struct PrError {
     message: String,
 }
 
+const SIZE_RULE: &str = "One concern per PR. Target 400 changed lines. Over 1,000 changed lines, the PR body must state why it cannot be split with a `Why not split:` line.";
+
+/// Count substantive changed lines for a branch against its base.
+pub fn changed_line_count(cwd: &Path, base: &str) -> Result<usize, PrError> {
+    let spec = format!("origin/{base}...HEAD");
+    let output = crate::supervised::git_supervised()
+        .args(["diff", "--numstat", &spec])
+        .current_dir(cwd)
+        .output()
+        .map_err(|error| PrError::new(format!("git diff --numstat failed: {error}")))?;
+    if !output.status.success() {
+        return Err(PrError::new(format!(
+            "git diff --numstat failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let mut total = 0usize;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let Some((added, rest)) = line.split_once('\t') else {
+            continue;
+        };
+        let Some((deleted, path)) = rest.split_once('\t') else {
+            continue;
+        };
+        if excluded_size_path(path) {
+            continue;
+        }
+        let added = added.parse::<usize>().unwrap_or(0);
+        let deleted = deleted.parse::<usize>().unwrap_or(0);
+        total = total.saturating_add(added).saturating_add(deleted);
+    }
+    Ok(total)
+}
+
+fn excluded_size_path(path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
+    let lower = normalized.to_ascii_lowercase();
+    lower.contains("/fixtures/")
+        || lower.starts_with("fixtures/")
+        || lower.contains("/testdata/")
+        || lower.starts_with("testdata/")
+        || lower.ends_with("cargo.lock")
+        || lower.ends_with("package-lock.json")
+        || lower.ends_with(".lock")
+        || lower
+            .split('/')
+            .any(|part| part == "generated" || part.ends_with(".generated"))
+        || matches!(
+            lower.rsplit('/').next().unwrap_or(""),
+            "version" | "version.txt" | "version.json"
+        )
+}
+
+fn size_guidance(body: &str, count: usize) -> String {
+    let mut note = format!(
+        "\n\n## PR size\n\nChanged lines (excluding generated files, lockfiles, fixtures, and version files): **{count}**.\n\n{SIZE_RULE}"
+    );
+    if count > 1_000
+        && !body
+            .lines()
+            .any(|line| line.trim_start().starts_with("Why not split:"))
+    {
+        note.push_str("\n\nWARNING: this PR is over 1,000 changed lines and its body does not explain why it cannot be split.");
+    }
+    note
+}
+
 impl PrError {
     fn new(message: impl Into<String>) -> Self {
         Self {
@@ -349,10 +416,22 @@ pub fn create_pr(
     title: &str,
     body: &str,
 ) -> Result<PrInfo, PrError> {
+    let count = changed_line_count(cwd, base).unwrap_or(0);
+    let body = format!("{body}{}", size_guidance(body, count));
+    eprintln!("▸ PR size: {count} changed lines");
+    if count > 1_000
+        && !body
+            .lines()
+            .any(|line| line.trim_start().starts_with("Why not split:"))
+    {
+        eprintln!(
+            "WARNING: PR is over 1,000 changed lines without a `Why not split:` line in the body"
+        );
+    }
     let client = gh_client(config)?;
     let output = gh(&client, cwd, gh_command)?
         .args([
-            "pr", "create", "--head", branch, "--base", base, "--title", title, "--body", body,
+            "pr", "create", "--head", branch, "--base", base, "--title", title, "--body", &body,
         ])
         .output()
         .map_err(|error| PrError::new(format!("gh pr create failed to start: {error}")))?;
@@ -360,14 +439,14 @@ pub fn create_pr(
         let message = stderr_or_stdout(&output);
         if is_graphql_rate_limited(&message) {
             report_graphql_pr_create_fallback_with_client(&client, &message, cwd);
-            return create_pr_rest(&client, cwd, gh_command, branch, base, title, body);
+            return create_pr_rest(&client, cwd, gh_command, branch, base, title, &body);
         }
         if is_graphql_pr_create_integration_blocked(&message) {
             report_graphql_pr_create_fallback_with_client(&client, &message, cwd);
-            return match create_pr_rest(&client, cwd, gh_command, branch, base, title, body) {
+            return match create_pr_rest(&client, cwd, gh_command, branch, base, title, &body) {
                 Ok(info) => Ok(info),
                 Err(error) if is_integration_blocked(error.message()) => {
-                    create_pr_with_ambient_gh(&client, cwd, gh_command, branch, base, title, body)
+                    create_pr_with_ambient_gh(&client, cwd, gh_command, branch, base, title, &body)
                 }
                 Err(error) => Err(error),
             };
@@ -858,11 +937,12 @@ fn nested_string_field(value: &Value, path: &[&str]) -> Result<String, PrError> 
 #[cfg(test)]
 mod tests {
     use super::{
-        PrInfo, is_graphql_pr_create_integration_blocked, is_graphql_rate_limited,
-        is_integration_blocked, parse_github_remote_slug, parse_pr_checkout_info,
-        parse_pr_checkout_rest_info, parse_pr_info, parse_pr_list, parse_pr_rest_info,
-        parse_pr_rest_list, push_branch_with_expected_head, scoped_push_environment,
-        select_unique_head_match, selector_pr_number, shell_single_quote, url_encode,
+        PrInfo, excluded_size_path, is_graphql_pr_create_integration_blocked,
+        is_graphql_rate_limited, is_integration_blocked, parse_github_remote_slug,
+        parse_pr_checkout_info, parse_pr_checkout_rest_info, parse_pr_info, parse_pr_list,
+        parse_pr_rest_info, parse_pr_rest_list, push_branch_with_expected_head,
+        scoped_push_environment, select_unique_head_match, selector_pr_number, shell_single_quote,
+        size_guidance, url_encode,
     };
     use std::process::Command;
 
@@ -1220,5 +1300,30 @@ mod tests {
             .number,
             274
         );
+    }
+
+    #[test]
+    fn size_exclusions_cover_generated_locks_fixtures_and_versions() {
+        for path in [
+            "src/generated/output.rs",
+            "Cargo.lock",
+            "nested/tool.lock",
+            "package-lock.json",
+            "tests/fixtures/data.json",
+            "testdata/input.txt",
+            "VERSION",
+            "meta/version.json",
+        ] {
+            assert!(excluded_size_path(path), "{path}");
+        }
+        assert!(!excluded_size_path("src/ship.rs"));
+    }
+
+    #[test]
+    fn size_guidance_warns_only_for_large_unjustified_prs() {
+        let warning = size_guidance("Body", 1_001);
+        assert!(warning.contains("WARNING"));
+        assert!(!size_guidance("Why not split: generated together", 1_001).contains("WARNING"));
+        assert!(!size_guidance("Body", 1_000).contains("WARNING"));
     }
 }
