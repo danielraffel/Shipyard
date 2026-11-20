@@ -19,7 +19,7 @@ use crate::identity::RuntimeMode;
 use crate::output::write_pretty_json;
 
 /// GitHub logins whose comments may carry reviewer verdicts.
-const TRUSTED_SIGNERS: &[&str] = &["shipyard-local[bot]"];
+const TRUSTED_SIGNERS: &[&str] = &["shipyard-local[bot]", "shipyard-review[bot]"];
 
 const READ_TIMEOUT: Duration = Duration::from_mins(1);
 
@@ -523,6 +523,13 @@ mod tests {
         };
         accumulate(&mut report, &parse_verdicts(&comments), 10);
         assert_eq!(report.reviewers["b"].hold_after_hold, 0);
+    }
+
+    #[test]
+    fn review_app_signer_is_trusted() {
+        let comments =
+            json!([{"user":{"login":"shipyard-review[bot]"},"body":"reviewer: a\nverdict: HOLD"}]);
+        assert_eq!(parse_verdicts(&comments).len(), 1);
     }
 
     #[test]
