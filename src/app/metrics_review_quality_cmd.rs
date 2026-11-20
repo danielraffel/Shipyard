@@ -350,9 +350,10 @@ fn accumulate(report: &mut ReviewQualityReport, verdicts: &[Verdict], lines: u64
     let mut seen = BTreeSet::new();
     let mut previous_hold = false;
     let held = verdicts.iter().filter(|v| v.hold).count() as u64;
-    for (index, verdict) in verdicts.iter().enumerate() {
+    let mut first_seen = BTreeSet::new();
+    for verdict in verdicts {
         let entry = report.reviewers.entry(verdict.signer.clone()).or_default();
-        if index == 0 {
+        if first_seen.insert(verdict.signer.clone()) {
             entry.first_verdicts += 1;
             if verdict.hold {
                 entry.first_verdict_holds += 1;
@@ -383,7 +384,11 @@ fn accumulate(report: &mut ReviewQualityReport, verdicts: &[Verdict], lines: u64
         {
             let entry = report.reviewers.entry(signer.clone()).or_default();
             entry.held_prs += 1;
-            entry.later_rounds += held.saturating_sub(1);
+            let own = verdicts
+                .iter()
+                .filter(|v| v.hold && &v.signer == signer)
+                .count() as u64;
+            entry.later_rounds += own.saturating_sub(1);
         }
     }
     report.totals.first_verdicts += 1;
@@ -551,5 +556,24 @@ mod tests {
             ))
         };
         assert!(read_all_comments(&mut read, "o/r", 9).is_err());
+    }
+
+    #[test]
+    fn rounds_are_attributed_to_each_signers_own_sequence() {
+        let comments = json!([
+            {"user":{"login":"b[bot]"},"body":"reviewer: a\nverdict: HOLD"},
+            {"user":{"login":"b[bot]"},"body":"reviewer: b\nverdict: HOLD"}
+        ]);
+        let verdicts = parse_verdicts(&comments);
+        let mut report = ReviewQualityReport {
+            schema: "x",
+            ..Default::default()
+        };
+        accumulate(&mut report, &verdicts, 10);
+        let b = &report.reviewers["b"];
+        assert_eq!(
+            (b.first_verdicts, b.first_verdict_holds, b.later_rounds),
+            (1, 1, 0)
+        );
     }
 }
