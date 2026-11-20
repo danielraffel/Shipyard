@@ -53,7 +53,6 @@ pub(crate) struct ReadCounts {
 #[derive(Clone, Debug)]
 struct PullRequest {
     number: u64,
-    lines: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -115,12 +114,15 @@ pub(super) fn review_quality_command<W: Write>(
         };
         let prs = list_merged(&mut read, &repo, since)?;
         for pr in prs {
-            let comments = read(format!(
-                "repos/{repo}/issues/{}/comments?per_page=100",
-                pr.number
-            ))?;
+            let comments = read_all_comments(&mut read, &repo, pr.number)?;
             let verdicts = parse_verdicts(&comments);
-            accumulate(&mut report, &verdicts, pr.lines);
+            if verdicts.is_empty() {
+                continue;
+            }
+            // The pulls list endpoint omits additions/deletions; only the
+            // single-PR GET returns them.
+            let detail = read(format!("repos/{repo}/pulls/{}", pr.number))?;
+            accumulate(&mut report, &verdicts, changed_lines(&detail));
         }
         let stats = cache.stats();
         report.reads.github += live_reads;
@@ -169,6 +171,33 @@ fn delta(
     }
 }
 
+fn changed_lines(detail: &Value) -> u64 {
+    ["additions", "deletions"]
+        .iter()
+        .map(|key| detail.get(key).and_then(Value::as_u64).unwrap_or_default())
+        .sum()
+}
+
+/// Read every page of a PR's issue comments (100 per page) as one array.
+fn read_all_comments(
+    read: &mut impl FnMut(String) -> Result<Value, CliFailure>,
+    repo: &str,
+    number: u64,
+) -> Result<Value, CliFailure> {
+    let mut all = Vec::new();
+    for page in 1..=100 {
+        let value = read(format!(
+            "repos/{repo}/issues/{number}/comments?per_page=100&page={page}"
+        ))?;
+        let Some(items) = value.as_array() else { break };
+        all.extend(items.iter().cloned());
+        if items.len() < 100 {
+            break;
+        }
+    }
+    Ok(Value::Array(all))
+}
+
 fn list_merged(
     read: &mut impl FnMut(String) -> Result<Value, CliFailure>,
     repo: &str,
@@ -181,6 +210,17 @@ fn list_merged(
         ))?;
         let Some(items) = value.as_array() else { break };
         for item in items {
+            // Sorted by updated desc, and merged_at <= updated_at, so once an
+            // item was last updated before the window nothing later can have
+            // merged inside it.
+            if let Some(updated_at) = item
+                .get("updated_at")
+                .and_then(Value::as_str)
+                .and_then(|text| DateTime::parse_from_rfc3339(text).ok())
+                && updated_at.with_timezone(&Utc) < since
+            {
+                return Ok(result);
+            }
             let Some(merged_at) = item
                 .get("merged_at")
                 .and_then(Value::as_str)
@@ -190,21 +230,13 @@ fn list_merged(
                 continue;
             };
             if merged_at < since {
-                return Ok(result);
+                continue;
             }
             result.push(PullRequest {
                 number: item
                     .get("number")
                     .and_then(Value::as_u64)
                     .unwrap_or_default(),
-                lines: item
-                    .get("additions")
-                    .and_then(Value::as_u64)
-                    .unwrap_or_default()
-                    + item
-                        .get("deletions")
-                        .and_then(Value::as_u64)
-                        .unwrap_or_default(),
             });
         }
         if items.len() < 100 {
@@ -218,7 +250,10 @@ fn parse_verdicts(value: &Value) -> Vec<Verdict> {
     let verdict_re = Regex::new(r"(?im)^\s*verdict:\s*(HOLD|APPROVE)\b").expect("verdict regex");
     let reviewer_re = Regex::new(r"(?im)^\s*reviewer:\s*([^\s]+)").expect("reviewer regex");
     let session_re = Regex::new(r"(?i)<!--\s*session:\s*([^>]+)-->").expect("session regex");
-    let finding_re = Regex::new(r"(?i)([^\s`]+):(\d+)\s*[-–—:]?\s*(.+)").expect("finding regex");
+    let finding_re = Regex::new(
+        r"(?i)^\s*[-*]\s+(?:\[[^\]]*\]\s+)?`?([\w./-]+\.\w+)`?[:\s]\s*(\d+)\b\s*[-–—:]?\s*(.*)$",
+    )
+    .expect("finding regex");
     let Some(items) = value.as_array() else {
         return Vec::new();
     };
@@ -412,5 +447,55 @@ mod tests {
         accumulate(&mut report, &verdicts, 401);
         assert!(report.reviewers.contains_key("agent-b"));
         assert!(report.rounds_by_size.contains_key("401-1,000"));
+    }
+
+    #[test]
+    fn verdict_head_line_and_timestamps_are_not_findings() {
+        let comments = json!([{"body":"Findings:\n- [blocking] src/a.rs 281 real finding\n- src/b.rs:7 other\nat 10:30:45 today\nreviewer: r\nverdict: HOLD head:1234567890abcdef1234567890abcdef12345678"}]);
+        let verdicts = parse_verdicts(&comments);
+        assert_eq!(verdicts[0].findings.len(), 2);
+    }
+
+    #[test]
+    fn changed_lines_comes_from_pr_detail() {
+        assert_eq!(
+            changed_lines(&json!({"additions": 300, "deletions": 150})),
+            450
+        );
+        assert_eq!(changed_lines(&json!({"number": 1})), 0);
+    }
+
+    #[test]
+    fn old_merge_recently_updated_does_not_end_the_scan() {
+        let since = DateTime::parse_from_rfc3339("2026-11-10T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut read = |_path: String| -> Result<Value, CliFailure> {
+            Ok(json!([
+                {"number": 1, "merged_at": "2026-10-01T00:00:00Z", "updated_at": "2026-11-19T00:00:00Z"},
+                {"number": 2, "merged_at": "2026-11-15T00:00:00Z", "updated_at": "2026-11-15T00:00:00Z"},
+                {"number": 3, "merged_at": null, "updated_at": "2026-11-14T00:00:00Z"},
+                {"number": 5, "merged_at": "2026-11-13T00:00:00Z", "updated_at": "2026-11-13T00:00:00Z"},
+                {"number": 4, "merged_at": "2026-10-02T00:00:00Z", "updated_at": "2026-10-02T00:00:00Z"},
+                {"number": 6, "merged_at": "2026-11-12T00:00:00Z", "updated_at": "2026-11-12T00:00:00Z"}
+            ]))
+        };
+        let prs = list_merged(&mut read, "o/r", since).unwrap();
+        assert_eq!(prs.iter().map(|p| p.number).collect::<Vec<_>>(), vec![2, 5]);
+    }
+
+    #[test]
+    fn comments_are_paginated() {
+        let mut calls = Vec::new();
+        let mut read = |path: String| -> Result<Value, CliFailure> {
+            calls.push(path.clone());
+            let n = if path.ends_with("page=1") { 100 } else { 3 };
+            Ok(Value::Array(
+                (0..n).map(|i| json!({"body": format!("c{i}")})).collect(),
+            ))
+        };
+        let all = read_all_comments(&mut read, "o/r", 9).unwrap();
+        assert_eq!(all.as_array().unwrap().len(), 103);
+        assert_eq!(calls.len(), 2);
     }
 }
