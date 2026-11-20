@@ -80,6 +80,8 @@ pub const RED_EVERYWHERE_KEY: &str = "red_everywhere";
 pub const UNSTABLE_ADVISORY_CHECKS_KEY: &str = "unstable_advisory_checks";
 /// `[auto_merge]` key selecting [`EjectionGuards::repair_unstable_reds`].
 pub const REPAIR_UNSTABLE_REDS_KEY: &str = "repair_unstable_reds";
+/// `[auto_merge] admit_stacks_together`; shadow when false.
+pub const ADMIT_STACKS_TOGETHER_KEY: &str = "admit_stacks_together";
 
 /// What the steward does when the same required check fails the same way on
 /// many open pull requests (`[auto_merge] red_everywhere`).
@@ -178,6 +180,8 @@ pub struct EjectionGuards {
     /// the coordinator (`[auto_merge] repair_unstable_reds`, default off).
     /// It routes; it never admits anything.
     pub repair_unstable_reds: bool,
+    /// Admit a fully approved declared stack in one queue pass.
+    pub admit_stacks_together: bool,
     /// Why the base config could not be read, when it could not. The guards
     /// then keep their merge-queue defaults (on) with no generated paths.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -210,6 +214,7 @@ impl EjectionGuards {
             unstable_advisory_checks: None,
             unstable_advisory_checks_error: None,
             repair_unstable_reds: false,
+            admit_stacks_together: false,
             read_error: None,
         }
     }
@@ -258,6 +263,7 @@ impl EjectionGuards {
         }
         guards.batch_guard = flag(BATCH_GUARD_KEY, guards.batch_guard);
         guards.repair_unstable_reds = !merge_queue && flag(REPAIR_UNSTABLE_REDS_KEY, false);
+        guards.admit_stacks_together = flag(ADMIT_STACKS_TOGETHER_KEY, false);
         guards.red_outranks_pending = flag(RED_OUTRANKS_PENDING_KEY, guards.red_outranks_pending);
         guards.infra_only_retry = flag(INFRA_ONLY_RETRY_KEY, guards.infra_only_retry);
         if let Some(mode) = section
@@ -411,6 +417,18 @@ generated_paths = [
         let direct = EjectionGuards::from_table(&toml::Table::new(), false);
         assert!(!direct.batch_guard && !direct.red_outranks_pending && !direct.infra_only_retry);
         assert_eq!(EjectionGuards::default(), EjectionGuards::for_base(false));
+    }
+
+    #[test]
+    fn stack_admission_is_opt_in_and_reads_auto_merge_flag() {
+        assert!(!EjectionGuards::from_table(&table("[auto_merge]\n"), true).admit_stacks_together);
+        assert!(
+            EjectionGuards::from_table(
+                &table("[auto_merge]\nadmit_stacks_together = true\n"),
+                true,
+            )
+            .admit_stacks_together
+        );
     }
 
     #[test]
