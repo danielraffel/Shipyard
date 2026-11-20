@@ -483,7 +483,7 @@ fn first_migration_selects_anchor_before_enumerating_direct_readers() {
     let old_entered = fixture.root.path().join("old-reader-entered");
     let old_release = fixture.root.path().join("old-reader-entered.release");
     let mut legacy_wrapper = std::fs::read_to_string(&fixture.wrapper).expect("legacy wrapper");
-    let latch = "fi\nif [[ -n \"${SHIPYARD_TEST_OLD_READER_ENTERED:-}\" ]]; then /usr/bin/touch \"$SHIPYARD_TEST_OLD_READER_ENTERED\"; while [[ ! -e \"$SHIPYARD_TEST_OLD_READER_ENTERED.release\" ]]; do /bin/sleep 0.02; done; fi\ncache_dir=";
+    let latch = "fi\nif [[ -n \"${SHIPYARD_TEST_OLD_READER_ENTERED:-}\" ]]; then /usr/bin/touch \"$SHIPYARD_TEST_OLD_READER_ENTERED\"; i=0; while [[ ! -e \"$SHIPYARD_TEST_OLD_READER_ENTERED.release\" ]] && [[ \"$i\" -lt 3000 ]]; do /bin/sleep 0.02; i=$((i+1)); done; fi\ncache_dir=";
     assert_eq!(legacy_wrapper.matches("fi\ncache_dir=").count(), 1);
     legacy_wrapper = legacy_wrapper.replacen("fi\ncache_dir=", latch, 1);
     ReaderFixture::write_executable(&fixture.wrapper, legacy_wrapper.as_bytes());
@@ -510,7 +510,7 @@ fn first_migration_selects_anchor_before_enumerating_direct_readers() {
     let anchor_publish = "auth_publish_file \"$auth_wrapper\" \"$auth_generation/ghapp.public-trampoline\"\n    auth_public_trampoline_active=1\n";
     assert_eq!(script.matches(anchor_publish).count(), 1);
     let injected = format!(
-        "{anchor_publish}/usr/bin/touch {}\nwhile [ ! -e {} ]; do /bin/sleep 0.02; done\n",
+        "{anchor_publish}/usr/bin/touch {}\ni=0; while [ ! -e {} ] && [ \"$i\" -lt 3000 ]; do /bin/sleep 0.02; i=$((i+1)); done\n",
         shlex_quote(&anchor_selected.display().to_string()),
         shlex_quote(&transaction_release.display().to_string()),
     );
@@ -583,7 +583,7 @@ fn first_migration_fences_a_reader_that_appears_after_the_initial_observation() 
         .args([
             "-c",
             &format!(
-                "while [ ! -e {} ]; do /bin/sleep 0.02; done",
+                "i=0; while [ ! -e {} ] && [ \"$i\" -lt 3000 ]; do /bin/sleep 0.02; i=$((i+1)); done",
                 shlex_quote(&release.display().to_string())
             ),
         ])

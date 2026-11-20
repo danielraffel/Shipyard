@@ -811,7 +811,7 @@ fn remote_supervisor_kills_term_ignoring_descendants_after_leader_exits() {
     let temp = tempfile::tempdir().expect("temp dir");
     let pid_file = temp.path().join("descendant.pid");
     let worker = format!(
-        "(trap '' TERM; echo $$ > {}; while :; do sleep 1; done) & wait $!",
+        "(trap '' TERM; echo $$ > {}; i=0; while [ \"$i\" -lt 60 ]; do sleep 1; i=$((i+1)); done) & wait $!",
         crate::executor::ssh::shlex_quote(&pid_file.display().to_string())
     );
     let status = Command::new("/usr/bin/perl")

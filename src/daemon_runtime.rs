@@ -4880,7 +4880,7 @@ mod tests {
             std::fs::write(
                 script,
                 format!(
-                    "#!/bin/sh\npid_file=\"$1\"\nowner=\"$4\"\necho $$ > \"$pid_file\"\ntrap '{on_term}' TERM\nwhile kill -0 \"$owner\" 2>/dev/null; do sleep 1; done\n"
+                    "#!/bin/sh\npid_file=\"$1\"\nowner=\"$4\"\necho $$ > \"$pid_file\"\ntrap '{on_term}' TERM\ni=0; while kill -0 \"$owner\" 2>/dev/null && [ \"$i\" -lt 60 ]; do sleep 1; i=$((i+1)); done\n"
                 ),
             )
             .expect("script");

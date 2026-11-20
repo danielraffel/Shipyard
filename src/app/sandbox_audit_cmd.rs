@@ -280,6 +280,7 @@ fn capture_process_start_identity(_pid: u32) -> Result<Sha256Digest, String> {
 #[cfg(all(test, unix))]
 mod tests {
     use std::os::unix::process::CommandExt as _;
+    use std::process::Child;
 
     use crate::daemon_worker_capacity::{
         DaemonWorkerCapacity, DaemonWorkerClaim, ExclusiveSandboxAdmission,
@@ -288,6 +289,17 @@ mod tests {
     use crate::queue::Queue;
 
     use super::*;
+
+    struct TestWorker {
+        child: Child,
+    }
+
+    impl Drop for TestWorker {
+        fn drop(&mut self) {
+            let _ = crate::worker_process_custody::terminate_child_tree(&mut self.child);
+            let _ = self.child.wait();
+        }
+    }
 
     #[test]
     fn durable_process_receipt_holds_capacity_for_full_child_lifetime() {
@@ -360,13 +372,15 @@ mod tests {
         command
             .args([
                 "-c",
-                "while [ ! -e \"$1\" ]; do sleep 0.01; done",
+                "i=0; while [ ! -e \"$1\" ] && [ \"$i\" -lt 3000 ]; do sleep 0.01; i=$((i+1)); done",
                 "shipyard-sandbox-race",
             ])
             .arg(&release)
             .process_group(0);
-        let mut worker = command.spawn().expect("worker");
-        let pid = worker.id();
+        let mut worker = TestWorker {
+            child: command.spawn().expect("worker"),
+        };
+        let pid = worker.child.id();
         let identity = capture_process_start_identity(pid).expect("birth identity");
         capacity
             .bind_exclusive_process("audit-race", "authority", "generation-race", pid, identity)
@@ -378,7 +392,7 @@ mod tests {
             "audit-race",
             "authority",
             "generation-race",
-            &mut worker,
+            &mut worker.child,
             || {
                 assert!(
                     !released,
@@ -447,5 +461,49 @@ mod tests {
 
         assert_eq!(error.code, WRITER_DOMAIN_OVERLAP_EXIT_CODE);
         assert!(error.message.contains("receipt authority mismatch"));
+    }
+
+    #[test]
+    fn shell_wait_loops_in_source_are_bounded() {
+        fn visit(root: &Path, violations: &mut Vec<String>) {
+            let Ok(entries) = std::fs::read_dir(root) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.file_name().is_some_and(|name| name == "fixtures") {
+                    continue;
+                }
+                if path.is_dir() {
+                    visit(&path, violations);
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                for (line_number, line) in text.lines().enumerate() {
+                    let loop_word = line.contains("while") || line.contains("until");
+                    let sleep_word = line.contains("do sleep") || line.contains("do /bin/sleep");
+                    let bounded = line.contains("-lt")
+                        || line.contains("timeout")
+                        || line.contains("$((i+1))")
+                        || line.contains("$(( i + 1 ))");
+                    if loop_word && sleep_word && !bounded {
+                        violations.push(format!("{}:{}", path.display(), line_number + 1));
+                    }
+                }
+            }
+        }
+
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut violations = Vec::new();
+        visit(&manifest.join("src"), &mut violations);
+        visit(&manifest.join("tests"), &mut violations);
+        assert!(
+            violations.is_empty(),
+            "every shell wait loop must have a finite counter, -lt bound, or timeout; \
+             unbounded leaked workers can repeat sandboxed sleep calls and exhaust \
+             sandboxd's dispatch threads, as in the 2026-11-19 WindowServer incident: {violations:?}"
+        );
     }
 }

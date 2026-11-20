@@ -2034,7 +2034,7 @@ mod tests {
         let mut worker = Command::new("/bin/sh")
             .args([
                 "-c",
-                "while :; do sleep 1; done",
+                "i=0; while [ \"$i\" -lt 60 ]; do sleep 1; i=$((i+1)); done",
                 "execution-worker",
                 fixture.source_job_id.as_str(),
                 generation,
