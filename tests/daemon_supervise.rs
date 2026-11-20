@@ -38,7 +38,7 @@ fn supervise_forwards_sigterm_to_the_daemon_and_exits_with_its_code() {
     common::write_executable(
         &script,
         &format!(
-            "#!/bin/sh\ntrap 'echo term > \"{marker}\"; exit 7' TERM\necho $PPID > \"{ppid}\"\necho $$ > \"{pid}\"\nwhile :; do sleep 0.05; done\n",
+            "#!/bin/sh\ntrap 'echo term > \"{marker}\"; exit 7' TERM\necho $PPID > \"{ppid}\"\necho $$ > \"{pid}\"\ni=0; while [ \"$i\" -lt 1200 ]; do sleep 0.05; i=$((i+1)); done\n",
             marker = marker.display(),
             ppid = parent_file.display(),
             pid = pid_file.display()
@@ -191,7 +191,7 @@ fn write_counting_daemon(dir: &Path) -> std::path::PathBuf {
     common::write_executable(
         &script,
         &format!(
-            "#!/bin/sh\necho $$ >> \"{starts}\"\nwhile [ ! -e \"{stop}\" ]; do sleep 0.05; done\nexit 0\n",
+            "#!/bin/sh\necho $$ >> \"{starts}\"\ni=0; while [ ! -e \"{stop}\" ] && [ \"$i\" -lt 1200 ]; do sleep 0.05; i=$((i+1)); done\nexit 0\n",
             starts = dir.join("starts").display(),
             stop = dir.join("stop").display(),
         ),

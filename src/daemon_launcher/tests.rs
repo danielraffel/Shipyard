@@ -508,7 +508,7 @@ fn supervise_passes_signals_through_to_the_daemon_child() {
     fs::write(
         &script,
         format!(
-            "#!/bin/sh\ntrap 'echo term > \"{marker}\"; exit 7' TERM\nprintf '%s\\n' \"$@\" > \"{args}\"\necho $$ > \"{pid}\"\nwhile :; do sleep 0.05; done\n",
+            "#!/bin/sh\ntrap 'echo term > \"{marker}\"; exit 7' TERM\nprintf '%s\\n' \"$@\" > \"{args}\"\necho $$ > \"{pid}\"\ni=0; while [ \"$i\" -lt 1200 ]; do sleep 0.05; i=$((i+1)); done\n",
             marker = marker.display(),
             args = args_file.display(),
             pid = pid_file.display()
