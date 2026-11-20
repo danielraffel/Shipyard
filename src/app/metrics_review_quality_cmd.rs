@@ -83,7 +83,11 @@ pub(super) fn review_quality_command<W: Write>(
         repositories: args.repos.clone(),
         ..ReviewQualityReport::default()
     };
-    let since = Utc::now() - chrono::Duration::days(args.days.cast_signed());
+    let since = i64::try_from(args.days)
+        .ok()
+        .and_then(chrono::Duration::try_days)
+        .and_then(|window| Utc::now().checked_sub_signed(window))
+        .ok_or_else(|| CliFailure::new(2, format!("--days {} is out of range", args.days)))?;
     for repo in args.repos {
         let actions = GitHubActions::from_loaded_config(cwd, &config).with_repo_override(&repo);
         let cache = ReadCache::open(
