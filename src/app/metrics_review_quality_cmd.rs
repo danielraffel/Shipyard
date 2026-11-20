@@ -207,7 +207,12 @@ fn read_all_comments(
         let value = read(format!(
             "repos/{repo}/issues/{number}/comments?per_page=100&page={page}"
         ))?;
-        let Some(items) = value.as_array() else { break };
+        let Some(items) = value.as_array() else {
+            return Err(CliFailure::new(
+                1,
+                format!("review-quality: PR {number} comments page {page} is not a JSON array"),
+            ));
+        };
         all.extend(items.iter().cloned());
         if items.len() < 100 {
             return Ok(Value::Array(all));
@@ -231,7 +236,12 @@ fn list_merged(
         let value = read(format!(
             "repos/{repo}/pulls?state=closed&sort=updated&direction=desc&per_page=100&page={page}"
         ))?;
-        let Some(items) = value.as_array() else { break };
+        let Some(items) = value.as_array() else {
+            return Err(CliFailure::new(
+                1,
+                format!("review-quality: {repo} closed-PR page {page} is not a JSON array"),
+            ));
+        };
         for item in items {
             // Sorted by updated desc, and merged_at <= updated_at, so once an
             // item was last updated before the window nothing later can have
@@ -278,8 +288,9 @@ fn parse_verdicts(value: &Value) -> Vec<Verdict> {
     let verdict_re = Regex::new(r"(?im)^\s*verdict:\s*(HOLD|APPROVE)\b").expect("verdict regex");
     let reviewer_re = Regex::new(r"(?im)^\s*reviewer:\s*([^\s]+)").expect("reviewer regex");
     let session_re = Regex::new(r"(?i)<!--\s*session:\s*([^>]+)-->").expect("session regex");
+    let agent_re = Regex::new(r"(?i)\bagent:\s*([\w.-]+)").expect("agent regex");
     let finding_re = Regex::new(
-        r"(?i)^\s*[-*]\s+(?:\[[^\]]*\]\s+)?`?([\w./-]+\.\w+)`?[:\s]\s*(\d+)\b\s*[-–—:]?\s*(.*)$",
+        r"(?i)^\s*[-*]\s+(?:\[[^\]]*\]\s+)?`?([\w./-]*[A-Za-z_.][\w./-]*)`?[:\s]\s*(\d+)\b\s*[-–—:]?\s*(.*)$",
     )
     .expect("finding regex");
     let Some(items) = value.as_array() else {
@@ -305,11 +316,17 @@ fn parse_verdicts(value: &Value) -> Vec<Verdict> {
             .map(|c| c[1].to_owned())
             .or_else(|| {
                 session_re.captures(body).map(|c| {
-                    c[1].trim()
-                        .split('/')
-                        .next_back()
-                        .unwrap_or("unknown")
-                        .to_owned()
+                    let marker = c[1].trim();
+                    agent_re.captures(marker).map_or_else(
+                        || {
+                            marker
+                                .split('/')
+                                .next_back()
+                                .unwrap_or("unknown")
+                                .to_owned()
+                        },
+                        |a| a[1].to_owned(),
+                    )
                 })
             })
             .unwrap_or_else(|| "unknown".to_owned());
@@ -493,6 +510,25 @@ mod tests {
         accumulate(&mut report, &verdicts, 401);
         assert!(report.reviewers.contains_key("agent-b"));
         assert!(report.rounds_by_size.contains_key("401-1,000"));
+    }
+
+    #[test]
+    fn canonical_session_marker_yields_agent_name() {
+        let comments = json!([{"user":{"login":"shipyard-local[bot]"},"body":"verdict: HOLD\n<!-- session: Host/fleet-pass-reviewer-1-2 agent: infra-review2 -->"}]);
+        assert_eq!(parse_verdicts(&comments)[0].signer, "infra-review2");
+    }
+
+    #[test]
+    fn extensionless_paths_are_findings() {
+        let comments = json!([{"user":{"login":"shipyard-local[bot]"},"body":"verdict: HOLD\n- [blocking] Dockerfile 12 bad\n- Makefile:3 bad\n- .gitignore 4 bad\n- 12 items 5"}]);
+        assert_eq!(parse_verdicts(&comments)[0].findings.len(), 3);
+    }
+
+    #[test]
+    fn non_array_responses_fail_instead_of_truncating() {
+        let mut read = |_: String| Ok(json!({"message":"rate limited"}));
+        assert!(read_all_comments(&mut read, "o/r", 1).is_err());
+        assert!(list_merged(&mut read, "o/r", Utc::now()).is_err());
     }
 
     #[test]
