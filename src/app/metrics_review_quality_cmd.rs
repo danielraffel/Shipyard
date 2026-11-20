@@ -18,6 +18,9 @@ use crate::gate_cost::ReadCache;
 use crate::identity::RuntimeMode;
 use crate::output::write_pretty_json;
 
+/// GitHub logins whose comments may carry reviewer verdicts.
+const TRUSTED_SIGNERS: &[&str] = &["shipyard-local[bot]"];
+
 const READ_TIMEOUT: Duration = Duration::from_mins(1);
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -290,7 +293,7 @@ fn parse_verdicts(value: &Value) -> Vec<Verdict> {
         let is_bot = item
             .pointer("/user/login")
             .and_then(Value::as_str)
-            .is_some_and(|login| login.ends_with("[bot]"));
+            .is_some_and(|login| TRUSTED_SIGNERS.contains(&login));
         if !is_bot {
             continue;
         }
@@ -368,7 +371,7 @@ fn accumulate(report: &mut ReviewQualityReport, verdicts: &[Verdict], lines: u64
             entry.repeat_findings += verdict
                 .findings
                 .iter()
-                .filter(|f| !seen.insert(f.identity.clone()))
+                .filter(|f| !seen.insert((verdict.signer.clone(), f.identity.clone())))
                 .count() as u64;
             previous_hold = true;
         } else {
@@ -561,8 +564,8 @@ mod tests {
     #[test]
     fn rounds_are_attributed_to_each_signers_own_sequence() {
         let comments = json!([
-            {"user":{"login":"b[bot]"},"body":"reviewer: a\nverdict: HOLD"},
-            {"user":{"login":"b[bot]"},"body":"reviewer: b\nverdict: HOLD"}
+            {"user":{"login":"shipyard-local[bot]"},"body":"reviewer: a\nverdict: HOLD"},
+            {"user":{"login":"shipyard-local[bot]"},"body":"reviewer: b\nverdict: HOLD"}
         ]);
         let verdicts = parse_verdicts(&comments);
         let mut report = ReviewQualityReport {
@@ -575,5 +578,24 @@ mod tests {
             (b.first_verdicts, b.first_verdict_holds, b.later_rounds),
             (1, 1, 0)
         );
+    }
+
+    #[test]
+    fn other_bots_are_rejected_and_repeats_are_per_signer() {
+        let other =
+            json!([{"user":{"login":"dependabot[bot]"},"body":"reviewer: x\nverdict: HOLD"}]);
+        assert!(parse_verdicts(&other).is_empty());
+        let t = "shipyard-local[bot]";
+        let comments = json!([
+            {"user":{"login":t},"body":"reviewer: a\nverdict: HOLD\n- src/a.rs:1 same"},
+            {"user":{"login":t},"body":"reviewer: b\nverdict: HOLD\n- src/a.rs:1 same"}
+        ]);
+        let mut report = ReviewQualityReport {
+            schema: "x",
+            ..Default::default()
+        };
+        accumulate(&mut report, &parse_verdicts(&comments), 10);
+        assert_eq!(report.reviewers["b"].repeat_findings, 0);
+        assert_eq!(report.totals.repeat_findings, 1);
     }
 }
