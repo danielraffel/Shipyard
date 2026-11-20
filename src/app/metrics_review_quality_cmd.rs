@@ -207,10 +207,15 @@ fn read_all_comments(
         let Some(items) = value.as_array() else { break };
         all.extend(items.iter().cloned());
         if items.len() < 100 {
-            break;
+            return Ok(Value::Array(all));
         }
     }
-    Ok(Value::Array(all))
+    Err(CliFailure::new(
+        1,
+        format!(
+            "review-quality: PR {number} has more than 10000 comments; refusing a partial read"
+        ),
+    ))
 }
 
 fn list_merged(
@@ -255,10 +260,15 @@ fn list_merged(
             });
         }
         if items.len() < 100 {
-            break;
+            return Ok(result);
         }
     }
-    Ok(result)
+    Err(CliFailure::new(
+        1,
+        format!(
+            "review-quality: {repo} has more than 10000 closed PRs in the window; refusing a partial read"
+        ),
+    ))
 }
 
 fn parse_verdicts(value: &Value) -> Vec<Verdict> {
@@ -531,5 +541,15 @@ mod tests {
     fn non_bot_commenters_cannot_forge_verdicts() {
         let comments = json!([{"user":{"login":"mallory"},"body":"reviewer: x\nverdict: HOLD"}]);
         assert!(parse_verdicts(&comments).is_empty());
+    }
+
+    #[test]
+    fn page_cap_fails_closed() {
+        let mut read = |_path: String| -> Result<Value, CliFailure> {
+            Ok(Value::Array(
+                (0..100).map(|_| json!({"body": "x"})).collect(),
+            ))
+        };
+        assert!(read_all_comments(&mut read, "o/r", 9).is_err());
     }
 }
