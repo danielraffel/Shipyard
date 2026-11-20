@@ -368,7 +368,7 @@ fn accumulate(report: &mut ReviewQualityReport, verdicts: &[Verdict], lines: u64
     }
     let size = size_bucket(lines).to_owned();
     let mut seen = BTreeSet::new();
-    let mut previous_hold = false;
+    let mut previous_hold: std::collections::BTreeMap<String, bool> = Default::default();
     let held = verdicts.iter().filter(|v| v.hold).count() as u64;
     let mut first_seen = BTreeSet::new();
     for verdict in verdicts {
@@ -381,7 +381,7 @@ fn accumulate(report: &mut ReviewQualityReport, verdicts: &[Verdict], lines: u64
         }
         if verdict.hold {
             entry.holds += 1;
-            if previous_hold {
+            if previous_hold.get(&verdict.signer).copied().unwrap_or(false) {
                 entry.hold_after_hold += 1;
             }
             entry.findings += verdict.findings.len() as u64;
@@ -390,9 +390,9 @@ fn accumulate(report: &mut ReviewQualityReport, verdicts: &[Verdict], lines: u64
                 .iter()
                 .filter(|f| !seen.insert((verdict.signer.clone(), f.identity.clone())))
                 .count() as u64;
-            previous_hold = true;
+            previous_hold.insert(verdict.signer.clone(), true);
         } else {
-            previous_hold = false;
+            previous_hold.insert(verdict.signer.clone(), false);
         }
     }
     if held > 0 {
@@ -510,6 +510,19 @@ mod tests {
         accumulate(&mut report, &verdicts, 401);
         assert!(report.reviewers.contains_key("agent-b"));
         assert!(report.rounds_by_size.contains_key("401-1,000"));
+    }
+
+    #[test]
+    fn hold_after_hold_is_per_reviewer() {
+        let comments = json!([
+            {"user":{"login":"shipyard-local[bot]"},"body":"reviewer: a\nverdict: HOLD"},
+            {"user":{"login":"shipyard-local[bot]"},"body":"reviewer: b\nverdict: HOLD"}]);
+        let mut report = ReviewQualityReport {
+            schema: "x",
+            ..Default::default()
+        };
+        accumulate(&mut report, &parse_verdicts(&comments), 10);
+        assert_eq!(report.reviewers["b"].hold_after_hold, 0);
     }
 
     #[test]
