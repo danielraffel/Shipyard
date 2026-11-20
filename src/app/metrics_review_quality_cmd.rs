@@ -95,8 +95,17 @@ pub(super) fn review_quality_command<W: Write>(
         let mut live_reads = 0_u64;
         let before = report.totals.clone();
         let mut read = |path: String| -> Result<Value, CliFailure> {
+            // Only a merged PR's detail is immutable; the closed-PR listing and
+            // comment threads change as PRs merge and verdicts are posted, so
+            // those are always read live.
+            let cacheable = path.split('?').next().is_some_and(|p| {
+                p.rsplit('/')
+                    .next()
+                    .is_some_and(|n| n.parse::<u64>().is_ok())
+                    && p.contains("/pulls/")
+            });
             let key = format!("review-quality:{path}");
-            if let Some(value) = cache.get(&key) {
+            if cacheable && let Some(value) = cache.get(&key) {
                 return Ok(value);
             }
             let args = vec!["api".to_owned(), path.clone()];
@@ -109,7 +118,9 @@ pub(super) fn review_quality_command<W: Write>(
             let value: Value = serde_json::from_str(&text).map_err(|error| {
                 CliFailure::new(1, format!("review-quality JSON failed: {error}"))
             })?;
-            cache.put(&key, &value);
+            if cacheable {
+                cache.put(&key, &value);
+            }
             Ok(value)
         };
         let prs = list_merged(&mut read, &repo, since)?;
