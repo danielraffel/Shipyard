@@ -58,6 +58,7 @@ mod merge_queue_control_cmd;
 mod merge_steward_cmd;
 mod metrics_cmd;
 mod metrics_gate_cost_cmd;
+mod metrics_review_quality_cmd;
 mod owner_cmd;
 mod parallel_proof_canary_cmd;
 mod paths_cmd;
@@ -129,6 +130,7 @@ use self::init_cmd::init_command;
 use self::merge_queue_control_cmd::merge_queue_control_command;
 use self::metrics_cmd::metrics_command;
 use self::metrics_gate_cost_cmd::gate_cost_command;
+use self::metrics_review_quality_cmd::review_quality_command;
 use self::parallel_proof_canary_cmd::parallel_proof_canary_command;
 use self::paths_cmd::print_paths;
 use self::pin_cmd::pin_command;
@@ -403,6 +405,14 @@ where
             return match *command {
                 self::cli::MetricsCommand::GateCost(args) => gate_cost_command(
                     *args,
+                    cli.mode.into(),
+                    &cwd,
+                    &runtime_paths.state_dir,
+                    cli.json,
+                    stdout,
+                ),
+                self::cli::MetricsCommand::ReviewQuality(args) => review_quality_command(
+                    args,
                     cli.mode.into(),
                     &cwd,
                     &runtime_paths.state_dir,

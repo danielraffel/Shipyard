@@ -1,0 +1,5 @@
+[
+  {"user":{"login":"shipyard-local[bot]"},"body":"Reviewed exact head.\nreviewer: alice\n<!-- session: m5/review-1 -->\nverdict: HOLD head:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nFindings:\n- src/lib.rs:10 use thing"},
+  {"user":{"login":"shipyard-local[bot]"},"body":"Reviewed repaired head.\nreviewer: alice\n<!-- session: m5/review-1 -->\nverdict: HOLD head:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nFindings:\n- src/lib.rs:10 use thing\n- src/main.rs:20 new"},
+  {"user":{"login":"shipyard-local[bot]"},"body":"Reviewed exact head.\nreviewer: alice\n<!-- session: m5/review-1 -->\nverdict: APPROVE head:cccccccccccccccccccccccccccccccccccccccc"}
+]

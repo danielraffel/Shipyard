@@ -1751,6 +1751,18 @@ pub(crate) enum MetricsCommand {
     /// the repository so GitHub credentials resolve for it.
     #[command(name = "gate-cost", verbatim_doc_comment)]
     GateCost(Box<MetricsGateCostArgs>),
+    /// Read-only weekly reviewer-quality scorecard from merged pull requests.
+    ReviewQuality(MetricsReviewQualityArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct MetricsReviewQualityArgs {
+    /// Repository slug. Repeat for multiple repositories.
+    #[arg(long = "repo", required = true)]
+    pub(crate) repos: Vec<String>,
+    /// Number of days ending now to inspect.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub(crate) days: u64,
 }
 
 #[derive(Debug, Args)]

@@ -199,6 +199,11 @@ counts each distinct superseded job once, reports clean versus
 uncertain/cancelled/unmatched coverage, and never treats survivor runtime as
 savings. It never turns this evidence into a queue or merge decision.
 
+`metrics review-quality` is a read-only scorecard of reviewer verdict quality (rounds,
+repeat findings, HOLD-after-HOLD, size buckets) over merged PRs in a `--days`
+window. It counts verdicts only from the trusted bot signers, pages every
+comment and PR list, and fails instead of returning a partial read.
+
 The producer-side merge-receipt export supports an explicit `--stdout` stream
 mode for a governed transport. It emits canonical JSONL receipt records only;
 `--file` remains the atomic handoff mode, and `--stdout` cannot be combined
