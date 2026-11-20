@@ -385,11 +385,10 @@ mod tests {
 
     #[test]
     fn parses_two_round_hold_and_repeat_id() {
-        let comments = json!([
-            {"body":"reviewer: alice\nverdict: HOLD\n- src/lib.rs:10 use thing"},
-            {"body":"reviewer: alice\nverdict: HOLD\n- src/lib.rs:10 use thing\n- src/main.rs:20 new"},
-            {"body":"reviewer: alice\nverdict: APPROVE"}
-        ]);
+        let comments: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/review-quality/two-round-comments.json"
+        ))
+        .expect("fixture");
         let verdicts = parse_verdicts(&comments);
         let mut report = ReviewQualityReport {
             schema: "x",
