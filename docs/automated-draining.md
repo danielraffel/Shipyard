@@ -356,7 +356,7 @@ One result shows why this is worth doing. Adding finding ids to reviews kept rou
 
 ### Optional: a local model for judging work
 
-Scoring those replays takes thousands of "is this the same defect?" calls. We run that job on a local model, Inkling 2 Mini under Ollama on an Apple silicon Mac, at about 49 calls a minute with no per-call cost. On our hand-checked pairs it was right 52 times out of 52, where the paid model was right 47 times. It generates about 60 tokens a second with thinking off.
+Scoring a replay takes thousands of "is this the same defect?" calls. We ran that job on a local model, Inkling 2 Mini under Ollama on an Apple silicon Mac, at about 49 calls a minute with no per-call cost. On our hand-checked pairs it was right 52 times out of 52, where the paid model was right 47 times. It generates about 60 tokens a second with thinking off. A replay runs when we evaluate a change to the reviewers, not on a schedule, so the local model is used only then.
 
 It is optional and advisory: it feeds measurement, never a merge or a verdict. Before each use it is scored against a small hand-checked set, and the job falls back to the paid model below the bar. A local model did not do well enough as a first-pass code reviewer (about half the blocking findings caught), so reviews stay with the frontier models.
 
