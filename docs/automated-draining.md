@@ -343,6 +343,23 @@ Put the rules in the repo so they travel with the code. Put machine-specific
 details (which host runs the steward, local paths) in the global file on each
 machine.
 
+## Changing how reviewers review
+
+Reviewer instructions decide how many rounds a pull request takes, so a change to them deserves the same evidence as a code change. We test one by replaying our own history before it goes live:
+
+- **Cases:** merged pull requests, with the round-1 diff the reviewer saw, and the blocking findings that later rounds raised. Those later findings are the answer key.
+- **The measure:** how many of those findings the changed instructions catch in round 1, and how often they hold pull requests that later merged clean.
+- **Isolation:** the replayed reviewer runs with no shell or file tools. When we first allowed a shell, it read the answer key in 4 of 10 runs.
+- **Bars fixed before the run:** tune on one set of cases, score a held-out set once.
+
+One result shows why this is worth doing. Adding finding ids to reviews kept round-1 recall of blocking findings the same, and cut holds on clean pull requests by 17 points. Live, the share of repaired pull requests held again fell from 51% to 33%. A stricter "what counts as blocking" bar looked better on false holds, but it halved the blocking findings caught, so it never shipped.
+
+### Optional: a local model for judging work
+
+Scoring those replays takes thousands of "is this the same defect?" calls. We run that job on a local model, Inkling 2 Mini under Ollama on an Apple silicon Mac, at about 49 calls a minute with no per-call cost. On our hand-checked pairs it was right 52 times out of 52, where the paid model was right 47 times. It generates about 60 tokens a second with thinking off.
+
+It is optional and advisory: it feeds measurement, never a merge or a verdict. Before each use it is scored against a small hand-checked set, and the job falls back to the paid model below the bar. A local model did not do well enough as a first-pass code reviewer (about half the blocking findings caught), so reviews stay with the frontier models.
+
 ## When not to use it
 
 - **You want a human to read every change before it lands.** Keep the review
