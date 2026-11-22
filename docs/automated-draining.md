@@ -360,6 +360,8 @@ Scoring those replays takes thousands of "is this the same defect?" calls. We ru
 
 It is optional and advisory: it feeds measurement, never a merge or a verdict. Before each use it is scored against a small hand-checked set, and the job falls back to the paid model below the bar. A local model did not do well enough as a first-pass code reviewer (about half the blocking findings caught), so reviews stay with the frontier models.
 
+We keep it only while it earns its place: it has to avoid enough paid calls, agree with a daily audit sample from the paid model, and not slow CI on the machine it runs on. If it stops doing that, it comes out of the process and this section goes with it.
+
 ## When not to use it
 
 - **You want a human to read every change before it lands.** Keep the review
