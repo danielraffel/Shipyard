@@ -924,6 +924,7 @@ window_minutes = 120              # default; 1 to 1440
 ```
 
 Absent, the steward reads nothing extra and behaves exactly as before.
+Removing it also forgets any window it opened.
 
 - **Release window.** Open while the base's version is newer than every
   `<tag_prefix>x.y.z` tag and has no tag of its own. The first pass that sees
@@ -937,8 +938,8 @@ Absent, the steward reads nothing extra and behaves exactly as before.
   approved exact head. A solo pull request that is red, held, unapproved, a
   draft, or not the steward's to enqueue changes nothing.
 - **While it is ready, nothing else is admitted** for that repository: other
-  rows report `held_solo_entry:#<n>`, and the native-arm backstop arms
-  nothing. `runner steward-admit-ready` skips a repository with an open window
+  rows report `held_solo_entry:#<n>`, the native-arm backstop arms nothing,
+  and the red-base fix reorder does not jump a fix. `runner steward-admit-ready` skips a repository with an open window
   (`solo_entry_window_open`).
 - **It is enqueued only into an empty queue.** Otherwise it reports
   `solo_entry_waiting:<k>_ahead`. The queue is read again under the mutation

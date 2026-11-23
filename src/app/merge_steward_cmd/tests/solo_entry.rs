@@ -5,7 +5,7 @@ use super::*;
 use crate::app::merge_steward_cmd::pr_mutations::mutate_pr_with_recovery;
 use crate::app::merge_steward_cmd::solo_entry::{
     Gate, ObserveInput, Phase, Reads, RepoSetting, Settings, advance_window, file_version, observe,
-    release_pending, verify_after_enqueue, window_key, window_open,
+    pre_enqueue_refusal, release_pending, verify_after_enqueue, window_key, window_open,
 };
 
 const SOLO_BRANCH: &str = "automation/pulp-observatory-coalesced";
@@ -162,6 +162,16 @@ fn without_a_setting_nothing_is_read_and_nothing_is_held() {
     let observation = observation_with(vec![product, solo]);
     let reads = FakeReads::release(&[(99, 1)]);
     let mut ledger = StewardLedger::default();
+    // A window left by a setting since removed (a rollback) is forgotten.
+    ledger.solo_entry_windows.insert(
+        window_key("owner/repo", "main"),
+        crate::app::merge_steward_cmd::solo_entry::Window {
+            version: "v0.2.2".to_owned(),
+            opened_at: now(),
+            deadline: now() + chrono::Duration::minutes(120),
+            expired: false,
+        },
+    );
 
     // Another repository's setting does not reach this one.
     for settings in [Settings::default(), settings_for("Generous-Corp/vellum")] {
@@ -506,4 +516,85 @@ fn a_malformed_setting_is_reported_and_admission_runs_normally() {
     assert!(gate.line().unwrap().contains("setting refused"), "{gate:?}");
     assert_eq!(gate.enqueue_hold(SOLO), None);
     assert!(reads.calls.borrow().is_empty());
+}
+
+#[cfg(unix)]
+fn queue_gh(temp: &tempfile::TempDir, nodes: &str) -> GitHubActions {
+    fake_gh(
+        temp,
+        &format!(
+            r#"case "$*" in
+  *"mergeQueue"*) printf '%s' '{{"data":{{"repository":{{"mergeQueue":{{"entries":{{"nodes":[{nodes}],"pageInfo":{{"hasNextPage":false}}}}}}}}}}}}' ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac"#
+        ),
+    )
+}
+
+/// Under the enqueue's guard the queue is read again: an entry that
+/// appeared since the pass's read refuses the solo enqueue.
+#[cfg(unix)]
+#[test]
+fn the_solo_enqueue_rereads_the_queue_under_the_guard() {
+    let solo = pr(SOLO, SOLO_BRANCH, false, "SUCCESS", &[]);
+    let gate = Gate::Hold {
+        solo: SOLO,
+        phase: Phase::Admit,
+        line: String::new(),
+    };
+    let entry = format!(
+        r#"{{"position":1,"enqueuedAt":"2026-11-23T00:59:00Z","headCommit":{{"oid":"{PRODUCT:0>40}"}},"pullRequest":{{"number":{PRODUCT}}}}}"#
+    );
+    for (nodes, expected) in [
+        (
+            entry.as_str(),
+            Some(Ok("solo_entry_waiting:1_ahead".to_owned())),
+        ),
+        ("", None),
+    ] {
+        let temp = tempfile::tempdir().expect("temp");
+        let actions = queue_gh(&temp, nodes);
+        let observation = observation_with(vec![solo.clone()]);
+        let control = mutation_control(&temp, "studio", "studio");
+        let ledger_path = temp.path().join("ledger.json");
+        let mut context = mutation_apply_context(&actions, &observation, &ledger_path, &control);
+        context.solo_entry = Some(&gate);
+        assert_eq!(pre_enqueue_refusal(&context, &solo), expected, "{nodes}");
+    }
+}
+
+/// The exact snippet the docs give for Vellum loads from a real
+/// machine-global config file.
+#[test]
+fn the_documented_setting_loads_from_the_machine_global_config() {
+    let temp = tempfile::tempdir().expect("temp");
+    fs::write(
+        temp.path().join("config.toml"),
+        "[merge_steward.solo_entry.\"Generous-Corp/vellum\"]\n\
+         branches = [\"automation/pulp-observatory-coalesced\"]\n\
+         version_file = \"CMakeLists.txt\"\n",
+    )
+    .expect("config");
+    let settings = Settings::from_machine_global(temp.path());
+    let mut observation = observation_with(vec![pr(SOLO, SOLO_BRANCH, false, "SUCCESS", &[])]);
+    "Generous-Corp/vellum".clone_into(&mut observation.repo);
+    let reads = FakeReads::release(&[]);
+    let gate = run(
+        &settings,
+        &observation,
+        &reads,
+        &mut StewardLedger::default(),
+        now(),
+    );
+    assert!(
+        matches!(
+            gate,
+            Gate::Hold {
+                solo: SOLO,
+                phase: Phase::Admit,
+                ..
+            }
+        ),
+        "{gate:?}"
+    );
 }

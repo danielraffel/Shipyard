@@ -548,7 +548,16 @@ pub(super) fn observe(
     let observation = input.observation;
     let repo = &observation.repo;
     let setting = match input.settings.for_repo(repo) {
-        None => return Gate::Off,
+        None => {
+            // A removed setting is a rollback: forget its window too, so
+            // `runner steward-admit-ready` stops deferring the repository.
+            if input.apply {
+                ledger
+                    .solo_entry_windows
+                    .remove(&window_key(repo, &observation.base));
+            }
+            return Gate::Off;
+        }
         Some(Err(error)) => {
             return Gate::Inactive {
                 line: format!("solo entry: setting refused ({error}); normal admission"),

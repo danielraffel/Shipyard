@@ -259,7 +259,14 @@ pub(super) fn apply_repo_plan(
         args.apply,
         observation,
     );
-    if let Some(poison) = base_poison.as_ref() {
+    // The fix reorder jump-enqueues a fix; while a solo pull request holds
+    // the repository nothing else is admitted, so it waits. See `solo_entry`.
+    if base_poison.is_some() && !solo_gate.backstop_allowed() {
+        triage_lines.push(format!(
+            "fix_reorder: held: {}",
+            solo_gate.line().unwrap_or_default()
+        ));
+    } else if let Some(poison) = base_poison.as_ref() {
         triage_lines.extend(super::fix_reorder::run(
             actions,
             mutation_control,
