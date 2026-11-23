@@ -4545,15 +4545,23 @@ of such a head to pass.
 **A solo branch merges alone during a release window.** The steward host's
 `[merge_steward.solo_entry."<owner/name>"]` (`branches`, `version_file`,
 optional `tag_prefix` and `window_minutes`, default 120) names head branches
-that must merge with nothing ahead of them while the base's version is newer
-than every tag and untagged. While such a pull request is ready (queued, or
-green with an approved exact head), every other row reports
-`held_solo_entry:#<n>` and the native-arm backstop arms nothing; the solo pull
-request waits as `solo_entry_waiting:<k>_ahead` until the queue is empty, and
-when an entry lands ahead of it the steward removes only its own entry
-(`dequeued_solo_entry:<k>_ahead`). Nothing to do for a held row: it is admitted
-once the solo pull request merges, stops being ready, or the window expires.
-See `docs/automated-draining.md` "Solo entry".
+whose pull request must merge alone while the base's version is unreleased
+(untagged, or its GitHub release missing or a draft). A hold engages when such
+a pull request (opened by the fleet App, from this repository) is ready, and
+continues while it is open, for at most `window_minutes` from the engage and 3
+attempts per version. During it every other row reports `held_solo_entry:#<n>`
+(`held_for_solo_attempt:#<n>` while the solo pull request is being rebuilt or
+reviewed), the backstop arms nothing and the steward disables auto-merge
+requests it armed itself. The solo pull request is enqueued only into an empty
+queue with a head that contains the base tip; otherwise it waits as
+`solo_entry_waiting:<k>_ahead` or `solo_entry_waiting:behind_base` (its owner
+rebuilds it; do not push to it). When an entry lands ahead of it the steward
+removes only its own entry (`dequeued_solo_entry:<k>_ahead`); an entry behind
+it is reported as `solo_entry_shared_batch_risk` and never touched. Nothing to
+do for a held row: it is admitted once the solo pull request merges or the
+hold ends, and the `solo_entry` line of the report says which
+(`HOLD RELEASED`, `RELEASE WINDOW EXPIRED`). The named fix for a confirmed red
+base is not held. See `docs/automated-draining.md` "Solo entry".
 
 **A flake that ejected several approved pull requests is re-enqueued once.**
 When the same failing test signature (each failing required check with the

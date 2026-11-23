@@ -88,7 +88,7 @@ fn approval() -> String {
 const JUMP_ACCEPTED: &str = r#"{"data":{"enqueuePullRequest":{"mergeQueueEntry":{"position":1}}}}"#;
 const JUMP_FORBIDDEN: &str = r#"{"data":{"enqueuePullRequest":null},"errors":[{"type":"FORBIDDEN","message":"Viewer is not allowed to jump the queue"}]}"#;
 
-fn poisoned(hold: PoisonHold, auto_jump: AutoJump, fixes: &[u64]) -> RepoPoison {
+pub(super) fn poisoned(hold: PoisonHold, auto_jump: AutoJump, fixes: &[u64]) -> RepoPoison {
     let mut poison = streak_only(hold, auto_jump, fixes);
     poison.tip = crate::app::merge_steward_cmd::base_poison::red_tip(&poison.health);
     // The named fix's head passed the context after the base went red.

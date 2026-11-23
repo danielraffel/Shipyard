@@ -458,11 +458,11 @@ pub(super) fn admit_ready_event(
     if super::flake_requeue::unswept_requeue(&ledger, &observation.repo) {
         return ReadyEventOutcome::skipped(event, apply, "flake_requeue_unswept");
     }
-    // A solo-entry release window the tick opened: only the tick, which
-    // reads the queue and the solo pull request, admits anything. See
-    // `solo_entry`.
-    if super::solo_entry::window_open(&ledger, &observation.repo, &observation.base, now) {
-        return ReadyEventOutcome::skipped(event, apply, "solo_entry_window_open");
+    // A solo-entry hold the tick engaged: only the tick, which reads the
+    // queue and the solo pull request, admits anything. An open release
+    // window with no hold does not stop this path. See `solo_entry`.
+    if super::solo_entry::hold_engaged(&ledger, &observation.repo, &observation.base, now) {
+        return ReadyEventOutcome::skipped(event, apply, "solo_entry_hold_engaged");
     }
     // The decision again, on the ledger the lock protects.
     let decision = classify_pr(
