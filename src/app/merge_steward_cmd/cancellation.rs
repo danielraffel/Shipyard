@@ -41,6 +41,45 @@ pub(super) fn pass_policy(
     }
 }
 
+/// The fix reorder jump-enqueues a fix; while a solo pull request holds the
+/// repository nothing else is admitted, so it waits. See `solo_entry`.
+pub(super) fn fix_reorder_step(
+    solo_gate: &super::solo_entry::Gate,
+    actions: &GitHubActions,
+    mutation_control: Option<&MutationControl>,
+    apply: bool,
+    observation: &RepoObservation,
+    base_poison: Option<&super::base_poison::RepoPoison>,
+) -> Vec<String> {
+    match base_poison {
+        None => Vec::new(),
+        Some(_) if !solo_gate.backstop_allowed() => vec![format!(
+            "fix_reorder: held: {}",
+            solo_gate.line().unwrap_or_default()
+        )],
+        Some(poison) => {
+            super::fix_reorder::run(actions, mutation_control, apply, observation, poison)
+        }
+    }
+}
+
+/// The native-arm backstop's status while a solo pull request holds the
+/// repository: nothing is armed. `None` when the backstop may run.
+pub(super) fn native_arm_solo_hold(
+    solo_gate: &super::solo_entry::Gate,
+    arm_unqueued: bool,
+) -> Option<super::native_arm::NativeArmRepoStatus> {
+    (arm_unqueued && !solo_gate.backstop_allowed()).then(|| {
+        super::native_arm::NativeArmRepoStatus {
+            policy: format!(
+                "held: {}; nothing armed this pass",
+                solo_gate.line().unwrap_or_default()
+            ),
+            results: Vec::new(),
+        }
+    })
+}
+
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn apply_repo_plan(
@@ -259,22 +298,14 @@ pub(super) fn apply_repo_plan(
         args.apply,
         observation,
     );
-    // The fix reorder jump-enqueues a fix; while a solo pull request holds
-    // the repository nothing else is admitted, so it waits. See `solo_entry`.
-    if base_poison.is_some() && !solo_gate.backstop_allowed() {
-        triage_lines.push(format!(
-            "fix_reorder: held: {}",
-            solo_gate.line().unwrap_or_default()
-        ));
-    } else if let Some(poison) = base_poison.as_ref() {
-        triage_lines.extend(super::fix_reorder::run(
-            actions,
-            mutation_control,
-            args.apply,
-            observation,
-            poison,
-        ));
-    }
+    triage_lines.extend(fix_reorder_step(
+        &solo_gate,
+        actions,
+        mutation_control,
+        args.apply,
+        observation,
+        base_poison.as_ref(),
+    ));
     let pause_lines = if args.apply {
         super::poison_pause::reconcile(ledger, observation, base_poison.as_ref(), Utc::now())
     } else {
@@ -421,17 +452,8 @@ pub(super) fn apply_repo_plan(
     // The backstop acts only on pull requests the steward declines to own, so
     // it can never contend with the enqueue path above. See `native_arm`.
     let (native_arm_status, native_arm_failed) =
-        if args.arm_unqueued && !solo_gate.backstop_allowed() {
-            (
-                super::native_arm::NativeArmRepoStatus {
-                    policy: format!(
-                        "held: {}; nothing armed this pass",
-                        solo_gate.line().unwrap_or_default()
-                    ),
-                    results: Vec::new(),
-                },
-                false,
-            )
+        if let Some(held) = native_arm_solo_hold(&solo_gate, args.arm_unqueued) {
+            (held, false)
         } else if args.arm_unqueued && super::pass_budget::deadline_passed(args.pass_deadline) {
             (
                 super::native_arm::NativeArmRepoStatus {

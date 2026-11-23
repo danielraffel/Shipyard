@@ -598,3 +598,71 @@ fn the_documented_setting_loads_from_the_machine_global_config() {
         "{gate:?}"
     );
 }
+
+fn holding_gate() -> Gate {
+    Gate::Hold {
+        solo: SOLO,
+        phase: Phase::Admit,
+        line: "solo_entry: #7 admitting it alone".to_owned(),
+    }
+}
+
+/// The fix reorder jump-enqueues a fix, so a held repository must not run it:
+/// the step reports `fix_reorder: held` and reads nothing from GitHub.
+#[cfg(unix)]
+#[test]
+fn the_fix_reorder_is_held_while_a_solo_pr_holds_the_repository() {
+    use crate::app::merge_steward_cmd::cancellation::fix_reorder_step;
+    use crate::base_health::{AutoJump, PoisonHold};
+
+    let temp = tempfile::tempdir().expect("temp");
+    let log = temp.path().join("calls");
+    let actions = fake_gh(
+        &temp,
+        &format!("printf '%s\\n' \"$*\" >> '{}'\nexit 2", log.display()),
+    );
+    let observation = observation_with(vec![pr(PRODUCT, "feature", false, "SUCCESS", &[])]);
+    let poison = super::base_poison::streak_only(PoisonHold::On, AutoJump::On, &[PRODUCT]);
+
+    let held = fix_reorder_step(
+        &holding_gate(),
+        &actions,
+        None,
+        true,
+        &observation,
+        Some(&poison),
+    );
+    assert_eq!(
+        held,
+        vec!["fix_reorder: held: solo_entry: #7 admitting it alone".to_owned()]
+    );
+    assert!(fs::read_to_string(&log).unwrap_or_default().is_empty());
+
+    // Controls: no poison runs nothing; an inactive gate does not hold.
+    assert!(fix_reorder_step(&holding_gate(), &actions, None, true, &observation, None).is_empty());
+    let open = fix_reorder_step(
+        &Gate::Off,
+        &actions,
+        None,
+        true,
+        &observation,
+        Some(&poison),
+    );
+    assert!(open.iter().all(|line| !line.contains("held")), "{open:?}");
+}
+
+/// The native-arm backstop arms unqueued pull requests, so a held repository
+/// arms nothing; with the gate off or the backstop disabled it is not held.
+#[test]
+fn the_native_arm_backstop_is_held_while_a_solo_pr_holds_the_repository() {
+    use crate::app::merge_steward_cmd::cancellation::native_arm_solo_hold;
+
+    let held = native_arm_solo_hold(&holding_gate(), true).expect("held");
+    assert_eq!(
+        held.policy,
+        "held: solo_entry: #7 admitting it alone; nothing armed this pass"
+    );
+    assert!(held.results.is_empty());
+    assert!(native_arm_solo_hold(&holding_gate(), false).is_none());
+    assert!(native_arm_solo_hold(&Gate::Off, true).is_none());
+}
