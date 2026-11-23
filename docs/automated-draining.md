@@ -946,7 +946,13 @@ window_minutes = 120              # default; 1 to 1440
 ```
 
 Absent, the steward reads nothing extra and behaves exactly as before.
-Removing it also forgets everything the mode recorded.
+Removing it also forgets everything the mode recorded, on the next applying
+pass.
+
+Before installing an older binary, remove the setting and run one applying
+pass. The window this version keeps in the steward ledger has a different
+shape, and an older binary that finds one refuses the whole ledger
+(`invalid steward ledger`) for every repository.
 
 - **Release window.** Open while the base's version is newer than every other
   `<tag_prefix>x.y.z` tag, and its own tag is missing or its GitHub release is
@@ -966,17 +972,34 @@ Removing it also forgets everything the mode recorded.
   `held_solo_entry:#<n>`, or `held_for_solo_attempt:#<n>` while the solo pull
   request is not ready. The native-arm backstop arms nothing and the red-base
   fix reorder does not jump a fix. `runner steward-admit-ready` skips the
-  repository only while a hold is engaged (`solo_entry_hold_engaged`), not for
-  the whole window.
-- **The hold ends** when the solo pull request merges or closes, or after
-  `window_minutes` of holding. The clock starts when the hold engages, not when
-  the window opens. The expiry logs `solo entry: RELEASE WINDOW EXPIRED for
-  <tag>` once and normal admission resumes. It also ends for a head that cannot
-  be enqueued: the queue removed it, the enqueue path refused it on 3 passes
-  after the gate admitted it, or the steward removed its own entry 3 times.
+  repository while a hold is engaged (`solo_entry_hold_engaged`), not for the
+  whole window.
+- **Only the tick enqueues a solo pull request.** `runner
+  steward-admit-ready` never admits one (`solo_entry_candidate`), hold or no
+  hold: the approval that makes it ready arrives there before any tick has
+  engaged a hold, and that path does not read the queue as empty or the head
+  as up to date.
+- **The hold is for one pull request and ends when it merges or closes**
+  (read from GitHub, so a census that misses it for a pass does not end the
+  hold). The next reconcile, even if it is already open, starts its own
+  attempt. It also ends after `window_minutes` of holding. The clock starts
+  when the hold engages, not when the window opens. The expiry logs `solo
+  entry: RELEASE WINDOW EXPIRED for <tag>` once and normal admission resumes.
+- **Past its window with the solo entry still in the merge queue, the hold
+  stays** (`HOLD EXTENDED`), because letting go would admit the backlog into
+  its push. The queue decides: the entry merges, or the queue removes it. The
+  extension ends at twice `window_minutes` whatever happens.
+- **The hold lets go of a head that cannot be enqueued**: the queue removed
+  it, the enqueue path refused it by name on 3 passes after the gate admitted
+  it, or the steward removed its own entry 3 times. A pass stopped by the
+  central HOLD, the wrong mutation machine or a failed read is not a refusal
+  and counts nothing.
 - **A hold that ended on a head does not engage for that head again.** A new
   head, or another solo pull request, starts the next attempt. A version gets
-  at most 3 attempts, each bounded by `window_minutes`.
+  at most 3 attempts, each bounded by `window_minutes`, and an attempt that
+  ends in a merge counts. So the attempts go to the first 3 reconciles after
+  a version bump; later reconciles for that version are admitted like any
+  other pull request.
 - **A failed release read keeps the last known window** for up to 3 passes in
   a row, so one 5xx does not drop a hold. After that the mode fails open:
   the hold is released and normal admission runs. With no window on record a
@@ -986,7 +1009,9 @@ Removing it also forgets everything the mode recorded.
   `solo_entry_waiting:<k>_ahead` or `solo_entry_waiting:behind_base`. A stale
   head would merge alone and still be refused by the tag gate, so it is never
   enqueued; the steward never pushes to it, its owner rebuilds it. Both are
-  read again under the mutation guard just before the enqueue.
+  read again under the mutation guard just before the enqueue. An entry
+  another path put in the queue (a person, a native arm) is compared with the
+  base too, and a stale one is removed as the steward's own entry.
 - **Nothing lands ahead of it.** Right after the enqueue, and on every pass
   while it is queued, the queue is read again. When any entry is ahead of it
   (an already-armed pull request GitHub enqueued in the gap), the steward
@@ -998,8 +1023,10 @@ Removing it also forgets everything the mode recorded.
   that shares its push. While the hold is engaged the steward enqueues and
   arms nothing else, and it disables the auto-merge requests its own backstop
   armed (it records them in the ledger when it arms, for a repository with
-  this setting). The backstop arms them again, under its usual checks, once
-  the hold ends. An entry that still appears behind the solo entry (armed by
+  this setting), after reading each again under the guard: same head, still
+  armed, not queued. A disabled request is no longer on record, so one a
+  person arms on that head later is left alone. The backstop arms them
+  again, under its usual checks, once the hold ends. An entry that still appears behind the solo entry (armed by
   a person, `runner carrier`, or `shipyard pr` without `--no-arm`) is reported
   as `solo_entry_shared_batch_risk` with its number. The steward never
   dequeues or disarms a pull request it did not arm.

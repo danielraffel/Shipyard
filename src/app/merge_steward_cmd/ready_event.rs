@@ -374,6 +374,15 @@ pub(super) fn admit_ready_event(
     if pr.fact.queue_position.is_some() || pr.fact.auto_merge_active {
         return ReadyEventOutcome::skipped(event, apply, "already_queued_or_armed");
     }
+    // A solo-entry pull request is the tick's alone: only the tick reads the
+    // queue as empty and the head as up to date before it enqueues it, and
+    // the event that makes it ready arrives here before any tick has engaged
+    // a hold. See `solo_entry`.
+    if super::solo_entry::Settings::from_machine_global(&control.global_dir)
+        .solo_candidate(&observation.repo, pr)
+    {
+        return ReadyEventOutcome::skipped(event, apply, "solo_entry_candidate");
+    }
     let policy = super::cancellation::pass_policy(actions, &args, &observation);
     let decision = classify_pr(
         &pr.fact,
