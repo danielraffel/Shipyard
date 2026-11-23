@@ -493,10 +493,36 @@ fn the_release_request_is_read_from_the_version_file_and_tags() {
         "refs/tags/v0.2.1".to_owned(),
         "refs/tags/v0.1.10".to_owned(),
     ];
-    assert!(release_pending((0, 2, 2), &tags, "v"));
-    assert!(!release_pending((0, 2, 1), &tags, "v"), "already tagged");
-    assert!(!release_pending((0, 2, 0), &tags, "v"), "older than a tag");
-    assert!(release_pending((0, 1, 0), &[], "v"), "no tags yet");
+    assert!(release_pending((0, 2, 2), &tags, "v", false));
+    assert!(
+        !release_pending((0, 2, 1), &tags, "v", true),
+        "tagged and released"
+    );
+    assert!(
+        !release_pending((0, 2, 0), &tags, "v", false),
+        "older than a tag"
+    );
+}
+
+/// Vellum v0.2.2: the tag existed at 02:27Z, but its own provenance run judged
+/// live state after signing and failed, and no release was published. The
+/// window must hold until the release is published, not end at the tag.
+#[test]
+fn tag_exists_but_release_unpublished_keeps_the_window_open() {
+    let tags = ["refs/tags/v0.2.2".to_owned(), "refs/tags/v0.2.1".to_owned()];
+    assert!(
+        release_pending((0, 2, 2), &tags, "v", false),
+        "tagged, release missing or draft: still pending"
+    );
+    assert!(
+        !release_pending((0, 2, 2), &tags, "v", true),
+        "tagged and published: closed"
+    );
+    assert!(
+        !release_pending((0, 2, 1), &tags, "v", false),
+        "an older version is never pending"
+    );
+    assert!(release_pending((0, 1, 0), &[], "v", false), "no tags yet");
 }
 
 #[test]

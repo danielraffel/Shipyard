@@ -18,9 +18,12 @@
 //! The mode acts only inside a *release window*: the base's version (the
 //! `project(... VERSION x.y.z)` of a `CMakeLists.txt`, otherwise the first
 //! `x.y.z` in the file) is newer than every `<prefix>x.y.z` tag and has no tag
-//! of its own. The window opens the first pass that sees it, closes when the
-//! tag exists, and expires `window_minutes` after it opened (one log line), so
-//! a reconcile that never lands cannot freeze the repository.
+//! of its own, or its tag exists but its GitHub release is not published yet
+//! (missing or a draft). The tag's own provenance run judges live state after
+//! signing, so the window holds until the release is out. It opens the first
+//! pass that sees it, closes when the release is published, and expires
+//! `window_minutes` after it opened (one log line), so a reconcile that never
+//! lands cannot freeze the repository.
 //!
 //! Inside a window, while a pull request whose head is a solo branch is open,
 //! not a draft, and admission-ready (the steward would enqueue it and its
@@ -304,8 +307,15 @@ pub(super) fn file_version(file: &str, content: &str) -> Option<(u64, u64, u64)>
 }
 
 /// Whether `version` is a pending release request against `tags` (full refs
-/// or tag names): newer than every `<prefix>x.y.z` tag and untagged itself.
-pub(super) fn release_pending(version: (u64, u64, u64), tags: &[String], prefix: &str) -> bool {
+/// or tag names): newer than every other `<prefix>x.y.z` tag, and either
+/// untagged itself or tagged with its release not yet published
+/// (`own_release_published` is read only when its tag exists).
+pub(super) fn release_pending(
+    version: (u64, u64, u64),
+    tags: &[String],
+    prefix: &str,
+    own_release_published: bool,
+) -> bool {
     let tagged = tags
         .iter()
         .filter_map(|tag| {
@@ -313,7 +323,31 @@ pub(super) fn release_pending(version: (u64, u64, u64), tags: &[String], prefix:
             semver(name.strip_prefix(prefix)?)
         })
         .collect::<Vec<_>>();
-    !tagged.contains(&version) && tagged.iter().all(|tag| version > *tag)
+    let newer_than_others = tagged
+        .iter()
+        .filter(|tag| **tag != version)
+        .all(|tag| version > *tag);
+    newer_than_others && !(tagged.contains(&version) && own_release_published)
+}
+
+/// Whether the GitHub release for `tag` is published: it exists and is not a
+/// draft. A missing release (404) is unpublished; any other read error is
+/// returned, so the caller reports it and admits as usual.
+fn release_published(actions: &GitHubActions, repo: &str, tag: &str) -> Result<bool, String> {
+    match actions.run_gh(&[
+        "api".to_owned(),
+        format!("repos/{repo}/releases/tags/{tag}"),
+        "--jq".to_owned(),
+        ".draft".to_owned(),
+    ]) {
+        Ok(draft) => Ok(draft.trim() == "false"),
+        Err(error)
+            if error.to_string().contains("404") || error.to_string().contains("Not Found") =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(format!("release {tag} unreadable: {error}")),
+    }
 }
 
 /// The version a pending release request names on `base`, or `None`.
@@ -349,8 +383,12 @@ fn read_pending_release(
         .map(str::to_owned)
         .collect::<Vec<_>>();
     let (major, minor, patch) = version;
-    Ok(release_pending(version, &tags, &setting.tag_prefix)
-        .then(|| format!("{}{major}.{minor}.{patch}", setting.tag_prefix)))
+    let own_tag = format!("{}{major}.{minor}.{patch}", setting.tag_prefix);
+    let own_tagged = tags
+        .iter()
+        .any(|tag| tag.strip_prefix("refs/tags/").unwrap_or(tag) == own_tag);
+    let published = own_tagged && release_published(actions, repo, &own_tag)?;
+    Ok(release_pending(version, &tags, &setting.tag_prefix, published).then_some(own_tag))
 }
 
 /// Where the solo pull request stands against the base's merge queue.

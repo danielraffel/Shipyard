@@ -927,10 +927,12 @@ Absent, the steward reads nothing extra and behaves exactly as before.
 Removing it also forgets any window it opened.
 
 - **Release window.** Open while the base's version is newer than every
-  `<tag_prefix>x.y.z` tag and has no tag of its own. The first pass that sees
-  it records it in the steward ledger; the window closes when the tag exists
-  and expires `window_minutes` after it opened, whether or not the tag
-  appeared. The expiry logs `solo entry: RELEASE WINDOW EXPIRED for <tag>`
+  other `<tag_prefix>x.y.z` tag and its own release is not published yet: it
+  has no tag, or its tag exists but the GitHub release is missing or a draft.
+  A tag's own provenance run judges live state after signing, so the window
+  holds until the release is out. The first pass that sees it records it in
+  the steward ledger; the window closes when the release is published and
+  expires `window_minutes` after it opened, whether or not it was. The expiry logs `solo entry: RELEASE WINDOW EXPIRED for <tag>`
   once, and normal admission resumes. Outside a window the setting changes
   nothing.
 - **Ready solo pull request.** Its head branch is listed, it is open and not a
