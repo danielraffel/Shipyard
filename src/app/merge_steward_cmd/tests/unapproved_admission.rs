@@ -344,6 +344,7 @@ fn run_poisoned(
         approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
         wake_owner: false,
         unapproved_dequeue: fixture.dequeue_mode,
+        solo_entry: crate::app::merge_steward_cmd::solo_entry::Settings::default(),
         infra_rerun: crate::app::merge_steward_cmd::InfraRerunMode::Off,
         pass_budget: None,
         pass_deadline: None,
@@ -372,6 +373,7 @@ fn run_poisoned(
             &mut ledger,
             fixture.apply.then_some(&control),
             poison,
+            None,
             None,
         );
     Outcome {

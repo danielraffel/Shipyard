@@ -582,6 +582,34 @@ fn pending_cancellations_leave_the_head_to_the_tick() {
     assert_eq!(harness.enqueues(), 0);
 }
 
+/// An open solo-entry release window leaves every head to the tick, which
+/// reads the queue and the solo pull request; an expired one does not.
+#[test]
+fn an_open_solo_entry_window_leaves_the_head_to_the_tick() {
+    let now = Utc::now();
+    for (expired, held) in [(false, true), (true, false)] {
+        let harness = Harness::new(&Fixture::approved());
+        let mut ledger = StewardLedger::default();
+        ledger.solo_entry_windows.insert(
+            crate::app::merge_steward_cmd::solo_entry::window_key("owner/repo", "main"),
+            crate::app::merge_steward_cmd::solo_entry::Window {
+                version: "v0.2.2".to_owned(),
+                opened_at: now - chrono::Duration::minutes(5),
+                deadline: now + chrono::Duration::minutes(115),
+                expired,
+            },
+        );
+        harness.save(&ledger);
+        let outcome = harness.admit_at(HEAD, &observed(HEAD), true, now);
+        assert_eq!(
+            outcome.reason == "solo_entry_window_open",
+            held,
+            "{outcome:?}"
+        );
+        assert_eq!(harness.enqueues(), usize::from(!held), "{outcome:?}");
+    }
+}
+
 /// The tick sweeps the flake breaker before it admits; this path does not.
 /// Pull request 41 was flake re-enqueued and may have been ejected again on
 /// its signature, unswept: an event for pull request 42, which has no receipt

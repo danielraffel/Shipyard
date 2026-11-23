@@ -902,6 +902,62 @@ A member that pushes a new head leaves the episode; the episode ends (and is
 forgotten) when fewer than three members remain. Not yet built: filing an
 issue when an episode lasts a second pass.
 
+## Solo entry: a pull request that must merge alone
+
+Some repositories tag a release only on a commit whose tail is all evidence.
+Vellum's release-tag gate is one: the coalesced observatory reconcile has to
+merge with no product pull request ahead of it, and the merge queue batches
+up to five entries, always merging the earlier ones first. Solo-entry
+admission makes the steward admit such a pull request alone, during a release
+window only.
+
+It is set per repository in the steward host's machine-global config, not in
+the repository, so removing it is a file edit on that host and never waits on
+the queue it holds:
+
+```toml
+[merge_steward.solo_entry."Generous-Corp/vellum"]
+branches = ["automation/pulp-observatory-coalesced"]
+version_file = "CMakeLists.txt"   # project(... VERSION x.y.z); any other file: its first x.y.z
+tag_prefix = "v"                  # default
+window_minutes = 120              # default; 1 to 1440
+```
+
+Absent, the steward reads nothing extra and behaves exactly as before.
+Removing it also forgets any window it opened.
+
+- **Release window.** Open while the base's version is newer than every
+  `<tag_prefix>x.y.z` tag and has no tag of its own. The first pass that sees
+  it records it in the steward ledger; the window closes when the tag exists
+  and expires `window_minutes` after it opened, whether or not the tag
+  appeared. The expiry logs `solo entry: RELEASE WINDOW EXPIRED for <tag>`
+  once, and normal admission resumes. Outside a window the setting changes
+  nothing.
+- **Ready solo pull request.** Its head branch is listed, it is open and not a
+  draft, and it is either queued or one the steward would enqueue with an
+  approved exact head. A solo pull request that is red, held, unapproved, a
+  draft, or not the steward's to enqueue changes nothing.
+- **While it is ready, nothing else is admitted** for that repository: other
+  rows report `held_solo_entry:#<n>`, the native-arm backstop arms nothing,
+  and the red-base fix reorder does not jump a fix. `runner steward-admit-ready` skips a repository with an open window
+  (`solo_entry_window_open`).
+- **It is enqueued only into an empty queue.** Otherwise it reports
+  `solo_entry_waiting:<k>_ahead`. The queue is read again under the mutation
+  guard just before the enqueue.
+- **Nothing lands ahead of it.** Right after the enqueue, and on every pass
+  while it is queued, the queue is read again. When any entry is ahead of it
+  (an already-armed pull request GitHub enqueued in the gap), the steward
+  dequeues only its own solo entry (`dequeued_solo_entry:<k>_ahead`; recorded
+  as the steward's own removal, so it never counts toward the ejection cap)
+  and retries next pass. It never dequeues another pull request.
+- Every mutation goes through the merge-queue mutation guard, so the central
+  HOLD, `[merge_queue] mutation_machine` and the pass budget apply.
+
+The repository report carries one `solo_entry` line saying which pull request
+holds admission and why, or why the mode is inactive. A product pull request
+armed before the window opened can still be enqueued by GitHub behind the solo
+entry and share its batch; the steward does not touch it.
+
 ## Stale merge refs
 
 GitHub runs a `pull_request` workflow on `refs/pull/<n>/merge`, the head

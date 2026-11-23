@@ -97,7 +97,7 @@ fn poisoned(hold: PoisonHold, auto_jump: AutoJump, fixes: &[u64]) -> RepoPoison 
 }
 
 /// The merge-group streak with the base tip not read red.
-fn streak_only(hold: PoisonHold, auto_jump: AutoJump, fixes: &[u64]) -> RepoPoison {
+pub(super) fn streak_only(hold: PoisonHold, auto_jump: AutoJump, fixes: &[u64]) -> RepoPoison {
     RepoPoison {
         policy: BasePoisonPolicy {
             acts: crate::base_health::TriageActs::default(),

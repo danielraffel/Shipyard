@@ -41,6 +41,16 @@ pub(super) fn mutate_pr_with_recovery(
     ) {
         return (None, None);
     }
+    // While a ready solo pull request holds the repository, nothing else is
+    // admitted, and it is admitted only into an empty queue. First, before
+    // any read, so a held row costs nothing. See `solo_entry`.
+    if matches!(decision, StewardDecision::ArmMergeQueue)
+        && let Some(token) = context
+            .solo_entry
+            .and_then(|gate| gate.enqueue_hold(pr.fact.number))
+    {
+        return (Some(token), None);
+    }
     // A head removed from the queue for a defect is not put back until it
     // changes. Checked on the census head before any read, and again on the
     // live head below. See `defect_fix_removals`.
@@ -504,6 +514,26 @@ fn enqueue_pull_request_with_recovery(
         recover_hosted_setup_eviction_priority,
         fast_track_jump,
     );
+    // The solo pull request: read the queue again now that it is in, and
+    // take its own entry back out when anything landed ahead of it.
+    let (mutation, error) = if mutation
+        .as_deref()
+        .is_some_and(|mutation| mutation.split(',').any(|part| part == "enqueued"))
+    {
+        let (check, check_error) = super::solo_entry::verify_after_enqueue(context, pr, ledger);
+        (
+            match (mutation, check) {
+                (Some(mutation), Some(check)) => Some(format!("{mutation},{check}")),
+                (mutation, check) => mutation.or(check),
+            },
+            match (error, check_error) {
+                (Some(error), Some(check)) => Some(format!("{error}; {check}")),
+                (error, check) => error.or(check),
+            },
+        )
+    } else {
+        (mutation, error)
+    };
     // A flake re-enqueue's `pending` receipt is `done` only once GitHub
     // accepted the enqueue; a deferral or refusal leaves it pending.
     super::flake_requeue::settle(
@@ -733,6 +763,28 @@ fn enqueue_unstacked_pull_request(
             },
             Err(error) => {
                 let audit_error = guard.finish("generated_paths_unreadable").err();
+                (
+                    None,
+                    Some(audit_error.map_or(error.clone(), |audit_error| {
+                        format!("{error}; mutation audit also failed: {audit_error}")
+                    })),
+                )
+            }
+        };
+    }
+    // The solo pull request is enqueued only into an empty queue, read again
+    // under the guard just before the enqueue.
+    if let Some(skip) = super::solo_entry::pre_enqueue_refusal(context, &pr) {
+        return match skip {
+            Ok(outcome) => match guard.finish(&outcome) {
+                Ok(()) => (Some(outcome), None),
+                Err(error) => (
+                    Some(outcome),
+                    Some(format!("enqueue skip mutation audit failed: {error}")),
+                ),
+            },
+            Err(error) => {
+                let audit_error = guard.finish("solo_entry_queue_unreadable").err();
                 (
                     None,
                     Some(audit_error.map_or(error.clone(), |audit_error| {

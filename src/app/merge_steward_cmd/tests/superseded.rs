@@ -756,6 +756,7 @@ fn pass_args(apply: bool) -> StewardCommandArgs {
         approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
         wake_owner: false,
         unapproved_dequeue: crate::app::merge_steward_cmd::DequeueMode::Report,
+        solo_entry: crate::app::merge_steward_cmd::solo_entry::Settings::default(),
         infra_rerun: crate::app::merge_steward_cmd::InfraRerunMode::Off,
         pass_budget: None,
         pass_deadline: None,
