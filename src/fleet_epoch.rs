@@ -202,15 +202,22 @@ pub fn check(repo_root: &Path, machine: &str) -> FleetEpochStatus {
     }
 }
 
-/// The `[hosts.<key>]` manifest entry this machine corresponds to, matched by
-/// key or by a `hostname` field, case-insensitively.
+/// The `[hosts.<key>]` manifest entry this machine corresponds to, matched
+/// case-insensitively by key, by a `hostname` string, or by any element of a
+/// `hostnames` array (the shape the fleet manifest uses).
 fn manifest_host_key(manifest: &toml::Table, machine: &str) -> Option<String> {
     let hosts = manifest.get("hosts").and_then(toml::Value::as_table)?;
+    let is_machine = |value: &toml::Value| {
+        value
+            .as_str()
+            .is_some_and(|name| name.eq_ignore_ascii_case(machine))
+    };
     hosts.iter().find_map(|(key, entry)| {
-        let by_name = entry
-            .get("hostname")
-            .and_then(toml::Value::as_str)
-            .is_some_and(|name| name.eq_ignore_ascii_case(machine));
+        let by_name = entry.get("hostname").is_some_and(is_machine)
+            || entry
+                .get("hostnames")
+                .and_then(toml::Value::as_array)
+                .is_some_and(|names| names.iter().any(is_machine));
         (key.eq_ignore_ascii_case(machine) || by_name).then(|| key.clone())
     })
 }
@@ -430,6 +437,32 @@ mod tests {
             }
         );
         assert!(status.blocks());
+    }
+
+    #[test]
+    fn the_real_manifest_shape_hostnames_array_matches_and_names_the_key_receipt() {
+        // fleet/manifest.toml declares `hostnames = [...]` under the host key,
+        // and `hostname -s` on that machine returns the array element.
+        let sandbox = TempDir::new().expect("tempdir");
+        seed_manifest(
+            sandbox.path(),
+            "epoch = 3\n\n[hosts.m5studio]\nhostnames = [\"Daniels-M5-Studio\"]\n",
+        );
+
+        let text = check(sandbox.path(), "Daniels-M5-Studio").to_string();
+
+        let receipt = sandbox
+            .path()
+            .join(super::DEFAULT_RECEIPT_RELATIVE_DIR)
+            .join("m5studio.json");
+        assert!(
+            text.contains("matched manifest entry [hosts.m5studio]"),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("{} (missing)", receipt.display())),
+            "{text}"
+        );
     }
 
     #[test]
