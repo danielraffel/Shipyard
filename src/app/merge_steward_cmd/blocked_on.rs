@@ -98,8 +98,12 @@ pub(super) struct HeldBy {
 pub(super) struct BlockedSummary {
     /// Pull requests per token.
     pub counts: BTreeMap<String, usize>,
-    /// The oldest blocked pull requests, oldest first.
+    /// The oldest blocked pull requests, oldest first. Every pull request
+    /// the base-poison hold kept back this pass is listed too, whatever its
+    /// age, as `held_base_poisoned:<context>`.
     pub oldest: Vec<OldestBlocked>,
+    /// Pull requests the base-poison hold kept back this pass.
+    pub held: usize,
 }
 
 /// One entry in [`BlockedSummary::oldest`].
@@ -1298,40 +1302,73 @@ fn undated(token: String, detail: Option<String>, hint: SinceHint) -> (Stall, Si
     )
 }
 
+/// The mutation part that marks a pull request the base-poison hold kept
+/// back this pass (`held_base_poisoned:<contexts>`).
+const HELD_BASE_POISONED: &str = "held_base_poisoned:";
+
+/// The `held_base_poisoned:<contexts>` token of a row the hold kept back.
+fn held_by_base_poison(report: &PrReport) -> Option<&str> {
+    report
+        .mutation
+        .as_deref()?
+        .split(',')
+        .find(|part| part.starts_with(HELD_BASE_POISONED))
+}
+
 /// Roll the rows up: counts by token and the oldest blocked rows.
+///
+/// A row the base-poison hold kept back is always listed (with its reason in
+/// place of its token) and counted in `held`: it is approved and green, so
+/// it would otherwise rank below older rows and vanish from the list.
 #[must_use]
 pub(super) fn summarize(reports: &[PrReport], now: DateTime<Utc>) -> BlockedSummary {
     let mut counts = BTreeMap::new();
     let mut aged = Vec::new();
+    let mut held = Vec::new();
     for report in reports {
         let token = &report.blocked.blocked_on;
         *counts.entry(token.clone()).or_insert(0) += 1;
-        if NOT_BLOCKED.contains(&token.as_str()) {
-            continue;
-        }
-        if let Some(since) = report
+        let age = report
             .blocked
             .since
             .as_deref()
             .and_then(|since| DateTime::parse_from_rfc3339(since).ok())
-        {
+            .map(|since| (now - since.with_timezone(&Utc)).num_minutes());
+        if let Some(reason) = held_by_base_poison(report) {
+            held.push(OldestBlocked {
+                number: report.number,
+                blocked_on: reason.to_owned(),
+                // An undated row still shows, at age 0, rather than vanish.
+                age_minutes: age.unwrap_or(0),
+            });
+            continue;
+        }
+        if NOT_BLOCKED.contains(&token.as_str()) {
+            continue;
+        }
+        if let Some(age_minutes) = age {
             aged.push(OldestBlocked {
                 number: report.number,
                 blocked_on: token.clone(),
-                age_minutes: (now - since.with_timezone(&Utc)).num_minutes(),
+                age_minutes,
             });
         }
     }
-    aged.sort_by(|left, right| {
+    let by_age = |left: &OldestBlocked, right: &OldestBlocked| {
         right
             .age_minutes
             .cmp(&left.age_minutes)
             .then(left.number.cmp(&right.number))
-    });
+    };
+    aged.sort_by(by_age);
     aged.truncate(OLDEST_LISTED);
+    let held_count = held.len();
+    aged.extend(held);
+    aged.sort_by(by_age);
     BlockedSummary {
         counts,
         oldest: aged,
+        held: held_count,
     }
 }
 
