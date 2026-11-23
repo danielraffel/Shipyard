@@ -59,6 +59,10 @@ pub(super) struct StewardCommandArgs {
     /// unapproved queue entries or only reports them. Read from the
     /// machine-global config by [`steward_command`].
     pub(super) unapproved_dequeue: unapproved_admission::DequeueMode,
+    /// `[merge_steward.solo_entry]`: per-repository solo branches that must
+    /// merge with nothing ahead of them during a release window. Read from
+    /// the machine-global config by [`steward_command`]. See `solo_entry`.
+    pub(super) solo_entry: solo_entry::Settings,
     /// `--infra-rerun`: re-run required checks that failed for an
     /// infrastructure reason, on every open pull request. See `infra_rerun`.
     pub(super) infra_rerun: infra_rerun::Mode,
@@ -273,6 +277,10 @@ struct RepoReport {
     /// observed.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     invariants: Vec<invariants::Invariant>,
+    /// The solo-entry mode's reason line ([`solo_entry`]). Absent for a
+    /// repository with no setting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    solo_entry: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -387,6 +395,10 @@ struct StewardLedger {
     /// When each repository was last probed (the probe runs every 30 min).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     ci_health_probed: BTreeMap<String, DateTime<Utc>>,
+    /// Release windows the solo-entry mode opened, keyed `repo@base`. See
+    /// `solo_entry`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    solo_entry_windows: BTreeMap<String, solo_entry::Window>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -621,6 +633,9 @@ struct MutationApplyContext<'a> {
     /// This pass's reading of the queue-removals ledger: a `defect-fix`
     /// removal of a head refuses its admission. See `defect_fix_removals`.
     defect_fix: Option<&'a defect_fix_removals::Reading>,
+    /// This pass's solo-entry gate: while a ready solo pull request holds the
+    /// repository, nothing else is enqueued. See `solo_entry`.
+    solo_entry: Option<&'a solo_entry::Gate>,
 }
 
 /// Exact-head approval gate reads made during one pass, by PR number.
@@ -1431,6 +1446,8 @@ pub(super) fn steward_command<W: Write>(
     normalized_args.unapproved_dequeue =
         unapproved_admission::DequeueMode::from_machine_global(&runtime_paths.global_dir)
             .map_err(|error| CliFailure::new(2, error))?;
+    normalized_args.solo_entry =
+        solo_entry::Settings::from_machine_global(&runtime_paths.global_dir);
     if normalized_args.invariants.is_some() {
         normalized_args.invariants = Some(
             invariants::Settings::from_machine_global(
@@ -1952,6 +1969,7 @@ fn deferred_rate_limit_repo_report(
         red_everywhere: None,
         flake_requeue: None,
         invariants: Vec::new(),
+        solo_entry: None,
     }
 }
 
@@ -1987,6 +2005,7 @@ fn unreadable_repo_report(
         red_everywhere: None,
         flake_requeue: None,
         invariants: Vec::new(),
+        solo_entry: None,
     }
 }
 
@@ -2072,6 +2091,7 @@ fn append_unmatched_recovery_errors(
             red_everywhere: None,
             flake_requeue: None,
             invariants: Vec::new(),
+            solo_entry: None,
         });
     }
 }
@@ -2117,6 +2137,7 @@ fn persist_final_ledger(
             red_everywhere: None,
             flake_requeue: None,
             invariants: Vec::new(),
+            solo_entry: None,
         });
     }
 }
@@ -2307,6 +2328,7 @@ mod resume_record;
 mod review_quarantine;
 mod scheduling_loop;
 mod shadow_ledger;
+pub(super) mod solo_entry;
 mod stale_merge_ref;
 mod superseded;
 mod terminal_handoff;
@@ -2523,6 +2545,7 @@ fn single_repo_args(repo: &str, base: &str, apply: bool) -> StewardCommandArgs {
         approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
         wake_owner: false,
         unapproved_dequeue: DequeueMode::Report,
+        solo_entry: solo_entry::Settings::default(),
         infra_rerun: InfraRerunMode::Off,
         pass_budget: None,
         pass_deadline: None,

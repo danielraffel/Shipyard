@@ -458,6 +458,12 @@ pub(super) fn admit_ready_event(
     if super::flake_requeue::unswept_requeue(&ledger, &observation.repo) {
         return ReadyEventOutcome::skipped(event, apply, "flake_requeue_unswept");
     }
+    // A solo-entry release window the tick opened: only the tick, which
+    // reads the queue and the solo pull request, admits anything. See
+    // `solo_entry`.
+    if super::solo_entry::window_open(&ledger, &observation.repo, &observation.base, now) {
+        return ReadyEventOutcome::skipped(event, apply, "solo_entry_window_open");
+    }
     // The decision again, on the ledger the lock protects.
     let decision = classify_pr(
         &pr.fact,
@@ -501,6 +507,7 @@ pub(super) fn admit_ready_event(
         ejection_guards: policy.ejection_guards.clone(),
         base_poison: base_poison.as_ref(),
         defect_fix: Some(&defect_fix),
+        solo_entry: None,
     };
     let (mutation, error) = mutate_pr_with_recovery(
         &context,

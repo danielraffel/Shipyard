@@ -54,6 +54,9 @@ pub(super) fn render_report<W: Write>(
             )
             .map_err(|error| io_failure(&error))?;
         }
+        if let Some(line) = &repo.solo_entry {
+            writeln!(stdout, "  {line}").map_err(|error| io_failure(&error))?;
+        }
         if !repo.invariants.is_empty() {
             writeln!(
                 stdout,

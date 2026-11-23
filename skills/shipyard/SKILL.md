@@ -4542,6 +4542,19 @@ See `docs/automated-draining.md` "Ejection guards". The `ghapp`
 Python guard does not mirror this class, so do not expect a manual `ghapp` arm
 of such a head to pass.
 
+**A solo branch merges alone during a release window.** The steward host's
+`[merge_steward.solo_entry."<owner/name>"]` (`branches`, `version_file`,
+optional `tag_prefix` and `window_minutes`, default 120) names head branches
+that must merge with nothing ahead of them while the base's version is newer
+than every tag and untagged. While such a pull request is ready (queued, or
+green with an approved exact head), every other row reports
+`held_solo_entry:#<n>` and the native-arm backstop arms nothing; the solo pull
+request waits as `solo_entry_waiting:<k>_ahead` until the queue is empty, and
+when an entry lands ahead of it the steward removes only its own entry
+(`dequeued_solo_entry:<k>_ahead`). Nothing to do for a held row: it is admitted
+once the solo pull request merges, stops being ready, or the window expires.
+See `docs/automated-draining.md` "Solo entry".
+
 **A flake that ejected several approved pull requests is re-enqueued once.**
 When the same failing test signature (each failing required check with the
 ctest tests it named, read by the same-head retry classifier) ejects heads of

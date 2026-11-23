@@ -121,6 +121,26 @@ pub(super) fn apply_repo_plan(
         None
     };
     let policy = pass_policy(actions, args, observation);
+    // Solo entry, before any admission: while a ready solo pull request
+    // holds the repository, nothing else is enqueued or armed. Reads nothing
+    // for a repository with no setting. See `solo_entry`.
+    let solo_gate = super::solo_entry::observe(
+        &super::solo_entry::GitHubReads {
+            actions,
+            observation,
+            control: mutation_control,
+            ledger_path,
+        },
+        &super::solo_entry::ObserveInput {
+            settings: &args.solo_entry,
+            observation,
+            policy: &policy,
+            apply: args.apply,
+            deadline: args.pass_deadline,
+            now: Utc::now(),
+        },
+        ledger,
+    );
     // Infra reruns and red everywhere skip the same labels.
     let mut infra_excluded = vec![args.opt_out_label.clone()];
     infra_excluded.extend(args.provenance_blocking_labels.iter().cloned());
@@ -196,6 +216,7 @@ pub(super) fn apply_repo_plan(
         mutation_control,
         base_poison.as_ref(),
         Some(&stall_pass),
+        Some(&solo_gate),
     );
     let mut stall_lines = stall_pass.lines();
     stall_lines.extend(stall_pass.defect_fix.lines());
@@ -393,7 +414,18 @@ pub(super) fn apply_repo_plan(
     // The backstop acts only on pull requests the steward declines to own, so
     // it can never contend with the enqueue path above. See `native_arm`.
     let (native_arm_status, native_arm_failed) =
-        if args.arm_unqueued && super::pass_budget::deadline_passed(args.pass_deadline) {
+        if args.arm_unqueued && !solo_gate.backstop_allowed() {
+            (
+                super::native_arm::NativeArmRepoStatus {
+                    policy: format!(
+                        "held: {}; nothing armed this pass",
+                        solo_gate.line().unwrap_or_default()
+                    ),
+                    results: Vec::new(),
+                },
+                false,
+            )
+        } else if args.arm_unqueued && super::pass_budget::deadline_passed(args.pass_deadline) {
             (
                 super::native_arm::NativeArmRepoStatus {
                     policy: format!(
@@ -602,6 +634,7 @@ pub(super) fn apply_repo_plan(
             red_everywhere: Some(red_everywhere_status),
             flake_requeue: Some(flake_requeue_status),
             invariants: Vec::new(),
+            solo_entry: solo_gate.line(),
             repo: observation.repo.clone(),
             base: args.base.clone(),
             allow_auto_merge: observation.allow_auto_merge,
@@ -689,6 +722,7 @@ pub(super) fn apply_pr_plans_with_listing(
         mutation_control,
         None,
         None,
+        None,
     )
 }
 
@@ -705,6 +739,7 @@ pub(super) fn apply_pr_plans_with_poison(
     mutation_control: Option<&MutationControl>,
     base_poison: Option<&super::base_poison::RepoPoison>,
     merge_group_stall: Option<&super::merge_group_stall::StallPass>,
+    solo_entry: Option<&super::solo_entry::Gate>,
 ) -> (
     Vec<PrReport>,
     bool,
@@ -722,6 +757,7 @@ pub(super) fn apply_pr_plans_with_poison(
         ejection_guards: policy.ejection_guards.clone(),
         base_poison,
         defect_fix: merge_group_stall.map(|stall| &stall.defect_fix),
+        solo_entry,
     });
     let mut sweep_pass = super::unapproved_admission::SweepPass::new(args.unapproved_dequeue);
     if args.apply {

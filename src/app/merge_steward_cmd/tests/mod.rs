@@ -84,6 +84,7 @@ fn mutation_apply_context<'a>(
         ejection_guards: crate::merge_steward::EjectionGuards::default(),
         base_poison: None,
         defect_fix: None,
+        solo_entry: None,
     }
 }
 
@@ -257,6 +258,7 @@ mod recovery;
 #[cfg(unix)]
 mod retired_tables;
 mod scheduling_loop;
+mod solo_entry;
 mod superseded;
 #[cfg(unix)]
 mod transient_rerun;
