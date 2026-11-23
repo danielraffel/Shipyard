@@ -247,10 +247,17 @@ impl Display for ShipPreflightError {
             Self::FleetEpochDrift { status } => write!(
                 formatter,
                 "{status}\n\n\
-                 This host is running against fleet assumptions that have since changed, so \
-                 dispatching from here could produce a result nobody can reproduce. Options:\n\
-                 \x20 - Run tools/fleet/apply.sh to converge this host, OR\n\
-                 \x20 - Pass --allow-fleet-epoch-drift to proceed anyway."
+                 Refusing: dispatching from a host that never applied the fleet manifest could \
+                 produce a result nobody can reproduce.\n\
+                 Converging the host (tools/fleet/apply.sh) changes host configuration. It \
+                 belongs to the fleet owner or the orchestrator, not to an agent opening a PR.\n\
+                 What an agent does instead:\n\
+                 \x20 1. Run the repo's own pre-push gates: tools/scripts/gates.sh origin/main \
+                 when that file exists, otherwise the gates the repo documents.\n\
+                 \x20 2. Open the PR with: ghapp pr create --base <base>\n\
+                 \x20 3. Report this drift to the orchestrator.\n\
+                 --allow-fleet-epoch-drift exists for the fleet owner only. Agents must not use \
+                 it."
             ),
             Self::TriggerUnreachable { diagnosis } => write!(
                 formatter,
@@ -578,6 +585,84 @@ mod tests {
     use crate::daemon_version::DaemonVersionRelation;
     use crate::executor::dispatch::{ExecutorDispatcher, resolve_targets_from_table};
     use crate::job::ValidationMode;
+
+    fn epoch_drift_message(host: &str) -> String {
+        let sandbox = tempfile::TempDir::new().expect("tempdir");
+        let manifest = sandbox
+            .path()
+            .join(crate::fleet_epoch::MANIFEST_RELATIVE_PATH);
+        std::fs::create_dir_all(manifest.parent().expect("parent")).expect("dirs");
+        std::fs::write(
+            &manifest,
+            "epoch = 3\n\n[hosts.m5s]\nhostname = \"Daniels-Mac-Studio\"\n",
+        )
+        .expect("manifest");
+        let status = crate::fleet_epoch::check(sandbox.path(), host);
+        let text = ShipPreflightError::FleetEpochDrift {
+            status: status.to_string(),
+        }
+        .to_string();
+        text.replace(&sandbox.path().display().to_string(), "<root>")
+    }
+
+    #[test]
+    fn epoch_drift_names_host_key_and_missing_receipt() {
+        let text = epoch_drift_message("Daniels-Mac-Studio");
+
+        assert!(text.contains("[hosts.m5s]"), "{text}");
+        assert!(
+            text.contains("<root>/planning/fleet/manifest.toml (epoch 3)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("<root>/planning/fleet/receipts/m5s.json (missing)"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn epoch_drift_gives_the_agent_fallback_and_assigns_apply_to_the_owner() {
+        let text = epoch_drift_message("Daniels-Mac-Studio");
+
+        assert!(
+            text.contains("tools/scripts/gates.sh origin/main"),
+            "{text}"
+        );
+        assert!(text.contains("ghapp pr create --base <base>"), "{text}");
+        assert!(
+            text.contains("Report this drift to the orchestrator"),
+            "{text}"
+        );
+        assert!(
+            text.contains("belongs to the fleet owner or the orchestrator"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn epoch_drift_names_an_unmatched_host_and_still_gives_the_fallback() {
+        let text = epoch_drift_message("stranger");
+
+        assert!(text.contains("host stranger matched no entry"), "{text}");
+        assert!(text.contains("ghapp pr create --base <base>"), "{text}");
+    }
+
+    #[test]
+    fn epoch_drift_mentions_the_override_last_and_forbids_agents() {
+        let text = epoch_drift_message("Daniels-Mac-Studio");
+
+        let override_at = text.find("--allow-fleet-epoch-drift").expect("override");
+        assert_eq!(
+            text.matches("--allow-fleet-epoch-drift").count(),
+            1,
+            "{text}"
+        );
+        for earlier in ["apply.sh", "gates.sh", "ghapp pr create", "[hosts.m5s]"] {
+            assert!(text.find(earlier).expect(earlier) < override_at, "{text}");
+        }
+        assert!(text.contains("Agents must not use it"), "{text}");
+        assert!(!text.contains('\u{2014}'), "no em dash: {text}");
+    }
 
     /// Issue #301 (3/3): the unreachable-target Display surface must cite the
     /// `--skip-target` escape hatch with the exact target names so an agent
