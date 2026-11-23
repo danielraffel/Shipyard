@@ -41,13 +41,17 @@ pub(super) fn mutate_pr_with_recovery(
     ) {
         return (None, None);
     }
-    // While a ready solo pull request holds the repository, nothing else is
+    // While a solo pull request holds the repository, nothing else is
     // admitted, and it is admitted only into an empty queue. First, before
-    // any read, so a held row costs nothing. See `solo_entry`.
+    // any read, so a held row costs nothing. The one exemption is the fix
+    // the base-poison path fast-tracks for a confirmed red base. See
+    // `solo_entry`.
     if matches!(decision, StewardDecision::ArmMergeQueue)
-        && let Some(token) = context
-            .solo_entry
-            .and_then(|gate| gate.enqueue_hold(pr.fact.number))
+        && let Some(token) = super::solo_entry::admission_hold(
+            context.solo_entry,
+            context.base_poison,
+            pr.fact.number,
+        )
     {
         return (Some(token), None);
     }
@@ -518,7 +522,7 @@ fn enqueue_pull_request_with_recovery(
     // take its own entry back out when anything landed ahead of it.
     let (mutation, error) = if mutation
         .as_deref()
-        .is_some_and(|mutation| mutation.split(',').any(|part| part == "enqueued"))
+        .is_some_and(super::solo_entry::was_enqueued)
     {
         let (check, check_error) = super::solo_entry::verify_after_enqueue(context, pr, ledger);
         (

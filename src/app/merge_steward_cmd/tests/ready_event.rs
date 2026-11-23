@@ -582,27 +582,38 @@ fn pending_cancellations_leave_the_head_to_the_tick() {
     assert_eq!(harness.enqueues(), 0);
 }
 
-/// An open solo-entry release window leaves every head to the tick, which
-/// reads the queue and the solo pull request; an expired one does not.
+/// An engaged solo-entry hold leaves every head to the tick, which reads the
+/// queue and the solo pull request. An open release window with no hold, or
+/// a hold past its deadline, does not.
 #[test]
-fn an_open_solo_entry_window_leaves_the_head_to_the_tick() {
+fn an_engaged_solo_entry_hold_leaves_the_head_to_the_tick() {
+    use crate::app::merge_steward_cmd::solo_entry::{Attempt, Window, window_key};
     let now = Utc::now();
-    for (expired, held) in [(false, true), (true, false)] {
+    let attempt = |deadline: i64| Attempt {
+        solo: 7,
+        head: "7".repeat(40),
+        engaged_at: now - chrono::Duration::minutes(5),
+        deadline: now + chrono::Duration::minutes(deadline),
+        refused: 0,
+        queued: false,
+        own_dequeues: 0,
+    };
+    for (attempt, held) in [
+        (Some(attempt(115)), true),
+        (Some(attempt(-1)), false),
+        (None, false),
+    ] {
         let harness = Harness::new(&Fixture::approved());
         let mut ledger = StewardLedger::default();
-        ledger.solo_entry_windows.insert(
-            crate::app::merge_steward_cmd::solo_entry::window_key("owner/repo", "main"),
-            crate::app::merge_steward_cmd::solo_entry::Window {
-                version: "v0.2.2".to_owned(),
-                opened_at: now - chrono::Duration::minutes(5),
-                deadline: now + chrono::Duration::minutes(115),
-                expired,
-            },
-        );
+        let mut window = Window::new("v0.2.2", now - chrono::Duration::minutes(300));
+        window.attempt = attempt;
+        ledger
+            .solo_entry_windows
+            .insert(window_key("owner/repo", "main"), window);
         harness.save(&ledger);
         let outcome = harness.admit_at(HEAD, &observed(HEAD), true, now);
         assert_eq!(
-            outcome.reason == "solo_entry_window_open",
+            outcome.reason == "solo_entry_hold_engaged",
             held,
             "{outcome:?}"
         );

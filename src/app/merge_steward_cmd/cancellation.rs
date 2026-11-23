@@ -42,7 +42,9 @@ pub(super) fn pass_policy(
 }
 
 /// The fix reorder jump-enqueues a fix; while a solo pull request holds the
-/// repository nothing else is admitted, so it waits. See `solo_entry`.
+/// repository nothing else is admitted, so it waits. The one exemption is
+/// the same as admission's: the fix the base-poison path fast-tracks for a
+/// confirmed red base is still moved to the front. See `solo_entry`.
 pub(super) fn fix_reorder_step(
     solo_gate: &super::solo_entry::Gate,
     actions: &GitHubActions,
@@ -53,10 +55,18 @@ pub(super) fn fix_reorder_step(
 ) -> Vec<String> {
     match base_poison {
         None => Vec::new(),
-        Some(_) if !solo_gate.backstop_allowed() => vec![format!(
-            "fix_reorder: held: {}",
-            solo_gate.line().unwrap_or_default()
-        )],
+        Some(poison)
+            if !solo_gate.backstop_allowed()
+                && !matches!(
+                    super::fix_reorder::candidate(poison, observation),
+                    Ok(Some(fix)) if super::solo_entry::poison_fix_exempt(Some(poison), fix.pr)
+                ) =>
+        {
+            vec![format!(
+                "fix_reorder: held: {}",
+                solo_gate.line().unwrap_or_default()
+            )]
+        }
         Some(poison) => {
             super::fix_reorder::run(actions, mutation_control, apply, observation, poison)
         }
@@ -256,6 +266,17 @@ pub(super) fn apply_repo_plan(
         base_poison.as_ref(),
         Some(&stall_pass),
         Some(&solo_gate),
+    );
+    // The solo pull request's own outcome this pass: a head the gate
+    // admitted and nothing enqueued is counted, and after three such passes
+    // the hold lets go of it. See `solo_entry::settle`.
+    let solo_line = super::solo_entry::settle(
+        &solo_gate,
+        observation,
+        &reports,
+        base_poison.as_ref(),
+        args.apply,
+        ledger,
     );
     let mut stall_lines = stall_pass.lines();
     stall_lines.extend(stall_pass.defect_fix.lines());
@@ -502,6 +523,14 @@ pub(super) fn apply_repo_plan(
                 false,
             )
         };
+    // Which auto-merge requests are the steward's own, for the solo hold.
+    super::solo_entry::record_native_arms(
+        &args.solo_entry,
+        observation,
+        &native_arm_status.results,
+        args.apply,
+        ledger,
+    );
     super::native_arm::annotate_carried_refusals(&native_arm_status, &mut reports);
     // Infra reruns act on every open pull request, owned or not. A dry run
     // never writes, so it reports what an enforcing pass would re-run.
@@ -663,7 +692,7 @@ pub(super) fn apply_repo_plan(
             red_everywhere: Some(red_everywhere_status),
             flake_requeue: Some(flake_requeue_status),
             invariants: Vec::new(),
-            solo_entry: solo_gate.line(),
+            solo_entry: solo_line,
             repo: observation.repo.clone(),
             base: args.base.clone(),
             allow_auto_merge: observation.allow_auto_merge,

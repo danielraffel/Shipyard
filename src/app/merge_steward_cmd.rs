@@ -399,6 +399,11 @@ struct StewardLedger {
     /// `solo_entry`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     solo_entry_windows: BTreeMap<String, solo_entry::Window>,
+    /// Auto-merge requests the native-arm backstop armed, keyed `repo@base`
+    /// then pull request, with the head it armed. Kept only for a repository
+    /// with a solo-entry setting. See `solo_entry`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    solo_entry_native_arms: BTreeMap<String, BTreeMap<u64, String>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
