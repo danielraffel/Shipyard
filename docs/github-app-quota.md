@@ -376,9 +376,14 @@ or `Generous-Corp`. The only other flags are `--signer-repo`,
 `--deny-self-hosted-runners` and `--format json`, each at most once. With a
 local bundle native `gh` fetches no attestations from the GitHub API, so it
 runs with `GH_TOKEN`, `GITHUB_TOKEN` and the enterprise tokens unset and with
-`GH_CONFIG_DIR` pointed at an empty owner-only directory, which also keeps a
-stored personal login out of reach. It still downloads the Sigstore and GitHub
-trust roots over TUF. `--custom-trusted-root` stays refused because a local
+both `HOME` and `GH_CONFIG_DIR` pointed at an empty owner-only directory.
+`GH_CONFIG_DIR` hides a login stored in `hosts.yml`; `HOME` hides the macOS
+login keychain, which native `gh` reads regardless of `GH_CONFIG_DIR`. It still
+downloads the Sigstore and GitHub trust roots over TUF, into that directory
+(removed afterwards) unless the caller sets `XDG_CACHE_HOME`. Other caller environment, such as
+`XDG_CACHE_HOME`, proxy settings and CA bundles, passes through, so the exit
+status is only as trustworthy as the caller's environment and native `gh`
+binary; treat it as evidence only from a trusted environment. `--custom-trusted-root` stays refused because a local
 trust root would make the verdict meaningless, and `--bundle-from-oci`,
 `--hostname`, `--limit`, `-R`, every short spelling and the other `attestation`
 subcommands stay outside the grammar.
