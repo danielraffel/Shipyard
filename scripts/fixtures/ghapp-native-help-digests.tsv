@@ -1,4 +1,7 @@
 # Normalized command|subcommand|option|kind rows, verified from exact native help.
-2.94.0	e4565c81da9f9da3bf63dbdcfa757aa1408143c54d7c358eab80eb6d3b79f120
-2.100.0	e4565c81da9f9da3bf63dbdcfa757aa1408143c54d7c358eab80eb6d3b79f120
-2.101.0	e4565c81da9f9da3bf63dbdcfa757aa1408143c54d7c358eab80eb6d3b79f120
+# The attestation|verify rows were checked against native help of gh 2.94.0 (m1),
+# 2.100.0 (m5) and 2.103.3 (m3, m5s); no 2.101.0 host was reachable, and its
+# bracketing releases list identical attestation verify flags.
+2.94.0	dea3ee25d27b4d88fb5141037610551dadbcc560b97fe047ead806cf1faa614a
+2.100.0	dea3ee25d27b4d88fb5141037610551dadbcc560b97fe047ead806cf1faa614a
+2.101.0	dea3ee25d27b4d88fb5141037610551dadbcc560b97fe047ead806cf1faa614a

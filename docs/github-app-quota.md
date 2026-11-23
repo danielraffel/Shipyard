@@ -337,6 +337,7 @@ audited against the fleet's native `gh` 2.93 and 2.96 binaries:
 | Command | Allowed subcommands |
 | --- | --- |
 | `api` | relative GitHub Cloud REST and GraphQL endpoints |
+| `attestation` | `verify`, with a local `--bundle` only (below) |
 | `auth` | `status`, `token` |
 | `issue` | `list`, `view` |
 | `pr` | `checks`, `close`, `create`, `list`, `merge`, `update-branch`, `view` |
@@ -364,6 +365,23 @@ Before token mint, the wrapper opens every source through no-follow directory
 descriptors, copies it into an owner-only staging directory, and rejects any
 source identity change during the copy. Native `gh` receives only those stable
 private snapshots under the original asset basenames.
+
+`attestation verify` is a read-only, offline check of a local Sigstore bundle
+and is the one row that never mints an App token. The wrapper accepts exactly
+one local artifact path, a required `--bundle PATH`, and exactly one of
+`--owner OWNER` or `--repo OWNER/REPO`, where the owner must be `danielraffel`
+or `Generous-Corp`. The only other flags are `--signer-repo`,
+`--signer-workflow`, `--cert-oidc-issuer`, `--cert-identity`,
+`--predicate-type`, `--source-ref`, `--source-digest`,
+`--deny-self-hosted-runners` and `--format json`, each at most once. With a
+local bundle native `gh` fetches no attestations from the GitHub API, so it
+runs with `GH_TOKEN`, `GITHUB_TOKEN` and the enterprise tokens unset and with
+`GH_CONFIG_DIR` pointed at an empty owner-only directory, which also keeps a
+stored personal login out of reach. It still downloads the Sigstore and GitHub
+trust roots over TUF. `--custom-trusted-root` stays refused because a local
+trust root would make the verdict meaningless, and `--bundle-from-oci`,
+`--hostname`, `--limit`, `-R`, every short spelling and the other `attestation`
+subcommands stay outside the grammar.
 
 For an App installed on more than one account, the exact repository slug is the
 routing authority. Do not put `--installation-id` in shared config and do not
