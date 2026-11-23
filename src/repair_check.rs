@@ -80,9 +80,20 @@ pub(crate) fn parse_findings(body: &str) -> Vec<Finding> {
                 });
                 continue;
             }
-            if !line.trim().is_empty() && !line.trim_start().starts_with('-') {
+            if !line.trim().is_empty() && !line.trim_start().starts_with(['-', '*']) {
                 in_structured = false;
             }
+        }
+        if in_structured && !free.is_match(line) && line.trim_start().starts_with(['-', '*']) {
+            // A bullet under the findings header that no format recognizes must
+            // stay visible as an open, unlocated finding rather than vanish.
+            findings.push(Finding {
+                id: format!("unparsed-{}", findings.len() + 1),
+                file: None,
+                line: None,
+                problem: line.trim().to_owned(),
+            });
+            continue;
         }
         if let Some(c) = free.captures(line) {
             let file = c[1].trim().to_owned();
@@ -141,8 +152,7 @@ pub(crate) fn evaluate(
                 (Some(_), Some(item)) => match finding.line {
                     Some(line) => item.hunks.iter().any(|h| {
                         let end = h.new_start.saturating_add(h.new_count.saturating_sub(1));
-                        line.saturating_add(30) >= h.new_start
-                            && line.saturating_sub(30) <= end.saturating_add(30)
+                        line.saturating_add(30) >= h.new_start && line.saturating_sub(30) <= end
                     }),
                     None => true,
                 },
@@ -225,6 +235,49 @@ mod tests {
         let results = evaluate(&[near, far], &changed, &BTreeMap::new());
         assert_eq!(results[0].status, Status::Addressed);
         assert_eq!(results[1].status, Status::Open);
+    }
+
+    fn proximity_status(distance_below_hunk: u32) -> Status {
+        let changed = vec![ChangedFile {
+            name: "src/a.rs".to_owned(),
+            hunks: vec![Hunk {
+                new_start: 100,
+                new_count: 1,
+            }],
+        }];
+        let finding = Finding {
+            id: "d".to_owned(),
+            file: Some("src/a.rs".to_owned()),
+            line: Some(100 + distance_below_hunk),
+            problem: "x".to_owned(),
+        };
+        evaluate(&[finding], &changed, &BTreeMap::new())[0]
+            .status
+            .clone()
+    }
+
+    #[test]
+    fn proximity_below_hunk_is_bounded_at_thirty_lines() {
+        assert_eq!(proximity_status(30), Status::Addressed);
+        assert_eq!(proximity_status(31), Status::Open);
+        assert_eq!(proximity_status(60), Status::Open);
+    }
+
+    #[test]
+    fn unrecognized_bullet_under_findings_is_kept_open() {
+        let findings = parse_findings(
+            "FINDINGS:\n- f-1 | src/a.rs:10 | ok\n- totally unrecognizable bullet\n* another odd one",
+        );
+        assert_eq!(findings.len(), 3);
+        assert_eq!(findings[1].file, None);
+        let results = evaluate(&findings, &[], &BTreeMap::new());
+        assert_eq!(results[1].status, Status::Open);
+        assert_eq!(results[2].status, Status::Open);
+    }
+
+    #[test]
+    fn body_with_no_findings_parses_empty() {
+        assert!(parse_findings("HOLD but no recognizable list\nverdict: HOLD head:x").is_empty());
     }
 
     #[test]

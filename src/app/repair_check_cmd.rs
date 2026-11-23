@@ -62,6 +62,12 @@ pub(super) fn repair_check_command<W: Write>(
     let changed = compare_files(&compare)?;
     let answers = parse_answers(&args.answers)?;
     let findings = repair_check::parse_findings(&hold_body);
+    if findings.is_empty() {
+        return Err(CliFailure::new(
+            2,
+            "latest HOLD has no parseable findings; refusing to report it as repaired",
+        ));
+    }
     let results = repair_check::evaluate(&findings, &changed, &answers);
     render(&results, json_output, args.comment_body, stdout)
 }
@@ -269,6 +275,17 @@ mod tests {
                 .expect_err("must fail")
                 .code,
             2
+        );
+    }
+
+    #[test]
+    fn open_unparsed_finding_exits_nonzero() {
+        let findings = repair_check::parse_findings("FINDINGS:\n- garbled bullet");
+        let results = repair_check::evaluate(&findings, &[], &BTreeMap::new());
+        let mut output = Vec::new();
+        assert_eq!(
+            render(&results, false, false, &mut output).expect("render"),
+            ExitCode::from(1)
         );
     }
 
