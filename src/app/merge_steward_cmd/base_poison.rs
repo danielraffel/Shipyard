@@ -1229,5 +1229,7 @@ pub(super) fn ensure_tracking_issue(
     Ok((number, "opened"))
 }
 
+pub(super) mod fix_notice;
+
 #[cfg(test)]
 mod tests;

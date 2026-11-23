@@ -811,6 +811,28 @@ they did:
   ejection cap, if its latest removal was one of them, and the steward
   enqueues it as usual: exact head, approval and checks still required,
   once per head.
+- `notify_fix_pr`: once per poison episode, one comment on the pull request
+  picked as the fix. It names the failing check, the red base tip and how
+  many approved, green pull requests are held, and says what the fix still
+  needs: a required check that is red on the fix (for example
+  `release-path-review`) is named and its review is asked for. The comment is
+  recorded in `<state>/base-health/fast-track.jsonl` (`action = "fix_notice"`)
+  under a key of the base, each confirmed context and when it went red, plus
+  the fix number, so a later pass posts nothing; a new episode or a new fix
+  pick posts again, and a failed post is retried after 30 minutes. No fix
+  pick means no comment (the pass report's `fix_notice` says so). Unlike the
+  other acts it defaults to `on` on a merge-queue base, because the steward
+  already comments and files a tracking issue under the same hold, and it
+  acts only while `merge_group_hold = "on"`; `dry-run` reports the comment
+  it would post, and `off` is the rollback.
+
+Held pull requests stay visible. The per-repository `blocked_summary` carries
+`held` (pull requests the hold kept back this pass) and lists each of them in
+`oldest` as `held_base_poisoned:<context>` with its age, whatever their rank,
+so a green, approved pull request waiting on the base no longer disappears
+behind older rows. The `summary.log` line is written by the m3 steward tick
+script, outside this repository: it should print `held=<blocked_summary.held>`
+and format the `oldest` entries as it does today.
 
 `shipyard base-health --replay FILE` runs recorded episodes through the same
 rule and scores each pick against the pull request that repaired the base.

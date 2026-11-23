@@ -283,7 +283,59 @@ pub(super) fn apply_repo_plan(
             }
             _ => super::base_poison::would_fast_track(poison),
         };
-        super::base_poison::report(poison, &fast_track)
+        let mut value = super::base_poison::report(poison, &fast_track);
+        // One comment on the fix per poison episode, so the people who can
+        // clear the base are told. Only a pass that applies, under the hold
+        // `on`, posts; every other pass reports what it would post.
+        let notify = poison.policy.acts.notify_fix_pr;
+        let mode = if args.apply
+            && mutation_control.is_some()
+            && poison.policy.hold == crate::base_health::PoisonHold::On
+        {
+            notify
+        } else {
+            notify.min_dry_run()
+        };
+        let held = reports
+            .iter()
+            .filter(|report| {
+                report.mutation.as_deref().is_some_and(|mutation| {
+                    mutation
+                        .split(',')
+                        .any(|part| part.starts_with("held_base_poisoned:"))
+                })
+            })
+            .count();
+        let notice = super::base_poison::fix_notice::notify(
+            mode,
+            &|pr, body| {
+                super::merge_group_stall::post_comment(actions, &observation.repo, pr, body)
+            },
+            mutation_control
+                .map_or_else(|| std::path::Path::new("."), |control| &control.state_dir),
+            &observation.repo,
+            &observation.base,
+            poison,
+            held,
+            &|number| {
+                observation
+                    .prs
+                    .iter()
+                    .find(|pr| pr.fact.number == number)
+                    .map(|pr| {
+                        super::base_poison::fix_notice::red_required(
+                            &pr.fact.checks,
+                            &policy.required_checks,
+                            &policy.approval_context,
+                        )
+                    })
+            },
+            Utc::now(),
+        );
+        if let Some(object) = value.as_object_mut() {
+            object.insert("fix_notice".to_owned(), serde_json::json!(notice));
+        }
+        value
     });
     // The red-base triage acts, each under its own `[base_health]` key; one
     // `<act>: ...` line each when it has something to say.

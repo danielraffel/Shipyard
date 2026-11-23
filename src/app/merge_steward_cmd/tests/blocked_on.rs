@@ -335,6 +335,58 @@ fn the_summary_counts_tokens_and_lists_the_three_oldest_blocked() {
     );
 }
 
+#[test]
+fn the_summary_lists_and_counts_every_pull_request_the_base_poison_hold_kept_back() {
+    let report = |number: u64, token: &str, since: &str, mutation: Option<&str>| PrReport {
+        number,
+        head_sha: HEAD.to_owned(),
+        decision: StewardDecision::ArmMergeQueue,
+        mutation: mutation.map(str::to_owned),
+        error: None,
+        blocked: Stall {
+            blocked_on: token.to_owned(),
+            since: Some(since.to_owned()),
+            ..Stall::default()
+        },
+    };
+    // Three older blocked rows fill the three-row list; the held rows are
+    // younger than all of them and used to be dropped.
+    let reports = [
+        report(1, "no_verdict", "2026-10-31T06:00:00Z", None),
+        report(2, "no_verdict", "2026-10-31T07:00:00Z", None),
+        report(3, "no_verdict", "2026-10-31T08:00:00Z", None),
+        report(
+            715,
+            "admission_pending",
+            "2026-10-31T10:42:00Z",
+            Some("held_base_poisoned:provenance-verify"),
+        ),
+        report(
+            716,
+            "admission_pending",
+            "2026-10-31T11:00:00Z",
+            Some("would_hold_base_poisoned:provenance-verify"),
+        ),
+    ];
+    let now = DateTime::parse_from_rfc3339("2026-10-31T12:00:00Z")
+        .expect("now")
+        .with_timezone(&Utc);
+    let summary = summarize(&reports, now);
+    assert_eq!(summary.held, 1, "a would-hold under dry-run is not held");
+    let oldest: Vec<(u64, &str, i64)> = summary
+        .oldest
+        .iter()
+        .map(|entry| (entry.number, entry.blocked_on.as_str(), entry.age_minutes))
+        .collect();
+    assert!(
+        oldest.contains(&(715, "held_base_poisoned:provenance-verify", 78)),
+        "{oldest:?}"
+    );
+    assert_eq!(summary.oldest.len(), 4, "three oldest plus the held row");
+    // No held row: nothing changes.
+    assert_eq!(summarize(&reports[..3], now).held, 0);
+}
+
 /// The apply pass's admission attempt reads the gate once; the report reuses
 /// that read instead of asking GitHub again, and names the exclusion.
 #[cfg(unix)]

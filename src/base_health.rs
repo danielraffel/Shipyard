@@ -238,14 +238,22 @@ pub struct TriageActs {
     /// the ejection cap a head whose last removal was a `failed_checks`
     /// ejection during the episode, so the steward enqueues it again, once.
     pub reenqueue_red_base_ejections: PoisonHold,
+    /// `notify_fix_pr`: post one comment on the fix pull request per poison
+    /// episode, naming the failing check, the red tip, the held count and
+    /// what the fix still needs. Acts only with the hold `on`. Unlike the
+    /// other acts it defaults to `on` on a merge-queue base, because the
+    /// steward already comments and opens a tracking issue under the same
+    /// hold; `off` is the rollback.
+    pub notify_fix_pr: PoisonHold,
 }
 
 impl TriageActs {
     /// Config keys, in report order.
-    pub const KEYS: [&'static str; 3] = [
+    pub const KEYS: [&'static str; 4] = [
         "reorder_fix",
         "cancel_orphaned_groups",
         "reenqueue_red_base_ejections",
+        "notify_fix_pr",
     ];
 
     /// Every act at `mode`.
@@ -255,6 +263,7 @@ impl TriageActs {
             reorder_fix: mode,
             cancel_orphaned_groups: mode,
             reenqueue_red_base_ejections: mode,
+            notify_fix_pr: mode,
         }
     }
 
@@ -267,6 +276,7 @@ impl TriageActs {
                 reorder_fix: PoisonHold::Off,
                 cancel_orphaned_groups: PoisonHold::Off,
                 reenqueue_red_base_ejections: PoisonHold::Off,
+                ..
             }
         )
     }
@@ -276,6 +286,7 @@ impl TriageActs {
             "reorder_fix" => Some(&mut self.reorder_fix),
             "cancel_orphaned_groups" => Some(&mut self.cancel_orphaned_groups),
             "reenqueue_red_base_ejections" => Some(&mut self.reenqueue_red_base_ejections),
+            "notify_fix_pr" => Some(&mut self.notify_fix_pr),
             _ => None,
         }
     }
@@ -299,11 +310,18 @@ impl BasePoisonPolicy {
                 PoisonHold::Off
             },
             control_workflows: std::collections::BTreeMap::new(),
-            acts: TriageActs::all(if merge_queue {
-                PoisonHold::DryRun
-            } else {
-                PoisonHold::Off
-            }),
+            acts: TriageActs {
+                notify_fix_pr: if merge_queue {
+                    PoisonHold::On
+                } else {
+                    PoisonHold::Off
+                },
+                ..TriageActs::all(if merge_queue {
+                    PoisonHold::DryRun
+                } else {
+                    PoisonHold::Off
+                })
+            },
             read_error: None,
         }
     }

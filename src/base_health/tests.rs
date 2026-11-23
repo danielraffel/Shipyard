@@ -224,7 +224,18 @@ fn triage_acts_default_to_dry_run_on_a_merge_queue_and_parse_each_key() {
     let none: toml::Table = toml::from_str("").expect("toml");
     assert_eq!(
         BasePoisonPolicy::from_table(&none, true).acts,
-        TriageActs::all(PoisonHold::DryRun)
+        TriageActs {
+            notify_fix_pr: PoisonHold::On,
+            ..TriageActs::all(PoisonHold::DryRun)
+        }
+    );
+    // The fix notice is the one act that defaults on; a typo never turns it
+    // on from off, and `off` is the rollback.
+    let off: toml::Table =
+        toml::from_str("[base_health]\nnotify_fix_pr = \"off\"\n").expect("toml");
+    assert_eq!(
+        BasePoisonPolicy::from_table(&off, true).acts.notify_fix_pr,
+        PoisonHold::Off
     );
     assert_eq!(
         BasePoisonPolicy::from_table(&none, false).acts,
