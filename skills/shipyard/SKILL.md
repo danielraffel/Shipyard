@@ -26,6 +26,13 @@ uses the exact-identity index, without changing duplicate or attempt policy.
 
 ## Review pickup is computed, not chosen by the model
 
+Repair lanes can run `shipyard repair-check --pr N --repo OWNER/REPO` before
+posting `repaired:`. It reads the latest `shipyard-local[bot]` HOLD, compares
+that exact head with the current PR head, and reports each finding as
+`ADDRESSED`, `ANSWERED`, or `OPEN`. Use repeatable `--answer ID=REASON` for a
+finding that is resolved by an explanation. The command is read-only and exits
+1 while any finding remains open, or 2 when GitHub evidence is unreadable.
+
 A scheduled reviewer pass works through the **must-review queue** a script computes before it starts: open,
 non-draft, green, and no verdict naming the head, with missed ones first. A 2-minute eligibility tick, which makes
 no model call, starts a pass when a pull request becomes reviewable, or queues one follow-up behind a running pass.

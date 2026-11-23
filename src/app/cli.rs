@@ -568,6 +568,21 @@ pub(super) enum Command {
         #[arg(long)]
         no_rebase_carry: bool,
     },
+    /// Check the latest HOLD findings against the repair diff. Read-only.
+    RepairCheck {
+        /// Pull request number.
+        #[arg(long)]
+        pr: u64,
+        /// Exact OWNER/REPO.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Answer a finding without changing code. Repeatable.
+        #[arg(long = "answer", value_name = "ID=REASON")]
+        answers: Vec<String>,
+        /// Print the table prefixed as a `repaired:` comment body.
+        #[arg(long)]
+        comment_body: bool,
+    },
     /// Record or reconcile reviewer-dispatch liveness receipts.
     #[command(name = "reviewer-dispatch")]
     ReviewerDispatch {

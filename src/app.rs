@@ -77,6 +77,7 @@ mod queue_quarantine_cmd;
 mod relay_cmd;
 mod release_bot_cmd;
 mod release_canary_cmd;
+mod repair_check_cmd;
 mod reroute_cmd;
 mod rescue_cmd;
 mod reuse_cmd;
@@ -624,6 +625,25 @@ where
                 stdout,
             );
         }
+        Command::RepairCheck {
+            pr,
+            repo,
+            answers,
+            comment_body,
+        } => {
+            return repair_check_cmd::repair_check_command(
+                repair_check_cmd::RepairCheckArgs {
+                    pr,
+                    repo,
+                    answers,
+                    comment_body,
+                },
+                cli.mode.into(),
+                &cwd,
+                cli.json,
+                stdout,
+            );
+        }
         Command::ReviewerDispatch { command } => {
             return reviewer_dispatch_command(
                 command,
@@ -1100,6 +1120,7 @@ fn handle_operational_variant<W: Write>(
         | Command::Inspect { .. }
         | Command::Advance { .. }
         | Command::ReviewVerdict { .. }
+        | Command::RepairCheck { .. }
         | Command::ReviewerDispatch { .. }
         | Command::ReviewerClaim { .. }
         | Command::Who { .. }
