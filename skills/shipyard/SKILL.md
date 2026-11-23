@@ -1850,6 +1850,15 @@ equivalent. The native-help probe must read the whole help text before
 matching: `gh … --help | grep -q` under `pipefail` fails whenever grep exits
 first and gh dies of SIGPIPE (exit 141), which silently skipped the flag and
 left `api …/logs` refused after release.
+`attestation verify` is allowed only with a local `--bundle`, one local
+artifact path, exactly one of `--owner` or `--repo` naming `danielraffel` or
+`Generous-Corp`, and the policy flags `--signer-repo`, `--signer-workflow`,
+`--cert-oidc-issuer`, `--cert-identity`, `--predicate-type`, `--source-ref`,
+`--source-digest`, `--deny-self-hosted-runners` and `--format json`. It never
+mints an App token: native gh runs with every GitHub token unset and an empty
+private `GH_CONFIG_DIR`. `--custom-trusted-root`, `--bundle-from-oci`,
+`--hostname`, `--limit`, `-R`, short spellings and the other `attestation`
+subcommands stay refused.
 
 On macOS, `install.sh` and `shipyard update` install only the Developer ID
 release (identifier `shipyard` / `shipyard-workstream-provider`, team

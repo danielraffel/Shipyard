@@ -67,7 +67,9 @@ class GhappWrapperTests(unittest.TestCase):
         cases = []
         for line in grammar.splitlines():
             fields = line.split("|", 3)
-            if fields[0] != "boolean" or fields[1] == "*":
+            # `attestation verify` never mints a token or routes by --repo;
+            # its tokenless path has dedicated tests below.
+            if fields[0] != "boolean" or fields[1] in {"*", "attestation"}:
                 continue
             cases.extend(
                 (fields[1], fields[2], option)
@@ -684,6 +686,183 @@ class GhappWrapperTests(unittest.TestCase):
         )
         self.assertEqual(download.returncode, 0, download.stderr)
         self.assertIn("run download 5 -n logs -D out", self.gh_log.read_text())
+
+    ATTESTATION_ARTIFACT = "skia-build.json"
+    ATTESTATION_BUNDLE = "skia-build.sigstore.json"
+
+    def use_attestation_gh(self) -> Path:
+        """A native gh stand-in that records argv and its credential env."""
+        record = self.root / "attestation-gh.json"
+        self.gh.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, sys\n"
+            "config = os.environ.get('GH_CONFIG_DIR', '')\n"
+            "state = {\n"
+            "    'argv': sys.argv[1:],\n"
+            "    'env': {name: os.environ.get(name) for name in (\n"
+            "        'GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN',\n"
+            "        'GITHUB_ENTERPRISE_TOKEN', 'GH_HOST', 'GH_REPO')},\n"
+            "    'config_dir': config,\n"
+            "    'config_entries': sorted(os.listdir(config)) if config and os.path.isdir(config) else None,\n"
+            "    'config_mode': oct(os.stat(config).st_mode & 0o777) if config and os.path.isdir(config) else None,\n"
+            "}\n"
+            f"open({str(record)!r}, 'w', encoding='utf-8').write(json.dumps(state))\n"
+            "print('[]')\n",
+            encoding="utf-8",
+        )
+        self.gh.chmod(0o755)
+        return record
+
+    def attestation_arguments(self, *extra: str) -> list[str]:
+        return [
+            "attestation", "verify", self.ATTESTATION_ARTIFACT,
+            "--bundle", self.ATTESTATION_BUNDLE, *extra,
+        ]
+
+    def assert_attestation_refused(self, arguments: list[str], message: str) -> None:
+        record = self.use_attestation_gh()
+        result = self.run_wrapper(*arguments)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(message, result.stderr)
+        self.assertFalse(record.exists(), "native gh must not run")
+        self.assertFalse(self.helper_log.exists(), "no App token may be minted")
+        self.assertFalse(self.resolver_log.exists())
+
+    def test_attestation_verify_with_local_bundle_runs_without_any_token(self) -> None:
+        record = self.use_attestation_gh()
+        self.environment.update({
+            "GH_TOKEN": "ghp_personal_ambient",
+            "GITHUB_TOKEN": "ghp_personal_ambient",
+            "GH_ENTERPRISE_TOKEN": "ghp_personal_ambient",
+            "GITHUB_ENTERPRISE_TOKEN": "ghp_personal_ambient",
+            "GH_REPO": "danielraffel/Shipyard",
+        })
+        arguments = self.attestation_arguments(
+            "--repo", "danielraffel/skia-builder",
+            "--signer-workflow",
+            "danielraffel/skia-builder/.github/workflows/build-skia.yml@refs/heads/main",
+            "--source-ref", "refs/heads/main",
+            "--source-digest", "a9c9f37255121d4b3d0fe8931fdd81c9eca97da2",
+            "--predicate-type", "https://slsa.dev/provenance/v1",
+            "--cert-oidc-issuer", "https://token.actions.githubusercontent.com",
+            "--deny-self-hosted-runners", "--format", "json",
+        )
+
+        result = self.run_wrapper(*arguments)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = json.loads(record.read_text(encoding="utf-8"))
+        self.assertEqual(state["argv"], arguments)
+        self.assertEqual(set(state["env"].values()), {None})
+        self.assertTrue(state["config_dir"].startswith("/tmp/shipyard-ghapp-attestation."))
+        self.assertEqual(state["config_entries"], [])
+        self.assertEqual(state["config_mode"], "0o700")
+        self.assertFalse(Path(state["config_dir"]).exists(), "config dir is cleaned up")
+        self.assertFalse(self.helper_log.exists(), "no App token may be minted")
+        self.assertFalse(self.resolver_log.exists())
+        self.assertFalse(self.guard_log.exists())
+
+    def test_attestation_verify_accepts_allowlisted_owner_forms(self) -> None:
+        for selector in (
+            ["--owner", "danielraffel"],
+            ["--owner=Generous-Corp"],
+            ["--repo=Generous-Corp/vellum"],
+        ):
+            with self.subTest(selector=selector):
+                record = self.use_attestation_gh()
+                result = self.run_wrapper(*self.attestation_arguments(*selector))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue(record.exists())
+                self.assertFalse(self.helper_log.exists())
+
+    def test_attestation_verify_requires_a_local_bundle(self) -> None:
+        for arguments in (
+            ["attestation", "verify", self.ATTESTATION_ARTIFACT, "--owner", "danielraffel"],
+            ["attestation", "verify", self.ATTESTATION_ARTIFACT, "--owner", "danielraffel",
+             "--bundle", "https://example.com/bundle.json"],
+        ):
+            with self.subTest(arguments=arguments):
+                self.assert_attestation_refused(
+                    arguments, "requires --bundle with a local Sigstore bundle path"
+                )
+
+    def test_attestation_verify_refuses_custom_trusted_root(self) -> None:
+        for option in (["--custom-trusted-root", "root.jsonl"], ["--custom-trusted-root=root.jsonl"]):
+            with self.subTest(option=option):
+                self.assert_attestation_refused(
+                    self.attestation_arguments("--owner", "danielraffel", *option),
+                    "is outside privileged grammar",
+                )
+
+    def test_attestation_verify_refuses_owner_outside_allowlist(self) -> None:
+        for selector in (
+            ["--owner", "github"],
+            ["--owner=evil-corp"],
+            ["--repo", "evil-corp/skia-builder"],
+            ["--repo=github/example"],
+        ):
+            with self.subTest(selector=selector):
+                self.assert_attestation_refused(
+                    self.attestation_arguments(*selector), "is not in the allowlist"
+                )
+
+    def test_attestation_verify_needs_exactly_one_unique_identity_selector(self) -> None:
+        cases = (
+            ([], "requires exactly one of --owner or --repo"),
+            (["--owner", "danielraffel", "--repo", "danielraffel/skia-builder"],
+             "requires exactly one of --owner or --repo"),
+            (["--owner", "danielraffel", "--owner", "github"], "may be given only once"),
+            (["--repo", "danielraffel/x", "--repo=github/x"], "may be given only once"),
+            (["--repo", "danielraffel"], "--repo must be OWNER/REPO"),
+        )
+        for extra, message in cases:
+            with self.subTest(extra=extra):
+                self.assert_attestation_refused(self.attestation_arguments(*extra), message)
+
+    def test_attestation_verify_refuses_short_repo_and_unknown_options(self) -> None:
+        for extra in (
+            ["-R", "danielraffel/skia-builder"],
+            ["-Rdanielraffel/skia-builder"],
+            ["-R=danielraffel/skia-builder"],
+            ["-o", "danielraffel"],
+            ["--owner", "danielraffel", "--bundle-from-oci"],
+            ["--owner", "danielraffel", "--hostname", "github.com"],
+            ["--owner", "danielraffel", "--limit", "5"],
+            ["--owner", "danielraffel", "--jq", ".[]"],
+            ["--owner", "danielraffel", "--no-public-good"],
+            ["--owner", "danielraffel", "--not-a-gh-flag"],
+            ["--owner", "danielraffel", "--", "extra"],
+        ):
+            with self.subTest(extra=extra):
+                self.assert_attestation_refused(
+                    self.attestation_arguments(*extra), "outside privileged grammar"
+                )
+
+    def test_attestation_verify_refuses_other_artifact_shapes_and_formats(self) -> None:
+        cases = (
+            (["attestation", "verify", "oci://ghcr.io/x/y", "--bundle", "b.json",
+              "--owner", "danielraffel"], "exactly one local artifact path"),
+            (["attestation", "verify", "a", "b", "--bundle", "b.json",
+              "--owner", "danielraffel"], "exactly one local artifact path"),
+            (["attestation", "verify", "--bundle", "b.json", "--owner", "danielraffel"],
+             "exactly one local artifact path"),
+            (self.attestation_arguments("--owner", "danielraffel", "--format", "table"),
+             "--format accepts only json"),
+        )
+        for arguments, message in cases:
+            with self.subTest(arguments=arguments):
+                self.assert_attestation_refused(arguments, message)
+
+    def test_other_attestation_subcommands_stay_outside_the_grammar(self) -> None:
+        for arguments in (
+            ["attestation", "download", self.ATTESTATION_ARTIFACT, "--owner", "danielraffel"],
+            ["attestation", "trusted-root"],
+            ["attestation", "inspect", self.ATTESTATION_BUNDLE],
+        ):
+            with self.subTest(arguments=arguments):
+                self.assert_attestation_refused(
+                    arguments, "command is outside privileged grammar"
+                )
 
     def test_pr_edit_is_refused_with_the_exact_rest_equivalent(self) -> None:
         result = self.run_wrapper(

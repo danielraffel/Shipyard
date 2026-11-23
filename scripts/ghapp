@@ -500,6 +500,7 @@ set_target_url_repo() {
 # a routing regression and security review.
 GHAPP_COMMAND_GRAMMAR_VERSION="shipyard-v1"
 GHAPP_COMMAND_GRAMMAR='surface|api|*
+surface|attestation|verify
 surface|auth|status
 surface|auth|token
 surface|issue|list
@@ -533,6 +534,8 @@ surface|workflow|view
 boolean|*|*|--help
 boolean|api|*|-i --include --paginate --silent --slurp --verbose
 value|api|*|--cache -F --field -H --header --hostname --input -q --jq -X --method -p --preview -f --raw-field -t --template
+boolean|attestation|verify|--deny-self-hosted-runners
+value|attestation|verify|--bundle --cert-identity --cert-oidc-issuer --format --owner --predicate-type --signer-repo --signer-workflow --source-digest --source-ref
 boolean|auth|status|-a --active -t --show-token
 value|auth|status|-h --hostname --jq --json --template
 value|auth|token|-h --hostname -u --user
@@ -700,6 +703,22 @@ repo_attached_value_option() {
             ;;
     esac
     return 1
+}
+
+resolve_native_gh_binary() {
+    gh_binary="${SHIPYARD_GHAPP_GH_BINARY:-}"
+    if [[ -z "$gh_binary" ]]; then
+        for candidate in /opt/homebrew/bin/gh /usr/local/bin/gh; do
+            if [[ -x "$candidate" ]]; then
+                gh_binary="$candidate"
+                break
+            fi
+        done
+    fi
+    if [[ -z "$gh_binary" || "$gh_binary" != /* || ! -x "$gh_binary" ]]; then
+        echo "ghapp: set SHIPYARD_GHAPP_GH_BINARY to an absolute native gh executable" >&2
+        exit 1
+    fi
 }
 
 if [[ "${1:-}" == "token" ]]; then
@@ -909,6 +928,145 @@ done
 if [[ -n "$grammar_pending_option" ]]; then
     echo "ghapp: $grammar_pending_option requires a value" >&2
     exit 1
+fi
+
+# `attestation verify` checks a local Sigstore bundle against an artifact. With
+# `--bundle` native gh fetches no attestations from the GitHub API and needs no
+# credential, so this row never mints an App token: it runs native gh with
+# every GitHub token removed and an empty private GH_CONFIG_DIR, so a stored
+# personal login cannot be used either. The accepted form is deliberately
+# narrower than native gh: exactly one local artifact path, a required
+# `--bundle`, exactly one of `--owner` or `--repo` naming an allowlisted owner,
+# and only the policy flags listed below. In particular `--custom-trusted-root`
+# (a local file would replace the trust root), `--bundle-from-oci`,
+# `--hostname`, `--limit`, `-R` and every short spelling stay refused.
+ghapp_attestation_owner_allowed() {
+    case "$(printf '%s' "$1" | /usr/bin/tr '[:upper:]' '[:lower:]')" in
+        danielraffel|generous-corp) return 0 ;;
+    esac
+    return 1
+}
+
+if [[ "$command_name" == "attestation" ]]; then
+    if [[ "$#" == 3 && "${3:-}" == "--help" ]]; then
+        attestation_help_only=1
+    else
+        attestation_help_only=0
+    fi
+    attestation_artifact=""
+    attestation_artifact_count=0
+    attestation_bundle=""
+    attestation_owner=""
+    attestation_repo=""
+    attestation_seen=" "
+    attestation_index=3
+    while [[ "$attestation_help_only" == 0 && "$attestation_index" -le "$#" ]]; do
+        argument="${!attestation_index}"
+        attestation_index=$((attestation_index + 1))
+        attestation_option=""
+        attestation_value=""
+        attestation_has_value=0
+        case "$argument" in
+            --deny-self-hosted-runners)
+                attestation_option="$argument"
+                ;;
+            --bundle|--cert-identity|--cert-oidc-issuer|--format|--owner|--predicate-type|\
+            --repo|--signer-repo|--signer-workflow|--source-digest|--source-ref)
+                attestation_option="$argument"
+                if [[ "$attestation_index" -gt "$#" ]]; then
+                    echo "ghapp: attestation verify $argument requires a value" >&2
+                    exit 1
+                fi
+                attestation_value="${!attestation_index}"
+                attestation_index=$((attestation_index + 1))
+                attestation_has_value=1
+                ;;
+            --bundle=*|--cert-identity=*|--cert-oidc-issuer=*|--format=*|--owner=*|\
+            --predicate-type=*|--repo=*|--signer-repo=*|--signer-workflow=*|\
+            --source-digest=*|--source-ref=*)
+                attestation_option="${argument%%=*}"
+                attestation_value="${argument#*=}"
+                attestation_has_value=1
+                ;;
+            -*)
+                echo "ghapp: attestation verify option $argument is outside privileged grammar $GHAPP_COMMAND_GRAMMAR_VERSION" >&2
+                exit 1
+                ;;
+            *)
+                attestation_artifact="$argument"
+                attestation_artifact_count=$((attestation_artifact_count + 1))
+                continue
+                ;;
+        esac
+        if [[ "$attestation_seen" == *" $attestation_option "* ]]; then
+            echo "ghapp: attestation verify $attestation_option may be given only once" >&2
+            exit 1
+        fi
+        attestation_seen="$attestation_seen$attestation_option "
+        if [[ "$attestation_has_value" == 1 && \
+              ( -z "$attestation_value" || "$attestation_value" == -* || \
+                "$attestation_value" == *$'\n'* || "$attestation_value" == *$'\r'* ) ]]; then
+            echo "ghapp: attestation verify $attestation_option requires a non-empty value" >&2
+            exit 1
+        fi
+        case "$attestation_option" in
+            --bundle) attestation_bundle="$attestation_value" ;;
+            --owner) attestation_owner="$attestation_value" ;;
+            --repo) attestation_repo="$attestation_value" ;;
+            --format)
+                if [[ "$attestation_value" != "json" ]]; then
+                    echo "ghapp: attestation verify --format accepts only json" >&2
+                    exit 1
+                fi
+                ;;
+        esac
+    done
+    if [[ "$attestation_help_only" == 0 ]]; then
+        if [[ "$attestation_artifact_count" != 1 || "$attestation_artifact" == *://* ]]; then
+            echo "ghapp: attestation verify requires exactly one local artifact path" >&2
+            exit 1
+        fi
+        if [[ -z "$attestation_bundle" || "$attestation_bundle" == *://* ]]; then
+            echo "ghapp: attestation verify requires --bundle with a local Sigstore bundle path" >&2
+            exit 1
+        fi
+        if [[ -n "$attestation_owner" && -n "$attestation_repo" ]] || \
+           [[ -z "$attestation_owner" && -z "$attestation_repo" ]]; then
+            echo "ghapp: attestation verify requires exactly one of --owner or --repo" >&2
+            exit 1
+        fi
+        if [[ -n "$attestation_repo" ]]; then
+            if [[ ! "$attestation_repo" =~ ^([A-Za-z0-9][A-Za-z0-9-]{0,38})/[A-Za-z0-9_.-]+$ ]]; then
+                echo "ghapp: attestation verify --repo must be OWNER/REPO" >&2
+                exit 1
+            fi
+            attestation_owner="${BASH_REMATCH[1]}"
+        fi
+        if ! ghapp_attestation_owner_allowed "$attestation_owner"; then
+            echo "ghapp: attestation verify owner $attestation_owner is not in the allowlist (danielraffel, Generous-Corp)" >&2
+            exit 1
+        fi
+    fi
+    resolve_native_gh_binary
+    attestation_config_dir="$(/usr/bin/mktemp -d /tmp/shipyard-ghapp-attestation.XXXXXX)"
+    /bin/chmod 700 "$attestation_config_dir"
+    cleanup_attestation_config() {
+        if [[ -n "${attestation_config_dir:-}" && \
+              "$attestation_config_dir" == /tmp/shipyard-ghapp-attestation.* && \
+              -d "$attestation_config_dir" && ! -L "$attestation_config_dir" ]]; then
+            /bin/rm -rf -- "$attestation_config_dir"
+        fi
+    }
+    trap cleanup_attestation_config EXIT
+    set +e
+    /usr/bin/env -u GH_TOKEN -u GITHUB_TOKEN -u GH_ENTERPRISE_TOKEN \
+        -u GITHUB_ENTERPRISE_TOKEN -u GH_HOST -u GH_REPO -u GITHUB_API_URL \
+        -u GHAPP_REAL_GH -u MERGE_GUARD_GH \
+        GH_CONFIG_DIR="$attestation_config_dir" GH_NO_UPDATE_NOTIFIER=1 \
+        GH_PROMPT_DISABLED=1 "$gh_binary" "$@"
+    attestation_status=$?
+    set -e
+    exit "$attestation_status"
 fi
 
 if [[ -n "${GH_HOST:-}" ]]; then
@@ -1399,19 +1557,7 @@ fi
 # metadata rather than a native --repo flag.
 export GH_REPO="$repo"
 
-gh_binary="${SHIPYARD_GHAPP_GH_BINARY:-}"
-if [[ -z "$gh_binary" ]]; then
-    for candidate in /opt/homebrew/bin/gh /usr/local/bin/gh; do
-        if [[ -x "$candidate" ]]; then
-            gh_binary="$candidate"
-            break
-        fi
-    done
-fi
-if [[ -z "$gh_binary" || "$gh_binary" != /* || ! -x "$gh_binary" ]]; then
-    echo "ghapp: set SHIPYARD_GHAPP_GH_BINARY to an absolute native gh executable" >&2
-    exit 1
-fi
+resolve_native_gh_binary
 
 if [[ "$public_wrapper_path" != /* || "$wrapper_path" != /* ]]; then
     echo "ghapp: wrapper must be invoked through an absolute installed path" >&2
