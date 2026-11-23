@@ -262,6 +262,7 @@ pub mod release_base;
 pub mod release_canary;
 /// The Developer ID identity every Shipyard release binary carries on macOS.
 pub mod release_identity;
+pub(crate) mod repair_check;
 /// Canonical identity of a watched repository after a rename or transfer.
 pub mod repo_slug;
 /// Read and write one GitHub Actions repository variable.

@@ -141,6 +141,8 @@ shipyard review-verdict --pr 123 [--repo OWNER/REPO] [--head SHA] [--no-rebase-c
                                              #   switch); merge-only and rebase carries apply; exit 0 allowed,
                                              #   1 refused, 2 unreadable; JSON names the approval or carry,
                                              #   excluded human approvals, and the fix
+shipyard repair-check --pr 123 --repo OWNER/REPO [--answer ID=REASON]... [--comment-body] [--json]
+                                             # refuse a repaired: marker while the latest bot HOLD finding is open
 shipyard reviewer-dispatch record --repo OWNER/REPO --pr 123 --head SHA \
   --reviewer infra-review2 --attempt-id ID --launcher-identity ID \
   --dispatch-id ID --started-at TIME --deadline-at TIME \
