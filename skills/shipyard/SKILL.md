@@ -1855,8 +1855,9 @@ artifact path, exactly one of `--owner` or `--repo` naming `danielraffel` or
 `Generous-Corp`, and the policy flags `--signer-repo`, `--signer-workflow`,
 `--cert-oidc-issuer`, `--cert-identity`, `--predicate-type`, `--source-ref`,
 `--source-digest`, `--deny-self-hosted-runners` and `--format json`. It never
-mints an App token: native gh runs with every GitHub token unset and an empty
-private `GH_CONFIG_DIR`. `--custom-trusted-root`, `--bundle-from-oci`,
+mints an App token: native gh runs with every GitHub token variable unset and
+with `HOME` and `GH_CONFIG_DIR` both set to an empty private directory, which
+hides `hosts.yml` and the macOS login keychain. `--custom-trusted-root`, `--bundle-from-oci`,
 `--hostname`, `--limit`, `-R`, short spellings and the other `attestation`
 subcommands stay refused.
 

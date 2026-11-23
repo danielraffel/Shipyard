@@ -932,9 +932,14 @@ fi
 
 # `attestation verify` checks a local Sigstore bundle against an artifact. With
 # `--bundle` native gh fetches no attestations from the GitHub API and needs no
-# credential, so this row never mints an App token: it runs native gh with
-# every GitHub token removed and an empty private GH_CONFIG_DIR, so a stored
-# personal login cannot be used either. The accepted form is deliberately
+# credential, so this row never mints an App token. Native gh runs with every
+# GitHub token variable removed and with both HOME and GH_CONFIG_DIR set to an
+# empty private directory: GH_CONFIG_DIR hides hosts.yml, and HOME hides the
+# macOS login keychain, which gh reads regardless of GH_CONFIG_DIR. Other
+# caller environment (XDG_CACHE_HOME, proxies, CA bundles) still passes
+# through, so the verdict is only as trustworthy as the caller's environment.
+# INT, TERM and HUP are forwarded so native gh is never orphaned. The accepted
+# form is deliberately
 # narrower than native gh: exactly one local artifact path, a required
 # `--bundle`, exactly one of `--owner` or `--repo` naming an allowlisted owner,
 # and only the policy flags listed below. In particular `--custom-trusted-root`
@@ -1058,14 +1063,29 @@ if [[ "$command_name" == "attestation" ]]; then
         fi
     }
     trap cleanup_attestation_config EXIT
+    attestation_child=""
+    for attestation_signal in INT TERM HUP; do
+        trap 'if [[ -n "$attestation_child" ]]; then kill -'"$attestation_signal"' "$attestation_child" 2>/dev/null || true; fi' "$attestation_signal"
+    done
     set +e
+    # A background command gets /dev/null for stdin unless told otherwise.
+    exec 3<&0
     /usr/bin/env -u GH_TOKEN -u GITHUB_TOKEN -u GH_ENTERPRISE_TOKEN \
         -u GITHUB_ENTERPRISE_TOKEN -u GH_HOST -u GH_REPO -u GITHUB_API_URL \
         -u GHAPP_REAL_GH -u MERGE_GUARD_GH \
-        GH_CONFIG_DIR="$attestation_config_dir" GH_NO_UPDATE_NOTIFIER=1 \
-        GH_PROMPT_DISABLED=1 "$gh_binary" "$@"
+        HOME="$attestation_config_dir" GH_CONFIG_DIR="$attestation_config_dir" \
+        GH_NO_UPDATE_NOTIFIER=1 GH_PROMPT_DISABLED=1 "$gh_binary" "$@" <&3 &
+    attestation_child=$!
+    exec 3<&-
+    wait "$attestation_child"
     attestation_status=$?
+    # A signal interrupts the first wait; collect the child's real status.
+    while kill -0 "$attestation_child" 2>/dev/null; do
+        wait "$attestation_child"
+        attestation_status=$?
+    done
     set -e
+    trap - INT TERM HUP
     exit "$attestation_status"
 fi
 

@@ -703,6 +703,7 @@ class GhappWrapperTests(unittest.TestCase):
             "        'GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN',\n"
             "        'GITHUB_ENTERPRISE_TOKEN', 'GH_HOST', 'GH_REPO')},\n"
             "    'config_dir': config,\n"
+            "    'home': os.environ.get('HOME'),\n"
             "    'config_entries': sorted(os.listdir(config)) if config and os.path.isdir(config) else None,\n"
             "    'config_mode': oct(os.stat(config).st_mode & 0o777) if config and os.path.isdir(config) else None,\n"
             "}\n"
@@ -757,10 +758,54 @@ class GhappWrapperTests(unittest.TestCase):
         self.assertTrue(state["config_dir"].startswith("/tmp/shipyard-ghapp-attestation."))
         self.assertEqual(state["config_entries"], [])
         self.assertEqual(state["config_mode"], "0o700")
+        # HOME hides the macOS login keychain, which gh reads regardless of
+        # GH_CONFIG_DIR.
+        self.assertEqual(state["home"], state["config_dir"])
         self.assertFalse(Path(state["config_dir"]).exists(), "config dir is cleaned up")
         self.assertFalse(self.helper_log.exists(), "no App token may be minted")
         self.assertFalse(self.resolver_log.exists())
         self.assertFalse(self.guard_log.exists())
+
+    def test_attestation_verify_forwards_termination_to_native_gh(self) -> None:
+        pid_file = self.root / "attestation-gh.pid"
+        self.gh.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os, time\n"
+            f"open({str(pid_file)!r}, 'w').write(str(os.getpid()))\n"
+            "time.sleep(60)\n",
+            encoding="utf-8",
+        )
+        self.gh.chmod(0o755)
+        for signal_number in (15, 1):
+            with self.subTest(signal=signal_number):
+                pid_file.unlink(missing_ok=True)
+                process = subprocess.Popen(
+                    [str(self.wrapper), *self.attestation_arguments("--owner", "danielraffel")],
+                    cwd=self.root, env=self.environment,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+                try:
+                    deadline = time.monotonic() + 30
+                    while not pid_file.exists() or not pid_file.read_text():
+                        self.assertLess(time.monotonic(), deadline, "native gh never started")
+                        time.sleep(0.05)
+                    child = int(pid_file.read_text())
+                    process.send_signal(signal_number)
+                    process.wait(timeout=30)
+                    deadline = time.monotonic() + 10
+                    while True:
+                        try:
+                            os.kill(child, 0)
+                        except ProcessLookupError:
+                            break
+                        if time.monotonic() > deadline:
+                            os.kill(child, 9)
+                            self.fail("native gh was orphaned after the wrapper was signalled")
+                        time.sleep(0.05)
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait()
 
     def test_attestation_verify_accepts_allowlisted_owner_forms(self) -> None:
         for selector in (
