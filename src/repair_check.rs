@@ -80,7 +80,13 @@ pub(crate) fn parse_findings(body: &str) -> Vec<Finding> {
                 });
                 continue;
             }
-            if !line.trim().is_empty() && !line.trim_start().starts_with(['-', '*']) {
+            // Only the trailer closes the block: wrapped continuation lines of a
+            // finding are non-bullets and must not disable the unparsed-bullet rule.
+            let lower = line.trim_start().to_ascii_lowercase();
+            if ["reviewer:", "session:", "verdict:", "<!--"]
+                .iter()
+                .any(|marker| lower.starts_with(marker))
+            {
                 in_structured = false;
             }
         }
@@ -273,6 +279,24 @@ mod tests {
         let results = evaluate(&findings, &[], &BTreeMap::new());
         assert_eq!(results[1].status, Status::Open);
         assert_eq!(results[2].status, Status::Open);
+    }
+
+    #[test]
+    fn wrapped_continuation_does_not_hide_a_later_unmatched_bullet() {
+        let body = "FINDINGS:\n- [blocking] src/a.rs 10 first problem that wraps\n  onto a continuation line\n- [blocking] a bullet with no file or line\nreviewer: x\nverdict: HOLD head:abc";
+        let findings = parse_findings(body);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.problem.contains("no file or line")),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn trailer_closes_the_findings_block() {
+        let body = "FINDINGS:\n- garbled\nreviewer: x\n- bullet after trailer";
+        assert_eq!(parse_findings(body).len(), 1);
     }
 
     #[test]

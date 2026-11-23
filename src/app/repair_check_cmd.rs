@@ -61,15 +61,25 @@ pub(super) fn repair_check_command<W: Write>(
     let compare = read(format!("repos/{repo}/compare/{hold_head}...{current_head}"))?;
     let changed = compare_files(&compare)?;
     let answers = parse_answers(&args.answers)?;
-    let findings = repair_check::parse_findings(&hold_body);
+    let results = check_hold(&hold_body, &changed, &answers)?;
+    render(&results, json_output, args.comment_body, stdout)
+}
+
+/// Parse a HOLD body and evaluate it; a HOLD with no parseable findings is an
+/// error so an unreadable HOLD can never read as repaired.
+fn check_hold(
+    hold_body: &str,
+    changed: &[ChangedFile],
+    answers: &BTreeMap<String, String>,
+) -> Result<Vec<FindingResult>, CliFailure> {
+    let findings = repair_check::parse_findings(hold_body);
     if findings.is_empty() {
         return Err(CliFailure::new(
             2,
             "latest HOLD has no parseable findings; refusing to report it as repaired",
         ));
     }
-    let results = repair_check::evaluate(&findings, &changed, &answers);
-    render(&results, json_output, args.comment_body, stdout)
+    Ok(repair_check::evaluate(&findings, changed, answers))
 }
 
 fn read_comments(
@@ -287,6 +297,25 @@ mod tests {
             render(&results, false, false, &mut output).expect("render"),
             ExitCode::from(1)
         );
+    }
+
+    #[test]
+    fn unparseable_hold_is_an_error_not_repaired() {
+        let error = check_hold(
+            "HOLD, prose only\nverdict: HOLD head:x",
+            &[],
+            &BTreeMap::new(),
+        )
+        .expect_err("must fail");
+        assert_eq!(error.code, 2);
+    }
+
+    #[test]
+    fn parseable_hold_is_evaluated() {
+        let results =
+            check_hold("FINDINGS:\n- garbled bullet", &[], &BTreeMap::new()).expect("parsed");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, Status::Open);
     }
 
     #[test]
