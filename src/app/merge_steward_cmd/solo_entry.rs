@@ -24,15 +24,22 @@
 //! A *hold* engages on the first pass that sees an admission-ready solo pull
 //! request in the window: open, not a draft, authored by the fleet App from a
 //! branch of this repository, and either queued or one the steward would
-//! enqueue with an approved exact head. Once engaged it lasts while any such
-//! pull request is open on a solo branch, ready or not (the reconcile is
-//! rebuilt on the new base tip and reviewed again), and it ends when:
+//! enqueue with an approved exact head. The hold is for that one pull request.
+//! Once engaged it lasts while that pull request is open, ready or not (the
+//! reconcile is rebuilt on the new base tip and reviewed again), and it ends
+//! when:
 //!
-//! * that pull request merges or closes;
+//! * that pull request merges or closes, read from GitHub (a census that
+//!   misses it for one pass ends nothing). The next reconcile, even when it
+//!   is already open, starts its own attempt;
 //! * the hold has run `window_minutes` (the clock starts when the hold
-//!   engages, never when the window opens);
+//!   engages, never when the window opens). Past that with its entry still
+//!   in the merge queue the hold stays, so the backlog is not admitted into
+//!   its push, until the queue merges or removes it and for at most one more
+//!   `window_minutes`;
 //! * the solo head cannot be enqueued: it left the queue unmerged, the gate
-//!   admitted it on [`MAX_REFUSED_PASSES`] passes and the enqueue was refused,
+//!   admitted it on [`MAX_REFUSED_PASSES`] passes and the enqueue path
+//!   refused it by name (a central HOLD or a failed read is not a refusal),
 //!   or the steward removed its own entry [`MAX_OWN_DEQUEUES`] times;
 //! * the release state could not be read for more than
 //!   [`MAX_READ_FAILURES`] passes in a row (fail open). Up to that many
@@ -40,8 +47,9 @@
 //!
 //! A hold that ended on a head does not engage again for that head. A new
 //! head, or another solo pull request, starts the next attempt, at most
-//! [`MAX_ATTEMPTS`] per version. Every engage, release and expiry is in the
-//! repository report's `solo_entry` line.
+//! [`MAX_ATTEMPTS`] per version; an attempt that ends in a merge counts, so
+//! the attempts go to the first reconciles after a version bump. Every
+//! engage, release and expiry is in the repository report's `solo_entry` line.
 //!
 //! While a hold is engaged:
 //!
@@ -61,14 +69,17 @@
 //! * right after the enqueue, and on every pass while it is queued, the queue
 //!   is read again; when any entry is ahead of it, the steward dequeues only
 //!   its own solo entry ([`super::unapproved_admission::dequeue_under_guard`],
-//!   so the removal never counts as an ejection) and retries next pass. An
+//!   so the removal never counts as an ejection) and retries next pass. A
+//!   queued solo entry whose head is behind the base (another path enqueued
+//!   it) is removed the same way. An
 //!   entry behind it is reported as `solo_entry_shared_batch_risk` and never
 //!   touched: the steward never dequeues another pull request.
 //!
 //! Every mutation goes through the merge-queue mutation guard, so the central
 //! HOLD, the mutation machine and the pass budget all apply.
-//! `runner steward-admit-ready` skips a repository only while a hold is
-//! engaged, leaving it to the tick.
+//! `runner steward-admit-ready` never admits a solo pull request (only the
+//! tick runs the checks above), and skips the whole repository while a hold
+//! is engaged.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -96,6 +107,9 @@ pub(super) const MAX_READ_FAILURES: u32 = 3;
 pub(super) const MAX_REFUSED_PASSES: u32 = 3;
 /// The steward's own removals of its solo entry within one attempt.
 pub(super) const MAX_OWN_DEQUEUES: u32 = 3;
+/// How far one pass moves the deadline of a hold whose entry is still in the
+/// merge queue past its window (two ticks).
+const QUEUED_EXTENSION_MINUTES: i64 = 10;
 /// Audit action recorded when the steward disables an auto-merge request its
 /// own backstop armed.
 const DISARM_AUDIT: &str = "solo_entry_disarmed_own_arm";
@@ -161,6 +175,13 @@ impl Settings {
     /// Whether `repo` has a well-formed setting.
     pub(super) fn configured(&self, repo: &str) -> bool {
         matches!(self.for_repo(repo), Some(Ok(_)))
+    }
+
+    /// Whether `pr` can be `repo`'s solo pull request ([`candidate`]) under a
+    /// well-formed setting. `runner steward-admit-ready` leaves such a pull
+    /// request to the tick, which alone runs the solo checks.
+    pub(super) fn solo_candidate(&self, repo: &str, pr: &ObservedPr) -> bool {
+        matches!(self.for_repo(repo), Some(Ok(setting)) if candidate(&setting.branches, pr))
     }
 
     /// `repo`'s setting: `None` when it has none (today's behaviour).
@@ -657,6 +678,9 @@ pub(super) trait Reads {
     fn queue(&self) -> Result<BTreeMap<u64, u64>, String>;
     /// Whether `pr`'s head contains the current base tip.
     fn up_to_date(&self, pr: &ObservedPr) -> Result<bool, String>;
+    /// The state of pull request `number`, read from GitHub: `open`,
+    /// `closed` or `merged`.
+    fn pr_state(&self, number: u64) -> Result<String, String>;
     /// Remove `pr`'s own queue entry under the mutation guard.
     fn dequeue(&self, pr: &ObservedPr, ledger: &mut StewardLedger) -> Result<(), String>;
     /// Disable the auto-merge request the steward armed on `pr`, under the
@@ -734,6 +758,22 @@ impl Reads for GitHubReads<'_> {
         )
     }
 
+    fn pr_state(&self, number: u64) -> Result<String, String> {
+        self.actions
+            .run_gh(&[
+                "api".to_owned(),
+                format!("repos/{}/pulls/{number}", self.observation.repo),
+                "--jq".to_owned(),
+                r#"if .merged then "merged" else .state end"#.to_owned(),
+            ])
+            .map(|state| state.trim().to_owned())
+            .map_err(|error| error.to_string())
+            .and_then(|state| match state.as_str() {
+                "open" | "closed" | "merged" => Ok(state),
+                other => Err(format!("unexpected pull request state {other:?}")),
+            })
+    }
+
     fn dequeue(&self, pr: &ObservedPr, ledger: &mut StewardLedger) -> Result<(), String> {
         dequeue_with_context(&self.context()?, pr, ledger)
     }
@@ -746,6 +786,39 @@ impl Reads for GitHubReads<'_> {
             pr,
             "runner steward disable its own auto-merge arm during a solo-entry hold",
         )?;
+        // The census is minutes old: read the pull request again under the
+        // guard, and disable only a request still armed on the head the
+        // steward armed, with no queue entry.
+        let live = super::native_arm::read_queue_state(
+            self.actions,
+            &self.observation.repo,
+            pr.fact.number,
+        )
+        .and_then(|queue| {
+            let live = queue
+                .pointer("/data/repository/pullRequest")
+                .ok_or_else(|| "pull request not in the response".to_owned())?;
+            let head = live.get("headRefOid").and_then(serde_json::Value::as_str);
+            let armed = live
+                .get("autoMergeRequest")
+                .is_some_and(|request| !request.is_null());
+            let queued = live.get("isInMergeQueue") != Some(&serde_json::Value::Bool(false));
+            if head != Some(pr.fact.head_sha.as_str()) {
+                Err("its head moved since the census".to_owned())
+            } else if !armed {
+                Err("it is no longer armed".to_owned())
+            } else if queued {
+                Err("it is in the merge queue now".to_owned())
+            } else {
+                Ok(())
+            }
+        });
+        if let Err(reason) = live {
+            let audit = guard.finish("solo_entry_disarm_skipped").err();
+            return Err(audit.map_or(format!("left alone: {reason}"), |audit| {
+                format!("left alone: {reason}; mutation audit also failed: {audit}")
+            }));
+        }
         match super::exact_head_merge::disarm_under_guard(&context, pr, ledger, DISARM_AUDIT) {
             Ok(()) => guard.finish("solo_entry_disarmed_own_arm"),
             Err(error) => {
@@ -899,9 +972,9 @@ fn pass(
         _ => Window::new(&version, now),
     };
     window.read_failures = read_failures;
-    // Solo pull requests a hold can still be for: a head a hold already let
-    // go of is not one.
-    let pending_prs = observation
+    // Solo pull requests a hold can be for: a head a hold already let go of
+    // is not one.
+    let candidates = observation
         .prs
         .iter()
         .filter(|pr| {
@@ -909,31 +982,46 @@ fn pass(
                 && !window.is_released(pr.fact.number, &pr.fact.head_sha)
         })
         .collect::<Vec<_>>();
+    let mut events = String::new();
+    let mut note = String::new();
     let mut attempt = window.attempt.take();
-    if let Some(engaged) = attempt.as_ref() {
+    if let Some(engaged) = attempt.as_mut() {
+        let listed = observation
+            .prs
+            .iter()
+            .find(|pr| pr.fact.number == engaged.solo);
+        let same_head = listed.filter(|pr| pr.fact.head_sha == engaged.head);
         if attempt_expired(engaged, now) {
-            window
-                .released
-                .insert(released_key(engaged.solo, &engaged.head));
-            return (
-                inactive(&format!(
-                    "RELEASE WINDOW EXPIRED for {version}: the hold for #{} ran its {} min \
-                     (attempt {} of {MAX_ATTEMPTS}); normal admission resumes{read_note}",
-                    engaged.solo, setting.window_minutes, window.attempts
-                )),
-                Some(window),
-            );
+            // Past the deadline with its entry in the merge queue: letting go
+            // now would admit the backlog behind it, into its push. The queue
+            // decides (it merges, or the queue removes it), and the hold
+            // waits for that, for at most one more `window_minutes`.
+            let hard_stop =
+                engaged.engaged_at + ChronoDuration::minutes(2 * setting.window_minutes);
+            let queued = same_head.is_some_and(|pr| pr.fact.queue_position.is_some());
+            if queued && now >= engaged.engaged_at && now < hard_stop {
+                engaged.deadline =
+                    (now + ChronoDuration::minutes(QUEUED_EXTENSION_MINUTES)).min(hard_stop);
+                "; past its window, HOLD EXTENDED while its entry is in the merge queue"
+                    .clone_into(&mut events);
+            } else {
+                window
+                    .released
+                    .insert(released_key(engaged.solo, &engaged.head));
+                return (
+                    inactive(&format!(
+                        "RELEASE WINDOW EXPIRED for {version}: the hold for #{} ran its {} min \
+                         (attempt {} of {MAX_ATTEMPTS}); normal admission resumes{read_note}",
+                        engaged.solo, setting.window_minutes, window.attempts
+                    )),
+                    Some(window),
+                );
+            }
         }
         // Seen queued, and now open at the same head with no queue entry:
         // the queue removed it. The same head is not enqueued again, so
         // holding for it would freeze the repository for nothing.
-        if engaged.queued
-            && pending_prs.iter().any(|pr| {
-                pr.fact.number == engaged.solo
-                    && pr.fact.head_sha == engaged.head
-                    && pr.fact.queue_position.is_none()
-            })
-        {
+        if engaged.queued && same_head.is_some_and(|pr| pr.fact.queue_position.is_none()) {
             window
                 .released
                 .insert(released_key(engaged.solo, &engaged.head));
@@ -947,56 +1035,101 @@ fn pass(
                 Some(window),
             );
         }
+        match listed {
+            // Not among the open pull requests: the attempt ends when GitHub
+            // says it merged or closed, whether or not the next reconcile is
+            // already open (that one starts its own attempt). A census that
+            // only missed it keeps the hold.
+            None => match reads.pr_state(engaged.solo) {
+                Ok(state) if state != "open" => {
+                    return (
+                        inactive(&format!(
+                            "HOLD RELEASED for {version}: #{} {state}; normal admission{read_note}",
+                            engaged.solo
+                        )),
+                        Some(window),
+                    );
+                }
+                Ok(_) => {
+                    note = format!(
+                        "; #{} is open but not in this pass's census, hold kept",
+                        engaged.solo
+                    );
+                }
+                Err(error) => {
+                    note = format!(
+                        "; #{} is not in this pass's census and its state is unreadable \
+                         ({error}), hold kept",
+                        engaged.solo
+                    );
+                }
+            },
+            Some(pr)
+                if !candidates
+                    .iter()
+                    .any(|other| other.fact.number == pr.fact.number) =>
+            {
+                return (
+                    inactive(&format!(
+                        "HOLD RELEASED for {version}: #{} is no longer a solo pull request (a \
+                         draft, or back at a head already let go); normal admission{read_note}",
+                        engaged.solo
+                    )),
+                    Some(window),
+                );
+            }
+            Some(_) => {}
+        }
     }
-    let engaged_solo = attempt.as_ref().map(|engaged| engaged.solo);
-    let ready_solo = {
-        let ledger = &*ledger;
-        pending_prs
+    let is_ready = |pr: &ObservedPr, ledger: &StewardLedger| {
+        let decision = classify_pr(
+            &pr.fact,
+            input.policy,
+            &attempts_for(ledger, repo, &pr.fact),
+        );
+        ready(pr, &decision, &|pr| reads.approved(pr, ledger))
+    };
+    // The hold is for one pull request. Another one on a solo branch is held
+    // like any other row until this attempt ends.
+    let (mut attempt, solo, solo_ready) = if let Some(engaged) = attempt {
+        let solo = candidates
             .iter()
             .copied()
-            .filter(|pr| {
-                let decision = classify_pr(
-                    &pr.fact,
-                    input.policy,
-                    &attempts_for(ledger, repo, &pr.fact),
-                );
-                ready(pr, &decision, &|pr| reads.approved(pr, ledger))
-                    // The head repository of a pull request never changes, so
-                    // the one the hold is already for is not read again. An
-                    // unreadable one is not a solo pull request.
-                    && (engaged_solo == Some(pr.fact.number)
-                        || reads.same_repo(pr).unwrap_or(false))
-            })
-            .min_by_key(|pr| pr.fact.number)
-    };
-    let mut events = String::new();
-    let mut attempt = match (attempt.take(), ready_solo) {
-        (Some(engaged), _) => engaged,
-        (None, None) => {
+            .find(|pr| pr.fact.number == engaged.solo);
+        let solo_ready = solo.is_some_and(|pr| is_ready(pr, ledger));
+        (engaged, solo, solo_ready)
+    } else {
+        // An unreadable head repository is not a solo pull request.
+        let ready_solo = candidates
+            .iter()
+            .copied()
+            .filter(|pr| is_ready(pr, ledger) && reads.same_repo(pr).unwrap_or(false))
+            .min_by_key(|pr| pr.fact.number);
+        let Some(solo) = ready_solo else {
             return (
                 inactive(&format!(
-                    "release window for {version} open, but no admission-ready pull request on \
-                     {branches}; normal admission{read_note}"
+                    "release window for {version} open, but no admission-ready pull request \
+                         on {branches}; normal admission{read_note}"
                 )),
                 Some(window),
             );
-        }
-        (None, Some(solo)) if window.attempts >= MAX_ATTEMPTS => {
+        };
+        if window.attempts >= MAX_ATTEMPTS {
             return (
                 inactive(&format!(
-                    "all {MAX_ATTEMPTS} hold attempts for {version} are spent; #{} is admitted as \
-                     any other pull request{read_note}",
+                    "all {MAX_ATTEMPTS} hold attempts for {version} are spent; #{} is \
+                         admitted as any other pull request{read_note}",
                     solo.fact.number
                 )),
                 Some(window),
             );
         }
-        (None, Some(solo)) => {
-            window.attempts += 1;
-            events = format!(
-                "; HOLD ENGAGED (attempt {} of {MAX_ATTEMPTS}, at most {} min)",
-                window.attempts, setting.window_minutes
-            );
+        window.attempts += 1;
+        events = format!(
+            "; HOLD ENGAGED (attempt {} of {MAX_ATTEMPTS}, at most {} min)",
+            window.attempts, setting.window_minutes
+        );
+        (
             Attempt {
                 solo: solo.fact.number,
                 head: solo.fact.head_sha.clone(),
@@ -1005,41 +1138,28 @@ fn pass(
                 refused: 0,
                 queued: false,
                 own_dequeues: 0,
-            }
-        }
+            },
+            Some(solo),
+            true,
+        )
     };
-    // The solo pull request this pass: the ready one, else the one the hold
-    // is for, else the lowest open one.
-    let Some(solo) = ready_solo.or_else(|| {
-        pending_prs
-            .iter()
-            .copied()
-            .find(|pr| pr.fact.number == attempt.solo)
-            .or_else(|| pending_prs.iter().copied().min_by_key(|pr| pr.fact.number))
-    }) else {
-        return (
-            inactive(&format!(
-                "HOLD RELEASED for {version}: no pending pull request on {branches} (merged, \
-                 closed or already let go); normal admission{read_note}"
-            )),
-            Some(window),
-        );
-    };
-    let number = solo.fact.number;
-    // Rebuilt, or replaced by another solo pull request that is ready (so its
-    // head repository was read): the hold follows it, on the same clock.
-    let follows = attempt.solo == number || ready_solo.is_some();
-    if follows && (attempt.solo != number || attempt.head != solo.fact.head_sha) {
-        attempt.solo = number;
+    let number = attempt.solo;
+    if let Some(solo) = solo
+        && attempt.head != solo.fact.head_sha
+    {
+        // Rebuilt: the hold follows the new head, on the same clock. The new
+        // head was never queued and never refused.
         attempt.head.clone_from(&solo.fact.head_sha);
         attempt.refused = 0;
         attempt.queued = false;
     }
-    let mut note = String::new();
     let mut phase = Phase::NotReady;
-    if ready_solo.is_some() {
+    if let Some(solo) = solo.filter(|_| solo_ready) {
         let positions = reads.queue();
+        let total = positions.as_ref().map_or(0, BTreeMap::len);
         phase = self::phase(number, positions.as_ref());
+        // Why the solo entry must leave the queue, when it must.
+        let mut leave = None;
         match phase {
             Phase::Admit => match reads.up_to_date(solo) {
                 Ok(true) => {}
@@ -1054,6 +1174,16 @@ fn pass(
             }
             Phase::Queued => {
                 attempt.queued = true;
+                // An entry the tick's own admission did not create (a ready
+                // event, a person, a native arm) may be stale: compare it.
+                match reads.up_to_date(solo) {
+                    Ok(false) => {
+                        phase = Phase::Stale;
+                        leave = Some("behind the base tip".to_owned());
+                    }
+                    Ok(true) => {}
+                    Err(error) => note = format!("; base comparison unreadable ({error})"),
+                }
                 let behind = positions
                     .as_ref()
                     .map(|positions| {
@@ -1064,8 +1194,9 @@ fn pass(
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
-                if !behind.is_empty() {
-                    note = format!(
+                if phase == Phase::Queued && !behind.is_empty() {
+                    let _ = write!(
+                        note,
                         "; solo_entry_shared_batch_risk: {} queued behind it and may merge in \
                          its push (not the steward's entry, left alone)",
                         behind.join(", ")
@@ -1074,39 +1205,40 @@ fn pass(
             }
             Phase::Behind { ahead } => {
                 attempt.queued = true;
-                let total = positions.as_ref().map_or(0, BTreeMap::len);
-                if !input.apply {
-                    note = format!("; would dequeue its own entry ({ahead} ahead)");
-                } else if attempt.own_dequeues >= MAX_OWN_DEQUEUES {
-                    window.released.insert(released_key(number, &attempt.head));
-                    return (
-                        inactive(&format!(
-                            "HOLD RELEASED for {version}: #{number} was queued behind another \
-                             entry after {MAX_OWN_DEQUEUES} own dequeues; its entry is left in \
-                             the queue; normal admission{read_note}"
-                        )),
-                        Some(window),
-                    );
-                } else if super::pass_budget::deadline_passed(input.deadline) {
-                    "; its own dequeue deferred: the pass time budget is spent"
-                        .clone_into(&mut note);
-                } else {
-                    match reads.dequeue(solo, ledger) {
-                        Ok(()) => {
-                            attempt.own_dequeues += 1;
-                            attempt.queued = false;
-                            note = format!(
-                                "; dequeued its own entry ({ahead} ahead), retry next pass"
-                            );
+                leave = Some(format!("{ahead} ahead"));
+            }
+            Phase::NotReady | Phase::Waiting { .. } | Phase::Stale | Phase::BaseUnreadable => {}
+        }
+        if let Some(why) = leave {
+            if !input.apply {
+                note = format!("; would dequeue its own entry ({why})");
+            } else if attempt.own_dequeues >= MAX_OWN_DEQUEUES {
+                window.released.insert(released_key(number, &attempt.head));
+                return (
+                    inactive(&format!(
+                        "HOLD RELEASED for {version}: #{number} is queued {why} after \
+                         {MAX_OWN_DEQUEUES} own dequeues; its entry is left in the queue; normal \
+                         admission{read_note}"
+                    )),
+                    Some(window),
+                );
+            } else if super::pass_budget::deadline_passed(input.deadline) {
+                "; its own dequeue deferred: the pass time budget is spent".clone_into(&mut note);
+            } else {
+                match reads.dequeue(solo, ledger) {
+                    Ok(()) => {
+                        attempt.own_dequeues += 1;
+                        attempt.queued = false;
+                        note = format!("; dequeued its own entry ({why}), retry next pass");
+                        if matches!(phase, Phase::Behind { .. }) {
                             phase = Phase::Waiting {
                                 ahead: total.saturating_sub(1),
                             };
                         }
-                        Err(error) => note = format!("; its own dequeue failed: {error}"),
                     }
+                    Err(error) => note = format!("; its own dequeue failed: {error}"),
                 }
             }
-            Phase::NotReady | Phase::Waiting { .. } | Phase::Stale | Phase::BaseUnreadable => {}
         }
     }
     note.push_str(&disarm_own_arms(reads, input, number, ledger));
@@ -1130,7 +1262,7 @@ fn pass(
     let line = format!(
         "solo entry: #{number} ({}) holds admission for {repo} for the {version} release (attempt \
          {} of {MAX_ATTEMPTS}, {} min of hold left): {state}{note}{events}{read_note}",
-        solo.fact.head_branch,
+        solo.map_or(branches.as_str(), |solo| solo.fact.head_branch.as_str()),
         window.attempts,
         (attempt.deadline - now).num_minutes()
     );
@@ -1191,6 +1323,15 @@ fn disarm_own_arms(
         } else {
             match reads.disarm(pr, ledger) {
                 Ok(()) => {
+                    // No longer the steward's arm: a request anyone arms on
+                    // this head later is theirs. The backstop's own re-arm
+                    // records it again.
+                    if let Some(arms) = ledger.solo_entry_native_arms.get_mut(&key) {
+                        arms.remove(&number);
+                        if arms.is_empty() {
+                            ledger.solo_entry_native_arms.remove(&key);
+                        }
+                    }
                     let _ = write!(
                         note,
                         "; disabled the auto-merge the steward armed on #{number} for the hold"
@@ -1249,8 +1390,10 @@ pub(super) fn record_native_arms(
 /// [`MAX_REFUSED_PASSES`] such passes the hold lets go of that head: a head
 /// the enqueue path refuses (ejected and unchanged, carried commits, a
 /// code-owner wait, a defect-fix block) would otherwise hold every other
-/// pull request until the hold expired. A deferral, a failed read, and the
-/// guarded re-read's own wait are not refusals.
+/// pull request until the hold expired. Only a refusal the enqueue path names
+/// with a token counts: a deferral, the guarded re-read's own wait, and a row
+/// with no token (a central HOLD, the wrong mutation machine, a failed read)
+/// are not refusals.
 pub(super) fn settle(
     gate: &Gate,
     observation: &RepoObservation,
@@ -1290,11 +1433,10 @@ pub(super) fn settle(
                 .split(',')
                 .any(|part| part.starts_with("solo_entry_"))
         })
-        || (mutation.is_none()
-            && report
-                .error
-                .as_deref()
-                .is_none_or(|error| super::classify_pr_error(error) == super::ErrorKind::Read));
+        // No token: nothing judged this head. A central HOLD, the wrong
+        // mutation machine and a failed read all end here; only a refusal
+        // the enqueue path names counts.
+        || mutation.is_none();
     let key = window_key(&observation.repo, &observation.base);
     let Some(window) = ledger.solo_entry_windows.get_mut(&key) else {
         return Some(line);
@@ -1310,10 +1452,7 @@ pub(super) fn settle(
         attempt.refused = 0;
     } else if !waited {
         attempt.refused += 1;
-        let why = mutation
-            .or(report.error.as_deref())
-            .unwrap_or("no enqueue")
-            .to_owned();
+        let why = mutation.unwrap_or_default().to_owned();
         if attempt.refused >= MAX_REFUSED_PASSES {
             let released = released_key(attempt.solo, &attempt.head);
             window.released.insert(released);

@@ -621,6 +621,36 @@ fn an_engaged_solo_entry_hold_leaves_the_head_to_the_tick() {
     }
 }
 
+/// Re-review A: the approval that makes a reconcile ready reaches this path
+/// before any tick has engaged a hold, and this path runs none of the solo
+/// checks. A solo-entry pull request is left to the tick, with no window or
+/// hold on record yet; any other pull request of the repository is admitted.
+#[test]
+fn a_solo_entry_candidate_is_left_to_the_tick_before_any_hold_engages() {
+    const SOLO_BRANCH: &str = "automation/pulp-observatory-coalesced";
+    for (branch, skipped) in [(SOLO_BRANCH, true), ("feature", false)] {
+        let harness = Harness::new(&Fixture::approved());
+        let config = harness.control.global_dir.join("config.toml");
+        let text = format!(
+            "{}\n[merge_steward.solo_entry.\"owner/repo\"]\nbranches = [\"{SOLO_BRANCH}\"]\n\
+             version_file = \"CMakeLists.txt\"\n",
+            fs::read_to_string(&config).expect("config")
+        );
+        fs::write(&config, text).expect("config");
+        let mut observation = observed(HEAD);
+        branch.clone_into(&mut observation.prs[0].fact.head_branch);
+        for apply in [false, true] {
+            let outcome = harness.admit_at(HEAD, &observation, apply, Utc::now());
+            assert_eq!(
+                outcome.reason == "solo_entry_candidate",
+                skipped,
+                "{branch} apply={apply}: {outcome:?}"
+            );
+        }
+        assert_eq!(harness.enqueues(), usize::from(!skipped), "{branch}");
+    }
+}
+
 /// The tick sweeps the flake breaker before it admits; this path does not.
 /// Pull request 41 was flake re-enqueued and may have been ejected again on
 /// its signature, unswept: an event for pull request 42, which has no receipt

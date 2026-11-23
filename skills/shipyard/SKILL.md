@@ -4565,8 +4565,10 @@ optional `tag_prefix` and `window_minutes`, default 120) names head branches
 whose pull request must merge alone while the base's version is unreleased
 (untagged, or its GitHub release missing or a draft). A hold engages when such
 a pull request (opened by the fleet App, from this repository) is ready, and
-continues while it is open, for at most `window_minutes` from the engage and 3
-attempts per version. During it every other row reports `held_solo_entry:#<n>`
+continues until it merges or closes, for at most `window_minutes` from the
+engage (longer only while its entry is in the merge queue) and 3 attempts per
+version, which go to the first 3 reconciles after a bump. Only the tick
+enqueues it: `steward-admit-ready` reports `solo_entry_candidate`. During it every other row reports `held_solo_entry:#<n>`
 (`held_for_solo_attempt:#<n>` while the solo pull request is being rebuilt or
 reviewed), the backstop arms nothing and the steward disables auto-merge
 requests it armed itself. The solo pull request is enqueued only into an empty

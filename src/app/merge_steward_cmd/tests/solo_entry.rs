@@ -77,6 +77,7 @@ struct FakeReads {
     approved: bool,
     same_repo: Result<bool, String>,
     up_to_date: Result<bool, String>,
+    state: Result<String, String>,
     queue: Result<BTreeMap<u64, u64>, String>,
     calls: RefCell<Vec<String>>,
     dequeued: RefCell<Vec<u64>>,
@@ -90,6 +91,7 @@ impl FakeReads {
             approved: true,
             same_repo: Ok(true),
             up_to_date: Ok(true),
+            state: Ok("merged".to_owned()),
             queue: Ok(queue.iter().copied().collect()),
             calls: RefCell::default(),
             dequeued: RefCell::default(),
@@ -122,6 +124,10 @@ impl Reads for FakeReads {
     fn up_to_date(&self, _pr: &ObservedPr) -> Result<bool, String> {
         self.calls.borrow_mut().push("compare".to_owned());
         self.up_to_date.clone()
+    }
+    fn pr_state(&self, number: u64) -> Result<String, String> {
+        self.calls.borrow_mut().push(format!("state:{number}"));
+        self.state.clone()
     }
     fn dequeue(&self, pr: &ObservedPr, _ledger: &mut StewardLedger) -> Result<(), String> {
         self.dequeued.borrow_mut().push(pr.fact.number);
@@ -816,10 +822,11 @@ fn once_engaged_the_hold_continues_while_the_solo_pr_is_rebuilt() {
     ));
 }
 
-/// A hold that passes to another solo pull request still reads that one's
-/// head repository before it can be admitted.
+/// Re-review D: the hold ends when its solo pull request merges, even when
+/// the next reconcile is already open. That one starts its own attempt, with
+/// its own head-repository read, under the attempt cap.
 #[test]
-fn a_hold_that_follows_another_solo_pr_still_checks_its_head_repository() {
+fn the_hold_ends_on_the_merge_and_the_next_reconcile_is_a_new_attempt() {
     let mut reads = FakeReads::release(&[]);
     let mut ledger = StewardLedger::default();
     assert!(is_hold(&run(
@@ -829,27 +836,440 @@ fn a_hold_that_follows_another_solo_pr_still_checks_its_head_repository() {
         &mut ledger,
         now()
     )));
-    // #7 closed; #8 is open on the solo branch and not approved yet.
-    let other = observation_with(vec![
+    // #7 merged, and the next reconcile #8 opened before this pass.
+    let next = observation_with(vec![
         product_pr(),
         pr(8, SOLO_BRANCH, false, "SUCCESS", &[]),
     ]);
     reads.approved = false;
-    let gate = run(&settings(), &other, &reads, &mut ledger, now());
-    assert_eq!(
-        gate.enqueue_hold(8).as_deref(),
-        Some("solo_entry_waiting:not_ready")
+    reads.calls.borrow_mut().clear();
+    let gate = run(&settings(), &next, &reads, &mut ledger, now() + minutes(7));
+    assert_free(&gate);
+    let line = gate.line().expect("line");
+    assert!(
+        line.contains("HOLD RELEASED") && line.contains("#7 merged"),
+        "{line}"
     );
-    // Approved, but its branch is a fork's: never admitted alone.
+    assert!(reads.calls.borrow().contains(&"state:7".to_owned()));
+    assert!(window(&ledger).attempt.is_none());
+
+    // #8 engages its own attempt once ready, and only from this repository.
     reads.approved = true;
     reads.same_repo = Ok(false);
-    reads.calls.borrow_mut().clear();
-    let gate = run(&settings(), &other, &reads, &mut ledger, now());
-    assert!(reads.calls.borrow().contains(&"same_repo:8".to_owned()));
-    assert_eq!(
-        gate.enqueue_hold(8).as_deref(),
-        Some("solo_entry_waiting:not_ready"),
+    assert_free(&run(
+        &settings(),
+        &next,
+        &reads,
+        &mut ledger,
+        now() + minutes(12),
+    ));
+    reads.same_repo = Ok(true);
+    let gate = run(&settings(), &next, &reads, &mut ledger, now() + minutes(17));
+    assert!(matches!(gate, Gate::Hold { solo: 8, .. }), "{gate:?}");
+    assert_eq!(window(&ledger).attempts, 2);
+    assert_eq!(attempt(&ledger).engaged_at, now() + minutes(17));
+}
+
+/// A census that misses the solo pull request for one pass does not end the
+/// hold: GitHub still says it is open. Neither does an unreadable state.
+#[test]
+fn a_census_that_misses_the_solo_pr_keeps_the_hold() {
+    let mut reads = FakeReads::release(&[]);
+    let mut ledger = StewardLedger::default();
+    assert!(is_hold(&run(
+        &settings(),
+        &both(),
+        &reads,
+        &mut ledger,
+        now()
+    )));
+    let missing = observation_with(vec![
+        product_pr(),
+        // Another pull request on the solo branch does not take the hold over.
+        pr(8, SOLO_BRANCH, false, "SUCCESS", &[]),
+    ]);
+    for state in [Ok("open".to_owned()), Err("HTTP 502".to_owned())] {
+        reads.state = state;
+        let gate = run(
+            &settings(),
+            &missing,
+            &reads,
+            &mut ledger,
+            now() + minutes(5),
+        );
+        assert!(
+            matches!(
+                gate,
+                Gate::Hold {
+                    solo: SOLO,
+                    phase: Phase::NotReady,
+                    ..
+                }
+            ),
+            "{gate:?}"
+        );
+        assert_eq!(
+            gate.enqueue_hold(PRODUCT).as_deref(),
+            Some("held_for_solo_attempt:#7")
+        );
+        assert_eq!(
+            gate.enqueue_hold(8).as_deref(),
+            Some("held_for_solo_attempt:#7")
+        );
+        assert!(gate.line().unwrap().contains("hold kept"), "{gate:?}");
+    }
+    assert_eq!(window(&ledger).attempts, 1);
+}
+
+/// Re-review C: an entry the tick's own admission did not create (a ready
+/// event, a person, a native arm) may be stale. A queued solo entry is
+/// compared with the base, and a stale one is the steward's own to remove.
+#[test]
+fn a_queued_solo_entry_behind_the_base_removes_itself() {
+    let observation = observation_with(vec![
+        product_pr(),
+        pr(SOLO, SOLO_BRANCH, false, "SUCCESS", &[(SOLO, 1)]),
+    ]);
+    let mut reads = FakeReads::release(&[(SOLO, 1)]);
+    reads.up_to_date = Ok(false);
+    let mut ledger = StewardLedger::default();
+    let gate = run(&settings(), &observation, &reads, &mut ledger, now());
+    assert_eq!(*reads.dequeued.borrow(), vec![SOLO]);
+    assert!(
+        matches!(
+            gate,
+            Gate::Hold {
+                phase: Phase::Stale,
+                ..
+            }
+        ),
         "{gate:?}"
+    );
+    assert_eq!(
+        gate.enqueue_hold(SOLO).as_deref(),
+        Some("solo_entry_waiting:behind_base")
+    );
+    assert_eq!(
+        gate.enqueue_hold(PRODUCT).as_deref(),
+        Some("held_solo_entry:#7")
+    );
+    let line = gate.line().expect("line");
+    assert!(
+        line.contains("dequeued its own entry (behind the base tip)"),
+        "{line}"
+    );
+    assert_eq!(attempt(&ledger).own_dequeues, 1);
+    assert!(
+        !attempt(&ledger).queued,
+        "its own removal is not an ejection"
+    );
+
+    // A comparison that cannot be read removes nothing.
+    let mut unread = FakeReads::release(&[(SOLO, 1)]);
+    unread.up_to_date = Err("HTTP 502".to_owned());
+    let gate = run(
+        &settings(),
+        &observation,
+        &unread,
+        &mut StewardLedger::default(),
+        now(),
+    );
+    assert!(
+        matches!(
+            gate,
+            Gate::Hold {
+                phase: Phase::Queued,
+                ..
+            }
+        ),
+        "{gate:?}"
+    );
+    assert!(unread.dequeued.borrow().is_empty());
+}
+
+/// Re-review F: past its window with the solo entry still in the merge
+/// queue, the hold stays (letting go would admit the backlog into its push)
+/// until the queue decides, for at most one more `window_minutes`.
+#[test]
+fn a_hold_past_its_window_stays_while_the_solo_entry_is_queued() {
+    let queued = observation_with(vec![
+        product_pr(),
+        pr(SOLO, SOLO_BRANCH, false, "SUCCESS", &[(SOLO, 1)]),
+    ]);
+    let reads = FakeReads::release(&[(SOLO, 1)]);
+    let mut ledger = StewardLedger::default();
+    assert!(is_hold(&run(
+        &settings(),
+        &queued,
+        &reads,
+        &mut ledger,
+        now()
+    )));
+    let past = now() + minutes(125);
+    let gate = run(&settings(), &queued, &reads, &mut ledger, past);
+    assert_eq!(
+        gate.enqueue_hold(PRODUCT).as_deref(),
+        Some("held_solo_entry:#7"),
+        "{gate:?}"
+    );
+    assert!(gate.line().unwrap().contains("HOLD EXTENDED"), "{gate:?}");
+    // The ledger says so too, so `steward-admit-ready` keeps skipping.
+    assert!(hold_engaged(&ledger, "owner/repo", "main", past));
+    assert!(hold_engaged(
+        &ledger,
+        "owner/repo",
+        "main",
+        past + minutes(5)
+    ));
+
+    // The same moment with the solo not queued: the hold expires.
+    let mut idle = StewardLedger::default();
+    let waiting = FakeReads::release(&[(99, 1)]);
+    assert!(is_hold(&run(
+        &settings(),
+        &both(),
+        &waiting,
+        &mut idle,
+        now()
+    )));
+    let gate = run(&settings(), &both(), &waiting, &mut idle, past);
+    assert_free(&gate);
+    assert!(gate.line().unwrap().contains("EXPIRED"), "{gate:?}");
+
+    // The extension is bounded: at twice the window it expires even queued.
+    let gate = run(
+        &settings(),
+        &queued,
+        &reads,
+        &mut ledger,
+        now() + minutes(240),
+    );
+    assert_free(&gate);
+    assert!(gate.line().unwrap().contains("EXPIRED"), "{gate:?}");
+    // A clock that moved back still ends it, queued or not.
+    let mut back = StewardLedger::default();
+    assert!(is_hold(&run(
+        &settings(),
+        &queued,
+        &reads,
+        &mut back,
+        now()
+    )));
+    assert_free(&run(
+        &settings(),
+        &queued,
+        &reads,
+        &mut back,
+        now() - minutes(1),
+    ));
+}
+
+/// A head pushed while the solo entry is queued takes the entry out of the
+/// queue. That is a rebuild, not "the queue removed it": the hold stays on
+/// the new head, on that pass and on the next.
+#[test]
+fn a_head_pushed_while_the_solo_entry_is_queued_keeps_the_hold() {
+    let queued = observation_with(vec![
+        product_pr(),
+        pr(SOLO, SOLO_BRANCH, false, "SUCCESS", &[(SOLO, 1)]),
+    ]);
+    let mut ledger = StewardLedger::default();
+    assert!(is_hold(&run(
+        &settings(),
+        &queued,
+        &FakeReads::release(&[(SOLO, 1)]),
+        &mut ledger,
+        now(),
+    )));
+    assert!(attempt(&ledger).queued);
+
+    let pushed = observation_with(vec![product_pr(), rebuilt(solo_pr(), "b")]);
+    let mut reads = FakeReads::release(&[]);
+    reads.approved = false;
+    for pass in 1..=2 {
+        let gate = run(
+            &settings(),
+            &pushed,
+            &reads,
+            &mut ledger,
+            now() + minutes(5 * pass),
+        );
+        assert_eq!(
+            gate.enqueue_hold(PRODUCT).as_deref(),
+            Some("held_for_solo_attempt:#7"),
+            "pass {pass}: {gate:?}"
+        );
+        assert_eq!(attempt(&ledger).head, "b".repeat(40));
+        assert!(!attempt(&ledger).queued, "the new head was never queued");
+    }
+    assert!(window(&ledger).released.is_empty());
+}
+
+/// Mutant "the real disarm sends nothing", and re-review E's live re-read:
+/// the disarm against GitHub reads the pull request again under the guard
+/// and disables only a request still armed on the same head, not queued.
+#[cfg(unix)]
+#[test]
+fn the_real_disarm_rereads_the_pull_request_and_disables_only_its_own_arm() {
+    use crate::app::merge_steward_cmd::solo_entry::GitHubReads;
+    let product = product_pr();
+    let head = product.fact.head_sha.clone();
+    let observation = observation_with(vec![product.clone(), solo_pr()]);
+    let disarm = |live_head: &str, request: &str, in_queue: bool| {
+        let temp = tempfile::tempdir().expect("temp");
+        let log = temp.path().join("calls");
+        let actions = fake_gh(
+            &temp,
+            &format!(
+                r#"printf '%s\n' "$*" >> '{log}'
+case "$*" in
+  *"disablePullRequestAutoMerge"*) printf '%s' '{{"data":{{"disablePullRequestAutoMerge":{{"pullRequest":{{"number":{PRODUCT},"autoMergeRequest":null}}}}}}}}' ;;
+  *"isInMergeQueue"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"number":{PRODUCT},"state":"OPEN","headRefOid":"{live_head}","isInMergeQueue":{in_queue},"mergeQueueEntry":null,"autoMergeRequest":{request},"timelineItems":{{"pageInfo":{{"hasPreviousPage":false}},"nodes":[]}}}}}}}}}}' ;;
+  *) printf '%s' '{{}}' ;;
+esac"#,
+                log = log.display(),
+            ),
+        );
+        let control = mutation_control(&temp, "studio", "studio");
+        let ledger_path = temp.path().join("ledger.json");
+        let reads = GitHubReads {
+            actions: &actions,
+            observation: &observation,
+            control: Some(&control),
+            ledger_path: &ledger_path,
+        };
+        let outcome = reads.disarm(&product, &mut StewardLedger::default());
+        (outcome, fs::read_to_string(log).unwrap_or_default())
+    };
+    let armed = r#"{"enabledAt":"2026-11-23T00:00:00Z"}"#;
+
+    let (outcome, calls) = disarm(&head, armed, false);
+    assert_eq!(outcome, Ok(()), "{calls}");
+    let sent = calls
+        .lines()
+        .filter(|line| line.contains("disablePullRequestAutoMerge"))
+        .collect::<Vec<_>>();
+    assert_eq!(sent.len(), 1, "{calls}");
+    assert!(sent[0].contains("id=PR_node_42"), "{calls}");
+
+    for (live_head, request, in_queue, why) in [
+        ("e".repeat(40), armed, false, "head moved"),
+        (head.clone(), "null", false, "no longer armed"),
+        (head.clone(), armed, true, "in the merge queue"),
+    ] {
+        let (outcome, calls) = disarm(&live_head, request, in_queue);
+        assert!(
+            outcome.as_ref().is_err_and(|error| error.contains(why)),
+            "{outcome:?}"
+        );
+        assert_eq!(count(&calls, "disablePullRequestAutoMerge"), 0, "{calls}");
+    }
+}
+
+/// Mutant "the tick never counts refused passes" (`cancellation.rs`): an
+/// applying tick whose gate admits the solo head and whose enqueue path
+/// refuses it with a named token counts the pass in the ledger and says so.
+#[cfg(unix)]
+#[test]
+fn a_tick_counts_a_pass_that_admitted_the_solo_head_and_did_not_enqueue_it() {
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = fake_gh(
+        &temp,
+        &format!(
+            r#"
+case "$*" in
+  *"contents/CMakeLists.txt?ref=main"*) printf '%s\n' 'project(Vellum VERSION 0.2.2)' ;;
+  *"git/matching-refs/tags/v"*) printf '%s\n' 'refs/tags/v0.2.1' ;;
+  *"pulls/7 --jq .head.repo.full_name"*) printf '%s\n' 'owner/repo' ;;
+  *"/compare/main..."*"behind_by"*) echo 0 ;;
+  *"mergeQueue"*) {queue} ;;
+  *enqueuePullRequest*|*enablePullRequestAutoMerge*|*dequeuePullRequest*|*disablePullRequestAutoMerge*) echo "no mutation is allowed: $*" >&2; exit 90 ;;
+  *) printf '%s' '{{}}' ;;
+esac
+"#,
+            queue = queue_answer(""),
+        ),
+    );
+    let observation = observation_with(vec![solo_pr()]);
+    let control = mutation_control(&temp, "studio", "studio");
+    let mut ledger = StewardLedger::default();
+
+    let (report, _, _) = apply_repo_plan(
+        &actions,
+        &tick_args(false),
+        &observation,
+        &temp.path().join("ledger.json"),
+        &mut ledger,
+        0,
+        Some(&control),
+        None,
+    );
+
+    let row = &report.prs[0];
+    let token = row.mutation.clone().expect("a named refusal token");
+    assert!(
+        !token.contains("enqueued") && !token.starts_with("solo_entry_"),
+        "{row:?}"
+    );
+    assert_eq!(attempt(&ledger).refused, 1, "{report:?}");
+    let line = report.solo_entry.expect("solo_entry line");
+    assert!(
+        line.contains("admitted and not enqueued") && line.contains("pass 1 of 3"),
+        "{line}"
+    );
+}
+
+/// Mutant "the tick never records backstop arms" (`cancellation.rs`): an
+/// applying tick whose backstop arms a pull request, in a repository with
+/// the setting, leaves that arm in the ledger for a later hold to disable.
+#[cfg(unix)]
+#[test]
+fn a_tick_records_the_auto_merge_its_backstop_armed() {
+    let temp = tempfile::tempdir().expect("temp");
+    let log = temp.path().join("calls");
+    let head = "a".repeat(40);
+    let actions = fake_gh(
+        &temp,
+        &format!(
+            r#"
+printf '%s\n' "$*" >> '{log}'
+case "$*" in
+  *"contents/CMakeLists.txt?ref=main"*) printf '%s\n' 'project(Vellum VERSION 0.2.2)' ;;
+  *"git/matching-refs/tags/v"*) printf '%s\n' 'refs/tags/v0.2.1' ;;
+  *enablePullRequestAutoMerge*) printf '%s' '{{"data":{{"enablePullRequestAutoMerge":{{"pullRequest":{{"number":42}}}}}}}}' ;;
+  *isInMergeQueue*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"number":42,"state":"OPEN","headRefOid":"{head}","isInMergeQueue":false,"mergeQueueEntry":null,"autoMergeRequest":null,"timelineItems":{{"pageInfo":{{"hasPreviousPage":false}},"nodes":[]}}}}}}}}}}' ;;
+  *"mergeQueue"*) {queue} ;;
+  *) printf '%s' '{{}}' ;;
+esac
+"#,
+            log = log.display(),
+            queue = queue_answer(""),
+        ),
+    );
+    // Not the fleet App's and not handed off: the steward declines to own
+    // it, so it is the backstop's.
+    let observation = observation_for(ready_pr(), true);
+    let control = mutation_control(&temp, "studio", "studio");
+    let mut ledger = StewardLedger::default();
+
+    let (report, _, _) = apply_repo_plan(
+        &actions,
+        &tick_args(true),
+        &observation,
+        &temp.path().join("ledger.json"),
+        &mut ledger,
+        0,
+        Some(&control),
+        None,
+    );
+
+    let calls = fs::read_to_string(&log).unwrap_or_default();
+    let results = &report.native_auto_merge_backstop.results;
+    assert_eq!(results.len(), 1, "{report:?}\n{calls}");
+    assert_eq!(results[0].outcome, "armed", "{report:?}\n{calls}");
+    assert_eq!(
+        ledger.solo_entry_native_arms[&window_key("owner/repo", "main")],
+        [(42, head)].into(),
     );
 }
 
@@ -933,6 +1353,16 @@ fn a_solo_head_the_enqueue_path_refuses_releases_the_hold_after_three_passes() {
             None,
             Some("solo entry: merge queue unreadable before enqueue: HTTP 502"),
         ),
+        // The operator's HOLD, and a host that is not the mutation machine:
+        // nothing judged the head, so neither can end the hold for it.
+        (
+            None,
+            Some("merge-queue mutations are centrally held by /state/merge-queue.HOLD"),
+        ),
+        (
+            None,
+            Some("this machine is not the merge-queue mutation machine"),
+        ),
         (None, None),
         (Some("enqueued"), None),
     ] {
@@ -975,14 +1405,14 @@ fn a_solo_head_the_enqueue_path_refuses_releases_the_hold_after_three_passes() {
     let line = settle(
         &gate,
         &observation,
-        &[report(SOLO, None, Some("code owner review required"))],
+        &[report(SOLO, Some("waiting_code_owner_review"), None)],
         None,
         true,
         &mut ledger,
     )
     .expect("line");
     assert!(
-        line.contains("HOLD RELEASED for this head") && line.contains("code owner review"),
+        line.contains("HOLD RELEASED for this head") && line.contains("waiting_code_owner_review"),
         "{line}"
     );
     assert!(window(&ledger).attempt.is_none());
@@ -1071,7 +1501,12 @@ fn only_auto_merge_the_steward_armed_is_disabled_for_the_hold() {
         armed(52, &[]),
         // Recorded, no longer armed.
         pr(53, "feature", false, "SUCCESS", &[]),
-        solo_pr(),
+        // The solo pull request's own request is never disabled.
+        {
+            let mut solo = solo_pr();
+            solo.fact.auto_merge_active = true;
+            solo
+        },
     ]);
     let key = window_key("owner/repo", "main");
     let mut ledger = StewardLedger::default();
@@ -1097,6 +1532,23 @@ fn only_auto_merge_the_steward_armed_is_disabled_for_the_hold() {
         "{gate:?}"
     );
     assert!(reads.dequeued.borrow().is_empty());
+    // Re-review E: once disabled it is no longer the steward's arm, so a
+    // request a person arms on that head later is never disabled.
+    let arms = &ledger.solo_entry_native_arms[&window_key("owner/repo", "main")];
+    assert!(!arms.contains_key(&PRODUCT), "{arms:?}");
+    assert!(arms.contains_key(&50) && arms.contains_key(&51), "{arms:?}");
+    let again = FakeReads::release(&[(50, 1)]);
+    assert!(is_hold(&run(
+        &settings(),
+        &observation,
+        &again,
+        &mut ledger,
+        now()
+    )));
+    assert!(
+        again.disarmed.borrow().is_empty(),
+        "armed again by a person"
+    );
 
     // No hold, nothing disabled.
     let mut idle = FakeReads::release(&[]);
