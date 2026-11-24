@@ -37,7 +37,9 @@
 //!   in the merge queue the hold stays, so the backlog is not admitted into
 //!   its push, until the queue merges or removes it and for at most one more
 //!   `window_minutes`;
-//! * the solo head cannot be enqueued: it left the queue unmerged, the gate
+//! * the solo head cannot be enqueued: it left the queue unmerged (its own
+//!   enqueue counts as seen queued, so a merge group that fails within one
+//!   tick ends the hold on the next pass), the gate
 //!   admitted it on [`MAX_REFUSED_PASSES`] passes and the enqueue path
 //!   refused it by name (a central HOLD or a failed read is not a refusal),
 //!   or the steward removed its own entry [`MAX_OWN_DEQUEUES`] times;
@@ -775,7 +777,7 @@ impl Reads for GitHubReads<'_> {
     }
 
     fn dequeue(&self, pr: &ObservedPr, ledger: &mut StewardLedger) -> Result<(), String> {
-        dequeue_with_context(&self.context()?, pr, ledger)
+        own_dequeue(&self.context()?, pr, ledger)
     }
 
     fn disarm(&self, pr: &ObservedPr, ledger: &mut StewardLedger) -> Result<(), String> {
@@ -1010,9 +1012,11 @@ fn pass(
                     .insert(released_key(engaged.solo, &engaged.head));
                 return (
                     inactive(&format!(
-                        "RELEASE WINDOW EXPIRED for {version}: the hold for #{} ran its {} min \
-                         (attempt {} of {MAX_ATTEMPTS}); normal admission resumes{read_note}",
-                        engaged.solo, setting.window_minutes, window.attempts
+                        "RELEASE WINDOW EXPIRED for {version}: the hold for #{} ended after {} \
+                         min (attempt {} of {MAX_ATTEMPTS}); normal admission resumes{read_note}",
+                        engaged.solo,
+                        (now - engaged.engaged_at).num_minutes().max(0),
+                        window.attempts
                     )),
                     Some(window),
                 );
@@ -1474,6 +1478,48 @@ pub(super) fn settle(
     Some(line)
 }
 
+/// The steward's own removal of solo pull request `pr`'s queue entry. The
+/// ledger says "not queued" (and counts the removal) on disk before the
+/// dequeue is sent: a crash right after it must not leave "seen queued" on
+/// record with the entry gone, which the next pass would read as "the queue
+/// removed it" and let go of the head. When the ledger cannot be saved
+/// nothing is sent. A failed dequeue puts the record back.
+fn own_dequeue(
+    context: &MutationApplyContext<'_>,
+    pr: &ObservedPr,
+    ledger: &mut StewardLedger,
+) -> Result<(), String> {
+    let key = window_key(&context.observation.repo, &context.observation.base);
+    let mark = |ledger: &mut StewardLedger, removed: bool| {
+        if let Some(attempt) = ledger
+            .solo_entry_windows
+            .get_mut(&key)
+            .and_then(|window| window.attempt.as_mut())
+            .filter(|attempt| attempt.solo == pr.fact.number)
+        {
+            attempt.queued = !removed;
+            attempt.own_dequeues = if removed {
+                attempt.own_dequeues.saturating_add(1)
+            } else {
+                attempt.own_dequeues.saturating_sub(1)
+            };
+        }
+    };
+    mark(ledger, true);
+    let sent = super::ledger::save_ledger(context.ledger_path, ledger)
+        .map_err(|error| {
+            format!(
+                "ledger not saved before the own dequeue, nothing sent: {}",
+                error.message()
+            )
+        })
+        .and_then(|()| dequeue_with_context(context, pr, ledger));
+    if sent.is_err() {
+        mark(ledger, false);
+    }
+    sent
+}
+
 /// Remove `pr`'s own queue entry under the merge-queue mutation guard.
 fn dequeue_with_context(
     context: &MutationApplyContext<'_>,
@@ -1484,7 +1530,7 @@ fn dequeue_with_context(
         context.mutation_control,
         context.observation,
         pr,
-        "runner steward dequeue solo entry queued behind another",
+        "runner steward dequeue its own solo entry (behind another entry or behind the base)",
     )?;
     match super::unapproved_admission::dequeue_under_guard(
         context,
@@ -1553,24 +1599,26 @@ pub(super) fn verify_after_enqueue(
     {
         return (None, None);
     }
+    // The entry is in the queue now. Recorded here, not on the next pass
+    // that sees it: a merge group that fails within one tick removes it
+    // before any pass does, and "seen queued, now open with no entry" is how
+    // the next pass knows the queue removed it.
+    let key = window_key(&context.observation.repo, &context.observation.base);
+    if let Some(attempt) = ledger
+        .solo_entry_windows
+        .get_mut(&key)
+        .and_then(|window| window.attempt.as_mut())
+        .filter(|attempt| attempt.solo == pr.fact.number && attempt.head == pr.fact.head_sha)
+    {
+        attempt.queued = true;
+    }
     // Unreadable: the next pass reads the queue again and acts then.
     let Ok(positions) = queue_positions(context.actions, context.observation) else {
         return (Some("solo_entry_recheck_unread".to_owned()), None);
     };
     match phase(pr.fact.number, Ok(&positions)) {
-        Phase::Behind { ahead } => match dequeue_with_context(context, pr, ledger) {
-            Ok(()) => {
-                let key = window_key(&context.observation.repo, &context.observation.base);
-                if let Some(attempt) = ledger
-                    .solo_entry_windows
-                    .get_mut(&key)
-                    .and_then(|window| window.attempt.as_mut())
-                {
-                    attempt.own_dequeues += 1;
-                    attempt.queued = false;
-                }
-                (Some(format!("dequeued_solo_entry:{ahead}_ahead")), None)
-            }
+        Phase::Behind { ahead } => match own_dequeue(context, pr, ledger) {
+            Ok(()) => (Some(format!("dequeued_solo_entry:{ahead}_ahead")), None),
             Err(error) => (
                 Some(format!("solo_entry_behind:{ahead}_ahead")),
                 Some(format!(

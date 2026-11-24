@@ -673,7 +673,11 @@ fn the_hold_clock_starts_when_the_hold_engages_not_when_the_window_opens() {
     let expired = engaged + minutes(120);
     let gate = run(&settings(), &both(), &reads, &mut ledger, expired);
     assert_free(&gate);
-    assert!(gate.line().unwrap().contains("RELEASE WINDOW EXPIRED"));
+    let line = gate.line().expect("line");
+    assert!(line.contains("RELEASE WINDOW EXPIRED"), "{line}");
+    // The minutes it held, counted from the engage (the window opened 5 h
+    // earlier, and the setting may have changed since).
+    assert!(line.contains("ended after 120 min"), "{line}");
     assert!(!hold_engaged(&ledger, "owner/repo", "main", expired));
 
     // The expiry is logged once, and the same head never holds again.
@@ -2198,24 +2202,48 @@ fn queue_node(number: u64, position: u64, head: &str) -> String {
 /// admits it: the mutation, the error and every `gh` call.
 #[cfg(unix)]
 fn enqueue_solo(queue: &str, behind_by: &str) -> (Option<String>, Option<String>, String) {
-    use crate::app::merge_steward_cmd::pr_mutations::enqueue_pull_request;
-    use crate::queue_arm_gate::tests_support::with_real_guard;
-
-    let temp = tempfile::tempdir().expect("temp");
-    let actions = enqueue_gh(&temp, queue, behind_by);
     let pr = ready_pr();
     let mut observation = observation_for(pr.clone(), true);
     "Generous-Corp/pulp".clone_into(&mut observation.repo);
-    let mut ledger = StewardLedger::default();
-    let control = mutation_control(&temp, "studio", "studio");
-    let ledger_path = temp.path().join("ledger.json");
     let gate = Gate::Hold {
         solo: pr.fact.number,
         phase: Phase::Admit,
         line: String::new(),
     };
-    let mut context = mutation_apply_context(&actions, &observation, &ledger_path, &control);
-    context.solo_entry = Some(&gate);
+    enqueue_solo_in(
+        queue,
+        behind_by,
+        &observation,
+        &gate,
+        &mut StewardLedger::default(),
+    )
+}
+
+/// [`enqueue_solo`] for pull request 42 of `observation`, under `gate` and
+/// with the pass's `ledger`.
+#[cfg(unix)]
+fn enqueue_solo_in(
+    queue: &str,
+    behind_by: &str,
+    observation: &RepoObservation,
+    gate: &Gate,
+    ledger: &mut StewardLedger,
+) -> (Option<String>, Option<String>, String) {
+    use crate::app::merge_steward_cmd::pr_mutations::enqueue_pull_request;
+    use crate::queue_arm_gate::tests_support::with_real_guard;
+
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = enqueue_gh(&temp, queue, behind_by);
+    let pr = observation
+        .prs
+        .iter()
+        .find(|pr| pr.fact.number == 42)
+        .expect("pull request 42")
+        .clone();
+    let control = mutation_control(&temp, "studio", "studio");
+    let ledger_path = temp.path().join("ledger.json");
+    let mut context = mutation_apply_context(&actions, observation, &ledger_path, &control);
+    context.solo_entry = Some(gate);
     let arms = temp
         .path()
         .join("state")
@@ -2224,7 +2252,7 @@ fn enqueue_solo(queue: &str, behind_by: &str) -> (Option<String>, Option<String>
     fs::create_dir_all(&guards).expect("guards");
     let (mutation, error) = with_real_guard(&arms, &guards, || {
         crate::head_approval::with_host_review_default(false, || {
-            enqueue_pull_request(&context, &pr, &queue_policy(), &mut ledger)
+            enqueue_pull_request(&context, &pr, &queue_policy(), ledger)
         })
     });
     (
@@ -2480,4 +2508,321 @@ esac
     }
     assert!(ledger.solo_entry_windows.is_empty());
     assert!(ledger.solo_entry_native_arms.is_empty());
+}
+
+// ---- A solo entry the queue removes within one tick, and a crash around the
+// ---- steward's own dequeue (rehearsal case 8, review finding J) ------------
+
+/// The window the pulp fixtures engage: repository `Generous-Corp/pulp`.
+#[cfg(unix)]
+fn pulp_attempt(ledger: &StewardLedger) -> &Attempt {
+    ledger
+        .solo_entry_windows
+        .get(&window_key("Generous-Corp/pulp", "main"))
+        .and_then(|window| window.attempt.as_ref())
+        .expect("engaged hold")
+}
+
+/// Rehearsal pass p082 then p084, state for state. The tick admits the solo
+/// head and its own enqueue succeeds; the merge group fails within the tick
+/// and the queue removes the entry before any pass has seen it queued. The
+/// next pass finds the head open, unchanged and not queued: the hold is
+/// released at once and the products are admitted. Before the fix that pass
+/// kept the hold and reported `admitted and not enqueued
+/// (skipped_ejected_same_head:failed_checks:needs_new_head): pass 1 of 3`.
+#[cfg(unix)]
+#[test]
+fn a_solo_entry_the_queue_ejects_within_one_tick_releases_the_hold_on_the_next_pass() {
+    let mut solo = ready_pr();
+    SOLO_BRANCH.clone_into(&mut solo.fact.head_branch);
+    solo.fact.author = Some("app/shipyard-local".to_owned());
+    let mut observation = observation_for(solo.clone(), true);
+    "Generous-Corp/pulp".clone_into(&mut observation.repo);
+    observation
+        .prs
+        .insert(0, pr(43, "feature", false, "SUCCESS", &[]));
+    let settings = settings_for("Generous-Corp/pulp");
+    let reads = FakeReads::release(&[]);
+    let mut ledger = StewardLedger::default();
+
+    // p082: the hold engages and the gate admits the solo head alone.
+    let gate = run(&settings, &observation, &reads, &mut ledger, now());
+    assert_eq!(gate.enqueue_hold(42), None, "{gate:?}");
+    assert_eq!(
+        gate.enqueue_hold(43).as_deref(),
+        Some("held_solo_entry:#42")
+    );
+    assert!(!pulp_attempt(&ledger).queued);
+    // Empty until the enqueue, then the solo entry alone.
+    let queue = format!(
+        "if [ -f \"$ENQUEUED\" ]; then {}; else {}; fi",
+        queue_answer(&queue_node(42, 1, WIRE_HEAD)),
+        queue_answer("")
+    );
+    let (mutation, error, calls) =
+        enqueue_solo_in(&queue, "echo 0", &observation, &gate, &mut ledger);
+    assert_eq!(mutation.as_deref(), Some("enqueued"), "{error:?}\n{calls}");
+    assert!(
+        pulp_attempt(&ledger).queued,
+        "its own enqueue put the entry in the queue"
+    );
+
+    // p084: ejected, so open at the same head with no queue entry.
+    let gate = run(
+        &settings,
+        &observation,
+        &reads,
+        &mut ledger,
+        now() + minutes(5),
+    );
+    assert!(matches!(gate, Gate::Inactive { .. }), "{gate:?}");
+    assert_eq!(gate.enqueue_hold(43), None, "the product is admitted");
+    assert_eq!(gate.enqueue_hold(42), None);
+    let line = settle(
+        &gate,
+        &observation,
+        &[PrReport {
+            number: 42,
+            head_sha: WIRE_HEAD.to_owned(),
+            decision: StewardDecision::ArmMergeQueue,
+            mutation: Some("skipped_ejected_same_head:failed_checks:needs_new_head".to_owned()),
+            error: None,
+            blocked: crate::app::merge_steward_cmd::blocked_on::Stall::default(),
+        }],
+        None,
+        true,
+        &mut ledger,
+    )
+    .expect("line");
+    assert!(
+        line.contains("HOLD RELEASED") && line.contains("#42 left the merge queue unmerged"),
+        "{line}"
+    );
+    assert!(!line.contains("admitted and not enqueued"), "{line}");
+    let window = &ledger.solo_entry_windows[&window_key("Generous-Corp/pulp", "main")];
+    assert!(window.attempt.is_none());
+    assert!(window.is_released(42, WIRE_HEAD));
+}
+
+/// The record behind that release: right after its own enqueue the entry
+/// counts as seen queued, whether or not the queue could be read again, and
+/// only for the head the hold is for.
+#[cfg(unix)]
+#[test]
+fn the_solo_entrys_own_enqueue_counts_as_seen_queued() {
+    let solo = solo_pr();
+    let observation = both();
+    let gate = Gate::Hold {
+        solo: SOLO,
+        phase: Phase::Admit,
+        line: String::new(),
+    };
+    let alone = queue_node(SOLO, 1, &solo.fact.head_sha);
+    for (queue, token) in [
+        (queue_answer(&alone), None),
+        ("exit 1".to_owned(), Some("solo_entry_recheck_unread")),
+    ] {
+        let temp = tempfile::tempdir().expect("temp");
+        let actions = fake_gh(
+            &temp,
+            &format!("case \"$*\" in\n  *\"mergeQueue\"*) {queue} ;;\n  *) exit 2 ;;\nesac"),
+        );
+        let control = mutation_control(&temp, "studio", "studio");
+        let ledger_path = temp.path().join("ledger.json");
+        let mut context = mutation_apply_context(&actions, &observation, &ledger_path, &control);
+        context.solo_entry = Some(&gate);
+        let mut ledger = StewardLedger::default();
+        run(
+            &settings(),
+            &observation,
+            &FakeReads::release(&[]),
+            &mut ledger,
+            now(),
+        );
+        assert!(!attempt(&ledger).queued);
+
+        // Another head than the one the hold is for records nothing.
+        let other = rebuilt(solo.clone(), "b");
+        verify_after_enqueue(&context, &other, &mut ledger);
+        assert!(!attempt(&ledger).queued);
+
+        let (mutation, error) = verify_after_enqueue(&context, &solo, &mut ledger);
+        assert_eq!(mutation.as_deref(), token, "{error:?}");
+        assert!(attempt(&ledger).queued, "{queue}");
+
+        // Ejected before the next pass: released at once.
+        let gate = run(
+            &settings(),
+            &observation,
+            &FakeReads::release(&[]),
+            &mut ledger,
+            now() + minutes(5),
+        );
+        assert_free(&gate);
+        assert!(
+            gate.line()
+                .unwrap()
+                .contains("left the merge queue unmerged"),
+            "{gate:?}"
+        );
+    }
+}
+
+/// Finding J: the ledger says "not queued" on disk before the steward's own
+/// dequeue is sent. A crash right after the dequeue (the pass's save never
+/// happens) leaves that record, so the next pass keeps the hold instead of
+/// reading the missing entry as "the queue removed it". Both own-dequeue
+/// call sites: the pass's, and the recheck after the enqueue.
+#[cfg(unix)]
+#[test]
+fn a_crash_after_the_own_dequeue_is_not_an_unmerged_exit() {
+    use crate::app::merge_steward_cmd::ledger::load_ledger;
+    use crate::app::merge_steward_cmd::solo_entry::GitHubReads;
+
+    let solo = solo_pr();
+    let observation = both();
+    let ahead = format!(
+        "{},{}",
+        queue_node(PRODUCT, 1, &format!("{PRODUCT:0>40}")),
+        queue_node(SOLO, 2, &solo.fact.head_sha)
+    );
+    // What an earlier pass saved: the hold engaged, the entry seen queued.
+    let seen_queued = || {
+        let mut ledger = StewardLedger::default();
+        let queued = observation_with(vec![
+            product_pr(),
+            pr(SOLO, SOLO_BRANCH, false, "SUCCESS", &[(SOLO, 1)]),
+        ]);
+        run(
+            &settings(),
+            &queued,
+            &FakeReads::release(&[(SOLO, 1)]),
+            &mut ledger,
+            now(),
+        );
+        assert!(attempt(&ledger).queued);
+        ledger
+    };
+    for site in ["pass", "recheck"] {
+        let temp = tempfile::tempdir().expect("temp");
+        let ledger_path = temp.path().join("ledger.json");
+        let on_disk = temp.path().join("at-dequeue.json");
+        // The dequeue copies the ledger file as it is on disk at that moment.
+        let actions = fake_gh(
+            &temp,
+            &format!(
+                r#"case "$*" in
+  *"dequeuePullRequest"*) cp '{ledger}' '{snapshot}'; printf '%s' '{{"data":{{"dequeuePullRequest":{{"mergeQueueEntry":{{"id":"MQE"}}}}}}}}' ;;
+  *"mergeQueue"*) {queue} ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac"#,
+                ledger = ledger_path.display(),
+                snapshot = on_disk.display(),
+                queue = queue_answer(&ahead),
+            ),
+        );
+        let control = mutation_control(&temp, "studio", "studio");
+        let mut ledger = seen_queued();
+        if site == "pass" {
+            let reads = GitHubReads {
+                actions: &actions,
+                observation: &observation,
+                control: Some(&control),
+                ledger_path: &ledger_path,
+            };
+            assert_eq!(reads.dequeue(&solo, &mut ledger), Ok(()), "{site}");
+        } else {
+            let gate = Gate::Hold {
+                solo: SOLO,
+                phase: Phase::Admit,
+                line: String::new(),
+            };
+            let mut context =
+                mutation_apply_context(&actions, &observation, &ledger_path, &control);
+            context.solo_entry = Some(&gate);
+            let (mutation, error) = verify_after_enqueue(&context, &solo, &mut ledger);
+            assert_eq!(
+                mutation.as_deref(),
+                Some("dequeued_solo_entry:1_ahead"),
+                "{error:?}"
+            );
+        }
+        assert!(!attempt(&ledger).queued, "{site}");
+        assert_eq!(attempt(&ledger).own_dequeues, 1, "{site}");
+
+        // The crash: only what was on disk when the dequeue went out survives.
+        let mut survived = load_ledger(&on_disk).expect("ledger saved before the dequeue");
+        assert!(!attempt(&survived).queued, "{site}");
+        assert_eq!(attempt(&survived).own_dequeues, 1, "{site}");
+        let gate = run(
+            &settings(),
+            &observation,
+            &FakeReads::release(&[(PRODUCT, 1)]),
+            &mut survived,
+            now() + minutes(5),
+        );
+        assert_eq!(
+            gate.enqueue_hold(PRODUCT).as_deref(),
+            Some("held_solo_entry:#7"),
+            "{site}: {gate:?}"
+        );
+        assert!(window(&survived).released.is_empty(), "{site}");
+    }
+}
+
+/// The own dequeue is sent only once its record is on disk, and a dequeue
+/// that fails puts the record back: the entry is still in the queue.
+#[cfg(unix)]
+#[test]
+fn an_own_dequeue_that_is_not_sent_or_fails_leaves_the_entry_on_record() {
+    use crate::app::merge_steward_cmd::solo_entry::GitHubReads;
+
+    let solo = solo_pr();
+    let observation = both();
+    for (unsavable, why) in [(true, "ledger not saved"), (false, "dequeue")] {
+        let temp = tempfile::tempdir().expect("temp");
+        let log = temp.path().join("calls");
+        let actions = fake_gh(
+            &temp,
+            &format!("printf '%s\\n' \"$*\" >> '{}'\nexit 1", log.display()),
+        );
+        let control = mutation_control(&temp, "studio", "studio");
+        // A directory cannot be written as the ledger file.
+        let ledger_path = if unsavable {
+            temp.path().to_path_buf()
+        } else {
+            temp.path().join("ledger.json")
+        };
+        let mut ledger = StewardLedger::default();
+        let queued = observation_with(vec![
+            product_pr(),
+            pr(SOLO, SOLO_BRANCH, false, "SUCCESS", &[(SOLO, 1)]),
+        ]);
+        run(
+            &settings(),
+            &queued,
+            &FakeReads::release(&[(SOLO, 1)]),
+            &mut ledger,
+            now(),
+        );
+        let reads = GitHubReads {
+            actions: &actions,
+            observation: &observation,
+            control: Some(&control),
+            ledger_path: &ledger_path,
+        };
+        let outcome = reads.dequeue(&solo, &mut ledger);
+        assert!(
+            outcome.as_ref().is_err_and(|error| error.contains(why)),
+            "{outcome:?}"
+        );
+        assert!(attempt(&ledger).queued, "{why}");
+        assert_eq!(attempt(&ledger).own_dequeues, 0, "{why}");
+        let calls = fs::read_to_string(&log).unwrap_or_default();
+        assert_eq!(
+            count(&calls, "dequeuePullRequest"),
+            usize::from(!unsavable),
+            "{calls}"
+        );
+    }
 }

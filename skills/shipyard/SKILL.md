@@ -4578,7 +4578,8 @@ rebuilds it; do not push to it). When an entry lands ahead of it the steward
 removes only its own entry (`dequeued_solo_entry:<k>_ahead`); an entry behind
 it is reported as `solo_entry_shared_batch_risk` and never touched. Nothing to
 do for a held row: it is admitted once the solo pull request merges or the
-hold ends, and the `solo_entry` line of the report says which
+hold ends (a solo entry the queue ejects ends it on the next pass), and the
+`solo_entry` line of the report says which
 (`HOLD RELEASED`, `RELEASE WINDOW EXPIRED`). The named fix for a confirmed red
 base is not held. See `docs/automated-draining.md` "Solo entry".
 
