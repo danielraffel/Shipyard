@@ -990,7 +990,8 @@ shape, and an older binary that finds one refuses the whole ledger
   its push. The queue decides: the entry merges, or the queue removes it. The
   extension ends at twice `window_minutes` whatever happens.
 - **The hold lets go of a head that cannot be enqueued**: the queue removed
-  it, the enqueue path refused it by name on 3 passes after the gate admitted
+  it (on the next pass, also when its merge group failed before any pass saw
+  the entry queued), the enqueue path refused it by name on 3 passes after the gate admitted
   it, or the steward removed its own entry 3 times. A pass stopped by the
   central HOLD, the wrong mutation machine or a failed read is not a refusal
   and counts nothing.
@@ -1017,7 +1018,9 @@ shape, and an older binary that finds one refuses the whole ledger
   (an already-armed pull request GitHub enqueued in the gap), the steward
   dequeues only its own solo entry (`dequeued_solo_entry:<k>_ahead`; recorded
   as the steward's own removal, so it never counts toward the ejection cap)
-  and retries next pass.
+  and retries next pass. The ledger records the removal before the dequeue
+  is sent, so a crash right after it is not read as the queue removing the
+  entry.
 - **Nothing the steward controls lands behind it.** A merge-queue batch is one
   push, and a tag gate that reads only the pushed tip never sees a reconcile
   that shares its push. While the hold is engaged the steward enqueues and
