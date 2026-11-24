@@ -56,6 +56,12 @@ pub enum FleetEpochStatus {
         applied: Option<u64>,
         /// Host the receipt was looked up for.
         host: String,
+        /// Manifest `[hosts.<key>]` entry this host matched, if any.
+        host_key: Option<String>,
+        /// Manifest that declared the epoch.
+        manifest_path: String,
+        /// Receipt that was read, or the path one would have to appear at.
+        receipt_path: String,
     },
     /// The manifest or receipt could not be read or parsed.
     ///
@@ -93,12 +99,26 @@ impl Display for FleetEpochStatus {
                 declared,
                 applied,
                 host,
-            } => write!(
-                f,
-                "host {host} is behind the declared fleet epoch: manifest is at {declared}, host \
-                 applied {}. Run tools/fleet/apply.sh to converge before dispatching work.",
-                applied.map_or_else(|| "nothing".to_owned(), |epoch| epoch.to_string())
-            ),
+                host_key,
+                manifest_path,
+                receipt_path,
+            } => {
+                let entry = host_key.as_ref().map_or_else(
+                    || format!("host {host} matched no entry under [hosts] in the manifest"),
+                    |key| format!("host {host} matched manifest entry [hosts.{key}]"),
+                );
+                let receipt = applied.map_or_else(
+                    || format!("{receipt_path} (missing)"),
+                    |epoch| format!("{receipt_path} (applied epoch {epoch})"),
+                );
+                write!(
+                    f,
+                    "this host is behind the declared fleet epoch.\n\
+                     \x20 manifest: {manifest_path} (epoch {declared})\n\
+                     \x20 {entry}\n\
+                     \x20 receipt: {receipt}"
+                )
+            }
             Self::Unobservable { detail } => write!(
                 f,
                 "fleet epoch could not be observed: {detail}. Refusing rather than assuming \
@@ -156,16 +176,56 @@ pub fn check(repo_root: &Path, machine: &str) -> FleetEpochStatus {
     );
 
     match read_applied_epoch(&receipts_dir, machine) {
-        Ok(Some(applied)) if applied >= declared => {
-            FleetEpochStatus::Converged { declared, applied }
-        }
-        Ok(applied) => FleetEpochStatus::Behind {
+        Ok(Some(found)) if found.epoch >= declared => FleetEpochStatus::Converged {
             declared,
-            applied,
-            host: machine.to_owned(),
+            applied: found.epoch,
         },
+        Ok(applied) => {
+            let host_key = manifest_host_key(&manifest, machine);
+            let receipt_path = applied.as_ref().map_or_else(
+                || {
+                    let name = host_key.as_deref().unwrap_or(machine);
+                    receipts_dir.join(format!("{name}.json"))
+                },
+                |found| found.path.clone(),
+            );
+            FleetEpochStatus::Behind {
+                declared,
+                applied: applied.map(|found| found.epoch),
+                host: machine.to_owned(),
+                host_key,
+                manifest_path: manifest_path.display().to_string(),
+                receipt_path: receipt_path.display().to_string(),
+            }
+        }
         Err(detail) => FleetEpochStatus::Unobservable { detail },
     }
+}
+
+/// The `[hosts.<key>]` manifest entry this machine corresponds to, matched
+/// case-insensitively by key, by a `hostname` string, or by any element of a
+/// `hostnames` array (the shape the fleet manifest uses).
+fn manifest_host_key(manifest: &toml::Table, machine: &str) -> Option<String> {
+    let hosts = manifest.get("hosts").and_then(toml::Value::as_table)?;
+    let is_machine = |value: &toml::Value| {
+        value
+            .as_str()
+            .is_some_and(|name| name.eq_ignore_ascii_case(machine))
+    };
+    hosts.iter().find_map(|(key, entry)| {
+        let by_name = entry.get("hostname").is_some_and(is_machine)
+            || entry
+                .get("hostnames")
+                .and_then(toml::Value::as_array)
+                .is_some_and(|names| names.iter().any(is_machine));
+        (key.eq_ignore_ascii_case(machine) || by_name).then(|| key.clone())
+    })
+}
+
+/// A receipt that claimed this machine.
+struct FoundReceipt {
+    path: std::path::PathBuf,
+    epoch: u64,
 }
 
 /// Find this machine's receipt and read the epoch it converged to.
@@ -174,7 +234,7 @@ pub fn check(repo_root: &Path, machine: &str) -> FleetEpochStatus {
 /// exists but cannot be read is an error, never a miss: an unreadable receipt
 /// is not evidence that this host is unconverged, it is evidence that we do
 /// not know, and the two must stay distinguishable.
-fn read_applied_epoch(receipts_dir: &Path, machine: &str) -> Result<Option<u64>, String> {
+fn read_applied_epoch(receipts_dir: &Path, machine: &str) -> Result<Option<FoundReceipt>, String> {
     let Ok(entries) = std::fs::read_dir(receipts_dir) else {
         // A missing receipts directory means nothing has ever applied here.
         return Ok(None);
@@ -202,7 +262,7 @@ fn read_applied_epoch(receipts_dir: &Path, machine: &str) -> Result<Option<u64>,
             .get("epoch")
             .and_then(serde_json::Value::as_u64)
             .ok_or_else(|| format!("receipt {} declares no integer epoch", path.display()))?;
-        applied.get_or_insert(epoch);
+        applied.get_or_insert(FoundReceipt { path, epoch });
     }
     Ok(applied)
 }
@@ -331,13 +391,22 @@ mod tests {
                 declared: 7,
                 applied: Some(6),
                 host: "Daniels-Mac-Studio".to_owned(),
+                host_key: None,
+                manifest_path: sandbox
+                    .path()
+                    .join(super::MANIFEST_RELATIVE_PATH)
+                    .display()
+                    .to_string(),
+                receipt_path: sandbox
+                    .path()
+                    .join(super::DEFAULT_RECEIPT_RELATIVE_DIR)
+                    .join("macstudio.json")
+                    .display()
+                    .to_string(),
             }
         );
         assert!(status.blocks());
-        assert!(
-            status.to_string().contains("tools/fleet/apply.sh"),
-            "the message must say how to converge: {status}"
-        );
+        assert!(status.to_string().contains("(applied epoch 6)"), "{status}");
     }
 
     #[test]
@@ -353,9 +422,70 @@ mod tests {
                 declared: 7,
                 applied: None,
                 host: "Daniels-Mac-Studio".to_owned(),
+                host_key: None,
+                manifest_path: sandbox
+                    .path()
+                    .join(super::MANIFEST_RELATIVE_PATH)
+                    .display()
+                    .to_string(),
+                receipt_path: sandbox
+                    .path()
+                    .join(super::DEFAULT_RECEIPT_RELATIVE_DIR)
+                    .join("Daniels-Mac-Studio.json")
+                    .display()
+                    .to_string(),
             }
         );
         assert!(status.blocks());
+    }
+
+    #[test]
+    fn the_real_manifest_shape_hostnames_array_matches_and_names_the_key_receipt() {
+        // fleet/manifest.toml declares `hostnames = [...]` under the host key,
+        // and `hostname -s` on that machine returns the array element.
+        let sandbox = TempDir::new().expect("tempdir");
+        seed_manifest(
+            sandbox.path(),
+            "epoch = 3\n\n[hosts.m5studio]\nhostnames = [\"Daniels-M5-Studio\"]\n",
+        );
+
+        let text = check(sandbox.path(), "Daniels-M5-Studio").to_string();
+
+        let receipt = sandbox
+            .path()
+            .join(super::DEFAULT_RECEIPT_RELATIVE_DIR)
+            .join("m5studio.json");
+        assert!(
+            text.contains("matched manifest entry [hosts.m5studio]"),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("{} (missing)", receipt.display())),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_declared_host_with_no_receipt_names_the_key_and_the_missing_receipt() {
+        let sandbox = TempDir::new().expect("tempdir");
+        seed_manifest(
+            sandbox.path(),
+            "epoch = 3\n\n[hosts.m5s]\nhostname = \"Daniels-Mac-Studio\"\n",
+        );
+
+        let status = check(sandbox.path(), "daniels-mac-studio");
+        let text = status.to_string();
+
+        let receipt = sandbox
+            .path()
+            .join(super::DEFAULT_RECEIPT_RELATIVE_DIR)
+            .join("m5s.json");
+        assert!(text.contains("[hosts.m5s]"), "{text}");
+        assert!(
+            text.contains(&format!("{} (missing)", receipt.display())),
+            "{text}"
+        );
+        assert!(text.contains("(epoch 3)"), "{text}");
     }
 
     #[test]

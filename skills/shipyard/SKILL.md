@@ -4061,6 +4061,14 @@ and re-validates from scratch. Never automate `--adopt-head` for anything else.
 `--allow-fleet-epoch-drift` is unrelated: it waives the fleet-epoch preflight
 and never touches ship-state SHA drift.
 
+When `shipyard pr` or `ship` refuses with fleet-epoch drift, the message names
+the manifest entry and the missing or stale receipt
+(`planning/fleet/receipts/<host>.json`). Converging the host with
+`tools/fleet/apply.sh` belongs to the fleet owner or the orchestrator, and
+`--allow-fleet-epoch-drift` is for the fleet owner only. An agent runs the
+repo's pre-push gates (`tools/scripts/gates.sh origin/main` where it exists),
+opens the PR with `ghapp pr create --base <base>`, and reports the drift.
+
 For an already-created PR, the submitting agent must run
 `shipyard runner steward-handoff --repo OWNER/REPO --pr N --head SHA
 --workstream-id ID [--context-url URL] --apply`.
