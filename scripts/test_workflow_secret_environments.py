@@ -34,6 +34,9 @@ ENVIRONMENT_SECRETS: dict[str, str] = {
     "MACOS_NOTARIZE_APPLE_ID": "release",
     "MACOS_NOTARIZE_APP_PASSWORD": "release",
     "MACOS_NOTARIZE_TEAM_ID": "release",
+    # The shipyard-local App key: `app-key` admits only refs/heads/main, so
+    # post-tag-sync runs from auto-release's run on main, not the tag push.
+    "SHIPYARD_APP_PRIVATE_KEY": "app-key",
 }
 
 # Environments whose jobs must run no repository code.
@@ -41,9 +44,6 @@ NO_REPO_CODE = set()  # none yet: the signing and post-tag jobs still build repo
 
 # Credentials that stay repository secrets this round, with the reason.
 REPOSITORY_SECRETS: dict[str, str] = {
-    # Deferred: the shipyard-local App key; Shipyard and the steward read it
-    # at runtime, so moving it waits for the shipyard-local narrowing.
-    "SHIPYARD_APP_PRIVATE_KEY": "deferred: shipyard-local",
     # post-tag-sync's PAT: the file must stay identical to what
     # `shipyard release-bot hook install` renders, so it names no
     # environment; the PAT moves with Stage 1a+.
@@ -182,6 +182,34 @@ class WorkflowSecretEnvironments(unittest.TestCase):
                     offenders.append(f"{wf}:{job_name}")
         self.assertEqual(offenders, [])
 
+
+    def test_app_key_jobs_only_run_on_main_refs(self) -> None:
+        # `app-key` admits only refs/heads/main. A job naming it must start
+        # from an event whose ref is main: a push to main, a dispatch, a
+        # schedule or a workflow_run. A tag push or a pull request event would
+        # be refused, and widening the environment instead would reopen it.
+        allowed = {"push", "workflow_dispatch", "schedule", "workflow_run"}
+        offenders, seen = [], 0
+        for path in sorted(SECRET_WORKFLOWS.glob("*.y*ml")):
+            workflow = yaml.safe_load(path.read_text(encoding="utf-8"))
+            jobs = [name for name, job in (workflow.get("jobs") or {}).items()
+                    if _secret_environment(job) == "app-key"]
+            if not jobs:
+                continue
+            seen += len(jobs)
+            on = workflow.get(True, workflow.get("on"))
+            triggers = _secret_triggers(workflow)
+            if triggers - allowed:
+                offenders.append(f"{path.name}: triggers {sorted(triggers - allowed)}")
+            push = (on or {}).get("push") if isinstance(on, dict) else None
+            if "push" in triggers and (not isinstance(push, dict) or push.get("tags")
+                                       or push.get("branches") != ["main"]):
+                offenders.append(f"{path.name}: push must be branches [main] only")
+            run = (on or {}).get("workflow_run") if isinstance(on, dict) else None
+            if "workflow_run" in triggers and (run or {}).get("branches") != ["main"]:
+                offenders.append(f"{path.name}: workflow_run must filter branches [main]")
+        self.assertEqual(offenders, [])
+        self.assertEqual(seen, 3)  # auto-release tag, version-at-land assign, post-tag-sync sync
 
     def test_the_tagging_job_runs_no_tree_code(self) -> None:
         # auto-release's `tag` job holds the tagging identity, which the v*
