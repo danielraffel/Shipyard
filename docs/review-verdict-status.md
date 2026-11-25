@@ -200,10 +200,14 @@ empty token (the mint step failed) or a refused post prints a `::warning`
 and never changes the exit code. A refusal is retried and then fails the job
 (see "The verdict App's stale status"). Before a ruleset binds the App this keeps a bad key or an
 outage from turning every pull request red; after the bind, a missing App
-status already leaves the rule unmet. The token is never printed. In the
-workflow, the mint step carries `continue-on-error: true` and the poster step
-gets `REVIEW_VERDICT_APP_ID`, `REVIEW_VERDICT_APP_BOT_LOGIN` and
-`REVIEW_VERDICT_APP_TOKEN`.
+status already leaves the rule unmet. The token is never printed.
+
+Not yet wired (future rollout): `.github/workflows/review-verdict.yml` today
+sets only `GH_TOKEN`, so the job posts as GitHub Actions alone and the App
+leg is inactive. The planned workflow adds a token mint step with
+`continue-on-error: true` and gives the poster step `REVIEW_VERDICT_APP_ID`,
+`REVIEW_VERDICT_APP_BOT_LOGIN` and `REVIEW_VERDICT_APP_TOKEN`; until then the
+script's App leg runs only where those variables are set by hand.
 
 The steward maps a commit status to the App that posted it by its creator.
 GitHub Actions maps always. The verdict App maps only when the steward host's

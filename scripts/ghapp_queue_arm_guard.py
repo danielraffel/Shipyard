@@ -3508,8 +3508,9 @@ def default_branch(pull: Any) -> str:
     """The repository's default branch, as the pull request's own answer
     names it (``base.repo.default_branch``). Raises when it is missing: the
     policy is never read from a branch the pull request chose."""
-    branch = (((pull.get("base") or {}).get("repo") or {}).get("default_branch")
-              if isinstance(pull, dict) else None)
+    branch: Any = pull
+    for key in ("base", "repo", "default_branch"):
+        branch = branch.get(key) if isinstance(branch, dict) else None
     if not isinstance(branch, str) or not branch:
         raise GuardError("the pull request does not name its repository's default branch")
     return branch
@@ -3605,11 +3606,13 @@ def comment_last_edited(node_id: str) -> str | None:
     the second the comment was posted leaves it equal to ``created_at``;
     ``lastEditedAt`` is set by any edit. Raises when it cannot be read."""
     answer = graphql(COMMENT_EDIT_QUERY, {"id": node_id})
-    if not isinstance(answer, dict) or answer.get("errors"):
-        # Partial data next to errors is not an answer.
+    # Partial data next to errors is not an answer: any non-null ``errors``,
+    # an empty or malformed one included, refuses (as src/head_approval.rs).
+    if not isinstance(answer, dict) or answer.get("errors") is not None:
         raise GuardError(f"comment {node_id} edit history is unreadable "
-                         f"({(answer or {}).get('errors') if isinstance(answer, dict) else answer})")
-    node = (answer.get("data") or {}).get("node")
+                         f"({answer.get('errors') if isinstance(answer, dict) else answer})")
+    data = answer.get("data")
+    node = data.get("node") if isinstance(data, dict) else None
     if not isinstance(node, dict) or "lastEditedAt" not in node:
         raise GuardError(f"comment {node_id} edit history is unreadable")
     edited = node["lastEditedAt"]

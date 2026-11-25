@@ -95,6 +95,99 @@ APP_TOKEN_ENV = "REVIEW_VERDICT_APP_TOKEN"
 APP_BOT_ENV = "REVIEW_VERDICT_APP_BOT_LOGIN"
 
 
+# The ``issue_comment`` actions GitHub sends. Any other action is a payload
+# this job cannot read, never one it may skip.
+COMMENT_ACTIONS = frozenset({"created", "edited", "deleted"})
+
+
+class CommentEvent(NamedTuple):
+    """An ``issue_comment`` payload, validated (``comment_event``)."""
+
+    # ``None``: a comment on an issue, nothing to judge.
+    number: int | None
+    action: str
+    comment: dict[str, Any]
+    # The posted or deleted body, and on an edit the body before it.
+    bodies: tuple[str, ...]
+
+
+class PullRecord(NamedTuple):
+    """A ``repos/{repo}/pulls/{n}`` answer, validated (``read_pull``)."""
+
+    state: str
+    head: str
+    base: str
+    default_branch: str
+    author: str
+
+
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def comment_event(event: Any) -> CommentEvent:
+    """The one reader of an ``issue_comment`` payload.
+
+    Only an issue with no ``pull_request`` key is "not a pull request"; a
+    marker that is present must be GitHub's object (a dict naming its
+    ``url``), so a malformed marker is never read either way. For a pull
+    request the comment must carry a string body and author login, the action
+    must be one GitHub sends, and every edit must carry its earlier body
+    (``changes.body.from``): that body is the only record of a HOLD edited
+    away. Raises ``ValueError`` for anything else."""
+    if not isinstance(event, dict):
+        raise ValueError("the issue_comment payload is not an object")
+    issue = event.get("issue")
+    if not isinstance(issue, dict):
+        raise ValueError("the issue_comment payload carries no issue")
+    if "pull_request" not in issue:
+        return CommentEvent(None, "", {}, ())
+    marker = issue["pull_request"]
+    if not isinstance(marker, dict) or not isinstance(marker.get("url"), str) \
+            or not marker["url"]:
+        raise ValueError("the issue_comment payload's pull_request marker is malformed")
+    number = issue.get("number")
+    if not _is_int(number):
+        raise ValueError("the issue_comment payload names no pull request number")
+    comment = event.get("comment")
+    action = event.get("action")
+    if (not isinstance(comment, dict) or not isinstance(comment.get("body"), str)
+            or not isinstance(comment.get("user"), dict)
+            or not isinstance(comment["user"].get("login"), str)):
+        raise ValueError("the comment event payload is malformed")
+    if action not in COMMENT_ACTIONS:
+        raise ValueError(f"the comment event's action {action!r} is not one GitHub sends")
+    bodies = [comment["body"]]
+    if action == "edited":
+        changes = event.get("changes")
+        body = changes.get("body") if isinstance(changes, dict) else None
+        before = body.get("from") if isinstance(body, dict) else None
+        if not isinstance(before, str):
+            raise ValueError("the comment edit carries no readable earlier body")
+        bodies.append(before)
+    return CommentEvent(number, action, comment, tuple(bodies))
+
+
+def read_pull(guard: ModuleType, repo: str, number: int) -> PullRecord:
+    """The one reader of a pull request's REST answer: its state, head sha,
+    base ref, repository default branch and author login, each a non-empty
+    string, or ``GuardError``."""
+    pull = guard.run_real_gh(["api", f"repos/{repo}/pulls/{number}"])
+    if not isinstance(pull, dict):
+        raise guard.GuardError(f"PR #{number} is unreadable")
+
+    def text(*path: str) -> str:
+        value: Any = pull
+        for key in path:
+            value = value.get(key) if isinstance(value, dict) else None
+        if not isinstance(value, str) or not value:
+            raise guard.GuardError(f"PR #{number} is unreadable (no {'.'.join(path)})")
+        return value
+
+    return PullRecord(text("state"), text("head", "sha"), text("base", "ref"),
+                      text("base", "repo", "default_branch"), text("user", "login"))
+
+
 class Decision(NamedTuple):
     """One pull request's review decision for the head."""
 
@@ -129,6 +222,8 @@ def event_target(event_name: str, event: dict[str, Any]) -> tuple[int | None, st
     A payload whose fields cannot be read raises (``ValueError``): read as
     "nothing to judge", it would exit 0 and leave the check green.
     """
+    if not isinstance(event, dict):
+        raise ValueError(f"the {event_name} payload is not an object")
     if event_name == "pull_request_target":
         pull = event.get("pull_request")
         number = pull.get("number") if isinstance(pull, dict) else None
@@ -136,19 +231,12 @@ def event_target(event_name: str, event: dict[str, Any]) -> tuple[int | None, st
             raise ValueError("the pull_request_target payload names no pull request number")
         return number, None
     if event_name == "issue_comment":
-        issue = event.get("issue")
-        if not isinstance(issue, dict):
-            raise ValueError("the issue_comment payload carries no issue")
-        if not issue.get("pull_request"):
-            return None, None
-        number = issue.get("number")
-        if not isinstance(number, int) or isinstance(number, bool):
-            raise ValueError("the issue_comment payload names no pull request number")
-        return number, None
+        return comment_event(event).number, None
     if event_name in ("check_run", "workflow_run"):
         run = event.get(event_name)
         if not isinstance(run, dict):
             raise ValueError(f"the {event_name} payload carries no {event_name}")
+        # A missing list is a numberless event: its head is still judged.
         listed = run.get("pull_requests", [])
         if not isinstance(listed, list):
             raise ValueError(f"the {event_name} payload's pull_requests is not a list")
@@ -197,12 +285,9 @@ def base_refusal(guard: ModuleType, repo: str, number: int) -> str | None:
     status still standing on its head (verdict-App review N4). The status is
     never ``success`` for such a pull request; a retarget re-runs this job
     (``pull_request_target: edited``)."""
-    pull = guard.run_real_gh(["api", f"repos/{repo}/pulls/{number}"])
-    if not isinstance(pull, dict):
-        raise guard.GuardError(f"PR #{number} is unreadable")
-    base = (pull.get("base") or {}).get("ref")
-    default = guard.default_branch(pull)
-    if not isinstance(base, str) or base != default:
+    pull = read_pull(guard, repo, number)
+    base, default = pull.base, pull.default_branch
+    if base != default:
         return (f"PR #{number}: its base {base} is not the default branch {default}; only a "
                 f"pull request into {default} is judged")
     return None
@@ -294,38 +379,26 @@ def removed_holds(guard: ModuleType, repo: str, number: int, head: str,
         return []
     # A comment event whose payload cannot be read is refused, never read as
     # "no HOLD removed": the payload is the only record of a deleted HOLD.
-    comment = event.get("comment")
-    action = event.get("action")
-    if (not isinstance(comment, dict) or not isinstance(action, str)
-            or not isinstance(comment.get("body"), str)
-            or not isinstance(comment.get("user"), dict)
-            or not isinstance(comment["user"].get("login"), str)):
-        raise guard.GuardError("the comment event payload is malformed")
-    bodies = [comment["body"]]
-    if action == "edited":
-        changes = event.get("changes")
-        if not isinstance(changes, dict):
-            raise guard.GuardError("the comment edit carries no readable changes")
-        if "body" in changes:
-            before = changes["body"].get("from") if isinstance(changes["body"], dict) else None
-            if not isinstance(before, str):
-                raise guard.GuardError("the comment edit carries no readable earlier body")
-            bodies.append(before)
-    if not any("HOLD" in body for body in bodies):
+    try:
+        parsed = comment_event(event)
+    except ValueError as error:
+        raise guard.GuardError(str(error)) from error
+    if parsed.number is None:
+        raise guard.GuardError("the comment event names no pull request")
+    comment = parsed.comment
+    if not any("HOLD" in body for body in parsed.bodies):
         return []
-    pull = guard.run_real_gh(["api", f"repos/{repo}/pulls/{number}"])
-    if not isinstance(pull, dict):
-        raise guard.GuardError(f"PR #{number} is unreadable")
-    author = (pull.get("user") or {}).get("login")
+    pull = read_pull(guard, repo, number)
+    author = pull.author
     policy = guard.review_policy(
-        guard.base_config_text(repo, guard.default_branch(pull)), repo, True)
+        guard.base_config_text(repo, pull.default_branch), repo, True)
     holds = []
-    for body in bodies:
+    for body in parsed.bodies:
         record = {"id": comment.get("id"), "user": comment.get("user"),
                   "author_association": comment.get("author_association"),
                   "created_at": comment.get("created_at"), "body": body}
         for _, verdict, named, what in guard.counting_verdicts(
-                author if isinstance(author, str) else None, [record], [], policy):
+                author, [record], [], policy):
             if verdict == "HOLD" and named == head.lower() and what not in holds:
                 holds.append(what)
     return holds
@@ -477,16 +550,17 @@ def run(event_name: str, event: dict[str, Any], repo: str, run_url: str | None) 
     os.environ.setdefault("GHAPP_REAL_GH", shutil.which("gh") or "gh")
     guard = load_guard()
     if number is not None:
-        pull = guard.run_real_gh(["api", f"repos/{repo}/pulls/{number}"])
-        if not isinstance(pull, dict) or not isinstance(pull.get("state"), str):
+        try:
+            pull = read_pull(guard, repo, number)
+        except guard.GuardError as error:
             # A pull request with no readable state is not "closed": closed
             # posts nothing and exits 0.
-            print(f"review-verdict: PR #{number} is unreadable", file=sys.stderr)
+            print(f"review-verdict: {error}", file=sys.stderr)
             return 1
-        if pull.get("state") != "open":
-            print(f"review-verdict: PR #{number} is {pull.get('state')}; nothing to post")
+        if pull.state != "open":
+            print(f"review-verdict: PR #{number} is {pull.state}; nothing to post")
             return 0
-        head = (pull.get("head") or {}).get("sha") or ""
+        head = pull.head
     if not head:
         print(f"review-verdict: PR #{number} has no readable head", file=sys.stderr)
         return 1

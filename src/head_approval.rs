@@ -1540,27 +1540,46 @@ pub(crate) const EDITED_REFUSAL: &str = "it was edited after it was posted";
 /// `updated_at` key is a review (reviews have none); every comment reader's
 /// jq carries it ([`COMMENT_RECORD_JQ`]), so a comment whose `updated_at`
 /// is null, or any other non-string, cannot show it was not edited and counts
-/// as edited. Times that cannot be compared count as edited.
+/// as edited. Times that cannot be compared count as edited, identical
+/// malformed strings included ([`comment_edit_stamps`]).
 pub(crate) fn comment_edited(record: &Value) -> bool {
+    match comment_edit_stamps(record) {
+        Ok(None) => false,
+        Ok(Some((created, updated))) => created != updated,
+        Err(_) => true,
+    }
+}
+
+/// A comment's posted and last-updated times.
+pub(crate) type EditStamps = (DateTime<Utc>, DateTime<Utc>);
+
+/// A comment record's two edit stamps, validated: the only reader of `at`
+/// and `updated_at` for the edit rule.
+///
+/// `Ok(None)` for a record with no `updated_at` key (a review);
+/// `Ok(Some((posted, updated)))` only when both are strings that parse as
+/// RFC 3339. Both are parsed before they are compared, so two identical
+/// malformed strings are an error, never "not edited".
+///
+/// # Errors
+///
+/// When either time is missing, not a string, or not an RFC 3339 time.
+pub(crate) fn comment_edit_stamps(record: &Value) -> Result<Option<EditStamps>, String> {
     let Some(updated) = record.get("updated_at") else {
-        return false;
+        return Ok(None);
     };
-    let Some(updated) = updated.as_str() else {
-        return true;
-    };
-    let created = record.get("at").and_then(Value::as_str);
-    if created == Some(updated) {
-        return false;
-    }
-    let parse = |text: &str| {
+    let parse = |field: &str, value: Option<&Value>| {
+        let text = value
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("comment `{field}` is not a string"))?;
         DateTime::parse_from_rfc3339(text)
-            .ok()
             .map(|at| at.with_timezone(&Utc))
+            .map_err(|_| format!("comment `{field}` is not an RFC 3339 time"))
     };
-    match (created.and_then(parse), parse(updated)) {
-        (Some(created), Some(updated)) => created != updated,
-        _ => true,
-    }
+    Ok(Some((
+        parse("at", record.get("at"))?,
+        parse("updated_at", Some(updated))?,
+    )))
 }
 
 /// Whether an approval by `record`'s login counts, beyond
@@ -2702,9 +2721,9 @@ fn edit_checked(
             "approval comment {id} is not among the comments read"
         ));
     };
-    if !record.get("updated_at").is_some_and(Value::is_string) {
+    if !matches!(comment_edit_stamps(record), Ok(Some(_))) {
         return Err(format!(
-            "approval comment {id} carries no edit metadata (updated_at)"
+            "approval comment {id} carries no readable edit metadata (at, updated_at)"
         ));
     }
     let node_id = record

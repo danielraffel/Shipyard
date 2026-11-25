@@ -885,9 +885,88 @@ class TamperedVerdicts(unittest.TestCase):
             event["changes"] = changes
             broken.append(event)
         for event in broken:
-            result = self.post(self.answers(self.approved(), SIGNERS), event=event)
-            self.assertNotEqual(result.returncode, 0, f"{event}: {result.stdout}")
-            self.assertNotIn("state=success", self.calls(), event)
+            self.assert_refused(event)
+
+    def assert_refused(self, event: dict[str, Any], name: str = "issue_comment",
+                       answers: list[tuple[str, dict[str, Any]]] | None = None) -> None:
+        result = self.post(answers if answers is not None
+                           else self.answers(self.approved(), SIGNERS), name, event)
+        self.assertNotEqual(result.returncode, 0, f"{event}: {result.stdout}")
+        self.assertNotIn("state=success", self.calls() if (self.root / "calls").exists()
+                         else "", event)
+
+    def test_a_malformed_pull_request_marker_refuses(self) -> None:
+        # Control: GitHub's own marker object is judged.
+        self.post(self.answers(self.approved(), SIGNERS),
+                  event=self.comment_event("created", "thanks"))
+        self.assertEqual(self.posted()["state"], "success", "control")
+        # A truthy non-object, a null, an empty or url-less object: none is
+        # GitHub's marker, so none is read as a pull request or as an issue.
+        for marker in ("x", ["x"], [], 1, 0, True, False, None, {}, {"url": ""},
+                       {"url": 3}, {"html_url": "x"}):
+            event = self.comment_event("created", "thanks")
+            event["issue"]["pull_request"] = marker
+            self.assert_refused(event)
+        # Control: an issue with no marker at all is still nothing to judge.
+        self.assertEqual(self.post([], event={"issue": {"number": 5}}).returncode, 0)
+
+    def test_an_edit_without_its_earlier_body_or_an_unknown_action_refuses(self) -> None:
+        approve = SIGNED_APPROVE.format(head=HEAD)
+        for action in ("created", "deleted"):
+            self.post(self.answers(self.approved(), SIGNERS),
+                      event=self.comment_event(action, approve))
+            self.assertEqual(self.posted()["state"], "success", f"control {action}")
+        # An edit that removed a HOLD but carries no earlier body would let
+        # the HOLD vanish: every edit must carry ``changes.body.from``.
+        for changes in ({}, {"title": {"from": "x"}}, {"body": {"from": None}}, [], None):
+            event = self.comment_event("edited", approve, before=HOLD_BODY)
+            event["changes"] = changes
+            self.assert_refused(event)
+        for action in ("pinned", "", None, 5, ["edited"], {"edited": True}):
+            event = self.comment_event("deleted", approve)
+            event["action"] = action
+            self.assert_refused(event)
+
+    def test_a_malformed_pull_request_record_refuses(self) -> None:
+        event = {"pull_request": {"number": 784}}
+        result = self.post(self.answers(self.approved(), SIGNERS), "pull_request_target",
+                           copy.deepcopy(event))
+        self.assertEqual(result.returncode, 0, f"control: {result.stdout}{result.stderr}")
+
+        def broken(change: Any) -> list[tuple[str, dict[str, Any]]]:
+            answers = self.answers(self.approved(), SIGNERS)
+            pull = next(answer["json"] for needle, answer in answers if needle == "/pulls/")
+            change(pull)
+            return answers
+
+        changes = [
+            lambda pull: pull.update(state=""), lambda pull: pull.update(state=None),
+            lambda pull: pull.update(head="x"), lambda pull: pull.update(head={}),
+            lambda pull: pull["head"].update(sha=""), lambda pull: pull["head"].update(sha=7),
+            lambda pull: pull.update(base=None), lambda pull: pull["base"].update(ref=["main"]),
+            lambda pull: pull["base"].update(repo="x"),
+            lambda pull: pull["base"]["repo"].pop("default_branch"),
+            lambda pull: pull.update(user=None), lambda pull: pull["user"].update(login=""),
+        ]
+        for change in changes:
+            self.assert_refused(copy.deepcopy(event), "pull_request_target", broken(change))
+            # The comment path reads the same record.
+            self.assert_refused(self.comment_event("created", "thanks"),
+                                answers=broken(change))
+
+    def test_an_edit_history_answer_must_be_well_formed(self) -> None:
+        from unittest import mock
+        guard = arm.guard
+        never = {"data": {"node": {"lastEditedAt": None}}}
+        with mock.patch.object(guard, "graphql", return_value=never):
+            self.assertIsNone(guard.comment_last_edited("IC_1"), "control")
+        for answer in (dict(never, errors=[]), dict(never, errors={}), dict(never, errors=""),
+                       dict(never, errors=0), {"data": ["x"]}, {"data": "x"}, {"data": None},
+                       {"data": {"node": "x"}}, {"data": {"node": {}}},
+                       {"data": {"node": {"lastEditedAt": 5}}}, [], None):
+            with mock.patch.object(guard, "graphql", return_value=answer), \
+                    self.assertRaises(guard.GuardError, msg=answer):
+                guard.comment_last_edited("IC_1")
 
     def retargeted(self, base_config: str) -> list[tuple[str, dict[str, Any]]]:
         answers = self.answers([], SIGNERS)
@@ -1082,7 +1161,8 @@ class CarryFromAHeldHead(unittest.TestCase):
 
         def real_gh(arguments: list[str]) -> Any:
             if arguments[-1] == f"repos/{REPO}/pulls/7":
-                return {"state": "open", "head": {"sha": self.H2}}
+                return {"state": "open", "head": {"sha": self.H2}, "user": {"login": "author"},
+                        "base": {"ref": "main", "repo": {"default_branch": "main"}}}
             if "/statuses/" in " ".join(arguments):
                 posted.append(arguments)
                 return {}

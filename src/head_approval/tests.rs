@@ -4691,7 +4691,8 @@ fn an_approve_edited_in_its_own_second_is_refused_by_graphql() {
 /// cannot be checked, so it never approves.
 #[test]
 fn an_api_comment_with_no_node_id_never_approves() {
-    let comments = [json!({"id": 7, "updated_at": "2026-10-12T01:00:00Z"})];
+    let comments = [json!({"id": 7, "at": "2026-10-12T01:00:00Z",
+                           "updated_at": "2026-10-12T01:00:00Z"})];
     let approved = HeadGate::Approved {
         approval: Approval::Marker {
             login: "shipyard-local[bot]".to_owned(),
@@ -4724,7 +4725,8 @@ fn a_deciding_comment_without_edit_metadata_never_approves() {
         },
     };
     let gh = |_: &[String]| Ok(json!({"data": {"node": {"lastEditedAt": null}}}).to_string());
-    let good = json!({"id": 7, "node_id": "IC_7", "updated_at": "2026-10-12T01:00:00Z"});
+    let good = json!({"id": 7, "node_id": "IC_7", "at": "2026-10-12T01:00:00Z",
+                      "updated_at": "2026-10-12T01:00:00Z"});
     assert!(
         super::edit_checked(&gh, HEAD, std::slice::from_ref(&good), approved.clone())
             .expect("control: readable")
@@ -4811,4 +4813,61 @@ fn noncomparable_edit_times_count_as_edited() {
     assert!(super::comment_edited(
         &json!({"updated_at": "2026-10-12T01:00:00Z"})
     ));
+}
+
+/// Both edit stamps are parsed before they are compared: identical malformed
+/// strings are not "never edited", so an APPROVE carrying them never counts,
+/// even when GraphQL reports `lastEditedAt: null`.
+#[test]
+fn identical_malformed_edit_stamps_count_as_edited() {
+    let at = "2026-10-12T01:00:00Z";
+    let record = |created: Value, updated: Value| json!({"at": created, "updated_at": updated});
+    assert_eq!(super::comment_edit_stamps(&json!({"at": at})), Ok(None));
+    assert!(matches!(
+        super::comment_edit_stamps(&record(json!(at), json!(at))),
+        Ok(Some((created, updated))) if created == updated
+    ));
+    let malformed = [
+        (json!("yesterday"), json!("yesterday")),
+        (json!(""), json!("")),
+        (json!("2026-10-12"), json!("2026-10-12")),
+        (Value::Null, Value::Null),
+        (json!(5), json!(5)),
+        (json!({}), json!({})),
+        (json!([]), json!([])),
+        (json!(true), json!(true)),
+        (json!(at), json!("yesterday")),
+        (json!("yesterday"), json!(at)),
+        (Value::Null, json!(at)),
+    ];
+    for (created, updated) in malformed {
+        let bad = record(created, updated);
+        assert!(super::comment_edit_stamps(&bad).is_err(), "{bad}");
+        assert!(super::comment_edited(&bad), "{bad}");
+    }
+    let mut missing_at = record(json!(at), json!(at));
+    missing_at.as_object_mut().expect("object").remove("at");
+    assert!(super::comment_edit_stamps(&missing_at).is_err());
+    assert!(super::comment_edited(&missing_at));
+
+    // The deciding APPROVE with identical malformed stamps is refused even
+    // when GraphQL says it was never edited.
+    let approved = HeadGate::Approved {
+        approval: Approval::Marker {
+            login: "shipyard-local[bot]".to_owned(),
+            comment_id: Some(7),
+            performed_via_github_app_id: None,
+        },
+    };
+    let gh = |_: &[String]| Ok(json!({"data": {"node": {"lastEditedAt": null}}}).to_string());
+    let good = json!({"id": 7, "node_id": "IC_7", "at": at, "updated_at": at});
+    assert!(
+        super::edit_checked(&gh, HEAD, std::slice::from_ref(&good), approved.clone())
+            .expect("control: readable")
+            .allows()
+    );
+    let mut bad = good.clone();
+    bad["at"] = json!("yesterday");
+    bad["updated_at"] = json!("yesterday");
+    assert!(super::edit_checked(&gh, HEAD, std::slice::from_ref(&bad), approved).is_err());
 }
