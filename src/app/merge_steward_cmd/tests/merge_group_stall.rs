@@ -563,6 +563,7 @@ fn a_stalled_row_reads_merge_group_stalled_and_reports_a_line() {
             blocked_on: "queued".to_owned(),
             ..Default::default()
         },
+        required_checks: Vec::new(),
     }];
     merge_group_stall::annotate(&pass, &mut reports);
     assert_eq!(

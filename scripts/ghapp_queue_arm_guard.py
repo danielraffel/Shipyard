@@ -1779,6 +1779,30 @@ def _reviewer_counts(
     )
 
 
+EDITED_REFUSAL = "it was edited after it was posted"
+
+
+def comment_edited(comment: dict[str, Any]) -> bool:
+    """Whether a comment's text changed after it was posted.
+
+    Any token with ``pull-requests: write`` (a pull request's own workflow
+    included) can edit any comment in the repository, and the author stays
+    who posted it (merge-queue-rehearsal#47 proved it on an App comment). So
+    an edited body says nothing about what its author wrote. GitHub moves
+    ``updated_at`` on an edit and not on a reaction. A record without
+    ``updated_at`` is one this module did not read from the API; one whose
+    times cannot be compared counts as edited."""
+    created_raw = comment.get("created_at")
+    updated_raw = comment.get("updated_at")
+    if updated_raw is None:
+        return False
+    if updated_raw == created_raw:
+        return False
+    created = _timestamp(created_raw)
+    updated = _timestamp(updated_raw)
+    return created is None or updated is None or updated != created
+
+
 def counting_verdicts(
     author: str | None,
     comments: list[dict[str, Any]],
@@ -1808,6 +1832,11 @@ def counting_verdicts(
         body = comment.get("body")
         found = marker_verdict(body) if isinstance(body, str) else None
         if not isinstance(login, str) or found is None:
+            continue
+        if found[0] == "APPROVE" and comment_edited(comment):
+            # An edited APPROVE never counts. An edited HOLD still holds: it
+            # can only refuse more.
+            EXCLUDED_APPROVALS.append(f"{login} ({EDITED_REFUSAL})")
             continue
         if _reviewer_counts(login, comment.get("author_association"), policy, author, found[0],
                             (comment.get("user") or {}).get("type") == "Bot", body):
@@ -1914,6 +1943,7 @@ def _deciding_approval_comment(
         body = comment.get("body")
         if (isinstance(login, str) and isinstance(body, str)
                 and marker_verdict(body) == ("APPROVE", head)
+                and not comment_edited(comment)
                 and _timestamp(comment.get("created_at")) == latest[0]
                 and _reviewer_counts(login, comment.get("author_association"), policy, author,
                                      "APPROVE", (comment.get("user") or {}).get("type") == "Bot",
@@ -3415,6 +3445,17 @@ def _rest_pages(path: str) -> list[dict[str, Any]]:
     return records
 
 
+def default_branch(pull: Any) -> str:
+    """The repository's default branch, as the pull request's own answer
+    names it (``base.repo.default_branch``). Raises when it is missing: the
+    policy is never read from a branch the pull request chose."""
+    branch = (((pull.get("base") or {}).get("repo") or {}).get("default_branch")
+              if isinstance(pull, dict) else None)
+    if not isinstance(branch, str) or not branch:
+        raise GuardError("the pull request does not name its repository's default branch")
+    return branch
+
+
 def base_config_text(repo: str, base: str) -> str | None:
     """The base branch's ``.shipyard/config.toml``, or ``None`` when it has none."""
     real_gh = os.environ.get("GHAPP_REAL_GH", "/opt/homebrew/bin/gh")
@@ -3517,7 +3558,11 @@ def _review_gate(classification: dict[str, Any], repo: str | None, dry_run: bool
         base = ((pull.get("base") or {}).get("ref")) if isinstance(pull, dict) else None
         if not isinstance(base, str) or not base:
             raise GuardError("the pull request carries no base branch")
-        config_text = base_config_text(repo, base)
+        # The policy comes from the default branch, never the pull request's
+        # base: a pull request chooses its base, and a branch no ruleset
+        # protects can carry a config that turns review off or names any
+        # reviewer (verdict-App review N4).
+        config_text = base_config_text(repo, default_branch(pull))
         policy = review_policy(config_text, repo, True)
         if not policy["required"] and not host_requires_guard():
             # A host that requires guard admission never takes this early

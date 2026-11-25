@@ -1139,6 +1139,7 @@ pub(super) fn apply_pr_plans_with_poison(
             mutation,
             error,
             blocked: super::blocked_on::Stall::default(),
+            required_checks: Vec::new(),
         }
     };
     let mut indexed = Vec::with_capacity(order.len());
@@ -1167,6 +1168,17 @@ pub(super) fn apply_pr_plans_with_poison(
     let approval_blockers = mutation_context
         .map(|context| context.approval_blockers.take())
         .unwrap_or_default();
+    // Which check or status each required rule selects, so a rollout can
+    // prove this host picks the verdict App's status before a ruleset binds it.
+    for report in &mut reports {
+        if let Some(pr) = observation
+            .prs
+            .iter()
+            .find(|pr| pr.fact.number == report.number)
+        {
+            report.required_checks = crate::merge_steward::required_selections(&pr.fact, policy);
+        }
+    }
     super::blocked_on::annotate(
         actions,
         observation,
@@ -1226,6 +1238,7 @@ fn provenance_blocked_report(
         mutation,
         error,
         blocked: super::blocked_on::Stall::default(),
+        required_checks: Vec::new(),
     })
 }
 

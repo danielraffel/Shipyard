@@ -2852,9 +2852,11 @@ impl History {
             return Some(Ok("2026-10-11T00:00:00Z\n".to_owned()));
         }
         if joined.contains("pulls/7 --jq {head") {
-            return Some(Ok(json!({"head": self.approved, "base": "main",
+            return Some(Ok(
+                json!({"head": self.approved, "base": "main", "default_branch": "main",
                                   "author": "shipyard-local[bot]"})
-            .to_string()));
+                .to_string(),
+            ));
         }
         if joined.contains("/comments") {
             // With a base signer list the repository-side rule applies: a
@@ -4505,4 +4507,109 @@ fn a_non_boolean_fleet_review_switch_on_the_base_is_unreadable() {
             .expect("a boolean switch reads");
         assert!(policy.required, "{policy:?}");
     });
+}
+
+// ---------------------------------------------------------------------------
+// An edited verdict comment (merge-queue-rehearsal#47, 2026-11-24): a pull
+// request's own `GITHUB_TOKEN` with `pull-requests: write` edited an App
+// comment into new text, and the author stayed `shipyard-local[bot]`.
+// ---------------------------------------------------------------------------
+
+/// `comment` as GitHub reports it after an edit at `edited_at`.
+fn edited(mut comment: Value, edited_at: &str) -> Value {
+    comment["updated_at"] = json!(edited_at);
+    comment
+}
+
+#[test]
+fn an_edited_approve_does_not_approve_its_head() {
+    let policy = pulp_signed();
+    let approve = signed_verdict(
+        7,
+        "2026-11-24T01:52:01Z",
+        "pulp-review",
+        "fleet-pass-reviewer-1",
+        "APPROVE",
+        HEAD,
+    );
+    super::with_host_sessions(None, || {
+        // Control: the same comment, never edited (`updated_at == created_at`).
+        let unedited = edited(approve.clone(), "2026-11-24T01:52:01Z");
+        assert!(allows(&policy, &[unedited], None));
+        let forged = edited(approve.clone(), "2026-11-24T01:52:24Z");
+        assert!(!allows(&policy, std::slice::from_ref(&forged), None));
+        assert_eq!(
+            super::verdict_audit_events(HEAD, &[], &[forged], &policy, None),
+            vec!["excluded_edited_approval:shipyard-local[bot]".to_owned()]
+        );
+        // Times that cannot be compared count as edited.
+        assert!(!allows(&policy, &[edited(approve, "yesterday")], None));
+    });
+}
+
+#[test]
+fn an_edited_approve_of_an_earlier_head_names_no_head_a_carry_could_start_from() {
+    let policy = pulp_signed();
+    let approve = signed_verdict(
+        7,
+        "2026-11-24T01:52:01Z",
+        "pulp-review",
+        "fleet-pass-reviewer-1",
+        "APPROVE",
+        OTHER,
+    );
+    let input = |comments: &[Value]| {
+        super::verdict_heads(&super::CarryInput {
+            repo: "Generous-Corp/pulp",
+            pr: 1,
+            head: HEAD,
+            reviews: &[],
+            comments,
+            policy: &policy,
+            author: None,
+        })
+    };
+    super::with_host_sessions(None, || {
+        assert_eq!(
+            input(std::slice::from_ref(&approve)),
+            vec![OTHER.to_owned()]
+        );
+        assert!(input(&[edited(approve, "2026-11-24T01:52:24Z")]).is_empty());
+    });
+}
+
+#[test]
+fn an_edited_hold_still_holds() {
+    let policy = pulp_signed();
+    let comments = [
+        signed_verdict(
+            1,
+            "2026-10-31T14:40:00Z",
+            "pulp-review",
+            "fleet-pass-reviewer-1",
+            "APPROVE",
+            HEAD,
+        ),
+        edited(
+            signed_verdict(
+                2,
+                "2026-10-31T15:21:00Z",
+                "pulp-review",
+                "fleet-pass-reviewer-1",
+                "HOLD",
+                HEAD,
+            ),
+            "2026-10-31T15:30:00Z",
+        ),
+    ];
+    super::with_host_sessions(None, || {
+        assert!(allows(&policy, &comments[..1], None));
+        assert!(!allows(&policy, &comments, None));
+    });
+}
+
+#[test]
+fn every_comment_record_reader_carries_updated_at() {
+    // Without `updated_at` an edit is invisible to `comment_edited`.
+    assert!(super::COMMENT_RECORD_JQ.contains("updated_at: .updated_at"));
 }

@@ -115,6 +115,10 @@ pub(super) fn runner_command<W: Write>(
     json: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
+    // The steward, its recovery worker and admission read commit statuses;
+    // a configured verdict App's status must map to its app id in all of them.
+    crate::merge_steward::load_status_app(&runtime_paths.global_dir)
+        .map_err(|error| CliFailure::new(2, error))?;
     let actions = GitHubActions::from_loaded_config(cwd, config);
     runner_command_with_actions(
         command,

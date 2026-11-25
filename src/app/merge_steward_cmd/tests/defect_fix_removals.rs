@@ -220,6 +220,7 @@ fn a_refused_row_reads_defect_fix_removed_with_the_repair_lane_next() {
         mutation: None,
         error: None,
         blocked: crate::app::merge_steward_cmd::blocked_on::Stall::default(),
+        required_checks: Vec::new(),
     }];
     crate::app::merge_steward_cmd::merge_group_stall::annotate_defect_fix(
         &reading,

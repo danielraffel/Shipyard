@@ -14,9 +14,26 @@ fn gh(
     reviews: Vec<Value>,
     comments: Vec<Value>,
 ) -> impl Fn(&[String]) -> Result<String, String> {
+    gh_into("main", live, config, reviews, comments)
+}
+
+/// [`gh`] for a pull request into `base` of a repository whose default
+/// branch is `main`; the config is answered only from `main`.
+fn gh_into(
+    base: &'static str,
+    live: &'static str,
+    config: Option<&'static str>,
+    reviews: Vec<Value>,
+    comments: Vec<Value>,
+) -> impl Fn(&[String]) -> Result<String, String> {
     move |args: &[String]| {
         let joined = args.join(" ");
         if joined.contains("contents/.shipyard/config.toml") {
+            if !joined.contains("?ref=main") {
+                return Err(format!(
+                    "config read from a branch other than main: {joined}"
+                ));
+            }
             return config
                 .map(str::to_owned)
                 .ok_or_else(|| "gh: Not Found (HTTP 404)".to_owned());
@@ -36,9 +53,9 @@ fn gh(
                 .join("\n"));
         }
         if joined.contains("pulls/7 --jq {head") {
-            return Ok(
-                json!({"head": live, "base": "main", "author": "shipyard-local[bot]"}).to_string(),
-            );
+            return Ok(json!({"head": live, "base": base, "default_branch": "main",
+                       "author": "shipyard-local[bot]"})
+            .to_string());
         }
         if joined.contains("/commits/") && joined.contains(".commit.committer.date") {
             return Ok("2026-10-14T16:00:00Z\n".to_owned());
@@ -247,4 +264,26 @@ fn a_hold_then_a_later_approve_of_the_same_head_is_refused() {
     );
     let fix = verdict.fix.as_deref().expect("a refusal names its fix");
     assert!(fix.contains("pushes a new head"), "{fix}");
+}
+
+/// A pull request chooses its base, and only the default branch is
+/// protected: the policy is read from the default branch, and a pull request
+/// into any other branch is refused even with a counted approval
+/// (verdict-App review N4).
+#[test]
+fn a_pull_request_into_another_branch_is_refused_and_policy_comes_from_main() {
+    let approved = || vec![app_approval(HEAD, Some("pulp-review"))];
+    // Control: into main, the same approval allows the head.
+    let into_main = gh_into("main", HEAD, Some(SIGNED), vec![], approved());
+    let verdict =
+        review_verdict(&into_main, "danielraffel/tartci", 7, None, false).expect("judged");
+    assert!(verdict.allowed(), "{verdict:?}");
+    let stacked = gh_into("b0", HEAD, Some(SIGNED), vec![], approved());
+    let verdict = review_verdict(&stacked, "danielraffel/tartci", 7, None, false).expect("judged");
+    assert!(!verdict.allowed(), "{verdict:?}");
+    assert_eq!(verdict.base, "b0");
+    assert!(
+        verdict.reason.contains("not the default branch main"),
+        "{verdict:?}"
+    );
 }

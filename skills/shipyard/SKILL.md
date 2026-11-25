@@ -851,6 +851,20 @@ match on `head:<sha>` alone, or a ruling would count. Tests:
 `AdversarialRulingIsNoVerdict` (arm guard), the `Stamp` ruling cases (stamper),
 `an_adversarial_ruling_is_never_a_verdict` (Rust).
 
+## An edited verdict comment counts for nothing
+
+Any token with `pull-requests: write`, a pull request's own workflow token
+included, can edit or delete any comment in the repository, and the author
+stays who posted it (merge-queue-rehearsal#47). So every verdict reader
+judges a comment's text only when it was never edited: REST `updated_at`
+equal to `created_at` (`comment_edited` in `ghapp_queue_arm_guard.py` and
+`src/head_approval.rs`; GraphQL `lastEditedAt` in the relay). An edited
+APPROVE never approves or carries; an edited HOLD still holds. A HOLD that
+was deleted or edited away still holds through the `review-verdict` poster:
+see docs/review-verdict-status.md. A new reader of comment records must carry
+`updated_at` (`COMMENT_RECORD_JQ`). A legitimate reviewer posts a new verdict
+rather than editing an old one.
+
 ## merge-guard is versioned and tested here
 
 `merge-guard` (refuses `pr merge` on a private repo that cannot enforce

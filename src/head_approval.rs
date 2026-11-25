@@ -1525,11 +1525,52 @@ fn reviewer_allowed(record: &Value, policy: &ApprovalPolicy, author: Option<&str
         && author.is_none_or(|author| normalized_login(author) != reviewer)
 }
 
+/// Why an approval counts for nothing once its comment was edited.
+pub(crate) const EDITED_REFUSAL: &str = "it was edited after it was posted";
+
+/// Whether a comment record's text changed after it was posted: its
+/// `updated_at` differs from its `at` (`created_at`).
+///
+/// Any token with `pull-requests: write`, a pull request's own workflow
+/// included, can edit any comment in the repository, and the author stays
+/// who posted it (merge-queue-rehearsal#47 proved it on an App comment). An
+/// edited body says nothing about what its author wrote, so an edited APPROVE
+/// never counts; an edited HOLD still holds, since it can only refuse more.
+/// GitHub moves `updated_at` on an edit, not on a reaction. A record with no
+/// `updated_at` is a review (reviews have none); every comment reader's jq
+/// carries it ([`COMMENT_RECORD_JQ`]). Times that cannot be compared count
+/// as edited.
+pub(crate) fn comment_edited(record: &Value) -> bool {
+    let Some(updated) = record.get("updated_at").filter(|value| !value.is_null()) else {
+        return false;
+    };
+    let Some(updated) = updated.as_str() else {
+        return true;
+    };
+    let created = record.get("at").and_then(Value::as_str);
+    if created == Some(updated) {
+        return false;
+    }
+    let parse = |text: &str| {
+        DateTime::parse_from_rfc3339(text)
+            .ok()
+            .map(|at| at.with_timezone(&Utc))
+    };
+    match (created.and_then(parse), parse(updated)) {
+        (Some(created), Some(updated)) => created != updated,
+        _ => true,
+    }
+}
+
 /// Whether an approval by `record`'s login counts, beyond
-/// [`reviewer_allowed`]: under the default rule (no reviewer listed) only the
+/// [`reviewer_allowed`]: an edited comment never approves
+/// ([`comment_edited`]); under the default rule (no reviewer listed) only the
 /// fleet App or a listed human reviewer approves. A repository that lists
 /// `reviewer_identities` decides by that list alone.
 fn approver_allowed(record: &Value, policy: &ApprovalPolicy) -> bool {
+    if comment_edited(record) {
+        return false;
+    }
     if !(policy.any_reviewer_but_author && policy.reviewer_logins.is_empty()) {
         return true;
     }
@@ -1736,7 +1777,9 @@ pub fn verdict_audit_events(
             && !approver_allowed(record, policy)
             && let Some(login) = login(record)
         {
-            events.push(if is_fleet_author(login) {
+            events.push(if comment_edited(record) {
+                format!("excluded_edited_approval:{login}")
+            } else if is_fleet_author(login) {
                 format!(
                     "excluded_app_approval:{}",
                     app_approval_refusal(record, policy).unwrap_or_default()
@@ -2479,7 +2522,9 @@ pub fn read_policy_required(
 /// A review as the gate reads it.
 const REVIEW_RECORD_JQ: &str = ".[] | {id: .id, login: .user.login, type: .user.type, association: .author_association, at: .submitted_at, state: .state, commit_id: .commit_id, body: .body, performed_via_github_app_id: .performed_via_github_app.id}";
 /// A comment as the gate reads it.
-const COMMENT_RECORD_JQ: &str = ".[] | {id: .id, login: .user.login, type: .user.type, association: .author_association, at: .created_at, body: .body, performed_via_github_app_id: .performed_via_github_app.id}";
+/// `updated_at` is load-bearing: without it [`comment_edited`] cannot see an
+/// edit.
+pub(crate) const COMMENT_RECORD_JQ: &str = ".[] | {id: .id, login: .user.login, type: .user.type, association: .author_association, at: .created_at, updated_at: .updated_at, body: .body, performed_via_github_app_id: .performed_via_github_app.id}";
 
 fn read_records(run_gh: RunGh<'_>, path: &str, jq: &str) -> Result<Vec<Value>, String> {
     let raw = run_gh(&[

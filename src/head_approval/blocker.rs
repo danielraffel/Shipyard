@@ -12,8 +12,9 @@ use serde::Serialize;
 use serde_json::Value;
 
 use super::{
-    ApprovalPolicy, HeadGate, Verdict, app_approval_refusal_reason, approver_allowed, head_hold,
-    hold_signer, is_fleet_author, login, marker_verdict, normalized_login, reviewer_allowed,
+    ApprovalPolicy, EDITED_REFUSAL, HeadGate, Verdict, app_approval_refusal_reason,
+    approver_allowed, comment_edited, head_hold, hold_signer, is_fleet_author, login,
+    marker_verdict, normalized_login, reviewer_allowed,
 };
 
 /// Why the approval gate refuses a head.
@@ -247,6 +248,9 @@ fn exclusion(
     }
     if approver_allowed(record, policy) {
         return None;
+    }
+    if comment_edited(record) {
+        return Some(("edited", EDITED_REFUSAL.to_owned()));
     }
     if is_fleet_author(who) {
         return app_approval_refusal_reason(record, policy);

@@ -132,6 +132,7 @@ fn report(decision: StewardDecision) -> Vec<PrReport> {
         mutation: None,
         error: None,
         blocked: crate::app::merge_steward_cmd::blocked_on::Stall::default(),
+        required_checks: Vec::new(),
     }]
 }
 
@@ -1307,6 +1308,7 @@ fn an_uncertain_mutation_for_one_pr_does_not_stop_arming_another() {
         mutation: None,
         error: None,
         blocked: crate::app::merge_steward_cmd::blocked_on::Stall::default(),
+        required_checks: Vec::new(),
     });
 
     let (status, unhealthy) = apply_native_arm_backstop(

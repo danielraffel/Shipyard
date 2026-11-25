@@ -534,7 +534,16 @@ fn scan_comments(pr: &Value, head: &str) -> (Option<String>, Option<Claim>, Opti
         if !trusted_author(comment) {
             continue;
         }
+        // Any token with `pull-requests: write` can edit a comment and keep
+        // its author, so an edited APPROVE is not the author's word. An
+        // edited HOLD still counts: it can only hold.
+        let edited = comment
+            .get("lastEditedAt")
+            .is_some_and(|value| !value.is_null());
         for found in verdict_regex().captures_iter(body) {
+            if edited && found[1].eq_ignore_ascii_case("APPROVE") {
+                continue;
+            }
             if &found[2] == head {
                 verdict = Some(found[1].to_ascii_uppercase());
             }
@@ -745,7 +754,7 @@ pub(crate) fn pr_fields(number: u64) -> String {
         "pr{number}: pullRequest(number:{number}){{id number state merged isDraft isInMergeQueue \
          mergeStateStatus headRefOid baseRefName baseRefOid \
          baseRef{{associatedPullRequests(states:[MERGED],last:1){{nodes{{number}}}}}} \
-         comments(last:30){{nodes{{body createdAt authorAssociation author{{__typename login}}}}}} \
+         comments(last:30){{nodes{{body createdAt lastEditedAt authorAssociation author{{__typename login}}}}}} \
          commits(last:1){{nodes{{commit{{statusCheckRollup{{contexts(first:100){{totalCount nodes{{\
          ... on CheckRun{{name status conclusion isRequired(pullRequestNumber:{number})}} \
          ... on StatusContext{{context state isRequired(pullRequestNumber:{number})}}}}}}}}}}}}}}}}"

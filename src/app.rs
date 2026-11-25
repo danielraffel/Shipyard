@@ -284,6 +284,13 @@ where
         cli.global_dir.clone(),
         cli.state_dir.clone(),
     );
+    // Every command that reads commit statuses (`wait`, `pr`, `watch`, the
+    // steward) maps a configured verdict App's status to its app id. Here a
+    // malformed setting only warns; `runner` and `advance` load it again and
+    // refuse to run on one.
+    if let Err(error) = crate::merge_steward::load_status_app(&runtime_paths.global_dir) {
+        eprintln!("shipyard: warning: {error}; the verdict App's status is not recognized");
+    }
     // Daemon control uses only explicit runtime paths and IPC. Resolving an
     // unrelated checkout here made `daemon status` block when an external
     // volume's cwd was temporarily unavailable.
@@ -589,6 +596,8 @@ where
             head,
             dry_run,
         } => {
+            crate::merge_steward::load_status_app(&runtime_paths.global_dir)
+                .map_err(|error| CliFailure::new(2, error))?;
             return advance_cmd::advance_command(
                 cli.mode.into(),
                 &cwd,

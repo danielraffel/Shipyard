@@ -45,7 +45,7 @@ impl Fixture {
                 "isInMergeQueue": false, "mergeQueueEntry": null, "autoMergeRequest": null,
                 "repository": {"nameWithOwner": REPO},
                 "timelineItems": {"pageInfo": {"hasPreviousPage": false}, "nodes": []}}}}}],
-            ["/pulls/4242", {"json": {"number": 4242, "base": {"ref": "main"},
+            ["/pulls/4242", {"json": {"number": 4242, "base": {"ref": "main", "repo": {"default_branch": "main"}},
                 "head": {"sha": HEAD}, "user": {"login": "shipyard-local[bot]", "type": "Bot"}}}],
         ]);
         let table = temp.path().join("answers.json");

@@ -127,7 +127,7 @@ class Hub:
     def pull(self, number: int, branch: str, head: str, head_repo: str = REPO) -> None:
         self.pulls.append({"number": number, "state": "open", "draft": False, "head": {
             "ref": branch, "sha": head, "repo": {"full_name": head_repo}},
-            "base": {"ref": "main"}, "user": {"login": "author"}})
+            "base": {"ref": "main", "repo": {"default_branch": "main"}}, "user": {"login": "author"}})
 
     def find(self, number: int) -> dict[str, Any]:
         return next(pull for pull in self.pulls if pull["number"] == number)

@@ -57,6 +57,7 @@ import json
 import os
 import pathlib
 import shutil
+import subprocess
 import sys
 import tempfile
 from types import ModuleType
@@ -81,6 +82,17 @@ AWAITING_CAUSES = frozenset({"unreviewed", "approval_does_not_carry", "admission
 # from the fleet admission check run instead of comments; its completion
 # reaches this workflow as a ``check_run`` event (see event_target).
 RECEIPT_REFUSAL = "reviewer claim receipt refused"
+# Every failure this status posts for a held head starts with this, then the
+# head's first 12 characters (the guard's own HOLD message, cut by
+# ``describe``). A later run reads it back from the head's status history.
+HOLD_PREFIX = "a HOLD naming head "
+# The creator GitHub records on a status posted with a workflow's token.
+ACTIONS_BOT = "github-actions[bot]"
+# The dedicated verdict App's leg (see post_as_app). The id and bot login are
+# public; only the token, minted per job from a main-only environment, is not.
+APP_ID_ENV = "REVIEW_VERDICT_APP_ID"
+APP_TOKEN_ENV = "REVIEW_VERDICT_APP_TOKEN"
+APP_BOT_ENV = "REVIEW_VERDICT_APP_BOT_LOGIN"
 
 
 class Decision(NamedTuple):
@@ -144,6 +156,8 @@ def describe(allowed: bool, message: str) -> str:
 
 def exclusion_code(reason: str) -> str:
     """A short stable code for why the guard did not count an approval."""
+    if "edited after it was posted" in reason:
+        return "edited"
     if "unattributed" in reason or "no `ghapp` session stamp" in reason:
         return "unattributed"
     if "reviewer_stamp_sessions" in reason:
@@ -157,8 +171,30 @@ def exclusion_code(reason: str) -> str:
     return "unlisted_human" if "(" not in reason else "uncounted"
 
 
+def base_refusal(guard: ModuleType, repo: str, number: int) -> str | None:
+    """Why pull request ``number`` is not judged at all: its base is not the
+    repository's default branch. Rulesets protect only the default branch, so
+    a pull request into any other branch could be judged there under a config
+    that branch carries, then retargeted to the default branch with the
+    status still standing on its head (verdict-App review N4). The status is
+    never ``success`` for such a pull request; a retarget re-runs this job
+    (``pull_request_target: edited``)."""
+    pull = guard.run_real_gh(["api", f"repos/{repo}/pulls/{number}"])
+    if not isinstance(pull, dict):
+        raise guard.GuardError(f"PR #{number} is unreadable")
+    base = (pull.get("base") or {}).get("ref")
+    default = guard.default_branch(pull)
+    if not isinstance(base, str) or base != default:
+        return (f"PR #{number}: its base {base} is not the default branch {default}; only a "
+                f"pull request into {default} is judged")
+    return None
+
+
 def decide(guard: ModuleType, repo: str, number: int, head: str) -> Decision:
     """The guard's review-before-arm decision for ``head``, bound to it."""
+    refused_base = base_refusal(guard, repo, number)
+    if refused_base is not None:
+        return Decision(False, refused_base, "wrong_base", ())
     classification: dict[str, Any] = {
         "repo": repo, "pr": number, "head": head, "bound_head": head}
     # A status is read-only: it judges a carry but never logs one.
@@ -220,6 +256,113 @@ def open_pulls_on(guard: ModuleType, repo: str, head: str) -> list[int]:
         and pull.get("state") == "open"
         and ((pull.get("head") or {}).get("sha") or "").lower() == head.lower()
     )
+
+
+def removed_holds(guard: ModuleType, repo: str, number: int, head: str,
+                  event_name: str, event: dict[str, Any]) -> list[str]:
+    """Counted HOLDs naming ``head`` that this comment event carries.
+
+    Any token with ``pull-requests: write`` can delete or edit any comment and
+    keep its author (merge-queue-rehearsal#47), so the comment listing alone
+    cannot show a HOLD that was removed seconds after it was posted. GitHub's
+    own event payload still carries the text: the posted or deleted body,
+    and on an edit the body before it (``changes.body.from``). Each is
+    judged by the guard's own rule for a HOLD, under the default branch's
+    policy. Only HOLDs count from the payload, never an APPROVE."""
+    if event_name != "issue_comment":
+        return []
+    comment = event.get("comment") or {}
+    if not isinstance(comment, dict):
+        return []
+    bodies = [comment.get("body")]
+    if event.get("action") == "edited":
+        bodies.append(((event.get("changes") or {}).get("body") or {}).get("from"))
+    if not any(isinstance(body, str) and "HOLD" in body for body in bodies):
+        return []
+    pull = guard.run_real_gh(["api", f"repos/{repo}/pulls/{number}"])
+    if not isinstance(pull, dict):
+        raise guard.GuardError(f"PR #{number} is unreadable")
+    author = (pull.get("user") or {}).get("login")
+    policy = guard.review_policy(
+        guard.base_config_text(repo, guard.default_branch(pull)), repo, True)
+    holds = []
+    for body in bodies:
+        if not isinstance(body, str):
+            continue
+        record = {"id": comment.get("id"), "user": comment.get("user"),
+                  "author_association": comment.get("author_association"),
+                  "created_at": comment.get("created_at"), "body": body}
+        for _, verdict, named, what in guard.counting_verdicts(
+                author if isinstance(author, str) else None, [record], [], policy):
+            if verdict == "HOLD" and named == head.lower() and what not in holds:
+                holds.append(what)
+    return holds
+
+
+def status_creators() -> set[str]:
+    """The creator whose ``review-verdict`` statuses are this job's own: the
+    verdict App's bot once ``REVIEW_VERDICT_APP_BOT_LOGIN`` names it, else
+    ``github-actions[bot]``. Never both: every workflow in the repository posts
+    as ``github-actions[bot]``, so once the App posts, a ``github-actions``
+    failure is anyone's and must not hold a head."""
+    app_bot = os.environ.get(APP_BOT_ENV, "").strip()
+    return {app_bot} if app_bot else {ACTIONS_BOT}
+
+
+def held_in_history(guard: ModuleType, repo: str, head: str) -> str | None:
+    """A failure this job once posted on ``head`` for a HOLD, if any.
+
+    A HOLD makes its head un-approvable, and the head's status history keeps
+    every status ever posted on it, so a HOLD later deleted or edited away
+    still holds. Only statuses this job's own creators posted count."""
+    what = f"the statuses on {head[:12]}"
+    marker = f"{HOLD_PREFIX}{head[:12]}".lower()
+    creators = status_creators()
+    for page in read_pages(guard, f"repos/{repo}/commits/{head}/statuses?per_page=100", what):
+        if not isinstance(page, list):
+            raise guard.GuardError(f"{what} are unreadable")
+        for status in page:
+            if not isinstance(status, dict):
+                raise guard.GuardError(f"{what} contain a malformed status")
+            description = status.get("description")
+            if (status.get("context") == CONTEXT and status.get("state") == "failure"
+                    and (status.get("creator") or {}).get("login") in creators
+                    and isinstance(description, str)
+                    and description.lower().startswith(marker)):
+                return description
+    return None
+
+
+def post_as_app(arguments: list[str]) -> None:
+    """Post the same status as the dedicated verdict App, failing open.
+
+    Until a ruleset binds ``review-verdict`` to the App this leg is shadow
+    only, and after the bind a missing App status already leaves the rule
+    unmet. So a token that could not be minted or a refused post never fails
+    the job (that would turn every pull request red): it is logged as a
+    warning and the job goes on. The token is never printed."""
+    if not os.environ.get(APP_ID_ENV, "").strip():
+        return
+    token = os.environ.get(APP_TOKEN_ENV, "").strip()
+    if not token:
+        print(f"::warning title=review-verdict App leg::{APP_TOKEN_ENV} is empty (the token "
+              "could not be minted); the App status was not posted")
+        return
+    real_gh = os.environ.get("GHAPP_REAL_GH", "gh")
+    try:
+        completed = subprocess.run(
+            [real_gh, *arguments], check=False, capture_output=True, text=True, timeout=60,
+            env=dict(os.environ, GH_TOKEN=token))
+    except (OSError, subprocess.TimeoutExpired) as error:
+        print(f"::warning title=review-verdict App leg::the App post did not run: "
+              f"{type(error).__name__}")
+        return
+    if completed.returncode != 0:
+        tail = completed.stderr.replace(token, "***").strip()[-200:]
+        print(f"::warning title=review-verdict App leg::the App post failed "
+              f"(exit {completed.returncode}): {tail}")
+        return
+    print("review-verdict: posted the same status as the verdict App")
 
 
 def refresh_head_check(guard: ModuleType, repo: str, head: str) -> None:
@@ -318,6 +461,17 @@ def run(event_name: str, event: dict[str, Any], repo: str, run_url: str | None) 
     else:
         hard = next(d for _, d in refused if not d.awaiting)
         state, text = "failure", describe(False, hard.message + shared)
+    if state != "failure" and number is not None:
+        # A HOLD deleted or edited away still holds: from this event's own
+        # payload, else from a failure this job posted on the head before.
+        removed = removed_holds(guard, repo, number, head, event_name, event)
+        held = (f"{HOLD_PREFIX}{head[:12]} was removed after it was posted "
+                f"({removed[0]}); it still holds") if removed else held_in_history(
+                    guard, repo, head)
+        if held is not None:
+            state, allowed, awaiting = "failure", False, False
+            text = held if len(held) <= DESCRIPTION_LIMIT else held[: DESCRIPTION_LIMIT - 1] + "…"
+            print(f"review-verdict: head {head} stays held: {held}")
     arguments = [
         "api", "-X", "POST", f"repos/{repo}/statuses/{head}",
         "-f", f"state={state}",
@@ -326,6 +480,7 @@ def run(event_name: str, event: dict[str, Any], repo: str, run_url: str | None) 
     ]
     if run_url:
         arguments += ["-f", f"target_url={run_url}"]
+    post_as_app(arguments)
     guard.run_real_gh(arguments)
     for n, d in decisions:
         verdict = "allowed" if d.allowed else "awaiting" if d.awaiting else "refused"

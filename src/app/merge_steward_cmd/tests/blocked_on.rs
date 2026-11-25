@@ -299,6 +299,7 @@ fn the_summary_counts_tokens_and_lists_the_three_oldest_blocked() {
             since: since.map(str::to_owned),
             ..Stall::default()
         },
+        required_checks: Vec::new(),
     };
     let reports = [
         report(1, "no_verdict", Some("2026-10-31T10:00:00Z")),
@@ -348,6 +349,7 @@ fn the_summary_lists_and_counts_every_pull_request_the_base_poison_hold_kept_bac
             since: Some(since.to_owned()),
             ..Stall::default()
         },
+        required_checks: Vec::new(),
     };
     // Three older blocked rows fill the three-row list; the held rows are
     // younger than all of them and used to be dropped.
@@ -548,6 +550,13 @@ esac
     assert_eq!(first["since"], json!("2026-10-31T01:00:00Z"));
     assert_eq!(first["since_source"], json!("head_commit"));
     assert!(rendered["blocked_summary"]["oldest"].is_array());
+    // Each row names what the steward selected for every required rule, so a
+    // rollout can see it pick the verdict App's status before a bind.
+    let macos = first["required_checks"]
+        .as_array()
+        .and_then(|rules| rules.iter().find(|rule| rule["context"] == json!("macos")))
+        .unwrap_or_else(|| panic!("a required_checks row for macos: {first:#}"));
+    assert_eq!(macos["selected_source"], Value::Null, "{macos:#}");
 }
 
 /// The real `RemovedFromMergeQueueEvent` timeline of PR 8811: the queue
@@ -1326,6 +1335,7 @@ esac
         mutation: None,
         error: None,
         blocked: Stall::default(),
+        required_checks: Vec::new(),
     }];
     crate::head_approval::with_host_review_default(true, || {
         blocked_on::annotate(
@@ -1471,6 +1481,7 @@ fn a_pr_refusal_with_no_repo_error_is_named_in_exit_reasons() {
         mutation: None,
         error: error.map(str::to_owned),
         blocked: Stall::default(),
+        required_checks: Vec::new(),
     };
     let mut report =
         unreadable_repo_report("o/r", "main", &StewardLedger::default(), "boom".to_owned());
@@ -1564,6 +1575,7 @@ fn a_pr_error_is_serialized_with_its_kind() {
         mutation: None,
         error: error.map(str::to_owned),
         blocked: Stall::default(),
+        required_checks: Vec::new(),
     };
     let kind = |error: Option<&str>| {
         let value = serde_json::to_value(pr(error)).expect("serialize");
@@ -2021,6 +2033,7 @@ esac
             blocked_on: token.to_owned(),
             ..Stall::default()
         },
+        required_checks: Vec::new(),
     };
     let quarantine = crate::app::merge_steward_cmd::scheduling_loop::parse_quarantine(&format!(
         "danielraffel/Shipyard#1434 {HEAD} reviewer_unverified_exhausted since=1794020000\n"

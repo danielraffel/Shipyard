@@ -192,7 +192,7 @@ class ReviewGateHostRule(unittest.TestCase):
 
     def review_gate(self, config: str, require_file: bool) -> tuple[bool, str, Any]:
         classification = {"repo": "owner/repo", "pr": 7, "head": HEAD, "bound_head": HEAD}
-        pull = {"base": {"ref": "main"}, "head": {"sha": HEAD}, "user": {"login": "author"}}
+        pull = {"base": {"ref": "main", "repo": {"default_branch": "main"}}, "head": {"sha": HEAD}, "user": {"login": "author"}}
         with tempfile.TemporaryDirectory() as guards, \
                 mock.patch.object(guard, "_guards_dir", return_value=pathlib.Path(guards)), \
                 mock.patch.object(guard, "host_review_default", return_value=True), \

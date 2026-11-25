@@ -418,7 +418,9 @@ an App APPROVE must be signed with a `reviewer: <name>` line from the base's
 `[auto_merge] reviewer_signers`, else the host's `reviewer-signers.json`,
 where either exists, and never counts when stamped `unattributed` (the
 server-side `review-verdict` status also refuses one with no ghapp stamp, so
-post verdicts through `ghapp api .../issues/N/comments -f body=`); where the
+post verdicts through `ghapp api .../issues/N/comments -f body=`, and never
+edit one: an edited APPROVE counts for nothing anywhere, while an edited or
+deleted HOLD still holds); where the
 host's `reviewer-signers.json` has a `sessions` list, every `session:` line on
 the App APPROVE must be listed and one must be present, since a copied
 `reviewer:` line otherwise passes, and its single `ghapp` stamp must come

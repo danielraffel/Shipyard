@@ -624,6 +624,7 @@ pub(super) fn decide(
         mutation,
         error,
         blocked: super::blocked_on::Stall::default(),
+        required_checks: Vec::new(),
     };
     let key = receipt_key(repo, pr.fact.number, &entry.group_sha);
     if let Some(done) = ledger.doomed_dequeues.get(&key)

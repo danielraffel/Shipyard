@@ -90,6 +90,88 @@ fork pushing an approved commit). The status is `success` only when the guard
 allows the head for every open pull request whose head it is
 (`commits/{sha}/pulls`).
 
+## Edited and deleted verdicts
+
+A pull request's own workflow can edit or delete any comment in its
+repository with `pull-requests: write`, and an edited comment keeps its
+author. merge-queue-rehearsal#47 showed both on an App comment (PATCH 200,
+DELETE 204; `issues: write` alone and a read-only token got 403). So:
+
+- **An edited APPROVE counts for nothing.** A comment counts as an approval
+  only while its REST `updated_at` equals its `created_at`. A reaction does
+  not move `updated_at`; an edit does. The status names the exclusion
+  `edited`. The same rule holds in `queue-arm-guard`, `shipyard
+  review-verdict`, the steward's gate, `repair-check` (which refuses to judge
+  an edited newest verdict) and the relay. A reviewer who changes their mind
+  posts a new verdict.
+- **An edited HOLD still holds,** since it can only refuse more.
+- **A HOLD deleted or edited away still holds.** The `issue_comment` event
+  carries the text GitHub had: the created or deleted body, and on an edit
+  the body before it (`changes.body.from`). The poster judges that text by
+  the HOLD rule, and a counted HOLD naming the live head posts `failure`
+  (`a HOLD naming head <sha> was removed after it was posted (...); it still
+  holds`). Later runs read the head's status history: a `review-verdict`
+  `failure` starting `a HOLD naming head <sha>`, posted by this job's own
+  creator, keeps the head held. That creator is the verdict App's bot once
+  `REVIEW_VERDICT_APP_BOT_LOGIN` names it, else `github-actions[bot]`, never
+  both. Only a new
+  head can be approved, as with any HOLD.
+- **The steward needs no ledger of its own for this.** Every landing path it
+  takes requires the required checks green at the exact head, and once the
+  ruleset binds `review-verdict` to the verdict App only the App's status,
+  which the poster keeps failed, satisfies it.
+
+Residuals: a PR job with `actions: write` can cancel the poster run a
+deletion starts before it posts; a dismissed HOLD review leaves no payload
+text, so only an earlier failure in the status history keeps it held; and
+until the App posts, a PR workflow can post a `github-actions` failure that
+holds any head in the repository until that head's pull request pushes again. Vellum does not require `review-verdict` at all.
+
+## Which branch's policy
+
+The policy (`.shipyard/config.toml`) is read from the repository's default
+branch, never the pull request's base. A pull request chooses its base, and
+only the default branch is protected, so a branch could carry a config that
+turns review off or names any reviewer. A pull request whose base is not the
+default branch is refused outright (`failure`, "its base ... is not the
+default branch"), whatever it carries, so a status judged there cannot be
+carried to the default branch by a retarget. `pull_request_target: edited`
+re-runs the job when a pull request is retargeted. `queue-arm-guard` reads the
+policy from the default branch too; `shipyard review-verdict` refuses another
+base the same way.
+
+## The verdict App leg
+
+When `REVIEW_VERDICT_APP_ID` is set, the job posts the same status twice:
+first with `REVIEW_VERDICT_APP_TOKEN` (a token for the dedicated verdict App),
+then with the job's own token. The App leg fails open: an empty token (the
+mint step failed) or a refused post prints a `::warning` and never changes
+the exit code. Before a ruleset binds the App this keeps a bad key or an
+outage from turning every pull request red; after the bind, a missing App
+status already leaves the rule unmet. The token is never printed. In the
+workflow, the mint step carries `continue-on-error: true` and the poster step
+gets `REVIEW_VERDICT_APP_ID`, `REVIEW_VERDICT_APP_BOT_LOGIN` and
+`REVIEW_VERDICT_APP_TOKEN`.
+
+The steward maps a commit status to the App that posted it by its creator.
+GitHub Actions maps always. The verdict App maps only when the steward host's
+machine-global config names it:
+
+```toml
+[merge_steward.review_verdict_app]
+id = 1234567                     # the App's id, as the ruleset binds it
+bot_login = "fleet-verdict[bot]"
+bot_user_id = 7654321            # the bot user's id
+```
+
+Login and user id must both match. A setting naming GitHub Actions or
+malformed is refused, and `shipyard runner ...` stops instead of silently not
+recognizing an App a ruleset may require. Before a ruleset is bound, check
+which observation the steward selects: each pull request row in `shipyard
+runner steward --repo <repo> --json` carries `required_checks`, one entry per
+rule with `required_app_id`, `selected_source` (`check_run` or `status`),
+`selected_app_id` and `selected_state`.
+
 ## The job is the check
 
 The job is also the `review-verdict` check run, and it exits non-zero unless
@@ -232,7 +314,7 @@ name: Review verdict
 
 on:
   pull_request_target:
-    types: [opened, reopened, synchronize, ready_for_review]
+    types: [opened, reopened, synchronize, ready_for_review, edited]
   issue_comment:
     types: [created, edited, deleted]
   workflow_run:

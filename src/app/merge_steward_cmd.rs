@@ -130,6 +130,8 @@ struct PrReport {
     error: Option<String>,
     /// Why this pull request is not merging, and since when.
     blocked: blocked_on::Stall,
+    /// Which check or status the steward selects for each required rule.
+    required_checks: Vec<crate::merge_steward::RequiredSelection>,
 }
 
 /// Whether a pull request's `error` is a failed read this pass could not
@@ -181,6 +183,8 @@ struct PrReportWire {
     error_kind: Option<ErrorKind>,
     #[serde(flatten)]
     blocked: blocked_on::Stall,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    required_checks: Vec<crate::merge_steward::RequiredSelection>,
 }
 
 impl From<PrReport> for PrReportWire {
@@ -193,6 +197,7 @@ impl From<PrReport> for PrReportWire {
             mutation: report.mutation,
             error: report.error,
             blocked: report.blocked,
+            required_checks: report.required_checks,
         }
     }
 }

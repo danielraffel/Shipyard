@@ -92,6 +92,7 @@ fn report(number: u64, token: &str, since_minutes: Option<i64>) -> PrReport {
             }),
             ..Stall::default()
         },
+        required_checks: Vec::new(),
     }
 }
 

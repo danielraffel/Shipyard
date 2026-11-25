@@ -55,6 +55,15 @@ pub(super) fn repair_check_command<W: Write>(
         .ok_or_else(|| CliFailure::new(2, "PR has no readable head sha"))?
         .to_owned();
     let comments = read_comments(&read, &repo, args.pr)?;
+    if let Some(id) = edited_latest_verdict(&comments) {
+        return Err(CliFailure::new(
+            2,
+            format!(
+                "the newest bot verdict (comment {id}) was edited after it was posted, so its \
+                 text is not the reviewer's; refusing to judge the HOLD from it"
+            ),
+        ));
+    }
     let Some((hold_head, hold_body)) = latest_hold(&comments) else {
         return render_no_hold(json_output, stdout);
     };
@@ -104,6 +113,36 @@ fn read_comments(
         2,
         "HOLD comments exceeded the 10000-comment safety bound",
     ))
+}
+
+/// The id of the newest bot verdict comment when its text changed after it
+/// was posted (`updated_at` differs from `created_at`). Any token with
+/// `pull-requests: write` can edit a comment and keep its author, so an edited
+/// HOLD can hide or rewrite findings and an edited APPROVE can read as no HOLD.
+fn edited_latest_verdict(comments: &[Value]) -> Option<u64> {
+    let newest = comments
+        .iter()
+        .filter(|comment| {
+            comment.pointer("/user/login").and_then(Value::as_str) == Some("shipyard-local[bot]")
+                && comment
+                    .get("body")
+                    .and_then(Value::as_str)
+                    .and_then(|body| body.lines().rev().find(|line| !line.trim().is_empty()))
+                    .is_some_and(|last| last.trim().starts_with("verdict: "))
+        })
+        .max_by(|a, b| {
+            let at = |c: &Value| {
+                c.get("created_at")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned()
+            };
+            at(a).cmp(&at(b))
+        })?;
+    let created = newest.get("created_at").and_then(Value::as_str);
+    let updated = newest.get("updated_at").and_then(Value::as_str);
+    (updated.is_some() && updated != created)
+        .then(|| newest.get("id").and_then(Value::as_u64).unwrap_or_default())
 }
 
 /// The newest bot verdict decides: a HOLD followed by an APPROVE (or any later
@@ -247,6 +286,26 @@ fn status_label(status: &Status) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Any token with `pull-requests: write` can edit a comment and keep its
+    /// author (merge-queue-rehearsal#47), so an edited newest verdict is not
+    /// judged: an APPROVE edited over a HOLD would read as no HOLD.
+    #[test]
+    fn an_edited_newest_verdict_is_refused() {
+        let hold = serde_json::json!({"id": 1, "user":{"login":"shipyard-local[bot]"},
+            "created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z",
+            "body":"Findings:\n- [blocking] a.rs 3 r p\nverdict: HOLD head:old"});
+        assert_eq!(edited_latest_verdict(std::slice::from_ref(&hold)), None);
+        let mut forged = hold.clone();
+        forged["body"] = serde_json::json!("ok\nverdict: APPROVE head:old");
+        forged["updated_at"] = serde_json::json!("2026-01-01T00:05:00Z");
+        assert_eq!(
+            latest_hold(std::slice::from_ref(&forged)),
+            None,
+            "it reads as no HOLD"
+        );
+        assert_eq!(edited_latest_verdict(&[forged]), Some(1));
+    }
 
     #[test]
     fn latest_hold_uses_the_newest_trusted_bot_comment() {

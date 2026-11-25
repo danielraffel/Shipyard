@@ -272,6 +272,7 @@ fn report(number: u64, mutation: Option<&str>, error: Option<&str>) -> PrReport 
         mutation: mutation.map(str::to_owned),
         error: error.map(str::to_owned),
         blocked: crate::app::merge_steward_cmd::blocked_on::Stall::default(),
+        required_checks: Vec::new(),
     }
 }
 
@@ -2163,7 +2164,7 @@ case "$*" in
   *"--slurp"*"pulls/42/reviews"*) printf '%s' '[[]]' ;;
   *"--slurp"*"issues/42/comments"*) printf '%s' '[[{approval}]]' ;;
   *"node(id:"*) printf '%s' '{{"data":{{"node":{{"number":42,"state":"OPEN","headRefOid":"{head}","baseRefName":"main","isInMergeQueue":false,"mergeQueueEntry":null,"autoMergeRequest":null,"repository":{{"nameWithOwner":"Generous-Corp/pulp"}},"timelineItems":{{"pageInfo":{{"hasPreviousPage":false}},"nodes":[]}}}}}}}}' ;;
-  "api repos/Generous-Corp/pulp/pulls/42") printf '%s' '{{"number":42,"base":{{"ref":"main"}},"head":{{"sha":"{head}"}},"user":{{"login":"shipyard-local[bot]","type":"Bot"}}}}' ;;
+  "api repos/Generous-Corp/pulp/pulls/42") printf '%s' '{{"number":42,"base":{{"ref":"main","repo":{{"default_branch":"main"}}}},"head":{{"sha":"{head}"}},"user":{{"login":"shipyard-local[bot]","type":"Bot"}}}}' ;;
   *"isInMergeQueue"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"number":42,"state":"OPEN","headRefOid":"{head}","isInMergeQueue":false,"mergeQueueEntry":null,"autoMergeRequest":null,"timelineItems":{{"pageInfo":{{"hasPreviousPage":false}},"nodes":[]}}}}}}}}}}' ;;
   *"dequeuePullRequest"*) printf '%s' '{{"data":{{"dequeuePullRequest":{{"mergeQueueEntry":{{"id":"MQE"}}}}}}}}' ;;
   *"query=query("*"mergeQueue"*)
@@ -2588,6 +2589,7 @@ fn a_solo_entry_the_queue_ejects_within_one_tick_releases_the_hold_on_the_next_p
             mutation: Some("skipped_ejected_same_head:failed_checks:needs_new_head".to_owned()),
             error: None,
             blocked: crate::app::merge_steward_cmd::blocked_on::Stall::default(),
+            required_checks: Vec::new(),
         }],
         None,
         true,

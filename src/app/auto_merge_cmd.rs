@@ -4265,7 +4265,7 @@ else:
             ["mergeQueue(branch", {"json": {"data": {"repository": {"mergeQueue": {"id": "MQ_1"}}}}}],
             ["node(id:", {"json": {"data": {"node": node}}}],
             ["pullRequest(number", {"json": {"data": {"repository": {"pullRequest": node}}}}],
-            ["/pulls/42", {"json": {"number": 42, "base": {"ref": "main"},
+            ["/pulls/42", {"json": {"number": 42, "base": {"ref": "main", "repo": {"default_branch": "main"}},
                 "head": {"sha": GATE_HEAD}, "user": {"login": "shipyard-local[bot]", "type": "Bot"}}}],
         ]);
         let table = dir.join("answers.json");

@@ -109,6 +109,8 @@ class ReviewVerdictStatus(unittest.TestCase):
     def setUp(self) -> None:
         self.root = pathlib.Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.root, True)
+        # Statuses already on the head (``held_in_history``): none by default.
+        self.history: list[dict[str, Any]] = []
         self.guards = self.root / "guards"
         self.guards.mkdir()
         shutil.copy(arm.SCRIPT, self.guards / "queue-arm-guard")
@@ -134,6 +136,8 @@ class ReviewVerdictStatus(unittest.TestCase):
         answers = self.case("shipyard-784", queue=False, comments=[trail], config=config,
                             graphql=arm.opened(arm.review_fixture("shipyard-784-graphql.json")))
         answers.insert(0, ("/statuses/", {"json": {"state": "posted"}}))
+        # The head's status history, read for a HOLD this job posted before.
+        answers.insert(0, (f"/commits/{HEAD}/statuses?", {"pages": [self.history]}))
         # The head's own pull_request_target run, which a comment or review
         # re-runs so its check follows the verdict.
         answers.insert(0, ("/actions/runs/555/rerun", {"text": ""}))
@@ -154,7 +158,8 @@ class ReviewVerdictStatus(unittest.TestCase):
         return arm.comment_like(template, body=body, created_at=at, **change)
 
     def post(self, answers: list[tuple[str, dict[str, Any]]], event_name: str = "issue_comment",
-             event: dict[str, Any] | None = None, ref: str = "refs/heads/main") -> subprocess.CompletedProcess:
+             event: dict[str, Any] | None = None, ref: str = "refs/heads/main",
+             **env: str) -> subprocess.CompletedProcess:
         (self.root / "calls").unlink(missing_ok=True)
         fake = self.install(answers)
         payload = event if event is not None else {
@@ -170,6 +175,7 @@ class ReviewVerdictStatus(unittest.TestCase):
                        "SHIPYARD_REBASE_CARRY": "0", "SHIPYARD_REVIEW_BEFORE_ARM": "0",
                        # Nor its signers file, which would allow anyone here.
                        "SHIPYARD_GHAPP_GUARDS_DIR": str(self.permissive_guards())}
+        environment.update(env)
         return subprocess.run([sys.executable, str(self.scripts / STATUS.name)], env=environment,
                               capture_output=True, text=True, check=False,
                               stdin=subprocess.DEVNULL)
@@ -637,3 +643,149 @@ class ReviewVerdictStatus(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# A pull request's own workflow token can edit or delete any comment and keep
+# its author (merge-queue-rehearsal#47, runs 45528887180 and 45529945081).
+HOLD_BODY = f"Findings.\nreviewer: pulp-review\n{STAMP}\nverdict: HOLD head:{HEAD}"
+OPT_OUT = "[auto_merge]\narm_requires_head_approval = false\n"
+
+
+class TamperedVerdicts(unittest.TestCase):
+    """Edited and deleted verdict comments, and a chosen base."""
+
+    install = ReviewVerdictStatus.install
+    case = ReviewVerdictStatus.case
+    run_guard = ReviewVerdictStatus.run_guard
+    calls = ReviewVerdictStatus.calls
+    setUp = ReviewVerdictStatus.setUp
+    permissive_guards = ReviewVerdictStatus.permissive_guards
+    answers = ReviewVerdictStatus.answers
+    comment = ReviewVerdictStatus.comment
+    post = ReviewVerdictStatus.post
+    posted = ReviewVerdictStatus.posted
+    judged = ReviewVerdictStatus.judged
+
+    def approved(self) -> list[dict[str, Any]]:
+        return [self.comment(SIGNED_APPROVE.format(head=HEAD), "2026-10-12T15:00:00Z")]
+
+    def statuses(self) -> list[str]:
+        return [line for line in self.calls().splitlines() if f"statuses/{HEAD} " in line
+                or line.endswith(f"statuses/{HEAD}")]
+
+    def comment_event(self, action: str, body: str, before: str | None = None) -> dict[str, Any]:
+        comment = self.comment(body, "2026-10-12T16:00:00Z", id=9)
+        event: dict[str, Any] = {"action": action, "comment": comment,
+                                 "issue": {"number": 784, "pull_request": {"url": "x"}}}
+        if before is not None:
+            event["changes"] = {"body": {"from": before}}
+        return event
+
+    def test_an_edited_approve_is_not_success(self) -> None:
+        self.assertEqual(self.judged(self.approved(), SIGNERS), "success")  # control
+        trail = [self.comment(SIGNED_APPROVE.format(head=HEAD), "2026-10-12T15:00:00Z",
+                              updated_at="2026-10-12T15:00:23Z")]
+        self.assertEqual(self.judged(trail, SIGNERS), "pending")
+        self.assertIn("edited", self.posted()["description"])
+
+    def test_a_deleted_hold_still_holds(self) -> None:
+        # Control: the deleted comment was not a HOLD, so the APPROVE decides.
+        quiet = self.post(self.answers(self.approved(), SIGNERS),
+                          event=self.comment_event("deleted", "thanks"))
+        self.assertEqual(self.posted()["state"], "success", quiet.stderr)
+        result = self.post(self.answers(self.approved(), SIGNERS),
+                           event=self.comment_event("deleted", HOLD_BODY))
+        posted = self.posted()
+        self.assertEqual(posted["state"], "failure", result.stdout + result.stderr)
+        self.assertTrue(posted["description"].startswith(f"a HOLD naming head {HEAD[:12]}"),
+                        posted)
+
+    def test_a_hold_edited_into_an_approve_still_holds(self) -> None:
+        self.post(self.answers(self.approved(), SIGNERS),
+                  event=self.comment_event("edited", SIGNED_APPROVE.format(head=HEAD),
+                                           before=HOLD_BODY))
+        self.assertEqual(self.posted()["state"], "failure")
+
+    def test_a_hold_this_job_posted_before_still_holds(self) -> None:
+        held = {"context": "review-verdict", "state": "failure",
+                "creator": {"login": "github-actions[bot]"},
+                "description": f"a HOLD naming head {HEAD[:12]} makes it un-approvable"}
+        self.history = [dict(held, creator={"login": "someone-else[bot]"})]
+        self.assertEqual(self.judged(self.approved(), SIGNERS), "success",
+                         "another creator's status is not this job's")
+        self.history = [held]
+        self.post(self.answers(self.approved(), SIGNERS))
+        self.assertEqual(self.posted()["state"], "failure")
+        # Once the App posts, only the App's own failure holds: a
+        # github-actions one could come from any workflow.
+        app = {"REVIEW_VERDICT_APP_BOT_LOGIN": "fleet-verdict[bot]"}
+        self.post(self.answers(self.approved(), SIGNERS), **app)
+        self.assertEqual(self.posted()["state"], "success")
+        self.history = [dict(held, creator={"login": "fleet-verdict[bot]"})]
+        self.post(self.answers(self.approved(), SIGNERS), **app)
+        self.assertEqual(self.posted()["state"], "failure")
+
+    def retargeted(self, base_config: str) -> list[tuple[str, dict[str, Any]]]:
+        answers = self.answers([], SIGNERS)
+        pull = next(answer["json"] for needle, answer in answers if needle == "/pulls/")
+        pull["base"]["ref"] = "b0"
+        return [("config.toml?ref=b0", {"text": base_config}),
+                ("config.toml?ref=main", {"text": SIGNERS}), *answers]
+
+    def test_policy_comes_from_the_default_branch_and_another_base_is_refused(self) -> None:
+        # The N4 attack: branch b0 turns review off; the pull request into b0
+        # carries no approval at all.
+        result = self.post(self.retargeted(OPT_OUT))
+        posted = self.posted()
+        self.assertEqual(posted["state"], "failure", result.stdout + result.stderr)
+        self.assertIn("not the default branch main", posted["description"])
+        self.assertNotIn("ref=b0", self.calls())
+
+    def test_the_host_guard_reads_policy_from_the_default_branch(self) -> None:
+        guard = self.run_guard(["pr", "merge", "784", "--merge", "--match-head-commit", HEAD],
+                               self.retargeted(OPT_OUT), REPO, SHIPYARD_SIGNERS_FROM_BASE="1")
+        self.assertNotEqual(guard.returncode, 0, guard.stderr)
+        self.assertNotIn("does not require a review", guard.stderr)
+        self.assertNotIn("ref=b0", self.calls())
+
+    def app_gh(self, fake: pathlib.Path) -> pathlib.Path:
+        """``gh`` that refuses the App token and passes anything else to ``fake``."""
+        wrapper = self.root / "gh-app"
+        wrapper.write_text(
+            "#!/bin/sh\n"
+            'if [ "$GH_TOKEN" = broken-app-token ]; then echo "HTTP 401 Bad credentials" >&2; '
+            "exit 1; fi\n"
+            f'exec {fake} "$@"\n', encoding="utf-8")
+        wrapper.chmod(0o755)
+        return wrapper
+
+    def test_the_app_leg_fails_open(self) -> None:
+        answers = self.answers(self.approved(), SIGNERS)
+        baseline = self.post(answers, event_name="pull_request_target",
+                             event={"pull_request": {"number": 784}})
+        self.assertEqual(baseline.returncode, 0, baseline.stderr)
+        # A token that could not be minted: logged, Actions post unchanged.
+        empty = self.post(answers, event_name="pull_request_target",
+                          event={"pull_request": {"number": 784}},
+                          REVIEW_VERDICT_APP_ID="123", REVIEW_VERDICT_APP_TOKEN="")
+        self.assertEqual(empty.returncode, 0, empty.stderr)
+        self.assertIn("::warning title=review-verdict App leg::", empty.stdout)
+        self.assertEqual(len(self.statuses()), 1)
+        # A refused App post: logged without the token, Actions post unchanged.
+        self.install(answers)
+        broken = self.post(answers, event_name="pull_request_target",
+                           event={"pull_request": {"number": 784}},
+                           GHAPP_REAL_GH=str(self.app_gh(self.root / "gh")),
+                           REVIEW_VERDICT_APP_ID="123", REVIEW_VERDICT_APP_TOKEN="broken-app-token")
+        self.assertEqual(broken.returncode, 0, broken.stderr)
+        self.assertIn("the App post failed", broken.stdout)
+        self.assertNotIn("broken-app-token", broken.stdout + broken.stderr)
+        self.assertEqual(len(self.statuses()), 1)
+        # A working App token posts the same status twice.
+        self.install(answers)
+        good = self.post(answers, event_name="pull_request_target",
+                         event={"pull_request": {"number": 784}},
+                         GHAPP_REAL_GH=str(self.app_gh(self.root / "gh")),
+                         REVIEW_VERDICT_APP_ID="123", REVIEW_VERDICT_APP_TOKEN="good-app-token")
+        self.assertEqual(good.returncode, 0, good.stderr)
+        self.assertEqual(len(self.statuses()), 2)
