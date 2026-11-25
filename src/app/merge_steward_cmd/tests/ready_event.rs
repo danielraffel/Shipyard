@@ -57,7 +57,7 @@ fn observed_no_queue(head: &str) -> RepoObservation {
 
 fn approved_comment(head: &str) -> String {
     format!(
-        r#"{{"id":12345,"login":"shipyard-review[bot]","type":"Bot","at":"2026-11-13T00:05:00Z","body":"LGTM\nreviewed: {head}","performed_via_github_app_id":99}}"#
+        r#"{{"id":12345,"login":"shipyard-review[bot]","type":"Bot","at":"2026-11-13T00:05:00Z","updated_at":"2026-11-13T00:05:00Z","node_id":"IC_12345","body":"LGTM\nreviewed: {head}","performed_via_github_app_id":99}}"#
     )
 }
 
@@ -113,6 +113,7 @@ case "$*" in
   *"contents/.shipyard/config.toml"*) {policy} ;;
   *"pulls/42/reviews"*) printf '' ;;
   *"issues/42/comments"*) printf '%s\n' '{comments}' ;;
+  *"lastEditedAt"*) printf '%s' '{{"data":{{"node":{{"lastEditedAt":null}}}}}}' ;;
   *"/check-runs?"*) printf '%s' '{check_runs}' ;;
   *"/statuses?"*) printf '%s' '[]' ;;
   *"commits/{live_head}"*) printf '%s' '2026-11-13T00:00:00Z' ;;

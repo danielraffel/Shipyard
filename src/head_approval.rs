@@ -1537,11 +1537,12 @@ pub(crate) const EDITED_REFUSAL: &str = "it was edited after it was posted";
 /// edited body says nothing about what its author wrote, so an edited APPROVE
 /// never counts; an edited HOLD still holds, since it can only refuse more.
 /// GitHub moves `updated_at` on an edit, not on a reaction. A record with no
-/// `updated_at` is a review (reviews have none); every comment reader's jq
-/// carries it ([`COMMENT_RECORD_JQ`]). Times that cannot be compared count
-/// as edited.
+/// `updated_at` key is a review (reviews have none); every comment reader's
+/// jq carries it ([`COMMENT_RECORD_JQ`]), so a comment whose `updated_at`
+/// is null, or any other non-string, cannot show it was not edited and counts
+/// as edited. Times that cannot be compared count as edited.
 pub(crate) fn comment_edited(record: &Value) -> bool {
-    let Some(updated) = record.get("updated_at").filter(|value| !value.is_null()) else {
+    let Some(updated) = record.get("updated_at") else {
         return false;
     };
     let Some(updated) = updated.as_str() else {
@@ -2666,9 +2667,10 @@ const COMMENT_EDIT_QUERY: &str =
 ///
 /// REST times have one-second resolution, so an edit in the second the
 /// comment was posted leaves `updated_at == created_at` ([`comment_edited`]);
-/// `lastEditedAt` is set by any edit. Checked only for a record read through
-/// [`COMMENT_RECORD_JQ`] (it carries `updated_at`): such a record without a
-/// `node_id`, or an unreadable answer, is an error, never an approval.
+/// `lastEditedAt` is set by any edit. The deciding record is a comment, read
+/// through [`COMMENT_RECORD_JQ`], so it must carry a string `updated_at` and a
+/// `node_id`: a record without either, or an unreadable answer, is an error,
+/// never an approval.
 fn edit_checked(
     run_gh: RunGh<'_>,
     head: &str,
@@ -2700,8 +2702,10 @@ fn edit_checked(
             "approval comment {id} is not among the comments read"
         ));
     };
-    if record.get("updated_at").is_none() {
-        return Ok(gate);
+    if !record.get("updated_at").is_some_and(Value::is_string) {
+        return Err(format!(
+            "approval comment {id} carries no edit metadata (updated_at)"
+        ));
     }
     let node_id = record
         .get("node_id")

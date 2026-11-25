@@ -107,6 +107,9 @@ impl Fake {
             };
             return Ok(pr_json(&head, &self.labels));
         }
+        if args.iter().any(|arg| arg.contains("lastEditedAt")) {
+            return Ok(json!({"data": {"node": {"lastEditedAt": null}}}).to_string());
+        }
         if has("graphql") {
             return Ok(queue_json());
         }
@@ -384,7 +387,7 @@ fn hold_fake() -> Fake {
             "at": "2026-11-13T09:01:00Z",
             "body": format!("Holding with {HOLD_LABEL}.\nhold-condition: green\nhold-condition: approved")}),
         json!({"id": 50, "login": "rev-human", "type": "User", "association": "MEMBER",
-            "at": "2026-11-13T11:30:00Z",
+            "at": "2026-11-13T11:30:00Z", "updated_at": "2026-11-13T11:30:00Z", "node_id": "IC_50",
             "body": format!("ok\n<!-- session: m1/reviewer-run-1 agent: reviewer -->\nverdict: APPROVE head:{HEAD}")}),
     ];
     fake

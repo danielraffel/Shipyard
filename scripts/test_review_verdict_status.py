@@ -788,6 +788,52 @@ class TamperedVerdicts(unittest.TestCase):
         self.post(self.answers(self.approved(), SIGNERS), **app)
         self.assertEqual(self.posted()["state"], "failure")
 
+    def test_a_numberless_event_still_reads_the_heads_hold_history(self) -> None:
+        # A fork's workflow_run and a check_run can list no pull request; the
+        # head's status history must still hold a head whose HOLD is gone.
+        held = {"context": "review-verdict", "state": "failure",
+                "creator": {"login": "github-actions[bot]"},
+                "description": f"a HOLD naming head {HEAD[:12]} makes it un-approvable"}
+        for name in ("workflow_run", "check_run"):
+            event = {name: {"pull_requests": [], "head_sha": HEAD}}
+            self.history = []
+            result = self.post(self.answers(self.approved(), SIGNERS), name, copy.deepcopy(event))
+            self.assertEqual(self.posted()["state"], "success", f"control {name}: {result.stderr}")
+            self.history = [held]
+            result = self.post(self.answers(self.approved(), SIGNERS), name, copy.deepcopy(event))
+            self.assertEqual(self.posted()["state"], "failure", f"{name}: {result.stdout}")
+            self.assertIn(f"/commits/{HEAD}/statuses", self.calls())
+
+    def test_a_malformed_event_payload_refuses(self) -> None:
+        # Read as "not a pull request", a malformed payload would exit 0 and
+        # leave the required check green.
+        broken = [("pull_request_target", {}), ("pull_request_target", {"pull_request": None}),
+                  ("pull_request_target", {"pull_request": {"number": "784"}}),
+                  ("pull_request_target", {"pull_request": {"number": True}}),
+                  ("issue_comment", {"issue": None}),
+                  ("issue_comment", {"issue": {"pull_request": {"url": "x"}}}),
+                  ("issue_comment", {"issue": {"number": "784", "pull_request": {"url": "x"}}})]
+        for name in ("workflow_run", "check_run"):
+            broken += [(name, {}), (name, {name: None}),
+                       (name, {name: {"pull_requests": [], "head_sha": None}}),
+                       (name, {name: {"pull_requests": []}}),
+                       (name, {name: {"pull_requests": "784", "head_sha": HEAD}}),
+                       (name, {name: {"pull_requests": [{"number": "784"}], "head_sha": HEAD}}),
+                       (name, {name: {"pull_requests": ["x"], "head_sha": HEAD}})]
+        for name, event in broken:
+            result = self.post(self.answers(self.approved(), SIGNERS), name, event)
+            self.assertNotEqual(result.returncode, 0, f"{name} {event}: {result.stdout}")
+            self.assertNotIn("state=success", self.calls() if (self.root / "calls").exists()
+                             else "", event)
+        # Controls: a comment on an issue still posts nothing, and a PR with
+        # no readable state is unreadable, never "closed".
+        self.assertEqual(self.post([], event={"issue": {"number": 5}}).returncode, 0)
+        answers = self.answers(self.approved(), SIGNERS)
+        pull = next(answer["json"] for needle, answer in answers if needle == "/pulls/")
+        pull.pop("state")
+        result = self.post(answers, "pull_request_target", {"pull_request": {"number": 784}})
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+
     def test_a_malformed_status_in_the_history_refuses(self) -> None:
         held = {"context": "review-verdict", "state": "failure",
                 "creator": {"login": "github-actions[bot]"},
@@ -875,7 +921,8 @@ class TamperedVerdicts(unittest.TestCase):
         self.assertEqual(allowed.returncode, 0, "control: " + allowed.stderr)
         record = self.guards / "holds.jsonl"
         record.write_text(json.dumps({"repo": "danielraffel/shipyard", "pr": 784,
-                                      "hold_head": arm.HOLD_784, "action": "none"}) + "\n"
+                                      "hold_head": arm.HOLD_784, "action": "none",
+                                      "at": "2026-11-24T00:00:00Z"}) + "\n"
                           , encoding="utf-8")
         other = self.run_guard(merge, self.answers(self.approved(), SIGNERS), REPO,
                                SHIPYARD_SIGNERS_FROM_BASE="1")
@@ -891,9 +938,25 @@ class TamperedVerdicts(unittest.TestCase):
     def test_a_malformed_hold_record_refuses(self) -> None:
         merge = ["pr", "merge", "784", "--merge", "--match-head-commit", HEAD]
         record = self.guards / "holds.jsonl"
-        for bad in ("not json\n", "[1, 2]\n", "\"text\"\n"):
-            record.write_text(json.dumps({"repo": REPO, "pr": 9, "hold_head": HEAD}) + "\n"
-                              + bad, encoding="utf-8")
+        row = {"repo": REPO, "pr": 9, "hold_head": HEAD, "at": "2026-11-24T01:00:00Z"}
+        # Control: a well-formed row of another pull request is no record.
+        record.write_text(json.dumps(row) + "\n", encoding="utf-8")
+        control = self.run_guard(merge, self.answers(self.approved(), SIGNERS), REPO,
+                                 SHIPYARD_SIGNERS_FROM_BASE="1")
+        self.assertEqual(control.returncode, 0, "control: " + control.stderr)
+        # A row missing, or mistyping, any field the match reads could be the
+        # HOLD of this head, so it refuses rather than being skipped.
+        held = dict(row, pr=784)
+        shapes = [{k: v for k, v in held.items() if k != key}
+                  for key in ("repo", "pr", "hold_head", "at")]
+        shapes += [dict(held, repo=None), dict(held, repo=7), dict(held, repo=""),
+                   dict(held, pr="784"), dict(held, pr=784.0), dict(held, pr=True),
+                   dict(held, pr=None), dict(held, hold_head=None), dict(held, hold_head=""),
+                   dict(held, hold_head=["x"]), dict(held, at=None), dict(held, at=5),
+                   dict(held, at="")]
+        for bad in ("not json\n", "[1, 2]\n", "\"text\"\n",
+                    *(json.dumps(shape) + "\n" for shape in shapes)):
+            record.write_text(json.dumps(row) + "\n" + bad, encoding="utf-8")
             guard = self.run_guard(merge, self.answers(self.approved(), SIGNERS), REPO,
                                    SHIPYARD_SIGNERS_FROM_BASE="1")
             self.assertNotEqual(guard.returncode, 0, bad + guard.stderr)

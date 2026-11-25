@@ -744,6 +744,7 @@ case "$*" in
   *contents/.shipyard/config.toml*) printf '%s\n' '[auto_merge]' 'arm_requires_head_approval = true' 'reviewer_identities = ["pulp-reviewer"]' '[queue]' 'tiered_required_checks = ["macos"]' 'tier_record_app = "pulp-tier-records"' ;;
   *"--paginate"*"/reviews"*) ;;
   *"--paginate"*"/comments"*) printf '%s\n' '{approval}' ;;
+  *"lastEditedAt"*) printf '%s' '{{"data":{{"node":{{"lastEditedAt":null}}}}}}' ;;
   *pulls/8933*) printf '%s' '{{"number":8933,"user":{{"login":"author","type":"User"}}}}' ;;
   *isInMergeQueue*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"number":8933,"state":"OPEN","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","isInMergeQueue":true,"mergeQueueEntry":{{"state":"QUEUED","position":3}},"autoMergeRequest":null,"timelineItems":{{"pageInfo":{{"hasPreviousPage":false}},"nodes":[]}}}}}}}}}}' ;;
   *check-runs*) printf '%s' '[{{"total_count":2,"check_runs":[{{"id":9,"name":"macos","status":"completed","app":{{"slug":"github-actions"}}}},{{"id":750,"name":"shipyard-test-tier/macos","status":"completed","app":{{"slug":"pulp-tier-records"}},"output":{{"summary":"{summary}"}}}}]}}]' ;;
@@ -781,7 +782,7 @@ esac
 
     fn jump_approval() -> String {
         format!(
-            r#"{{"id":6390564321,"login":"pulp-reviewer","type":"User","association":"MEMBER","at":"2026-11-11T01:53:36Z","body":"verdict: APPROVE head:{HEAD}"}}"#
+            r#"{{"id":6390564321,"login":"pulp-reviewer","type":"User","association":"MEMBER","at":"2026-11-11T01:53:36Z","updated_at":"2026-11-11T01:53:36Z","node_id":"IC_6390564321","body":"verdict: APPROVE head:{HEAD}"}}"#
         )
     }
 
@@ -809,6 +810,7 @@ case "$*" in
   *contents/.shipyard/config.toml*) printf '%s\n' '[auto_merge]' 'arm_requires_head_approval = true' 'reviewer_identities = ["pulp-reviewer"]' ;;
   *"--paginate"*"/reviews"*) ;;
   *"--paginate"*"/comments"*) printf '%s\n' '{comments}' ;;
+  *"lastEditedAt"*) printf '%s' '{{"data":{{"node":{{"lastEditedAt":null}}}}}}' ;;
   *pulls/8933*) printf '%s' '{{"number":8933,"user":{{"login":"author","type":"User"}}}}' ;;
   *check-runs*) printf '%s' '[{{"total_count":0,"check_runs":[]}}]' ;;
   *isInMergeQueue*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"number":8933,"state":"OPEN","headRefOid":"{HEAD}","isInMergeQueue":true,"mergeQueueEntry":{{"state":"QUEUED","position":3}},"autoMergeRequest":null,"timelineItems":{{"pageInfo":{{"hasPreviousPage":false}},"nodes":[]}}}}}}}}}}' ;;

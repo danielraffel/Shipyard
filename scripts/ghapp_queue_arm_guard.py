@@ -1884,10 +1884,19 @@ def recorded_hold(repo: str, number: int, head: str) -> str | None:
                              f"{error}") from error
         if not isinstance(row, dict):
             raise GuardError(f"the hold record {path} line {number_line} is not an object")
-        if (str(row.get("repo") or "").lower() == repo.lower()
-                and row.get("pr") == number
-                and str(row.get("hold_head") or "").lower() == head.lower()):
-            return str(row.get("at") or "an unrecorded time")
+        # Every row the hold hook writes carries all four; a row missing one
+        # could be the HOLD of this head, so it refuses rather than being
+        # skipped as "no record".
+        if (not isinstance(row.get("repo"), str) or not row["repo"]
+                or not isinstance(row.get("pr"), int) or isinstance(row.get("pr"), bool)
+                or not isinstance(row.get("hold_head"), str) or not row["hold_head"]
+                or not isinstance(row.get("at"), str) or not row["at"]):
+            raise GuardError(f"the hold record {path} line {number_line} is malformed: it "
+                             "needs a string repo, hold_head and at and an integer pr")
+        if (row["repo"].lower() == repo.lower()
+                and row["pr"] == number
+                and row["hold_head"].lower() == head.lower()):
+            return row["at"]
     return None
 
 

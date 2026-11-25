@@ -140,42 +140,39 @@ fn recorded_hold(
             ));
         }
     };
-    // A malformed or non-object line refuses, as in the queue-arm guard.
-    let mut rows = Vec::new();
+    // A malformed or non-object line refuses, as in the queue-arm guard, and
+    // so does a row missing or mistyping any field the match reads: it could
+    // be the HOLD of this head, so it is never skipped as "no record".
     for (index, line) in text.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
-        let row = serde_json::from_str::<Value>(line)
-            .ok()
-            .filter(Value::is_object)
-            .ok_or_else(|| {
-                format!(
-                    "the hold record {} line {} is malformed",
-                    path.display(),
-                    index + 1
-                )
-            })?;
-        rows.push(row);
+        let malformed = || {
+            format!(
+                "the hold record {} line {} is malformed",
+                path.display(),
+                index + 1
+            )
+        };
+        let row = serde_json::from_str::<Value>(line).map_err(|_| malformed())?;
+        let text_field = |key: &str| {
+            row.get(key)
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+        };
+        let (Some(name), Some(number), Some(hold_head), Some(at)) = (
+            text_field("repo"),
+            row.get("pr").and_then(Value::as_u64),
+            text_field("hold_head"),
+            text_field("at"),
+        ) else {
+            return Err(malformed());
+        };
+        if name.eq_ignore_ascii_case(repo) && number == pr && hold_head.eq_ignore_ascii_case(head) {
+            return Ok(Some(at.to_owned()));
+        }
     }
-    Ok(rows
-        .into_iter()
-        .find(|row| {
-            row.get("repo")
-                .and_then(Value::as_str)
-                .is_some_and(|name| name.eq_ignore_ascii_case(repo))
-                && row.get("pr").and_then(Value::as_u64) == Some(pr)
-                && row
-                    .get("hold_head")
-                    .and_then(Value::as_str)
-                    .is_some_and(|held| held.eq_ignore_ascii_case(head))
-        })
-        .map(|row| {
-            row.get("at")
-                .and_then(Value::as_str)
-                .unwrap_or("an unrecorded time")
-                .to_owned()
-        }))
+    Ok(None)
 }
 
 /// `gate`, refused when the steward ledger or this host's hold record holds
@@ -433,10 +430,58 @@ mod tests {
                 .allows(),
             "another pull request"
         );
-        // A malformed or non-object line refuses.
-        for bad in ["not json", "[1]", "\"text\""] {
+        // A malformed or non-object line refuses, and so does a row missing
+        // or mistyping any field the match reads.
+        let held = serde_json::json!({"repo": "O/R", "pr": 7, "hold_head": HEAD,
+                                      "at": "2026-11-24T01:00:00Z"});
+        let mut shapes: Vec<String> = ["repo", "pr", "hold_head", "at"]
+            .iter()
+            .map(|key| {
+                let mut row = held.clone();
+                row.as_object_mut().expect("object").remove(*key);
+                row.to_string()
+            })
+            .collect();
+        for (key, value) in [
+            ("repo", Value::Null),
+            ("repo", serde_json::json!(7)),
+            ("repo", serde_json::json!("")),
+            ("pr", serde_json::json!("7")),
+            ("pr", serde_json::json!(7.5)),
+            ("pr", serde_json::json!(-7)),
+            ("pr", serde_json::json!(true)),
+            ("pr", Value::Null),
+            ("hold_head", Value::Null),
+            ("hold_head", serde_json::json!("")),
+            ("hold_head", serde_json::json!(["x"])),
+            ("at", Value::Null),
+            ("at", serde_json::json!(5)),
+            ("at", serde_json::json!("")),
+        ] {
+            let mut row = held.clone();
+            row[key] = value;
+            shapes.push(row.to_string());
+        }
+        // Control: a well-formed row of another pull request is no record.
+        let other = tempfile::tempdir().expect("guards");
+        let mut row = held.clone();
+        row["pr"] = serde_json::json!(8);
+        std::fs::write(other.path().join(HOLDS_LOG), format!("{row}\n")).expect("record");
+        assert!(
+            apply_with_holds(&ledger, Some(other.path()), "o/r", 7, HEAD, approved())
+                .unwrap()
+                .0
+                .allows(),
+            "control: another pull request's row"
+        );
+        for bad in ["not json", "[1]", "\"text\""]
+            .into_iter()
+            .map(str::to_owned)
+            .chain(shapes)
+        {
             let malformed = tempfile::tempdir().expect("guards");
-            std::fs::write(malformed.path().join(HOLDS_LOG), format!("{bad}\n")).expect("record");
+            std::fs::write(malformed.path().join(HOLDS_LOG), format!("{row}\n{bad}\n"))
+                .expect("record");
             assert!(
                 apply_with_holds(&ledger, Some(malformed.path()), "o/r", 7, HEAD, approved())
                     .is_err(),

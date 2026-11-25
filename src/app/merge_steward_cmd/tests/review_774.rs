@@ -27,6 +27,7 @@ case "$*" in
   *"contents/.shipyard/config.toml"*) {config_case} ;;
   *"pulls/42/reviews"*) printf '%s\n' '{reviews}' ;;
   *"issues/42/comments"*) printf '%s\n' '{comments}' ;;
+  *"lastEditedAt"*) printf '%s' '{{"data":{{"node":{{"lastEditedAt":null}}}}}}' ;;
   *"commits/{head}"*) printf '%s' '2026-10-11T00:00:00Z' ;;
   *"isInMergeQueue"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"number":42,"headRefOid":"{head}","isInMergeQueue":false,"mergeQueueEntry":null,"autoMergeRequest":null,"timelineItems":{{"pageInfo":{{"hasPreviousPage":false}},"nodes":[]}}}}}}}}}}' ;;
   *"stackEntry"*) echo "GATE_PASSED_REACHED_STACK" >&2; exit 90 ;;
@@ -47,7 +48,7 @@ const POLICY_ERR: &str = r"echo 'HTTP 500 server error' >&2; exit 1";
 
 fn comment(login: &str, body: &str) -> String {
     format!(
-        r#"{{"id":12345,"login":"{login}","type":"User","at":"2026-10-11T12:00:00Z","body":"{body}","performed_via_github_app_id":99}}"#
+        r#"{{"id":12345,"login":"{login}","type":"User","at":"2026-10-11T12:00:00Z","updated_at":"2026-10-11T12:00:00Z","node_id":"IC_12345","body":"{body}","performed_via_github_app_id":99}}"#
     )
 }
 
@@ -309,7 +310,9 @@ fn r774_r1_absent_policy_file_does_not_arm_unapproved_head() {
 }
 
 fn comment_at(login: &str, at: &str, body: &str) -> String {
-    format!(r#"{{"id":777,"login":"{login}","type":"Bot","at":"{at}","body":"{body}"}}"#)
+    format!(
+        r#"{{"id":777,"login":"{login}","type":"Bot","at":"{at}","updated_at":"{at}","node_id":"IC_777","body":"{body}"}}"#
+    )
 }
 
 fn review_record(login: &str, state: &str, commit: &str, at: &str) -> String {

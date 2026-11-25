@@ -126,25 +126,41 @@ def event_target(event_name: str, event: dict[str, Any]) -> tuple[int | None, st
 
     ``(None, None)`` means there is nothing to judge (a comment on an issue).
     A ``workflow_run`` from a fork lists no pull request, only its head.
+    A payload whose fields cannot be read raises (``ValueError``): read as
+    "nothing to judge", it would exit 0 and leave the check green.
     """
     if event_name == "pull_request_target":
-        number = (event.get("pull_request") or {}).get("number")
-        return (number if isinstance(number, int) else None), None
+        pull = event.get("pull_request")
+        number = pull.get("number") if isinstance(pull, dict) else None
+        if not isinstance(number, int) or isinstance(number, bool):
+            raise ValueError("the pull_request_target payload names no pull request number")
+        return number, None
     if event_name == "issue_comment":
-        issue = event.get("issue") or {}
-        number = issue.get("number") if issue.get("pull_request") else None
-        return (number if isinstance(number, int) else None), None
-    if event_name == "check_run":
-        run = event.get("check_run") or {}
-        pulls = [pull.get("number") for pull in run.get("pull_requests") or []
-                 if isinstance(pull, dict) and isinstance(pull.get("number"), int)]
-        head = run.get("head_sha") if isinstance(run.get("head_sha"), str) else None
-        return (pulls[0] if pulls else None), head
-    if event_name == "workflow_run":
-        run = event.get("workflow_run") or {}
-        pulls = [pull.get("number") for pull in run.get("pull_requests") or []
-                 if isinstance(pull, dict) and isinstance(pull.get("number"), int)]
-        head = run.get("head_sha") if isinstance(run.get("head_sha"), str) else None
+        issue = event.get("issue")
+        if not isinstance(issue, dict):
+            raise ValueError("the issue_comment payload carries no issue")
+        if not issue.get("pull_request"):
+            return None, None
+        number = issue.get("number")
+        if not isinstance(number, int) or isinstance(number, bool):
+            raise ValueError("the issue_comment payload names no pull request number")
+        return number, None
+    if event_name in ("check_run", "workflow_run"):
+        run = event.get(event_name)
+        if not isinstance(run, dict):
+            raise ValueError(f"the {event_name} payload carries no {event_name}")
+        listed = run.get("pull_requests", [])
+        if not isinstance(listed, list):
+            raise ValueError(f"the {event_name} payload's pull_requests is not a list")
+        pulls = []
+        for pull in listed:
+            number = pull.get("number") if isinstance(pull, dict) else None
+            if not isinstance(number, int) or isinstance(number, bool):
+                raise ValueError(f"the {event_name} payload lists a malformed pull request")
+            pulls.append(number)
+        head = run.get("head_sha")
+        if not isinstance(head, str) or not head:
+            raise ValueError(f"the {event_name} payload names no head")
         return (pulls[0] if pulls else None), head
     raise ValueError(f"unsupported event {event_name!r}")
 
@@ -462,7 +478,9 @@ def run(event_name: str, event: dict[str, Any], repo: str, run_url: str | None) 
     guard = load_guard()
     if number is not None:
         pull = guard.run_real_gh(["api", f"repos/{repo}/pulls/{number}"])
-        if not isinstance(pull, dict):
+        if not isinstance(pull, dict) or not isinstance(pull.get("state"), str):
+            # A pull request with no readable state is not "closed": closed
+            # posts nothing and exits 0.
             print(f"review-verdict: PR #{number} is unreadable", file=sys.stderr)
             return 1
         if pull.get("state") != "open":
@@ -497,10 +515,14 @@ def run(event_name: str, event: dict[str, Any], repo: str, run_url: str | None) 
     else:
         hard = next(d for _, d in refused if not d.awaiting)
         state, text = "failure", describe(False, hard.message + shared)
-    if state != "failure" and number is not None:
+    if state != "failure":
         # A HOLD deleted or edited away still holds: from this event's own
         # payload, else from a failure this job posted on the head before.
-        removed = removed_holds(guard, repo, number, head, event_name, event)
+        # A numberless event (a fork's ``workflow_run``, a ``check_run``)
+        # still reads the head's status history; only the payload check
+        # needs a pull request number.
+        removed = (removed_holds(guard, repo, number, head, event_name, event)
+                   if number is not None else [])
         held = (f"{HOLD_PREFIX}{head[:12]} was removed after it was posted "
                 f"({removed[0]}); it still holds") if removed else held_in_history(
                     guard, repo, head)

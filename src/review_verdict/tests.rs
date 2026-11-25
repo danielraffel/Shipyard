@@ -45,6 +45,9 @@ fn gh_into(
                 .collect::<Vec<_>>()
                 .join("\n"));
         }
+        if joined.contains("lastEditedAt") {
+            return Ok(json!({"data": {"node": {"lastEditedAt": null}}}).to_string());
+        }
         if joined.contains("/comments") {
             return Ok(comments
                 .iter()
@@ -79,7 +82,8 @@ fn app_approval(head: &str, signer: Option<&str>) -> Value {
 
 fn app_comment(body: &str) -> Value {
     json!({"id": 5, "login": "shipyard-local[bot]", "type": "Bot", "association": "CONTRIBUTOR",
-           "at": "2026-10-14T17:00:00Z", "body": body})
+           "at": "2026-10-14T17:00:00Z", "updated_at": "2026-10-14T17:00:00Z",
+           "node_id": "IC_5", "body": body})
 }
 
 fn owner_review(head: &str) -> Value {

@@ -296,6 +296,9 @@ impl<'a> Hub<'a> {
             .iter()
             .position(|arg| *arg == "--jq")
             .map_or("", |index| args[index + 1]);
+        if args.iter().any(|arg| arg.contains("lastEditedAt")) {
+            return Ok(json!({"data": {"node": {"lastEditedAt": null}}}).to_string());
+        }
         if args.contains(&"graphql") {
             let query = args
                 .iter()
@@ -908,7 +911,8 @@ fn reviewer_policy() -> ApprovalPolicy {
 
 fn verdict(verdict: &str, head: &str) -> Value {
     json!({"id": 1, "login": "shipyard-review[bot]", "type": "Bot",
-           "at": "2026-10-04T01:00:00Z", "body": format!("verdict: {verdict} head:{head}")})
+           "at": "2026-10-04T01:00:00Z", "updated_at": "2026-10-04T01:00:00Z", "node_id": "IC_1",
+           "body": format!("verdict: {verdict} head:{head}")})
 }
 
 #[test]

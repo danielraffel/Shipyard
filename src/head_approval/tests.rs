@@ -4711,6 +4711,45 @@ fn an_api_comment_with_no_node_id_never_approves() {
     );
 }
 
+/// The deciding APPROVE comment must carry its edit metadata: with no
+/// `updated_at`, or a null or non-string one, the GraphQL edit check is never
+/// skipped and the head is never approved.
+#[test]
+fn a_deciding_comment_without_edit_metadata_never_approves() {
+    let approved = HeadGate::Approved {
+        approval: Approval::Marker {
+            login: "shipyard-local[bot]".to_owned(),
+            comment_id: Some(7),
+            performed_via_github_app_id: None,
+        },
+    };
+    let gh = |_: &[String]| Ok(json!({"data": {"node": {"lastEditedAt": null}}}).to_string());
+    let good = json!({"id": 7, "node_id": "IC_7", "updated_at": "2026-10-12T01:00:00Z"});
+    assert!(
+        super::edit_checked(&gh, HEAD, std::slice::from_ref(&good), approved.clone())
+            .expect("control: readable")
+            .allows()
+    );
+    let mut missing = good.clone();
+    missing
+        .as_object_mut()
+        .expect("object")
+        .remove("updated_at");
+    let mut shapes = vec![missing];
+    for bad in [Value::Null, json!(5), json!(true)] {
+        let mut record = good.clone();
+        record["updated_at"] = bad;
+        shapes.push(record);
+    }
+    for record in shapes {
+        assert!(
+            super::edit_checked(&gh, HEAD, std::slice::from_ref(&record), approved.clone())
+                .is_err(),
+            "{record}"
+        );
+    }
+}
+
 /// An edited APPROVE from a listed human, or a listed reviewer identity,
 /// counts no more than the App's.
 #[test]
@@ -4748,19 +4787,25 @@ fn an_edited_approve_by_a_listed_human_or_reviewer_does_not_count() {
     ));
 }
 
-/// Times that cannot be compared count as edited: a non-string, an
-/// unparseable string, or a missing creation time.
+/// Times that cannot be compared count as edited: a null or other
+/// non-string, an unparseable string, or a missing creation time. Only a
+/// record with no `updated_at` key at all (a review) is not an edit.
 #[test]
 fn noncomparable_edit_times_count_as_edited() {
     let record = |updated: Value| json!({"at": "2026-10-12T01:00:00Z", "updated_at": updated});
     assert!(!super::comment_edited(&record(json!(
         "2026-10-12T01:00:00Z"
     ))));
-    assert!(!super::comment_edited(&record(Value::Null)));
     assert!(!super::comment_edited(
         &json!({"at": "2026-10-12T01:00:00Z"})
     ));
-    for bad in [json!(5), json!(true), json!("yesterday"), json!("")] {
+    for bad in [
+        Value::Null,
+        json!(5),
+        json!(true),
+        json!("yesterday"),
+        json!(""),
+    ] {
         assert!(super::comment_edited(&record(bad.clone())), "{bad}");
     }
     assert!(super::comment_edited(

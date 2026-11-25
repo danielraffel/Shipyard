@@ -125,7 +125,7 @@ fn observation(pr: ObservedPr) -> RepoObservation {
 
 fn comment(body: &str) -> String {
     format!(
-        r#"{{"id":12345,"login":"shipyard-review[bot]","type":"Bot","at":"2026-10-30T12:00:00Z","body":"{body}","performed_via_github_app_id":99}}"#
+        r#"{{"id":12345,"login":"shipyard-review[bot]","type":"Bot","at":"2026-10-30T12:00:00Z","updated_at":"2026-10-30T12:00:00Z","node_id":"IC_12345","body":"{body}","performed_via_github_app_id":99}}"#
     )
 }
 
@@ -191,6 +191,7 @@ case "$*" in
   *"enqueuePullRequest"*) echo "a no-queue base must never enqueue" >&2; exit 91 ;;
   *"pulls/42/reviews"*) printf '' ;;
   *"issues/42/comments"*) printf '%s\n' '{comments}' ;;
+  *"lastEditedAt"*) printf '%s' '{{"data":{{"node":{{"lastEditedAt":null}}}}}}' ;;
   *"/check-runs?"*) printf '%s' '{{"check_runs":[{check_runs}]}}' ;;
   *"/statuses?"*) printf '%s' '[{statuses}]' ;;
   *"commits/{HEAD}"*) printf '%s' '2026-10-30T00:00:00Z' ;;
