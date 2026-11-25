@@ -1338,8 +1338,14 @@ fn an_outsiders_verdict_or_claim_is_not_relayed() {
         Some("2026-11-09T12:01:00Z"),
         "still activity"
     );
-    // A GitHub App (the fleet's reviewer) is trusted.
-    node["comments"]["nodes"][0]["author"]["__typename"] = json!("Bot");
+    // Another Bot is not: a pull request's own workflow posts as
+    // `github-actions` with its GITHUB_TOKEN.
+    node["comments"]["nodes"][0]["author"] =
+        json!({"__typename": "Bot", "login": "github-actions"});
+    assert_eq!(summarize(Some(&node), "main", &gates()).verdict, None);
+    // The fleet App (the fleet's reviewer) is trusted.
+    node["comments"]["nodes"][0]["author"] =
+        json!({"__typename": "Bot", "login": "shipyard-local"});
     assert_eq!(
         summarize(Some(&node), "main", &gates()).verdict.as_deref(),
         Some("APPROVE")
@@ -2305,6 +2311,9 @@ fn an_edited_approve_is_not_relayed_and_an_edited_hold_is() {
         "control: unedited, it is relayed"
     );
     node["comments"]["nodes"] = json!([comment("APPROVE", Some("2026-11-09T12:05:00Z"))]);
+    assert_eq!(summarize(Some(&node), "main", &gates()).verdict, None);
+    // The verdict pattern is case-blind, so the edit rule must be too.
+    node["comments"]["nodes"] = json!([comment("approve", Some("2026-11-09T12:05:00Z"))]);
     assert_eq!(summarize(Some(&node), "main", &gates()).verdict, None);
     node["comments"]["nodes"] = json!([comment("HOLD", Some("2026-11-09T12:05:00Z"))]);
     assert_eq!(

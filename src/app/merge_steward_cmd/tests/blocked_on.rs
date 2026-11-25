@@ -2204,3 +2204,66 @@ fn an_unstable_hold_names_the_check_that_holds_it() {
         )
     );
 }
+
+/// A head a pass once found held stays refused through the steward's own
+/// gate read after the HOLD comment is gone (a pull request's token can
+/// delete it). Control: the same read with an empty ledger admits the head.
+#[test]
+fn the_gate_refuses_a_head_the_steward_ledger_holds() {
+    use crate::head_approval::tests::{History, by_default};
+    let history = History::new(false);
+    let head = history.rebase(|history| history.write("more.txt", b"more base\n"), |_| {});
+    let guards = tempfile::tempdir().expect("guards");
+    let run_gh = |args: &[String]| history.gh(args);
+    let mut pr = ready_pr();
+    pr.fact.head_sha.clone_from(&head);
+    pr.fact.number = 7;
+    let mut observation = observation_for(pr.clone(), true);
+    observation.repo = "danielraffel/tartci".to_owned();
+    let mut policy = by_default("danielraffel/tartci");
+    policy.rebase_carry = true;
+    let queue = json!({"data": {"repository": {"pullRequest": {
+        "number": 7, "state": "OPEN", "headRefOid": head, "isInMergeQueue": false,
+        "mergeQueueEntry": null, "autoMergeRequest": null,
+        "timelineItems": {"pageInfo": {"hasPreviousPage": false}, "nodes": []}}}}});
+    let gate = |ledger: &StewardLedger| {
+        crate::head_approval::with_guards_dir(guards.path(), || {
+            crate::head_approval::with_host_review_default(true, || {
+                crate::app::merge_steward_cmd::pr_mutations::report_gate_with(
+                    &run_gh,
+                    &observation,
+                    &pr,
+                    &policy,
+                    &queue,
+                    ledger,
+                )
+            })
+        })
+        .expect("gate")
+    };
+    let mut ledger = StewardLedger::default();
+    assert!(gate(&ledger).0.allows(), "control: the comments admit it");
+    let hold_read = crate::app::merge_steward_cmd::blocked_on::GateRecord::new(
+        &head,
+        Some(ApprovalBlocker::Held {
+            holder: "infra-review2".to_owned(),
+            record: "comment",
+            id: Some(1),
+            at: Some("2026-11-24T01:00:00Z".to_owned()),
+        }),
+        &Value::Null,
+        false,
+    );
+    crate::app::merge_steward_cmd::held_ledger::record(
+        &mut ledger,
+        "danielraffel/tartci",
+        &BTreeMap::from([(7, hold_read)]),
+        chrono::Utc::now(),
+    );
+    let (refused, blocker) = gate(&ledger);
+    assert!(!refused.allows(), "{refused:?}");
+    assert!(
+        matches!(blocker, Some(ApprovalBlocker::Held { .. })),
+        "{blocker:?}"
+    );
+}

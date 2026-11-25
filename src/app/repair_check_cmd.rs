@@ -304,7 +304,20 @@ mod tests {
             None,
             "it reads as no HOLD"
         );
-        assert_eq!(edited_latest_verdict(&[forged]), Some(1));
+        assert_eq!(edited_latest_verdict(&[forged.clone()]), Some(1));
+        // The newest verdict decides: an older edited one does not refuse a
+        // newer unedited one, and a newer edited one refuses an older one.
+        let mut newer = hold.clone();
+        newer["id"] = serde_json::json!(2);
+        newer["created_at"] = serde_json::json!("2026-01-02T00:00:00Z");
+        newer["updated_at"] = serde_json::json!("2026-01-02T00:00:00Z");
+        assert_eq!(
+            edited_latest_verdict(&[forged.clone(), newer.clone()]),
+            None
+        );
+        let mut newer_edited = newer;
+        newer_edited["updated_at"] = serde_json::json!("2026-01-02T00:05:00Z");
+        assert_eq!(edited_latest_verdict(&[hold, newer_edited]), Some(2));
     }
 
     #[test]

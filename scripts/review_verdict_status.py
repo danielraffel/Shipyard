@@ -333,21 +333,23 @@ def held_in_history(guard: ModuleType, repo: str, head: str) -> str | None:
     return None
 
 
-def post_as_app(arguments: list[str]) -> None:
-    """Post the same status as the dedicated verdict App, failing open.
+def post_as_app(arguments: list[str]) -> bool:
+    """Post the same status as the dedicated verdict App; whether it posted
+    (``True`` too when no App is configured).
 
-    Until a ruleset binds ``review-verdict`` to the App this leg is shadow
-    only, and after the bind a missing App status already leaves the rule
-    unmet. So a token that could not be minted or a refused post never fails
-    the job (that would turn every pull request red): it is logged as a
-    warning and the job goes on. The token is never printed."""
+    A token that could not be minted or a refused post is logged as a
+    warning, never raised: for a ``success`` the job goes on (a missing App
+    status already leaves a bound rule unmet, so failing would only turn
+    pull requests red). The caller fails the job when a refusal could not be
+    posted, because the App's last status would stand on a refused head
+    (``run``). The token is never printed."""
     if not os.environ.get(APP_ID_ENV, "").strip():
-        return
+        return True
     token = os.environ.get(APP_TOKEN_ENV, "").strip()
     if not token:
         print(f"::warning title=review-verdict App leg::{APP_TOKEN_ENV} is empty (the token "
               "could not be minted); the App status was not posted")
-        return
+        return False
     real_gh = os.environ.get("GHAPP_REAL_GH", "gh")
     try:
         completed = subprocess.run(
@@ -356,13 +358,14 @@ def post_as_app(arguments: list[str]) -> None:
     except (OSError, subprocess.TimeoutExpired) as error:
         print(f"::warning title=review-verdict App leg::the App post did not run: "
               f"{type(error).__name__}")
-        return
+        return False
     if completed.returncode != 0:
         tail = completed.stderr.replace(token, "***").strip()[-200:]
         print(f"::warning title=review-verdict App leg::the App post failed "
               f"(exit {completed.returncode}): {tail}")
-        return
+        return False
     print("review-verdict: posted the same status as the verdict App")
+    return True
 
 
 def refresh_head_check(guard: ModuleType, repo: str, head: str) -> None:
@@ -480,7 +483,10 @@ def run(event_name: str, event: dict[str, Any], repo: str, run_url: str | None) 
     ]
     if run_url:
         arguments += ["-f", f"target_url={run_url}"]
-    post_as_app(arguments)
+    # A refusal the App could not post would leave the App's last status (an
+    # earlier `success`) standing on a refused head: retry once, then fail
+    # the job after the Actions post. A `success` fails open.
+    app_posted = post_as_app(arguments) or (state != "success" and post_as_app(arguments))
     guard.run_real_gh(arguments)
     for n, d in decisions:
         verdict = "allowed" if d.allowed else "awaiting" if d.awaiting else "refused"
@@ -491,10 +497,14 @@ def run(event_name: str, event: dict[str, Any], repo: str, run_url: str | None) 
         # as satisfied. The author has nothing to fix.
         print(f"::notice title=review-verdict::awaiting reviewer verdict for head {head[:12]}; "
               "nothing for the author to do")
+    if not app_posted and state != "success":
+        print(f"::error title=review-verdict App leg::the verdict App could not post {state} on "
+              f"{head}; its last status may still read success, so this job fails")
     if event_name in HEAD_CHECK_EVENTS:
+        # A refusal already fails this run; a success fails open.
         return 0 if allowed else 1
     refresh_head_check(guard, repo, head)
-    return 0
+    return 0 if app_posted or state == "success" else 1
 
 
 def main() -> int:

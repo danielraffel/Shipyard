@@ -98,34 +98,60 @@ author. merge-queue-rehearsal#47 showed both on an App comment (PATCH 200,
 DELETE 204; `issues: write` alone and a read-only token got 403). So:
 
 - **An edited APPROVE counts for nothing.** A comment counts as an approval
-  only while its REST `updated_at` equals its `created_at`. A reaction does
-  not move `updated_at`; an edit does. The status names the exclusion
-  `edited`. The same rule holds in `queue-arm-guard`, `shipyard
-  review-verdict`, the steward's gate, `repair-check` (which refuses to judge
-  an edited newest verdict) and the relay. A reviewer who changes their mind
-  posts a new verdict.
+  only while its REST `updated_at` equals its `created_at` (a reaction does
+  not move it; an edit does, and times that cannot be compared count as
+  edited), and, for the comment that decides a head, while its GraphQL
+  `lastEditedAt` is null. REST times have one-second resolution, so an edit
+  made in the second the comment was posted only shows in `lastEditedAt`; a
+  `lastEditedAt` that cannot be read refuses the head. The status names the
+  exclusion `edited`. The same rule holds in `queue-arm-guard`, `shipyard
+  review-verdict`, the steward's gate (any author: the App, a listed human,
+  a listed reviewer), `repair-check` (which refuses to judge an edited newest
+  verdict) and the relay. A reviewer who changes their mind posts a new
+  verdict.
 - **An edited HOLD still holds,** since it can only refuse more.
-- **A HOLD deleted or edited away still holds.** The `issue_comment` event
-  carries the text GitHub had: the created or deleted body, and on an edit
-  the body before it (`changes.body.from`). The poster judges that text by
-  the HOLD rule, and a counted HOLD naming the live head posts `failure`
-  (`a HOLD naming head <sha> was removed after it was posted (...); it still
-  holds`). Later runs read the head's status history: a `review-verdict`
-  `failure` starting `a HOLD naming head <sha>`, posted by this job's own
-  creator, keeps the head held. That creator is the verdict App's bot once
-  `REVIEW_VERDICT_APP_BOT_LOGIN` names it, else `github-actions[bot]`, never
-  both. Only a new
-  head can be approved, as with any HOLD.
-- **The steward needs no ledger of its own for this.** Every landing path it
-  takes requires the required checks green at the exact head, and once the
-  ruleset binds `review-verdict` to the verdict App only the App's status,
-  which the poster keeps failed, satisfies it.
+- **A HOLD deleted or edited away still holds, from three records no pull
+  request's code can rewrite.** None of them is complete; the durable fix
+  takes verdicts from an App-posted status instead of comments.
+  - The poster. An edit or a delete made with a `GITHUB_TOKEN` starts no
+    workflow run (GitHub creates none for events that token causes), so the
+    poster never sees that edit or delete. What it has is the HOLD's own
+    `created` run: that event's payload carries the HOLD text even after the
+    comment is gone, and a counted HOLD naming the live head posts `failure`
+    (`a HOLD naming head <sha> was removed after it was posted (...); it still
+    holds`), whether the head was approved or only pending. An edit or delete
+    by anyone else does start a run, and its payload (the deleted body, or
+    `changes.body.from`) is judged the same way. Later runs read the head's
+    status history: a `review-verdict` `failure` starting `a HOLD naming head
+    <sha>`, posted by this job's own creator, keeps the head held. That
+    creator is the verdict App's bot once `REVIEW_VERDICT_APP_BOT_LOGIN` names
+    it, else `github-actions[bot]`, never both.
+  - The steward's ledger. A head any steward pass finds held is written to
+    the steward's own ledger (`held_heads`, kept 30 days), and the steward's
+    gate refuses it from then on, and the native-arm backstop skips it,
+    whatever the comments say. A HOLD deleted before any pass judged its head
+    is not in it.
+  - The host guard's hold record. `queue-arm-guard` refuses a head that the
+    hold hook's `holds.jsonl` on the same host names as held (it records each
+    HOLD posted through `ghapp` there). A HOLD posted from another host is not
+    in it; an unreadable file refuses.
 
-Residuals: a PR job with `actions: write` can cancel the poster run a
-deletion starts before it posts; a dismissed HOLD review leaves no payload
-text, so only an earlier failure in the status history keeps it held; and
-until the App posts, a PR workflow can post a `github-actions` failure that
-holds any head in the repository until that head's pull request pushes again. Vellum does not require `review-verdict` at all.
+Residuals: the HOLD's `created` run can still be lost, either cancelled by a PR
+job with `actions: write`, or displaced in the per-PR concurrency group (one
+run runs and one waits; a newer waiting run cancels the older waiting one);
+a dismissed HOLD review leaves no payload text, so only an earlier failure in
+the status history or the steward ledger keeps it held; and until the App
+posts, a PR workflow can post a `github-actions` failure that holds any head
+in the repository until that head's pull request pushes again. Vellum does not
+require `review-verdict` at all.
+
+## The verdict App's stale status
+
+When `REVIEW_VERDICT_APP_ID` is set and the state to post is not `success`
+(a refusal), an App post that fails is retried once; if it still fails the
+job exits non-zero with an `::error`, because the App's last status (perhaps
+an earlier `success`) would otherwise stand on a refused head. A `success`
+the App cannot post still fails open.
 
 ## Which branch's policy
 
@@ -144,9 +170,10 @@ base the same way.
 
 When `REVIEW_VERDICT_APP_ID` is set, the job posts the same status twice:
 first with `REVIEW_VERDICT_APP_TOKEN` (a token for the dedicated verdict App),
-then with the job's own token. The App leg fails open: an empty token (the
-mint step failed) or a refused post prints a `::warning` and never changes
-the exit code. Before a ruleset binds the App this keeps a bad key or an
+then with the job's own token. For a `success` the App leg fails open: an
+empty token (the mint step failed) or a refused post prints a `::warning`
+and never changes the exit code. A refusal is retried and then fails the job
+(see "The verdict App's stale status"). Before a ruleset binds the App this keeps a bad key or an
 outage from turning every pull request red; after the bind, a missing App
 status already leaves the rule unmet. The token is never printed. In the
 workflow, the mint step carries `continue-on-error: true` and the poster step

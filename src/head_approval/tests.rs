@@ -4613,3 +4613,127 @@ fn every_comment_record_reader_carries_updated_at() {
     // Without `updated_at` an edit is invisible to `comment_edited`.
     assert!(super::COMMENT_RECORD_JQ.contains("updated_at: .updated_at"));
 }
+
+/// A `gh` for `Generous-Corp/pulp#7` whose only comment is a signed App
+/// APPROVE of `HEAD`, read the way `COMMENT_RECORD_JQ` reads it (equal REST
+/// times), with `edited` as its GraphQL `lastEditedAt` answer.
+fn same_second_gh(edited: Result<Value, String>) -> impl Fn(&[String]) -> Result<String, String> {
+    move |args: &[String]| {
+        let joined = args.join(" ");
+        if joined.contains("contents/.shipyard/config.toml") {
+            Ok("[auto_merge]\nreviewer_signers = [\"pulp-review\"]\n".to_owned())
+        } else if joined.contains("lastEditedAt") {
+            assert!(joined.contains("id=IC_node7"), "{joined}");
+            edited.clone().map(|value| value.to_string())
+        } else if joined.contains("/reviews") {
+            Ok(String::new())
+        } else if joined.contains("/comments") {
+            Ok(json!({"id": 7, "node_id": "IC_node7", "login": "shipyard-local[bot]",
+                      "type": "Bot", "association": "CONTRIBUTOR",
+                      "at": "2026-10-12T01:00:00Z", "updated_at": "2026-10-12T01:00:00Z",
+                      "body": format!("reviewer: pulp-review\n<!-- session: \
+                                       Daniels-Mac-Studio-m3/r1 -->\nverdict: APPROVE head:{HEAD}")})
+            .to_string())
+        } else if joined.contains(".commit.committer.date") {
+            Ok("2026-10-12T00:00:00Z\n".to_owned())
+        } else if joined.contains("pulls/7 --jq .user.login") {
+            Ok("someone\n".to_owned())
+        } else {
+            Err(format!("unexpected gh call: {joined}"))
+        }
+    }
+}
+
+/// REST times have one-second resolution: an APPROVE edited in the second it
+/// was posted reads `updated_at == created_at`. GraphQL's `lastEditedAt`
+/// still shows the edit, and an unreadable answer is never an approval.
+#[test]
+fn an_approve_edited_in_its_own_second_is_refused_by_graphql() {
+    let judge = |edited: Result<Value, String>| {
+        let gh = same_second_gh(edited);
+        super::with_host_sessions(None, || {
+            let policy = super::read_policy_repository_side(&gh, "Generous-Corp/pulp", "main")
+                .expect("policy");
+            super::evaluate_with_policy_for_author_with_diagnosis(
+                &gh,
+                "Generous-Corp/pulp",
+                7,
+                HEAD,
+                &policy,
+                &empty_queue(HEAD),
+                Some("someone"),
+            )
+        })
+    };
+    let (gate, _, blocker) =
+        judge(Ok(json!({"data": {"node": {"lastEditedAt": null}}}))).expect("readable");
+    assert!(gate.allows(), "control: never edited: {gate:?}");
+    assert_eq!(blocker, None);
+    let (gate, _, blocker) = judge(Ok(json!({"data": {"node": {
+        "lastEditedAt": "2026-10-12T01:00:00Z"}}})))
+    .expect("readable");
+    assert!(!gate.allows(), "{gate:?}");
+    assert_eq!(
+        blocker.map(|blocker| blocker.token()),
+        Some("approval_excluded:edited".to_owned())
+    );
+    assert!(judge(Err("gh: HTTP 502".to_owned())).is_err());
+    assert!(judge(Ok(json!({"data": {"node": null}}))).is_err());
+}
+
+/// An edited APPROVE from a listed human, or a listed reviewer identity,
+/// counts no more than the App's.
+#[test]
+fn an_edited_approve_by_a_listed_human_or_reviewer_does_not_count() {
+    let human = |updated: &str| {
+        let mut comment = person(
+            "danielraffel",
+            "OWNER",
+            &format!("verdict: APPROVE head:{HEAD}"),
+        );
+        comment["updated_at"] = json!(updated);
+        comment
+    };
+    let humans = by_default_with_humans("danielraffel/tartci", &["danielraffel"]);
+    assert!(allows(
+        &humans,
+        &[human("2026-10-12T01:00:00Z")],
+        Some("author")
+    ));
+    assert!(!allows(
+        &humans,
+        &[human("2026-10-12T01:00:09Z")],
+        Some("author")
+    ));
+    let listed = required(&["danielraffel"]);
+    assert!(allows(
+        &listed,
+        &[human("2026-10-12T01:00:00Z")],
+        Some("author")
+    ));
+    assert!(!allows(
+        &listed,
+        &[human("2026-10-12T01:00:09Z")],
+        Some("author")
+    ));
+}
+
+/// Times that cannot be compared count as edited: a non-string, an
+/// unparseable string, or a missing creation time.
+#[test]
+fn noncomparable_edit_times_count_as_edited() {
+    let record = |updated: Value| json!({"at": "2026-10-12T01:00:00Z", "updated_at": updated});
+    assert!(!super::comment_edited(&record(json!(
+        "2026-10-12T01:00:00Z"
+    ))));
+    assert!(!super::comment_edited(&record(Value::Null)));
+    assert!(!super::comment_edited(
+        &json!({"at": "2026-10-12T01:00:00Z"})
+    ));
+    for bad in [json!(5), json!(true), json!("yesterday"), json!("")] {
+        assert!(super::comment_edited(&record(bad.clone())), "{bad}");
+    }
+    assert!(super::comment_edited(
+        &json!({"updated_at": "2026-10-12T01:00:00Z"})
+    ));
+}

@@ -414,6 +414,9 @@ pub(super) fn evaluate_head_gate_with(
         queue,
         pr.fact.author.as_deref(),
     )
+    .map(|outcome| {
+        super::held_ledger::apply(ledger, &observation.repo, pr.fact.number, head, outcome)
+    })
     .map_err(|error| format!("head approval unreadable: {error}"))
 }
 

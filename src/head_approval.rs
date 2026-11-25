@@ -1473,7 +1473,7 @@ fn normalized_login(value: &str) -> String {
         .to_ascii_lowercase()
 }
 
-fn is_fleet_author(login: &str) -> bool {
+pub(crate) fn is_fleet_author(login: &str) -> bool {
     normalized_login(login) == "shipyard-local"
 }
 
@@ -2524,7 +2524,7 @@ const REVIEW_RECORD_JQ: &str = ".[] | {id: .id, login: .user.login, type: .user.
 /// A comment as the gate reads it.
 /// `updated_at` is load-bearing: without it [`comment_edited`] cannot see an
 /// edit.
-pub(crate) const COMMENT_RECORD_JQ: &str = ".[] | {id: .id, login: .user.login, type: .user.type, association: .author_association, at: .created_at, updated_at: .updated_at, body: .body, performed_via_github_app_id: .performed_via_github_app.id}";
+pub(crate) const COMMENT_RECORD_JQ: &str = ".[] | {id: .id, node_id: .node_id, login: .user.login, type: .user.type, association: .author_association, at: .created_at, updated_at: .updated_at, body: .body, performed_via_github_app_id: .performed_via_github_app.id}";
 
 fn read_records(run_gh: RunGh<'_>, path: &str, jq: &str) -> Result<Vec<Value>, String> {
     let raw = run_gh(&[
@@ -2653,7 +2653,80 @@ pub fn evaluate_excusing_with_policy(
     };
     let gate = with_carry(run_gh, &input, gate);
     let gate = with_rollup(run_gh, &input, gate);
+    let gate = edit_checked(run_gh, head, &comments, gate)?;
     trusted_signal::apply(run_gh, repo, pr, head, &policy.trusted_signals, gate)
+}
+
+/// The GraphQL query for one comment's edit history.
+const COMMENT_EDIT_QUERY: &str =
+    "query($id: ID!) { node(id: $id) { ... on IssueComment { lastEditedAt } } }";
+
+/// `gate`, refused when the comment whose APPROVE decides it (directly or
+/// carried) was ever edited by GraphQL's `lastEditedAt`.
+///
+/// REST times have one-second resolution, so an edit in the second the
+/// comment was posted leaves `updated_at == created_at` ([`comment_edited`]);
+/// `lastEditedAt` is set by any edit. Checked only for a record read through
+/// [`COMMENT_RECORD_JQ`] (it carries `updated_at`): such a record without a
+/// `node_id`, or an unreadable answer, is an error, never an approval.
+fn edit_checked(
+    run_gh: RunGh<'_>,
+    head: &str,
+    comments: &[Value],
+    gate: HeadGate,
+) -> Result<HeadGate, String> {
+    let HeadGate::Approved { approval } = &gate else {
+        return Ok(gate);
+    };
+    let mut deciding = approval;
+    while let Approval::Carried {
+        approval: inner, ..
+    } = deciding
+    {
+        deciding = inner;
+    }
+    let Approval::Marker {
+        comment_id: Some(id),
+        ..
+    } = deciding
+    else {
+        return Ok(gate);
+    };
+    let Some(record) = comments
+        .iter()
+        .find(|comment| comment.get("id").and_then(Value::as_u64) == Some(*id))
+    else {
+        return Err(format!(
+            "approval comment {id} is not among the comments read"
+        ));
+    };
+    if record.get("updated_at").is_none() {
+        return Ok(gate);
+    }
+    let node_id = record
+        .get("node_id")
+        .and_then(Value::as_str)
+        .filter(|node| !node.is_empty())
+        .ok_or_else(|| format!("approval comment {id} carries no node id"))?;
+    let answer = gh_json(
+        run_gh,
+        &[
+            "api".to_owned(),
+            "graphql".to_owned(),
+            "-f".to_owned(),
+            format!("query={COMMENT_EDIT_QUERY}"),
+            "-f".to_owned(),
+            format!("id={node_id}"),
+        ],
+    )
+    .map_err(|error| format!("approval comment {id} edit history unreadable: {error}"))?;
+    match answer.pointer("/data/node/lastEditedAt") {
+        Some(Value::Null) => Ok(gate),
+        Some(Value::String(_)) => Ok(HeadGate::NotApproved {
+            head: head.to_owned(),
+        }),
+        _ => Err(format!("approval comment {id} edit history unreadable")),
+    }
 }
 
 /// The pull request's author, read when the policy turns on it: with no
@@ -2837,6 +2910,9 @@ fn evaluate_events_by_source(
     } else {
         gate
     };
+    let allowed_by_comments = gate.allows();
+    let gate = edit_checked(run_gh, head, &comments, gate)?;
+    let edited_away = allowed_by_comments && !gate.allows();
     let blocker = blocker::diagnose(
         &gate,
         &blocker::Records {
@@ -2848,6 +2924,16 @@ fn evaluate_events_by_source(
         policy,
         author,
     );
+    let blocker = if edited_away {
+        Some(ApprovalBlocker::Excluded {
+            reason: "edited",
+            detail: format!("{EDITED_REFUSAL} (GraphQL `lastEditedAt`)"),
+            id: None,
+            at: None,
+        })
+    } else {
+        blocker
+    };
     Ok((gate, events, blocker))
 }
 

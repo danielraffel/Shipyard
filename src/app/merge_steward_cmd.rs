@@ -409,6 +409,10 @@ struct StewardLedger {
     /// with a solo-entry setting. See `solo_entry`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     solo_entry_native_arms: BTreeMap<String, BTreeMap<u64, String>>,
+    /// Heads a pass found held, keyed `repo#pr`, so a HOLD whose comment was
+    /// later deleted or edited still holds. See `held_ledger`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    held_heads: held_ledger::HeldHeads,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2315,6 +2319,7 @@ mod fix_reorder;
 mod flake_requeue;
 mod generated_paths;
 mod head_rollup;
+mod held_ledger;
 pub(super) mod infra_rerun;
 pub(super) mod invariants;
 mod ledger;

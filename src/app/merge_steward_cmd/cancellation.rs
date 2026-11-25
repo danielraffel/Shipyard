@@ -551,6 +551,14 @@ pub(super) fn apply_repo_plan(
                             .defect_fix
                             .blocking(&observation.repo, report.number, &report.head_sha)
                             .is_none()
+                            // Nor a head the steward ledger holds.
+                            && super::held_ledger::held_since(
+                                ledger,
+                                &observation.repo,
+                                report.number,
+                                &report.head_sha,
+                            )
+                            .is_none()
                     })
                     .cloned()
                     .collect::<Vec<_>>(),
@@ -1168,6 +1176,9 @@ pub(super) fn apply_pr_plans_with_poison(
     let approval_blockers = mutation_context
         .map(|context| context.approval_blockers.take())
         .unwrap_or_default();
+    // A head this pass found held stays held after its HOLD comment is
+    // deleted or edited. See `held_ledger`.
+    super::held_ledger::record(ledger, &observation.repo, &approval_blockers, Utc::now());
     // Which check or status each required rule selects, so a rollout can
     // prove this host picks the verdict App's status before a ruleset binds it.
     for report in &mut reports {

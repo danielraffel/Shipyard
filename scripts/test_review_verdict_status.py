@@ -688,6 +688,22 @@ class TamperedVerdicts(unittest.TestCase):
         self.assertEqual(self.judged(trail, SIGNERS), "pending")
         self.assertIn("edited", self.posted()["description"])
 
+    def test_an_approve_edited_in_its_own_second_is_not_success(self) -> None:
+        # REST times have one-second resolution: an edit in the second the
+        # comment was posted leaves updated_at == created_at. GraphQL's
+        # lastEditedAt still shows it.
+        edited = [("lastEditedAt", {"json": {"data": {"node": {
+            "lastEditedAt": "2026-10-12T15:00:00Z"}}}}), *self.answers(self.approved(), SIGNERS)]
+        result = self.post(edited)
+        self.assertEqual(self.posted()["state"], "pending", result.stdout + result.stderr)
+        unreadable = [("lastEditedAt", {"error": "gh: HTTP 502"}),
+                      *self.answers(self.approved(), SIGNERS)]
+        result = self.post(unreadable)
+        self.assertEqual(self.posted()["state"], "failure", result.stdout + result.stderr)
+        guard = self.run_guard(["pr", "merge", "784", "--merge", "--match-head-commit", HEAD],
+                               edited, REPO, SHIPYARD_SIGNERS_FROM_BASE="1")
+        self.assertNotEqual(guard.returncode, 0, guard.stderr)
+
     def test_a_deleted_hold_still_holds(self) -> None:
         # Control: the deleted comment was not a HOLD, so the APPROVE decides.
         quiet = self.post(self.answers(self.approved(), SIGNERS),
@@ -699,6 +715,34 @@ class TamperedVerdicts(unittest.TestCase):
         self.assertEqual(posted["state"], "failure", result.stdout + result.stderr)
         self.assertTrue(posted["description"].startswith(f"a HOLD naming head {HEAD[:12]}"),
                         posted)
+
+    def test_a_hold_deleted_before_its_own_created_run_reads_still_holds(self) -> None:
+        # A pull request's GITHUB_TOKEN deletes the HOLD at once; that delete
+        # starts no workflow run, so the HOLD's own `created` payload is the
+        # only evidence left. The listing no longer has it.
+        result = self.post(self.answers(self.approved(), SIGNERS),
+                           event=self.comment_event("created", HOLD_BODY))
+        posted = self.posted()
+        self.assertEqual(posted["state"], "failure", result.stdout + result.stderr)
+        self.assertTrue(posted["description"].startswith(f"a HOLD naming head {HEAD[:12]}"))
+
+    def test_a_removed_hold_holds_even_before_any_approve(self) -> None:
+        # With no approval the head is only pending; the removed HOLD must
+        # still be recorded as a failure, or a later APPROVE would count.
+        self.post(self.answers([], SIGNERS), event=self.comment_event("created", HOLD_BODY))
+        self.assertEqual(self.posted()["state"], "failure")
+
+    def test_the_payload_holds_only_a_hold_naming_this_head(self) -> None:
+        other = HOLD_BODY.replace(HEAD, arm.HOLD_784)
+        self.post(self.answers(self.approved(), SIGNERS),
+                  event=self.comment_event("created", other))
+        self.assertEqual(self.posted()["state"], "success", "a HOLD of another head")
+        # An APPROVE whose prose says HOLD reaches the payload judge, which
+        # takes only HOLDs.
+        prose = SIGNED_APPROVE.format(head=HEAD).replace("Reviewed.", "Reviewed; no HOLD.")
+        self.post(self.answers(self.approved(), SIGNERS),
+                  event=self.comment_event("created", prose))
+        self.assertEqual(self.posted()["state"], "success", "an APPROVE in the payload")
 
     def test_a_hold_edited_into_an_approve_still_holds(self) -> None:
         self.post(self.answers(self.approved(), SIGNERS),
@@ -748,6 +792,28 @@ class TamperedVerdicts(unittest.TestCase):
         self.assertNotIn("does not require a review", guard.stderr)
         self.assertNotIn("ref=b0", self.calls())
 
+    def test_the_host_guard_refuses_a_head_its_hold_record_holds(self) -> None:
+        # The HOLD comment is gone (a pull request's token deleted it); the
+        # hold hook's record on this host still names the head.
+        merge = ["pr", "merge", "784", "--merge", "--match-head-commit", HEAD]
+        allowed = self.run_guard(merge, self.answers(self.approved(), SIGNERS), REPO,
+                                 SHIPYARD_SIGNERS_FROM_BASE="1")
+        self.assertEqual(allowed.returncode, 0, "control: " + allowed.stderr)
+        record = self.guards / "holds.jsonl"
+        record.write_text(json.dumps({"repo": "danielraffel/shipyard", "pr": 784,
+                                      "hold_head": arm.HOLD_784, "action": "none"}) + "\n"
+                          + "not json\n", encoding="utf-8")
+        other = self.run_guard(merge, self.answers(self.approved(), SIGNERS), REPO,
+                               SHIPYARD_SIGNERS_FROM_BASE="1")
+        self.assertEqual(other.returncode, 0, "a HOLD of another head: " + other.stderr)
+        with record.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"repo": REPO, "pr": 784, "hold_head": HEAD,
+                                     "at": "2026-11-24T01:00:00Z"}) + "\n")
+        held = self.run_guard(merge, self.answers(self.approved(), SIGNERS), REPO,
+                              SHIPYARD_SIGNERS_FROM_BASE="1")
+        self.assertNotEqual(held.returncode, 0, held.stderr)
+        self.assertIn("hold record", held.stderr)
+
     def app_gh(self, fake: pathlib.Path) -> pathlib.Path:
         """``gh`` that refuses the App token and passes anything else to ``fake``."""
         wrapper = self.root / "gh-app"
@@ -781,6 +847,18 @@ class TamperedVerdicts(unittest.TestCase):
         self.assertIn("the App post failed", broken.stdout)
         self.assertNotIn("broken-app-token", broken.stdout + broken.stderr)
         self.assertEqual(len(self.statuses()), 1)
+        # A refusal the App cannot post fails the job after a retry, so the
+        # App's last `success` is never left standing on a refused head.
+        held = self.answers([], SIGNERS)
+        self.install(held)
+        refused = self.post(held, event={"issue": {"number": 784, "pull_request": {"url": "x"}}},
+                            GHAPP_REAL_GH=str(self.app_gh(self.root / "gh")),
+                            REVIEW_VERDICT_APP_ID="123",
+                            REVIEW_VERDICT_APP_TOKEN="broken-app-token")
+        self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+        self.assertEqual(refused.stdout.count("the App post failed"), 2, "one retry")
+        self.assertIn("::error title=review-verdict App leg::", refused.stdout)
+        self.assertEqual(len(self.statuses()), 1, "the Actions post still happens")
         # A working App token posts the same status twice.
         self.install(answers)
         good = self.post(answers, event_name="pull_request_target",

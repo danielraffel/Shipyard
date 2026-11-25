@@ -479,11 +479,18 @@ pub(crate) fn trusted_author(comment: &Value) -> bool {
         .get("authorAssociation")
         .and_then(Value::as_str)
         .unwrap_or("");
+    // Only the fleet App among bots: every workflow's `GITHUB_TOKEN` posts as
+    // the `github-actions` Bot, so "any Bot" let a pull request's own job
+    // relay a verdict it wrote.
     crate::head_approval::TRUSTED_ASSOCIATIONS.contains(&association)
-        || comment
+        || (comment
             .pointer("/author/__typename")
             .and_then(Value::as_str)
             == Some("Bot")
+            && comment
+                .pointer("/author/login")
+                .and_then(Value::as_str)
+                .is_some_and(crate::head_approval::is_fleet_author))
 }
 
 fn required_name(node: &Value) -> Option<String> {

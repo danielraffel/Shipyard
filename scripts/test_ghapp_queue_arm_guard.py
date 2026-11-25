@@ -1894,6 +1894,9 @@ class BatchAttributionTests(unittest.TestCase):
                 f"printf '%s\\n' \"$*\" >> '{guards / 'calls'}'\n"
                 "case \"$*\" in *contents/.shipyard/config.toml*)\n"
                 "  echo 'gh: Not Found (HTTP 404)' >&2; exit 1;; esac\n"
+                # The deciding approval comment's edit history: never edited.
+                "case \"$*\" in *lastEditedAt*)\n"
+                "  echo '{\"data\": {\"node\": {\"lastEditedAt\": null}}}'; exit 0;; esac\n"
                 f"n=$(cat '{guards / 'n'}' 2>/dev/null || echo 0)\n"
                 f"echo $((n+1)) > '{guards / 'n'}'\n"
                 f"cat '{answers}'/$n.json\n",
@@ -2696,6 +2699,8 @@ class ReviewBeforeArm(unittest.TestCase):
              extra: list[tuple[str, dict[str, Any]]] | None = None) -> list[tuple[str, dict[str, Any]]]:
         config_answer = {"error": "gh: Not Found (HTTP 404)"} if config is None else {"text": config}
         return [
+            # The deciding APPROVE comment's GraphQL edit history: never edited.
+            ("lastEditedAt", {"json": {"data": {"node": {"lastEditedAt": None}}}}),
             ("contents/.shipyard/config.toml", config_answer),
             ("mergeQueue(branch", {"json": {"data": {"repository": {
                 "mergeQueue": {"id": "MQ_1"} if queue else None}}}}),
@@ -4363,6 +4368,24 @@ class ReviewIdentity(unittest.TestCase):
         self.assertFalse(guard.review_verdict(self.HEAD, "author", [approve, hold], [],
                                               self.policy())[0])
 
+    def test_unreadable_or_noncomparable_edit_times_count_as_edited(self) -> None:
+        base = {"created_at": "2026-10-12T01:00:00Z"}
+        self.assertFalse(guard.comment_edited(dict(base, updated_at="2026-10-12T01:00:00Z")))
+        self.assertFalse(guard.comment_edited(base), "no updated_at: not read from the API")
+        for updated in ("yesterday", "2026-10-12T01:00:00", 5, ""):
+            self.assertTrue(guard.comment_edited(dict(base, updated_at=updated)), updated)
+        self.assertTrue(guard.comment_edited({"created_at": None, "updated_at": "x"}))
+
+    def test_a_listed_humans_edited_approve_does_not_count(self) -> None:
+        approve = dict(self.comment("danielraffel", f"verdict: APPROVE head:{self.HEAD}",
+                                    association="OWNER"), updated_at="2026-10-12T01:00:00Z")
+        listed = self.policy(("danielraffel",))
+        self.assertTrue(guard.review_verdict(self.HEAD, "author", [approve], [], listed)[0])
+        edited = dict(approve, updated_at="2026-10-12T01:00:09Z")
+        self.assertFalse(guard.review_verdict(self.HEAD, "author", [edited], [], listed)[0])
+        self.assertIsNone(guard._deciding_approval_comment(
+            self.HEAD, "author", [edited], [], listed))
+
     def policy(self, humans: tuple[str, ...] = ()) -> dict[str, Any]:
         policy = guard.review_policy(None, "danielraffel/tartci", True)
         policy["humans"] = list(humans)
@@ -5350,13 +5373,19 @@ class ReviewerClaimReviewGate(unittest.TestCase):
                 return pull
             raise AssertionError(f"unexpected gh read {arguments}")
 
-        approval = {"verdict_comment_id": 1, "signer": "pulp-review",
+        def real_gh_or_graphql(arguments: list[str]) -> Any:
+            if any("lastEditedAt" in arg for arg in arguments):
+                return {"data": {"node": {"lastEditedAt": None}}}
+            return real_gh(arguments)
+
+        approval = {"verdict_comment_id": 1, "verdict_node_id": "IC_1", "verdict_from_api": True,
+                    "signer": "pulp-review",
                     "approved_head": self.head, "approved_at": "2026-10-27T20:30:00Z"}
         target = {"repo": self.repo, "pr": 11, "head": self.head, "bound_head": self.head}
         with tempfile.TemporaryDirectory() as guards, \
                 mock.patch.dict(os.environ, {"SHIPYARD_GHAPP_GUARDS_DIR": guards}), \
                 mock.patch.object(guard, "host_review_default", return_value=True), \
-                mock.patch.object(guard, "run_real_gh", side_effect=real_gh), \
+                mock.patch.object(guard, "run_real_gh", side_effect=real_gh_or_graphql), \
                 mock.patch.object(guard, "base_config_text", return_value=self.config), \
                 mock.patch.object(guard, "_rest_pages", return_value=[]), \
                 mock.patch.object(guard, "review_verdict",

@@ -1800,7 +1800,10 @@ def comment_edited(comment: dict[str, Any]) -> bool:
         return False
     created = _timestamp(created_raw)
     updated = _timestamp(updated_raw)
-    return created is None or updated is None or updated != created
+    if (created is None or updated is None
+            or created.tzinfo is None or updated.tzinfo is None):
+        return True
+    return updated != created
 
 
 def counting_verdicts(
@@ -1853,6 +1856,39 @@ def _held_by(login: str, body: Any, kind: str, record_id: Any) -> str:
     signed = _SIGNER_LINE.findall(body) if isinstance(body, str) else []
     signer = signed[-1].lower() if signed else login
     return f"held by {signer} at {kind} {record_id if record_id is not None else '(no id)'}"
+
+
+# The verdict hold hook's own record of every HOLD this host posted
+# (scripts/ghapp_verdict_hold_hook.py), in the guards directory.
+HOLDS_LOG = "holds.jsonl"
+
+
+def recorded_hold(repo: str, number: int, head: str) -> str | None:
+    """When this host's hold hook recorded a HOLD of ``head`` on ``repo#number``.
+
+    A pull request's own workflow can delete or edit the HOLD comment
+    (merge-queue-rehearsal#47); this record lives on the host, where no pull
+    request's code reaches. It knows only HOLDs posted through ``ghapp`` on
+    this host. No file is no record; a file that exists but cannot be read
+    raises, so the landing is refused rather than judged without it."""
+    path = _guards_dir() / HOLDS_LOG
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise GuardError(f"the hold record {path} is unreadable: {error}") from error
+    for line in text.splitlines():
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if (isinstance(row, dict)
+                and str(row.get("repo") or "").lower() == repo.lower()
+                and row.get("pr") == number
+                and str(row.get("hold_head") or "").lower() == head.lower()):
+            return str(row.get("at") or "an unrecorded time")
+    return None
 
 
 def _latest_on(
@@ -1996,6 +2032,10 @@ def deciding_approval(
     if comment is not None:
         signed = _SIGNER_LINE.findall(comment.get("body") or "")
         return {"verdict_comment_id": comment.get("id"),
+                "verdict_node_id": comment.get("node_id"),
+                # Only a comment read from the API carries updated_at (as
+                # src/head_approval.rs `edit_checked`); only that is checked.
+                "verdict_from_api": "updated_at" in comment,
                 "signer": signed[-1].lower() if signed else None, "approved_head": head,
                 "approved_at": _comment_effective_time(comment)}
     for review in reviews:
@@ -3520,6 +3560,8 @@ def review_gate(classification: dict[str, Any], repo: str | None, dry_run: bool 
     EXCLUDED_APPROVALS.clear()
     HELD_EXCLUSIONS.clear()
     result = _review_gate(classification, repo, dry_run)
+    if result[0]:
+        result = _edit_checked(classification, repo, result)
     if HELD_EXCLUSIONS:
         classification["held_exclusions"] = sorted(set(HELD_EXCLUSIONS))
         print(f"queue-arm-guard: note: PR #{classification.get('pr')}: "
@@ -3533,6 +3575,61 @@ def review_gate(classification: dict[str, Any], repo: str | None, dry_run: bool 
               "reviewer where the host lists signers), or a login the base lists in "
               "`[auto_merge] human_reviewers`, approves", file=sys.stderr)
     return result
+
+
+COMMENT_EDIT_QUERY = "query($id: ID!) { node(id: $id) { ... on IssueComment { lastEditedAt } } }"
+
+
+def comment_last_edited(node_id: str) -> str | None:
+    """The comment's GraphQL ``lastEditedAt``: ``None`` when it was never
+    edited. REST ``updated_at`` has one-second resolution, so an edit made in
+    the second the comment was posted leaves it equal to ``created_at``;
+    ``lastEditedAt`` is set by any edit. Raises when it cannot be read."""
+    answer = graphql(COMMENT_EDIT_QUERY, {"id": node_id})
+    node = ((answer or {}).get("data") or {}).get("node") if isinstance(answer, dict) else None
+    if not isinstance(node, dict) or "lastEditedAt" not in node:
+        raise GuardError(f"comment {node_id} edit history is unreadable")
+    edited = node["lastEditedAt"]
+    if edited is not None and not isinstance(edited, str):
+        raise GuardError(f"comment {node_id} edit history is malformed")
+    return edited
+
+
+def _edit_checked(classification: dict[str, Any], repo: str | None,
+                  result: tuple[bool, str, dict[str, Any] | None]
+                  ) -> tuple[bool, str, dict[str, Any] | None]:
+    """``result``, refused when the APPROVE comment deciding it was ever
+    edited (GraphQL ``lastEditedAt``), or when that cannot be read."""
+    approval = classification.get("approval")
+    if (not isinstance(approval, dict) or approval.get("verdict_comment_id") is None
+            or not approval.get("verdict_from_api")):
+        return result
+    repo = classification.get("repo") or repo
+    number = classification.get("pr")
+    head = str(classification.get("head") or "")
+    label = f"PR #{number}"
+    node_id = approval.get("verdict_node_id")
+    read_pull = f"ghapp api repos/{repo}/pulls/{number} --jq .head.sha"
+    try:
+        if not isinstance(node_id, str) or not node_id:
+            raise GuardError(f"comment {approval['verdict_comment_id']} carries no node id")
+        edited = comment_last_edited(node_id)
+    except GuardError as error:
+        return False, (f"{label} ({repo}): cannot read whether its approval comment was "
+                       f"edited ({error}); refusing to land it"), review_fix(
+            "unreadable", f"the approval comment of {label} could not be checked: {error}",
+            str(repo), int(number) if isinstance(number, int) else 0, head, read_pull, True)
+    if edited is None:
+        return result
+    EXCLUDED_APPROVALS.append(f"comment {approval['verdict_comment_id']} ({EDITED_REFUSAL})")
+    classification.pop("approval", None)
+    return False, (f"{label} ({repo}): no reviewer verdict names head {head[:12]}: its "
+                   f"approval comment {approval['verdict_comment_id']} was edited at {edited}, "
+                   "so it does not count"), review_fix(
+        "unreviewed", f"the approval of {label} was edited after it was posted",
+        str(repo), int(number) if isinstance(number, int) else 0, head,
+        f"a reviewer posts a new `verdict: APPROVE head:{head}` comment on "
+        f"https://github.com/{repo}/pull/{number}", False)
 
 
 def _review_gate(classification: dict[str, Any], repo: str | None, dry_run: bool = False
@@ -3596,6 +3693,19 @@ def _review_gate(classification: dict[str, Any], repo: str | None, dry_run: bool
     if admitted is not None:
         return admitted
     allowed, why = review_verdict(head, author, comments, reviews, policy)
+    if allowed:
+        try:
+            held_at = recorded_hold(repo, number, head)
+        except GuardError as error:
+            return False, f"{label} ({repo}): {error}", review_fix(
+                "unreadable", f"the hold record for {label} could not be read: {error}",
+                repo, number, head, read_pull, True)
+        if held_at is not None:
+            allowed = False
+            why = (f"a HOLD naming head {head[:12]} makes it un-approvable (held by this "
+                   f"host's hold record at {held_at}; its comment is gone or no longer "
+                   "reads as a HOLD); push a new head that addresses the HOLD and have it "
+                   "reviewed")
     if allowed:
         own = self_approval(head, author, comments, reviews, policy)
         if own is not None:
