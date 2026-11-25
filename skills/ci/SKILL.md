@@ -1148,15 +1148,22 @@ host while a sandbox canary is running: the probe itself is a foreign holder.
 The signing job names the `release` environment (tags `v*` only), so it runs
 only for `v*` tags. The Developer ID and notarization secrets stay repository
 secrets for now (an environment job also receives them, so releases keep
-signing); moving them into the environment is a later owner step. post-tag-sync does not: it must stay identical to what
-`shipyard release-bot hook install` renders. A tag push runs the
+signing); moving them into the environment is a later owner step. A tag push runs the
 tagged commit's own workflow file, so the environment is only as safe as the
 `v*` tag rulesets; add the tag policy only after they exist. The job still
 builds repository code next to those secrets: the environment limits which
 refs reach them, not what merged code can do. Adding a job that reads a secret
 means classifying it in `scripts/test_workflow_secret_environments.py`.
-`SHIPYARD_APP_PRIVATE_KEY` and post-tag-sync's `RELEASE_BOT_TOKEN` stay
-repository secrets too.
+
+`SHIPYARD_APP_PRIVATE_KEY` is a secret of the `app-key` environment, which
+admits only `refs/heads/main` and has administrator bypass off. The jobs that
+name it are auto-release's `tag`, version-at-land's `assign` and post-tag-sync's
+`sync`. A tag push cannot use it, so post-tag-sync starts with `workflow_run`
+when auto-release finishes on main: a `resolve` job with no secret checks that
+the run's commit is on main and finds its `v*` tag, then `sync` runs for that
+tag. `hook install` renders that shape whenever `push_mode = "handoff"`. Never
+give `app-key` a tag rule. post-tag-sync's legacy `RELEASE_BOT_TOKEN` path stays
+a repository secret.
 
 On a protected default branch the post-tag hook must not push: set
 `release.post_tag_hook.push_mode = "handoff"` and `app_client_id`. The hook then

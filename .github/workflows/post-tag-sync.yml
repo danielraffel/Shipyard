@@ -2,31 +2,90 @@ name: Post-tag docs sync
 
 # Installed by `shipyard release-bot hook install`. Shipyard-owned file:
 # re-running the install command overwrites this file in place.
+#
+# The release App key is a secret of the `app-key` environment, which
+# admits only runs whose ref is `refs/heads/main`. A tag push runs with the
+# tag as its ref, so this workflow starts when "Auto-Release on CLI Version Bump"
+# finishes on main instead, and syncs the release tag that run left on its
+# commit. The `resolve` job holds no secret; it checks that the commit is on
+# main and finds the tag.
 
 on:
-  push:
-    tags: ["v*"]
-
-concurrency:
-  group: shipyard-post-tag-sync
-  cancel-in-progress: false
+  workflow_run:
+    workflows: ["Auto-Release on CLI Version Bump"]
+    types: [completed]
+    branches: [main]
 
 permissions:
   contents: read
   pull-requests: write
 
-env:
-  SHIPYARD_VERSION: "${{ github.ref_name }}"
-
 jobs:
-  sync:
-    name: Regenerate docs for ${{ github.ref_name }}
+  resolve:
+    name: Resolve the release tag
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      (github.event.workflow_run.event == 'push' ||
+        github.event.workflow_run.event == 'workflow_dispatch')
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      sha: ${{ steps.tag.outputs.sha }}
     steps:
-      - name: Checkout release tag with full history
+      - name: Checkout main with tags
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
-          ref: ${{ github.ref }}
+          ref: main
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Find the release tag on the run's commit
+        id: tag
+        shell: bash
+        env:
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          TAG_PATTERN: "v*"
+        run: |
+          set -euo pipefail
+          if ! [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::run head $HEAD_SHA is not a commit SHA" >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$HEAD_SHA" HEAD; then
+            echo "::error::run head $HEAD_SHA is not on main" >&2
+            exit 1
+          fi
+          tags="$(git tag --points-at "$HEAD_SHA" --list "$TAG_PATTERN")"
+          if [ -z "$tags" ]; then
+            echo "No $TAG_PATTERN tag at $HEAD_SHA; nothing to sync."
+            exit 0
+          fi
+          if [ "$(printf '%s\n' "$tags" | grep -c .)" -ne 1 ]; then
+            echo "::error::more than one $TAG_PATTERN tag at $HEAD_SHA" >&2
+            exit 1
+          fi
+          test "$(git rev-parse "refs/tags/$tags^{commit}")" = "$HEAD_SHA"
+          echo "tag=$tags" >> "$GITHUB_OUTPUT"
+          echo "sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+
+  sync:
+    name: Regenerate docs for ${{ needs.resolve.outputs.tag }}
+    needs: resolve
+    if: needs.resolve.outputs.tag != ''
+    environment: app-key
+    runs-on: ubuntu-latest
+    concurrency:
+      group: shipyard-post-tag-sync
+      cancel-in-progress: false
+    env:
+      SHIPYARD_VERSION: "${{ needs.resolve.outputs.tag }}"
+    steps:
+      - name: Checkout the release tag's commit with full history
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
           fetch-depth: 0
           fetch-tags: true
           # Only the docs-sync step below receives the push token.
@@ -63,6 +122,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
         run: |
           set -euo pipefail
           # Git credentials for this step only; nothing is written to .git/config.
@@ -71,5 +131,4 @@ jobs:
           export GIT_CONFIG_COUNT=1
           export GIT_CONFIG_KEY_0="http.https://github.com/.extraheader"
           export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth"
-          tag="${GITHUB_REF#refs/tags/}"
-          shipyard release-bot hook run --tag "$tag"
+          shipyard release-bot hook run --tag "$RELEASE_TAG"

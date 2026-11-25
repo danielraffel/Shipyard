@@ -6,10 +6,12 @@ name: Auto-Release on CLI Version Bump
 # release.yml then builds draft release assets from the tag.
 #
 # The tag is pushed with a shipyard-local GitHub App installation token
-# (secret SHIPYARD_APP_PRIVATE_KEY), scoped to this
+# (secret SHIPYARD_APP_PRIVATE_KEY of the `app-key` environment, which admits
+# only runs on refs/heads/main), scoped to this
 # repository with contents write only: a tag pushed by the default workflow
 # token would start no release.yml run. Without the App credentials the run
-# fails rather than falling back to the default token.
+# fails rather than falling back to the default token. post-tag-sync.yml
+# starts when this workflow finishes on main and syncs the tag it pushed.
 #
 # The workflow also supports workflow_dispatch so `shipyard doctor
 # --release-chain` can verify that the release token is accepted. A manual
@@ -31,6 +33,7 @@ jobs:
   tag:
     runs-on: ubuntu-latest
     name: Tag CLI version bumps
+    environment: app-key
 
     steps:
       - name: Require release App credentials

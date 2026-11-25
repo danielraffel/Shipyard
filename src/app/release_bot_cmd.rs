@@ -388,6 +388,24 @@ fn hook_install<W: Write>(
             "release.post_tag_hook.push_mode = \"handoff\" requires release.post_tag_hook.app_client_id (the release App's public client ID)",
         ));
     }
+    let release_app = app_client_id
+        .map(|client_id| {
+            let tag_workflow = hook_config.tag_workflow.as_deref().ok_or_else(|| {
+                CliFailure::new(
+                    1,
+                    "release.post_tag_hook.push_mode = \"handoff\" requires release.post_tag_hook.tag_workflow (the `name:` of the workflow that pushes the release tag from the base branch)",
+                )
+            })?;
+            validate_tag_workflow_name(tag_workflow).map_err(|error| CliFailure::new(1, error))?;
+            validate_base_branch_name(&hook_config.branch)
+                .map_err(|error| CliFailure::new(1, error))?;
+            Ok::<_, CliFailure>(ReleaseApp {
+                client_id,
+                tag_workflow,
+                branch: &hook_config.branch,
+            })
+        })
+        .transpose()?;
     let trusted_config = LoadedConfig::load_machine_global_from_dir(config.global_dir.clone())
         .map_err(|error| {
             CliFailure::new(
@@ -418,7 +436,7 @@ fn hook_install<W: Write>(
             shipyard_version,
             &runner,
             signing_setup_script,
-            app_client_id,
+            release_app,
         ),
     )
     .map_err(|error| {
@@ -442,8 +460,17 @@ fn hook_install<W: Write>(
         let verb = if overwrote { "Overwrote" } else { "Wrote" };
         writeln!(stdout, "{verb} {}", target.display())
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
-        writeln!(stdout, "  - fires on tag push matching {tag_pattern:?}")
+        if let Some(app) = release_app {
+            writeln!(
+                stdout,
+                "  - fires when {:?} finishes on {}, for the {tag_pattern:?} tag on its commit; the sync job reads SHIPYARD_APP_PRIVATE_KEY from the `{APP_KEY_ENVIRONMENT}` environment",
+                app.tag_workflow, app.branch
+            )
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        } else {
+            writeln!(stdout, "  - fires on tag push matching {tag_pattern:?}")
+                .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        }
         writeln!(
             stdout,
             "  - installs shipyard {shipyard_version} before running the hook"
@@ -737,23 +764,69 @@ fn ensure_checkout_builds_shipyard(cwd: &Path) -> Result<(), String> {
     }
 }
 
+/// The release App the generated workflow mints its push token from, in
+/// `handoff` mode. Its key is an `app-key` environment secret.
+#[derive(Clone, Copy, Debug)]
+struct ReleaseApp<'a> {
+    client_id: &'a str,
+    // `name:` of the workflow that pushes the release tag from `branch`.
+    tag_workflow: &'a str,
+    branch: &'a str,
+}
+
+/// The environment that holds `SHIPYARD_APP_PRIVATE_KEY`. Its deployment
+/// policy admits only the base branch, so a tag-triggered run cannot use it.
+const APP_KEY_ENVIRONMENT: &str = "app-key";
+
+fn validate_tag_workflow_name(name: &str) -> Result<(), String> {
+    let safe = !name.is_empty()
+        && name == name.trim()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || " -_.()/:+,".contains(c));
+    if safe {
+        Ok(())
+    } else {
+        Err(format!(
+            "release.post_tag_hook.tag_workflow must be a workflow `name:` of letters, digits, spaces and -_.()/:+, only, got {name:?}"
+        ))
+    }
+}
+
+fn validate_base_branch_name(branch: &str) -> Result<(), String> {
+    let safe = !branch.is_empty()
+        && !branch.starts_with(['-', '/'])
+        && !branch.ends_with(['/', '.'])
+        && !branch.contains("..")
+        && branch
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./".contains(c));
+    if safe {
+        Ok(())
+    } else {
+        Err(format!(
+            "release.post_tag_hook.branch must be a plain branch name, got {branch:?}"
+        ))
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn render_workflow(
     tag_pattern: &str,
     shipyard_version: &str,
     runner: &str,
     ssh_signing_setup_script: Option<&str>,
-    app_client_id: Option<&str>,
+    app: Option<ReleaseApp<'_>>,
 ) -> String {
     // `handoff` mode: a GitHub App installation token pushes the coalesced
     // branch and opens its pull request. Without an App the legacy token
     // fallback applies.
-    let gh_token_env = if app_client_id.is_some() {
+    let gh_token_env = if app.is_some() {
         "\n          GH_TOKEN: ${{ steps.app-token.outputs.token }}"
     } else {
         ""
     };
-    let (mint_app_token, push_token, contents_permission) = app_client_id.map_or_else(
+    let (mint_app_token, push_token, contents_permission) = app.map_or_else(
         || {
             (
                 String::new(),
@@ -761,7 +834,8 @@ fn render_workflow(
                 "write",
             )
         },
-        |client_id| {
+        |app| {
+            let client_id = app.client_id;
             (
                 format!(
                     r"      - name: Mint release App token
@@ -799,7 +873,12 @@ fn render_workflow(
     // tag for a pinned version, `main` only for an explicit `latest`.
     let (env_version, install) = if shipyard_version == CHECKOUT_SHIPYARD_VERSION {
         (
-            "${{ github.ref_name }}".to_owned(),
+            if app.is_some() {
+                "${{ needs.resolve.outputs.tag }}"
+            } else {
+                "${{ github.ref_name }}"
+            }
+            .to_owned(),
             r#"      - name: Install Rust
         uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-13
         with:
@@ -836,8 +915,9 @@ fn render_workflow(
             ),
         )
     };
-    format!(
-        r#"name: Post-tag docs sync
+    let Some(app) = app else {
+        return format!(
+            r#"name: Post-tag docs sync
 
 # Installed by `shipyard release-bot hook install`. Shipyard-owned file:
 # re-running the install command overwrites this file in place.
@@ -887,6 +967,123 @@ jobs:
           tag="${{GITHUB_REF#refs/tags/}}"
           shipyard release-bot hook run --tag "$tag"
 "#
+        );
+    };
+    let ReleaseApp {
+        tag_workflow,
+        branch,
+        ..
+    } = app;
+    format!(
+        r#"name: Post-tag docs sync
+
+# Installed by `shipyard release-bot hook install`. Shipyard-owned file:
+# re-running the install command overwrites this file in place.
+#
+# The release App key is a secret of the `{APP_KEY_ENVIRONMENT}` environment, which
+# admits only runs whose ref is `refs/heads/{branch}`. A tag push runs with the
+# tag as its ref, so this workflow starts when "{tag_workflow}"
+# finishes on {branch} instead, and syncs the release tag that run left on its
+# commit. The `resolve` job holds no secret; it checks that the commit is on
+# {branch} and finds the tag.
+
+on:
+  workflow_run:
+    workflows: ["{tag_workflow}"]
+    types: [completed]
+    branches: [{branch}]
+
+permissions:
+  contents: {contents_permission}
+  pull-requests: write
+
+jobs:
+  resolve:
+    name: Resolve the release tag
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      (github.event.workflow_run.event == 'push' ||
+        github.event.workflow_run.event == 'workflow_dispatch')
+    runs-on: {runner}
+    outputs:
+      tag: ${{{{ steps.tag.outputs.tag }}}}
+      sha: ${{{{ steps.tag.outputs.sha }}}}
+    steps:
+      - name: Checkout {branch} with tags
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: {branch}
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Find the release tag on the run's commit
+        id: tag
+        shell: bash
+        env:
+          HEAD_SHA: ${{{{ github.event.workflow_run.head_sha }}}}
+          TAG_PATTERN: "{tag_pattern}"
+        run: |
+          set -euo pipefail
+          if ! [[ "$HEAD_SHA" =~ ^[0-9a-f]{{40}}$ ]]; then
+            echo "::error::run head $HEAD_SHA is not a commit SHA" >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$HEAD_SHA" HEAD; then
+            echo "::error::run head $HEAD_SHA is not on {branch}" >&2
+            exit 1
+          fi
+          tags="$(git tag --points-at "$HEAD_SHA" --list "$TAG_PATTERN")"
+          if [ -z "$tags" ]; then
+            echo "No $TAG_PATTERN tag at $HEAD_SHA; nothing to sync."
+            exit 0
+          fi
+          if [ "$(printf '%s\n' "$tags" | grep -c .)" -ne 1 ]; then
+            echo "::error::more than one $TAG_PATTERN tag at $HEAD_SHA" >&2
+            exit 1
+          fi
+          test "$(git rev-parse "refs/tags/$tags^{{commit}}")" = "$HEAD_SHA"
+          echo "tag=$tags" >> "$GITHUB_OUTPUT"
+          echo "sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+
+  sync:
+    name: Regenerate docs for ${{{{ needs.resolve.outputs.tag }}}}
+    needs: resolve
+    if: needs.resolve.outputs.tag != ''
+    environment: {APP_KEY_ENVIRONMENT}
+    runs-on: {runner}
+    concurrency:
+      group: shipyard-post-tag-sync
+      cancel-in-progress: false
+    env:
+      SHIPYARD_VERSION: "{env_version}"
+    steps:
+      - name: Checkout the release tag's commit with full history
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{{{ needs.resolve.outputs.sha }}}}
+          fetch-depth: 0
+          fetch-tags: true
+          # Only the docs-sync step below receives the push token.
+          persist-credentials: false
+
+{install}
+{signing_setup}{mint_app_token}      - name: Run post-tag docs sync
+        shell: bash
+        env:
+          GITHUB_TOKEN: {push_token}{gh_token_env}
+          RELEASE_TAG: ${{{{ needs.resolve.outputs.tag }}}}
+        run: |
+          set -euo pipefail
+          # Git credentials for this step only; nothing is written to .git/config.
+          auth="$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')"
+          echo "::add-mask::$auth"
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="http.https://github.com/.extraheader"
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth"
+          shipyard release-bot hook run --tag "$RELEASE_TAG"
+"#
     )
 }
 
@@ -922,8 +1119,12 @@ struct HookConfig {
     handoff_branch: String,
     // Public client ID of the GitHub App whose installation token the
     // generated workflow mints for `push_mode = "handoff"`. Its private key is
-    // the `SHIPYARD_APP_PRIVATE_KEY` secret.
+    // the `SHIPYARD_APP_PRIVATE_KEY` secret, held by the `app-key` environment.
     app_client_id: Option<String>,
+    // `name:` of the workflow that pushes the release tag from `branch`. In
+    // `handoff` mode the generated workflow starts when that workflow finishes,
+    // so its ref is `branch` and the main-only `app-key` environment admits it.
+    tag_workflow: Option<String>,
 }
 
 impl Default for HookConfig {
@@ -945,6 +1146,7 @@ impl Default for HookConfig {
             pr_branch_prefix: String::from("release/post-tag-sync"),
             handoff_branch: String::from("release/changelog-sync"),
             app_client_id: None,
+            tag_workflow: None,
         }
     }
 }
@@ -1030,6 +1232,10 @@ fn load_hook_config(config: &LoadedConfig) -> HookConfig {
             .to_owned(),
         app_client_id: section
             .get("app_client_id")
+            .and_then(toml::Value::as_str)
+            .map(str::to_owned),
+        tag_workflow: section
+            .get("tag_workflow")
             .and_then(toml::Value::as_str)
             .map(str::to_owned),
         ..HookConfig::default()
@@ -2838,8 +3044,31 @@ workflow_shipyard_version = "latest"
                 hook.ssh_signing_setup_script.as_deref(),
                 hook.app_client_id
                     .as_deref()
-                    .filter(|_| hook.push_mode == "handoff"),
+                    .filter(|_| hook.push_mode == "handoff")
+                    .map(|client_id| ReleaseApp {
+                        client_id,
+                        tag_workflow: hook.tag_workflow.as_deref().expect("dogfood tag_workflow"),
+                        branch: &hook.branch,
+                    }),
             )
+        );
+    }
+
+    // The dogfood workflow starts when the tagging workflow finishes; a renamed
+    // auto-release.yml would otherwise stop every docs sync without an error.
+    #[test]
+    fn dogfood_tag_workflow_names_auto_release() {
+        let config = config_from_toml(include_str!("../../.shipyard/config.toml"));
+        let hook = load_hook_config(&config);
+        let auto_release = include_str!("../../.github/workflows/auto-release.yml");
+        let name = auto_release
+            .lines()
+            .find_map(|line| line.strip_prefix("name: "))
+            .expect("auto-release.yml name");
+        assert_eq!(hook.tag_workflow.as_deref(), Some(name));
+        assert!(
+            include_str!("../../.github/workflows/auto-release.yml")
+                .contains("    environment: app-key\n")
         );
     }
 
@@ -3375,9 +3604,149 @@ app_client_id = "Iv1.abc"
         assert_eq!(parsed.app_client_id.as_deref(), Some("Iv1.abc"));
     }
 
+    const TEST_APP: ReleaseApp<'static> = ReleaseApp {
+        client_id: "Iv1.abc",
+        tag_workflow: "Auto-Release on CLI Version Bump",
+        branch: "main",
+    };
+
+    // The App key is an `app-key` environment secret, admitted only on
+    // `refs/heads/main`. A tag-triggered run would be refused, so the App
+    // workflow starts from the tagging workflow's run on main, resolves the
+    // tag in a job with no secret, and only the sync job names the
+    // environment.
+    #[test]
+    fn handoff_workflow_runs_from_main_and_only_sync_names_app_key() {
+        for version in ["v0.51.0", CHECKOUT_SHIPYARD_VERSION] {
+            let workflow = render_workflow("v*", version, "ubuntu-latest", None, Some(TEST_APP));
+            assert!(workflow.contains(
+                "on:\n  workflow_run:\n    workflows: [\"Auto-Release on CLI Version Bump\"]\n    types: [completed]\n    branches: [main]\n\n"
+            ));
+            assert!(!workflow.contains("push:"), "{version}");
+            assert!(!workflow.contains("tags: ["), "{version}");
+            let (head, sync) = workflow.split_once("\n  sync:\n").expect("sync job");
+            let resolve = head.split_once("\n  resolve:\n").expect("resolve job").1;
+            assert!(!resolve.contains("environment:"), "{version}");
+            assert!(!resolve.contains("secrets."), "{version}");
+            assert!(!head.contains("secrets."), "{version}");
+            assert_eq!(workflow.matches("environment:").count(), 1, "{version}");
+            assert!(sync.contains("\n    environment: app-key\n"), "{version}");
+            assert!(
+                sync.contains("secrets.SHIPYARD_APP_PRIVATE_KEY"),
+                "{version}"
+            );
+            assert!(resolve.contains(r#"git merge-base --is-ancestor "$HEAD_SHA" HEAD"#));
+            assert!(sync.contains("ref: ${{ needs.resolve.outputs.sha }}"));
+            assert!(sync.contains(r#"hook run --tag "$RELEASE_TAG""#));
+            assert!(!workflow.contains("github.ref"), "{version}");
+            assert!(!workflow.contains("GITHUB_REF"), "{version}");
+            // The workflow_run payload reaches the shell only through env.
+            for line in workflow
+                .lines()
+                .filter(|line| line.contains("github.event.workflow_run.head_sha"))
+            {
+                assert!(line.trim_start().starts_with("HEAD_SHA: "), "{line}");
+            }
+        }
+        let checkout = render_workflow(
+            "v*",
+            CHECKOUT_SHIPYARD_VERSION,
+            "ubuntu-latest",
+            None,
+            Some(TEST_APP),
+        );
+        assert!(checkout.contains(r#"SHIPYARD_VERSION: "${{ needs.resolve.outputs.tag }}""#));
+    }
+
+    #[test]
+    fn handoff_tag_resolution_finds_exactly_one_tag_on_main() {
+        // Run the rendered resolve script against a real repository.
+        let workflow = render_workflow("v*", "v0.51.0", "ubuntu-latest", None, Some(TEST_APP));
+        let script = workflow
+            .split_once("        run: |\n")
+            .and_then(|(_, rest)| rest.split_once("\n\n  sync:\n"))
+            .expect("resolve script")
+            .0
+            .lines()
+            .map(|line| line.strip_prefix("          ").unwrap_or(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "tag.gpgSign=false",
+                    "-c",
+                    "commit.gpgSign=false",
+                ])
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "one"]);
+        let tagged = git(&["rev-parse", "HEAD"]);
+        git(&["tag", "-a", "v1.2.3", "-m", "Release v1.2.3"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "two"]);
+        let untagged = git(&["rev-parse", "HEAD"]);
+        git(&["checkout", "-q", "-b", "side", &tagged]);
+        git(&["commit", "-q", "--allow-empty", "-m", "side"]);
+        let side = git(&["rev-parse", "HEAD"]);
+        git(&["tag", "v9.9.9"]);
+        git(&["checkout", "-q", "main"]);
+        let run = |sha: &str| {
+            let output = temp.path().join(format!("out-{sha}"));
+            fs::write(&output, "").expect("output");
+            let status = std::process::Command::new("bash")
+                .args(["-c", &script])
+                .current_dir(repo)
+                .env("HEAD_SHA", sha)
+                .env("TAG_PATTERN", "v*")
+                .env("GITHUB_OUTPUT", &output)
+                .output()
+                .expect("bash");
+            (
+                status.status.success(),
+                fs::read_to_string(&output).expect("read"),
+            )
+        };
+        assert_eq!(run(&tagged), (true, format!("tag=v1.2.3\nsha={tagged}\n")));
+        assert_eq!(run(&untagged), (true, String::new()));
+        // A tag on a commit that is not on main is refused.
+        assert!(!run(&side).0);
+        assert!(!run("not-a-sha").0);
+        git(&["tag", "v1.2.4", &tagged]);
+        assert!(!run(&tagged).0, "two tags on one commit");
+    }
+
+    #[test]
+    fn handoff_install_requires_a_safe_tag_workflow() {
+        for bad in ["", " x", "a\"b", "x${{ y }}", "a\nb", "it's"] {
+            assert!(validate_tag_workflow_name(bad).is_err(), "{bad:?}");
+        }
+        assert!(validate_tag_workflow_name("Auto-Release on CLI Version Bump").is_ok());
+        for bad in ["", "-x", "a..b", "a b", "a/", "x]"] {
+            assert!(validate_base_branch_name(bad).is_err(), "{bad:?}");
+        }
+        assert!(validate_base_branch_name("main").is_ok());
+    }
+
     #[test]
     fn handoff_workflow_mints_an_app_token_and_never_uses_the_default_token() {
-        let workflow = render_workflow("v*", "v0.51.0", "ubuntu-latest", None, Some("Iv1.abc"));
+        let workflow = render_workflow("v*", "v0.51.0", "ubuntu-latest", None, Some(TEST_APP));
         assert!(workflow.contains("actions/create-github-app-token@"));
         assert!(workflow.contains("client-id: Iv1.abc"));
         assert!(workflow.contains("secrets.SHIPYARD_APP_PRIVATE_KEY"));

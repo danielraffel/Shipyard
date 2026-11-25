@@ -55,6 +55,10 @@ max_push_attempts    = 5
 # does the push, as in version-at-land.yml.
 push_mode            = "handoff"
 app_client_id        = "Iv23liTCzDQWqmMjkDTI"
+# The release App key is an `app-key` environment secret that only main can
+# use, so the sync starts when this workflow (auto-release.yml's `name:`)
+# finishes on main, not on the tag push.
+tag_workflow         = "Auto-Release on CLI Version Bump"
 # Shipyard dogfoods its hook while the triggering release is still a draft,
 # so it builds the CLI from the tagged checkout instead of racing the new
 # tag's assets or trusting whatever release is `latest`. Only this repository

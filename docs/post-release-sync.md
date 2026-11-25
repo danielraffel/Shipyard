@@ -84,7 +84,8 @@ workflow uses it because its release is still a draft when the tag fires.
 
 The workflow:
 
-1. Fires on `push: tags: ["v*"]` (or your configured pattern).
+1. Fires on `push: tags: ["v*"]` (or your configured pattern). In `handoff`
+   mode it fires on `workflow_run` instead; see below.
 2. Runs on `ubuntu-latest` unless `[merge_queue].mutation_machine` is set in
    trusted machine-global config; a queue-authority install instead targets
    `[self-hosted, <repo>-queue-authority-<machine>]` so required-check
@@ -134,10 +135,22 @@ and a review refuses (the push fails with `git push failed after N attempt(s)`).
 - The workflow mints a GitHub App installation token with
   `actions/create-github-app-token` from `app_client_id` (the App's public
   client ID, required in this mode) and the `SHIPYARD_APP_PRIVATE_KEY`
-  repository secret. The default workflow token is not used, because events it
+  secret of the `app-key` environment. The default workflow token is not used, because events it
   causes start no workflows and the required checks would never run, and no
   personal token is involved. The App needs Contents, Pull requests, Commit
   statuses and Workflows write on the repository, the same as version-at-land.
+- The App key is a secret of an `app-key` environment whose deployment policy
+  admits only the base branch (`branch`, default `main`), with administrator
+  bypass off. A tag push runs with the tag as its ref, which that policy
+  refuses, so the handoff workflow does not start on the tag. It starts with
+  `workflow_run` when `tag_workflow` (the `name:` of the workflow that pushes
+  the release tag, required in this mode) finishes successfully on the base
+  branch. A `resolve` job with no secret checks that the run's commit is on the
+  base branch and finds exactly one tag matching the pattern on it; with no tag
+  it ends there. Only the `sync` job names `app-key`, checks out that commit and
+  runs `hook run --tag` for the resolved tag. Do not add a tag rule to
+  `app-key`: whoever can create a matching tag could then run any workflow file
+  with the key.
 - Editing the workflow file is a workflow change, so the PR that switches a
   repository to `handoff` may need the owner's admission.
 
@@ -145,6 +158,7 @@ and a review refuses (the push fails with `git push failed after N attempt(s)`).
 [release.post_tag_hook]
 push_mode     = "handoff"
 app_client_id = "Iv23li..."          # public client ID of the release App
+tag_workflow  = "Auto-Release on CLI Version Bump"   # `name:` of the tagging workflow
 # handoff_branch = "release/changelog-sync"
 ```
 
