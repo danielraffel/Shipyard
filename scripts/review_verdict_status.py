@@ -98,6 +98,13 @@ APP_BOT_ENV = "REVIEW_VERDICT_APP_BOT_LOGIN"
 # The ``issue_comment`` actions GitHub sends. Any other action is a payload
 # this job cannot read, never one it may skip.
 COMMENT_ACTIONS = frozenset({"created", "edited", "deleted"})
+# Every state the pull request REST API documents. Anything else is
+# unreadable, never "not open": a closed pull request posts nothing and exits
+# 0, so an unknown state read as closed would leave an earlier green status.
+PULL_STATES = frozenset({"open", "closed"})
+# Every state a commit status can carry. A status in any other state is
+# unreadable: skipped, it could be the HOLD failure this job posted.
+STATUS_STATES = frozenset({"error", "failure", "pending", "success"})
 
 
 class CommentEvent(NamedTuple):
@@ -169,9 +176,9 @@ def comment_event(event: Any) -> CommentEvent:
 
 
 def read_pull(guard: ModuleType, repo: str, number: int) -> PullRecord:
-    """The one reader of a pull request's REST answer: its state, head sha,
-    base ref, repository default branch and author login, each a non-empty
-    string, or ``GuardError``."""
+    """The one reader of a pull request's REST answer: its state (one of
+    ``PULL_STATES``), head sha, base ref, repository default branch and author
+    login, each a non-empty string, or ``GuardError``."""
     pull = guard.run_real_gh(["api", f"repos/{repo}/pulls/{number}"])
     if not isinstance(pull, dict):
         raise guard.GuardError(f"PR #{number} is unreadable")
@@ -184,7 +191,10 @@ def read_pull(guard: ModuleType, repo: str, number: int) -> PullRecord:
             raise guard.GuardError(f"PR #{number} is unreadable (no {'.'.join(path)})")
         return value
 
-    return PullRecord(text("state"), text("head", "sha"), text("base", "ref"),
+    state = text("state")
+    if state not in PULL_STATES:
+        raise guard.GuardError(f"PR #{number} is unreadable (unknown state {state!r})")
+    return PullRecord(state, text("head", "sha"), text("base", "ref"),
                       text("base", "repo", "default_branch"), text("user", "login"))
 
 
@@ -352,6 +362,7 @@ def open_pulls_on(guard: ModuleType, repo: str, head: str) -> list[int]:
                     or not isinstance(pull.get("number"), int)
                     or isinstance(pull.get("number"), bool)
                     or not isinstance(pull.get("state"), str)
+                    or pull["state"] not in PULL_STATES
                     or not isinstance(pull.get("head"), dict)
                     or not isinstance(pull["head"].get("sha"), str)):
                 raise guard.GuardError(f"{what} contain a malformed pull request")
@@ -440,6 +451,7 @@ def held_in_history(guard: ModuleType, repo: str, head: str) -> str | None:
             if (not isinstance(status, dict)
                     or not isinstance(status.get("context"), str)
                     or not isinstance(status.get("state"), str)
+                    or status["state"] not in STATUS_STATES
                     or not isinstance(creator, dict)
                     or not isinstance(creator.get("login"), str)
                     or not (status.get("description") is None
@@ -450,7 +462,11 @@ def held_in_history(guard: ModuleType, repo: str, head: str) -> str | None:
                 continue
             if not isinstance(description, str):
                 raise guard.GuardError(f"{what} contain a {CONTEXT} status with no description")
-            if status["state"] == "failure" and description.lower().startswith(marker):
+            # This job posts the HOLD text only as a failure. The same text in
+            # any other state was not posted by this job's success or pending
+            # path, so it holds too rather than being skipped: it can only
+            # refuse more.
+            if description.lower().startswith(marker):
                 return description
     return None
 

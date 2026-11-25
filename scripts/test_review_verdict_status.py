@@ -856,6 +856,69 @@ class TamperedVerdicts(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0, f"{bad}: {result.stdout}")
             self.assertNotIn("state=success", self.calls(), bad)
 
+    def test_an_unknown_status_state_in_the_history_refuses(self) -> None:
+        held = {"context": "review-verdict", "state": "failure",
+                "creator": {"login": "github-actions[bot]"},
+                "description": f"a HOLD naming head {HEAD[:12]} makes it un-approvable"}
+        # Controls: another context in each documented state is read, not held.
+        for state in ("error", "failure", "pending", "success"):
+            self.history = [dict(held, context="ci", state=state, description="x")]
+            self.post(self.answers(self.approved(), SIGNERS))
+            self.assertEqual(self.posted()["state"], "success", f"control {state}")
+        # The HOLD text in any documented state holds: skipped, an error or
+        # pending copy of it would hide the HOLD.
+        for state in ("error", "failure", "pending", "success"):
+            self.history = [dict(held, state=state)]
+            self.post(self.answers(self.approved(), SIGNERS))
+            self.assertEqual(self.posted()["state"], "failure", state)
+        # A state outside the enum refuses, on this job's context and any other.
+        for state in ("held", "FAILURE", "Failure", "", " failure", "queued", ["failure"], {}):
+            for context in ("review-verdict", "ci"):
+                self.history = [dict(held, context=context, state=state)]
+                result = self.post(self.answers(self.approved(), SIGNERS))
+                self.assertNotEqual(result.returncode, 0, f"{context} {state!r}: {result.stdout}")
+                self.assertNotIn("state=success", self.calls(), (context, state))
+
+    def test_an_unknown_pull_request_state_refuses(self) -> None:
+        # Only "open" and "closed" are documented. A closed pull request posts
+        # nothing and exits 0, so an unknown state read as closed would leave
+        # an earlier green status standing.
+        event = {"pull_request": {"number": 784}}
+
+        def with_state(state: Any) -> list[tuple[str, dict[str, Any]]]:
+            answers = self.answers(self.approved(), SIGNERS)
+            next(answer["json"] for needle, answer in answers
+                 if needle == "/pulls/")["state"] = state
+            return answers
+
+        self.assertEqual(self.post(with_state("open"), "pull_request_target",
+                                   copy.deepcopy(event)).returncode, 0, "control open")
+        result = self.post(with_state("closed"), "pull_request_target", copy.deepcopy(event))
+        self.assertEqual(result.returncode, 0, "control closed")
+        self.assertNotIn("/statuses/", self.calls())
+        for state in ("pending", "OPEN", "Closed", "merged", "draft", " open", "open ",
+                      5, True, ["open"], {"open": True}):
+            result = self.post(with_state(state), "pull_request_target", copy.deepcopy(event))
+            self.assertNotEqual(result.returncode, 0, f"{state!r}: {result.stdout}")
+            self.assertIn("unreadable", result.stderr, state)
+            self.assertNotIn("nothing to post", result.stdout, state)
+            self.assert_refused(self.comment_event("created", "thanks"),
+                                answers=with_state(state))
+        # A pull request sharing the head with an unknown state is never
+        # dropped from the judgment as "not open".
+        for state in ("pending", "OPEN", "", None, 5, ["open"]):
+            answers = [
+                (needle, {"pages": [[
+                    {"number": 784, "state": "open", "head": {"sha": HEAD}},
+                    {"number": 785, "state": state, "head": {"sha": HEAD}},
+                ]]}) if needle == f"/commits/{HEAD}/pulls" else (needle, answer)
+                for needle, answer in self.answers(self.approved(), SIGNERS)
+            ]
+            result = self.post(answers)
+            self.assertNotEqual(result.returncode, 0, f"{state!r}: {result.stdout}")
+            self.assertIn("pull requests on", result.stderr, state)
+            self.assertNotIn("/statuses/", self.calls(), state)
+
     def test_a_malformed_comment_event_refuses(self) -> None:
         approve = SIGNED_APPROVE.format(head=HEAD)
         good = self.comment_event("edited", approve, before="thanks")
