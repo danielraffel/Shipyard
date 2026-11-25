@@ -4681,6 +4681,30 @@ fn an_approve_edited_in_its_own_second_is_refused_by_graphql() {
     assert!(judge(Ok(json!({"data": {"node": null}}))).is_err());
 }
 
+/// A comment read from the API (it carries `updated_at`) with no `node_id`
+/// cannot be checked, so it never approves.
+#[test]
+fn an_api_comment_with_no_node_id_never_approves() {
+    let comments = [json!({"id": 7, "updated_at": "2026-10-12T01:00:00Z"})];
+    let approved = HeadGate::Approved {
+        approval: Approval::Marker {
+            login: "shipyard-local[bot]".to_owned(),
+            comment_id: Some(7),
+            performed_via_github_app_id: None,
+        },
+    };
+    let gh = |_: &[String]| -> Result<String, String> { panic!("no read without a node id") };
+    assert!(super::edit_checked(&gh, HEAD, &comments, approved.clone()).is_err());
+    let mut with_node = comments[0].clone();
+    with_node["node_id"] = json!("IC_7");
+    let gh = |_: &[String]| Ok(json!({"data": {"node": {"lastEditedAt": null}}}).to_string());
+    assert!(
+        super::edit_checked(&gh, HEAD, &[with_node], approved)
+            .expect("readable")
+            .allows()
+    );
+}
+
 /// An edited APPROVE from a listed human, or a listed reviewer identity,
 /// counts no more than the App's.
 #[test]

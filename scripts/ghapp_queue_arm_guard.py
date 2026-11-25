@@ -2500,6 +2500,16 @@ def member_review(repo: str, number: int, head: str, policy: dict[str, Any],
     own = self_approval(approved, author, comments, reviews, policy)
     if own is not None:
         return f"member #{number}: {own}"
+    # The same GraphQL edit rule as any landing (`_edit_checked`).
+    deciding = deciding_approval(approved, author, comments, reviews, policy)
+    if deciding.get("verdict_comment_id") is not None and deciding.get("verdict_from_api"):
+        node_id = deciding.get("verdict_node_id")
+        if not isinstance(node_id, str) or not node_id:
+            raise GuardError(f"member #{number}'s approval comment carries no node id")
+        edited = comment_last_edited(node_id)
+        if edited is not None:
+            return (f"member #{number}: its approval comment {deciding['verdict_comment_id']} "
+                    f"was edited at {edited}, so it does not count")
     return None
 
 
@@ -3756,6 +3766,18 @@ def _review_gate(classification: dict[str, Any], repo: str | None, dry_run: bool
         limited = (f"the base's carry configuration is refused ({policy['carry_error']})"
                    if policy.get("carry_error")
                    else carry_limits(approved, author, comments, reviews, policy))
+        if limited is None:
+            # A head this host's hold record holds passes no approval on: with
+            # the HOLD comment deleted, a merge of the base would otherwise
+            # carry the held head's approval to the new head.
+            try:
+                carried_hold = recorded_hold(repo, number, approved)
+            except GuardError as error:
+                limited = f"its hold record cannot be read ({error})"
+            else:
+                if carried_hold is not None:
+                    limited = (f"head {approved[:12]} was held (this host's hold record at "
+                               f"{carried_hold}), and a held head's approval never carries")
         merge_record: dict[str, Any] = {}
         refusal = limited or merge_only_carry(repo, base, approved, head, excluded, merge_record)
         own = self_approval(approved, author, comments, reviews, policy)

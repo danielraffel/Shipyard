@@ -544,24 +544,21 @@ pub(super) fn apply_repo_plan(
                 observation,
                 // A head a defect-fix removal blocks is never offered to the
                 // backstop: a pull request with no row is no candidate.
-                &reports
-                    .iter()
-                    .filter(|report| {
-                        stall_pass
-                            .defect_fix
-                            .blocking(&observation.repo, report.number, &report.head_sha)
-                            .is_none()
-                            // Nor a head the steward ledger holds.
-                            && super::held_ledger::held_since(
-                                ledger,
-                                &observation.repo,
-                                report.number,
-                                &report.head_sha,
-                            )
-                            .is_none()
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>(),
+                // Nor a head the steward ledger holds.
+                &super::held_ledger::backstop_candidates(
+                    ledger,
+                    &observation.repo,
+                    reports
+                        .iter()
+                        .filter(|report| {
+                            stall_pass
+                                .defect_fix
+                                .blocking(&observation.repo, report.number, &report.head_sha)
+                                .is_none()
+                        })
+                        .cloned()
+                        .collect(),
+                ),
                 &args.opt_out_label,
                 args.apply,
                 || {

@@ -814,6 +814,21 @@ class TamperedVerdicts(unittest.TestCase):
         self.assertNotEqual(held.returncode, 0, held.stderr)
         self.assertIn("hold record", held.stderr)
 
+    def test_an_unreadable_hold_record_refuses(self) -> None:
+        (self.guards / "holds.jsonl").mkdir()
+        guard = self.run_guard(["pr", "merge", "784", "--merge", "--match-head-commit", HEAD],
+                               self.answers(self.approved(), SIGNERS), REPO,
+                               SHIPYARD_SIGNERS_FROM_BASE="1")
+        self.assertNotEqual(guard.returncode, 0, guard.stderr)
+        self.assertIn("hold record", guard.stderr)
+
+    def test_an_api_comment_with_no_node_id_never_approves(self) -> None:
+        trail = [self.comment(SIGNED_APPROVE.format(head=HEAD), "2026-10-12T15:00:00Z")]
+        trail[0].pop("node_id")
+        result = self.post(self.answers(trail, SIGNERS))
+        self.assertEqual(self.posted()["state"], "failure", result.stdout + result.stderr)
+        self.assertIn("node id", result.stdout + result.stderr)
+
     def app_gh(self, fake: pathlib.Path) -> pathlib.Path:
         """``gh`` that refuses the App token and passes anything else to ``fake``."""
         wrapper = self.root / "gh-app"
@@ -867,3 +882,103 @@ class TamperedVerdicts(unittest.TestCase):
                          REVIEW_VERDICT_APP_ID="123", REVIEW_VERDICT_APP_TOKEN="good-app-token")
         self.assertEqual(good.returncode, 0, good.stderr)
         self.assertEqual(len(self.statuses()), 2)
+
+
+class CarryFromAHeldHead(unittest.TestCase):
+    """The delta review's D1: APPROVE(H), HOLD(H), the HOLD deleted, the base
+    merged in (H2). The approval of H carries to H2; a held head's approval
+    never carries."""
+
+    H = "a" * 40
+    H2 = "b" * 40
+
+    def setUp(self) -> None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("review_verdict_status", STATUS)
+        assert spec is not None and spec.loader is not None
+        self.status = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.status)
+        self.guard = self.status.load_guard()
+
+    def poster_state(self, held: dict[str, str]) -> str:
+        from unittest import mock
+        posted: list[list[str]] = []
+
+        def real_gh(arguments: list[str]) -> Any:
+            if arguments[-1] == f"repos/{REPO}/pulls/7":
+                return {"state": "open", "head": {"sha": self.H2}}
+            if "/statuses/" in " ".join(arguments):
+                posted.append(arguments)
+                return {}
+            raise AssertionError(arguments)
+
+        self.guard.run_real_gh = real_gh
+        carried = self.status.Decision(True, "PR #7: carried", None, (), self.H)
+        with mock.patch.object(self.status, "load_guard", return_value=self.guard), \
+                mock.patch.object(self.status, "open_pulls_on", return_value=[7]), \
+                mock.patch.object(self.status, "decide", return_value=carried), \
+                mock.patch.object(self.status, "refresh_head_check"), \
+                mock.patch.object(self.status, "held_in_history",
+                                  side_effect=lambda guard, repo, head: held.get(head)):
+            self.status.run("pull_request_target", {"pull_request": {"number": 7}}, REPO, None)
+        state = next(a for a in posted[-1] if a.startswith("state="))
+        return state.split("=", 1)[1]
+
+    def test_the_poster_refuses_a_carry_from_a_held_head(self) -> None:
+        self.assertEqual(self.poster_state({}), "success", "control: nothing held")
+        self.assertEqual(self.poster_state({self.H: "a HOLD naming head aaaa"}), "failure")
+
+    def guard_gate(self, holds: dict[str, str | None]) -> tuple[bool, str]:
+        import os
+        from unittest import mock
+        pull = {"base": {"ref": "main", "repo": {"default_branch": "main"}},
+                "head": {"sha": self.H2, "ref": "feature/x"}, "user": {"login": "author"}}
+        target = {"repo": REPO, "pr": 7, "head": self.H2, "bound_head": self.H2}
+        guard = self.guard
+        with tempfile.TemporaryDirectory() as guards, \
+                mock.patch.dict(os.environ, {"SHIPYARD_GHAPP_GUARDS_DIR": guards}), \
+                mock.patch.object(guard, "host_review_default", return_value=True), \
+                mock.patch.object(guard, "run_real_gh", return_value=pull), \
+                mock.patch.object(guard, "base_config_text", return_value=SIGNERS), \
+                mock.patch.object(guard, "_rest_pages", return_value=[]), \
+                mock.patch.object(guard, "review_verdict", return_value=(False, "no verdict")), \
+                mock.patch.object(guard, "approved_earlier_head", return_value=self.H), \
+                mock.patch.object(guard, "carry_limits", return_value=None), \
+                mock.patch.object(guard, "merge_only_carry", return_value=None), \
+                mock.patch.object(guard, "self_approval", return_value=None), \
+                mock.patch.object(guard, "same_session_note", return_value=None), \
+                mock.patch.object(guard, "deciding_approval", return_value={}), \
+                mock.patch.object(guard, "recorded_hold",
+                                  side_effect=lambda repo, number, head: holds.get(head)):
+            allowed, message, _ = guard.review_gate(target, REPO, dry_run=True)
+        return allowed, message
+
+    def test_the_guard_refuses_a_carry_from_a_held_head(self) -> None:
+        allowed, message = self.guard_gate({})
+        self.assertTrue(allowed, "control: " + message)
+        allowed, message = self.guard_gate({self.H: "2026-11-24T01:00:00Z"})
+        self.assertFalse(allowed, message)
+        self.assertIn("never carries", message)
+
+
+class RollupMemberEdit(unittest.TestCase):
+    """A rollup member's approval meets the same GraphQL edit rule."""
+
+    def test_an_edited_member_approval_does_not_count(self) -> None:
+        from unittest import mock
+        guard = arm.guard
+
+        def review(deciding: dict[str, Any], edited: str | None) -> str | None:
+            with mock.patch.object(guard, "run_real_gh", return_value={"user": {"login": "a"}}), \
+                    mock.patch.object(guard, "_rest_pages", return_value=[]), \
+                    mock.patch.object(guard, "review_verdict", return_value=(True, "ok")), \
+                    mock.patch.object(guard, "self_approval", return_value=None), \
+                    mock.patch.object(guard, "deciding_approval", return_value=deciding), \
+                    mock.patch.object(guard, "comment_last_edited", return_value=edited):
+                return guard.member_review(REPO, 7, HEAD, {}, False)
+
+        api = {"verdict_comment_id": 1, "verdict_node_id": "IC_1", "verdict_from_api": True}
+        self.assertIsNone(review(api, None), "control: never edited")
+        self.assertIn("was edited", review(api, "2026-11-24T01:00:00Z") or "")
+        with self.assertRaises(guard.GuardError):
+            review(dict(api, verdict_node_id=None), None)

@@ -102,6 +102,8 @@ class Decision(NamedTuple):
     message: str
     cause: str | None
     excluded: tuple[str, ...]
+    # The earlier head an allowed approval was carried from, if any.
+    carried_from: str | None = None
 
     @property
     def awaiting(self) -> bool:
@@ -204,7 +206,10 @@ def decide(guard: ModuleType, repo: str, number: int, head: str) -> Decision:
                 for entry in classification.get("excluded_approvals") or []]
     if cause == "approval_does_not_carry":
         excluded.append("not_exact_head")
-    return Decision(allowed, message, cause, tuple(excluded))
+    approved = (classification.get("approval") or {}).get("approved_head")
+    carried_from = (approved.lower() if allowed and isinstance(approved, str)
+                    and approved.lower() != head.lower() else None)
+    return Decision(allowed, message, cause, tuple(excluded), carried_from)
 
 
 def awaiting_description(head: str, excluded: list[str], admission: bool = False) -> str:
@@ -471,6 +476,15 @@ def run(event_name: str, event: dict[str, Any], repo: str, run_url: str | None) 
         held = (f"{HOLD_PREFIX}{head[:12]} was removed after it was posted "
                 f"({removed[0]}); it still holds") if removed else held_in_history(
                     guard, repo, head)
+        # A held head's approval never carries: with the HOLD comment deleted,
+        # a merge of the base would otherwise carry it to this head.
+        for source in sorted({d.carried_from for _, d in decisions if d.carried_from}):
+            if held is not None:
+                break
+            source_held = held_in_history(guard, repo, source)
+            if source_held is not None:
+                held = (f"{HOLD_PREFIX}{head[:12]}'s approval is carried from held head "
+                        f"{source[:12]} ({source_held})")
         if held is not None:
             state, allowed, awaiting = "failure", False, False
             text = held if len(held) <= DESCRIPTION_LIMIT else held[: DESCRIPTION_LIMIT - 1] + "…"

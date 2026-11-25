@@ -131,10 +131,14 @@ DELETE 204; `issues: write` alone and a read-only token got 403). So:
     gate refuses it from then on, and the native-arm backstop skips it,
     whatever the comments say. A HOLD deleted before any pass judged its head
     is not in it.
-  - The host guard's hold record. `queue-arm-guard` refuses a head that the
-    hold hook's `holds.jsonl` on the same host names as held (it records each
-    HOLD posted through `ghapp` there). A HOLD posted from another host is not
-    in it; an unreadable file refuses.
+  - The host's hold record. `queue-arm-guard` and the steward's gate both
+    refuse a head that the hold hook's `holds.jsonl` on their host names as
+    held (it records each HOLD posted through `ghapp` there). A HOLD posted
+    from another host is not in it; an unreadable file refuses.
+  - A held head's approval never carries. Each record is checked for the head
+    an approval is carried from as well as the live head, so deleting the
+    HOLD and merging the base into the branch does not carry the held head's
+    approval to the new head.
 
 Residuals: the HOLD's `created` run can still be lost, either cancelled by a PR
 job with `actions: write`, or displaced in the per-PR concurrency group (one
@@ -144,6 +148,27 @@ the status history or the steward ledger keeps it held; and until the App
 posts, a PR workflow can post a `github-actions` failure that holds any head
 in the repository until that head's pull request pushes again. Vellum does not
 require `review-verdict` at all.
+
+### What this interim hardening does not close
+
+- **Comments are still the verdict authority.** Every rule above is a
+  defence of comment text that any holder of the shared App, and a pull
+  request's own token for edits and deletes, can touch. The fix is an
+  App-posted status from the reviewer process that the steward reads, in a
+  separate change.
+- **A HOLD posted from another host and deleted within one steward tick.**
+  It is in no host's `holds.jsonl` on the steward's host, no steward pass
+  read the gate while it stood (the gate is read only on an admission
+  attempt), and if its `created` poster run was cancelled or displaced it is
+  in no status history either.
+- **A missing steward ledger file loads as empty,** so every held head it
+  recorded is forgotten (a file that does not parse is an error). Entries
+  also expire after 30 days.
+- **After the App bind, keep the Actions-bound rule alongside the App
+  rule.** A job that fails because the App could not post a refusal does not
+  remove the App's earlier `success`; until the App leg has a record of
+  posting refusals, the Actions-bound rule is what keeps such a head
+  unsatisfied.
 
 ## The verdict App's stale status
 
